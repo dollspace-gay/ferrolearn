@@ -188,6 +188,55 @@ fn test_lasso_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// ElasticNet oracle test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_elastic_net_oracle() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("../../fixtures/elastic_net.json")).unwrap();
+
+    let x = json_to_array2(&fixture["input"]["X"]);
+    let y = json_to_array1(&fixture["input"]["y"]);
+
+    let expected_coefs = json_to_array1(&fixture["expected"]["coefficients"]);
+    let expected_intercept = fixture["expected"]["intercept"].as_f64().unwrap();
+    let expected_preds = json_to_array1(&fixture["expected"]["predictions"]);
+
+    let alpha = fixture["params"]["alpha"].as_f64().unwrap();
+    let l1_ratio = fixture["params"]["l1_ratio"].as_f64().unwrap();
+    let fit_intercept = fixture["params"]["fit_intercept"].as_bool().unwrap();
+
+    let model = ferrolearn_linear::ElasticNet::<f64>::new()
+        .with_alpha(alpha)
+        .with_l1_ratio(l1_ratio)
+        .with_fit_intercept(fit_intercept)
+        .with_max_iter(10_000)
+        .with_tol(1e-8);
+    let fitted = model.fit(&x, &y).unwrap();
+
+    // Compare coefficients (coordinate descent — moderate tolerance).
+    assert_array_close(
+        fitted.coefficients().as_slice().unwrap(),
+        expected_coefs.as_slice().unwrap(),
+        1e-3,
+        "ElasticNet coefficients",
+    );
+
+    // Compare intercept.
+    assert_relative_eq!(fitted.intercept(), expected_intercept, epsilon = 1e-3);
+
+    // Compare predictions.
+    let preds = fitted.predict(&x).unwrap();
+    assert_array_close(
+        preds.as_slice().unwrap(),
+        expected_preds.as_slice().unwrap(),
+        1e-2,
+        "ElasticNet predictions",
+    );
+}
+
+// ---------------------------------------------------------------------------
 // LogisticRegression oracle test
 // ---------------------------------------------------------------------------
 
