@@ -63,7 +63,7 @@ pub(crate) fn solve_lstsq<F: Float + Send + Sync + 'static>(
 ///
 /// Uses Cholesky decomposition of `X^T X` for efficiency. Falls back
 /// to a direct solver if Cholesky fails (system may be ill-conditioned).
-fn solve_normal_equations<F: Float + Send + Sync + 'static>(
+pub(crate) fn solve_normal_equations<F: Float + Send + Sync + 'static>(
     x: &Array2<F>,
     y: &Array1<F>,
 ) -> Result<Array1<F>, FerroError> {

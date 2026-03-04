@@ -41,6 +41,7 @@
 //! All models are generic over `F: num_traits::Float + Send + Sync + 'static`,
 //! supporting both `f32` and `f64`.
 
+pub mod balltree;
 pub mod kdtree;
 pub mod knn;
 

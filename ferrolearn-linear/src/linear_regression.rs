@@ -85,13 +85,17 @@ pub struct FittedLinearRegression<F> {
     intercept: F,
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
-    for LinearRegression<F>
+impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'static>
+    Fit<Array2<F>, Array1<F>> for LinearRegression<F>
 {
     type Fitted = FittedLinearRegression<F>;
     type Error = FerroError;
 
-    /// Fit the linear regression model using QR decomposition.
+    /// Fit the linear regression model.
+    ///
+    /// Uses the centering trick with Cholesky normal equations for speed.
+    /// Falls back to QR decomposition via faer if the normal equations are
+    /// ill-conditioned.
     ///
     /// # Errors
     ///
@@ -101,7 +105,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     /// than features.
     /// Returns [`FerroError::NumericalInstability`] if the system is singular.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLinearRegression<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
+        let (n_samples, _n_features) = x.dim();
 
         // Validate input shapes.
         if n_samples != y.len() {
@@ -121,24 +125,30 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
         }
 
         if self.fit_intercept {
-            // Augment X with a column of ones for the intercept.
-            let ones = Array2::from_elem((n_samples, 1), F::one());
-            let x_aug = ndarray::concatenate(Axis(1), &[x.view(), ones.view()]).map_err(|_| {
-                FerroError::NumericalInstability {
-                    message: "failed to augment design matrix".into(),
-                }
-            })?;
+            // Centering trick: center X and y, solve without intercept column,
+            // then recover intercept as y_mean - x_mean . w.
+            // This avoids the expensive matrix augmentation + QR path.
+            let n = F::from(n_samples).unwrap();
+            let x_mean = x.mean_axis(Axis(0)).unwrap();
+            let y_mean = y.sum() / n;
 
-            let w = linalg::solve_lstsq(&x_aug, y)?;
-            let coefficients = w.slice(ndarray::s![..n_features]).to_owned();
-            let intercept = w[n_features];
+            let x_centered = x - &x_mean;
+            let y_centered = y - y_mean;
+
+            // Try fast Cholesky normal equations first, fall back to QR.
+            let w = linalg::solve_normal_equations(&x_centered, &y_centered)
+                .or_else(|_| linalg::solve_lstsq(&x_centered, &y_centered))?;
+
+            let intercept = y_mean - x_mean.dot(&w);
 
             Ok(FittedLinearRegression {
-                coefficients,
+                coefficients: w,
                 intercept,
             })
         } else {
-            let w = linalg::solve_lstsq(x, y)?;
+            // Try fast Cholesky normal equations first, fall back to QR.
+            let w = linalg::solve_normal_equations(x, y)
+                .or_else(|_| linalg::solve_lstsq(x, y))?;
 
             Ok(FittedLinearRegression {
                 coefficients: w,

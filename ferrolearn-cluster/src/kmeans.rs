@@ -213,58 +213,119 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
     centers
 }
 
-/// Assign each sample to its nearest centroid (parallelized with Rayon).
+/// Threshold below which we skip Rayon and run serially.
+const PARALLEL_THRESHOLD: usize = 512;
+
+/// Assign each sample to its nearest centroid.
 ///
-/// Returns `(labels, inertia)`.
+/// Returns `(labels, inertia)`. Uses serial iteration for small inputs
+/// and Rayon parallelism for larger ones.
 fn assign_clusters<F: Float + Send + Sync>(
     x: &Array2<F>,
     centers: &Array2<F>,
 ) -> (Array1<usize>, F) {
     let n_samples = x.nrows();
-    let k = centers.nrows();
-
-    let results: Vec<(usize, F)> = (0..n_samples)
-        .into_par_iter()
-        .map(|i| {
-            let row = x.row(i);
-            let row_slice = row.as_slice().unwrap_or(&[]);
-            let mut best_label = 0;
-            let mut best_dist = F::max_value();
-            for c in 0..k {
-                let center_row = centers.row(c);
-                let center_slice = center_row.as_slice().unwrap_or(&[]);
-                let d = squared_euclidean(row_slice, center_slice);
-                if d < best_dist {
-                    best_dist = d;
-                    best_label = c;
-                }
-            }
-            (best_label, best_dist)
-        })
-        .collect();
-
     let mut labels = Array1::zeros(n_samples);
-    let mut inertia = F::zero();
-    for (i, (label, dist)) in results.into_iter().enumerate() {
-        labels[i] = label;
-        inertia = inertia + dist;
-    }
-
+    let inertia = assign_clusters_into(&mut labels, x, centers);
     (labels, inertia)
 }
 
-/// Recompute centroids as the mean of assigned samples.
+/// Assign each sample to its nearest centroid, writing into a pre-allocated
+/// labels array. Returns the inertia.
+fn assign_clusters_into<F: Float + Send + Sync>(
+    labels: &mut Array1<usize>,
+    x: &Array2<F>,
+    centers: &Array2<F>,
+) -> F {
+    let n_samples = x.nrows();
+
+    if n_samples < PARALLEL_THRESHOLD {
+        assign_serial(labels, x, centers)
+    } else {
+        assign_parallel(labels, x, centers)
+    }
+}
+
+/// Find the nearest center for a single row.
+#[inline]
+fn nearest_center<F: Float>(row_slice: &[F], centers: &Array2<F>) -> (usize, F) {
+    let k = centers.nrows();
+    let mut best_label = 0;
+    let mut best_dist = F::max_value();
+    for c in 0..k {
+        let center_row = centers.row(c);
+        let center_slice = center_row.as_slice().unwrap_or(&[]);
+        let d = squared_euclidean(row_slice, center_slice);
+        if d < best_dist {
+            best_dist = d;
+            best_label = c;
+        }
+    }
+    (best_label, best_dist)
+}
+
+/// Serial assignment — no thread-pool overhead.
+fn assign_serial<F: Float>(
+    labels: &mut Array1<usize>,
+    x: &Array2<F>,
+    centers: &Array2<F>,
+) -> F {
+    let n_samples = x.nrows();
+    let mut inertia = F::zero();
+    for i in 0..n_samples {
+        let row = x.row(i);
+        let row_slice = row.as_slice().unwrap_or(&[]);
+        let (label, dist) = nearest_center(row_slice, centers);
+        labels[i] = label;
+        inertia = inertia + dist;
+    }
+    inertia
+}
+
+/// Parallel assignment using Rayon par_chunks for cache-friendly access.
+fn assign_parallel<F: Float + Send + Sync>(
+    labels: &mut Array1<usize>,
+    x: &Array2<F>,
+    centers: &Array2<F>,
+) -> F {
+    let n_samples = x.nrows();
+    let labels_slice = labels.as_slice_mut().unwrap();
+    let chunk_size = (n_samples / rayon::current_num_threads()).max(64);
+
+    labels_slice
+        .par_chunks_mut(chunk_size)
+        .enumerate()
+        .map(|(chunk_idx, chunk)| {
+            let start = chunk_idx * chunk_size;
+            let mut local_inertia = F::zero();
+            for (local_i, label) in chunk.iter_mut().enumerate() {
+                let i = start + local_i;
+                let row = x.row(i);
+                let row_slice = row.as_slice().unwrap_or(&[]);
+                let (best_label, dist) = nearest_center(row_slice, centers);
+                *label = best_label;
+                local_inertia = local_inertia + dist;
+            }
+            local_inertia
+        })
+        .reduce(F::zero, |a, b| a + b)
+}
+
+/// Recompute centroids as the mean of assigned samples, writing into
+/// pre-allocated buffers.
 ///
-/// Returns the new centroids and the maximum centroid movement.
-fn recompute_centroids<F: Float>(
+/// Returns the maximum centroid movement.
+fn recompute_centroids_into<F: Float>(
+    new_centers: &mut Array2<F>,
+    counts: &mut [F],
     x: &Array2<F>,
     labels: &Array1<usize>,
-    k: usize,
     n_features: usize,
     old_centers: &Array2<F>,
-) -> (Array2<F>, F) {
-    let mut new_centers = Array2::zeros((k, n_features));
-    let mut counts = vec![F::zero(); k];
+) -> F {
+    let k = new_centers.nrows();
+    new_centers.fill(F::zero());
+    counts.iter_mut().for_each(|c| *c = F::zero());
 
     for (i, &label) in labels.iter().enumerate() {
         counts[label] = counts[label] + F::one();
@@ -296,7 +357,7 @@ fn recompute_centroids<F: Float>(
         }
     }
 
-    (new_centers, max_shift.sqrt())
+    max_shift.sqrt()
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
@@ -350,6 +411,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
         let base_seed = self.random_state.unwrap_or(0);
         let mut best_result: Option<FittedKMeans<F>> = None;
 
+        // Pre-allocate reusable buffers for the Lloyd loop.
+        let mut labels = Array1::zeros(n_samples);
+        let mut new_centers = Array2::zeros((self.n_clusters, n_features));
+        let mut counts = vec![F::zero(); self.n_clusters];
+
         for run in 0..self.n_init {
             let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(run as u64));
 
@@ -357,19 +423,22 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
             let mut centers = kmeans_plus_plus(x, self.n_clusters, &mut rng);
 
             let mut n_iter = 0;
-            let mut labels = Array1::zeros(n_samples);
             let mut inertia = F::max_value();
 
             for iter in 0..self.max_iter {
-                // Assign step (parallelized).
-                let (new_labels, new_inertia) = assign_clusters(x, &centers);
-                labels = new_labels;
-                inertia = new_inertia;
+                // Assign step (serial or parallel depending on size).
+                inertia = assign_clusters_into(&mut labels, x, &centers);
 
-                // Recompute centroids.
-                let (new_centers, max_shift) =
-                    recompute_centroids(x, &labels, self.n_clusters, n_features, &centers);
-                centers = new_centers;
+                // Recompute centroids using pre-allocated buffers.
+                let max_shift = recompute_centroids_into(
+                    &mut new_centers,
+                    &mut counts,
+                    x,
+                    &labels,
+                    n_features,
+                    &centers,
+                );
+                std::mem::swap(&mut centers, &mut new_centers);
                 n_iter = iter + 1;
 
                 // Check convergence.
@@ -380,7 +449,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
 
             let candidate = FittedKMeans {
                 cluster_centers_: centers,
-                labels_: labels,
+                labels_: labels.clone(),
                 inertia_: inertia,
                 n_iter_: n_iter,
             };
@@ -457,21 +526,34 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKMeans<F> 
 
         let n_samples = x.nrows();
         let k = self.cluster_centers_.nrows();
+        let centers = &self.cluster_centers_;
 
-        let distances: Vec<F> = (0..n_samples)
-            .into_par_iter()
-            .flat_map(|i| {
+        let mut distances = vec![F::zero(); n_samples * k];
+
+        if n_samples < PARALLEL_THRESHOLD {
+            for i in 0..n_samples {
                 let row = x.row(i);
                 let row_slice = row.as_slice().unwrap_or(&[]);
-                (0..k)
-                    .map(|c| {
-                        let center_slice = self.cluster_centers_.row(c);
-                        let cs = center_slice.as_slice().unwrap_or(&[]);
-                        squared_euclidean(row_slice, cs).sqrt()
-                    })
-                    .collect::<Vec<F>>()
-            })
-            .collect();
+                for c in 0..k {
+                    let center = centers.row(c);
+                    let cs = center.as_slice().unwrap_or(&[]);
+                    distances[i * k + c] = squared_euclidean(row_slice, cs).sqrt();
+                }
+            }
+        } else {
+            distances
+                .par_chunks_mut(k)
+                .enumerate()
+                .for_each(|(i, chunk)| {
+                    let row = x.row(i);
+                    let row_slice = row.as_slice().unwrap_or(&[]);
+                    for c in 0..k {
+                        let center = centers.row(c);
+                        let cs = center.as_slice().unwrap_or(&[]);
+                        chunk[c] = squared_euclidean(row_slice, cs).sqrt();
+                    }
+                });
+        }
 
         Array2::from_shape_vec((n_samples, k), distances).map_err(|_| {
             FerroError::NumericalInstability {

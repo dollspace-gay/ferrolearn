@@ -47,6 +47,7 @@ use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 
+use crate::balltree::BallTree;
 use crate::kdtree::{self, KdTree};
 
 // ---------------------------------------------------------------------------
@@ -57,12 +58,14 @@ use crate::kdtree::{self, KdTree};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Algorithm {
     /// Automatically select the best algorithm based on data characteristics.
-    /// Uses KD-Tree for dimensions <= 20, brute force otherwise.
+    /// Uses KD-Tree for dimensions <= 15, ball tree for higher dimensions.
     Auto,
     /// Use brute-force exhaustive search (O(n) per query).
     BruteForce,
     /// Use a KD-Tree spatial index (O(log n) average per query for low dimensions).
     KdTree,
+    /// Use a ball tree spatial index (handles high dimensions better than KD-Tree).
+    BallTree,
 }
 
 /// The weighting scheme for neighbor contributions.
@@ -80,6 +83,23 @@ pub enum Weights {
 // Helper: find k nearest neighbors
 // ---------------------------------------------------------------------------
 
+/// Which spatial index was built during fit.
+enum SpatialIndex {
+    None,
+    KdTree(KdTree),
+    BallTree(BallTree),
+}
+
+impl std::fmt::Debug for SpatialIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SpatialIndex::None => write!(f, "None"),
+            SpatialIndex::KdTree(t) => write!(f, "KdTree({t:?})"),
+            SpatialIndex::BallTree(t) => write!(f, "BallTree({t:?})"),
+        }
+    }
+}
+
 /// Find the k nearest neighbors of a query point.
 ///
 /// Returns `(index, distance)` pairs sorted by distance.
@@ -87,32 +107,48 @@ fn find_neighbors<F: Float + Send + Sync + 'static>(
     data: &Array2<F>,
     query_row: &[F],
     k: usize,
-    kdtree: Option<&KdTree>,
+    index: &SpatialIndex,
 ) -> Vec<(usize, F)> {
-    match kdtree {
-        Some(tree) => {
-            // Use KD-Tree: convert query to f64.
+    match index {
+        SpatialIndex::KdTree(tree) => {
             let query_f64: Vec<f64> = query_row.iter().map(|v| v.to_f64().unwrap()).collect();
             let results = tree.query(data, &query_f64, k);
-            // Convert distances back to F.
             results
                 .into_iter()
                 .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
                 .collect()
         }
-        None => {
-            // Use brute force.
+        SpatialIndex::BallTree(tree) => {
+            let query_f64: Vec<f64> = query_row.iter().map(|v| v.to_f64().unwrap()).collect();
+            let results = tree.query(data, &query_f64, k);
+            results
+                .into_iter()
+                .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
+                .collect()
+        }
+        SpatialIndex::None => {
             kdtree::brute_force_knn(data, query_row, k)
         }
     }
 }
 
-/// Determine whether to use KD-Tree based on algorithm setting and dimensionality.
-fn should_use_kdtree(algorithm: Algorithm, n_features: usize) -> bool {
+/// Build the appropriate spatial index based on algorithm setting and dimensionality.
+fn build_spatial_index<F: Float + Send + Sync + 'static>(
+    algorithm: Algorithm,
+    data: &Array2<F>,
+) -> SpatialIndex {
+    let n_features = data.ncols();
     match algorithm {
-        Algorithm::Auto => n_features <= 20,
-        Algorithm::BruteForce => false,
-        Algorithm::KdTree => true,
+        Algorithm::Auto => {
+            if n_features <= 15 {
+                SpatialIndex::KdTree(KdTree::build(data))
+            } else {
+                SpatialIndex::BallTree(BallTree::build(data))
+            }
+        }
+        Algorithm::KdTree => SpatialIndex::KdTree(KdTree::build(data)),
+        Algorithm::BallTree => SpatialIndex::BallTree(BallTree::build(data)),
+        Algorithm::BruteForce => SpatialIndex::None,
     }
 }
 
@@ -214,8 +250,8 @@ pub struct FittedKNeighborsClassifier<F> {
     n_neighbors: usize,
     /// Weighting scheme.
     weights: Weights,
-    /// Optional KD-Tree spatial index.
-    kdtree: Option<KdTree>,
+    /// Spatial index (KD-Tree, Ball Tree, or None for brute force).
+    spatial_index: SpatialIndex,
     /// Sorted unique class labels.
     classes: Vec<usize>,
 }
@@ -239,7 +275,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedKNeighborsClassifier<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
+        let n_samples = x.nrows();
 
         if n_samples != y.len() {
             return Err(FerroError::ShapeMismatch {
@@ -272,19 +308,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
         classes.sort_unstable();
         classes.dedup();
 
-        // Build KD-Tree if appropriate.
-        let kdtree = if should_use_kdtree(self.algorithm, n_features) {
-            Some(KdTree::build(x))
-        } else {
-            None
-        };
+        // Build spatial index.
+        let spatial_index = build_spatial_index(self.algorithm, x);
 
         Ok(FittedKNeighborsClassifier {
             x_train: x.clone(),
             y_train: y.clone(),
             n_neighbors: self.n_neighbors,
             weights: self.weights,
-            kdtree,
+            spatial_index,
             classes,
         })
     }
@@ -324,7 +356,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
                 &self.x_train,
                 &query,
                 self.n_neighbors,
-                self.kdtree.as_ref(),
+                &self.spatial_index,
             );
 
             predictions[i] = self.weighted_vote(&neighbors);
@@ -518,8 +550,8 @@ pub struct FittedKNeighborsRegressor<F> {
     n_neighbors: usize,
     /// Weighting scheme.
     weights: Weights,
-    /// Optional KD-Tree spatial index.
-    kdtree: Option<KdTree>,
+    /// Spatial index (KD-Tree, Ball Tree, or None for brute force).
+    spatial_index: SpatialIndex,
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsRegressor<F> {
@@ -541,7 +573,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<FittedKNeighborsRegressor<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
+        let n_samples = x.nrows();
 
         if n_samples != y.len() {
             return Err(FerroError::ShapeMismatch {
@@ -569,19 +601,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
             });
         }
 
-        // Build KD-Tree if appropriate.
-        let kdtree = if should_use_kdtree(self.algorithm, n_features) {
-            Some(KdTree::build(x))
-        } else {
-            None
-        };
+        // Build spatial index.
+        let spatial_index = build_spatial_index(self.algorithm, x);
 
         Ok(FittedKNeighborsRegressor {
             x_train: x.clone(),
             y_train: y.clone(),
             n_neighbors: self.n_neighbors,
             weights: self.weights,
-            kdtree,
+            spatial_index,
         })
     }
 }
@@ -620,7 +648,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
                 &self.x_train,
                 &query,
                 self.n_neighbors,
-                self.kdtree.as_ref(),
+                &self.spatial_index,
             );
 
             predictions[i] = self.weighted_mean(&neighbors);
@@ -1030,8 +1058,8 @@ mod tests {
             .with_algorithm(Algorithm::Auto);
         let fitted = clf.fit(&x, &y).unwrap();
 
-        // Should have no KD-Tree.
-        assert!(fitted.kdtree.is_none());
+        // With d > 20 and Auto, should use BallTree (not brute force).
+        assert!(matches!(fitted.spatial_index, SpatialIndex::BallTree(_)));
 
         let preds = fitted.predict(&x).unwrap();
         assert_eq!(preds.len(), n_samples);
