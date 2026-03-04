@@ -1,0 +1,5 @@
+error[E0599]: no method named `predict` found for struct `StandardScaler<F>` in the current scope
+  --> tests/ui/transform_unfitted_scaler.rs:19:20
+   |
+19 |     let _ = scaler.predict(&x);
+   |                    ^^^^^^^ method not found in `StandardScaler<f64>`

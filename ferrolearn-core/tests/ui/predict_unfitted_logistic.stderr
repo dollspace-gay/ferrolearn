@@ -1,0 +1,5 @@
+error[E0599]: no method named `predict` found for struct `LogisticRegression<F>` in the current scope
+  --> tests/ui/predict_unfitted_logistic.rs:11:19
+   |
+11 |     let _ = model.predict(&x);
+   |                   ^^^^^^^ method not found in `LogisticRegression<f64>`
