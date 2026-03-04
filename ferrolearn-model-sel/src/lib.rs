@@ -11,6 +11,8 @@
 //! - [`cross_val_score`] — evaluate a pipeline using cross-validation.
 //! - [`GridSearchCV`] — exhaustive hyperparameter search over a parameter grid.
 //! - [`RandomizedSearchCV`] — randomized hyperparameter search over distributions.
+//! - [`TimeSeriesSplit`] — time-series aware cross-validation splitter.
+//! - [`HalvingGridSearchCV`] — successive-halving hyperparameter search.
 //! - [`param_grid!`] — macro for building Cartesian-product parameter grids.
 //! - [`ParamValue`] / [`ParamSet`] — hyperparameter value and set types.
 //! - [`distributions`] — sampling distributions for [`RandomizedSearchCV`].
@@ -37,12 +39,16 @@
 pub mod cross_validation;
 pub mod distributions;
 pub mod grid_search;
+pub mod halving_grid_search;
 pub mod param_grid;
 pub mod random_search;
 pub mod split;
+pub mod time_series_split;
 
 pub use cross_validation::{CrossValidator, KFold, StratifiedKFold, cross_val_score};
 pub use grid_search::{CvResults, GridSearchCV};
+pub use halving_grid_search::HalvingGridSearchCV;
 pub use param_grid::{ParamSet, ParamValue};
 pub use random_search::RandomizedSearchCV;
 pub use split::train_test_split;
+pub use time_series_split::TimeSeriesSplit;

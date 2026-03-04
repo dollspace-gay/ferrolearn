@@ -592,6 +592,237 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// make_swiss_roll
+// ---------------------------------------------------------------------------
+
+/// Generate a 3D Swiss roll manifold dataset.
+///
+/// The Swiss roll is a classic manifold learning dataset: a 2D surface (a
+/// rolled-up rectangle) embedded in 3D space. Each sample is parameterised by
+/// angle `t ∈ [1.5π, 4.5π]` and a height coordinate.
+///
+/// # Parameters
+///
+/// - `n_samples` — number of samples to generate (must be ≥ 1).
+/// - `noise` — standard deviation of Gaussian noise added to each coordinate
+///   (must be ≥ 0).
+/// - `random_state` — optional RNG seed for reproducibility.
+///
+/// # Returns
+///
+/// `(X, t)` where:
+/// - `X` has shape `(n_samples, 3)` with columns `(x, y, z)`.
+/// - `t` is an [`Array1<F>`] of length `n_samples` containing the angle
+///   parameter (the intrinsic coordinate along the roll).
+///
+/// # Errors
+///
+/// - [`FerroError::InvalidParameter`] if `n_samples == 0` or `noise < 0`.
+///
+/// # Examples
+///
+/// ```rust
+/// use ferrolearn_datasets::make_swiss_roll;
+///
+/// let (x, t) = make_swiss_roll::<f64>(200, 0.0, Some(42)).unwrap();
+/// assert_eq!(x.shape(), &[200, 3]);
+/// assert_eq!(t.len(), 200);
+/// ```
+pub fn make_swiss_roll<F>(
+    n_samples: usize,
+    noise: F,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array1<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    if n_samples == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_samples".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    let noise_f64 = noise.to_f64().unwrap_or(0.0);
+    if noise_f64 < 0.0 {
+        return Err(FerroError::InvalidParameter {
+            name: "noise".into(),
+            reason: "must be non-negative".into(),
+        });
+    }
+
+    let mut rng = make_rng(random_state);
+
+    // t ∈ [1.5π, 4.5π]
+    let t_dist = Uniform::new(1.5 * PI, 4.5 * PI).map_err(|e| FerroError::InvalidParameter {
+        name: "t_distribution".into(),
+        reason: e.to_string(),
+    })?;
+    // height ∈ [0, 21)
+    let height_dist = Uniform::new(0.0_f64, 21.0).map_err(|e| FerroError::InvalidParameter {
+        name: "height_distribution".into(),
+        reason: e.to_string(),
+    })?;
+
+    let noise_dist = if noise_f64 > 0.0 {
+        Some(
+            Normal::new(0.0_f64, noise_f64).map_err(|e| FerroError::InvalidParameter {
+                name: "noise_distribution".into(),
+                reason: e.to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut x_data: Vec<F> = Vec::with_capacity(n_samples * 3);
+    let mut t_data: Vec<F> = Vec::with_capacity(n_samples);
+
+    for _ in 0..n_samples {
+        let t_val = t_dist.sample(&mut rng);
+        let height = height_dist.sample(&mut rng);
+
+        let mut px = t_val * t_val.cos();
+        let mut py = height;
+        let mut pz = t_val * t_val.sin();
+
+        if let Some(ref nd) = noise_dist {
+            px += nd.sample(&mut rng);
+            py += nd.sample(&mut rng);
+            pz += nd.sample(&mut rng);
+        }
+
+        x_data.push(F::from(px).unwrap_or(F::zero()));
+        x_data.push(F::from(py).unwrap_or(F::zero()));
+        x_data.push(F::from(pz).unwrap_or(F::zero()));
+        t_data.push(F::from(t_val).unwrap_or(F::zero()));
+    }
+
+    let x = Array2::from_shape_vec((n_samples, 3), x_data).map_err(|e| FerroError::SerdeError {
+        message: format!("make_swiss_roll reshape failed: {e}"),
+    })?;
+    let t = Array1::from_vec(t_data);
+
+    Ok((x, t))
+}
+
+// ---------------------------------------------------------------------------
+// make_s_curve
+// ---------------------------------------------------------------------------
+
+/// Generate a 3D S-curve manifold dataset.
+///
+/// The S-curve is a 2D surface embedded in 3D space: two half-cylinders joined
+/// at the edges to form an "S" shape. It is commonly used to benchmark
+/// manifold-learning algorithms.
+///
+/// Each sample is parameterised by `t ∈ [-3π/2, 3π/2]` (the intrinsic
+/// coordinate) and a height coordinate.
+///
+/// # Parameters
+///
+/// - `n_samples` — number of samples to generate (must be ≥ 1).
+/// - `noise` — standard deviation of Gaussian noise added to each coordinate
+///   (must be ≥ 0).
+/// - `random_state` — optional RNG seed for reproducibility.
+///
+/// # Returns
+///
+/// `(X, t)` where:
+/// - `X` has shape `(n_samples, 3)` with columns `(x, y, z)`.
+/// - `t` is an [`Array1<F>`] of length `n_samples` containing the parameter `t`.
+///
+/// # Errors
+///
+/// - [`FerroError::InvalidParameter`] if `n_samples == 0` or `noise < 0`.
+///
+/// # Examples
+///
+/// ```rust
+/// use ferrolearn_datasets::make_s_curve;
+///
+/// let (x, t) = make_s_curve::<f64>(200, 0.0, Some(42)).unwrap();
+/// assert_eq!(x.shape(), &[200, 3]);
+/// assert_eq!(t.len(), 200);
+/// ```
+pub fn make_s_curve<F>(
+    n_samples: usize,
+    noise: F,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array1<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    if n_samples == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_samples".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    let noise_f64 = noise.to_f64().unwrap_or(0.0);
+    if noise_f64 < 0.0 {
+        return Err(FerroError::InvalidParameter {
+            name: "noise".into(),
+            reason: "must be non-negative".into(),
+        });
+    }
+
+    let mut rng = make_rng(random_state);
+
+    // t ∈ [-3π/2, 3π/2]
+    let t_dist = Uniform::new(-1.5 * PI, 1.5 * PI).map_err(|e| FerroError::InvalidParameter {
+        name: "t_distribution".into(),
+        reason: e.to_string(),
+    })?;
+    // height ∈ [0, 2)
+    let height_dist = Uniform::new(0.0_f64, 2.0).map_err(|e| FerroError::InvalidParameter {
+        name: "height_distribution".into(),
+        reason: e.to_string(),
+    })?;
+
+    let noise_dist = if noise_f64 > 0.0 {
+        Some(
+            Normal::new(0.0_f64, noise_f64).map_err(|e| FerroError::InvalidParameter {
+                name: "noise_distribution".into(),
+                reason: e.to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let mut x_data: Vec<F> = Vec::with_capacity(n_samples * 3);
+    let mut t_data: Vec<F> = Vec::with_capacity(n_samples);
+
+    for _ in 0..n_samples {
+        let t_val = t_dist.sample(&mut rng);
+        let height = height_dist.sample(&mut rng);
+
+        // S-curve: x = sin(t), y = height, z = sign(t) * (cos(t) - 1)
+        let mut px = t_val.sin();
+        let mut py = height;
+        let mut pz = t_val.signum() * (t_val.cos() - 1.0);
+
+        if let Some(ref nd) = noise_dist {
+            px += nd.sample(&mut rng);
+            py += nd.sample(&mut rng);
+            pz += nd.sample(&mut rng);
+        }
+
+        x_data.push(F::from(px).unwrap_or(F::zero()));
+        x_data.push(F::from(py).unwrap_or(F::zero()));
+        x_data.push(F::from(pz).unwrap_or(F::zero()));
+        t_data.push(F::from(t_val).unwrap_or(F::zero()));
+    }
+
+    let x = Array2::from_shape_vec((n_samples, 3), x_data).map_err(|e| FerroError::SerdeError {
+        message: format!("make_s_curve reshape failed: {e}"),
+    })?;
+    let t = Array1::from_vec(t_data);
+
+    Ok((x, t))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -869,5 +1100,188 @@ mod tests {
     #[test]
     fn test_make_circles_invalid_factor_one() {
         assert!(make_circles::<f64>(100, 0.0, 1.0, None).is_err());
+    }
+
+    // --- make_swiss_roll ---
+
+    #[test]
+    fn test_make_swiss_roll_shape() {
+        let (x, t) = make_swiss_roll::<f64>(200, 0.0, Some(42)).unwrap();
+        assert_eq!(x.shape(), &[200, 3]);
+        assert_eq!(t.len(), 200);
+    }
+
+    #[test]
+    fn test_make_swiss_roll_f32() {
+        let (x, t) = make_swiss_roll::<f32>(50, 0.0, Some(1)).unwrap();
+        assert_eq!(x.shape(), &[50, 3]);
+        assert_eq!(t.len(), 50);
+    }
+
+    #[test]
+    fn test_make_swiss_roll_reproducible() {
+        let (x1, t1) = make_swiss_roll::<f64>(100, 0.5, Some(7)).unwrap();
+        let (x2, t2) = make_swiss_roll::<f64>(100, 0.5, Some(7)).unwrap();
+        assert_eq!(x1, x2);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_make_swiss_roll_different_seeds() {
+        let (x1, _) = make_swiss_roll::<f64>(100, 0.0, Some(1)).unwrap();
+        let (x2, _) = make_swiss_roll::<f64>(100, 0.0, Some(999)).unwrap();
+        assert_ne!(x1, x2, "different seeds should give different data");
+    }
+
+    #[test]
+    fn test_make_swiss_roll_t_range() {
+        // t should be in [1.5π, 4.5π]
+        let (_, t) = make_swiss_roll::<f64>(300, 0.0, Some(0)).unwrap();
+        let low = 1.5 * PI;
+        let high = 4.5 * PI;
+        for &ti in t.iter() {
+            assert!(ti >= low && ti <= high, "t={ti} outside [{low}, {high}]");
+        }
+    }
+
+    #[test]
+    fn test_make_swiss_roll_no_noise_on_manifold() {
+        // Without noise, x = t*cos(t), z = t*sin(t), so
+        // sqrt(x^2 + z^2) = |t| and y ∈ [0, 21).
+        let (x, t) = make_swiss_roll::<f64>(100, 0.0, Some(0)).unwrap();
+        for i in 0..x.nrows() {
+            let xi = x[[i, 0]];
+            let yi = x[[i, 1]];
+            let zi = x[[i, 2]];
+            let ti = t[i];
+            let expected_r = ti; // t is positive in [1.5π, 4.5π]
+            let actual_r = (xi * xi + zi * zi).sqrt();
+            assert!(
+                (actual_r - expected_r).abs() < 1e-10,
+                "point {i}: radius {actual_r} != t={expected_r}"
+            );
+            assert!(yi >= 0.0 && yi < 21.0, "point {i}: y={yi} outside [0,21)");
+        }
+    }
+
+    #[test]
+    fn test_make_swiss_roll_invalid_n_samples_zero() {
+        assert!(make_swiss_roll::<f64>(0, 0.0, None).is_err());
+    }
+
+    #[test]
+    fn test_make_swiss_roll_invalid_noise_negative() {
+        assert!(make_swiss_roll::<f64>(100, -1.0_f64, None).is_err());
+    }
+
+    #[test]
+    fn test_make_swiss_roll_with_noise() {
+        // With noise the manifold constraint is approximate; just check shapes.
+        let (x, t) = make_swiss_roll::<f64>(100, 0.5, Some(42)).unwrap();
+        assert_eq!(x.shape(), &[100, 3]);
+        assert_eq!(t.len(), 100);
+        // All values should be finite.
+        assert!(x.iter().all(|v| v.is_finite()));
+        assert!(t.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_make_swiss_roll_single_sample() {
+        let (x, t) = make_swiss_roll::<f64>(1, 0.0, Some(0)).unwrap();
+        assert_eq!(x.shape(), &[1, 3]);
+        assert_eq!(t.len(), 1);
+    }
+
+    // --- make_s_curve ---
+
+    #[test]
+    fn test_make_s_curve_shape() {
+        let (x, t) = make_s_curve::<f64>(200, 0.0, Some(42)).unwrap();
+        assert_eq!(x.shape(), &[200, 3]);
+        assert_eq!(t.len(), 200);
+    }
+
+    #[test]
+    fn test_make_s_curve_f32() {
+        let (x, t) = make_s_curve::<f32>(50, 0.0, Some(1)).unwrap();
+        assert_eq!(x.shape(), &[50, 3]);
+        assert_eq!(t.len(), 50);
+    }
+
+    #[test]
+    fn test_make_s_curve_reproducible() {
+        let (x1, t1) = make_s_curve::<f64>(100, 0.5, Some(7)).unwrap();
+        let (x2, t2) = make_s_curve::<f64>(100, 0.5, Some(7)).unwrap();
+        assert_eq!(x1, x2);
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn test_make_s_curve_different_seeds() {
+        let (x1, _) = make_s_curve::<f64>(100, 0.0, Some(1)).unwrap();
+        let (x2, _) = make_s_curve::<f64>(100, 0.0, Some(999)).unwrap();
+        assert_ne!(x1, x2, "different seeds should give different data");
+    }
+
+    #[test]
+    fn test_make_s_curve_t_range() {
+        // t should be in [-3π/2, 3π/2]
+        let (_, t) = make_s_curve::<f64>(300, 0.0, Some(0)).unwrap();
+        let low = -1.5 * PI;
+        let high = 1.5 * PI;
+        for &ti in t.iter() {
+            assert!(ti >= low && ti <= high, "t={ti} outside [{low}, {high}]");
+        }
+    }
+
+    #[test]
+    fn test_make_s_curve_no_noise_x_is_sin_t() {
+        // Without noise: x = sin(t)
+        let (x, t) = make_s_curve::<f64>(100, 0.0, Some(0)).unwrap();
+        for i in 0..x.nrows() {
+            let xi = x[[i, 0]];
+            let ti = t[i];
+            assert!(
+                (xi - ti.sin()).abs() < 1e-10,
+                "point {i}: x={xi} != sin(t)={} (t={ti})",
+                ti.sin()
+            );
+        }
+    }
+
+    #[test]
+    fn test_make_s_curve_no_noise_y_in_range() {
+        // Without noise: y ∈ [0, 2)
+        let (x, _) = make_s_curve::<f64>(200, 0.0, Some(0)).unwrap();
+        for i in 0..x.nrows() {
+            let yi = x[[i, 1]];
+            assert!(yi >= 0.0 && yi < 2.0, "point {i}: y={yi} outside [0,2)");
+        }
+    }
+
+    #[test]
+    fn test_make_s_curve_invalid_n_samples_zero() {
+        assert!(make_s_curve::<f64>(0, 0.0, None).is_err());
+    }
+
+    #[test]
+    fn test_make_s_curve_invalid_noise_negative() {
+        assert!(make_s_curve::<f64>(100, -0.5_f64, None).is_err());
+    }
+
+    #[test]
+    fn test_make_s_curve_with_noise() {
+        let (x, t) = make_s_curve::<f64>(100, 0.5, Some(42)).unwrap();
+        assert_eq!(x.shape(), &[100, 3]);
+        assert_eq!(t.len(), 100);
+        assert!(x.iter().all(|v| v.is_finite()));
+        assert!(t.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn test_make_s_curve_single_sample() {
+        let (x, t) = make_s_curve::<f64>(1, 0.0, Some(0)).unwrap();
+        assert_eq!(x.shape(), &[1, 3]);
+        assert_eq!(t.len(), 1);
     }
 }
