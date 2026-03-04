@@ -484,3 +484,299 @@ mod tests {
         assert_abs_diff_eq!(back[[1, 2]], 2.0);
     }
 }
+
+/// Kani proof harnesses for CsrMatrix structural invariants.
+///
+/// These proofs verify that after construction via `new()`, `from_coo()`, and
+/// `add()`, the underlying CSR representation satisfies all structural
+/// invariants:
+///
+/// - `indptr.len() == n_rows + 1`
+/// - `indptr` is monotonically non-decreasing
+/// - All column indices are less than `n_cols`
+/// - `indices.len() == data.len()`
+///
+/// All proofs use small symbolic bounds (at most 3 rows/cols) because sparse
+/// matrix verification is computationally expensive for Kani.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::coo::CooMatrix;
+
+    /// Maximum dimension for symbolic exploration.
+    const MAX_DIM: usize = 3;
+    /// Maximum number of non-zero entries for symbolic exploration.
+    const MAX_NNZ: usize = 4;
+
+    /// Helper: assert all CSR structural invariants on the inner `CsMat`.
+    fn assert_csr_invariants<T>(m: &CsrMatrix<T>) {
+        let inner = m.inner();
+
+        // Invariant 1: indptr length == n_rows + 1
+        let indptr = inner.indptr();
+        let indptr_raw = indptr.raw_storage();
+        assert!(indptr_raw.len() == m.n_rows() + 1);
+
+        // Invariant 2: indptr is monotonically non-decreasing
+        for i in 0..m.n_rows() {
+            assert!(indptr_raw[i] <= indptr_raw[i + 1]);
+        }
+
+        // Invariant 3: all column indices < n_cols
+        let indices = inner.indices();
+        for &col_idx in indices {
+            assert!(col_idx < m.n_cols());
+        }
+
+        // Invariant 4: indices.len() == data.len()
+        assert!(inner.indices().len() == inner.data().len());
+    }
+
+    /// Verify `indptr.len() == n_rows + 1` after `new()` with a symbolic
+    /// empty matrix of arbitrary dimensions.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_new_indptr_length() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Build a valid empty CSR matrix
+        let indptr = vec![0usize; n_rows + 1];
+        let indices: Vec<usize> = vec![];
+        let data: Vec<i32> = vec![];
+
+        if let Ok(m) = CsrMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            let inner_indptr = m.inner().indptr();
+            assert!(inner_indptr.raw_storage().len() == n_rows + 1);
+        }
+    }
+
+    /// Verify indptr monotonicity after `new()` with a symbolic single-entry
+    /// matrix.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_new_indptr_monotonic() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Place a single non-zero at a symbolic valid position
+        let row: usize = kani::any();
+        let col: usize = kani::any();
+        kani::assume(row < n_rows);
+        kani::assume(col < n_cols);
+
+        // Build indptr for a single entry at (row, col)
+        let mut indptr = vec![0usize; n_rows + 1];
+        for i in (row + 1)..=n_rows {
+            indptr[i] = 1;
+        }
+        let indices = vec![col];
+        let data = vec![42i32];
+
+        if let Ok(m) = CsrMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            let inner_indptr = m.inner().indptr().raw_storage().to_vec();
+            for i in 0..m.n_rows() {
+                assert!(inner_indptr[i] <= inner_indptr[i + 1]);
+            }
+        }
+    }
+
+    /// Verify all column indices < n_cols after `new()`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_new_column_indices_in_bounds() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let col: usize = kani::any();
+        let row: usize = kani::any();
+        kani::assume(row < n_rows);
+        kani::assume(col < n_cols);
+
+        let mut indptr = vec![0usize; n_rows + 1];
+        for i in (row + 1)..=n_rows {
+            indptr[i] = 1;
+        }
+        let indices = vec![col];
+        let data = vec![1i32];
+
+        if let Ok(m) = CsrMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            for &c in m.inner().indices() {
+                assert!(c < m.n_cols());
+            }
+        }
+    }
+
+    /// Verify `indices.len() == data.len()` after `new()`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_new_indices_data_same_length() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Try empty matrix
+        let indptr = vec![0usize; n_rows + 1];
+        let indices: Vec<usize> = vec![];
+        let data: Vec<i32> = vec![];
+
+        if let Ok(m) = CsrMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            assert!(m.inner().indices().len() == m.inner().data().len());
+        }
+    }
+
+    /// Verify that `new()` rejects inputs where indices and data have
+    /// mismatched lengths.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_new_rejects_mismatched_lengths() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // indices has 1 element, data has 0 — must fail
+        let indptr = vec![0usize; n_rows + 1];
+        let indices = vec![0usize];
+        let data: Vec<i32> = vec![];
+
+        let result = CsrMatrix::new(n_rows, n_cols, indptr, indices, data);
+        assert!(result.is_err());
+    }
+
+    /// Verify all structural invariants after `from_coo()` with symbolic
+    /// entries.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_from_coo_invariants() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let mut coo = CooMatrix::<i32>::new(n_rows, n_cols);
+
+        // Insert a symbolic number of entries (0 or 1)
+        let do_insert: bool = kani::any();
+        if do_insert {
+            let row: usize = kani::any();
+            let col: usize = kani::any();
+            kani::assume(row < n_rows);
+            kani::assume(col < n_cols);
+            let _ = coo.push(row, col, 1i32);
+        }
+
+        if let Ok(csr) = CsrMatrix::from_coo(&coo) {
+            assert_csr_invariants(&csr);
+            assert!(csr.n_rows() == n_rows);
+            assert!(csr.n_cols() == n_cols);
+        }
+    }
+
+    /// Verify that `add()` preserves shape and structural invariants.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_add_preserves_invariants() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Build two valid empty CSR matrices of the same shape
+        let indptr = vec![0usize; n_rows + 1];
+        let a = CsrMatrix::<i32>::new(n_rows, n_cols, indptr.clone(), vec![], vec![]);
+        let b = CsrMatrix::<i32>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let (Ok(a), Ok(b)) = (a, b) {
+            if let Ok(sum) = a.add(&b) {
+                // Shape is preserved
+                assert!(sum.n_rows() == n_rows);
+                assert!(sum.n_cols() == n_cols);
+                // Structural invariants hold
+                assert_csr_invariants(&sum);
+            }
+        }
+    }
+
+    /// Verify that `add()` with non-empty matrices preserves invariants.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_add_nonempty_preserves_invariants() {
+        // Fixed 2x2 matrices with one entry each in different positions
+        let a = CsrMatrix::<i32>::new(2, 2, vec![0, 1, 1], vec![0], vec![1]);
+        let b = CsrMatrix::<i32>::new(2, 2, vec![0, 0, 1], vec![1], vec![2]);
+
+        if let (Ok(a), Ok(b)) = (a, b) {
+            if let Ok(sum) = a.add(&b) {
+                assert!(sum.n_rows() == 2);
+                assert!(sum.n_cols() == 2);
+                assert_csr_invariants(&sum);
+            }
+        }
+    }
+
+    /// Verify `mul_vec()` output has correct dimension and does not panic.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_mul_vec_output_dimension() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Empty matrix for tractable verification
+        let indptr = vec![0usize; n_rows + 1];
+        let m = CsrMatrix::<f64>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let Ok(m) = m {
+            let v = Array1::<f64>::zeros(n_cols);
+            if let Ok(result) = m.mul_vec(&v) {
+                assert!(result.len() == n_rows);
+            }
+        }
+    }
+
+    /// Verify `mul_vec()` rejects vectors of wrong dimension.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_mul_vec_rejects_wrong_dimension() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let indptr = vec![0usize; n_rows + 1];
+        let m = CsrMatrix::<f64>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let Ok(m) = m {
+            let wrong_len: usize = kani::any();
+            kani::assume(wrong_len <= MAX_DIM);
+            kani::assume(wrong_len != n_cols);
+            let v = Array1::<f64>::zeros(wrong_len);
+            let result = m.mul_vec(&v);
+            assert!(result.is_err());
+        }
+    }
+
+    /// Verify `mul_vec()` with a non-empty matrix produces the correct
+    /// output dimension and does not trigger any out-of-bounds access.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csr_mul_vec_nonempty_no_oob() {
+        // 2x3 matrix with entries at (0,1) and (1,2)
+        let m = CsrMatrix::<f64>::new(2, 3, vec![0, 1, 2], vec![1, 2], vec![3.0, 4.0]);
+        if let Ok(m) = m {
+            let v = Array1::from(vec![1.0, 2.0, 3.0]);
+            if let Ok(result) = m.mul_vec(&v) {
+                assert!(result.len() == 2);
+            }
+        }
+    }
+}

@@ -402,3 +402,297 @@ mod tests {
         assert!(m.mul_vec(&v).is_err());
     }
 }
+
+/// Kani proof harnesses for CscMatrix structural invariants.
+///
+/// These proofs verify that after construction via `new()`, `from_coo()`, and
+/// `add()`, the underlying CSC representation satisfies all structural
+/// invariants:
+///
+/// - `indptr.len() == n_cols + 1`
+/// - `indptr` is monotonically non-decreasing
+/// - All row indices are less than `n_rows`
+/// - `indices.len() == data.len()`
+///
+/// All proofs use small symbolic bounds (at most 3 rows/cols) because sparse
+/// matrix verification is computationally expensive for Kani.
+#[cfg(kani)]
+mod kani_proofs {
+    use super::*;
+    use crate::coo::CooMatrix;
+
+    /// Maximum dimension for symbolic exploration.
+    const MAX_DIM: usize = 3;
+
+    /// Helper: assert all CSC structural invariants on the inner `CsMat`.
+    fn assert_csc_invariants<T>(m: &CscMatrix<T>) {
+        let inner = m.inner();
+
+        // Invariant 1: indptr length == n_cols + 1
+        let indptr = inner.indptr();
+        let indptr_raw = indptr.raw_storage();
+        assert!(indptr_raw.len() == m.n_cols() + 1);
+
+        // Invariant 2: indptr is monotonically non-decreasing
+        for i in 0..m.n_cols() {
+            assert!(indptr_raw[i] <= indptr_raw[i + 1]);
+        }
+
+        // Invariant 3: all row indices < n_rows
+        let indices = inner.indices();
+        for &row_idx in indices {
+            assert!(row_idx < m.n_rows());
+        }
+
+        // Invariant 4: indices.len() == data.len()
+        assert!(inner.indices().len() == inner.data().len());
+    }
+
+    /// Verify `indptr.len() == n_cols + 1` after `new()` with a symbolic
+    /// empty matrix of arbitrary dimensions.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_new_indptr_length() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Build a valid empty CSC matrix
+        let indptr = vec![0usize; n_cols + 1];
+        let indices: Vec<usize> = vec![];
+        let data: Vec<i32> = vec![];
+
+        if let Ok(m) = CscMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            let inner_indptr = m.inner().indptr();
+            assert!(inner_indptr.raw_storage().len() == n_cols + 1);
+        }
+    }
+
+    /// Verify indptr monotonicity after `new()` with a symbolic single-entry
+    /// matrix.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_new_indptr_monotonic() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Place a single non-zero at a symbolic valid position
+        let row: usize = kani::any();
+        let col: usize = kani::any();
+        kani::assume(row < n_rows);
+        kani::assume(col < n_cols);
+
+        // Build indptr for a single entry in column `col`
+        let mut indptr = vec![0usize; n_cols + 1];
+        for i in (col + 1)..=n_cols {
+            indptr[i] = 1;
+        }
+        let indices = vec![row];
+        let data = vec![42i32];
+
+        if let Ok(m) = CscMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            let inner_indptr = m.inner().indptr().raw_storage().to_vec();
+            for i in 0..m.n_cols() {
+                assert!(inner_indptr[i] <= inner_indptr[i + 1]);
+            }
+        }
+    }
+
+    /// Verify all row indices < n_rows after `new()`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_new_row_indices_in_bounds() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let row: usize = kani::any();
+        let col: usize = kani::any();
+        kani::assume(row < n_rows);
+        kani::assume(col < n_cols);
+
+        let mut indptr = vec![0usize; n_cols + 1];
+        for i in (col + 1)..=n_cols {
+            indptr[i] = 1;
+        }
+        let indices = vec![row];
+        let data = vec![1i32];
+
+        if let Ok(m) = CscMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            for &r in m.inner().indices() {
+                assert!(r < m.n_rows());
+            }
+        }
+    }
+
+    /// Verify `indices.len() == data.len()` after `new()`.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_new_indices_data_same_length() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let indptr = vec![0usize; n_cols + 1];
+        let indices: Vec<usize> = vec![];
+        let data: Vec<i32> = vec![];
+
+        if let Ok(m) = CscMatrix::new(n_rows, n_cols, indptr, indices, data) {
+            assert!(m.inner().indices().len() == m.inner().data().len());
+        }
+    }
+
+    /// Verify that `new()` rejects inputs where indices and data have
+    /// mismatched lengths.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_new_rejects_mismatched_lengths() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // indices has 1 element, data has 0 — must fail
+        let indptr = vec![0usize; n_cols + 1];
+        let indices = vec![0usize];
+        let data: Vec<i32> = vec![];
+
+        let result = CscMatrix::new(n_rows, n_cols, indptr, indices, data);
+        assert!(result.is_err());
+    }
+
+    /// Verify all structural invariants after `from_coo()` with symbolic
+    /// entries.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_from_coo_invariants() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let mut coo = CooMatrix::<i32>::new(n_rows, n_cols);
+
+        // Insert a symbolic number of entries (0 or 1)
+        let do_insert: bool = kani::any();
+        if do_insert {
+            let row: usize = kani::any();
+            let col: usize = kani::any();
+            kani::assume(row < n_rows);
+            kani::assume(col < n_cols);
+            let _ = coo.push(row, col, 1i32);
+        }
+
+        if let Ok(csc) = CscMatrix::from_coo(&coo) {
+            assert_csc_invariants(&csc);
+            assert!(csc.n_rows() == n_rows);
+            assert!(csc.n_cols() == n_cols);
+        }
+    }
+
+    /// Verify that `add()` preserves shape and structural invariants.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_add_preserves_invariants() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Build two valid empty CSC matrices of the same shape
+        let indptr = vec![0usize; n_cols + 1];
+        let a = CscMatrix::<i32>::new(n_rows, n_cols, indptr.clone(), vec![], vec![]);
+        let b = CscMatrix::<i32>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let (Ok(a), Ok(b)) = (a, b) {
+            if let Ok(sum) = a.add(&b) {
+                // Shape is preserved
+                assert!(sum.n_rows() == n_rows);
+                assert!(sum.n_cols() == n_cols);
+                // Structural invariants hold
+                assert_csc_invariants(&sum);
+            }
+        }
+    }
+
+    /// Verify that `add()` with non-empty matrices preserves invariants.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_add_nonempty_preserves_invariants() {
+        // Fixed 2x2 matrices with one entry each in different columns
+        let a = CscMatrix::<i32>::new(2, 2, vec![0, 1, 1], vec![0], vec![1]);
+        let b = CscMatrix::<i32>::new(2, 2, vec![0, 0, 1], vec![1], vec![2]);
+
+        if let (Ok(a), Ok(b)) = (a, b) {
+            if let Ok(sum) = a.add(&b) {
+                assert!(sum.n_rows() == 2);
+                assert!(sum.n_cols() == 2);
+                assert_csc_invariants(&sum);
+            }
+        }
+    }
+
+    /// Verify `mul_vec()` output has correct dimension and does not panic.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_mul_vec_output_dimension() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        // Empty matrix for tractable verification
+        let indptr = vec![0usize; n_cols + 1];
+        let m = CscMatrix::<f64>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let Ok(m) = m {
+            let v = Array1::<f64>::zeros(n_cols);
+            if let Ok(result) = m.mul_vec(&v) {
+                assert!(result.len() == n_rows);
+            }
+        }
+    }
+
+    /// Verify `mul_vec()` rejects vectors of wrong dimension.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_mul_vec_rejects_wrong_dimension() {
+        let n_rows: usize = kani::any();
+        let n_cols: usize = kani::any();
+        kani::assume(n_rows > 0 && n_rows <= MAX_DIM);
+        kani::assume(n_cols > 0 && n_cols <= MAX_DIM);
+
+        let indptr = vec![0usize; n_cols + 1];
+        let m = CscMatrix::<f64>::new(n_rows, n_cols, indptr, vec![], vec![]);
+
+        if let Ok(m) = m {
+            let wrong_len: usize = kani::any();
+            kani::assume(wrong_len <= MAX_DIM);
+            kani::assume(wrong_len != n_cols);
+            let v = Array1::<f64>::zeros(wrong_len);
+            let result = m.mul_vec(&v);
+            assert!(result.is_err());
+        }
+    }
+
+    /// Verify `mul_vec()` with a non-empty matrix produces the correct
+    /// output dimension and does not trigger any out-of-bounds access.
+    #[kani::proof]
+    #[kani::unwind(5)]
+    fn csc_mul_vec_nonempty_no_oob() {
+        // 2x3 CSC matrix with entries at (0,1) and (1,2)
+        // Column 0: empty, Column 1: row 0, Column 2: row 1
+        let m = CscMatrix::<f64>::new(2, 3, vec![0, 0, 1, 2], vec![0, 1], vec![3.0, 4.0]);
+        if let Ok(m) = m {
+            let v = Array1::from(vec![1.0, 2.0, 3.0]);
+            if let Ok(result) = m.mul_vec(&v) {
+                assert!(result.len() == 2);
+            }
+        }
+    }
+}
