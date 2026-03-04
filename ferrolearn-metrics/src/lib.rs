@@ -47,12 +47,16 @@
 //! ```
 
 pub mod classification;
+pub mod clustering;
 pub mod regression;
 
 // Flat re-exports for convenient access.
 pub use classification::{
     Average, accuracy_score, confusion_matrix, f1_score, log_loss, precision_score, recall_score,
     roc_auc_score,
+};
+pub use clustering::{
+    adjusted_mutual_info, adjusted_rand_score, davies_bouldin_score, silhouette_score,
 };
 pub use regression::{
     explained_variance_score, mean_absolute_error, mean_absolute_percentage_error,

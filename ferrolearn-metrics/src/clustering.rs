@@ -1,0 +1,968 @@
+//! Clustering evaluation metrics.
+//!
+//! This module provides standard clustering metrics used to evaluate the
+//! quality of unsupervised clustering results:
+//!
+//! - [`silhouette_score`] — mean silhouette coefficient across all samples
+//! - [`adjusted_rand_score`] — Adjusted Rand Index comparing two labelings
+//! - [`adjusted_mutual_info`] — Adjusted Mutual Information between two labelings
+//! - [`davies_bouldin_score`] — Davies-Bouldin index for cluster separation
+//!
+//! Noise points (label == -1, as used by DBSCAN) are excluded from all
+//! silhouette computations but are counted in contingency-based metrics.
+
+use ferrolearn_core::FerroError;
+use ndarray::{Array1, Array2};
+use num_traits::Float;
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Validate that two label arrays have the same length.
+fn check_labels_same_length(n_a: usize, n_b: usize, context: &str) -> Result<(), FerroError> {
+    if n_a != n_b {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_a],
+            actual: vec![n_b],
+            context: context.into(),
+        });
+    }
+    Ok(())
+}
+
+/// Validate that `x` (n_samples, n_features) and `labels` (n_samples,)
+/// have compatible lengths.
+fn check_x_labels_compat(
+    n_samples: usize,
+    n_labels: usize,
+    context: &str,
+) -> Result<(), FerroError> {
+    if n_samples != n_labels {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![n_labels],
+            context: context.into(),
+        });
+    }
+    Ok(())
+}
+
+/// Euclidean distance between two row views represented as slices.
+#[inline]
+fn euclidean_dist<F: Float>(a: &[F], b: &[F]) -> F {
+    a.iter()
+        .zip(b.iter())
+        .fold(F::zero(), |acc, (&ai, &bi)| {
+            let d = ai - bi;
+            acc + d * d
+        })
+        .sqrt()
+}
+
+/// Return a sorted, deduplicated list of non-noise cluster labels.
+fn unique_cluster_labels(labels: &Array1<isize>) -> Vec<isize> {
+    let mut v: Vec<isize> = labels.iter().copied().filter(|&l| l != -1).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// n choose 2.
+#[inline]
+fn n_choose_2(n: u64) -> u64 {
+    if n < 2 { 0 } else { n * (n - 1) / 2 }
+}
+
+// ---------------------------------------------------------------------------
+// silhouette_score
+// ---------------------------------------------------------------------------
+
+/// Compute the mean Silhouette Coefficient for all non-noise samples.
+///
+/// For each sample `i` belonging to cluster `C_i`:
+/// - `a(i)` = mean distance from `i` to all other samples in `C_i`
+/// - `b(i)` = mean distance from `i` to samples in the nearest other cluster
+/// - `s(i)` = `(b(i) - a(i)) / max(a(i), b(i))`
+///
+/// The score returned is the mean of `s(i)` over all non-noise samples.
+///
+/// Noise points (label == -1) are ignored entirely.
+///
+/// # Arguments
+///
+/// * `x`      — feature matrix of shape `(n_samples, n_features)`.
+/// * `labels` — cluster label for each sample. Use `-1` for noise.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != labels.len()`.
+/// Returns [`FerroError::InsufficientSamples`] if there are no samples or all
+/// samples are noise.
+/// Returns [`FerroError::InvalidParameter`] if there is only one cluster
+/// (after excluding noise).
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::silhouette_score;
+/// use ndarray::{array, Array2};
+///
+/// // Two well-separated clusters.
+/// let x = Array2::from_shape_vec((4, 2), vec![
+///     0.0_f64, 0.0,
+///     0.1, 0.1,
+///     10.0, 10.0,
+///     10.1, 10.1,
+/// ]).unwrap();
+/// let labels = array![0isize, 0, 1, 1];
+/// let score = silhouette_score(&x, &labels).unwrap();
+/// assert!(score > 0.9);
+/// ```
+pub fn silhouette_score<F>(x: &Array2<F>, labels: &Array1<isize>) -> Result<F, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    let n = x.nrows();
+    check_x_labels_compat(n, labels.len(), "silhouette_score: x rows vs labels")?;
+
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "silhouette_score".into(),
+        });
+    }
+
+    let cluster_labels = unique_cluster_labels(labels);
+    let n_clusters = cluster_labels.len();
+
+    if n_clusters < 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "labels".into(),
+            reason: format!(
+                "silhouette_score requires at least 2 clusters (excluding noise), found {n_clusters}"
+            ),
+        });
+    }
+
+    // Pre-compute cluster membership lists (indices of samples per cluster).
+    let cluster_indices: Vec<Vec<usize>> = cluster_labels
+        .iter()
+        .map(|&cl| {
+            labels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &l)| if l == cl { Some(i) } else { None })
+                .collect()
+        })
+        .collect();
+
+    // Map from cluster label to its position in `cluster_labels`.
+    let label_to_idx = |lbl: isize| -> Option<usize> {
+        cluster_labels
+            .partition_point(|&c| c < lbl)
+            .let_if(|&pos| pos < cluster_labels.len() && cluster_labels[pos] == lbl)
+    };
+
+    let mut sum_s = F::zero();
+    let mut count = 0usize;
+
+    for i in 0..n {
+        let li = labels[i];
+        if li == -1 {
+            continue; // skip noise
+        }
+
+        let ci_idx = match label_to_idx(li) {
+            Some(idx) => idx,
+            None => continue,
+        };
+
+        let ci_members = &cluster_indices[ci_idx];
+
+        // a(i): mean intra-cluster distance (exclude self)
+        let a_i = if ci_members.len() <= 1 {
+            F::zero()
+        } else {
+            let mut dist_sum = F::zero();
+            for &j in ci_members {
+                if j == i {
+                    continue;
+                }
+                dist_sum = dist_sum + row_euclidean_dist(x, i, j);
+            }
+            dist_sum / F::from(ci_members.len() - 1).unwrap()
+        };
+
+        // b(i): mean distance to the nearest other cluster
+        let mut b_i = F::infinity();
+        for (k, &cl_k) in cluster_labels.iter().enumerate() {
+            if cl_k == li {
+                continue; // same cluster
+            }
+            let other_members = &cluster_indices[k];
+            if other_members.is_empty() {
+                continue;
+            }
+            let mut dist_sum = F::zero();
+            for &j in other_members {
+                dist_sum = dist_sum + row_euclidean_dist(x, i, j);
+            }
+            let mean_dist = dist_sum / F::from(other_members.len()).unwrap();
+            if mean_dist < b_i {
+                b_i = mean_dist;
+            }
+        }
+
+        // s(i) = (b - a) / max(a, b)
+        let max_ab = if a_i > b_i { a_i } else { b_i };
+        let s_i = if max_ab == F::zero() {
+            F::zero()
+        } else {
+            (b_i - a_i) / max_ab
+        };
+
+        sum_s = sum_s + s_i;
+        count += 1;
+    }
+
+    if count == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "silhouette_score: all samples are noise (label == -1)".into(),
+        });
+    }
+
+    Ok(sum_s / F::from(count).unwrap())
+}
+
+/// Euclidean distance between row `i` and row `j` of a 2D array.
+fn row_euclidean_dist<F: Float>(x: &Array2<F>, i: usize, j: usize) -> F {
+    let n_features = x.ncols();
+    let mut sq_sum = F::zero();
+    for f in 0..n_features {
+        let d = x[[i, f]] - x[[j, f]];
+        sq_sum = sq_sum + d * d;
+    }
+    sq_sum.sqrt()
+}
+
+// Helper trait to make partition_point + check more ergonomic via closure.
+trait LetIf: Sized {
+    fn let_if(self, pred: impl FnOnce(&Self) -> bool) -> Option<Self>;
+}
+impl LetIf for usize {
+    fn let_if(self, pred: impl FnOnce(&Self) -> bool) -> Option<Self> {
+        if pred(&self) { Some(self) } else { None }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// adjusted_rand_score
+// ---------------------------------------------------------------------------
+
+/// Compute the Adjusted Rand Index (ARI) between two clusterings.
+///
+/// ARI measures the similarity between two label assignments, corrected for
+/// chance. A score of `1.0` means perfect agreement; `0.0` is the expected
+/// value for random labelings.
+///
+/// The combinatorial formula used is:
+///
+/// ```text
+/// ARI = (sum_ij C(n_ij, 2) - (sum_i C(a_i, 2) * sum_j C(b_j, 2)) / C(n, 2))
+///       / ((sum_i C(a_i, 2) + sum_j C(b_j, 2)) / 2
+///          - (sum_i C(a_i, 2) * sum_j C(b_j, 2)) / C(n, 2))
+/// ```
+///
+/// where `n_ij` is the contingency table entry, `a_i` is the row sum, and
+/// `b_j` is the column sum.
+///
+/// # Arguments
+///
+/// * `labels_true` — ground-truth cluster labels.
+/// * `labels_pred` — predicted cluster labels.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
+/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::adjusted_rand_score;
+/// use ndarray::array;
+///
+/// let labels = array![0isize, 0, 1, 1, 2, 2];
+/// let ari = adjusted_rand_score(&labels, &labels).unwrap();
+/// assert!((ari - 1.0).abs() < 1e-10);
+/// ```
+pub fn adjusted_rand_score(
+    labels_true: &Array1<isize>,
+    labels_pred: &Array1<isize>,
+) -> Result<f64, FerroError> {
+    let n = labels_true.len();
+    check_labels_same_length(n, labels_pred.len(), "adjusted_rand_score")?;
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "adjusted_rand_score".into(),
+        });
+    }
+
+    // Collect unique sorted labels for each.
+    let mut classes_true: Vec<isize> = labels_true.iter().copied().collect();
+    classes_true.sort_unstable();
+    classes_true.dedup();
+
+    let mut classes_pred: Vec<isize> = labels_pred.iter().copied().collect();
+    classes_pred.sort_unstable();
+    classes_pred.dedup();
+
+    let r = classes_true.len();
+    let s = classes_pred.len();
+
+    // Build contingency table.
+    let mut contingency = vec![vec![0u64; s]; r];
+    for (&lt, &lp) in labels_true.iter().zip(labels_pred.iter()) {
+        let ri = classes_true.partition_point(|&c| c < lt);
+        let ci = classes_pred.partition_point(|&c| c < lp);
+        contingency[ri][ci] += 1;
+    }
+
+    // Row sums a_i and column sums b_j.
+    let a: Vec<u64> = contingency.iter().map(|row| row.iter().sum()).collect();
+    let b: Vec<u64> = (0..s)
+        .map(|j| contingency.iter().map(|row| row[j]).sum())
+        .collect();
+
+    let n_u64 = n as u64;
+    let sum_comb_c: u64 = contingency
+        .iter()
+        .flat_map(|row| row.iter())
+        .map(|&v| n_choose_2(v))
+        .sum();
+    let sum_comb_a: u64 = a.iter().map(|&ai| n_choose_2(ai)).sum();
+    let sum_comb_b: u64 = b.iter().map(|&bj| n_choose_2(bj)).sum();
+    let comb_n = n_choose_2(n_u64);
+
+    if comb_n == 0 {
+        // Only one sample — convention: ARI = 1 if labels agree, else 0.
+        return Ok(if labels_true[0] == labels_pred[0] {
+            1.0
+        } else {
+            0.0
+        });
+    }
+
+    let prod_ab = sum_comb_a as f64 * sum_comb_b as f64;
+    let expected = prod_ab / comb_n as f64;
+    let max_val = (sum_comb_a as f64 + sum_comb_b as f64) / 2.0;
+    let numerator = sum_comb_c as f64 - expected;
+    let denominator = max_val - expected;
+
+    if denominator == 0.0 {
+        // Degenerate case: all samples in one cluster or all in separate clusters.
+        return Ok(if numerator == 0.0 { 1.0 } else { 0.0 });
+    }
+
+    Ok(numerator / denominator)
+}
+
+// ---------------------------------------------------------------------------
+// adjusted_mutual_info
+// ---------------------------------------------------------------------------
+
+/// Compute the Adjusted Mutual Information (AMI) between two clusterings.
+///
+/// AMI corrects the Mutual Information (MI) for chance. A score of `1.0`
+/// indicates perfect agreement; `0.0` is the expected value for random
+/// labelings.
+///
+/// The formula used is:
+///
+/// ```text
+/// MI = sum_{i,j} p_{ij} * log(p_{ij} / (p_i * p_j))
+/// AMI = (MI - E[MI]) / (max(H_true, H_pred) - E[MI])
+/// ```
+///
+/// where `E[MI]` is the expected MI under random permutations (computed using
+/// the exact formula from Vinh et al., 2010).
+///
+/// # Arguments
+///
+/// * `labels_true` — ground-truth cluster labels.
+/// * `labels_pred` — predicted cluster labels.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
+/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::adjusted_mutual_info;
+/// use ndarray::array;
+///
+/// let labels = array![0isize, 0, 1, 1, 2, 2];
+/// let ami = adjusted_mutual_info(&labels, &labels).unwrap();
+/// assert!((ami - 1.0).abs() < 1e-10);
+/// ```
+pub fn adjusted_mutual_info(
+    labels_true: &Array1<isize>,
+    labels_pred: &Array1<isize>,
+) -> Result<f64, FerroError> {
+    let n = labels_true.len();
+    check_labels_same_length(n, labels_pred.len(), "adjusted_mutual_info")?;
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "adjusted_mutual_info".into(),
+        });
+    }
+
+    let n_f = n as f64;
+
+    // Unique sorted labels.
+    let mut classes_true: Vec<isize> = labels_true.iter().copied().collect();
+    classes_true.sort_unstable();
+    classes_true.dedup();
+
+    let mut classes_pred: Vec<isize> = labels_pred.iter().copied().collect();
+    classes_pred.sort_unstable();
+    classes_pred.dedup();
+
+    let r = classes_true.len();
+    let s = classes_pred.len();
+
+    // Contingency table.
+    let mut contingency = vec![vec![0u64; s]; r];
+    for (&lt, &lp) in labels_true.iter().zip(labels_pred.iter()) {
+        let ri = classes_true.partition_point(|&c| c < lt);
+        let ci = classes_pred.partition_point(|&c| c < lp);
+        contingency[ri][ci] += 1;
+    }
+
+    let a: Vec<u64> = contingency.iter().map(|row| row.iter().sum()).collect();
+    let b: Vec<u64> = (0..s)
+        .map(|j| contingency.iter().map(|row| row[j]).sum())
+        .collect();
+
+    // Mutual Information.
+    let mut mi = 0.0_f64;
+    for i in 0..r {
+        for j in 0..s {
+            let n_ij = contingency[i][j] as f64;
+            if n_ij == 0.0 {
+                continue;
+            }
+            let ai = a[i] as f64;
+            let bj = b[j] as f64;
+            mi += n_ij / n_f * (n_ij * n_f / (ai * bj)).ln();
+        }
+    }
+
+    // Entropies H(U) and H(V).
+    let h_true = entropy_from_counts(&a, n_f);
+    let h_pred = entropy_from_counts(&b, n_f);
+
+    // Expected MI (exact formula from Vinh et al., 2010).
+    let e_mi = expected_mutual_info(&a, &b, n as u64);
+
+    let denominator = f64::max(h_true, h_pred) - e_mi;
+
+    if denominator.abs() < f64::EPSILON {
+        return Ok(1.0);
+    }
+
+    Ok((mi - e_mi) / denominator)
+}
+
+/// Shannon entropy from raw counts.
+fn entropy_from_counts(counts: &[u64], n: f64) -> f64 {
+    counts.iter().fold(0.0, |acc, &c| {
+        if c == 0 {
+            acc
+        } else {
+            let p = c as f64 / n;
+            acc - p * p.ln()
+        }
+    })
+}
+
+/// Expected Mutual Information under random permutations.
+///
+/// Uses the exact combinatorial formula:
+/// E[MI] = sum_{i,j} sum_{n_ij} p(n_ij) * (n_ij/n) * log((n * n_ij) / (a_i * b_j))
+///
+/// where the sum over n_ij runs from max(1, a_i + b_j - n) to min(a_i, b_j).
+fn expected_mutual_info(a: &[u64], b: &[u64], n: u64) -> f64 {
+    let n_f = n as f64;
+    let mut e_mi = 0.0_f64;
+
+    // Precompute log factorials for n up to n.
+    let log_fact = precompute_log_factorials(n as usize);
+
+    for &ai in a {
+        for &bj in b {
+            let lo = ai.saturating_add(bj).saturating_sub(n).max(1);
+            let hi = ai.min(bj);
+            if lo > hi {
+                continue;
+            }
+            for nij in lo..=hi {
+                let nij_f = nij as f64;
+                let ai_f = ai as f64;
+                let bj_f = bj as f64;
+
+                // log hypergeometric probability:
+                // log P(n_ij) = log C(a_i, n_ij) + log C(b_j, n - a_i) - log C(n, b_j)
+                //             + correction for n_ij being the actual value in numerator
+
+                // log (n_ij / n) * log(n * n_ij / (a_i * b_j)) term
+                // Full formula (as in sklearn):
+                // term = nij/n * log(n*nij/(ai*bj))
+                //        * C(ai, nij) * C(n-ai, bj-nij) / C(n, bj)
+                // log hypergeometric probability using log-factorial table.
+                // P(n_ij) = C(a_i, n_ij) * C(n - a_i, b_j - n_ij) / C(n, b_j)
+                // The term (n - ai - bj + nij) must be non-negative by
+                // construction (nij >= max(1, ai+bj-n)), so saturating sub is safe.
+                let rem = n.saturating_sub(ai).saturating_sub(bj).saturating_add(nij);
+                let log_num = log_fact[ai as usize]
+                    + log_fact[(n - ai) as usize]
+                    + log_fact[bj as usize]
+                    + log_fact[(n - bj) as usize];
+                let log_den = log_fact[nij as usize]
+                    + log_fact[(ai - nij) as usize]
+                    + log_fact[(bj - nij) as usize]
+                    + log_fact[rem as usize]
+                    + log_fact[n as usize];
+                let log_p = log_num - log_den;
+                let p = log_p.exp();
+
+                let mi_term = nij_f / n_f * (n_f * nij_f / (ai_f * bj_f)).ln();
+                e_mi += mi_term * p;
+            }
+        }
+    }
+
+    e_mi
+}
+
+/// Precompute log(k!) for k = 0..=n.
+fn precompute_log_factorials(n: usize) -> Vec<f64> {
+    let mut lf = vec![0.0_f64; n + 1];
+    for k in 1..=n {
+        lf[k] = lf[k - 1] + (k as f64).ln();
+    }
+    lf
+}
+
+// ---------------------------------------------------------------------------
+// davies_bouldin_score
+// ---------------------------------------------------------------------------
+
+/// Compute the Davies-Bouldin Index for a clustering.
+///
+/// The Davies-Bouldin Index measures clustering quality based on the ratio of
+/// within-cluster scatter to between-cluster separation. Lower values indicate
+/// better clustering.
+///
+/// For each cluster `i`, let `s_i` be the mean distance from cluster members
+/// to their centroid. For each pair of clusters `(i, j)`, define:
+///
+/// ```text
+/// R_ij = (s_i + s_j) / d(c_i, c_j)
+/// ```
+///
+/// where `d(c_i, c_j)` is the Euclidean distance between centroids. Then:
+///
+/// ```text
+/// DB = (1/k) * sum_i max_{j != i} R_ij
+/// ```
+///
+/// Noise points (label == -1) are excluded.
+///
+/// # Arguments
+///
+/// * `x`      — feature matrix of shape `(n_samples, n_features)`.
+/// * `labels` — cluster label for each sample. Use `-1` for noise.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != labels.len()`.
+/// Returns [`FerroError::InsufficientSamples`] if there are no samples or all
+/// samples are noise.
+/// Returns [`FerroError::InvalidParameter`] if fewer than 2 clusters are found.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::davies_bouldin_score;
+/// use ndarray::{array, Array2};
+///
+/// let x = Array2::from_shape_vec((4, 2), vec![
+///     0.0_f64, 0.0,
+///     0.1, 0.1,
+///     10.0, 10.0,
+///     10.1, 10.1,
+/// ]).unwrap();
+/// let labels = array![0isize, 0, 1, 1];
+/// let score = davies_bouldin_score(&x, &labels).unwrap();
+/// assert!(score < 0.05);
+/// ```
+pub fn davies_bouldin_score<F>(x: &Array2<F>, labels: &Array1<isize>) -> Result<F, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    let n = x.nrows();
+    check_x_labels_compat(n, labels.len(), "davies_bouldin_score: x rows vs labels")?;
+
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "davies_bouldin_score".into(),
+        });
+    }
+
+    let cluster_labels = unique_cluster_labels(labels);
+    let n_clusters = cluster_labels.len();
+
+    if n_clusters < 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "labels".into(),
+            reason: format!(
+                "davies_bouldin_score requires at least 2 clusters (excluding noise), found {n_clusters}"
+            ),
+        });
+    }
+
+    let n_features = x.ncols();
+
+    // Compute centroids for each cluster.
+    let cluster_indices: Vec<Vec<usize>> = cluster_labels
+        .iter()
+        .map(|&cl| {
+            labels
+                .iter()
+                .enumerate()
+                .filter_map(|(i, &l)| if l == cl { Some(i) } else { None })
+                .collect()
+        })
+        .collect();
+
+    // Centroids: average position.
+    let centroids: Vec<Vec<F>> = cluster_indices
+        .iter()
+        .map(|members| {
+            let mut centroid = vec![F::zero(); n_features];
+            for &i in members {
+                for f in 0..n_features {
+                    centroid[f] = centroid[f] + x[[i, f]];
+                }
+            }
+            let cnt = F::from(members.len()).unwrap();
+            centroid.iter_mut().for_each(|v| *v = *v / cnt);
+            centroid
+        })
+        .collect();
+
+    // s_i: mean distance from each member to its centroid.
+    let s: Vec<F> = cluster_indices
+        .iter()
+        .enumerate()
+        .map(|(k, members)| {
+            let c = &centroids[k];
+            let total: F = members.iter().fold(F::zero(), |acc, &i| {
+                acc + euclidean_dist(&c[..], &x.row(i).to_vec()[..])
+            });
+            if members.is_empty() {
+                F::zero()
+            } else {
+                total / F::from(members.len()).unwrap()
+            }
+        })
+        .collect();
+
+    // Pairwise centroid distances.
+    let mut db_sum = F::zero();
+    for i in 0..n_clusters {
+        let mut max_r = F::zero();
+        for j in 0..n_clusters {
+            if i == j {
+                continue;
+            }
+            let d_ij = euclidean_dist(&centroids[i][..], &centroids[j][..]);
+            if d_ij == F::zero() {
+                // Coincident centroids — R_ij is undefined; treat as infinity.
+                max_r = F::infinity();
+                break;
+            }
+            let r_ij = (s[i] + s[j]) / d_ij;
+            if r_ij > max_r {
+                max_r = r_ij;
+            }
+        }
+        db_sum = db_sum + max_r;
+    }
+
+    Ok(db_sum / F::from(n_clusters).unwrap())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use approx::assert_abs_diff_eq;
+    use ndarray::{Array2, array};
+
+    // -----------------------------------------------------------------------
+    // silhouette_score
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_silhouette_perfect_clustering() {
+        // Two clusters far apart — score should be very close to 1.0.
+        let x =
+            Array2::from_shape_vec((4, 2), vec![0.0_f64, 0.0, 0.1, 0.0, 100.0, 0.0, 100.1, 0.0])
+                .unwrap();
+        let labels = array![0isize, 0, 1, 1];
+        let score = silhouette_score(&x, &labels).unwrap();
+        assert!(score > 0.99, "expected near 1.0, got {score}");
+    }
+
+    #[test]
+    fn test_silhouette_identical_labels_returns_score() {
+        // Identical labels: well-separated clusters score close to 1.
+        let x =
+            Array2::from_shape_vec((6, 1), vec![0.0_f64, 0.5, 1.0, 100.0, 100.5, 101.0]).unwrap();
+        let labels = array![0isize, 0, 0, 1, 1, 1];
+        let score = silhouette_score(&x, &labels).unwrap();
+        assert!(score > 0.9, "expected > 0.9, got {score}");
+    }
+
+    #[test]
+    fn test_silhouette_noise_points_ignored() {
+        // Noise points (label -1) must be skipped.
+        let x = Array2::from_shape_vec((5, 1), vec![0.0_f64, 0.1, 50.0, 100.0, 100.1]).unwrap();
+        // point at index 2 is noise
+        let labels = array![0isize, 0, -1, 1, 1];
+        let score = silhouette_score(&x, &labels).unwrap();
+        assert!(score > 0.9, "expected > 0.9, got {score}");
+    }
+
+    #[test]
+    fn test_silhouette_all_noise_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![-1isize, -1, -1];
+        assert!(silhouette_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_silhouette_single_cluster_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![0isize, 0, 0];
+        assert!(silhouette_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_silhouette_shape_mismatch_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![0isize, 0];
+        assert!(silhouette_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_silhouette_overlapping_clusters_lower_score() {
+        // Clusters that overlap should yield a lower silhouette than well-separated ones.
+        let x_sep = Array2::from_shape_vec((4, 1), vec![0.0_f64, 0.1, 100.0, 100.1]).unwrap();
+        let x_ov = Array2::from_shape_vec((4, 1), vec![0.0_f64, 1.0, 0.5, 1.5]).unwrap();
+        let labels = array![0isize, 0, 1, 1];
+        let score_sep = silhouette_score(&x_sep, &labels).unwrap();
+        let score_ov = silhouette_score(&x_ov, &labels).unwrap();
+        assert!(
+            score_sep > score_ov,
+            "separated ({score_sep}) should beat overlapping ({score_ov})"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // adjusted_rand_score
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ari_identical_labels_is_one() {
+        let labels = array![0isize, 0, 1, 1, 2, 2];
+        assert_abs_diff_eq!(
+            adjusted_rand_score(&labels, &labels).unwrap(),
+            1.0,
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn test_ari_permuted_labels_is_one() {
+        // Relabeling clusters should not change ARI.
+        let lt = array![0isize, 0, 1, 1];
+        let lp = array![1isize, 1, 0, 0]; // same partition, different names
+        assert_abs_diff_eq!(adjusted_rand_score(&lt, &lp).unwrap(), 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_ari_all_in_one_cluster() {
+        // All samples in a single predicted cluster, true has two clusters.
+        let lt = array![0isize, 0, 1, 1];
+        let lp = array![0isize, 0, 0, 0];
+        let ari = adjusted_rand_score(&lt, &lp).unwrap();
+        // ARI should be <= 0 for this degenerate case.
+        assert!(ari <= 0.0, "expected <= 0, got {ari}");
+    }
+
+    #[test]
+    fn test_ari_shape_mismatch_returns_error() {
+        let lt = array![0isize, 0, 1];
+        let lp = array![0isize, 0];
+        assert!(adjusted_rand_score(&lt, &lp).is_err());
+    }
+
+    #[test]
+    fn test_ari_empty_returns_error() {
+        let lt = Array1::<isize>::from_vec(vec![]);
+        let lp = Array1::<isize>::from_vec(vec![]);
+        assert!(adjusted_rand_score(&lt, &lp).is_err());
+    }
+
+    #[test]
+    fn test_ari_opposite_labeling_near_zero() {
+        // Each sample in its own cluster vs all in one: near 0 or negative.
+        let lt = array![0isize, 1, 2, 3];
+        let lp = array![0isize, 0, 0, 0];
+        let ari = adjusted_rand_score(&lt, &lp).unwrap();
+        assert!(ari <= 0.1, "expected near 0 or negative, got {ari}");
+    }
+
+    // -----------------------------------------------------------------------
+    // adjusted_mutual_info
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ami_identical_labels_is_one() {
+        let labels = array![0isize, 0, 1, 1, 2, 2];
+        assert_abs_diff_eq!(
+            adjusted_mutual_info(&labels, &labels).unwrap(),
+            1.0,
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn test_ami_permuted_labels_is_one() {
+        let lt = array![0isize, 0, 1, 1];
+        let lp = array![1isize, 1, 0, 0];
+        assert_abs_diff_eq!(
+            adjusted_mutual_info(&lt, &lp).unwrap(),
+            1.0,
+            epsilon = 1e-10
+        );
+    }
+
+    #[test]
+    fn test_ami_shape_mismatch_returns_error() {
+        let lt = array![0isize, 0, 1];
+        let lp = array![0isize, 0];
+        assert!(adjusted_mutual_info(&lt, &lp).is_err());
+    }
+
+    #[test]
+    fn test_ami_empty_returns_error() {
+        let lt = Array1::<isize>::from_vec(vec![]);
+        let lp = Array1::<isize>::from_vec(vec![]);
+        assert!(adjusted_mutual_info(&lt, &lp).is_err());
+    }
+
+    #[test]
+    fn test_ami_all_same_predicted_label_near_zero() {
+        // Predicting all samples as one cluster has near-zero AMI.
+        let lt = array![0isize, 0, 1, 1, 2, 2];
+        let lp = array![0isize, 0, 0, 0, 0, 0];
+        let ami = adjusted_mutual_info(&lt, &lp).unwrap();
+        assert!(ami <= 0.1, "expected near 0, got {ami}");
+    }
+
+    // -----------------------------------------------------------------------
+    // davies_bouldin_score
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_db_well_separated_is_low() {
+        // Clusters far apart and compact → very low DB index.
+        let x =
+            Array2::from_shape_vec((4, 2), vec![0.0_f64, 0.0, 0.1, 0.0, 100.0, 0.0, 100.1, 0.0])
+                .unwrap();
+        let labels = array![0isize, 0, 1, 1];
+        let score = davies_bouldin_score(&x, &labels).unwrap();
+        assert!(score < 0.01, "expected very low DB, got {score}");
+    }
+
+    #[test]
+    fn test_db_shape_mismatch_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![0isize, 0];
+        assert!(davies_bouldin_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_db_single_cluster_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![0isize, 0, 0];
+        assert!(davies_bouldin_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_db_all_noise_returns_error() {
+        let x = Array2::from_shape_vec((3, 1), vec![0.0_f64, 1.0, 2.0]).unwrap();
+        let labels = array![-1isize, -1, -1];
+        assert!(davies_bouldin_score(&x, &labels).is_err());
+    }
+
+    #[test]
+    fn test_db_noise_points_ignored() {
+        // Noise label -1 should be ignored; result same as without noise point.
+        let x_no_noise = Array2::from_shape_vec((4, 1), vec![0.0_f64, 0.1, 100.0, 100.1]).unwrap();
+        let x_with_noise =
+            Array2::from_shape_vec((5, 1), vec![0.0_f64, 0.1, 50.0, 100.0, 100.1]).unwrap();
+        let labels_no_noise = array![0isize, 0, 1, 1];
+        let labels_with_noise = array![0isize, 0, -1, 1, 1];
+
+        let db_no = davies_bouldin_score(&x_no_noise, &labels_no_noise).unwrap();
+        let db_with = davies_bouldin_score(&x_with_noise, &labels_with_noise).unwrap();
+        assert_abs_diff_eq!(db_no, db_with, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_db_worse_clustering_has_higher_score() {
+        // A poor clustering (large scatter relative to separation) yields higher DB.
+        let x = Array2::from_shape_vec((6, 1), vec![0.0_f64, 5.0, 10.0, 15.0, 20.0, 25.0]).unwrap();
+        // Good: [0,5] vs [10..25]  — tight cluster 0, wider cluster 1
+        let labels_good = array![0isize, 0, 1, 1, 1, 1];
+        // Bad: alternating assignments
+        let labels_bad = array![0isize, 1, 0, 1, 0, 1];
+
+        let db_good = davies_bouldin_score(&x, &labels_good).unwrap();
+        let db_bad = davies_bouldin_score(&x, &labels_bad).unwrap();
+        assert!(
+            db_good < db_bad,
+            "good clustering ({db_good}) should have lower DB than bad ({db_bad})"
+        );
+    }
+}
