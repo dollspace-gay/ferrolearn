@@ -1,0 +1,11 @@
+[package]
+name = "ferrolearn"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A scikit-learn equivalent for Rust — re-export crate"
+
+[dependencies]
+ferrolearn-core.workspace = true

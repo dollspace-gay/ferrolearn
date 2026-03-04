@@ -1,0 +1,14 @@
+[package]
+name = "ferrolearn-sparse"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Sparse matrix support for ferrolearn"
+
+[dependencies]
+ferrolearn-core.workspace = true
+ndarray.workspace = true
+num-traits.workspace = true
+sprs.workspace = true

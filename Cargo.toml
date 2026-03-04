@@ -1,0 +1,51 @@
+[workspace]
+members = [
+    "ferrolearn",
+    "ferrolearn-core",
+    "ferrolearn-linear",
+    "ferrolearn-tree",
+    "ferrolearn-neighbors",
+    "ferrolearn-bayes",
+    "ferrolearn-cluster",
+    "ferrolearn-decomp",
+    "ferrolearn-preprocess",
+    "ferrolearn-metrics",
+    "ferrolearn-model-sel",
+    "ferrolearn-sparse",
+    "ferrolearn-datasets",
+    "ferrolearn-io",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ferrolearn/ferrolearn"
+
+[workspace.dependencies]
+ndarray = "0.17"
+faer = "0.24"
+sprs = "0.11"
+rayon = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+num-traits = "0.2"
+thiserror = "2.0"
+approx = "0.5"
+float-cmp = "0.10"
+rand = "0.9"
+
+# Internal crates
+ferrolearn-core = { path = "ferrolearn-core" }
+ferrolearn-linear = { path = "ferrolearn-linear" }
+ferrolearn-tree = { path = "ferrolearn-tree" }
+ferrolearn-neighbors = { path = "ferrolearn-neighbors" }
+ferrolearn-bayes = { path = "ferrolearn-bayes" }
+ferrolearn-cluster = { path = "ferrolearn-cluster" }
+ferrolearn-decomp = { path = "ferrolearn-decomp" }
+ferrolearn-preprocess = { path = "ferrolearn-preprocess" }
+ferrolearn-metrics = { path = "ferrolearn-metrics" }
+ferrolearn-model-sel = { path = "ferrolearn-model-sel" }
+ferrolearn-sparse = { path = "ferrolearn-sparse" }
+ferrolearn-datasets = { path = "ferrolearn-datasets" }
+ferrolearn-io = { path = "ferrolearn-io" }
