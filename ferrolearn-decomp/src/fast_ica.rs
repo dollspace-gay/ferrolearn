@@ -278,10 +278,7 @@ fn apply_nonlinearity<F: Float>(u: &Array1<F>, fun: NonLinearity) -> (Array1<F>,
 ///
 /// `x_white_w`: the projections `W_row @ X_white`, shape `(n_samples,)`.
 /// Returns `(mean_g_prime, g_vals)` where `g_vals` has shape `(n_samples,)`.
-fn ica_step_values<F: Float>(
-    projections: &Array1<F>,
-    fun: NonLinearity,
-) -> (F, Array1<F>) {
+fn ica_step_values<F: Float>(projections: &Array1<F>, fun: NonLinearity) -> (F, Array1<F>) {
     let (g_vals, gp_vals) = apply_nonlinearity(projections, fun);
     let n_f = F::from(projections.len()).unwrap();
     let mean_gp = gp_vals.iter().copied().fold(F::zero(), |a, b| a + b) / n_f;
@@ -293,14 +290,19 @@ fn gs_orthogonalise<F: Float>(w: &mut Array2<F>, col: usize) {
     let k = col;
     // w[k] -= sum_{j<k} (w[k] . w[j]) w[j]
     for j in 0..k {
-        let dot = (0..w.ncols()).map(|d| w[[k, d]] * w[[j, d]]).fold(F::zero(), |a, b| a + b);
+        let dot = (0..w.ncols())
+            .map(|d| w[[k, d]] * w[[j, d]])
+            .fold(F::zero(), |a, b| a + b);
         for d in 0..w.ncols() {
             let wd = w[[j, d]];
             w[[k, d]] = w[[k, d]] - dot * wd;
         }
     }
     // Normalise.
-    let norm = (0..w.ncols()).map(|d| w[[k, d]] * w[[k, d]]).fold(F::zero(), |a, b| a + b).sqrt();
+    let norm = (0..w.ncols())
+        .map(|d| w[[k, d]] * w[[k, d]])
+        .fold(F::zero(), |a, b| a + b)
+        .sqrt();
     if norm > F::from(1e-15).unwrap() {
         for d in 0..w.ncols() {
             w[[k, d]] = w[[k, d]] / norm;
@@ -309,13 +311,17 @@ fn gs_orthogonalise<F: Float>(w: &mut Array2<F>, col: usize) {
 }
 
 /// Symmetric orthogonalisation: W ← (W W^T)^{-1/2} W.
-fn sym_orthogonalise<F: Float + Send + Sync + 'static>(w: &mut Array2<F>) -> Result<(), FerroError> {
+fn sym_orthogonalise<F: Float + Send + Sync + 'static>(
+    w: &mut Array2<F>,
+) -> Result<(), FerroError> {
     let k = w.nrows();
     // Compute S = W W^T (k × k).
     let mut s = Array2::<F>::zeros((k, k));
     for i in 0..k {
         for j in 0..k {
-            let dot = (0..w.ncols()).map(|d| w[[i, d]] * w[[j, d]]).fold(F::zero(), |a, b| a + b);
+            let dot = (0..w.ncols())
+                .map(|d| w[[i, d]] * w[[j, d]])
+                .fold(F::zero(), |a, b| a + b);
             s[[i, j]] = dot;
         }
     }
@@ -344,7 +350,8 @@ fn sym_orthogonalise<F: Float + Send + Sync + 'static>(w: &mut Array2<F>) -> Res
         }
         for row in 0..k {
             for col in 0..w.ncols() {
-                w_new[[row, col]] = w_new[[row, col]] + scale * eigenvectors[[row, i]] * vi_t_w[col];
+                w_new[[row, col]] =
+                    w_new[[row, col]] + scale * eigenvectors[[row, i]] * vi_t_w[col];
             }
         }
     }
@@ -507,7 +514,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FastICA<F> {
         for i in 0..k {
             let idx = indices[i];
             let ev = eigenvalues[idx];
-            let scale = if ev > eps { F::one() / ev.sqrt() } else { F::zero() };
+            let scale = if ev > eps {
+                F::one() / ev.sqrt()
+            } else {
+                F::zero()
+            };
             for j in 0..n_features {
                 whitening[[i, j]] = eigenvectors[[j, idx]] * scale;
             }
@@ -567,7 +578,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FastICA<F> {
                     // Convergence: max |1 - |w_new[i] . w[i]||
                     let mut max_change = F::zero();
                     for i in 0..k {
-                        let dot: F = (0..k).map(|d| w_new[[i, d]] * w[[i, d]]).fold(F::zero(), |a, b| a + b);
+                        let dot: F = (0..k)
+                            .map(|d| w_new[[i, d]] * w[[i, d]])
+                            .fold(F::zero(), |a, b| a + b);
                         let change = (F::one() - dot.abs()).abs();
                         if change > max_change {
                             max_change = change;
@@ -599,19 +612,28 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FastICA<F> {
                         }
                         // Gram-Schmidt orthogonalisation.
                         for j in 0..i {
-                            let dot: F = (0..k).map(|d| w_new_row[d] * w[[j, d]]).fold(F::zero(), |a, b| a + b);
+                            let dot: F = (0..k)
+                                .map(|d| w_new_row[d] * w[[j, d]])
+                                .fold(F::zero(), |a, b| a + b);
                             for d in 0..k {
                                 let wd = w[[j, d]];
                                 w_new_row[d] = w_new_row[d] - dot * wd;
                             }
                         }
                         // Normalise.
-                        let norm = w_new_row.iter().copied().map(|v| v * v).fold(F::zero(), |a, b| a + b).sqrt();
+                        let norm = w_new_row
+                            .iter()
+                            .copied()
+                            .map(|v| v * v)
+                            .fold(F::zero(), |a, b| a + b)
+                            .sqrt();
                         if norm > F::from(1e-15).unwrap() {
                             w_new_row.mapv_inplace(|v| v / norm);
                         }
                         // Convergence: |1 - |w_new . w_old||
-                        let dot: F = (0..k).map(|d| w_new_row[d] * w_row[d]).fold(F::zero(), |a, b| a + b);
+                        let dot: F = (0..k)
+                            .map(|d| w_new_row[d] * w_row[d])
+                            .fold(F::zero(), |a, b| a + b);
                         let change = (F::one() - dot.abs()).abs();
                         for d in 0..k {
                             w[[i, d]] = w_new_row[d];
@@ -780,7 +802,9 @@ mod tests {
 
     #[test]
     fn test_ica_logcosh() {
-        let ica = FastICA::<f64>::new(2).with_fun(NonLinearity::LogCosh).with_random_state(3);
+        let ica = FastICA::<f64>::new(2)
+            .with_fun(NonLinearity::LogCosh)
+            .with_random_state(3);
         let x = mixed_signals();
         let fitted = ica.fit(&x, &()).unwrap();
         let s = fitted.transform(&x).unwrap();
@@ -789,7 +813,9 @@ mod tests {
 
     #[test]
     fn test_ica_exp() {
-        let ica = FastICA::<f64>::new(2).with_fun(NonLinearity::Exp).with_random_state(4);
+        let ica = FastICA::<f64>::new(2)
+            .with_fun(NonLinearity::Exp)
+            .with_random_state(4);
         let x = mixed_signals();
         let fitted = ica.fit(&x, &()).unwrap();
         let s = fitted.transform(&x).unwrap();
@@ -798,7 +824,9 @@ mod tests {
 
     #[test]
     fn test_ica_cube() {
-        let ica = FastICA::<f64>::new(2).with_fun(NonLinearity::Cube).with_random_state(5);
+        let ica = FastICA::<f64>::new(2)
+            .with_fun(NonLinearity::Cube)
+            .with_random_state(5);
         let x = mixed_signals();
         let fitted = ica.fit(&x, &()).unwrap();
         let s = fitted.transform(&x).unwrap();

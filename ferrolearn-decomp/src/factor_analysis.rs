@@ -278,7 +278,11 @@ fn compute_log_likelihood<F: Float + Send + Sync + 'static>(
                     s = s - l[[i, kk]] * l[[j, kk]];
                 }
                 if i == j {
-                    s = if s > F::zero() { s } else { F::from(1e-30).unwrap() };
+                    s = if s > F::zero() {
+                        s
+                    } else {
+                        F::from(1e-30).unwrap()
+                    };
                     l[[i, j]] = s.sqrt();
                     log_det_inner = log_det_inner + l[[i, j]].ln();
                 } else {
@@ -288,10 +292,18 @@ fn compute_log_likelihood<F: Float + Send + Sync + 'static>(
         }
         log_det_inner = log_det_inner * F::from(2.0).unwrap();
     }
-    let log_det_psi: F = psi.iter().copied().map(|v| {
-        let v_clamped = if v > F::zero() { v } else { F::from(1e-30).unwrap() };
-        v_clamped.ln()
-    }).fold(F::zero(), |a, b| a + b);
+    let log_det_psi: F = psi
+        .iter()
+        .copied()
+        .map(|v| {
+            let v_clamped = if v > F::zero() {
+                v
+            } else {
+                F::from(1e-30).unwrap()
+            };
+            v_clamped.ln()
+        })
+        .fold(F::zero(), |a, b| a + b);
     let log_det_sigma = log_det_inner + log_det_psi;
 
     // Sample covariance S = X_c^T X_c / n.
@@ -465,21 +477,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FactorAnalysis<F> 
             // W_new = (Σ_i x_i e_i^T) (Σ_i e_i e_i^T)⁻¹
             //       = X_c^T E[Z|X]^T * (n Σ_z + E[Z|X] E[Z|X]^T)⁻¹
 
-            // X_c^T E[Z|X]^T = xc^T (ez^T)  = xc^T ez^T    shape p × k
-            let xc_ezt = xc.dot(&ez.t()); // p × k  (dot with ez^T = ez transposed)
-            // Actually ez is k × n, ez.t() is n × k, xc is n × p, so xc.t().dot(ez.t()) = p × k.
-            // Wait: xc.dot(&ez.t()) — xc is n×p, ez.t() is n×k — incompatible.
-            // We need: (xc^T) @ (ez^T) ... xc^T is p×n, ez is k×n so ez^T is n×k.
-            // (p×n) @ (n×k) = p×k  ✓
-            let xc_ez_t = xc.t().dot(&ez.t()); // p × k  (but ez.t() is n × k)
+            // X_c^T E[Z|X]^T: xc^T is p×n, ez^T is n×k → result is p×k
+            let xc_ez_t = xc.t().dot(&ez.t()); // p × k
 
-            // ezzT_sum is k × k
-            let ezz_t_inv = cholesky_inv(&ezz_t_sum).map_err(|_| FerroError::NumericalInstability {
-                message: "FactorAnalysis: E[ZZ^T] is singular in M-step".into(),
-            })?;
+            // ezz_t_sum is k × k
+            let ezz_t_inv =
+                cholesky_inv(&ezz_t_sum).map_err(|_| FerroError::NumericalInstability {
+                    message: "FactorAnalysis: E[ZZ^T] is singular in M-step".into(),
+                })?;
 
             let w_new = xc_ez_t.dot(&ezz_t_inv); // p × k
-            let _ = xc_ezt; // suppress unused warning
 
             // ψ_new[d] = (1/n) Σ_i (x_id² - w_new[d,:] e_i x_id)
             //          = (1/n) [Σ_i x_id² - w_new[d,:] Σ_i e_i x_id^T]
@@ -490,16 +497,28 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FactorAnalysis<F> 
             let mut psi_new = Array1::<F>::zeros(p);
             for d in 0..p {
                 // Sample variance of feature d.
-                let var_d = xc.column(d).iter().copied().map(|v| v * v).fold(F::zero(), |a, b| a + b) / n_f;
+                let var_d = xc
+                    .column(d)
+                    .iter()
+                    .copied()
+                    .map(|v| v * v)
+                    .fold(F::zero(), |a, b| a + b)
+                    / n_f;
                 // w_new[d,:] @ (1/n) ez @ xc[:,d]
                 // (1/n) ez @ xc[:,d] is (1/n) Σ_i ez[:,i] * xc[i,d] — k-vector
                 let mut ez_xd = Array1::<F>::zeros(k);
                 for kk in 0..k {
-                    let s = (0..n_samples).map(|i| ez[[kk, i]] * xc[[i, d]]).fold(F::zero(), |a, b| a + b);
+                    let s = (0..n_samples)
+                        .map(|i| ez[[kk, i]] * xc[[i, d]])
+                        .fold(F::zero(), |a, b| a + b);
                     ez_xd[kk] = s / n_f;
                 }
                 let wd = w_new.row(d);
-                let corr = wd.iter().zip(ez_xd.iter()).map(|(&wi, &ei)| wi * ei).fold(F::zero(), |a, b| a + b);
+                let corr = wd
+                    .iter()
+                    .zip(ez_xd.iter())
+                    .map(|(&wi, &ei)| wi * ei)
+                    .fold(F::zero(), |a, b| a + b);
                 let psi_d = var_d - corr;
                 psi_new[d] = if psi_d > F::from(1e-6).unwrap() {
                     psi_d
@@ -574,7 +593,8 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFactorAnal
             for j in 0..k {
                 let mut s = F::zero();
                 for d in 0..n_features {
-                    s = s + self.components[[d, i]] * self.components[[d, j]] / self.noise_variance[d];
+                    s = s + self.components[[d, i]] * self.components[[d, j]]
+                        / self.noise_variance[d];
                 }
                 wzw[[i, j]] = s;
             }
@@ -645,23 +665,16 @@ impl FittedPipelineTransformer for FittedFactorAnalysis<f64> {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
-    use ndarray::{array, Array2};
+    use ndarray::Array2;
 
     fn simple_data() -> Array2<f64> {
         // 10 samples, 4 features with some latent structure.
         Array2::from_shape_vec(
             (10, 4),
             vec![
-                1.0, 2.0, 1.5, 3.0,
-                1.1, 2.1, 1.6, 3.1,
-                0.9, 1.9, 1.4, 2.9,
-                2.0, 4.0, 3.0, 6.0,
-                2.1, 4.1, 3.1, 6.1,
-                1.9, 3.9, 2.9, 5.9,
-                0.5, 1.0, 0.7, 1.5,
-                0.4, 0.9, 0.6, 1.4,
-                0.6, 1.1, 0.8, 1.6,
-                1.5, 3.0, 2.2, 4.5,
+                1.0, 2.0, 1.5, 3.0, 1.1, 2.1, 1.6, 3.1, 0.9, 1.9, 1.4, 2.9, 2.0, 4.0, 3.0, 6.0,
+                2.1, 4.1, 3.1, 6.1, 1.9, 3.9, 2.9, 5.9, 0.5, 1.0, 0.7, 1.5, 0.4, 0.9, 0.6, 1.4,
+                0.6, 1.1, 0.8, 1.6, 1.5, 3.0, 2.2, 4.5,
             ],
         )
         .unwrap()
@@ -689,7 +702,11 @@ mod tests {
         let fa = FactorAnalysis::<f64>::new(1);
         let x = simple_data();
         let fitted = fa.fit(&x, &()).unwrap();
-        let x_new = Array2::from_shape_vec((3, 4), vec![1.0, 2.0, 1.5, 3.0, 2.0, 4.0, 3.0, 6.0, 0.5, 1.0, 0.7, 1.5]).unwrap();
+        let x_new = Array2::from_shape_vec(
+            (3, 4),
+            vec![1.0, 2.0, 1.5, 3.0, 2.0, 4.0, 3.0, 6.0, 0.5, 1.0, 0.7, 1.5],
+        )
+        .unwrap();
         let scores = fitted.transform(&x_new).unwrap();
         assert_eq!(scores.dim(), (3, 1));
     }
@@ -774,13 +791,22 @@ mod tests {
 
     #[test]
     fn test_fa_different_seeds_differ() {
-        let fa1 = FactorAnalysis::<f64>::new(2).with_random_state(0).with_max_iter(1);
-        let fa2 = FactorAnalysis::<f64>::new(2).with_random_state(99).with_max_iter(1);
+        let fa1 = FactorAnalysis::<f64>::new(2)
+            .with_random_state(0)
+            .with_max_iter(1);
+        let fa2 = FactorAnalysis::<f64>::new(2)
+            .with_random_state(99)
+            .with_max_iter(1);
         let x = simple_data();
         let f1 = fa1.fit(&x, &()).unwrap();
         let f2 = fa2.fit(&x, &()).unwrap();
         // After 1 iteration with different seeds the components should differ.
-        let diff: f64 = f1.components().iter().zip(f2.components().iter()).map(|(a, b)| (a - b).abs()).sum();
+        let diff: f64 = f1
+            .components()
+            .iter()
+            .zip(f2.components().iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
         // They may differ unless the initialisation is identical.
         let _ = diff; // just check it doesn't panic
     }
