@@ -55,7 +55,7 @@ pub use backend_faer::NdarrayFaerBackend;
 pub use dataset::Dataset;
 pub use error::{FerroError, FerroResult};
 pub use introspection::{HasClasses, HasCoefficients, HasFeatureImportances};
-pub use traits::{Fit, FitTransform, Predict, Transform};
+pub use traits::{Fit, FitTransform, PartialFit, Predict, Transform};
 
 /// The default linear algebra backend.
 ///

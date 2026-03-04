@@ -138,6 +138,33 @@ pub trait FitTransform<X>: Transform<X> {
     fn fit_transform(&self, x: &X) -> Result<Self::Output, Self::FitError>;
 }
 
+/// Incrementally train a model on a batch of data.
+///
+/// Unlike [`Fit`], `PartialFit` can be called multiple times — each call
+/// updates the model with a new batch. This enables online/streaming learning.
+///
+/// The trait is implemented by both unfitted models (first call) and fitted
+/// models (subsequent calls), enabling chaining:
+/// `model.partial_fit(&b1, &y1)?.partial_fit(&b2, &y2)?.predict(&x)?`
+pub trait PartialFit<X, Y>: Sized {
+    /// The result type returned by [`partial_fit`](PartialFit::partial_fit).
+    ///
+    /// Must itself implement both [`Predict`] (so predictions can be made)
+    /// and `PartialFit` (so additional batches can be fed).
+    type FitResult: Predict<X> + PartialFit<X, Y>;
+
+    /// The error type returned by [`partial_fit`](PartialFit::partial_fit).
+    type Error: std::error::Error;
+
+    /// Update the model with a new batch of data.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the data is invalid (wrong shape, insufficient
+    /// samples) or if the algorithm encounters a numerical problem.
+    fn partial_fit(self, x: &X, y: &Y) -> Result<Self::FitResult, Self::Error>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
