@@ -5,9 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Linear models for ferrolearn (regression, classification)"
+description = "Linear models for the ferrolearn ML framework"
 
 [dependencies]
 ferrolearn-core.workspace = true
 ndarray.workspace = true
 num-traits.workspace = true
+faer.workspace = true
+
+[dev-dependencies]
+approx.workspace = true
+float-cmp.workspace = true
