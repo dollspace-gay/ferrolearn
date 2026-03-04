@@ -70,6 +70,7 @@
 //! ```
 
 pub mod binarizer;
+pub mod column_transformer;
 pub mod feature_selection;
 pub mod function_transformer;
 pub mod imputer;
@@ -86,6 +87,9 @@ pub mod standard_scaler;
 
 // Re-exports
 pub use binarizer::Binarizer;
+pub use column_transformer::{
+    ColumnSelector, ColumnTransformer, FittedColumnTransformer, Remainder, make_column_transformer,
+};
 pub use feature_selection::{
     FittedSelectKBest, FittedVarianceThreshold, ScoreFunc, SelectFromModel, SelectKBest,
     VarianceThreshold,
