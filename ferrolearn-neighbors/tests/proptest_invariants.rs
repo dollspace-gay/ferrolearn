@@ -11,20 +11,18 @@ use proptest::prelude::*;
 // ---------------------------------------------------------------------------
 
 /// Strategy for classification data with at least 2 classes and enough samples for k=3.
-fn classification_data_strategy(
-) -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
-    (6usize..=12usize, 2usize..=3usize, 2usize..=3usize).prop_flat_map(
-        |(n_samples, n_feat, n_classes)| {
+fn classification_data_strategy() -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
+    (6usize..=12usize, 2usize..=3usize, 2usize..=3usize)
+        .prop_flat_map(|(n_samples, n_feat, n_classes)| {
             let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
             (x_strat, Just(n_samples), Just(n_feat), Just(n_classes))
-        },
-    )
-    .prop_map(|(x_data, n_samples, n_feat, n_classes)| {
-        let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
-        let labels: Vec<usize> = (0..n_samples).map(|i| i % n_classes).collect();
-        let y = Array1::from_vec(labels);
-        (x, y)
-    })
+        })
+        .prop_map(|(x_data, n_samples, n_feat, n_classes)| {
+            let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
+            let labels: Vec<usize> = (0..n_samples).map(|i| i % n_classes).collect();
+            let y = Array1::from_vec(labels);
+            (x, y)
+        })
 }
 
 // ---------------------------------------------------------------------------

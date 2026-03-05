@@ -265,11 +265,7 @@ fn nearest_center<F: Float>(row_slice: &[F], centers: &Array2<F>) -> (usize, F) 
 }
 
 /// Serial assignment — no thread-pool overhead.
-fn assign_serial<F: Float>(
-    labels: &mut Array1<usize>,
-    x: &Array2<F>,
-    centers: &Array2<F>,
-) -> F {
+fn assign_serial<F: Float>(labels: &mut Array1<usize>, x: &Array2<F>, centers: &Array2<F>) -> F {
     let n_samples = x.nrows();
     let mut inertia = F::zero();
     for i in 0..n_samples {
@@ -547,10 +543,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKMeans<F> 
                 .for_each(|(i, chunk)| {
                     let row = x.row(i);
                     let row_slice = row.as_slice().unwrap_or(&[]);
-                    for c in 0..k {
+                    for (c, dist) in chunk.iter_mut().enumerate().take(k) {
                         let center = centers.row(c);
                         let cs = center.as_slice().unwrap_or(&[]);
-                        chunk[c] = squared_euclidean(row_slice, cs).sqrt();
+                        *dist = squared_euclidean(row_slice, cs).sqrt();
                     }
                 });
         }

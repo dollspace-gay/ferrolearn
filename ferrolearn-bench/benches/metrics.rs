@@ -2,11 +2,7 @@ use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ferrolearn_metrics::{classification, regression};
 use ndarray::Array1;
 
-const METRIC_SIZES: &[(&str, usize)] = &[
-    ("1K", 1_000),
-    ("10K", 10_000),
-    ("100K", 100_000),
-];
+const METRIC_SIZES: &[(&str, usize)] = &[("1K", 1_000), ("10K", 10_000), ("100K", 100_000)];
 
 fn make_regression_predictions(n: usize) -> (Array1<f64>, Array1<f64>) {
     let y_true = Array1::from_iter((0..n).map(|i| i as f64 * 0.1));
@@ -37,12 +33,7 @@ fn bench_f1(c: &mut Criterion) {
         let (y_true, y_pred) = make_classification_predictions(n);
         group.bench_with_input(BenchmarkId::from_parameter(label), &(), |b, _| {
             b.iter(|| {
-                classification::f1_score(
-                    &y_true,
-                    &y_pred,
-                    classification::Average::Macro,
-                )
-                .unwrap()
+                classification::f1_score(&y_true, &y_pred, classification::Average::Macro).unwrap()
             });
         });
     }

@@ -201,7 +201,12 @@ fn sklearn_equiv_nmf() {
     // Each column of W should have similar norm.
     for j in 0..w.ncols() {
         let our_norm: f64 = w.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
-        let sk_norm: f64 = sklearn_w.column(j).iter().map(|v| v * v).sum::<f64>().sqrt();
+        let sk_norm: f64 = sklearn_w
+            .column(j)
+            .iter()
+            .map(|v| v * v)
+            .sum::<f64>()
+            .sqrt();
         let ratio = our_norm / sk_norm.max(1e-10);
         assert!(
             (0.1..10.0).contains(&ratio),

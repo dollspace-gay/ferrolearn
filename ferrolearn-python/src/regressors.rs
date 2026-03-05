@@ -29,8 +29,8 @@ impl RsLinearRegression {
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray(y);
-        let model =
-            ferrolearn_linear::LinearRegression::<f64>::new().with_fit_intercept(self.fit_intercept);
+        let model = ferrolearn_linear::LinearRegression::<f64>::new()
+            .with_fit_intercept(self.fit_intercept);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

@@ -89,10 +89,7 @@ impl RsKMeans {
     }
 
     #[getter]
-    fn cluster_centers_<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    fn cluster_centers_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let fitted = self
             .fitted
             .as_ref()

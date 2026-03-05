@@ -147,8 +147,7 @@ impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'stati
             })
         } else {
             // Try fast Cholesky normal equations first, fall back to QR.
-            let w = linalg::solve_normal_equations(x, y)
-                .or_else(|_| linalg::solve_lstsq(x, y))?;
+            let w = linalg::solve_normal_equations(x, y).or_else(|_| linalg::solve_lstsq(x, y))?;
 
             Ok(FittedLinearRegression {
                 coefficients: w,

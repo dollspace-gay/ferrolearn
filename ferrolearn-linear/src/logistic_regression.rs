@@ -486,6 +486,27 @@ fn softmax_2d<F: Float>(logits: &Array2<F>) -> Array2<F> {
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedLogisticRegression<F> {
+    /// Returns a reference to the full weight matrix.
+    ///
+    /// For binary classification, shape is `(1, n_features)`.
+    /// For multiclass, shape is `(n_classes, n_features)`.
+    #[must_use]
+    pub fn weight_matrix(&self) -> &Array2<F> {
+        &self.weight_matrix
+    }
+
+    /// Returns a reference to the intercept vector (one per class).
+    #[must_use]
+    pub fn intercept_vec(&self) -> &Array1<F> {
+        &self.intercept_vec
+    }
+
+    /// Returns whether this is a binary classification model.
+    #[must_use]
+    pub fn is_binary(&self) -> bool {
+        self.is_binary
+    }
+
     /// Predict class probabilities for the given feature matrix.
     ///
     /// For binary classification, returns an array of shape `(n_samples, 2)`.

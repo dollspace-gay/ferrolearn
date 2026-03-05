@@ -14,33 +14,33 @@ use proptest::prelude::*;
 /// Strategy for classification labels: n_samples in [3, 12], values in [0, n_classes).
 fn classification_labels_strategy() -> impl Strategy<Value = (Array1<usize>, usize)> {
     (3usize..=12usize, 2usize..=4usize).prop_flat_map(|(n_samples, n_classes)| {
-        proptest::collection::vec(0..n_classes, n_samples).prop_map(move |labels| {
-            (Array1::from_vec(labels), n_samples)
-        })
+        proptest::collection::vec(0..n_classes, n_samples)
+            .prop_map(move |labels| (Array1::from_vec(labels), n_samples))
     })
 }
 
 /// Strategy for a pair of regression arrays: n_samples in [3, 12], values in [-10, 10].
 fn regression_pair_strategy() -> impl Strategy<Value = (Array1<f64>, Array1<f64>, usize)> {
-    (3usize..=12usize).prop_flat_map(|n_samples| {
-        let y_true_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
-        let y_pred_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
-        (y_true_strat, y_pred_strat, Just(n_samples))
-    }).prop_map(|(y_true_data, y_pred_data, n_samples)| {
-        (
-            Array1::from_vec(y_true_data),
-            Array1::from_vec(y_pred_data),
-            n_samples,
-        )
-    })
+    (3usize..=12usize)
+        .prop_flat_map(|n_samples| {
+            let y_true_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
+            let y_pred_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
+            (y_true_strat, y_pred_strat, Just(n_samples))
+        })
+        .prop_map(|(y_true_data, y_pred_data, n_samples)| {
+            (
+                Array1::from_vec(y_true_data),
+                Array1::from_vec(y_pred_data),
+                n_samples,
+            )
+        })
 }
 
 /// Strategy for a single regression array with non-constant values (for r2_score).
 fn regression_nonconstant_strategy() -> impl Strategy<Value = (Array1<f64>, usize)> {
     (3usize..=12usize).prop_flat_map(|n_samples| {
-        proptest::collection::vec(-10.0..10.0f64, n_samples).prop_map(move |data| {
-            (Array1::from_vec(data), n_samples)
-        })
+        proptest::collection::vec(-10.0..10.0f64, n_samples)
+            .prop_map(move |data| (Array1::from_vec(data), n_samples))
     })
 }
 

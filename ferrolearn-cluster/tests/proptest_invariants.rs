@@ -1,7 +1,7 @@
 //! Property-based tests for KMeans mathematical invariants.
 
-use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_cluster::KMeans;
+use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::Array2;
 use proptest::prelude::*;
 
@@ -12,13 +12,14 @@ use proptest::prelude::*;
 /// Strategy for KMeans data: n_clusters in [2, 4], n_samples >= n_clusters,
 /// n_features in [2, 4].
 fn kmeans_data_strategy() -> impl Strategy<Value = (Array2<f64>, usize, usize, usize)> {
-    (2usize..=4usize, 2usize..=3usize).prop_flat_map(|(n_clusters, n_feat)| {
-        let min_samples = n_clusters;
-        let max_samples = n_clusters + 8;
-        (min_samples..=max_samples, Just(n_clusters), Just(n_feat))
-    }).prop_flat_map(|(n_samples, n_clusters, n_feat)| {
-        proptest::collection::vec(-10.0..10.0f64, n_samples * n_feat)
-            .prop_map(move |data| {
+    (2usize..=4usize, 2usize..=3usize)
+        .prop_flat_map(|(n_clusters, n_feat)| {
+            let min_samples = n_clusters;
+            let max_samples = n_clusters + 8;
+            (min_samples..=max_samples, Just(n_clusters), Just(n_feat))
+        })
+        .prop_flat_map(|(n_samples, n_clusters, n_feat)| {
+            proptest::collection::vec(-10.0..10.0f64, n_samples * n_feat).prop_map(move |data| {
                 (
                     Array2::from_shape_vec((n_samples, n_feat), data).unwrap(),
                     n_samples,
@@ -26,7 +27,7 @@ fn kmeans_data_strategy() -> impl Strategy<Value = (Array2<f64>, usize, usize, u
                     n_clusters,
                 )
             })
-    })
+        })
 }
 
 // ---------------------------------------------------------------------------

@@ -367,6 +367,32 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for GradientBoo
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedGradientBoostingRegressor<F> {
+    /// Returns the initial prediction (intercept) of the boosted model.
+    #[must_use]
+    pub fn init(&self) -> F {
+        self.init
+    }
+
+    /// Returns the learning rate used during training.
+    #[must_use]
+    pub fn learning_rate(&self) -> F {
+        self.learning_rate
+    }
+
+    /// Returns a reference to the sequence of fitted trees.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Node<F>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGradientBoostingRegressor<F> {
     type Output = Array1<F>;
     type Error = FerroError;
@@ -889,6 +915,35 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
             n_features,
             feature_importances: total_importances,
         })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FittedGradientBoostingClassifier<F> {
+    /// Returns the initial predictions per class (log-odds or log-prior).
+    #[must_use]
+    pub fn init(&self) -> &[F] {
+        &self.init
+    }
+
+    /// Returns the learning rate used during training.
+    #[must_use]
+    pub fn learning_rate(&self) -> F {
+        self.learning_rate
+    }
+
+    /// Returns a reference to the tree ensemble.
+    ///
+    /// For binary classification, `trees()[0]` contains all trees.
+    /// For multiclass, `trees()[k]` contains trees for class `k`.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Vec<Node<F>>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
     }
 }
 

@@ -11,10 +11,11 @@ keywords = ["machine-learning", "traits", "pipeline", "ml", "ferrolearn"]
 categories = ["science", "algorithms"]
 
 [dependencies]
-faer.workspace = true
+faer = { workspace = true, optional = true }
 ndarray.workspace = true
+ndarray-linalg = { version = "0.18", features = ["openblas-static"], optional = true }
 num-traits.workspace = true
-thiserror.workspace = true
+thiserror = { version = "2.0", default-features = false }
 
 [dev-dependencies]
 approx.workspace = true
@@ -23,3 +24,9 @@ ferrolearn-linear.workspace = true
 ferrolearn-preprocess.workspace = true
 ferrolearn-decomp.workspace = true
 ferrolearn-cluster.workspace = true
+
+[features]
+default = ["std", "faer"]
+std = ["thiserror/std"]
+faer = ["dep:faer"]
+blas = ["dep:ndarray-linalg"]

@@ -10,6 +10,9 @@
 //!   ensembles of decision trees with random feature subsets, built in parallel via `rayon`.
 //! - **[`GradientBoostingClassifier`]** / **[`GradientBoostingRegressor`]** — Gradient boosting
 //!   ensembles that sequentially fit trees to the negative gradient of a loss function.
+//! - **[`HistGradientBoostingClassifier`]** / **[`HistGradientBoostingRegressor`]** —
+//!   Histogram-based gradient boosting with O(n_bins) split finding, subtraction trick,
+//!   native NaN support, and optional best-first (leaf-wise) growth.
 //! - **[`AdaBoostClassifier`]** — Adaptive Boosting using decision tree stumps with
 //!   SAMME and SAMME.R algorithms.
 //!
@@ -37,6 +40,7 @@
 pub mod adaboost;
 pub mod decision_tree;
 pub mod gradient_boosting;
+pub mod hist_gradient_boosting;
 pub mod random_forest;
 
 // Re-export the main types at the crate root.
@@ -48,6 +52,11 @@ pub use decision_tree::{
 pub use gradient_boosting::{
     ClassificationLoss, FittedGradientBoostingClassifier, FittedGradientBoostingRegressor,
     GradientBoostingClassifier, GradientBoostingRegressor, RegressionLoss,
+};
+pub use hist_gradient_boosting::{
+    FittedHistGradientBoostingClassifier, FittedHistGradientBoostingRegressor,
+    HistClassificationLoss, HistGradientBoostingClassifier, HistGradientBoostingRegressor,
+    HistNode, HistRegressionLoss,
 };
 pub use random_forest::{
     FittedRandomForestClassifier, FittedRandomForestRegressor, MaxFeatures, RandomForestClassifier,

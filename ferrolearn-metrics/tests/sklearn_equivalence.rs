@@ -81,12 +81,9 @@ fn sklearn_equiv_classification_precision_binary() {
     let y_pred = json_to_array1_usize(&fixture["y_pred"]);
     let expected = fixture["precision_binary"].as_f64().unwrap();
 
-    let actual = ferrolearn_metrics::precision_score(
-        &y_true,
-        &y_pred,
-        ferrolearn_metrics::Average::Binary,
-    )
-    .unwrap();
+    let actual =
+        ferrolearn_metrics::precision_score(&y_true, &y_pred, ferrolearn_metrics::Average::Binary)
+            .unwrap();
     assert_relative_eq!(actual, expected, epsilon = 1e-12);
 }
 
@@ -135,12 +132,9 @@ fn sklearn_equiv_classification_precision_macro() {
     let y_pred = json_to_array1_usize(&fixture["y_pred"]);
     let expected = fixture["precision_macro"].as_f64().unwrap();
 
-    let actual = ferrolearn_metrics::precision_score(
-        &y_true,
-        &y_pred,
-        ferrolearn_metrics::Average::Macro,
-    )
-    .unwrap();
+    let actual =
+        ferrolearn_metrics::precision_score(&y_true, &y_pred, ferrolearn_metrics::Average::Macro)
+            .unwrap();
     assert_relative_eq!(actual, expected, epsilon = 1e-12);
 }
 
@@ -173,8 +167,7 @@ fn sklearn_equiv_classification_f1_macro() {
     let expected = fixture["f1_macro"].as_f64().unwrap();
 
     let actual =
-        ferrolearn_metrics::f1_score(&y_true, &y_pred, ferrolearn_metrics::Average::Macro)
-            .unwrap();
+        ferrolearn_metrics::f1_score(&y_true, &y_pred, ferrolearn_metrics::Average::Macro).unwrap();
     assert_relative_eq!(actual, expected, epsilon = 1e-12);
 }
 
@@ -374,8 +367,7 @@ fn sklearn_equiv_regression_mape() {
     let y_pred = json_to_array1_f64(&fixture["y_pred"]);
     let expected = fixture["mape"].as_f64().unwrap();
 
-    let actual: f64 =
-        ferrolearn_metrics::mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
+    let actual: f64 = ferrolearn_metrics::mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
     // ferrolearn returns MAPE as a percentage (multiplied by 100),
     // while sklearn returns it as a fraction. Adjust for comparison.
     let actual_fraction = actual / 100.0;
@@ -415,9 +407,8 @@ fn sklearn_equiv_silhouette_score() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let labels = ndarray::Array1::from_vec(
-        labels_true.iter().map(|&l| l as isize).collect::<Vec<_>>(),
-    );
+    let labels =
+        ndarray::Array1::from_vec(labels_true.iter().map(|&l| l as isize).collect::<Vec<_>>());
     let expected = fixture["silhouette_score"].as_f64().unwrap();
 
     let actual = ferrolearn_metrics::silhouette_score(&x, &labels).unwrap();
@@ -495,9 +486,8 @@ fn sklearn_equiv_davies_bouldin_score() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let labels = ndarray::Array1::from_vec(
-        labels_true.iter().map(|&l| l as isize).collect::<Vec<_>>(),
-    );
+    let labels =
+        ndarray::Array1::from_vec(labels_true.iter().map(|&l| l as isize).collect::<Vec<_>>());
     let expected = fixture["davies_bouldin_score"].as_f64().unwrap();
 
     let actual = ferrolearn_metrics::davies_bouldin_score(&x, &labels).unwrap();

@@ -26,6 +26,13 @@
 //!   reduction via the normalised graph Laplacian.
 //! - [`LLE`] — Locally Linear Embedding. Non-linear dimensionality reduction
 //!   preserving local reconstruction weights.
+//! - [`Tsne`] — t-distributed Stochastic Neighbor Embedding. Non-linear
+//!   dimensionality reduction using Barnes-Hut approximation.
+//! - [`Umap`] — Uniform Manifold Approximation and Projection. Fast non-linear
+//!   dimensionality reduction based on topological data analysis.
+//! - [`LatentDirichletAllocation`] — Latent Dirichlet Allocation topic model.
+//!   Discovers latent topics in document-term matrices.
+//! - [`DictionaryLearning`] — Sparse coding with a learned dictionary.
 //!
 //! ## Pipeline Integration
 //!
@@ -49,27 +56,39 @@
 //! assert_eq!(projected.ncols(), 1);
 //! ```
 
+pub mod dictionary_learning;
 pub mod factor_analysis;
 pub mod fast_ica;
 pub mod incremental_pca;
 pub mod isomap;
 pub mod kernel_pca;
+pub mod lda_topic;
 pub mod lle;
 pub mod mds;
 pub mod nmf;
 pub mod pca;
 pub mod spectral_embedding;
 pub mod truncated_svd;
+pub mod tsne;
+pub mod umap;
 
 // Re-exports
+pub use dictionary_learning::{
+    DictFitAlgorithm, DictTransformAlgorithm, DictionaryLearning, FittedDictionaryLearning,
+};
 pub use factor_analysis::{FactorAnalysis, FittedFactorAnalysis};
 pub use fast_ica::{Algorithm, FastICA, FittedFastICA, NonLinearity};
 pub use incremental_pca::{FittedIncrementalPCA, IncrementalPCA};
 pub use isomap::{FittedIsomap, Isomap};
 pub use kernel_pca::{FittedKernelPCA, Kernel, KernelPCA};
+pub use lda_topic::{
+    FittedLatentDirichletAllocation, LatentDirichletAllocation, LdaLearningMethod,
+};
 pub use lle::{FittedLLE, LLE};
 pub use mds::{Dissimilarity, FittedMDS, MDS};
 pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver};
 pub use pca::{FittedPCA, PCA};
 pub use spectral_embedding::{Affinity, FittedSpectralEmbedding, SpectralEmbedding};
 pub use truncated_svd::{FittedTruncatedSVD, TruncatedSVD};
+pub use tsne::{FittedTsne, Tsne};
+pub use umap::{FittedUmap, Umap, UmapMetric};

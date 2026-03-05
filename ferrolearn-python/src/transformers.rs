@@ -155,10 +155,7 @@ impl RsPCA {
     }
 
     #[getter]
-    fn explained_variance_<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn explained_variance_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let fitted = self
             .fitted
             .as_ref()
@@ -188,10 +185,7 @@ impl RsPCA {
     }
 
     #[getter]
-    fn singular_values_<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn singular_values_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let fitted = self
             .fitted
             .as_ref()

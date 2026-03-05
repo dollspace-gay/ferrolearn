@@ -133,11 +133,7 @@ fn ball_lower_bound_sq(query: &[f64], center: &[f64], radius_sq: f64) -> f64 {
     let d = d2.sqrt();
     let r = radius_sq.sqrt();
     let gap = d - r;
-    if gap > 0.0 {
-        gap * gap
-    } else {
-        0.0
-    }
+    if gap > 0.0 { gap * gap } else { 0.0 }
 }
 
 impl BallTree {
@@ -559,7 +555,11 @@ mod tests {
                 let bt_result = tree.query(&data, &query, k);
                 let bf_result = kdtree::brute_force_knn(&data, &query, k);
 
-                assert_eq!(bt_result.len(), bf_result.len(), "leaf_size={leaf_size}, k={k}");
+                assert_eq!(
+                    bt_result.len(),
+                    bf_result.len(),
+                    "leaf_size={leaf_size}, k={k}"
+                );
                 for (bt, bf) in bt_result.iter().zip(bf_result.iter()) {
                     assert!(
                         (bt.1 - bf.1).abs() < 1e-10,
@@ -623,7 +623,11 @@ mod tests {
         let mut bf_results: Vec<(usize, f64)> = (0..n)
             .filter_map(|i| {
                 let point = &flat[i * d..(i + 1) * d];
-                let d2: f64 = point.iter().zip(query.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+                let d2: f64 = point
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum();
                 let dist = d2.sqrt();
                 if dist <= radius {
                     Some((i, dist))
@@ -662,7 +666,9 @@ mod tests {
         // 500 points in 10 dimensions
         let n = 500;
         let d = 10;
-        let flat: Vec<f64> = (0..n * d).map(|i| ((i * 7 + 13) % 100) as f64 * 0.01).collect();
+        let flat: Vec<f64> = (0..n * d)
+            .map(|i| ((i * 7 + 13) % 100) as f64 * 0.01)
+            .collect();
         let data = Array2::from_shape_vec((n, d), flat).unwrap();
 
         let tree = BallTree::build(&data);
@@ -673,12 +679,7 @@ mod tests {
 
         assert_eq!(bt_result.len(), bf_result.len());
         for (bt, bf) in bt_result.iter().zip(bf_result.iter()) {
-            assert!(
-                (bt.1 - bf.1).abs() < 1e-9,
-                "bt={}, bf={}",
-                bt.1,
-                bf.1
-            );
+            assert!((bt.1 - bf.1).abs() < 1e-9, "bt={}, bf={}", bt.1, bf.1);
         }
     }
 

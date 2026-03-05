@@ -350,6 +350,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for RandomF
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedRandomForestClassifier<F> {
+    /// Returns a reference to the individual tree node vectors.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Node<F>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRandomForestClassifier<F> {
     type Output = Array1<usize>;
     type Error = FerroError;
@@ -667,6 +681,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for RandomFores
             n_features,
             feature_importances: total_importances,
         })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FittedRandomForestRegressor<F> {
+    /// Returns a reference to the individual tree node vectors.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Node<F>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
     }
 }
 

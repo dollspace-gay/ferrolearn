@@ -212,6 +212,18 @@ pub struct FittedDecisionTreeClassifier<F> {
 }
 
 impl<F: Float + Send + Sync + 'static> FittedDecisionTreeClassifier<F> {
+    /// Returns a reference to the flat node storage of the tree.
+    #[must_use]
+    pub fn nodes(&self) -> &[Node<F>] {
+        &self.nodes
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+
     /// Predict class probabilities for each sample.
     ///
     /// Returns a 2-D array of shape `(n_samples, n_classes)`.
@@ -569,6 +581,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
             n_features,
             feature_importances,
         })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FittedDecisionTreeRegressor<F> {
+    /// Returns a reference to the flat node storage of the tree.
+    #[must_use]
+    pub fn nodes(&self) -> &[Node<F>] {
+        &self.nodes
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
     }
 }
 

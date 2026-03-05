@@ -151,10 +151,7 @@ fn sklearn_equiv_dbscan() {
     );
 
     // Core sample count should match.
-    let sklearn_core_count = fixture["core_sample_indices"]
-        .as_array()
-        .unwrap()
-        .len();
+    let sklearn_core_count = fixture["core_sample_indices"].as_array().unwrap().len();
     let core_count = fitted.core_sample_indices().len();
     assert_eq!(
         core_count, sklearn_core_count,

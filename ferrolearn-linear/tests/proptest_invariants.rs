@@ -2,9 +2,7 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::{
-    ElasticNet, Lasso, LinearRegression, LogisticRegression, Ridge,
-};
+use ferrolearn_linear::{ElasticNet, Lasso, LinearRegression, LogisticRegression, Ridge};
 use ndarray::{Array1, Array2};
 use proptest::prelude::*;
 
@@ -14,56 +12,60 @@ use proptest::prelude::*;
 
 /// Strategy for generating regression data with n_samples > n_features,
 /// non-constant y, and values in a reasonable range.
-fn regression_data_strategy(
-) -> impl Strategy<Value = (Array2<f64>, Array1<f64>, usize, usize)> {
+fn regression_data_strategy() -> impl Strategy<Value = (Array2<f64>, Array1<f64>, usize, usize)> {
     // n_features in 2..=4, n_samples in n_features+2..=n_features+10
-    (2usize..=4usize).prop_flat_map(|n_feat| {
-        let min_samples = n_feat + 2;
-        let max_samples = n_feat + 10;
-        (min_samples..=max_samples, Just(n_feat))
-    }).prop_flat_map(|(n_samples, n_feat)| {
-        let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
-        let y_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
-        (x_strat, y_strat, Just(n_samples), Just(n_feat))
-    }).prop_map(|(x_data, y_data, n_samples, n_feat)| {
-        let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
-        let y = Array1::from_vec(y_data);
-        (x, y, n_samples, n_feat)
-    })
+    (2usize..=4usize)
+        .prop_flat_map(|n_feat| {
+            let min_samples = n_feat + 2;
+            let max_samples = n_feat + 10;
+            (min_samples..=max_samples, Just(n_feat))
+        })
+        .prop_flat_map(|(n_samples, n_feat)| {
+            let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
+            let y_strat = proptest::collection::vec(-10.0..10.0f64, n_samples);
+            (x_strat, y_strat, Just(n_samples), Just(n_feat))
+        })
+        .prop_map(|(x_data, y_data, n_samples, n_feat)| {
+            let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
+            let y = Array1::from_vec(y_data);
+            (x, y, n_samples, n_feat)
+        })
 }
 
 /// Strategy for generating binary classification data (2 classes).
-fn binary_classification_data_strategy(
-) -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
-    (6usize..=12usize, 2usize..=4usize).prop_flat_map(|(n_samples, n_feat)| {
-        let half = n_samples / 2;
-        let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
-        // Ensure at least 1 sample per class by constructing labels manually
-        (x_strat, Just(n_samples), Just(n_feat), Just(half))
-    }).prop_map(|(x_data, n_samples, n_feat, half)| {
-        let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
-        let mut labels = vec![0usize; half];
-        labels.extend(vec![1usize; n_samples - half]);
-        let y = Array1::from_vec(labels);
-        (x, y)
-    })
+fn binary_classification_data_strategy() -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
+    (6usize..=12usize, 2usize..=4usize)
+        .prop_flat_map(|(n_samples, n_feat)| {
+            let half = n_samples / 2;
+            let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
+            // Ensure at least 1 sample per class by constructing labels manually
+            (x_strat, Just(n_samples), Just(n_feat), Just(half))
+        })
+        .prop_map(|(x_data, n_samples, n_feat, half)| {
+            let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
+            let mut labels = vec![0usize; half];
+            labels.extend(vec![1usize; n_samples - half]);
+            let y = Array1::from_vec(labels);
+            (x, y)
+        })
 }
 
 /// Strategy for multiclass classification data (3 classes).
-fn multiclass_data_strategy(
-) -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
-    (9usize..=15usize, 2usize..=3usize).prop_flat_map(|(n_samples, n_feat)| {
-        let third = n_samples / 3;
-        let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
-        (x_strat, Just(n_samples), Just(n_feat), Just(third))
-    }).prop_map(|(x_data, n_samples, n_feat, third)| {
-        let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
-        let mut labels = vec![0usize; third];
-        labels.extend(vec![1usize; third]);
-        labels.extend(vec![2usize; n_samples - 2 * third]);
-        let y = Array1::from_vec(labels);
-        (x, y)
-    })
+fn multiclass_data_strategy() -> impl Strategy<Value = (Array2<f64>, Array1<usize>)> {
+    (9usize..=15usize, 2usize..=3usize)
+        .prop_flat_map(|(n_samples, n_feat)| {
+            let third = n_samples / 3;
+            let x_strat = proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat);
+            (x_strat, Just(n_samples), Just(n_feat), Just(third))
+        })
+        .prop_map(|(x_data, n_samples, n_feat, third)| {
+            let x = Array2::from_shape_vec((n_samples, n_feat), x_data).unwrap();
+            let mut labels = vec![0usize; third];
+            labels.extend(vec![1usize; third]);
+            labels.extend(vec![2usize; n_samples - 2 * third]);
+            let y = Array1::from_vec(labels);
+            (x, y)
+        })
 }
 
 // ---------------------------------------------------------------------------

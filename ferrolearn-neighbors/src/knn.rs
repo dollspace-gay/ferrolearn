@@ -126,9 +126,7 @@ fn find_neighbors<F: Float + Send + Sync + 'static>(
                 .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
                 .collect()
         }
-        SpatialIndex::None => {
-            kdtree::brute_force_knn(data, query_row, k)
-        }
+        SpatialIndex::None => kdtree::brute_force_knn(data, query_row, k),
     }
 }
 
@@ -352,12 +350,8 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
 
         for i in 0..n_samples {
             let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let neighbors = find_neighbors(
-                &self.x_train,
-                &query,
-                self.n_neighbors,
-                &self.spatial_index,
-            );
+            let neighbors =
+                find_neighbors(&self.x_train, &query, self.n_neighbors, &self.spatial_index);
 
             predictions[i] = self.weighted_vote(&neighbors);
         }
@@ -644,12 +638,8 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
 
         for i in 0..n_samples {
             let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let neighbors = find_neighbors(
-                &self.x_train,
-                &query,
-                self.n_neighbors,
-                &self.spatial_index,
-            );
+            let neighbors =
+                find_neighbors(&self.x_train, &query, self.n_neighbors, &self.spatial_index);
 
             predictions[i] = self.weighted_mean(&neighbors);
         }
