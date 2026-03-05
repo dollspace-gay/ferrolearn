@@ -5,6 +5,12 @@
 //! dimensionality, making ball trees effective for d > 15 where KD-Trees become
 //! equivalent to brute force.
 //!
+//! # Implementation
+//!
+//! Nodes are stored in a flat `Vec` for cache-friendly traversal. All internal
+//! computations use squared Euclidean distance to avoid unnecessary `sqrt` calls.
+//! The k-NN search uses a `BinaryHeap` (max-heap) for O(log k) insertion.
+//!
 //! # Complexity
 //!
 //! - Build: O(n log n)
@@ -31,113 +37,131 @@
 
 use ndarray::Array2;
 use num_traits::Float;
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
 
-/// A node in the ball tree.
-///
-/// Each leaf node stores a range of point indices. Internal nodes store a
-/// pivot point (the centroid of their subset) and a bounding radius.
+/// Default leaf size — the maximum number of points in a leaf node.
+const DEFAULT_LEAF_SIZE: usize = 40;
+
+/// A node in the flat ball tree.
 #[derive(Debug)]
-struct BallNode {
-    /// Index of the centroid point (closest to the actual centroid).
-    pivot: usize,
-    /// Bounding radius: max distance from pivot to any point in this node.
-    radius: f64,
-    /// Indices into the original data (only populated for leaf nodes).
-    /// For internal nodes, this is empty — children contain the indices.
+struct Node {
+    /// Centroid of the points in this node (true centroid, not nearest point).
+    centroid: Vec<f64>,
+    /// Squared bounding radius from centroid to farthest point.
+    radius_sq: f64,
+    /// Start index (inclusive) into the permuted index array.
     start: usize,
-    /// End index (exclusive) into the index array.
+    /// End index (exclusive) into the permuted index array.
     end: usize,
-    /// Left child (if internal node).
-    left: Option<Box<BallNode>>,
-    /// Right child (if internal node).
-    right: Option<Box<BallNode>>,
+    /// Node type: leaf or branch with child indices.
+    kind: NodeKind,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NodeKind {
+    Leaf,
+    Branch { left: usize, right: usize },
 }
 
 /// A ball tree spatial index for nearest neighbor queries.
 ///
-/// Stores data as flattened f64 for cache-friendly access. Point indices
-/// are permuted during construction so that each node's points are
-/// contiguous in memory.
+/// Stores data as flattened f64 for cache-friendly access. Nodes are stored
+/// in a flat `Vec` with index-based child references.
 #[derive(Debug)]
 pub struct BallTree {
-    /// Root of the tree.
-    root: Option<Box<BallNode>>,
+    /// Flat array of tree nodes.
+    nodes: Vec<Node>,
     /// Flattened data: `data[i * n_features + j]` is feature j of point i.
     data: Vec<f64>,
     /// Number of features per point.
     n_features: usize,
-    /// Permuted index array — maps internal indices to original dataset indices.
+    /// Permuted index array — maps internal positions to original dataset indices.
     indices: Vec<usize>,
+    /// Leaf size used during construction (accessible for introspection).
+    _leaf_size: usize,
 }
 
-/// Maximum number of points in a leaf node before splitting.
-const LEAF_SIZE: usize = 40;
-
-/// A bounded max-heap for tracking the k nearest neighbors.
-struct NeighborHeap {
-    k: usize,
-    items: Vec<(f64, usize)>, // (distance, original_index)
+/// Entry in the max-heap used during k-NN search.
+/// The largest squared distance sits at the top and gets evicted first.
+struct KnnCandidate {
+    dist_sq: f64,
+    orig_idx: usize,
 }
 
-impl NeighborHeap {
-    fn new(k: usize) -> Self {
-        Self {
-            k,
-            items: Vec::with_capacity(k + 1),
-        }
+impl PartialEq for KnnCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist_sq == other.dist_sq
     }
+}
 
-    /// Worst (largest) distance currently tracked, or infinity if not full.
-    fn worst_distance(&self) -> f64 {
-        if self.items.len() < self.k {
-            f64::INFINITY
-        } else {
-            self.items
-                .iter()
-                .fold(f64::NEG_INFINITY, |acc, &(d, _)| acc.max(d))
-        }
+impl Eq for KnnCandidate {}
+
+impl PartialOrd for KnnCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
+}
 
-    /// Try to insert a neighbor. Only inserts if better than worst or heap not full.
-    fn try_insert(&mut self, distance: f64, index: usize) {
-        if self.items.len() < self.k {
-            self.items.push((distance, index));
-        } else {
-            let worst_idx = self
-                .items
-                .iter()
-                .enumerate()
-                .max_by(|a, b| a.1 .0.partial_cmp(&b.1 .0).unwrap())
-                .map(|(i, _)| i)
-                .unwrap();
-            if distance < self.items[worst_idx].0 {
-                self.items[worst_idx] = (distance, index);
-            }
-        }
+impl Ord for KnnCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist_sq
+            .partial_cmp(&other.dist_sq)
+            .unwrap_or(Ordering::Equal)
     }
+}
 
-    /// Drain into sorted `(original_index, distance)` pairs.
-    fn into_sorted(mut self) -> Vec<(usize, f64)> {
-        self.items.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-        self.items.into_iter().map(|(d, i)| (i, d)).collect()
+/// Squared Euclidean distance between two f64 slices.
+#[inline]
+fn dist_sq(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(ai, bi)| {
+            let d = ai - bi;
+            d * d
+        })
+        .sum()
+}
+
+/// Squared lower-bound distance from a query point to the nearest possible
+/// point inside a ball defined by `center` and `radius_sq`.
+///
+/// Returns zero when the query is inside the ball.
+#[inline]
+fn ball_lower_bound_sq(query: &[f64], center: &[f64], radius_sq: f64) -> f64 {
+    let d2 = dist_sq(query, center);
+    let d = d2.sqrt();
+    let r = radius_sq.sqrt();
+    let gap = d - r;
+    if gap > 0.0 {
+        gap * gap
+    } else {
+        0.0
     }
 }
 
 impl BallTree {
-    /// Build a ball tree from a dataset.
-    ///
-    /// Converts data to f64 internally and constructs a hierarchical
-    /// bounding-ball partition.
+    /// Build a ball tree from a dataset with the default leaf size.
     pub fn build<F: Float + Send + Sync + 'static>(data: &Array2<F>) -> Self {
+        Self::build_with_leaf_size(data, DEFAULT_LEAF_SIZE)
+    }
+
+    /// Build a ball tree with a custom leaf size.
+    pub fn build_with_leaf_size<F: Float + Send + Sync + 'static>(
+        data: &Array2<F>,
+        leaf_size: usize,
+    ) -> Self {
         let n_samples = data.nrows();
         let n_features = data.ncols();
+        let leaf_size = leaf_size.max(1);
 
         if n_samples == 0 {
             return Self {
-                root: None,
+                nodes: Vec::new(),
                 data: Vec::new(),
                 n_features,
                 indices: Vec::new(),
+                _leaf_size: leaf_size,
             };
         }
 
@@ -147,237 +171,266 @@ impl BallTree {
             .collect();
 
         let mut indices: Vec<usize> = (0..n_samples).collect();
+        let mut nodes = Vec::new();
 
-        let root = Self::build_recursive(&flat_data, &mut indices, 0, n_samples, n_features);
+        build_recursive(
+            &flat_data,
+            &mut indices,
+            0,
+            n_samples,
+            n_features,
+            &mut nodes,
+            leaf_size,
+        );
 
         Self {
-            root: Some(Box::new(root)),
+            nodes,
             data: flat_data,
             n_features,
             indices,
-        }
-    }
-
-    /// Recursively build the tree over indices[start..end].
-    fn build_recursive(
-        data: &[f64],
-        indices: &mut [usize],
-        start: usize,
-        end: usize,
-        n_features: usize,
-    ) -> BallNode {
-        let count = end - start;
-
-        // Find centroid of this subset.
-        let centroid = compute_centroid(data, &indices[start..end], n_features);
-
-        // Find the point closest to the centroid — that's our pivot.
-        let pivot_pos = find_closest_to_centroid(data, &indices[start..end], &centroid, n_features);
-        let pivot = indices[start + pivot_pos];
-
-        // Compute bounding radius: max distance from pivot to any point.
-        let radius = compute_radius(data, &indices[start..end], pivot, n_features);
-
-        // If small enough, make a leaf.
-        if count <= LEAF_SIZE {
-            return BallNode {
-                pivot,
-                radius,
-                start,
-                end,
-                left: None,
-                right: None,
-            };
-        }
-
-        // Split: find the dimension of greatest spread.
-        let split_dim = dimension_of_greatest_spread(data, &indices[start..end], n_features);
-
-        // Partition around the median along split_dim.
-        let mid = start + count / 2;
-        partition_by_dimension(data, &mut indices[start..end], split_dim, n_features);
-        // Now indices[start..mid] have smaller values along split_dim,
-        // indices[mid..end] have larger values.
-
-        let left = Self::build_recursive(data, indices, start, mid, n_features);
-        let right = Self::build_recursive(data, indices, mid, end, n_features);
-
-        BallNode {
-            pivot,
-            radius,
-            start,
-            end,
-            left: Some(Box::new(left)),
-            right: Some(Box::new(right)),
+            _leaf_size: leaf_size,
         }
     }
 
     /// Query the k nearest neighbors of a point.
     ///
     /// Returns `(original_index, distance)` pairs sorted by distance ascending.
+    /// The `_data` parameter is accepted for API compatibility but not used
+    /// (data is stored internally during build).
     pub fn query<F: Float + Send + Sync + 'static>(
         &self,
         _data: &Array2<F>,
         query: &[f64],
         k: usize,
     ) -> Vec<(usize, f64)> {
-        let mut heap = NeighborHeap::new(k);
-
-        if let Some(root) = &self.root {
-            self.search_recursive(root, query, &mut heap);
+        if self.nodes.is_empty() || k == 0 {
+            return Vec::new();
         }
 
-        heap.into_sorted()
+        let mut heap: BinaryHeap<KnnCandidate> = BinaryHeap::with_capacity(k);
+        self.knn_search(0, query, k, &mut heap);
+
+        let mut results: Vec<(usize, f64)> = heap
+            .into_iter()
+            .map(|c| (c.orig_idx, c.dist_sq.sqrt()))
+            .collect();
+        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        results
     }
 
-    /// Recursive search with ball pruning.
-    fn search_recursive(&self, node: &BallNode, query: &[f64], heap: &mut NeighborHeap) {
+    /// Find all points within `radius` of `query`.
+    ///
+    /// Returns `(original_index, distance)` pairs (unsorted).
+    pub fn within_radius(&self, query: &[f64], radius: f64) -> Vec<(usize, f64)> {
+        if self.nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let radius_sq = radius * radius;
+        let mut results = Vec::new();
+        self.radius_search(0, query, radius, radius_sq, &mut results);
+        results
+    }
+
+    fn knn_search(
+        &self,
+        node_idx: usize,
+        query: &[f64],
+        k: usize,
+        heap: &mut BinaryHeap<KnnCandidate>,
+    ) {
+        let node = &self.nodes[node_idx];
         let nf = self.n_features;
 
-        // Distance from query to this node's pivot.
-        let pivot_data = &self.data[node.pivot * nf..(node.pivot + 1) * nf];
-        let dist_to_pivot = euclidean_dist(query, pivot_data);
-
-        // Ball pruning: if the closest possible point in this ball is
-        // farther than our current worst, skip entirely.
-        let min_possible = (dist_to_pivot - node.radius).max(0.0);
-        if min_possible >= heap.worst_distance() {
-            return;
-        }
-
-        // If leaf, check all points.
-        if node.left.is_none() && node.right.is_none() {
-            for &idx in &self.indices[node.start..node.end] {
-                let point = &self.data[idx * nf..(idx + 1) * nf];
-                let d = euclidean_dist(query, point);
-                heap.try_insert(d, idx);
+        // Prune: if the closest possible point in this ball is farther than
+        // our current worst, skip this subtree.
+        if heap.len() == k {
+            let worst_sq = heap.peek().unwrap().dist_sq;
+            if ball_lower_bound_sq(query, &node.centroid, node.radius_sq) > worst_sq {
+                return;
             }
-            return;
         }
 
-        // Check the pivot point.
-        heap.try_insert(dist_to_pivot, node.pivot);
-
-        // Determine which child is closer and search it first.
-        let (closer, farther) = match (&node.left, &node.right) {
-            (Some(l), Some(r)) => {
-                let l_pivot = &self.data[l.pivot * nf..(l.pivot + 1) * nf];
-                let r_pivot = &self.data[r.pivot * nf..(r.pivot + 1) * nf];
-                let dl = euclidean_dist(query, l_pivot);
-                let dr = euclidean_dist(query, r_pivot);
-                if dl <= dr {
-                    (l.as_ref(), r.as_ref())
-                } else {
-                    (r.as_ref(), l.as_ref())
+        match node.kind {
+            NodeKind::Leaf => {
+                for &idx in &self.indices[node.start..node.end] {
+                    let point = &self.data[idx * nf..(idx + 1) * nf];
+                    let d2 = dist_sq(query, point);
+                    if heap.len() < k {
+                        heap.push(KnnCandidate {
+                            dist_sq: d2,
+                            orig_idx: idx,
+                        });
+                    } else if d2 < heap.peek().unwrap().dist_sq {
+                        heap.pop();
+                        heap.push(KnnCandidate {
+                            dist_sq: d2,
+                            orig_idx: idx,
+                        });
+                    }
                 }
             }
-            (Some(l), None) => {
-                self.search_recursive(l, query, heap);
-                return;
-            }
-            (None, Some(r)) => {
-                self.search_recursive(r, query, heap);
-                return;
-            }
-            (None, None) => unreachable!(),
-        };
+            NodeKind::Branch { left, right } => {
+                // Search the closer child first for better pruning.
+                let dl = dist_sq(query, &self.nodes[left].centroid);
+                let dr = dist_sq(query, &self.nodes[right].centroid);
 
-        self.search_recursive(closer, query, heap);
-        self.search_recursive(farther, query, heap);
+                let (first, second) = if dl <= dr {
+                    (left, right)
+                } else {
+                    (right, left)
+                };
+
+                self.knn_search(first, query, k, heap);
+                self.knn_search(second, query, k, heap);
+            }
+        }
+    }
+
+    fn radius_search(
+        &self,
+        node_idx: usize,
+        query: &[f64],
+        radius: f64,
+        radius_sq: f64,
+        results: &mut Vec<(usize, f64)>,
+    ) {
+        let node = &self.nodes[node_idx];
+        let nf = self.n_features;
+
+        let dist_to_center = dist_sq(query, &node.centroid).sqrt();
+        let node_radius = node.radius_sq.sqrt();
+
+        // Prune: ball is entirely outside the search radius.
+        if dist_to_center - node_radius > radius {
+            return;
+        }
+
+        // Bulk include: ball is entirely within the search radius.
+        if dist_to_center + node_radius <= radius {
+            for &idx in &self.indices[node.start..node.end] {
+                let point = &self.data[idx * nf..(idx + 1) * nf];
+                let d = dist_sq(query, point).sqrt();
+                results.push((idx, d));
+            }
+            return;
+        }
+
+        match node.kind {
+            NodeKind::Leaf => {
+                for &idx in &self.indices[node.start..node.end] {
+                    let point = &self.data[idx * nf..(idx + 1) * nf];
+                    let d2 = dist_sq(query, point);
+                    if d2 <= radius_sq {
+                        results.push((idx, d2.sqrt()));
+                    }
+                }
+            }
+            NodeKind::Branch { left, right } => {
+                self.radius_search(left, query, radius, radius_sq, results);
+                self.radius_search(right, query, radius, radius_sq, results);
+            }
+        }
     }
 }
 
-/// Euclidean distance between two f64 slices.
-#[inline]
-fn euclidean_dist(a: &[f64], b: &[f64]) -> f64 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(ai, bi)| (ai - bi) * (ai - bi))
-        .sum::<f64>()
-        .sqrt()
-}
+/// Recursively build the ball tree, appending nodes to the flat `nodes` vec.
+/// Returns the index of the created node.
+fn build_recursive(
+    data: &[f64],
+    indices: &mut [usize],
+    start: usize,
+    end: usize,
+    n_features: usize,
+    nodes: &mut Vec<Node>,
+    leaf_size: usize,
+) -> usize {
+    let count = end - start;
+    debug_assert!(count > 0);
 
-/// Compute the centroid of a set of points.
-fn compute_centroid(data: &[f64], indices: &[usize], n_features: usize) -> Vec<f64> {
-    let n = indices.len() as f64;
+    // Single pass: compute centroid and per-dimension min/max for split axis.
     let mut centroid = vec![0.0; n_features];
-    for &idx in indices {
+    let mut mins = vec![f64::INFINITY; n_features];
+    let mut maxs = vec![f64::NEG_INFINITY; n_features];
+
+    for &idx in &indices[start..end] {
         let base = idx * n_features;
         for j in 0..n_features {
-            centroid[j] += data[base + j];
+            let v = data[base + j];
+            centroid[j] += v;
+            if v < mins[j] {
+                mins[j] = v;
+            }
+            if v > maxs[j] {
+                maxs[j] = v;
+            }
         }
     }
+
+    let inv_n = 1.0 / count as f64;
     for v in &mut centroid {
-        *v /= n;
+        *v *= inv_n;
     }
-    centroid
-}
 
-/// Find the index (position within the slice) of the point closest to the centroid.
-fn find_closest_to_centroid(
-    data: &[f64],
-    indices: &[usize],
-    centroid: &[f64],
-    n_features: usize,
-) -> usize {
-    let mut best_pos = 0;
-    let mut best_dist = f64::INFINITY;
-    for (pos, &idx) in indices.iter().enumerate() {
+    // Compute squared radius: max squared distance from centroid to any point.
+    let mut radius_sq = 0.0_f64;
+    for &idx in &indices[start..end] {
         let point = &data[idx * n_features..(idx + 1) * n_features];
-        let d = euclidean_dist(point, centroid);
-        if d < best_dist {
-            best_dist = d;
-            best_pos = pos;
+        let d2 = dist_sq(&centroid, point);
+        if d2 > radius_sq {
+            radius_sq = d2;
         }
     }
-    best_pos
-}
 
-/// Compute the max distance from a pivot to any point in the set.
-fn compute_radius(data: &[f64], indices: &[usize], pivot: usize, n_features: usize) -> f64 {
-    let pivot_data = &data[pivot * n_features..(pivot + 1) * n_features];
-    let mut max_dist = 0.0_f64;
-    for &idx in indices {
-        let point = &data[idx * n_features..(idx + 1) * n_features];
-        let d = euclidean_dist(pivot_data, point);
-        if d > max_dist {
-            max_dist = d;
-        }
+    let node_idx = nodes.len();
+
+    // Leaf node.
+    if count <= leaf_size {
+        nodes.push(Node {
+            centroid,
+            radius_sq,
+            start,
+            end,
+            kind: NodeKind::Leaf,
+        });
+        return node_idx;
     }
-    max_dist
-}
 
-/// Find the dimension with the greatest spread among the given points.
-fn dimension_of_greatest_spread(data: &[f64], indices: &[usize], n_features: usize) -> usize {
-    let mut best_dim = 0;
-    let mut best_spread = f64::NEG_INFINITY;
-    for dim in 0..n_features {
-        let mut lo = f64::INFINITY;
-        let mut hi = f64::NEG_INFINITY;
-        for &idx in indices {
-            let v = data[idx * n_features + dim];
-            lo = lo.min(v);
-            hi = hi.max(v);
-        }
-        let spread = hi - lo;
-        if spread > best_spread {
-            best_spread = spread;
-            best_dim = dim;
-        }
-    }
-    best_dim
-}
-
-/// Partition indices around the median value along the given dimension.
-/// After this call, indices[..mid] have smaller values and indices[mid..]
-/// have larger values along `dim`.
-fn partition_by_dimension(data: &[f64], indices: &mut [usize], dim: usize, n_features: usize) {
-    let mid = indices.len() / 2;
-    indices.select_nth_unstable_by(mid, |&a, &b| {
-        let va = data[a * n_features + dim];
-        let vb = data[b * n_features + dim];
-        va.partial_cmp(&vb).unwrap()
+    // Reserve slot — children will be appended after.
+    nodes.push(Node {
+        centroid,
+        radius_sq,
+        start,
+        end,
+        kind: NodeKind::Leaf, // placeholder
     });
+
+    // Split along the dimension of greatest spread.
+    let split_dim = mins
+        .iter()
+        .zip(maxs.iter())
+        .enumerate()
+        .max_by(|(_, (a_min, a_max)), (_, (b_min, b_max))| {
+            (*a_max - *a_min)
+                .partial_cmp(&(*b_max - *b_min))
+                .unwrap_or(Ordering::Equal)
+        })
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let mid = start + count / 2;
+    indices[start..end].select_nth_unstable_by(mid - start, |&a, &b| {
+        let va = data[a * n_features + split_dim];
+        let vb = data[b * n_features + split_dim];
+        va.partial_cmp(&vb).unwrap_or(Ordering::Equal)
+    });
+
+    let left = build_recursive(data, indices, start, mid, n_features, nodes, leaf_size);
+    let right = build_recursive(data, indices, mid, end, n_features, nodes, leaf_size);
+
+    nodes[node_idx].kind = NodeKind::Branch { left, right };
+
+    node_idx
 }
 
 #[cfg(test)]
@@ -390,14 +443,14 @@ mod tests {
     fn test_build_empty() {
         let data = Array2::<f64>::zeros((0, 2));
         let tree = BallTree::build(&data);
-        assert!(tree.root.is_none());
+        assert!(tree.nodes.is_empty());
     }
 
     #[test]
     fn test_build_single_point() {
         let data = Array2::from_shape_vec((1, 2), vec![1.0, 2.0]).unwrap();
         let tree = BallTree::build(&data);
-        assert!(tree.root.is_some());
+        assert_eq!(tree.nodes.len(), 1);
 
         let neighbors = tree.query(&data, &[1.0, 2.0], 1);
         assert_eq!(neighbors.len(), 1);
@@ -485,6 +538,185 @@ mod tests {
                 bt.1,
                 bf.1
             );
+        }
+    }
+
+    #[test]
+    fn test_custom_leaf_size() {
+        let data = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0, 1.0, 2.0,
+            ],
+        )
+        .unwrap();
+
+        for leaf_size in [1, 2, 4, 8, 16] {
+            let tree = BallTree::build_with_leaf_size(&data, leaf_size);
+            let query = [0.5, 0.5];
+
+            for k in 1..=8 {
+                let bt_result = tree.query(&data, &query, k);
+                let bf_result = kdtree::brute_force_knn(&data, &query, k);
+
+                assert_eq!(bt_result.len(), bf_result.len(), "leaf_size={leaf_size}, k={k}");
+                for (bt, bf) in bt_result.iter().zip(bf_result.iter()) {
+                    assert!(
+                        (bt.1 - bf.1).abs() < 1e-10,
+                        "leaf_size={leaf_size}, k={k}: bt={}, bf={}",
+                        bt.1,
+                        bf.1
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_within_radius_basic() {
+        let data =
+            Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 5.0, 5.0]).unwrap();
+
+        let tree = BallTree::build(&data);
+        // Points within distance 1.5 of origin: (0,0), (1,0), (0,1)
+        let results = tree.within_radius(&[0.0, 0.0], 1.5);
+        let mut indices: Vec<usize> = results.iter().map(|r| r.0).collect();
+        indices.sort();
+        assert_eq!(indices, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn test_within_radius_empty() {
+        let data =
+            Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+
+        let tree = BallTree::build(&data);
+        let results = tree.within_radius(&[10.0, 10.0], 0.1);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_within_radius_all() {
+        let data =
+            Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+
+        let tree = BallTree::build(&data);
+        let results = tree.within_radius(&[0.5, 0.5], 100.0);
+        assert_eq!(results.len(), 4);
+    }
+
+    #[test]
+    fn test_within_radius_brute_force_comparison() {
+        let n = 50;
+        let d = 5;
+        let flat: Vec<f64> = (0..n * d).map(|i| (i as f64) * 0.1).collect();
+        let data = Array2::from_shape_vec((n, d), flat.clone()).unwrap();
+
+        let tree = BallTree::build(&data);
+        let query = vec![1.0; d];
+        let radius = 3.0;
+
+        let mut bt_results = tree.within_radius(&query, radius);
+        bt_results.sort_by_key(|r| r.0);
+
+        // Brute force
+        let mut bf_results: Vec<(usize, f64)> = (0..n)
+            .filter_map(|i| {
+                let point = &flat[i * d..(i + 1) * d];
+                let d2: f64 = point.iter().zip(query.iter()).map(|(a, b)| (a - b).powi(2)).sum();
+                let dist = d2.sqrt();
+                if dist <= radius {
+                    Some((i, dist))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        bf_results.sort_by_key(|r| r.0);
+
+        assert_eq!(bt_results.len(), bf_results.len(), "count mismatch");
+        for (bt, bf) in bt_results.iter().zip(bf_results.iter()) {
+            assert_eq!(bt.0, bf.0);
+            assert!((bt.1 - bf.1).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_query_empty_tree() {
+        let data = Array2::<f64>::zeros((0, 2));
+        let tree = BallTree::build(&data);
+        let results = tree.query(&data, &[0.0, 0.0], 5);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_query_k_zero() {
+        let data = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 1.0]).unwrap();
+        let tree = BallTree::build(&data);
+        let results = tree.query(&data, &[0.0, 0.0], 0);
+        assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_large_dataset() {
+        // 500 points in 10 dimensions
+        let n = 500;
+        let d = 10;
+        let flat: Vec<f64> = (0..n * d).map(|i| ((i * 7 + 13) % 100) as f64 * 0.01).collect();
+        let data = Array2::from_shape_vec((n, d), flat).unwrap();
+
+        let tree = BallTree::build(&data);
+        let query: Vec<f64> = vec![0.5; d];
+
+        let bt_result = tree.query(&data, &query, 10);
+        let bf_result = kdtree::brute_force_knn(&data, &query, 10);
+
+        assert_eq!(bt_result.len(), bf_result.len());
+        for (bt, bf) in bt_result.iter().zip(bf_result.iter()) {
+            assert!(
+                (bt.1 - bf.1).abs() < 1e-9,
+                "bt={}, bf={}",
+                bt.1,
+                bf.1
+            );
+        }
+    }
+
+    #[test]
+    fn test_bounding_invariant() {
+        // Every point should be within the root node's bounding ball.
+        let data = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                0.0, 0.0, 1.0, 0.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 1.0, 0.0, 2.0, 1.0, 2.0,
+            ],
+        )
+        .unwrap();
+
+        let tree = BallTree::build(&data);
+        let root = &tree.nodes[0];
+
+        for i in 0..8 {
+            let point = &tree.data[i * 2..(i + 1) * 2];
+            let d2 = dist_sq(&root.centroid, point);
+            assert!(
+                d2 <= root.radius_sq + 1e-10,
+                "point {i} at dist_sq={d2} outside root radius_sq={}",
+                root.radius_sq
+            );
+        }
+    }
+
+    #[test]
+    fn test_duplicate_points() {
+        let flat: Vec<f64> = std::iter::repeat_n([5.0, 5.0], 20).flatten().collect();
+        let data = Array2::from_shape_vec((20, 2), flat).unwrap();
+
+        let tree = BallTree::build(&data);
+        let results = tree.query(&data, &[5.0, 5.0], 5);
+        assert_eq!(results.len(), 5);
+        for r in &results {
+            assert!(r.1 < 1e-10);
         }
     }
 }
