@@ -10,6 +10,11 @@ readme = "README.md"
 keywords = ["machine-learning", "serialization", "messagepack", "model-persistence", "ferrolearn"]
 categories = ["science", "encoding"]
 
+[features]
+default = []
+onnx = ["ndarray", "num-traits", "ferrolearn-linear", "ferrolearn-tree"]
+pmml = ["ndarray", "num-traits", "ferrolearn-linear"]
+
 [dependencies]
 ferrolearn-core.workspace = true
 serde = { workspace = true }
@@ -17,5 +22,15 @@ serde_json.workspace = true
 rmp-serde.workspace = true
 crc32fast.workspace = true
 
+# Optional deps for ONNX/PMML export
+ndarray = { workspace = true, optional = true }
+num-traits = { workspace = true, optional = true }
+ferrolearn-linear = { workspace = true, optional = true }
+ferrolearn-tree = { workspace = true, optional = true }
+
 [dev-dependencies]
 approx.workspace = true
+ndarray.workspace = true
+num-traits.workspace = true
+ferrolearn-linear.workspace = true
+ferrolearn-tree.workspace = true

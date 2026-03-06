@@ -9,6 +9,11 @@
 //! (`rmp-serde`) with a CRC32 integrity checksum, or alternatively
 //! exported to JSON via `serde_json`.
 //!
+//! ## Feature Flags
+//!
+//! - **`onnx`** — Enables ONNX protobuf model export via the [`onnx`] module.
+//! - **`pmml`** — Enables PMML 4.4 XML model export via the [`pmml`] module.
+//!
 //! # Example
 //!
 //! ```no_run
@@ -26,6 +31,12 @@
 //! let loaded: MyModel = load_model("/tmp/my_model.flrn").unwrap();
 //! assert_eq!(model, loaded);
 //! ```
+
+#[cfg(feature = "onnx")]
+pub mod onnx;
+
+#[cfg(feature = "pmml")]
+pub mod pmml;
 
 use std::fs;
 use std::path::Path;

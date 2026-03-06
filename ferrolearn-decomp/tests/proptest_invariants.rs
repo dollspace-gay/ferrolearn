@@ -11,17 +11,19 @@ use proptest::prelude::*;
 
 /// Strategy for PCA data: at least 3 rows, 2-4 features, n_components <= n_features.
 fn pca_data_strategy() -> impl Strategy<Value = (Array2<f64>, usize, usize, usize)> {
-    (2usize..=4usize).prop_flat_map(|n_feat| {
-        // n_components between 1 and n_feat
-        (1usize..=n_feat, Just(n_feat))
-    }).prop_flat_map(|(n_comp, n_feat)| {
-        // n_samples between max(3, n_feat+1) and n_feat+8
-        let min_samples = 3usize.max(n_feat + 1);
-        let max_samples = n_feat + 8;
-        (min_samples..=max_samples, Just(n_feat), Just(n_comp))
-    }).prop_flat_map(|(n_samples, n_feat, n_comp)| {
-        proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat)
-            .prop_map(move |data| {
+    (2usize..=4usize)
+        .prop_flat_map(|n_feat| {
+            // n_components between 1 and n_feat
+            (1usize..=n_feat, Just(n_feat))
+        })
+        .prop_flat_map(|(n_comp, n_feat)| {
+            // n_samples between max(3, n_feat+1) and n_feat+8
+            let min_samples = 3usize.max(n_feat + 1);
+            let max_samples = n_feat + 8;
+            (min_samples..=max_samples, Just(n_feat), Just(n_comp))
+        })
+        .prop_flat_map(|(n_samples, n_feat, n_comp)| {
+            proptest::collection::vec(-5.0..5.0f64, n_samples * n_feat).prop_map(move |data| {
                 (
                     Array2::from_shape_vec((n_samples, n_feat), data).unwrap(),
                     n_samples,
@@ -29,7 +31,7 @@ fn pca_data_strategy() -> impl Strategy<Value = (Array2<f64>, usize, usize, usiz
                     n_comp,
                 )
             })
-    })
+        })
 }
 
 // ---------------------------------------------------------------------------

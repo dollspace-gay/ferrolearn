@@ -70,10 +70,14 @@
 //! ```
 
 pub mod binarizer;
+pub mod binary_encoder;
 pub mod column_transformer;
 pub mod feature_selection;
 pub mod function_transformer;
 pub mod imputer;
+pub mod iterative_imputer;
+pub mod kbins_discretizer;
+pub mod knn_imputer;
 pub mod label_encoder;
 pub mod max_abs_scaler;
 pub mod min_max_scaler;
@@ -82,8 +86,13 @@ pub mod one_hot_encoder;
 pub mod ordinal_encoder;
 pub mod polynomial_features;
 pub mod power_transformer;
+pub mod quantile_transformer;
+pub mod rfe;
 pub mod robust_scaler;
+pub mod select_percentile;
+pub mod spline_transformer;
 pub mod standard_scaler;
+pub mod target_encoder;
 
 // Re-exports
 pub use binarizer::Binarizer;
@@ -106,3 +115,16 @@ pub use polynomial_features::PolynomialFeatures;
 pub use power_transformer::{FittedPowerTransformer, PowerTransformer};
 pub use robust_scaler::{FittedRobustScaler, RobustScaler};
 pub use standard_scaler::{FittedStandardScaler, StandardScaler};
+
+// Phase 3 re-exports
+pub use binary_encoder::{BinaryEncoder, FittedBinaryEncoder};
+pub use iterative_imputer::{FittedIterativeImputer, InitialStrategy, IterativeImputer};
+pub use kbins_discretizer::{BinEncoding, BinStrategy, FittedKBinsDiscretizer, KBinsDiscretizer};
+pub use knn_imputer::{FittedKNNImputer, KNNImputer, KNNWeights};
+pub use quantile_transformer::{
+    FittedQuantileTransformer, OutputDistribution, QuantileTransformer,
+};
+pub use rfe::{RFE, RFECV};
+pub use select_percentile::{FittedSelectPercentile, SelectPercentile};
+pub use spline_transformer::{FittedSplineTransformer, KnotStrategy, SplineTransformer};
+pub use target_encoder::{FittedTargetEncoder, TargetEncoder};

@@ -1,6 +1,6 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use ferrolearn_bench::{SIZES, classification_data};
 use ferrolearn_bayes::GaussianNB;
+use ferrolearn_bench::{SIZES, classification_data};
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_linear::LogisticRegression;
 use ferrolearn_neighbors::KNeighborsClassifier;

@@ -9,7 +9,8 @@
 //!
 //! 1. Compute the per-feature mean and centre the data.
 //! 2. Compute the covariance matrix `C = X_centered^T X_centered / (n - 1)`.
-//! 3. Eigendecompose `C` using the Jacobi iterative method.
+//! 3. Eigendecompose `C` using faer's optimised self-adjoint eigensolver
+//!    (for f64/f32), with a Jacobi fallback for other float types.
 //! 4. Sort eigenvalues in descending order and retain the top `n_components`.
 //! 5. Store the corresponding eigenvectors as rows of `components_`.
 //!
@@ -32,6 +33,7 @@ use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+use std::any::TypeId;
 
 // ---------------------------------------------------------------------------
 // PCA (unfitted)
@@ -267,6 +269,87 @@ fn jacobi_eigen<F: Float + Send + Sync + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// faer-accelerated eigendecomposition for f64 and f32
+// ---------------------------------------------------------------------------
+
+/// Perform eigendecomposition of a symmetric matrix using faer's optimised
+/// self-adjoint eigensolver. Returns `(eigenvalues, eigenvectors)` where
+/// `eigenvectors` is column-major (column `i` is the eigenvector for
+/// `eigenvalues[i]`). Eigenvalues are returned in ascending order.
+fn faer_eigen_f64(a: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), FerroError> {
+    let n = a.nrows();
+    let mat = faer::Mat::from_fn(n, n, |i, j| a[[i, j]]);
+    let decomp = mat.self_adjoint_eigen(faer::Side::Lower).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("faer symmetric eigendecomposition failed: {e:?}"),
+        }
+    })?;
+
+    let eigenvalues = Array1::from_shape_fn(n, |i| decomp.S().column_vector()[i]);
+    let eigenvectors = Array2::from_shape_fn((n, n), |(i, j)| decomp.U()[(i, j)]);
+
+    Ok((eigenvalues, eigenvectors))
+}
+
+/// Perform eigendecomposition of a symmetric f32 matrix using faer's
+/// optimised self-adjoint eigensolver.
+fn faer_eigen_f32(a: &Array2<f32>) -> Result<(Array1<f32>, Array2<f32>), FerroError> {
+    let n = a.nrows();
+    let mat = faer::Mat::from_fn(n, n, |i, j| a[[i, j]]);
+    let decomp = mat.self_adjoint_eigen(faer::Side::Lower).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("faer symmetric eigendecomposition failed: {e:?}"),
+        }
+    })?;
+
+    let eigenvalues = Array1::from_shape_fn(n, |i| decomp.S().column_vector()[i]);
+    let eigenvectors = Array2::from_shape_fn((n, n), |(i, j)| decomp.U()[(i, j)]);
+
+    Ok((eigenvalues, eigenvectors))
+}
+
+/// Dispatch eigendecomposition to faer for f64/f32, falling back to
+/// Jacobi for other float types.
+///
+/// Returns `(eigenvalues, eigenvectors)` where `eigenvectors` is column-major.
+/// Eigenvalues are NOT guaranteed to be sorted in any particular order.
+fn eigen_dispatch<F: Float + Send + Sync + 'static>(
+    a: &Array2<F>,
+    max_jacobi_iter: usize,
+) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    // SAFETY: We check TypeId at runtime and only reinterpret when the types
+    // match. The transmutes are between identical types (Array<f64> -> Array<F>
+    // when F == f64, etc.).
+    if TypeId::of::<F>() == TypeId::of::<f64>() {
+        // F is f64 — cast through raw pointers to call the f64 specialisation.
+        let a_f64: &Array2<f64> = unsafe { &*(std::ptr::from_ref(a).cast::<Array2<f64>>()) };
+        let (eigenvalues, eigenvectors) = faer_eigen_f64(a_f64)?;
+        // Cast back from f64 to F (which is f64).
+        let eigenvalues_f: Array1<F> =
+            unsafe { std::mem::transmute_copy::<Array1<f64>, Array1<F>>(&eigenvalues) };
+        let eigenvectors_f: Array2<F> =
+            unsafe { std::mem::transmute_copy::<Array2<f64>, Array2<F>>(&eigenvectors) };
+        // Prevent double-free of the originals.
+        std::mem::forget(eigenvalues);
+        std::mem::forget(eigenvectors);
+        Ok((eigenvalues_f, eigenvectors_f))
+    } else if TypeId::of::<F>() == TypeId::of::<f32>() {
+        let a_f32: &Array2<f32> = unsafe { &*(std::ptr::from_ref(a).cast::<Array2<f32>>()) };
+        let (eigenvalues, eigenvectors) = faer_eigen_f32(a_f32)?;
+        let eigenvalues_f: Array1<F> =
+            unsafe { std::mem::transmute_copy::<Array1<f32>, Array1<F>>(&eigenvalues) };
+        let eigenvectors_f: Array2<F> =
+            unsafe { std::mem::transmute_copy::<Array2<f32>, Array2<F>>(&eigenvectors) };
+        std::mem::forget(eigenvalues);
+        std::mem::forget(eigenvectors);
+        Ok((eigenvalues_f, eigenvectors_f))
+    } else {
+        // Fallback to Jacobi for exotic float types.
+        jacobi_eigen(a, max_jacobi_iter)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Trait implementations
 // ---------------------------------------------------------------------------
 
@@ -332,9 +415,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
         let mut cov = xt.dot(&x_centered);
         cov.mapv_inplace(|v| v / n_minus_1);
 
-        // Step 3: eigendecompose
+        // Step 3: eigendecompose (faer fast-path for f64/f32, Jacobi fallback)
         let max_jacobi_iter = n_features * n_features * 100 + 1000;
-        let (eigenvalues, eigenvectors) = jacobi_eigen(&cov, max_jacobi_iter)?;
+        let (eigenvalues, eigenvectors) = eigen_dispatch(&cov, max_jacobi_iter)?;
 
         // Step 4: sort eigenvalues descending and select top n_components
         let mut indices: Vec<usize> = (0..n_features).collect();
@@ -420,10 +503,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPCA<F> {
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline integration (f64 specialisation)
+// Pipeline integration (generic)
 // ---------------------------------------------------------------------------
 
-impl PipelineTransformer for PCA<f64> {
+impl<F: Float + Send + Sync + 'static> PipelineTransformer<F> for PCA<F> {
     /// Fit PCA using the pipeline interface.
     ///
     /// The `y` argument is ignored; PCA is unsupervised.
@@ -433,21 +516,21 @@ impl PipelineTransformer for PCA<f64> {
     /// Propagates errors from [`Fit::fit`].
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        _y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineTransformer>, FerroError> {
+        x: &Array2<F>,
+        _y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineTransformer<F>>, FerroError> {
         let fitted = self.fit(x, &())?;
         Ok(Box::new(fitted))
     }
 }
 
-impl FittedPipelineTransformer for FittedPCA<f64> {
+impl<F: Float + Send + Sync + 'static> FittedPipelineTransformer<F> for FittedPCA<F> {
     /// Transform data using the pipeline interface.
     ///
     /// # Errors
     ///
     /// Propagates errors from [`Transform::transform`].
-    fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+    fn transform_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         self.transform(x)
     }
 }
@@ -704,19 +787,19 @@ mod tests {
         // Trivial estimator that sums each row.
         struct SumEstimator;
 
-        impl PipelineEstimator for SumEstimator {
+        impl PipelineEstimator<f64> for SumEstimator {
             fn fit_pipeline(
                 &self,
                 _x: &Array2<f64>,
                 _y: &Array1<f64>,
-            ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+            ) -> Result<Box<dyn FittedPipelineEstimator<f64>>, FerroError> {
                 Ok(Box::new(FittedSumEstimator))
             }
         }
 
         struct FittedSumEstimator;
 
-        impl FittedPipelineEstimator for FittedSumEstimator {
+        impl FittedPipelineEstimator<f64> for FittedSumEstimator {
             fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
                 let sums: Vec<f64> = x.rows().into_iter().map(|r| r.sum()).collect();
                 Ok(Array1::from_vec(sums))

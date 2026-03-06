@@ -1,9 +1,7 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ferrolearn_bench::{SIZES, regression_data};
 use ferrolearn_core::{Fit, Predict};
-use ferrolearn_linear::{
-    ElasticNet, Lasso, LinearRegression, Ridge,
-};
+use ferrolearn_linear::{ElasticNet, Lasso, LinearRegression, Ridge};
 
 fn bench_linear_regression(c: &mut Criterion) {
     let mut group = c.benchmark_group("LinearRegression");

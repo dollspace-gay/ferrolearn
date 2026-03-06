@@ -43,7 +43,7 @@ use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand::seq::index::sample as rand_sample_indices;
@@ -367,6 +367,32 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for GradientBoo
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedGradientBoostingRegressor<F> {
+    /// Returns the initial prediction (intercept) of the boosted model.
+    #[must_use]
+    pub fn init(&self) -> F {
+        self.init
+    }
+
+    /// Returns the learning rate used during training.
+    #[must_use]
+    pub fn learning_rate(&self) -> F {
+        self.learning_rate
+    }
+
+    /// Returns a reference to the sequence of fitted trees.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Node<F>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGradientBoostingRegressor<F> {
     type Output = Array1<F>;
     type Error = FerroError;
@@ -411,20 +437,22 @@ impl<F: Float + Send + Sync + 'static> HasFeatureImportances<F>
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for GradientBoostingRegressor<f64> {
+// Pipeline integration.
+impl<F: Float + Send + Sync + 'static> PipelineEstimator<F> for GradientBoostingRegressor<F> {
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
         let fitted = self.fit(x, y)?;
         Ok(Box::new(fitted))
     }
 }
 
-impl FittedPipelineEstimator for FittedGradientBoostingRegressor<f64> {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F: Float + Send + Sync + 'static> FittedPipelineEstimator<F>
+    for FittedGradientBoostingRegressor<F>
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.predict(x)
     }
 }
@@ -892,6 +920,35 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedGradientBoostingClassifier<F> {
+    /// Returns the initial predictions per class (log-odds or log-prior).
+    #[must_use]
+    pub fn init(&self) -> &[F] {
+        &self.init
+    }
+
+    /// Returns the learning rate used during training.
+    #[must_use]
+    pub fn learning_rate(&self) -> F {
+        self.learning_rate
+    }
+
+    /// Returns a reference to the tree ensemble.
+    ///
+    /// For binary classification, `trees()[0]` contains all trees.
+    /// For multiclass, `trees()[k]` contains trees for class `k`.
+    #[must_use]
+    pub fn trees(&self) -> &[Vec<Vec<Node<F>>>] {
+        &self.trees
+    }
+
+    /// Returns the number of features the model was trained on.
+    #[must_use]
+    pub fn n_features(&self) -> usize {
+        self.n_features
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGradientBoostingClassifier<F> {
     type Output = Array1<usize>;
     type Error = FerroError;
@@ -979,26 +1036,32 @@ impl<F: Float + Send + Sync + 'static> HasClasses for FittedGradientBoostingClas
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for GradientBoostingClassifier<f64> {
+// Pipeline integration.
+impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> PipelineEstimator<F>
+    for GradientBoostingClassifier<F>
+{
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
-        let y_usize = y.mapv(|v| v as usize);
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
         let fitted = self.fit(x, &y_usize)?;
         Ok(Box::new(FittedGbcPipelineAdapter(fitted)))
     }
 }
 
-/// Pipeline adapter for `FittedGradientBoostingClassifier<f64>`.
-struct FittedGbcPipelineAdapter(FittedGradientBoostingClassifier<f64>);
+/// Pipeline adapter for `FittedGradientBoostingClassifier<F>`.
+struct FittedGbcPipelineAdapter<F: Float + Send + Sync + 'static>(
+    FittedGradientBoostingClassifier<F>,
+);
 
-impl FittedPipelineEstimator for FittedGbcPipelineAdapter {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipelineEstimator<F>
+    for FittedGbcPipelineAdapter<F>
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| v as f64))
+        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or(F::nan())))
     }
 }
 

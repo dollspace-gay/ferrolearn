@@ -45,7 +45,8 @@ use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
+use rayon::prelude::*;
 
 use crate::balltree::BallTree;
 use crate::kdtree::{self, KdTree};
@@ -126,9 +127,7 @@ fn find_neighbors<F: Float + Send + Sync + 'static>(
                 .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
                 .collect()
         }
-        SpatialIndex::None => {
-            kdtree::brute_force_knn(data, query_row, k)
-        }
+        SpatialIndex::None => kdtree::brute_force_knn(data, query_row, k),
     }
 }
 
@@ -348,21 +347,40 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
         }
 
         let n_samples = x.nrows();
-        let mut predictions = Array1::<usize>::zeros(n_samples);
 
-        for i in 0..n_samples {
-            let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let neighbors = find_neighbors(
-                &self.x_train,
-                &query,
-                self.n_neighbors,
-                &self.spatial_index,
-            );
+        // Use a threshold to avoid Rayon overhead on small inputs.
+        const PAR_THRESHOLD: usize = 256;
 
-            predictions[i] = self.weighted_vote(&neighbors);
-        }
+        let predictions_vec: Vec<usize> = if n_samples >= PAR_THRESHOLD {
+            (0..n_samples)
+                .into_par_iter()
+                .map(|i| {
+                    let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
+                    let neighbors = find_neighbors(
+                        &self.x_train,
+                        &query,
+                        self.n_neighbors,
+                        &self.spatial_index,
+                    );
+                    self.weighted_vote(&neighbors)
+                })
+                .collect()
+        } else {
+            (0..n_samples)
+                .map(|i| {
+                    let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
+                    let neighbors = find_neighbors(
+                        &self.x_train,
+                        &query,
+                        self.n_neighbors,
+                        &self.spatial_index,
+                    );
+                    self.weighted_vote(&neighbors)
+                })
+                .collect()
+        };
 
-        Ok(predictions)
+        Ok(Array1::from_vec(predictions_vec))
     }
 }
 
@@ -425,33 +443,40 @@ impl<F: Float + Send + Sync + 'static> HasClasses for FittedKNeighborsClassifier
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for KNeighborsClassifier<f64> {
+// Pipeline integration.
+impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> PipelineEstimator<F>
+    for KNeighborsClassifier<F>
+{
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
-        // Convert f64 labels to usize.
-        let y_usize: Array1<usize> = y.mapv(|v| v as usize);
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        // Convert float labels to usize.
+        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
         let fitted = self.fit(x, &y_usize)?;
         Ok(Box::new(FittedKNeighborsClassifierPipeline(fitted)))
     }
 }
 
-/// Wrapper for pipeline integration that converts predictions to f64.
-struct FittedKNeighborsClassifierPipeline(FittedKNeighborsClassifier<f64>);
+/// Wrapper for pipeline integration that converts predictions to float.
+struct FittedKNeighborsClassifierPipeline<F: Float + Send + Sync + 'static>(
+    FittedKNeighborsClassifier<F>,
+);
 
-// Safety: FittedKNeighborsClassifier<f64> is Send + Sync because all its
-// fields (Array2<f64>, Array1<usize>, usize, Weights, Option<KdTree>, Vec<usize>)
+// Safety: FittedKNeighborsClassifier<F> is Send + Sync because all its
+// fields (Array2<F>, Array1<usize>, usize, Weights, Option<KdTree>, Vec<usize>)
 // are Send + Sync.
-unsafe impl Send for FittedKNeighborsClassifierPipeline {}
-unsafe impl Sync for FittedKNeighborsClassifierPipeline {}
+unsafe impl<F: Float + Send + Sync + 'static> Send for FittedKNeighborsClassifierPipeline<F> {}
+unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedKNeighborsClassifierPipeline<F> {}
 
-impl FittedPipelineEstimator for FittedKNeighborsClassifierPipeline {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipelineEstimator<F>
+    for FittedKNeighborsClassifierPipeline<F>
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| v as f64))
+
+        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or(F::nan())))
     }
 }
 
@@ -640,21 +665,40 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
         }
 
         let n_samples = x.nrows();
-        let mut predictions = Array1::<F>::zeros(n_samples);
 
-        for i in 0..n_samples {
-            let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let neighbors = find_neighbors(
-                &self.x_train,
-                &query,
-                self.n_neighbors,
-                &self.spatial_index,
-            );
+        // Use a threshold to avoid Rayon overhead on small inputs.
+        const PAR_THRESHOLD: usize = 256;
 
-            predictions[i] = self.weighted_mean(&neighbors);
-        }
+        let predictions_vec: Vec<F> = if n_samples >= PAR_THRESHOLD {
+            (0..n_samples)
+                .into_par_iter()
+                .map(|i| {
+                    let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
+                    let neighbors = find_neighbors(
+                        &self.x_train,
+                        &query,
+                        self.n_neighbors,
+                        &self.spatial_index,
+                    );
+                    self.weighted_mean(&neighbors)
+                })
+                .collect()
+        } else {
+            (0..n_samples)
+                .map(|i| {
+                    let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
+                    let neighbors = find_neighbors(
+                        &self.x_train,
+                        &query,
+                        self.n_neighbors,
+                        &self.spatial_index,
+                    );
+                    self.weighted_mean(&neighbors)
+                })
+                .collect()
+        };
 
-        Ok(predictions)
+        Ok(Array1::from_vec(predictions_vec))
     }
 }
 
@@ -699,28 +743,30 @@ impl<F: Float + Send + Sync + 'static> FittedKNeighborsRegressor<F> {
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for KNeighborsRegressor<f64> {
+// Pipeline integration.
+impl<F: Float + Send + Sync + 'static> PipelineEstimator<F> for KNeighborsRegressor<F> {
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
         let fitted = self.fit(x, y)?;
         Ok(Box::new(FittedKNeighborsRegressorPipeline(fitted)))
     }
 }
 
 /// Wrapper for pipeline integration.
-struct FittedKNeighborsRegressorPipeline(FittedKNeighborsRegressor<f64>);
+struct FittedKNeighborsRegressorPipeline<F: Float + Send + Sync + 'static>(
+    FittedKNeighborsRegressor<F>,
+);
 
-// Safety: FittedKNeighborsRegressor<f64> is Send + Sync because all its
-// fields are Send + Sync.
-unsafe impl Send for FittedKNeighborsRegressorPipeline {}
-unsafe impl Sync for FittedKNeighborsRegressorPipeline {}
+unsafe impl<F: Float + Send + Sync + 'static> Send for FittedKNeighborsRegressorPipeline<F> {}
+unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedKNeighborsRegressorPipeline<F> {}
 
-impl FittedPipelineEstimator for FittedKNeighborsRegressorPipeline {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F: Float + Send + Sync + 'static> FittedPipelineEstimator<F>
+    for FittedKNeighborsRegressorPipeline<F>
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.0.predict(x)
     }
 }

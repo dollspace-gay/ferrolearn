@@ -125,11 +125,7 @@ pub struct RsDecisionTreeClassifier {
 impl RsDecisionTreeClassifier {
     #[new]
     #[pyo3(signature = (max_depth=None, min_samples_split=2, min_samples_leaf=1))]
-    fn new(
-        max_depth: Option<usize>,
-        min_samples_split: usize,
-        min_samples_leaf: usize,
-    ) -> Self {
+    fn new(max_depth: Option<usize>, min_samples_split: usize, min_samples_leaf: usize) -> Self {
         Self {
             max_depth,
             min_samples_split,
@@ -196,10 +192,7 @@ impl RsDecisionTreeClassifier {
     }
 
     #[getter]
-    fn feature_importances_<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn feature_importances_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let fitted = self
             .fitted
             .as_ref()
@@ -289,10 +282,7 @@ impl RsRandomForestClassifier {
     }
 
     #[getter]
-    fn feature_importances_<'py>(
-        &self,
-        py: Python<'py>,
-    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn feature_importances_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let fitted = self
             .fitted
             .as_ref()

@@ -27,7 +27,7 @@ use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2, Axis, ScalarOperand};
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive};
 
 use crate::linalg;
 
@@ -147,8 +147,7 @@ impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'stati
             })
         } else {
             // Try fast Cholesky normal equations first, fall back to QR.
-            let w = linalg::solve_normal_equations(x, y)
-                .or_else(|_| linalg::solve_lstsq(x, y))?;
+            let w = linalg::solve_normal_equations(x, y).or_else(|_| linalg::solve_lstsq(x, y))?;
 
             Ok(FittedLinearRegression {
                 coefficients: w,
@@ -199,20 +198,26 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for LinearRegression<f64> {
+// Pipeline integration.
+impl<F> PipelineEstimator<F> for LinearRegression<F>
+where
+    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
         let fitted = self.fit(x, y)?;
         Ok(Box::new(fitted))
     }
 }
 
-impl FittedPipelineEstimator for FittedLinearRegression<f64> {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F> FittedPipelineEstimator<F> for FittedLinearRegression<F>
+where
+    F: Float + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.predict(x)
     }
 }

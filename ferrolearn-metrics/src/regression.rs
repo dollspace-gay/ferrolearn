@@ -765,10 +765,7 @@ mod kani_proofs {
 
         let result = explained_variance_score(&y_true, &y_pred);
         if let Ok(evs) = result {
-            assert!(
-                !evs.is_nan(),
-                "EVS must not be NaN for non-constant y_true"
-            );
+            assert!(!evs.is_nan(), "EVS must not be NaN for non-constant y_true");
         }
     }
 }

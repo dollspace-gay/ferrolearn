@@ -40,22 +40,31 @@
 pub mod bayesian_ridge;
 pub mod elastic_net;
 pub mod huber_regressor;
+pub mod isotonic;
 pub mod lasso;
 pub mod lda;
 mod linalg;
 pub mod linear_regression;
 pub mod logistic_regression;
 mod optim;
+pub mod ransac;
 pub mod ridge;
 pub mod sgd;
+pub mod svm;
 
 // Re-export the main types at the crate root.
 pub use bayesian_ridge::{BayesianRidge, FittedBayesianRidge};
 pub use elastic_net::{ElasticNet, FittedElasticNet};
 pub use huber_regressor::{FittedHuberRegressor, HuberRegressor};
+pub use isotonic::{FittedIsotonicRegression, IsotonicRegression};
 pub use lasso::{FittedLasso, Lasso};
 pub use lda::{FittedLDA, LDA};
 pub use linear_regression::{FittedLinearRegression, LinearRegression};
 pub use logistic_regression::{FittedLogisticRegression, LogisticRegression};
+pub use ransac::{FittedRANSACRegressor, RANSACRegressor};
 pub use ridge::{FittedRidge, Ridge};
 pub use sgd::{FittedSGDClassifier, FittedSGDRegressor, SGDClassifier, SGDRegressor};
+pub use svm::{
+    FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,
+    SigmoidKernel,
+};

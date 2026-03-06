@@ -1,13 +1,13 @@
 [package]
 name = "ferrolearn-decomp"
-version = "0.1.0"
+version = "0.1.3"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Dimensionality reduction and decomposition for the ferrolearn ML framework"
 readme = "README.md"
-keywords = ["machine-learning", "pca", "svd", "dimensionality-reduction", "decomposition"]
+keywords = ["machine-learning", "pca", "svd", "dim-reduction", "decomposition"]
 categories = ["science", "algorithms"]
 
 [dependencies]

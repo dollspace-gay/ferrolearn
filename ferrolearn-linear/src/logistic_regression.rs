@@ -32,7 +32,7 @@ use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2, Axis, ScalarOperand};
-use num_traits::Float;
+use num_traits::{Float, FromPrimitive, ToPrimitive};
 
 use crate::optim::lbfgs::LbfgsOptimizer;
 
@@ -486,6 +486,27 @@ fn softmax_2d<F: Float>(logits: &Array2<F>) -> Array2<F> {
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedLogisticRegression<F> {
+    /// Returns a reference to the full weight matrix.
+    ///
+    /// For binary classification, shape is `(1, n_features)`.
+    /// For multiclass, shape is `(n_classes, n_features)`.
+    #[must_use]
+    pub fn weight_matrix(&self) -> &Array2<F> {
+        &self.weight_matrix
+    }
+
+    /// Returns a reference to the intercept vector (one per class).
+    #[must_use]
+    pub fn intercept_vec(&self) -> &Array1<F> {
+        &self.intercept_vec
+    }
+
+    /// Returns whether this is a binary classification model.
+    #[must_use]
+    pub fn is_binary(&self) -> bool {
+        self.is_binary
+    }
+
     /// Predict class probabilities for the given feature matrix.
     ///
     /// For binary classification, returns an array of shape `(n_samples, 2)`.
@@ -582,31 +603,39 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasClasses for FittedLogi
     }
 }
 
-// Pipeline integration for f64.
-impl PipelineEstimator for LogisticRegression<f64> {
+// Pipeline integration.
+impl<F> PipelineEstimator<F> for LogisticRegression<F>
+where
+    F: Float + ToPrimitive + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
         // Convert f64 labels to usize.
-        let y_usize: Array1<usize> = y.mapv(|v| v as usize);
+        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
         let fitted = self.fit(x, &y_usize)?;
         Ok(Box::new(FittedLogisticRegressionPipeline(fitted)))
     }
 }
 
-/// Wrapper for pipeline integration that converts predictions to f64.
-struct FittedLogisticRegressionPipeline(FittedLogisticRegression<f64>);
+/// Wrapper for pipeline integration that converts predictions to float.
+struct FittedLogisticRegressionPipeline<F>(FittedLogisticRegression<F>)
+where
+    F: Float + Send + Sync + 'static;
 
 // Safety: the inner type is Send + Sync.
-unsafe impl Send for FittedLogisticRegressionPipeline {}
-unsafe impl Sync for FittedLogisticRegressionPipeline {}
+unsafe impl<F: Float + Send + Sync + 'static> Send for FittedLogisticRegressionPipeline<F> {}
+unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedLogisticRegressionPipeline<F> {}
 
-impl FittedPipelineEstimator for FittedLogisticRegressionPipeline {
-    fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+impl<F> FittedPipelineEstimator<F> for FittedLogisticRegressionPipeline<F>
+where
+    F: Float + ToPrimitive + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| v as f64))
+        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or(F::nan())))
     }
 }
 

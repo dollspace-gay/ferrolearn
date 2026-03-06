@@ -1,9 +1,11 @@
 [package]
 name = "ferrolearn-python"
-version = "0.1.0"
+version = "0.1.1"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Python bindings for ferrolearn via PyO3"
 
 [lib]
 name = "_ferrolearn_rs"

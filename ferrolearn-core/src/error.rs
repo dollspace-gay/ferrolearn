@@ -4,7 +4,10 @@
 //! all ferrolearn crates. Each variant carries diagnostic context to help
 //! users identify and fix problems.
 
-use std::fmt;
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
+
+use core::fmt;
 
 /// The unified error type for all ferrolearn operations.
 ///
@@ -75,6 +78,7 @@ pub enum FerroError {
     },
 
     /// An I/O error occurred during data loading or model persistence.
+    #[cfg(feature = "std")]
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 
@@ -217,6 +221,7 @@ mod tests {
         assert!(err.to_string().contains("matrix is singular"));
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn test_io_error_from() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");

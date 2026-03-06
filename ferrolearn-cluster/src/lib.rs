@@ -16,6 +16,10 @@
 //! - **[`MeanShift`]** — Non-parametric mode-seeking clustering (REQ-23).
 //! - **[`SpectralClustering`]** — Graph Laplacian eigenmap clustering (REQ-23).
 //! - **[`OPTICS`]** — Ordering Points To Identify the Clustering Structure (REQ-23).
+//! - **[`Hdbscan`]** — Hierarchical DBSCAN with automatic cluster detection.
+//! - **[`Birch`]** — Balanced Iterative Reducing and Clustering using Hierarchies.
+//! - **[`LabelPropagation`]** — Semi-supervised label propagation through a similarity graph.
+//! - **[`LabelSpreading`]** — Semi-supervised label spreading via normalized graph Laplacian.
 //!
 //! # Design
 //!
@@ -40,6 +44,14 @@
 //!   labels — it does **not** implement `Predict`.
 //! - [`OPTICS`] produces [`FittedOPTICS`], which stores the reachability
 //!   ordering and distances — it does **not** implement `Predict`.
+//! - [`Hdbscan`] produces [`FittedHdbscan`], which stores labels and
+//!   probabilities — it does **not** implement `Predict`.
+//! - [`Birch`] produces [`FittedBirch`], which stores labels and subcluster
+//!   centers — it does **not** implement `Predict`.
+//! - [`LabelPropagation`] produces [`FittedLabelPropagation`], which implements
+//!   [`Predict`](ferrolearn_core::Predict) for new data via nearest-neighbor lookup.
+//! - [`LabelSpreading`] produces [`FittedLabelSpreading`], which implements
+//!   [`Predict`](ferrolearn_core::Predict) for new data via nearest-neighbor lookup.
 //!
 //! # Float Generics
 //!
@@ -47,9 +59,13 @@
 //! supporting both `f32` and `f64`.
 
 pub mod agglomerative;
+pub mod birch;
 pub mod dbscan;
 pub mod gmm;
+pub mod hdbscan;
 pub mod kmeans;
+pub mod label_propagation;
+pub mod label_spreading;
 pub mod mean_shift;
 pub mod mini_batch_kmeans;
 pub mod optics;
@@ -57,9 +73,13 @@ pub mod spectral;
 
 // Re-export the main types at the crate root.
 pub use agglomerative::{AgglomerativeClustering, FittedAgglomerativeClustering, Linkage};
+pub use birch::{Birch, FittedBirch};
 pub use dbscan::{DBSCAN, FittedDBSCAN};
 pub use gmm::{CovarianceType, FittedGaussianMixture, GaussianMixture};
+pub use hdbscan::{FittedHdbscan, Hdbscan};
 pub use kmeans::{FittedKMeans, KMeans};
+pub use label_propagation::{FittedLabelPropagation, LabelPropagation, LabelPropagationKernel};
+pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel};
 pub use mean_shift::{FittedMeanShift, MeanShift};
 pub use mini_batch_kmeans::{FittedMiniBatchKMeans, MiniBatchKMeans, MiniBatchKMeansInit};
 pub use optics::{FittedOPTICS, OPTICS};

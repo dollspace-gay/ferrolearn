@@ -182,7 +182,7 @@ pub trait FitTransform<X>: Transform<X> {
 
 /// Incrementally train a model on a batch of data.
 ///
-/// Unlike [`Fit`], `PartialFit` can be called multiple times — each call
+/// Unlike [`Fit`], `PartialFit` can be called multiple times -- each call
 /// updates the model with a new batch. This enables online/streaming learning.
 ///
 /// The trait is implemented by both unfitted models (first call) and fitted
@@ -196,7 +196,7 @@ pub trait PartialFit<X, Y>: Sized {
     type FitResult: Predict<X> + PartialFit<X, Y>;
 
     /// The error type returned by [`partial_fit`](PartialFit::partial_fit).
-    type Error: std::error::Error;
+    type Error: core::fmt::Display;
 
     /// Update the model with a new batch of data.
     ///
@@ -212,10 +212,10 @@ mod tests {
     use super::*;
     use crate::error::FerroError;
 
-    /// A dummy unfitted model — does NOT implement Predict.
+    /// A dummy unfitted model -- does NOT implement Predict.
     struct DummyEstimator;
 
-    /// A dummy fitted model — implements Predict.
+    /// A dummy fitted model -- implements Predict.
     struct FittedDummyEstimator {
         _learned_value: f64,
     }

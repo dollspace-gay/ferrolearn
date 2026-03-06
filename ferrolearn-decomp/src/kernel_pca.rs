@@ -597,10 +597,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKernelPCA<
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline integration (f64 specialisation)
+// Pipeline integration (generic)
 // ---------------------------------------------------------------------------
 
-impl PipelineTransformer for KernelPCA<f64> {
+impl<F: Float + Send + Sync + 'static> PipelineTransformer<F> for KernelPCA<F> {
     /// Fit KernelPCA using the pipeline interface.
     ///
     /// The `y` argument is ignored; Kernel PCA is unsupervised.
@@ -610,21 +610,21 @@ impl PipelineTransformer for KernelPCA<f64> {
     /// Propagates errors from [`Fit::fit`].
     fn fit_pipeline(
         &self,
-        x: &Array2<f64>,
-        _y: &Array1<f64>,
-    ) -> Result<Box<dyn FittedPipelineTransformer>, FerroError> {
+        x: &Array2<F>,
+        _y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineTransformer<F>>, FerroError> {
         let fitted = self.fit(x, &())?;
         Ok(Box::new(fitted))
     }
 }
 
-impl FittedPipelineTransformer for FittedKernelPCA<f64> {
+impl<F: Float + Send + Sync + 'static> FittedPipelineTransformer<F> for FittedKernelPCA<F> {
     /// Transform data using the pipeline interface.
     ///
     /// # Errors
     ///
     /// Propagates errors from [`Transform::transform`].
-    fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+    fn transform_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         self.transform(x)
     }
 }
@@ -858,19 +858,19 @@ mod tests {
 
         struct SumEstimator;
 
-        impl PipelineEstimator for SumEstimator {
+        impl PipelineEstimator<f64> for SumEstimator {
             fn fit_pipeline(
                 &self,
                 _x: &Array2<f64>,
                 _y: &Array1<f64>,
-            ) -> Result<Box<dyn FittedPipelineEstimator>, FerroError> {
+            ) -> Result<Box<dyn FittedPipelineEstimator<f64>>, FerroError> {
                 Ok(Box::new(FittedSumEstimator))
             }
         }
 
         struct FittedSumEstimator;
 
-        impl FittedPipelineEstimator for FittedSumEstimator {
+        impl FittedPipelineEstimator<f64> for FittedSumEstimator {
             fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
                 let sums: Vec<f64> = x.rows().into_iter().map(|r| r.sum()).collect();
                 Ok(Array1::from_vec(sums))

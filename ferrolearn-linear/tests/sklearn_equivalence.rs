@@ -138,10 +138,7 @@ fn sklearn_equiv_linear_regression() {
     );
 
     // R2 score.
-    let actual_r2 = r2_score(
-        y.as_slice().unwrap(),
-        preds.as_slice().unwrap(),
-    );
+    let actual_r2 = r2_score(y.as_slice().unwrap(), preds.as_slice().unwrap());
     assert!(
         (actual_r2 - expected_r2).abs() < 1e-10,
         "LinearRegression R2: actual={actual_r2}, expected={expected_r2}"

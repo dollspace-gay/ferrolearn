@@ -213,8 +213,13 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
     centers
 }
 
-/// Threshold below which we skip Rayon and run serially.
-const PARALLEL_THRESHOLD: usize = 512;
+/// Minimum work units (samples * features) before we parallelize.
+///
+/// Rayon's fork/join overhead is not amortized when the per-task work is
+/// small. At 1K samples x 10 features (10K work units), the serial path
+/// is faster. At 10K samples x 100 features (1M work units), parallelism
+/// wins comfortably.
+const PARALLEL_WORK_THRESHOLD: usize = 100_000;
 
 /// Assign each sample to its nearest centroid.
 ///
@@ -237,9 +242,9 @@ fn assign_clusters_into<F: Float + Send + Sync>(
     x: &Array2<F>,
     centers: &Array2<F>,
 ) -> F {
-    let n_samples = x.nrows();
+    let work = x.nrows() * x.ncols();
 
-    if n_samples < PARALLEL_THRESHOLD {
+    if work < PARALLEL_WORK_THRESHOLD {
         assign_serial(labels, x, centers)
     } else {
         assign_parallel(labels, x, centers)
@@ -265,11 +270,7 @@ fn nearest_center<F: Float>(row_slice: &[F], centers: &Array2<F>) -> (usize, F) 
 }
 
 /// Serial assignment — no thread-pool overhead.
-fn assign_serial<F: Float>(
-    labels: &mut Array1<usize>,
-    x: &Array2<F>,
-    centers: &Array2<F>,
-) -> F {
+fn assign_serial<F: Float>(labels: &mut Array1<usize>, x: &Array2<F>, centers: &Array2<F>) -> F {
     let n_samples = x.nrows();
     let mut inertia = F::zero();
     for i in 0..n_samples {
@@ -529,8 +530,9 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKMeans<F> 
         let centers = &self.cluster_centers_;
 
         let mut distances = vec![F::zero(); n_samples * k];
+        let work = n_samples * n_features;
 
-        if n_samples < PARALLEL_THRESHOLD {
+        if work < PARALLEL_WORK_THRESHOLD {
             for i in 0..n_samples {
                 let row = x.row(i);
                 let row_slice = row.as_slice().unwrap_or(&[]);
@@ -547,10 +549,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKMeans<F> 
                 .for_each(|(i, chunk)| {
                     let row = x.row(i);
                     let row_slice = row.as_slice().unwrap_or(&[]);
-                    for c in 0..k {
+                    for (c, slot) in chunk.iter_mut().enumerate() {
                         let center = centers.row(c);
                         let cs = center.as_slice().unwrap_or(&[]);
-                        chunk[c] = squared_euclidean(row_slice, cs).sqrt();
+                        *slot = squared_euclidean(row_slice, cs).sqrt();
                     }
                 });
         }

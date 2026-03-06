@@ -1010,14 +1010,8 @@ mod kani_proofs {
 
         let result = silhouette_score(&x, &labels);
         if let Ok(score) = result {
-            assert!(
-                score >= -1.0,
-                "silhouette score must be >= -1.0"
-            );
-            assert!(
-                score <= 1.0,
-                "silhouette score must be <= 1.0"
-            );
+            assert!(score >= -1.0, "silhouette score must be >= -1.0");
+            assert!(score <= 1.0, "silhouette score must be <= 1.0");
         }
     }
 
@@ -1044,10 +1038,7 @@ mod kani_proofs {
 
         let result = davies_bouldin_score(&x, &labels);
         if let Ok(score) = result {
-            assert!(
-                score >= 0.0,
-                "Davies-Bouldin score must be >= 0.0"
-            );
+            assert!(score >= 0.0, "Davies-Bouldin score must be >= 0.0");
         }
     }
 }
