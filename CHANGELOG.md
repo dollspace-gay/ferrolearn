@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ## [0.1.0] - 2026-03-04
 
 ### Added
+- Resolve open questions in kernel regression design document (#18)
+- Add kernel regression design document for ferrolearn-kernel crate (#17)
 - Add Pipeline support for f32 data (generic over float type) (#14)
 
 Initial release with full scikit-learn-equivalent coverage across 14 crates.

@@ -14,6 +14,7 @@ members = [
     "ferrolearn-sparse",
     "ferrolearn-datasets",
     "ferrolearn-io",
+    "ferrolearn-kernel",
     "ferrolearn-python",
     "ferrolearn-bench",
 ]
@@ -57,3 +58,4 @@ ferrolearn-model-sel = { path = "ferrolearn-model-sel", version = "0.1.0" }
 ferrolearn-sparse = { path = "ferrolearn-sparse", version = "0.1.0" }
 ferrolearn-datasets = { path = "ferrolearn-datasets", version = "0.1.0" }
 ferrolearn-io = { path = "ferrolearn-io", version = "0.1.0" }
+ferrolearn-kernel = { path = "ferrolearn-kernel", version = "0.1.0" }

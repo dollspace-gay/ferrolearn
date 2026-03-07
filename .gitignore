@@ -40,3 +40,6 @@
 # Python
 __pycache__/
 *.so
+
+# Reference implementations (not project source)
+.reference/
