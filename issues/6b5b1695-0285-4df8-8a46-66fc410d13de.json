@@ -6,8 +6,17 @@
   "priority": "high",
   "created_by": "anon-2101b8a8",
   "created_at": "2026-03-14T17:04:36.852004869Z",
-  "updated_at": "2026-03-14T17:04:38.427452892Z",
+  "updated_at": "2026-03-14T17:04:59.849297621Z",
   "labels": [
     "enhancement"
+  ],
+  "comments": [
+    {
+      "id": 1,
+      "author": "anon-2101b8a8",
+      "content": "Plan: extend scripts/generate_fixtures.py with ~35 new generators for 6 crates (bayes, cluster, preprocess, model-sel, metrics, numerical), generate JSON fixtures, then write/extend oracle_tests.rs in each crate. All Python deps available (sklearn 1.7.2, numpy 2.3.5, scipy 1.16.3).",
+      "created_at": "2026-03-14T17:04:59.849296550Z",
+      "kind": "plan"
+    }
   ]
 }
