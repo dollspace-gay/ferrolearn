@@ -383,6 +383,26 @@ pub fn adjusted_rand_score(
 // adjusted_mutual_info
 // ---------------------------------------------------------------------------
 
+/// Normalization method for [`adjusted_mutual_info_with_method`].
+///
+/// Selects the entropy-aggregation function used to form the AMI denominator
+/// `aggregate(H(U), H(V)) - E[MI]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmiMethod {
+    /// Aggregate entropies by their arithmetic mean: `(H(U) + H(V)) / 2`.
+    ///
+    /// This matches scikit-learn's `adjusted_mutual_info_score` default
+    /// (`average_method='arithmetic'`) and is the default used by
+    /// [`adjusted_mutual_info`].
+    Arithmetic,
+    /// Aggregate by the geometric mean: `sqrt(H(U) * H(V))`.
+    Geometric,
+    /// Aggregate by the minimum entropy: `min(H(U), H(V))`.
+    Min,
+    /// Aggregate by the maximum entropy: `max(H(U), H(V))`.
+    Max,
+}
+
 /// Compute the Adjusted Mutual Information (AMI) between two clusterings.
 ///
 /// AMI corrects the Mutual Information (MI) for chance. A score of `1.0`
@@ -392,12 +412,17 @@ pub fn adjusted_rand_score(
 /// The formula used is:
 ///
 /// ```text
-/// MI = sum_{i,j} p_{ij} * log(p_{ij} / (p_i * p_j))
-/// AMI = (MI - E[MI]) / (max(H_true, H_pred) - E[MI])
+/// MI  = sum_{i,j} p_{ij} * log(p_{ij} / (p_i * p_j))
+/// AMI = (MI - E[MI]) / ((H_true + H_pred) / 2 - E[MI])
 /// ```
 ///
 /// where `E[MI]` is the expected MI under random permutations (computed using
-/// the exact formula from Vinh et al., 2010).
+/// the exact formula from Vinh et al., 2010). The denominator uses the
+/// arithmetic mean of the entropies, matching the scikit-learn default
+/// (`adjusted_mutual_info_score(..., average_method='arithmetic')`).
+///
+/// To select a different aggregation (geometric, min, or max), use
+/// [`adjusted_mutual_info_with_method`] with the corresponding [`AmiMethod`].
 ///
 /// # Arguments
 ///
@@ -422,6 +447,49 @@ pub fn adjusted_rand_score(
 pub fn adjusted_mutual_info(
     labels_true: &Array1<isize>,
     labels_pred: &Array1<isize>,
+) -> Result<f64, FerroError> {
+    adjusted_mutual_info_with_method(labels_true, labels_pred, AmiMethod::Arithmetic)
+}
+
+/// Compute the Adjusted Mutual Information (AMI) between two clusterings using
+/// a caller-selected entropy aggregation method.
+///
+/// The score is computed as
+///
+/// ```text
+/// AMI = (MI - E[MI]) / (aggregate(H_true, H_pred) - E[MI])
+/// ```
+///
+/// where `aggregate` is selected by the [`AmiMethod`] argument. See
+/// [`adjusted_mutual_info`] for the default ([`AmiMethod::Arithmetic`], which
+/// matches scikit-learn).
+///
+/// # Arguments
+///
+/// * `labels_true` — ground-truth cluster labels.
+/// * `labels_pred` — predicted cluster labels.
+/// * `method`      — entropy aggregation strategy.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
+/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::{adjusted_mutual_info_with_method, AmiMethod};
+/// use ndarray::array;
+///
+/// let labels = array![0isize, 0, 1, 1, 2, 2];
+/// let ami =
+///     adjusted_mutual_info_with_method(&labels, &labels, AmiMethod::Geometric).unwrap();
+/// assert!((ami - 1.0).abs() < 1e-10);
+/// ```
+pub fn adjusted_mutual_info_with_method(
+    labels_true: &Array1<isize>,
+    labels_pred: &Array1<isize>,
+    method: AmiMethod,
 ) -> Result<f64, FerroError> {
     let n = labels_true.len();
     check_labels_same_length(n, labels_pred.len(), "adjusted_mutual_info")?;
@@ -481,7 +549,14 @@ pub fn adjusted_mutual_info(
     // Expected MI (exact formula from Vinh et al., 2010).
     let e_mi = expected_mutual_info(&a, &b, n as u64);
 
-    let denominator = f64::max(h_true, h_pred) - e_mi;
+    let aggregate = match method {
+        AmiMethod::Arithmetic => f64::midpoint(h_true, h_pred),
+        AmiMethod::Geometric => (h_true * h_pred).sqrt(),
+        AmiMethod::Min => h_true.min(h_pred),
+        AmiMethod::Max => h_true.max(h_pred),
+    };
+
+    let denominator = aggregate - e_mi;
 
     if denominator.abs() < f64::EPSILON {
         return Ok(1.0);
@@ -1960,6 +2035,22 @@ mod tests {
         let lp = array![0isize, 0, 0, 0, 0, 0];
         let ami = adjusted_mutual_info(&lt, &lp).unwrap();
         assert!(ami <= 0.1, "expected near 0, got {ami}");
+    }
+
+    #[test]
+    fn test_ami_mixed_labels_matches_sklearn_arithmetic() {
+        // Discriminating case for the sklearn-parity fix (#1073): the previous
+        // hardcoded `max` denominator returned ~0.225042283, while sklearn's
+        // default `average_method='arithmetic'` returns ~0.298792458.
+        //
+        // Reference: scikit-learn 1.5.2,
+        //   sklearn.metrics.adjusted_mutual_info_score(
+        //       [0, 0, 1, 1, 2, 2], [0, 0, 0, 1, 1, 1])
+        //   -> 0.2987924581708901
+        let lt = array![0isize, 0, 1, 1, 2, 2];
+        let lp = array![0isize, 0, 0, 1, 1, 1];
+        let ami = adjusted_mutual_info(&lt, &lp).unwrap();
+        assert_abs_diff_eq!(ami, 0.298_792_458_170_890_1, epsilon = 1e-9);
     }
 
     // -----------------------------------------------------------------------
