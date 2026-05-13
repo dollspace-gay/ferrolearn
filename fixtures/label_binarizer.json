@@ -1,0 +1,62 @@
+{
+  "description": "LabelBinarizer on 3-class labels",
+  "random_state": 42,
+  "input": {
+    "y": [
+      0,
+      1,
+      2,
+      0,
+      1,
+      2,
+      0
+    ]
+  },
+  "params": {},
+  "expected": {
+    "transformed": [
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ],
+      [
+        1,
+        0,
+        0
+      ],
+      [
+        0,
+        1,
+        0
+      ],
+      [
+        0,
+        0,
+        1
+      ],
+      [
+        1,
+        0,
+        0
+      ]
+    ],
+    "classes": [
+      0,
+      1,
+      2
+    ]
+  },
+  "sklearn_version": "1.5.2",
+  "sklearn_pin": "scikit-learn==1.5.2"
+}

@@ -20,7 +20,6 @@ use ferrolearn_core::traits::Transform;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 
-
 // ---------------------------------------------------------------------------
 // Direction
 // ---------------------------------------------------------------------------
@@ -157,12 +156,8 @@ impl SequentialFeatureSelector {
         }
 
         let selected_indices = match self.direction {
-            Direction::Forward => {
-                self.forward_search(x, y, n_features, &score_fn)?
-            }
-            Direction::Backward => {
-                self.backward_search(x, y, n_features, &score_fn)?
-            }
+            Direction::Forward => self.forward_search(x, y, n_features, &score_fn)?,
+            Direction::Backward => self.backward_search(x, y, n_features, &score_fn)?,
         };
 
         Ok(FittedSequentialFeatureSelector {
@@ -276,9 +271,7 @@ impl<F: Float + Send + Sync + 'static> FittedSequentialFeatureSelector<F> {
     }
 }
 
-impl<F: Float + Send + Sync + 'static> Transform<Array2<F>>
-    for FittedSequentialFeatureSelector<F>
-{
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSequentialFeatureSelector<F> {
     type Output = Array2<F>;
     type Error = FerroError;
 

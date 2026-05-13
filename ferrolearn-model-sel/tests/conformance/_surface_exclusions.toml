@@ -1,0 +1,125 @@
+# Documented exclusions for ferrolearn-model-sel.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_model_sel::ClassifierChain"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::CvResults"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FitScoreFn"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedCalibratedClassifierCV"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedClassifierChain"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedDummyClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedDummyRegressor"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedFeatureUnion"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedFixedThresholdClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedMultiOutputClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedMultiOutputRegressor"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedOneVsOneClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedOneVsRestClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedOutputCodeClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedRegressorChain"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedSelfTrainingClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedTransformedTargetRegressor"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FittedTunedThresholdClassifierCV"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::FixedThresholdClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::LearningCurveResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::LeavePGroupsOut"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::OutputCodeClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::PartialDependenceResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::PermutationImportanceResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::RegressorChain"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::StratifiedGroupKFold"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::ThresholdScoring"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::TunedThresholdClassifierCV"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::UNLABELED"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_model_sel::ValidationCurveResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

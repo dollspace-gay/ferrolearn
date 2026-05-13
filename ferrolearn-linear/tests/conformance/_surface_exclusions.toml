@@ -1,0 +1,110 @@
+# Documented exclusions from the ferrolearn-linear conformance gate.
+#
+# An entry here says: "this public item is not (yet) covered by a sklearn
+# conformance test, and that is an acceptable temporary state because <reason>."
+#
+# Move items OUT of this file by writing a conformance test that mentions
+# the item's leaf name. The coverage gate test scans test sources by text.
+
+# Estimators that do not yet have fixtures. Filling these in is the
+# main follow-up tracked in #333.
+
+[[exclusion]]
+path = "ferrolearn_linear::ARDRegression"
+reason = "No fixture yet. Add via gap-fixture generator. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::BayesianRidge"
+reason = "No fixture yet. Add via gap-fixture generator. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::HuberRegressor"
+reason = "No fixture yet. Add via gap-fixture generator. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::IsotonicRegression"
+reason = "No fixture yet. Different API than sklearn (scalar y input). Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::Lars"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LassoLars"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LinearSVC"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LinearSVR"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LogisticRegressionCV"
+reason = "No fixture yet (CV variant of LogisticRegression). Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::NuSVC"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::NuSVR"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::OneClassSVM"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::OrthogonalMatchingPursuit"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::QDA"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LDA"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::QuantileRegressor"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::RANSACRegressor"
+reason = "No fixture yet (sampling-based; expected output is bound on inlier mask)."
+
+[[exclusion]]
+path = "ferrolearn_linear::RidgeClassifier"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::RidgeCV"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::LassoCV"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::ElasticNetCV"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::SGDClassifier"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::SGDRegressor"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::SVC"
+reason = "No fixture yet. Tracked under #333 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_linear::SVR"
+reason = "No fixture yet. Tracked under #333 follow-up."

@@ -1,7 +1,8 @@
 //! Ordinal encoder: map string categories to integer indices.
 //!
-//! Each column's categories are mapped to integers `0, 1, 2, ...` in **order
-//! of first appearance** in the training data. Unknown categories seen during
+//! Each column's categories are mapped to integers `0, 1, 2, ...` in
+//! **lexicographic order** (matching scikit-learn's `OrdinalEncoder`).
+//! Unknown categories seen during
 //! `transform` produce an error.
 
 use ferrolearn_core::error::FerroError;
@@ -16,7 +17,7 @@ use std::collections::HashMap;
 /// An unfitted ordinal encoder.
 ///
 /// Calling [`Fit::fit`] on an `Array2<String>` learns, for each column, a
-/// mapping from the unique string categories (in order of first appearance)
+/// mapping from the unique string categories (sorted lexicographically)
 /// to consecutive integers `0, 1, 2, ...`, and returns a
 /// [`FittedOrdinalEncoder`].
 ///
@@ -93,7 +94,8 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
 
     /// Fit the encoder by building per-column category-to-index mappings.
     ///
-    /// Categories are recorded in **order of first appearance** in each column.
+    /// Categories are recorded in **lexicographic order** in each column,
+    /// matching scikit-learn's `OrdinalEncoder.categories_`.
     ///
     /// # Errors
     ///
@@ -113,19 +115,28 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
         let mut category_to_index = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
-            let mut seen: Vec<String> = Vec::new();
-            let mut map: HashMap<String, usize> = HashMap::new();
-
+            // Collect unique categories then sort lexicographically so the
+            // assigned indices match sklearn's `OrdinalEncoder`, which
+            // documents `categories_ = sorted(unique(X[:, j]))`. (Older
+            // ferrolearn versions used first-seen order — #344.)
+            let mut unique: Vec<String> = Vec::new();
+            let mut seen_set: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
             for i in 0..n_samples {
-                let cat = x[[i, j]].clone();
-                if !map.contains_key(&cat) {
-                    let idx = seen.len();
-                    map.insert(cat.clone(), idx);
-                    seen.push(cat);
+                let cat = &x[[i, j]];
+                if seen_set.insert(cat.clone()) {
+                    unique.push(cat.clone());
                 }
             }
+            unique.sort();
 
-            categories.push(seen);
+            let map: HashMap<String, usize> = unique
+                .iter()
+                .enumerate()
+                .map(|(idx, s)| (s.clone(), idx))
+                .collect();
+
+            categories.push(unique);
             category_to_index.push(map);
         }
 
@@ -239,19 +250,19 @@ mod tests {
         ]);
         let fitted = enc.fit(&x, &()).unwrap();
 
-        // Categories should be in order of first appearance
-        assert_eq!(fitted.categories()[0], vec!["cat", "dog", "bird"]);
-        assert_eq!(fitted.categories()[1], vec!["small", "large", "medium"]);
+        // Categories are sorted lexicographically (sklearn convention).
+        assert_eq!(fitted.categories()[0], vec!["bird", "cat", "dog"]);
+        assert_eq!(fitted.categories()[1], vec!["large", "medium", "small"]);
 
         let encoded = fitted.transform(&x).unwrap();
-        assert_eq!(encoded[[0, 0]], 0); // "cat" -> 0
-        assert_eq!(encoded[[1, 0]], 1); // "dog" -> 1
-        assert_eq!(encoded[[2, 0]], 0); // "cat" -> 0
-        assert_eq!(encoded[[3, 0]], 2); // "bird" -> 2
-        assert_eq!(encoded[[0, 1]], 0); // "small" -> 0
-        assert_eq!(encoded[[1, 1]], 1); // "large" -> 1
-        assert_eq!(encoded[[2, 1]], 2); // "medium" -> 2
-        assert_eq!(encoded[[3, 1]], 0); // "small" -> 0
+        assert_eq!(encoded[[0, 0]], 1); // "cat"  -> 1 (lex pos)
+        assert_eq!(encoded[[1, 0]], 2); // "dog"  -> 2
+        assert_eq!(encoded[[2, 0]], 1); // "cat"  -> 1
+        assert_eq!(encoded[[3, 0]], 0); // "bird" -> 0
+        assert_eq!(encoded[[0, 1]], 2); // "small"  -> 2
+        assert_eq!(encoded[[1, 1]], 0); // "large"  -> 0
+        assert_eq!(encoded[[2, 1]], 1); // "medium" -> 1
+        assert_eq!(encoded[[3, 1]], 2); // "small"  -> 2
     }
 
     #[test]
@@ -308,12 +319,13 @@ mod tests {
         ];
         let x = Array2::from_shape_vec((4, 1), flat).unwrap();
         let fitted = enc.fit(&x, &()).unwrap();
-        assert_eq!(fitted.categories()[0], vec!["red", "green", "blue"]);
+        // Lex order: blue (0), green (1), red (2)
+        assert_eq!(fitted.categories()[0], vec!["blue", "green", "red"]);
         let encoded = fitted.transform(&x).unwrap();
-        assert_eq!(encoded[[0, 0]], 0);
-        assert_eq!(encoded[[1, 0]], 1);
-        assert_eq!(encoded[[2, 0]], 2);
-        assert_eq!(encoded[[3, 0]], 0);
+        assert_eq!(encoded[[0, 0]], 2); // red
+        assert_eq!(encoded[[1, 0]], 1); // green
+        assert_eq!(encoded[[2, 0]], 0); // blue
+        assert_eq!(encoded[[3, 0]], 2); // red
     }
 
     #[test]
@@ -325,15 +337,15 @@ mod tests {
     }
 
     #[test]
-    fn test_first_appearance_order() {
-        // Categories must be in first-appearance order, NOT alphabetical
+    fn test_lexicographic_order() {
+        // Categories are sorted lexicographically to match sklearn (#344).
         let enc = OrdinalEncoder::new();
         let flat = vec!["zebra".to_string(), "ant".to_string(), "moose".to_string()];
         let x = Array2::from_shape_vec((3, 1), flat).unwrap();
         let fitted = enc.fit(&x, &()).unwrap();
-        // zebra first, then ant, then moose
-        assert_eq!(fitted.categories()[0][0], "zebra");
-        assert_eq!(fitted.categories()[0][1], "ant");
-        assert_eq!(fitted.categories()[0][2], "moose");
+        // ant < moose < zebra
+        assert_eq!(fitted.categories()[0][0], "ant");
+        assert_eq!(fitted.categories()[0][1], "moose");
+        assert_eq!(fitted.categories()[0][2], "zebra");
     }
 }

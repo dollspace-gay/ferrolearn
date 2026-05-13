@@ -372,10 +372,22 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             (x.clone(), y.clone(), None, None)
         };
 
-        // Initialise coefficients to zero.
-        let mut w = Array1::<F>::zeros(n_features);
-        // Initialise with small values for L1 linearisation.
-        let mut w_prev = Array1::from_elem(n_features, eps);
+        // Warm-start IRLS from the OLS solution. The L1 linearisation
+        // (`scaled_alpha / max(|w_prev_j|, eps)`) blows up when `w_prev`
+        // is initialised to `eps` everywhere — the penalty diagonal
+        // becomes `scaled_alpha / eps`, forcing `w ≈ 0` on iteration 1
+        // and starving the IRLS of useful gradient information. (#340).
+        // OLS gives `w_prev` in the right order of magnitude so the
+        // penalty is informative from the first iteration.
+        let mut w = {
+            // Compute X^T X and X^T y for a one-shot OLS solve.
+            let xtx = x_work.t().dot(&x_work);
+            let xty = x_work.t().dot(&y_work);
+            cholesky_solve(&xtx, &xty)
+                .or_else(|_| gaussian_solve(n_features, &xtx, &xty))
+                .unwrap_or_else(|_| Array1::<F>::zeros(n_features))
+        };
+        let mut w_prev = w.mapv(|v| v.abs().max(eps));
 
         for _iter in 0..self.max_iter {
             let w_old = w.clone();

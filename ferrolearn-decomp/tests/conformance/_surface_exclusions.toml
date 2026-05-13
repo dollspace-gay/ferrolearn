@@ -1,0 +1,89 @@
+# Documented exclusions for ferrolearn-decomp.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedCCA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedDictionaryLearning"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedFactorAnalysis"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedFastICA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedIncrementalPCA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedIsomap"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedKernelPCA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedLLE"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedLatentDirichletAllocation"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedMDS"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedMiniBatchNMF"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedNMF"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedPCA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedPLSCanonical"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedPLSRegression"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedPLSSVD"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedSparsePCA"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedSpectralEmbedding"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedTruncatedSVD"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedTsne"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_decomp::FittedUmap"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

@@ -14,8 +14,10 @@
 //! where `N_~cj` is the total count of feature `j` in all classes except `c`,
 //! and `N_~c` is the total count of all features in all classes except `c`.
 //!
-//! Prediction uses `argmin_c sum_j x_j * w_cj` (i.e., the class with the
-//! *smallest* complement score is chosen).
+//! Stores weights with sklearn's sign convention (positive
+//! `-log(complement_prob)`), and prediction uses
+//! `argmax_c sum_j x_j * w_cj` — matching sklearn's
+//! `argmax(X @ feature_log_prob.T)` exactly.
 //!
 //! # Examples
 //!
@@ -232,7 +234,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
 
         let total_all: F = total_feature_counts.sum();
 
-        // Compute complement weights for each class.
+        // Compute complement-log weights for each class. sklearn stores
+        // `feature_log_prob_ = -log((complement_count + alpha) / (total + alpha*n_features))`
+        // (positive values — see #346). ferrolearn previously stored the
+        // pre-negation value; we now match sklearn's convention so
+        // introspection is parity-correct and predict uses argmax.
         let mut weights = Array2::<F>::zeros((n_classes, n_features));
 
         for ci in 0..n_classes {
@@ -243,7 +249,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
 
             for j in 0..n_features {
                 let complement_count_j = total_feature_counts[j] - class_feature_counts[[ci, j]];
-                weights[[ci, j]] = ((complement_count_j + alpha) / denom).ln();
+                // Negate so the stored value matches sklearn's
+                // `feature_log_prob_` exactly: positive values whose
+                // *smaller* indicates higher complement probability.
+                weights[[ci, j]] = -((complement_count_j + alpha) / denom).ln();
             }
         }
 
@@ -276,14 +285,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
     }
 }
 
-/// Apply sklearn's `norm=True` second L1 normalization to complement
-/// weights, then negate so ferrolearn's `argmin` predict semantics keep
-/// matching sklearn's `argmax(X @ feature_log_prob.T)`.
+/// Apply sklearn's `norm=True` second L1 normalization to complement weights.
 ///
-/// Walks each row of `weights` (= sklearn's pre-negation `logged`):
-/// - row_sum = Σ_j logged[c, j]    (≤ 0 since logs of probabilities)
-/// - normalized = logged / row_sum  (≥ 0, rows sum to 1)
-/// - weights[c, j] = -normalized    (re-negated to keep argmin convention)
+/// `weights` is already stored as sklearn's positive `-log(complement_prob)`.
+/// sklearn divides each row by its sum so rows sum to 1 (still positive,
+/// since the unnormalised values are positive).
 fn apply_norm_inplace<F: Float>(weights: &mut Array2<F>) {
     let n_classes = weights.nrows();
     let n_features = weights.ncols();
@@ -293,7 +299,7 @@ fn apply_norm_inplace<F: Float>(weights: &mut Array2<F>) {
             continue;
         }
         for j in 0..n_features {
-            weights[[ci, j]] = -(weights[[ci, j]] / row_sum);
+            weights[[ci, j]] = weights[[ci, j]] / row_sum;
         }
     }
 }
@@ -382,7 +388,8 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
             let denom = complement_total + self.alpha * n_feat_f;
             for j in 0..n_features {
                 let complement_count_j = total_feature_counts[j] - self.feature_counts[[ci, j]];
-                self.weights[[ci, j]] = ((complement_count_j + self.alpha) / denom).ln();
+                // sklearn-parity sign: positive -log(complement_prob).
+                self.weights[[ci, j]] = -((complement_count_j + self.alpha) / denom).ln();
             }
         }
 
@@ -393,9 +400,11 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
         Ok(())
     }
 
-    /// Compute complement scores for each class.
+    /// Compute the joint log-likelihood scores for each class.
     ///
-    /// Returns shape `(n_samples, n_classes)`. Lower is better.
+    /// Returns `X @ feature_log_prob_.T` (shape `(n_samples, n_classes)`).
+    /// With ferrolearn's sklearn-parity sign for `feature_log_prob_`,
+    /// **higher is better** and `argmax(scores, axis=1)` predicts the class.
     fn complement_scores(&self, x: &Array2<F>) -> Array2<F> {
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
@@ -437,21 +446,22 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
             });
         }
 
-        // Negate complement scores so that lower complement score → higher probability.
-        let neg_scores = self.complement_scores(x).mapv(|v| -v);
+        // scores are joint log-likelihoods (sklearn convention, higher=better).
+        // softmax directly without negation.
+        let scores = self.complement_scores(x);
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
         let mut proba = Array2::<F>::zeros((n_samples, n_classes));
 
         for i in 0..n_samples {
-            let max_score = neg_scores
+            let max_score = scores
                 .row(i)
                 .iter()
                 .fold(F::neg_infinity(), |a, &b| a.max(b));
 
             let mut row_sum = F::zero();
             for ci in 0..n_classes {
-                let p = (neg_scores[[i, ci]] - max_score).exp();
+                let p = (scores[[i, ci]] - max_score).exp();
                 proba[[i, ci]] = p;
                 row_sum = row_sum + p;
             }
@@ -484,7 +494,9 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
                 context: "number of features must match fitted ComplementNB".into(),
             });
         }
-        Ok(self.complement_scores(x).mapv(|v| -v))
+        // With the sklearn-parity sign, complement_scores IS the joint
+        // log-likelihood directly (no negation needed).
+        Ok(self.complement_scores(x))
     }
 
     /// Compute log of class probabilities (numerically stable).
@@ -554,11 +566,12 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedComplementNB
 
         let mut predictions = Array1::<usize>::zeros(n_samples);
         for i in 0..n_samples {
-            // Argmin: class with the smallest complement score.
+            // Argmax: with sklearn-parity sign, higher joint-log-likelihood
+            // wins.
             let mut best_class = 0;
             let mut best_score = scores[[i, 0]];
             for ci in 1..n_classes {
-                if scores[[i, ci]] < best_score {
+                if scores[[i, ci]] > best_score {
                     best_score = scores[[i, ci]];
                     best_class = ci;
                 }

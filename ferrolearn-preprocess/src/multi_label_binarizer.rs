@@ -167,12 +167,13 @@ impl Transform<Vec<Vec<usize>>> for FittedMultiLabelBinarizer {
 
         for (i, labels) in y.iter().enumerate() {
             for &label in labels {
-                let &idx = class_to_idx.get(&label).ok_or_else(|| {
-                    FerroError::InvalidParameter {
-                        name: "y".into(),
-                        reason: format!("unknown label {label} not seen during fit"),
-                    }
-                })?;
+                let &idx =
+                    class_to_idx
+                        .get(&label)
+                        .ok_or_else(|| FerroError::InvalidParameter {
+                            name: "y".into(),
+                            reason: format!("unknown label {label} not seen during fit"),
+                        })?;
                 out[[i, idx]] = 1.0;
             }
         }

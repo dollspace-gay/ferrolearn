@@ -1,0 +1,5 @@
+# ferrolearn-bayes documented divergences from scikit-learn.
+#
+# Fixed in #346: ComplementNB now stores `weights` with sklearn's positive
+# sign convention (`-log(complement_prob)`), uses `argmax` for prediction,
+# and the strict-sign conformance test passes. No outstanding divergences.

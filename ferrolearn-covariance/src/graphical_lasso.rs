@@ -381,7 +381,11 @@ fn solve_glasso<F: Float>(
     tol: F,
 ) -> (Array2<F>, Array2<F>, usize) {
     let p = emp_cov.nrows();
-    // Initialise W = S + alpha I (sklearn convention)
+    // Friedman, Hastie & Tibshirani (2008) initialise W = S + alpha * I
+    // for numerical stability of the inner block solves; sklearn does
+    // not include this shift in `covariance_` output (it strips the
+    // diagonal back to the empirical diagonal — see the trim step at
+    // the bottom of this function). #343.
     let mut w = emp_cov.clone();
     for i in 0..p {
         w[[i, i]] = w[[i, i]] + alpha;
@@ -501,6 +505,16 @@ fn solve_glasso<F: Float>(
             prec[[j, a]] = v;
             idx += 1;
         }
+    }
+
+    // Strip the +alpha shift from the diagonal of W before returning so
+    // `covariance_` matches sklearn's GraphicalLasso output, where the
+    // diagonal equals the empirical-covariance diagonal exactly. The
+    // precision matrix was computed using the un-stripped W (per the
+    // Friedman et al. 2008 inversion identity) so it stays correct.
+    // #343.
+    for i in 0..p {
+        w[[i, i]] = w[[i, i]] - alpha;
     }
     (w, prec, iter)
 }

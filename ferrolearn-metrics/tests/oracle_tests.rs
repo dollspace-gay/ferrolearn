@@ -297,15 +297,12 @@ fn test_regression_metrics_extended_oracle() {
     let y_true = Array1::from_vec(y_true_vec);
     let y_pred = Array1::from_vec(y_pred_vec);
 
-    // sklearn returns MAPE as a fraction; ferrolearn returns it as a percentage
-    // (multiplied by 100). Convert the expected value accordingly.
+    // #335 fixed: ferrolearn returns fraction (matches sklearn).
     let expected_mape_fraction = fixture["expected"]["mape"].as_f64().unwrap();
-    let expected_mape_percent = expected_mape_fraction * 100.0;
     let expected_evs = fixture["expected"]["explained_variance"].as_f64().unwrap();
 
-    // Compare MAPE (ferrolearn returns percentage, sklearn returns fraction).
     let mape: f64 = ferrolearn_metrics::mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
-    assert_relative_eq!(mape, expected_mape_percent, epsilon = 1e-10);
+    assert_relative_eq!(mape, expected_mape_fraction, epsilon = 1e-10);
 
     // Compare explained variance score.
     let evs: f64 = ferrolearn_metrics::explained_variance_score(&y_true, &y_pred).unwrap();

@@ -1,0 +1,45 @@
+# Public surface inventory for ferrolearn-neural.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_neural::Activation"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::BernoulliRBM"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::FittedBernoulliRBM"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::FittedMLPClassifier"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::FittedMLPRegressor"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::MLPClassifier"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::MLPRegressor"
+phase = "neural"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neural::Solver"
+phase = "neural"
+fixture = ""
+

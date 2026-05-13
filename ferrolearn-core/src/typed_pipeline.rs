@@ -15,7 +15,7 @@
 //!
 //! # Examples
 //!
-//! ```ignore
+//! ```text
 //! use ferrolearn_core::typed_pipeline::TypedPipeline;
 //!
 //! // Build a pipeline with method chaining:
@@ -517,7 +517,7 @@ where
 ///
 /// # Examples
 ///
-/// ```ignore
+/// ```text
 /// use ferrolearn_core::typed_pipeline::TypedPipeline;
 ///
 /// let pipeline = TypedPipeline::new()
@@ -565,7 +565,7 @@ impl<Steps> TypedPipelineBuilder<Steps> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// use ferrolearn_core::typed_pipeline::TypedPipeline;
     ///
     /// let builder = TypedPipeline::new()
@@ -587,7 +587,7 @@ impl<Steps> TypedPipelineBuilder<Steps> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// use ferrolearn_core::typed_pipeline::TypedPipeline;
     ///
     /// let pipeline = TypedPipeline::new()
@@ -608,7 +608,7 @@ impl<Steps> TypedPipelineBuilder<Steps> {
     ///
     /// # Examples
     ///
-    /// ```ignore
+    /// ```text
     /// use ferrolearn_core::typed_pipeline::TypedPipeline;
     ///
     /// let pipeline = TypedPipeline::new()

@@ -1,0 +1,65 @@
+# Documented exclusions for ferrolearn-kernel.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_kernel::BiasCorrection"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::ConfidenceIntervalResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::ConformalResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::DynKernel"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedGaussianProcessClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedGaussianProcessRegressor"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedKernelRidge"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedLocalPolynomialRegression"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedNadarayaWatson"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedNystroem"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::FittedRBFSampler"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::GoodnessOfFit"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::HeteroscedasticityTestResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::ResidualDiagnosticsResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_kernel::VarianceFunctionResult"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

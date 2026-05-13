@@ -1,0 +1,17 @@
+# Documented exclusions for ferrolearn-neural.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_neural::FittedBernoulliRBM"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_neural::FittedMLPClassifier"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_neural::FittedMLPRegressor"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

@@ -1,0 +1,260 @@
+# Public surface inventory for ferrolearn-tree.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_tree::AdaBoostAlgorithm"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::AdaBoostClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::AdaBoostLoss"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::AdaBoostRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::BaggingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::BaggingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ClassificationCriterion"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ClassificationLoss"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::DecisionTreeClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::DecisionTreeRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ExtraTreeClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ExtraTreeRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ExtraTreesClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::ExtraTreesRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedAdaBoostClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedAdaBoostRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedBaggingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedBaggingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedDecisionTreeClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedDecisionTreeRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedExtraTreeClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedExtraTreeRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedExtraTreesClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedExtraTreesRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedGradientBoostingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedGradientBoostingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedHistGradientBoostingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedHistGradientBoostingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedIsolationForest"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedRandomForestClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedRandomForestRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedRandomTreesEmbedding"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedVotingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::FittedVotingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::GradientBoostingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::GradientBoostingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::HistClassificationLoss"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::HistGradientBoostingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::HistGradientBoostingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::HistNode"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::HistRegressionLoss"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::IsolationForest"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::MaxFeatures"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::Node"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::RandomForestClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::RandomForestRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::RandomTreesEmbedding"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::RegressionCriterion"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::RegressionLoss"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::VotingClassifier"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::VotingRegressor"
+phase = "tree"
+fixture = ""
+

@@ -148,7 +148,9 @@ pub use random_projection::{
 };
 
 // Newly wired (previously orphaned) re-exports
-pub use feature_scoring::{chi2, compute_scores_classif, compute_scores_regression, f_classif, f_regression};
+pub use feature_scoring::{
+    chi2, compute_scores_classif, compute_scores_regression, f_classif, f_regression,
+};
 pub use label_binarizer::{FittedLabelBinarizer, LabelBinarizer};
 pub use multi_label_binarizer::{FittedMultiLabelBinarizer, MultiLabelBinarizer};
 pub use sequential_feature_selector::{

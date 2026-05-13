@@ -1,0 +1,66 @@
+# ferrolearn-covariance documented divergences from scikit-learn.
+
+[[divergence]]
+id = "oas-chen-2010-vs-sklearn-simplified"
+estimator = "OAS"
+description = """
+ferrolearn's OAS shrinkage estimator implements the Chen, Wiesel, Eldar &
+Hero (2010) formula with the full `(1 - 2/p)` correction factors:
+
+    rho_num = (1 - 2/p) * trace(S^2) + trace(S)^2
+    rho_den = (n + 1 - 2/p) * (trace(S^2) - trace(S)^2 / p)
+    shrinkage = clip(rho_num / rho_den, 0, 1)
+
+scikit-learn (as of 1.5.x) uses a simplified variant that drops the
+`(1 - 2/p)` and `(n + 1 - 2/p)` factors:
+
+    num = mean(S^2) + (trace(S)/p)^2
+    den = (n + 1) * (mean(S^2) - (trace(S)/p)^2 / p)
+    shrinkage = clip(num / den, 0, 1)
+
+Both produce valid shrinkage in [0, 1] but yield slightly different values.
+On the standard `oas.json` fixture (n=200, p=5) the resulting covariance
+matrices agree to ~7e-4 rel, well within the 5e-3 tolerance used for the
+conformance test.
+
+ferrolearn is faithful to the original published formula; sklearn's
+simplification is a deliberate choice for code clarity. Neither library is
+"wrong" in any absolute sense — sklearn parity would require ferrolearn
+to also offer the simplified path (e.g. as a feature flag), tracked as a
+future enhancement, NOT a bug.
+"""
+citation = """
+Chen, Wiesel, Eldar & Hero (2010), "Shrinkage Algorithms for MMSE
+Covariance Estimation", IEEE Transactions on Signal Processing 58(10),
+pp. 5016-5029. See equations (19)-(23).
+
+For sklearn's simplified variant, see `sklearn.covariance.OAS.fit` in
+sklearn 1.5.x source (`sklearn/covariance/_shrunk_covariance.py`).
+"""
+affected_fixtures = ["oas"]
+
+[[divergence]]
+id = "fastmcd-subset-selection-variance"
+estimator = "MinCovDet"
+description = """
+FastMCD (Rousseeuw & Van Driessen, 1999) starts from many random h-subsets
+and refines each via concentration steps until convergence, then returns
+the best. Different random number generators / starting seeds produce
+slightly different (but equally valid) best subsets, especially on datasets
+where multiple h-subsets achieve near-optimal determinant.
+
+On `min_cov_det.json` (n=120, p=4, support_fraction=0.9) ferrolearn's
+location agrees with sklearn's to ~1e-2 and covariance to ~2e-2 — both
+within expected FastMCD run-to-run variance. The support sets overlap
+by ≥80%; the test asserts this floor.
+
+The fixture's `random_state` is supplied to ferrolearn but ferrolearn's
+RNG path differs from sklearn's NumPy RandomState, so seed-for-seed
+identity is not achievable without porting sklearn's exact draw sequence.
+This is an iterative-algorithm convergence artefact, not a bug.
+"""
+citation = """
+Rousseeuw & Van Driessen (1999), "A Fast Algorithm for the Minimum
+Covariance Determinant Estimator", Technometrics 41(3), pp. 212-223.
+"""
+affected_fixtures = ["min_cov_det"]

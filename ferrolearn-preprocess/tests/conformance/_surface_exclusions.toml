@@ -1,0 +1,145 @@
+# Documented exclusions for ferrolearn-preprocess.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_preprocess::ColumnSelector"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::ColumnTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedBinaryEncoder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedColumnTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedCountVectorizer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedGaussianRandomProjection"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedIterativeImputer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedKBinsDiscretizer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedKNNImputer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedLabelBinarizer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedLabelEncoder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedMaxAbsScaler"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedMinMaxScaler"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedMultiLabelBinarizer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedOneHotEncoder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedOrdinalEncoder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedPowerTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedQuantileTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedRobustScaler"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSelectFdr"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSelectFpr"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSelectFwe"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSelectKBest"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSelectPercentile"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSequentialFeatureSelector"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSimpleImputer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSparseRandomProjection"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedSplineTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedStandardScaler"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedTargetEncoder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedTfidfTransformer"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::FittedVarianceThreshold"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::RFECV"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::Remainder"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_preprocess::TfidfNorm"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

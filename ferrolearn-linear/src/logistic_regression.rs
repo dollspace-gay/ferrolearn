@@ -274,10 +274,13 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
                 }
             }
 
-            // Average loss and add regularization.
-            loss = loss / n_f;
-            grad_w.mapv_inplace(|v| v / n_f);
-            grad_b = grad_b / n_f;
+            // sklearn convention: J(w) = C * sum_i log_loss_i + 0.5 * ||w||^2.
+            // We minimise the equivalent objective scaled by 1/C:
+            //   J(w) / C = sum_i log_loss_i + (1/(2C)) * ||w||^2
+            // which is what we accumulate here (loss = sum, NOT mean).
+            // Previously ferrolearn divided by n which made the effective
+            // regularisation `n×` stronger than sklearn's at the same C (#334).
+            let _ = n_f; // intentionally unused — kept for compile-symmetry
 
             // L2 regularization (on weights only, not intercept).
             let reg_loss: F = w.iter().fold(F::zero(), |acc, &wi| acc + wi * wi);
@@ -382,7 +385,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             // Softmax probabilities.
             let probs = softmax_2d(&logits);
 
-            // Multinomial cross-entropy loss.
+            // Multinomial cross-entropy loss (sklearn convention: sum, not
+            // mean — see #334 for the binary-branch counterpart and the
+            // associated J(w) = C * sum_i loss_i + 0.5 * ||w||^2 contract).
             let mut loss = F::zero();
             let eps = F::from(1e-15).unwrap();
             for i in 0..n_samples {
@@ -391,18 +396,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
                     loss = loss - y_onehot[[i, c]] * p.ln();
                 }
             }
-            loss = loss / n_f;
+            let _ = n_f; // n_f intentionally unused since we don't divide
 
             // L2 regularization.
             let reg_loss: F = w_mat.iter().fold(F::zero(), |acc, &wi| acc + wi * wi);
             loss = loss + reg / F::from(2.0).unwrap() * reg_loss;
 
-            // Gradient.
-            // diff = probs - y_onehot, shape (n_samples, n_classes)
+            // Gradient (sum form to match sklearn's loss scaling).
             let diff = &probs - &y_onehot;
-
-            // grad_W = diff^T @ X / n, shape (n_classes, n_features)
-            let grad_w = diff.t().dot(x) / n_f;
+            let grad_w = diff.t().dot(x);
 
             let mut grad = Array1::<F>::zeros(n_params);
             for c in 0..n_classes {
@@ -412,8 +414,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             }
 
             if fit_intercept {
-                // grad_b = sum(diff, axis=0) / n
-                let grad_b = diff.sum_axis(Axis(0)) / n_f;
+                // grad_b = sum(diff, axis=0)
+                let grad_b = diff.sum_axis(Axis(0));
                 for c in 0..n_classes {
                     grad[n_weight_params + c] = grad_b[c];
                 }

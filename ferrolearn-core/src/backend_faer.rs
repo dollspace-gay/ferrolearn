@@ -46,7 +46,7 @@ fn faer_diag_to_ndarray(d: faer::diag::DiagRef<'_, f64>) -> Array1<f64> {
 /// This is a zero-sized type intended for use as a type parameter on
 /// algorithms that are generic over [`Backend`]:
 ///
-/// ```ignore
+/// ```text
 /// fn my_algorithm<B: Backend>(data: &Array2<f64>) -> FerroResult<Array1<f64>> {
 ///     let (u, s, vt) = B::svd(data)?;
 ///     // ...

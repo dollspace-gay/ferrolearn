@@ -281,10 +281,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array1<F>, ()> for SelectFdr<F> {
 
         // Sort features by p-value (ascending), keeping original indices
         let mut ranked: Vec<(usize, F)> = x.iter().copied().enumerate().collect();
-        ranked.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        ranked.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Find the largest rank k where p_(k) <= alpha * (k+1) / n
         let mut max_qualifying_rank: Option<usize> = None;
@@ -297,10 +294,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array1<F>, ()> for SelectFdr<F> {
 
         // Select all features at or below the max qualifying rank
         let mut selected_indices: Vec<usize> = match max_qualifying_rank {
-            Some(max_rank) => ranked[..=max_rank]
-                .iter()
-                .map(|&(idx, _)| idx)
-                .collect(),
+            Some(max_rank) => ranked[..=max_rank].iter().map(|&(idx, _)| idx).collect(),
             None => Vec::new(),
         };
         selected_indices.sort_unstable();

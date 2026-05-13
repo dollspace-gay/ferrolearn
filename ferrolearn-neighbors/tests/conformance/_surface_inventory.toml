@@ -1,0 +1,90 @@
+# Public surface inventory for ferrolearn-neighbors.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_neighbors::Algorithm"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedKNeighborsClassifier"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedKNeighborsRegressor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedLocalOutlierFactor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedNearestCentroid"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedNearestNeighbors"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedRadiusNeighborsClassifier"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::FittedRadiusNeighborsRegressor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::GraphMode"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::KNeighborsClassifier"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::KNeighborsRegressor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::LocalOutlierFactor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::NearestCentroid"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::NearestNeighbors"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::RadiusNeighborsClassifier"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::RadiusNeighborsRegressor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::Weights"
+phase = "neighbors"
+fixture = ""
+

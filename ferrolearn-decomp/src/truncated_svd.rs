@@ -588,18 +588,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for TruncatedSVD<F> {
             }
         }
 
-        // Compute explained variance.
-        // explained_variance = sigma^2 / (n_samples - 1)
-        let n_minus_1 = F::from(if n_samples > 1 { n_samples - 1 } else { 1 }).unwrap();
-        let explained_variance = singular_values.mapv(|s| s * s / n_minus_1);
+        // Compute explained variance with population-variance normalization
+        // (`/ n_samples`, ddof=0) to match scikit-learn's TruncatedSVD which
+        // uses `np.var(X_transformed, axis=0)`. Earlier versions used `n-1`
+        // (Bessel correction) and produced values off by `n/(n-1)` (#342).
+        let n_f = F::from(n_samples.max(1)).unwrap();
+        let explained_variance = singular_values.mapv(|s| s * s / n_f);
 
-        // Compute total variance from X directly: sum of squared Frobenius / (n-1).
+        // Total variance: same population normalization.
         let total_var = {
             let mut ss = F::zero();
             for &v in x {
                 ss = ss + v * v;
             }
-            ss / n_minus_1
+            ss / n_f
         };
 
         let explained_variance_ratio = if total_var > F::zero() {

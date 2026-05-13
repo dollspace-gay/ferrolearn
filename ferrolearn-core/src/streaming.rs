@@ -6,7 +6,7 @@
 //!
 //! # Example
 //!
-//! ```ignore
+//! ```text
 //! use ferrolearn_core::streaming::StreamingFitter;
 //!
 //! // Assume `model` implements PartialFit<Array2<f64>, Array1<f64>>

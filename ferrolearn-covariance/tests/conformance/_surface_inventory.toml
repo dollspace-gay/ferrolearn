@@ -1,0 +1,80 @@
+# Public surface inventory for ferrolearn-covariance.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_covariance::EllipticEnvelope"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::EmpiricalCovariance"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedCovariance"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedEllipticEnvelope"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedGraphicalLasso"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedGraphicalLassoCV"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedLedoitWolf"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedMinCovDet"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::FittedOAS"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::GraphicalLasso"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::GraphicalLassoCV"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::LedoitWolf"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::MinCovDet"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::OAS"
+phase = "covariance"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_covariance::ShrunkCovariance"
+phase = "covariance"
+fixture = ""
+

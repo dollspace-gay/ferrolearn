@@ -130,24 +130,35 @@ fn cholesky<F: Float>(a: &Array2<F>, d: usize) -> Result<Array2<F>, FerroError> 
 /// Compute the inverse of a symmetric positive-definite matrix via Cholesky.
 ///
 /// Given `A = L L^T`, computes `A^{-1} = L^{-T} L^{-1}`.
+///
+/// The triangular-inverse loop iterates by **column** (with growing rows
+/// already-known) so that `l_inv[k, j]` is populated for every
+/// `k = j, j+1, ..., i-1` *before* we read it when computing
+/// `l_inv[i, j]`. Earlier the loop iterated by row, which made the
+/// off-diagonal accumulations read uninitialised zero entries, producing
+/// a diagonal-only "inverse" (#336).
 fn spd_inverse<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
     let d = a.nrows();
     let l = cholesky(a, d)?;
 
-    // Invert L (lower-triangular).
+    // Invert L (lower-triangular) via forward substitution, column by
+    // column. Solve L * X = I:
+    //   X[j, j] = 1 / L[j, j]
+    //   For i > j: X[i, j] = -(sum_{k=j}^{i-1} L[i, k] * X[k, j]) / L[i, i]
     let mut l_inv = Array2::<F>::zeros((d, d));
-    for i in 0..d {
-        l_inv[[i, i]] = F::one() / l[[i, i]];
-        for j in (0..i).rev() {
+    for j in 0..d {
+        l_inv[[j, j]] = F::one() / l[[j, j]];
+        for i in (j + 1)..d {
             let mut s = F::zero();
-            for k in (j + 1)..=i {
+            for k in j..i {
                 s = s + l[[i, k]] * l_inv[[k, j]];
             }
-            l_inv[[i, j]] = -s / l[[j, j]];
+            l_inv[[i, j]] = -s / l[[i, i]];
         }
     }
 
-    // A^{-1} = L^{-T} L^{-1}
+    // A^{-1} = L^{-T} L^{-1}.  Element (i, j) = sum_k L^{-1}[k, i] * L^{-1}[k, j],
+    // restricted to k >= max(i, j) because L^{-1} is lower-triangular.
     let mut inv = Array2::<F>::zeros((d, d));
     for i in 0..d {
         for j in 0..=i {
@@ -1185,12 +1196,200 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinCovDet<F> {
             }
         }
 
-        let precision = spd_inverse(&best_cov)?;
+        // sklearn-parity post-processing (#337):
+        //   1. Empirical consistency correction:
+        //        c = median(mahal_dist^2 over support) / chi2_quantile(0.5, p)
+        //      scales the raw MCD covariance so it estimates the true
+        //      covariance of the underlying Gaussian, not its truncated
+        //      h-subset version.
+        //   2. Reweighting: include samples with mahal^2 < chi2_quantile(0.975, p)
+        //      and re-fit (location, covariance) on that larger set.
+        //      Reweighting recovers efficiency lost in the initial h-trim.
+        // Without these steps, ferrolearn returns the *raw* FastMCD
+        // estimates, which differ from sklearn's by the consistency factor
+        // (~1.3 for p=4 at 90% support) and from the reweighted estimates
+        // by additional sample inclusion.
+        let p_f = p as f64;
+        let mut location = best_location;
+        let mut cov = best_cov;
+
+        // Helper closure: invert `m` after shrinkage toward the identity if
+        // the matrix is near-singular. Tiny support sets (e.g. h <= p+1) or
+        // near-collinear support sets produce rank-deficient covariances —
+        // sklearn dodges this by using `pinvh` (Moore–Penrose); ferrolearn
+        // applies a small Tikhonov shrinkage instead so the standard
+        // Cholesky inverse still works and the reweighting step doesn't
+        // throw out perfectly good off-axis samples just because the raw
+        // MCD support happened to land on a near-1D subspace (#337).
+        let invert_with_shrinkage = |m: &Array2<F>| -> Result<Array2<F>, FerroError> {
+            // Use the Cholesky-pivot ratio as a fast estimate of the
+            // condition number. For an SPD matrix A = L L^T, the smallest
+            // diagonal entry of L is approximately sqrt(lambda_min) and
+            // the largest is approximately sqrt(lambda_max), so the
+            // diagonal ratio squared estimates 1 / cond(A). A diagonal
+            // ratio below 1e-3 means cond(A) > 1e6 — treat as singular.
+            let well_conditioned = match cholesky(m, p) {
+                Ok(l) => {
+                    let mut min_d = F::infinity();
+                    let mut max_d = F::zero();
+                    for k in 0..p {
+                        let v = l[[k, k]].abs();
+                        if v < min_d {
+                            min_d = v;
+                        }
+                        if v > max_d {
+                            max_d = v;
+                        }
+                    }
+                    if max_d <= F::zero() {
+                        false
+                    } else {
+                        let ratio = min_d / max_d;
+                        let ratio_f: f64 =
+                            num_traits::ToPrimitive::to_f64(&ratio).unwrap_or(0.0);
+                        ratio_f > 1e-3
+                    }
+                }
+                Err(_) => false,
+            };
+            if well_conditioned {
+                if let Ok(inv) = spd_inverse(m) {
+                    return Ok(inv);
+                }
+            }
+            // Apply trace-relative shrinkage *off-diagonal* zero +
+            // diagonal-target shrinkage. Use a large enough alpha that a
+            // rank-1 input matrix (all rows identical) becomes well-
+            // conditioned.
+            let mut trace = F::zero();
+            for k in 0..p {
+                trace = trace + m[[k, k]];
+            }
+            let alpha = F::from(0.1).unwrap_or_else(F::epsilon);
+            let p_f = F::from(p).unwrap_or_else(F::one);
+            let diag_target = trace / p_f;
+            let mut shrunk = m.clone();
+            for i in 0..p {
+                for j in 0..p {
+                    if i == j {
+                        shrunk[[i, j]] =
+                            (F::one() - alpha) * shrunk[[i, j]] + alpha * diag_target;
+                    } else {
+                        shrunk[[i, j]] = (F::one() - alpha) * shrunk[[i, j]];
+                    }
+                }
+            }
+            spd_inverse(&shrunk)
+        };
+
+        // Step 1: consistency correction via the squared-Mahalanobis median.
+        if let Ok(precision_raw) = invert_with_shrinkage(&cov) {
+            let dists = mahalanobis_distances(x, &location, &precision_raw);
+            // Squared Mahalanobis distances over the support set.
+            let mut sq_sup: Vec<f64> = best_support
+                .iter()
+                .enumerate()
+                .filter(|&(_, &in_sup)| in_sup)
+                .map(|(i, _)| {
+                    let d = dists[i];
+                    let d_f: f64 = num_traits::ToPrimitive::to_f64(&d).unwrap_or(0.0);
+                    d_f * d_f
+                })
+                .collect();
+            sq_sup.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_sq = if sq_sup.is_empty() {
+                1.0
+            } else {
+                sq_sup[sq_sup.len() / 2]
+            };
+            let chi2_50 = chi2_quantile_approx(p_f, 0.5);
+            if chi2_50 > 0.0 && median_sq > 0.0 {
+                let correction = F::from(median_sq / chi2_50).unwrap_or_else(F::one);
+                cov.mapv_inplace(|v| v * correction);
+            }
+        }
+
+        // Step 2: reweighting — include all samples whose Mahalanobis
+        // distance (using the *corrected* covariance, with shrinkage if
+        // necessary so off-axis samples aren't infinity-far) falls below
+        // the 0.975 chi-squared quantile.
+        if let Ok(precision_corr) = invert_with_shrinkage(&cov) {
+            let dists = mahalanobis_distances(x, &location, &precision_corr);
+            let thresh_sq = chi2_quantile_approx(p_f, 0.975);
+            let mask: Vec<bool> = (0..n)
+                .map(|i| {
+                    let d = dists[i];
+                    let d_f: f64 = num_traits::ToPrimitive::to_f64(&d).unwrap_or(0.0);
+                    d_f * d_f < thresh_sq
+                })
+                .collect();
+            let n_reweight = mask.iter().filter(|&&b| b).count();
+            if n_reweight > p {
+                // Recompute location.
+                let mut loc_rw = Array1::<F>::zeros(p);
+                for i in 0..n {
+                    if mask[i] {
+                        for j in 0..p {
+                            loc_rw[j] = loc_rw[j] + x[[i, j]];
+                        }
+                    }
+                }
+                let n_rw_f = F::from(n_reweight).unwrap();
+                loc_rw.mapv_inplace(|v| v / n_rw_f);
+
+                // Recompute covariance on the reweight set.
+                let mut cov_rw = Array2::<F>::zeros((p, p));
+                for i in 0..n {
+                    if mask[i] {
+                        for r in 0..p {
+                            let dr = x[[i, r]] - loc_rw[r];
+                            for c in 0..p {
+                                let dc = x[[i, c]] - loc_rw[c];
+                                cov_rw[[r, c]] = cov_rw[[r, c]] + dr * dc;
+                            }
+                        }
+                    }
+                }
+                cov_rw.mapv_inplace(|v| v / n_rw_f);
+
+                // Apply the same consistency correction (median chi^2 / chi2(0.5, p)).
+                if let Ok(prec_rw) = invert_with_shrinkage(&cov_rw) {
+                    let dists_rw = mahalanobis_distances(x, &loc_rw, &prec_rw);
+                    let mut sq_rw: Vec<f64> = (0..n)
+                        .filter(|&i| mask[i])
+                        .map(|i| {
+                            let d_f: f64 =
+                                num_traits::ToPrimitive::to_f64(&dists_rw[i]).unwrap_or(0.0);
+                            d_f * d_f
+                        })
+                        .collect();
+                    sq_rw.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                    let median_rw = if sq_rw.is_empty() {
+                        1.0
+                    } else {
+                        sq_rw[sq_rw.len() / 2]
+                    };
+                    let chi2_50 = chi2_quantile_approx(p_f, 0.5);
+                    if chi2_50 > 0.0 && median_rw > 0.0 {
+                        let c2 = F::from(median_rw / chi2_50).unwrap_or_else(F::one);
+                        cov_rw.mapv_inplace(|v| v * c2);
+                    }
+                }
+
+                location = loc_rw;
+                cov = cov_rw;
+                best_support = mask;
+            }
+        }
+
+        // Same shrinkage policy as the in-loop helper: invert directly if
+        // well-conditioned, otherwise apply trace-relative Tikhonov.
+        let precision = invert_with_shrinkage(&cov)?;
 
         Ok(FittedMinCovDet {
             inner: FittedCovariance {
-                covariance_: best_cov,
-                location_: best_location,
+                covariance_: cov,
+                location_: location,
                 precision_: precision,
             },
             support_: best_support,

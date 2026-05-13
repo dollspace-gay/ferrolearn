@@ -1,0 +1,21 @@
+# Documented exclusions for ferrolearn-bayes.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_bayes::FittedBernoulliNB"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_bayes::FittedCategoricalNB"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_bayes::FittedMultinomialNB"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_bayes::FittedComplementNB"
+reason = "Fitted-state struct — covered transitively via ComplementNB::fit() returning it."
+

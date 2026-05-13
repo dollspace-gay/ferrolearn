@@ -181,12 +181,12 @@ impl Transform<Array1<usize>> for FittedLabelBinarizer {
             // Binary: single column, 1.0 for the second class
             let mut out = Array2::zeros((n, 1));
             for (i, &label) in y.iter().enumerate() {
-                let idx = class_to_idx.get(&label).ok_or_else(|| {
-                    FerroError::InvalidParameter {
+                let idx = class_to_idx
+                    .get(&label)
+                    .ok_or_else(|| FerroError::InvalidParameter {
                         name: "y".into(),
                         reason: format!("unknown label {label} not seen during fit"),
-                    }
-                })?;
+                    })?;
                 out[[i, 0]] = if *idx == 1 { 1.0 } else { 0.0 };
             }
             Ok(out)
@@ -194,12 +194,13 @@ impl Transform<Array1<usize>> for FittedLabelBinarizer {
             // Multiclass: one-hot rows
             let mut out = Array2::zeros((n, k));
             for (i, &label) in y.iter().enumerate() {
-                let &idx = class_to_idx.get(&label).ok_or_else(|| {
-                    FerroError::InvalidParameter {
-                        name: "y".into(),
-                        reason: format!("unknown label {label} not seen during fit"),
-                    }
-                })?;
+                let &idx =
+                    class_to_idx
+                        .get(&label)
+                        .ok_or_else(|| FerroError::InvalidParameter {
+                            name: "y".into(),
+                            reason: format!("unknown label {label} not seen during fit"),
+                        })?;
                 out[[i, idx]] = 1.0;
             }
             Ok(out)

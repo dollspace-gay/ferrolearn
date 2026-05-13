@@ -1,0 +1,55 @@
+# Public surface inventory for ferrolearn-bayes.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_bayes::BernoulliNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::CategoricalNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::ComplementNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::FittedBernoulliNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::FittedCategoricalNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::FittedComplementNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::FittedGaussianNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::FittedMultinomialNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::GaussianNB"
+phase = "bayes"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_bayes::MultinomialNB"
+phase = "bayes"
+fixture = ""
+

@@ -1,0 +1,400 @@
+# Public surface inventory for ferrolearn-preprocess.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_preprocess::BinEncoding"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::BinStrategy"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::Binarizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::BinaryEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::ColumnSelector"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::ColumnTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::CountVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::Direction"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedBinaryEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedColumnTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedCountVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedGaussianRandomProjection"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedIterativeImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedKBinsDiscretizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedKNNImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedLabelBinarizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedLabelEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedMaxAbsScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedMinMaxScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedMultiLabelBinarizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedOneHotEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedOrdinalEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedPowerTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedQuantileTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedRobustScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSelectFdr"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSelectFpr"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSelectFwe"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSelectKBest"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSelectPercentile"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSequentialFeatureSelector"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSimpleImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSparseRandomProjection"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedSplineTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedStandardScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedTargetEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedTfidfTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedVarianceThreshold"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FunctionTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::GaussianRandomProjection"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::ImputeStrategy"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::InitialStrategy"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::IterativeImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::KBinsDiscretizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::KNNImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::KNNWeights"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::KnotStrategy"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::LabelBinarizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::LabelEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::MaxAbsScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::MinMaxScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::MultiLabelBinarizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::Normalizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::OneHotEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::OrdinalEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::OutputDistribution"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::PolynomialFeatures"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::PowerTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::QuantileTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::RFE"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::RFECV"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::Remainder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::RobustScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::ScoreFunc"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectFdr"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectFpr"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectFromModel"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectFwe"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectKBest"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SelectPercentile"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SequentialFeatureSelector"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SimpleImputer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SparseRandomProjection"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::SplineTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::StandardScaler"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::TargetEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::TfidfNorm"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::TfidfTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::VarianceThreshold"
+phase = "preprocess"
+fixture = ""
+

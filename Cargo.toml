@@ -21,6 +21,7 @@ members = [
     "ferrolearn-fetch",
     "ferrolearn-python",
     "ferrolearn-bench",
+    "ferrolearn-test-oracle",
 ]
 resolver = "3"
 
@@ -50,21 +51,21 @@ crc32fast = "1.4"
 statrs = "0.18"
 
 # Internal crates
-ferrolearn-core = { path = "ferrolearn-core", version = "0.3.0" }
-ferrolearn-linear = { path = "ferrolearn-linear", version = "0.3.0" }
-ferrolearn-tree = { path = "ferrolearn-tree", version = "0.3.0" }
-ferrolearn-neighbors = { path = "ferrolearn-neighbors", version = "0.3.0" }
-ferrolearn-bayes = { path = "ferrolearn-bayes", version = "0.3.0" }
-ferrolearn-cluster = { path = "ferrolearn-cluster", version = "0.3.0" }
-ferrolearn-decomp = { path = "ferrolearn-decomp", version = "0.3.0" }
-ferrolearn-preprocess = { path = "ferrolearn-preprocess", version = "0.3.0" }
-ferrolearn-metrics = { path = "ferrolearn-metrics", version = "0.3.0" }
-ferrolearn-model-sel = { path = "ferrolearn-model-sel", version = "0.3.0" }
-ferrolearn-sparse = { path = "ferrolearn-sparse", version = "0.3.0" }
-ferrolearn-datasets = { path = "ferrolearn-datasets", version = "0.3.0" }
-ferrolearn-io = { path = "ferrolearn-io", version = "0.3.0" }
-ferrolearn-kernel = { path = "ferrolearn-kernel", version = "0.3.0" }
-ferrolearn-numerical = { path = "ferrolearn-numerical", version = "0.3.0" }
-ferrolearn-covariance = { path = "ferrolearn-covariance", version = "0.3.0" }
-ferrolearn-neural = { path = "ferrolearn-neural", version = "0.3.0" }
-ferrolearn-fetch = { path = "ferrolearn-fetch", version = "0.3.0" }
+ferrolearn-core = { path = "ferrolearn-core", version = "0.4.0" }
+ferrolearn-linear = { path = "ferrolearn-linear", version = "0.4.0" }
+ferrolearn-tree = { path = "ferrolearn-tree", version = "0.4.0" }
+ferrolearn-neighbors = { path = "ferrolearn-neighbors", version = "0.4.0" }
+ferrolearn-bayes = { path = "ferrolearn-bayes", version = "0.4.0" }
+ferrolearn-cluster = { path = "ferrolearn-cluster", version = "0.4.0" }
+ferrolearn-decomp = { path = "ferrolearn-decomp", version = "0.4.0" }
+ferrolearn-preprocess = { path = "ferrolearn-preprocess", version = "0.4.0" }
+ferrolearn-metrics = { path = "ferrolearn-metrics", version = "0.4.0" }
+ferrolearn-model-sel = { path = "ferrolearn-model-sel", version = "0.4.0" }
+ferrolearn-sparse = { path = "ferrolearn-sparse", version = "0.4.0" }
+ferrolearn-datasets = { path = "ferrolearn-datasets", version = "0.4.0" }
+ferrolearn-io = { path = "ferrolearn-io", version = "0.4.0" }
+ferrolearn-kernel = { path = "ferrolearn-kernel", version = "0.4.0" }
+ferrolearn-numerical = { path = "ferrolearn-numerical", version = "0.4.0" }
+ferrolearn-covariance = { path = "ferrolearn-covariance", version = "0.4.0" }
+ferrolearn-neural = { path = "ferrolearn-neural", version = "0.4.0" }
+ferrolearn-fetch = { path = "ferrolearn-fetch", version = "0.4.0" }

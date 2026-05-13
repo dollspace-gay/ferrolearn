@@ -9,7 +9,7 @@ use ferrolearn_preprocess::feature_selection::SelectFromModel as FeatureSelectio
 use ferrolearn_preprocess::imputer::ImputeStrategy;
 use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
-    Binarizer, BinaryEncoder, BinEncoding, BinStrategy, CountVectorizer, Direction,
+    BinEncoding, BinStrategy, Binarizer, BinaryEncoder, CountVectorizer, Direction,
     FunctionTransformer, GaussianRandomProjection, InitialStrategy, IterativeImputer,
     KBinsDiscretizer, KNNImputer, KNNWeights, KnotStrategy, LabelBinarizer, LabelEncoder,
     MaxAbsScaler, MinMaxScaler, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
@@ -78,10 +78,15 @@ fn api_proof_power_quantile() {
 fn api_proof_feature_engineering() {
     let x = small_data();
 
-    let _ = PolynomialFeatures::<f64>::new(2, true, false).unwrap().transform(&x).unwrap();
+    let _ = PolynomialFeatures::<f64>::new(2, true, false)
+        .unwrap()
+        .transform(&x)
+        .unwrap();
     let _ = Binarizer::<f64>::new(50.0).transform(&x).unwrap();
     // FunctionTransformer takes an element-wise Fn(F) -> F.
-    let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0).transform(&x).unwrap();
+    let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0)
+        .transform(&x)
+        .unwrap();
 }
 
 // =============================================================================
@@ -90,7 +95,11 @@ fn api_proof_feature_engineering() {
 #[test]
 fn api_proof_kbins_and_splines() {
     let x = small_data();
-    for strategy in [BinStrategy::Uniform, BinStrategy::Quantile, BinStrategy::KMeans] {
+    for strategy in [
+        BinStrategy::Uniform,
+        BinStrategy::Quantile,
+        BinStrategy::KMeans,
+    ] {
         for encode in [BinEncoding::Ordinal, BinEncoding::OneHot] {
             let _ = KBinsDiscretizer::<f64>::new(3, encode, strategy)
                 .fit_transform(&x)
@@ -98,7 +107,9 @@ fn api_proof_kbins_and_splines() {
         }
     }
     for knots in [KnotStrategy::Uniform, KnotStrategy::Quantile] {
-        let _ = SplineTransformer::<f64>::new(4, 3, knots).fit_transform(&x).unwrap();
+        let _ = SplineTransformer::<f64>::new(4, 3, knots)
+            .fit_transform(&x)
+            .unwrap();
     }
 }
 
@@ -152,7 +163,20 @@ fn api_proof_imputers() {
     let x_with_nan = Array2::from_shape_vec(
         (5, 3),
         vec![
-            1.0, f64::NAN, 3.0, 2.0, 2.0, f64::NAN, f64::NAN, 3.0, 1.0, 4.0, 4.0, 2.0, 5.0, 5.0,
+            1.0,
+            f64::NAN,
+            3.0,
+            2.0,
+            2.0,
+            f64::NAN,
+            f64::NAN,
+            3.0,
+            1.0,
+            4.0,
+            4.0,
+            2.0,
+            5.0,
+            5.0,
             3.0,
         ],
     )
@@ -163,11 +187,15 @@ fn api_proof_imputers() {
         ImputeStrategy::Median,
         ImputeStrategy::Constant(0.0),
     ] {
-        let _ = SimpleImputer::<f64>::new(strat).fit_transform(&x_with_nan).unwrap();
+        let _ = SimpleImputer::<f64>::new(strat)
+            .fit_transform(&x_with_nan)
+            .unwrap();
     }
 
     for w in [KNNWeights::Uniform, KNNWeights::Distance] {
-        let _ = KNNImputer::<f64>::new(2, w).fit_transform(&x_with_nan).unwrap();
+        let _ = KNNImputer::<f64>::new(2, w)
+            .fit_transform(&x_with_nan)
+            .unwrap();
     }
 
     for init in [InitialStrategy::Mean, InitialStrategy::Median] {
@@ -191,9 +219,13 @@ fn api_proof_feature_selection() {
     let _ = f.transform(&x).unwrap();
 
     // SelectKBest / SelectPercentile (supervised, FClassif)
-    let f = SelectKBest::<f64>::new(2, ScoreFunc::FClassif).fit(&x, &y).unwrap();
+    let f = SelectKBest::<f64>::new(2, ScoreFunc::FClassif)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f.transform(&x).unwrap();
-    let f = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif).fit(&x, &y).unwrap();
+    let f = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f.transform(&x).unwrap();
 
     // SelectFpr/Fdr/Fwe take p-values (Array1<F>) — get them from f_classif first.
@@ -207,19 +239,18 @@ fn api_proof_feature_selection() {
 
     // SelectFromModel — new_from_importances(importances, threshold: Option<F>).
     let importances = Array1::from(vec![0.1f64, 0.5, 0.9]);
-    let f = FeatureSelectionSelectFromModel::<f64>::new_from_importances(
-        &importances,
-        Some(0.3),
-    )
-    .unwrap();
+    let f = FeatureSelectionSelectFromModel::<f64>::new_from_importances(&importances, Some(0.3))
+        .unwrap();
     let _ = f.transform(&x).unwrap();
 
     // SequentialFeatureSelector::fit(x, y, score_fn) — takes a scoring closure.
-    let score_fn = |_x: &Array2<f64>, _y: &Array1<f64>| -> Result<f64, ferrolearn_core::error::FerroError> {
-        Ok(0.0)
-    };
+    let score_fn = |_x: &Array2<f64>,
+                    _y: &Array1<f64>|
+     -> Result<f64, ferrolearn_core::error::FerroError> { Ok(0.0) };
     for dir in [Direction::Forward, Direction::Backward] {
-        let _ = SequentialFeatureSelector::new(2, dir).fit(&x, &y_f64, score_fn).unwrap();
+        let _ = SequentialFeatureSelector::new(2, dir)
+            .fit(&x, &y_f64, score_fn)
+            .unwrap();
     }
 
     // Module-level scoring helpers.
@@ -253,6 +284,10 @@ fn api_proof_text() {
 #[test]
 fn api_proof_random_projection() {
     let x = Array2::<f64>::from_shape_vec((8, 50), (0..400).map(|i| i as f64).collect()).unwrap();
-    let _ = GaussianRandomProjection::<f64>::new(10).fit_transform(&x).unwrap();
-    let _ = SparseRandomProjection::<f64>::new(10).fit_transform(&x).unwrap();
+    let _ = GaussianRandomProjection::<f64>::new(10)
+        .fit_transform(&x)
+        .unwrap();
+    let _ = SparseRandomProjection::<f64>::new(10)
+        .fit_transform(&x)
+        .unwrap();
 }

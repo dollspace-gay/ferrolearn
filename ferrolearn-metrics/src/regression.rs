@@ -244,14 +244,13 @@ where
 
 /// Compute the mean absolute percentage error (MAPE).
 ///
-/// `MAPE = (1/n) * sum |( y_true - y_pred ) / y_true| * 100`
+/// `MAPE = (1/n) * sum |( y_true - y_pred ) / y_true|`
 ///
-/// **Convention note:** This function returns MAPE as a **percentage** (multiplied
-/// by 100), so perfect predictions yield 0.0 and predictions that are off by 10%
-/// on average yield 10.0. This differs from scikit-learn's
-/// `mean_absolute_percentage_error`, which returns a **fraction** (not multiplied
-/// by 100), where the same 10% error would be 0.1. Divide by 100 to convert to
-/// the sklearn convention.
+/// Returns the MAPE as a **fraction** (not multiplied by 100) to match
+/// scikit-learn's `mean_absolute_percentage_error`. Perfect predictions
+/// yield 0.0; predictions that are off by 10% on average yield 0.10.
+///
+/// (Earlier versions multiplied by 100 — see #335.)
 ///
 /// Note: samples where `y_true == 0` are skipped to avoid division by zero.
 /// If all `y_true` values are zero, `MAPE` is returned as `F::infinity()`.
@@ -275,8 +274,8 @@ where
 /// let y_true = array![100.0_f64, 200.0, 300.0];
 /// let y_pred = array![110.0_f64, 190.0, 300.0];
 /// let mape = mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
-/// // |10/100| + |10/200| + |0/300| = 0.1 + 0.05 + 0.0 = 0.15 / 3 * 100 = 5.0
-/// assert!((mape - 5.0).abs() < 1e-10);
+/// // |10/100| + |10/200| + |0/300| = 0.1 + 0.05 + 0.0 = 0.15 / 3 = 0.05
+/// assert!((mape - 0.05).abs() < 1e-10);
 /// ```
 pub fn mean_absolute_percentage_error<F>(
     y_true: &Array1<F>,
@@ -293,7 +292,6 @@ where
     let n = y_true.len();
     check_non_empty(n, "mean_absolute_percentage_error")?;
 
-    let hundred = F::from(100.0).unwrap();
     let mut sum = F::zero();
     let mut count = 0usize;
 
@@ -308,7 +306,7 @@ where
         return Ok(F::infinity());
     }
 
-    Ok(sum * hundred / F::from(count).unwrap())
+    Ok(sum / F::from(count).unwrap())
 }
 
 /// Compute the explained variance score.
@@ -1350,10 +1348,11 @@ mod tests {
     fn test_mape_basic() {
         let y_true = array![100.0_f64, 200.0, 300.0];
         let y_pred = array![110.0_f64, 190.0, 300.0];
-        // (|10/100| + |10/200| + |0/300|) / 3 * 100 = (0.1 + 0.05 + 0.0) / 3 * 100 = 5.0
+        // (|10/100| + |10/200| + |0/300|) / 3 = (0.1 + 0.05 + 0.0) / 3 = 0.05
+        // (sklearn-convention fraction, not percentage — see #335.)
         assert_abs_diff_eq!(
             mean_absolute_percentage_error(&y_true, &y_pred).unwrap(),
-            5.0,
+            0.05,
             epsilon = 1e-10
         );
     }
@@ -1374,10 +1373,10 @@ mod tests {
         let y_true = array![100.0_f64, 0.0, 200.0];
         let y_pred = array![110.0_f64, 999.0, 200.0];
         // index 0: |10/100| = 0.1; index 2: |0/200| = 0.0; count=2
-        // MAPE = (0.1 + 0.0) / 2 * 100 = 5.0
+        // MAPE = (0.1 + 0.0) / 2 = 0.05 (sklearn-convention fraction)
         assert_abs_diff_eq!(
             mean_absolute_percentage_error(&y_true, &y_pred).unwrap(),
-            5.0,
+            0.05,
             epsilon = 1e-10
         );
     }

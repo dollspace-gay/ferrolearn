@@ -1,0 +1,325 @@
+# Public surface inventory for ferrolearn-model-sel.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_model_sel::CalibratedClassifierCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::CalibrationMethod"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ClassifierChain"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::CrossValidateResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::CrossValidator"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::CvResults"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::DummyClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::DummyClassifierStrategy"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::DummyRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::DummyRegressorStrategy"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FeatureUnion"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FitScoreFn"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedCalibratedClassifierCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedClassifierChain"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedDummyClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedDummyRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedFeatureUnion"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedFixedThresholdClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedMultiOutputClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedMultiOutputRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedOneVsOneClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedOneVsRestClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedOutputCodeClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedRegressorChain"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedSelfTrainingClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedTransformedTargetRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FittedTunedThresholdClassifierCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::FixedThresholdClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::GridSearchCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::GroupKFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::GroupShuffleSplit"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::HalvingGridSearchCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::HalvingRandomSearchCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::KFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::LearningCurveResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::LeaveOneGroupOut"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::LeaveOneOut"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::LeavePGroupsOut"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::LeavePOut"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::MultiOutputClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::MultiOutputRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::OneVsOneClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::OneVsRestClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::OutputCodeClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ParamSet"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ParamValue"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::PartialDependenceResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::PermutationImportanceResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::PredefinedSplit"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::RandomizedSearchCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::RegressorChain"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::RepeatedKFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::RepeatedStratifiedKFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::SelfTrainingClassifier"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ShuffleSplit"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::StratifiedGroupKFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::StratifiedKFold"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::StratifiedShuffleSplit"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ThresholdScoring"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::TimeSeriesSplit"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::TransformedTargetRegressor"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::TunedThresholdClassifierCV"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::UNLABELED"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ValidationCurveResult"
+phase = "model_sel"
+fixture = ""
+

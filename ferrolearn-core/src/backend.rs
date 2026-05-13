@@ -15,7 +15,7 @@
 //! All methods on `Backend` are associated functions (no `&self`). The backend
 //! is a zero-sized type used as a type parameter, not as an instance:
 //!
-//! ```ignore
+//! ```text
 //! fn my_algorithm<B: Backend>(data: &Array2<f64>) -> FerroResult<Array1<f64>> {
 //!     let (u, s, vt) = B::svd(data)?;
 //!     // ...

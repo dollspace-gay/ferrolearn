@@ -1,6 +1,6 @@
 [package]
 name = "ferrolearn-metrics"
-version = "0.3.1"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -21,6 +21,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 [dev-dependencies]
 approx.workspace = true
 float-cmp.workspace = true
+ferrolearn-test-oracle = { path = "../ferrolearn-test-oracle" }
 serde_json.workspace = true
 kani-verifier = "0.67"
 proptest = "1"

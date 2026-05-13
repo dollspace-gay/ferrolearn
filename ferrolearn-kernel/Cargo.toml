@@ -1,6 +1,6 @@
 [package]
 name = "ferrolearn-kernel"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -30,3 +30,4 @@ float-cmp = { workspace = true }
 ferrolearn-metrics = { workspace = true }
 serde_json = { workspace = true }
 proptest = "1"
+ferrolearn-test-oracle = { path = "../ferrolearn-test-oracle" }

@@ -559,8 +559,7 @@ fn regularized_incomplete_beta<F: Float>(x: F, a: F, b: F) -> F {
         } else {
             // Odd: d_{2m+1} term
             let k = (m_f - one) / two;
-            let num =
-                -((a + k) * (a + b + k) * x) / ((a + two * k) * (a + two * k + one));
+            let num = -((a + k) * (a + b + k) * x) / ((a + two * k) * (a + two * k + one));
             (num, one)
         };
 
@@ -953,12 +952,7 @@ mod tests {
 
     #[test]
     fn test_compute_scores_classif_f_classif() {
-        let x = array![
-            [1.0_f64, 5.0],
-            [1.5, 5.5],
-            [10.0, 5.0],
-            [10.5, 4.5]
-        ];
+        let x = array![[1.0_f64, 5.0], [1.5, 5.5], [10.0, 5.0], [10.5, 4.5]];
         let y: Array1<usize> = array![0, 0, 1, 1];
         let scores = compute_scores_classif(&x, &y, "f_classif").unwrap();
         assert_eq!(scores.len(), 2);

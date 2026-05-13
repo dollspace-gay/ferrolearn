@@ -416,8 +416,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
     /// Fit the LARS model.
     ///
-    /// Iteratively adds the feature most correlated with the residual to the
-    /// active set and solves OLS on that subset.
+    /// Implements Efron, Hastie, Johnstone & Tibshirani (2004) "Least Angle
+    /// Regression": after adding the feature most correlated with the
+    /// residual to the active set, walk along the **equiangular direction**
+    /// until another feature joins the active set (i.e. has equal absolute
+    /// correlation with the new residual), and only then add that feature.
+    /// Earlier ferrolearn versions added a feature then jumped to OLS on
+    /// the active set, which is forward stepwise regression — coefficients
+    /// were ~2× too large vs sklearn (#339).
     ///
     /// # Errors
     ///
@@ -440,41 +446,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let (x_work, y_work, x_mean, y_mean) =
             center_data(x, y, self.fit_intercept)?;
 
-        let mut active: Vec<usize> = Vec::with_capacity(max_active);
-        let mut in_active = vec![false; n_features];
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut residual = y_work.clone();
-
-        for _step in 0..max_active {
-            // Find feature most correlated with residual (not already active).
-            let mut best_j = None;
-            let mut best_corr = F::zero();
-            for (j, &is_active) in in_active.iter().enumerate() {
-                if is_active {
-                    continue;
-                }
-                let corr = x_work.column(j).dot(&residual).abs();
-                if corr > best_corr {
-                    best_corr = corr;
-                    best_j = Some(j);
-                }
-            }
-
-            let j = match best_j {
-                Some(j) => j,
-                None => break, // all features active
-            };
-
-            active.push(j);
-            in_active[j] = true;
-
-            // OLS on active set.
-            w = ols_active(&x_work, &y_work, &active, n_features)?;
-
-            // Update residual.
-            residual = &y_work - x_work.dot(&w);
-        }
-
+        let w = lars_path(&x_work, &y_work, max_active, false)?;
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
 
         Ok(FittedLars {
@@ -482,6 +454,223 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             intercept,
         })
     }
+}
+
+/// Core LARS path computation, shared by [`Lars`] and (via wrapper) [`LassoLars`].
+///
+/// Walks the LARS path for at most `max_steps` steps. If `lasso_modification`
+/// is `true`, applies the Lasso modification (Efron §3.3): when an active
+/// coefficient is about to cross zero on the current equiangular step,
+/// truncate the step and drop that feature from the active set.
+///
+/// Returns the final coefficient vector. `x` and `y` are assumed centred.
+fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    max_steps: usize,
+    lasso_modification: bool,
+) -> Result<Array1<F>, FerroError> {
+    let (n_samples, n_features) = x.dim();
+    let mut beta = Array1::<F>::zeros(n_features);
+    let mut mu = Array1::<F>::zeros(n_samples);
+    let mut active: Vec<usize> = Vec::with_capacity(max_steps.max(1));
+    let mut sign_active: Vec<F> = Vec::with_capacity(max_steps.max(1));
+    let mut in_active = vec![false; n_features];
+
+    let eps = F::from(1e-12).unwrap_or_else(F::epsilon);
+
+    let mut step = 0;
+    while step < max_steps {
+        // Current correlations c = X^T (y - mu).
+        let residual = y - &mu;
+        let mut corr = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            corr[j] = x.column(j).dot(&residual);
+        }
+
+        // Maximum absolute correlation among non-active features (or among
+        // active features when starting from a Lasso-modification drop).
+        let mut c_max = F::zero();
+        let mut j_star: Option<usize> = None;
+        for j in 0..n_features {
+            if in_active[j] {
+                continue;
+            }
+            let ac = corr[j].abs();
+            if ac > c_max {
+                c_max = ac;
+                j_star = Some(j);
+            }
+        }
+        if c_max <= eps {
+            break;
+        }
+        if let Some(j) = j_star {
+            active.push(j);
+            sign_active.push(if corr[j] >= F::zero() {
+                F::one()
+            } else {
+                -F::one()
+            });
+            in_active[j] = true;
+        } else {
+            break;
+        }
+
+        // Equiangular direction. Let X_A be the active columns flipped to
+        // positive-correlation sign. Compute G_AA = X_A^T X_A, solve
+        // G_AA * u = 1_A, then A_A = 1 / sqrt(1^T u).
+        let k_a = active.len();
+        let mut x_a = Array2::<F>::zeros((n_samples, k_a));
+        for (idx, &j) in active.iter().enumerate() {
+            let s = sign_active[idx];
+            for i in 0..n_samples {
+                x_a[[i, idx]] = x[[i, j]] * s;
+            }
+        }
+        let g_aa = x_a.t().dot(&x_a);
+
+        // Solve g_aa * u = ones via in-place Gaussian elimination on a
+        // local copy (small system: k_a <= max_steps).
+        let mut aug = Array2::<F>::zeros((k_a, k_a + 1));
+        for i in 0..k_a {
+            for j in 0..k_a {
+                aug[[i, j]] = g_aa[[i, j]];
+            }
+            aug[[i, k_a]] = F::one();
+        }
+        for col in 0..k_a {
+            // Partial pivot.
+            let mut piv = col;
+            let mut piv_v = aug[[col, col]].abs();
+            for r in (col + 1)..k_a {
+                let v = aug[[r, col]].abs();
+                if v > piv_v {
+                    piv_v = v;
+                    piv = r;
+                }
+            }
+            if piv_v <= F::epsilon() {
+                return Err(FerroError::NumericalInstability {
+                    message: "LARS Gram matrix is singular".into(),
+                });
+            }
+            if piv != col {
+                for c in 0..(k_a + 1) {
+                    let tmp = aug[[col, c]];
+                    aug[[col, c]] = aug[[piv, c]];
+                    aug[[piv, c]] = tmp;
+                }
+            }
+            for r in 0..k_a {
+                if r == col {
+                    continue;
+                }
+                let factor = aug[[r, col]] / aug[[col, col]];
+                for c in col..(k_a + 1) {
+                    let v = aug[[col, c]] * factor;
+                    aug[[r, c]] = aug[[r, c]] - v;
+                }
+            }
+        }
+        let mut u = Array1::<F>::zeros(k_a);
+        for i in 0..k_a {
+            u[i] = aug[[i, k_a]] / aug[[i, i]];
+        }
+        let u_sum: F = u.iter().copied().fold(F::zero(), |a, b| a + b);
+        if u_sum <= F::zero() {
+            return Err(FerroError::NumericalInstability {
+                message: "LARS A_A normalisation produced non-positive sum".into(),
+            });
+        }
+        let a_a = F::one() / u_sum.sqrt();
+        let mut w_a = u.clone();
+        w_a.mapv_inplace(|v| v * a_a);
+
+        // Equiangular direction in sample space: u_vec = X_A @ w_a.
+        let u_vec = x_a.dot(&w_a);
+
+        // Angles a_k = X[:, k]^T u_vec for each non-active feature.
+        // Step size gamma chosen so that one new feature joins the active set:
+        //   gamma = min over k not in A of:
+        //       (C_max - c_k) / (A_A - a_k)  if positive,
+        //       (C_max + c_k) / (A_A + a_k)  if positive.
+        let mut gamma = c_max / a_a; // last-step OLS direction
+        if active.len() < n_features {
+            let mut min_g = F::infinity();
+            for j in 0..n_features {
+                if in_active[j] {
+                    continue;
+                }
+                let a_j = x.column(j).dot(&u_vec);
+                let cands = [
+                    (c_max - corr[j], a_a - a_j),
+                    (c_max + corr[j], a_a + a_j),
+                ];
+                for (num, den) in cands {
+                    if den.abs() <= eps {
+                        continue;
+                    }
+                    let g = num / den;
+                    if g > eps && g < min_g {
+                        min_g = g;
+                    }
+                }
+            }
+            if min_g.is_finite() && min_g < gamma {
+                gamma = min_g;
+            }
+        }
+
+        // Lasso modification: check whether any active beta will cross zero.
+        let mut lasso_drop: Option<usize> = None;
+        if lasso_modification {
+            let mut min_drop = F::infinity();
+            for (idx, &j) in active.iter().enumerate() {
+                let s = sign_active[idx];
+                let direction_j = s * w_a[idx];
+                if direction_j.abs() <= eps {
+                    continue;
+                }
+                // beta[j] becomes 0 when gamma_drop = -beta[j] / direction_j.
+                let g_drop = -beta[j] / direction_j;
+                if g_drop > eps && g_drop < min_drop {
+                    min_drop = g_drop;
+                    lasso_drop = Some(idx);
+                }
+            }
+            if lasso_drop.is_some() {
+                if min_drop < gamma {
+                    gamma = min_drop;
+                } else {
+                    lasso_drop = None;
+                }
+            }
+        }
+
+        // Update beta along equiangular direction.
+        for (idx, &j) in active.iter().enumerate() {
+            beta[j] = beta[j] + gamma * sign_active[idx] * w_a[idx];
+        }
+        mu = mu + &(u_vec * gamma);
+
+        if let Some(drop_idx) = lasso_drop {
+            let j = active[drop_idx];
+            in_active[j] = false;
+            beta[j] = F::zero();
+            active.remove(drop_idx);
+            sign_active.remove(drop_idx);
+        }
+
+        step += 1;
+        if active.is_empty() {
+            // Pathological: dropped the only active feature on a Lasso
+            // step; allow the next iteration to re-add a feature.
+            continue;
+        }
+    }
+
+    Ok(beta)
 }
 
 // ---------------------------------------------------------------------------

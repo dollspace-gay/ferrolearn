@@ -1,0 +1,215 @@
+# Public surface inventory for ferrolearn-cluster.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_cluster::AffinityPropagation"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::AgglomerativeClustering"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::AgglomerativeLinkage"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::BayesianCovType"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::BayesianGaussianMixture"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::Birch"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::BisectingKMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::BisectingStrategy"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::CovarianceType"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::DBSCAN"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FeatureAgglomeration"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedAffinityPropagation"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedAgglomerativeClustering"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedBayesianGaussianMixture"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedBirch"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedBisectingKMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedDBSCAN"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedFeatureAgglomeration"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedGaussianMixture"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedHdbscan"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedKMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedLabelPropagation"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedLabelSpreading"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedMeanShift"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedMiniBatchKMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedOPTICS"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::FittedSpectralClustering"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::GaussianMixture"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::Hdbscan"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::KMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::LabelPropagation"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::LabelPropagationKernel"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::LabelSpreading"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::LabelSpreadingKernel"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::Linkage"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::MeanShift"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::MiniBatchKMeans"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::MiniBatchKMeansInit"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::OPTICS"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::PoolingFunc"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::SpectralClustering"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::WeightPriorType"
+phase = "cluster"
+fixture = ""
+

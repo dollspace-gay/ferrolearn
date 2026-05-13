@@ -1,0 +1,17 @@
+# Documented exclusions for ferrolearn-metrics.
+#
+# Items here have no conformance test yet; move them into a test
+# (any leaf-name mention will satisfy the gate) to remove the entry.
+
+[[exclusion]]
+path = "ferrolearn_metrics::BUILTIN_SCORER_NAMES"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_metrics::DistanceMetric"
+reason = "No conformance test yet — tracked under #338 follow-up."
+
+[[exclusion]]
+path = "ferrolearn_metrics::ScoringInput"
+reason = "No conformance test yet — tracked under #338 follow-up."
+

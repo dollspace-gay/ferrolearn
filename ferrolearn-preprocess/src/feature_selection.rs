@@ -167,13 +167,23 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for VarianceThreshold<
 
         for j in 0..n_features {
             let col = x.column(j);
-            let mean = col.iter().copied().fold(F::zero(), |acc, v| acc + v) / n;
-            let var = col
-                .iter()
-                .copied()
-                .map(|v| (v - mean) * (v - mean))
-                .fold(F::zero(), |acc, v| acc + v)
-                / n;
+            // Welford's online algorithm — numerically stable and yields
+            // *exactly* zero for constant columns, matching numpy/sklearn.
+            // The naive `sum((v-mean)^2) / n` accumulates FP error during
+            // the `sum / n` step and produces ~1e-34 noise on constant
+            // columns, defeating the `threshold=0.0 ⇒ drop constants`
+            // contract that sklearn ships.
+            let mut mean = F::zero();
+            let mut m2 = F::zero();
+            let mut count = F::zero();
+            for &v in col.iter() {
+                count = count + F::one();
+                let delta = v - mean;
+                mean = mean + delta / count;
+                let delta2 = v - mean;
+                m2 = m2 + delta * delta2;
+            }
+            let var = m2 / n;
             variances[j] = var;
             if var > self.threshold {
                 selected_indices.push(j);

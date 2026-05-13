@@ -181,30 +181,37 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedLogisticRe
     }
 }
 
-/// Split data into k folds, returning `(train_indices, test_indices)` for
-/// fold number `fold`.
-fn kfold_split(n_samples: usize, k: usize, fold: usize) -> (Vec<usize>, Vec<usize>) {
-    let fold_size = n_samples / k;
-    let remainder = n_samples % k;
+/// StratifiedKFold-style split: group indices by class label, then
+/// distribute each class's indices evenly across the `k` folds, matching
+/// scikit-learn's `LogisticRegressionCV` default which uses
+/// `StratifiedKFold` (#346).
+///
+/// Returns `(train_indices, test_indices)` for fold number `fold`.
+fn stratified_kfold_split(
+    y: &Array1<usize>,
+    k: usize,
+    fold: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    // Group sample indices by class.
+    let mut classes: Vec<usize> = y.iter().copied().collect();
+    classes.sort_unstable();
+    classes.dedup();
 
-    let mut start = 0;
-    let mut test_start = 0;
-    let mut test_end = 0;
-
-    for f in 0..k {
-        let size = fold_size + if f < remainder { 1 } else { 0 };
-        if f == fold {
-            test_start = start;
-            test_end = start + size;
+    let mut test_indices: Vec<usize> = Vec::new();
+    for &cls in &classes {
+        // Indices for this class, in input order — sklearn's StratifiedKFold
+        // walks the input in order and assigns sample j to fold `j % k`
+        // within each class.
+        let cls_indices: Vec<usize> = (0..y.len()).filter(|&i| y[i] == cls).collect();
+        for (i, &idx) in cls_indices.iter().enumerate() {
+            if i % k == fold {
+                test_indices.push(idx);
+            }
         }
-        start += size;
     }
-
-    let test_indices: Vec<usize> = (test_start..test_end).collect();
-    let train_indices: Vec<usize> = (0..n_samples)
-        .filter(|i| *i < test_start || *i >= test_end)
-        .collect();
-
+    test_indices.sort_unstable();
+    let test_set: std::collections::HashSet<usize> = test_indices.iter().copied().collect();
+    let train_indices: Vec<usize> = (0..y.len()).filter(|i| !test_set.contains(i)).collect();
     (train_indices, test_indices)
 }
 
@@ -304,7 +311,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             let mut fold_failed = false;
 
             for fold in 0..self.cv {
-                let (train_idx, test_idx) = kfold_split(n_samples, self.cv, fold);
+                let _ = n_samples; // computed via y.len() in the splitter
+                let (train_idx, test_idx) = stratified_kfold_split(y, self.cv, fold);
 
                 let x_train = select_rows(x, &train_idx);
                 let y_train = select_elements(y, &train_idx);
@@ -576,23 +584,29 @@ mod tests {
     }
 
     #[test]
-    fn test_kfold_split() {
-        let (train, test) = kfold_split(10, 5, 0);
+    fn test_stratified_kfold_split() {
+        // 10 samples, 5 folds, balanced binary labels.
+        let y: Array1<usize> = ndarray::array![0, 0, 0, 0, 0, 1, 1, 1, 1, 1];
+        let (train, test) = stratified_kfold_split(&y, 5, 0);
+        // Each fold gets one sample per class.
         assert_eq!(test.len(), 2);
         assert_eq!(train.len(), 8);
-        assert_eq!(test, vec![0, 1]);
-
-        let (train2, test2) = kfold_split(10, 5, 4);
-        assert_eq!(test2.len(), 2);
-        assert_eq!(train2.len(), 8);
-        assert_eq!(test2, vec![8, 9]);
+        // The test set must contain one of each class.
+        let n0 = test.iter().filter(|&&i| y[i] == 0).count();
+        let n1 = test.iter().filter(|&&i| y[i] == 1).count();
+        assert_eq!(n0, 1);
+        assert_eq!(n1, 1);
     }
 
     #[test]
-    fn test_kfold_split_uneven() {
-        // 7 samples, 3 folds -> sizes 3, 2, 2
-        let (train, test) = kfold_split(7, 3, 0);
-        assert_eq!(test.len(), 3);
-        assert_eq!(train.len(), 4);
+    fn test_stratified_kfold_uneven() {
+        // 7 samples, 3 folds, 4 of class 0 + 3 of class 1.
+        let y: Array1<usize> = ndarray::array![0, 0, 0, 0, 1, 1, 1];
+        let (train, test) = stratified_kfold_split(&y, 3, 0);
+        // train + test must partition the 7 samples.
+        assert_eq!(train.len() + test.len(), 7);
+        // Class-0 distributed: 4 / 3 ≈ 1-2 per fold; class-1: 3 / 3 = 1 per fold.
+        let n1 = test.iter().filter(|&&i| y[i] == 1).count();
+        assert!(n1 >= 1, "class 1 must be present in stratified test fold");
     }
 }

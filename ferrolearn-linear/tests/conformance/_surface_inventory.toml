@@ -1,0 +1,34 @@
+# Public estimator surface for ferrolearn-linear.
+#
+# Every entry must either:
+#   - Appear by leaf name in a conformance test (any `tests/*.rs` file)
+#   - OR be listed in `_surface_exclusions.toml` with a reason
+#
+# Adding a new public estimator to this crate: add it here AND write at
+# least one conformance test (or document an exclusion). The
+# `conformance_surface_coverage` test fails the build if you skip both.
+
+[[item]]
+path = "ferrolearn_linear::LinearRegression"
+phase = "direct-linear"
+fixture = "linear_regression"
+
+[[item]]
+path = "ferrolearn_linear::Ridge"
+phase = "direct-linear"
+fixture = "ridge"
+
+[[item]]
+path = "ferrolearn_linear::Lasso"
+phase = "iterative-linear"
+fixture = "lasso"
+
+[[item]]
+path = "ferrolearn_linear::ElasticNet"
+phase = "iterative-linear"
+fixture = "elastic_net"
+
+[[item]]
+path = "ferrolearn_linear::LogisticRegression"
+phase = "logistic"
+fixture = "logistic_regression"

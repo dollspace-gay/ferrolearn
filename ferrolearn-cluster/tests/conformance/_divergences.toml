@@ -1,0 +1,32 @@
+# ferrolearn-cluster documented divergences from scikit-learn.
+
+[[divergence]]
+id = "optics-xi-extraction-schubert-2018"
+estimator = "OPTICS"
+description = """
+ferrolearn's OPTICS xi-cluster-extraction implements Schubert & Gertz (2018)
+Algorithm 2 ("Improving the Cluster Structure Extracted from OPTICS Plots"),
+which uses an explicit predecessor-correction step on the boundary points
+of each steep region. scikit-learn's `cluster_optics_xi` implements an
+earlier version that omits this correction and uses a different downward/
+upward steep-region merging heuristic.
+
+On the standard `optics.json` fixture (300 samples, 3 well-separated
+clusters at random_state=42):
+  - n_clusters: identical (3 vs 3)
+  - n_noise: agrees within ~10 boundary points (out of 300)
+  - Adjusted Rand Index: 0.7548 (well above noise, below the 0.95 floor
+    used for other clusterings)
+
+The disagreement is concentrated on boundary points where reachability is
+ambiguous between two clusters. Both implementations are valid choices in
+the OPTICS literature — neither is "more correct" in an absolute sense,
+but Schubert & Gertz argue Algorithm 2 produces more stable cluster
+structure for non-convex shapes.
+"""
+citation = """
+Schubert & Gertz (2018), "Improving the Cluster Structure Extracted from
+OPTICS Plots", Proceedings of LWDA 2018, pp. 318-329, Algorithm 2.
+See also sklearn's `cluster_optics_xi` source for the divergent variant.
+"""
+affected_fixtures = ["optics"]

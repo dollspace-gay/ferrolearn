@@ -1,0 +1,275 @@
+# Public surface inventory for ferrolearn-decomp.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_decomp::Affinity"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Algorithm"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::CCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::DictFitAlgorithm"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::DictTransformAlgorithm"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::DictionaryLearning"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Dissimilarity"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FactorAnalysis"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FastICA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedCCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedDictionaryLearning"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedFactorAnalysis"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedFastICA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedIncrementalPCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedIsomap"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedKernelPCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedLLE"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedLatentDirichletAllocation"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedMDS"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedMiniBatchNMF"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedNMF"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedPCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedPLSCanonical"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedPLSRegression"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedPLSSVD"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedSparsePCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedSpectralEmbedding"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedTruncatedSVD"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedTsne"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedUmap"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::IncrementalPCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Isomap"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Kernel"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::KernelPCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::LLE"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::LatentDirichletAllocation"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::LdaLearningMethod"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::MDS"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::MiniBatchNMF"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::MiniBatchNMFInit"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::NMF"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::NMFInit"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::NMFSolver"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::NonLinearity"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::PCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::PLSCanonical"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::PLSRegression"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::PLSSVD"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::SparsePCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::SpectralEmbedding"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::TruncatedSVD"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Tsne"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::Umap"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::UmapMetric"
+phase = "decomp"
+fixture = ""
+

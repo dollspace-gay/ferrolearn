@@ -4,6 +4,79 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [0.4.0] - Unreleased
+
+Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
+
+### Fixed (sklearn-parity bugs)
+
+- **#334 LogisticRegression loss normalisation** — removed the `1/n` averaging in both the binary and multinomial branches so the loss has units of `sum`, matching sklearn's `J = C * sum + 0.5 * ||w||^2`. At the same `C`, effective regularization is now `n×` weaker than before (i.e. matches sklearn).
+- **#335 MAPE convention** — `mean_absolute_percentage_error` now returns the fraction (no `×100`), matching sklearn. Public-API breaking change at the metric level.
+- **#336 spd_inverse diagonal-only bug** — the Cholesky-based triangular-inverse loop in `ferrolearn-covariance` was reading uninitialised `l_inv` entries during forward substitution, producing a diagonal-only "inverse" that silently corrupted every `precision_` and `mahalanobis(...)` output. Rewrote the loop to iterate by column with the rows-already-known invariant.
+- **#337 MinCovDet FastMCD post-processing** — added sklearn's consistency correction (`median(mahal^2) / chi2_quantile(0.5, p)`) and reweighting steps. Added an `invert_with_shrinkage` helper that detects rank-deficient support covariances via the Cholesky-pivot ratio and applies trace-relative Tikhonov shrinkage so distance computations remain stable even when the support set lands on a near-1D subspace.
+- **#339 Lars equiangular path** — replaced the forward-stepwise (OLS-on-active-set) implementation with the true LARS algorithm per Efron, Hastie, Johnstone & Tibshirani (2004). New `lars_path` shared helper computes the equiangular direction via the `X_A^T X_A` solve and steps the size that brings one new feature to equal absolute correlation.
+- **#340 QuantileRegressor IRLS** — replaced `w_prev = eps` initialisation with an OLS warm-start. The eps-initialisation made the L1 linearisation diagonal `scaled_alpha / eps` huge on iteration 1, forcing `w ≈ 0` and producing predictions 25× off.
+- **#341 SVM `gamma="scale"` parity (partial)** — confirmed and documented that `RbfKernel::new()` returns `gamma=None` which the kernel silently treated as `gamma=1`, while sklearn's `gamma="scale"` (the SVM default since 0.22) computes `1 / (n_features * X.var())`. Conformance tests now use the explicit scale gamma; SVC, NuSVC, and OneClassSVM pass. SVR/NuSVR/LinearSVR retain a separate epsilon-tube SMO divergence as the remaining open scope.
+- **#342 TruncatedSVD Bessel correction** — `explained_variance_` now divides by `n_samples` (ddof=0) to match sklearn's `np.var(X_transformed, axis=0)`. Older `n-1` divisor produced values off by `n/(n-1)`.
+- **#343 GraphicalLasso alpha-on-diagonal** — the Friedman et al. 2008 algorithm initialises `W = S + alpha * I` for numerical stability; sklearn strips this `+alpha` from the diagonal at output. Added the matching trim step inside `solve_glasso` so `fitted.covariance()` matches sklearn (and not `S + alpha * I`).
+- **#344 OrdinalEncoder category order** — categories are now sorted lexicographically during fit, matching sklearn's `OrdinalEncoder.categories_`. Earlier ferrolearn used first-seen order.
+- **#345 VarianceThreshold strict comparison** — replaced naive two-pass variance with Welford's online algorithm so constant columns produce *exactly* zero variance, making `threshold=0.0` correctly drop zero-variance columns. The naive sum/n then sum((v-mean)²)/n was accumulating ~1e-34 FP noise that defeated the strict `>` comparison.
+
+### Added — Comprehensive conformance coverage (#338, follow-up to #333)
+
+Total: **156 conformance tests passing across 13 crates** with 25 ignored, each ignored entry annotated with a tracking issue. Surface coverage gates on 12 of 13 crates lock the gate so any new public estimator must be tested or explicitly excluded.
+
+- **Wave 1 — linear gap fixtures + tests** (28 estimators): HuberRegressor, BayesianRidge, ARDRegression, QuantileRegressor, Lars, LassoLars, OrthogonalMatchingPursuit, RidgeCV, LassoCV, ElasticNetCV, LogisticRegressionCV, LDA, QDA, RidgeClassifier, LinearSVC, LinearSVR, SVC, SVR, NuSVC, NuSVR, OneClassSVM, SGDClassifier, SGDRegressor, RANSACRegressor, IsotonicRegression, PoissonRegressor, GammaRegressor, TweedieRegressor.
+- **Wave 2 — decomp gap fixtures + tests** (17 estimators): TruncatedSVD, FastICA, KernelPCA, FactorAnalysis, IncrementalPCA, SparsePCA, DictionaryLearning, MiniBatchNMF, LatentDirichletAllocation, CCA, PLSRegression, PLSCanonical, Isomap, MDS, LLE, SpectralEmbedding, t-SNE.
+- **Wave 3 — tree gap fixtures + tests** (13 estimators): ExtraTreeClassifier/Regressor (single), ExtraTrees{Classifier,Regressor}, BaggingClassifier/Regressor, AdaBoostRegressor, HistGradientBoosting{Classifier,Regressor}, IsolationForest, RandomTreesEmbedding, VotingClassifier/Regressor.
+- **Wave 4 — cluster + neighbors + bayes + neural + covariance gaps** (17 estimators): AffinityPropagation, BayesianGaussianMixture, BisectingKMeans, FeatureAgglomeration, HDBSCAN, LabelPropagation, LabelSpreading, LocalOutlierFactor, NearestCentroid, NearestNeighbors, RadiusNeighbors{Classifier,Regressor}, CategoricalNB, MLPRegressor, BernoulliRBM, GraphicalLasso, EllipticEnvelope.
+- **Wave 5 — kernel gap fixtures + tests** (6 estimators): GaussianProcessRegressor, GaussianProcessClassifier, Nystroem, RBFSampler, KernelRidge (RBF), KernelRidge (polynomial).
+- **Wave 6 — preprocess gap fixtures + tests** (13 utilities): OrdinalEncoder, LabelBinarizer, MultiLabelBinarizer, VarianceThreshold, SelectKBest, SelectPercentile, SelectFromModel (api-gap), RFE (api-gap), KNNImputer, SplineTransformer, GaussianRandomProjection, SparseRandomProjection, FunctionTransformer.
+- **Wave 7 — model-sel gap fixtures + tests** (8 utilities): LeaveOneOut, LeavePOut, ShuffleSplit, GroupKFold, GroupShuffleSplit, LeaveOneGroupOut, DummyClassifier, DummyRegressor.
+- **Wave 8 — surface-coverage gates** in `tests/conformance_surface_coverage.rs` for 12 additional crates (ferrolearn-tree, cluster, decomp, preprocess, metrics, neighbors, bayes, model-sel, kernel, covariance, neural — numerical excluded as it has no `pub use` surface to inventory). Each crate ships `_surface_inventory.toml` listing every public symbol and `_surface_exclusions.toml` documenting items not yet covered with a `#338 follow-up` tag.
+
+### Fixed — bugs surfaced by the comprehensive conformance suite
+
+All listed are filed but not yet patched; the related conformance test is `#[ignore]`d with a pointer to the issue.
+
+- **#334** `LogisticRegression` data-fit normalization mismatch (sklearn-parity, `1/n` vs `1` weighting at the same `C`).
+- **#335** `mean_absolute_percentage_error` returns ×100 of sklearn's value.
+- **#336** `spd_inverse()` in `ferrolearn-covariance` returns a diagonal matrix instead of the true inverse — silently corrupts `precision_` across the whole crate.
+- **#337** `MinCovDet` FastMCD divergence beyond expected subset variance (investigation).
+- **#339** `Lars` coefficient path diverges 2× from sklearn at the same `n_nonzero_coefs`.
+- **#340** `QuantileRegressor` predictions diverge 25× from sklearn — IRLS does not reach sklearn's HiGHS optimum.
+- **#341** SVM family (`LinearSVR`, `NuSVC`, `NuSVR`, `OneClassSVM`, `SVR`) wide divergence from sklearn's libsvm — gamma=scale + SMO/QP investigation.
+- **#342** `TruncatedSVD.explained_variance_` uses Bessel correction (ddof=1) while sklearn uses ddof=0.
+- **#343** `GraphicalLasso.covariance_` diagonal off by exactly `alpha` vs sklearn.
+- **#344** `OrdinalEncoder` uses first-seen category order; sklearn uses lex.
+- **#345** `VarianceThreshold(threshold=0.0)` does not drop zero-variance columns (strict-vs-non-strict comparison off by one).
+
+### Added — Conformance test infrastructure (#333)
+
+- **`ferrolearn-test-oracle` crate** — workspace-internal helper crate with:
+  - Algorithm-class tolerance constants (`TOL_LINEAR_FIT_*`, `TOL_TREE_PRED_*`, `TOL_CLUSTER_CENTER_*`, `TOL_METRIC_*`, `TOL_COVARIANCE_*`, etc.) so tolerances are documented in one place rather than hardcoded per test.
+  - Fixture loader (`load_fixture(name)`) that walks up to the workspace root and returns a typed `Fixture` with optional per-fixture `tolerance` override and `divergence_id` annotation.
+  - Assertion helpers (`assert_close`, `assert_close_slice`, `assert_close_rows_sign_ambiguous` for PCA-style sign-ambiguous outputs, `assert_labels_equal`, `assert_ari_ge`).
+  - Adjusted Rand Index implementation for label-permutation-invariant cluster comparison.
+  - Toml parsers for `_divergences.toml`, `_surface_inventory.toml`, `_surface_exclusions.toml`.
+
+- **Fixture schema v2** — `fixtures/README.md` documents backwards-compatible additions: optional `sklearn_pin`, `tolerance: { rel, abs }`, and `divergence_id` fields. All v1 fixtures continue to load.
+
+- **`conformance_sklearn.rs` test files** in 13 crates, exercising 64 sklearn parity tests against the fixture corpus:
+  - ferrolearn-linear (5 tests), ferrolearn-tree (7), ferrolearn-cluster (9), ferrolearn-decomp (2), ferrolearn-preprocess (13), ferrolearn-metrics (6), ferrolearn-neighbors (2), ferrolearn-bayes (5), ferrolearn-model-sel (3), ferrolearn-numerical (3), ferrolearn-kernel (1), ferrolearn-covariance (9), ferrolearn-neural (1).
+  - 57 passing, 9 ignored with explicit annotations pointing to tracking issues or documented divergences.
+
+- **7 new fixtures** for previously-untested estimators: `empirical_covariance`, `shrunk_covariance`, `ledoit_wolf`, `oas`, `min_cov_det`, `kernel_ridge`, `mlp_classifier`. Generator at `scripts/generate_gap_fixtures.py`.
+
+- **`_divergences.toml` registries** in `ferrolearn-linear/`, `ferrolearn-cluster/`, `ferrolearn-bayes/`, `ferrolearn-covariance/` documenting 6 known-and-justified divergences from sklearn (coordinate-descent path differences, OPTICS xi-extraction variant, ComplementNB internal sign convention, OAS Chen-2010 vs sklearn-simplified formula, FastMCD subset-selection variance, L-BFGS path differences in LogisticRegression).
+
+### Fixed (real bugs surfaced by the conformance suite)
+
+- *(filed, not yet patched)* **#334** — `LogisticRegression` normalizes the data-fit term by `1/n` while sklearn does not, making ferrolearn's effective regularization `n×` stronger than sklearn's at the same `C`. Conformance test is `#[ignore]`d pending fix.
+- *(filed, not yet patched)* **#335** — `mean_absolute_percentage_error` returns the value multiplied by 100 (percentage) while sklearn returns the unscaled fraction. Cross-library numerical traps for porters.
+- *(filed, not yet patched)* **#336** — `spd_inverse()` in `ferrolearn-covariance` returns a diagonal matrix `diag(1/L[i,i]^2)` instead of the true matrix inverse. Silently corrupts the `precision_` field of every covariance estimator in the crate and all `mahalanobis(...)` distances when features are correlated. Five conformance tests `#[ignore]`d pending fix.
+- *(filed, investigation)* **#337** — `MinCovDet` location/covariance diverges from sklearn FastMCD by more than expected subset-selection variance. Needs triage to determine whether bug or acceptable divergence.
+
 ## [0.3.0] - 2026-04-29
 
 Workspace-wide parity audit against scikit-learn 1.8.0, accompanied by a 4×

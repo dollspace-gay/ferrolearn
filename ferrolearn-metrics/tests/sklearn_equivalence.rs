@@ -368,10 +368,8 @@ fn sklearn_equiv_regression_mape() {
     let expected = fixture["mape"].as_f64().unwrap();
 
     let actual: f64 = ferrolearn_metrics::mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
-    // ferrolearn returns MAPE as a percentage (multiplied by 100),
-    // while sklearn returns it as a fraction. Adjust for comparison.
-    let actual_fraction = actual / 100.0;
-    assert_relative_eq!(actual_fraction, expected, epsilon = 1e-10);
+    // #335 fixed: ferrolearn now returns fraction (matches sklearn).
+    assert_relative_eq!(actual, expected, epsilon = 1e-10);
 }
 
 #[test]

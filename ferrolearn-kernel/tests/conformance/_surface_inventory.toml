@@ -1,0 +1,215 @@
+# Public surface inventory for ferrolearn-kernel.
+#
+# Each entry must either appear by name in a conformance test file
+# OR be listed in `_surface_exclusions.toml` with a reason.
+
+[[item]]
+path = "ferrolearn_kernel::BiasCorrection"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::BiweightKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::ConfidenceIntervalResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::ConformalResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::ConstantKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::CosineKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::CrossValidatedBandwidth"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::CvStrategy"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::DotProductKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::DynKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::EpanechnikovKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedGaussianProcessClassifier"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedGaussianProcessRegressor"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedKernelRidge"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedLocalPolynomialRegression"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedNadarayaWatson"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedNystroem"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedRBFSampler"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::GPKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::GaussianKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::GaussianProcessClassifier"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::GaussianProcessRegressor"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::GoodnessOfFit"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::HeteroscedasticityTest"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::HeteroscedasticityTestResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::Kernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::KernelRidge"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::KernelType"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::LocalPolynomialRegression"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::MaternKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::NadarayaWatson"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::Nystroem"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::ProductKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::RBFKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::RBFSampler"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::ResidualDiagnosticsResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::SumKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::TricubeKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::TriweightKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::UniformKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::VarianceFunctionResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::WhiteKernel"
+phase = "kernel"
+fixture = ""
+
