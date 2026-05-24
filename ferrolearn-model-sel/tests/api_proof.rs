@@ -233,10 +233,10 @@ fn api_proof_search_estimators() {
 // =============================================================================
 #[test]
 fn api_proof_meta_estimators() {
-    let _ovr = OneVsRestClassifier::new(Box::new(|| Pipeline::<f64>::new()));
-    let _ovo = OneVsOneClassifier::new(Box::new(|| Pipeline::<f64>::new()));
-    let _moc = MultiOutputClassifier::new(Box::new(|| Pipeline::<f64>::new()));
-    let _mor = MultiOutputRegressor::new(Box::new(|| Pipeline::<f64>::new()));
+    let _ovr = OneVsRestClassifier::new(Box::new(Pipeline::<f64>::new));
+    let _ovo = OneVsOneClassifier::new(Box::new(Pipeline::<f64>::new));
+    let _moc = MultiOutputClassifier::new(Box::new(Pipeline::<f64>::new));
+    let _mor = MultiOutputRegressor::new(Box::new(Pipeline::<f64>::new));
 
     // CalibratedClassifierCV — constructor + method enum
     let fit_fn: CalibFitFn = Box::new(|_x, _y| {

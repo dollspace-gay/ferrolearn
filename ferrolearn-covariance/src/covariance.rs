@@ -1245,8 +1245,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinCovDet<F> {
                         false
                     } else {
                         let ratio = min_d / max_d;
-                        let ratio_f: f64 =
-                            num_traits::ToPrimitive::to_f64(&ratio).unwrap_or(0.0);
+                        let ratio_f: f64 = num_traits::ToPrimitive::to_f64(&ratio).unwrap_or(0.0);
                         ratio_f > 1e-3
                     }
                 }
@@ -1272,8 +1271,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinCovDet<F> {
             for i in 0..p {
                 for j in 0..p {
                     if i == j {
-                        shrunk[[i, j]] =
-                            (F::one() - alpha) * shrunk[[i, j]] + alpha * diag_target;
+                        shrunk[[i, j]] = (F::one() - alpha) * shrunk[[i, j]] + alpha * diag_target;
                     } else {
                         shrunk[[i, j]] = (F::one() - alpha) * shrunk[[i, j]];
                     }

@@ -245,8 +245,7 @@ fn solve_binary_primal<F: Float + 'static>(
                             hess = hess + c / n_f * xij * xij;
                         }
                         LinearSVCLoss::SquaredHinge => {
-                            grad = grad - two * c / n_f
-                                * (F::one() - margin) * y_signed[i] * xij;
+                            grad = grad - two * c / n_f * (F::one() - margin) * y_signed[i] * xij;
                             hess = hess + two * c / n_f * xij * xij;
                         }
                     }
@@ -282,8 +281,7 @@ fn solve_binary_primal<F: Float + 'static>(
                             hess_b = hess_b + c / n_f;
                         }
                         LinearSVCLoss::SquaredHinge => {
-                            grad_b = grad_b - two * c / n_f
-                                * (F::one() - margin) * y_signed[i];
+                            grad_b = grad_b - two * c / n_f * (F::one() - margin) * y_signed[i];
                             hess_b = hess_b + two * c / n_f;
                         }
                     }
@@ -321,11 +319,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InvalidParameter`] — `C` not positive.
     /// - [`FerroError::InsufficientSamples`] — fewer than 2 distinct classes.
-    fn fit(
-        &self,
-        x: &Array2<F>,
-        y: &Array1<usize>,
-    ) -> Result<FittedLinearSVC<F>, FerroError> {
+    fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedLinearSVC<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -365,7 +359,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 }
             });
 
-            let (w, b) = solve_binary_primal(x, &y_signed, self.c, self.max_iter, self.tol, self.loss);
+            let (w, b) =
+                solve_binary_primal(x, &y_signed, self.c, self.max_iter, self.tol, self.loss);
 
             Ok(FittedLinearSVC {
                 weight_vectors: vec![w],
@@ -380,13 +375,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             let mut intercepts = Vec::with_capacity(classes.len());
 
             for &cls in &classes {
-                let y_signed: Array1<F> = y.mapv(|label| {
-                    if label == cls {
-                        F::one()
-                    } else {
-                        -F::one()
-                    }
-                });
+                let y_signed: Array1<F> =
+                    y.mapv(|label| if label == cls { F::one() } else { -F::one() });
 
                 let (w, b) =
                     solve_binary_primal(x, &y_signed, self.c, self.max_iter, self.tol, self.loss);
@@ -405,9 +395,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
-    for FittedLinearSVC<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for FittedLinearSVC<F> {
     type Output = Array1<usize>;
     type Error = FerroError;
 
@@ -462,9 +450,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
-    for FittedLinearSVC<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F> for FittedLinearSVC<F> {
     /// Returns the coefficient vector of the first (or only) binary sub-problem.
     fn coefficients(&self) -> &Array1<F> {
         &self.weight_vectors[0]
@@ -516,8 +502,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -555,9 +540,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (9, 2),
             vec![
-                0.0, 0.0, 0.5, 0.0, 0.0, 0.5,
-                10.0, 0.0, 10.5, 0.0, 10.0, 0.5,
-                0.0, 10.0, 0.5, 10.0, 0.0, 10.5,
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 0.0, 10.0, 0.5,
+                10.0, 0.0, 10.5,
             ],
         )
         .unwrap();
@@ -627,7 +611,10 @@ mod tests {
         .unwrap();
         let y = array![0, 0, 0, 1, 1, 1];
 
-        let fitted = LinearSVC::<f64>::new().with_max_iter(5000).fit(&x, &y).unwrap();
+        let fitted = LinearSVC::<f64>::new()
+            .with_max_iter(5000)
+            .fit(&x, &y)
+            .unwrap();
 
         let x_bad = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         assert!(fitted.predict(&x_bad).is_err());

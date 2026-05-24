@@ -10,14 +10,14 @@
 
 use ferrolearn_core::{Fit, Transform};
 use ferrolearn_decomp::{
-    cross_decomposition::{PLSCanonical, PLSRegression, CCA},
-    DictionaryLearning, FactorAnalysis, FastICA, IncrementalPCA, Isomap, Kernel, KernelPCA,
-    LatentDirichletAllocation, LdaLearningMethod, MiniBatchNMF, MDS, LLE, SparsePCA,
-    SpectralEmbedding, TruncatedSVD, Tsne,
+    DictionaryLearning, FactorAnalysis, FastICA, IncrementalPCA, Isomap, Kernel, KernelPCA, LLE,
+    LatentDirichletAllocation, LdaLearningMethod, MDS, MiniBatchNMF, SparsePCA, SpectralEmbedding,
+    TruncatedSVD, Tsne,
+    cross_decomposition::{CCA, PLSCanonical, PLSRegression},
 };
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_slice, json_to_array1, json_to_array2, load_fixture,
-    TOL_DECOMP_ABS, TOL_DECOMP_REL,
+    TOL_DECOMP_ABS, TOL_DECOMP_REL, assert_close, assert_close_slice, json_to_array1,
+    json_to_array2, load_fixture,
 };
 
 fn finite_and_shaped(arr: &ndarray::Array2<f64>, n_rows: usize, n_cols: usize, label: &str) {
@@ -132,11 +132,7 @@ fn conformance_kernel_pca() {
         expected_eigvals.len(),
         "KernelPCA.eigenvalues length"
     );
-    for (i, (&a, &e)) in actual
-        .iter()
-        .zip(expected_eigvals.iter())
-        .enumerate()
-    {
+    for (i, (&a, &e)) in actual.iter().zip(expected_eigvals.iter()).enumerate() {
         assert_close(a, e, 1e-4, 1e-6, &format!("KernelPCA.eigenvalues[{i}]"));
     }
 }
@@ -214,7 +210,13 @@ fn conformance_incremental_pca() {
     let actual = fitted.explained_variance();
     assert_eq!(actual.len(), expected_ev.len(), "IPCA.expl_var length");
     for (i, (&a, &e)) in actual.iter().zip(expected_ev.iter()).enumerate() {
-        assert_close(a, e, 5e-2, 1e-4, &format!("IPCA.explained_variance[{i}] (blocked by #342)"));
+        assert_close(
+            a,
+            e,
+            5e-2,
+            1e-4,
+            &format!("IPCA.explained_variance[{i}] (blocked by #342)"),
+        );
     }
 }
 
@@ -285,10 +287,7 @@ fn conformance_mini_batch_nmf() {
     // W and components_ should be non-negative.
     assert!(w.iter().all(|&v| v >= 0.0), "MiniBatchNMF W has negatives");
     let h = fitted.components();
-    assert!(
-        h.iter().all(|&v| v >= 0.0),
-        "MiniBatchNMF H has negatives"
-    );
+    assert!(h.iter().all(|&v| v >= 0.0), "MiniBatchNMF H has negatives");
 
     // Reconstruction error within an order of magnitude of sklearn's.
     let expected_err = fx.expected["reconstruction_error"].as_f64().unwrap();
@@ -454,7 +453,12 @@ fn conformance_spectral_embedding() {
     let fitted = SpectralEmbedding::new(n_components)
         .fit(&x, &())
         .expect("SpectralEmbedding fit");
-    finite_and_shaped(fitted.embedding(), x.nrows(), n_components, "SpectralEmbedding");
+    finite_and_shaped(
+        fitted.embedding(),
+        x.nrows(),
+        n_components,
+        "SpectralEmbedding",
+    );
 }
 
 #[test]

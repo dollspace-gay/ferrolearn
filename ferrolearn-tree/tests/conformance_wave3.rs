@@ -56,7 +56,11 @@ fn conformance_extra_tree_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(
@@ -116,7 +120,11 @@ fn conformance_extra_trees_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(
@@ -172,7 +180,11 @@ fn conformance_bagging_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(
@@ -203,7 +215,11 @@ fn conformance_adaboost_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(
@@ -267,7 +283,11 @@ fn conformance_hist_gradient_boosting_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(
@@ -329,7 +349,9 @@ fn conformance_random_trees_embedding() {
         .with_max_depth(max_depth)
         .with_random_state(random_state);
     let fitted = model.fit(&x, &()).expect("RandomTreesEmbedding fit");
-    let xt = fitted.transform(&x).expect("RandomTreesEmbedding transform");
+    let xt = fitted
+        .transform(&x)
+        .expect("RandomTreesEmbedding transform");
     assert_eq!(xt.nrows(), x.nrows(), "embedding rows");
     // Expansion factor: each tree contributes one one-hot encoded leaf
     // index; ferrolearn may use a denser binary representation.
@@ -355,8 +377,8 @@ fn conformance_voting_classifier() {
     // ferrolearn's VotingClassifier uses a Vec<Option<usize>> of max-depths
     // for an ensemble of DTs — not arbitrary base estimators like sklearn.
     // Use a 2-tree ensemble matching the fixture's LR+DT pair pattern.
-    let model = ferrolearn_tree::VotingClassifier::<f64>::new()
-        .with_max_depths(vec![Some(5), Some(5)]);
+    let model =
+        ferrolearn_tree::VotingClassifier::<f64>::new().with_max_depths(vec![Some(5), Some(5)]);
     let fitted = model.fit(&x, &y).expect("VotingClassifier fit");
     let preds = fitted.predict(&x).expect("VotingClassifier predict");
     let expected_acc = fx.expected["accuracy"].as_f64().unwrap_or(0.5);
@@ -375,16 +397,23 @@ fn conformance_voting_regressor() {
     let x = json_to_array2(&fx.input["X"]);
     let y = json_to_array1(&fx.input["y"]);
 
-    let model = ferrolearn_tree::VotingRegressor::<f64>::new()
-        .with_max_depths(vec![Some(5), Some(5)]);
+    let model =
+        ferrolearn_tree::VotingRegressor::<f64>::new().with_max_depths(vec![Some(5), Some(5)]);
     let fitted = model.fit(&x, &y).expect("VotingRegressor fit");
     let preds = fitted.predict(&x).expect("VotingRegressor predict");
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     // R² >= 0 means the model beats predicting the mean — minimal sanity.
     // Not comparable to sklearn LR+DT directly; ferrolearn uses DT-only.
-    assert!(r2 >= 0.0, "VotingRegressor R² {r2:.4} below baseline (mean prediction)");
+    assert!(
+        r2 >= 0.0,
+        "VotingRegressor R² {r2:.4} below baseline (mean prediction)"
+    );
 }

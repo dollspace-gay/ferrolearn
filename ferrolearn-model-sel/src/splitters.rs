@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(folds.len(), 3);
         for (train, test) in &folds {
             assert_eq!(train.len() + test.len(), 8);
-            assert!(test.len() >= 1);
+            assert!(!test.is_empty());
         }
     }
 

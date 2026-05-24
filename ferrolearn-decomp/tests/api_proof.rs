@@ -56,7 +56,10 @@ fn api_proof_pca() {
 #[test]
 fn api_proof_incremental_pca() {
     let x = small_2d_data();
-    let f = IncrementalPCA::<f64>::new(2).with_batch_size(4).fit(&x, &()).unwrap();
+    let f = IncrementalPCA::<f64>::new(2)
+        .with_batch_size(4)
+        .fit(&x, &())
+        .unwrap();
     let z = f.transform(&x).unwrap();
     assert_eq!(z.dim(), (12, 2));
     let recon = f.inverse_transform(&z).unwrap();
@@ -72,7 +75,12 @@ fn api_proof_incremental_pca() {
 #[test]
 fn api_proof_kernel_pca() {
     let x = small_2d_data();
-    for kernel in [Kernel::Linear, Kernel::RBF, Kernel::Polynomial, Kernel::Sigmoid] {
+    for kernel in [
+        Kernel::Linear,
+        Kernel::RBF,
+        Kernel::Polynomial,
+        Kernel::Sigmoid,
+    ] {
         let f = KernelPCA::<f64>::new(2)
             .with_kernel(kernel)
             .with_gamma(1.0)
@@ -105,7 +113,10 @@ fn api_proof_sparse_pca() {
 #[test]
 fn api_proof_truncated_svd() {
     let x = small_2d_data();
-    let f = TruncatedSVD::<f64>::new(2).with_random_state(0).fit(&x, &()).unwrap();
+    let f = TruncatedSVD::<f64>::new(2)
+        .with_random_state(0)
+        .fit(&x, &())
+        .unwrap();
     let z = f.transform(&x).unwrap();
     assert_eq!(z.dim(), (12, 2));
     let recon = f.inverse_transform(&z).unwrap();
@@ -122,7 +133,10 @@ fn api_proof_truncated_svd() {
 #[test]
 fn api_proof_nmf() {
     let x = count_data();
-    for solver in [NMFSolver::CoordinateDescent, NMFSolver::MultiplicativeUpdate] {
+    for solver in [
+        NMFSolver::CoordinateDescent,
+        NMFSolver::MultiplicativeUpdate,
+    ] {
         for init in [NMFInit::Random, NMFInit::Nndsvd] {
             let f = NMF::<f64>::new(2)
                 .with_max_iter(100)

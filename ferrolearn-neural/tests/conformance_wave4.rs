@@ -2,7 +2,7 @@
 //!
 //! MLPRegressor + BernoulliRBM. Stochastic models — we use accuracy/R² floors.
 
-use ferrolearn_core::{Fit, Predict, Transform};
+use ferrolearn_core::{Fit, Predict};
 use ferrolearn_neural::{Activation, BernoulliRBM, MLPRegressor, Solver};
 use ferrolearn_test_oracle::{json_to_array1, json_to_array2, load_fixture};
 
@@ -39,7 +39,11 @@ fn conformance_mlp_regressor() {
     // convergence on this fixture, not by a library-specific bug.
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     // Ferrolearn R² must be within 0.15 absolute of sklearn's R²

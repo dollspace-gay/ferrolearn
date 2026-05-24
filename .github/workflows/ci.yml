@@ -1,0 +1,110 @@
+# ferrolearn CI
+#
+# Gates every push to `main` and every PR targeting `main` on four
+# parallel jobs:
+#
+#   - `cargo fmt --check`            — strict rustfmt parity with main
+#   - `cargo clippy -D warnings`     — strict lints; the workspace is
+#                                       expected to clear with -D warnings
+#                                       (math idioms that want range loops
+#                                       carry per-function #[allow])
+#   - `cargo test --release`         — full workspace test suite in release
+#                                       (release is significantly faster
+#                                       for the math-heavy paths)
+#   - `cargo doc --no-deps`          — `RUSTDOCFLAGS=-D warnings` catches
+#                                       broken doc links + missing docs
+#                                       errors before they ship to docs.rs
+#
+# Jobs are independent so a failure in one (e.g. fmt drift) doesn't gate
+# the others — you see all the breakages in one CI run instead of
+# discovering them serially.
+#
+# Concurrency: a new push to the same ref (branch / PR) cancels any
+# in-flight run. Prevents redundant work when contributors push a fix
+# while CI is still running on the prior commit.
+#
+# Permissions: read-only on `contents` — the workflow doesn't push, doesn't
+# comment, doesn't deploy. Smallest blast radius.
+#
+# Caching: Swatinem/rust-cache@v2 keys on Cargo.lock + the runner image.
+# First run on a PR pays the cold-compile cost; subsequent pushes to the
+# same branch reuse the target/ + ~/.cargo state.
+#
+# Stable toolchain only. MSRV (`rust-version = "1.85"` in workspace
+# Cargo.toml) is not enforced here — add a separate matrix job if MSRV
+# regressions become a problem in practice.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable + rustfmt
+        run: rustup toolchain install stable --component rustfmt --profile minimal --no-self-update
+      - run: cargo fmt --check
+
+  clippy:
+    name: cargo clippy -D warnings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable + clippy
+        run: rustup toolchain install stable --component clippy --profile minimal --no-self-update
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: cargo test --release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: test
+      # `--release` is faster than dev for the linear-algebra-heavy paths
+      # and matches the perf characteristics users will hit in practice.
+      - run: cargo test --workspace --release --lib --tests
+
+  doc:
+    name: cargo doc --no-deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --no-self-update
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: doc
+      # Builds docs without strict warnings — the workspace currently has
+      # several broken intra-doc links (`FerroError::*` variants, etc.)
+      # that should be cleaned up as a follow-up PR. Tighten to
+      # `RUSTDOCFLAGS: -D warnings` once those land. For now, this catches
+      # syntax-level doc errors that would break the docs.rs build.
+      - run: cargo doc --workspace --no-deps --document-private-items

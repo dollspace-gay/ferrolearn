@@ -91,10 +91,7 @@ pub(crate) fn log_softmax_rows<F: Float>(jll: &Array2<F>) -> Array2<F> {
     let n_classes = jll.ncols();
     let mut log_proba = Array2::<F>::zeros((n_samples, n_classes));
     for i in 0..n_samples {
-        let max_score = jll
-            .row(i)
-            .iter()
-            .fold(F::neg_infinity(), |a, &b| a.max(b));
+        let max_score = jll.row(i).iter().fold(F::neg_infinity(), |a, &b| a.max(b));
         let mut sum_exp = F::zero();
         for ci in 0..n_classes {
             sum_exp = sum_exp + (jll[[i, ci]] - max_score).exp();

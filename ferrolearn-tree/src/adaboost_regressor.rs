@@ -521,7 +521,6 @@ fn resample_weighted<F: Float>(weights: &[F], n: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::array;
 
     #[test]
     fn test_adaboost_regressor_simple() {

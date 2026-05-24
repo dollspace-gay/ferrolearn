@@ -148,8 +148,8 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedRidgeClass
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>
-    Fit<Array2<F>, Array1<usize>> for RidgeClassifier<F>
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<usize>>
+    for RidgeClassifier<F>
 {
     type Fitted = FittedRidgeClassifier<F>;
     type Error = FerroError;
@@ -234,11 +234,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>
                 .ok_or_else(|| FerroError::NumericalInstability {
                     message: "failed to compute column means".into(),
                 })?;
-            let y_mean = y_indicator
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute target means".into(),
-                })?;
+            let y_mean =
+                y_indicator
+                    .mean_axis(Axis(0))
+                    .ok_or_else(|| FerroError::NumericalInstability {
+                        message: "failed to compute target means".into(),
+                    })?;
             let x_c = x - &x_mean;
             let y_c = &y_indicator - &y_mean;
             (x_c, y_c, Some(x_mean), Some(y_mean))
@@ -383,8 +384,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -403,9 +403,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (9, 2),
             vec![
-                0.0, 0.0, 0.5, 0.0, 0.0, 0.5,
-                10.0, 0.0, 10.5, 0.0, 10.0, 0.5,
-                0.0, 10.0, 0.5, 10.0, 0.0, 10.5,
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 0.0, 10.0, 0.5,
+                10.0, 0.0, 10.5,
             ],
         )
         .unwrap();

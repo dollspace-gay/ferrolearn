@@ -22,12 +22,12 @@
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
-    BiweightKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel,
-    EpanechnikovKernel, GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor,
-    HeteroscedasticityTest, KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel,
-    NadarayaWatson, Nystroem, ProductKernel, RBFKernel, RBFSampler, SumKernel, TricubeKernel,
-    TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test, residual_diagnostics,
-    scott_bandwidth, silverman_bandwidth,
+    BiweightKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel, EpanechnikovKernel,
+    GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor, HeteroscedasticityTest,
+    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
+    ProductKernel, RBFKernel, RBFSampler, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
+    WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
+    silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -211,7 +211,10 @@ fn api_proof_gp_kernel_zoo() {
     let dp = DotProductKernel::new(1.0);
     let _ = dp.compute(&x, &x);
 
-    let s = SumKernel::new(Box::new(RBFKernel::new(1.0)), Box::new(WhiteKernel::new(0.1)));
+    let s = SumKernel::new(
+        Box::new(RBFKernel::new(1.0)),
+        Box::new(WhiteKernel::new(0.1)),
+    );
     let _ = s.compute(&x, &x);
 
     let p = ProductKernel::new(

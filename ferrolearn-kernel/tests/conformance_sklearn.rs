@@ -6,8 +6,8 @@
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_kernel::{KernelRidge, KernelType};
 use ferrolearn_test_oracle::{
-    assert_close_slice, json_to_array1, json_to_array2, load_fixture, TOL_KERNEL_ABS,
-    TOL_KERNEL_REL,
+    TOL_KERNEL_ABS, TOL_KERNEL_REL, assert_close_slice, json_to_array1, json_to_array2,
+    load_fixture,
 };
 
 #[test]
@@ -24,7 +24,9 @@ fn conformance_kernel_ridge_linear() {
         "polynomial" => KernelType::Polynomial,
         other => panic!("unsupported kernel: {other}"),
     };
-    let model = KernelRidge::<f64>::new().with_alpha(alpha).with_kernel(kernel);
+    let model = KernelRidge::<f64>::new()
+        .with_alpha(alpha)
+        .with_kernel(kernel);
     let fitted = model.fit(&x, &y).expect("KernelRidge fit");
 
     let preds = fitted.predict(&x).expect("KernelRidge predict");

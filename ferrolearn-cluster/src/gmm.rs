@@ -528,6 +528,7 @@ fn log_sum_exp_rows<F: Float>(log_resp: &Array2<F>) -> (Array2<F>, Array1<F>) {
 /// inferior local minima — measured at -0.27 ARI vs sklearn at n=200 with
 /// uniform-random init, and ~0.16 ARI gap remaining at n=5000 with
 /// single-trial KMeans++.
+#[allow(clippy::needless_range_loop)] // index-keyed access into `min_sq_dist` is clearer than enumerate-rebind
 fn init_means<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Array2<F> {
     let n_samples = x.nrows();
     let n_features = x.ncols();

@@ -305,8 +305,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
             }
 
             // Per-class, per-category count table.
-            let mut counts_for_feature: Vec<Vec<usize>> =
-                vec![vec![0usize; cats.len()]; n_classes];
+            let mut counts_for_feature: Vec<Vec<usize>> = vec![vec![0usize; cats.len()]; n_classes];
             for (ci, indices) in class_indices.iter().enumerate() {
                 for &sample_idx in indices {
                     let val = x[[sample_idx, j]].to_usize().unwrap_or(0);
@@ -321,8 +320,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
         }
 
         // Cached log probabilities derived from counts.
-        let feature_log_prob =
-            recompute_feature_log_prob(&category_counts, &class_counts, alpha);
+        let feature_log_prob = recompute_feature_log_prob(&category_counts, &class_counts, alpha);
 
         // Resolve priors.
         let class_log_prior =
@@ -345,6 +343,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
 
 /// Recompute `feature_log_prob[j][c][k]` from raw `category_counts` and
 /// `class_counts`, using Laplace smoothing.
+#[allow(clippy::needless_range_loop)] // matrix-style triple indexing reads cleaner than nested .iter().enumerate()
 fn recompute_feature_log_prob<F: Float>(
     category_counts: &[Vec<Vec<usize>>],
     class_counts: &[usize],
@@ -374,6 +373,7 @@ fn recompute_feature_log_prob<F: Float>(
 
 /// Resolve `class_log_prior` from `class_counts`, honoring an optional
 /// explicit `class_prior` and the `fit_prior` flag.
+#[allow(clippy::needless_range_loop)] // index-by-class is the natural loop here
 fn resolve_class_log_prior<F: Float>(
     class_counts: &[usize],
     n_classes: usize,

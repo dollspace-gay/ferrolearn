@@ -764,8 +764,7 @@ impl Powell {
             if f_extrap < fx_start {
                 let two_term = 2.0 * (fx_start - 2.0 * fx + f_extrap);
                 let lhs = fx_start - fx - largest_decrease;
-                let test =
-                    two_term * lhs * lhs - largest_decrease * (fx_start - f_extrap).powi(2);
+                let test = two_term * lhs * lhs - largest_decrease * (fx_start - f_extrap).powi(2);
                 if test < 0.0 {
                     let (alpha, f_after) = line_minimise_powell(&mut f, &x, &delta, self);
                     for (xk, dk) in x.iter_mut().zip(delta.iter()) {

@@ -46,11 +46,7 @@ fn conformance_kneighbors_classifier() {
     assert_labels_equal(&preds_i64, &expected_preds, "KNeighborsClassifier.predict");
 
     // Accuracy is a single scalar — match within metric tolerance.
-    let n_correct = preds
-        .iter()
-        .zip(y.iter())
-        .filter(|(a, b)| a == b)
-        .count();
+    let n_correct = preds.iter().zip(y.iter()).filter(|(a, b)| a == b).count();
     let accuracy = n_correct as f64 / y.len() as f64;
     assert_close(
         accuracy,

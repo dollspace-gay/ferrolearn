@@ -47,7 +47,9 @@ fn two_clusters_2d() -> (Array2<f64>, Array1<usize>, Array1<f64>) {
     )
     .unwrap();
     let y_cls = array![0usize, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
-    let y_reg = array![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0];
+    let y_reg = array![
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0
+    ];
     (x, y_cls, y_reg)
 }
 
@@ -75,7 +77,7 @@ fn assert_importances_well_formed(imp: &Array1<f64>, n_features: usize) {
         "feature_importances should sum to 1 or be all zeros; got sum = {total}"
     );
     for &v in imp.iter() {
-        assert!(v >= 0.0 && v <= 1.0, "importance {v} outside [0, 1]");
+        assert!((0.0..=1.0).contains(&v), "importance {v} outside [0, 1]");
     }
 }
 
@@ -512,13 +514,17 @@ fn api_proof_random_trees_embedding() {
 fn api_proof_f32_compiles() {
     let x = Array2::from_shape_vec(
         (8, 2),
-        vec![0.0f32, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5, 5.0, 5.0, 5.5, 5.0, 5.0, 5.5, 5.5, 5.5],
+        vec![
+            0.0f32, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5, 5.0, 5.0, 5.5, 5.0, 5.0, 5.5, 5.5, 5.5,
+        ],
     )
     .unwrap();
     let y_cls = array![0usize, 0, 0, 0, 1, 1, 1, 1];
     let y_reg = array![1.0f32, 2.0, 3.0, 4.0, 10.0, 11.0, 12.0, 13.0];
 
-    let _ = DecisionTreeClassifier::<f32>::new().fit(&x, &y_cls).unwrap();
+    let _ = DecisionTreeClassifier::<f32>::new()
+        .fit(&x, &y_cls)
+        .unwrap();
     let _ = DecisionTreeRegressor::<f32>::new().fit(&x, &y_reg).unwrap();
     let _ = ExtraTreeClassifier::<f32>::new().fit(&x, &y_cls).unwrap();
     let _ = ExtraTreeRegressor::<f32>::new().fit(&x, &y_reg).unwrap();

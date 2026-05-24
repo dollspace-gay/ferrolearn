@@ -628,7 +628,9 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         eta = x_design.dot(&coef);
         for i in 0..n_samples {
             // Clamp eta to prevent overflow in exp.
-            let eta_i = eta[i].max(F::from(-20.0).unwrap()).min(F::from(20.0).unwrap());
+            let eta_i = eta[i]
+                .max(F::from(-20.0).unwrap())
+                .min(F::from(20.0).unwrap());
             eta[i] = eta_i;
             mu[i] = eta_i.exp().max(min_mu).min(max_mu);
         }
@@ -922,19 +924,23 @@ mod tests {
     fn test_glm_shape_mismatch() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0];
-        assert!(GLMRegressor::<f64>::new(GLMFamily::Poisson)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            GLMRegressor::<f64>::new(GLMFamily::Poisson)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_glm_negative_alpha() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(GLMRegressor::<f64>::new(GLMFamily::Poisson)
-            .with_alpha(-1.0)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            GLMRegressor::<f64>::new(GLMFamily::Poisson)
+                .with_alpha(-1.0)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1160,8 +1166,10 @@ mod tests {
     fn test_glm_negative_y() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, -2.0, 3.0];
-        assert!(GLMRegressor::<f64>::new(GLMFamily::Poisson)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            GLMRegressor::<f64>::new(GLMFamily::Poisson)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 }

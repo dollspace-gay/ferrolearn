@@ -681,8 +681,7 @@ impl<F: Float + Send + Sync + 'static> FittedAdaBoostClassifier<F> {
                             ..
                         } = tree_nodes[leaf_idx]
                         {
-                            let log_probs: Vec<F> =
-                                dist.iter().map(|&p| p.max(eps).ln()).collect();
+                            let log_probs: Vec<F> = dist.iter().map(|&p| p.max(eps).ln()).collect();
                             let mean_log: F =
                                 log_probs.iter().copied().fold(F::zero(), |a, b| a + b) / k_f;
                             for k in 0..n_classes {
@@ -784,13 +783,11 @@ impl<F: Float + Send + Sync + 'static> FittedAdaBoostClassifier<F> {
                             ..
                         } = tree_nodes[leaf_idx]
                         {
-                            let log_probs: Vec<F> =
-                                dist.iter().map(|&p| p.max(eps).ln()).collect();
+                            let log_probs: Vec<F> = dist.iter().map(|&p| p.max(eps).ln()).collect();
                             let mean_log: F =
                                 log_probs.iter().copied().fold(F::zero(), |a, b| a + b) / k_f;
                             for k in 0..n_classes {
-                                out[[i, k]] =
-                                    out[[i, k]] + k_minus_1 * (log_probs[k] - mean_log);
+                                out[[i, k]] = out[[i, k]] + k_minus_1 * (log_probs[k] - mean_log);
                             }
                         } else if let Node::Leaf { value, .. } = tree_nodes[leaf_idx] {
                             let class_idx = value.to_f64().map_or(0, |f| f.round() as usize);

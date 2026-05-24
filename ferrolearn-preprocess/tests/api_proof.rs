@@ -273,7 +273,7 @@ fn api_proof_text() {
     let f = CountVectorizer::new().fit(&docs).unwrap();
     let counts = f.transform(&docs).unwrap();
     assert_eq!(counts.nrows(), 3);
-    let counts_f64 = counts.mapv(|v| v as f64);
+    let counts_f64 = counts.mapv(|v| v);
     let f = TfidfTransformer::<f64>::new().fit(&counts_f64).unwrap();
     let _ = f.transform(&counts_f64).unwrap();
 }

@@ -52,7 +52,12 @@ fn assert_log_proba_consistent(log_proba: &Array2<f64>, proba: &Array2<f64>) {
             let p = proba[[i, ci]];
             // Avoid log(0) at boundaries.
             if p > 1e-100 {
-                assert_relative_eq!(log_proba[[i, ci]], p.ln(), epsilon = 1e-9, max_relative = 1e-9);
+                assert_relative_eq!(
+                    log_proba[[i, ci]],
+                    p.ln(),
+                    epsilon = 1e-9,
+                    max_relative = 1e-9
+                );
             }
         }
     }
@@ -347,16 +352,38 @@ fn api_proof_conjugate_normal_normal() {
 // =============================================================================
 #[test]
 fn api_proof_f32_compiles() {
-    let x32 = Array2::from_shape_vec((4, 2), vec![1.0f32, 2.0, 1.0, 2.5, 5.0, 6.0, 5.5, 6.0]).unwrap();
+    let x32 =
+        Array2::from_shape_vec((4, 2), vec![1.0f32, 2.0, 1.0, 2.5, 5.0, 6.0, 5.5, 6.0]).unwrap();
     let y = array![0usize, 0, 1, 1];
 
-    let _ = GaussianNB::<f32>::new().fit(&x32, &y).unwrap().predict(&x32).unwrap();
-    let _ = MultinomialNB::<f32>::new().fit(&x32, &y).unwrap().predict(&x32).unwrap();
-    let _ = BernoulliNB::<f32>::new().fit(&x32, &y).unwrap().predict(&x32).unwrap();
-    let _ = ComplementNB::<f32>::new().fit(&x32, &y).unwrap().predict(&x32).unwrap();
+    let _ = GaussianNB::<f32>::new()
+        .fit(&x32, &y)
+        .unwrap()
+        .predict(&x32)
+        .unwrap();
+    let _ = MultinomialNB::<f32>::new()
+        .fit(&x32, &y)
+        .unwrap()
+        .predict(&x32)
+        .unwrap();
+    let _ = BernoulliNB::<f32>::new()
+        .fit(&x32, &y)
+        .unwrap()
+        .predict(&x32)
+        .unwrap();
+    let _ = ComplementNB::<f32>::new()
+        .fit(&x32, &y)
+        .unwrap()
+        .predict(&x32)
+        .unwrap();
 
-    let x_cat = Array2::from_shape_vec((4, 2), vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
-    let _ = CategoricalNB::<f32>::new().fit(&x_cat, &y).unwrap().predict(&x_cat).unwrap();
+    let x_cat =
+        Array2::from_shape_vec((4, 2), vec![0.0f32, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
+    let _ = CategoricalNB::<f32>::new()
+        .fit(&x_cat, &y)
+        .unwrap()
+        .predict(&x_cat)
+        .unwrap();
 }
 
 // =============================================================================

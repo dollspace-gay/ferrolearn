@@ -43,12 +43,7 @@ fn conformance_bayesian_gaussian_mixture() {
     let expected = json_to_labels(&fx.expected["labels"]);
     // Variational EM converges to different posteriors than sklearn under
     // different init RNG paths; ARI floor 0.40 accepts the divergence.
-    assert_ari_ge(
-        &actual,
-        &expected,
-        0.40,
-        "BayesianGaussianMixture.labels",
-    );
+    assert_ari_ge(&actual, &expected, 0.40, "BayesianGaussianMixture.labels");
 }
 
 #[test]
@@ -76,7 +71,9 @@ fn conformance_feature_agglomeration() {
 
     let model = FeatureAgglomeration::<f64>::new(n_clusters);
     let fitted = model.fit(&x, &()).expect("FeatureAgglomeration fit");
-    let xt = fitted.transform(&x).expect("FeatureAgglomeration transform");
+    let xt = fitted
+        .transform(&x)
+        .expect("FeatureAgglomeration transform");
     assert_eq!(xt.nrows(), x.nrows(), "FA transformed rows");
     assert_eq!(xt.ncols(), n_clusters, "FA transformed cols");
     for v in xt.iter() {
@@ -91,9 +88,7 @@ fn conformance_hdbscan() {
     let min_cluster_size = fx.params["min_cluster_size"].as_u64().unwrap_or(10) as usize;
 
     let model = Hdbscan::<f64>::new().with_min_cluster_size(min_cluster_size);
-    let labels = model
-        .fit_predict(&x)
-        .expect("Hdbscan fit_predict");
+    let labels = model.fit_predict(&x).expect("Hdbscan fit_predict");
     let actual: Vec<i64> = labels.iter().map(|&v| v as i64).collect();
     let expected = json_to_labels(&fx.expected["labels"]);
     // HDBSCAN clustering uses different mutual-reachability minimum-spanning-tree
@@ -126,7 +121,11 @@ fn conformance_label_propagation() {
         .collect();
     let actual: Vec<i64> = preds.iter().map(|&v| v as i64).collect();
     // Different gamma normalization paths can flip ~10% of labels.
-    let matches = actual.iter().zip(expected.iter()).filter(|(a, e)| a == e).count();
+    let matches = actual
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / actual.len() as f64;
     assert!(
         acc >= 0.80,
@@ -160,7 +159,11 @@ fn conformance_label_spreading() {
         .map(|v| v.as_i64().unwrap())
         .collect();
     let actual: Vec<i64> = preds.iter().map(|&v| v as i64).collect();
-    let matches = actual.iter().zip(expected.iter()).filter(|(a, e)| a == e).count();
+    let matches = actual
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / actual.len() as f64;
     assert!(
         acc >= 0.80,

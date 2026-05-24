@@ -28,7 +28,11 @@ fn conformance_nearest_centroid() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let matches = preds.iter().zip(expected.iter()).filter(|(a, e)| a == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / preds.len() as f64;
     assert!(
         acc >= 0.95,
@@ -49,25 +53,18 @@ fn conformance_nearest_neighbors() {
     let (dists, idxs) = fitted
         .kneighbors(&query, Some(n_neighbors))
         .expect("kneighbors");
-    let expected_dists = fx.expected["distances"]
-        .as_array()
-        .unwrap();
-    assert_eq!(
-        dists.nrows(),
-        expected_dists.len(),
-        "kneighbors dists rows"
-    );
+    let expected_dists = fx.expected["distances"].as_array().unwrap();
+    assert_eq!(dists.nrows(), expected_dists.len(), "kneighbors dists rows");
     assert_eq!(dists.ncols(), n_neighbors, "kneighbors dists cols");
-    assert_eq!(
-        idxs.nrows(),
-        expected_dists.len(),
-        "kneighbors idxs rows"
-    );
+    assert_eq!(idxs.nrows(), expected_dists.len(), "kneighbors idxs rows");
     // Distance to closest neighbor (self) should be ~0; verify monotone increasing.
     for row in dists.rows() {
         let mut prev = -1.0;
         for &d in row.iter() {
-            assert!(d >= prev - 1e-9, "kneighbors dists not monotone: {d} after {prev}");
+            assert!(
+                d >= prev - 1e-9,
+                "kneighbors dists not monotone: {d} after {prev}"
+            );
             prev = d;
         }
     }
@@ -83,21 +80,20 @@ fn conformance_local_outlier_factor() {
     let model = LocalOutlierFactor::<f64>::new()
         .with_n_neighbors(n_neighbors)
         .with_contamination(contamination);
-    let preds = model
-        .fit_predict(&x)
-        .expect("LOF fit_predict");
+    let preds = model.fit_predict(&x).expect("LOF fit_predict");
     let expected: Vec<i64> = fx.expected["predictions"]
         .as_array()
         .unwrap()
         .iter()
         .map(|v| v.as_i64().unwrap())
         .collect();
-    let matches = preds.iter().zip(expected.iter()).filter(|&(&a, &e)| a as i64 == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected.iter())
+        .filter(|&(&a, &e)| a as i64 == e)
+        .count();
     let frac = matches as f64 / preds.len() as f64;
-    assert!(
-        frac >= 0.80,
-        "LOF +1/-1 agreement {frac:.4} < 0.80 floor"
-    );
+    assert!(frac >= 0.80, "LOF +1/-1 agreement {frac:.4} < 0.80 floor");
 }
 
 #[test]
@@ -122,7 +118,11 @@ fn conformance_radius_neighbors_classifier() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let matches = preds.iter().zip(expected.iter()).filter(|(a, e)| a == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / preds.len() as f64;
     assert!(
         acc >= 0.90,
@@ -143,7 +143,11 @@ fn conformance_radius_neighbors_regressor() {
 
     let y_mean = y.iter().sum::<f64>() / y.len() as f64;
     let ss_tot: f64 = y.iter().map(|v| (v - y_mean).powi(2)).sum();
-    let ss_res: f64 = preds.iter().zip(y.iter()).map(|(a, e)| (a - e).powi(2)).sum();
+    let ss_res: f64 = preds
+        .iter()
+        .zip(y.iter())
+        .map(|(a, e)| (a - e).powi(2))
+        .sum();
     let r2 = 1.0 - ss_res / ss_tot;
     let expected_r2 = fx.expected["r2"].as_f64().unwrap_or(0.5);
     assert!(

@@ -15,18 +15,17 @@
 
 use approx::assert_relative_eq;
 use ferrolearn_core::introspection::HasClasses;
-use ferrolearn_core::traits::{Fit, Predict, Transform};
+use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::sgd::{ClassifierLoss, LearningRateSchedule, RegressorLoss};
+use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
     ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, GLMFamily,
     GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, LDA, Lars, Lasso, LassoCV,
     LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
-    LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM,
-    OrthogonalMatchingPursuit, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor,
-    RegressorScore, Ridge, RidgeCV, RidgeClassifier, SGDClassifier, SGDRegressor, SVC, SVR,
-    TweedieRegressor,
+    LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
+    PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV,
+    RidgeClassifier, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor,
 };
-use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ndarray::{Array1, Array2, array};
 
 /// Two well-separated clusters in 2D (for binary classification).
@@ -143,30 +142,49 @@ fn api_proof_elastic_net_family() {
 #[test]
 fn api_proof_bayesian_ridge_and_ard() {
     let (x, y) = regression_data();
-    let f = BayesianRidge::<f64>::new().with_max_iter(50).fit(&x, &y).unwrap();
+    let f = BayesianRidge::<f64>::new()
+        .with_max_iter(50)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f.score(&x, &y).unwrap();
-    let f2 = ARDRegression::<f64>::new().with_max_iter(50).fit(&x, &y).unwrap();
+    let f2 = ARDRegression::<f64>::new()
+        .with_max_iter(50)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f2.score(&x, &y).unwrap();
 }
 
 #[test]
 fn api_proof_huber_and_quantile() {
     let (x, y) = regression_data();
-    let h = HuberRegressor::<f64>::new().with_epsilon(1.35).with_alpha(1e-4).fit(&x, &y).unwrap();
+    let h = HuberRegressor::<f64>::new()
+        .with_epsilon(1.35)
+        .with_alpha(1e-4)
+        .fit(&x, &y)
+        .unwrap();
     let _ = h.score(&x, &y).unwrap();
-    let q = QuantileRegressor::<f64>::new().with_quantile(0.5).fit(&x, &y).unwrap();
+    let q = QuantileRegressor::<f64>::new()
+        .with_quantile(0.5)
+        .fit(&x, &y)
+        .unwrap();
     let _ = q.score(&x, &y).unwrap();
 }
 
 #[test]
 fn api_proof_glm_family() {
     let (x, y) = positive_regression_data();
-    let f = GLMRegressor::<f64>::new(GLMFamily::Poisson).with_alpha(0.1).fit(&x, &y).unwrap();
+    let f = GLMRegressor::<f64>::new(GLMFamily::Poisson)
+        .with_alpha(0.1)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f.score(&x, &y).unwrap();
 
     let _ = PoissonRegressor::<f64>::new().fit(&x, &y).unwrap();
     let _ = GammaRegressor::<f64>::new().fit(&x, &y).unwrap();
-    let _ = TweedieRegressor::<f64>::new().with_power(1.5).fit(&x, &y).unwrap();
+    let _ = TweedieRegressor::<f64>::new()
+        .with_power(1.5)
+        .fit(&x, &y)
+        .unwrap();
 
     // Family enum coverage smoke
     for fam in [GLMFamily::Poisson, GLMFamily::Gamma] {
@@ -177,9 +195,15 @@ fn api_proof_glm_family() {
 #[test]
 fn api_proof_lars_family() {
     let (x, y) = regression_data();
-    let f = Lars::<f64>::new().with_n_nonzero_coefs(1).fit(&x, &y).unwrap();
+    let f = Lars::<f64>::new()
+        .with_n_nonzero_coefs(1)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f.score(&x, &y).unwrap();
-    let f2 = LassoLars::<f64>::new().with_alpha(0.01).fit(&x, &y).unwrap();
+    let f2 = LassoLars::<f64>::new()
+        .with_alpha(0.01)
+        .fit(&x, &y)
+        .unwrap();
     let _ = f2.score(&x, &y).unwrap();
 }
 
@@ -389,7 +413,9 @@ fn api_proof_kernel_svm_family() {
     let f = nusvr.fit(&xr, &yr).unwrap();
     let _ = f.predict(&xr).unwrap();
 
-    let ocsvm = OneClassSVM::new(LinearKernel).with_nu(0.5).with_max_iter(200);
+    let ocsvm = OneClassSVM::new(LinearKernel)
+        .with_nu(0.5)
+        .with_max_iter(200);
     let f = ocsvm.fit(&x, &()).unwrap();
     let _ = f.predict(&x).unwrap();
     let _ = f.decision_function(&x).unwrap();
@@ -403,7 +429,10 @@ fn api_proof_isotonic_regression() {
     let x = Array2::from_shape_vec((6, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
     let y = array![1.0, 2.5, 2.0, 4.0, 5.5, 5.0];
 
-    let f = IsotonicRegression::<f64>::new().with_increasing(true).fit(&x, &y).unwrap();
+    let f = IsotonicRegression::<f64>::new()
+        .with_increasing(true)
+        .fit(&x, &y)
+        .unwrap();
     let preds = f.predict(&x).unwrap();
     assert_eq!(preds.len(), 6);
     let _ = f.score(&x, &y).unwrap();

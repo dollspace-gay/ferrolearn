@@ -31,8 +31,8 @@
 use ferrolearn_core::introspection::HasFeatureImportances;
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_test_oracle::{
-    assert_close, json_to_array1, json_to_array2, json_to_labels, load_fixture,
-    TOL_TREE_ENSEMBLE_ABS, TOL_TREE_ENSEMBLE_REL,
+    TOL_TREE_ENSEMBLE_ABS, TOL_TREE_ENSEMBLE_REL, assert_close, json_to_array1, json_to_array2,
+    json_to_labels, load_fixture,
 };
 use ndarray::Array1;
 
@@ -49,7 +49,11 @@ const QUALITY_FLOOR: f64 = 0.95;
 /// Classification accuracy on integer label arrays.
 fn accuracy(preds: &Array1<usize>, targets: &Array1<usize>) -> f64 {
     assert_eq!(preds.len(), targets.len());
-    let correct = preds.iter().zip(targets.iter()).filter(|(a, b)| a == b).count();
+    let correct = preds
+        .iter()
+        .zip(targets.iter())
+        .filter(|(a, b)| a == b)
+        .count();
     correct as f64 / targets.len() as f64
 }
 
@@ -130,13 +134,7 @@ fn check_feature_importances(
     // comparison at ensemble tolerance is the right check. We assert per-index
     // rather than slice so we get a useful first-failure index in the panic.
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-        assert_close(
-            a,
-            e,
-            rel,
-            abs,
-            &format!("{label}.feature_importances[{i}]"),
-        );
+        assert_close(a, e, rel, abs, &format!("{label}.feature_importances[{i}]"));
     }
 }
 
@@ -331,7 +329,9 @@ fn conformance_gradient_boosting_classifier() {
         .with_learning_rate(learning_rate)
         .with_random_state(seed);
     let fitted = model.fit(&x, &y).expect("GradientBoostingClassifier fit");
-    let preds = fitted.predict(&x).expect("GradientBoostingClassifier predict");
+    let preds = fitted
+        .predict(&x)
+        .expect("GradientBoostingClassifier predict");
 
     let sklearn_accuracy = fx.expected["accuracy"].as_f64().unwrap();
     let acc = accuracy(&preds, &y);
@@ -376,7 +376,9 @@ fn conformance_gradient_boosting_regressor() {
         .with_learning_rate(learning_rate)
         .with_random_state(seed);
     let fitted = model.fit(&x, &y).expect("GradientBoostingRegressor fit");
-    let preds = fitted.predict(&x).expect("GradientBoostingRegressor predict");
+    let preds = fitted
+        .predict(&x)
+        .expect("GradientBoostingRegressor predict");
 
     let sklearn_r2 = fx.expected["r2"].as_f64().unwrap();
     let r2v = r2(&preds, &y);

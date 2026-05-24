@@ -60,12 +60,13 @@ fn conformance_gaussian_process_classifier() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let matches = preds.iter().zip(expected_preds.iter()).filter(|(a, e)| a == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected_preds.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / preds.len() as f64;
-    assert!(
-        acc >= 0.85,
-        "GP classifier accuracy {acc:.4} < 0.85 floor"
-    );
+    assert!(acc >= 0.85, "GP classifier accuracy {acc:.4} < 0.85 floor");
 }
 
 #[test]

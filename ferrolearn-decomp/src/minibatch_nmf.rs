@@ -278,7 +278,11 @@ fn init_nndsvd_simple<F: Float + Send + Sync + 'static>(
         // Clamp negatives to zero and store as row of H.
         for j in 0..n_features {
             let val = v[[j, 0]];
-            h[[k, j]] = if val > F::zero() { val } else { eps::<F>() * scale };
+            h[[k, j]] = if val > F::zero() {
+                val
+            } else {
+                eps::<F>() * scale
+            };
         }
     }
 
@@ -308,11 +312,7 @@ fn reconstruction_error<F: Float + 'static>(x: &Array2<F>, w: &Array2<F>, h: &Ar
 
 /// Solve for W_batch via coordinate descent on `||X_batch - W_batch @ H||^2`,
 /// keeping H fixed. All values in W_batch are clamped non-negative.
-fn update_w_batch<F: Float + 'static>(
-    x_batch: &Array2<F>,
-    w_batch: &mut Array2<F>,
-    h: &Array2<F>,
-) {
+fn update_w_batch<F: Float + 'static>(x_batch: &Array2<F>, w_batch: &mut Array2<F>, h: &Array2<F>) {
     let n_batch = x_batch.nrows();
     let n_components = h.nrows();
     let n_features = h.ncols();
@@ -426,8 +426,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MiniBatchNMF<F> {
             let mut batch_start = 0;
             while batch_start < n_samples {
                 let batch_end = (batch_start + batch_size).min(n_samples);
-                let batch_indices: Vec<usize> =
-                    indices[batch_start..batch_end].to_vec();
+                let batch_indices: Vec<usize> = indices[batch_start..batch_end].to_vec();
                 let actual_batch = batch_indices.len();
 
                 // Extract X_batch.

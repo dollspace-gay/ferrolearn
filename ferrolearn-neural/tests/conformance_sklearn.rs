@@ -38,11 +38,7 @@ fn conformance_mlp_classifier() {
 
     let preds = fitted.predict(&x).expect("MLPClassifier predict");
     let expected_acc = fx.expected["accuracy"].as_f64().unwrap_or(0.5);
-    let matches: usize = preds
-        .iter()
-        .zip(y.iter())
-        .filter(|(a, e)| a == e)
-        .count();
+    let matches: usize = preds.iter().zip(y.iter()).filter(|(a, e)| a == e).count();
     let acc = matches as f64 / y.len() as f64;
     // sklearn at Adam defaults also doesn't fully converge on this n=100,
     // p=5, 3-class problem; both libraries achieve similar mediocre Adam

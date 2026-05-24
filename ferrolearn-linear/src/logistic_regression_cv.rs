@@ -187,11 +187,7 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedLogisticRe
 /// `StratifiedKFold` (#346).
 ///
 /// Returns `(train_indices, test_indices)` for fold number `fold`.
-fn stratified_kfold_split(
-    y: &Array1<usize>,
-    k: usize,
-    fold: usize,
-) -> (Vec<usize>, Vec<usize>) {
+fn stratified_kfold_split(y: &Array1<usize>, k: usize, fold: usize) -> (Vec<usize>, Vec<usize>) {
     // Group sample indices by class.
     let mut classes: Vec<usize> = y.iter().copied().collect();
     classes.sort_unstable();
@@ -458,8 +454,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (12, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5, 1.0, 1.8,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0, 8.5, 8.5, 8.0, 8.8,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5, 1.0, 1.8, 8.0, 8.0, 8.0, 9.0,
+                9.0, 8.0, 9.0, 9.0, 8.5, 8.5, 8.0, 8.8,
             ],
         )
         .unwrap();
@@ -484,8 +480,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (12, 2),
             vec![
-                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5,
-                10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 10.5, 0.5,
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5, 10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 10.5, 0.5,
                 0.0, 10.0, 0.5, 10.0, 0.0, 10.5, 0.5, 10.5,
             ],
         )
@@ -509,8 +504,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (10, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0, 8.5, 8.5,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0,
+                9.0, 9.0, 8.5, 8.5,
             ],
         )
         .unwrap();
@@ -568,8 +563,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (10, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0, 8.5, 8.5,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 1.5, 1.5, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0,
+                9.0, 9.0, 8.5, 8.5,
             ],
         )
         .unwrap();

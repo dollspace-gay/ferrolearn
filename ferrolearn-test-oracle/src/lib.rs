@@ -270,7 +270,11 @@ pub fn assert_close_rows_sign_ambiguous(
         let use_pos = pos_max <= neg_max;
         for (j, (&a, &e)) in a_row.iter().zip(e_row.iter()).enumerate() {
             let threshold = abs.max(rel * e.abs());
-            let diff = if use_pos { (a - e).abs() } else { (a + e).abs() };
+            let diff = if use_pos {
+                (a - e).abs()
+            } else {
+                (a + e).abs()
+            };
             assert!(
                 diff <= threshold,
                 "{label}[row {i}, col {j}]: actual={a} expected={e} \
@@ -324,7 +328,11 @@ pub fn assert_labels_equal(actual: &[i64], expected: &[i64], label: &str) {
 /// labels diverge only by permutation.
 #[must_use]
 pub fn adjusted_rand_index(a: &[i64], b: &[i64]) -> f64 {
-    assert_eq!(a.len(), b.len(), "ARI: label arrays must be the same length");
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "ARI: label arrays must be the same length"
+    );
     let n = a.len();
     if n == 0 {
         return 1.0;
@@ -347,12 +355,14 @@ pub fn adjusted_rand_index(a: &[i64], b: &[i64]) -> f64 {
     let col_sums: Vec<u64> = (0..classes_b.len())
         .map(|j| cont.iter().map(|r| r[j]).sum())
         .collect();
-    let comb2 = |k: u64| if k < 2 { 0u128 } else { u128::from(k) * (u128::from(k) - 1) / 2 };
-    let sum_comb_cont: u128 = cont
-        .iter()
-        .flat_map(|r| r.iter())
-        .map(|&v| comb2(v))
-        .sum();
+    let comb2 = |k: u64| {
+        if k < 2 {
+            0u128
+        } else {
+            u128::from(k) * (u128::from(k) - 1) / 2
+        }
+    };
+    let sum_comb_cont: u128 = cont.iter().flat_map(|r| r.iter()).map(|&v| comb2(v)).sum();
     let sum_comb_row: u128 = row_sums.iter().map(|&v| comb2(v)).sum();
     let sum_comb_col: u128 = col_sums.iter().map(|&v| comb2(v)).sum();
     let total = comb2(n as u64);
@@ -428,9 +438,9 @@ pub fn json_to_labels(value: &serde_json::Value) -> Vec<i64> {
         .iter()
         .map(|v| {
             v.as_i64().unwrap_or_else(|| {
-                v.as_f64().map(|x| x as i64).unwrap_or_else(|| {
-                    panic!("label must be int or float-int, got {v}")
-                })
+                v.as_f64()
+                    .map(|x| x as i64)
+                    .unwrap_or_else(|| panic!("label must be int or float-int, got {v}"))
             })
         })
         .collect()

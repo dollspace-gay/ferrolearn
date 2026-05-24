@@ -760,7 +760,7 @@ mod tests {
         let y: Array1<usize> = array![0, 0, 0, 1, 1, 1];
         let (_, p_vals) = f_classif(&x, &y).unwrap();
         for &p in p_vals.iter() {
-            assert!(p >= 0.0 && p <= 1.0, "p-value {p} out of bounds");
+            assert!((0.0..=1.0).contains(&p), "p-value {p} out of bounds");
         }
     }
 
@@ -812,7 +812,7 @@ mod tests {
         let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0, 5.0];
         let (_, p_vals) = f_regression(&x, &y).unwrap();
         for &p in p_vals.iter() {
-            assert!(p >= 0.0 && p <= 1.0, "p-value {p} out of bounds");
+            assert!((0.0..=1.0).contains(&p), "p-value {p} out of bounds");
         }
     }
 
@@ -893,7 +893,7 @@ mod tests {
         let y: Array1<usize> = array![0, 1, 0, 1, 0, 1];
         let (_, p_vals) = chi2(&x, &y).unwrap();
         for &p in p_vals.iter() {
-            assert!(p >= 0.0 && p <= 1.0, "p-value {p} out of bounds");
+            assert!((0.0..=1.0).contains(&p), "p-value {p} out of bounds");
         }
     }
 

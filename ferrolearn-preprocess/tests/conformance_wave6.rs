@@ -8,11 +8,11 @@
 
 use ferrolearn_core::{Fit, Transform};
 use ferrolearn_preprocess::{
+    FunctionTransformer, GaussianRandomProjection, LabelBinarizer, MultiLabelBinarizer,
+    OrdinalEncoder, SelectPercentile, SparseRandomProjection, VarianceThreshold,
     feature_selection::{ScoreFunc, SelectFromModel, SelectKBest},
     knn_imputer::{KNNImputer, KNNWeights},
     spline_transformer::{KnotStrategy, SplineTransformer},
-    FunctionTransformer, GaussianRandomProjection, LabelBinarizer, MultiLabelBinarizer,
-    OrdinalEncoder, SelectPercentile, SparseRandomProjection, VarianceThreshold,
 };
 use ferrolearn_test_oracle::{json_to_array1, json_to_array2, load_fixture};
 
@@ -99,10 +99,7 @@ fn conformance_multilabel_binarizer() {
     let expected = json_to_array2(&fx.expected["transformed"]);
     assert_eq!(yt.shape(), expected.shape(), "MLB shape");
     for (i, (&a, &e)) in yt.iter().zip(expected.iter()).enumerate() {
-        assert!(
-            (a - e).abs() < 1e-12,
-            "MLB[{i}] actual={a} expected={e}"
-        );
+        assert!((a - e).abs() < 1e-12, "MLB[{i}] actual={a} expected={e}");
     }
 }
 
@@ -118,10 +115,7 @@ fn conformance_variance_threshold() {
     let expected = json_to_array2(&fx.expected["transformed"]);
     assert_eq!(xt.shape(), expected.shape(), "VT shape");
     for (i, (&a, &e)) in xt.iter().zip(expected.iter()).enumerate() {
-        assert!(
-            (a - e).abs() < 1e-12,
-            "VT[{i}] actual={a} expected={e}"
-        );
+        assert!((a - e).abs() < 1e-12, "VT[{i}] actual={a} expected={e}");
     }
 }
 
@@ -183,8 +177,8 @@ fn conformance_select_from_model() {
     let c = fx.params["C"].as_f64().unwrap_or(1.0);
     let max_iter = fx.params["max_iter"].as_u64().unwrap_or(500) as usize;
 
-    use ferrolearn_core::introspection::HasCoefficients;
     use ferrolearn_core::Fit;
+    use ferrolearn_core::introspection::HasCoefficients;
     let lr = ferrolearn_linear::LogisticRegression::<f64>::new()
         .with_c(c)
         .with_max_iter(max_iter);
@@ -232,8 +226,8 @@ fn conformance_rfe() {
     let y = ndarray::Array1::from_vec(y_vec);
     let n_keep = fx.params["n_features_to_select"].as_u64().unwrap_or(4) as usize;
 
-    use ferrolearn_core::introspection::HasCoefficients;
     use ferrolearn_core::Fit;
+    use ferrolearn_core::introspection::HasCoefficients;
     let lr = ferrolearn_linear::LogisticRegression::<f64>::new();
     let fitted = lr.fit(&x, &y).expect("LogisticRegression fit");
     let importances: ndarray::Array1<f64> = fitted.coefficients().mapv(|v| v.abs());
@@ -365,10 +359,7 @@ fn conformance_function_transformer() {
     let xt = model.transform(&x).expect("FunctionTransformer transform");
     let expected = json_to_array2(&fx.expected["transformed"]);
     for (i, (&a, &e)) in xt.iter().zip(expected.iter()).enumerate() {
-        assert!(
-            (a - e).abs() < 1e-12,
-            "FT[{i}] actual={a} expected={e}"
-        );
+        assert!((a - e).abs() < 1e-12, "FT[{i}] actual={a} expected={e}");
     }
     // silence unused warning
     let _ = json_to_array1;

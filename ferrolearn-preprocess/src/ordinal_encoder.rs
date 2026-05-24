@@ -120,8 +120,7 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
             // documents `categories_ = sorted(unique(X[:, j]))`. (Older
             // ferrolearn versions used first-seen order — #344.)
             let mut unique: Vec<String> = Vec::new();
-            let mut seen_set: std::collections::HashSet<String> =
-                std::collections::HashSet::new();
+            let mut seen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
             for i in 0..n_samples {
                 let cat = &x[[i, j]];
                 if seen_set.insert(cat.clone()) {

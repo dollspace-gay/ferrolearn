@@ -18,7 +18,11 @@ fn json_to_usize_vec(value: &serde_json::Value) -> Vec<usize> {
         .collect()
 }
 
-fn assert_folds_match(actual: &[(Vec<usize>, Vec<usize>)], expected: &serde_json::Value, label: &str) {
+fn assert_folds_match(
+    actual: &[(Vec<usize>, Vec<usize>)],
+    expected: &serde_json::Value,
+    label: &str,
+) {
     let expected_folds = expected.as_array().unwrap();
     assert_eq!(
         actual.len(),
@@ -83,11 +87,7 @@ fn conformance_shuffle_split() {
     assert_eq!(folds.len(), expected_folds.len(), "ShuffleSplit n_splits");
     let total_size = (test_size * n as f64).round() as usize;
     for (i, (_train, test)) in folds.iter().enumerate() {
-        assert_eq!(
-            test.len(),
-            total_size,
-            "ShuffleSplit fold {i} test size"
-        );
+        assert_eq!(test.len(), total_size, "ShuffleSplit fold {i} test size");
     }
 }
 
@@ -97,7 +97,9 @@ fn conformance_group_kfold() {
     let groups_vec = json_to_usize_vec(&fx.input["groups"]);
     let groups = ndarray::Array1::from_vec(groups_vec);
     let n_splits = fx.params["n_splits"].as_u64().unwrap() as usize;
-    let folds = GroupKFold::new(n_splits).split(&groups).expect("GroupKFold split");
+    let folds = GroupKFold::new(n_splits)
+        .split(&groups)
+        .expect("GroupKFold split");
     // GroupKFold assignment depends on group-size ordering — both libraries
     // should produce the same partition up to fold permutation.
     let expected_folds = fx.expected["folds"].as_array().unwrap();
@@ -127,7 +129,9 @@ fn conformance_group_shuffle_split() {
     let groups = ndarray::Array1::from_vec(groups_vec);
     let n_splits = fx.params["n_splits"].as_u64().unwrap() as usize;
     let test_size = fx.params["test_size"].as_f64().unwrap();
-    let folds = GroupShuffleSplit::new(n_splits, test_size).split(&groups).expect("GSS split");
+    let folds = GroupShuffleSplit::new(n_splits, test_size)
+        .split(&groups)
+        .expect("GSS split");
     let expected_folds = fx.expected["folds"].as_array().unwrap();
     assert_eq!(folds.len(), expected_folds.len(), "GSS n_splits");
     for (_train, test) in folds.iter() {

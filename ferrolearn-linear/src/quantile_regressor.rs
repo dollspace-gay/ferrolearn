@@ -314,11 +314,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::InsufficientSamples`] — zero samples.
     /// - [`FerroError::InvalidParameter`] — quantile outside (0, 1) or
     ///   negative alpha.
-    fn fit(
-        &self,
-        x: &Array2<F>,
-        y: &Array1<F>,
-    ) -> Result<FittedQuantileRegressor<F>, FerroError> {
+    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedQuantileRegressor<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -401,7 +397,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             for i in 0..n_samples {
                 let abs_r = residuals[i].abs().max(eps);
                 // Asymmetric weight: q for positive residuals, (1-q) for negative.
-                let asym = if residuals[i] >= F::zero() { q } else { one - q };
+                let asym = if residuals[i] >= F::zero() {
+                    q
+                } else {
+                    one - q
+                };
                 weights[i] = asym / abs_r;
             }
 
@@ -543,30 +543,36 @@ mod tests {
     fn test_invalid_quantile_zero() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(QuantileRegressor::<f64>::new()
-            .with_quantile(0.0)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            QuantileRegressor::<f64>::new()
+                .with_quantile(0.0)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_invalid_quantile_one() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(QuantileRegressor::<f64>::new()
-            .with_quantile(1.0)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            QuantileRegressor::<f64>::new()
+                .with_quantile(1.0)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
     fn test_negative_alpha() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(QuantileRegressor::<f64>::new()
-            .with_alpha(-1.0)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            QuantileRegressor::<f64>::new()
+                .with_alpha(-1.0)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]

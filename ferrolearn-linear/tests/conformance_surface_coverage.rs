@@ -9,7 +9,7 @@
 //! it must fail the build. This pattern is borrowed from ferrotorch and
 //! ferray's surface-coverage gates.
 
-use ferrolearn_test_oracle::{assert_surface_covered, SurfaceExclusions, SurfaceInventory};
+use ferrolearn_test_oracle::{SurfaceExclusions, SurfaceInventory, assert_surface_covered};
 use std::path::{Path, PathBuf};
 
 fn crate_root() -> PathBuf {
@@ -22,8 +22,12 @@ fn test_dir() -> PathBuf {
 
 #[test]
 fn surface_coverage_gate() {
-    let inv_path = test_dir().join("conformance").join("_surface_inventory.toml");
-    let exc_path = test_dir().join("conformance").join("_surface_exclusions.toml");
+    let inv_path = test_dir()
+        .join("conformance")
+        .join("_surface_inventory.toml");
+    let exc_path = test_dir()
+        .join("conformance")
+        .join("_surface_exclusions.toml");
     let inventory = SurfaceInventory::load(&inv_path);
     let exclusions = SurfaceExclusions::load(&exc_path);
     assert!(

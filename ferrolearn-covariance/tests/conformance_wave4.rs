@@ -2,9 +2,7 @@
 
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_covariance::{EllipticEnvelope, GraphicalLasso};
-use ferrolearn_test_oracle::{
-    assert_close_slice, json_to_array1, json_to_array2, load_fixture,
-};
+use ferrolearn_test_oracle::{assert_close_slice, json_to_array1, json_to_array2, load_fixture};
 
 #[test]
 fn conformance_graphical_lasso_location() {
@@ -62,7 +60,11 @@ fn conformance_elliptic_envelope() {
         .iter()
         .map(|v| v.as_i64().unwrap())
         .collect();
-    let matches = preds.iter().zip(expected.iter()).filter(|&(&a, &e)| a as i64 == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected.iter())
+        .filter(|&(&a, &e)| a as i64 == e)
+        .count();
     let frac = matches as f64 / preds.len() as f64;
     // EllipticEnvelope depends on FastMCD which has subset variance (see
     // documented divergence `fastmcd-subset-selection-variance` and

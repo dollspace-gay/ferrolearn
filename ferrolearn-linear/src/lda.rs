@@ -154,6 +154,7 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
     /// does not match the model.
+    #[allow(clippy::needless_range_loop)] // index-by-class loop is natural for the softmax row write
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let projected = self.transform(x)?;
         let n_samples = projected.nrows();

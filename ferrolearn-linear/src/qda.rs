@@ -241,10 +241,7 @@ fn cholesky_inv_and_logdet<F: Float + 'static>(
 
     // Log-determinant: log|A| = 2 * sum(log(diag(L))).
     let two = F::from(2.0).unwrap();
-    let log_det = (0..n)
-        .map(|i| l[[i, i]].ln())
-        .fold(F::zero(), |a, b| a + b)
-        * two;
+    let log_det = (0..n).map(|i| l[[i, i]].ln()).fold(F::zero(), |a, b| a + b) * two;
 
     // Compute L^{-1} by forward substitution on each column of I.
     let mut l_inv = Array2::<F>::zeros((n, n));
@@ -265,9 +262,7 @@ fn cholesky_inv_and_logdet<F: Float + 'static>(
     Ok((a_inv, log_det))
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>>
-    for QDA<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>> for QDA<F> {
     type Fitted = FittedQDA<F>;
     type Error = FerroError;
 
@@ -280,11 +275,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     ///   or a class has too few samples.
     /// - [`FerroError::InvalidParameter`] — `reg_param` not in `[0, 1]`.
     /// - [`FerroError::NumericalInstability`] — covariance matrix is singular.
-    fn fit(
-        &self,
-        x: &Array2<F>,
-        y: &Array1<usize>,
-    ) -> Result<FittedQDA<F>, FerroError> {
+    fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedQDA<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -392,9 +383,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
-    for FittedQDA<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for FittedQDA<F> {
     type Output = Array1<usize>;
     type Error = FerroError;
 
@@ -476,8 +465,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -496,8 +484,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (12, 2),
             vec![
-                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5,
-                10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 10.5, 0.5,
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 0.5, 0.5, 10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 10.5, 0.5,
                 0.0, 10.0, 0.5, 10.0, 0.0, 10.5, 0.5, 10.5,
             ],
         )
@@ -520,8 +507,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -569,8 +555,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -587,8 +572,7 @@ mod tests {
         let x = Array2::from_shape_vec(
             (8, 2),
             vec![
-                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0,
-                8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
+                1.0, 1.0, 1.0, 2.0, 2.0, 1.0, 2.0, 2.0, 8.0, 8.0, 8.0, 9.0, 9.0, 8.0, 9.0, 9.0,
             ],
         )
         .unwrap();
@@ -601,11 +585,7 @@ mod tests {
 
     #[test]
     fn test_means() {
-        let x = Array2::from_shape_vec(
-            (4, 1),
-            vec![1.0, 2.0, 5.0, 6.0],
-        )
-        .unwrap();
+        let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 5.0, 6.0]).unwrap();
         let y = array![0, 0, 1, 1];
 
         let fitted = QDA::<f64>::new().with_reg_param(0.1).fit(&x, &y).unwrap();
@@ -615,11 +595,7 @@ mod tests {
 
     #[test]
     fn test_class_with_too_few_samples() {
-        let x = Array2::from_shape_vec(
-            (3, 1),
-            vec![1.0, 5.0, 6.0],
-        )
-        .unwrap();
+        let x = Array2::from_shape_vec((3, 1), vec![1.0, 5.0, 6.0]).unwrap();
         let y = array![0, 1, 1]; // class 0 has only 1 sample
 
         let model = QDA::<f64>::new();

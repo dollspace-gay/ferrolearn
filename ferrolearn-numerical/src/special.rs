@@ -218,11 +218,11 @@ mod tests {
     #[test]
     fn digamma_known_values() {
         // ψ(1) = -γ ≈ -0.577_215_664_901_532_86
-        assert!(approx(digamma(1.0), -0.577_215_664_901_532_86, 1e-9));
+        assert!(approx(digamma(1.0), -0.577_215_664_901_532_9, 1e-9));
         // ψ(2) = 1 - γ
-        assert!(approx(digamma(2.0), 1.0 - 0.577_215_664_901_532_86, 1e-9));
+        assert!(approx(digamma(2.0), 1.0 - 0.577_215_664_901_532_9, 1e-9));
         // ψ(0.5) = -γ - 2 ln 2
-        let expected = -0.577_215_664_901_532_86 - 2.0 * 2.0_f64.ln();
+        let expected = -0.577_215_664_901_532_9 - 2.0 * 2.0_f64.ln();
         assert!(approx(digamma(0.5), expected, 1e-9));
     }
 

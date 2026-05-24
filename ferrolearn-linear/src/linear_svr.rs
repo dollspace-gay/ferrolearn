@@ -128,9 +128,7 @@ pub struct FittedLinearSVR<F> {
     intercept: F,
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
-    for LinearSVR<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>> for LinearSVR<F> {
     type Fitted = FittedLinearSVR<F>;
     type Error = FerroError;
 
@@ -141,11 +139,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InvalidParameter`] — `C` not positive or epsilon negative.
     /// - [`FerroError::InsufficientSamples`] — no samples provided.
-    fn fit(
-        &self,
-        x: &Array2<F>,
-        y: &Array1<F>,
-    ) -> Result<FittedLinearSVR<F>, FerroError> {
+    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLinearSVR<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -280,9 +274,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
-    for FittedLinearSVR<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for FittedLinearSVR<F> {
     type Output = Array1<F>;
     type Error = FerroError;
 
@@ -309,9 +301,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
-    for FittedLinearSVR<F>
-{
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F> for FittedLinearSVR<F> {
     fn coefficients(&self) -> &Array1<F> {
         &self.coefficients
     }
@@ -388,7 +378,10 @@ mod tests {
 
         // Should roughly recover y = 2x.
         for (p, &t) in preds.iter().zip(y.iter()) {
-            assert!((p - t).abs() < 3.0, "prediction {p} too far from target {t}");
+            assert!(
+                (p - t).abs() < 3.0,
+                "prediction {p} too far from target {t}"
+            );
         }
     }
 
@@ -450,8 +443,8 @@ mod tests {
 
     #[test]
     fn test_has_coefficients() {
-        let x = Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0])
-            .unwrap();
+        let x =
+            Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 4.0, 0.0]).unwrap();
         let y = array![1.0, 2.0, 3.0, 4.0];
 
         let fitted = LinearSVR::<f64>::new()

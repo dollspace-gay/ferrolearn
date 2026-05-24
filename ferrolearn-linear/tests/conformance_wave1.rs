@@ -14,9 +14,8 @@
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_slice, json_to_array1, json_to_array2, load_fixture,
     TOL_ITERATIVE_LINEAR_ABS, TOL_ITERATIVE_LINEAR_REL, TOL_LINEAR_FIT_ABS, TOL_LINEAR_FIT_REL,
-    TOL_LOGISTIC_ABS, TOL_LOGISTIC_REL,
+    assert_close, assert_close_slice, json_to_array1, json_to_array2, load_fixture,
 };
 
 /// sklearn's `gamma="scale"` formula: `1 / (n_features * X.var())`.
@@ -710,8 +709,7 @@ fn conformance_isotonic_regression() {
     // wrap as a single-feature matrix.
     let x_vec = json_to_array1(&fx.input["x"]);
     let n = x_vec.len();
-    let x =
-        ndarray::Array2::from_shape_vec((n, 1), x_vec.as_slice().unwrap().to_vec()).unwrap();
+    let x = ndarray::Array2::from_shape_vec((n, 1), x_vec.as_slice().unwrap().to_vec()).unwrap();
     let y = json_to_array1(&fx.input["y"]);
     let (rel, abs) = fx.tolerance(1e-4, 1e-6);
 
@@ -845,10 +843,7 @@ fn conformance_sgd_classifier() {
         .with_random_state(random_state);
     let fitted = model.fit(&x, &y).expect("SGDClassifier fit");
 
-    let preds: Vec<usize> = fitted
-        .predict(&x)
-        .expect("SGDClassifier predict")
-        .to_vec();
+    let preds: Vec<usize> = fitted.predict(&x).expect("SGDClassifier predict").to_vec();
     let expected_classes: Vec<usize> = fx.expected["predicted_classes"]
         .as_array()
         .unwrap()
@@ -894,7 +889,10 @@ fn conformance_sgd_regressor() {
         .map(|(&a, &e)| (a - e).powi(2))
         .sum();
     let r2 = 1.0 - ss_res / ss_tot;
-    assert!(r2 >= 0.85, "SGDRegressor R² with sklearn = {r2:.4}, floor 0.85");
+    assert!(
+        r2 >= 0.85,
+        "SGDRegressor R² with sklearn = {r2:.4}, floor 0.85"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1045,7 +1043,10 @@ fn conformance_nu_svr_rbf() {
     // libsvm; with normalized y and gamma=scale they reach moderately similar
     // fits, but the nu-formulation has a free rho parameter that diverges
     // between the two implementations more than the C-formulation's bias does.
-    assert!(r2 >= 0.40, "NuSVR(RBF) R² with sklearn = {r2:.4}, floor 0.40");
+    assert!(
+        r2 >= 0.40,
+        "NuSVR(RBF) R² with sklearn = {r2:.4}, floor 0.40"
+    );
 }
 
 #[test]

@@ -72,7 +72,9 @@ fn api_proof_kneighbors_classifier() {
     let (dists, idxs) = f.kneighbors(&x, None).unwrap();
     assert_eq!(dists.dim(), (6, 3));
     assert_eq!(idxs.dim(), (6, 3));
-    let g = f.kneighbors_graph(&x, None, GraphMode::Connectivity).unwrap();
+    let g = f
+        .kneighbors_graph(&x, None, GraphMode::Connectivity)
+        .unwrap();
     assert_eq!(g.n_rows(), 6);
     assert_eq!(g.n_cols(), 6);
     assert_eq!(g.nnz(), 6 * 3);
@@ -86,7 +88,12 @@ fn api_proof_kneighbors_classifier() {
 
     // Default impl + every Algorithm and Weights variant compiles.
     let _: KNeighborsClassifier<f64> = Default::default();
-    for alg in [Algorithm::Auto, Algorithm::BruteForce, Algorithm::KdTree, Algorithm::BallTree] {
+    for alg in [
+        Algorithm::Auto,
+        Algorithm::BruteForce,
+        Algorithm::KdTree,
+        Algorithm::BallTree,
+    ] {
         for w in [Weights::Uniform, Weights::Distance] {
             let _ = KNeighborsClassifier::<f64>::new()
                 .with_algorithm(alg)
@@ -119,7 +126,9 @@ fn api_proof_kneighbors_regressor() {
     let (dists, idxs) = f.kneighbors(&x, Some(2)).unwrap();
     assert_eq!(dists.dim(), (6, 2));
     assert_eq!(idxs.dim(), (6, 2));
-    let g = f.kneighbors_graph(&x, Some(2), GraphMode::Distance).unwrap();
+    let g = f
+        .kneighbors_graph(&x, Some(2), GraphMode::Distance)
+        .unwrap();
     assert_eq!(g.nnz(), 6 * 2);
     assert_eq!(f.n_samples_fit(), 6);
 
@@ -217,7 +226,9 @@ fn api_proof_nearest_neighbors() {
     let pairs = nn.radius_neighbors(&x, 1.0).unwrap();
     assert_eq!(pairs.len(), 6);
 
-    let g = nn.kneighbors_graph(&x, None, GraphMode::Connectivity).unwrap();
+    let g = nn
+        .kneighbors_graph(&x, None, GraphMode::Connectivity)
+        .unwrap();
     assert_eq!(g.n_rows(), 6);
     assert_eq!(g.n_cols(), 6);
     let g2 = nn
@@ -366,7 +377,9 @@ fn api_proof_graph_free_functions() {
 fn api_proof_f32_compiles() {
     let x32 = Array2::from_shape_vec(
         (6, 2),
-        vec![0.0f32, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 5.0, 5.5, 5.0, 5.0, 5.5],
+        vec![
+            0.0f32, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 5.0, 5.5, 5.0, 5.0, 5.5,
+        ],
     )
     .unwrap();
     let y_cls = array![0usize, 0, 0, 1, 1, 1];

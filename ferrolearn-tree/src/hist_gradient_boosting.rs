@@ -1975,6 +1975,7 @@ impl<F: Float + Send + Sync + 'static> FittedHistGradientBoostingClassifier<F> {
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
     /// does not match the fitted model.
+    #[allow(clippy::needless_range_loop)] // index-by-class loop is natural for the per-class score accumulation
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         if x.ncols() != self.n_features {
             return Err(FerroError::ShapeMismatch {

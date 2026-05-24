@@ -1565,7 +1565,9 @@ mod tests {
 
     #[test]
     fn test_activate_identity() {
-        let mut z = Array2::from_shape_vec((1, 2), vec![3.14, -2.71]).unwrap();
+        // Arbitrary nonzero test values — clippy's approx_constant lint
+        // false-positives on `3.14` thinking we meant `f32::consts::PI`.
+        let mut z = Array2::from_shape_vec((1, 2), vec![1.25, -2.71]).unwrap();
         let original = z.clone();
         activate_inplace(&mut z, Activation::Identity);
         assert_relative_eq!(z[[0, 0]], original[[0, 0]], epsilon = 1e-15);

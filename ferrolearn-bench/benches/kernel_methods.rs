@@ -1,11 +1,10 @@
 //! Kernel methods benchmarks: KernelRidge, GaussianProcess, Nystroem, RBFSampler.
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
-use ferrolearn_bench::{regression_data};
+use ferrolearn_bench::regression_data;
 use ferrolearn_core::{Fit, Predict, Transform};
 use ferrolearn_kernel::{
-    GaussianProcessRegressor, KernelRidge, Nystroem, RBFSampler,
-    gp_kernels::RBFKernel,
+    GaussianProcessRegressor, KernelRidge, Nystroem, RBFSampler, gp_kernels::RBFKernel,
 };
 
 const KERNEL_SIZES: &[(&str, usize, usize)] = &[

@@ -292,11 +292,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InsufficientSamples`] — fewer than 2 samples.
     /// - [`FerroError::NumericalInstability`] — numerical failure in solver.
-    fn fit(
-        &self,
-        x: &Array2<F>,
-        y: &Array1<F>,
-    ) -> Result<FittedARDRegression<F>, FerroError> {
+    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedARDRegression<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -350,9 +346,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             let (w_new, sd_new) = ard_solve(&x_work, &y_work, alpha, &lambda)?;
 
             // Compute gamma_i = 1 - lambda_i * Sigma_ii.
-            let gamma: Array1<F> = Array1::from_shape_fn(n_features, |i| {
-                F::one() - lambda[i] * sd_new[i]
-            });
+            let gamma: Array1<F> =
+                Array1::from_shape_fn(n_features, |i| F::one() - lambda[i] * sd_new[i]);
 
             let gamma_sum: F = gamma.iter().fold(F::zero(), |a, &b| a + b);
 
@@ -612,7 +607,9 @@ mod tests {
         // y depends only on x1, x2 is noise-free irrelevant.
         let x = Array2::from_shape_vec(
             (6, 2),
-            vec![1.0, 100.0, 2.0, 200.0, 3.0, 300.0, 4.0, 400.0, 5.0, 500.0, 6.0, 600.0],
+            vec![
+                1.0, 100.0, 2.0, 200.0, 3.0, 300.0, 4.0, 400.0, 5.0, 500.0, 6.0, 600.0,
+            ],
         )
         .unwrap();
         let y = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0]; // y = 2 * x1

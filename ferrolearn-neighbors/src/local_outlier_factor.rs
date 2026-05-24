@@ -386,8 +386,7 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
         }
 
         // Compute LOF for new data against the training set.
-        let train_data: Vec<Vec<F>> =
-            (0..n_train).map(|i| self.x_train.row(i).to_vec()).collect();
+        let train_data: Vec<Vec<F>> = (0..n_train).map(|i| self.x_train.row(i).to_vec()).collect();
 
         let effective_k = self.n_neighbors.min(n_train);
         let eps = F::from(1e-15).unwrap();

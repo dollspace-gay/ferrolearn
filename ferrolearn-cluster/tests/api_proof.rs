@@ -19,15 +19,14 @@
 //! - All public enum variants
 
 use approx::assert_relative_eq;
-use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_cluster::{
     AffinityPropagation, AgglomerativeClustering, AgglomerativeLinkage, BayesianCovType,
     BayesianGaussianMixture, Birch, BisectingKMeans, BisectingStrategy, CovarianceType, DBSCAN,
     FeatureAgglomeration, GaussianMixture, Hdbscan, KMeans, LabelPropagation,
     LabelPropagationKernel, LabelSpreading, LabelSpreadingKernel, Linkage, MeanShift,
-    MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering,
-    WeightPriorType,
+    MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering, WeightPriorType,
 };
+use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ndarray::{Array1, Array2, array};
 
 /// Two well-separated clusters in 2D for unsupervised tests.
@@ -169,7 +168,12 @@ fn api_proof_optics() {
 #[test]
 fn api_proof_agglomerative_clustering() {
     let x = two_blobs();
-    for linkage in [Linkage::Ward, Linkage::Complete, Linkage::Average, Linkage::Single] {
+    for linkage in [
+        Linkage::Ward,
+        Linkage::Complete,
+        Linkage::Average,
+        Linkage::Single,
+    ] {
         let m = AgglomerativeClustering::<f64>::new(2).with_linkage(linkage);
         let f = m.fit(&x, &()).unwrap();
         let _ = f.labels();
@@ -302,7 +306,10 @@ fn api_proof_bayesian_gaussian_mixture() {
         BayesianCovType::Diag,
         BayesianCovType::Spherical,
     ] {
-        for wpt in [WeightPriorType::DirichletProcess, WeightPriorType::DirichletDistribution] {
+        for wpt in [
+            WeightPriorType::DirichletProcess,
+            WeightPriorType::DirichletDistribution,
+        ] {
             let m = BayesianGaussianMixture::<f64>::new(3)
                 .with_covariance_type(cov)
                 .with_weight_prior_type(wpt)
@@ -343,7 +350,9 @@ fn api_proof_bayesian_gaussian_mixture() {
 fn semi_supervised_data() -> (Array2<f64>, Array1<isize>) {
     let x = Array2::from_shape_vec(
         (8, 2),
-        vec![0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 10.0, 10.0, 10.1, 10.0, 10.0, 10.1, 10.1, 10.1],
+        vec![
+            0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 0.1, 0.1, 10.0, 10.0, 10.1, 10.0, 10.0, 10.1, 10.1, 10.1,
+        ],
     )
     .unwrap();
     // First and fifth labeled; others unlabeled (-1).

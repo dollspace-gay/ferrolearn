@@ -10,8 +10,8 @@ use ferrolearn_numerical::distributions::{
 use ferrolearn_numerical::interpolate::{BoundaryCondition, CubicSpline};
 use ferrolearn_numerical::sparse_eig::{LanczosSolver, WhichEigenvalues};
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_slice, load_fixture, parse_f64_value, TOL_NUMERICAL_ABS,
-    TOL_NUMERICAL_REL,
+    TOL_NUMERICAL_ABS, TOL_NUMERICAL_REL, assert_close, assert_close_slice, load_fixture,
+    parse_f64_value,
 };
 
 fn json_f64_vec(v: &serde_json::Value) -> Vec<f64> {
@@ -99,8 +99,20 @@ fn conformance_distributions() {
         let pdf: Vec<f64> = points.iter().map(|&x| dist.pdf(x)).collect();
         let cdf: Vec<f64> = points.iter().map(|&x| dist.cdf(x)).collect();
         let sf: Vec<f64> = points.iter().map(|&x| dist.sf(x)).collect();
-        assert_close_slice(&pdf, &json_f64_vec(&block["pdf"]), rel, abs, "ChiSquared.pdf");
-        assert_close_slice(&cdf, &json_f64_vec(&block["cdf"]), rel, abs, "ChiSquared.cdf");
+        assert_close_slice(
+            &pdf,
+            &json_f64_vec(&block["pdf"]),
+            rel,
+            abs,
+            "ChiSquared.pdf",
+        );
+        assert_close_slice(
+            &cdf,
+            &json_f64_vec(&block["cdf"]),
+            rel,
+            abs,
+            "ChiSquared.cdf",
+        );
         assert_close_slice(&sf, &json_f64_vec(&block["sf"]), rel, abs, "ChiSquared.sf");
     }
 
@@ -128,8 +140,20 @@ fn conformance_distributions() {
         let pdf: Vec<f64> = points.iter().map(|&x| dist.pdf(x)).collect();
         let cdf: Vec<f64> = points.iter().map(|&x| dist.cdf(x)).collect();
         let sf: Vec<f64> = points.iter().map(|&x| dist.sf(x)).collect();
-        assert_close_slice(&pdf, &json_f64_vec(&block["pdf"]), rel, abs, "StudentsT.pdf");
-        assert_close_slice(&cdf, &json_f64_vec(&block["cdf"]), rel, abs, "StudentsT.cdf");
+        assert_close_slice(
+            &pdf,
+            &json_f64_vec(&block["pdf"]),
+            rel,
+            abs,
+            "StudentsT.pdf",
+        );
+        assert_close_slice(
+            &cdf,
+            &json_f64_vec(&block["cdf"]),
+            rel,
+            abs,
+            "StudentsT.cdf",
+        );
         assert_close_slice(&sf, &json_f64_vec(&block["sf"]), rel, abs, "StudentsT.sf");
     }
 
@@ -178,7 +202,7 @@ fn conformance_sparse_eigsh() {
         .as_array()
         .unwrap()
         .iter()
-        .map(|row| json_f64_vec(row))
+        .map(json_f64_vec)
         .collect();
     assert_eq!(matrix_rows.len(), n, "matrix must be n x n");
 

@@ -100,8 +100,8 @@ pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
 pub use ridge_cv::{FittedRidgeCV, RidgeCV};
 pub use sgd::{FittedSGDClassifier, FittedSGDRegressor, SGDClassifier, SGDRegressor};
 pub use svm::{
-    FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SigmoidKernel, SVC,
-    SVR,
+    FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,
+    SigmoidKernel,
 };
 
 use ferrolearn_core::error::FerroError;

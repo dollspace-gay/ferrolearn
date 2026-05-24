@@ -14,12 +14,10 @@
 //!   documented run-to-run variance. Fixture tolerance widened accordingly.
 
 use ferrolearn_core::Fit;
-use ferrolearn_covariance::{
-    EmpiricalCovariance, LedoitWolf, MinCovDet, OAS, ShrunkCovariance,
-};
+use ferrolearn_covariance::{EmpiricalCovariance, LedoitWolf, MinCovDet, OAS, ShrunkCovariance};
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_slice, json_to_array1, json_to_array2, load_fixture,
-    TOL_COVARIANCE_ABS, TOL_COVARIANCE_REL,
+    TOL_COVARIANCE_ABS, TOL_COVARIANCE_REL, assert_close, assert_close_slice, json_to_array1,
+    json_to_array2, load_fixture,
 };
 
 // ---------------------------------------------------------------------------
@@ -134,7 +132,9 @@ fn conformance_ledoit_wolf() {
     let x = json_to_array2(&fx.input["X"]);
     let (rel, abs) = fx.tolerance(TOL_COVARIANCE_REL, TOL_COVARIANCE_ABS);
 
-    let fitted = LedoitWolf::<f64>::new().fit(&x, &()).expect("LedoitWolf fit");
+    let fitted = LedoitWolf::<f64>::new()
+        .fit(&x, &())
+        .expect("LedoitWolf fit");
 
     let expected_loc = json_to_array1(&fx.expected["location"]);
     let expected_cov = json_to_array2(&fx.expected["covariance"]);

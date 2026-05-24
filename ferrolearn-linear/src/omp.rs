@@ -251,8 +251,7 @@ fn ols_active<F: Float + FromPrimitive + 'static>(
     let xtx = xat.dot(&xa);
     let xty = xat.dot(y);
 
-    let w_active =
-        cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(k, &xtx, &xty))?;
+    let w_active = cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(k, &xtx, &xty))?;
 
     let mut w = Array1::<F>::zeros(n_features);
     for (col_idx, &j) in support.iter().enumerate() {
@@ -309,18 +308,13 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let max_k = self
-            .n_nonzero_coefs
-            .unwrap_or(n_features)
-            .min(n_features);
+        let max_k = self.n_nonzero_coefs.unwrap_or(n_features).min(n_features);
 
         if let Some(n) = self.n_nonzero_coefs {
             if n > n_features {
                 return Err(FerroError::InvalidParameter {
                     name: "n_nonzero_coefs".into(),
-                    reason: format!(
-                        "cannot exceed number of features ({n_features})"
-                    ),
+                    reason: format!("cannot exceed number of features ({n_features})"),
                 });
             }
         }
@@ -492,10 +486,12 @@ mod tests {
     fn test_shape_mismatch() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0];
-        assert!(OrthogonalMatchingPursuit::<f64>::new()
-            .with_n_nonzero_coefs(1)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            OrthogonalMatchingPursuit::<f64>::new()
+                .with_n_nonzero_coefs(1)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -509,10 +505,12 @@ mod tests {
     fn test_n_nonzero_exceeds_features() {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(OrthogonalMatchingPursuit::<f64>::new()
-            .with_n_nonzero_coefs(5)
-            .fit(&x, &y)
-            .is_err());
+        assert!(
+            OrthogonalMatchingPursuit::<f64>::new()
+                .with_n_nonzero_coefs(5)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -534,9 +532,8 @@ mod tests {
         let x = Array2::from_shape_vec(
             (10, 3),
             vec![
-                1.0, 0.1, 0.01, 2.0, 0.2, 0.02, 3.0, 0.3, 0.03, 4.0, 0.4, 0.04,
-                5.0, 0.5, 0.05, 6.0, 0.6, 0.06, 7.0, 0.7, 0.07, 8.0, 0.8, 0.08,
-                9.0, 0.9, 0.09, 10.0, 1.0, 0.10,
+                1.0, 0.1, 0.01, 2.0, 0.2, 0.02, 3.0, 0.3, 0.03, 4.0, 0.4, 0.04, 5.0, 0.5, 0.05,
+                6.0, 0.6, 0.06, 7.0, 0.7, 0.07, 8.0, 0.8, 0.08, 9.0, 0.9, 0.09, 10.0, 1.0, 0.10,
             ],
         )
         .unwrap();

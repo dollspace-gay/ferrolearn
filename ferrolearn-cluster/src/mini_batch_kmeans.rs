@@ -249,10 +249,7 @@ fn kmeans_plus_plus_mb<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> A
         let center0 = centers.row(0);
         let center0_slice = center0.as_slice().unwrap_or(&[]);
         for i in 0..n_samples {
-            min_dists[i] = squared_euclidean_mb(
-                x.row(i).as_slice().unwrap_or(&[]),
-                center0_slice,
-            );
+            min_dists[i] = squared_euclidean_mb(x.row(i).as_slice().unwrap_or(&[]), center0_slice);
         }
     }
 
@@ -276,8 +273,7 @@ fn kmeans_plus_plus_mb<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> A
         let mut best_new_dists: Option<Array1<F>> = None;
 
         for _ in 0..n_trials {
-            let threshold: F =
-                F::from(rng.random::<f64>()).unwrap_or_else(F::zero) * total;
+            let threshold: F = F::from(rng.random::<f64>()).unwrap_or_else(F::zero) * total;
             let mut cumsum = F::zero();
             let mut candidate = n_samples - 1;
             for i in 0..n_samples {
@@ -294,10 +290,7 @@ fn kmeans_plus_plus_mb<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> A
             let mut new_dists = min_dists.clone();
             let mut potential = F::zero();
             for i in 0..n_samples {
-                let d = squared_euclidean_mb(
-                    x.row(i).as_slice().unwrap_or(&[]),
-                    &cand_slice,
-                );
+                let d = squared_euclidean_mb(x.row(i).as_slice().unwrap_or(&[]), &cand_slice);
                 if d < new_dists[i] {
                     new_dists[i] = d;
                 }

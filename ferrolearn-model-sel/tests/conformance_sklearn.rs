@@ -22,7 +22,10 @@ fn conformance_kfold() {
     let n_splits = fx.params["n_splits"].as_u64().unwrap() as usize;
     let shuffle = fx.params["shuffle"].as_bool().unwrap_or(false);
 
-    assert!(!shuffle, "fixture must use shuffle=false for deterministic comparison");
+    assert!(
+        !shuffle,
+        "fixture must use shuffle=false for deterministic comparison"
+    );
 
     let kf = ferrolearn_model_sel::KFold::new(n_splits);
     let folds = kf.split(n_samples);

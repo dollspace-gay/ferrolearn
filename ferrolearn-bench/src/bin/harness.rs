@@ -42,14 +42,13 @@ use ferrolearn_decomp::{
 };
 use ferrolearn_kernel::{KernelRidge, Nystroem, RBFSampler};
 use ferrolearn_linear::{
-    ARDRegression, BayesianRidge, ElasticNet, HuberRegressor, Lasso, LinearRegression,
-    LinearSVC, LogisticRegression, QDA, QuantileRegressor, Ridge, RidgeClassifier,
+    ARDRegression, BayesianRidge, ElasticNet, HuberRegressor, Lasso, LinearRegression, LinearSVC,
+    LogisticRegression, QDA, QuantileRegressor, Ridge, RidgeClassifier,
 };
 use ferrolearn_neighbors::{KNeighborsClassifier, KNeighborsRegressor, NearestCentroid};
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, KBinsDiscretizer, MaxAbsScaler, MinMaxScaler, Normalizer,
-    PolynomialFeatures, PowerTransformer, RobustScaler, StandardScaler,
-    normalizer::NormType,
+    PolynomialFeatures, PowerTransformer, RobustScaler, StandardScaler, normalizer::NormType,
 };
 use ferrolearn_tree::{
     AdaBoostClassifier, BaggingClassifier, DecisionTreeClassifier, DecisionTreeRegressor,
@@ -167,45 +166,191 @@ fn bench_regressors(records: &mut Vec<BenchRecord>) {
         let (x, y) = regression_data(n, p);
         let (xtr, xte, ytr, yte) = split_regression(&x, &y);
 
-        reg_bench!(records, "LinearRegression", label, n, p,
-            &xtr, &xte, &ytr, &yte, LinearRegression::<f64>::new());
-        reg_bench!(records, "Ridge", label, n, p,
-            &xtr, &xte, &ytr, &yte, Ridge::<f64>::new());
-        reg_bench!(records, "Lasso", label, n, p,
-            &xtr, &xte, &ytr, &yte, Lasso::<f64>::new());
-        reg_bench!(records, "ElasticNet", label, n, p,
-            &xtr, &xte, &ytr, &yte, ElasticNet::<f64>::new());
-        reg_bench!(records, "BayesianRidge", label, n, p,
-            &xtr, &xte, &ytr, &yte, BayesianRidge::<f64>::new());
-        reg_bench!(records, "ARDRegression", label, n, p,
-            &xtr, &xte, &ytr, &yte, ARDRegression::<f64>::new());
+        reg_bench!(
+            records,
+            "LinearRegression",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            LinearRegression::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "Ridge",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            Ridge::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "Lasso",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            Lasso::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "ElasticNet",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            ElasticNet::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "BayesianRidge",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            BayesianRidge::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "ARDRegression",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            ARDRegression::<f64>::new()
+        );
         if n <= 1_000 {
-            reg_bench!(records, "HuberRegressor", label, n, p,
-                &xtr, &xte, &ytr, &yte, HuberRegressor::<f64>::new());
-            reg_bench!(records, "QuantileRegressor", label, n, p,
-                &xtr, &xte, &ytr, &yte, QuantileRegressor::<f64>::new());
+            reg_bench!(
+                records,
+                "HuberRegressor",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                HuberRegressor::<f64>::new()
+            );
+            reg_bench!(
+                records,
+                "QuantileRegressor",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                QuantileRegressor::<f64>::new()
+            );
         }
-        reg_bench!(records, "DecisionTreeRegressor", label, n, p,
-            &xtr, &xte, &ytr, &yte, DecisionTreeRegressor::<f64>::new());
-        reg_bench!(records, "RandomForestRegressor", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            RandomForestRegressor::<f64>::new().with_random_state(42));
-        reg_bench!(records, "ExtraTreesRegressor", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            ExtraTreesRegressor::<f64>::new().with_random_state(42));
+        reg_bench!(
+            records,
+            "DecisionTreeRegressor",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            DecisionTreeRegressor::<f64>::new()
+        );
+        reg_bench!(
+            records,
+            "RandomForestRegressor",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            RandomForestRegressor::<f64>::new().with_random_state(42)
+        );
+        reg_bench!(
+            records,
+            "ExtraTreesRegressor",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            ExtraTreesRegressor::<f64>::new().with_random_state(42)
+        );
         if n <= 1_000 {
-            reg_bench!(records, "GradientBoostingRegressor", label, n, p,
-                &xtr, &xte, &ytr, &yte,
-                GradientBoostingRegressor::<f64>::new().with_random_state(42));
+            reg_bench!(
+                records,
+                "GradientBoostingRegressor",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                GradientBoostingRegressor::<f64>::new().with_random_state(42)
+            );
         }
-        reg_bench!(records, "HistGradientBoostingRegressor", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            HistGradientBoostingRegressor::<f64>::new().with_random_state(42));
-        reg_bench!(records, "KNeighborsRegressor", label, n, p,
-            &xtr, &xte, &ytr, &yte, KNeighborsRegressor::<f64>::new());
+        reg_bench!(
+            records,
+            "HistGradientBoostingRegressor",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            HistGradientBoostingRegressor::<f64>::new().with_random_state(42)
+        );
+        reg_bench!(
+            records,
+            "KNeighborsRegressor",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            KNeighborsRegressor::<f64>::new()
+        );
         if n <= 2_000 {
-            reg_bench!(records, "KernelRidge", label, n, p,
-                &xtr, &xte, &ytr, &yte, KernelRidge::<f64>::new());
+            reg_bench!(
+                records,
+                "KernelRidge",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                KernelRidge::<f64>::new()
+            );
         }
     }
 }
@@ -219,69 +364,262 @@ fn bench_classifiers(records: &mut Vec<BenchRecord>) {
         let (x, y) = classification_data(n, p);
         let (xtr, xte, ytr, yte) = split_classification(&x, &y);
 
-        cls_bench!(records, "LogisticRegression", label, n, p,
-            &xtr, &xte, &ytr, &yte, LogisticRegression::<f64>::new());
-        cls_bench!(records, "RidgeClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte, RidgeClassifier::<f64>::new());
-        cls_bench!(records, "LinearSVC", label, n, p,
-            &xtr, &xte, &ytr, &yte, LinearSVC::<f64>::new());
-        cls_bench!(records, "QDA", label, n, p,
-            &xtr, &xte, &ytr, &yte, QDA::<f64>::new());
-        cls_bench!(records, "GaussianNB", label, n, p,
-            &xtr, &xte, &ytr, &yte, GaussianNB::<f64>::new());
-        cls_bench!(records, "DecisionTreeClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte, DecisionTreeClassifier::<f64>::new());
-        cls_bench!(records, "ExtraTreeClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte, ExtraTreeClassifier::<f64>::new());
-        cls_bench!(records, "RandomForestClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            RandomForestClassifier::<f64>::new().with_random_state(42));
-        cls_bench!(records, "ExtraTreesClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            ExtraTreesClassifier::<f64>::new().with_random_state(42));
+        cls_bench!(
+            records,
+            "LogisticRegression",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            LogisticRegression::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "RidgeClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            RidgeClassifier::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "LinearSVC",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            LinearSVC::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "QDA",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            QDA::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "GaussianNB",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            GaussianNB::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "DecisionTreeClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            DecisionTreeClassifier::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "ExtraTreeClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            ExtraTreeClassifier::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "RandomForestClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            RandomForestClassifier::<f64>::new().with_random_state(42)
+        );
+        cls_bench!(
+            records,
+            "ExtraTreesClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            ExtraTreesClassifier::<f64>::new().with_random_state(42)
+        );
         if n <= 1_000 {
-            cls_bench!(records, "AdaBoostClassifier", label, n, p,
-                &xtr, &xte, &ytr, &yte,
-                AdaBoostClassifier::<f64>::new().with_random_state(42));
-            cls_bench!(records, "BaggingClassifier", label, n, p,
-                &xtr, &xte, &ytr, &yte,
-                BaggingClassifier::<f64>::new().with_random_state(42));
-            cls_bench!(records, "GradientBoostingClassifier", label, n, p,
-                &xtr, &xte, &ytr, &yte,
-                GradientBoostingClassifier::<f64>::new().with_random_state(42));
+            cls_bench!(
+                records,
+                "AdaBoostClassifier",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                AdaBoostClassifier::<f64>::new().with_random_state(42)
+            );
+            cls_bench!(
+                records,
+                "BaggingClassifier",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                BaggingClassifier::<f64>::new().with_random_state(42)
+            );
+            cls_bench!(
+                records,
+                "GradientBoostingClassifier",
+                label,
+                n,
+                p,
+                &xtr,
+                &xte,
+                &ytr,
+                &yte,
+                GradientBoostingClassifier::<f64>::new().with_random_state(42)
+            );
         }
-        cls_bench!(records, "HistGradientBoostingClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte,
-            HistGradientBoostingClassifier::<f64>::new().with_random_state(42));
-        cls_bench!(records, "KNeighborsClassifier", label, n, p,
-            &xtr, &xte, &ytr, &yte, KNeighborsClassifier::<f64>::new());
-        cls_bench!(records, "NearestCentroid", label, n, p,
-            &xtr, &xte, &ytr, &yte, NearestCentroid::<f64>::new());
+        cls_bench!(
+            records,
+            "HistGradientBoostingClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            HistGradientBoostingClassifier::<f64>::new().with_random_state(42)
+        );
+        cls_bench!(
+            records,
+            "KNeighborsClassifier",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            KNeighborsClassifier::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "NearestCentroid",
+            label,
+            n,
+            p,
+            &xtr,
+            &xte,
+            &ytr,
+            &yte,
+            NearestCentroid::<f64>::new()
+        );
 
         // Non-negative-feature NB variants.
         let xtr_pos = xtr.mapv(f64::abs);
         let xte_pos = xte.mapv(f64::abs);
-        cls_bench!(records, "MultinomialNB", label, n, p,
-            &xtr_pos, &xte_pos, &ytr, &yte, MultinomialNB::<f64>::new());
-        cls_bench!(records, "ComplementNB", label, n, p,
-            &xtr_pos, &xte_pos, &ytr, &yte, ComplementNB::<f64>::new());
+        cls_bench!(
+            records,
+            "MultinomialNB",
+            label,
+            n,
+            p,
+            &xtr_pos,
+            &xte_pos,
+            &ytr,
+            &yte,
+            MultinomialNB::<f64>::new()
+        );
+        cls_bench!(
+            records,
+            "ComplementNB",
+            label,
+            n,
+            p,
+            &xtr_pos,
+            &xte_pos,
+            &ytr,
+            &yte,
+            ComplementNB::<f64>::new()
+        );
 
         // Bernoulli NB needs binary features.
         let xtr_bin = xtr.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 });
         let xte_bin = xte.mapv(|v| if v > 0.0 { 1.0 } else { 0.0 });
-        cls_bench!(records, "BernoulliNB", label, n, p,
-            &xtr_bin, &xte_bin, &ytr, &yte, BernoulliNB::<f64>::new());
+        cls_bench!(
+            records,
+            "BernoulliNB",
+            label,
+            n,
+            p,
+            &xtr_bin,
+            &xte_bin,
+            &ytr,
+            &yte,
+            BernoulliNB::<f64>::new()
+        );
     }
 
     // Multi-class addition (one-vs-rest path).
     let (label, n, p) = ("multiclass_2Kx20", 2_000, 20);
     let (x, y) = multiclass_data(n, p, 5);
     let (xtr, xte, ytr, yte) = split_classification(&x, &y);
-    cls_bench!(records, "LogisticRegression(5class)", label, n, p,
-        &xtr, &xte, &ytr, &yte, LogisticRegression::<f64>::new());
-    cls_bench!(records, "RandomForestClassifier(5class)", label, n, p,
-        &xtr, &xte, &ytr, &yte,
-        RandomForestClassifier::<f64>::new().with_random_state(42));
+    cls_bench!(
+        records,
+        "LogisticRegression(5class)",
+        label,
+        n,
+        p,
+        &xtr,
+        &xte,
+        &ytr,
+        &yte,
+        LogisticRegression::<f64>::new()
+    );
+    cls_bench!(
+        records,
+        "RandomForestClassifier(5class)",
+        label,
+        n,
+        p,
+        &xtr,
+        &xte,
+        &ytr,
+        &yte,
+        RandomForestClassifier::<f64>::new().with_random_state(42)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -410,8 +748,7 @@ fn bench_clusterers(records: &mut Vec<BenchRecord>) {
         // O(n²) algorithms — restrict to small sizes.
         if n <= 1_000 {
             {
-                let mut rec =
-                    BenchRecord::new("cluster", "AgglomerativeClustering", label, n, p);
+                let mut rec = BenchRecord::new("cluster", "AgglomerativeClustering", label, n, p);
                 rec.fit_us = slow_once(|| {
                     let _ = AgglomerativeClustering::<f64>::new(8).fit(&x, &()).unwrap();
                 });

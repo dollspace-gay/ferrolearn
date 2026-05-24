@@ -16,9 +16,9 @@
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_slice, json_to_array1, json_to_array2, json_to_labels,
-    load_fixture, MIN_LOGISTIC_ACCURACY, TOL_ITERATIVE_LINEAR_ABS, TOL_ITERATIVE_LINEAR_REL,
-    TOL_LINEAR_FIT_ABS, TOL_LINEAR_FIT_REL, TOL_LOGISTIC_ABS, TOL_LOGISTIC_REL,
+    MIN_LOGISTIC_ACCURACY, TOL_ITERATIVE_LINEAR_ABS, TOL_ITERATIVE_LINEAR_REL, TOL_LINEAR_FIT_ABS,
+    TOL_LINEAR_FIT_REL, TOL_LOGISTIC_ABS, TOL_LOGISTIC_REL, assert_close, assert_close_slice,
+    json_to_array1, json_to_array2, json_to_labels, load_fixture,
 };
 
 // ---------------------------------------------------------------------------
@@ -33,8 +33,7 @@ fn conformance_linear_regression() {
     let (rel, abs) = fx.tolerance(TOL_LINEAR_FIT_REL, TOL_LINEAR_FIT_ABS);
 
     let fit_intercept = fx.params["fit_intercept"].as_bool().unwrap_or(true);
-    let model =
-        ferrolearn_linear::LinearRegression::<f64>::new().with_fit_intercept(fit_intercept);
+    let model = ferrolearn_linear::LinearRegression::<f64>::new().with_fit_intercept(fit_intercept);
     let fitted = model.fit(&x, &y).expect("LinearRegression fit");
 
     let expected_coefs = json_to_array1(&fx.expected["coefficients"]);

@@ -357,7 +357,7 @@ mod tests {
         let fitted = clf.fit(&x(), &y).unwrap();
         let preds = fitted.predict(&x()).unwrap();
         for p in preds.iter() {
-            assert!(matches!(*p, 0 | 1 | 2));
+            assert!(matches!(*p, 0..=2));
         }
     }
 
@@ -368,7 +368,7 @@ mod tests {
         let fitted = clf.fit(&x(), &y).unwrap();
         let preds = fitted.predict(&x()).unwrap();
         for p in preds.iter() {
-            assert!(matches!(*p, 0 | 1 | 2));
+            assert!(matches!(*p, 0..=2));
         }
     }
 

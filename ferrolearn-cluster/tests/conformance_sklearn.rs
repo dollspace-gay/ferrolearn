@@ -18,8 +18,8 @@
 
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_test_oracle::{
-    assert_ari_ge, assert_close, assert_close_slice, json_to_array2, json_to_labels,
-    load_fixture, MIN_CLUSTER_ARI, TOL_CLUSTER_CENTER_ABS, TOL_CLUSTER_CENTER_REL,
+    MIN_CLUSTER_ARI, TOL_CLUSTER_CENTER_ABS, TOL_CLUSTER_CENTER_REL, assert_ari_ge, assert_close,
+    assert_close_slice, json_to_array2, json_to_labels, load_fixture,
 };
 use ndarray::{Array2, ArrayView1};
 
@@ -51,7 +51,14 @@ fn closest_row_index(target: ArrayView1<f64>, centers: &Array2<f64>) -> usize {
 /// Compare two sets of cluster centers up to row permutation: for each
 /// expected row, find the closest actual row and assert element-wise
 /// agreement. Both sides must have the same number of rows.
-fn assert_centers_match(actual: &Array2<f64>, expected: &Array2<f64>, rel: f64, abs: f64, label: &str) {
+#[allow(clippy::needless_range_loop)] // skip-if-used index walk reads cleaner than filter/enumerate
+fn assert_centers_match(
+    actual: &Array2<f64>,
+    expected: &Array2<f64>,
+    rel: f64,
+    abs: f64,
+    label: &str,
+) {
     assert_eq!(
         actual.shape(),
         expected.shape(),
@@ -113,7 +120,12 @@ fn conformance_kmeans() {
 
     let expected_labels = json_to_labels(&fx.expected["labels"]);
     let actual_labels: Vec<i64> = fitted.labels().iter().map(|&v| v as i64).collect();
-    assert_ari_ge(&actual_labels, &expected_labels, MIN_CLUSTER_ARI, "KMeans.labels");
+    assert_ari_ge(
+        &actual_labels,
+        &expected_labels,
+        MIN_CLUSTER_ARI,
+        "KMeans.labels",
+    );
 
     let expected_centers = json_to_array2(&fx.expected["cluster_centers"]);
     assert_centers_match(
@@ -154,7 +166,12 @@ fn conformance_dbscan() {
     // raw labels is meaningful. (sklearn also encodes noise as -1.)
     let expected_labels = json_to_labels(&fx.expected["labels"]);
     let actual_labels: Vec<i64> = fitted.labels().iter().map(|&v| v as i64).collect();
-    assert_ari_ge(&actual_labels, &expected_labels, MIN_CLUSTER_ARI, "DBSCAN.labels");
+    assert_ari_ge(
+        &actual_labels,
+        &expected_labels,
+        MIN_CLUSTER_ARI,
+        "DBSCAN.labels",
+    );
 
     // Order-invariant scalars: should match exactly.
     let expected_n_clusters = fx.expected["n_clusters"].as_u64().unwrap() as usize;
@@ -167,10 +184,7 @@ fn conformance_dbscan() {
     let actual_n_noise = actual_labels.iter().filter(|&&v| v == -1).count();
     assert_eq!(actual_n_noise, expected_n_noise, "DBSCAN.n_noise");
 
-    let expected_core_count = fx.expected["core_sample_indices"]
-        .as_array()
-        .unwrap()
-        .len();
+    let expected_core_count = fx.expected["core_sample_indices"].as_array().unwrap().len();
     assert_eq!(
         fitted.core_sample_indices().len(),
         expected_core_count,
@@ -197,8 +211,8 @@ fn conformance_agglomerative_clustering() {
         other => panic!("unsupported linkage in fixture: {other}"),
     };
 
-    let model = ferrolearn_cluster::AgglomerativeClustering::<f64>::new(n_clusters)
-        .with_linkage(linkage);
+    let model =
+        ferrolearn_cluster::AgglomerativeClustering::<f64>::new(n_clusters).with_linkage(linkage);
     let fitted = model.fit(&x, &()).expect("AgglomerativeClustering fit");
 
     assert_eq!(
@@ -379,7 +393,10 @@ fn conformance_birch() {
     // shape and may legitimately differ from sklearn's. Just sanity-check
     // it's non-empty and has the right feature dimension.
     let sub = fitted.subcluster_centers();
-    assert!(sub.nrows() > 0, "Birch.subcluster_centers must be non-empty");
+    assert!(
+        sub.nrows() > 0,
+        "Birch.subcluster_centers must be non-empty"
+    );
     assert_eq!(
         sub.ncols(),
         x.ncols(),
@@ -388,7 +405,12 @@ fn conformance_birch() {
 
     let expected_labels = json_to_labels(&fx.expected["labels"]);
     let actual_labels: Vec<i64> = fitted.labels().iter().map(|&v| v as i64).collect();
-    assert_ari_ge(&actual_labels, &expected_labels, MIN_CLUSTER_ARI, "Birch.labels");
+    assert_ari_ge(
+        &actual_labels,
+        &expected_labels,
+        MIN_CLUSTER_ARI,
+        "Birch.labels",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -482,8 +504,8 @@ fn conformance_spectral_clustering() {
         "SpectralClustering fixture uses unsupported affinity '{affinity}' (only 'rbf' is implemented)"
     );
 
-    let model =
-        ferrolearn_cluster::SpectralClustering::<f64>::new(n_clusters).with_random_state(random_state);
+    let model = ferrolearn_cluster::SpectralClustering::<f64>::new(n_clusters)
+        .with_random_state(random_state);
     let fitted = model.fit(&x, &()).expect("SpectralClustering fit");
 
     let labels = fitted.labels();

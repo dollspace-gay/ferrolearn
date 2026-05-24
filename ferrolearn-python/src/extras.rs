@@ -227,9 +227,21 @@ impl RsRandomForestRegressor {
     #[new]
     #[pyo3(signature = (n_estimators=100, max_depth=None, min_samples_split=2,
                         min_samples_leaf=1, random_state=None))]
-    fn new(n_estimators: usize, max_depth: Option<usize>, min_samples_split: usize,
-           min_samples_leaf: usize, random_state: Option<u64>) -> Self {
-        Self { n_estimators, max_depth, min_samples_split, min_samples_leaf, random_state, fitted: None }
+    fn new(
+        n_estimators: usize,
+        max_depth: Option<usize>,
+        min_samples_split: usize,
+        min_samples_leaf: usize,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            max_depth,
+            min_samples_split,
+            min_samples_leaf,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
@@ -240,18 +252,28 @@ impl RsRandomForestRegressor {
             .with_max_depth(self.max_depth)
             .with_min_samples_split(self.min_samples_split)
             .with_min_samples_leaf(self.min_samples_leaf);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_to_numpy(py, &preds))
     }
@@ -270,7 +292,12 @@ impl RsExtraTreesRegressor {
     #[new]
     #[pyo3(signature = (n_estimators=100, max_depth=None, random_state=None))]
     fn new(n_estimators: usize, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, max_depth, random_state, fitted: None }
+        Self {
+            n_estimators,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
@@ -279,18 +306,28 @@ impl RsExtraTreesRegressor {
         let mut m = ferrolearn_tree::ExtraTreesRegressor::<f64>::new()
             .with_n_estimators(self.n_estimators)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_to_numpy(py, &preds))
     }
@@ -309,8 +346,19 @@ pub struct RsGradientBoostingRegressor {
 impl RsGradientBoostingRegressor {
     #[new]
     #[pyo3(signature = (n_estimators=100, learning_rate=0.1, max_depth=Some(3), random_state=None))]
-    fn new(n_estimators: usize, learning_rate: f64, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, learning_rate, max_depth, random_state, fitted: None }
+    fn new(
+        n_estimators: usize,
+        learning_rate: f64,
+        max_depth: Option<usize>,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            learning_rate,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
@@ -320,18 +368,28 @@ impl RsGradientBoostingRegressor {
             .with_n_estimators(self.n_estimators)
             .with_learning_rate(self.learning_rate)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_to_numpy(py, &preds))
     }
@@ -350,8 +408,19 @@ pub struct RsHistGradientBoostingRegressor {
 impl RsHistGradientBoostingRegressor {
     #[new]
     #[pyo3(signature = (n_estimators=100, learning_rate=0.1, max_depth=None, random_state=None))]
-    fn new(n_estimators: usize, learning_rate: f64, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, learning_rate, max_depth, random_state, fitted: None }
+    fn new(
+        n_estimators: usize,
+        learning_rate: f64,
+        max_depth: Option<usize>,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            learning_rate,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
@@ -361,18 +430,28 @@ impl RsHistGradientBoostingRegressor {
             .with_n_estimators(self.n_estimators)
             .with_learning_rate(self.learning_rate)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_to_numpy(py, &preds))
     }
@@ -493,7 +572,12 @@ impl RsExtraTreesClassifier {
     #[new]
     #[pyo3(signature = (n_estimators=100, max_depth=None, random_state=None))]
     fn new(n_estimators: usize, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, max_depth, random_state, fitted: None }
+        Self {
+            n_estimators,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
@@ -502,18 +586,28 @@ impl RsExtraTreesClassifier {
         let mut m = ferrolearn_tree::ExtraTreesClassifier::<f64>::new()
             .with_n_estimators(self.n_estimators)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
@@ -532,7 +626,12 @@ impl RsAdaBoostClassifier {
     #[new]
     #[pyo3(signature = (n_estimators=50, learning_rate=1.0, random_state=None))]
     fn new(n_estimators: usize, learning_rate: f64, random_state: Option<u64>) -> Self {
-        Self { n_estimators, learning_rate, random_state, fitted: None }
+        Self {
+            n_estimators,
+            learning_rate,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
@@ -541,18 +640,28 @@ impl RsAdaBoostClassifier {
         let mut m = ferrolearn_tree::AdaBoostClassifier::<f64>::new()
             .with_n_estimators(self.n_estimators)
             .with_learning_rate(self.learning_rate);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
@@ -571,8 +680,19 @@ pub struct RsGradientBoostingClassifier {
 impl RsGradientBoostingClassifier {
     #[new]
     #[pyo3(signature = (n_estimators=100, learning_rate=0.1, max_depth=Some(3), random_state=None))]
-    fn new(n_estimators: usize, learning_rate: f64, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, learning_rate, max_depth, random_state, fitted: None }
+    fn new(
+        n_estimators: usize,
+        learning_rate: f64,
+        max_depth: Option<usize>,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            learning_rate,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
@@ -582,18 +702,28 @@ impl RsGradientBoostingClassifier {
             .with_n_estimators(self.n_estimators)
             .with_learning_rate(self.learning_rate)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
@@ -612,8 +742,19 @@ pub struct RsHistGradientBoostingClassifier {
 impl RsHistGradientBoostingClassifier {
     #[new]
     #[pyo3(signature = (n_estimators=100, learning_rate=0.1, max_depth=None, random_state=None))]
-    fn new(n_estimators: usize, learning_rate: f64, max_depth: Option<usize>, random_state: Option<u64>) -> Self {
-        Self { n_estimators, learning_rate, max_depth, random_state, fitted: None }
+    fn new(
+        n_estimators: usize,
+        learning_rate: f64,
+        max_depth: Option<usize>,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            learning_rate,
+            max_depth,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
@@ -623,18 +764,28 @@ impl RsHistGradientBoostingClassifier {
             .with_n_estimators(self.n_estimators)
             .with_learning_rate(self.learning_rate)
             .with_max_depth(self.max_depth);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
@@ -652,38 +803,51 @@ impl RsBaggingClassifier {
     #[new]
     #[pyo3(signature = (n_estimators=10, random_state=None))]
     fn new(n_estimators: usize, random_state: Option<u64>) -> Self {
-        Self { n_estimators, random_state, fitted: None }
+        Self {
+            n_estimators,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray_usize(y);
-        let mut m = ferrolearn_tree::BaggingClassifier::<f64>::new()
-            .with_n_estimators(self.n_estimators);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &y_nd)
+        let mut m =
+            ferrolearn_tree::BaggingClassifier::<f64>::new().with_n_estimators(self.n_estimators);
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
 }
 
 py_classifier!(
-    RsNearestCentroid, "_RsNearestCentroid",
+    RsNearestCentroid,
+    "_RsNearestCentroid",
     ferrolearn_neighbors::FittedNearestCentroid<f64>,
     (),
-    {
-        ferrolearn_neighbors::NearestCentroid::<f64>::new()
-    }
+    { ferrolearn_neighbors::NearestCentroid::<f64>::new() }
 );
 
 // ===========================================================================
@@ -703,32 +867,49 @@ impl RsMiniBatchKMeans {
     #[new]
     #[pyo3(signature = (n_clusters=8, max_iter=100, random_state=None))]
     fn new(n_clusters: usize, max_iter: usize, random_state: Option<u64>) -> Self {
-        Self { n_clusters, max_iter, random_state, fitted: None }
+        Self {
+            n_clusters,
+            max_iter,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let mut m = ferrolearn_cluster::MiniBatchKMeans::<f64>::new(self.n_clusters)
             .with_max_iter(self.max_iter);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &())
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
 
     #[getter]
     fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(ndarray1_usize_to_numpy(py, f.labels()))
     }
@@ -746,13 +927,18 @@ impl RsDBSCAN {
     #[new]
     #[pyo3(signature = (eps=0.5, min_samples=5))]
     fn new(eps: f64, min_samples: usize) -> Self {
-        Self { eps, min_samples, fitted: None }
+        Self {
+            eps,
+            min_samples,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let m = ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples);
-        let fitted = m.fit(&x_nd, &())
+        let fitted = m
+            .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
@@ -760,7 +946,9 @@ impl RsDBSCAN {
 
     #[getter]
     fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let lbls = f.labels();
         let arr: Array1<i64> = lbls.mapv(|v| v as i64);
@@ -779,13 +967,17 @@ impl RsAgglomerativeClustering {
     #[new]
     #[pyo3(signature = (n_clusters=2))]
     fn new(n_clusters: usize) -> Self {
-        Self { n_clusters, fitted: None }
+        Self {
+            n_clusters,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let m = ferrolearn_cluster::AgglomerativeClustering::<f64>::new(self.n_clusters);
-        let fitted = m.fit(&x_nd, &())
+        let fitted = m
+            .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
@@ -793,7 +985,9 @@ impl RsAgglomerativeClustering {
 
     #[getter]
     fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(ndarray1_usize_to_numpy(py, f.labels()))
     }
@@ -811,14 +1005,21 @@ impl RsBirch {
     #[new]
     #[pyo3(signature = (n_clusters=None, threshold=0.5))]
     fn new(n_clusters: Option<usize>, threshold: f64) -> Self {
-        Self { n_clusters, threshold, fitted: None }
+        Self {
+            n_clusters,
+            threshold,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let mut m = ferrolearn_cluster::Birch::<f64>::new().with_threshold(self.threshold);
-        if let Some(n) = self.n_clusters { m = m.with_n_clusters(n); }
-        let fitted = m.fit(&x_nd, &())
+        if let Some(n) = self.n_clusters {
+            m = m.with_n_clusters(n);
+        }
+        let fitted = m
+            .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
@@ -826,7 +1027,9 @@ impl RsBirch {
 
     #[getter]
     fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(ndarray1_usize_to_numpy(py, f.labels()))
     }
@@ -845,25 +1048,40 @@ impl RsGaussianMixture {
     #[new]
     #[pyo3(signature = (n_components=1, max_iter=100, random_state=None))]
     fn new(n_components: usize, max_iter: usize, random_state: Option<u64>) -> Self {
-        Self { n_components, max_iter, random_state, fitted: None }
+        Self {
+            n_components,
+            max_iter,
+            random_state,
+            fitted: None,
+        }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let mut m = ferrolearn_cluster::GaussianMixture::<f64>::new(self.n_components)
             .with_max_iter(self.max_iter);
-        if let Some(s) = self.random_state { m = m.with_random_state(s); }
-        let fitted = m.fit(&x_nd, &())
+        if let Some(s) = self.random_state {
+            m = m.with_random_state(s);
+        }
+        let fitted = m
+            .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
     }
 
-    fn predict<'py>(&self, py: Python<'py>, x: PyReadonlyArray2<'_, f64>) -> PyResult<Bound<'py, PyArray1<i64>>> {
-        let f = self.fitted.as_ref()
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         let x_nd = numpy2_to_ndarray(x);
-        let preds = f.predict(&x_nd)
+        let preds = f
+            .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
     }
@@ -927,42 +1145,48 @@ py_transformer!(
 // ===========================================================================
 
 py_transformer!(
-    RsMinMaxScaler, "_RsMinMaxScaler",
+    RsMinMaxScaler,
+    "_RsMinMaxScaler",
     ferrolearn_preprocess::FittedMinMaxScaler<f64>,
     (),
     { ferrolearn_preprocess::MinMaxScaler::<f64>::new() }
 );
 
 py_transformer!(
-    RsMaxAbsScaler, "_RsMaxAbsScaler",
+    RsMaxAbsScaler,
+    "_RsMaxAbsScaler",
     ferrolearn_preprocess::FittedMaxAbsScaler<f64>,
     (),
     { ferrolearn_preprocess::MaxAbsScaler::<f64>::new() }
 );
 
 py_transformer!(
-    RsRobustScaler, "_RsRobustScaler",
+    RsRobustScaler,
+    "_RsRobustScaler",
     ferrolearn_preprocess::FittedRobustScaler<f64>,
     (),
     { ferrolearn_preprocess::RobustScaler::<f64>::new() }
 );
 
 py_transformer!(
-    RsPowerTransformer, "_RsPowerTransformer",
+    RsPowerTransformer,
+    "_RsPowerTransformer",
     ferrolearn_preprocess::FittedPowerTransformer<f64>,
     (),
     { ferrolearn_preprocess::PowerTransformer::<f64>::new() }
 );
 
 py_transformer!(
-    RsNystroem, "_RsNystroem",
+    RsNystroem,
+    "_RsNystroem",
     ferrolearn_kernel::FittedNystroem<f64>,
     (),
     { ferrolearn_kernel::Nystroem::<f64>::new() }
 );
 
 py_transformer!(
-    RsRBFSampler, "_RsRBFSampler",
+    RsRBFSampler,
+    "_RsRBFSampler",
     ferrolearn_kernel::FittedRBFSampler<f64>,
     (),
     { ferrolearn_kernel::RBFSampler::<f64>::new() }

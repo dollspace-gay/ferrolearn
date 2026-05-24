@@ -27,10 +27,11 @@ fn conformance_categorical_nb() {
         .iter()
         .map(|v| v.as_u64().unwrap() as usize)
         .collect();
-    let matches = preds.iter().zip(expected.iter()).filter(|(a, e)| a == e).count();
+    let matches = preds
+        .iter()
+        .zip(expected.iter())
+        .filter(|(a, e)| a == e)
+        .count();
     let acc = matches as f64 / preds.len() as f64;
-    assert!(
-        acc >= 0.95,
-        "CategoricalNB accuracy {acc:.4} < 0.95 floor"
-    );
+    assert!(acc >= 0.95, "CategoricalNB accuracy {acc:.4} < 0.95 floor");
 }

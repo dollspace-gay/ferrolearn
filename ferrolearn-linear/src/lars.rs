@@ -216,8 +216,7 @@ fn ols_active<F: Float + FromPrimitive + 'static>(
     let xtx = xat.dot(&xa);
     let xty = xat.dot(y);
 
-    let w_active = cholesky_solve(&xtx, &xty)
-        .or_else(|_| gaussian_solve(k, &xtx, &xty))?;
+    let w_active = cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(k, &xtx, &xty))?;
 
     // Scatter into full-length vector.
     let mut w = Array1::<F>::zeros(n_features);
@@ -437,14 +436,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         if max_active > n_features {
             return Err(FerroError::InvalidParameter {
                 name: "n_nonzero_coefs".into(),
-                reason: format!(
-                    "cannot exceed number of features ({n_features})"
-                ),
+                reason: format!("cannot exceed number of features ({n_features})"),
             });
         }
 
-        let (x_work, y_work, x_mean, y_mean) =
-            center_data(x, y, self.fit_intercept)?;
+        let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
         let w = lars_path(&x_work, &y_work, max_active, false)?;
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
@@ -603,10 +599,7 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
                     continue;
                 }
                 let a_j = x.column(j).dot(&u_vec);
-                let cands = [
-                    (c_max - corr[j], a_a - a_j),
-                    (c_max + corr[j], a_a + a_j),
-                ];
+                let cands = [(c_max - corr[j], a_a - a_j), (c_max + corr[j], a_a + a_j)];
                 for (num, den) in cands {
                     if den.abs() <= eps {
                         continue;
@@ -706,8 +699,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         }
 
         let n_f = F::from(n_samples).unwrap();
-        let (x_work, y_work, x_mean, y_mean) =
-            center_data(x, y, self.fit_intercept)?;
+        let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
         let mut active: Vec<usize> = Vec::new();
         let mut in_active = vec![false; n_features];
@@ -750,9 +742,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             for idx in (0..active.len()).rev() {
                 let feat = active[idx];
                 // A sign change (or zero) means it crossed zero.
-                if w[feat] != F::zero()
-                    && w_new[feat].signum() != w[feat].signum()
-                {
+                if w[feat] != F::zero() && w_new[feat].signum() != w[feat].signum() {
                     active.remove(idx);
                     in_active[feat] = false;
                     dropped = true;
@@ -945,15 +935,17 @@ mod tests {
         let x = Array2::from_shape_vec(
             (10, 3),
             vec![
-                1.0, 0.1, 0.01, 2.0, 0.2, 0.02, 3.0, 0.3, 0.03, 4.0, 0.4, 0.04,
-                5.0, 0.5, 0.05, 6.0, 0.6, 0.06, 7.0, 0.7, 0.07, 8.0, 0.8, 0.08,
-                9.0, 0.9, 0.09, 10.0, 1.0, 0.10,
+                1.0, 0.1, 0.01, 2.0, 0.2, 0.02, 3.0, 0.3, 0.03, 4.0, 0.4, 0.04, 5.0, 0.5, 0.05,
+                6.0, 0.6, 0.06, 7.0, 0.7, 0.07, 8.0, 0.8, 0.08, 9.0, 0.9, 0.09, 10.0, 1.0, 0.10,
             ],
         )
         .unwrap();
         let y = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0];
 
-        let fitted = Lars::<f64>::new().with_n_nonzero_coefs(1).fit(&x, &y).unwrap();
+        let fitted = Lars::<f64>::new()
+            .with_n_nonzero_coefs(1)
+            .fit(&x, &y)
+            .unwrap();
         let nonzero = fitted
             .coefficients()
             .iter()
@@ -992,7 +984,12 @@ mod tests {
     fn test_lars_n_nonzero_exceeds_features() {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(Lars::<f64>::new().with_n_nonzero_coefs(5).fit(&x, &y).is_err());
+        assert!(
+            Lars::<f64>::new()
+                .with_n_nonzero_coefs(5)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1051,10 +1048,7 @@ mod tests {
         let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
         let y = array![3.0, 5.0, 7.0, 9.0, 11.0];
 
-        let fitted = LassoLars::<f64>::new()
-            .with_alpha(0.0)
-            .fit(&x, &y)
-            .unwrap();
+        let fitted = LassoLars::<f64>::new().with_alpha(0.0).fit(&x, &y).unwrap();
         assert_relative_eq!(fitted.coefficients()[0], 2.0, epsilon = 0.1);
     }
 
@@ -1064,18 +1058,14 @@ mod tests {
         let x = Array2::from_shape_vec(
             (10, 3),
             vec![
-                1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 4.0, 0.0, 0.0,
-                5.0, 0.0, 0.0, 6.0, 0.0, 0.0, 7.0, 0.0, 0.0, 8.0, 0.0, 0.0,
-                9.0, 0.0, 0.0, 10.0, 0.0, 0.0,
+                1.0, 0.0, 0.0, 2.0, 0.0, 0.0, 3.0, 0.0, 0.0, 4.0, 0.0, 0.0, 5.0, 0.0, 0.0, 6.0,
+                0.0, 0.0, 7.0, 0.0, 0.0, 8.0, 0.0, 0.0, 9.0, 0.0, 0.0, 10.0, 0.0, 0.0,
             ],
         )
         .unwrap();
         let y = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0];
 
-        let fitted = LassoLars::<f64>::new()
-            .with_alpha(5.0)
-            .fit(&x, &y)
-            .unwrap();
+        let fitted = LassoLars::<f64>::new().with_alpha(5.0).fit(&x, &y).unwrap();
         // Irrelevant features (all-zero) should not enter.
         assert_relative_eq!(fitted.coefficients()[1], 0.0, epsilon = 1e-10);
         assert_relative_eq!(fitted.coefficients()[2], 0.0, epsilon = 1e-10);
@@ -1085,7 +1075,12 @@ mod tests {
     fn test_lasso_lars_negative_alpha() {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        assert!(LassoLars::<f64>::new().with_alpha(-1.0).fit(&x, &y).is_err());
+        assert!(
+            LassoLars::<f64>::new()
+                .with_alpha(-1.0)
+                .fit(&x, &y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1099,7 +1094,10 @@ mod tests {
     fn test_lasso_lars_predict() {
         let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let y = array![2.0, 4.0, 6.0, 8.0];
-        let fitted = LassoLars::<f64>::new().with_alpha(0.01).fit(&x, &y).unwrap();
+        let fitted = LassoLars::<f64>::new()
+            .with_alpha(0.01)
+            .fit(&x, &y)
+            .unwrap();
         let preds = fitted.predict(&x).unwrap();
         assert_eq!(preds.len(), 4);
     }
@@ -1108,7 +1106,10 @@ mod tests {
     fn test_lasso_lars_has_coefficients() {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
-        let fitted = LassoLars::<f64>::new().with_alpha(0.01).fit(&x, &y).unwrap();
+        let fitted = LassoLars::<f64>::new()
+            .with_alpha(0.01)
+            .fit(&x, &y)
+            .unwrap();
         assert_eq!(fitted.coefficients().len(), 2);
     }
 

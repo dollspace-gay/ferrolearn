@@ -19,9 +19,9 @@
 
 use ferrolearn_core::{Fit, Transform};
 use ferrolearn_test_oracle::{
-    assert_close, assert_close_rows_sign_ambiguous, assert_close_slice,
-    assert_close_slice_sign_ambiguous, json_to_array1, json_to_array2, load_fixture,
-    TOL_DECOMP_ABS, TOL_DECOMP_REL,
+    TOL_DECOMP_ABS, TOL_DECOMP_REL, assert_close, assert_close_rows_sign_ambiguous,
+    assert_close_slice, assert_close_slice_sign_ambiguous, json_to_array1, json_to_array2,
+    load_fixture,
 };
 
 // ---------------------------------------------------------------------------

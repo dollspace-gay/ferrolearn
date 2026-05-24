@@ -888,12 +888,8 @@ fn build_classification_tree<F: Float>(
 
     // Reborrow the rng for the split-finder; recursive children get fresh
     // reborrows via `rng.as_deref_mut()` below.
-    let best = find_best_classification_split(
-        data,
-        indices,
-        params.min_samples_leaf,
-        rng.as_deref_mut(),
-    );
+    let best =
+        find_best_classification_split(data, indices, params.min_samples_leaf, rng.as_deref_mut());
 
     if let Some((best_feature, best_threshold, best_impurity_decrease)) = best {
         let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
@@ -915,14 +911,8 @@ fn build_classification_tree<F: Float>(
             params,
             rng.as_deref_mut(),
         );
-        let right_idx = build_classification_tree(
-            data,
-            &right_indices,
-            nodes,
-            depth + 1,
-            params,
-            rng.as_deref_mut(),
-        );
+        let right_idx =
+            build_classification_tree(data, &right_indices, nodes, depth + 1, params, rng);
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1069,12 +1059,8 @@ fn build_regression_tree<F: Float>(
         return idx;
     }
 
-    let best = find_best_regression_split(
-        data,
-        indices,
-        params.min_samples_leaf,
-        rng.as_deref_mut(),
-    );
+    let best =
+        find_best_regression_split(data, indices, params.min_samples_leaf, rng.as_deref_mut());
 
     if let Some((best_feature, best_threshold, best_impurity_decrease)) = best {
         let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
@@ -1096,14 +1082,7 @@ fn build_regression_tree<F: Float>(
             params,
             rng.as_deref_mut(),
         );
-        let right_idx = build_regression_tree(
-            data,
-            &right_indices,
-            nodes,
-            depth + 1,
-            params,
-            rng.as_deref_mut(),
-        );
+        let right_idx = build_regression_tree(data, &right_indices, nodes, depth + 1, params, rng);
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1280,8 +1259,7 @@ pub(crate) fn aggregate_tree_importances<F: Float>(
                     Some(map) => map[t][*feature],
                     None => *feature,
                 };
-                total_imp[original_feature] =
-                    total_imp[original_feature] + w * *impurity_decrease;
+                total_imp[original_feature] = total_imp[original_feature] + w * *impurity_decrease;
             }
         }
     }
