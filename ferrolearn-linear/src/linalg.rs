@@ -203,6 +203,64 @@ fn gaussian_solve<F: Float>(
     Ok(x)
 }
 
+/// Solve a symmetric positive-definite system `A @ X = B` via Cholesky,
+/// where `B` is `(n, t)` and the returned `X` is `(n, t)`. Each column of
+/// `B` is solved independently after a single Cholesky factorization of
+/// `A` — the asymptotic win vs. calling [`cholesky_solve`] in a loop is
+/// the factorization cost `O(n^3)` paid once instead of `t` times.
+///
+/// Used by [`solve_ridge_multi`] to share `X^T X + alpha * I`'s
+/// factorization across all targets.
+fn cholesky_solve_multi<F: Float>(a: &Array2<F>, b: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let n = a.nrows();
+    let t = b.ncols();
+
+    // Cholesky-Crout: A = L @ L^T, L lower-triangular.
+    let mut l = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j {
+                sum = sum - l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if sum <= F::zero() {
+                    return Err(FerroError::NumericalInstability {
+                        message: "matrix is not positive definite".into(),
+                    });
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+
+    // For each target column independently: forward then backward sub.
+    let mut out = Array2::<F>::zeros((n, t));
+    for k in 0..t {
+        // Forward sub: L @ z = b[:, k]
+        let mut z = Array1::<F>::zeros(n);
+        for i in 0..n {
+            let mut sum = b[[i, k]];
+            for j in 0..i {
+                sum = sum - l[[i, j]] * z[j];
+            }
+            z[i] = sum / l[[i, i]];
+        }
+        // Backward sub: L^T @ x = z, write into out[:, k]
+        for i in (0..n).rev() {
+            let mut sum = z[i];
+            for j in (i + 1)..n {
+                sum = sum - l[[j, i]] * out[[j, k]];
+            }
+            out[[i, k]] = sum / l[[i, i]];
+        }
+    }
+
+    Ok(out)
+}
+
 /// Solve `(X^T X + alpha * I) @ w = X^T y` (Ridge regression).
 ///
 /// Uses Cholesky decomposition since `X^T X + alpha * I` is guaranteed
@@ -228,6 +286,38 @@ pub(crate) fn solve_ridge<F: Float + Send + Sync + 'static>(
     }
 
     cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(n, &xtx, &xty))
+}
+
+/// Solve `(X^T X + alpha * I) @ W = X^T Y` (multi-output Ridge regression).
+///
+/// `X` is `(n_samples, n_features)`, `Y` is `(n_samples, n_targets)`, and
+/// the returned `W` is `(n_features, n_targets)`. The Cholesky factor of
+/// `X^T X + alpha * I` is shared across all target columns, so the cost
+/// is dominated by one `O(p^3)` factorization plus `O(p^2 * t)` for the
+/// forward/backward substitutions — the same asymptotic behaviour as a
+/// single-output fit on `t = 1`. This is the multi-output companion to
+/// [`solve_ridge`].
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the regularized system
+/// is somehow singular (should not happen for `alpha > 0`).
+pub(crate) fn solve_ridge_multi<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    y: &Array2<F>,
+    alpha: F,
+) -> Result<Array2<F>, FerroError> {
+    let xt = x.t();
+    let mut xtx = xt.dot(x);
+    let xty = xt.dot(y);
+    let n = xtx.nrows();
+
+    // Add regularization: X^T X + alpha * I
+    for i in 0..n {
+        xtx[[i, i]] = xtx[[i, i]] + alpha;
+    }
+
+    cholesky_solve_multi(&xtx, &xty)
 }
 
 /// Solve `X^T X w = X^T y` using faer QR decomposition (f64 only).

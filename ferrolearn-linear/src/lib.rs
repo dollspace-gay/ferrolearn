@@ -76,8 +76,7 @@ pub use bayesian_ridge::{BayesianRidge, FittedBayesianRidge};
 pub use elastic_net::{ElasticNet, FittedElasticNet};
 pub use elastic_net_cv::{ElasticNetCV, FittedElasticNetCV};
 pub use glm::{
-    FittedGLMRegressor, GLMFamily, GLMRegressor, GammaRegressor, PoissonRegressor,
-    TweedieRegressor,
+    FittedGLMRegressor, GLMFamily, GLMRegressor, GammaRegressor, PoissonRegressor, TweedieRegressor,
 };
 pub use huber_regressor::{FittedHuberRegressor, HuberRegressor};
 pub use isotonic::{FittedIsotonicRegression, IsotonicRegression};
@@ -96,13 +95,13 @@ pub use one_class_svm::{FittedOneClassSVM, OneClassSVM};
 pub use qda::{FittedQDA, QDA};
 pub use quantile_regressor::{FittedQuantileRegressor, QuantileRegressor};
 pub use ransac::{FittedRANSACRegressor, RANSACRegressor};
-pub use ridge::{FittedRidge, Ridge};
+pub use ridge::{FittedRidge, FittedRidgeMulti, Ridge};
 pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
 pub use ridge_cv::{FittedRidgeCV, RidgeCV};
 pub use sgd::{FittedSGDClassifier, FittedSGDRegressor, SGDClassifier, SGDRegressor};
 pub use svm::{
-    FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,
-    SigmoidKernel,
+    FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SigmoidKernel, SVC,
+    SVR,
 };
 
 use ferrolearn_core::error::FerroError;
