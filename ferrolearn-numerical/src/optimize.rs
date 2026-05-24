@@ -1,7 +1,7 @@
 //! Optimization algorithms for smooth objectives.
 //!
 //! This module provides scipy.optimize equivalents for the ferrolearn ML
-//! framework. Three optimizers are available:
+//! framework. Four optimizers are available:
 //!
 //! - **[`NewtonCG`]** — Truncated Newton with conjugate-gradient inner loop
 //!   and backtracking line search. Good for large-scale smooth problems when
@@ -9,14 +9,19 @@
 //! - **[`TrustRegionNCG`]** — Trust-region Newton-CG using the Steihaug-Toint
 //!   CG subproblem solver. More robust than line-search Newton-CG, especially
 //!   near saddle points or in ill-conditioned regions.
+//! - **[`Powell`]** — Direction-set method (Numerical Recipes §10.5) for
+//!   derivative-free ND minimization. Good when the gradient is unavailable
+//!   or expensive — e.g. objectives that wrap an external solve or a
+//!   discrete-sample interpolant. Equivalent to
+//!   `scipy.optimize.minimize(method='powell')`.
 //! - **[`brent_bounded`]** — Brent's method for 1-D bounded minimization on
 //!   an interval `[a, b]`. Combines golden-section search with parabolic
 //!   interpolation for superlinear convergence. Equivalent to
 //!   `scipy.optimize.minimize_scalar(method='bounded')`.
 //!
-//! The Newton-CG and Trust-Region optimizers require a closure that returns
-//! the objective value and gradient, and a second closure that computes
-//! Hessian-vector products.
+//! Newton-CG and Trust-Region require a closure that returns the objective
+//! value and gradient, plus a second closure for Hessian-vector products.
+//! `Powell` requires only the objective.
 //!
 //! # Example
 //!
@@ -571,6 +576,330 @@ fn dot(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
 }
 
 // ---------------------------------------------------------------------------
+// Powell direction-set method (derivative-free ND minimization)
+// ---------------------------------------------------------------------------
+
+/// Powell's direction-set method — derivative-free ND minimization.
+///
+/// Equivalent to `scipy.optimize.minimize(method='powell')`. Given a
+/// starting point and the canonical basis as the initial direction set,
+/// repeatedly line-minimize along each direction; after every full sweep
+/// of N line searches, evaluate the extrapolation test (Numerical
+/// Recipes §10.5) and, if it passes, replace the direction of greatest
+/// decrease with the net displacement vector. Iterate until the relative
+/// function improvement falls below tolerance.
+///
+/// Line search is by golden-section after a tripling-step bracket — a
+/// simple, robust strategy that gives reliable convergence on smooth
+/// objectives. The closure is `FnMut`, so callers that hold state (e.g.
+/// counters, caches) can borrow mutably across evaluations.
+///
+/// # Builder
+///
+/// ```
+/// use ferrolearn_numerical::optimize::Powell;
+///
+/// let opt = Powell::new()
+///     .with_max_iter(500)
+///     .with_ftol(1e-10)
+///     .with_initial_step(0.25);
+/// ```
+///
+/// # Example
+///
+/// ```
+/// use ndarray::array;
+/// use ferrolearn_numerical::optimize::Powell;
+///
+/// // Minimize f(x) = (x0 - 3)^2 + (x1 + 4)^2
+/// let f = |x: &ndarray::Array1<f64>| (x[0] - 3.0).powi(2) + (x[1] + 4.0).powi(2);
+/// let result = Powell::new().minimize(f, array![0.0, 0.0]);
+/// assert!(result.converged);
+/// assert!((result.x[0] - 3.0).abs() < 1e-4);
+/// assert!((result.x[1] + 4.0).abs() < 1e-4);
+/// ```
+///
+/// # Result
+///
+/// Powell is derivative-free; the returned [`OptimizeResult::grad`] is
+/// filled with zeros (the algorithm never computes a gradient). Consumers
+/// that need gradient information should use [`NewtonCG`] or
+/// [`TrustRegionNCG`].
+pub struct Powell {
+    /// Maximum number of outer iterations (direction-set sweeps).
+    pub max_iter: usize,
+    /// Relative tolerance on objective improvement between sweeps.
+    pub ftol: f64,
+    /// Initial step size used to seed the line bracket.
+    pub initial_step: f64,
+    /// Maximum golden-section iterations per line search.
+    pub line_max_iter: usize,
+    /// Absolute x-tolerance for the line search.
+    pub line_xtol: f64,
+    /// Maximum bracketing iterations per line search before falling back
+    /// to a fixed bracket.
+    pub bracket_max_iter: usize,
+}
+
+impl Default for Powell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Powell {
+    /// Create a new `Powell` optimizer with default settings.
+    ///
+    /// Defaults: `max_iter = 200`, `ftol = 1e-8`, `initial_step = 0.5`,
+    /// `line_max_iter = 200`, `line_xtol = 1e-7`, `bracket_max_iter = 60`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_iter: 200,
+            ftol: 1.0e-8,
+            initial_step: 0.5,
+            line_max_iter: 200,
+            line_xtol: 1.0e-7,
+            bracket_max_iter: 60,
+        }
+    }
+
+    /// Set the maximum number of outer iterations.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the relative tolerance on objective improvement.
+    #[must_use]
+    pub fn with_ftol(mut self, ftol: f64) -> Self {
+        self.ftol = ftol;
+        self
+    }
+
+    /// Set the initial step size for the line bracket.
+    #[must_use]
+    pub fn with_initial_step(mut self, initial_step: f64) -> Self {
+        self.initial_step = initial_step;
+        self
+    }
+
+    /// Set the maximum golden-section iterations per line search.
+    #[must_use]
+    pub fn with_line_max_iter(mut self, line_max_iter: usize) -> Self {
+        self.line_max_iter = line_max_iter;
+        self
+    }
+
+    /// Set the absolute x-tolerance for the line search.
+    #[must_use]
+    pub fn with_line_xtol(mut self, line_xtol: f64) -> Self {
+        self.line_xtol = line_xtol;
+        self
+    }
+
+    /// Set the maximum bracketing iterations before falling back.
+    #[must_use]
+    pub fn with_bracket_max_iter(mut self, bracket_max_iter: usize) -> Self {
+        self.bracket_max_iter = bracket_max_iter;
+        self
+    }
+
+    /// Minimize the objective `f` starting from `x0`.
+    ///
+    /// The initial direction set is the canonical basis (one unit vector
+    /// per dimension of `x0`).
+    pub fn minimize<F>(&self, mut f: F, x0: Array1<f64>) -> OptimizeResult
+    where
+        F: FnMut(&Array1<f64>) -> f64,
+    {
+        let n = x0.len();
+
+        let mut x = x0;
+        let mut dirs: Vec<Array1<f64>> = (0..n)
+            .map(|i| {
+                let mut v = Array1::<f64>::zeros(n);
+                v[i] = 1.0;
+                v
+            })
+            .collect();
+
+        let mut fx = f(&x);
+        let mut converged = false;
+        let mut iterations = 0usize;
+
+        for it in 0..self.max_iter {
+            iterations = it + 1;
+            let fx_start = fx;
+            let x_start = x.clone();
+            let mut largest_decrease = 0.0;
+            let mut largest_decrease_idx = 0usize;
+
+            for (i, dir) in dirs.clone().into_iter().enumerate() {
+                let f_before = fx;
+                let (alpha, f_after) = line_minimise_powell(&mut f, &x, &dir, self);
+                for (xk, dk) in x.iter_mut().zip(dir.iter()) {
+                    *xk += alpha * dk;
+                }
+                fx = f_after;
+                let dec = f_before - f_after;
+                if dec > largest_decrease {
+                    largest_decrease = dec;
+                    largest_decrease_idx = i;
+                }
+            }
+
+            // Relative-improvement convergence test (Numerical Recipes §10.5).
+            let denom = (fx_start.abs() + fx.abs()).max(1.0e-30);
+            if 2.0 * (fx_start - fx).abs() <= self.ftol * denom {
+                converged = true;
+                break;
+            }
+
+            // Net displacement across the sweep + extrapolation step.
+            let delta: Array1<f64> = &x - &x_start;
+            let x_extrap: Array1<f64> = 2.0 * &x - &x_start;
+            let f_extrap = f(&x_extrap);
+            if f_extrap < fx_start {
+                let two_term = 2.0 * (fx_start - 2.0 * fx + f_extrap);
+                let lhs = fx_start - fx - largest_decrease;
+                let test =
+                    two_term * lhs * lhs - largest_decrease * (fx_start - f_extrap).powi(2);
+                if test < 0.0 {
+                    let (alpha, f_after) = line_minimise_powell(&mut f, &x, &delta, self);
+                    for (xk, dk) in x.iter_mut().zip(delta.iter()) {
+                        *xk += alpha * dk;
+                    }
+                    fx = f_after;
+                    // Replace the direction of greatest decrease with the
+                    // net displacement; rotate the last basis vector into
+                    // its slot so the direction set stays linearly
+                    // independent (the canonical NR trick).
+                    dirs[largest_decrease_idx] = dirs[n - 1].clone();
+                    dirs[n - 1] = delta;
+                }
+            }
+        }
+
+        OptimizeResult {
+            x,
+            fun: fx,
+            grad: Array1::<f64>::zeros(n),
+            n_iter: iterations,
+            converged,
+        }
+    }
+}
+
+/// 1-D line minimisation along `direction` starting at `origin`. Returns
+/// `(alpha, f(origin + alpha * direction))`. Used internally by [`Powell`].
+fn line_minimise_powell<F>(
+    f: &mut F,
+    origin: &Array1<f64>,
+    direction: &Array1<f64>,
+    cfg: &Powell,
+) -> (f64, f64)
+where
+    F: FnMut(&Array1<f64>) -> f64,
+{
+    let mut probe = origin.clone();
+    let mut g = |alpha: f64| -> f64 {
+        for ((p, o), d) in probe.iter_mut().zip(origin.iter()).zip(direction.iter()) {
+            *p = o + alpha * d;
+        }
+        f(&probe)
+    };
+
+    let (a, b, c) = bracket_min_powell(&mut g, 0.0, cfg.initial_step, cfg.bracket_max_iter);
+    golden_section_powell(&mut g, a, b, c, cfg.line_xtol, cfg.line_max_iter)
+}
+
+/// Bracket a 1-D minimum by stepping from `ax` and then golden-ratio
+/// expanding the upper bound until `f(b) < f(c)`. Falls back to a fixed
+/// symmetric bracket around the origin if anything goes non-finite or
+/// the iteration limit is exceeded. Used internally by [`Powell`].
+fn bracket_min_powell<G>(g: &mut G, ax: f64, step: f64, bracket_max_iter: usize) -> (f64, f64, f64)
+where
+    G: FnMut(f64) -> f64,
+{
+    let gold: f64 = 1.618_033_988_749_895;
+    let mut a = ax;
+    let mut b = ax + step;
+    let mut fa = g(a);
+    let mut fb = g(b);
+    if fb > fa {
+        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(&mut fa, &mut fb);
+    }
+    let mut c = b + gold * (b - a);
+    let mut fc = g(c);
+    let mut k = 0usize;
+    while fb > fc && k < bracket_max_iter {
+        a = b;
+        fa = fb;
+        b = c;
+        fb = fc;
+        c = b + gold * (b - a);
+        fc = g(c);
+        k += 1;
+    }
+    if !a.is_finite() || !b.is_finite() || !c.is_finite() {
+        return (-step, 0.0, step);
+    }
+    let _ = (fa, fc);
+    (a, b, c)
+}
+
+/// Golden-section search inside the bracket `(a, b, c)`. Returns
+/// `(xmin, f(xmin))`. Used internally by [`Powell`].
+fn golden_section_powell<G>(
+    g: &mut G,
+    a: f64,
+    b: f64,
+    c: f64,
+    xtol: f64,
+    max_iter: usize,
+) -> (f64, f64)
+where
+    G: FnMut(f64) -> f64,
+{
+    let r = 0.618_033_988_749_895_f64;
+    let mut x0 = a.min(c);
+    let mut x3 = a.max(c);
+    let mut x1;
+    let mut x2;
+    if (x3 - b).abs() > (b - x0).abs() {
+        x1 = b;
+        x2 = b + (1.0 - r) * (x3 - b);
+    } else {
+        x2 = b;
+        x1 = b - (1.0 - r) * (b - x0);
+    }
+    let mut f1 = g(x1);
+    let mut f2 = g(x2);
+    for _ in 0..max_iter {
+        if (x3 - x0).abs() < xtol * (x1.abs() + x2.abs()) + xtol {
+            break;
+        }
+        if f2 < f1 {
+            x0 = x1;
+            x1 = x2;
+            x2 = r * x1 + (1.0 - r) * x3;
+            f1 = f2;
+            f2 = g(x2);
+        } else {
+            x3 = x2;
+            x2 = x1;
+            x1 = r * x2 + (1.0 - r) * x0;
+            f2 = f1;
+            f1 = g(x1);
+        }
+    }
+    if f1 < f2 { (x1, f1) } else { (x2, f2) }
+}
+
+// ---------------------------------------------------------------------------
 // Brent's method for 1-D bounded minimization
 // ---------------------------------------------------------------------------
 
@@ -969,5 +1298,90 @@ mod tests {
         let expected = 1.5 * std::f64::consts::PI;
         assert_abs_diff_eq!(result.x, expected, epsilon = 1e-8);
         assert_abs_diff_eq!(result.fun, -1.0, epsilon = 1e-10);
+    }
+
+    // -----------------------------------------------------------------------
+    // Powell direction-set tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn powell_finds_2d_quadratic_minimum() {
+        // f(x, y) = (x - 3)^2 + (y + 4)^2 → min at (3, -4), f = 0.
+        let f = |x: &Array1<f64>| (x[0] - 3.0).powi(2) + (x[1] + 4.0).powi(2);
+        let r = super::Powell::new().minimize(f, array![0.0, 0.0]);
+        assert!(r.converged, "did not converge in {} iter", r.n_iter);
+        assert_abs_diff_eq!(r.x[0], 3.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(r.x[1], -4.0, epsilon = 1e-4);
+        assert!(r.fun < 1e-8, "f = {}", r.fun);
+        // Derivative-free: grad is reported as zeros.
+        assert_eq!(r.grad.len(), 2);
+        assert!(r.grad.iter().all(|&g| g == 0.0));
+    }
+
+    #[test]
+    fn powell_finds_skewed_quadratic() {
+        // f(x, y) = (x - y)^2 + (x + y - 1)^2 → min at (0.5, 0.5).
+        let f = |x: &Array1<f64>| (x[0] - x[1]).powi(2) + (x[0] + x[1] - 1.0).powi(2);
+        let r = super::Powell::new().minimize(f, array![3.0, -2.0]);
+        assert_abs_diff_eq!(r.x[0], 0.5, epsilon = 1e-4);
+        assert_abs_diff_eq!(r.x[1], 0.5, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn powell_3d_anisotropic_quadratic() {
+        // f(dy, dx, theta) = (dy - 0.7)^2 + (dx + 1.2)^2 + 100*(theta - 0.04)^2.
+        // The 100× factor on theta is realistic for motion-correction
+        // objectives where rotation has much sharper curvature than
+        // translation — Powell handles the anisotropy via the direction
+        // updates.
+        let f = |x: &Array1<f64>| {
+            (x[0] - 0.7).powi(2) + (x[1] + 1.2).powi(2) + 100.0 * (x[2] - 0.04).powi(2)
+        };
+        let r = super::Powell::new()
+            .with_initial_step(0.2)
+            .minimize(f, array![0.0, 0.0, 0.0]);
+        assert_abs_diff_eq!(r.x[0], 0.7, epsilon = 1e-3);
+        assert_abs_diff_eq!(r.x[1], -1.2, epsilon = 1e-3);
+        assert_abs_diff_eq!(r.x[2], 0.04, epsilon = 1e-4);
+    }
+
+    #[test]
+    fn powell_iteration_limit_marks_unconverged() {
+        // A pathologically tight max_iter on a curved 5-D objective should
+        // hit the iteration limit and report converged=false.
+        let f = |x: &Array1<f64>| (0..x.len()).map(|i| (x[i] - i as f64).powi(2)).sum();
+        let r = super::Powell::new()
+            .with_max_iter(1)
+            .minimize(f, array![10.0, 10.0, 10.0, 10.0, 10.0]);
+        assert!(!r.converged, "1-iter run should not declare convergence");
+        assert_eq!(r.n_iter, 1);
+    }
+
+    #[test]
+    fn powell_one_dim_reduces_to_line_search() {
+        // 1-D problem: f(x) = (x - 7)^2 + 1 → min at x = 7, f = 1.
+        let f = |x: &Array1<f64>| (x[0] - 7.0).powi(2) + 1.0;
+        let r = super::Powell::new().minimize(f, array![0.0]);
+        assert!(r.converged);
+        assert_abs_diff_eq!(r.x[0], 7.0, epsilon = 1e-4);
+        assert_abs_diff_eq!(r.fun, 1.0, epsilon = 1e-5);
+    }
+
+    #[test]
+    fn powell_handles_fnmut_closure_with_eval_counter() {
+        // FnMut bound is real: the closure can mutably borrow external
+        // state. Counting evaluations is the canonical use case.
+        let mut nfev = 0_usize;
+        let r = super::Powell::new().minimize(
+            |x: &Array1<f64>| {
+                nfev += 1;
+                (x[0] - 1.5).powi(2) + (x[1] + 0.25).powi(2)
+            },
+            array![0.0, 0.0],
+        );
+        assert!(r.converged);
+        assert_abs_diff_eq!(r.x[0], 1.5, epsilon = 1e-4);
+        assert_abs_diff_eq!(r.x[1], -0.25, epsilon = 1e-4);
+        assert!(nfev > 0, "closure should have been called");
     }
 }

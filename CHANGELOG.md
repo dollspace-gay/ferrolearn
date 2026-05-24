@@ -11,6 +11,7 @@ Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug f
 ### Added
 
 - **Multi-output Ridge regression** in `ferrolearn-linear`. New `FittedRidgeMulti<F>` type plus `Fit<Array2<F>, Array2<F>> for Ridge<F>` impl share the existing single-output `Ridge`'s hyperparameter struct but solve for an `(n_features, n_targets)` coefficient matrix in a single shared Cholesky factorization of `X^T X + αI`. Backed by a new `cholesky_solve_multi` + `solve_ridge_multi` pair in `linalg.rs`; the factor cost is `O(p^3)` paid once regardless of `t`. Donated from `forecast-bio/decode`'s `forecast-decode-regression::ridge_multi` (the per-PC ridge fit in the DINOv3 decoding pipeline) where the multi-target path is the hot path.
+- **`Powell` direction-set optimizer** in `ferrolearn-numerical::optimize`. Derivative-free ND minimization matching `scipy.optimize.minimize(method='powell')`. Builder API mirrors `NewtonCG` / `TrustRegionNCG` (`Powell::new().with_max_iter(...).with_ftol(...).minimize(f, x0)`), and reuses the existing `OptimizeResult` (gradient field is zero-filled since Powell is derivative-free). Donated from `forecast-bio/decode`'s `forecast-decode-motion::optimize::powell` where it lines up `(dy, dx, theta)` for FFT-seeded motion correction.
 
 ### Fixed (sklearn-parity bugs)
 
