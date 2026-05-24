@@ -108,7 +108,7 @@ struct ClassificationData<'a, F> {
     n_classes: usize,
     /// Fixed feature subset for the entire tree (used by Bagging-style
     /// per-tree feature subsampling). Mutually exclusive with
-    /// [`max_features_per_split`].
+    /// [`Self::max_features_per_split`].
     feature_indices: Option<&'a [usize]>,
     /// When set, every split samples a fresh random subset of this many
     /// features (per-split feature sampling, the Breiman 2001 RandomForest

@@ -39,8 +39,8 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if the inner dimensions of `A`
-    /// and `B` do not match (i.e., `A.ncols() != B.nrows()`).
+    /// Returns [`crate::FerroError::ShapeMismatch`] if the inner dimensions
+    /// of `A` and `B` do not match (i.e., `A.ncols() != B.nrows()`).
     fn gemm(a: &Array2<f64>, b: &Array2<f64>) -> FerroResult<Array2<f64>>;
 
     /// Singular Value Decomposition: `A = U * diag(S) * Vt`.
@@ -53,7 +53,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::NumericalInstability`] if the SVD fails to converge.
+    /// Returns [`crate::FerroError::NumericalInstability`] if the SVD fails to converge.
     fn svd(a: &Array2<f64>) -> FerroResult<(Array2<f64>, Array1<f64>, Array2<f64>)>;
 
     /// QR decomposition: `A = Q * R`.
@@ -64,7 +64,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::NumericalInstability`] if the decomposition fails.
+    /// Returns [`crate::FerroError::NumericalInstability`] if the decomposition fails.
     fn qr(a: &Array2<f64>) -> FerroResult<(Array2<f64>, Array2<f64>)>;
 
     /// Cholesky decomposition: `A = L * L^T` (lower triangular).
@@ -73,8 +73,8 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::NumericalInstability`] if the matrix is not
-    /// positive definite.
+    /// Returns [`crate::FerroError::NumericalInstability`] if the matrix is
+    /// not positive definite.
     fn cholesky(a: &Array2<f64>) -> FerroResult<Array2<f64>>;
 
     /// Solve linear system: `A * x = b`.
@@ -83,9 +83,9 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `A` is not square or if
-    /// `b.len() != A.nrows()`.
-    /// Returns [`FerroError::NumericalInstability`] if `A` is singular.
+    /// Returns [`crate::FerroError::ShapeMismatch`] if `A` is not square or
+    /// if `b.len() != A.nrows()`.
+    /// Returns [`crate::FerroError::NumericalInstability`] if `A` is singular.
     fn solve(a: &Array2<f64>, b: &Array1<f64>) -> FerroResult<Array1<f64>>;
 
     /// Symmetric eigendecomposition: `A = V * diag(eigenvalues) * V^T`.
@@ -97,9 +97,9 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `A` is not square.
-    /// Returns [`FerroError::NumericalInstability`] if the decomposition fails
-    /// to converge.
+    /// Returns [`crate::FerroError::ShapeMismatch`] if `A` is not square.
+    /// Returns [`crate::FerroError::NumericalInstability`] if the
+    /// decomposition fails to converge.
     fn eigh(a: &Array2<f64>) -> FerroResult<(Array1<f64>, Array2<f64>)>;
 
     /// Matrix determinant.
@@ -108,7 +108,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `A` is not square.
+    /// Returns [`crate::FerroError::ShapeMismatch`] if `A` is not square.
     fn det(a: &Array2<f64>) -> FerroResult<f64>;
 
     /// Matrix inverse.
@@ -117,7 +117,7 @@ pub trait Backend: Send + Sync + 'static {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `A` is not square.
-    /// Returns [`FerroError::NumericalInstability`] if `A` is singular.
+    /// Returns [`crate::FerroError::ShapeMismatch`] if `A` is not square.
+    /// Returns [`crate::FerroError::NumericalInstability`] if `A` is singular.
     fn inv(a: &Array2<f64>) -> FerroResult<Array2<f64>>;
 }

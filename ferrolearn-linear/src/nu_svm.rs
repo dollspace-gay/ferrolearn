@@ -1,8 +1,8 @@
 //! Nu-parameterized Support Vector Machines.
 //!
 //! This module provides [`NuSVC`] (classification) and [`NuSVR`] (regression),
-//! which are nu-parameterized variants of [`SVC`](super::svm::SVC) and
-//! [`SVR`](super::svm::SVR). Instead of setting the penalty parameter `C`
+//! which are nu-parameterized variants of [`super::svm::SVC`] and
+//! [`super::svm::SVR`]. Instead of setting the penalty parameter `C`
 //! directly, the user specifies `nu` in `(0, 1]`, which is an upper bound on
 //! the fraction of training errors and a lower bound on the fraction of
 //! support vectors.
@@ -10,9 +10,9 @@
 //! # Internals
 //!
 //! `NuSVC` converts `nu` to an equivalent `C = 1 / (nu * n_samples)` and
-//! delegates to [`SVC`](super::svm::SVC). `NuSVR` converts `nu` to
+//! delegates to [`super::svm::SVC`]. `NuSVR` converts `nu` to
 //! `epsilon = 0` and `C = 1 / (nu * n_samples)`, delegating to
-//! [`SVR`](super::svm::SVR).
+//! [`super::svm::SVR`].
 //!
 //! # Examples
 //!

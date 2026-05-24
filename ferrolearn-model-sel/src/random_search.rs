@@ -3,7 +3,7 @@
 //! [`RandomizedSearchCV`] samples `n_iter` random parameter combinations from
 //! the supplied distributions, evaluates each using cross-validation, and
 //! records the results in a [`CvResults`] struct (re-exported from
-//! [`grid_search`]).
+//! [`crate::grid_search`]).
 //!
 //! # Example
 //!

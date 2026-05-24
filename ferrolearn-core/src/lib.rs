@@ -23,8 +23,8 @@
 //!   pipelines, `std::error::Error` impls).
 //! - `faer` (default) -- Enables the [`NdarrayFaerBackend`] using the `faer`
 //!   crate for pure-Rust linear algebra.
-//! - `blas` -- Enables the [`BLASBackend`](backend_blas::BLASBackend) using
-//!   system BLAS/LAPACK via `ndarray-linalg`.
+//! - `blas` -- Enables the `BLASBackend` (feature-gated) using system
+//!   BLAS/LAPACK via `ndarray-linalg`.
 //!
 //! # Design Principles
 //!

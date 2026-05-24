@@ -13,7 +13,9 @@
 #                                       for the math-heavy paths)
 #   - `cargo doc --no-deps`          — `RUSTDOCFLAGS=-D warnings` catches
 #                                       broken doc links + missing docs
-#                                       errors before they ship to docs.rs
+#                                       errors before they ship to docs.rs.
+#                                       Runs with `--document-private-items`
+#                                       so private docs are also gated.
 #
 # Jobs are independent so a failure in one (e.g. fmt drift) doesn't gate
 # the others — you see all the breakages in one CI run instead of
@@ -94,6 +96,8 @@ jobs:
   doc:
     name: cargo doc --no-deps
     runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust stable
@@ -102,9 +106,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: doc
-      # Builds docs without strict warnings — the workspace currently has
-      # several broken intra-doc links (`FerroError::*` variants, etc.)
-      # that should be cleaned up as a follow-up PR. Tighten to
-      # `RUSTDOCFLAGS: -D warnings` once those land. For now, this catches
-      # syntax-level doc errors that would break the docs.rs build.
       - run: cargo doc --workspace --no-deps --document-private-items

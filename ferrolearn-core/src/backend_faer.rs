@@ -1,7 +1,7 @@
 //! Default backend implementation using `faer` for linear algebra.
 //!
-//! [`NdarrayFaerBackend`] implements the [`Backend`](crate::backend::Backend)
-//! trait by converting between `ndarray::Array2<f64>` and `faer::Mat<f64>`,
+//! [`NdarrayFaerBackend`] implements the [`crate::backend::Backend`] trait by
+//! converting between `ndarray::Array2<f64>` and `faer::Mat<f64>`,
 //! then delegating to `faer`'s high-performance decomposition routines.
 //!
 //! - **gemm**: uses `ndarray`'s `dot` (which may use optimized BLAS internally).

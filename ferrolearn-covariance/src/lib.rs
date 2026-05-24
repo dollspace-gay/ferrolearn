@@ -27,7 +27,7 @@
 //! - [`ledoit_wolf_shrinkage`] — return only the shrinkage coefficient.
 //! - [`oas`] — return `(cov, shrinkage)`.
 //! - [`log_likelihood`] — Gaussian log-likelihood under a covariance.
-//! - [`graphical_lasso`] — one-shot graphical-lasso fit.
+//! - [`fn@graphical_lasso`] — one-shot graphical-lasso fit.
 //! - [`fast_mcd`] — robust MCD location/cov estimate.
 
 pub mod covariance;

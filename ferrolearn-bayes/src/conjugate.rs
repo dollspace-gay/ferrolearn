@@ -57,10 +57,10 @@ const MIN_OBS_VAR: f64 = 1e-12;
 ///
 /// # Edge cases
 ///
-/// - `prior_var ≤ 0` is clipped to [`MIN_OBS_VAR`] (the prior is effectively
+/// - `prior_var ≤ 0` is clipped to an internal `MIN_OBS_VAR` floor (the prior is effectively
 ///   improper but the math still produces a defined posterior dominated by
 ///   the data).
-/// - Any `obs_var_i ≤ 0` is clipped to [`MIN_OBS_VAR`] (degenerate
+/// - Any `obs_var_i ≤ 0` is clipped to an internal `MIN_OBS_VAR` floor (degenerate
 ///   observations get extremely high weight but do not produce NaN).
 /// - Empty `observations` returns the prior unchanged.
 ///

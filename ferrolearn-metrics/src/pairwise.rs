@@ -44,7 +44,7 @@ where
     fn pairwise(&self, x: &Array2<F>, y: &Array2<F>) -> Result<Array2<F>, FerroError>;
 
     /// Convenience: compute the distance from a single point `a` to a single
-    /// point `b`. Default implementation calls [`pairwise`] on `1 × d`
+    /// point `b`. Default implementation calls [`Self::pairwise`] on `1 × d`
     /// matrices and returns the single entry.
     fn distance(&self, a: &ndarray::Array1<F>, b: &ndarray::Array1<F>) -> Result<F, FerroError> {
         let mut x = Array2::<F>::zeros((1, a.len()));

@@ -1,11 +1,11 @@
-//! Parameter grid types and the [`param_grid!`] macro.
+//! Parameter grid types and the [`macro@crate::param_grid`] macro.
 //!
 //! This module defines:
 //!
 //! - [`ParamValue`] — a dynamically-typed hyperparameter value.
 //! - [`ParamSet`] — a single parameter configuration (`HashMap<String, ParamValue>`).
-//! - [`param_grid!`] — a macro that builds the Cartesian product of parameter
-//!   lists as `Vec<ParamSet>`.
+//! - [`macro@crate::param_grid`] — a macro that builds the Cartesian product
+//!   of parameter lists as `Vec<ParamSet>`.
 //!
 //! # Example
 //!
@@ -50,7 +50,7 @@ impl std::fmt::Display for ParamValue {
 
 /// A single set of hyperparameter name–value pairs.
 ///
-/// Created by [`param_grid!`] or built manually.
+/// Created by [`macro@crate::param_grid`] or built manually.
 pub type ParamSet = HashMap<String, ParamValue>;
 
 // ---------------------------------------------------------------------------

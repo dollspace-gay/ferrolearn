@@ -17,7 +17,7 @@
 //! 4. **Row-normalize** the embedding matrix so each row has unit L2 norm.
 //! 5. **K-Means** clustering on the embedded points with `n_init` restarts.
 //!
-//! Spectral Clustering does **not** implement [`Predict`](ferrolearn_core::Predict)
+//! Spectral Clustering does **not** implement [`ferrolearn_core::Predict`]
 //! because there is no simple way to embed new points into the learned eigenspace
 //! without refitting.
 //!
@@ -123,7 +123,7 @@ impl<F: Float> SpectralClustering<F> {
 ///
 /// Stores the cluster labels for the training data.
 ///
-/// Spectral Clustering does **not** implement [`Predict`](ferrolearn_core::Predict).
+/// Spectral Clustering does **not** implement [`ferrolearn_core::Predict`].
 #[derive(Debug, Clone)]
 pub struct FittedSpectralClustering<F> {
     /// Cluster label for each training sample (0-indexed).

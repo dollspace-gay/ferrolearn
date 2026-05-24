@@ -26,7 +26,7 @@
 //! - The unfitted struct (e.g., `LinearRegression<F>`) holds hyperparameters
 //!   and implements [`Fit`](ferrolearn_core::Fit).
 //! - Calling `fit()` produces a new fitted type (e.g., `FittedLinearRegression<F>`)
-//!   that implements [`Predict`](ferrolearn_core::Predict).
+//!   that implements [`ferrolearn_core::Predict`].
 //! - Calling `predict()` on an unfitted model is a compile-time error.
 //!
 //! # Pipeline Integration

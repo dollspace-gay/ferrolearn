@@ -925,7 +925,7 @@ impl<F: Float + Send + Sync + 'static> FittedKNeighborsClassifier<F> {
     ///
     /// # Errors
     ///
-    /// As [`kneighbors_impl`].
+    /// As the internal `kneighbors_impl`.
     pub fn kneighbors(
         &self,
         x: &Array2<F>,

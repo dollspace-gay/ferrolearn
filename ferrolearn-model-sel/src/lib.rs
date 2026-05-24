@@ -12,14 +12,14 @@
 //! - [`cross_validate`] — like `cross_val_score` but with timing and optional
 //!   training scores.
 //! - [`cross_val_predict`] — generate out-of-fold predictions for every sample.
-//! - [`learning_curve`] — train/test scores for varying training set sizes.
-//! - [`validation_curve`] — train/test scores for varying hyperparameter values.
+//! - [`learning_curve()`] — train/test scores for varying training set sizes.
+//! - [`validation_curve()`] — train/test scores for varying hyperparameter values.
 //! - [`GridSearchCV`] — exhaustive hyperparameter search over a parameter grid.
 //! - [`RandomizedSearchCV`] — randomized hyperparameter search over distributions.
 //! - [`TimeSeriesSplit`] — time-series aware cross-validation splitter.
 //! - [`HalvingGridSearchCV`] — successive-halving hyperparameter search.
 //! - [`HalvingRandomSearchCV`] — successive-halving search with random sampling.
-//! - [`param_grid!`] — macro for building Cartesian-product parameter grids.
+//! - [`macro@param_grid`] — macro for building Cartesian-product parameter grids.
 //! - [`ParamValue`] / [`ParamSet`] — hyperparameter value and set types.
 //! - [`distributions`] — sampling distributions for [`RandomizedSearchCV`].
 //! - [`CalibratedClassifierCV`] — probability calibration via cross-validation.

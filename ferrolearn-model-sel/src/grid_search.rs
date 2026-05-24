@@ -35,7 +35,8 @@ use crate::param_grid::ParamSet;
 // CvResults
 // ---------------------------------------------------------------------------
 
-/// Results collected during a [`GridSearchCV`] or [`RandomizedSearchCV`] run.
+/// Results collected during a [`GridSearchCV`] or
+/// [`crate::RandomizedSearchCV`] run.
 ///
 /// Each entry corresponds to one parameter combination that was evaluated.
 #[derive(Debug, Clone)]

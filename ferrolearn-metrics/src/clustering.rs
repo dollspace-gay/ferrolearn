@@ -580,7 +580,7 @@ fn entropy_from_counts(counts: &[u64], n: f64) -> f64 {
 /// Expected Mutual Information under random permutations.
 ///
 /// Uses the exact combinatorial formula:
-/// E[MI] = sum_{i,j} sum_{n_ij} p(n_ij) * (n_ij/n) * log((n * n_ij) / (a_i * b_j))
+/// `E[MI] = sum_{i,j} sum_{n_ij} p(n_ij) * (n_ij/n) * log((n * n_ij) / (a_i * b_j))`
 ///
 /// where the sum over n_ij runs from max(1, a_i + b_j - n) to min(a_i, b_j).
 fn expected_mutual_info(a: &[u64], b: &[u64], n: u64) -> f64 {

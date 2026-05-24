@@ -470,7 +470,7 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
     ///
     /// # Errors
     ///
-    /// As [`compute_lof`](Self::compute_lof).
+    /// As the internal `compute_lof`.
     pub fn score_samples(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let lof = self.compute_lof(x)?;
         Ok(Array1::from_iter(lof.into_iter().map(|v| -v)))
@@ -483,7 +483,7 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
     ///
     /// # Errors
     ///
-    /// As [`compute_lof`](Self::compute_lof).
+    /// As the internal `compute_lof`.
     pub fn decision_function(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let lof = self.compute_lof(x)?;
         Ok(Array1::from_iter(

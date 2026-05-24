@@ -1,8 +1,8 @@
 //! Streaming data adapter for incremental learning.
 //!
 //! The [`StreamingFitter`] feeds batches from an iterator to a
-//! [`PartialFit`](crate::PartialFit) model, enabling online/streaming
-//! learning workflows where the full dataset does not fit in memory.
+//! [`crate::PartialFit`] model, enabling online/streaming learning workflows
+//! where the full dataset does not fit in memory.
 //!
 //! # Example
 //!

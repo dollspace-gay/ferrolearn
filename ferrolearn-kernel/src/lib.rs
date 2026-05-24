@@ -23,7 +23,7 @@
 //!   Williams Algorithm 3.2 predictions and `log_marginal_likelihood()` for
 //!   hyperparameter selection.
 //! - **GP Kernels** — RBF, Matern (0.5/1.5/2.5), Constant, White, DotProduct,
-//!   plus Sum and Product kernel composition via the [`GPKernel`](gp_kernels::GPKernel) trait.
+//!   plus Sum and Product kernel composition via the [`gp_kernels::GPKernel`] trait.
 //! - **[`KernelRidge`]** — Kernel ridge regression in dual form
 //!   `(K + αI) c = y` with RBF / Polynomial / Linear / Sigmoid / Laplacian
 //!   / Cosine kernels.

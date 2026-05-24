@@ -11,8 +11,10 @@
 //!
 //! ## Feature Flags
 //!
-//! - **`onnx`** — Enables ONNX protobuf model export via the [`onnx`] module.
-//! - **`pmml`** — Enables PMML 4.4 XML model export via the [`pmml`] module.
+//! - **`onnx`** — Enables ONNX protobuf model export via the `onnx` module
+//!   (feature-gated).
+//! - **`pmml`** — Enables PMML 4.4 XML model export via the `pmml` module
+//!   (feature-gated).
 //!
 //! # Example
 //!
@@ -69,8 +71,8 @@ struct ModelEnvelope {
     checksum: u32,
 }
 
-/// Serialize `model` to MessagePack bytes, wrap in a [`ModelEnvelope`], and
-/// write the envelope to `path`.
+/// Serialize `model` to MessagePack bytes, wrap in a private `ModelEnvelope`,
+/// and write the envelope to `path`.
 ///
 /// # Errors
 ///
@@ -85,7 +87,7 @@ pub fn save_model<T: Serialize>(model: &T, path: impl AsRef<Path>) -> Result<(),
 ///
 /// Validation checks:
 /// - Magic bytes must equal `FLRN`.
-/// - Schema version must equal [`SCHEMA_VERSION`].
+/// - Schema version must equal the internal `SCHEMA_VERSION` constant.
 /// - CRC32 of the payload must match the stored checksum.
 ///
 /// # Errors

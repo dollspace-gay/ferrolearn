@@ -12,8 +12,8 @@
 //!
 //! For simplicity this module returns dense [`ndarray::Array2<F>`] feature
 //! matrices, which is adequate for small/medium datasets. For very large
-//! sparse data, prefer streaming directly into a [`ferrolearn_sparse`]
-//! matrix (out of scope here).
+//! sparse data, prefer streaming directly into a `ferrolearn_sparse` matrix
+//! (out of scope here).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};

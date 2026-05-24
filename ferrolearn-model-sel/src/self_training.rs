@@ -2,7 +2,7 @@
 //!
 //! [`SelfTrainingClassifier`] is a meta-estimator that wraps a supervised
 //! classifier and iteratively assigns pseudo-labels to unlabeled samples
-//! whose predicted probabilities exceed a confidence [`threshold`].
+//! whose predicted probabilities exceed a confidence `threshold`.
 //!
 //! # Algorithm
 //!
