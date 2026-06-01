@@ -27,11 +27,27 @@ resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+# Raised 1.85 -> 1.88 to consume ferray (the numpy substrate), whose
+# workspace MSRV is 1.88. ferrolearn:ferray :: sklearn:numpy (issue #352).
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/dollspace-gay/ferrolearn"
 
 [workspace.dependencies]
+# ── The numpy substrate ──────────────────────────────────────────────
+# ferray is ferrolearn's NumPy: sklearn is built on numpy, so ferrolearn
+# (the sklearn translation) is built on ferray (the numpy translation).
+# Per issue #352, each translation unit migrates its numpy-like deps
+# (ndarray array type, statrs, rand_distr, ndarray-linalg/faer, sprs) onto
+# the ferray analog (ferray-core array type, ferray::linalg, ferray::stats,
+# ferray::random, ferray-ufunc) as part of that unit's ACToR iteration.
+# `ferray-core` (array type) and `ferray-stats` are unconditional; linalg /
+# random / numpy-bridge are feature-gated.
+ferray = { path = "../ferray/ferray", default-features = false, features = ["linalg", "random", "numpy"] }
+# Legacy numpy-like crates below are MIGRATION TARGETS, not the destination.
+# They remain only until the per-unit loop has moved each consumer onto
+# ferray; do not add NEW usages (acto-critic flags new numpy-like-crate
+# usage as a wrong-substrate divergence). See goal.md R-SUBSTRATE.
 ndarray = "0.17"
 faer = "0.24"
 sprs = "0.11"
