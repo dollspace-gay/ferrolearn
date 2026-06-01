@@ -29,6 +29,24 @@
 //!
 //! If step N outputs `Array2<f64>` but step N+1 expects `Array2<f32>`, the
 //! compiler rejects the pipeline at build time. No runtime checks needed.
+//!
+//! ## REQ status (per `.design/core/typed_pipeline.md`, mirrors `sklearn/pipeline.py` @ 1.5.2)
+//!
+//! The Rust-idiom typestate variant of sklearn's `Pipeline`: same fit→transform→
+//! predict chaining contract, plus compile-time step type-compatibility (a
+//! sanctioned R-DEV-5 deviation with no sklearn analog). Generic over `Input`/
+//! `Output` — no hardcoded `ndarray`, so the ferray substrate flows through the
+//! concrete step types in estimator crates, not this file.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (typed fit→transform chaining + final predict) | SHIPPED | `TypedPipeline` + recursive `fit_chain`/`transform_chain` run steps left-to-right, mirroring `Pipeline._fit` (`pipeline.py:383`) / `Pipeline.predict` (`pipeline.py:599`). (critic: order-sensitive oracle probe matched sklearn exactly.) Existing public boundary API (grandfathered S5/R-DOC-5); consumers are tests + `api_proof.rs` (no estimator-crate caller yet). |
+//! | REQ-2 (compile-time type-compatibility, R-DEV-5) | SHIPPED | Enforced structurally by recursive trait bounds (`Step: TypedTransformStep<Rest::ChainOutput>`); sanctioned Rust-idiom deviation, no sklearn analog. (Coverage note: no trybuild step-mismatch case yet.) |
+//! | REQ-3..8 (fit_transform/transform/proba/score; named_steps/get_params/__getitem__; passthrough/memory; fit_params/routing; make_pipeline; FeatureUnion) | NOT-STARTED | shared blockers #361–#366 (same missing surface as the dynamic `Pipeline`). |
+//!
+//! acto-critic verdict: NO DIVERGENCE FOUND (chaining is left-to-right correct vs
+//! the live sklearn oracle; learning-transformer fit/predict separation + error
+//! propagation correct; no numerics of its own). Two states only per R-DEFER-2.
 
 use crate::error::FerroError;
 use crate::traits::{Fit, Predict, Transform};
