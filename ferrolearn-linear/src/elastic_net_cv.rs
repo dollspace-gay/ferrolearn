@@ -6,6 +6,27 @@
 //! candidate `l1_ratio`, an alpha grid is generated (or supplied), and the
 //! combination that minimises mean squared error is selected.
 //!
+//! ## REQ status (per `.design/linear/elastic_net_cv.md`, mirrors `sklearn/linear_model/_coordinate_descent.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.ElasticNetCV` (`_coordinate_descent.py:2131`): per-l1_ratio
+//! alpha path (`alpha_max = max|Xᵀy|/(n·l1_ratio)` centered) + contiguous k-fold CV, MSE
+//! selection of `(alpha_, l1_ratio_)`, refit. Selection matches the live oracle exactly.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (per-l1_ratio alpha path) | SHIPPED | `compute_alpha_max_enet` (centered, max\|Xᵀy\|/(n·l1_ratio)) + log-spaced grid; members match sklearn `_alpha_grid` to ULP. |
+//! | REQ-2 ((alpha,l1_ratio) CV select + refit) | SHIPPED | `alpha_`/`l1_ratio_` match sklearn exactly after #431/#432 fixes. Consumer: `pub use ElasticNetCV` (boundary API). coef_ residual gated by CD-stopping #412 (≤~1e-4). |
+//! | REQ-3 (explicit alphas/l1_ratios grids) | SHIPPED | `with_alphas`/`with_l1_ratios`. |
+//! | REQ-4 (predict / fit_intercept / HasCoefficients) | SHIPPED | `Predict`/`HasCoefficients for FittedElasticNetCV`. |
+//! | REQ-5 (sklearn contiguous KFold) | SHIPPED | #431 fixed (ca90c48) — was round-robin. |
+//! | REQ-6 (default l1_ratio=0.5 matching sklearn) | SHIPPED | #432 fixed (ca90c48) — default was a 7-grid; now `[0.5]` (`:2328`). |
+//! | REQ-7 (l1_ratio=0 auto-grid raises) | SHIPPED | #440 fixed — auto-grid l1_ratio=0 → `InvalidParameter`, mirroring `_coordinate_descent.py:140`. |
+//! | REQ-8..14 NOT-STARTED | mse_path_ (#433), alphas_/dual_gap_/n_iter_ (#434), eps param (#435), positive (#436), n_jobs/precompute (#437), random_state/selection (#438), ferray substrate (#439). coef exact parity gated by #412. |
+//!
+//! acto-critic: per-l1_ratio alpha grid matches sklearn to ULP; 3 divergences found+fixed
+//! (#431 folds, #432 default l1_ratio, #440 l1_ratio=0 validation) — `alpha_`/`l1_ratio_` now
+//! match the live oracle exactly; coef residual is the tracked #412. Two states only per R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
