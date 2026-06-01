@@ -3,6 +3,28 @@
 //! This module defines [`FerroError`], the unified error type used throughout
 //! all ferrolearn crates. Each variant carries diagnostic context to help
 //! users identify and fix problems.
+//!
+//! ## REQ status (per `.design/core/error.md`, mirrors `sklearn/exceptions.py` @ 1.5.2)
+//!
+//! `FerroError` is the Rust-idiom collapse of sklearn's exceptions.py class
+//! hierarchy into one `#[non_exhaustive]` enum returned as `Result<T, FerroError>`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (ShapeMismatch) | SHIPPED | `FerroError::ShapeMismatch`; consumer `predict` in `mean_shift.rs`. Analog of sklearn input-validation `ValueError`. |
+//! | REQ-2 (InsufficientSamples) | SHIPPED | `FerroError::InsufficientSamples`; consumer `fit` in `gaussian.rs`. |
+//! | REQ-3 (ConvergenceFailure) | SHIPPED | `FerroError::ConvergenceFailure`; consumer `jacobi_eigen_symmetric` in `kernel_pca.rs`. Name mirrors `ConvergenceWarning` (`exceptions.py:64`); warn-vs-error severity is pinned per-estimator downstream. |
+//! | REQ-4 (InvalidParameter) | SHIPPED | `FerroError::InvalidParameter`; consumer `fit` in `mini_batch_kmeans.rs`. Mirrors sklearn `ValueError` from `_parameter_constraints`. |
+//! | REQ-5 (NumericalInstability) | SHIPPED | `FerroError::NumericalInstability`; consumer `cholesky_gpc` in `gp_classifier.rs`. |
+//! | REQ-6 (IoError + SerdeError) | SHIPPED | `FerroError::IoError(#[from])` / `SerdeError`; consumers `save_pmml` in `pmml.rs`, `fetch_openml` in `openml.rs`. |
+//! | REQ-7 (FerroResult alias) | SHIPPED | `pub type FerroResult<T>`; pervasive return type; `FerroError: Send + Sync`. |
+//! | REQ-8 (NotFittedError eliminated, R-DEV-4) | SHIPPED | Sanctioned deviation: no `NotFitted` variant — replaced by the `traits.rs` typestate (predict-before-fit is a compile error). Mirrors `NotFittedError` (`exceptions.py:42`). Runtime `PyErr` MRO parity pinned later in `ferrolearn-python`. |
+//! | REQ-9 (ShapeMismatchContext builder) | NOT-STARTED | open blocker #351 — builder has no non-test production consumer (sites construct `ShapeMismatch{..}` directly). |
+//! | REQ-10 (advisory-warning mapping) | SHIPPED | Documented non-applicable: sklearn's `*Warning` advisories (`exceptions.py:64-188`) have no `Result`-contract analog; `#[non_exhaustive]` leaves room for a future warnings channel. |
+//!
+//! acto-critic audit: NO DIVERGENCE FOUND (error.rs is vocabulary-only; exception-type
+//! `ValueError`/`NotFittedError` parity is owned by `ferrolearn-python`'s `From<FerroError>
+//! for PyErr` boundary and pinned there). Two states only per goal.md R-DEFER-2.
 
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
