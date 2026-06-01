@@ -300,15 +300,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        // At least one stopping criterion must be set.
-        if self.n_nonzero_coefs.is_none() && self.tol.is_none() {
-            return Err(FerroError::InvalidParameter {
-                name: "n_nonzero_coefs / tol".into(),
-                reason: "at least one stopping criterion must be set".into(),
-            });
-        }
+        // Default for n_nonzero_coefs when neither stopping criterion is set:
+        // sklearn `_omp.py:785` sets `n_nonzero_coefs_ = max(int(0.1 * n_features), 1)`
+        // (truncating int cast) and fits, rather than erroring.
+        let effective_n_nonzero = if self.n_nonzero_coefs.is_none() && self.tol.is_none() {
+            Some(((n_features as f64 * 0.1) as usize).max(1))
+        } else {
+            self.n_nonzero_coefs
+        };
 
-        let max_k = self.n_nonzero_coefs.unwrap_or(n_features).min(n_features);
+        let max_k = effective_n_nonzero.unwrap_or(n_features).min(n_features);
 
         if let Some(n) = self.n_nonzero_coefs {
             if n > n_features {
@@ -495,10 +496,23 @@ mod tests {
     }
 
     #[test]
-    fn test_no_stopping_criterion() {
-        let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+    fn test_default_n_nonzero_fits() {
+        // sklearn `_omp.py:785`: when both n_nonzero_coefs and tol are None,
+        // n_nonzero_coefs_ = max(int(0.1 * n_features), 1), and fit succeeds.
+        // With 1 feature: max(int(0.1), 1) = 1.
+        let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]);
         let y = array![1.0, 2.0, 3.0];
-        assert!(OrthogonalMatchingPursuit::<f64>::new().fit(&x, &y).is_err());
+        assert!(x.is_ok(), "valid shape");
+        let Ok(x) = x else { return };
+        let result = OrthogonalMatchingPursuit::<f64>::new().fit(&x, &y);
+        assert!(result.is_ok(), "default OMP must fit, not error");
+        let Ok(fitted) = result else { return };
+        let nonzero = fitted
+            .coefficients()
+            .iter()
+            .filter(|&&c| c.abs() > 1e-10)
+            .count();
+        assert_eq!(nonzero, 1);
     }
 
     #[test]

@@ -83,7 +83,6 @@ const SK_INTERCEPT_K5: f64 = 152.13348416289602;
 ///
 /// Tracking: #488
 #[test]
-#[ignore = "divergence: OMP default-construction errors instead of n_nonzero=max(int(0.1*n_features),1); tracking #488"]
 fn divergence_omp_default_n_nonzero_fits() {
     let (x, y) = diabetes();
     let fitted = OrthogonalMatchingPursuit::<f64>::new()
