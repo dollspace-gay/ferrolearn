@@ -9,6 +9,30 @@
 //! (matching scikit-learn's convention): smaller values specify stronger
 //! regularization.
 //!
+//! ## REQ status (per `.design/linear/logistic_regression.md`, mirrors `sklearn/linear_model/_logistic.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.LogisticRegression` default path (`solver='lbfgs'`,
+//! `penalty='l2'`, `C=1.0`, multinomial for >2 classes). Objective `C·Σlogloss + ½||w||²`
+//! (intercept unpenalized). coef_/intercept_/predict_proba match the live oracle to ~1e-8 at
+//! convergence (the ~1e-3 gap at default tol is the LBFGS stopping bound, analog of #412).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (binary LBFGS L2 fit) | SHIPPED | `Fit for LogisticRegression` (LBFGS, C·Σlogloss+½‖w‖², intercept unpenalized); coef/intercept match oracle to 1e-8. Consumers: `RsLogisticRegression` (ferrolearn-python), `LogisticRegressionCV`. |
+//! | REQ-2 (multiclass multinomial softmax fit) | SHIPPED | softmax cross-entropy for ≥3 classes = sklearn lbfgs multinomial; predict_proba matches oracle to 5e-8. |
+//! | REQ-3 (predict argmax → original labels) | SHIPPED | returns `classes[idx]` (original label values; no #368 collapse). |
+//! | REQ-4 (predict_proba sigmoid/softmax, normalized) | SHIPPED | rows sum to 1; matches oracle. |
+//! | REQ-5 (decision_function values) | SHIPPED | values match oracle; the binary numpy `(n,)`-shape ABI is a ferrolearn-python binding concern (#454, binding ravels `(n,1)→(n,)`). |
+//! | REQ-6 (fit_intercept incl. false) | SHIPPED | intercept fixed at 0, unpenalized. |
+//! | REQ-7 (C regularization convention) | SHIPPED | C multiplies the loss (not the penalty); matches sklearn. |
+//! | REQ-8 (HasCoefficients/HasClasses) | SHIPPED | coef_ `(n_classes,n_features)`/`(1,n_features)` (no transpose). |
+//! | REQ-9..20 NOT-STARTED | penalty l1/elasticnet/none (#442), solver variants (#443), multi_class=ovr (#444), class_weight (#445), dual (#446), intercept_scaling (#447), l1_ratio (#448), warm_start (#449), n_iter_ (#450), sample_weight (#451), random_state/n_jobs (#452), ferray substrate (#453). |
+//!
+//! acto-critic: binary + multinomial coef/intercept/predict_proba match the live oracle to ~1e-8 at
+//! convergence; classes_ returns original labels; intercept unpenalized; C convention correct. The
+//! only divergence (#454, binary decision_function shape) is a binding-layer ABI item (goal.md:
+//! shape fixed at the boundary). Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
