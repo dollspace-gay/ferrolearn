@@ -14,6 +14,28 @@
 //! `l1_ratio = 0`, it is equivalent to Ridge. Intermediate values produce
 //! solutions that are both sparse (L1) and small in magnitude (L2).
 //!
+//! ## REQ status (per `.design/linear/elastic_net.md`, mirrors `sklearn/linear_model/_coordinate_descent.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.ElasticNet` (`_coordinate_descent.py:729`). CD with the L1/L2
+//! split `soft_threshold(Xⱼᵀr/n, α·l1_ratio)/(XⱼᵀXⱼ/n + α·(1−l1_ratio))` ≡ sklearn's
+//! `l1_reg=α·l1_ratio·n` / `l2_reg=α·(1−l1_ratio)·n`. coef_/intercept_ match the live oracle to
+//! <1e-5 across the (alpha, l1_ratio) grid; default `l1_ratio=0.5` matches sklearn.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (CD ElasticNet fit, L1/L2 split) | SHIPPED | `Fit for ElasticNet`; converged coef/intercept match oracle <1e-5 over alpha∈{0.01,0.1,1}×l1_ratio∈{0.1,0.5,0.9}. Consumers: `RsElasticNet` in `ferrolearn-python`, `ElasticNetCV`. |
+//! | REQ-2 (predict) | SHIPPED | `Predict for FittedElasticNet`. |
+//! | REQ-3 (fit_intercept incl. false) | SHIPPED | centering. |
+//! | REQ-4 (l1_ratio mixing; =1→Lasso, =0→L2) | SHIPPED | l1_ratio=1 ≡ Lasso; l1_ratio=0 ≡ sklearn ElasticNet L2; both match oracle. |
+//! | REQ-5 (L1 sparsity) | SHIPPED | exact-zero support set bit-identical to sklearn. |
+//! | REQ-6 (HasCoefficients) | SHIPPED | `HasCoefficients for FittedElasticNet`. |
+//! | REQ-7 (alpha/l1_ratio validation; l1_ratio∈[0,1]) | SHIPPED | matches sklearn's `_parameter_constraints` (l1_ratio=0 accepted by the class; the auto-grid error is owned by elastic_net_cv). |
+//! | REQ-8..15 NOT-STARTED | positive (#407), warm_start (#408), selection='random' (#409), precompute (#410), dual-gap stopping (#412), n_iter_/dual_gap_ (#417), MultiTaskElasticNet (#418), ferray substrate (#419). |
+//!
+//! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
+//! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
+//! Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
