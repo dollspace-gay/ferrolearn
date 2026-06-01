@@ -166,11 +166,23 @@ impl<F: Float> FittedLassoCV<F> {
     }
 }
 
-/// Split sample indices into `k` roughly equal folds.
+/// Split sample indices into `k` contiguous folds, mirroring scikit-learn's
+/// non-shuffled `KFold._iter_test_indices` (`sklearn/model_selection/_split.py:521-534`).
+///
+/// Fold sizes are `n_samples / k`, with the first `n_samples % k` folds
+/// receiving one extra sample; folds are sequential index blocks. For
+/// `n_samples = 12, k = 3` this yields `[0,1,2,3], [4,5,6,7], [8,9,10,11]`;
+/// for `n_samples = 10, k = 3` it yields `[0,1,2,3], [4,5,6], [7,8,9]`.
 fn kfold_indices(n_samples: usize, k: usize) -> Vec<Vec<usize>> {
-    let mut folds: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
-    for i in 0..n_samples {
-        folds[i % k].push(i);
+    let base = n_samples / k;
+    let remainder = n_samples % k;
+    let mut folds: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut current = 0;
+    for fold in 0..k {
+        let fold_size = if fold < remainder { base + 1 } else { base };
+        let stop = current + fold_size;
+        folds.push((current..stop).collect());
+        current = stop;
     }
     folds
 }
