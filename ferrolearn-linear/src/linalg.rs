@@ -15,6 +15,25 @@
 //! The `ndarray ↔ ferray` conversion happens at this module boundary
 //! (R-SUBSTRATE-4): callers keep their `ndarray` signatures during the
 //! workspace-wide migration.
+//!
+//! ## REQ status (per `.design/linear/linalg.md`, mirrors `sklearn/linear_model/_base.py:687` @ 1.5.2)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (full-rank OLS solve) | SHIPPED | `solve_lstsq` → `ferray::linalg::lstsq`; full-rank coef/intercept match the live sklearn oracle to 1e-8. Consumer: `Fit for LinearRegression in linear_regression.rs`. |
+//! | REQ-2 (minimum-norm for rank-deficient X) | SHIPPED | `solve_lstsq` → `ferray::linalg::lstsq` (SVD zeroes sub-rcond sv → min-norm), mirrors LAPACK `gelsd` (`_base.py:687`). Closed #376; regression test `divergence_rank_deficient_*_min_norm`. |
+//! | REQ-3 (underdetermined n<p accepted) | SHIPPED | rejection removed; SVD handles any m×n. Closed #377; regression test `divergence_underdetermined_accepted_min_norm`. |
+//! | REQ-4 (rank_ / singular_ exposed) | NOT-STARTED | blocker #374 — `ferray::linalg::lstsq` returns rank+singular values, but they are not yet stored as fitted attributes on the estimators. |
+//! | REQ-5 (safe_sparse_dot helper) | NOT-STARTED | blocker #380 — no dot/matmul wrapper (`extmath.py:161`); estimators call `ndarray::.dot()` inline. |
+//! | REQ-6 (ferray substrate for OLS solve) | SHIPPED | OLS decomposition runs on `ferray::linalg` (`solve.rs:208`); ndarray↔ferray bridged at this boundary (R-SUBSTRATE-4). |
+//! | REQ-7 (gelsd parity on near-singular X, cond~1e14) | NOT-STARTED | blocker #381 (rcond `eps` cutoff) blocked on ferray #382 (ferray SVD precision on near-zero singular values diverges from LAPACK). Per R-SUBSTRATE-5 the fix is in ferray's harness. |
+//!
+//! acto-critic: #376/#377 fixed and verified vs the live oracle; full-rank parity,
+//! bridge fidelity, and edge cases (single feature/sample, f32, fit_intercept) all
+//! match. One residual near-singular divergence (#381) is owned by ferray (#382).
+//! Two states only per goal.md R-DEFER-2.
+//!
+//! The Ridge path retains its hand-rolled Cholesky kernels (PD for `alpha > 0`).
 
 use ferray::linalg::LinalgFloat;
 use ferray::{Array as FerrayArray, IxDyn};
