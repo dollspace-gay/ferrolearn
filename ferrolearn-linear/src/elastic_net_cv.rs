@@ -61,25 +61,25 @@ pub struct ElasticNetCV<F> {
 impl<F: Float + FromPrimitive> ElasticNetCV<F> {
     /// Create a new `ElasticNetCV` with default settings.
     ///
-    /// Defaults:
-    /// - `l1_ratios = [0.1, 0.5, 0.7, 0.9, 0.95, 0.99, 1.0]`
+    /// Defaults (mirroring `sklearn.linear_model.ElasticNetCV.__init__`,
+    /// `_coordinate_descent.py:2328`, which fixes a single `l1_ratio=0.5`):
+    /// - `l1_ratios = [0.5]`
     /// - `n_alphas = 100`
     /// - `cv = 5`
     /// - `max_iter = 1000`
     /// - `tol = 1e-4`
     /// - `fit_intercept = true`
+    ///
+    /// Use [`with_l1_ratios`](Self::with_l1_ratios) to search a grid of
+    /// mixing ratios.
     #[must_use]
     pub fn new() -> Self {
+        // sklearn `ElasticNetCV` defaults `l1_ratio=0.5` (a single value),
+        // not a grid (`_coordinate_descent.py:2328`). 0.5 is built as
+        // `1 / (1 + 1)` so no fallible float conversion is needed here.
+        let half = F::one() / (F::one() + F::one());
         Self {
-            l1_ratios: vec![
-                F::from(0.1).unwrap(),
-                F::from(0.5).unwrap(),
-                F::from(0.7).unwrap(),
-                F::from(0.9).unwrap(),
-                F::from(0.95).unwrap(),
-                F::from(0.99).unwrap(),
-                F::one(),
-            ],
+            l1_ratios: vec![half],
             n_alphas: 100,
             cv: 5,
             max_iter: 1000,
@@ -171,11 +171,23 @@ impl<F: Float> FittedElasticNetCV<F> {
     }
 }
 
-/// Split sample indices into `k` roughly equal folds.
+/// Split sample indices into `k` contiguous folds, mirroring scikit-learn's
+/// non-shuffled `KFold._iter_test_indices` (`sklearn/model_selection/_split.py:521-534`).
+///
+/// Fold sizes are `n_samples / k`, with the first `n_samples % k` folds
+/// receiving one extra sample; folds are sequential index blocks. For
+/// `n_samples = 12, k = 3` this yields `[0,1,2,3], [4,5,6,7], [8,9,10,11]`;
+/// for `n_samples = 10, k = 3` it yields `[0,1,2,3], [4,5,6], [7,8,9]`.
 fn kfold_indices(n_samples: usize, k: usize) -> Vec<Vec<usize>> {
-    let mut folds: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
-    for i in 0..n_samples {
-        folds[i % k].push(i);
+    let base = n_samples / k;
+    let remainder = n_samples % k;
+    let mut folds: Vec<Vec<usize>> = Vec::with_capacity(k);
+    let mut current = 0;
+    for fold in 0..k {
+        let fold_size = if fold < remainder { base + 1 } else { base };
+        let stop = current + fold_size;
+        folds.push((current..stop).collect());
+        current = stop;
     }
     folds
 }
@@ -337,6 +349,21 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let mut best_mse = F::infinity();
 
         for &l1_ratio in &self.l1_ratios {
+            // Automatic alpha-grid generation is undefined for l1_ratio == 0:
+            // alpha_max = max|Xᵀy| / (n * l1_ratio) divides by zero. sklearn's
+            // `_alpha_grid` raises ValueError here (`_coordinate_descent.py:140-146`,
+            // "Automatic alpha grid generation is not supported for l1_ratio=0").
+            // An explicit user-supplied alphas grid would be allowed, but this
+            // path always auto-generates, so l1_ratio == 0 is rejected.
+            if l1_ratio == F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "l1_ratio".into(),
+                    reason: "Automatic alpha grid generation is not supported for \
+                             l1_ratio=0; supply an explicit alphas grid"
+                        .into(),
+                });
+            }
+
             // Generate alpha grid for this l1_ratio.
             let alpha_max = compute_alpha_max_enet(x, y, l1_ratio, self.fit_intercept);
             let alpha_grid = if alpha_max <= F::zero() {
@@ -452,7 +479,10 @@ mod tests {
     #[test]
     fn test_elastic_net_cv_default_builder() {
         let m = ElasticNetCV::<f64>::new();
-        assert_eq!(m.l1_ratios.len(), 7);
+        // sklearn `ElasticNetCV()` defaults to a single `l1_ratio=0.5`
+        // (`_coordinate_descent.py:2328`), not a 7-element grid.
+        assert_eq!(m.l1_ratios.len(), 1);
+        assert_eq!(m.l1_ratios[0], 0.5);
         assert_eq!(m.n_alphas, 100);
         assert_eq!(m.cv, 5);
         assert_eq!(m.max_iter, 1000);
@@ -609,8 +639,10 @@ mod tests {
     }
 
     #[test]
-    fn test_elastic_net_cv_pure_ridge_l1_ratio_zero() {
-        // l1_ratio=0 should work (pure Ridge-like behavior).
+    fn test_elastic_net_cv_l1_ratio_zero_auto_grid_errors() {
+        // sklearn's `_alpha_grid` raises ValueError for l1_ratio=0 with no
+        // explicit alphas grid ("Automatic alpha grid generation is not
+        // supported for l1_ratio=0", `_coordinate_descent.py:140-146`).
         let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect()).unwrap();
         let y = Array1::from_iter((1..=10).map(|i| 2.0 * f64::from(i) + 1.0));
 
@@ -618,9 +650,7 @@ mod tests {
             .with_l1_ratios(vec![0.0, 0.5, 1.0])
             .with_n_alphas(5)
             .with_cv(3);
-        let fitted = model.fit(&x, &y).unwrap();
-
-        let preds = fitted.predict(&x).unwrap();
-        assert_eq!(preds.len(), 10);
+        let result = model.fit(&x, &y);
+        assert!(result.is_err());
     }
 }

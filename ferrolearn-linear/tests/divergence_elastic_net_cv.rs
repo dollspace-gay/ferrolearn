@@ -87,7 +87,6 @@ fn seed1_data() -> (Array2<f64>, Array1<f64>) {
 /// Tracking: #432 (default `l1_ratios=[0.5]`). Also gated by #431 (folds) and
 /// #412 (CD stopping); this test pins the default-`l1_ratio` selection divergence.
 #[test]
-#[ignore = "divergence: ElasticNetCV() default l1_ratios is a 7-grid, sklearn fixes l1_ratio=0.5; tracking #432"]
 fn divergence_elastic_net_cv_default_l1_ratio_selection() {
     let (x, y) = seed1_data();
 
@@ -140,7 +139,6 @@ fn divergence_elastic_net_cv_default_l1_ratio_selection() {
 ///
 /// Tracking: #431 (contiguous KFold, same fix as LassoCV #421); #412 (coef).
 #[test]
-#[ignore = "divergence: ElasticNetCV round-robin folds vs sklearn contiguous KFold -> different alpha_; tracking #431"]
 fn divergence_elastic_net_cv_fold_strategy_selects_alpha() {
     let (x, y) = seed1_data();
 
@@ -209,7 +207,6 @@ fn divergence_elastic_net_cv_fold_strategy_selects_alpha() {
 ///
 /// Tracking: #440 (l1_ratio=0 validation; raise on auto-grid l1_ratio=0).
 #[test]
-#[ignore = "divergence: ElasticNetCV l1_ratio=0 auto-grid fits instead of raising ValueError like sklearn; tracking #440"]
 fn divergence_elastic_net_cv_l1_ratio_zero_must_error() {
     let (x, y) = seed1_data();
 
