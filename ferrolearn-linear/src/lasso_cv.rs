@@ -6,6 +6,25 @@
 //! spaced sequence from `alpha_max` (the smallest alpha that zeros all
 //! coefficients) down to `alpha_max * epsilon`.
 //!
+//! ## REQ status (per `.design/linear/lasso_cv.md`, mirrors `sklearn/linear_model/_coordinate_descent.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.LassoCV`: auto alpha path (`alpha_max = max|Xᵀy|/n` on centered
+//! data, log-spaced `n_alphas=100` down by `eps=1e-3`) + k-fold CV over the grid, MSE selection,
+//! refit. The alpha grid matches sklearn's `_alpha_grid` to <1e-9; folds are sklearn-contiguous.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (auto alpha path: alpha_max/eps/n_alphas/log-spacing) | SHIPPED | `compute_alpha_max` (centered, max\|Xᵀy\|/n) + log-spaced grid; matches sklearn `_alpha_grid` (`:96`/`:178`) to <1e-9. |
+//! | REQ-2 (k-fold CV alpha selection + refit) | SHIPPED | contiguous `kfold_indices` (sklearn KFold, `_split.py`) → `alpha_` matches sklearn to ~2e-17 (#421 fixed); refit via `Lasso`. Consumer: `pub use LassoCV` (boundary API). Note: refit coef_ inherits Lasso's CD-stopping residual #412 (≤~4e-5 at default tol). |
+//! | REQ-3 (explicit user alphas grid) | SHIPPED | `with_alphas`. |
+//! | REQ-4 (predict / fit_intercept / HasCoefficients) | SHIPPED | `Predict`/`HasCoefficients for FittedLassoCV`. |
+//! | REQ-5 (sklearn contiguous KFold) | SHIPPED | #421 fixed (abf5a14) — was round-robin. |
+//! | REQ-6..12 NOT-STARTED | mse_path_ (#422), alphas_/dual_gap_/n_iter_ (#423), eps as param (#424), positive (#425), precompute/n_jobs (#426), random_state/selection (#427), ferray substrate (#428). coef exact parity gated by CD-stopping #412. |
+//!
+//! acto-critic: alpha grid matches sklearn <1e-9; the fold-strategy divergence (#421) found and
+//! fixed (alpha_ now matches to ~2e-17); residual coef_ difference is the tracked Lasso CD-stopping
+//! criterion #412, not the CV logic. Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
