@@ -181,33 +181,69 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedLogisticRe
     }
 }
 
-/// StratifiedKFold-style split: group indices by class label, then
-/// distribute each class's indices evenly across the `k` folds, matching
-/// scikit-learn's `LogisticRegressionCV` default which uses
-/// `StratifiedKFold` (#346).
+/// StratifiedKFold-style split, replicating scikit-learn's non-shuffled
+/// `StratifiedKFold._make_test_folds` (`sklearn/model_selection/_split.py:746-806`),
+/// the default CV splitter for `LogisticRegressionCV` (#346, #456).
+///
+/// Each class's samples are assigned to folds in CONTIGUOUS blocks (not
+/// round-robin `i % k`). The per-fold class allocation is the round-robin
+/// distribution over the *sorted* class labels:
+///   `allocation[j][c] = bincount(y_order[j::k])[c]` where `y_order = sort(y_encoded)`
+/// (sklearn `_split.py:786-792`). Then, for each class `c`, its samples (in
+/// original input order) are assigned to folds via
+///   `folds_for_class = arange(k).repeat(allocation[:, c])`
+/// so fold 0 takes the first `allocation[0][c]` of class-`c`'s samples, fold 1
+/// the next `allocation[1][c]`, etc. (sklearn `_split.py:794-805`).
 ///
 /// Returns `(train_indices, test_indices)` for fold number `fold`.
 fn stratified_kfold_split(y: &Array1<usize>, k: usize, fold: usize) -> (Vec<usize>, Vec<usize>) {
-    // Group sample indices by class.
+    let n = y.len();
+
+    // Distinct classes, sorted ascending — this is sklearn's class encoding
+    // (`np.unique`); the encoded label of sample `i` is its position here.
     let mut classes: Vec<usize> = y.iter().copied().collect();
     classes.sort_unstable();
     classes.dedup();
+    let n_classes = classes.len();
+    let encode = |label: usize| classes.binary_search(&label).unwrap_or(0);
 
-    let mut test_indices: Vec<usize> = Vec::new();
-    for &cls in &classes {
-        // Indices for this class, in input order — sklearn's StratifiedKFold
-        // walks the input in order and assigns sample j to fold `j % k`
-        // within each class.
-        let cls_indices: Vec<usize> = (0..y.len()).filter(|&i| y[i] == cls).collect();
-        for (i, &idx) in cls_indices.iter().enumerate() {
-            if i % k == fold {
-                test_indices.push(idx);
-            }
+    // y_order = the class-encoded labels sorted ascending (all class-0 samples,
+    // then class-1, ...). sklearn: `y_order = np.sort(y_encoded)`.
+    let mut y_order: Vec<usize> = y.iter().map(|&label| encode(label)).collect();
+    y_order.sort_unstable();
+
+    // allocation[j][c] = bincount(y_order[j::k], minlength=n_classes)[c]
+    // = number of class-c samples assigned to fold j (balances fold sizes).
+    let mut allocation = vec![vec![0usize; n_classes]; k];
+    for (j, alloc_row) in allocation.iter_mut().enumerate() {
+        let mut idx = j;
+        while idx < y_order.len() {
+            alloc_row[y_order[idx]] += 1;
+            idx += k;
         }
     }
+
+    // For each class c, assign its original-order samples to folds in
+    // contiguous blocks per `allocation[:, c]`, then collect those landing in
+    // the requested `fold` as the test set.
+    let mut test_indices: Vec<usize> = Vec::new();
+    for (c, &cls) in classes.iter().enumerate() {
+        let cls_indices: Vec<usize> = (0..n).filter(|&i| y[i] == cls).collect();
+        let mut pos = 0usize;
+        for (j, alloc_row) in allocation.iter().enumerate() {
+            let count = alloc_row[c];
+            if j == fold {
+                for &idx in &cls_indices[pos..pos + count] {
+                    test_indices.push(idx);
+                }
+            }
+            pos += count;
+        }
+    }
+
     test_indices.sort_unstable();
     let test_set: std::collections::HashSet<usize> = test_indices.iter().copied().collect();
-    let train_indices: Vec<usize> = (0..y.len()).filter(|i| !test_set.contains(i)).collect();
+    let train_indices: Vec<usize> = (0..n).filter(|i| !test_set.contains(i)).collect();
     (train_indices, test_indices)
 }
 
@@ -428,6 +464,42 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasClasses
 mod tests {
     use super::*;
     use ndarray::array;
+
+    /// #456: `stratified_kfold_split` must replicate sklearn's non-shuffled
+    /// `StratifiedKFold._make_test_folds` (contiguous blocks), NOT the old
+    /// `i % k` round-robin. Expected test-fold memberships come from the live
+    /// oracle (R-CHAR-3):
+    ///   `StratifiedKFold(3).split(zeros, y)` for
+    ///   `y=[0,0,0,0,1,1,1,1,1]` -> [[0,1,4],[2,5,6],[3,7,8]]
+    /// and for the 18-sample test dataset
+    ///   `y=[1,1,0,1,1,0,0,0,0,1,1,0,0,0,1,1,0,1]` ->
+    ///   [[0,1,2,3,5,6],[4,7,8,9,10,11],[12,13,14,15,16,17]].
+    #[test]
+    fn stratified_kfold_split_matches_sklearn_partition() {
+        // y=[0,0,0,0,1,1,1,1,1], k=3 (the goal.md verification case).
+        let y = Array1::from_vec(vec![0usize, 0, 0, 0, 1, 1, 1, 1, 1]);
+        let expected: [Vec<usize>; 3] = [vec![0, 1, 4], vec![2, 5, 6], vec![3, 7, 8]];
+        for (fold, exp) in expected.iter().enumerate() {
+            let (_train, test) = stratified_kfold_split(&y, 3, fold);
+            assert_eq!(&test, exp, "fold {fold} test indices mismatch vs sklearn");
+        }
+
+        // The 18-sample, 2-class dataset used by the divergence integration test.
+        let y2 = Array1::from_vec(vec![
+            1usize, 1, 0, 1, 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1,
+        ]);
+        let expected2: [Vec<usize>; 3] = [
+            vec![0, 1, 2, 3, 5, 6],
+            vec![4, 7, 8, 9, 10, 11],
+            vec![12, 13, 14, 15, 16, 17],
+        ];
+        for (fold, exp) in expected2.iter().enumerate() {
+            let (train, test) = stratified_kfold_split(&y2, 3, fold);
+            assert_eq!(&test, exp, "18-sample fold {fold} test mismatch vs sklearn");
+            // train is the disjoint complement.
+            assert_eq!(train.len() + test.len(), y2.len());
+        }
+    }
 
     #[test]
     fn test_default_constructor() {
