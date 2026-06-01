@@ -10,6 +10,32 @@
 //! The regularization parameter `alpha` controls the strength of the
 //! L2 penalty, shrinking coefficients toward zero.
 //!
+//! ## REQ status (per `.design/linear/ridge.md`, mirrors `sklearn/linear_model/_ridge.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.Ridge` (`_ridge.py:1016`), default dense path
+//! `solver='auto'`→`'cholesky'` with `fit_intercept` via centering (intercept unpenalized).
+//! coef_/intercept_ match the live sklearn oracle to 1e-8 across alpha∈{0.1,1,10,100}.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (L2 cholesky fit, intercept unpenalized) | SHIPPED | `Fit for Ridge` (centering + `linalg::solve_ridge`). Consumer: `RsRidge` in `ferrolearn-python/src/regressors.rs`. |
+//! | REQ-2 (predict = X·coef + intercept) | SHIPPED | `Predict for FittedRidge`. |
+//! | REQ-3 (fit_intercept incl. false) | SHIPPED | `with_fit_intercept`. |
+//! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedRidge`. |
+//! | REQ-5 (alpha≥0 validation; alpha=0 → OLS incl. rank-deficient min-norm) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 singular falls back `solve_ridge` → `solve_lstsq` (ferray min-norm), mirroring sklearn cholesky→SVD (`_ridge.py:752-756`). Closed #392; test `divergence_ridge_alpha_zero_rank_deficient_min_norm`. |
+//! | REQ-6 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | `FittedRidgeMulti` exists, no production consumer (#384). |
+//! | REQ-7 (per-target alpha array) | NOT-STARTED | #385. |
+//! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
+//! | REQ-9 (positive=True) | NOT-STARTED | #387. |
+//! | REQ-10 (max_iter/tol + n_iter_) | NOT-STARTED | #388. |
+//! | REQ-11 (sample_weight) | NOT-STARTED | #389. |
+//! | REQ-12 (copy_X/random_state) | NOT-STARTED | #390. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
+//!
+//! acto-critic: core L2 numerics (coef/intercept, alpha scaling, fit_intercept, f32) match the
+//! live oracle; one divergence (#392, alpha=0 rank-deficient min-norm) found and fixed.
+//! Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
