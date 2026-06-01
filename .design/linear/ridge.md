@@ -1,0 +1,123 @@
+# Ridge Regression
+
+<!--
+tier: 3-component
+status: draft
+baseline-commit: f012c75716c4d80c74b236b7628c43df9ef4075e
+upstream-paths:
+  - sklearn/linear_model/_ridge.py
+  - sklearn/linear_model/_base.py
+-->
+
+## Summary
+`ridge.rs` mirrors scikit-learn's `class Ridge` (`sklearn/linear_model/_ridge.py:1016`): linear
+least squares with an L2 penalty, `||y - Xw||^2_2 + alpha * ||w||^2_2`, solved in closed form. The
+ferrolearn implementation covers sklearn's default dense path — `solver='auto'` → `'cholesky'` with
+`fit_intercept` handled by centering — and exposes `Ridge<F>` / `FittedRidge<F>` (single output) plus
+`FittedRidgeMulti<F>` (2-D `Y`). It does NOT cover sklearn's alternate solvers, per-target `alpha`,
+`positive`, `sample_weight`, `max_iter`/`tol`/`n_iter_`, `copy_X`, or `random_state`.
+
+## Requirements
+- REQ-1: Fit `coef_` and `intercept_` by minimizing `||y - Xw||^2_2 + alpha * ||w||^2_2` via Cholesky
+  on `(X^T X + alpha * I) w = X^T y`, with the intercept handled by centering so the intercept term
+  is NOT penalized (sklearn's default `solver='auto'` → `'cholesky'` dense path).
+- REQ-2: `predict(X) = X @ coef_ + intercept_`.
+- REQ-3: `fit_intercept` (default `true`); when `false`, `X`/`y` are used uncentered and `intercept_ = 0`.
+- REQ-4: Expose `coef_`/`intercept_` for introspection via `HasCoefficients`.
+- REQ-5: `alpha` must be a non-negative float in `[0, inf)`; reject negative `alpha` with a parameter
+  error; `alpha = 0` reduces to ordinary least squares.
+- REQ-6: Multi-output regression — accept a 2-D target `Y` of shape `(n_samples, n_targets)` and produce
+  a `(n_features, n_targets)` coefficient matrix with a per-target intercept vector.
+- REQ-7: Per-target `alpha` — accept `alpha` as an array of shape `(n_targets,)` (one penalty per target).
+- REQ-8: Solver selection — support `solver` in {`auto`, `cholesky`, `svd`, `lsqr`, `sparse_cg`, `sag`,
+  `saga`, `lbfgs`} and expose the resolved `solver_` fitted attribute.
+- REQ-9: `positive=True` constrained (non-negative coefficient) fitting via the lbfgs solver.
+- REQ-10: `max_iter`/`tol` controls for iterative solvers and the `n_iter_` fitted attribute.
+- REQ-11: `sample_weight` support (per-sample weighting of the loss).
+- REQ-12: `copy_X` and `random_state` constructor parameters.
+- REQ-13 (substrate): run the owned array/linalg computation on ferray (`ferray-core` array type,
+  `ferray::linalg` Cholesky) rather than `ndarray` + the in-crate `linalg` Cholesky.
+
+## Acceptance criteria
+- AC-1: On `X = [[1,0],[0,1],[1,1],[2,2]]`, `y = [1,2,3,6]`, `alpha=1.0`, `fit_intercept=true`,
+  `coef_ ≈ [0.875, 1.375]` and `intercept_ ≈ 0.75` (matches `sklearn.linear_model.Ridge`).
+- AC-2: `predict` on the training `X` returns a length-`n_samples` vector equal to `X @ coef_ + intercept_`.
+- AC-3: With `fit_intercept=false`, `alpha=0`, `X=[[1],[2],[3],[4]]`, `y=[2,4,6,8]`: `coef_ ≈ [2.0]`,
+  `intercept_ = 0.0` (matches `Ridge(alpha=0, fit_intercept=False)`).
+- AC-4: `HasCoefficients::coefficients()` and `intercept()` return the fitted values.
+- AC-5: `alpha = -1.0` causes `fit` to return an error; `alpha = 0` recovers the OLS slope/intercept.
+- AC-6: For a 2-D `Y` synthesized from two distinct linear targets with `alpha → 0`, the recovered
+  `(n_features, n_targets)` coefficients and per-target intercepts match the generating coefficients.
+
+## REQ status table
+
+| REQ | Status | Evidence |
+|---|---|---|
+| REQ-1 (L2 cholesky fit, intercept unpenalized) | SHIPPED | impl `pub fn fit (Fit<Array2<F>, Array1<F>>) in ridge.rs` centers `x`/`y` then solves via `crate::linalg::solve_ridge` (`let x_centered = x - &x_mean; ... let w = linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?; let intercept = y_mean - x_mean.dot(&w);`). Centering means `alpha` never touches the intercept — mirrors sklearn `_ridge_regression` cholesky branch `sklearn/linear_model/_ridge.py:741-756` (`coef = _solve_cholesky(X, y, alpha)`) preceded by `_preprocess_data` centering `sklearn/linear_model/_base.py:116` and `_set_intercept` `sklearn/linear_model/_base.py:308`. Non-test consumer: `ferrolearn-python/src/regressors.rs` (`RsRidge::fit` → `ferrolearn_linear::Ridge::<f64>::new().with_alpha(..).with_fit_intercept(..).fit(..)`); also `ridge_cv.rs` (`FittedRidgeCV` fits inner `Ridge::<F>::new()`). Verification: live `Ridge(alpha=1.0).fit` gives `coef_=[0.875,1.375]`, `intercept_=0.75`; `cargo test -p ferrolearn-linear` `sklearn_equiv_ridge`/`test_ridge_oracle` green. |
+| REQ-2 (predict = X·coef + intercept) | SHIPPED | impl `pub fn predict (Predict<Array2<F>>) for FittedRidge in ridge.rs` (`let preds = x.dot(&self.coefficients) + self.intercept;`). Mirrors sklearn `LinearModel.predict` / `_decision_function` `sklearn/linear_model/_base.py` (`X @ self.coef_.T + self.intercept_`). Non-test consumer: `ferrolearn-python/src/regressors.rs` (`RsRidge::predict` → `fitted.predict(&x_nd)`); `ferrolearn-io/src/onnx.rs` + `pmml.rs` serialize `FittedRidge` via `coefficients()`/`intercept()`. Verification: `cargo test -p ferrolearn-linear` `test_ridge_predict` green. |
+| REQ-3 (fit_intercept incl. false) | SHIPPED | impl `pub fn with_fit_intercept in ridge.rs` + the `if self.fit_intercept { ... } else { let w = linalg::solve_ridge(x, y, self.alpha)?; ... intercept: F::zero() }` branch in `Fit::fit`. Mirrors sklearn ctor `fit_intercept=True` `sklearn/linear_model/_ridge.py:897` and `_preprocess_data(fit_intercept=...)` `sklearn/linear_model/_base.py:116`. Non-test consumer: `ferrolearn-python/src/regressors.rs` (`RsRidge::new(alpha, fit_intercept)` threads `fit_intercept` through `with_fit_intercept`). Verification: `cargo test -p ferrolearn-linear` `test_ridge_no_intercept` green (`coef_=2.0`, `intercept_=0.0`). |
+| REQ-4 (HasCoefficients introspection) | SHIPPED | impl `impl HasCoefficients<F> for FittedRidge in ridge.rs` (`fn coefficients(&self) -> &Array1<F>`, `fn intercept(&self) -> F`). Mirrors sklearn fitted attrs `coef_`/`intercept_` `sklearn/linear_model/_ridge.py:994`/`:1011`. Non-test consumer: `ferrolearn-io/src/onnx.rs` (`linear_regressor_to_onnx(self.coefficients(), self.intercept(), "FittedRidge")`) and `ferrolearn-io/src/pmml.rs` (`linear_model_to_pmml`), plus `ferrolearn-python/src/regressors.rs` `coef_` getter. Verification: `cargo test -p ferrolearn-linear` `test_ridge_has_coefficients` green. |
+| REQ-5 (alpha ≥ 0 validation; alpha=0 → OLS) | SHIPPED | impl `Fit::fit in ridge.rs` (`if self.alpha < F::zero() { return Err(FerroError::InvalidParameter { name: "alpha".into(), reason: "must be non-negative".into() }); }`). Mirrors sklearn `_ridge_regression` `check_scalar(alpha, "alpha", min_val=0.0, include_boundaries="left")` `sklearn/linear_model/_ridge.py:693-699` and the `alpha = 0 → OLS` contract documented at `sklearn/linear_model/_ridge.py:1037`. Non-test consumer: `ferrolearn-python/src/regressors.rs` maps the error to `PyValueError` (R-DEV-2 exception contract). Verification: `cargo test -p ferrolearn-linear` `test_ridge_negative_alpha`, `test_ridge_no_regularization` and proptest `ridge_alpha_zero_matches_ols` green. |
+| REQ-6 (multi-output 2-D Y) | NOT-STARTED | open prereq blocker #384. `FittedRidgeMulti<F>` and the `Fit<Array2<F>, Array2<F>>` impl exist and the oracle-matchable math is in place, but the type has NO non-test production consumer — `RidgeClassifier` rolls its own per-column `solve_ridge` loop and the Python binding wires only the single-output `FittedRidge`, so the 2-D path is unreachable end-to-end and cannot be SHIPPED under the impl+consumer rule. |
+| REQ-7 (per-target alpha array) | NOT-STARTED | open prereq blocker #385. `Ridge<F>.alpha` is a scalar `F`; sklearn accepts `alpha` as an `ndarray` of shape `(n_targets,)` and validates 1-or-`n_targets` penalties (`sklearn/linear_model/_ridge.py:701-712`). |
+| REQ-8 (solver variants + solver_) | NOT-STARTED | open prereq blocker #386. The impl hardcodes the dense Cholesky path (`crate::linalg::solve_ridge`); sklearn dispatches `auto/cholesky/svd/lsqr/sparse_cg/sag/saga/lbfgs` via `resolve_solver` (`sklearn/linear_model/_ridge.py:830`) and returns a `solver_` attribute (`sklearn/linear_model/_ridge.py:994`). No `solver` param, no `solver_`. |
+| REQ-9 (positive=True) | NOT-STARTED | open prereq blocker #387. No `positive` constructor parameter; sklearn requires the lbfgs solver for non-negative coefficients (`sklearn/linear_model/_ridge.py:923-928`, `_solve_lbfgs` at `:795`). |
+| REQ-10 (max_iter/tol + n_iter_) | NOT-STARTED | open prereq blocker #388. No `max_iter`/`tol` params and no `n_iter_` attribute; the closed-form Cholesky path has no iteration count. sklearn ctor `max_iter=None, tol=1e-4` (`sklearn/linear_model/_ridge.py:899-900`), sets `n_iter_` at `:994`. |
+| REQ-11 (sample_weight) | NOT-STARTED | open prereq blocker #389. `Fit::fit` takes `(X, y)` only; sklearn rescales `X`/`y` by `sqrt(sample_weight)` for non-sag solvers (`sklearn/linear_model/_ridge.py:682-688`, `_check_sample_weight` at `:956`). |
+| REQ-12 (copy_X / random_state) | NOT-STARTED | open prereq blocker #390. `Ridge<F>` omits both; sklearn ctor `copy_X=True` (`sklearn/linear_model/_ridge.py:898`) drives the `_preprocess_data` copy, `random_state=None` (`:903`) seeds the sag/saga solvers. |
+| REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #391 (refs #359 coef-return shape, #375 solve_ridge → `ferray::linalg`). `ridge.rs` operates on `ndarray::{Array1, Array2}` and `crate::linalg::solve_ridge` (in-crate Cholesky), not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). |
+
+## Architecture
+The module owns two estimator surfaces, both produced by the unfitted `Ridge<F> { alpha, fit_intercept }`
+(`pub struct Ridge in ridge.rs`, builders `pub fn new`/`with_alpha`/`with_fit_intercept`/`Default`):
+
+- Single-output: `impl Fit<Array2<F>, Array1<F>> for Ridge<F>` → `FittedRidge<F> { coefficients: Array1<F>, intercept: F }`.
+- Multi-output: `impl Fit<Array2<F>, Array2<F>> for Ridge<F>` → `FittedRidgeMulti<F> { coefficients: Array2<F>, intercepts: Array1<F> }`.
+
+**Intercept invariant (REQ-1/REQ-3).** sklearn never penalizes the intercept: `_preprocess_data`
+(`sklearn/linear_model/_base.py:116`) subtracts the column means of `X` and the mean of `y` before the
+penalized solve, then `_set_intercept` (`sklearn/linear_model/_base.py:308`) recovers
+`intercept_ = y_offset - X_offset @ coef_`. `ridge.rs` reproduces this exactly: when `fit_intercept` is
+true it forms `x_centered = x - x_mean`, `y_centered = y - y_mean`, calls `linalg::solve_ridge(x_centered,
+y_centered, alpha)`, and sets `intercept = y_mean - x_mean.dot(w)`. Because the penalty is applied only to
+the centered system, the intercept is unpenalized — matching sklearn's observable contract. When
+`fit_intercept` is false, the raw `x`/`y` are solved and `intercept = 0`.
+
+**Solver (REQ-1).** `crate::linalg::solve_ridge` (`pub(crate) fn solve_ridge in linalg.rs`) forms
+`X^T X + alpha * I` and runs a Cholesky solve (falling back to a Gaussian solve on factorization
+failure). This is the Rust analog of sklearn's `_solve_cholesky` reached from the `'cholesky'` branch
+(`sklearn/linear_model/_ridge.py:741-756`); for dense `n_features <= n_samples` data sklearn's
+`solver='auto'` resolves to `'cholesky'`, so the default contract is mirrored. The Cholesky factor of
+`X^T X + alpha * I` is shared across target columns in `solve_ridge_multi` for the multi-output path.
+
+**Predict (REQ-2).** `FittedRidge::predict` computes `x.dot(coefficients) + intercept`;
+`FittedRidgeMulti::predict` computes `x.dot(coefficients)` and broadcast-adds the per-target intercepts.
+
+**Introspection / pipeline (REQ-4).** `FittedRidge` implements `HasCoefficients<F>` and
+`FittedPipelineEstimator<F>`; `Ridge<F>` implements `PipelineEstimator<F>`, so a `Ridge` is composable in
+the core pipeline. `FittedRidgeMulti` exposes inherent `coefficients()`/`intercepts()` accessors but does
+not implement `HasCoefficients` (whose `intercept()` returns a scalar `F`).
+
+**Gaps.** Everything beyond the dense Cholesky single-output path is NOT-STARTED (REQ-6..REQ-13): the
+2-D path lacks a consumer, and the alternate solvers, per-target `alpha`, `positive`, `sample_weight`,
+`max_iter`/`tol`/`n_iter_`, `copy_X`/`random_state`, and the ferray substrate are unimplemented. Each is
+pinned by an open blocker referenced above.
+
+## Verification
+Commands that establish the SHIPPED claims (REQ-1..REQ-5):
+
+- `cargo test -p ferrolearn-linear` — the `ridge::tests` module (30 lib tests incl.
+  `test_ridge_no_regularization`, `test_ridge_no_intercept`, `test_ridge_negative_alpha`,
+  `test_ridge_predict`, `test_ridge_has_coefficients`), plus `tests/oracle_tests.rs::test_ridge_oracle`,
+  `tests/sklearn_equivalence.rs::sklearn_equiv_ridge`, and `tests/proptest_invariants.rs`
+  (`ridge_coef_len_equals_n_features`, `ridge_alpha_zero_matches_ols`) all pass.
+- sklearn oracle (live):
+  `python3 -c "from sklearn.linear_model import Ridge; import numpy as np;
+  X=np.array([[1.,0.],[0.,1.],[1.,1.],[2.,2.]]); y=np.array([1.,2.,3.,6.]);
+  m=Ridge(alpha=1.0).fit(X,y); print(m.coef_.tolist(), m.intercept_)"`
+  → `[0.875..., 1.375...] 0.75` — matches ferrolearn `Ridge::<f64>::new()` on the same input (AC-1).
+- Gauntlet: `cargo clippy -p ferrolearn-linear --all-targets -- -D warnings`, `cargo fmt --all --check`.
+
+NOT-STARTED REQs (REQ-6..REQ-13) have no green verification by construction — they are pinned by open
+blockers #384, #385, #386, #387, #388, #389, #390, #391 and become SHIPPED only when the impl plus a
+non-test consumer plus a passing sklearn-grounded test all land.
