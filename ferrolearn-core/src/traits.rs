@@ -41,6 +41,20 @@
 //! # Float Bound
 //!
 //! All algorithms are generic over `F: num_traits::Float + Send + Sync + 'static`.
+//!
+//! ## REQ status (per `.design/core/traits.md`, mirrors `sklearn/base.py` @ 1.5.2)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (fit→fitted typestate) | SHIPPED | `Fit` trait; consumer `LinearRegression`→`FittedLinearRegression` in `linear_regression.rs`. Replaces sklearn runtime `check_is_fitted` (`base.py:1143`) with a compile-time guard (trybuild `predict_unfitted_*`). |
+//! | REQ-2 (Transform) | SHIPPED | `Transform` trait; consumer `FittedStandardScaler` in `standard_scaler.rs`. Mirrors `TransformerMixin.transform` (`base.py:1010`). |
+//! | REQ-3 (FitTransform) | SHIPPED | `FitTransform<X>: Transform<X>`; consumer `StandardScaler` (+16 preprocess transformers). Mirrors `TransformerMixin.fit_transform` (`base.py:1098`, `self.fit(X).transform(X)`). |
+//! | REQ-4 (PartialFit) | SHIPPED | `PartialFit` trait; consumers `SGDClassifier`/`FittedSGDClassifier` in `sgd.rs`. Mirrors sklearn `partial_fit` re-call (`base.py:1461`). |
+//! | REQ-5 (Predict) | SHIPPED | `Predict` trait (fitted-only); consumers `FittedLinearRegression`, `FittedGaussianNB`, `FittedEllipticEnvelope`. Mirrors `BaseEstimator.predict` per `ClassifierMixin.score` (`base.py:764`) / `RegressorMixin.score` (`base.py:848`). |
+//!
+//! All five REQs SHIPPED; no open divergence (acto-critic audit: NO DIVERGENCE FOUND —
+//! `traits.rs` carries no numerics; behavioral parity is pinned at the owning estimator
+//! crates). Two states only (SHIPPED / NOT-STARTED) per goal.md R-DEFER-2.
 
 /// Train a model on data, producing a fitted model.
 ///
