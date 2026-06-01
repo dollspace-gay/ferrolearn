@@ -8,6 +8,28 @@
 //! and `f64` data. All steps in a pipeline must use the same float type.
 //! The type parameter defaults to `f64` for backward compatibility.
 //!
+//! ## REQ status (per `.design/core/pipeline.md`, mirrors `sklearn/pipeline.py` @ 1.5.2)
+//!
+//! ferrolearn's `Pipeline` is a minimal subset of sklearn's: sequential
+//! transformer fit→transform chaining + a single final estimator's fit/predict.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (fit→transform chaining + final predict) | SHIPPED | `Fit for Pipeline` (fit each transformer, transform, fit final estimator) mirrors `Pipeline._fit` (`pipeline.py:406`); `Predict for FittedPipeline` mirrors `Pipeline.predict` (`pipeline.py:599`). Non-test consumers: `impl PipelineEstimator for GaussianNB in gaussian.rs`, `impl PipelineEstimator for BernoulliNB in bernoulli.rs`, `impl PipelineTransformer for KernelPCA in kernel_pca.rs`. (critic: fit-then-transform ≡ sklearn fused fit_transform to ≤1.1e-14 on KernelPCA.) |
+//! | REQ-2 (no-final-estimator rejected at fit) | SHIPPED | `Fit for Pipeline` returns `FerroError::InvalidParameter` when the estimator slot is unset; matches sklearn requiring a final predictor for `.predict` (`available_if` at `pipeline.py:549`). |
+//! | REQ-3 (fit_transform/transform/predict_proba/decision_function/score) | NOT-STARTED | blocker #361. `FittedPipeline` exposes only `predict`. |
+//! | REQ-4 (named_steps/get_params/set_params/__getitem__) | NOT-STARTED | blocker #362. Only `step_names()` exists. |
+//! | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | blocker #363. |
+//! | REQ-6 (fit_params / metadata routing) | NOT-STARTED | blocker #364. |
+//! | REQ-7 (make_pipeline auto-naming helper) | NOT-STARTED | blocker #365 (`pipeline.py:1220`). |
+//! | REQ-8 (FeatureUnion) | NOT-STARTED | blocker #366 (`pipeline.py:1329`). |
+//! | REQ-9 (ferray substrate) | NOT-STARTED | blocker #367 — data flow typed on `ndarray::{Array1,Array2}`; cascades (R-SUBSTRATE-4). |
+//!
+//! acto-critic verdict: NO DIVERGENCE FOUND in the implemented surface (chaining,
+//! y-threading, estimator-only predict all match the live sklearn oracle; the
+//! transformer-terminal-pipeline rejection is owned by the missing transform surface,
+//! #361). Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
