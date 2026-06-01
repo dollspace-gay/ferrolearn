@@ -1034,6 +1034,14 @@ const SK_LARS_5_INTERCEPT: f64 = 152.13348416289602;
 /// sklearn active set (nonzero coef indices) for LassoLars(alpha=0.1): [1, 2, 3, 4, 6, 8, 9].
 const SK_LASSO_A01_ACTIVE: [usize; 7] = [1, 2, 3, 4, 6, 8, 9];
 
+/// sklearn `LassoLars(alpha=1.0).fit(X, y).coef_` on diabetes (live oracle).
+#[rustfmt::skip]
+const SK_LASSO_A10: [f64; 10] = [0.0, 0.0, 367.70162582143130, 6.3097026441744966, 0.0, 0.0, 0.0, 0.0, 307.60214746219714, 0.0];
+/// sklearn `LassoLars(alpha=1.0).fit(X, y).intercept_`.
+const SK_LASSO_A10_INTERCEPT: f64 = 152.13348416289602;
+/// sklearn active set (nonzero coef indices) for LassoLars(alpha=1.0): [2, 3, 8].
+const SK_LASSO_A10_ACTIVE: [usize; 3] = [2, 3, 8];
+
 fn diabetes() -> (Array2<f64>, Array1<f64>) {
     let x = Array2::from_shape_vec((442, 10), X_FLAT.to_vec()).unwrap();
     let y = Array1::from_vec(Y_FLAT.to_vec());
@@ -1049,7 +1057,6 @@ fn diabetes() -> (Array2<f64>, Array1<f64>) {
 /// and returns `coef_ ~ [0, -233.09, 527.02, 315.45, 0, -110.93, -289.40, 0,
 /// 479.23, 70.08]`. Tracking: #482.
 #[test]
-#[ignore = "divergence: LassoLars uses forward-stepwise OLS, not the equiangular LARS-Lasso drop path; tracking #482"]
 fn divergence_lasso_lars_coef_alpha_0_1() {
     let (x, y) = diabetes();
     let fitted = LassoLars::<f64>::new().with_alpha(0.1).fit(&x, &y).unwrap();
@@ -1088,7 +1095,6 @@ fn divergence_lasso_lars_coef_alpha_0_1() {
 /// sklearn returns `coef_ ~ [0, 0, 471.01, 136.52, 0, 0, -58.34, 0, 408.02, 0]`.
 /// Tracking: #482.
 #[test]
-#[ignore = "divergence: LassoLars forward-stepwise OLS diverges from the LARS-Lasso path; tracking #482"]
 fn divergence_lasso_lars_coef_alpha_0_5() {
     let (x, y) = diabetes();
     let fitted = LassoLars::<f64>::new().with_alpha(0.5).fit(&x, &y).unwrap();
@@ -1103,6 +1109,43 @@ fn divergence_lasso_lars_coef_alpha_0_5() {
     assert!(
         (fitted.intercept() - SK_LASSO_A05_INTERCEPT).abs() <= 1e-4,
         "intercept diverges: ferrolearn {} vs sklearn {SK_LASSO_A05_INTERCEPT}",
+        fitted.intercept()
+    );
+}
+
+/// Parity (oracle): `ferrolearn_linear::LassoLars::fit` matches sklearn
+/// `LassoLars(alpha=1.0)` on diabetes — a sparser knot than alpha=0.1/0.5,
+/// admitting only [2, 3, 8]. Mirrors `sklearn/linear_model/_least_angle.py:413+`
+/// (`method == "lasso"`). Expected values are the live sklearn 1.5.2 oracle
+/// (R-CHAR-3).
+#[test]
+fn parity_lasso_lars_coef_alpha_1_0() {
+    let (x, y) = diabetes();
+    let fitted = LassoLars::<f64>::new().with_alpha(1.0).fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+
+    let ferro_active: Vec<usize> = coef
+        .iter()
+        .enumerate()
+        .filter(|&(_, &c)| c.abs() > 1e-9)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(
+        ferro_active,
+        SK_LASSO_A10_ACTIVE.to_vec(),
+        "active set diverges: ferrolearn {ferro_active:?} vs sklearn {SK_LASSO_A10_ACTIVE:?}"
+    );
+
+    for (j, &sk) in SK_LASSO_A10.iter().enumerate() {
+        let got = coef[j];
+        assert!(
+            (got - sk).abs() <= 1e-4,
+            "coef[{j}] diverges: ferrolearn {got} vs sklearn {sk}"
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_LASSO_A10_INTERCEPT).abs() <= 1e-4,
+        "intercept diverges: ferrolearn {} vs sklearn {SK_LASSO_A10_INTERCEPT}",
         fitted.intercept()
     );
 }

@@ -191,152 +191,6 @@ pub struct FittedLassoLars<F> {
 // Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Solve the OLS sub-problem on the active columns of `x` for target `y`.
-///
-/// Returns the full-length coefficient vector (inactive entries = 0).
-fn ols_active<F: Float + FromPrimitive + 'static>(
-    x: &Array2<F>,
-    y: &Array1<F>,
-    active: &[usize],
-    n_features: usize,
-) -> Result<Array1<F>, FerroError> {
-    let n_samples = x.nrows();
-    let k = active.len();
-
-    // Build X_active  (n_samples x k).
-    let mut xa = Array2::<F>::zeros((n_samples, k));
-    for (col_idx, &j) in active.iter().enumerate() {
-        for i in 0..n_samples {
-            xa[[i, col_idx]] = x[[i, j]];
-        }
-    }
-
-    // Solve (Xa^T Xa) w_active = Xa^T y  via Cholesky / Gauss fallback.
-    let xat = xa.t();
-    let xtx = xat.dot(&xa);
-    let xty = xat.dot(y);
-
-    let w_active = cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(k, &xtx, &xty))?;
-
-    // Scatter into full-length vector.
-    let mut w = Array1::<F>::zeros(n_features);
-    for (col_idx, &j) in active.iter().enumerate() {
-        w[j] = w_active[col_idx];
-    }
-    Ok(w)
-}
-
-/// Cholesky solve for `A x = b`.
-fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "Cholesky: matrix not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
-        }
-    }
-
-    let mut z = Array1::<F>::zeros(n);
-    for i in 0..n {
-        let mut s = b[i];
-        for k in 0..i {
-            s = s - l[[i, k]] * z[k];
-        }
-        z[i] = s / l[[i, i]];
-    }
-
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = z[i];
-        for k in (i + 1)..n {
-            s = s - l[[k, i]] * x_sol[k];
-        }
-        x_sol[i] = s / l[[i, i]];
-    }
-
-    Ok(x_sol)
-}
-
-/// Gaussian elimination with partial pivoting.
-fn gaussian_solve<F: Float>(
-    n: usize,
-    a: &Array2<F>,
-    b: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let mut aug = Array2::<F>::zeros((n, n + 1));
-    for i in 0..n {
-        for j in 0..n {
-            aug[[i, j]] = a[[i, j]];
-        }
-        aug[[i, n]] = b[i];
-    }
-
-    for col in 0..n {
-        let mut max_val = aug[[col, col]].abs();
-        let mut max_row = col;
-        for row in (col + 1)..n {
-            let v = aug[[row, col]].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-
-        if max_val < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "singular matrix in Gaussian elimination".into(),
-            });
-        }
-
-        if max_row != col {
-            for j in 0..=n {
-                let tmp = aug[[col, j]];
-                aug[[col, j]] = aug[[max_row, j]];
-                aug[[max_row, j]] = tmp;
-            }
-        }
-
-        let pivot = aug[[col, col]];
-        for row in (col + 1)..n {
-            let factor = aug[[row, col]] / pivot;
-            for j in col..=n {
-                let above = aug[[col, j]];
-                aug[[row, j]] = aug[[row, j]] - factor * above;
-            }
-        }
-    }
-
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = aug[[i, n]];
-        for j in (i + 1)..n {
-            s = s - aug[[i, j]] * x_sol[j];
-        }
-        if aug[[i, i]].abs() < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "near-zero pivot in back substitution".into(),
-            });
-        }
-        x_sol[i] = s / aug[[i, i]];
-    }
-
-    Ok(x_sol)
-}
-
 /// Centred data: `(x_centred, y_centred, x_mean, y_mean)`.
 type CentredData<F> = (Array2<F>, Array1<F>, Option<Array1<F>>, Option<F>);
 
@@ -442,7 +296,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let w = lars_path(&x_work, &y_work, max_active, false)?;
+        let w = lars_path(&x_work, &y_work, max_active, false, F::zero())?;
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
 
         Ok(FittedLars {
@@ -452,12 +306,26 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     }
 }
 
-/// Core LARS path computation, shared by [`Lars`] and (via wrapper) [`LassoLars`].
+/// Core LARS path computation, shared by [`Lars`] (`method="lar"`) and
+/// [`LassoLars`] (`method="lasso"`).
 ///
-/// Walks the LARS path for at most `max_steps` steps. If `lasso_modification`
-/// is `true`, applies the Lasso modification (Efron §3.3): when an active
-/// coefficient is about to cross zero on the current equiangular step,
-/// truncate the step and drop that feature from the active set.
+/// Walks the LARS equiangular homotopy path. With `lasso_modification = false`
+/// this is plain Least Angle Regression: at each step add the maximally
+/// correlated feature, move along the equiangular direction until the next
+/// feature joins, and stop after `max_steps` features (`n_nonzero_coefs`).
+///
+/// With `lasso_modification = true` this is the LARS-Lasso homotopy
+/// (`sklearn/linear_model/_least_angle.py` `_lars_path_solver`,
+/// `method == "lasso"`, `:635`–`:895`): in addition to the join step it
+/// computes, for each active variable, the step length at which its
+/// coefficient would cross zero (the Efron §3.3 drop length, `z = -coef /
+/// least_squares`, `:817`). If a coefficient crosses zero before the next
+/// join, the step is truncated at that length (`gamma_ = z_pos`, `:827`), the
+/// variable is dropped from the active set after the coefficient update
+/// (`:855`–`:894`) and **no** new variable is added on the next iteration
+/// (the `if not drop` guard, `:673`). When `alpha_min > 0` the path stops once
+/// the maximum correlation `C / n_samples` drops to `alpha_min`, interpolating
+/// the final coefficients at exactly `alpha_min` (`:657`–`:669`).
 ///
 /// Returns the final coefficient vector. `x` and `y` are assumed centred.
 fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
@@ -465,52 +333,94 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
     y: &Array1<F>,
     max_steps: usize,
     lasso_modification: bool,
+    alpha_min: F,
 ) -> Result<Array1<F>, FerroError> {
     let (n_samples, n_features) = x.dim();
+    let n_f = F::from(n_samples).unwrap_or_else(F::one);
     let mut beta = Array1::<F>::zeros(n_features);
+    // Coefficients at the start of the current iteration (sklearn `prev_coef`).
+    let mut prev_beta = Array1::<F>::zeros(n_features);
     let mut mu = Array1::<F>::zeros(n_samples);
     let mut active: Vec<usize> = Vec::with_capacity(max_steps.max(1));
     let mut sign_active: Vec<F> = Vec::with_capacity(max_steps.max(1));
     let mut in_active = vec![false; n_features];
 
     let eps = F::from(1e-12).unwrap_or_else(F::epsilon);
+    // sklearn uses np.finfo(np.float32).eps as the alpha equality tolerance
+    // (`equality_tolerance`, `:629`).
+    let eq_tol = F::from(f32::EPSILON).unwrap_or_else(F::epsilon);
+
+    // `drop` is true when the previous iteration truncated the step at a
+    // zero-crossing and removed a variable; on such an iteration no new
+    // variable is added (sklearn `if not drop:` guard, `:673`).
+    let mut drop = false;
+    // `prev_alpha` = C / n_samples from the previous iteration, used for the
+    // alpha_min interpolation (`:664`).
+    let mut prev_alpha = F::zero();
 
     let mut step = 0;
     while step < max_steps {
-        // Current correlations c = X^T (y - mu).
+        // Current correlations c = X^T (y - mu) and the maximum |correlation|.
         let residual = y - &mu;
         let mut corr = Array1::<F>::zeros(n_features);
         for j in 0..n_features {
             corr[j] = x.column(j).dot(&residual);
         }
-
-        // Maximum absolute correlation among non-active features (or among
-        // active features when starting from a Lasso-modification drop).
         let mut c_max = F::zero();
-        let mut j_star: Option<usize> = None;
         for j in 0..n_features {
-            if in_active[j] {
-                continue;
-            }
             let ac = corr[j].abs();
             if ac > c_max {
                 c_max = ac;
-                j_star = Some(j);
             }
+        }
+
+        // alpha = C / n_samples (sklearn `:657`). For LARS-Lasso, stop once
+        // alpha drops to alpha_min, interpolating the final coefficients at
+        // exactly alpha_min (`:658`–`:669`).
+        let alpha = c_max / n_f;
+        if lasso_modification && alpha <= alpha_min + eq_tol {
+            if (alpha - alpha_min).abs() > eq_tol && step > 0 {
+                let denom = prev_alpha - alpha;
+                if denom.abs() > eps {
+                    let ss = (prev_alpha - alpha_min) / denom;
+                    // beta = prev_beta + ss * (beta - prev_beta).
+                    for j in 0..n_features {
+                        beta[j] = prev_beta[j] + ss * (beta[j] - prev_beta[j]);
+                    }
+                }
+            }
+            break;
         }
         if c_max <= eps {
             break;
         }
-        if let Some(j) = j_star {
-            active.push(j);
-            sign_active.push(if corr[j] >= F::zero() {
-                F::one()
-            } else {
-                -F::one()
-            });
-            in_active[j] = true;
-        } else {
-            break;
+
+        // Add the maximally correlated inactive feature, unless the previous
+        // iteration dropped a variable (sklearn `if not drop:`, `:673`).
+        if !drop {
+            let mut j_star: Option<usize> = None;
+            let mut best = F::zero();
+            for j in 0..n_features {
+                if in_active[j] {
+                    continue;
+                }
+                let ac = corr[j].abs();
+                if ac > best {
+                    best = ac;
+                    j_star = Some(j);
+                }
+            }
+            if let Some(j) = j_star {
+                active.push(j);
+                sign_active.push(if corr[j] >= F::zero() {
+                    F::one()
+                } else {
+                    -F::one()
+                });
+                in_active[j] = true;
+            } else if active.is_empty() {
+                break;
+            }
         }
 
         // Equiangular direction. Let X_A be the active columns flipped to
@@ -583,15 +493,18 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
         let mut w_a = u.clone();
         w_a.mapv_inplace(|v| v * a_a);
 
+        // sklearn's signed equiangular weights: least_squares[idx] =
+        // sign_active[idx] * w_a[idx] (it folds the sign back in, `:766`).
+        let least_squares: Vec<F> = (0..k_a).map(|idx| sign_active[idx] * w_a[idx]).collect();
+
         // Equiangular direction in sample space: u_vec = X_A @ w_a.
         let u_vec = x_a.dot(&w_a);
 
-        // Angles a_k = X[:, k]^T u_vec for each non-active feature.
-        // Step size gamma chosen so that one new feature joins the active set:
-        //   gamma = min over k not in A of:
-        //       (C_max - c_k) / (A_A - a_k)  if positive,
-        //       (C_max + c_k) / (A_A + a_k)  if positive.
-        let mut gamma = c_max / a_a; // last-step OLS direction
+        // Join step: gamma chosen so that one new feature joins the active set:
+        //   gamma = min over k not in A of the positive ratios
+        //       (C_max - c_k) / (A_A - a_k),  (C_max + c_k) / (A_A + a_k)
+        // (sklearn g1/g2, `:808`–`:813`).
+        let mut gamma = c_max / a_a; // last-step / full-OLS direction
         if active.len() < n_features {
             let mut min_g = F::infinity();
             for j in 0..n_features {
@@ -615,51 +528,59 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
             }
         }
 
-        // Lasso modification: check whether any active beta will cross zero.
-        let mut lasso_drop: Option<usize> = None;
+        // Lasso modification (Efron §3.3): the step length at which an active
+        // coefficient crosses zero is z = -beta[j] / least_squares[idx]
+        // (sklearn `:817`). If the smallest positive z is below the join step,
+        // truncate the step there and mark the variable for dropping
+        // (`:819`–`:828`).
+        let mut drop_idx: Option<usize> = None;
+        drop = false;
         if lasso_modification {
-            let mut min_drop = F::infinity();
+            let mut z_pos = F::infinity();
             for (idx, &j) in active.iter().enumerate() {
-                let s = sign_active[idx];
-                let direction_j = s * w_a[idx];
-                if direction_j.abs() <= eps {
+                let ls = least_squares[idx];
+                if ls.abs() <= eps {
                     continue;
                 }
-                // beta[j] becomes 0 when gamma_drop = -beta[j] / direction_j.
-                let g_drop = -beta[j] / direction_j;
-                if g_drop > eps && g_drop < min_drop {
-                    min_drop = g_drop;
-                    lasso_drop = Some(idx);
+                let z = -beta[j] / ls;
+                if z > eps && z < z_pos {
+                    z_pos = z;
+                    drop_idx = Some(idx);
                 }
             }
-            if lasso_drop.is_some() {
-                if min_drop < gamma {
-                    gamma = min_drop;
+            if let Some(_idx) = drop_idx {
+                if z_pos < gamma {
+                    gamma = z_pos;
+                    drop = true;
                 } else {
-                    lasso_drop = None;
+                    drop_idx = None;
                 }
             }
         }
 
-        // Update beta along equiangular direction.
+        // Record the iteration-start coefficients, then update beta and mu.
+        prev_beta.assign(&beta);
         for (idx, &j) in active.iter().enumerate() {
-            beta[j] = beta[j] + gamma * sign_active[idx] * w_a[idx];
+            beta[j] = beta[j] + gamma * least_squares[idx];
         }
         mu = mu + &(u_vec * gamma);
+        prev_alpha = alpha;
 
-        if let Some(drop_idx) = lasso_drop {
-            let j = active[drop_idx];
-            in_active[j] = false;
+        // Drop the zero-crossing variable from the active set (sklearn
+        // `:855`–`:894`): remove it, force its coefficient to exactly zero,
+        // and do not add a new variable on the next iteration (`drop` stays
+        // true so the `if not drop:` guard is skipped).
+        if drop && let Some(idx) = drop_idx {
+            let j = active[idx];
             beta[j] = F::zero();
-            active.remove(drop_idx);
-            sign_active.remove(drop_idx);
+            in_active[j] = false;
+            active.remove(idx);
+            sign_active.remove(idx);
         }
 
         step += 1;
-        if active.is_empty() {
-            // Pathological: dropped the only active feature on a Lasso
-            // step; allow the next iteration to re-add a feature.
-            continue;
+        if active.is_empty() && !drop {
+            break;
         }
     }
 
@@ -678,10 +599,17 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
     /// Fit the Lasso-LARS model.
     ///
-    /// Like LARS, but features whose coefficients cross zero during the OLS
-    /// step are removed from the active set, enforcing an implicit L1
-    /// penalty. The iteration stops when the maximum absolute correlation
-    /// with the residual drops below `alpha`.
+    /// Routes through the equiangular LARS-Lasso homotopy path
+    /// ([`lars_path`] with `lasso_modification = true`, `alpha_min = alpha`),
+    /// mirroring sklearn `_lars_path_solver` (`method == "lasso"`,
+    /// `sklearn/linear_model/_least_angle.py:413+`). At each knot the standard
+    /// LARS join step competes with the Efron §3.3 drop step (the length at
+    /// which an active coefficient crosses zero); the smaller is taken, and on
+    /// a drop the crossing variable leaves the active set (its coefficient set
+    /// to exactly zero) before the direction is recomputed. The path stops
+    /// when the maximum correlation `C / n_samples` reaches `alpha`,
+    /// interpolating the final coefficients at exactly `alpha`. This minimizes
+    /// the Lasso objective `(1/(2n))||y - Xw||² + alpha·||w||₁`.
     ///
     /// # Errors
     ///
@@ -689,7 +617,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::InsufficientSamples`] — zero samples.
     /// - [`FerroError::InvalidParameter`] — `alpha` is negative.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLassoLars<F>, FerroError> {
-        let (n_samples, n_features) = validate_input(x, y, "LassoLars")?;
+        let (_n_samples, _n_features) = validate_input(x, y, "LassoLars")?;
 
         if self.alpha < F::zero() {
             return Err(FerroError::InvalidParameter {
@@ -698,68 +626,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let mut active: Vec<usize> = Vec::new();
-        let mut in_active = vec![false; n_features];
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut residual = y_work.clone();
-
-        for _step in 0..self.max_iter {
-            // Check stopping criterion: max |X^T r| / n <= alpha.
-            let mut best_j = None;
-            let mut best_corr = F::zero();
-            for (j, &is_active) in in_active.iter().enumerate() {
-                if is_active {
-                    continue;
-                }
-                let corr = x_work.column(j).dot(&residual).abs() / n_f;
-                if corr > best_corr {
-                    best_corr = corr;
-                    best_j = Some(j);
-                }
-            }
-
-            // If maximum correlation is below alpha, stop.
-            if best_corr <= self.alpha && !active.is_empty() {
-                break;
-            }
-
-            // Add best feature (if any remain).
-            if let Some(j) = best_j {
-                active.push(j);
-                in_active[j] = true;
-            } else {
-                break;
-            }
-
-            // OLS on active set.
-            let w_new = ols_active(&x_work, &y_work, &active, n_features)?;
-
-            // Drop features that crossed zero (Lasso modification).
-            let mut dropped = false;
-            for idx in (0..active.len()).rev() {
-                let feat = active[idx];
-                // A sign change (or zero) means it crossed zero.
-                if w[feat] != F::zero() && w_new[feat].signum() != w[feat].signum() {
-                    active.remove(idx);
-                    in_active[feat] = false;
-                    dropped = true;
-                }
-            }
-
-            if dropped && !active.is_empty() {
-                // Re-solve OLS without the dropped features.
-                w = ols_active(&x_work, &y_work, &active, n_features)?;
-            } else {
-                w = w_new;
-            }
-
-            // Update residual.
-            residual = &y_work - x_work.dot(&w);
-        }
-
+        let w = lars_path(&x_work, &y_work, self.max_iter, true, self.alpha)?;
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
 
         Ok(FittedLassoLars {

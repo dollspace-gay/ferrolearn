@@ -16,8 +16,9 @@ the active feature with maximal absolute correlation is added, then the model
 moves along the equiangular direction until a new feature ties for maximal
 correlation. `LassoLars` adds the Efron §3.3 drop modification to recover the
 Lasso solution path. ferrolearn's `Lars` reproduces sklearn `Lars.coef_` exactly
-on the diabetes dataset; `LassoLars` currently uses a forward-stepwise OLS
-approximation that diverges from sklearn and is pinned NOT-STARTED.
+on the diabetes dataset; `LassoLars` now routes through the same equiangular
+`fn lars_path` with the §3.3 drop condition and `alpha_min` stopping, reproducing
+sklearn `LassoLars.coef_` to 1e-4 (REQ-2 SHIPPED).
 
 ## Requirements
 - REQ-1: `Lars` with `method="lar"` produces `coef_` / `intercept_` matching
@@ -44,11 +45,11 @@ approximation that diverges from sklearn and is pinned NOT-STARTED.
   `[0.0, -74.9105, 511.3522, 234.1487, 0.0, 0.0, -169.7071, 0.0, 450.666, 0.0]`
   equals sklearn `[0.0, -74.9105, 511.3522, 234.1487, 0.0, 0.0, -169.7071, 0.0, 450.666, 0.0]`
   (printed to 4 dp), `intercept_ = 152.133484`.
-- AC-2: `LassoLars(alpha=0.1)` `coef_` matches sklearn within `1e-6` on diabetes.
-  Currently FAILS: ferrolearn
-  `[0.0, -233.091, 527.0189, 315.4471, 0.0, -110.9251, -289.404, 0.0, 479.2267, 70.0792]`
-  vs sklearn `[0.0, -155.3431, 517.2162, 275.0872, -52.552, 0.0, -210.1395, 0.0, 483.9172, 33.6622]`
-  (different active set: ferrolearn enters feature 4, sklearn enters feature 9).
+- AC-2: `LassoLars(alpha=0.1)` `coef_` matches sklearn within `1e-4` on diabetes.
+  Verified (SHIPPED): ferrolearn matches sklearn
+  `[0.0, -155.3431, 517.2162, 275.0872, -52.552, 0.0, -210.1395, 0.0, 483.9172, 33.6622]`
+  with active set `[1, 2, 3, 4, 6, 8, 9]` (the §3.3 drop path admits feature 4
+  then later interpolates at `alpha_min`).
 - AC-3: `predict` output length equals the number of rows of `X` and equals
   `X @ coef_ + intercept_`.
 - AC-4: `fit_intercept=false` yields `intercept_ == 0`; `coefficients()` length
@@ -63,7 +64,7 @@ approximation that diverges from sklearn and is pinned NOT-STARTED.
 | REQ | Status | Evidence |
 |---|---|---|
 | REQ-1 (Lars lar path) | SHIPPED | impl `fn lars_path in lars.rs` (called by `impl Fit for Lars` `fn fit`) walks the equiangular direction — `let u_vec = x_a.dot(&w_a)` then the step-size `gamma = min over k of (c_max - corr[j])/(a_a - a_j)` — mirroring sklearn `_lars_path_solver` (`sklearn/linear_model/_least_angle.py:635` while-loop, argmax-correlation + equiangular vector `u = np.dot(X.T[n_active:], eq_dir)`). Non-test consumer: crate re-export `pub use lars::{..., Lars} in lib.rs` (boundary public API per R-DEFER-5/S5). Verification: live oracle — ferrolearn `coef_ = [0, -74.9105, 511.3522, 234.1487, 0,0, -169.7071, 0, 450.666, 0]`, `intercept_ = 152.133484` equals sklearn `Lars(n_nonzero_coefs=5)` exactly on diabetes. |
-| REQ-2 (LassoLars lasso path) | NOT-STARTED | open prereq blocker #482. `impl Fit for LassoLars` `fn fit` uses forward-stepwise OLS (`fn ols_active in lars.rs`) with a sign-flip drop heuristic, not the equiangular LARS-lasso path used by `fn lars_path` (whose `lasso_modification` branch is never reached by `LassoLars::fit`). Diverges from sklearn `LassoLars` on diabetes (alpha=0.1: feature 4 enters in ferrolearn, feature 9 in sklearn; coef -233 vs -155). |
+| REQ-2 (LassoLars lasso path) | SHIPPED | `impl Fit for LassoLars` `fn fit` now routes through `fn lars_path in lars.rs` with `lasso_modification = true` and `alpha_min = self.alpha`, implementing the equiangular LARS-Lasso homotopy with the Efron §3.3 drop condition: at each knot the join step competes with the zero-crossing step `z = -beta[j] / least_squares[idx]` (mirroring sklearn `_lars_path_solver`, `method == "lasso"`, `sklearn/linear_model/_least_angle.py:817` `z = -coef[active] / (least_squares + tiny32)`, truncation `gamma_ = z_pos` `:827`, the `if not drop:` add-guard `:673`, and the alpha_min interpolation `:657`–`:669`). The forward-stepwise OLS path (`fn ols_active`) is removed. Non-test consumer: crate re-export `pub use lars::{LassoLars, FittedLassoLars} in lib.rs` (boundary public API per R-DEFER-5/S5); `impl FittedPipelineEstimator for FittedLassoLars` `fn predict_pipeline`. Verification: live sklearn oracle — diabetes alpha=0.1 active set [1,2,3,4,6,8,9] with `coef_[1]=-155.34`, alpha=0.5 `coef_[2]=471.01`, alpha=1.0 active [2,3,8] all match sklearn within 1e-4 (`tests/divergence_lasso_lars_path.rs`: `divergence_lasso_lars_coef_alpha_0_1`, `divergence_lasso_lars_coef_alpha_0_5`, `parity_lasso_lars_coef_alpha_1_0`). |
 | REQ-3 (predict) | SHIPPED | impl `fn predict in lars.rs` for `FittedLars` and `FittedLassoLars` computes `Ok(x.dot(&self.coefficients) + self.intercept)`, mirroring sklearn `LinearModel._decision_function` (`sklearn/linear_model/_base.py`, `X @ self.coef_.T + self.intercept_`). Non-test consumer: `impl FittedPipelineEstimator for FittedLars` `fn predict_pipeline` calls `self.predict(x)` (pipeline boundary). Verification: `cargo test -p ferrolearn-linear` (`test_lars_predict`, `test_lasso_lars_predict`). |
 | REQ-4 (fit_intercept / HasCoefficients) | SHIPPED | impl `fn center_data in lars.rs` subtracts column/target means when `fit_intercept`, and `fn compute_intercept in lars.rs` returns `*ym - xm.dot(w)`, mirroring sklearn `_preprocess_data` + `_set_intercept` (`sklearn/linear_model/_base.py`). `impl HasCoefficients for FittedLars` exposes `coefficients()` / `intercept()`. Non-test consumer: crate re-export `pub use lars::{FittedLars, ...} in lib.rs`; `HasCoefficients` is the introspection boundary trait. Verification: `cargo test -p ferrolearn-linear` (`test_lars_no_intercept` → `intercept_ == 0`, `test_lars_has_coefficients`). |
 | REQ-5 (coef_path_/alphas_/active_/n_iter_) | NOT-STARTED | open prereq blocker #483. `fn lars_path in lars.rs` returns only the final `Array1 beta`; `FittedLars` stores just `coefficients` + `intercept`. sklearn `Lars._fit` (`sklearn/linear_model/_least_angle.py:1096`) records `self.alphas_`, `self.active_`, `self.coef_path_`, `self.n_iter_` — none are exposed here. |
@@ -92,26 +93,28 @@ mirroring sklearn's Cholesky solve of `G_a w = sign_active` and
 (4) compute the step size `gamma` as the minimum positive ratio
 `(c_max ∓ corr[j])/(a_a ∓ a_j)` over inactive features (the LARS join condition),
 matching sklearn's `gamma_hat = min(...)`; (5) update `beta` and `mu` along the
-direction. The `lasso_modification` branch implements the Efron §3.3 drop (a beta
-crossing zero truncates the step), but `LassoLars::fit` does **not** call this
-path (see REQ-2).
+direction. The `lasso_modification` branch implements the Efron §3.3 drop and the
+`alpha_min` stopping/interpolation; both `Lars::fit` and `LassoLars::fit` call it.
 
 `Lars::fit` centers data (`fn center_data`), runs `lars_path(.., max_active,
-false)` with `max_active = n_nonzero_coefs.unwrap_or(n_features)`, then sets the
-intercept via `fn compute_intercept`. This reproduces sklearn exactly on
+false, 0)` with `max_active = n_nonzero_coefs.unwrap_or(n_features)`, then sets
+the intercept via `fn compute_intercept`. This reproduces sklearn exactly on
 diabetes (REQ-1 / AC-1).
 
-**LassoLars divergence.** `LassoLars::fit` runs an independent loop: add the
-feature with the largest `|X^T r|/n`, solve OLS on the active set
-(`fn ols_active`), drop features whose coefficient changed sign, re-solve, and
-stop when `max |X^T r|/n <= alpha`. This is forward-stepwise OLS, not the
-equiangular Lasso-LARS path. The stopping threshold is correctly the LARS alpha
-(`max|X^T r|/n`, matching sklearn `alphas[n_iter] = C / n_samples`), but the
-coefficient trajectory between knots is wrong, so `coef_` diverges (REQ-2,
-blocker #482).
+**LassoLars path (SHIPPED).** `LassoLars::fit` centers data and calls
+`lars_path(.., self.max_iter, true, self.alpha)`. Inside, each knot competes the
+LARS join step against the Efron §3.3 drop step `z = -beta[j] /
+least_squares[idx]` (sklearn `:817`); the smaller is taken. On a drop the step is
+truncated (`gamma_ = z_pos`, `:827`), the crossing variable leaves the active set
+with its coefficient forced to exactly zero (`:855`–`:894`), and no new variable
+is added on the following iteration (the `if not drop:` guard, `:673`). The path
+stops once `alpha = C / n_samples` reaches `alpha_min = self.alpha`, interpolating
+`beta = prev_beta + ss·(beta - prev_beta)` at exactly `alpha_min` (`:657`–`:669`).
+This minimizes `(1/(2n))||y - Xw||² + alpha·||w||₁` and reproduces sklearn
+`LassoLars.coef_` on diabetes to 1e-4 (REQ-2 / AC-2, closes #482).
 
 **Invariants.** Inactive coefficients stay exactly zero (scatter into a
-zero-initialized full-length vector in `fn ols_active` and `fn lars_path`).
+zero-initialized full-length vector in `fn lars_path`).
 `validate_input` rejects sample-count mismatch (`ShapeMismatch`) and zero samples
 (`InsufficientSamples`); `Lars::fit` rejects `n_nonzero_coefs > n_features`
 (`InvalidParameter`); `LassoLars::fit` rejects negative `alpha`.
