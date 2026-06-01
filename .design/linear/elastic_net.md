@@ -1,0 +1,89 @@
+# ElasticNet (combined L1 + L2 regularized linear regression)
+
+<!--
+tier: 3-component
+status: draft
+baseline-commit: 4a2011eb2956a48f7c5fd3d05f2619e20577b9cd
+upstream-paths:
+  - sklearn/linear_model/_coordinate_descent.py
+  - sklearn/linear_model/_cd_fast.pyx
+-->
+
+## Summary
+
+This module mirrors scikit-learn's `ElasticNet` estimator (`sklearn/linear_model/_coordinate_descent.py:729`, `class ElasticNet(MultiOutputMixin, RegressorMixin, LinearModel)`), a linear model fit by coordinate descent with soft-thresholding that minimizes a blended L1/L2 objective (documented at `_coordinate_descent.py:734-736`):
+
+```text
+(1 / (2 * n_samples)) * ||y - Xw||^2_2
+    + alpha * l1_ratio * ||w||_1
+    + 0.5 * alpha * (1 - l1_ratio) * ||w||^2_2
+```
+
+In scikit-learn the production solver is the Cython `enet_coordinate_descent` in `_cd_fast.pyx`, driven via `enet_path` which splits the penalty into `l1_reg = alpha * l1_ratio * n_samples` and `l2_reg = alpha * (1 - l1_ratio) * n_samples` (`_coordinate_descent.py:655-656`). `Lasso` is `ElasticNet(l1_ratio=1.0)` — see the companion `.design/linear/lasso.md`, which documents the shared cyclic-CD soft-threshold pattern; ElasticNet adds the L2 term to the per-coordinate denominator. ferrolearn implements the single-output, dense, cyclic-coordinate-descent core directly in `elastic_net.rs` (`ElasticNet<F>` / `FittedElasticNet<F>`); the public boundary type is exposed to Python as `_RsElasticNet` and reused internally by `ElasticNetCV`.
+
+## Requirements
+
+- REQ-1: Coordinate-descent ElasticNet fit at the `(1 / (2 * n_samples))` objective with the correct L1/L2 split — `alpha_l1 = alpha * l1_ratio`, `alpha_l2 = alpha * (1 - l1_ratio)`, producing `coef_` / `intercept_` consistent with sklearn's `alpha`/`l1_ratio`/`n_samples` scaling.
+- REQ-2: `predict` computes `X @ coef_ + intercept_`.
+- REQ-3: `fit_intercept` honored, including `fit_intercept=False` (no centering, zero intercept).
+- REQ-4: `l1_ratio` mixing — `l1_ratio = 1` → Lasso (pure L1); `l1_ratio = 0` → Ridge (pure L2); `0 < l1_ratio < 1` → combined L1 + L2.
+- REQ-5: L1 sparsity via soft-thresholding — coefficients driven exactly to `0.0` when the L1 term dominates.
+- REQ-6: `HasCoefficients` introspection exposes `coef_` (slice) and `intercept_` (scalar).
+- REQ-7: `alpha` / `l1_ratio` validation — `alpha >= 0`, `l1_ratio in [0, 1]` (closed-both, matching the `ElasticNet` class), plus shape / empty-input guards.
+- REQ-8: `positive=True` — force coefficients to be non-negative.
+- REQ-9: `warm_start=True` — reuse the previous solution as CD initialization.
+- REQ-10: `selection='random'` + `random_state` — random coordinate selection.
+- REQ-11: `precompute` — Gram-matrix coordinate-descent path.
+- REQ-12: `n_iter_` and `dual_gap_` fitted attributes.
+- REQ-13: Dual-gap stopping criterion — relative coefficient change AND dual gap `< tol * ||y||^2 / n_samples`, matching `_cd_fast.pyx` / the `ElasticNet` Notes.
+- REQ-14: `MultiTaskElasticNet` (multi-output L1/L21 mixed-norm) — separate estimator.
+- REQ-substrate: ferray array/linalg substrate (currently `ndarray`).
+
+## Acceptance criteria
+
+- AC-1: For `X = [[1],[2],[3],[4],[5]]`, `y = [3,5,7,9,11]`, `alpha=0.1`, `l1_ratio=0.5`, the fitted `coef_[0]` and `intercept_` match `sklearn.linear_model.ElasticNet(alpha=0.1, l1_ratio=0.5)` (`coef_ ≈ 1.9268`, `intercept_ ≈ 1.2195`) within a loose tolerance (ferrolearn and sklearn use different stopping criteria — see REQ-13).
+- AC-2: `predict` on the training matrix returns a length-`n_samples` vector equal to `X @ coef_ + intercept_`.
+- AC-3: With `fit_intercept=false`, `intercept_ == 0.0` exactly.
+- AC-4: With `l1_ratio = 1`, ElasticNet reproduces the Lasso solution (`coef_[0] ≈ 2.0`, `intercept_ ≈ 1.0` on the linear fixture); with `l1_ratio = 0` and `alpha = 0` it recovers OLS.
+- AC-5: A feature column orthogonal to the residual under a sufficiently large `alpha` with `l1_ratio = 1` receives `coef_ == 0.0` exactly (bit-exact zero).
+- AC-6: `coefficients()` length equals `n_features`; `intercept()` returns the scalar bias.
+- AC-7: `alpha < 0` returns `FerroError::InvalidParameter`; `l1_ratio` outside `[0, 1]` returns `FerroError::InvalidParameter`; `n_samples == 0` returns `FerroError::InsufficientSamples`; mismatched `y` length returns `FerroError::ShapeMismatch`. `l1_ratio = 0` is accepted (pure L2), matching the sklearn `ElasticNet` class.
+
+## REQ status table
+
+| REQ | Status | Evidence |
+|---|---|---|
+| REQ-1 (CD fit + L1/L2 split) | SHIPPED | impl `Fit::fit for ElasticNet<F> in elastic_net.rs` runs cyclic CD: centers when `fit_intercept`, precomputes `col_norms[j] = X_jᵀX_j / n` (`col.dot(&col) / n_f`), splits the penalty `alpha_l1 = self.alpha * self.l1_ratio` / `alpha_l2 = self.alpha * (F::one() - self.l1_ratio)`, forms `denominators[j] = col_norm + alpha_l2`, and updates `w_new = soft_threshold(X_jᵀr / n, alpha_l1) / denominators[j]`. This matches sklearn `_coordinate_descent.py:655-656` (`l1_reg = alpha * l1_ratio * n_samples`, `l2_reg = alpha * (1 - l1_ratio) * n_samples`) fed to `_cd_fast.pyx`, which works on the `n_samples`-scaled objective: ferrolearn's per-`n` form `soft_threshold(X_jᵀr/n, alpha·l1_ratio) / (X_jᵀX_j/n + alpha·(1-l1_ratio))` equals sklearn's `soft_threshold(X_jᵀr, alpha·l1_ratio·n) / (X_jᵀX_j + alpha·(1-l1_ratio)·n)` (the `1/n` cancels in numerator and denominator), so both target the identical `(1/2n)`-scaled objective at `:734-736`. Non-test consumer: `ferrolearn-python/src/regressors.rs` (`RsElasticNet::fit` calls `ferrolearn_linear::ElasticNet::<f64>::new().with_alpha(..).with_l1_ratio(..)...fit`); also `elastic_net_cv.rs` (`Fit::fit for ElasticNetCV` constructs `ElasticNet::<F>::new()` per fold and for the final refit). Verification: `python3 -c "from sklearn.linear_model import ElasticNet; ...; ElasticNet(alpha=0.1, l1_ratio=0.5).fit(X,y)" → coef≈1.9268, intercept≈1.2195`; `cargo test -p ferrolearn-linear --lib elastic_net` → 30 passed, 0 failed. |
+| REQ-2 (predict) | SHIPPED | impl `Predict::predict for FittedElasticNet<F> in elastic_net.rs` computes `x.dot(&self.coefficients) + self.intercept`; shape-guards on `n_features`. Non-test consumer: `RsElasticNet::predict in regressors.rs`; also `FittedPipelineEstimator::predict_pipeline for FittedElasticNet`. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_predict_correct_length`, `test_predict_feature_mismatch`). |
+| REQ-3 (fit_intercept) | SHIPPED | impl `Fit::fit for ElasticNet<F> in elastic_net.rs` branches on `self.fit_intercept`: when true it centers `x`/`y` and recovers the intercept via `compute_intercept` (`ȳ - x̄·w`, mirrors sklearn `_preprocess_data` + `LinearModel._set_intercept`); when false it skips centering and `compute_intercept` returns `F::zero()`. `with_fit_intercept` builder + `RsElasticNet` `fit_intercept` field thread the flag through. Default `true` matches sklearn `_coordinate_descent.py:770`. Non-test consumer: `RsElasticNet::new`/`fit in regressors.rs` (signature default `fit_intercept=true`). Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_no_intercept` asserts `intercept_ == 0`). |
+| REQ-4 (l1_ratio mixing) | SHIPPED | impl `Fit::fit for ElasticNet<F> in elastic_net.rs` derives both penalty strengths from `l1_ratio`: at `l1_ratio = 1`, `alpha_l2 = 0` → the denominator reduces to `col_norm` and the update is the pure-L1 Lasso step (`Lasso = ElasticNet(l1_ratio=1)`, sklearn `:453`); at `l1_ratio = 0`, `alpha_l1 = 0` → `soft_threshold(·, 0)` is the identity, leaving the closed-form ridge step `X_jᵀr/n / (col_norm + alpha)` (pure L2, sklearn docstring `:766`); intermediate values blend both. Non-test consumer: `RsElasticNet` exposes the `l1_ratio` ctor param (default `0.5`) to Python; `ElasticNetCV` sweeps `l1_ratio` candidates per fold. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_lasso_limit_l1_ratio_one`, `test_ridge_limit_l1_ratio_zero`, `test_higher_alpha_shrinks_more`). |
+| REQ-5 (L1 sparsity) | SHIPPED | impl `fn soft_threshold in elastic_net.rs` returns `F::zero()` inside the threshold band, so when `alpha_l1 > 0` the CD loop drives coefficients to bit-exact `0.0` — sklearn's exact-sparsity contract from soft-thresholding in `_cd_fast.pyx`. Non-test consumer: `RsElasticNet` exposes the resulting sparse `coef_` to Python. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_sparsity_with_high_l1_ratio` asserts `coef_[1] == coef_[2] == 0.0` at `epsilon = 1e-10`; `test_soft_threshold_*`). |
+| REQ-6 (HasCoefficients) | SHIPPED | impl `HasCoefficients<F> for FittedElasticNet<F> in elastic_net.rs` (`coefficients(&self) -> &Array1<F>`, `intercept(&self) -> F`). Non-test consumer: `RsElasticNet::coef_`/`intercept_` getters in `regressors.rs` call `fitted.coefficients()`/`fitted.intercept()` to expose the sklearn `coef_`/`intercept_` attributes to Python. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_has_coefficients_length`). |
+| REQ-7 (alpha / l1_ratio / input validation) | SHIPPED | impl `Fit::fit for ElasticNet<F> in elastic_net.rs` rejects `alpha < F::zero()` with `FerroError::InvalidParameter{name:"alpha"}` (sklearn `_parameter_constraints` `"alpha": [Interval(Real, 0, None, closed="left")]`, `:883`), rejects `l1_ratio < 0 || l1_ratio > 1` with `InvalidParameter{name:"l1_ratio"}` (sklearn `"l1_ratio": [Interval(Real, 0, 1, closed="both")]`, `:884`), guards `n_samples != y.len()` (`ShapeMismatch`) and `n_samples == 0` (`InsufficientSamples`). `l1_ratio = 0` is ACCEPTED and runs the pure-L2 path — this MATCHES the sklearn `ElasticNet` class (closed-both constraint at `:884`; docstring `:766` "For `l1_ratio = 0` the penalty is an L2 penalty"). The `l1_ratio == 0` `ValueError` at `_coordinate_descent.py:140` lives inside `_alpha_grid` (automatic alpha-grid generation) and fires only on the CV/path code, NOT in `ElasticNet.fit`; that constraint is owned by `elastic_net_cv.rs`, not this module. Non-test consumer: `RsElasticNet::fit` propagates the error as `PyValueError`. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`test_negative_alpha_error`, `test_l1_ratio_out_of_range_error`, `test_shape_mismatch_error`); live oracle `ElasticNet(alpha=1.0, l1_ratio=0.0).fit(X,y)` → `coef≈[1.333]`, no error. |
+| REQ-8 (positive=True) | NOT-STARTED | open prereq blocker #407 (shared with Lasso — identical CD-core gap). No `positive` field or non-negativity clamp; sklearn ctor `positive=False` (`_coordinate_descent.py:800`) clips `w[ii]` to `>= 0` in `_cd_fast.pyx`. |
+| REQ-9 (warm_start) | NOT-STARTED | open prereq blocker #408 (shared with Lasso). `Fit::fit` always re-initializes `w` to zeros; sklearn ctor `warm_start=False` (`_coordinate_descent.py:795`) reuses prior `coef_` as CD init. |
+| REQ-10 (selection='random' + random_state) | NOT-STARTED | open prereq blocker #409 (shared with Lasso). Solver iterates strictly cyclically `for j in 0..n_features`; sklearn supports `selection='random'` with `random_state`-seeded picks (`_coordinate_descent.py:809`, `_cd_fast.pyx`). |
+| REQ-11 (precompute / Gram) | NOT-STARTED | open prereq blocker #410 (shared with Lasso). No Gram-matrix path; sklearn ctor `precompute=False` (`_coordinate_descent.py:774`) can run CD on a precomputed `XᵀX` (`cd_fast.enet_coordinate_descent_gram`, `:683`). |
+| REQ-12 (n_iter_ / dual_gap_) | NOT-STARTED | open prereq blocker #417. `FittedElasticNet<F>` stores only `coefficients`/`intercept`; sklearn exposes `n_iter_` (`:827`) and `dual_gap_` (`:831`). `dual_gap_` is unavailable because ferrolearn computes no dual gap (REQ-13, #412). |
+| REQ-13 (dual-gap stopping) | NOT-STARTED | open prereq blocker #412 (shared with Lasso — identical stopping-criterion gap). ferrolearn stops on absolute `max_change < self.tol` (max coefficient change). sklearn (`ElasticNet` Notes `:859-863`, `_cd_fast.pyx`) stops on relative `max|Δw_j| < tol·max|w_j|` AND then the principled dual gap `< tol·||y||²/n_samples`. These differ → at a fixed `tol` the returned `coef_` can differ slightly; this is the most likely numerical divergence a critic will pin (REQ-1 parity asserted at loose tolerance). |
+| REQ-14 (MultiTaskElasticNet) | NOT-STARTED | open prereq blocker #418. `Fit` is implemented only for `Array1<F>` targets; `MultiTaskElasticNet` (multi-output L1/L21 mixed-norm, separate sklearn estimator class, objective `_coordinate_descent.py:426-430`) has no ferrolearn analog. |
+| REQ-substrate (ferray) | NOT-STARTED | open prereq blocker #419. `elastic_net.rs` computes on `ndarray::{Array1, Array2}`, not the ferray substrate (R-SUBSTRATE-1/2). CD is elementwise + dot products (no linalg-crate dependency), so migration is array-type only; `coef_` return shape tied to #359/#375. |
+
+## Architecture
+
+- **Unfitted type** `ElasticNet<F>` (`elastic_net.rs`): public fields `alpha`, `l1_ratio`, `max_iter`, `tol`, `fit_intercept` with `with_*` builders and a `Default`/`new` matching the sklearn defaults that ferrolearn supports (`alpha = 1.0`, `l1_ratio = 0.5`, `max_iter = 1000`, `tol = 1e-4`, `fit_intercept = true`; cf. sklearn `_coordinate_descent.py:900/902/903/905/907`). The sklearn ctor params `precompute`, `copy_X`, `warm_start`, `positive`, `random_state`, `selection` are absent → REQ-8..11, plus the unmodeled attrs REQ-12.
+- **Fitted type** `FittedElasticNet<F>` (`elastic_net.rs`): holds `coefficients: Array1<F>` and `intercept: F`. No `n_iter_`/`dual_gap_` → REQ-12.
+- **Solver** `Fit::fit for ElasticNet<F>` (`elastic_net.rs`): (1) validate `alpha`/`l1_ratio`/shape/`n_samples`; (2) center `X`/`y` when `fit_intercept` (sklearn `_preprocess_data`); (3) precompute `col_norms[j] = X_jᵀX_j / n`; (4) split `alpha_l1 = alpha·l1_ratio`, `alpha_l2 = alpha·(1-l1_ratio)`, form `denominators[j] = col_norm[j] + alpha_l2`; (5) cyclic CD with the standard partial-residual update (add back `X_j·w_old`, soft-threshold `X_jᵀr/n` by `alpha_l1`, divide by `denominators[j]`, subtract `X_j·w_new`); (6) stop when `max_change < tol` (the divergence point vs sklearn's dual gap, REQ-13) or after `max_iter`; (7) recover `intercept = ȳ - x̄·w` via `compute_intercept`. On non-convergence it returns the current iterate (sklearn raises a `ConvergenceWarning` and likewise returns the iterate — the warning surface is not modeled).
+- **Penalty-split invariant** (REQ-1): the L2 term enters only the denominator (`col_norm + alpha_l2`) and the L1 term only the soft-threshold (`alpha_l1`), exactly matching the separable elastic-net coordinate update. ferrolearn's `soft_threshold(X_jᵀr/n, alpha·l1_ratio)/(X_jᵀX_j/n + alpha·(1-l1_ratio))` equals sklearn's `soft_threshold(X_jᵀr, l1_reg)/(X_jᵀX_j + l2_reg)` with `l1_reg = alpha·l1_ratio·n`, `l2_reg = alpha·(1-l1_ratio)·n` (`_coordinate_descent.py:655-656`); the `1/n` factors cancel in numerator and denominator, so both target the identical `(1/2n)`-scaled objective at `:734-736`.
+- **Relation to Lasso** (REQ-4): `Lasso = ElasticNet(l1_ratio=1)` (sklearn `:453`). At `l1_ratio = 1` the `alpha_l2` term vanishes and the update is bit-identical to `lasso.rs`'s CD step; the shared cyclic-CD soft-threshold pattern is documented in `.design/linear/lasso.md`.
+- **Boundary / consumers**: `ElasticNet` is the public estimator API. `ferrolearn-python/src/regressors.rs` wraps it as `_RsElasticNet` (registered in `ferrolearn-python/src/lib.rs` as `RsElasticNet`, surfaced to Python as `ferrolearn.ElasticNet`); `elastic_net_cv.rs` constructs `ElasticNet` per CV fold and for the final refit. Both are non-test production consumers (R-DEFER-1; `ElasticNet` is grandfathered boundary API per S5).
+
+## Verification
+
+Commands establishing the SHIPPED claims:
+
+- `cargo test -p ferrolearn-linear --lib elastic_net` → 30 passed, 0 failed (unit tests in `elastic_net.rs`: `test_default_builder`, `test_builder_setters`, `test_negative_alpha_error`, `test_l1_ratio_out_of_range_error`, `test_shape_mismatch_error`, `test_lasso_limit_l1_ratio_one`, `test_ridge_limit_l1_ratio_zero`, `test_sparsity_with_high_l1_ratio`, `test_higher_alpha_shrinks_more`, `test_no_intercept`, `test_predict_correct_length`, `test_predict_feature_mismatch`, `test_has_coefficients_length`, `test_pipeline_integration`, `test_soft_threshold_*` — plus the `elastic_net_cv` tests).
+- sklearn oracle (REQ-1, AC-1): `python3 -c "from sklearn.linear_model import ElasticNet; import numpy as np; X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([3.,5.,7.,9.,11.]); m=ElasticNet(alpha=0.1, l1_ratio=0.5).fit(X,y); print(m.coef_, m.intercept_)"` → `[1.9268...] 1.2195...`.
+- sklearn oracle (REQ-7, l1_ratio=0 finding): `python3 -c "from sklearn.linear_model import ElasticNet; ...; ElasticNet(alpha=1.0, l1_ratio=0.0).fit(X,y)"` → `coef≈[1.333]`, no error raised — confirming the `ElasticNet` class accepts `l1_ratio=0` (the `:140` raise is `_alpha_grid`-only / CV-path).
+
+NOT-STARTED REQs (8-14, substrate) have no green verification and are tracked by blockers: shared with Lasso — #407 (positive), #408 (warm_start), #409 (selection='random'), #410 (precompute), #412 (dual-gap stopping); ElasticNet-specific — #417 (n_iter_/dual_gap_), #418 (MultiTaskElasticNet), #419 (ferray substrate). Because ferrolearn's stopping criterion (REQ-13) differs from sklearn's dual gap, REQ-1 parity is asserted only at a loose tolerance; a tight ULP comparison is expected to fail until the dual-gap criterion lands.
