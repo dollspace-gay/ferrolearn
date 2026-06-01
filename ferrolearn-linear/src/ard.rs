@@ -26,6 +26,25 @@
 //! iteration). This mirrors scikit-learn's `ARDRegression.fit`
 //! (`sklearn/linear_model/_bayes.py:644-730`).
 //!
+//! ## REQ status (per `.design/linear/ard.md`, mirrors `sklearn/linear_model/_bayes.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.ARDRegression` (`_bayes.py:433`): per-iteration `keep_lambda`
+//! column-masking + Gamma hyperpriors + `1/var(y)` init + `threshold_lambda` pruning. coef_/
+//! alpha_/lambda_ and the pruned-feature set match the live oracle.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (ARD iterative fit) | SHIPPED | `Fit for ARDRegression` (per-iter masking, hyperpriors, coef-delta convergence); coef_/alpha_/lambda_/pruned-set match oracle (2- and 4-feature cases). Consumer: `RsARDRegression` in `ferrolearn-python`. Mirrors `_bayes.py:644-730`. |
+//! | REQ-2 (alpha_=1/(var(y)+eps) init) | SHIPPED | `fit` seeds `1/(var_y+eps)` (`_bayes.py:658`). |
+//! | REQ-3 (per-iteration keep_lambda masking + threshold pruning) | SHIPPED | `keep_lambda = lambda_ < threshold_lambda(1e4)` recomputed each iter; pruned coef zeroed (`_bayes.py:691`). |
+//! | REQ-4 (predict) | SHIPPED | `Predict for FittedARDRegression`. |
+//! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
+//! | REQ-6..9 NOT-STARTED | compute_score/scores_ (#477), n_iter_ (#478), predict(return_std)/sigma_ (#479), array-type ferray substrate (#480; the kept-Gram inverse already on `ferray::linalg::inv`). |
+//!
+//! acto-critic + builder: the fit was rewritten to sklearn's per-iteration ARD (was wrongly
+//! pruning relevant features); coef_/alpha_/lambda_/pruned-set now match the live oracle. The
+//! kept-block inverse runs on `ferray::linalg::inv` (R-SUBSTRATE). Two states only per R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
