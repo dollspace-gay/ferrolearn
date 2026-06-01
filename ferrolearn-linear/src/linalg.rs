@@ -1,85 +1,87 @@
 //! Internal linear algebra utilities.
 //!
-//! This module provides helper functions for solving linear systems
-//! using QR and Cholesky decompositions. The implementations convert
-//! between `ndarray` arrays and `faer` matrices for computation.
+//! This module provides helper functions for solving linear systems. The
+//! unregularized least-squares (OLS) path mirrors scikit-learn's dense solve
+//! `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)`
+//! (`sklearn/linear_model/_base.py:687`) — `scipy.linalg.lstsq` → LAPACK
+//! `gelsd` (SVD-based, minimum-norm) — by routing through
+//! [`ferray::linalg::lstsq`](ferray::linalg::lstsq) (`ferray-linalg/src/solve.rs:208`),
+//! a single-SVD gelsd-equivalent solver that zeroes sub-`rcond` singular
+//! values (yielding the minimum-norm solution) and accepts any `m × n` system
+//! (underdetermined included). This is the ferray substrate (R-SUBSTRATE-1).
+//! The Ridge path retains its hand-rolled Cholesky kernels (positive-definite
+//! for `alpha > 0`, where the min-norm concern does not arise).
+//!
+//! The `ndarray ↔ ferray` conversion happens at this module boundary
+//! (R-SUBSTRATE-4): callers keep their `ndarray` signatures during the
+//! workspace-wide migration.
 
+use ferray::linalg::LinalgFloat;
+use ferray::{Array as FerrayArray, IxDyn};
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 
-/// Convert an `ndarray::Array2<F>` to a `faer::Mat<f64>`.
-///
-/// This is used internally when `F` is `f64` (the common case).
-fn ndarray_to_faer_f64(a: &Array2<f64>) -> faer::Mat<f64> {
-    let (nrows, ncols) = a.dim();
-    faer::Mat::from_fn(nrows, ncols, |i, j| a[[i, j]])
-}
-
-/// Convert a `faer::Mat<f64>` column vector to an `ndarray::Array1<f64>`.
-fn faer_col_to_ndarray_f64(col: &faer::Mat<f64>) -> Array1<f64> {
-    let n = col.nrows();
-    Array1::from_shape_fn(n, |i| col[(i, 0)])
-}
-
 /// Solve the least squares problem `X @ w = y` for `w`.
 ///
-/// Uses QR decomposition for numerical stability. For `f64` data, this
-/// delegates to `faer`'s highly optimized QR solver. For other float
-/// types, a pure ndarray normal-equation solver is used.
+/// Routes through [`ferray::linalg::lstsq`] (`ferray-linalg/src/solve.rs:208`),
+/// a single-SVD, LAPACK-`gelsd`-equivalent solver. For a rank-deficient or
+/// underdetermined `X` it returns the unique **minimum-norm** least-squares
+/// solution (sub-`rcond` singular values are zeroed), matching scikit-learn's
+/// `linalg.lstsq(X, y)` (`sklearn/linear_model/_base.py:687`). `rcond` is left
+/// at the `None` default (`max(m, n) * eps`), matching scipy/sklearn's default.
+///
+/// Any `m × n` shape is accepted, including `n_samples < n_features`
+/// (underdetermined), exactly as `linalg.lstsq` does.
 ///
 /// # Errors
 ///
-/// Returns [`FerroError::NumericalInstability`] if the system is singular
-/// or numerically ill-conditioned.
-pub(crate) fn solve_lstsq<F: Float + Send + Sync + 'static>(
+/// Returns [`FerroError::NumericalInstability`] if the underlying SVD fails
+/// or the ferray↔ndarray bridge encounters a shape inconsistency.
+pub(crate) fn solve_lstsq<F: LinalgFloat>(
     x: &Array2<F>,
     y: &Array1<F>,
 ) -> Result<Array1<F>, FerroError> {
     let (n_samples, n_features) = x.dim();
 
-    if n_samples < n_features {
-        return Err(FerroError::InsufficientSamples {
-            required: n_features,
-            actual: n_samples,
-            context: "need at least as many samples as features for least squares".into(),
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4). Build from a flat,
+    // row-major Vec + shape; ferray-core's `from_ndarray` is crate-private.
+    let x_flat: Vec<F> = x.iter().copied().collect();
+    let a =
+        FerrayArray::<F, ferray::Ix2>::from_vec(ferray::Ix2::new([n_samples, n_features]), x_flat)
+            .map_err(|e| FerroError::NumericalInstability {
+                message: format!("ferray lstsq: failed to build design matrix: {e}"),
+            })?;
+
+    let y_flat: Vec<F> = y.iter().copied().collect();
+    let b = FerrayArray::<F, IxDyn>::from_vec(IxDyn::new(&[n_samples]), y_flat).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray lstsq: failed to build target vector: {e}"),
+        }
+    })?;
+
+    // Single-SVD gelsd-equivalent solve; `None` rcond matches the
+    // scipy/sklearn default of `max(m, n) * eps`.
+    let (solution, _residuals, _rank, _singular) =
+        ferray::linalg::lstsq(&a, &b, None).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray lstsq solve failed: {e}"),
+        })?;
+
+    // Bridge ferray -> ndarray: solution is a 1-D `IxDyn` array of length
+    // `n_features`. `into_ndarray()` yields an `ndarray::ArrayD`; flatten to
+    // the owned `Array1<F>` callers expect.
+    let solution_nd = solution.into_ndarray();
+    let w_vec: Vec<F> = solution_nd.iter().copied().collect();
+    if w_vec.len() != n_features {
+        return Err(FerroError::NumericalInstability {
+            message: format!(
+                "ferray lstsq: solution length {} does not match {} features",
+                w_vec.len(),
+                n_features
+            ),
         });
     }
-
-    // Use faer QR decomposition for f64 (higher numerical accuracy).
-    if std::any::TypeId::of::<F>() == std::any::TypeId::of::<f64>() {
-        // Convert to f64 arrays, solve with faer, convert back.
-        let x_f64 = x.mapv(|v| v.to_f64().unwrap());
-        let y_f64 = y.mapv(|v| v.to_f64().unwrap());
-        let result = solve_lstsq_faer(&x_f64, &y_f64)?;
-        return Ok(result.mapv(|v| F::from(v).unwrap()));
-    }
-
-    // Fallback for f32 and other float types: normal equations.
-    solve_normal_equations(x, y)
-}
-
-/// Solve `X @ w = y` via the normal equations: `(X^T X) w = X^T y`.
-///
-/// Uses Cholesky decomposition of `X^T X` for efficiency. Falls back
-/// to a direct solver if Cholesky fails (system may be ill-conditioned).
-pub(crate) fn solve_normal_equations<F: Float + Send + Sync + 'static>(
-    x: &Array2<F>,
-    y: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let xt = x.t();
-    let xtx = xt.dot(x);
-    let xty = xt.dot(y);
-    let n = xtx.nrows();
-
-    // Try Cholesky decomposition (X^T X should be positive semi-definite).
-    match cholesky_solve(&xtx, &xty) {
-        Ok(w) => Ok(w),
-        Err(_) => {
-            // Fallback: use LU-style Gaussian elimination.
-            gaussian_solve(n, &xtx, &xty)
-        }
-    }
+    Ok(Array1::from_vec(w_vec))
 }
 
 /// Solve a symmetric positive-definite system `A @ x = b` via Cholesky.
@@ -320,24 +322,6 @@ pub(crate) fn solve_ridge_multi<F: Float + Send + Sync + 'static>(
     cholesky_solve_multi(&xtx, &xty)
 }
 
-/// Solve `X^T X w = X^T y` using faer QR decomposition (f64 only).
-///
-/// This provides the highest numerical accuracy for f64 data.
-pub(crate) fn solve_lstsq_faer(
-    x: &Array2<f64>,
-    y: &Array1<f64>,
-) -> Result<Array1<f64>, FerroError> {
-    use faer::linalg::solvers::SolveLstsq;
-
-    let a = ndarray_to_faer_f64(x);
-    let (n_samples, _n_features) = x.dim();
-    let rhs = faer::Mat::from_fn(n_samples, 1, |i, _| y[i]);
-
-    let qr = a.qr();
-    let result = qr.solve_lstsq(rhs.as_ref());
-    Ok(faer_col_to_ndarray_f64(&result))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,10 +359,35 @@ mod tests {
     }
 
     #[test]
-    fn test_solve_lstsq_faer() {
-        let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
-        let y = Array1::from_vec(vec![2.0, 4.0, 6.0]);
-        let w = solve_lstsq_faer(&x, &y).unwrap();
-        assert_relative_eq!(w[0], 2.0, epsilon = 1e-10);
+    fn test_solve_lstsq_rank_deficient_min_norm() {
+        // Rank-1 design (duplicate columns). The minimum-norm least-squares
+        // solution splits the weight evenly across the tied columns. Oracle:
+        //   python3 -c "import numpy as np; from scipy.linalg import lstsq; \
+        //     print(lstsq(np.array([[1.,1.],[2.,2.],[3.,3.]]), \
+        //     np.array([1.,2.,3.]))[0].tolist())"  -> [0.5, 0.5]
+        // (the gelsd min-norm split; the same value sklearn
+        // LinearRegression(fit_intercept=False) returns, per
+        // tests/divergence_linreg_minnorm.rs).
+        let x = Array2::from_shape_vec((3, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]).unwrap();
+        let y = Array1::from_vec(vec![1.0, 2.0, 3.0]);
+        let w = solve_lstsq(&x, &y).unwrap();
+        assert_relative_eq!(w[0], 0.5, epsilon = 1e-10);
+        assert_relative_eq!(w[1], 0.5, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_solve_lstsq_underdetermined_accepted() {
+        // n_samples (2) < n_features (3): scipy.linalg.lstsq accepts this and
+        // returns the minimum-norm solution. Oracle:
+        //   python3 -c "import numpy as np; from scipy.linalg import lstsq; \
+        //     print(lstsq(np.array([[1.,2.,3.],[4.,5.,6.]]), \
+        //     np.array([1.,2.]))[0].tolist())"
+        //   -> [-0.05555555555555583, 0.11111111111111112, 0.277777777777778]
+        let x = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+        let y = Array1::from_vec(vec![1.0, 2.0]);
+        let w = solve_lstsq(&x, &y).unwrap();
+        assert_relative_eq!(w[0], -0.055_555_555_555_555_83, epsilon = 1e-8);
+        assert_relative_eq!(w[1], 0.111_111_111_111_111_12, epsilon = 1e-8);
+        assert_relative_eq!(w[2], 0.277_777_777_777_778, epsilon = 1e-8);
     }
 }

@@ -17,10 +17,10 @@
 //! Fix site: `ferrolearn-linear/src/linalg.rs` (the `solve_lstsq` /
 //! `solve_normal_equations` solver path), NOT `linear_regression.rs`.
 
-use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::Fit;
+use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_linear::LinearRegression;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Divergence: ferrolearn `LinearRegression::fit` (via `linalg::solve_lstsq`,
 /// `ferrolearn-linear/src/linalg.rs:35`) diverges from sklearn
@@ -38,7 +38,6 @@ use ndarray::{array, Array2};
 ///
 /// Tracking: #376  (fix in linalg.rs)
 #[test]
-#[ignore = "divergence: rank-deficient OLS not minimum-norm (QR vs gelsd SVD); tracking #376"]
 fn divergence_rank_deficient_no_intercept_min_norm() {
     // Oracle: minimum-norm solution from scipy gelsd.
     const SK_COEF0: f64 = 0.4999999999999999;
@@ -48,7 +47,9 @@ fn divergence_rank_deficient_no_intercept_min_norm() {
     let y = array![1., 2., 3.];
 
     let model = LinearRegression::<f64>::new().with_fit_intercept(false);
-    let fitted = model.fit(&x, &y).expect("fit should succeed on rank-deficient X");
+    let fitted = model
+        .fit(&x, &y)
+        .expect("fit should succeed on rank-deficient X");
     let coef = fitted.coefficients();
 
     assert!(
@@ -74,7 +75,6 @@ fn divergence_rank_deficient_no_intercept_min_norm() {
 ///
 /// Tracking: #376  (fix in linalg.rs)
 #[test]
-#[ignore = "divergence: rank-deficient OLS not minimum-norm (QR vs gelsd SVD); tracking #376"]
 fn divergence_rank_deficient_with_intercept_min_norm() {
     // Oracle: gelsd min-norm split of the centered system.
     const SK_COEF0: f64 = 1.0;
@@ -85,7 +85,9 @@ fn divergence_rank_deficient_with_intercept_min_norm() {
     let y = array![1., 3., 5.];
 
     let model = LinearRegression::<f64>::new();
-    let fitted = model.fit(&x, &y).expect("fit should succeed on rank-deficient X");
+    let fitted = model
+        .fit(&x, &y)
+        .expect("fit should succeed on rank-deficient X");
     let coef = fitted.coefficients();
 
     assert!(
@@ -117,7 +119,6 @@ fn divergence_rank_deficient_with_intercept_min_norm() {
 ///
 /// Tracking: #377  (fix in linalg.rs)
 #[test]
-#[ignore = "divergence: underdetermined input rejected (sklearn succeeds, min-norm); tracking #377"]
 fn divergence_underdetermined_accepted_min_norm() {
     // Oracle: gelsd minimum-norm solution for the underdetermined system.
     const SK_COEF: [f64; 3] = [

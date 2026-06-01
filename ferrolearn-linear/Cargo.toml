@@ -12,6 +12,7 @@ categories = ["science", "algorithms"]
 
 [dependencies]
 ferrolearn-core.workspace = true
+ferray = { workspace = true }
 ndarray.workspace = true
 num-traits.workspace = true
 faer.workspace = true

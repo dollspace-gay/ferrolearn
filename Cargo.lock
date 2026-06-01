@@ -1009,6 +1009,7 @@ version = "0.4.0"
 dependencies = [
  "approx 0.5.1",
  "faer",
+ "ferray",
  "ferrolearn-core",
  "ferrolearn-test-oracle",
  "float-cmp",

@@ -1,7 +1,8 @@
 //! Ordinary Least Squares linear regression.
 //!
-//! This module provides [`LinearRegression`], which fits a linear model
-//! using QR decomposition (via `faer`) to solve the least squares problem:
+//! This module provides [`LinearRegression`], which fits a linear model by
+//! solving the least squares problem via a single SVD (the LAPACK-`gelsd`
+//! minimum-norm path, through `ferray::linalg::lstsq`):
 //!
 //! ```text
 //! minimize ||X @ w - y||^2
@@ -9,27 +10,27 @@
 //!
 //! ## REQ status (per `.design/linear/linear_regression.md`, mirrors `sklearn/linear_model/_base.py` @ 1.5.2)
 //!
-//! Mirrors `sklearn.linear_model.LinearRegression` (`_base.py:465`). Full-rank OLS matches
-//! the live sklearn oracle to 1e-8; the rank-deficient/underdetermined minimum-norm contract
-//! diverges (ferrolearn uses centering + Cholesky normal equations with a QR fallback, vs
-//! sklearn's LAPACK `gelsd` SVD min-norm path).
+//! Mirrors `sklearn.linear_model.LinearRegression` (`_base.py:465`). Full-rank,
+//! rank-deficient, and underdetermined OLS all match the live sklearn oracle to
+//! 1e-8: the solve routes through `crate::linalg::solve_lstsq` →
+//! `ferray::linalg::lstsq` (single-SVD, LAPACK-`gelsd`-equivalent min-norm),
+//! mirroring sklearn's `linalg.lstsq(X, y)` (`_base.py:687`).
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (full-rank OLS coef_/intercept_) | SHIPPED | `Fit for LinearRegression` (centering + `linalg::solve_normal_equations`); full-rank coef/intercept match oracle to 1e-8. Consumer: `RsLinearRegression` in `ferrolearn-python/src/regressors.rs`. Mirrors `_base.py:582`, intercept `_base.py:308`. |
+//! | REQ-1 (full-rank OLS coef_/intercept_) | SHIPPED | `Fit for LinearRegression` (centering + `linalg::solve_lstsq` via `ferray::linalg::lstsq`); full-rank coef/intercept match oracle to 1e-8. Consumer: `RsLinearRegression` in `ferrolearn-python/src/regressors.rs`. Mirrors `_base.py:582`, intercept `_base.py:308`. |
 //! | REQ-2 (predict = X·coef + intercept) | SHIPPED | `Predict for FittedLinearRegression`. Mirrors `_base.py:282`. |
 //! | REQ-3 (fit_intercept incl. false) | SHIPPED | `with_fit_intercept`; `fit_intercept=false` forces intercept 0. Mirrors `_base.py:571`. |
 //! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedLinearRegression`. Mirrors fitted attrs `_base.py:499/511`. |
-//! | REQ-5 (min-norm for rank-deficient / underdetermined X) | NOT-STARTED | divergences #376 (rank-deficient not min-norm) + #377 (underdetermined rejected); root cause in `linalg.rs` solver (SVD min-norm = LAPACK `gelsd`, `_base.py:687`). Failing tests pinned in `tests/divergence_linreg_minnorm.rs`. |
+//! | REQ-5 (min-norm for rank-deficient / underdetermined X) | SHIPPED | `Fit for LinearRegression` calls `crate::linalg::solve_lstsq` → `ferray::linalg::lstsq` (`ferray-linalg/src/solve.rs:208`), the single-SVD gelsd-equivalent min-norm solver mirroring `_base.py:687`. Closes #376 (rank-deficient min-norm) + #377 (underdetermined accepted). Tests now passing (`#[ignore]` removed): `divergence_rank_deficient_no_intercept_min_norm`, `divergence_rank_deficient_with_intercept_min_norm`, `divergence_underdetermined_accepted_min_norm` in `tests/divergence_linreg_minnorm.rs`. |
 //! | REQ-6 (positive=True / NNLS) | NOT-STARTED | blocker #371 (`_base.py:574/645`). |
 //! | REQ-7 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | blocker #372 (fit takes `Array1` only). |
 //! | REQ-8 (sample_weight in fit) | NOT-STARTED | blocker #373 (`_base.py` `fit(..., sample_weight=None)`). |
-//! | REQ-9 (rank_/singular_/copy_X/n_jobs) | NOT-STARTED | blocker #374. |
-//! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 (ndarray + faer; coef return type tied to #359). |
+//! | REQ-9 (rank_/singular_/copy_X/n_jobs) | NOT-STARTED | blocker #374 (`ferray::linalg::lstsq` now returns rank/singular; not yet stored as fitted attrs). |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 — OLS solve now on `ferray::linalg::lstsq`, but `LinearRegression`'s coef storage is still `ndarray` (coef return type tied to #359); fully on-substrate when the boundary `ndarray` types migrate. |
 //!
-//! acto-critic: 3 divergences pinned (#376/#377) — fix belongs in `linalg.rs` (the next unit
-//! per R-LOOP-3). Full-rank OLS, centering, and through-origin fits match the oracle.
-//! Two states only per goal.md R-DEFER-2.
+//! Two states only per goal.md R-DEFER-2. The OLS min-norm contract (#376/#377)
+//! is fixed in `linalg.rs` via the ferray substrate.
 //!
 //! # Examples
 //!
@@ -57,9 +58,10 @@ use crate::linalg;
 
 /// Ordinary least squares linear regression.
 ///
-/// Solves the normal equations using QR decomposition for numerical
-/// stability. The `fit_intercept` option controls whether a bias
-/// (intercept) term is included.
+/// Solves the least-squares problem via a single SVD (minimum-norm,
+/// LAPACK-`gelsd`-equivalent, through `ferray::linalg::lstsq`). The
+/// `fit_intercept` option controls whether a bias (intercept) term is
+/// included.
 ///
 /// # Type Parameters
 ///
@@ -109,17 +111,28 @@ pub struct FittedLinearRegression<F> {
     intercept: F,
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'static>
-    Fit<Array2<F>, Array1<F>> for LinearRegression<F>
+impl<
+    F: Float
+        + Send
+        + Sync
+        + ScalarOperand
+        + num_traits::FromPrimitive
+        + ferray::linalg::LinalgFloat
+        + 'static,
+> Fit<Array2<F>, Array1<F>> for LinearRegression<F>
 {
     type Fitted = FittedLinearRegression<F>;
     type Error = FerroError;
 
     /// Fit the linear regression model.
     ///
-    /// Uses the centering trick with Cholesky normal equations for speed.
-    /// Falls back to QR decomposition via faer if the normal equations are
-    /// ill-conditioned.
+    /// Solves the OLS least-squares problem via the SVD-based
+    /// minimum-norm solver [`crate::linalg::solve_lstsq`] (routed through
+    /// [`ferray::linalg::lstsq`], LAPACK-`gelsd`-equivalent), matching
+    /// scikit-learn's dense path `linalg.lstsq(X, y)`
+    /// (`sklearn/linear_model/_base.py:687`). When `fit_intercept` is true,
+    /// `X` and `y` are centered first and the intercept is recovered as
+    /// `y_mean - x_mean . w`.
     ///
     /// # Errors
     ///
@@ -149,19 +162,31 @@ impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'stati
         }
 
         if self.fit_intercept {
-            // Centering trick: center X and y, solve without intercept column,
-            // then recover intercept as y_mean - x_mean . w.
-            // This avoids the expensive matrix augmentation + QR path.
-            let n = F::from(n_samples).unwrap();
-            let x_mean = x.mean_axis(Axis(0)).unwrap();
+            // Centering trick: center X and y, solve the (uncentered) OLS
+            // problem on the centered design, then recover the intercept as
+            // y_mean - x_mean . w. sklearn centers identically before its
+            // `linalg.lstsq` call (`_base.py` `_preprocess_data` + `:687`).
+            let n = <F as num_traits::NumCast>::from(n_samples).ok_or_else(|| {
+                FerroError::NumericalInstability {
+                    message: "could not represent n_samples as the float type".into(),
+                }
+            })?;
+            let x_mean = x
+                .mean_axis(Axis(0))
+                .ok_or_else(|| FerroError::InsufficientSamples {
+                    required: 1,
+                    actual: 0,
+                    context: "cannot compute feature means of an empty design".into(),
+                })?;
             let y_mean = y.sum() / n;
 
             let x_centered = x - &x_mean;
             let y_centered = y - y_mean;
 
-            // Try fast Cholesky normal equations first, fall back to QR.
-            let w = linalg::solve_normal_equations(&x_centered, &y_centered)
-                .or_else(|_| linalg::solve_lstsq(&x_centered, &y_centered))?;
+            // SVD-based minimum-norm least squares (gelsd-equivalent), so
+            // rank-deficient designs yield the min-norm split, not an
+            // arbitrary basic solution (#376).
+            let w = linalg::solve_lstsq(&x_centered, &y_centered)?;
 
             let intercept = y_mean - x_mean.dot(&w);
 
@@ -170,12 +195,13 @@ impl<F: Float + Send + Sync + ScalarOperand + num_traits::FromPrimitive + 'stati
                 intercept,
             })
         } else {
-            // Try fast Cholesky normal equations first, fall back to QR.
-            let w = linalg::solve_normal_equations(x, y).or_else(|_| linalg::solve_lstsq(x, y))?;
+            // SVD-based minimum-norm least squares; accepts underdetermined
+            // (n_samples < n_features) input as sklearn does (#377).
+            let w = linalg::solve_lstsq(x, y)?;
 
             Ok(FittedLinearRegression {
                 coefficients: w,
-                intercept: F::zero(),
+                intercept: <F as num_traits::Zero>::zero(),
             })
         }
     }
@@ -225,7 +251,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
 // Pipeline integration.
 impl<F> PipelineEstimator<F> for LinearRegression<F>
 where
-    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+    F: Float + FromPrimitive + ScalarOperand + ferray::linalg::LinalgFloat + Send + Sync + 'static,
 {
     fn fit_pipeline(
         &self,
