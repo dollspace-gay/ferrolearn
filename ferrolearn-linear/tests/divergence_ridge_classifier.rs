@@ -24,9 +24,11 @@ use ndarray::{Array1, Array2};
 ///                        0.2666666666666665, 0.13333333333333325]
 #[test]
 fn guard_binary_decision_matches_sklearn() {
-    let x =
-        Array2::from_shape_vec((5, 2), vec![0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 2.0, 1.0, 1.0])
-            .unwrap();
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 2.0, 1.0, 1.0],
+    )
+    .unwrap();
     let y = Array1::from_vec(vec![0usize, 0, 1, 1, 0]);
     let fitted = RidgeClassifier::<f64>::new()
         .with_alpha(1.0)
@@ -68,11 +70,12 @@ fn guard_binary_decision_matches_sklearn() {
 ///
 /// Tracking: #405
 #[test]
-#[ignore = "divergence: binary predict uses >=0 not sklearn's >0 (_base.py:384); tracking #405"]
 fn divergence_binary_decision_boundary_strict_gt() {
-    let x =
-        Array2::from_shape_vec((5, 2), vec![0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 2.0, 1.0, 1.0])
-            .unwrap();
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![0.0, 0.0, 2.0, 0.0, 0.0, 2.0, 2.0, 2.0, 1.0, 1.0],
+    )
+    .unwrap();
     let y = Array1::from_vec(vec![0usize, 0, 1, 1, 0]);
     let fitted = RidgeClassifier::<f64>::new()
         .with_alpha(1.0)

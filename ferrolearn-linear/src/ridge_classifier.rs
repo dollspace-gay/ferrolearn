@@ -317,7 +317,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
 
         if self.is_binary {
             for i in 0..n_samples {
-                predictions[i] = if scores[[i, 0]] >= F::zero() {
+                // sklearn `LinearClassifierMixin.predict` uses STRICT `scores > 0`
+                // (`sklearn/linear_model/_base.py:384`:
+                // `indices = xp.astype(scores > 0, ...)`), so a decision of
+                // exactly 0 maps to index 0 -> `classes_[0]`.
+                predictions[i] = if scores[[i, 0]] > <F as num_traits::Zero>::zero() {
                     self.classes[1]
                 } else {
                     self.classes[0]
