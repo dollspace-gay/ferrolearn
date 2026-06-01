@@ -4,6 +4,27 @@
 //! the optimal regularization strength `C` by running k-fold cross-validation
 //! over a grid of candidate values.
 //!
+//! ## REQ status (per `.design/linear/logistic_regression_cv.md`, mirrors `sklearn/linear_model/_logistic.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.LogisticRegressionCV` (`_logistic.py:1464`): Cs=10 log-spaced
+//! 1e-4..1e4, StratifiedKFold CV, accuracy scoring, best-C refit. Grid + scoring + the stratified
+//! fold partition match sklearn exactly; exact `C_` is gated by the inner-LR LBFGS convergence #412.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (Cs grid 10 log-spaced 1e-4..1e4) | SHIPPED | matches `np.logspace(-4,4,10)` (`_logistic.py:276`) to ≤3.4e-13. |
+//! | REQ-2 (stratified k-fold C-selection + refit) | SHIPPED | per-C accuracy over folds, argmax, refit `LogisticRegression`. Consumer: `pub use LogisticRegressionCV` (boundary API). C_ in sklearn's regularization region (exact C_ gated by #412). |
+//! | REQ-3 (predict / predict_proba) | SHIPPED | `Predict`/`predict_proba for FittedLogisticRegressionCV`. |
+//! | REQ-4 (fit_intercept / HasCoefficients / HasClasses) | SHIPPED | original-label classes_. |
+//! | REQ-5 (sklearn StratifiedKFold partition) | SHIPPED | #456 fixed (45221f0) — `stratified_kfold_split` now uses sklearn's contiguous-block allocation (`_split.py:746-806`); deterministic unit test matches sklearn partition exactly. Was round-robin `i%k`. |
+//! | REQ-6 (accuracy scoring matching sklearn scoring=None) | SHIPPED | per-fold `correct/count` = `accuracy_score`. |
+//! | REQ-7..19 NOT-STARTED | Cs as int param (#457), CV attrs scores_/Cs_/coefs_paths_ (#458-#460), refit=False (#461), l1_ratios (#462), penalty (#442), solver variants (#443), multi_class=ovr (#444), class_weight (#445), sample_weight (#451), random_state/n_jobs (#452), ferray substrate (#453). |
+//!
+//! acto-critic: Cs grid (3e-13), accuracy scoring, and (after #456) the StratifiedKFold partition
+//! all match sklearn; #456 (round-robin → contiguous-block stratified folds) found + fixed — moved
+//! C_ from the wrong regularization side to sklearn's region. Exact `C_` is bounded by the inner-LR
+//! LBFGS convergence #412 (intercept precision at strong regularization). Two states only per R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
