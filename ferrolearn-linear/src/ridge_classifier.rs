@@ -12,6 +12,29 @@
 //! This approach is significantly faster than logistic regression for
 //! large datasets while often achieving competitive accuracy.
 //!
+//! ## REQ status (per `.design/linear/ridge_classifier.md`, mirrors `sklearn/linear_model/_ridge.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.RidgeClassifier` (`_ridge.py:1344`): `LabelBinarizer(pos_label=1,
+//! neg_label=-1)` encoding (`_ridge.py:1300`) + per-class Ridge fit + sign/argmax predict.
+//! coef_/intercept_/decision_function match the live sklearn oracle to 1e-9.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (±1/one-hot encoding + per-class Ridge fit) | SHIPPED | `Fit for RidgeClassifier` (binary {-1,+1}, multiclass one-hot, per-column `linalg::solve_ridge`, centering). Consumer: `RsRidgeClassifier` in `ferrolearn-python`. Mirrors `_ridge.py:1300`. |
+//! | REQ-2 (predict: sign/argmax → original labels) | SHIPPED | binary uses strict `> 0` (mirrors `_base.py:384` `scores > 0`); multiclass argmax; returns `classes[idx]` (original label values). Closed #405 (boundary `>=`→`>`); test `divergence_binary_decision_boundary_strict_gt`. |
+//! | REQ-3 (fit_intercept incl. false) | SHIPPED | centering; matches oracle. |
+//! | REQ-4 (coef_/intercept_/classes_ introspection) | SHIPPED | `HasCoefficients`/`HasClasses`; values match oracle. NOTE: `coef_matrix` is `(n_features, n_targets)`, transposed vs sklearn `coef_` `(n_classes, n_features)` — orientation contract owned by the `ferrolearn-python` binding layer. |
+//! | REQ-5 (alpha≥0 validation; ≥2-class guard) | SHIPPED | negative-alpha → `InvalidParameter`; <2 classes → error. |
+//! | REQ-6 (class_weight / solver variants / solver_ / positive) | NOT-STARTED | blocker #393. |
+//! | REQ-7 (max_iter/tol + n_iter_) | NOT-STARTED | blocker #394. |
+//! | REQ-8 (sample_weight) | NOT-STARTED | blocker #395. |
+//! | REQ-9 (RidgeClassifierCV) | NOT-STARTED | blocker #396. |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | solve_ridge already on ferray::linalg fallback; coef storage ndarray (tied to #359). |
+//!
+//! acto-critic: binary + multiclass coef_/intercept_/decision_function match the live oracle to
+//! 1e-9; classes_ returns original label values (no #368-style collapse); one divergence (#405,
+//! binary boundary operator) found and fixed. Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
