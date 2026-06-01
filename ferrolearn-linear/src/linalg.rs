@@ -26,11 +26,14 @@
 //! | REQ-4 (rank_ / singular_ exposed) | NOT-STARTED | blocker #374 — `ferray::linalg::lstsq` returns rank+singular values, but they are not yet stored as fitted attributes on the estimators. |
 //! | REQ-5 (safe_sparse_dot helper) | NOT-STARTED | blocker #380 — no dot/matmul wrapper (`extmath.py:161`); estimators call `ndarray::.dot()` inline. |
 //! | REQ-6 (ferray substrate for OLS solve) | SHIPPED | OLS decomposition runs on `ferray::linalg` (`solve.rs:208`); ndarray↔ferray bridged at this boundary (R-SUBSTRATE-4). |
-//! | REQ-7 (gelsd parity on near-singular X, cond~1e14) | NOT-STARTED | blocker #381 (rcond `eps` cutoff) blocked on ferray #382 (ferray SVD precision on near-zero singular values diverges from LAPACK). Per R-SUBSTRATE-5 the fix is in ferray's harness. |
+//! | REQ-7 (gelsd rcond cutoff parity, `eps * s_max`) | SHIPPED | `solve_lstsq` passes `Some(F::epsilon())` to `ferray::linalg::lstsq`, pinning the singular-value cutoff to scipy's `cond=eps` (matching `linalg.lstsq(X, y)`'s default, `_base.py:687`) so the RANK decision matches scipy/sklearn. Closed #381; regression test `lstsq_rcond_eps_cutoff_and_stable_contract`. Per #382 the residual coefficient values on a numerically-singular (`cond~1e14`) design are an inherent FP limit (1/s_min-amplified noise, no implementation has a "true" answer), so the deterministic contract asserted is rank parity + the stable `X @ coef` projection, not the individual coefficients. |
 //!
 //! acto-critic: #376/#377 fixed and verified vs the live oracle; full-rank parity,
 //! bridge fidelity, and edge cases (single feature/sample, f32, fit_intercept) all
-//! match. One residual near-singular divergence (#381) is owned by ferray (#382).
+//! match. #381 (rcond cutoff) fixed: the `eps * s_max` cutoff makes the rank
+//! decision match scipy/sklearn; per ferray #382 the coefficient values on a
+//! numerically-singular design are an inherent FP limit, so the deterministic
+//! contract is rank parity + the stable `X @ coef` projection.
 //! Two states only per goal.md R-DEFER-2.
 //!
 //! The Ridge path retains its hand-rolled Cholesky kernels (PD for `alpha > 0`).
@@ -47,8 +50,11 @@ use num_traits::Float;
 /// a single-SVD, LAPACK-`gelsd`-equivalent solver. For a rank-deficient or
 /// underdetermined `X` it returns the unique **minimum-norm** least-squares
 /// solution (sub-`rcond` singular values are zeroed), matching scikit-learn's
-/// `linalg.lstsq(X, y)` (`sklearn/linear_model/_base.py:687`). `rcond` is left
-/// at the `None` default (`max(m, n) * eps`), matching scipy/sklearn's default.
+/// `linalg.lstsq(X, y)` (`sklearn/linear_model/_base.py:687`). `rcond` is set
+/// to `Some(F::epsilon())` (machine eps), matching scipy's `cond=eps` cutoff
+/// (`eps * s_max`) — the default scipy/sklearn use when `cond=None` — so the
+/// singular-value rank decision matches scipy/sklearn (rather than ferray's
+/// larger numpy-convention `max(m, n) * eps` default).
 ///
 /// Any `m × n` shape is accepted, including `n_samples < n_features`
 /// (underdetermined), exactly as `linalg.lstsq` does.
@@ -79,11 +85,19 @@ pub(crate) fn solve_lstsq<F: LinalgFloat>(
         }
     })?;
 
-    // Single-SVD gelsd-equivalent solve; `None` rcond matches the
-    // scipy/sklearn default of `max(m, n) * eps`.
+    // Single-SVD gelsd-equivalent solve. scikit-learn calls
+    // `linalg.lstsq(X, y)` with no `cond` (`sklearn/linear_model/_base.py:687`);
+    // scipy's `cond=None` default sets the singular-value cutoff to
+    // `eps * s_max` (machine epsilon). ferray's own `None` default uses the
+    // larger numpy convention `max(m, n) * eps * s_max`, which makes a
+    // DIFFERENT rank decision for singular-value ratios in `(eps, max(m,n)*eps)`.
+    // Passing `Some(F::epsilon())` pins ferray to scipy's `cond=eps` cutoff so
+    // the rank decision matches scipy/sklearn.
     let (solution, _residuals, _rank, _singular) =
-        ferray::linalg::lstsq(&a, &b, None).map_err(|e| FerroError::NumericalInstability {
-            message: format!("ferray lstsq solve failed: {e}"),
+        ferray::linalg::lstsq(&a, &b, Some(F::epsilon())).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray lstsq solve failed: {e}"),
+            }
         })?;
 
     // Bridge ferray -> ndarray: solution is a 1-D `IxDyn` array of length
