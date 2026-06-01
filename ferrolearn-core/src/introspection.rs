@@ -3,6 +3,24 @@
 //! These traits allow downstream code to inspect the internal state of
 //! fitted models (coefficients, feature importances, class labels) in
 //! a uniform way, enabling generic model-inspection utilities.
+//!
+//! ## REQ status (per `.design/core/introspection.md`, mirrors sklearn fitted attrs @ 1.5.2)
+//!
+//! These traits encode scikit-learn's trailing-underscore fitted-attribute
+//! convention (`coef_`/`intercept_`/`feature_importances_`/`classes_`) as
+//! compile-time traits implemented on `Fitted*` types across the workspace.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (HasCoefficients ↔ coef_/intercept_) | SHIPPED | `HasCoefficients` trait; consumers `impl HasCoefficients for FittedLinearRegression in linear_regression.rs` (+ `FittedRidge`, `FittedLogisticRegression`). Mirrors `sklearn/linear_model/_base.py:691-692`. |
+//! | REQ-2 (HasFeatureImportances ↔ feature_importances_) | SHIPPED | `HasFeatureImportances` trait; consumers `impl ... for FittedDecisionTreeClassifier in decision_tree.rs` (+ random_forest, gradient_boosting). Mirrors `sklearn/tree/_classes.py:671`. |
+//! | REQ-3 (HasClasses ↔ classes_/n_classes_) | SHIPPED | `HasClasses` trait; consumers `impl ... for FittedLogisticRegression in logistic_regression.rs` (+ tree/bayes/neighbors classifiers). Mirrors `classes_ = np.unique(y)` at `sklearn/linear_model/_logistic.py:1232`. |
+//! | REQ-4 (ferray substrate for return types) | NOT-STARTED | open blocker #359 — `coefficients()`/`feature_importances()` return `&ndarray::Array1<F>`; migrating to ferray `Array1` cascades through every implementing estimator (R-SUBSTRATE-4, grandfathered-transitional). |
+//!
+//! acto-critic audit: NO DIVERGENCE FOUND (pure trait definitions; the multi-output
+//! `coef_`/`intercept_` shape and `classes_` label-value contracts are observable only
+//! through implementing estimators and are pinned when the loop audits linear/tree/bayes/
+//! neighbors). Two states only per goal.md R-DEFER-2.
 
 use ndarray::Array1;
 
