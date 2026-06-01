@@ -18,14 +18,14 @@ update rules), rather than using a fixed regularization strength. The
 ferrolearn type is `BayesianRidge<F>` with fitted type `FittedBayesianRidge<F>`
 in `bayesian_ridge.rs`.
 
-The current ferrolearn implementation captures the *shape* of the algorithm
-(center, iterate `coef_`/`alpha_`/`lambda_`, expose `predict`/`HasCoefficients`)
-but **diverges numerically from sklearn** in three contract-bearing ways: it
-omits the four Gamma-prior hyperparameters that enter the update equations, it
-approximates the effective-degrees-of-freedom term `gamma_` with a
-Cholesky-diagonal trace instead of sklearn's exact SVD eigenvalue sum, and its
-`alpha_init` default is `1.0` instead of sklearn's `1/Var(y)`. Those are pinned
-NOT-STARTED below.
+The ferrolearn implementation now matches sklearn's SVD-based MacKay
+evidence-maximization loop (closed #464/#465/#466): `fn fit` takes the thin SVD
+of the centered design via `ferray::linalg::svd`, iterates the exact `gamma_`
+eigenvalue sum and the Gamma-hyperprior `alpha_`/`lambda_` updates, converges on
+`sum(|coef_old - coef|) < tol`, and seeds `alpha_` from `1/(Var(y)+eps)` when
+`alpha_init` is `None`. REQ-1/2/3 and the SVD facet of REQ-10 are SHIPPED below;
+the remaining facets (`scores_`, `n_iter_`, full `sigma_`/`return_std`,
+`sample_weight`, and the array-type migration off `ndarray`) stay NOT-STARTED.
 
 ## Requirements
 
@@ -53,9 +53,10 @@ NOT-STARTED below.
 
 - AC-1: On `X=[[1],[2],[3],[4],[5]]`, `y=[3,5,7,9,11]`, sklearn yields
   `alpha_ ≈ 2.000e6`, `lambda_ ≈ 0.2500004`, `coef_ ≈ [1.99999997]`,
-  `intercept_ ≈ 1.00000008`, `n_iter_ = 5`. ferrolearn's `alpha()` must match
-  `alpha_` within relative `1e-6` (it currently returns the clamp ceiling
-  `1e10`). (REQ-1)
+  `intercept_ ≈ 1.00000008`, `n_iter_ = 5`. The SVD/MacKay rewrite now matches
+  the converged `coef_`/`alpha_`/`lambda_` (no clamp ceiling); the parity is
+  exercised on the regularization-sensitive 30×5 design in
+  `divergence_bayesian_ridge_fit_coef_alpha_lambda`. (REQ-1)
 - AC-2: `BayesianRidge` constructed with `alpha_1=alpha_2=lambda_1=lambda_2=1e-6`
   reproduces AC-1; with those set to `0` it reproduces the no-prior limit.
   (REQ-2)
@@ -71,16 +72,16 @@ NOT-STARTED below.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (evidence-max fit w/ hyperpriors) | NOT-STARTED | open prereq blocker #464. The M-step in `fn fit` of `bayesian_ridge.rs` computes `new_alpha = (n_f - gamma) / sse` and `new_lambda = gamma / w_norm_sq` — it omits sklearn's `+ 2*alpha_1` / `+ 2*alpha_2` (`_bayes.py:307`) and `+ 2*lambda_1` / `+ 2*lambda_2` (`_bayes.py:306`). It also computes `gamma` via `alpha * xtx[[i,i]] * sd_new[i]` (a Cholesky-diagonal trace approximation in `fn fit`) instead of sklearn's exact `np.sum((alpha_*eigen_vals_)/(lambda_ + alpha_*eigen_vals_))` (`_bayes.py:305`), and converges on relative change in `alpha`/`lambda` rather than sklearn's `np.sum(np.abs(coef_old_ - coef_)) < tol` (`_bayes.py:310`). Oracle: `python3 -c "from sklearn.linear_model import BayesianRidge; import numpy as np; X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([3.,5.,7.,9.,11.]); m=BayesianRidge().fit(X,y); print(m.alpha_, m.lambda_)"` → `alpha_=2000000.99..., lambda_=0.25000037...`; the ferrolearn update (emulated) yields `alpha=1e10` (clamp ceiling), a > 3-order-of-magnitude divergence in `alpha_`. |
-| REQ-2 (alpha_1/alpha_2/lambda_1/lambda_2 params) | NOT-STARTED | open prereq blocker #465. `struct BayesianRidge<F>` in `bayesian_ridge.rs` has only `{max_iter, tol, alpha_init, lambda_init, fit_intercept}`; sklearn's `__init__` declares `alpha_1=1e-6, alpha_2=1e-6, lambda_1=1e-6, lambda_2=1e-6` (`_bayes.py:192-195`) and constrains them in `_parameter_constraints` (`_bayes.py:175-178`). Missing params ⇒ the REQ-1 update equations cannot be expressed. |
-| REQ-3 (alpha_init default = 1/Var(y)) | NOT-STARTED | open prereq blocker #466. `fn new` in `bayesian_ridge.rs` sets `alpha_init = F::one()` (i.e. `1.0`) unconditionally; sklearn defaults `alpha_init=None` and, when `None`, sets `alpha_ = 1.0 / (np.var(y) + eps)` (`_bayes.py:266-269`). For the AC-1 data this is `0.125` vs ferrolearn's `1.0`, changing the EM trajectory. (ferrolearn's field is a non-optional `F`, so the `None` sentinel itself is also absent.) |
+| REQ-1 (evidence-max fit w/ hyperpriors) | SHIPPED | closed #464. `fn fit` for `BayesianRidge` (`bayesian_ridge.rs`) runs the MacKay/Tipping loop: per-iteration `update_coef` posterior mean (`_bayes.py:373-394`), exact `gamma = sum((alpha*eigen_vals)/(lambda + alpha*eigen_vals))` (`_bayes.py:305`), `lambda = (gamma + 2*lambda_1) / (sum(coef^2) + 2*lambda_2)` (`_bayes.py:306`), `alpha = (n - gamma + 2*alpha_1) / (rmse + 2*alpha_2)` (`_bayes.py:307`), converging on `sum(|coef_old - coef|) < tol` (`_bayes.py:310`), with a final `update_coef` after the loop (`_bayes.py:322`). Non-test consumer: `RsBayesianRidge` in `ferrolearn-python/src/extras.rs` (`py_regressor!` over `FittedBayesianRidge<f64>`). Verified by `divergence_bayesian_ridge_fit_coef_alpha_lambda` (coef_ to ~1e-3, alpha_/lambda_ to ~1e-2 vs the live oracle SK_COEF/SK_ALPHA/SK_LAMBDA) plus `oracle_bayesian_ridge_y_scaled_var_init` and `oracle_bayesian_ridge_random_state_7`. |
+| REQ-2 (alpha_1/alpha_2/lambda_1/lambda_2 params) | SHIPPED | closed #465. `struct BayesianRidge<F>` (`bayesian_ridge.rs`) gains fields `alpha_1, alpha_2, lambda_1, lambda_2` (default `1e-6` in `fn new`) with setters `with_alpha_1`/`with_alpha_2`/`with_lambda_1`/`with_lambda_2`, mirroring `_bayes.py:192-195` and `_parameter_constraints` (`_bayes.py:175-178`). Consumed in the M-step of `fn fit` (`lambda` / `alpha` updates). Verified by `test_default_constructor` / `test_builder_setters`. |
+| REQ-3 (alpha_init default = 1/Var(y)) | SHIPPED | closed #466. `alpha_init` is now `Option<F>` (default `None`, the sklearn sentinel) on `struct BayesianRidge`; `fn fit` sets `alpha = 1 / (var(y) + eps)` when `None` (`_bayes.py:266-269`) via `fn variance`, and `lambda_init: Option<F>` defaults to `1.0` (`_bayes.py:270-271`). The y-scaled `oracle_bayesian_ridge_y_scaled_var_init` case (where `1/Var(y) ≈ 2.65e-6`) exercises this init and matches the oracle. |
 | REQ-4 (predict posterior mean) | SHIPPED | impl `fn predict in bayesian_ridge.rs` (`impl Predict for FittedBayesianRidge`) computes `x.dot(&self.coefficients) + self.intercept`, mirroring sklearn's `_decision_function` path (`_bayes.py:365`, the `return_std=False` branch). Non-test consumer: `ferrolearn-python/src/extras.rs` `RsBayesianRidge` (`py_regressor!` macro wraps `FittedBayesianRidge<f64>` and exposes `predict` to CPython), surfaced as `ferrolearn.BayesianRidge` in `ferrolearn-python/python/ferrolearn/_extras.py`. Verification: `cargo test -p ferrolearn-linear bayesian` (`test_predict_length`, `test_predict_feature_mismatch`). |
 | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | impl `fn fit in bayesian_ridge.rs` centers X, y when `fit_intercept` and recovers `intercept = y_mean - x_mean·w` (mirrors sklearn `_set_intercept`, `_bayes.py:339`); `impl HasCoefficients for FittedBayesianRidge` (`fn coefficients`, `fn intercept`) exposes `coef_`/`intercept_`. Non-test consumer: `RsBayesianRidge` in `ferrolearn-python/src/extras.rs` (constructed with `.with_fit_intercept(fit_intercept)`, `.with_max_iter`, `.with_tol`), exposing the fitted coefficients/intercept across the PyO3 boundary. Verification: `cargo test -p ferrolearn-linear bayesian` (`test_no_intercept`, `test_has_coefficients_length`). |
 | REQ-6 (compute_score / scores_) | NOT-STARTED | open prereq blocker #467. No `compute_score` field, no `scores_` attribute, no `_log_marginal_likelihood` analog; sklearn computes it per iteration (`_bayes.py:396-426`, accumulated at `:302`/`:330`). |
 | REQ-7 (n_iter_) | NOT-STARTED | open prereq blocker #468. `FittedBayesianRidge` stores no iteration count; sklearn sets `self.n_iter_ = iter_ + 1` (`_bayes.py:316`). The ferrolearn loop variable is `_iter` (unused). |
 | REQ-8 (predict return_std / sigma_) | NOT-STARTED | open prereq blocker #469. `FittedBayesianRidge.sigma` is only the *diagonal* of `(alpha·XᵀX + lambda·I)⁻¹` from `fn bayesian_ridge_solve`; sklearn's `sigma_` is the full `(n_features, n_features)` covariance `(1/alpha_)·Vh.T·(Vh/(eigen_vals_+lambda_/alpha_))` (`_bayes.py:333-337`) used by `predict(return_std=True)` to form `y_std = sqrt((X·sigma_·X).sum(1) + 1/alpha_)` (`_bayes.py:369-370`). `fn predict` has no `return_std` path. |
 | REQ-9 (sample_weight) | NOT-STARTED | open prereq blocker #470. `fn fit` takes only `(x, y)`; sklearn accepts `sample_weight` and rescales via `_rescale_data` (`_bayes.py:254-256`). |
-| REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #471. The module uses `ndarray` (`Array1`/`Array2`) and a hand-rolled `fn cholesky_solve` / `fn cholesky_diag_inv` rather than `ferray-core` arrays and `ferray::linalg` SVD (sklearn uses `scipy.linalg.svd`, `_bayes.py:287`). R-SUBSTRATE-2. |
+| REQ-10 (ferray substrate) | SHIPPED (SVD) | `fn fit` now computes the design-matrix SVD through `ferray::linalg::svd` (`ferray-linalg/src/decomp/svd.rs:40`) in `fn svd_thin`, bridging ndarray↔ferray at that boundary (R-SUBSTRATE-4), replacing the hand-rolled Cholesky kernels — mirroring sklearn's `scipy.linalg.svd(X, full_matrices=False)` (`_bayes.py:287`). The remaining array-type migration off `ndarray` (`Array1`/`Array2`) to `ferray-core` is tracked by #471. |
 
 ## Architecture
 

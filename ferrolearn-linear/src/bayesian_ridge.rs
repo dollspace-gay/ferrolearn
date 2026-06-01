@@ -35,7 +35,24 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status (per `.design/linear/bayesian_ridge.md`, mirrors `sklearn/linear_model/_bayes.py:26` @ 1.5.2)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (evidence-max fit w/ hyperpriors) | SHIPPED | `fn fit` for `BayesianRidge` runs the MacKay/Tipping loop (`_bayes.py:291-314`): exact `gamma = sum((alpha*eig)/(lambda+alpha*eig))` (`_bayes.py:305`), `lambda = (gamma+2*lambda_1)/(sum(coef^2)+2*lambda_2)` (`_bayes.py:306`), `alpha = (n-gamma+2*alpha_1)/(rmse+2*alpha_2)` (`_bayes.py:307`), converging on `sum|coef_old-coef|<tol` (`_bayes.py:310`). Consumer: `RsBayesianRidge` in `ferrolearn-python/src/extras.rs`. Verified by `divergence_bayesian_ridge_fit_coef_alpha_lambda` + 2 extra oracle cases vs live sklearn. |
+//! | REQ-2 (alpha_1/alpha_2/lambda_1/lambda_2 params) | SHIPPED | `struct BayesianRidge` fields `alpha_1, alpha_2, lambda_1, lambda_2` (default `1e-6`) with `with_alpha_1`/`with_alpha_2`/`with_lambda_1`/`with_lambda_2` setters, mirroring `_bayes.py:192-195` / `_parameter_constraints` (`_bayes.py:175-178`). Consumed in the M-step of `fn fit`. |
+//! | REQ-3 (alpha_init default = 1/Var(y)) | SHIPPED | `alpha_init: Option<F>` (default `None`), and `fn fit` sets `alpha = 1/(var(y)+eps)` when `None` (`_bayes.py:266-269`); `lambda_init: Option<F>` defaults to `1.0` (`_bayes.py:270-271`). |
+//! | REQ-4 (predict posterior mean) | SHIPPED | `fn predict` for `FittedBayesianRidge` computes `X·coef_ + intercept_` (`_bayes.py:365`). Consumer: `RsBayesianRidge` in `ferrolearn-python/src/extras.rs`. |
+//! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | `fn fit` centers and recovers `intercept = y_offset - X_offset·coef_` (`_bayes.py:339`); `impl HasCoefficients` exposes `coef_`/`intercept_`. |
+//! | REQ-6 (compute_score / scores_) | NOT-STARTED | open prereq blocker #467 — no `_log_marginal_likelihood` analog (`_bayes.py:396-426`). |
+//! | REQ-7 (n_iter_) | NOT-STARTED | open prereq blocker #468 — `FittedBayesianRidge` stores no iteration count (`_bayes.py:316`). |
+//! | REQ-8 (predict return_std / full sigma_) | NOT-STARTED | open prereq blocker #469 — `sigma` is the covariance diagonal, not the full `(n_features, n_features)` `sigma_` (`_bayes.py:333-337`); `predict` has no `return_std` path. |
+//! | REQ-9 (sample_weight) | NOT-STARTED | open prereq blocker #470 — `fn fit` takes only `(x, y)` (`_bayes.py:254-256`). |
+//! | REQ-10 (ferray substrate) | SHIPPED (SVD) | the SVD runs on `ferray::linalg::svd` (`ferray-linalg/src/decomp/svd.rs:40`), bridged ndarray↔ferray at the `fn fit` boundary (R-SUBSTRATE-4), mirroring sklearn `scipy.linalg.svd` (`_bayes.py:287`). Remaining `ndarray` array-type migration tracked by #471. |
 
+use ferray::linalg::{LinalgFloat, svd};
+use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -56,12 +73,27 @@ use num_traits::{Float, FromPrimitive};
 pub struct BayesianRidge<F> {
     /// Maximum number of EM (evidence-maximization) iterations.
     pub max_iter: usize,
-    /// Convergence tolerance on the relative change in log-evidence.
+    /// Convergence tolerance on `sum(|coef_old - coef|)` (sklearn `tol`).
     pub tol: F,
-    /// Initial noise precision (alpha). Must be positive.
-    pub alpha_init: F,
-    /// Initial weight precision (lambda). Must be positive.
-    pub lambda_init: F,
+    /// Shape parameter of the Gamma prior over `alpha` (sklearn `alpha_1`,
+    /// default `1e-6`).
+    pub alpha_1: F,
+    /// Inverse-scale (rate) parameter of the Gamma prior over `alpha`
+    /// (sklearn `alpha_2`, default `1e-6`).
+    pub alpha_2: F,
+    /// Shape parameter of the Gamma prior over `lambda` (sklearn `lambda_1`,
+    /// default `1e-6`).
+    pub lambda_1: F,
+    /// Inverse-scale (rate) parameter of the Gamma prior over `lambda`
+    /// (sklearn `lambda_2`, default `1e-6`).
+    pub lambda_2: F,
+    /// Initial noise precision (alpha). `None` (the default) means
+    /// `1 / (Var(y) + eps)`, matching sklearn's `alpha_init=None`. Must be
+    /// positive when set.
+    pub alpha_init: Option<F>,
+    /// Initial weight precision (lambda). `None` (the default) means `1.0`,
+    /// matching sklearn's `lambda_init=None`. Must be positive when set.
+    pub lambda_init: Option<F>,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
 }
@@ -69,15 +101,23 @@ pub struct BayesianRidge<F> {
 impl<F: Float + FromPrimitive> BayesianRidge<F> {
     /// Create a new `BayesianRidge` with default settings.
     ///
-    /// Defaults: `max_iter = 300`, `tol = 1e-3`, `alpha_init = 1.0`,
-    /// `lambda_init = 1.0`, `fit_intercept = true`.
+    /// Defaults mirror `sklearn.linear_model.BayesianRidge.__init__`
+    /// (`sklearn/linear_model/_bayes.py:187-202`): `max_iter = 300`,
+    /// `tol = 1e-3`, `alpha_1 = alpha_2 = lambda_1 = lambda_2 = 1e-6`,
+    /// `alpha_init = None` (⇒ `1/(Var(y)+eps)` at fit time),
+    /// `lambda_init = None` (⇒ `1.0`), `fit_intercept = true`.
     #[must_use]
     pub fn new() -> Self {
+        let eps6 = F::from(1e-6).unwrap_or_else(F::epsilon);
         Self {
             max_iter: 300,
-            tol: F::from(1e-3).unwrap(),
-            alpha_init: F::one(),
-            lambda_init: F::one(),
+            tol: F::from(1e-3).unwrap_or_else(F::epsilon),
+            alpha_1: eps6,
+            alpha_2: eps6,
+            lambda_1: eps6,
+            lambda_2: eps6,
+            alpha_init: None,
+            lambda_init: None,
             fit_intercept: true,
         }
     }
@@ -96,17 +136,46 @@ impl<F: Float + FromPrimitive> BayesianRidge<F> {
         self
     }
 
-    /// Set the initial noise precision.
+    /// Set the Gamma-prior shape parameter `alpha_1` over the noise precision.
     #[must_use]
-    pub fn with_alpha_init(mut self, alpha_init: F) -> Self {
-        self.alpha_init = alpha_init;
+    pub fn with_alpha_1(mut self, alpha_1: F) -> Self {
+        self.alpha_1 = alpha_1;
         self
     }
 
-    /// Set the initial weight precision.
+    /// Set the Gamma-prior rate parameter `alpha_2` over the noise precision.
+    #[must_use]
+    pub fn with_alpha_2(mut self, alpha_2: F) -> Self {
+        self.alpha_2 = alpha_2;
+        self
+    }
+
+    /// Set the Gamma-prior shape parameter `lambda_1` over the weight precision.
+    #[must_use]
+    pub fn with_lambda_1(mut self, lambda_1: F) -> Self {
+        self.lambda_1 = lambda_1;
+        self
+    }
+
+    /// Set the Gamma-prior rate parameter `lambda_2` over the weight precision.
+    #[must_use]
+    pub fn with_lambda_2(mut self, lambda_2: F) -> Self {
+        self.lambda_2 = lambda_2;
+        self
+    }
+
+    /// Set the initial noise precision. `None` restores the `1/(Var(y)+eps)`
+    /// default.
+    #[must_use]
+    pub fn with_alpha_init(mut self, alpha_init: F) -> Self {
+        self.alpha_init = Some(alpha_init);
+        self
+    }
+
+    /// Set the initial weight precision. `None` restores the `1.0` default.
     #[must_use]
     pub fn with_lambda_init(mut self, lambda_init: F) -> Self {
-        self.lambda_init = lambda_init;
+        self.lambda_init = Some(lambda_init);
         self
     }
 
@@ -160,155 +229,132 @@ impl<F: Float> FittedBayesianRidge<F> {
     }
 }
 
-/// Solve `(lambda/alpha * I + X^T X) w = X^T y` via Cholesky or fallback.
+/// Thin-SVD factor triple `(U, S, Vh)` returned by [`svd_thin`].
+type SvdFactors<F> = (Array2<F>, Array1<F>, Array2<F>);
+
+/// Compute the SVD of the (centered) design `X = U S Vᵀ` via the ferray
+/// substrate (`ferray::linalg::svd`, `ferray-linalg/src/decomp/svd.rs:40`),
+/// the analog of scikit-learn's `U, S, Vh = scipy.linalg.svd(X,
+/// full_matrices=False)` (`sklearn/linear_model/_bayes.py:287`).
 ///
-/// Returns `(w, diag(Sigma))` where `Sigma = alpha^{-1} * (lambda * I + alpha * X^T X)^{-1}`.
-fn bayesian_ridge_solve<F: Float + FromPrimitive + 'static>(
+/// The `ndarray ↔ ferray` conversion happens at this boundary (R-SUBSTRATE-4):
+/// the caller keeps its `ndarray` signature during the workspace-wide
+/// migration. Returns `(U, S, Vh)` as owned `ndarray` arrays with `U` of shape
+/// `(n_samples, k)`, `S` of length `k`, and `Vh` of shape `(k, n_features)`
+/// where `k = min(n_samples, n_features)`.
+fn svd_thin<F: LinalgFloat>(x: &Array2<F>) -> Result<SvdFactors<F>, FerroError> {
+    let (n_samples, n_features) = x.dim();
+
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4).
+    let x_flat: Vec<F> = x.iter().copied().collect();
+    let a = FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([n_samples, n_features]), x_flat)
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd: failed to build design matrix: {e}"),
+        })?;
+
+    // full_matrices=false => thin SVD, matching scipy's `full_matrices=False`.
+    let (u, s, vt) = svd(&a, false).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray svd failed: {e}"),
+    })?;
+
+    // Bridge ferray -> ndarray.
+    let u_shape = u.shape();
+    let u_nd = Array2::from_shape_vec((u_shape[0], u_shape[1]), u.iter().copied().collect())
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd: U shape conversion failed: {e}"),
+        })?;
+    let s_nd = Array1::from_vec(s.iter().copied().collect());
+    let vt_shape = vt.shape();
+    let vt_nd = Array2::from_shape_vec((vt_shape[0], vt_shape[1]), vt.iter().copied().collect())
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd: Vt shape conversion failed: {e}"),
+        })?;
+
+    Ok((u_nd, s_nd, vt_nd))
+}
+
+/// Posterior mean `coef_` and residual sum of squares `rmse_`, mirroring
+/// scikit-learn's `BayesianRidge._update_coef_`
+/// (`sklearn/linear_model/_bayes.py:373-394`):
+///
+/// ```text
+/// coef_ = Vhᵀ · diag(S / (eigen_vals_ + lambda_/alpha_)) · (Uᵀ y)    (n > p)
+///       = Xᵀ · diag(1 / (eigen_vals_ + lambda_/alpha_)) · (Uᵀ y)·... (n ≤ p)
+/// rmse_ = sum((y - X·coef_)²)
+/// ```
+///
+/// We implement the `n_samples > n_features` posterior-mean form
+/// `coef_ = (Vhᵀ * S/(eigen_vals_ + lambda_/alpha_)) @ (Uᵀ y)` for both cases:
+/// the thin-SVD identity `Xᵀ y = Vhᵀ · diag(S) · (Uᵀ y)` makes
+/// `Vhᵀ · diag(S/(eig + lambda/alpha)) · (Uᵀ y)` equal to sklearn's `n ≤ p`
+/// branch `Xᵀ · diag(1/(eig + lambda/alpha)) · U Uᵀ y` whenever it shares the
+/// same row space, so the single form reproduces sklearn's `coef_` on both
+/// regimes (the test suite covers `n > p` and the binding's f64 path).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors sklearn's BayesianRidge._update_coef_(self, X, y, n_samples, \
+              n_features, XT_y, U, Vh, eigen_vals_, alpha_, lambda_) — the SVD factors \
+              + precisions are the intrinsic posterior-mean inputs (_bayes.py:373)"
+)]
+fn update_coef<F: Float + ScalarOperand + 'static>(
     x: &Array2<F>,
     y: &Array1<F>,
+    u: &Array2<F>,
+    vt: &Array2<F>,
+    s: &Array1<F>,
+    eigen_vals: &Array1<F>,
     alpha: F,
     lambda: F,
-) -> Result<(Array1<F>, Array1<F>), FerroError> {
-    let (_n_samples, n_features) = x.dim();
-
-    // Compute X^T X.
-    let xt = x.t();
-    let mut xtx = xt.dot(x);
-
-    // Scale by alpha, then add lambda * I.
-    // The system we solve is: (alpha * X^T X + lambda * I) w = alpha * X^T y
-    for i in 0..n_features {
-        for j in 0..n_features {
-            xtx[[i, j]] = xtx[[i, j]] * alpha;
-        }
-        xtx[[i, i]] = xtx[[i, i]] + lambda;
+) -> (Array1<F>, F) {
+    let k = s.len();
+    // Uᵀ y, length k.
+    let ut_y = u.t().dot(y);
+    // scale_i = S_i / (eigen_vals_i + lambda_/alpha_)
+    let ratio = lambda / alpha;
+    let mut scaled = Array1::<F>::zeros(k);
+    for i in 0..k {
+        scaled[i] = s[i] / (eigen_vals[i] + ratio) * ut_y[i];
     }
+    // coef_ = Vhᵀ · scaled  (Vh is (k, n_features), so Vhᵀ is (n_features, k)).
+    let coef = vt.t().dot(&scaled);
 
-    let xty = xt.dot(y);
-    let xty_scaled: Array1<F> = xty.mapv(|v| v * alpha);
+    // rmse_ = sum((y - X·coef_)²)
+    let residual = y - &x.dot(&coef);
+    let rmse = residual.dot(&residual);
 
-    // Solve via Cholesky.
-    let w = cholesky_solve(&xtx, &xty_scaled)?;
-
-    // Compute diagonal of posterior covariance: diag((alpha * X^T X + lambda * I)^{-1}).
-    let sigma_diag = cholesky_diag_inv(&xtx)?;
-
-    Ok((w, sigma_diag))
+    (coef, rmse)
 }
 
-/// Cholesky decomposition and solve `A x = b`.
-fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "Cholesky: matrix not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
-        }
-    }
-
-    // Forward substitution.
-    let mut z = Array1::<F>::zeros(n);
-    for i in 0..n {
-        let mut s = b[i];
-        for j in 0..i {
-            s = s - l[[i, j]] * z[j];
-        }
-        z[i] = s / l[[i, i]];
-    }
-
-    // Backward substitution.
-    let mut x = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = z[i];
-        for j in (i + 1)..n {
-            s = s - l[[j, i]] * x[j];
-        }
-        x[i] = s / l[[i, i]];
-    }
-
-    Ok(x)
-}
-
-/// Compute the diagonal of `A^{-1}` given Cholesky `L` of `A = L L^T`.
-///
-/// Uses the identity: `diag(A^{-1}) = diag(L^{-T} L^{-1})`.
-fn cholesky_diag_inv<F: Float>(a: &Array2<F>) -> Result<Array1<F>, FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "Cholesky diag_inv: matrix not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
-        }
-    }
-
-    // Compute L^{-1} column by column and accumulate diagonal of L^{-T} L^{-1}.
-    let mut diag = Array1::<F>::zeros(n);
-    for col in 0..n {
-        // Solve L z = e_col.
-        let mut z = Array1::<F>::zeros(n);
-        z[col] = F::one() / l[[col, col]];
-        for i in (col + 1)..n {
-            let mut s = F::zero();
-            for k in col..i {
-                s = s + l[[i, k]] * z[k];
-            }
-            z[i] = -s / l[[i, i]];
-        }
-        // Accumulate z^T z into the diagonal positions it touches.
-        for i in 0..n {
-            diag[i] = diag[i] + z[i] * z[i];
-        }
-    }
-
-    Ok(diag)
-}
-
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
+impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
     for BayesianRidge<F>
 {
     type Fitted = FittedBayesianRidge<F>;
     type Error = FerroError;
 
-    /// Fit the Bayesian Ridge model via evidence maximization (EM).
+    /// Fit the Bayesian Ridge model by MacKay (1992) evidence maximization,
+    /// mirroring `sklearn.linear_model.BayesianRidge.fit`
+    /// (`sklearn/linear_model/_bayes.py:217-339`).
     ///
-    /// Iterates over:
-    /// 1. Solve posterior for `w` given current `alpha` and `lambda`.
-    /// 2. Update `alpha` and `lambda` using the posterior statistics.
+    /// After centering (when `fit_intercept`), the (thin) SVD `X = U S Vᵀ`
+    /// gives `eigen_vals_ = S²` (`_bayes.py:287-288`). Each iteration updates
+    /// the posterior mean `coef_` (`_bayes.py:294`, `_update_coef_`), then the
+    /// effective degrees of freedom and the Gamma-prior precision updates
+    /// (`_bayes.py:305-307`):
+    ///
+    /// ```text
+    /// gamma_  = sum((alpha_ * eigen_vals_) / (lambda_ + alpha_ * eigen_vals_))
+    /// lambda_ = (gamma_ + 2*lambda_1) / (sum(coef_²) + 2*lambda_2)
+    /// alpha_  = (n_samples - gamma_ + 2*alpha_1) / (rmse_ + 2*alpha_2)
+    /// ```
+    ///
+    /// converging when `sum(|coef_old - coef_|) < tol` (`_bayes.py:310`).
     ///
     /// # Errors
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
-    /// - [`FerroError::InvalidParameter`] — non-positive initial precisions.
+    /// - [`FerroError::InvalidParameter`] — non-positive `alpha_init`/`lambda_init`.
     /// - [`FerroError::InsufficientSamples`] — fewer than 2 samples.
-    /// - [`FerroError::NumericalInstability`] — numerical failure in solver.
+    /// - [`FerroError::NumericalInstability`] — SVD or numerical failure.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedBayesianRidge<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -328,24 +374,30 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        if self.alpha_init <= F::zero() {
+        let zero = <F as num_traits::Zero>::zero();
+        let one = <F as num_traits::One>::one();
+
+        if let Some(a0) = self.alpha_init
+            && a0 <= zero
+        {
             return Err(FerroError::InvalidParameter {
                 name: "alpha_init".into(),
                 reason: "must be positive".into(),
             });
         }
 
-        if self.lambda_init <= F::zero() {
+        if let Some(l0) = self.lambda_init
+            && l0 <= zero
+        {
             return Err(FerroError::InvalidParameter {
                 name: "lambda_init".into(),
                 reason: "must be positive".into(),
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
-        let n_feat_f = F::from(n_features).unwrap();
+        let n_f = <F as num_traits::NumCast>::from(n_samples).unwrap_or(one);
 
-        // Center data for intercept.
+        // Center data for intercept (sklearn `_preprocess_data`, `_bayes.py:246`).
         let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
             let x_mean = x
                 .mean_axis(Axis(0))
@@ -363,86 +415,120 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             (x.clone(), y.clone(), None, None)
         };
 
-        // Precompute eigenvalues of X^T X for the effective degrees of freedom.
-        // We use a simpler trace-based approximation here: gamma ≈ n_features.
-        let xt = x_work.t();
-        let xtx = xt.dot(&x_work);
-
-        // Eigenvalues of X^T X via power iteration or trace approximation.
-        // We compute the trace to get sum of eigenvalues.
-        let trace_xtx: F = (0..n_features)
-            .map(|i| xtx[[i, i]])
-            .fold(F::zero(), |a, b| a + b);
-
-        let mut alpha = self.alpha_init;
-        let mut lambda = self.lambda_init;
-
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut sigma_diag = Array1::<F>::ones(n_features);
-
-        for _iter in 0..self.max_iter {
-            let alpha_old = alpha;
-            let lambda_old = lambda;
-
-            // E-step: compute posterior mean w and diag(Sigma).
-            let (w_new, sd_new) = bayesian_ridge_solve(&x_work, &y_work, alpha, lambda)?;
-
-            // Effective degrees of freedom: gamma = sum_i alpha * lambda_i / (alpha * lambda_i + lambda)
-            // Approximated using trace(Sigma * alpha * X^T X) = alpha * trace(X^T X Sigma).
-            // For simplicity we use: gamma ≈ sum_i (alpha * xtx_ii * sigma_ii).
-            let gamma: F = (0..n_features)
-                .map(|i| alpha * xtx[[i, i]] * sd_new[i])
-                .fold(F::zero(), |a, b| a + b);
-
-            // M-step: update alpha and lambda.
-            let residual = &y_work - x_work.dot(&w_new);
-            let sse = residual.dot(&residual);
-
-            // alpha = (n - gamma) / ||y - Xw||^2
-            let new_alpha = (n_f - gamma) / sse.max(F::from(1e-300).unwrap());
-
-            // lambda = gamma / ||w||^2
-            let w_norm_sq = w_new.dot(&w_new);
-            let new_lambda = gamma / w_norm_sq.max(F::from(1e-300).unwrap());
-
-            // Clamp to reasonable range.
-            let clamp_max = F::from(1e10).unwrap();
-            let clamp_min = F::from(1e-10).unwrap();
-            alpha = new_alpha.min(clamp_max).max(clamp_min);
-            lambda = new_lambda.min(clamp_max).max(clamp_min);
-
-            // Check convergence on relative change in alpha.
-            let delta_alpha =
-                (alpha - alpha_old).abs() / (alpha_old.abs() + F::from(1e-10).unwrap());
-            let delta_lambda =
-                (lambda - lambda_old).abs() / (lambda_old.abs() + F::from(1e-10).unwrap());
-
-            w = w_new;
-            sigma_diag = sd_new;
-
-            if delta_alpha < self.tol && delta_lambda < self.tol {
-                break;
+        // Initialization (`_bayes.py:262-271`): eps = finfo(dtype).eps;
+        // alpha_ = 1/(Var(y)+eps) when alpha_init is None; lambda_ = 1 when
+        // lambda_init is None.
+        let eps = <F as Float>::epsilon();
+        let mut alpha = match self.alpha_init {
+            Some(a0) => a0,
+            None => {
+                let var_y = variance(&y_work);
+                one / (var_y + eps)
             }
+        };
+        let mut lambda = self.lambda_init.unwrap_or(one);
 
-            // Avoid unused variable warning — trace_xtx is used in convergence.
-            let _ = trace_xtx;
-            let _ = n_feat_f;
+        // SVD (`_bayes.py:287-288`): U, S, Vh = svd(X, full_matrices=False);
+        // eigen_vals_ = S².
+        let (u, s, vt) = svd_thin(&x_work)?;
+        let eigen_vals: Array1<F> = s.mapv(|v| v * v);
+
+        let two = one + one;
+        let alpha_1 = self.alpha_1;
+        let alpha_2 = self.alpha_2;
+        let lambda_1 = self.lambda_1;
+        let lambda_2 = self.lambda_2;
+
+        // `coef_old_` tracks the previous iterate for the convergence check;
+        // sklearn recomputes `coef_` once more after the loop (`_bayes.py:322`),
+        // so the in-loop posterior mean is not itself the returned coefficient.
+        let mut coef_old: Option<Array1<F>> = None;
+
+        // Convergence loop (`_bayes.py:291-314`).
+        for iter_ in 0..self.max_iter {
+            let (coef_new, rmse) =
+                update_coef(&x_work, &y_work, &u, &vt, &s, &eigen_vals, alpha, lambda);
+
+            // gamma_ = sum((alpha_ * eigen_vals_) / (lambda_ + alpha_ * eigen_vals_))
+            let gamma: F = eigen_vals
+                .iter()
+                .map(|&ev| (alpha * ev) / (lambda + alpha * ev))
+                .fold(zero, |acc, t| acc + t);
+
+            // lambda_ = (gamma_ + 2*lambda_1) / (sum(coef_²) + 2*lambda_2)
+            let coef_sq: F = coef_new.iter().map(|&c| c * c).fold(zero, |a, b| a + b);
+            lambda = (gamma + two * lambda_1) / (coef_sq + two * lambda_2);
+
+            // alpha_ = (n_samples - gamma_ + 2*alpha_1) / (rmse_ + 2*alpha_2)
+            alpha = (n_f - gamma + two * alpha_1) / (rmse + two * alpha_2);
+
+            // Convergence: iter>0 and sum(|coef_old - coef|) < tol.
+            if iter_ != 0
+                && let Some(ref prev) = coef_old
+            {
+                let delta: F = prev
+                    .iter()
+                    .zip(coef_new.iter())
+                    .map(|(&o, &c)| (o - c).abs())
+                    .fold(zero, |a, b| a + b);
+                if delta < self.tol {
+                    break;
+                }
+            }
+            coef_old = Some(coef_new);
         }
 
+        // Final coef_ update with the converged alpha_/lambda_ (`_bayes.py:322`).
+        let (coef, _rmse) = update_coef(&x_work, &y_work, &u, &vt, &s, &eigen_vals, alpha, lambda);
+
+        // Posterior covariance diagonal: sigma_ = (1/alpha_) * Vhᵀ ·
+        // diag(1/(eigen_vals_ + lambda_/alpha_)) · Vh (`_bayes.py:333-337`);
+        // we expose its diagonal.
+        let ratio = lambda / alpha;
+        let inv_alpha = one / alpha;
+        let mut sigma_diag = Array1::<F>::zeros(n_features);
+        let k = s.len();
+        for j in 0..n_features {
+            let mut acc = zero;
+            for i in 0..k {
+                let vij = vt[[i, j]];
+                acc += (vij * vij) / (eigen_vals[i] + ratio);
+            }
+            sigma_diag[j] = inv_alpha * acc;
+        }
+
+        // intercept_ = y_offset - X_offset · coef_ (`_bayes.py:339`,
+        // `_set_intercept`).
         let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
-            *ym - xm.dot(&w)
+            *ym - xm.dot(&coef)
         } else {
-            F::zero()
+            zero
         };
 
         Ok(FittedBayesianRidge {
-            coefficients: w,
+            coefficients: coef,
             intercept,
             alpha,
             lambda,
             sigma: sigma_diag,
         })
     }
+}
+
+/// Population variance `mean((v - mean(v))²)`, matching numpy's `np.var`
+/// (the `ddof=0` default sklearn relies on at `_bayes.py:269`).
+fn variance<F: Float>(v: &Array1<F>) -> F {
+    let n = v.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let n_f = F::from(n).unwrap_or_else(F::one);
+    let mean = v.iter().fold(F::zero(), |a, &b| a + b) / n_f;
+    let ss = v
+        .iter()
+        .map(|&x| (x - mean) * (x - mean))
+        .fold(F::zero(), |a, b| a + b);
+    ss / n_f
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
@@ -491,7 +577,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
 // Pipeline integration.
 impl<F> PipelineEstimator<F> for BayesianRidge<F>
 where
-    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+    F: LinalgFloat + FromPrimitive + ScalarOperand,
 {
     /// Fit the model and return it as a boxed pipeline estimator.
     ///
@@ -532,11 +618,18 @@ mod tests {
 
     #[test]
     fn test_default_constructor() {
+        // Mirrors sklearn BayesianRidge.__init__ defaults (`_bayes.py:187-202`):
+        // alpha_init/lambda_init default to None; the four Gamma hyperpriors
+        // default to 1e-6.
         let m = BayesianRidge::<f64>::new();
         assert_eq!(m.max_iter, 300);
         assert!(m.fit_intercept);
-        assert_relative_eq!(m.alpha_init, 1.0);
-        assert_relative_eq!(m.lambda_init, 1.0);
+        assert!(m.alpha_init.is_none());
+        assert!(m.lambda_init.is_none());
+        assert_relative_eq!(m.alpha_1, 1e-6);
+        assert_relative_eq!(m.alpha_2, 1e-6);
+        assert_relative_eq!(m.lambda_1, 1e-6);
+        assert_relative_eq!(m.lambda_2, 1e-6);
     }
 
     #[test]
@@ -546,11 +639,19 @@ mod tests {
             .with_tol(1e-6)
             .with_alpha_init(2.0)
             .with_lambda_init(0.5)
+            .with_alpha_1(1e-4)
+            .with_alpha_2(2e-4)
+            .with_lambda_1(3e-4)
+            .with_lambda_2(4e-4)
             .with_fit_intercept(false);
         assert_eq!(m.max_iter, 50);
         assert!(!m.fit_intercept);
-        assert_relative_eq!(m.alpha_init, 2.0);
-        assert_relative_eq!(m.lambda_init, 0.5);
+        assert_eq!(m.alpha_init, Some(2.0));
+        assert_eq!(m.lambda_init, Some(0.5));
+        assert_relative_eq!(m.alpha_1, 1e-4);
+        assert_relative_eq!(m.alpha_2, 2e-4);
+        assert_relative_eq!(m.lambda_1, 3e-4);
+        assert_relative_eq!(m.lambda_2, 4e-4);
     }
 
     // ---- Validation errors ----
