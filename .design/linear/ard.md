@@ -24,12 +24,11 @@ The ferrolearn implementation already carries the constructor surface
 doc-comment, which writes the update equations *without* the Gamma hyperprior
 terms — the actual `fn fit` update equations DO include the
 `2*alpha_1`/`2*alpha_2`/`2*lambda_1`/`2*lambda_2` terms (so this is NOT a
-#464-class hyperprior-omission divergence). However, the fit loop diverges from
-sklearn in three structural ways that break 2D parity (REQ-1/2/3 NOT-STARTED):
-it seeds `alpha = 1.0` instead of `1/(Var(y)+eps)`, it solves the *full*
-feature system every iteration instead of masking pruned columns via
-`keep_lambda`, and it converges on a relative `alpha`/`lambda` delta rather than
-sklearn's `sum(|coef_old - coef_|) < tol`. `predict` and the
+#464-class hyperprior-omission divergence). The fit loop now matches sklearn's
+three structural pillars (REQ-1/2/3 SHIPPED): it seeds
+`alpha = 1/(Var(y)+eps)`, masks pruned columns via a per-iteration `keep_lambda`
+and solves only the kept sub-block, and converges on
+`sum(|coef_old - coef_|) < tol`. `predict` and the
 `fit_intercept`/`HasCoefficients` surface (REQ-4/5) are SHIPPED.
 
 ## Requirements
@@ -88,15 +87,15 @@ sklearn's `sum(|coef_old - coef_|) < tol`. `predict` and the
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (iterative ARD fit) | NOT-STARTED | open prereq blocker #474. The hyperprior terms ARE present (`fn fit` in `ard.rs`: `new_alpha = (n_f - gamma_sum + two * self.alpha_1) / (sse + two * self.alpha_2)` and `new_lambda[i] = (gamma[i] + two * self.lambda_1) / (wi_sq + two * self.lambda_2)`), but the loop solves the full system every iteration (`fn ard_solve` over all `n_features`) with no `keep_lambda` masking, seeds `alpha = F::one()`, and converges on a relative `alpha`/`lambda` delta. Live oracle: sklearn 2D `coef_=[0.01019,0.01990]`, `lambda_=[48.80,2500.005]`; ferrolearn `coef=[0.0,0.01990]`, `lambda=[493087,2475]` — feature 0 wrongly pruned. |
-| REQ-2 (init `alpha_=1/Var(y)`, params) | NOT-STARTED | open prereq blocker #475. Constructor params `lambda_1`/`lambda_2`/`threshold_lambda` ARE present (`struct ARDRegression`, `fn new` defaults `lambda_1=lambda_2=1e-6`, `threshold_lambda=1e4`), but `fn fit` hardcodes `let mut alpha = F::one()` rather than sklearn's `1.0 / (np.var(y) + eps)` (`sklearn/linear_model/_bayes.py:658`). |
-| REQ-3 (per-iter `threshold_lambda` pruning) | NOT-STARTED | open prereq blocker #476. `fn fit` applies pruning ONCE after the loop (`if lambda[i] > self.threshold_lambda { w[i] = F::zero() }`), not the per-iteration `keep_lambda = lambda_ < self.threshold_lambda; coef_[~keep_lambda] = 0` that also removes columns from the solve (`sklearn/linear_model/_bayes.py:691-692`). |
+| REQ-1 (iterative ARD fit) | SHIPPED | impl `fn fit in ard.rs` runs the per-iteration evidence-maximization loop including the Gamma hyperprior terms (`lambda[i] = (gamma_keep[col] + two * self.lambda_1) / (ci * ci + two * self.lambda_2)`, `alpha = (n_f - gamma_sum + two * self.alpha_1) / (rmse + two * self.alpha_2)`), with per-iteration `keep_lambda` column masking (`update_sigma` over `Xk = X[:, keep_lambda]`), init `alpha = one / (var_y + eps)`, and convergence on `sum(|coef_old - coef_|) < tol`, mirroring sklearn `ARDRegression.fit` (`sklearn/linear_model/_bayes.py:644-730`). Non-test consumer: `RsARDRegression` in `ferrolearn-python/src/extras.rs` (the f64 binding satisfies `LinalgFloat`). Verification: `divergence_ard_fit_2feature_wrong_pruning`/`divergence_ard_fit_4feature_wrong_pruned_set` (`ferrolearn-linear/tests/divergence_ard_fit.rs`) now pass — 2D `coef_=[0.010193,0.019898]`, `alpha_=2.5e6`, `lambda_=[48.80,2500.005]` (both features kept), 4D pruned set `{1,3}` — matching the live sklearn 1.5.2 oracle (closes #474). |
+| REQ-2 (init `alpha_=1/Var(y)`, params) | SHIPPED | impl `fn fit in ard.rs` seeds `let mut alpha = one / (var_y + eps)` with `var_y = centered.dot(&centered) / n_f` and `eps = finfo(f64).eps`, and `lambda = ones(n_features)`, mirroring sklearn `_bayes.py:658-659`. Constructor params `lambda_1`/`lambda_2` (`1e-6`) and `threshold_lambda` (`1e4`) present in `struct ARDRegression`/`fn new`. Non-test consumer: `RsARDRegression` in `ferrolearn-python/src/extras.rs`. Verification: `ard_fit_1feature_matches_sklearn_control` (`alpha_≈2.000001e6`) plus the 2D/4D divergence tests now match the oracle (closes #475). |
+| REQ-3 (per-iter `threshold_lambda` pruning) | SHIPPED | impl `fn fit in ard.rs` recomputes `keep_lambda[i] = lambda[i] < self.threshold_lambda` every iteration and zeros pruned coefficients (`if !keep_lambda[i] { coef[i] = zero }`), removing pruned columns from the next `update_sigma` solve (`Xk = X[:, keep_lambda]`), mirroring sklearn `_bayes.py:691-692`. Non-test consumer: `RsARDRegression` in `ferrolearn-python/src/extras.rs`. Verification: `divergence_ard_fit_4feature_wrong_pruned_set` asserts the pruned set is exactly `{1,3}` (relevant features 0 and 2 kept), matching the live oracle (closes #476). |
 | REQ-4 (predict) | SHIPPED | impl `fn predict in ard.rs` (`let preds = x.dot(&self.coefficients) + self.intercept`) mirrors sklearn `LinearModel._decision_function` used by `ARDRegression.predict` (`sklearn/linear_model/_bayes.py:761`, `X @ coef_ + intercept_`). Non-test consumer: `ferrolearn-python/src/extras.rs` (`RsARDRegression` via the `py_regressor!` macro, whose `predict` calls `FittedARDRegression::predict`). Verification: `cargo run` example yields 1D `coef≈[2.0]`, `intercept≈1.0` (matches sklearn `coef_≈[1.99999997]`, `intercept_≈1.0`). |
 | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | impl `fn fit in ard.rs` centers when `self.fit_intercept` then sets `intercept = *ym - xm.dot(&w)`; `impl HasCoefficients for FittedARDRegression` returns `&self.coefficients` and `self.intercept`. Mirrors sklearn `_set_intercept` (`sklearn/linear_model/_bayes.py:729`) and the `coef_`/`intercept_` attributes (`_bayes.py:725`, `:490`). Non-test consumer: `ferrolearn-python/src/extras.rs` (`RsARDRegression` exposes `coef_`/`intercept_` through `py_regressor!`). Verification: `test_no_intercept` asserts `intercept_ == 0.0` with `fit_intercept=false`. |
 | REQ-6 (compute_score / scores_) | NOT-STARTED | open prereq blocker #477. No `compute_score` constructor param and no `scores_` fitted attribute; sklearn computes the objective per iteration (`sklearn/linear_model/_bayes.py:695-704`). |
 | REQ-7 (n_iter_) | NOT-STARTED | open prereq blocker #478. `FittedARDRegression` stores no iteration count; sklearn sets `self.n_iter_ = iter_ + 1` (`sklearn/linear_model/_bayes.py:716`). |
 | REQ-8 (return_std / full sigma_) | NOT-STARTED | open prereq blocker #479. `fn predict` returns only the mean; `FittedARDRegression` stores `sigma` as the covariance *diagonal* (`Array1`), not the full `(n_keep, n_keep)` matrix sklearn stores (`sklearn/linear_model/_bayes.py:727`) and uses for `predict(return_std=True)` (`_bayes.py:761`). |
-| REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #480. `ard.rs` is built on `ndarray` (`use ndarray::{Array1, Array2, ...}`) with a hand-rolled Cholesky in `fn ard_solve`; the destination substrate is `ferray-core` arrays and `ferray::linalg` (R-SUBSTRATE-1). |
+| REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #480. The kept-block posterior-covariance inverse now runs on `ferray::linalg::inv` (`fn update_sigma in ard.rs`, `ferray-linalg/src/solve.rs:367`), bridged ndarray↔ferray at the boundary (R-SUBSTRATE-4) — the hand-rolled Cholesky `fn ard_solve` is gone. The array type is still `ndarray` (`use ndarray::{Array1, Array2, ...}`); the destination `ferray-core` array-type migration remains under #480 (R-SUBSTRATE-1). |
 
 ## Architecture
 
@@ -120,22 +119,22 @@ and `sigma` — but `sigma` is the *diagonal* of the posterior covariance
 introspection surface.
 
 `fn fit` (`impl Fit for ARDRegression`) centers `X`/`y` when `fit_intercept`,
-seeds `alpha = F::one()` and `lambda = ones(n_features)`, then iterates: solve
-the regularized posterior via `fn ard_solve` (Cholesky of
-`alpha * Xᵀ X + diag(lambda)` plus a diagonal-of-inverse pass for the covariance
-diagonal), compute `gamma_i = 1 - lambda_i * Sigma_ii`, and apply the
-hyperprior-bearing `alpha`/`lambda` updates. It diverges from sklearn's fit
-(`_bayes.py:644-730`) in three ways tracked as blockers: (1) sklearn seeds
-`alpha_ = 1/(Var(y)+eps)` (`_bayes.py:658`); (2) sklearn maintains a boolean
-`keep_lambda` mask and solves only the kept sub-block each iteration
-(`update_coeff`/`update_sigma` over `X[:, keep_lambda]`, `_bayes.py:664-692`),
-pruning columns mid-loop, whereas ferrolearn solves the full system and prunes
-only once after the loop (`if lambda[i] > self.threshold_lambda`); (3) sklearn
-converges on `sum(|coef_old - coef_|) < tol` (`_bayes.py:707`) while ferrolearn
-uses a relative `alpha`/`lambda` delta. ferrolearn also clamps `alpha`/`lambda`
-to `[1e-10, 1e10]`, which has no sklearn analog. On single-feature designs the
-mask is a no-op so results match; on multi-feature designs the masking and init
-differences flip pruning decisions, producing the 2D divergence in AC-1.
+seeds `alpha = 1/(Var(y)+eps)` (`_bayes.py:658`) and `lambda = ones(n_features)`
+with all features kept, then iterates: build `Xk = X[:, keep_lambda]`, solve the
+kept-block posterior covariance via `fn update_sigma`
+(`Sigma = (diag(lambda[keep]) + alpha * Xkᵀ Xk)⁻¹` on `ferray::linalg::inv`,
+`_bayes.py:750-759`), set `coef[keep] = alpha * Sigma @ Xkᵀ y` and `coef[~keep] =
+0`, compute `gamma_i = 1 - lambda_i * Sigma_ii`, apply the hyperprior-bearing
+`lambda`/`alpha` updates, recompute `keep_lambda = lambda_ < threshold_lambda`
+and zero pruned coefficients, then check convergence on
+`sum(|coef_old - coef_|) < tol` (`_bayes.py:707`). After the loop a final
+`update_sigma`/`coef` refresh runs over the surviving kept set (`_bayes.py:718-721`).
+This mirrors sklearn's fit (`_bayes.py:644-730`); the `_update_sigma` (n≥p)
+regime is implemented (the test designs and the f64 binding are all n≥p), with
+the Woodbury (`_update_sigma_woodbury`, n<p) path left for a future blocker. On
+single-feature designs the mask is a trivial no-op so results match (the control
+test); on multi-feature designs the per-iteration masking keeps the features
+sklearn keeps (AC-1).
 
 `fn predict` (`impl Predict for FittedARDRegression`) computes
 `X @ coefficients + intercept`, validating the feature count. `ARDRegression`

@@ -7,15 +7,24 @@
 //!
 //! # Algorithm
 //!
-//! Starting from initial alpha (noise precision) and per-feature lambda_i
-//! (weight precision) values, the model iterates:
+//! Initialisation seeds `alpha = 1/(Var(y)+eps)` and `lambda_i = 1` for every
+//! feature, with all features kept (`keep_lambda = lambda_ < threshold_lambda`,
+//! initially all-true). Each iteration solves only the KEPT columns
+//! `Xk = X[:, keep_lambda]` and updates, including the Gamma hyperprior terms:
 //!
-//! 1. Solve the regularised posterior: `w = (alpha * X^T X + diag(lambda))^{-1} alpha X^T y`.
-//! 2. Update gamma_i (effective degrees of freedom): `gamma_i = 1 - lambda_i * Sigma_{ii}`.
-//! 3. Update alpha: `alpha = (n - sum(gamma)) / ||y - Xw||^2`.
-//! 4. Update lambda_i: `lambda_i = gamma_i / w_i^2`.
+//! 1. Posterior covariance of the kept block:
+//!    `Sigma = (diag(lambda[keep]) + alpha * Xk^T Xk)^{-1}`,
+//!    then `w[keep] = alpha * Sigma @ Xk^T y`, `w[~keep] = 0`.
+//! 2. Effective degrees of freedom: `gamma_i = 1 - lambda_i * Sigma_{ii}`.
+//! 3. Update lambda: `lambda_i = (gamma_i + 2*lambda_1) / (w_i^2 + 2*lambda_2)`.
+//! 4. Update alpha:
+//!    `alpha = (n - sum(gamma) + 2*alpha_1) / (||y - Xw||^2 + 2*alpha_2)`.
+//! 5. Recompute the mask `keep_lambda = lambda_ < threshold_lambda` and zero the
+//!    coefficients of pruned features.
 //!
-//! Features where `lambda_i > threshold_lambda` are pruned.
+//! Convergence is `sum(|coef_old - coef_|) < tol` (checked after the first
+//! iteration). This mirrors scikit-learn's `ARDRegression.fit`
+//! (`sklearn/linear_model/_bayes.py:644-730`).
 //!
 //! # Examples
 //!
@@ -35,6 +44,8 @@
 //! assert_eq!(preds.len(), 5);
 //! ```
 
+use ferray::linalg::{LinalgFloat, inv};
+use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -192,100 +203,76 @@ impl<F: Float> FittedARDRegression<F> {
     }
 }
 
-/// Solve the ARD system: `(alpha * X^T X + diag(lambda)) w = alpha * X^T y`.
+/// Posterior covariance of the kept feature block, mirroring scikit-learn's
+/// `ARDRegression._update_sigma` (`sklearn/linear_model/_bayes.py:750-759`):
 ///
-/// Returns `(w, diag(Sigma))`.
-fn ard_solve<F: Float + FromPrimitive + 'static>(
-    x: &Array2<F>,
-    y: &Array1<F>,
+/// ```text
+/// gram      = Xk^T @ Xk
+/// sigma_inv = diag(lambda[keep]) + alpha * gram
+/// Sigma     = pinvh(sigma_inv)
+/// ```
+///
+/// where `Xk = X[:, keep]`. The `(k_keep, k_keep)` inverse runs on the ferray
+/// linear-algebra substrate (`ferray::linalg::inv`, `ferray-linalg/src/solve.rs:367`)
+/// — for the symmetric positive-definite `sigma_inv` (`n_samples >= n_features`,
+/// the `_update_sigma` regime) the LU inverse matches scipy's `pinvh`. The
+/// `ndarray ↔ ferray` conversion happens at this boundary (R-SUBSTRATE-4); the
+/// caller keeps its `ndarray` signature during the workspace-wide migration.
+///
+/// Returns the full `(k_keep, k_keep)` posterior covariance `Sigma`.
+fn update_sigma<F: LinalgFloat>(
+    xk: &Array2<F>,
     alpha: F,
-    lambda: &Array1<F>,
-) -> Result<(Array1<F>, Array1<F>), FerroError> {
-    let n_features = x.ncols();
-    let xt = x.t();
-    let mut xtx = xt.dot(x);
-
-    // Scale by alpha, then add diag(lambda).
-    for i in 0..n_features {
-        for j in 0..n_features {
-            xtx[[i, j]] = xtx[[i, j]] * alpha;
+    lambda_keep: &[F],
+) -> Result<Array2<F>, FerroError> {
+    let k = xk.ncols();
+    // sigma_inv = diag(lambda[keep]) + alpha * Xk^T Xk.
+    let mut sigma_inv = xk.t().dot(xk);
+    for i in 0..k {
+        for j in 0..k {
+            sigma_inv[[i, j]] *= alpha;
         }
-        xtx[[i, i]] = xtx[[i, i]] + lambda[i];
+        sigma_inv[[i, i]] += lambda_keep[i];
     }
 
-    let xty = xt.dot(y);
-    let xty_scaled: Array1<F> = xty.mapv(|v| v * alpha);
-
-    // Cholesky solve.
-    let n = n_features;
-    let mut l = Array2::<F>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = xtx[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "ARD: matrix not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4).
+    let flat: Vec<F> = sigma_inv.iter().copied().collect();
+    let a = FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([k, k]), flat).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray inv: failed to build sigma_inv: {e}"),
         }
-    }
+    })?;
+    let sigma_f = inv(&a).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray inv failed (ARD sigma): {e}"),
+    })?;
 
-    // Forward substitution.
-    let mut z = Array1::<F>::zeros(n);
-    for i in 0..n {
-        let mut s = xty_scaled[i];
-        for j in 0..i {
-            s = s - l[[i, j]] * z[j];
+    // Bridge ferray -> ndarray.
+    let sigma = Array2::from_shape_vec((k, k), sigma_f.iter().copied().collect()).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray inv: Sigma shape conversion failed: {e}"),
         }
-        z[i] = s / l[[i, i]];
-    }
-
-    // Back substitution.
-    let mut w = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = z[i];
-        for j in (i + 1)..n {
-            s = s - l[[j, i]] * w[j];
-        }
-        w[i] = s / l[[i, i]];
-    }
-
-    // Compute diagonal of posterior covariance: diag((alpha * X^T X + diag(lambda))^{-1}).
-    let mut sigma_diag = Array1::<F>::zeros(n);
-    for col in 0..n {
-        let mut z_inv = Array1::<F>::zeros(n);
-        z_inv[col] = F::one() / l[[col, col]];
-        for i in (col + 1)..n {
-            let mut s = F::zero();
-            for k in col..i {
-                s = s + l[[i, k]] * z_inv[k];
-            }
-            z_inv[i] = -s / l[[i, i]];
-        }
-        for i in 0..n {
-            sigma_diag[i] = sigma_diag[i] + z_inv[i] * z_inv[i];
-        }
-    }
-
-    Ok((w, sigma_diag))
+    })?;
+    Ok(sigma)
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
+impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
     for ARDRegression<F>
 {
     type Fitted = FittedARDRegression<F>;
     type Error = FerroError;
 
-    /// Fit the ARD model via iterative evidence maximization.
+    /// Fit the ARD model via iterative evidence maximization with per-iteration
+    /// `keep_lambda` column masking, mirroring scikit-learn's `ARDRegression.fit`
+    /// (`sklearn/linear_model/_bayes.py:644-730`).
+    ///
+    /// After centering (when `fit_intercept`), `alpha` is seeded to
+    /// `1/(Var(y)+eps)` (`_bayes.py:658`) and `lambda` to ones (`_bayes.py:659`)
+    /// with all features kept. Each iteration solves only the kept sub-block via
+    /// [`update_sigma`] (`_bayes.py:677-678`, `:750-759`), updates the Gamma-prior
+    /// `lambda`/`alpha` (`_bayes.py:681-688`), recomputes
+    /// `keep_lambda = lambda_ < threshold_lambda` and zeros pruned coefficients
+    /// (`_bayes.py:691-692`), and converges on
+    /// `sum(|coef_old - coef_|) < tol` (`_bayes.py:707`).
     ///
     /// # Errors
     ///
@@ -311,9 +298,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
+        let zero = <F as num_traits::Zero>::zero();
+        let one = <F as num_traits::One>::one();
+        let n_f = <F as num_traits::NumCast>::from(n_samples).unwrap_or(one);
+        let two = one + one;
 
-        // Center data for intercept.
+        // Center data for intercept (_bayes.py:637 `_preprocess_data`).
         let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
             let x_mean = x
                 .mean_axis(Axis(0))
@@ -330,84 +320,143 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             (x.clone(), y.clone(), None, None)
         };
 
-        let mut alpha = F::one();
-        let mut lambda = Array1::<F>::from_elem(n_features, F::one());
-        let clamp_max = F::from(1e10).unwrap();
-        let clamp_min = F::from(1e-10).unwrap();
+        // Init: alpha = 1/(Var(y)+eps), lambda = ones, coef = zeros, all kept
+        // (_bayes.py:645, :658-659). `eps = finfo(f64).eps` matches sklearn,
+        // which fixes float64 eps regardless of dtype.
+        let eps =
+            <F as num_traits::NumCast>::from(f64::EPSILON).unwrap_or_else(<F as Float>::epsilon);
+        let var_y = {
+            let ym = y_work
+                .mean()
+                .ok_or_else(|| FerroError::NumericalInstability {
+                    message: "failed to compute target mean for variance".into(),
+                })?;
+            let centered = &y_work - ym;
+            centered.dot(&centered) / n_f
+        };
+        let mut alpha = one / (var_y + eps);
+        let mut lambda = Array1::<F>::from_elem(n_features, one);
+        let mut keep_lambda: Vec<bool> = vec![true; n_features];
 
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut sigma_diag = Array1::<F>::ones(n_features);
+        let mut coef = Array1::<F>::zeros(n_features);
+        let mut coef_old: Option<Array1<F>> = None;
+        // Diagonal of the posterior covariance over the full feature index
+        // (pruned features carry 0); kept entries filled from `Sigma` each iter.
+        let mut sigma_diag = Array1::<F>::zeros(n_features);
 
-        for _iter in 0..self.max_iter {
-            let alpha_old = alpha;
-            let lambda_old = lambda.clone();
+        for _iter_ in 0..self.max_iter {
+            // Indices of kept columns.
+            let kept: Vec<usize> = (0..n_features).filter(|&i| keep_lambda[i]).collect();
+            let k = kept.len();
 
-            // E-step: compute posterior.
-            let (w_new, sd_new) = ard_solve(&x_work, &y_work, alpha, &lambda)?;
+            // Xk = X[:, keep_lambda].
+            let mut xk = Array2::<F>::zeros((n_samples, k));
+            for (col, &i) in kept.iter().enumerate() {
+                for row in 0..n_samples {
+                    xk[[row, col]] = x_work[[row, i]];
+                }
+            }
+            let lambda_keep: Vec<F> = kept.iter().map(|&i| lambda[i]).collect();
 
-            // Compute gamma_i = 1 - lambda_i * Sigma_ii.
-            let gamma: Array1<F> =
-                Array1::from_shape_fn(n_features, |i| F::one() - lambda[i] * sd_new[i]);
+            // sigma_ = (diag(lambda[keep]) + alpha * Xk^T Xk)^{-1}  (_bayes.py:677).
+            let sigma = update_sigma(&xk, alpha, &lambda_keep)?;
 
-            let gamma_sum: F = gamma.iter().fold(F::zero(), |a, &b| a + b);
-
-            // Update alpha: (n - sum(gamma) + 2*alpha_1) / (||y - Xw||^2 + 2*alpha_2).
-            let residual = &y_work - x_work.dot(&w_new);
-            let sse = residual.dot(&residual);
-            let two = F::from(2.0).unwrap();
-            let new_alpha = (n_f - gamma_sum + two * self.alpha_1)
-                / (sse + two * self.alpha_2).max(F::from(1e-300).unwrap());
-
-            // Update lambda_i: (gamma_i + 2*lambda_1) / (w_i^2 + 2*lambda_2).
-            let mut new_lambda = Array1::<F>::zeros(n_features);
-            for i in 0..n_features {
-                let wi_sq = w_new[i] * w_new[i];
-                new_lambda[i] = (gamma[i] + two * self.lambda_1)
-                    / (wi_sq + two * self.lambda_2).max(F::from(1e-300).unwrap());
+            // coef_[keep] = alpha * sigma_ @ Xk^T @ y; coef_[~keep] = 0
+            // (_bayes.py:665-667, the running zeros from the prior mask).
+            let xkt_y = xk.t().dot(&y_work);
+            let coef_keep = sigma.dot(&xkt_y).mapv(|v| v * alpha);
+            sigma_diag.fill(zero);
+            for (col, &i) in kept.iter().enumerate() {
+                coef[i] = coef_keep[col];
+                sigma_diag[i] = sigma[[col, col]];
             }
 
-            // Clamp.
-            alpha = new_alpha.min(clamp_max).max(clamp_min);
-            for i in 0..n_features {
-                new_lambda[i] = new_lambda[i].min(clamp_max).max(clamp_min);
+            // rmse_ = sum((y - X @ coef_)^2)  (_bayes.py:681).
+            let residual = &y_work - x_work.dot(&coef);
+            let rmse = residual.dot(&residual);
+
+            // gamma_ = 1 - lambda[keep] * diag(sigma_)  (_bayes.py:682).
+            let mut gamma_sum = zero;
+            let mut gamma_keep = vec![zero; k];
+            for (col, &i) in kept.iter().enumerate() {
+                let g = one - lambda[i] * sigma[[col, col]];
+                gamma_keep[col] = g;
+                gamma_sum += g;
             }
-            lambda = new_lambda;
 
-            w = w_new;
-            sigma_diag = sd_new;
+            // lambda[keep] = (gamma_ + 2*lambda_1) / (coef_[keep]^2 + 2*lambda_2)
+            // (_bayes.py:683-685).
+            for (col, &i) in kept.iter().enumerate() {
+                let ci = coef[i];
+                lambda[i] =
+                    (gamma_keep[col] + two * self.lambda_1) / (ci * ci + two * self.lambda_2);
+            }
 
-            // Check convergence.
-            let delta_alpha =
-                (alpha - alpha_old).abs() / (alpha_old.abs() + F::from(1e-10).unwrap());
-            let mut max_delta_lambda = F::zero();
+            // alpha_ = (n - gamma.sum() + 2*alpha_1) / (rmse_ + 2*alpha_2)
+            // (_bayes.py:686-688).
+            alpha = (n_f - gamma_sum + two * self.alpha_1) / (rmse + two * self.alpha_2);
+
+            // Prune: keep_lambda = lambda_ < threshold; coef_[~keep] = 0
+            // (_bayes.py:691-692).
             for i in 0..n_features {
-                let delta = (lambda[i] - lambda_old[i]).abs()
-                    / (lambda_old[i].abs() + F::from(1e-10).unwrap());
-                if delta > max_delta_lambda {
-                    max_delta_lambda = delta;
+                keep_lambda[i] = lambda[i] < self.threshold_lambda;
+                if !keep_lambda[i] {
+                    coef[i] = zero;
                 }
             }
 
-            if delta_alpha < self.tol && max_delta_lambda < self.tol {
+            // Convergence: iter>0 and sum(|coef_old - coef_|) < tol (_bayes.py:707).
+            if let Some(prev) = &coef_old {
+                let delta: F = (0..n_features)
+                    .map(|i| (prev[i] - coef[i]).abs())
+                    .fold(zero, |a, b| a + b);
+                if delta < self.tol {
+                    break;
+                }
+            }
+            coef_old = Some(coef.clone());
+
+            // All features pruned -> stop (_bayes.py:713-714).
+            if !keep_lambda.iter().any(|&b| b) {
                 break;
             }
         }
 
-        // Prune features with lambda > threshold.
-        for i in 0..n_features {
-            if lambda[i] > self.threshold_lambda {
-                w[i] = F::zero();
+        // Final coef_/sigma_ refresh with the converged params, over the
+        // surviving kept set (_bayes.py:718-721).
+        let kept: Vec<usize> = (0..n_features).filter(|&i| keep_lambda[i]).collect();
+        let k = kept.len();
+        if k > 0 {
+            let mut xk = Array2::<F>::zeros((n_samples, k));
+            for (col, &i) in kept.iter().enumerate() {
+                for row in 0..n_samples {
+                    xk[[row, col]] = x_work[[row, i]];
+                }
             }
+            let lambda_keep: Vec<F> = kept.iter().map(|&i| lambda[i]).collect();
+            let sigma = update_sigma(&xk, alpha, &lambda_keep)?;
+            let xkt_y = xk.t().dot(&y_work);
+            let coef_keep = sigma.dot(&xkt_y).mapv(|v| v * alpha);
+            coef.fill(zero);
+            sigma_diag.fill(zero);
+            for (col, &i) in kept.iter().enumerate() {
+                coef[i] = coef_keep[col];
+                sigma_diag[i] = sigma[[col, col]];
+            }
+        } else {
+            coef.fill(zero);
+            sigma_diag.fill(zero);
         }
 
+        // intercept_ = y_offset - X_offset @ coef_ (_bayes.py:729 `_set_intercept`).
         let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
-            *ym - xm.dot(&w)
+            *ym - xm.dot(&coef)
         } else {
-            F::zero()
+            zero
         };
 
         Ok(FittedARDRegression {
-            coefficients: w,
+            coefficients: coef,
             intercept,
             alpha,
             lambda,
@@ -460,7 +509,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
 // Pipeline integration.
 impl<F> PipelineEstimator<F> for ARDRegression<F>
 where
-    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+    F: LinalgFloat + FromPrimitive + ScalarOperand + Send + Sync,
 {
     fn fit_pipeline(
         &self,

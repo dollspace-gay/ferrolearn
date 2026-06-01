@@ -66,7 +66,6 @@ fn pruned_set(coef: &ndarray::Array1<f64>) -> Vec<usize> {
 ///
 /// Tracking: #474
 #[test]
-#[ignore = "divergence: ARD fit has no per-iter keep_lambda mask + wrong init (alpha=1, not 1/Var(y)); feature 0 wrongly pruned on multi-feature designs; tracking #474"]
 fn divergence_ard_fit_2feature_wrong_pruning() {
     // sklearn 1.5.2 live oracle (see module doc).
     const SK_COEF: [f64; 2] = [0.010193278903540725, 0.019898067101591296];
@@ -151,7 +150,6 @@ fn divergence_ard_fit_2feature_wrong_pruning() {
 ///
 /// Tracking: #474
 #[test]
-#[ignore = "divergence: ARD fit prunes a relevant feature (0) it should keep; no per-iter keep_lambda mask + wrong init; tracking #474"]
 fn divergence_ard_fit_4feature_wrong_pruned_set() {
     // sklearn 1.5.2 live oracle (see module doc).
     const SK_COEF: [f64; 4] = [0.5999942561395434, 0.0, 1.2000028896712696, 0.0];
