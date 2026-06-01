@@ -10,6 +10,34 @@
 //! The L1 penalty encourages sparse solutions where some coefficients
 //! are exactly zero, making Lasso useful for feature selection.
 //!
+//! ## REQ status (per `.design/linear/lasso.md`, mirrors `sklearn/linear_model/_coordinate_descent.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.Lasso` (`_coordinate_descent.py:1154`), objective
+//! `(1/2n)||y−Xw||² + α||w||₁`. Cyclic coordinate descent with soft-thresholding;
+//! `soft_threshold(Xⱼᵀr/n, α)/(XⱼᵀXⱼ/n)` ≡ sklearn's `l1_reg = α·n` convention. coef_/
+//! intercept_ + the exactly-zero support set match the live sklearn oracle to ≤1e-6 (converged).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (CD Lasso fit, coef_/intercept_) | SHIPPED | `Fit for Lasso`; converged coef/intercept match oracle ≤1e-6 (alpha 0.01/0.1/1). Consumers: `RsLasso` in `ferrolearn-python`, `LassoCV` in `lasso_cv.rs`. |
+//! | REQ-2 (predict) | SHIPPED | `Predict for FittedLasso`. |
+//! | REQ-3 (fit_intercept incl. false) | SHIPPED | centering; matches oracle. |
+//! | REQ-4 (L1 sparsity, exact zeros) | SHIPPED | `fn soft_threshold`; support set bit-identical to sklearn. |
+//! | REQ-5 (HasCoefficients) | SHIPPED | `HasCoefficients for FittedLasso`. |
+//! | REQ-6 (alpha≥0 validation; alpha=0 → OLS) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 matches sklearn to 1e-6. Defaults max_iter=1000/tol=1e-4 match sklearn. |
+//! | REQ-7 (positive=True) | NOT-STARTED | #407. |
+//! | REQ-8 (warm_start) | NOT-STARTED | #408. |
+//! | REQ-9 (selection='random' + random_state) | NOT-STARTED | #409. |
+//! | REQ-10 (precompute/Gram) | NOT-STARTED | #410. |
+//! | REQ-11 (n_iter_ / dual_gap_ attrs) | NOT-STARTED | #411. |
+//! | REQ-12 (dual-gap stopping criterion) | NOT-STARTED | #412 — ferrolearn stops on max-coef-change vs sklearn relative-change + dual-gap; converges to the same optimum (≤1e-6), only the stopping measure differs. |
+//! | REQ-13 (MultiTaskLasso) | NOT-STARTED | #413 (separate estimator). |
+//! | REQ-14 (ferray substrate) | NOT-STARTED | #414 (CD is elementwise; coef storage ndarray, tied to #359). |
+//!
+//! acto-critic: NO DIVERGENCE FOUND — converged coef/intercept, sparsity support set, alpha
+//! scaling, alpha=0, fit_intercept=false, f32, and defaults all match the live oracle. Two
+//! states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
