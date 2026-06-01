@@ -9,14 +9,29 @@
 //!   by removing features from the active set when their coefficients cross
 //!   zero.
 //!
-//! Both estimators use a simplified forward stagewise approach:
+//! Both estimators follow the LARS equiangular homotopy: at each step the
+//! direction is equiangular to all active features; `Lars` adds variables until
+//! `n_nonzero_coefs` is reached, while `LassoLars` additionally applies the
+//! Efron §3.3 drop condition (a variable leaves the active set when its
+//! coefficient would cross zero) and stops at the target `alpha`.
 //!
-//! 1. Find the feature most correlated with the residual.
-//! 2. Add it to the active set.
-//! 3. Solve OLS on the active features.
-//! 4. Update the residual.
-//! 5. Repeat until the desired number of non-zero coefficients is reached
-//!    (LARS) or convergence (LassoLars).
+//! ## REQ status (per `.design/linear/lars.md`, mirrors `sklearn/linear_model/_least_angle.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.Lars` / `LassoLars` (`_least_angle.py`). The LARS-Lasso path
+//! follows sklearn's `_lars_path_solver` (equiangular direction + drop condition + alpha
+//! interpolation); coef_/intercept_/active-set match the live oracle on the diabetes dataset.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (Lars method='lar' path) | SHIPPED | `lars_path` (equiangular); `Lars(n_nonzero_coefs=5)` coef_/intercept_ match sklearn EXACTLY (1e-6) on diabetes. Consumer: `pub use Lars` (boundary API). |
+//! | REQ-2 (LassoLars method='lasso' path) | SHIPPED | `LassoLars::fit` → `lars_path` lasso branch (drop condition `z=-coef/least_squares`, alpha_min stopping, interpolation; `_least_angle.py:413+`). coef_/active-set match oracle at alpha=0.1/0.5/1.0. Closed #482 (was forward-stepwise OLS). |
+//! | REQ-3 (predict) | SHIPPED | `Predict for FittedLars`/`FittedLassoLars`. |
+//! | REQ-4 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
+//! | REQ-5..8 NOT-STARTED | coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
+//!
+//! acto-critic + builder: `Lars` matched sklearn exactly; `LassoLars` diverged (used forward-stepwise
+//! OLS instead of the equiangular lasso path) — rewritten to sklearn's `_lars_path_solver` lasso
+//! branch (3c2c746). coef_/active-set now match the live oracle. Two states only per R-DEFER-2.
 //!
 //! # Examples
 //!
