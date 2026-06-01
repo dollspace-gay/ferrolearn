@@ -31,6 +31,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use ferray::linalg::LinalgFloat;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::traits::{Fit, Predict};
@@ -148,8 +149,8 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedRidgeClass
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<usize>>
-    for RidgeClassifier<F>
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    Fit<Array2<F>, Array1<usize>> for RidgeClassifier<F>
 {
     type Fitted = FittedRidgeClassifier<F>;
     type Error = FerroError;
@@ -177,7 +178,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        if self.alpha < F::zero() {
+        // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
+        // `ferray::Element` (which also defines `zero`/`one`) into scope, so
+        // bare `F::zero()`/`F::one()` are ambiguous between `Element` and
+        // `num_traits`. Disambiguate to the `num_traits` items used elsewhere.
+        if self.alpha < <F as num_traits::Zero>::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
                 reason: "must be non-negative".into(),
@@ -214,16 +219,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             // Binary: encode as {-1, +1}.
             for i in 0..n_samples {
                 y_indicator[[i, 0]] = if y[i] == classes[1] {
-                    F::one()
+                    <F as num_traits::One>::one()
                 } else {
-                    -F::one()
+                    -<F as num_traits::One>::one()
                 };
             }
         } else {
             // Multiclass: one-hot.
             for i in 0..n_samples {
                 let ci = classes.iter().position(|&c| c == y[i]).unwrap();
-                y_indicator[[i, ci]] = F::one();
+                y_indicator[[i, ci]] = <F as num_traits::One>::one();
             }
         }
 

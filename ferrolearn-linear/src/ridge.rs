@@ -25,6 +25,7 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
 
+use ferray::linalg::LinalgFloat;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -96,8 +97,8 @@ pub struct FittedRidge<F> {
     intercept: F,
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
-    for Ridge<F>
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    Fit<Array2<F>, Array1<F>> for Ridge<F>
 {
     type Fitted = FittedRidge<F>;
     type Error = FerroError;
@@ -122,7 +123,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        if self.alpha < F::zero() {
+        // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
+        // `ferray::Element` (which also defines a `zero`) into scope, so a bare
+        // `F::zero()` is ambiguous between `Element` and `num_traits::Zero`.
+        if self.alpha < <F as num_traits::Zero>::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
                 reason: "must be non-negative".into(),
@@ -163,7 +167,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
             Ok(FittedRidge {
                 coefficients: w,
-                intercept: F::zero(),
+                // Disambiguate `Element::zero` vs `num_traits::Zero::zero`
+                // (both in scope under the `LinalgFloat` bound).
+                intercept: <F as num_traits::Zero>::zero(),
             })
         }
     }
@@ -357,7 +363,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for Fi
 // Pipeline integration.
 impl<F> PipelineEstimator<F> for Ridge<F>
 where
-    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+    F: Float + FromPrimitive + ScalarOperand + LinalgFloat + Send + Sync + 'static,
 {
     fn fit_pipeline(
         &self,

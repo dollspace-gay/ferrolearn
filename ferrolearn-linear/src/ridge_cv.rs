@@ -21,6 +21,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use ferray::linalg::LinalgFloat;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -146,8 +147,8 @@ fn select_elements<F: Float>(y: &Array1<F>, indices: &[usize]) -> Array1<F> {
     Array1::from_iter(indices.iter().map(|&i| y[i]))
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
-    for RidgeCV<F>
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    Fit<Array2<F>, Array1<F>> for RidgeCV<F>
 {
     type Fitted = FittedRidgeCV<F>;
     type Error = FerroError;
@@ -185,7 +186,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         }
 
         for &a in &self.alphas {
-            if a < F::zero() {
+            // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
+            // `ferray::Element` (also defining `zero`) into scope, making a
+            // bare `F::zero()` ambiguous. Disambiguate to `num_traits::Zero`.
+            if a < <F as num_traits::Zero>::zero() {
                 return Err(FerroError::InvalidParameter {
                     name: "alphas".into(),
                     reason: "all alpha values must be non-negative".into(),
@@ -214,7 +218,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let mut best_mse = F::infinity();
 
         for &alpha in &self.alphas {
-            let mut total_mse = F::zero();
+            let mut total_mse = <F as num_traits::Zero>::zero();
 
             for fold_idx in 0..self.cv {
                 // Build train/test split.

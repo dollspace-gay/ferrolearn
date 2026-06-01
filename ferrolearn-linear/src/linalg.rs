@@ -298,14 +298,35 @@ fn cholesky_solve_multi<F: Float>(a: &Array2<F>, b: &Array2<F>) -> Result<Array2
 
 /// Solve `(X^T X + alpha * I) @ w = X^T y` (Ridge regression).
 ///
-/// Uses Cholesky decomposition since `X^T X + alpha * I` is guaranteed
-/// to be positive definite for `alpha > 0`.
+/// For `alpha > 0` the normal-equations matrix `X^T X + alpha * I` is
+/// positive definite, so the Cholesky solve succeeds and the fallbacks
+/// never fire. For `alpha = 0` on a rank-deficient `X`, `X^T X` is singular:
+/// both the Cholesky and the Gaussian-elimination solves fail, and the
+/// chain falls through to the minimum-norm least-squares solve on the
+/// original `X`/`y` (LAPACK `gelsd` via [`solve_lstsq`]). This mirrors
+/// scikit-learn's `'cholesky'` branch, which on a `linalg.LinAlgError`
+/// (singular `X^T X`) switches to the SVD solver
+/// (`sklearn/linear_model/_ridge.py:752-756`):
+///
+/// ```text
+/// try:
+///     coef = _solve_cholesky(X, y, alpha)
+/// except linalg.LinAlgError:
+///     # use SVD solver if matrix is singular
+///     solver = "svd"
+/// ```
+///
+/// scikit-learn's SVD solver returns the minimum-norm solution; for
+/// `alpha = 0` (`X^T X + 0 * I = X^T X`) that coincides with the gelsd
+/// minimum-norm least-squares solution of `X @ w = y`, which is exactly
+/// what [`solve_lstsq`] computes. (For `alpha > 0` the PD Cholesky always
+/// succeeds, so the lstsq branch is unreachable and behavior is unchanged.)
 ///
 /// # Errors
 ///
-/// Returns [`FerroError::NumericalInstability`] if the regularized system
-/// is somehow singular (should not happen for `alpha > 0`).
-pub(crate) fn solve_ridge<F: Float + Send + Sync + 'static>(
+/// Returns [`FerroError::NumericalInstability`] if every solve in the
+/// chain fails (e.g. the underlying SVD itself fails).
+pub(crate) fn solve_ridge<F: LinalgFloat>(
     x: &Array2<F>,
     y: &Array1<F>,
     alpha: F,
@@ -320,7 +341,9 @@ pub(crate) fn solve_ridge<F: Float + Send + Sync + 'static>(
         xtx[[i, i]] = xtx[[i, i]] + alpha;
     }
 
-    cholesky_solve(&xtx, &xty).or_else(|_| gaussian_solve(n, &xtx, &xty))
+    cholesky_solve(&xtx, &xty)
+        .or_else(|_| gaussian_solve(n, &xtx, &xty))
+        .or_else(|_| solve_lstsq(x, y))
 }
 
 /// Solve `(X^T X + alpha * I) @ W = X^T Y` (multi-output Ridge regression).
