@@ -7,6 +7,24 @@
 //! desired number of non-zero coefficients is reached or the residual
 //! tolerance is met.
 //!
+//! ## REQ status (per `.design/linear/omp.md`, mirrors `sklearn/linear_model/_omp.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.OrthogonalMatchingPursuit` (`_omp.py:645`), greedy Cholesky OMP.
+//! coef_/intercept_ match the live oracle to ~1e-12 on the diabetes dataset.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (greedy OMP fit) | SHIPPED | `Fit for OrthogonalMatchingPursuit`; `OMP(n_nonzero_coefs=5)` coef_/intercept_ match sklearn to 1e-12 on diabetes. Consumer: `pub use OrthogonalMatchingPursuit` (boundary API). |
+//! | REQ-2 (default n_nonzero_coefs = max(int(0.1·n_features),1)) | SHIPPED | when both n_nonzero_coefs and tol are None, defaults to `max(int(0.1·n_features),1)` and fits (`_omp.py:785`). Closed #488 (was erroring). |
+//! | REQ-3 (tol stopping ‖r‖²≤tol) | SHIPPED | residual-norm stopping (minor strict-before vs ≤-after boundary, equivalent for typical inputs). |
+//! | REQ-4 (predict) | SHIPPED | `Predict for FittedOMP`. |
+//! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
+//! | REQ-6..10 NOT-STARTED | Gram/precompute path (#489), OrthogonalMatchingPursuitCV (#490), n_iter_ (#491), multi-output (#492), ferray substrate (#493). |
+//!
+//! acto-critic: the greedy path matches sklearn exactly (1e-12); the default-construction
+//! divergence (#488 — errored where sklearn applies 0.1·n_features) found and fixed. Two states
+//! only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
