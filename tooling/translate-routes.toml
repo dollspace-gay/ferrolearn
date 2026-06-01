@@ -1,0 +1,889 @@
+# translate-routes.toml — read-gate route table (ferrolearn <- scikit-learn 1.5.2)
+#
+# Consumed by tooling/translate-discipline.py to gate Edit/Write on
+# ferrolearn-* crate src/ files. Each [[route]] declares:
+#
+#   crate_pattern : repo-relative target file (exact or glob).
+#   upstream      : scikit-learn source paths under /home/doll/scikit-learn/
+#                   (clone pinned to tag 1.5.2, commit 156ef14; this matches
+#                   the installed `sklearn` 1.5.2 used as the live oracle).
+#                   At least ONE must be Read before the edit.
+#   design        : .design/<area>/<doc>.md governing this translation.
+#                   MUST exist on disk; if missing, the hook blocks with
+#                   acto-doc-author dispatch instructions.
+#   parity_ops    : estimator / function families this file owns
+#                   (informational — verification is cargo-test + the live
+#                   sklearn oracle for library crates, pytest-vs-sklearn for
+#                   ferrolearn-python; see goal.md "The verification model").
+#
+# Every gated edit also requires a Read of goal.md in the same session.
+# Files under a ferrolearn-* crate's src/ without a route are BLOCKED
+# (R-XLATE-2): that block is the ratchet — when the loop reaches a new
+# translation unit, its first action is to add the route here.
+#
+# This seed covers the dependency-ordered priority crates (core -> linear
+# -> tree -> neighbors -> bayes -> cluster -> preprocess -> metrics ->
+# decomp). Remaining crates (model-sel, kernel, numerical, covariance,
+# neural, sparse, datasets, io, fetch, and ferrolearn-python) get routes
+# added as the loop reaches them.
+
+# =====================================================================
+# Layer 0 — ferrolearn-core (leaf: traits, dataset, errors, pipeline)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/traits.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/base.py"]
+design = ".design/core/traits.md"
+parity_ops = ["BaseEstimator", "ClassifierMixin", "RegressorMixin", "TransformerMixin", "fit", "predict", "transform", "fit_transform"]
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/dataset.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/utils/validation.py",
+  "/home/doll/scikit-learn/sklearn/base.py",
+]
+design = ".design/core/dataset.md"
+parity_ops = ["check_X_y", "check_array", "check_consistent_length"]
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/error.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/exceptions.py"]
+design = ".design/core/error.md"
+parity_ops = ["NotFittedError", "ConvergenceWarning", "DataConversionWarning"]
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/pipeline.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/pipeline.py"]
+design = ".design/core/pipeline.md"
+parity_ops = ["Pipeline", "make_pipeline", "FeatureUnion"]
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/typed_pipeline.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/pipeline.py"]
+design = ".design/core/typed_pipeline.md"
+parity_ops = ["Pipeline"]
+
+[[route]]
+crate_pattern = "ferrolearn-core/src/introspection.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/base.py",
+  "/home/doll/scikit-learn/sklearn/utils/_param_validation.py",
+]
+design = ".design/core/introspection.md"
+parity_ops = ["get_params", "set_params"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-linear (linear_model, svm, discriminant, isotonic)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/linear_regression.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_base.py"]
+design = ".design/linear/linear_regression.md"
+parity_ops = ["LinearRegression"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/ridge.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_ridge.py"]
+design = ".design/linear/ridge.md"
+parity_ops = ["Ridge"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/ridge_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_ridge.py"]
+design = ".design/linear/ridge_cv.md"
+parity_ops = ["RidgeCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/ridge_classifier.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_ridge.py"]
+design = ".design/linear/ridge_classifier.md"
+parity_ops = ["RidgeClassifier", "RidgeClassifierCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/lasso.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/lasso.md"
+parity_ops = ["Lasso"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/lasso_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/lasso_cv.md"
+parity_ops = ["LassoCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/elastic_net.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/elastic_net.md"
+parity_ops = ["ElasticNet"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/elastic_net_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/elastic_net_cv.md"
+parity_ops = ["ElasticNetCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/logistic_regression.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_logistic.py"]
+design = ".design/linear/logistic_regression.md"
+parity_ops = ["LogisticRegression"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/logistic_regression_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_logistic.py"]
+design = ".design/linear/logistic_regression_cv.md"
+parity_ops = ["LogisticRegressionCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/bayesian_ridge.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_bayes.py"]
+design = ".design/linear/bayesian_ridge.md"
+parity_ops = ["BayesianRidge"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/ard.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_bayes.py"]
+design = ".design/linear/ard.md"
+parity_ops = ["ARDRegression"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/lars.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_least_angle.py"]
+design = ".design/linear/lars.md"
+parity_ops = ["Lars", "LassoLars", "LarsCV", "LassoLarsCV", "LassoLarsIC"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/omp.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_omp.py"]
+design = ".design/linear/omp.md"
+parity_ops = ["OrthogonalMatchingPursuit", "OrthogonalMatchingPursuitCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/huber_regressor.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_huber.py"]
+design = ".design/linear/huber_regressor.md"
+parity_ops = ["HuberRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/quantile_regressor.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_quantile.py"]
+design = ".design/linear/quantile_regressor.md"
+parity_ops = ["QuantileRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/ransac.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_ransac.py"]
+design = ".design/linear/ransac.md"
+parity_ops = ["RANSACRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/sgd.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/_stochastic_gradient.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_sag.py",
+]
+design = ".design/linear/sgd.md"
+parity_ops = ["SGDClassifier", "SGDRegressor", "SGDOneClassSVM"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/glm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_glm/glm.py"]
+design = ".design/linear/glm.md"
+parity_ops = ["PoissonRegressor", "GammaRegressor", "TweedieRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/svm.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/svm/_classes.py",
+  "/home/doll/scikit-learn/sklearn/svm/_base.py",
+]
+design = ".design/linear/svm.md"
+parity_ops = ["SVC", "SVR"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/linear_svc.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/svm/_classes.py"]
+design = ".design/linear/linear_svc.md"
+parity_ops = ["LinearSVC"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/linear_svr.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/svm/_classes.py"]
+design = ".design/linear/linear_svr.md"
+parity_ops = ["LinearSVR"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/nu_svm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/svm/_classes.py"]
+design = ".design/linear/nu_svm.md"
+parity_ops = ["NuSVC", "NuSVR"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/one_class_svm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/svm/_classes.py"]
+design = ".design/linear/one_class_svm.md"
+parity_ops = ["OneClassSVM"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/lda.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/discriminant_analysis.py"]
+design = ".design/linear/lda.md"
+parity_ops = ["LinearDiscriminantAnalysis"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/qda.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/discriminant_analysis.py"]
+design = ".design/linear/qda.md"
+parity_ops = ["QuadraticDiscriminantAnalysis"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/isotonic.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/isotonic.py"]
+design = ".design/linear/isotonic.md"
+parity_ops = ["IsotonicRegression"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/linalg.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/utils/extmath.py"]
+design = ".design/linear/linalg.md"
+parity_ops = ["safe_sparse_dot", "randomized_svd"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-tree (tree + ensemble)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/decision_tree.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/tree/_classes.py"]
+design = ".design/tree/decision_tree.md"
+parity_ops = ["DecisionTreeClassifier", "DecisionTreeRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/extra_tree.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/tree/_classes.py"]
+design = ".design/tree/extra_tree.md"
+parity_ops = ["ExtraTreeClassifier", "ExtraTreeRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/random_forest.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_forest.py"]
+design = ".design/tree/random_forest.md"
+parity_ops = ["RandomForestClassifier", "RandomForestRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/extra_trees_ensemble.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_forest.py"]
+design = ".design/tree/extra_trees_ensemble.md"
+parity_ops = ["ExtraTreesClassifier", "ExtraTreesRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/random_trees_embedding.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_forest.py"]
+design = ".design/tree/random_trees_embedding.md"
+parity_ops = ["RandomTreesEmbedding"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/bagging.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_bagging.py"]
+design = ".design/tree/bagging.md"
+parity_ops = ["BaggingClassifier", "BaggingRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/voting.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_voting.py"]
+design = ".design/tree/voting.md"
+parity_ops = ["VotingClassifier", "VotingRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/adaboost.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_weight_boosting.py"]
+design = ".design/tree/adaboost.md"
+parity_ops = ["AdaBoostClassifier"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/adaboost_regressor.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_weight_boosting.py"]
+design = ".design/tree/adaboost_regressor.md"
+parity_ops = ["AdaBoostRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/gradient_boosting.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_gb.py"]
+design = ".design/tree/gradient_boosting.md"
+parity_ops = ["GradientBoostingClassifier", "GradientBoostingRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/hist_gradient_boosting.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py"]
+design = ".design/tree/hist_gradient_boosting.md"
+parity_ops = ["HistGradientBoostingClassifier", "HistGradientBoostingRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-tree/src/isolation_forest.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/ensemble/_iforest.py"]
+design = ".design/tree/isolation_forest.md"
+parity_ops = ["IsolationForest"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-neighbors
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/knn.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_classification.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_regression.py",
+]
+design = ".design/neighbors/knn.md"
+parity_ops = ["KNeighborsClassifier", "KNeighborsRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/radius_neighbors.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_classification.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_regression.py",
+]
+design = ".design/neighbors/radius_neighbors.md"
+parity_ops = ["RadiusNeighborsClassifier", "RadiusNeighborsRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/nearest_neighbors.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_unsupervised.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_base.py",
+]
+design = ".design/neighbors/nearest_neighbors.md"
+parity_ops = ["NearestNeighbors"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/nearest_centroid.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neighbors/_nearest_centroid.py"]
+design = ".design/neighbors/nearest_centroid.md"
+parity_ops = ["NearestCentroid"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/local_outlier_factor.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neighbors/_lof.py"]
+design = ".design/neighbors/local_outlier_factor.md"
+parity_ops = ["LocalOutlierFactor"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/graph.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neighbors/_graph.py"]
+design = ".design/neighbors/graph.md"
+parity_ops = ["kneighbors_graph", "radius_neighbors_graph", "KNeighborsTransformer", "RadiusNeighborsTransformer"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/kdtree.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_kd_tree.pyx.tp",
+  "/home/doll/scikit-learn/sklearn/neighbors/_binary_tree.pxi.tp",
+]
+design = ".design/neighbors/kdtree.md"
+parity_ops = ["KDTree"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/balltree.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_ball_tree.pyx.tp",
+  "/home/doll/scikit-learn/sklearn/neighbors/_binary_tree.pxi.tp",
+]
+design = ".design/neighbors/balltree.md"
+parity_ops = ["BallTree"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-bayes (naive_bayes.py)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/gaussian.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/gaussian.md"
+parity_ops = ["GaussianNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/multinomial.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/multinomial.md"
+parity_ops = ["MultinomialNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/bernoulli.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/bernoulli.md"
+parity_ops = ["BernoulliNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/complement.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/complement.md"
+parity_ops = ["ComplementNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/categorical.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/categorical.md"
+parity_ops = ["CategoricalNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/conjugate.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/conjugate.md"
+parity_ops = ["_BaseNB", "_BaseDiscreteNB"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-cluster (cluster + mixture + semi_supervised)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/kmeans.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_kmeans.py"]
+design = ".design/cluster/kmeans.md"
+parity_ops = ["KMeans"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/mini_batch_kmeans.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_kmeans.py"]
+design = ".design/cluster/mini_batch_kmeans.md"
+parity_ops = ["MiniBatchKMeans"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/bisecting_kmeans.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_bisect_k_means.py"]
+design = ".design/cluster/bisecting_kmeans.md"
+parity_ops = ["BisectingKMeans"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/dbscan.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_dbscan.py"]
+design = ".design/cluster/dbscan.md"
+parity_ops = ["DBSCAN"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/optics.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_optics.py"]
+design = ".design/cluster/optics.md"
+parity_ops = ["OPTICS"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/agglomerative.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_agglomerative.py"]
+design = ".design/cluster/agglomerative.md"
+parity_ops = ["AgglomerativeClustering"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/feature_agglomeration.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_agglomerative.py"]
+design = ".design/cluster/feature_agglomeration.md"
+parity_ops = ["FeatureAgglomeration"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/birch.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_birch.py"]
+design = ".design/cluster/birch.md"
+parity_ops = ["Birch"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/mean_shift.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_mean_shift.py"]
+design = ".design/cluster/mean_shift.md"
+parity_ops = ["MeanShift"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/spectral.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_spectral.py"]
+design = ".design/cluster/spectral.md"
+parity_ops = ["SpectralClustering"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/affinity_propagation.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_affinity_propagation.py"]
+design = ".design/cluster/affinity_propagation.md"
+parity_ops = ["AffinityPropagation"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/hdbscan.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cluster/_hdbscan/hdbscan.py"]
+design = ".design/cluster/hdbscan.md"
+parity_ops = ["HDBSCAN"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/gmm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/mixture/_gaussian_mixture.py"]
+design = ".design/cluster/gmm.md"
+parity_ops = ["GaussianMixture"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/bayesian_gmm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/mixture/_bayesian_mixture.py"]
+design = ".design/cluster/bayesian_gmm.md"
+parity_ops = ["BayesianGaussianMixture"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/label_propagation.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/semi_supervised/_label_propagation.py"]
+design = ".design/cluster/label_propagation.md"
+parity_ops = ["LabelPropagation"]
+
+[[route]]
+crate_pattern = "ferrolearn-cluster/src/label_spreading.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/semi_supervised/_label_propagation.py"]
+design = ".design/cluster/label_spreading.md"
+parity_ops = ["LabelSpreading"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-preprocess (preprocessing + impute +
+#            feature_selection + feature_extraction + compose +
+#            random_projection)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/standard_scaler.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/standard_scaler.md"
+parity_ops = ["StandardScaler", "scale"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/min_max_scaler.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/min_max_scaler.md"
+parity_ops = ["MinMaxScaler", "minmax_scale"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/max_abs_scaler.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/max_abs_scaler.md"
+parity_ops = ["MaxAbsScaler", "maxabs_scale"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/robust_scaler.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/robust_scaler.md"
+parity_ops = ["RobustScaler", "robust_scale"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/normalizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/normalizer.md"
+parity_ops = ["Normalizer", "normalize"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/binarizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/binarizer.md"
+parity_ops = ["Binarizer", "binarize"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/power_transformer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/power_transformer.md"
+parity_ops = ["PowerTransformer", "power_transform"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/quantile_transformer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_data.py"]
+design = ".design/preprocess/quantile_transformer.md"
+parity_ops = ["QuantileTransformer", "quantile_transform"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/polynomial_features.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_polynomial.py"]
+design = ".design/preprocess/polynomial_features.md"
+parity_ops = ["PolynomialFeatures"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/spline_transformer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_polynomial.py"]
+design = ".design/preprocess/spline_transformer.md"
+parity_ops = ["SplineTransformer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/one_hot_encoder.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_encoders.py"]
+design = ".design/preprocess/one_hot_encoder.md"
+parity_ops = ["OneHotEncoder"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/ordinal_encoder.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_encoders.py"]
+design = ".design/preprocess/ordinal_encoder.md"
+parity_ops = ["OrdinalEncoder"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/binary_encoder.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_encoders.py"]
+design = ".design/preprocess/binary_encoder.md"
+parity_ops = ["OneHotEncoder"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/label_encoder.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_label.py"]
+design = ".design/preprocess/label_encoder.md"
+parity_ops = ["LabelEncoder"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/label_binarizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_label.py"]
+design = ".design/preprocess/label_binarizer.md"
+parity_ops = ["LabelBinarizer", "label_binarize"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/multi_label_binarizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_label.py"]
+design = ".design/preprocess/multi_label_binarizer.md"
+parity_ops = ["MultiLabelBinarizer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/kbins_discretizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_discretization.py"]
+design = ".design/preprocess/kbins_discretizer.md"
+parity_ops = ["KBinsDiscretizer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/function_transformer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_function_transformer.py"]
+design = ".design/preprocess/function_transformer.md"
+parity_ops = ["FunctionTransformer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/target_encoder.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_target_encoder.py"]
+design = ".design/preprocess/target_encoder.md"
+parity_ops = ["TargetEncoder"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/imputer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/impute/_base.py"]
+design = ".design/preprocess/imputer.md"
+parity_ops = ["SimpleImputer", "MissingIndicator"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/knn_imputer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/impute/_knn.py"]
+design = ".design/preprocess/knn_imputer.md"
+parity_ops = ["KNNImputer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/iterative_imputer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/impute/_iterative.py"]
+design = ".design/preprocess/iterative_imputer.md"
+parity_ops = ["IterativeImputer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/count_vectorizer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_extraction/text.py"]
+design = ".design/preprocess/count_vectorizer.md"
+parity_ops = ["CountVectorizer", "HashingVectorizer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/tfidf.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_extraction/text.py"]
+design = ".design/preprocess/tfidf.md"
+parity_ops = ["TfidfTransformer", "TfidfVectorizer"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/random_projection.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/random_projection.py"]
+design = ".design/preprocess/random_projection.md"
+parity_ops = ["GaussianRandomProjection", "SparseRandomProjection"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/feature_selection.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_univariate_selection.py"]
+design = ".design/preprocess/feature_selection.md"
+parity_ops = ["SelectKBest", "GenericUnivariateSelect", "VarianceThreshold"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/select_percentile.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_univariate_selection.py"]
+design = ".design/preprocess/select_percentile.md"
+parity_ops = ["SelectPercentile", "SelectFpr", "SelectFdr", "SelectFwe"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/stat_selectors.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_univariate_selection.py"]
+design = ".design/preprocess/stat_selectors.md"
+parity_ops = ["f_classif", "f_regression", "chi2", "mutual_info_classif"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/feature_scoring.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_univariate_selection.py"]
+design = ".design/preprocess/feature_scoring.md"
+parity_ops = ["f_classif", "f_regression"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/rfe.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_rfe.py"]
+design = ".design/preprocess/rfe.md"
+parity_ops = ["RFE", "RFECV"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/select_from_model.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_from_model.py"]
+design = ".design/preprocess/select_from_model.md"
+parity_ops = ["SelectFromModel"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/sequential_feature_selector.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_sequential.py"]
+design = ".design/preprocess/sequential_feature_selector.md"
+parity_ops = ["SequentialFeatureSelector"]
+
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/column_transformer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/compose/_column_transformer.py"]
+design = ".design/preprocess/column_transformer.md"
+parity_ops = ["ColumnTransformer", "make_column_transformer"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-metrics
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/classification.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/metrics/_classification.py"]
+design = ".design/metrics/classification.md"
+parity_ops = ["accuracy_score", "f1_score", "precision_score", "recall_score", "confusion_matrix", "log_loss"]
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/regression.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/metrics/_regression.py"]
+design = ".design/metrics/regression.md"
+parity_ops = ["mean_squared_error", "r2_score", "mean_absolute_error"]
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/ranking.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/metrics/_ranking.py"]
+design = ".design/metrics/ranking.md"
+parity_ops = ["roc_auc_score", "roc_curve", "precision_recall_curve", "average_precision_score"]
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/clustering.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/metrics/cluster/_supervised.py",
+  "/home/doll/scikit-learn/sklearn/metrics/cluster/_unsupervised.py",
+]
+design = ".design/metrics/clustering.md"
+parity_ops = ["adjusted_rand_score", "silhouette_score", "normalized_mutual_info_score"]
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/pairwise.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/metrics/pairwise.py"]
+design = ".design/metrics/pairwise.md"
+parity_ops = ["euclidean_distances", "cosine_similarity", "pairwise_distances", "rbf_kernel"]
+
+[[route]]
+crate_pattern = "ferrolearn-metrics/src/scorer.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/metrics/_scorer.py"]
+design = ".design/metrics/scorer.md"
+parity_ops = ["get_scorer", "make_scorer"]
+
+# =====================================================================
+# Layer 1 — ferrolearn-decomp (decomposition + manifold +
+#            cross_decomposition)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/pca.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_pca.py"]
+design = ".design/decomp/pca.md"
+parity_ops = ["PCA"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/incremental_pca.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_incremental_pca.py"]
+design = ".design/decomp/incremental_pca.md"
+parity_ops = ["IncrementalPCA"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/kernel_pca.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_kernel_pca.py"]
+design = ".design/decomp/kernel_pca.md"
+parity_ops = ["KernelPCA"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/truncated_svd.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_truncated_svd.py"]
+design = ".design/decomp/truncated_svd.md"
+parity_ops = ["TruncatedSVD"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/nmf.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_nmf.py"]
+design = ".design/decomp/nmf.md"
+parity_ops = ["NMF"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/minibatch_nmf.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_nmf.py"]
+design = ".design/decomp/minibatch_nmf.md"
+parity_ops = ["MiniBatchNMF"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/fast_ica.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_fastica.py"]
+design = ".design/decomp/fast_ica.md"
+parity_ops = ["FastICA"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/factor_analysis.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_factor_analysis.py"]
+design = ".design/decomp/factor_analysis.md"
+parity_ops = ["FactorAnalysis"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/dictionary_learning.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_dict_learning.py"]
+design = ".design/decomp/dictionary_learning.md"
+parity_ops = ["DictionaryLearning", "MiniBatchDictionaryLearning"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/sparse_pca.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_sparse_pca.py"]
+design = ".design/decomp/sparse_pca.md"
+parity_ops = ["SparsePCA", "MiniBatchSparsePCA"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/lda_topic.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/decomposition/_lda.py"]
+design = ".design/decomp/lda_topic.md"
+parity_ops = ["LatentDirichletAllocation"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/cross_decomposition.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/cross_decomposition/_pls.py"]
+design = ".design/decomp/cross_decomposition.md"
+parity_ops = ["PLSRegression", "PLSCanonical", "CCA", "PLSSVD"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/isomap.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/manifold/_isomap.py"]
+design = ".design/decomp/isomap.md"
+parity_ops = ["Isomap"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/lle.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/manifold/_locally_linear.py"]
+design = ".design/decomp/lle.md"
+parity_ops = ["LocallyLinearEmbedding"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/mds.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/manifold/_mds.py"]
+design = ".design/decomp/mds.md"
+parity_ops = ["MDS"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/tsne.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/manifold/_t_sne.py"]
+design = ".design/decomp/tsne.md"
+parity_ops = ["TSNE"]
+
+[[route]]
+crate_pattern = "ferrolearn-decomp/src/spectral_embedding.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/manifold/_spectral_embedding.py"]
+design = ".design/decomp/spectral_embedding.md"
+parity_ops = ["SpectralEmbedding"]
