@@ -7,6 +7,30 @@
 //! minimize ||X @ w - y||^2
 //! ```
 //!
+//! ## REQ status (per `.design/linear/linear_regression.md`, mirrors `sklearn/linear_model/_base.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.LinearRegression` (`_base.py:465`). Full-rank OLS matches
+//! the live sklearn oracle to 1e-8; the rank-deficient/underdetermined minimum-norm contract
+//! diverges (ferrolearn uses centering + Cholesky normal equations with a QR fallback, vs
+//! sklearn's LAPACK `gelsd` SVD min-norm path).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (full-rank OLS coef_/intercept_) | SHIPPED | `Fit for LinearRegression` (centering + `linalg::solve_normal_equations`); full-rank coef/intercept match oracle to 1e-8. Consumer: `RsLinearRegression` in `ferrolearn-python/src/regressors.rs`. Mirrors `_base.py:582`, intercept `_base.py:308`. |
+//! | REQ-2 (predict = X·coef + intercept) | SHIPPED | `Predict for FittedLinearRegression`. Mirrors `_base.py:282`. |
+//! | REQ-3 (fit_intercept incl. false) | SHIPPED | `with_fit_intercept`; `fit_intercept=false` forces intercept 0. Mirrors `_base.py:571`. |
+//! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedLinearRegression`. Mirrors fitted attrs `_base.py:499/511`. |
+//! | REQ-5 (min-norm for rank-deficient / underdetermined X) | NOT-STARTED | divergences #376 (rank-deficient not min-norm) + #377 (underdetermined rejected); root cause in `linalg.rs` solver (SVD min-norm = LAPACK `gelsd`, `_base.py:687`). Failing tests pinned in `tests/divergence_linreg_minnorm.rs`. |
+//! | REQ-6 (positive=True / NNLS) | NOT-STARTED | blocker #371 (`_base.py:574/645`). |
+//! | REQ-7 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | blocker #372 (fit takes `Array1` only). |
+//! | REQ-8 (sample_weight in fit) | NOT-STARTED | blocker #373 (`_base.py` `fit(..., sample_weight=None)`). |
+//! | REQ-9 (rank_/singular_/copy_X/n_jobs) | NOT-STARTED | blocker #374. |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 (ndarray + faer; coef return type tied to #359). |
+//!
+//! acto-critic: 3 divergences pinned (#376/#377) — fix belongs in `linalg.rs` (the next unit
+//! per R-LOOP-3). Full-rank OLS, centering, and through-origin fits match the oracle.
+//! Two states only per goal.md R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
