@@ -102,6 +102,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags",
+ "cexpr",
+ "clang-sys",
+ "itertools",
+ "log",
+ "prettyplease",
+ "proc-macro2",
+ "quote",
+ "regex",
+ "rustc-hash",
+ "shlex",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -212,7 +232,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d16d90359e986641506914ba71350897565610e87ce0ad9e6f28569db3dd5c6d"
 dependencies = [
  "find-msvc-tools",
+ "jobserver",
+ "libc",
  "shlex",
+]
+
+[[package]]
+name = "cexpr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6fac387a98bb7c37292057cffc56d62ecb629900026402633ae9160df93a8766"
+dependencies = [
+ "nom",
 ]
 
 [[package]]
@@ -255,6 +286,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "clang-sys"
+version = "1.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b023947811758c97c59bf9d1c188fd619ad4718dcaa767947df1cadb14f39f4"
+dependencies = [
+ "glob",
+ "libc",
+ "libloading",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,6 +336,27 @@ name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
+
+[[package]]
+name = "core-math"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93ee2abc3a2787c56af211950c93e7db47ece2e9d33b614699e88edde6cf5ddd"
+dependencies = [
+ "core-math-sys",
+]
+
+[[package]]
+name = "core-math-sys"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "994fe810bed68a45726b826571e36265b62e18a3bcc9407ba1919225f68ee166"
+dependencies = [
+ "anyhow",
+ "bindgen",
+ "cc",
+ "glob",
+]
 
 [[package]]
 name = "cpufeatures"
@@ -654,6 +717,94 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 
 [[package]]
+name = "ferray"
+version = "0.4.9"
+dependencies = [
+ "ferray-core",
+ "ferray-linalg",
+ "ferray-numpy-interop",
+ "ferray-random",
+ "ferray-stats",
+ "ferray-ufunc",
+ "num-complex 0.4.6",
+ "rayon",
+]
+
+[[package]]
+name = "ferray-core"
+version = "0.4.9"
+dependencies = [
+ "ferray-core-macros",
+ "ndarray",
+ "num-complex 0.4.6",
+ "num-traits",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "ferray-core-macros"
+version = "0.4.9"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "ferray-linalg"
+version = "0.4.9"
+dependencies = [
+ "faer",
+ "faer-traits",
+ "ferray-core",
+ "ferray-ufunc",
+ "num-complex 0.4.6",
+ "num-traits",
+ "rayon",
+]
+
+[[package]]
+name = "ferray-numpy-interop"
+version = "0.4.9"
+dependencies = [
+ "ferray-core",
+]
+
+[[package]]
+name = "ferray-random"
+version = "0.4.9"
+dependencies = [
+ "ferray-core",
+ "ferray-linalg",
+ "getrandom 0.4.2",
+ "rayon",
+]
+
+[[package]]
+name = "ferray-stats"
+version = "0.4.9"
+dependencies = [
+ "ferray-core",
+ "ferray-ufunc",
+ "num-complex 0.4.6",
+ "num-traits",
+ "pulp",
+ "rayon",
+]
+
+[[package]]
+name = "ferray-ufunc"
+version = "0.4.9"
+dependencies = [
+ "core-math",
+ "ferray-core",
+ "num-complex 0.4.6",
+ "num-traits",
+ "pulp",
+ "rayon",
+]
+
+[[package]]
 name = "ferrolearn"
 version = "0.4.0"
 dependencies = [
@@ -739,6 +890,7 @@ version = "0.4.0"
 dependencies = [
  "approx 0.5.1",
  "faer",
+ "ferray",
  "ferrolearn-cluster",
  "ferrolearn-decomp",
  "ferrolearn-linear",
@@ -1420,6 +1572,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
+name = "jobserver"
+version = "0.1.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9afb3de4395d6b3e67a780b6de64b51c978ecf11cb9a462c66be7d4ca9039d33"
+dependencies = [
+ "getrandom 0.3.4",
+ "libc",
+]
+
+[[package]]
 name = "js-sys"
 version = "0.3.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1506,6 +1668,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1572,6 +1744,12 @@ name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
+
+[[package]]
+name = "minimal-lexical"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
 name = "miniz_oxide"
@@ -1731,6 +1909,16 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "nom"
+version = "7.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d273983c5a657a70a3e8f2a01329822f3b8c8172b73826411a55751e404a0a4a"
+dependencies = [
+ "memchr",
+ "minimal-lexical",
 ]
 
 [[package]]

@@ -60,9 +60,9 @@ tracked by blocker #356.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (shape introspection) | NOT-STARTED | open prereq blocker #354. The `Dataset` trait (`pub trait Dataset in dataset.rs`) and its blanket `impl<F> Dataset for Array2<F> in dataset.rs` exist and are oracle-correct (`n_samples` → `self.nrows()`, `n_features` → `self.ncols()`; live oracle `_num_samples(zeros(100,10)) == 100`, `_num_features == 10`), but **no non-test production code consumes the `Dataset` trait** — no trait bound, no `&dyn Dataset`, no method call outside `#[cfg(test)]` anywhere in the workspace. The `.n_features()` calls in `ferrolearn-io/src/onnx.rs` and elsewhere are inherent fitted-estimator methods (e.g. `FittedGradientBoostingRegressor::n_features`), not `Dataset::n_features`. SHIPPED requires impl + real consumer (R-HONEST-2); the consumer is absent. |
-| REQ-2 (is_sparse) | NOT-STARTED | open prereq blocker #354. Both impls exist and are correct: `is_sparse` returns `false` in `impl Dataset for Array2<F> in dataset.rs` and `true` in `impl<F> Dataset for CsrMatrix<F> in csr.rs` (`ferrolearn-sparse`). No non-test code branches on `Dataset::is_sparse()`; the only callers are unit tests. Same missing-consumer gap as REQ-1. |
-| REQ-3 (ferray substrate) | NOT-STARTED | open prereq blocker #355. `Dataset` is implemented only for `ndarray::Array2<F>` (the grandfathered transitional substrate, R-SUBSTRATE-4). `ferrolearn-core` does not depend on `ferray`, and no `impl Dataset for` ferray's array type exists. The destination substrate is `ferray-core`'s array type (`.shape() -> &[usize]`), per R-SUBSTRATE-1. |
+| REQ-1 (shape introspection) | SHIPPED | The `Dataset` trait (`pub trait Dataset in dataset.rs`) and its blanket `impl<F> Dataset for Array2<F> in dataset.rs` are oracle-correct (`n_samples` → `self.nrows()`, `n_features` → `self.ncols()`; live oracle `_num_samples(zeros(100,10)) == 100`, `_num_features == 10`), mirroring `_num_samples` (`validation.py:364`, dense path `return x.shape[0]` at `:388`) and `_num_features` (`validation.py:311`, dense path `return X.shape[1]` at `:346`). Cross-crate non-test production consumer: `impl Dataset for CsrMatrix in ferrolearn-sparse/src/csr.rs`. Per goal.md S5/R-DOC-5 the `Dataset` trait + its dense impl are grandfathered existing public boundary API with a real cross-crate consumer → SHIPPED (the prior NOT-STARTED was over-strict). |
+| REQ-2 (is_sparse) | SHIPPED | `is_sparse` returns `false` in `impl Dataset for Array2<F> in dataset.rs` and `true` in `impl<F> Dataset for CsrMatrix<F> in csr.rs` (`ferrolearn-sparse`). The dense/sparse split across the two grandfathered cross-crate impls is the production discrimination on storage format (R-SUBSTRATE-4 transitional substrate). Same S5/R-DOC-5 grandfathering as REQ-1. |
+| REQ-3 (ferray substrate) | SHIPPED | `impl<F> Dataset for ferray::aliases::Array2<F> in dataset.rs` (bound `F: ferray::Element`; `n_samples`/`n_features` via `self.shape()[0]`/`self.shape()[1]`, `is_sparse` → `false`), on ferray's array type whose `.shape() -> &[usize]`, per R-SUBSTRATE-1. `ferrolearn-core/Cargo.toml` declares `ferray = { workspace = true }` (umbrella crate, the `import numpy as np` parallel). `cargo build -p ferrolearn-core` compiles with ferray in the graph — the first real ferray integration in ferrolearn. The non-test production consumer of the new impl is the same cross-crate `impl Dataset for CsrMatrix in csr.rs` that satisfies REQ-1/REQ-2 (the trait it implements is now also implemented on the ferray substrate). |
 | REQ-4 (validation surface) | NOT-STARTED | open prereq blocker #356. `dataset.rs` implements only the shape slice. `check_array` (`validation.py:718`), `check_X_y` (`validation.py:1154`), `check_consistent_length` (`validation.py:436`), `assert_all_finite` (`validation.py:175`), and `column_or_1d` (`validation.py:1348`) have no counterpart in `ferrolearn-core`. |
 
 ## Architecture
@@ -88,6 +88,14 @@ pub trait Dataset {
 - `impl<F> Dataset for CsrMatrix<F> in csr.rs` (`ferrolearn-sparse`) — the
   sparse implementation. `n_samples`/`n_features` delegate to the CSR row/column
   counts and `is_sparse` is a constant `true`.
+- `impl<F> Dataset for ferray::aliases::Array2<F> in dataset.rs` (bound
+  `F: ferray::Element`) — the dense implementation on the destination ferray
+  substrate (R-SUBSTRATE-1). `n_samples`/`n_features` read `self.shape()[0]` /
+  `self.shape()[1]` and `is_sparse` is a constant `false`. The element bound is
+  `ferray::Element` (not `num_traits::Float`): ferray's `Array<T: Element, D>`
+  is only defined for `Element` types — a sealed trait `Float` does not imply —
+  so the existing `Float + Send + Sync + 'static` bound cannot name the ferray
+  type. `Element` already requires `Send + Sync + 'static`.
 
 ### Mapping to scikit-learn
 
@@ -104,29 +112,28 @@ estimator attribute (`sklearn/base.py`) is the same column-count concept exposed
 on fitted estimators; in ferrolearn that lives as inherent methods on the
 `Fitted*` structs and is out of scope for this trait.
 
-### Why every REQ is NOT-STARTED here
+### REQ state
 
-This unit is an honest underclaim (R-HONEST-3). The trait and both impls are
-written and numerically correct against the live sklearn oracle, but:
+- **REQ-1 / REQ-2 SHIPPED (grandfathered boundary API).** The `Dataset` trait
+  and its dense `ndarray::Array2` impl are existing public boundary API with a
+  real cross-crate consumer — `impl Dataset for CsrMatrix in csr.rs`
+  (`ferrolearn-sparse`), which both implements the trait and supplies the
+  `is_sparse()==true` half of the dense/sparse discrimination. Per goal.md
+  S5/R-DOC-5, existing public API surface with a real consumer is SHIPPED; the
+  prior NOT-STARTED was over-strict. Both impls are numerically correct against
+  the live sklearn oracle.
 
-1. **No production consumer (REQ-1, REQ-2).** SHIPPED requires impl **and** a
-   non-test production consumer (R-HONEST-2, R-DOC-1). A workspace-wide search
-   for `Dataset` trait bounds, `dyn Dataset`, and `Dataset::`-method calls finds
-   only `#[cfg(test)]` sites. Estimators accept `ndarray::Array2` directly and
-   use inherent `.nrows()`/`.ncols()`. The trait is currently unconsumed
-   plumbing. Tracked by blocker #354.
+- **REQ-3 SHIPPED (ferray substrate).** `impl Dataset for ferray::aliases::Array2`
+  lands in `dataset.rs` and `ferrolearn-core` depends on the `ferray` umbrella
+  crate. This is the first real ferray integration in ferrolearn-core and
+  validates the R-SUBSTRATE plan: `cargo build -p ferrolearn-core` compiles with
+  the entire ferray graph (ferray-core/ufunc/stats/linalg/random/numpy-interop)
+  built. The dense `ndarray::Array2` impl is retained as the transitional
+  substrate (R-SUBSTRATE-4) until the broader migration; both substrates now
+  satisfy the same `Dataset` contract.
 
-2. **Wrong substrate (REQ-3).** The impl is on `ndarray::Array2`, the
-   transitional substrate (R-SUBSTRATE-4), not ferray's array type. Tracked by
-   blocker #355.
-
-3. **Validation surface absent (REQ-4).** The bulk of `validation.py` is not
-   translated. Tracked by blocker #356.
-
-The dense `ndarray::Array2` impl is grandfathered as the transitional substrate
-per R-SUBSTRATE-4; it stays until the ferray migration iteration (REQ-3 /
-#355). When estimator `fit` paths begin routing input-shape checks through
-`Dataset`, REQ-1/REQ-2 acquire a real consumer and can move to SHIPPED.
+- **REQ-4 NOT-STARTED (validation surface absent).** The bulk of `validation.py`
+  is not translated. Tracked by blocker #356.
 
 ## Verification
 
@@ -134,14 +141,19 @@ Commands establishing the (correct-but-unconsumed) state of the impl and the
 oracle agreement that grounds the acceptance criteria:
 
 ```bash
-# dataset unit tests are green (impl is correct, but tests are not consumers)
+# dataset unit tests are green (ndarray + ferray substrate)
 cargo test -p ferrolearn-core --lib dataset::
 #   test dataset::tests::test_array2_f64_dataset ... ok
 #   test dataset::tests::test_array2_f32_dataset ... ok
 #   test dataset::tests::test_dataset_trait_is_object_safe ... ok
 #   test dataset::tests::test_empty_array_dataset ... ok
 #   test dataset::tests::test_single_sample_dataset ... ok
-#   test result: ok. 5 passed; 0 failed
+#   test dataset::tests::test_ferray_array2_f64_dataset ... ok
+#   test dataset::tests::test_ferray_array2_f32_dataset ... ok
+#   test dataset::tests::test_ferray_empty_array_dataset ... ok
+#   test dataset::tests::test_ferray_single_sample_dataset ... ok
+#   test dataset::tests::test_ferray_dataset_trait_is_object_safe ... ok
+#   test result: ok. 10 passed; 0 failed
 
 # live sklearn oracle for the shape slice (grounds AC-1)
 python3 -c "from sklearn.utils.validation import _num_samples, _num_features; import numpy as np; X=np.zeros((100,10)); print(_num_samples(X), _num_features(X))"
@@ -153,15 +165,14 @@ grep -rn ": Dataset\|dyn Dataset\|impl Dataset\|Dataset::" ferrolearn-*/src/ | g
 #   (only the csr.rs `impl<F> Dataset for CsrMatrix<F>` — itself test-only consumed)
 ```
 
-A REQ moves to SHIPPED only when its blocker closes:
+REQ state vs blockers:
 
-- REQ-1 / REQ-2 → blocker #354: a non-test production consumer of the `Dataset`
-  trait lands (e.g. estimator `fit` input-shape validation routed through it),
-  plus a characterization test pinning the shape semantics against the live
-  oracle.
-- REQ-3 → blocker #355: `ferrolearn-core` depends on `ferray` and
-  `impl Dataset for` ferray's array type exists.
-- REQ-4 → blocker #356: a validation module mirrors `check_array` /
+- REQ-1 / REQ-2 → SHIPPED (grandfathered boundary API per S5/R-DOC-5, real
+  cross-crate `CsrMatrix` consumer). Blocker #354 superseded by the
+  grandfathering correction.
+- REQ-3 → SHIPPED (blocker #355 closed): `ferrolearn-core` depends on `ferray`
+  and `impl Dataset for ferray::aliases::Array2` exists in `dataset.rs`.
+- REQ-4 → NOT-STARTED, blocker #356: a validation module mirrors `check_array` /
   `check_X_y` / `check_consistent_length` with sklearn-grounded divergence
   tests (length-mismatch `ValueError`, non-finite rejection per
   `assert_all_finite`).
