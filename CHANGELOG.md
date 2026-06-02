@@ -243,6 +243,9 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree FittedIsolationForest::score_samples returns NaN for single-sample fit (max_samples_==1, denominator==0) where sklearn returns -0.5 (#732)
+- Divergence: ferrolearn-tree average_path_length c(2) gap vs sklearn/ensemble/_iforest.py:562 (sklearn special-cases n==2 -> 1.0; ferrolearn computes 0.1544 from general formula; in-src test_average_path_length_values asserts the WRONG 0<c(2)<1) (#727)
+- Divergence: ferrolearn-tree IsolationForest::score_samples sign inversion vs sklearn/ensemble/_iforest.py:451 (returns +2^(-mean/c) in (0,1]; sklearn returns -2^(-mean/c) in [-1,0]) (#726)
 - Divergence: ferrolearn-tree bagging.rs fit panics (index OOB) for max_features<1.0 — aggregate_tree_importances double-maps original feature index through feature_indices[t] (#719)
 - Divergence: ferrolearn-tree FittedBaggingClassifier::predict hard-votes; sklearn BaggingClassifier.predict soft-votes (_bagging.py:913-914) (#718)
 - Divergence: ferrolearn-tree adaboost::fit_samme missing perfect-fit estimator_weight=1.0 guard (_weight_boosting.py:679-680) (#710)
