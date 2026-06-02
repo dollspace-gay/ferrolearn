@@ -553,3 +553,176 @@ fn sgd_shuffle_false_multisample_kernel_parity() {
          coef={coef_en:?} intercept={intercept_en}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-10 / #530 — convergence stop rule: `best_loss` + `sumloss` +
+// `n_iter_no_change` consecutive-non-improving epochs (NOT a first-epoch
+// mean-loss delta). Now pinnable cross-impl via `shuffle=false`.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:688-707`
+//   `if tol > -INFINITY and sumloss > best_loss - tol * train_count:`
+//   `    no_improvement_count += 1`
+//   `else:`
+//   `    no_improvement_count = 0`
+//   `if sumloss < best_loss:`
+//   `    best_loss = sumloss`
+//   `if no_improvement_count >= n_iter_no_change:`   (default 5)
+//   `    ... else: break`
+//   `sumloss` is the SUM of per-sample losses over the epoch (`:669`,
+//   `sumloss / train_count` is only the *printed* average); `best_loss` tracks
+//   the running minimum. So convergence requires `n_iter_no_change` (=5)
+//   CONSECUTIVE epochs whose `sumloss` fails to beat `best_loss - tol*n`.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `train_regressor_sgd:1560-1562`
+//   `if (prev_loss - epoch_loss).abs() < hyper.tol { break; }`
+//   on the MEAN epoch_loss (`epoch_loss /= n`, `:1557`). This breaks on the
+//   FIRST epoch whose mean-loss delta drops below tol — a different criterion
+//   that stops at a DIFFERENT epoch, yielding different `coef_`/`intercept_`.
+//
+// Setup (deterministic on both sides): 4 samples / 2 features, squared_error,
+// penalty='l2', `learning_rate='constant'` (eta=eta0 every step, removes the
+// t/t0 schedule subtleties so the divergence is PURELY the stop rule),
+// alpha=0.01, eta0=0.01, default tol=1e-3, default n_iter_no_change=5,
+// `shuffle=False` (index order 0..n-1 each epoch in BOTH impls). max_iter=1000
+// (large enough that the stop rule, not the cap, decides when to stop).
+//
+// Stop-epoch divergence: sklearn runs 49 epochs (`m.n_iter_` below); ferrolearn's
+// mean-delta rule stops at epoch 45, so the final weights differ by ~1.6e-2.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (live scikit-learn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01, \
+///   learning_rate='constant',eta0=0.01,max_iter=1000,tol=1e-3,shuffle=False, \
+///   random_state=0,fit_intercept=True).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist(), m.n_iter_)"
+/// ```
+/// -> coef [0.8037686404055491, 0.16059017315681692]
+///    intercept [0.12903834217696583]   n_iter_ 49
+///
+/// ferrolearn's first-epoch mean-delta stop rule halts at epoch 45 with
+/// coef ~[0.78798, 0.17604] intercept ~0.13199 — a ~1.6e-2 weight divergence
+/// driven entirely by the different convergence criterion.
+#[test]
+fn sgd_convergence_n_iter_no_change() {
+    const SK_COEF0: f64 = 0.8037686404055491;
+    const SK_COEF1: f64 = 0.16059017315681692;
+    const SK_INTERCEPT: f64 = 0.12903834217696583;
+
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0]).unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+
+    // constant schedule => eta=eta0 every step in both impls; tol=1e-3 default,
+    // n_iter_no_change=5 default (ferrolearn hardcodes 5). shuffle=false makes
+    // the visit order 0..n-1 identical to sklearn.
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(1000)
+        .with_tol(1e-3)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-7
+            && (coef[1] - SK_COEF1).abs() < 1e-7
+            && (intercept - SK_INTERCEPT).abs() < 1e-7,
+        "convergence stop rule diverges: sklearn (best_loss/sumloss/n_iter_no_change, \
+         49 epochs) coef=[{SK_COEF0}, {SK_COEF1}] intercept={SK_INTERCEPT}; ferrolearn \
+         (first-epoch mean-delta, ~45 epochs) coef={coef:?} intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8 / #528 — adaptive learning-rate schedule: divide `eta` by 5 on the
+// SAME `no_improvement_count >= n_iter_no_change` machinery as convergence (and
+// only while `eta > 1e-6`), resetting the count. Now pinnable via `shuffle=
+// false`.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:697-707`
+//   `if no_improvement_count >= n_iter_no_change:`
+//   `    if learning_rate == ADAPTIVE and eta > 1e-6:`
+//   `        eta = eta / 5`
+//   `        no_improvement_count = 0`
+//   `    else: ... break`
+//   where `no_improvement_count` is driven by the training-loss branch at
+//   `:690-693` (`sumloss > best_loss - tol*train_count`). So in adaptive mode
+//   the convergence break is REPLACED by an eta/=5 step; the fit keeps running
+//   (here to `n_iter_ = 80`) instead of stopping.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `train_regressor_sgd:1560-1577`
+//   - convergence check `if (prev_loss-epoch_loss).abs() < tol { break; }` fires
+//     FIRST and still applies under the adaptive schedule (sklearn removes it);
+//   - the adaptive arm divides `current_eta` by 2 (NOT 5) and only when
+//     `epoch_loss >= prev_loss` for 5 CONSECUTIVE epochs (a different trigger
+//     than sklearn's `sumloss > best_loss - tol*n`).
+//   On this monotone-decreasing-loss data the `>= prev_loss` trigger never
+//   fires, so ferrolearn never divides eta and instead early-stops at epoch ~45
+//   via the (sklearn-absent) convergence rule.
+//
+// Same data / params as #530 but `learning_rate='adaptive'` (eta0=0.01). Both
+// sides deterministic under shuffle=false; the eta trajectory (and stop epoch)
+// diverge -> different `coef_`. sklearn 80 epochs vs ferrolearn ~45.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (live scikit-learn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01, \
+///   learning_rate='adaptive',eta0=0.01,max_iter=1000,tol=1e-3,shuffle=False, \
+///   random_state=0,fit_intercept=True).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist(), m.n_iter_)"
+/// ```
+/// -> coef [0.8065190275590332, 0.15336844797680402]
+///    intercept [0.12731338963662575]   n_iter_ 80
+///
+/// ferrolearn's adaptive arm (÷2 on a never-firing `>=prev_loss` 5-epoch trigger,
+/// plus the sklearn-absent mean-delta early stop) halts at epoch ~45 with
+/// coef ~[0.78798, 0.17604] intercept ~0.13199 — a ~2e-2 weight divergence from
+/// the ÷5 / n_iter_no_change schedule mismatch.
+#[test]
+fn sgd_adaptive_schedule_divisor() {
+    const SK_COEF0: f64 = 0.8065190275590332;
+    const SK_COEF1: f64 = 0.15336844797680402;
+    const SK_INTERCEPT: f64 = 0.12731338963662575;
+
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0]).unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+
+    // adaptive schedule, eta0=0.01, tol=1e-3 default, n_iter_no_change=5 default.
+    // shuffle=false => visit order 0..n-1 identical to sklearn.
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Adaptive)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(1000)
+        .with_tol(1e-3)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-7
+            && (coef[1] - SK_COEF1).abs() < 1e-7
+            && (intercept - SK_INTERCEPT).abs() < 1e-7,
+        "adaptive schedule diverges: sklearn (eta/=5 on n_iter_no_change, 80 epochs) \
+         coef=[{SK_COEF0}, {SK_COEF1}] intercept={SK_INTERCEPT}; ferrolearn (eta/=2 on \
+         >=prev_loss 5-epoch trigger + mean-delta early stop, ~45 epochs) coef={coef:?} \
+         intercept={intercept}"
+    );
+}
