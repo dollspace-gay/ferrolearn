@@ -48,7 +48,7 @@
 
 use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::linear_svc::{LinearSVC, LinearSVCLoss};
+use ferrolearn_linear::linear_svc::{DualMode, LinearSVC, LinearSVCLoss, LinearSVCPenalty};
 use ndarray::{Array1, Array2, array};
 
 /// The fixed binary 8x2 well-separated set used across the pins (AC-1).
@@ -457,5 +457,290 @@ fn linear_svc_attrs_and_tol_validation() {
     assert!(
         LinearSVC::<f64>::new().with_tol(-1.0).fit(&x, &y).is_err(),
         "tol=-1.0 must be rejected (closed='neither', _classes.py:237)"
+    );
+}
+
+/// PIN 1 (#622, REQ-5 — l1-penalty coef_/intercept_ parity). Certifies the NEW
+/// l1 solver (`fn solve_binary_l1r_l2`, liblinear `solve_l1r_l2_svc`,
+/// `linear.cpp:1467`, solver type 5 via `_get_liblinear_solver_type`,
+/// `sklearn/svm/_base.py:1014`) reaches liblinear's l1 optimum on the binary
+/// 8x2 set. This is a DISTINCT optimum from the l2 fit: the l2 intercept is
+/// -1.19438, the l1 intercept is -1.20796 — same `coef_` to 1e-2 here but a
+/// different objective (`‖w‖₁ + C·Σ max(0,1−yf)²`).
+///
+/// NOTE: `LinearSVC(penalty='l1')` defaults `random_state=None` and liblinear
+/// shuffles the coordinate order, so the converged `coef_` jitters at ~1e-7..1e-9
+/// run-to-run. We pin with tolerance 1e-2 — well above the jitter, far below the
+/// l1-vs-wrong-objective gap.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=LinearSVC(penalty='l1',loss='squared_hinge',dual=False,C=1.0,\
+///     fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # coef [[0.12831858, 0.12831858]] intercept [-1.20796460]  (jitters ~1e-7)
+/// ```
+#[test]
+fn linear_svc_l1_penalty_coef_parity() {
+    // Live sklearn 1.5.2: l1, squared_hinge, dual=False, C=1.0,
+    // fit_intercept=True. Run-to-run-stable to ~1e-7 (random shuffle).
+    const SK_COEF: f64 = 0.12831858;
+    const SK_INTERCEPT: f64 = -1.20796460;
+
+    let (x, y) = binary_set();
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_penalty(LinearSVCPenalty::L1)
+        .with_loss(LinearSVCLoss::SquaredHinge)
+        .with_dual(DualMode::False)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coefficients();
+    let coef0 = coef[0];
+    let coef1 = coef[1];
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef0 - SK_COEF).abs() < 1e-2,
+        "l1 coef_[0]: sklearn (liblinear solve_l1r_l2_svc, type 5) {SK_COEF}, \
+         ferrolearn {coef0} (gap {:.6}).",
+        (coef0 - SK_COEF).abs()
+    );
+    assert!(
+        (coef1 - SK_COEF).abs() < 1e-2,
+        "l1 coef_[1]: sklearn (liblinear) {SK_COEF}, ferrolearn {coef1} \
+         (gap {:.6}).",
+        (coef1 - SK_COEF).abs()
+    );
+    assert!(
+        (intercept - SK_INTERCEPT).abs() < 1e-2,
+        "l1 intercept_: sklearn (liblinear) {SK_INTERCEPT}, ferrolearn \
+         {intercept} (gap {:.6}). (Distinct from the l2 optimum -1.19438.)",
+        (intercept - SK_INTERCEPT).abs()
+    );
+}
+
+/// PIN 2 (#625, REQ-8 — unsupported penalty×loss×dual combinations reject).
+/// `fn liblinear_solver_type` mirrors `_get_liblinear_solver_type`
+/// (`sklearn/svm/_base.py:995-1049`). The `multi_class='ovr'` slice of
+/// `_solver_type_dict` (`_base.py:1013-1014`) is:
+///
+/// ```text
+///   hinge:         { l2: { True: 3 } }
+///   squared_hinge: { l1: { False: 5 }, l2: { False: 2, True: 1 } }
+/// ```
+///
+/// Combos with no entry raise `ValueError` in sklearn → ferrolearn `Err`.
+///
+/// Oracle matrix (live sklearn 1.5.2 `.fit`, binary 8x2 set; ERR = ValueError,
+/// OK = fits):
+/// ```text
+///   l1 + hinge          (any dual)  -> ERR  "penalty='l1' and loss='hinge' is not supported"
+///   l1 + squared_hinge  dual=True   -> ERR  "... are not supported when dual=True"
+///   l2 + hinge          dual=False  -> ERR  "... are not supported when dual=False"
+///   l2 + squared_hinge  dual=True   -> OK   (solver 1)
+///   l2 + squared_hinge  dual=False  -> OK   (solver 2)
+///   l2 + hinge          dual=True   -> OK   (solver 3)
+///   l1 + squared_hinge  dual=False  -> OK   (solver 5)
+/// python3 -c "import numpy as np,warnings; from sklearn.svm import LinearSVC; \
+///   X=...; y=...; \
+///   [print(p,l,d, ...try LinearSVC(penalty=p,loss=l,dual=d).fit(X,y)...) ...]"
+/// ```
+#[test]
+fn linear_svc_dual_penalty_rejects() {
+    let (x, y) = binary_set();
+
+    let base = || {
+        LinearSVC::<f64>::new()
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+    };
+
+    // --- Unsupported combos: sklearn raises ValueError; ferrolearn must Err. ---
+
+    // l1 + hinge (any dual): no `hinge` entry has an `l1` penalty (_base.py:1013).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L1)
+            .with_loss(LinearSVCLoss::Hinge)
+            .with_dual(DualMode::True)
+            .fit(&x, &y)
+            .is_err(),
+        "l1+hinge,dual=True must reject (penalty='l1' and loss='hinge' unsupported)"
+    );
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L1)
+            .with_loss(LinearSVCLoss::Hinge)
+            .with_dual(DualMode::False)
+            .fit(&x, &y)
+            .is_err(),
+        "l1+hinge,dual=False must reject (penalty='l1' and loss='hinge' unsupported)"
+    );
+
+    // l1 + squared_hinge + dual=True: l1 requires dual=False (_base.py:1014).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L1)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(DualMode::True)
+            .fit(&x, &y)
+            .is_err(),
+        "l1+squared_hinge,dual=True must reject (l1 has no dual solver)"
+    );
+
+    // l2 + hinge + dual=False: hinge requires dual=True (_base.py:1013).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L2)
+            .with_loss(LinearSVCLoss::Hinge)
+            .with_dual(DualMode::False)
+            .fit(&x, &y)
+            .is_err(),
+        "l2+hinge,dual=False must reject (hinge has no primal solver)"
+    );
+
+    // --- Supported combos: sklearn fits; ferrolearn must be Ok. ---
+
+    // l2 + squared_hinge + dual=True (solver 1).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L2)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(DualMode::True)
+            .fit(&x, &y)
+            .is_ok(),
+        "l2+squared_hinge,dual=True must fit (solver type 1)"
+    );
+    // l2 + squared_hinge + dual=False (solver 2).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L2)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(DualMode::False)
+            .fit(&x, &y)
+            .is_ok(),
+        "l2+squared_hinge,dual=False must fit (solver type 2)"
+    );
+    // l2 + hinge + dual=True (solver 3).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L2)
+            .with_loss(LinearSVCLoss::Hinge)
+            .with_dual(DualMode::True)
+            .fit(&x, &y)
+            .is_ok(),
+        "l2+hinge,dual=True must fit (solver type 3)"
+    );
+    // l1 + squared_hinge + dual=False (solver 5).
+    assert!(
+        base()
+            .with_penalty(LinearSVCPenalty::L1)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(DualMode::False)
+            .fit(&x, &y)
+            .is_ok(),
+        "l1+squared_hinge,dual=False must fit (solver type 5)"
+    );
+}
+
+/// PIN 3 (#625, REQ-8 — dual='auto' resolution + l2 dual-invariance).
+///
+/// (a) l2+squared_hinge is dual-INVARIANT: the live oracle's
+///     `LinearSVC(dual=True).coef_` == `LinearSVC(dual=False).coef_` (both fit
+///     the same `0.5·‖w‖² + C·Σ L`). ferrolearn must agree across `DualMode::True`
+///     and `DualMode::False` (within 1e-6) AND both match the live l2 oracle.
+/// (b) `DualMode::Auto` on the 8x2 set (n_samples=8 ≥ n_features=2) resolves to
+///     the primal-preferring path (`_validate_dual_parameter('auto',
+///     'squared_hinge','l2','ovr',X) == False`, live oracle), and — since l2 is
+///     dual-invariant — must reach the SAME l2 optimum.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   from sklearn.svm._classes import _validate_dual_parameter; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   mt=LinearSVC(penalty='l2',loss='squared_hinge',dual=True,C=1.0,\
+///       fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   mf=LinearSVC(penalty='l2',loss='squared_hinge',dual=False,C=1.0,\
+///       fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(mt.coef_.tolist(), mt.intercept_.tolist()); \
+///   print(mf.coef_.tolist(), mf.intercept_.tolist()); \
+///   print(_validate_dual_parameter('auto','squared_hinge','l2','ovr',X))"
+/// # dual=True  coef [[0.12835213612349905, 0.12835213612515478]] intercept [-1.1943776585903603]
+/// # dual=False coef [[0.12835213611984458, 0.12835213611984475]] intercept [-1.1943776585907158]
+/// # _validate_dual_parameter(...) == False
+/// ```
+#[test]
+fn linear_svc_dual_auto_and_invariance() {
+    // Live sklearn 1.5.2 l2/squared_hinge optimum (dual-invariant to ~3e-12).
+    const SK_COEF_0: f64 = 0.12835213611984458;
+    const SK_COEF_1: f64 = 0.12835213611984475;
+    const SK_INTERCEPT: f64 = -1.1943776585907158;
+
+    let (x, y) = binary_set();
+
+    let fit_with = |dual: DualMode| {
+        LinearSVC::<f64>::new()
+            .with_penalty(LinearSVCPenalty::L2)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(dual)
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&x, &y)
+            .unwrap()
+    };
+
+    let dual_true = fit_with(DualMode::True);
+    let dual_false = fit_with(DualMode::False);
+    let dual_auto = fit_with(DualMode::Auto);
+
+    // (a) dual-invariance: ferrolearn dual=True and dual=False agree (1e-6).
+    assert!(
+        (dual_true.coefficients()[0] - dual_false.coefficients()[0]).abs() < 1e-6
+            && (dual_true.coefficients()[1] - dual_false.coefficients()[1]).abs() < 1e-6
+            && (dual_true.intercept() - dual_false.intercept()).abs() < 1e-6,
+        "l2/squared_hinge must be dual-invariant: dual=True coef={:?} int={}, \
+         dual=False coef={:?} int={}",
+        dual_true.coefficients(),
+        dual_true.intercept(),
+        dual_false.coefficients(),
+        dual_false.intercept()
+    );
+
+    // Both match the live l2 oracle (1e-2).
+    for (label, f) in [("dual=True", &dual_true), ("dual=False", &dual_false)] {
+        assert!(
+            (f.coefficients()[0] - SK_COEF_0).abs() < 1e-2
+                && (f.coefficients()[1] - SK_COEF_1).abs() < 1e-2
+                && (f.intercept() - SK_INTERCEPT).abs() < 1e-2,
+            "{label} must match live l2 oracle coef [[{SK_COEF_0}, {SK_COEF_1}]] \
+             intercept [{SK_INTERCEPT}]; got coef={:?} intercept={}",
+            f.coefficients(),
+            f.intercept()
+        );
+    }
+
+    // (b) dual='auto' on 8x2 (n_samples=8 >= n_features=2) resolves to the
+    // primal-preferring path (_validate_dual_parameter -> False, live oracle)
+    // and reaches the same dual-invariant l2 optimum.
+    assert!(
+        (dual_auto.coefficients()[0] - SK_COEF_0).abs() < 1e-2
+            && (dual_auto.coefficients()[1] - SK_COEF_1).abs() < 1e-2
+            && (dual_auto.intercept() - SK_INTERCEPT).abs() < 1e-2,
+        "dual=Auto must match live l2 oracle coef [[{SK_COEF_0}, {SK_COEF_1}]] \
+         intercept [{SK_INTERCEPT}]; got coef={:?} intercept={}",
+        dual_auto.coefficients(),
+        dual_auto.intercept()
     );
 }

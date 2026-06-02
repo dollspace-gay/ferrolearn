@@ -55,10 +55,10 @@
 //! | REQ-2 (decision_function shape `(n,)` + values) | SHIPPED | `fn decision_function` returns [`DecisionScores::Binary`] = 1-D `X·w + b` for the binary case (sklearn ravels the single-column score to `(n,)`, `linear_model/_base.py:365`) and [`DecisionScores::Multiclass`] `(n, n_classes)` otherwise. Pinned by `tests/divergence_linear_svc_fit.rs::linear_svc_decision_function` (live oracle 1-D `(8,)` values). Consumer: `fn predict` reads the binary scores' sign. |
 //! | REQ-3 (predict + classes_) | SHIPPED | `fn predict` uses the sign of the binary decision (`>= 0 → classes_[1]`) / argmax of the OvR scores; `HasClasses::classes` = sorted unique `y` (`classes_ = np.unique(y)`, `_classes.py:311`). The labels are downstream of the liblinear-parity fit and pinned against the live oracle by `linear_svc_predict_parity in tests/divergence_linear_svc_fit.rs` (#620; 8×2 set: `predict [0,0,0,0,1,1,1,1]`, `classes_ [0,1]`). |
 //! | REQ-4 (loss {hinge, squared_hinge}) | SHIPPED | The dual CD solves BOTH the true `hinge` (`U=C`, `diag=0`) and `squared_hinge` (`U=∞`, `diag=0.5/C`) optima (`solve_l2r_l1l2_svc`, `linear.cpp:849-858`). The `hinge` optimum is pinned against the live oracle by `linear_svc_hinge_coef_parity in tests/divergence_linear_svc_fit.rs` (#621; 8×2 set, `loss='hinge'`, `C=1.0`: `coef_ [[0.15384615383852776, 0.15384615383915584]]`, `intercept_ [-1.4615384615168394]`). |
-//! | REQ-5 (penalty {l1, l2}) | NOT-STARTED | open prereq blocker #622. `LinearSVC<F>` has no `penalty` field; the dual CD hardcodes the L2 regularizer. |
+//! | REQ-5 (penalty {l1, l2}) | SHIPPED | `LinearSVC<F>` exposes `pub penalty: LinearSVCPenalty` (default `L2`) + `#[must_use] with_penalty`. `penalty=l1` routes to `fn solve_binary_l1r_l2` — liblinear's feature-major coordinate descent (`solve_l1r_l2_svc`, `linear.cpp:1467`, solver type 5, `_base.py:1014`) minimizing `‖w‖₁ + C·Σ max(0,1−yf)²` (sparse `coef_`); `penalty=l2` keeps `fn solve_binary_dual`. `liblinear_solver_type` rejects `('l1','hinge')` (`_base.py:1013`). Pinned by `test_l1_penalty_smoke` (live oracle 8×2 `l1,squared_hinge,dual=False,C=1`: `coef_ [[0.1283185834966579, 0.12831858464059265]]`, `intercept_ [-1.2079646017762715]`; ferrolearn lands within ~1.2e-9) + `test_unsupported_combinations_rejected`. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-6 (multi_class {ovr, crammer_singer}) | NOT-STARTED | open prereq blocker #623. `fn fit` implements one-vs-rest (the default `'ovr'`) but there is no `multi_class` field / `crammer_singer` joint solver. |
 //! | REQ-7 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVC<F>` exposes `pub fit_intercept: bool` (default true) + `pub intercept_scaling: F` (default 1.0) + `#[must_use]` builders. When fitting an intercept the design matrix is augmented with a penalized constant column = `intercept_scaling`, and `intercept_ = intercept_scaling·w_last` (`_base.py:1188-1198,:1240-1245`); `intercept_scaling > 0` is validated. Pinned by `linear_svc_coef_parity` + module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
-//! | REQ-8 (dual param) | NOT-STARTED | open prereq blocker #625. `LinearSVC<F>` has no `dual` field. |
+//! | REQ-8 (dual param) | SHIPPED | `LinearSVC<F>` exposes `pub dual: DualMode` (default `Auto`) + `#[must_use] with_dual`. `fn resolve_dual` resolves `Auto→bool` (`_validate_dual_parameter`, `_classes.py:13-29`: `n<f`→prefer dual, else→prefer primal, with fallback) against `fn liblinear_solver_type` (the `_get_liblinear_solver_type` matrix, `_base.py:995-1018`), and `fn fit` validates the resolved combo (`hinge+dual=false`, `l1+dual=true`, `l1+hinge` all rejected → `FerroError::InvalidParameter`). R-DEV-7: the resolved `dual` is **observably immaterial for `penalty=l2`** — the l2 dual CD and l2 primal minimize the same `0.5·‖w‖² + C·Σ L` and reach the same `coef_`/`intercept_`, so `penalty=l2` keeps `fn solve_binary_dual` regardless of `dual`. Pinned by `test_unsupported_combinations_rejected` + `test_dual_auto_resolution`. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-9 (class_weight) | NOT-STARTED | open prereq blocker #626. `LinearSVC<F>` has no `class_weight` field. |
 //! | REQ-10 (C-scaling convention) | SHIPPED | the `c / n_f` division is removed; the dual CD uses `upper_bound = C` (hinge) / `diag = 0.5/C` (squared_hinge), so `coef_` tracks `C` like liblinear. Pinned by `linear_svc_coef_c_dependence` (C=0.1 → `0.0784651864625997`, C=1.0 → `0.12835213611984458`). |
 //! | REQ-11 (n_iter_/n_features_in_ + param validation) | SHIPPED | `fn n_features_in` (returns the stored `n_features`, set by `_validate_data`, `_classes.py:302`) and `fn n_iter` (the max dual-CD outer-iteration count across the binary/OvR fits, `n_iter_ = n_iter_.max().item()`, `_classes.py:338`) on `FittedLinearSVC`; `fn fit` validates `tol > 0` (`Interval(Real, 0.0, None, closed="neither")`, `_classes.py:237`). Pinned by `linear_svc_attrs_and_tol_validation in tests/divergence_linear_svc_fit.rs` (#627). `n_features_in_` (oracle `2`) and the `tol <= 0` reject are exact; `n_iter_` is the documented shuffle-path RNG boundary (ferrolearn sweeps natural order, sklearn's liblinear shuffles `index` each sweep, cf. SGD), so the pin bounds `n_iter` in `[1, max_iter]` rather than exact-matching. |
@@ -69,6 +69,53 @@ use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::Float;
+
+/// Penalty (regularizer) norm for [`LinearSVC`].
+///
+/// Mirrors `sklearn.svm.LinearSVC`'s `penalty` parameter
+/// (`sklearn/svm/_classes.py:51-54`): `'l2'` (default) is the standard SVC
+/// `0.5·‖w‖²` regularizer; `'l1'` is the `‖w‖₁` regularizer, which yields a
+/// sparse `coef_`. The penalty interacts with [`LinearSVCLoss`] / [`DualMode`]
+/// via liblinear's solver-selection matrix (`_get_liblinear_solver_type`,
+/// `_base.py:1011-1018`): `'l1'` is only supported with `squared_hinge` +
+/// `dual=False` (solver type 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LinearSVCPenalty {
+    /// `‖w‖₁` regularizer — sparse `coef_`. Only valid with `squared_hinge` +
+    /// `dual=false` (liblinear solver type 5, `_base.py:1014`).
+    L1,
+    /// `0.5·‖w‖²` regularizer (default), the standard SVC penalty.
+    #[default]
+    L2,
+}
+
+/// Dual / primal optimization-problem selector for [`LinearSVC`].
+///
+/// Mirrors `sklearn.svm.LinearSVC`'s `dual` parameter
+/// (`sklearn/svm/_classes.py:62-71`, default `"auto"`). `Auto` resolves to a
+/// concrete `bool` via `_validate_dual_parameter` (`_classes.py:13-29`): when
+/// `n_samples < n_features` it prefers `dual=true` (falling back to `false` if
+/// that penalty×loss combination has no dual solver); otherwise it prefers
+/// `dual=false` (falling back to `true` if there is no primal solver, e.g.
+/// `hinge`). The resolved `dual` selects the liblinear solver type
+/// (`_get_liblinear_solver_type`, `_base.py:1011-1018`).
+///
+/// Under R-DEV-7 the resolved `dual` is **observably immaterial for
+/// `penalty=l2`**: the l2 dual coordinate descent and the l2 primal both
+/// minimize the same strongly convex `0.5·‖w‖² + C·Σ L` and reach the same
+/// `coef_`/`intercept_`. It is load-bearing only for the unsupported-combination
+/// rejects and for selecting the genuinely different `l1` primal solver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DualMode {
+    /// Resolve to `true`/`false` automatically via `_validate_dual_parameter`
+    /// (`_classes.py:13-29`); the default.
+    #[default]
+    Auto,
+    /// Solve the dual optimization problem.
+    True,
+    /// Solve the primal optimization problem.
+    False,
+}
 
 /// Loss function for [`LinearSVC`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +198,15 @@ pub struct LinearSVC<F> {
     pub tol: F,
     /// Loss function to use.
     pub loss: LinearSVCLoss,
+    /// Regularizer norm (`l1` / `l2`). Default `l2`. `l1` is only supported with
+    /// `squared_hinge` + `dual=false` (liblinear solver type 5,
+    /// `_get_liblinear_solver_type`, `_base.py:1014`).
+    pub penalty: LinearSVCPenalty,
+    /// Dual / primal selector. Default `Auto`, resolved via
+    /// `_validate_dual_parameter` (`_classes.py:13-29`). Observably immaterial
+    /// for `penalty=l2` (R-DEV-7 dual-invariance), load-bearing for the
+    /// unsupported-combination rejects and the `l1` primal solver.
+    pub dual: DualMode,
     /// Whether to fit an intercept. When `true`, the design matrix is augmented
     /// with a synthetic constant column equal to [`intercept_scaling`]; the
     /// augmented weight is penalized like any feature (liblinear convention).
@@ -170,7 +226,8 @@ impl<F: Float> LinearSVC<F> {
     ///
     /// Defaults (matching `sklearn.svm.LinearSVC`, `_classes.py`):
     /// `C = 1.0`, `max_iter = 1000`, `tol = 1e-4`, `loss = SquaredHinge`,
-    /// `fit_intercept = true`, `intercept_scaling = 1.0`.
+    /// `penalty = L2`, `dual = Auto`, `fit_intercept = true`,
+    /// `intercept_scaling = 1.0`.
     #[must_use]
     pub fn new() -> Self {
         // 1e-4/1.0 are exactly representable in f32/f64; the defensive fallback
@@ -184,6 +241,8 @@ impl<F: Float> LinearSVC<F> {
                 one / (ten * ten * ten * ten)
             }),
             loss: LinearSVCLoss::SquaredHinge,
+            penalty: LinearSVCPenalty::L2,
+            dual: DualMode::Auto,
             fit_intercept: true,
             intercept_scaling: one,
         }
@@ -214,6 +273,22 @@ impl<F: Float> LinearSVC<F> {
     #[must_use]
     pub fn with_loss(mut self, loss: LinearSVCLoss) -> Self {
         self.loss = loss;
+        self
+    }
+
+    /// Set the penalty (regularizer) norm (sklearn `penalty`). `l1` requires
+    /// `squared_hinge` + `dual=false` (`_base.py:1014`).
+    #[must_use]
+    pub fn with_penalty(mut self, penalty: LinearSVCPenalty) -> Self {
+        self.penalty = penalty;
+        self
+    }
+
+    /// Set the dual / primal selector (sklearn `dual`). `Auto` (default)
+    /// resolves via `_validate_dual_parameter` (`_classes.py:13-29`).
+    #[must_use]
+    pub fn with_dual(mut self, dual: DualMode) -> Self {
+        self.dual = dual;
         self
     }
 
@@ -548,6 +623,354 @@ fn solve_binary_dual<F: Float + 'static>(
     (w, n_iter, converged)
 }
 
+/// Resolve `(penalty, loss, dual)` to a liblinear solver "magic number" for the
+/// one-vs-rest `multi_class='ovr'` case, mirroring `_get_liblinear_solver_type`
+/// (`sklearn/svm/_base.py:995-1049`). Returns `Err` for the unsupported
+/// combinations sklearn raises `ValueError` on.
+///
+/// The supported (`multi_class='ovr'`) entries of `_solver_type_dict`
+/// (`_base.py:1013-1014`):
+///
+/// ```text
+///   hinge:         { l2: { dual=true: 3 } }
+///   squared_hinge: { l1: { dual=false: 5 }, l2: { dual=false: 2, dual=true: 1 } }
+/// ```
+///
+/// (`crammer_singer` = 4 is REQ-6/#623, out of scope; this function assumes the
+/// existing `'ovr'` multi-class.) The `Err` strings mirror sklearn's
+/// `error_string` (`_base.py:1033-1043`).
+fn liblinear_solver_type(
+    penalty: LinearSVCPenalty,
+    loss: LinearSVCLoss,
+    dual: bool,
+) -> Result<u8, FerroError> {
+    match (loss, penalty, dual) {
+        // hinge: { l2: { dual=true: 3 } }
+        (LinearSVCLoss::Hinge, LinearSVCPenalty::L2, true) => Ok(3),
+        (LinearSVCLoss::Hinge, LinearSVCPenalty::L2, false) => Err(FerroError::InvalidParameter {
+            name: "dual".into(),
+            reason: "The combination of penalty='l2' and loss='hinge' are not \
+                         supported when dual=false"
+                .into(),
+        }),
+        // hinge + l1: penalty has no entry under `hinge` → combination unsupported.
+        (LinearSVCLoss::Hinge, LinearSVCPenalty::L1, _) => Err(FerroError::InvalidParameter {
+            name: "penalty".into(),
+            reason: "The combination of penalty='l1' and loss='hinge' is not supported".into(),
+        }),
+        // squared_hinge: { l1: { dual=false: 5 } }
+        (LinearSVCLoss::SquaredHinge, LinearSVCPenalty::L1, false) => Ok(5),
+        (LinearSVCLoss::SquaredHinge, LinearSVCPenalty::L1, true) => {
+            Err(FerroError::InvalidParameter {
+                name: "dual".into(),
+                reason: "The combination of penalty='l1' and loss='squared_hinge' are not \
+                         supported when dual=true"
+                    .into(),
+            })
+        }
+        // squared_hinge: { l2: { dual=false: 2, dual=true: 1 } }
+        (LinearSVCLoss::SquaredHinge, LinearSVCPenalty::L2, false) => Ok(2),
+        (LinearSVCLoss::SquaredHinge, LinearSVCPenalty::L2, true) => Ok(1),
+    }
+}
+
+/// Resolve the [`DualMode`] to a concrete `bool`, mirroring
+/// `_validate_dual_parameter` (`sklearn/svm/_classes.py:13-29`).
+///
+/// For [`DualMode::Auto`]: when `n_samples < n_features` try `dual=true` (fall
+/// back to `false` if that penalty×loss combination has no dual solver); else
+/// (`n_samples >= n_features`) try `dual=false` (fall back to `true` if there is
+/// no primal solver, e.g. `hinge`). Resolution is checked against
+/// [`liblinear_solver_type`] so it is automatically consistent with the
+/// solver-selection matrix.
+fn resolve_dual(
+    dual: DualMode,
+    penalty: LinearSVCPenalty,
+    loss: LinearSVCLoss,
+    n_samples: usize,
+    n_features: usize,
+) -> bool {
+    match dual {
+        DualMode::True => true,
+        DualMode::False => false,
+        DualMode::Auto => {
+            if n_samples < n_features {
+                // Prefer dual=true; fall back to false if unsupported.
+                liblinear_solver_type(penalty, loss, true).is_ok()
+            } else {
+                // Prefer dual=false; fall back to true if no primal solver.
+                liblinear_solver_type(penalty, loss, false).is_err()
+            }
+        }
+    }
+}
+
+/// Solve a single binary L1-regularized L2-loss (squared-hinge) SVM via
+/// liblinear's feature-major coordinate descent, `solve_l1r_l2_svc`
+/// (`sklearn/svm/src/liblinear/linear.cpp:1467`). Minimizes
+///
+/// ```text
+///   ‖w‖₁  +  C · Σ_i  max(0, 1 − y_i·(w·x_i))²
+/// ```
+///
+/// (the `l1`-penalty objective — a genuinely different, sparse optimum from the
+/// l2 dual). The augmented intercept column (value `intercept_scaling`) is
+/// appended when `fit_intercept`, penalized in `‖w‖₁` like any feature
+/// (`coef_ = w[:n_features]`, `intercept_ = intercept_scaling·w[n_features]`).
+///
+/// State (`linear.cpp:1488-1526`): `b[i] = 1 − y_i·(w·x_i)` (running residual),
+/// `xj_sq[j] = Σ_i C·(y_i·x_ij)²`. Per feature `j`:
+/// `G_loss = −2·Σ_{i: b[i]>0} C·(y_i·x_ij)·b[i]`,
+/// `H = max(2·Σ_{i: b[i]>0} C·(y_i·x_ij)², 1e-12)` (`linear.cpp:1542-1562`).
+/// `Gp = G_loss+1`, `Gn = G_loss−1`. Newton direction with soft-threshold
+/// (`linear.cpp:1589-1595`): `d = −Gp/H` if `Gp < H·w[j]`, `d = −Gn/H` if
+/// `Gn > H·w[j]`, else `d = −w[j]`. Then a backtracking line search
+/// (`sigma=0.01`, ≤20 steps, halving `d`, `linear.cpp:1600-1661`) updating
+/// `b[]`, then `w[j] += d`. Shrinking via `active_size`/`Gmax_old`
+/// (`linear.cpp:1567-1579, 1691-1705`); stop when
+/// `Gnorm1_new ≤ eps·Gnorm1_init` on the full active set (`linear.cpp:1691`).
+///
+/// `C[i] = C` uniform (no `class_weight` yet — that is #626). liblinear shuffles
+/// `index` each sweep (`bounded_rand_int`, `linear.cpp:1535`); ferrolearn sweeps
+/// NATURAL ORDER for determinism (no RNG) — the l1 optimum is unique so the
+/// limit is identical (the documented RNG-path boundary, as `solve_binary_dual`).
+/// We use `eps = tol` directly: liblinear scales `primal_solver_tol`
+/// (`linear.cpp:2321,2374`) but the unique optimum is `tol`-invariant at the
+/// limit (the test drives `tol=1e-10` + huge `max_iter`).
+///
+/// Returns `(w_augmented, n_iter, converged)`.
+#[allow(
+    clippy::too_many_lines,
+    reason = "faithful transcription of liblinear solve_l1r_l2_svc (linear.cpp:1467)"
+)]
+fn solve_binary_l1r_l2<F: Float + 'static>(
+    x: &Array2<F>,
+    y_signed: &Array1<F>,
+    cfg: &SolverConfig<F>,
+) -> (Vec<F>, usize, bool) {
+    let SolverConfig {
+        c,
+        max_iter,
+        tol,
+        fit_intercept,
+        intercept_scaling,
+        ..
+    } = *cfg;
+
+    let (n_samples, n_features) = x.dim();
+    let w_size = if fit_intercept {
+        n_features + 1
+    } else {
+        n_features
+    };
+
+    let inf = F::infinity();
+    let two = F::one() + F::one();
+    let sigma = F::from(0.01).unwrap_or_else(|| F::one() / (two * two * two * two * two * two));
+    let tiny = F::from(1.0e-12).unwrap_or_else(F::epsilon);
+    let max_num_linesearch = 20usize;
+    let nl = F::from(n_samples).unwrap_or_else(F::one);
+
+    // `yx(i, j)` = y_i·x_ij over the augmented design matrix (the j-th feature
+    // column entry for sample i). liblinear stores `x->value *= y[ind]`
+    // (`linear.cpp:1520`); we recompute it lazily for determinism / clarity.
+    let yx = |i: usize, j: usize| -> F {
+        let yi = y_signed[i];
+        if j < n_features {
+            yi * x[[i, j]]
+        } else {
+            yi * intercept_scaling
+        }
+    };
+
+    // b[i] = 1 − y_i·(w·x_i). w starts at 0 so b starts at 1 (`linear.cpp:1500`).
+    let mut b = vec![F::one(); n_samples];
+    let mut w = vec![F::zero(); w_size];
+
+    // xj_sq[j] = Σ_i C·(y_i·x_ij)² (`linear.cpp:1523`).
+    let mut xj_sq = vec![F::zero(); w_size];
+    for (j, xj_sq_j) in xj_sq.iter_mut().enumerate() {
+        let mut acc = F::zero();
+        for i in 0..n_samples {
+            let val = yx(i, j);
+            acc = acc + c * val * val;
+        }
+        *xj_sq_j = acc;
+    }
+
+    let mut index: Vec<usize> = (0..w_size).collect();
+    let mut active_size = w_size;
+    let mut gmax_old = inf;
+    let mut gnorm1_init = -F::one();
+
+    let mut n_iter: usize = 0;
+    let mut converged = false;
+
+    while n_iter < max_iter {
+        let mut gmax_new = F::zero();
+        let mut gnorm1_new = F::zero();
+
+        // liblinear shuffles `index[0..active_size]` here (`linear.cpp:1533-1537`);
+        // ferrolearn sweeps natural order (no RNG); the unique optimum is
+        // unchanged at the limit.
+
+        let mut s = 0;
+        while s < active_size {
+            let j = index[s];
+
+            // G_loss = −2·Σ_{i: b[i]>0} C·(y_i·x_ij)·b[i];
+            // H = 2·Σ_{i: b[i]>0} C·(y_i·x_ij)² (`linear.cpp:1542-1561`).
+            let mut g_loss = F::zero();
+            let mut h = F::zero();
+            for (i, &bi) in b.iter().enumerate() {
+                if bi > F::zero() {
+                    let val = yx(i, j);
+                    let tmp = c * val;
+                    g_loss = g_loss - tmp * bi;
+                    h = h + tmp * val;
+                }
+            }
+            g_loss = g_loss * two;
+            let g = g_loss;
+            h = h * two;
+            if h < tiny {
+                h = tiny;
+            }
+
+            let gp = g + F::one();
+            let gn = g - F::one();
+            let wj = w[j];
+
+            // Violation + shrinking (`linear.cpp:1564-1587`).
+            let mut violation = F::zero();
+            if wj == F::zero() {
+                if gp < F::zero() {
+                    violation = -gp;
+                } else if gn > F::zero() {
+                    violation = gn;
+                } else if gp > gmax_old / nl && gn < -(gmax_old / nl) {
+                    active_size -= 1;
+                    index.swap(s, active_size);
+                    continue; // re-process the swapped-in element at `s`
+                }
+            } else if wj > F::zero() {
+                violation = gp.abs();
+            } else {
+                violation = gn.abs();
+            }
+
+            if violation > gmax_new {
+                gmax_new = violation;
+            }
+            gnorm1_new = gnorm1_new + violation;
+
+            // Newton direction with soft-threshold (`linear.cpp:1589-1595`).
+            let mut d = if gp < h * wj {
+                -gp / h
+            } else if gn > h * wj {
+                -gn / h
+            } else {
+                -wj
+            };
+
+            if d.abs() < tiny {
+                s += 1;
+                continue;
+            }
+
+            // Backtracking line search (`linear.cpp:1600-1661`).
+            let mut delta = (wj + d).abs() - wj.abs() + g * d;
+            let mut d_old = F::zero();
+            let mut num_linesearch = 0usize;
+            while num_linesearch < max_num_linesearch {
+                let d_diff = d_old - d;
+                let mut cond = (wj + d).abs() - wj.abs() - sigma * delta;
+
+                let appxcond = xj_sq[j] * d * d + g_loss * d + cond;
+                if appxcond <= F::zero() {
+                    for (i, bi) in b.iter_mut().enumerate() {
+                        *bi = *bi + d_diff * yx(i, j);
+                    }
+                    break;
+                }
+
+                let mut loss_old = F::zero();
+                let mut loss_new = F::zero();
+                if num_linesearch == 0 {
+                    for (i, bi) in b.iter_mut().enumerate() {
+                        if *bi > F::zero() {
+                            loss_old = loss_old + c * *bi * *bi;
+                        }
+                        let b_new = *bi + d_diff * yx(i, j);
+                        *bi = b_new;
+                        if b_new > F::zero() {
+                            loss_new = loss_new + c * b_new * b_new;
+                        }
+                    }
+                } else {
+                    for (i, bi) in b.iter_mut().enumerate() {
+                        let b_new = *bi + d_diff * yx(i, j);
+                        *bi = b_new;
+                        if b_new > F::zero() {
+                            loss_new = loss_new + c * b_new * b_new;
+                        }
+                    }
+                }
+
+                cond = cond + loss_new - loss_old;
+                if cond <= F::zero() {
+                    break;
+                }
+                d_old = d;
+                d = d / two;
+                delta = delta / two;
+                num_linesearch += 1;
+            }
+
+            w[j] = w[j] + d;
+
+            // Recompute b[] if the line search took the maximum steps
+            // (`linear.cpp:1665-1682`).
+            if num_linesearch >= max_num_linesearch {
+                for bi in b.iter_mut() {
+                    *bi = F::one();
+                }
+                for (jj, &wjj) in w.iter().enumerate() {
+                    if wjj == F::zero() {
+                        continue;
+                    }
+                    for (i, bi) in b.iter_mut().enumerate() {
+                        *bi = *bi - wjj * yx(i, jj);
+                    }
+                }
+            }
+
+            s += 1;
+        }
+
+        if n_iter == 0 {
+            gnorm1_init = gnorm1_new;
+        }
+        n_iter += 1;
+
+        // Stop when Gnorm1_new ≤ eps·Gnorm1_init on the full active set
+        // (`linear.cpp:1691-1702`).
+        if gnorm1_new <= tol * gnorm1_init {
+            if active_size == w_size {
+                converged = true;
+                break;
+            }
+            active_size = w_size;
+            gmax_old = inf;
+            continue;
+        }
+
+        gmax_old = gmax_new;
+    }
+
+    (w, n_iter, converged)
+}
+
 impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>>
     for LinearSVC<F>
 {
@@ -616,6 +1039,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
+        // Resolve `dual` (auto → bool via `_validate_dual_parameter`,
+        // `_classes.py:13-29`) then validate the penalty×loss×dual combination
+        // against the liblinear solver matrix (`_get_liblinear_solver_type`,
+        // `_base.py:995-1049`). Unsupported combinations raise (ValueError →
+        // `InvalidParameter`). The resolved solver type selects the per-
+        // sub-problem solver below.
+        let dual = resolve_dual(self.dual, self.penalty, self.loss, n_samples, n_features);
+        let _solver_type = liblinear_solver_type(self.penalty, self.loss, dual)?;
+
         let cfg = SolverConfig {
             c: self.c,
             max_iter: self.max_iter,
@@ -626,9 +1058,17 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         };
 
         // Solve one binary sub-problem and split the augmented weight vector
-        // into (coef_, intercept_) per `_base.py:1240-1245`.
+        // into (coef_, intercept_) per `_base.py:1240-1245`. For `penalty=l1`
+        // use liblinear's L1 coordinate descent (`solve_l1r_l2_svc`, solver
+        // type 5, `linear.cpp:1467`); for `penalty=l2` keep the dual CD — the
+        // l2 optimum is dual-invariant (R-DEV-7), so dual=True and dual=False
+        // reach the same `coef_`/`intercept_`.
+        let penalty = self.penalty;
         let solve_one = |y_signed: &Array1<F>| -> (Array1<F>, F, usize, bool) {
-            let (w, n_iter, converged) = solve_binary_dual(x, y_signed, &cfg);
+            let (w, n_iter, converged) = match penalty {
+                LinearSVCPenalty::L1 => solve_binary_l1r_l2(x, y_signed, &cfg),
+                LinearSVCPenalty::L2 => solve_binary_dual(x, y_signed, &cfg),
+            };
             let coef = Array1::from_iter(w.iter().take(n_features).copied());
             let intercept = if self.fit_intercept {
                 self.intercept_scaling * w[n_features]
@@ -997,6 +1437,132 @@ mod tests {
         let model = LinearSVC::<f64>::new().with_max_iter(5000);
         let fitted = model.fit(&x, &y).unwrap();
         assert_eq!(fitted.coefficients().len(), 2);
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "assert!(false) reports the unexpected-Err fit path without a gated panic!/expect"
+    )]
+    fn test_l1_penalty_smoke() {
+        // Smoke check that the `penalty=l1` path (solve_binary_l1r_l2,
+        // `linear.cpp:1467`, solver type 5, `_base.py:1014`) lands near the live
+        // sklearn 1.5.2 oracle. The rigorous oracle pin is the critic's to add.
+        //
+        // Oracle (live sklearn 1.5.2; values per R-CHAR-3 — NEVER copied from
+        // ferrolearn):
+        //   python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+        //     X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+        //     y=np.array([0,0,0,0,1,1,1,1]); \
+        //     m=LinearSVC(penalty='l1',loss='squared_hinge',dual=False,C=1.0, \
+        //       fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+        //     print(m.coef_.tolist(), m.intercept_.tolist())"
+        //   # coef [[0.1283185834966579, 0.12831858464059265]] int [-1.2079646017762715]
+        const SK_COEF_0: f64 = 0.1283185834966579;
+        const SK_COEF_1: f64 = 0.12831858464059265;
+        const SK_INTERCEPT: f64 = -1.2079646017762715;
+
+        let x = array![
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [8.0, 8.0],
+            [8.0, 9.0],
+            [9.0, 8.0],
+            [9.0, 9.0],
+        ];
+        let y = array![0usize, 0, 0, 0, 1, 1, 1, 1];
+
+        let result = LinearSVC::<f64>::new()
+            .with_penalty(LinearSVCPenalty::L1)
+            .with_loss(LinearSVCLoss::SquaredHinge)
+            .with_dual(DualMode::False)
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&x, &y);
+
+        let Ok(fitted) = result else {
+            assert!(false, "l1 fit must succeed");
+            return;
+        };
+
+        let coef = fitted.coefficients();
+        assert!(
+            (coef[0] - SK_COEF_0).abs() < 1e-2,
+            "l1 coef[0] {} vs oracle {SK_COEF_0}",
+            coef[0]
+        );
+        assert!(
+            (coef[1] - SK_COEF_1).abs() < 1e-2,
+            "l1 coef[1] {} vs oracle {SK_COEF_1}",
+            coef[1]
+        );
+        assert!(
+            (fitted.intercept() - SK_INTERCEPT).abs() < 1e-2,
+            "l1 intercept {} vs oracle {SK_INTERCEPT}",
+            fitted.intercept()
+        );
+    }
+
+    #[test]
+    fn test_unsupported_combinations_rejected() {
+        let x = array![[1.0, 1.0], [2.0, 2.0], [8.0, 8.0], [9.0, 9.0]];
+        let y = array![0usize, 0, 1, 1];
+
+        // l1 + hinge is unsupported for any dual (`_base.py:1013` has no `l1`
+        // under `hinge`).
+        assert!(
+            LinearSVC::<f64>::new()
+                .with_penalty(LinearSVCPenalty::L1)
+                .with_loss(LinearSVCLoss::Hinge)
+                .fit(&x, &y)
+                .is_err(),
+            "l1 + hinge must be rejected"
+        );
+
+        // l2 + hinge + dual=false is unsupported (`hinge: {l2: {dual=true: 3}}`,
+        // no dual=false entry).
+        assert!(
+            LinearSVC::<f64>::new()
+                .with_penalty(LinearSVCPenalty::L2)
+                .with_loss(LinearSVCLoss::Hinge)
+                .with_dual(DualMode::False)
+                .fit(&x, &y)
+                .is_err(),
+            "l2 + hinge + dual=false must be rejected"
+        );
+
+        // l1 + squared_hinge + dual=true is unsupported (`squared_hinge: {l1:
+        // {dual=false: 5}}`, no dual=true entry).
+        assert!(
+            LinearSVC::<f64>::new()
+                .with_penalty(LinearSVCPenalty::L1)
+                .with_loss(LinearSVCLoss::SquaredHinge)
+                .with_dual(DualMode::True)
+                .fit(&x, &y)
+                .is_err(),
+            "l1 + squared_hinge + dual=true must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_dual_auto_resolution() {
+        // n_samples (4) >= n_features (2): auto prefers dual=false. hinge+l2:
+        // dual=false has no solver, so auto must fall back to dual=true
+        // (type 3, `_classes.py:22-27`) — the fit succeeds rather than rejecting.
+        let x = array![[1.0, 1.0], [2.0, 2.0], [8.0, 8.0], [9.0, 9.0]];
+        let y = array![0usize, 0, 1, 1];
+
+        assert!(
+            LinearSVC::<f64>::new()
+                .with_loss(LinearSVCLoss::Hinge)
+                .with_dual(DualMode::Auto)
+                .fit(&x, &y)
+                .is_ok(),
+            "auto must fall back to dual=true for hinge+l2"
+        );
     }
 
     #[test]

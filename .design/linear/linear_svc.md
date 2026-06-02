@@ -41,10 +41,13 @@ the penalized augmented `intercept_scaling` column with
 `intercept_ = intercept_scaling·w_last` (REQ-7), and the binary
 `decision_function` returns 1-D `(n,)` (`DecisionScores::Binary`, sklearn's
 `.ravel()`, REQ-2). These are pinned by `tests/divergence_linear_svc_fit.rs`
-against the live oracle (R-CHAR-1/R-CHAR-3). Still absent from the API:
-`penalty`/`dual`/`multi_class`/`class_weight`/`n_iter_`/`n_features_in_`
-(REQ-4/5/6/8/9/11 NOT-STARTED), and the unit is on the `ndarray` substrate, not
-ferray (REQ-12).
+against the live oracle (R-CHAR-1/R-CHAR-3). `penalty` (`l1`/`l2`, with the L1
+feature-major CD `fn solve_binary_l1r_l2`, `linear.cpp:1467`) and `dual`
+(`Auto`/`True`/`False`, the `_get_liblinear_solver_type` solver matrix +
+`_validate_dual_parameter` auto-resolution + unsupported-combination rejects) are
+now shipped (REQ-5/REQ-8). Still absent from the API:
+`multi_class`/`class_weight` (REQ-6/9 NOT-STARTED), and the unit is on the
+`ndarray` substrate, not ferray (REQ-12).
 
 ## Algorithm (sklearn — the contract)
 
@@ -191,10 +194,14 @@ argmax (multiclass). `HasCoefficients` returns the *first* weight vector /
 intercept; `HasClasses` returns `classes`.
 
 The constructor `fn LinearSVC::new` defaults `C=1.0`, `max_iter=1000`, `tol=1e-4`,
-`loss=SquaredHinge`, `fit_intercept=true`, `intercept_scaling=1.0` (matching
-sklearn's defaults). There is **no** `penalty`, `dual`, `multi_class`,
-`class_weight`, `random_state`, `verbose`, `n_iter_`, or `n_features_in_`
-field/accessor, and no `tol > 0` validation.
+`loss=SquaredHinge`, `penalty=L2`, `dual=Auto`, `fit_intercept=true`,
+`intercept_scaling=1.0` (matching sklearn's defaults). `fn fit` resolves
+`dual` (`fn resolve_dual`, `_classes.py:13-29`) and validates the
+penalty×loss×dual combination against the liblinear solver matrix
+(`fn liblinear_solver_type`, `_base.py:995-1018`) before dispatching per
+sub-problem to `fn solve_binary_l1r_l2` (`penalty=l1`) or `fn solve_binary_dual`
+(`penalty=l2`). There is **no** `multi_class`, `class_weight`, `random_state`,
+or `verbose` field/accessor.
 `LinearSVC`/`FittedLinearSVC`/`LinearSVCLoss` are boundary types re-exported at
 the crate root (`pub use linear_svc::{FittedLinearSVC, LinearSVC, LinearSVCLoss}
 in lib.rs`) and the unfitted `LinearSVC` drives the `RsLinearSVC` PyO3 binding
@@ -299,9 +306,15 @@ the live oracle by `tests/divergence_linear_svc_fit.rs::{linear_svc_coef_parity,
 linear_svc_coef_c_dependence, linear_svc_decision_function}` (R-CHAR-1/R-CHAR-3).
 REQ-3 (`predict`/`classes_`) is incidentally covered (the sign/argmax labels are
 now downstream of the parity fit; a dedicated `predict` oracle pin pends #620).
-The module's API still lacks `penalty`, `dual`, `multi_class`, `class_weight`,
-`n_iter_`, and `n_features_in_` (REQ-4/5/6/8/9/11 NOT-STARTED, their blockers),
-and the unit remains on `ndarray` (REQ-12).
+REQ-5 (`penalty`) and REQ-8 (`dual`) are now SHIPPED: `penalty=l1` ships the
+genuinely-different sparse L1 optimum via `fn solve_binary_l1r_l2`
+(`solve_l1r_l2_svc`, `linear.cpp:1467`, solver type 5), `dual` ships the
+`_get_liblinear_solver_type` solver matrix + `_validate_dual_parameter`
+auto-resolution + the unsupported-combination rejects, and R-DEV-7
+dual-invariance keeps the l2 dual CD for `penalty=l2` regardless of the resolved
+`dual`. The module's API still lacks `multi_class` and `class_weight`
+(REQ-6/9 NOT-STARTED, their blockers), and the unit remains on `ndarray`
+(REQ-12).
 
 | REQ | Status | Evidence |
 |---|---|---|
@@ -309,10 +322,10 @@ and the unit remains on `ndarray` (REQ-12).
 | REQ-2 (decision_function shape `(n,)` + values) | SHIPPED | `fn decision_function in linear_svc.rs` returns `DecisionScores::Binary` (a 1-D `Array1` = `X·w + b`) for the binary case — sklearn ravels the single column to `(n_samples,)` (`return xp.reshape(scores, (-1,)) if scores.shape[1] == 1 else scores`, `linear_model/_base.py:365`) — and `DecisionScores::Multiclass` `(n, n_classes)` otherwise. Pinned by `linear_svc_decision_function in tests/divergence_linear_svc_fit.rs` (live oracle 1-D `(8,)` values, tol 1e-2; the test asserts `as_binary().len() == 8`). Consumer: `fn predict` reads the binary sign; `api_proof_linear_svc` asserts `as_binary().is_some()`. |
 | REQ-3 (predict + classes_) | SHIPPED | `fn predict in linear_svc.rs` uses the sign convention (`>= 0 → classes[1]`) / argmax, and `HasClasses::classes` returns sorted unique labels (`classes_ = np.unique(y)`, `_classes.py:311`). The predicted labels are downstream of the liblinear-parity fit (REQ-1) and are pinned against the live oracle by `linear_svc_predict_parity in tests/divergence_linear_svc_fit.rs` (#620; 8×2 set: `predict [0,0,0,0,1,1,1,1]`, `classes_ [0,1]`). |
 | REQ-4 (loss {hinge, squared_hinge}) | SHIPPED | `fn solve_binary_dual` solves BOTH the true `hinge` (`U = C`, `diag = 0`) and `squared_hinge` (`U = ∞`, `diag = 0.5/C`) optima (`linear.cpp:849-858`), so the `Hinge` branch is the actual hinge optimum, not a smooth-majorant approximation. Pinned against the live oracle by `linear_svc_hinge_coef_parity in tests/divergence_linear_svc_fit.rs` (#621; live `hinge` 8×2: `coef [[0.15384615383852776, 0.15384615383915584]]`, `intercept [-1.4615384615168394]`). |
-| REQ-5 (penalty {l1, l2}) | NOT-STARTED | open prereq blocker #622. `LinearSVC<F>` has no `penalty` field — `fn solve_binary_dual` hardcodes the L2 regularizer (the `0.5·‖w‖²` dual). sklearn defaults `penalty='l2'` and supports `'l1'` (sparse `coef_`, solver type 5, `_base.py:1014`); `('l1','hinge')` is rejected (`_classes.py:59-60`). l1 is entirely absent. |
+| REQ-5 (penalty {l1, l2}) | SHIPPED | `LinearSVC<F>` exposes `pub penalty: LinearSVCPenalty` (default `L2`) + `fn with_penalty in linear_svc.rs`. `penalty=l1` routes (in `fn fit`'s `solve_one`) to `fn solve_binary_l1r_l2 in linear_svc.rs` — liblinear's feature-major coordinate descent (`solve_l1r_l2_svc`, `linear.cpp:1467`, solver type 5, `_base.py:1014`) minimizing `‖w‖₁ + C·Σ max(0,1−yf)²` over the augmented (penalized-intercept) weights, giving sparse `coef_`; `penalty=l2` keeps `fn solve_binary_dual`. `fn liblinear_solver_type in linear_svc.rs` rejects `('l1','hinge')` (no `l1` under `hinge`, `_base.py:1013`). Pinned by `test_l1_penalty_smoke in linear_svc.rs` (live oracle 8×2 `l1,squared_hinge,dual=False,C=1.0,fit_intercept=True`: `coef_ [[0.1283185834966579, 0.12831858464059265]]`, `intercept_ [-1.2079646017762715]`; ferrolearn's natural-order CD lands within ~1.2e-9) + `test_unsupported_combinations_rejected in linear_svc.rs`. The rigorous oracle pin in `tests/divergence_linear_svc_fit.rs` is the critic's next step. ferrolearn sweeps natural order (no `bounded_rand_int` shuffle, `linear.cpp:1535`); the l1 optimum is unique so the limit is identical (documented RNG-path boundary). Consumer: `pub use linear_svc::{…} in lib.rs` + `RsLinearSVC` PyO3 binding. |
 | REQ-6 (multi_class {ovr, crammer_singer}) | NOT-STARTED | open prereq blocker #623. `fn fit in linear_svc.rs` implements one-vs-rest (a binary solve per class) — structurally sklearn's default `'ovr'` — but there is no `multi_class` field and no `crammer_singer` joint solver (`_base.py:1017` solver type 4); and the OvR per-class `coef_` is downstream of the REQ-1 C/n bug, so the per-class rows do not match the oracle (`coef_` shape `(3, 2)` on the 9×2 3-class set). No per-class `coef_` test vs the oracle. |
 | REQ-7 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVC<F>` exposes `pub fit_intercept: bool` (default `true`) + `pub intercept_scaling: F` (default `1.0`) + `#[must_use]` `with_fit_intercept`/`with_intercept_scaling`. `fn solve_binary_dual` augments the design matrix with a synthetic constant column = `intercept_scaling`, penalized in `‖w‖²` like any feature (`QD[i] += intercept_scaling²`, `w_last += d·intercept_scaling`); `fn fit` sets `intercept_ = intercept_scaling·w_last` (`_base.py:1188-1198, :1240-1245`) and `intercept_ = 0` when `fit_intercept=false`, and rejects `intercept_scaling <= 0` with `fit_intercept` (`FerroError::InvalidParameter`, `_base.py:1190-1196`). Pinned by `linear_svc_coef_parity` (`fit_intercept=True`) + module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
-| REQ-8 (dual param) | NOT-STARTED | open prereq blocker #625. `LinearSVC<F>` has no `dual` field. sklearn defaults `dual='auto'` (`_classes.py:253`), resolving to the liblinear solver type per penalty×loss×dual (`_get_liblinear_solver_type`, `_base.py:995`), with `hinge` dual-only and `l1` primal-only — the unsupported combinations raise `ValueError`. None of this exists. |
+| REQ-8 (dual param) | SHIPPED | `LinearSVC<F>` exposes `pub dual: DualMode` (`Auto`/`True`/`False`, default `Auto`) + `fn with_dual in linear_svc.rs`. `fn resolve_dual in linear_svc.rs` mirrors `_validate_dual_parameter` (`_classes.py:13-29`): for `Auto`, `n_samples < n_features` prefers dual (fall back to primal), else prefers primal (fall back to dual) — resolution is checked against `fn liblinear_solver_type in linear_svc.rs` (the `_get_liblinear_solver_type` matrix, `_base.py:995-1018`) so it is automatically consistent. `fn fit` calls `liblinear_solver_type(penalty, loss, dual)?` to validate the resolved combination, rejecting `hinge+dual=false`, `l1+dual=true`, and `l1+hinge` with `FerroError::InvalidParameter` (mirroring sklearn's `ValueError` strings, `_base.py:1033-1043`). **R-DEV-7**: the resolved `dual` is observably immaterial for `penalty=l2` — the l2 dual CD (`solve_l2r_l1l2_svc`) and the l2 primal minimize the same strongly convex `0.5·‖w‖² + C·Σ L` and reach the same `coef_`/`intercept_`, so `penalty=l2` keeps `fn solve_binary_dual` regardless of the resolved `dual` (observable contract preserved; implementation may differ). `dual` is load-bearing only for the rejects and for selecting the genuinely different `l1` primal solver (REQ-5). Pinned by `test_unsupported_combinations_rejected in linear_svc.rs` (the three rejects) + `test_dual_auto_resolution in linear_svc.rs` (auto falls back to dual=true for hinge+l2). Consumer: `pub use linear_svc::{…} in lib.rs` + `RsLinearSVC` PyO3 binding. |
 | REQ-9 (class_weight) | NOT-STARTED | open prereq blocker #626. `LinearSVC<F>` has no `class_weight` field. sklearn scales `C` per class via `compute_class_weight` (`_base.py:1179`); `'balanced'` uses `n_samples/(n_classes·bincount(y))` (`_classes.py:118-124`). ferrolearn's `fn solve_binary_dual` applies a uniform `C`/`U`/`diag` to every sample. Absent. |
 | REQ-10 (C-scaling convention) | SHIPPED | the `c / n_f` division is removed; `fn solve_binary_dual` uses `upper_bound = C` (hinge) / `diag = 0.5/C` (squared_hinge) with the summed-loss objective, so `coef_` tracks `C` like liblinear (no `1/n`). Pinned by `linear_svc_coef_c_dependence in tests/divergence_linear_svc_fit.rs` (live oracle, 8×2 set, `squared_hinge`, `fit_intercept=True`: `C=0.1 → coef[0] 0.0784651864625997`, `C=1.0 → 0.12835213611984458`; the bug flattened this spread). |
 | REQ-11 (n_iter_/n_features_in_ + param validation) | SHIPPED | `FittedLinearSVC<F>` exposes `fn n_features_in in linear_svc.rs` (returns the stored `n_features`, set by `_validate_data`, `_classes.py:302`) and `fn n_iter in linear_svc.rs` (the max dual-CD outer-iteration count threaded from `solve_binary_dual` across the binary/OvR fits, `n_iter_ = n_iter_.max().item()`, `_classes.py:338`); `fn fit in linear_svc.rs` now validates `tol > 0` (mirroring the `C`/`intercept_scaling` checks; `Interval(Real, 0.0, None, closed="neither")`, `_classes.py:237`) alongside the `ConvergenceWarning`-equivalent (`eprintln!`, `_base.py:1234-1238`). Pinned by `linear_svc_attrs_and_tol_validation in tests/divergence_linear_svc_fit.rs` (#627). `n_features_in_` (oracle `2`) and the `tol <= 0` reject are EXACT; `n_iter_` is the documented shuffle-path RNG boundary (ferrolearn sweeps natural order, sklearn's liblinear shuffles `index` each sweep — cf. the SGD boundary), so the pin bounds `n_iter` in `[1, max_iter]` rather than exact-matching. |
