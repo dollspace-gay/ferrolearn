@@ -27,6 +27,33 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.VotingClassifier` / `VotingRegressor`
+//! (`sklearn/ensemble/_voting.py`). See `.design/tree/voting.md`.
+//!
+//! **Architectural note:** sklearn's Voting* are meta-estimators over a
+//! *required* heterogeneous `estimators=[(name, est)]` list with a `voting`
+//! hard/soft toggle and per-estimator `weights`. This implementation is a
+//! *homogeneous decision-tree* ensemble keyed by `with_max_depths`. The
+//! deterministic aggregation math (hard-vote argmax, soft-mean proba,
+//! regressor mean) is SHIPPED for the `weights=None` case; the heterogeneous
+//! estimator surface is NOT-STARTED and needs cross-crate estimators (it
+//! cannot live in `ferrolearn-tree` by dependency direction — see #695).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-7 | Classifier hard-vote = `argmax(bincount)` with LOWEST-index tie-break (`_voting.py:445`) | SHIPPED |
+//! | REQ-8 | Soft `predict_proba` = mean of per-tree proba, weights=None (`_voting.py:480`) | SHIPPED |
+//! | REQ-9 | Regressor `predict` = mean of per-tree predictions, weights=None (`_voting.py:716`) | SHIPPED |
+//! | REQ-1 | Heterogeneous `estimators=[(name, est)]` list (architectural; cross-crate) | NOT-STARTED (#695) |
+//! | REQ-2 | `voting='hard'\|'soft'` toggle | NOT-STARTED (#696) |
+//! | REQ-3 | `predict_proba` gated behind `voting='soft'` (sklearn raises for 'hard') | NOT-STARTED (#697) |
+//! | REQ-4 | Per-estimator `weights` (weighted bincount / weighted average) | NOT-STARTED (#698) |
+//! | REQ-5 | `transform` / `flatten_transform` | NOT-STARTED (#699) |
+//! | REQ-6 | `le_` LabelEncoder + `named_estimators_` + y-type guard | NOT-STARTED (#700) |
+//! | REQ-10 | ferray substrate migration | NOT-STARTED (#701) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -299,11 +326,18 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedVotingClassi
                     votes[class_idx] += 1;
                 }
             }
-            let winner = votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &count)| count)
-                .map_or(0, |(idx, _)| idx);
+            // sklearn `np.argmax(np.bincount(...))` breaks ties to the
+            // LOWEST index (first maximum). Rust `max_by_key` returns the
+            // LAST maximum on ties, so we use a manual strict-`>` argmax.
+            let mut best_idx = 0usize;
+            let mut best_count = votes[0];
+            for (idx, &count) in votes.iter().enumerate().skip(1) {
+                if count > best_count {
+                    best_idx = idx;
+                    best_count = count;
+                }
+            }
+            let winner = best_idx;
             predictions[i] = self.classes[winner];
         }
 
