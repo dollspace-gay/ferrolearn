@@ -28,6 +28,22 @@
 //!     assert!(preds[i] >= preds[i - 1]);
 //! }
 //! ```
+//!
+//! ## REQ status (per `.design/linear/isotonic.md`, mirrors `sklearn/isotonic.py` @ 1.5.2)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (increasing PAVA fit) | SHIPPED | `fn pav_increasing` → `pav_increasing_unique_weighted`; distinct-X fit matches the live oracle (`X=[1..6],y=[1,4,2,5,3,7]` → `[1,3,3,4,4,7]`). Consumer: `Fit for IsotonicRegression`. |
+//! | REQ-2 (decreasing) | SHIPPED | negate-fit-negate path; decreasing dup-X `[4,2,3,1]` → `[3,3,1]` matches oracle. |
+//! | REQ-3 (predict piecewise-LINEAR interpolation) | SHIPPED | `predict_single` does `y0 + t*(y1-y0)` (`scipy interp1d(kind='linear')`); test `test_interpolation`. |
+//! | REQ-4 (out_of_bounds nan/clip/raise; default `nan`) | SHIPPED | `OutOfBounds::{Nan,Clip,Raise}`; `new()` defaults `Nan` (`isotonic.py:274`); test `isotonic_default_out_of_bounds_nan`. Closed #565. |
+//! | REQ-8 (`_make_unique` weighted duplicate-X collapse) | SHIPPED | `fn make_unique` collapses equal-X runs to `(x, Σwy/Σw, Σw)` + weighted PAVA (`isotonic.py:308-325`); test `isotonic_make_unique_duplicate_x` (`[1,1,2,3]/[1,3,2,4]` → `[2,2,4]`). Closed #569. |
+//! | REQ-5 (y_min/y_max clipping) | NOT-STARTED | #566. |
+//! | REQ-6 (increasing='auto' via Spearman) | NOT-STARTED | #567. |
+//! | REQ-7 (sample_weight public API) | NOT-STARTED | #568 (weighted PAVA already exists internally). |
+//! | REQ-9 (X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_) | NOT-STARTED | #570. |
+//! | REQ-10 (free `isotonic_regression` + `check_increasing`) | NOT-STARTED | #571. |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | #572 (crate-wide-deferred, cf. ridge #391). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
