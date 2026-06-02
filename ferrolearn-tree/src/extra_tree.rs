@@ -24,6 +24,29 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2): SHIPPED = impl + non-test consumer + tests + green
+//! verification; NOT-STARTED = open blocker `#`. `ExtraTreeClassifier`/
+//! `ExtraTreeRegressor` are re-exported at the crate root + registered as PyO3
+//! `RsExtraTreeClassifier` (non-test consumers). ExtraTree is RNG-driven (random
+//! split thresholds): exact node-for-node parity with sklearn at a given
+//! `random_state` is the DOCUMENTED numpy-RNG boundary (#668/#670, same class as
+//! SGD shuffle / libsvm CV) — verification pins the DETERMINISTIC contract +
+//! ferrolearn-internal reproducibility. Pins in `tests/divergence_extra_tree.rs`.
+//! See `.design/tree/extra_tree.md`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (criteria gini/entropy/log_loss + mse/friedman_mse/absolute_error/poisson) | SHIPPED | classifier `compute_impurity` covers Gini/Entropy/LogLoss; `ExtraTreeRegressor` threads `criterion` through `RegressionData` → `regression_leaf_value` (median for AbsoluteError) + per-criterion split score in `find_random_regression_split` (mirrors `decision_tree.rs`); Poisson y>0 guard. Pinned by `pin3_reg_absolute_error_differs_from_mse_same_seed` + `pin3_reg_absolute_error_yields_median_leaf`. |
+//! | REQ-2 (random-split FEATURE_THRESHOLD band + threshold==max guard) | NOT-STARTED | open prereq blocker #682. `find_random_*_split` use exact `feat_min >= feat_max` not sklearn's `1e-7` band (`_splitter.pyx:773`); no `threshold==max → min` guard (`:791`). |
+//! | REQ-3 (param surface & defaults) | SHIPPED | clf `max_features=Sqrt`/`criterion=Gini`, reg `max_features=All`/`criterion=Mse`, both `splitter='random'`, `random_state=None` — match `_classes.py:1564`/`:1838` (live-verified). Pinned by `pin1_clf_defaults_match_sklearn`/`pin1_reg_defaults_match_sklearn`. `min_weight_fraction_leaf`/`max_leaf_nodes`/`min_impurity_decrease`/`ccp_alpha`/`class_weight` absent (#684). |
+//! | REQ-4 (max_features resolution) | NOT-STARTED | open prereq blocker #685. `resolve_max_features` uses `ceil` vs sklearn's `int(...)` (off-by-one at e.g. n=2); no `max_features_` fitted attr (#686). |
+//! | REQ-5 (fitted attributes) | SHIPPED | `fn feature_importances` (`HasFeatureImportances`, consumed by `extra_trees_ensemble.rs` + PyO3), `fn classes`/`n_classes`, `fn nodes`, `fn n_features`. `feature_importances_` exact value is RNG-dependent (documented boundary); `max_features_` NOT-STARTED (#686). |
+//! | REQ-6 (predict / predict_proba) | SHIPPED | `fn predict`/`fn predict_proba`/`fn predict_log_proba` (consumed by `RsExtraTreeClassifier` + pipeline adapter); rows sum to 1. Exact leaf-frequency values RNG-dependent (boundary); multi-output NOT-STARTED (#689). |
+//! | REQ-7 (random_state determinism) | SHIPPED | `random_state: Option<u64>` seeds `StdRng`; same seed ⇒ identical tree (`pin2_clf_random_state_reproducible`). Exact numpy-MT19937 cross-impl parity is the DOCUMENTED RNG boundary (#668/#670). |
+//! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #690. Imports `ndarray` + `rand::StdRng`, not `ferray-core`/`ferray::random` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -60,6 +83,7 @@ struct RegressionData<'a, F> {
     x: &'a Array2<F>,
     y: &'a Array1<F>,
     feature_indices: Option<&'a [usize]>,
+    criterion: RegressionCriterion,
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +656,28 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for ExtraTreeRe
             });
         }
 
+        // Poisson requires non-negative targets with a strictly positive sum,
+        // mirroring sklearn's check (`_classes.py:267-277`) and the analogous
+        // guard in `decision_tree.rs` `DecisionTreeRegressor::fit`.
+        if self.criterion == RegressionCriterion::Poisson {
+            if y.iter().any(|&v| v < F::zero()) {
+                return Err(FerroError::InvalidParameter {
+                    name: "y".into(),
+                    reason: "Some value(s) of y are negative which is not allowed for Poisson \
+                             regression."
+                        .into(),
+                });
+            }
+            let sum_y = y.iter().fold(F::zero(), |a, &b| a + b);
+            if sum_y <= F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "y".into(),
+                    reason: "Sum of y is not positive which is necessary for Poisson regression."
+                        .into(),
+                });
+            }
+        }
+
         let indices: Vec<usize> = (0..n_samples).collect();
         let max_features_n = resolve_max_features(self.max_features, n_features);
 
@@ -645,6 +691,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for ExtraTreeRe
             x,
             y,
             feature_indices: None,
+            criterion: self.criterion,
         };
         let params = TreeParams {
             max_depth: self.max_depth,
@@ -845,6 +892,119 @@ fn mean_value<F: Float>(y: &Array1<F>, indices: &[usize]) -> F {
     }
     let sum: F = indices.iter().map(|&i| y[i]).fold(F::zero(), |a, b| a + b);
     sum / F::from(indices.len()).unwrap()
+}
+
+/// Compute the median of target values for the given indices.
+///
+/// Mirrors `decision_tree.rs`'s `median_value` / sklearn's
+/// `WeightedMedianCalculator.get_median` (unweighted, `MAE.node_value`,
+/// `_criterion.pyx:1419-1423`): for an even-length sample the median is the
+/// average of the two middle (sorted) values. Uses a NaN-last total order via
+/// `partial_cmp(..).unwrap_or(Equal)` so it never panics (R-CODE-2 / R-APG-1).
+fn median_value<F: Float>(y: &Array1<F>, indices: &[usize]) -> F {
+    let n = indices.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let mut vals: Vec<F> = indices.iter().map(|&i| y[i]).collect();
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = n / 2;
+    if n % 2 == 1 {
+        vals[mid]
+    } else {
+        (vals[mid - 1] + vals[mid]) / F::from(2.0).unwrap_or_else(F::one)
+    }
+}
+
+/// Compute the mean absolute error of the given indices around their median,
+/// `(1/n)·Σ|y_i − median|` (`_criterion.pyx:1450-1472`, `MAE.node_impurity`).
+fn mae_for_indices<F: Float>(y: &Array1<F>, indices: &[usize]) -> F {
+    let n = indices.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let median = median_value(y, indices);
+    let sum_abs: F = indices
+        .iter()
+        .map(|&i| (y[i] - median).abs())
+        .fold(F::zero(), |a, b| a + b);
+    sum_abs / F::from(n).unwrap_or_else(F::one)
+}
+
+/// Compute the half-Poisson deviance impurity of the given indices,
+/// `(1/n)·Σ y_i·ln(y_i/mean)` with `0·ln0 = 0` (`_criterion.pyx:1671-1708`,
+/// `Poisson.poisson_loss`). Returns `+∞` when the node's target sum is
+/// non-positive, mirroring sklearn's `y_sum <= EPSILON ⇒ return INFINITY`
+/// guard so such splits are never selected.
+fn poisson_deviance_for_indices<F: Float>(y: &Array1<F>, indices: &[usize]) -> F {
+    let n = indices.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let n_f = F::from(n).unwrap_or_else(F::one);
+    let sum: F = indices.iter().map(|&i| y[i]).fold(F::zero(), |a, b| a + b);
+    if sum <= F::epsilon() {
+        return F::infinity();
+    }
+    let mean = sum / n_f;
+    let mut loss = F::zero();
+    for &i in indices {
+        let yi = y[i];
+        // xlogy(y, y/mean): the `y == 0` term contributes 0 (`0·ln0 = 0`).
+        if yi > F::zero() {
+            loss = loss + yi * (yi / mean).ln();
+        }
+    }
+    loss / n_f
+}
+
+/// Compute the leaf prediction value for a regression node under `criterion`.
+///
+/// Mirrors `decision_tree.rs`'s `regression_leaf_value` / `Criterion.node_value`
+/// (`_criterion.pyx`): MSE / FriedmanMSE / Poisson predict the **mean**
+/// (`_criterion.pyx:1052`), while MAE / `absolute_error` predicts the **median**
+/// (`MAE.node_value`, `_criterion.pyx:1419-1423`).
+fn regression_leaf_value<F: Float>(
+    y: &Array1<F>,
+    indices: &[usize],
+    criterion: RegressionCriterion,
+) -> F {
+    match criterion {
+        RegressionCriterion::AbsoluteError => median_value(y, indices),
+        RegressionCriterion::Mse
+        | RegressionCriterion::FriedmanMse
+        | RegressionCriterion::Poisson => mean_value(y, indices),
+    }
+}
+
+/// Compute the node impurity for a regression node under `criterion`
+/// (`Criterion.node_impurity`), mirroring `decision_tree.rs`'s
+/// `regression_node_impurity`.
+fn regression_node_impurity<F: Float>(
+    y: &Array1<F>,
+    indices: &[usize],
+    criterion: RegressionCriterion,
+) -> F {
+    match criterion {
+        // FriedmanMSE shares MSE's node impurity (it only overrides the split
+        // improvement); MSE is the variance around the mean (`_criterion.pyx:1094`).
+        RegressionCriterion::Mse | RegressionCriterion::FriedmanMse => {
+            if indices.is_empty() {
+                return F::zero();
+            }
+            let mean = mean_value(y, indices);
+            let sum_sq: F = indices
+                .iter()
+                .map(|&i| {
+                    let diff = y[i] - mean;
+                    diff * diff
+                })
+                .fold(F::zero(), |a, b| a + b);
+            sum_sq / F::from(indices.len()).unwrap_or_else(F::one)
+        }
+        RegressionCriterion::AbsoluteError => mae_for_indices(y, indices),
+        RegressionCriterion::Poisson => poisson_deviance_for_indices(y, indices),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,34 +1227,32 @@ fn build_extra_regression_tree<F: Float>(
     rng: &mut StdRng,
 ) -> usize {
     let n = indices.len();
-    let mean = mean_value(data.y, indices);
+    // Leaf prediction depends on the criterion: median for `AbsoluteError`,
+    // mean for MSE / FriedmanMSE / Poisson (mirrors `regression_leaf_value`).
+    let leaf_value = regression_leaf_value(data.y, indices, data.criterion);
 
     let should_stop = n < params.min_samples_split || params.max_depth.is_some_and(|d| depth >= d);
 
     if should_stop {
         let idx = nodes.len();
         nodes.push(Node::Leaf {
-            value: mean,
+            value: leaf_value,
             class_distribution: None,
             n_samples: n,
         });
         return idx;
     }
 
-    // Check if variance is essentially zero.
-    let parent_sum_sq: F = indices
-        .iter()
-        .map(|&i| {
-            let diff = data.y[i] - mean;
-            diff * diff
-        })
-        .fold(F::zero(), |a, b| a + b);
-    let parent_mse = parent_sum_sq / F::from(n).unwrap();
+    // Pure-node short-circuit: the node's impurity (variance for MSE/FriedmanMSE,
+    // L1 spread for AbsoluteError, deviance for Poisson) is essentially zero ⇒
+    // no split can improve it, so emit a leaf. Uses the criterion's own node
+    // impurity so the stop condition is criterion-consistent.
+    let parent_impurity = regression_node_impurity(data.y, indices, data.criterion);
 
-    if parent_mse <= F::epsilon() {
+    if parent_impurity <= F::epsilon() {
         let idx = nodes.len();
         nodes.push(Node::Leaf {
-            value: mean,
+            value: leaf_value,
             class_distribution: None,
             n_samples: n,
         });
@@ -1121,7 +1279,7 @@ fn build_extra_regression_tree<F: Float>(
         {
             let idx = nodes.len();
             nodes.push(Node::Leaf {
-                value: mean,
+                value: leaf_value,
                 class_distribution: None,
                 n_samples: n,
             });
@@ -1169,7 +1327,7 @@ fn build_extra_regression_tree<F: Float>(
     } else {
         let idx = nodes.len();
         nodes.push(Node::Leaf {
-            value: mean,
+            value: leaf_value,
             class_distribution: None,
             n_samples: n,
         });
@@ -1203,6 +1361,11 @@ fn find_random_regression_split<F: Float>(
         .map(|&i| data.y[i] * data.y[i])
         .fold(F::zero(), |a, b| a + b);
     let parent_mse = parent_sum_sq / n_f - (parent_sum / n_f) * (parent_sum / n_f);
+    // Parent impurity for the median-based (absolute_error) and Poisson
+    // criteria; unused (cheap to leave) for the variance-based MSE/FriedmanMSE
+    // paths, which score off `parent_mse` / the Friedman proxy instead. Mirrors
+    // `decision_tree.rs`'s `find_best_regression_split`.
+    let parent_impurity = regression_node_impurity(data.y, indices, data.criterion);
 
     let mut best_score = F::neg_infinity();
     let mut best_feature = 0;
@@ -1243,41 +1406,82 @@ fn find_random_regression_split<F: Float>(
         // Draw a random threshold uniformly in (min, max).
         let threshold = random_threshold(rng, feat_min, feat_max);
 
-        // Compute left/right statistics.
+        // Compute left/right statistics. The running sums power the
+        // byte-identical MSE path; the index slices power the median-based
+        // (absolute_error) and Poisson criteria.
         let mut left_sum = F::zero();
         let mut left_sum_sq = F::zero();
-        let mut left_n: usize = 0;
+        let mut left_indices: Vec<usize> = Vec::new();
+        let mut right_indices: Vec<usize> = Vec::new();
 
         for &i in indices {
             if data.x[[i, feat]] <= threshold {
                 let val = data.y[i];
                 left_sum = left_sum + val;
                 left_sum_sq = left_sum_sq + val * val;
-                left_n += 1;
+                left_indices.push(i);
+            } else {
+                right_indices.push(i);
             }
         }
 
+        let left_n = left_indices.len();
         let right_n = n - left_n;
         if left_n < min_samples_leaf || right_n < min_samples_leaf {
             continue;
         }
 
-        let left_n_f = F::from(left_n).unwrap();
-        let right_n_f = F::from(right_n).unwrap();
+        let left_n_f = F::from(left_n).unwrap_or_else(F::one);
+        let right_n_f = F::from(right_n).unwrap_or_else(F::one);
 
-        let left_mean = left_sum / left_n_f;
-        let left_mse = left_sum_sq / left_n_f - left_mean * left_mean;
+        // Per-criterion split score (higher = better). All four reduce to a
+        // "parent impurity minus weighted child impurity" improvement so the
+        // shared `> best_score` argmax + `> 0` accept gate is reused. Mirrors
+        // `decision_tree.rs`'s `find_best_regression_split`.
+        let score = match data.criterion {
+            // squared_error: parent_mse − (n_L·mse_L + n_R·mse_R)/n
+            // (`_criterion.pyx:1094`), kept byte-identical to the prior MSE path.
+            RegressionCriterion::Mse => {
+                let left_mean = left_sum / left_n_f;
+                let left_mse = left_sum_sq / left_n_f - left_mean * left_mean;
+                let right_sum = parent_sum - left_sum;
+                let right_sum_sq = parent_sum_sq - left_sum_sq;
+                let right_mean = right_sum / right_n_f;
+                let right_mse = right_sum_sq / right_n_f - right_mean * right_mean;
+                let weighted_child_mse = (left_n_f * left_mse + right_n_f * right_mse) / n_f;
+                parent_mse - weighted_child_mse
+            }
+            // friedman_mse proxy (`FriedmanMSE.impurity_improvement`,
+            // `_criterion.pyx:1557-1574`, n_outputs == 1):
+            //   diff = n_R·sum_L − n_L·sum_R; improvement = diff²/(n_L·n_R·n_node).
+            RegressionCriterion::FriedmanMse => {
+                let right_sum = parent_sum - left_sum;
+                let diff = right_n_f * left_sum - left_n_f * right_sum;
+                diff * diff / (left_n_f * right_n_f * n_f)
+            }
+            // absolute_error: parent_mae − (n_L·mae_L + n_R·mae_R)/n
+            // (`MAE.node_impurity`/`children_impurity`, L1 around each child
+            // median, `_criterion.pyx:1450-1519`).
+            RegressionCriterion::AbsoluteError => {
+                let left_mae = mae_for_indices(data.y, &left_indices);
+                let right_mae = mae_for_indices(data.y, &right_indices);
+                let weighted_child_mae = (left_n_f * left_mae + right_n_f * right_mae) / n_f;
+                parent_impurity - weighted_child_mae
+            }
+            // poisson: parent_deviance − (n_L·dev_L + n_R·dev_R)/n
+            // (`Poisson.poisson_loss`, `_criterion.pyx:1671-1708`). A child with a
+            // non-positive sum yields +∞ deviance ⇒ −∞ score ⇒ never selected,
+            // mirroring sklearn's `y_sum <= EPSILON ⇒ INFINITY`.
+            RegressionCriterion::Poisson => {
+                let left_dev = poisson_deviance_for_indices(data.y, &left_indices);
+                let right_dev = poisson_deviance_for_indices(data.y, &right_indices);
+                let weighted_child_dev = (left_n_f * left_dev + right_n_f * right_dev) / n_f;
+                parent_impurity - weighted_child_dev
+            }
+        };
 
-        let right_sum = parent_sum - left_sum;
-        let right_sum_sq = parent_sum_sq - left_sum_sq;
-        let right_mean = right_sum / right_n_f;
-        let right_mse = right_sum_sq / right_n_f - right_mean * right_mean;
-
-        let weighted_child_mse = (left_n_f * left_mse + right_n_f * right_mse) / n_f;
-        let mse_decrease = parent_mse - weighted_child_mse;
-
-        if mse_decrease > best_score {
-            best_score = mse_decrease;
+        if score > best_score {
+            best_score = score;
             best_feature = feat;
             best_threshold = threshold;
         }
@@ -1345,10 +1549,14 @@ pub(crate) fn build_extra_regression_tree_for_ensemble<F: Float>(
     max_features_n: usize,
     rng: &mut StdRng,
 ) -> Vec<Node<F>> {
+    // The ensemble path (`ExtraTreesRegressor`) currently builds MSE/mean trees
+    // exclusively; preserve that exact behavior. Per-criterion ensemble support
+    // is a separate unit (the ensemble builder signature lives across files).
     let data = RegressionData {
         x,
         y,
         feature_indices,
+        criterion: RegressionCriterion::Mse,
     };
     let mut nodes = Vec::new();
     build_extra_regression_tree(
