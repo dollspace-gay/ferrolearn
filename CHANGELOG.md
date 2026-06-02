@@ -9,6 +9,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(linear_svr): REQ-9 fitted-attr contract (length-1 intercept_, n_features_in_) + param validation (#614)
+- translate(linear_svr): REQ-6 dual param (auto/True/False) (#612)
+- translate(linear_svr): REQ-8 n_iter_ + ConvergenceWarning at max_iter (#613)
+- translate(linear_svr): REQ-2 pin predict vs oracle (gated on #607) (#608)
+- translate(linear_svr): REQ-4 pin squared_epsilon_insensitive vs oracle (#610)
+- translate(linear_svr): REQ-5 fit_intercept + intercept_scaling (penalized augmented column) (#611)
+- translate(linear_svr): REQ-3 epsilon default 0.1 -> 0.0 (#609)
+- translate(linear_svr): REQ-1/7 CRUX — drop C/n scaling to plain C + convergent solver (#607)
 - translate(lda): REQ-10 eigen solver (generalized eigh(Sb,Sw)) (#596)
 - Translation unit: ferrolearn-linear/lda.rs — eigen solver (#596) (#605)
 - translate(lda): REQ-11 shrinkage (None/auto Ledoit-Wolf/float) (#597)
