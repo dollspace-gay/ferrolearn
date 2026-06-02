@@ -26,6 +26,22 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 4);
 //! ```
+//!
+//! ## REQ status (per `.design/linear/glm.md`, mirrors `sklearn/linear_model/_glm/glm.py` @ 1.5.2, commit 156ef14)
+//!
+//! Binary classification (R-DEFER-2): SHIPPED = impl + tests + green oracle
+//! verification; NOT-STARTED = concrete open blocker referenced by `#`-number.
+//! The public estimator types re-exported at the crate root are the consumer
+//! surface (R-DEFER-1; no `ferrolearn-python` GLM binding yet).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-4 (penalized objective: mean half-deviance + ½·alpha, intercept-free) | SHIPPED | `fn weighted_ridge_solve` adds the L2 penalty `weight_sum * alpha` to feature columns only, skipping the intercept column (`intercept_col`), matching sklearn's mean-deviance objective + unpenalized intercept (`glm.py:229-258`: `obj = average(½·deviance) + ½·alpha·‖coef‖²`, `l2_reg_strength = self.alpha`). Oracle parity tests `glm_poisson_intercept_unpenalized` (alpha=1e6 → `intercept_ = log(mean y)`, coef → 0) and `glm_poisson_penalty_scaling` (alpha=1.0 → `coef_=[0.34151720,0.18859745]`, `intercept_=-0.37680132`) green in `tests/divergence_glm_fit.rs`. |
+//! | REQ-1/REQ-2/REQ-3 (Poisson/Gamma/Tweedie families) | NOT-STARTED | #548/#549/#550 — alpha=0 paths match the oracle; per-family alpha>0 parity now uses the correct objective but the director reconciles the SHIPPED claim. |
+//! | REQ-5 (intercept init = link(mean y)) | NOT-STARTED | #552 — `coef` still cold-starts at zero; the alpha=1e6 test reaches `log(mean y)` via convergence of the unpenalized intercept, not via init. |
+//! | REQ-7 (predict = link.inverse) | NOT-STARTED | #553. |
+//! | REQ-8 (Tweedie link='auto'/identity/log) | NOT-STARTED | #554. |
+//! | REQ-9 (Tweedie default power=0.0) | NOT-STARTED | #555. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -493,12 +509,40 @@ fn gaussian_solve<F: Float>(
     Ok(x_sol)
 }
 
-/// Solve the weighted ridge system `(X^T W X + alpha I) w = X^T W z`.
+/// Solve the weighted ridge system `(X^T W X + P) w = X^T W z`, where the
+/// penalty matrix `P` adds the L2 regularization to the diagonal of the
+/// feature columns only.
+///
+/// # Penalty scaling and the intercept (sklearn parity, `glm.py:229-258`)
+///
+/// scikit-learn minimizes the per-sample-MEAN half-deviance plus an L2 prior on
+/// the feature coefficients (NOT the intercept):
+///
+/// ```text
+/// J(w) = 1/(2*S) * sum_i s_i * deviance_i + 1/2 * alpha * ||coef||^2,
+/// ```
+///
+/// with `S = sum_i s_i` (= `n_samples` for unweighted fits). Its stationarity
+/// condition is `(1/S) * grad[sum 1/2 dev] + alpha * w_features = 0`.
+///
+/// The IRLS normal equations `X^T W X w = X^T W z` are the linearization of the
+/// SUMMED half-deviance `sum_i 1/2 dev_i` (no `1/S` factor): `X^T W X` is the
+/// summed-scale Hessian. To make those summed equations correspond to sklearn's
+/// mean-scale objective we multiply the penalty by `S` (the sum of weights, =
+/// `n_samples` unweighted) before adding it to the diagonal: the added penalty
+/// is `weight_sum * alpha`, applied to feature columns only, leaving the
+/// intercept (column 0 of the augmented design, when present) unpenalized.
+///
+/// `weight_sum` is the sum of the GLM `sample_weight` (= `n_samples` for the
+/// unweighted case implemented here); `intercept_col` is `Some(0)` when an
+/// intercept column was prepended to `x`, `None` otherwise.
 fn weighted_ridge_solve<F: Float + FromPrimitive>(
     x: &Array2<F>,
     z: &Array1<F>,
     weights: &Array1<F>,
     alpha: F,
+    weight_sum: F,
+    intercept_col: Option<usize>,
 ) -> Result<Array1<F>, FerroError> {
     let (n_samples, n_features) = x.dim();
 
@@ -516,9 +560,17 @@ fn weighted_ridge_solve<F: Float + FromPrimitive>(
         }
     }
 
-    // Add L2 regularization (do not penalise intercept column if present).
+    // Add L2 regularization. The IRLS normal equations are at the SUMMED-deviance
+    // scale, so to match sklearn's MEAN-deviance objective the diagonal penalty is
+    // `weight_sum * alpha` (glm.py:229-242). The intercept column is excluded:
+    // sklearn's `l2_reg_strength = self.alpha` weights only `||coef||^2`
+    // (glm.py:258), never the intercept.
+    let penalty = weight_sum * alpha;
     for i in 0..n_features {
-        xtwx[[i, i]] = xtwx[[i, i]] + alpha;
+        if Some(i) == intercept_col {
+            continue;
+        }
+        xtwx[[i, i]] = xtwx[[i, i]] + penalty;
     }
 
     cholesky_solve(&xtwx, &xtwz).or_else(|_| gaussian_solve(n_features, &xtwx, &xtwz))
@@ -589,6 +641,18 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         x_design.assign(x);
     }
 
+    // The intercept (column 0 of the augmented design when fitting one) is
+    // excluded from the L2 penalty, matching sklearn (glm.py:258).
+    let intercept_col = if fit_intercept { Some(0) } else { None };
+
+    // Sum of sample weights. Unweighted GLM => every weight is 1, so this is
+    // `n_samples`. It scales the L2 penalty so the summed-deviance IRLS normal
+    // equations minimize sklearn's mean-deviance objective (glm.py:229-242).
+    let weight_sum = F::from(n_samples).unwrap_or_else(|| {
+        // n_samples >= 1 was checked above; fall back by accumulating ones.
+        (0..n_samples).fold(F::zero(), |acc, _| acc + F::one())
+    });
+
     // Clamp y for log.
     let y_safe: Array1<F> = y.mapv(|v| if v < min_y { min_y } else { v });
 
@@ -621,8 +685,13 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
             }
         }
 
-        // Solve weighted ridge.
-        coef = weighted_ridge_solve(&x_design, &z, &weights, alpha)?;
+        // Solve weighted ridge. `weight_sum` = sum of sample weights (= n_samples
+        // for the unweighted case); the penalty is scaled by it so the
+        // summed-deviance normal equations minimize sklearn's mean-deviance
+        // objective (glm.py:229-242). The intercept column (column 0 of the
+        // augmented design, present iff `fit_intercept`) is left unpenalized
+        // (glm.py:258, `l2_reg_strength = self.alpha` weighs only `||coef||^2`).
+        coef = weighted_ridge_solve(&x_design, &z, &weights, alpha, weight_sum, intercept_col)?;
 
         // Update eta and mu.
         eta = x_design.dot(&coef);
