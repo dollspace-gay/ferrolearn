@@ -46,8 +46,8 @@
 //! Tracking: #618 (coef_ C-dependence + basic coef_/intercept_ parity — the
 //! C-vs-C/n solver crux), #619 (binary decision_function shape `(n,)` + value).
 
-use ferrolearn_core::introspection::HasCoefficients;
-use ferrolearn_core::traits::Fit;
+use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
+use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::linear_svc::{LinearSVC, LinearSVCLoss};
 use ndarray::{Array1, Array2, array};
 
@@ -276,4 +276,186 @@ fn linear_svc_decision_function() {
             (fl - sk).abs()
         );
     }
+}
+
+/// Pin (#620, REQ-3 — predict + classes_): certifies that `predict` and
+/// `classes_` reproduce the live `sklearn.svm.LinearSVC` oracle on the binary
+/// 8x2 set. The predicted labels are downstream of the liblinear-parity fit
+/// (REQ-1), and `classes_ = np.unique(y)` (`sklearn/svm/_classes.py:311`).
+/// This pin should PASS — a green pin certifies REQ-3 SHIPPED.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=LinearSVC(C=1.0,loss='squared_hinge',fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.predict(X).tolist(), m.classes_.tolist())"
+/// # [0, 0, 0, 0, 1, 1, 1, 1] [0, 1]
+/// ```
+#[test]
+fn linear_svc_predict_parity() {
+    // Live sklearn 1.5.2: binary 8x2 set, squared_hinge, C=1.0,
+    // fit_intercept=True, max_iter=200000, tol=1e-10.
+    const SK_PREDICT: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+    const SK_CLASSES: [usize; 2] = [0, 1];
+
+    let (x, y) = binary_set();
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_c(1.0)
+        .with_loss(LinearSVCLoss::SquaredHinge)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let preds = fitted.predict(&x).unwrap();
+    assert_eq!(
+        preds.len(),
+        SK_PREDICT.len(),
+        "predict length: sklearn {}, ferrolearn {}",
+        SK_PREDICT.len(),
+        preds.len()
+    );
+    for (i, &sk) in SK_PREDICT.iter().enumerate() {
+        assert_eq!(
+            preds[i], sk,
+            "predict[{i}]: sklearn (liblinear) {sk}, ferrolearn {}",
+            preds[i]
+        );
+    }
+
+    assert_eq!(
+        fitted.classes(),
+        &SK_CLASSES,
+        "classes_ mismatch: sklearn np.unique(y) {SK_CLASSES:?}, ferrolearn {:?}",
+        fitted.classes()
+    );
+}
+
+/// Pin (#621, REQ-4 — hinge-loss optimum): certifies that a `loss='hinge'` fit
+/// reproduces the live `sklearn.svm.LinearSVC(loss='hinge')` `coef_` /
+/// `intercept_` on the binary 8x2 set. The dual CD solves the true hinge
+/// optimum (`U = C`, `diag = 0`, solver type 3, `linear.cpp:849-858`), so this
+/// pin should PASS — a green pin certifies REQ-4 SHIPPED.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=LinearSVC(loss='hinge',C=1.0,fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # coef [[0.15384615383852776, 0.15384615383915584]] intercept [-1.4615384615168394]
+/// ```
+#[test]
+fn linear_svc_hinge_coef_parity() {
+    // Live sklearn 1.5.2: binary 8x2 set, loss='hinge', C=1.0,
+    // fit_intercept=True, max_iter=200000, tol=1e-10.
+    const SK_COEF_0: f64 = 0.15384615383852776;
+    const SK_COEF_1: f64 = 0.15384615383915584;
+    const SK_INTERCEPT: f64 = -1.4615384615168394;
+
+    let (x, y) = binary_set();
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_c(1.0)
+        .with_loss(LinearSVCLoss::Hinge)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coefficients();
+    let coef0 = coef[0];
+    let coef1 = coef[1];
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef0 - SK_COEF_0).abs() < 1e-2,
+        "hinge coef_[0]: sklearn (liblinear, U=C diag=0) {SK_COEF_0}, \
+         ferrolearn {coef0} (gap {:.5}).",
+        (coef0 - SK_COEF_0).abs()
+    );
+    assert!(
+        (coef1 - SK_COEF_1).abs() < 1e-2,
+        "hinge coef_[1]: sklearn (liblinear) {SK_COEF_1}, ferrolearn {coef1} \
+         (gap {:.5}).",
+        (coef1 - SK_COEF_1).abs()
+    );
+    assert!(
+        (intercept - SK_INTERCEPT).abs() < 1e-2,
+        "hinge intercept: sklearn (liblinear) {SK_INTERCEPT}, \
+         ferrolearn {intercept} (gap {:.5}).",
+        (intercept - SK_INTERCEPT).abs()
+    );
+}
+
+/// Pin (#627, REQ-11 — n_iter_ / n_features_in_ / tol validation). These
+/// accessors DO NOT EXIST on `FittedLinearSVC` yet, so this pin FAILS (compile
+/// error on `n_features_in()` / `n_iter()`) until the fixer adds them — that
+/// compile failure IS the real REQ-11 gap.
+///
+/// - `n_features_in_` is DETERMINISTIC: oracle `n_features_in_ == 2` for the
+///   8x2 set (`sklearn/svm/_classes.py:302` via `_validate_data`).
+/// - `n_iter_` is shuffle-path dependent: sklearn's liblinear shuffles `index`
+///   each sweep (live: squared_hinge n_iter_=6, hinge n_iter_=560), while
+///   ferrolearn sweeps natural order, so the COUNT legitimately differs (the
+///   documented RNG-path boundary, cf. SGD). sklearn exposes
+///   `n_iter_ = n_iter_.max().item()` (`_classes.py:338`). We DO NOT pin an
+///   exact value — only that the accessor exists and is bounded.
+/// - tol validation: `_parameter_constraints` is
+///   `tol: Interval(Real, 0.0, None, closed="neither")` (`_classes.py:237`), so
+///   `tol <= 0` raises ValueError. ferrolearn must error on `tol <= 0`.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=LinearSVC(C=1.0,loss='squared_hinge',fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.n_features_in_, m.n_iter_)"
+/// # 2 6
+/// ```
+#[test]
+fn linear_svc_attrs_and_tol_validation() {
+    let (x, y) = binary_set();
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_c(1.0)
+        .with_loss(LinearSVCLoss::SquaredHinge)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    // n_features_in_ is deterministic (oracle == 2 for the 8x2 set).
+    assert_eq!(
+        fitted.n_features_in(),
+        2,
+        "n_features_in_: sklearn (_validate_data, _classes.py:302) 2, \
+         ferrolearn {}",
+        fitted.n_features_in()
+    );
+
+    // n_iter_ is shuffle-path dependent (sklearn liblinear shuffles `index`
+    // each sweep; ferrolearn sweeps natural order). Pin only existence +
+    // boundedness, not an exact value (the documented RNG-path boundary).
+    let k = fitted.n_iter();
+    assert!(
+        (1..=200_000).contains(&k),
+        "n_iter_ must be bounded in [1, max_iter]; got {k}"
+    );
+
+    // tol <= 0 must raise (Interval(Real, 0.0, None, closed='neither'),
+    // _classes.py:237).
+    assert!(
+        LinearSVC::<f64>::new().with_tol(0.0).fit(&x, &y).is_err(),
+        "tol=0.0 must be rejected (closed='neither', _classes.py:237)"
+    );
+    assert!(
+        LinearSVC::<f64>::new().with_tol(-1.0).fit(&x, &y).is_err(),
+        "tol=-1.0 must be rejected (closed='neither', _classes.py:237)"
+    );
 }

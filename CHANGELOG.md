@@ -9,6 +9,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(linear_svc): REQ-11 n_iter_/n_features_in_ accessors + tol>0 validation (#627)
+- translate(linear_svc): REQ-4 pin hinge-loss coef_/intercept_ vs live oracle (#621)
+- translate(linear_svc): REQ-3 pin predict + classes_ vs live oracle (#620)
+- translate(linear_svc): REQ-7 fit_intercept + intercept_scaling (penalized augmented column) (#624)
+- translate(linear_svc): REQ-2 binary decision_function (n,) + oracle pin (#619)
+- translate(linear_svc): REQ-1/10 CRUX — drop C/n scaling + liblinear dual CD + penalized augmented intercept (#618)
 - translate(linear_svr): REQ-9 fitted-attr contract (length-1 intercept_, n_features_in_) + param validation (#614)
 - translate(linear_svr): REQ-6 dual param (auto/True/False) (#612)
 - translate(linear_svr): REQ-8 n_iter_ + ConvergenceWarning at max_iter (#613)

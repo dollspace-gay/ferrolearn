@@ -53,15 +53,15 @@
 //! |---|---|---|
 //! | REQ-1 (fit parity — coef_/intercept_ vs liblinear oracle) | SHIPPED | `fn solve_binary_dual` minimizes liblinear's `0.5·‖w‖² + C·Σ L` via the dual CD (`solve_l2r_l1l2_svc`, `linear.cpp:819`); `fn fit` maps `classes_[1]→+1` and extracts `coef_ = w[:n_features]`, `intercept_ = intercept_scaling·w_last` (`_base.py:1240-1245`). Pinned by `tests/divergence_linear_svc_fit.rs::linear_svc_coef_parity` (live oracle `coef_ [[0.12835213611984458, 0.12835213611984475]]`, `intercept_ [-1.1943776585907158]`, C=1.0, squared_hinge, fit_intercept=True). Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-2 (decision_function shape `(n,)` + values) | SHIPPED | `fn decision_function` returns [`DecisionScores::Binary`] = 1-D `X·w + b` for the binary case (sklearn ravels the single-column score to `(n,)`, `linear_model/_base.py:365`) and [`DecisionScores::Multiclass`] `(n, n_classes)` otherwise. Pinned by `tests/divergence_linear_svc_fit.rs::linear_svc_decision_function` (live oracle 1-D `(8,)` values). Consumer: `fn predict` reads the binary scores' sign. |
-//! | REQ-3 (predict + classes_) | SHIPPED (incidental) | `fn predict` uses the sign of the binary decision (`>= 0 → classes_[1]`) / argmax of the OvR scores; `HasClasses::classes` = sorted unique `y` (`classes_ = np.unique(y)`, `_classes.py:311`). The labels are now downstream of the liblinear-parity fit; pinned indirectly via `linear_svc_decision_function` (sign agreement) + `conformance_linear_svc` accuracy floor. A dedicated `predict` oracle pin remains under #620. |
-//! | REQ-4 (loss {hinge, squared_hinge}) | NOT-STARTED | open prereq blocker #621. The dual CD now solves BOTH the true `hinge` (`U=C`, `diag=0`) and `squared_hinge` (`U=∞`, `diag=0.5/C`) optima (`solve_l2r_l1l2_svc`, `linear.cpp:849-858`), but no per-loss `coef_`/`intercept_` test pins the `hinge` optimum against the live oracle. |
+//! | REQ-3 (predict + classes_) | SHIPPED | `fn predict` uses the sign of the binary decision (`>= 0 → classes_[1]`) / argmax of the OvR scores; `HasClasses::classes` = sorted unique `y` (`classes_ = np.unique(y)`, `_classes.py:311`). The labels are downstream of the liblinear-parity fit and pinned against the live oracle by `linear_svc_predict_parity in tests/divergence_linear_svc_fit.rs` (#620; 8×2 set: `predict [0,0,0,0,1,1,1,1]`, `classes_ [0,1]`). |
+//! | REQ-4 (loss {hinge, squared_hinge}) | SHIPPED | The dual CD solves BOTH the true `hinge` (`U=C`, `diag=0`) and `squared_hinge` (`U=∞`, `diag=0.5/C`) optima (`solve_l2r_l1l2_svc`, `linear.cpp:849-858`). The `hinge` optimum is pinned against the live oracle by `linear_svc_hinge_coef_parity in tests/divergence_linear_svc_fit.rs` (#621; 8×2 set, `loss='hinge'`, `C=1.0`: `coef_ [[0.15384615383852776, 0.15384615383915584]]`, `intercept_ [-1.4615384615168394]`). |
 //! | REQ-5 (penalty {l1, l2}) | NOT-STARTED | open prereq blocker #622. `LinearSVC<F>` has no `penalty` field; the dual CD hardcodes the L2 regularizer. |
 //! | REQ-6 (multi_class {ovr, crammer_singer}) | NOT-STARTED | open prereq blocker #623. `fn fit` implements one-vs-rest (the default `'ovr'`) but there is no `multi_class` field / `crammer_singer` joint solver. |
 //! | REQ-7 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVC<F>` exposes `pub fit_intercept: bool` (default true) + `pub intercept_scaling: F` (default 1.0) + `#[must_use]` builders. When fitting an intercept the design matrix is augmented with a penalized constant column = `intercept_scaling`, and `intercept_ = intercept_scaling·w_last` (`_base.py:1188-1198,:1240-1245`); `intercept_scaling > 0` is validated. Pinned by `linear_svc_coef_parity` + module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
 //! | REQ-8 (dual param) | NOT-STARTED | open prereq blocker #625. `LinearSVC<F>` has no `dual` field. |
 //! | REQ-9 (class_weight) | NOT-STARTED | open prereq blocker #626. `LinearSVC<F>` has no `class_weight` field. |
 //! | REQ-10 (C-scaling convention) | SHIPPED | the `c / n_f` division is removed; the dual CD uses `upper_bound = C` (hinge) / `diag = 0.5/C` (squared_hinge), so `coef_` tracks `C` like liblinear. Pinned by `linear_svc_coef_c_dependence` (C=0.1 → `0.0784651864625997`, C=1.0 → `0.12835213611984458`). |
-//! | REQ-11 (n_iter_/n_features_in_ + param validation) | NOT-STARTED | open prereq blocker #627. `fn fit` counts dual-CD outer iterations and emits the ConvergenceWarning-equivalent, but `n_iter_`/`n_features_in_` accessors + `tol > 0` validation are not yet exposed/pinned. |
+//! | REQ-11 (n_iter_/n_features_in_ + param validation) | SHIPPED | `fn n_features_in` (returns the stored `n_features`, set by `_validate_data`, `_classes.py:302`) and `fn n_iter` (the max dual-CD outer-iteration count across the binary/OvR fits, `n_iter_ = n_iter_.max().item()`, `_classes.py:338`) on `FittedLinearSVC`; `fn fit` validates `tol > 0` (`Interval(Real, 0.0, None, closed="neither")`, `_classes.py:237`). Pinned by `linear_svc_attrs_and_tol_validation in tests/divergence_linear_svc_fit.rs` (#627). `n_features_in_` (oracle `2`) and the `tol <= 0` reject are exact; `n_iter_` is the documented shuffle-path RNG boundary (ferrolearn sweeps natural order, sklearn's liblinear shuffles `index` each sweep, cf. SGD), so the pin bounds `n_iter` in `[1, max_iter]` rather than exact-matching. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #628. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
@@ -257,6 +257,9 @@ pub struct FittedLinearSVC<F> {
     is_binary: bool,
     /// Number of features.
     n_features: usize,
+    /// Maximum dual-CD outer-iteration count across sub-problem fits
+    /// (`n_iter_ = n_iter_.max().item()`, `_classes.py:338`).
+    n_iter: usize,
 }
 
 impl<F: Float> FittedLinearSVC<F> {
@@ -270,6 +273,28 @@ impl<F: Float> FittedLinearSVC<F> {
     #[must_use]
     pub fn intercepts(&self) -> &[F] {
         &self.intercepts
+    }
+
+    /// Number of features seen during fit (`n_features_in_`).
+    ///
+    /// Mirrors sklearn's `n_features_in_`, set by `_validate_data`
+    /// (`sklearn/svm/_classes.py:302`); equals `X.ncols()`.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.n_features
+    }
+
+    /// Maximum number of dual coordinate-descent outer iterations across the
+    /// (binary or one-vs-rest) sub-problem fits.
+    ///
+    /// Mirrors sklearn's `n_iter_ = n_iter_.max().item()`
+    /// (`sklearn/svm/_classes.py:338`). The exact value is shuffle-path
+    /// dependent (sklearn's liblinear shuffles the active index each sweep;
+    /// ferrolearn sweeps natural order), so it is bounded in `[1, max_iter]`
+    /// rather than exact-matching the oracle.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
     }
 }
 
@@ -561,6 +586,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
+        // `_parameter_constraints["tol"] = Interval(Real, 0.0, None,
+        // closed="neither")` (`_classes.py:237`) → `tol <= 0` raises.
+        if self.tol <= F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "tol".into(),
+                reason: "must be positive".into(),
+            });
+        }
+
         // liblinear raises when intercept_scaling <= 0 with fit_intercept
         // (`_base.py:1190-1196`).
         if self.fit_intercept && self.intercept_scaling <= F::zero() {
@@ -605,6 +639,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         };
 
         let mut any_unconverged = false;
+        // n_iter_ = n_iter_.max() across the sub-problem fits (`_classes.py:338`).
+        let mut max_n_iter: usize = 0;
 
         let fitted = if classes.len() == 2 {
             // Binary classification. liblinear's `prob.y` are the LabelEncoder
@@ -619,10 +655,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 }
             });
 
-            let (coef, intercept, _n_iter, converged) = solve_one(&y_signed);
+            let (coef, intercept, n_iter, converged) = solve_one(&y_signed);
             if !converged {
                 any_unconverged = true;
             }
+            max_n_iter = max_n_iter.max(n_iter);
 
             FittedLinearSVC {
                 weight_vectors: vec![coef],
@@ -630,6 +667,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 classes,
                 is_binary: true,
                 n_features,
+                n_iter: max_n_iter,
             }
         } else {
             // Multiclass: one-vs-rest. Each class is the positive (+1) class of
@@ -640,10 +678,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             for &cls in &classes {
                 let y_signed: Array1<F> =
                     y.mapv(|label| if label == cls { F::one() } else { -F::one() });
-                let (coef, intercept, _n_iter, converged) = solve_one(&y_signed);
+                let (coef, intercept, n_iter, converged) = solve_one(&y_signed);
                 if !converged {
                     any_unconverged = true;
                 }
+                max_n_iter = max_n_iter.max(n_iter);
                 weight_vectors.push(coef);
                 intercepts.push(intercept);
             }
@@ -654,6 +693,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 classes,
                 is_binary: false,
                 n_features,
+                n_iter: max_n_iter,
             }
         };
 
