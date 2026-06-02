@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree ExtraTreeRegressor ignores criterion (hard-wired MSE/mean leaves) vs sklearn/tree/_criterion.pyx MAE.node_value median (#681) (#667)
 - decision_tree: class_weight (None/balanced/dict) (#665)
 - decision_tree: max_leaf_nodes best-first growth (#664)
 - decision_tree: ccp_alpha minimal cost-complexity pruning (#663)
