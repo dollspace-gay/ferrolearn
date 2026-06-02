@@ -1146,3 +1146,197 @@ fn divergence_pin14_class_weight_three_fits() {
         bal_explicit_fit.intercept()[0]
     );
 }
+
+/// PIN 15 — REQ-9: `predict_proba`/`predict_log_proba` STRUCTURAL contract (#642).
+///
+/// Pins the NEW REQ-9 probability path (`SVC::with_probability`,
+/// `FittedSVC::predict_proba`/`predict_log_proba`, the deterministic Platt
+/// machinery `sigmoid_train`/`sigmoid_predict`/`multiclass_probability`/
+/// `platt_cv_sigmoid in svm.rs`) against the DETERMINISTIC, STRUCTURAL part of
+/// sklearn's documented `predict_proba` contract.
+///
+/// ## RNG-CV exact-value boundary — why no exact-value pin (R-CHAR-3)
+///
+/// libsvm's Platt CV fold permutation is RNG-seeded (`svm.cpp:2116-2122`), so
+/// sklearn's `probA_`/`probB_` — and therefore the exact `predict_proba` values
+/// — are NON-DETERMINISTIC across `random_state`. The `predict_proba` docstring
+/// itself admits this: "The probability model is created using cross
+/// validation, so the results can be slightly different than those obtained by
+/// predict" (`sklearn/svm/_base.py:849-854`). Verified live:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[1.,1.],[2.,1.],[1.,2.],[2.,2.],[1.5,1.5],[5.,5.],[6.,5.],[5.,6.],[6.,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,0,1,1,1,1,1]); \
+///   print(SVC(kernel='linear',C=1.0,probability=True,random_state=0).fit(X,y).probA_, \
+///         SVC(kernel='linear',C=1.0,probability=True,random_state=1).fit(X,y).probA_)"
+/// # e.g. [-0.7749...] vs [-1.0541...]  -> probA_ (hence predict_proba) is RNG-CV-dependent
+/// ```
+/// Pinning exact `predict_proba` values against sklearn would therefore be an
+/// ILL-DEFINED (flaky) pin. Per R-CHAR-3 only sklearn's DETERMINISTIC documented
+/// contract is asserted here — none of it is copied from the ferrolearn side:
+///
+///  (a) RAISE: `probability=False` (default) -> `predict_proba`/
+///      `predict_log_proba` are unavailable (sklearn raises `NotFittedError`
+///      "predict_proba is not available when fitted with probability=False",
+///      `sklearn/svm/_base.py:857-860`).
+///  (b) SHAPE/DISTRIBUTION: with `probability=true`, `predict_proba(X)` is `Ok`,
+///      shape `(n, n_classes)` (binary `(n,2)`, 3-class `(n,3)`), each row a
+///      probability distribution — sums to 1 (±1e-9) with every entry ∈ [0,1]
+///      (`predict_proba` returns "the probability of the sample for each class",
+///      columns = `classes_` in sorted order, `_base.py:843-848`).
+///  (c) BINARY MONOTONICITY: P(classes_[1]) (column 1) is monotone
+///      NON-DECREASING in the binary `decision_function` value — the Platt model
+///      P(y=1|f) = 1/(1+exp(A·f+B)) is a monotone sigmoid of the decision
+///      (`_base.py:775-776`: "the decision function is a monotonic
+///      transformation"; sigmoid is monotone in f). Asserted by sorting samples
+///      by `decision_function.as_binary()` and checking column-1 proba is
+///      non-decreasing along that order (1e-9 tie tolerance). NOT a copied value.
+///  (d) LOG: `predict_log_proba(X) == predict_proba(X).ln()` elementwise (±1e-12)
+///      (`sklearn/svm/_base.py:894`: `return np.log(self.predict_proba(X))`).
+///
+/// Tracking: #642
+#[test]
+fn divergence_pin15_predict_proba_contract() {
+    // ----- (a) RAISE: probability=False (default) -> predict_proba errors -----
+    {
+        let (x, y) = binary_6x2();
+        let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(1_000_000); // probability defaults to false
+        let fitted = model.fit(&x, &y).unwrap();
+        assert!(
+            fitted.predict_proba(&x).is_err(),
+            "probability=false predict_proba must Err (sklearn NotFittedError, _base.py:857-860)"
+        );
+        assert!(
+            fitted.predict_log_proba(&x).is_err(),
+            "probability=false predict_log_proba must Err (sklearn NotFittedError, _base.py:857-860)"
+        );
+    }
+
+    // ----- BINARY probability=true fit (>=6 samples, 2 classes) -----
+    let (xb, yb) = binary_6x2();
+    let bin_fit = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_probability(true)
+        .fit(&xb, &yb)
+        .unwrap();
+
+    // (b) shape (6,2); every row sums to 1 (±1e-9); every entry in [0,1].
+    let pb = bin_fit.predict_proba(&xb).unwrap();
+    assert_eq!(pb.dim(), (6, 2), "binary predict_proba shape must be (n,2)");
+    for s in 0..6 {
+        let row_sum = pb[[s, 0]] + pb[[s, 1]];
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "binary predict_proba row {s} must sum to 1 (sklearn distribution \
+             contract, _base.py:843-848); got {row_sum}"
+        );
+        for c in 0..2 {
+            assert!(
+                pb[[s, c]] >= 0.0 && pb[[s, c]] <= 1.0,
+                "binary predict_proba[{s},{c}]={} out of [0,1]",
+                pb[[s, c]]
+            );
+        }
+    }
+
+    // (c) BINARY MONOTONICITY: P(classes_[1]) (column 1) non-decreasing in the
+    // binary decision_function value. Sweep query points from the class-0 to
+    // the class-1 side so the decision spans both signs.
+    let q = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 6.0, 6.0],
+    )
+    .unwrap();
+    let pq = bin_fit.predict_proba(&q).unwrap();
+    let dq = bin_fit.decision_function(&q).unwrap();
+    let bin = dq
+        .as_binary()
+        .expect("binary decision_function is the 1-D Binary variant");
+    let mut order: Vec<usize> = (0..6).collect();
+    order.sort_by(|&a, &b| {
+        bin[a]
+            .partial_cmp(&bin[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut prev = f64::NEG_INFINITY;
+    for &s in &order {
+        let p1 = pq[[s, 1]];
+        assert!(
+            p1 >= prev - 1e-9,
+            "P(classes_[1]) must be monotone non-decreasing in decision_function \
+             (Platt sigmoid is monotone, _base.py:775-776): sample {s} df={} p1={p1} prev={prev}",
+            bin[s]
+        );
+        prev = p1;
+    }
+
+    // (d) LOG: predict_log_proba == predict_proba.ln() elementwise (±1e-12).
+    let lpb = bin_fit.predict_log_proba(&xb).unwrap();
+    assert_eq!(
+        lpb.dim(),
+        pb.dim(),
+        "predict_log_proba shape == predict_proba"
+    );
+    for s in 0..6 {
+        for c in 0..2 {
+            let gap = (lpb[[s, c]] - pb[[s, c]].ln()).abs();
+            assert!(
+                gap < 1e-12,
+                "predict_log_proba[{s},{c}]={} != ln(predict_proba)={} (_base.py:894), gap={gap}",
+                lpb[[s, c]],
+                pb[[s, c]].ln()
+            );
+        }
+    }
+
+    // ----- 3-CLASS probability=true fit -----
+    let (x3, y3) = three_class_9x2();
+    let mc_fit = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_probability(true)
+        .fit(&x3, &y3)
+        .unwrap();
+
+    // (b) shape (9,3); every row sums to 1 (±1e-9); every entry in [0,1].
+    let pm = mc_fit.predict_proba(&x3).unwrap();
+    assert_eq!(
+        pm.dim(),
+        (9, 3),
+        "3-class predict_proba shape must be (n,3)"
+    );
+    for s in 0..9 {
+        let row_sum: f64 = (0..3).map(|c| pm[[s, c]]).sum();
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "3-class predict_proba row {s} must sum to 1 (Wu-Lin-Weng coupling \
+             distribution contract, _base.py:843-848); got {row_sum}"
+        );
+        for c in 0..3 {
+            assert!(
+                pm[[s, c]] >= 0.0 && pm[[s, c]] <= 1.0,
+                "3-class predict_proba[{s},{c}]={} out of [0,1]",
+                pm[[s, c]]
+            );
+        }
+    }
+
+    // (d) LOG for the 3-class case too.
+    let lpm = mc_fit.predict_log_proba(&x3).unwrap();
+    assert_eq!(lpm.dim(), pm.dim(), "3-class predict_log_proba shape");
+    for s in 0..9 {
+        for c in 0..3 {
+            let gap = (lpm[[s, c]] - pm[[s, c]].ln()).abs();
+            assert!(
+                gap < 1e-12,
+                "3-class predict_log_proba[{s},{c}] != ln(predict_proba) (_base.py:894), gap={gap}"
+            );
+        }
+    }
+}

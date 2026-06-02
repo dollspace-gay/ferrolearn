@@ -59,7 +59,7 @@
 //! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
 //! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
 //! | REQ-8 (constructor param surface + defaults) | SHIPPED | `shrinking` (`SVC`/`SVR`, default `true`, `with_shrinking`; accepted for API parity, shrinking-invariant optimum so DOES NOT alter results — R-DEV-7); `break_ties` (`SVC`, default `false`, `with_break_ties`; `fn predict in svm.rs` ovr-argmax branch for `break_ties=true`+ovr+`n_classes>2`, `InvalidParameter` for the ovo combo, `_base.py:801-814`); default alignment `cache_size=200`, `max_iter=0` (= sklearn `-1`, no iteration limit; the `smo_binary`/`smo_svr` loops treat `0` as unbounded); REQ-1's `gamma` enum (`scale`/`auto`/float); and now **`class_weight`** (`SVC`, `pub class_weight: ClassWeight<F>` default `None`, `with_class_weight`). `fn compute_class_weight in svm.rs` mirrors `sklearn.utils.compute_class_weight` as called by `BaseSVC._validate_targets` (`class_weight_ = compute_class_weight(class_weight, classes, y)`, `_base.py:740`): `None`→1.0, `Balanced`→`n_samples/(n_classes·count_c)` (`_classes.py:122-124`), `Explicit`→1.0 default overridden by map. `fn smo_binary in svm.rs` now takes per-class box bounds `(cp, cn)` (the `y=+1`/`y=-1` upper bounds) instead of a scalar `c`, applied in the WSS `in_up`/`in_low` tests, the analytic-update box clip, and the free-SV bias recovery (`0<alpha_i<C_i`); when `cp==cn` the math is identical to before (the 13 divergence pins stay green). `fn fit in svm.rs` (SVC) computes `weights = compute_class_weight(...)` ONCE over the full `y`, then per ovo pair `(ci,cj)`: `cp = C·weights[cj]`, `cn = C·weights[ci]` (libsvm `weighted_C`, `_base.py:740`). Non-test consumer: `fn fit in svm.rs` consumes `self.class_weight` (the boundary `SVC`/`FittedSVC` types are re-exported at the crate root + consumed by `nu_svm.rs`). Pinned: `test_svc_class_weight_smoke`/`test_compute_class_weight_balanced`/`test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs` (live oracle on the imbalanced 8×2 set: None `dual_coef_ [[-0.5,-1,1,0.5]]`/`intercept_ [-2.0]`/`support_ [1,3,5,6]`; balanced `[[-0.8,-0.8,1.3333,0.2667]]`/`-1.6667`; `{0:1,1:5}` `support_ [1,3,4,5]`/`-2.0`; R-CHAR-3, 1e-2; None≠balanced intercept). **R-DEV-7 design difference (preserved contract, NOT a gap):** estimator-level `kernel`(string-select)/`degree`/`coef0` are the type parameter `K`, set by construction; `random_state` is unused (ferrolearn's SMO is deterministic). `class_weight` is SVC-only (sklearn SVR has no `class_weight`). |
-//! | REQ-9 (probability / predict_proba) | NOT-STARTED | open #642. No `probability` Platt-scaling CV (`_probA`/`_probB`), no `predict_proba`/`predict_log_proba` (`_base.py:820-925`). |
+//! | REQ-9 (probability / predict_proba) | SHIPPED | `pub probability: bool` field on `SVC` (default `false`, `with_probability`) + `prob_a`/`prob_b`/`probability` on `FittedSVC`. The DETERMINISTIC Platt machinery is transcribed from libsvm: `fn sigmoid_train in svm.rs` (Newton iteration + prior init + target smoothing + step-halving line search, `svm.cpp:1919-2030`), `fn sigmoid_predict in svm.rs` (overflow-safe form, `svm.cpp:2032-2040`), `fn multiclass_probability in svm.rs` (Wu-Lin-Weng 2004 coupling, `svm.cpp:2043-2104`). `fn platt_cv_sigmoid in svm.rs` runs a per-ovo-pair 5-fold CV at fit time when `probability=true` (`svm.cpp:2107-2203`). `FittedSVC::predict_proba in svm.rs` builds the pairwise matrix via `sigmoid_predict` (clamped `[1e-7,1-1e-7]`, `svm.cpp:2937`) -> `multiclass_probability` -> `(n,n_classes)`; binary -> `[P(classes[0]),P(classes[1])]`; rows sum to 1. `FittedSVC::predict_log_proba` = `predict_proba.ln()` (`_base.py:866-894`). `probability=false` -> `InvalidParameter` carrying sklearn's `NotFittedError` text "predict_proba is not available when fitted with probability=False" (`_base.py:856-860`; no `NotFitted` variant by R-DEV-4 typestate). **RNG-CV boundary (documented divergence, NOT a gap):** libsvm's CV fold permutation is RNG-seeded, so sklearn's `probA_`/`probB_`/`predict_proba` are NON-DETERMINISTIC across `random_state` (`probA_` = -0.7749 at rs=0 vs -1.0541 at rs=1; the docstring admits CV-dependence). ferrolearn uses a DETERMINISTIC contiguous 5-fold split (analogous to the documented SGD shuffle boundary), so it does NOT bit-match sklearn's predict_proba VALUES — only the deterministic machinery + structural invariants + the raise contract are verified (R-CHAR-3: the asserted invariants are sklearn's DOCUMENTED contract, not copied values). Pinned by `test_svc_predict_proba_raises_when_probability_false`/`test_svc_predict_proba_binary_rows_sum_to_one`/`test_svc_predict_proba_binary_monotone_in_decision`/`test_svc_predict_log_proba_equals_log_of_proba`/`test_svc_predict_proba_multiclass_rows_sum_to_one`/`test_sigmoid_predict_overflow_safe`/`test_multiclass_probability_binary_reduces_to_pairwise in svm.rs`. Non-test consumer: `fn fit in svm.rs` (SVC) consumes `self.probability` (the boundary `SVC`/`FittedSVC` types are re-exported at the crate root + consumed by `nu_svm.rs`). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
 use std::collections::HashMap;
@@ -737,6 +737,372 @@ fn smo_binary<F: Float, K: Kernel<F>>(
 }
 
 // ---------------------------------------------------------------------------
+// Platt scaling (probability estimates)
+// ---------------------------------------------------------------------------
+
+/// Fit the Platt sigmoid `P(y=+1 | f) = 1 / (1 + exp(A·f + B))` to a set of
+/// decision values `dec_values` with binary labels `labels` (`+1` / `-1`),
+/// returning the `(A, B)` parameters.
+///
+/// A faithful transcription of libsvm's `sigmoid_train`
+/// (`sklearn/svm/src/libsvm/svm.cpp:1919-2030`): the prior-based initial point
+/// (`A=0`, `B=log((prior0+1)/(prior1+1))`), the `t` target smoothing
+/// (`hiTarget=(prior1+1)/(prior1+2)`, `loTarget=1/(prior0+2)`), the Newton
+/// iteration with the regularized Hessian (`H' = H + sigma·I`,
+/// `sigma=1e-12`), the gradient/Hessian accumulation, the step-halving line
+/// search (`min_step=1e-10`, sufficient-decrease constant `0.0001`),
+/// `max_iter=100`, and the `eps=1e-5` gradient stopping criterion. The
+/// overflow-safe `fApB>=0` branching matches the C code exactly.
+#[allow(
+    clippy::too_many_lines,
+    reason = "a faithful one-to-one transcription of libsvm's sigmoid_train \
+              Newton loop (svm.cpp:1919-2030); splitting it would obscure the \
+              line-by-line correspondence to the C oracle"
+)]
+fn sigmoid_train<F: Float>(dec_values: &[F], labels: &[F]) -> (F, F) {
+    let l = dec_values.len();
+    let zero = F::zero();
+    let one = F::one();
+    let two = one + one;
+
+    let mut prior1 = zero;
+    let mut prior0 = zero;
+    for &lab in labels {
+        if lab > zero {
+            prior1 = prior1 + one;
+        } else {
+            prior0 = prior0 + one;
+        }
+    }
+
+    let max_iter = 100usize;
+    let min_step = F::from(1e-10).unwrap_or_else(F::epsilon);
+    let sigma = F::from(1e-12).unwrap_or_else(F::epsilon);
+    let eps = F::from(1e-5).unwrap_or_else(F::epsilon);
+    let suff = F::from(0.0001).unwrap_or_else(F::epsilon);
+
+    let hi_target = (prior1 + one) / (prior1 + two);
+    let lo_target = one / (prior0 + two);
+
+    // Per-sample target smoothed labels `t`.
+    let t: Vec<F> = labels
+        .iter()
+        .map(|&lab| if lab > zero { hi_target } else { lo_target })
+        .collect();
+
+    // Initial point and initial function value.
+    let mut a = zero;
+    let mut b = ((prior0 + one) / (prior1 + one)).ln();
+
+    let funcval = |a: F, b: F| -> F {
+        let mut fval = zero;
+        for i in 0..l {
+            let f_ap_b = dec_values[i] * a + b;
+            if f_ap_b >= zero {
+                fval = fval + t[i] * f_ap_b + (one + (-f_ap_b).exp()).ln();
+            } else {
+                fval = fval + (t[i] - one) * f_ap_b + (one + f_ap_b.exp()).ln();
+            }
+        }
+        fval
+    };
+
+    let mut fval = funcval(a, b);
+
+    for _iter in 0..max_iter {
+        // Update gradient and Hessian (H' = H + sigma·I).
+        let mut h11 = sigma;
+        let mut h22 = sigma;
+        let mut h21 = zero;
+        let mut g1 = zero;
+        let mut g2 = zero;
+        for i in 0..l {
+            let f_ap_b = dec_values[i] * a + b;
+            let (p, q) = if f_ap_b >= zero {
+                let e = (-f_ap_b).exp();
+                (e / (one + e), one / (one + e))
+            } else {
+                let e = f_ap_b.exp();
+                (one / (one + e), e / (one + e))
+            };
+            let d2 = p * q;
+            h11 = h11 + dec_values[i] * dec_values[i] * d2;
+            h22 = h22 + d2;
+            h21 = h21 + dec_values[i] * d2;
+            let d1 = t[i] - p;
+            g1 = g1 + dec_values[i] * d1;
+            g2 = g2 + d1;
+        }
+
+        // Stopping criterion.
+        if g1.abs() < eps && g2.abs() < eps {
+            break;
+        }
+
+        // Newton direction: -inv(H')·g.
+        let det = h11 * h22 - h21 * h21;
+        let d_a = -(h22 * g1 - h21 * g2) / det;
+        let d_b = -(-h21 * g1 + h11 * g2) / det;
+        let gd = g1 * d_a + g2 * d_b;
+
+        // Line search (step halving).
+        let mut stepsize = one;
+        while stepsize >= min_step {
+            let new_a = a + stepsize * d_a;
+            let new_b = b + stepsize * d_b;
+            let newf = funcval(new_a, new_b);
+            if newf < fval + suff * stepsize * gd {
+                a = new_a;
+                b = new_b;
+                fval = newf;
+                break;
+            }
+            stepsize = stepsize / two;
+        }
+
+        if stepsize < min_step {
+            // Line search failed — libsvm bails out of the Newton loop.
+            break;
+        }
+    }
+
+    (a, b)
+}
+
+/// Evaluate the Platt sigmoid `P(y=+1 | f) = 1 / (1 + exp(A·f + B))` at a single
+/// decision value, in the overflow-safe form of libsvm's `sigmoid_predict`
+/// (`sklearn/svm/src/libsvm/svm.cpp:2032-2040`):
+/// `fApB = decision·A + B`; if `fApB >= 0` return `exp(-fApB)/(1+exp(-fApB))`,
+/// else `1/(1+exp(fApB))` (avoiding `exp` overflow / catastrophic
+/// cancellation).
+fn sigmoid_predict<F: Float>(decision: F, a: F, b: F) -> F {
+    let f_ap_b = decision * a + b;
+    if f_ap_b >= F::zero() {
+        let e = (-f_ap_b).exp();
+        e / (F::one() + e)
+    } else {
+        F::one() / (F::one() + f_ap_b.exp())
+    }
+}
+
+/// Wu-Lin-Weng (2004) pairwise coupling ("Method 2"): given the `k×k` pairwise
+/// probability matrix `r` (where `r[i][j] = P(class i | class i or j)`),
+/// produce the `k` coupled class probabilities `p`.
+///
+/// A faithful transcription of libsvm's `multiclass_probability`
+/// (`sklearn/svm/src/libsvm/svm.cpp:2043-2104`): build the `Q` matrix from the
+/// pairwise probabilities, then run the fixed-point iteration
+/// (`max_iter = max(100, k)`, `eps = 0.005/k`) that minimizes the coupling
+/// objective, normalized so the returned probabilities sum to 1.
+fn multiclass_probability<F: Float>(k: usize, r: &Array2<F>) -> Vec<F> {
+    let zero = F::zero();
+    let one = F::one();
+    let k_f = F::from(k).unwrap_or(one);
+
+    let mut p = vec![one / k_f; k];
+    // Q[t][j].
+    let mut q = Array2::<F>::zeros((k, k));
+    for t in 0..k {
+        for j in 0..t {
+            q[[t, t]] = q[[t, t]] + r[[j, t]] * r[[j, t]];
+            q[[t, j]] = q[[j, t]];
+        }
+        for j in (t + 1)..k {
+            q[[t, t]] = q[[t, t]] + r[[j, t]] * r[[j, t]];
+            q[[t, j]] = -r[[j, t]] * r[[t, j]];
+        }
+    }
+
+    let max_iter = 100.max(k);
+    let eps = F::from(0.005).unwrap_or_else(F::epsilon) / k_f;
+    let mut qp = vec![zero; k];
+
+    for _iter in 0..max_iter {
+        // Recompute Qp, pQp for numerical accuracy.
+        let mut p_qp = zero;
+        for t in 0..k {
+            qp[t] = zero;
+            for j in 0..k {
+                qp[t] = qp[t] + q[[t, j]] * p[j];
+            }
+            p_qp = p_qp + p[t] * qp[t];
+        }
+        let mut max_error = zero;
+        for &qpt in qp.iter().take(k) {
+            let error = (qpt - p_qp).abs();
+            if error > max_error {
+                max_error = error;
+            }
+        }
+        if max_error < eps {
+            break;
+        }
+
+        for t in 0..k {
+            let qtt = q[[t, t]];
+            if qtt == zero {
+                continue;
+            }
+            let diff = (-qp[t] + p_qp) / qtt;
+            p[t] = p[t] + diff;
+            p_qp = (p_qp + diff * (diff * qtt + two_qp(qp[t]))) / (one + diff) / (one + diff);
+            for j in 0..k {
+                qp[j] = (qp[j] + diff * q[[t, j]]) / (one + diff);
+                p[j] = p[j] / (one + diff);
+            }
+        }
+    }
+
+    p
+}
+
+/// `2·x` helper for [`multiclass_probability`] (libsvm `2*Qp[t]`).
+#[inline]
+fn two_qp<F: Float>(x: F) -> F {
+    x + x
+}
+
+/// Decision value of a freshly-trained binary SMO sub-model on a query sample,
+/// in ferrolearn's sign convention (positive favors the `+1` label, i.e. the
+/// higher-index `class_pos` group).
+fn sub_decision_value<F: Float, K: Kernel<F>>(
+    sv_data: &[Vec<F>],
+    sv_coefs: &[F],
+    bias: F,
+    kernel: &K,
+    q: &[F],
+) -> F {
+    let mut val = bias;
+    for (sv, &coef) in sv_data.iter().zip(sv_coefs.iter()) {
+        val = val + coef * kernel.compute(sv, q);
+    }
+    val
+}
+
+/// Fit the per-ovo-pair Platt sigmoid `(A, B)` via a DETERMINISTIC 5-fold CV
+/// over the pair's samples, mirroring libsvm's `svm_binary_svc_probability`
+/// (`sklearn/svm/src/libsvm/svm.cpp:2107-2203`) EXCEPT for the fold
+/// permutation.
+///
+/// libsvm shuffles the fold assignment with an RNG seeded by `random_state`
+/// (`svm.cpp:2116-2122`), which makes the resulting `(A, B)` (sklearn's
+/// `probA_`/`probB_`) and thus `predict_proba` NON-DETERMINISTIC across
+/// `random_state`. To keep ferrolearn deterministic (it has no libsvm RNG
+/// seed; cf. the documented SGD shuffle boundary), the folds here are
+/// CONTIGUOUS (`fold i = [i·l/5, (i+1)·l/5)`), with NO shuffle. The rest is a
+/// faithful transcription: train `smo_binary` on the 4 training folds,
+/// `predict_values` the held-out fold (in libsvm sign), with the degenerate
+/// one-class-fold fallbacks (`+1` / `-1` / `0`, `svm.cpp:2161-2169`), then
+/// [`sigmoid_train`] over all out-of-fold decisions.
+///
+/// `sub_labels` is ferrolearn's sign (`+1` = higher-index `class_pos`,
+/// `-1` = lower-index `class_neg`). The decision values and labels passed to
+/// [`sigmoid_train`] are converted to libsvm sign (`+1` = lower-index
+/// `class_neg`, matching `raw_ovo`) so the fitted `(A, B)` is consistent with
+/// the raw ovo decision used by [`FittedSVC::predict_proba`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors smo_binary's per-class box bounds (cp, cn) + solver \
+              hyperparameters threaded through the CV folds"
+)]
+fn platt_cv_sigmoid<F: Float, K: Kernel<F>>(
+    sub_data: &[Vec<F>],
+    sub_labels: &[F],
+    kernel: &K,
+    cp: F,
+    cn: F,
+    tol: F,
+    max_iter: usize,
+    cache_size: usize,
+) -> (F, F) {
+    let l = sub_data.len();
+    let nr_fold = 5usize;
+    // Out-of-fold decision value per sample, in libsvm sign (+1 = class_neg).
+    let mut dec_values = vec![F::zero(); l];
+
+    for fold in 0..nr_fold {
+        let begin = fold * l / nr_fold;
+        let end = (fold + 1) * l / nr_fold;
+
+        // Training set = all samples outside [begin, end).
+        let mut tr_data: Vec<Vec<F>> = Vec::with_capacity(l);
+        let mut tr_labels: Vec<F> = Vec::with_capacity(l);
+        for (j, row) in sub_data.iter().enumerate() {
+            if j < begin || j >= end {
+                tr_data.push(row.clone());
+                tr_labels.push(sub_labels[j]);
+            }
+        }
+
+        // Count classes in the training folds (ferrolearn sign).
+        let mut p_count = 0usize;
+        let mut n_count = 0usize;
+        for &lab in &tr_labels {
+            if lab > F::zero() {
+                p_count += 1;
+            } else {
+                n_count += 1;
+            }
+        }
+
+        // Degenerate folds: libsvm assigns a constant decision
+        // (`svm.cpp:2161-2169`). In ferrolearn sign a held-out sample gets
+        // +1 (all-positive train), -1 (all-negative train), or 0 (empty); we
+        // store the libsvm-sign value = negation.
+        if p_count == 0 && n_count == 0 {
+            for d in dec_values.iter_mut().take(end).skip(begin) {
+                *d = F::zero();
+            }
+            continue;
+        } else if n_count == 0 {
+            // train all +1 (class_pos) -> ferrolearn dec +1 -> libsvm -1.
+            for d in dec_values.iter_mut().take(end).skip(begin) {
+                *d = -F::one();
+            }
+            continue;
+        } else if p_count == 0 {
+            for d in dec_values.iter_mut().take(end).skip(begin) {
+                *d = F::one();
+            }
+            continue;
+        }
+
+        // Train a probability-free sub-model on the training folds.
+        let Ok(sub) = smo_binary(
+            &tr_data, &tr_labels, kernel, cp, cn, tol, max_iter, cache_size,
+        ) else {
+            // A failed sub-solve falls back to a neutral 0 decision.
+            for d in dec_values.iter_mut().take(end).skip(begin) {
+                *d = F::zero();
+            }
+            continue;
+        };
+
+        // Extract the sub-model's support vectors.
+        let eps = F::from(1e-8).unwrap_or_else(F::epsilon);
+        let mut sv_data: Vec<Vec<F>> = Vec::new();
+        let mut sv_coefs: Vec<F> = Vec::new();
+        for (k, &alpha) in sub.alphas.iter().enumerate() {
+            if alpha > eps {
+                sv_data.push(tr_data[k].clone());
+                sv_coefs.push(alpha * tr_labels[k]);
+            }
+        }
+
+        // Score the held-out fold; store in libsvm sign (negate ferrolearn).
+        for j in begin..end {
+            let dec_ferro = sub_decision_value(&sv_data, &sv_coefs, sub.bias, kernel, &sub_data[j]);
+            dec_values[j] = -dec_ferro;
+        }
+    }
+
+    // libsvm labels for sigmoid_train: +1 = lower-index class_neg, matching
+    // the libsvm-sign decision values (so `-sub_labels`).
+    let libsvm_labels: Vec<F> = sub_labels.iter().map(|&lab| -lab).collect();
+    sigmoid_train(&dec_values, &libsvm_labels)
+}
+
+// ---------------------------------------------------------------------------
 // decision_function shape + scores
 // ---------------------------------------------------------------------------
 
@@ -872,6 +1238,31 @@ pub struct SVC<F, K> {
     /// `C·class_weight_[a]`; the weights are computed ONCE over the full `y`
     /// by [`compute_class_weight`] (`_base.py:740`).
     pub class_weight: ClassWeight<F>,
+    /// Whether to enable Platt-scaling probability estimates
+    /// (`probability`, `sklearn/svm/_classes.py`, default `False`).
+    ///
+    /// When `true`, [`Fit::fit`] runs an internal 5-fold cross-validation per
+    /// one-vs-one pair, fits a sigmoid `1/(1+exp(A·f+B))` over the out-of-fold
+    /// decision values ([`sigmoid_train`], libsvm `svm_binary_svc_probability`,
+    /// `svm.cpp:2107-2203`), and stores the per-pair `(A, B)` so
+    /// [`FittedSVC::predict_proba`]/[`FittedSVC::predict_log_proba`] are
+    /// available. When `false` (the default) `predict_proba` returns an error
+    /// (`_base.py:820-827`).
+    ///
+    /// **RNG boundary (documented divergence).** libsvm's
+    /// `svm_binary_svc_probability` shuffles the CV fold assignment with an
+    /// RNG seeded by `random_state`, so sklearn's `probA_`/`probB_` (and hence
+    /// the exact `predict_proba` values) are NON-DETERMINISTIC across
+    /// `random_state` — the docstring itself warns "the results can be slightly
+    /// different than those obtained by predict". ferrolearn instead uses a
+    /// DETERMINISTIC 5-fold split (contiguous folds, no RNG shuffle), so it
+    /// CANNOT and DOES NOT bit-match sklearn's `predict_proba` values. What is
+    /// reproduced exactly is the DETERMINISTIC machinery ([`sigmoid_train`],
+    /// [`sigmoid_predict`], [`multiclass_probability`]) and the STRUCTURAL
+    /// contract (rows sum to 1, entries in `[0, 1]`, monotone in the binary
+    /// decision value, the raise-when-`probability=false`). This is analogous
+    /// to the SGD shuffle boundary already documented in this codebase.
+    pub probability: bool,
 }
 
 impl<F: Float, K: Kernel<F>> SVC<F, K> {
@@ -881,7 +1272,7 @@ impl<F: Float, K: Kernel<F>> SVC<F, K> {
     /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 0` (= sklearn `-1`, no
     /// iteration limit), `cache_size = 200`, `shrinking = true`,
     /// `decision_function_shape = Ovr`, `break_ties = false`,
-    /// `class_weight = None`.
+    /// `class_weight = None`, `probability = false`.
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
@@ -894,7 +1285,24 @@ impl<F: Float, K: Kernel<F>> SVC<F, K> {
             decision_function_shape: SvmDecisionShape::Ovr,
             break_ties: false,
             class_weight: ClassWeight::None,
+            probability: false,
         }
+    }
+
+    /// Enable/disable Platt-scaling probability estimates (`sklearn`
+    /// `probability`, default `false`). When `true`, [`Fit::fit`] runs the
+    /// internal per-pair 5-fold CV + [`sigmoid_train`] so
+    /// [`FittedSVC::predict_proba`]/[`FittedSVC::predict_log_proba`] are
+    /// available; when `false` they return an error.
+    ///
+    /// See the [`SVC::probability`] field doc for the documented RNG-CV
+    /// exact-value boundary (sklearn is non-deterministic across
+    /// `random_state`; only the deterministic machinery + structural
+    /// invariants + the raise contract are reproduced).
+    #[must_use]
+    pub fn with_probability(mut self, probability: bool) -> Self {
+        self.probability = probability;
+        self
     }
 
     /// Set the per-class `C` scaling (`sklearn` `class_weight`,
@@ -1014,6 +1422,17 @@ pub struct FittedSVC<F, K> {
     /// The `break_ties` flag carried over from the unfitted [`SVC`]
     /// (`sklearn/svm/_base.py:801-814`).
     break_ties: bool,
+    /// Whether probability estimates were fitted (`probability`,
+    /// `sklearn/svm/_classes.py`). When `false`, [`Self::predict_proba`]
+    /// returns an error (`_base.py:820-827`).
+    probability: bool,
+    /// Per-ovo-pair Platt sigmoid `A` parameter (`probA_`,
+    /// `sklearn/svm/src/libsvm/svm.cpp:2200` via `sigmoid_train`), parallel to
+    /// `binary_models`. Empty when `probability == false`.
+    prob_a: Vec<F>,
+    /// Per-ovo-pair Platt sigmoid `B` parameter (`probB_`), parallel to
+    /// `binary_models`. Empty when `probability == false`.
+    prob_b: Vec<F>,
 }
 
 impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
@@ -1144,6 +1563,99 @@ impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
                 Ok(SvmScores::Multiclass(self.ovr_decision_function(&raw_ovo)))
             }
         }
+    }
+
+    /// Class probability estimates, shape `(n_samples, n_classes)`; columns
+    /// correspond to `classes_` in sorted order
+    /// (`sklearn/svm/_base.py:829-864`, `libsvm.predict_probability`,
+    /// `svm.cpp:2918-2955`).
+    ///
+    /// Built from the per-pair Platt sigmoids fitted at `fit` time when
+    /// `probability=true`: the raw one-vs-one decision values (libsvm sign,
+    /// lower-index class `+1`) are mapped to pairwise probabilities via
+    /// [`sigmoid_predict`] (clamped to `[1e-7, 1-1e-7]`, `svm.cpp:2929-2938`),
+    /// then coupled by [`multiclass_probability`] (Wu-Lin-Weng 2004,
+    /// `svm.cpp:2941`). For the binary case `multiclass_probability` reduces to
+    /// `[sigmoid_predict(dec), 1 - sigmoid_predict(dec)]` =
+    /// `[P(classes_[0]), P(classes_[1])]`. Each row sums to 1.
+    ///
+    /// **RNG-CV exact-value boundary (documented divergence).** Because the
+    /// underlying `(A, B)` come from a cross-validation whose fold assignment
+    /// is RNG-dependent in libsvm/sklearn (sklearn's `probA_`/`probB_` and
+    /// `predict_proba` values change with `random_state`), ferrolearn uses a
+    /// DETERMINISTIC contiguous 5-fold split instead and therefore does NOT
+    /// bit-match sklearn's `predict_proba` values. The reproduced contract is
+    /// structural: rows sum to 1, entries in `[0, 1]`, and (binary) the
+    /// `classes_[1]` column is monotone non-decreasing in the
+    /// `decision_function` value. See [`SVC::probability`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when the model was fitted with
+    /// `probability=false`, with the message mirroring sklearn's
+    /// `NotFittedError` text "predict_proba is not available when fitted with
+    /// probability=False" (`_base.py:856-860`). (This crate has no `NotFitted`
+    /// variant — predict-before-fit is a compile error via the typestate,
+    /// R-DEV-4 — so the "fitted-without-probability" runtime condition maps to
+    /// `InvalidParameter`; the binding maps it to the matching `PyErr`.)
+    pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        if !self.probability {
+            return Err(FerroError::InvalidParameter {
+                name: "probability".into(),
+                reason: "predict_proba is not available when fitted with probability=False".into(),
+            });
+        }
+
+        let raw_ovo = self.raw_ovo(x);
+        let n_samples = raw_ovo.nrows();
+        let n_classes = self.classes.len();
+        let min_prob = F::from(1e-7).unwrap_or_else(F::epsilon);
+        let max_prob = F::one() - min_prob;
+
+        let mut out = Array2::<F>::zeros((n_samples, n_classes));
+
+        for s in 0..n_samples {
+            // Build the k×k pairwise probability matrix for this sample.
+            let mut pairwise = Array2::<F>::zeros((n_classes, n_classes));
+            let mut k = 0usize;
+            for i in 0..n_classes {
+                for j in (i + 1)..n_classes {
+                    // dec_values[k] is the raw ovo value (libsvm sign: positive
+                    // favors the lower-index class i = classes_[i]).
+                    let dec = raw_ovo[[s, k]];
+                    let (a, b) = (self.prob_a[k], self.prob_b[k]);
+                    let mut pij = sigmoid_predict(dec, a, b);
+                    // Clamp to [min_prob, 1-min_prob] (`svm.cpp:2937`).
+                    if pij < min_prob {
+                        pij = min_prob;
+                    }
+                    if pij > max_prob {
+                        pij = max_prob;
+                    }
+                    pairwise[[i, j]] = pij;
+                    pairwise[[j, i]] = F::one() - pij;
+                    k += 1;
+                }
+            }
+            let probs = multiclass_probability(n_classes, &pairwise);
+            for (c, &pc) in probs.iter().enumerate() {
+                out[[s, c]] = pc;
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Natural-log class probability estimates, shape `(n_samples, n_classes)`
+    /// = `predict_proba(x).ln()` elementwise (`sklearn/svm/_base.py:866-894`:
+    /// `np.log(self.predict_proba(X))`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::NotFitted`] when the model was fitted with
+    /// `probability=false` (delegated from [`Self::predict_proba`]).
+    pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        self.predict_proba(x).map(|p| p.mapv(F::ln))
     }
 }
 
@@ -1404,6 +1916,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         // One-vs-one: train one binary SVM per pair.
         let n_classes = classes.len();
         let mut binary_models = Vec::new();
+        // Per-pair Platt sigmoid params (only filled when `probability`).
+        let mut prob_a: Vec<F> = Vec::new();
+        let mut prob_b: Vec<F> = Vec::new();
 
         for ci in 0..n_classes {
             for cj in (ci + 1)..n_classes {
@@ -1464,6 +1979,22 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                     }
                 }
 
+                // Platt-scaling CV for this ovo pair (only when probability).
+                if self.probability {
+                    let (a, b) = platt_cv_sigmoid(
+                        &sub_data,
+                        &sub_labels,
+                        &kernel,
+                        cp,
+                        cn,
+                        self.tol,
+                        self.max_iter,
+                        self.cache_size,
+                    );
+                    prob_a.push(a);
+                    prob_b.push(b);
+                }
+
                 binary_models.push(BinarySvm {
                     support_vectors: sv_data,
                     sv_indices: sv_idx,
@@ -1483,6 +2014,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             y_train: y.to_vec(),
             decision_function_shape: self.decision_function_shape,
             break_ties: self.break_ties,
+            probability: self.probability,
+            prob_a,
+            prob_b,
         })
     }
 }
@@ -2932,6 +3466,190 @@ mod tests {
             "None intercept {none_int} must differ from balanced {bal_int}"
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-9 smoke tests: probability / predict_proba (Platt scaling).
+    //
+    // These pin the DETERMINISTIC contract + STRUCTURAL invariants only, NOT
+    // exact probA/probB or predict_proba values. sklearn's predict_proba is
+    // RNG-CV-dependent (probA_ = -0.7749 at random_state=0 vs -1.0541 at
+    // random_state=1 on the binary set), so exact values are NOT a stable
+    // oracle (R-CHAR-3: the asserted invariants are sklearn's DOCUMENTED
+    // contract — `_base.py:829-864` "columns correspond to classes_ in sorted
+    // order", `predict_proba` rows are a probability distribution — never
+    // copied from the ferrolearn side).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_svc_predict_proba_raises_when_probability_false() -> TestResult {
+        // probability=false (default): predict_proba/predict_log_proba error,
+        // mirroring sklearn's raise (`_base.py:820-827`/`856-860`).
+        let m = binary_fit()?; // default probability=false
+        let x = Array2::from_shape_vec((1, 2), vec![3.0, 3.0]).map_err(|_| err("shape"))?;
+        assert!(m.predict_proba(&x).is_err());
+        assert!(m.predict_log_proba(&x).is_err());
+        Ok(())
+    }
+
+    fn proba_binary_fit() -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let x = Array2::from_shape_vec(
+            (10, 2),
+            vec![
+                1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.5, 1.5, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0,
+                6.0, 6.0, 5.5, 5.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 0, 0, 1, 1, 1, 1, 1];
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .with_probability(true)
+            .fit(&x, &y)
+    }
+
+    #[test]
+    fn test_svc_predict_proba_binary_rows_sum_to_one() -> TestResult {
+        let m = proba_binary_fit()?;
+        let x = Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 1.5, 1.5, 5.0, 5.0, 5.5, 5.5])
+            .map_err(|_| err("shape"))?;
+        let p = m.predict_proba(&x)?;
+        assert_eq!(p.dim(), (4, 2));
+        for s in 0..4 {
+            let row_sum = p[[s, 0]] + p[[s, 1]];
+            assert!((row_sum - 1.0).abs() < 1e-9, "row {s} sums to {row_sum}");
+            for c in 0..2 {
+                assert!(
+                    p[[s, c]] >= 0.0 && p[[s, c]] <= 1.0,
+                    "p[{s},{c}] = {} out of [0,1]",
+                    p[[s, c]]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_predict_proba_binary_monotone_in_decision() -> TestResult {
+        // STRUCTURAL invariant: P(classes_[1]) is monotone non-decreasing in
+        // the (binary) decision_function value (higher decision -> higher
+        // P(class_1)), per the sigmoid `1/(1+exp(A f + B))` contract.
+        let m = proba_binary_fit()?;
+        // A grid of query points sweeping from the class-0 to the class-1 side.
+        let x = Array2::from_shape_vec(
+            (5, 2),
+            vec![1.0, 1.0, 2.5, 2.5, 3.5, 3.5, 4.5, 4.5, 6.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let p = m.predict_proba(&x)?;
+        let df = m.decision_function(&x)?;
+        let bin = df.as_binary().ok_or_else(|| err("binary"))?;
+
+        // Sort sample indices by decision value, then P(class_1) must be
+        // non-decreasing along that order.
+        let mut order: Vec<usize> = (0..5).collect();
+        order.sort_by(|&a, &b| {
+            bin[a]
+                .partial_cmp(&bin[b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut prev = f64::NEG_INFINITY;
+        for &s in &order {
+            let p1 = p[[s, 1]];
+            assert!(
+                p1 >= prev - 1e-9,
+                "P(class_1) not monotone in decision: sample {s} df={} p1={p1} prev={prev}",
+                bin[s]
+            );
+            prev = p1;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_predict_log_proba_equals_log_of_proba() -> TestResult {
+        let m = proba_binary_fit()?;
+        let x = Array2::from_shape_vec((3, 2), vec![1.0, 1.0, 3.5, 3.5, 6.0, 6.0])
+            .map_err(|_| err("shape"))?;
+        let p = m.predict_proba(&x)?;
+        let lp = m.predict_log_proba(&x)?;
+        assert_eq!(lp.dim(), p.dim());
+        for s in 0..3 {
+            for c in 0..2 {
+                assert_relative_eq!(lp[[s, c]], p[[s, c]].ln(), epsilon = 1e-12);
+            }
+        }
+        Ok(())
+    }
+
+    fn proba_multiclass_fit() -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let x = Array2::from_shape_vec(
+            (9, 2),
+            vec![
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0,
+                0.0, 5.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .with_probability(true)
+            .fit(&x, &y)
+    }
+
+    #[test]
+    fn test_svc_predict_proba_multiclass_rows_sum_to_one() -> TestResult {
+        // 3-class: predict_proba is (n, 3), each row a probability
+        // distribution (Wu-Lin-Weng coupling, `svm.cpp:2941`).
+        let m = proba_multiclass_fit()?;
+        let x = Array2::from_shape_vec((3, 2), vec![0.25, 0.25, 5.0, 0.25, 0.25, 5.0])
+            .map_err(|_| err("shape"))?;
+        let p = m.predict_proba(&x)?;
+        assert_eq!(p.dim(), (3, 3));
+        for s in 0..3 {
+            let row_sum: f64 = (0..3).map(|c| p[[s, c]]).sum();
+            assert!((row_sum - 1.0).abs() < 1e-9, "row {s} sums to {row_sum}");
+            for c in 0..3 {
+                assert!(
+                    p[[s, c]] >= 0.0 && p[[s, c]] <= 1.0,
+                    "p[{s},{c}] = {} out of [0,1]",
+                    p[[s, c]]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_sigmoid_predict_overflow_safe() {
+        // sigmoid_predict matches `1/(1+exp(A f + B))` and is overflow-safe at
+        // extreme decision values (`svm.cpp:2032-2040`).
+        let a = -1.0f64;
+        let b = 0.0;
+        // f large positive -> fApB = -f large negative -> p -> 1.
+        let p_pos = sigmoid_predict(1000.0, a, b);
+        assert!(p_pos.is_finite() && (p_pos - 1.0).abs() < 1e-6);
+        // f large negative -> p -> 0.
+        let p_neg = sigmoid_predict(-1000.0, a, b);
+        assert!(p_neg.is_finite() && p_neg.abs() < 1e-6);
+        // f = 0 -> 1/(1+exp(0)) = 0.5.
+        assert_relative_eq!(sigmoid_predict(0.0, a, b), 0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_multiclass_probability_binary_reduces_to_pairwise() {
+        // For k=2 the Wu-Lin-Weng coupling reduces to [r01, 1-r01].
+        let mut r = Array2::<f64>::zeros((2, 2));
+        r[[0, 1]] = 0.7;
+        r[[1, 0]] = 0.3;
+        let p = multiclass_probability(2, &r);
+        assert_relative_eq!(p[0], 0.7, epsilon = 1e-6);
+        assert_relative_eq!(p[1], 0.3, epsilon = 1e-6);
     }
 
     /// `compute_class_weight` matches `sklearn.utils.compute_class_weight`

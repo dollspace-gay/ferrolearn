@@ -146,7 +146,25 @@ Live oracle (linear, 6×1, `C=100`, `epsilon=0.1`): `support_ [0,5]`,
 `probability=True` runs internal 5-fold CV to fit a sigmoid `1/(1+exp(Af+B))`
 (`_probA`/`_probB`), enabling `predict_proba`/`predict_log_proba`. With
 `probability=False` (default) `predict_proba` raises `AttributeError`
-(`_check_proba`, `_base.py:820-827`). ferrolearn has no probability path.
+(`_check_proba`, `_base.py:820-827`); when fitted without probability it also
+raises `NotFittedError` "predict_proba is not available when fitted with
+probability=False" (`_base.py:856-860`). The CV decision values feed
+`sigmoid_train` (`svm.cpp:1919`); `sigmoid_predict` (`svm.cpp:2032`) maps a
+decision to a pairwise probability; the multiclass class probabilities come
+from the Wu-Lin-Weng (2004) coupling `multiclass_probability` (`svm.cpp:2043`)
+over the pairwise matrix (clamped to `[1e-7, 1-1e-7]`, `svm.cpp:2937`).
+
+**RNG-CV exact-value boundary.** libsvm's `svm_binary_svc_probability`
+(`svm.cpp:2107-2203`) shuffles the CV fold assignment with an RNG seeded by
+`random_state` (`svm.cpp:2116-2122`), so sklearn's `probA_`/`probB_` — and
+therefore the exact `predict_proba` values — are **non-deterministic** across
+`random_state` (verified: `probA_` = -0.7749 at `random_state=0` vs -1.0541 at
+`random_state=1`), a fact the docstring itself admits. ferrolearn is now on the
+probability path with a **deterministic** contiguous 5-fold split (no RNG
+shuffle), analogous to the documented SGD shuffle boundary: it reproduces the
+deterministic machinery (`sigmoid_train`/`sigmoid_predict`/
+`multiclass_probability`) and the structural contract exactly, but CANNOT and
+DOES NOT bit-match sklearn's `predict_proba` values.
 
 ## ferrolearn (what exists)
 
@@ -298,7 +316,11 @@ ScalarOperand} in svm.rs`), not ferray (R-SUBSTRATE).
   `shrinking=True`, `cache_size=200`, `class_weight=None`, `max_iter=-1`,
   `decision_function_shape='ovr'`, `break_ties=False`; `SVR` adds `epsilon=0.1`.
 - AC-9 (REQ-9): `SVC(probability=True)` exposes `predict_proba` summing to 1 per
-  row matching the oracle; `probability=False` → `predict_proba` raises.
+  row with entries in `[0,1]` (and binary `P(class_1)` monotone in the decision
+  value, `predict_log_proba == predict_proba.ln()`); `probability=False` →
+  `predict_proba` raises. The exact `predict_proba` VALUES are NOT asserted
+  against the oracle (RNG-CV boundary: sklearn is non-deterministic across
+  `random_state`; ferrolearn's deterministic 5-fold split diverges by design).
 - AC-10 (REQ-10): `svm.rs` owns its computation on `ferray-core` arrays, not
   `ndarray`.
 
@@ -362,7 +384,7 @@ converge to the right α yet still fail parity because of these):
 | REQ-6 (epsilon-SVR) | NOT-STARTED | open prereq blocker #639. `fn smo_svr in svm.rs` reformulates the epsilon-SVR `2n`-variable dual (`α`/`α*`, prediction coef `α*−α`) and *appears* correct, but `FittedSVR` exposes no `support_`/`dual_coef_ (1,n_SV)`/`intercept_` accessors and no oracle pins the fit. Live oracle target (linear 6×1, `C=100,epsilon=0.1`): `support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]`, `predict ≈ [2.1,4.06,6.02,7.98,9.94,11.9]`. |
 | REQ-7 (multiclass one-vs-one) | NOT-STARTED | open prereq blocker #640. `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair (ovo) and sets `classes` = sort+dedup (= `np.unique(y)`) — structurally matching libsvm. But per-pair `dual_coef_`/`intercept_` are unverified and unexposed (REQ-3); no oracle pin of the 3-class `(2,6)` `dual_coef_` / 3 `intercept_` exists. Gated on #635/#636. |
 | REQ-8 (constructor params/defaults) | SHIPPED | `shrinking` (`SVC`/`SVR`, `pub shrinking: bool` default `true`, `with_shrinking`) — accepted for API parity but DOES NOT alter the converged optimum (ferrolearn's SMO has no shrinking heuristic; the optimum is shrinking-invariant, R-DEV-7, `_base.py:339`); `break_ties` (`SVC`, `pub break_ties: bool` default `false`, `with_break_ties`) with the `BaseSVC.predict` semantics in `fn predict in svm.rs` (when `break_ties=true` AND `SvmDecisionShape::Ovr` AND `n_classes>2`, `predict=argmax(decision_function)`; `InvalidParameter` for the `break_ties=true`+`Ovo` combo, `_base.py:801-814`); default alignment `cache_size=200` (was 1024) and `max_iter=0` = sklearn `-1` (no iteration limit — the `smo_binary`/`smo_svr` loops treat `0` as run-to-convergence; non-zero caps the count); REQ-1's three-way `gamma` enum default `'scale'`; and **`class_weight`** (`SVC`, `pub class_weight: ClassWeight<F>` default `None`, `with_class_weight`). The local `pub enum ClassWeight<F>{None,Balanced,Explicit}` + `fn compute_class_weight in svm.rs` mirror `sklearn.utils.compute_class_weight` as called by `BaseSVC._validate_targets` (`class_weight_ = compute_class_weight(self.class_weight, classes=cls, y=y_)`, `_base.py:740`): `None`→1.0, `Balanced`→`n_samples/(n_classes·count_c)` (the balanced formula `n_samples/(n_classes·np.bincount(y))`, `_classes.py:122-124`), `Explicit`→1.0 default overridden by `(label,weight)` map. `fn smo_binary in svm.rs` was generalized to take per-class box bounds `(cp, cn)` — the `y=+1` (class_pos) and `y=-1` (class_neg) upper bounds — instead of a scalar `c`, applied in the WSS `in_up`/`in_low` tests, the analytic-update box clip `[max(0,…),min(C_j,…)]` (distinct `C_i`,`C_j`), and the free-SV bias recovery (`0<alpha_i<C_i`); `cp==cn` reproduces the no-class-weight math exactly. `fn fit in svm.rs` (SVC) computes `weights` ONCE over the full `y` then per ovo pair `(ci,cj)`: `cp=C·weights[cj]`, `cn=C·weights[ci]` (libsvm `weighted_C`, `_base.py:740`). Pinned by `test_svc_class_weight_smoke in svm.rs` (live oracle on `X=[[0,0],[1,0],[0,1],[1,1],[0.5,0.5],[1.5,0.5],[2,2],[2.5,2.5]]`,`y=[0,0,0,0,0,1,1,1]`,`SVC(kernel='linear',C=1.0)`: None `dual_coef_ [[-0.5,-1,1,0.5]]`/`intercept_ [-2.0]`/`support_ [1,3,5,6]`; balanced `[[-0.8,-0.8,1.3333,0.2667]]`/`-1.6667` weights `[0.8,1.3333]`; `{0:1,1:5}` `support_ [1,3,4,5]`/`-2.0`; None≠balanced intercept; R-CHAR-3, 1e-2) + `test_compute_class_weight_balanced in svm.rs` + `test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs`. Non-test consumer: the production `fn fit in svm.rs` consumes `self.class_weight` (the `SVC`/`FittedSVC` boundary types are re-exported at the crate root + consumed by `nu_svm.rs`). `kernel` (string-select), `degree`, `coef0` are a documented **R-DEV-7 design difference** — the kernel and its `degree`/`coef0` are the type parameter `K`, set by construction (`SVC::new(PolynomialKernel { degree, coef0, gamma })`), not a string + scalar pair; the observable contract (the kernel formula evaluated with those values) is preserved. `random_state` is unused (ferrolearn's SMO is deterministic, no libsvm shuffle seed). `class_weight` is SVC-only (sklearn SVR has none). |
-| REQ-9 (probability / predict_proba) | NOT-STARTED | open prereq blocker #642. No `probability` field, no Platt-scaling CV (`_probA`/`_probB`), no `predict_proba`/`predict_log_proba`, no `AttributeError`-when-`probability=False` path (`_base.py:820-925`). Entirely absent. |
+| REQ-9 (probability / predict_proba) | SHIPPED | `SVC` gains `pub probability: bool` (default `false`, `fn with_probability in svm.rs`); `FittedSVC` carries `probability`/`prob_a`/`prob_b` (per-ovo-pair Platt `(A,B)`). The deterministic Platt machinery is a faithful libsvm transcription: `fn sigmoid_train in svm.rs` (prior-init Newton iteration + target smoothing + regularized Hessian + step-halving line search, `svm.cpp:1919-2030`), `fn sigmoid_predict in svm.rs` (overflow-safe `1/(1+exp(Af+B))`, `svm.cpp:2032-2040`), `fn multiclass_probability in svm.rs` (Wu-Lin-Weng 2004 coupling, `svm.cpp:2043-2104`). `fn platt_cv_sigmoid in svm.rs` runs a per-pair 5-fold CV at fit time (`fn fit in svm.rs`, SVC, when `probability=true`) mirroring `svm_binary_svc_probability` (`svm.cpp:2107-2203`) with the degenerate-fold fallbacks. `FittedSVC::predict_proba in svm.rs` -> pairwise `sigmoid_predict` (clamped `[1e-7,1-1e-7]`, `svm.cpp:2937`) -> `multiclass_probability` -> `(n,n_classes)`, rows sum to 1; binary -> `[P(classes_[0]),P(classes_[1])]`. `FittedSVC::predict_log_proba in svm.rs` = `predict_proba.ln()` (`_base.py:866-894`). `probability=false` -> `InvalidParameter` with sklearn's `NotFittedError` text (`_base.py:856-860`). **RNG-CV exact-value boundary (documented):** libsvm's CV fold permutation is RNG-seeded, so sklearn's `probA_`/`probB_`/`predict_proba` are non-deterministic across `random_state` (`probA_`=-0.7749 at rs=0 vs -1.0541 at rs=1); ferrolearn uses a DETERMINISTIC contiguous 5-fold split, so the exact values are NOT pinned — only the deterministic machinery + structural invariants (rows sum to 1, entries in `[0,1]`, binary `P(class_1)` monotone in `decision_function`, `predict_log_proba == predict_proba.ln()`) + the raise contract are verified (R-CHAR-3: sklearn's documented contract, not copied values). Non-test consumer: `fn fit in svm.rs` consumes `self.probability`. Pinned by `test_svc_predict_proba_raises_when_probability_false`/`test_svc_predict_proba_binary_rows_sum_to_one`/`test_svc_predict_proba_binary_monotone_in_decision`/`test_svc_predict_log_proba_equals_log_of_proba`/`test_svc_predict_proba_multiclass_rows_sum_to_one`/`test_sigmoid_predict_overflow_safe`/`test_multiclass_probability_binary_reduces_to_pairwise in svm.rs`. |
 | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}` and computes on `ndarray`/`Vec<Vec<F>>`, not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). Consistent with the crate-wide deferral (cf. `linear_svc.md` REQ-12). |
 
 ## Verification
@@ -486,6 +508,14 @@ green; all ten REQs are currently NOT-STARTED.
 - **#642** — REQ-9 of svm: add `probability` (Platt-scaling internal-CV sigmoid,
   `_probA`/`_probB`) with `predict_proba`/`predict_log_proba` and the
   `AttributeError`-when-`probability=False` contract (`_base.py:820-925`).
+  **CLOSED** — REQ-9 SHIPPED: `probability` field + `with_probability`;
+  `sigmoid_train`/`sigmoid_predict`/`multiclass_probability` (libsvm
+  `svm.cpp:1919-2104`) + `platt_cv_sigmoid` (deterministic 5-fold CV,
+  `svm.cpp:2107-2203`); `predict_proba`/`predict_log_proba`; the raise contract.
+  The exact `predict_proba` values are NOT pinned — sklearn is RNG-CV
+  non-deterministic across `random_state`; ferrolearn's deterministic 5-fold
+  split (documented divergence) verifies the machinery + structural invariants
+  + raise only.
 - **#643** — REQ-10 of svm: migrate `svm.rs` off `ndarray` onto the ferray
   substrate (`ferray-core` arrays, ferray kernel/linear-algebra ops) per
   R-SUBSTRATE.
