@@ -56,7 +56,7 @@
 //! | REQ-6 (constant + invscaling schedules) | SHIPPED | `fn compute_lr`: `Constant => eta0`, `InvScaling => eta0 / t^power_t` (`_sgd_fast.pyx.tp:479,593-594`). Consumer: per-step in `fn train_binary_sgd`/`train_regressor_sgd`. Tests: `test_constant_lr`, `test_invscaling_lr`. |
 //! | REQ-7 (optimal schedule t0 offset) | SHIPPED | `fn compute_lr` Optimal arm now `1/(alpha*(optimal_init + t - 1))` with `optimal_init` from `fn optimal_init` (`typw=sqrt(1/sqrt(alpha))`, `e0=typw/max(1,|gradient(1,-typw)|)`, `optimal_init=1/(e0*alpha)`), mirroring `_sgd_fast.pyx.tp:565-570,592`. Computed once per fit before the epoch loop. Consumer: `fn train_*_sgd`. Tests: `test_optimal_lr`, `test_optimal_init_matches_oracle`, divergence `sgd_optimal_schedule_t0_offset`. Closed #527. |
 //! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) divides `current_eta` by 5 (not 2) when `no_improve_count >= n_iter_no_change` AND the schedule is `Adaptive` AND `eta > 1e-6`, resetting the count — the SAME `best_loss`/`sumloss > best_loss - tol*n` machinery as convergence (`_sgd_fast.pyx.tp:697-707`). The old `>= prev_loss` 5-epoch `/2` trigger is deleted. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_adaptive_schedule_divisor` (live oracle coef `[0.8065190275590332, 0.15336844797680402]` intercept `0.12731338963662575`, n_iter_ 80). Closes #528. |
-//! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`fit_intercept`, `epsilon`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. (`penalty`/`l1_ratio` shipped under REQ-5; `shuffle` under REQ-12; `n_iter_no_change` folded into REQ-10.) |
+//! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. `epsilon` is validated to `[0, inf)` in `fn validate_reg_params` (`RegressorLoss::{Huber,EpsilonInsensitive,SquaredEpsilonInsensitive}(e)` reject `e < 0` with `FerroError::InvalidParameter { name: "epsilon" }`, mirroring `_stochastic_gradient.py:2024` `"epsilon": [Interval(Real, 0, None, closed="left")]`; test `sgd_epsilon_negative_rejected`, closes #544). Remaining missing fields (`fit_intercept`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. (`penalty`/`l1_ratio` shipped under REQ-5; `shuffle` under REQ-12; `n_iter_no_change` folded into REQ-10.) |
 //! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) tracks `best_loss` (running min, init `+inf`) and increments `no_improve_count` when `tol_active && sumloss > best_loss - tol*n_samples`, resetting otherwise; breaks once `no_improve_count >= hyper.n_iter_no_change` (non-adaptive), exactly mirroring `_sgd_fast.pyx.tp:688-707`. `sumloss` is now the SUM of per-sample losses over the epoch (the `/= n_samples` mean division is removed, `_sgd_fast.pyx.tp:597`); `tol_active = hyper.tol > -inf` encodes sklearn's `tol=None -> -INFINITY` disable (`:690`). The per-sample gradient is clipped to `[-1e12, 1e12]` via `fn max_dloss` before the update (`_sgd_fast.pyx.tp:546,613-620`). `n_iter_no_change` is now a settable `pub` field (default 5) with `fn with_n_iter_no_change` on both estimators, threaded through `SGDHyper`/`clf_hyper`/`reg_hyper` (`_stochastic_gradient.py` `n_iter_no_change=5`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_convergence_n_iter_no_change` (live oracle coef `[0.8037686404055491, 0.16059017315681692]` intercept `0.12903834217696583`, n_iter_ 49). Closes #530. |
 //! | REQ-11 (fit_intercept) | SHIPPED | `pub fit_intercept: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_fit_intercept` builders (default `true`, sklearn `_stochastic_gradient.py` `fit_intercept=True`, constraint `["boolean"]` at `:86`), threaded through `SGDHyper.fit_intercept` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the intercept update: `if hyper.fit_intercept { *intercept = *intercept - eta * grad; }`, mirroring `if fit_intercept == 1: intercept_update = update; ... intercept += intercept_update * intercept_decay` (`_sgd_fast.pyx.tp:639-644`, `intercept_decay=1` on the standard path). When `false` the intercept is never modified and stays at its init value `0` (`b = F::zero()` before training in `fn fit_ova`/regressor `Fit::fit`), so `coef_` matches sklearn and `intercept_` is exactly `0`. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_fit_intercept_false` (live oracle coef `[0.5326796739094939, 0.44573604649819804]`, intercept exactly `0.0`). Closes #531. |
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
@@ -1939,6 +1939,7 @@ fn validate_reg_params<F: Float>(
     eta0: F,
     alpha: F,
     l1_ratio: F,
+    loss: &RegressorLoss<F>,
 ) -> Result<(), FerroError> {
     let n_samples = x.nrows();
     if n_samples != y.len() {
@@ -1973,6 +1974,26 @@ fn validate_reg_params<F: Float>(
             reason: "must be in the range [0, 1]".into(),
         });
     }
+    // sklearn `_stochastic_gradient.py:2024`:
+    // `"epsilon": [Interval(Real, 0, None, closed="left")]` — epsilon must be
+    // `>= 0` (a negative epsilon raises `InvalidParameterError`). ferrolearn
+    // carries epsilon inside the loss variant, so the faithful equivalent is to
+    // reject a negative epsilon on the variants that have one (SquaredError has
+    // none, boundary 0 is valid — closed-left).
+    let epsilon = match loss {
+        RegressorLoss::Huber(e)
+        | RegressorLoss::EpsilonInsensitive(e)
+        | RegressorLoss::SquaredEpsilonInsensitive(e) => Some(*e),
+        RegressorLoss::SquaredError => None,
+    };
+    if let Some(e) = epsilon
+        && e < F::zero()
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "epsilon".into(),
+            reason: "must be in the range [0, inf)".into(),
+        });
+    }
     Ok(())
 }
 
@@ -1998,6 +2019,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             self.eta0,
             self.alpha,
             self.l1_ratio,
+            &self.loss,
         )?;
 
         let n_features = x.ncols();
@@ -2123,6 +2145,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             self.eta0,
             self.alpha,
             self.l1_ratio,
+            &self.loss,
         )?;
 
         let n_features = x.ncols();

@@ -1038,3 +1038,77 @@ fn sgd_squared_epsilon_insensitive_loss() {
          coef={coef_m:?} intercept={intercept_m}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-9b / #544 (parent #522) — loss `epsilon` is NOT validated to [0, inf).
+//
+// sklearn site: `sklearn/linear_model/_stochastic_gradient.py:2024` (regressor)
+//   and `:1219` (BaseSGDRegressor):
+//     `"epsilon": [Interval(Real, 0, None, closed="left")],`
+//   This `_parameter_constraints` entry is enforced by `@_fit_context` on EVERY
+//   `.fit()`, so a negative `epsilon` raises `InvalidParameterError` (boundary 0
+//   is valid — closed="left"). Default `epsilon=0.1`.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `validate_reg_params` — the
+//   epsilon lives inside the `RegressorLoss::{Huber,EpsilonInsensitive,
+//   SquaredEpsilonInsensitive}(F)` variants; before #544 it was never range-
+//   checked, so `with_loss(RegressorLoss::EpsilonInsensitive(-0.5))` was
+//   silently accepted and `fit` returned `Ok`.
+//
+// Fully deterministic: a parameter-validation contract, no RNG / no fit
+// trajectory — `fit` either errors (sklearn) or (pre-fix) returns Ok.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "from sklearn.linear_model import SGDRegressor; import numpy as np; \
+///   SGDRegressor(loss='epsilon_insensitive', epsilon=-0.5).fit( \
+///     np.array([[1.,2.],[2.,1.]]), np.array([1.,2.]))"
+/// ```
+/// -> raises `sklearn.utils._param_validation.InvalidParameterError`
+///    ("The 'epsilon' parameter ... must be a float in the range [0.0, inf)").
+/// Same for `loss='huber'` and `loss='squared_epsilon_insensitive'` with a
+/// negative `epsilon`. A NON-negative epsilon (0.0, 0.1) fits OK (live oracle).
+#[test]
+fn sgd_epsilon_negative_rejected() {
+    let x = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 2.0, 1.0]).unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0]);
+
+    // sklearn rejects a negative epsilon on every loss that carries one.
+    for loss in [
+        RegressorLoss::EpsilonInsensitive(-0.5),
+        RegressorLoss::Huber(-0.5),
+        RegressorLoss::SquaredEpsilonInsensitive(-0.5),
+    ] {
+        let model = SGDRegressor::<f64>::new()
+            .with_loss(loss)
+            .with_learning_rate(LearningRateSchedule::Constant)
+            .with_eta0(0.1)
+            .with_max_iter(3)
+            .with_tol(-1.0)
+            .with_shuffle(false)
+            .with_random_state(0);
+        assert!(
+            model.fit(&x, &y).is_err(),
+            "epsilon=-0.5 ({loss:?}) out of [0, inf): sklearn raises \
+             InvalidParameterError, ferrolearn accepted it (fit returned Ok)"
+        );
+    }
+
+    // Boundary 0.0 is valid (closed="left") and 0.1 (the default) fits OK.
+    for eps in [0.0_f64, 0.1] {
+        let model = SGDRegressor::<f64>::new()
+            .with_loss(RegressorLoss::EpsilonInsensitive(eps))
+            .with_learning_rate(LearningRateSchedule::Constant)
+            .with_eta0(0.1)
+            .with_max_iter(3)
+            .with_tol(-1.0)
+            .with_shuffle(false)
+            .with_random_state(0);
+        assert!(
+            model.fit(&x, &y).is_ok(),
+            "epsilon={eps} is in [0, inf) (closed-left boundary 0 valid); \
+             sklearn fits OK but ferrolearn rejected it"
+        );
+    }
+}
