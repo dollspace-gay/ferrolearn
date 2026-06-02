@@ -243,6 +243,10 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: FittedNuSVC/FittedNuSVR do not re-expose support()/dual_coef()/intercept()/n_support() libsvm-layout fitted attrs (#657)
+- Divergence: NuSVR missing C parameter (sklearn/svm/_classes.py:1531 default C=1.0); ferrolearn forces C=1/(nu*n) (#656)
+- Divergence: NuSVR::predict diverges from sklearn/svm/src/libsvm/svm.cpp solve_nu_svr (nu_svm.rs delegates to epsilon-SVR) (#655)
+- Divergence: NuSVC::decision_function diverges from sklearn/svm/src/libsvm/svm.cpp solve_nu_svc (nu_svm.rs delegates to SVC C=1/(nu*n)) (#654)
 - translate(one_class_svm): REQ-6 constructor params/defaults (max_iter -1, cache_size 200, gamma/shrinking) (#651)
 - translate(one_class_svm): REQ-5 nu param + (0,1] validation pin (#650)
 - translate(one_class_svm): REQ-4 decision_function + score_samples + predict sign (#649)
