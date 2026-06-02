@@ -54,7 +54,7 @@
 //! | REQ-1 (kernels + gamma scale/auto/float) | NOT-STARTED | open #641. The four kernel formulas + `gamma='scale'` (default, `fn resolved_for_fit in svm.rs` = `1/(n_features·X.var())`) + explicit float are done and pinned (`divergence_pin2_rbf_default_scale_gamma`; #634 closed); the `'auto' = 1/n_features` variant is not yet expressible (no estimator-level gamma enum) — pending the param-surface work #641. |
 //! | REQ-2 (C-SVC SMO fit) | SHIPPED | `fn smo_binary in svm.rs` (Fan-Chen-Lin WSS) converges to libsvm's `α`; pinned by `divergence_pin5_binary_fitted_attributes in tests/divergence_svm_fit.rs` (`dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `support_ [1,2,3]`, `intercept_ [-1.8565]` vs live `SVC(kernel='linear',C=1.0)`). |
 //! | REQ-3 (fitted attrs + binary sign flip) | SHIPPED | `FittedSVC::{support,support_vectors,n_support,dual_coef,intercept,coef} in svm.rs` emit the libsvm layout with the binary sign flip (`_base.py:258-262`); `coef_` is linear-only (`_base.py:642-666`). Pinned by `divergence_pin5_*` (binary) + `divergence_pin6_multiclass_dual_coef_packing` (multiclass `(n_class-1,n_SV)` packing). |
-//! | REQ-4 (decision_function shape/sign/ovr) | NOT-STARTED | open #637. Per-sample values match (`divergence_pin1_binary_decision_function_values`) but binary `decision_function` returns `(n,1)` not sklearn's 1-D `(n,)` `-dec.ravel()`, and there is no `decision_function_shape`/`_ovr_decision_function` transform (`_base.py:538-539, 779-780`). |
+//! | REQ-4 (decision_function shape/sign/ovr) | SHIPPED | `FittedSVC::decision_function in svm.rs` returns the `SvmScores<F>` enum: binary -> `SvmScores::Binary` 1-D `(n,)` = `-raw_ovo.ravel()` (positive -> `classes_[1]`, `_base.py:538-539`); multiclass -> `SvmScores::Multiclass` `(n, n_classes)` via `fn ovr_decision_function in svm.rs` (default `SvmDecisionShape::Ovr`, transcribed from `multiclass.py:520-562`) applied to `dec<0`/`-dec` (`_base.py:780`), or raw `(n, n·(n-1)/2)` for `SvmDecisionShape::Ovo`. `SVC::decision_function_shape` field + `with_decision_function_shape`. Sign normalized: `fn raw_ovo` negates `decision_value_binary` to restore libsvm's lower-index-class-`+1` ovo convention. Pinned by `divergence_pin8_multiclass_ovr_decision_function` (ovr `(9,3)` row0 `[2.2366,0.8167,-0.1833]`, row3 `[1.0606,2.2262,-0.2333]`), `divergence_pin9_multiclass_ovo_decision_function` (ovo `(9,3)` row0 `[1.2222,1.2222,0.0]`), `divergence_pin10_binary_shape_contract` (binary 1-D `(6,)`) in `tests/divergence_svm_fit.rs` (R-CHAR-3, 1e-2). Consumer: `FittedNuSVC::decision_function in nu_svm.rs` delegates (non-test, propagates `SvmScores`). |
 //! | REQ-5 (predict + tie-break) | NOT-STARTED | open #638. `fn predict in svm.rs` ovo voting matches the oracle labels on separable sets (`divergence_pin3_predict_labels`), but vote ties use `max_by_key` (last-maximum) instead of libsvm's lower-class-index tie-break (`_base.py:814`). |
 //! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
 //! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
@@ -555,6 +555,81 @@ fn smo_binary<F: Float, K: Kernel<F>>(
 }
 
 // ---------------------------------------------------------------------------
+// decision_function shape + scores
+// ---------------------------------------------------------------------------
+
+/// The shape convention for [`FittedSVC::decision_function`] in the multiclass
+/// case, mirroring scikit-learn's `SVC.decision_function_shape`
+/// (`sklearn/svm/_base.py:778-781`).
+///
+/// - [`SvmDecisionShape::Ovr`] (default): one-vs-rest scores, shape
+///   `(n_samples, n_classes)`, produced by the `_ovr_decision_function`
+///   transform (`sklearn/utils/multiclass.py:520-562`).
+/// - [`SvmDecisionShape::Ovo`]: the raw one-vs-one decision values, shape
+///   `(n_samples, n_class·(n_class-1)/2)`.
+///
+/// The binary case is unaffected (it always collapses to a 1-D `(n_samples,)`
+/// score, `_base.py:538-539`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SvmDecisionShape {
+    /// One-vs-rest: `(n_samples, n_classes)` via `_ovr_decision_function`
+    /// (sklearn's default).
+    #[default]
+    Ovr,
+    /// One-vs-one: raw `(n_samples, n_class·(n_class-1)/2)` decision values.
+    Ovo,
+}
+
+/// The result of [`FittedSVC::decision_function`].
+///
+/// Mirrors scikit-learn's polymorphic `SVC.decision_function` return
+/// (`sklearn/svm/_base.py:536-541, 778-781`): the binary case collapses the
+/// single ovo column to a 1-D `(n_samples,)` array (`-dec.ravel()`,
+/// `_base.py:538-539`), while the multiclass case returns
+/// `(n_samples, n_classes)` (ovr, default) or
+/// `(n_samples, n·(n-1)/2)` (ovo). Structurally parallels
+/// [`crate::linear_svc::DecisionScores`] for cross-estimator consistency.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SvmScores<F> {
+    /// Binary decision values, shape `(n_samples,)`. A POSITIVE value predicts
+    /// `classes_[1]` (`-dec.ravel()`, `_base.py:538-539`).
+    Binary(Array1<F>),
+    /// Multiclass decision values: `(n_samples, n_classes)` for
+    /// [`SvmDecisionShape::Ovr`] or `(n_samples, n·(n-1)/2)` for
+    /// [`SvmDecisionShape::Ovo`].
+    Multiclass(Array2<F>),
+}
+
+impl<F: Clone> SvmScores<F> {
+    /// Number of samples scored (the leading axis length in both variants).
+    #[must_use]
+    pub fn n_samples(&self) -> usize {
+        match self {
+            SvmScores::Binary(v) => v.len(),
+            SvmScores::Multiclass(m) => m.nrows(),
+        }
+    }
+
+    /// Borrow the binary 1-D scores, if this is the binary case.
+    #[must_use]
+    pub fn as_binary(&self) -> Option<&Array1<F>> {
+        match self {
+            SvmScores::Binary(v) => Some(v),
+            SvmScores::Multiclass(_) => None,
+        }
+    }
+
+    /// Borrow the multiclass score matrix, if this is the multiclass case.
+    #[must_use]
+    pub fn as_multiclass(&self) -> Option<&Array2<F>> {
+        match self {
+            SvmScores::Multiclass(m) => Some(m),
+            SvmScores::Binary(_) => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SVC (Support Vector Classifier)
 // ---------------------------------------------------------------------------
 
@@ -579,21 +654,35 @@ pub struct SVC<F, K> {
     pub max_iter: usize,
     /// Size of the kernel evaluation LRU cache.
     pub cache_size: usize,
+    /// The multiclass `decision_function` shape convention
+    /// (`sklearn/svm/_base.py:778-781`); default
+    /// [`SvmDecisionShape::Ovr`] (sklearn's `decision_function_shape='ovr'`).
+    pub decision_function_shape: SvmDecisionShape,
 }
 
 impl<F: Float, K: Kernel<F>> SVC<F, K> {
     /// Create a new `SVC` with the given kernel and default hyperparameters.
     ///
-    /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 10000`, `cache_size = 1024`.
+    /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 10000`,
+    /// `cache_size = 1024`, `decision_function_shape = Ovr`.
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
             kernel,
             c: F::one(),
-            tol: F::from(1e-3).unwrap(),
+            tol: F::from(1e-3).unwrap_or_else(F::epsilon),
             max_iter: 10000,
             cache_size: 1024,
+            decision_function_shape: SvmDecisionShape::Ovr,
         }
+    }
+
+    /// Set the multiclass `decision_function` shape convention
+    /// (`'ovr'` default / `'ovo'`, `sklearn/svm/_base.py:778-781`).
+    #[must_use]
+    pub fn with_decision_function_shape(mut self, shape: SvmDecisionShape) -> Self {
+        self.decision_function_shape = shape;
+        self
     }
 
     /// Set the regularization parameter C.
@@ -670,6 +759,9 @@ pub struct FittedSVC<F, K> {
     /// The training labels (class index per row), retained so `support_` can
     /// be grouped by class.
     y_train: Vec<usize>,
+    /// The multiclass `decision_function` shape convention carried over from
+    /// the unfitted [`SVC`] (`sklearn/svm/_base.py:778-781`).
+    decision_function_shape: SvmDecisionShape,
 }
 
 impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
@@ -683,15 +775,16 @@ impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
         val
     }
 
-    /// Compute the raw decision function values for each sample.
+    /// Raw one-vs-one decision values in **libsvm sign convention**, shape
+    /// `(n_samples, n·(n-1)/2)`, columns in ovo pair order
+    /// `(0,1),(0,2),...,(1,2),...` (the `(ci,cj)` double loop).
     ///
-    /// For binary classification, returns a 1-column array.
-    /// For multiclass, returns one column per class pair.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the input has no columns.
-    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    /// libsvm/sklearn use the LOWER-index class as the `+1` side, so a POSITIVE
+    /// value means the lower-index class wins (`sklearn/svm/_base.py:520-524`).
+    /// This crate's [`Self::decision_value_binary`] uses the HIGHER-index class
+    /// (`class_pos`) as `+1`, the opposite sign — so the raw ovo value is the
+    /// negation of `decision_value_binary` to restore libsvm's convention.
+    fn raw_ovo(&self, x: &Array2<F>) -> Array2<F> {
         let n_samples = x.nrows();
         let n_models = self.binary_models.len();
         let mut result = Array2::<F>::zeros((n_samples, n_models));
@@ -699,11 +792,106 @@ impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
         for s in 0..n_samples {
             let xi: Vec<F> = x.row(s).to_vec();
             for (m, model) in self.binary_models.iter().enumerate() {
-                result[[s, m]] = self.decision_value_binary(&xi, model);
+                // Negate to match libsvm's "lower-index class = +1" sign.
+                result[[s, m]] = self.decision_value_binary(&xi, model).neg();
             }
         }
 
-        Ok(result)
+        result
+    }
+
+    /// The continuous one-vs-rest decision function transformed from the
+    /// one-vs-one scores, mirroring `_ovr_decision_function`
+    /// (`sklearn/utils/multiclass.py:520-562`), shape `(n_samples, n_classes)`.
+    ///
+    /// `predictions[s,k] = if raw_ovo[s,k] < 0 { 1 } else { 0 }` and
+    /// `confidences[s,k] = -raw_ovo[s,k]`, matching sklearn's call
+    /// `_ovr_decision_function(dec < 0, -dec, n_classes)`
+    /// (`sklearn/svm/_base.py:780`). The ovo pair iteration `(i,j)` with `i<j`,
+    /// `k = 0,1,...`, is the SAME order as the `raw_ovo` columns.
+    fn ovr_decision_function(&self, raw_ovo: &Array2<F>) -> Array2<F> {
+        let n_samples = raw_ovo.nrows();
+        let n_classes = self.classes.len();
+        let mut votes = Array2::<F>::zeros((n_samples, n_classes));
+        let mut sum_of_confidences = Array2::<F>::zeros((n_samples, n_classes));
+        let one = F::one();
+
+        let mut k = 0usize;
+        for i in 0..n_classes {
+            for j in (i + 1)..n_classes {
+                for s in 0..n_samples {
+                    let dec = raw_ovo[[s, k]];
+                    let confidence = dec.neg(); // -dec
+                    // sum_of_confidences[:, i] -= confidences[:, k]
+                    sum_of_confidences[[s, i]] = sum_of_confidences[[s, i]] - confidence;
+                    // sum_of_confidences[:, j] += confidences[:, k]
+                    sum_of_confidences[[s, j]] = sum_of_confidences[[s, j]] + confidence;
+                    // predictions[s,k] = (dec < 0) ? 1 : 0
+                    // votes[predictions==0, i] += 1; votes[predictions==1, j] += 1
+                    if dec < F::zero() {
+                        votes[[s, j]] = votes[[s, j]] + one;
+                    } else {
+                        votes[[s, i]] = votes[[s, i]] + one;
+                    }
+                }
+                k += 1;
+            }
+        }
+
+        // transformed = sum_of_confidences / (3 * (|sum_of_confidences| + 1))
+        // return votes + transformed.
+        let three = match F::from(3.0) {
+            Some(v) => v,
+            None => one + one + one,
+        };
+        let mut out = votes;
+        for s in 0..n_samples {
+            for c in 0..n_classes {
+                let soc = sum_of_confidences[[s, c]];
+                let transformed = soc / (three * (soc.abs() + one));
+                out[[s, c]] = out[[s, c]] + transformed;
+            }
+        }
+        out
+    }
+
+    /// The decision function for the samples in `x`
+    /// (`sklearn/svm/_base.py:536-541, 778-781`).
+    ///
+    /// - **Binary** (`n_classes == 2`): [`SvmScores::Binary`], shape
+    ///   `(n_samples,)` = `-raw_ovo.ravel()` (sklearn flips the sign for
+    ///   `c_svc`/`nu_svc` binary, `_base.py:538-539`), so a POSITIVE value
+    ///   predicts `classes_[1]`. Because this crate's `decision_value_binary`
+    ///   already uses the higher-index class as `+1`, `-raw_ovo` equals
+    ///   `decision_value_binary` directly.
+    /// - **Multiclass [`SvmDecisionShape::Ovr`]** (default):
+    ///   [`SvmScores::Multiclass`], shape `(n_samples, n_classes)` =
+    ///   `_ovr_decision_function(raw_ovo)` (`_base.py:780`).
+    /// - **Multiclass [`SvmDecisionShape::Ovo`]**: [`SvmScores::Multiclass`],
+    ///   shape `(n_samples, n·(n-1)/2)` = the raw ovo values.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Ok` for valid input.
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<SvmScores<F>, FerroError> {
+        let raw_ovo = self.raw_ovo(x);
+
+        if self.classes.len() == 2 {
+            // Binary: -raw_ovo.ravel() = +decision_value_binary (1-D).
+            let n_samples = raw_ovo.nrows();
+            let mut binary = Array1::<F>::zeros(n_samples);
+            for s in 0..n_samples {
+                binary[s] = raw_ovo[[s, 0]].neg();
+            }
+            return Ok(SvmScores::Binary(binary));
+        }
+
+        match self.decision_function_shape {
+            SvmDecisionShape::Ovo => Ok(SvmScores::Multiclass(raw_ovo)),
+            SvmDecisionShape::Ovr => {
+                Ok(SvmScores::Multiclass(self.ovr_decision_function(&raw_ovo)))
+            }
+        }
     }
 }
 
@@ -1025,6 +1213,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             classes,
             x_train: x.clone(),
             y_train: y.to_vec(),
+            decision_function_shape: self.decision_function_shape,
         })
     }
 }
@@ -1698,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn test_svc_decision_function() {
+    fn test_svc_decision_function() -> TestResult {
         let x = Array2::from_shape_vec(
             (6, 2),
             vec![
@@ -1706,25 +1895,133 @@ mod tests {
                 5.0, 5.0, 5.5, 5.0, 5.0, 5.5, // class 1
             ],
         )
-        .unwrap();
+        .map_err(|_| err("shape"))?;
         let y = array![0usize, 0, 0, 1, 1, 1];
 
         let model = SVC::new(LinearKernel).with_c(10.0);
-        let fitted = model.fit(&x, &y).unwrap();
+        let fitted = model.fit(&x, &y)?;
 
-        let df = fitted.decision_function(&x).unwrap();
-        assert_eq!(df.nrows(), 6);
-        assert_eq!(df.ncols(), 1); // One binary model for 2 classes.
+        let df = fitted.decision_function(&x)?;
+        // Binary: 1-D (n,) score (sklearn ravels the single ovo column,
+        // `_base.py:538-539`); the multiclass borrow is None.
+        assert!(df.as_multiclass().is_none());
+        let bin = df.as_binary().ok_or_else(|| err("binary 1-D"))?;
+        assert_eq!(bin.len(), 6);
 
         // Class 0 samples should have negative decision values,
-        // class 1 should have positive.
-        for i in 0..3 {
+        // class 1 should have positive (positive -> classes_[1]).
+        for (i, &v) in bin.iter().enumerate().take(3) {
+            assert!(v < 0.5, "Class 0 sample {i} has decision value {v}");
+        }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-4 smoke tests: decision_function shape + sign + ovr/ovo transform.
+    //
+    // Expected values from the LIVE sklearn 1.5.2 oracle (R-CHAR-3):
+    //
+    //   import numpy as np; from sklearn.svm import SVC
+    //   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]])
+    //   y=np.array([0,0,0,1,1,1]); m=SVC(kernel='linear',C=1.0).fit(X,y)
+    //   m.decision_function(X)  # (6,) [-1.2853,-0.9997,-0.9997,0.9995,1.2851,1.2851]
+    //
+    //   X3=[[0,0],[.5,0],[0,.5],[5,0],[5.5,0],[5,.5],[0,5],[.5,5],[0,5.5]]
+    //   y3=[0,0,0,1,1,1,2,2,2]; m3=SVC(kernel='linear',C=1.0).fit(X3,y3)
+    //   m3.decision_function(X3)            # ovr (9,3) row0 [2.2366,0.8167,-0.1833]
+    //                                       #         row3 [1.0606,2.2262,-0.2333]
+    //   SVC(...,decision_function_shape='ovo').fit(X3,y3).decision_function(X3)
+    //                                       # ovo (9,3) row0 [1.2222,1.2222,0.0]
+    // -----------------------------------------------------------------------
+
+    fn three_class_9x2() -> Result<(Array2<f64>, Array1<usize>), FerroError> {
+        let x = Array2::from_shape_vec(
+            (9, 2),
+            vec![
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0,
+                0.0, 5.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+        Ok((x, y))
+    }
+
+    #[test]
+    fn test_svc_decision_function_binary_values() -> TestResult {
+        let m = binary_fit()?;
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let df = m.decision_function(&x)?;
+        let bin = df.as_binary().ok_or_else(|| err("binary"))?;
+        assert_eq!(bin.len(), 6);
+        let oracle = [-1.2853, -0.9997, -0.9997, 0.9995, 1.2851, 1.2851];
+        for (i, &exp) in oracle.iter().enumerate() {
             assert!(
-                df[[i, 0]] < 0.0 + 0.5, // Allow some tolerance
-                "Class 0 sample {i} has decision value {}",
-                df[[i, 0]]
+                (bin[i] - exp).abs() < 1e-2,
+                "binary df[{i}] = {} vs oracle {exp}",
+                bin[i]
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_decision_function_ovr() -> TestResult {
+        let (x, y) = three_class_9x2()?;
+        let m = SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .fit(&x, &y)?;
+        let df = m.decision_function(&x)?;
+        let mc = df.as_multiclass().ok_or_else(|| err("multiclass"))?;
+        assert_eq!(mc.dim(), (9, 3));
+        // ovr (default): row0 [2.2366,0.8167,-0.1833], row3 [1.0606,2.2262,-0.2333].
+        let row0 = [2.2366, 0.8167, -0.1833];
+        let row3 = [1.0606, 2.2262, -0.2333];
+        for (c, &v) in row0.iter().enumerate() {
+            assert!(
+                (mc[[0, c]] - v).abs() < 1e-2,
+                "ovr row0[{c}] = {} vs oracle {v}",
+                mc[[0, c]]
+            );
+        }
+        for (c, &v) in row3.iter().enumerate() {
+            assert!(
+                (mc[[3, c]] - v).abs() < 1e-2,
+                "ovr row3[{c}] = {} vs oracle {v}",
+                mc[[3, c]]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_decision_function_ovo() -> TestResult {
+        let (x, y) = three_class_9x2()?;
+        let m = SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .with_decision_function_shape(SvmDecisionShape::Ovo)
+            .fit(&x, &y)?;
+        let df = m.decision_function(&x)?;
+        let mc = df.as_multiclass().ok_or_else(|| err("multiclass"))?;
+        assert_eq!(mc.dim(), (9, 3));
+        // ovo: row0 [1.2222,1.2222,0.0].
+        let row0 = [1.2222, 1.2222, 0.0];
+        for (c, &v) in row0.iter().enumerate() {
+            assert!(
+                (mc[[0, c]] - v).abs() < 1e-2,
+                "ovo row0[{c}] = {} vs oracle {v}",
+                mc[[0, c]]
+            );
+        }
+        Ok(())
     }
 
     #[test]

@@ -13,9 +13,11 @@
 //! `n_support`/`dual_coef`/`intercept`/`coef`, `FittedSVR::support`/
 //! `support_vectors`/`n_support`/`dual_coef`/`intercept`) added by the builder
 //! (#636/#639/#640), pinning REQ-2/REQ-3/REQ-6/REQ-7 against the live oracle.
+//! PIN 8-10 exercise the NEW REQ-4 `decision_function_shape` ovr/ovo support +
+//! the binary 1-D `SvmScores::Binary` enum-variant contract (#637).
 
 use ferrolearn_core::{Fit, Predict};
-use ferrolearn_linear::svm::{LinearKernel, RbfKernel, SVC, SVR};
+use ferrolearn_linear::svm::{LinearKernel, RbfKernel, SVC, SVR, SvmDecisionShape};
 use ndarray::{Array1, Array2, array};
 
 /// Binary 6x2 training set shared by PIN 1 / PIN 2 / PIN 3.
@@ -26,6 +28,20 @@ fn binary_6x2() -> (Array2<f64>, Array1<usize>) {
     )
     .unwrap();
     let y = array![0usize, 0, 0, 1, 1, 1];
+    (x, y)
+}
+
+/// 3-class 9x2 separable linear set shared by PIN 8 / PIN 9.
+fn three_class_9x2() -> (Array2<f64>, Array1<usize>) {
+    let x = Array2::from_shape_vec(
+        (9, 2),
+        vec![
+            0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0, 0.0,
+            5.5,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
     (x, y)
 }
 
@@ -60,16 +76,18 @@ fn divergence_pin1_binary_decision_function_values() {
     let fitted = model.fit(&x, &y).unwrap();
     let df = fitted.decision_function(&x).unwrap();
 
-    // sklearn binary decision_function is conceptually 1-D shape (6,).
-    // ferrolearn returns Array2 (6,1); read its single column.
-    assert_eq!(df.nrows(), 6, "expected 6 rows");
+    // sklearn binary decision_function is 1-D shape (6,) (`-dec.ravel()`,
+    // `_base.py:538-539`). ferrolearn now returns `SvmScores::Binary` of the
+    // same 1-D shape; read it via `as_binary()`.
+    let bin = df.as_binary().expect("binary decision_function is 1-D");
+    assert_eq!(bin.len(), 6, "expected 6 values");
 
     // Live oracle values from SVC(kernel='linear',C=1.0).decision_function(X).
     let oracle: [f64; 6] = [
         -1.285333, -0.999733, -0.999733, 0.999467, 1.285067, 1.285067,
     ];
     for (i, &exp) in oracle.iter().enumerate() {
-        let got = df[[i, 0]];
+        let got = bin[i];
         assert!(
             (got - exp).abs() < 1e-2,
             "binary decision_function[{i}]: ferrolearn={got}, sklearn={exp}, gap={}",
@@ -103,13 +121,16 @@ fn divergence_pin2_rbf_default_scale_gamma() {
         .with_max_iter(1_000_000);
     let fitted = model.fit(&x, &y).unwrap();
     let df = fitted.decision_function(&x).unwrap();
+    // Binary: `SvmScores::Binary` 1-D (mechanical adaptation to the new enum
+    // return type; this pin's REQ-1/gamma logic + oracle are unchanged).
+    let bin = df.as_binary().expect("binary decision_function is 1-D");
 
     // Live oracle SVC(C=1.0) (default rbf, gamma='scale'=0.1184) values.
     let oracle: [f64; 6] = [
         -1.013804, -1.000632, -1.000319, 1.000308, 1.000335, 1.000308,
     ];
     for (i, &exp) in oracle.iter().enumerate() {
-        let got = df[[i, 0]];
+        let got = bin[i];
         assert!(
             (got - exp).abs() < 1e-2,
             "default-rbf decision_function[{i}]: ferrolearn(gamma=1.0)={got}, \
@@ -480,4 +501,176 @@ fn divergence_pin7_svr_fitted_attributes() {
         intercept[0],
         (intercept[0] - 0.14).abs()
     );
+}
+
+/// PIN 8 — REQ-4: multiclass OVR `decision_function` shape + values (#637).
+///
+/// Pins the NEW `SvmDecisionShape::Ovr` (default) path: `decision_function`
+/// for `n_classes > 2` must return [`SvmScores::Multiclass`] shape
+/// `(n_samples, n_classes)` = `(9, 3)`, computed via `_ovr_decision_function`
+/// (`sklearn/utils/multiclass.py:520-562`) fed `dec<0`/`-dec`
+/// (`sklearn/svm/_base.py:780`). It must NOT be the binary 1-D variant
+/// (`as_binary()` is `None`).
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[0.,0.],[0.5,0.],[0.,0.5],[5.,0.],[5.5,0.],[5.,0.5],[0.,5.],[0.5,5.],[0.,5.5]]); \
+///   y=np.array([0,0,0,1,1,1,2,2,2]); m=SVC(kernel='linear',C=1.0).fit(X,y); \
+///   print(m.decision_function(X).shape, np.round(m.decision_function(X),4).tolist())"
+/// # (9, 3)
+/// # [[2.2366,0.8167,-0.1833],[2.2299,0.8431,-0.1905],[2.2299,-0.1905,0.8431],
+/// #  [1.0606,2.2262,-0.2333],[1.0,2.2366,-0.2366],[1.0,2.2222,-0.2222],
+/// #  [1.0606,-0.2333,2.2262],[1.0,-0.2222,2.2222],[1.0,-0.2366,2.2366]]
+/// ```
+///
+/// Tracking: #637
+#[test]
+fn divergence_pin8_multiclass_ovr_decision_function() {
+    let (x, y) = three_class_9x2();
+    // Default decision_function_shape is Ovr (`SVC::new`).
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+    let df = fitted.decision_function(&x).unwrap();
+
+    // Multiclass must be the Multiclass variant, NOT Binary.
+    assert!(
+        df.as_binary().is_none(),
+        "multiclass decision_function must NOT be the 1-D Binary variant"
+    );
+    let m = df
+        .as_multiclass()
+        .expect("multiclass (ovr) decision_function is 2-D");
+    assert_eq!(m.dim(), (9, 3), "ovr decision_function shape");
+
+    // Live oracle full (9,3) ovr matrix.
+    let oracle: [[f64; 3]; 9] = [
+        [2.2366, 0.8167, -0.1833],
+        [2.2299, 0.8431, -0.1905],
+        [2.2299, -0.1905, 0.8431],
+        [1.0606, 2.2262, -0.2333],
+        [1.0, 2.2366, -0.2366],
+        [1.0, 2.2222, -0.2222],
+        [1.0606, -0.2333, 2.2262],
+        [1.0, -0.2222, 2.2222],
+        [1.0, -0.2366, 2.2366],
+    ];
+    for (r, row) in oracle.iter().enumerate() {
+        for (c, &exp) in row.iter().enumerate() {
+            assert!(
+                (m[[r, c]] - exp).abs() < 1e-2,
+                "ovr decision_function[{r}][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+                m[[r, c]],
+                (m[[r, c]] - exp).abs()
+            );
+        }
+    }
+}
+
+/// PIN 9 — REQ-4: multiclass OVO `decision_function` shape + values (#637).
+///
+/// Pins the NEW `SvmDecisionShape::Ovo` path: with
+/// `with_decision_function_shape(SvmDecisionShape::Ovo)`, `decision_function`
+/// must return the RAW one-vs-one decision values shape
+/// `(n_samples, n_class*(n_class-1)/2)` = `(9, 3)`, in libsvm sign convention
+/// (lower-index class is the `+1` side, `sklearn/svm/_base.py:520-524`). This
+/// pins the raw-ovo column order + sign that feeds the ovr transform.
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[0.,0.],[0.5,0.],[0.,0.5],[5.,0.],[5.5,0.],[5.,0.5],[0.,5.],[0.5,5.],[0.,5.5]]); \
+///   y=np.array([0,0,0,1,1,1,2,2,2]); \
+///   m=SVC(kernel='linear',C=1.0,decision_function_shape='ovo').fit(X,y); \
+///   print(m.decision_function(X).shape, np.round(m.decision_function(X)[0],4).tolist())"
+/// # (9, 3)
+/// # row0 [1.2222, 1.2222, 0.0]
+/// ```
+///
+/// Tracking: #637
+#[test]
+fn divergence_pin9_multiclass_ovo_decision_function() {
+    let (x, y) = three_class_9x2();
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_decision_function_shape(SvmDecisionShape::Ovo);
+    let fitted = model.fit(&x, &y).unwrap();
+    let df = fitted.decision_function(&x).unwrap();
+
+    assert!(
+        df.as_binary().is_none(),
+        "multiclass ovo decision_function must NOT be the 1-D Binary variant"
+    );
+    let m = df
+        .as_multiclass()
+        .expect("multiclass (ovo) decision_function is 2-D");
+    assert_eq!(m.dim(), (9, 3), "ovo decision_function shape (n_models=3)");
+
+    // Live oracle row0 of the raw ovo matrix.
+    let oracle_row0: [f64; 3] = [1.2222, 1.2222, 0.0];
+    for (c, &exp) in oracle_row0.iter().enumerate() {
+        assert!(
+            (m[[0, c]] - exp).abs() < 1e-2,
+            "ovo decision_function[0][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+            m[[0, c]],
+            (m[[0, c]] - exp).abs()
+        );
+    }
+}
+
+/// PIN 10 — REQ-4: binary 1-D `SvmScores::Binary` enum-variant contract (#637).
+///
+/// Focuses the SHAPE/enum-variant half of the binary decision_function
+/// contract that PIN 1 covers value-wise: for `n_classes == 2`,
+/// `decision_function` must return [`SvmScores::Binary`] (`as_binary()` is
+/// `Some`, length 6, 1-D; `_base.py:538-539` `-dec.ravel()`) and NOT the
+/// multiclass variant (`as_multiclass()` is `None`). Values are re-derived live
+/// and asserted too (positive -> class 1).
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]]); y=np.array([0,0,0,1,1,1]); \
+///   m=SVC(kernel='linear',C=1.0).fit(X,y); \
+///   print(m.decision_function(X).shape, np.round(m.decision_function(X),4).tolist())"
+/// # (6,)
+/// # [-1.2853, -0.9997, -0.9997, 0.9995, 1.2851, 1.2851]
+/// ```
+///
+/// Tracking: #637
+#[test]
+fn divergence_pin10_binary_shape_contract() {
+    let (x, y) = binary_6x2();
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+    let df = fitted.decision_function(&x).unwrap();
+
+    // Enum-variant contract: binary -> Binary 1-D, multiclass variant absent.
+    assert!(
+        df.as_multiclass().is_none(),
+        "binary decision_function must NOT be the 2-D Multiclass variant"
+    );
+    let bin = df
+        .as_binary()
+        .expect("binary decision_function must be the 1-D Binary variant");
+    assert_eq!(bin.len(), 6, "binary decision_function length (1-D (6,))");
+
+    // Live oracle values (positive -> classes_[1]).
+    let oracle: [f64; 6] = [-1.2853, -0.9997, -0.9997, 0.9995, 1.2851, 1.2851];
+    for (i, &exp) in oracle.iter().enumerate() {
+        assert!(
+            (bin[i] - exp).abs() < 1e-2,
+            "binary decision_function[{i}]: ferrolearn={}, sklearn={exp}, gap={}",
+            bin[i],
+            (bin[i] - exp).abs()
+        );
+    }
 }

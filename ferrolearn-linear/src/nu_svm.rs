@@ -39,7 +39,7 @@ use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::Float;
 
-use crate::svm::{FittedSVC, FittedSVR, Kernel, SVC, SVR};
+use crate::svm::{FittedSVC, FittedSVR, Kernel, SVC, SVR, SvmScores};
 
 // ---------------------------------------------------------------------------
 // NuSVC
@@ -179,12 +179,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> P
 impl<F: Float, K: Kernel<F>> FittedNuSVC<F, K> {
     /// Compute the raw decision function values for each sample.
     ///
-    /// Delegates to the inner [`FittedSVC::decision_function`].
+    /// Delegates to the inner [`FittedSVC::decision_function`], propagating its
+    /// [`SvmScores<F>`] contract (binary `(n,)`, multiclass `(n, n_classes)`):
+    /// NuSVC shares the `BaseSVC` decision-function contract with SVC
+    /// (`sklearn/svm/_base.py:751`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the input has no columns.
-    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<SvmScores<F>, FerroError> {
         self.0.decision_function(x)
     }
 }
@@ -394,7 +397,11 @@ mod tests {
         let model = NuSVC::<f64, LinearKernel>::new(LinearKernel).with_nu(0.5);
         let fitted = model.fit(&x, &y).unwrap();
         let df = fitted.decision_function(&x).unwrap();
-        assert_eq!(df.nrows(), 6);
+        // Binary (2-class) NuSVC: SvmScores::Binary, shape (n,) — 6 samples,
+        // mirroring svm.rs's test_svc_decision_function.
+        assert_eq!(df.n_samples(), 6);
+        assert!(df.as_multiclass().is_none());
+        assert!(df.as_binary().is_some_and(|b| b.len() == 6));
     }
 
     #[test]
