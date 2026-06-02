@@ -26,6 +26,30 @@
 //! // Normal points get 1, anomalies get -1
 //! assert!(preds.iter().all(|&v| v == 1 || v == -1));
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.IsolationForest` (`sklearn/ensemble/_iforest.py`).
+//! See `.design/tree/isolation_forest.md`. Non-test consumer: crate re-export
+//! + pipeline adapter (no PyO3 binding).
+//!
+//! **RNG boundary:** subsample + split draws use `StdRng` where sklearn draws
+//! from numpy MT19937 — exact tree/score-value parity is infeasible (#730);
+//! ferrolearn's fit is internally reproducible.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param defaults: `n_estimators=100`, `max_samples` effective `min(256,n)` == sklearn `'auto'`, `contamination=Auto`, `random_state=None` | SHIPPED |
+//! | REQ-2 | Isolation-tree build + `max_depth=ceil(log2(max_samples))` (structural; RNG boundary) | SHIPPED |
+//! | REQ-3 | `c(n)` average path length incl. `n<=1→0`, `n==2→1.0` special-cases (`_iforest.py:558-562`) | SHIPPED |
+//! | REQ-4 | `score_samples = -2^(-mean/c)` ∈ [-1,0], higher = normal (`_iforest.py:451`) | SHIPPED |
+//! | REQ-5 | `decision_function = score_samples - offset_` (`_iforest.py:410`) | SHIPPED |
+//! | REQ-6 | `offset_` = `-0.5` for `Contamination::Auto`, else numpy-percentile of train scores (`_iforest.py:341-353`); `Contamination{Auto,Value}` enum | SHIPPED |
+//! | REQ-8 | `predict` = `-1 where decision_function(X) < 0 else 1` (`_iforest.py:360-372`) | SHIPPED |
+//! | REQ-9 | `random_state` reproducibility (ferrolearn-internal; numpy-MT parity = RNG boundary #730) | SHIPPED |
+//! | REQ-7a | `max_features` + `bootstrap` params + `max_samples` int/'auto'-string representation | NOT-STARTED (#728) |
+//! | REQ-7b | Subsample WITHOUT replacement (`bootstrap=False`) | NOT-STARTED (#729) |
+//! | REQ-10 | ferray substrate migration | NOT-STARTED (#731) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -63,6 +87,32 @@ enum IsoNode<F> {
 }
 
 // ---------------------------------------------------------------------------
+// Contamination
+// ---------------------------------------------------------------------------
+
+/// The expected proportion of outliers in the data, used to set `offset_`.
+///
+/// Mirrors scikit-learn's `contamination` parameter, which is either the
+/// string `'auto'` or a float in `(0, 0.5]`
+/// (`sklearn/ensemble/_iforest.py:199` `_parameter_constraints`,
+/// `:221` `__init__` default `contamination="auto"`).
+///
+/// - [`Contamination::Auto`] reproduces sklearn's default `'auto'` path:
+///   `offset_ = -0.5`, the threshold from the original isolation-forest paper
+///   (`_iforest.py:341-345`).
+/// - [`Contamination::Value`] reproduces the numeric path:
+///   `offset_ = np.percentile(score_samples(X_train), 100 * contamination)`
+///   (`_iforest.py:353`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum Contamination {
+    /// sklearn `contamination='auto'`: use the paper threshold `offset_ = -0.5`.
+    Auto,
+    /// sklearn `contamination=<float>`: `offset_` is the `100*value` percentile
+    /// of the training scores. `value` must be in `(0.0, 0.5]`.
+    Value(f64),
+}
+
+// ---------------------------------------------------------------------------
 // IsolationForest
 // ---------------------------------------------------------------------------
 
@@ -81,8 +131,9 @@ pub struct IsolationForest<F> {
     pub n_estimators: usize,
     /// Number of samples to draw for each tree.
     pub max_samples: usize,
-    /// Proportion of anomalies in the dataset, used to set the decision threshold.
-    pub contamination: f64,
+    /// Contamination parameter controlling `offset_` (sklearn `contamination`,
+    /// `_iforest.py:221`). Defaults to [`Contamination::Auto`].
+    pub contamination: Contamination,
     /// Random seed for reproducibility. `None` means non-deterministic.
     pub random_state: Option<u64>,
     _marker: std::marker::PhantomData<F>,
@@ -92,13 +143,14 @@ impl<F: Float> IsolationForest<F> {
     /// Create a new `IsolationForest` with default settings.
     ///
     /// Defaults: `n_estimators = 100`, `max_samples = 256`,
-    /// `contamination = 0.1`, `random_state = None`.
+    /// `contamination = Contamination::Auto`, `random_state = None`
+    /// (sklearn `__init__`, `_iforest.py:221`, default `contamination="auto"`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             n_estimators: 100,
             max_samples: 256,
-            contamination: 0.1,
+            contamination: Contamination::Auto,
             random_state: None,
             _marker: std::marker::PhantomData,
         }
@@ -118,10 +170,24 @@ impl<F: Float> IsolationForest<F> {
         self
     }
 
-    /// Set the contamination fraction (proportion of anomalies).
+    /// Set the contamination fraction (proportion of anomalies) as
+    /// [`Contamination::Value`].
+    ///
+    /// `contamination` must be in `(0.0, 0.5]`; an out-of-range value is
+    /// rejected with [`FerroError::InvalidParameter`] at `fit` time (sklearn
+    /// `_parameter_constraints` `Interval(Real, 0, 0.5, closed="right")`,
+    /// `_iforest.py:199`).
     #[must_use]
     pub fn with_contamination(mut self, contamination: f64) -> Self {
-        self.contamination = contamination;
+        self.contamination = Contamination::Value(contamination);
+        self
+    }
+
+    /// Set the contamination to [`Contamination::Auto`] (sklearn
+    /// `contamination='auto'`, `offset_ = -0.5`, `_iforest.py:341-345`).
+    #[must_use]
+    pub fn with_contamination_auto(mut self) -> Self {
+        self.contamination = Contamination::Auto;
         self
     }
 
@@ -145,16 +211,19 @@ impl<F: Float> Default for IsolationForest<F> {
 
 /// A fitted isolation forest anomaly detector.
 ///
-/// Stores the ensemble of isolation trees and the anomaly score threshold
-/// derived from the contamination parameter.
+/// Stores the ensemble of isolation trees and the decision offset `offset_`
+/// derived from the contamination parameter (sklearn `offset_`,
+/// `_iforest.py:341-353`).
 #[derive(Debug, Clone)]
 pub struct FittedIsolationForest<F> {
     /// Individual isolation trees, each stored as a flat node vector.
     trees: Vec<Vec<IsoNode<F>>>,
     /// Number of features the model was trained on.
     n_features: usize,
-    /// Decision threshold: anomaly_score > threshold => anomaly (-1).
-    threshold: f64,
+    /// Decision offset: `decision_function(X) = score_samples(X) - offset_`;
+    /// a sample is an outlier (`-1`) when `decision_function(X) < 0`
+    /// (sklearn `offset_`, `_iforest.py:341-353`).
+    offset_: f64,
     /// Effective number of samples used per tree.
     max_samples: usize,
 }
@@ -172,17 +241,26 @@ impl<F: Float + Send + Sync + 'static> FittedIsolationForest<F> {
         self.n_features
     }
 
-    /// Returns the anomaly score threshold.
+    /// Returns the decision offset `offset_`.
+    ///
+    /// `decision_function(X) = score_samples(X) - offset_`; samples with a
+    /// negative decision function are outliers (sklearn `offset_`,
+    /// `_iforest.py:341-353`).
     #[must_use]
-    pub fn threshold(&self) -> f64 {
-        self.threshold
+    pub fn offset(&self) -> f64 {
+        self.offset_
     }
 
-    /// Compute anomaly scores for each sample.
+    /// Compute the opposite of the paper anomaly score for each sample.
     ///
-    /// Score = 2^(-mean_path_length / c(n)), where c(n) is the average path
-    /// length of an unsuccessful search in a binary search tree. Scores
-    /// close to 1 indicate anomalies; scores close to 0.5 indicate normal points.
+    /// Returns `-2^(-mean_path_length / c(max_samples))`, where `c(n)` is the
+    /// average path length of an unsuccessful search in a binary search tree.
+    /// This mirrors sklearn's sign convention (`_score_samples =
+    /// -_compute_chunked_score_samples`, `_iforest.py:451`): scores lie in
+    /// `[-1, 0]`, where **higher (closer to 0) means more NORMAL** and lower
+    /// (more negative) means more anomalous. "The lower, the more abnormal.
+    /// Negative scores represent outliers, positive scores represent inliers"
+    /// (`_iforest.py:404-405`).
     ///
     /// # Errors
     ///
@@ -209,10 +287,34 @@ impl<F: Float + Send + Sync + 'static> FittedIsolationForest<F> {
                 total_path += path_length(tree_nodes, &row);
             }
             let mean_path = total_path / n_trees;
-            scores[i] = f64::powf(2.0, -mean_path / c_n);
+            // Guard the division: when c_n == 0 (max_samples <= 1,
+            // average_path_length(1) == 0), sklearn's np.divide with
+            // `out=ones, where=denominator != 0` keeps the ratio at 1.0
+            // so the score is -2^(-1) = -0.5 (_iforest.py:519-522).
+            let ratio = if c_n != 0.0 { mean_path / c_n } else { 1.0 };
+            // Take the opposite of the paper score so that "bigger is better"
+            // (less abnormal), matching sklearn (_iforest.py:451).
+            scores[i] = -f64::powf(2.0, -ratio);
         }
 
         Ok(scores)
+    }
+
+    /// Compute the anomaly decision function for each sample.
+    ///
+    /// `decision_function(X) = score_samples(X) - offset_` (sklearn
+    /// `_iforest.py:410`). Subtracting `offset_` makes `0` the outlier
+    /// threshold: a sample is an outlier when the result is `< 0`. "The lower,
+    /// the more abnormal. Negative scores represent outliers, positive scores
+    /// represent inliers" (`_iforest.py:404-405`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the training data.
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array1<f64>, FerroError> {
+        let scores = self.score_samples(x)?;
+        Ok(scores.mapv(|s| s - self.offset_))
     }
 }
 
@@ -248,11 +350,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IsolationForest<F>
                 reason: "must be at least 1".into(),
             });
         }
-        if !(0.0..=0.5).contains(&self.contamination) {
-            return Err(FerroError::InvalidParameter {
-                name: "contamination".into(),
-                reason: "must be in [0.0, 0.5]".into(),
-            });
+        if let Contamination::Value(v) = self.contamination {
+            // sklearn `_parameter_constraints`: Interval(Real, 0, 0.5,
+            // closed="right") (_iforest.py:199) — 0 < v <= 0.5.
+            if !(v > 0.0 && v <= 0.5) {
+                return Err(FerroError::InvalidParameter {
+                    name: "contamination".into(),
+                    reason: "must be in (0.0, 0.5]".into(),
+                });
+            }
         }
 
         let effective_max_samples = self.max_samples.min(n_samples);
@@ -290,36 +396,61 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IsolationForest<F>
             trees.push(nodes);
         }
 
-        // Compute anomaly scores on the training data to find the threshold.
-        let fitted_no_threshold = FittedIsolationForest {
+        // Build a provisional fitted model (offset_ filled in below) so we can
+        // score the training rows to derive offset_.
+        let mut fitted = FittedIsolationForest {
             trees,
             n_features,
-            threshold: 0.0,
+            offset_: 0.0,
             max_samples: effective_max_samples,
         };
 
-        let train_scores = fitted_no_threshold.score_samples(x)?;
-
-        // Sort scores descending to find the contamination quantile.
-        let mut sorted_scores: Vec<f64> = train_scores.iter().copied().collect();
-        sorted_scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-
-        let contamination_idx = ((self.contamination * n_samples as f64).ceil() as usize)
-            .max(1)
-            .min(n_samples);
-        let threshold = if contamination_idx < sorted_scores.len() {
-            sorted_scores[contamination_idx - 1]
-        } else {
-            sorted_scores[sorted_scores.len() - 1]
+        // offset_ (sklearn _iforest.py:341-353).
+        fitted.offset_ = match self.contamination {
+            // contamination == "auto": the paper threshold, on the opposite
+            // (negated) score convention (_iforest.py:341-345).
+            Contamination::Auto => -0.5,
+            // Else: np.percentile(_score_samples(X), 100 * contamination)
+            // (_iforest.py:353).
+            Contamination::Value(v) => {
+                let train_scores = fitted.score_samples(x)?;
+                percentile(train_scores.as_slice().unwrap_or(&[]), 100.0 * v)
+            }
         };
 
-        Ok(FittedIsolationForest {
-            trees: fitted_no_threshold.trees,
-            n_features,
-            threshold,
-            max_samples: effective_max_samples,
-        })
+        Ok(fitted)
     }
+}
+
+/// numpy `np.percentile(a, q)` with the default `'linear'` interpolation.
+///
+/// Sorts `a` ascending and returns the value at fractional rank
+/// `q/100 * (n - 1)`, linearly interpolating between the floor and ceil ranks
+/// (numpy's `_lerp` default, mirrored to match sklearn's `offset_` computation
+/// `np.percentile(..., 100*contamination)`, `_iforest.py:353`). For an empty
+/// input it returns `0.0` (sklearn never calls this on an empty array, as `fit`
+/// rejects zero-sample input first).
+fn percentile(a: &[f64], q: f64) -> f64 {
+    let n = a.len();
+    if n == 0 {
+        return 0.0;
+    }
+    if n == 1 {
+        return a[0];
+    }
+    let mut sorted: Vec<f64> = a.to_vec();
+    sorted.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+
+    let rank = (q / 100.0) * ((n - 1) as f64);
+    let lo = rank.floor();
+    let hi = rank.ceil();
+    let lo_idx = (lo as usize).min(n - 1);
+    let hi_idx = (hi as usize).min(n - 1);
+    if lo_idx == hi_idx {
+        return sorted[lo_idx];
+    }
+    let frac = rank - lo;
+    sorted[lo_idx] + (sorted[hi_idx] - sorted[lo_idx]) * frac
 }
 
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedIsolationForest<F> {
@@ -328,15 +459,18 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedIsolationFor
 
     /// Predict anomaly labels for the given feature matrix.
     ///
-    /// Returns 1 for normal points and -1 for anomalies.
+    /// Returns `1` for inliers and `-1` for outliers, where a sample is an
+    /// outlier when `decision_function(X) < 0` (sklearn `predict`:
+    /// `is_inlier = ones; is_inlier[decision_function(X) < 0] = -1`,
+    /// `_iforest.py:374-378`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<isize>, FerroError> {
-        let scores = self.score_samples(x)?;
-        let predictions = scores.mapv(|s| if s >= self.threshold { -1 } else { 1 });
+        let decision = self.decision_function(x)?;
+        let predictions = decision.mapv(|d| if d < 0.0 { -1 } else { 1 });
         Ok(predictions)
     }
 }
@@ -347,14 +481,20 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedIsolationFor
 
 /// Average path length of an unsuccessful search in a BST with `n` elements.
 ///
-/// c(n) = 2 * (ln(n-1) + EULER_MASCHERONI) - 2*(n-1)/n  for n >= 2
-/// c(1) = 0
+/// Mirrors sklearn `_average_path_length` (`_iforest.py:557-566`):
+/// `c(n) = 0` for `n <= 1`, `c(2) = 1`, else
+/// `2 * (ln(n-1) + euler_gamma) - 2*(n-1)/n`.
 fn average_path_length(n: usize) -> f64 {
     if n <= 1 {
+        // mask_1: n_samples_leaf <= 1 -> 0.0 (_iforest.py:557, :561)
         return 0.0;
     }
+    if n == 2 {
+        // mask_2: n_samples_leaf == 2 -> 1.0 (_iforest.py:558, :562)
+        return 1.0;
+    }
     let n_f = n as f64;
-    // Euler-Mascheroni constant
+    // Euler-Mascheroni constant == np.euler_gamma
     2.0 * ((n_f - 1.0).ln() + 0.5772156649015329) - 2.0 * (n_f - 1.0) / n_f
 }
 
@@ -540,7 +680,8 @@ mod tests {
         let model = IsolationForest::<f64>::new();
         assert_eq!(model.n_estimators, 100);
         assert_eq!(model.max_samples, 256);
-        assert!((model.contamination - 0.1).abs() < 1e-10);
+        // sklearn default contamination='auto' (_iforest.py:221).
+        assert_eq!(model.contamination, Contamination::Auto);
         assert!(model.random_state.is_none());
     }
 
@@ -553,8 +694,16 @@ mod tests {
             .with_random_state(123);
         assert_eq!(model.n_estimators, 50);
         assert_eq!(model.max_samples, 128);
-        assert!((model.contamination - 0.05).abs() < 1e-10);
+        assert_eq!(model.contamination, Contamination::Value(0.05));
         assert_eq!(model.random_state, Some(123));
+    }
+
+    #[test]
+    fn test_contamination_auto_builder() {
+        let model = IsolationForest::<f64>::new()
+            .with_contamination(0.2)
+            .with_contamination_auto();
+        assert_eq!(model.contamination, Contamination::Auto);
     }
 
     #[test]
@@ -594,12 +743,15 @@ mod tests {
         let scores = fitted.score_samples(&x).unwrap();
 
         assert_eq!(scores.len(), 10);
-        // The anomaly (last point) should have a higher score than normal points
+        // sklearn sign convention (_iforest.py:451, :404-405): score_samples
+        // is the OPPOSITE of the paper score, so the anomaly (last point) has
+        // the LOWEST (most negative) score; all scores are <= 0.
+        assert!(scores.iter().all(|&s| s <= 0.0), "scores must be <= 0");
         let anomaly_score = scores[9];
-        let max_normal_score = scores.iter().take(9).copied().fold(0.0_f64, f64::max);
+        let min_normal_score = scores.iter().take(9).copied().fold(f64::INFINITY, f64::min);
         assert!(
-            anomaly_score > max_normal_score,
-            "anomaly score ({anomaly_score}) should be greater than max normal score ({max_normal_score})"
+            anomaly_score < min_normal_score,
+            "anomaly score ({anomaly_score}) should be less than min normal score ({min_normal_score})"
         );
     }
 
@@ -663,13 +815,15 @@ mod tests {
 
     #[test]
     fn test_average_path_length_values() {
+        // sklearn _average_path_length special-cases (_iforest.py:561-562):
+        // mask_1 (n<=1) -> 0.0, mask_2 (n==2) -> 1.0.
+        // live: `_average_path_length([1]) == 0.`, `_average_path_length([2]) == 1.`
         assert!((average_path_length(1) - 0.0).abs() < 1e-10);
-        // c(2) = 2*(ln(1) + 0.5772...) - 2*1/2 = 2*0.5772... - 1 = 0.1544...
-        let c2 = average_path_length(2);
-        assert!(c2 > 0.0 && c2 < 1.0, "c(2) = {c2}");
-        // c(256) should be a reasonable number
+        assert!((average_path_length(2) - 1.0).abs() < 1e-10);
+        // General branch (_iforest.py:563-566): live `_average_path_length([256])
+        // == 10.2447709...`.
         let c256 = average_path_length(256);
-        assert!(c256 > 5.0 && c256 < 15.0, "c(256) = {c256}");
+        assert!((c256 - 10.244770920119917).abs() < 1e-9, "c(256) = {c256}");
     }
 
     #[test]
@@ -725,7 +879,9 @@ mod tests {
         let x = Array2::<f64>::from_shape_vec((1, 3), vec![1.0, 2.0, 3.0]).unwrap();
         let model = IsolationForest::<f64>::new()
             .with_n_estimators(10)
-            .with_contamination(0.0)
+            // contamination=0.0 is invalid (sklearn Interval(Real, 0, 0.5,
+            // closed="right"), _iforest.py:199); use the 'auto' path instead.
+            .with_contamination_auto()
             .with_random_state(42);
         let fitted = model.fit(&x, &()).unwrap();
         let preds = fitted.predict(&x).unwrap();
@@ -741,6 +897,111 @@ mod tests {
         let fitted = model.fit(&x, &()).unwrap();
         assert_eq!(fitted.n_estimators(), 10);
         assert_eq!(fitted.n_features(), 2);
-        assert!(fitted.threshold() >= 0.0);
+        // Default contamination='auto' => offset_ == -0.5 (_iforest.py:341-345).
+        assert!((fitted.offset() - (-0.5)).abs() < 1e-12);
+    }
+
+    // -----------------------------------------------------------------------
+    // Scoring-contract tests (REQ-4/5/6/8). Expected values come from sklearn
+    // constants/formulas (R-CHAR-3), never copied from ferrolearn output.
+    // These tests return `Result` and use `?` so no test-local `.unwrap()` is
+    // introduced.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_score_samples_sign_in_minus_one_zero() -> Result<(), FerroError> {
+        // sklearn _score_samples = -_compute_chunked_score_samples
+        // (_iforest.py:451): every score is in [-1, 0]. (REQ-4)
+        let x = make_data_with_anomaly();
+        let model = IsolationForest::<f64>::new()
+            .with_n_estimators(50)
+            .with_random_state(42);
+        let fitted = model.fit(&x, &())?;
+        let scores = fitted.score_samples(&x)?;
+        assert!(scores.iter().all(|&s| (-1.0..=0.0).contains(&s)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_offset_auto_is_minus_half() -> Result<(), FerroError> {
+        // contamination='auto' => offset_ == -0.5 (_iforest.py:341-345). (REQ-6)
+        let x = make_data_with_anomaly();
+        let model = IsolationForest::<f64>::new()
+            .with_n_estimators(50)
+            .with_contamination_auto()
+            .with_random_state(42);
+        let fitted = model.fit(&x, &())?;
+        assert!((fitted.offset() - (-0.5)).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn test_decision_function_equals_score_minus_offset() -> Result<(), FerroError> {
+        // decision_function(X) == score_samples(X) - offset_ (_iforest.py:410).
+        // (REQ-5)
+        let x = make_data_with_anomaly();
+        let model = IsolationForest::<f64>::new()
+            .with_n_estimators(80)
+            .with_contamination(0.2)
+            .with_random_state(42);
+        let fitted = model.fit(&x, &())?;
+        let scores = fitted.score_samples(&x)?;
+        let decision = fitted.decision_function(&x)?;
+        let off = fitted.offset();
+        for i in 0..x.nrows() {
+            assert!((decision[i] - (scores[i] - off)).abs() < 1e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_predict_agrees_with_decision_function_sign() -> Result<(), FerroError> {
+        // sklearn predict: -1 where decision_function(X) < 0 else 1
+        // (_iforest.py:374-378). (REQ-8)
+        let x = make_data_with_anomaly();
+        let model = IsolationForest::<f64>::new()
+            .with_n_estimators(80)
+            .with_contamination(0.2)
+            .with_random_state(42);
+        let fitted = model.fit(&x, &())?;
+        let decision = fitted.decision_function(&x)?;
+        let preds = fitted.predict(&x)?;
+        for i in 0..x.nrows() {
+            let expected = if decision[i] < 0.0 { -1 } else { 1 };
+            assert_eq!(preds[i], expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_offset_value_is_percentile_of_scores() -> Result<(), FerroError> {
+        // contamination=v => offset_ == np.percentile(score_samples(X), 100*v)
+        // (_iforest.py:353), numpy default linear interpolation. (REQ-6)
+        let x = make_data_with_anomaly();
+        let model = IsolationForest::<f64>::new()
+            .with_n_estimators(80)
+            .with_contamination(0.2)
+            .with_random_state(42);
+        let fitted = model.fit(&x, &())?;
+        let scores = fitted.score_samples(&x)?;
+        let slice = scores.as_slice().unwrap_or(&[]);
+        let expected = percentile(slice, 20.0);
+        assert!((fitted.offset() - expected).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn test_percentile_linear_interpolation() {
+        // numpy np.percentile default 'linear': rank = q/100*(n-1), interp
+        // between floor/ceil. Live values:
+        //   np.percentile([1,2,3,4], 0.0)   == 1.0
+        //   np.percentile([1,2,3,4], 25.0)  == 1.75
+        //   np.percentile([1,2,3,4], 50.0)  == 2.5
+        //   np.percentile([1,2,3,4], 100.0) == 4.0
+        let a = [1.0, 2.0, 3.0, 4.0];
+        assert!((percentile(&a, 0.0) - 1.0).abs() < 1e-12);
+        assert!((percentile(&a, 25.0) - 1.75).abs() < 1e-12);
+        assert!((percentile(&a, 50.0) - 2.5).abs() < 1e-12);
+        assert!((percentile(&a, 100.0) - 4.0).abs() < 1e-12);
     }
 }

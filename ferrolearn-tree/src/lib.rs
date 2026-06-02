@@ -85,7 +85,7 @@ pub use hist_gradient_boosting::{
     HistClassificationLoss, HistGradientBoostingClassifier, HistGradientBoostingRegressor,
     HistNode, HistRegressionLoss,
 };
-pub use isolation_forest::{FittedIsolationForest, IsolationForest};
+pub use isolation_forest::{Contamination, FittedIsolationForest, IsolationForest};
 pub use random_forest::{
     FittedRandomForestClassifier, FittedRandomForestRegressor, MaxFeatures, RandomForestClassifier,
     RandomForestRegressor,

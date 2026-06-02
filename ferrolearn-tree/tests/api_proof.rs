@@ -473,14 +473,18 @@ fn api_proof_isolation_forest() {
     assert_eq!(preds[9], -1);
     let scores = f.score_samples(&x).unwrap();
     assert_eq!(scores.len(), 10);
-    // ferrolearn's score_samples currently returns the raw anomaly score
-    // (higher = more anomalous), unlike sklearn (negated, higher = inlier).
-    // See #276; assertion follows ferrolearn's convention.
+    // score_samples follows the sklearn convention: negated path-length score,
+    // higher = more inlier, all values <= 0 (sklearn/ensemble/_iforest.py:451).
+    // Outliers therefore get the LOWEST (most negative) scores.
+    assert!(
+        scores.iter().all(|&s| s <= 0.0),
+        "sklearn score_samples are all <= 0; got {scores:?}"
+    );
     let outlier_max = scores[8].max(scores[9]);
     let inlier_min = (0..8).map(|i| scores[i]).fold(f64::INFINITY, f64::min);
     assert!(
-        outlier_max >= inlier_min,
-        "expected outlier scores to be >= inlier min; got {outlier_max} vs {inlier_min}"
+        outlier_max <= inlier_min,
+        "expected outlier scores <= inlier min (more negative); got {outlier_max} vs {inlier_min}"
     );
 
     let _: IsolationForest<f64> = Default::default();
