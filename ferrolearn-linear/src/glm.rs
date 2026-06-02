@@ -45,6 +45,7 @@
 //! | REQ-13 (score = D², deviance-explained) | SHIPPED | #559. `#[must_use] pub fn score(&self, x, y) -> Result<F, FerroError>` on `FittedGLMRegressor` computes `D² = 1 − (deviance + constant)/(deviance_null + constant)` (`glm.py:365-438`): `μ = predict(x)`, the null model predicts the (unweighted) mean `ȳ` for every sample, and the per-family unit deviance comes from `GLMFamily::unit_deviance` (Poisson `2·(y·ln(y/μ) − y + μ)`, y=0→`2μ`; Gamma `2·(−ln(y/μ) + (y−μ)/μ)`; Tweedie p=0 `(y−μ)²`; general-p `2·(y^(2−p)/((1−p)(2−p)) − y·μ^(1−p)/(1−p) + μ^(2−p)/(2−p))`), verified term-for-term against `sklearn/_loss/loss.py` (`HalfPoissonLoss:728-742`, `HalfGammaLoss:754-773`, `HalfTweedieLoss:789-837`). `GLMFamily::constant_to_optimal_zero` restores sklearn's `+ constant` so the degenerate constant-`y` boundary matches the oracle. `score` re-validates the y-domain (`YDomain::for_power`), mirroring `glm.py:413-417`. Consumer: the crate-root-exported `FittedGLMRegressor::score` (a public method on the boundary fitted type). Oracle tests `glm_poisson_d2_score` (D²=0.7979479374534378), `glm_gamma_d2_score` (0.8987486959882107), `glm_tweedie_power0_d2_score` (0.9319946452476573, == R²), `glm_tweedie_d2_score` (0.9277805586816806), `glm_score_rejects_out_of_domain_y` green in `tests/divergence_glm_fit.rs`; all 14 pre-existing glm divergence tests stay green. |
 //! | REQ-7 (predict = link.inverse) | SHIPPED | `fn predict` applies `self.link.inverse(eta)` (`Link::Log => exp`, `Link::Identity => eta`), mirroring `glm.py:362` (`y_pred = link.inverse(raw_prediction)`). Consumer: the crate-root-exported `FittedGLMRegressor::predict` used by every wrapper; oracle test `glm_tweedie_power0_predict_identity_inverse` (identity link → raw linear predictor `[0.4,6.3,12.2,18.1]`) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
+//! | REQ-10 (solver param: lbfgs/newton-cholesky) | SHIPPED | #556. **R-DEV-2 (API parity):** `pub enum Solver { Lbfgs, NewtonCholesky }` + a `pub solver: Solver` field (default `Solver::Lbfgs`) on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`, plus `#[must_use] fn with_solver`, mirroring sklearn's validated `solver` constructor parameter `StrOptions({"lbfgs","newton-cholesky"})` default `"lbfgs"` (`glm.py:140-145, :155`); the two-variant enum mirrors the `StrOptions` constraint. **R-DEV-7 (implementation differs, observable contract preserved):** ferrolearn fits all GLMs via IRLS/Fisher-scoring (`fn fit_glm_irls`) regardless of `solver` — the penalized GLM objective is convex, so IRLS reaches the SAME minimizer as both sklearn solvers (verified live: `PoissonRegressor(alpha=0.5)` gives coef `[0.38388523,0.20239975]`, int `-0.51935749` for `lbfgs` AND `newton-cholesky`, identical to ~1e-9). Consumer: each estimator's `Fit::fit` (crate-root export) — the `solver` field is part of the boundary estimator ABI. Oracle test `glm_solver_param_invariant` (fits with `Solver::Lbfgs` and `Solver::NewtonCholesky`, both coef/intercept match the solver-invariant live sklearn 1.5.2 oracle to 1e-4) green in `tests/divergence_glm_fit.rs`; the 19 pre-existing glm divergence tests stay green. |
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
 //! | REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`, where the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance objective normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector, so the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` (coef `[0.35738828,0.19717462]`, int `-0.43719203`) and `glm_gamma_sample_weight` (coef `[0.23049054,0.11350454]`, int `0.41955357`) green in `tests/divergence_glm_fit.rs`; the 8 pre-existing unweighted oracle tests stay green. |
 //! | REQ-14 (n_iter_ + per-family y-domain validation) | SHIPPED | #560. Per-family y-domain guard in `fn fit_glm_irls`: `YDomain::for_power(family.domain_power())` then `y.iter().any(|&yi| !y_domain.contains(yi))` → `FerroError::InvalidParameter{name:"y", reason:"Some value(s) of y are out of the valid range of the loss '<loss>'."}`, mirroring sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` (`glm.py:221-225`). The valid range is keyed on the family's Tweedie `power` (NOT the link — verified vs the live oracle that `HalfTweedieLoss(p).interval_y_true == HalfTweedieLossIdentity(p).interval_y_true`): `power <= 0` unconstrained (Normal), `0 < power < 2` → `y >= 0` (Poisson `power=1`), `power >= 2` → `y > 0` (Gamma `power=2`, open at 0). `FittedGLMRegressor` gains `n_iter: usize` (the IRLS iteration count captured in the convergence loop) with `#[must_use] pub fn n_iter(&self) -> usize` — sklearn's `n_iter_` is the lbfgs count (`glm.py:110-114, :283`); ferrolearn's is the IRLS count (solvers differ, both report iterations-to-convergence). Consumer: `FittedGLMRegressor::n_iter` accessor on the crate-root-exported fitted type. Oracle tests `glm_gamma_rejects_zero_y` (Gamma rejects `y==0`, accepts `y>0`), `glm_tweedie_power2_rejects_zero_y` (`power=2.0` rejects `y==0`; `power=1.5` accepts it), `glm_poisson_rejects_negative_y` (rejects `y<0`, accepts `y==0`), `glm_n_iter_exposed` (`1 <= n_iter() <= max_iter`) green in `tests/divergence_glm_fit.rs`; the 10 pre-existing glm divergence tests stay green (all their `y` are in-domain). |
@@ -148,6 +149,41 @@ impl LinkConfig {
             LinkConfig::Identity => Link::Identity,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Solver
+// ---------------------------------------------------------------------------
+
+/// The optimization algorithm requested for fitting a GLM, mirroring sklearn's
+/// `solver` constructor parameter (`sklearn/linear_model/_glm/glm.py:140-145`,
+/// `StrOptions({"lbfgs", "newton-cholesky"})`, default `"lbfgs"`).
+///
+/// **Implementation note (R-DEV-7 — Rust analog).** ferrolearn fits all GLMs via
+/// IRLS / Fisher-scoring (`fn fit_glm_irls`); the `solver` parameter is accepted
+/// for scikit-learn API parity (R-DEV-2) and selects the requested optimizer's
+/// *contract*. The penalized GLM objective is convex, so IRLS converges to the
+/// **same** minimizer as both sklearn's `lbfgs` (scipy L-BFGS-B) and
+/// `newton-cholesky` (Newton-Raphson with an inner Cholesky solve) — all three
+/// are descent methods on one convex objective. Therefore the observable
+/// contract (`coef_` / `intercept_`) matches sklearn for **either** `solver`
+/// value, and ferrolearn does not vary the numerical path between them
+/// (verified live: `PoissonRegressor(alpha=0.5)` gives the same fitted
+/// attributes to ~1e-9 for `lbfgs` and `newton-cholesky`).
+///
+/// The type system constrains valid values to the two sklearn options, mirroring
+/// the role of sklearn's `StrOptions` parameter constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Solver {
+    /// L-BFGS-B (sklearn's default `"lbfgs"`): a quasi-Newton optimizer on the
+    /// penalized loss + gradient (`glm.py:263-284`). In ferrolearn the fit is
+    /// performed by IRLS, which reaches the same convex optimum (R-DEV-7).
+    Lbfgs,
+    /// Newton-Cholesky (sklearn's `"newton-cholesky"`): Newton-Raphson steps
+    /// with an inner Cholesky solve, equivalent in exact arithmetic to iterated
+    /// reweighted least squares (`glm.py:72-78, :285-296`). In ferrolearn the
+    /// fit is performed by IRLS, which reaches the same convex optimum (R-DEV-7).
+    NewtonCholesky,
 }
 
 // ---------------------------------------------------------------------------
@@ -425,21 +461,31 @@ pub struct GLMRegressor<F> {
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// Optimization algorithm requested, mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS / Fisher-scoring regardless of this value
+    /// (R-DEV-7); the parameter is accepted for sklearn API parity (R-DEV-2) and
+    /// the observable `coef_` / `intercept_` match sklearn for either value
+    /// because IRLS reaches the same convex optimum as both `lbfgs` and
+    /// `newton-cholesky`. See [`Solver`].
+    pub solver: Solver,
 }
 
 impl<F: Float + FromPrimitive> GLMRegressor<F> {
     /// Create a new `GLMRegressor` with the given family.
     ///
     /// Defaults: `alpha = 1.0`, `max_iter = 100`, `tol = 1e-4`,
-    /// `fit_intercept = true`.
+    /// `fit_intercept = true`, `solver = Solver::Lbfgs` (sklearn default).
     #[must_use]
     pub fn new(family: GLMFamily) -> Self {
         Self {
             family,
             alpha: F::one(),
             max_iter: 100,
-            tol: F::from(1e-4).unwrap(),
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
+            solver: Solver::Lbfgs,
         }
     }
 
@@ -468,6 +514,19 @@ impl<F: Float + FromPrimitive> GLMRegressor<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the optimization [`Solver`], mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of the value (R-DEV-7); the parameter
+    /// is accepted for sklearn API parity (R-DEV-2) and both values produce the
+    /// same observable `coef_` / `intercept_` (IRLS reaches the same convex
+    /// optimum as both `lbfgs` and `newton-cholesky`).
+    #[must_use]
+    pub fn with_solver(mut self, solver: Solver) -> Self {
+        self.solver = solver;
         self
     }
 }
@@ -691,20 +750,28 @@ pub struct PoissonRegressor<F> {
     pub tol: F,
     /// Whether to fit an intercept.
     pub fit_intercept: bool,
+    /// Optimization algorithm requested, mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of this value (R-DEV-7); the parameter
+    /// is accepted for sklearn API parity (R-DEV-2) and the observable
+    /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
+    pub solver: Solver,
 }
 
 impl<F: Float + FromPrimitive> PoissonRegressor<F> {
     /// Create a new `PoissonRegressor` with default settings.
     ///
     /// Defaults: `alpha = 1.0`, `max_iter = 100`, `tol = 1e-4`,
-    /// `fit_intercept = true`.
+    /// `fit_intercept = true`, `solver = Solver::Lbfgs` (sklearn default).
     #[must_use]
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
             max_iter: 100,
-            tol: F::from(1e-4).unwrap(),
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
+            solver: Solver::Lbfgs,
         }
     }
 
@@ -733,6 +800,18 @@ impl<F: Float + FromPrimitive> PoissonRegressor<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the optimization [`Solver`], mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of the value (R-DEV-7); both values
+    /// produce the same observable `coef_` / `intercept_` (sklearn API parity,
+    /// R-DEV-2).
+    #[must_use]
+    pub fn with_solver(mut self, solver: Solver) -> Self {
+        self.solver = solver;
         self
     }
 }
@@ -791,20 +870,28 @@ pub struct GammaRegressor<F> {
     pub tol: F,
     /// Whether to fit an intercept.
     pub fit_intercept: bool,
+    /// Optimization algorithm requested, mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of this value (R-DEV-7); the parameter
+    /// is accepted for sklearn API parity (R-DEV-2) and the observable
+    /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
+    pub solver: Solver,
 }
 
 impl<F: Float + FromPrimitive> GammaRegressor<F> {
     /// Create a new `GammaRegressor` with default settings.
     ///
     /// Defaults: `alpha = 1.0`, `max_iter = 100`, `tol = 1e-4`,
-    /// `fit_intercept = true`.
+    /// `fit_intercept = true`, `solver = Solver::Lbfgs` (sklearn default).
     #[must_use]
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
             max_iter: 100,
-            tol: F::from(1e-4).unwrap(),
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
+            solver: Solver::Lbfgs,
         }
     }
 
@@ -833,6 +920,18 @@ impl<F: Float + FromPrimitive> GammaRegressor<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the optimization [`Solver`], mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of the value (R-DEV-7); both values
+    /// produce the same observable `coef_` / `intercept_` (sklearn API parity,
+    /// R-DEV-2).
+    #[must_use]
+    pub fn with_solver(mut self, solver: Solver) -> Self {
+        self.solver = solver;
         self
     }
 }
@@ -900,6 +999,13 @@ pub struct TweedieRegressor<F> {
     pub tol: F,
     /// Whether to fit an intercept.
     pub fit_intercept: bool,
+    /// Optimization algorithm requested, mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of this value (R-DEV-7); the parameter
+    /// is accepted for sklearn API parity (R-DEV-2) and the observable
+    /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
+    pub solver: Solver,
 }
 
 impl<F: Float + FromPrimitive> TweedieRegressor<F> {
@@ -907,7 +1013,8 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
     ///
     /// Defaults match sklearn's `TweedieRegressor.__init__` (`glm.py:864-887`):
     /// `power = 0.0` (Normal), `link = LinkConfig::Auto`, `alpha = 1.0`,
-    /// `max_iter = 100`, `tol = 1e-4`, `fit_intercept = true`. With the default
+    /// `max_iter = 100`, `tol = 1e-4`, `fit_intercept = true`,
+    /// `solver = Solver::Lbfgs` (sklearn default). With the default
     /// `power = 0.0` and `Auto` link, the model is Normal/identity-link (OLS).
     #[must_use]
     pub fn new() -> Self {
@@ -918,6 +1025,7 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
             max_iter: 100,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
+            solver: Solver::Lbfgs,
         }
     }
 
@@ -962,6 +1070,18 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the optimization [`Solver`], mirroring sklearn's `solver` parameter
+    /// (`glm.py:140-145`, default `"lbfgs"`).
+    ///
+    /// ferrolearn fits via IRLS regardless of the value (R-DEV-7); both values
+    /// produce the same observable `coef_` / `intercept_` (sklearn API parity,
+    /// R-DEV-2).
+    #[must_use]
+    pub fn with_solver(mut self, solver: Solver) -> Self {
+        self.solver = solver;
         self
     }
 }
@@ -1938,6 +2058,36 @@ mod tests {
     fn test_tweedie_with_link_builder() {
         let m = TweedieRegressor::<f64>::new().with_link(LinkConfig::Log);
         assert_eq!(m.link, LinkConfig::Log);
+    }
+
+    // ---- Solver (sklearn API parity, glm.py:140-145) ----
+
+    #[test]
+    fn test_solver_default_lbfgs() {
+        // sklearn default solver='lbfgs' (glm.py:155).
+        assert_eq!(
+            GLMRegressor::<f64>::new(GLMFamily::Poisson).solver,
+            Solver::Lbfgs
+        );
+        assert_eq!(PoissonRegressor::<f64>::new().solver, Solver::Lbfgs);
+        assert_eq!(GammaRegressor::<f64>::new().solver, Solver::Lbfgs);
+        assert_eq!(TweedieRegressor::<f64>::new().solver, Solver::Lbfgs);
+    }
+
+    #[test]
+    fn test_with_solver_builder() {
+        assert_eq!(
+            PoissonRegressor::<f64>::new()
+                .with_solver(Solver::NewtonCholesky)
+                .solver,
+            Solver::NewtonCholesky
+        );
+        assert_eq!(
+            GLMRegressor::<f64>::new(GLMFamily::Gamma)
+                .with_solver(Solver::NewtonCholesky)
+                .solver,
+            Solver::NewtonCholesky
+        );
     }
 
     // ---- Variance function ----

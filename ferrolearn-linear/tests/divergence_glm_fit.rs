@@ -33,6 +33,7 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::{Fit, Predict};
+use ferrolearn_linear::glm::Solver;
 use ferrolearn_linear::{GammaRegressor, PoissonRegressor, TweedieRegressor};
 use ndarray::{Array1, Array2};
 
@@ -834,6 +835,71 @@ fn glm_tweedie_d2_score() {
         (d2 - SK_D2).abs() < 1e-6,
         "Tweedie(power=1.5) D²: sklearn {SK_D2}, ferrolearn {d2}"
     );
+}
+
+// ===========================================================================
+// #556 — `solver` parameter (lbfgs / newton-cholesky) API parity (R-DEV-2)
+// via IRLS (R-DEV-7).
+//
+// sklearn exposes `solver ∈ {'lbfgs','newton-cholesky'}` (default 'lbfgs',
+// `glm.py:140-145`, `StrOptions({"lbfgs","newton-cholesky"})`). Both sklearn
+// solvers minimize the SAME convex penalized GLM objective and reach the SAME
+// optimum. ferrolearn fits via IRLS/Fisher-scoring — a third solver that reaches
+// that same optimum — so per R-DEV-2 (match the constructor parameter
+// names/defaults/constraints) + R-DEV-7 (implementation may differ while
+// preserving the observable contract), the `solver` param is exposed as a
+// validated part of the ABI and the observable `coef_`/`intercept_` match
+// sklearn for EITHER value (the optimum is solver-invariant).
+// ===========================================================================
+
+/// `PoissonRegressor(alpha=0.5)` fitted with `Solver::Lbfgs` AND
+/// `Solver::NewtonCholesky` produces the SAME `coef_`/`intercept_`, matching the
+/// (solver-invariant) live sklearn oracle for both values (#556).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:140-145` — the `solver`
+/// parameter constraint `StrOptions({"lbfgs", "newton-cholesky"})`, default
+/// `"lbfgs"`. Both solvers reach the same convex optimum.
+///
+/// Oracle (live sklearn 1.5.2 — solver-invariant to ~1e-9):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   m=PoissonRegressor(alpha=0.5,solver='lbfgs',max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_.tolist()), repr(m.intercept_))"
+/// # lbfgs           -> [0.3838852306065439, 0.20239975413374428] -0.5193574932086451
+/// # newton-cholesky -> [0.38388523050815737, 0.2023997532777797] -0.519357493320607
+/// ```
+/// Both ferrolearn solver values (fit via IRLS) must match this to 1e-4.
+#[test]
+fn glm_solver_param_invariant() {
+    // Live sklearn 1.5.2 oracle (solver-invariant; see invocation above).
+    const SK_COEF: [f64; 2] = [0.383_885_230_606_543_9, 0.202_399_754_133_744_28];
+    const SK_INTERCEPT: f64 = -0.519_357_493_208_645_1;
+
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+    for solver in [Solver::Lbfgs, Solver::NewtonCholesky] {
+        let fitted = PoissonRegressor::<f64>::new()
+            .with_alpha(0.5)
+            .with_solver(solver)
+            .with_max_iter(1000)
+            .with_tol(1e-10)
+            .fit(&x, &y)
+            .expect("fit");
+        let coef = fitted.coefficients();
+        assert!(
+            (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+            "solver={solver:?}: sklearn (solver-invariant) coef {SK_COEF:?}, \
+             ferrolearn (IRLS) {coef:?}"
+        );
+        assert!(
+            (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+            "solver={solver:?}: sklearn (solver-invariant) intercept {SK_INTERCEPT}, \
+             ferrolearn (IRLS) {}",
+            fitted.intercept()
+        );
+    }
 }
 
 /// `score` re-validates the y-domain: Gamma rejects `y == 0` in `score`, mirroring
