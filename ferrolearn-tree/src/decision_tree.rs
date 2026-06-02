@@ -728,6 +728,33 @@ impl<F: Float + Send + Sync + 'static> FittedPipelineEstimator<F>
 // Internal: tree building helpers
 // ---------------------------------------------------------------------------
 
+/// sklearn's constant-feature / equal-value split band.
+///
+/// Mirrors `FEATURE_THRESHOLD = 1e-7` in `sklearn/tree/_splitter.pyx:33`.
+/// A feature whose sorted value spread over a node's samples is
+/// `<= FEATURE_THRESHOLD` is considered constant (un-splittable), and a split
+/// between adjacent sorted values is only considered when
+/// `x[p] > x[p-1] + FEATURE_THRESHOLD` (`_splitter.pyx:405` and the per-pair
+/// `next_p` skip). `1e-7` is exactly representable in both `f32` and `f64`, so
+/// the `F::from` conversion is lossless; the `F::epsilon` fallback is defensive
+/// and never taken for the supported `f32`/`f64` types.
+fn feature_threshold<F: Float>() -> F {
+    F::from(1e-7).unwrap_or_else(F::epsilon)
+}
+
+/// Sort `idxs` ascending by feature `feat` of `x`, putting any NaN last.
+///
+/// Uses `Ordering::Equal` as the fallback for incomparable (NaN) pairs so the
+/// sort is total without panicking — no `partial_cmp(..).unwrap()` in
+/// production (R-CODE-2 / R-APG-1).
+fn sort_indices_by_feature<F: Float>(idxs: &mut [usize], x: &Array2<F>, feat: usize) {
+    idxs.sort_by(|&a, &b| {
+        x[[a, feat]]
+            .partial_cmp(&x[[b, feat]])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
 /// Traverse the tree from root to leaf for a single sample, returning the leaf node index.
 fn traverse_tree<F: Float>(nodes: &[Node<F>], sample: &ndarray::ArrayView1<F>) -> usize {
     let mut idx = 0;
@@ -836,11 +863,21 @@ fn make_classification_leaf<F: Float>(
     n_classes: usize,
     n_samples: usize,
 ) -> usize {
-    let majority_class = class_counts
-        .iter()
-        .enumerate()
-        .max_by_key(|&(_, &count)| count)
-        .map_or(0, |(i, _)| i);
+    // Majority class = argmax of the class counts. On a count tie, sklearn's
+    // `np.argmax` returns the LOWEST index, so we update only on a strictly
+    // greater count (keeping the first maximum) rather than `max_by_key`,
+    // which would return the last.
+    let majority_class = {
+        let mut best = 0usize;
+        let mut best_count = 0usize;
+        for (i, &count) in class_counts.iter().enumerate() {
+            if count > best_count {
+                best_count = count;
+                best = i;
+            }
+        }
+        best
+    };
 
     let total_f = if n_samples > 0 {
         F::from(n_samples).unwrap()
@@ -975,9 +1012,20 @@ fn find_best_classification_split<F: Float>(
         },
     };
 
+    let threshold_band = feature_threshold::<F>();
+
     for feat in candidate_features {
         let mut sorted_indices: Vec<usize> = indices.to_vec();
-        sorted_indices.sort_by(|&a, &b| data.x[[a, feat]].partial_cmp(&data.x[[b, feat]]).unwrap());
+        sort_indices_by_feature(&mut sorted_indices, data.x, feat);
+
+        // Constant-feature band: if the sorted spread (max - min) over this
+        // node is within FEATURE_THRESHOLD, sklearn treats the feature as
+        // constant and never splits on it (`_splitter.pyx:405`).
+        let feat_min = data.x[[sorted_indices[0], feat]];
+        let feat_max = data.x[[sorted_indices[n - 1], feat]];
+        if feat_max <= feat_min + threshold_band {
+            continue;
+        }
 
         let mut left_counts = vec![0usize; data.n_classes];
         let mut right_counts = parent_counts.clone();
@@ -991,8 +1039,10 @@ fn find_best_classification_split<F: Float>(
             left_n += 1;
             let right_n = n - left_n;
 
+            // Only consider a split where adjacent sorted values differ by more
+            // than FEATURE_THRESHOLD (sklearn's `next_p` skip, `_splitter.pyx`).
             let next_idx = sorted_indices[split_pos + 1];
-            if data.x[[idx, feat]] == data.x[[next_idx, feat]] {
+            if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
                 continue;
             }
 
@@ -1146,9 +1196,19 @@ fn find_best_regression_split<F: Float>(
         },
     };
 
+    let threshold_band = feature_threshold::<F>();
+
     for feat in candidate_features {
         let mut sorted_indices: Vec<usize> = indices.to_vec();
-        sorted_indices.sort_by(|&a, &b| data.x[[a, feat]].partial_cmp(&data.x[[b, feat]]).unwrap());
+        sort_indices_by_feature(&mut sorted_indices, data.x, feat);
+
+        // Constant-feature band: spread (max - min) within FEATURE_THRESHOLD ⇒
+        // sklearn treats the feature as constant (`_splitter.pyx:405`).
+        let feat_min = data.x[[sorted_indices[0], feat]];
+        let feat_max = data.x[[sorted_indices[n - 1], feat]];
+        if feat_max <= feat_min + threshold_band {
+            continue;
+        }
 
         let mut left_sum = F::zero();
         let mut left_sum_sq = F::zero();
@@ -1162,8 +1222,10 @@ fn find_best_regression_split<F: Float>(
             left_n += 1;
             let right_n = n - left_n;
 
+            // Adjacent sorted values must differ by more than FEATURE_THRESHOLD
+            // (sklearn's `next_p` skip, `_splitter.pyx`).
             let next_idx = sorted_indices[split_pos + 1];
-            if data.x[[idx, feat]] == data.x[[next_idx, feat]] {
+            if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
                 continue;
             }
 
