@@ -243,6 +243,8 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree bagging.rs fit panics (index OOB) for max_features<1.0 — aggregate_tree_importances double-maps original feature index through feature_indices[t] (#719)
+- Divergence: ferrolearn-tree FittedBaggingClassifier::predict hard-votes; sklearn BaggingClassifier.predict soft-votes (_bagging.py:913-914) (#718)
 - Divergence: ferrolearn-tree adaboost::fit_samme missing perfect-fit estimator_weight=1.0 guard (_weight_boosting.py:679-680) (#710)
 - Divergence: ferrolearn-tree adaboost::fit_samme fits resampled UNWEIGHTED stump vs sklearn weighted fit (_weight_boosting.py:664) (#709)
 - Divergence: ferrolearn-tree AdaBoostRegressor::fit reweight exponent diverges from sklearn/ensemble/_weight_boosting.py:1209-1211 (missing * learning_rate) (#703)
