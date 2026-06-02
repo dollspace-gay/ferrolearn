@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- decision_tree: class_weight (None/balanced/dict) (#665)
 - decision_tree: max_leaf_nodes best-first growth (#664)
 - decision_tree: ccp_alpha minimal cost-complexity pruning (#663)
 - decision_tree: min_impurity_decrease + min_weight_fraction_leaf stopping gates (#662)
