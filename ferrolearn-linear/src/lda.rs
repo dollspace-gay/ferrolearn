@@ -12,7 +12,9 @@
 //! # Algorithm (`_solve_svd`, `discriminant_analysis.py:487-559`)
 //!
 //! With `n = n_samples`, `c = n_classes`:
-//! 1. `priors_ = n_k / n` (empirical; sklearn's `priors=None` default).
+//! 1. `priors_`: empirical `n_k / n` when the constructor `priors` is `None`
+//!    (sklearn's default), else the provided `priors` used VERBATIM
+//!    (`discriminant_analysis.py:601-605`).
 //! 2. `means_` = per-class mean; `xbar_ = priors_ @ means_`.
 //! 3. `Xc` = each sample minus its class mean (stacked); `std = std(Xc, axis=0)`
 //!    (population, `ddof=0`), zeros replaced by `1`.
@@ -47,10 +49,10 @@
 //! | REQ-3 (predict_proba prior-aware) | SHIPPED | `FittedLDA::predict_proba` = `softmax(decision_function)` (`discriminant_analysis.py:711`); rows sum to 1. Test `lda_imbalanced_priors_predict` proba block <1e-6 vs live oracle. #590 (partial: multiclass softmax; binary `expit` collapse pends #600). |
 //! | REQ-5 (transform parity) | SHIPPED | `fn transform` = `((X - xbar_) @ scalings_)[:, :max_components]` (`discriminant_analysis.py:684-689`). Test `lda_transform_parity` <1e-6 (per-column sign) vs live oracle. #592. |
 //! | REQ-6 (n_components bound) | SHIPPED | `fn fit` computes `max_components = min(n_classes-1, n_features)`, defaults `None` to it, errors `Some(0)`/`Some(k>max)` (`discriminant_analysis.py:614-625`). Tests `test_lda_default_n_components`, `test_lda_error_zero_n_components`, `test_lda_error_n_components_too_large`. |
-//! | REQ-7 (empirical priors) | SHIPPED | `fn fit` resolves `priors_ = n_k/n` (`discriminant_analysis.py:601-603`); `FittedLDA::priors` exposes them; the priors enter the decision via `intercept_ += log(priors_)` (`:557`). Test `lda_imbalanced_priors_predict` (priors `[0.9091,0.0909]` flip the label). Provided-`priors` parameter pends #593. |
+//! | REQ-7 (priors: None=empirical + provided) | SHIPPED | `fn fit` resolves `priors_`: empirical `n_k/n` when `priors` is `None` (`discriminant_analysis.py:601-603`), else the provided `LDA::with_priors` array VERBATIM (`:605`); R-DEV-4 length check (`p.len() != n_classes` → `ShapeMismatch`, sklearn would mis-index `:540,557`). The resolved priors flow into `xbar_ = priors_ @ means_` (`:517`), the between-class scaling `sqrt(n·priors_·fac)` (`:540`), and `intercept_ += log(priors_)` (`:557`). `FittedLDA::priors` exposes `priors_`. (Empirical was already done; this commit completes provided.) Consumer: the resolved `priors` is read by `fn fit` (xbar_/scaling/intercept_); `Predict for FittedLDA` consumes the prior-shifted decision. Tests: `lda_imbalanced_priors_predict` (empirical `[0.9091,0.0909]` flips the label), `lda_provided_priors` (`with_priors([0.9,0.1])` `predict_proba` <1e-6 vs live oracle; empirical default differs). #593. |
 //! | REQ-8 (coef_/intercept_/xbar_) | SHIPPED | `FittedLDA::{coef, intercept, xbar}` accessors expose the `_solve_svd` arrays (`discriminant_analysis.py:556-559,517`). Consumer: `fn decision_function` reads `coef_`/`intercept_`; `fn transform` reads `xbar_`. Verified via `lda_decision_function_parity` (decision = `X@coef_.T+intercept_`) + `lda_transform_parity` (uses `xbar_`). |
 //! | REQ-13 (explained_variance_ratio_) | SHIPPED | `fn fit` sets `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]` from the SECOND (between-class) SVD (`discriminant_analysis.py:550-552`). Test `test_lda_explained_variance_ratio_oracle` <1e-9 vs live `L().explained_variance_ratio_`. #599. |
-//! | REQ-4 (predict_log_proba smallest_normal floor) | NOT-STARTED | open prereq blocker #591. `fn predict_log_proba` returns `crate::log_proba(&predict_proba)` (clamps at `1e-300`), not sklearn's exact-zero `smallest_normal` floor (`discriminant_analysis.py:729-736`). |
+//! | REQ-4 (predict_log_proba smallest_normal floor) | SHIPPED | `FittedLDA::predict_log_proba` mirrors sklearn exactly (`discriminant_analysis.py:713-737`): `predict_proba` then `prediction[prediction == 0.0] += smallest_normal` (`F::min_positive_value()` = numpy `finfo.smallest_normal`, `:729-736`) before `log`, so nonzero probas keep their true `ln` and exact zeros become `log(MIN_POSITIVE)` (not `-inf`). Consumer: shares `FittedLDA::predict_proba` (the `Predict` path). Test `lda_predict_log_proba` (overlapping 3-class, all-finite log-probas) <1e-6 vs live `LinearDiscriminantAnalysis().predict_log_proba`. #591. |
 //! | REQ-9 (lsqr solver) | NOT-STARTED | open prereq blocker #595. Only the `svd` solver exists; no `solver` parameter, no `_solve_lstsq` (`discriminant_analysis.py:365-419`). |
 //! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. No `solver="eigen"` generalized-eigenvalue path (`discriminant_analysis.py:421-485`). |
 //! | REQ-11 (shrinkage) | NOT-STARTED | open prereq blocker #597. No `shrinkage` parameter / Ledoit-Wolf `'auto'` (`discriminant_analysis.py:339,628-629`). |
@@ -96,6 +98,10 @@ use num_traits::{Float, NumCast};
 /// `solver="svd"` path (`discriminant_analysis.py:487-559`) and returns a
 /// [`FittedLDA`].
 ///
+/// Use [`LDA::with_priors`] to supply class priors (sklearn's `priors`,
+/// `discriminant_analysis.py:359`); the default `None` infers the empirical
+/// priors `n_k / n` at fit time.
+///
 /// # Type Parameters
 ///
 /// - `F`: The floating-point scalar type (`f32` or `f64`).
@@ -105,6 +111,15 @@ pub struct LDA<F> {
     ///
     /// If `None`, defaults to `min(n_classes - 1, n_features)` at fit time.
     n_components: Option<usize>,
+
+    /// Class prior probabilities (sklearn's `priors`,
+    /// `discriminant_analysis.py:351,359`).
+    ///
+    /// `None` (sklearn's default) ⇒ the empirical priors `n_k / n` are inferred
+    /// from the training data at fit time. `Some(p)` ⇒ `p` is used VERBATIM as
+    /// `priors_` (matching sklearn `:605`, `self.priors_ = xp.asarray(self.priors)`).
+    priors: Option<Array1<F>>,
+
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -117,6 +132,7 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
     pub fn new(n_components: Option<usize>) -> Self {
         Self {
             n_components,
+            priors: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -125,6 +141,27 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
     #[must_use]
     pub fn n_components(&self) -> Option<usize> {
         self.n_components
+    }
+
+    /// Set the class prior probabilities (sklearn's `priors`,
+    /// `discriminant_analysis.py:351,359`).
+    ///
+    /// The provided vector is used VERBATIM as `priors_` (sklearn does not
+    /// normalize it here when it already sums to 1, `:605`). Its length must
+    /// equal the number of classes seen at fit time, or [`Fit::fit`] returns
+    /// [`FerroError::ShapeMismatch`]. Pass nothing (the `None` default) to infer
+    /// the empirical priors `n_k / n` from the training data (`:601-603`).
+    #[must_use]
+    pub fn with_priors(mut self, priors: Array1<F>) -> Self {
+        self.priors = Some(priors);
+        self
+    }
+
+    /// Return the configured class priors (`None` ⇒ empirical at fit time).
+    /// Mirrors sklearn's constructor `priors` (`discriminant_analysis.py:359`).
+    #[must_use]
+    pub fn priors(&self) -> Option<&Array1<F>> {
+        self.priors.as_ref()
     }
 }
 
@@ -159,8 +196,9 @@ pub struct FittedLDA<F> {
     /// Mirrors sklearn's `xbar_` (`discriminant_analysis.py:517`).
     xbar: Array1<F>,
 
-    /// Empirical class priors `n_k / n`, length `n_classes`. Mirrors sklearn's
-    /// `priors_` (`discriminant_analysis.py:601-603`).
+    /// Resolved class priors `priors_`, length `n_classes`. Empirical `n_k / n`
+    /// when the constructor `priors` was `None`, else the provided `priors`
+    /// verbatim. Mirrors sklearn's `priors_` (`discriminant_analysis.py:601-605`).
     priors: Array1<F>,
 
     /// Affine classifier coefficients `coef_`, shape `(n_classes, n_features)`.
@@ -212,8 +250,9 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
         &self.xbar
     }
 
-    /// Empirical class priors `priors_`, length `n_classes`. Mirrors sklearn's
-    /// `priors_` (`discriminant_analysis.py:601-603`).
+    /// Resolved class priors `priors_`, length `n_classes` (empirical `n_k / n`
+    /// when the constructor `priors` was `None`, else the provided `priors`
+    /// verbatim). Mirrors sklearn's `priors_` (`discriminant_analysis.py:601-605`).
     #[must_use]
     pub fn priors(&self) -> &Array1<F> {
         &self.priors
@@ -313,16 +352,28 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
     }
 
     /// Element-wise log of [`predict_proba`](Self::predict_proba). Mirrors
-    /// sklearn `predict_log_proba` (`discriminant_analysis.py:713-737`), modulo
-    /// the exact-zero `smallest_normal` floor (REQ-4/#591 — this uses the
-    /// crate-shared `1e-300` clamp).
+    /// sklearn `predict_log_proba` exactly (`discriminant_analysis.py:713-737`):
+    /// entries that are EXACTLY `0.0` are bumped by the dtype's
+    /// `smallest_normal` (`f32`/`f64::MIN_POSITIVE`) before taking `log`
+    /// (`:729-736`), so `log(0)` becomes `log(MIN_POSITIVE)` rather than `-inf`;
+    /// every nonzero probability keeps its true `ln`.
     ///
     /// # Errors
     ///
     /// Forwards any error from [`predict_proba`](Self::predict_proba).
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let proba = self.predict_proba(x)?;
-        Ok(crate::log_proba(&proba))
+        // sklearn: prediction[prediction == 0.0] += smallest_normal; log(prediction).
+        // `F::min_positive_value()` is numpy's `finfo(dtype).smallest_normal`
+        // (`f64::MIN_POSITIVE` ≈ 2.2250738585072014e-308).
+        let smallest_normal = F::min_positive_value();
+        Ok(proba.mapv(|p| {
+            if p == F::zero() {
+                (p + smallest_normal).ln()
+            } else {
+                p.ln()
+            }
+        }))
     }
 }
 
@@ -500,11 +551,30 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
             }
         }
 
-        // --- priors_ = n_k / n  (empirical; sklearn :601-603) -----------------
-        let mut priors = Array1::<F>::zeros(n_classes);
-        for idx in 0..n_classes {
-            priors[idx] = usize_to_f::<F>(class_indices[idx].len())? / n_f;
-        }
+        // --- priors_  (sklearn :601-605) --------------------------------------
+        // `priors=None` (default) ⇒ empirical `n_k / n` inferred from the data
+        // (`:601-603`). `Some(p)` ⇒ `p` used VERBATIM (`:605`,
+        // `self.priors_ = xp.asarray(self.priors)`). sklearn would mis-index a
+        // wrong-length array, so reject it up front (R-DEV-4 length check).
+        let priors = match &self.priors {
+            None => {
+                let mut priors = Array1::<F>::zeros(n_classes);
+                for idx in 0..n_classes {
+                    priors[idx] = usize_to_f::<F>(class_indices[idx].len())? / n_f;
+                }
+                priors
+            }
+            Some(p) => {
+                if p.len() != n_classes {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n_classes],
+                        actual: vec![p.len()],
+                        context: "LDA: priors length must match number of classes".into(),
+                    });
+                }
+                p.clone()
+            }
+        };
 
         // --- xbar_ = priors_ @ means_  (sklearn :517) -------------------------
         let mut xbar = Array1::<F>::zeros(n_features);
@@ -1098,6 +1168,19 @@ mod tests {
         assert_eq!(lda.n_components(), Some(2));
         let lda_none = LDA::<f64>::new(None);
         assert_eq!(lda_none.n_components(), None);
+    }
+
+    #[test]
+    fn test_lda_priors_builder_default_none() {
+        // Default (sklearn `priors=None`, discriminant_analysis.py:359).
+        let lda = LDA::<f64>::new(None);
+        assert!(lda.priors().is_none());
+        // with_priors stores the vector verbatim.
+        let lda = lda.with_priors(array![0.7, 0.3]);
+        let p = lda.priors().cloned().unwrap_or_default();
+        assert_eq!(p.len(), 2);
+        assert_abs_diff_eq!(p[0], 0.7, epsilon = 1e-12);
+        assert_abs_diff_eq!(p[1], 0.3, epsilon = 1e-12);
     }
 
     /// Re-oracled (was `test_lda_transform_then_predict_consistent`, which

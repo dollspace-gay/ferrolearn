@@ -25,11 +25,12 @@
 //! python invocation that produced each constant is recorded in a comment.
 //!
 //! Tracking: #588 (decision_function / svd fit), #589 (predict argmax /
-//! imbalanced priors), #592 (transform).
+//! imbalanced priors), #592 (transform), #593 (provided `priors`),
+//! #591 (`predict_log_proba`).
 
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_linear::LDA;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 // ===========================================================================
 // Balanced 3-class / 2-feature dataset for transform + decision_function.
@@ -284,6 +285,241 @@ fn lda_imbalanced_priors_predict() {
                 "imbalanced predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
                 SK_PROBA_EVAL[i][c],
                 proba[[i, c]]
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// #593 — provided `priors` (LDA::with_priors).
+//
+// sklearn's constructor `priors` (default `None`,
+// `discriminant_analysis.py:351,359`) feeds `priors_` directly when given
+// (`:605`, `self.priors_ = xp.asarray(self.priors)`, used VERBATIM — no
+// renormalization when it already sums to 1). The provided priors flow into
+// `xbar_ = priors_ @ means_` (`:517`), the between-class scaling
+// `sqrt(n·priors_·fac)` (`:540`), and `intercept_ += log(priors_)` (`:557`),
+// shifting the affine decision relative to the empirical default.
+// ===========================================================================
+
+fn pp_x() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 1.0, 2.0, 0.5, 0.5, 2.0, // class 0
+            5.0, 5.0, 6.0, 4.5, 4.5, 6.0, 5.5, 5.5, // class 1
+        ],
+    )
+    .unwrap()
+}
+
+fn pp_y() -> Array1<usize> {
+    Array1::from(vec![0, 0, 0, 0, 1, 1, 1, 1])
+}
+
+/// #593 (REQ-7): provided `priors=[0.9, 0.1]` are used VERBATIM as `priors_`
+/// and shift the decision (via `xbar_` + `log(priors_)`) relative to the
+/// empirical `[0.5, 0.5]` default. The `predict_proba` matches the live oracle
+/// to 1e-6, `priors()` returns the provided vector verbatim, and the empirical
+/// default differs.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,0.5],[0.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   print(repr(L(priors=[0.9,0.1]).fit(X,y).predict_proba(X).tolist()))"
+/// # [[1.0, 4.4173717141944625e-31], [1.0, 1.759372325813511e-21],
+/// #  [1.0, 4.419836550435889e-19], [1.0, 4.419836550435889e-19],
+/// #  [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+/// ```
+/// The empirical default `priors_ = [0.5, 0.5]` (verified live by `L().fit(...)`)
+/// produces a strictly different `priors_` vector.
+#[test]
+fn lda_provided_priors() {
+    // Live sklearn 1.5.2 predict_proba with priors=[0.9, 0.1] (shape (8, 2)).
+    const SK_PROBA: [[f64; 2]; 8] = [
+        [1.0, 4.4173717141944625e-31],
+        [1.0, 1.759372325813511e-21],
+        [1.0, 4.419836550435889e-19],
+        [1.0, 4.419836550435889e-19],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ];
+
+    let x = pp_x();
+    let y = pp_y();
+
+    let fitted = LDA::<f64>::new(None)
+        .with_priors(array![0.9, 0.1])
+        .fit(&x, &y)
+        .unwrap();
+
+    // priors_ is the provided vector VERBATIM (sklearn :605).
+    let priors = fitted.priors();
+    assert_eq!(priors.len(), 2);
+    assert!(
+        (priors[0] - 0.9).abs() < 1e-12,
+        "priors_[0] = {}",
+        priors[0]
+    );
+    assert!(
+        (priors[1] - 0.1).abs() < 1e-12,
+        "priors_[1] = {}",
+        priors[1]
+    );
+
+    // predict_proba matches the live oracle to 1e-6 (shape-stable (n, 2)).
+    let proba = fitted.predict_proba(&x).unwrap();
+    assert_eq!(proba.dim(), (8, 2), "predict_proba shape");
+    for i in 0..8 {
+        for c in 0..2 {
+            assert!(
+                (proba[[i, c]] - SK_PROBA[i][c]).abs() < 1e-6,
+                "provided-priors predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_PROBA[i][c],
+                proba[[i, c]]
+            );
+        }
+    }
+
+    // The empirical default (priors=None) resolves a DIFFERENT priors_
+    // ([0.5, 0.5], the live sklearn `L().fit(X,y).priors_`).
+    let empirical = LDA::<f64>::new(None).fit(&x, &y).unwrap();
+    let emp = empirical.priors();
+    assert!(
+        (emp[0] - 0.5).abs() < 1e-12 && (emp[1] - 0.5).abs() < 1e-12,
+        "empirical priors_ should be [0.5, 0.5], got [{}, {}]",
+        emp[0],
+        emp[1]
+    );
+    assert!(
+        (emp[0] - priors[0]).abs() > 1e-3,
+        "empirical priors_ must differ from the provided [0.9, 0.1]"
+    );
+}
+
+/// #593 (REQ-7, R-DEV-4): a `priors` vector whose length does not match the
+/// number of classes is rejected (sklearn would silently mis-index it when
+/// computing `xbar_`/`intercept_`, `:517,540,557`). `with_priors([0.3,0.3,0.4])`
+/// on a 2-class dataset → `Err`.
+#[test]
+fn lda_provided_priors_length_mismatch() {
+    let x = pp_x();
+    let y = pp_y(); // 2 classes
+    let result = LDA::<f64>::new(None)
+        .with_priors(array![0.3, 0.3, 0.4])
+        .fit(&x, &y);
+    assert!(
+        result.is_err(),
+        "3-element priors on a 2-class dataset must error"
+    );
+}
+
+// ===========================================================================
+// #591 — predict_log_proba oracle pin.
+//
+// sklearn's `predict_log_proba` (`discriminant_analysis.py:713-737`) is
+// `predict_proba` followed by an exact-zero `smallest_normal` floor and
+// elementwise `log`. On an OVERLAPPING multiclass dataset every probability is
+// strictly positive, so every log-proba is finite and the floor never fires —
+// a clean 1e-6 assertion against the live oracle.
+// ===========================================================================
+
+fn lp_x() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (12, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 2.0, 1.5, // class 0
+            2.0, 2.0, 3.0, 1.8, 1.8, 2.5, 2.5, 3.0, // class 1
+            1.0, 3.0, 2.0, 4.0, 0.5, 3.5, 3.0, 2.0, // class 2
+        ],
+    )
+    .unwrap()
+}
+
+fn lp_y() -> Array1<usize> {
+    Array1::from(vec![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2])
+}
+
+/// #591 (REQ-4): `predict_log_proba(X) = log(predict_proba(X))` with sklearn's
+/// exact-zero `smallest_normal` floor (`discriminant_analysis.py:713-737`). On
+/// this overlapping 3-class set all log-probas are finite; match the live
+/// oracle to 1e-6.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,.5],[.5,1.],[2.,1.5],[2.,2.],[3.,1.8],[1.8,2.5],[2.5,3.],\
+///               [1.,3.],[2.,4.],[.5,3.5],[3.,2.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+///   print(repr(L().fit(X,y).predict_log_proba(X).tolist()))"
+/// ```
+#[test]
+fn lda_predict_log_proba() {
+    // Live sklearn 1.5.2 predict_log_proba(X) (shape (12, 3), all finite).
+    const SK_LOG_PROBA: [[f64; 3]; 12] = [
+        [
+            -0.0001587412147669112,
+            -8.81424374538817,
+            -11.500273228176736,
+        ],
+        [
+            -0.007767261965175309,
+            -4.925071263751486,
+            -7.6522673234724765,
+        ],
+        [
+            -0.017383613399066335,
+            -4.260126861781577,
+            -5.772207198980196,
+        ],
+        [
+            -1.2117694284515876,
+            -0.48365825811924473,
+            -2.455665938735218,
+        ],
+        [-2.8079420405217523, -0.331196700457846, -1.50684942503638],
+        [
+            -4.035961820544284,
+            -0.11052331571747627,
+            -2.4422395556808483,
+        ],
+        [-4.400938867709207, -0.6051887244448422, -0.8169821863919637],
+        [-7.740817660189232, -0.6927305643344344, -0.6944341433230202],
+        [-5.336182619023403, -1.510315772151896, -0.2557370516856885],
+        [-11.60682696215518, -2.135544943165018, -0.1257778435937946],
+        [-7.052209041503329, -2.551781441228021, -0.08208699823944263],
+        [-4.758871118466485, -0.1339789457470513, -2.1471532032954483],
+    ];
+
+    let fitted = LDA::<f64>::new(Some(2)).fit(&lp_x(), &lp_y()).unwrap();
+    let log_proba = fitted.predict_log_proba(&lp_x()).unwrap();
+
+    assert_eq!(log_proba.dim(), (12, 3), "predict_log_proba shape");
+    for i in 0..12 {
+        // The max log-proba per row is <= 0 (it is log of a probability).
+        let row_max = (0..3)
+            .map(|c| log_proba[[i, c]])
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            row_max <= 1e-12,
+            "row {i} max log-proba {row_max} should be <= 0"
+        );
+        for c in 0..3 {
+            assert!(
+                log_proba[[i, c]].is_finite(),
+                "predict_log_proba[{i}][{c}] should be finite"
+            );
+            assert!(
+                (log_proba[[i, c]] - SK_LOG_PROBA[i][c]).abs() < 1e-6,
+                "predict_log_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_LOG_PROBA[i][c],
+                log_proba[[i, c]]
             );
         }
     }
