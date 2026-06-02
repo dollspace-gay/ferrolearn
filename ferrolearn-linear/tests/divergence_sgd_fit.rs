@@ -360,3 +360,82 @@ fn sgd_elasticnet_l1_ratio() {
          intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-5 / #526 (re-audit, parent #522) — `l1_ratio` is NOT validated to the
+// closed interval [0, 1].
+//
+// sklearn site: `sklearn/linear_model/_stochastic_gradient.py:2018` (regressor)
+//   and `:1217` (classifier):
+//     `"l1_ratio": [Interval(Real, 0, 1, closed="both")],`
+//   This `_parameter_constraints` entry is enforced by `@_fit_context`
+//   on EVERY `.fit()` regardless of `penalty`, so `l1_ratio=2.0` (or any value
+//   outside [0,1]) raises `InvalidParameterError` even under `penalty='l2'`.
+//   (Live oracle: SGDRegressor(penalty='l2', l1_ratio=2.0).fit(...) -> raises
+//    InvalidParameterError; same for penalty='elasticnet' and for l1_ratio<0.)
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `validate_reg_params`
+//   (`:1564-1599`) / `validate_clf_params` (`:835-870`) check only `eta0` and
+//   `alpha` — there is NO `l1_ratio` range check anywhere, so `with_l1_ratio(2.0)`
+//   is silently accepted and `fit` returns `Ok` (eff is clamped only implicitly
+//   by `effective_l1_ratio`, which for `penalty='l2'` ignores l1_ratio entirely).
+//
+// Fully deterministic: this is a parameter-validation contract, no RNG / no fit
+// trajectory involved — `fit` either errors (sklearn) or returns Ok (ferrolearn).
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[2.0,-1.0]]); y=np.array([3.0]); \
+/// SGDRegressor(penalty='l2',l1_ratio=2.0,alpha=0.1,eta0=0.1,learning_rate='constant', \
+///   max_iter=3,tol=None,random_state=0,shuffle=False).fit(X,y)"
+/// ```
+/// -> raises `sklearn.utils._param_validation.InvalidParameterError`
+///    ("The 'l1_ratio' parameter ... must be a float in the range [0, 1]").
+/// Also raises for `penalty='elasticnet'` and for `l1_ratio=-0.5` (live oracle).
+///
+/// ferrolearn `SGDRegressor::with_l1_ratio(2.0).fit(...)` returns `Ok` — no
+/// `InvalidParameter` error is produced — so this assertion (expecting an `Err`)
+/// FAILS against the current implementation.
+#[test]
+#[ignore = "divergence: l1_ratio not validated to [0,1]; tracking #540"]
+fn sgd_l1_ratio_out_of_range_rejected() {
+    let x = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
+    let y = Array1::from_vec(vec![3.0]);
+
+    // sklearn rejects l1_ratio outside [0, 1] regardless of penalty.
+    let model = SGDRegressor::<f64>::new()
+        .with_penalty(Penalty::L2)
+        .with_l1_ratio(2.0)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.1)
+        .with_max_iter(3)
+        .with_tol(-1.0)
+        .with_random_state(0);
+
+    let result = model.fit(&x, &y);
+    assert!(
+        result.is_err(),
+        "l1_ratio=2.0 out of [0,1]: sklearn raises InvalidParameterError, \
+         ferrolearn accepted it (fit returned Ok)"
+    );
+
+    // Negative l1_ratio is likewise rejected by sklearn.
+    let model_neg = SGDRegressor::<f64>::new()
+        .with_penalty(Penalty::ElasticNet)
+        .with_l1_ratio(-0.5)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.1)
+        .with_max_iter(3)
+        .with_tol(-1.0)
+        .with_random_state(0);
+
+    assert!(
+        model_neg.fit(&x, &y).is_err(),
+        "l1_ratio=-0.5 out of [0,1]: sklearn raises InvalidParameterError, \
+         ferrolearn accepted it (fit returned Ok)"
+    );
+}
