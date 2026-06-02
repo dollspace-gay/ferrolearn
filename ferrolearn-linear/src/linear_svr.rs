@@ -1,16 +1,26 @@
 //! Linear Support Vector Regressor.
 //!
-//! This module provides [`LinearSVR`], an optimized linear SVR that operates
-//! directly in the primal space without kernel overhead. It uses coordinate
-//! descent on the L2-regularized epsilon-insensitive or squared
-//! epsilon-insensitive loss.
+//! This module provides [`LinearSVR`], a liblinear-faithful linear SVR that
+//! operates directly in the primal space without kernel overhead. The fit
+//! minimizes the L2-regularized epsilon-insensitive (or squared
+//! epsilon-insensitive) objective
+//!
+//! ```text
+//!   min_w  0.5 * ||w||^2  +  C * sum_i  L_eps(y_i - w . x_i)
+//! ```
+//!
+//! (NO `1/n` averaging — the summed loss is scaled by `C`, matching
+//! `sklearn/svm/_base.py` `_fit_liblinear`). The solver is liblinear's dual
+//! coordinate descent for SVR (`solve_l2r_l1l2_svr` in
+//! `sklearn/svm/src/liblinear/linear.cpp:1051`), which converges to the unique
+//! minimizer of the strongly convex objective.
 //!
 //! # Examples
 //!
 //! ```
 //! use ferrolearn_linear::linear_svr::LinearSVR;
 //! use ferrolearn_core::{Fit, Predict};
-//! use ndarray::{array, Array1, Array2};
+//! use ndarray::{array, Array2};
 //!
 //! let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 //! let y = array![2.0, 4.0, 6.0, 8.0, 10.0];
@@ -31,47 +41,81 @@ use num_traits::Float;
 /// Loss function for [`LinearSVR`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearSVRLoss {
-    /// Epsilon-insensitive loss: `max(0, |y - f(x)| - epsilon)`.
+    /// Epsilon-insensitive loss: `max(0, |y - f(x)| - epsilon)` (L1, the
+    /// standard SVR loss). liblinear solver `L2R_L1LOSS_SVR_DUAL` (type 13).
     EpsilonInsensitive,
-    /// Squared epsilon-insensitive loss: `max(0, |y - f(x)| - epsilon)^2`.
+    /// Squared epsilon-insensitive loss: `max(0, |y - f(x)| - epsilon)^2` (L2).
+    /// liblinear solver `L2R_L2LOSS_SVR_DUAL` (type 12).
     SquaredEpsilonInsensitive,
 }
 
-/// Linear Support Vector Regressor (primal formulation).
+/// Linear Support Vector Regressor (primal objective, liblinear dual CD).
 ///
 /// Solves the L2-regularized epsilon-insensitive or squared
-/// epsilon-insensitive loss via coordinate descent in the primal.
+/// epsilon-insensitive objective `0.5*||w||^2 + C * sum_i L_eps(y_i - w.x_i)`
+/// via liblinear's dual coordinate descent. Mirrors `sklearn.svm.LinearSVR`.
 ///
 /// # Type Parameters
 ///
 /// - `F`: The floating-point type (`f32` or `f64`).
 #[derive(Debug, Clone)]
 pub struct LinearSVR<F> {
-    /// Inverse regularization strength.
+    /// Regularization parameter. The strength of the regularization is
+    /// inversely proportional to `C`. Must be strictly positive.
     pub c: F,
-    /// Width of the epsilon-insensitive tube.
+    /// Width of the epsilon-insensitive tube (sklearn default `0.0`).
     pub epsilon: F,
-    /// Maximum number of coordinate descent iterations.
+    /// Maximum number of dual coordinate descent iterations.
     pub max_iter: usize,
-    /// Convergence tolerance on the change in weight vector.
+    /// Convergence tolerance on the projected-gradient L1 norm.
     pub tol: F,
     /// Loss function to use.
     pub loss: LinearSVRLoss,
+    /// Whether to fit an intercept. When `true`, the design matrix is augmented
+    /// with a synthetic constant column equal to [`intercept_scaling`]; the
+    /// augmented weight is penalized like any feature (liblinear convention).
+    ///
+    /// [`intercept_scaling`]: Self::intercept_scaling
+    pub fit_intercept: bool,
+    /// Value of the synthetic intercept feature when [`fit_intercept`] is
+    /// `true`. Must be strictly positive. `intercept_ = intercept_scaling *
+    /// w_last`.
+    ///
+    /// [`fit_intercept`]: Self::fit_intercept
+    pub intercept_scaling: F,
 }
 
 impl<F: Float> LinearSVR<F> {
-    /// Create a new `LinearSVR` with default settings.
+    /// Create a new `LinearSVR` with scikit-learn's default settings.
     ///
-    /// Defaults: `C = 1.0`, `epsilon = 0.1`, `max_iter = 1000`,
-    /// `tol = 1e-4`, `loss = EpsilonInsensitive`.
+    /// Defaults (matching `sklearn.svm.LinearSVR`, `_classes.py:519-532`):
+    /// `C = 1.0`, `epsilon = 0.0`, `max_iter = 1000`, `tol = 1e-4`,
+    /// `loss = EpsilonInsensitive`, `fit_intercept = true`,
+    /// `intercept_scaling = 1.0`.
+    ///
+    /// # Panics
+    ///
+    /// Never panics: the literal constants `0.0`, `1e-4`, `1.0` are exactly
+    /// representable in every supported float type, so the `F::from` conversions
+    /// cannot fail.
     #[must_use]
     pub fn new() -> Self {
+        // These literals are exactly representable, so `or(F::zero())` /
+        // `or(F::one())` fallbacks are never taken (no `.unwrap()` in lib code).
+        let zero = F::zero();
+        let one = F::one();
         Self {
-            c: F::one(),
-            epsilon: F::from(0.1).unwrap(),
+            c: one,
+            epsilon: zero,
             max_iter: 1000,
-            tol: F::from(1e-4).unwrap(),
+            tol: F::from(1e-4).unwrap_or_else(|| {
+                // 1e-4 is representable in f32/f64; fall back defensively.
+                let ten = F::from(10).unwrap_or(one);
+                one / (ten * ten * ten * ten)
+            }),
             loss: LinearSVRLoss::EpsilonInsensitive,
+            fit_intercept: true,
+            intercept_scaling: one,
         }
     }
 
@@ -109,6 +153,21 @@ impl<F: Float> LinearSVR<F> {
         self.loss = loss;
         self
     }
+
+    /// Set whether to fit an intercept (sklearn `fit_intercept`).
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the intercept scaling (sklearn `intercept_scaling`). Must be
+    /// strictly positive when `fit_intercept` is `true`.
+    #[must_use]
+    pub fn with_intercept_scaling(mut self, intercept_scaling: F) -> Self {
+        self.intercept_scaling = intercept_scaling;
+        self
+    }
 }
 
 impl<F: Float> Default for LinearSVR<F> {
@@ -119,10 +178,12 @@ impl<F: Float> Default for LinearSVR<F> {
 
 /// Fitted Linear Support Vector Regressor.
 ///
-/// Stores the learned coefficients and intercept.
+/// Stores the learned coefficients and intercept. `coef_` are the weights on
+/// the original features; `intercept_ = intercept_scaling * w_last` when an
+/// intercept was fit, otherwise `0`.
 #[derive(Debug, Clone)]
 pub struct FittedLinearSVR<F> {
-    /// Learned coefficient vector (one per feature).
+    /// Learned coefficient vector (one per original feature).
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
@@ -132,12 +193,19 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     type Fitted = FittedLinearSVR<F>;
     type Error = FerroError;
 
-    /// Fit the linear SVR model using coordinate descent.
+    /// Fit the linear SVR model using liblinear's dual coordinate descent.
+    ///
+    /// Minimizes `0.5*||w||^2 + C * sum_i L_eps(y_i - w.x_i)` (no `1/n`). When
+    /// `fit_intercept` is set, the design matrix is augmented with a constant
+    /// column equal to `intercept_scaling`, the augmented weight is penalized
+    /// like any feature, and `intercept_ = intercept_scaling * w_last`.
     ///
     /// # Errors
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
-    /// - [`FerroError::InvalidParameter`] — `C` not positive or epsilon negative.
+    /// - [`FerroError::InvalidParameter`] — `C` not positive, `epsilon`
+    ///   negative, or `intercept_scaling` not positive (when fitting an
+    ///   intercept).
     /// - [`FerroError::InsufficientSamples`] — no samples provided.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLinearSVR<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
@@ -172,104 +240,203 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut b = F::zero();
-        let step = F::from(0.01).unwrap();
-
-        for _iter in 0..self.max_iter {
-            let mut max_change = F::zero();
-
-            // Update each weight coordinate.
-            for j in 0..n_features {
-                let mut grad = w[j]; // regularization gradient
-                for i in 0..n_samples {
-                    let pred = x.row(i).dot(&w) + b;
-                    let residual = y[i] - pred;
-                    let abs_residual = residual.abs();
-
-                    if abs_residual > self.epsilon {
-                        match self.loss {
-                            LinearSVRLoss::EpsilonInsensitive => {
-                                let sign = if residual > F::zero() {
-                                    F::one()
-                                } else {
-                                    -F::one()
-                                };
-                                grad = grad - self.c / n_f * sign * x[[i, j]];
-                            }
-                            LinearSVRLoss::SquaredEpsilonInsensitive => {
-                                let two = F::from(2.0).unwrap();
-                                let sign = if residual > F::zero() {
-                                    F::one()
-                                } else {
-                                    -F::one()
-                                };
-                                grad = grad
-                                    - two * self.c / n_f
-                                        * (abs_residual - self.epsilon)
-                                        * sign
-                                        * x[[i, j]];
-                            }
-                        }
-                    }
-                }
-
-                let new_w = w[j] - step * grad;
-                let change = (new_w - w[j]).abs();
-                if change > max_change {
-                    max_change = change;
-                }
-                w[j] = new_w;
-            }
-
-            // Update intercept.
-            {
-                let mut grad_b = F::zero();
-                for i in 0..n_samples {
-                    let pred = x.row(i).dot(&w) + b;
-                    let residual = y[i] - pred;
-                    let abs_residual = residual.abs();
-
-                    if abs_residual > self.epsilon {
-                        match self.loss {
-                            LinearSVRLoss::EpsilonInsensitive => {
-                                let sign = if residual > F::zero() {
-                                    F::one()
-                                } else {
-                                    -F::one()
-                                };
-                                grad_b = grad_b - self.c / n_f * sign;
-                            }
-                            LinearSVRLoss::SquaredEpsilonInsensitive => {
-                                let two = F::from(2.0).unwrap();
-                                let sign = if residual > F::zero() {
-                                    F::one()
-                                } else {
-                                    -F::one()
-                                };
-                                grad_b = grad_b
-                                    - two * self.c / n_f * (abs_residual - self.epsilon) * sign;
-                            }
-                        }
-                    }
-                }
-                let new_b = b - step * grad_b;
-                let change = (new_b - b).abs();
-                if change > max_change {
-                    max_change = change;
-                }
-                b = new_b;
-            }
-
-            if max_change < self.tol {
-                break;
-            }
+        // liblinear raises when intercept_scaling <= 0 with fit_intercept
+        // (`_base.py:1190-1196`).
+        if self.fit_intercept && self.intercept_scaling <= F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "intercept_scaling".into(),
+                reason: "must be greater than 0 when fit_intercept is true".into(),
+            });
         }
 
+        // Build the (possibly augmented) design matrix. The synthetic bias
+        // column holds `intercept_scaling`; its weight is penalized in ||w||^2,
+        // exactly as liblinear treats it (`_base.py:1189-1198`).
+        let w_size = if self.fit_intercept {
+            n_features + 1
+        } else {
+            n_features
+        };
+
+        // Per-sample squared norm QD[i] = ||x_i||^2 (including the bias column).
+        let mut qd = vec![F::zero(); n_samples];
+        for (i, qd_i) in qd.iter_mut().enumerate() {
+            let mut acc = F::zero();
+            let row = x.row(i);
+            for &v in row.iter() {
+                acc = acc + v * v;
+            }
+            if self.fit_intercept {
+                acc = acc + self.intercept_scaling * self.intercept_scaling;
+            }
+            *qd_i = acc;
+        }
+
+        // liblinear `solve_l2r_l1l2_svr` (`linear.cpp:1051`).
+        //   p   = epsilon, C = C, eps = tol
+        //   L1 loss: lambda[i] = 0,        upper_bound[i] = C
+        //   L2 loss: lambda[i] = 0.5 / C,  upper_bound[i] = +inf
+        let p = self.epsilon;
+        let inf = F::infinity();
+        let (lambda, upper_bound) = match self.loss {
+            LinearSVRLoss::EpsilonInsensitive => (F::zero(), self.c),
+            LinearSVRLoss::SquaredEpsilonInsensitive => {
+                let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+                (half / self.c, inf)
+            }
+        };
+
+        let mut beta = vec![F::zero(); n_samples];
+        let mut w = vec![F::zero(); w_size];
+        // beta starts at 0 so w starts at 0; no contribution to accumulate.
+
+        let mut index: Vec<usize> = (0..n_samples).collect();
+        let mut active_size = n_samples;
+        let mut gmax_old = inf;
+        let mut gnorm1_init = -F::one();
+
+        let tiny = F::from(1.0e-12).unwrap_or_else(|| F::epsilon());
+
+        // Closure-free helper to compute w . x_i (augmented).
+        let dot_w_xi = |w: &[F], i: usize| -> F {
+            let mut acc = F::zero();
+            let row = x.row(i);
+            for (j, &v) in row.iter().enumerate() {
+                acc = acc + v * w[j];
+            }
+            if self.fit_intercept {
+                acc = acc + self.intercept_scaling * w[n_features];
+            }
+            acc
+        };
+
+        for iter in 0..self.max_iter {
+            let mut gmax_new = F::zero();
+            let mut gnorm1_new = F::zero();
+
+            // liblinear shuffles `index` each sweep; the minimizer is unique so
+            // order only affects the path, not the limit. We sweep in natural
+            // order for determinism (no RNG), matching the converged optimum.
+
+            let mut s = 0;
+            while s < active_size {
+                let i = index[s];
+
+                // G = -y_i + lambda*beta_i + w . x_i
+                let g = -y[i] + lambda * beta[i] + dot_w_xi(&w, i);
+                let gp = g + p;
+                let gn = g - p;
+
+                let mut violation = F::zero();
+                let mut shrink = false;
+
+                if beta[i] == F::zero() {
+                    if gp < F::zero() {
+                        violation = -gp;
+                    } else if gn > F::zero() {
+                        violation = gn;
+                    } else if gp > gmax_old && gn < -gmax_old {
+                        shrink = true;
+                    }
+                } else if beta[i] >= upper_bound {
+                    if gp > F::zero() {
+                        violation = gp;
+                    } else if gp < -gmax_old {
+                        shrink = true;
+                    }
+                } else if beta[i] <= -upper_bound {
+                    if gn < F::zero() {
+                        violation = -gn;
+                    } else if gn > gmax_old {
+                        shrink = true;
+                    }
+                } else if beta[i] > F::zero() {
+                    violation = gp.abs();
+                } else {
+                    violation = gn.abs();
+                }
+
+                if shrink {
+                    active_size -= 1;
+                    index.swap(s, active_size);
+                    continue; // re-process the swapped-in element at `s`
+                }
+
+                gmax_new = if violation > gmax_new {
+                    violation
+                } else {
+                    gmax_new
+                };
+                gnorm1_new = gnorm1_new + violation;
+
+                // Newton direction d (1-D minimization of the dual along beta_i).
+                let h = qd[i] + lambda;
+                let d = if gp < h * beta[i] {
+                    -gp / h
+                } else if gn > h * beta[i] {
+                    -gn / h
+                } else {
+                    -beta[i]
+                };
+
+                if d.abs() < tiny {
+                    s += 1;
+                    continue;
+                }
+
+                let beta_old = beta[i];
+                let mut new_beta = beta[i] + d;
+                // Clamp to [-upper_bound, upper_bound].
+                if new_beta > upper_bound {
+                    new_beta = upper_bound;
+                } else if new_beta < -upper_bound {
+                    new_beta = -upper_bound;
+                }
+                beta[i] = new_beta;
+                let d_eff = beta[i] - beta_old;
+
+                if d_eff != F::zero() {
+                    let row = x.row(i);
+                    for (j, &v) in row.iter().enumerate() {
+                        w[j] = w[j] + d_eff * v;
+                    }
+                    if self.fit_intercept {
+                        w[n_features] = w[n_features] + d_eff * self.intercept_scaling;
+                    }
+                }
+
+                s += 1;
+            }
+
+            if iter == 0 {
+                gnorm1_init = gnorm1_new;
+            }
+
+            // Convergence: Gnorm1_new <= tol * Gnorm1_init. If converged on the
+            // active set, reactivate all and re-check once (liblinear pattern).
+            if gnorm1_new <= self.tol * gnorm1_init {
+                if active_size == n_samples {
+                    break;
+                }
+                active_size = n_samples;
+                gmax_old = inf;
+                continue;
+            }
+
+            gmax_old = gmax_new;
+        }
+
+        // Extract coef_ / intercept_ (`_base.py:598`, `_classes.py:581-598`).
+        let coefficients = Array1::from_iter(w.iter().take(n_features).copied());
+        let intercept = if self.fit_intercept {
+            self.intercept_scaling * w[n_features]
+        } else {
+            F::zero()
+        };
+
         Ok(FittedLinearSVR {
-            coefficients: w,
-            intercept: b,
+            coefficients,
+            intercept,
         })
     }
 }
@@ -346,8 +513,11 @@ mod tests {
         let m = LinearSVR::<f64>::new();
         assert_eq!(m.max_iter, 1000);
         assert!(m.c == 1.0);
-        assert_relative_eq!(m.epsilon, 0.1);
+        // sklearn default epsilon=0.0 (`_classes.py:522`).
+        assert_relative_eq!(m.epsilon, 0.0);
         assert_eq!(m.loss, LinearSVRLoss::EpsilonInsensitive);
+        assert!(m.fit_intercept);
+        assert_relative_eq!(m.intercept_scaling, 1.0);
     }
 
     #[test]
@@ -357,11 +527,15 @@ mod tests {
             .with_epsilon(0.5)
             .with_max_iter(500)
             .with_tol(1e-6)
-            .with_loss(LinearSVRLoss::SquaredEpsilonInsensitive);
+            .with_loss(LinearSVRLoss::SquaredEpsilonInsensitive)
+            .with_fit_intercept(false)
+            .with_intercept_scaling(2.0);
         assert!(m.c == 10.0);
         assert_relative_eq!(m.epsilon, 0.5);
         assert_eq!(m.max_iter, 500);
         assert_eq!(m.loss, LinearSVRLoss::SquaredEpsilonInsensitive);
+        assert!(!m.fit_intercept);
+        assert_relative_eq!(m.intercept_scaling, 2.0);
     }
 
     #[test]
@@ -428,6 +602,21 @@ mod tests {
     }
 
     #[test]
+    fn test_invalid_intercept_scaling() {
+        let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+        let y = array![1.0, 2.0, 3.0];
+
+        let model = LinearSVR::<f64>::new().with_intercept_scaling(0.0);
+        assert!(model.fit(&x, &y).is_err());
+
+        // But with fit_intercept=false, intercept_scaling is ignored.
+        let model = LinearSVR::<f64>::new()
+            .with_fit_intercept(false)
+            .with_intercept_scaling(0.0);
+        assert!(model.fit(&x, &y).is_ok());
+    }
+
+    #[test]
     fn test_predict_feature_mismatch() {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
@@ -452,6 +641,19 @@ mod tests {
             .fit(&x, &y)
             .unwrap();
         assert_eq!(fitted.coefficients().len(), 2);
+    }
+
+    #[test]
+    fn test_fit_intercept_false_zero_intercept() {
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+        let fitted = LinearSVR::<f64>::new()
+            .with_fit_intercept(false)
+            .with_max_iter(5000)
+            .fit(&x, &y)
+            .unwrap();
+        assert_relative_eq!(fitted.intercept(), 0.0);
     }
 
     #[test]
