@@ -9,6 +9,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(glm): REQ-5 intercept init = link(weighted_mean(y)) (#552)
+- translate(glm): REQ-9 TweedieRegressor default power 1.5 -> 0.0 (#555)
+- translate(glm): REQ-8 TweedieRegressor link param auto/identity/log (#554)
+- translate(glm): REQ-7 predict applies link.inverse not unconditional exp (#553)
+- translate(glm): REQ-4/6 CRUX objective — mean half-deviance + 0.5*alpha, intercept UNPENALIZED (#551)
 - translate(sgd): REQ-13 early_stopping + validation_fraction + n_iter_no_change (#533)
 - Translation unit: ferrolearn-linear/sgd.rs — early_stopping + validation_fraction (REQ-13) (#546)
 - translate(sgd): REQ-19 anti-pattern cleanup — unreachable!()/unwrap in kernel (#537)

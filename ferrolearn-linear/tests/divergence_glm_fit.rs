@@ -33,7 +33,7 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::{PoissonRegressor, TweedieRegressor};
+use ferrolearn_linear::{GammaRegressor, PoissonRegressor, TweedieRegressor};
 use ndarray::{Array1, Array2};
 
 // ===========================================================================
@@ -322,5 +322,106 @@ fn glm_tweedie_default_power() {
         "default power: sklearn TweedieRegressor default power=0.0 (Normal, \
          glm.py:867); ferrolearn defaults to {}",
         m.power
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Family parity at alpha>0 (#548/#549/#550) — confirms the penalized objective
+// (#551) + link (#554) fixes give full coef parity for all three families, not
+// just the alpha=0 MLE. GLM fitting is deterministic, so we assert full
+// coef_/intercept_ against the live sklearn 1.5.2 oracle.
+// ---------------------------------------------------------------------------
+
+/// `PoissonRegressor(alpha=0.5)` on a 5x2 dataset (#548).
+/// Oracle (live sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_), repr(m.intercept_))"
+///   -> coef [0.38388476754733647, 0.2024000617918683], intercept -0.519356533563308
+#[test]
+fn glm_poisson_alpha_half_parity() {
+    const SK_COEF: [f64; 2] = [0.383_884_767_547_336_47, 0.202_400_061_791_868_3];
+    const SK_INTERCEPT: f64 = -0.519_356_533_563_308;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+        "Poisson alpha=0.5: sklearn coef {SK_COEF:?}, ferrolearn {coef:?}"
+    );
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "Poisson alpha=0.5: sklearn intercept {SK_INTERCEPT}, ferrolearn {}",
+        fitted.intercept()
+    );
+}
+
+/// `GammaRegressor(alpha=0.5)`, y>0 (#549).
+/// Oracle (live sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.linear_model import GammaRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([1.,2.,3.,4.,5.]); \
+///   m=GammaRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_), repr(m.intercept_))"
+///   -> coef [0.24777318480127428, 0.11632310150595548], intercept 0.35993159442417294
+#[test]
+fn glm_gamma_alpha_half_parity() {
+    const SK_COEF: [f64; 2] = [0.247_773_184_801_274_28, 0.116_323_101_505_955_48];
+    const SK_INTERCEPT: f64 = 0.359_931_594_424_172_94;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let fitted = GammaRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+        "Gamma alpha=0.5: sklearn coef {SK_COEF:?}, ferrolearn {coef:?}"
+    );
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "Gamma alpha=0.5: sklearn intercept {SK_INTERCEPT}, ferrolearn {}",
+        fitted.intercept()
+    );
+}
+
+/// `TweedieRegressor(power=1.5, alpha=0.5)` (log link), y>0 (#550).
+/// Oracle (live sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.linear_model import TweedieRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([1.,2.,3.,4.,5.]); \
+///   m=TweedieRegressor(power=1.5,alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_), repr(m.intercept_))"
+///   -> coef [0.25606046404981164, 0.11657692670900446], intercept 0.3563978246931595
+#[test]
+fn glm_tweedie_alpha_half_parity() {
+    const SK_COEF: [f64; 2] = [0.256_060_464_049_811_64, 0.116_576_926_709_004_46];
+    const SK_INTERCEPT: f64 = 0.356_397_824_693_159_5;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let fitted = TweedieRegressor::<f64>::new()
+        .with_power(1.5)
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+        "Tweedie(1.5) alpha=0.5: sklearn coef {SK_COEF:?}, ferrolearn {coef:?}"
+    );
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "Tweedie(1.5) alpha=0.5: sklearn intercept {SK_INTERCEPT}, ferrolearn {}",
+        fitted.intercept()
     );
 }
