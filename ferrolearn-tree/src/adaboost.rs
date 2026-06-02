@@ -28,9 +28,37 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.AdaBoostClassifier` (SAMME/SAMME.R,
+//! `sklearn/ensemble/_weight_boosting.py`). See `.design/tree/adaboost.md`.
+//! Non-test consumer: the `RsAdaBoostClassifier` PyO3 binding
+//! (`ferrolearn-python/src/extras.rs`).
+//!
+//! **Algorithm default (R-DEV-6 deviation):** ferrolearn defaults to `Samme`.
+//! sklearn 1.5.2's literal default is `'SAMME.R'`, but 1.5.2 deprecates it with
+//! a `FutureWarning` (`_weight_boosting.py:526-534`) and 1.6 removed it,
+//! making SAMME the sole option — a deliberate, documented deviation (#713).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param surface + numeric defaults (`n_estimators=50`, `learning_rate=1.0`, `random_state=None`) | SHIPPED |
+//! | REQ-2 | SAMME `estimator_weight = lr*(log((1-err)/err)+log(K-1))` + reweight `*=exp(alpha·incorrect)` (`_weight_boosting.py:696-706`) | SHIPPED |
+//! | REQ-3 | SAMME weighted error `Σ w_i·[pred≠y]/Σw` (`:676`) | SHIPPED |
+//! | REQ-4 | Worse-than-random stop `err >= 1 - 1/K` (`:685`) | SHIPPED |
+//! | REQ-6 | Weighted base-estimator fit (deterministic, no resample) — `predict` matches sklearn SAMME end-to-end (`:664`; verified on iris N≤50, K=3) | SHIPPED |
+//! | REQ-7 | Perfect-fit `err<=0 → estimator_weight=1.0` + stop, before worse-than-random check (`:679-680`) | SHIPPED |
+//! | REQ-10 | `feature_importances_` = weighted-normalized mean of per-stump importances | SHIPPED |
+//! | REQ-5 | `decision_function`/`predict_proba` exact form (`decision/(K-1)` scaling + softmax, `:799-870`) | NOT-STARTED (#712) |
+//! | REQ-8 | SAMME.R `_boost_real` reweight correct for `K>2` (full `y_coding` xlogy, `:644-656`) | NOT-STARTED (#711) |
+//! | REQ-9 | Pluggable base estimator + `estimator_errors_` attribute | NOT-STARTED (#714) |
+//! | REQ-1b | `algorithm` default match-1.5.2-literal (`'SAMME.R'`) — deliberate R-DEV-6 deviation | NOT-STARTED (#713) |
+//! | REQ-12 | Empty-ensemble worse-than-random raises `ValueError` (`:687-692`) | NOT-STARTED (#715) |
+//! | REQ-13 | ferray substrate migration | NOT-STARTED (#716) |
 
 use crate::decision_tree::{
-    self, ClassificationCriterion, Node, build_classification_tree_with_feature_subset,
+    self, ClassificationCriterion, Node, build_weighted_classification_tree_with_feature_subset,
 };
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -275,14 +303,14 @@ impl<F: Float + Send + Sync + 'static> AdaBoostClassifier<F> {
         let mut estimator_weights = Vec::with_capacity(self.n_estimators);
 
         for _ in 0..self.n_estimators {
-            // Build weighted sample indices: replicate indices proportional to weight.
-            let indices = resample_weighted(&weights, n_samples);
-
-            let tree = build_classification_tree_with_feature_subset(
+            // sklearn fits each round's stump on the WEIGHTED data directly
+            // (`estimator.fit(X, y, sample_weight=sample_weight)`,
+            // `_weight_boosting.py:664`), deterministically — NO bootstrap/RNG.
+            let tree = build_weighted_classification_tree_with_feature_subset(
                 x,
                 y_mapped,
                 n_classes,
-                &indices,
+                &weights,
                 &all_features,
                 &stump_params,
                 ClassificationCriterion::Gini,
@@ -309,6 +337,17 @@ impl<F: Float + Send + Sync + 'static> AdaBoostClassifier<F> {
             } else {
                 F::from(0.5).unwrap()
             };
+
+            // Stop if classification is perfect: sklearn returns
+            // `(sample_weight, 1.0, 0.0)` the instant `estimator_error <= 0`
+            // (`_boost_discrete:679-680`) and `fit` then breaks on
+            // `estimator_error == 0` (`fit:180`). This guard MUST come BEFORE the
+            // worse-than-random check, matching sklearn's ordering.
+            if err <= eps {
+                estimators.push(tree);
+                estimator_weights.push(F::one());
+                break;
+            }
 
             // If error is too high or zero, stop or skip.
             if err >= F::one() - F::one() / F::from(n_classes).unwrap() {
@@ -391,13 +430,16 @@ impl<F: Float + Send + Sync + 'static> AdaBoostClassifier<F> {
         let mut estimator_weights = Vec::with_capacity(self.n_estimators);
 
         for _ in 0..self.n_estimators {
-            let indices = resample_weighted(&weights, n_samples);
-
-            let tree = build_classification_tree_with_feature_subset(
+            // sklearn fits each round's stump on the WEIGHTED data directly
+            // (`estimator.fit(X, y, sample_weight=sample_weight)`,
+            // `_weight_boosting.py:605`), deterministically — NO bootstrap/RNG.
+            // (The SAMME.R reweight math, REQ-8/#713, is unchanged here — only
+            // the stump FIT is rewired off the systematic resample.)
+            let tree = build_weighted_classification_tree_with_feature_subset(
                 x,
                 y_mapped,
                 n_classes,
-                &indices,
+                &weights,
                 &all_features,
                 &stump_params,
                 ClassificationCriterion::Gini,
@@ -429,6 +471,38 @@ impl<F: Float + Send + Sync + 'static> AdaBoostClassifier<F> {
                         *val = *val / row_sum;
                     }
                 }
+            }
+
+            // Stop if classification is perfect: sklearn's SAMME.R `_boost_real`
+            // computes `incorrect = argmax(proba) != y`,
+            // `estimator_error = mean(average(incorrect, weights))`, and returns
+            // `(sample_weight, 1.0, 0.0)` the instant `estimator_error <= 0`
+            // (`_boost_real:616-623`); `fit` then breaks on `error == 0`
+            // (`fit:180`). SAMME.R uses an estimator weight of `1.0` regardless.
+            let mut weighted_error = F::zero();
+            for (i, proba_row) in proba.iter().enumerate() {
+                let mut argmax = 0usize;
+                let mut best = proba_row[0];
+                for (k, &p) in proba_row.iter().enumerate().skip(1) {
+                    if p > best {
+                        best = p;
+                        argmax = k;
+                    }
+                }
+                if argmax != y_mapped[i] {
+                    weighted_error = weighted_error + weights[i];
+                }
+            }
+            let weight_sum: F = weights.iter().copied().fold(F::zero(), |a, b| a + b);
+            let err = if weight_sum > F::zero() {
+                weighted_error / weight_sum
+            } else {
+                F::zero()
+            };
+            if err <= eps {
+                estimators.push(tree);
+                estimator_weights.push(F::one());
+                break;
             }
 
             // SAMME.R weight update: based on log-probability.
@@ -841,49 +915,6 @@ impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipel
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
-// ---------------------------------------------------------------------------
-
-/// Resample indices proportional to weights (weighted bootstrap).
-///
-/// Uses a systematic resampling approach: the cumulative weight distribution
-/// determines which original indices appear in the resampled set.
-fn resample_weighted<F: Float>(weights: &[F], n: usize) -> Vec<usize> {
-    if weights.is_empty() {
-        return Vec::new();
-    }
-
-    // Build cumulative distribution.
-    let mut cumsum = Vec::with_capacity(weights.len());
-    let mut running = F::zero();
-    for &w in weights {
-        running = running + w;
-        cumsum.push(running);
-    }
-
-    // Normalise (in case weights don't sum to 1).
-    let total = running;
-    if total <= F::zero() {
-        return (0..n).collect();
-    }
-
-    let mut indices = Vec::with_capacity(n);
-    let step = total / F::from(n).unwrap();
-    let mut threshold = step / F::from(2.0).unwrap(); // Start in the middle of the first bin.
-    let mut j = 0;
-
-    for _ in 0..n {
-        while j < cumsum.len() - 1 && cumsum[j] < threshold {
-            j += 1;
-        }
-        indices.push(j);
-        threshold = threshold + step;
-    }
-
-    indices
-}
-
-// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1214,34 +1245,6 @@ mod tests {
 
         assert_eq!(preds.len(), 12);
         assert_eq!(fitted.n_classes(), 4);
-    }
-
-    // -- Resample helper tests --
-
-    #[test]
-    fn test_resample_weighted_uniform() {
-        let weights = vec![0.25, 0.25, 0.25, 0.25];
-        let indices = resample_weighted(&weights, 4);
-        // With uniform weights, each index should appear once in order.
-        assert_eq!(indices, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn test_resample_weighted_skewed() {
-        let weights = vec![0.0, 0.0, 0.0, 1.0];
-        let indices = resample_weighted(&weights, 4);
-        assert_eq!(indices.len(), 4);
-        // All weight on last index.
-        for &idx in &indices {
-            assert_eq!(idx, 3);
-        }
-    }
-
-    #[test]
-    fn test_resample_weighted_empty() {
-        let weights: Vec<f64> = Vec::new();
-        let indices = resample_weighted(&weights, 0);
-        assert!(indices.is_empty());
     }
 
     #[test]

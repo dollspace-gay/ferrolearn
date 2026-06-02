@@ -2456,6 +2456,58 @@ pub(crate) fn build_classification_tree_with_feature_subset<F: Float>(
     nodes
 }
 
+/// Build a **weighted** classification tree over ALL samples with a fixed
+/// feature subset.
+///
+/// Mirrors [`build_classification_tree_with_feature_subset`] exactly except it
+/// threads `sample_weight: Some(sample_weight)` into [`ClassificationData`] and
+/// builds over the full sample set (`indices = 0..n_samples`, no resampling).
+/// The node class counts, gini/entropy, and the leaf class distribution are all
+/// weighted by `sample_weight` (the oracle-verified `class_weight` path,
+/// `.design/tree/decision_tree.md` REQ-7).
+///
+/// This is the substrate for AdaBoost's deterministic weighted base fit:
+/// scikit-learn fits each round's stump on the weighted data directly —
+/// `estimator.fit(X, y, sample_weight=sample_weight)`
+/// (`sklearn/ensemble/_weight_boosting.py:664` — SAMME `_boost_discrete`,
+/// `:605` — SAMME.R `_boost_real`) — with NO bootstrap/RNG in the classifier
+/// path. `min_weight_leaf` is `F::zero()` because AdaBoost sets no
+/// `min_weight_fraction_leaf`.
+///
+/// `sample_weight` is indexed by the ORIGINAL sample index (parallel to `y`),
+/// length `n_samples`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_weighted_classification_tree_with_feature_subset<F: Float>(
+    x: &Array2<F>,
+    y: &[usize],
+    n_classes: usize,
+    sample_weight: &[F],
+    feature_indices: &[usize],
+    params: &TreeParams,
+    criterion: ClassificationCriterion,
+) -> Vec<Node<F>> {
+    let n_samples = y.len();
+    let data = ClassificationData {
+        x,
+        y,
+        n_classes,
+        feature_indices: Some(feature_indices),
+        max_features_per_split: None,
+        criterion,
+        // AdaBoost fits the stump WEIGHTED on all samples (`_weight_boosting.py:664`).
+        sample_weight: Some(sample_weight),
+        // AdaBoost sets no `min_weight_fraction_leaf`, so the weighted leaf-mass
+        // gate never rejects.
+        min_weight_leaf: F::zero(),
+    };
+    // All samples — no resampling (sklearn fits on the full weighted data).
+    let indices: Vec<usize> = (0..n_samples).collect();
+    let mut nodes = Vec::new();
+    let gate = ImpurityGate::disabled(indices.len());
+    build_classification_tree(&data, &indices, &mut nodes, None, 0, params, &gate, None);
+    nodes
+}
+
 /// Build a classification tree with **per-split** random feature sampling.
 ///
 /// At every split node, a fresh random subset of `max_features` features is
