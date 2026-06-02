@@ -61,7 +61,7 @@
 //! | REQ-11 (fit_intercept) | SHIPPED | `pub fit_intercept: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_fit_intercept` builders (default `true`, sklearn `_stochastic_gradient.py` `fit_intercept=True`, constraint `["boolean"]` at `:86`), threaded through `SGDHyper.fit_intercept` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the intercept update: `if hyper.fit_intercept { *intercept = *intercept - eta * grad; }`, mirroring `if fit_intercept == 1: intercept_update = update; ... intercept += intercept_update * intercept_decay` (`_sgd_fast.pyx.tp:639-644`, `intercept_decay=1` on the standard path). When `false` the intercept is never modified and stays at its init value `0` (`b = F::zero()` before training in `fn fit_ova`/regressor `Fit::fit`), so `coef_` matches sklearn and `intercept_` is exactly `0`. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_fit_intercept_false` (live oracle coef `[0.5326796739094939, 0.44573604649819804]`, intercept exactly `0.0`). Closes #531. |
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
 //! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
-//! | REQ-14 (average / ASGD) | NOT-STARTED | blocker #534. No averaged coef/intercept (`_sgd_fast.pyx.tp:646-654`). |
+//! | REQ-14 (average / ASGD) | SHIPPED | `pub average: usize` field on `SGDClassifier`/`SGDRegressor` (default `0` = OFF) + `fn with_average` builders (sklearn `average=True`≡`1`, `average=N`≡`N`, `average=False`≡`0`; `_stochastic_gradient.py:1256,2068`), threaded through `SGDHyper.average` + `fn clf_hyper`/`reg_hyper` (one-class path hardwires `0`). `fn train_binary_sgd`/`train_regressor_sgd` allocate `average_coef`/`average_intercept` before the epoch loop and, AFTER the weight/intercept update + L1 truncation, when `hyper.average > 0 && t >= hyper.average`, accumulate the DIRECT running mean `avg += (current - avg) / (t - average + 1)` — the plain-array equivalent of sklearn's lazy `w.add_average(..., t - average + 1)` / `average_intercept += (intercept - average_intercept) / (t - average + 1)` (`_sgd_fast.pyx.tp:646-654`); the accumulator is passive (does NOT alter the live trajectory). FINALIZE: at fit-end, `if hyper.average > 0 && hyper.average <= t { weights = average_coef; intercept = average_intercept; }`, mirroring `if self.average > 0: if self.average <= self.t_ - 1: coef_ = average_coef` (`_stochastic_gradient.py:834-836`); `t` (= `n_iter_ * n_samples`, `initial_t=0`) equals sklearn's `self.t_ - 1` (sklearn inits `self.t_ = 1`). `average=0` skips both blocks, leaving the trajectory byte-identical (the 22 prior divergence tests stay green). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_average_from_start` (`SGDRegressor(average=True)` live oracle coef `[0.42614902504529534, 0.3665230497098742]` intercept `0.14648807826338486`), `sgd_average_threshold` (`SGDRegressor(average=20)`, begins mid-run, oracle coef `[0.5042444287230554, 0.41888001003992603]` intercept `0.16902090306985734`), `sgd_average_classifier` (`SGDClassifier(average=True)` oracle coef `[0.11902998815794437, 0.060826180676538694]` intercept `-0.10666666666666665`). `_sgd_fast.pyx.tp:646-654` / `_stochastic_gradient.py:834-836`. Closes #534. NOTE: averaging on the `partial_fit` path is OFF (`average` not yet carried into the `partial_fit_ova` hyper, which sets `max_iter=1`) — the full `fit` path (the parity-critical one) is exact; partial_fit ASGD state carry-over is a follow-up. |
 //! | REQ-15 (class_weight + sample_weight) | SHIPPED | `pub enum ClassWeight<F> {None,Balanced,Explicit(Vec<(usize,F)>)}` + `pub class_weight` field on `SGDClassifier` (default `ClassWeight::None`) with `fn with_class_weight`; `fn compute_class_weight` returns the expanded per-class weights (`None->1.0`; `Balanced-> n_samples/(n_classes*count_c)`; `Explicit->1.0 default, override by label`) faithful to `sklearn.utils.compute_class_weight` (`sklearn/utils/class_weight.py:63-81`, `_stochastic_gradient.py:624`). `fn fit_with_sample_weight` on `SGDClassifier` AND `SGDRegressor` validates `sample_weight.len()==n_samples` (else `ShapeMismatch`); `Fit::fit` delegates with `ones(n)` (byte-identical default path — the 17 prior divergence tests stay green). `fn fit_ova` builds the per-subproblem per-sample weight `w_i = class_weight_for_sample(i) * sample_weight[i]` with the sklearn OvA mapping (binary `pos=expanded[1]`/`neg=expanded[0]`, `_stochastic_gradient.py:765-766`; multiclass class k `pos=expanded[k]`/`neg=1.0`, `:816`) and passes `&[F]` into `fn train_binary_sgd`. The kernel scales ONLY the gradient term `g = grad * sample_w[i]` (`update *= class_weight*sample_weight`, `_sgd_fast.pyx.tp:630`): the weight data term `w[j]*shrink - eta*g*x[j]` and the (gated) intercept gradient term `-eta*g` use `g`; the L2 shrink (`:632-635`), L1 truncation (`:656-658`), one-class `-2*eta*alpha` offset (`:642`) and the unweighted `sumloss` (`:597`) are UNSCALED. `fn train_regressor_sgd` mirrors the same scaling (`class_weight=1` for regression). Consumer: `Fit for SGDClassifier`/`SGDRegressor` -> `PipelineEstimator`; `fit_with_sample_weight` consumed by `Fit::fit`. Tests: divergence `sgd_class_weight_balanced` (oracle coef `[0.4806667587635881, 0.4620316761984426]` intercept `-1.2811684177087947`), `sgd_class_weight_explicit` (`{0:1.0,1:3.0}` coef `[0.5705300651778317, 0.5660417632427646]` intercept `-1.7542279278451731`), `sgd_sample_weight` (coef `[0.25648548424261425, 0.7995046753090618]` intercept `-1.221373410658307`), `sgd_class_weight_balanced_multiclass` (class-0 coef `[-0.586000112348521, -0.369263665877338]` + argmax preds), `sgd_regressor_sample_weight` (coef `[0.9425558668838198, 1.3974216923953962]` intercept `0.7259434415390171`). `_sgd_fast.pyx.tp:599-602,630` / `_stochastic_gradient.py:624,765-766,816`. Closes #535. NOTE: `class_weight`/`sample_weight` on the `partial_fit` path are uniform `1.0` (no `class_weight`/`sample_weight` arg on `PartialFit` yet) — tracked under the partial_fit surface, not this REQ. |
 //! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
 //! | REQ-17 (multiclass one-vs-all) | SHIPPED | `fn fit_ova` (one binary per class) + `fn predict` argmax (`_stochastic_gradient.py:788-844`). Consumer: `Fit for SGDClassifier` -> `PipelineEstimator`. Test: `test_sgd_classifier_multiclass`. |
@@ -719,6 +719,13 @@ pub struct SGDClassifier<F> {
     /// weights scale the per-sample gradient term via
     /// `update *= class_weight * sample_weight` (`_sgd_fast.pyx.tp:599-602,630`).
     pub class_weight: ClassWeight<F>,
+    /// Averaged-SGD (ASGD) threshold. `0` disables averaging (the default,
+    /// matching sklearn `average=False`); `1` averages from the first step
+    /// (sklearn `average=True`); `N > 1` begins averaging once the global step
+    /// counter `t >= N` (sklearn `average=N`). The averaged weights/intercept
+    /// replace the plain ones at fit-end when `average <= self.t_ - 1`
+    /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
+    pub average: usize,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -746,6 +753,7 @@ impl<F: Float> SGDClassifier<F> {
             n_iter_no_change: 5,
             fit_intercept: true,
             class_weight: ClassWeight::None,
+            average: 0,
         }
     }
 
@@ -869,6 +877,22 @@ impl<F: Float> SGDClassifier<F> {
         self.class_weight = class_weight;
         self
     }
+
+    /// Set the averaged-SGD (ASGD) threshold.
+    ///
+    /// Mirrors sklearn's `average` parameter (default `False`,
+    /// `_stochastic_gradient.py:1256`). `0` disables averaging (the plain SGD
+    /// trajectory, byte-identical to the unaveraged kernel); `with_average(1)`
+    /// is sklearn `average=True` (average from the first step); `with_average(N)`
+    /// is sklearn `average=N` (begin averaging once the global step counter
+    /// `t >= N`). The running mean of the post-update weights/intercept replaces
+    /// the plain `coef_`/`intercept_` at fit-end when `average <= self.t_ - 1`
+    /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
+    #[must_use]
+    pub fn with_average(mut self, average: usize) -> Self {
+        self.average = average;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -893,6 +917,7 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         n_iter_no_change: clf.n_iter_no_change,
         fit_intercept: clf.fit_intercept,
         one_class: false,
+        average: clf.average,
     }
 }
 
@@ -925,6 +950,12 @@ struct SGDHyper<F> {
     /// (`intercept_update -= 2. * eta * alpha`). `false` for the standard
     /// classifier/regressor paths, leaving their intercept update byte-identical.
     one_class: bool,
+    /// Averaged-SGD (ASGD) threshold. `0` disables averaging (the default,
+    /// byte-identical to the plain SGD trajectory). `N > 0` begins accumulating
+    /// the running mean of the post-update weights/intercept once the global step
+    /// counter `t >= N`, mirroring `if 0 < average <= t` (`_sgd_fast.pyx.tp:646`).
+    /// sklearn `average=True` maps to `N = 1`; `average=N` maps to `N`.
+    average: usize,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -988,6 +1019,17 @@ where
     // `u = 0.0` allocated once per `_plain_sgd` call (`_sgd_fast.pyx.tp:551-556`).
     let mut u = F::zero();
     let mut q: Array1<F> = Array1::zeros(n_features);
+
+    // Averaged-SGD (ASGD) accumulators (`_sgd_fast.pyx.tp:646-654`). When
+    // `hyper.average > 0`, once the global step `t >= average` we maintain the
+    // running mean of the POST-update weights/intercept. This is the DIRECT
+    // running-mean form of sklearn's lazy `w.add_average` (a wscale optimization
+    // that is mathematically identical for plain arrays): with
+    // `num_iter = t - average + 1` (= 1 at the first averaged step) and
+    // `mu = 1/num_iter`, `avg += (current - avg) * mu`. The accumulator is a
+    // PASSIVE observer — it never feeds back into the live `weights`/`intercept`.
+    let mut average_coef: Array1<F> = Array1::zeros(n_features);
+    let mut average_intercept = F::zero();
 
     // Build the RNG for shuffling.
     let mut rng = match hyper.random_state {
@@ -1098,6 +1140,24 @@ where
                     q[j] = q[j] + (weights[j] - z);
                 }
             }
+
+            // ASGD running-mean accumulation (`_sgd_fast.pyx.tp:646-654`:
+            // `if 0 < average <= t: w.add_average(..., t - average + 1);
+            // average_intercept += (intercept - average_intercept) /
+            // (t - average + 1)`). Performed AFTER the weight/intercept update +
+            // L1 truncation, so `weights`/`intercept` hold their final post-step
+            // values for this sample. `t` here is the SAME 1-based global step
+            // the schedule used above. `num_iter = t - average + 1` is `>= 1`
+            // whenever `t >= average`.
+            if hyper.average > 0 && t >= hyper.average {
+                let num_iter = t - hyper.average + 1;
+                let num_iter_f = F::from(num_iter).unwrap_or_else(F::one);
+                let mu = F::one() / num_iter_f;
+                for j in 0..n_features {
+                    average_coef[j] = average_coef[j] + (weights[j] - average_coef[j]) * mu;
+                }
+                average_intercept = average_intercept + (*intercept - average_intercept) * mu;
+            }
         }
 
         // `epoch_loss` is now the epoch `sumloss` (no mean division). The
@@ -1118,6 +1178,20 @@ where
         ) {
             break;
         }
+    }
+
+    // ASGD finalize: select the averaged weights/intercept when averaging was
+    // enabled AND enough steps were taken (`_stochastic_gradient.py:834-836`:
+    // `if self.average > 0: if self.average <= self.t_ - 1: coef_ =
+    // average_coef`). Here `t` is the returned step counter `= n_iter_ *
+    // n_samples` (`initial_t = 0` on the full-fit path), which equals sklearn's
+    // `self.t_ - 1` (sklearn inits `self.t_ = 1`, then `self.t_ += n_iter_ *
+    // n_samples`). So `average <= self.t_ - 1` maps to `hyper.average <= t`.
+    if hyper.average > 0 && hyper.average <= t {
+        for j in 0..n_features {
+            weights[j] = average_coef[j];
+        }
+        *intercept = average_intercept;
     }
 
     (total_loss, t)
@@ -1813,6 +1887,13 @@ pub struct SGDRegressor<F> {
     /// updated and stays at its init value `0` (`_sgd_fast.pyx.tp:639-644`: the
     /// intercept update is gated on `if fit_intercept == 1`).
     pub fit_intercept: bool,
+    /// Averaged-SGD (ASGD) threshold. `0` disables averaging (the default,
+    /// matching sklearn `average=False`); `1` averages from the first step
+    /// (sklearn `average=True`); `N > 1` begins averaging once the global step
+    /// counter `t >= N` (sklearn `average=N`). The averaged weights/intercept
+    /// replace the plain ones at fit-end when `average <= self.t_ - 1`
+    /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
+    pub average: usize,
 }
 
 impl<F: Float> SGDRegressor<F> {
@@ -1828,6 +1909,7 @@ impl<F: Float> SGDRegressor<F> {
         Self {
             loss: RegressorLoss::SquaredError,
             n_iter_no_change: 5,
+            average: 0,
             fit_intercept: true,
             shuffle: true,
             penalty: Penalty::L2,
@@ -1949,6 +2031,22 @@ impl<F: Float> SGDRegressor<F> {
         self.fit_intercept = fit_intercept;
         self
     }
+
+    /// Set the averaged-SGD (ASGD) threshold.
+    ///
+    /// Mirrors sklearn's `average` parameter (default `False`,
+    /// `_stochastic_gradient.py:2068`). `0` disables averaging (the plain SGD
+    /// trajectory, byte-identical to the unaveraged kernel); `with_average(1)`
+    /// is sklearn `average=True` (average from the first step); `with_average(N)`
+    /// is sklearn `average=N` (begin averaging once the global step counter
+    /// `t >= N`). The running mean of the post-update weights/intercept replaces
+    /// the plain `coef_`/`intercept_` at fit-end when `average <= self.t_ - 1`
+    /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
+    #[must_use]
+    pub fn with_average(mut self, average: usize) -> Self {
+        self.average = average;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDRegressor<F> {
@@ -1973,6 +2071,7 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         n_iter_no_change: reg.n_iter_no_change,
         fit_intercept: reg.fit_intercept,
         one_class: false,
+        average: reg.average,
     }
 }
 
@@ -2030,6 +2129,14 @@ where
     // once and persisting for the whole fit (`_sgd_fast.pyx.tp:551-556`).
     let mut u = F::zero();
     let mut q: Array1<F> = Array1::zeros(n_features);
+
+    // Averaged-SGD (ASGD) accumulators (`_sgd_fast.pyx.tp:646-654`). Direct
+    // running-mean form of sklearn's lazy `w.add_average` (mathematically
+    // identical for plain arrays): once `t >= average`, `avg += (current - avg)
+    // / (t - average + 1)`. A passive observer — never fed back into the live
+    // `weights`/`intercept` trajectory.
+    let mut average_coef: Array1<F> = Array1::zeros(n_features);
+    let mut average_intercept = F::zero();
 
     let mut rng = match hyper.random_state {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
@@ -2121,6 +2228,21 @@ where
                     q[j] = q[j] + (weights[j] - z);
                 }
             }
+
+            // ASGD running-mean accumulation (`_sgd_fast.pyx.tp:646-654`),
+            // AFTER the weight/intercept update + L1 truncation so
+            // `weights`/`intercept` are the final post-step values for this
+            // sample. `t` is the SAME 1-based global step the schedule used;
+            // `num_iter = t - average + 1` is `>= 1` whenever `t >= average`.
+            if hyper.average > 0 && t >= hyper.average {
+                let num_iter = t - hyper.average + 1;
+                let num_iter_f = F::from(num_iter).unwrap_or_else(F::one);
+                let mu = F::one() / num_iter_f;
+                for j in 0..n_features {
+                    average_coef[j] = average_coef[j] + (weights[j] - average_coef[j]) * mu;
+                }
+                average_intercept = average_intercept + (*intercept - average_intercept) * mu;
+            }
         }
 
         // `epoch_loss` is now the epoch `sumloss` (no mean division). The
@@ -2140,6 +2262,18 @@ where
         ) {
             break;
         }
+    }
+
+    // ASGD finalize (`_stochastic_gradient.py:834-836`: averaged coef/intercept
+    // chosen when `average <= self.t_ - 1`). `t` here equals sklearn's
+    // `self.t_ - 1` on the full-fit path (`initial_t = 0`, sklearn inits
+    // `self.t_ = 1` then adds `n_iter_ * n_samples`), so the condition is
+    // `hyper.average <= t`.
+    if hyper.average > 0 && hyper.average <= t {
+        for j in 0..n_features {
+            weights[j] = average_coef[j];
+        }
+        *intercept = average_intercept;
     }
 
     (total_loss, t)
@@ -2776,6 +2910,9 @@ impl<F: Float> SGDOneClassSVM<F> {
             n_iter_no_change: self.n_iter_no_change,
             fit_intercept: self.fit_intercept,
             one_class: true,
+            // sklearn's `SGDOneClassSVM` has no `average` parameter — averaging is
+            // always off on the one-class path (`_stochastic_gradient.py:2245-2281`).
+            average: 0,
         };
 
         // `y = np.ones(n_samples)` (`_stochastic_gradient.py:2289`).

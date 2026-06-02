@@ -1548,3 +1548,174 @@ fn sgd_regressor_sample_weight() {
         fitted.intercept()
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-14 / #534 — averaged SGD (ASGD): `average` accumulates the running mean
+// of the post-update weights/intercept once `t >= average`, and the averaged
+// values replace the plain `coef_`/`intercept_` at fit-end.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:646-654`
+//   `if 0 < average <= t:`
+//   `    w.add_average(x_data_ptr, x_ind_ptr, xnnz, update, (t - average + 1))`
+//   `    average_intercept += ((intercept - average_intercept) /`
+//   `                          (t - average + 1))`
+// and the finalize at `_stochastic_gradient.py:834-836`
+//   `if self.average > 0:`
+//   `    if self.average <= self.t_ - 1.0:`
+//   `        self.coef_ = self._average_coef`
+//   `        self.intercept_ = self._average_intercept`
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `train_binary_sgd` /
+// `train_regressor_sgd` — `average_coef`/`average_intercept` running-mean
+// accumulation + the fit-end finalize selection. `with_average(1)` ≡ sklearn
+// `average=True`; `with_average(N)` ≡ sklearn `average=N`.
+//
+// Multi-sample, multi-epoch, `shuffle=False` so the trajectory is fully
+// cross-impl deterministic (index order 0..n-1 each epoch).
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (average from the first step, `average=True`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+///   X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[1.,0.],[0.,1.]]); \
+///   y=np.array([1.,2.,3.,4.,0.5,0.8]); \
+///   m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01,learning_rate='constant', \
+///     eta0=0.01,max_iter=8,tol=None,shuffle=False,average=True,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.42614902504529534, 0.3665230497098742] [0.14648807826338486]
+/// ```
+#[test]
+fn sgd_average_from_start() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0, 1.0, 0.0, 0.0, 1.0],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 0.5, 0.8]);
+
+    const SK_COEF0: f64 = 0.42614902504529534;
+    const SK_COEF1: f64 = 0.3665230497098742;
+    const SK_INTERCEPT: f64 = 0.14648807826338486;
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(8)
+        .with_tol(f64::NEG_INFINITY) // tol=None -> -inf: all 8 epochs run
+        .with_shuffle(false)
+        .with_average(1) // sklearn average=True
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("ASGD fit must succeed");
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-7
+            && (coef[1] - SK_COEF1).abs() < 1e-7
+            && (intercept - SK_INTERCEPT).abs() < 1e-7,
+        "average=True diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
+
+/// Oracle invocation (begin averaging partway, `average=20`; 6 samples * 8
+/// epochs = 48 steps, so `t` ranges 1..=48 and averaging starts at `t=20`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+///   X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[1.,0.],[0.,1.]]); \
+///   y=np.array([1.,2.,3.,4.,0.5,0.8]); \
+///   m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01,learning_rate='constant', \
+///     eta0=0.01,max_iter=8,tol=None,shuffle=False,average=20,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.5042444287230554, 0.41888001003992603] [0.16902090306985734]
+/// ```
+#[test]
+fn sgd_average_threshold() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0, 1.0, 0.0, 0.0, 1.0],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 0.5, 0.8]);
+
+    const SK_COEF0: f64 = 0.5042444287230554;
+    const SK_COEF1: f64 = 0.41888001003992603;
+    const SK_INTERCEPT: f64 = 0.16902090306985734;
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(8)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_average(20) // sklearn average=20: averaging begins at t=20
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("ASGD threshold fit must succeed");
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-7
+            && (coef[1] - SK_COEF1).abs() < 1e-7
+            && (intercept - SK_INTERCEPT).abs() < 1e-7,
+        "average=20 diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
+
+/// Oracle invocation (classifier `average=True`, hinge, constant schedule):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+///   X=np.array([[1.,2.],[2.,3.],[3.,1.],[8.,7.],[9.,8.],[7.,9.]]); \
+///   y=np.array([0,0,0,1,1,1]); \
+///   m=SGDClassifier(loss='hinge',penalty='l2',alpha=0.01,learning_rate='constant', \
+///     eta0=0.01,max_iter=10,tol=None,shuffle=False,average=True,fit_intercept=True, \
+///     random_state=0).fit(X,y); print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [[0.11902998815794437, 0.060826180676538694]] [-0.10666666666666665]
+/// ```
+#[test]
+fn sgd_average_classifier() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 8.0, 7.0, 9.0, 8.0, 7.0, 9.0],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![0, 0, 0, 1, 1, 1]);
+
+    const SK_COEF0: f64 = 0.11902998815794437;
+    const SK_COEF1: f64 = 0.060826180676538694;
+    const SK_INTERCEPT: f64 = -0.10666666666666665;
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Hinge)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_average(1) // sklearn average=True
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("classifier ASGD fit must succeed");
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-7
+            && (coef[1] - SK_COEF1).abs() < 1e-7
+            && (intercept - SK_INTERCEPT).abs() < 1e-7,
+        "classifier average=True diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
