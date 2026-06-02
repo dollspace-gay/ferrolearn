@@ -616,3 +616,212 @@ fn qda_scalings_rotations() {
         }
     }
 }
+
+// ===========================================================================
+// REQ-9 (#582) — store_covariance + covariance_.
+// ===========================================================================
+
+/// REQ-9 (#582): `QDA::with_store_covariance(true)` materializes the per-class
+/// `covariance_`, reconstructed from the REGULARIZED scalings as
+/// `Rₖ · diag(scalingsₖ) · Rₖᵀ`, matching sklearn
+/// `QuadraticDiscriminantAnalysis(store_covariance=True).covariance_`
+/// (`discriminant_analysis.py:951-952` `cov.append(np.dot(S2 * Vt.T, Vt))`,
+/// where `S2` is the regularized scalings; `:955-956` `self.covariance_ = cov`).
+/// With `store_covariance=False` (the default) sklearn does not set the
+/// attribute at all, so `covariance()` must be `None`.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -W ignore -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as Q; \
+///   X=np.array([[1.,1.],[1.5,1.2],[1.2,0.8],[1.1,1.3],[5.,5.],[5.5,4.8],[4.8,5.2]]); \
+///   y=np.array([0,0,0,0,1,1,1]); \
+///   m=Q(store_covariance=True).fit(X,y); \
+///   [print(repr(c.tolist())) for c in m.covariance_]; \
+///   print('default attr:', hasattr(Q().fit(X,y),'covariance_'))"
+/// # class0 -> [[0.04666666666666665, 0.010000000000000014],
+/// #            [0.01000000000000002, 0.049166666666666664]]
+/// # class1 -> [[0.13000000000000014, -0.07000000000000012],
+/// #            [-0.07000000000000012, 0.04000000000000009]]
+/// # default attr: False  (covariance_ only exists under store_covariance=True)
+/// ```
+#[test]
+fn qda_store_covariance() {
+    // Live sklearn 1.5.2 `Q(store_covariance=True).covariance_` (per class,
+    // (n_features, n_features), row-major).
+    const SK_COV: [[f64; 4]; 2] = [
+        [
+            0.04666666666666665,
+            0.010000000000000014,
+            0.01000000000000002,
+            0.049166666666666664,
+        ],
+        [
+            0.13000000000000014,
+            -0.07000000000000012,
+            -0.07000000000000012,
+            0.04000000000000009,
+        ],
+    ];
+
+    let x = Array2::from_shape_vec(
+        (7, 2),
+        vec![
+            1.0, 1.0, 1.5, 1.2, 1.2, 0.8, 1.1, 1.3, // class 0
+            5.0, 5.0, 5.5, 4.8, 4.8, 5.2, // class 1
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0, 0, 0, 0, 1, 1, 1]);
+
+    let fitted = QDA::<f64>::new()
+        .with_store_covariance(true)
+        .fit(&x, &y)
+        .unwrap();
+
+    let cov = fitted
+        .covariance()
+        .expect("store_covariance=true must populate covariance_");
+    assert_eq!(cov.len(), 2, "one covariance matrix per class");
+    for c in 0..2 {
+        assert_eq!(
+            cov[c].dim(),
+            (2, 2),
+            "covariance[{c}] is (n_features, n_features)"
+        );
+        for a in 0..2 {
+            for b in 0..2 {
+                let exp = SK_COV[c][a * 2 + b];
+                assert!(
+                    (cov[c][[a, b]] - exp).abs() < 1e-9,
+                    "store_covariance covariance_[{c}][{a}][{b}]: sklearn {}, ferrolearn {}",
+                    exp,
+                    cov[c][[a, b]]
+                );
+            }
+        }
+    }
+
+    // store_covariance=false (the default and the explicit-false builder) ->
+    // covariance_ is not set (None), matching sklearn (hasattr -> False).
+    let fitted_default = QDA::<f64>::new().fit(&x, &y).unwrap();
+    assert!(
+        fitted_default.covariance().is_none(),
+        "default (store_covariance=false) must leave covariance_ unset (None)"
+    );
+    let fitted_false = QDA::<f64>::new()
+        .with_store_covariance(false)
+        .fit(&x, &y)
+        .unwrap();
+    assert!(
+        fitted_false.covariance().is_none(),
+        "with_store_covariance(false) must leave covariance_ unset (None)"
+    );
+}
+
+// ===========================================================================
+// REQ-4 (#578) — predict_log_proba oracle pin.
+// ===========================================================================
+
+/// REQ-4 (#578): `predict_log_proba` is the elementwise log of `predict_proba`,
+/// matching sklearn `QuadraticDiscriminantAnalysis().predict_log_proba`
+/// (`discriminant_analysis.py:1058-1059` `probas_ = self.predict_proba(X);
+/// return np.log(probas_)`). The shared OVERLAPPING 3-class `mc_x`/`mc_y`
+/// dataset keeps every class probability in `(0, 1)`, so all log-probas are
+/// FINITE (no `log(0) = -inf`) and an exact <1e-6 pin is meaningful.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -W ignore -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as Q; \
+///   X=np.array([[0.,0.],[1.,.5],[.5,1.],[1.,1.],[2.,2.],[3.,2.5],[2.5,3.],[3.,3.],\
+///               [1.,3.],[2.,4.],[1.5,3.5],[2.,3.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+///   m=Q().fit(X,y); \
+///   [print(repr(r)) for r in m.predict_log_proba(X).tolist()]"
+/// ```
+#[test]
+fn qda_predict_log_proba() {
+    // Live sklearn 1.5.2 `predict_log_proba(X)` (all entries finite).
+    const SK_LOG_PROBA: [[f64; 3]; 12] = [
+        [
+            -2.970257239867861e-08,
+            -17.333333363035898,
+            -23.977174399261802,
+        ],
+        [
+            -8.843091345757376e-05,
+            -9.333421764246792,
+            -18.664762800472694,
+        ],
+        [
+            -9.701432257666628e-05,
+            -9.333430347655908,
+            -11.664771383881808,
+        ],
+        [
+            -0.0012750479584154241,
+            -6.667941714625081,
+            -12.645116084184309,
+        ],
+        [
+            -4.020637201309386,
+            -0.020637201309386656,
+            -5.997811570868613,
+        ],
+        [
+            -12.000069628853462,
+            -6.962885346522371e-05,
+            -9.664743998412685,
+        ],
+        [
+            -12.067311078830054,
+            -0.0673110788300555,
+            -2.7319854483892785,
+        ],
+        [
+            -14.667968262678182,
+            -0.001301596011517959,
+            -6.645142632237407,
+        ],
+        [
+            -16.022831745972976,
+            -12.022831745972978,
+            -6.115532202653518e-06,
+        ],
+        [
+            -26.022837327601888,
+            -11.356170660935224,
+            -1.1697161113845318e-05,
+        ],
+        [
+            -21.106166675711933,
+            -11.772833342378599,
+            -7.711937820823237e-06,
+        ],
+        [
+            -11.263049363960029,
+            -1.9297160306266947,
+            -0.15689040018591827,
+        ],
+    ];
+
+    let fitted = QDA::<f64>::new().fit(&mc_x(), &mc_y()).unwrap();
+    let log_proba = fitted.predict_log_proba(&mc_x()).unwrap();
+
+    assert_eq!(log_proba.dim(), (12, 3));
+    for i in 0..12 {
+        for c in 0..3 {
+            assert!(
+                log_proba[[i, c]].is_finite(),
+                "predict_log_proba[{i}][{c}] must be finite (overlapping dataset)"
+            );
+            assert!(
+                (log_proba[[i, c]] - SK_LOG_PROBA[i][c]).abs() < 1e-6,
+                "predict_log_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_LOG_PROBA[i][c],
+                log_proba[[i, c]]
+            );
+        }
+    }
+}

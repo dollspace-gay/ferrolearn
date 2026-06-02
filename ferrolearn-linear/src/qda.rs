@@ -37,9 +37,9 @@
 //! | REQ-10 (tol + rank-deficient SVD, no error) | SHIPPED | `with_tol` (default 1e-4); `rank = Σ(S>tol)`, collinearity warning, no error (`:945-947`). Test `qda_rank_deficient_class` (`predict == [0;8]`). #583. |
 //! | REQ-11 (scalings_/rotations_/means_/priors_ attrs) | SHIPPED | `FittedQDA::{scalings,rotations,means,priors}` (`:948-954`,`:921-924`). Test `qda_scalings_rotations`. #584. |
 //! | REQ-6 (provided priors) | SHIPPED | `QDA::priors` field + `with_priors` builder; `fn fit` resolves `priors_` (`None`→empirical `n_k/n`, `Some(p)`→verbatim, no renorm/sign check — `discriminant_analysis.py:341,351,359,921-924`) and `log_prior = priors[k].ln()` enters `fn raw_decision` as `+ log π_k` (`:976`). R-DEV-4 deviation: length-mismatch → `ShapeMismatch` (sklearn silently mis-indexes). Consumer: `fn fit` reads `self.priors`; `FittedQDA::priors` exposes the resolved priors. Test `qda_provided_priors` + `qda_priors_length_mismatch` <1e-6. #580. |
-//! | REQ-4 (predict_log_proba pin + consumer) | NOT-STARTED | #578. |
+//! | REQ-4 (predict_log_proba pin + consumer) | SHIPPED | `FittedQDA::predict_log_proba` = `log_proba(predict_proba(X))` (elementwise `log`, `discriminant_analysis.py:1058-1059` `return np.log(probas_)`). Consumer: `Predict for FittedQDA` shares `predict_proba`; test `qda_predict_log_proba` (overlapping 3-class, finite log-probas) <1e-6 vs live `QuadraticDiscriminantAnalysis().predict_log_proba`. #578. |
 //! | REQ-7 (binary decision_function shape `(n,)`) | NOT-STARTED | #581 (binding-ABI layer, cf. logistic #454; lib returns `(n,2)`, binding applies `col1-col0`). |
-//! | REQ-9 (store_covariance + covariance_) | NOT-STARTED | #582. |
+//! | REQ-9 (store_covariance + covariance_) | SHIPPED | `QDA::store_covariance` field + `with_store_covariance` builder (default `false`, `discriminant_analysis.py:353,361`); `fn fit` reconstructs per-class `Rₖ·diag(scalingsₖ)·Rₖᵀ` from the REGULARIZED scalings (`cov.append(np.dot(S2 * Vt.T, Vt))`, `:951-952`) only when set (`:955-956`). Consumer: `fn fit` reads `self.store_covariance`; `FittedQDA::covariance` exposes the per-class covariances (`None` when unset). Test `qda_store_covariance` <1e-9 vs live `QuadraticDiscriminantAnalysis(store_covariance=True).covariance_` (+ `with_store_covariance(false)` → `None`). #582. |
 //! | REQ-12 (ferray array-type substrate) | NOT-STARTED | #585 (per-class SVD already on `ferray::linalg::svd`; owned array still `ndarray`, crate-wide-deferred cf. ridge #391). |
 //!
 //! # Examples
@@ -111,6 +111,16 @@ pub struct QDA<F> {
     /// [`FerroError::ShapeMismatch`]; sklearn would silently mis-index (a
     /// CPython/numpy footgun Rust eliminates).
     pub priors: Option<Array1<F>>,
+    /// Whether to compute and store the per-class covariance matrices on the
+    /// fitted model. Mirrors sklearn's `store_covariance` constructor argument
+    /// (`discriminant_analysis.py:353,361`; default `False`). When `true`,
+    /// [`Fit::fit`] reconstructs each class covariance from the regularized
+    /// scalings/rotations (`Rₖ · diag(scalingsₖ) · Rₖᵀ`, matching
+    /// `cov.append(np.dot(S2 * Vt.T, Vt))`, `:951-952`) and exposes them via
+    /// [`FittedQDA::covariance`]. When `false` (the default), no covariance is
+    /// stored and [`FittedQDA::covariance`] returns `None`, mirroring sklearn
+    /// (`covariance_` only exists when `store_covariance=True`, `:955-956`).
+    pub store_covariance: bool,
 }
 
 impl<F: Float> QDA<F> {
@@ -123,7 +133,19 @@ impl<F: Float> QDA<F> {
             reg_param: F::zero(),
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             priors: None,
+            store_covariance: false,
         }
+    }
+
+    /// Set whether the per-class covariance matrices are stored on the fitted
+    /// model (sklearn's `store_covariance`, `discriminant_analysis.py:353,361`;
+    /// default `false`). When `true`, [`FittedQDA::covariance`] returns the
+    /// reconstructed `Rₖ · diag(scalingsₖ) · Rₖᵀ` per class; when `false` it
+    /// returns `None`.
+    #[must_use]
+    pub fn with_store_covariance(mut self, store_covariance: bool) -> Self {
+        self.store_covariance = store_covariance;
+        self
     }
 
     /// Set the regularization parameter.
@@ -203,9 +225,28 @@ pub struct FittedQDA<F> {
     /// verbatim. Each entry equals `exp(QDAClass::log_prior)` of the matching
     /// class.
     priors: Array1<F>,
+    /// Per-class covariance matrices, present only when [`QDA::store_covariance`]
+    /// was `true` at fit time. Mirrors sklearn's `covariance_`
+    /// (`discriminant_analysis.py:951-956`): each is the reconstructed
+    /// `Rₖ · diag(scalingsₖ) · Rₖᵀ` (`(n_features, n_features)`) built from the
+    /// regularized scalings. `None` when `store_covariance` was `false` —
+    /// matching sklearn, where `covariance_` only exists when
+    /// `store_covariance=True`.
+    covariance: Option<Vec<Array2<F>>>,
 }
 
 impl<F: Float> FittedQDA<F> {
+    /// Returns the per-class covariance matrices when [`QDA::store_covariance`]
+    /// was `true` at fit time, else `None`. Mirrors sklearn's `covariance_`
+    /// (`discriminant_analysis.py:951-956`): each entry is the regularized
+    /// `Rₖ · diag(scalingsₖ) · Rₖᵀ` of shape `(n_features, n_features)`, in
+    /// sorted class order. `None` (no attribute) when `store_covariance` was
+    /// `false` — matching sklearn, where `covariance_` is set only under
+    /// `store_covariance=True`.
+    #[must_use]
+    pub fn covariance(&self) -> Option<&[Array2<F>]> {
+        self.covariance.as_deref()
+    }
     /// Returns the class means, one per class. Mirrors sklearn's `means_`.
     #[must_use]
     pub fn means(&self) -> Vec<&Array1<F>> {
@@ -499,6 +540,13 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
 
         let one_minus_reg = <F as num_traits::One>::one() - self.reg_param;
         let mut class_models = Vec::with_capacity(classes.len());
+        // sklearn: `cov = []` only when store_covariance (`:928-929`); the
+        // `covariance_` attribute is set only under store_covariance (`:955-956`).
+        let mut covariance: Option<Vec<Array2<F>>> = if self.store_covariance {
+            Some(Vec::with_capacity(classes.len()))
+        } else {
+            None
+        };
 
         for (cls_idx, &cls) in classes.iter().enumerate() {
             // Extract samples for this class.
@@ -563,6 +611,26 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
             // (n_features, k) where k = len(S) = min(n_k, n_features).
             let rotations = vt.t().to_owned();
 
+            // store_covariance: `cov.append(np.dot(S2 * Vt.T, Vt))`
+            // (discriminant_analysis.py:951-952), using the REGULARIZED `S2`
+            // computed above. With `rotations = Vt.T` of shape (n_features, k):
+            //   cov[a,b] = Σ_j rotations[a,j] · scalings[j] · rotations[b,j]
+            // i.e. `Rₖ · diag(scalingsₖ) · Rₖᵀ`, of shape (n_features, n_features).
+            if let Some(cov) = covariance.as_mut() {
+                let k = scalings.len();
+                let mut cov_k = Array2::<F>::zeros((n_features, n_features));
+                for a in 0..n_features {
+                    for b in 0..n_features {
+                        let mut acc = <F as num_traits::Zero>::zero();
+                        for j in 0..k {
+                            acc += rotations[[a, j]] * scalings[j] * rotations[[b, j]];
+                        }
+                        cov_k[[a, b]] = acc;
+                    }
+                }
+                cov.push(cov_k);
+            }
+
             // log(prior_k) of the resolved priors (empirical n_k/n for the
             // `None` path — bit-identical to the previous `(n_k_f / n_f).ln()`
             // — or the provided prior verbatim, where `ln` of a zero gives
@@ -582,6 +650,7 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
             classes,
             n_features,
             priors,
+            covariance,
         })
     }
 }
