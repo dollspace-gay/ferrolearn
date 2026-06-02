@@ -9,6 +9,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- Translation unit: ferrolearn-linear/src/quantile_regressor.rs (mirrors sklearn QuantileRegressor) (#505)
+- Translation unit: ferrolearn-linear/src/quantile_regressor.rs — exact LP fit (#510)
+- Translation unit: ferrolearn-linear/src/huber_regressor.rs (mirrors sklearn HuberRegressor) (#494)
+- Translation unit: ferrolearn-linear/src/huber_regressor.rs — joint [coef,intercept,scale] L-BFGS Huber fit (#503)
+- Translation unit: ferrolearn-linear/src/omp.rs (mirrors sklearn OrthogonalMatchingPursuit) (#487)
+- Translation unit: ferrolearn-linear/src/lars.rs (mirrors sklearn Lars/LassoLars) (#481)
+- Translation unit: ferrolearn-linear/src/ard.rs (mirrors sklearn ARDRegression) (#473)
+- Translation unit: ferrolearn-linear/src/bayesian_ridge.rs (mirrors sklearn BayesianRidge) (#463)
+- Translation unit: ferrolearn-linear/bayesian_ridge.rs — MacKay evidence-max fit (#472)
+- Translation unit: ferrolearn-linear/src/logistic_regression_cv.rs (mirrors sklearn LogisticRegressionCV) (#455)
+- Translation unit: ferrolearn-linear/src/logistic_regression.rs (mirrors sklearn LogisticRegression) (#441)
+- Translation unit: ferrolearn-linear/src/elastic_net_cv.rs (mirrors sklearn ElasticNetCV) (#430)
+- Translation unit: ferrolearn-linear/src/lasso_cv.rs (mirrors sklearn LassoCV) (#420)
+- Translation unit: ferrolearn-linear/src/elastic_net.rs (mirrors sklearn ElasticNet) (#416)
+- Translation unit: ferrolearn-linear/src/lasso.rs (mirrors sklearn/linear_model/_coordinate_descent.py Lasso) (#406)
+- Translation unit: ferrolearn-linear/src/ridge_classifier.rs (mirrors sklearn RidgeClassifier) (#404)
+- Translation unit: ferrolearn-linear/src/ridge_cv.rs (mirrors sklearn RidgeCV) (#402)
+- Translation unit: ferrolearn-linear/src/ridge.rs (mirrors sklearn/linear_model/_ridge.py Ridge) (#383)
+- Translation unit: ferrolearn-linear/src/linalg.rs — SVD min-norm lstsq (fixes #376/#377; mirror LAPACK gelsd) (#379)
+- Translation unit: ferrolearn-linear/src/linear_regression.rs (mirrors sklearn/linear_model/_base.py LinearRegression) (#370)
 
 - **Multi-output Ridge regression** in `ferrolearn-linear`. New `FittedRidgeMulti<F>` type plus `Fit<Array2<F>, Array2<F>> for Ridge<F>` impl share the existing single-output `Ridge`'s hyperparameter struct but solve for an `(n_features, n_targets)` coefficient matrix in a single shared Cholesky factorization of `X^T X + αI`. Backed by a new `cholesky_solve_multi` + `solve_ridge_multi` pair in `linalg.rs`; the factor cost is `O(p^3)` paid once regardless of `t`. Donated from `forecast-bio/decode`'s `forecast-decode-regression::ridge_multi` (the per-PC ridge fit in the DINOv3 decoding pipeline) where the multi-target path is the hot path.
 - **`Powell` direction-set optimizer** in `ferrolearn-numerical::optimize`. Derivative-free ND minimization matching `scipy.optimize.minimize(method='powell')`. Builder API mirrors `NewtonCG` / `TrustRegionNCG` (`Powell::new().with_max_iter(...).with_ftol(...).minimize(f, x0)`), and reuses the existing `OptimizeResult` (gradient field is zero-filled since Powell is derivative-free). Donated from `forecast-bio/decode`'s `forecast-decode-motion::optimize::powell` where it lines up `(dy, dx, theta)` for FFT-seeded motion correction.
@@ -132,6 +152,34 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- QuantileRegressor: scale alpha by n_samples for sklearn parity (#332)
+- Blocker for REQ-1/REQ-3 of quantile_regressor: intercept recovered via X/y centering is invalid for quantile regression (sklearn _quantile.py:177 'centering y and X does not work for quantile regression'). ferrolearn's FittedQuantileRegressor intercept is computed as y_mean - x_mean.dot(w), giving the SAME intercept for every quantile; sklearn's LP makes the intercept a free LP variable (s0-t0). Live oracle q=0.8 alpha=0: ferro intercept=0.2988 vs sklearn 0.8815 (3x). Fix: fit intercept as an LP variable, not by centering — requires the LP solver (#340). (#506)
+- Blocker for REQ-5 of huber_regressor: outliers_ mask (|resid| > scale*epsilon) not computed/exposed (#497)
+- Blocker for REQ-4 of huber_regressor: scale_ not jointly optimized/bounded — IRLS has no sigma parameter (#496)
+- Blocker for REQ-1 of huber_regressor: ferrolearn IRLS diverges from sklearn L-BFGS Huber on outlier data (no joint scale optimization) (#495)
+- Blocker for REQ-2 of omp: default n_nonzero_coefs must be max(int(0.1*n_features),1) when both None (sklearn _omp.py:785); ferrolearn errors instead (#488)
+- Blocker for REQ-2 of omp: default n_nonzero_coefs must be max(int(0.1*n_features),1) when both None (sklearn _omp.py:785); ferrolearn errors instead (#488)
+- Blocker for REQ-2 of lars: LassoLars uses forward-stepwise OLS (ols_active), not the equiangular LARS-lasso path; coef_ diverges from sklearn LassoLars on diabetes (a=0.1: feat-4 enters in ferrolearn, feat-9 in sklearn; -233 vs -155) (#482)
+- Blocker for REQ-3 of ard: needs per-iteration keep_lambda pruning (lambda_>=threshold_lambda drops columns from the solve each iter, sklearn _bayes.py:691-692); ferrolearn prunes coef once after the loop (#476)
+- Blocker for REQ-2 of ard: needs init alpha_=1/(np.var(y)+eps) (sklearn _bayes.py:658); ferrolearn fn fit hardcodes alpha=F::one() (#475)
+- Blocker for REQ-1 of ard: needs iterative keep_lambda column-masking + init alpha=1/(var(y)+eps) + convergence on sum|coef_old-coef_|<tol to match sklearn ARDRegression.fit coef_/alpha_/lambda_ (2D parity fails: feature 0 wrongly pruned) (#474)
+- Blocker for REQ-3 of bayesian_ridge: alpha_init default is 1.0 instead of sklearn's None->1/(Var(y)+eps); changes EM trajectory and fitted alpha_/lambda_/coef_ (#466)
+- Blocker for REQ-2 of bayesian_ridge: BayesianRidge<F> lacks alpha_1/alpha_2/lambda_1/lambda_2 Gamma-prior params (sklearn defaults 1e-6); they enter the alpha_/lambda_ update equations (#465)
+- Blocker for REQ-1 of bayesian_ridge: fit update equations omit Gamma hyperpriors (2*alpha_1/2*alpha_2/2*lambda_1/2*lambda_2) and use a trace/Cholesky-diag gamma approximation instead of sklearn's exact SVD eigenvalue formula; alpha_/lambda_/coef_ diverge from sklearn BayesianRidge (#464)
+- Blocker for REQ-5 of logistic_regression_cv: stratified_kfold_split uses i%k-within-class, diverges from sklearn StratifiedKFold balanced partition (contiguous chunks per class, optional shuffle/random_state) — different fold membership changes per-C accuracy and selected C_ (#456)
+- Blocker for REQ-14 of elastic_net_cv: l1_ratio=0 alpha-grid path; sklearn _alpha_grid raises ValueError for l1_ratio=0 (auto grid unsupported), ferrolearn silently uses max|Xᵀy|/n (#440)
+- Blocker for REQ-5 of elastic_net_cv: kfold_indices uses round-robin i%k; sklearn KFold is contiguous blocks (#431)
+- Blocker for REQ-6 of elastic_net_cv: ElasticNetCV::new() defaults to 7-element l1_ratios grid; sklearn default is l1_ratio=0.5 (single) (#432)
+- Blocker for REQ-5 of lasso_cv.md: LassoCV uses round-robin (i%k) folds, not sklearn KFold contiguous blocks — diverges alpha_/coef_. kfold_indices in lasso_cv.rs must mirror sklearn check_cv(5)->KFold(5) non-shuffled contiguous splits (_coordinate_descent.py:1729). (#421)
+- Divergence: ferrolearn_linear::FittedRidgeClassifier::predict binary boundary uses >=0 not >0 vs sklearn/linear_model/_base.py:384 (#405)
+- Blocker for REQ-3 of ridge_cv: RidgeCV uses brute-force k-fold (default cv=5) over alphas grid; sklearn default cv=None uses _RidgeGCV efficient leave-one-out Generalized Cross-Validation (_ridge.py:2382-2412). Selected alpha_ diverges from sklearn default (#397)
+- Translation unit: ferrolearn-linear/src/ridge_cv.rs (default LOO-GCV) (#403)
+- Divergence: ferrolearn-linear Ridge::fit (alpha=0) errors on rank-deficient X where sklearn/_ridge.py:753 returns min-norm coef (#392)
+- Divergence: ferrolearn-linear solve_lstsq diverges from sklearn/linear_model/_base.py:687 — rcond default eps vs max(m,n)*eps zeroes singular values scipy keeps (#381)
+- Divergence: ferrolearn-linear solve_lstsq diverges from sklearn/linear_model/_base.py:687 — rcond default eps vs max(m,n)*eps zeroes singular values scipy keeps (#381)
+- ferray-side (R-SUBSTRATE-5): ferray-linalg SVD precision on near-zero singular values diverges from LAPACK gelsd — s_min 5.0186e-15 vs 4.9735e-15 + different u_min, ~63% coef magnitude error on near-singular (cond~1e14) lstsq. Root: ferray-linalg/src/decomp/svd.rs. Blocks ferrolearn #381 (rcond fix Some(eps) is the ferrolearn-side half, lands with this). Fix in ferray's own vibe-fork harness. (#382)
+- Divergence: ferrolearn-linear LinearRegression rejects valid underdetermined input (n_samples<n_features) with InsufficientSamples; sklearn succeeds (min-norm) (#377)
+- Divergence: ferrolearn-linear LinearRegression rank-deficient X not minimum-norm (linalg::solve_lstsq QR vs sklearn gelsd SVD) (#376)
 - datasets: add network fetch_* loaders + cache management (fetch_california_housing, get_data_home, clear_data_home, fetch_openml) (#321)
 - numerical: scipy parity audit — special functions (gamma, beta, erf, etc.) + linalg (decompositions live in core::backend) (#322)
 - model-sel: add make_pipeline, make_union helpers + threshold classifiers (FixedThresholdClassifier, TunedThresholdClassifierCV) (#316)
@@ -217,6 +265,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
 - **ferrolearn-numerical**: Replaced manual `(a + b) / 2.0` with `f64::midpoint(a, b)` in adaptive Simpson, Gauss-Kronrod, and cubic-spline routines for overflow-safe averaging (#239)
 
 ### Fixed
+- QuantileRegressor predictions 25x off from sklearn (IRLS vs HiGHS solver divergence) (#340)
 - **ferrolearn-decomp**: `LLE::test_lle_different_n_neighbors` now asserts a real difference (`diff_sum > 1e-10`) instead of the no-op `diff_sum > 1e-10 || true` that always passed (#237)
 - **ferrolearn-neighbors**: `test_all_algorithms_agree_kneighbors` now compares per-row sorted index sets across BruteForce/KdTree/BallTree, restoring an invariant that was previously dropped (the `reference_idxs` variable was assigned but never read) (#237)
 - **ferrolearn-decomp** (`FittedPLSCanonical`, `FittedCCA`): removed stale `#[allow(dead_code)]` on `y_std_` field — it is in fact read by `transform_y` (#237)

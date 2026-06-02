@@ -105,8 +105,7 @@ fn ransac_selection_criterion_r2_not_residual_sum() {
     const SK_MASK: [bool; 6] = [false, false, false, true, true, true];
     let mask = fitted.inlier_mask();
     assert_eq!(
-        mask,
-        &SK_MASK,
+        mask, &SK_MASK,
         "selection criterion: sklearn (higher R^2 wins ties) selects group B \
          mask {SK_MASK:?}; ferrolearn (lower residual_sum) reports {mask:?}"
     );
@@ -181,8 +180,7 @@ fn ransac_mad_zero_threshold_excludes_tiny_deviation() {
     const SK_MASK: [bool; 8] = [true, true, true, true, true, true, true, false];
     let mask = fitted.inlier_mask();
     assert_eq!(
-        mask,
-        &SK_MASK,
+        mask, &SK_MASK,
         "MAD-zero: sklearn threshold = MAD(y) = 0.0 marks idx 7 (residual 1e-7) \
          an outlier {SK_MASK:?}; ferrolearn substitutes 1e-6 and marks it an \
          inlier, reporting {mask:?}"
