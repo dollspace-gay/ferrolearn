@@ -243,6 +243,8 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree adaboost::fit_samme missing perfect-fit estimator_weight=1.0 guard (_weight_boosting.py:679-680) (#710)
+- Divergence: ferrolearn-tree adaboost::fit_samme fits resampled UNWEIGHTED stump vs sklearn weighted fit (_weight_boosting.py:664) (#709)
 - Divergence: ferrolearn-tree AdaBoostRegressor::fit reweight exponent diverges from sklearn/ensemble/_weight_boosting.py:1209-1211 (missing * learning_rate) (#703)
 - Divergence: ferrolearn-tree FittedVotingClassifier::predict tie-break diverges from sklearn/ensemble/_voting.py:445 (Rust max_by_key last-index vs numpy argmax(bincount) lowest-index) (#694)
 - Divergence: ferrolearn-tree RandomTreesEmbedding::new sets n_estimators=10, sklearn default is 100 (sklearn/ensemble/_forest.py:2820) (#687)
