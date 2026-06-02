@@ -122,11 +122,51 @@ pub enum Node<F> {
 // ---------------------------------------------------------------------------
 
 /// Configuration parameters for tree building, bundled to reduce argument counts.
+///
+/// `min_samples_leaf` is the **effective** minimum leaf size — already the
+/// `max(min_samples_leaf, ceil(min_weight_fraction_leaf · n_total))` fold (the
+/// uniform-weight `min_weight_leaf` gate of `_splitter.pyx:470`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TreeParams {
     pub(crate) max_depth: Option<usize>,
     pub(crate) min_samples_split: usize,
     pub(crate) min_samples_leaf: usize,
+}
+
+/// The `min_impurity_decrease` split gate, threaded through the depth-first
+/// build recursion separately from [`TreeParams`] so the (non-generic, forest-
+/// shared) `TreeParams` layout is unchanged.
+///
+/// `n_total` is the WHOLE tree's training-sample count (sklearn's `N` in
+/// `impurity_improvement`, `_criterion.pyx:199`), used to tree-normalize the
+/// improvement; `threshold` is the `min_impurity_decrease` hyperparameter
+/// (default `0.0`). A node becomes a leaf when
+/// `improvement + EPSILON < threshold` (`_tree.pyx:284`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImpurityGate<F> {
+    pub(crate) n_total: usize,
+    pub(crate) threshold: F,
+}
+
+impl<F: Float> ImpurityGate<F> {
+    /// The no-op gate (`min_impurity_decrease = 0.0`) used by the forest
+    /// builders, which do not expose `min_impurity_decrease`. With a `0.0`
+    /// threshold the gate never rejects a split (any improvement
+    /// `>= -EPSILON` passes), keeping forest trees byte-identical.
+    fn disabled(n_total: usize) -> Self {
+        Self {
+            n_total,
+            threshold: F::zero(),
+        }
+    }
+
+    /// Returns `true` when a split with tree-normalized `improvement` must be
+    /// rejected (node becomes a leaf): `improvement + EPSILON < threshold`
+    /// (`_tree.pyx:284`). `EPSILON = np.finfo('double').eps` (`_tree.pyx:63`);
+    /// `F::epsilon()` is exactly that constant for `f64`.
+    fn rejects(&self, improvement: F) -> bool {
+        improvement + F::epsilon() < self.threshold
+    }
 }
 
 /// Data references for classification tree building.
@@ -175,6 +215,22 @@ pub struct DecisionTreeClassifier<F> {
     pub min_samples_split: usize,
     /// Minimum number of samples required in a leaf node.
     pub min_samples_leaf: usize,
+    /// Minimum weighted fraction of the total sample weight required at a leaf.
+    ///
+    /// Mirrors sklearn's `min_weight_fraction_leaf` (`_classes.py:946`,
+    /// default `0.0`). For uniform sample weights the effective minimum leaf
+    /// size becomes `max(min_samples_leaf, ceil(min_weight_fraction_leaf · N))`
+    /// where `N` is the total training-sample count (`_classes.py:371`,
+    /// `_splitter.pyx:470`).
+    pub min_weight_fraction_leaf: F,
+    /// Minimum tree-normalized weighted impurity decrease required to split a
+    /// node.
+    ///
+    /// Mirrors sklearn's `min_impurity_decrease` (`_classes.py:946`, default
+    /// `0.0`). A node is made a leaf when the split's improvement
+    /// `N_t/N·(parent − N_tL/N_t·imp_L − N_tR/N_t·imp_R)` satisfies
+    /// `improvement + EPSILON < min_impurity_decrease` (`_tree.pyx:284`).
+    pub min_impurity_decrease: F,
     /// Splitting criterion.
     pub criterion: ClassificationCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -184,13 +240,16 @@ impl<F: Float> DecisionTreeClassifier<F> {
     /// Create a new `DecisionTreeClassifier` with default settings.
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
-    /// `min_samples_leaf = 1`, `criterion = Gini`.
+    /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
+    /// `min_impurity_decrease = 0.0`, `criterion = Gini`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_depth: None,
             min_samples_split: 2,
             min_samples_leaf: 1,
+            min_weight_fraction_leaf: F::zero(),
+            min_impurity_decrease: F::zero(),
             criterion: ClassificationCriterion::Gini,
             _marker: std::marker::PhantomData,
         }
@@ -214,6 +273,22 @@ impl<F: Float> DecisionTreeClassifier<F> {
     #[must_use]
     pub fn with_min_samples_leaf(mut self, min_samples_leaf: usize) -> Self {
         self.min_samples_leaf = min_samples_leaf;
+        self
+    }
+
+    /// Set the minimum weighted fraction of the total sample weight required at
+    /// a leaf (sklearn `min_weight_fraction_leaf`, `_classes.py:946`).
+    #[must_use]
+    pub fn with_min_weight_fraction_leaf(mut self, min_weight_fraction_leaf: F) -> Self {
+        self.min_weight_fraction_leaf = min_weight_fraction_leaf;
+        self
+    }
+
+    /// Set the minimum tree-normalized weighted impurity decrease required to
+    /// split a node (sklearn `min_impurity_decrease`, `_classes.py:946`).
+    #[must_use]
+    pub fn with_min_impurity_decrease(mut self, min_impurity_decrease: F) -> Self {
+        self.min_impurity_decrease = min_impurity_decrease;
         self
     }
 
@@ -399,14 +474,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             max_features_per_split: None,
             criterion: self.criterion,
         };
+        // Fold `min_weight_fraction_leaf` into the effective per-child minimum
+        // leaf size (uniform weights, `_classes.py:371` / `_splitter.pyx:470`).
         let params = TreeParams {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
-            min_samples_leaf: self.min_samples_leaf,
+            min_samples_leaf: effective_min_samples_leaf(
+                self.min_samples_leaf,
+                self.min_weight_fraction_leaf,
+                n_samples,
+            ),
+        };
+        let gate = ImpurityGate {
+            n_total: n_samples,
+            threshold: self.min_impurity_decrease,
         };
 
         let mut nodes: Vec<Node<F>> = Vec::new();
-        build_classification_tree(&data, &indices, &mut nodes, 0, &params, None);
+        build_classification_tree(&data, &indices, &mut nodes, 0, &params, &gate, None);
 
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
@@ -517,6 +602,22 @@ pub struct DecisionTreeRegressor<F> {
     pub min_samples_split: usize,
     /// Minimum number of samples required in a leaf node.
     pub min_samples_leaf: usize,
+    /// Minimum weighted fraction of the total sample weight required at a leaf.
+    ///
+    /// Mirrors sklearn's `min_weight_fraction_leaf` (`_classes.py:1317`,
+    /// default `0.0`). For uniform sample weights the effective minimum leaf
+    /// size becomes `max(min_samples_leaf, ceil(min_weight_fraction_leaf · N))`
+    /// where `N` is the total training-sample count (`_classes.py:371`,
+    /// `_splitter.pyx:470`).
+    pub min_weight_fraction_leaf: F,
+    /// Minimum tree-normalized weighted impurity decrease required to split a
+    /// node.
+    ///
+    /// Mirrors sklearn's `min_impurity_decrease` (`_classes.py:1317`, default
+    /// `0.0`). A node is made a leaf when the split's improvement
+    /// `N_t/N·(parent − N_tL/N_t·imp_L − N_tR/N_t·imp_R)` satisfies
+    /// `improvement + EPSILON < min_impurity_decrease` (`_tree.pyx:284`).
+    pub min_impurity_decrease: F,
     /// Splitting criterion.
     pub criterion: RegressionCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -526,13 +627,16 @@ impl<F: Float> DecisionTreeRegressor<F> {
     /// Create a new `DecisionTreeRegressor` with default settings.
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
-    /// `min_samples_leaf = 1`, `criterion = MSE`.
+    /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
+    /// `min_impurity_decrease = 0.0`, `criterion = MSE`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_depth: None,
             min_samples_split: 2,
             min_samples_leaf: 1,
+            min_weight_fraction_leaf: F::zero(),
+            min_impurity_decrease: F::zero(),
             criterion: RegressionCriterion::Mse,
             _marker: std::marker::PhantomData,
         }
@@ -556,6 +660,22 @@ impl<F: Float> DecisionTreeRegressor<F> {
     #[must_use]
     pub fn with_min_samples_leaf(mut self, min_samples_leaf: usize) -> Self {
         self.min_samples_leaf = min_samples_leaf;
+        self
+    }
+
+    /// Set the minimum weighted fraction of the total sample weight required at
+    /// a leaf (sklearn `min_weight_fraction_leaf`, `_classes.py:1317`).
+    #[must_use]
+    pub fn with_min_weight_fraction_leaf(mut self, min_weight_fraction_leaf: F) -> Self {
+        self.min_weight_fraction_leaf = min_weight_fraction_leaf;
+        self
+    }
+
+    /// Set the minimum tree-normalized weighted impurity decrease required to
+    /// split a node (sklearn `min_impurity_decrease`, `_classes.py:1317`).
+    #[must_use]
+    pub fn with_min_impurity_decrease(mut self, min_impurity_decrease: F) -> Self {
+        self.min_impurity_decrease = min_impurity_decrease;
         self
     }
 
@@ -669,14 +789,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
             max_features_per_split: None,
             criterion: self.criterion,
         };
+        // Fold `min_weight_fraction_leaf` into the effective per-child minimum
+        // leaf size (uniform weights, `_classes.py:371` / `_splitter.pyx:470`).
         let params = TreeParams {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
-            min_samples_leaf: self.min_samples_leaf,
+            min_samples_leaf: effective_min_samples_leaf(
+                self.min_samples_leaf,
+                self.min_weight_fraction_leaf,
+                n_samples,
+            ),
+        };
+        let gate = ImpurityGate {
+            n_total: n_samples,
+            threshold: self.min_impurity_decrease,
         };
 
         let mut nodes: Vec<Node<F>> = Vec::new();
-        build_regression_tree(&data, &indices, &mut nodes, 0, &params, None);
+        build_regression_tree(&data, &indices, &mut nodes, 0, &params, &gate, None);
 
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
@@ -794,6 +924,31 @@ impl<F: Float + Send + Sync + 'static> FittedPipelineEstimator<F>
 /// and never taken for the supported `f32`/`f64` types.
 fn feature_threshold<F: Float>() -> F {
     F::from(1e-7).unwrap_or_else(F::epsilon)
+}
+
+/// Fold `min_weight_fraction_leaf` into the effective minimum leaf size for
+/// uniform sample weights.
+///
+/// sklearn sets `min_weight_leaf = min_weight_fraction_leaf · N`
+/// (`_classes.py:371`, uniform-weight branch) and the best-splitter rejects a
+/// split whose child has `weighted_n_child < min_weight_leaf`
+/// (`_splitter.pyx:470`). With uniform weights `weighted_n_child = n_child`, so
+/// rejecting `n_child < min_weight_leaf` is equivalent to requiring
+/// `n_child >= ceil(min_weight_leaf)`. The effective per-child minimum is then
+/// `max(min_samples_leaf, ceil(min_weight_fraction_leaf · N))`.
+fn effective_min_samples_leaf<F: Float>(
+    min_samples_leaf: usize,
+    min_weight_fraction_leaf: F,
+    n_total: usize,
+) -> usize {
+    if min_weight_fraction_leaf <= F::zero() {
+        return min_samples_leaf;
+    }
+    let min_weight_leaf = min_weight_fraction_leaf * F::from(n_total).unwrap_or_else(F::one);
+    // ceil(min_weight_leaf), saturating into usize; defensive `map_or(0)` keeps
+    // this panic-free (R-CODE-2) for the supported f32/f64 types.
+    let ceil_weight = min_weight_leaf.ceil().to_usize().unwrap_or(0);
+    min_samples_leaf.max(ceil_weight)
 }
 
 /// Sort `idxs` ascending by feature `feat` of `x`, putting any NaN last.
@@ -1065,6 +1220,7 @@ fn build_classification_tree<F: Float>(
     nodes: &mut Vec<Node<F>>,
     depth: usize,
     params: &TreeParams,
+    gate: &ImpurityGate<F>,
     mut rng: Option<&mut StdRng>,
 ) -> usize {
     let n = indices.len();
@@ -1087,7 +1243,19 @@ fn build_classification_tree<F: Float>(
     let best =
         find_best_classification_split(data, indices, params.min_samples_leaf, rng.as_deref_mut());
 
-    if let Some((best_feature, best_threshold, best_impurity_decrease)) = best {
+    // `min_impurity_decrease` gate (`_tree.pyx:284`): reject the split (make a
+    // leaf) when its tree-normalized improvement is below the threshold. The
+    // finder returns `best_impurity_decrease = improvement_inner · n_node`
+    // where `improvement_inner = parent − Σ(n_child/n_node)·imp_child`; the
+    // tree-normalized improvement of `_criterion.pyx:188` is then
+    // `(n_node/N)·improvement_inner = best_impurity_decrease / N`.
+    let gated = best.filter(|&(_, _, best_impurity_decrease)| {
+        let n_total_f = F::from(gate.n_total).unwrap_or_else(F::one);
+        let improvement = best_impurity_decrease / n_total_f;
+        !gate.rejects(improvement)
+    });
+
+    if let Some((best_feature, best_threshold, best_impurity_decrease)) = gated {
         let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
             .iter()
             .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
@@ -1105,10 +1273,11 @@ fn build_classification_tree<F: Float>(
             nodes,
             depth + 1,
             params,
+            gate,
             rng.as_deref_mut(),
         );
         let right_idx =
-            build_classification_tree(data, &right_indices, nodes, depth + 1, params, rng);
+            build_classification_tree(data, &right_indices, nodes, depth + 1, params, gate, rng);
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1226,7 +1395,15 @@ fn find_best_classification_split<F: Float>(
         }
     }
 
-    if best_score > F::zero() {
+    // Return the best split with a valid child-size split point, even when its
+    // improvement is exactly `0` (the impurity decrease is `>= 0` for
+    // gini/entropy). sklearn accepts the best split regardless of sign and lets
+    // the `min_impurity_decrease` gate (`improvement + EPSILON <
+    // min_impurity_decrease`, `_tree.pyx:284`) reject it in the build loop; the
+    // default `0.0` threshold accepts zero-improvement splits (e.g. the
+    // `min_weight_fraction_leaf` fallback split). `best_score` stays `-inf`
+    // when no valid split point exists ⇒ `None`.
+    if best_score >= F::zero() {
         Some((best_feature, best_threshold, best_score * n_f))
     } else {
         None
@@ -1240,6 +1417,7 @@ fn build_regression_tree<F: Float>(
     nodes: &mut Vec<Node<F>>,
     depth: usize,
     params: &TreeParams,
+    gate: &ImpurityGate<F>,
     mut rng: Option<&mut StdRng>,
 ) -> usize {
     let n = indices.len();
@@ -1273,7 +1451,25 @@ fn build_regression_tree<F: Float>(
     let best =
         find_best_regression_split(data, indices, params.min_samples_leaf, rng.as_deref_mut());
 
-    if let Some((best_feature, best_threshold, best_impurity_decrease)) = best {
+    // `min_impurity_decrease` gate (`_tree.pyx:284`). The finder returns
+    // `best_impurity_decrease = score · n_node`. For MSE / absolute_error /
+    // poisson, `score = parent − Σ(n_child/n_node)·imp_child`, so the
+    // tree-normalized improvement `(n_node/N)·score` equals
+    // `best_impurity_decrease / N`. For friedman_mse the finder's `score` IS
+    // `FriedmanMSE.impurity_improvement = diff²/(n_L·n_R·n_node)`
+    // (`_criterion.pyx:1573`) — already tree-normalized, with NO extra `1/N`
+    // factor — so the improvement is `best_impurity_decrease / n_node = score`.
+    let gated = best.filter(|&(_, _, best_impurity_decrease)| {
+        let denom = match data.criterion {
+            RegressionCriterion::FriedmanMse => n,
+            _ => gate.n_total,
+        };
+        let denom_f = F::from(denom).unwrap_or_else(F::one);
+        let improvement = best_impurity_decrease / denom_f;
+        !gate.rejects(improvement)
+    });
+
+    if let Some((best_feature, best_threshold, best_impurity_decrease)) = gated {
         let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
             .iter()
             .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
@@ -1291,9 +1487,11 @@ fn build_regression_tree<F: Float>(
             nodes,
             depth + 1,
             params,
+            gate,
             rng.as_deref_mut(),
         );
-        let right_idx = build_regression_tree(data, &right_indices, nodes, depth + 1, params, rng);
+        let right_idx =
+            build_regression_tree(data, &right_indices, nodes, depth + 1, params, gate, rng);
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1562,7 +1760,8 @@ pub(crate) fn build_classification_tree_with_feature_subset<F: Float>(
         criterion,
     };
     let mut nodes = Vec::new();
-    build_classification_tree(&data, indices, &mut nodes, 0, params, None);
+    let gate = ImpurityGate::disabled(indices.len());
+    build_classification_tree(&data, indices, &mut nodes, 0, params, &gate, None);
     nodes
 }
 
@@ -1594,7 +1793,8 @@ pub(crate) fn build_classification_tree_per_split_features<F: Float>(
     };
     let mut rng = StdRng::seed_from_u64(seed);
     let mut nodes = Vec::new();
-    build_classification_tree(&data, indices, &mut nodes, 0, params, Some(&mut rng));
+    let gate = ImpurityGate::disabled(indices.len());
+    build_classification_tree(&data, indices, &mut nodes, 0, params, &gate, Some(&mut rng));
     nodes
 }
 
@@ -1615,7 +1815,8 @@ pub(crate) fn build_regression_tree_with_feature_subset<F: Float>(
         criterion: RegressionCriterion::Mse,
     };
     let mut nodes = Vec::new();
-    build_regression_tree(&data, indices, &mut nodes, 0, params, None);
+    let gate = ImpurityGate::disabled(indices.len());
+    build_regression_tree(&data, indices, &mut nodes, 0, params, &gate, None);
     nodes
 }
 
@@ -1641,7 +1842,8 @@ pub(crate) fn build_regression_tree_per_split_features<F: Float>(
     };
     let mut rng = StdRng::seed_from_u64(seed);
     let mut nodes = Vec::new();
-    build_regression_tree(&data, indices, &mut nodes, 0, params, Some(&mut rng));
+    let gate = ImpurityGate::disabled(indices.len());
+    build_regression_tree(&data, indices, &mut nodes, 0, params, &gate, Some(&mut rng));
     nodes
 }
 
@@ -2312,6 +2514,183 @@ mod tests {
             .with_criterion(RegressionCriterion::Poisson)
             .fit(&x, &y_zero);
         assert!(res0.is_err(), "poisson must reject sum(y) <= 0");
+    }
+
+    // -- REQ-3: min_impurity_decrease / min_weight_fraction_leaf smoke tests.
+    //    Expected values from the live sklearn 1.5.2 oracle (R-CHAR-3),
+    //    recorded in each test's doc comment:
+    //
+    //    import numpy as np; from sklearn.tree import DecisionTreeClassifier
+    //    X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],float)
+    //    y=np.array([0,0,0,1,1,1,2,2,0])
+    //    for mid in (0.0,0.2,0.5):
+    //        c=DecisionTreeClassifier(min_impurity_decrease=mid,random_state=0).fit(X,y)
+    //        print(mid, c.tree_.node_count, c.predict(X).tolist())
+    //    # 0.0  -> 7  [0,0,0,1,1,1,2,2,0]
+    //    # 0.2  -> 3  [0,0,0,1,1,1,0,0,0]
+    //    # 0.5  -> 1  [0,0,0,0,0,0,0,0,0]
+    //    for mwfl in (0.0,0.25):
+    //        c=DecisionTreeClassifier(min_weight_fraction_leaf=mwfl,random_state=0).fit(X,y)
+    //        print(mwfl, c.tree_.node_count, c.predict(X).tolist())
+    //    # 0.0  -> 7  [0,0,0,1,1,1,2,2,0]
+    //    # 0.25 -> 5  [0,0,0,1,1,1,0,0,0]
+
+    /// The 9x2 classifier oracle fixture shared by the REQ-3 pruning tests.
+    fn clf_prune_fixture() -> (Array2<f64>, Array1<usize>) {
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 3.0],
+            [3.0, 3.0],
+            [5.0, 6.0],
+            [6.0, 7.0],
+            [7.0, 8.0],
+            [1.5, 5.0],
+            [6.5, 2.0],
+            [3.0, 1.0]
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 0];
+        (x, y)
+    }
+
+    /// Assert a classifier `predict` matches `expected` exactly.
+    fn assert_clf_predict(
+        fitted: &FittedDecisionTreeClassifier<f64>,
+        x: &Array2<f64>,
+        expected: &[usize],
+    ) {
+        let res = fitted.predict(x);
+        assert!(res.is_ok(), "predict failed: {:?}", res.as_ref().err());
+        let preds = res.unwrap_or_else(|_| Array1::zeros(0));
+        assert_eq!(preds.as_slice().unwrap_or(&[]), expected);
+    }
+
+    /// Default `min_impurity_decrease = 0.0` keeps the full oracle tree:
+    /// `node_count == 7`, `predict == [0,0,0,1,1,1,2,2,0]` (sklearn 1.5.2).
+    #[test]
+    fn test_classifier_min_impurity_decrease_default_node_count_7() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new().fit(&x, &y) {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(fitted.nodes().len(), 7, "default node_count (sklearn: 7)");
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 2, 2, 0]);
+    }
+
+    /// `min_impurity_decrease = 0.2` prunes the class-2 split:
+    /// `node_count == 3`, `predict == [0,0,0,1,1,1,0,0,0]` (sklearn 1.5.2).
+    #[test]
+    fn test_classifier_min_impurity_decrease_0_2_node_count_3() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_min_impurity_decrease(0.2)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            3,
+            "node_count at mid=0.2 (sklearn: 3)"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 0, 0, 0]);
+    }
+
+    /// `min_impurity_decrease = 0.5` prunes the root: `node_count == 1`,
+    /// `predict` all-0 (majority class), sklearn 1.5.2.
+    #[test]
+    fn test_classifier_min_impurity_decrease_0_5_node_count_1() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_min_impurity_decrease(0.5)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            1,
+            "node_count at mid=0.5 (sklearn: 1)"
+        );
+        assert!(
+            matches!(fitted.nodes()[0], Node::Leaf { .. }),
+            "root must be a leaf at mid=0.5"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// `min_weight_fraction_leaf = 0.25` (N=9 ⇒ min_weight_leaf=2.25 ⇒ each
+    /// child needs >= 3 samples) prunes the small class-2 leaves:
+    /// `node_count == 5`, `predict == [0,0,0,1,1,1,0,0,0]` (sklearn 1.5.2).
+    #[test]
+    fn test_classifier_min_weight_fraction_leaf_0_25_node_count_5() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_min_weight_fraction_leaf(0.25)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            5,
+            "node_count at mwfl=0.25 (sklearn: 5)"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 0, 0, 0]);
+    }
+
+    /// `effective_min_samples_leaf` folds `min_weight_fraction_leaf · N`
+    /// (ceil'd) with `min_samples_leaf` for uniform weights
+    /// (`_classes.py:371`, `_splitter.pyx:470`).
+    #[test]
+    fn test_effective_min_samples_leaf_fold() {
+        // 0.0 fraction is a no-op.
+        assert_eq!(effective_min_samples_leaf::<f64>(1, 0.0, 9), 1);
+        // 0.25 * 9 = 2.25 -> ceil 3, > min_samples_leaf 1.
+        assert_eq!(effective_min_samples_leaf::<f64>(1, 0.25, 9), 3);
+        // exact integer 0.25 * 8 = 2.0 -> ceil 2.
+        assert_eq!(effective_min_samples_leaf::<f64>(1, 0.25, 8), 2);
+        // explicit min_samples_leaf wins when larger.
+        assert_eq!(effective_min_samples_leaf::<f64>(5, 0.25, 9), 5);
     }
 
     /// MSE path stays byte-identical after the criterion-dispatch refactor:

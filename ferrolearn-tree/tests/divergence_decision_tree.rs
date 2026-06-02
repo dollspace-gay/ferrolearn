@@ -575,3 +575,212 @@ fn req1_reg_poisson_oracle_and_negative_y_errors() {
         "poisson fit on a set with negative y must return Err (sklearn raises ValueError)"
     );
 }
+
+// ===========================================================================
+// REQ-3 STOPPING-PARAM CERTIFYING PINS (#662 min_impurity_decrease / #664
+// min_weight_fraction_leaf). All expected values derived LIVE from the
+// sklearn 1.5.2 oracle (R-CHAR-3); the exact python invocations are recorded
+// above each pin. node_count = `tree_.node_count`; predict = `predict(X)`.
+// Tests run in integration-test (test) context — the .unwrap()/.expect() idiom
+// matches the 11 prior pins above (R-APG-2: test context is gate-exempt).
+// ===========================================================================
+
+/// PIN A — `min_impurity_decrease` gates the CLASSIFIER tree (#662).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+///     X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],dtype=float); \
+///     y=np.array([0,0,0,1,1,1,2,2,0]); \
+///     [print(V, DecisionTreeClassifier(min_impurity_decrease=V,random_state=0).fit(X,y).tree_.node_count, \
+///       DecisionTreeClassifier(min_impurity_decrease=V,random_state=0).fit(X,y).predict(X).tolist()) \
+///       for V in (0.0,0.2,0.5)]"
+///   => V=0.0 node_count 7  predict [0,0,0,1,1,1,2,2,0]
+///      V=0.2 node_count 3  predict [0,0,0,1,1,1,0,0,0]
+///      V=0.5 node_count 1  predict [0,0,0,0,0,0,0,0,0]
+#[test]
+fn req3_clf_min_impurity_decrease_oracle() {
+    let (x, y) = clf_dataset();
+
+    // Default (V=0.0): impurity gate is OFF — full oracle tree (node_count 7).
+    let default = DecisionTreeClassifier::<f64>::new().fit(&x, &y).unwrap();
+    assert_eq!(
+        default.nodes().len(),
+        7,
+        "min_impurity_decrease default node_count: ferrolearn={} sklearn=7",
+        default.nodes().len()
+    );
+    assert_eq!(
+        default.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 2, 2, 0],
+        "mid=0.0 predict"
+    );
+
+    // V=0.2: prunes the class-2 split — node_count 3.
+    let v02 = DecisionTreeClassifier::<f64>::new()
+        .with_min_impurity_decrease(0.2)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        v02.nodes().len(),
+        3,
+        "min_impurity_decrease=0.2 node_count: ferrolearn={} sklearn=3",
+        v02.nodes().len()
+    );
+    assert_eq!(
+        v02.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 0, 0, 0],
+        "mid=0.2 predict"
+    );
+
+    // V=0.5: prunes the root — single leaf, all-majority (0).
+    let v05 = DecisionTreeClassifier::<f64>::new()
+        .with_min_impurity_decrease(0.5)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        v05.nodes().len(),
+        1,
+        "min_impurity_decrease=0.5 node_count: ferrolearn={} sklearn=1",
+        v05.nodes().len()
+    );
+    assert!(
+        matches!(v05.nodes().first(), Some(Node::Leaf { .. })),
+        "mid=0.5 root must be a Leaf"
+    );
+    assert_eq!(
+        v05.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 0, 0, 0, 0, 0, 0],
+        "mid=0.5 predict"
+    );
+}
+
+/// PIN B — `min_weight_fraction_leaf` gates the CLASSIFIER tree (#664).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+///     X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],dtype=float); \
+///     y=np.array([0,0,0,1,1,1,2,2,0]); \
+///     [print(W, DecisionTreeClassifier(min_weight_fraction_leaf=W,random_state=0).fit(X,y).tree_.node_count, \
+///       DecisionTreeClassifier(min_weight_fraction_leaf=W,random_state=0).fit(X,y).predict(X).tolist()) \
+///       for W in (0.0,0.25)]"
+///   => W=0.0  node_count 7  predict [0,0,0,1,1,1,2,2,0]
+///      W=0.25 node_count 5  predict [0,0,0,1,1,1,0,0,0]
+#[test]
+fn req3_clf_min_weight_fraction_leaf_oracle() {
+    let (x, y) = clf_dataset();
+
+    // Default (W=0.0): full oracle tree (node_count 7).
+    let default = DecisionTreeClassifier::<f64>::new().fit(&x, &y).unwrap();
+    assert_eq!(
+        default.nodes().len(),
+        7,
+        "min_weight_fraction_leaf default node_count: ferrolearn={} sklearn=7",
+        default.nodes().len()
+    );
+    assert_eq!(
+        default.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 2, 2, 0],
+        "mwfl=0.0 predict"
+    );
+
+    // W=0.25: effective per-child minimum becomes ceil(0.25*9)=3 — node_count 5.
+    let w025 = DecisionTreeClassifier::<f64>::new()
+        .with_min_weight_fraction_leaf(0.25)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        w025.nodes().len(),
+        5,
+        "min_weight_fraction_leaf=0.25 node_count: ferrolearn={} sklearn=5",
+        w025.nodes().len()
+    );
+    assert_eq!(
+        w025.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 0, 0, 0],
+        "mwfl=0.25 predict"
+    );
+}
+
+/// PIN C — `min_impurity_decrease` gates the REGRESSOR tree (#662). Exercises
+/// the regressor finder's split-accept path with the impurity gate (the builder
+/// noted the regressor finder keeps a strict `>0` accept — this pins a value
+/// where the oracle measurably reduces the tree, and a value that collapses it
+/// to a single leaf).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]); \
+///     [print(V, DecisionTreeRegressor(min_impurity_decrease=V,random_state=0).fit(Xr,yr).tree_.node_count, \
+///       DecisionTreeRegressor(min_impurity_decrease=V,random_state=0).fit(Xr,yr).predict(Xr).tolist()) \
+///       for V in (0.0,0.5,5.0)]"
+///   => V=0.0 node_count 15 predict [1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]
+///      V=0.5 node_count 3  root (0,4.5) predict [1.05,1.05,1.05,1.05,5.05,5.05,5.05,5.05]
+///      V=5.0 node_count 1  predict all 3.05 (mean of all y = 24.4/8)
+#[test]
+fn req3_reg_min_impurity_decrease_oracle() {
+    let (x, y) = reg_dataset();
+
+    // Default (V=0.0): impurity gate OFF — full oracle tree (node_count 15).
+    let default = DecisionTreeRegressor::<f64>::new().fit(&x, &y).unwrap();
+    assert_eq!(
+        default.nodes().len(),
+        15,
+        "REG min_impurity_decrease default node_count: ferrolearn={} sklearn=15",
+        default.nodes().len()
+    );
+
+    // V=0.5: gate prunes 15 -> 3, root (0, 4.5), mean leaves 1.05 / 5.05.
+    let v05 = DecisionTreeRegressor::<f64>::new()
+        .with_min_impurity_decrease(0.5)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        v05.nodes().len(),
+        3,
+        "REG min_impurity_decrease=0.5 node_count: ferrolearn={} sklearn=3",
+        v05.nodes().len()
+    );
+    let (feat, thr) = root_split(v05.nodes()).expect("REG mid=0.5 root must be a Split");
+    assert_eq!(
+        feat, 0,
+        "REG mid=0.5 root feature: ferrolearn={feat} sklearn=0"
+    );
+    assert!(
+        (thr - 4.5).abs() < 1e-9,
+        "REG mid=0.5 root threshold: ferrolearn={thr} sklearn=4.5"
+    );
+    let sk_v05_predict = [1.05, 1.05, 1.05, 1.05, 5.05, 5.05, 5.05, 5.05];
+    let preds = v05.predict(&x).unwrap();
+    for (i, &exp) in sk_v05_predict.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "REG mid=0.5 predict[{i}]: ferrolearn={} sklearn={exp}",
+            preds[i]
+        );
+    }
+
+    // V=5.0: gate prunes the root — single leaf, mean of all y = 3.05.
+    let v50 = DecisionTreeRegressor::<f64>::new()
+        .with_min_impurity_decrease(5.0)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        v50.nodes().len(),
+        1,
+        "REG min_impurity_decrease=5.0 node_count: ferrolearn={} sklearn=1",
+        v50.nodes().len()
+    );
+    assert!(
+        matches!(v50.nodes().first(), Some(Node::Leaf { .. })),
+        "REG mid=5.0 root must be a Leaf"
+    );
+    let preds50 = v50.predict(&x).unwrap();
+    for i in 0..preds50.len() {
+        assert!(
+            (preds50[i] - 3.05).abs() < 1e-9,
+            "REG mid=5.0 predict[{i}] (mean of all y): ferrolearn={} sklearn=3.05",
+            preds50[i]
+        );
+    }
+}
