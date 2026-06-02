@@ -22,6 +22,31 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.AdaBoostRegressor` (AdaBoost.R2,
+//! `sklearn/ensemble/_weight_boosting.py`). See
+//! `.design/tree/adaboost_regressor.md`.
+//!
+//! **Resampling boundary:** ferrolearn fits each tree on a *deterministic
+//! systematic resample* (`resample_weighted`, no RNG) where sklearn uses a
+//! *numpy weighted bootstrap-with-replacement* draw (`random_state.choice`,
+//! `_weight_boosting.py:1160`). End-to-end prediction parity with sklearn is
+//! therefore infeasible (#705), but ferrolearn's fit is fully deterministic
+//! and reproducible — the per-step formulas below are oracle-grounded.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param defaults: `n_estimators=50`, `learning_rate=1.0`, `loss=Linear`, base `max_depth=Some(3)` | SHIPPED |
+//! | REQ-2 | `AdaBoostLoss` Linear/Square/Exponential loss normalization by `error_max` (`_weight_boosting.py:1183-1188`) | SHIPPED |
+//! | REQ-3 | `beta = err/(1-err)`, `estimator_weight = learning_rate * ln(1/beta)`, reweight `beta^((1-loss)*learning_rate)` (`:1203,:1206,:1209-1211`) | SHIPPED |
+//! | REQ-4 | Weighted-median `predict` = first sorted position whose weight CDF >= 0.5 * total (`_get_median_predict` `:799-809`) | SHIPPED |
+//! | REQ-8 | `feature_importances_` = weighted-normalized mean of per-tree importances | SHIPPED |
+//! | REQ-6 | Pluggable base estimator + `estimator_errors_` attribute | NOT-STARTED (#704) |
+//! | REQ-7 | numpy weighted-bootstrap resampling / end-to-end sklearn parity | NOT-STARTED (#705, boundary) |
+//! | REQ-9 | PyO3 binding (ferrolearn-python regressor registration) | NOT-STARTED (#706) |
+//! | REQ-10 | ferray substrate migration | NOT-STARTED (#707) |
 
 use crate::decision_tree::{self, Node, build_regression_tree_with_feature_subset};
 use ferrolearn_core::error::FerroError;
@@ -342,9 +367,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for AdaBoostReg
             // Estimator weight = ln(1 / beta) * learning_rate.
             let est_weight = (F::one() / beta.max(eps)).ln() * self.learning_rate;
 
-            // Update sample weights: w_i *= beta^(1 - loss_i).
+            // Update sample weights: w_i *= beta^((1 - loss_i) * learning_rate).
             for i in 0..n_samples {
-                let exponent = F::one() - losses[i];
+                let exponent = (F::one() - losses[i]) * self.learning_rate;
                 weights[i] = weights[i] * beta.powf(exponent);
             }
 
