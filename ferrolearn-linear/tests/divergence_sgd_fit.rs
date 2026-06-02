@@ -399,7 +399,6 @@ fn sgd_elasticnet_l1_ratio() {
 /// `InvalidParameter` error is produced — so this assertion (expecting an `Err`)
 /// FAILS against the current implementation.
 #[test]
-#[ignore = "divergence: l1_ratio not validated to [0,1]; tracking #540"]
 fn sgd_l1_ratio_out_of_range_rejected() {
     let x = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
     let y = Array1::from_vec(vec![3.0]);

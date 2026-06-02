@@ -784,7 +784,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// not positive.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedSGDClassifier<F>, FerroError> {
-        validate_clf_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
+        validate_clf_params(
+            x,
+            y,
+            &self.learning_rate,
+            self.eta0,
+            self.alpha,
+            self.l1_ratio,
+        )?;
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -838,6 +845,7 @@ fn validate_clf_params<F: Float>(
     schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
+    l1_ratio: F,
 ) -> Result<(), FerroError> {
     let n_samples = x.nrows();
     if n_samples != y.len() {
@@ -864,6 +872,12 @@ fn validate_clf_params<F: Float>(
         return Err(FerroError::InvalidParameter {
             name: "alpha".into(),
             reason: "must be non-negative".into(),
+        });
+    }
+    if l1_ratio < F::zero() || l1_ratio > F::one() {
+        return Err(FerroError::InvalidParameter {
+            name: "l1_ratio".into(),
+            reason: "must be in the range [0, 1]".into(),
         });
     }
     Ok(())
@@ -1128,7 +1142,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedSGDClassifier<F>, FerroError> {
-        validate_clf_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
+        validate_clf_params(
+            x,
+            y,
+            &self.learning_rate,
+            self.eta0,
+            self.alpha,
+            self.l1_ratio,
+        )?;
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -1567,6 +1588,7 @@ fn validate_reg_params<F: Float>(
     schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
+    l1_ratio: F,
 ) -> Result<(), FerroError> {
     let n_samples = x.nrows();
     if n_samples != y.len() {
@@ -1595,6 +1617,12 @@ fn validate_reg_params<F: Float>(
             reason: "must be non-negative".into(),
         });
     }
+    if l1_ratio < F::zero() || l1_ratio > F::one() {
+        return Err(FerroError::InvalidParameter {
+            name: "l1_ratio".into(),
+            reason: "must be in the range [0, 1]".into(),
+        });
+    }
     Ok(())
 }
 
@@ -1613,7 +1641,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// invalid.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedSGDRegressor<F>, FerroError> {
-        validate_reg_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
+        validate_reg_params(
+            x,
+            y,
+            &self.learning_rate,
+            self.eta0,
+            self.alpha,
+            self.l1_ratio,
+        )?;
 
         let n_features = x.ncols();
         let hyper = reg_hyper(self);
@@ -1731,7 +1766,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<FittedSGDRegressor<F>, FerroError> {
-        validate_reg_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
+        validate_reg_params(
+            x,
+            y,
+            &self.learning_rate,
+            self.eta0,
+            self.alpha,
+            self.l1_ratio,
+        )?;
 
         let n_features = x.ncols();
         let mut hyper = reg_hyper(&self);
