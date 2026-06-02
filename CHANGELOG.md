@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- decision_tree: ccp_alpha minimal cost-complexity pruning (#663)
 - decision_tree: min_impurity_decrease + min_weight_fraction_leaf stopping gates (#662)
 - decision_tree: REQ-1 alt criteria (log_loss/friedman_mse/absolute_error/poisson) (#661)
 - Divergence: ferrolearn-tree decision_tree split tie-break ignores random_state feature-order (sklearn/tree/_splitter.pyx:293) (#659)
