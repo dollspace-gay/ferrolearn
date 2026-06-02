@@ -55,7 +55,7 @@
 //! | REQ-2 (C-SVC SMO fit) | SHIPPED | `fn smo_binary in svm.rs` (Fan-Chen-Lin WSS) converges to libsvm's `α`; pinned by `divergence_pin5_binary_fitted_attributes in tests/divergence_svm_fit.rs` (`dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `support_ [1,2,3]`, `intercept_ [-1.8565]` vs live `SVC(kernel='linear',C=1.0)`). |
 //! | REQ-3 (fitted attrs + binary sign flip) | SHIPPED | `FittedSVC::{support,support_vectors,n_support,dual_coef,intercept,coef} in svm.rs` emit the libsvm layout with the binary sign flip (`_base.py:258-262`); `coef_` is linear-only (`_base.py:642-666`). Pinned by `divergence_pin5_*` (binary) + `divergence_pin6_multiclass_dual_coef_packing` (multiclass `(n_class-1,n_SV)` packing). |
 //! | REQ-4 (decision_function shape/sign/ovr) | SHIPPED | `FittedSVC::decision_function in svm.rs` returns the `SvmScores<F>` enum: binary -> `SvmScores::Binary` 1-D `(n,)` = `-raw_ovo.ravel()` (positive -> `classes_[1]`, `_base.py:538-539`); multiclass -> `SvmScores::Multiclass` `(n, n_classes)` via `fn ovr_decision_function in svm.rs` (default `SvmDecisionShape::Ovr`, transcribed from `multiclass.py:520-562`) applied to `dec<0`/`-dec` (`_base.py:780`), or raw `(n, n·(n-1)/2)` for `SvmDecisionShape::Ovo`. `SVC::decision_function_shape` field + `with_decision_function_shape`. Sign normalized: `fn raw_ovo` negates `decision_value_binary` to restore libsvm's lower-index-class-`+1` ovo convention. Pinned by `divergence_pin8_multiclass_ovr_decision_function` (ovr `(9,3)` row0 `[2.2366,0.8167,-0.1833]`, row3 `[1.0606,2.2262,-0.2333]`), `divergence_pin9_multiclass_ovo_decision_function` (ovo `(9,3)` row0 `[1.2222,1.2222,0.0]`), `divergence_pin10_binary_shape_contract` (binary 1-D `(6,)`) in `tests/divergence_svm_fit.rs` (R-CHAR-3, 1e-2). Consumer: `FittedNuSVC::decision_function in nu_svm.rs` delegates (non-test, propagates `SvmScores`). |
-//! | REQ-5 (predict + tie-break) | NOT-STARTED | open #638. `fn predict in svm.rs` ovo voting matches the oracle labels on separable sets (`divergence_pin3_predict_labels`), but vote ties use `max_by_key` (last-maximum) instead of libsvm's lower-class-index tie-break (`_base.py:814`). |
+//! | REQ-5 (predict + tie-break) | SHIPPED | `fn predict in svm.rs` (FittedSVC) does libsvm ovo voting and breaks vote ties toward the LOWER class index via a strictly-greater first-max scan (keeps the first/lowest-index maximum since `classes` is `np.unique(y)`-sorted), matching libsvm/sklearn `super().predict` (`_base.py:813-814`) instead of `max_by_key`'s last-maximum. Pinned by `divergence_pin3_predict_labels` (separable-set labels) + `divergence_pin11_ovo_vote_tie_break_lower_index` (4-class vote tie `(0,2,2,2)` at `q=(-0.21,-8.976)` -> class 1) in `tests/divergence_svm_fit.rs` vs live `SVC(kernel='linear',C=1.0)`. |
 //! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
 //! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
 //! | REQ-8 (constructor param surface + defaults) | NOT-STARTED | open #641. The kernel is the type parameter `K`; missing estimator-level `kernel`(string)/`degree`/`gamma`/`coef0`/`shrinking`/`class_weight`/`decision_function_shape`/`break_ties`/`random_state`; defaults diverge (`max_iter=10000` vs sklearn `-1`, `cache_size=1024` vs `200`). |
@@ -1254,11 +1254,20 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> P
                 }
             }
 
-            let best_class_idx = votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &v)| v)
-                .map_or(0, |(i, _)| i);
+            // libsvm/sklearn break ovo vote ties toward the LOWER class index
+            // (`sklearn/svm/_base.py:813-814`: `super().predict` -> libsvm
+            // `svm_predict` keeps the first argmax). `classes` is ascending
+            // (`np.unique(y)`), so a strictly-greater scan keeps the
+            // first/lowest-index maximum — unlike `max_by_key`, which returns
+            // the LAST maximum (the higher index).
+            let mut best_class_idx = 0usize;
+            let mut best_votes = 0usize;
+            for (i, &v) in votes.iter().enumerate() {
+                if v > best_votes {
+                    best_votes = v;
+                    best_class_idx = i;
+                }
+            }
 
             predictions[s] = self.classes[best_class_idx];
         }

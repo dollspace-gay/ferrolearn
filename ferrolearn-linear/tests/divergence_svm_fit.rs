@@ -674,3 +674,116 @@ fn divergence_pin10_binary_shape_contract() {
         );
     }
 }
+
+/// 4-class 12x2 set with a robustly-reproducible ovo VOTE TIE, shared by PIN 11.
+///
+/// Three tight 3-point clusters at the vertices of a (scalene) triangle —
+/// class 1 lower-left `(-5,-3)`, class 2 lower-right `(5,-3)`, class 3 near
+/// `(0,-1)` — plus class 0 up at `(0,5)`. A query well BELOW the triangle is
+/// closer to all three of classes 1/2/3 than to class 0 (so class 0 loses every
+/// pair it is in) while the three pairwise boundaries among 1/2/3 split their
+/// votes 1-1-1 — producing the 3-way top tie at 2 votes each. Coordinates and
+/// the tie query were located by a live-sklearn grid search (see PIN 11 doc).
+fn four_class_tie_12x2() -> (Array2<f64>, Array1<usize>) {
+    let x = Array2::from_shape_vec(
+        (12, 2),
+        vec![
+            0.0, 5.0, 0.4, 5.0, 0.0, 5.4, // class 0 (up high)
+            -5.0, -3.0, -5.4, -3.0, -5.0, -3.4, // class 1 (lower-left)
+            5.0, -3.0, 5.4, -3.0, 5.0, -3.4, // class 2 (lower-right)
+            0.0, -1.0, 0.4, -1.0, 0.0, -1.4, // class 3 (near center-bottom)
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3];
+    (x, y)
+}
+
+/// PIN 11 — REQ-5: ovo vote TIE-BREAK divergence (#638).
+///
+/// Divergence: `FittedSVC::predict` in `ferrolearn-linear/src/svm.rs` aggregates
+/// the one-vs-one votes with `max_by_key(|&(_, &v)| v)`, which returns the LAST
+/// maximum — so on a top-vote tie ferrolearn picks the HIGHER class index.
+/// libsvm/sklearn's `SVC.predict` (`super().predict` -> libsvm `svm_predict`)
+/// breaks ovo vote ties toward the LOWER class index
+/// (`sklearn/svm/_base.py:813` `y = super().predict(X)` -> libsvm voting;
+/// `_base.py:814` `return self.classes_.take(...)`).
+///
+/// ## Constructing the observable tie (live grid search, R-CHAR-3)
+///
+/// 3-class linear vote ties are ~measure-zero (3 bisectors meet at one point),
+/// so this uses a 4-class config (6 ovo classifiers). A grid search over query
+/// points with the live oracle found a robust query `q = (-0.21, -8.976)` below
+/// the triangle of classes 1/2/3 where the vote count is `(0, 2, 2, 2)` — a
+/// 3-way tie among classes 1, 2, 3.
+///
+/// ```text
+/// python3 -c "
+/// import numpy as np; from sklearn.svm import SVC; from itertools import combinations
+/// X=np.array([[0,5],[0.4,5],[0,5.4],[-5,-3],[-5.4,-3],[-5,-3.4],
+///             [5,-3],[5.4,-3],[5,-3.4],[0,-1],[0.4,-1],[0,-1.4]],dtype=float)
+/// y=np.array([0,0,0,1,1,1,2,2,2,3,3,3])
+/// mo=SVC(kernel='linear',C=1.0).fit(X,y)
+/// m =SVC(kernel='linear',C=1.0,decision_function_shape='ovo').fit(X,y)
+/// q=np.array([[-0.21,-8.976]])
+/// dec=m.decision_function(q)[0]   # ovo, pair order (0,1)(0,2)(0,3)(1,2)(1,3)(2,3)
+/// # dec = [-1.5361, -1.5599, -3.6587, 0.0420, -0.0442, 0.0450]
+/// print(mo.predict(q))            # -> [1]   (libsvm LOWER-index tie-break)
+/// print(mo.predict(X))            # -> [0,0,0,1,1,1,2,2,2,3,3,3] (non-tie)
+/// "
+/// ```
+///
+/// Per-pair winner derivation (libsvm: `dec>0` -> LOWER index of the pair wins;
+/// this is exactly the sign convention ferrolearn reproduces — PIN 9 confirms
+/// ferrolearn's raw ovo decisions match the oracle to 1e-2, and at this q
+/// ferrolearn's own ovo dec `[-1.5361,-1.5599,-3.6587,0.0420,-0.0442,0.0450]`
+/// matches the oracle to 4 decimals):
+///   pair(0,1) dec=-1.5361 -> class 1 ; pair(0,2) dec=-1.5599 -> class 2
+///   pair(0,3) dec=-3.6587 -> class 3 ; pair(1,2) dec=+0.0420 -> class 1
+///   pair(1,3) dec=-0.0442 -> class 3 ; pair(2,3) dec=+0.0450 -> class 2
+/// votes -> class0:0, class1:2, class2:2, class3:2  (3-way tie at 2)
+///   - libsvm  lower-index rule -> class 1  (the oracle's answer)
+///   - max_by_key last-max rule -> class 3  (ferrolearn's answer)
+///
+/// The nearest decision boundary is `min|dec| = 0.042`, well above PIN 9's
+/// proven 1e-2 ovo agreement, so the tie is robustly reproduced by ferrolearn's
+/// fit — the ONLY difference is the tie-break rule.
+///
+/// This pin FAILS today: ferrolearn `predict([-0.21,-8.976])` returns 3, the
+/// oracle returns 1. It also asserts the non-tie training-point predictions
+/// still match the oracle (so the pin is not solely about the tie).
+///
+/// Tracking: #638
+#[test]
+fn divergence_pin11_ovo_vote_tie_break_lower_index() {
+    let (x, y) = four_class_tie_12x2();
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+
+    // Non-tie sanity: the 12 training points predict their own class (the pin
+    // is not only about the tie). Live oracle predict(X) == y.
+    let train_pred = fitted.predict(&x).unwrap();
+    let oracle_train = [0usize, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3];
+    for (i, &exp) in oracle_train.iter().enumerate() {
+        assert_eq!(
+            train_pred[i], exp,
+            "non-tie train predict[{i}]: ferrolearn={}, sklearn={exp}",
+            train_pred[i]
+        );
+    }
+
+    // THE TIE: q=(-0.21,-8.976) -> votes (0,2,2,2). libsvm picks the LOWER index
+    // (class 1); ferrolearn's `max_by_key` last-max picks the HIGHER (class 3).
+    let q = Array2::from_shape_vec((1, 2), vec![-0.21, -8.976]).unwrap();
+    let tie_pred = fitted.predict(&q).unwrap();
+    // Live oracle SVC(kernel='linear',C=1.0).predict([[-0.21,-8.976]]) == [1].
+    assert_eq!(
+        tie_pred[0], 1usize,
+        "ovo vote-tie predict: ferrolearn={} (last-max -> higher index), \
+         sklearn=1 (libsvm lower-index tie-break, _base.py:814)",
+        tie_pred[0]
+    );
+}
