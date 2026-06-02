@@ -9,6 +9,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(sgd): REQ-13 early_stopping + validation_fraction + n_iter_no_change (#533)
+- Translation unit: ferrolearn-linear/sgd.rs — early_stopping + validation_fraction (REQ-13) (#546)
+- translate(sgd): REQ-19 anti-pattern cleanup — unreachable!()/unwrap in kernel (#537)
+- translate(sgd): REQ-14 average / ASGD (#534)
+- translate(sgd): REQ-15 class_weight + sample_weight (#535)
+- translate(sgd): REQ-18 SGDOneClassSVM estimator missing (builder) (#536)
+- translate(sgd): REQ-9b epsilon not validated to [0, inf) for Huber/EpsilonInsensitive/SquaredEpsilonInsensitive (#544)
+- translate(sgd): REQ-11 fit_intercept flag (#531)
+- translate(sgd): REQ-3 missing squared_epsilon_insensitive regressor loss (#524)
+- translate(sgd): REQ-2 missing squared_hinge + perceptron classifier losses (#523)
+- Translation unit: ferrolearn-linear/sgd.rs — squared_hinge/perceptron/squared_epsilon_insensitive losses (#543)
+- translate(sgd): REQ-8 adaptive schedule — divisor 5 + n_iter_no_change/best_loss trigger (#528)
+- translate(sgd): REQ-10 convergence — best_loss + n_iter_no_change + tol on sumloss + dloss clip (#530)
+- Translation unit: ferrolearn-linear/src/sgd.rs — SGD convergence + adaptive epoch tail (#522 #530 #528) (#542)
+- translate(sgd): REQ-12 shuffle flag (#532)
+- Translation unit: ferrolearn-linear/sgd.rs shuffle flag (REQ-12 #532) (#541)
+- translate(sgd): REQ-5 penalty l1/elasticnet + l1_ratio (truncated-gradient u/q) (#526)
 - translate(sgd): REQ-5 penalty l1/elasticnet + l1_ratio via Tsuruoka truncated gradient (u/q cumulative penalty) (#526)
 - translate(sgd): REQ-9 default params (classifier learning_rate=optimal/eta0=0.0/power_t=0.5; epsilon=0.1) (#529)
 - translate(sgd): REQ-7 optimal schedule omits t0 (optimal_init) offset (#527)
@@ -160,6 +177,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: SGDRegressor/SGDClassifier do not validate l1_ratio to [0,1] (sklearn/linear_model/_stochastic_gradient.py:2018,1217) (#540)
 - Divergence: SGD Hinge::gradient diverges from sklearn/linear_model/_sgd_fast.pyx.tp:224 at z==threshold boundary (#539)
 - translate: ferrolearn-linear/ransac.rs — RANSACRegressor sklearn parity (iter 24) (#511)
 - QuantileRegressor: scale alpha by n_samples for sklearn parity (#332)
