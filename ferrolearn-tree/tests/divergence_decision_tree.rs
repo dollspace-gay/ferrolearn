@@ -784,3 +784,162 @@ fn req3_reg_min_impurity_decrease_oracle() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-3 ccp_alpha (minimal cost-complexity pruning) CERTIFYING PINS (#663).
+// Breiman weakest-link pruning applied at the END of fit when ccp_alpha > 0
+// (`fn prune_ccp` / `fn rebuild_pruned_tree`, the native analog of sklearn's
+// `_cost_complexity_prune` + `_build_pruned_tree_ccp`, `_tree.pyx`;
+// stop_pruning when `ccp_alpha < effective_alpha`, `_tree.pyx:1617`).
+// All expected values derived LIVE from the sklearn 1.5.2 oracle (R-CHAR-3);
+// the exact python invocations are recorded above each pin. Tolerance 1e-9.
+// node_count = `tree_.node_count`; predict = `predict(X)`.
+// PIN C (cost_complexity_pruning_path values) is NOT pinned: ferrolearn exposes
+// NO `cost_complexity_pruning_path`/`ccp_alphas` accessor (verified by
+// `grep cost_complexity_pruning_path decision_tree.rs lib.rs` => none public);
+// the pruning is therefore certified through the OBSERVABLE node_count/predict
+// contract, which is exactly what `ccp_alpha` controls. The oracle ccp_alphas
+// path is recorded here for traceability:
+//   clf cost_complexity_pruning_path(X,y).ccp_alphas
+//     => [0.0, 0.14814814814814814, 0.345679012345679]
+//   reg cost_complexity_pruning_path(Xr,yr).ccp_alphas
+//     => [0.0, 0.0020833333…, 0.0020833333…, 3.9999999999999996]
+// ===========================================================================
+
+/// PIN A — `ccp_alpha` prunes the CLASSIFIER tree (#663).
+///
+/// On the 9x2 oracle set the weakest-link effective_alpha is 0.14814814…
+/// (the class-2 subtree). So `ccp_alpha=0.1 < 0.14815` keeps the full tree,
+/// and `ccp_alpha=0.3 >= 0.14815` (but `< 0.34568`) collapses exactly that
+/// subtree → node_count 3. Default `ccp_alpha=0.0` ⇒ no pruning (node_count 7).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+///     X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],dtype=float); \
+///     y=np.array([0,0,0,1,1,1,2,2,0]); \
+///     [print(A, DecisionTreeClassifier(ccp_alpha=A,random_state=0).fit(X,y).tree_.node_count, \
+///       DecisionTreeClassifier(ccp_alpha=A,random_state=0).fit(X,y).predict(X).tolist()) \
+///       for A in (0.0,0.1,0.3)]"
+///   => A=0.0 node_count 7 predict [0,0,0,1,1,1,2,2,0]
+///      A=0.1 node_count 7 predict [0,0,0,1,1,1,2,2,0]   (0.1 < weakest-link 0.14815)
+///      A=0.3 node_count 3 predict [0,0,0,1,1,1,0,0,0]   (prunes the 0.14815 subtree)
+#[test]
+fn req3_clf_ccp_alpha_oracle() {
+    let (x, y) = clf_dataset();
+
+    // Default (ccp_alpha=0.0): no pruning — full oracle tree (node_count 7).
+    let default = DecisionTreeClassifier::<f64>::new().fit(&x, &y).unwrap();
+    assert_eq!(
+        default.nodes().len(),
+        7,
+        "ccp_alpha default node_count: ferrolearn={} sklearn=7",
+        default.nodes().len()
+    );
+    assert_eq!(
+        default.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 2, 2, 0],
+        "ccp_alpha=0.0 predict"
+    );
+
+    // A=0.1: below the weakest-link effective_alpha (0.14815) — no prune.
+    let a01 = DecisionTreeClassifier::<f64>::new()
+        .with_ccp_alpha(0.1)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        a01.nodes().len(),
+        7,
+        "ccp_alpha=0.1 node_count: ferrolearn={} sklearn=7 (0.1 < 0.14815)",
+        a01.nodes().len()
+    );
+    assert_eq!(
+        a01.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 2, 2, 0],
+        "ccp_alpha=0.1 predict"
+    );
+
+    // A=0.3: prunes the 0.14815 subtree (class-2 split) — node_count 3.
+    let a03 = DecisionTreeClassifier::<f64>::new()
+        .with_ccp_alpha(0.3)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        a03.nodes().len(),
+        3,
+        "ccp_alpha=0.3 node_count: ferrolearn={} sklearn=3",
+        a03.nodes().len()
+    );
+    assert_eq!(
+        a03.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 0, 0, 0],
+        "ccp_alpha=0.3 predict"
+    );
+}
+
+/// PIN B — `ccp_alpha` prunes the REGRESSOR tree (#663).
+///
+/// On the 8x1 oracle set the full tree has node_count 15 (each sample its own
+/// leaf). `ccp_alpha=0.05` collapses the tree to the two top-level clusters →
+/// node_count 3, root `(0, 4.5)`, MEAN leaves `[1.05x4, 5.05x4]`.
+/// Default `ccp_alpha=0.0` ⇒ no pruning (node_count 15).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]); \
+///     [print(A, DecisionTreeRegressor(ccp_alpha=A).fit(Xr,yr).tree_.node_count, \
+///       DecisionTreeRegressor(ccp_alpha=A).fit(Xr,yr).predict(Xr).tolist()) \
+///       for A in (0.0,0.05)]"
+///   => A=0.0  node_count 15 predict [1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]
+///      A=0.05 node_count 3  predict [1.05,1.05,1.05,1.05,5.05,5.05,5.05,5.05]
+#[test]
+fn req3_reg_ccp_alpha_oracle() {
+    let (x, y) = reg_dataset();
+
+    // Default (ccp_alpha=0.0): no pruning — full oracle tree (node_count 15).
+    let default = DecisionTreeRegressor::<f64>::new().fit(&x, &y).unwrap();
+    assert_eq!(
+        default.nodes().len(),
+        15,
+        "REG ccp_alpha default node_count: ferrolearn={} sklearn=15",
+        default.nodes().len()
+    );
+    let def_pred = default.predict(&x).unwrap();
+    for (i, &exp) in [1.0, 1.2, 0.9, 1.1, 5.0, 5.2, 4.9, 5.1].iter().enumerate() {
+        assert!(
+            (def_pred[i] - exp).abs() < 1e-9,
+            "REG ccp_alpha=0.0 predict[{i}]: ferrolearn={} sklearn={exp}",
+            def_pred[i]
+        );
+    }
+
+    // A=0.05: prunes 15 -> 3, root (0, 4.5), mean leaves 1.05 / 5.05.
+    let a05 = DecisionTreeRegressor::<f64>::new()
+        .with_ccp_alpha(0.05)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        a05.nodes().len(),
+        3,
+        "REG ccp_alpha=0.05 node_count: ferrolearn={} sklearn=3",
+        a05.nodes().len()
+    );
+    let (feat, thr) = root_split(a05.nodes()).expect("REG ccp_alpha=0.05 root must be a Split");
+    assert_eq!(
+        feat, 0,
+        "REG ccp_alpha=0.05 root feature: ferrolearn={feat} sklearn=0"
+    );
+    assert!(
+        (thr - 4.5).abs() < 1e-9,
+        "REG ccp_alpha=0.05 root threshold: ferrolearn={thr} sklearn=4.5"
+    );
+    let sk_a05_predict = [1.05, 1.05, 1.05, 1.05, 5.05, 5.05, 5.05, 5.05];
+    let preds = a05.predict(&x).unwrap();
+    for (i, &exp) in sk_a05_predict.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "REG ccp_alpha=0.05 predict[{i}] (mean leaf): ferrolearn={} sklearn={exp}",
+            preds[i]
+        );
+    }
+}

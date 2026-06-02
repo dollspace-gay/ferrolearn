@@ -169,6 +169,34 @@ impl<F: Float> ImpurityGate<F> {
     }
 }
 
+/// Per-node side metadata recorded ONLY by the [`DecisionTreeClassifier`] /
+/// [`DecisionTreeRegressor`] builders (not the forest builders) when
+/// `ccp_alpha > 0`, indexed in lock-step with the flat `Vec<Node<F>>`.
+///
+/// Minimal cost-complexity pruning (`ccp_alpha`, Breiman weakest-link;
+/// `_tree.pyx::_cost_complexity_prune`) needs, for EVERY node `t` (internal or
+/// leaf), the node's own impurity and sample count to form the resubstitution
+/// risk `R(t) = impurity(t) · n_t / N` (sklearn `r_node`, `_tree.pyx:1711`), and
+/// — when an internal node is collapsed into a leaf — that node's own
+/// prediction value and class distribution (sklearn copies the original node's
+/// stored value into the pruned leaf). These cannot all be reconstructed from
+/// the children alone (the `absolute_error` median is not the mean of child
+/// medians), so the builder records them here.
+#[derive(Debug, Clone)]
+struct NodeMeta<F> {
+    /// The node's own impurity (gini/entropy for classifiers; MSE/MAE/poisson
+    /// for regressors).
+    impurity: F,
+    /// The node's own sample count (sklearn `n_node_samples`).
+    n_samples: usize,
+    /// The node's own collapse prediction (majority class for classifiers,
+    /// mean/median for regressors) — the leaf value when this node is pruned.
+    value: F,
+    /// The node's own class distribution (classifier only) — the collapsed
+    /// leaf's `predict_proba` row when pruned. `None` for regressors.
+    distribution: Option<Vec<F>>,
+}
+
 /// Data references for classification tree building.
 struct ClassificationData<'a, F> {
     x: &'a Array2<F>,
@@ -231,6 +259,14 @@ pub struct DecisionTreeClassifier<F> {
     /// `N_t/N·(parent − N_tL/N_t·imp_L − N_tR/N_t·imp_R)` satisfies
     /// `improvement + EPSILON < min_impurity_decrease` (`_tree.pyx:284`).
     pub min_impurity_decrease: F,
+    /// Complexity parameter for Minimal Cost-Complexity Pruning.
+    ///
+    /// Mirrors sklearn's `ccp_alpha` (`_classes.py:946`, default `0.0`,
+    /// `Interval(Real, 0.0, None, closed="left")`, `_classes.py:123`). After the
+    /// tree is grown, the subtree with the largest cost complexity that is
+    /// smaller than `ccp_alpha` is chosen (Breiman weakest-link pruning,
+    /// `_tree.pyx::_cost_complexity_prune`). `0.0` ⇒ no pruning.
+    pub ccp_alpha: F,
     /// Splitting criterion.
     pub criterion: ClassificationCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -241,7 +277,7 @@ impl<F: Float> DecisionTreeClassifier<F> {
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
     /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
-    /// `min_impurity_decrease = 0.0`, `criterion = Gini`.
+    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`, `criterion = Gini`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -250,6 +286,7 @@ impl<F: Float> DecisionTreeClassifier<F> {
             min_samples_leaf: 1,
             min_weight_fraction_leaf: F::zero(),
             min_impurity_decrease: F::zero(),
+            ccp_alpha: F::zero(),
             criterion: ClassificationCriterion::Gini,
             _marker: std::marker::PhantomData,
         }
@@ -289,6 +326,14 @@ impl<F: Float> DecisionTreeClassifier<F> {
     #[must_use]
     pub fn with_min_impurity_decrease(mut self, min_impurity_decrease: F) -> Self {
         self.min_impurity_decrease = min_impurity_decrease;
+        self
+    }
+
+    /// Set the complexity parameter for Minimal Cost-Complexity Pruning
+    /// (sklearn `ccp_alpha`, `_classes.py:946`, default `0.0`).
+    #[must_use]
+    pub fn with_ccp_alpha(mut self, ccp_alpha: F) -> Self {
+        self.ccp_alpha = ccp_alpha;
         self
     }
 
@@ -490,8 +535,19 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             threshold: self.min_impurity_decrease,
         };
 
+        // Record per-node pruning metadata only when `ccp_alpha > 0` (the cost
+        // of the side vec is otherwise skipped, and forest trees never need it).
+        let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
-        build_classification_tree(&data, &indices, &mut nodes, 0, &params, &gate, None);
+        let mut meta: Vec<NodeMeta<F>> = Vec::new();
+        let meta_arg = if prune { Some(&mut meta) } else { None };
+        build_classification_tree(
+            &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+        );
+
+        if prune {
+            nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+        }
 
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
@@ -618,6 +674,14 @@ pub struct DecisionTreeRegressor<F> {
     /// `N_t/N·(parent − N_tL/N_t·imp_L − N_tR/N_t·imp_R)` satisfies
     /// `improvement + EPSILON < min_impurity_decrease` (`_tree.pyx:284`).
     pub min_impurity_decrease: F,
+    /// Complexity parameter for Minimal Cost-Complexity Pruning.
+    ///
+    /// Mirrors sklearn's `ccp_alpha` (`_classes.py:1317`, default `0.0`,
+    /// `Interval(Real, 0.0, None, closed="left")`, `_classes.py:123`). After the
+    /// tree is grown, the subtree with the largest cost complexity that is
+    /// smaller than `ccp_alpha` is chosen (Breiman weakest-link pruning,
+    /// `_tree.pyx::_cost_complexity_prune`). `0.0` ⇒ no pruning.
+    pub ccp_alpha: F,
     /// Splitting criterion.
     pub criterion: RegressionCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -628,7 +692,7 @@ impl<F: Float> DecisionTreeRegressor<F> {
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
     /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
-    /// `min_impurity_decrease = 0.0`, `criterion = MSE`.
+    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`, `criterion = MSE`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -637,6 +701,7 @@ impl<F: Float> DecisionTreeRegressor<F> {
             min_samples_leaf: 1,
             min_weight_fraction_leaf: F::zero(),
             min_impurity_decrease: F::zero(),
+            ccp_alpha: F::zero(),
             criterion: RegressionCriterion::Mse,
             _marker: std::marker::PhantomData,
         }
@@ -676,6 +741,14 @@ impl<F: Float> DecisionTreeRegressor<F> {
     #[must_use]
     pub fn with_min_impurity_decrease(mut self, min_impurity_decrease: F) -> Self {
         self.min_impurity_decrease = min_impurity_decrease;
+        self
+    }
+
+    /// Set the complexity parameter for Minimal Cost-Complexity Pruning
+    /// (sklearn `ccp_alpha`, `_classes.py:1317`, default `0.0`).
+    #[must_use]
+    pub fn with_ccp_alpha(mut self, ccp_alpha: F) -> Self {
+        self.ccp_alpha = ccp_alpha;
         self
     }
 
@@ -805,8 +878,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
             threshold: self.min_impurity_decrease,
         };
 
+        // Record per-node pruning metadata only when `ccp_alpha > 0`.
+        let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
-        build_regression_tree(&data, &indices, &mut nodes, 0, &params, &gate, None);
+        let mut meta: Vec<NodeMeta<F>> = Vec::new();
+        let meta_arg = if prune { Some(&mut meta) } else { None };
+        build_regression_tree(
+            &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+        );
+
+        if prune {
+            nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+        }
 
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
@@ -1170,17 +1253,17 @@ fn compute_impurity<F: Float>(
     }
 }
 
-/// Create a classification leaf node and return its index.
-fn make_classification_leaf<F: Float>(
-    nodes: &mut Vec<Node<F>>,
+/// Compute the majority class (argmax of `class_counts`) and the normalized
+/// class distribution for a classification node.
+///
+/// On a count tie, sklearn's `np.argmax` returns the LOWEST index, so the
+/// argmax updates only on a strictly greater count (keeping the first maximum)
+/// rather than `max_by_key`, which would return the last.
+fn classification_node_value<F: Float>(
     class_counts: &[usize],
     n_classes: usize,
     n_samples: usize,
-) -> usize {
-    // Majority class = argmax of the class counts. On a count tie, sklearn's
-    // `np.argmax` returns the LOWEST index, so we update only on a strictly
-    // greater count (keeping the first maximum) rather than `max_by_key`,
-    // which would return the last.
+) -> (usize, Vec<F>) {
     let majority_class = {
         let mut best = 0usize;
         let mut best_count = 0usize;
@@ -1194,30 +1277,62 @@ fn make_classification_leaf<F: Float>(
     };
 
     let total_f = if n_samples > 0 {
-        F::from(n_samples).unwrap()
+        F::from(n_samples).unwrap_or_else(F::one)
     } else {
         F::one()
     };
     let distribution: Vec<F> = (0..n_classes)
-        .map(|c| F::from(class_counts[c]).unwrap() / total_f)
+        .map(|c| F::from(class_counts[c]).unwrap_or_else(F::zero) / total_f)
         .collect();
+    (majority_class, distribution)
+}
+
+/// Create a classification leaf node and return its index.
+///
+/// When `meta` is `Some` (the estimator builder with `ccp_alpha > 0`), records
+/// the node's own impurity / value / distribution / sample count for later
+/// minimal cost-complexity pruning.
+fn make_classification_leaf<F: Float>(
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    class_counts: &[usize],
+    n_classes: usize,
+    n_samples: usize,
+    criterion: ClassificationCriterion,
+) -> usize {
+    let (majority_class, distribution) =
+        classification_node_value::<F>(class_counts, n_classes, n_samples);
+    let value = F::from(majority_class).unwrap_or_else(F::zero);
 
     let idx = nodes.len();
     nodes.push(Node::Leaf {
-        value: F::from(majority_class).unwrap(),
-        class_distribution: Some(distribution),
+        value,
+        class_distribution: Some(distribution.clone()),
         n_samples,
     });
+    if let Some(meta) = meta {
+        meta.push(NodeMeta {
+            impurity: compute_impurity::<F>(class_counts, n_samples, criterion),
+            n_samples,
+            value,
+            distribution: Some(distribution),
+        });
+    }
     idx
 }
 
 /// Build a classification tree recursively.
 ///
 /// Returns the index of the node that was created at the root of this subtree.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive builder threads data/nodes/prune-meta/params/gate/rng; bundling would obscure the recursion"
+)]
 fn build_classification_tree<F: Float>(
     data: &ClassificationData<'_, F>,
     indices: &[usize],
     nodes: &mut Vec<Node<F>>,
+    mut meta: Option<&mut Vec<NodeMeta<F>>>,
     depth: usize,
     params: &TreeParams,
     gate: &ImpurityGate<F>,
@@ -1235,7 +1350,14 @@ fn build_classification_tree<F: Float>(
         || class_counts.iter().filter(|&&c| c > 0).count() <= 1;
 
     if should_stop {
-        return make_classification_leaf(nodes, &class_counts, data.n_classes, n);
+        return make_classification_leaf(
+            nodes,
+            meta.as_deref_mut(),
+            &class_counts,
+            data.n_classes,
+            n,
+            data.criterion,
+        );
     }
 
     // Reborrow the rng for the split-finder; recursive children get fresh
@@ -1266,18 +1388,38 @@ fn build_classification_tree<F: Float>(
             class_distribution: None,
             n_samples: 0,
         }); // placeholder
+        // Keep `meta` index-aligned with `nodes`: push a placeholder for this
+        // internal node now, overwritten below with its OWN impurity/value/
+        // distribution (the leaf it collapses to under `ccp_alpha` pruning).
+        if let Some(meta) = meta.as_deref_mut() {
+            meta.push(NodeMeta {
+                impurity: F::zero(),
+                n_samples: 0,
+                value: F::zero(),
+                distribution: None,
+            });
+        }
 
         let left_idx = build_classification_tree(
             data,
             &left_indices,
             nodes,
+            meta.as_deref_mut(),
             depth + 1,
             params,
             gate,
             rng.as_deref_mut(),
         );
-        let right_idx =
-            build_classification_tree(data, &right_indices, nodes, depth + 1, params, gate, rng);
+        let right_idx = build_classification_tree(
+            data,
+            &right_indices,
+            nodes,
+            meta.as_deref_mut(),
+            depth + 1,
+            params,
+            gate,
+            rng,
+        );
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1288,9 +1430,27 @@ fn build_classification_tree<F: Float>(
             n_samples: n,
         };
 
+        if let Some(meta) = meta {
+            let (majority_class, distribution) =
+                classification_node_value::<F>(&class_counts, data.n_classes, n);
+            meta[node_idx] = NodeMeta {
+                impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+                n_samples: n,
+                value: F::from(majority_class).unwrap_or_else(F::zero),
+                distribution: Some(distribution),
+            };
+        }
+
         node_idx
     } else {
-        make_classification_leaf(nodes, &class_counts, data.n_classes, n)
+        make_classification_leaf(
+            nodes,
+            meta,
+            &class_counts,
+            data.n_classes,
+            n,
+            data.criterion,
+        )
     }
 }
 
@@ -1410,11 +1570,42 @@ fn find_best_classification_split<F: Float>(
     }
 }
 
+/// Push a regression leaf node (and, when `meta` is `Some`, its pruning
+/// metadata) at the end of `nodes`, returning its index.
+fn push_regression_leaf<F: Float>(
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    value: F,
+    impurity: F,
+    n_samples: usize,
+) -> usize {
+    let idx = nodes.len();
+    nodes.push(Node::Leaf {
+        value,
+        class_distribution: None,
+        n_samples,
+    });
+    if let Some(meta) = meta {
+        meta.push(NodeMeta {
+            impurity,
+            n_samples,
+            value,
+            distribution: None,
+        });
+    }
+    idx
+}
+
 /// Build a regression tree recursively.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "recursive builder threads data/nodes/prune-meta/params/gate/rng; bundling would obscure the recursion"
+)]
 fn build_regression_tree<F: Float>(
     data: &RegressionData<'_, F>,
     indices: &[usize],
     nodes: &mut Vec<Node<F>>,
+    mut meta: Option<&mut Vec<NodeMeta<F>>>,
     depth: usize,
     params: &TreeParams,
     gate: &ImpurityGate<F>,
@@ -1428,24 +1619,17 @@ fn build_regression_tree<F: Float>(
     let should_stop = n < params.min_samples_split || params.max_depth.is_some_and(|d| depth >= d);
 
     if should_stop {
-        let idx = nodes.len();
-        nodes.push(Node::Leaf {
-            value: leaf_value,
-            class_distribution: None,
-            n_samples: n,
+        // The leaf's own impurity (recorded only when pruning) — sklearn keeps
+        // each node's stored impurity for `R(t)`.
+        let imp = meta.as_deref().map_or(F::zero(), |_| {
+            regression_node_impurity(data.y, indices, data.criterion)
         });
-        return idx;
+        return push_regression_leaf(nodes, meta, leaf_value, imp, n);
     }
 
     let parent_impurity = regression_node_impurity(data.y, indices, data.criterion);
     if parent_impurity <= F::epsilon() {
-        let idx = nodes.len();
-        nodes.push(Node::Leaf {
-            value: leaf_value,
-            class_distribution: None,
-            n_samples: n,
-        });
-        return idx;
+        return push_regression_leaf(nodes, meta, leaf_value, parent_impurity, n);
     }
 
     let best =
@@ -1480,18 +1664,37 @@ fn build_regression_tree<F: Float>(
             class_distribution: None,
             n_samples: 0,
         }); // placeholder
+        // Keep `meta` index-aligned with `nodes`; overwrite below with this
+        // internal node's OWN impurity/value (the leaf it collapses to).
+        if let Some(meta) = meta.as_deref_mut() {
+            meta.push(NodeMeta {
+                impurity: F::zero(),
+                n_samples: 0,
+                value: F::zero(),
+                distribution: None,
+            });
+        }
 
         let left_idx = build_regression_tree(
             data,
             &left_indices,
             nodes,
+            meta.as_deref_mut(),
             depth + 1,
             params,
             gate,
             rng.as_deref_mut(),
         );
-        let right_idx =
-            build_regression_tree(data, &right_indices, nodes, depth + 1, params, gate, rng);
+        let right_idx = build_regression_tree(
+            data,
+            &right_indices,
+            nodes,
+            meta.as_deref_mut(),
+            depth + 1,
+            params,
+            gate,
+            rng,
+        );
 
         nodes[node_idx] = Node::Split {
             feature: best_feature,
@@ -1502,15 +1705,18 @@ fn build_regression_tree<F: Float>(
             n_samples: n,
         };
 
+        if let Some(meta) = meta {
+            meta[node_idx] = NodeMeta {
+                impurity: parent_impurity,
+                n_samples: n,
+                value: leaf_value,
+                distribution: None,
+            };
+        }
+
         node_idx
     } else {
-        let idx = nodes.len();
-        nodes.push(Node::Leaf {
-            value: leaf_value,
-            class_distribution: None,
-            n_samples: n,
-        });
-        idx
+        push_regression_leaf(nodes, meta, leaf_value, parent_impurity, n)
     }
 }
 
@@ -1761,7 +1967,9 @@ pub(crate) fn build_classification_tree_with_feature_subset<F: Float>(
     };
     let mut nodes = Vec::new();
     let gate = ImpurityGate::disabled(indices.len());
-    build_classification_tree(&data, indices, &mut nodes, 0, params, &gate, None);
+    // Forests do not expose `ccp_alpha`; pass `None` for the prune metadata so
+    // the trees stay byte-identical and no side vec is allocated.
+    build_classification_tree(&data, indices, &mut nodes, None, 0, params, &gate, None);
     nodes
 }
 
@@ -1794,7 +2002,16 @@ pub(crate) fn build_classification_tree_per_split_features<F: Float>(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut nodes = Vec::new();
     let gate = ImpurityGate::disabled(indices.len());
-    build_classification_tree(&data, indices, &mut nodes, 0, params, &gate, Some(&mut rng));
+    build_classification_tree(
+        &data,
+        indices,
+        &mut nodes,
+        None,
+        0,
+        params,
+        &gate,
+        Some(&mut rng),
+    );
     nodes
 }
 
@@ -1816,7 +2033,8 @@ pub(crate) fn build_regression_tree_with_feature_subset<F: Float>(
     };
     let mut nodes = Vec::new();
     let gate = ImpurityGate::disabled(indices.len());
-    build_regression_tree(&data, indices, &mut nodes, 0, params, &gate, None);
+    // Forests do not expose `ccp_alpha`; pass `None` for the prune metadata.
+    build_regression_tree(&data, indices, &mut nodes, None, 0, params, &gate, None);
     nodes
 }
 
@@ -1843,8 +2061,245 @@ pub(crate) fn build_regression_tree_per_split_features<F: Float>(
     let mut rng = StdRng::seed_from_u64(seed);
     let mut nodes = Vec::new();
     let gate = ImpurityGate::disabled(indices.len());
-    build_regression_tree(&data, indices, &mut nodes, 0, params, &gate, Some(&mut rng));
+    build_regression_tree(
+        &data,
+        indices,
+        &mut nodes,
+        None,
+        0,
+        params,
+        &gate,
+        Some(&mut rng),
+    );
     nodes
+}
+
+// ---------------------------------------------------------------------------
+// Minimal cost-complexity pruning (`ccp_alpha`)
+// ---------------------------------------------------------------------------
+
+/// Sentinel for "no parent" in the parent map (the root's parent), mirroring
+/// sklearn's `_TREE_UNDEFINED` (`_tree.pyx`).
+const CCP_NO_PARENT: usize = usize::MAX;
+
+/// Apply Minimal Cost-Complexity Pruning (Breiman weakest-link) to a grown tree
+/// and return a NEW compacted flat `Vec<Node<F>>`.
+///
+/// This is the native analog of sklearn's `_cost_complexity_prune` +
+/// `_build_pruned_tree_ccp` (`_tree.pyx:1649,1808`). For every node `t` the
+/// resubstitution risk is `R(t) = impurity(t) · n_t / N`
+/// (`r_node`, `_tree.pyx:1711`, uniform weights ⇒
+/// `weighted_n_node_samples = n_t`, `total_sum_weights = N`). For a subtree the
+/// branch risk `R(T_t)` is the sum of `R(leaf)` over its leaves, and the
+/// effective alpha is `(R(t) − R(T_t)) / (n_leaves(T_t) − 1)`. The internal node
+/// with the SMALLEST effective alpha is collapsed while that alpha is
+/// `<= ccp_alpha` (sklearn `_AlphaPruner.stop_pruning` returns true — i.e. stop
+/// — when `ccp_alpha < effective_alpha`, `_tree.pyx:1617`), recomputing after
+/// each collapse, until the smallest effective alpha exceeds `ccp_alpha` or only
+/// the root remains.
+///
+/// `meta` is index-aligned with `nodes` (built only when `ccp_alpha > 0`).
+/// `n_total` is `N` (the whole tree's training-sample count). The returned tree
+/// re-uses the surviving nodes' indices in a fresh pre-order-stable compaction
+/// so the child pointers remain valid.
+fn prune_ccp<F: Float>(
+    nodes: &[Node<F>],
+    meta: &[NodeMeta<F>],
+    n_total: usize,
+    ccp_alpha: F,
+) -> Vec<Node<F>> {
+    let n_nodes = nodes.len();
+    if n_nodes <= 1 {
+        return nodes.to_vec();
+    }
+    let total_w = F::from(n_total).unwrap_or_else(F::one);
+
+    // Parent map + per-node `R(t)`.
+    let mut parent = vec![CCP_NO_PARENT; n_nodes];
+    let mut r_node = vec![F::zero(); n_nodes];
+    for (i, node) in nodes.iter().enumerate() {
+        let m = &meta[i];
+        r_node[i] = m.impurity * F::from(m.n_samples).unwrap_or_else(F::zero) / total_w;
+        if let Node::Split { left, right, .. } = node {
+            parent[*left] = i;
+            parent[*right] = i;
+        }
+    }
+
+    // `leaves_in_subtree[i]` — is node `i` currently a leaf of the pruned tree?
+    // `in_subtree[i]` — does node `i` survive in the pruned tree?
+    let mut leaves_in_subtree = vec![false; n_nodes];
+    let mut in_subtree = vec![true; n_nodes];
+    for (i, node) in nodes.iter().enumerate() {
+        if matches!(node, Node::Leaf { .. }) {
+            leaves_in_subtree[i] = true;
+        }
+    }
+
+    // Bubble each original leaf's risk up to its ancestors to get the branch
+    // risk `r_branch` and leaf count `n_leaves` per internal node.
+    let mut r_branch = vec![F::zero(); n_nodes];
+    let mut n_leaves = vec![0usize; n_nodes];
+    for leaf in 0..n_nodes {
+        if !leaves_in_subtree[leaf] {
+            continue;
+        }
+        r_branch[leaf] = r_node[leaf];
+        let current_r = r_node[leaf];
+        let mut idx = leaf;
+        while idx != 0 {
+            let p = parent[idx];
+            if p == CCP_NO_PARENT {
+                break;
+            }
+            r_branch[p] = r_branch[p] + current_r;
+            n_leaves[p] += 1;
+            idx = p;
+        }
+    }
+
+    // Candidate (prunable) nodes are the internal nodes.
+    let mut candidate_nodes = vec![false; n_nodes];
+    for i in 0..n_nodes {
+        candidate_nodes[i] = !leaves_in_subtree[i];
+    }
+
+    // Weakest-link loop: while the root is still an internal node.
+    while candidate_nodes[0] {
+        // Smallest effective alpha over all candidates; ties resolved by the
+        // lowest index (strict `<`, matching sklearn's ascending scan).
+        let mut effective_alpha = F::infinity();
+        let mut pruned_idx = 0usize;
+        for i in 0..n_nodes {
+            if !candidate_nodes[i] {
+                continue;
+            }
+            let denom = n_leaves[i].saturating_sub(1);
+            if denom == 0 {
+                continue;
+            }
+            let subtree_alpha = (r_node[i] - r_branch[i]) / F::from(denom).unwrap_or_else(F::one);
+            if subtree_alpha < effective_alpha {
+                effective_alpha = subtree_alpha;
+                pruned_idx = i;
+            }
+        }
+
+        // `_AlphaPruner.stop_pruning`: stop when `ccp_alpha < effective_alpha`
+        // (`_tree.pyx:1617`) — i.e. prune while `effective_alpha <= ccp_alpha`.
+        if ccp_alpha < effective_alpha {
+            break;
+        }
+
+        // Mark all proper descendants of `pruned_idx` as out of the subtree.
+        let mut stack = vec![pruned_idx];
+        while let Some(idx) = stack.pop() {
+            if !in_subtree[idx] {
+                continue;
+            }
+            candidate_nodes[idx] = false;
+            leaves_in_subtree[idx] = false;
+            in_subtree[idx] = false;
+            if let Node::Split { left, right, .. } = nodes[idx] {
+                stack.push(left);
+                stack.push(right);
+            }
+        }
+        // The pruned branch's root becomes a surviving leaf.
+        leaves_in_subtree[pruned_idx] = true;
+        in_subtree[pruned_idx] = true;
+
+        // Update leaf counts / branch risk and bubble the change to ancestors.
+        let n_pruned_leaves = n_leaves[pruned_idx].saturating_sub(1);
+        n_leaves[pruned_idx] = 0;
+        let r_diff = r_node[pruned_idx] - r_branch[pruned_idx];
+        r_branch[pruned_idx] = r_node[pruned_idx];
+
+        let mut idx = parent[pruned_idx];
+        while idx != CCP_NO_PARENT {
+            n_leaves[idx] = n_leaves[idx].saturating_sub(n_pruned_leaves);
+            r_branch[idx] = r_branch[idx] + r_diff;
+            idx = parent[idx];
+        }
+    }
+
+    rebuild_pruned_tree(nodes, meta, &in_subtree, &leaves_in_subtree)
+}
+
+/// Rebuild a compacted flat `Vec<Node<F>>` from the surviving nodes after a
+/// `ccp_alpha` prune.
+///
+/// A surviving node that is `leaves_in_subtree` becomes a [`Node::Leaf`] using
+/// the node's OWN stored collapse value / distribution (`meta`), mirroring
+/// sklearn's `_build_pruned_tree` copying the original node's value into the
+/// pruned leaf. Surviving split nodes keep their `feature`/`threshold`/
+/// `impurity_decrease`/`n_samples`, with child indices remapped into the
+/// compacted vec. The traversal is depth-first pre-order from the root so the
+/// resulting layout matches the original builder's ordering.
+fn rebuild_pruned_tree<F: Float>(
+    nodes: &[Node<F>],
+    meta: &[NodeMeta<F>],
+    in_subtree: &[bool],
+    leaves_in_subtree: &[bool],
+) -> Vec<Node<F>> {
+    let mut new_nodes: Vec<Node<F>> = Vec::new();
+    // (old_idx, slot_in_new_nodes) — the slot was reserved with a placeholder.
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+
+    let root_slot = new_nodes.len();
+    new_nodes.push(placeholder_leaf::<F>());
+    stack.push((0usize, root_slot));
+
+    while let Some((old_idx, slot)) = stack.pop() {
+        if !in_subtree[old_idx] {
+            continue;
+        }
+        let is_leaf = leaves_in_subtree[old_idx] || matches!(nodes[old_idx], Node::Leaf { .. });
+        if is_leaf {
+            let m = &meta[old_idx];
+            new_nodes[slot] = Node::Leaf {
+                value: m.value,
+                class_distribution: m.distribution.clone(),
+                n_samples: m.n_samples,
+            };
+        } else if let Node::Split {
+            feature,
+            threshold,
+            left,
+            right,
+            impurity_decrease,
+            n_samples,
+        } = nodes[old_idx]
+        {
+            // Reserve child slots (left then right) and fill in pointers.
+            let left_slot = new_nodes.len();
+            new_nodes.push(placeholder_leaf::<F>());
+            let right_slot = new_nodes.len();
+            new_nodes.push(placeholder_leaf::<F>());
+            new_nodes[slot] = Node::Split {
+                feature,
+                threshold,
+                left: left_slot,
+                right: right_slot,
+                impurity_decrease,
+                n_samples,
+            };
+            // Push right first so left is processed first (pre-order, matching
+            // the original builder which recurses left before right).
+            stack.push((right, right_slot));
+            stack.push((left, left_slot));
+        }
+    }
+    new_nodes
+}
+
+/// A placeholder leaf used to reserve a slot before its real contents are known.
+fn placeholder_leaf<F: Float>() -> Node<F> {
+    Node::Leaf {
+        value: F::zero(),
+        class_distribution: None,
+        n_samples: 0,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2691,6 +3146,213 @@ mod tests {
         assert_eq!(effective_min_samples_leaf::<f64>(1, 0.25, 8), 2);
         // explicit min_samples_leaf wins when larger.
         assert_eq!(effective_min_samples_leaf::<f64>(5, 0.25, 9), 5);
+    }
+
+    // -- REQ-3: ccp_alpha minimal cost-complexity pruning smoke tests.
+    //    Expected values from the live sklearn 1.5.2 oracle (R-CHAR-3),
+    //    recorded below:
+    //
+    //    import numpy as np; from sklearn.tree import DecisionTreeClassifier
+    //    X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],float)
+    //    y=np.array([0,0,0,1,1,1,2,2,0])
+    //    for a in (0.0,0.1,0.3):
+    //        c=DecisionTreeClassifier(ccp_alpha=a,random_state=0).fit(X,y)
+    //        print(a, c.tree_.node_count, c.predict(X).tolist())
+    //    # 0.0 -> 7 [0,0,0,1,1,1,2,2,0]
+    //    # 0.1 -> 7 [0,0,0,1,1,1,2,2,0]   (weakest link 0.14815 > 0.1, no prune)
+    //    # 0.3 -> 3 [0,0,0,1,1,1,0,0,0]   (prunes 0.14815 subtree; 0.34568 > 0.3)
+    //    c0=DecisionTreeClassifier(random_state=0).fit(X,y)
+    //    c0.cost_complexity_pruning_path(X,y).ccp_alphas
+    //    # [0.0, 0.14814814814814814, 0.345679012345679]
+    //
+    //    from sklearn.tree import DecisionTreeRegressor
+    //    Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],float)
+    //    yr=np.array([1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1])
+    //    for a in (0.0,0.001,0.05):
+    //        r=DecisionTreeRegressor(ccp_alpha=a,random_state=0).fit(Xr,yr)
+    //        print(a, r.tree_.node_count, r.predict(Xr).tolist())
+    //    # 0.0   -> 15 [1,1.2,0.9,1.1,5,5.2,4.9,5.1]
+    //    # 0.001 -> 15 (weakest link 0.0020833 > 0.001, no prune)
+    //    # 0.05  -> 3  [1.05]*4 + [5.05]*4
+    //    r0.cost_complexity_pruning_path -> ccp_alphas
+    //    # [0.0, 0.0020833333333333350, 0.0020833333333338070, 4.0]
+
+    /// `ccp_alpha = 0.0` (default) ⇒ NO pruning: the full oracle tree
+    /// (`node_count == 7`, `predict == [0,0,0,1,1,1,2,2,0]`, sklearn 1.5.2).
+    #[test]
+    fn test_classifier_ccp_alpha_default_node_count_7() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_ccp_alpha(0.0)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            7,
+            "ccp_alpha=0.0 node_count (sklearn: 7)"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 2, 2, 0]);
+    }
+
+    /// `ccp_alpha = 0.1` ⇒ no prune (weakest link 0.14815 > 0.1):
+    /// `node_count == 7`, `predict == [0,0,0,1,1,1,2,2,0]` (sklearn 1.5.2).
+    #[test]
+    fn test_classifier_ccp_alpha_0_1_node_count_7() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_ccp_alpha(0.1)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            7,
+            "ccp_alpha=0.1 node_count (sklearn: 7)"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 2, 2, 0]);
+    }
+
+    /// `ccp_alpha = 0.3` ⇒ prunes the 0.14815 subtree (leaving the root split):
+    /// `node_count == 3`, `predict == [0,0,0,1,1,1,0,0,0]` (sklearn 1.5.2).
+    #[test]
+    fn test_classifier_ccp_alpha_0_3_node_count_3() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = match DecisionTreeClassifier::<f64>::new()
+            .with_ccp_alpha(0.3)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            3,
+            "ccp_alpha=0.3 node_count (sklearn: 3)"
+        );
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 0, 0, 0]);
+    }
+
+    /// Regressor `ccp_alpha = 0.0` ⇒ no prune: the full tree
+    /// (`node_count == 15`, predict == y), sklearn 1.5.2.
+    #[test]
+    fn test_regressor_ccp_alpha_default_node_count_15() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = match DecisionTreeRegressor::<f64>::new()
+            .with_ccp_alpha(0.0)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            15,
+            "ccp_alpha=0.0 node_count (sklearn: 15)"
+        );
+        assert_reg_predict(&fitted, &x, &[1.0, 1.2, 0.9, 1.1, 5.0, 5.2, 4.9, 5.1]);
+    }
+
+    /// Regressor `ccp_alpha = 0.001` ⇒ no prune (weakest link 0.00208 > 0.001):
+    /// `node_count == 15` (sklearn 1.5.2).
+    #[test]
+    fn test_regressor_ccp_alpha_0_001_node_count_15() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = match DecisionTreeRegressor::<f64>::new()
+            .with_ccp_alpha(0.001)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            15,
+            "ccp_alpha=0.001 node_count (sklearn: 15)"
+        );
+    }
+
+    /// Regressor `ccp_alpha = 0.05` ⇒ prunes to the root split:
+    /// `node_count == 3`, `predict == [1.05]*4 + [5.05]*4` (mean leaves),
+    /// sklearn 1.5.2.
+    #[test]
+    fn test_regressor_ccp_alpha_0_05_node_count_3() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = match DecisionTreeRegressor::<f64>::new()
+            .with_ccp_alpha(0.05)
+            .fit(&x, &y)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                #[allow(
+                    clippy::assertions_on_constants,
+                    reason = "test-only failure-path assertion; no cheap fitted-model fallback"
+                )]
+                {
+                    assert!(false, "fit failed: {e}");
+                }
+                return;
+            }
+        };
+        assert_eq!(
+            fitted.nodes().len(),
+            3,
+            "ccp_alpha=0.05 node_count (sklearn: 3)"
+        );
+        assert_reg_predict(
+            &fitted,
+            &x,
+            &[1.05, 1.05, 1.05, 1.05, 5.05, 5.05, 5.05, 5.05],
+        );
     }
 
     /// MSE path stays byte-identical after the criterion-dispatch refactor:
