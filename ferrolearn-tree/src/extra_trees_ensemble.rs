@@ -26,6 +26,25 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.ExtraTreesClassifier` / `ExtraTreesRegressor`
+//! (`sklearn/ensemble/_forest.py`). See `.design/tree/extra_trees_ensemble.md`.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param surface + defaults: clf `n_estimators=100, criterion=Gini, max_features=Sqrt, bootstrap=false`; reg `max_features=All` (`_forest.py` ExtraTrees ctor) | SHIPPED |
+//! | REQ-2b | Per-tree fit via [`crate::ExtraTreeClassifier`]/`ExtraTreeRegressor` base learners | SHIPPED |
+//! | REQ-3 | Classifier soft-vote `predict` = `classes[argmax(mean predict_proba)]` (`_forest.py:907`), lowest-index tie-break | SHIPPED |
+//! | REQ-4 | `predict_proba` = mean of per-tree proba (`_forest.py:963`); regressor `predict` = mean of per-tree predictions (`:1081`) | SHIPPED |
+//! | REQ-5 | `feature_importances_` = normalized mean of per-tree importances | SHIPPED |
+//! | REQ-9 | `random_state` reproducibility (ferrolearn-internal determinism; numpy-MT cross-parity is a documented RNG boundary, #681) | SHIPPED |
+//! | REQ-2 | `bootstrap=true` numpy-parity + `max_samples` | NOT-STARTED (#680, RNG boundary #681) |
+//! | REQ-6 | `oob_score` / `oob_decision_function_` / `oob_prediction_` | NOT-STARTED (#682) |
+//! | REQ-7 | `class_weight` (balanced / subsample / explicit) | NOT-STARTED (#683) |
+//! | REQ-8 | Regressor `criterion` passthrough (friedman_mse/absolute_error/poisson; currently pinned MSE) | NOT-STARTED (#684) |
+//! | REQ-10 | ferray substrate migration | NOT-STARTED (#685) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -510,45 +529,34 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedExtraTreesCl
     type Output = Array1<usize>;
     type Error = FerroError;
 
-    /// Predict class labels by majority vote across all trees.
+    /// Predict class labels by a SOFT vote: the argmax of the per-tree-averaged
+    /// [`predict_proba`](Self::predict_proba) (NOT a hard per-tree-label
+    /// majority). Routes through [`predict_proba`](Self::predict_proba) so the
+    /// two are consistent. Ties resolve to the lowest class index, matching
+    /// `np.argmax`.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        if x.ncols() != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted model".into(),
-            });
-        }
-
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
+        let proba = self.predict_proba(x)?;
+        let n_samples = proba.nrows();
+        let n_classes = proba.ncols();
         let mut predictions = Array1::zeros(n_samples);
 
         for i in 0..n_samples {
-            let row = x.row(i);
-            let mut votes = vec![0usize; n_classes];
-
-            for tree_nodes in &self.trees {
-                let leaf_idx = traverse(tree_nodes, &row);
-                if let Node::Leaf { value, .. } = tree_nodes[leaf_idx] {
-                    let class_idx = value.to_f64().map_or(0, |f| f.round() as usize);
-                    if class_idx < n_classes {
-                        votes[class_idx] += 1;
-                    }
+            // np.argmax tie-break: first (lowest) index of the maximum.
+            let mut best = 0usize;
+            let mut best_v = proba[[i, 0]];
+            for j in 1..n_classes {
+                let v = proba[[i, j]];
+                if v > best_v {
+                    best_v = v;
+                    best = j;
                 }
             }
-
-            let winner = votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &count)| count)
-                .map_or(0, |(idx, _)| idx);
-            predictions[i] = self.classes[winner];
+            predictions[i] = self.classes[best];
         }
 
         Ok(predictions)
