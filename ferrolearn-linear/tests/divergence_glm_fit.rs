@@ -37,6 +37,163 @@ use ferrolearn_linear::{GammaRegressor, PoissonRegressor, TweedieRegressor};
 use ndarray::{Array1, Array2};
 
 // ===========================================================================
+// #560 — per-family y-domain validation (`in_y_true_range`) + `n_iter_`.
+//
+// sklearn validates `y` against the loss's `interval_y_true` BEFORE fitting:
+//   `if not linear_loss.base_loss.in_y_true_range(y): raise ValueError(
+//        "Some value(s) of y are out of the valid range of the loss ...")`
+// (`sklearn/linear_model/_glm/glm.py:221-225`). The valid range depends on the
+// family's Tweedie power (verified against the live oracle; the link does NOT
+// change it):
+//   * Poisson  (power 1): y >= 0   (closed at 0)
+//   * Gamma    (power 2): y > 0    (open at 0 — y == 0 is INVALID)
+//   * Tweedie(power): power<=0 unconstrained, 0<power<2 -> y>=0, power>=2 -> y>0
+//
+// sklearn also exposes the solver iteration count as fitted `n_iter_`
+// (`glm.py:110-114, :283`); ferrolearn exposes the IRLS iteration count via
+// `FittedGLMRegressor::n_iter()`.
+// ===========================================================================
+
+/// Divergence: `GammaRegressor` must reject `y == 0` (`HalfGammaLoss` domain is
+/// `0 < y`, open at 0), and accept all-positive `y`.
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:221-225` +
+/// `HalfGammaLoss.interval_y_true == (0, inf)` (open at 0).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import GammaRegressor; \
+///   X=np.array([[1.],[2.],[3.]]); \
+///   GammaRegressor().fit(X, np.array([0.,1.,2.]))"
+/// # -> ValueError: Some value(s) of y are out of the valid range of the loss 'HalfGammaLoss'.
+/// # GammaRegressor().fit(X, [1.,2.,3.]) -> OK
+/// ```
+#[test]
+fn glm_gamma_rejects_zero_y() {
+    let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+
+    // y contains 0.0 — out of the Gamma domain (0 < y). sklearn raises ValueError.
+    let y_bad = Array1::from(vec![0.0, 1.0, 2.0]);
+    assert!(
+        GammaRegressor::<f64>::new().fit(&x, &y_bad).is_err(),
+        "Gamma domain is 0 < y (open at 0): sklearn raises ValueError for y==0, \
+         ferrolearn must return Err"
+    );
+
+    // All-positive y is in-domain — fits fine.
+    let y_ok = Array1::from(vec![1.0, 2.0, 3.0]);
+    assert!(
+        GammaRegressor::<f64>::new().fit(&x, &y_ok).is_ok(),
+        "Gamma with all-positive y is in-domain and must fit"
+    );
+}
+
+/// Divergence: `TweedieRegressor(power=2.0)` rejects `y == 0` (Gamma domain,
+/// `power >= 2` -> `y > 0`), while `power=1.5` (`1 <= power < 2` -> `y >= 0`)
+/// accepts `y == 0`.
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:221-225` +
+/// `HalfTweedieLoss(power).interval_y_true`: `power=2.0` -> `(0, inf)` (open),
+/// `power=1.5` -> `[0, inf)` (closed).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import TweedieRegressor; \
+///   X=np.array([[1.],[2.],[3.]]); \
+///   TweedieRegressor(power=2.0).fit(X, np.array([0.,1.,2.]))"
+/// # -> ValueError (out of range of loss 'HalfTweedieLoss')
+/// # TweedieRegressor(power=1.5).fit(X, [0.,1.,2.]) -> OK
+/// ```
+#[test]
+fn glm_tweedie_power2_rejects_zero_y() {
+    let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0]);
+
+    // power=2.0 (Gamma): y > 0 strictly — y==0 is out of range.
+    assert!(
+        TweedieRegressor::<f64>::new()
+            .with_power(2.0)
+            .fit(&x, &y)
+            .is_err(),
+        "Tweedie(power=2.0) domain is y > 0 (open at 0): sklearn raises ValueError \
+         for y==0, ferrolearn must return Err"
+    );
+
+    // power=1.5 (1 <= power < 2): y >= 0 — y==0 is allowed.
+    assert!(
+        TweedieRegressor::<f64>::new()
+            .with_power(1.5)
+            .fit(&x, &y)
+            .is_ok(),
+        "Tweedie(power=1.5) domain is y >= 0 (closed at 0): sklearn accepts y==0, \
+         ferrolearn must return Ok"
+    );
+}
+
+/// Divergence: `PoissonRegressor` rejects negative `y` (`HalfPoissonLoss` domain
+/// is `0 <= y`), and accepts `y == 0`.
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:221-225` +
+/// `HalfPoissonLoss.interval_y_true == [0, inf)` (closed at 0).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[1.],[2.],[3.]]); \
+///   PoissonRegressor().fit(X, np.array([-1.,1.,2.]))"
+/// # -> ValueError (out of range of loss 'HalfPoissonLoss')
+/// # PoissonRegressor().fit(X, [0.,1.,2.]) -> OK
+/// ```
+#[test]
+fn glm_poisson_rejects_negative_y() {
+    let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+
+    // Negative y is out of the Poisson domain (0 <= y).
+    let y_neg = Array1::from(vec![-1.0, 1.0, 2.0]);
+    assert!(
+        PoissonRegressor::<f64>::new().fit(&x, &y_neg).is_err(),
+        "Poisson domain is 0 <= y: sklearn raises ValueError for y<0, \
+         ferrolearn must return Err"
+    );
+
+    // y == 0 is in-domain (closed at 0) — fits fine.
+    let y_zero = Array1::from(vec![0.0, 1.0, 2.0]);
+    assert!(
+        PoissonRegressor::<f64>::new().fit(&x, &y_zero).is_ok(),
+        "Poisson domain is closed at 0: sklearn accepts y==0, ferrolearn must \
+         return Ok"
+    );
+}
+
+/// `n_iter_` is exposed and reasonable: `1 <= n_iter() <= max_iter`.
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:110-114, :283`
+///   `n_iter_ : int` — "Actual number of iterations used in the solver."
+///
+/// Structural pin: ferrolearn's solver is IRLS (sklearn's default is lbfgs), so
+/// the exact value need not match the oracle — only that the count is exposed
+/// and in `[1, max_iter]`.
+#[test]
+fn glm_n_iter_exposed() {
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = Array1::from(vec![2.0, 5.0, 10.0, 20.0]);
+
+    let max_iter = 100;
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.0)
+        .with_max_iter(max_iter)
+        .fit(&x, &y)
+        .expect("Poisson fit");
+
+    let n = fitted.n_iter();
+    assert!(
+        n >= 1 && n <= max_iter,
+        "n_iter_ must be in [1, max_iter={max_iter}] (sklearn glm.py:283 exposes \
+         the solver iteration count); ferrolearn returned {n}"
+    );
+}
+
+// ===========================================================================
 // #551 (crux) — intercept penalization. sklearn excludes the intercept from
 // the L2 penalty (`l2_reg_strength = self.alpha`, glm.py:258; the intercept is
 // the last coef entry and `LinearModelLoss` does not penalize it). ferrolearn's

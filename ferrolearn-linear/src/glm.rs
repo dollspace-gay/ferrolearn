@@ -46,6 +46,7 @@
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
 //! | REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`, where the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance objective normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector, so the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` (coef `[0.35738828,0.19717462]`, int `-0.43719203`) and `glm_gamma_sample_weight` (coef `[0.23049054,0.11350454]`, int `0.41955357`) green in `tests/divergence_glm_fit.rs`; the 8 pre-existing unweighted oracle tests stay green. |
+//! | REQ-14 (n_iter_ + per-family y-domain validation) | SHIPPED | #560. Per-family y-domain guard in `fn fit_glm_irls`: `YDomain::for_power(family.domain_power())` then `y.iter().any(|&yi| !y_domain.contains(yi))` → `FerroError::InvalidParameter{name:"y", reason:"Some value(s) of y are out of the valid range of the loss '<loss>'."}`, mirroring sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` (`glm.py:221-225`). The valid range is keyed on the family's Tweedie `power` (NOT the link — verified vs the live oracle that `HalfTweedieLoss(p).interval_y_true == HalfTweedieLossIdentity(p).interval_y_true`): `power <= 0` unconstrained (Normal), `0 < power < 2` → `y >= 0` (Poisson `power=1`), `power >= 2` → `y > 0` (Gamma `power=2`, open at 0). `FittedGLMRegressor` gains `n_iter: usize` (the IRLS iteration count captured in the convergence loop) with `#[must_use] pub fn n_iter(&self) -> usize` — sklearn's `n_iter_` is the lbfgs count (`glm.py:110-114, :283`); ferrolearn's is the IRLS count (solvers differ, both report iterations-to-convergence). Consumer: `FittedGLMRegressor::n_iter` accessor on the crate-root-exported fitted type. Oracle tests `glm_gamma_rejects_zero_y` (Gamma rejects `y==0`, accepts `y>0`), `glm_tweedie_power2_rejects_zero_y` (`power=2.0` rejects `y==0`; `power=1.5` accepts it), `glm_poisson_rejects_negative_y` (rejects `y<0`, accepts `y==0`), `glm_n_iter_exposed` (`1 <= n_iter() <= max_iter`) green in `tests/divergence_glm_fit.rs`; the 10 pre-existing glm divergence tests stay green (all their `y` are in-domain). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -180,9 +181,92 @@ impl GLMFamily {
             GLMFamily::Poisson => mu,
             GLMFamily::Gamma => mu * mu,
             GLMFamily::Tweedie(p) => {
-                let power = F::from(*p).unwrap();
+                let power = F::from(*p).unwrap_or_else(F::zero);
                 mu.powf(power)
             }
+        }
+    }
+
+    /// The Tweedie power that determines this family's target (`y`) domain.
+    ///
+    /// The sklearn EDM losses derive their `interval_y_true` from the Tweedie
+    /// `power` alone (`HalfPoissonLoss` is `power = 1`, `HalfGammaLoss` is
+    /// `power = 2`); the link function does NOT change the valid `y` range
+    /// (verified against the live oracle: `HalfTweedieLoss(power).interval_y_true
+    /// == HalfTweedieLossIdentity(power).interval_y_true`). See
+    /// [`YDomain::for_power`].
+    #[must_use]
+    fn domain_power(&self) -> f64 {
+        match self {
+            GLMFamily::Poisson => 1.0,
+            GLMFamily::Gamma => 2.0,
+            GLMFamily::Tweedie(p) => *p,
+        }
+    }
+}
+
+/// The valid target (`y`) domain of a GLM loss, derived from its Tweedie
+/// `power`, mirroring sklearn's `BaseLoss.interval_y_true` /
+/// `in_y_true_range(y)` (`sklearn/linear_model/_glm/glm.py:221-225`).
+///
+/// The interval depends on `power` only (NOT the link); verified against the
+/// live sklearn 1.5.2 oracle:
+///
+/// | power range          | valid `y`     | sklearn loss / interval                            |
+/// |----------------------|---------------|----------------------------------------------------|
+/// | `power <= 0`         | any real `y`  | `HalfSquaredError`/Tweedie identity, `(-inf, inf)` |
+/// | `0 < power < 2`      | `y >= 0`      | Poisson (`power = 1`): `[0, inf)`                  |
+/// | `power >= 2`         | `y > 0`       | Gamma (`power = 2`): `(0, inf)`                    |
+///
+/// (`power < 0` is the identity-link case, unconstrained; `0 < power < 1` is not
+/// a standard Tweedie EDM but sklearn's `HalfTweedieLoss(power).interval_y_true`
+/// is `[0, inf)` there, so we treat it as `y >= 0`.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YDomain {
+    /// `y` may be any real number (`power <= 0`, Normal/identity).
+    Unconstrained,
+    /// `y >= 0` (closed at 0; `0 < power < 2`, e.g. Poisson `power = 1`).
+    NonNegative,
+    /// `y > 0` (open at 0; `power >= 2`, e.g. Gamma `power = 2`).
+    Positive,
+}
+
+impl YDomain {
+    /// Resolve the valid `y` domain from a Tweedie `power`.
+    ///
+    /// Mirrors the boundaries of `HalfTweedieLoss(power).interval_y_true`
+    /// (live sklearn 1.5.2 oracle): `power <= 0` → unconstrained, `0 < power < 2`
+    /// → `y >= 0`, `power >= 2` → `y > 0`.
+    #[must_use]
+    fn for_power(power: f64) -> Self {
+        if power <= 0.0 {
+            YDomain::Unconstrained
+        } else if power < 2.0 {
+            YDomain::NonNegative
+        } else {
+            YDomain::Positive
+        }
+    }
+
+    /// Human-readable description of the loss whose domain this is, for the
+    /// error message (mirrors sklearn's `loss.__class__.__name__`,
+    /// `glm.py:224`).
+    #[must_use]
+    fn loss_name(self) -> &'static str {
+        match self {
+            YDomain::Unconstrained => "HalfSquaredError",
+            YDomain::NonNegative => "HalfPoissonLoss",
+            YDomain::Positive => "HalfGammaLoss",
+        }
+    }
+
+    /// Whether a single target value `yi` is inside this domain.
+    #[must_use]
+    fn contains<F: Float>(self, yi: F) -> bool {
+        match self {
+            YDomain::Unconstrained => true,
+            YDomain::NonNegative => yi >= F::zero(),
+            YDomain::Positive => yi > F::zero(),
         }
     }
 }
@@ -309,6 +393,29 @@ pub struct FittedGLMRegressor<F> {
     intercept: F,
     /// Link function applied by `predict` (inverse link maps `eta` to `mu`).
     link: Link,
+    /// Number of IRLS iterations actually run (until convergence or `max_iter`).
+    ///
+    /// Mirrors sklearn's fitted `n_iter_` attribute (`glm.py:110-114, :283`),
+    /// the solver's iteration count. ferrolearn's solver is IRLS (not lbfgs), so
+    /// this is the **IRLS** iteration count; both report iterations-to-convergence
+    /// but the exact value is solver-dependent.
+    n_iter: usize,
+}
+
+impl<F> FittedGLMRegressor<F> {
+    /// Number of IRLS iterations run during the fit
+    /// (until convergence or `max_iter`).
+    ///
+    /// Mirrors scikit-learn's fitted `n_iter_` attribute
+    /// (`sklearn/linear_model/_glm/glm.py:110-114, :283`), which reports the
+    /// solver's iteration count. ferrolearn's solver is **IRLS** (sklearn's
+    /// default is lbfgs), so this is the IRLS iteration count, not the lbfgs
+    /// one — both report iterations-to-convergence, but the exact value differs
+    /// because the solvers differ. The value is in `1..=max_iter`.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -900,20 +1007,27 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         });
     }
 
-    // The log link requires y >= 0 (mu = exp(eta) > 0 and the working response
-    // uses ln(y)). The identity link (Tweedie power <= 0, Normal) has no such
-    // restriction — y may be any real number (`glm.py:121-127`,
-    // `HalfSquaredError` / `HalfTweedieLossIdentity` target domains).
+    // Per-family target-domain validation, mirroring sklearn's
+    //   `if not linear_loss.base_loss.in_y_true_range(y): raise ValueError(...)`
+    // (`glm.py:221-225`). The valid `y` range is determined by the family's
+    // Tweedie `power` (NOT the link — verified against the live oracle):
+    //   * `power <= 0`  (Normal/identity)        -> y unconstrained
+    //   * `0 < power < 2` (Poisson `power = 1`)  -> y >= 0   (closed at 0)
+    //   * `power >= 2`    (Gamma `power = 2`)     -> y > 0    (open at 0)
+    // Confirmed live-oracle behaviors: `GammaRegressor().fit(X, [0,1,2])` and
+    // `TweedieRegressor(power=2.0).fit(X, [0,1,2])` raise ValueError;
+    // `PoissonRegressor().fit(X, [-1,1,2])` raises; `TweedieRegressor(power=1.5)`
+    // accepts y == 0.
     let min_y = F::from(1e-10).unwrap_or_else(F::epsilon);
-    if link == Link::Log {
-        for &yi in y.iter() {
-            if yi < F::zero() {
-                return Err(FerroError::InvalidParameter {
-                    name: "y".into(),
-                    reason: "target values must be non-negative for GLM with log link".into(),
-                });
-            }
-        }
+    let y_domain = YDomain::for_power(family.domain_power());
+    if y.iter().any(|&yi| !y_domain.contains(yi)) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: format!(
+                "Some value(s) of y are out of the valid range of the loss '{}'.",
+                y_domain.loss_name()
+            ),
+        });
     }
 
     // Build design matrix (optionally prepend intercept column).
@@ -966,7 +1080,12 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
     let min_mu = F::from(1e-10).unwrap_or_else(F::epsilon);
     let max_mu = F::from(1e10).unwrap_or_else(F::max_value);
 
+    // Count the IRLS iterations actually run (sklearn's `n_iter_`, `glm.py:283`).
+    // At least one iteration always runs (`max_iter >= 1`); on convergence we
+    // break after the iteration that satisfied the tolerance.
+    let mut n_iter = 0usize;
     for _iter in 0..max_iter {
+        n_iter += 1;
         let coef_old = coef.clone();
 
         // Compute IRLS weights and working response.
@@ -1067,6 +1186,7 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         coefficients,
         intercept,
         link,
+        n_iter,
     })
 }
 
