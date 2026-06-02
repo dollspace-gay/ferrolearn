@@ -1435,6 +1435,82 @@ pub struct FittedSVC<F, K> {
     prob_b: Vec<F>,
 }
 
+/// One ovo binary sub-model in **this crate's sign convention** (higher-index
+/// `class_pos` is the `+1` side, matching [`BinarySvm`] and
+/// [`FittedSVC::decision_value_binary`]). Used by [`FittedSVC::from_nu_ovo`] to
+/// assemble a nu-SVC fitted model that reuses all of [`FittedSVC`]'s accessors
+/// / `decision_function` / `predict`.
+///
+/// The nu-SVC solver ([`solve_nu_svc`]) is fed the per-pair labels in this same
+/// convention (`class_pos = +1`), so `sv_coefs`/`bias_internal` are already in
+/// this-crate sign and `from_nu_ovo` stores them verbatim.
+pub(crate) struct NuOvoPair<F> {
+    /// Support-vector feature rows for this pair.
+    pub sv_data: Vec<Vec<F>>,
+    /// Per-SV coefficient `alpha·y/r` (this-crate sign, `class_pos = +1`),
+    /// equal to the public binary `dual_coef_` value (the nu_svc binary flip
+    /// `public = -internal` cancels with `internal = -stored`).
+    pub sv_coefs: Vec<F>,
+    /// Original training-row index of each support vector.
+    pub sv_indices: Vec<usize>,
+    /// Decision bias for the `+1`-side (`class_pos`) in this crate's
+    /// convention (`f(x) = Σ sv_coef·K + bias_internal`).
+    pub bias_internal: F,
+    /// Lower-index class label (this crate's `-1` side).
+    pub class_neg: usize,
+    /// Higher-index class label (this crate's `+1` side).
+    pub class_pos: usize,
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> FittedSVC<F, K> {
+    /// Assemble a [`FittedSVC`] from per-ovo-pair nu-SVC sub-models (in libsvm
+    /// sign convention) so that [`NuSVC`](crate::nu_svm::NuSVC) reuses the full
+    /// libsvm-layout fitted-attribute machinery (`support_`/`dual_coef_`/
+    /// `intercept_`/`coef_`/`decision_function`/`predict`) without duplicating
+    /// it (`sklearn/svm/_base.py:318-410`).
+    ///
+    /// Each [`NuOvoPair`] is already in this crate's [`BinarySvm`] sign
+    /// convention (higher-index `class_pos` as the `+1` side, because
+    /// [`solve_nu_svc`] is fed labels in that convention), so the coefficients
+    /// and bias are stored verbatim. The resulting public `dual_coef_`/
+    /// `intercept_` then carry the binary nu_svc sign flip exactly as `c_svc`
+    /// does (`_base.py:258-262`, predicate `_impl in ["c_svc","nu_svc"]`).
+    pub(crate) fn from_nu_ovo(
+        kernel: K,
+        pairs: Vec<NuOvoPair<F>>,
+        classes: Vec<usize>,
+        x_train: Array2<F>,
+        y_train: Vec<usize>,
+        decision_function_shape: SvmDecisionShape,
+        break_ties: bool,
+    ) -> Self {
+        let binary_models = pairs
+            .into_iter()
+            .map(|pair| BinarySvm {
+                support_vectors: pair.sv_data,
+                sv_indices: pair.sv_indices,
+                dual_coefs: pair.sv_coefs,
+                bias: pair.bias_internal,
+                class_neg: pair.class_neg,
+                class_pos: pair.class_pos,
+            })
+            .collect();
+
+        FittedSVC {
+            kernel,
+            binary_models,
+            classes,
+            x_train,
+            y_train,
+            decision_function_shape,
+            break_ties,
+            probability: false,
+            prob_a: Vec::new(),
+            prob_b: Vec::new(),
+        }
+    }
+}
+
 impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
     /// Compute the decision function value for a single sample against a
     /// binary model.
@@ -2547,6 +2623,540 @@ fn smo_svr<F: Float, K: Kernel<F>>(
     };
 
     Ok((coefs, bias))
+}
+
+// ---------------------------------------------------------------------------
+// Solver_NU — the libsvm nu-parameterized solver (nu-SVC / nu-SVR)
+// ---------------------------------------------------------------------------
+
+/// Output of the generic [`solver_nu_core`] solve.
+struct NuResult<F> {
+    /// The dual variables `alpha` (length `l`, the solver-internal variables).
+    alpha: Vec<F>,
+    /// `rho = (r1 - r2) / 2` (the per-pair bias term, `Solver_NU::calculate_rho`
+    /// returns this; `sklearn/svm/src/libsvm/svm.cpp:1417`).
+    rho: F,
+    /// `r = (r1 + r2) / 2` (`si->r`, the nu-SVC `/r` rescale factor /
+    /// the nu-SVR `-epsilon`, `svm.cpp:1416`).
+    r: F,
+}
+
+/// The generic libsvm `Solver_NU` core: solves
+/// `min 0.5 αᵀQα + pᵀα  s.t.  0≤α_k≤C_k,  yᵀα=0,  eᵀα=const`
+/// where `Q[k][t] = y_k·y_t·K(sample(k), sample(t))`, with the nu-specific
+/// second-order working-set selection (separately over the `y=+1` / `y=-1`
+/// groups, four running maxima `Gmaxp/Gmaxp2/Gmaxn/Gmaxn2`) and the
+/// two-group `rho`/`r` recovery.
+///
+/// A faithful transcription of libsvm's `Solver_NU` + the shared
+/// `Solver::Solve` update step (`sklearn/svm/src/libsvm/svm.cpp:1166-1418`
+/// for the nu-specific `select_working_set`/`calculate_rho`, and `:663-940`
+/// for the gradient init + analytic 2-variable update + objective). Like the
+/// existing [`smo_binary`]/[`smo_svr`] solvers this is a NATURAL-ORDER,
+/// no-shrinking, DETERMINISTIC variant: libsvm's shrinking heuristic
+/// (`Solver_NU::do_shrinking`, `svm.cpp:1318`) is a performance optimization
+/// that does NOT change the converged optimum (R-DEV-7), so it is omitted; the
+/// `active_size` always equals `l`. The result (`alpha`, `rho`, `r`) is in
+/// libsvm's convention so the caller can reconstruct `dual_coef_`/`intercept_`
+/// that match the live `NuSVC`/`NuSVR` oracle after the public sign flip.
+///
+/// Arguments:
+/// - `data`: the ORIGINAL per-sample feature rows (length `n`), keyed by the
+///   [`KernelCache`] via `sample(i)` for the kernel evaluation.
+/// - `m`: number of solver variables (`l` in libsvm; `= n` for nu-SVC,
+///   `= 2n` for nu-SVR).
+/// - `sample`: maps a solver variable index `k` to the original sample index
+///   (into `data`) used for the kernel evaluation `K(sample(i), sample(j))`.
+/// - `y`: the per-variable sign (`+1` / `-1`).
+/// - `p`: the linear term (`p[k]`; `0` for nu-SVC, `∓prob.y` for nu-SVR).
+/// - `c`: the per-variable upper bound `C_k`.
+/// - `alpha`: the (greedily-initialized) starting dual variables, modified
+///   in place into the solution.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a faithful transcription of libsvm's Solver_NU::Solve threads the \
+              problem (n, m, sample, y, p, c, alpha) + hyperparameters through \
+              one call; splitting them would obscure the C oracle correspondence"
+)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "a one-to-one transcription of libsvm's Solver_NU select_working_set \
+              + the shared Solver analytic 2-variable update + calculate_rho \
+              (svm.cpp:663-940, 1186-1418); kept inline to preserve the \
+              line-by-line correspondence to the C oracle"
+)]
+fn solver_nu_core<F: Float, K: Kernel<F>>(
+    data: &[Vec<F>],
+    m: usize,
+    sample: &dyn Fn(usize) -> usize,
+    y: &[F],
+    p: &[F],
+    c: &[F],
+    mut alpha: Vec<F>,
+    kernel: &K,
+    tol: F,
+    max_iter: usize,
+    cache_size: usize,
+) -> NuResult<F> {
+    let zero = F::zero();
+    let two = F::one() + F::one();
+    // libsvm's TAU (`svm.cpp:316`): a tiny positive floor for the quadratic
+    // coefficient when the kernel is not strictly positive-definite.
+    let tau = F::from(1e-12).unwrap_or_else(F::epsilon);
+    let eps_bound = F::from(1e-12).unwrap_or_else(F::epsilon);
+
+    let mut cache = KernelCache::new(cache_size);
+    // `QD[i] = K(sample(i), sample(i))` (since `y_i^2 = 1`, `Q_ii = K(i,i)`).
+    // The cache keys on the ORIGINAL-sample index `sample(i)` into `data`.
+    let qd: Vec<F> = (0..m)
+        .map(|i| {
+            let si = sample(i);
+            cache.get_or_compute(si, si, kernel, data)
+        })
+        .collect();
+
+    // `q(i, j) = y_i·y_j·K(sample(i), sample(j))` (libsvm `SVC_Q::get_Q`,
+    // `svm.cpp:1436-1446`). The cache is keyed by original-sample index.
+    let q_entry = |i: usize, j: usize, cache: &mut KernelCache<F>| -> F {
+        y[i] * y[j] * cache.get_or_compute(sample(i), sample(j), kernel, data)
+    };
+
+    // Bound predicates (`Solver::update_alpha_status`, `svm.cpp:588-598`).
+    let is_upper = |k: usize, a: &[F]| -> bool { a[k] >= c[k] - eps_bound };
+    let is_lower = |k: usize, a: &[F]| -> bool { a[k] <= eps_bound };
+
+    // Gradient `G[k] = (Q·alpha)_k + p[k]` (`svm.cpp:693-715`). Since the
+    // greedy init has some `alpha_k > 0`, accumulate the full product.
+    let mut grad: Vec<F> = p.to_vec();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "i indexes alpha while the inner loop forms Q[i][j]·alpha[i]"
+    )]
+    for i in 0..m {
+        if alpha[i] > eps_bound {
+            let ai = alpha[i];
+            for (j, g) in grad.iter_mut().enumerate() {
+                *g = *g + ai * q_entry(i, j, &mut cache);
+            }
+        }
+    }
+
+    let mut iter = 0usize;
+    loop {
+        if max_iter != 0 && iter >= max_iter {
+            break;
+        }
+        iter += 1;
+
+        // ---- Solver_NU::select_working_set (svm.cpp:1186-1296) ----
+        let mut gmaxp = F::neg_infinity();
+        let mut gmaxp2 = F::neg_infinity();
+        let mut gmaxp_idx: isize = -1;
+        let mut gmaxn = F::neg_infinity();
+        let mut gmaxn2 = F::neg_infinity();
+        let mut gmaxn_idx: isize = -1;
+
+        for t in 0..m {
+            if y[t] > zero {
+                if !is_upper(t, &alpha) && -grad[t] >= gmaxp {
+                    gmaxp = -grad[t];
+                    gmaxp_idx = t as isize;
+                }
+            } else if !is_lower(t, &alpha) && grad[t] >= gmaxn {
+                gmaxn = grad[t];
+                gmaxn_idx = t as isize;
+            }
+        }
+
+        let ip = gmaxp_idx;
+        let in_ = gmaxn_idx;
+
+        let mut gmin_idx: isize = -1;
+        let mut obj_diff_min = F::infinity();
+
+        for j in 0..m {
+            if y[j] > zero {
+                if !is_lower(j, &alpha) {
+                    let grad_diff = gmaxp + grad[j];
+                    if grad[j] >= gmaxp2 {
+                        gmaxp2 = grad[j];
+                    }
+                    if grad_diff > zero && ip != -1 {
+                        let ipi = ip as usize;
+                        let quad_coef = qd[ipi] + qd[j] - two * q_entry(ipi, j, &mut cache);
+                        let obj_diff = if quad_coef > zero {
+                            -(grad_diff * grad_diff) / quad_coef
+                        } else {
+                            -(grad_diff * grad_diff) / tau
+                        };
+                        if obj_diff <= obj_diff_min {
+                            gmin_idx = j as isize;
+                            obj_diff_min = obj_diff;
+                        }
+                    }
+                }
+            } else if !is_upper(j, &alpha) {
+                let grad_diff = gmaxn - grad[j];
+                if -grad[j] >= gmaxn2 {
+                    gmaxn2 = -grad[j];
+                }
+                if grad_diff > zero && in_ != -1 {
+                    let ini = in_ as usize;
+                    let quad_coef = qd[ini] + qd[j] - two * q_entry(ini, j, &mut cache);
+                    let obj_diff = if quad_coef > zero {
+                        -(grad_diff * grad_diff) / quad_coef
+                    } else {
+                        -(grad_diff * grad_diff) / tau
+                    };
+                    if obj_diff <= obj_diff_min {
+                        gmin_idx = j as isize;
+                        obj_diff_min = obj_diff;
+                    }
+                }
+            }
+        }
+
+        // Stopping criterion (`svm.cpp:1286`).
+        if (gmaxp + gmaxp2).max(gmaxn + gmaxn2) < tol || gmin_idx == -1 {
+            break;
+        }
+
+        let i = if y[gmin_idx as usize] > zero {
+            gmaxp_idx
+        } else {
+            gmaxn_idx
+        };
+        if i == -1 {
+            break;
+        }
+        let i = i as usize;
+        let j = gmin_idx as usize;
+        if i == j {
+            break;
+        }
+
+        // ---- Solver::Solve analytic 2-variable update (svm.cpp:756-852) ----
+        let q_ij = q_entry(i, j, &mut cache);
+        let c_i = c[i];
+        let c_j = c[j];
+        let old_alpha_i = alpha[i];
+        let old_alpha_j = alpha[j];
+
+        if y[i] != y[j] {
+            // `Q_i[j] = y_i·y_j·K = -K(i,j)` here, so `+2·Q_i[j]` in libsvm.
+            let mut quad_coef = qd[i] + qd[j] + two * q_ij;
+            if quad_coef <= zero {
+                quad_coef = tau;
+            }
+            let delta = (-grad[i] - grad[j]) / quad_coef;
+            let diff = alpha[i] - alpha[j];
+            alpha[i] = alpha[i] + delta;
+            alpha[j] = alpha[j] + delta;
+
+            if diff > zero {
+                if alpha[j] < zero {
+                    alpha[j] = zero;
+                    alpha[i] = diff;
+                }
+            } else if alpha[i] < zero {
+                alpha[i] = zero;
+                alpha[j] = -diff;
+            }
+            if diff > c_i - c_j {
+                if alpha[i] > c_i {
+                    alpha[i] = c_i;
+                    alpha[j] = c_i - diff;
+                }
+            } else if alpha[j] > c_j {
+                alpha[j] = c_j;
+                alpha[i] = c_j + diff;
+            }
+        } else {
+            let mut quad_coef = qd[i] + qd[j] - two * q_ij;
+            if quad_coef <= zero {
+                quad_coef = tau;
+            }
+            let delta = (grad[i] - grad[j]) / quad_coef;
+            let sum = alpha[i] + alpha[j];
+            alpha[i] = alpha[i] - delta;
+            alpha[j] = alpha[j] + delta;
+
+            if sum > c_i {
+                if alpha[i] > c_i {
+                    alpha[i] = c_i;
+                    alpha[j] = sum - c_i;
+                }
+            } else if alpha[j] < zero {
+                alpha[j] = zero;
+                alpha[i] = sum;
+            }
+            if sum > c_j {
+                if alpha[j] > c_j {
+                    alpha[j] = c_j;
+                    alpha[i] = sum - c_j;
+                }
+            } else if alpha[i] < zero {
+                alpha[i] = zero;
+                alpha[j] = sum;
+            }
+        }
+
+        // ---- Update gradient (svm.cpp:856-862) ----
+        let delta_alpha_i = alpha[i] - old_alpha_i;
+        let delta_alpha_j = alpha[j] - old_alpha_j;
+        #[allow(
+            clippy::needless_range_loop,
+            reason = "k indexes grad and is also the kernel column Q[k][i]/Q[k][j]"
+        )]
+        for k in 0..m {
+            let q_ki = q_entry(k, i, &mut cache);
+            let q_kj = q_entry(k, j, &mut cache);
+            grad[k] = grad[k] + q_ki * delta_alpha_i + q_kj * delta_alpha_j;
+        }
+    }
+
+    // ---- Solver_NU::calculate_rho (svm.cpp:1370-1418) ----
+    let mut nr_free1 = 0usize;
+    let mut nr_free2 = 0usize;
+    let mut ub1 = F::infinity();
+    let mut ub2 = F::infinity();
+    let mut lb1 = F::neg_infinity();
+    let mut lb2 = F::neg_infinity();
+    let mut sum_free1 = zero;
+    let mut sum_free2 = zero;
+
+    for i in 0..m {
+        let upper = is_upper(i, &alpha);
+        let lower = is_lower(i, &alpha);
+        if y[i] > zero {
+            if upper {
+                lb1 = lb1.max(grad[i]);
+            } else if lower {
+                ub1 = ub1.min(grad[i]);
+            } else {
+                nr_free1 += 1;
+                sum_free1 = sum_free1 + grad[i];
+            }
+        } else if upper {
+            lb2 = lb2.max(grad[i]);
+        } else if lower {
+            ub2 = ub2.min(grad[i]);
+        } else {
+            nr_free2 += 1;
+            sum_free2 = sum_free2 + grad[i];
+        }
+    }
+
+    let r1 = if nr_free1 > 0 {
+        sum_free1 / F::from(nr_free1).unwrap_or_else(F::one)
+    } else {
+        (ub1 + lb1) / two
+    };
+    let r2 = if nr_free2 > 0 {
+        sum_free2 / F::from(nr_free2).unwrap_or_else(F::one)
+    } else {
+        (ub2 + lb2) / two
+    };
+
+    NuResult {
+        alpha,
+        rho: (r1 - r2) / two,
+        r: (r1 + r2) / two,
+    }
+}
+
+/// The recovered nu-SVC binary sub-model: support vectors, their `dual_coef`
+/// values (`alpha_i·y_i/r`, libsvm's `sv_coef`), original indices, and the
+/// libsvm-internal bias `-rho/r` (so the decision function is
+/// `f(x) = Σ sv_coef·K(sv, x) - rho/r`).
+pub(crate) struct NuSvcModel<F> {
+    pub sv_data: Vec<Vec<F>>,
+    pub sv_coefs: Vec<F>,
+    pub sv_indices: Vec<usize>,
+    /// libsvm-internal bias term: `-rho/r`. Used directly as the `+1`-side
+    /// decision bias for the LOWER-index class (libsvm convention).
+    pub bias_internal: F,
+}
+
+/// Solve the libsvm **nu-SVC** dual for a single binary sub-problem
+/// (`solve_nu_svc`, `sklearn/svm/src/libsvm/svm.cpp:1646-1708`):
+/// `min 0.5 αᵀQα  s.t.  yᵀα=0, eᵀα=ν·l, 0≤α_i≤1`, `Q_ij=y_iy_jK`.
+///
+/// `data`/`labels` are the per-pair samples and signs (`+1` for the higher-index
+/// `class_pos`, `-1` for the lower-index `class_neg`, matching this crate's
+/// [`BinarySvm`] convention). The greedy `alpha` init (`svm.cpp:1667-1682`)
+/// fills each class up to `min(C_i, nu·l/2 − running_sum)`. After
+/// [`solver_nu_core`], libsvm rescales `alpha_i ← alpha_i·y_i/r` and
+/// `rho ← rho/r` (`svm.cpp:1696-1702`); the support-vector coefficient is
+/// `sv_coef = alpha·y/r` and the decision bias is `−rho/r`.
+///
+/// Returns `None` when `r ≈ 0` (degenerate — no usable rescale, e.g. a
+/// pathological all-bound solution), letting the caller surface a clean error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the solver + per-pair samples/labels + hyperparameters thread \
+              through one call mirroring libsvm's solve_nu_svc"
+)]
+pub(crate) fn solve_nu_svc<F: Float, K: Kernel<F>>(
+    data: &[Vec<F>],
+    labels: &[F],
+    kernel: &K,
+    nu: F,
+    tol: F,
+    max_iter: usize,
+    cache_size: usize,
+) -> Option<NuSvcModel<F>> {
+    let l = data.len();
+    let zero = F::zero();
+    let one = F::one();
+    let two = one + one;
+    // `C[i] = prob->W[i] = 1` (unit instance weights, `svm.cpp:1664`).
+    let c = vec![one; l];
+
+    // Greedy alpha init (`svm.cpp:1667-1682`): `nu_l = Σ nu·C[i] = nu·l`,
+    // `sum_pos = sum_neg = nu_l/2`, fill each class greedily up to `C[i]`.
+    let nu_l = nu * F::from(l).unwrap_or_else(F::zero);
+    let mut sum_pos = nu_l / two;
+    let mut sum_neg = nu_l / two;
+    let mut alpha = vec![zero; l];
+    for i in 0..l {
+        if labels[i] > zero {
+            alpha[i] = c[i].min(sum_pos);
+            sum_pos = sum_pos - alpha[i];
+        } else {
+            alpha[i] = c[i].min(sum_neg);
+            sum_neg = sum_neg - alpha[i];
+        }
+    }
+
+    let p = vec![zero; l]; // nu-SVC linear term is 0 (`zeros`, svm.cpp:1684).
+    let sample = |k: usize| k;
+    let res = solver_nu_core(
+        data, l, &sample, labels, &p, &c, alpha, kernel, tol, max_iter, cache_size,
+    );
+
+    let r = res.r;
+    if r.abs() <= F::from(1e-12).unwrap_or_else(F::epsilon) {
+        return None;
+    }
+
+    // libsvm: `alpha_i *= y_i / r`, `rho /= r` (`svm.cpp:1696-1702`).
+    // `sv_coef = alpha·y/r`; decision bias = `-rho/r`.
+    let eps_sv = F::from(1e-8).unwrap_or_else(F::epsilon);
+    let mut sv_data = Vec::new();
+    let mut sv_coefs = Vec::new();
+    let mut sv_indices = Vec::new();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "i indexes alpha, the sign labels[i], and the sample data[i] together"
+    )]
+    for i in 0..l {
+        let coef = res.alpha[i] * labels[i] / r;
+        if coef.abs() > eps_sv {
+            sv_data.push(data[i].clone());
+            sv_coefs.push(coef);
+            sv_indices.push(i);
+        }
+    }
+
+    Some(NuSvcModel {
+        sv_data,
+        sv_coefs,
+        sv_indices,
+        bias_internal: (res.rho / r).neg(),
+    })
+}
+
+/// The recovered nu-SVR model: prediction coefficients `α*−α` per sample,
+/// support indices, and the bias.
+pub(crate) struct NuSvrModel<F> {
+    pub sv_data: Vec<Vec<F>>,
+    pub sv_coefs: Vec<F>,
+    pub sv_indices: Vec<usize>,
+    /// Prediction bias: `f(x) = Σ coef·K(sv, x) + bias`. libsvm's decision
+    /// function is `Σ coef·K − rho`, so `bias = −rho`.
+    pub bias: F,
+}
+
+/// Solve the libsvm **nu-SVR** dual (`solve_nu_svr`,
+/// `sklearn/svm/src/libsvm/svm.cpp:1795-1839`): a `2l`-variable
+/// `(α, α*)` dual with the learned-tube `nu` constraint, both `nu` AND `C`
+/// used (`epsilon` is replaced by `nu`).
+///
+/// Variable layout (libsvm): `k < l` is `α*_k` with sign `+1` and linear term
+/// `−y_k`; `k ≥ l` is `α_{k−l}` with sign `−1` and linear term `+y_{k−l}`;
+/// `C_k = W·C` for all (`svm.cpp:1806-1824`). The greedy init fills both halves
+/// to `min(sum, C)` where `sum = (Σ C·nu)/2` (`svm.cpp:1814-1817`). After
+/// [`solver_nu_core`] the prediction coefficient is `coef_k = α*_k − α_k`
+/// (`svm.cpp:1832-1833`) and the bias is `−rho` (libsvm `f = Σ coef·K − rho`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the solver + samples/targets + (nu, C) + hyperparameters thread \
+              through one call mirroring libsvm's solve_nu_svr"
+)]
+pub(crate) fn solve_nu_svr<F: Float, K: Kernel<F>>(
+    data: &[Vec<F>],
+    targets: &[F],
+    kernel: &K,
+    nu: F,
+    c_param: F,
+    tol: F,
+    max_iter: usize,
+    cache_size: usize,
+) -> NuSvrModel<F> {
+    let l = data.len();
+    let m = 2 * l;
+    let zero = F::zero();
+    let one = F::one();
+    let two = one + one;
+
+    // `C[i] = C[i+l] = W·C` (`svm.cpp:1809`); `sum = (Σ C·nu)/2`.
+    let c = vec![c_param; m];
+    let mut sum = c_param * nu * F::from(l).unwrap_or_else(F::zero) / two;
+
+    let mut alpha = vec![zero; m];
+    let mut y = vec![zero; m];
+    let mut p = vec![zero; m];
+    for i in 0..l {
+        let a = sum.min(c[i]); // alpha2[i] = alpha2[i+l] = min(sum, C[i])
+        alpha[i] = a;
+        alpha[i + l] = a;
+        sum = sum - a;
+        p[i] = targets[i].neg(); // linear_term[i]   = -y_i
+        y[i] = one;
+        p[i + l] = targets[i]; // linear_term[i+l] = +y_i
+        y[i + l] = -one;
+    }
+
+    let sample = |k: usize| if k < l { k } else { k - l };
+    let res = solver_nu_core(
+        data, m, &sample, &y, &p, &c, alpha, kernel, tol, max_iter, cache_size,
+    );
+
+    // coef_i = alpha2[i] - alpha2[i+l] = α*_i - α_i (`svm.cpp:1832-1833`).
+    let eps_sv = F::from(1e-8).unwrap_or_else(F::epsilon);
+    let mut sv_data = Vec::new();
+    let mut sv_coefs = Vec::new();
+    let mut sv_indices = Vec::new();
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "i pairs alpha2[i] with alpha2[i+l] and indexes the sample data[i]"
+    )]
+    for i in 0..l {
+        let coef = res.alpha[i] - res.alpha[i + l];
+        if coef.abs() > eps_sv {
+            sv_data.push(data[i].clone());
+            sv_coefs.push(coef);
+            sv_indices.push(i);
+        }
+    }
+
+    NuSvrModel {
+        sv_data,
+        sv_coefs,
+        sv_indices,
+        bias: res.rho.neg(),
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
