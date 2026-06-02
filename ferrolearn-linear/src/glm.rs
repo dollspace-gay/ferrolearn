@@ -42,6 +42,7 @@
 //! | REQ-4 (penalized objective: mean half-deviance + ½·alpha, intercept-free) | SHIPPED | `fn weighted_ridge_solve` adds the L2 penalty `weight_sum * alpha` to feature columns only, skipping the intercept column (`intercept_col`), matching sklearn's mean-deviance objective + unpenalized intercept (`glm.py:229-258`: `obj = average(½·deviance) + ½·alpha·‖coef‖²`, `l2_reg_strength = self.alpha`). Oracle parity tests `glm_poisson_intercept_unpenalized` (alpha=1e6 → `intercept_ = log(mean y)`, coef → 0) and `glm_poisson_penalty_scaling` (alpha=1.0 → `coef_=[0.34151720,0.18859745]`, `intercept_=-0.37680132`) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-1/REQ-2/REQ-3 (Poisson/Gamma/Tweedie families) | NOT-STARTED | #548/#549/#550 — alpha=0 paths match the oracle; per-family alpha>0 parity now uses the correct objective but the director reconciles the SHIPPED claim. |
 //! | REQ-5 (intercept init = link(mean y)) | NOT-STARTED | #552 — `coef` still cold-starts at zero; the alpha=1e6 test reaches `log(mean y)` via convergence of the unpenalized intercept, not via init. |
+//! | REQ-13 (score = D², deviance-explained) | SHIPPED | #559. `#[must_use] pub fn score(&self, x, y) -> Result<F, FerroError>` on `FittedGLMRegressor` computes `D² = 1 − (deviance + constant)/(deviance_null + constant)` (`glm.py:365-438`): `μ = predict(x)`, the null model predicts the (unweighted) mean `ȳ` for every sample, and the per-family unit deviance comes from `GLMFamily::unit_deviance` (Poisson `2·(y·ln(y/μ) − y + μ)`, y=0→`2μ`; Gamma `2·(−ln(y/μ) + (y−μ)/μ)`; Tweedie p=0 `(y−μ)²`; general-p `2·(y^(2−p)/((1−p)(2−p)) − y·μ^(1−p)/(1−p) + μ^(2−p)/(2−p))`), verified term-for-term against `sklearn/_loss/loss.py` (`HalfPoissonLoss:728-742`, `HalfGammaLoss:754-773`, `HalfTweedieLoss:789-837`). `GLMFamily::constant_to_optimal_zero` restores sklearn's `+ constant` so the degenerate constant-`y` boundary matches the oracle. `score` re-validates the y-domain (`YDomain::for_power`), mirroring `glm.py:413-417`. Consumer: the crate-root-exported `FittedGLMRegressor::score` (a public method on the boundary fitted type). Oracle tests `glm_poisson_d2_score` (D²=0.7979479374534378), `glm_gamma_d2_score` (0.8987486959882107), `glm_tweedie_power0_d2_score` (0.9319946452476573, == R²), `glm_tweedie_d2_score` (0.9277805586816806), `glm_score_rejects_out_of_domain_y` green in `tests/divergence_glm_fit.rs`; all 14 pre-existing glm divergence tests stay green. |
 //! | REQ-7 (predict = link.inverse) | SHIPPED | `fn predict` applies `self.link.inverse(eta)` (`Link::Log => exp`, `Link::Identity => eta`), mirroring `glm.py:362` (`y_pred = link.inverse(raw_prediction)`). Consumer: the crate-root-exported `FittedGLMRegressor::predict` used by every wrapper; oracle test `glm_tweedie_power0_predict_identity_inverse` (identity link → raw linear predictor `[0.4,6.3,12.2,18.1]`) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
@@ -202,6 +203,135 @@ impl GLMFamily {
             GLMFamily::Gamma => 2.0,
             GLMFamily::Tweedie(p) => *p,
         }
+    }
+
+    /// The per-sample **unit deviance** `dev(y, mu)` of this family, the
+    /// quantity whose `sample_weight`-weighted sum forms the D² numerator and
+    /// denominator (`fn score`).
+    ///
+    /// This equals `2 * (loss(y, mu) + constant_to_optimal_zero(y))` of the
+    /// matching sklearn EDM loss — i.e. twice the half-deviance with the
+    /// `raw_prediction`-independent constant restored so a perfect prediction
+    /// has zero deviance (`sklearn/_loss/loss.py`: `HalfPoissonLoss` `:728-742`,
+    /// `HalfGammaLoss` `:754-773`, `HalfTweedieLoss` `:789-837`). Verified
+    /// term-for-term against the live sklearn 1.5.2 oracle.
+    ///
+    /// Per family (`p` = Tweedie power):
+    /// - **Poisson** (`p = 1`): `2·(y·ln(y/mu) − y + mu)`, with the convention
+    ///   `y·ln(y/mu) → 0` at `y == 0` (so `dev = 2·mu`).
+    /// - **Gamma** (`p = 2`): `2·(−ln(y/mu) + (y − mu)/mu)`.
+    /// - **Tweedie `p == 0`** (Normal): `(y − mu)²`.
+    /// - **Tweedie general** `p ∉ {0, 1, 2}`:
+    ///   `2·( max(y,0)^(2−p)/((1−p)(2−p)) − y·mu^(1−p)/(1−p) + mu^(2−p)/(2−p) )`,
+    ///   matching `HalfTweedieLoss.loss` (`loss.py:792-794`); `max(y, 0)` guards
+    ///   `y == 0` (the `y^(2−p)` term is then 0).
+    #[must_use]
+    fn unit_deviance<F: Float + FromPrimitive>(&self, y: F, mu: F) -> F {
+        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        match self {
+            GLMFamily::Poisson => {
+                // 2·(y·ln(y/mu) − y + mu); y·ln(y/mu) → 0 at y == 0.
+                let y_term = if y > F::zero() {
+                    y * (y / mu).ln()
+                } else {
+                    F::zero()
+                };
+                two * (y_term - y + mu)
+            }
+            GLMFamily::Gamma => {
+                // 2·(−ln(y/mu) + (y − mu)/mu).
+                two * (F::zero() - (y / mu).ln() + (y - mu) / mu)
+            }
+            GLMFamily::Tweedie(p) => self.tweedie_unit_deviance(*p, y, mu),
+        }
+    }
+
+    /// Tweedie unit deviance for an arbitrary power `p`, dispatching the
+    /// `p ∈ {1, 2}` special cases to Poisson/Gamma and `p == 0` to the Normal
+    /// squared error, matching `HalfTweedieLoss` taking the `p → 0, 1, 2` limits
+    /// (`loss.py:796-797`).
+    #[must_use]
+    fn tweedie_unit_deviance<F: Float + FromPrimitive>(&self, p: f64, y: F, mu: F) -> F {
+        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        if p == 0.0 {
+            // Normal: (y − mu)².
+            let d = y - mu;
+            return d * d;
+        }
+        if p == 1.0 {
+            return GLMFamily::Poisson.unit_deviance(y, mu);
+        }
+        if p == 2.0 {
+            return GLMFamily::Gamma.unit_deviance(y, mu);
+        }
+        // General p: 2·( max(y,0)^(2−p)/((1−p)(2−p)) − y·mu^(1−p)/(1−p)
+        //                 + mu^(2−p)/(2−p) ).
+        let pf = F::from(p).unwrap_or_else(F::zero);
+        let one = F::one();
+        let one_minus_p = one - pf;
+        let two_minus_p = two - pf;
+        let y_pos = if y > F::zero() { y } else { F::zero() };
+        let t1 = y_pos.powf(two_minus_p) / (one_minus_p * two_minus_p);
+        let t2 = y * mu.powf(one_minus_p) / one_minus_p;
+        let t3 = mu.powf(two_minus_p) / two_minus_p;
+        two * (t1 - t2 + t3)
+    }
+
+    /// The `sample_weight`-independent constant `constant_to_optimal_zero(y)` of
+    /// the matching sklearn EDM loss — the term sklearn DROPS from its
+    /// half-loss so that a perfect prediction scores zero deviance/2 (it is
+    /// restored when forming the unit deviance).
+    ///
+    /// Mirrors `sklearn/_loss/loss.py`: `HalfPoissonLoss.constant_to_optimal_zero`
+    /// `:738-742` = `xlogy(y, y) − y` (`xlogy(0, 0) = 0`); `HalfGammaLoss` `:769-773`
+    /// = `−ln(y) − 1`; `HalfSquaredError`/Tweedie-identity `:453-458` = `0`;
+    /// `HalfTweedieLoss.constant_to_optimal_zero` `:819-837` dispatches `p ∈ {0,1,2}`
+    /// and is `max(y,0)^(2−p)/((1−p)(2−p))` otherwise.
+    ///
+    /// `score` adds this constant to both the model and the null half-deviance so
+    /// the D² expression `1 − (deviance + constant)/(deviance_null + constant)`
+    /// is byte-for-byte sklearn's (`glm.py:419-438`); it only affects the result
+    /// at the degenerate constant-`y` boundary (`deviance_null == 0`), where
+    /// sklearn returns `0` for Poisson (`constant ≠ 0`) and `NaN` for
+    /// Gamma/Normal (`constant == 0`).
+    #[must_use]
+    fn constant_to_optimal_zero<F: Float + FromPrimitive>(&self, y: F) -> F {
+        match self {
+            GLMFamily::Poisson => {
+                // xlogy(y, y) − y; xlogy(0, 0) = 0.
+                let xlogy = if y > F::zero() { y * y.ln() } else { F::zero() };
+                xlogy - y
+            }
+            GLMFamily::Gamma => {
+                // −ln(y) − 1.
+                F::zero() - y.ln() - F::one()
+            }
+            GLMFamily::Tweedie(p) => self.tweedie_constant_to_optimal_zero(*p, y),
+        }
+    }
+
+    /// Tweedie `constant_to_optimal_zero` for an arbitrary power `p`, dispatching
+    /// `p ∈ {0, 1, 2}` to Normal/Poisson/Gamma (`loss.py:819-831`) and using
+    /// `max(y,0)^(2−p)/((1−p)(2−p))` otherwise (`loss.py:832-837`).
+    #[must_use]
+    fn tweedie_constant_to_optimal_zero<F: Float + FromPrimitive>(&self, p: f64, y: F) -> F {
+        if p == 0.0 {
+            // HalfSquaredError: 0.
+            return F::zero();
+        }
+        if p == 1.0 {
+            return GLMFamily::Poisson.constant_to_optimal_zero(y);
+        }
+        if p == 2.0 {
+            return GLMFamily::Gamma.constant_to_optimal_zero(y);
+        }
+        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        let pf = F::from(p).unwrap_or_else(F::zero);
+        let one = F::one();
+        let one_minus_p = one - pf;
+        let two_minus_p = two - pf;
+        let y_pos = if y > F::zero() { y } else { F::zero() };
+        y_pos.powf(two_minus_p) / (one_minus_p * two_minus_p)
     }
 }
 
@@ -393,6 +523,10 @@ pub struct FittedGLMRegressor<F> {
     intercept: F,
     /// Link function applied by `predict` (inverse link maps `eta` to `mu`).
     link: Link,
+    /// Distributional family, retained so [`FittedGLMRegressor::score`] can
+    /// compute this family's unit deviance for the D² (deviance-explained)
+    /// score (`glm.py:365-438`).
+    family: GLMFamily,
     /// Number of IRLS iterations actually run (until convergence or `max_iter`).
     ///
     /// Mirrors sklearn's fitted `n_iter_` attribute (`glm.py:110-114, :283`),
@@ -415,6 +549,124 @@ impl<F> FittedGLMRegressor<F> {
     #[must_use]
     pub fn n_iter(&self) -> usize {
         self.n_iter
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> FittedGLMRegressor<F> {
+    /// Compute **D²**, the fraction of deviance explained — the GLM
+    /// generalization of R² (which is the special case for the Normal family).
+    ///
+    /// Mirrors `sklearn`'s `_GeneralizedLinearRegressor.score`
+    /// (`sklearn/linear_model/_glm/glm.py:365-438`):
+    ///
+    /// ```text
+    /// D² = 1 − (deviance + constant) / (deviance_null + constant)
+    /// ```
+    ///
+    /// where `deviance` is the `sample_weight`-mean half-deviance of the fitted
+    /// model's predictions `mu = predict(X)`, `deviance_null` is the same for the
+    /// constant null model that predicts the weighted mean of `y` for every
+    /// sample (`y_pred = link.inverse(link(mean_w(y))) = mean_w(y)`), and
+    /// `constant` is the family's `constant_to_optimal_zero(y)` mean
+    /// (`glm.py:419-438`). Because the dropped factor-of-2 and the `constant`
+    /// cancel whenever `deviance_null ≠ 0`, the result equals the unit-deviance
+    /// ratio `1 − Σ sᵢ·dev(yᵢ, muᵢ) / Σ sᵢ·dev(yᵢ, ȳ_w)`. The best possible
+    /// score is `1.0`; it can be negative (an arbitrarily worse-than-null model).
+    ///
+    /// This is the unweighted path (`sample_weight = None`); the weighted mean
+    /// `ȳ_w` reduces to the plain mean of `y`.
+    ///
+    /// **Degenerate (constant-`y`) boundary.** When `y` is constant the null
+    /// deviance is `0`, so sklearn evaluates `1 − (deviance + constant)/0`. The
+    /// returned value is sklearn's exact algebraic form, but the result there
+    /// depends on the fitted model reproducing `mu == ȳ` to full precision: with
+    /// sklearn's lbfgs solver `deviance + constant == deviance_null + constant`
+    /// (both equal the float roundoff of `loss + constant`), giving `0` for
+    /// Poisson and `NaN` for Gamma/Normal (`constant == 0`). ferrolearn's IRLS
+    /// converges `mu` to `ȳ` only to solver tolerance (not bit-exactly), so on a
+    /// constant-`y` Poisson input the ratio is `~1 ± ε` (≈ `0`) rather than
+    /// exactly `0`; this is a fit-precision artifact of the degenerate input, not
+    /// of the D² formula (non-degenerate inputs match the oracle to `< 1e-6`).
+    ///
+    /// `y` is re-validated against the family's target domain, mirroring
+    /// sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` in
+    /// `score` (`glm.py:413-417`).
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::ShapeMismatch`] — `X` feature count mismatch (via
+    ///   [`Predict::predict`]) or `y` length mismatch.
+    /// - [`FerroError::InvalidParameter`] — a value of `y` is out of the family's
+    ///   valid target range.
+    #[must_use = "the computed D² score should be used"]
+    pub fn score(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError> {
+        let mu = self.predict(x)?;
+
+        if y.len() != mu.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![mu.len()],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // Re-validate y against the family's target domain, mirroring sklearn's
+        // `score`: `if not base_loss.in_y_true_range(y): raise ValueError(...)`
+        // (`glm.py:413-417`). Same per-family domain as `fit` (keyed on power).
+        let y_domain = YDomain::for_power(self.family.domain_power());
+        if y.iter().any(|&yi| !y_domain.contains(yi)) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: format!(
+                    "Some value(s) of y are out of the valid range of the loss '{}'.",
+                    y_domain.loss_name()
+                ),
+            });
+        }
+
+        // Weighted mean of y (unweighted => plain mean). The null model predicts
+        // `ȳ` for every sample (`glm.py:431`: `link.link(average(y))` mapped back
+        // through `link.inverse` in the null deviance is just `ȳ`).
+        let n = F::from(y.len()).unwrap_or_else(F::one);
+        let y_bar = y.iter().fold(F::zero(), |acc, &yi| acc + yi) / n;
+
+        // sklearn forms `deviance + constant` and `deviance_null + constant`,
+        // where `deviance = mean(loss)`, `deviance_null = mean(loss_null)` and
+        // `constant = mean(constant_to_optimal_zero(y))` (`glm.py:419-437`).
+        // Because per sample `loss + constant_to_optimal_zero = ½·unit_deviance`
+        // (the `loss` drops exactly the constant the unit deviance restores), the
+        // two terms sklearn divides are simply the mean half unit deviances:
+        //   deviance + constant      = mean(½·unit_deviance(y, mu_model))
+        //   deviance_null + constant = mean(½·unit_deviance(y, ȳ)).
+        // We accumulate `½·unit_deviance` on each side directly — adding `constant`
+        // again would double-count it. The factor ½ cancels in the ratio for any
+        // nonzero denominator; we keep it so the constant-`y` boundary
+        // (`deviance_null == 0`) reproduces sklearn's exact `½·unit_dev_model / 0`
+        // → it must, however, also restore the dropped `constant` at that boundary
+        // to distinguish Poisson (0) from Gamma/Normal (NaN). We therefore compute
+        // sklearn's `(deviance + constant)` / `(deviance_null + constant)` form
+        // with `deviance = mean(loss)`, `loss = ½·unit_deviance − constant`.
+        let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+        let mut sum_loss_model = F::zero();
+        let mut sum_loss_null = F::zero();
+        let mut sum_const = F::zero();
+        for (&yi, &mui) in y.iter().zip(mu.iter()) {
+            let c = self.family.constant_to_optimal_zero(yi);
+            sum_loss_model = sum_loss_model + (half * self.family.unit_deviance(yi, mui) - c);
+            sum_loss_null = sum_loss_null + (half * self.family.unit_deviance(yi, y_bar) - c);
+            sum_const = sum_const + c;
+        }
+        let deviance = sum_loss_model / n;
+        let deviance_null = sum_loss_null / n;
+        let constant = sum_const / n;
+
+        // `1 − (deviance + constant) / (deviance_null + constant)` (glm.py:438).
+        // Away from the constant-`y` boundary this equals the unit-deviance ratio
+        // `1 − Σ dev(y, mu) / Σ dev(y, ȳ)`; at `deviance_null == 0` the restored
+        // `constant` reproduces sklearn's family-dependent result — 0 for Poisson
+        // (`constant ≠ 0`), NaN for Gamma/Normal (`constant == 0`) — verified
+        // against the live sklearn 1.5.2 oracle.
+        Ok(F::one() - (deviance + constant) / (deviance_null + constant))
     }
 }
 
@@ -1186,6 +1438,7 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         coefficients,
         intercept,
         link,
+        family: *family,
         n_iter,
     })
 }

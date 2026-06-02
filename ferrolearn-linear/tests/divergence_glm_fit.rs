@@ -679,3 +679,178 @@ fn glm_gamma_sample_weight() {
         fitted.intercept()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #559 — D² deviance `score`. sklearn's `_GeneralizedLinearRegressor.score`
+// returns D² = 1 − (deviance + constant) / (deviance_null + constant), the
+// fraction of (family) deviance explained — the GLM generalization of R²
+// (`glm.py:365-438`). The null model predicts the (weighted) mean of y.
+// ferrolearn's `FittedGLMRegressor::score` computes the same per-family unit
+// deviance (`GLMFamily::unit_deviance`, verified term-for-term against
+// `sklearn._loss.loss`) and replicates the `+ constant` algebra
+// (`GLMFamily::constant_to_optimal_zero`). GLM fitting is deterministic, so for
+// the same fit config the fitted model — and hence D² — matches the live
+// sklearn 1.5.2 oracle.
+// ---------------------------------------------------------------------------
+
+/// `PoissonRegressor(alpha=0.5).score(X, y)` == live sklearn D² (#559).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:365-438`
+///   D² = 1 − (deviance + constant) / (deviance_null + constant), Poisson unit
+///   deviance `2·(y·ln(y/mu) − y + mu)` (`sklearn/_loss/loss.py:728-742`).
+///
+/// ferrolearn site: `ferrolearn-linear/src/glm.rs`
+///   `FittedGLMRegressor::score` → `GLMFamily::unit_deviance` (Poisson arm).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.score(X,y)))"
+/// # -> 0.7979479374534378
+/// ```
+#[test]
+fn glm_poisson_d2_score() {
+    const SK_D2: f64 = 0.797_947_937_453_437_8;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let d2 = fitted.score(&x, &y).expect("score");
+    assert!(
+        (d2 - SK_D2).abs() < 1e-6,
+        "Poisson D²: sklearn {SK_D2}, ferrolearn {d2}"
+    );
+}
+
+/// `GammaRegressor(alpha=0.5).score(X, y)` == live sklearn D², y>0 (#559).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:365-438`; Gamma unit deviance
+///   `2·(−ln(y/mu) + (y − mu)/mu)` (`sklearn/_loss/loss.py:754-773`).
+///
+/// ferrolearn site: `FittedGLMRegressor::score` → `GLMFamily::unit_deviance`
+///   (Gamma arm).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import GammaRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([1.,2.,3.,4.,5.]); \
+///   m=GammaRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.score(X,y)))"
+/// # -> 0.8987486959882107
+/// ```
+#[test]
+fn glm_gamma_d2_score() {
+    const SK_D2: f64 = 0.898_748_695_988_210_7;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let fitted = GammaRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let d2 = fitted.score(&x, &y).expect("score");
+    assert!(
+        (d2 - SK_D2).abs() < 1e-6,
+        "Gamma D²: sklearn {SK_D2}, ferrolearn {d2}"
+    );
+}
+
+/// `TweedieRegressor(power=0).score(X, y)` == live sklearn D² == R² (#559).
+///
+/// For `power = 0` (Normal, identity link) the Tweedie unit deviance is
+/// `(y − mu)²`, so D² coincides exactly with the coefficient of determination
+/// R² (`sklearn/_loss/loss.py:792-797` `p → 0` limit; `glm.py:368-369`
+/// "D² is a generalization of R²").
+///
+/// ferrolearn site: `FittedGLMRegressor::score` → `GLMFamily::unit_deviance`
+///   (Tweedie `p == 0` arm = squared error).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import TweedieRegressor; \
+///   from sklearn.metrics import r2_score; \
+///   X=np.array([[1.],[2.],[3.],[4.]]); y=np.array([2.,5.,10.,20.]); \
+///   m=TweedieRegressor(power=0.0,alpha=0.0,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.score(X,y)), repr(r2_score(y, m.predict(X))))"
+/// # -> 0.9319946452476573 0.9319946452476573   (D² == R²)
+/// ```
+#[test]
+fn glm_tweedie_power0_d2_score() {
+    const SK_D2: f64 = 0.931_994_645_247_657_3;
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = Array1::from(vec![2.0, 5.0, 10.0, 20.0]);
+    let fitted = TweedieRegressor::<f64>::new()
+        .with_power(0.0)
+        .with_alpha(0.0)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let d2 = fitted.score(&x, &y).expect("score");
+    assert!(
+        (d2 - SK_D2).abs() < 1e-6,
+        "Tweedie(power=0) D² (== R²): sklearn {SK_D2}, ferrolearn {d2}"
+    );
+}
+
+/// `TweedieRegressor(power=1.5).score(X, y)` == live sklearn D², log link (#559).
+///
+/// Exercises the general-`p` Tweedie unit deviance
+/// `2·( y^(2−p)/((1−p)(2−p)) − y·mu^(1−p)/(1−p) + mu^(2−p)/(2−p) )`
+/// (`sklearn/_loss/loss.py:789-837`), `p ∉ {0,1,2}`.
+///
+/// ferrolearn site: `FittedGLMRegressor::score` → `GLMFamily::unit_deviance`
+///   (Tweedie general-`p` arm).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import TweedieRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([1.,2.,3.,4.,5.]); \
+///   m=TweedieRegressor(power=1.5,alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.score(X,y)))"
+/// # -> 0.9277805586816806
+/// ```
+#[test]
+fn glm_tweedie_d2_score() {
+    const SK_D2: f64 = 0.927_780_558_681_680_6;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let fitted = TweedieRegressor::<f64>::new()
+        .with_power(1.5)
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let d2 = fitted.score(&x, &y).expect("score");
+    assert!(
+        (d2 - SK_D2).abs() < 1e-6,
+        "Tweedie(power=1.5) D²: sklearn {SK_D2}, ferrolearn {d2}"
+    );
+}
+
+/// `score` re-validates the y-domain: Gamma rejects `y == 0` in `score`, mirroring
+/// sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` in
+/// `score` (`glm.py:413-417`).
+#[test]
+fn glm_score_rejects_out_of_domain_y() {
+    let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+    let y_ok = Array1::from(vec![1.0, 2.0, 3.0]);
+    let fitted = GammaRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .fit(&x, &y_ok)
+        .expect("fit");
+    // y with 0.0 is out of the Gamma domain (0 < y) — score must Err, like sklearn.
+    let y_bad = Array1::from(vec![0.0, 2.0, 3.0]);
+    assert!(
+        fitted.score(&x, &y_bad).is_err(),
+        "score must re-validate y-domain (glm.py:413-417): Gamma rejects y==0"
+    );
+}
