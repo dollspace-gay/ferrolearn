@@ -45,6 +45,7 @@
 //! | REQ-7 (predict = link.inverse) | SHIPPED | `fn predict` applies `self.link.inverse(eta)` (`Link::Log => exp`, `Link::Identity => eta`), mirroring `glm.py:362` (`y_pred = link.inverse(raw_prediction)`). Consumer: the crate-root-exported `FittedGLMRegressor::predict` used by every wrapper; oracle test `glm_tweedie_power0_predict_identity_inverse` (identity link → raw linear predictor `[0.4,6.3,12.2,18.1]`) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
+//! | REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`, where the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance objective normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector, so the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` (coef `[0.35738828,0.19717462]`, int `-0.43719203`) and `glm_gamma_sample_weight` (coef `[0.23049054,0.11350454]`, int `0.41955357`) green in `tests/divergence_glm_fit.rs`; the 8 pre-existing unweighted oracle tests stay green. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -257,6 +258,43 @@ impl<F: Float + FromPrimitive> GLMRegressor<F> {
     }
 }
 
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> GLMRegressor<F> {
+    /// Fit the GLM via IRLS with per-sample weights `sample_weight`.
+    ///
+    /// Mirrors sklearn's `fit(X, y, sample_weight)` (`glm.py:170`,
+    /// `:229-242`): the deviance term is a `sample_weight`-weighted average
+    /// (normalized by `S = sum_i s_i`), so the IRLS `W` diagonal becomes
+    /// `s_i * w_irls,i` and the L2 penalty scales with `S`. The working
+    /// response `z_i` is unchanged per sample. Passing an all-ones weight
+    /// vector reproduces [`Fit::fit`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::ShapeMismatch`] — `sample_weight.len() != n_samples`,
+    ///   or `y` length mismatch.
+    /// - [`FerroError::InvalidParameter`] — a negative sample weight, negative
+    ///   alpha, or (log link) negative `y`.
+    /// - [`FerroError::InsufficientSamples`] — zero samples.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedGLMRegressor<F>, FerroError> {
+        fit_glm_irls(
+            x,
+            y,
+            sample_weight,
+            &self.family,
+            Link::Log,
+            self.alpha,
+            self.max_iter,
+            self.tol,
+            self.fit_intercept,
+        )
+    }
+}
+
 /// Fitted GLM regressor.
 ///
 /// Stores the learned coefficients and intercept on the link scale, together
@@ -346,6 +384,37 @@ impl<F: Float + FromPrimitive> Default for PoissonRegressor<F> {
     }
 }
 
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> PoissonRegressor<F> {
+    /// Fit the Poisson GLM via IRLS with per-sample weights `sample_weight`.
+    ///
+    /// Mirrors sklearn's `PoissonRegressor.fit(X, y, sample_weight)`
+    /// (`glm.py:170`, `:229-242`). See
+    /// [`GLMRegressor::fit_with_sample_weight`] for the weighting semantics;
+    /// an all-ones weight vector reproduces [`Fit::fit`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// See [`GLMRegressor::fit_with_sample_weight`].
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedGLMRegressor<F>, FerroError> {
+        fit_glm_irls(
+            x,
+            y,
+            sample_weight,
+            &GLMFamily::Poisson,
+            Link::Log,
+            self.alpha,
+            self.max_iter,
+            self.tol,
+            self.fit_intercept,
+        )
+    }
+}
+
 /// Gamma regressor — GLM with Gamma family and log link.
 ///
 /// Suitable for modelling positive continuous data (y > 0).
@@ -412,6 +481,37 @@ impl<F: Float + FromPrimitive> GammaRegressor<F> {
 impl<F: Float + FromPrimitive> Default for GammaRegressor<F> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> GammaRegressor<F> {
+    /// Fit the Gamma GLM via IRLS with per-sample weights `sample_weight`.
+    ///
+    /// Mirrors sklearn's `GammaRegressor.fit(X, y, sample_weight)`
+    /// (`glm.py:170`, `:229-242`). See
+    /// [`GLMRegressor::fit_with_sample_weight`] for the weighting semantics;
+    /// an all-ones weight vector reproduces [`Fit::fit`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// See [`GLMRegressor::fit_with_sample_weight`].
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedGLMRegressor<F>, FerroError> {
+        fit_glm_irls(
+            x,
+            y,
+            sample_weight,
+            &GLMFamily::Gamma,
+            Link::Log,
+            self.alpha,
+            self.max_iter,
+            self.tol,
+            self.fit_intercept,
+        )
     }
 }
 
@@ -510,6 +610,39 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
 impl<F: Float + FromPrimitive> Default for TweedieRegressor<F> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> TweedieRegressor<F> {
+    /// Fit the Tweedie GLM via IRLS with per-sample weights `sample_weight`.
+    ///
+    /// Mirrors sklearn's `TweedieRegressor.fit(X, y, sample_weight)`
+    /// (`glm.py:170`, `:229-242`). The link is resolved from `link`/`power`
+    /// as in [`Fit::fit`] (`glm.py:889-903`); see
+    /// [`GLMRegressor::fit_with_sample_weight`] for the weighting semantics.
+    /// An all-ones weight vector reproduces [`Fit::fit`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// See [`GLMRegressor::fit_with_sample_weight`].
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedGLMRegressor<F>, FerroError> {
+        let link = self.link.resolve(self.power);
+        fit_glm_irls(
+            x,
+            y,
+            sample_weight,
+            &GLMFamily::Tweedie(self.power),
+            link,
+            self.alpha,
+            self.max_iter,
+            self.tol,
+            self.fit_intercept,
+        )
     }
 }
 
@@ -652,9 +785,9 @@ fn gaussian_solve<F: Float>(
 /// is `weight_sum * alpha`, applied to feature columns only, leaving the
 /// intercept (column 0 of the augmented design, when present) unpenalized.
 ///
-/// `weight_sum` is the sum of the GLM `sample_weight` (= `n_samples` for the
-/// unweighted case implemented here); `intercept_col` is `Some(0)` when an
-/// intercept column was prepended to `x`, `None` otherwise.
+/// `weight_sum` is `S = sum_i s_i`, the sum of the GLM `sample_weight`
+/// (= `n_samples` for an all-ones / unweighted fit); `intercept_col` is
+/// `Some(0)` when an intercept column was prepended to `x`, `None` otherwise.
 fn weighted_ridge_solve<F: Float + FromPrimitive>(
     x: &Array2<F>,
     z: &Array1<F>,
@@ -715,6 +848,7 @@ fn weighted_ridge_solve<F: Float + FromPrimitive>(
 fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
     x: &Array2<F>,
     y: &Array1<F>,
+    sample_weight: &Array1<F>,
     family: &GLMFamily,
     link: Link,
     alpha: F,
@@ -730,6 +864,25 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
             actual: vec![y.len()],
             context: "y length must match number of samples in X".into(),
         });
+    }
+
+    if sample_weight.len() != n_samples {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![sample_weight.len()],
+            context: "sample_weight length must match number of samples in X".into(),
+        });
+    }
+
+    // sklearn validates sample weights are non-negative
+    // (`_check_sample_weight`, `glm.py:211`).
+    for &si in sample_weight.iter() {
+        if si < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "sample weights must be non-negative".into(),
+            });
+        }
     }
 
     if n_samples == 0 {
@@ -786,13 +939,12 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
     // excluded from the L2 penalty, matching sklearn (glm.py:258).
     let intercept_col = if fit_intercept { Some(0) } else { None };
 
-    // Sum of sample weights. Unweighted GLM => every weight is 1, so this is
-    // `n_samples`. It scales the L2 penalty so the summed-deviance IRLS normal
-    // equations minimize sklearn's mean-deviance objective (glm.py:229-242).
-    let weight_sum = F::from(n_samples).unwrap_or_else(|| {
-        // n_samples >= 1 was checked above; fall back by accumulating ones.
-        (0..n_samples).fold(F::zero(), |acc, _| acc + F::one())
-    });
+    // Sum of sample weights `S = sum_i s_i`. For an unweighted GLM every weight
+    // is 1, so this is `n_samples` (byte-identical to the previous unweighted
+    // path). It scales the L2 penalty so the summed-deviance IRLS normal
+    // equations minimize sklearn's mean-deviance objective normalized by
+    // `sum(sample_weight)` (glm.py:229-242).
+    let weight_sum = sample_weight.iter().fold(F::zero(), |acc, &si| acc + si);
 
     // For the log link, clamp y away from 0 so `ln(y)` and `mu` stay finite.
     // For the identity link y is used as-is (mu = eta = y, no positivity
@@ -848,16 +1000,23 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
                     weights[i] = dmu_deta * dmu_deta / var_i;
                 }
             }
-            // Clamp weight.
+            // Clamp the Fisher (GLM) working weight.
             if weights[i] < min_mu {
                 weights[i] = min_mu;
             }
+            // Apply the per-sample weight `s_i`: the `W` diagonal entry for
+            // sample i becomes `s_i * w_irls,i` (standard weighted IRLS).
+            // sklearn weights the deviance average by `sample_weight`
+            // (glm.py:229-242); the working response `z_i` is unchanged. For
+            // all-ones weights this is a no-op (byte-identical unweighted path).
+            weights[i] = weights[i] * sample_weight[i];
         }
 
-        // Solve weighted ridge. `weight_sum` = sum of sample weights (= n_samples
-        // for the unweighted case); the penalty is scaled by it so the
-        // summed-deviance normal equations minimize sklearn's mean-deviance
-        // objective (glm.py:229-242). The intercept column (column 0 of the
+        // Solve weighted ridge. `weights` now carry `s_i * w_irls,i`;
+        // `weight_sum = S = sum_i s_i` (= n_samples for an all-ones fit). The
+        // penalty is scaled by `S` so the summed-deviance normal equations
+        // minimize sklearn's sample-weight-averaged deviance objective
+        // (glm.py:229-242). The intercept column (column 0 of the
         // augmented design, present iff `fit_intercept`) is left unpenalized
         // (glm.py:258, `l2_reg_strength = self.alpha` weighs only `||coef||^2`).
         coef = weighted_ridge_solve(&x_design, &z, &weights, alpha, weight_sum, intercept_col)?;
@@ -932,17 +1091,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // GLMRegressor's families are all log-link (Poisson/Gamma/Tweedie>0).
         // The Tweedie identity link is exposed only through TweedieRegressor's
         // `link` configuration (sklearn similarly only exposes `link` on
-        // `TweedieRegressor`, `glm.py:861`).
-        fit_glm_irls(
-            x,
-            y,
-            &self.family,
-            Link::Log,
-            self.alpha,
-            self.max_iter,
-            self.tol,
-            self.fit_intercept,
-        )
+        // `TweedieRegressor`, `glm.py:861`). The default (no sample_weight) path
+        // delegates with an all-ones weight vector, matching sklearn's
+        // `_check_sample_weight` default (`glm.py:208-211`); `weight_sum` then
+        // equals `n_samples`, so this is byte-identical to the unweighted fit.
+        self.fit_with_sample_weight(x, y, &Array1::ones(x.nrows()))
     }
 }
 
@@ -963,16 +1116,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// See [`GLMRegressor::fit`].
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedGLMRegressor<F>, FerroError> {
         // Poisson uses the log link only (`HalfPoissonLoss`, `glm.py:589-590`).
-        fit_glm_irls(
-            x,
-            y,
-            &GLMFamily::Poisson,
-            Link::Log,
-            self.alpha,
-            self.max_iter,
-            self.tol,
-            self.fit_intercept,
-        )
+        // Default (no sample_weight) path: all-ones weights => byte-identical to
+        // the unweighted fit (`weight_sum = n_samples`).
+        self.fit_with_sample_weight(x, y, &Array1::ones(x.nrows()))
     }
 }
 
@@ -993,16 +1139,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// See [`GLMRegressor::fit`].
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedGLMRegressor<F>, FerroError> {
         // Gamma uses the log link only (`HalfGammaLoss`, `glm.py:721-722`).
-        fit_glm_irls(
-            x,
-            y,
-            &GLMFamily::Gamma,
-            Link::Log,
-            self.alpha,
-            self.max_iter,
-            self.tol,
-            self.fit_intercept,
-        )
+        // Default (no sample_weight) path: all-ones weights => byte-identical to
+        // the unweighted fit (`weight_sum = n_samples`).
+        self.fit_with_sample_weight(x, y, &Array1::ones(x.nrows()))
     }
 }
 
@@ -1025,17 +1164,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // Resolve the link from the configuration and Tweedie power, mirroring
         // `TweedieRegressor._get_loss` (`glm.py:889-903`): `auto` selects
         // identity for `power <= 0` (Normal/OLS) and log for `power > 0`.
-        let link = self.link.resolve(self.power);
-        fit_glm_irls(
-            x,
-            y,
-            &GLMFamily::Tweedie(self.power),
-            link,
-            self.alpha,
-            self.max_iter,
-            self.tol,
-            self.fit_intercept,
-        )
+        // Default (no sample_weight) path: all-ones weights => byte-identical to
+        // the unweighted fit (`weight_sum = n_samples`).
+        self.fit_with_sample_weight(x, y, &Array1::ones(x.nrows()))
     }
 }
 

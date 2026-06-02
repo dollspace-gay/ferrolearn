@@ -425,3 +425,100 @@ fn glm_tweedie_alpha_half_parity() {
         fitted.intercept()
     );
 }
+
+// ---------------------------------------------------------------------------
+// #558 — sample_weight support. sklearn weights the per-sample deviance by
+// `sample_weight` and normalizes the objective by `sum(sample_weight)`
+// (glm.py:229-242). ferrolearn's `fit_with_sample_weight` multiplies the IRLS
+// `W` diagonal by `s_i` and scales the L2 penalty by `S = sum_i s_i`. A
+// non-uniform weight vector shifts `coef_`/`intercept_`; full parity is testable
+// (deterministic objective). Verified against the live sklearn 1.5.2 oracle.
+// ---------------------------------------------------------------------------
+
+/// `PoissonRegressor(alpha=0.5).fit(X, y, sample_weight=w)` full parity (#558).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:229-242`
+///   the data term is `average(½·deviance, weights=sample_weight)`, normalized
+///   by `S = sum(sample_weight)`; in the IRLS normal equations the effective
+///   per-sample weight is `s_i · w_irls,i` and the penalty scales with `S`.
+///
+/// ferrolearn site: `ferrolearn-linear/src/glm.rs`
+///   `PoissonRegressor::fit_with_sample_weight` → `fn fit_glm_irls`
+///   (`weights[i] = weights[i] * sample_weight[i]`, `weight_sum = Σ s_i`).
+///
+/// Non-uniform weights (not all equal) so the weighting is actually exercised.
+///
+/// Oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   w=np.array([1.,2.,0.5,1.5,3.]); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y,sample_weight=w); \
+///   print(repr(m.coef_.tolist()), repr(m.intercept_))"
+/// # -> [0.3573882843613702, 0.19717461697342614] -0.4371920273289445
+/// ```
+#[test]
+fn glm_poisson_sample_weight() {
+    const SK_COEF: [f64; 2] = [0.357_388_284_361_370_2, 0.197_174_616_973_426_14];
+    const SK_INTERCEPT: f64 = -0.437_192_027_328_944_5;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    let w = Array1::from(vec![1.0, 2.0, 0.5, 1.5, 3.0]);
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit_with_sample_weight(&x, &y, &w)
+        .expect("weighted fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+        "Poisson sample_weight: sklearn coef {SK_COEF:?}, ferrolearn {coef:?}"
+    );
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "Poisson sample_weight: sklearn intercept {SK_INTERCEPT}, ferrolearn {}",
+        fitted.intercept()
+    );
+}
+
+/// `GammaRegressor(alpha=0.5).fit(X, y, sample_weight=w)` full parity, y>0 (#558).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:229-242` (same weighting as
+/// Poisson above; Gamma uses `V(mu)=mu^2`, log link).
+///
+/// ferrolearn site: `GammaRegressor::fit_with_sample_weight` → `fn fit_glm_irls`.
+///
+/// Oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import GammaRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([1.,2.,3.,4.,5.]); \
+///   w=np.array([1.,2.,0.5,1.5,3.]); \
+///   m=GammaRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y,sample_weight=w); \
+///   print(repr(m.coef_.tolist()), repr(m.intercept_))"
+/// # -> [0.23049053907808104, 0.1135045392820989] 0.4195535739122035
+/// ```
+#[test]
+fn glm_gamma_sample_weight() {
+    const SK_COEF: [f64; 2] = [0.230_490_539_078_081_04, 0.113_504_539_282_098_9];
+    const SK_INTERCEPT: f64 = 0.419_553_573_912_203_5;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![1.0, 2.0, 3.0, 4.0, 5.0]);
+    let w = Array1::from(vec![1.0, 2.0, 0.5, 1.5, 3.0]);
+    let fitted = GammaRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit_with_sample_weight(&x, &y, &w)
+        .expect("weighted fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4 && (coef[1] - SK_COEF[1]).abs() < 1e-4,
+        "Gamma sample_weight: sklearn coef {SK_COEF:?}, ferrolearn {coef:?}"
+    );
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "Gamma sample_weight: sklearn intercept {SK_INTERCEPT}, ferrolearn {}",
+        fitted.intercept()
+    );
+}

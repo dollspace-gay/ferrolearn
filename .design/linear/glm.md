@@ -33,9 +33,9 @@ GLM objective both reach the same minimizer. The divergences are in **the
 objective ferrolearn's normal equations actually minimize** (penalty scaling and
 intercept penalization), the **always-log link** (TweedieRegressor identity-link
 cases), the **default Tweedie power**, and the absence of `solver`, `link`,
-`warm_start`, `sample_weight`, `score` (D²), `n_iter_`, and the ferray
-substrate. No `coef_`/`intercept_` value is pinned against the sklearn oracle in
-any current test, so per-family numerical parity cannot be claimed SHIPPED.
+`warm_start`, `score` (D²), `n_iter_`, and the ferray
+substrate. (`sample_weight` is now supported via `fit_with_sample_weight` —
+REQ-12 SHIPPED; see the REQ-status table.)
 
 ## Algorithm (sklearn — the contract)
 
@@ -244,7 +244,7 @@ be SHIPPED (R-HONEST-3: honest underclaim over unverified overclaim).
 | REQ-9 (default params; Tweedie power=0.0) | SHIPPED | #555. `fn TweedieRegressor::new` now sets `power: 0.0` and `link: LinkConfig::Auto`, matching sklearn (`glm.py:867, :870`); `alpha=1.0`, `max_iter=100`, `tol=1e-4`, `fit_intercept=true` unchanged. Consumer: `TweedieRegressor::default`/`new` (crate-root export). Oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green; in-module `test_tweedie_defaults` updated to assert `power == 0.0`, `link == Auto`. |
 | REQ-10 (solver param) | NOT-STARTED | open prereq blocker #556. No `solver` field on any GLM struct (`glm.rs:88-100, :171-180, :240-249, :310-321`); ferrolearn always runs IRLS. sklearn exposes `solver={'lbfgs','newton-cholesky'}` default `'lbfgs'` (`glm.py:140-143, :155, :263-309`) with a gradient-norm stopping rule (`max|g_j| <= tol`, `glm.py:86-91`), whereas ferrolearn stops on `max|Δcoef| < tol` (`glm.rs:639-647`) — a different convergence criterion that affects `n_iter_` and near-tol fits. (Solver mechanism per se is not a divergence — see "Solver / optimum equivalence" — but the absent `solver` param and the different stop rule are.) |
 | REQ-11 (warm_start) | NOT-STARTED | open prereq blocker #557. No `warm_start` field; `fn fit_glm_irls` always cold-starts from `coef = 0` (`glm.rs:598`). sklearn reuses `coef_`/`intercept_` when `warm_start and hasattr(self,'coef_')` (`glm.py:146, :244-250`). |
-| REQ-12 (sample_weight) | NOT-STARTED | open prereq blocker #558. `Fit` for the GLM types takes only `(x, y)` (`glm.rs:669-693, :699-777`); no `sample_weight`. sklearn threads `sample_weight` through the averaged deviance, the weighted intercept init, and `score` (`glm.py:170, :208-211, :255, :419-431`). |
+| REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`; the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector → the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` / `glm_gamma_sample_weight` (live sklearn 1.5.2, non-uniform `w`) green; the 8 pre-existing unweighted oracle tests stay green. The weighted intercept *init* and `score`'s `sample_weight` remain under REQ-5/REQ-13 (cold-start init / no `score` yet); they do not affect the converged `coef_`/`intercept_` parity verified here. |
 | REQ-13 (score = D²) | NOT-STARTED | open prereq blocker #559. `FittedGLMRegressor` implements `Predict`/`HasCoefficients` only (`glm.rs:783-820`); no `score`. sklearn's `score` returns D² (deviance-explained) with the link-mean null model (`glm.py:365-438`). |
 | REQ-14 (n_iter_ introspection / y-domain) | NOT-STARTED | open prereq blocker #560. `FittedGLMRegressor` stores only `coefficients`, `intercept` (`glm.rs:151-157`); the IRLS iteration count is discarded (`for _iter in 0..max_iter`, `glm.rs:603`). sklearn exposes `n_iter_` (`glm.py:283, :296`). Also y-domain validation is family-flat (`y<0 -> error`, `y` clamped to `1e-10`, `glm.rs:563-571, :593`) rather than per-loss `in_y_true_range` (Gamma: `0<y`; `glm.py:221-225`). |
 | REQ-15 (ferray substrate) | NOT-STARTED | open prereq blocker #561. `glm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}` (`glm.rs:34`) and hand-rolls Cholesky/Gaussian solves (`fn cholesky_solve`, `fn gaussian_solve in glm.rs`) on `ndarray`, not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). Consistent with the crate-wide deferral (e.g. `ridge.md`, `ransac.md` keep substrate NOT-STARTED). |
@@ -286,10 +286,10 @@ np.log(np.array([2.,5.,10.,20.]).mean()))"
 # 2.2246.. 2.2246..   (REQ-4: intercept UNpenalized -> log(mean y); ferrolearn penalizes it)
 ```
 
-Every REQ-1..REQ-15 lacks green oracle verification and is NOT-STARTED, each
-gated on the blocker below. A NOT-STARTED REQ closes only when its fix lands AND
-a divergence test (expected values from the live oracle / a sklearn `file:line`
-constant per R-CHAR-3) goes green.
+A NOT-STARTED REQ closes only when its fix lands AND a divergence test (expected
+values from the live oracle / a sklearn `file:line` constant per R-CHAR-3) goes
+green; see the REQ-status table above for the current SHIPPED/NOT-STARTED split
+(REQ-4/7/8/9/12 SHIPPED, the remainder gated on the blockers below).
 
 ## Blockers to open
 
