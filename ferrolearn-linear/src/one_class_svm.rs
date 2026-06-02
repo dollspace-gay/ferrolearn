@@ -50,7 +50,7 @@
 //! | REQ-3 (fitted attributes + offset_) | SHIPPED | The libsvm-layout accessor surface now exists: `FittedOneClassSVM::{support,support_vectors,n_support,dual_coef,intercept,offset,coef} in one_class_svm.rs` — `support_` (SV indices via the new `sv_indices` field), `support_vectors_` shape `(n_SV,n_features)`, `n_support_` `vec![n_SV]` (length 1), `dual_coef_` shape `(1,n_SV)` (libsvm scale, raw α — no `α·y` flip, `Σ=ν·n`), `intercept_=[-rho]`, `offset_=rho=-intercept_` (`_classes.py:1767`), linear-only `coef_=dual_coef_@support_vectors_` (gated on `Kernel::is_linear`, else `None`, `_base.py:650-666`). The hyperplane attributes match the live oracle: `intercept_ [-0.01]`, `offset_ 0.01` (= `-intercept_`), `coef_ [[0.05,0.05]]`. Consumer: the crate-root re-export. Pinned by `test_one_class_svm_fitted_attributes_linear_oracle` (offset_/coef_/intercept_/shapes/the `offset_=-intercept_` identity + `dual_coef_` sum `=ν·n`) + `test_one_class_svm_coef_none_for_rbf` (rbf → `None`) in `one_class_svm.rs` (R-CHAR-3, 1e-2). The `support_`/`dual_coef_`/`n_support_` decomposition matches the oracle on NON-DEGENERATE (unique) optima (`divergence_pin5_sv_decomposition_nondegenerate_646`); on the symmetric toy set the decomposition is a sanctioned non-unique vertex (REQ-1's documented degeneracy boundary — same hyperplane). |
 //! | REQ-4 (decision_function / score_samples) | SHIPPED | `pub fn decision_function in one_class_svm.rs` returns `Array1<F>` `(n,)` = `Σ coef·K(sv,x) − rho` in libsvm scale (the #646 rescale: `let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`, `svm.cpp:2834` `sum -= rho`). `pub fn score_samples in one_class_svm.rs` now returns `decision_function(X) + offset_` (`_classes.py:1801`). Pinned: `divergence_pin1_decision_function_scaling_646 in tests/divergence_one_class_svm.rs` — linear `nu=0.5` on the 7×2 set gives df `[-0.01,0.0,-0.01,-0.01,0.0,0.0,0.29]` matching the live oracle; `test_one_class_svm_score_samples_linear_oracle in one_class_svm.rs` pins `score_samples [0,0.01,0,0,0.01,0.01,0.3]` against the live oracle (R-CHAR-3, 1e-2). |
 //! | REQ-5 (predict +1/-1) | SHIPPED | `fn predict in one_class_svm.rs` returns `+1` (inlier) / `-1` (outlier); labels match the live oracle `[-1,1,-1,-1,1,1,1]` (pinned by `divergence_pin3_predict_labels_648 in tests/divergence_one_class_svm.rs`, R-CHAR-3). The boundary uses a `|rho|`-relative slack so on-margin points (`decision≈0` modulo float roundoff) take libsvm's observable label (`+1`), reproducing the oracle (R-DEV-3 observable contract); libsvm's exact `(sum>0)?+1:-1` (`svm.cpp:2837-2838`) differs only at a genuine `decision==0` (measure-zero / degenerate edge). |
-//! | REQ-6 (constructor params/defaults) | NOT-STARTED | open prereq blocker #651. `max_iter=10000` (sklearn `-1`), `cache_size=1024` (sklearn `200`, unused), `shrinking` field absent. |
+//! | REQ-6 (constructor params/defaults) | SHIPPED | `OneClassSVM::new` now mirrors sklearn's exact param surface defaults (`_classes.py:1712-1721`, live `inspect.signature`): `nu=0.5`, `tol=1e-3`, `cache_size=200` (was `1024`; accepted for parity, no kernel cache in this module), `max_iter=0` (was `10000`) = sklearn `max_iter=-1` ("no iteration limit"), and a new `pub shrinking: bool` field (default `true`) + `#[must_use] with_shrinking` — accepted for API parity, shrinking-invariant one-class optimum so DOES NOT alter the fit (no shrinking heuristic, R-DEV-7), mirroring `svm.rs`'s `SVC`/`SVR`. `fn fit`'s SMO loop treats `max_iter == 0` as unbounded (run to convergence) via the sentinel guard `if self.max_iter != 0 && iter >= self.max_iter { break; }` (same as `svm.rs`'s `smo_binary`/`smo_svr`); the KKT-gap break (`i_max_grad - j_min_grad < tol`) terminates the default-0 fit. R-DEV-7 design difference (preserved contract, NOT a gap): estimator-level `kernel`(string)/`degree`/`coef0` are the type parameter `K` set by construction, `gamma` resolution is REQ-2; `verbose`/`random_state` are unused (deterministic SMO). Pinned by `test_one_class_svm_default_params` (asserts `nu==0.5`, `tol==1e-3`, `max_iter==0`, `cache_size==200`, `shrinking==true` against the live `OneClassSVM.__init__` signature, R-DEV-2) + `test_one_class_svm_default_max_iter_converges` (default-0 fit converges, no infinite loop) + `test_one_class_svm_builder_pattern` (`with_shrinking`) in `one_class_svm.rs`. The 6 divergence pins use explicit `with_max_iter(1_000_000)` and stay green. |
 //! | REQ-7 (ferray substrate) | NOT-STARTED | open prereq blocker #652. `one_class_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
@@ -82,24 +82,38 @@ pub struct OneClassSVM<F, K> {
     pub kernel: K,
     /// Convergence tolerance.
     pub tol: F,
-    /// Maximum number of SMO iterations.
+    /// Maximum number of SMO iterations. `0` is the sklearn `max_iter=-1`
+    /// sentinel ("no iteration limit"; libsvm runs to convergence) — the SMO
+    /// loop then runs until the KKT gap closes; a non-zero value caps the
+    /// iteration count (`sklearn/svm/_classes.py:1721`, `max_iter` default `-1`).
     pub max_iter: usize,
-    /// Size of the kernel evaluation LRU cache.
+    /// Size of the kernel evaluation cache (`sklearn` `cache_size`, default
+    /// `200`). Accepted for API parity; this module has no kernel cache.
     pub cache_size: usize,
+    /// Whether to use libsvm's shrinking heuristic (`sklearn` `shrinking`,
+    /// `_classes.py:1718`, default `true`).
+    ///
+    /// Accepted for API parity. The one-class optimum is shrinking-invariant
+    /// and ferrolearn's SMO implements no shrinking heuristic, so this flag
+    /// DOES NOT alter the fitted `α`/`dual_coef_`/`intercept_` (R-DEV-7).
+    pub shrinking: bool,
 }
 
 impl<F: Float, K: Kernel<F>> OneClassSVM<F, K> {
     /// Create a new `OneClassSVM` with the given kernel and default hyperparameters.
     ///
-    /// Defaults: `nu = 0.5`, `tol = 1e-3`, `max_iter = 10000`, `cache_size = 1024`.
+    /// Defaults: `nu = 0.5`, `tol = 1e-3`, `max_iter = 0` (= sklearn `-1`, no
+    /// iteration limit — runs to convergence), `cache_size = 200`,
+    /// `shrinking = true` (`sklearn/svm/_classes.py:1712-1721`).
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
-            nu: F::from(0.5).unwrap(),
+            nu: F::from(0.5).unwrap_or_else(F::zero),
             kernel,
-            tol: F::from(1e-3).unwrap(),
-            max_iter: 10000,
-            cache_size: 1024,
+            tol: F::from(1e-3).unwrap_or_else(F::zero),
+            max_iter: 0,
+            cache_size: 200,
+            shrinking: true,
         }
     }
 
@@ -128,6 +142,17 @@ impl<F: Float, K: Kernel<F>> OneClassSVM<F, K> {
     #[must_use]
     pub fn with_cache_size(mut self, cache_size: usize) -> Self {
         self.cache_size = cache_size;
+        self
+    }
+
+    /// Set the `shrinking` flag (`sklearn` `shrinking`, default `true`).
+    ///
+    /// Accepted for API parity; the one-class optimum is shrinking-invariant
+    /// (ferrolearn's SMO has no shrinking heuristic — R-DEV-7), so this does
+    /// not change the fit.
+    #[must_use]
+    pub fn with_shrinking(mut self, shrinking: bool) -> Self {
+        self.shrinking = shrinking;
         self
     }
 }
@@ -230,8 +255,17 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
             }
         }
 
-        // SMO iterations
-        for _iter in 0..self.max_iter {
+        // SMO iterations. `max_iter == 0` is the sklearn `max_iter=-1` ("no
+        // iteration limit", libsvm runs to convergence) sentinel — the loop
+        // then runs until the KKT gap closes (the `i_max_grad - j_min_grad <
+        // tol` break below). A non-zero `max_iter` caps the iteration count,
+        // mirroring `svm.rs`'s `smo_binary`/`smo_svr` loop guard.
+        let mut iter = 0usize;
+        loop {
+            if self.max_iter != 0 && iter >= self.max_iter {
+                break;
+            }
+            iter += 1;
             // Select working set: i with largest gradient (and alpha_i > 0),
             // j with smallest gradient (and alpha_j < c).
             let mut i_best = None;
@@ -625,12 +659,53 @@ mod tests {
             .with_nu(0.3)
             .with_tol(1e-4)
             .with_max_iter(5000)
-            .with_cache_size(2048);
+            .with_cache_size(2048)
+            .with_shrinking(false);
 
         assert!((model.nu - 0.3).abs() < 1e-10);
         assert!((model.tol - 1e-4).abs() < 1e-10);
         assert_eq!(model.max_iter, 5000);
         assert_eq!(model.cache_size, 2048);
+        assert!(!model.shrinking);
+    }
+
+    /// REQ-6 (R-DEV-2): `OneClassSVM::new` exposes sklearn's exact param
+    /// surface defaults. Expected values from the live oracle:
+    ///   python3 -c "from sklearn.svm import OneClassSVM; import inspect; \
+    ///   print({k:v.default for k,v in \
+    ///   inspect.signature(OneClassSVM.__init__).parameters.items() if k!='self'})"
+    ///   # kernel='rbf' degree=3 gamma='scale' coef0=0.0 tol=1e-3 nu=0.5
+    ///   #   shrinking=True cache_size=200 max_iter=-1
+    /// (`max_iter=-1` maps to ferrolearn's `0` sentinel = no iteration limit).
+    #[test]
+    fn test_one_class_svm_default_params() {
+        let model = OneClassSVM::<f64, LinearKernel>::new(LinearKernel);
+        assert!((model.nu - 0.5).abs() < 1e-12, "nu default 0.5");
+        assert!((model.tol - 1e-3).abs() < 1e-12, "tol default 1e-3");
+        assert_eq!(model.max_iter, 0, "max_iter default 0 (= sklearn -1)");
+        assert_eq!(model.cache_size, 200, "cache_size default 200");
+        assert!(model.shrinking, "shrinking default true");
+    }
+
+    /// A default-`max_iter` (`0` = unbounded) fit must run to convergence, NOT
+    /// run zero iterations or spin forever: the `i_max_grad - j_min_grad < tol`
+    /// break terminates the loop. Verifies the sentinel loop guard.
+    #[test]
+    fn test_one_class_svm_default_max_iter_converges() {
+        let x = oracle_7x2();
+        let model = OneClassSVM::new(LinearKernel).with_nu(0.5);
+        assert_eq!(model.max_iter, 0, "uses the default unbounded sentinel");
+        let fit = model.fit(&x, &());
+        assert!(
+            fit.is_ok(),
+            "default max_iter=0 fit converges, no infinite loop"
+        );
+        let Ok(fitted) = fit else { return };
+        // Converged to a usable boundary: it produces a label per sample.
+        let preds = fitted.predict(&x);
+        assert!(preds.is_ok(), "predict succeeds on converged fit");
+        let Ok(preds) = preds else { return };
+        assert_eq!(preds.len(), 7);
     }
 
     #[test]
