@@ -30,6 +30,23 @@
 //! // Output has n_samples rows and (total_leaves_across_trees) columns.
 //! assert_eq!(embedded.nrows(), 6);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.RandomTreesEmbedding`
+//! (`sklearn/ensemble/_forest.py`). See `.design/tree/random_trees_embedding.md`.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param defaults: `n_estimators=100`, `max_depth=Some(5)`, `min_samples_split=2`, `random_state=None` (`_forest.py:2820-2823`) | SHIPPED |
+//! | REQ-2 | Totally-random per-tree build (random feature + random threshold, target-free) | SHIPPED |
+//! | REQ-3 | `transform` one-hot contract: each row sums to exactly `n_estimators`, cols == Σ per-tree leaves, entries ∈ {0,1} (`_forest.py:2982`); consumed via crate re-export + [`PipelineTransformer`] impl | SHIPPED |
+//! | REQ-5 | Unsupervised fit (`Fit<_, ()>`; sklearn fabricates uniform `y` — R-DEV-4 correct deviation) | SHIPPED |
+//! | REQ-6 | `random_state` reproducibility (ferrolearn-internal determinism; numpy-MT cross-parity is a documented RNG boundary, #690) | SHIPPED |
+//! | REQ-1b | Leaf-control params `min_samples_leaf` / `min_weight_fraction_leaf` / `max_leaf_nodes` / `min_impurity_decrease` | NOT-STARTED (#688) |
+//! | REQ-4 | `sparse_output` (CSR) — `transform` currently returns dense `Array2` | NOT-STARTED (#689) |
+//! | REQ-7 | PyO3 binding (ferrolearn-python registration) | NOT-STARTED (#692) |
+//! | REQ-8 | ferray substrate migration | NOT-STARTED (#691) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -74,12 +91,12 @@ pub struct RandomTreesEmbedding<F> {
 impl<F: Float> RandomTreesEmbedding<F> {
     /// Create a new `RandomTreesEmbedding` with default settings.
     ///
-    /// Defaults: `n_estimators = 10`, `max_depth = Some(5)`,
+    /// Defaults: `n_estimators = 100`, `max_depth = Some(5)`,
     /// `min_samples_split = 2`, `random_state = None`.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            n_estimators: 10,
+            n_estimators: 100,
             max_depth: Some(5),
             min_samples_split: 2,
             random_state: None,
@@ -504,7 +521,7 @@ mod tests {
     #[test]
     fn test_default() {
         let model = RandomTreesEmbedding::<f64>::new();
-        assert_eq!(model.n_estimators, 10);
+        assert_eq!(model.n_estimators, 100);
         assert_eq!(model.max_depth, Some(5));
         assert_eq!(model.min_samples_split, 2);
         assert!(model.random_state.is_none());
