@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate(one_class_svm): REQ-6 constructor params/defaults (max_iter -1, cache_size 200, gamma/shrinking) (#651)
 - translate(one_class_svm): REQ-5 nu param + (0,1] validation pin (#650)
 - translate(one_class_svm): REQ-4 decision_function + score_samples + predict sign (#649)
 - translate(one_class_svm): REQ-3 fitted attrs support_/support_vectors_/n_support_/dual_coef_/intercept_/offset_/coef_ (#648)
