@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree FittedVotingClassifier::predict tie-break diverges from sklearn/ensemble/_voting.py:445 (Rust max_by_key last-index vs numpy argmax(bincount) lowest-index) (#694)
 - Divergence: ferrolearn-tree RandomTreesEmbedding::new sets n_estimators=10, sklearn default is 100 (sklearn/ensemble/_forest.py:2820) (#687)
 - Divergence: ferrolearn-tree::FittedExtraTreesClassifier::predict hard-votes; sklearn ExtraTreesClassifier.predict soft-votes (_forest.py:907) (#679)
 - Divergence: ferrolearn-tree RandomForestClassifier::predict hard-votes; sklearn/ensemble/_forest.py:904-907 soft-votes (argmax of mean predict_proba) (#670)
