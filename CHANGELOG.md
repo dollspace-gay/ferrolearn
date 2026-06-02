@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(linear_svc): REQ-9 class_weight {None, balanced, dict} (#626)
 - translate(linear_svc): REQ-8 dual {auto, True, False} + unsupported-combination rejects (#625)
 - translate(linear_svc): REQ-5 penalty {l2, l1} + l1 solver + (l1,hinge) reject (#622)
 - translate(linear_svc): REQ-11 n_iter_/n_features_in_ accessors + tol>0 validation (#627)
