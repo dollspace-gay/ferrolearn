@@ -940,6 +940,165 @@ fn lda_shrinkage_auto() {
     }
 }
 
+// ===========================================================================
+// #596 (REQ-10) — eigen solver (generalized-eigh via Cholesky reduction).
+//
+// sklearn's `solver="eigen"` (`_solve_eigen`, discriminant_analysis.py:421-485)
+// computes `Sw = covariance_ = _class_cov(X, y, priors_, shrinkage)` (within
+// scatter), `St = _cov(X, shrinkage)` (total scatter of the WHOLE X),
+// `Sb = St - Sw`, then solves the GENERALIZED symmetric-definite eigenproblem
+// `evals, evecs = linalg.eigh(Sb, Sw)` (`:475`); `explained_variance_ratio_ =
+// sort(evals/sum(evals))[::-1][:max_components]` (`:476-478`); `evecs` sorted
+// by DESCENDING eigenvalue (`:479`); `scalings_ = evecs`; `coef_ =
+// (means_@evecs)@evecs.T` (`:482`); `intercept_ = -0.5*diag(means_@coef_.T) +
+// log(priors_)` (`:483-485`).
+//
+// For the binary case sklearn COLLAPSES coef_/intercept_ to a single row
+// `coef_[1] - coef_[0]` (`:651-657`). ferrolearn (matching its existing svd/
+// lsqr paths, open prereq blocker #600) keeps the FULL `(n_classes,
+// n_features)` coef_, so the assertions reconstruct the collapsed discriminant
+// `coef_[1] - coef_[0]` and compare it to the live (collapsed) oracle. The
+// collapsed coef_ and `coef_ = (means_@evecs)@evecs.T` are SIGN/ORDER-invariant
+// under the eigenvector sign/order ambiguity, so they match regardless.
+//
+// Shared dataset (X=cov_x(), y=cov_y()):
+//   X = [[0,0],[1,1],[2,0.5],[0.5,2],[5,5],[6,4.5],[4.5,6],[5.5,5.5]]
+//   y = [0,0,0,0,1,1,1,1]
+// ===========================================================================
+
+/// #596 (REQ-10): the `eigen` solver matches the live sklearn 1.5.2
+/// `LinearDiscriminantAnalysis(solver='eigen').fit(X,y)` (no shrinkage). The
+/// collapsed discriminant `coef_[1] - coef_[0]` matches `coef_` (already
+/// collapsed by sklearn) to 1e-6, `explained_variance_ratio_` is `[1.0]`, and
+/// `predict`/`predict_proba` match the oracle.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); m=L(solver='eigen').fit(X,y); \
+///   print(repr(m.coef_.tolist()), repr(m.explained_variance_ratio_.tolist())); \
+///   print(m.predict(X).tolist(), repr(m.predict_proba(X).tolist()))"
+/// # coef_ [[14.736842105263165, 14.736842105263165]]
+/// # explained_variance_ratio_ [1.0]
+/// # predict [0, 0, 0, 0, 1, 1, 1, 1]
+/// # predict_proba [[1.0, 6.298086297966993e-40], [1.0, 3.976189014921992e-27],
+/// #   [1.0, 6.3027724011855906e-24], [1.0, 6.3027724011855906e-24],
+/// #   [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+/// ```
+#[test]
+fn lda_eigen_solver() {
+    // Live sklearn 1.5.2 (collapsed binary) `coef_` for solver='eigen'.
+    const SK_COEF_COLLAPSED: [f64; 2] = [14.736842105263165, 14.736842105263165];
+    // Live sklearn 1.5.2 explained_variance_ratio_ (truncated to max_components=1).
+    const SK_EVR: [f64; 1] = [1.0];
+    const SK_PRED: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+    const SK_PROBA: [[f64; 2]; 8] = [
+        [1.0, 6.298086297966993e-40],
+        [1.0, 3.976189014921992e-27],
+        [1.0, 6.3027724011855906e-24],
+        [1.0, 6.3027724011855906e-24],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ];
+
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None)
+        .with_solver(Solver::Eigen)
+        .fit(&x, &y)
+        .unwrap();
+
+    // coef_ is FULL (2, 2); the collapsed binary discriminant is row1 - row0
+    // (SIGN/ORDER-invariant under the eigenvector ambiguity).
+    let coef = fitted.coef();
+    assert_eq!(coef.dim(), (2, 2), "eigen coef_ shape (uncollapsed)");
+    for j in 0..2 {
+        let collapsed = coef[[1, j]] - coef[[0, j]];
+        assert!(
+            (collapsed - SK_COEF_COLLAPSED[j]).abs() < 1e-6,
+            "eigen coef_[1]-coef_[0] [{j}]: sklearn {}, ferrolearn {}",
+            SK_COEF_COLLAPSED[j],
+            collapsed
+        );
+    }
+
+    // explained_variance_ratio_ matches the oracle (truncated to max_components).
+    let evr = fitted.explained_variance_ratio();
+    assert_eq!(evr.len(), 1, "eigen evr length = max_components (1)");
+    assert!(
+        (evr[0] - SK_EVR[0]).abs() < 1e-9,
+        "eigen explained_variance_ratio_[0]: sklearn {}, ferrolearn {}",
+        SK_EVR[0],
+        evr[0]
+    );
+
+    // covariance_ (= Sw) is ALWAYS populated for eigen (sklearn :467-469).
+    assert!(
+        fitted.covariance().is_some(),
+        "eigen always sets covariance_ (sklearn :467-469)"
+    );
+
+    let pred = fitted.predict(&x).unwrap();
+    for i in 0..8 {
+        assert_eq!(pred[i], SK_PRED[i], "eigen predict[{i}]");
+    }
+
+    let proba = fitted.predict_proba(&x).unwrap();
+    assert_eq!(proba.dim(), (8, 2));
+    for i in 0..8 {
+        for c in 0..2 {
+            assert!(
+                (proba[[i, c]] - SK_PROBA[i][c]).abs() < 1e-6,
+                "eigen predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_PROBA[i][c],
+                proba[[i, c]]
+            );
+        }
+    }
+}
+
+/// #596 (REQ-10): the `eigen` solver with a FIXED shrinkage `0.5` (shrinkage
+/// is applied to BOTH `Sw` and `St`, `discriminant_analysis.py:467-472`). The
+/// collapsed discriminant matches the live oracle to 1e-6.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   print(repr(L(solver='eigen', shrinkage=0.5).fit(X,y).coef_.tolist()))"
+/// # [[12.043010752688174, 12.04301075268817]]
+/// ```
+#[test]
+fn lda_eigen_shrinkage() {
+    const SK_COEF_COLLAPSED: [f64; 2] = [12.043010752688174, 12.04301075268817];
+
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None)
+        .with_solver(Solver::Eigen)
+        .with_shrinkage(Shrinkage::Fixed(0.5))
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coef();
+    assert_eq!(coef.dim(), (2, 2));
+    for j in 0..2 {
+        let collapsed = coef[[1, j]] - coef[[0, j]];
+        assert!(
+            (collapsed - SK_COEF_COLLAPSED[j]).abs() < 1e-6,
+            "eigen fixed-shrinkage coef_[1]-coef_[0] [{j}]: sklearn {}, ferrolearn {}",
+            SK_COEF_COLLAPSED[j],
+            collapsed
+        );
+    }
+}
+
 /// #597 (REQ-11): sklearn rejects `shrinkage` combined with the `svd` solver
 /// (`discriminant_analysis.py:628-629`, `raise NotImplementedError("shrinkage
 /// not supported with 'svd' solver.")`). ferrolearn's [`Fit::fit`] must return

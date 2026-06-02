@@ -14,8 +14,16 @@
 //! it forms the prior-weighted within-class covariance `covariance_` and solves
 //! `coef_ = lstsq(covariance_, means_.T).T`, supporting covariance
 //! [`Shrinkage`] (`None`/`Auto` Ledoit-Wolf/`Fixed`); it does NOT do
-//! dimensionality reduction (no `transform`). [`Solver::Eigen`] is deferred
-//! (#596).
+//! dimensionality reduction (no `transform`). The [`Solver::Eigen`]
+//! generalized-eigenvalue path (`_solve_eigen`,
+//! `discriminant_analysis.py:421-485`) is also available (`LDA::with_solver`):
+//! it forms the within-class scatter `Sw = covariance_` and total scatter
+//! `St = cov(X)`, then solves the generalized symmetric-definite eigenproblem
+//! `eigh(Sb, Sw)` (with `Sb = St - Sw`) — reduced to a STANDARD symmetric
+//! eigenproblem via the Cholesky factor of `Sw` (`Sw = L·Lᵀ`,
+//! `M = L⁻¹·Sb·L⁻ᵀ`, `eigh(M)`, `evecs = L⁻ᵀ·W`) since ferray exposes only the
+//! standard solver. It supports `shrinkage` and dimensionality reduction
+//! (`transform` is the un-centered `X @ scalings_`, since eigen has no `xbar_`).
 //!
 //! # Algorithm (`_solve_svd`, `discriminant_analysis.py:487-559`)
 //!
@@ -62,7 +70,7 @@
 //! | REQ-13 (explained_variance_ratio_) | SHIPPED | `fn fit` sets `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]` from the SECOND (between-class) SVD (`discriminant_analysis.py:550-552`). Test `test_lda_explained_variance_ratio_oracle` <1e-9 vs live `L().explained_variance_ratio_`. #599. |
 //! | REQ-4 (predict_log_proba smallest_normal floor) | SHIPPED | `FittedLDA::predict_log_proba` mirrors sklearn exactly (`discriminant_analysis.py:713-737`): `predict_proba` then `prediction[prediction == 0.0] += smallest_normal` (`F::min_positive_value()` = numpy `finfo.smallest_normal`, `:729-736`) before `log`, so nonzero probas keep their true `ln` and exact zeros become `log(MIN_POSITIVE)` (not `-inf`). Consumer: shares `FittedLDA::predict_proba` (the `Predict` path). Test `lda_predict_log_proba` (overlapping 3-class, all-finite log-probas) <1e-6 vs live `LinearDiscriminantAnalysis().predict_log_proba`. #591. |
 //! | REQ-9 (lsqr solver) | SHIPPED | `Solver::Lsqr` (`LDA::with_solver`) dispatches `fn fit` to `fn solve_lstsq` (sklearn `_solve_lstsq`, `discriminant_analysis.py:365-419`): `covariance_ = Σ_k priors_[k] · cov(X_k)` (`_class_cov` `:128-172`, ALWAYS populated for lsqr, `:413`); `coef_ = lstsq(covariance_, means_.T)[0].T` (`:416`) via `fn lstsq_multi` → `ferray::linalg::lstsq` (multi-RHS, `ferray-linalg/src/solve.rs:208`, R-SUBSTRATE-4 bridge); `intercept_ = -½·diag(means_ @ coef_.T) + log(priors_)` (`:417-418`). No `scalings_`/`xbar_`/`explained_variance_ratio_` / `transform` (sklearn raises for lsqr `transform`, `:676-679`; `max_components=0` ⇒ empty projection). Binary collapse `coef_[1]-coef_[0]` deferred to #600 (coef_ stays `(n_classes, n_features)`, matching the svd path). Consumer: `fn fit` reads `self.solver` and dispatches; `Predict`/`predict_proba` for `FittedLDA` consume the lsqr `coef_`/`intercept_`. Test `lda_lsqr_solver` (collapsed `coef_[1]-coef_[0]` = `[14.7368…, 14.7368…]`, predict/predict_proba) <1e-6 vs live `LinearDiscriminantAnalysis(solver='lsqr').fit(X,y)`. #595. |
-//! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. The `Solver::Eigen` variant EXISTS (so the enum is complete) but `fn fit` returns `FerroError::InvalidParameter("eigen solver not yet implemented (#596)")`; no generalized-eigenvalue `_solve_eigen` path (`discriminant_analysis.py:421-485`). |
+//! | REQ-10 (eigen solver) | SHIPPED | `Solver::Eigen` (`LDA::with_solver`) dispatches `fn fit` to `fn solve_eigen` (sklearn `_solve_eigen`, `discriminant_analysis.py:421-485`): `Sw = covariance_ = Σ_k priors_[k]·cov(X_k)` (`_class_cov` `:467-471`); `St = _cov(WHOLE X, shrinkage)` (total scatter, `:472`); `Sb = St - Sw` (`:473`); the GENERALIZED symmetric-definite eigenproblem `eigh(Sb, Sw)` (`:475`) reduced to STANDARD form via the Cholesky factor of `Sw` (ferray has `eigh`/`cholesky` but no generalized solver): `Sw = L·Lᵀ` (`fn cholesky_lower` → `ferray::linalg::cholesky`, `ferray-linalg/src/decomp/cholesky.rs:22`), `M = L⁻¹·Sb·L⁻ᵀ` (`fn matrix_inverse` → `ferray::linalg::inv`, `ferray-linalg/src/solve.rs:367`) SYMMETRIZED `M = (M+Mᵀ)/2`, `(evals, W) = eigh(M)` (`fn eigh_sym` → `ferray::linalg::eigh`, ascending, `ferray-linalg/src/decomp/eigen.rs:105`), generalized `evecs = L⁻ᵀ·W` sorted DESCENDING by eigenvalue (`:479`); `explained_variance_ratio_ = sort(evals/Σevals)[::-1][:max_components]` (`:476-478`); `scalings_ = evecs` (ALL columns, `:481`); `coef_ = (means_@evecs)@evecs.T` (`:482`, SIGN/ORDER-INVARIANT so it matches sklearn despite the eigenvector ambiguity); `intercept_ = -½·diag(means_@coef_.T) + log(priors_)` (`:483-485`). Supports `shrinkage` (like lsqr); `transform` is the un-centered `X @ scalings_[:, :max_components]` (eigen has NO `xbar_`, `:687`). Consumer: `fn fit` reads `self.solver` and dispatches; `Predict`/`predict_proba` for `FittedLDA` consume the eigen `coef_`/`intercept_`; `Transform` consumes `scalings_`. Tests `lda_eigen_solver` (collapsed `coef_[1]-coef_[0]` = `[14.7368…, 14.7368…]`, `explained_variance_ratio_` = `[1.0]`, predict/predict_proba) and `lda_eigen_shrinkage` (`Fixed(0.5)` collapsed coef = `[12.043…, 12.043…]`) <1e-6 vs live `LinearDiscriminantAnalysis(solver='eigen').fit(X,y)`. #596. |
 //! | REQ-11 (shrinkage None/auto/float) | SHIPPED | `Shrinkage::{None, Auto, Fixed(F)}` (`LDA::with_shrinkage`) drives `fn cov_shrunk` (sklearn `_cov`, `discriminant_analysis.py:36-93`) inside `fn solve_lstsq`: `None` → maximum-likelihood empirical covariance (`fn empirical_covariance`, `np.cov(...,bias=1)`, `:76-77`); `Fixed(s)` → `(1-s)·emp + s·(trace(emp)/p)·I` (`shrunk_covariance`, `covariance/_shrunk_covariance.py:153-156`), validated `0 ≤ s ≤ 1` (`Interval(Real,0,1,closed=both)`, `:339`) else `InvalidParameter`; `Auto` → analytical Ledoit-Wolf (`fn ledoit_wolf_shrinkage`, transcribed from `covariance/_shrunk_covariance.py:365-401` unblocked case) on StandardScaler-standardized data then rescaled (`_cov` `:70-75`). `Solver::Svd` + non-`None` shrinkage → `InvalidParameter("shrinkage not supported with svd solver")` mirroring sklearn `NotImplementedError` (`:628-629`). Consumer: `fn fit`/`fn solve_lstsq` read `self.shrinkage`. Tests `lda_shrinkage_fixed` (`Fixed(0.5)` coef = `[12.043…, 12.043…]`), `lda_shrinkage_auto` (`Auto` coef = `[11.3706…, 11.3706…]`, validates the Ledoit-Wolf transcription), `lda_svd_shrinkage_rejected` (svd+shrinkage → `Err`) <1e-6 vs the live oracle. #597. |
 //! | REQ-12 (store_covariance / covariance_) | SHIPPED | `LDA::with_store_covariance` sets the flag (sklearn default `false`, `discriminant_analysis.py:353`); when `true`, `fn fit` computes the shared within-class covariance `covariance_ = Σ_k priors_[k] · cov(X_k)` (`:509-510`, `_class_cov` `:128-172`) with the maximum-likelihood (`bias=1`, ÷`n_k`) per-class empirical covariance (`empirical_covariance`, `np.cov(...,bias=1)`), stored on `FittedLDA::covariance` (`None` when the flag is unset, matching sklearn). Consumer: `fn fit` reads `self.store_covariance`/`priors`/`means` and populates the field; `FittedLDA::covariance` exposes it. Test `lda_store_covariance` matches the live oracle `LinearDiscriminantAnalysis(store_covariance=True).fit(X,y).covariance_` to 1e-9 and asserts `None` for the default/`false` path. #598. |
 //! | REQ-14 (binary decision_function shape `(n,)`) | NOT-STARTED | open prereq blocker #600. `fn decision_function` always returns `(n, n_classes)`; sklearn collapses binary to `(n,)` (`discriminant_analysis.py:651-657,739`). Binding-ABI layer (parallel to QDA #581). |
@@ -87,7 +95,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
-use ferray::linalg::{LinalgFloat, svd};
+use ferray::linalg::{LinalgFloat, cholesky, eigh, inv, svd};
 use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -112,9 +120,11 @@ use num_traits::{Float, NumCast};
 ///   Supports `shrinkage`; does NOT support `transform` (sklearn raises
 ///   `NotImplementedError`, `:676-679`).
 /// - [`Solver::Eigen`] — the generalized-eigenvalue path
-///   (`_solve_eigen`, `discriminant_analysis.py:421-485`). NOT implemented in
-///   ferrolearn yet (open prereq blocker #596); [`Fit::fit`] returns a
-///   [`FerroError`] for it.
+///   (`_solve_eigen`, `discriminant_analysis.py:421-485`): forms `Sw`/`St`,
+///   solves the generalized `eigh(Sb, Sw)` (reduced to a STANDARD symmetric
+///   eigenproblem via the Cholesky factor of `Sw`), and yields `scalings_`,
+///   `coef_`, `intercept_`, `explained_variance_ratio_`. Supports `shrinkage`
+///   and `transform` (the un-centered `X @ scalings_`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Solver {
     /// Singular-value-decomposition solver (sklearn default).
@@ -122,7 +132,7 @@ pub enum Solver {
     Svd,
     /// Least-squares solver (`_solve_lstsq`).
     Lsqr,
-    /// Generalized-eigenvalue solver. NOT implemented (#596); errors at fit.
+    /// Generalized-eigenvalue solver (`_solve_eigen`), via Cholesky reduction.
     Eigen,
 }
 
@@ -267,8 +277,8 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
     /// Default [`Solver::Svd`]. See [`Solver`].
     ///
     /// [`Solver::Lsqr`] enables the least-squares path (and `shrinkage`);
-    /// [`Solver::Eigen`] is not yet implemented (#596) and makes [`Fit::fit`]
-    /// return a [`FerroError`].
+    /// [`Solver::Eigen`] enables the generalized-eigenvalue path (also supports
+    /// `shrinkage` and `transform`).
     #[must_use]
     pub fn with_solver(mut self, solver: Solver) -> Self {
         self.solver = solver;
@@ -893,6 +903,105 @@ fn lstsq_multi<F: LinalgFloat>(a: &Array2<F>, b: &Array2<F>) -> Result<Array2<F>
     Ok(out)
 }
 
+/// Lower-triangular Cholesky factor `L` of the symmetric-positive-definite `a`
+/// (`a = L·Lᵀ`), on the ferray substrate ([`ferray::linalg::cholesky`],
+/// `ferray-linalg/src/decomp/cholesky.rs:22`, the analog of
+/// `scipy.linalg.cholesky(..., lower=True)`), bridging ndarray↔ferray at this
+/// boundary (R-SUBSTRATE-4) exactly as [`svd_s_vt`]/[`lstsq_multi`] do. Used by
+/// the generalized-eigen reduction in `_solve_eigen`
+/// (`discriminant_analysis.py:475`, `linalg.eigh(Sb, Sw)`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray build or the
+/// factorization fails (e.g. `Sw` is not positive definite).
+fn cholesky_lower<F: LinalgFloat>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let (m, n) = a.dim();
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray cholesky: failed to build matrix: {e}"),
+            }
+        })?;
+    let l = cholesky(&fa).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray cholesky failed (Sw not positive definite?): {e}"),
+    })?;
+    let shape = l.shape();
+    Array2::from_shape_vec((shape[0], shape[1]), l.iter().copied().collect()).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray cholesky: shape conversion failed: {e}"),
+        }
+    })
+}
+
+/// Inverse of the square matrix `a`, on the ferray substrate
+/// ([`ferray::linalg::inv`], `ferray-linalg/src/solve.rs:367`, the analog of
+/// `numpy.linalg.inv`), bridging ndarray↔ferray at this boundary
+/// (R-SUBSTRATE-4). Used to form `L⁻¹` for the generalized-eigen reduction in
+/// `_solve_eigen`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray build or the
+/// inversion fails (singular matrix).
+fn matrix_inverse<F: LinalgFloat>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let (m, n) = a.dim();
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray inv: failed to build matrix: {e}"),
+            }
+        })?;
+    let ai = inv(&fa).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray inv failed (singular matrix?): {e}"),
+    })?;
+    let shape = ai.shape();
+    Array2::from_shape_vec((shape[0], shape[1]), ai.iter().copied().collect()).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray inv: shape conversion failed: {e}"),
+        }
+    })
+}
+
+/// Eigenvalues and eigenvectors of the symmetric matrix `a`, on the ferray
+/// substrate ([`ferray::linalg::eigh`], `ferray-linalg/src/decomp/eigen.rs:105`,
+/// the analog of `scipy.linalg.eigh` for the STANDARD symmetric problem),
+/// bridging ndarray↔ferray at this boundary (R-SUBSTRATE-4). Returns
+/// `(evals, evecs)` with eigenvalues in ASCENDING order (ferray/LAPACK
+/// convention) and eigenvectors as columns of `evecs`. The generalized
+/// `eigh(Sb, Sw)` of `_solve_eigen` (`discriminant_analysis.py:475`) is reduced
+/// to this standard form via the Cholesky factor of `Sw` (see `solve_eigen`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray build or the
+/// eigendecomposition fails.
+fn eigh_sym<F: LinalgFloat>(a: &Array2<F>) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    let (m, n) = a.dim();
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray eigh: failed to build matrix: {e}"),
+            }
+        })?;
+    let (vals, vecs) = eigh(&fa).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray eigh failed: {e}"),
+    })?;
+    let vals_nd = Array1::from_vec(vals.iter().copied().collect());
+    let vecs_shape = vecs.shape();
+    let vecs_nd = Array2::from_shape_vec(
+        (vecs_shape[0], vecs_shape[1]),
+        vecs.iter().copied().collect(),
+    )
+    .map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray eigh: eigenvector shape conversion failed: {e}"),
+    })?;
+    Ok((vals_nd, vecs_nd))
+}
+
 // ---------------------------------------------------------------------------
 // Fit (sklearn _solve_svd)
 // ---------------------------------------------------------------------------
@@ -1080,13 +1189,20 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
                 );
             }
             Solver::Eigen => {
-                // The generalized-eigenvalue solver is not yet implemented
-                // (open prereq blocker #596); the variant exists so the enum
-                // is complete, but fit errors rather than silently mis-solving.
-                return Err(FerroError::InvalidParameter {
-                    name: "solver".into(),
-                    reason: "eigen solver not yet implemented (#596)".into(),
-                });
+                // The generalized-eigenvalue solver (sklearn `_solve_eigen`,
+                // `discriminant_analysis.py:421-485`): generalized `eigh(Sb, Sw)`
+                // reduced to a standard symmetric eigenproblem via the Cholesky
+                // factor of `Sw`. Supports `shrinkage` (like lsqr). See
+                // [`LDA::solve_eigen`].
+                return self.solve_eigen(
+                    x,
+                    &classes,
+                    &class_indices,
+                    &means,
+                    &priors,
+                    user_max,
+                    n_features,
+                );
             }
             Solver::Svd => {
                 // sklearn: svd + shrinkage != None → NotImplementedError
@@ -1439,6 +1555,213 @@ impl<F: LinalgFloat + ScalarOperand> LDA<F> {
             covariance: Some(covariance),
             classes: classes.to_vec(),
             max_components: 0,
+            n_features,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fit (sklearn _solve_eigen) — the eigen solver
+// ---------------------------------------------------------------------------
+
+impl<F: LinalgFloat + ScalarOperand> LDA<F> {
+    /// The generalized-eigenvalue solver (sklearn's `_solve_eigen`,
+    /// `discriminant_analysis.py:421-485`), dispatched from [`Fit::fit`] when
+    /// [`Solver::Eigen`] is selected.
+    ///
+    /// Computes (`:466-485`):
+    /// - `Sw = Σ_k priors_[k] · cov(X_k)` — the within-class scatter (the
+    ///   shrinkage-aware `_class_cov`, `:467-471`), stored as `covariance_`.
+    /// - `St = cov(WHOLE X)` — the total scatter of all of `X` (the SAME `_cov`
+    ///   with the configured shrinkage applied to the full centered `X`, `:472`).
+    /// - `Sb = St - Sw` — the between-class scatter (`:473`).
+    /// - the GENERALIZED symmetric-definite eigenproblem `eigh(Sb, Sw)` (`:475`),
+    ///   sorted by DESCENDING eigenvalue (`:479`,
+    ///   `evecs = evecs[:, argsort(evals)[::-1]]`).
+    /// - `explained_variance_ratio_ = sort(evals / Σ evals)[::-1][:max_components]`
+    ///   (`:476-478`).
+    /// - `scalings_ = evecs` (`:481`), `coef_ = (means_ @ evecs) @ evecs.T`
+    ///   (`:482`), `intercept_ = -½·diag(means_ @ coef_.T) + log(priors_)`
+    ///   (`:483-485`).
+    ///
+    /// # The Cholesky reduction
+    ///
+    /// ferray exposes the STANDARD symmetric eigensolver
+    /// ([`ferray::linalg::eigh`]) and [`ferray::linalg::cholesky`], not a
+    /// generalized solver, so the generalized problem `Sb·v = λ·Sw·v` (with `Sw`
+    /// SPD) is reduced to standard form: let `Sw = L·Lᵀ` (Cholesky); then
+    /// `M = L⁻¹·Sb·L⁻ᵀ` is symmetric and `eigh(M)` gives the same eigenvalues
+    /// `λ`, with generalized eigenvectors `v = L⁻ᵀ·w` (`w` the standard
+    /// eigenvectors of `M`). `M` is symmetrized (`M = (M + Mᵀ)/2`) to kill
+    /// rounding asymmetry before [`eigh`]. Because `coef_ = (means_@evecs)@evecsᵀ`
+    /// is invariant to the per-column SIGN and ORDER of `evecs`, `coef_`/
+    /// `intercept_` (hence `predict`/`predict_proba`/`decision_function`) match
+    /// sklearn exactly regardless of the eigenvector sign/order ambiguity. The
+    /// explained-variance ratio is sorted by eigenvalue, so it is order-stable.
+    ///
+    /// `scalings_` is `(n_features, n_features)` (sklearn keeps ALL columns for
+    /// the eigen solver, `:481`); `transform` slices to `[:, :max_components]`.
+    /// Eigen has NO `xbar_` (sklearn `_solve_eigen` does not set it, `:466-485`),
+    /// so `transform` is the un-centered `X @ scalings_` (`:687`).
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::InvalidParameter`] if [`Shrinkage::Fixed`]`(s)` has
+    ///   `s ∉ [0, 1]` (sklearn `Interval(Real, 0, 1, closed="both")`, `:339`).
+    /// - [`FerroError::NumericalInstability`] if the Cholesky factorization,
+    ///   inversion, or eigendecomposition fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the eigen solver consumes the same pre-resolved fit state (X/classes/indices/means/priors/dims) the svd path computes; threading them avoids recomputation"
+    )]
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "explicit index loops mirror sklearn's matrix arithmetic per-row/per-column"
+    )]
+    fn solve_eigen(
+        &self,
+        x: &Array2<F>,
+        classes: &[usize],
+        class_indices: &[Vec<usize>],
+        means: &Array2<F>,
+        priors: &Array1<F>,
+        max_components: usize,
+        n_features: usize,
+    ) -> Result<FittedLDA<F>, FerroError> {
+        let n_classes = classes.len();
+
+        // Validate Fixed(s): sklearn Interval(Real, 0, 1, closed="both") (:339).
+        if let Shrinkage::Fixed(s) = self.shrinkage
+            && (s < <F as num_traits::Zero>::zero() || s > <F as num_traits::One>::one())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "shrinkage".into(),
+                reason: "shrinkage float must be in [0, 1]".into(),
+            });
+        }
+
+        // Sw = Σ_k priors_[k] · cov(X_k)  — within-class scatter (covariance_,
+        // sklearn :467-471, `_class_cov` :128-172, `_cov` :36-93 shrinkage-aware).
+        let mut sw = Array2::<F>::zeros((n_features, n_features));
+        for (idx, indices) in class_indices.iter().enumerate() {
+            let nk = indices.len();
+            let mut xg = Array2::<F>::zeros((nk, n_features));
+            for (r, &i) in indices.iter().enumerate() {
+                for j in 0..n_features {
+                    xg[[r, j]] = x[[i, j]];
+                }
+            }
+            let cov_k = cov_shrunk(&xg, self.shrinkage)?;
+            let prior_k = priors[idx];
+            for a in 0..n_features {
+                for b in 0..n_features {
+                    sw[[a, b]] += prior_k * cov_k[[a, b]];
+                }
+            }
+        }
+
+        // St = _cov(WHOLE X, shrinkage)  — total scatter of all of X (sklearn
+        // :472). Same `_cov` (shrinkage applied to the FULL centered X).
+        let st = cov_shrunk(&x.to_owned(), self.shrinkage)?;
+
+        // Sb = St - Sw  — between-class scatter (sklearn :473).
+        let mut sb = Array2::<F>::zeros((n_features, n_features));
+        for a in 0..n_features {
+            for b in 0..n_features {
+                sb[[a, b]] = st[[a, b]] - sw[[a, b]];
+            }
+        }
+
+        // --- generalized eigh(Sb, Sw) via Cholesky reduction (sklearn :475) ---
+        // Sw = L·Lᵀ; M = L⁻¹·Sb·L⁻ᵀ (symmetric); (evals, W) = eigh(M);
+        // generalized eigenvectors evecs = L⁻ᵀ·W.
+        let l = cholesky_lower(&sw)?; // lower-triangular, Sw = L·Lᵀ
+        let l_inv = matrix_inverse(&l)?; // L⁻¹  (n_features, n_features)
+        // M = L⁻¹ · Sb · L⁻ᵀ
+        let l_inv_t = l_inv.t().to_owned();
+        let m = l_inv.dot(&sb).dot(&l_inv_t);
+        // Symmetrize M = (M + Mᵀ)/2 to kill rounding asymmetry before eigh.
+        let mut m_sym = Array2::<F>::zeros((n_features, n_features));
+        let half_f = half::<F>();
+        for a in 0..n_features {
+            for b in 0..n_features {
+                m_sym[[a, b]] = (m[[a, b]] + m[[b, a]]) * half_f;
+            }
+        }
+        // eigh(M) — ascending eigenvalues, eigenvectors as columns.
+        let (evals_asc, w) = eigh_sym(&m_sym)?;
+        // Generalized eigenvectors: evecs = L⁻ᵀ · W  (n_features, n_features).
+        let evecs_asc = l_inv_t.dot(&w);
+
+        // --- sort by DESCENDING eigenvalue (sklearn :479) ---------------------
+        // argsort(evals)[::-1]: indices ordered by descending eigenvalue.
+        let n = evals_asc.len();
+        let mut order: Vec<usize> = (0..n).collect();
+        // evals_asc is ascending; reverse it for descending order.
+        order.reverse();
+        let mut evals_desc = Array1::<F>::zeros(n);
+        let mut evecs = Array2::<F>::zeros((n_features, n));
+        for (new_c, &old_c) in order.iter().enumerate() {
+            evals_desc[new_c] = evals_asc[old_c];
+            for j in 0..n_features {
+                evecs[[j, new_c]] = evecs_asc[[j, old_c]];
+            }
+        }
+
+        // --- explained_variance_ratio_  (sklearn :476-478) --------------------
+        // sort(evals / sum(evals))[::-1][:max_components]. The ratio is over ALL
+        // eigenvalues, sorted descending, then truncated to max_components.
+        let mut sum_evals = <F as num_traits::Zero>::zero();
+        for &v in evals_asc.iter() {
+            sum_evals += v;
+        }
+        let evr_len = max_components.min(n);
+        let mut explained_variance_ratio = Array1::<F>::zeros(evr_len);
+        for k in 0..evr_len {
+            // evals_desc is already the descending sort of evals; dividing by the
+            // (sign-stable) sum preserves the sort order sklearn applies.
+            explained_variance_ratio[k] = if sum_evals != <F as num_traits::Zero>::zero() {
+                evals_desc[k] / sum_evals
+            } else {
+                <F as num_traits::Zero>::zero()
+            };
+        }
+
+        // --- scalings_ / coef_ / intercept_  (sklearn :481-485) ---------------
+        // scalings_ = evecs (ALL columns; sklearn keeps the full (n_features,
+        // n_features) for the eigen solver, :481).
+        let scalings = evecs.clone();
+        // coef_ = (means_ @ evecs) @ evecs.T   (n_classes, n_features).
+        // This is invariant to the per-column sign/order of evecs, so it matches
+        // sklearn exactly despite the eigenvector sign/order ambiguity.
+        let coef = means.dot(&evecs).dot(&evecs.t());
+        // intercept_ = -0.5 * diag(means_ @ coef_.T) + log(priors_)  (:483-485).
+        // diag(means_ @ coef_.T)[k] = Σ_j means_[k,j] · coef_[k,j].
+        let neg_half = -half::<F>();
+        let mut intercept = Array1::<F>::zeros(n_classes);
+        for k in 0..n_classes {
+            let mut dot = <F as num_traits::Zero>::zero();
+            for j in 0..n_features {
+                dot += means[[k, j]] * coef[[k, j]];
+            }
+            intercept[k] = neg_half * dot + priors[k].ln();
+        }
+
+        Ok(FittedLDA {
+            scalings,
+            means: means.to_owned(),
+            // Eigen has NO xbar_ (sklearn `_solve_eigen` never sets it,
+            // :466-485); `transform` is the un-centered `X @ scalings_` (:687).
+            xbar: Array1::<F>::zeros(n_features),
+            priors: priors.to_owned(),
+            coef,
+            intercept,
+            explained_variance_ratio,
+            // covariance_ = Sw, ALWAYS populated for eigen (sklearn :467-469,
+            // the attribute is set regardless of store_covariance).
+            covariance: Some(sw),
+            classes: classes.to_vec(),
+            max_components,
             n_features,
         })
     }
