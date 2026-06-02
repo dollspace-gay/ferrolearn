@@ -23,6 +23,32 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2): SHIPPED = impl + non-test consumer + tests + green
+//! verification; NOT-STARTED = open blocker `#`. `RandomForestClassifier`/
+//! `RandomForestRegressor` are re-exported at the crate root + registered as PyO3
+//! bindings (non-test consumers). The forest is RNG-driven (bootstrap +
+//! per-tree `random_state`): exact node-for-node ensemble parity with sklearn at
+//! a given `random_state` is the DOCUMENTED numpy-RNG boundary (#673, same class
+//! as SGD shuffle / extra_tree / libsvm CV) — verification pins the DETERMINISTIC
+//! contract (param surface/defaults, the soft-vote/mean aggregation,
+//! `predict_proba` mean, ferrolearn-internal reproducibility). Pins in
+//! `tests/divergence_random_forest.rs`. See `.design/tree/random_forest.md`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (param surface & defaults) | SHIPPED | `n_estimators=100`, clf `max_features=Sqrt`/`criterion=Gini`, reg `max_features=All`, `random_state=None` — match `_forest.py:1170`/`:1555` (live-verified). Pinned by `defaults_classifier_match_sklearn`/`defaults_regressor_match_sklearn`. Missing params (regressor `criterion`/`bootstrap`/`max_samples`/`oob_score`/`class_weight`/tree-param passthrough) tracked NOT-STARTED #671. |
+//! | REQ-2 (bootstrap / max_samples / bootstrap toggle) | NOT-STARTED | open prereq blocker #672. With-replacement draw exists but no `max_samples`/`bootstrap=False`; sampling RNG is the #673 boundary. |
+//! | REQ-3 (per-tree fit) | SHIPPED | each tree delegates to the oracle-verified `decision_tree.rs` build on a bootstrap sample with `max_features` subsampling. |
+//! | REQ-4 (classifier soft-vote predict) | SHIPPED | `FittedRandomForestClassifier::predict` returns `classes_[argmax(predict_proba)]` (SOFT vote, `_forest.py:904-907`), consistent with `predict_proba`. Pinned by `divergence_predict_is_soft_vote_argmax_of_proba` (predict == argmax(predict_proba) for all rows). |
+//! | REQ-5 (predict_proba mean / regressor mean) | SHIPPED | `predict_proba` = mean of per-tree probas (rows sum to 1), regressor `predict` = mean of tree predictions. Pinned by `predict_proba_rows_sum_to_one` + `regressor_predict_is_mean_constant_target`. |
+//! | REQ-6 (feature_importances_ mean-normalize) | SHIPPED | normalized mean of per-tree importances (`HasFeatureImportances`, consumed by ensemble + PyO3); all-stumps zero edge tracked #674. |
+//! | REQ-7 (oob_score_ / oob_decision_function_) | NOT-STARTED | open prereq blocker #675. No OOB scoring. |
+//! | REQ-8 (class_weight + balanced_subsample) | NOT-STARTED | open prereq blocker #676. |
+//! | REQ-9 (random_state determinism) | SHIPPED | `random_state` seeds the per-tree builds; same seed ⇒ identical forest (`random_state_reproducible`). Exact numpy-MT cross-impl parity is the DOCUMENTED RNG boundary #673. |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #677. Imports `ndarray`/`rand::StdRng`, not `ferray-core`/`ferray::random` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -461,45 +487,38 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRandomForest
     type Output = Array1<usize>;
     type Error = FerroError;
 
-    /// Predict class labels by majority vote across all trees.
+    /// Predict class labels by SOFT voting across all trees.
+    ///
+    /// Mirrors `ForestClassifier.predict`
+    /// (`sklearn/ensemble/_forest.py:904-907`):
+    /// `self.classes_.take(np.argmax(proba, axis=1), axis=0)` — the argmax of
+    /// the mean of per-tree `predict_proba` (NOT a hard per-tree-label
+    /// majority). Routes through [`predict_proba`](Self::predict_proba) so the
+    /// two are consistent. Ties resolve to the lowest class index, matching
+    /// `np.argmax`.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        if x.ncols() != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted model".into(),
-            });
-        }
-
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
+        let proba = self.predict_proba(x)?;
+        let n_samples = proba.nrows();
+        let n_classes = proba.ncols();
         let mut predictions = Array1::zeros(n_samples);
 
         for i in 0..n_samples {
-            let row = x.row(i);
-            let mut votes = vec![0usize; n_classes];
-
-            for tree_nodes in &self.trees {
-                let leaf_idx = decision_tree::traverse(tree_nodes, &row);
-                if let Node::Leaf { value, .. } = tree_nodes[leaf_idx] {
-                    let class_idx = value.to_f64().map_or(0, |f| f.round() as usize);
-                    if class_idx < n_classes {
-                        votes[class_idx] += 1;
-                    }
+            // np.argmax tie-break: first (lowest) index of the maximum.
+            let mut best = 0usize;
+            let mut best_v = proba[[i, 0]];
+            for j in 1..n_classes {
+                let v = proba[[i, j]];
+                if v > best_v {
+                    best_v = v;
+                    best = j;
                 }
             }
-
-            let winner = votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &count)| count)
-                .map_or(0, |(idx, _)| idx);
-            predictions[i] = self.classes[winner];
+            predictions[i] = self.classes[best];
         }
 
         Ok(predictions)
