@@ -12,11 +12,13 @@
 //!   "Note that centering y and X with _preprocess_data does not work for
 //!    quantile regression." (`sklearn/linear_model/_quantile.py:177`).
 //!
-//! ferrolearn fits via IRLS on a smoothed pinball loss and recovers the
-//! intercept by CENTERING (`intercept = y_mean - x_mean·w`, `fn fit` in
-//! `quantile_regressor.rs`). This makes the fit quantile-INVARIANT (the
-//! intercept and coefficients do not change with `quantile`) and unable to
-//! reach the LP's sparse vertex under regularization.
+//! ferrolearn now solves this exact LP with a self-contained two-phase primal
+//! simplex (Bland's rule) in `fn fit` of `quantile_regressor.rs` (the intercept
+//! is a free LP variable, not centering-recovered), reaching sklearn's HiGHS
+//! vertex. Previously it fit via IRLS on a smoothed pinball loss and recovered
+//! the intercept by centering, which made the fit quantile-INVARIANT and unable
+//! to reach the LP's sparse vertex under regularization — the divergence these
+//! tests pinned (now closed).
 //!
 //! Expected values are computed by the LIVE sklearn 1.5.2 oracle (R-CHAR-3),
 //! NOT copied from the ferrolearn side. To regenerate:
@@ -182,13 +184,15 @@ const SK_Q05_A0_INTERCEPT: f64 = 0.3242701963545993;
 /// `QuantileRegressor(quantile=0.8, alpha=0.0).fit(X,y).intercept_`.
 const SK_Q08_A0_INTERCEPT: f64 = 0.8814801705256051;
 /// `QuantileRegressor(quantile=0.8, alpha=0.0).fit(X,y).coef_`.
-const SK_Q08_A0_COEF: [f64; 3] = [
-    0.8105308493753483,
-    2.1063600422551434,
-    -0.9546586985136533,
-];
+const SK_Q08_A0_COEF: [f64; 3] = [0.8105308493753483, 2.1063600422551434, -0.9546586985136533];
 /// Difference `intercept_(q=0.8) - intercept_(q=0.5)` at `alpha=0.0`.
 const SK_INTERCEPT_DIFF_Q08_Q05: f64 = 0.5572099741710058;
+/// `QuantileRegressor(quantile=0.2, alpha=0.0).fit(X,y).coef_` (extra parity case).
+const SK_Q02_A0_COEF: [f64; 3] = [1.1124010932987514, 1.927469048094979, -1.0789864337813768];
+/// `QuantileRegressor(quantile=0.2, alpha=0.0).fit(X,y).intercept_`.
+const SK_Q02_A0_INTERCEPT: f64 = -0.29353907960416564;
+/// `QuantileRegressor(quantile=0.8, alpha=1.0).fit(X,y).coef_` — exact sparse 0.
+const SK_Q08_A1_COEF: [f64; 3] = [0.0, 0.0, 0.0];
 /// `QuantileRegressor(quantile=0.5, alpha=1.0).fit(X,y).coef_` — exact sparse 0.
 const SK_Q05_A1_COEF: [f64; 3] = [0.0, 0.0, 0.0];
 /// `QuantileRegressor(quantile=0.5, alpha=1.0).fit(X,y).intercept_`.
@@ -209,7 +213,6 @@ const SK_Q08_A1_INTERCEPT: f64 = 2.740633561059503;
 /// IRLS fit is quantile-invariant.
 /// Tracking: #340, #506.
 #[test]
-#[ignore = "divergence: quantile-invariant IRLS intercept != HiGHS LP free-variable intercept; tracking #340"]
 fn divergence_quantile_08_intercept_diverges_from_lp() {
     let (x, y) = oracle_dataset();
     let fitted = QuantileRegressor::<f64>::new()
@@ -233,7 +236,6 @@ fn divergence_quantile_08_intercept_diverges_from_lp() {
 /// so the observed difference is ≈ 0 rather than ≈ 0.557.
 /// Tracking: #506.
 #[test]
-#[ignore = "divergence: ferrolearn intercept identical across quantiles (delta ~0) vs sklearn delta ~0.557; tracking #506"]
 fn divergence_quantile_intercept_must_change_with_quantile() {
     let (x, y) = oracle_dataset();
     let f05 = QuantileRegressor::<f64>::new()
@@ -261,7 +263,6 @@ fn divergence_quantile_intercept_must_change_with_quantile() {
 /// returns its quantile=0.5 coefficients regardless of the quantile.
 /// Tracking: #340.
 #[test]
-#[ignore = "divergence: quantile-invariant IRLS coef != HiGHS LP coef at q=0.8; tracking #340"]
 fn divergence_quantile_08_coef_diverges_from_lp() {
     let (x, y) = oracle_dataset();
     let fitted = QuantileRegressor::<f64>::new()
@@ -293,7 +294,6 @@ fn divergence_quantile_08_coef_diverges_from_lp() {
 /// intercept, so it cannot reach the LP vertex.
 /// Tracking: #332, #340.
 #[test]
-#[ignore = "divergence: IRLS reweighted-ridge cannot reach LP sparse vertex coef=[0,0,0] / quantile-dependent intercept; tracking #332"]
 fn divergence_alpha1_sparse_vertex() {
     let (x, y) = oracle_dataset();
     let fitted = QuantileRegressor::<f64>::new()
@@ -324,7 +324,6 @@ fn divergence_alpha1_sparse_vertex() {
 /// ≈ 0.912 intercept for both quantiles.
 /// Tracking: #332, #506.
 #[test]
-#[ignore = "divergence: alpha=1.0 intercept identical across quantiles vs sklearn 0.7387 (q=0.5) / 2.7406 (q=0.8); tracking #332"]
 fn divergence_alpha1_intercept_quantile_dependent() {
     let (x, y) = oracle_dataset();
     let f08 = QuantileRegressor::<f64>::new()
@@ -337,6 +336,48 @@ fn divergence_alpha1_intercept_quantile_dependent() {
     assert!(
         (intercept - SK_Q08_A1_INTERCEPT).abs() < 1e-6,
         "q=0.8 alpha=1.0 intercept: sklearn {SK_Q08_A1_INTERCEPT}, ferrolearn {intercept}"
+    );
+    // The L1 sparse vertex also holds at q=0.8: coef is exactly [0,0,0].
+    let coef = f08.coefficients();
+    for (j, &sk) in SK_Q08_A1_COEF.iter().enumerate() {
+        assert!(
+            (coef[j] - sk).abs() < 1e-8,
+            "q=0.8 alpha=1.0 coef[{j}] must be EXACTLY zero (LP vertex): \
+             sklearn {sk}, ferrolearn {}",
+            coef[j]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Additional parity case (extra oracle, q=0.2 alpha=0.0): a non-median, no-
+// penalty quantile. The LP solution must match sklearn's HiGHS coef_/intercept_
+// to ~1e-4. Tracking: #340, #506.
+// ---------------------------------------------------------------------------
+
+/// Parity: `QuantileRegressor(quantile=0.2, alpha=0.0)` `coef_`/`intercept_`
+/// match the live sklearn 1.5.2 HiGHS LP optimum (`_quantile.py:298-304`).
+#[test]
+fn parity_quantile_02_no_penalty() {
+    let (x, y) = oracle_dataset();
+    let fitted = QuantileRegressor::<f64>::new()
+        .with_quantile(0.2)
+        .with_alpha(0.0)
+        .with_max_iter(20000)
+        .fit(&x, &y)
+        .unwrap();
+    let coef = fitted.coefficients();
+    for (j, &sk) in SK_Q02_A0_COEF.iter().enumerate() {
+        assert!(
+            (coef[j] - sk).abs() < 1e-4,
+            "q=0.2 alpha=0.0 coef[{j}]: sklearn {sk}, ferrolearn {}",
+            coef[j]
+        );
+    }
+    let intercept = fitted.intercept();
+    assert!(
+        (intercept - SK_Q02_A0_INTERCEPT).abs() < 1e-4,
+        "q=0.2 alpha=0.0 intercept: sklearn {SK_Q02_A0_INTERCEPT}, ferrolearn {intercept}"
     );
 }
 

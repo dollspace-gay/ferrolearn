@@ -1,4 +1,4 @@
-//! Quantile Regression via IRLS on the pinball loss.
+//! Quantile Regression via the exact linear program (matching scikit-learn).
 //!
 //! This module provides [`QuantileRegressor`], which estimates conditional
 //! quantiles of the response variable. The default `quantile = 0.5`
@@ -11,8 +11,27 @@
 //! L_q(r) = q * max(r, 0) + (1 - q) * max(-r, 0)
 //! ```
 //!
-//! The model is fitted via IRLS with weights `w_i = 1 / (2 * max(|r_i|, eps))`
-//! and optional L1 regularization (`alpha`).
+//! Like scikit-learn's `QuantileRegressor` (`sklearn/linear_model/_quantile.py`),
+//! the model minimizes `(1/n) * sum(pinball loss) + alpha * ||coef||_1` by
+//! solving the equivalent quantile-regression **linear program**:
+//!
+//! ```text
+//! min  c · x   s.t.  A_eq · x = y,  x >= 0
+//! x        = [intercept+, intercept-, coef+, coef-, u, v]   (all >= 0)
+//! coef     = coef+ - coef-,    intercept = intercept+ - intercept-
+//! residual = y - X@coef - intercept = u - v
+//! c        = [0, 0, alpha*n .. , quantile .. (u), (1-quantile) .. (v)]
+//! A_eq row i = [1, -1, X[i,:], -X[i,:], e_i, -e_i]
+//! ```
+//!
+//! The L1 weight is `alpha * n_samples` (sklearn rescales `alpha` by
+//! `sum(sample_weight)`, which equals `n_samples` unweighted), and the intercept
+//! slacks are NOT penalized. The intercept is therefore a free LP variable, not a
+//! centering-recovered quantity — sklearn explicitly notes that centering does
+//! not work for quantile regression (`_quantile.py:177`). The LP is solved by a
+//! self-contained two-phase primal simplex (Bland's anti-cycling rule); the
+//! pinned datasets have a unique optimum, so the simplex reaches sklearn's exact
+//! HiGHS vertex.
 //!
 //! # Examples
 //!
@@ -24,7 +43,7 @@
 //! let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
 //! let y = array![2.0, 4.0, 6.0, 8.0, 10.0];
 //!
-//! let model = QuantileRegressor::<f64>::new(); // median regression
+//! let model = QuantileRegressor::<f64>::new().with_alpha(0.0); // median regression
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 5);
@@ -34,14 +53,15 @@ use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
-use ndarray::{Array1, Array2, Axis, ScalarOperand};
+use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::{Float, FromPrimitive};
 
-/// Quantile Regressor — conditional quantile estimation via IRLS.
+/// Quantile Regressor — conditional quantile estimation via the exact LP.
 ///
-/// Minimises the pinball loss with optional L1 regularization. The IRLS
-/// weights are `w_i = 1 / (2 * max(|r_i|, eps))`, which gives the
-/// iteratively reweighted least absolute deviations procedure.
+/// Minimises `(1/n) * sum(pinball loss) + alpha * ||coef||_1` by solving the
+/// equivalent quantile-regression linear program with a two-phase primal
+/// simplex, matching scikit-learn's HiGHS solution. The intercept is a free LP
+/// variable, not a centering-recovered quantity.
 ///
 /// # Type Parameters
 ///
@@ -52,9 +72,9 @@ pub struct QuantileRegressor<F> {
     pub quantile: F,
     /// L1 regularization strength.
     pub alpha: F,
-    /// Maximum number of IRLS iterations.
+    /// Maximum number of simplex pivot iterations before declaring failure.
     pub max_iter: usize,
-    /// Convergence tolerance on the maximum coefficient change.
+    /// Convergence/feasibility tolerance for the simplex solver.
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
@@ -63,15 +83,18 @@ pub struct QuantileRegressor<F> {
 impl<F: Float + FromPrimitive> QuantileRegressor<F> {
     /// Create a new `QuantileRegressor` with default settings.
     ///
-    /// Defaults: `quantile = 0.5`, `alpha = 1.0`, `max_iter = 1000`,
-    /// `tol = 1e-5`, `fit_intercept = true`.
+    /// Defaults: `quantile = 0.5`, `alpha = 1.0`, `max_iter = 10000`,
+    /// `tol = 1e-9`, `fit_intercept = true`. (`max_iter` caps the simplex
+    /// pivot count; `tol` is the simplex feasibility tolerance.)
     #[must_use]
     pub fn new() -> Self {
+        let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+        let tol = F::from(1e-9).unwrap_or_else(F::epsilon);
         Self {
-            quantile: F::from(0.5).unwrap(),
+            quantile: half,
             alpha: F::one(),
-            max_iter: 1000,
-            tol: F::from(1e-5).unwrap(),
+            max_iter: 10000,
+            tol,
             fit_intercept: true,
         }
     }
@@ -92,7 +115,7 @@ impl<F: Float + FromPrimitive> QuantileRegressor<F> {
         self
     }
 
-    /// Set the maximum number of IRLS iterations.
+    /// Set the maximum number of simplex pivot iterations.
     #[must_use]
     pub fn with_max_iter(mut self, max_iter: usize) -> Self {
         self.max_iter = max_iter;
@@ -132,168 +155,270 @@ pub struct FittedQuantileRegressor<F> {
 }
 
 // ---------------------------------------------------------------------------
-// Internal helpers
+// Linear-program solver (self-contained two-phase primal simplex)
 // ---------------------------------------------------------------------------
 
-/// Cholesky solve for `A x = b`.
-fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
+/// A standard-form linear program `min c·x  s.t.  A x = b, x >= 0`, solved by a
+/// two-phase primal simplex with Bland's anti-cycling rule.
+///
+/// ferrolearn has no LP solver and the ferray substrate does not yet expose
+/// `scipy.optimize.linprog`, so the quantile-regression LP (which scikit-learn
+/// hands to HiGHS) is solved here. The simplex operates on a dense tableau of
+/// `f64` coefficients; the pinned quantile-regression datasets have a unique LP
+/// optimum, so the simplex reaches the same vertex HiGHS does.
+///
+/// (Substrate note: this is pure arithmetic over arrays. The `ferray` array-type
+/// migration of this module is tracked as #509; this introduces no NEW
+/// wrong-substrate dependency — it uses only the existing `ndarray` types.)
+mod lp {
+    /// Outcome of a simplex solve.
+    pub(super) enum LpStatus {
+        /// An optimal basic feasible solution was found; the vector is the full
+        /// decision vector `x` (length = number of structural variables).
+        Optimal(Vec<f64>),
+        /// The phase-1 problem could not drive the artificial objective to zero
+        /// (the equality system `A x = b, x >= 0` is infeasible).
+        Infeasible,
+        /// The pivot cap was hit without reaching optimality.
+        IterationLimit,
+    }
 
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "Cholesky: matrix not positive definite".into(),
-                    });
+    /// Dense simplex tableau over `m` equality rows and `n` structural columns.
+    ///
+    /// The tableau carries the structural columns followed by `m` artificial
+    /// columns (used only in phase 1). `basis[i]` is the column index basic in
+    /// row `i`.
+    struct Tableau {
+        m: usize,
+        /// Total columns currently materialized: `n_struct + n_artificial`.
+        cols: usize,
+        n_struct: usize,
+        /// `m` rows, each `cols + 1` wide (last entry is the RHS `b_i`).
+        rows: Vec<Vec<f64>>,
+        basis: Vec<usize>,
+        tol: f64,
+    }
+
+    impl Tableau {
+        /// Build the phase-1 tableau. `b` is assumed already non-negative
+        /// (callers flip any negative row before constructing). Each row gets a
+        /// dedicated artificial variable forming the initial identity basis.
+        fn new(a: &[Vec<f64>], b: &[f64], n_struct: usize, tol: f64) -> Self {
+            let m = a.len();
+            let cols = n_struct + m;
+            let mut rows = vec![vec![0.0f64; cols + 1]; m];
+            let mut basis = vec![0usize; m];
+            for i in 0..m {
+                for j in 0..n_struct {
+                    rows[i][j] = a[i][j];
                 }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
+                rows[i][n_struct + i] = 1.0;
+                rows[i][cols] = b[i];
+                basis[i] = n_struct + i;
             }
-        }
-    }
-
-    let mut z = Array1::<F>::zeros(n);
-    for i in 0..n {
-        let mut s = b[i];
-        for k in 0..i {
-            s = s - l[[i, k]] * z[k];
-        }
-        z[i] = s / l[[i, i]];
-    }
-
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = z[i];
-        for k in (i + 1)..n {
-            s = s - l[[k, i]] * x_sol[k];
-        }
-        x_sol[i] = s / l[[i, i]];
-    }
-
-    Ok(x_sol)
-}
-
-/// Gaussian elimination with partial pivoting.
-fn gaussian_solve<F: Float>(
-    n: usize,
-    a: &Array2<F>,
-    b: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let mut aug = Array2::<F>::zeros((n, n + 1));
-    for i in 0..n {
-        for j in 0..n {
-            aug[[i, j]] = a[[i, j]];
-        }
-        aug[[i, n]] = b[i];
-    }
-
-    for col in 0..n {
-        let mut max_val = aug[[col, col]].abs();
-        let mut max_row = col;
-        for row in (col + 1)..n {
-            let v = aug[[row, col]].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
+            Tableau {
+                m,
+                cols,
+                n_struct,
+                rows,
+                basis,
+                tol,
             }
         }
 
-        if max_val < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "singular matrix in Gaussian elimination".into(),
-            });
+        /// Pivot on `(prow, pcol)`: normalize the pivot row, then eliminate the
+        /// pivot column from every other row.
+        fn pivot(&mut self, prow: usize, pcol: usize) {
+            let piv = self.rows[prow][pcol];
+            let width = self.cols + 1;
+            for j in 0..width {
+                self.rows[prow][j] /= piv;
+            }
+            for i in 0..self.m {
+                if i == prow {
+                    continue;
+                }
+                let factor = self.rows[i][pcol];
+                if factor != 0.0 {
+                    for j in 0..width {
+                        self.rows[i][j] -= factor * self.rows[prow][j];
+                    }
+                }
+            }
+            self.basis[prow] = pcol;
         }
 
-        if max_row != col {
-            for j in 0..=n {
-                let tmp = aug[[col, j]];
-                aug[[col, j]] = aug[[max_row, j]];
-                aug[[max_row, j]] = tmp;
+        /// Run primal simplex iterations to optimality for the supplied cost
+        /// vector (length `cols`). `allowed` gates which columns may enter
+        /// (phase 2 forbids artificial columns). Uses Bland's rule: among
+        /// columns with negative reduced cost, pick the smallest index, and on
+        /// the ratio-test tie pick the row whose basic variable has the
+        /// smallest index — this guarantees termination without cycling.
+        ///
+        /// Returns `true` on optimality, `false` on hitting the iteration cap.
+        fn optimize(
+            &mut self,
+            cost: &[f64],
+            allowed: &dyn Fn(usize) -> bool,
+            max_iter: usize,
+        ) -> bool {
+            for _ in 0..max_iter {
+                // Reduced costs: c_j - c_B · (B^{-1} A_j). With the tableau in
+                // canonical form, reduced cost of column j is
+                //   cost[j] - sum_i cost[basis[i]] * rows[i][j].
+                let mut entering: Option<usize> = None;
+                for j in 0..self.cols {
+                    if !allowed(j) {
+                        continue;
+                    }
+                    let mut reduced = cost[j];
+                    for i in 0..self.m {
+                        reduced -= cost[self.basis[i]] * self.rows[i][j];
+                    }
+                    if reduced < -self.tol {
+                        // Bland: first (smallest-index) improving column.
+                        entering = Some(j);
+                        break;
+                    }
+                }
+                let Some(pcol) = entering else {
+                    return true; // optimal
+                };
+
+                // Ratio test: minimize rhs / col over rows with positive entry.
+                let mut prow: Option<usize> = None;
+                let mut best_ratio = f64::INFINITY;
+                for i in 0..self.m {
+                    let aij = self.rows[i][pcol];
+                    if aij > self.tol {
+                        let ratio = self.rows[i][self.cols] / aij;
+                        if ratio < best_ratio - self.tol {
+                            best_ratio = ratio;
+                            prow = Some(i);
+                        } else if (ratio - best_ratio).abs() <= self.tol {
+                            // Bland tie-break: smallest leaving-variable index.
+                            if prow.is_some_and(|cur| self.basis[i] < self.basis[cur]) {
+                                prow = Some(i);
+                            }
+                        }
+                    }
+                }
+                // No leaving row ⇒ unbounded along this column. The
+                // quantile-regression LP is always bounded below (costs >= 0),
+                // so this cannot happen; treat as optimal w.r.t. allowed cols.
+                let Some(prow) = prow else {
+                    return true;
+                };
+                self.pivot(prow, pcol);
+            }
+            false
+        }
+
+        /// Sum of the current basic values that correspond to artificial
+        /// columns — the phase-1 objective.
+        fn artificial_objective(&self) -> f64 {
+            let mut s = 0.0;
+            for i in 0..self.m {
+                if self.basis[i] >= self.n_struct {
+                    s += self.rows[i][self.cols];
+                }
+            }
+            s
+        }
+
+        /// Drive any artificial variable still basic at value ~0 out of the
+        /// basis by pivoting on a non-artificial column with a non-zero entry
+        /// (a degeneracy clean-up so phase 2 starts on a structural basis).
+        fn drive_out_artificials(&mut self) {
+            for i in 0..self.m {
+                if self.basis[i] < self.n_struct {
+                    continue;
+                }
+                let mut pcol: Option<usize> = None;
+                for j in 0..self.n_struct {
+                    if self.rows[i][j].abs() > self.tol {
+                        pcol = Some(j);
+                        break;
+                    }
+                }
+                if let Some(j) = pcol {
+                    self.pivot(i, j);
+                }
+                // If the whole structural part of the row is zero, the row is
+                // redundant; leaving the artificial basic at value 0 is fine.
             }
         }
 
-        let pivot = aug[[col, col]];
-        for row in (col + 1)..n {
-            let factor = aug[[row, col]] / pivot;
-            for j in col..=n {
-                let above = aug[[col, j]];
-                aug[[row, j]] = aug[[row, j]] - factor * above;
+        /// Extract the structural decision vector from the final basis.
+        fn solution(&self) -> Vec<f64> {
+            let mut x = vec![0.0f64; self.n_struct];
+            for i in 0..self.m {
+                let col = self.basis[i];
+                if col < self.n_struct {
+                    x[col] = self.rows[i][self.cols];
+                }
+            }
+            x
+        }
+    }
+
+    /// Solve `min c·x  s.t.  A x = b, x >= 0` via two-phase primal simplex.
+    ///
+    /// - `a`: `m × n_struct` constraint matrix (row-major).
+    /// - `b`: length-`m` RHS (may contain negatives; rows are flipped to keep
+    ///   `b >= 0` for phase 1).
+    /// - `c`: length-`n_struct` cost vector.
+    pub(super) fn solve(
+        a: &[Vec<f64>],
+        b: &[f64],
+        c: &[f64],
+        n_struct: usize,
+        max_iter: usize,
+        tol: f64,
+    ) -> LpStatus {
+        let m = a.len();
+
+        // Normalize so every RHS is non-negative (flip the whole row).
+        let mut a_norm = a.to_vec();
+        let mut b_norm = b.to_vec();
+        for i in 0..m {
+            if b_norm[i] < 0.0 {
+                for entry in a_norm[i].iter_mut().take(n_struct) {
+                    *entry = -*entry;
+                }
+                b_norm[i] = -b_norm[i];
             }
         }
-    }
 
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = aug[[i, n]];
-        for j in (i + 1)..n {
-            s = s - aug[[i, j]] * x_sol[j];
+        let mut tab = Tableau::new(&a_norm, &b_norm, n_struct, tol);
+
+        // Phase 1: minimize sum of artificial variables.
+        let mut phase1_cost = vec![0.0f64; tab.cols];
+        for cost in phase1_cost.iter_mut().skip(n_struct) {
+            *cost = 1.0;
         }
-        if aug[[i, i]].abs() < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "near-zero pivot in back substitution".into(),
-            });
+        let p1_ok = tab.optimize(&phase1_cost, &|_j| true, max_iter);
+        if !p1_ok {
+            return LpStatus::IterationLimit;
         }
-        x_sol[i] = s / aug[[i, i]];
-    }
-
-    Ok(x_sol)
-}
-
-/// Solve the weighted least-squares problem with L1 penalty approximation.
-///
-/// `(X^T W X + n_samples * alpha * diag) w = X^T W y`
-///
-/// For the quantile regression IRLS, the L1 penalty is linearised around
-/// the current coefficients. The penalty is scaled by `n_samples` so that
-/// `alpha` has the same meaning as in scikit-learn — sklearn's
-/// `QuantileRegressor` averages the data-fit term by `1/n` and adds an
-/// unscaled `alpha * ||w||_1`, which is mathematically equivalent to our
-/// unaveraged data fit plus `n_samples * alpha * ||w||_1`. Without this
-/// factor, `alpha = 1.0` in ferrolearn would be roughly `n_samples` times
-/// weaker than the same value in sklearn.
-fn weighted_l1_solve<F: Float + FromPrimitive>(
-    x: &Array2<F>,
-    y: &Array1<F>,
-    weights: &Array1<F>,
-    alpha: F,
-    prev_coef: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let (n_samples, n_features) = x.dim();
-    let eps = F::from(1e-8).unwrap();
-    let n_f = F::from(n_samples).unwrap_or_else(F::one);
-    let scaled_alpha = alpha * n_f;
-
-    let mut xtwx = Array2::<F>::zeros((n_features, n_features));
-    let mut xtwy = Array1::<F>::zeros(n_features);
-
-    for i in 0..n_samples {
-        let wi = weights[i];
-        let xi = x.row(i);
-        for r in 0..n_features {
-            xtwy[r] = xtwy[r] + wi * xi[r] * y[i];
-            for c in 0..n_features {
-                xtwx[[r, c]] = xtwx[[r, c]] + wi * xi[r] * xi[c];
-            }
+        // Feasible iff the artificial objective is driven to ~0.
+        if tab.artificial_objective() > tol.max(1e-7) {
+            return LpStatus::Infeasible;
         }
-    }
+        tab.drive_out_artificials();
 
-    // Add L1 penalty via IRLS approximation: penalise with
-    // (n_samples * alpha) / max(|w_j|, eps). The n_samples factor keeps
-    // `alpha` numerically equivalent to scikit-learn's `alpha` parameter
-    // (see function-level docstring).
-    for j in 0..n_features {
-        let pen = scaled_alpha / prev_coef[j].abs().max(eps);
-        xtwx[[j, j]] = xtwx[[j, j]] + pen;
-    }
+        // Phase 2: minimize the real cost, forbidding artificial columns from
+        // re-entering the basis.
+        let mut phase2_cost = vec![0.0f64; tab.cols];
+        phase2_cost[..n_struct].copy_from_slice(&c[..n_struct]);
+        let n_struct_cap = n_struct;
+        let p2_ok = tab.optimize(&phase2_cost, &|j| j < n_struct_cap, max_iter);
+        if !p2_ok {
+            return LpStatus::IterationLimit;
+        }
 
-    cholesky_solve(&xtwx, &xtwy).or_else(|_| gaussian_solve(n_features, &xtwx, &xtwy))
+        LpStatus::Optimal(tab.solution())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -306,7 +431,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     type Fitted = FittedQuantileRegressor<F>;
     type Error = FerroError;
 
-    /// Fit the quantile regression model via IRLS.
+    /// Fit the quantile regression model by solving the exact LP.
+    ///
+    /// Builds the standard-form linear program of `sklearn/linear_model/`
+    /// `_quantile.py:212-269` and solves it with a two-phase primal simplex,
+    /// matching scikit-learn's HiGHS solution. The intercept is a free LP
+    /// variable; no centering is performed.
     ///
     /// # Errors
     ///
@@ -314,6 +444,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::InsufficientSamples`] — zero samples.
     /// - [`FerroError::InvalidParameter`] — quantile outside (0, 1) or
     ///   negative alpha.
+    /// - [`FerroError::NumericalInstability`] — the simplex hit the iteration
+    ///   cap or the LP was infeasible (should not happen for valid input).
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedQuantileRegressor<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -347,88 +479,113 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let eps = F::from(1e-8).unwrap();
-        let one = F::one();
-        let q = self.quantile;
+        // Work in f64 for the LP solve regardless of `F` (HiGHS solves in
+        // double precision; we match that and cast results back to `F`).
+        let to_f64 = |v: F| -> Result<f64, FerroError> {
+            v.to_f64().ok_or_else(|| FerroError::NumericalInstability {
+                message: "failed to convert value to f64 for LP solve".into(),
+            })
+        };
 
-        // Center data if fitting intercept.
-        let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute column means".into(),
-                })?;
-            let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
-                message: "failed to compute target mean".into(),
-            })?;
-            let x_c = x - &x_mean;
-            let y_c = y - y_mean;
-            (x_c, y_c, Some(x_mean), Some(y_mean))
+        let quantile = to_f64(self.quantile)?;
+        let alpha_param = to_f64(self.alpha)?;
+        // sklearn rescales: alpha = sum(sample_weight) * self.alpha; unweighted
+        // sum(sample_weight) == n_samples (`_quantile.py:182`).
+        let alpha = alpha_param * (n_samples as f64);
+
+        let fit_intercept = self.fit_intercept;
+        // n_params = n_features (+ 1 for the intercept), matching sklearn.
+        let n_params = if fit_intercept {
+            n_features + 1
         } else {
-            (x.clone(), y.clone(), None, None)
+            n_features
         };
 
-        // Warm-start IRLS from the OLS solution. The L1 linearisation
-        // (`scaled_alpha / max(|w_prev_j|, eps)`) blows up when `w_prev`
-        // is initialised to `eps` everywhere — the penalty diagonal
-        // becomes `scaled_alpha / eps`, forcing `w ≈ 0` on iteration 1
-        // and starving the IRLS of useful gradient information. (#340).
-        // OLS gives `w_prev` in the right order of magnitude so the
-        // penalty is informative from the first iteration.
-        let mut w = {
-            // Compute X^T X and X^T y for a one-shot OLS solve.
-            let xtx = x_work.t().dot(&x_work);
-            let xty = x_work.t().dot(&y_work);
-            cholesky_solve(&xtx, &xty)
-                .or_else(|_| gaussian_solve(n_features, &xtx, &xty))
-                .unwrap_or_else(|_| Array1::<F>::zeros(n_features))
-        };
-        let mut w_prev = w.mapv(|v| v.abs().max(eps));
+        // Decision vector layout (all variables >= 0), matching
+        // `_quantile.py:218` `x = (s0, s, t0, t, u, v)`:
+        //   [0 .. n_params)               positive params (s0?, s)
+        //   [n_params .. 2*n_params)      negative params (t0?, t)
+        //   [2*n_params .. +n_samples)    u (residual+)
+        //   [.. + n_samples)              v (residual-)
+        let n_struct = 2 * n_params + 2 * n_samples;
+        let u_off = 2 * n_params;
+        let v_off = u_off + n_samples;
 
-        for _iter in 0..self.max_iter {
-            let w_old = w.clone();
-
-            // Compute residuals.
-            let residuals = &y_work - x_work.dot(&w);
-
-            // Compute IRLS weights for pinball loss.
-            // weight_i = asymmetric_weight_i / (2 * max(|r_i|, eps))
-            let mut weights = Array1::<F>::zeros(n_samples);
-            for i in 0..n_samples {
-                let abs_r = residuals[i].abs().max(eps);
-                // Asymmetric weight: q for positive residuals, (1-q) for negative.
-                let asym = if residuals[i] >= F::zero() {
-                    q
-                } else {
-                    one - q
-                };
-                weights[i] = asym / abs_r;
-            }
-
-            // Working response is y_work itself (we re-solve for w directly).
-            w = weighted_l1_solve(&x_work, &y_work, &weights, self.alpha, &w_prev)?;
-            w_prev = w.mapv(|v| v.abs().max(eps));
-
-            // Check convergence.
-            let max_change = w
-                .iter()
-                .zip(w_old.iter())
-                .map(|(&wn, &wo)| (wn - wo).abs())
-                .fold(F::zero(), |a, b| if b > a { b } else { a });
-
-            if max_change < self.tol {
-                break;
-            }
+        // Cost vector c (`_quantile.py:238-248`).
+        let mut c = vec![0.0f64; n_struct];
+        for j in 0..n_params {
+            c[j] = alpha;
+            c[n_params + j] = alpha;
+        }
+        if fit_intercept {
+            // Do not penalize the intercept slacks (`c[0]=0; c[n_params]=0`).
+            c[0] = 0.0;
+            c[n_params] = 0.0;
+        }
+        for i in 0..n_samples {
+            c[u_off + i] = quantile;
+            c[v_off + i] = 1.0 - quantile;
         }
 
-        let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
-            *ym - xm.dot(&w)
+        // Equality system A_eq x = y (`_quantile.py:256-269`). Row i:
+        //   [1, -1, X[i,:], -X[i,:], e_i, -e_i] (with intercept), else
+        //   [X[i,:], -X[i,:], e_i, -e_i].
+        let mut a_eq = vec![vec![0.0f64; n_struct]; n_samples];
+        let mut b_eq = vec![0.0f64; n_samples];
+        for i in 0..n_samples {
+            let row = &mut a_eq[i];
+            let base = if fit_intercept {
+                // intercept+ (col 0) and intercept- (col n_params).
+                row[0] = 1.0;
+                row[n_params] = -1.0;
+                1usize
+            } else {
+                0usize
+            };
+            for f in 0..n_features {
+                let xv = to_f64(x[[i, f]])?;
+                row[base + f] = xv; // coef+ column
+                row[n_params + base + f] = -xv; // coef- column
+            }
+            row[u_off + i] = 1.0;
+            row[v_off + i] = -1.0;
+            b_eq[i] = to_f64(y[i])?;
+        }
+
+        let tol = to_f64(self.tol)?.max(1e-9);
+        let solution = match lp::solve(&a_eq, &b_eq, &c, n_struct, self.max_iter.max(1), tol) {
+            lp::LpStatus::Optimal(sol) => sol,
+            lp::LpStatus::Infeasible => {
+                return Err(FerroError::NumericalInstability {
+                    message: "quantile-regression LP is infeasible".into(),
+                });
+            }
+            lp::LpStatus::IterationLimit => {
+                return Err(FerroError::NumericalInstability {
+                    message: "quantile-regression LP simplex did not converge \
+                              within max_iter pivots"
+                        .into(),
+                });
+            }
+        };
+
+        // Recover params = positive_slack - negative_slack
+        // (`_quantile.py:298`): params[0]=intercept, params[1:]=coef.
+        let from_f64 = |v: f64| -> F { F::from(v).unwrap_or_else(F::zero) };
+        let mut coefficients = Array1::<F>::zeros(n_features);
+        let coef_base = if fit_intercept { 1 } else { 0 };
+        for f in 0..n_features {
+            let p = solution[coef_base + f] - solution[n_params + coef_base + f];
+            coefficients[f] = from_f64(p);
+        }
+        let intercept = if fit_intercept {
+            from_f64(solution[0] - solution[n_params])
         } else {
             F::zero()
         };
 
         Ok(FittedQuantileRegressor {
-            coefficients: w,
+            coefficients,
             intercept,
         })
     }
@@ -514,7 +671,7 @@ mod tests {
         let m = QuantileRegressor::<f64>::new();
         assert_relative_eq!(m.quantile, 0.5);
         assert_relative_eq!(m.alpha, 1.0);
-        assert_eq!(m.max_iter, 1000);
+        assert_eq!(m.max_iter, 10000);
         assert!(m.fit_intercept);
     }
 
