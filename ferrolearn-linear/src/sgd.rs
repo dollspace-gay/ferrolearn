@@ -62,7 +62,7 @@
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
 //! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
 //! | REQ-14 (average / ASGD) | NOT-STARTED | blocker #534. No averaged coef/intercept (`_sgd_fast.pyx.tp:646-654`). |
-//! | REQ-15 (class_weight) | NOT-STARTED | blocker #535. No per-class `weight_pos`/`weight_neg`/`sample_weight` (`_sgd_fast.pyx.tp:599-602,630`). |
+//! | REQ-15 (class_weight + sample_weight) | SHIPPED | `pub enum ClassWeight<F> {None,Balanced,Explicit(Vec<(usize,F)>)}` + `pub class_weight` field on `SGDClassifier` (default `ClassWeight::None`) with `fn with_class_weight`; `fn compute_class_weight` returns the expanded per-class weights (`None->1.0`; `Balanced-> n_samples/(n_classes*count_c)`; `Explicit->1.0 default, override by label`) faithful to `sklearn.utils.compute_class_weight` (`sklearn/utils/class_weight.py:63-81`, `_stochastic_gradient.py:624`). `fn fit_with_sample_weight` on `SGDClassifier` AND `SGDRegressor` validates `sample_weight.len()==n_samples` (else `ShapeMismatch`); `Fit::fit` delegates with `ones(n)` (byte-identical default path — the 17 prior divergence tests stay green). `fn fit_ova` builds the per-subproblem per-sample weight `w_i = class_weight_for_sample(i) * sample_weight[i]` with the sklearn OvA mapping (binary `pos=expanded[1]`/`neg=expanded[0]`, `_stochastic_gradient.py:765-766`; multiclass class k `pos=expanded[k]`/`neg=1.0`, `:816`) and passes `&[F]` into `fn train_binary_sgd`. The kernel scales ONLY the gradient term `g = grad * sample_w[i]` (`update *= class_weight*sample_weight`, `_sgd_fast.pyx.tp:630`): the weight data term `w[j]*shrink - eta*g*x[j]` and the (gated) intercept gradient term `-eta*g` use `g`; the L2 shrink (`:632-635`), L1 truncation (`:656-658`), one-class `-2*eta*alpha` offset (`:642`) and the unweighted `sumloss` (`:597`) are UNSCALED. `fn train_regressor_sgd` mirrors the same scaling (`class_weight=1` for regression). Consumer: `Fit for SGDClassifier`/`SGDRegressor` -> `PipelineEstimator`; `fit_with_sample_weight` consumed by `Fit::fit`. Tests: divergence `sgd_class_weight_balanced` (oracle coef `[0.4806667587635881, 0.4620316761984426]` intercept `-1.2811684177087947`), `sgd_class_weight_explicit` (`{0:1.0,1:3.0}` coef `[0.5705300651778317, 0.5660417632427646]` intercept `-1.7542279278451731`), `sgd_sample_weight` (coef `[0.25648548424261425, 0.7995046753090618]` intercept `-1.221373410658307`), `sgd_class_weight_balanced_multiclass` (class-0 coef `[-0.586000112348521, -0.369263665877338]` + argmax preds), `sgd_regressor_sample_weight` (coef `[0.9425558668838198, 1.3974216923953962]` intercept `0.7259434415390171`). `_sgd_fast.pyx.tp:599-602,630` / `_stochastic_gradient.py:624,765-766,816`. Closes #535. NOTE: `class_weight`/`sample_weight` on the `partial_fit` path are uniform `1.0` (no `class_weight`/`sample_weight` arg on `PartialFit` yet) — tracked under the partial_fit surface, not this REQ. |
 //! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
 //! | REQ-17 (multiclass one-vs-all) | SHIPPED | `fn fit_ova` (one binary per class) + `fn predict` argmax (`_stochastic_gradient.py:788-844`). Consumer: `Fit for SGDClassifier` -> `PipelineEstimator`. Test: `test_sgd_classifier_multiclass`. |
 //! | REQ-18 (SGDOneClassSVM) | SHIPPED | `pub struct SGDOneClassSVM<F>` (`nu`/`fit_intercept`/`max_iter`/`tol`/`shuffle`/`learning_rate`/`eta0`/`power_t`/`random_state`/`n_iter_no_change` + `new`/`#[must_use]` builders, defaults `_stochastic_gradient.py:2245-2281`) with `fn fit_one_class` + `impl Fit<Array2<F>, ()> for SGDOneClassSVM` (X-only fit, `y` ignored, `_stochastic_gradient.py:2554`): builds `y = ones(n)`, `alpha = nu/2` (`:2588`), `penalty = L2`, `l1_ratio = 0`, `one_class = true` (`:2262-2289,2312`), inits the SGD intercept `b = 1` (offset init 0 -> `1 - 0`, `:2238,2325`), calls the reused `fn train_binary_sgd` Hinge kernel, then stores `coef_ = w`, `offset_ = 1 - b` (`:2377`). The one-class intercept term lives in `fn train_binary_sgd`: when `hyper.one_class` the gated intercept update gains `- 2*eta*alpha` (`intercept_update = -eta*grad - 2*eta*alpha`), mirroring `_sgd_fast.pyx.tp:641-642` (`if one_class: intercept_update -= 2.*eta*alpha`); `pub one_class: bool` was added to `SGDHyper` (default `false` via `fn clf_hyper`/`reg_hyper`, leaving the clf/reg intercept update byte-identical — the existing 15 divergence tests stay green). `pub struct FittedSGDOneClassSVM<F>` exposes `coef()`/`offset()`/`decision_function()` (`X·coef_ - offset_`, `:2622`)/`score_samples()` (`+ offset_ = X·coef_`, `:2639`) and `impl Predict<Array2<F>>` returning `Array1<isize>` of `+1`/`-1` (`(decision >= 0) ? +1 : -1`, `:2655-2657`). Consumer: `pub use sgd::{SGDOneClassSVM, FittedSGDOneClassSVM}` from `ferrolearn-linear/src/lib.rs` (the grandfathered public-API boundary, matching `SGDClassifier`/`SGDRegressor`). Tests: divergence `sgd_one_class_svm_decision` (live oracle nu=0.5/eta0=0.05/constant/max_iter=10/shuffle=false: coef `[0.009883660184666337, 0.009883660184666337]`, offset `1.1102230246251565e-16`, 1e-7) and `sgd_one_class_svm_predict` (nu=0.8/eta0=0.1/max_iter=15: coef `[0.20020636453962284, 0.12292535592963398]`, offset `0.10000000000000009`, predict `[1,-1,1,-1]`). `_stochastic_gradient.py:2084-2668` / `_sgd_fast.pyx.tp:639-644`. Closes #536. |
@@ -441,6 +441,75 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Class weights
+// ---------------------------------------------------------------------------
+
+/// Per-class weighting strategy for [`SGDClassifier`].
+///
+/// Mirrors sklearn's `class_weight` parameter
+/// (`_stochastic_gradient.py` constraint `[dict, "balanced", None]`); the
+/// expanded per-class weights are computed by [`compute_class_weight`] following
+/// `sklearn.utils.compute_class_weight` semantics and fed into the per-sample
+/// `update *= class_weight * sample_weight` scaling (`_sgd_fast.pyx.tp:630`).
+#[derive(Debug, Clone)]
+pub enum ClassWeight<F> {
+    /// Uniform weights (all classes weighted `1.0`). The default.
+    None,
+    /// Balanced weights `n_samples / (n_classes * count_c)` per class `c`,
+    /// matching `sklearn.utils.compute_class_weight("balanced", ...)`
+    /// (`class_weight.py:73`).
+    Balanced,
+    /// Explicit class-label -> weight map. Classes absent from the map default
+    /// to `1.0`, matching the dict branch of `compute_class_weight`
+    /// (`class_weight.py:77-81`).
+    Explicit(Vec<(usize, F)>),
+}
+
+/// Compute the expanded per-class weight vector aligned to `classes`
+/// (sorted ascending, matching sklearn's `classes_`).
+///
+/// Faithful to `sklearn.utils.compute_class_weight`
+/// (`sklearn/utils/class_weight.py:63-81`):
+/// - `None` -> all `1.0` (`:63-65`).
+/// - `Balanced` -> `n_samples / (n_classes * count_c)` per class `c`,
+///   where `count_c` is the number of samples with label `c` (`:66-74`).
+/// - `Explicit(map)` -> `1.0` default, overridden by the map entries matched by
+///   class label (`:75-81`).
+///
+/// `classes` is the sorted unique label set; `y` is the per-sample label array.
+fn compute_class_weight<F: Float>(cw: &ClassWeight<F>, classes: &[usize], y: &[usize]) -> Vec<F> {
+    match cw {
+        ClassWeight::None => vec![F::one(); classes.len()],
+        ClassWeight::Balanced => {
+            // `recip_freq = len(y) / (n_classes * bincount(y_ind))`
+            // (`class_weight.py:73`), indexed per class.
+            let n_samples = F::from(y.len()).unwrap_or_else(F::zero);
+            let n_classes = F::from(classes.len()).unwrap_or_else(F::one);
+            classes
+                .iter()
+                .map(|&c| {
+                    let count = y.iter().filter(|&&label| label == c).count();
+                    let count_f = F::from(count).unwrap_or_else(F::one);
+                    if count_f > F::zero() {
+                        n_samples / (n_classes * count_f)
+                    } else {
+                        F::one()
+                    }
+                })
+                .collect()
+        }
+        ClassWeight::Explicit(map) => classes
+            .iter()
+            .map(|&c| {
+                map.iter()
+                    .find(|(label, _)| *label == c)
+                    .map_or_else(F::one, |(_, w)| *w)
+            })
+            .collect(),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Penalty (regularization term)
 // ---------------------------------------------------------------------------
 
@@ -645,6 +714,11 @@ pub struct SGDClassifier<F> {
     /// updated and stays at its init value `0` (`_sgd_fast.pyx.tp:639-644`: the
     /// intercept update is gated on `if fit_intercept == 1`).
     pub fit_intercept: bool,
+    /// Per-class weighting strategy. Defaults to [`ClassWeight::None`] (uniform).
+    /// Mirrors sklearn's `class_weight` parameter (default `None`); the expanded
+    /// weights scale the per-sample gradient term via
+    /// `update *= class_weight * sample_weight` (`_sgd_fast.pyx.tp:599-602,630`).
+    pub class_weight: ClassWeight<F>,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -671,6 +745,7 @@ impl<F: Float> SGDClassifier<F> {
             shuffle: true,
             n_iter_no_change: 5,
             fit_intercept: true,
+            class_weight: ClassWeight::None,
         }
     }
 
@@ -781,6 +856,19 @@ impl<F: Float> SGDClassifier<F> {
         self.fit_intercept = fit_intercept;
         self
     }
+
+    /// Set the per-class weighting strategy.
+    ///
+    /// Mirrors sklearn's `class_weight` parameter (default `None`). The expanded
+    /// per-class weights (via [`compute_class_weight`]) scale only the
+    /// gradient-derived part of each per-sample update
+    /// (`_sgd_fast.pyx.tp:599-602,630`); the L2 shrink, L1 truncation and the
+    /// one-class offset are left unscaled.
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -842,7 +930,19 @@ struct SGDHyper<F> {
 /// Train a single binary classifier via SGD, updating `weights` and
 /// `intercept` in place. `y_binary` must be in `{-1, +1}`.
 ///
+/// `sample_w[i]` is the per-sample weight `class_weight_i * sample_weight_i`
+/// for sample `i` (`_sgd_fast.pyx.tp:599-602,630`). It scales ONLY the
+/// gradient-derived part of the update (`update *= class_weight * sample_weight`
+/// at `:630`); the L2 shrink (`:632-635`), the L1 truncation (`:656-658`) and
+/// the one-class `-2*eta*alpha` offset (`:642`) are left unscaled. An all-ones
+/// `sample_w` (the default `fit` path) reproduces the byte-identical unweighted
+/// behaviour. `sample_w.len()` must equal `x.nrows()`.
+///
 /// Returns the cumulative loss and the step counter after training.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the per-sample weight vector"
+)]
 fn train_binary_sgd<F, L>(
     x: &Array2<F>,
     y_binary: &Array1<F>,
@@ -851,6 +951,7 @@ fn train_binary_sgd<F, L>(
     loss_fn: &L,
     hyper: &SGDHyper<F>,
     initial_t: usize,
+    sample_w: &[F],
 ) -> (F, usize)
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
@@ -934,8 +1035,17 @@ where
                 .gradient(y_binary[i], y_pred)
                 .max(-max_dloss)
                 .min(max_dloss);
+            // Per-sample weight scaling: `update *= class_weight * sample_weight`
+            // (`_sgd_fast.pyx.tp:630`). `update = -eta*dloss`, so scaling the
+            // update by `w_i` is equivalent to scaling the (clipped) gradient
+            // `dloss` by `w_i` BEFORE forming both the weight data term and the
+            // (gated) intercept gradient term. This multiplies ONLY the
+            // gradient-derived part; the L2 shrink, L1 truncation and the
+            // one-class offset below are unaffected. `g` is the scaled gradient.
+            let g = grad * sample_w[i];
             // `sumloss` is the SUM (not mean) of per-sample losses over the
-            // epoch (`_sgd_fast.pyx.tp:597`), used by the `best_loss` stop rule.
+            // epoch (`_sgd_fast.pyx.tp:597`), computed from the UNWEIGHTED loss
+            // (the weight only multiplies `update`, not `loss.loss(y, p)`).
             epoch_loss = epoch_loss + loss_fn.loss(y_binary[i], y_pred);
 
             // L2 shrink: scale the whole weight vector by the CLAMPED factor
@@ -948,23 +1058,25 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] * shrink;
             }
-            // Gradient add `w.add(x, -eta*grad)` (`_sgd_fast.pyx.tp:637-638`).
+            // Gradient add `w.add(x, update)` with the scaled `update = -eta*g`
+            // (`_sgd_fast.pyx.tp:637-638`); `g` is the sample-weighted gradient.
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * grad * xi[j];
+                weights[j] = weights[j] - eta * g * xi[j];
             }
             // The intercept update is gated on `fit_intercept` and is NOT
             // regularized (`intercept_decay=1`, `_sgd_fast.pyx.tp:639-644`:
             // `if fit_intercept == 1: intercept_update = update; if one_class:
             // intercept_update -= 2.*eta*alpha; intercept += intercept_update *
-            // intercept_decay`). `update = -eta*grad`, so the standard path is
-            // `intercept -= eta*grad`. For the one-class SVM the extra
-            // `- 2*eta*alpha` term is added (`:641-642`), so
-            // `intercept -= eta*grad + 2*eta*alpha`. When `fit_intercept` is
-            // false the intercept is never modified and stays at its init value
-            // (`0` for clf/reg, `1` for one-class — set by the caller).
+            // intercept_decay`). `update = -eta*g` is the SCALED update (sklearn
+            // sets `intercept_update = update` at `:640`, after `update *=
+            // class_weight*sample_weight` at `:630`), so the standard path is
+            // `intercept -= eta*g`. For the one-class SVM the extra
+            // `- 2*eta*alpha` term is added (`:641-642`) and is NOT scaled by the
+            // sample weight. When `fit_intercept` is false the intercept is never
+            // modified and stays at its init value (`0` clf/reg, `1` one-class).
             if hyper.fit_intercept {
                 let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
-                let mut intercept_update = -eta * grad;
+                let mut intercept_update = -eta * g;
                 if hyper.one_class {
                     intercept_update = intercept_update - two * eta * hyper.alpha;
                 }
@@ -1055,6 +1167,41 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// not positive.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedSGDClassifier<F>, FerroError> {
+        // Delegate to the sample-weighted path with a uniform `ones(n)` weight
+        // vector, so the default `fit` behaviour is byte-identical to the
+        // unweighted kernel (`_check_sample_weight` returns `ones` when
+        // `sample_weight=None`, `_stochastic_gradient.py:627`).
+        let sample_weight = Array1::<F>::from_elem(x.nrows(), F::one());
+        self.fit_with_sample_weight(x, y, &sample_weight)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDClassifier<F> {
+    /// Fit the SGD classifier with explicit per-sample weights.
+    ///
+    /// Mirrors `SGDClassifier.fit(X, y, sample_weight=...)`. The per-sample
+    /// weight scales ONLY the gradient-derived part of each update
+    /// (`update *= class_weight * sample_weight`, `_sgd_fast.pyx.tp:630`); the
+    /// L2 shrink, L1 truncation and one-class offset are unscaled. The
+    /// `class_weight` field (via [`compute_class_weight`],
+    /// `_stochastic_gradient.py:624`) is combined multiplicatively per sample.
+    ///
+    /// [`Fit::fit`] delegates here with a uniform `ones(n)` weight vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x`/`y`/`sample_weight` have
+    /// mismatched sample counts.
+    /// Returns [`FerroError::InsufficientSamples`] if fewer than 2 classes
+    /// are present.
+    /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
+    /// invalid.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedSGDClassifier<F>, FerroError> {
         validate_clf_params(
             x,
             y,
@@ -1063,6 +1210,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             self.alpha,
             self.l1_ratio,
         )?;
+
+        let n_samples = x.nrows();
+        if sample_weight.len() != n_samples {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sample_weight.len()],
+                context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -1080,8 +1236,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         let hyper = clf_hyper(self);
         let loss_enum = self.loss;
 
-        let (weight_matrix, intercepts, t) =
-            fit_ova(x, y, &classes, n_features, &loss_enum, &hyper, 0)?;
+        // Expanded per-class weights (`_stochastic_gradient.py:624`), aligned to
+        // the sorted `classes` (= sklearn `classes_`).
+        let expanded = compute_class_weight(&self.class_weight, &classes, &y.to_vec());
+        let sw = sample_weight.to_vec();
+
+        let (weight_matrix, intercepts, t) = fit_ova(
+            x, y, &classes, n_features, &loss_enum, &hyper, 0, &expanded, &sw,
+        )?;
 
         Ok(FittedSGDClassifier {
             weight_matrix,
@@ -1159,6 +1321,17 @@ type OvaResult<F> = (Vec<Array1<F>>, Vec<F>, usize);
 
 /// Train one-vs-all binary classifiers, returning per-class weights, intercepts,
 /// and the cumulative step counter.
+///
+/// `expanded_class_weight[k]` is the weight of `classes[k]` from
+/// [`compute_class_weight`] (`_stochastic_gradient.py:624`). `sample_weight[i]`
+/// is the user per-sample weight. For each binary subproblem the per-sample
+/// weight passed to the kernel is `class_weight_for_sample(i) * sample_weight[i]`
+/// where `class_weight_for_sample(i)` is `pos_weight` if sample `i` is the
+/// positive class else `neg_weight`, with the sklearn OvA mapping:
+/// binary (`_fit_binary`, `:765-766`) `pos = expanded[1]`, `neg = expanded[0]`;
+/// multiclass class `k` (`_fit_multiclass`, `:816`) `pos = expanded[k]`,
+/// `neg = 1.0`.
+#[allow(clippy::too_many_arguments, reason = "threads class + sample weights")]
 fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
     x: &Array2<F>,
     y: &Array1<usize>,
@@ -1167,6 +1340,8 @@ fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
     loss_enum: &ClassifierLoss,
     hyper: &SGDHyper<F>,
     initial_t: usize,
+    expanded_class_weight: &[F],
+    sample_weight: &[F],
 ) -> Result<OvaResult<F>, FerroError> {
     let n_classes = classes.len();
     let mut weight_matrix: Vec<Array1<F>> = Vec::with_capacity(n_classes);
@@ -1175,6 +1350,10 @@ fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
 
     if n_classes == 2 {
         // Single binary problem: class[0] -> -1, class[1] -> +1.
+        // OvA weight mapping (`_fit_binary`, `_stochastic_gradient.py:765-766`):
+        // pos_weight = expanded[1], neg_weight = expanded[0].
+        let pos_weight = expanded_class_weight[1];
+        let neg_weight = expanded_class_weight[0];
         let y_binary: Array1<F> = y.mapv(|label| {
             if label == classes[1] {
                 F::one()
@@ -1182,22 +1361,50 @@ fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
                 -F::one()
             }
         });
+        // Per-sample weight = class_weight_for_sample(i) * sample_weight[i]
+        // (`_sgd_fast.pyx.tp:599-602,630`). `y_binary[i] > 0` selects pos_weight.
+        let sample_w: Vec<F> = (0..x.nrows())
+            .map(|i| {
+                let cw = if y_binary[i] > F::zero() {
+                    pos_weight
+                } else {
+                    neg_weight
+                };
+                cw * sample_weight[i]
+            })
+            .collect();
         let mut w = Array1::<F>::zeros(n_features);
         let mut b = F::zero();
-        let (_, t) =
-            dispatch_train_binary(x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t);
+        let (_, t) = dispatch_train_binary(
+            x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t, &sample_w,
+        );
         global_t = t;
         weight_matrix.push(w);
         intercepts.push(b);
     } else {
-        // One-vs-all: one binary problem per class.
-        for &cls in classes {
+        // One-vs-all: one binary problem per class. Multiclass mapping
+        // (`_fit_multiclass`, `_stochastic_gradient.py:816`): for class k,
+        // pos_weight = expanded[k], neg_weight = 1.0.
+        for (k, &cls) in classes.iter().enumerate() {
+            let pos_weight = expanded_class_weight[k];
+            let neg_weight = F::one();
             let y_binary: Array1<F> =
                 y.mapv(|label| if label == cls { F::one() } else { -F::one() });
+            let sample_w: Vec<F> = (0..x.nrows())
+                .map(|i| {
+                    let cw = if y_binary[i] > F::zero() {
+                        pos_weight
+                    } else {
+                        neg_weight
+                    };
+                    cw * sample_weight[i]
+                })
+                .collect();
             let mut w = Array1::<F>::zeros(n_features);
             let mut b = F::zero();
-            let (_, t) =
-                dispatch_train_binary(x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t);
+            let (_, t) = dispatch_train_binary(
+                x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t, &sample_w,
+            );
             global_t = t;
             weight_matrix.push(w);
             intercepts.push(b);
@@ -1221,6 +1428,10 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
 ) -> usize {
     let n_classes = classes.len();
     let mut global_t = initial_t;
+    // `partial_fit` does not (yet) carry `class_weight`/`sample_weight`, so the
+    // per-sample weight is uniform `1.0` — the all-ones path is byte-identical to
+    // the pre-weighting kernel (`update *= 1*1`, `_sgd_fast.pyx.tp:630`).
+    let sample_w: Vec<F> = vec![F::one(); x.nrows()];
 
     if n_classes == 2 {
         let y_binary: Array1<F> = y.mapv(|label| {
@@ -1238,6 +1449,7 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
             loss_enum,
             hyper,
             global_t,
+            &sample_w,
         );
         global_t = t;
     } else {
@@ -1252,6 +1464,7 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
                 loss_enum,
                 hyper,
                 global_t,
+                &sample_w,
             );
             global_t = t;
         }
@@ -1261,6 +1474,13 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
 }
 
 /// Dispatch to the appropriate typed loss training function.
+///
+/// `sample_w[i] = class_weight_i * sample_weight_i` is the per-sample weight
+/// (`_sgd_fast.pyx.tp:599-602,630`), forwarded verbatim to the kernel.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the per-sample weight vector"
+)]
 fn dispatch_train_binary<F: Float + Send + Sync + ScalarOperand + 'static>(
     x: &Array2<F>,
     y_binary: &Array1<F>,
@@ -1269,22 +1489,34 @@ fn dispatch_train_binary<F: Float + Send + Sync + ScalarOperand + 'static>(
     loss_enum: &ClassifierLoss,
     hyper: &SGDHyper<F>,
     initial_t: usize,
+    sample_w: &[F],
 ) -> (F, usize) {
     match loss_enum {
-        ClassifierLoss::Hinge => train_binary_sgd(x, y_binary, w, b, &Hinge, hyper, initial_t),
+        ClassifierLoss::Hinge => {
+            train_binary_sgd(x, y_binary, w, b, &Hinge, hyper, initial_t, sample_w)
+        }
         ClassifierLoss::SquaredHinge => {
-            train_binary_sgd(x, y_binary, w, b, &SquaredHinge, hyper, initial_t)
+            train_binary_sgd(x, y_binary, w, b, &SquaredHinge, hyper, initial_t, sample_w)
         }
         ClassifierLoss::Perceptron => {
-            train_binary_sgd(x, y_binary, w, b, &Perceptron, hyper, initial_t)
+            train_binary_sgd(x, y_binary, w, b, &Perceptron, hyper, initial_t, sample_w)
         }
-        ClassifierLoss::Log => train_binary_sgd(x, y_binary, w, b, &LogLoss, hyper, initial_t),
+        ClassifierLoss::Log => {
+            train_binary_sgd(x, y_binary, w, b, &LogLoss, hyper, initial_t, sample_w)
+        }
         ClassifierLoss::SquaredError => {
-            train_binary_sgd(x, y_binary, w, b, &SquaredError, hyper, initial_t)
+            train_binary_sgd(x, y_binary, w, b, &SquaredError, hyper, initial_t, sample_w)
         }
-        ClassifierLoss::ModifiedHuber => {
-            train_binary_sgd(x, y_binary, w, b, &ModifiedHuber, hyper, initial_t)
-        }
+        ClassifierLoss::ModifiedHuber => train_binary_sgd(
+            x,
+            y_binary,
+            w,
+            b,
+            &ModifiedHuber,
+            hyper,
+            initial_t,
+            sample_w,
+        ),
     }
 }
 
@@ -1445,8 +1677,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         hyper.max_iter = 1;
         let loss_enum = self.loss;
 
-        let (weight_matrix, intercepts, t) =
-            fit_ova(x, y, &classes, n_features, &loss_enum, &hyper, 0)?;
+        // Initial `partial_fit` does not carry per-sample/class weights here, so
+        // the expanded class weights and sample weights are uniform `1.0` — the
+        // all-ones path is byte-identical to the pre-weighting kernel.
+        let expanded: Vec<F> = vec![F::one(); classes.len()];
+        let sw: Vec<F> = vec![F::one(); x.nrows()];
+
+        let (weight_matrix, intercepts, t) = fit_ova(
+            x, y, &classes, n_features, &loss_enum, &hyper, 0, &expanded, &sw,
+        )?;
 
         Ok(FittedSGDClassifier {
             weight_matrix,
@@ -1739,6 +1978,16 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
 
 /// Train a single regressor via SGD, updating `weights` and `intercept`
 /// in place. Returns the final loss and step counter.
+///
+/// `sample_w[i]` is the per-sample weight `sample_weight[i]`, scaling ONLY the
+/// gradient-derived part of each update (`update *= class_weight * sample_weight`
+/// with `class_weight = 1` for regression, `_sgd_fast.pyx.tp:599-602,630`); the
+/// L2 shrink and L1 truncation are unscaled. An all-ones `sample_w` (the default
+/// `fit` path) reproduces the byte-identical unweighted behaviour.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the per-sample weight vector"
+)]
 fn train_regressor_sgd<F, L>(
     x: &Array2<F>,
     y: &Array1<F>,
@@ -1747,6 +1996,7 @@ fn train_regressor_sgd<F, L>(
     loss_fn: &L,
     hyper: &SGDHyper<F>,
     initial_t: usize,
+    sample_w: &[F],
 ) -> (F, usize)
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
@@ -1825,8 +2075,12 @@ where
                 .gradient(y[i], y_pred)
                 .max(-max_dloss)
                 .min(max_dloss);
+            // Per-sample weight scaling: `update *= class_weight * sample_weight`
+            // with `class_weight = 1` for regression (`_sgd_fast.pyx.tp:630`).
+            // `g` is the sample-weighted gradient, scaling ONLY the gradient term.
+            let g = grad * sample_w[i];
             // `sumloss` is the SUM (not mean) of per-sample losses over the
-            // epoch (`_sgd_fast.pyx.tp:597`), used by the `best_loss` stop rule.
+            // epoch (`_sgd_fast.pyx.tp:597`), computed from the UNWEIGHTED loss.
             epoch_loss = epoch_loss + loss_fn.loss(y[i], y_pred);
 
             // L2 shrink: clamped multiplicative factor
@@ -1837,18 +2091,19 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] * shrink;
             }
-            // Gradient add `w.add(x, -eta*grad)` (`_sgd_fast.pyx.tp:637-638`).
+            // Gradient add `w.add(x, -eta*g)` with the scaled `g`
+            // (`_sgd_fast.pyx.tp:637-638`).
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * grad * xi[j];
+                weights[j] = weights[j] - eta * g * xi[j];
             }
             // The intercept update is gated on `fit_intercept` and is NOT
             // regularized (`_sgd_fast.pyx.tp:639-644`: `if fit_intercept == 1:
             // intercept_update = update; ... intercept += intercept_update *
-            // intercept_decay`). When `fit_intercept` is false the intercept is
-            // never modified and stays at its init value `0` (`intercept` enters
-            // this fn as `0`).
+            // intercept_decay`). `update = -eta*g` is the SCALED update. When
+            // `fit_intercept` is false the intercept is never modified and stays
+            // at its init value `0` (`intercept` enters this fn as `0`).
             if hyper.fit_intercept {
-                *intercept = *intercept - eta * grad;
+                *intercept = *intercept - eta * g;
             }
 
             // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
@@ -1891,6 +2146,13 @@ where
 }
 
 /// Dispatch regressor training to the appropriate typed loss function.
+///
+/// `sample_w[i] = sample_weight[i]` is forwarded verbatim to the kernel
+/// (`_sgd_fast.pyx.tp:630`, `class_weight = 1` for regression).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads the per-sample weight vector"
+)]
 fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
     x: &Array2<F>,
     y: &Array1<F>,
@@ -1899,14 +2161,22 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
     loss_enum: &RegressorLoss<F>,
     hyper: &SGDHyper<F>,
     initial_t: usize,
+    sample_w: &[F],
 ) -> (F, usize) {
     match loss_enum {
         RegressorLoss::SquaredError => {
-            train_regressor_sgd(x, y, w, b, &SquaredError, hyper, initial_t)
+            train_regressor_sgd(x, y, w, b, &SquaredError, hyper, initial_t, sample_w)
         }
-        RegressorLoss::Huber(eps) => {
-            train_regressor_sgd(x, y, w, b, &Huber { epsilon: *eps }, hyper, initial_t)
-        }
+        RegressorLoss::Huber(eps) => train_regressor_sgd(
+            x,
+            y,
+            w,
+            b,
+            &Huber { epsilon: *eps },
+            hyper,
+            initial_t,
+            sample_w,
+        ),
         RegressorLoss::EpsilonInsensitive(eps) => train_regressor_sgd(
             x,
             y,
@@ -1915,6 +2185,7 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             &EpsilonInsensitive { epsilon: *eps },
             hyper,
             initial_t,
+            sample_w,
         ),
         RegressorLoss::SquaredEpsilonInsensitive(eps) => train_regressor_sgd(
             x,
@@ -1924,6 +2195,7 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             &SquaredEpsilonInsensitive { epsilon: *eps },
             hyper,
             initial_t,
+            sample_w,
         ),
     }
 }
@@ -2029,6 +2301,35 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// invalid.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedSGDRegressor<F>, FerroError> {
+        // Delegate to the sample-weighted path with a uniform `ones(n)` weight
+        // vector — byte-identical to the unweighted kernel
+        // (`_check_sample_weight` -> ones, `_stochastic_gradient.py:627`).
+        let sample_weight = Array1::<F>::from_elem(x.nrows(), F::one());
+        self.fit_with_sample_weight(x, y, &sample_weight)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDRegressor<F> {
+    /// Fit the SGD regressor with explicit per-sample weights.
+    ///
+    /// Mirrors `SGDRegressor.fit(X, y, sample_weight=...)`. The per-sample weight
+    /// scales ONLY the gradient-derived part of each update
+    /// (`update *= class_weight * sample_weight` with `class_weight = 1` for
+    /// regression, `_sgd_fast.pyx.tp:630`); the L2 shrink and L1 truncation are
+    /// unscaled. [`Fit::fit`] delegates here with a uniform `ones(n)` vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x`/`y`/`sample_weight` have
+    /// mismatched sample counts.
+    /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
+    /// invalid.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedSGDRegressor<F>, FerroError> {
         validate_reg_params(
             x,
             y,
@@ -2039,12 +2340,22 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             &self.loss,
         )?;
 
+        let n_samples = x.nrows();
+        if sample_weight.len() != n_samples {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sample_weight.len()],
+                context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
         let n_features = x.ncols();
         let hyper = reg_hyper(self);
         let mut w = Array1::<F>::zeros(n_features);
         let mut b = F::zero();
+        let sw = sample_weight.to_vec();
 
-        let (_, t) = dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0);
+        let (_, t) = dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sw);
 
         Ok(FittedSGDRegressor {
             weights: w,
@@ -2121,6 +2432,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
 
         let mut hyper = self.hyper.clone();
         hyper.max_iter = 1;
+        // `partial_fit` carries no per-sample weight here; uniform `1.0`.
+        let sample_w: Vec<F> = vec![F::one(); x.nrows()];
 
         let (_, t) = dispatch_train_regressor(
             x,
@@ -2130,6 +2443,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             &self.loss,
             &hyper,
             self.t,
+            &sample_w,
         );
         self.t = t;
 
@@ -2170,8 +2484,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         hyper.max_iter = 1;
         let mut w = Array1::<F>::zeros(n_features);
         let mut b = F::zero();
+        // Initial `partial_fit` carries no per-sample weight here; uniform `1.0`.
+        let sample_w: Vec<F> = vec![F::one(); x.nrows()];
 
-        let (_, t) = dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0);
+        let (_, t) =
+            dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sample_w);
 
         Ok(FittedSGDRegressor {
             weights: w,
@@ -2468,8 +2785,11 @@ impl<F: Float> SGDOneClassSVM<F> {
         // at `b = 1 - offset_ = 1` (`_stochastic_gradient.py:2238,2325`). This
         // differs from the classifier/regressor paths, which start at `b = 0`.
         let mut b = F::one();
+        // One-Class SVM fit has no per-sample weighting here; the per-sample
+        // weight is uniform `1.0` (byte-identical to the pre-weighting kernel).
+        let sample_w: Vec<F> = vec![F::one(); n_samples];
 
-        let (_, _t) = train_binary_sgd(x, &y_ones, &mut w, &mut b, &Hinge, &hyper, 0);
+        let (_, _t) = train_binary_sgd(x, &y_ones, &mut w, &mut b, &Hinge, &hyper, 0, &sample_w);
 
         // `offset_ = 1 - intercept` (`_stochastic_gradient.py:2377`).
         let offset = F::one() - b;

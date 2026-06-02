@@ -28,8 +28,8 @@ use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
 use ferrolearn_core::traits::Predict;
 use ferrolearn_linear::sgd::{
-    ClassifierLoss, Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss, SGDClassifier,
-    SGDOneClassSVM, SGDRegressor,
+    ClassWeight, ClassifierLoss, Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss,
+    SGDClassifier, SGDOneClassSVM, SGDRegressor,
 };
 use ndarray::{Array1, Array2};
 
@@ -1247,4 +1247,304 @@ fn sgd_one_class_svm_predict() {
             preds[i]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-15 / #535 — `class_weight` + `sample_weight` per-sample update scaling.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:599-602,630`
+//   `class_weight = weight_pos if y > 0 else weight_neg`
+//   `update *= class_weight * sample_weight`
+// scales ONLY the dloss-derived `update` (= -eta*dloss), BEFORE the L2 shrink
+// (`:632-635`) and BEFORE the L1 truncation (`:656-658`); the one-class
+// `-2*eta*alpha` intercept term (`:642`) is added AFTER and is NOT scaled.
+//
+// OvA weight mapping (`sklearn/linear_model/_stochastic_gradient.py`):
+//   binary  (`_fit_binary`, :765-766): pos=expanded[1], neg=expanded[0]
+//   multiclass class i (`_fit_multiclass`, :816): pos=expanded[i], neg=1.0
+// expanded weights from `compute_class_weight(self.class_weight, classes_, y)`
+// (`:624`) per `sklearn.utils.compute_class_weight` (`class_weight.py:63-81`):
+//   None -> 1.0; balanced -> n_samples/(n_classes*count_c); dict -> 1.0 default.
+//
+// All four pins use `shuffle=False` (single deterministic index order, so the
+// fitted weights are cross-impl comparable) with the `constant` schedule.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[0.,0.],[1.,0.],[0.,1.],[2.,0.],[0.,2.],[5.,5.],[6.,5.]]); \
+/// y=np.array([0,0,0,0,0,1,1]); \
+/// m=SGDClassifier(loss='log_loss',class_weight='balanced',learning_rate='constant', \
+///   eta0=0.1,alpha=0.0001,max_iter=10,tol=None,shuffle=False,fit_intercept=True, \
+///   random_state=0).fit(X,y); print(m.coef_.ravel().tolist(), m.intercept_.tolist())"
+/// ```
+#[test]
+fn sgd_class_weight_balanced() {
+    // Live sklearn 1.5.2 oracle (5 negatives, 2 positives -> imbalanced).
+    const SK_COEF: [f64; 2] = [0.4806667587635881, 0.4620316761984426];
+    const SK_INTERCEPT: f64 = -1.2811684177087947;
+
+    let x = Array2::from_shape_vec(
+        (7, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0, 5.0, 5.0, 6.0, 5.0,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0_usize, 0, 0, 0, 0, 1, 1]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Log)
+        .with_class_weight(ClassWeight::Balanced)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.0001)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY) // == sklearn `tol=None`
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("fit must succeed");
+    let coef = fitted.coefficients();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!(
+            (coef[k] - sk).abs() < 1e-7,
+            "coef[{k}]={} vs sklearn {sk}",
+            coef[k]
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-7,
+        "intercept={} vs sklearn {SK_INTERCEPT}",
+        fitted.intercept()
+    );
+}
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[0.,0.],[1.,0.],[0.,1.],[2.,0.],[0.,2.],[5.,5.],[6.,5.]]); \
+/// y=np.array([0,0,0,0,0,1,1]); \
+/// m=SGDClassifier(loss='log_loss',class_weight={0:1.0,1:3.0},learning_rate='constant', \
+///   eta0=0.1,alpha=0.0001,max_iter=10,tol=None,shuffle=False,fit_intercept=True, \
+///   random_state=0).fit(X,y); print(m.coef_.ravel().tolist(), m.intercept_.tolist())"
+/// ```
+#[test]
+fn sgd_class_weight_explicit() {
+    // Live sklearn 1.5.2 oracle (dict {0:1.0, 1:3.0}).
+    const SK_COEF: [f64; 2] = [0.5705300651778317, 0.5660417632427646];
+    const SK_INTERCEPT: f64 = -1.7542279278451731;
+
+    let x = Array2::from_shape_vec(
+        (7, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 0.0, 0.0, 2.0, 5.0, 5.0, 6.0, 5.0,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0_usize, 0, 0, 0, 0, 1, 1]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Log)
+        .with_class_weight(ClassWeight::Explicit(vec![(0, 1.0), (1, 3.0)]))
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.0001)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("fit must succeed");
+    let coef = fitted.coefficients();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!(
+            (coef[k] - sk).abs() < 1e-7,
+            "coef[{k}]={} vs sklearn {sk}",
+            coef[k]
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-7,
+        "intercept={} vs sklearn {SK_INTERCEPT}",
+        fitted.intercept()
+    );
+}
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[0.,0.],[1.,0.],[0.,1.],[5.,5.],[6.,5.]]); y=np.array([0,0,0,1,1]); \
+/// w=np.array([1.0,2.0,0.5,1.5,3.0]); \
+/// m=SGDClassifier(loss='log_loss',learning_rate='constant',eta0=0.1,alpha=0.0001, \
+///   max_iter=10,tol=None,shuffle=False,fit_intercept=True,random_state=0) \
+///   .fit(X,y,sample_weight=w); print(m.coef_.ravel().tolist(), m.intercept_.tolist())"
+/// ```
+#[test]
+fn sgd_sample_weight() {
+    // Live sklearn 1.5.2 oracle (per-sample weight vector, class_weight=None).
+    const SK_COEF: [f64; 2] = [0.25648548424261425, 0.7995046753090618];
+    const SK_INTERCEPT: f64 = -1.221373410658307;
+
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 5.0, 5.0, 6.0, 5.0],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0_usize, 0, 0, 1, 1]);
+    let w = Array1::from(vec![1.0_f64, 2.0, 0.5, 1.5, 3.0]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Log)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.0001)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_random_state(0);
+
+    let fitted = model
+        .fit_with_sample_weight(&x, &y, &w)
+        .expect("fit_with_sample_weight must succeed");
+    let coef = fitted.coefficients();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!(
+            (coef[k] - sk).abs() < 1e-7,
+            "coef[{k}]={} vs sklearn {sk}",
+            coef[k]
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-7,
+        "intercept={} vs sklearn {SK_INTERCEPT}",
+        fitted.intercept()
+    );
+}
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[0.,0.],[1.,0.],[0.,1.],[5.,5.],[6.,5.],[5.,6.],[10.,0.],[11.,0.]]); \
+/// y=np.array([0,0,0,1,1,1,2,2]); \
+/// m=SGDClassifier(loss='log_loss',class_weight='balanced',learning_rate='constant', \
+///   eta0=0.1,alpha=0.0001,max_iter=10,tol=None,shuffle=False,fit_intercept=True, \
+///   random_state=0).fit(X,y); print(m.coef_.tolist()); print(m.intercept_.tolist())"
+/// ```
+///
+/// Exercises the multiclass OvA weight mapping (`_stochastic_gradient.py:816`):
+/// for each class `i`, `pos=expanded[i]`, `neg=1.0` (NOT `expanded` of the
+/// rest). 3 balanced classes of equal count -> `expanded[i] = 8/(3*?)`.
+#[test]
+fn sgd_class_weight_balanced_multiclass() {
+    // Live sklearn 1.5.2 oracle: coef_ is (3, 2), one OvA row per class.
+    // Full oracle (rows 1,2 documented; the public surface exposes the class-0
+    // OvA row via HasCoefficients + the argmax predictions):
+    //   coef_ = [[-0.586000112348521,   -0.369263665877338  ],
+    //            [-0.28727734693646345,  1.1050446584452778 ],
+    //            [ 0.5075782268738237,  -1.203254607643712  ]]
+    //   intercept_ = [1.001493742545345, -1.0751638402499792, -1.0417171806847456]
+    const SK_COEF0: [f64; 2] = [-0.586000112348521, -0.369263665877338];
+
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0, 10.0, 0.0, 11.0, 0.0,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0_usize, 0, 0, 1, 1, 1, 2, 2]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Log)
+        .with_class_weight(ClassWeight::Balanced)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.0001)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).expect("multiclass fit must succeed");
+    // The full per-class weight matrix is internal; `HasCoefficients` exposes the
+    // class-0 OvA weight vector. Its exact match to the oracle proves the
+    // multiclass mapping (`_stochastic_gradient.py:816`: for class i,
+    // pos=expanded[i], neg=1.0) is applied — a wrong pos/neg assignment would
+    // shift this row.
+    let coef0 = fitted.coefficients();
+    for (k, &sk) in SK_COEF0.iter().enumerate() {
+        assert!(
+            (coef0[k] - sk).abs() < 1e-7,
+            "class0 coef[{k}]={} vs sklearn {sk}",
+            coef0[k]
+        );
+    }
+    // End-to-end OvA argmax (`predict`) reproduces the separable class layout,
+    // exercising all three per-class decision functions jointly.
+    let preds = fitted.predict(&x).expect("predict must succeed");
+    let expected = [0_usize, 0, 0, 1, 1, 1, 2, 2];
+    for (i, &e) in expected.iter().enumerate() {
+        assert_eq!(preds[i], e, "predict[{i}]={} vs {e}", preds[i]);
+    }
+}
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[0.,0.],[1.,0.],[0.,1.],[2.,1.],[1.,2.]]); \
+/// y=np.array([0.0,1.0,2.0,4.0,5.0]); w=np.array([1.0,2.0,0.5,1.5,3.0]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.0001,learning_rate='constant', \
+///   eta0=0.01,max_iter=10,tol=None,shuffle=False,fit_intercept=True,random_state=0) \
+///   .fit(X,y,sample_weight=w); print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+///
+/// `SGDRegressor::fit_with_sample_weight` scales the gradient term by
+/// `sample_weight` (`class_weight = 1` for regression, `_sgd_fast.pyx.tp:630`).
+#[test]
+fn sgd_regressor_sample_weight() {
+    const SK_COEF: [f64; 2] = [0.9425558668838198, 1.3974216923953962];
+    const SK_INTERCEPT: f64 = 0.7259434415390171;
+
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 2.0, 1.0, 1.0, 2.0],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0.0_f64, 1.0, 2.0, 4.0, 5.0]);
+    let w = Array1::from(vec![1.0_f64, 2.0, 0.5, 1.5, 3.0]);
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_alpha(0.0001)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false)
+        .with_fit_intercept(true)
+        .with_random_state(0);
+
+    let fitted = model
+        .fit_with_sample_weight(&x, &y, &w)
+        .expect("regressor fit_with_sample_weight must succeed");
+    let coef = fitted.coefficients();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!(
+            (coef[k] - sk).abs() < 1e-7,
+            "coef[{k}]={} vs sklearn {sk}",
+            coef[k]
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT).abs() < 1e-7,
+        "intercept={} vs sklearn {SK_INTERCEPT}",
+        fitted.intercept()
+    );
 }
