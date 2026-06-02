@@ -56,6 +56,64 @@ use num_traits::Float;
 pub trait Kernel<F: Float>: Clone + Send + Sync {
     /// Compute the kernel value between two vectors.
     fn compute(&self, x: &[F], y: &[F]) -> F;
+
+    /// Resolve any data-dependent kernel parameters against the training data
+    /// at fit time, returning a copy of the kernel with those parameters fixed.
+    ///
+    /// For kernels with a `gamma: Option<F>` parameter, a `None` gamma mirrors
+    /// scikit-learn's default `gamma='scale'`, resolving to
+    /// `1 / (n_features * X.var())` where `X.var()` is the population variance
+    /// (ddof=0) over the whole flattened training matrix
+    /// (`sklearn/svm/_base.py:236-239`). An explicit `Some(gamma)` is left
+    /// verbatim. `'auto'` (`1 / n_features`) is not expressible by the current
+    /// `Option<F>` surface and is tracked under #641; only `None` -> `'scale'`
+    /// is resolved here.
+    ///
+    /// The default implementation is a no-op (returns `self.clone()`), which is
+    /// correct for parameter-free kernels such as [`LinearKernel`].
+    #[must_use]
+    fn resolved_for_fit(&self, _x: &Array2<F>) -> Self
+    where
+        Self: Sized,
+    {
+        self.clone()
+    }
+}
+
+/// Compute the population variance (ddof=0) of all elements of `x`, mirroring
+/// numpy's `X.var()` (`mean((x - mean)^2)`). Returns `None` when `x` is empty.
+fn population_variance<F: Float>(x: &Array2<F>) -> Option<F> {
+    let n = x.len();
+    if n == 0 {
+        return None;
+    }
+    let count = F::from(n)?;
+    let sum = x.iter().fold(F::zero(), |acc, &v| acc + v);
+    let mean = sum / count;
+    let sq = x
+        .iter()
+        .fold(F::zero(), |acc, &v| acc + (v - mean) * (v - mean));
+    Some(sq / count)
+}
+
+/// Resolve a `None` gamma to scikit-learn's `gamma='scale'`
+/// = `1 / (n_features * X.var())` (`sklearn/svm/_base.py:236-239`). An explicit
+/// `Some(gamma)` is returned unchanged. When `X.var() == 0` sklearn would divide
+/// by zero; sklearn itself guards this by falling back to `1.0`
+/// (`_base.py:239`), so we do the same (avoiding a non-finite gamma).
+fn resolve_scale_gamma<F: Float>(gamma: Option<F>, x: &Array2<F>) -> Option<F> {
+    if gamma.is_some() {
+        return gamma;
+    }
+    let n_features = match F::from(x.ncols()) {
+        Some(nf) if nf > F::zero() => nf,
+        _ => return Some(F::one()),
+    };
+    match population_variance(x) {
+        Some(var) if var > F::zero() => Some(F::one() / (n_features * var)),
+        // var == 0 (constant X) or empty: sklearn falls back to gamma = 1.0.
+        _ => Some(F::one()),
+    }
 }
 
 /// Linear kernel: `K(x, y) = x . y`.
@@ -75,7 +133,9 @@ impl<F: Float> Kernel<F> for LinearKernel {
 /// `K(x, y) = exp(-gamma * ||x - y||^2)`
 #[derive(Debug, Clone, Copy)]
 pub struct RbfKernel<F> {
-    /// The gamma parameter. If `None`, it is set to `1 / (n_features * var(X))`.
+    /// The gamma parameter. `None` mirrors scikit-learn's default
+    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
+    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
     pub gamma: Option<F>,
 }
 
@@ -108,12 +168,20 @@ impl<F: Float + Send + Sync> Kernel<F> for RbfKernel<F> {
         });
         (-gamma * sq_dist).exp()
     }
+
+    fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
+        Self {
+            gamma: resolve_scale_gamma(self.gamma, x),
+        }
+    }
 }
 
 /// Polynomial kernel: `K(x, y) = (gamma * x . y + coef0)^degree`.
 #[derive(Debug, Clone, Copy)]
 pub struct PolynomialKernel<F> {
-    /// The gamma parameter. If `None`, uses `1 / n_features`.
+    /// The gamma parameter. `None` mirrors scikit-learn's default
+    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
+    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
     pub gamma: Option<F>,
     /// Polynomial degree.
     pub degree: usize,
@@ -153,12 +221,22 @@ impl<F: Float + Send + Sync> Kernel<F> for PolynomialKernel<F> {
         }
         result
     }
+
+    fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
+        Self {
+            gamma: resolve_scale_gamma(self.gamma, x),
+            degree: self.degree,
+            coef0: self.coef0,
+        }
+    }
 }
 
 /// Sigmoid kernel: `K(x, y) = tanh(gamma * x . y + coef0)`.
 #[derive(Debug, Clone, Copy)]
 pub struct SigmoidKernel<F> {
-    /// The gamma parameter. If `None`, uses `1 / n_features`.
+    /// The gamma parameter. `None` mirrors scikit-learn's default
+    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
+    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
     pub gamma: Option<F>,
     /// Independent term.
     pub coef0: F,
@@ -189,6 +267,13 @@ impl<F: Float + Send + Sync> Kernel<F> for SigmoidKernel<F> {
             .zip(y.iter())
             .fold(F::zero(), |acc, (&a, &b)| acc + a * b);
         (gamma * dot + self.coef0).tanh()
+    }
+
+    fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
+        Self {
+            gamma: resolve_scale_gamma(self.gamma, x),
+            coef0: self.coef0,
+        }
     }
 }
 
@@ -609,6 +694,12 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             });
         }
 
+        // Resolve any data-dependent kernel parameters (e.g. a `None` gamma ->
+        // sklearn's default `gamma='scale'` = 1/(n_features * X.var()),
+        // `_base.py:236-239`) against the training data BEFORE fitting, and use
+        // this resolved kernel for both fitting and prediction.
+        let kernel = self.kernel.resolved_for_fit(x);
+
         // Convert data to Vec<Vec<F>> for kernel cache.
         let data: Vec<Vec<F>> = (0..n_samples).map(|i| x.row(i).to_vec()).collect();
 
@@ -642,7 +733,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 let result = smo_binary(
                     &sub_data,
                     &sub_labels,
-                    &self.kernel,
+                    &kernel,
                     self.c,
                     self.tol,
                     self.max_iter,
@@ -672,7 +763,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         }
 
         Ok(FittedSVC {
-            kernel: self.kernel.clone(),
+            kernel,
             binary_models,
             classes,
         })
@@ -1106,13 +1197,19 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             });
         }
 
+        // Resolve any data-dependent kernel parameters (e.g. a `None` gamma ->
+        // sklearn's default `gamma='scale'` = 1/(n_features * X.var()),
+        // `_base.py:236-239`) against the training data BEFORE fitting, and use
+        // this resolved kernel for both fitting and prediction.
+        let kernel = self.kernel.resolved_for_fit(x);
+
         let data: Vec<Vec<F>> = (0..n_samples).map(|i| x.row(i).to_vec()).collect();
         let targets: Vec<F> = y.to_vec();
 
         let (coefs, bias) = smo_svr(
             &data,
             &targets,
-            &self.kernel,
+            &kernel,
             self.c,
             self.epsilon,
             self.tol,
@@ -1133,7 +1230,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         }
 
         Ok(FittedSVR {
-            kernel: self.kernel.clone(),
+            kernel,
             support_vectors: sv_data,
             dual_coefs: sv_coefs,
             bias,
