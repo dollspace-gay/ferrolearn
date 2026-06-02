@@ -193,3 +193,84 @@ fn isotonic_sample_weight() {
         );
     }
 }
+
+/// Parity: `y_min`/`y_max` clip the pooled `y_thresholds` after PAVA.
+///
+/// sklearn's `IsotonicRegression(y_min=..., y_max=...)` clips the pooled `y`
+/// (the `y_thresholds_`) to `[y_min, y_max]` AFTER the PAVA pool
+/// (`sklearn/isotonic.py:163-170`: `if y_min is not None or y_max is not None:
+/// ...; np.clip(y, y_min, y_max, y)`; unset bounds default to `±inf`,
+/// `isotonic.py:165-168`); the constructor declares `y_min=None, y_max=None`
+/// (`isotonic.py:274`). On `X=[1,2,3,4,5], y=[1,2,3,4,5]` (already monotone, so
+/// `y_thresholds_ == [1,2,3,4,5]`), clipping the thresholds caps the linear
+/// interpolant, so `predict` at the training X reflects the clipped thresholds.
+///
+/// Oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.isotonic import IsotonicRegression; \
+///   X=np.array([1.,2.,3.,4.,5.]); y=np.array([1.,2.,3.,4.,5.]); \
+///   print(IsotonicRegression(y_min=2.0).fit(X,y).predict(X).tolist(), \
+///         IsotonicRegression(y_max=4.0).fit(X,y).predict(X).tolist(), \
+///         IsotonicRegression(y_min=2.0,y_max=4.0).fit(X,y).predict(X).tolist())"
+///   # -> [2.0, 2.0, 3.0, 4.0, 5.0] [1.0, 2.0, 3.0, 4.0, 4.0] [2.0, 2.0, 3.0, 4.0, 4.0]
+/// ```
+/// All query X are in-range, so the default out_of_bounds='nan' never fires.
+///
+/// Tracking: #566
+#[test]
+fn isotonic_y_min_y_max() {
+    let x = Array2::from_shape_vec((5, 1), vec![1.0_f64, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y = array![1.0_f64, 2.0, 3.0, 4.0, 5.0];
+
+    // y_min=2.0 -> [2,2,3,4,5]
+    let fitted_min = IsotonicRegression::<f64>::new()
+        .with_y_min(2.0)
+        .fit(&x, &y)
+        .unwrap();
+    let preds_min = fitted_min.predict(&x).unwrap();
+    let oracle_min = [2.0_f64, 2.0, 3.0, 4.0, 5.0];
+
+    // y_max=4.0 -> [1,2,3,4,4]
+    let fitted_max = IsotonicRegression::<f64>::new()
+        .with_y_max(4.0)
+        .fit(&x, &y)
+        .unwrap();
+    let preds_max = fitted_max.predict(&x).unwrap();
+    let oracle_max = [1.0_f64, 2.0, 3.0, 4.0, 4.0];
+
+    // y_min=2.0, y_max=4.0 -> [2,2,3,4,4]
+    let fitted_both = IsotonicRegression::<f64>::new()
+        .with_y_min(2.0)
+        .with_y_max(4.0)
+        .fit(&x, &y)
+        .unwrap();
+    let preds_both = fitted_both.predict(&x).unwrap();
+    let oracle_both = [2.0_f64, 2.0, 3.0, 4.0, 4.0];
+
+    for i in 0..5 {
+        assert!(
+            (preds_min[i] - oracle_min[i]).abs() < 1e-9,
+            "y_min=2.0 predict({}): sklearn (np.clip, isotonic.py:163-170) returns {}, \
+             ferrolearn returned {}",
+            [1.0, 2.0, 3.0, 4.0, 5.0][i],
+            oracle_min[i],
+            preds_min[i]
+        );
+        assert!(
+            (preds_max[i] - oracle_max[i]).abs() < 1e-9,
+            "y_max=4.0 predict({}): sklearn (np.clip, isotonic.py:163-170) returns {}, \
+             ferrolearn returned {}",
+            [1.0, 2.0, 3.0, 4.0, 5.0][i],
+            oracle_max[i],
+            preds_max[i]
+        );
+        assert!(
+            (preds_both[i] - oracle_both[i]).abs() < 1e-9,
+            "y_min=2.0,y_max=4.0 predict({}): sklearn (np.clip, isotonic.py:163-170) returns {}, \
+             ferrolearn returned {}",
+            [1.0, 2.0, 3.0, 4.0, 5.0][i],
+            oracle_both[i],
+            preds_both[i]
+        );
+    }
+}

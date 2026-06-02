@@ -38,7 +38,7 @@
 //! | REQ-3 (predict piecewise-LINEAR interpolation) | SHIPPED | `predict_single` does `y0 + t*(y1-y0)` (`scipy interp1d(kind='linear')`); test `test_interpolation`. |
 //! | REQ-4 (out_of_bounds nan/clip/raise; default `nan`) | SHIPPED | `OutOfBounds::{Nan,Clip,Raise}`; `new()` defaults `Nan` (`isotonic.py:274`); test `isotonic_default_out_of_bounds_nan`. Closed #565. |
 //! | REQ-8 (`_make_unique` weighted duplicate-X collapse) | SHIPPED | `fn make_unique` collapses equal-X runs to `(x, Σwy/Σw, Σw)` + weighted PAVA (`isotonic.py:308-325`); test `isotonic_make_unique_duplicate_x` (`[1,1,2,3]/[1,3,2,4]` → `[2,2,4]`). Closed #569. |
-//! | REQ-5 (y_min/y_max clipping) | NOT-STARTED | #566. |
+//! | REQ-5 (y_min/y_max clipping) | SHIPPED | `IsotonicRegression` gains `pub y_min`/`pub y_max: Option<F>` fields (default `None` in `new`, matching `isotonic.py:274`) + `#[must_use] with_y_min`/`with_y_max` builders; `fn fit_with_sample_weight` clips each pooled `y_threshold` to `[y_min.unwrap_or(-inf), y_max.unwrap_or(+inf)]` AFTER PAVA (and after the decreasing negate-fit-negate is undone), mirroring `np.clip(y, y_min, y_max, y)` (`isotonic.py:163-170`). Both-`None` is a no-op (byte-identical unclipped path). Consumer: `Fit::fit` → `FittedIsotonicRegression` (crate-root export). Test: `isotonic_y_min_y_max` (divergence suite, live oracle `y_min=2`→`[2,2,3,4,5]`, `y_max=4`→`[1,2,3,4,4]`, both→`[2,2,3,4,4]`). #566. |
 //! | REQ-6 (increasing='auto' via Spearman) | NOT-STARTED | #567. |
 //! | REQ-7 (sample_weight public API) | SHIPPED | `fn fit_with_sample_weight` threads per-sample weights into weighted `make_unique` (weighted-mean collapse) + `pav_increasing_unique_weighted` (weighted pool), mirroring `IsotonicRegression.fit(X,y,sample_weight)` → `_build_y` `_make_unique`/`isotonic_regression` (`isotonic.py:251`,`:300-328`). Consumer: `Fit::fit` delegates with an all-ones weight vector. Test: `isotonic_sample_weight` (divergence suite). Closed #568. |
 //! | REQ-9 (X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_) | NOT-STARTED | #570. |
@@ -84,6 +84,16 @@ pub struct IsotonicRegression<F> {
     pub increasing: bool,
     /// Strategy for predictions outside the training range.
     pub out_of_bounds: OutOfBounds,
+    /// Lower bound on the lowest predicted value. `None` (the default) means
+    /// `-inf` — no lower clip. Mirrors scikit-learn's `y_min=None`
+    /// (`sklearn/isotonic.py:274`); the pooled `y_thresholds` are clipped to
+    /// `[y_min, y_max]` after PAVA (`isotonic.py:163-170`).
+    pub y_min: Option<F>,
+    /// Upper bound on the highest predicted value. `None` (the default) means
+    /// `+inf` — no upper clip. Mirrors scikit-learn's `y_max=None`
+    /// (`sklearn/isotonic.py:274`); the pooled `y_thresholds` are clipped to
+    /// `[y_min, y_max]` after PAVA (`isotonic.py:163-170`).
+    pub y_max: Option<F>,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -198,6 +208,23 @@ impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
             (rx, ry_neg)
         };
 
+        // Clip the pooled `y_thresholds` to `[y_min, y_max]` AFTER PAVA (and
+        // after the decreasing negate-fit-negate is undone), mirroring
+        // scikit-learn's `np.clip(y, y_min, y_max, y)` on the pooled values
+        // (`sklearn/isotonic.py:163-170`). Unset bounds default to the open
+        // `±inf` (`isotonic.py:165-168`), so when both `y_min`/`y_max` are
+        // `None` this is `y.max(-inf).min(+inf)` — a no-op leaving every
+        // threshold byte-identical to the unclipped path. The clip is applied
+        // to the STORED thresholds so `predict` (linear interpolation between
+        // them) stays within `[y_min, y_max]`.
+        if self.y_min.is_some() || self.y_max.is_some() {
+            let lo = self.y_min.unwrap_or_else(F::neg_infinity);
+            let hi = self.y_max.unwrap_or_else(F::infinity);
+            for y in &mut result_y {
+                *y = y.max(lo).min(hi);
+            }
+        }
+
         // Ensure at least 2 breakpoints.
         if result_x.len() < 2 {
             // All same x value: duplicate.
@@ -223,19 +250,51 @@ impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
 impl<F: Float> IsotonicRegression<F> {
     /// Create a new `IsotonicRegression` with default settings.
     ///
-    /// Defaults: `increasing = true`, `out_of_bounds = Nan`.
+    /// Defaults: `increasing = true`, `out_of_bounds = Nan`, `y_min = None`,
+    /// `y_max = None`.
     ///
     /// The `out_of_bounds` default matches scikit-learn's
     /// `IsotonicRegression(out_of_bounds="nan")` (`sklearn/isotonic.py:274`):
     /// a default-constructed estimator returns `NaN` for predictions outside
     /// the training range `[X_min_, X_max_]`.
+    ///
+    /// The `y_min`/`y_max` defaults of `None` match scikit-learn's
+    /// `IsotonicRegression(y_min=None, y_max=None)` (`sklearn/isotonic.py:274`):
+    /// with both unset the pooled `y_thresholds` are clipped to
+    /// `[-inf, +inf]`, i.e. not clipped at all.
     #[must_use]
     pub fn new() -> Self {
         Self {
             increasing: true,
             out_of_bounds: OutOfBounds::Nan,
+            y_min: None,
+            y_max: None,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set the lower bound on the lowest predicted value (`y_min`).
+    ///
+    /// The pooled `y_thresholds` produced by PAVA are clipped so none falls
+    /// below `y_min`, mirroring scikit-learn's `np.clip(y, y_min, y_max, y)`
+    /// after pooling (`sklearn/isotonic.py:163-170`; constructor `y_min`,
+    /// `isotonic.py:274`).
+    #[must_use]
+    pub fn with_y_min(mut self, y_min: F) -> Self {
+        self.y_min = Some(y_min);
+        self
+    }
+
+    /// Set the upper bound on the highest predicted value (`y_max`).
+    ///
+    /// The pooled `y_thresholds` produced by PAVA are clipped so none rises
+    /// above `y_max`, mirroring scikit-learn's `np.clip(y, y_min, y_max, y)`
+    /// after pooling (`sklearn/isotonic.py:163-170`; constructor `y_max`,
+    /// `isotonic.py:274`).
+    #[must_use]
+    pub fn with_y_max(mut self, y_max: F) -> Self {
+        self.y_max = Some(y_max);
+        self
     }
 
     /// Set whether the fitted function should be increasing.
