@@ -58,7 +58,7 @@
 //! | REQ-5 (predict + tie-break) | SHIPPED | `fn predict in svm.rs` (FittedSVC) does libsvm ovo voting and breaks vote ties toward the LOWER class index via a strictly-greater first-max scan (keeps the first/lowest-index maximum since `classes` is `np.unique(y)`-sorted), matching libsvm/sklearn `super().predict` (`_base.py:813-814`) instead of `max_by_key`'s last-maximum. Pinned by `divergence_pin3_predict_labels` (separable-set labels) + `divergence_pin11_ovo_vote_tie_break_lower_index` (4-class vote tie `(0,2,2,2)` at `q=(-0.21,-8.976)` -> class 1) in `tests/divergence_svm_fit.rs` vs live `SVC(kernel='linear',C=1.0)`. |
 //! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
 //! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
-//! | REQ-8 (constructor param surface + defaults) | NOT-STARTED | open #641 (narrowed). SHIPPED so far: `shrinking` (`SVC`/`SVR`, default `true`, `with_shrinking`; accepted for API parity, shrinking-invariant optimum so DOES NOT alter results — R-DEV-7); `break_ties` (`SVC`, default `false`, `with_break_ties`; `fn predict in svm.rs` ovr-argmax branch for `break_ties=true`+ovr+`n_classes>2`, `InvalidParameter` for the ovo combo, `_base.py:801-814`); default alignment `cache_size=200`, `max_iter=0` (= sklearn `-1`, no iteration limit; the `smo_binary`/`smo_svr` loops treat `0` as unbounded); plus REQ-1's `gamma` enum (`scale`/`auto`/float). Pinned: `test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs`. STILL NOT-STARTED: estimator-level `kernel`(string-select)/`degree`/`coef0`/`class_weight`/`random_state` — `degree`/`coef0`/string-kernel are a documented R-DEV-7 design difference (the kernel and its degree/coef0 are the type parameter `K`, set by construction); `class_weight` is genuinely absent (open #641). |
+//! | REQ-8 (constructor param surface + defaults) | SHIPPED | `shrinking` (`SVC`/`SVR`, default `true`, `with_shrinking`; accepted for API parity, shrinking-invariant optimum so DOES NOT alter results — R-DEV-7); `break_ties` (`SVC`, default `false`, `with_break_ties`; `fn predict in svm.rs` ovr-argmax branch for `break_ties=true`+ovr+`n_classes>2`, `InvalidParameter` for the ovo combo, `_base.py:801-814`); default alignment `cache_size=200`, `max_iter=0` (= sklearn `-1`, no iteration limit; the `smo_binary`/`smo_svr` loops treat `0` as unbounded); REQ-1's `gamma` enum (`scale`/`auto`/float); and now **`class_weight`** (`SVC`, `pub class_weight: ClassWeight<F>` default `None`, `with_class_weight`). `fn compute_class_weight in svm.rs` mirrors `sklearn.utils.compute_class_weight` as called by `BaseSVC._validate_targets` (`class_weight_ = compute_class_weight(class_weight, classes, y)`, `_base.py:740`): `None`→1.0, `Balanced`→`n_samples/(n_classes·count_c)` (`_classes.py:122-124`), `Explicit`→1.0 default overridden by map. `fn smo_binary in svm.rs` now takes per-class box bounds `(cp, cn)` (the `y=+1`/`y=-1` upper bounds) instead of a scalar `c`, applied in the WSS `in_up`/`in_low` tests, the analytic-update box clip, and the free-SV bias recovery (`0<alpha_i<C_i`); when `cp==cn` the math is identical to before (the 13 divergence pins stay green). `fn fit in svm.rs` (SVC) computes `weights = compute_class_weight(...)` ONCE over the full `y`, then per ovo pair `(ci,cj)`: `cp = C·weights[cj]`, `cn = C·weights[ci]` (libsvm `weighted_C`, `_base.py:740`). Non-test consumer: `fn fit in svm.rs` consumes `self.class_weight` (the boundary `SVC`/`FittedSVC` types are re-exported at the crate root + consumed by `nu_svm.rs`). Pinned: `test_svc_class_weight_smoke`/`test_compute_class_weight_balanced`/`test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs` (live oracle on the imbalanced 8×2 set: None `dual_coef_ [[-0.5,-1,1,0.5]]`/`intercept_ [-2.0]`/`support_ [1,3,5,6]`; balanced `[[-0.8,-0.8,1.3333,0.2667]]`/`-1.6667`; `{0:1,1:5}` `support_ [1,3,4,5]`/`-2.0`; R-CHAR-3, 1e-2; None≠balanced intercept). **R-DEV-7 design difference (preserved contract, NOT a gap):** estimator-level `kernel`(string-select)/`degree`/`coef0` are the type parameter `K`, set by construction; `random_state` is unused (ferrolearn's SMO is deterministic). `class_weight` is SVC-only (sklearn SVR has no `class_weight`). |
 //! | REQ-9 (probability / predict_proba) | NOT-STARTED | open #642. No `probability` Platt-scaling CV (`_probA`/`_probB`), no `predict_proba`/`predict_log_proba` (`_base.py:820-925`). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
@@ -102,6 +102,84 @@ impl<F> Default for Gamma<F> {
     /// sklearn's default is `gamma='scale'`.
     fn default() -> Self {
         Gamma::Scale
+    }
+}
+
+/// Per-class scaling of the regularization parameter `C` for [`SVC`].
+///
+/// Mirrors `sklearn.svm.SVC`'s `class_weight` parameter
+/// (`sklearn/svm/_classes.py:118-124`, constraint `{None, dict, 'balanced'}`):
+/// it sets the C of class `i` to `class_weight[i]·C` (libsvm's per-class
+/// `weighted_C[i] = C·class_weight_[i]`). The expanded per-class weights are
+/// computed by [`compute_class_weight`] following
+/// `sklearn.utils.compute_class_weight` semantics, as called from
+/// `BaseSVC._validate_targets`
+/// (`self.class_weight_ = compute_class_weight(self.class_weight, classes=cls,
+/// y=y_)`, `sklearn/svm/_base.py:740`).
+///
+/// This mirrors [`crate::linear_svc::ClassWeight`] for cross-estimator
+/// consistency, but is defined locally (no cross-import of `linear_svc`
+/// internals).
+#[derive(Debug, Clone, Default)]
+pub enum ClassWeight<F> {
+    /// Uniform weights (all classes weighted `1.0`). The default
+    /// (`class_weight=None`).
+    #[default]
+    None,
+    /// Balanced weights `n_samples / (n_classes · count_c)` per class `c`,
+    /// matching `sklearn.utils.compute_class_weight("balanced", ...)`
+    /// (`_classes.py:122-124`: `n_samples / (n_classes * np.bincount(y))`).
+    Balanced,
+    /// Explicit class-label -> weight map. Classes absent from the map default
+    /// to `1.0`, matching the dict branch of `compute_class_weight`.
+    Explicit(Vec<(usize, F)>),
+}
+
+/// Compute the expanded per-class weight vector aligned to `classes`
+/// (sorted ascending, matching sklearn's `classes_ = np.unique(y)`).
+///
+/// Faithful to `sklearn.utils.compute_class_weight`, as called by
+/// `BaseSVC._validate_targets`
+/// (`compute_class_weight(self.class_weight, classes=cls, y=y_)`,
+/// `sklearn/svm/_base.py:740`):
+/// - `None` -> all `1.0`.
+/// - `Balanced` -> `n_samples / (n_classes · count_c)` per class `c`,
+///   where `count_c` is the number of samples with label `c`
+///   (`_classes.py:122-124`).
+/// - `Explicit(map)` -> `1.0` default, overridden by the map entries matched by
+///   class label.
+///
+/// `classes` is the sorted unique label set; `y` is the per-sample label array.
+/// Mirrors `ferrolearn_linear::linear_svc::compute_class_weight` exactly.
+fn compute_class_weight<F: Float>(cw: &ClassWeight<F>, classes: &[usize], y: &[usize]) -> Vec<F> {
+    match cw {
+        ClassWeight::None => vec![F::one(); classes.len()],
+        ClassWeight::Balanced => {
+            // `recip_freq = len(y) / (n_classes * bincount(y))`, indexed per
+            // class (`_classes.py:124`).
+            let n_samples = F::from(y.len()).unwrap_or_else(F::zero);
+            let n_classes = F::from(classes.len()).unwrap_or_else(F::one);
+            classes
+                .iter()
+                .map(|&c| {
+                    let count = y.iter().filter(|&&label| label == c).count();
+                    let count_f = F::from(count).unwrap_or_else(F::one);
+                    if count_f > F::zero() {
+                        n_samples / (n_classes * count_f)
+                    } else {
+                        F::one()
+                    }
+                })
+                .collect()
+        }
+        ClassWeight::Explicit(map) => classes
+            .iter()
+            .map(|&c| {
+                map.iter()
+                    .find(|(label, _)| *label == c)
+                    .map_or_else(F::one, |(_, w)| *w)
+            })
+            .collect(),
     }
 }
 
@@ -450,11 +528,17 @@ struct SmoResult<F> {
 /// Uses the dual gradient `grad_i = (Q * alpha)_i - 1` where
 /// `Q_{ij} = y_i * y_j * K(x_i, x_j)`. Bias is computed after
 /// convergence from the KKT conditions.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the per-class box bounds (cp, cn) are separate args mirroring \
+              libsvm's per-sample upper bound C_i (Cp for y=+1, Cn for y=-1)"
+)]
 fn smo_binary<F: Float, K: Kernel<F>>(
     data: &[Vec<F>],
     labels: &[F],
     kernel: &K,
-    c: F,
+    cp: F,
+    cn: F,
     tol: F,
     max_iter: usize,
     cache_size: usize,
@@ -462,6 +546,12 @@ fn smo_binary<F: Float, K: Kernel<F>>(
     let n = data.len();
     let mut alphas = vec![F::zero(); n];
     let mut cache = KernelCache::new(cache_size);
+
+    // Per-sample box upper bound `C_i = (y_i > 0 ? Cp : Cn)` (libsvm `GETI`):
+    // `class_weight` scales C per class so the +1 group (class_pos) gets `Cp`
+    // and the -1 group (class_neg) gets `Cn`. When `cp == cn` the box is the
+    // uniform `[0, C]` of the no-class-weight case.
+    let c_of = |i: usize| -> F { if labels[i] > F::zero() { cp } else { cn } };
 
     // Gradient of the dual objective: grad_i = (Q*alpha)_i - 1
     // where Q_{ij} = y_i * y_j * K(x_i, x_j).
@@ -493,12 +583,13 @@ fn smo_binary<F: Float, K: Kernel<F>>(
 
         for t in 0..n {
             let val = -labels[t] * grad[t];
+            let c_t = c_of(t);
 
-            let in_up = (labels[t] > F::zero() && alphas[t] < c - eps)
+            let in_up = (labels[t] > F::zero() && alphas[t] < c_t - eps)
                 || (labels[t] < F::zero() && alphas[t] > eps);
 
             let in_low = (labels[t] > F::zero() && alphas[t] > eps)
-                || (labels[t] < F::zero() && alphas[t] < c - eps);
+                || (labels[t] < F::zero() && alphas[t] < c_t - eps);
 
             if in_up && val > max_val {
                 max_val = val;
@@ -532,16 +623,24 @@ fn smo_binary<F: Float, K: Kernel<F>>(
             continue;
         }
 
-        // Bounds for alpha_j
+        // Bounds for alpha_j, respecting the per-sample box bounds
+        // `0 <= alpha_i <= C_i` and `0 <= alpha_j <= C_j` (libsvm allows a
+        // different upper bound per sample under `class_weight`).
         let old_ai = alphas[i];
         let old_aj = alphas[j];
+        let ci = c_of(i);
+        let cj = c_of(j);
 
         let (lo, hi) = if labels[i] == labels[j] {
+            // alpha_i + alpha_j = sum (const): alpha_j in
+            // [max(0, sum - C_i), min(C_j, sum)].
             let sum = old_ai + old_aj;
-            ((sum - c).max(F::zero()), sum.min(c))
+            ((sum - ci).max(F::zero()), sum.min(cj))
         } else {
+            // alpha_i = alpha_j - diff (const diff): alpha_j in
+            // [max(0, diff), min(C_j, C_i + diff)].
             let diff = old_aj - old_ai;
-            (diff.max(F::zero()), (c + diff).min(c))
+            (diff.max(F::zero()), (ci + diff).min(cj))
         };
 
         if (hi - lo).abs() < eps {
@@ -594,8 +693,8 @@ fn smo_binary<F: Float, K: Kernel<F>>(
     let mut b_count = 0usize;
 
     for i in 0..n {
-        if alphas[i] > eps && alphas[i] < c - eps {
-            // This is a free support vector.
+        if alphas[i] > eps && alphas[i] < c_of(i) - eps {
+            // This is a free support vector (`0 < alpha_i < C_i`).
             let mut f_no_b = F::zero();
             for j in 0..n {
                 if alphas[j] > eps {
@@ -766,6 +865,13 @@ pub struct SVC<F, K> {
     /// rejected at predict time (`InvalidParameter`), matching sklearn
     /// (`_base.py:801-804`).
     pub break_ties: bool,
+    /// Per-class scaling of `C` (`class_weight`, `sklearn/svm/_classes.py:118-124`).
+    /// Default [`ClassWeight::None`] (all classes weighted `1.0`). For an ovo
+    /// pair `(a, b)` with `a < b`, the C of the `y=+1` group (class `b`) is
+    /// `C·class_weight_[b]` and the C of the `y=-1` group (class `a`) is
+    /// `C·class_weight_[a]`; the weights are computed ONCE over the full `y`
+    /// by [`compute_class_weight`] (`_base.py:740`).
+    pub class_weight: ClassWeight<F>,
 }
 
 impl<F: Float, K: Kernel<F>> SVC<F, K> {
@@ -774,7 +880,8 @@ impl<F: Float, K: Kernel<F>> SVC<F, K> {
     ///
     /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 0` (= sklearn `-1`, no
     /// iteration limit), `cache_size = 200`, `shrinking = true`,
-    /// `decision_function_shape = Ovr`, `break_ties = false`.
+    /// `decision_function_shape = Ovr`, `break_ties = false`,
+    /// `class_weight = None`.
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
@@ -786,7 +893,19 @@ impl<F: Float, K: Kernel<F>> SVC<F, K> {
             shrinking: true,
             decision_function_shape: SvmDecisionShape::Ovr,
             break_ties: false,
+            class_weight: ClassWeight::None,
         }
+    }
+
+    /// Set the per-class `C` scaling (`sklearn` `class_weight`,
+    /// `_classes.py:118-124`). [`ClassWeight::None`] (default) leaves every
+    /// class at `1.0`; [`ClassWeight::Balanced`] uses
+    /// `n_samples / (n_classes · count_c)`; [`ClassWeight::Explicit`] takes a
+    /// `(label, weight)` map (unlisted classes default to `1.0`).
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
+        self
     }
 
     /// Set the `shrinking` flag (`sklearn` `shrinking`, default `true`).
@@ -1276,6 +1395,12 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         // Convert data to Vec<Vec<F>> for kernel cache.
         let data: Vec<Vec<F>> = (0..n_samples).map(|i| x.row(i).to_vec()).collect();
 
+        // Per-class weights computed ONCE over the FULL y (libsvm's
+        // `class_weight_ = compute_class_weight(class_weight, classes, y)`,
+        // `_base.py:740`); `weighted_C[c] = C·class_weight_[c]`.
+        let y_vec: Vec<usize> = y.to_vec();
+        let weights = compute_class_weight(&self.class_weight, &classes, &y_vec);
+
         // One-vs-one: train one binary SVM per pair.
         let n_classes = classes.len();
         let mut binary_models = Vec::new();
@@ -1284,6 +1409,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             for cj in (ci + 1)..n_classes {
                 let class_neg = classes[ci];
                 let class_pos = classes[cj];
+
+                // Per-class box bounds for this ovo pair `(class_neg, class_pos)`:
+                // the `y=+1` group (class_pos = classes[cj]) gets `Cp = C·w[cj]`
+                // and the `y=-1` group (class_neg = classes[ci]) gets
+                // `Cn = C·w[ci]` (`weighted_C`, `_base.py:740`). The `weights`
+                // vector is aligned to `classes`, so the class-index = the
+                // position in `classes` (`ci`/`cj`).
+                let cp = self.c * weights[cj];
+                let cn = self.c * weights[ci];
 
                 // Extract samples for these two classes.
                 let mut sub_data = Vec::new();
@@ -1307,7 +1441,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                     &sub_data,
                     &sub_labels,
                     &kernel,
-                    self.c,
+                    cp,
+                    cn,
                     self.tol,
                     self.max_iter,
                     self.cache_size,
@@ -2710,5 +2845,111 @@ mod tests {
         assert_eq!(r.cache_size, 200);
         assert_eq!(r.max_iter, 0);
         assert!(r.shrinking);
+    }
+
+    /// The overlapping imbalanced binary set used to pin `class_weight`.
+    fn class_weight_xy() -> Result<(Array2<f64>, Array1<usize>), FerroError> {
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5, 1.5, 0.5, 2.0, 2.0, 2.5, 2.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 0, 0, 1, 1, 1];
+        Ok((x, y))
+    }
+
+    fn cw_fit(cw: ClassWeight<f64>) -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let (x, y) = class_weight_xy()?;
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-7)
+            .with_max_iter(500_000)
+            .with_class_weight(cw)
+            .fit(&x, &y)
+    }
+
+    /// `class_weight` per-class C in the C-SVC SMO (REQ-8, #641).
+    ///
+    /// Oracle (live `SVC(kernel='linear', C=1.0, class_weight=...)` on the
+    /// overlapping imbalanced binary set, R-CHAR-3):
+    /// ```text
+    /// X=[[0,0],[1,0],[0,1],[1,1],[0.5,0.5],[1.5,0.5],[2,2],[2.5,2.5]] y=[0,0,0,0,0,1,1,1]
+    /// None     -> dual_coef_ [[-0.5,-1.0,1.0,0.5]]      intercept_ [-2.0]    support_ [1,3,5,6]
+    /// balanced -> dual_coef_ [[-0.8,-0.8,1.3333,0.2667]] intercept_ [-1.6667] support_ [1,3,5,6]
+    /// {0:1,1:5}-> support_ [1,3,4,5] intercept_ [-2.0]
+    /// ```
+    #[test]
+    fn test_svc_class_weight_smoke() -> TestResult {
+        // class_weight=None.
+        let none = cw_fit(ClassWeight::None)?;
+        assert_eq!(none.support().to_vec(), vec![1, 3, 5, 6]);
+        let dc = none.dual_coef();
+        for (c, &v) in [-0.5, -1.0, 1.0, 0.5].iter().enumerate() {
+            assert!(
+                (dc[[0, c]] - v).abs() < 1e-2,
+                "None dual_coef_[0,{c}] = {} vs {v}",
+                dc[[0, c]]
+            );
+        }
+        let none_int = none.intercept()[0];
+        assert!(
+            (none_int - (-2.0)).abs() < 1e-2,
+            "None intercept_ {none_int}"
+        );
+
+        // class_weight='balanced' (weights [0.8, 1.3333]).
+        let bal = cw_fit(ClassWeight::Balanced)?;
+        assert_eq!(bal.support().to_vec(), vec![1, 3, 5, 6]);
+        let dcb = bal.dual_coef();
+        for (c, &v) in [-0.8, -0.8, 1.3333, 0.2667].iter().enumerate() {
+            assert!(
+                (dcb[[0, c]] - v).abs() < 1e-2,
+                "balanced dual_coef_[0,{c}] = {} vs {v}",
+                dcb[[0, c]]
+            );
+        }
+        let bal_int = bal.intercept()[0];
+        assert!(
+            (bal_int - (-1.6667)).abs() < 1e-2,
+            "balanced intercept_ {bal_int}"
+        );
+
+        // class_weight={0:1, 1:5}.
+        let exp = cw_fit(ClassWeight::Explicit(vec![(0, 1.0), (1, 5.0)]))?;
+        assert_eq!(exp.support().to_vec(), vec![1, 3, 4, 5]);
+        let exp_int = exp.intercept()[0];
+        assert!(
+            (exp_int - (-2.0)).abs() < 1e-2,
+            "explicit intercept_ {exp_int}"
+        );
+
+        // None vs balanced MUST give different intercepts — fails if
+        // class_weight were ignored (R-CHAR-1).
+        assert!(
+            (none_int - bal_int).abs() > 1e-2,
+            "None intercept {none_int} must differ from balanced {bal_int}"
+        );
+        Ok(())
+    }
+
+    /// `compute_class_weight` matches `sklearn.utils.compute_class_weight`
+    /// (`_classes.py:122-124` balanced formula) on the imbalanced set.
+    #[test]
+    fn test_compute_class_weight_balanced() {
+        // 8 samples, 2 classes; class0 count=5, class1 count=3.
+        // balanced[c] = 8 / (2 * count_c): [8/10, 8/6] = [0.8, 1.3333].
+        let classes = [0usize, 1];
+        let y = [0usize, 0, 0, 0, 0, 1, 1, 1];
+        let w = compute_class_weight::<f64>(&ClassWeight::Balanced, &classes, &y);
+        assert_relative_eq!(w[0], 0.8, epsilon = 1e-9);
+        assert_relative_eq!(w[1], 8.0 / 6.0, epsilon = 1e-9);
+        // None -> all 1.0.
+        let wn = compute_class_weight::<f64>(&ClassWeight::None, &classes, &y);
+        assert_eq!(wn, vec![1.0, 1.0]);
+        // Explicit map, unlisted defaults to 1.0.
+        let we = compute_class_weight::<f64>(&ClassWeight::Explicit(vec![(1, 5.0)]), &classes, &y);
+        assert_eq!(we, vec![1.0, 5.0]);
     }
 }

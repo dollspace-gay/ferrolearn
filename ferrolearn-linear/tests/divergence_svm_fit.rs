@@ -17,7 +17,9 @@
 //! the binary 1-D `SvmScores::Binary` enum-variant contract (#637).
 
 use ferrolearn_core::{Fit, Predict};
-use ferrolearn_linear::svm::{Gamma, LinearKernel, RbfKernel, SVC, SVR, SvmDecisionShape};
+use ferrolearn_linear::svm::{
+    ClassWeight, Gamma, LinearKernel, RbfKernel, SVC, SVR, SvmDecisionShape,
+};
 use ndarray::{Array1, Array2, array};
 
 /// Binary 6x2 training set shared by PIN 1 / PIN 2 / PIN 3.
@@ -957,5 +959,190 @@ fn divergence_pin13_break_ties_ovr_argmax() {
         ovo_res.is_err(),
         "break_ties=true + Ovo must be Err (sklearn raises ValueError, _base.py:801-804); \
          ferrolearn returned Ok"
+    );
+}
+
+/// 8x2 OVERLAPPING imbalanced binary set (5 vs 3) shared by PIN 14.
+///
+/// Classes overlap near `(1.5, 0.5)` so the margin constraints actually bind
+/// and `class_weight` measurably moves the converged `α`/intercept/support set
+/// (a cleanly-separable set would give a `class_weight`-invariant hard-margin
+/// solution, hiding the divergence). Class 0 has 5 samples, class 1 has 3.
+fn imbalanced_8x2() -> (Array2<f64>, Array1<usize>) {
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.5, 0.5, // class 0 (5)
+            1.5, 0.5, 2.0, 2.0, 2.5, 2.5, // class 1 (3)
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 0, 0, 1, 1, 1];
+    (x, y)
+}
+
+/// PIN 14 — REQ-8: SVC `class_weight` (`None` / `balanced` / explicit dict).
+///
+/// Pins the NEW `ClassWeight<F>` parameter (`with_class_weight`,
+/// `fn compute_class_weight in svm.rs`, the `smo_binary` `(cp, cn)` per-class
+/// box generalization, and the `fit` wiring `cp = C·weights[cj]` /
+/// `cn = C·weights[ci]`) against the LIVE sklearn oracle. `class_weight` scales
+/// the per-class `C` (libsvm `weighted_C[i] = C·class_weight_[i]`,
+/// `sklearn/svm/_base.py:740`: `self.class_weight_ =
+/// compute_class_weight(self.class_weight, classes=cls, y=y_)`); the balanced
+/// formula is `n_samples / (n_classes · np.bincount(y))`
+/// (`sklearn/utils/class_weight.py:122-124`).
+///
+/// Three DISTINCT fits on the overlapping imbalanced 8x2 set
+/// (`SVC(kernel='linear', C=1.0, class_weight=...)`), `dual_coef_` ordered by
+/// `support_`. All re-derived LIVE this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[0,0],[1,0],[0,1],[1,1],[0.5,0.5],[1.5,0.5],[2,2],[2.5,2.5]],dtype=float); \
+///   y=np.array([0,0,0,0,0,1,1,1]); \
+///   for cw in [None,'balanced',{0:1.0,1:5.0}]: \
+///       m=SVC(kernel='linear',C=1.0,class_weight=cw).fit(X,y); \
+///       print(cw, m.support_.tolist(), np.round(m.dual_coef_,6).tolist(), \
+///             np.round(m.intercept_,6).tolist(), np.round(m.class_weight_,6).tolist())"
+/// # None       support_ [1,3,5,6]  dual_coef_ [[-0.5,-1.0,1.0,0.5]]            intercept_ [-2.0]      class_weight_ [1.0,1.0]
+/// # balanced   support_ [1,3,5,6]  dual_coef_ [[-0.8,-0.8,1.333333,0.266667]] intercept_ [-1.666667] class_weight_ [0.8,1.333333]
+/// # {0:1,1:5}  support_ [1,3,4,5]  dual_coef_ [[-1.0,-1.0,-1.0,3.0]]          intercept_ [-2.0]      class_weight_ [1.0,5.0]
+/// ```
+///
+/// The pin also asserts the three fits are mutually DISTINCT (None-vs-balanced
+/// intercept gap > 0.01; None-vs-explicit `support_` differs), so it FAILS if
+/// `class_weight` were silently ignored — and that the balanced fit equals the
+/// explicit `{0:0.8, 1:1.3333…}` fit (the balanced formula).
+///
+/// Tracking: #641
+#[test]
+fn divergence_pin14_class_weight_three_fits() {
+    let (x, y) = imbalanced_8x2();
+
+    let fit_with = |cw: ClassWeight<f64>| {
+        SVC::<f64, LinearKernel>::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(1_000_000)
+            .with_class_weight(cw)
+            .fit(&x, &y)
+            .unwrap()
+    };
+
+    // Compare dual_coef()/intercept()/support() in support_ order to a live
+    // oracle triple. dual_coef_ is (1, n_SV) for the binary case.
+    let assert_fit = |fitted: &ferrolearn_linear::svm::FittedSVC<f64, LinearKernel>,
+                      exp_support: &[usize],
+                      exp_dual: &[f64],
+                      exp_intercept: f64,
+                      label: &str| {
+        let support = fitted.support();
+        assert_eq!(
+            support.to_vec(),
+            exp_support.to_vec(),
+            "{label} support_: ferrolearn={:?}, sklearn={exp_support:?}",
+            support.to_vec()
+        );
+        let dual = fitted.dual_coef();
+        assert_eq!(dual.dim(), (1, exp_dual.len()), "{label} dual_coef_ shape");
+        for (c, &exp) in exp_dual.iter().enumerate() {
+            assert!(
+                (dual[[0, c]] - exp).abs() < 1e-2,
+                "{label} dual_coef_[0][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+                dual[[0, c]],
+                (dual[[0, c]] - exp).abs()
+            );
+        }
+        let intercept = fitted.intercept();
+        assert_eq!(intercept.len(), 1, "{label} intercept_ length");
+        assert!(
+            (intercept[0] - exp_intercept).abs() < 1e-2,
+            "{label} intercept_: ferrolearn={}, sklearn={exp_intercept}, gap={}",
+            intercept[0],
+            (intercept[0] - exp_intercept).abs()
+        );
+    };
+
+    // ClassWeight::None -> oracle None fit.
+    let none_fit = fit_with(ClassWeight::None);
+    assert_fit(
+        &none_fit,
+        &[1, 3, 5, 6],
+        &[-0.5, -1.0, 1.0, 0.5],
+        -2.0,
+        "None",
+    );
+
+    // ClassWeight::Balanced -> oracle 'balanced' fit (weights [0.8, 1.3333]).
+    let bal_fit = fit_with(ClassWeight::Balanced);
+    assert_fit(
+        &bal_fit,
+        &[1, 3, 5, 6],
+        &[-0.8, -0.8, 1.333_333, 0.266_667],
+        -1.666_667,
+        "Balanced",
+    );
+
+    // ClassWeight::Explicit({0:1, 1:5}) -> oracle dict fit (DIFFERENT support_).
+    let exp_fit = fit_with(ClassWeight::Explicit(vec![(0, 1.0), (1, 5.0)]));
+    assert_fit(
+        &exp_fit,
+        &[1, 3, 4, 5],
+        &[-1.0, -1.0, -1.0, 3.0],
+        -2.0,
+        "Explicit{0:1,1:5}",
+    );
+
+    // ----- the three fits MUST be mutually distinct (fails if cw ignored) -----
+    let none_b = none_fit.intercept()[0];
+    let bal_b = bal_fit.intercept()[0];
+    assert!(
+        (none_b - bal_b).abs() > 0.01,
+        "None vs Balanced intercept must differ (>0.01): None={none_b}, \
+         Balanced={bal_b}, gap={} (oracle gap |−2.0 − −1.6667| = 0.3333)",
+        (none_b - bal_b).abs()
+    );
+    assert_ne!(
+        none_fit.support().to_vec(),
+        exp_fit.support().to_vec(),
+        "None vs Explicit{{0:1,1:5}} support_ must differ \
+         (oracle: [1,3,5,6] vs [1,3,4,5]) — else class_weight was ignored"
+    );
+
+    // ----- the balanced formula: Balanced == Explicit({0:0.8, 1:1.3333…}) -----
+    // sklearn `compute_class_weight('balanced')` = n_samples/(n_classes·bincount)
+    // = 8/(2·5)=0.8 for class 0, 8/(2·3)=1.33333 for class 1
+    // (`sklearn/utils/class_weight.py:122-124`).
+    let bal_explicit_fit = fit_with(ClassWeight::Explicit(vec![
+        (0, 0.8),
+        (1, 1.333_333_333_333_333_3),
+    ]));
+    let bal_dual = bal_fit.dual_coef();
+    let bal_exp_dual = bal_explicit_fit.dual_coef();
+    assert_eq!(
+        bal_fit.support().to_vec(),
+        bal_explicit_fit.support().to_vec(),
+        "Balanced and Explicit({{0:0.8,1:1.3333}}) support_ must match (the balanced formula)"
+    );
+    assert_eq!(
+        bal_dual.dim(),
+        bal_exp_dual.dim(),
+        "balanced dual_coef_ shape"
+    );
+    for c in 0..bal_dual.ncols() {
+        assert!(
+            (bal_dual[[0, c]] - bal_exp_dual[[0, c]]).abs() < 1e-2,
+            "Balanced == Explicit({{0:0.8,1:1.3333}}) dual_coef_[0][{c}]: \
+             balanced={}, explicit={}, gap={}",
+            bal_dual[[0, c]],
+            bal_exp_dual[[0, c]],
+            (bal_dual[[0, c]] - bal_exp_dual[[0, c]]).abs()
+        );
+    }
+    assert!(
+        (bal_fit.intercept()[0] - bal_explicit_fit.intercept()[0]).abs() < 1e-2,
+        "Balanced == Explicit({{0:0.8,1:1.3333}}) intercept_: balanced={}, explicit={}",
+        bal_fit.intercept()[0],
+        bal_explicit_fit.intercept()[0]
     );
 }
