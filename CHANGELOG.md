@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate(one_class_svm): REQ-2 gamma='scale'/'auto' not resolved at fit (uses 1.0) (#647)
 - translate(svm): REQ-9 probability Platt scaling predict_proba (#642)
 - translate(svm): REQ-8 estimator-level param surface + defaults (R-DEV-2) (#641)
 - translate(svm): REQ-5 predict ovo voting tie-break (lower class index) (#638)
