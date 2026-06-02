@@ -55,9 +55,9 @@
 //! | REQ-5 (l1/elasticnet + l1_ratio) | SHIPPED | `enum Penalty {L2,L1,ElasticNet}` + `pub penalty`/`pub l1_ratio` fields on `SGDClassifier`/`SGDRegressor` with `fn with_penalty`/`fn with_l1_ratio` builders (defaults `L2`/`0.15`, `_stochastic_gradient.py:1231-1256`). `fn train_binary_sgd`/`train_regressor_sgd` derive `eff` via `fn effective_l1_ratio` (`L2->0`, `L1->1`, `ElasticNet->l1_ratio`, `_sgd_fast.pyx.tp:558-561`), apply the L2 shrink `max(0, 1-(1-eff)*eta*alpha)` BEFORE the gradient add (`:632-635`), then the Tsuruoka cumulative-penalty L1 truncation with fit-persistent scalar `u` and per-feature `q` AFTER (`:656-658,750-778`, `wscale=1`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_l1_truncated_gradient` (live oracle coef [0.9204,-0.4452]), `sgd_elasticnet_l1_ratio` (l1_ratio=0.3, coef [0.92340705,-0.45723495]). Closed #526. NOTE (partial_fit+l1): `u`/`q` are scoped per `train_*_sgd` call, so they persist across the epochs of a single `fit` (the parity-critical path) but reset per `partial_fit` call. This MATCHES sklearn, which re-allocates `q=np.zeros(...)`/`u=0.0` at the top of every `_plain_sgd` call (`_sgd_fast.pyx.tp:551-556`) and only carries `t_` across `partial_fit` (`_stochastic_gradient.py` re-invokes `_plain_sgd` per call). The full `fit` path is exact. |
 //! | REQ-6 (constant + invscaling schedules) | SHIPPED | `fn compute_lr`: `Constant => eta0`, `InvScaling => eta0 / t^power_t` (`_sgd_fast.pyx.tp:479,593-594`). Consumer: per-step in `fn train_binary_sgd`/`train_regressor_sgd`. Tests: `test_constant_lr`, `test_invscaling_lr`. |
 //! | REQ-7 (optimal schedule t0 offset) | SHIPPED | `fn compute_lr` Optimal arm now `1/(alpha*(optimal_init + t - 1))` with `optimal_init` from `fn optimal_init` (`typw=sqrt(1/sqrt(alpha))`, `e0=typw/max(1,|gradient(1,-typw)|)`, `optimal_init=1/(e0*alpha)`), mirroring `_sgd_fast.pyx.tp:565-570,592`. Computed once per fit before the epoch loop. Consumer: `fn train_*_sgd`. Tests: `test_optimal_lr`, `test_optimal_init_matches_oracle`, divergence `sgd_optimal_schedule_t0_offset`. Closed #527. |
-//! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | NOT-STARTED | blocker #528. Divides by 2 on a 5-epoch mean-loss trigger; sklearn /5 on `n_iter_no_change`/`best_loss` (`_sgd_fast.pyx.tp:698-701`). |
-//! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`penalty`, `l1_ratio`, `fit_intercept`, `shuffle`, `epsilon`, `n_iter_no_change`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. |
-//! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | NOT-STARTED | blocker #530. First-epoch mean-loss delta; sklearn `best_loss`+`n_iter_no_change`+`sumloss` (`_sgd_fast.pyx.tp:688-707`); missing dloss `+-1e12` clip. |
+//! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) divides `current_eta` by 5 (not 2) when `no_improve_count >= n_iter_no_change` AND the schedule is `Adaptive` AND `eta > 1e-6`, resetting the count — the SAME `best_loss`/`sumloss > best_loss - tol*n` machinery as convergence (`_sgd_fast.pyx.tp:697-707`). The old `>= prev_loss` 5-epoch `/2` trigger is deleted. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_adaptive_schedule_divisor` (live oracle coef `[0.8065190275590332, 0.15336844797680402]` intercept `0.12731338963662575`, n_iter_ 80). Closes #528. |
+//! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`fit_intercept`, `epsilon`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. (`penalty`/`l1_ratio` shipped under REQ-5; `shuffle` under REQ-12; `n_iter_no_change` folded into REQ-10.) |
+//! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) tracks `best_loss` (running min, init `+inf`) and increments `no_improve_count` when `tol_active && sumloss > best_loss - tol*n_samples`, resetting otherwise; breaks once `no_improve_count >= hyper.n_iter_no_change` (non-adaptive), exactly mirroring `_sgd_fast.pyx.tp:688-707`. `sumloss` is now the SUM of per-sample losses over the epoch (the `/= n_samples` mean division is removed, `_sgd_fast.pyx.tp:597`); `tol_active = hyper.tol > -inf` encodes sklearn's `tol=None -> -INFINITY` disable (`:690`). The per-sample gradient is clipped to `[-1e12, 1e12]` via `fn max_dloss` before the update (`_sgd_fast.pyx.tp:546,613-620`). `n_iter_no_change` is now a settable `pub` field (default 5) with `fn with_n_iter_no_change` on both estimators, threaded through `SGDHyper`/`clf_hyper`/`reg_hyper` (`_stochastic_gradient.py` `n_iter_no_change=5`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_convergence_n_iter_no_change` (live oracle coef `[0.8037686404055491, 0.16059017315681692]` intercept `0.12903834217696583`, n_iter_ 49). Closes #530. |
 //! | REQ-11 (fit_intercept) | NOT-STARTED | blocker #531. No field; intercept always fit (`_sgd_fast.pyx.tp:639`). |
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
 //! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
@@ -380,6 +380,73 @@ fn effective_l1_ratio<F: Float>(penalty: Penalty, l1_ratio: F) -> F {
     }
 }
 
+/// The `MAX_DLOSS` gradient clip bound (`_sgd_fast.pyx.tp:546`, `1e12`).
+///
+/// sklearn clips `dloss` to `[-MAX_DLOSS, MAX_DLOSS]` before forming the update
+/// `update = -eta * dloss` (`_sgd_fast.pyx.tp:613-620`) to avoid numerical
+/// instabilities. Falls back to `F::max_value()` (an even looser, never-active
+/// bound) if `1e12` is not representable in `F` — so the clamp is always a safe
+/// no-op widening rather than a panic.
+#[inline]
+fn max_dloss<F: Float>() -> F {
+    F::from(1e12_f64).unwrap_or_else(F::max_value)
+}
+
+/// Shared SGD epoch-end convergence / adaptive-eta tail.
+///
+/// Mirrors `_sgd_fast.pyx.tp:688-707` exactly. `epoch_sumloss` is the SUM of
+/// per-sample losses over the epoch (`:597`, NOT the printed mean `sumloss /
+/// train_count`). The criterion increments `no_improve_count` whenever
+/// `sumloss > best_loss - tol * train_count` (an epoch that fails to beat the
+/// running minimum by at least `tol*n`) and resets it otherwise; `best_loss`
+/// tracks the running minimum. Once `no_improve_count >= n_iter_no_change`,
+/// under the adaptive schedule (`eta > 1e-6`) `eta` is divided by 5 and the
+/// count reset (`:699-701`); otherwise the caller breaks (convergence, `:702`).
+///
+/// Returns `true` iff the epoch loop should `break` (convergence). The two
+/// branches are mutually exclusive, exactly as upstream: adaptive decays eta
+/// and keeps running, non-adaptive (or eta already `<= 1e-6`) stops.
+#[allow(clippy::too_many_arguments, reason = "mirrors the upstream epoch tail")]
+#[inline]
+fn convergence_tail<F: Float>(
+    epoch_sumloss: F,
+    best_loss: &mut F,
+    no_improve_count: &mut usize,
+    current_eta: &mut F,
+    tol_active: bool,
+    tol: F,
+    n_samples: usize,
+    n_iter_no_change: usize,
+    adaptive: bool,
+) -> bool {
+    // `_sgd_fast.pyx.tp:690-693`: training-loss branch (early_stopping=False).
+    let n = F::from(n_samples).unwrap_or_else(F::zero);
+    if tol_active && epoch_sumloss > *best_loss - tol * n {
+        *no_improve_count += 1;
+    } else {
+        *no_improve_count = 0;
+    }
+    // `:694-695`: track the running minimum.
+    if epoch_sumloss < *best_loss {
+        *best_loss = epoch_sumloss;
+    }
+    // `:698-707`: convergence break OR adaptive eta/=5.
+    if *no_improve_count >= n_iter_no_change {
+        // `:699`: `if learning_rate == ADAPTIVE and eta > 1e-6`.
+        let eta_floor = F::from(1e-6_f64).unwrap_or_else(F::zero);
+        let divisor = F::from(5.0_f64).unwrap_or_else(F::one);
+        if adaptive && *current_eta > eta_floor {
+            *current_eta = *current_eta / divisor;
+            *no_improve_count = 0;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Classifier loss enum
 // ---------------------------------------------------------------------------
@@ -466,6 +533,11 @@ pub struct SGDClassifier<F> {
     /// `true` (sklearn `SGDClassifier(shuffle=True)`,
     /// `_stochastic_gradient.py:107`).
     pub shuffle: bool,
+    /// Number of consecutive epochs with no loss improvement (beyond `tol`)
+    /// before convergence triggers, or — under the `adaptive` schedule — before
+    /// `eta` is divided by 5. Defaults to `5` (sklearn
+    /// `_stochastic_gradient.py` `n_iter_no_change=5`, `_sgd_fast.pyx.tp:698`).
+    pub n_iter_no_change: usize,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -490,6 +562,7 @@ impl<F: Float> SGDClassifier<F> {
             random_state: None,
             power_t: F::from(0.5).unwrap_or_else(F::zero),
             shuffle: true,
+            n_iter_no_change: 5,
         }
     }
 
@@ -575,6 +648,18 @@ impl<F: Float> SGDClassifier<F> {
         self.shuffle = shuffle;
         self
     }
+
+    /// Set the number of consecutive non-improving epochs before convergence
+    /// (or, under the `adaptive` schedule, before `eta` is divided by 5).
+    ///
+    /// Mirrors sklearn's `n_iter_no_change` parameter (default `5`,
+    /// `_stochastic_gradient.py`); the epoch-end stop rule at
+    /// `_sgd_fast.pyx.tp:698` triggers once `no_improvement_count` reaches it.
+    #[must_use]
+    pub fn with_n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -596,6 +681,7 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         penalty: clf.penalty,
         l1_ratio: clf.l1_ratio,
         shuffle: clf.shuffle,
+        n_iter_no_change: clf.n_iter_no_change,
     }
 }
 
@@ -615,6 +701,10 @@ struct SGDHyper<F> {
     l1_ratio: F,
     /// Whether to shuffle the sample order each epoch (`_sgd_fast.pyx.tp:579`).
     shuffle: bool,
+    /// Number of consecutive non-improving epochs before convergence /
+    /// adaptive-eta decay triggers (`_stochastic_gradient.py` default 5,
+    /// `_sgd_fast.pyx.tp:698`).
+    n_iter_no_change: usize,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -637,9 +727,17 @@ where
     let n_samples = x.nrows();
     let n_features = x.ncols();
     let mut t = initial_t;
-    let mut prev_loss = F::infinity();
+    // Epoch-end convergence state, mirroring `_sgd_fast.pyx.tp:525,532-534`:
+    // `best_loss = INFINITY`, `no_improvement_count = 0`. `current_eta` carries
+    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`).
+    let mut best_loss = F::infinity();
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
+    // `tol = None` upstream becomes `-INFINITY`, disabling the stop rule
+    // (`tol > -INFINITY` is false, `:690`). ferrolearn encodes that as a
+    // finite/-inf `tol`; the criterion is active iff `tol > -inf`.
+    let tol_active = hyper.tol > F::neg_infinity();
+    let max_dloss = max_dloss::<F>();
     let mut indices: Vec<usize> = (0..n_samples).collect();
     // `optimal_init` (the `optimal` schedule's t0 offset) depends on the loss
     // and alpha, so it is computed once per fit, before the epoch loop
@@ -698,7 +796,14 @@ where
                 y_pred = y_pred + weights[j] * xi[j];
             }
 
-            let grad = loss_fn.gradient(y_binary[i], y_pred);
+            // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before forming the
+            // update, matching `_sgd_fast.pyx.tp:613-620`.
+            let grad = loss_fn
+                .gradient(y_binary[i], y_pred)
+                .max(-max_dloss)
+                .min(max_dloss);
+            // `sumloss` is the SUM (not mean) of per-sample losses over the
+            // epoch (`_sgd_fast.pyx.tp:597`), used by the `best_loss` stop rule.
             epoch_loss = epoch_loss + loss_fn.loss(y_binary[i], y_pred);
 
             // L2 shrink: scale the whole weight vector by the CLAMPED factor
@@ -736,31 +841,24 @@ where
             }
         }
 
-        epoch_loss = epoch_loss / F::from(n_samples).unwrap();
+        // `epoch_loss` is now the epoch `sumloss` (no mean division). The
+        // epoch-end stop rule mirrors `_sgd_fast.pyx.tp:688-707` exactly:
+        // the criterion compares `sumloss` to `best_loss - tol * train_count`.
         total_loss = epoch_loss;
 
-        // Convergence check.
-        if (prev_loss - epoch_loss).abs() < hyper.tol {
+        if convergence_tail(
+            epoch_loss,
+            &mut best_loss,
+            &mut no_improve_count,
+            &mut current_eta,
+            tol_active,
+            hyper.tol,
+            n_samples,
+            hyper.n_iter_no_change,
+            matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+        ) {
             break;
         }
-
-        // Adaptive learning rate adjustment.
-        if let LearningRateSchedule::Adaptive = hyper.learning_rate {
-            if epoch_loss >= prev_loss {
-                no_improve_count += 1;
-                if no_improve_count >= 5 {
-                    current_eta = current_eta / F::from(2.0).unwrap();
-                    no_improve_count = 0;
-                    if current_eta < F::from(1e-6).unwrap() {
-                        break;
-                    }
-                }
-            } else {
-                no_improve_count = 0;
-            }
-        }
-
-        prev_loss = epoch_loss;
     }
 
     (total_loss, t)
@@ -1312,6 +1410,11 @@ pub struct SGDRegressor<F> {
     /// `true` (sklearn `SGDRegressor(shuffle=True)`,
     /// `_stochastic_gradient.py:2038`).
     pub shuffle: bool,
+    /// Number of consecutive epochs with no loss improvement (beyond `tol`)
+    /// before convergence triggers, or — under the `adaptive` schedule — before
+    /// `eta` is divided by 5. Defaults to `5` (sklearn
+    /// `_stochastic_gradient.py` `n_iter_no_change=5`, `_sgd_fast.pyx.tp:698`).
+    pub n_iter_no_change: usize,
 }
 
 impl<F: Float> SGDRegressor<F> {
@@ -1326,6 +1429,7 @@ impl<F: Float> SGDRegressor<F> {
     pub fn new() -> Self {
         Self {
             loss: RegressorLoss::SquaredError,
+            n_iter_no_change: 5,
             shuffle: true,
             penalty: Penalty::L2,
             l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
@@ -1421,6 +1525,18 @@ impl<F: Float> SGDRegressor<F> {
         self.shuffle = shuffle;
         self
     }
+
+    /// Set the number of consecutive non-improving epochs before convergence
+    /// (or, under the `adaptive` schedule, before `eta` is divided by 5).
+    ///
+    /// Mirrors sklearn's `n_iter_no_change` parameter (default `5`,
+    /// `_stochastic_gradient.py`); the epoch-end stop rule at
+    /// `_sgd_fast.pyx.tp:698` triggers once `no_improvement_count` reaches it.
+    #[must_use]
+    pub fn with_n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDRegressor<F> {
@@ -1442,6 +1558,7 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         penalty: reg.penalty,
         l1_ratio: reg.l1_ratio,
         shuffle: reg.shuffle,
+        n_iter_no_change: reg.n_iter_no_change,
     }
 }
 
@@ -1463,9 +1580,17 @@ where
     let n_samples = x.nrows();
     let n_features = x.ncols();
     let mut t = initial_t;
-    let mut prev_loss = F::infinity();
+    // Epoch-end convergence state, mirroring `_sgd_fast.pyx.tp:525,532-534`:
+    // `best_loss = INFINITY`, `no_improvement_count = 0`. `current_eta` carries
+    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`).
+    let mut best_loss = F::infinity();
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
+    // `tol = None` upstream becomes `-INFINITY`, disabling the stop rule
+    // (`tol > -INFINITY` is false, `:690`). ferrolearn encodes that as a
+    // finite/-inf `tol`; the criterion is active iff `tol > -inf`.
+    let tol_active = hyper.tol > F::neg_infinity();
+    let max_dloss = max_dloss::<F>();
     let mut indices: Vec<usize> = (0..n_samples).collect();
     // `optimal_init` (the `optimal` schedule's t0 offset) depends on the loss
     // and alpha, so it is computed once per fit, before the epoch loop
@@ -1519,7 +1644,14 @@ where
                 y_pred = y_pred + weights[j] * xi[j];
             }
 
-            let grad = loss_fn.gradient(y[i], y_pred);
+            // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before forming the
+            // update, matching `_sgd_fast.pyx.tp:613-620`.
+            let grad = loss_fn
+                .gradient(y[i], y_pred)
+                .max(-max_dloss)
+                .min(max_dloss);
+            // `sumloss` is the SUM (not mean) of per-sample losses over the
+            // epoch (`_sgd_fast.pyx.tp:597`), used by the `best_loss` stop rule.
             epoch_loss = epoch_loss + loss_fn.loss(y[i], y_pred);
 
             // L2 shrink: clamped multiplicative factor
@@ -1554,29 +1686,23 @@ where
             }
         }
 
-        epoch_loss = epoch_loss / F::from(n_samples).unwrap();
+        // `epoch_loss` is now the epoch `sumloss` (no mean division). The
+        // epoch-end stop rule mirrors `_sgd_fast.pyx.tp:688-707` exactly.
         total_loss = epoch_loss;
 
-        if (prev_loss - epoch_loss).abs() < hyper.tol {
+        if convergence_tail(
+            epoch_loss,
+            &mut best_loss,
+            &mut no_improve_count,
+            &mut current_eta,
+            tol_active,
+            hyper.tol,
+            n_samples,
+            hyper.n_iter_no_change,
+            matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+        ) {
             break;
         }
-
-        if let LearningRateSchedule::Adaptive = hyper.learning_rate {
-            if epoch_loss >= prev_loss {
-                no_improve_count += 1;
-                if no_improve_count >= 5 {
-                    current_eta = current_eta / F::from(2.0).unwrap();
-                    no_improve_count = 0;
-                    if current_eta < F::from(1e-6).unwrap() {
-                        break;
-                    }
-                }
-            } else {
-                no_improve_count = 0;
-            }
-        }
-
-        prev_loss = epoch_loss;
     }
 
     (total_loss, t)
