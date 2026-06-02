@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(svm): REQ-1/8 gamma='auto' (Gamma enum scale/auto/value) + shrinking/break_ties/default alignment (#641 partial)
 - translate(linear_svc): REQ-6 multi_class {ovr, crammer_singer} + per-class coef pin (#623)
 - translate(linear_svc): REQ-9 class_weight {None, balanced, dict} (#626)
 - translate(linear_svc): REQ-8 dual {auto, True, False} + unsupported-combination rejects (#625)
