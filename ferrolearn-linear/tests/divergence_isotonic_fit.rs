@@ -28,7 +28,7 @@
 //! is written; REQ-1's core unweighted PAVA on distinct X is correct.
 
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::isotonic::IsotonicRegression;
+use ferrolearn_linear::isotonic::{IsotonicRegression, check_increasing, isotonic_regression};
 use ndarray::{Array2, array};
 
 /// Divergence: a DEFAULT-constructed `IsotonicRegression` clips out-of-range
@@ -271,6 +271,196 @@ fn isotonic_y_min_y_max() {
             [1.0, 2.0, 3.0, 4.0, 5.0][i],
             oracle_both[i],
             preds_both[i]
+        );
+    }
+}
+
+/// Parity: `increasing='auto'` resolves the monotonicity direction from the
+/// data via a Spearman correlation test (#567).
+///
+/// sklearn's `_build_y` runs `self.increasing_ = check_increasing(X, y)` when
+/// `self.increasing == "auto"` (`sklearn/isotonic.py:306-307`), where
+/// `check_increasing` returns `rho >= 0` for the Spearman rho between `x` and
+/// `y` (`isotonic.py:76-77`). On strictly DECREASING data the rho is `-1`, so
+/// the fit goes decreasing and `increasing_` is `False`; on the increasing
+/// scatter `[1,3,2,4]` rho > 0 so `increasing_` is `True`.
+///
+/// Oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.isotonic import IsotonicRegression; \
+///   m=IsotonicRegression(increasing='auto',out_of_bounds='clip').fit(np.array([1.,2.,3.,4.]).reshape(-1,1), np.array([4.,3.,2.,1.])); \
+///   print(m.predict(np.array([1.,2.,3.,4.]).reshape(-1,1)).tolist(), m.increasing_); \
+///   m2=IsotonicRegression(increasing='auto').fit(np.array([1.,2.,3.,4.]).reshape(-1,1), np.array([1.,3.,2.,4.])); \
+///   print(m2.increasing_)"
+///   # -> [4.0, 3.0, 2.0, 1.0] False
+///   # -> True
+/// ```
+/// (The Spearman-CI warning sklearn emits is advisory and does not change the
+/// returned direction — see `check_increasing`'s doc.)
+///
+/// Tracking: #567
+#[test]
+fn isotonic_increasing_auto() {
+    // Decreasing data: X=[1,2,3,4], y=[4,3,2,1] -> resolves decreasing.
+    let x = Array2::from_shape_vec((4, 1), vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap();
+    let y_dec = array![4.0_f64, 3.0, 2.0, 1.0];
+
+    let fitted_dec = IsotonicRegression::<f64>::new()
+        .with_increasing_auto()
+        .fit(&x, &y_dec)
+        .unwrap();
+
+    // increasing_ == False (oracle).
+    assert!(
+        !fitted_dec.increasing(),
+        "increasing='auto' on decreasing data: sklearn increasing_=False \
+         (check_increasing, isotonic.py:306-307), ferrolearn returned {}",
+        fitted_dec.increasing()
+    );
+
+    // predict([1,2,3,4]) == [4,3,2,1] (oracle).
+    let preds = fitted_dec.predict(&x).unwrap();
+    let oracle = [4.0_f64, 3.0, 2.0, 1.0];
+    for (i, &exp) in oracle.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "increasing='auto' decreasing predict({}): sklearn returns {exp}, \
+             ferrolearn returned {}",
+            [1.0, 2.0, 3.0, 4.0][i],
+            preds[i]
+        );
+    }
+
+    // Increasing scatter: X=[1,2,3,4], y=[1,3,2,4] -> resolves increasing.
+    let y_inc = array![1.0_f64, 3.0, 2.0, 4.0];
+    let fitted_inc = IsotonicRegression::<f64>::new()
+        .with_increasing_auto()
+        .fit(&x, &y_inc)
+        .unwrap();
+    assert!(
+        fitted_inc.increasing(),
+        "increasing='auto' on increasing data: sklearn increasing_=True \
+         (check_increasing, isotonic.py:306-307), ferrolearn returned {}",
+        fitted_inc.increasing()
+    );
+}
+
+/// Parity: the fitted `X_min_`/`X_max_`/`X_thresholds_`/`y_thresholds_`/
+/// `increasing_` attributes are exposed and match sklearn (#570).
+///
+/// sklearn sets these in `fit`/`_build_y` (`sklearn/isotonic.py:331` `X_min_`/
+/// `X_max_`; `:393` `X_thresholds_`/`y_thresholds_`; `:307-309` `increasing_`),
+/// after the `trim_duplicates` interior-plateau trim (`:333-341`).
+///
+/// Oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.isotonic import IsotonicRegression; \
+///   m=IsotonicRegression().fit(np.array([1.,2.,3.,4.]).reshape(-1,1), np.array([1.,3.,2.,4.])); \
+///   print(m.X_min_, m.X_max_, m.X_thresholds_.tolist(), m.y_thresholds_.tolist(), m.increasing_)"
+///   # -> 1.0 4.0 [1.0, 2.0, 3.0, 4.0] [1.0, 2.5, 2.5, 4.0] True
+/// ```
+///
+/// Tracking: #570
+#[test]
+fn isotonic_fitted_attributes() {
+    let x = Array2::from_shape_vec((4, 1), vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap();
+    let y = array![1.0_f64, 3.0, 2.0, 4.0];
+
+    let fitted = IsotonicRegression::<f64>::new().fit(&x, &y).unwrap();
+
+    // sklearn 1.5.2 oracle (recorded above).
+    assert!(
+        (fitted.x_min() - 1.0).abs() < 1e-12,
+        "X_min_: sklearn=1.0 (isotonic.py:331), ferrolearn={}",
+        fitted.x_min()
+    );
+    assert!(
+        (fitted.x_max() - 4.0).abs() < 1e-12,
+        "X_max_: sklearn=4.0 (isotonic.py:331), ferrolearn={}",
+        fitted.x_max()
+    );
+
+    let x_thr_oracle = [1.0_f64, 2.0, 3.0, 4.0];
+    let y_thr_oracle = [1.0_f64, 2.5, 2.5, 4.0];
+    assert_eq!(
+        fitted.x_thresholds().len(),
+        x_thr_oracle.len(),
+        "X_thresholds_ length: sklearn={} (isotonic.py:393), ferrolearn={}",
+        x_thr_oracle.len(),
+        fitted.x_thresholds().len()
+    );
+    for (i, (&xt, &xo)) in fitted.x_thresholds().iter().zip(&x_thr_oracle).enumerate() {
+        assert!(
+            (xt - xo).abs() < 1e-12,
+            "X_thresholds_[{i}]: sklearn={xo} (isotonic.py:393), ferrolearn={xt}"
+        );
+    }
+    for (i, (&yt, &yo)) in fitted.y_thresholds().iter().zip(&y_thr_oracle).enumerate() {
+        assert!(
+            (yt - yo).abs() < 1e-12,
+            "y_thresholds_[{i}]: sklearn={yo} (isotonic.py:393), ferrolearn={yt}"
+        );
+    }
+    assert!(
+        fitted.increasing(),
+        "increasing_: sklearn=True (isotonic.py:307-309), ferrolearn={}",
+        fitted.increasing()
+    );
+}
+
+/// Parity: the free `check_increasing(x, y)` function (#571).
+///
+/// sklearn's `check_increasing` returns `rho >= 0` for the Spearman rho between
+/// `x` and `y` (`sklearn/isotonic.py:32-98`, esp. `:76-77`).
+///
+/// Oracle:
+/// ```text
+/// python3 -c "from sklearn.isotonic import check_increasing; \
+///   print(check_increasing([1,2,3,4],[1,2,3,4]), check_increasing([1,2,3,4],[4,3,2,1]))"
+///   # -> True False
+/// ```
+///
+/// Tracking: #571
+#[test]
+fn isotonic_free_check_increasing() {
+    assert!(
+        check_increasing(&[1.0_f64, 2.0, 3.0, 4.0], &[1.0_f64, 2.0, 3.0, 4.0]),
+        "check_increasing([1,2,3,4],[1,2,3,4]): sklearn=True (isotonic.py:76-77)"
+    );
+    assert!(
+        !check_increasing(&[1.0_f64, 2.0, 3.0, 4.0], &[4.0_f64, 3.0, 2.0, 1.0]),
+        "check_increasing([1,2,3,4],[4,3,2,1]): sklearn=False (isotonic.py:76-77)"
+    );
+}
+
+/// Parity: the free `isotonic_regression(y, ...)` PAVA function (#571).
+///
+/// sklearn's `isotonic_regression` runs the contiguous-sequence PAVA on `y`
+/// (`sklearn/isotonic.py:111-171`).
+///
+/// Oracle:
+/// ```text
+/// python3 -c "from sklearn.isotonic import isotonic_regression; \
+///   print(isotonic_regression([5,3,1,2,8,10,7,9,6,4]).tolist())"
+///   # -> [2.75, 2.75, 2.75, 2.75, 7.333333333333333, 7.333333333333333,
+///   #     7.333333333333333, 7.333333333333333, 7.333333333333333, 7.333333333333333]
+/// ```
+///
+/// Tracking: #571
+#[test]
+fn isotonic_free_isotonic_regression() {
+    let y = [5.0_f64, 3.0, 1.0, 2.0, 8.0, 10.0, 7.0, 9.0, 6.0, 4.0];
+    let out = isotonic_regression(&y, None, None, None, true);
+
+    let third = 7.0_f64 + 1.0 / 3.0;
+    let oracle = [
+        2.75_f64, 2.75, 2.75, 2.75, third, third, third, third, third, third,
+    ];
+    assert_eq!(out.len(), oracle.len());
+    for (i, (&got, &exp)) in out.iter().zip(&oracle).enumerate() {
+        assert!(
+            (got - exp).abs() < 1e-9,
+            "isotonic_regression[{i}]: sklearn={exp} (isotonic.py:111-171), ferrolearn={got}"
         );
     }
 }

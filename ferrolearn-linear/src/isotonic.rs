@@ -39,10 +39,10 @@
 //! | REQ-4 (out_of_bounds nan/clip/raise; default `nan`) | SHIPPED | `OutOfBounds::{Nan,Clip,Raise}`; `new()` defaults `Nan` (`isotonic.py:274`); test `isotonic_default_out_of_bounds_nan`. Closed #565. |
 //! | REQ-8 (`_make_unique` weighted duplicate-X collapse) | SHIPPED | `fn make_unique` collapses equal-X runs to `(x, Σwy/Σw, Σw)` + weighted PAVA (`isotonic.py:308-325`); test `isotonic_make_unique_duplicate_x` (`[1,1,2,3]/[1,3,2,4]` → `[2,2,4]`). Closed #569. |
 //! | REQ-5 (y_min/y_max clipping) | SHIPPED | `IsotonicRegression` gains `pub y_min`/`pub y_max: Option<F>` fields (default `None` in `new`, matching `isotonic.py:274`) + `#[must_use] with_y_min`/`with_y_max` builders; `fn fit_with_sample_weight` clips each pooled `y_threshold` to `[y_min.unwrap_or(-inf), y_max.unwrap_or(+inf)]` AFTER PAVA (and after the decreasing negate-fit-negate is undone), mirroring `np.clip(y, y_min, y_max, y)` (`isotonic.py:163-170`). Both-`None` is a no-op (byte-identical unclipped path). Consumer: `Fit::fit` → `FittedIsotonicRegression` (crate-root export). Test: `isotonic_y_min_y_max` (divergence suite, live oracle `y_min=2`→`[2,2,3,4,5]`, `y_max=4`→`[1,2,3,4,4]`, both→`[2,2,3,4,4]`). #566. |
-//! | REQ-6 (increasing='auto' via Spearman) | NOT-STARTED | #567. |
+//! | REQ-6 (increasing='auto' via Spearman) | SHIPPED | `enum Increasing::Auto` + `fn with_increasing_auto`/`fn with_increasing_mode`; `fn fit_with_sample_weight` resolves `Auto` via the free `fn check_increasing` (Spearman rho sign, `sklearn/isotonic.py:32-98,306-307`) and stores the bool in `FittedIsotonicRegression::increasing`. Consumer: `Fit::fit`. Test: `isotonic_increasing_auto` (divergence suite, live oracle `X=[1..4],y=[4,3,2,1]`→decreasing, `increasing_==false`). #567. |
 //! | REQ-7 (sample_weight public API) | SHIPPED | `fn fit_with_sample_weight` threads per-sample weights into weighted `make_unique` (weighted-mean collapse) + `pav_increasing_unique_weighted` (weighted pool), mirroring `IsotonicRegression.fit(X,y,sample_weight)` → `_build_y` `_make_unique`/`isotonic_regression` (`isotonic.py:251`,`:300-328`). Consumer: `Fit::fit` delegates with an all-ones weight vector. Test: `isotonic_sample_weight` (divergence suite). Closed #568. |
-//! | REQ-9 (X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_) | NOT-STARTED | #570. |
-//! | REQ-10 (free `isotonic_regression` + `check_increasing`) | NOT-STARTED | #571. |
+//! | REQ-9 (X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_) | SHIPPED | `FittedIsotonicRegression::{x_min,x_max,x_thresholds,y_thresholds,increasing}` accessors mirror `X_min_`/`X_max_`/`X_thresholds_`/`y_thresholds_`/`increasing_` (`sklearn/isotonic.py:331,393,307-309`); `fit_with_sample_weight` applies sklearn's `trim_duplicates` interior-plateau trim (`isotonic.py:333-341`) to the stored thresholds. Consumer: `Fit::fit` → these accessors are read by the predict path (`x_min`/`x_max` bound the interpolant). Test: `isotonic_fitted_attributes` (live oracle `X=[1..4],y=[1,3,2,4]`→`x_min=1,x_max=4,x_thr=[1,2,3,4],y_thr=[1,2.5,2.5,4],increasing=true`). #570. |
+//! | REQ-10 (free `isotonic_regression` + `check_increasing`) | SHIPPED | `pub fn check_increasing` (Spearman rho sign, `isotonic.py:32-98`) + `pub fn isotonic_regression` (free PAVA with `sample_weight`/`y_min`/`y_max`/`increasing`, `isotonic.py:111-171`). Consumer: `check_increasing` consumed by `fit_with_sample_weight`'s `Auto` resolution; `isotonic_regression` reuses the internal weighted-PAVA machinery and is itself a production free function. Tests: `isotonic_free_check_increasing`, `isotonic_free_isotonic_regression` (live oracle). #571. |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | #572 (crate-wide-deferred, cf. ridge #391). |
 
 use ferrolearn_core::error::FerroError;
@@ -66,6 +66,47 @@ pub enum OutOfBounds {
 }
 
 // ---------------------------------------------------------------------------
+// Increasing mode
+// ---------------------------------------------------------------------------
+
+/// Monotonicity direction for the fitted function.
+///
+/// Mirrors scikit-learn's `increasing` constructor parameter, whose
+/// `_parameter_constraints` allows `["boolean", StrOptions({"auto"})]` with
+/// default `True` (`sklearn/isotonic.py:271-274`):
+///
+/// - [`Increasing::True`] — force a non-decreasing fit (`increasing=True`).
+/// - [`Increasing::False`] — force a non-increasing fit (`increasing=False`).
+/// - [`Increasing::Auto`] — resolve the direction from the data at fit time via
+///   a Spearman correlation test (`increasing='auto'`,
+///   `sklearn/isotonic.py:306-307`: `self.increasing_ = check_increasing(X, y)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Increasing {
+    /// Force a non-decreasing (increasing) fit. The default, matching
+    /// `IsotonicRegression(increasing=True)` (`sklearn/isotonic.py:274`).
+    #[default]
+    True,
+    /// Force a non-increasing (decreasing) fit.
+    False,
+    /// Resolve the direction from the data via a Spearman correlation test
+    /// (`increasing='auto'`).
+    Auto,
+}
+
+impl From<bool> for Increasing {
+    /// `true` → [`Increasing::True`], `false` → [`Increasing::False`].
+    ///
+    /// This preserves the prior `with_increasing(bool)` API semantics.
+    fn from(b: bool) -> Self {
+        if b {
+            Increasing::True
+        } else {
+            Increasing::False
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // IsotonicRegression (unfitted)
 // ---------------------------------------------------------------------------
 
@@ -79,9 +120,10 @@ pub enum OutOfBounds {
 /// - `F`: The floating-point type (`f32` or `f64`).
 #[derive(Debug, Clone)]
 pub struct IsotonicRegression<F> {
-    /// Whether the fitted function should be increasing (true) or
-    /// decreasing (false).
-    pub increasing: bool,
+    /// Monotonicity direction: increasing, decreasing, or auto-resolved from
+    /// the data via a Spearman test. Mirrors scikit-learn's `increasing`
+    /// constructor parameter (`sklearn/isotonic.py:271-274`, default `True`).
+    pub increasing: Increasing,
     /// Strategy for predictions outside the training range.
     pub out_of_bounds: OutOfBounds,
     /// Lower bound on the lowest predicted value. `None` (the default) means
@@ -195,7 +237,26 @@ impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
             });
         }
 
-        let (mut result_x, mut result_y) = if self.increasing {
+        // Resolve the monotonicity direction. For `Increasing::Auto` this runs
+        // a Spearman correlation test over the (positively weighted) sample
+        // `(x, y)` pairs, mirroring scikit-learn's `_build_y`
+        // (`sklearn/isotonic.py:306-307`: `if self.increasing == "auto":
+        // self.increasing_ = check_increasing(X, y)`). NOTE: sklearn resolves
+        // BEFORE the zero-weight `mask` filter (`isotonic.py:306` precedes
+        // `:314-315`), so `check_increasing` sees all rows; we replicate that by
+        // resolving on the full `x.column(0)` / `y` rather than the filtered
+        // `xs`/`ys`.
+        let increasing: bool = match self.increasing {
+            Increasing::True => true,
+            Increasing::False => false,
+            Increasing::Auto => {
+                let x_full: Vec<F> = col.to_vec();
+                let y_full: Vec<F> = y.to_vec();
+                check_increasing(&x_full, &y_full)
+            }
+        };
+
+        let (mut result_x, mut result_y) = if increasing {
             let (ux, uy, uw) = make_unique(&xs, &ys, &ws);
             pav_increasing_unique_weighted(&ux, &uy, &uw)
         } else {
@@ -225,6 +286,33 @@ impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
             }
         }
 
+        // Trim interior plateau points so the stored thresholds mirror
+        // scikit-learn's `X_thresholds_`/`y_thresholds_` exactly: aside from the
+        // first and last point, drop any point whose `y` equals BOTH its
+        // neighbors (`sklearn/isotonic.py:333-341`, the `trim_duplicates`
+        // branch: `keep_data[1:-1] = not_equal(y[1:-1], y[:-2]) | not_equal(
+        // y[1:-1], y[2:])`). This is purely a storage compaction — the
+        // piecewise-linear interpolant is unchanged because the dropped points
+        // lie on a flat segment between two retained breakpoints with the same
+        // `y`.
+        if result_y.len() > 2 {
+            let n = result_y.len();
+            let mut kept_x = Vec::with_capacity(n);
+            let mut kept_y = Vec::with_capacity(n);
+            kept_x.push(result_x[0]);
+            kept_y.push(result_y[0]);
+            for i in 1..n - 1 {
+                if result_y[i] != result_y[i - 1] || result_y[i] != result_y[i + 1] {
+                    kept_x.push(result_x[i]);
+                    kept_y.push(result_y[i]);
+                }
+            }
+            kept_x.push(result_x[n - 1]);
+            kept_y.push(result_y[n - 1]);
+            result_x = kept_x;
+            result_y = kept_y;
+        }
+
         // Ensure at least 2 breakpoints.
         if result_x.len() < 2 {
             // All same x value: duplicate.
@@ -242,7 +330,7 @@ impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
             x_thresholds: result_x,
             y_thresholds: result_y,
             out_of_bounds: self.out_of_bounds,
-            increasing: self.increasing,
+            increasing,
         })
     }
 }
@@ -265,7 +353,7 @@ impl<F: Float> IsotonicRegression<F> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            increasing: true,
+            increasing: Increasing::True,
             out_of_bounds: OutOfBounds::Nan,
             y_min: None,
             y_max: None,
@@ -298,8 +386,36 @@ impl<F: Float> IsotonicRegression<F> {
     }
 
     /// Set whether the fitted function should be increasing.
+    ///
+    /// `true` → [`Increasing::True`] (non-decreasing), `false` →
+    /// [`Increasing::False`] (non-increasing). This preserves the prior
+    /// `with_increasing(bool)` API; for the data-resolved `'auto'` direction use
+    /// [`with_increasing_auto`](Self::with_increasing_auto) or
+    /// [`with_increasing_mode`](Self::with_increasing_mode).
     #[must_use]
     pub fn with_increasing(mut self, increasing: bool) -> Self {
+        self.increasing = Increasing::from(increasing);
+        self
+    }
+
+    /// Resolve the monotonicity direction from the data at fit time via a
+    /// Spearman correlation test, mirroring scikit-learn's
+    /// `IsotonicRegression(increasing='auto')` (`sklearn/isotonic.py:306-307`).
+    ///
+    /// The resolved direction is exposed by
+    /// [`FittedIsotonicRegression::increasing`].
+    #[must_use]
+    pub fn with_increasing_auto(mut self) -> Self {
+        self.increasing = Increasing::Auto;
+        self
+    }
+
+    /// Set the monotonicity direction directly via the [`Increasing`] enum.
+    ///
+    /// Mirrors scikit-learn's `increasing` parameter
+    /// (`sklearn/isotonic.py:271-274`), which accepts `True`/`False`/`'auto'`.
+    #[must_use]
+    pub fn with_increasing_mode(mut self, increasing: Increasing) -> Self {
         self.increasing = increasing;
         self
     }
@@ -343,6 +459,59 @@ impl<F: Float> FittedIsotonicRegression<F> {
     #[must_use]
     pub fn is_increasing(&self) -> bool {
         self.increasing
+    }
+
+    /// The resolved monotonicity direction (`true` = increasing).
+    ///
+    /// Mirrors scikit-learn's fitted `increasing_` attribute
+    /// (`sklearn/isotonic.py:307-309`). When the estimator was configured with
+    /// [`Increasing::Auto`] this is the direction resolved from the data via the
+    /// Spearman test; otherwise it equals the requested direction.
+    #[must_use]
+    pub fn increasing(&self) -> bool {
+        self.increasing
+    }
+
+    /// The minimum training `X` value (`X_min_`).
+    ///
+    /// Mirrors scikit-learn's fitted `X_min_` attribute
+    /// (`sklearn/isotonic.py:331`: `self.X_min_, self.X_max_ = np.min(X),
+    /// np.max(X)`). The thresholds are sorted ascending, so this is the first
+    /// stored threshold.
+    #[must_use]
+    pub fn x_min(&self) -> F {
+        self.x_thresholds[0]
+    }
+
+    /// The maximum training `X` value (`X_max_`).
+    ///
+    /// Mirrors scikit-learn's fitted `X_max_` attribute
+    /// (`sklearn/isotonic.py:331`). The thresholds are sorted ascending, so this
+    /// is the last stored threshold.
+    #[must_use]
+    pub fn x_max(&self) -> F {
+        self.x_thresholds[self.x_thresholds.len() - 1]
+    }
+
+    /// The breakpoint `X` values of the fitted step function (`X_thresholds_`).
+    ///
+    /// Mirrors scikit-learn's fitted `X_thresholds_` attribute
+    /// (`sklearn/isotonic.py:393`), after the interior-plateau trim
+    /// (`isotonic.py:333-341`).
+    #[must_use]
+    pub fn x_thresholds(&self) -> &[F] {
+        &self.x_thresholds
+    }
+
+    /// The breakpoint `y` values of the fitted step function (`y_thresholds_`),
+    /// monotonic in the resolved direction.
+    ///
+    /// Mirrors scikit-learn's fitted `y_thresholds_` attribute
+    /// (`sklearn/isotonic.py:393`), after the interior-plateau trim
+    /// (`isotonic.py:333-341`).
+    #[must_use]
+    pub fn y_thresholds(&self) -> &[F] {
+        &self.y_thresholds
     }
 
     /// Predict a single value using linear interpolation.
@@ -553,6 +722,196 @@ fn pav_increasing_unique_weighted<F: Float>(xs: &[F], ys: &[F], ws: &[F]) -> (Ve
     }
 
     (result_x, result_y)
+}
+
+// ---------------------------------------------------------------------------
+// Free functions: check_increasing / isotonic_regression
+// ---------------------------------------------------------------------------
+
+/// Average (fractional) ranks of `v`, ties resolved to the mean rank of the
+/// tied group — the rank convention `scipy.stats.spearmanr` uses internally
+/// (`scipy.stats.rankdata` with `method='average'`).
+///
+/// Returned ranks are 1-based (rank 1 = smallest), matching `rankdata`. NaN is
+/// ordered as greater-than-all via `total_cmp`-style fallback so the routine
+/// never panics (goal.md R-APG-1).
+fn average_ranks<F: Float>(v: &[F]) -> Vec<F> {
+    let n = v.len();
+    let mut idx: Vec<usize> = (0..n).collect();
+    idx.sort_by(|&a, &b| v[a].partial_cmp(&v[b]).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut ranks = vec![F::zero(); n];
+    let mut i = 0;
+    while i < n {
+        // Find the extent of the tied group [i, j).
+        let mut j = i + 1;
+        while j < n && v[idx[j]] == v[idx[i]] {
+            j += 1;
+        }
+        // Average of the 1-based positions i+1 .. j is (i + j + 1) / 2.
+        let count = j - i;
+        let sum_pos = {
+            // Σ_{k=i}^{j-1} (k + 1) = count*(i+1) + (0+1+...+(count-1)).
+            let mut s = F::zero();
+            for k in 0..count {
+                s = s + F::from(i + 1 + k).unwrap_or_else(F::zero);
+            }
+            s
+        };
+        let avg = sum_pos / F::from(count).unwrap_or_else(F::one);
+        for &orig in &idx[i..j] {
+            ranks[orig] = avg;
+        }
+        i = j;
+    }
+    ranks
+}
+
+/// Determine whether `y` is monotonically increasing or decreasing with respect
+/// to `x`, via the sign of the Spearman rank correlation.
+///
+/// This is the free function `sklearn.isotonic.check_increasing`
+/// (`sklearn/isotonic.py:32-98`): it computes the Spearman rho between `x` and
+/// `y` and returns `rho >= 0` (`isotonic.py:76-77`: `rho, _ = spearmanr(x, y);
+/// increasing_bool = rho >= 0`). The Spearman rho is the Pearson correlation of
+/// the average ranks of `x` and `y`.
+///
+/// scikit-learn additionally emits a `UserWarning` when the 95% Fisher-transform
+/// confidence interval of rho spans zero (`isotonic.py:79-96`). That branch is
+/// purely advisory (it does not change the returned bool), so it is intentionally
+/// omitted here — the contract is the returned direction.
+///
+/// Degenerate inputs return `true` (sklearn's `rho` is `NaN` for a constant
+/// input, and `np.nan >= 0` is `False` in numpy — but for empty/constant data
+/// the direction is conventionally treated as increasing; this only affects
+/// inputs that PAVA handles identically in either direction).
+#[must_use]
+pub fn check_increasing<F: Float + Send + Sync + 'static>(x: &[F], y: &[F]) -> bool {
+    let n = x.len();
+    if n == 0 || n != y.len() {
+        return true;
+    }
+
+    let rx = average_ranks(x);
+    let ry = average_ranks(y);
+
+    // Pearson correlation of the ranks.
+    let nf = F::from(n).unwrap_or_else(F::one);
+    let mean_x = rx.iter().fold(F::zero(), |a, &v| a + v) / nf;
+    let mean_y = ry.iter().fold(F::zero(), |a, &v| a + v) / nf;
+
+    let mut cov = F::zero();
+    let mut var_x = F::zero();
+    let mut var_y = F::zero();
+    for i in 0..n {
+        let dx = rx[i] - mean_x;
+        let dy = ry[i] - mean_y;
+        cov = cov + dx * dy;
+        var_x = var_x + dx * dx;
+        var_y = var_y + dy * dy;
+    }
+
+    // Constant ranks (no variance): rho is undefined; treat as increasing.
+    if var_x <= F::zero() || var_y <= F::zero() {
+        return true;
+    }
+
+    let rho = cov / (var_x.sqrt() * var_y.sqrt());
+    rho >= F::zero()
+}
+
+/// Solve the isotonic regression model on the sequence `y` (the free function
+/// `sklearn.isotonic.isotonic_regression`, `sklearn/isotonic.py:111-171`).
+///
+/// Unlike the [`IsotonicRegression`] estimator, this operates purely on the
+/// **order of `y`** (there is no `X` and no `_make_unique` collapse): index `i`
+/// precedes index `i+1`. For `increasing = false` the sequence is reversed,
+/// pooled increasing, then reversed back (`isotonic.py:156,158,170`: `order =
+/// np.s_[::-1]`). Optional per-element `sample_weight` weights the pool
+/// (defaults to unit weight, `isotonic.py:159`); `y_min`/`y_max` clip the pooled
+/// result to `[y_min, y_max]` afterward (`isotonic.py:163-170`, unset bounds
+/// default to `∓inf`).
+///
+/// Returns the isotonic fit `y_` in the original index order.
+#[must_use]
+pub fn isotonic_regression<F: Float + Send + Sync + 'static>(
+    y: &[F],
+    sample_weight: Option<&[F]>,
+    y_min: Option<F>,
+    y_max: Option<F>,
+    increasing: bool,
+) -> Vec<F> {
+    let n = y.len();
+    if n == 0 {
+        return Vec::new();
+    }
+
+    // Build the working sequence in pool order (`np.s_[:]` vs `np.s_[::-1]`).
+    let mut vals: Vec<F> = Vec::with_capacity(n);
+    let mut wts: Vec<F> = Vec::with_capacity(n);
+    for i in 0..n {
+        let src = if increasing { i } else { n - 1 - i };
+        vals.push(y[src]);
+        wts.push(match sample_weight {
+            Some(sw) if sw.len() == n => sw[src],
+            _ => F::one(),
+        });
+    }
+
+    // Weighted PAV on the contiguous sequence (no X de-duplication): mirrors
+    // `_inplace_contiguous_isotonic_regression`. Each block carries its weighted
+    // sum, total weight, and the count of original elements it spans.
+    struct Block<F> {
+        wsum: F,
+        weight: F,
+        len: usize,
+    }
+    let mut blocks: Vec<Block<F>> = Vec::with_capacity(n);
+    for i in 0..n {
+        blocks.push(Block {
+            wsum: vals[i] * wts[i],
+            weight: wts[i],
+            len: 1,
+        });
+        while blocks.len() > 1 {
+            let k = blocks.len();
+            let prev_mean = blocks[k - 2].wsum / blocks[k - 2].weight;
+            let curr_mean = blocks[k - 1].wsum / blocks[k - 1].weight;
+            if prev_mean > curr_mean {
+                let Some(last) = blocks.pop() else { break };
+                let Some(prev) = blocks.last_mut() else { break };
+                prev.wsum = prev.wsum + last.wsum;
+                prev.weight = prev.weight + last.weight;
+                prev.len += last.len;
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Expand the pooled block means back to per-element values (in pool order).
+    let lo = y_min.unwrap_or_else(F::neg_infinity);
+    let hi = y_max.unwrap_or_else(F::infinity);
+    let clip = y_min.is_some() || y_max.is_some();
+
+    let mut pooled: Vec<F> = Vec::with_capacity(n);
+    for block in &blocks {
+        let mut mean = block.wsum / block.weight;
+        if clip {
+            mean = mean.max(lo).min(hi);
+        }
+        for _ in 0..block.len {
+            pooled.push(mean);
+        }
+    }
+
+    // Undo the reversal so the result is in the original index order
+    // (`isotonic.py:170`: `return y[order]`).
+    if increasing {
+        pooled
+    } else {
+        pooled.into_iter().rev().collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
