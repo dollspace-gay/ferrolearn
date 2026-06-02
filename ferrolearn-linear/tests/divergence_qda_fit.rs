@@ -33,9 +33,10 @@
 //! "Variables are collinear" warning, `discriminant_analysis.py:945-947`);
 //! ferrolearn's Cholesky inversion returns `FerroError::NumericalInstability`.
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::QDA;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 // ===========================================================================
 // Fixed 3-class, 2-feature, 4-points-per-class dataset shared by the core
@@ -409,6 +410,109 @@ fn qda_rank_deficient_class() {
             SK_PRED[i], pred[i]
         );
     }
+}
+
+// ===========================================================================
+// REQ-6 (#580) — provided `priors` constructor argument.
+// ===========================================================================
+
+/// REQ-6 (#580): `QDA::with_priors([0.9, 0.1])` uses the provided priors
+/// VERBATIM (no renormalization, no sign/sum check), matching sklearn
+/// `QuadraticDiscriminantAnalysis(priors=[0.9,0.1])`
+/// (`discriminant_analysis.py:341` `"priors": ["array-like", None]`; `:351,359`
+/// the constructor arg; `:921-924` `self.priors_ = np.array(self.priors)`; the
+/// `+ np.log(self.priors_)` term in `_decision_function`, `:976`). The provided
+/// priors shift the per-class log-posterior by `log(0.9)`/`log(0.1)` versus the
+/// empirical default, observably moving `predict_proba` (row 4 below: empirical
+/// proba[0] ≈ 0.0180 vs provided ≈ 0.1415).
+///
+/// `predict_proba` is the cross-shape-stable `(n, 2)` assertion (sklearn's
+/// binary `decision_function` is `(n,)` = col1−col0; ferrolearn's lib returns
+/// `(n, 2)` — the binding ABI reshape is REQ-7/#581, out of scope here).
+///
+/// Oracle (live sklearn 1.5.2, the OVERLAPPING 2-class dataset below so the
+/// proba is non-degenerate):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as Q; \
+///   X=np.array([[0.,0.],[1.,.5],[.5,1.],[1.,1.],[2.,2.],[3.,2.5],[2.5,3.],[3.,3.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=Q(priors=[0.9,0.1]).fit(X,y); \
+///   print(repr(m.predict_proba(X).tolist())); print(repr(m.priors_.tolist()))"
+/// ```
+#[test]
+fn qda_provided_priors() {
+    // Live sklearn 1.5.2 `Q(priors=[0.9,0.1]).predict_proba(X)`.
+    const SK_PROBA: [[f64; 2]; 8] = [
+        [0.9999999967040056, 3.295994432841995e-09],
+        [0.9999901748755718, 9.825124428190748e-06],
+        [0.9999901748755718, 9.825124428190783e-06],
+        [0.9998586162364907, 0.00014138376350926758],
+        [0.1415135502417861, 0.8584864497582139],
+        [5.529485349005703e-05, 0.99994470514651],
+        [5.5294853490056925e-05, 0.99994470514651],
+        [3.842274951061619e-06, 0.9999961577250489],
+    ];
+
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, // class 0
+            2.0, 2.0, 3.0, 2.5, 2.5, 3.0, 3.0, 3.0, // class 1
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0, 0, 0, 0, 1, 1, 1, 1]);
+
+    let fitted = QDA::<f64>::new()
+        .with_priors(array![0.9, 0.1])
+        .fit(&x, &y)
+        .unwrap();
+
+    // priors_ is the provided vector verbatim.
+    assert_eq!(fitted.priors().to_vec(), vec![0.9, 0.1], "priors_ verbatim");
+
+    let proba = fitted.predict_proba(&x).unwrap();
+    assert_eq!(proba.dim(), (8, 2));
+    for i in 0..8 {
+        let row_sum: f64 = (0..2).map(|c| proba[[i, c]]).sum();
+        assert!(
+            (row_sum - 1.0).abs() < 1e-12,
+            "predict_proba row {i} must sum to 1, got {row_sum}"
+        );
+        for c in 0..2 {
+            assert!(
+                (proba[[i, c]] - SK_PROBA[i][c]).abs() < 1e-6,
+                "priors=[0.9,0.1] predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_PROBA[i][c],
+                proba[[i, c]]
+            );
+        }
+    }
+}
+
+/// REQ-6 (#580), R-DEV-4 deviation: a wrong-length `priors` is rejected with
+/// `FerroError::ShapeMismatch`. sklearn silently mis-indexes a wrong-length
+/// `priors` (CPython/numpy footgun); ferrolearn eliminates it by checking the
+/// length in `fit` against `n_classes` (here 2 classes, 3 priors).
+#[test]
+fn qda_priors_length_mismatch() {
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 2.0, 2.0, 3.0, 2.5, 2.5, 3.0, 3.0, 3.0,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from(vec![0, 0, 0, 0, 1, 1, 1, 1]);
+
+    let res = QDA::<f64>::new()
+        .with_priors(array![0.3, 0.3, 0.4])
+        .fit(&x, &y);
+    assert!(
+        matches!(res, Err(FerroError::ShapeMismatch { .. })),
+        "wrong-length priors must return ShapeMismatch (R-DEV-4)"
+    );
 }
 
 // ===========================================================================

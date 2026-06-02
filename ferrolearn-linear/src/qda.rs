@@ -35,9 +35,9 @@
 //! | REQ-5 (reg_param) | SHIPPED | `with_reg_param`; `scalings = (1-reg)·(S²/(n_k-1)) + reg` (== sklearn singular-value blend). Test `qda_reg_param`. #579. |
 //! | REQ-8 (covariance n_k-1 normalization) | SHIPPED | `S²/(n_k-1)` in `fn fit` (`discriminant_analysis.py:948`). |
 //! | REQ-10 (tol + rank-deficient SVD, no error) | SHIPPED | `with_tol` (default 1e-4); `rank = Σ(S>tol)`, collinearity warning, no error (`:945-947`). Test `qda_rank_deficient_class` (`predict == [0;8]`). #583. |
-//! | REQ-11 (scalings_/rotations_/means_ attrs) | SHIPPED | `FittedQDA::{scalings,rotations,means}` (`:948-954`). Test `qda_scalings_rotations`. #584. |
+//! | REQ-11 (scalings_/rotations_/means_/priors_ attrs) | SHIPPED | `FittedQDA::{scalings,rotations,means,priors}` (`:948-954`,`:921-924`). Test `qda_scalings_rotations`. #584. |
+//! | REQ-6 (provided priors) | SHIPPED | `QDA::priors` field + `with_priors` builder; `fn fit` resolves `priors_` (`None`→empirical `n_k/n`, `Some(p)`→verbatim, no renorm/sign check — `discriminant_analysis.py:341,351,359,921-924`) and `log_prior = priors[k].ln()` enters `fn raw_decision` as `+ log π_k` (`:976`). R-DEV-4 deviation: length-mismatch → `ShapeMismatch` (sklearn silently mis-indexes). Consumer: `fn fit` reads `self.priors`; `FittedQDA::priors` exposes the resolved priors. Test `qda_provided_priors` + `qda_priors_length_mismatch` <1e-6. #580. |
 //! | REQ-4 (predict_log_proba pin + consumer) | NOT-STARTED | #578. |
-//! | REQ-6 (provided priors) | NOT-STARTED | #580 (constructor `priors` arg). |
 //! | REQ-7 (binary decision_function shape `(n,)`) | NOT-STARTED | #581 (binding-ABI layer, cf. logistic #454; lib returns `(n,2)`, binding applies `col1-col0`). |
 //! | REQ-9 (store_covariance + covariance_) | NOT-STARTED | #582. |
 //! | REQ-12 (ferray array-type substrate) | NOT-STARTED | #585 (per-class SVD already on `ferray::linalg::svd`; owned array still `ndarray`, crate-wide-deferred cf. ridge #391). |
@@ -91,6 +91,26 @@ pub struct QDA<F> {
     /// (`discriminant_analysis.py:801-806`). Does **not** affect predictions.
     /// Default: `1e-4`.
     pub tol: F,
+    /// Class prior probabilities, one entry per class (in sorted class order).
+    ///
+    /// Mirrors sklearn's `priors` constructor argument
+    /// (`discriminant_analysis.py:351,359`; `_parameter_constraints`:
+    /// `"priors": ["array-like", None]`, `:341`). Default `None`: the empirical
+    /// class frequencies `n_k / n` are used (`self.priors_ = np.bincount(y) /
+    /// n_samples`, `:921-922`). When `Some(p)`, `p` is used **verbatim** as the
+    /// per-class priors — exactly as sklearn does (`self.priors_ =
+    /// np.array(self.priors)`, `:924`): the values are NOT renormalized to sum
+    /// to 1 and negative/zero entries are NOT rejected (sklearn accepts e.g.
+    /// `[0.5, 0.6]` and negatives verbatim). The priors enter the decision
+    /// through the additive `+ log(prior_k)` term (`:976`); for a zero entry
+    /// `log(0) = -inf` and for a negative entry `log(p) = NaN`, matching
+    /// sklearn's verbatim arithmetic (no special-casing).
+    ///
+    /// The one deviation (R-DEV-4): the length is checked at [`Fit::fit`]. If
+    /// `p.len() != n_classes`, ferrolearn returns
+    /// [`FerroError::ShapeMismatch`]; sklearn would silently mis-index (a
+    /// CPython/numpy footgun Rust eliminates).
+    pub priors: Option<Array1<F>>,
 }
 
 impl<F: Float> QDA<F> {
@@ -102,6 +122,7 @@ impl<F: Float> QDA<F> {
         Self {
             reg_param: F::zero(),
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
+            priors: None,
         }
     }
 
@@ -121,6 +142,22 @@ impl<F: Float> QDA<F> {
     #[must_use]
     pub fn with_tol(mut self, tol: F) -> Self {
         self.tol = tol;
+        self
+    }
+
+    /// Set the class priors (one entry per class, in sorted class order).
+    ///
+    /// Mirrors sklearn's `priors` constructor argument
+    /// (`discriminant_analysis.py:351,359`). The values are used **verbatim**
+    /// at [`Fit::fit`] (no renormalization, no non-negativity check — matching
+    /// `self.priors_ = np.array(self.priors)`, `:924`). When unset (the default
+    /// `None`), the empirical class frequencies `n_k / n` are used. The slice
+    /// length must equal the number of distinct classes or `fit` returns
+    /// [`FerroError::ShapeMismatch`] (the R-DEV-4 deviation; see the
+    /// [`priors`](Self::priors) field).
+    #[must_use]
+    pub fn with_priors(mut self, priors: Array1<F>) -> Self {
+        self.priors = Some(priors);
         self
     }
 }
@@ -160,6 +197,12 @@ pub struct FittedQDA<F> {
     classes: Vec<usize>,
     /// Number of features seen during fitting.
     n_features: usize,
+    /// Resolved per-class priors (in sorted class order). Mirrors sklearn's
+    /// fitted `priors_` (`discriminant_analysis.py:921-924`): empirical `n_k /
+    /// n` when [`QDA::priors`] is `None`, otherwise the provided priors
+    /// verbatim. Each entry equals `exp(QDAClass::log_prior)` of the matching
+    /// class.
+    priors: Array1<F>,
 }
 
 impl<F: Float> FittedQDA<F> {
@@ -167,6 +210,15 @@ impl<F: Float> FittedQDA<F> {
     #[must_use]
     pub fn means(&self) -> Vec<&Array1<F>> {
         self.class_models.iter().map(|m| &m.mean).collect()
+    }
+
+    /// Returns the resolved per-class priors (in sorted class order). Mirrors
+    /// sklearn's fitted `priors_` (`discriminant_analysis.py:921-924`):
+    /// empirical class frequencies `n_k / n` when [`QDA::priors`] was `None`,
+    /// otherwise the priors supplied via [`QDA::with_priors`] verbatim.
+    #[must_use]
+    pub fn priors(&self) -> &Array1<F> {
+        &self.priors
     }
 
     /// Returns the per-class scalings (`S² / (n_k - 1)` regularized), one
@@ -409,11 +461,46 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
             });
         }
 
+        let n_classes = classes.len();
         let n_f = usize_to_f::<F>(n_samples)?;
+
+        // Resolve per-class priors (in sorted class order), mirroring sklearn
+        // (`discriminant_analysis.py:921-924`):
+        //   priors is None  -> self.priors_ = np.bincount(y) / n_samples
+        //   priors is Some(p) -> self.priors_ = np.array(self.priors) (verbatim)
+        // The provided priors are used as-is: NOT renormalized to sum 1, and
+        // negative/zero entries are NOT rejected (sklearn accepts them). The
+        // ONE deviation (R-DEV-4) is the length check below — sklearn silently
+        // mis-indexes a wrong-length `priors`; Rust eliminates that footgun by
+        // returning `ShapeMismatch`.
+        let priors: Array1<F> = match &self.priors {
+            None => {
+                // Empirical n_k / n per class. `n_k / n` here is bit-identical
+                // to the previous `(n_k_f / n_f).ln()` path's argument, so the
+                // empirical decision is byte-identical.
+                let mut p = Array1::<F>::zeros(n_classes);
+                for (idx, &cls) in classes.iter().enumerate() {
+                    let n_k = y.iter().filter(|&&label| label == cls).count();
+                    p[idx] = usize_to_f::<F>(n_k)? / n_f;
+                }
+                p
+            }
+            Some(provided) => {
+                if provided.len() != n_classes {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n_classes],
+                        actual: vec![provided.len()],
+                        context: "priors length must equal the number of classes".into(),
+                    });
+                }
+                provided.clone()
+            }
+        };
+
         let one_minus_reg = <F as num_traits::One>::one() - self.reg_param;
         let mut class_models = Vec::with_capacity(classes.len());
 
-        for &cls in &classes {
+        for (cls_idx, &cls) in classes.iter().enumerate() {
             // Extract samples for this class.
             let indices: Vec<usize> = y
                 .iter()
@@ -476,7 +563,11 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
             // (n_features, k) where k = len(S) = min(n_k, n_features).
             let rotations = vt.t().to_owned();
 
-            let log_prior = (n_k_f / n_f).ln();
+            // log(prior_k) of the resolved priors (empirical n_k/n for the
+            // `None` path — bit-identical to the previous `(n_k_f / n_f).ln()`
+            // — or the provided prior verbatim, where `ln` of a zero gives
+            // `-inf` and of a negative gives `NaN`, matching sklearn `:976`).
+            let log_prior = priors[cls_idx].ln();
 
             class_models.push(QDAClass {
                 mean,
@@ -490,6 +581,7 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
             class_models,
             classes,
             n_features,
+            priors,
         })
     }
 }
@@ -698,6 +790,51 @@ mod tests {
         let fitted = QDA::<f64>::new().with_reg_param(0.1).fit(&x, &y).unwrap();
         let means = fitted.means();
         assert_eq!(means.len(), 2);
+    }
+
+    #[test]
+    fn test_priors_default_none() {
+        let m = QDA::<f64>::new();
+        assert!(m.priors.is_none());
+    }
+
+    #[test]
+    fn test_with_priors_builder() {
+        let m = QDA::<f64>::new().with_priors(array![0.9, 0.1]);
+        assert_eq!(m.priors.as_ref().map(|p| p.to_vec()), Some(vec![0.9, 0.1]));
+    }
+
+    #[test]
+    fn test_priors_empirical_resolved() {
+        // None path: fitted priors_ are the empirical n_k / n (here 4/8, 4/8).
+        // `array!` builds the Array2 directly (no fallible from_shape_vec).
+        let x = array![
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [8.0, 8.0],
+            [8.0, 9.0],
+            [9.0, 8.0],
+            [9.0, 9.0]
+        ];
+        let y = array![0, 0, 0, 0, 1, 1, 1, 1];
+        let fitted = QDA::<f64>::new().fit(&x, &y);
+        assert!(fitted.is_ok(), "empirical fit should succeed");
+        if let Ok(f) = fitted {
+            assert_eq!(f.priors().to_vec(), vec![0.5, 0.5]);
+        }
+    }
+
+    #[test]
+    fn test_priors_length_mismatch_errors() {
+        // R-DEV-4: a wrong-length priors vector errors (2 classes, 3 priors).
+        let x = array![[1.0], [2.0], [5.0], [6.0]];
+        let y = array![0, 0, 1, 1];
+        let res = QDA::<f64>::new()
+            .with_priors(array![0.3, 0.3, 0.4])
+            .fit(&x, &y);
+        assert!(matches!(res, Err(FerroError::ShapeMismatch { .. })));
     }
 
     #[test]
