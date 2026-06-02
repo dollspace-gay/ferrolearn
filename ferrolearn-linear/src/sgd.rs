@@ -49,8 +49,8 @@
 //! | REQ | Status | Evidence |
 //! |---|---|---|
 //! | REQ-1 (classifier losses hinge/log/modified_huber/squared_error incl. Hinge boundary) | SHIPPED | `impl Loss for Hinge/LogLoss/ModifiedHuber/SquaredError`. Hinge `gradient` now uses the NON-strict boundary `margin <= 1` matching `_sgd_fast.pyx.tp:224` (`if z <= threshold: return -y`). Consumer: `fn dispatch_train_binary` -> `Fit for SGDClassifier` -> `impl PipelineEstimator for SGDClassifier`. Tests: `test_hinge_loss_*`, divergence `sgd_hinge_gradient_boundary`. Closed #539. |
-//! | REQ-2 (squared_hinge, perceptron) | NOT-STARTED | blocker #523. `enum ClassifierLoss` lacks `SquaredHinge` and a per-loss `threshold` (`_sgd_fast.pyx.tp:232-258,512`). |
-//! | REQ-3 (regressor losses incl. squared_epsilon_insensitive) | NOT-STARTED | blocker #524. `enum RegressorLoss` lacks `SquaredEpsilonInsensitive` (`_sgd_fast.pyx.tp:364-387`). |
+//! | REQ-2 (squared_hinge, perceptron) | SHIPPED | `pub struct SquaredHinge` (`loss = (1-py)^2 if >0 else 0`, `gradient = -2y(1-py)`, `_sgd_fast.pyx.tp:248-258` with `threshold=1.0`, `_stochastic_gradient.py:511`) + `pub struct Perceptron` (`Hinge(threshold=0.0)`: `loss = max(0,-py)`, `gradient = -y if py<=0 else 0`, `_sgd_fast.pyx.tp:216-226`, `_stochastic_gradient.py:512`); `enum ClassifierLoss::{SquaredHinge,Perceptron}` wired in `fn dispatch_train_binary`. Consumer: `fn dispatch_train_binary` -> `fn fit_ova` -> `Fit for SGDClassifier` -> `impl PipelineEstimator for SGDClassifier`. Tests: divergence `sgd_squared_hinge_loss` (live oracle coef `[0.0569485774276016, 0.09335170687740356]` intercept `-0.20237316143907`), `sgd_perceptron_loss` (live oracle coef `[0.009957048471181063, 0.009961042575429069]` intercept `-0.04`). Closes #523. |
+//! | REQ-3 (regressor losses incl. squared_epsilon_insensitive) | SHIPPED | `pub struct SquaredEpsilonInsensitive<F> { epsilon }` (`loss = max(0,|y-p|-eps)^2`, `gradient = -2(z-eps) if z>eps; 2(-z-eps) if z<-eps; else 0` for `z=y-p`, `_sgd_fast.pyx.tp:375-387`, `_stochastic_gradient.py:1405` default `epsilon=0.1`) + `enum RegressorLoss::SquaredEpsilonInsensitive(F)` wired in `fn dispatch_train_regressor`. Consumer: `fn dispatch_train_regressor` -> `Fit for SGDRegressor` -> `impl PipelineEstimator for SGDRegressor`. Test: divergence `sgd_squared_epsilon_insensitive_loss` (live oracle single-sample coef `[0.9558857922397863, -0.47794289611989316]` intercept `0.478752180393125`, multi-sample shuffle=false coef `[0.5631419328099845, 0.41545070758814734]` intercept `0.16944283314514064`). Closes #524. |
 //! | REQ-4 (L2 penalty = clamped wscale shrink) | SHIPPED | `fn train_binary_sgd`/`train_regressor_sgd` apply `shrink = max(0, 1 - eta*alpha)` then `w = w*shrink - eta*grad*x`, mirroring `w.scale(max(0, 1-eta*alpha))` (`_sgd_fast.pyx.tp:632-635`); intercept unregularized. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_l2_wscale_clamp`. Closed #525. |
 //! | REQ-5 (l1/elasticnet + l1_ratio) | SHIPPED | `enum Penalty {L2,L1,ElasticNet}` + `pub penalty`/`pub l1_ratio` fields on `SGDClassifier`/`SGDRegressor` with `fn with_penalty`/`fn with_l1_ratio` builders (defaults `L2`/`0.15`, `_stochastic_gradient.py:1231-1256`). `fn train_binary_sgd`/`train_regressor_sgd` derive `eff` via `fn effective_l1_ratio` (`L2->0`, `L1->1`, `ElasticNet->l1_ratio`, `_sgd_fast.pyx.tp:558-561`), apply the L2 shrink `max(0, 1-(1-eff)*eta*alpha)` BEFORE the gradient add (`:632-635`), then the Tsuruoka cumulative-penalty L1 truncation with fit-persistent scalar `u` and per-feature `q` AFTER (`:656-658,750-778`, `wscale=1`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_l1_truncated_gradient` (live oracle coef [0.9204,-0.4452]), `sgd_elasticnet_l1_ratio` (l1_ratio=0.3, coef [0.92340705,-0.45723495]). Closed #526. NOTE (partial_fit+l1): `u`/`q` are scoped per `train_*_sgd` call, so they persist across the epochs of a single `fit` (the parity-critical path) but reset per `partial_fit` call. This MATCHES sklearn, which re-allocates `q=np.zeros(...)`/`u=0.0` at the top of every `_plain_sgd` call (`_sgd_fast.pyx.tp:551-556`) and only carries `t_` across `partial_fit` (`_stochastic_gradient.py` re-invokes `_plain_sgd` per call). The full `fit` path is exact. |
 //! | REQ-6 (constant + invscaling schedules) | SHIPPED | `fn compute_lr`: `Constant => eta0`, `InvScaling => eta0 / t^power_t` (`_sgd_fast.pyx.tp:479,593-594`). Consumer: per-step in `fn train_binary_sgd`/`train_regressor_sgd`. Tests: `test_constant_lr`, `test_invscaling_lr`. |
@@ -119,6 +119,59 @@ impl<F: Float> Loss<F> for Hinge {
         } else {
             F::zero()
         }
+    }
+}
+
+/// Squared hinge loss for (quadratically penalized) linear SVM classification.
+///
+/// `L(y, p) = max(0, 1 - y * p)^2` where `y in {-1, +1}`. This is sklearn's
+/// `SquaredHinge(threshold=1.0)` (`_sgd_fast.pyx.tp:232-258`); the
+/// `squared_hinge` classifier loss maps to it (`_stochastic_gradient.py:511`).
+#[derive(Debug, Clone, Copy)]
+pub struct SquaredHinge;
+
+impl<F: Float> Loss<F> for SquaredHinge {
+    fn loss(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:248-252`: `z = threshold - p*y; z*z if z > 0 else 0`
+        // with `threshold = 1.0` (`_stochastic_gradient.py:511`).
+        let z = F::one() - y_pred * y_true;
+        if z > F::zero() { z * z } else { F::zero() }
+    }
+
+    fn gradient(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:254-258`: `z = threshold - p*y; -2*y*z if z > 0 else 0`.
+        let z = F::one() - y_pred * y_true;
+        if z > F::zero() {
+            -F::from(2.0).unwrap_or_else(|| F::one() + F::one()) * y_true * z
+        } else {
+            F::zero()
+        }
+    }
+}
+
+/// Perceptron loss for linear classification.
+///
+/// `L(y, p) = max(0, -y * p)` where `y in {-1, +1}`. This is sklearn's
+/// `Hinge(threshold=0.0)` (`_sgd_fast.pyx.tp:200-226`); the `perceptron`
+/// classifier loss maps to it (`_stochastic_gradient.py:512`). The existing
+/// [`Hinge`] hardcodes `threshold = 1.0`, so this is a separate type.
+#[derive(Debug, Clone, Copy)]
+pub struct Perceptron;
+
+impl<F: Float> Loss<F> for Perceptron {
+    fn loss(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:216-220`: `z = p*y; threshold - z if z <= threshold
+        // else 0` with `threshold = 0.0` (`_stochastic_gradient.py:512`), i.e.
+        // `max(0, -z)`.
+        let z = y_pred * y_true;
+        if z <= F::zero() { -z } else { F::zero() }
+    }
+
+    fn gradient(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:222-226`: `z = p*y; -y if z <= threshold else 0`
+        // with `threshold = 0.0`.
+        let z = y_pred * y_true;
+        if z <= F::zero() { -y_true } else { F::zero() }
     }
 }
 
@@ -269,6 +322,45 @@ impl<F: Float + Send + Sync> Loss<F> for EpsilonInsensitive<F> {
             F::one()
         } else if diff < -self.epsilon {
             -F::one()
+        } else {
+            F::zero()
+        }
+    }
+}
+
+/// Squared epsilon-insensitive loss for support vector regression.
+///
+/// `L(y, p) = max(0, |y - p| - epsilon)^2`. This is sklearn's
+/// `SquaredEpsilonInsensitive` (`_sgd_fast.pyx.tp:364-388`); the
+/// `squared_epsilon_insensitive` regressor loss maps to it
+/// (`_stochastic_gradient.py:1405`, default `epsilon = DEFAULT_EPSILON = 0.1`).
+#[derive(Debug, Clone, Copy)]
+pub struct SquaredEpsilonInsensitive<F> {
+    /// Insensitivity margin.
+    pub epsilon: F,
+}
+
+impl<F: Float + Send + Sync> Loss<F> for SquaredEpsilonInsensitive<F> {
+    fn loss(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:375-377`: `ret = |y - p| - epsilon;
+        // ret*ret if ret > 0 else 0`.
+        let ret = (y_true - y_pred).abs() - self.epsilon;
+        if ret > F::zero() {
+            ret * ret
+        } else {
+            F::zero()
+        }
+    }
+
+    fn gradient(&self, y_true: F, y_pred: F) -> F {
+        // `_sgd_fast.pyx.tp:379-387`: `z = y - p;
+        // -2*(z-epsilon) if z > epsilon; 2*(-z-epsilon) if z < -epsilon; else 0`.
+        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        let z = y_true - y_pred;
+        if z > self.epsilon {
+            -two * (z - self.epsilon)
+        } else if z < -self.epsilon {
+            two * (-z - self.epsilon)
         } else {
             F::zero()
         }
@@ -456,6 +548,12 @@ fn convergence_tail<F: Float>(
 pub enum ClassifierLoss {
     /// Hinge loss (linear SVM).
     Hinge,
+    /// Squared hinge loss (quadratically penalized SVM,
+    /// `_stochastic_gradient.py:511`).
+    SquaredHinge,
+    /// Perceptron loss (`Hinge(threshold=0.0)`,
+    /// `_stochastic_gradient.py:512`).
+    Perceptron,
     /// Log loss (logistic regression).
     Log,
     /// Squared error loss.
@@ -473,6 +571,9 @@ pub enum RegressorLoss<F> {
     Huber(F),
     /// Epsilon-insensitive loss with the given epsilon.
     EpsilonInsensitive(F),
+    /// Squared epsilon-insensitive loss with the given epsilon
+    /// (`_stochastic_gradient.py:1405`, `_sgd_fast.pyx.tp:364-388`).
+    SquaredEpsilonInsensitive(F),
 }
 
 // ---------------------------------------------------------------------------
@@ -1125,6 +1226,12 @@ fn dispatch_train_binary<F: Float + Send + Sync + ScalarOperand + 'static>(
 ) -> (F, usize) {
     match loss_enum {
         ClassifierLoss::Hinge => train_binary_sgd(x, y_binary, w, b, &Hinge, hyper, initial_t),
+        ClassifierLoss::SquaredHinge => {
+            train_binary_sgd(x, y_binary, w, b, &SquaredHinge, hyper, initial_t)
+        }
+        ClassifierLoss::Perceptron => {
+            train_binary_sgd(x, y_binary, w, b, &Perceptron, hyper, initial_t)
+        }
         ClassifierLoss::Log => train_binary_sgd(x, y_binary, w, b, &LogLoss, hyper, initial_t),
         ClassifierLoss::SquaredError => {
             train_binary_sgd(x, y_binary, w, b, &SquaredError, hyper, initial_t)
@@ -1731,6 +1838,15 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             w,
             b,
             &EpsilonInsensitive { epsilon: *eps },
+            hyper,
+            initial_t,
+        ),
+        RegressorLoss::SquaredEpsilonInsensitive(eps) => train_regressor_sgd(
+            x,
+            y,
+            w,
+            b,
+            &SquaredEpsilonInsensitive { epsilon: *eps },
             hyper,
             initial_t,
         ),

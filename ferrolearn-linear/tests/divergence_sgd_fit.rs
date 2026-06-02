@@ -27,7 +27,8 @@
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
 use ferrolearn_linear::sgd::{
-    Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss, SGDClassifier, SGDRegressor,
+    ClassifierLoss, Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss, SGDClassifier,
+    SGDRegressor,
 };
 use ndarray::{Array1, Array2};
 
@@ -724,5 +725,238 @@ fn sgd_adaptive_schedule_divisor() {
          coef=[{SK_COEF0}, {SK_COEF1}] intercept={SK_INTERCEPT}; ferrolearn (eta/=2 on \
          >=prev_loss 5-epoch trigger + mean-delta early stop, ~45 epochs) coef={coef:?} \
          intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-2 / #523 — `squared_hinge` classifier loss
+// (`SquaredHinge(threshold=1.0)`).
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:248-258`
+//   `cdef double z = self.threshold - p * y`
+//   loss:  `z * z if z > 0 else 0.0`
+//   dloss: `-2 * y * z if z > 0 else 0.0`
+//   registry `sklearn/linear_model/_stochastic_gradient.py:511`
+//     `"squared_hinge": (SquaredHinge, 1.0)`.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `impl Loss for SquaredHinge`,
+//   wired through `enum ClassifierLoss::SquaredHinge` in `dispatch_train_binary`.
+//
+// 2-class, shuffle=false, constant schedule (eta=eta0 identical both impls),
+// tol=None (no early stop), so the full multi-sample / multi-epoch update
+// kernel is deterministic and cross-impl comparable.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (live scikit-learn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[1.,2.],[2.,1.],[8.,9.],[9.,8.]]); y=np.array([0,0,1,1]); \
+/// m=SGDClassifier(loss='squared_hinge',penalty='l2',alpha=0.01, \
+///   learning_rate='constant',eta0=0.01,max_iter=5,tol=None,shuffle=False, \
+///   fit_intercept=True,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+/// -> coef [0.0569485774276016, 0.09335170687740356]
+///    intercept [-0.20237316143907]
+#[test]
+fn sgd_squared_hinge_loss() {
+    const SK_COEF0: f64 = 0.0569485774276016;
+    const SK_COEF1: f64 = 0.09335170687740356;
+    const SK_INTERCEPT: f64 = -0.20237316143907;
+
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 8.0, 9.0, 9.0, 8.0]).unwrap();
+    let y = Array1::from_vec(vec![0_usize, 0, 1, 1]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::SquaredHinge)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(-1.0) // disable convergence early-exit (tol=None analog)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-9
+            && (coef[1] - SK_COEF1).abs() < 1e-9
+            && (intercept - SK_INTERCEPT).abs() < 1e-9,
+        "squared_hinge loss diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-2 / #523 — `perceptron` classifier loss (`Hinge(threshold=0.0)`).
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:216-226`
+//   `cdef double z = p * y`
+//   loss:  `self.threshold - z if z <= self.threshold else 0.0`  (= max(0,-z))
+//   dloss: `-y if z <= self.threshold else 0.0`
+//   registry `sklearn/linear_model/_stochastic_gradient.py:512`
+//     `"perceptron": (Hinge, 0.0)`.
+// (Note: `SGDClassifier(loss='perceptron')` is the oracle here, NOT the
+//  standalone `Perceptron` estimator, which differs in defaults.)
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `impl Loss for Perceptron`,
+//   wired through `enum ClassifierLoss::Perceptron` in `dispatch_train_binary`.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (live scikit-learn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDClassifier; \
+/// X=np.array([[1.,2.],[2.,1.],[8.,9.],[9.,8.]]); y=np.array([0,0,1,1]); \
+/// m=SGDClassifier(loss='perceptron',penalty='l2',alpha=0.01, \
+///   learning_rate='constant',eta0=0.01,max_iter=5,tol=None,shuffle=False, \
+///   fit_intercept=True,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+/// -> coef [0.009957048471181063, 0.009961042575429069]
+///    intercept [-0.04]
+#[test]
+fn sgd_perceptron_loss() {
+    const SK_COEF0: f64 = 0.009957048471181063;
+    const SK_COEF1: f64 = 0.009961042575429069;
+    const SK_INTERCEPT: f64 = -0.04;
+
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 8.0, 9.0, 9.0, 8.0]).unwrap();
+    let y = Array1::from_vec(vec![0_usize, 0, 1, 1]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Perceptron)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(-1.0)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-9
+            && (coef[1] - SK_COEF1).abs() < 1e-9
+            && (intercept - SK_INTERCEPT).abs() < 1e-9,
+        "perceptron loss diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-3 / #524 — `squared_epsilon_insensitive` regressor loss.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:375-387`
+//   loss:  `ret = |y - p| - epsilon; ret*ret if ret > 0 else 0`
+//   dloss: `z = y - p;
+//           -2*(z-epsilon) if z > epsilon;
+//            2*(-z-epsilon) if z < -epsilon;
+//            else 0`
+//   registry `sklearn/linear_model/_stochastic_gradient.py:1405`
+//     `"squared_epsilon_insensitive": (SquaredEpsilonInsensitive, DEFAULT_EPSILON)`
+//   with `DEFAULT_EPSILON = 0.1`.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs`
+//   `impl Loss for SquaredEpsilonInsensitive`, wired through
+//   `enum RegressorLoss::SquaredEpsilonInsensitive(eps)` in
+//   `dispatch_train_regressor`.
+//
+// Two oracle fits: a single-sample fit (exact per-step eta, no RNG) AND a
+// multi-sample / multi-epoch shuffle=false fit (validates the loss over epochs).
+// Both: constant schedule, tol=None, fully deterministic.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocations (live scikit-learn 1.5.2):
+/// ```text
+/// # single sample, eta0=0.05
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[2.0,-1.0]]); y=np.array([3.0]); \
+/// m=SGDRegressor(loss='squared_epsilon_insensitive',epsilon=0.1,penalty='l2', \
+///   alpha=0.01,learning_rate='constant',eta0=0.05,max_iter=5,tol=None, \
+///   shuffle=False,fit_intercept=True,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.9558857922397863, -0.47794289611989316] [0.478752180393125]
+///
+/// # multi-sample, shuffle=False, eta0=0.01
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_epsilon_insensitive',epsilon=0.1,penalty='l2', \
+///   alpha=0.01,learning_rate='constant',eta0=0.01,max_iter=5,tol=None, \
+///   shuffle=False,fit_intercept=True,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.5631419328099845, 0.41545070758814734] [0.16944283314514064]
+/// ```
+#[test]
+fn sgd_squared_epsilon_insensitive_loss() {
+    // ----- single sample (live oracle) -----
+    const SK_S_COEF0: f64 = 0.9558857922397863;
+    const SK_S_COEF1: f64 = -0.47794289611989316;
+    const SK_S_INTERCEPT: f64 = 0.478752180393125;
+
+    let xs = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
+    let ys = Array1::from_vec(vec![3.0]);
+
+    let model_s = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredEpsilonInsensitive(0.1))
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.05)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(-1.0)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted_s = model_s.fit(&xs, &ys).unwrap();
+    let coef_s = fitted_s.coefficients();
+    let intercept_s = fitted_s.intercept();
+
+    assert!(
+        (coef_s[0] - SK_S_COEF0).abs() < 1e-9
+            && (coef_s[1] - SK_S_COEF1).abs() < 1e-9
+            && (intercept_s - SK_S_INTERCEPT).abs() < 1e-9,
+        "squared_epsilon_insensitive (single sample) diverges: sklearn coef=[{SK_S_COEF0}, \
+         {SK_S_COEF1}] intercept={SK_S_INTERCEPT}; ferrolearn coef={coef_s:?} \
+         intercept={intercept_s}"
+    );
+
+    // ----- multi-sample, shuffle=false (live oracle) -----
+    const SK_M_COEF0: f64 = 0.5631419328099845;
+    const SK_M_COEF1: f64 = 0.41545070758814734;
+    const SK_M_INTERCEPT: f64 = 0.16944283314514064;
+
+    let xm = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0]).unwrap();
+    let ym = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+
+    let model_m = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredEpsilonInsensitive(0.1))
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(-1.0)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted_m = model_m.fit(&xm, &ym).unwrap();
+    let coef_m = fitted_m.coefficients();
+    let intercept_m = fitted_m.intercept();
+
+    assert!(
+        (coef_m[0] - SK_M_COEF0).abs() < 1e-9
+            && (coef_m[1] - SK_M_COEF1).abs() < 1e-9
+            && (intercept_m - SK_M_INTERCEPT).abs() < 1e-9,
+        "squared_epsilon_insensitive (multi-sample shuffle=false) diverges: sklearn \
+         coef=[{SK_M_COEF0}, {SK_M_COEF1}] intercept={SK_M_INTERCEPT}; ferrolearn \
+         coef={coef_m:?} intercept={intercept_m}"
     );
 }
