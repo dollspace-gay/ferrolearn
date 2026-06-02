@@ -242,6 +242,10 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate(svm): REQ-7 multiclass one-vs-one per-pair coef pin (#640)
+- translate(svm): REQ-6 epsilon-SVR fitted attrs + oracle pin (#639)
+- translate(svm): REQ-3 expose libsvm-layout fitted attrs + binary sign flip (#636)
+- translate(svm): REQ-2 pin C-SVC SMO fit (dual_coef_/intercept_/support_) vs live oracle (#635)
 - translate(svm): REQ-1 gamma scale/auto resolution at fit time (kernels resolve None->1.0) (#634)
 - chore(clippy): cleared all Rust 1.95 lints blocking `ferrolearn-linear` crate `-D warnings` (omp.rs/svm.rs collapsible_if, linalg.rs assign_op, lda.rs test needless_range_loop, test-fixture literal reformat) — behavior-preserving (#378, #357)
 - Translation unit: ferrolearn-linear/src/isotonic.rs — out_of_bounds='nan' default + _make_unique weighted collapse (#573)
