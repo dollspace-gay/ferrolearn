@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(ransac): REQ-6 n_inliers_best=1 init and >= acceptance gate (#514)
+- translate(ransac): REQ-5 refit-once-after-loop + inlier_mask_ from subset model (#513)
+- translate(ransac): REQ-9 MAD-zero parity — remove 1e-6 substitution (#517)
+- translate(ransac): REQ-4 selection criterion — rank by base-estimator R² score (n_inliers, score), not residual_sum (#512)
 - Translation unit: ferrolearn-linear/src/quantile_regressor.rs (mirrors sklearn QuantileRegressor) (#505)
 - Translation unit: ferrolearn-linear/src/quantile_regressor.rs — exact LP fit (#510)
 - Translation unit: ferrolearn-linear/src/huber_regressor.rs (mirrors sklearn HuberRegressor) (#494)
@@ -152,6 +156,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate: ferrolearn-linear/ransac.rs — RANSACRegressor sklearn parity (iter 24) (#511)
 - QuantileRegressor: scale alpha by n_samples for sklearn parity (#332)
 - Blocker for REQ-1/REQ-3 of quantile_regressor: intercept recovered via X/y centering is invalid for quantile regression (sklearn _quantile.py:177 'centering y and X does not work for quantile regression'). ferrolearn's FittedQuantileRegressor intercept is computed as y_mean - x_mean.dot(w), giving the SAME intercept for every quantile; sklearn's LP makes the intercept a free LP variable (s0-t0). Live oracle q=0.8 alpha=0: ferro intercept=0.2988 vs sklearn 0.8815 (3x). Fix: fit intercept as an LP variable, not by centering — requires the LP solver (#340). (#506)
 - Blocker for REQ-5 of huber_regressor: outliers_ mask (|resid| > scale*epsilon) not computed/exposed (#497)
