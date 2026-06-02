@@ -188,6 +188,17 @@ upstream = [
 design = ".design/linear/sgd.md"
 parity_ops = ["SGDClassifier", "SGDRegressor", "SGDOneClassSVM"]
 
+# The crate-root re-export aggregator. It is not itself a translation unit;
+# it re-exports the per-estimator modules as the public API boundary (the
+# grandfathered R-DEFER-1 production consumer). Routed against the estimator
+# module currently extending it so the translate-discipline gate is satisfied
+# by the same upstream/design reads that govern that estimator's edit.
+[[route]]
+crate_pattern = "ferrolearn-linear/src/lib.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_stochastic_gradient.py"]
+design = ".design/linear/sgd.md"
+parity_ops = ["re-export boundary"]
+
 [[route]]
 crate_pattern = "ferrolearn-linear/src/glm.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_glm/glm.py"]

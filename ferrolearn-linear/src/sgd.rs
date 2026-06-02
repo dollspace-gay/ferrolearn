@@ -65,7 +65,7 @@
 //! | REQ-15 (class_weight) | NOT-STARTED | blocker #535. No per-class `weight_pos`/`weight_neg`/`sample_weight` (`_sgd_fast.pyx.tp:599-602,630`). |
 //! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
 //! | REQ-17 (multiclass one-vs-all) | SHIPPED | `fn fit_ova` (one binary per class) + `fn predict` argmax (`_stochastic_gradient.py:788-844`). Consumer: `Fit for SGDClassifier` -> `PipelineEstimator`. Test: `test_sgd_classifier_multiclass`. |
-//! | REQ-18 (SGDOneClassSVM) | NOT-STARTED | blocker #536 (builder). Estimator absent (`_stochastic_gradient.py:2084-2278`). |
+//! | REQ-18 (SGDOneClassSVM) | SHIPPED | `pub struct SGDOneClassSVM<F>` (`nu`/`fit_intercept`/`max_iter`/`tol`/`shuffle`/`learning_rate`/`eta0`/`power_t`/`random_state`/`n_iter_no_change` + `new`/`#[must_use]` builders, defaults `_stochastic_gradient.py:2245-2281`) with `fn fit_one_class` + `impl Fit<Array2<F>, ()> for SGDOneClassSVM` (X-only fit, `y` ignored, `_stochastic_gradient.py:2554`): builds `y = ones(n)`, `alpha = nu/2` (`:2588`), `penalty = L2`, `l1_ratio = 0`, `one_class = true` (`:2262-2289,2312`), inits the SGD intercept `b = 1` (offset init 0 -> `1 - 0`, `:2238,2325`), calls the reused `fn train_binary_sgd` Hinge kernel, then stores `coef_ = w`, `offset_ = 1 - b` (`:2377`). The one-class intercept term lives in `fn train_binary_sgd`: when `hyper.one_class` the gated intercept update gains `- 2*eta*alpha` (`intercept_update = -eta*grad - 2*eta*alpha`), mirroring `_sgd_fast.pyx.tp:641-642` (`if one_class: intercept_update -= 2.*eta*alpha`); `pub one_class: bool` was added to `SGDHyper` (default `false` via `fn clf_hyper`/`reg_hyper`, leaving the clf/reg intercept update byte-identical — the existing 15 divergence tests stay green). `pub struct FittedSGDOneClassSVM<F>` exposes `coef()`/`offset()`/`decision_function()` (`X·coef_ - offset_`, `:2622`)/`score_samples()` (`+ offset_ = X·coef_`, `:2639`) and `impl Predict<Array2<F>>` returning `Array1<isize>` of `+1`/`-1` (`(decision >= 0) ? +1 : -1`, `:2655-2657`). Consumer: `pub use sgd::{SGDOneClassSVM, FittedSGDOneClassSVM}` from `ferrolearn-linear/src/lib.rs` (the grandfathered public-API boundary, matching `SGDClassifier`/`SGDRegressor`). Tests: divergence `sgd_one_class_svm_decision` (live oracle nu=0.5/eta0=0.05/constant/max_iter=10/shuffle=false: coef `[0.009883660184666337, 0.009883660184666337]`, offset `1.1102230246251565e-16`, 1e-7) and `sgd_one_class_svm_predict` (nu=0.8/eta0=0.1/max_iter=15: coef `[0.20020636453962284, 0.12292535592963398]`, offset `0.10000000000000009`, predict `[1,-1,1,-1]`). `_stochastic_gradient.py:2084-2668` / `_sgd_fast.pyx.tp:639-644`. Closes #536. |
 //! | REQ-19 (anti-pattern cleanup) | NOT-STARTED | blocker #537. `fn compute_lr`'s `_Phantom` arm now returns `eta0` (unreach macro removed); the loss/lr kernels still use `F::from(..).unwrap()` constants (R-CODE-2) tracked here. |
 //! | REQ-20 (ferray substrate migration) | NOT-STARTED | blocker #538. Still `ndarray` + `StdRng` (R-SUBSTRATE-1). |
 
@@ -804,6 +804,7 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         shuffle: clf.shuffle,
         n_iter_no_change: clf.n_iter_no_change,
         fit_intercept: clf.fit_intercept,
+        one_class: false,
     }
 }
 
@@ -830,6 +831,12 @@ struct SGDHyper<F> {
     /// Whether to fit (update) the intercept each step. When `false` the
     /// intercept update is skipped (`_sgd_fast.pyx.tp:639-644`).
     fit_intercept: bool,
+    /// Whether this is a one-class SVM fit. When `true` the (gated) intercept
+    /// update gains the extra `- 2*eta*alpha` term, mirroring the `if one_class`
+    /// branch in `_sgd_fast.pyx.tp:641-642`
+    /// (`intercept_update -= 2. * eta * alpha`). `false` for the standard
+    /// classifier/regressor paths, leaving their intercept update byte-identical.
+    one_class: bool,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -947,12 +954,21 @@ where
             }
             // The intercept update is gated on `fit_intercept` and is NOT
             // regularized (`intercept_decay=1`, `_sgd_fast.pyx.tp:639-644`:
-            // `if fit_intercept == 1: intercept_update = update; ...
-            // intercept += intercept_update * intercept_decay`). When
-            // `fit_intercept` is false the intercept is never modified and
-            // stays at its init value `0` (`intercept` enters this fn as `0`).
+            // `if fit_intercept == 1: intercept_update = update; if one_class:
+            // intercept_update -= 2.*eta*alpha; intercept += intercept_update *
+            // intercept_decay`). `update = -eta*grad`, so the standard path is
+            // `intercept -= eta*grad`. For the one-class SVM the extra
+            // `- 2*eta*alpha` term is added (`:641-642`), so
+            // `intercept -= eta*grad + 2*eta*alpha`. When `fit_intercept` is
+            // false the intercept is never modified and stays at its init value
+            // (`0` for clf/reg, `1` for one-class — set by the caller).
             if hyper.fit_intercept {
-                *intercept = *intercept - eta * grad;
+                let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+                let mut intercept_update = -eta * grad;
+                if hyper.one_class {
+                    intercept_update = intercept_update - two * eta * hyper.alpha;
+                }
+                *intercept = *intercept + intercept_update;
             }
 
             // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
@@ -1717,6 +1733,7 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         shuffle: reg.shuffle,
         n_iter_no_change: reg.n_iter_no_change,
         fit_intercept: reg.fit_intercept,
+        one_class: false,
     }
 }
 
@@ -2200,6 +2217,384 @@ where
 {
     fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.predict(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SGDOneClassSVM
+// ---------------------------------------------------------------------------
+
+/// Linear One-Class SVM trained by Stochastic Gradient Descent.
+///
+/// Mirrors scikit-learn's
+/// [`SGDOneClassSVM`](https://scikit-learn.org/stable/modules/generated/sklearn.linear_model.SGDOneClassSVM.html)
+/// (`_stochastic_gradient.py:2084-2668`). It solves the linear One-Class SVM
+/// primal via the same SGD kernel as [`SGDClassifier`], with the targets fixed
+/// to `y = ones(n)`, the Hinge loss (`threshold = 1`), the L2 penalty, and
+/// `alpha = nu / 2` (`_stochastic_gradient.py:2479,2588`). The SGD intercept
+/// `b` relates to the One-Class offset `rho` by `offset_ = 1 - b`
+/// (`_stochastic_gradient.py:2325,2377`), and the per-sample intercept update
+/// gains an extra `- 2*eta*alpha` term (`_sgd_fast.pyx.tp:641-642`).
+///
+/// The decision function is `decision_function(X) = X · coef_ - offset_`
+/// (`_stochastic_gradient.py:2622`); `predict` returns `+1` (inlier) where the
+/// decision is `>= 0` and `-1` (outlier) otherwise (`:2655-2657`).
+///
+/// # Type Parameters
+///
+/// - `F`: The floating-point type (`f32` or `f64`).
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_linear::sgd::SGDOneClassSVM;
+/// use ferrolearn_core::{Fit, Predict};
+/// use ndarray::{array, Array2};
+///
+/// let x = Array2::from_shape_vec((4, 2), vec![
+///     -1.0, -1.0, -2.0, -1.0, 1.0, 1.0, 2.0, 1.0,
+/// ]).unwrap();
+///
+/// let model = SGDOneClassSVM::<f64>::new()
+///     .with_learning_rate(ferrolearn_linear::sgd::LearningRateSchedule::Constant)
+///     .with_eta0(0.05)
+///     .with_max_iter(10)
+///     .with_shuffle(false);
+/// let fitted = model.fit(&x, &()).unwrap();
+/// let preds = fitted.predict(&x).unwrap();
+/// assert_eq!(preds.len(), 4);
+/// ```
+#[derive(Debug, Clone)]
+pub struct SGDOneClassSVM<F> {
+    /// The `nu` parameter — an upper bound on the fraction of training errors
+    /// and a lower bound on the fraction of support vectors. Must be in
+    /// `(0, 1]`. Defaults to `0.5` (`_stochastic_gradient.py:2098-2102,2247`).
+    pub nu: F,
+    /// Whether to fit (update) the intercept. Defaults to `true`
+    /// (`_stochastic_gradient.py:2104-2105,2248`).
+    pub fit_intercept: bool,
+    /// Maximum number of passes over the training data. Defaults to `1000`
+    /// (`_stochastic_gradient.py:2107,2249`).
+    pub max_iter: usize,
+    /// Convergence tolerance. Defaults to `1e-3`
+    /// (`_stochastic_gradient.py:2113,2250`). Set to `F::neg_infinity()` to
+    /// disable the early-stop rule (the analog of sklearn's `tol=None`,
+    /// `_stochastic_gradient.py:2310`).
+    pub tol: F,
+    /// Whether to shuffle the training data after each epoch. Defaults to
+    /// `true` (`_stochastic_gradient.py:2118,2251`).
+    pub shuffle: bool,
+    /// The learning rate schedule. Defaults to `Optimal`
+    /// (`_stochastic_gradient.py:2132,2254`).
+    pub learning_rate: LearningRateSchedule<F>,
+    /// Initial learning rate for the `constant`/`invscaling`/`adaptive`
+    /// schedules. Defaults to `0.0` (`_stochastic_gradient.py:2145,2255`).
+    pub eta0: F,
+    /// Power parameter for the inverse-scaling schedule. Defaults to `0.5`
+    /// (`_stochastic_gradient.py:2151,2256`).
+    pub power_t: F,
+    /// Optional random seed for sample shuffling
+    /// (`_stochastic_gradient.py:2125`).
+    pub random_state: Option<u64>,
+    /// Number of consecutive non-improving epochs before convergence (or, under
+    /// the `adaptive` schedule, before `eta` is divided by 5). Defaults to `5`
+    /// (`_stochastic_gradient.py:2278`).
+    pub n_iter_no_change: usize,
+}
+
+impl<F: Float> SGDOneClassSVM<F> {
+    /// Create a new `SGDOneClassSVM` with default settings.
+    ///
+    /// Defaults match scikit-learn's `SGDOneClassSVM.__init__`
+    /// (`_stochastic_gradient.py:2245-2281`): `nu = 0.5`,
+    /// `fit_intercept = true`, `max_iter = 1000`, `tol = 1e-3`,
+    /// `shuffle = true`, `learning_rate = Optimal`, `eta0 = 0.0`,
+    /// `power_t = 0.5`, `n_iter_no_change = 5`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            nu: F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one())),
+            fit_intercept: true,
+            max_iter: 1000,
+            tol: F::from(1e-3).unwrap_or_else(F::zero),
+            shuffle: true,
+            learning_rate: LearningRateSchedule::Optimal,
+            eta0: F::from(0.0).unwrap_or_else(F::zero),
+            power_t: F::from(0.5).unwrap_or_else(F::zero),
+            random_state: None,
+            n_iter_no_change: 5,
+        }
+    }
+
+    /// Set the `nu` parameter (upper bound on the fraction of training errors).
+    #[must_use]
+    pub fn with_nu(mut self, nu: F) -> Self {
+        self.nu = nu;
+        self
+    }
+
+    /// Set whether the intercept (bias) term is fit.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the maximum number of epochs.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set whether the training data is shuffled after each epoch.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = shuffle;
+        self
+    }
+
+    /// Set the learning rate schedule.
+    #[must_use]
+    pub fn with_learning_rate(mut self, lr: LearningRateSchedule<F>) -> Self {
+        self.learning_rate = lr;
+        self
+    }
+
+    /// Set the initial learning rate.
+    #[must_use]
+    pub fn with_eta0(mut self, eta0: F) -> Self {
+        self.eta0 = eta0;
+        self
+    }
+
+    /// Set the power parameter for inverse scaling.
+    #[must_use]
+    pub fn with_power_t(mut self, power_t: F) -> Self {
+        self.power_t = power_t;
+        self
+    }
+
+    /// Set the random seed for reproducibility.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
+        self
+    }
+
+    /// Set the number of consecutive non-improving epochs before convergence.
+    #[must_use]
+    pub fn with_n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
+        self
+    }
+
+    /// Fit the linear One-Class SVM on `x` (the X-only fit shape).
+    ///
+    /// This is the inherent entry point mirroring sklearn's `fit(X)`
+    /// (`_stochastic_gradient.py:2554-2600`). The [`Fit`] trait impl with a
+    /// unit target `()` delegates here.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::InvalidParameter`] if `nu` is not in `(0, 1]`
+    ///   (`_stochastic_gradient.py:2236`,
+    ///   `Interval(Real, 0.0, 1.0, closed="right")`).
+    /// - [`FerroError::InvalidParameter`] if `eta0` is not positive for the
+    ///   `constant`/`invscaling`/`adaptive` schedules.
+    /// - [`FerroError::InsufficientSamples`] if `x` has no rows.
+    pub fn fit_one_class(&self, x: &Array2<F>) -> Result<FittedSGDOneClassSVM<F>, FerroError>
+    where
+        F: Send + Sync + ScalarOperand + 'static,
+    {
+        // `nu` constraint: `Interval(Real, 0.0, 1.0, closed="right")`, i.e.
+        // `0 < nu <= 1` (`_stochastic_gradient.py:2236`).
+        if self.nu <= F::zero() || self.nu > F::one() {
+            return Err(FerroError::InvalidParameter {
+                name: "nu".into(),
+                reason: "must be in the range (0, 1]".into(),
+            });
+        }
+        let n_samples = x.nrows();
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "SGDOneClassSVM requires at least one sample".into(),
+            });
+        }
+        // `eta0 > 0` is required for the constant/invscaling/adaptive schedules
+        // (mirrors `_more_validate_params`, `_stochastic_gradient.py:149-153`);
+        // the `optimal` schedule accepts `eta0 == 0`.
+        if schedule_requires_eta0(&self.learning_rate) && self.eta0 <= F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "eta0".into(),
+                reason: "must be positive".into(),
+            });
+        }
+
+        let n_features = x.ncols();
+        // sklearn: `alpha = self.nu / 2` (`_stochastic_gradient.py:2588`),
+        // `penalty="l2"`, `l1_ratio=0`, `loss="hinge"` (`:2262-2265`).
+        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        let alpha = self.nu / two;
+        let hyper = SGDHyper {
+            learning_rate: self.learning_rate,
+            eta0: self.eta0,
+            alpha,
+            max_iter: self.max_iter,
+            tol: self.tol,
+            random_state: self.random_state,
+            power_t: self.power_t,
+            penalty: Penalty::L2,
+            l1_ratio: F::zero(),
+            shuffle: self.shuffle,
+            n_iter_no_change: self.n_iter_no_change,
+            fit_intercept: self.fit_intercept,
+            one_class: true,
+        };
+
+        // `y = np.ones(n_samples)` (`_stochastic_gradient.py:2289`).
+        let y_ones: Array1<F> = Array1::from_elem(n_samples, F::one());
+        let mut w = Array1::<F>::zeros(n_features);
+        // The One-Class offset is initialized to 0, so the SGD intercept starts
+        // at `b = 1 - offset_ = 1` (`_stochastic_gradient.py:2238,2325`). This
+        // differs from the classifier/regressor paths, which start at `b = 0`.
+        let mut b = F::one();
+
+        let (_, _t) = train_binary_sgd(x, &y_ones, &mut w, &mut b, &Hinge, &hyper, 0);
+
+        // `offset_ = 1 - intercept` (`_stochastic_gradient.py:2377`).
+        let offset = F::one() - b;
+
+        Ok(FittedSGDOneClassSVM {
+            coef: w,
+            offset,
+            n_features,
+        })
+    }
+}
+
+impl<F: Float> Default for SGDOneClassSVM<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, ()> for SGDOneClassSVM<F> {
+    type Fitted = FittedSGDOneClassSVM<F>;
+    type Error = FerroError;
+
+    /// Fit the linear One-Class SVM. The target `y` is ignored (present for API
+    /// consistency, mirroring sklearn's `fit(X, y=None)`,
+    /// `_stochastic_gradient.py:2554`); the fit uses `y = ones(n)` internally.
+    ///
+    /// # Errors
+    ///
+    /// See [`SGDOneClassSVM::fit_one_class`].
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedSGDOneClassSVM<F>, FerroError> {
+        self.fit_one_class(x)
+    }
+}
+
+/// Fitted linear One-Class SVM.
+///
+/// Holds the learned weight vector `coef_` and the One-Class offset `offset_`
+/// (`_stochastic_gradient.py:2177-2182`). Implements [`Predict`] (returning
+/// `+1`/`-1` inlier/outlier labels) and exposes [`decision_function`],
+/// [`score_samples`], [`coef`], and [`offset`].
+///
+/// [`decision_function`]: FittedSGDOneClassSVM::decision_function
+/// [`score_samples`]: FittedSGDOneClassSVM::score_samples
+/// [`coef`]: FittedSGDOneClassSVM::coef
+/// [`offset`]: FittedSGDOneClassSVM::offset
+#[derive(Debug, Clone)]
+pub struct FittedSGDOneClassSVM<F> {
+    /// Weight vector (`coef_`, shape `(n_features,)`).
+    coef: Array1<F>,
+    /// The One-Class offset (`offset_`), a scalar: `offset_ = 1 - intercept`.
+    offset: F,
+    /// Number of features the model was trained on.
+    n_features: usize,
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedSGDOneClassSVM<F> {
+    /// The learned weight vector (`coef_`).
+    #[must_use]
+    pub fn coef(&self) -> &Array1<F> {
+        &self.coef
+    }
+
+    /// The One-Class offset (`offset_`).
+    ///
+    /// Satisfies `decision_function = score_samples - offset_`
+    /// (`_stochastic_gradient.py:2182`).
+    #[must_use]
+    pub fn offset(&self) -> F {
+        self.offset
+    }
+
+    /// Signed distance to the separating hyperplane:
+    /// `decision_function(X) = X · coef_ - offset_`
+    /// (`_stochastic_gradient.py:2622`).
+    ///
+    /// Positive for an inlier, negative for an outlier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        let n_features = x.ncols();
+        if n_features != self.n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.n_features],
+                actual: vec![n_features],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+        Ok(x.dot(&self.coef) - self.offset)
+    }
+
+    /// Raw scoring function of the samples:
+    /// `score_samples(X) = decision_function(X) + offset_ = X · coef_`
+    /// (`_stochastic_gradient.py:2639`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    pub fn score_samples(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        Ok(self.decision_function(x)? + self.offset)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
+    for FittedSGDOneClassSVM<F>
+{
+    type Output = Array1<isize>;
+    type Error = FerroError;
+
+    /// Return labels (`+1` inlier, `-1` outlier) for the given feature matrix.
+    ///
+    /// Mirrors `_stochastic_gradient.py:2655-2657`:
+    /// `y = (decision_function(X) >= 0); y[y == 0] = -1`, i.e. `+1` where the
+    /// decision is `>= 0` and `-1` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<isize>, FerroError> {
+        let decisions = self.decision_function(x)?;
+        Ok(decisions.mapv(|d| if d >= F::zero() { 1 } else { -1 }))
     }
 }
 

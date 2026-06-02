@@ -26,9 +26,10 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
+use ferrolearn_core::traits::Predict;
 use ferrolearn_linear::sgd::{
     ClassifierLoss, Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss, SGDClassifier,
-    SGDRegressor,
+    SGDOneClassSVM, SGDRegressor,
 };
 use ndarray::{Array1, Array2};
 
@@ -1109,6 +1110,141 @@ fn sgd_epsilon_negative_rejected() {
             model.fit(&x, &y).is_ok(),
             "epsilon={eps} is in [0, inf) (closed-left boundary 0 valid); \
              sklearn fits OK but ferrolearn rejected it"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-18 / #536 — `SGDOneClassSVM` estimator (builder).
+//
+// sklearn site: `sklearn/linear_model/_stochastic_gradient.py:2084-2668`
+//   - `alpha = self.nu / 2`                                       (`:2588`)
+//   - `y = np.ones(n_samples)`, `loss="hinge"`, `penalty="l2"`,
+//     `l1_ratio=0`, `one_class=1`                          (`:2262-2289,2312`)
+//   - `intercept = 1 - self.offset_`, `offset_` init 0 -> intercept init 1
+//                                                          (`:2238,2325,2377`)
+//   - one-class intercept update term `intercept_update -= 2.*eta*alpha`
+//                                              (`_sgd_fast.pyx.tp:641-642`)
+//   - `offset_ = 1 - intercept`                                   (`:2377`)
+//   - `decision_function = X·coef_ - offset_`                     (`:2622`)
+//   - `predict`: `(decision >= 0) -> +1 else -1`             (`:2655-2657`)
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `SGDOneClassSVM` /
+// `FittedSGDOneClassSVM` (`fit_one_class`, `decision_function`,
+// `score_samples`, `predict`), reusing `train_binary_sgd` with the new
+// `one_class` flag on `SGDHyper`.
+//
+// shuffle=false for cross-impl determinism (single permutation barrier
+// avoided; the index order is `0..n-1` in both implementations).
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDOneClassSVM; \
+/// X=np.array([[-1.,-1.],[-2.,-1.],[1.,1.],[2.,1.]]); \
+/// m=SGDOneClassSVM(nu=0.5,learning_rate='constant',eta0=0.05,max_iter=10,tol=None, \
+///   shuffle=False,random_state=0,fit_intercept=True).fit(X); \
+/// print(m.coef_.ravel().tolist(), float(m.offset_[0]))"
+/// ```
+/// -> coef `[0.009883660184666337, 0.009883660184666337]`,
+///    offset `1.1102230246251565e-16` (≈ 0).
+#[test]
+fn sgd_one_class_svm_decision() {
+    // Live sklearn 1.5.2 oracle constants (computed by the invocation above).
+    const SK_COEF: [f64; 2] = [0.009883660184666337, 0.009883660184666337];
+    const SK_OFFSET: f64 = 1.1102230246251565e-16;
+
+    let x =
+        Array2::from_shape_vec((4, 2), vec![-1.0, -1.0, -2.0, -1.0, 1.0, 1.0, 2.0, 1.0]).unwrap();
+
+    let model = SGDOneClassSVM::<f64>::new()
+        .with_nu(0.5)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.05)
+        .with_max_iter(10)
+        .with_tol(f64::NEG_INFINITY) // == sklearn `tol=None` (disable early stop)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &()).expect("SGDOneClassSVM fit must succeed");
+
+    let coef = fitted.coef();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!(
+            (coef[k] - sk).abs() < 1e-7,
+            "coef[{k}] = {} diverges from sklearn oracle {sk} (alpha=nu/2 + \
+             one-class intercept term must match _sgd_fast.pyx.tp:641-642)",
+            coef[k]
+        );
+    }
+    assert!(
+        (fitted.offset() - SK_OFFSET).abs() < 1e-7,
+        "offset_ = {} diverges from sklearn oracle {SK_OFFSET} \
+         (offset_ = 1 - intercept, _stochastic_gradient.py:2377)",
+        fitted.offset()
+    );
+
+    // score_samples(X) = decision_function(X) + offset_ = X·coef_
+    // (`_stochastic_gradient.py:2639`): check the identity holds in ferrolearn.
+    let dec = fitted.decision_function(&x).unwrap();
+    let scores = fitted.score_samples(&x).unwrap();
+    let raw = x.dot(coef);
+    for i in 0..x.nrows() {
+        assert!((scores[i] - raw[i]).abs() < 1e-12);
+        assert!((dec[i] - (raw[i] - fitted.offset())).abs() < 1e-12);
+    }
+}
+
+/// Oracle invocation (nonzero offset, mixed inlier/outlier predictions):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDOneClassSVM; \
+/// X=np.array([[-1.,-1.],[-2.,-1.],[1.,1.],[2.,1.]]); \
+/// m=SGDOneClassSVM(nu=0.8,learning_rate='constant',eta0=0.1,max_iter=15,tol=None, \
+///   shuffle=False,random_state=0,fit_intercept=True).fit(X); \
+/// Xt=np.array([[4.,4.],[-3.,-3.],[0.5,0.5],[0.,0.]]); \
+/// print(m.coef_.ravel().tolist(), float(m.offset_[0])); print(m.predict(Xt).tolist())"
+/// ```
+/// -> coef `[0.20020636453962284, 0.12292535592963398]`, offset `0.10000000000000009`;
+///    predict `[1, -1, 1, -1]`.
+#[test]
+fn sgd_one_class_svm_predict() {
+    // Live sklearn 1.5.2 oracle constants.
+    const SK_COEF: [f64; 2] = [0.20020636453962284, 0.12292535592963398];
+    const SK_OFFSET: f64 = 0.10000000000000009;
+    const SK_PRED: [isize; 4] = [1, -1, 1, -1];
+
+    let x =
+        Array2::from_shape_vec((4, 2), vec![-1.0, -1.0, -2.0, -1.0, 1.0, 1.0, 2.0, 1.0]).unwrap();
+
+    let model = SGDOneClassSVM::<f64>::new()
+        .with_nu(0.8)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_max_iter(15)
+        .with_tol(f64::NEG_INFINITY) // == sklearn `tol=None`
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &()).expect("SGDOneClassSVM fit must succeed");
+
+    // Fitted attributes match the oracle (nonzero offset, unlike the
+    // alpha=0.25 constant case where offset ≈ 0).
+    let coef = fitted.coef();
+    for (k, &sk) in SK_COEF.iter().enumerate() {
+        assert!((coef[k] - sk).abs() < 1e-7, "coef[{k}]={} vs {sk}", coef[k]);
+    }
+    assert!((fitted.offset() - SK_OFFSET).abs() < 1e-7);
+
+    // predict returns the SAME ±1 inlier/outlier labels as sklearn.
+    let x_test =
+        Array2::from_shape_vec((4, 2), vec![4.0, 4.0, -3.0, -3.0, 0.5, 0.5, 0.0, 0.0]).unwrap();
+    let preds = fitted.predict(&x_test).unwrap();
+    for (i, &sk) in SK_PRED.iter().enumerate() {
+        assert_eq!(
+            preds[i], sk,
+            "predict[{i}] = {} but sklearn returns {sk} \
+             ((decision >= 0) ? +1 : -1, _stochastic_gradient.py:2655-2657)",
+            preds[i]
         );
     }
 }

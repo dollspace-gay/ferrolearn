@@ -98,7 +98,10 @@ pub use ransac::{FittedRANSACRegressor, RANSACRegressor};
 pub use ridge::{FittedRidge, FittedRidgeMulti, Ridge};
 pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
 pub use ridge_cv::{FittedRidgeCV, RidgeCV};
-pub use sgd::{FittedSGDClassifier, FittedSGDRegressor, SGDClassifier, SGDRegressor};
+pub use sgd::{
+    FittedSGDClassifier, FittedSGDOneClassSVM, FittedSGDRegressor, SGDClassifier, SGDOneClassSVM,
+    SGDRegressor,
+};
 pub use svm::{
     FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,
     SigmoidKernel,
