@@ -243,6 +243,8 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree decision_tree split tie-break ignores random_state feature-order (sklearn/tree/_splitter.pyx:293) (#659)
+- Divergence: ferrolearn-tree decision_tree missing FEATURE_THRESHOLD=1e-7 constant-feature band (sklearn/tree/_splitter.pyx:33) (#660)
 - Divergence: FittedNuSVC/FittedNuSVR do not re-expose support()/dual_coef()/intercept()/n_support() libsvm-layout fitted attrs (#657)
 - Divergence: NuSVR missing C parameter (sklearn/svm/_classes.py:1531 default C=1.0); ferrolearn forces C=1/(nu*n) (#656)
 - Divergence: NuSVR::predict diverges from sklearn/svm/src/libsvm/svm.cpp solve_nu_svr (nu_svm.rs delegates to epsilon-SVR) (#655)
