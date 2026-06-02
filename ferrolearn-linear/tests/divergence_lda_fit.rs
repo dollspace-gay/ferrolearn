@@ -30,6 +30,7 @@
 
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_linear::LDA;
+use ferrolearn_linear::lda::{Shrinkage, Solver};
 use ndarray::{Array1, Array2, array};
 
 // ===========================================================================
@@ -760,4 +761,208 @@ fn lda_tol_param() {
     let y = cov_y();
     let fitted = LDA::<f64>::new(None).fit(&x, &y).unwrap();
     assert_eq!(fitted.scalings().nrows(), 2);
+}
+
+// ===========================================================================
+// #595 (REQ-9) — lsqr solver / #597 (REQ-11) — shrinkage.
+//
+// sklearn's `solver="lsqr"` (`_solve_lstsq`, discriminant_analysis.py:365-419)
+// computes `covariance_ = _class_cov(X, y, priors_, shrinkage)` (`:413`, the
+// shrinkage-aware `Σ_k priors_[k] · cov(X_k)`, _class_cov :128-172, _cov
+// :36-93), `coef_ = lstsq(covariance_, means_.T)[0].T` (`:416`), and
+// `intercept_ = -0.5*diag(means_ @ coef_.T) + log(priors_)` (`:417-418`).
+//
+// For the binary case sklearn COLLAPSES coef_/intercept_ to a single row
+// `coef_[1] - coef_[0]` (`:651-657`). ferrolearn (matching its existing svd
+// path, open prereq blocker #600) keeps the FULL `(n_classes, n_features)`
+// coef_, so the assertions below reconstruct the collapsed discriminant
+// `coef_[1] - coef_[0]` and compare it to the live (collapsed) oracle.
+//
+// The shared dataset (X=cov_x(), y=cov_y()):
+//   X = [[0,0],[1,1],[2,0.5],[0.5,2],[5,5],[6,4.5],[4.5,6],[5.5,5.5]]
+//   y = [0,0,0,0,1,1,1,1]
+// ===========================================================================
+
+/// #595 (REQ-9): the `lsqr` solver matches the live sklearn 1.5.2
+/// `LinearDiscriminantAnalysis(solver='lsqr').fit(X,y)` (no shrinkage). The
+/// collapsed discriminant `coef_[1] - coef_[0]` matches `coef_` (already
+/// collapsed by sklearn) to 1e-6, and `predict`/`predict_proba` match the
+/// oracle.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); m=L(solver='lsqr').fit(X,y); \
+///   print(repr(m.coef_.tolist()), m.predict(X).tolist(), repr(m.predict_proba(X).tolist()))"
+/// # coef_ [[14.736842105263158, 14.736842105263154]]
+/// # predict [0, 0, 0, 0, 1, 1, 1, 1]
+/// # predict_proba [[1.0, 6.30e-40], [1.0, 3.98e-27], [1.0, 6.30e-24],
+/// #   [1.0, 6.30e-24], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+/// ```
+#[test]
+fn lda_lsqr_solver() {
+    // Live sklearn 1.5.2 (collapsed binary) `coef_` for solver='lsqr'.
+    const SK_COEF_COLLAPSED: [f64; 2] = [14.736842105263158, 14.736842105263154];
+    const SK_PRED: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+    const SK_PROBA: [[f64; 2]; 8] = [
+        [1.0, 6.2980862979674404e-40],
+        [1.0, 3.976189014922218e-27],
+        [1.0, 6.3027724011859036e-24],
+        [1.0, 6.3027724011859036e-24],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ];
+
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None)
+        .with_solver(Solver::Lsqr)
+        .fit(&x, &y)
+        .unwrap();
+
+    // coef_ is FULL (2, 2); the collapsed binary discriminant is row1 - row0.
+    let coef = fitted.coef();
+    assert_eq!(coef.dim(), (2, 2), "lsqr coef_ shape (uncollapsed)");
+    for j in 0..2 {
+        let collapsed = coef[[1, j]] - coef[[0, j]];
+        assert!(
+            (collapsed - SK_COEF_COLLAPSED[j]).abs() < 1e-6,
+            "lsqr coef_[1]-coef_[0] [{j}]: sklearn {}, ferrolearn {}",
+            SK_COEF_COLLAPSED[j],
+            collapsed
+        );
+    }
+
+    // covariance_ is ALWAYS populated for lsqr (sklearn :413).
+    assert!(
+        fitted.covariance().is_some(),
+        "lsqr always sets covariance_ (sklearn :413)"
+    );
+
+    let pred = fitted.predict(&x).unwrap();
+    for i in 0..8 {
+        assert_eq!(pred[i], SK_PRED[i], "lsqr predict[{i}]");
+    }
+
+    let proba = fitted.predict_proba(&x).unwrap();
+    assert_eq!(proba.dim(), (8, 2));
+    for i in 0..8 {
+        for c in 0..2 {
+            assert!(
+                (proba[[i, c]] - SK_PROBA[i][c]).abs() < 1e-6,
+                "lsqr predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_PROBA[i][c],
+                proba[[i, c]]
+            );
+        }
+    }
+}
+
+/// #597 (REQ-11): the `lsqr` solver with a FIXED shrinkage `0.5`
+/// (`shrunk_covariance(emp_cov, 0.5)`, _shrunk_covariance.py:153-156:
+/// `(1-s)*emp + s*(trace(emp)/p)*I`). The collapsed discriminant matches the
+/// live oracle to 1e-6.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   print(repr(L(solver='lsqr', shrinkage=0.5).fit(X,y).coef_.tolist()))"
+/// # [[12.043010752688168, 12.043010752688172]]
+/// ```
+#[test]
+fn lda_shrinkage_fixed() {
+    const SK_COEF_COLLAPSED: [f64; 2] = [12.043010752688168, 12.043010752688172];
+
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None)
+        .with_solver(Solver::Lsqr)
+        .with_shrinkage(Shrinkage::Fixed(0.5))
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coef();
+    assert_eq!(coef.dim(), (2, 2));
+    for j in 0..2 {
+        let collapsed = coef[[1, j]] - coef[[0, j]];
+        assert!(
+            (collapsed - SK_COEF_COLLAPSED[j]).abs() < 1e-6,
+            "fixed-shrinkage coef_[1]-coef_[0] [{j}]: sklearn {}, ferrolearn {}",
+            SK_COEF_COLLAPSED[j],
+            collapsed
+        );
+    }
+}
+
+/// #597 (REQ-11): the `lsqr` solver with `shrinkage='auto'` (Ledoit-Wolf,
+/// _cov :70-75 → ledoit_wolf_shrinkage, _shrunk_covariance.py:299-402). This
+/// validates the analytical Ledoit-Wolf transcription against the live oracle.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   print(repr(L(solver='lsqr', shrinkage='auto').fit(X,y).coef_.tolist()))"
+/// # [[11.370558375634516, 11.370558375634513]]
+/// ```
+#[test]
+fn lda_shrinkage_auto() {
+    const SK_COEF_COLLAPSED: [f64; 2] = [11.370558375634516, 11.370558375634513];
+
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None)
+        .with_solver(Solver::Lsqr)
+        .with_shrinkage(Shrinkage::Auto)
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coef();
+    assert_eq!(coef.dim(), (2, 2));
+    for j in 0..2 {
+        let collapsed = coef[[1, j]] - coef[[0, j]];
+        assert!(
+            (collapsed - SK_COEF_COLLAPSED[j]).abs() < 1e-6,
+            "auto-shrinkage coef_[1]-coef_[0] [{j}]: sklearn {}, ferrolearn {} \
+             (Ledoit-Wolf transcription)",
+            SK_COEF_COLLAPSED[j],
+            collapsed
+        );
+    }
+}
+
+/// #597 (REQ-11): sklearn rejects `shrinkage` combined with the `svd` solver
+/// (`discriminant_analysis.py:628-629`, `raise NotImplementedError("shrinkage
+/// not supported with 'svd' solver.")`). ferrolearn's [`Fit::fit`] must return
+/// an `Err` for `Solver::Svd` + any non-`None` shrinkage.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); L(solver='svd', shrinkage=0.5).fit(X,y)"
+/// # NotImplementedError: shrinkage not supported with 'svd' solver.
+/// ```
+#[test]
+fn lda_svd_shrinkage_rejected() {
+    let x = cov_x();
+    let y = cov_y();
+    let result = LDA::<f64>::new(None)
+        .with_solver(Solver::Svd)
+        .with_shrinkage(Shrinkage::Fixed(0.5))
+        .fit(&x, &y);
+    assert!(
+        result.is_err(),
+        "svd + shrinkage must error (sklearn NotImplementedError, :628-629)"
+    );
 }

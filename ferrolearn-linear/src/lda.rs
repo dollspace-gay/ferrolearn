@@ -9,6 +9,14 @@
 //! forms the **affine** classifier `coef_`/`intercept_` (whose `intercept_`
 //! embeds `log(priors_)`).
 //!
+//! The [`Solver::Lsqr`] least-squares path (`_solve_lstsq`,
+//! `discriminant_analysis.py:365-419`) is also available (`LDA::with_solver`):
+//! it forms the prior-weighted within-class covariance `covariance_` and solves
+//! `coef_ = lstsq(covariance_, means_.T).T`, supporting covariance
+//! [`Shrinkage`] (`None`/`Auto` Ledoit-Wolf/`Fixed`); it does NOT do
+//! dimensionality reduction (no `transform`). [`Solver::Eigen`] is deferred
+//! (#596).
+//!
 //! # Algorithm (`_solve_svd`, `discriminant_analysis.py:487-559`)
 //!
 //! With `n = n_samples`, `c = n_classes`:
@@ -53,9 +61,9 @@
 //! | REQ-8 (coef_/intercept_/xbar_) | SHIPPED | `FittedLDA::{coef, intercept, xbar}` accessors expose the `_solve_svd` arrays (`discriminant_analysis.py:556-559,517`). Consumer: `fn decision_function` reads `coef_`/`intercept_`; `fn transform` reads `xbar_`. Verified via `lda_decision_function_parity` (decision = `X@coef_.T+intercept_`) + `lda_transform_parity` (uses `xbar_`). |
 //! | REQ-13 (explained_variance_ratio_) | SHIPPED | `fn fit` sets `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]` from the SECOND (between-class) SVD (`discriminant_analysis.py:550-552`). Test `test_lda_explained_variance_ratio_oracle` <1e-9 vs live `L().explained_variance_ratio_`. #599. |
 //! | REQ-4 (predict_log_proba smallest_normal floor) | SHIPPED | `FittedLDA::predict_log_proba` mirrors sklearn exactly (`discriminant_analysis.py:713-737`): `predict_proba` then `prediction[prediction == 0.0] += smallest_normal` (`F::min_positive_value()` = numpy `finfo.smallest_normal`, `:729-736`) before `log`, so nonzero probas keep their true `ln` and exact zeros become `log(MIN_POSITIVE)` (not `-inf`). Consumer: shares `FittedLDA::predict_proba` (the `Predict` path). Test `lda_predict_log_proba` (overlapping 3-class, all-finite log-probas) <1e-6 vs live `LinearDiscriminantAnalysis().predict_log_proba`. #591. |
-//! | REQ-9 (lsqr solver) | NOT-STARTED | open prereq blocker #595. Only the `svd` solver exists; no `solver` parameter, no `_solve_lstsq` (`discriminant_analysis.py:365-419`). |
-//! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. No `solver="eigen"` generalized-eigenvalue path (`discriminant_analysis.py:421-485`). |
-//! | REQ-11 (shrinkage) | NOT-STARTED | open prereq blocker #597. No `shrinkage` parameter / Ledoit-Wolf `'auto'` (`discriminant_analysis.py:339,628-629`). |
+//! | REQ-9 (lsqr solver) | SHIPPED | `Solver::Lsqr` (`LDA::with_solver`) dispatches `fn fit` to `fn solve_lstsq` (sklearn `_solve_lstsq`, `discriminant_analysis.py:365-419`): `covariance_ = Σ_k priors_[k] · cov(X_k)` (`_class_cov` `:128-172`, ALWAYS populated for lsqr, `:413`); `coef_ = lstsq(covariance_, means_.T)[0].T` (`:416`) via `fn lstsq_multi` → `ferray::linalg::lstsq` (multi-RHS, `ferray-linalg/src/solve.rs:208`, R-SUBSTRATE-4 bridge); `intercept_ = -½·diag(means_ @ coef_.T) + log(priors_)` (`:417-418`). No `scalings_`/`xbar_`/`explained_variance_ratio_` / `transform` (sklearn raises for lsqr `transform`, `:676-679`; `max_components=0` ⇒ empty projection). Binary collapse `coef_[1]-coef_[0]` deferred to #600 (coef_ stays `(n_classes, n_features)`, matching the svd path). Consumer: `fn fit` reads `self.solver` and dispatches; `Predict`/`predict_proba` for `FittedLDA` consume the lsqr `coef_`/`intercept_`. Test `lda_lsqr_solver` (collapsed `coef_[1]-coef_[0]` = `[14.7368…, 14.7368…]`, predict/predict_proba) <1e-6 vs live `LinearDiscriminantAnalysis(solver='lsqr').fit(X,y)`. #595. |
+//! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. The `Solver::Eigen` variant EXISTS (so the enum is complete) but `fn fit` returns `FerroError::InvalidParameter("eigen solver not yet implemented (#596)")`; no generalized-eigenvalue `_solve_eigen` path (`discriminant_analysis.py:421-485`). |
+//! | REQ-11 (shrinkage None/auto/float) | SHIPPED | `Shrinkage::{None, Auto, Fixed(F)}` (`LDA::with_shrinkage`) drives `fn cov_shrunk` (sklearn `_cov`, `discriminant_analysis.py:36-93`) inside `fn solve_lstsq`: `None` → maximum-likelihood empirical covariance (`fn empirical_covariance`, `np.cov(...,bias=1)`, `:76-77`); `Fixed(s)` → `(1-s)·emp + s·(trace(emp)/p)·I` (`shrunk_covariance`, `covariance/_shrunk_covariance.py:153-156`), validated `0 ≤ s ≤ 1` (`Interval(Real,0,1,closed=both)`, `:339`) else `InvalidParameter`; `Auto` → analytical Ledoit-Wolf (`fn ledoit_wolf_shrinkage`, transcribed from `covariance/_shrunk_covariance.py:365-401` unblocked case) on StandardScaler-standardized data then rescaled (`_cov` `:70-75`). `Solver::Svd` + non-`None` shrinkage → `InvalidParameter("shrinkage not supported with svd solver")` mirroring sklearn `NotImplementedError` (`:628-629`). Consumer: `fn fit`/`fn solve_lstsq` read `self.shrinkage`. Tests `lda_shrinkage_fixed` (`Fixed(0.5)` coef = `[12.043…, 12.043…]`), `lda_shrinkage_auto` (`Auto` coef = `[11.3706…, 11.3706…]`, validates the Ledoit-Wolf transcription), `lda_svd_shrinkage_rejected` (svd+shrinkage → `Err`) <1e-6 vs the live oracle. #597. |
 //! | REQ-12 (store_covariance / covariance_) | SHIPPED | `LDA::with_store_covariance` sets the flag (sklearn default `false`, `discriminant_analysis.py:353`); when `true`, `fn fit` computes the shared within-class covariance `covariance_ = Σ_k priors_[k] · cov(X_k)` (`:509-510`, `_class_cov` `:128-172`) with the maximum-likelihood (`bias=1`, ÷`n_k`) per-class empirical covariance (`empirical_covariance`, `np.cov(...,bias=1)`), stored on `FittedLDA::covariance` (`None` when the flag is unset, matching sklearn). Consumer: `fn fit` reads `self.store_covariance`/`priors`/`means` and populates the field; `FittedLDA::covariance` exposes it. Test `lda_store_covariance` matches the live oracle `LinearDiscriminantAnalysis(store_covariance=True).fit(X,y).covariance_` to 1e-9 and asserts `None` for the default/`false` path. #598. |
 //! | REQ-14 (binary decision_function shape `(n,)`) | NOT-STARTED | open prereq blocker #600. `fn decision_function` always returns `(n, n_classes)`; sklearn collapses binary to `(n,)` (`discriminant_analysis.py:651-657,739`). Binding-ABI layer (parallel to QDA #581). |
 //! | REQ-15 (tol parameter) | SHIPPED | `LDA::with_tol` sets the svd-solver rank threshold (sklearn default `1e-4`, `discriminant_analysis.py:354,362`); `fn fit` reads `self.tol` into BOTH rank cutoffs `rank = Σ(S > tol)` (`:532`) and `rank2 = Σ(S2 > tol·S2[0])` (`:554`), REPLACING the prior hardcoded `1e-4`. Default `1e-4` ⇒ byte-identical to prior behavior (all existing svd-fit oracle tests stay green). Consumer: `fn fit` reads `self.tol` in both rank thresholds. Test `lda_tol_param` (field default `1e-4` + `with_tol` plumb-through). #601. |
@@ -89,6 +97,66 @@ use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::{Float, NumCast};
 
 // ---------------------------------------------------------------------------
+// Solver / Shrinkage enums
+// ---------------------------------------------------------------------------
+
+/// LDA solver selector (sklearn's `solver`, `discriminant_analysis.py:204-216`,
+/// `_parameter_constraints` `StrOptions({svd, lsqr, eigen})` `:338`).
+///
+/// - [`Solver::Svd`] (default) — the singular-value-decomposition path
+///   (`_solve_svd`, `discriminant_analysis.py:487-559`); supports `transform`
+///   (dimensionality reduction) but NOT `shrinkage`.
+/// - [`Solver::Lsqr`] — the least-squares path (`_solve_lstsq`,
+///   `discriminant_analysis.py:365-419`): `coef_ = lstsq(covariance_,
+///   means_.T).T`, `intercept_ = -½·diag(means_ @ coef_.T) + log(priors_)`.
+///   Supports `shrinkage`; does NOT support `transform` (sklearn raises
+///   `NotImplementedError`, `:676-679`).
+/// - [`Solver::Eigen`] — the generalized-eigenvalue path
+///   (`_solve_eigen`, `discriminant_analysis.py:421-485`). NOT implemented in
+///   ferrolearn yet (open prereq blocker #596); [`Fit::fit`] returns a
+///   [`FerroError`] for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Solver {
+    /// Singular-value-decomposition solver (sklearn default).
+    #[default]
+    Svd,
+    /// Least-squares solver (`_solve_lstsq`).
+    Lsqr,
+    /// Generalized-eigenvalue solver. NOT implemented (#596); errors at fit.
+    Eigen,
+}
+
+/// LDA covariance-shrinkage selector (sklearn's `shrinkage`,
+/// `discriminant_analysis.py:218-225`, `_parameter_constraints`
+/// `[StrOptions({auto}), Interval(Real, 0, 1, closed=both), None]` `:339`).
+///
+/// Drives the per-class covariance estimate `_cov`
+/// (`discriminant_analysis.py:36-93`) inside the `lsqr`/`eigen` solvers
+/// (sklearn note `:225`: shrinkage works only with the `lsqr` and `eigen`
+/// solvers):
+/// - [`Shrinkage::None`] — no shrinkage; the maximum-likelihood empirical
+///   covariance (`np.cov(..., bias=1)`, `:76-77`).
+/// - [`Shrinkage::Auto`] — automatic Ledoit-Wolf shrinkage (`:70-75`):
+///   standardize features, run the Ledoit-Wolf lemma, then rescale.
+/// - [`Shrinkage::Fixed`]`(s)` — fixed shrinkage `s ∈ [0, 1]`
+///   (`shrunk_covariance`, `_shrunk_covariance.py:111-158`):
+///   `(1 - s)·emp_cov + s·(trace(emp_cov)/p)·I`.
+///
+/// # Type Parameters
+///
+/// - `F`: the floating-point scalar type (`f32` or `f64`).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum Shrinkage<F> {
+    /// No shrinkage (sklearn `None`/`'empirical'`). Default.
+    #[default]
+    None,
+    /// Automatic Ledoit-Wolf shrinkage (sklearn `'auto'`).
+    Auto,
+    /// Fixed shrinkage coefficient `s ∈ [0, 1]` (sklearn `float`).
+    Fixed(F),
+}
+
+// ---------------------------------------------------------------------------
 // LDA (unfitted)
 // ---------------------------------------------------------------------------
 
@@ -120,6 +188,16 @@ pub struct LDA<F> {
     /// `priors_` (matching sklearn `:605`, `self.priors_ = xp.asarray(self.priors)`).
     priors: Option<Array1<F>>,
 
+    /// Solver selector (sklearn's `solver`, default `"svd"`,
+    /// `discriminant_analysis.py:204,349`). See [`Solver`].
+    solver: Solver,
+
+    /// Covariance-shrinkage selector (sklearn's `shrinkage`, default `None`,
+    /// `discriminant_analysis.py:218,350`). See [`Shrinkage`]. Only honored by
+    /// the `lsqr` solver here; combined with `Solver::Svd` it is rejected at fit
+    /// (sklearn `NotImplementedError`, `:628-629`).
+    shrinkage: Shrinkage<F>,
+
     /// Whether to compute and store the shared within-class covariance matrix
     /// `covariance_` during fit (sklearn's `store_covariance`, default `false`,
     /// `discriminant_analysis.py:353,361`). When `true`, the svd-solver `fit`
@@ -146,6 +224,8 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
         Self {
             n_components,
             priors: None,
+            solver: Solver::Svd,
+            shrinkage: Shrinkage::None,
             store_covariance: false,
             // sklearn default `tol=1e-4` (`discriminant_analysis.py:354`).
             // `1e-4` is exactly representable in f32/f64; the fallback to
@@ -181,6 +261,49 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
     #[must_use]
     pub fn priors(&self) -> Option<&Array1<F>> {
         self.priors.as_ref()
+    }
+
+    /// Set the solver (sklearn's `solver`, `discriminant_analysis.py:204,349`).
+    /// Default [`Solver::Svd`]. See [`Solver`].
+    ///
+    /// [`Solver::Lsqr`] enables the least-squares path (and `shrinkage`);
+    /// [`Solver::Eigen`] is not yet implemented (#596) and makes [`Fit::fit`]
+    /// return a [`FerroError`].
+    #[must_use]
+    pub fn with_solver(mut self, solver: Solver) -> Self {
+        self.solver = solver;
+        self
+    }
+
+    /// Return the configured solver. Mirrors sklearn's constructor `solver`
+    /// (`discriminant_analysis.py:349`, default `"svd"`).
+    #[must_use]
+    pub fn solver(&self) -> Solver {
+        self.solver
+    }
+
+    /// Set the covariance shrinkage (sklearn's `shrinkage`,
+    /// `discriminant_analysis.py:218,350`). Default [`Shrinkage::None`]. See
+    /// [`Shrinkage`].
+    ///
+    /// Honored only by [`Solver::Lsqr`] here (sklearn note `:225`: shrinkage
+    /// works only with the `lsqr`/`eigen` solvers). Combined with
+    /// [`Solver::Svd`], [`Fit::fit`] returns a [`FerroError`] mirroring sklearn's
+    /// `NotImplementedError("shrinkage not supported with 'svd' solver.")`
+    /// (`:628-629`). [`Shrinkage::Fixed`]`(s)` requires `0 <= s <= 1` (sklearn
+    /// `Interval(Real, 0, 1, closed="both")`, `:339`), else [`Fit::fit`] returns
+    /// [`FerroError::InvalidParameter`].
+    #[must_use]
+    pub fn with_shrinkage(mut self, shrinkage: Shrinkage<F>) -> Self {
+        self.shrinkage = shrinkage;
+        self
+    }
+
+    /// Return the configured covariance shrinkage. Mirrors sklearn's constructor
+    /// `shrinkage` (`discriminant_analysis.py:350`, default `None`).
+    #[must_use]
+    pub fn shrinkage(&self) -> Shrinkage<F> {
+        self.shrinkage
     }
 
     /// Set whether to compute and store the shared within-class covariance
@@ -515,6 +638,261 @@ fn svd_s_vt<F: LinalgFloat>(a: &Array2<F>) -> Result<(Array1<F>, Array2<F>), Fer
     Ok((s_nd, vt_nd))
 }
 
+/// Maximum-likelihood empirical covariance of `xg` (rows = samples), centered on
+/// the per-column mean and normalized by `n` (NOT `n-1`). Mirrors sklearn's
+/// `empirical_covariance` / `np.cov(..., bias=1)` (`discriminant_analysis.py:77`,
+/// `covariance/_empirical_covariance.py:109`).
+///
+/// Returns the `(p, p)` covariance and the per-column means (length `p`).
+fn empirical_covariance<F: Float>(xg: &Array2<F>) -> Result<(Array2<F>, Array1<F>), FerroError> {
+    let (n, p) = xg.dim();
+    let nf = usize_to_f::<F>(n)?;
+    let mut mean = Array1::<F>::zeros(p);
+    for i in 0..n {
+        for j in 0..p {
+            mean[j] = mean[j] + xg[[i, j]];
+        }
+    }
+    for j in 0..p {
+        mean[j] = mean[j] / nf;
+    }
+    let mut cov = Array2::<F>::zeros((p, p));
+    for a in 0..p {
+        for b in 0..p {
+            let mut acc = F::zero();
+            for i in 0..n {
+                acc = acc + (xg[[i, a]] - mean[a]) * (xg[[i, b]] - mean[b]);
+            }
+            cov[[a, b]] = acc / nf;
+        }
+    }
+    Ok((cov, mean))
+}
+
+/// Ledoit-Wolf analytical shrinkage coefficient of `x` (rows = samples), the
+/// transcription of sklearn's `ledoit_wolf_shrinkage`
+/// (`covariance/_shrunk_covariance.py:299-402`) for the unblocked case
+/// (`block_size=1000 >> n_features`, so `n_splits = 0` and the blocked loops
+/// collapse to the single tail term `beta_ = Σ(X²ᵀ·X²)`, `delta_ =
+/// Σ((Xᵀ·X)²)`). `x` is assumed already centered (`assume_centered=True`, the
+/// caller centers in [`cov_shrunk`]).
+///
+/// Formula (`:365-401`): with `X² = x⊙x`, `emp_cov_trace = Σ_i X²[i,:]/n`,
+/// `mu = Σ(emp_cov_trace)/p`, `beta_ = Σ(X²ᵀ·X²)`, `delta_ = Σ((Xᵀ·X)²)/n²`,
+/// `beta = (1/(p·n))·(beta_/n − delta_)`,
+/// `delta = (delta_ − 2·mu·Σ(emp_cov_trace) + p·mu²)/p`,
+/// `beta = min(beta, delta)`, `shrinkage = 0 if beta==0 else beta/delta`.
+fn ledoit_wolf_shrinkage<F: Float>(x: &Array2<F>) -> Result<F, FerroError> {
+    let (n, p) = x.dim();
+    // sklearn `:345-346`: for a single feature the result is shrinkage-invariant.
+    if p == 1 {
+        return Ok(F::zero());
+    }
+    let nf = usize_to_f::<F>(n)?;
+    let pf = usize_to_f::<F>(p)?;
+
+    // emp_cov_trace[j] = Σ_i x[i,j]² / n   (:365-366)
+    let mut emp_cov_trace = Array1::<F>::zeros(p);
+    for j in 0..p {
+        let mut acc = F::zero();
+        for i in 0..n {
+            acc = acc + x[[i, j]] * x[[i, j]];
+        }
+        emp_cov_trace[j] = acc / nf;
+    }
+    // mu = Σ(emp_cov_trace) / p   (:367)
+    let mut trace_sum = F::zero();
+    for j in 0..p {
+        trace_sum = trace_sum + emp_cov_trace[j];
+    }
+    let mu = trace_sum / pf;
+
+    // beta_ = Σ over (a,b) of (X²ᵀ·X²)[a,b] = Σ_{a,b} Σ_i x[i,a]²·x[i,b]²  (:388-390)
+    // delta_ = Σ over (a,b) of ((Xᵀ·X)[a,b])²  (:384-386)
+    let mut beta_acc = F::zero();
+    let mut delta_acc = F::zero();
+    for a in 0..p {
+        for b in 0..p {
+            let mut g_ab = F::zero(); // (Xᵀ·X)[a,b] = Σ_i x[i,a]·x[i,b]
+            let mut h_ab = F::zero(); // (X²ᵀ·X²)[a,b] = Σ_i x[i,a]²·x[i,b]²
+            for i in 0..n {
+                let xa = x[[i, a]];
+                let xb = x[[i, b]];
+                g_ab = g_ab + xa * xb;
+                h_ab = h_ab + (xa * xa) * (xb * xb);
+            }
+            beta_acc = beta_acc + h_ab;
+            delta_acc = delta_acc + g_ab * g_ab;
+        }
+    }
+    // delta_ /= n²   (:387)
+    let delta_ = delta_acc / (nf * nf);
+    // beta = (1/(p·n)) · (beta_/n − delta_)   (:392)
+    let beta = (F::one() / (pf * nf)) * (beta_acc / nf - delta_);
+    // delta = (delta_ − 2·mu·Σ(emp_cov_trace) + p·mu²) / p   (:394-395)
+    let two = F::one() + F::one();
+    let mut delta = delta_ - two * mu * trace_sum + pf * mu * mu;
+    delta = delta / pf;
+    // beta = min(beta, delta)   (:399)
+    let beta = if beta < delta { beta } else { delta };
+    // shrinkage = 0 if beta==0 else beta/delta   (:401)
+    if beta == F::zero() {
+        Ok(F::zero())
+    } else {
+        Ok(beta / delta)
+    }
+}
+
+/// Per-class covariance estimate with optional shrinkage — sklearn's `_cov`
+/// (`discriminant_analysis.py:36-93`) for `covariance_estimator=None`:
+/// - [`Shrinkage::None`] → empirical maximum-likelihood covariance (`:76-77`).
+/// - [`Shrinkage::Fixed`]`(s)` → `shrunk_covariance(emp_cov, s)`
+///   (`:78-79`, `_shrunk_covariance.py:153-156`):
+///   `(1 − s)·emp_cov + s·(trace(emp_cov)/p)·I`.
+/// - [`Shrinkage::Auto`] → Ledoit-Wolf on the StandardScaler-standardized data,
+///   then rescaled (`:70-75`): standardize `Xs = (X − mean)/scale` (population
+///   std, `ddof=0`, zeros → 1), `s = ledoit_wolf(Xs)`, then `cov[a,b] =
+///   scale[a]·s[a,b]·scale[b]`.
+fn cov_shrunk<F: Float>(xg: &Array2<F>, shrinkage: Shrinkage<F>) -> Result<Array2<F>, FerroError> {
+    let (n, p) = xg.dim();
+    match shrinkage {
+        Shrinkage::None => {
+            let (cov, _mean) = empirical_covariance(xg)?;
+            Ok(cov)
+        }
+        Shrinkage::Fixed(s) => {
+            let (emp, _mean) = empirical_covariance(xg)?;
+            let pf = usize_to_f::<F>(p)?;
+            let mut trace = F::zero();
+            for j in 0..p {
+                trace = trace + emp[[j, j]];
+            }
+            let mu = trace / pf;
+            let mut out = Array2::<F>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    let diag = if a == b { mu } else { F::zero() };
+                    out[[a, b]] = (F::one() - s) * emp[[a, b]] + s * diag;
+                }
+            }
+            Ok(out)
+        }
+        Shrinkage::Auto => {
+            // StandardScaler: center + divide by POPULATION std (ddof=0); zeros
+            // replaced by 1.0 (sklearn StandardScaler `_handle_zeros_in_scale`).
+            let nf = usize_to_f::<F>(n)?;
+            let mut mean = Array1::<F>::zeros(p);
+            for i in 0..n {
+                for j in 0..p {
+                    mean[j] = mean[j] + xg[[i, j]];
+                }
+            }
+            for j in 0..p {
+                mean[j] = mean[j] / nf;
+            }
+            let mut scale = Array1::<F>::zeros(p);
+            for j in 0..p {
+                let mut var = F::zero();
+                for i in 0..n {
+                    let d = xg[[i, j]] - mean[j];
+                    var = var + d * d;
+                }
+                var = var / nf;
+                let sd = var.sqrt();
+                scale[j] = if sd == F::zero() { F::one() } else { sd };
+            }
+            let mut xs = Array2::<F>::zeros((n, p));
+            for i in 0..n {
+                for j in 0..p {
+                    xs[[i, j]] = (xg[[i, j]] - mean[j]) / scale[j];
+                }
+            }
+            // ledoit_wolf re-centers; Xs already has ~0 mean, but follow sklearn
+            // exactly and re-center (assume_centered=False, `:357-358`).
+            let mut xs_mean = Array1::<F>::zeros(p);
+            for i in 0..n {
+                for j in 0..p {
+                    xs_mean[j] = xs_mean[j] + xs[[i, j]];
+                }
+            }
+            for j in 0..p {
+                xs_mean[j] = xs_mean[j] / nf;
+            }
+            let mut xc = Array2::<F>::zeros((n, p));
+            for i in 0..n {
+                for j in 0..p {
+                    xc[[i, j]] = xs[[i, j]] - xs_mean[j];
+                }
+            }
+            // shrinkage coefficient from the (centered) standardized data.
+            let shr = ledoit_wolf_shrinkage(&xc)?;
+            // emp_cov of the standardized data = Xcᵀ·Xc / n, then shrink:
+            // (1 − shr)·emp + shr·(trace(emp)/p)·I  (`_shrunk_covariance.py`).
+            let (emp, _m) = empirical_covariance(&xs)?;
+            let pf = usize_to_f::<F>(p)?;
+            let mut trace = F::zero();
+            for j in 0..p {
+                trace = trace + emp[[j, j]];
+            }
+            let mu = trace / pf;
+            // rescale: cov[a,b] = scale[a] · shrunk[a,b] · scale[b]  (`:75`).
+            let mut out = Array2::<F>::zeros((p, p));
+            for a in 0..p {
+                for b in 0..p {
+                    let diag = if a == b { mu } else { F::zero() };
+                    let shrunk = (F::one() - shr) * emp[[a, b]] + shr * diag;
+                    out[[a, b]] = scale[a] * shrunk * scale[b];
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+/// Solve the multi-RHS least-squares problem `A @ x = b` (with `b` having
+/// `nrhs` columns) through [`ferray::linalg::lstsq`]
+/// (`ferray-linalg/src/solve.rs:208`, the LAPACK-`gelsd`-equivalent single-SVD
+/// min-norm solver), bridging ndarray↔ferray at this boundary (R-SUBSTRATE-4),
+/// mirroring the bridge in `linalg.rs::solve_lstsq`. Returns the `(n, nrhs)`
+/// solution. Used by `_solve_lstsq` to compute `coef_ = lstsq(covariance_,
+/// means_.T)[0].T` (`discriminant_analysis.py:416`).
+///
+/// `rcond` is `Some(F::epsilon())`, pinning the singular-value cutoff to scipy's
+/// `cond=eps` default (matching `linalg.lstsq` `:416`), as in `solve_lstsq`.
+fn lstsq_multi<F: LinalgFloat>(a: &Array2<F>, b: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let (m, n) = a.dim();
+    let (bm, nrhs) = b.dim();
+    if bm != m {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![m, nrhs],
+            actual: vec![bm, nrhs],
+            context: "LDA lsqr: covariance/means row mismatch".into(),
+        });
+    }
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray lstsq: failed to build matrix A: {e}"),
+            }
+        })?;
+    let b_flat: Vec<F> = b.iter().copied().collect();
+    let fb = FerrayArray::<F, ferray::IxDyn>::from_vec(ferray::IxDyn::new(&[bm, nrhs]), b_flat)
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray lstsq: failed to build RHS B: {e}"),
+        })?;
+    let (sol, _residuals, _rank, _singular) = ferray::linalg::lstsq(&fa, &fb, Some(F::epsilon()))
+        .map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray lstsq solve failed: {e}"),
+    })?;
+    let sol_shape = sol.shape();
+    let out = Array2::from_shape_vec((sol_shape[0], sol_shape[1]), sol.iter().copied().collect())
+        .map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray lstsq: solution shape conversion failed: {e}"),
+    })?;
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Fit (sklearn _solve_svd)
 // ---------------------------------------------------------------------------
@@ -683,6 +1061,44 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
                 p
             }
         };
+
+        // --- solver dispatch (sklearn :627-650) -------------------------------
+        // `lsqr` and `eigen` need only means_/priors_/class_indices; resolve
+        // them above this point, then branch. `svd` falls through to the
+        // existing two-SVD path below (BYTE-IDENTICAL — `shrinkage` must be
+        // `None` for svd, sklearn `NotImplementedError` `:628-629`).
+        match self.solver {
+            Solver::Lsqr => {
+                return self.solve_lstsq(
+                    x,
+                    &classes,
+                    &class_indices,
+                    &means,
+                    &priors,
+                    user_max,
+                    n_features,
+                );
+            }
+            Solver::Eigen => {
+                // The generalized-eigenvalue solver is not yet implemented
+                // (open prereq blocker #596); the variant exists so the enum
+                // is complete, but fit errors rather than silently mis-solving.
+                return Err(FerroError::InvalidParameter {
+                    name: "solver".into(),
+                    reason: "eigen solver not yet implemented (#596)".into(),
+                });
+            }
+            Solver::Svd => {
+                // sklearn: svd + shrinkage != None → NotImplementedError
+                // ("shrinkage not supported with 'svd' solver.", `:628-629`).
+                if !matches!(self.shrinkage, Shrinkage::None) {
+                    return Err(FerroError::InvalidParameter {
+                        name: "shrinkage".into(),
+                        reason: "shrinkage not supported with svd solver".into(),
+                    });
+                }
+            }
+        }
 
         // --- xbar_ = priors_ @ means_  (sklearn :517) -------------------------
         let mut xbar = Array1::<F>::zeros(n_features);
@@ -895,6 +1311,134 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
             covariance,
             classes,
             max_components: user_max,
+            n_features,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fit (sklearn _solve_lstsq) — the lsqr solver
+// ---------------------------------------------------------------------------
+
+impl<F: LinalgFloat + ScalarOperand> LDA<F> {
+    /// The least-squares solver (sklearn's `_solve_lstsq`,
+    /// `discriminant_analysis.py:365-419`), dispatched from [`Fit::fit`] when
+    /// [`Solver::Lsqr`] is selected.
+    ///
+    /// Computes (`:412-418`):
+    /// - `covariance_ = Σ_k priors_[k] · cov(X_k)` where `cov(X_k)` applies the
+    ///   configured [`Shrinkage`] to class `k`'s empirical covariance
+    ///   (`_class_cov` `:128-172`, `_cov` `:36-93`).
+    /// - `coef_ = lstsq(covariance_, means_.T)[0].T` (`:416`), via
+    ///   [`ferray::linalg::lstsq`] (multi-RHS).
+    /// - `intercept_ = -½·diag(means_ @ coef_.T) + log(priors_)` (`:417-418`).
+    ///
+    /// Unlike sklearn's `svd` solver, the lsqr `coef_` is the FULL-space
+    /// discriminant `(n_classes, n_features)` — NO `scalings_`/`xbar_`/
+    /// `explained_variance_ratio_` and NO `transform` (sklearn raises
+    /// `NotImplementedError` for `transform` under lsqr, `:676-679`); here
+    /// [`Transform`] returns an error because `scalings_` is the zero matrix /
+    /// `xbar_` is zero, and `transform` slices to `max_components` of a meaningless
+    /// projection — we instead document that `transform` is unsupported by
+    /// recording `max_components = 0` so the projection is empty (mirroring
+    /// sklearn's "dimensionality reduction is not supported" for lsqr).
+    ///
+    /// `covariance_` is ALWAYS populated for lsqr (sklearn `:413`, the attribute
+    /// is set regardless of `store_covariance`), exposed via
+    /// [`FittedLDA::covariance`].
+    ///
+    /// `decision_function`/`predict`/`predict_proba` work identically to the svd
+    /// path because they consume `coef_`/`intercept_` only.
+    ///
+    /// NOTE: the binary-collapse of `coef_`/`intercept_` to a single row
+    /// (sklearn `:651-657`) is NOT applied here, matching the existing svd path
+    /// (open prereq blocker #600); `coef_` stays `(n_classes, n_features)`.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::InvalidParameter`] if [`Shrinkage::Fixed`]`(s)` has
+    ///   `s ∉ [0, 1]` (sklearn `Interval(Real, 0, 1, closed="both")`, `:339`).
+    /// - [`FerroError::NumericalInstability`] if the least-squares solve fails.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the lsqr solver consumes the same pre-resolved fit state (classes/indices/means/priors/dims) the svd path computes; threading them avoids recomputation"
+    )]
+    fn solve_lstsq(
+        &self,
+        x: &Array2<F>,
+        classes: &[usize],
+        class_indices: &[Vec<usize>],
+        means: &Array2<F>,
+        priors: &Array1<F>,
+        _user_max: usize,
+        n_features: usize,
+    ) -> Result<FittedLDA<F>, FerroError> {
+        let n_classes = classes.len();
+
+        // Validate Fixed(s): sklearn Interval(Real, 0, 1, closed="both") (:339).
+        if let Shrinkage::Fixed(s) = self.shrinkage
+            && (s < <F as num_traits::Zero>::zero() || s > <F as num_traits::One>::one())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "shrinkage".into(),
+                reason: "shrinkage float must be in [0, 1]".into(),
+            });
+        }
+
+        // covariance_ = Σ_k priors_[k] · cov(X_k)  (sklearn _class_cov :167-172).
+        let mut covariance = Array2::<F>::zeros((n_features, n_features));
+        for (idx, indices) in class_indices.iter().enumerate() {
+            // Gather class-k rows.
+            let nk = indices.len();
+            let mut xg = Array2::<F>::zeros((nk, n_features));
+            for (r, &i) in indices.iter().enumerate() {
+                for j in 0..n_features {
+                    xg[[r, j]] = x[[i, j]];
+                }
+            }
+            let cov_k = cov_shrunk(&xg, self.shrinkage)?;
+            let prior_k = priors[idx];
+            for a in 0..n_features {
+                for b in 0..n_features {
+                    covariance[[a, b]] += prior_k * cov_k[[a, b]];
+                }
+            }
+        }
+
+        // coef_ = lstsq(covariance_, means_.T)[0].T  (sklearn :416).
+        // Solve `covariance_ @ X = means_.T` for X of shape (n_features,
+        // n_classes); X = lstsq(...)[0]; coef_ = X.T = (n_classes, n_features).
+        let means_t = means.t().to_owned(); // (n_features, n_classes)
+        let sol = lstsq_multi(&covariance, &means_t)?; // (n_features, n_classes)
+        let coef = sol.t().to_owned(); // (n_classes, n_features)
+
+        // intercept_ = -0.5 * diag(means_ @ coef_.T) + log(priors_)  (:417-418).
+        // diag(means_ @ coef_.T)[k] = Σ_j means_[k,j] · coef_[k,j].
+        let neg_half = -half::<F>();
+        let mut intercept = Array1::<F>::zeros(n_classes);
+        for k in 0..n_classes {
+            let mut dot = <F as num_traits::Zero>::zero();
+            for j in 0..n_features {
+                dot += means[[k, j]] * coef[[k, j]];
+            }
+            intercept[k] = neg_half * dot + priors[k].ln();
+        }
+
+        // lsqr does NOT support dimensionality reduction (sklearn :372-373,
+        // :676-679): no scalings_/xbar_/explained_variance_ratio_. Set them to
+        // empty/zero and `max_components = 0` so `transform` yields a `(n, 0)`
+        // projection (the lsqr "no transform" contract).
+        Ok(FittedLDA {
+            scalings: Array2::<F>::zeros((n_features, 0)),
+            means: means.to_owned(),
+            xbar: Array1::<F>::zeros(n_features),
+            priors: priors.to_owned(),
+            coef,
+            intercept,
+            explained_variance_ratio: Array1::<F>::zeros(0),
+            covariance: Some(covariance),
+            classes: classes.to_vec(),
+            max_components: 0,
             n_features,
         })
     }
