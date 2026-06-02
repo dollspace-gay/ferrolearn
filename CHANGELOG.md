@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree::FittedExtraTreesClassifier::predict hard-votes; sklearn ExtraTreesClassifier.predict soft-votes (_forest.py:907) (#679)
 - Divergence: ferrolearn-tree RandomForestClassifier::predict hard-votes; sklearn/ensemble/_forest.py:904-907 soft-votes (argmax of mean predict_proba) (#670)
 - Divergence: ferrolearn-tree ExtraTreeRegressor ignores criterion (hard-wired MSE/mean leaves) vs sklearn/tree/_criterion.pyx MAE.node_value median (#681) (#667)
 - decision_tree: class_weight (None/balanced/dict) (#665)
