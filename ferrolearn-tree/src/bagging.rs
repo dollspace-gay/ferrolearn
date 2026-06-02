@@ -29,6 +29,30 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.BaggingClassifier` / `BaggingRegressor`
+//! (`sklearn/ensemble/_bagging.py`). See `.design/tree/bagging.md`.
+//! Non-test consumer: crate re-export + `RsBaggingClassifier` PyO3 binding
+//! (`ferrolearn-python/src/extras.rs`).
+//!
+//! **RNG boundary:** bootstrap-sample and feature-subset draws use `StdRng`
+//! where sklearn draws from numpy MT19937 — exact end-to-end ensemble parity
+//! is infeasible (#723); ferrolearn's fit is internally reproducible.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param defaults: `n_estimators=10`, `max_samples=1.0`, `max_features=1.0`, `bootstrap=true`, `bootstrap_features=false`, `random_state=None` | SHIPPED |
+//! | REQ-2 | Per-estimator bootstrap-sample + feature-subset fit (tree base learner; original-space split indices) | SHIPPED |
+//! | REQ-3 | Classifier SOFT-vote `predict` = `classes[argmax(mean predict_proba)]`, lowest-index tie (`_bagging.py:913-914`) | SHIPPED |
+//! | REQ-4 | `predict_proba` = mean of per-estimator proba (`_bagging.py:964`); regressor `predict` = mean (`:1299`) | SHIPPED |
+//! | REQ-6 | `estimators_features_` (per-estimator feature subset) accessor | SHIPPED |
+//! | REQ-10 | `random_state` reproducibility (ferrolearn-internal; numpy-MT parity = RNG boundary #723) | SHIPPED |
+//! | REQ-7 | Heterogeneous base estimator (arbitrary `estimator`); ferrolearn tree-only | NOT-STARTED (#720, architectural) |
+//! | REQ-8 | `oob_score` / `oob_decision_function_` / `oob_prediction_` | NOT-STARTED (#721) |
+//! | REQ-9 | int `max_samples`/`max_features` + sizing parity (`_bagging.py:487-498`) | NOT-STARTED (#722) |
+//! | REQ-11 | ferray substrate migration | NOT-STARTED (#724) |
 
 use crate::decision_tree::{
     self, ClassificationCriterion, Node, build_classification_tree_with_feature_subset,
@@ -190,6 +214,15 @@ impl<F: Float + Send + Sync + 'static> FittedBaggingClassifier<F> {
         self.n_features
     }
 
+    /// The original feature indices drawn for each estimator.
+    ///
+    /// Mirrors sklearn's `BaggingClassifier.estimators_features_`: the subset
+    /// of (original-space) feature columns sampled to train each tree.
+    #[must_use]
+    pub fn estimators_features(&self) -> &[Vec<usize>] {
+        &self.feature_indices
+    }
+
     /// Mean accuracy on the given test data and labels.
     /// Equivalent to sklearn's `ClassifierMixin.score`.
     ///
@@ -215,8 +248,8 @@ impl<F: Float + Send + Sync + 'static> FittedBaggingClassifier<F> {
     ///
     /// Returns an `(n_samples, n_classes)` array. Each tree contributes
     /// either its leaf's full class distribution or a one-hot vote based
-    /// on the leaf's predicted class. Each tree gets a row sub-set
-    /// according to the `feature_indices` it was trained on.
+    /// on the leaf's predicted class. Tree splits store original-space
+    /// feature indices, so each tree traverses the full feature row.
     ///
     /// # Errors
     ///
@@ -237,11 +270,10 @@ impl<F: Float + Send + Sync + 'static> FittedBaggingClassifier<F> {
 
         for i in 0..n_samples {
             let row = x.row(i);
-            for (t, tree_nodes) in self.trees.iter().enumerate() {
-                let feat_idx = &self.feature_indices[t];
-                let sub_row: Vec<F> = feat_idx.iter().map(|&fi| row[fi]).collect();
-                let sub_view = ndarray::Array1::from(sub_row);
-                let leaf_idx = decision_tree::traverse(tree_nodes, &sub_view.view());
+            for tree_nodes in &self.trees {
+                // Tree splits store ORIGINAL feature indices, so traverse the
+                // full row directly (no subset re-mapping).
+                let leaf_idx = decision_tree::traverse(tree_nodes, &row);
                 match &tree_nodes[leaf_idx] {
                     Node::Leaf {
                         class_distribution: Some(dist),
@@ -425,12 +457,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Bagging
             .collect();
 
         let (trees, feature_indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-        let feature_importances = decision_tree::aggregate_tree_importances(
-            &trees,
-            Some(&feature_indices),
-            None,
-            n_features,
-        );
+        // Tree `Node::Split.feature` already holds the ORIGINAL feature index
+        // (candidate features are the subset's original indices), so no remap.
+        let feature_importances =
+            decision_tree::aggregate_tree_importances(&trees, None, None, n_features);
 
         Ok(FittedBaggingClassifier {
             trees,
@@ -452,51 +482,36 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedBaggingClass
     type Output = Array1<usize>;
     type Error = FerroError;
 
-    /// Predict class labels by majority vote across all trees.
+    /// Predict class labels by soft vote (argmax of mean class probabilities)
+    /// across all trees.
+    ///
+    /// Mirrors `sklearn/ensemble/_bagging.py:913-914`:
+    /// `predicted_probabilitiy = self.predict_proba(X)` /
+    /// `return self.classes_.take(np.argmax(predicted_probabilitiy, axis=1))`.
+    /// Ties are broken by lowest class index (numpy `np.argmax` semantics).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        if x.ncols() != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted model".into(),
-            });
-        }
-
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
+        let proba = self.predict_proba(x)?;
+        let n_samples = proba.nrows();
+        let n_classes = proba.ncols();
         let mut predictions = Array1::zeros(n_samples);
 
         for i in 0..n_samples {
-            let row = x.row(i);
-            let mut votes = vec![0usize; n_classes];
-
-            for (t, tree_nodes) in self.trees.iter().enumerate() {
-                // Build a subsetted row using only the features this tree was trained on.
-                let feat_idx = &self.feature_indices[t];
-                let sub_row: Vec<F> = feat_idx.iter().map(|&fi| row[fi]).collect();
-                let sub_view = ndarray::Array1::from(sub_row);
-
-                let leaf_idx = decision_tree::traverse(tree_nodes, &sub_view.view());
-                if let Node::Leaf { value, .. } = tree_nodes[leaf_idx] {
-                    let class_idx = value.to_f64().map(|f| f.round() as usize).unwrap_or(0);
-                    if class_idx < n_classes {
-                        votes[class_idx] += 1;
-                    }
+            // np.argmax tie-break: first (lowest) index of the maximum.
+            let mut best = 0usize;
+            let mut best_v = proba[[i, 0]];
+            for j in 1..n_classes {
+                let v = proba[[i, j]];
+                if v > best_v {
+                    best_v = v;
+                    best = j;
                 }
             }
-
-            let winner = votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, &count)| count)
-                .map(|(idx, _)| idx)
-                .unwrap_or(0);
-            predictions[i] = self.classes[winner];
+            predictions[i] = self.classes[best];
         }
 
         Ok(predictions)
@@ -710,6 +725,15 @@ impl<F: Float + Send + Sync + 'static> FittedBaggingRegressor<F> {
         self.n_features
     }
 
+    /// The original feature indices drawn for each estimator.
+    ///
+    /// Mirrors sklearn's `BaggingRegressor.estimators_features_`: the subset
+    /// of (original-space) feature columns sampled to train each tree.
+    #[must_use]
+    pub fn estimators_features(&self) -> &[Vec<usize>] {
+        &self.feature_indices
+    }
+
     /// R² coefficient of determination on the given test data.
     /// Equivalent to sklearn's `RegressorMixin.score`.
     ///
@@ -853,12 +877,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for BaggingRegr
             .collect();
 
         let (trees, feature_indices): (Vec<_>, Vec<_>) = results.into_iter().unzip();
-        let feature_importances = decision_tree::aggregate_tree_importances(
-            &trees,
-            Some(&feature_indices),
-            None,
-            n_features,
-        );
+        // Tree `Node::Split.feature` already holds the ORIGINAL feature index
+        // (candidate features are the subset's original indices), so no remap.
+        let feature_importances =
+            decision_tree::aggregate_tree_importances(&trees, None, None, n_features);
 
         Ok(FittedBaggingRegressor {
             trees,
@@ -896,12 +918,10 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedBaggingRegre
             let row = x.row(i);
             let mut sum = F::zero();
 
-            for (t, tree_nodes) in self.trees.iter().enumerate() {
-                let feat_idx = &self.feature_indices[t];
-                let sub_row: Vec<F> = feat_idx.iter().map(|&fi| row[fi]).collect();
-                let sub_view = ndarray::Array1::from(sub_row);
-
-                let leaf_idx = decision_tree::traverse(tree_nodes, &sub_view.view());
+            for tree_nodes in &self.trees {
+                // Tree splits store ORIGINAL feature indices, so traverse the
+                // full row directly (no subset re-mapping).
+                let leaf_idx = decision_tree::traverse(tree_nodes, &row);
                 if let Node::Leaf { value, .. } = tree_nodes[leaf_idx] {
                     sum = sum + value;
                 }
