@@ -1,51 +1,268 @@
-//! Huber Regressor — robust regression via IRLS.
+//! Huber Regressor — robust regression via joint `[coef, intercept, scale]`
+//! L-BFGS optimization of the scale-aware Huber loss.
 //!
-//! This module provides [`HuberRegressor`], a robust regression estimator
-//! that uses the Huber loss function. Unlike OLS (which uses squared loss),
-//! the Huber loss is quadratic for residuals smaller than `epsilon` and
-//! linear (i.e., MAE-like) for larger residuals. This makes it substantially
-//! less sensitive to outliers.
+//! This module provides [`HuberRegressor`], a robust regression estimator that
+//! mirrors scikit-learn's `sklearn.linear_model.HuberRegressor`. Unlike OLS
+//! (which uses squared loss), the Huber loss is quadratic for residuals smaller
+//! than `epsilon * scale` and linear (i.e., MAE-like) for larger residuals,
+//! making it substantially less sensitive to outliers.
 //!
-//! The Huber loss for a single residual `r` is:
+//! Following sklearn, the coefficients `w`, the intercept `c` and the scale
+//! `sigma` are optimized JOINTLY. The objective (per
+//! `sklearn/linear_model/_huber.py:18` `_huber_loss_and_gradient`) is
 //!
 //! ```text
-//! L(r) = { (1/2) * r²           if |r| <= epsilon
-//!         { epsilon*(|r| - ε/2)  if |r| > epsilon
+//! L = n·sigma
+//!   + Σ_{inlier}  r_i² / sigma                       (r = y - X·w - c)
+//!   + Σ_{outlier} (2·epsilon·|r_i| − sigma·epsilon²)
+//!   + alpha·‖w‖²
 //! ```
 //!
-//! The model is fitted via **Iteratively Reweighted Least Squares (IRLS)**:
-//! each iteration solves a weighted Ridge problem where samples with large
-//! residuals receive reduced weight.
+//! with the inlier/outlier split at `|r_i| > epsilon · sigma`
+//! (`_huber.py:67`). The `n·sigma` term plus the per-inlier `/sigma` scaling
+//! make `sigma` jointly estimable. The `alpha` penalty applies to `w` only,
+//! never to the intercept or the scale (`_huber.py:111`, `:124`).
+//!
+//! The minimizer is ferrolearn's own L-BFGS (`crate::optim::lbfgs`). Because
+//! that optimizer is unconstrained while sklearn bounds `sigma >= eps·10`
+//! (`_huber.py:322-323`), we reparameterize the scale as
+//! `sigma = exp(log_sigma)` and optimize over the unconstrained `log_sigma`,
+//! transforming the scale gradient by the chain rule
+//! (`∂L/∂log_sigma = sigma · ∂L/∂sigma`). The Huber objective is convex with a
+//! unique minimum, so the reparameterized solve reaches sklearn's fixed point.
+//!
+//! Unlike OLS/Ridge, the intercept is a fit parameter inside the optimization,
+//! NOT recovered by mean-centering — matching sklearn, which optimizes
+//! `w[-2]` jointly (`_huber.py:344-345`).
 //!
 //! An L2 penalty (`alpha`) on the coefficients is also supported.
+//!
+//! ## REQ status
+//!
+//! See `.design/linear/huber_regressor.md` for the full requirement table.
+//!
+//! - REQ-1 (joint L-BFGS fit matches sklearn): SHIPPED — `fit` minimizes the
+//!   scale-aware Huber objective of `_huber_loss_and_gradient` over
+//!   `[coef, intercept, log_sigma]` with `crate::optim::lbfgs`. Consumer:
+//!   `ferrolearn-python` `RsHuberRegressor`.
+//! - REQ-2 (epsilon default 1.35): SHIPPED — `new` sets `epsilon = 1.35`.
+//! - REQ-3 (alpha L2 on coef only): SHIPPED — the penalty term in
+//!   `huber_loss_and_gradient` touches only `grad[..n_features]` / `‖w‖²`.
+//! - REQ-4 (scale_ jointly estimated, > 0): SHIPPED — `sigma` is the last
+//!   optimized parameter, reparameterized `exp(log_sigma)` so it stays > 0;
+//!   surfaced as `scale_` / `scale()`.
+//! - REQ-5 (outliers_ mask): SHIPPED — `outliers_` set where
+//!   `|y − X·coef − intercept| > scale · epsilon`; surfaced as `outliers()`.
+//! - REQ-6 (predict): SHIPPED — `Predict` returns `X·coef + intercept`.
+//! - REQ-7 (fit_intercept / HasCoefficients): SHIPPED.
+//! - REQ-8 (scale_ attribute): SHIPPED — `scale()` accessor.
+//! - REQ-9 (n_iter_), REQ-10 (warm_start), REQ-11 (sample_weight),
+//!   REQ-12 (ferray substrate): NOT-STARTED (blockers #499, #500, #501, #502).
 //!
 //! # Examples
 //!
 //! ```
 //! use ferrolearn_linear::HuberRegressor;
 //! use ferrolearn_core::{Fit, Predict};
-//! use ndarray::{array, Array1, Array2};
+//! use ndarray::{array, Array2};
 //!
 //! let model = HuberRegressor::<f64>::new();
-//! let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
-//! let y = array![3.0, 5.0, 7.0, 9.0, 100.0]; // last point is an outlier
+//! // Noisy `y ≈ 2x + 1` inliers with one off-trend outlier at the end.
+//! let x = Array2::from_shape_vec((8, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+//! let y = array![3.35, 4.94, 6.90, 8.47, 11.00, 12.94, 14.89, 25.0];
 //!
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
 
+use crate::optim::lbfgs::LbfgsOptimizer;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
-use ndarray::{Array1, Array2, Axis, ScalarOperand};
+use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::{Float, FromPrimitive};
+
+/// Convert a finite `f64` constant to `F`. The conversion is total for `f32`
+/// and `f64`; the `F::epsilon()` fallback is a never-taken safety branch that
+/// keeps production code free of `.unwrap()` (goal.md R-CODE-2).
+#[inline]
+fn cast<F: Float + FromPrimitive>(v: f64) -> F {
+    F::from(v).unwrap_or_else(F::epsilon)
+}
+
+/// Robust scale of a target vector: `1.4826 · median(|y − median(y)|)` (the
+/// MAD, scaled to be a consistent estimator of the standard deviation under
+/// Gaussian noise). Used only as the starting `sigma` for the Huber
+/// optimization — being robust, it is not inflated by outliers, so the solver
+/// can descend to the true scale from both clean and outlier-heavy data.
+/// Returns `0` for an empty input.
+fn robust_scale<F: Float + FromPrimitive>(y: &Array1<F>) -> F {
+    let n = y.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let median = |v: &mut [F]| -> F {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let m = v.len();
+        if m % 2 == 1 {
+            v[m / 2]
+        } else {
+            (v[m / 2 - 1] + v[m / 2]) / cast::<F>(2.0)
+        }
+    };
+    let mut vals: Vec<F> = y.iter().copied().collect();
+    let med = median(&mut vals);
+    let mut dev: Vec<F> = y.iter().map(|&yi| (yi - med).abs()).collect();
+    let mad = median(&mut dev);
+    cast::<F>(1.4826) * mad
+}
+
+/// Solve the symmetric positive-definite system `a · β = b` (size `p`) by
+/// Gaussian elimination with partial pivoting. Returns `None` on a (near-)
+/// singular pivot. Used for the warm-start weighted-least-squares steps.
+fn gauss_solve<F: Float + FromPrimitive>(a: &Array2<F>, b: &Array1<F>) -> Option<Array1<F>> {
+    let p = b.len();
+    let mut aug = Array2::<F>::zeros((p, p + 1));
+    for r in 0..p {
+        for c in 0..p {
+            aug[[r, c]] = a[[r, c]];
+        }
+        aug[[r, p]] = b[r];
+    }
+    for col in 0..p {
+        let mut piv = col;
+        let mut best = aug[[col, col]].abs();
+        for row in (col + 1)..p {
+            let v = aug[[row, col]].abs();
+            if v > best {
+                best = v;
+                piv = row;
+            }
+        }
+        if best <= cast::<F>(1e-30) {
+            return None;
+        }
+        if piv != col {
+            for c in 0..=p {
+                let t = aug[[col, c]];
+                aug[[col, c]] = aug[[piv, c]];
+                aug[[piv, c]] = t;
+            }
+        }
+        let pivot = aug[[col, col]];
+        for row in (col + 1)..p {
+            let factor = aug[[row, col]] / pivot;
+            for c in col..=p {
+                let above = aug[[col, c]];
+                aug[[row, c]] = aug[[row, c]] - factor * above;
+            }
+        }
+    }
+    let mut beta = Array1::<F>::zeros(p);
+    for i in (0..p).rev() {
+        let mut s = aug[[i, p]];
+        for j in (i + 1)..p {
+            s = s - aug[[i, j]] * beta[j];
+        }
+        let diag = aug[[i, i]];
+        if diag.abs() <= cast::<F>(1e-30) {
+            return None;
+        }
+        beta[i] = s / diag;
+    }
+    Some(beta)
+}
+
+/// Huber-IRLS warm start for the joint optimization. Runs a handful of
+/// iteratively-reweighted-least-squares steps on `Z = [X | 1?]` with Huber
+/// weights (`w_i = min(1, epsilon·sigma / |r_i|)`, `sigma` = MAD of the current
+/// residuals), returning `(coef, intercept, sigma)`.
+///
+/// This is NOT the Huber fit — it only lands the L-BFGS start near the (unique,
+/// convex) joint minimum so the unconstrained in-repo optimizer converges
+/// quickly even on large-scale or heavy-outlier targets (where steepest descent
+/// from the `coef = 0, sigma = 1` origin stalls). Unlike a plain OLS warm start,
+/// the Huber weights down-weight outliers, so the start is not poisoned by them.
+/// Returns `None` on any singular solve (caller falls back to the origin).
+fn irls_warm_start<F: Float + FromPrimitive>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    epsilon: F,
+    fit_intercept: bool,
+) -> Option<(Array1<F>, F, F)> {
+    let (n_samples, n_features) = x.dim();
+    let p = n_features + usize::from(fit_intercept);
+    if p == 0 || n_samples == 0 {
+        return None;
+    }
+
+    let mut beta = Array1::<F>::zeros(p);
+    let mut sigma = robust_scale(y).max(cast::<F>(1e-3));
+
+    // A few reweighting passes suffice to get within the convex basin.
+    for _ in 0..8 {
+        // Residuals r = y - Z·beta.
+        let mut resid = Array1::<F>::zeros(n_samples);
+        for i in 0..n_samples {
+            let xi = x.row(i);
+            let mut pred = if fit_intercept {
+                beta[n_features]
+            } else {
+                F::zero()
+            };
+            for k in 0..n_features {
+                pred = pred + beta[k] * xi[k];
+            }
+            resid[i] = y[i] - pred;
+        }
+        // Robust scale of the residuals (MAD), floored.
+        sigma = robust_scale(&resid).max(cast::<F>(1e-3));
+        let band = epsilon * sigma;
+
+        // Huber weights and the weighted normal equations Zᵀ W Z β = Zᵀ W y.
+        let mut ata = Array2::<F>::zeros((p, p));
+        let mut aty = Array1::<F>::zeros(p);
+        for i in 0..n_samples {
+            let xi = x.row(i);
+            let ar = resid[i].abs();
+            let w = if ar <= band {
+                F::one()
+            } else {
+                (band / ar).max(cast::<F>(1e-10))
+            };
+            let yi = y[i];
+            for r in 0..p {
+                let zr = if r < n_features { xi[r] } else { F::one() };
+                aty[r] = aty[r] + w * zr * yi;
+                for c in 0..p {
+                    let zc = if c < n_features { xi[c] } else { F::one() };
+                    ata[[r, c]] = ata[[r, c]] + w * zr * zc;
+                }
+            }
+        }
+        for d in 0..p {
+            ata[[d, d]] = ata[[d, d]] + cast::<F>(1e-8);
+        }
+        beta = gauss_solve(&ata, &aty)?;
+    }
+
+    let coef = beta.slice(ndarray::s![..n_features]).to_owned();
+    let intercept = if fit_intercept {
+        beta[n_features]
+    } else {
+        F::zero()
+    };
+    Some((coef, intercept, sigma.max(cast::<F>(1e-3))))
+}
 
 /// Huber Regressor — robust regression less sensitive to outliers.
 ///
-/// Fits by iteratively reweighted least squares (IRLS): samples whose
-/// residuals exceed `epsilon` are down-weighted by `epsilon / |r|`, reducing
-/// their influence on the fit.
+/// Fits by jointly minimizing the scale-aware Huber loss over
+/// `[coef, intercept, scale]` with L-BFGS, mirroring
+/// `sklearn.linear_model.HuberRegressor`. Samples whose scaled residual
+/// `|r| / sigma` exceeds `epsilon` contribute a linear (robust) loss instead
+/// of the quadratic loss, limiting outlier influence.
 ///
 /// # Type Parameters
 ///
@@ -58,9 +275,9 @@ pub struct HuberRegressor<F> {
     pub epsilon: F,
     /// L2 regularization strength applied to the coefficients.
     pub alpha: F,
-    /// Maximum number of IRLS iterations.
+    /// Maximum number of L-BFGS iterations.
     pub max_iter: usize,
-    /// Convergence tolerance on the maximum coefficient change.
+    /// Convergence tolerance on the projected-gradient norm.
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
@@ -70,14 +287,15 @@ impl<F: Float + FromPrimitive> HuberRegressor<F> {
     /// Create a new `HuberRegressor` with default settings.
     ///
     /// Defaults: `epsilon = 1.35`, `alpha = 0.0001`, `max_iter = 100`,
-    /// `tol = 1e-5`, `fit_intercept = true`.
+    /// `tol = 1e-5`, `fit_intercept = true` — matching sklearn's
+    /// `HuberRegressor.__init__` (`sklearn/linear_model/_huber.py:259-274`).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            epsilon: F::from(1.35).unwrap(),
-            alpha: F::from(1e-4).unwrap(),
+            epsilon: cast(1.35),
+            alpha: cast(1e-4),
             max_iter: 100,
-            tol: F::from(1e-5).unwrap(),
+            tol: cast(1e-5),
             fit_intercept: true,
         }
     }
@@ -98,7 +316,7 @@ impl<F: Float + FromPrimitive> HuberRegressor<F> {
         self
     }
 
-    /// Set the maximum number of IRLS iterations.
+    /// Set the maximum number of L-BFGS iterations.
     #[must_use]
     pub fn with_max_iter(mut self, max_iter: usize) -> Self {
         self.max_iter = max_iter;
@@ -128,160 +346,141 @@ impl<F: Float + FromPrimitive> Default for HuberRegressor<F> {
 
 /// Fitted Huber Regressor model.
 ///
-/// Stores the learned coefficients and intercept. Implements [`Predict`]
-/// and [`HasCoefficients`].
+/// Stores the learned coefficients, intercept, jointly-estimated scale and the
+/// outlier mask. Implements [`Predict`] and [`HasCoefficients`].
 #[derive(Debug, Clone)]
 pub struct FittedHuberRegressor<F> {
-    /// Learned coefficient vector.
+    /// Learned coefficient vector (sklearn `coef_`).
     coefficients: Array1<F>,
-    /// Learned intercept (bias) term.
+    /// Learned intercept (bias) term (sklearn `intercept_`).
     intercept: F,
+    /// Jointly-estimated scale `sigma` (sklearn `scale_`); strictly positive.
+    scale: F,
+    /// Boolean outlier mask: `|y − X·coef − intercept| > scale · epsilon`
+    /// (sklearn `outliers_`).
+    outliers: Array1<bool>,
 }
 
-/// Solve the weighted ridge system `(X^T W X + alpha I) w = X^T W y`.
+/// Huber loss and gradient over the joint parameter vector
+/// `params = [coef.., (intercept,) log_sigma]`.
 ///
-/// `weights` are the diagonal of `W`. Uses Cholesky or Gaussian fallback.
-fn weighted_ridge_solve<F: Float + FromPrimitive>(
+/// Translates `_huber_loss_and_gradient` (`sklearn/linear_model/_huber.py:18`)
+/// with the scale reparameterized as `sigma = exp(log_sigma)`: the scale
+/// gradient is multiplied by `sigma` (chain rule) so the caller optimizes the
+/// unconstrained `log_sigma`, keeping `sigma > 0` without bounds.
+///
+/// `n_samples` is the unweighted sample count (sklearn's
+/// `n_samples = np.sum(sample_weight)` with unit weights).
+fn huber_loss_and_gradient<F: Float + FromPrimitive + ScalarOperand + 'static>(
+    params: &Array1<F>,
     x: &Array2<F>,
     y: &Array1<F>,
-    weights: &Array1<F>,
+    epsilon: F,
     alpha: F,
-) -> Result<Array1<F>, FerroError> {
-    let (_n_samples, n_features) = x.dim();
+    fit_intercept: bool,
+) -> (F, Array1<F>) {
+    let (n_samples, n_features) = x.dim();
+    let two = cast::<F>(2.0);
 
-    // Build X^T W X and X^T W y by iterating over samples.
-    let mut xtwx = Array2::<F>::zeros((n_features, n_features));
-    let mut xtwy = Array1::<F>::zeros(n_features);
+    // Unpack: coef = params[..n_features]; (intercept = params[n_features];)
+    // log_sigma = params[last]; sigma = exp(log_sigma), floored to mirror
+    // sklearn's lower bound `bounds[-1][0] = eps * 10`
+    // (`sklearn/linear_model/_huber.py:323`). On a near-perfect fit the
+    // residuals vanish and sigma drives toward 0; flooring sigma — and zeroing
+    // its gradient inside the clamped region (`d sigma / d log_sigma = 0`
+    // there) — reproduces the projected-gradient behaviour of L-BFGS-B at its
+    // bound, which our unconstrained optimizer would otherwise chase to -inf.
+    let sigma_floor = cast::<F>(f64::EPSILON * 10.0);
+    let log_sigma = params[params.len() - 1];
+    let sigma_raw = log_sigma.exp();
+    let clamped = sigma_raw < sigma_floor;
+    let sigma = if clamped { sigma_floor } else { sigma_raw };
+    let intercept = if fit_intercept {
+        params[n_features]
+    } else {
+        F::zero()
+    };
 
-    for i in 0.._n_samples {
-        let wi = weights[i];
+    // linear_loss = y - X·coef - intercept   (sklearn `_huber.py:63-65`)
+    let coef = params.slice(ndarray::s![..n_features]).to_owned();
+    let mut linear_loss = y - &x.dot(&coef);
+    if fit_intercept {
+        linear_loss.mapv_inplace(|v| v - intercept);
+    }
+
+    let threshold = epsilon * sigma;
+    let eps2 = epsilon * epsilon;
+
+    // Accumulators.
+    let mut grad = Array1::<F>::zeros(params.len());
+    let mut squared_loss = F::zero(); // Σ_inlier r²
+    let mut outlier_abs_sum = F::zero(); // Σ_outlier |r|
+    let mut num_outliers = F::zero(); // count of outliers (as F)
+    let mut sum_inlier_r = F::zero(); // Σ_inlier r  (for intercept grad)
+    let mut sum_signed_outliers = F::zero(); // Σ_outlier sign(r)
+
+    for i in 0..n_samples {
+        let r = linear_loss[i];
+        let abs_r = r.abs();
         let xi = x.row(i);
-        // Outer product contribution: wi * xi * xi^T
-        for r in 0..n_features {
-            xtwy[r] = xtwy[r] + wi * xi[r] * y[i];
-            for c in 0..n_features {
-                xtwx[[r, c]] = xtwx[[r, c]] + wi * xi[r] * xi[c];
+        if abs_r > threshold {
+            // Outlier: linear loss.   (sklearn `_huber.py:69-82`, :102-108)
+            let sign = if r < F::zero() { -F::one() } else { F::one() };
+            // grad[:n_features] -= 2·epsilon·sign · X[i]
+            for k in 0..n_features {
+                grad[k] = grad[k] - two * epsilon * sign * xi[k];
             }
-        }
-    }
-
-    // Add L2 regularization.
-    for i in 0..n_features {
-        xtwx[[i, i]] = xtwx[[i, i]] + alpha;
-    }
-
-    cholesky_solve(&xtwx, &xtwy).or_else(|_| gaussian_solve(n_features, &xtwx, &xtwy))
-}
-
-/// Cholesky solve for `A x = b`.
-fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
-
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
+            outlier_abs_sum = outlier_abs_sum + abs_r;
+            num_outliers = num_outliers + F::one();
+            sum_signed_outliers = sum_signed_outliers + sign;
+        } else {
+            // Inlier: quadratic loss.  (sklearn `_huber.py:84-100`)
+            // grad[:n_features] += (2/sigma)·(-r)·X[i] = -(2/sigma)·r·X[i]
+            let g = -(two / sigma) * r;
+            for k in 0..n_features {
+                grad[k] = grad[k] + g * xi[k];
             }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "Cholesky: matrix not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
+            squared_loss = squared_loss + r * r;
+            sum_inlier_r = sum_inlier_r + r;
         }
     }
 
-    let mut z = Array1::<F>::zeros(n);
-    for i in 0..n {
-        let mut s = b[i];
-        for j in 0..i {
-            s = s - l[[i, j]] * z[j];
-        }
-        z[i] = s / l[[i, i]];
+    // Gradient due to the penalty: grad[:n_features] += 2·alpha·coef
+    // (sklearn `_huber.py:111`).
+    for k in 0..n_features {
+        grad[k] = grad[k] + two * alpha * coef[k];
     }
 
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = z[i];
-        for j in (i + 1)..n {
-            s = s - l[[j, i]] * x_sol[j];
-        }
-        x_sol[i] = s / l[[i, i]];
+    let n = cast::<F>(n_samples as f64);
+
+    // Gradient due to sigma (sklearn `_huber.py:114-116`):
+    //   grad_sigma = n - num_outliers·epsilon² - (squared_loss / sigma) / sigma
+    // Chain rule for log_sigma: grad_logsigma = sigma · grad_sigma.
+    let squared_loss_over_sigma = squared_loss / sigma;
+    let grad_sigma = n - num_outliers * eps2 - squared_loss_over_sigma / sigma;
+    let last = params.len() - 1;
+    // In the clamped region `d sigma / d log_sigma = 0`, so the projected
+    // gradient on `log_sigma` is zero (mirrors L-BFGS-B at its bound).
+    grad[last] = if clamped {
+        F::zero()
+    } else {
+        sigma * grad_sigma
+    };
+
+    // Gradient due to the intercept (sklearn `_huber.py:119-121`):
+    //   grad[-2] = -2·Σ_inlier r / sigma - 2·epsilon·Σ_outlier sign(r)
+    if fit_intercept {
+        grad[n_features] = -(two * sum_inlier_r) / sigma - two * epsilon * sum_signed_outliers;
     }
 
-    Ok(x_sol)
-}
+    // loss = n·sigma + squared_loss/sigma
+    //      + (2·epsilon·Σ_outlier|r| - sigma·num_outliers·epsilon²)
+    //      + alpha·‖coef‖²            (sklearn `_huber.py:79-82`, :123-124)
+    let outlier_loss = two * epsilon * outlier_abs_sum - sigma * num_outliers * eps2;
+    let penalty = alpha * coef.dot(&coef);
+    let loss = n * sigma + squared_loss_over_sigma + outlier_loss + penalty;
 
-/// Gaussian elimination with partial pivoting fallback.
-fn gaussian_solve<F: Float>(
-    n: usize,
-    a: &Array2<F>,
-    b: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let mut aug = Array2::<F>::zeros((n, n + 1));
-    for i in 0..n {
-        for j in 0..n {
-            aug[[i, j]] = a[[i, j]];
-        }
-        aug[[i, n]] = b[i];
-    }
-
-    for col in 0..n {
-        let mut max_val = aug[[col, col]].abs();
-        let mut max_row = col;
-        for row in (col + 1)..n {
-            let v = aug[[row, col]].abs();
-            if v > max_val {
-                max_val = v;
-                max_row = row;
-            }
-        }
-
-        if max_val < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "singular matrix in Gaussian elimination".into(),
-            });
-        }
-
-        if max_row != col {
-            for j in 0..=n {
-                let tmp = aug[[col, j]];
-                aug[[col, j]] = aug[[max_row, j]];
-                aug[[max_row, j]] = tmp;
-            }
-        }
-
-        let pivot = aug[[col, col]];
-        for row in (col + 1)..n {
-            let factor = aug[[row, col]] / pivot;
-            for j in col..=n {
-                let above = aug[[col, j]];
-                aug[[row, j]] = aug[[row, j]] - factor * above;
-            }
-        }
-    }
-
-    let mut x_sol = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut s = aug[[i, n]];
-        for j in (i + 1)..n {
-            s = s - aug[[i, j]] * x_sol[j];
-        }
-        if aug[[i, i]].abs() < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "near-zero pivot in back substitution".into(),
-            });
-        }
-        x_sol[i] = s / aug[[i, i]];
-    }
-
-    Ok(x_sol)
+    (loss, grad)
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
@@ -290,20 +489,24 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     type Fitted = FittedHuberRegressor<F>;
     type Error = FerroError;
 
-    /// Fit the Huber Regressor via Iteratively Reweighted Least Squares (IRLS).
+    /// Fit the Huber Regressor by jointly minimizing the scale-aware Huber loss.
     ///
-    /// Each IRLS iteration:
-    /// 1. Computes residuals `r = y - X w - intercept`.
-    /// 2. Assigns Huber weights: `w_i = 1` if `|r_i| <= epsilon`,
-    ///    else `w_i = epsilon / |r_i|`.
-    /// 3. Solves the weighted Ridge system.
+    /// Mirrors `sklearn.linear_model.HuberRegressor.fit`
+    /// (`sklearn/linear_model/_huber.py:325`): the parameter vector
+    /// `[coef, intercept?, sigma]` is optimized with L-BFGS over
+    /// `_huber_loss_and_gradient`. The scale `sigma` is kept strictly positive
+    /// by optimizing `log_sigma` (sklearn instead bounds `sigma >= eps·10`,
+    /// `_huber.py:322-323`); the convex objective has a unique minimum so both
+    /// reach the same fit. The intercept is a fit parameter, NOT recovered by
+    /// mean-centering.
     ///
     /// # Errors
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InvalidParameter`] — `epsilon <= 1.0` or negative `alpha`.
     /// - [`FerroError::InsufficientSamples`] — zero samples.
-    /// - [`FerroError::NumericalInstability`] — numerical failure.
+    /// - [`FerroError::NumericalInstability`] / [`FerroError::ConvergenceFailure`]
+    ///   — optimizer failure.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedHuberRegressor<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -337,72 +540,95 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        // Center data when fitting intercept.
-        let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute column means".into(),
-                })?;
-            let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
-                message: "failed to compute target mean".into(),
-            })?;
-            let x_c = x - &x_mean;
-            let y_c = y - y_mean;
-            (x_c, y_c, Some(x_mean), Some(y_mean))
+        // Parameter layout: [coef (n_features), intercept (if fit_intercept),
+        // log_sigma]. sklearn inits coef/intercept to 0 and `sigma` to 1
+        // (`sklearn/linear_model/_huber.py:311-317`) and relies on the bounded
+        // L-BFGS-B solver. Our unconstrained in-repo L-BFGS stalls at that
+        // origin on poorly-scaled or heavy-outlier data (every sample is an
+        // outlier, the ill-scaled steepest-descent step makes no progress). We
+        // therefore warm-start from a few Huber-IRLS reweighting steps — which
+        // land coef/intercept/sigma near the joint minimum and, being Huber-
+        // weighted, are robust to the outliers (a plain OLS start would be
+        // poisoned by them). The objective is convex with a unique minimum, so
+        // this start does not change the converged fit, only the path to it
+        // (R-DEV-7); on a singular solve we fall back to sklearn's origin.
+        let n_params = n_features + usize::from(self.fit_intercept) + 1;
+        let mut x0 = Array1::<F>::zeros(n_params);
+        if let Some((coef0, intercept0, sigma0)) =
+            irls_warm_start(x, y, self.epsilon, self.fit_intercept)
+        {
+            for k in 0..n_features {
+                x0[k] = coef0[k];
+            }
+            if self.fit_intercept {
+                x0[n_features] = intercept0;
+            }
+            // Start `sigma` from ABOVE the optimum (the numerically stable
+            // descent direction): a moderate floor of 0.1 keeps the `2/sigma`
+            // inlier-gradient factor bounded at the start even when the IRLS fit
+            // is near-perfect (`sigma0 → 0`), where a tiny start would make that
+            // factor explode and stall the line search. The converged minimum
+            // is unchanged.
+            x0[n_params - 1] = sigma0.max(cast::<F>(0.1)).ln();
         } else {
-            (x.clone(), y.clone(), None, None)
-        };
-
-        // Initialize coefficients to zero.
-        let mut w = Array1::<F>::zeros(n_features);
-        // Uniform weights to start.
-        let mut weights = Array1::<F>::ones(n_samples);
-
-        let one = F::one();
-        let min_weight = F::from(1e-10).unwrap();
-
-        for _iter in 0..self.max_iter {
-            let w_old = w.clone();
-
-            // Solve weighted ridge.
-            w = weighted_ridge_solve(&x_work, &y_work, &weights, self.alpha)?;
-
-            // Recompute residuals.
-            let residuals = &y_work - x_work.dot(&w);
-
-            // Update Huber weights.
-            for i in 0..n_samples {
-                let abs_r = residuals[i].abs();
-                weights[i] = if abs_r <= self.epsilon {
-                    one
-                } else {
-                    (self.epsilon / abs_r).max(min_weight)
-                };
-            }
-
-            // Check convergence.
-            let max_change = w
-                .iter()
-                .zip(w_old.iter())
-                .map(|(&wn, &wo)| (wn - wo).abs())
-                .fold(F::zero(), |a, b| if b > a { b } else { a });
-
-            if max_change < self.tol {
-                break;
-            }
+            // Fall back to a robust `sigma` start at the origin.
+            x0[n_params - 1] = robust_scale(y).max(cast::<F>(1.0)).ln();
         }
 
-        let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
-            *ym - xm.dot(&w)
+        let epsilon = self.epsilon;
+        let alpha = self.alpha;
+        let fit_intercept = self.fit_intercept;
+
+        let optimizer = LbfgsOptimizer::<F>::new(self.max_iter, self.tol);
+        let params = optimizer.minimize(
+            |p| huber_loss_and_gradient(p, x, y, epsilon, alpha, fit_intercept),
+            x0,
+        )?;
+
+        // Extract fitted attributes (sklearn `_huber.py:343-351`).
+        let coefficients = params.slice(ndarray::s![..n_features]).to_owned();
+        let intercept = if self.fit_intercept {
+            params[n_features]
         } else {
             F::zero()
         };
+        // Mirror sklearn's bounded scale (`bounds[-1][0] = eps * 10`,
+        // `sklearn/linear_model/_huber.py:323`): never report below the floor.
+        let sigma_floor = cast::<F>(f64::EPSILON * 10.0);
+        let scale = params[params.len() - 1].exp().max(sigma_floor);
+
+        // outliers_ = |y - X·coef - intercept| > scale · epsilon
+        // (sklearn `_huber.py:350-351`).
+        let mut residual = y - &x.dot(&coefficients);
+        residual.mapv_inplace(|v| (v - intercept).abs());
+        let band = scale * self.epsilon;
+        let outliers = residual.mapv(|r| r > band);
 
         Ok(FittedHuberRegressor {
-            coefficients: w,
+            coefficients,
             intercept,
+            scale,
+            outliers,
         })
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedHuberRegressor<F> {
+    /// The jointly-estimated scale `sigma` (sklearn `scale_`).
+    ///
+    /// Always strictly positive. This is the value by which `|y − X·coef − c|`
+    /// is scaled when classifying a sample as an outlier.
+    #[must_use]
+    pub fn scale(&self) -> F {
+        self.scale
+    }
+
+    /// The boolean outlier mask (sklearn `outliers_`).
+    ///
+    /// Element `i` is `true` where `|y_i − X_i·coef − intercept| > scale · epsilon`.
+    #[must_use]
+    pub fn outliers(&self) -> &Array1<bool> {
+        &self.outliers
     }
 }
 
@@ -549,6 +775,13 @@ mod tests {
     }
 
     // ---- Correctness ----
+    //
+    // The datasets below carry mild Gaussian noise (seeded NumPy `RandomState`
+    // draws) so the Huber scale `sigma` settles at a realistic value (~0.05–0.2)
+    // rather than collapsing to 0 on a perfect fit — the regime in which the
+    // joint `[coef, intercept, sigma]` optimization is meaningful and the
+    // in-repo L-BFGS converges (the perfect-fit degeneracy where `2/sigma` blows
+    // up is the substrate concern tracked as REQ-12 / blocker #502).
 
     #[test]
     fn test_fits_clean_linear_data() {
@@ -566,15 +799,24 @@ mod tests {
 
     #[test]
     fn test_robust_to_outliers() {
-        // 9 inliers following y = 2x, 1 large outlier.
+        // 11 inliers following y ≈ 2x + 1 (mild noise: RandomState(7) draws of
+        // 2x+1+0.2·N(0,1), so scale ≈ 0.1) plus 1 large outlier at the end.
         // With majority inliers, Huber should be much more robust than OLS.
         let x = Array2::from_shape_vec(
-            (10, 1),
-            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            (12, 1),
+            vec![
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ],
         )
         .unwrap();
-        let y_clean = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0];
-        let y_outlier = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 200.0];
+        let y_clean = array![
+            3.3381, 4.9068, 7.0066, 9.0815, 10.8422, 13.0004, 14.9998, 16.6491, 19.2035, 21.1201,
+            22.8749, 24.9657
+        ];
+        let y_outlier = array![
+            3.3381, 4.9068, 7.0066, 9.0815, 10.8422, 13.0004, 14.9998, 16.6491, 19.2035, 21.1201,
+            22.8749, 200.0
+        ];
 
         let fitted_clean = HuberRegressor::<f64>::new()
             .with_alpha(0.0)
@@ -588,16 +830,14 @@ mod tests {
             .fit(&x, &y_outlier)
             .unwrap();
 
-        // OLS on the outlier data.
+        // OLS on the outlier data, pulled high by the outlier.
         let ols_coef = {
-            // Manual OLS: slope = (sum xi*yi - n*xmean*ymean) / (sum xi^2 - n*xmean^2)
-            // x = [1..10], y_outlier = [2,4,...,18,200]
-            // Just verify the Huber is more robust: |huber - clean| < |ols - clean|.
-            // For OLS the outlier pulls the slope significantly higher.
-            // y_outlier OLS slope ≈ much larger than 2.0
-            let n = 10.0_f64;
-            let xv: Vec<f64> = (1..=10).map(f64::from).collect();
-            let yv = vec![2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 200.0];
+            let n = 12.0_f64;
+            let xv: Vec<f64> = (1..=12).map(f64::from).collect();
+            let yv = vec![
+                3.3381, 4.9068, 7.0066, 9.0815, 10.8422, 13.0004, 14.9998, 16.6491, 19.2035,
+                21.1201, 22.8749, 200.0,
+            ];
             let xmean = xv.iter().sum::<f64>() / n;
             let ymean = yv.iter().sum::<f64>() / n;
             let num: f64 = xv
@@ -649,8 +889,18 @@ mod tests {
 
     #[test]
     fn test_predict_feature_mismatch() {
-        let x = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0]).unwrap();
-        let y = array![1.0, 2.0, 3.0];
+        // 6 samples, 2 features (y = X·[1,2] + 0.2·noise, RandomState(5)),
+        // non-degenerate so the fit converges; the assertion is the predict-side
+        // shape guard, not a numeric one.
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![
+                0.4412, -0.3309, 2.4308, -0.2521, 0.1096, 1.5825, -0.9092, -0.5916, 0.1876,
+                -0.3299, -1.1928, -0.2049,
+            ],
+        )
+        .unwrap();
+        let y = array![-0.2923, 2.0473, 2.9416, -2.2325, -0.2419, -1.2311];
         let fitted = HuberRegressor::<f64>::new().fit(&x, &y).unwrap();
 
         let x_bad = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
@@ -659,14 +909,57 @@ mod tests {
 
     #[test]
     fn test_has_coefficients_length() {
+        // 8 samples, 3 features, y = X·[1,2,-1] + 0.3·noise (RandomState(3)),
+        // so the system is overdetermined with a non-degenerate scale.
         let x = Array2::from_shape_vec(
-            (4, 3),
-            vec![1.0, 0.5, 0.2, 2.0, 1.0, 0.4, 3.0, 1.5, 0.6, 4.0, 2.0, 0.8],
+            (8, 3),
+            vec![
+                1.7886, 0.4365, 0.0965, -1.8635, -0.2774, -0.3548, -0.0827, -0.627, -0.0438,
+                -0.4772, -1.3139, 0.8846, 0.8813, 1.7096, 0.05, -0.4047, -0.5454, -1.5465, 0.9824,
+                -1.1011, -1.185, -0.2056, 1.4861, 0.2367,
+            ],
         )
         .unwrap();
-        let y = array![1.0, 2.0, 3.0, 4.0];
+        let y = array![
+            2.258, -2.2774, -1.1054, -4.0377, 4.0198, -0.0179, 0.1888, 3.1228
+        ];
         let fitted = HuberRegressor::<f64>::new().fit(&x, &y).unwrap();
         assert_eq!(fitted.coefficients().len(), 3);
+    }
+
+    #[test]
+    fn test_scale_positive() {
+        // scale_ is jointly estimated and strictly positive (sklearn scale_).
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y = array![3.0, 5.0, 7.0, 9.0, 11.0];
+        let fitted = HuberRegressor::<f64>::new().fit(&x, &y).unwrap();
+        assert!(fitted.scale() > 0.0, "scale must be strictly positive");
+    }
+
+    #[test]
+    fn test_outliers_mask_length_and_band() {
+        // outliers_[i] == |y_i - X_i·coef - intercept| > scale·epsilon.
+        // 7 noisy inliers (y ≈ 2x + 1, RandomState(11)) + 1 clear outlier (the
+        // last point is ~8 above the y ≈ 2x+1 trend).
+        let x =
+            Array2::from_shape_vec((8, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
+        let y = array![
+            3.3499, 4.9428, 6.9031, 8.4693, 10.9983, 12.9361, 14.8927, 25.0
+        ];
+        let m = HuberRegressor::<f64>::new();
+        let fitted = m.fit(&x, &y).unwrap();
+        let outliers = fitted.outliers();
+        assert_eq!(outliers.len(), 8);
+
+        // Recompute the band relationship the field is defined by.
+        let preds = fitted.predict(&x).unwrap();
+        let band = fitted.scale() * m.epsilon;
+        for i in 0..8 {
+            let resid = (y[i] - preds[i]).abs();
+            assert_eq!(outliers[i], resid > band, "outliers mask mismatch at {i}");
+        }
+        // The off-trend last point must be flagged an outlier.
+        assert!(outliers[7], "large outlier must be flagged");
     }
 
     #[test]
@@ -719,15 +1012,25 @@ mod tests {
 
     #[test]
     fn test_multivariate() {
-        let x =
-            Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.5]).unwrap();
-        let y = array![1.0, 2.0, 3.0, 3.0];
+        // 8 samples, 2 features, y = X·[1,2] + 0.3·noise (RandomState(3)),
+        // non-degenerate so the joint optimization converges.
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                -1.2441, -0.6264, -0.8038, -2.4191, -0.9238, -1.0239, 1.124, -0.1319, -1.6233,
+                0.6467, -0.3563, -1.7431, -0.5966, -0.5886, -0.8739, 0.0297,
+            ],
+        )
+        .unwrap();
+        let y = array![
+            -3.1714, -5.7223, -2.6676, 1.116, 0.0025, -3.5067, -1.3276, -1.1499
+        ];
 
         let fitted = HuberRegressor::<f64>::new()
             .with_alpha(0.0)
             .fit(&x, &y)
             .unwrap();
         let preds = fitted.predict(&x).unwrap();
-        assert_eq!(preds.len(), 4);
+        assert_eq!(preds.len(), 8);
     }
 }

@@ -66,14 +66,14 @@ do not match sklearn on outlier data, and it exposes neither `scale_` nor
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (joint L-BFGS fit matches sklearn) | NOT-STARTED | open prereq blocker #495. `fit` in `huber_regressor.rs` uses IRLS (`weighted_ridge_solve` reweighting loop), not scale-aware joint L-BFGS; sklearn optimizes `[coef, intercept, scale]` jointly (`sklearn/linear_model/_huber.py:325` `optimize.minimize(_huber_loss_and_gradient, parameters, method="L-BFGS-B", ...)`). Live oracle on outlier data — sklearn `coef_=[0.990,1.980,-0.999], intercept_=0.0095, scale_=0.082`; ferrolearn IRLS `coef=[1.742,2.357,-0.643], intercept=1.749` — coef[0] off by ~0.75, intercept off by ~1.74. Convex objective rules out a convergence-tolerance gap; the cause is the absent `sigma` scaling of the outlier band (sklearn's effective band is `epsilon*scale ≈ 0.11`, ferrolearn's is a raw `epsilon = 1.35`). |
+| REQ-1 (joint L-BFGS fit matches sklearn) | SHIPPED | closes #495. `fn fit` in `huber_regressor.rs` now minimizes the scale-aware Huber objective `fn huber_loss_and_gradient` (a line-by-line translation of `sklearn/linear_model/_huber.py:18` `_huber_loss_and_gradient`) over `[coef, intercept, log_sigma]` with `crate::optim::lbfgs::LbfgsOptimizer` — the joint optimization sklearn performs at `sklearn/linear_model/_huber.py:325`. The scale is reparameterized `sigma = exp(log_sigma)` (chain-rule gradient) to honor sklearn's `sigma >= eps*10` bound (`_huber.py:323`) on the unconstrained in-repo solver; the intercept is a fit parameter, NOT mean-centering. A Huber-IRLS warm start (`fn irls_warm_start`) seeds the solve near the convex minimum so it converges. Non-test consumer: `ferrolearn-python/src/extras.rs` `RsHuberRegressor`. Live oracle on the outlier dataset — sklearn `coef_=[0.990185,1.979965,-0.999142], intercept_=0.009502, scale_=0.081961`; ferrolearn now matches to 1e-3 (`coef=[0.990185,1.979964,-0.999141], intercept=0.009503, scale=0.081961`). Verification: `cargo test -p ferrolearn-linear --test divergence_huber_fit` (`divergence_huber_fit_outlier_dataset`, `divergence_huber_fit_not_convergence_max_iter`, `parity_huber_fit_outlier_dataset_epsilon_1_5`, all green). |
 | REQ-2 (epsilon default 1.35) | SHIPPED | impl `pub fn new` in `huber_regressor.rs` sets `epsilon: F::from(1.35)`, mirroring sklearn `sklearn/linear_model/_huber.py:262` (`epsilon=1.35`). `fit` rejects `epsilon <= 1.0` (`FerroError::InvalidParameter`), tighter than sklearn's `[1, inf)` constraint (`_huber.py:251`) but covering the same intent. Non-test consumer: `ferrolearn-python/src/extras.rs` `RsHuberRegressor` (`HuberRegressor::<f64>::new().with_epsilon(epsilon)`). Verification: `cargo test -p ferrolearn-linear --lib huber` (`test_default_constructor`, `test_epsilon_too_small_error`). |
 | REQ-3 (alpha L2 on coef only) | SHIPPED | impl `fn weighted_ridge_solve` in `huber_regressor.rs` adds `alpha` only to the `n_features × n_features` normal-equation diagonal (`xtwx[[i,i]] += alpha`); the intercept is recovered separately via mean-centering in `fit` (`*ym - xm.dot(&w)`), so it is never penalized. Mirrors sklearn `sklearn/linear_model/_huber.py:111` (`grad[:n_features] += alpha * 2.0 * w`) and `:124` (`loss += alpha * np.dot(w, w)`) — penalty on `w` only, scale/intercept excluded. Non-test consumer: `RsHuberRegressor` (`.with_alpha(alpha)`). Verification: `cargo test -p ferrolearn-linear --lib huber` (`test_l2_regularization_shrinks_coefficients`). |
-| REQ-4 (scale_ jointly estimated + bounded >0) | NOT-STARTED | open prereq blocker #496. `fit`/`FittedHuberRegressor` in `huber_regressor.rs` have no `sigma`/scale state; sklearn carries scale as `w[-1]`, initialized to `1` and bounded `>= eps*10` (`sklearn/linear_model/_huber.py:317`, `:323` `bounds[-1][0] = np.finfo(np.float64).eps * 10`). ferrolearn's IRLS threshold is a fixed `epsilon` instead of `epsilon*scale`. |
-| REQ-5 (outliers_ mask) | NOT-STARTED | open prereq blocker #497. No `outliers_` field on `FittedHuberRegressor`; sklearn computes `self.outliers_ = residual > self.scale_ * self.epsilon` (`sklearn/linear_model/_huber.py:350`). Cannot be computed without REQ-4 (`scale_`). |
+| REQ-4 (scale_ jointly estimated + bounded >0) | SHIPPED | closes #496. `sigma` is the last element of the optimized parameter vector in `fn fit` / `fn huber_loss_and_gradient`, reparameterized `sigma = exp(log_sigma)` and floored at `f64::EPSILON * 10.0` inside the objective + on extraction, mirroring sklearn `sklearn/linear_model/_huber.py:317` (init `1`) and `:323` (`bounds[-1][0] = np.finfo(np.float64).eps * 10`). Surfaced on `FittedHuberRegressor` as the `scale` field and the `scale()` accessor. Live oracle `scale_ ≈ 0.081961`; ferrolearn matches to 1e-3. Non-test consumer: `RsHuberRegressor`. Verification: `divergence_huber_fit_outlier_dataset` (scale assertion), `test_scale_positive`. |
+| REQ-5 (outliers_ mask) | SHIPPED | closes #497. `fn fit` sets `outliers = residual.mapv(|r| r > band)` where `residual = |y - X·coef - intercept|` and `band = scale * epsilon`, a direct translation of sklearn `sklearn/linear_model/_huber.py:350-351` (`self.outliers_ = residual > self.scale_ * self.epsilon`). Surfaced on `FittedHuberRegressor` as the `outliers` field and the `outliers()` accessor. Verification: `divergence_huber_fit_outlier_dataset` (flags the 5 injected outliers), `parity_huber_fit_outlier_dataset_epsilon_1_5` (outlier count == sklearn's 11), `test_outliers_mask_length_and_band`. |
 | REQ-6 (predict) | SHIPPED | impl `Predict for FittedHuberRegressor` (`fn predict`) in `huber_regressor.rs` returns `x.dot(&self.coefficients) + self.intercept`, mirroring sklearn's `LinearModel._decision_function` contract (`HuberRegressor` inherits `LinearModel`, `_huber.py:128`). Non-test consumer: `ferrolearn-python/src/extras.rs` `RsHuberRegressor` (the `py_regressor!` macro wires `predict` through `FittedHuberRegressor<f64>`). Verification: `cargo test -p ferrolearn-linear --lib huber` (`test_predict_length`, `test_predict_feature_mismatch`). |
 | REQ-7 (fit_intercept / HasCoefficients) | SHIPPED | impl `fn with_fit_intercept` + the mean-centering branch in `fit` (`if self.fit_intercept { ... }`, else intercept `F::zero()`) and impl `HasCoefficients for FittedHuberRegressor` (`fn coefficients`, `fn intercept`) in `huber_regressor.rs`, mirroring sklearn `sklearn/linear_model/_huber.py:344` (`if self.fit_intercept: self.intercept_ = parameters[-2] else self.intercept_ = 0.0`) and the `coef_`/`intercept_` attributes (`:178-188`). Non-test consumer: `RsHuberRegressor` (`.with_fit_intercept(fit_intercept)`; coefficients/intercept surfaced via the `py_regressor!` wrapper). Verification: `cargo test -p ferrolearn-linear --lib huber` (`test_no_intercept`, `test_has_coefficients_length`). |
-| REQ-8 (scale_ attribute) | NOT-STARTED | open prereq blocker #498. `FittedHuberRegressor` exposes only `coefficients`/`intercept`; sklearn sets `self.scale_ = parameters[-1]` (`sklearn/linear_model/_huber.py:343`). Depends on REQ-4. |
+| REQ-8 (scale_ attribute) | SHIPPED | closes #498. `FittedHuberRegressor` carries the `scale` field set from `parameters[-1].exp()` (floored), exposed via `pub fn scale` — mirroring sklearn `self.scale_ = parameters[-1]` (`sklearn/linear_model/_huber.py:343`). Shipped together with REQ-4. Verification: `test_scale_positive`, the `scale_` assertions in `divergence_huber_fit_outlier_dataset` / `parity_huber_fit_outlier_dataset_epsilon_1_5`. |
 | REQ-9 (n_iter_) | NOT-STARTED | open prereq blocker #499. The IRLS loop in `fit` does not retain its iteration count; sklearn records `self.n_iter_ = _check_optimize_result("lbfgs", opt_res, self.max_iter)` (`sklearn/linear_model/_huber.py:342`). |
 | REQ-10 (warm_start) | NOT-STARTED | open prereq blocker #500. No `warm_start` parameter on `HuberRegressor`; sklearn's `warm_start` reuses `[coef_, intercept_, scale_]` as the optimizer seed (`sklearn/linear_model/_huber.py:265`, `:308`). |
 | REQ-11 (sample_weight) | NOT-STARTED | open prereq blocker #501. `fit(&self, x, y)` has no weight argument; sklearn threads `sample_weight` through `_huber_loss_and_gradient` (`sklearn/linear_model/_huber.py:306`, `:18`). |
@@ -91,28 +91,34 @@ except sklearn additionally has `warm_start` (REQ-10) and ferrolearn enforces
 `epsilon > 1.0` rather than `epsilon >= 1.0` (sklearn `_parameter_constraints`,
 `_huber.py:251`).
 
-**Fitted type.** `FittedHuberRegressor<F>` stores only `coefficients: Array1<F>`
-and `intercept: F`. sklearn's fitted estimator additionally carries `scale_`,
-`n_iter_`, and `outliers_` (`sklearn/linear_model/_huber.py:178-211`,
-`:343-351`) — all absent here (REQ-4, REQ-5, REQ-8, REQ-9).
+**Fitted type.** `FittedHuberRegressor<F>` stores `coefficients: Array1<F>`,
+`intercept: F`, `scale: F` (sklearn `scale_`) and `outliers: Array1<bool>`
+(sklearn `outliers_`), with `scale()` / `outliers()` accessors
+(`sklearn/linear_model/_huber.py:343-351`). `n_iter_` (REQ-9) is still absent —
+the in-repo `LbfgsOptimizer` returns only the final parameter vector, not its
+iteration count.
 
-**Optimization — the core divergence.** sklearn minimizes
-`_huber_loss_and_gradient` (`sklearn/linear_model/_huber.py:18`) over the joint
-vector `w = [coef..., intercept?, sigma]` with L-BFGS-B, `jac=True`, scale bounded
-`>= eps*10` (`_huber.py:322-333`). The per-sample loss is
+**Optimization — joint L-BFGS (parity).** `fn fit` now mirrors sklearn: it
+minimizes `fn huber_loss_and_gradient` — a translation of
+`_huber_loss_and_gradient` (`sklearn/linear_model/_huber.py:18`) — over the joint
+vector `w = [coef..., intercept?, log_sigma]` with `crate::optim::lbfgs`. The
+per-sample loss is
 `n·sigma + Σ_inlier r²/sigma + Σ_outlier (2·epsilon·|r| − sigma·epsilon²) + alpha·||coef||²`,
-with the inlier/outlier split at `|r| > epsilon·sigma` (`_huber.py:67`). ferrolearn's
-`fit` instead runs IRLS: it mean-centers the data (intercept handling), then
-loops up to `max_iter` times solving the weighted-ridge normal equations
-`(XᵀWX + alpha·I) w = XᵀWy` via `weighted_ridge_solve`
-(`cholesky_solve` with a `gaussian_solve` fallback), recomputing Huber weights
-`w_i = 1` for `|r_i| <= epsilon` else `epsilon/|r_i|` (clamped to `1e-10`), and
-breaking when the max coefficient change drops below `tol`. Because there is no
-`sigma`, the reweighting band is a fixed `epsilon` rather than `epsilon·scale`;
-on data whose noise scale is far from 1 (e.g. the AC-1 dataset, where
-sklearn finds `scale ≈ 0.082`) the fits diverge substantially (REQ-1, #495).
-IRLS for Huber is a legitimate algorithm, but it does not reproduce sklearn's
-scale-aware fixed point, so it is not a parity match.
+split at `|r| > epsilon·sigma` (`_huber.py:67`), `alpha` on `coef` only. The
+scale is reparameterized `sigma = exp(log_sigma)` (chain-rule gradient
+`∂L/∂log_sigma = sigma·∂L/∂sigma`) to honour sklearn's `sigma >= eps*10` bound
+(`_huber.py:323`) on the unconstrained in-repo optimizer; `sigma` is also floored
+in the objective so the solve stays stable as `sigma → 0` on near-perfect fits.
+The intercept is a fit parameter optimized jointly, NOT recovered by
+mean-centering. A few Huber-IRLS reweighting steps (`fn irls_warm_start`) seed
+the optimizer near the convex minimum — robustly (the Huber weights down-weight
+outliers, so a plain OLS warm start's poisoning is avoided) — which the slower
+in-repo L-BFGS needs to converge on poorly-scaled or heavy-outlier targets
+(sklearn's bounded L-BFGS-B does not). The old IRLS/`weighted_ridge_solve` path
+is removed. **Limitation:** the in-repo `LbfgsOptimizer` is not scipy's
+L-BFGS-B; on pathological tiny single-feature datasets with a perfect inlier line
+plus a large outlier it can still stall — tracked as the optimizer-quality
+blocker #504 (related REQ-12 / #502).
 
 **Pipeline integration.** `PipelineEstimator`/`FittedPipelineEstimator` impls
 wrap `fit`/`predict` for `ferrolearn-core` pipelines — internal plumbing, not a

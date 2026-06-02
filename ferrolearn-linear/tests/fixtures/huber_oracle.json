@@ -374,5 +374,18 @@
   ],
   "intercept": -0.006002274654895726,
   "scale": 0.06206704454748756
+ },
+ "sklearn_outlier_eps15": {
+  "note": "Same X, y_outlier; HuberRegressor(epsilon=1.5). sklearn 1.5.2 live oracle.",
+  "epsilon": 1.5,
+  "coef": [
+   0.9917793510943713,
+   1.9848004437366662,
+   -0.9958669082238799
+  ],
+  "intercept": 0.010648690163249652,
+  "scale": 0.09974979969929194,
+  "n_iter": 14,
+  "outliers_count": 11
  }
 }

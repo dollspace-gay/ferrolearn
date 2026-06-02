@@ -26,6 +26,11 @@ struct Oracle {
     sk_outlier_scale: f64,
     sk_clean_coef: Vec<f64>,
     sk_clean_intercept: f64,
+    sk_eps15_epsilon: f64,
+    sk_eps15_coef: Vec<f64>,
+    sk_eps15_intercept: f64,
+    sk_eps15_scale: f64,
+    sk_eps15_outliers_count: usize,
 }
 
 fn load_oracle() -> Oracle {
@@ -65,6 +70,13 @@ fn load_oracle() -> Oracle {
         sk_outlier_scale: v["sklearn_outlier"]["scale"].as_f64().unwrap(),
         sk_clean_coef: to_vec(&v["sklearn_clean"]["coef"]),
         sk_clean_intercept: v["sklearn_clean"]["intercept"].as_f64().unwrap(),
+        sk_eps15_epsilon: v["sklearn_outlier_eps15"]["epsilon"].as_f64().unwrap(),
+        sk_eps15_coef: to_vec(&v["sklearn_outlier_eps15"]["coef"]),
+        sk_eps15_intercept: v["sklearn_outlier_eps15"]["intercept"].as_f64().unwrap(),
+        sk_eps15_scale: v["sklearn_outlier_eps15"]["scale"].as_f64().unwrap(),
+        sk_eps15_outliers_count: v["sklearn_outlier_eps15"]["outliers_count"]
+            .as_u64()
+            .unwrap() as usize,
     }
 }
 
@@ -81,9 +93,8 @@ fn load_oracle() -> Oracle {
 /// it. Root cause is the absent `scale_` (#496) — the outlier band is a fixed
 /// `epsilon` instead of `epsilon * scale`.
 ///
-/// Tracking: #495
+/// Tracking: #495, #496 (scale_ jointly optimized), #497 (outliers_)
 #[test]
-#[ignore = "divergence: HuberRegressor IRLS fit lacks joint scale, diverges from sklearn L-BFGS on outlier data; tracking #495"]
 fn divergence_huber_fit_outlier_dataset() {
     let o = load_oracle();
 
@@ -108,6 +119,22 @@ fn divergence_huber_fit_outlier_dataset() {
         o.sk_outlier_intercept,
         (intercept - o.sk_outlier_intercept).abs()
     );
+
+    // #496: scale_ is jointly optimized and matches sklearn's scale_.
+    let scale = fitted.scale();
+    assert!(
+        (scale - o.sk_outlier_scale).abs() < 1e-3,
+        "scale_: sklearn={:.6}, ferrolearn={scale:.6} (diff {:.4})",
+        o.sk_outlier_scale,
+        (scale - o.sk_outlier_scale).abs()
+    );
+
+    // #497: outliers_ flags the 5 injected outliers (y[:5] += 20).
+    let outliers = fitted.outliers();
+    assert_eq!(outliers.len(), o.y_outlier.len());
+    for i in 0..5 {
+        assert!(outliers[i], "injected outlier {i} must be flagged");
+    }
 }
 
 /// Divergence (#495/#496): `HuberRegressor::fit` does not converge to sklearn's
@@ -119,7 +146,6 @@ fn divergence_huber_fit_outlier_dataset() {
 ///
 /// Tracking: #495
 #[test]
-#[ignore = "divergence: HuberRegressor IRLS does not reach sklearn fit at any max_iter (algorithmic, not convergence); tracking #495"]
 fn divergence_huber_fit_not_convergence_max_iter() {
     let o = load_oracle();
 
@@ -178,5 +204,55 @@ fn control_huber_fit_clean_dataset_matches_sklearn() {
         "clean intercept: sklearn={:.6}, ferrolearn={intercept:.6} (diff {:.4})",
         o.sk_clean_intercept,
         (intercept - o.sk_clean_intercept).abs()
+    );
+}
+
+/// Parity (#495/#496/#497) with a DIFFERENT `epsilon`. Same outlier dataset,
+/// `HuberRegressor(epsilon=1.5)`. A second oracle point guards against an
+/// epsilon-specific coincidence: the joint `[coef, intercept, scale]` L-BFGS
+/// must track sklearn as the inlier/outlier band `epsilon * scale` widens.
+///
+/// sklearn 1.5.2 (`epsilon=1.5`): `coef_ ≈ [0.9918, 1.9848, -0.9959]`,
+/// `intercept_ ≈ 0.0106`, `scale_ ≈ 0.0997`, `outliers_.sum() == 11`.
+#[test]
+fn parity_huber_fit_outlier_dataset_epsilon_1_5() {
+    let o = load_oracle();
+
+    let fitted = HuberRegressor::<f64>::new()
+        .with_epsilon(o.sk_eps15_epsilon)
+        .fit(&o.x, &o.y_outlier)
+        .expect("fit on outlier data (epsilon=1.5)");
+
+    let coef = ferrolearn_core::introspection::HasCoefficients::coefficients(&fitted);
+    let intercept = ferrolearn_core::introspection::HasCoefficients::intercept(&fitted);
+
+    for (i, &sk) in o.sk_eps15_coef.iter().enumerate() {
+        assert!(
+            (coef[i] - sk).abs() < 1e-3,
+            "eps=1.5 coef[{i}]: sklearn={sk:.6}, ferrolearn={:.6} (diff {:.4})",
+            coef[i],
+            (coef[i] - sk).abs()
+        );
+    }
+    assert!(
+        (intercept - o.sk_eps15_intercept).abs() < 1e-3,
+        "eps=1.5 intercept: sklearn={:.6}, ferrolearn={intercept:.6} (diff {:.4})",
+        o.sk_eps15_intercept,
+        (intercept - o.sk_eps15_intercept).abs()
+    );
+    let scale = fitted.scale();
+    assert!(
+        (scale - o.sk_eps15_scale).abs() < 1e-3,
+        "eps=1.5 scale_: sklearn={:.6}, ferrolearn={scale:.6} (diff {:.4})",
+        o.sk_eps15_scale,
+        (scale - o.sk_eps15_scale).abs()
+    );
+
+    // #497: outliers_ count matches sklearn's mask cardinality.
+    let n_out = fitted.outliers().iter().filter(|&&b| b).count();
+    assert_eq!(
+        n_out, o.sk_eps15_outliers_count,
+        "eps=1.5 outliers_ count: sklearn={}, ferrolearn={n_out}",
+        o.sk_eps15_outliers_count
     );
 }
