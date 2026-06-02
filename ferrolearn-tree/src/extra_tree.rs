@@ -797,7 +797,13 @@ fn compute_impurity<F: Float>(
 ) -> F {
     match criterion {
         ClassificationCriterion::Gini => gini_impurity(class_counts, total),
-        ClassificationCriterion::Entropy => entropy_impurity(class_counts, total),
+        // `log_loss` is an alias of `entropy` in sklearn's CRITERIA_CLF
+        // (`sklearn/tree/_classes.py`: both map to `_criterion.Entropy`), so
+        // LogLoss uses the identical Shannon-entropy impurity — mirroring
+        // `decision_tree.rs`'s `Entropy | LogLoss => entropy_impurity` arm.
+        ClassificationCriterion::Entropy | ClassificationCriterion::LogLoss => {
+            entropy_impurity(class_counts, total)
+        }
     }
 }
 

@@ -285,3 +285,293 @@ fn divergence_clf_feature_threshold_band() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-1 ALT-CRITERIA CERTIFYING PINS (#661 / iter REQ-1).
+// log_loss alias, friedman_mse, absolute_error (median leaves), poisson.
+// All expected values derived LIVE from the sklearn 1.5.2 oracle (R-CHAR-3);
+// the exact python invocations are recorded above each pin. Tolerance 1e-9.
+// ===========================================================================
+
+use ferrolearn_tree::{ClassificationCriterion, RegressionCriterion};
+
+/// PIN A — `log_loss` is the `entropy` alias (classification).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+///     X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],dtype=float); \
+///     y=np.array([0,0,0,1,1,1,2,2,0]); \
+///     c=DecisionTreeClassifier(criterion='log_loss',random_state=0).fit(X,y); \
+///     print(c.tree_.feature[0], c.tree_.threshold[0], \
+///           c.feature_importances_.tolist(), c.predict(X).tolist())"
+///   => root (1, 5.5);
+///      feature_importances_ [0.13794643363098585, 0.8620535663690142];
+///      predict [0,0,0,1,1,1,2,2,0]
+///   and `criterion='entropy'` produces the IDENTICAL fi + predict (alias).
+#[test]
+fn req1_clf_log_loss_is_entropy_alias_oracle() {
+    const SK_LOGLOSS_FI_0: f64 = 0.13794643363098585;
+    const SK_LOGLOSS_FI_1: f64 = 0.8620535663690142;
+    let sk_predict: [usize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 0];
+
+    let (x, y) = clf_dataset();
+
+    // LogLoss criterion vs the oracle absolute values.
+    let log_loss = DecisionTreeClassifier::<f64>::new()
+        .with_criterion(ClassificationCriterion::LogLoss)
+        .fit(&x, &y)
+        .unwrap();
+
+    let (feat, thr) = root_split(log_loss.nodes()).expect("LogLoss root must be a Split");
+    assert_eq!(feat, 1, "LogLoss root feature: ferrolearn={feat} sklearn=1");
+    assert!(
+        (thr - 5.5).abs() < 1e-9,
+        "LogLoss root threshold: ferrolearn={thr} sklearn=5.5"
+    );
+
+    let ll_imp = log_loss.feature_importances();
+    assert!(
+        (ll_imp[0] - SK_LOGLOSS_FI_0).abs() < 1e-9,
+        "LogLoss fi[0]: ferrolearn={} sklearn={SK_LOGLOSS_FI_0}",
+        ll_imp[0]
+    );
+    assert!(
+        (ll_imp[1] - SK_LOGLOSS_FI_1).abs() < 1e-9,
+        "LogLoss fi[1]: ferrolearn={} sklearn={SK_LOGLOSS_FI_1}",
+        ll_imp[1]
+    );
+
+    let ll_preds = log_loss.predict(&x).unwrap();
+    for (i, &exp) in sk_predict.iter().enumerate() {
+        assert_eq!(
+            ll_preds[i], exp,
+            "LogLoss predict[{i}]: ferrolearn={} sklearn={exp}",
+            ll_preds[i]
+        );
+    }
+
+    // Alias invariant: LogLoss == Entropy, feature-importances + predict identical.
+    let entropy = DecisionTreeClassifier::<f64>::new()
+        .with_criterion(ClassificationCriterion::Entropy)
+        .fit(&x, &y)
+        .unwrap();
+    let en_imp = entropy.feature_importances();
+    assert!(
+        (ll_imp[0] - en_imp[0]).abs() < 1e-12 && (ll_imp[1] - en_imp[1]).abs() < 1e-12,
+        "LogLoss/Entropy fi must be identical: log_loss=[{}, {}] entropy=[{}, {}]",
+        ll_imp[0],
+        ll_imp[1],
+        en_imp[0],
+        en_imp[1]
+    );
+    let en_preds = entropy.predict(&x).unwrap();
+    assert_eq!(
+        ll_preds, en_preds,
+        "LogLoss/Entropy predict must be identical (alias invariant)"
+    );
+}
+
+/// PIN B — `friedman_mse` (regression, mean leaves).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1,1.2,0.9,1.1,5,5.2,4.9,5.1]); \
+///     r=DecisionTreeRegressor(criterion='friedman_mse',max_depth=2,random_state=0).fit(Xr,yr); \
+///     print(r.tree_.feature[0], r.tree_.threshold[0], r.predict(Xr).tolist())"
+///   => root (0, 4.5); predict [1.1,1.1,1.0,1.0,5.1,5.1,5.0,5.0]  (MEAN leaves)
+#[test]
+fn req1_reg_friedman_mse_oracle() {
+    let sk_predict = [1.1, 1.1, 1.0, 1.0, 5.1, 5.1, 5.0, 5.0];
+
+    let (x, y) = reg_dataset();
+    let fitted = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::FriedmanMse)
+        .with_max_depth(Some(2))
+        .fit(&x, &y)
+        .unwrap();
+
+    let (feat, thr) = root_split(fitted.nodes()).expect("friedman_mse root must be a Split");
+    assert_eq!(
+        feat, 0,
+        "friedman_mse root feature: ferrolearn={feat} sklearn=0"
+    );
+    assert!(
+        (thr - 4.5).abs() < 1e-9,
+        "friedman_mse root threshold: ferrolearn={thr} sklearn=4.5"
+    );
+
+    let preds = fitted.predict(&x).unwrap();
+    for (i, &exp) in sk_predict.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "friedman_mse predict[{i}] (mean leaf): ferrolearn={} sklearn={exp}",
+            preds[i]
+        );
+    }
+}
+
+/// PIN B' — friedman_mse's improvement formula picks a DIFFERENT split than
+/// squared_error on this set, proving the Friedman proxy is actually distinct
+/// (not a no-op that coincides on every input).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     X=np.arange(5,dtype=float).reshape(-1,1); yr=np.array([0.9,6.3,6.0,3.7,0.9]); \
+///     rf=DecisionTreeRegressor(criterion='friedman_mse',max_depth=1,random_state=0).fit(X,yr); \
+///     rs=DecisionTreeRegressor(criterion='squared_error',max_depth=1,random_state=0).fit(X,yr); \
+///     print(rf.tree_.threshold[0], rf.predict(X).tolist()); \
+///     print(rs.tree_.threshold[0], rs.predict(X).tolist())"
+///   => friedman_mse root thr 3.5, predict [4.225,4.225,4.225,4.225,0.9]
+///      squared_error root thr 0.5, predict [0.9,4.225,4.225,4.225,4.225]
+#[test]
+fn req1_reg_friedman_mse_differs_from_squared_error() {
+    const SK_FRIEDMAN_THR: f64 = 3.5;
+    const SK_SQUARED_THR: f64 = 0.5;
+    let sk_friedman_predict = [4.225, 4.225, 4.225, 4.225, 0.9];
+    let sk_squared_predict = [0.9, 4.225, 4.225, 4.225, 4.225];
+
+    let x = Array2::from_shape_vec((5, 1), vec![0.0, 1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = array![0.9, 6.3, 6.0, 3.7, 0.9];
+
+    let friedman = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::FriedmanMse)
+        .with_max_depth(Some(1))
+        .fit(&x, &y)
+        .unwrap();
+    let squared = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::Mse)
+        .with_max_depth(Some(1))
+        .fit(&x, &y)
+        .unwrap();
+
+    let (_ff, ft) = root_split(friedman.nodes()).expect("friedman root must be a Split");
+    let (_sf, st) = root_split(squared.nodes()).expect("squared root must be a Split");
+    assert!(
+        (ft - SK_FRIEDMAN_THR).abs() < 1e-9,
+        "friedman_mse root threshold: ferrolearn={ft} sklearn={SK_FRIEDMAN_THR}"
+    );
+    assert!(
+        (st - SK_SQUARED_THR).abs() < 1e-9,
+        "squared_error root threshold: ferrolearn={st} sklearn={SK_SQUARED_THR}"
+    );
+    // The two criteria must DISAGREE on the split (proof the proxy differs).
+    assert!(
+        (ft - st).abs() > 1e-9,
+        "friedman_mse and squared_error must pick DIFFERENT splits here: \
+         friedman={ft} squared={st}"
+    );
+
+    let fpred = friedman.predict(&x).unwrap();
+    let spred = squared.predict(&x).unwrap();
+    for (i, &exp) in sk_friedman_predict.iter().enumerate() {
+        assert!(
+            (fpred[i] - exp).abs() < 1e-9,
+            "friedman predict[{i}]: ferrolearn={} sklearn={exp}",
+            fpred[i]
+        );
+    }
+    for (i, &exp) in sk_squared_predict.iter().enumerate() {
+        assert!(
+            (spred[i] - exp).abs() < 1e-9,
+            "squared predict[{i}]: ferrolearn={} sklearn={exp}",
+            spred[i]
+        );
+    }
+}
+
+/// PIN C — `absolute_error` (regression, MEDIAN leaves).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1,1.2,0.9,1.1,5,5.2,4.9,5.1]); \
+///     r=DecisionTreeRegressor(criterion='absolute_error',max_depth=2,random_state=0).fit(Xr,yr); \
+///     print(r.predict(Xr).tolist())"
+///   => predict [1.0,1.1,1.1,1.1,5.0,5.1,5.1,5.1]  (MEDIAN leaves)
+/// The DISTINCTNESS from PIN B's mean-leaf predict is the proof of the
+/// median-leaf path (`MAE.node_value`, `_criterion.pyx:1419-1423`).
+#[test]
+fn req1_reg_absolute_error_median_leaves_oracle() {
+    let sk_predict = [1.0, 1.1, 1.1, 1.1, 5.0, 5.1, 5.1, 5.1];
+    // PIN B's friedman_mse (mean-leaf) predictions on the SAME set — must differ.
+    let friedman_mean_predict = [1.1, 1.1, 1.0, 1.0, 5.1, 5.1, 5.0, 5.0];
+
+    let (x, y) = reg_dataset();
+    let fitted = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::AbsoluteError)
+        .with_max_depth(Some(2))
+        .fit(&x, &y)
+        .unwrap();
+
+    let preds = fitted.predict(&x).unwrap();
+    for (i, &exp) in sk_predict.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "absolute_error predict[{i}] (median leaf): ferrolearn={} sklearn={exp}",
+            preds[i]
+        );
+    }
+
+    // Median leaves are DISTINCT from friedman_mse's mean leaves on this set.
+    let any_diff = sk_predict
+        .iter()
+        .zip(friedman_mean_predict.iter())
+        .any(|(a, b)| (a - b).abs() > 1e-9);
+    assert!(
+        any_diff,
+        "median-leaf predict must differ from mean-leaf predict (proof of MEDIAN path)"
+    );
+}
+
+/// PIN D — `poisson` (regression).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1,1.2,0.9,1.1,5,5.2,4.9,5.1]); \
+///     r=DecisionTreeRegressor(criterion='poisson',max_depth=2,random_state=0).fit(Xr,yr); \
+///     print(r.tree_.feature[0], r.tree_.threshold[0], r.predict(Xr).tolist())"
+///   => root (0, 4.5); predict [1.1,1.1,1.0,1.0,5.1,5.1,5.0,5.0]  (MEAN leaves)
+/// AND a set with a y <= 0 must Err (sklearn raises ValueError "Some value(s)
+/// of y are negative which is not allowed for Poisson regression.",
+/// `_classes.py:267-277`).
+#[test]
+fn req1_reg_poisson_oracle_and_negative_y_errors() {
+    let sk_predict = [1.1, 1.1, 1.0, 1.0, 5.1, 5.1, 5.0, 5.0];
+
+    let (x, y) = reg_dataset();
+    let fitted = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::Poisson)
+        .with_max_depth(Some(2))
+        .fit(&x, &y)
+        .unwrap();
+
+    let (feat, thr) = root_split(fitted.nodes()).expect("poisson root must be a Split");
+    assert_eq!(feat, 0, "poisson root feature: ferrolearn={feat} sklearn=0");
+    assert!(
+        (thr - 4.5).abs() < 1e-9,
+        "poisson root threshold: ferrolearn={thr} sklearn=4.5"
+    );
+
+    let preds = fitted.predict(&x).unwrap();
+    for (i, &exp) in sk_predict.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "poisson predict[{i}] (mean leaf): ferrolearn={} sklearn={exp}",
+            preds[i]
+        );
+    }
+
+    // A set with a negative y must be rejected (sklearn raises ValueError).
+    let x_neg = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y_neg = array![1.0, -0.5, 2.0, 3.0];
+    let res = DecisionTreeRegressor::<f64>::new()
+        .with_criterion(RegressionCriterion::Poisson)
+        .with_max_depth(Some(2))
+        .fit(&x_neg, &y_neg);
+    assert!(
+        res.is_err(),
+        "poisson fit on a set with negative y must return Err (sklearn raises ValueError)"
+    );
+}
