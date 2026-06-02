@@ -33,6 +33,25 @@
 //! let inliers: usize = preds.iter().filter(|&&p| p == 1).count();
 //! assert!(inliers >= 4);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Classification (R-DEFER-2): SHIPPED = impl + non-test production consumer +
+//! tests + green oracle verification; NOT-STARTED = open blocker `#`.
+//! `OneClassSVM`/`FittedOneClassSVM` are boundary estimator types re-exported at
+//! the crate root (`pub use one_class_svm::{…}` in `lib.rs`) — under S5/R-DEFER-1
+//! the consumer surface exists for the grandfathered public API. See
+//! `.design/linear/one_class_svm.md`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (ONE_CLASS nu dual + nu validation) | NOT-STARTED | open prereq blocker #646 (dual exposes `dual_coef_`/`intercept_`/`support_`/`n_support_` accessors not yet present). `fn fit in one_class_svm.rs` validates `nu ∈ (0,1]` and solves the normalized one-class dual `0≤α≤1/(n·ν), Σα=1`, then rescales to libsvm's `Σα=ν·n` convention (`let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`) so the decision values match the libsvm scale — the `decision_function` scaling is pinned (REQ-4), but the public fitted-attribute layout (`dual_coef_`/`support_`/`n_support_`) is not yet exposed. |
+//! | REQ-2 (kernels & gamma resolution) | SHIPPED | `fn fit in one_class_svm.rs` resolves the kernel against X at fit time via `let kernel = self.kernel.resolved_for_fit(x);` (mirroring `svm.rs`'s `SVC::fit`), used for ALL kernel evaluations in the SMO solve and stored on `FittedOneClassSVM` so decision_function/predict reuse the same gamma. `Gamma::Scale` (default) resolves to `1/(n_features·X.var())`, `Auto` to `1/n_features`, `Value` verbatim (`crate::svm::Kernel::resolved_for_fit`, `_base.py:236-243`). Pinned: `divergence_pin2_gamma_scale_default_647 in tests/divergence_one_class_svm.rs` — default `RbfKernel` (`Gamma::Scale`) on the 7×2 set gives `_gamma≈0.46578` and df matching the live `OneClassSVM(kernel='rbf',nu=0.5)` oracle `[0.022499,0.022633,0.000122,0.0,0.0,0.000387,-1.44231]` (R-CHAR-3, 1e-2). |
+//! | REQ-3 (fitted attributes + offset_) | NOT-STARTED | open prereq blocker #648. `FittedOneClassSVM` stores private `support_vectors`/`dual_coefs`/`rho` with no public `support_`/`support_vectors_`/`n_support_`/`dual_coef_`/`intercept_`/`offset_`/`coef_` accessors and no `score_samples` method. |
+//! | REQ-4 (decision_function / score_samples) | SHIPPED | `pub fn decision_function in one_class_svm.rs` returns `Array1<F>` `(n,)` = `Σ coef·K(sv,x) − rho` in libsvm scale (the #646 rescale: `let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`, `svm.cpp:2834` `sum -= rho`). Pinned: `divergence_pin1_decision_function_scaling_646 in tests/divergence_one_class_svm.rs` — linear `nu=0.5` on the 7×2 set gives df `[-0.01,0.0,-0.01,-0.01,0.0,0.0,0.29]` matching the live `OneClassSVM(kernel='linear',nu=0.5)` oracle (R-CHAR-3, 1e-2). `score_samples` (`= df + offset_`, `_classes.py:1801`) is NOT-STARTED (blocker #649). |
+//! | REQ-5 (predict +1/-1) | NOT-STARTED | open prereq blocker #650. `fn predict in one_class_svm.rs` returns `+1`/`-1`; the labels match the oracle `[-1,1,-1,-1,1,1,1]` (pinned by `divergence_pin3_predict_labels_648`), but the boundary uses a relative slack off `|rho|` rather than libsvm's strict `(sum>0)?+1:-1` (`svm.cpp:2837-2838`) — the exact-zero boundary convention is unverified. |
+//! | REQ-6 (constructor params/defaults) | NOT-STARTED | open prereq blocker #651. `max_iter=10000` (sklearn `-1`), `cache_size=1024` (sklearn `200`, unused), `shrinking` field absent. |
+//! | REQ-7 (ferray substrate) | NOT-STARTED | open prereq blocker #652. `one_class_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -161,6 +180,16 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
             });
         }
 
+        // Resolve the kernel against X at fit time (gamma='scale'/'auto'/float),
+        // exactly as `svm.rs`'s `SVC::fit` does (`self.kernel.resolved_for_fit(x)`).
+        // sklearn resolves `gamma='scale'` to `1/(n_features·X.var())` and
+        // `'auto'` to `1/n_features` against the training X (`_base.py:236-243`);
+        // without this a default `RbfKernel` (`Gamma::Scale`) silently fits with
+        // `gamma=1.0`. The resolved kernel is used for ALL kernel evaluations
+        // below and stored on `FittedOneClassSVM` so decision_function/predict
+        // reuse the same resolved gamma.
+        let kernel = self.kernel.resolved_for_fit(x);
+
         // Solve the one-class SVM dual:
         // max sum_i alpha_i - 0.5 * sum_{i,j} alpha_i * alpha_j * K(x_i, x_j)
         // s.t. 0 <= alpha_i <= 1/(n * nu), sum alpha_i = 1
@@ -193,7 +222,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         let mut grad = vec![F::zero(); n_samples];
         for i in 0..n_samples {
             for j in 0..n_samples {
-                grad[i] = grad[i] + alphas[j] * self.kernel.compute(&data[i], &data[j]);
+                grad[i] = grad[i] + alphas[j] * kernel.compute(&data[i], &data[j]);
             }
         }
 
@@ -228,9 +257,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
                 break;
             }
 
-            let kii = self.kernel.compute(&data[i], &data[i]);
-            let kjj = self.kernel.compute(&data[j], &data[j]);
-            let kij = self.kernel.compute(&data[i], &data[j]);
+            let kii = kernel.compute(&data[i], &data[i]);
+            let kjj = kernel.compute(&data[j], &data[j]);
+            let kij = kernel.compute(&data[i], &data[j]);
             let eta = kii + kjj - two * kij;
 
             if eta <= eps {
@@ -250,8 +279,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
 
             // Update gradients.
             for k in 0..n_samples {
-                let kki = self.kernel.compute(&data[k], &data[i]);
-                let kkj = self.kernel.compute(&data[k], &data[j]);
+                let kki = kernel.compute(&data[k], &data[i]);
+                let kkj = kernel.compute(&data[k], &data[j]);
                 grad[k] = grad[k] - delta * kki + delta * kkj;
             }
         }
@@ -286,6 +315,16 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
             }
         };
 
+        // Rescale from the normalized one-class dual (0<=a<=1/(n*nu), Sum a = 1)
+        // to libsvm's un-normalized convention (0<=a<=1, Sum a = nu*n). The two
+        // optima are the SAME point scaled by `nu*n`, so the reported
+        // coefficients and `rho` must be multiplied by `nu*n` for the decision
+        // function `Sum a_i K - rho` to match the sklearn/libsvm oracle
+        // (libsvm `solve_one_class` svm.cpp:1722-1736, decision svm.cpp:2834).
+        // `c == 1/(n*nu)`, so the scale factor `nu*n` is exactly `1/c`.
+        let scale = F::one() / c;
+        let rho = rho * scale;
+
         // Extract support vectors.
         let mut support_vectors = Vec::new();
         let mut dual_coefs = Vec::new();
@@ -293,13 +332,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         for (i, &alpha) in alphas.iter().enumerate() {
             if alpha > eps {
                 support_vectors.push(data[i].clone());
-                dual_coefs.push(alpha);
+                dual_coefs.push(alpha * scale);
             }
         }
 
-        // If no support vectors found, use all data as fallback.
+        // If no support vectors found, use all data as fallback: distribute the
+        // total mass `nu*n` (== scale) uniformly across all n samples. With
+        // `c == 1/(n*nu)`, the per-sample weight `scale/n == scale*c*nu`.
         if support_vectors.is_empty() {
-            let weight = F::one() / F::from(n_samples).unwrap();
+            let weight = scale * c * self.nu;
             for row in &data {
                 support_vectors.push(row.clone());
                 dual_coefs.push(weight);
@@ -309,7 +350,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         let _ = n_features; // used for validation context
 
         Ok(FittedOneClassSVM {
-            kernel: self.kernel.clone(),
+            kernel,
             support_vectors,
             dual_coefs,
             rho,
@@ -365,10 +406,21 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> P
         let n_samples = x.nrows();
         let mut predictions = Array1::<isize>::zeros(n_samples);
 
+        // libsvm ONE_CLASS uses `(sum > 0) ? +1 : -1` (svm.cpp:2837-2838). A
+        // point exactly on the decision boundary (a free support vector, whose
+        // decision value is mathematically 0) is reported `+1` by libsvm: its
+        // converged `rho` lands fractionally below the on-boundary kernel sum
+        // (e.g. 0.00999999977 vs 0.01), so `sum` is a small positive. ferrolearn
+        // recovers `rho` exactly, leaving boundary points at machine-epsilon
+        // noise of either sign. To reproduce libsvm's observable labels
+        // (R-DEV-3), treat decision values within solver-precision of 0 as the
+        // inlier side: a relative slack off `|rho|` separates true outliers
+        // (whose `|sum|` is order `|rho|`) from on-boundary roundoff.
+        let boundary = self.rho.abs() * F::from(1e-9).unwrap_or_else(F::epsilon);
         for s in 0..n_samples {
             let xi: Vec<F> = x.row(s).to_vec();
             let val = self.decision_value(&xi);
-            predictions[s] = if val >= F::zero() { 1 } else { -1 };
+            predictions[s] = if val > -boundary { 1 } else { -1 };
         }
 
         Ok(predictions)
