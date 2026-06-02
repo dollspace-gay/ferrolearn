@@ -410,3 +410,105 @@ fn qda_rank_deficient_class() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-11 (#584, partial) — scalings_ / rotations_ fitted attributes.
+// ===========================================================================
+
+/// REQ-11 (#584): the SVD formulation now materializes per-class `scalings_`
+/// (`S²/(n_k-1)`) and `rotations_` (`Vtᵀ`). `scalings_` is sign-invariant and is
+/// pinned to the live `m.scalings_` oracle directly. `rotations_` (the SVD right
+/// singular vectors) is only defined up to a per-column sign, which differs
+/// between LAPACK implementations (faer vs numpy), so it is verified through the
+/// sign-invariant reconstruction `R·diag(S2)·Rᵀ`, which must equal sklearn's
+/// `store_covariance=True` per-class `covariance_` (`discriminant_analysis.py:952`:
+/// `cov = V·(S²/(n-1))·Vᵀ`).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -W ignore -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis as Q; \
+///   X=np.array([[0.,0.],[1.,.5],[.5,1.],[1.,1.],[2.,2.],[3.,2.5],[2.5,3.],[3.,3.],\
+///               [1.,3.],[2.,4.],[1.5,3.5],[2.,3.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+///   m=Q(store_covariance=True).fit(X,y); \
+///   [print(s.tolist()) for s in m.scalings_]; \
+///   [print(c.tolist()) for c in m.covariance_]"
+/// ```
+#[test]
+fn qda_scalings_rotations() {
+    // Live sklearn 1.5.2 `m.scalings_` (per class, length min(n_k, n_features)).
+    const SK_SCALINGS: [[f64; 2]; 3] = [
+        [0.37500000000000006, 0.08333333333333333],
+        [0.37500000000000006, 0.08333333333333333],
+        [0.3333333333333333, 0.12500000000000003],
+    ];
+    // Live sklearn 1.5.2 `m.covariance_` (store_covariance=True) = V·diag(S2)·Vᵀ.
+    const SK_COV: [[f64; 4]; 3] = [
+        [
+            0.22916666666666669,
+            0.14583333333333334,
+            0.14583333333333337,
+            0.22916666666666666,
+        ],
+        [
+            0.22916666666666669,
+            0.14583333333333334,
+            0.14583333333333337,
+            0.22916666666666666,
+        ],
+        [
+            0.2291666666666667,
+            0.10416666666666664,
+            0.10416666666666664,
+            0.2291666666666666,
+        ],
+    ];
+
+    let fitted = QDA::<f64>::new().fit(&mc_x(), &mc_y()).unwrap();
+    let scalings = fitted.scalings();
+    let rotations = fitted.rotations();
+
+    assert_eq!(scalings.len(), 3, "one scalings vector per class");
+    assert_eq!(rotations.len(), 3, "one rotations matrix per class");
+
+    for c in 0..3 {
+        // scalings_ is sign-invariant — pin directly to the oracle.
+        assert_eq!(scalings[c].len(), 2, "scalings[{c}] length");
+        for j in 0..2 {
+            assert!(
+                (scalings[c][j] - SK_SCALINGS[c][j]).abs() < 1e-12,
+                "scalings[{c}][{j}]: sklearn {}, ferrolearn {}",
+                SK_SCALINGS[c][j],
+                scalings[c][j]
+            );
+        }
+
+        // rotations_ defined up to per-column sign; verify the sign-invariant
+        // reconstruction R·diag(S2)·Rᵀ == sklearn's covariance_ (V·diag(S2)·Vᵀ).
+        let r = rotations[c]; // (n_features=2, k=2)
+        assert_eq!(r.dim(), (2, 2), "rotations[{c}] shape (n_features, k)");
+        let s2 = scalings[c];
+        let mut recon = [[0.0_f64; 2]; 2];
+        for a in 0..2 {
+            for b in 0..2 {
+                let mut acc = 0.0;
+                for j in 0..2 {
+                    acc += r[[a, j]] * s2[j] * r[[b, j]];
+                }
+                recon[a][b] = acc;
+            }
+        }
+        for a in 0..2 {
+            for b in 0..2 {
+                let exp = SK_COV[c][a * 2 + b];
+                assert!(
+                    (recon[a][b] - exp).abs() < 1e-12,
+                    "R·diag(S2)·Rᵀ[{c}][{a}][{b}]: sklearn {}, ferrolearn {}",
+                    exp,
+                    recon[a][b]
+                );
+            }
+        }
+    }
+}

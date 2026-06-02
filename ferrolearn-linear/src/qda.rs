@@ -7,12 +7,52 @@
 //!
 //! # Algorithm
 //!
-//! For each class `k`:
-//! 1. Compute the class mean `mu_k` and covariance `Sigma_k`.
-//! 2. Optionally regularize: `Sigma_k = (1 - reg) * Sigma_k + reg * I`.
-//! 3. Compute the log-posterior:
-//!    `delta_k(x) = -0.5 * log|Sigma_k| - 0.5 * (x - mu_k)^T Sigma_k^{-1} (x - mu_k) + log(prior_k)`.
-//! 4. Predict the class with the largest `delta_k`.
+//! Mirrors scikit-learn's per-class SVD formulation
+//! (`sklearn/discriminant_analysis.py:940-976`). For each class `k`:
+//! 1. Compute the class mean `mu_k` and center the samples: `Xkc = Xk - mu_k`.
+//! 2. Take the thin SVD `Xkc = U·diag(S)·Vtᵀ` (`full_matrices=False`).
+//! 3. Scalings: `scalings_k = (1 - reg) * (S² / (n_k - 1)) + reg`; rotations:
+//!    `rotations_k = Vtᵀ`. (Algebraically identical to the eigendecomposition of
+//!    the regularized covariance `(1 - reg) * Sigma_k + reg * I`.)
+//! 4. Log-posterior in the rotated/scaled frame:
+//!    `delta_k(x) = -0.5 * (norm2_k(x) + sum(log scalings_k)) + log(prior_k)`,
+//!    where `norm2_k(x) = || (x - mu_k) · (rotations_k · scalings_k^(-0.5)) ||²`.
+//! 5. Predict the class with the largest `delta_k`.
+//!
+//! Unlike the previous Cholesky covariance-inversion path, the SVD formulation
+//! does **not** error on a rank-deficient (collinear) class: a zero singular
+//! value yields a zero scaling, and the degenerate `inf`/`NaN` arithmetic
+//! propagates exactly as in scikit-learn (which emits a "Variables are
+//! collinear" warning and still predicts), reproducing the upstream behavior.
+//!
+//! # REQ status
+//!
+//! Mirrors `sklearn/discriminant_analysis.py:940-976`
+//! (`QuadraticDiscriminantAnalysis`). Full table in `.design/linear/qda.md`;
+//! the REQs touched by the SVD migration are summarized here.
+//!
+//! - **REQ-1 (fit + decision_function parity) — SHIPPED.** `fn fit` builds the
+//!   per-class thin SVD (`fn svd_s_vt` → `ferray::linalg::svd`) and
+//!   `fn raw_decision` computes the SVD log-posterior
+//!   `-½(‖(x-μ)·R·S^(-½)‖² + Σ log S) + log π` (`discriminant_analysis.py:962-976`).
+//!   Consumer: `fn decision_function` / `fn predict` (`Predict` impl) and the
+//!   Python binding `RsQDA::predict`. Verified to the live `_decision_function`
+//!   oracle to <1e-6 (`qda_decision_function_multiclass`).
+//! - **REQ-10 (tol + rank-deficient SVD, no error) — SHIPPED.** `with_tol` adds
+//!   the `tol` field (default `1e-4`); `fn fit` computes `rank = sum(S > tol)`
+//!   and warns "Variables are collinear" when `rank < n_features` instead of
+//!   erroring, mirroring `discriminant_analysis.py:945-947`. Consumer: `fn fit`
+//!   → `FittedQDA` → `RsQDA::predict`. Verified: `qda_rank_deficient_class`
+//!   (collinear class ⇒ `predict == [0;8]`, matching the live oracle).
+//! - **REQ-11 (scalings_/rotations_ attributes) — SHIPPED.** `FittedQDA::scalings`
+//!   / `FittedQDA::rotations` expose the materialized `S²/(n_k-1)` scalings and
+//!   `Vtᵀ` rotations (`discriminant_analysis.py:948-954`). Consumer: `fn
+//!   raw_decision` reads them every prediction. Verified: `qda_scalings_rotations`
+//!   (scalings to the oracle; `R·diag(S2)·Rᵀ` reconstructs the oracle covariance).
+//! - **REQ-12 (ferray substrate) — NOT-STARTED (#585):** the per-class SVD now
+//!   runs on `ferray::linalg::svd` (bridged ndarray↔ferray at `fn svd_s_vt`,
+//!   R-SUBSTRATE-4), but the owned array type is still `ndarray::Array2`, so the
+//!   full array-type migration off `ndarray` is not done.
 //!
 //! # Examples
 //!
@@ -33,6 +73,8 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use ferray::linalg::{LinalgFloat, svd};
+use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -55,16 +97,23 @@ pub struct QDA<F> {
     /// `Sigma_k = (1 - reg) * Sigma_k + reg * I`.
     /// Must be in `[0, 1]`. Default: `0.0`.
     pub reg_param: F,
+    /// Absolute threshold for a singular value to be considered significant,
+    /// used to estimate the rank of the centered per-class matrix and to emit
+    /// the "Variables are collinear" warning. Mirrors sklearn's `tol`
+    /// (`discriminant_analysis.py:801-806`). Does **not** affect predictions.
+    /// Default: `1e-4`.
+    pub tol: F,
 }
 
 impl<F: Float> QDA<F> {
     /// Create a new `QDA` with default settings.
     ///
-    /// Default: `reg_param = 0.0`.
+    /// Default: `reg_param = 0.0`, `tol = 1e-4` (sklearn's default).
     #[must_use]
     pub fn new() -> Self {
         Self {
             reg_param: F::zero(),
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
         }
     }
 
@@ -72,6 +121,18 @@ impl<F: Float> QDA<F> {
     #[must_use]
     pub fn with_reg_param(mut self, reg_param: F) -> Self {
         self.reg_param = reg_param;
+        self
+    }
+
+    /// Set the rank/collinearity tolerance `tol`.
+    ///
+    /// A class whose centered matrix has a singular value `<= tol` for any
+    /// principal axis triggers the "Variables are collinear" warning (the
+    /// rank is `< n_features`). This does not change the predictions; it only
+    /// controls the warning, mirroring sklearn (`discriminant_analysis.py:801`).
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
         self
     }
 }
@@ -82,22 +143,26 @@ impl<F: Float> Default for QDA<F> {
     }
 }
 
-/// Per-class model component for QDA.
+/// Per-class model component for QDA (sklearn's SVD formulation).
 #[derive(Debug, Clone)]
 struct QDAClass<F> {
-    /// Class mean, shape `(n_features,)`.
+    /// Class mean, shape `(n_features,)`. Mirrors `means_[i]`.
     mean: Array1<F>,
-    /// Inverse of the (regularized) covariance matrix, shape `(n_features, n_features)`.
-    cov_inv: Array2<F>,
-    /// Log-determinant of the covariance matrix.
-    log_det: F,
-    /// Log-prior probability for this class.
+    /// Per-axis scalings `(1 - reg) * (S² / (n_k - 1)) + reg`, length
+    /// `k = min(n_k, n_features)`. Mirrors sklearn's `scalings_[i]`
+    /// (`discriminant_analysis.py:948-949,953`). A zero entry encodes a
+    /// collapsed (rank-deficient) principal axis.
+    scalings: Array1<F>,
+    /// Rotation matrix `Vtᵀ`, shape `(n_features, k)`. Mirrors sklearn's
+    /// `rotations_[i]` (`discriminant_analysis.py:954`).
+    rotations: Array2<F>,
+    /// Log-prior probability for this class, `log(n_k / n)`.
     log_prior: F,
 }
 
 /// Fitted Quadratic Discriminant Analysis model.
 ///
-/// Stores per-class means, covariance inverses, and priors. Implements
+/// Stores per-class means, SVD scalings/rotations, and log-priors. Implements
 /// [`Predict`] to produce class labels.
 #[derive(Debug, Clone)]
 pub struct FittedQDA<F> {
@@ -110,26 +175,61 @@ pub struct FittedQDA<F> {
 }
 
 impl<F: Float> FittedQDA<F> {
-    /// Returns the class means, one per class.
+    /// Returns the class means, one per class. Mirrors sklearn's `means_`.
     #[must_use]
     pub fn means(&self) -> Vec<&Array1<F>> {
         self.class_models.iter().map(|m| &m.mean).collect()
     }
+
+    /// Returns the per-class scalings (`S² / (n_k - 1)` regularized), one
+    /// `Array1<F>` of length `min(n_k, n_features)` per class. Mirrors
+    /// sklearn's `scalings_` (`discriminant_analysis.py:832-838`).
+    #[must_use]
+    pub fn scalings(&self) -> Vec<&Array1<F>> {
+        self.class_models.iter().map(|m| &m.scalings).collect()
+    }
+
+    /// Returns the per-class rotations `Vtᵀ`, one `(n_features, k)` matrix per
+    /// class. Mirrors sklearn's `rotations_` (`discriminant_analysis.py:824-830`).
+    #[must_use]
+    pub fn rotations(&self) -> Vec<&Array2<F>> {
+        self.class_models.iter().map(|m| &m.rotations).collect()
+    }
+}
+
+/// `0.5` as `F`, built panic-free from `1 / (1 + 1)` (exact for binary floats).
+#[inline]
+fn half<F: Float>() -> F {
+    F::one() / (F::one() + F::one())
+}
+
+/// Convert a `usize` count to `F` without panicking. Returns
+/// [`FerroError::NumericalInstability`] if the value is not representable
+/// (effectively impossible for the sample/feature counts here, but `Float::from`
+/// is fallible and the codebase forbids `.unwrap()` in production).
+#[inline]
+fn usize_to_f<F: Float>(v: usize) -> Result<F, FerroError> {
+    F::from(v).ok_or_else(|| FerroError::NumericalInstability {
+        message: format!("could not represent count {v} as the float type"),
+    })
 }
 
 impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedQDA<F> {
-    /// Predict per-class probabilities. Mirrors sklearn
-    /// `QuadraticDiscriminantAnalysis.predict_proba`.
+    /// Raw per-class log-posterior `(n_samples, n_classes)`, the SVD form of
+    /// sklearn's `_decision_function` (`discriminant_analysis.py:962-976`):
     ///
-    /// Computes softmax over the per-class quadratic discriminants
-    /// `δ_c(x) = -½ log|Σ_c| - ½ (x-μ_c)ᵀ Σ_c⁻¹ (x-μ_c) + log π_c`.
-    /// Returns shape `(n_samples, n_classes)`; rows sum to 1.
+    /// ```text
+    /// Xm    = X - means_[i]
+    /// X2    = Xm @ (rotations_[i] * scalings_[i]^(-0.5))   # column-scaled
+    /// norm2 = sum(X2², axis=1)
+    /// u     = sum(log(scalings_[i]))
+    /// dec_i = -0.5 * (norm2 + u) + log(priors_[i])
+    /// ```
     ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features
-    /// does not match the fitted model.
-    pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    /// For a rank-deficient class a zero scaling makes `scalings^(-0.5) = +inf`
+    /// and `log(scalings) = -inf`, so the degenerate `inf`/`NaN` arithmetic
+    /// propagates exactly as in numpy/sklearn (no special-casing).
+    fn raw_decision(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = x.ncols();
         if n_features != self.n_features {
             return Err(FerroError::ShapeMismatch {
@@ -140,23 +240,62 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedQDA<F> {
         }
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
-        let half = F::from(0.5).unwrap();
+        let half: F = half();
+        let neg_half = -half;
+        let mut out = Array2::<F>::zeros((n_samples, n_classes));
+
+        for (c, model) in self.class_models.iter().enumerate() {
+            // u = sum(log(scalings_[c]))  — -inf when any scaling is 0.
+            let u = model
+                .scalings
+                .iter()
+                .fold(F::zero(), |acc, &s| acc + s.ln());
+            // Column-scaled rotations: rotations_[c] * scalings_[c]^(-0.5).
+            // (n_features, k); scaled[:, j] = rotations[:, j] * scalings[j]^(-0.5).
+            let k = model.scalings.len();
+            let mut scaled = Array2::<F>::zeros((n_features, k));
+            for j in 0..k {
+                let inv_sqrt = model.scalings[j].powf(neg_half); // +inf when scaling==0
+                for r in 0..n_features {
+                    scaled[[r, j]] = model.rotations[[r, j]] * inv_sqrt;
+                }
+            }
+            for i in 0..n_samples {
+                // Xm = x_i - mean_c
+                let diff: Array1<F> = x.row(i).to_owned() - &model.mean;
+                // X2 = Xm @ scaled  (length k); norm2 = sum(X2²).
+                let x2 = diff.dot(&scaled);
+                let norm2 = x2.iter().fold(F::zero(), |acc, &v| acc + v * v);
+                out[[i, c]] = neg_half * (norm2 + u) + model.log_prior;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Predict per-class probabilities. Mirrors sklearn
+    /// `QuadraticDiscriminantAnalysis.predict_proba`
+    /// (`discriminant_analysis.py:1024-1042`).
+    ///
+    /// Computes the max-shifted softmax over the per-class log-posteriors
+    /// from [`decision_function`](Self::decision_function). Returns shape
+    /// `(n_samples, n_classes)`; rows sum to 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features
+    /// does not match the fitted model.
+    pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let values = self.raw_decision(x)?;
+        let n_samples = values.nrows();
+        let n_classes = values.ncols();
         let mut proba = Array2::<F>::zeros((n_samples, n_classes));
         for i in 0..n_samples {
-            let xi = x.row(i);
-            let mut logits = vec![F::neg_infinity(); n_classes];
-            for (c, model) in self.class_models.iter().enumerate() {
-                let diff: Array1<F> = xi.to_owned() - &model.mean;
-                let mahal = diff.dot(&model.cov_inv.dot(&diff));
-                logits[c] = -half * model.log_det - half * mahal + model.log_prior;
-            }
-            let max_l = logits
-                .iter()
-                .copied()
+            let max_l = (0..n_classes)
+                .map(|c| values[[i, c]])
                 .fold(F::neg_infinity(), |a, b| if b > a { b } else { a });
             let mut sum_exp = F::zero();
             for c in 0..n_classes {
-                let e = (logits[c] - max_l).exp();
+                let e = (values[[i, c]] - max_l).exp();
                 proba[[i, c]] = e;
                 sum_exp = sum_exp + e;
             }
@@ -178,95 +317,72 @@ impl<F: Float + ndarray::ScalarOperand + Send + Sync + 'static> FittedQDA<F> {
     }
 
     /// Per-class quadratic discriminant scores. Mirrors sklearn
-    /// `QuadraticDiscriminantAnalysis.decision_function`. Returns shape
-    /// `(n_samples, n_classes)` with `δ_c(x) = -½ log|Σ_c| - ½ (x-μ_c)ᵀ
-    /// Σ_c⁻¹ (x-μ_c) + log π_c`. argmax of each row agrees with [`Predict`].
+    /// `QuadraticDiscriminantAnalysis.decision_function`
+    /// (`discriminant_analysis.py:962-976`). Returns shape
+    /// `(n_samples, n_classes)` with the SVD log-posterior
+    /// `δ_c(x) = -½ (‖(x-μ_c)·R_c·S_c^(-½)‖² + Σ log S_c) + log π_c`.
+    /// argmax of each row agrees with [`Predict`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
     /// does not match the fitted model.
     pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features = x.ncols();
-        if n_features != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![n_features],
-                context: "number of features must match fitted model".into(),
-            });
-        }
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let half = F::from(0.5).unwrap();
-        let mut out = Array2::<F>::zeros((n_samples, n_classes));
-        for i in 0..n_samples {
-            let xi = x.row(i);
-            for (c, model) in self.class_models.iter().enumerate() {
-                let diff: Array1<F> = xi.to_owned() - &model.mean;
-                let mahal = diff.dot(&model.cov_inv.dot(&diff));
-                out[[i, c]] = -half * model.log_det - half * mahal + model.log_prior;
-            }
-        }
-        Ok(out)
+        self.raw_decision(x)
     }
 }
 
-/// Compute the inverse and log-determinant of a symmetric positive-definite
-/// matrix via Cholesky decomposition.
-fn cholesky_inv_and_logdet<F: Float + 'static>(
-    a: &Array2<F>,
-) -> Result<(Array2<F>, F), FerroError> {
-    let n = a.nrows();
-    let mut l = Array2::<F>::zeros((n, n));
+/// Singular values `S` and right singular vectors transposed `Vt` of the thin
+/// SVD `A = U·diag(S)·Vt` (`full_matrices=False`), computed on the ferray
+/// substrate (`ferray::linalg::svd`, `ferray-linalg/src/decomp/svd.rs:40`) —
+/// the analog of scikit-learn's `_, S, Vt = np.linalg.svd(Xgc,
+/// full_matrices=False)` (`discriminant_analysis.py:944`). Mirrors the bridging
+/// pattern in `bayesian_ridge.rs::svd_thin` (R-SUBSTRATE-4): the caller keeps
+/// its `ndarray` signature and the ndarray↔ferray conversion happens here.
+///
+/// Returns `(S, Vt)` with `S` of length `k = min(m, n)` and `Vt` of shape
+/// `(k, n)`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray array build or
+/// the SVD itself fails.
+fn svd_s_vt<F: LinalgFloat>(a: &Array2<F>) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    let (m, n) = a.dim();
 
-    // Cholesky decomposition: A = L L^T.
-    for i in 0..n {
-        for j in 0..=i {
-            let mut s = a[[i, j]];
-            for k in 0..j {
-                s = s - l[[i, k]] * l[[j, k]];
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4).
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray svd: failed to build centered matrix: {e}"),
             }
-            if i == j {
-                if s <= F::zero() {
-                    return Err(FerroError::NumericalInstability {
-                        message: "covariance matrix is not positive definite".into(),
-                    });
-                }
-                l[[i, j]] = s.sqrt();
-            } else {
-                l[[i, j]] = s / l[[j, j]];
-            }
-        }
-    }
+        })?;
 
-    // Log-determinant: log|A| = 2 * sum(log(diag(L))).
-    let two = F::from(2.0).unwrap();
-    let log_det = (0..n).map(|i| l[[i, i]].ln()).fold(F::zero(), |a, b| a + b) * two;
+    // full_matrices=false => thin SVD, matching numpy's `full_matrices=False`.
+    let (_u, s, vt) = svd(&fa, false).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray svd failed: {e}"),
+    })?;
 
-    // Compute L^{-1} by forward substitution on each column of I.
-    let mut l_inv = Array2::<F>::zeros((n, n));
-    for col in 0..n {
-        l_inv[[col, col]] = F::one() / l[[col, col]];
-        for i in (col + 1)..n {
-            let mut s = F::zero();
-            for k in col..i {
-                s = s + l[[i, k]] * l_inv[[k, col]];
-            }
-            l_inv[[i, col]] = -s / l[[i, i]];
-        }
-    }
+    let s_nd = Array1::from_vec(s.iter().copied().collect());
+    let vt_shape = vt.shape();
+    let vt_nd = Array2::from_shape_vec((vt_shape[0], vt_shape[1]), vt.iter().copied().collect())
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd: Vt shape conversion failed: {e}"),
+        })?;
 
-    // A^{-1} = L^{-T} L^{-1}.
-    let a_inv = l_inv.t().dot(&l_inv);
-
-    Ok((a_inv, log_det))
+    Ok((s_nd, vt_nd))
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>> for QDA<F> {
+impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for QDA<F> {
     type Fitted = FittedQDA<F>;
     type Error = FerroError;
 
-    /// Fit the QDA model by computing per-class means and covariances.
+    /// Fit the QDA model via a per-class SVD of the centered data, mirroring
+    /// scikit-learn (`discriminant_analysis.py:940-960`). A rank-deficient
+    /// (collinear) class does **not** error — its zero singular value yields a
+    /// zero scaling and a "Variables are collinear" warning is emitted, exactly
+    /// as in sklearn.
     ///
     /// # Errors
     ///
@@ -274,7 +390,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     /// - [`FerroError::InsufficientSamples`] — fewer than 2 distinct classes
     ///   or a class has too few samples.
     /// - [`FerroError::InvalidParameter`] — `reg_param` not in `[0, 1]`.
-    /// - [`FerroError::NumericalInstability`] — covariance matrix is singular.
+    /// - [`FerroError::NumericalInstability`] — the underlying SVD fails.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedQDA<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -286,7 +402,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
-        if self.reg_param < F::zero() || self.reg_param > F::one() {
+        if self.reg_param < num_traits::Zero::zero() || self.reg_param > num_traits::One::one() {
             return Err(FerroError::InvalidParameter {
                 name: "reg_param".into(),
                 reason: "must be in [0, 1]".into(),
@@ -305,7 +421,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
+        let n_f = usize_to_f::<F>(n_samples)?;
+        let one_minus_reg = <F as num_traits::One>::one() - self.reg_param;
         let mut class_models = Vec::with_capacity(classes.len());
 
         for &cls in &classes {
@@ -326,51 +443,57 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 });
             }
 
-            let n_k_f = F::from(n_k).unwrap();
+            let n_k_f = usize_to_f::<F>(n_k)?;
 
-            // Compute class mean.
+            // Compute class mean (`meang = Xg.mean(0)`, discriminant_analysis.py:935).
             let mut mean = Array1::<F>::zeros(n_features);
             for &i in &indices {
                 for j in 0..n_features {
-                    mean[j] = mean[j] + x[[i, j]];
+                    mean[j] += x[[i, j]];
                 }
             }
             mean.mapv_inplace(|v| v / n_k_f);
 
-            // Compute class covariance.
-            let mut cov = Array2::<F>::zeros((n_features, n_features));
-            for &i in &indices {
-                let diff: Array1<F> = x.row(i).to_owned() - &mean;
-                for r in 0..n_features {
-                    for c in 0..n_features {
-                        cov[[r, c]] = cov[[r, c]] + diff[r] * diff[c];
-                    }
-                }
-            }
-            // Use unbiased estimator: divide by (n_k - 1).
-            let divisor = F::from(n_k - 1).unwrap();
-            cov.mapv_inplace(|v| v / divisor);
-
-            // Regularize: Sigma_k = (1 - reg) * Sigma_k + reg * I.
-            if self.reg_param > F::zero() {
-                let one_minus = F::one() - self.reg_param;
-                for r in 0..n_features {
-                    for c in 0..n_features {
-                        cov[[r, c]] = cov[[r, c]] * one_minus;
-                    }
-                    cov[[r, r]] = cov[[r, r]] + self.reg_param;
+            // Center: `Xgc = Xg - meang` (discriminant_analysis.py:942).
+            let mut xgc = Array2::<F>::zeros((n_k, n_features));
+            for (row, &i) in indices.iter().enumerate() {
+                for j in 0..n_features {
+                    xgc[[row, j]] = x[[i, j]] - mean[j];
                 }
             }
 
-            // Compute inverse and log-determinant.
-            let (cov_inv, log_det) = cholesky_inv_and_logdet(&cov)?;
+            // Thin SVD `Xgc = U·diag(S)·Vt` (discriminant_analysis.py:944).
+            let (s, vt) = svd_s_vt::<F>(&xgc)?;
+
+            // Rank / collinearity warning (discriminant_analysis.py:945-947).
+            // `rank = sum(S > tol)`; warn if `rank < n_features`. Does NOT
+            // change predictions — only emits a warning.
+            let rank = s.iter().filter(|&&sv| sv > self.tol).count();
+            if rank < n_features {
+                eprintln!("Variables are collinear");
+            }
+
+            // `S2 = (S**2) / (n_k - 1)`; `S2 = (1 - reg)*S2 + reg`
+            // (discriminant_analysis.py:948-949). For a zero singular value the
+            // scaling collapses to `reg` (== 0 when unregularized), encoding the
+            // rank-deficient axis with the same degenerate float arithmetic as
+            // numpy/sklearn.
+            let n_k_minus_1 = usize_to_f::<F>(n_k - 1)?;
+            let scalings: Array1<F> = s.mapv(|sv| {
+                let s2 = (sv * sv) / n_k_minus_1;
+                one_minus_reg * s2 + self.reg_param
+            });
+
+            // `rotations.append(Vt.T)` (discriminant_analysis.py:954):
+            // (n_features, k) where k = len(S) = min(n_k, n_features).
+            let rotations = vt.t().to_owned();
 
             let log_prior = (n_k_f / n_f).ln();
 
             class_models.push(QDAClass {
                 mean,
-                cov_inv,
-                log_det,
+                scalings,
+                rotations,
                 log_prior,
             });
         }
@@ -389,44 +512,40 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for Fi
 
     /// Predict class labels for the given feature matrix.
     ///
-    /// Selects the class with the largest log-posterior for each sample.
+    /// Returns `classes_.take(argmax over the per-class decision)`, mirroring
+    /// sklearn `predict` (`discriminant_analysis.py:1020-1022`). The argmax
+    /// replicates numpy's `ndarray.argmax(1)` semantics exactly, including the
+    /// degenerate rank-deficient case: a `NaN` decision (from a collinear class)
+    /// is treated as the maximum, and the **first** index that is either `NaN`
+    /// or strictly greater than the running best wins (ties → first index).
+    /// This is what makes a singular class deterministically dominate.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
     /// does not match the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        let n_features = x.ncols();
-        if n_features != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![n_features],
-                context: "number of features must match fitted model".into(),
-            });
-        }
-
-        let n_samples = x.nrows();
+        let dec = self.raw_decision(x)?;
+        let n_samples = dec.nrows();
+        let n_classes = dec.ncols();
         let mut predictions = Array1::<usize>::zeros(n_samples);
-        let half = F::from(0.5).unwrap();
 
         for i in 0..n_samples {
-            let xi = x.row(i);
-            let mut best_class = 0;
-            let mut best_score = F::neg_infinity();
-
-            for (c, model) in self.class_models.iter().enumerate() {
-                let diff: Array1<F> = xi.to_owned() - &model.mean;
-                // Mahalanobis: diff^T * cov_inv * diff
-                let mahal = diff.dot(&model.cov_inv.dot(&diff));
-                let score = -half * model.log_det - half * mahal + model.log_prior;
-
-                if score > best_score {
-                    best_score = score;
-                    best_class = c;
+            // numpy argmax: best := dec[i,0]; once best is NaN nothing beats it;
+            // otherwise dec[i,c] wins if it is NaN or strictly greater.
+            let mut best_idx = 0;
+            let mut best = dec[[i, 0]];
+            for c in 1..n_classes {
+                if best.is_nan() {
+                    break;
+                }
+                let v = dec[[i, c]];
+                if v.is_nan() || v > best {
+                    best = v;
+                    best_idx = c;
                 }
             }
-
-            predictions[i] = self.classes[best_class];
+            predictions[i] = self.classes[best_idx];
         }
 
         Ok(predictions)
