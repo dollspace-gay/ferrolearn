@@ -27,6 +27,7 @@
 //!   * `TweedieRegressor(power=1.5, alpha=0)` (log link) — ferrolearn coef
 //!     0.742980981726, int 0.048291902 vs oracle coef 0.742980981243,
 //!     int 0.048291904 (#549 log-link alpha=0 path CORRECT).
+//!
 //! These three match to <1e-9, far inside any solver-tolerance band, so no
 //! failing test is written for them. The divergences pinned below are all in
 //! the alpha>0 objective, the always-log link, and the default power.

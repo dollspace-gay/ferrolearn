@@ -224,11 +224,11 @@ impl<F: Float> KernelCache<F> {
             return val;
         }
         let val = kernel.compute(&data[i], &data[j]);
-        if self.order.len() >= self.capacity {
-            if let Some(old_key) = self.order.first().copied() {
-                self.cache.remove(&old_key);
-                self.order.remove(0);
-            }
+        if self.order.len() >= self.capacity
+            && let Some(old_key) = self.order.first().copied()
+        {
+            self.cache.remove(&old_key);
+            self.order.remove(0);
         }
         self.cache.insert(key, val);
         self.order.push(key);

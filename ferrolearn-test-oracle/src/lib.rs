@@ -580,14 +580,13 @@ pub fn fixtures_dir() -> PathBuf {
     let mut dir = manifest_path;
     loop {
         let cargo = dir.join("Cargo.toml");
-        if cargo.is_file() {
-            if let Ok(text) = std::fs::read_to_string(&cargo) {
-                if text.contains("[workspace]") {
-                    let candidate = dir.join("fixtures");
-                    if candidate.is_dir() {
-                        return candidate;
-                    }
-                }
+        if cargo.is_file()
+            && let Ok(text) = std::fs::read_to_string(&cargo)
+            && text.contains("[workspace]")
+        {
+            let candidate = dir.join("fixtures");
+            if candidate.is_dir() {
+                return candidate;
             }
         }
         match dir.parent() {

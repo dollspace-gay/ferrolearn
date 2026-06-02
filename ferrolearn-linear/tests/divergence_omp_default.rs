@@ -138,7 +138,7 @@ fn control_omp_greedy_k5_matches_sklearn() {
     );
 }
 
-const X_FLAT: [f64; 4420] = [
+static X_FLAT: [f64; 4420] = [
     0.038075906433423026,
     0.05068011873981862,
     0.061696206518683294,

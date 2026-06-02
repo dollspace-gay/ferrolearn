@@ -329,13 +329,13 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let max_k = effective_n_nonzero.unwrap_or(n_features).min(n_features);
 
-        if let Some(n) = self.n_nonzero_coefs {
-            if n > n_features {
-                return Err(FerroError::InvalidParameter {
-                    name: "n_nonzero_coefs".into(),
-                    reason: format!("cannot exceed number of features ({n_features})"),
-                });
-            }
+        if let Some(n) = self.n_nonzero_coefs
+            && n > n_features
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "n_nonzero_coefs".into(),
+                reason: format!("cannot exceed number of features ({n_features})"),
+            });
         }
 
         // Center data if fitting intercept.

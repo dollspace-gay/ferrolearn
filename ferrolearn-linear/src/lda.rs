@@ -2067,13 +2067,13 @@ mod tests {
         let y = array![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
         let fitted = LDA::<f64>::new(Some(2)).fit(&x, &y).unwrap();
         for i in 0..3 {
-            for j in 0..2 {
-                assert_abs_diff_eq!(fitted.coef()[[i, j]], SK_COEF[i][j], epsilon = 1e-9);
+            for (j, &expected) in SK_COEF[i].iter().enumerate() {
+                assert_abs_diff_eq!(fitted.coef()[[i, j]], expected, epsilon = 1e-9);
             }
             assert_abs_diff_eq!(fitted.intercept()[i], SK_INTERCEPT[i], epsilon = 1e-9);
         }
-        for j in 0..2 {
-            assert_abs_diff_eq!(fitted.xbar()[j], SK_XBAR[j], epsilon = 1e-12);
+        for (j, &expected) in SK_XBAR.iter().enumerate() {
+            assert_abs_diff_eq!(fitted.xbar()[j], expected, epsilon = 1e-12);
         }
     }
 

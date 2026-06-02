@@ -338,7 +338,7 @@ pub(crate) fn solve_ridge<F: LinalgFloat>(
 
     // Add regularization: X^T X + alpha * I
     for i in 0..n {
-        xtx[[i, i]] = xtx[[i, i]] + alpha;
+        xtx[[i, i]] += alpha;
     }
 
     cholesky_solve(&xtx, &xty)
