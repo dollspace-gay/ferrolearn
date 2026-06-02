@@ -59,7 +59,7 @@
 //! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`penalty`, `l1_ratio`, `fit_intercept`, `shuffle`, `epsilon`, `n_iter_no_change`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. |
 //! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | NOT-STARTED | blocker #530. First-epoch mean-loss delta; sklearn `best_loss`+`n_iter_no_change`+`sumloss` (`_sgd_fast.pyx.tp:688-707`); missing dloss `+-1e12` clip. |
 //! | REQ-11 (fit_intercept) | NOT-STARTED | blocker #531. No field; intercept always fit (`_sgd_fast.pyx.tp:639`). |
-//! | REQ-12 (shuffle flag) | NOT-STARTED | blocker #532. Always shuffles (`_sgd_fast.pyx.tp:579`). |
+//! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
 //! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
 //! | REQ-14 (average / ASGD) | NOT-STARTED | blocker #534. No averaged coef/intercept (`_sgd_fast.pyx.tp:646-654`). |
 //! | REQ-15 (class_weight) | NOT-STARTED | blocker #535. No per-class `weight_pos`/`weight_neg`/`sample_weight` (`_sgd_fast.pyx.tp:599-602,630`). |
@@ -462,6 +462,10 @@ pub struct SGDClassifier<F> {
     pub random_state: Option<u64>,
     /// Power parameter for inverse scaling schedule.
     pub power_t: F,
+    /// Whether to shuffle the training data after each epoch. Defaults to
+    /// `true` (sklearn `SGDClassifier(shuffle=True)`,
+    /// `_stochastic_gradient.py:107`).
+    pub shuffle: bool,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -485,6 +489,7 @@ impl<F: Float> SGDClassifier<F> {
             tol: F::from(1e-3).unwrap_or_else(F::zero),
             random_state: None,
             power_t: F::from(0.5).unwrap_or_else(F::zero),
+            shuffle: true,
         }
     }
 
@@ -558,6 +563,18 @@ impl<F: Float> SGDClassifier<F> {
         self.power_t = power_t;
         self
     }
+
+    /// Set whether the training data is shuffled after each epoch.
+    ///
+    /// Mirrors sklearn's `shuffle` parameter (default `True`,
+    /// `_stochastic_gradient.py:107`). With `false` the samples are visited in
+    /// index order `0..n-1` every epoch (`_sgd_fast.pyx.tp:579-581`), making the
+    /// fit fully deterministic and cross-impl comparable to sklearn.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = shuffle;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -578,6 +595,7 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         power_t: clf.power_t,
         penalty: clf.penalty,
         l1_ratio: clf.l1_ratio,
+        shuffle: clf.shuffle,
     }
 }
 
@@ -595,6 +613,8 @@ struct SGDHyper<F> {
     penalty: Penalty,
     /// Elastic-net mixing parameter (only meaningful for `ElasticNet`).
     l1_ratio: F,
+    /// Whether to shuffle the sample order each epoch (`_sgd_fast.pyx.tp:579`).
+    shuffle: bool,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -647,7 +667,13 @@ where
     let mut total_loss = F::zero();
 
     for _epoch in 0..hyper.max_iter {
-        indices.shuffle(&mut rng);
+        // sklearn shuffles the sample order each epoch only when `shuffle` is
+        // set (`_sgd_fast.pyx.tp:579-580`: `if shuffle: dataset.shuffle(seed)`).
+        // With `shuffle == false` the indices stay `0..n-1` every epoch, exactly
+        // matching sklearn's no-shuffle index order (`:581 for i in range(n)`).
+        if hyper.shuffle {
+            indices.shuffle(&mut rng);
+        }
         let mut epoch_loss = F::zero();
 
         for &i in &indices {
@@ -1282,6 +1308,10 @@ pub struct SGDRegressor<F> {
     pub random_state: Option<u64>,
     /// Power parameter for inverse scaling schedule.
     pub power_t: F,
+    /// Whether to shuffle the training data after each epoch. Defaults to
+    /// `true` (sklearn `SGDRegressor(shuffle=True)`,
+    /// `_stochastic_gradient.py:2038`).
+    pub shuffle: bool,
 }
 
 impl<F: Float> SGDRegressor<F> {
@@ -1296,6 +1326,7 @@ impl<F: Float> SGDRegressor<F> {
     pub fn new() -> Self {
         Self {
             loss: RegressorLoss::SquaredError,
+            shuffle: true,
             penalty: Penalty::L2,
             l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
             learning_rate: LearningRateSchedule::InvScaling,
@@ -1378,6 +1409,18 @@ impl<F: Float> SGDRegressor<F> {
         self.power_t = power_t;
         self
     }
+
+    /// Set whether the training data is shuffled after each epoch.
+    ///
+    /// Mirrors sklearn's `shuffle` parameter (default `True`,
+    /// `_stochastic_gradient.py:2038`). With `false` the samples are visited in
+    /// index order `0..n-1` every epoch (`_sgd_fast.pyx.tp:579-581`), making the
+    /// fit fully deterministic and cross-impl comparable to sklearn.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = shuffle;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDRegressor<F> {
@@ -1398,6 +1441,7 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         power_t: reg.power_t,
         penalty: reg.penalty,
         l1_ratio: reg.l1_ratio,
+        shuffle: reg.shuffle,
     }
 }
 
@@ -1445,7 +1489,13 @@ where
     let mut total_loss = F::zero();
 
     for _epoch in 0..hyper.max_iter {
-        indices.shuffle(&mut rng);
+        // sklearn shuffles the sample order each epoch only when `shuffle` is
+        // set (`_sgd_fast.pyx.tp:579-580`: `if shuffle: dataset.shuffle(seed)`).
+        // With `shuffle == false` the indices stay `0..n-1` every epoch, exactly
+        // matching sklearn's no-shuffle index order (`:581 for i in range(n)`).
+        if hyper.shuffle {
+            indices.shuffle(&mut rng);
+        }
         let mut epoch_loss = F::zero();
 
         for &i in &indices {

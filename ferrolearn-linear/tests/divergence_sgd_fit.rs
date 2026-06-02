@@ -438,3 +438,118 @@ fn sgd_l1_ratio_out_of_range_rejected() {
          ferrolearn accepted it (fit returned Ok)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-12 / #532 — `shuffle=false` deterministic MULTI-sample, MULTI-epoch
+// kernel parity against the live sklearn oracle.
+//
+// sklearn site: `sklearn/linear_model/_stochastic_gradient.py:107` (default
+//   `shuffle=True`), constraint `"shuffle": ["boolean"]` (`:89`); kernel gate
+//   `sklearn/linear_model/_sgd_fast.pyx.tp:579-581`:
+//     `if shuffle:`
+//     `    dataset.shuffle(seed)`
+//     `for i in range(n_samples):`
+//   so with `shuffle=False` the samples are visited in index order `0..n-1`
+//   every epoch (no permutation), and ALL other kernel logic (schedule,
+//   penalty, gradient) is unchanged.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `train_regressor_sgd`
+//   `if hyper.shuffle { indices.shuffle(&mut rng); }` — when `shuffle=false`,
+//   `indices` stays `0..n-1` each epoch, matching sklearn exactly.
+//
+// This is the FIRST multi-sample, multi-epoch cross-impl parity test: the RNG
+// barrier that forced every other pin to n_samples=1 is removed by `shuffle=
+// false`, so the FULL update kernel (L2 shrink + gradient add + elasticnet L1
+// truncation, applied across 4 samples × 5 epochs) is validated against the
+// oracle. To isolate the kernel from the still-divergent early-stopping logic
+// (#530) both sides disable convergence: ferrolearn `with_tol(0.0)`
+// (`abs(prev_loss-epoch_loss) < 0.0` is never true, so all max_iter epochs
+// run) and sklearn `tol=None` (no early stop). `learning_rate='constant'`
+// removes the t/t0 schedule subtleties so any mismatch is purely the update
+// rule.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocations (live scikit-learn 1.5.2):
+/// ```text
+/// # penalty='l2'
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01, \
+///   learning_rate='constant',eta0=0.01,max_iter=5,tol=None,shuffle=False, \
+///   random_state=0,fit_intercept=True).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.5103165909636498, 0.42319810364130317] [0.16255331549195393]
+///
+/// # penalty='elasticnet', l1_ratio=0.3
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_error',penalty='elasticnet',l1_ratio=0.3, \
+///   alpha=0.01,learning_rate='constant',eta0=0.01,max_iter=5,tol=None, \
+///   shuffle=False,random_state=0,fit_intercept=True).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # -> [0.5102136050112174, 0.4230749783888256] [0.16265294456399926]
+/// ```
+#[test]
+fn sgd_shuffle_false_multisample_kernel_parity() {
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0]).unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+
+    // ----- penalty='l2' (live oracle) -----
+    const SK_L2_COEF0: f64 = 0.5103165909636498;
+    const SK_L2_COEF1: f64 = 0.42319810364130317;
+    const SK_L2_INTERCEPT: f64 = 0.16255331549195393;
+
+    let model_l2 = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(0.0) // abs(prev-cur) < 0.0 is never true -> all 5 epochs run
+        .with_shuffle(false) // index order 0..n-1 each epoch, matches sklearn
+        .with_random_state(0);
+
+    let fitted_l2 = model_l2.fit(&x, &y).unwrap();
+    let coef_l2 = fitted_l2.coefficients();
+    let intercept_l2 = fitted_l2.intercept();
+
+    assert!(
+        (coef_l2[0] - SK_L2_COEF0).abs() < 1e-7
+            && (coef_l2[1] - SK_L2_COEF1).abs() < 1e-7
+            && (intercept_l2 - SK_L2_INTERCEPT).abs() < 1e-7,
+        "shuffle=false L2 multi-sample kernel diverges: sklearn coef=[{SK_L2_COEF0}, \
+         {SK_L2_COEF1}] intercept={SK_L2_INTERCEPT}; ferrolearn coef={coef_l2:?} \
+         intercept={intercept_l2}"
+    );
+
+    // ----- penalty='elasticnet', l1_ratio=0.3 (live oracle) -----
+    const SK_EN_COEF0: f64 = 0.5102136050112174;
+    const SK_EN_COEF1: f64 = 0.4230749783888256;
+    const SK_EN_INTERCEPT: f64 = 0.16265294456399926;
+
+    let model_en = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::ElasticNet)
+        .with_l1_ratio(0.3)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(0.0)
+        .with_shuffle(false)
+        .with_random_state(0);
+
+    let fitted_en = model_en.fit(&x, &y).unwrap();
+    let coef_en = fitted_en.coefficients();
+    let intercept_en = fitted_en.intercept();
+
+    assert!(
+        (coef_en[0] - SK_EN_COEF0).abs() < 1e-7
+            && (coef_en[1] - SK_EN_COEF1).abs() < 1e-7
+            && (intercept_en - SK_EN_INTERCEPT).abs() < 1e-7,
+        "shuffle=false elasticnet(l1_ratio=0.3) multi-sample kernel diverges: sklearn \
+         coef=[{SK_EN_COEF0}, {SK_EN_COEF1}] intercept={SK_EN_INTERCEPT}; ferrolearn \
+         coef={coef_en:?} intercept={intercept_en}"
+    );
+}
