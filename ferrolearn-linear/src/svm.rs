@@ -37,6 +37,30 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2): SHIPPED = impl + non-test production consumer + tests +
+//! green oracle verification; NOT-STARTED = open blocker `#`. `SVC`/`SVR`/
+//! `FittedSVC`/`FittedSVR`/`Kernel` + the four kernels are boundary estimator
+//! types re-exported at the crate root (`pub use svm::{…}` in `lib.rs`) and
+//! consumed by `nu_svm.rs` (`NuSVC`/`NuSVR` delegate to `SVC`/`SVR`) and
+//! `one_class_svm.rs` (uses `Kernel`) — non-test production consumers; under
+//! S5/R-DEFER-1 the fitted-attribute accessors are part of that boundary public
+//! API surface. See `.design/linear/svm.md`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (kernels + gamma scale/auto/float) | NOT-STARTED | open #641. The four kernel formulas + `gamma='scale'` (default, `fn resolved_for_fit in svm.rs` = `1/(n_features·X.var())`) + explicit float are done and pinned (`divergence_pin2_rbf_default_scale_gamma`; #634 closed); the `'auto' = 1/n_features` variant is not yet expressible (no estimator-level gamma enum) — pending the param-surface work #641. |
+//! | REQ-2 (C-SVC SMO fit) | SHIPPED | `fn smo_binary in svm.rs` (Fan-Chen-Lin WSS) converges to libsvm's `α`; pinned by `divergence_pin5_binary_fitted_attributes in tests/divergence_svm_fit.rs` (`dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `support_ [1,2,3]`, `intercept_ [-1.8565]` vs live `SVC(kernel='linear',C=1.0)`). |
+//! | REQ-3 (fitted attrs + binary sign flip) | SHIPPED | `FittedSVC::{support,support_vectors,n_support,dual_coef,intercept,coef} in svm.rs` emit the libsvm layout with the binary sign flip (`_base.py:258-262`); `coef_` is linear-only (`_base.py:642-666`). Pinned by `divergence_pin5_*` (binary) + `divergence_pin6_multiclass_dual_coef_packing` (multiclass `(n_class-1,n_SV)` packing). |
+//! | REQ-4 (decision_function shape/sign/ovr) | NOT-STARTED | open #637. Per-sample values match (`divergence_pin1_binary_decision_function_values`) but binary `decision_function` returns `(n,1)` not sklearn's 1-D `(n,)` `-dec.ravel()`, and there is no `decision_function_shape`/`_ovr_decision_function` transform (`_base.py:538-539, 779-780`). |
+//! | REQ-5 (predict + tie-break) | NOT-STARTED | open #638. `fn predict in svm.rs` ovo voting matches the oracle labels on separable sets (`divergence_pin3_predict_labels`), but vote ties use `max_by_key` (last-maximum) instead of libsvm's lower-class-index tie-break (`_base.py:814`). |
+//! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
+//! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
+//! | REQ-8 (constructor param surface + defaults) | NOT-STARTED | open #641. The kernel is the type parameter `K`; missing estimator-level `kernel`(string)/`degree`/`gamma`/`coef0`/`shrinking`/`class_weight`/`decision_function_shape`/`break_ties`/`random_state`; defaults diverge (`max_iter=10000` vs sklearn `-1`, `cache_size=1024` vs `200`). |
+//! | REQ-9 (probability / predict_proba) | NOT-STARTED | open #642. No `probability` Platt-scaling CV (`_probA`/`_probB`), no `predict_proba`/`predict_log_proba` (`_base.py:820-925`). |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
 use std::collections::HashMap;
 
@@ -77,6 +101,17 @@ pub trait Kernel<F: Float>: Clone + Send + Sync {
         Self: Sized,
     {
         self.clone()
+    }
+
+    /// Whether this is the linear kernel `K(x, y) = x . y`.
+    ///
+    /// sklearn exposes `coef_` (the primal weight vector
+    /// `dual_coef_ @ support_vectors_`) ONLY for the linear kernel and raises
+    /// `AttributeError` otherwise (`sklearn/svm/_base.py:650-651`). The default
+    /// is `false`; [`LinearKernel`] overrides it to `true`.
+    #[must_use]
+    fn is_linear(&self) -> bool {
+        false
     }
 }
 
@@ -125,6 +160,10 @@ impl<F: Float> Kernel<F> for LinearKernel {
         x.iter()
             .zip(y.iter())
             .fold(F::zero(), |acc, (&a, &b)| acc + a * b)
+    }
+
+    fn is_linear(&self) -> bool {
+        true
     }
 }
 
@@ -591,11 +630,22 @@ impl<F: Float, K: Kernel<F>> SVC<F, K> {
 struct BinarySvm<F> {
     /// Support vectors (stored as rows).
     support_vectors: Vec<Vec<F>>,
-    /// Dual coefficients: alpha_i * y_i for each support vector.
+    /// Original training-row index of each support vector (parallel to
+    /// `support_vectors`/`dual_coefs`). Used to build the global, per-class
+    /// grouped `support_` set (`sklearn/svm/_base.py:318-410`).
+    sv_indices: Vec<usize>,
+    /// Dual coefficients: `alpha_i * y_i` for each support vector, where this
+    /// crate maps the lower-index class (`class_neg`) to `y = -1` and the
+    /// higher-index class (`class_pos`) to `y = +1`. NOTE this is the OPPOSITE
+    /// sign convention to libsvm internally (libsvm gives the lower-index class
+    /// `+1`); the public-attribute layout compensates in
+    /// [`FittedSVC::dual_coef`].
     dual_coefs: Vec<F>,
     /// Bias term.
     bias: F,
-    /// The two class labels: (negative_class, positive_class).
+    /// The two class labels: (negative_class, positive_class). `class_neg` is
+    /// the lower class index and `class_pos` the higher (the ovo pair `(a, b)`
+    /// with `a < b`).
     class_neg: usize,
     class_pos: usize,
 }
@@ -608,10 +658,18 @@ struct BinarySvm<F> {
 pub struct FittedSVC<F, K> {
     /// The kernel used for predictions.
     kernel: K,
-    /// One binary SVM per class pair.
+    /// One binary SVM per class pair, in libsvm ovo pair order
+    /// `(0,1),(0,2),...,(0,k-1),(1,2),...` (the `(ci,cj)` double loop).
     binary_models: Vec<BinarySvm<F>>,
-    /// Sorted unique classes.
+    /// Sorted unique classes (`classes_ = np.unique(y)`).
     classes: Vec<usize>,
+    /// The training feature matrix, retained so the libsvm-layout fitted
+    /// attributes (`support_`, `support_vectors_`) can index back into the
+    /// original rows (`sklearn/svm/_base.py:318-410`).
+    x_train: Array2<F>,
+    /// The training labels (class index per row), retained so `support_` can
+    /// be grouped by class.
+    y_train: Vec<usize>,
 }
 
 impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
@@ -646,6 +704,200 @@ impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
         }
 
         Ok(result)
+    }
+}
+
+impl<F: Float + ScalarOperand + 'static, K: Kernel<F>> FittedSVC<F, K> {
+    /// Build the global, per-class-grouped support-vector index set, mirroring
+    /// libsvm's `support_` layout (`sklearn/svm/_base.py:318-410`): the indices
+    /// of the training rows that are a support vector in AT LEAST ONE ovo
+    /// binary problem, deduplicated, grouped by class (all of class
+    /// `classes_[0]` first, then `classes_[1]`, ...), ascending within a class.
+    ///
+    /// Returns `(support, per_class_indices)` where `support` is the flat
+    /// grouped index vector and `per_class_indices[c]` is the (ascending)
+    /// list of global training-row indices that are SVs for class
+    /// `classes_[c]`.
+    fn build_support(&self) -> (Vec<usize>, Vec<Vec<usize>>) {
+        let n_classes = self.classes.len();
+        // Per-class set of training-row indices that are an SV anywhere.
+        let mut per_class: Vec<Vec<usize>> = vec![Vec::new(); n_classes];
+        let mut seen: Vec<bool> = vec![false; self.y_train.len()];
+
+        for model in &self.binary_models {
+            for &idx in &model.sv_indices {
+                if !seen[idx] {
+                    seen[idx] = true;
+                    let cls = self.y_train[idx];
+                    if let Some(ci) = self.classes.iter().position(|&c| c == cls) {
+                        per_class[ci].push(idx);
+                    }
+                }
+            }
+        }
+
+        for group in &mut per_class {
+            group.sort_unstable();
+        }
+
+        let support: Vec<usize> = per_class.iter().flatten().copied().collect();
+        (support, per_class)
+    }
+
+    /// Indices of the support vectors into the training set, **grouped by
+    /// class** (all class-`classes_[0]` SVs first, then `classes_[1]`, ...),
+    /// ascending within each class.
+    ///
+    /// Mirrors `SVC.support_` (`sklearn/svm/_base.py:318-410`).
+    #[must_use]
+    pub fn support(&self) -> Array1<usize> {
+        let (support, _) = self.build_support();
+        Array1::from_vec(support)
+    }
+
+    /// The support vectors `X[support_]`, shape `(n_SV, n_features)`.
+    ///
+    /// Mirrors `SVC.support_vectors_` (`sklearn/svm/_base.py:318-410`).
+    #[must_use]
+    pub fn support_vectors(&self) -> Array2<F> {
+        let (support, _) = self.build_support();
+        let n_features = self.x_train.ncols();
+        let mut out = Array2::<F>::zeros((support.len(), n_features));
+        for (row, &idx) in support.iter().enumerate() {
+            out.row_mut(row).assign(&self.x_train.row(idx));
+        }
+        out
+    }
+
+    /// Number of support vectors per class (`n_support_`,
+    /// `sklearn/svm/_base.py:668-682`), parallel to `classes_`.
+    #[must_use]
+    pub fn n_support(&self) -> Vec<usize> {
+        let (_, per_class) = self.build_support();
+        per_class.iter().map(Vec::len).collect()
+    }
+
+    /// Dual coefficients in the libsvm public layout, shape
+    /// `(n_class - 1, n_SV)` (`sklearn/svm/_base.py:318-410`, the `dual_coef_`
+    /// attribute), columns in `support_` (per-class-grouped) order.
+    ///
+    /// For an SV belonging to class `i`, row `m` holds its coefficient in the
+    /// binary classifier between class `i` and the `m`-th OTHER class (the
+    /// other classes in increasing index order, skipping `i`). In the ovo pair
+    /// `(a, b)` with `a < b`, libsvm uses class `a` as the `+1` side and `b` as
+    /// `-1`; the stored coefficient is `alpha * y_libsvm`.
+    ///
+    /// This crate stores `alpha * y` per pair with the OPPOSITE sign
+    /// (`class_neg = a` mapped to `-1`), so the libsvm-internal coefficient is
+    /// the negation of the stored value. For `n_class == 2` sklearn negates the
+    /// internal coefficient again to form the PUBLIC binary attribute
+    /// (`sklearn/svm/_base.py:258-262`: `dual_coef_ = -dual_coef_`), which
+    /// leaves the public binary value equal to this crate's stored value; for
+    /// `n_class > 2` the public value IS the libsvm-internal value (no flip).
+    #[must_use]
+    pub fn dual_coef(&self) -> Array2<F> {
+        let n_classes = self.classes.len();
+        let (support, _per_class) = self.build_support();
+        let n_sv = support.len();
+
+        if n_classes == 2 {
+            // Binary: public dual_coef_ = -internal, and internal = -stored,
+            // so public = stored. The single ovo model holds one stored coef
+            // per SV keyed by training index; map them into support_ column
+            // order.
+            let mut out = Array2::<F>::zeros((1, n_sv));
+            if let Some(model) = self.binary_models.first() {
+                for (sv_idx, &coef) in model.sv_indices.iter().zip(model.dual_coefs.iter()) {
+                    if let Some(col) = support.iter().position(|&s| s == *sv_idx) {
+                        out[[0, col]] = coef;
+                    }
+                }
+            }
+            return out;
+        }
+
+        // Multiclass: public dual_coef_ = libsvm-internal = -(stored). Row m
+        // for an SV of class i is its coefficient in the pair (i, m-th other).
+        let mut out = Array2::<F>::zeros((n_classes - 1, n_sv));
+
+        // Column index in `support_` for a given training-row index.
+        let col_of: HashMap<usize, usize> =
+            support.iter().enumerate().map(|(c, &i)| (i, c)).collect();
+
+        for model in &self.binary_models {
+            let a = model.class_neg; // lower-index class in the pair
+            let b = model.class_pos; // higher-index class
+            let ai = self.classes.iter().position(|&c| c == a);
+            let bi = self.classes.iter().position(|&c| c == b);
+            let (ai, bi) = match (ai, bi) {
+                (Some(ai), Some(bi)) => (ai, bi),
+                _ => continue,
+            };
+
+            for (sv_idx, &stored) in model.sv_indices.iter().zip(model.dual_coefs.iter()) {
+                let Some(&col) = col_of.get(sv_idx) else {
+                    continue;
+                };
+                let cls = self.y_train[*sv_idx];
+                let internal = stored.neg(); // libsvm internal = -(stored)
+                // Determine which row this pair occupies for class `cls`:
+                // the count of OTHER classes with index < the partner's index.
+                let (own_class_index, partner_class_index) =
+                    if cls == a { (ai, bi) } else { (bi, ai) };
+                // Row m = number of other classes (excluding own) with class
+                // index < partner_class_index.
+                let mut row = 0usize;
+                for ci in 0..n_classes {
+                    if ci == own_class_index {
+                        continue;
+                    }
+                    if ci < partner_class_index {
+                        row += 1;
+                    }
+                }
+                out[[row, col]] = internal;
+            }
+        }
+
+        out
+    }
+
+    /// The per-ovo-problem intercepts, length `n_class * (n_class - 1) / 2`,
+    /// in pair order `(0,1),(0,2),(1,2),...` (`intercept_`,
+    /// `sklearn/svm/_base.py:318-410`). For `n_class == 2` sklearn negates the
+    /// internal bias to form the public attribute
+    /// (`sklearn/svm/_base.py:258-262`: `intercept_ *= -1`).
+    ///
+    /// This crate's per-pair `bias` is recovered for the decision function
+    /// `sum coef*K + bias` with `class_pos` (the higher index) as the `+1`
+    /// side. libsvm/sklearn use the lower-index class as `+1`, so the
+    /// libsvm-internal intercept is the negation of this crate's `bias`. For
+    /// binary, the public attribute negates the internal again, leaving the
+    /// public value equal to this crate's stored `bias`; for multiclass the
+    /// public value IS the internal `-bias`.
+    #[must_use]
+    pub fn intercept(&self) -> Array1<F> {
+        let n_classes = self.classes.len();
+        let vals: Vec<F> = if n_classes == 2 {
+            self.binary_models.iter().map(|m| m.bias).collect()
+        } else {
+            self.binary_models.iter().map(|m| m.bias.neg()).collect()
+        };
+        Array1::from_vec(vals)
+    }
+
+    /// Primal weight vector `coef_ = dual_coef_ @ support_vectors_`, shape
+    /// `(n_class - 1, n_features)` — available ONLY for the linear kernel
+    /// (`sklearn/svm/_base.py:650-666`). Returns `None` for any other kernel
+    /// (sklearn raises `AttributeError`).
+    #[must_use]
+    pub fn coef(&self) -> Option<Array2<F>> {
+        if !self.kernel.is_linear() {
+            return None;
+        }
+        let dual = self.dual_coef(); // (n_class-1, n_SV)
+        let svs = self.support_vectors(); // (n_SV, n_features)
+        Some(dual.dot(&svs))
     }
 }
 
@@ -744,16 +996,21 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 let eps = F::from(1e-8).unwrap_or_else(F::epsilon);
                 let mut sv_data = Vec::new();
                 let mut sv_coefs = Vec::new();
+                let mut sv_idx = Vec::new();
 
                 for (k, &alpha) in result.alphas.iter().enumerate() {
                     if alpha > eps {
                         sv_data.push(sub_data[k].clone());
                         sv_coefs.push(alpha * sub_labels[k]);
+                        // Record the ORIGINAL training-row index of this SV
+                        // (sub_indices maps the per-pair row k back to X).
+                        sv_idx.push(sub_indices[k]);
                     }
                 }
 
                 binary_models.push(BinarySvm {
                     support_vectors: sv_data,
+                    sv_indices: sv_idx,
                     dual_coefs: sv_coefs,
                     bias: result.bias,
                     class_neg,
@@ -766,6 +1023,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             kernel,
             binary_models,
             classes,
+            x_train: x.clone(),
+            y_train: y.to_vec(),
         })
     }
 }
@@ -909,6 +1168,9 @@ pub struct FittedSVR<F, K> {
     kernel: K,
     /// Support vectors.
     support_vectors: Vec<Vec<F>>,
+    /// Original training-row index of each support vector (parallel to
+    /// `support_vectors`/`dual_coefs`), for the `support_` attribute.
+    sv_indices: Vec<usize>,
     /// Dual coefficients (alpha_i* - alpha_i) for each support vector.
     dual_coefs: Vec<F>,
     /// Bias term.
@@ -938,6 +1200,58 @@ impl<F: Float, K: Kernel<F>> FittedSVR<F, K> {
             result[s] = self.decision_value(&xi);
         }
         Ok(result)
+    }
+
+    /// Indices of the support vectors into the training set, ascending
+    /// (`SVR.support_`, `sklearn/svm/_base.py:318-410`). SVR has a single
+    /// "class", so there is no per-class grouping; the SVs are kept in
+    /// training-row order.
+    #[must_use]
+    pub fn support(&self) -> Array1<usize> {
+        Array1::from_vec(self.sv_indices.clone())
+    }
+
+    /// The support vectors, shape `(n_SV, n_features)`
+    /// (`SVR.support_vectors_`).
+    #[must_use]
+    pub fn support_vectors(&self) -> Array2<F> {
+        let n_sv = self.support_vectors.len();
+        let n_features = self.support_vectors.first().map_or(0, Vec::len);
+        let mut out = Array2::<F>::zeros((n_sv, n_features));
+        for (r, sv) in self.support_vectors.iter().enumerate() {
+            for (c, &v) in sv.iter().enumerate() {
+                out[[r, c]] = v;
+            }
+        }
+        out
+    }
+
+    /// Number of support vectors. For SVR `n_support_` has size 1
+    /// (`sklearn/svm/_base.py:680-682`).
+    #[must_use]
+    pub fn n_support(&self) -> Vec<usize> {
+        vec![self.support_vectors.len()]
+    }
+
+    /// Dual coefficients `alpha*_i - alpha_i`, shape `(1, n_SV)`
+    /// (`SVR.dual_coef_`). No sign flip applies to SVR
+    /// (`sklearn/svm/_base.py:260` restricts the flip to `c_svc`/`nu_svc`).
+    #[must_use]
+    pub fn dual_coef(&self) -> Array2<F> {
+        let n_sv = self.dual_coefs.len();
+        let mut out = Array2::<F>::zeros((1, n_sv));
+        for (c, &v) in self.dual_coefs.iter().enumerate() {
+            out[[0, c]] = v;
+        }
+        out
+    }
+
+    /// The intercept, length 1 (`SVR.intercept_`). The SVR decision function is
+    /// `sum coef*K + bias`, matching libsvm's `f(x) = ... + rho`, so the public
+    /// intercept equals this crate's stored `bias` (no sign flip).
+    #[must_use]
+    pub fn intercept(&self) -> Array1<F> {
+        Array1::from_vec(vec![self.bias])
     }
 }
 
@@ -1221,17 +1535,20 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         let eps = F::from(1e-8).unwrap_or_else(F::epsilon);
         let mut sv_data = Vec::new();
         let mut sv_coefs = Vec::new();
+        let mut sv_idx = Vec::new();
 
         for (i, &coef) in coefs.iter().enumerate() {
             if coef.abs() > eps {
                 sv_data.push(data[i].clone());
                 sv_coefs.push(coef);
+                sv_idx.push(i);
             }
         }
 
         Ok(FittedSVR {
             kernel,
             support_vectors: sv_data,
+            sv_indices: sv_idx,
             dual_coefs: sv_coefs,
             bias,
         })
@@ -1492,5 +1809,228 @@ mod tests {
 
         let model = SVR::new(LinearKernel);
         assert!(model.fit(&x, &y).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-3 smoke tests: libsvm-layout fitted attributes (binary sign flip).
+    //
+    // Expected values from the LIVE sklearn 1.5.2 oracle (R-CHAR-3), never
+    // copied from the ferrolearn side:
+    //
+    //   python3 -c "import numpy as np; from sklearn.svm import SVC, SVR
+    //   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]])
+    //   y=np.array([0,0,0,1,1,1]); m=SVC(kernel='linear',C=1.0).fit(X,y)
+    //   print(m.support_.tolist(), m.n_support_.tolist(),
+    //         m.dual_coef_.tolist(), m.intercept_.tolist(), m.coef_.tolist())"
+    //   # [1, 2, 3] [2, 1] [[-0.0408,-0.0408,0.0816]] [-1.8565] [[0.2856,0.2856]]
+    //
+    //   X3=[[0,0],[.5,0],[0,.5],[5,0],[5.5,0],[5,.5],[0,5],[.5,5],[0,5.5]]
+    //   y3=[0,0,0,1,1,1,2,2,2]; m3=SVC(kernel='linear',C=1.0).fit(X3,y3)
+    //   # support_ [1,2,3,5,6,7] n_support_ [2,2,2]
+    //   # dual_coef_ [[0.0988,0,-0.0988,0,-0.0988,0],[0,0.0988,0,0.0494,0,-0.0494]]
+    //   # intercept_ [1.2222,1.2222,0.0]
+    //
+    //   Xr=[[1],[2],[3],[4],[5],[6]]; yr=[2,4,6,8,10,12]
+    //   mr=SVR(kernel='linear',C=100,epsilon=0.1).fit(Xr,yr)
+    //   # support_ [0,5] dual_coef_ [[-0.392,0.392]] intercept_ [0.14] n_support_ [2]
+    //
+    // The tests return `Result` and use `?`/`ok_or` (no unwrap/expect/panic).
+    // -----------------------------------------------------------------------
+
+    type TestResult = Result<(), FerroError>;
+
+    fn err(msg: &str) -> FerroError {
+        FerroError::InvalidParameter {
+            name: "test".into(),
+            reason: msg.into(),
+        }
+    }
+
+    fn binary_fit() -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .fit(&x, &y)
+    }
+
+    #[test]
+    fn test_svc_binary_support_attrs() -> TestResult {
+        let m = binary_fit()?;
+        // support_ [1,2,3], grouped by class (class0:[1,2], class1:[3]).
+        assert_eq!(m.support().to_vec(), vec![1, 2, 3]);
+        // n_support_ [2,1].
+        assert_eq!(m.n_support(), vec![2, 1]);
+        // support_vectors_ = X[support_].
+        let svs = m.support_vectors();
+        assert_eq!(svs.dim(), (3, 2));
+        let expected = [[2.0, 1.0], [1.0, 2.0], [5.0, 5.0]];
+        for (r, row) in expected.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert_relative_eq!(svs[[r, c]], v, epsilon = 1e-10);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_binary_dual_coef_sign_flip() -> TestResult {
+        let m = binary_fit()?;
+        // dual_coef_ shape (1,3) = [[-0.0408,-0.0408,0.0816]] (binary sign flip).
+        let dc = m.dual_coef();
+        assert_eq!(dc.dim(), (1, 3));
+        let oracle = [-0.0408, -0.0408, 0.0816];
+        for (c, &v) in oracle.iter().enumerate() {
+            assert!(
+                (dc[[0, c]] - v).abs() < 1e-2,
+                "dual_coef_[0,{c}] = {} vs oracle {v}",
+                dc[[0, c]]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_binary_intercept_and_coef() -> TestResult {
+        let m = binary_fit()?;
+        // intercept_ [-1.8565], length 1 (binary sign flip).
+        let ic = m.intercept();
+        assert_eq!(ic.len(), 1);
+        assert!(
+            (ic[0] - (-1.8565)).abs() < 1e-2,
+            "intercept_ = {} vs oracle -1.8565",
+            ic[0]
+        );
+        // coef_ [[0.2856,0.2856]] shape (1,2) for the linear kernel.
+        let coef = m.coef().ok_or_else(|| err("linear kernel exposes coef_"))?;
+        assert_eq!(coef.dim(), (1, 2));
+        for c in 0..2 {
+            assert!(
+                (coef[[0, c]] - 0.2856).abs() < 1e-2,
+                "coef_[0,{c}] = {} vs oracle 0.2856",
+                coef[[0, c]]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_coef_none_for_nonlinear() -> TestResult {
+        // coef_ is only available for the linear kernel; RBF -> None
+        // (sklearn raises AttributeError, _base.py:650-651).
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        let m = SVC::new(RbfKernel::with_gamma(0.5)).fit(&x, &y)?;
+        assert!(m.coef().is_none());
+        Ok(())
+    }
+
+    fn multiclass_fit() -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let x = Array2::from_shape_vec(
+            (9, 2),
+            vec![
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0,
+                0.0, 5.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .fit(&x, &y)
+    }
+
+    #[test]
+    fn test_svc_multiclass_support_attrs() -> TestResult {
+        let m = multiclass_fit()?;
+        // support_ [1,2,3,5,6,7] grouped by class; n_support_ [2,2,2].
+        assert_eq!(m.support().to_vec(), vec![1, 2, 3, 5, 6, 7]);
+        assert_eq!(m.n_support(), vec![2, 2, 2]);
+        // intercept_ [1.2222,1.2222,0.0] (no sign flip for multiclass).
+        let ic = m.intercept();
+        assert_eq!(ic.len(), 3);
+        let oracle_ic = [1.2222, 1.2222, 0.0];
+        for (i, &v) in oracle_ic.iter().enumerate() {
+            assert!(
+                (ic[i] - v).abs() < 1e-2,
+                "intercept_[{i}] = {} vs oracle {v}",
+                ic[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_multiclass_dual_coef_packing() -> TestResult {
+        let m = multiclass_fit()?;
+        // dual_coef_ shape (2,6), libsvm packing (cols = SVs [1,2,3,5,6,7]):
+        //   row0 = [0.0988, 0.0, -0.0988, 0.0, -0.0988, 0.0]
+        //   row1 = [0.0, 0.0988, 0.0, 0.0494, 0.0, -0.0494]
+        let dc = m.dual_coef();
+        assert_eq!(dc.dim(), (2, 6));
+        let oracle = [
+            [0.0988, 0.0, -0.0988, 0.0, -0.0988, 0.0],
+            [0.0, 0.0988, 0.0, 0.0494, 0.0, -0.0494],
+        ];
+        for (r, row) in oracle.iter().enumerate() {
+            for (c, &v) in row.iter().enumerate() {
+                assert!(
+                    (dc[[r, c]] - v).abs() < 1e-2,
+                    "dual_coef_[{r},{c}] = {} vs oracle {v}",
+                    dc[[r, c]]
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svr_linear_attrs() -> TestResult {
+        // SVR(kernel='linear', C=100, epsilon=0.1) on the 6x1 set.
+        let x = Array2::from_shape_vec((6, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .map_err(|_| err("shape"))?;
+        let y = array![2.0, 4.0, 6.0, 8.0, 10.0, 12.0];
+        let m = SVR::new(LinearKernel)
+            .with_c(100.0)
+            .with_epsilon(0.1)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .fit(&x, &y)?;
+        // support_ [0,5]; n_support_ [2]; dual_coef_ (1,2) [[-0.392,0.392]];
+        // intercept_ [0.14].
+        assert_eq!(m.support().to_vec(), vec![0, 5]);
+        assert_eq!(m.n_support(), vec![2]);
+        let dc = m.dual_coef();
+        assert_eq!(dc.dim(), (1, 2));
+        assert!(
+            (dc[[0, 0]] - (-0.392)).abs() < 1e-2,
+            "dual_coef_[0,0] = {} vs oracle -0.392",
+            dc[[0, 0]]
+        );
+        assert!(
+            (dc[[0, 1]] - 0.392).abs() < 1e-2,
+            "dual_coef_[0,1] = {} vs oracle 0.392",
+            dc[[0, 1]]
+        );
+        let ic = m.intercept();
+        assert_eq!(ic.len(), 1);
+        assert!(
+            (ic[0] - 0.14).abs() < 1e-2,
+            "intercept_ = {} vs oracle 0.14",
+            ic[0]
+        );
+        Ok(())
     }
 }

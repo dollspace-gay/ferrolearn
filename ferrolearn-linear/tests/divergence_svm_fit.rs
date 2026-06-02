@@ -8,13 +8,11 @@
 //! python3 -c "import numpy as np; from sklearn.svm import SVC, SVR; ..."
 //! ```
 //!
-//! These pins use ONLY the current public API (`SVC::new`/`with_*`, `fit`,
-//! `decision_function`, `predict`, the kernel constructors). The libsvm-layout
-//! fitted-attribute accessors (`support_`/`dual_coef_`/`n_support_`/
-//! `intercept_`/`coef_`) do NOT exist on `FittedSVC`/`FittedSVR`, so REQ-2 /
-//! REQ-3 / REQ-6-attrs / REQ-7-per-pair cannot be pinned here without breaking
-//! compilation — they are blocked on the builder adding accessors (#636/#639/
-//! #640). See the critic report.
+//! PIN 1-4 use the original public API. PIN 5-7 exercise the NEW libsvm-layout
+//! fitted-attribute accessors (`FittedSVC::support`/`support_vectors`/
+//! `n_support`/`dual_coef`/`intercept`/`coef`, `FittedSVR::support`/
+//! `support_vectors`/`n_support`/`dual_coef`/`intercept`) added by the builder
+//! (#636/#639/#640), pinning REQ-2/REQ-3/REQ-6/REQ-7 against the live oracle.
 
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_linear::svm::{LinearKernel, RbfKernel, SVC, SVR};
@@ -213,4 +211,273 @@ fn divergence_pin4_svr_predict_values() {
             (preds[i] - exp).abs()
         );
     }
+}
+
+/// PIN 5 — REQ-2/REQ-3: binary fitted attributes + C-SVC fit correctness
+/// (#635/#636).
+///
+/// Pins the NEW libsvm-layout accessors on `FittedSVC`
+/// (`support`/`n_support`/`support_vectors`/`dual_coef`/`intercept`/`coef`,
+/// `ferrolearn-linear/src/svm.rs`) against the live oracle. Simultaneously
+/// verifies #635 — that `smo_binary` converged to libsvm's alpha (the
+/// `dual_coef`/`intercept` values can only match if the SMO optimum matches).
+///
+/// Binary sign-flip contract: `sklearn/svm/_base.py:260-262`
+/// (`if self._impl in ["c_svc","nu_svc"] and len(self.classes_)==2:
+/// self.intercept_ *= -1; self.dual_coef_ = -self.dual_coef_`); linear-only
+/// `coef_` at `sklearn/svm/_base.py:650-651` (raises `AttributeError` for
+/// non-linear).
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]]); y=np.array([0,0,0,1,1,1]); \
+///   m=SVC(kernel='linear',C=1.0).fit(X,y); \
+///   print(m.support_.tolist(), m.n_support_.tolist(), m.support_vectors_.tolist()); \
+///   print(m.dual_coef_.tolist(), m.intercept_.tolist(), m.coef_.tolist())"
+/// # support_ [1, 2, 3]  n_support_ [2, 1]
+/// # support_vectors_ [[2.,1.],[1.,2.],[5.,5.]]
+/// # dual_coef_ [[-0.0408, -0.0408, 0.0816]] (1,3)  intercept_ [-1.8565333]
+/// # coef_ [[0.2856, 0.2856]] (1,2)
+/// ```
+///
+/// Tracking: #635 / #636
+#[test]
+fn divergence_pin5_binary_fitted_attributes() {
+    let (x, y) = binary_6x2();
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+
+    // support_ == [1,2,3]
+    let support = fitted.support();
+    assert_eq!(
+        support.to_vec(),
+        vec![1usize, 2, 3],
+        "support_: ferrolearn={:?}, sklearn=[1,2,3]",
+        support.to_vec()
+    );
+
+    // n_support_ == [2,1]
+    let n_support = fitted.n_support();
+    assert_eq!(
+        n_support,
+        vec![2usize, 1],
+        "n_support_: ferrolearn={n_support:?}, sklearn=[2,1]"
+    );
+
+    // support_vectors_ == [[2,1],[1,2],[5,5]] (rows in support_ order)
+    let svs = fitted.support_vectors();
+    assert_eq!(svs.dim(), (3, 2), "support_vectors_ shape");
+    let oracle_svs: [[f64; 2]; 3] = [[2.0, 1.0], [1.0, 2.0], [5.0, 5.0]];
+    for (r, row) in oracle_svs.iter().enumerate() {
+        for (c, &exp) in row.iter().enumerate() {
+            assert!(
+                (svs[[r, c]] - exp).abs() < 1e-2,
+                "support_vectors_[{r}][{c}]: ferrolearn={}, sklearn={exp}",
+                svs[[r, c]]
+            );
+        }
+    }
+
+    // dual_coef_ shape (1,3) == [[-0.0408,-0.0408,0.0816]] (verifies #635 SMO).
+    let dual = fitted.dual_coef();
+    assert_eq!(dual.dim(), (1, 3), "dual_coef_ shape");
+    let oracle_dual: [f64; 3] = [-0.0408, -0.0408, 0.0816];
+    for (c, &exp) in oracle_dual.iter().enumerate() {
+        assert!(
+            (dual[[0, c]] - exp).abs() < 1e-2,
+            "dual_coef_[0][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+            dual[[0, c]],
+            (dual[[0, c]] - exp).abs()
+        );
+    }
+
+    // intercept_ == [-1.8565333]
+    let intercept = fitted.intercept();
+    assert_eq!(intercept.len(), 1, "intercept_ length");
+    assert!(
+        (intercept[0] - (-1.8565333)).abs() < 1e-2,
+        "intercept_: ferrolearn={}, sklearn=-1.8565333, gap={}",
+        intercept[0],
+        (intercept[0] - (-1.8565333)).abs()
+    );
+
+    // coef_ == Some([[0.2856,0.2856]]) for linear kernel.
+    let coef = fitted.coef();
+    let coef = coef.expect("coef() must be Some for the linear kernel");
+    assert_eq!(coef.dim(), (1, 2), "coef_ shape");
+    let oracle_coef: [f64; 2] = [0.2856, 0.2856];
+    for (c, &exp) in oracle_coef.iter().enumerate() {
+        assert!(
+            (coef[[0, c]] - exp).abs() < 1e-2,
+            "coef_[0][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+            coef[[0, c]],
+            (coef[[0, c]] - exp).abs()
+        );
+    }
+
+    // coef_ is None for a non-linear (RBF) kernel: sklearn raises
+    // AttributeError (`sklearn/svm/_base.py:650-651`).
+    let rbf_model = SVC::new(RbfKernel::<f64>::with_gamma(0.5))
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let rbf_fitted = rbf_model.fit(&x, &y).unwrap();
+    assert!(
+        rbf_fitted.coef().is_none(),
+        "coef() must be None for a non-linear kernel (sklearn raises AttributeError)"
+    );
+}
+
+/// PIN 6 — REQ-7: multiclass `dual_coef_` packing + per-pair `intercept_`
+/// (#640).
+///
+/// Pins the libsvm `(n_class-1, n_SV)` row-packing of `dual_coef_` and the
+/// per-ovo-pair `intercept_` (length `n_class*(n_class-1)/2`) for a 3-class
+/// linear fit. Multiclass dual_coef has NO binary sign flip
+/// (`sklearn/svm/_base.py:260` restricts the flip to `len(classes_)==2`); the
+/// columns are the SVs in `support_` (per-class-grouped) order.
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[0.,0.],[0.5,0.],[0.,0.5],[5.,0.],[5.5,0.],[5.,0.5],[0.,5.],[0.5,5.],[0.,5.5]]); \
+///   y=np.array([0,0,0,1,1,1,2,2,2]); m=SVC(kernel='linear',C=1.0).fit(X,y); \
+///   print(m.support_.tolist(), m.n_support_.tolist()); \
+///   print(np.round(m.dual_coef_,4).tolist(), np.round(m.intercept_,4).tolist())"
+/// # support_ [1,2,3,5,6,7]  n_support_ [2,2,2]
+/// # dual_coef_ [[0.0988,0,-0.0988,-0,-0.0988,-0],[0,0.0988,0,0.0494,-0,-0.0494]] (2,6)
+/// # intercept_ [1.2222, 1.2222, 0.0]
+/// ```
+///
+/// Tracking: #640
+#[test]
+fn divergence_pin6_multiclass_dual_coef_packing() {
+    let x = Array2::from_shape_vec(
+        (9, 2),
+        vec![
+            0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0, 0.0,
+            5.5,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+    let model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+
+    // support_ == [1,2,3,5,6,7]
+    let support = fitted.support();
+    assert_eq!(
+        support.to_vec(),
+        vec![1usize, 2, 3, 5, 6, 7],
+        "support_: ferrolearn={:?}, sklearn=[1,2,3,5,6,7]",
+        support.to_vec()
+    );
+
+    // n_support_ == [2,2,2]
+    let n_support = fitted.n_support();
+    assert_eq!(
+        n_support,
+        vec![2usize, 2, 2],
+        "n_support_: ferrolearn={n_support:?}, sklearn=[2,2,2]"
+    );
+
+    // dual_coef_ shape (2,6), libsvm packing.
+    let dual = fitted.dual_coef();
+    assert_eq!(dual.dim(), (2, 6), "dual_coef_ shape");
+    let oracle_dual: [[f64; 6]; 2] = [
+        [0.0988, 0.0, -0.0988, 0.0, -0.0988, 0.0],
+        [0.0, 0.0988, 0.0, 0.0494, 0.0, -0.0494],
+    ];
+    for (r, row) in oracle_dual.iter().enumerate() {
+        for (c, &exp) in row.iter().enumerate() {
+            assert!(
+                (dual[[r, c]] - exp).abs() < 1e-2,
+                "dual_coef_[{r}][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+                dual[[r, c]],
+                (dual[[r, c]] - exp).abs()
+            );
+        }
+    }
+
+    // intercept_ length 3 == [1.2222, 1.2222, 0.0]
+    let intercept = fitted.intercept();
+    assert_eq!(intercept.len(), 3, "intercept_ length");
+    let oracle_intercept: [f64; 3] = [1.2222, 1.2222, 0.0];
+    for (i, &exp) in oracle_intercept.iter().enumerate() {
+        assert!(
+            (intercept[i] - exp).abs() < 1e-2,
+            "intercept_[{i}]: ferrolearn={}, sklearn={exp}, gap={}",
+            intercept[i],
+            (intercept[i] - exp).abs()
+        );
+    }
+}
+
+/// PIN 7 — REQ-6: SVR fitted attributes (#639).
+///
+/// Pins the NEW libsvm-layout accessors on `FittedSVR`
+/// (`support`/`dual_coef`/`intercept`, `ferrolearn-linear/src/svm.rs`) against
+/// the live oracle. SVR has no binary sign flip (`sklearn/svm/_base.py:260`
+/// restricts the flip to `c_svc`/`nu_svc`); `n_support_` has size 1
+/// (`sklearn/svm/_base.py:680-682`); `dual_coef_` is `(1, n_SV)`.
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.],[6.]]); y=np.array([2.,4.,6.,8.,10.,12.]); \
+///   m=SVR(kernel='linear',C=100.0,epsilon=0.1).fit(X,y); \
+///   print(m.support_.tolist(), np.round(m.dual_coef_,4).tolist(), np.round(m.intercept_,4).tolist())"
+/// # support_ [0, 5]  dual_coef_ [[-0.392, 0.392]] (1,2)  intercept_ [0.14]
+/// ```
+///
+/// Tracking: #639
+#[test]
+fn divergence_pin7_svr_fitted_attributes() {
+    let x = Array2::from_shape_vec((6, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
+    let y = array![2.0f64, 4.0, 6.0, 8.0, 10.0, 12.0];
+    let model = SVR::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(100.0)
+        .with_epsilon(0.1)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &y).unwrap();
+
+    // support_ == [0,5]
+    let support = fitted.support();
+    assert_eq!(
+        support.to_vec(),
+        vec![0usize, 5],
+        "support_: ferrolearn={:?}, sklearn=[0,5]",
+        support.to_vec()
+    );
+
+    // dual_coef_ shape (1,2) == [[-0.392, 0.392]]
+    let dual = fitted.dual_coef();
+    assert_eq!(dual.dim(), (1, 2), "dual_coef_ shape");
+    let oracle_dual: [f64; 2] = [-0.392, 0.392];
+    for (c, &exp) in oracle_dual.iter().enumerate() {
+        assert!(
+            (dual[[0, c]] - exp).abs() < 1e-2,
+            "dual_coef_[0][{c}]: ferrolearn={}, sklearn={exp}, gap={}",
+            dual[[0, c]],
+            (dual[[0, c]] - exp).abs()
+        );
+    }
+
+    // intercept_ == [0.14]
+    let intercept = fitted.intercept();
+    assert_eq!(intercept.len(), 1, "intercept_ length");
+    assert!(
+        (intercept[0] - 0.14).abs() < 1e-2,
+        "intercept_: ferrolearn={}, sklearn=0.14, gap={}",
+        intercept[0],
+        (intercept[0] - 0.14).abs()
+    );
 }

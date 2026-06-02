@@ -327,11 +327,25 @@ converge to the right α yet still fail parity because of these):
    explicit gamma silently uses `gamma=1`, diverging from the oracle. The kernel
    trait has no `X` access, so `'scale'`/`'auto'` cannot be computed where they
    live now — this is a structural gap, not a tuning bug.
-2. **No libsvm-layout fitted attributes / binary sign flip** — `support_`,
-   `n_support_`, `dual_coef_` (shape `(n_class-1,n_SV)`), `intercept_`, linear
-   `coef_` are not exposed, and the binary sign flip (`intercept_*=-1`,
-   `dual_coef_=-dual_coef_`, `_base.py:258-262`) is absent. Users comparing
-   `m.dual_coef_`/`m.support_` array-by-array (R-DEV-1) will diverge.
+2. **(ADDRESSED for the accessors — pending critic pin)** The libsvm-layout
+   fitted attributes are now exposed: `FittedSVC::support`/`support_vectors`/
+   `n_support`/`dual_coef`/`intercept`/`coef` and `FittedSVR::support`/
+   `support_vectors`/`n_support`/`dual_coef`/`intercept in svm.rs`, with the
+   binary sign flip handled in `dual_coef`/`intercept` (`_base.py:258-262`).
+   `coef` returns `Option<Array2<F>>` (`Some` for the linear kernel via
+   `Kernel::is_linear`, `None` otherwise — sklearn raises `AttributeError`,
+   `_base.py:650-651`). Each `BinarySvm` now records `sv_indices` (the original
+   training-row index of each SV) and `FittedSVC` retains `x_train`/`y_train` so
+   `support_` can be built as the per-class-grouped union of per-pair SVs.
+   In-module `#[cfg(test)]` smoke tests verify binary `support_ [1,2,3]`,
+   `n_support_ [2,1]`, `dual_coef_ [[-0.0408,-0.0408,0.0816]]`,
+   `intercept_ [-1.8565]`, `coef_ [[0.2856,0.2856]]`; the 3-class
+   `dual_coef_ (2,6)` libsvm packing + `intercept_ [1.2222,1.2222,0.0]`; and
+   SVR `support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]`
+   against the live oracle (R-CHAR-3) within 1e-2. The rigorous `tests/
+   divergence_svm_fit.rs` pins of these accessors (and a non-test production
+   consumer of the new accessor methods) are owned by the next critic/builder
+   step.
 3. **`decision_function` has the wrong shape & no ovr transform** — ferrolearn
    returns raw ovo `(n, n_models)` always; sklearn binary is `-dec.ravel()`
    `(n,)` (sign-flipped) and multiclass-ovr is `_ovr_decision_function(...)`
@@ -342,7 +356,7 @@ converge to the right α yet still fail parity because of these):
 |---|---|---|
 | REQ-1 (kernels & gamma resolution) | NOT-STARTED | open prereq blocker #634. The four kernel formulas in `RbfKernel::compute`/`PolynomialKernel::compute`/`SigmoidKernel::compute in svm.rs` are correct in form, but `gamma` resolves a `None` to `F::one()` (= 1.0), NOT sklearn's data-dependent `'scale' = 1/(n_features·X.var())` (default) or `'auto' = 1/n_features` (`_base.py:236-241`); the kernel has no `X` access so `'scale'`/`'auto'` are unimplemented, and the struct doc-comments overstate the behavior. No oracle pin of kernel values or `_gamma` exists. |
 | REQ-2 (C-SVC SMO solver) | NOT-STARTED | open prereq blocker #635. `fn smo_binary in svm.rs` implements the Fan-Chen-Lin WSS + analytic update + KKT bias and *appears* algorithmically correct (critic: start here — verify the binary 6×2 oracle `dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `intercept_ [-1.8565]`), but no `divergence_svm_fit.rs` pins `dual_coef_`/`intercept_`/`support_` against the live `SVC(kernel='linear')` oracle (R-CHAR-1). Bias recovery averages free-SV residuals rather than libsvm's `-(m+M)/2 rho` — equivalent at optimum but unverified. |
-| REQ-3 (fitted classification attributes) | NOT-STARTED | open prereq blocker #636. `FittedSVC` stores SVs/`α·y`/`bias` in private `BinarySvm` fields with **no** `support_`/`support_vectors_`/`n_support_`/`dual_coef_` (`(n_class-1,n_SV)`)/`intercept_`/linear `coef_` accessors and **no** binary sign flip (`_base.py:258-262`). Live oracle target: binary 6×2 `support_ [1,2,3]`, `n_support_ [2,1]`, `dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `coef_ [[0.2856,0.2856]]`. |
+| REQ-3 (fitted classification attributes) | NOT-STARTED (accessors+oracle smoke tests landed; gated on critic pin + non-test consumer, #636) | The libsvm-layout accessors NOW exist: `FittedSVC::support`/`support_vectors`/`n_support`/`dual_coef`/`intercept`/`coef` and `FittedSVR::support`/`support_vectors`/`n_support`/`dual_coef`/`intercept in svm.rs`, with the binary sign flip in `dual_coef`/`intercept` (`_base.py:258-262`) and `coef -> Option` (linear only, `_base.py:650-651`, via `Kernel::is_linear`). `BinarySvm` records `sv_indices`; `FittedSVC` retains `x_train`/`y_train`. In-module `#[cfg(test)]` smoke tests (`test_svc_binary_support_attrs`/`test_svc_binary_dual_coef_sign_flip`/`test_svc_binary_intercept_and_coef`/`test_svc_coef_none_for_nonlinear`/`test_svc_multiclass_support_attrs`/`test_svc_multiclass_dual_coef_packing`/`test_svr_linear_attrs in svm.rs`) verify all of binary `support_ [1,2,3]`/`n_support_ [2,1]`/`dual_coef_ [[-0.0408,-0.0408,0.0816]]`/`intercept_ [-1.8565]`/`coef_ [[0.2856,0.2856]]`, the 3-class `dual_coef_ (2,6)` packing + `intercept_ [1.2222,1.2222,0.0]`, and SVR `support_ [0,5]`/`dual_coef_ [[-0.392,0.392]]`/`intercept_ [0.14]` against the LIVE oracle (R-CHAR-3, 1e-2). Remains **NOT-STARTED** under R-DEFER-1/R-CHAR-1 only because (a) the rigorous pin lives in `tests/divergence_svm_fit.rs` (critic-owned, next step) not yet added, and (b) the NEW accessor methods have no non-test production consumer yet (the binding/`nu_svm` does not call them). Multiclass `dual_coef_` packing was decoded and MATCHES the oracle (not deferred to #640). |
 | REQ-4 (decision_function shape/sign/ovr) | NOT-STARTED | open prereq blocker #637. `fn decision_function in svm.rs` (FittedSVC) returns raw ovo `Array2 (n, n_models)` with **no** binary `-dec.ravel()` to `(n,)` (sign-flipped, `_base.py:538-539`) and **no** `_ovr_decision_function` transform / `decision_function_shape` param (`_base.py:779-780`). Live oracle: binary `(6,)` `[-1.2853,…,1.2851]`; 3-class ovr `(9,3)` row0 `[2.2366,0.8167,-0.1833]`. Top divergence #3. |
 | REQ-5 (predict — ovo voting + tie-break) | NOT-STARTED | open prereq blocker #638. `fn predict in svm.rs` (FittedSVC) does ovo voting (vote per binary model, argmax) — structurally libsvm-like — but uses `max_by_key` (last-maximum tie-break), whereas libsvm breaks ties toward the **lower** class index (`_base.py:814`); and no oracle pin of `predict` labels exists. Gated on the parity-correct fit (#635). |
 | REQ-6 (epsilon-SVR) | NOT-STARTED | open prereq blocker #639. `fn smo_svr in svm.rs` reformulates the epsilon-SVR `2n`-variable dual (`α`/`α*`, prediction coef `α*−α`) and *appears* correct, but `FittedSVR` exposes no `support_`/`dual_coef_ (1,n_SV)`/`intercept_` accessors and no oracle pins the fit. Live oracle target (linear 6×1, `C=100,epsilon=0.1`): `support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]`, `predict ≈ [2.1,4.06,6.02,7.98,9.94,11.9]`. |
