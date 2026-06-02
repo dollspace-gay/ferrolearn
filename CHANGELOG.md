@@ -243,6 +243,10 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate(one_class_svm): REQ-5 nu param + (0,1] validation pin (#650)
+- translate(one_class_svm): REQ-4 decision_function + score_samples + predict sign (#649)
+- translate(one_class_svm): REQ-3 fitted attrs support_/support_vectors_/n_support_/dual_coef_/intercept_/offset_/coef_ (#648)
+- translate(one_class_svm): REQ-1 dual_coef_/rho scaling — normalized (sum a=1) vs libsvm un-normalized (sum a=nu*n) (#646)
 - translate(one_class_svm): REQ-2 gamma='scale'/'auto' not resolved at fit (uses 1.0) (#647)
 - translate(svm): REQ-9 probability Platt scaling predict_proba (#642)
 - translate(svm): REQ-8 estimator-level param surface + defaults (R-DEV-2) (#641)
