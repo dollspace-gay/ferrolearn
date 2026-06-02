@@ -21,6 +21,27 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2): SHIPPED = impl + non-test consumer + tests + green oracle
+//! verification; NOT-STARTED = open blocker `#`. `DecisionTreeClassifier`/
+//! `DecisionTreeRegressor` are boundary estimator types re-exported at the crate
+//! root (`pub use decision_tree::{…}` in `lib.rs`) and registered as PyO3
+//! `RsDecisionTreeClassifier`; under S5/R-DEFER-1 those are the non-test consumer
+//! surface. Pins in `tests/divergence_decision_tree.rs`. See
+//! `.design/tree/decision_tree.md` for the full evidence + sklearn `file:line`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (criteria gini/entropy/log_loss + mse/friedman_mse/absolute_error/poisson) | SHIPPED | `ClassificationCriterion`/`RegressionCriterion` + `fn regression_node_impurity`/`fn regression_leaf_value` (median for absolute_error); pinned by `req1_clf_log_loss_is_entropy_alias_oracle`, `req1_reg_friedman_mse_oracle` (+ `_differs_from_squared_error`), `req1_reg_absolute_error_median_leaves_oracle`, `req1_reg_poisson_oracle_and_negative_y_errors` (`_criterion.pyx`). |
+//! | REQ-2 (CART best-split + FEATURE_THRESHOLD band) | SHIPPED | `fn find_best_classification_split`/`fn find_best_regression_split` + `fn feature_threshold` (1e-7 constant band, `_splitter.pyx:33,405`); midpoint `(x[i]+x[i+1])/2`; pinned by `clf_tree_structure_oracle` (node_count 7, root `(1,5.5)`), `divergence_clf_feature_threshold_band`. Exact-improvement-tie root-feature choice is the documented `random_state` RNG boundary (`clf_tiebreak_predict_invariant_rng_boundary`). |
+//! | REQ-3 (stopping/pruning params) | SHIPPED | `max_depth`/`min_samples_split`/`min_samples_leaf` + `min_impurity_decrease` (`ImpurityGate`, `_tree.pyx:284`) + `min_weight_fraction_leaf` (`fn effective_min_samples_leaf`) + `ccp_alpha` (`fn prune_ccp`, Breiman weakest-link, `_tree.pyx:1617`) + `max_leaf_nodes` (best-first `fn build_*_best_first`, `_tree.pyx:407`). Pinned by `req3_clf_min_impurity_decrease_oracle`, `req3_clf_min_weight_fraction_leaf_oracle`, `req3_clf_ccp_alpha_oracle`/`req3_reg_ccp_alpha_oracle`, `req3_clf_max_leaf_nodes_oracle`/`req3_reg_max_leaf_nodes_oracle`. |
+//! | REQ-4 (max_features resolution + subsampling) | NOT-STARTED | open prereq blocker #665. `DecisionTreeClassifier`/`Regressor` expose no `max_features` param / `max_features_` attr; the `{sqrt,log2,float}` resolution is RNG-subsampling (documented boundary). |
+//! | REQ-5 (fitted attributes) | SHIPPED | `fn feature_importances` (`HasFeatureImportances`, consumed by `random_forest.rs` + PyO3), `fn classes`/`n_classes` (`HasClasses`), `fn nodes`, `fn n_features`; `feature_importances_` pinned by `clf_feature_importances_oracle` (`[0.18462,0.81538]`). |
+//! | REQ-6 (predict / predict_proba / multiclass) | SHIPPED | `fn predict`/`fn predict_proba`/`fn predict_log_proba` (consumed by `RsDecisionTreeClassifier` + the pipeline adapter); pinned by `clf_predict_and_proba_oracle` + the per-criterion/param predict pins. Multi-output (2-D y) NOT-STARTED (#668). |
+//! | REQ-7 (class_weight + random_state) | SHIPPED (class_weight) | `pub enum ClassWeight<F>{None,Balanced,Explicit}` + `with_class_weight` + `fn compute_class_weight` on `DecisionTreeClassifier` (regressor has none); weighted impurity/leaf/gates via `fn weighted_compute_impurity`/`fn weighted_classification_node_value` (forest/extra-tree path unchanged). Pinned by `req7_clf_class_weight_oracle` (None/Explicit/Balanced split+predict+proba) + `test_compute_class_weight_balanced`. `random_state`/`splitter='random'` determinism = NOT-STARTED RNG boundary #670. |
+//! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #671. Imports `ndarray`, not `ferray-core` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -79,6 +100,87 @@ pub enum RegressionCriterion {
     /// (`_criterion.pyx:1598-1708`). Leaf value = mean. Requires `y_i ≥ 0` and
     /// `Σy > 0` (`_classes.py:267-277`).
     Poisson,
+}
+
+// ---------------------------------------------------------------------------
+// Class weighting (classifier only)
+// ---------------------------------------------------------------------------
+
+/// Per-class weighting for [`DecisionTreeClassifier`].
+///
+/// Mirrors `sklearn.tree.DecisionTreeClassifier`'s `class_weight` parameter
+/// (`sklearn/tree/_classes.py:801-820`, constraint
+/// `{dict, list, 'balanced', None}`, `_classes.py:942`). sklearn expands
+/// `class_weight` to PER-SAMPLE weights via
+/// `compute_sample_weight(class_weight, y)` and folds them into the tree's
+/// `sample_weight` (`_classes.py:310-367`); every weighted quantity (node class
+/// counts, gini/entropy, the leaf `value_`/`predict_proba`, and the
+/// `min_weight_fraction_leaf` gate) is then computed on those weights.
+///
+/// Mirrors `ferrolearn_linear::svm::ClassWeight` for cross-estimator
+/// consistency, but is defined locally (no cross-crate import). `DecisionTreeRegressor`
+/// has NO `class_weight` (sklearn `_classes.py:1317`), so this lives only on the
+/// classifier.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub enum ClassWeight<F> {
+    /// Uniform weights (all classes weighted `1.0`). The default
+    /// (`class_weight=None`). Produces a byte-identical tree to the unweighted
+    /// build.
+    #[default]
+    None,
+    /// Balanced weights `n_samples / (n_classes · count_c)` per class `c`,
+    /// matching `sklearn.utils.compute_class_weight("balanced", ...)`
+    /// (`class_weight.py:72`: `n_samples / (n_classes * np.bincount(y))`).
+    Balanced,
+    /// Explicit class-label → weight map. Classes absent from the map default to
+    /// `1.0`, matching the dict branch of `compute_class_weight`
+    /// (`class_weight.py:74-86`).
+    Explicit(Vec<(usize, F)>),
+}
+
+/// Compute the expanded per-class weight vector aligned to `classes`
+/// (sorted ascending, matching sklearn's `classes_ = np.unique(y)`).
+///
+/// Faithful to `sklearn.utils.compute_class_weight`
+/// (`sklearn/utils/class_weight.py:20-94`):
+/// - `None` → all `1.0` (`class_weight.py:61-63`).
+/// - `Balanced` → `n_samples / (n_classes · count_c)` per class `c`, where
+///   `count_c` is the number of samples with label `c`
+///   (`recip_freq = len(y) / (len(le.classes_) * np.bincount(y_ind))`,
+///   `class_weight.py:72`).
+/// - `Explicit(map)` → `1.0` default, overridden by the map entries matched by
+///   class label (`class_weight.py:74-86`).
+///
+/// `classes` is the sorted unique label set; `y` is the per-sample label array.
+/// Mirrors `ferrolearn_linear::svm::compute_class_weight` exactly.
+fn compute_class_weight<F: Float>(cw: &ClassWeight<F>, classes: &[usize], y: &[usize]) -> Vec<F> {
+    match cw {
+        ClassWeight::None => vec![F::one(); classes.len()],
+        ClassWeight::Balanced => {
+            let n_samples = F::from(y.len()).unwrap_or_else(F::zero);
+            let n_classes = F::from(classes.len()).unwrap_or_else(F::one);
+            classes
+                .iter()
+                .map(|&c| {
+                    let count = y.iter().filter(|&&label| label == c).count();
+                    let count_f = F::from(count).unwrap_or_else(F::one);
+                    if count_f > F::zero() {
+                        n_samples / (n_classes * count_f)
+                    } else {
+                        F::one()
+                    }
+                })
+                .collect()
+        }
+        ClassWeight::Explicit(map) => classes
+            .iter()
+            .map(|&c| {
+                map.iter()
+                    .find(|(label, _)| *label == c)
+                    .map_or_else(F::one, |(_, w)| *w)
+            })
+            .collect(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +313,19 @@ struct ClassificationData<'a, F> {
     /// behaviour and what scikit-learn does).
     max_features_per_split: Option<usize>,
     criterion: ClassificationCriterion,
+    /// Per-sample weights (indexed by the ORIGINAL sample index, parallel to
+    /// `y`), the expanded `class_weight` of `_classes.py:310-367`. `None` ⇒
+    /// uniform weights ⇒ the integer-count build path runs unchanged
+    /// (byte-identical). `Some(w)` ⇒ node class counts, gini/entropy, the leaf
+    /// distribution, and the `min_weight_fraction_leaf` gate are all WEIGHTED.
+    /// The forest/extra-trees builders always pass `None`.
+    sample_weight: Option<&'a [F]>,
+    /// `min_weight_leaf = min_weight_fraction_leaf · Σ sample_weight`
+    /// (`_classes.py:373`), the WEIGHTED per-child leaf-mass gate used only on
+    /// the weighted (`sample_weight = Some`) path. A split is rejected unless
+    /// each child's weighted mass `≥ min_weight_leaf` (`_splitter.pyx:470`).
+    /// `0.0` (the default / unweighted path) never rejects.
+    min_weight_leaf: F,
 }
 
 /// Data references for regression tree building.
@@ -278,6 +393,12 @@ pub struct DecisionTreeClassifier<F> {
     pub max_leaf_nodes: Option<usize>,
     /// Splitting criterion.
     pub criterion: ClassificationCriterion,
+    /// Per-class weighting (sklearn `class_weight`, `_classes.py:801`, default
+    /// `None`). Expanded to per-sample weights at fit and folded into every
+    /// weighted quantity (node class counts, gini/entropy, the leaf
+    /// distribution / `predict_proba`, the `min_weight_fraction_leaf` gate).
+    /// [`ClassWeight::None`] (default) ⇒ a byte-identical unweighted tree.
+    pub class_weight: ClassWeight<F>,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -287,7 +408,8 @@ impl<F: Float> DecisionTreeClassifier<F> {
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
     /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
     /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`,
-    /// `max_leaf_nodes = None`, `criterion = Gini`.
+    /// `max_leaf_nodes = None`, `criterion = Gini`,
+    /// `class_weight = ClassWeight::None`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -299,6 +421,7 @@ impl<F: Float> DecisionTreeClassifier<F> {
             ccp_alpha: F::zero(),
             max_leaf_nodes: None,
             criterion: ClassificationCriterion::Gini,
+            class_weight: ClassWeight::None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -361,6 +484,18 @@ impl<F: Float> DecisionTreeClassifier<F> {
     #[must_use]
     pub fn with_criterion(mut self, criterion: ClassificationCriterion) -> Self {
         self.criterion = criterion;
+        self
+    }
+
+    /// Set the per-class weighting (sklearn `class_weight`, `_classes.py:801`).
+    /// [`ClassWeight::None`] (default) leaves every class at `1.0`;
+    /// [`ClassWeight::Balanced`] uses `n_samples / (n_classes · count_c)`;
+    /// [`ClassWeight::Explicit`] takes a per-class-label weight map
+    /// (`compute_class_weight`, `class_weight.py:20`). The weights are expanded
+    /// to per-sample weights at fit and fold into every weighted node quantity.
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
         self
     }
 }
@@ -531,6 +666,29 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
 
         let indices: Vec<usize> = (0..n_samples).collect();
 
+        // Expand `class_weight` into PER-SAMPLE weights, the
+        // `compute_sample_weight(class_weight, y)` of `_classes.py:310-367`:
+        // `sample_weight[i] = class_weight_[y_i]`. `None` ⇒ uniform ⇒ the
+        // integer-count build path runs unchanged (byte-identical).
+        let y_vec: Vec<usize> = y.iter().copied().collect();
+        let per_class_weight = compute_class_weight(&self.class_weight, &classes, &y_vec);
+        let use_weights = self.class_weight != ClassWeight::None;
+        let sample_weight: Option<Vec<F>> = if use_weights {
+            Some(y_mapped.iter().map(|&c| per_class_weight[c]).collect())
+        } else {
+            None
+        };
+        // `min_weight_leaf = min_weight_fraction_leaf · Σ sample_weight`
+        // (`_classes.py:373`). On the unweighted path the fold below into
+        // `effective_min_samples_leaf` handles `min_weight_fraction_leaf`
+        // (uniform weights); on the weighted path the weighted child gate uses
+        // this `min_weight_leaf` directly.
+        let total_weight: F = sample_weight.as_ref().map_or_else(
+            || F::from(n_samples).unwrap_or_else(F::one),
+            |w| w.iter().fold(F::zero(), |a, &b| a + b),
+        );
+        let min_weight_leaf = self.min_weight_fraction_leaf * total_weight;
+
         let data = ClassificationData {
             x,
             y: &y_mapped,
@@ -538,17 +696,26 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             feature_indices: None,
             max_features_per_split: None,
             criterion: self.criterion,
+            sample_weight: sample_weight.as_deref(),
+            min_weight_leaf,
         };
         // Fold `min_weight_fraction_leaf` into the effective per-child minimum
         // leaf size (uniform weights, `_classes.py:371` / `_splitter.pyx:470`).
+        // On the WEIGHTED path the uniform fold does not apply (the weighted
+        // `min_weight_leaf` gate above replaces it), so keep the raw
+        // `min_samples_leaf`.
         let params = TreeParams {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
-            min_samples_leaf: effective_min_samples_leaf(
-                self.min_samples_leaf,
-                self.min_weight_fraction_leaf,
-                n_samples,
-            ),
+            min_samples_leaf: if use_weights {
+                self.min_samples_leaf
+            } else {
+                effective_min_samples_leaf(
+                    self.min_samples_leaf,
+                    self.min_weight_fraction_leaf,
+                    n_samples,
+                )
+            },
         };
         let gate = ImpurityGate {
             n_total: n_samples,
@@ -1323,6 +1490,168 @@ fn compute_impurity<F: Float>(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Weighted classification helpers (class_weight path)
+// ---------------------------------------------------------------------------
+
+/// Weighted Gini impurity, `1 − Σ_c (W_c / W_total)²`, on per-class WEIGHTED
+/// counts `W_c` (`Σ` of the sample weights in class `c`) and the total weighted
+/// node mass `W_total`. The weighted analog of [`gini_impurity`]; with uniform
+/// weights `W_c = count_c` and `W_total = N` it equals [`gini_impurity`]
+/// exactly (`Gini.node_impurity`, `_criterion.pyx:695`, on weighted counts).
+fn weighted_gini_impurity<F: Float>(weighted_counts: &[F], total: F) -> F {
+    if total <= F::zero() {
+        return F::zero();
+    }
+    let mut impurity = F::one();
+    for &w in weighted_counts {
+        let p = w / total;
+        impurity = impurity - p * p;
+    }
+    impurity
+}
+
+/// Weighted Shannon entropy, `−Σ_c (W_c / W_total)·ln(W_c / W_total)` (natural
+/// log, `0·ln0 = 0`), on per-class WEIGHTED counts. The weighted analog of
+/// [`entropy_impurity`]; equals it for uniform weights
+/// (`Entropy.node_impurity`, `_criterion.pyx:655`).
+fn weighted_entropy_impurity<F: Float>(weighted_counts: &[F], total: F) -> F {
+    if total <= F::zero() {
+        return F::zero();
+    }
+    let mut ent = F::zero();
+    for &w in weighted_counts {
+        if w > F::zero() {
+            let p = w / total;
+            ent = ent - p * p.ln();
+        }
+    }
+    ent
+}
+
+/// Weighted classification impurity dispatch, the weighted analog of
+/// [`compute_impurity`] (kept as a SEPARATE function so [`compute_impurity`]'s
+/// integer-count signature — shared with the forest/extra-tree builders — is
+/// unchanged).
+fn weighted_compute_impurity<F: Float>(
+    weighted_counts: &[F],
+    total: F,
+    criterion: ClassificationCriterion,
+) -> F {
+    match criterion {
+        ClassificationCriterion::Gini => weighted_gini_impurity(weighted_counts, total),
+        ClassificationCriterion::Entropy | ClassificationCriterion::LogLoss => {
+            weighted_entropy_impurity(weighted_counts, total)
+        }
+    }
+}
+
+/// Accumulate per-class WEIGHTED counts `W_c = Σ_{i∈node, y_i=c} sample_weight[i]`
+/// and the total weighted node mass `W_total = Σ_{i∈node} sample_weight[i]`
+/// for the node's samples (`indices` are ORIGINAL sample indices).
+fn weighted_class_counts<F: Float>(
+    indices: &[usize],
+    y: &[usize],
+    n_classes: usize,
+    sample_weight: &[F],
+) -> (Vec<F>, F) {
+    let mut counts = vec![F::zero(); n_classes];
+    let mut total = F::zero();
+    for &i in indices {
+        let w = sample_weight[i];
+        counts[y[i]] = counts[y[i]] + w;
+        total = total + w;
+    }
+    (counts, total)
+}
+
+/// Majority class (argmax of WEIGHTED counts, lowest index on ties — sklearn
+/// `np.argmax`) and the normalized weighted class distribution `W_c / W_total`
+/// for a classification node. The weighted analog of [`classification_node_value`]:
+/// `predict_proba` = normalized weighted counts (`Tree.value` then row-normalized),
+/// `predict` = weighted argmax.
+fn weighted_classification_node_value<F: Float>(
+    weighted_counts: &[F],
+    total: F,
+) -> (usize, Vec<F>) {
+    let majority_class = {
+        let mut best = 0usize;
+        let mut best_w = F::neg_infinity();
+        for (i, &w) in weighted_counts.iter().enumerate() {
+            // Strictly-greater keeps the FIRST (lowest-index) maximum on ties,
+            // matching `np.argmax`.
+            if w > best_w {
+                best_w = w;
+                best = i;
+            }
+        }
+        best
+    };
+    let denom = if total > F::zero() { total } else { F::one() };
+    let distribution: Vec<F> = weighted_counts.iter().map(|&w| w / denom).collect();
+    (majority_class, distribution)
+}
+
+/// Create a WEIGHTED classification leaf node and return its index (the
+/// weighted analog of [`make_classification_leaf`]). `predict_proba` stores the
+/// normalized weighted distribution; the leaf value is the weighted argmax.
+fn make_weighted_classification_leaf<F: Float>(
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    weighted_counts: &[F],
+    total: F,
+    n_samples: usize,
+    criterion: ClassificationCriterion,
+) -> usize {
+    let (majority_class, distribution) =
+        weighted_classification_node_value::<F>(weighted_counts, total);
+    let value = F::from(majority_class).unwrap_or_else(F::zero);
+
+    let idx = nodes.len();
+    nodes.push(Node::Leaf {
+        value,
+        class_distribution: Some(distribution.clone()),
+        n_samples,
+    });
+    if let Some(meta) = meta {
+        meta.push(NodeMeta {
+            impurity: weighted_compute_impurity::<F>(weighted_counts, total, criterion),
+            n_samples,
+            value,
+            distribution: Some(distribution),
+        });
+    }
+    idx
+}
+
+/// Emit a classification leaf for the node's `indices`, dispatching to the
+/// WEIGHTED leaf maker when `data.sample_weight` is set and the unweighted maker
+/// otherwise (byte-identical to the prior path on the unweighted branch).
+/// `class_counts` is the already-accumulated UNWEIGHTED count vector (reused for
+/// the unweighted leaf); the weighted leaf re-accumulates weighted counts.
+fn emit_classification_leaf<F: Float>(
+    data: &ClassificationData<'_, F>,
+    indices: &[usize],
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    class_counts: &[usize],
+    n_samples: usize,
+) -> usize {
+    if let Some(sw) = data.sample_weight {
+        let (wc, total) = weighted_class_counts(indices, data.y, data.n_classes, sw);
+        make_weighted_classification_leaf(nodes, meta, &wc, total, n_samples, data.criterion)
+    } else {
+        make_classification_leaf(
+            nodes,
+            meta,
+            class_counts,
+            data.n_classes,
+            n_samples,
+            data.criterion,
+        )
+    }
+}
+
 /// Compute the majority class (argmax of `class_counts`) and the normalized
 /// class distribution for a classification node.
 ///
@@ -1415,18 +1744,22 @@ fn build_classification_tree<F: Float>(
         class_counts[data.y[i]] += 1;
     }
 
+    // The pure-node / min_samples / max_depth stops use UNWEIGHTED sample counts
+    // (sklearn `min_samples_split`/`min_samples_leaf` count raw samples even when
+    // `sample_weight` is set, `_splitter.pyx:451`); the pure-node check is on the
+    // number of non-empty classes, which is weight-invariant.
     let should_stop = n < params.min_samples_split
         || params.max_depth.is_some_and(|d| depth >= d)
         || class_counts.iter().filter(|&&c| c > 0).count() <= 1;
 
     if should_stop {
-        return make_classification_leaf(
+        return emit_classification_leaf(
+            data,
+            indices,
             nodes,
             meta.as_deref_mut(),
             &class_counts,
-            data.n_classes,
             n,
-            data.criterion,
         );
     }
 
@@ -1501,10 +1834,24 @@ fn build_classification_tree<F: Float>(
         };
 
         if let Some(meta) = meta {
-            let (majority_class, distribution) =
-                classification_node_value::<F>(&class_counts, data.n_classes, n);
+            let (majority_class, distribution, impurity) = if let Some(sw) = data.sample_weight {
+                let (wc, total) = weighted_class_counts(indices, data.y, data.n_classes, sw);
+                let (mc, dist) = weighted_classification_node_value::<F>(&wc, total);
+                (
+                    mc,
+                    dist,
+                    weighted_compute_impurity::<F>(&wc, total, data.criterion),
+                )
+            } else {
+                let (mc, dist) = classification_node_value::<F>(&class_counts, data.n_classes, n);
+                (
+                    mc,
+                    dist,
+                    compute_impurity::<F>(&class_counts, n, data.criterion),
+                )
+            };
             meta[node_idx] = NodeMeta {
-                impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+                impurity,
                 n_samples: n,
                 value: F::from(majority_class).unwrap_or_else(F::zero),
                 distribution: Some(distribution),
@@ -1513,14 +1860,7 @@ fn build_classification_tree<F: Float>(
 
         node_idx
     } else {
-        make_classification_leaf(
-            nodes,
-            meta,
-            &class_counts,
-            data.n_classes,
-            n,
-            data.criterion,
-        )
+        emit_classification_leaf(data, indices, nodes, meta, &class_counts, n)
     }
 }
 
@@ -1547,11 +1887,32 @@ fn find_best_classification_split<F: Float>(
     for &i in indices {
         parent_counts[data.y[i]] += 1;
     }
-    let parent_impurity = compute_impurity::<F>(&parent_counts, n, data.criterion);
+
+    // Weighted parent counts + total weighted mass on the `class_weight` path
+    // (the `compute_sample_weight`-folded weights, `_classes.py:310-367`). On the
+    // unweighted path `parent_weighted` stays `None` and the integer-count
+    // impurity below runs byte-identical.
+    let (parent_impurity, weighted_parent) = match data.sample_weight {
+        Some(sw) => {
+            let (wc, total) = weighted_class_counts(indices, data.y, data.n_classes, sw);
+            (
+                weighted_compute_impurity::<F>(&wc, total, data.criterion),
+                Some((wc, total, sw)),
+            )
+        }
+        None => (
+            compute_impurity::<F>(&parent_counts, n, data.criterion),
+            None,
+        ),
+    };
 
     let mut best_score = F::neg_infinity();
     let mut best_feature = 0;
     let mut best_threshold = F::zero();
+    // The weighted node mass `W_node` (= Σ sample_weight over the node), used to
+    // rescale the returned `best_impurity_decrease = improvement_inner · W_node`
+    // on the weighted path so it mirrors sklearn's `improvement·N` convention.
+    let mut best_weighted_n = n_f;
 
     // Build the candidate feature list for this split.
     //
@@ -1589,6 +1950,15 @@ fn find_best_classification_split<F: Float>(
         let mut right_counts = parent_counts.clone();
         let mut left_n = 0usize;
 
+        // Weighted running child counts (mirrors `left_counts`/`right_counts`)
+        // on the `class_weight` path; `right_w_counts` starts at the weighted
+        // parent counts and mass is moved left as the scan advances.
+        let mut left_w_counts = vec![F::zero(); data.n_classes];
+        let mut right_w_counts = weighted_parent
+            .as_ref()
+            .map_or_else(Vec::new, |(wc, _, _)| wc.clone());
+        let mut left_w = F::zero();
+
         for split_pos in 0..n - 1 {
             let idx = sorted_indices[split_pos];
             let cls = data.y[idx];
@@ -1596,6 +1966,12 @@ fn find_best_classification_split<F: Float>(
             right_counts[cls] -= 1;
             left_n += 1;
             let right_n = n - left_n;
+            if let Some((_, _, sw)) = weighted_parent.as_ref() {
+                let w = sw[idx];
+                left_w_counts[cls] = left_w_counts[cls] + w;
+                right_w_counts[cls] = right_w_counts[cls] - w;
+                left_w = left_w + w;
+            }
 
             // Only consider a split where adjacent sorted values differ by more
             // than FEATURE_THRESHOLD (sklearn's `next_p` skip, `_splitter.pyx`).
@@ -1604,23 +1980,51 @@ fn find_best_classification_split<F: Float>(
                 continue;
             }
 
+            // `min_samples_leaf` counts RAW samples even under sample_weight
+            // (`_splitter.pyx:451`).
             if left_n < min_samples_leaf || right_n < min_samples_leaf {
                 continue;
             }
 
-            let left_impurity = compute_impurity::<F>(&left_counts, left_n, data.criterion);
-            let right_impurity = compute_impurity::<F>(&right_counts, right_n, data.criterion);
-            let left_weight = F::from(left_n).unwrap() / n_f;
-            let right_weight = F::from(right_n).unwrap() / n_f;
-            let weighted_child_impurity =
-                left_weight * left_impurity + right_weight * right_impurity;
-            let impurity_decrease = parent_impurity - weighted_child_impurity;
+            let (impurity_decrease, weighted_n) = if let Some((_, total_w, _)) =
+                weighted_parent.as_ref()
+            {
+                let right_w = *total_w - left_w;
+                // Weighted `min_weight_fraction_leaf` child gate
+                // (`_splitter.pyx:470`): each child's weighted mass must meet
+                // `min_weight_leaf`. Default `0.0` never rejects.
+                if left_w < data.min_weight_leaf || right_w < data.min_weight_leaf {
+                    continue;
+                }
+                let left_impurity =
+                    weighted_compute_impurity::<F>(&left_w_counts, left_w, data.criterion);
+                let right_impurity =
+                    weighted_compute_impurity::<F>(&right_w_counts, right_w, data.criterion);
+                // improvement_inner = parent − (W_L/W_node)·imp_L − (W_R/W_node)·imp_R
+                // (`_criterion.pyx:188`, weighted-mass child weights).
+                let denom = if *total_w > F::zero() {
+                    *total_w
+                } else {
+                    F::one()
+                };
+                let weighted_child = (left_w * left_impurity + right_w * right_impurity) / denom;
+                (parent_impurity - weighted_child, *total_w)
+            } else {
+                let left_impurity = compute_impurity::<F>(&left_counts, left_n, data.criterion);
+                let right_impurity = compute_impurity::<F>(&right_counts, right_n, data.criterion);
+                let left_weight = F::from(left_n).unwrap_or_else(F::one) / n_f;
+                let right_weight = F::from(right_n).unwrap_or_else(F::one) / n_f;
+                let weighted_child_impurity =
+                    left_weight * left_impurity + right_weight * right_impurity;
+                (parent_impurity - weighted_child_impurity, n_f)
+            };
 
             if impurity_decrease > best_score {
                 best_score = impurity_decrease;
                 best_feature = feat;
-                best_threshold =
-                    (data.x[[idx, feat]] + data.x[[next_idx, feat]]) / F::from(2.0).unwrap();
+                best_weighted_n = weighted_n;
+                let two = F::from(2.0).unwrap_or_else(F::one);
+                best_threshold = (data.x[[idx, feat]] + data.x[[next_idx, feat]]) / two;
             }
         }
     }
@@ -1634,7 +2038,13 @@ fn find_best_classification_split<F: Float>(
     // `min_weight_fraction_leaf` fallback split). `best_score` stays `-inf`
     // when no valid split point exists ⇒ `None`.
     if best_score >= F::zero() {
-        Some((best_feature, best_threshold, best_score * n_f))
+        // Return `improvement_inner · weighted_n_node` (= `improvement_inner · n`
+        // on the unweighted path, where `best_weighted_n == n_f`). The build's
+        // `min_impurity_decrease` gate and `compute_feature_importances` both
+        // apply the same global denominator, so this scaling keeps the
+        // unweighted path byte-identical and yields sklearn-consistent
+        // (post-normalization) weighted importances.
+        Some((best_feature, best_threshold, best_score * best_weighted_n))
     } else {
         None
     }
@@ -2034,6 +2444,9 @@ pub(crate) fn build_classification_tree_with_feature_subset<F: Float>(
         feature_indices: Some(feature_indices),
         max_features_per_split: None,
         criterion,
+        // Forests do not expose `class_weight`; unweighted path (byte-identical).
+        sample_weight: None,
+        min_weight_leaf: F::zero(),
     };
     let mut nodes = Vec::new();
     let gate = ImpurityGate::disabled(indices.len());
@@ -2068,6 +2481,9 @@ pub(crate) fn build_classification_tree_per_split_features<F: Float>(
         feature_indices: None,
         max_features_per_split: Some(max_features),
         criterion,
+        // Forests do not expose `class_weight`; unweighted path (byte-identical).
+        sample_weight: None,
+        min_weight_leaf: F::zero(),
     };
     let mut rng = StdRng::seed_from_u64(seed);
     let mut nodes = Vec::new();
@@ -2421,15 +2837,30 @@ fn build_classification_tree_best_first<F: Float>(
         arena.push(placeholder_build_leaf::<F>());
 
         let node_meta = if record_meta {
-            let mut class_counts = vec![0usize; data.n_classes];
-            for &i in &record.indices {
-                class_counts[data.y[i]] += 1;
-            }
             let n = record.indices.len();
-            let (majority_class, distribution) =
-                classification_node_value::<F>(&class_counts, data.n_classes, n);
+            let (majority_class, distribution, impurity) = if let Some(sw) = data.sample_weight {
+                let (wc, total) =
+                    weighted_class_counts(&record.indices, data.y, data.n_classes, sw);
+                let (mc, dist) = weighted_classification_node_value::<F>(&wc, total);
+                (
+                    mc,
+                    dist,
+                    weighted_compute_impurity::<F>(&wc, total, data.criterion),
+                )
+            } else {
+                let mut class_counts = vec![0usize; data.n_classes];
+                for &i in &record.indices {
+                    class_counts[data.y[i]] += 1;
+                }
+                let (mc, dist) = classification_node_value::<F>(&class_counts, data.n_classes, n);
+                (
+                    mc,
+                    dist,
+                    compute_impurity::<F>(&class_counts, n, data.criterion),
+                )
+            };
             Some(NodeMeta {
-                impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+                impurity,
                 n_samples: n,
                 value: F::from(majority_class).unwrap_or_else(F::zero),
                 distribution: Some(distribution),
@@ -2462,22 +2893,39 @@ fn build_classification_tree_best_first<F: Float>(
 }
 
 /// Materialize a classification leaf [`BuildNode`] from a node's samples.
+///
+/// Uses WEIGHTED class counts when `data.sample_weight` is set (`class_weight`
+/// path); byte-identical to the prior unweighted maker otherwise.
 fn make_classification_build_leaf<F: Float>(
     data: &ClassificationData<'_, F>,
     node_indices: &[usize],
     record_meta: bool,
 ) -> BuildNode<F> {
     let n = node_indices.len();
-    let mut class_counts = vec![0usize; data.n_classes];
-    for &i in node_indices {
-        class_counts[data.y[i]] += 1;
-    }
-    let (majority_class, distribution) =
-        classification_node_value::<F>(&class_counts, data.n_classes, n);
+    let (majority_class, distribution, impurity) = if let Some(sw) = data.sample_weight {
+        let (wc, total) = weighted_class_counts(node_indices, data.y, data.n_classes, sw);
+        let (mc, dist) = weighted_classification_node_value::<F>(&wc, total);
+        (
+            mc,
+            dist,
+            weighted_compute_impurity::<F>(&wc, total, data.criterion),
+        )
+    } else {
+        let mut class_counts = vec![0usize; data.n_classes];
+        for &i in node_indices {
+            class_counts[data.y[i]] += 1;
+        }
+        let (mc, dist) = classification_node_value::<F>(&class_counts, data.n_classes, n);
+        (
+            mc,
+            dist,
+            compute_impurity::<F>(&class_counts, n, data.criterion),
+        )
+    };
     let value = F::from(majority_class).unwrap_or_else(F::zero);
     let meta = if record_meta {
         Some(NodeMeta {
-            impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+            impurity,
             n_samples: n,
             value,
             distribution: Some(distribution.clone()),
@@ -4229,5 +4677,120 @@ mod tests {
             "node_count at k=None (sklearn: 15)"
         );
         assert_reg_predict(&fitted, &x, &[1.0, 1.2, 0.9, 1.1, 5.0, 5.2, 4.9, 5.1]);
+    }
+
+    // -- class_weight (#665) --
+    //
+    // Oracle (live sklearn 1.5.2, R-CHAR-3) on the imbalanced 8×2 set:
+    //   X=[[1,0],[1.5,0],[2,0],[1.2,0],[2.2,0],[5,0],[6,0],[7,0]]
+    //   y=[0,0,0,1,1,1,1,1], DecisionTreeClassifier(max_depth=1,
+    //                                                class_weight=CW,
+    //                                                random_state=0)
+    //   None       → root (feat=0, thr≈2.1), predict [0,0,0,0,1,1,1,1],
+    //                proba[0]=[0.75, 0.25]
+    //   {0:1, 1:5} → root (feat=0, thr≈1.1), predict [0,1,1,1,1,1,1,1],
+    //                proba[0]=[1.0, 0.0]
+    //   'balanced' → root (feat=0, thr≈2.1), predict [0,0,0,0,1,1,1,1],
+    //                proba[0]=[0.8333…, 0.1667…]  (= 3·1.333/(3·1.333+1·0.8))
+    // Invocation:
+    //   python3 -c "import numpy as np; from sklearn.tree import \
+    //   DecisionTreeClassifier; \
+    //   X=np.array([[1,0],[1.5,0],[2,0],[1.2,0],[2.2,0],[5,0],[6,0],[7,0]]); \
+    //   y=np.array([0,0,0,1,1,1,1,1]); \
+    //   m=DecisionTreeClassifier(max_depth=1,class_weight=CW,random_state=0).fit(X,y); \
+    //   print(m.tree_.feature[0], m.tree_.threshold[0], m.predict(X).tolist(), \
+    //   m.predict_proba(X)[0].tolist())"
+
+    fn cw_fixture() -> (Array2<f64>, Array1<usize>) {
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1.0, 0.0, 1.5, 0.0, 2.0, 0.0, 1.2, 0.0, 2.2, 0.0, 5.0, 0.0, 6.0, 0.0, 7.0, 0.0,
+            ],
+        )
+        .unwrap_or_else(|_| Array2::zeros((8, 2)));
+        let y = array![0, 0, 0, 1, 1, 1, 1, 1];
+        (x, y)
+    }
+
+    /// Fit a depth-1 classifier with the given `class_weight`, returning the
+    /// root split `(feature, threshold)`, predictions, and `predict_proba` row 0.
+    #[allow(
+        clippy::type_complexity,
+        reason = "test helper bundling the oracle-compared quantities"
+    )]
+    fn cw_fit(cw: ClassWeight<f64>) -> Result<((usize, f64), Vec<usize>, Vec<f64>), FerroError> {
+        let (x, y) = cw_fixture();
+        let model = DecisionTreeClassifier::<f64>::new()
+            .with_max_depth(Some(1))
+            .with_class_weight(cw);
+        let fitted = model.fit(&x, &y)?;
+        let root = match fitted.nodes().first() {
+            Some(Node::Split {
+                feature, threshold, ..
+            }) => (*feature, *threshold),
+            _ => (usize::MAX, f64::NAN),
+        };
+        let preds = fitted.predict(&x)?.to_vec();
+        let proba0 = fitted.predict_proba(&x)?.row(0).to_vec();
+        Ok((root, preds, proba0))
+    }
+
+    #[test]
+    fn test_classifier_class_weight_none_oracle() {
+        let res = cw_fit(ClassWeight::None);
+        assert!(res.is_ok(), "fit with class_weight=None must succeed");
+        let (root, preds, proba0) = res.unwrap_or_else(|_| ((0, 0.0), vec![], vec![]));
+        assert_eq!(root.0, 0, "None root feature (sklearn: 0)");
+        assert_relative_eq!(root.1, 2.1, max_relative = 1e-2);
+        assert_eq!(preds, vec![0, 0, 0, 0, 1, 1, 1, 1], "None predict");
+        assert_relative_eq!(proba0[0], 0.75, max_relative = 1e-2);
+        assert_relative_eq!(proba0[1], 0.25, max_relative = 1e-2);
+    }
+
+    #[test]
+    fn test_classifier_class_weight_explicit_oracle() {
+        // {0:1, 1:5}: class 1 is up-weighted 5× ⇒ the root threshold shifts to
+        // ≈1.1, sending only sample 0 (y=0) left.
+        let res = cw_fit(ClassWeight::Explicit(vec![(0, 1.0), (1, 5.0)]));
+        assert!(res.is_ok(), "fit with explicit class_weight must succeed");
+        let (root, preds, proba0) = res.unwrap_or_else(|_| ((0, 0.0), vec![], vec![]));
+        assert_eq!(root.0, 0, "explicit root feature (sklearn: 0)");
+        assert_relative_eq!(root.1, 1.1, max_relative = 1e-2);
+        assert_eq!(preds, vec![0, 1, 1, 1, 1, 1, 1, 1], "explicit predict");
+        assert_relative_eq!(proba0[0], 1.0, max_relative = 1e-2);
+        assert!(proba0[1].abs() < 1e-2, "explicit proba[0][1] ≈ 0");
+    }
+
+    #[test]
+    fn test_classifier_class_weight_balanced_oracle() {
+        // 'balanced': w0 = 8/(2·3) = 1.333…, w1 = 8/(2·5) = 0.8. The root stays
+        // (0, ≈2.1); proba[0] = 3·1.333/(3·1.333+1·0.8) ≈ 0.8333.
+        let res = cw_fit(ClassWeight::Balanced);
+        assert!(res.is_ok(), "fit with class_weight=balanced must succeed");
+        let (root, preds, proba0) = res.unwrap_or_else(|_| ((0, 0.0), vec![], vec![]));
+        assert_eq!(root.0, 0, "balanced root feature (sklearn: 0)");
+        assert_relative_eq!(root.1, 2.1, max_relative = 1e-2);
+        assert_eq!(preds, vec![0, 0, 0, 0, 1, 1, 1, 1], "balanced predict");
+        assert_relative_eq!(proba0[0], 0.833_333_333_333, max_relative = 1e-2);
+        assert_relative_eq!(proba0[1], 0.166_666_666_666, max_relative = 1e-2);
+    }
+
+    /// `compute_class_weight` matches `sklearn.utils.compute_class_weight`
+    /// (`class_weight.py:72` balanced `n_samples/(n_classes·count_c)`).
+    #[test]
+    fn test_compute_class_weight_balanced() {
+        // y=[0,0,0,1,1,1,1,1]: count_0=3, count_1=5, n=8, n_classes=2.
+        let classes = vec![0usize, 1];
+        let y = vec![0usize, 0, 0, 1, 1, 1, 1, 1];
+        let bal = compute_class_weight::<f64>(&ClassWeight::Balanced, &classes, &y);
+        assert_relative_eq!(bal[0], 8.0 / (2.0 * 3.0), max_relative = 1e-12);
+        assert_relative_eq!(bal[1], 8.0 / (2.0 * 5.0), max_relative = 1e-12);
+        let none = compute_class_weight::<f64>(&ClassWeight::None, &classes, &y);
+        assert_relative_eq!(none[0], 1.0, max_relative = 1e-12);
+        assert_relative_eq!(none[1], 1.0, max_relative = 1e-12);
+        let exp = compute_class_weight::<f64>(&ClassWeight::Explicit(vec![(1, 5.0)]), &classes, &y);
+        assert_relative_eq!(exp[0], 1.0, max_relative = 1e-12);
+        assert_relative_eq!(exp[1], 5.0, max_relative = 1e-12);
     }
 }

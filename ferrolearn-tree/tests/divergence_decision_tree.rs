@@ -1200,3 +1200,190 @@ fn req3_reg_max_leaf_nodes_oracle() {
         none.nodes().len()
     );
 }
+
+// ===========================================================================
+// REQ-7 class_weight CERTIFYING PINS (#665).
+// `with_class_weight(ClassWeight::{None,Balanced,Explicit})` on
+// `DecisionTreeClassifier`. sklearn expands `class_weight` to per-sample
+// weights (`compute_sample_weight`, `_classes.py:310-367`) and folds them into
+// node class counts, the gini/entropy split (`fn weighted_compute_impurity`),
+// AND the leaf `value_`/`predict_proba` (`fn weighted_classification_node_value`).
+// `ClassWeight` is NOT re-exported at the crate root, so it is imported via the
+// module path `ferrolearn_tree::decision_tree::ClassWeight`.
+// All expected values derived LIVE from the sklearn 1.5.2 oracle (R-CHAR-3):
+//   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+//     X=np.array([[1,0],[1.5,0],[2,0],[1.2,0],[2.2,0],[5,0],[6,0],[7,0]],dtype=float); \
+//     y=np.array([0,0,0,1,1,1,1,1]); \
+//     [print(cw, DecisionTreeClassifier(max_depth=1,class_weight=cw,random_state=0).fit(X,y).tree_.feature[0], \
+//       DecisionTreeClassifier(max_depth=1,class_weight=cw,random_state=0).fit(X,y).tree_.threshold[0], \
+//       DecisionTreeClassifier(max_depth=1,class_weight=cw,random_state=0).fit(X,y).predict(X).tolist(), \
+//       DecisionTreeClassifier(max_depth=1,class_weight=cw,random_state=0).fit(X,y).predict_proba(X)[0].tolist()) \
+//       for cw in (None,{0:1.0,1:5.0},'balanced')]"
+//   => None       root (0, 2.1) predict [0,0,0,0,1,1,1,1] proba0 [0.75, 0.25]
+//      {0:1,1:5}  root (0, 1.1) predict [0,1,1,1,1,1,1,1] proba0 [1.0, 0.0]
+//      balanced   root (0, 2.1) predict [0,0,0,0,1,1,1,1] proba0 [0.8333…, 0.1667…]
+//   balanced weights = compute_class_weight('balanced', [0,1], y) = [8/6, 0.8]
+//   (n_samples / (n_classes * count_c): 8/(2*3)=1.333…, 8/(2*5)=0.8).
+// Tests run in integration-test context — the `.unwrap()` idiom matches the
+// prior pins above (R-APG-2: test context is gate-exempt).
+// ===========================================================================
+
+use ferrolearn_tree::decision_tree::ClassWeight;
+
+/// PIN — `DecisionTreeClassifier` class_weight wired through impurity AND leaf
+/// value (#665). On the 8x2 set above, `None`, `Explicit([(0,1),(1,5)])`, and
+/// `Balanced` produce three MUTUALLY DISTINCT fitted trees:
+///   * `None`/`Balanced` split at threshold 2.1, predict `[0,0,0,0,1,1,1,1]`;
+///   * `Explicit` flips both the split (threshold 1.1) AND the leaf proba (the
+///     class-1 reweighting by 5x makes the root-left leaf pure class 0 →
+///     proba0 `[1.0,0.0]`, the proof class_weight reaches BOTH the split and the
+///     leaf value);
+///   * `Balanced` keeps `None`'s split but reweights the leaf proba to
+///     `[0.8333…,0.1667…]` (`3·w0/(3·w0+1·w1)`, w0=8/6, w1=0.8), distinct from
+///     `None`'s `[0.75,0.25]` (the proof the leaf value is weighted).
+///
+/// The pin FAILS if class_weight were ignored (the three would coincide).
+/// Also asserts `Balanced == Explicit([(0,8/6),(1,0.8)])` (the balanced formula,
+/// `class_weight.py:72`).
+#[test]
+fn req7_clf_class_weight_oracle() {
+    // Oracle (live sklearn 1.5.2) — see header for invocation.
+    const SK_THR_NONE: f64 = 2.1;
+    const SK_THR_EXPLICIT: f64 = 1.1;
+    const SK_THR_BALANCED: f64 = 2.1;
+    let sk_predict_none: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+    let sk_predict_explicit: [usize; 8] = [0, 1, 1, 1, 1, 1, 1, 1];
+    let sk_predict_balanced: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+    let sk_proba0_none: [f64; 2] = [0.75, 0.25];
+    let sk_proba0_explicit: [f64; 2] = [1.0, 0.0];
+    let sk_proba0_balanced: [f64; 2] = [0.833_333_333_333_333_4, 0.166_666_666_666_666_69];
+
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            1.0, 0.0, 1.5, 0.0, 2.0, 0.0, 1.2, 0.0, 2.2, 0.0, 5.0, 0.0, 6.0, 0.0, 7.0, 0.0,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1, 1, 1];
+
+    let fit_cw = |cw: ClassWeight<f64>| {
+        DecisionTreeClassifier::<f64>::new()
+            .with_max_depth(Some(1))
+            .with_class_weight(cw)
+            .fit(&x, &y)
+            .unwrap()
+    };
+
+    let none = fit_cw(ClassWeight::None);
+    let explicit = fit_cw(ClassWeight::Explicit(vec![(0, 1.0), (1, 5.0)]));
+    let balanced = fit_cw(ClassWeight::Balanced);
+
+    // --- None ---
+    let (nf, nt) = root_split(none.nodes()).expect("None root must be a Split");
+    assert_eq!(nf, 0, "None root feature: ferrolearn={nf} sklearn=0");
+    assert!(
+        (nt - SK_THR_NONE).abs() < 1e-6,
+        "None root threshold: ferrolearn={nt} sklearn={SK_THR_NONE}"
+    );
+    let none_pred = none.predict(&x).unwrap();
+    for (i, &exp) in sk_predict_none.iter().enumerate() {
+        assert_eq!(
+            none_pred[i], exp,
+            "None predict[{i}]: ferrolearn={} sklearn={exp}",
+            none_pred[i]
+        );
+    }
+    let none_proba = none.predict_proba(&x).unwrap();
+    for (j, &exp) in sk_proba0_none.iter().enumerate() {
+        assert!(
+            (none_proba[[0, j]] - exp).abs() < 1e-6,
+            "None proba0[{j}]: ferrolearn={} sklearn={exp}",
+            none_proba[[0, j]]
+        );
+    }
+
+    // --- Explicit([(0,1),(1,5)]) — split AND leaf flip ---
+    let (ef, et) = root_split(explicit.nodes()).expect("Explicit root must be a Split");
+    assert_eq!(ef, 0, "Explicit root feature: ferrolearn={ef} sklearn=0");
+    assert!(
+        (et - SK_THR_EXPLICIT).abs() < 1e-6,
+        "Explicit root threshold: ferrolearn={et} sklearn={SK_THR_EXPLICIT}"
+    );
+    let exp_pred = explicit.predict(&x).unwrap();
+    for (i, &exp) in sk_predict_explicit.iter().enumerate() {
+        assert_eq!(
+            exp_pred[i], exp,
+            "Explicit predict[{i}]: ferrolearn={} sklearn={exp}",
+            exp_pred[i]
+        );
+    }
+    let exp_proba = explicit.predict_proba(&x).unwrap();
+    for (j, &exp) in sk_proba0_explicit.iter().enumerate() {
+        assert!(
+            (exp_proba[[0, j]] - exp).abs() < 1e-6,
+            "Explicit proba0[{j}]: ferrolearn={} sklearn={exp}",
+            exp_proba[[0, j]]
+        );
+    }
+
+    // --- Balanced — same split as None, reweighted leaf proba ---
+    let (bf, bt) = root_split(balanced.nodes()).expect("Balanced root must be a Split");
+    assert_eq!(bf, 0, "Balanced root feature: ferrolearn={bf} sklearn=0");
+    assert!(
+        (bt - SK_THR_BALANCED).abs() < 1e-6,
+        "Balanced root threshold: ferrolearn={bt} sklearn={SK_THR_BALANCED}"
+    );
+    let bal_pred = balanced.predict(&x).unwrap();
+    for (i, &exp) in sk_predict_balanced.iter().enumerate() {
+        assert_eq!(
+            bal_pred[i], exp,
+            "Balanced predict[{i}]: ferrolearn={} sklearn={exp}",
+            bal_pred[i]
+        );
+    }
+    let bal_proba = balanced.predict_proba(&x).unwrap();
+    for (j, &exp) in sk_proba0_balanced.iter().enumerate() {
+        assert!(
+            (bal_proba[[0, j]] - exp).abs() < 1e-6,
+            "Balanced proba0[{j}]: ferrolearn={} sklearn={exp}",
+            bal_proba[[0, j]]
+        );
+    }
+
+    // --- Mutual distinctness: the pin FAILS if class_weight were ignored. ---
+    // Explicit's split (1.1) must differ from None's (2.1).
+    assert!(
+        (et - nt).abs() > 1e-6,
+        "Explicit split ({et}) must differ from None ({nt}) — proof split is weighted"
+    );
+    // Balanced's leaf proba (0.833) must differ from None's (0.75).
+    assert!(
+        (bal_proba[[0, 0]] - none_proba[[0, 0]]).abs() > 1e-6,
+        "Balanced proba0 ({}) must differ from None ({}) — proof leaf value is weighted",
+        bal_proba[[0, 0]],
+        none_proba[[0, 0]]
+    );
+
+    // --- Balanced == Explicit([(0,8/6),(1,0.8)]) (the balanced formula). ---
+    let balanced_as_explicit = fit_cw(ClassWeight::Explicit(vec![(0, 8.0 / 6.0), (1, 0.8)]));
+    let (baf, bat) = root_split(balanced_as_explicit.nodes())
+        .expect("Balanced-as-Explicit root must be a Split");
+    assert_eq!(
+        baf, bf,
+        "Balanced-as-Explicit root feature must match Balanced"
+    );
+    assert!(
+        (bat - bt).abs() < 1e-9,
+        "Balanced-as-Explicit threshold ({bat}) must match Balanced ({bt})"
+    );
+    let bae_proba = balanced_as_explicit.predict_proba(&x).unwrap();
+    for j in 0..2 {
+        assert!(
+            (bae_proba[[0, j]] - bal_proba[[0, j]]).abs() < 1e-12,
+            "Balanced == Explicit([(0,8/6),(1,0.8)]) proba0[{j}]: explicit={} balanced={}",
+            bae_proba[[0, j]],
+            bal_proba[[0, j]]
+        );
+    }
+}

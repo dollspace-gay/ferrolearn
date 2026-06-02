@@ -159,10 +159,12 @@ Regressor, `X=[[1]..[8]]`, `y=[1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]`,
   `criterion: ClassificationCriterion` and builder methods `new`,
   `with_max_depth`, `with_min_samples_split`, `with_min_samples_leaf`,
   `with_criterion`; plus `with_min_weight_fraction_leaf`,
-  `with_min_impurity_decrease`, `with_ccp_alpha`, `with_max_leaf_nodes`;
-  `DecisionTreeRegressor<F>` analogous. `max_features`, `random_state`,
-  `class_weight`, `splitter`, `monotonic_cst` are still absent at the estimator
-  surface.
+  `with_min_impurity_decrease`, `with_ccp_alpha`, `with_max_leaf_nodes`,
+  `with_class_weight` (classifier only); `DecisionTreeRegressor<F>` analogous
+  minus `class_weight` (sklearn `DecisionTreeRegressor` has none). `max_features`,
+  `random_state`, `splitter`, `monotonic_cst` are still absent at the estimator
+  surface. `class_weight` (`enum ClassWeight<F> {None,Balanced,Explicit}` +
+  `fn compute_class_weight`, classifier-only) IS now shipped — see REQ-7.
 - `enum Node<F> { Split{...}, Leaf{...} }`, flat `Vec<Node<F>>`.
 - `fn build_classification_tree` / `fn build_regression_tree` — recursive
   depth-first builder; `fn find_best_classification_split` /
@@ -251,7 +253,7 @@ Node, RegressionCriterion}`); the ensemble crates consume the internal builders
 | REQ-4 (max_features resolution + subsampling) | NOT-STARTED | impl: per-split sampling exists internally (`max_features_per_split` in `ClassificationData`, used by `build_classification_tree_per_split_features`) but `DecisionTreeClassifier`/`Regressor` expose NO `max_features` param and NO `max_features_` fitted attribute; the `{"sqrt","log2",float}` resolution does not exist on the estimator. open prereq blocker #665. |
 | REQ-5 (fitted attributes) | NOT-STARTED (partial) | impl: `fn feature_importances` (`HasFeatureImportances`, consumed by `random_forest.rs` `aggregate_tree_importances` and the PyO3 binding), `fn classes`/`n_classes` (`HasClasses`), `fn nodes`, `fn n_features` are SHIPPED at the API level. But `feature_importances_` normalization is NOT oracle-pinned (`test_classifier_feature_importances` only asserts `sum==1` and `[0]>0`, not the `[0.1846…, 0.8153…]` values), no `max_features_`, and `nodes()` is not pinned to sklearn's `tree_` node count/order. open prereq blocker #666 (feature_importances_ numeric pin), #665 (max_features_). |
 | REQ-6 (predict / predict_proba / multiclass) | NOT-STARTED (partial) | impl `fn predict`/`fn predict_proba`/`fn predict_log_proba` in `decision_tree.rs` exist, consumed by the PyO3 binding (`RsDecisionTreeClassifier`) and the pipeline adapter (`FittedClassifierPipelineAdapter::predict_pipeline`). Multiclass label prediction is unit-tested (`test_classifier_multiclass`). But `predict_proba` leaf-frequency arrays are NOT oracle-pinned (`test_classifier_predict_proba` only checks row sums == 1), and multi-output (2-D `y`) is unsupported (`Fit<Array2<F>, Array1<usize>>` only). open prereq blocker #667 (predict_proba pin), #668 (multi-output). |
-| REQ-7 (class_weight + random_state determinism) | NOT-STARTED | impl: no `class_weight` field on `DecisionTreeClassifier`; no `random_state` field (RNG only enters via the forest builders' `seed: u64`). The estimator's split search is deterministic (no feature permutation), so it can NOT reproduce sklearn's `random_state`-dependent tie behavior. open prereq blocker #669 (class_weight), #670 (random_state determinism boundary, à la the SGD / libsvm-CV RNG boundary). |
+| REQ-7 (class_weight + random_state determinism) | NOT-STARTED (partial — `class_weight` #665/#669 SHIPPED) | **`class_weight` SHIPPED** (classifier ONLY; `DecisionTreeRegressor` has none, `_classes.py:1317`): `pub enum ClassWeight<F> { None, Balanced, Explicit(Vec<(usize,F)>) }` (default `None`, mirrors `ferrolearn_linear::svm::ClassWeight`) + `pub class_weight: ClassWeight<F>` field + `#[must_use] with_class_weight` on `DecisionTreeClassifier` (`new()`/`Default` set `None`). `fn compute_class_weight in decision_tree.rs` mirrors `sklearn.utils.compute_class_weight` (`class_weight.py:20-94`): `None`→1.0, `Balanced`→`n_samples/(n_classes·count_c)` (`class_weight.py:72`), `Explicit`→1.0 default overridden by map. `fn fit in decision_tree.rs` (classifier) expands these into PER-SAMPLE weights `sample_weight[i] = class_weight_[y_i]` (the `compute_sample_weight(class_weight, y)` of `_classes.py:310-367`) and threads `Option<&[F]>` + `min_weight_leaf` through `ClassificationData`. On the weighted path: node class counts become WEIGHTED sums (`fn weighted_class_counts`), gini/entropy compute on weighted counts (`fn weighted_gini_impurity`/`fn weighted_entropy_impurity` via `fn weighted_compute_impurity` — a SEPARATE function so the integer-count `compute_impurity` shared with the forest/extra-tree builders is UNCHANGED), the leaf distribution stores normalized weighted counts so `predict_proba = weighted_count_c/Σweighted` and `predict` = weighted argmax (lowest-index tie, `np.argmax`, `fn weighted_classification_node_value`/`fn make_weighted_classification_leaf`/`fn emit_classification_leaf`), the `min_samples_leaf` gate keeps UNWEIGHTED sample counts (`_splitter.pyx:451`) while `min_weight_fraction_leaf` uses the weighted `min_weight_leaf = min_weight_fraction_leaf·Σsample_weight` child gate (`_classes.py:373`, `_splitter.pyx:470`); the split-finder returns `improvement_inner·W_node` so `compute_feature_importances` (global-normalize) stays sklearn-consistent. Both the depth-first builder (`fn build_classification_tree`/`fn find_best_classification_split`) and the best-first builder (`fn build_classification_tree_best_first`/`fn make_classification_build_leaf`) are weight-aware. `None` ⇒ uniform ⇒ byte-identical (the 18 `divergence_decision_tree` pins + 340 lib tests stay green). **Production consumer** (R-DEFER-1): `fn fit in decision_tree.rs` consumes `self.class_weight` (a non-test production consumer); reachable via `with_class_weight` on the public `DecisionTreeClassifier` (re-exported at the crate root; `ClassWeight` is reachable via `pub mod decision_tree`). **Smoke tests** (R-CHAR-3, live sklearn 1.5.2 oracle, 8×2 imbalanced set, `DecisionTreeClassifier(max_depth=1, class_weight=CW, random_state=0)`): `test_classifier_class_weight_none_oracle` (root `(0, 2.1)`, predict `[0,0,0,0,1,1,1,1]`, proba[0] `[0.75,0.25]`), `_explicit_oracle` (`{0:1,1:5}`→root `(0,1.1)`, predict `[0,1,1,1,1,1,1,1]`, proba[0] `[1.0,0.0]`), `_balanced_oracle` (`'balanced'` w0=1.333,w1=0.8→root `(0,2.1)`, predict `[0,0,0,0,1,1,1,1]`, proba[0] `[0.8333,0.1667]`), `test_compute_class_weight_balanced` (balanced/none/explicit per-class weights, 1e-12). **STILL NOT-STARTED**: `random_state`/`splitter='random'` determinism boundary (open prereq blocker #670 — the estimator split search is deterministic, no feature permutation), plus `max_features` (#665), multi-output (#668). |
 | REQ-8 (ferray substrate) | NOT-STARTED | impl: module imports `use ndarray::{Array1, Array2}` and computes entirely on `ndarray` — the wrong substrate per R-SUBSTRATE-1. No `ferray-core` usage. open prereq blocker #671 (migrate decision_tree.rs to ferray-core). |
 
 ## Architecture
@@ -365,6 +367,14 @@ them.)
   classification/regression support.
 - **#669** — Blocker for REQ-7 of decision_tree: add `class_weight`
   (`{None,"balanced",dict}`) — extends existing issue #54 (sample_weight).
+  **CLOSED** (#665) — `pub enum ClassWeight<F> {None,Balanced,Explicit}` +
+  `pub class_weight` + `with_class_weight` on `DecisionTreeClassifier` (NOT the
+  regressor); `fn compute_class_weight` mirrors `sklearn.utils.compute_class_weight`
+  (`class_weight.py:72`); `fn fit` expands to per-sample weights
+  (`compute_sample_weight`, `_classes.py:310-367`) and threads WEIGHTED node
+  counts / gini-entropy / leaf distribution / `min_weight_fraction_leaf` gate
+  through the classifier build (weighted variants kept SEPARATE from the
+  forest-shared `compute_impurity`). `None` ⇒ byte-identical.
 - **#670** — Blocker for REQ-7 of decision_tree: add `random_state` +
   `splitter='random'`; document the RNG-determinism boundary — extends existing
   issue #50.
