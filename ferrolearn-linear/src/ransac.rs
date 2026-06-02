@@ -6,12 +6,58 @@
 //!
 //! # Algorithm
 //!
-//! 1. Randomly sample `min_samples` points.
-//! 2. Fit the base estimator on the sample.
-//! 3. Compute residuals for all points, identify inliers (residual below
-//!    `residual_threshold`).
-//! 4. If enough inliers, refit on all inliers.
-//! 5. Keep the model with the most inliers (ties broken by lowest residual).
+//! Mirrors scikit-learn 1.5.2's `RANSACRegressor.fit` decision rule
+//! (`sklearn/linear_model/_ransac.py:451-606`). Initialize `n_inliers_best = 1`,
+//! `score_best = -inf`, `inlier_mask_best = None`. Then for each trial:
+//!
+//! 1. Draw a `min_samples`-sized subset of indices (seedable; RNG-sequence
+//!    parity with numpy is out of scope — see `## REQ status`).
+//! 2. Fit the base estimator on the SUBSET.
+//! 3. Predict on ALL of `X`; classify a sample as an inlier iff
+//!    `|y − y_pred| <= residual_threshold` (boundary inclusive).
+//! 4. If `n_inliers_subset < n_inliers_best`, skip.
+//! 5. Compute `score_subset` = R² of the SUBSET model on its inlier set
+//!    (`1 − SS_res/SS_tot`; if `SS_tot == 0` then `1.0` when `SS_res == 0` else
+//!    `0.0`). No refit inside the loop.
+//! 6. If `n_inliers_subset == n_inliers_best` and `score_subset < score_best`,
+//!    skip — so higher R² wins ties on inlier count.
+//! 7. Otherwise record the new best (`n_inliers_best`, `score_best`, and the
+//!    SUBSET model's mask — never recomputed from a refit).
+//!
+//! After the loop, refit the base estimator ONCE on the best inlier set; that is
+//! the stored model. The reported `inlier_mask` is the winning subset model's
+//! mask. The default `residual_threshold` is the MAD of `y`
+//! (`median(|y − median(y)|)`), which may be exactly `0` for a constant target.
+//!
+//! ## REQ status (per `.design/linear/ransac.md`, mirrors `sklearn/linear_model/_ransac.py` @ 1.5.2)
+//!
+//! Binary classification (R-DEFER-2): SHIPPED means impl plus non-test consumer
+//! plus tests, all green; NOT-STARTED means an open blocker referenced by number.
+//! The boundary estimator types [`RANSACRegressor`] and
+//! [`FittedRANSACRegressor`] are re-exported at the crate root
+//! (`pub use ransac::{...} in lib.rs`); under S5/R-DEFER-1 the public estimator
+//! type IS the consumer surface (no `ferrolearn-python` RANSAC binding yet).
+//!
+//! **RNG non-parity caveat:** subset draws use `rand::rngs::StdRng` (Fisher-Yates),
+//! NOT numpy's Mersenne-Twister `sample_without_replacement`. Same-seed
+//! cross-implementation subset-sequence parity is infeasible and out of scope;
+//! parity is asserted only on the deterministic decision rules below.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (sampling loop) | SHIPPED | `fn sample_indices` draws `k` distinct indices via Fisher-Yates, called per trial in `fn fit`, seeded deterministically. Test: `test_ransac_reproducible_with_seed`. Structural only (RNG caveat above). |
+//! | REQ-2 (MAD threshold default) | SHIPPED | `fn fit` sets the auto threshold to `fn mad` (`median(|y − median(y)|)`) when `residual_threshold` is `None`, mirroring `_ransac.py:401`. Test: `test_ransac_auto_threshold`. |
+//! | REQ-3 (inlier classification) | SHIPPED | `fn fit`: `if (preds[i] - y[i]).abs() <= threshold { inlier_mask_subset[i] = true }`, boundary-inclusive `<=` per `_ransac.py:511`. Tests: `test_ransac_with_outlier`, `test_ransac_multiple_outliers`. |
+//! | REQ-4 (selection: n_inliers then R²) | SHIPPED | `fn fit` ranks by `(n_inliers_subset, score_subset)` with `score_subset = fn r2_score` of the subset model on its inliers; ties skip when `score_subset < score_best` (higher R² wins), mirroring `_ransac.py:530-543`. Test: `ransac_selection_criterion_r2_not_residual_sum` (tests/divergence_ransac_fit.rs) — oracle picks group B `[F,F,F,T,T,T]`, predict([[1.0]])≈10.05. Closed #512. |
+//! | REQ-5 (refit-once; mask from subset model) | SHIPPED | `fn fit` records `inlier_mask_best` from the SUBSET model (no in-loop refit/recompute) and refits the base estimator ONCE after the loop on `(x_inlier_best, y_inlier_best)`, mirroring `_ransac.py:544,602,605`. The stored `inlier_mask` is never recomputed from the refit. Verified by the green divergence suite + module unit tests. Closed #513. |
+//! | REQ-6 (n_inliers_best init / acceptance gate) | SHIPPED | `fn fit` initializes `n_inliers_best = 1` (`_ransac.py:451`), skips only when `n_inliers_subset < n_inliers_best` (`_ransac.py:515`), and no longer gates on `n_inliers >= min_samples`. The up-front `n_samples < min_samples` guard mirrors `_ransac.py:393-397`. Closed #514. |
+//! | REQ-7 (dynamic max_trials + stop criteria) | NOT-STARTED | open blocker #515. `fn fit` runs a FIXED `for _ in 0..self.max_trials` loop; no `_dynamic_max_trials` shrink, no `stop_n_inliers`/`stop_score`/`stop_probability`/`max_skips`, no `n_trials_`/`n_skips_*` tracking. |
+//! | REQ-8 (loss='squared_error') | NOT-STARTED | open blocker #516. `fn fit` hardcodes absolute-error residuals (`(preds[i] - y[i]).abs()`); no `loss` parameter. |
+//! | REQ-9 (MAD-zero parity) | SHIPPED | `fn fit` uses the MAD value directly (`mad(&y.to_vec())`) with no `1e-6` substitution, so a constant target yields threshold `0.0` per `_ransac.py:399-401`. Test: `ransac_mad_zero_threshold_excludes_tiny_deviation` (tests/divergence_ransac_fit.rs) — idx 7 (residual 1e-7) is an OUTLIER. Closed #517. |
+//! | REQ-10 (introspection attributes) | NOT-STARTED | open blocker #518. `FittedRANSACRegressor` exposes only `inlier_mask()`; no `estimator_`/`n_trials_`/`n_skips_*`/`n_features_in_`. |
+//! | REQ-11 (is_data_valid / is_model_valid / max_skips) | NOT-STARTED | open blocker #519. `RANSACRegressor` has no such fields. |
+//! | REQ-12 (min_samples float fraction) | NOT-STARTED | open blocker #520. `min_samples: Option<usize>` accepts only integer counts. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open blocker #521. Still on `ndarray` + `rand::rngs::StdRng`, not `ferray-core`/`ferray::random`. |
 //!
 //! # Examples
 //!
@@ -146,12 +192,13 @@ impl<Fitted> FittedRANSACRegressor<Fitted> {
 /// Compute the median of a slice of floats.
 fn median<F: Float>(values: &[F]) -> F {
     let mut sorted: Vec<F> = values.to_vec();
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // Total order without `.unwrap()`: NaNs (absent for valid targets) sort last.
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
     let n = sorted.len();
     if n == 0 {
         return F::zero();
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         (sorted[n / 2 - 1] + sorted[n / 2]) / (F::one() + F::one())
     } else {
         sorted[n / 2]
@@ -163,6 +210,46 @@ fn mad<F: Float>(values: &[F]) -> F {
     let med = median(values);
     let abs_devs: Vec<F> = values.iter().map(|&v| (v - med).abs()).collect();
     median(&abs_devs)
+}
+
+/// Coefficient of determination R² of `y_pred` against `y_true`.
+///
+/// Mirrors sklearn's `r2_score` (used through `estimator.score`,
+/// `_ransac.py:530`): `R² = 1 - SS_res / SS_tot` where
+/// `SS_res = Σ(y_true − y_pred)²` and `SS_tot = Σ(y_true − mean(y_true))²`.
+///
+/// Matches sklearn's constant-target edge case (`metrics/_regression.py`):
+/// when `SS_tot == 0`, R² is `1.0` if `SS_res == 0` (perfect prediction) and
+/// `0.0` otherwise.
+fn r2_score<F: Float>(y_true: &[F], y_pred: &[F]) -> F {
+    let n = y_true.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let mut sum = F::zero();
+    for &v in y_true {
+        sum = sum + v;
+    }
+    let mean = sum / F::from(n).unwrap_or_else(F::one);
+
+    let mut ss_res = F::zero();
+    let mut ss_tot = F::zero();
+    for (&t, &p) in y_true.iter().zip(y_pred.iter()) {
+        let res = t - p;
+        ss_res = ss_res + res * res;
+        let dev = t - mean;
+        ss_tot = ss_tot + dev * dev;
+    }
+
+    if ss_tot == F::zero() {
+        if ss_res == F::zero() {
+            F::one()
+        } else {
+            F::zero()
+        }
+    } else {
+        F::one() - ss_res / ss_tot
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -242,16 +329,15 @@ where
         }
 
         // Compute residual threshold if not provided.
-        let threshold = if let Some(t) = self.residual_threshold {
-            t
-        } else {
-            let y_mad = mad(&y.to_vec());
-            if y_mad <= F::epsilon() {
-                // If MAD is zero (constant target), use a small default.
-                F::from(1e-6).unwrap()
-            } else {
-                y_mad
-            }
+        //
+        // sklearn (`_ransac.py:399-401`) sets the default threshold to the MAD
+        // (median absolute deviation) of `y` with NO special-casing of zero:
+        // `residual_threshold = np.median(np.abs(y - np.median(y)))`. A constant
+        // (or near-constant) target therefore yields a threshold of exactly 0.0,
+        // under which only samples with a zero residual are inliers.
+        let threshold = match self.residual_threshold {
+            Some(t) => t,
+            None => mad(&y.to_vec()),
         };
 
         let mut rng = match self.random_state {
@@ -259,94 +345,96 @@ where
             None => rand::rngs::StdRng::seed_from_u64(42),
         };
 
-        let mut best_fitted: Option<E::Fitted> = None;
-        let mut best_inlier_mask: Option<Vec<bool>> = None;
-        let mut best_n_inliers = 0usize;
-        let mut best_residual_sum = F::infinity();
+        // sklearn-faithful selection state (`_ransac.py:451-456`):
+        //   n_inliers_best = 1, score_best = -inf, inlier_mask_best = None.
+        // The best inlier index set is remembered for the single final refit.
+        let mut n_inliers_best: usize = 1;
+        let mut score_best = F::neg_infinity();
+        let mut inlier_mask_best: Option<Vec<bool>> = None;
+        let mut inlier_best_idxs: Option<Vec<usize>> = None;
 
+        // `while n_trials < max_trials` (`_ransac.py:467`). We keep the fixed
+        // `self.max_trials` loop; dynamic max-trials / stop criteria are #515.
         for _ in 0..self.max_trials {
-            // Sample random subset.
-            let indices = sample_indices(&mut rng, n_samples, min_samples);
-            let (x_sub, y_sub) = subset(x, y, &indices);
+            // Choose a random sample set (`_ransac.py:478-482`). RNG-sequence
+            // parity with numpy's `sample_without_replacement` is infeasible and
+            // explicitly out of scope (see module REQ status).
+            let subset_idxs = sample_indices(&mut rng, n_samples, min_samples);
+            let (x_subset, y_subset) = subset(x, y, &subset_idxs);
 
-            // Fit base estimator on the subset.
-            let fitted = match self.estimator.fit(&x_sub, &y_sub) {
+            // Fit the base estimator on the SUBSET (`_ransac.py:497`).
+            let fitted_subset = match self.estimator.fit(&x_subset, &y_subset) {
                 Ok(f) => f,
-                Err(_) => continue, // Skip failed fits.
+                Err(_) => continue, // Skip failed fits (degenerate subset).
             };
 
-            // Compute residuals for all points.
-            let preds = match fitted.predict(x) {
+            // Residuals of ALL data under the subset model (`_ransac.py:507-508`).
+            let preds = match fitted_subset.predict(x) {
                 Ok(p) => p,
                 Err(_) => continue,
             };
 
-            let mut inlier_mask = vec![false; n_samples];
-            let mut n_inliers = 0usize;
-            let mut residual_sum = F::zero();
-
+            // Classify inliers: `residuals <= residual_threshold`, boundary
+            // inclusive (`_ransac.py:511-512`).
+            let mut inlier_mask_subset = vec![false; n_samples];
+            let mut inlier_idxs_subset: Vec<usize> = Vec::new();
             for i in 0..n_samples {
                 let residual = (preds[i] - y[i]).abs();
                 if residual <= threshold {
-                    inlier_mask[i] = true;
-                    n_inliers += 1;
-                    residual_sum = residual_sum + residual;
+                    inlier_mask_subset[i] = true;
+                    inlier_idxs_subset.push(i);
                 }
             }
+            let n_inliers_subset = inlier_idxs_subset.len();
 
-            // Check if this is better than the current best.
-            let is_better = n_inliers > best_n_inliers
-                || (n_inliers == best_n_inliers && residual_sum < best_residual_sum);
-
-            if is_better && n_inliers >= min_samples {
-                // Refit on all inliers.
-                let inlier_indices: Vec<usize> = inlier_mask
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &is_inlier)| is_inlier)
-                    .map(|(i, _)| i)
-                    .collect();
-                let (x_inlier, y_inlier) = subset(x, y, &inlier_indices);
-
-                if let Ok(refit) = self.estimator.fit(&x_inlier, &y_inlier) {
-                    // Recompute inlier mask with the refitted model.
-                    if let Ok(new_preds) = refit.predict(x) {
-                        let mut new_mask = vec![false; n_samples];
-                        let mut new_n_inliers = 0;
-                        let mut new_residual_sum = F::zero();
-                        for i in 0..n_samples {
-                            let r = (new_preds[i] - y[i]).abs();
-                            if r <= threshold {
-                                new_mask[i] = true;
-                                new_n_inliers += 1;
-                                new_residual_sum = new_residual_sum + r;
-                            }
-                        }
-                        best_fitted = Some(refit);
-                        best_inlier_mask = Some(new_mask);
-                        best_n_inliers = new_n_inliers;
-                        best_residual_sum = new_residual_sum;
-                    }
-                } else {
-                    // Keep the original fit if refit fails.
-                    best_fitted = Some(fitted);
-                    best_inlier_mask = Some(inlier_mask);
-                    best_n_inliers = n_inliers;
-                    best_residual_sum = residual_sum;
-                }
+            // Fewer inliers than the best so far -> skip (`_ransac.py:514-517`).
+            if n_inliers_subset < n_inliers_best {
+                continue;
             }
+
+            // Score the SUBSET model on the inlier set: R² of the subset-fitted
+            // model on `(X_inlier_subset, y_inlier_subset)` (`_ransac.py:530-534`).
+            // No refit inside the loop.
+            let y_inlier_subset: Vec<F> = inlier_idxs_subset.iter().map(|&i| y[i]).collect();
+            let pred_inlier_subset: Vec<F> = inlier_idxs_subset.iter().map(|&i| preds[i]).collect();
+            let score_subset = r2_score(&y_inlier_subset, &pred_inlier_subset);
+
+            // Same inlier count but worse score -> skip (`_ransac.py:538-539`).
+            // Higher R² wins ties on inlier count.
+            if n_inliers_subset == n_inliers_best && score_subset < score_best {
+                continue;
+            }
+
+            // Record the new best (`_ransac.py:542-547`). The stored mask is the
+            // SUBSET model's mask — NOT recomputed from a refit.
+            n_inliers_best = n_inliers_subset;
+            score_best = score_subset;
+            inlier_mask_best = Some(inlier_mask_subset);
+            inlier_best_idxs = Some(inlier_idxs_subset);
         }
 
-        match (best_fitted, best_inlier_mask) {
-            (Some(fitted), Some(mask)) => Ok(FittedRANSACRegressor {
-                fitted_estimator: fitted,
-                inlier_mask: mask,
-            }),
-            _ => Err(FerroError::ConvergenceFailure {
-                iterations: self.max_trials,
-                message: "RANSAC could not find a valid model after max_trials iterations".into(),
-            }),
-        }
+        // No valid consensus set found (`_ransac.py:561-580`).
+        let (mask_best, idxs_best) = match (inlier_mask_best, inlier_best_idxs) {
+            (Some(mask), Some(idxs)) => (mask, idxs),
+            _ => {
+                return Err(FerroError::ConvergenceFailure {
+                    iterations: self.max_trials,
+                    message: "RANSAC could not find a valid model after max_trials iterations"
+                        .into(),
+                });
+            }
+        };
+
+        // Estimate the final model using the best inlier set ONCE, after the
+        // loop (`_ransac.py:597-602`). `inlier_mask_` stays the subset model's
+        // mask; it is never recomputed from this refit.
+        let (x_inlier_best, y_inlier_best) = subset(x, y, &idxs_best);
+        let fitted_estimator = self.estimator.fit(&x_inlier_best, &y_inlier_best)?;
+
+        Ok(FittedRANSACRegressor {
+            fitted_estimator,
+            inlier_mask: mask_best,
+        })
     }
 }
 
