@@ -33,6 +33,24 @@
 //! pinned datasets have a unique optimum, so the simplex reaches sklearn's exact
 //! HiGHS vertex.
 //!
+//! ## REQ status (per `.design/linear/quantile_regressor.md`, mirrors `sklearn/linear_model/_quantile.py` @ 1.5.2)
+//!
+//! Mirrors `sklearn.linear_model.QuantileRegressor` (`_quantile.py:20`), pinball-loss LP solved
+//! by simplex (matching scipy's HiGHS). coef_/intercept_ match the live oracle to ~1e-6.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (LP-based quantile fit) | SHIPPED | `Fit for QuantileRegressor` → `mod lp` two-phase simplex; coef_/intercept_ match sklearn's HiGHS LP at q=0.2/0.5/0.8, α=0/1 (incl. exact sparse vertex). Consumer: `RsQuantileRegressor` in `ferrolearn-python`. Closed #340/#506 (was IRLS + centering intercept). |
+//! | REQ-2 (alpha L1 = alpha·n_samples, exact) | SHIPPED | LP cost `alpha·n` on coef± reaches the sparse vertex (α=1 → coef [0,0,0]). Closed #332. |
+//! | REQ-3 (quantile pinball asymmetry) | SHIPPED | cost `q` on u, `(1−q)` on v; intercept/coef now quantile-dependent. |
+//! | REQ-4 (predict) | SHIPPED | `Predict for FittedQuantileRegressor`. |
+//! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | intercept as LP variable; `HasCoefficients`. |
+//! | REQ-6..8 NOT-STARTED | n_iter_ (#507), solver/solver_options (#508; only 'highs' relevant), ferray substrate (#509; `mod lp` on ndarray/f64). |
+//!
+//! acto-critic + builder: the IRLS+centering fit was quantile-invariant and 25× off (#340);
+//! rewritten to the exact quantile-regression LP via a from-scratch two-phase simplex (8c18a21)
+//! matching sklearn's HiGHS vertex (incl. the degenerate α=1 sparse case). Two states only per R-DEFER-2.
+//!
 //! # Examples
 //!
 //! ```
