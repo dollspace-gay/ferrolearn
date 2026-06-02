@@ -187,7 +187,9 @@ fn sgd_classifier_default_learning_rate() {
 
     let is_optimal = matches!(clf.learning_rate, LearningRateSchedule::Optimal);
     assert!(
-        is_optimal && (clf.eta0 - SK_ETA0).abs() < 1e-12 && (clf.power_t - SK_POWER_T).abs() < 1e-12,
+        is_optimal
+            && (clf.eta0 - SK_ETA0).abs() < 1e-12
+            && (clf.power_t - SK_POWER_T).abs() < 1e-12,
         "SGDClassifier defaults diverge: sklearn learning_rate='optimal' eta0={SK_ETA0} \
          power_t={SK_POWER_T}; ferrolearn learning_rate={:?} eta0={} power_t={}",
         clf.learning_rate,
