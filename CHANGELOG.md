@@ -238,6 +238,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- chore(clippy): cleared all Rust 1.95 lints blocking `ferrolearn-linear` crate `-D warnings` (omp.rs/svm.rs collapsible_if, linalg.rs assign_op, lda.rs test needless_range_loop, test-fixture literal reformat) — behavior-preserving (#378, #357)
 - Translation unit: ferrolearn-linear/src/isotonic.rs — out_of_bounds='nan' default + _make_unique weighted collapse (#573)
 - Divergence: SGDRegressor/SGDClassifier do not validate l1_ratio to [0,1] (sklearn/linear_model/_stochastic_gradient.py:2018,1217) (#540)
 - Divergence: SGD Hinge::gradient diverges from sklearn/linear_model/_sgd_fast.pyx.tp:224 at z==threshold boundary (#539)
