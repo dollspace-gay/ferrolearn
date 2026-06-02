@@ -943,3 +943,260 @@ fn req3_reg_ccp_alpha_oracle() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-3 max_leaf_nodes (best-first growth) CERTIFYING PINS (#664).
+// `with_max_leaf_nodes(Some(k))` dispatches `fit` to the best-first builders
+// (`fn build_classification_tree_best_first` / `fn build_regression_tree_best_first`),
+// the native analog of sklearn's `BestFirstTreeBuilder.build` (`_tree.pyx:427`):
+// a max-heap frontier on tree-normalized improvement (`fn pop_best_frontier`),
+// `max_split_nodes = k - 1` (`_tree.pyx:457`), reusing the split-finder +
+// `ImpurityGate`. The regressor heap key uses a two-pass centered variance
+// (`fn stable_regression_improvement`) so the ~2e-17 near-tie at k=4 keeps
+// sklearn's frontier order. All expected values derived LIVE from the
+// sklearn 1.5.2 oracle (R-CHAR-3); python invocations recorded above each pin.
+// node_count = `tree_.node_count`; n_leaves = `get_n_leaves()`; predict =
+// `predict(X)`. Tests run in integration-test context — the `.unwrap()` idiom
+// matches the prior pins above (R-APG-2: test context is gate-exempt).
+// ===========================================================================
+
+/// Count `Node::Leaf` entries in a serialized tree (sklearn `get_n_leaves()`).
+fn count_leaves(nodes: &[Node<f64>]) -> usize {
+    nodes
+        .iter()
+        .filter(|n| matches!(n, Node::Leaf { .. }))
+        .count()
+}
+
+/// PIN A — `max_leaf_nodes` best-first growth on the CLASSIFIER (#664).
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier; \
+///     X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],dtype=float); \
+///     y=np.array([0,0,0,1,1,1,2,2,0]); \
+///     [print(k, DecisionTreeClassifier(max_leaf_nodes=k,random_state=0).fit(X,y).tree_.node_count, \
+///       DecisionTreeClassifier(max_leaf_nodes=k,random_state=0).fit(X,y).get_n_leaves(), \
+///       DecisionTreeClassifier(max_leaf_nodes=k,random_state=0).fit(X,y).predict(X).tolist()) \
+///       for k in (2,3,4)]; \
+///     print('None', DecisionTreeClassifier(random_state=0).fit(X,y).tree_.node_count)"
+///   => k=2  node_count 3  n_leaves 2  predict [0,0,0,1,1,1,0,0,0]
+///      k=3  node_count 5  n_leaves 3  predict [0,0,0,1,1,1,0,2,0]
+///      k=4  node_count 7  n_leaves 4  predict [0,0,0,1,1,1,2,2,0]
+///      None node_count 7
+#[test]
+fn req3_clf_max_leaf_nodes_oracle() {
+    let (x, y) = clf_dataset();
+
+    // k=2 -> node_count 3 / 2 leaves; the best-first frontier expands only the
+    // single highest-improvement split (the class-0/1 separation).
+    let k2 = DecisionTreeClassifier::<f64>::new()
+        .with_max_leaf_nodes(Some(2))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k2.nodes().len(),
+        3,
+        "CLF k=2 node_count: ferrolearn={} sklearn=3",
+        k2.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k2.nodes()),
+        2,
+        "CLF k=2 n_leaves: ferrolearn={} sklearn=2",
+        count_leaves(k2.nodes())
+    );
+    assert_eq!(
+        k2.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 0, 0, 0],
+        "CLF k=2 predict"
+    );
+
+    // k=3 -> node_count 5 / 3 leaves; predict separates one class-2 sample.
+    let k3 = DecisionTreeClassifier::<f64>::new()
+        .with_max_leaf_nodes(Some(3))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k3.nodes().len(),
+        5,
+        "CLF k=3 node_count: ferrolearn={} sklearn=5",
+        k3.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k3.nodes()),
+        3,
+        "CLF k=3 n_leaves: ferrolearn={} sklearn=3",
+        count_leaves(k3.nodes())
+    );
+    assert_eq!(
+        k3.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 0, 2, 0],
+        "CLF k=3 predict"
+    );
+
+    // k=4 -> node_count 7 / 4 leaves == the unlimited (depth-first) tree.
+    let k4 = DecisionTreeClassifier::<f64>::new()
+        .with_max_leaf_nodes(Some(4))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k4.nodes().len(),
+        7,
+        "CLF k=4 node_count: ferrolearn={} sklearn=7",
+        k4.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k4.nodes()),
+        4,
+        "CLF k=4 n_leaves: ferrolearn={} sklearn=4",
+        count_leaves(k4.nodes())
+    );
+    assert_eq!(
+        k4.predict(&x).unwrap().to_vec().as_slice(),
+        &[0, 0, 0, 1, 1, 1, 2, 2, 0],
+        "CLF k=4 predict"
+    );
+
+    // None -> depth-first builder, node_count 7 (unchanged).
+    let none = DecisionTreeClassifier::<f64>::new()
+        .with_max_leaf_nodes(None)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        none.nodes().len(),
+        7,
+        "CLF None node_count: ferrolearn={} sklearn=7",
+        none.nodes().len()
+    );
+}
+
+/// PIN B — `max_leaf_nodes` best-first growth on the REGRESSOR (#664).
+///
+/// SCRUTINY (k=4 near-tie): the depth-2 frontier holds the [5,6]-node
+/// (y=[5.0,5.2], split-improvement 0.0025000000000000044) and the [7,8]-node
+/// (y=[4.9,5.1], split-improvement 0.0024999999999999823) — differing by
+/// ~2.2e-17. sklearn's running-sum criterion expands the [5,6]-node first
+/// (higher improvement); the naive `Sum(y^2)/n - mean^2` variance can flip this
+/// order, so the builder orders the heap via `fn stable_regression_improvement`
+/// (two-pass centered variance). This pin asserts ferrolearn reproduces
+/// sklearn's exact frontier order at the near-tie: predict X=6 -> 5.2 (its own
+/// leaf) and X=7,8 -> 5.0 (collapsed). The result is random_state-invariant
+/// (single feature => no subsampling), verified across seeds.
+///
+/// Oracle (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor; \
+///     Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],dtype=float); \
+///     yr=np.array([1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1]); \
+///     [print(k, DecisionTreeRegressor(max_leaf_nodes=k).fit(Xr,yr).tree_.node_count, \
+///       DecisionTreeRegressor(max_leaf_nodes=k).fit(Xr,yr).get_n_leaves(), \
+///       DecisionTreeRegressor(max_leaf_nodes=k).fit(Xr,yr).predict(Xr).tolist()) \
+///       for k in (2,3,4)]; \
+///     print('None', DecisionTreeRegressor().fit(Xr,yr).tree_.node_count)"
+///   => k=2  node_count 3  n_leaves 2  predict [1.05,1.05,1.05,1.05,5.05,5.05,5.05,5.05]
+///      k=3  node_count 5  n_leaves 3  predict [1.05,1.05,1.05,1.05,5.1,5.1,5.0,5.0]
+///      k=4  node_count 7  n_leaves 4  predict [1.05,1.05,1.05,1.05,5.0,5.2,5.0,5.0]
+///      None node_count 15
+#[test]
+fn req3_reg_max_leaf_nodes_oracle() {
+    let (x, y) = reg_dataset();
+
+    // k=2 -> node_count 3 / 2 leaves; root (0,4.5), mean leaves 1.05 / 5.05.
+    let k2 = DecisionTreeRegressor::<f64>::new()
+        .with_max_leaf_nodes(Some(2))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k2.nodes().len(),
+        3,
+        "REG k=2 node_count: ferrolearn={} sklearn=3",
+        k2.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k2.nodes()),
+        2,
+        "REG k=2 n_leaves: ferrolearn={} sklearn=2",
+        count_leaves(k2.nodes())
+    );
+    let k2_pred = k2.predict(&x).unwrap();
+    for (i, &exp) in [1.05, 1.05, 1.05, 1.05, 5.05, 5.05, 5.05, 5.05]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            (k2_pred[i] - exp).abs() < 1e-9,
+            "REG k=2 predict[{i}]: ferrolearn={} sklearn={exp}",
+            k2_pred[i]
+        );
+    }
+
+    // k=3 -> node_count 5 / 3 leaves; predict [1.05x4, 5.1, 5.1, 5.0, 5.0].
+    let k3 = DecisionTreeRegressor::<f64>::new()
+        .with_max_leaf_nodes(Some(3))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k3.nodes().len(),
+        5,
+        "REG k=3 node_count: ferrolearn={} sklearn=5",
+        k3.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k3.nodes()),
+        3,
+        "REG k=3 n_leaves: ferrolearn={} sklearn=3",
+        count_leaves(k3.nodes())
+    );
+    let k3_pred = k3.predict(&x).unwrap();
+    for (i, &exp) in [1.05, 1.05, 1.05, 1.05, 5.1, 5.1, 5.0, 5.0]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            (k3_pred[i] - exp).abs() < 1e-9,
+            "REG k=3 predict[{i}]: ferrolearn={} sklearn={exp}",
+            k3_pred[i]
+        );
+    }
+
+    // k=4 (NEAR-TIE) -> node_count 7 / 4 leaves; the [5,6]-node is expanded
+    // before [7,8] becomes a leaf, so predict [1.05x4, 5.0, 5.2, 5.0, 5.0].
+    let k4 = DecisionTreeRegressor::<f64>::new()
+        .with_max_leaf_nodes(Some(4))
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        k4.nodes().len(),
+        7,
+        "REG k=4 node_count: ferrolearn={} sklearn=7",
+        k4.nodes().len()
+    );
+    assert_eq!(
+        count_leaves(k4.nodes()),
+        4,
+        "REG k=4 n_leaves: ferrolearn={} sklearn=4",
+        count_leaves(k4.nodes())
+    );
+    let k4_pred = k4.predict(&x).unwrap();
+    for (i, &exp) in [1.05, 1.05, 1.05, 1.05, 5.0, 5.2, 5.0, 5.0]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            (k4_pred[i] - exp).abs() < 1e-9,
+            "REG k=4 (near-tie) predict[{i}]: ferrolearn={} sklearn={exp}",
+            k4_pred[i]
+        );
+    }
+
+    // None -> depth-first builder, node_count 15 (each sample its own leaf).
+    let none = DecisionTreeRegressor::<f64>::new()
+        .with_max_leaf_nodes(None)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        none.nodes().len(),
+        15,
+        "REG None node_count: ferrolearn={} sklearn=15",
+        none.nodes().len()
+    );
+}

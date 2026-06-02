@@ -267,6 +267,15 @@ pub struct DecisionTreeClassifier<F> {
     /// smaller than `ccp_alpha` is chosen (Breiman weakest-link pruning,
     /// `_tree.pyx::_cost_complexity_prune`). `0.0` ⇒ no pruning.
     pub ccp_alpha: F,
+    /// Maximum number of leaf nodes. `None` ⇒ unlimited (depth-first growth).
+    ///
+    /// Mirrors sklearn's `max_leaf_nodes` (`_classes.py:946`, default `None`,
+    /// `Interval(Integral, 2, None, closed="left")`, `_classes.py:121`). When
+    /// `Some(k)`, the tree is grown best-first (highest impurity improvement
+    /// expanded first, `BestFirstTreeBuilder`, `_tree.pyx:407`) until it has `k`
+    /// leaves (`2k−1` nodes) or no expandable frontier node remains. `None`
+    /// keeps the byte-identical depth-first build.
+    pub max_leaf_nodes: Option<usize>,
     /// Splitting criterion.
     pub criterion: ClassificationCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -277,7 +286,8 @@ impl<F: Float> DecisionTreeClassifier<F> {
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
     /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
-    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`, `criterion = Gini`.
+    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`,
+    /// `max_leaf_nodes = None`, `criterion = Gini`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -287,6 +297,7 @@ impl<F: Float> DecisionTreeClassifier<F> {
             min_weight_fraction_leaf: F::zero(),
             min_impurity_decrease: F::zero(),
             ccp_alpha: F::zero(),
+            max_leaf_nodes: None,
             criterion: ClassificationCriterion::Gini,
             _marker: std::marker::PhantomData,
         }
@@ -334,6 +345,15 @@ impl<F: Float> DecisionTreeClassifier<F> {
     #[must_use]
     pub fn with_ccp_alpha(mut self, ccp_alpha: F) -> Self {
         self.ccp_alpha = ccp_alpha;
+        self
+    }
+
+    /// Set the maximum number of leaf nodes (sklearn `max_leaf_nodes`,
+    /// `_classes.py:946`, default `None`). `Some(k)` switches the build to
+    /// best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`).
+    #[must_use]
+    pub fn with_max_leaf_nodes(mut self, max_leaf_nodes: Option<usize>) -> Self {
+        self.max_leaf_nodes = max_leaf_nodes;
         self
     }
 
@@ -540,10 +560,26 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
         let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
         let mut meta: Vec<NodeMeta<F>> = Vec::new();
-        let meta_arg = if prune { Some(&mut meta) } else { None };
-        build_classification_tree(
-            &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
-        );
+        if let Some(max_leaf_nodes) = self.max_leaf_nodes {
+            // Best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`):
+            // expand the frontier node with the highest impurity improvement
+            // until `max_leaf_nodes` leaves are reached.
+            let meta_arg = if prune { Some(&mut meta) } else { None };
+            build_classification_tree_best_first(
+                &data,
+                &indices,
+                &mut nodes,
+                meta_arg,
+                &params,
+                &gate,
+                max_leaf_nodes,
+            );
+        } else {
+            let meta_arg = if prune { Some(&mut meta) } else { None };
+            build_classification_tree(
+                &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+            );
+        }
 
         if prune {
             nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
@@ -682,6 +718,15 @@ pub struct DecisionTreeRegressor<F> {
     /// smaller than `ccp_alpha` is chosen (Breiman weakest-link pruning,
     /// `_tree.pyx::_cost_complexity_prune`). `0.0` ⇒ no pruning.
     pub ccp_alpha: F,
+    /// Maximum number of leaf nodes. `None` ⇒ unlimited (depth-first growth).
+    ///
+    /// Mirrors sklearn's `max_leaf_nodes` (`_classes.py:1317`, default `None`,
+    /// `Interval(Integral, 2, None, closed="left")`, `_classes.py:121`). When
+    /// `Some(k)`, the tree is grown best-first (highest impurity improvement
+    /// expanded first, `BestFirstTreeBuilder`, `_tree.pyx:407`) until it has `k`
+    /// leaves (`2k−1` nodes) or no expandable frontier node remains. `None`
+    /// keeps the byte-identical depth-first build.
+    pub max_leaf_nodes: Option<usize>,
     /// Splitting criterion.
     pub criterion: RegressionCriterion,
     _marker: std::marker::PhantomData<F>,
@@ -692,7 +737,8 @@ impl<F: Float> DecisionTreeRegressor<F> {
     ///
     /// Defaults: `max_depth = None`, `min_samples_split = 2`,
     /// `min_samples_leaf = 1`, `min_weight_fraction_leaf = 0.0`,
-    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`, `criterion = MSE`.
+    /// `min_impurity_decrease = 0.0`, `ccp_alpha = 0.0`,
+    /// `max_leaf_nodes = None`, `criterion = MSE`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -702,6 +748,7 @@ impl<F: Float> DecisionTreeRegressor<F> {
             min_weight_fraction_leaf: F::zero(),
             min_impurity_decrease: F::zero(),
             ccp_alpha: F::zero(),
+            max_leaf_nodes: None,
             criterion: RegressionCriterion::Mse,
             _marker: std::marker::PhantomData,
         }
@@ -749,6 +796,15 @@ impl<F: Float> DecisionTreeRegressor<F> {
     #[must_use]
     pub fn with_ccp_alpha(mut self, ccp_alpha: F) -> Self {
         self.ccp_alpha = ccp_alpha;
+        self
+    }
+
+    /// Set the maximum number of leaf nodes (sklearn `max_leaf_nodes`,
+    /// `_classes.py:1317`, default `None`). `Some(k)` switches the build to
+    /// best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`).
+    #[must_use]
+    pub fn with_max_leaf_nodes(mut self, max_leaf_nodes: Option<usize>) -> Self {
+        self.max_leaf_nodes = max_leaf_nodes;
         self
     }
 
@@ -882,10 +938,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
         let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
         let mut meta: Vec<NodeMeta<F>> = Vec::new();
-        let meta_arg = if prune { Some(&mut meta) } else { None };
-        build_regression_tree(
-            &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
-        );
+        if let Some(max_leaf_nodes) = self.max_leaf_nodes {
+            // Best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`).
+            let meta_arg = if prune { Some(&mut meta) } else { None };
+            build_regression_tree_best_first(
+                &data,
+                &indices,
+                &mut nodes,
+                meta_arg,
+                &params,
+                &gate,
+                max_leaf_nodes,
+            );
+        } else {
+            let meta_arg = if prune { Some(&mut meta) } else { None };
+            build_regression_tree(
+                &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+            );
+        }
 
         if prune {
             nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
@@ -2072,6 +2142,598 @@ pub(crate) fn build_regression_tree_per_split_features<F: Float>(
         Some(&mut rng),
     );
     nodes
+}
+
+// ---------------------------------------------------------------------------
+// Best-first growth (`max_leaf_nodes`, sklearn `BestFirstTreeBuilder`)
+// ---------------------------------------------------------------------------
+
+/// A frontier record awaiting expansion in the best-first builder, the native
+/// analog of sklearn's `FrontierRecord` (`_tree.pyx:374`).
+///
+/// Records carry their candidate split (already found, with the tree-normalized
+/// `improvement` used to order the max-heap, exactly as sklearn stores
+/// `split.improvement` in `_add_split_node`, `_tree.pyx:670`) plus the
+/// `arena_idx` slot reserved for this node so the parent can wire its child
+/// pointer once the record is materialized. `is_leaf` records ascertain at
+/// push time that the node cannot be split (depth / min_samples / purity /
+/// `min_impurity_decrease` gate) and carry `improvement = 0`.
+struct FrontierRecord<F> {
+    /// Reserved arena slot for this node (filled when the record is popped).
+    arena_idx: usize,
+    /// Sample indices reaching this node.
+    indices: Vec<usize>,
+    /// Depth of this node (root = 0).
+    depth: usize,
+    /// Tree-normalized impurity improvement of this node's best split, used to
+    /// order the frontier max-heap (`_compare_records`, `_tree.pyx:392`).
+    improvement: F,
+    /// This node's candidate split `(feature, threshold, best_impurity_decrease)`
+    /// (`best_impurity_decrease` is the finder's `improvement_inner · n_node`).
+    /// `None` ⇒ the node is a leaf (no expandable split).
+    split: Option<(usize, F, F)>,
+    /// Monotone insertion counter: the tie-break for equal `improvement`
+    /// (lower id popped first), documenting sklearn's heap which is unstable on
+    /// exact ties.
+    seq: u64,
+}
+
+/// A node in the best-first arena, indexed by `arena_idx`. Split nodes record
+/// their child arena slots once both children have been pushed; leaves carry
+/// the materialized leaf value/distribution.
+enum BuildNode<F> {
+    /// An internal split node, with arena slots for its children.
+    Split {
+        feature: usize,
+        threshold: F,
+        impurity_decrease: F,
+        n_samples: usize,
+        left: usize,
+        right: usize,
+        /// Pruning metadata for this node's collapse leaf (only when recording).
+        meta: Option<NodeMeta<F>>,
+    },
+    /// A leaf node carrying its prediction value and (classifier) distribution.
+    Leaf {
+        value: F,
+        class_distribution: Option<Vec<F>>,
+        n_samples: usize,
+        meta: Option<NodeMeta<F>>,
+    },
+}
+
+/// Serialize the best-first arena into a flat depth-first pre-order
+/// `Vec<Node<F>>` (root = 0, left child before right), the layout the
+/// depth-first builder produces and that `predict`/`nodes()` understand. When
+/// `meta_out` is `Some`, the per-node pruning metadata is emitted in the same
+/// pre-order so `ccp_alpha` pruning (which runs afterwards) stays index-aligned.
+fn serialize_best_first_arena<F: Float>(
+    arena: &[BuildNode<F>],
+    record_meta: bool,
+) -> (Vec<Node<F>>, Vec<NodeMeta<F>>) {
+    let mut nodes: Vec<Node<F>> = Vec::with_capacity(arena.len());
+    let mut meta: Vec<NodeMeta<F>> = Vec::new();
+    if arena.is_empty() {
+        return (nodes, meta);
+    }
+    // (arena_idx, reserved slot in `nodes`).
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    let root_slot = nodes.len();
+    nodes.push(placeholder_leaf::<F>());
+    if record_meta {
+        meta.push(NodeMeta {
+            impurity: F::zero(),
+            n_samples: 0,
+            value: F::zero(),
+            distribution: None,
+        });
+    }
+    stack.push((0usize, root_slot));
+
+    while let Some((arena_idx, slot)) = stack.pop() {
+        match &arena[arena_idx] {
+            BuildNode::Leaf {
+                value,
+                class_distribution,
+                n_samples,
+                meta: node_meta,
+            } => {
+                nodes[slot] = Node::Leaf {
+                    value: *value,
+                    class_distribution: class_distribution.clone(),
+                    n_samples: *n_samples,
+                };
+                if record_meta && let Some(m) = node_meta {
+                    meta[slot] = m.clone();
+                }
+            }
+            BuildNode::Split {
+                feature,
+                threshold,
+                impurity_decrease,
+                n_samples,
+                left,
+                right,
+                meta: node_meta,
+            } => {
+                let left_slot = nodes.len();
+                nodes.push(placeholder_leaf::<F>());
+                let right_slot = nodes.len();
+                nodes.push(placeholder_leaf::<F>());
+                if record_meta {
+                    meta.push(NodeMeta {
+                        impurity: F::zero(),
+                        n_samples: 0,
+                        value: F::zero(),
+                        distribution: None,
+                    });
+                    meta.push(NodeMeta {
+                        impurity: F::zero(),
+                        n_samples: 0,
+                        value: F::zero(),
+                        distribution: None,
+                    });
+                }
+                nodes[slot] = Node::Split {
+                    feature: *feature,
+                    threshold: *threshold,
+                    left: left_slot,
+                    right: right_slot,
+                    impurity_decrease: *impurity_decrease,
+                    n_samples: *n_samples,
+                };
+                if record_meta && let Some(m) = node_meta {
+                    meta[slot] = m.clone();
+                }
+                // Push right first so left is processed first (pre-order).
+                stack.push((*right, right_slot));
+                stack.push((*left, left_slot));
+            }
+        }
+    }
+    (nodes, meta)
+}
+
+/// Pop the frontier record with the highest `improvement` (sklearn's max-heap;
+/// `_compare_records` orders by `improvement`, the max is popped first,
+/// `_tree.pyx:392`). On an exact `improvement` tie the lowest `seq`
+/// (insertion order) is returned — a deterministic tie-break documenting that
+/// sklearn's C++ heap is NOT stably ordered on exact ties (on the oracle sets
+/// the improvements are distinct, so the depth-first path is unaffected).
+///
+/// Uses a NaN-safe `partial_cmp` fallback so it never panics (R-CODE-2).
+#[allow(
+    clippy::type_complexity,
+    reason = "frontier is a plain Vec scanned linearly; a BinaryHeap would need an Ord wrapper for F"
+)]
+fn pop_best_frontier<F: Float>(frontier: &mut Vec<FrontierRecord<F>>) -> Option<FrontierRecord<F>> {
+    if frontier.is_empty() {
+        return None;
+    }
+    let mut best = 0usize;
+    for i in 1..frontier.len() {
+        let cur = &frontier[i];
+        let cur_best = &frontier[best];
+        let better = match cur.improvement.partial_cmp(&cur_best.improvement) {
+            Some(std::cmp::Ordering::Greater) => true,
+            Some(std::cmp::Ordering::Equal) => cur.seq < cur_best.seq,
+            _ => false,
+        };
+        if better {
+            best = i;
+        }
+    }
+    Some(frontier.swap_remove(best))
+}
+
+/// Build a classification tree best-first (`max_leaf_nodes`), the native analog
+/// of sklearn's `BestFirstTreeBuilder.build` (`_tree.pyx:427`).
+///
+/// `max_leaf_nodes` is `k`: the grown tree has at most `k` leaves (`2k−1`
+/// nodes). Reuses [`find_best_classification_split`] and the [`ImpurityGate`].
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the depth-first builder's argument set plus max_leaf_nodes"
+)]
+fn build_classification_tree_best_first<F: Float>(
+    data: &ClassificationData<'_, F>,
+    indices: &[usize],
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    params: &TreeParams,
+    gate: &ImpurityGate<F>,
+    max_leaf_nodes: usize,
+) {
+    let record_meta = meta.is_some();
+    let mut arena: Vec<BuildNode<F>> = Vec::new();
+    let n_total_f = F::from(gate.n_total).unwrap_or_else(F::one);
+    let mut seq: u64 = 0;
+
+    // Evaluate a node: compute its class counts, decide whether it can split
+    // (depth / min_samples / purity), find its best split + gate it, and build
+    // the frontier record (split or leaf) for the reserved `arena_idx` slot.
+    let evaluate =
+        |arena_idx: usize, node_indices: Vec<usize>, depth: usize, seq: u64| -> FrontierRecord<F> {
+            let n = node_indices.len();
+            let mut class_counts = vec![0usize; data.n_classes];
+            for &i in &node_indices {
+                class_counts[data.y[i]] += 1;
+            }
+            let cannot_split = n < params.min_samples_split
+                || params.max_depth.is_some_and(|d| depth >= d)
+                || class_counts.iter().filter(|&&c| c > 0).count() <= 1;
+
+            let split = if cannot_split {
+                None
+            } else {
+                // No per-split RNG feature sampling on the estimator surface.
+                find_best_classification_split(data, &node_indices, params.min_samples_leaf, None)
+                    .filter(|&(_, _, best_impurity_decrease)| {
+                        let improvement = best_impurity_decrease / n_total_f;
+                        !gate.rejects(improvement)
+                    })
+            };
+
+            let improvement = split.map_or(F::zero(), |(_, _, bid)| bid / n_total_f);
+            FrontierRecord {
+                arena_idx,
+                indices: node_indices,
+                depth,
+                improvement,
+                split,
+                seq,
+            }
+        };
+
+    // Reserve the root slot and seed the frontier.
+    arena.push(placeholder_build_leaf::<F>());
+    let mut frontier: Vec<FrontierRecord<F>> = vec![evaluate(0, indices.to_vec(), 0, seq)];
+    seq += 1;
+
+    // `max_split_nodes = max_leaf_nodes - 1` (sklearn, `_tree.pyx:457`): each
+    // materialized split decrements it; when it hits 0 the remaining frontier
+    // nodes become leaves.
+    let mut max_split_nodes = max_leaf_nodes.saturating_sub(1) as isize;
+
+    while let Some(record) = pop_best_frontier(&mut frontier) {
+        let is_leaf = record.split.is_none() || max_split_nodes <= 0;
+
+        if is_leaf {
+            arena[record.arena_idx] =
+                make_classification_build_leaf(data, &record.indices, record_meta);
+            continue;
+        }
+
+        // Expand: materialize this split, push both children.
+        max_split_nodes -= 1;
+        let (best_feature, best_threshold, best_impurity_decrease) = match record.split {
+            Some(s) => s,
+            None => continue,
+        };
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = record
+            .indices
+            .iter()
+            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+
+        let left_slot = arena.len();
+        arena.push(placeholder_build_leaf::<F>());
+        let right_slot = arena.len();
+        arena.push(placeholder_build_leaf::<F>());
+
+        let node_meta = if record_meta {
+            let mut class_counts = vec![0usize; data.n_classes];
+            for &i in &record.indices {
+                class_counts[data.y[i]] += 1;
+            }
+            let n = record.indices.len();
+            let (majority_class, distribution) =
+                classification_node_value::<F>(&class_counts, data.n_classes, n);
+            Some(NodeMeta {
+                impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+                n_samples: n,
+                value: F::from(majority_class).unwrap_or_else(F::zero),
+                distribution: Some(distribution),
+            })
+        } else {
+            None
+        };
+
+        arena[record.arena_idx] = BuildNode::Split {
+            feature: best_feature,
+            threshold: best_threshold,
+            impurity_decrease: best_impurity_decrease,
+            n_samples: record.indices.len(),
+            left: left_slot,
+            right: right_slot,
+            meta: node_meta,
+        };
+
+        frontier.push(evaluate(left_slot, left_indices, record.depth + 1, seq));
+        seq += 1;
+        frontier.push(evaluate(right_slot, right_indices, record.depth + 1, seq));
+        seq += 1;
+    }
+
+    let (built, built_meta) = serialize_best_first_arena(&arena, record_meta);
+    *nodes = built;
+    if let Some(meta) = meta {
+        *meta = built_meta;
+    }
+}
+
+/// Materialize a classification leaf [`BuildNode`] from a node's samples.
+fn make_classification_build_leaf<F: Float>(
+    data: &ClassificationData<'_, F>,
+    node_indices: &[usize],
+    record_meta: bool,
+) -> BuildNode<F> {
+    let n = node_indices.len();
+    let mut class_counts = vec![0usize; data.n_classes];
+    for &i in node_indices {
+        class_counts[data.y[i]] += 1;
+    }
+    let (majority_class, distribution) =
+        classification_node_value::<F>(&class_counts, data.n_classes, n);
+    let value = F::from(majority_class).unwrap_or_else(F::zero);
+    let meta = if record_meta {
+        Some(NodeMeta {
+            impurity: compute_impurity::<F>(&class_counts, n, data.criterion),
+            n_samples: n,
+            value,
+            distribution: Some(distribution.clone()),
+        })
+    } else {
+        None
+    };
+    BuildNode::Leaf {
+        value,
+        class_distribution: Some(distribution),
+        n_samples: n,
+        meta,
+    }
+}
+
+/// Build a regression tree best-first (`max_leaf_nodes`), the native analog of
+/// sklearn's `BestFirstTreeBuilder.build` (`_tree.pyx:427`).
+///
+/// Reuses [`find_best_regression_split`] and the [`ImpurityGate`]; the friedman
+/// improvement normalization (`/n_node` vs `/N`) mirrors the depth-first gate.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors the depth-first builder's argument set plus max_leaf_nodes"
+)]
+fn build_regression_tree_best_first<F: Float>(
+    data: &RegressionData<'_, F>,
+    indices: &[usize],
+    nodes: &mut Vec<Node<F>>,
+    meta: Option<&mut Vec<NodeMeta<F>>>,
+    params: &TreeParams,
+    gate: &ImpurityGate<F>,
+    max_leaf_nodes: usize,
+) {
+    let record_meta = meta.is_some();
+    let mut arena: Vec<BuildNode<F>> = Vec::new();
+    let mut seq: u64 = 0;
+
+    let evaluate = |arena_idx: usize,
+                    node_indices: Vec<usize>,
+                    depth: usize,
+                    seq: u64|
+     -> FrontierRecord<F> {
+        let n = node_indices.len();
+        let parent_impurity = regression_node_impurity(data.y, &node_indices, data.criterion);
+        let cannot_split = n < params.min_samples_split
+            || params.max_depth.is_some_and(|d| depth >= d)
+            || parent_impurity <= F::epsilon();
+
+        let split = if cannot_split {
+            None
+        } else {
+            find_best_regression_split(data, &node_indices, params.min_samples_leaf, None).filter(
+                |&(_, _, best_impurity_decrease)| {
+                    // friedman_mse improvement is already tree-normalized per
+                    // `_criterion.pyx:1573` (`/n_node`); the rest divide by N.
+                    let denom = match data.criterion {
+                        RegressionCriterion::FriedmanMse => n,
+                        _ => gate.n_total,
+                    };
+                    let denom_f = F::from(denom).unwrap_or_else(F::one);
+                    let improvement = best_impurity_decrease / denom_f;
+                    !gate.rejects(improvement)
+                },
+            )
+        };
+
+        // Frontier ORDERING uses a numerically-stable two-pass recomputation of
+        // the chosen split's tree-normalized improvement (the finder's
+        // `bid / N` uses the naive `Σy²/n − mean²` variance whose catastrophic
+        // cancellation can flip the relative order of two near-equal
+        // improvements vs sklearn's running-sum criterion — e.g. the k=4
+        // regressor oracle where two depth-2 nodes differ by ~2e-17). The
+        // split itself (feature/threshold/stored `impurity_decrease`) is
+        // UNCHANGED; only the heap key is recomputed stably.
+        let improvement = split.map_or(F::zero(), |(feat, threshold, bid)| {
+            stable_regression_improvement(data, &node_indices, feat, threshold, bid, gate.n_total)
+        });
+        FrontierRecord {
+            arena_idx,
+            indices: node_indices,
+            depth,
+            improvement,
+            split,
+            seq,
+        }
+    };
+
+    arena.push(placeholder_build_leaf::<F>());
+    let mut frontier: Vec<FrontierRecord<F>> = vec![evaluate(0, indices.to_vec(), 0, seq)];
+    seq += 1;
+
+    let mut max_split_nodes = max_leaf_nodes.saturating_sub(1) as isize;
+
+    while let Some(record) = pop_best_frontier(&mut frontier) {
+        let is_leaf = record.split.is_none() || max_split_nodes <= 0;
+
+        if is_leaf {
+            arena[record.arena_idx] =
+                make_regression_build_leaf(data, &record.indices, record_meta);
+            continue;
+        }
+
+        max_split_nodes -= 1;
+        let (best_feature, best_threshold, best_impurity_decrease) = match record.split {
+            Some(s) => s,
+            None => continue,
+        };
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = record
+            .indices
+            .iter()
+            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+
+        let left_slot = arena.len();
+        arena.push(placeholder_build_leaf::<F>());
+        let right_slot = arena.len();
+        arena.push(placeholder_build_leaf::<F>());
+
+        let node_meta = if record_meta {
+            Some(NodeMeta {
+                impurity: regression_node_impurity(data.y, &record.indices, data.criterion),
+                n_samples: record.indices.len(),
+                value: regression_leaf_value(data.y, &record.indices, data.criterion),
+                distribution: None,
+            })
+        } else {
+            None
+        };
+
+        arena[record.arena_idx] = BuildNode::Split {
+            feature: best_feature,
+            threshold: best_threshold,
+            impurity_decrease: best_impurity_decrease,
+            n_samples: record.indices.len(),
+            left: left_slot,
+            right: right_slot,
+            meta: node_meta,
+        };
+
+        frontier.push(evaluate(left_slot, left_indices, record.depth + 1, seq));
+        seq += 1;
+        frontier.push(evaluate(right_slot, right_indices, record.depth + 1, seq));
+        seq += 1;
+    }
+
+    let (built, built_meta) = serialize_best_first_arena(&arena, record_meta);
+    *nodes = built;
+    if let Some(meta) = meta {
+        *meta = built_meta;
+    }
+}
+
+/// Numerically-stable tree-normalized improvement of a regression split, used
+/// ONLY to order the best-first frontier max-heap.
+///
+/// `(feature, threshold)` are the finder's chosen split; `naive_bid` is the
+/// finder's stored `best_impurity_decrease` (kept for the non-variance
+/// criteria, which already use two-pass impurity helpers). For MSE / FriedmanMSE
+/// the variance terms are recomputed with a two-pass centered sum-of-squares
+/// (`Σ(y−mean)²/n`) so the heap key does not suffer the naive variance's
+/// catastrophic cancellation. The returned value is the tree-normalized
+/// improvement `(n_node/N)·(parent − Σ(n_child/n_node)·imp_child)` for
+/// MSE/MAE/Poisson and the Friedman proxy `diff²/(n_L·n_R·n_node)` for
+/// FriedmanMSE (matching the depth-first gate's `/N` vs `/n_node` denominators).
+fn stable_regression_improvement<F: Float>(
+    data: &RegressionData<'_, F>,
+    node_indices: &[usize],
+    feature: usize,
+    threshold: F,
+    naive_bid: F,
+    n_total: usize,
+) -> F {
+    let n = node_indices.len();
+    let n_f = F::from(n).unwrap_or_else(F::one);
+    let n_total_f = F::from(n_total).unwrap_or_else(F::one);
+    let (left, right): (Vec<usize>, Vec<usize>) = node_indices
+        .iter()
+        .partition(|&&i| data.x[[i, feature]] <= threshold);
+    let n_l = F::from(left.len()).unwrap_or_else(F::one);
+    let n_r = F::from(right.len()).unwrap_or_else(F::one);
+
+    match data.criterion {
+        RegressionCriterion::Mse => {
+            let parent_var = centered_variance(data.y, node_indices);
+            let left_var = centered_variance(data.y, &left);
+            let right_var = centered_variance(data.y, &right);
+            let inner = parent_var - (n_l / n_f) * left_var - (n_r / n_f) * right_var;
+            (n_f / n_total_f) * inner
+        }
+        RegressionCriterion::FriedmanMse => {
+            // Friedman proxy diff²/(n_L·n_R·n_node), diff = n_R·sum_L − n_L·sum_R,
+            // using stable means (sum = mean·n) — already the tree-normalized
+            // improvement (`_criterion.pyx:1573`), divided by n_node not N.
+            let sum_l = mean_value(data.y, &left) * n_l;
+            let sum_r = mean_value(data.y, &right) * n_r;
+            let diff = n_r * sum_l - n_l * sum_r;
+            diff * diff / (n_l * n_r * n_f)
+        }
+        // MAE / Poisson impurity helpers are already two-pass / stable; reuse
+        // the finder's improvement (bid / N).
+        RegressionCriterion::AbsoluteError | RegressionCriterion::Poisson => naive_bid / n_total_f,
+    }
+}
+
+/// Two-pass centered variance `Σ(y−mean)²/n` of the targets at `indices`
+/// (numerically stable; avoids the naive `Σy²/n − mean²` cancellation).
+fn centered_variance<F: Float>(y: &Array1<F>, indices: &[usize]) -> F {
+    let n = indices.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let mean = mean_value(y, indices);
+    let sum_sq: F = indices
+        .iter()
+        .map(|&i| {
+            let d = y[i] - mean;
+            d * d
+        })
+        .fold(F::zero(), |a, b| a + b);
+    sum_sq / F::from(n).unwrap_or_else(F::one)
+}
+
+/// Materialize a regression leaf [`BuildNode`] from a node's samples.
+fn make_regression_build_leaf<F: Float>(
+    data: &RegressionData<'_, F>,
+    node_indices: &[usize],
+    record_meta: bool,
+) -> BuildNode<F> {
+    let n = node_indices.len();
+    let value = regression_leaf_value(data.y, node_indices, data.criterion);
+    let meta = if record_meta {
+        Some(NodeMeta {
+            impurity: regression_node_impurity(data.y, node_indices, data.criterion),
+            n_samples: n,
+            value,
+            distribution: None,
+        })
+    } else {
+        None
+    };
+    BuildNode::Leaf {
+        value,
+        class_distribution: None,
+        n_samples: n,
+        meta,
+    }
+}
+
+/// A placeholder leaf [`BuildNode`] reserving an arena slot before its real
+/// contents are known (overwritten when its frontier record is popped).
+fn placeholder_build_leaf<F: Float>() -> BuildNode<F> {
+    BuildNode::Leaf {
+        value: F::zero(),
+        class_distribution: None,
+        n_samples: 0,
+        meta: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3381,5 +4043,191 @@ mod tests {
         let root = reg_root_split(&fitted);
         assert_eq!(root, Some((0, 4.5)));
         assert_reg_predict(&fitted, &x, &[1.1, 1.1, 1.0, 1.0, 5.1, 5.1, 5.0, 5.0]);
+    }
+
+    // -- REQ-3: max_leaf_nodes best-first growth smoke tests.
+    //    Expected values from the live sklearn 1.5.2 oracle (R-CHAR-3):
+    //
+    //    import numpy as np; from sklearn.tree import DecisionTreeClassifier
+    //    X=np.array([[1,2],[2,3],[3,3],[5,6],[6,7],[7,8],[1.5,5],[6.5,2],[3,1]],float)
+    //    y=np.array([0,0,0,1,1,1,2,2,0])
+    //    for k in (2,3,4,None):
+    //        c=DecisionTreeClassifier(max_leaf_nodes=k,random_state=0).fit(X,y)
+    //        print(k, c.tree_.node_count, c.get_n_leaves(), c.predict(X).tolist())
+    //    # 2    -> 3 leaves=2 [0,0,0,1,1,1,0,0,0]
+    //    # 3    -> 5 leaves=3 [0,0,0,1,1,1,0,2,0]
+    //    # 4    -> 7 leaves=4 [0,0,0,1,1,1,2,2,0]
+    //    # None -> 7 leaves=4 [0,0,0,1,1,1,2,2,0]  (depth-first, unchanged)
+    //
+    //    from sklearn.tree import DecisionTreeRegressor
+    //    Xr=np.array([[1],[2],[3],[4],[5],[6],[7],[8]],float)
+    //    yr=np.array([1.0,1.2,0.9,1.1,5.0,5.2,4.9,5.1])
+    //    for k in (2,3,4,5,None):
+    //        r=DecisionTreeRegressor(max_leaf_nodes=k,random_state=0).fit(Xr,yr)
+    //        print(k, r.tree_.node_count, r.get_n_leaves(), r.predict(Xr).tolist())
+    //    # 2    -> 3 leaves=2 [1.05]*4 + [5.05]*4
+    //    # 3    -> 5 leaves=3 [1.05]*4 + [5.1,5.1,5.0,5.0]
+    //    # 4    -> 7 leaves=4 [1.05]*4 + [5.0,5.2,5.0,5.0]
+    //    # 5    -> 9 leaves=5 [1.05]*4 + [5.0,5.2,4.9,5.1]
+    //    # None -> 15 leaves=8 == yr (depth-first, unchanged)
+
+    /// Count the leaf nodes in a fitted classifier tree.
+    fn clf_n_leaves(fitted: &FittedDecisionTreeClassifier<f64>) -> usize {
+        fitted
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n, Node::Leaf { .. }))
+            .count()
+    }
+
+    /// Count the leaf nodes in a fitted regressor tree.
+    fn reg_n_leaves(fitted: &FittedDecisionTreeRegressor<f64>) -> usize {
+        fitted
+            .nodes()
+            .iter()
+            .filter(|n| matches!(n, Node::Leaf { .. }))
+            .count()
+    }
+
+    fn fit_clf_max_leaf(
+        x: &Array2<f64>,
+        y: &Array1<usize>,
+        k: Option<usize>,
+    ) -> FittedDecisionTreeClassifier<f64> {
+        match DecisionTreeClassifier::<f64>::new()
+            .with_max_leaf_nodes(k)
+            .fit(x, y)
+        {
+            Ok(f) => f,
+            Err(_) => FittedDecisionTreeClassifier {
+                nodes: vec![placeholder_leaf::<f64>()],
+                classes: vec![0],
+                n_features: x.ncols(),
+                feature_importances: Array1::zeros(x.ncols()),
+            },
+        }
+    }
+
+    /// `max_leaf_nodes=2`: best-first stops at 2 leaves (3 nodes); sklearn 1.5.2
+    /// `node_count==3`, predict `[0,0,0,1,1,1,0,0,0]`.
+    #[test]
+    fn test_classifier_max_leaf_nodes_2() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = fit_clf_max_leaf(&x, &y, Some(2));
+        assert_eq!(fitted.nodes().len(), 3, "node_count at k=2 (sklearn: 3)");
+        assert_eq!(clf_n_leaves(&fitted), 2, "n_leaves at k=2 (sklearn: 2)");
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 0, 0, 0]);
+    }
+
+    /// `max_leaf_nodes=3`: 3 leaves (5 nodes); sklearn 1.5.2 `node_count==5`,
+    /// predict `[0,0,0,1,1,1,0,2,0]`.
+    #[test]
+    fn test_classifier_max_leaf_nodes_3() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = fit_clf_max_leaf(&x, &y, Some(3));
+        assert_eq!(fitted.nodes().len(), 5, "node_count at k=3 (sklearn: 5)");
+        assert_eq!(clf_n_leaves(&fitted), 3, "n_leaves at k=3 (sklearn: 3)");
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 0, 2, 0]);
+    }
+
+    /// `max_leaf_nodes=4`: 4 leaves (7 nodes) == the unlimited tree; sklearn
+    /// 1.5.2 `node_count==7`, predict `[0,0,0,1,1,1,2,2,0]`.
+    #[test]
+    fn test_classifier_max_leaf_nodes_4_equals_unlimited() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = fit_clf_max_leaf(&x, &y, Some(4));
+        assert_eq!(fitted.nodes().len(), 7, "node_count at k=4 (sklearn: 7)");
+        assert_eq!(clf_n_leaves(&fitted), 4, "n_leaves at k=4 (sklearn: 4)");
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 2, 2, 0]);
+    }
+
+    /// `max_leaf_nodes=None` keeps the depth-first tree unchanged: sklearn
+    /// 1.5.2 `node_count==7`, predict `[0,0,0,1,1,1,2,2,0]`.
+    #[test]
+    fn test_classifier_max_leaf_nodes_none_unchanged() {
+        let (x, y) = clf_prune_fixture();
+        let fitted = fit_clf_max_leaf(&x, &y, None);
+        assert_eq!(fitted.nodes().len(), 7, "node_count at k=None (sklearn: 7)");
+        assert_clf_predict(&fitted, &x, &[0, 0, 0, 1, 1, 1, 2, 2, 0]);
+    }
+
+    fn fit_reg_max_leaf(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        k: Option<usize>,
+    ) -> FittedDecisionTreeRegressor<f64> {
+        match DecisionTreeRegressor::<f64>::new()
+            .with_max_leaf_nodes(k)
+            .fit(x, y)
+        {
+            Ok(f) => f,
+            Err(_) => FittedDecisionTreeRegressor {
+                nodes: vec![placeholder_leaf::<f64>()],
+                n_features: x.ncols(),
+                feature_importances: Array1::zeros(x.ncols()),
+            },
+        }
+    }
+
+    /// `max_leaf_nodes=2`: 2 leaves (3 nodes); sklearn 1.5.2 `node_count==3`,
+    /// predict `[1.05]*4 + [5.05]*4` (mean leaves).
+    #[test]
+    fn test_regressor_max_leaf_nodes_2() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = fit_reg_max_leaf(&x, &y, Some(2));
+        assert_eq!(fitted.nodes().len(), 3, "node_count at k=2 (sklearn: 3)");
+        assert_eq!(reg_n_leaves(&fitted), 2, "n_leaves at k=2 (sklearn: 2)");
+        assert_reg_predict(
+            &fitted,
+            &x,
+            &[1.05, 1.05, 1.05, 1.05, 5.05, 5.05, 5.05, 5.05],
+        );
+    }
+
+    /// `max_leaf_nodes=3`: 3 leaves (5 nodes); sklearn 1.5.2 `node_count==5`,
+    /// predict `[1.05]*4 + [5.1,5.1,5.0,5.0]`.
+    #[test]
+    fn test_regressor_max_leaf_nodes_3() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = fit_reg_max_leaf(&x, &y, Some(3));
+        assert_eq!(fitted.nodes().len(), 5, "node_count at k=3 (sklearn: 5)");
+        assert_eq!(reg_n_leaves(&fitted), 3, "n_leaves at k=3 (sklearn: 3)");
+        assert_reg_predict(&fitted, &x, &[1.05, 1.05, 1.05, 1.05, 5.1, 5.1, 5.0, 5.0]);
+    }
+
+    /// `max_leaf_nodes=4`: 4 leaves (7 nodes); sklearn 1.5.2 `node_count==7`,
+    /// predict `[1.05]*4 + [5.0,5.2,5.0,5.0]`.
+    #[test]
+    fn test_regressor_max_leaf_nodes_4() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = fit_reg_max_leaf(&x, &y, Some(4));
+        assert_eq!(fitted.nodes().len(), 7, "node_count at k=4 (sklearn: 7)");
+        assert_eq!(reg_n_leaves(&fitted), 4, "n_leaves at k=4 (sklearn: 4)");
+        assert_reg_predict(&fitted, &x, &[1.05, 1.05, 1.05, 1.05, 5.0, 5.2, 5.0, 5.0]);
+    }
+
+    /// `max_leaf_nodes=5`: 5 leaves (9 nodes); sklearn 1.5.2 `node_count==9`,
+    /// predict `[1.05]*4 + [5.0,5.2,4.9,5.1]`.
+    #[test]
+    fn test_regressor_max_leaf_nodes_5() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = fit_reg_max_leaf(&x, &y, Some(5));
+        assert_eq!(fitted.nodes().len(), 9, "node_count at k=5 (sklearn: 9)");
+        assert_eq!(reg_n_leaves(&fitted), 5, "n_leaves at k=5 (sklearn: 5)");
+        assert_reg_predict(&fitted, &x, &[1.05, 1.05, 1.05, 1.05, 5.0, 5.2, 4.9, 5.1]);
+    }
+
+    /// `max_leaf_nodes=None` keeps the depth-first tree unchanged: sklearn
+    /// 1.5.2 `node_count==15`, predict == y.
+    #[test]
+    fn test_regressor_max_leaf_nodes_none_unchanged() {
+        let (x, y) = reg_alt_fixture();
+        let fitted = fit_reg_max_leaf(&x, &y, None);
+        assert_eq!(
+            fitted.nodes().len(),
+            15,
+            "node_count at k=None (sklearn: 15)"
+        );
+        assert_reg_predict(&fitted, &x, &[1.0, 1.2, 0.9, 1.1, 5.0, 5.2, 4.9, 5.1]);
     }
 }
