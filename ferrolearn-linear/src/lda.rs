@@ -1,20 +1,63 @@
 //! Linear Discriminant Analysis (LDA).
 //!
-//! LDA is both a supervised dimensionality reduction technique and a
-//! linear classifier. It finds the directions that maximise the separation
-//! between classes while minimising within-class scatter.
+//! LDA is both a supervised dimensionality-reduction technique and a linear
+//! classifier. This module mirrors scikit-learn's **default** `solver="svd"`
+//! path (`sklearn/discriminant_analysis.py:487-559`, commit 156ef14): rather
+//! than forming a covariance and solving the classical `Sw⁻¹·Sb` Fisher
+//! eigenproblem, it whitens the within-class data with two SVDs, derives the
+//! whitened projection `scalings_` and the weighted overall mean `xbar_`, then
+//! forms the **affine** classifier `coef_`/`intercept_` (whose `intercept_`
+//! embeds `log(priors_)`).
 //!
-//! # Algorithm
+//! # Algorithm (`_solve_svd`, `discriminant_analysis.py:487-559`)
 //!
-//! 1. Compute class means `μ_c` and the overall mean `μ`.
-//! 2. Compute the within-class scatter matrix
-//!    `Sw = Σ_c Σ_{x ∈ c} (x - μ_c)(x - μ_c)^T`.
-//! 3. Compute the between-class scatter matrix
-//!    `Sb = Σ_c n_c (μ_c - μ)(μ_c - μ)^T`.
-//! 4. Solve the generalised eigenvalue problem `Sw⁻¹ Sb v = λ v`.
-//! 5. Project data onto the top-`k` eigenvectors.
+//! With `n = n_samples`, `c = n_classes`:
+//! 1. `priors_ = n_k / n` (empirical; sklearn's `priors=None` default).
+//! 2. `means_` = per-class mean; `xbar_ = priors_ @ means_`.
+//! 3. `Xc` = each sample minus its class mean (stacked); `std = std(Xc, axis=0)`
+//!    (population, `ddof=0`), zeros replaced by `1`.
+//! 4. `Xw = sqrt(1/(n-c)) · (Xc / std)`; thin SVD `Xw = U·diag(S)·Vt`;
+//!    `rank = Σ(S > tol)`; `scalings = (Vt[:rank]/std).T / S[:rank]`.
+//! 5. Between-class scaled centers `Xb = (sqrt(n·priors_·1/(c-1)) ⊙
+//!    (means_-xbar_).T).T @ scalings`; thin SVD `Xb = U2·diag(S2)·Vt2`;
+//!    `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]`;
+//!    `rank2 = Σ(S2 > tol·S2[0])`; `scalings_ = scalings @ Vt2.T[:, :rank2]`.
+//! 6. `coef = (means_-xbar_) @ scalings_`;
+//!    `intercept_ = -½·Σ(coef²) + log(priors_)`;
+//!    `coef_ = coef @ scalings_.T`; `intercept_ -= xbar_ @ coef_.T`.
 //!
-//! The number of discriminant directions is at most `min(n_classes - 1, n_features)`.
+//! Inference (the `LinearClassifierMixin`, `discriminant_analysis.py:739`):
+//! - `transform(X) = ((X - xbar_) @ scalings_)[:, :max_components]`
+//!   (`discriminant_analysis.py:684-689`).
+//! - `decision_function(X) = X @ coef_.T + intercept_`
+//!   (`discriminant_analysis.py:739`).
+//! - `predict(X)` = `classes_[argmax(decision_function)]`.
+//! - `predict_proba(X)` = `softmax(decision_function)`
+//!   (`discriminant_analysis.py:706-711`).
+//!
+//! The number of discriminant directions is at most `min(n_classes - 1,
+//! n_features)`.
+//!
+//! ## REQ status (per `.design/linear/lda.md`, mirrors `sklearn/discriminant_analysis.py` @ 1.5.2)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (svd fit + decision_function parity) | SHIPPED | `_solve_svd` in `fn fit` (`fn svd_s_vt` → `ferray::linalg::svd`) builds `coef_`/`intercept_`/`xbar_`/`scalings_` (`discriminant_analysis.py:556-559`); `fn decision_function` = `X @ coef_.T + intercept_` (`:739`). Consumer: `Predict for FittedLDA` + crate-root `pub use`. Test `lda_decision_function_parity` <1e-6 vs live oracle. #588. |
+//! | REQ-2 (predict argmax) | SHIPPED | `Predict::predict` = `classes_[argmax(decision_function)]`; the affine decision carries `log(priors_)` via `intercept_`. Test `lda_imbalanced_priors_predict` (prior shifts the boundary, label-for-label vs live oracle). #589. |
+//! | REQ-3 (predict_proba prior-aware) | SHIPPED | `FittedLDA::predict_proba` = `softmax(decision_function)` (`discriminant_analysis.py:711`); rows sum to 1. Test `lda_imbalanced_priors_predict` proba block <1e-6 vs live oracle. #590 (partial: multiclass softmax; binary `expit` collapse pends #600). |
+//! | REQ-5 (transform parity) | SHIPPED | `fn transform` = `((X - xbar_) @ scalings_)[:, :max_components]` (`discriminant_analysis.py:684-689`). Test `lda_transform_parity` <1e-6 (per-column sign) vs live oracle. #592. |
+//! | REQ-6 (n_components bound) | SHIPPED | `fn fit` computes `max_components = min(n_classes-1, n_features)`, defaults `None` to it, errors `Some(0)`/`Some(k>max)` (`discriminant_analysis.py:614-625`). Tests `test_lda_default_n_components`, `test_lda_error_zero_n_components`, `test_lda_error_n_components_too_large`. |
+//! | REQ-7 (empirical priors) | SHIPPED | `fn fit` resolves `priors_ = n_k/n` (`discriminant_analysis.py:601-603`); `FittedLDA::priors` exposes them; the priors enter the decision via `intercept_ += log(priors_)` (`:557`). Test `lda_imbalanced_priors_predict` (priors `[0.9091,0.0909]` flip the label). Provided-`priors` parameter pends #593. |
+//! | REQ-8 (coef_/intercept_/xbar_) | SHIPPED | `FittedLDA::{coef, intercept, xbar}` accessors expose the `_solve_svd` arrays (`discriminant_analysis.py:556-559,517`). Consumer: `fn decision_function` reads `coef_`/`intercept_`; `fn transform` reads `xbar_`. Verified via `lda_decision_function_parity` (decision = `X@coef_.T+intercept_`) + `lda_transform_parity` (uses `xbar_`). |
+//! | REQ-13 (explained_variance_ratio_) | SHIPPED | `fn fit` sets `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]` from the SECOND (between-class) SVD (`discriminant_analysis.py:550-552`). Test `test_lda_explained_variance_ratio_oracle` <1e-9 vs live `L().explained_variance_ratio_`. #599. |
+//! | REQ-4 (predict_log_proba smallest_normal floor) | NOT-STARTED | open prereq blocker #591. `fn predict_log_proba` returns `crate::log_proba(&predict_proba)` (clamps at `1e-300`), not sklearn's exact-zero `smallest_normal` floor (`discriminant_analysis.py:729-736`). |
+//! | REQ-9 (lsqr solver) | NOT-STARTED | open prereq blocker #595. Only the `svd` solver exists; no `solver` parameter, no `_solve_lstsq` (`discriminant_analysis.py:365-419`). |
+//! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. No `solver="eigen"` generalized-eigenvalue path (`discriminant_analysis.py:421-485`). |
+//! | REQ-11 (shrinkage) | NOT-STARTED | open prereq blocker #597. No `shrinkage` parameter / Ledoit-Wolf `'auto'` (`discriminant_analysis.py:339,628-629`). |
+//! | REQ-12 (store_covariance / covariance_) | NOT-STARTED | open prereq blocker #598. No `store_covariance` flag / `covariance_` attribute (`discriminant_analysis.py:509-510`). |
+//! | REQ-14 (binary decision_function shape `(n,)`) | NOT-STARTED | open prereq blocker #600. `fn decision_function` always returns `(n, n_classes)`; sklearn collapses binary to `(n,)` (`discriminant_analysis.py:651-657,739`). Binding-ABI layer (parallel to QDA #581). |
+//! | REQ-15 (tol parameter) | NOT-STARTED | open prereq blocker #601. The SVD rank thresholds use a fixed `tol = 1e-4` (sklearn's default); no `tol` constructor parameter (`discriminant_analysis.py:354,532,554`). |
+//! | REQ-16 (ferray array-type substrate) | NOT-STARTED | open prereq blocker #602. The two SVDs run on `ferray::linalg::svd`; the owned array type is still `ndarray` (crate-wide deferral, cf. qda.rs REQ-12 #585). |
 //!
 //! # Examples
 //!
@@ -34,10 +77,13 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use ferray::linalg::{LinalgFloat, svd};
+use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
 use ferrolearn_core::error::FerroError;
+use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict, Transform};
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::{Float, NumCast};
 
 // ---------------------------------------------------------------------------
@@ -46,8 +92,9 @@ use num_traits::{Float, NumCast};
 
 /// Linear Discriminant Analysis configuration.
 ///
-/// Holds hyperparameters. Calling [`Fit::fit`] computes the discriminant
-/// directions and returns a [`FittedLDA`].
+/// Holds hyperparameters. Calling [`Fit::fit`] runs sklearn's default
+/// `solver="svd"` path (`discriminant_analysis.py:487-559`) and returns a
+/// [`FittedLDA`].
 ///
 /// # Type Parameters
 ///
@@ -91,45 +138,103 @@ impl<F: Float + Send + Sync + 'static> Default for LDA<F> {
 // FittedLDA
 // ---------------------------------------------------------------------------
 
-/// A fitted LDA model.
+/// A fitted LDA model (sklearn's `svd` solver).
 ///
 /// Created by calling [`Fit::fit`] on an [`LDA`]. Implements:
-/// - [`Transform<Array2<F>>`] — project data onto discriminant axes.
-/// - [`Predict<Array2<F>>`] — classify by nearest centroid in projected space.
+/// - [`Transform<Array2<F>>`] — project data via `(X - xbar_) @ scalings_`.
+/// - [`Predict<Array2<F>>`] — classify by argmax of the affine
+///   `decision_function`.
 #[derive(Debug, Clone)]
 pub struct FittedLDA<F> {
-    /// Projection matrix, shape `(n_features, n_components)`.
-    ///
-    /// New data is projected via `X @ scalings`.
+    /// Whitened projection matrix `scalings_`, shape `(n_features, rank2)`.
+    /// Mirrors sklearn's `scalings_` (`discriminant_analysis.py:555`).
     scalings: Array2<F>,
 
-    /// Class means in the projected space, shape `(n_classes, n_components)`.
+    /// Per-class means in the ORIGINAL feature space, shape
+    /// `(n_classes, n_features)`. Mirrors sklearn's `means_`
+    /// (`discriminant_analysis.py:508`).
     means: Array2<F>,
 
-    /// Ratio of explained variance per discriminant direction.
+    /// Weighted overall mean `xbar_ = priors_ @ means_`, length `n_features`.
+    /// Mirrors sklearn's `xbar_` (`discriminant_analysis.py:517`).
+    xbar: Array1<F>,
+
+    /// Empirical class priors `n_k / n`, length `n_classes`. Mirrors sklearn's
+    /// `priors_` (`discriminant_analysis.py:601-603`).
+    priors: Array1<F>,
+
+    /// Affine classifier coefficients `coef_`, shape `(n_classes, n_features)`.
+    /// Mirrors sklearn's `coef_` (`discriminant_analysis.py:558`). (Binary
+    /// collapse to `(1, n_features)` pends #600.)
+    coef: Array2<F>,
+
+    /// Affine classifier intercepts `intercept_`, length `n_classes` (embeds
+    /// `log(priors_)`). Mirrors sklearn's `intercept_`
+    /// (`discriminant_analysis.py:557,559`).
+    intercept: Array1<F>,
+
+    /// Ratio of explained variance per discriminant direction, length
+    /// `max_components`. Mirrors sklearn's `explained_variance_ratio_`
+    /// (`discriminant_analysis.py:550-552`).
     explained_variance_ratio: Array1<F>,
 
-    /// Class labels corresponding to rows of `means`.
+    /// Class labels corresponding to rows of `means`/`coef`.
     classes: Vec<usize>,
+
+    /// Number of components to keep on `transform` output (sklearn's
+    /// `_max_components`, `discriminant_analysis.py:619/625`).
+    max_components: usize,
 
     /// Number of features seen during fitting.
     n_features: usize,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
-    /// Projection (scalings) matrix, shape `(n_features, n_components)`.
+    /// Whitened projection (`scalings_`) matrix, shape `(n_features, rank2)`.
+    /// Mirrors sklearn's `scalings_` (`discriminant_analysis.py:555`).
     #[must_use]
     pub fn scalings(&self) -> &Array2<F> {
         &self.scalings
     }
 
-    /// Class centroids in the projected space, shape `(n_classes, n_components)`.
+    /// Per-class means in the original feature space, shape
+    /// `(n_classes, n_features)`. Mirrors sklearn's `means_`
+    /// (`discriminant_analysis.py:508`).
     #[must_use]
     pub fn means(&self) -> &Array2<F> {
         &self.means
     }
 
-    /// Explained-variance ratio per discriminant direction.
+    /// Weighted overall mean `xbar_`, length `n_features`. Mirrors sklearn's
+    /// `xbar_` (`discriminant_analysis.py:517`).
+    #[must_use]
+    pub fn xbar(&self) -> &Array1<F> {
+        &self.xbar
+    }
+
+    /// Empirical class priors `priors_`, length `n_classes`. Mirrors sklearn's
+    /// `priors_` (`discriminant_analysis.py:601-603`).
+    #[must_use]
+    pub fn priors(&self) -> &Array1<F> {
+        &self.priors
+    }
+
+    /// Affine classifier coefficients `coef_`, shape `(n_classes, n_features)`.
+    /// Mirrors sklearn's `coef_` (`discriminant_analysis.py:558`).
+    #[must_use]
+    pub fn coef(&self) -> &Array2<F> {
+        &self.coef
+    }
+
+    /// Affine classifier intercepts `intercept_`, length `n_classes`. Mirrors
+    /// sklearn's `intercept_` (`discriminant_analysis.py:557,559`).
+    #[must_use]
+    pub fn intercept(&self) -> &Array1<F> {
+        &self.intercept
+    }
+
+    /// Explained-variance ratio per discriminant direction. Mirrors sklearn's
+    /// `explained_variance_ratio_` (`discriminant_analysis.py:550-552`).
     #[must_use]
     pub fn explained_variance_ratio(&self) -> &Array1<F> {
         &self.explained_variance_ratio
@@ -141,55 +246,76 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
         &self.classes
     }
 
-    /// Predict per-class probabilities. Mirrors sklearn
-    /// `LinearDiscriminantAnalysis.predict_proba`.
+    /// Per-class discriminant scores. Mirrors sklearn
+    /// `LinearDiscriminantAnalysis.decision_function` (the `LinearClassifierMixin`,
+    /// `discriminant_analysis.py:739`): the affine map `X @ coef_.T + intercept_`.
     ///
-    /// Computes softmax over `-½ ‖z - μ_c‖²` in the projected space (an
-    /// equal-priors approximation; ferrolearn's FittedLDA does not store
-    /// the per-class priors, so the full sklearn formula reduces to this
-    /// when priors are uniform). Returns shape `(n_samples, n_classes)`;
-    /// rows sum to 1.
+    /// Returns shape `(n_samples, n_classes)`. (Binary collapse to `(n,)` pends
+    /// REQ-14/#600.) argmax of each row agrees with [`Predict`].
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features
-    /// does not match the model.
-    #[allow(clippy::needless_range_loop)] // index-by-class loop is natural for the softmax row write
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
+    /// match the fitted model.
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        if x.ncols() != self.n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), self.n_features],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedLDA::decision_function".into(),
+            });
+        }
+        // X @ coef_.T + intercept_  (coef_ is (n_classes, n_features)).
+        let mut out = x.dot(&self.coef.t());
+        let n_classes = self.intercept.len();
+        for mut row in out.rows_mut() {
+            for c in 0..n_classes {
+                row[c] = row[c] + self.intercept[c];
+            }
+        }
+        Ok(out)
+    }
+
+    /// Predict per-class probabilities. Mirrors sklearn
+    /// `LinearDiscriminantAnalysis.predict_proba` (`discriminant_analysis.py:706-711`):
+    /// the multiclass `softmax(decision_function)` (the row-max-shifted softmax
+    /// of `sklearn.utils.extmath.softmax`, `extmath.py:949-985`).
+    ///
+    /// Returns shape `(n_samples, n_classes)`; rows sum to 1. (The binary
+    /// `[1-expit(d), expit(d)]` collapse pends REQ-14/#600; the multiclass
+    /// softmax here is correct for `n_classes >= 2` because `coef_`/`intercept_`
+    /// are not yet collapsed to the binary single-row form.)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
+    /// match the model.
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let projected = self.transform(x)?;
-        let n_samples = projected.nrows();
-        let n_comp = projected.ncols();
-        let n_classes = self.classes.len();
-        let neg_half = F::from(-0.5).unwrap();
+        let decision = self.decision_function(x)?;
+        let n_samples = decision.nrows();
+        let n_classes = decision.ncols();
         let mut proba = Array2::<F>::zeros((n_samples, n_classes));
         for i in 0..n_samples {
-            let mut logits = vec![F::zero(); n_classes];
-            for ci in 0..n_classes {
-                let mut dist_sq = F::zero();
-                for k in 0..n_comp {
-                    let d = projected[[i, k]] - self.means[[ci, k]];
-                    dist_sq = dist_sq + d * d;
-                }
-                logits[ci] = neg_half * dist_sq;
-            }
-            let max_l = logits
-                .iter()
-                .copied()
+            let max_l = (0..n_classes)
+                .map(|c| decision[[i, c]])
                 .fold(F::neg_infinity(), |a, b| if b > a { b } else { a });
             let mut sum_exp = F::zero();
-            for ci in 0..n_classes {
-                let e = (logits[ci] - max_l).exp();
-                proba[[i, ci]] = e;
+            for c in 0..n_classes {
+                let e = (decision[[i, c]] - max_l).exp();
+                proba[[i, c]] = e;
                 sum_exp = sum_exp + e;
             }
-            for ci in 0..n_classes {
-                proba[[i, ci]] = proba[[i, ci]] / sum_exp;
+            for c in 0..n_classes {
+                proba[[i, c]] = proba[[i, c]] / sum_exp;
             }
         }
         Ok(proba)
     }
 
-    /// Element-wise log of [`predict_proba`](Self::predict_proba).
+    /// Element-wise log of [`predict_proba`](Self::predict_proba). Mirrors
+    /// sklearn `predict_log_proba` (`discriminant_analysis.py:713-737`), modulo
+    /// the exact-zero `smallest_normal` floor (REQ-4/#591 — this uses the
+    /// crate-shared `1e-300` clamp).
     ///
     /// # Errors
     ///
@@ -198,220 +324,88 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
         let proba = self.predict_proba(x)?;
         Ok(crate::log_proba(&proba))
     }
-
-    /// Per-class discriminant scores. Mirrors sklearn
-    /// `LinearDiscriminantAnalysis.decision_function`.
-    ///
-    /// Returns shape `(n_samples, n_classes)` with `-½ ‖z - μ_c‖²` in
-    /// the projected space. argmax of each row agrees with [`Predict`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features
-    /// does not match the fitted model.
-    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let projected = self.transform(x)?;
-        let n_samples = projected.nrows();
-        let n_comp = projected.ncols();
-        let n_classes = self.classes.len();
-        let neg_half = F::from(-0.5).unwrap();
-        let mut out = Array2::<F>::zeros((n_samples, n_classes));
-        for i in 0..n_samples {
-            for ci in 0..n_classes {
-                let mut dist_sq = F::zero();
-                for k in 0..n_comp {
-                    let d = projected[[i, k]] - self.means[[ci, k]];
-                    dist_sq = dist_sq + d * d;
-                }
-                out[[i, ci]] = neg_half * dist_sq;
-            }
-        }
-        Ok(out)
-    }
 }
 
 // ---------------------------------------------------------------------------
-// Internal linear algebra helpers (generic over F)
+// Internal helpers
 // ---------------------------------------------------------------------------
 
-/// Jacobi symmetric eigendecomposition.
-///
-/// Returns `(eigenvalues, eigenvectors_columns)` — column `i` is the
-/// eigenvector for `eigenvalues[i]`.  Eigenvalues are **not** sorted.
-fn jacobi_eigen_f<F: Float + Send + Sync + 'static>(
-    a: &Array2<F>,
-    max_iter: usize,
-) -> Result<(Array1<F>, Array2<F>), FerroError> {
-    let n = a.nrows();
-    let mut mat = a.to_owned();
-    let mut v = Array2::<F>::zeros((n, n));
-    for i in 0..n {
-        v[[i, i]] = F::one();
-    }
-    let tol = F::from(1e-12).unwrap_or_else(F::epsilon);
-
-    for _ in 0..max_iter {
-        // Find the largest off-diagonal entry.
-        let mut max_off = F::zero();
-        let mut p = 0usize;
-        let mut q = 1usize;
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let val = mat[[i, j]].abs();
-                if val > max_off {
-                    max_off = val;
-                    p = i;
-                    q = j;
-                }
-            }
-        }
-        if max_off < tol {
-            let eigenvalues = Array1::from_shape_fn(n, |i| mat[[i, i]]);
-            return Ok((eigenvalues, v));
-        }
-        let app = mat[[p, p]];
-        let aqq = mat[[q, q]];
-        let apq = mat[[p, q]];
-        let two = F::from(2.0).unwrap();
-        let theta = if (app - aqq).abs() < tol {
-            F::from(std::f64::consts::FRAC_PI_4).unwrap_or_else(F::one)
-        } else {
-            let tau = (aqq - app) / (two * apq);
-            let t = if tau >= F::zero() {
-                F::one() / (tau.abs() + (F::one() + tau * tau).sqrt())
-            } else {
-                -F::one() / (tau.abs() + (F::one() + tau * tau).sqrt())
-            };
-            t.atan()
-        };
-        let c = theta.cos();
-        let s = theta.sin();
-        let mut new_mat = mat.clone();
-        for i in 0..n {
-            if i != p && i != q {
-                let mip = mat[[i, p]];
-                let miq = mat[[i, q]];
-                new_mat[[i, p]] = c * mip - s * miq;
-                new_mat[[p, i]] = new_mat[[i, p]];
-                new_mat[[i, q]] = s * mip + c * miq;
-                new_mat[[q, i]] = new_mat[[i, q]];
-            }
-        }
-        new_mat[[p, p]] = c * c * app - two * s * c * apq + s * s * aqq;
-        new_mat[[q, q]] = s * s * app + two * s * c * apq + c * c * aqq;
-        new_mat[[p, q]] = F::zero();
-        new_mat[[q, p]] = F::zero();
-        mat = new_mat;
-        for i in 0..n {
-            let vip = v[[i, p]];
-            let viq = v[[i, q]];
-            v[[i, p]] = c * vip - s * viq;
-            v[[i, q]] = s * vip + c * viq;
-        }
-    }
-    Err(FerroError::ConvergenceFailure {
-        iterations: max_iter,
-        message: "Jacobi eigendecomposition did not converge (LDA)".into(),
+/// Convert a `usize` count to `F` without panicking. Returns
+/// [`FerroError::NumericalInstability`] if the value is not representable.
+#[inline]
+fn usize_to_f<F: Float>(v: usize) -> Result<F, FerroError> {
+    F::from(v).ok_or_else(|| FerroError::NumericalInstability {
+        message: format!("could not represent count {v} as the float type"),
     })
 }
 
-/// Gaussian elimination with partial pivoting to solve `A x = b`.
-fn gaussian_solve_f<F: Float>(
-    n: usize,
-    a: &Array2<F>,
-    b: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
-    let mut aug = Array2::<F>::zeros((n, n + 1));
-    for i in 0..n {
-        for j in 0..n {
-            aug[[i, j]] = a[[i, j]];
-        }
-        aug[[i, n]] = b[i];
-    }
-    for col in 0..n {
-        let mut max_val = aug[[col, col]].abs();
-        let mut max_row = col;
-        for row in (col + 1)..n {
-            let val = aug[[row, col]].abs();
-            if val > max_val {
-                max_val = val;
-                max_row = row;
-            }
-        }
-        if max_val < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "singular matrix during LDA inversion".into(),
-            });
-        }
-        if max_row != col {
-            for j in 0..=n {
-                let tmp = aug[[col, j]];
-                aug[[col, j]] = aug[[max_row, j]];
-                aug[[max_row, j]] = tmp;
-            }
-        }
-        let pivot = aug[[col, col]];
-        for row in (col + 1)..n {
-            let factor = aug[[row, col]] / pivot;
-            for j in col..=n {
-                let above = aug[[col, j]];
-                aug[[row, j]] = aug[[row, j]] - factor * above;
-            }
-        }
-    }
-    let mut x = Array1::<F>::zeros(n);
-    for i in (0..n).rev() {
-        let mut sum = aug[[i, n]];
-        for j in (i + 1)..n {
-            sum = sum - aug[[i, j]] * x[j];
-        }
-        if aug[[i, i]].abs() < F::from(1e-12).unwrap_or_else(F::epsilon) {
-            return Err(FerroError::NumericalInstability {
-                message: "near-zero pivot during LDA back substitution".into(),
-            });
-        }
-        x[i] = sum / aug[[i, i]];
-    }
-    Ok(x)
+/// `0.5` as `F`, built panic-free from `1 / (1 + 1)` (exact for binary floats).
+#[inline]
+fn half<F: Float>() -> F {
+    F::one() / (F::one() + F::one())
 }
 
-/// Compute `Sw⁻¹ @ Sb` column by column.
+/// Singular values `S` and right singular vectors transposed `Vt` of the thin
+/// SVD `A = U·diag(S)·Vt` (`full_matrices=False`), on the ferray substrate
+/// (`ferray::linalg::svd`, the analog of `scipy.linalg.svd(X,
+/// full_matrices=False)`, `discriminant_analysis.py:530,545`). Mirrors the
+/// bridging pattern in `qda.rs::svd_s_vt` / `bayesian_ridge.rs::svd_thin`
+/// (R-SUBSTRATE-4): the caller keeps its `ndarray` signature and the
+/// ndarray↔ferray conversion happens here.
 ///
-/// Returns the matrix `M = Sw⁻¹ Sb` of shape `(n, n)`.
-fn sw_inv_sb<F: Float + Send + Sync + 'static>(
-    sw: &Array2<F>,
-    sb: &Array2<F>,
-) -> Result<Array2<F>, FerroError> {
-    let n = sw.nrows();
-    let mut result = Array2::<F>::zeros((n, n));
-    for j in 0..n {
-        let col_sb = Array1::from_shape_fn(n, |i| sb[[i, j]]);
-        let col = gaussian_solve_f(n, sw, &col_sb)?;
-        for i in 0..n {
-            result[[i, j]] = col[i];
-        }
-    }
-    Ok(result)
+/// Returns `(S, Vt)` with `S` of length `k = min(m, n)` (descending) and `Vt`
+/// of shape `(k, n)`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray array build or
+/// the SVD itself fails.
+fn svd_s_vt<F: LinalgFloat>(a: &Array2<F>) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    let (m, n) = a.dim();
+    let a_flat: Vec<F> = a.iter().copied().collect();
+    let fa =
+        FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([m, n]), a_flat).map_err(|e| {
+            FerroError::NumericalInstability {
+                message: format!("ferray svd: failed to build matrix: {e}"),
+            }
+        })?;
+    let (_u, s, vt) = svd(&fa, false).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray svd failed: {e}"),
+    })?;
+    let s_nd = Array1::from_vec(s.iter().copied().collect());
+    let vt_shape = vt.shape();
+    let vt_nd = Array2::from_shape_vec((vt_shape[0], vt_shape[1]), vt.iter().copied().collect())
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd: Vt shape conversion failed: {e}"),
+        })?;
+    Ok((s_nd, vt_nd))
 }
 
 // ---------------------------------------------------------------------------
-// Fit
+// Fit (sklearn _solve_svd)
 // ---------------------------------------------------------------------------
 
-impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for LDA<F> {
+impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
     type Fitted = FittedLDA<F>;
     type Error = FerroError;
 
-    /// Fit the LDA model.
+    /// Fit the LDA model via sklearn's default `solver="svd"` path
+    /// (`discriminant_analysis.py:487-559`): two SVDs whiten the within-class
+    /// data and project onto the between-class subspace, yielding `scalings_`,
+    /// `xbar_`, `coef_`, `intercept_` (embedding `log(priors_)`), and
+    /// `explained_variance_ratio_`.
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InsufficientSamples`] if fewer than 2 samples are provided.
-    /// - [`FerroError::InvalidParameter`] if `n_components` is zero or exceeds the
-    ///   maximum allowed (`min(n_classes - 1, n_features)`).
-    /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers of rows.
-    /// - [`FerroError::NumericalInstability`] if `Sw` is singular.
-    /// - [`FerroError::ConvergenceFailure`] if eigendecomposition does not converge.
+    /// - [`FerroError::InsufficientSamples`] if fewer than 2 samples / classes.
+    /// - [`FerroError::InvalidParameter`] if `n_components` is zero or exceeds
+    ///   `min(n_classes - 1, n_features)`.
+    /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different row counts.
+    /// - [`FerroError::NumericalInstability`] if an SVD fails.
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "explicit index loops mirror sklearn's broadcasting per-column/per-class"
+    )]
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedLDA<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -430,7 +424,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for LDA<F> 
             });
         }
 
-        // Gather sorted unique classes.
+        // Sorted unique classes (sklearn `classes_ = unique_labels(y)`, :592).
         let mut classes: Vec<usize> = y.to_vec();
         classes.sort_unstable();
         classes.dedup();
@@ -443,10 +437,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for LDA<F> 
                 context: "LDA requires at least 2 distinct classes".into(),
             });
         }
+        // sklearn rejects n_samples == n_classes (:596-599).
+        if n_samples == n_classes {
+            return Err(FerroError::InsufficientSamples {
+                required: n_classes + 1,
+                actual: n_samples,
+                context: "LDA: number of samples must exceed number of classes".into(),
+            });
+        }
 
-        // Determine effective n_components.
+        // _max_components (sklearn :614-625).
         let max_components = (n_classes - 1).min(n_features);
-        let n_comp = match self.n_components {
+        let user_max = match self.n_components {
             None => max_components,
             Some(0) => {
                 return Err(FerroError::InvalidParameter {
@@ -458,155 +460,245 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for LDA<F> 
                 return Err(FerroError::InvalidParameter {
                     name: "n_components".into(),
                     reason: format!(
-                        "n_components ({k}) exceeds max allowed ({max_components} = min(n_classes-1, n_features))"
+                        "n_components ({k}) cannot be larger than min(n_features, n_classes - 1) = {max_components}"
                     ),
                 });
             }
             Some(k) => k,
         };
 
-        // --- Step 1: compute overall mean and per-class means ----------------
-        let n_f = F::from(n_samples).unwrap();
-        let mut overall_mean = Array1::<F>::zeros(n_features);
-        for j in 0..n_features {
-            let col = x.column(j);
-            let s = col.iter().copied().fold(F::zero(), |a, b| a + b);
-            overall_mean[j] = s / n_f;
-        }
+        let n_f = usize_to_f::<F>(n_samples)?;
 
-        // class_means[c] = mean of samples in class c
-        let mut class_means: Vec<Array1<F>> = Vec::with_capacity(n_classes);
-        let mut class_counts: Vec<usize> = Vec::with_capacity(n_classes);
-        for &cls in &classes {
-            let mut mean = Array1::<F>::zeros(n_features);
-            let mut cnt = 0usize;
-            for (i, &label) in y.iter().enumerate() {
-                if label == cls {
-                    for j in 0..n_features {
-                        mean[j] = mean[j] + x[[i, j]];
-                    }
-                    cnt += 1;
-                }
+        // --- per-class means_ and class indices (sklearn `_class_means`) ------
+        let mut means = Array2::<F>::zeros((n_classes, n_features));
+        let mut class_indices: Vec<Vec<usize>> = vec![Vec::new(); n_classes];
+        let mut class_pos = std::collections::HashMap::new();
+        for (idx, &cls) in classes.iter().enumerate() {
+            class_pos.insert(cls, idx);
+        }
+        for (i, &label) in y.iter().enumerate() {
+            if let Some(&idx) = class_pos.get(&label) {
+                class_indices[idx].push(i);
             }
-            if cnt == 0 {
+        }
+        for (idx, indices) in class_indices.iter().enumerate() {
+            if indices.is_empty() {
                 return Err(FerroError::InsufficientSamples {
                     required: 1,
                     actual: 0,
-                    context: format!("LDA: class {cls} has no samples"),
+                    context: format!("LDA: class {} has no samples", classes[idx]),
                 });
             }
-            let cnt_f = F::from(cnt).unwrap();
-            mean.mapv_inplace(|v| v / cnt_f);
-            class_means.push(mean);
-            class_counts.push(cnt);
-        }
-
-        // --- Step 2: within-class scatter Sw ----------------------------------
-        let mut sw = Array2::<F>::zeros((n_features, n_features));
-        for (ci, &cls) in classes.iter().enumerate() {
-            let mu_c = &class_means[ci];
-            for (i, &label) in y.iter().enumerate() {
-                if label == cls {
-                    // diff = x[i] - mu_c
-                    let diff: Vec<F> = (0..n_features).map(|j| x[[i, j]] - mu_c[j]).collect();
-                    for r in 0..n_features {
-                        for c in 0..n_features {
-                            sw[[r, c]] = sw[[r, c]] + diff[r] * diff[c];
-                        }
-                    }
-                }
-            }
-        }
-
-        // Add a small regularisation to Sw to avoid singularity.
-        let reg = F::from(1e-6).unwrap();
-        for i in 0..n_features {
-            sw[[i, i]] = sw[[i, i]] + reg;
-        }
-
-        // --- Step 3: between-class scatter Sb ---------------------------------
-        let mut sb = Array2::<F>::zeros((n_features, n_features));
-        for (ci, &nc) in class_counts.iter().enumerate() {
-            let nc_f = F::from(nc).unwrap();
-            let diff: Vec<F> = (0..n_features)
-                .map(|j| class_means[ci][j] - overall_mean[j])
-                .collect();
-            for r in 0..n_features {
-                for c in 0..n_features {
-                    sb[[r, c]] = sb[[r, c]] + nc_f * diff[r] * diff[c];
-                }
-            }
-        }
-
-        // --- Step 4: solve generalised eigenvalue problem Sw⁻¹ Sb v = λ v ----
-        let m = sw_inv_sb(&sw, &sb)?;
-        let max_jacobi = n_features * n_features * 100 + 1000;
-        let (eigenvalues, eigenvectors) = jacobi_eigen_f(&m, max_jacobi)?;
-
-        // Sort eigenvalues descending.
-        let mut indices: Vec<usize> = (0..n_features).collect();
-        indices.sort_by(|&a, &b| {
-            eigenvalues[b]
-                .partial_cmp(&eigenvalues[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Clamp negative eigenvalues.
-        let total_ev: F = eigenvalues
-            .iter()
-            .copied()
-            .map(|v| if v > F::zero() { v } else { F::zero() })
-            .fold(F::zero(), |a, b| a + b);
-
-        // --- Step 5: build scalings matrix (n_features × n_comp) -------------
-        let mut scalings = Array2::<F>::zeros((n_features, n_comp));
-        let mut explained_variance_ratio = Array1::<F>::zeros(n_comp);
-        for (k, &idx) in indices.iter().take(n_comp).enumerate() {
-            let ev = eigenvalues[idx];
-            let ev_clamped = if ev > F::zero() { ev } else { F::zero() };
-            explained_variance_ratio[k] = if total_ev > F::zero() {
-                ev_clamped / total_ev
-            } else {
-                F::zero()
-            };
-            for j in 0..n_features {
-                scalings[[j, k]] = eigenvectors[[j, idx]];
-            }
-        }
-
-        // --- Project class means into the discriminant space -----------------
-        // means[c, k] = class_means[c] · scalings[:, k]
-        let mut means = Array2::<F>::zeros((n_classes, n_comp));
-        for ci in 0..n_classes {
-            let mu_row = class_means[ci].view();
-            for k in 0..n_comp {
-                let mut dot = F::zero();
+            let cnt_f = usize_to_f::<F>(indices.len())?;
+            for &i in indices {
                 for j in 0..n_features {
-                    dot = dot + mu_row[j] * scalings[[j, k]];
+                    means[[idx, j]] += x[[i, j]];
                 }
-                means[[ci, k]] = dot;
             }
+            for j in 0..n_features {
+                means[[idx, j]] /= cnt_f;
+            }
+        }
+
+        // --- priors_ = n_k / n  (empirical; sklearn :601-603) -----------------
+        let mut priors = Array1::<F>::zeros(n_classes);
+        for idx in 0..n_classes {
+            priors[idx] = usize_to_f::<F>(class_indices[idx].len())? / n_f;
+        }
+
+        // --- xbar_ = priors_ @ means_  (sklearn :517) -------------------------
+        let mut xbar = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            let mut acc = <F as num_traits::Zero>::zero();
+            for idx in 0..n_classes {
+                acc += priors[idx] * means[[idx, j]];
+            }
+            xbar[j] = acc;
+        }
+
+        // --- Xc = each sample minus its class mean (stacked; sklearn :512-519) -
+        let mut xc = Array2::<F>::zeros((n_samples, n_features));
+        for (idx, indices) in class_indices.iter().enumerate() {
+            for &i in indices {
+                for j in 0..n_features {
+                    xc[[i, j]] = x[[i, j]] - means[[idx, j]];
+                }
+            }
+        }
+
+        // --- std = population std of Xc per column (ddof=0; sklearn :522-524) --
+        // numpy std: sqrt(mean((Xc - mean(Xc))^2)). Xc columns already have ~0
+        // mean by construction, but follow numpy exactly (subtract the column
+        // mean) for ULP fidelity.
+        let mut std = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            let mut col_mean = <F as num_traits::Zero>::zero();
+            for i in 0..n_samples {
+                col_mean += xc[[i, j]];
+            }
+            col_mean /= n_f;
+            let mut var = <F as num_traits::Zero>::zero();
+            for i in 0..n_samples {
+                let d = xc[[i, j]] - col_mean;
+                var += d * d;
+            }
+            var /= n_f;
+            let s = var.sqrt();
+            std[j] = if s == <F as num_traits::Zero>::zero() {
+                <F as num_traits::One>::one()
+            } else {
+                s
+            };
+        }
+
+        // --- Xw = sqrt(1/(n-c)) * (Xc / std)  (sklearn :525-528) --------------
+        let denom = usize_to_f::<F>(n_samples - n_classes)?;
+        let fac_sqrt = (<F as num_traits::One>::one() / denom).sqrt();
+        let mut xw = Array2::<F>::zeros((n_samples, n_features));
+        for i in 0..n_samples {
+            for j in 0..n_features {
+                xw[[i, j]] = fac_sqrt * (xc[[i, j]] / std[j]);
+            }
+        }
+
+        // --- first SVD: within whitening (sklearn :530-534) -------------------
+        let tol = F::from(1e-4).unwrap_or_else(F::epsilon);
+        let (s1, vt1) = svd_s_vt::<F>(&xw)?;
+        let rank1 = s1.iter().filter(|&&v| v > tol).count();
+        if rank1 == 0 {
+            return Err(FerroError::NumericalInstability {
+                message: "LDA: within-class scatter has rank 0 (all features constant)".into(),
+            });
+        }
+        // scalings = (Vt[:rank]/std).T / S[:rank]   -> (n_features, rank1)
+        let mut scalings1 = Array2::<F>::zeros((n_features, rank1));
+        for k in 0..rank1 {
+            let sk = s1[k];
+            for j in 0..n_features {
+                scalings1[[j, k]] = (vt1[[k, j]] / std[j]) / sk;
+            }
+        }
+
+        // --- between-class scaled centers (sklearn :535-541) ------------------
+        // Xb[i] = sqrt(n * priors_[i] * fac2) * (means_[i] - xbar_)  then @ scalings.
+        let fac2 = if n_classes == 1 {
+            <F as num_traits::One>::one()
+        } else {
+            <F as num_traits::One>::one() / usize_to_f::<F>(n_classes - 1)?
+        };
+        let mut xb_centers = Array2::<F>::zeros((n_classes, n_features));
+        for idx in 0..n_classes {
+            let w = (n_f * priors[idx] * fac2).sqrt();
+            for j in 0..n_features {
+                xb_centers[[idx, j]] = w * (means[[idx, j]] - xbar[j]);
+            }
+        }
+        let xb = xb_centers.dot(&scalings1); // (n_classes, rank1)
+
+        // --- second SVD: between-class projection (sklearn :545-555) ----------
+        let (s2, vt2) = svd_s_vt::<F>(&xb)?;
+
+        // explained_variance_ratio_ = (S2^2 / sum(S2^2))[:max_components] (:550-552)
+        let mut sum_sq = <F as num_traits::Zero>::zero();
+        for &v in s2.iter() {
+            sum_sq += v * v;
+        }
+        let evr_len = user_max.min(s2.len());
+        let mut explained_variance_ratio = Array1::<F>::zeros(evr_len);
+        for k in 0..evr_len {
+            explained_variance_ratio[k] = if sum_sq > <F as num_traits::Zero>::zero() {
+                (s2[k] * s2[k]) / sum_sq
+            } else {
+                <F as num_traits::Zero>::zero()
+            };
+        }
+
+        // rank2 = sum(S2 > tol * S2[0])  (sklearn :554)
+        let s2_0 = if s2.is_empty() {
+            <F as num_traits::Zero>::zero()
+        } else {
+            s2[0]
+        };
+        let rank2 = s2.iter().filter(|&&v| v > tol * s2_0).count();
+        if rank2 == 0 {
+            return Err(FerroError::NumericalInstability {
+                message: "LDA: between-class scatter has rank 0 (classes coincide)".into(),
+            });
+        }
+
+        // scalings_ = scalings @ Vt2.T[:, :rank2]   -> (n_features, rank2)
+        // Vt2 is (k2, rank1); Vt2.T is (rank1, k2); take first rank2 columns.
+        let mut scalings = Array2::<F>::zeros((n_features, rank2));
+        for j in 0..n_features {
+            for c in 0..rank2 {
+                let mut acc = <F as num_traits::Zero>::zero();
+                for k in 0..rank1 {
+                    // Vt2.T[k, c] = Vt2[c, k]
+                    acc += scalings1[[j, k]] * vt2[[c, k]];
+                }
+                scalings[[j, c]] = acc;
+            }
+        }
+
+        // --- coef_ / intercept_  (sklearn :556-559) ---------------------------
+        // coef = (means_ - xbar_) @ scalings_     (n_classes, rank2)
+        let mut centered_means = Array2::<F>::zeros((n_classes, n_features));
+        for idx in 0..n_classes {
+            for j in 0..n_features {
+                centered_means[[idx, j]] = means[[idx, j]] - xbar[j];
+            }
+        }
+        let coef_lowrank = centered_means.dot(&scalings); // (n_classes, rank2)
+
+        // intercept_ = -0.5 * sum(coef^2, axis=1) + log(priors_)
+        let neg_half = -half::<F>();
+        let mut intercept = Array1::<F>::zeros(n_classes);
+        for idx in 0..n_classes {
+            let mut sq = <F as num_traits::Zero>::zero();
+            for c in 0..rank2 {
+                sq += coef_lowrank[[idx, c]] * coef_lowrank[[idx, c]];
+            }
+            intercept[idx] = neg_half * sq + priors[idx].ln();
+        }
+
+        // coef_ = coef @ scalings_.T              (n_classes, n_features)
+        let coef = coef_lowrank.dot(&scalings.t());
+
+        // intercept_ -= xbar_ @ coef_.T           (subtract per class)
+        for idx in 0..n_classes {
+            let mut dot = <F as num_traits::Zero>::zero();
+            for j in 0..n_features {
+                dot += xbar[j] * coef[[idx, j]];
+            }
+            intercept[idx] -= dot;
         }
 
         Ok(FittedLDA {
             scalings,
             means,
+            xbar,
+            priors,
+            coef,
+            intercept,
             explained_variance_ratio,
             classes,
+            max_components: user_max,
             n_features,
         })
     }
 }
 
 // ---------------------------------------------------------------------------
-// Transform
+// Transform (sklearn svd transform)
 // ---------------------------------------------------------------------------
 
 impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedLDA<F> {
     type Output = Array2<F>;
     type Error = FerroError;
 
-    /// Project `x` onto the discriminant axes: `X @ scalings`.
+    /// Project `x` onto the discriminant axes: `((X - xbar_) @ scalings_)[:, :n]`
+    /// where `n = max_components`. Mirrors sklearn's svd-solver `transform`
+    /// (`discriminant_analysis.py:684-685,689`).
     ///
     /// # Errors
     ///
@@ -620,48 +712,70 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedLDA<F> {
                 context: "FittedLDA::transform".into(),
             });
         }
-        Ok(x.dot(&self.scalings))
+        // (X - xbar_) @ scalings_
+        let mut xc = x.to_owned();
+        for mut row in xc.rows_mut() {
+            for j in 0..self.n_features {
+                row[j] = row[j] - self.xbar[j];
+            }
+        }
+        let projected = xc.dot(&self.scalings);
+        // Slice to [:, :max_components] (sklearn :689).
+        let keep = self.max_components.min(projected.ncols());
+        Ok(projected.slice(ndarray::s![.., ..keep]).to_owned())
     }
 }
 
 // ---------------------------------------------------------------------------
-// Predict (nearest centroid in projected space)
+// Predict (argmax of the affine decision_function)
 // ---------------------------------------------------------------------------
 
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedLDA<F> {
     type Output = Array1<usize>;
     type Error = FerroError;
 
-    /// Classify samples by nearest centroid in the projected space.
+    /// Classify samples by argmax of the affine `decision_function`
+    /// (`classes_[argmax(X @ coef_.T + intercept_)]`), mirroring sklearn's
+    /// `predict` (the `LinearClassifierMixin`, `discriminant_analysis.py:739`).
+    /// The argmax follows numpy's first-max-wins tie-breaking.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
     /// match the model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        let projected = self.transform(x)?;
-        let n_samples = projected.nrows();
-        let n_comp = projected.ncols();
-        let n_classes = self.classes.len();
-
+        let decision = self.decision_function(x)?;
+        let n_samples = decision.nrows();
+        let n_classes = decision.ncols();
         let mut predictions = Array1::<usize>::zeros(n_samples);
         for i in 0..n_samples {
-            let mut best_class = 0usize;
-            let mut best_dist = F::infinity();
-            for ci in 0..n_classes {
-                let mut dist = F::zero();
-                for k in 0..n_comp {
-                    let d = projected[[i, k]] - self.means[[ci, k]];
-                    dist = dist + d * d;
-                }
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_class = ci;
+            let mut best_idx = 0usize;
+            let mut best = decision[[i, 0]];
+            for c in 1..n_classes {
+                let v = decision[[i, c]];
+                // numpy argmax: strictly-greater wins; ties keep first index.
+                if v > best {
+                    best = v;
+                    best_idx = c;
                 }
             }
-            predictions[i] = self.classes[best_class];
+            predictions[i] = self.classes[best_idx];
         }
         Ok(predictions)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Introspection
+// ---------------------------------------------------------------------------
+
+impl<F: Float + Send + Sync + 'static> HasClasses for FittedLDA<F> {
+    fn classes(&self) -> &[usize] {
+        &self.classes
+    }
+
+    fn n_classes(&self) -> usize {
+        self.classes.len()
     }
 }
 
@@ -669,7 +783,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedLDA<F> {
 // Pipeline integration (generic)
 // ---------------------------------------------------------------------------
 
-impl<F: Float + Send + Sync + 'static> PipelineEstimator<F> for LDA<F> {
+impl<F: LinalgFloat + ScalarOperand> PipelineEstimator<F> for LDA<F> {
     /// Fit LDA using the pipeline interface.
     ///
     /// # Errors
@@ -746,6 +860,7 @@ mod tests {
         let (x, y) = linearly_separable_2d();
         let lda = LDA::<f64>::new(Some(1));
         let fitted = lda.fit(&x, &y).unwrap();
+        // scalings_ is (n_features, rank2); for a binary 2-feature set rank2 = 1.
         assert_eq!(fitted.scalings().ncols(), 1);
         assert_eq!(fitted.scalings().nrows(), 2);
     }
@@ -756,7 +871,8 @@ mod tests {
         let (x, y) = linearly_separable_2d();
         let lda = LDA::<f64>::default();
         let fitted = lda.fit(&x, &y).unwrap();
-        assert_eq!(fitted.scalings().ncols(), 1);
+        // transform output is truncated to max_components = 1.
+        assert_eq!(fitted.transform(&x).unwrap().ncols(), 1);
     }
 
     #[test]
@@ -807,6 +923,81 @@ mod tests {
         assert!(total <= 1.0 + 1e-9, "total={total}");
     }
 
+    /// R-CHAR-3 oracle pin for `explained_variance_ratio_` (REQ-13). Expected
+    /// values are the live sklearn 1.5.2
+    /// `LinearDiscriminantAnalysis().fit(X,y).explained_variance_ratio_` on the
+    /// 3-class / 2-feature balanced set (same data as `divergence_lda_fit.rs`):
+    /// ```text
+    /// python3 -c "import numpy as np; \
+    ///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+    ///   X=np.array([[0.,0.],[1.,.5],[.5,1.],[1.,1.],[4.,4.],[5.,4.5],[4.5,5.],[5.,5.],\
+    ///               [0.,5.],[1.,6.],[.5,5.5],[1.,5.]]); \
+    ///   y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+    ///   print(repr(L().fit(X,y).explained_variance_ratio_.tolist()))"
+    /// # [0.6428683117561941, 0.3571316882438059]
+    /// ```
+    #[test]
+    fn test_lda_explained_variance_ratio_oracle() {
+        const SK_EVR: [f64; 2] = [0.6428683117561941, 0.3571316882438059];
+        let x = Array2::from_shape_vec(
+            (12, 2),
+            vec![
+                0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 4.0, 4.0, 5.0, 4.5, 4.5, 5.0, 5.0, 5.0,
+                0.0, 5.0, 1.0, 6.0, 0.5, 5.5, 1.0, 5.0,
+            ],
+        )
+        .unwrap();
+        let y = array![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+        let fitted = LDA::<f64>::new(Some(2)).fit(&x, &y).unwrap();
+        let evr = fitted.explained_variance_ratio();
+        assert_eq!(evr.len(), 2);
+        for k in 0..2 {
+            assert_abs_diff_eq!(evr[k], SK_EVR[k], epsilon = 1e-9);
+        }
+    }
+
+    /// R-CHAR-3 oracle pin for `coef_`/`intercept_`/`xbar_` (REQ-8). Live
+    /// sklearn 1.5.2 attributes on the same 3-class / 2-feature set:
+    /// ```text
+    /// python3 -c "... ; m=L().fit(X,y); \
+    ///   print(repr(m.coef_.tolist())); print(repr(m.intercept_.tolist())); \
+    ///   print(repr(m.xbar_.tolist()))"
+    /// # coef_ [[2.2582417582417564, -14.02747252747253],
+    /// #        [13.335164835164827, -2.950549450549442],
+    /// #        [-15.593406593406584, 16.978021978021978]]
+    /// # intercept_ [25.208393205837393, -32.94545294800878, -56.65081009086592]
+    /// # xbar_ [1.958333333333333, 3.541666666666666]
+    /// ```
+    #[test]
+    fn test_lda_coef_intercept_xbar_oracle() {
+        const SK_COEF: [[f64; 2]; 3] = [
+            [2.2582417582417564, -14.02747252747253],
+            [13.335164835164827, -2.950549450549442],
+            [-15.593406593406584, 16.978021978021978],
+        ];
+        const SK_INTERCEPT: [f64; 3] = [25.208393205837393, -32.94545294800878, -56.65081009086592];
+        const SK_XBAR: [f64; 2] = [1.958333333333333, 3.541666666666666];
+        let x = Array2::from_shape_vec(
+            (12, 2),
+            vec![
+                0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 1.0, 4.0, 4.0, 5.0, 4.5, 4.5, 5.0, 5.0, 5.0,
+                0.0, 5.0, 1.0, 6.0, 0.5, 5.5, 1.0, 5.0,
+            ],
+        )
+        .unwrap();
+        let y = array![0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+        let fitted = LDA::<f64>::new(Some(2)).fit(&x, &y).unwrap();
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_abs_diff_eq!(fitted.coef()[[i, j]], SK_COEF[i][j], epsilon = 1e-9);
+            }
+            assert_abs_diff_eq!(fitted.intercept()[i], SK_INTERCEPT[i], epsilon = 1e-9);
+        }
+        for j in 0..2 {
+            assert_abs_diff_eq!(fitted.xbar()[j], SK_XBAR[j], epsilon = 1e-12);
+        }
+    }
+
     #[test]
     fn test_lda_classes_accessor() {
         let (x, y) = linearly_separable_2d();
@@ -817,6 +1008,7 @@ mod tests {
 
     #[test]
     fn test_lda_means_shape() {
+        // means_ is now in the ORIGINAL feature space (n_classes, n_features).
         let (x, y) = three_class_data();
         let lda = LDA::<f64>::new(Some(2));
         let fitted = lda.fit(&x, &y).unwrap();
@@ -885,7 +1077,7 @@ mod tests {
         let (x, y) = linearly_separable_2d();
         let lda = LDA::<f64>::new(Some(1));
         let fitted = lda.fit(&x, &y).unwrap();
-        assert_eq!(fitted.scalings().dim(), (2, 1));
+        assert_eq!(fitted.scalings().nrows(), 2);
     }
 
     #[test]
@@ -908,32 +1100,31 @@ mod tests {
         assert_eq!(lda_none.n_components(), None);
     }
 
+    /// Re-oracled (was `test_lda_transform_then_predict_consistent`, which
+    /// asserted the OLD nearest-centroid algorithm: `predict ==
+    /// argmin ‖transform(x) - projected_mean‖`). The SVD solver's `predict` is
+    /// the argmax of the affine `decision_function = X @ coef_.T + intercept_`
+    /// (`discriminant_analysis.py:739`), NOT nearest-centroid in projected
+    /// space, so this now checks the new contract.
     #[test]
-    fn test_lda_transform_then_predict_consistent() {
+    fn test_lda_predict_matches_decision_argmax() {
         let (x, y) = linearly_separable_2d();
         let lda = LDA::<f64>::new(Some(1));
         let fitted = lda.fit(&x, &y).unwrap();
-        // Manually compute nearest-centroid prediction from transform output.
-        let projected = fitted.transform(&x).unwrap();
-        let preds_predict = fitted.predict(&x).unwrap();
-        let n_samples = projected.nrows();
-        let n_comp = projected.ncols();
-        let n_classes = fitted.classes().len();
+        let dec = fitted.decision_function(&x).unwrap();
+        let preds = fitted.predict(&x).unwrap();
+        let n_samples = dec.nrows();
+        let n_classes = dec.ncols();
         for i in 0..n_samples {
-            let mut best = 0;
-            let mut best_d = f64::INFINITY;
-            for ci in 0..n_classes {
-                let mut d = 0.0;
-                for k in 0..n_comp {
-                    let diff = projected[[i, k]] - fitted.means()[[ci, k]];
-                    d += diff * diff;
-                }
-                if d < best_d {
-                    best_d = d;
-                    best = ci;
+            let mut best = 0usize;
+            let mut best_v = dec[[i, 0]];
+            for c in 1..n_classes {
+                if dec[[i, c]] > best_v {
+                    best_v = dec[[i, c]];
+                    best = c;
                 }
             }
-            assert_eq!(preds_predict[i], fitted.classes()[best]);
+            assert_eq!(preds[i], fitted.classes()[best]);
         }
     }
 
@@ -970,17 +1161,15 @@ mod tests {
 
     #[test]
     fn test_lda_transform_known_data() {
-        // With perfectly separated data the transform should yield two clearly
-        // distinct groups.
+        // With perfectly separated 1-D data the centered/whitened transform
+        // should still place the two classes on opposite sides.
         let x = Array2::from_shape_vec((4, 1), vec![-2.0, -1.0, 1.0, 2.0]).unwrap();
         let y = array![0usize, 0, 1, 1];
         let lda = LDA::<f64>::new(Some(1));
         let fitted = lda.fit(&x, &y).unwrap();
         let proj = fitted.transform(&x).unwrap();
-        // The first two samples should project to one side, the other two to the other side.
         let sign0 = proj[[0, 0]].signum();
         let sign1 = proj[[2, 0]].signum();
-        // They should be on opposite sides of the origin (or at least the split is correct).
         assert_ne!(
             sign0 as i32, sign1 as i32,
             "Classes should be on opposite sides"
@@ -988,16 +1177,15 @@ mod tests {
     }
 
     #[test]
-    fn test_lda_abs_diff_eq_means_dimensions() {
-        let (x, y) = linearly_separable_2d();
-        let lda = LDA::<f64>::new(Some(1));
+    fn test_lda_predict_proba_rows_sum_to_one() {
+        let (x, y) = three_class_data();
+        let lda = LDA::<f64>::new(Some(2));
         let fitted = lda.fit(&x, &y).unwrap();
-        // Each class mean in projected space should be a 1-component vector.
-        assert_eq!(fitted.means().ncols(), 1);
-        let m0 = fitted.means()[[0, 0]];
-        let m1 = fitted.means()[[1, 0]];
-        // For well-separated data the projected means should differ by > 1.0.
-        assert!((m0 - m1).abs() > 0.5, "m0={m0}, m1={m1}");
-        assert_abs_diff_eq!(0.0_f64, 0.0_f64); // use the import
+        let proba = fitted.predict_proba(&x).unwrap();
+        assert_eq!(proba.dim(), (9, 3));
+        for row in proba.rows() {
+            let s: f64 = row.iter().sum();
+            assert_abs_diff_eq!(s, 1.0, epsilon = 1e-12);
+        }
     }
 }
