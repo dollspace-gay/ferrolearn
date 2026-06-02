@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- translate(svm): REQ-8 estimator-level param surface + defaults (R-DEV-2) (#641)
 - translate(svm): REQ-5 predict ovo voting tie-break (lower class index) (#638)
 - translate(svm): REQ-4 decision_function shape/sign + ovr transform (#637)
 - translate(svm): REQ-7 multiclass one-vs-one per-pair coef pin (#640)
