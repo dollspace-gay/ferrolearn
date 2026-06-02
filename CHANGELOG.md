@@ -9,6 +9,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(lda): REQ-10 eigen solver (generalized eigh(Sb,Sw)) (#596)
+- Translation unit: ferrolearn-linear/lda.rs — eigen solver (#596) (#605)
+- translate(lda): REQ-11 shrinkage (None/auto Ledoit-Wolf/float) (#597)
+- translate(lda): REQ-9 lsqr solver (#595)
+- Translation unit: ferrolearn-linear/src/lda.rs — lsqr solver + shrinkage (#604)
+- translate(lda): REQ-15 tol rank thresholds (#601)
+- translate(lda): REQ-12 store_covariance + covariance_ (#598)
+- translate(lda): REQ-7 priors (None=empirical + provided) (#593)
+- translate(lda): REQ-4 predict_log_proba + smallest_normal floor (#591)
+- translate(lda): REQ-3 prior-aware predict_proba + register LDA in binding (#590)
+- translate(lda): REQ-13 explained_variance_ratio_ oracle pin (#599)
+- translate(lda): REQ-8 coef_/intercept_/xbar_ fitted attrs (#594)
+- translate(lda): REQ-5 transform (X-xbar_)@scalings_ parity (#592)
+- translate(lda): REQ-2 predict argmax (imbalanced-prior label pin) (#589)
+- translate(lda): REQ-1 svd solver + decision_function parity (affine X@coef.T+intercept) (#588)
 - translate(qda): REQ-4 pin predict_log_proba + smallest_normal floor + expose (#578)
 - translate(qda): REQ-9 store_covariance + covariance_ accessor (#582)
 - translate(qda): REQ-6 provided priors (None=empirical, array verbatim) (#580)
@@ -326,6 +341,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
 - **ferrolearn-numerical**: Replaced manual `(a + b) / 2.0` with `f64::midpoint(a, b)` in adaptive Simpson, Gauss-Kronrod, and cubic-spline routines for overflow-safe averaging (#239)
 
 ### Fixed
+- translate(lda): REQ-7b priors validation — reject negative + renormalize sum!=1 (LDA differs from QDA) (#603)
 - QuantileRegressor predictions 25x off from sklearn (IRLS vs HiGHS solver divergence) (#340)
 - **ferrolearn-decomp**: `LLE::test_lle_different_n_neighbors` now asserts a real difference (`diff_sum > 1e-10`) instead of the no-op `diff_sum > 1e-10 || true` that always passed (#237)
 - **ferrolearn-neighbors**: `test_all_algorithms_agree_kneighbors` now compares per-row sorted index sets across BruteForce/KdTree/BallTree, restoring an invariant that was previously dropped (the `reference_idxs` variable was assigned but never read) (#237)
