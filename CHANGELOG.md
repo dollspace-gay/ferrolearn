@@ -243,6 +243,11 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: gradient_boosting::huber_leaf_value median uses np.median tie (mean of two middles) instead of _weighted_percentile lower-percentile; Huber predict off by ~6.6e-4 vs sklearn (#738)
+- Divergence: gradient_boosting::lad_leaf_value diverges from sklearn AbsoluteError leaf-update (uses np.median not _weighted_percentile lower-percentile) (#737)
+- Divergence: ferrolearn-tree GradientBoostingRegressor(loss=Huber) diverges from sklearn/_loss/loss.py:694-710 — missing median+clipped-mean terminal-region update (#736)
+- Divergence: ferrolearn-tree GradientBoostingClassifier diverges from sklearn/ensemble/_gb.py:191-206 — missing LogLoss Newton terminal-region update (#735)
+- Divergence: ferrolearn-tree GradientBoostingRegressor(loss=Lad) diverges from sklearn/ensemble/_gb.py:241-247 — missing weighted-median terminal-region update (#734)
 - Divergence: ferrolearn-tree FittedIsolationForest::score_samples returns NaN for single-sample fit (max_samples_==1, denominator==0) where sklearn returns -0.5 (#732)
 - Divergence: ferrolearn-tree average_path_length c(2) gap vs sklearn/ensemble/_iforest.py:562 (sklearn special-cases n==2 -> 1.0; ferrolearn computes 0.1544 from general formula; in-src test_average_path_length_values asserts the WRONG 0<c(2)<1) (#727)
 - Divergence: ferrolearn-tree IsolationForest::score_samples sign inversion vs sklearn/ensemble/_iforest.py:451 (returns +2^(-mean/c) in (0,1]; sklearn returns -2^(-mean/c) in [-1,0]) (#726)
