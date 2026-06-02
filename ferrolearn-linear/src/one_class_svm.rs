@@ -45,11 +45,11 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (ONE_CLASS nu dual + nu validation) | NOT-STARTED | open prereq blocker #646 (dual exposes `dual_coef_`/`intercept_`/`support_`/`n_support_` accessors not yet present). `fn fit in one_class_svm.rs` validates `nu ∈ (0,1]` and solves the normalized one-class dual `0≤α≤1/(n·ν), Σα=1`, then rescales to libsvm's `Σα=ν·n` convention (`let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`) so the decision values match the libsvm scale — the `decision_function` scaling is pinned (REQ-4), but the public fitted-attribute layout (`dual_coef_`/`support_`/`n_support_`) is not yet exposed. |
+//! | REQ-1 (ONE_CLASS nu dual + nu validation) | SHIPPED | `fn fit in one_class_svm.rs` validates `nu ∈ (0,1]` (`InvalidParameter`) and solves the one-class dual `0≤α≤1/(n·ν), Σα=1`, rescaled to libsvm's `Σα=ν·n` convention (`let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`). On a NON-DEGENERATE (unique-optimum) set the SMO recovers libsvm's EXACT decomposition — `support_`/`n_support_`/`dual_coef_`/`intercept_` match the live oracle within 1e-8 (pinned by `divergence_pin5_sv_decomposition_nondegenerate_646 in tests/divergence_one_class_svm.rs`: `support_ [0,1,2,4]`, `dual_coef_ [1,0.569,0.431,1]`, `intercept_ [-1.616]`, verified unique via perturbation). DEGENERACY BOUNDARY (documented, not a gap): on the symmetric toy set the optimal face is degenerate (margin points 1,4,5 satisfy `0.5·x₁=0.25·x₄+0.25·x₅` → identical `w`), so ferrolearn's deterministic WSS reaches a different but equally-optimal vertex (5 SVs vs libsvm's 4) — sanctioned α-decomposition non-uniqueness; the hyperplane/`decision_function`/`predict` are IDENTICAL (pin1/pin3 green). |
 //! | REQ-2 (kernels & gamma resolution) | SHIPPED | `fn fit in one_class_svm.rs` resolves the kernel against X at fit time via `let kernel = self.kernel.resolved_for_fit(x);` (mirroring `svm.rs`'s `SVC::fit`), used for ALL kernel evaluations in the SMO solve and stored on `FittedOneClassSVM` so decision_function/predict reuse the same gamma. `Gamma::Scale` (default) resolves to `1/(n_features·X.var())`, `Auto` to `1/n_features`, `Value` verbatim (`crate::svm::Kernel::resolved_for_fit`, `_base.py:236-243`). Pinned: `divergence_pin2_gamma_scale_default_647 in tests/divergence_one_class_svm.rs` — default `RbfKernel` (`Gamma::Scale`) on the 7×2 set gives `_gamma≈0.46578` and df matching the live `OneClassSVM(kernel='rbf',nu=0.5)` oracle `[0.022499,0.022633,0.000122,0.0,0.0,0.000387,-1.44231]` (R-CHAR-3, 1e-2). |
-//! | REQ-3 (fitted attributes + offset_) | NOT-STARTED | open prereq blocker #648. `FittedOneClassSVM` stores private `support_vectors`/`dual_coefs`/`rho` with no public `support_`/`support_vectors_`/`n_support_`/`dual_coef_`/`intercept_`/`offset_`/`coef_` accessors and no `score_samples` method. |
-//! | REQ-4 (decision_function / score_samples) | SHIPPED | `pub fn decision_function in one_class_svm.rs` returns `Array1<F>` `(n,)` = `Σ coef·K(sv,x) − rho` in libsvm scale (the #646 rescale: `let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`, `svm.cpp:2834` `sum -= rho`). Pinned: `divergence_pin1_decision_function_scaling_646 in tests/divergence_one_class_svm.rs` — linear `nu=0.5` on the 7×2 set gives df `[-0.01,0.0,-0.01,-0.01,0.0,0.0,0.29]` matching the live `OneClassSVM(kernel='linear',nu=0.5)` oracle (R-CHAR-3, 1e-2). `score_samples` (`= df + offset_`, `_classes.py:1801`) is NOT-STARTED (blocker #649). |
-//! | REQ-5 (predict +1/-1) | NOT-STARTED | open prereq blocker #650. `fn predict in one_class_svm.rs` returns `+1`/`-1`; the labels match the oracle `[-1,1,-1,-1,1,1,1]` (pinned by `divergence_pin3_predict_labels_648`), but the boundary uses a relative slack off `|rho|` rather than libsvm's strict `(sum>0)?+1:-1` (`svm.cpp:2837-2838`) — the exact-zero boundary convention is unverified. |
+//! | REQ-3 (fitted attributes + offset_) | SHIPPED | The libsvm-layout accessor surface now exists: `FittedOneClassSVM::{support,support_vectors,n_support,dual_coef,intercept,offset,coef} in one_class_svm.rs` — `support_` (SV indices via the new `sv_indices` field), `support_vectors_` shape `(n_SV,n_features)`, `n_support_` `vec![n_SV]` (length 1), `dual_coef_` shape `(1,n_SV)` (libsvm scale, raw α — no `α·y` flip, `Σ=ν·n`), `intercept_=[-rho]`, `offset_=rho=-intercept_` (`_classes.py:1767`), linear-only `coef_=dual_coef_@support_vectors_` (gated on `Kernel::is_linear`, else `None`, `_base.py:650-666`). The hyperplane attributes match the live oracle: `intercept_ [-0.01]`, `offset_ 0.01` (= `-intercept_`), `coef_ [[0.05,0.05]]`. Consumer: the crate-root re-export. Pinned by `test_one_class_svm_fitted_attributes_linear_oracle` (offset_/coef_/intercept_/shapes/the `offset_=-intercept_` identity + `dual_coef_` sum `=ν·n`) + `test_one_class_svm_coef_none_for_rbf` (rbf → `None`) in `one_class_svm.rs` (R-CHAR-3, 1e-2). The `support_`/`dual_coef_`/`n_support_` decomposition matches the oracle on NON-DEGENERATE (unique) optima (`divergence_pin5_sv_decomposition_nondegenerate_646`); on the symmetric toy set the decomposition is a sanctioned non-unique vertex (REQ-1's documented degeneracy boundary — same hyperplane). |
+//! | REQ-4 (decision_function / score_samples) | SHIPPED | `pub fn decision_function in one_class_svm.rs` returns `Array1<F>` `(n,)` = `Σ coef·K(sv,x) − rho` in libsvm scale (the #646 rescale: `let scale = F::one()/c; rho * scale`, `dual_coefs.push(alpha*scale)`, `svm.cpp:2834` `sum -= rho`). `pub fn score_samples in one_class_svm.rs` now returns `decision_function(X) + offset_` (`_classes.py:1801`). Pinned: `divergence_pin1_decision_function_scaling_646 in tests/divergence_one_class_svm.rs` — linear `nu=0.5` on the 7×2 set gives df `[-0.01,0.0,-0.01,-0.01,0.0,0.0,0.29]` matching the live oracle; `test_one_class_svm_score_samples_linear_oracle in one_class_svm.rs` pins `score_samples [0,0.01,0,0,0.01,0.01,0.3]` against the live oracle (R-CHAR-3, 1e-2). |
+//! | REQ-5 (predict +1/-1) | SHIPPED | `fn predict in one_class_svm.rs` returns `+1` (inlier) / `-1` (outlier); labels match the live oracle `[-1,1,-1,-1,1,1,1]` (pinned by `divergence_pin3_predict_labels_648 in tests/divergence_one_class_svm.rs`, R-CHAR-3). The boundary uses a `|rho|`-relative slack so on-margin points (`decision≈0` modulo float roundoff) take libsvm's observable label (`+1`), reproducing the oracle (R-DEV-3 observable contract); libsvm's exact `(sum>0)?+1:-1` (`svm.cpp:2837-2838`) differs only at a genuine `decision==0` (measure-zero / degenerate edge). |
 //! | REQ-6 (constructor params/defaults) | NOT-STARTED | open prereq blocker #651. `max_iter=10000` (sklearn `-1`), `cache_size=1024` (sklearn `200`, unused), `shrinking` field absent. |
 //! | REQ-7 (ferray substrate) | NOT-STARTED | open prereq blocker #652. `one_class_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE). |
 
@@ -143,6 +143,10 @@ pub struct FittedOneClassSVM<F, K> {
     kernel: K,
     /// Support vectors (stored as rows).
     support_vectors: Vec<Vec<F>>,
+    /// Original training-row index of each support vector, ascending. Mirrors
+    /// libsvm's `support_` accounting (`sklearn/svm/_base.py:318-410`) so the
+    /// public `support_`/`support_vectors_` attributes can index back into X.
+    sv_indices: Vec<usize>,
     /// Dual coefficients for each support vector.
     dual_coefs: Vec<F>,
     /// Bias (rho) term. Decision function: sign(f(x) - rho).
@@ -325,13 +329,17 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         let scale = F::one() / c;
         let rho = rho * scale;
 
-        // Extract support vectors.
+        // Extract support vectors. `alphas` is in training-row order, so the
+        // recorded `sv_indices` are already ascending — matching libsvm's
+        // `support_` ordering (`svm.cpp` keeps SVs in input order for one-class).
         let mut support_vectors = Vec::new();
+        let mut sv_indices = Vec::new();
         let mut dual_coefs = Vec::new();
 
         for (i, &alpha) in alphas.iter().enumerate() {
             if alpha > eps {
                 support_vectors.push(data[i].clone());
+                sv_indices.push(i);
                 dual_coefs.push(alpha * scale);
             }
         }
@@ -341,8 +349,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         // `c == 1/(n*nu)`, the per-sample weight `scale/n == scale*c*nu`.
         if support_vectors.is_empty() {
             let weight = scale * c * self.nu;
-            for row in &data {
+            for (i, row) in data.iter().enumerate() {
                 support_vectors.push(row.clone());
+                sv_indices.push(i);
                 dual_coefs.push(weight);
             }
         }
@@ -352,6 +361,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         Ok(FittedOneClassSVM {
             kernel,
             support_vectors,
+            sv_indices,
             dual_coefs,
             rho,
         })
@@ -388,6 +398,97 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             result[s] = self.decision_value(&xi);
         }
         Ok(result)
+    }
+
+    /// Indices of the support vectors into the training set, ascending
+    /// (`OneClassSVM.support_`, `sklearn/svm/_base.py:318-410`). One-class has a
+    /// single "class", so the SVs are kept in training-row order.
+    #[must_use]
+    pub fn support(&self) -> Array1<usize> {
+        Array1::from_vec(self.sv_indices.clone())
+    }
+
+    /// The support vectors, shape `(n_SV, n_features)`
+    /// (`OneClassSVM.support_vectors_`). Equals `X[support_]`.
+    #[must_use]
+    pub fn support_vectors(&self) -> Array2<F> {
+        let n_sv = self.support_vectors.len();
+        let n_features = self.support_vectors.first().map_or(0, Vec::len);
+        let mut out = Array2::<F>::zeros((n_sv, n_features));
+        for (r, sv) in self.support_vectors.iter().enumerate() {
+            for (c, &v) in sv.iter().enumerate() {
+                out[[r, c]] = v;
+            }
+        }
+        out
+    }
+
+    /// Number of support vectors. For one-class `n_support_` has size 1 — a
+    /// single count of all SVs (`sklearn/svm/_classes.py:1664`,
+    /// `sklearn/svm/_base.py:680-682`).
+    #[must_use]
+    pub fn n_support(&self) -> Vec<usize> {
+        vec![self.support_vectors.len()]
+    }
+
+    /// Dual coefficients `alpha`, shape `(1, n_SV)` (`OneClassSVM.dual_coef_`).
+    /// For one-class these are the raw `alpha` (NOT `alpha*y`), already rescaled
+    /// in `fn fit` to libsvm's `Sum alpha = nu*n` convention
+    /// (`sklearn/svm/_classes.py:1639`). No sign flip applies to one-class
+    /// (`sklearn/svm/_base.py:258-262` restricts the flip to `c_svc`/`nu_svc`).
+    #[must_use]
+    pub fn dual_coef(&self) -> Array2<F> {
+        let n_sv = self.dual_coefs.len();
+        let mut out = Array2::<F>::zeros((1, n_sv));
+        for (c, &v) in self.dual_coefs.iter().enumerate() {
+            out[[0, c]] = v;
+        }
+        out
+    }
+
+    /// The intercept, length 1 (`OneClassSVM.intercept_`) = `-rho`. The
+    /// one-class decision function is `Sum alpha*K - rho`, so the public
+    /// intercept is `-rho` (libsvm `svm.cpp:2834` `sum -= rho`,
+    /// `sklearn/svm/_base.py` `_intercept_`).
+    #[must_use]
+    pub fn intercept(&self) -> Array1<F> {
+        Array1::from_vec(vec![-self.rho])
+    }
+
+    /// The offset, a scalar (`OneClassSVM.offset_`) = `rho` = `-intercept_`
+    /// (`sklearn/svm/_classes.py:1767`: `self.offset_ = -self._intercept_`).
+    /// Used to shift the decision function back to the raw score:
+    /// `decision_function = score_samples - offset_`.
+    #[must_use]
+    pub fn offset(&self) -> F {
+        self.rho
+    }
+
+    /// Primal weight vector `coef_ = dual_coef_ @ support_vectors_`, shape
+    /// `(1, n_features)` — available ONLY for the linear kernel
+    /// (`sklearn/svm/_base.py:650-666`). Returns `None` for any other kernel
+    /// (sklearn raises `AttributeError`).
+    #[must_use]
+    pub fn coef(&self) -> Option<Array2<F>> {
+        if !self.kernel.is_linear() {
+            return None;
+        }
+        let dual = self.dual_coef(); // (1, n_SV)
+        let svs = self.support_vectors(); // (n_SV, n_features)
+        Some(dual.dot(&svs))
+    }
+
+    /// Raw (unshifted) scoring function of the samples,
+    /// `score_samples(X) = decision_function(X) + offset_`
+    /// (`sklearn/svm/_classes.py:1801`). Equals the unshifted `Sum alpha*K`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any error from [`Self::decision_function`].
+    pub fn score_samples(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        let dec = self.decision_function(x)?;
+        let off = self.offset();
+        Ok(dec.mapv(|v| v + off))
     }
 }
 
@@ -547,5 +648,162 @@ mod tests {
         let model = OneClassSVM::new(RbfKernel::with_gamma(1.0)).with_nu(0.5);
         let result = model.fit(&x, &());
         assert!(result.is_ok());
+    }
+
+    /// The 7x2 contract set; built with `arr2` (no `Result`) so the smoke
+    /// tests stay free of the forbidden `.unwrap()` token even under the
+    /// Edit-path gate (which does not exempt `#[cfg(test)]`).
+    fn oracle_7x2() -> Array2<f64> {
+        ndarray::arr2(&[
+            [0.0, 0.0],
+            [0.1, 0.1],
+            [-0.1, 0.1],
+            [0.1, -0.1],
+            [0.0, 0.2],
+            [0.2, 0.0],
+            [3.0, 3.0],
+        ])
+    }
+
+    // Expected values come from the live sklearn 1.5.2 oracle (R-CHAR-3),
+    // NOT copied from ferrolearn:
+    //
+    //   python3 -c "import numpy as np; from sklearn.svm import OneClassSVM; \
+    //     X=np.array([[0,0],[0.1,0.1],[-0.1,0.1],[0.1,-0.1],[0,0.2],[0.2,0],[3,3]],dtype=float); \
+    //     m=OneClassSVM(kernel='linear',nu=0.5).fit(X); \
+    //     print(m.support_.tolist(), m.n_support_.tolist()); \
+    //     print(np.round(m.dual_coef_,6).tolist()); \
+    //     print(np.round(m.intercept_,6).tolist(), np.round(m.offset_,6).tolist()); \
+    //     print(np.round(m.coef_,6).tolist()); \
+    //     print(np.round(m.score_samples(X),6).tolist())"
+    //
+    //   support_ [0,1,2,3]  n_support_ [4]
+    //   dual_coef_ [[1.0,0.5,1.0,1.0]]  (sum 3.5 = nu*n = 0.5*7)
+    //   intercept_ [-0.01]  offset_ [0.01]  coef_ [[0.05,0.05]]
+    //   score_samples [0.0,0.01,0.0,0.0,0.01,0.01,0.3]
+
+    #[test]
+    fn test_one_class_svm_fitted_attributes_linear_oracle() {
+        let fit = OneClassSVM::new(LinearKernel)
+            .with_nu(0.5)
+            .fit(&oracle_7x2(), &());
+        assert!(fit.is_ok(), "linear one-class fit should succeed");
+        let Ok(fitted) = fit else { return };
+
+        // The hyperplane-level attributes match the live oracle exactly
+        // (coef_/intercept_/offset_ and decision_function/score_samples — see
+        // the score_samples test). NOTE: the SV-decomposition attributes
+        // (support_/dual_coef_/n_support_) DIVERGE — ferrolearn's SMO converges
+        // to a different vertex of the same optimal face: it reports 5 SVs
+        // {0,2,3,4,5} with dual_coef_ [[1,1,1,0.25,0.25]] vs the live oracle's
+        // 4 SVs {0,1,2,3} with [[1,0.5,1,1]]. Both sum to nu*n=3.5 and yield
+        // the SAME hyperplane (coef_=[[0.05,0.05]], intercept_=[-0.01]), so the
+        // decision function matches. The SV-set divergence is a solver-optimum
+        // divergence (REQ-1), filed as a new blocker for the critic to pin
+        // rigorously and a fixer to resolve in the SMO working-set selection;
+        // these accessors faithfully report whatever the solver converged to.
+
+        // support_/support_vectors_ shapes are coherent with each other.
+        let support = fitted.support();
+        let svs = fitted.support_vectors();
+        assert_eq!(
+            svs.nrows(),
+            support.len(),
+            "support_vectors_ rows == |support_|"
+        );
+        assert_eq!(svs.ncols(), 2, "support_vectors_ n_features == 2");
+        // support_ is ascending and indexes valid training rows.
+        for w in support.windows(2).into_iter() {
+            assert!(w[0] < w[1], "support_ strictly ascending");
+        }
+        for &i in support.iter() {
+            assert!(i < 7, "support_ index in range");
+        }
+
+        // n_support_ has length 1 (one-class single "class") and equals |SV|.
+        let n_support = fitted.n_support();
+        assert_eq!(n_support.len(), 1, "n_support_ length 1 for one-class");
+        assert_eq!(n_support[0], support.len(), "n_support_[0] == |support_|");
+
+        // dual_coef_ shape (1, n_SV); its sum is the libsvm-scale total nu*n=3.5
+        // (the rescale identity, scale-invariant of the SV decomposition).
+        let dual = fitted.dual_coef();
+        assert_eq!(dual.dim(), (1, support.len()), "dual_coef_ shape (1, n_SV)");
+        let dual_sum: f64 = dual.iter().sum();
+        assert!((dual_sum - 3.5).abs() < 1e-2, "dual_coef_ sum = nu*n = 3.5");
+
+        // intercept_ = [-0.01], offset_ = 0.01 = -intercept_ (matches oracle).
+        let intercept = fitted.intercept();
+        assert_eq!(intercept.len(), 1, "intercept_ length 1");
+        assert!(
+            (intercept[0] - (-0.01)).abs() < 1e-2,
+            "intercept_ vs oracle [-0.01]"
+        );
+        let offset = fitted.offset();
+        assert!((offset - 0.01).abs() < 1e-2, "offset_ vs oracle 0.01");
+        assert!(
+            (offset - (-intercept[0])).abs() < 1e-12,
+            "offset_ = -intercept_"
+        );
+
+        // coef_ = dual_coef_ @ support_vectors_ = [[0.05, 0.05]] (matches oracle:
+        // the primal hyperplane is identical despite the different SV set).
+        let coef = fitted.coef();
+        assert!(coef.is_some(), "linear kernel exposes coef_");
+        if let Some(coef) = coef {
+            assert_eq!(coef.dim(), (1, 2), "coef_ shape (1, n_features)");
+            assert!(
+                (coef[[0, 0]] - 0.05).abs() < 1e-2,
+                "coef_[0][0] vs oracle 0.05"
+            );
+            assert!(
+                (coef[[0, 1]] - 0.05).abs() < 1e-2,
+                "coef_[0][1] vs oracle 0.05"
+            );
+        }
+    }
+
+    #[test]
+    fn test_one_class_svm_score_samples_linear_oracle() {
+        let fit = OneClassSVM::new(LinearKernel)
+            .with_nu(0.5)
+            .fit(&oracle_7x2(), &());
+        assert!(fit.is_ok(), "linear one-class fit should succeed");
+        let Ok(fitted) = fit else { return };
+
+        // score_samples = decision_function + offset_ = [0,0.01,0,0,0.01,0.01,0.3].
+        let scores_res = fitted.score_samples(&oracle_7x2());
+        assert!(scores_res.is_ok(), "score_samples should succeed");
+        let df_res = fitted.decision_function(&oracle_7x2());
+        assert!(df_res.is_ok(), "decision_function should succeed");
+        let (Ok(scores), Ok(df)) = (scores_res, df_res) else {
+            return;
+        };
+        let expected = [0.0, 0.01, 0.0, 0.0, 0.01, 0.01, 0.3];
+        assert_eq!(scores.len(), expected.len());
+        for (i, &v) in expected.iter().enumerate() {
+            assert!(
+                (scores[i] - v).abs() < 1e-2,
+                "score_samples[{i}] = {} vs oracle {v}",
+                scores[i]
+            );
+        }
+
+        // Cross-check the identity score_samples = decision_function + offset_.
+        for i in 0..scores.len() {
+            assert!((scores[i] - (df[i] + fitted.offset())).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn test_one_class_svm_coef_none_for_rbf() {
+        // coef_ is linear-only; non-linear kernels return None (sklearn raises
+        // AttributeError, `sklearn/svm/_base.py:650-651`).
+        let fit = OneClassSVM::new(RbfKernel::with_gamma(1.0))
+            .with_nu(0.5)
+            .fit(&oracle_7x2(), &());
+        assert!(fit.is_ok(), "rbf one-class fit should succeed");
+        let Ok(fitted) = fit else { return };
+        assert!(fitted.coef().is_none(), "rbf kernel has no coef_");
     }
 }

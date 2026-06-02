@@ -182,3 +182,280 @@ fn divergence_pin3_predict_labels_648() {
         );
     }
 }
+
+// ===========================================================================
+// PIN 4 / PIN 5 — fitted-attribute accessors landed (REQ-1/#646, REQ-3/#648,
+// REQ-4 score_samples/#649). These pins exercise the new public accessors
+// (`support`/`support_vectors`/`n_support`/`dual_coef`/`intercept`/`offset`/
+// `coef`/`score_samples`) against the live sklearn 1.5.2 oracle.
+//
+// The NOTE above (lines 13-19) is now superseded for these REQs — the
+// accessors exist, so the pins below compile and assert real sklearn values.
+// ===========================================================================
+
+/// PIN 4 — #648/#649: hyperplane fitted attributes + `score_samples`.
+///
+/// Pins `FittedOneClassSVM::{intercept,offset,coef,score_samples,dual_coef}`
+/// against the live `OneClassSVM(kernel='linear', nu=0.5)` oracle on the shared
+/// 7x2 set. These are the HYPERPLANE-level attributes — they are IDENTICAL
+/// across the optimal face (the α-decomposition non-uniqueness affects only the
+/// `support_`/`dual_coef_` *vector*, NOT `coef_`/`intercept_`/`offset_`/the
+/// decision function). Per the task brief this pin asserts only the
+/// scale-invariant / hyperplane quantities (incl. `dual_coef_.sum() = ν·n`),
+/// NOT the exact `support_`/`dual_coef_` vector (that is PIN 5's job on a
+/// non-degenerate set).
+///
+/// Oracle (re-derived live, R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import OneClassSVM; \
+/// X=np.array([[0,0],[0.1,0.1],[-0.1,0.1],[0.1,-0.1],[0,0.2],[0.2,0],[3,3]],dtype=float); \
+/// m=OneClassSVM(kernel='linear',nu=0.5).fit(X); \
+/// print('intercept_',m.intercept_.tolist()); \
+/// print('offset_',float(np.atleast_1d(m.offset_)[0])); \
+/// print('coef_',m.coef_.ravel().tolist()); \
+/// print('dual_sum',float(m.dual_coef_.sum())); \
+/// print('score_samples',np.round(m.score_samples(X),6).tolist())"
+/// # intercept_     [-0.01]
+/// # offset_        0.01
+/// # coef_          [0.05, 0.05]
+/// # dual_sum       3.5            (= nu*n = 0.5*7)
+/// # score_samples  [0.0, 0.01, 0.0, 0.0, 0.01, 0.01, 0.3]
+/// ```
+#[test]
+fn divergence_pin4_hyperplane_attrs_648_649() {
+    // LIVE oracle values (R-CHAR-3) — never copied from ferrolearn.
+    let oracle_intercept: f64 = -0.01;
+    let oracle_offset: f64 = 0.01;
+    let oracle_coef: [f64; 2] = [0.05, 0.05];
+    let oracle_dual_sum: f64 = 3.5; // nu*n
+    let oracle_score_samples: [f64; 7] = [0.0, 0.01, 0.0, 0.0, 0.01, 0.01, 0.3];
+
+    let x = fixture();
+    let model = OneClassSVM::new(LinearKernel)
+        .with_nu(0.5)
+        .with_tol(1e-9)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &()).expect("fit should succeed");
+
+    // intercept_ == [-0.01]
+    let intercept = fitted.intercept();
+    assert_eq!(intercept.len(), 1, "intercept_ length 1");
+    eprintln!(
+        "PIN4 intercept_ oracle={oracle_intercept} ferro={}",
+        intercept[0]
+    );
+    assert!(
+        (intercept[0] - oracle_intercept).abs() < 1e-2,
+        "intercept_: ferrolearn={} expected (sklearn)={oracle_intercept}",
+        intercept[0]
+    );
+
+    // offset_ == 0.01 (== -intercept_)
+    let offset = fitted.offset();
+    eprintln!("PIN4 offset_ oracle={oracle_offset} ferro={offset}");
+    assert!(
+        (offset - oracle_offset).abs() < 1e-2,
+        "offset_: ferrolearn={offset} expected (sklearn)={oracle_offset}"
+    );
+
+    // coef_ == [[0.05, 0.05]] (linear kernel exposes it).
+    let coef = fitted.coef().expect("linear kernel exposes coef_");
+    assert_eq!(coef.dim(), (1, 2), "coef_ shape (1, n_features)");
+    eprintln!(
+        "PIN4 coef_ oracle={oracle_coef:?} ferro=[{}, {}]",
+        coef[[0, 0]],
+        coef[[0, 1]]
+    );
+    assert!(
+        (coef[[0, 0]] - oracle_coef[0]).abs() < 1e-2,
+        "coef_[0][0]: ferrolearn={} expected (sklearn)={}",
+        coef[[0, 0]],
+        oracle_coef[0]
+    );
+    assert!(
+        (coef[[0, 1]] - oracle_coef[1]).abs() < 1e-2,
+        "coef_[0][1]: ferrolearn={} expected (sklearn)={}",
+        coef[[0, 1]],
+        oracle_coef[1]
+    );
+
+    // dual_coef_.sum() == 3.5 (= nu*n; scale-invariant of the decomposition).
+    let dual_sum: f64 = fitted.dual_coef().iter().sum();
+    eprintln!("PIN4 dual_coef_.sum() oracle={oracle_dual_sum} ferro={dual_sum}");
+    assert!(
+        (dual_sum - oracle_dual_sum).abs() < 1e-2,
+        "dual_coef_.sum(): ferrolearn={dual_sum} expected (sklearn)={oracle_dual_sum} (= nu*n)"
+    );
+
+    // score_samples == decision_function + offset_ == [0,0.01,0,0,0.01,0.01,0.3]
+    let scores = fitted
+        .score_samples(&x)
+        .expect("score_samples should succeed");
+    assert_eq!(scores.len(), oracle_score_samples.len());
+    eprintln!(
+        "PIN4 score_samples oracle={oracle_score_samples:?} ferro={:?}",
+        scores.to_vec()
+    );
+    for (i, &exp) in oracle_score_samples.iter().enumerate() {
+        assert!(
+            (scores[i] - exp).abs() < 1e-2,
+            "score_samples[{i}]: ferrolearn={} expected (sklearn)={exp}",
+            scores[i]
+        );
+    }
+}
+
+/// PIN 4b — #648: `coef_` is `None` for a non-linear (rbf) kernel.
+///
+/// sklearn raises `AttributeError` when accessing `coef_` on a non-linear
+/// `OneClassSVM` (`sklearn/svm/_base.py:650-666` gates `coef_` on
+/// `kernel == "linear"`). ferrolearn's `coef()` returns `None` for non-linear.
+#[test]
+fn divergence_pin4b_coef_none_for_rbf_648() {
+    let x = fixture();
+    let model = OneClassSVM::new(RbfKernel::with_gamma(1.0))
+        .with_nu(0.5)
+        .with_tol(1e-9)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &()).expect("rbf fit should succeed");
+    assert!(
+        fitted.coef().is_none(),
+        "coef_ must be None for rbf (sklearn raises AttributeError)"
+    );
+}
+
+/// The non-degenerate PIN-5 fixture: an asymmetric 5-point cluster + a clear
+/// outlier `[5,5]`. Unlike the symmetric 7x2 set, the optimal α-decomposition
+/// here is UNIQUE (verified live: see the module-level note in the PIN-5 test).
+fn fixture_nondegenerate() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (6, 2),
+        vec![0.0, 0.0, 1.0, 0.2, 0.3, 1.1, 1.4, 1.3, 0.7, 0.5, 5.0, 5.0],
+    )
+    .unwrap()
+}
+
+/// PIN 5 — #646: SV decomposition on a NON-DEGENERATE set (unique optimum).
+///
+/// The toy 7x2 set has a DEGENERATE optimal face (margin points 1,4,5 satisfy
+/// `0.5·x₁ = 0.25·x₄ + 0.25·x₅`), so libsvm and ferrolearn's SMO can land on
+/// different vertices (4 SVs `[0,1,2,3]` vs 5 SVs `[0,2,3,4,5]`) of the SAME
+/// hyperplane — genuine α-decomposition non-uniqueness, NOT a solver bug.
+///
+/// This pin instead uses an asymmetric cluster + clear outlier where the
+/// decomposition is UNIQUE. Uniqueness was verified LIVE by perturbing X by
+/// N(0, 1e-4) noise 20× and confirming (a) `support_` is invariant `[0,1,2,4]`
+/// and (b) `dual_coef_` varies *continuously* (std ≈ 2e-4 ∝ the perturbation,
+/// no jump to another vertex). `coef_ = [1.398, 1.088]` is well away from 0 and
+/// the two free margin SVs (rows 1,2) are in general position:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import OneClassSVM; \
+/// X0=np.array([[0,0],[1,0.2],[0.3,1.1],[1.4,1.3],[0.7,0.5],[5,5]],dtype=float); \
+/// rng=np.random.default_rng(0); base=OneClassSVM(kernel='linear',nu=0.5).fit(X0); \
+/// duals=[]; \
+/// [ ( (lambda m: (duals.append(m.dual_coef_.ravel()), \
+///      None if m.support_.tolist()==base.support_.tolist() else print('CHANGED'))) \
+///    (OneClassSVM(kernel='linear',nu=0.5).fit(X0+rng.normal(scale=1e-4,size=X0.shape))) ) \
+///   for _ in range(20) ]; \
+/// print('std',np.round(np.array(duals).std(0),6).tolist())"
+/// # (no 'CHANGED' printed; support stable)  std [0.0, 0.00026, 0.00026, 0.0]
+/// ```
+///
+/// Oracle (re-derived live, R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import OneClassSVM; \
+/// X=np.array([[0,0],[1,0.2],[0.3,1.1],[1.4,1.3],[0.7,0.5],[5,5]],dtype=float); \
+/// m=OneClassSVM(kernel='linear',nu=0.5).fit(X); \
+/// print(m.support_.tolist(), m.n_support_.tolist(), m.dual_coef_.ravel().tolist(), \
+///       m.intercept_.tolist())"
+/// # support_   [0, 1, 2, 4]
+/// # n_support_ [4]
+/// # dual_coef_ [1.0, 0.5692307470253847, 0.4307692529746154, 1.0]  (sum 3.0 = nu*n)
+/// # intercept_ [-1.6159999734144956]
+/// ```
+///
+/// If this pin is GREEN, the toy-set divergence is degeneracy-ONLY: REQ-1's
+/// `support_`/`dual_coef_` are CORRECT on non-degenerate inputs and #646 can
+/// close as a documented non-uniqueness boundary. If it is RED, the solver has
+/// a real working-set-selection bug and a fixer is required.
+#[test]
+fn divergence_pin5_sv_decomposition_nondegenerate_646() {
+    // LIVE oracle (R-CHAR-3) — never copied from ferrolearn.
+    let oracle_support: [usize; 4] = [0, 1, 2, 4];
+    let oracle_n_support: usize = 4;
+    let oracle_dual: [f64; 4] = [1.0, 0.5692307470253847, 0.4307692529746154, 1.0];
+    let oracle_dual_sum: f64 = 3.0; // nu*n = 0.5*6
+    let oracle_intercept: f64 = -1.6159999734144956;
+
+    let x = fixture_nondegenerate();
+    let model = OneClassSVM::new(LinearKernel)
+        .with_nu(0.5)
+        .with_tol(1e-9)
+        .with_max_iter(1_000_000);
+    let fitted = model.fit(&x, &()).expect("fit should succeed");
+
+    // support_ == [0,1,2,4]
+    let support = fitted.support();
+    eprintln!(
+        "PIN5 support_ oracle={oracle_support:?} ferro={:?}",
+        support.to_vec()
+    );
+    assert_eq!(
+        support.len(),
+        oracle_support.len(),
+        "support_ length: ferrolearn={:?} expected (sklearn)={oracle_support:?}",
+        support.to_vec()
+    );
+    for (i, &exp) in oracle_support.iter().enumerate() {
+        assert_eq!(
+            support[i], exp,
+            "support_[{i}]: ferrolearn={} expected (sklearn)={exp}",
+            support[i]
+        );
+    }
+
+    // n_support_ == [4]
+    let n_support = fitted.n_support();
+    eprintln!("PIN5 n_support_ oracle=[{oracle_n_support}] ferro={n_support:?}");
+    assert_eq!(n_support.len(), 1, "n_support_ length 1 for one-class");
+    assert_eq!(
+        n_support[0], oracle_n_support,
+        "n_support_[0]: ferrolearn={} expected (sklearn)={oracle_n_support}",
+        n_support[0]
+    );
+
+    // dual_coef_ == [[1.0, 0.5692.., 0.4308.., 1.0]] (sum 3.0 = nu*n)
+    let dual = fitted.dual_coef();
+    assert_eq!(
+        dual.dim(),
+        (1, oracle_dual.len()),
+        "dual_coef_ shape (1, n_SV)"
+    );
+    let dual_vec: Vec<f64> = dual.iter().copied().collect();
+    eprintln!("PIN5 dual_coef_ oracle={oracle_dual:?} ferro={dual_vec:?}");
+    for (i, &exp) in oracle_dual.iter().enumerate() {
+        assert!(
+            (dual_vec[i] - exp).abs() < 1e-2,
+            "dual_coef_[{i}]: ferrolearn={} expected (sklearn)={exp}",
+            dual_vec[i]
+        );
+    }
+    let dual_sum: f64 = dual_vec.iter().sum();
+    assert!(
+        (dual_sum - oracle_dual_sum).abs() < 1e-2,
+        "dual_coef_.sum(): ferrolearn={dual_sum} expected (sklearn)={oracle_dual_sum} (= nu*n)"
+    );
+
+    // intercept_ == [-1.616]
+    let intercept = fitted.intercept();
+    assert_eq!(intercept.len(), 1, "intercept_ length 1");
+    eprintln!(
+        "PIN5 intercept_ oracle={oracle_intercept} ferro={}",
+        intercept[0]
+    );
+    assert!(
+        (intercept[0] - oracle_intercept).abs() < 1e-2,
+        "intercept_: ferrolearn={} expected (sklearn)={oracle_intercept}",
+        intercept[0]
+    );
+}
