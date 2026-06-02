@@ -29,7 +29,7 @@
 
 use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::isotonic::IsotonicRegression;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Divergence: a DEFAULT-constructed `IsotonicRegression` clips out-of-range
 /// predictions instead of returning NaN.

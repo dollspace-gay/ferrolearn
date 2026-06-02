@@ -74,12 +74,17 @@ pub struct IsotonicRegression<F> {
 impl<F: Float> IsotonicRegression<F> {
     /// Create a new `IsotonicRegression` with default settings.
     ///
-    /// Defaults: `increasing = true`, `out_of_bounds = Clip`.
+    /// Defaults: `increasing = true`, `out_of_bounds = Nan`.
+    ///
+    /// The `out_of_bounds` default matches scikit-learn's
+    /// `IsotonicRegression(out_of_bounds="nan")` (`sklearn/isotonic.py:274`):
+    /// a default-constructed estimator returns `NaN` for predictions outside
+    /// the training range `[X_min_, X_max_]`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             increasing: true,
-            out_of_bounds: OutOfBounds::Clip,
+            out_of_bounds: OutOfBounds::Nan,
             _marker: std::marker::PhantomData,
         }
     }
@@ -204,32 +209,98 @@ impl<F: Float> FittedIsotonicRegression<F> {
 // Pool Adjacent Violators (PAV) algorithm
 // ---------------------------------------------------------------------------
 
-/// Run the PAV algorithm to produce a monotonically non-decreasing
-/// sequence of (x, y) breakpoints.
-fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
-    // Sort by x.
+/// Collapse maximal runs of equal `X` into a single point, mirroring
+/// scikit-learn's `_make_unique` (`sklearn/_isotonic.pyx`).
+///
+/// The inputs are first ordered by `X` (ties broken by `y`, matching
+/// `np.lexsort((y, X))` at `sklearn/isotonic.py:317`). Each run of equal `X`
+/// then collapses to one point whose `x` is the shared value, whose `y` is the
+/// **sample-weight-weighted mean** of the run (`Σ wᵢ yᵢ / Σ wᵢ`), and whose
+/// weight is the **summed** weight of the run.
+///
+/// For unit weights this reduces to the plain mean and a count, so the
+/// returned weights double as the run multiplicities consumed by the weighted
+/// PAVA. Returns `(x_unique, y_unique, w_unique)`.
+fn make_unique<F: Float>(xs: &[F], ys: &[F], ws: &[F]) -> (Vec<F>, Vec<F>, Vec<F>) {
     let n = xs.len();
-    let mut indices: Vec<usize> = (0..n).collect();
-    indices.sort_by(|&a, &b| xs[a].partial_cmp(&xs[b]).unwrap());
+    if n == 0 {
+        return (Vec::new(), Vec::new(), Vec::new());
+    }
 
-    let sorted_y: Vec<F> = indices.iter().map(|&i| ys[i]).collect();
-    let sorted_x: Vec<F> = indices.iter().map(|&i| xs[i]).collect();
+    // Order by X (primary), y (secondary) — np.lexsort((y, X)). total_cmp
+    // gives a total order without panicking on NaN (goal.md R-APG-1).
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| {
+        xs[a]
+            .partial_cmp(&xs[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| {
+                ys[a]
+                    .partial_cmp(&ys[b])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+
+    let mut x_out = Vec::new();
+    let mut y_out = Vec::new();
+    let mut w_out = Vec::new();
+
+    let mut cur_x = xs[indices[0]];
+    let mut cur_w = F::zero();
+    let mut cur_wy = F::zero();
+
+    for &idx in &indices {
+        let x = xs[idx];
+        let w = ws[idx];
+        if x != cur_x {
+            // Close the previous run.
+            x_out.push(cur_x);
+            w_out.push(cur_w);
+            y_out.push(cur_wy / cur_w);
+
+            cur_x = x;
+            cur_w = w;
+            cur_wy = ys[idx] * w;
+        } else {
+            cur_w = cur_w + w;
+            cur_wy = cur_wy + ys[idx] * w;
+        }
+    }
+    // Close the final run.
+    x_out.push(cur_x);
+    w_out.push(cur_w);
+    y_out.push(cur_wy / cur_w);
+
+    (x_out, y_out, w_out)
+}
+
+/// Run the **weighted** PAV algorithm on points pre-ordered and de-duplicated
+/// by `X` (see [`make_unique`]), producing a monotonically non-decreasing set
+/// of `(x, y)` breakpoints.
+///
+/// When two adjacent blocks violate monotonicity they are pooled: the merged
+/// block's value is the weighted mean `(w₁·v₁ + w₂·v₂)/(w₁ + w₂)` and its
+/// weight is `w₁ + w₂`, mirroring sklearn's
+/// `_inplace_contiguous_isotonic_regression` (`sklearn/_isotonic.pyx`). The
+/// `xs`/`ys`/`ws` slices must already be sorted by `x` with unique `x` values.
+fn pav_increasing_unique_weighted<F: Float>(xs: &[F], ys: &[F], ws: &[F]) -> (Vec<F>, Vec<F>) {
+    let n = xs.len();
 
     // PAV: merge adjacent blocks that violate monotonicity.
-    // Each block is (sum, count, first_x, last_x).
+    // Each block carries the weighted sum, total weight, and x extent.
     struct Block<F> {
-        sum: F,
-        count: usize,
+        wsum: F,
+        weight: F,
         first_idx: usize,
         last_idx: usize,
     }
 
     let mut blocks: Vec<Block<F>> = Vec::with_capacity(n);
 
-    for (i, &y_val) in sorted_y.iter().enumerate().take(n) {
+    for i in 0..n {
         blocks.push(Block {
-            sum: y_val,
-            count: 1,
+            wsum: ys[i] * ws[i],
+            weight: ws[i],
             first_idx: i,
             last_idx: i,
         });
@@ -237,15 +308,15 @@ fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
         // Merge with previous blocks as needed.
         while blocks.len() > 1 {
             let len = blocks.len();
-            let prev_mean = blocks[len - 2].sum / F::from(blocks[len - 2].count).unwrap();
-            let curr_mean = blocks[len - 1].sum / F::from(blocks[len - 1].count).unwrap();
+            let prev_mean = blocks[len - 2].wsum / blocks[len - 2].weight;
+            let curr_mean = blocks[len - 1].wsum / blocks[len - 1].weight;
 
             if prev_mean > curr_mean {
-                // Merge.
-                let last = blocks.pop().unwrap();
-                let prev = blocks.last_mut().unwrap();
-                prev.sum = prev.sum + last.sum;
-                prev.count += last.count;
+                // Pool the two violating blocks.
+                let Some(last) = blocks.pop() else { break };
+                let Some(prev) = blocks.last_mut() else { break };
+                prev.wsum = prev.wsum + last.wsum;
+                prev.weight = prev.weight + last.weight;
                 prev.last_idx = last.last_idx;
             } else {
                 break;
@@ -253,17 +324,17 @@ fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
         }
     }
 
-    // Extract breakpoints: for each block, use the first and last x,
-    // and the block mean as y.
+    // Extract breakpoints: for each block, emit the first and (if distinct)
+    // last x at the pooled weighted mean.
     let mut result_x = Vec::new();
     let mut result_y = Vec::new();
 
     for block in &blocks {
-        let mean = block.sum / F::from(block.count).unwrap();
-        let bx0 = sorted_x[block.first_idx];
-        let bx1 = sorted_x[block.last_idx];
+        let mean = block.wsum / block.weight;
+        let bx0 = xs[block.first_idx];
+        let bx1 = xs[block.last_idx];
 
-        if result_x.is_empty() || *result_x.last().unwrap() != bx0 {
+        if result_x.is_empty() || result_x.last().is_none_or(|&last| last != bx0) {
             result_x.push(bx0);
             result_y.push(mean);
         }
@@ -274,6 +345,20 @@ fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
     }
 
     (result_x, result_y)
+}
+
+/// Run the unweighted PAV algorithm to produce a monotonically non-decreasing
+/// sequence of `(x, y)` breakpoints.
+///
+/// This is the equal-weight special case of the pipeline used by [`Fit`]:
+/// every input point carries unit weight, so the weighted block mean reduces
+/// to the plain mean. It first collapses duplicate `X` via [`make_unique`]
+/// (matching sklearn's `_make_unique` pre-pool step) and then pools adjacent
+/// violators via [`pav_increasing_unique_weighted`].
+fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
+    let ws = vec![F::one(); xs.len()];
+    let (ux, uy, uw) = make_unique(xs, ys, &ws);
+    pav_increasing_unique_weighted(&ux, &uy, &uw)
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +639,42 @@ mod tests {
         for i in 0..4 {
             assert_relative_eq!(preds[i], 3.0, epsilon = 1e-10);
         }
+    }
+
+    #[test]
+    fn test_make_unique_weighted_collapse() {
+        // Exercises the internal weighted `make_unique` + weighted PAVA that
+        // back `_make_unique` (REQ-8) and enable `sample_weight` (REQ-7, #568).
+        //
+        // Oracle (scikit-learn 1.5.2, sklearn/isotonic.py:317-319 via
+        // _isotonic.pyx `_make_unique`):
+        //   python3 -c "import numpy as np; from sklearn.isotonic import \
+        //   IsotonicRegression; \
+        //   m=IsotonicRegression(out_of_bounds='clip').fit( \
+        //     np.array([1.,1.,2.,3.]).reshape(-1,1), np.array([1.,3.,2.,4.]), \
+        //     sample_weight=np.array([3.,1.,1.,1.])); \
+        //   print(m.X_thresholds_.tolist(), m.y_thresholds_.tolist())"
+        //   # -> [1.0, 2.0, 3.0] [1.5, 2.0, 4.0]
+        //
+        // The X=1 run collapses to the weighted mean (3*1 + 1*3)/4 = 1.5, the
+        // run weight is 3+1 = 4, and the already-monotone [1.5, 2, 4] is
+        // unchanged by the pool.
+        let xs = [1.0_f64, 1.0, 2.0, 3.0];
+        let ys = [1.0_f64, 3.0, 2.0, 4.0];
+        let ws = [3.0_f64, 1.0, 1.0, 1.0];
+
+        let (ux, uy, uw) = make_unique(&xs, &ys, &ws);
+        assert_eq!(ux, vec![1.0, 2.0, 3.0]);
+        assert_relative_eq!(uy[0], 1.5, epsilon = 1e-12);
+        assert_relative_eq!(uy[1], 2.0, epsilon = 1e-12);
+        assert_relative_eq!(uy[2], 4.0, epsilon = 1e-12);
+        assert_eq!(uw, vec![4.0, 1.0, 1.0]);
+
+        let (rx, ry) = pav_increasing_unique_weighted(&ux, &uy, &uw);
+        assert_eq!(rx, vec![1.0, 2.0, 3.0]);
+        assert_relative_eq!(ry[0], 1.5, epsilon = 1e-12);
+        assert_relative_eq!(ry[1], 2.0, epsilon = 1e-12);
+        assert_relative_eq!(ry[2], 4.0, epsilon = 1e-12);
     }
 
     #[test]
