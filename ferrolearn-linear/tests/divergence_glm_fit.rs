@@ -920,3 +920,175 @@ fn glm_score_rejects_out_of_domain_y() {
         "score must re-validate y-domain (glm.py:413-417): Gamma rejects y==0"
     );
 }
+
+// ===========================================================================
+// #557 — `warm_start` (REQ-11) API parity (R-DEV-2) via the explicit-init
+// analog (R-DEV-7).
+//
+// sklearn's `warm_start=True` reuses the previous fit's stateful `self.coef_` /
+// `self.intercept_` as the optimizer's starting point (`glm.py:243-254`):
+//   if self.warm_start and hasattr(self, "coef_"):
+//       coef = np.concatenate((self.coef_, [self.intercept_]))  # fit_intercept
+//   else:
+//       coef = linear_loss.init_zero_coef(X)                    # cold start
+//
+// ferrolearn's estimators are IMMUTABLE (`fit(&self, ...)` returns a fresh
+// fitted object, never mutating `self`), so there is no `self.coef_` to reuse
+// across calls. The R-DEV-7 analog is an EXPLICIT initial point supplied via
+// `with_coef_init(coef, intercept)`; when `warm_start` is set and an init is
+// provided, the IRLS seeds from it instead of cold-starting at `coef = 0`.
+//
+// Because the penalized GLM objective is convex, the converged
+// `coef_` / `intercept_` are warm-start-INVARIANT: the init changes only the
+// starting point (and the iteration count), never the optimum. So the
+// warm-started fit equals the cold fit AND the sklearn oracle. These two tests
+// pin (a) the observable contract is preserved and (b) the init is genuinely
+// consumed (not a no-op).
+// ===========================================================================
+
+/// REQ-11 observable contract: a WARM fit (seeded from a perturbed init) reaches
+/// the SAME `coef_` / `intercept_` as the COLD fit and as the live sklearn
+/// oracle — the convex optimum is init-invariant (`glm.py:244-256` reaches the
+/// same minimizer regardless of the seed).
+///
+/// Oracle (live sklearn 1.5.2 — same as `glm_poisson_alpha_half_parity`, the
+/// warm/cold fit is solver- and seed-invariant):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_.tolist()), repr(m.intercept_))"
+/// # -> [0.38388476754733647, 0.2024000617918683] -0.519356533563308
+/// ```
+#[test]
+fn glm_warm_start_observable_contract() {
+    // Live sklearn 1.5.2 oracle (PoissonRegressor(alpha=0.5), solver/seed-invariant).
+    const SK_COEF: [f64; 2] = [0.383_884_767_547_336_47, 0.202_400_061_791_868_3];
+    const SK_INTERCEPT: f64 = -0.519_356_533_563_308;
+
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+    // COLD fit (default warm_start=false).
+    let cold = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("cold fit");
+    let coef_cold = cold.coefficients().clone();
+    let int_cold = cold.intercept();
+
+    // Cold fit matches the oracle (anchors the contract).
+    assert!(
+        (coef_cold[0] - SK_COEF[0]).abs() < 1e-4
+            && (coef_cold[1] - SK_COEF[1]).abs() < 1e-4
+            && (int_cold - SK_INTERCEPT).abs() < 1e-4,
+        "cold fit must match the live sklearn oracle: oracle coef {SK_COEF:?} \
+         int {SK_INTERCEPT}; ferrolearn coef {coef_cold:?} int {int_cold}"
+    );
+
+    // WARM fit seeded from a PERTURBED init (cold coef ± 0.1, intercept + 0.1) —
+    // a reasonable but non-optimal starting point. The convex optimum is
+    // init-invariant, so the converged attributes must equal the cold fit.
+    let perturbed_coef = Array1::from(vec![coef_cold[0] + 0.1, coef_cold[1] - 0.1]);
+    let warm = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .with_warm_start(true)
+        .with_coef_init(perturbed_coef, int_cold + 0.1)
+        .fit(&x, &y)
+        .expect("warm fit");
+    let coef_warm = warm.coefficients();
+    let int_warm = warm.intercept();
+
+    // warm == cold (convex optimum is init-invariant).
+    assert!(
+        (coef_warm[0] - coef_cold[0]).abs() < 1e-6
+            && (coef_warm[1] - coef_cold[1]).abs() < 1e-6
+            && (int_warm - int_cold).abs() < 1e-6,
+        "warm_start observable contract: the convex optimum is init-invariant, so \
+         the warm fit must equal the cold fit; cold coef {coef_cold:?} int {int_cold}, \
+         warm coef {coef_warm:?} int {int_warm}"
+    );
+
+    // warm == oracle (so warm_start preserves the sklearn-observable contract).
+    assert!(
+        (coef_warm[0] - SK_COEF[0]).abs() < 1e-4
+            && (coef_warm[1] - SK_COEF[1]).abs() < 1e-4
+            && (int_warm - SK_INTERCEPT).abs() < 1e-4,
+        "warm_start observable contract: the warm fit must match the live sklearn \
+         oracle coef {SK_COEF:?} int {SK_INTERCEPT}; ferrolearn warm coef {coef_warm:?} \
+         int {int_warm}"
+    );
+}
+
+/// REQ-11 init genuinely used (not a no-op): seeding `with_coef_init` with the
+/// EXACT converged solution and a tiny `max_iter` already lands at/near the
+/// optimum, whereas a COLD fit with the same tiny `max_iter` has NOT converged.
+/// This is a behavioral assertion that the init changes the trajectory.
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:243-254` — the warm-start
+/// `coef` is handed straight to the optimizer as its starting point. With the
+/// optimum as the seed and one step allowed, the optimizer is already converged.
+#[test]
+fn glm_warm_start_init_used() {
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+
+    // Reference: the converged solution (large max_iter, tight tol).
+    let solved = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("converged fit");
+    let coef_star = solved.coefficients().clone();
+    let int_star = solved.intercept();
+
+    // COLD fit with a TINY max_iter (1 IRLS step) — starts at coef=0, so it is
+    // NOT yet at the optimum.
+    let cold_tiny = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1)
+        .with_tol(1e-12)
+        .fit(&x, &y)
+        .expect("cold tiny fit");
+    let cold_err = (cold_tiny.coefficients()[0] - coef_star[0]).abs()
+        + (cold_tiny.coefficients()[1] - coef_star[1]).abs()
+        + (cold_tiny.intercept() - int_star).abs();
+
+    // WARM fit with the SAME tiny max_iter but seeded at the EXACT optimum — it
+    // should already be at/near the solution (the init is genuinely consumed).
+    let warm_tiny = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1)
+        .with_tol(1e-12)
+        .with_warm_start(true)
+        .with_coef_init(coef_star.clone(), int_star)
+        .fit(&x, &y)
+        .expect("warm tiny fit");
+    let warm_err = (warm_tiny.coefficients()[0] - coef_star[0]).abs()
+        + (warm_tiny.coefficients()[1] - coef_star[1]).abs()
+        + (warm_tiny.intercept() - int_star).abs();
+
+    // The init is genuinely used: seeded at the optimum with 1 step, the warm fit
+    // is far closer to the solution than the cold (coef=0) fit with 1 step. If the
+    // init were a no-op (ignored), warm_err would equal cold_err.
+    assert!(
+        warm_err < 1e-6,
+        "warm_start init used: seeded at the exact optimum with max_iter=1, the \
+         warm fit must already be at the solution (||warm - star|| = {warm_err})"
+    );
+    assert!(
+        cold_err > 1e-2,
+        "control: a cold (coef=0) fit with max_iter=1 must NOT be converged \
+         (||cold - star|| = {cold_err}); else the test cannot distinguish init-used"
+    );
+    assert!(
+        warm_err < cold_err,
+        "warm_start changes the trajectory: warm (seeded at optimum) must be closer \
+         to the solution than cold (seeded at 0); warm_err {warm_err}, cold_err {cold_err}"
+    );
+}

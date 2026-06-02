@@ -47,6 +47,7 @@
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
 //! | REQ-10 (solver param: lbfgs/newton-cholesky) | SHIPPED | #556. **R-DEV-2 (API parity):** `pub enum Solver { Lbfgs, NewtonCholesky }` + a `pub solver: Solver` field (default `Solver::Lbfgs`) on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`, plus `#[must_use] fn with_solver`, mirroring sklearn's validated `solver` constructor parameter `StrOptions({"lbfgs","newton-cholesky"})` default `"lbfgs"` (`glm.py:140-145, :155`); the two-variant enum mirrors the `StrOptions` constraint. **R-DEV-7 (implementation differs, observable contract preserved):** ferrolearn fits all GLMs via IRLS/Fisher-scoring (`fn fit_glm_irls`) regardless of `solver` — the penalized GLM objective is convex, so IRLS reaches the SAME minimizer as both sklearn solvers (verified live: `PoissonRegressor(alpha=0.5)` gives coef `[0.38388523,0.20239975]`, int `-0.51935749` for `lbfgs` AND `newton-cholesky`, identical to ~1e-9). Consumer: each estimator's `Fit::fit` (crate-root export) — the `solver` field is part of the boundary estimator ABI. Oracle test `glm_solver_param_invariant` (fits with `Solver::Lbfgs` and `Solver::NewtonCholesky`, both coef/intercept match the solver-invariant live sklearn 1.5.2 oracle to 1e-4) green in `tests/divergence_glm_fit.rs`; the 19 pre-existing glm divergence tests stay green. |
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
+//! | REQ-11 (warm_start) | SHIPPED | #557. **R-DEV-2 (API parity):** `pub warm_start: bool` (default `false`) + `#[must_use] fn with_warm_start` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`, mirroring sklearn's `warm_start` parameter (`"boolean"`, default `False`, `glm.py:146, :158, :576, :708, :874`). **R-DEV-7 (Rust analog — immutable-estimator design, observable contract preserved):** sklearn's `warm_start=True` reuses the stateful `self.coef_`/`self.intercept_` mutated across `fit` calls as the optimizer's start (`glm.py:243-254`); ferrolearn's estimators are immutable (`fit(&self, ...)` never mutates `self`, no `self.coef_` to reuse), so the warm-start point is supplied EXPLICITLY via `pub coef_init: Option<(Array1<F>, F)>` + `#[must_use] fn with_coef_init(coef, intercept)`. `fn fit_glm_irls` seeds the IRLS coefficient vector (and derived `eta`/`mu`) from `coef_init` when `warm_start && coef_init.is_some()` (validating `feature_coef.len() == n_features`, else `ShapeMismatch`); otherwise the cold start (`coef = 0`) is byte-for-byte preserved. The penalized GLM objective is convex, so the converged `coef_`/`intercept_` are warm-start-INVARIANT — the init only changes the starting point (and iteration count), never the optimum — so the warm fit matches the cold fit AND the sklearn oracle (`glm.py:244-256`). Consumer: each estimator's `Fit::fit` (crate-root export) — the `warm_start`/`coef_init` fields are part of the boundary estimator ABI. Oracle tests `glm_warm_start_observable_contract` (warm fit from a perturbed init == cold fit == live sklearn 1.5.2 oracle `coef_=[0.38388477,0.20240006]`, `intercept_=-0.51935653` to 1e-6/1e-4) and `glm_warm_start_init_used` (seeding the exact optimum with `max_iter=1` lands at the solution, a cold `max_iter=1` fit does not — proves the init is genuinely used) green in `tests/divergence_glm_fit.rs`; the 20 pre-existing glm divergence tests stay green (all cold-start, byte-identical). |
 //! | REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`, where the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance objective normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector, so the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` (coef `[0.35738828,0.19717462]`, int `-0.43719203`) and `glm_gamma_sample_weight` (coef `[0.23049054,0.11350454]`, int `0.41955357`) green in `tests/divergence_glm_fit.rs`; the 8 pre-existing unweighted oracle tests stay green. |
 //! | REQ-14 (n_iter_ + per-family y-domain validation) | SHIPPED | #560. Per-family y-domain guard in `fn fit_glm_irls`: `YDomain::for_power(family.domain_power())` then `y.iter().any(|&yi| !y_domain.contains(yi))` → `FerroError::InvalidParameter{name:"y", reason:"Some value(s) of y are out of the valid range of the loss '<loss>'."}`, mirroring sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` (`glm.py:221-225`). The valid range is keyed on the family's Tweedie `power` (NOT the link — verified vs the live oracle that `HalfTweedieLoss(p).interval_y_true == HalfTweedieLossIdentity(p).interval_y_true`): `power <= 0` unconstrained (Normal), `0 < power < 2` → `y >= 0` (Poisson `power=1`), `power >= 2` → `y > 0` (Gamma `power=2`, open at 0). `FittedGLMRegressor` gains `n_iter: usize` (the IRLS iteration count captured in the convergence loop) with `#[must_use] pub fn n_iter(&self) -> usize` — sklearn's `n_iter_` is the lbfgs count (`glm.py:110-114, :283`); ferrolearn's is the IRLS count (solvers differ, both report iterations-to-convergence). Consumer: `FittedGLMRegressor::n_iter` accessor on the crate-root-exported fitted type. Oracle tests `glm_gamma_rejects_zero_y` (Gamma rejects `y==0`, accepts `y>0`), `glm_tweedie_power2_rejects_zero_y` (`power=2.0` rejects `y==0`; `power=1.5` accepts it), `glm_poisson_rejects_negative_y` (rejects `y<0`, accepts `y==0`), `glm_n_iter_exposed` (`1 <= n_iter() <= max_iter`) green in `tests/divergence_glm_fit.rs`; the 10 pre-existing glm divergence tests stay green (all their `y` are in-domain). |
 
@@ -470,6 +471,30 @@ pub struct GLMRegressor<F> {
     /// because IRLS reaches the same convex optimum as both `lbfgs` and
     /// `newton-cholesky`. See [`Solver`].
     pub solver: Solver,
+    /// Whether to warm-start the optimizer from an explicit initial point,
+    /// mirroring sklearn's `warm_start` constructor parameter (default `false`,
+    /// `glm.py:146, :158, :244`).
+    ///
+    /// **R-DEV-2 (API parity):** the name and default match sklearn. **R-DEV-7
+    /// (Rust analog):** sklearn reuses the stateful `self.coef_` / `self.intercept_`
+    /// across `fit` calls (`glm.py:244-250`); ferrolearn's estimators are immutable
+    /// (`fit(&self, ...)` never mutates `self`), so the warm-start point is supplied
+    /// EXPLICITLY via [`GLMRegressor::with_coef_init`]. When `warm_start == true`
+    /// and an init is set, the IRLS seeds from it; otherwise it cold-starts at
+    /// `coef = 0`. Because the GLM objective is convex, the converged
+    /// `coef_` / `intercept_` are warm-start-invariant — identical to the cold
+    /// fit and to sklearn regardless of the init.
+    pub warm_start: bool,
+    /// Explicit warm-start initial point `(feature_coefficients, intercept)` —
+    /// the ferrolearn analog of sklearn reusing `self.coef_` / `self.intercept_`
+    /// across `fit` calls (R-DEV-7, `glm.py:244-250`).
+    ///
+    /// Only consulted when [`GLMRegressor::warm_start`] is `true`. The
+    /// feature-coefficient vector length must equal the number of features in `X`
+    /// (else [`FerroError::ShapeMismatch`] at fit time). Set via
+    /// [`GLMRegressor::with_coef_init`]; typically a previous fit's
+    /// `coefficients()` / `intercept()`.
+    pub coef_init: Option<(Array1<F>, F)>,
 }
 
 impl<F: Float + FromPrimitive> GLMRegressor<F> {
@@ -486,6 +511,8 @@ impl<F: Float + FromPrimitive> GLMRegressor<F> {
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
             solver: Solver::Lbfgs,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -529,6 +556,35 @@ impl<F: Float + FromPrimitive> GLMRegressor<F> {
         self.solver = solver;
         self
     }
+
+    /// Enable or disable warm-starting, mirroring sklearn's `warm_start`
+    /// parameter (default `false`, `glm.py:146, :158`).
+    ///
+    /// **R-DEV-2 / R-DEV-7.** sklearn reuses the stateful `self.coef_` /
+    /// `self.intercept_` across `fit` calls (`glm.py:244-250`); ferrolearn's
+    /// immutable estimators take the warm-start point EXPLICITLY via
+    /// [`GLMRegressor::with_coef_init`]. When `warm_start` is `true` and an init
+    /// is set, the IRLS seeds from it; otherwise it cold-starts at `coef = 0`. The
+    /// convex GLM objective makes the converged `coef_` / `intercept_`
+    /// warm-start-invariant.
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Set the explicit warm-start initial point `(feature_coefficients,
+    /// intercept)` — the ferrolearn analog of sklearn reusing `self.coef_` /
+    /// `self.intercept_` (R-DEV-7, `glm.py:244-250`).
+    ///
+    /// Only consulted when [`GLMRegressor::warm_start`] is `true`. `coef`'s length
+    /// must equal the number of features in `X` (validated at fit time). Pass a
+    /// previous fit's `coefficients()` / `intercept()` to resume from it.
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>, intercept: F) -> Self {
+        self.coef_init = Some((coef, intercept));
+        self
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> GLMRegressor<F> {
@@ -564,6 +620,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> GLMRegres
             self.max_iter,
             self.tol,
             self.fit_intercept,
+            self.warm_start,
+            self.coef_init.as_ref(),
         )
     }
 }
@@ -757,6 +815,15 @@ pub struct PoissonRegressor<F> {
     /// is accepted for sklearn API parity (R-DEV-2) and the observable
     /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
     pub solver: Solver,
+    /// Whether to warm-start from an explicit initial point, mirroring sklearn's
+    /// `warm_start` parameter (default `false`, `glm.py:146, :576`). See
+    /// [`GLMRegressor::warm_start`] for the R-DEV-2 / R-DEV-7 rationale.
+    pub warm_start: bool,
+    /// Explicit warm-start initial point `(feature_coefficients, intercept)` — the
+    /// ferrolearn analog of sklearn reusing `self.coef_` / `self.intercept_`
+    /// (R-DEV-7, `glm.py:244-250`). Consulted only when `warm_start` is `true`. Set
+    /// via [`PoissonRegressor::with_coef_init`].
+    pub coef_init: Option<(Array1<F>, F)>,
 }
 
 impl<F: Float + FromPrimitive> PoissonRegressor<F> {
@@ -772,6 +839,8 @@ impl<F: Float + FromPrimitive> PoissonRegressor<F> {
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
             solver: Solver::Lbfgs,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -812,6 +881,27 @@ impl<F: Float + FromPrimitive> PoissonRegressor<F> {
     #[must_use]
     pub fn with_solver(mut self, solver: Solver) -> Self {
         self.solver = solver;
+        self
+    }
+
+    /// Enable or disable warm-starting, mirroring sklearn's `warm_start`
+    /// parameter (default `false`, `glm.py:146, :576`). See
+    /// [`GLMRegressor::with_warm_start`] for the R-DEV-2 / R-DEV-7 rationale; the
+    /// warm-start point is supplied explicitly via
+    /// [`PoissonRegressor::with_coef_init`].
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Set the explicit warm-start initial point `(feature_coefficients,
+    /// intercept)` — the ferrolearn analog of sklearn reusing `self.coef_` /
+    /// `self.intercept_` (R-DEV-7, `glm.py:244-250`). Only consulted when
+    /// `warm_start` is `true`; `coef`'s length must equal the number of features.
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>, intercept: F) -> Self {
+        self.coef_init = Some((coef, intercept));
         self
     }
 }
@@ -849,6 +939,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> PoissonRe
             self.max_iter,
             self.tol,
             self.fit_intercept,
+            self.warm_start,
+            self.coef_init.as_ref(),
         )
     }
 }
@@ -877,6 +969,15 @@ pub struct GammaRegressor<F> {
     /// is accepted for sklearn API parity (R-DEV-2) and the observable
     /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
     pub solver: Solver,
+    /// Whether to warm-start from an explicit initial point, mirroring sklearn's
+    /// `warm_start` parameter (default `false`, `glm.py:146, :708`). See
+    /// [`GLMRegressor::warm_start`] for the R-DEV-2 / R-DEV-7 rationale.
+    pub warm_start: bool,
+    /// Explicit warm-start initial point `(feature_coefficients, intercept)` — the
+    /// ferrolearn analog of sklearn reusing `self.coef_` / `self.intercept_`
+    /// (R-DEV-7, `glm.py:244-250`). Consulted only when `warm_start` is `true`. Set
+    /// via [`GammaRegressor::with_coef_init`].
+    pub coef_init: Option<(Array1<F>, F)>,
 }
 
 impl<F: Float + FromPrimitive> GammaRegressor<F> {
@@ -892,6 +993,8 @@ impl<F: Float + FromPrimitive> GammaRegressor<F> {
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
             solver: Solver::Lbfgs,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -934,6 +1037,27 @@ impl<F: Float + FromPrimitive> GammaRegressor<F> {
         self.solver = solver;
         self
     }
+
+    /// Enable or disable warm-starting, mirroring sklearn's `warm_start`
+    /// parameter (default `false`, `glm.py:146, :708`). See
+    /// [`GLMRegressor::with_warm_start`] for the R-DEV-2 / R-DEV-7 rationale; the
+    /// warm-start point is supplied explicitly via
+    /// [`GammaRegressor::with_coef_init`].
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Set the explicit warm-start initial point `(feature_coefficients,
+    /// intercept)` — the ferrolearn analog of sklearn reusing `self.coef_` /
+    /// `self.intercept_` (R-DEV-7, `glm.py:244-250`). Only consulted when
+    /// `warm_start` is `true`; `coef`'s length must equal the number of features.
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>, intercept: F) -> Self {
+        self.coef_init = Some((coef, intercept));
+        self
+    }
 }
 
 impl<F: Float + FromPrimitive> Default for GammaRegressor<F> {
@@ -969,6 +1093,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> GammaRegr
             self.max_iter,
             self.tol,
             self.fit_intercept,
+            self.warm_start,
+            self.coef_init.as_ref(),
         )
     }
 }
@@ -1006,6 +1132,15 @@ pub struct TweedieRegressor<F> {
     /// is accepted for sklearn API parity (R-DEV-2) and the observable
     /// `coef_` / `intercept_` match sklearn for either value. See [`Solver`].
     pub solver: Solver,
+    /// Whether to warm-start from an explicit initial point, mirroring sklearn's
+    /// `warm_start` parameter (default `false`, `glm.py:146, :874`). See
+    /// [`GLMRegressor::warm_start`] for the R-DEV-2 / R-DEV-7 rationale.
+    pub warm_start: bool,
+    /// Explicit warm-start initial point `(feature_coefficients, intercept)` — the
+    /// ferrolearn analog of sklearn reusing `self.coef_` / `self.intercept_`
+    /// (R-DEV-7, `glm.py:244-250`). Consulted only when `warm_start` is `true`. Set
+    /// via [`TweedieRegressor::with_coef_init`].
+    pub coef_init: Option<(Array1<F>, F)>,
 }
 
 impl<F: Float + FromPrimitive> TweedieRegressor<F> {
@@ -1026,6 +1161,8 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             fit_intercept: true,
             solver: Solver::Lbfgs,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -1084,6 +1221,27 @@ impl<F: Float + FromPrimitive> TweedieRegressor<F> {
         self.solver = solver;
         self
     }
+
+    /// Enable or disable warm-starting, mirroring sklearn's `warm_start`
+    /// parameter (default `false`, `glm.py:146, :874`). See
+    /// [`GLMRegressor::with_warm_start`] for the R-DEV-2 / R-DEV-7 rationale; the
+    /// warm-start point is supplied explicitly via
+    /// [`TweedieRegressor::with_coef_init`].
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Set the explicit warm-start initial point `(feature_coefficients,
+    /// intercept)` — the ferrolearn analog of sklearn reusing `self.coef_` /
+    /// `self.intercept_` (R-DEV-7, `glm.py:244-250`). Only consulted when
+    /// `warm_start` is `true`; `coef`'s length must equal the number of features.
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>, intercept: F) -> Self {
+        self.coef_init = Some((coef, intercept));
+        self
+    }
 }
 
 impl<F: Float + FromPrimitive> Default for TweedieRegressor<F> {
@@ -1121,6 +1279,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> TweedieRe
             self.max_iter,
             self.tol,
             self.fit_intercept,
+            self.warm_start,
+            self.coef_init.as_ref(),
         )
     }
 }
@@ -1318,9 +1478,29 @@ fn weighted_ridge_solve<F: Float + FromPrimitive>(
 /// byte-identical to the previous log-only code. For [`Link::Identity`] with
 /// `V(mu) = mu^0 = 1` (Normal/`power = 0`), `w = 1`, `z = y`, so IRLS reduces to
 /// ordinary least squares.
+///
+/// # Warm start (R-DEV-2 + R-DEV-7)
+///
+/// sklearn's `warm_start=True` reuses the previous fit's `self.coef_` /
+/// `self.intercept_` as the optimizer's starting point (`glm.py:243-254`).
+/// ferrolearn's estimators are immutable (`fit(&self, ...)` returns a fresh
+/// fitted object and never mutates `self`), so there is no `self.coef_` to reuse
+/// across calls; the Rust-idiomatic analog (R-DEV-7) is an EXPLICIT initial point
+/// supplied via `coef_init = Some((feature_coef, intercept))`. When
+/// `warm_start == true` and `coef_init` is provided, the IRLS coefficient vector
+/// (and the derived `eta` / `mu`) are seeded from `coef_init` instead of the
+/// cold start (`coef = 0`, `eta = link(y)`). The feature-coefficient length must
+/// equal `n_features` (else [`FerroError::ShapeMismatch`]). Otherwise the cold
+/// start is kept byte-for-byte.
+///
+/// Because the penalized GLM objective is convex, the converged `coef_` /
+/// `intercept_` are warm-start-INVARIANT: the init only changes the starting
+/// point (and so the iteration count), never the optimum — so the warm-started
+/// fit matches both the cold-start fit and the sklearn oracle (`glm.py:244-256`
+/// reaches the same minimizer regardless of the seed).
 #[allow(
     clippy::too_many_arguments,
-    reason = "shared IRLS core threads the link \
+    reason = "shared IRLS core threads the link and the warm-start init \
     alongside the family/penalty/convergence parameters; splitting into a config \
     struct would obscure the 1:1 mapping to sklearn's fit signature"
 )]
@@ -1334,6 +1514,8 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
     max_iter: usize,
     tol: F,
     fit_intercept: bool,
+    warm_start: bool,
+    coef_init: Option<&(Array1<F>, F)>,
 ) -> Result<FittedGLMRegressor<F>, FerroError> {
     let (n_samples, n_features_orig) = x.dim();
 
@@ -1447,7 +1629,70 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         Link::Log => y_safe.mapv(|v| v.ln()),
         Link::Identity => y_safe.clone(),
     };
+
+    // Coefficient initialization.
+    //
+    // COLD START (default, `warm_start == false` or no `coef_init`): `coef = 0`,
+    // with `eta`/`mu` seeded from `y` above — byte-for-byte the previous,
+    // oracle-matching path.
+    //
+    // WARM START (R-DEV-7 analog of sklearn's `warm_start=True`,
+    // `glm.py:243-254`): seed the IRLS coefficient vector from the explicit
+    // `coef_init = (feature_coef, intercept)` instead of zero, then recompute
+    // `eta = X_design @ coef` and `mu = link.inverse(eta)` so the first IRLS
+    // weights/working-response are formed at the supplied point (sklearn likewise
+    // hands `coef` straight to the optimizer). The objective is convex, so this
+    // changes only the starting point (and the iteration count), never the
+    // converged optimum.
     let mut coef = Array1::<F>::zeros(n_cols);
+    if warm_start && let Some((feature_coef, intercept_init)) = coef_init {
+        if feature_coef.len() != n_features_orig {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_features_orig],
+                actual: vec![feature_coef.len()],
+                context: "coef_init feature-coefficient length must match \
+                          number of features in X"
+                    .into(),
+            });
+        }
+        // Place the supplied coefficients into the (optionally
+        // intercept-augmented) design layout: column 0 is the intercept when
+        // `fit_intercept`, features follow. When `fit_intercept == false` the
+        // supplied intercept is ignored (the model has no intercept term),
+        // matching sklearn's `coef = self.coef_` (no intercept) branch
+        // (`glm.py:248-249`).
+        if fit_intercept {
+            coef[0] = *intercept_init;
+            for (j, &cj) in feature_coef.iter().enumerate() {
+                coef[j + 1] = cj;
+            }
+        } else {
+            for (j, &cj) in feature_coef.iter().enumerate() {
+                coef[j] = cj;
+            }
+        }
+        // Recompute eta/mu at the warm-start point so the first IRLS step is
+        // formed there (link.inverse with the same clamps as the loop body).
+        eta = x_design.dot(&coef);
+        match link {
+            Link::Log => {
+                let hi = F::from(20.0).unwrap_or_else(F::max_value);
+                let lo = F::zero() - hi;
+                let mmu = F::from(1e-10).unwrap_or_else(F::epsilon);
+                let xmu = F::from(1e10).unwrap_or_else(F::max_value);
+                for i in 0..n_samples {
+                    let eta_i = eta[i].max(lo).min(hi);
+                    eta[i] = eta_i;
+                    mu[i] = link.inverse(eta_i).max(mmu).min(xmu);
+                }
+            }
+            Link::Identity => {
+                for i in 0..n_samples {
+                    mu[i] = link.inverse(eta[i]);
+                }
+            }
+        }
+    }
 
     let min_mu = F::from(1e-10).unwrap_or_else(F::epsilon);
     let max_mu = F::from(1e10).unwrap_or_else(F::max_value);
