@@ -255,12 +255,18 @@ fn linear_svc_decision_function() {
 
     let df = fitted.decision_function(&x).unwrap();
 
-    // Per-sample value parity (ferrolearn's binary column 0 vs sklearn's 1-D
-    // (8,) decision values). FAILS because the values come from the wrong
-    // (C/n) optimum. The (8,1) vs (8,) shape divergence is documented above and
-    // tracked separately under #619.
+    // Binary decision_function is now 1-D `(8,)` (sklearn ravels the single
+    // column, `linear_model/_base.py:365`). `as_binary()` returns the raveled
+    // `Array1`; a multiclass fit would return `None` here.
+    let binary = df
+        .as_binary()
+        .expect("binary decision_function is 1-D (n,)");
+    assert_eq!(binary.len(), 8, "binary decision_function shape is (8,)");
+
+    // Per-sample value parity (ferrolearn's 1-D (8,) decision vs sklearn's 1-D
+    // (8,) decision values).
     for (i, &sk) in SK_DF.iter().enumerate() {
-        let fl = df[[i, 0]];
+        let fl = binary[i];
         assert!(
             (fl - sk).abs() < 1e-2,
             "decision_function[{i}]: sklearn (liblinear, 1-D (8,)) {sk}, \

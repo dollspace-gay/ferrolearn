@@ -356,8 +356,12 @@ fn api_proof_linear_svc() {
             .fit(&x, &y)
             .unwrap();
         let _ = f.predict(&x).unwrap();
+        // Binary LinearSVC.decision_function is 1-D (n,) (sklearn ravels the
+        // single column, `linear_model/_base.py:365`); the value is the
+        // raveled `DecisionScores::Binary`.
         let dec = f.decision_function(&x).unwrap();
-        assert_eq!(dec.nrows(), 10);
+        assert_eq!(dec.n_samples(), 10);
+        assert!(dec.as_binary().is_some());
         let _ = f.score(&x, &y).unwrap();
     }
 }
