@@ -60,7 +60,7 @@
 //! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) tracks `best_loss` (running min, init `+inf`) and increments `no_improve_count` when `tol_active && sumloss > best_loss - tol*n_samples`, resetting otherwise; breaks once `no_improve_count >= hyper.n_iter_no_change` (non-adaptive), exactly mirroring `_sgd_fast.pyx.tp:688-707`. `sumloss` is now the SUM of per-sample losses over the epoch (the `/= n_samples` mean division is removed, `_sgd_fast.pyx.tp:597`); `tol_active = hyper.tol > -inf` encodes sklearn's `tol=None -> -INFINITY` disable (`:690`). The per-sample gradient is clipped to `[-1e12, 1e12]` via `fn max_dloss` before the update (`_sgd_fast.pyx.tp:546,613-620`). `n_iter_no_change` is now a settable `pub` field (default 5) with `fn with_n_iter_no_change` on both estimators, threaded through `SGDHyper`/`clf_hyper`/`reg_hyper` (`_stochastic_gradient.py` `n_iter_no_change=5`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_convergence_n_iter_no_change` (live oracle coef `[0.8037686404055491, 0.16059017315681692]` intercept `0.12903834217696583`, n_iter_ 49). Closes #530. |
 //! | REQ-11 (fit_intercept) | SHIPPED | `pub fit_intercept: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_fit_intercept` builders (default `true`, sklearn `_stochastic_gradient.py` `fit_intercept=True`, constraint `["boolean"]` at `:86`), threaded through `SGDHyper.fit_intercept` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the intercept update: `if hyper.fit_intercept { *intercept = *intercept - eta * grad; }`, mirroring `if fit_intercept == 1: intercept_update = update; ... intercept += intercept_update * intercept_decay` (`_sgd_fast.pyx.tp:639-644`, `intercept_decay=1` on the standard path). When `false` the intercept is never modified and stays at its init value `0` (`b = F::zero()` before training in `fn fit_ova`/regressor `Fit::fit`), so `coef_` matches sklearn and `intercept_` is exactly `0`. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_fit_intercept_false` (live oracle coef `[0.5326796739094939, 0.44573604649819804]`, intercept exactly `0.0`). Closes #531. |
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
-//! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
+//! | REQ-13 (early_stopping + validation_fraction + n_iter_no_change-on-val-score) | SHIPPED (for the verifiable logic; the validation-split SELECTION is numpy-RNG-coupled so full fitted-coef parity is NOT oracle-verifiable — same barrier as `shuffle`) | `pub early_stopping: bool` (default `false`) + `pub validation_fraction: F` (default `0.1` via `cst`) fields on `SGDClassifier`/`SGDRegressor` + `fn with_early_stopping`/`with_validation_fraction` builders (`_stochastic_gradient.py:114-115`, constraints `["boolean"]`/`Interval(Real, 0, 1, closed="neither")` at `:524-525`), threaded through `SGDHyper.early_stopping`/`validation_fraction` (`fn clf_hyper`/`reg_hyper`; one-class hardwires `false`/`0.1`). `fn validate_validation_fraction` rejects `validation_fraction` outside the OPEN interval `(0, 1)` (`FerroError::InvalidParameter`, called from `fn validate_clf_params`/`validate_reg_params`). When `early_stopping`, the `Fit` path (`fn fit_ova` for the classifier, `SGDRegressor::fit_with_sample_weight` for the regressor) splits the data via `fn make_validation_split` BEFORE the kernel: a seeded (`StdRng::seed_from_u64(random_state.unwrap_or(0))`) hold-out of `fn validation_count` (`ceil(validation_fraction*n)`, clamped to `[1,n-1]`) samples — STRATIFIED per class for the classifier (mirrors `StratifiedShuffleSplit`, `:280-287`; the multiclass split is computed ONCE on the full `y` and SHARED across OvA subproblems, `:796`), plain `ShuffleSplit` for the regressor — returning `Err` on an empty train/val subset (`:295-307`). The kernel trains on the TRAIN subset only (sklearn does NOT refit on full data) and, at epoch-end, when early stopping, scores the CURRENT (weights,intercept) on the held-out val set via `fn convergence_tail_score` with `best_score` init `-inf`: `if tol_active && score < best_score + tol { no_improve++ } else { 0 }; if score > best_score { best_score = score }` then the SHARED `no_improve >= n_iter_no_change` adaptive-÷5/break tail (`_sgd_fast.pyx.tp:678-707`). The val score is `fn r2_score` for the regressor (`1 - SS_res/SS_tot`, `SS_tot==0` -> `1.0`/`0.0` edge) and `fn binary_accuracy` for each classifier subproblem (relabeled `{-1,+1}` target, `decision>=0 -> +1` tie convention), mirroring `_ValidationScoreCallback.__call__` = `est.score(X_val,y_val)` (R²/accuracy, `_stochastic_gradient.py:79`, `fit_binary`'s `classes=[-1,1]`+`y_i` callback at `:451-454`). `early_stopping=false` leaves the training-loss `fn convergence_tail` path byte-identical (the 25 prior divergence tests stay green). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `impl PipelineEstimator`. VERIFIED DETERMINISTICALLY: `fn r2_score`/`binary_accuracy` against the live `sklearn.metrics.r2_score`/`accuracy_score` oracle in `mod tests` (`test_validation_r2_matches_sklearn` -> `0.8887362637362637`, `test_validation_r2_constant_y_edge_cases` -> `1.0`/`0.0`, `test_validation_binary_accuracy_matches_sklearn` -> `0.75`); the `(0,1)` constraint (divergence `sgd_validation_fraction_invalid`); the behavioral early-stop (divergence `sgd_early_stopping_stops_early` — `early_stopping=true` yields a finite model DIFFERENT from `early_stopping=false`; `sgd_early_stopping_classifier_valid`). NOT VERIFIABLE (honest): the validation-subset SELECTION uses numpy Mersenne-Twister (`ShuffleSplit`/`StratifiedShuffleSplit`) whereas ferrolearn uses `StdRng`, so the exact held-out indices — and hence the full fitted `coef_` under early stopping — are NOT cross-impl reproducible (`_stochastic_gradient.py:284-287`, the SAME PRNG barrier as `shuffle`, `_sgd_fast.pyx.tp:579-580`). `_sgd_fast.pyx.tp:678-689` / `_stochastic_gradient.py:63-79,257-310,524-525`. Closes #533. NOTE: early stopping on `partial_fit` is OFF (sklearn raises `early_stopping should be False with partial_fit`, `:147-148`); the kernel receives `val_set=None` there. |
 //! | REQ-14 (average / ASGD) | SHIPPED | `pub average: usize` field on `SGDClassifier`/`SGDRegressor` (default `0` = OFF) + `fn with_average` builders (sklearn `average=True`≡`1`, `average=N`≡`N`, `average=False`≡`0`; `_stochastic_gradient.py:1256,2068`), threaded through `SGDHyper.average` + `fn clf_hyper`/`reg_hyper` (one-class path hardwires `0`). `fn train_binary_sgd`/`train_regressor_sgd` allocate `average_coef`/`average_intercept` before the epoch loop and, AFTER the weight/intercept update + L1 truncation, when `hyper.average > 0 && t >= hyper.average`, accumulate the DIRECT running mean `avg += (current - avg) / (t - average + 1)` — the plain-array equivalent of sklearn's lazy `w.add_average(..., t - average + 1)` / `average_intercept += (intercept - average_intercept) / (t - average + 1)` (`_sgd_fast.pyx.tp:646-654`); the accumulator is passive (does NOT alter the live trajectory). FINALIZE: at fit-end, `if hyper.average > 0 && hyper.average <= t { weights = average_coef; intercept = average_intercept; }`, mirroring `if self.average > 0: if self.average <= self.t_ - 1: coef_ = average_coef` (`_stochastic_gradient.py:834-836`); `t` (= `n_iter_ * n_samples`, `initial_t=0`) equals sklearn's `self.t_ - 1` (sklearn inits `self.t_ = 1`). `average=0` skips both blocks, leaving the trajectory byte-identical (the 22 prior divergence tests stay green). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_average_from_start` (`SGDRegressor(average=True)` live oracle coef `[0.42614902504529534, 0.3665230497098742]` intercept `0.14648807826338486`), `sgd_average_threshold` (`SGDRegressor(average=20)`, begins mid-run, oracle coef `[0.5042444287230554, 0.41888001003992603]` intercept `0.16902090306985734`), `sgd_average_classifier` (`SGDClassifier(average=True)` oracle coef `[0.11902998815794437, 0.060826180676538694]` intercept `-0.10666666666666665`). `_sgd_fast.pyx.tp:646-654` / `_stochastic_gradient.py:834-836`. Closes #534. NOTE: averaging on the `partial_fit` path is OFF (`average` not yet carried into the `partial_fit_ova` hyper, which sets `max_iter=1`) — the full `fit` path (the parity-critical one) is exact; partial_fit ASGD state carry-over is a follow-up. |
 //! | REQ-15 (class_weight + sample_weight) | SHIPPED | `pub enum ClassWeight<F> {None,Balanced,Explicit(Vec<(usize,F)>)}` + `pub class_weight` field on `SGDClassifier` (default `ClassWeight::None`) with `fn with_class_weight`; `fn compute_class_weight` returns the expanded per-class weights (`None->1.0`; `Balanced-> n_samples/(n_classes*count_c)`; `Explicit->1.0 default, override by label`) faithful to `sklearn.utils.compute_class_weight` (`sklearn/utils/class_weight.py:63-81`, `_stochastic_gradient.py:624`). `fn fit_with_sample_weight` on `SGDClassifier` AND `SGDRegressor` validates `sample_weight.len()==n_samples` (else `ShapeMismatch`); `Fit::fit` delegates with `ones(n)` (byte-identical default path — the 17 prior divergence tests stay green). `fn fit_ova` builds the per-subproblem per-sample weight `w_i = class_weight_for_sample(i) * sample_weight[i]` with the sklearn OvA mapping (binary `pos=expanded[1]`/`neg=expanded[0]`, `_stochastic_gradient.py:765-766`; multiclass class k `pos=expanded[k]`/`neg=1.0`, `:816`) and passes `&[F]` into `fn train_binary_sgd`. The kernel scales ONLY the gradient term `g = grad * sample_w[i]` (`update *= class_weight*sample_weight`, `_sgd_fast.pyx.tp:630`): the weight data term `w[j]*shrink - eta*g*x[j]` and the (gated) intercept gradient term `-eta*g` use `g`; the L2 shrink (`:632-635`), L1 truncation (`:656-658`), one-class `-2*eta*alpha` offset (`:642`) and the unweighted `sumloss` (`:597`) are UNSCALED. `fn train_regressor_sgd` mirrors the same scaling (`class_weight=1` for regression). Consumer: `Fit for SGDClassifier`/`SGDRegressor` -> `PipelineEstimator`; `fit_with_sample_weight` consumed by `Fit::fit`. Tests: divergence `sgd_class_weight_balanced` (oracle coef `[0.4806667587635881, 0.4620316761984426]` intercept `-1.2811684177087947`), `sgd_class_weight_explicit` (`{0:1.0,1:3.0}` coef `[0.5705300651778317, 0.5660417632427646]` intercept `-1.7542279278451731`), `sgd_sample_weight` (coef `[0.25648548424261425, 0.7995046753090618]` intercept `-1.221373410658307`), `sgd_class_weight_balanced_multiclass` (class-0 coef `[-0.586000112348521, -0.369263665877338]` + argmax preds), `sgd_regressor_sample_weight` (coef `[0.9425558668838198, 1.3974216923953962]` intercept `0.7259434415390171`). `_sgd_fast.pyx.tp:599-602,630` / `_stochastic_gradient.py:624,765-766,816`. Closes #535. NOTE: `class_weight`/`sample_weight` on the `partial_fit` path are uniform `1.0` (no `class_weight`/`sample_weight` arg on `PartialFit` yet) — tracked under the partial_fit surface, not this REQ. |
 //! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
@@ -562,6 +562,101 @@ fn max_dloss<F: Float>() -> F {
     F::from(1e12_f64).unwrap_or_else(F::max_value)
 }
 
+/// Coefficient of determination `R^2 = 1 - SS_res / SS_tot` of a linear model
+/// `(weights, intercept)` on `(x_val, y_val)`.
+///
+/// Mirrors `sklearn.metrics.r2_score` for the dense single-output, uniformly
+/// weighted case (`RegressorMixin.score` -> `r2_score`, the regressor
+/// `_ValidationScoreCallback.__call__`, `_stochastic_gradient.py:79`):
+/// `SS_res = sum((y - y_pred)^2)`, `SS_tot = sum((y - mean(y))^2)`,
+/// `R^2 = 1 - SS_res/SS_tot`. The degenerate `SS_tot == 0` (constant `y_val`)
+/// case follows sklearn's `_metrics/_regression.py` convention: a perfect
+/// `SS_res == 0` scores `1.0`, otherwise `0.0`
+/// (`r2_score` `nonzero_denominator`/`nonzero_numerator` branch). Returns `0.0`
+/// for an empty validation set (no information).
+#[must_use]
+fn r2_score<F: Float>(
+    weights: &Array1<F>,
+    intercept: F,
+    x_val: &Array2<F>,
+    y_val: &Array1<F>,
+) -> F {
+    let n = y_val.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let n_f = F::from(n).unwrap_or_else(F::one);
+    let mean = y_val.iter().fold(F::zero(), |acc, &v| acc + v) / n_f;
+    let mut ss_res = F::zero();
+    let mut ss_tot = F::zero();
+    let n_features = weights.len();
+    for i in 0..n {
+        let xi = x_val.row(i);
+        let mut pred = intercept;
+        for j in 0..n_features {
+            pred = pred + weights[j] * xi[j];
+        }
+        let res = y_val[i] - pred;
+        ss_res = ss_res + res * res;
+        let dev = y_val[i] - mean;
+        ss_tot = ss_tot + dev * dev;
+    }
+    if ss_tot > F::zero() {
+        F::one() - ss_res / ss_tot
+    } else if ss_res > F::zero() {
+        // constant `y_val` but imperfect prediction -> R^2 = 0 (sklearn).
+        F::zero()
+    } else {
+        // constant `y_val` and perfect prediction -> R^2 = 1 (sklearn).
+        F::one()
+    }
+}
+
+/// Binary classification accuracy of a linear decision on `(x_val, y_val)` where
+/// `y_val` is the relabeled `{-1, +1}` target.
+///
+/// Mirrors the classifier `_ValidationScoreCallback.__call__`
+/// (`_stochastic_gradient.py:79`, `est.score(X_val, y_val)` ->
+/// `ClassifierMixin.score` -> `accuracy_score`) for one One-vs-All binary
+/// subproblem: the callback is built with `classes = np.array([-1, 1])` and the
+/// relabeled binary target `y_i` (`fit_binary`, `:451-454`), so the score is the
+/// fraction of validation samples whose binary decision `sign(w·x + b)` matches
+/// the relabeled label. The decision uses the `>= 0 -> +1` tie convention
+/// matching [`FittedSGDClassifier::predict`] (`scores[i] >= 0 -> classes[1]`).
+/// Returns `0.0` for an empty validation set.
+#[must_use]
+fn binary_accuracy<F: Float>(
+    weights: &Array1<F>,
+    intercept: F,
+    x_val: &Array2<F>,
+    y_val: &Array1<F>,
+) -> F {
+    let n = y_val.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let n_features = weights.len();
+    let mut correct = 0usize;
+    for i in 0..n {
+        let xi = x_val.row(i);
+        let mut decision = intercept;
+        for j in 0..n_features {
+            decision = decision + weights[j] * xi[j];
+        }
+        let pred = if decision >= F::zero() {
+            F::one()
+        } else {
+            -F::one()
+        };
+        // `y_val[i]` is the relabeled `{-1, +1}` target; a positive product
+        // means `pred` and the label agree.
+        if pred * y_val[i] > F::zero() {
+            correct += 1;
+        }
+    }
+    F::from(correct).unwrap_or_else(F::zero) / F::from(n).unwrap_or_else(F::one)
+}
+
 /// Shared SGD epoch-end convergence / adaptive-eta tail.
 ///
 /// Mirrors `_sgd_fast.pyx.tp:688-707` exactly. `epoch_sumloss` is the SUM of
@@ -603,6 +698,59 @@ fn convergence_tail<F: Float>(
     // `:698-707`: convergence break OR adaptive eta/=5.
     if *no_improve_count >= n_iter_no_change {
         // `:699`: `if learning_rate == ADAPTIVE and eta > 1e-6`.
+        let eta_floor = F::from(1e-6_f64).unwrap_or_else(F::zero);
+        let divisor = F::from(5.0_f64).unwrap_or_else(F::one);
+        if adaptive && *current_eta > eta_floor {
+            *current_eta = *current_eta / divisor;
+            *no_improve_count = 0;
+            false
+        } else {
+            true
+        }
+    } else {
+        false
+    }
+}
+
+/// Score-based SGD epoch-end convergence / adaptive-eta tail (early stopping).
+///
+/// Mirrors the `if early_stopping:` branch of `_sgd_fast.pyx.tp:678-707`. The
+/// validation `score` (R^2 for the regressor, binary accuracy for the
+/// classifier subproblem) replaces the training loss, and — because a HIGHER
+/// score is better — `best_score` is initialized to `-inf` and the criterion
+/// flips sense relative to [`convergence_tail`]: `no_improvement_count`
+/// increments when `score < best_score + tol` (the epoch fails to beat the best
+/// score so far by at least `tol`, `:682-685`) and resets otherwise; `best_score`
+/// tracks the running MAXIMUM (`:686-687`). The shared
+/// `no_improvement_count >= n_iter_no_change` tail (`:698-707`, adaptive eta/=5
+/// or break) is identical to the loss path.
+///
+/// Returns `true` iff the epoch loop should `break` (convergence).
+#[allow(clippy::too_many_arguments, reason = "mirrors the upstream epoch tail")]
+#[inline]
+fn convergence_tail_score<F: Float>(
+    score: F,
+    best_score: &mut F,
+    no_improve_count: &mut usize,
+    current_eta: &mut F,
+    tol_active: bool,
+    tol: F,
+    n_iter_no_change: usize,
+    adaptive: bool,
+) -> bool {
+    // `_sgd_fast.pyx.tp:682-685`: validation-score branch (early_stopping=True).
+    if tol_active && score < *best_score + tol {
+        *no_improve_count += 1;
+    } else {
+        *no_improve_count = 0;
+    }
+    // `:686-687`: track the running maximum.
+    if score > *best_score {
+        *best_score = score;
+    }
+    // `:698-707`: convergence break OR adaptive eta/=5 (shared with the loss
+    // path — byte-identical logic).
+    if *no_improve_count >= n_iter_no_change {
         let eta_floor = F::from(1e-6_f64).unwrap_or_else(F::zero);
         let divisor = F::from(5.0_f64).unwrap_or_else(F::one);
         if adaptive && *current_eta > eta_floor {
@@ -735,6 +883,20 @@ pub struct SGDClassifier<F> {
     /// replace the plain ones at fit-end when `average <= self.t_ - 1`
     /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
     pub average: usize,
+    /// Whether to stop training early based on a held-out validation score.
+    /// Defaults to `false` (sklearn `SGDClassifier(early_stopping=False)`,
+    /// `_stochastic_gradient.py:114`, constraint `["boolean"]` at `:524`). When
+    /// `true`, [`validation_fraction`](Self::validation_fraction) of the training
+    /// data is held out (stratified) as a validation set and the epoch-end
+    /// convergence rule uses the validation accuracy of each One-vs-All binary
+    /// subproblem instead of the training loss (`_sgd_fast.pyx.tp:678-687`).
+    pub early_stopping: bool,
+    /// Fraction of the training data held out as the validation set when
+    /// [`early_stopping`](Self::early_stopping) is `true`. Defaults to `0.1`
+    /// (sklearn `validation_fraction=0.1`, `_stochastic_gradient.py:115`). Must
+    /// lie in the open interval `(0, 1)`
+    /// (constraint `Interval(Real, 0, 1, closed="neither")` at `:525`).
+    pub validation_fraction: F,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -763,6 +925,8 @@ impl<F: Float> SGDClassifier<F> {
             fit_intercept: true,
             class_weight: ClassWeight::None,
             average: 0,
+            early_stopping: false,
+            validation_fraction: cst(0.1),
         }
     }
 
@@ -902,6 +1066,34 @@ impl<F: Float> SGDClassifier<F> {
         self.average = average;
         self
     }
+
+    /// Enable or disable early stopping on a held-out validation score.
+    ///
+    /// Mirrors sklearn's `early_stopping` parameter (default `False`,
+    /// `_stochastic_gradient.py:114`, constraint `["boolean"]` at `:524`). When
+    /// enabled, [`with_validation_fraction`](Self::with_validation_fraction) of
+    /// the data is held out (stratified per class) and each One-vs-All binary
+    /// subproblem's epoch-end convergence is driven by its validation accuracy
+    /// rather than the training loss (`_sgd_fast.pyx.tp:678-687`).
+    #[must_use]
+    pub fn with_early_stopping(mut self, early_stopping: bool) -> Self {
+        self.early_stopping = early_stopping;
+        self
+    }
+
+    /// Set the fraction of the training data held out for early-stopping
+    /// validation.
+    ///
+    /// Mirrors sklearn's `validation_fraction` parameter (default `0.1`,
+    /// `_stochastic_gradient.py:115`, constraint
+    /// `Interval(Real, 0, 1, closed="neither")` at `:525`). Only used when
+    /// [`early_stopping`](Self::early_stopping) is `true`; validated to the open
+    /// interval `(0, 1)` at fit time.
+    #[must_use]
+    pub fn with_validation_fraction(mut self, validation_fraction: F) -> Self {
+        self.validation_fraction = validation_fraction;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -927,6 +1119,8 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         fit_intercept: clf.fit_intercept,
         one_class: false,
         average: clf.average,
+        early_stopping: clf.early_stopping,
+        validation_fraction: clf.validation_fraction,
     }
 }
 
@@ -965,6 +1159,20 @@ struct SGDHyper<F> {
     /// counter `t >= N`, mirroring `if 0 < average <= t` (`_sgd_fast.pyx.tp:646`).
     /// sklearn `average=True` maps to `N = 1`; `average=N` maps to `N`.
     average: usize,
+    /// Whether to use early stopping on a held-out validation score. When
+    /// `true` the epoch-end convergence rule scores the current weights on the
+    /// validation set (R^2 / accuracy) instead of the training loss
+    /// (`_sgd_fast.pyx.tp:678-687`, `_stochastic_gradient.py:114`). The
+    /// validation set itself is split off in the `Fit` path BEFORE the kernel
+    /// and passed in separately; this flag only selects the score-based
+    /// epoch-end branch. `false` (the default) leaves the training-loss
+    /// convergence path byte-identical.
+    early_stopping: bool,
+    /// Fraction of the training data held out as the validation set when
+    /// `early_stopping` is `true` (`_stochastic_gradient.py:115`, default `0.1`,
+    /// constraint `Interval(Real, 0, 1, closed="neither")` at `:525`). Carried
+    /// for validation/documentation; the actual split happens in the `Fit` path.
+    validation_fraction: F,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -992,6 +1200,7 @@ fn train_binary_sgd<F, L>(
     hyper: &SGDHyper<F>,
     initial_t: usize,
     sample_w: &[F],
+    val_set: Option<(&Array2<F>, &Array1<F>)>,
 ) -> (F, usize)
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
@@ -1002,8 +1211,16 @@ where
     let mut t = initial_t;
     // Epoch-end convergence state, mirroring `_sgd_fast.pyx.tp:525,532-534`:
     // `best_loss = INFINITY`, `no_improvement_count = 0`. `current_eta` carries
-    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`).
+    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`). When early
+    // stopping is active `best_score = -INFINITY` instead (higher score is
+    // better — `_sgd_fast.pyx.tp:533`).
     let mut best_loss = F::infinity();
+    let mut best_score = F::neg_infinity();
+    // Early stopping uses the score branch only when a validation set was split
+    // off in the `Fit` path (`val_set.is_some()`). The relabeled `{-1,+1}`
+    // binary validation target is scored with accuracy (`binary_accuracy`,
+    // `_stochastic_gradient.py:451-454,79`).
+    let early_stopping = hyper.early_stopping && val_set.is_some();
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
     // `tol = None` upstream becomes `-INFINITY`, disabling the stop rule
@@ -1169,22 +1386,41 @@ where
             }
         }
 
-        // `epoch_loss` is now the epoch `sumloss` (no mean division). The
-        // epoch-end stop rule mirrors `_sgd_fast.pyx.tp:688-707` exactly:
-        // the criterion compares `sumloss` to `best_loss - tol * train_count`.
+        // `epoch_loss` is now the epoch `sumloss` (no mean division).
         total_loss = epoch_loss;
 
-        if convergence_tail(
-            epoch_loss,
-            &mut best_loss,
-            &mut no_improve_count,
-            &mut current_eta,
-            tol_active,
-            hyper.tol,
-            n_samples,
-            hyper.n_iter_no_change,
-            matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
-        ) {
+        // Epoch-end stop rule (`_sgd_fast.pyx.tp:678-707`). When early stopping
+        // is active, score the CURRENT weights/intercept on the held-out
+        // validation set (binary accuracy of the relabeled `{-1,+1}` target,
+        // `_stochastic_gradient.py:79`) and run the score-based branch
+        // (`best_score` init `-inf`, higher is better, `:678-687`); otherwise
+        // the training-loss branch (`sumloss` vs `best_loss`, `:688-695`).
+        let should_break = if let (true, Some((x_val, y_val))) = (early_stopping, val_set) {
+            let score = binary_accuracy(weights, *intercept, x_val, y_val);
+            convergence_tail_score(
+                score,
+                &mut best_score,
+                &mut no_improve_count,
+                &mut current_eta,
+                tol_active,
+                hyper.tol,
+                hyper.n_iter_no_change,
+                matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+            )
+        } else {
+            convergence_tail(
+                epoch_loss,
+                &mut best_loss,
+                &mut no_improve_count,
+                &mut current_eta,
+                tol_active,
+                hyper.tol,
+                n_samples,
+                hyper.n_iter_no_change,
+                matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+            )
+        };
+        if should_break {
             break;
         }
     }
@@ -1292,6 +1528,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDClassifier<F> {
             self.eta0,
             self.alpha,
             self.l1_ratio,
+            self.validation_fraction,
         )?;
 
         let n_samples = x.nrows();
@@ -1355,6 +1592,27 @@ fn schedule_requires_eta0<F: Float>(schedule: &LearningRateSchedule<F>) -> bool 
 }
 
 /// Validate classifier input shapes and parameters.
+/// Validate `validation_fraction` to the OPEN interval `(0, 1)`.
+///
+/// Mirrors sklearn `_parameter_constraints["validation_fraction"]`
+/// (`_stochastic_gradient.py:525`, `Interval(Real, 0, 1, closed="neither")`):
+/// the bounds are both EXCLUSIVE, so `0.0` and `1.0` are invalid. sklearn
+/// validates this unconditionally (it is a constructor constraint), independent
+/// of `early_stopping`.
+fn validate_validation_fraction<F: Float>(validation_fraction: F) -> Result<(), FerroError> {
+    if validation_fraction <= F::zero() || validation_fraction >= F::one() {
+        return Err(FerroError::InvalidParameter {
+            name: "validation_fraction".into(),
+            reason: "must be in the open interval (0, 1)".into(),
+        });
+    }
+    Ok(())
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads each validated parameter"
+)]
 fn validate_clf_params<F: Float>(
     x: &Array2<F>,
     y: &Array1<usize>,
@@ -1362,6 +1620,7 @@ fn validate_clf_params<F: Float>(
     eta0: F,
     alpha: F,
     l1_ratio: F,
+    validation_fraction: F,
 ) -> Result<(), FerroError> {
     let n_samples = x.nrows();
     if n_samples != y.len() {
@@ -1396,11 +1655,119 @@ fn validate_clf_params<F: Float>(
             reason: "must be in the range [0, 1]".into(),
         });
     }
+    validate_validation_fraction(validation_fraction)?;
     Ok(())
 }
 
 /// Result type for one-vs-all training: (weight_matrix, intercepts, step_counter).
 type OvaResult<F> = (Vec<Array1<F>>, Vec<F>, usize);
+
+/// Number of validation samples for an early-stopping split: `ceil` of
+/// `validation_fraction * n` clamped to `[1, n-1]` so that BOTH the train and
+/// the validation subset are non-empty.
+///
+/// sklearn delegates the count to `ShuffleSplit`/`StratifiedShuffleSplit`, which
+/// use `ceil(test_size * n)` and raise if either subset is empty
+/// (`_stochastic_gradient.py:295-307`). The exact sample SELECTION is numpy-RNG
+/// coupled and not cross-impl reproducible (the same barrier as `shuffle`); only
+/// the count + non-emptiness are reproduced here.
+fn validation_count<F: Float>(validation_fraction: F, n: usize) -> usize {
+    let n_f = F::from(n).unwrap_or_else(F::zero);
+    let raw = (validation_fraction * n_f).ceil();
+    let n_val = raw.to_usize().unwrap_or(1).max(1);
+    n_val.min(n.saturating_sub(1))
+}
+
+/// Build a seeded, optionally stratified train/validation index partition for
+/// early stopping.
+///
+/// Returns `(train_idx, val_idx)`. The first `n_val` entries of a seeded random
+/// permutation form the validation set; for the classifier (`stratify = Some`)
+/// the permutation is built per class so the validation set is proportional per
+/// class, mirroring sklearn's `StratifiedShuffleSplit`
+/// (`_stochastic_gradient.py:280-287`); for the regressor a plain `ShuffleSplit`
+/// permutation is used. The RNG is `StdRng::seed_from_u64(random_state ?? 0)`.
+///
+/// The SELECTION is intentionally NOT identical to sklearn (numpy's
+/// Mersenne-Twister permutation differs from `StdRng`); only the deterministic
+/// contract — a valid, seeded, stratified-for-classifier, non-empty split — is
+/// reproduced. Returns `None` if either subset would be empty (sklearn raises a
+/// `ValueError`, `_stochastic_gradient.py:295-307`).
+fn make_validation_split<F: Float>(
+    n: usize,
+    validation_fraction: F,
+    random_state: Option<u64>,
+    stratify: Option<&[usize]>,
+) -> Option<(Vec<usize>, Vec<usize>)> {
+    if n < 2 {
+        return None;
+    }
+    let n_val = validation_count(validation_fraction, n);
+    if n_val == 0 || n_val >= n {
+        return None;
+    }
+    let mut rng = rand::rngs::StdRng::seed_from_u64(random_state.unwrap_or(0));
+
+    let mut val_mask = vec![false; n];
+    match stratify {
+        Some(labels) => {
+            // Per-class proportional hold-out (`StratifiedShuffleSplit`). For each
+            // class, shuffle its member indices and take `round(frac * count)`
+            // (at least 1 when the class has >= 2 members) into validation.
+            let mut classes: Vec<usize> = labels.to_vec();
+            classes.sort_unstable();
+            classes.dedup();
+            for &c in &classes {
+                let mut members: Vec<usize> = (0..n).filter(|&i| labels[i] == c).collect();
+                members.shuffle(&mut rng);
+                let count = members.len();
+                let frac_f = F::from(count).unwrap_or_else(F::zero) * validation_fraction;
+                let mut take = frac_f.round().to_usize().unwrap_or(0);
+                if take == 0 && count >= 2 {
+                    take = 1;
+                }
+                take = take.min(count.saturating_sub(1)).min(count);
+                for &idx in members.iter().take(take) {
+                    val_mask[idx] = true;
+                }
+            }
+        }
+        None => {
+            // Plain shuffle hold-out (`ShuffleSplit`): first `n_val` of a seeded
+            // permutation.
+            let mut perm: Vec<usize> = (0..n).collect();
+            perm.shuffle(&mut rng);
+            for &idx in perm.iter().take(n_val) {
+                val_mask[idx] = true;
+            }
+        }
+    }
+
+    let val_idx: Vec<usize> = (0..n).filter(|&i| val_mask[i]).collect();
+    let train_idx: Vec<usize> = (0..n).filter(|&i| !val_mask[i]).collect();
+    if val_idx.is_empty() || train_idx.is_empty() {
+        return None;
+    }
+    Some((train_idx, val_idx))
+}
+
+/// Gather the rows of `x` indexed by `idx` into a fresh `Array2`.
+fn gather_rows<F: Float>(x: &Array2<F>, idx: &[usize]) -> Array2<F> {
+    let n_features = x.ncols();
+    let mut out = Array2::<F>::zeros((idx.len(), n_features));
+    for (r, &i) in idx.iter().enumerate() {
+        let src = x.row(i);
+        for j in 0..n_features {
+            out[[r, j]] = src[j];
+        }
+    }
+    out
+}
+
+/// Gather the entries of `v` indexed by `idx` into a fresh `Array1`.
+fn gather<F: Float>(v: &Array1<F>, idx: &[usize]) -> Array1<F> {
+    Array1::from_iter(idx.iter().map(|&i| v[i]))
+}
 
 /// Train one-vs-all binary classifiers, returning per-class weights, intercepts,
 /// and the cumulative step counter.
@@ -1431,36 +1798,101 @@ fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
     let mut intercepts: Vec<F> = Vec::with_capacity(n_classes);
     let mut global_t = initial_t;
 
+    // Early-stopping validation split. Computed ONCE over the full multiclass
+    // labels (so the hold-out is stratified per class and SHARED by every OvA
+    // subproblem, exactly as sklearn precomputes the mask in `_fit_multiclass`,
+    // `_stochastic_gradient.py:796`, and reuses it for each binary fit). The
+    // split is stratified (`StratifiedShuffleSplit`, `:280-281`). When the split
+    // is infeasible (too few samples) it returns `None`, and an empty validation
+    // set raises (`:295-307`).
+    let split = if hyper.early_stopping {
+        match make_validation_split(
+            x.nrows(),
+            hyper.validation_fraction,
+            hyper.random_state,
+            Some(&y.to_vec()),
+        ) {
+            Some(s) => Some(s),
+            None => {
+                return Err(FerroError::InvalidParameter {
+                    name: "validation_fraction".into(),
+                    reason: "early_stopping split led to an empty train or validation set; \
+                             increase the number of samples or change validation_fraction"
+                        .into(),
+                });
+            }
+        }
+    } else {
+        None
+    };
+
+    // Closure: run one OvA binary subproblem (relabel + per-sample weights +
+    // optional validation slice + kernel call). `pos`/`neg` are the class-weight
+    // mappings for this subproblem.
+    let run_subproblem =
+        |cls: usize, pos_weight: F, neg_weight: F, w: &mut Array1<F>, b: &mut F, t0: usize| {
+            let y_binary: Array1<F> =
+                y.mapv(|label| if label == cls { F::one() } else { -F::one() });
+            // Per-sample weight = class_weight_for_sample(i) * sample_weight[i]
+            // (`_sgd_fast.pyx.tp:599-602,630`). `y_binary[i] > 0` selects pos.
+            let sample_w_full: Vec<F> = (0..x.nrows())
+                .map(|i| {
+                    let cw = if y_binary[i] > F::zero() {
+                        pos_weight
+                    } else {
+                        neg_weight
+                    };
+                    cw * sample_weight[i]
+                })
+                .collect();
+
+            if let Some((train_idx, val_idx)) = &split {
+                // Train on the train subset only; score on the held-out
+                // validation subset (relabeled `{-1,+1}` target, accuracy —
+                // `_stochastic_gradient.py:451-454,79`). sklearn does NOT refit
+                // on the full data; the train-subset weights are final
+                // (`_ValidationScoreCallback` only reads weights, never writes
+                // back to the live fit).
+                let x_tr = gather_rows(x, train_idx);
+                let y_tr = gather(&y_binary, train_idx);
+                let sw_tr: Vec<F> = train_idx.iter().map(|&i| sample_w_full[i]).collect();
+                let x_val = gather_rows(x, val_idx);
+                let y_val = gather(&y_binary, val_idx);
+                dispatch_train_binary(
+                    &x_tr,
+                    &y_tr,
+                    w,
+                    b,
+                    loss_enum,
+                    hyper,
+                    t0,
+                    &sw_tr,
+                    Some((&x_val, &y_val)),
+                )
+            } else {
+                dispatch_train_binary(
+                    x,
+                    &y_binary,
+                    w,
+                    b,
+                    loss_enum,
+                    hyper,
+                    t0,
+                    &sample_w_full,
+                    None,
+                )
+            }
+        };
+
     if n_classes == 2 {
         // Single binary problem: class[0] -> -1, class[1] -> +1.
         // OvA weight mapping (`_fit_binary`, `_stochastic_gradient.py:765-766`):
         // pos_weight = expanded[1], neg_weight = expanded[0].
         let pos_weight = expanded_class_weight[1];
         let neg_weight = expanded_class_weight[0];
-        let y_binary: Array1<F> = y.mapv(|label| {
-            if label == classes[1] {
-                F::one()
-            } else {
-                -F::one()
-            }
-        });
-        // Per-sample weight = class_weight_for_sample(i) * sample_weight[i]
-        // (`_sgd_fast.pyx.tp:599-602,630`). `y_binary[i] > 0` selects pos_weight.
-        let sample_w: Vec<F> = (0..x.nrows())
-            .map(|i| {
-                let cw = if y_binary[i] > F::zero() {
-                    pos_weight
-                } else {
-                    neg_weight
-                };
-                cw * sample_weight[i]
-            })
-            .collect();
         let mut w = Array1::<F>::zeros(n_features);
         let mut b = F::zero();
-        let (_, t) = dispatch_train_binary(
-            x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t, &sample_w,
-        );
+        let (_, t) = run_subproblem(classes[1], pos_weight, neg_weight, &mut w, &mut b, global_t);
         global_t = t;
         weight_matrix.push(w);
         intercepts.push(b);
@@ -1471,23 +1903,9 @@ fn fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
         for (k, &cls) in classes.iter().enumerate() {
             let pos_weight = expanded_class_weight[k];
             let neg_weight = F::one();
-            let y_binary: Array1<F> =
-                y.mapv(|label| if label == cls { F::one() } else { -F::one() });
-            let sample_w: Vec<F> = (0..x.nrows())
-                .map(|i| {
-                    let cw = if y_binary[i] > F::zero() {
-                        pos_weight
-                    } else {
-                        neg_weight
-                    };
-                    cw * sample_weight[i]
-                })
-                .collect();
             let mut w = Array1::<F>::zeros(n_features);
             let mut b = F::zero();
-            let (_, t) = dispatch_train_binary(
-                x, &y_binary, &mut w, &mut b, loss_enum, hyper, global_t, &sample_w,
-            );
+            let (_, t) = run_subproblem(cls, pos_weight, neg_weight, &mut w, &mut b, global_t);
             global_t = t;
             weight_matrix.push(w);
             intercepts.push(b);
@@ -1533,6 +1951,7 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
             hyper,
             global_t,
             &sample_w,
+            None,
         );
         global_t = t;
     } else {
@@ -1548,6 +1967,7 @@ fn partial_fit_ova<F: Float + Send + Sync + ScalarOperand + 'static>(
                 hyper,
                 global_t,
                 &sample_w,
+                None,
             );
             global_t = t;
         }
@@ -1573,23 +1993,48 @@ fn dispatch_train_binary<F: Float + Send + Sync + ScalarOperand + 'static>(
     hyper: &SGDHyper<F>,
     initial_t: usize,
     sample_w: &[F],
+    val_set: Option<(&Array2<F>, &Array1<F>)>,
 ) -> (F, usize) {
     match loss_enum {
-        ClassifierLoss::Hinge => {
-            train_binary_sgd(x, y_binary, w, b, &Hinge, hyper, initial_t, sample_w)
-        }
-        ClassifierLoss::SquaredHinge => {
-            train_binary_sgd(x, y_binary, w, b, &SquaredHinge, hyper, initial_t, sample_w)
-        }
-        ClassifierLoss::Perceptron => {
-            train_binary_sgd(x, y_binary, w, b, &Perceptron, hyper, initial_t, sample_w)
-        }
-        ClassifierLoss::Log => {
-            train_binary_sgd(x, y_binary, w, b, &LogLoss, hyper, initial_t, sample_w)
-        }
-        ClassifierLoss::SquaredError => {
-            train_binary_sgd(x, y_binary, w, b, &SquaredError, hyper, initial_t, sample_w)
-        }
+        ClassifierLoss::Hinge => train_binary_sgd(
+            x, y_binary, w, b, &Hinge, hyper, initial_t, sample_w, val_set,
+        ),
+        ClassifierLoss::SquaredHinge => train_binary_sgd(
+            x,
+            y_binary,
+            w,
+            b,
+            &SquaredHinge,
+            hyper,
+            initial_t,
+            sample_w,
+            val_set,
+        ),
+        ClassifierLoss::Perceptron => train_binary_sgd(
+            x,
+            y_binary,
+            w,
+            b,
+            &Perceptron,
+            hyper,
+            initial_t,
+            sample_w,
+            val_set,
+        ),
+        ClassifierLoss::Log => train_binary_sgd(
+            x, y_binary, w, b, &LogLoss, hyper, initial_t, sample_w, val_set,
+        ),
+        ClassifierLoss::SquaredError => train_binary_sgd(
+            x,
+            y_binary,
+            w,
+            b,
+            &SquaredError,
+            hyper,
+            initial_t,
+            sample_w,
+            val_set,
+        ),
         ClassifierLoss::ModifiedHuber => train_binary_sgd(
             x,
             y_binary,
@@ -1599,6 +2044,7 @@ fn dispatch_train_binary<F: Float + Send + Sync + ScalarOperand + 'static>(
             hyper,
             initial_t,
             sample_w,
+            val_set,
         ),
     }
 }
@@ -1741,6 +2187,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             self.eta0,
             self.alpha,
             self.l1_ratio,
+            self.validation_fraction,
         )?;
 
         let n_features = x.ncols();
@@ -1903,6 +2350,20 @@ pub struct SGDRegressor<F> {
     /// replace the plain ones at fit-end when `average <= self.t_ - 1`
     /// (`_sgd_fast.pyx.tp:646-654`, `_stochastic_gradient.py:834-836`).
     pub average: usize,
+    /// Whether to stop training early based on a held-out validation score.
+    /// Defaults to `false` (sklearn `SGDRegressor(early_stopping=False)`,
+    /// `_stochastic_gradient.py:114`, constraint `["boolean"]` at `:524`). When
+    /// `true`, [`validation_fraction`](Self::validation_fraction) of the training
+    /// data is held out as a validation set and the epoch-end convergence rule
+    /// uses the validation `R^2` instead of the training loss
+    /// (`_sgd_fast.pyx.tp:678-687`).
+    pub early_stopping: bool,
+    /// Fraction of the training data held out as the validation set when
+    /// [`early_stopping`](Self::early_stopping) is `true`. Defaults to `0.1`
+    /// (sklearn `validation_fraction=0.1`, `_stochastic_gradient.py:115`). Must
+    /// lie in the open interval `(0, 1)`
+    /// (constraint `Interval(Real, 0, 1, closed="neither")` at `:525`).
+    pub validation_fraction: F,
 }
 
 impl<F: Float> SGDRegressor<F> {
@@ -1930,6 +2391,8 @@ impl<F: Float> SGDRegressor<F> {
             tol: cst(1e-3),
             random_state: None,
             power_t: cst(0.25),
+            early_stopping: false,
+            validation_fraction: cst(0.1),
         }
     }
 
@@ -2056,6 +2519,34 @@ impl<F: Float> SGDRegressor<F> {
         self.average = average;
         self
     }
+
+    /// Enable or disable early stopping on a held-out validation score.
+    ///
+    /// Mirrors sklearn's `early_stopping` parameter (default `False`,
+    /// `_stochastic_gradient.py:114`, constraint `["boolean"]` at `:524`). When
+    /// enabled, [`with_validation_fraction`](Self::with_validation_fraction) of
+    /// the data is held out and the epoch-end convergence is driven by the
+    /// validation `R^2` rather than the training loss
+    /// (`_sgd_fast.pyx.tp:678-687`).
+    #[must_use]
+    pub fn with_early_stopping(mut self, early_stopping: bool) -> Self {
+        self.early_stopping = early_stopping;
+        self
+    }
+
+    /// Set the fraction of the training data held out for early-stopping
+    /// validation.
+    ///
+    /// Mirrors sklearn's `validation_fraction` parameter (default `0.1`,
+    /// `_stochastic_gradient.py:115`, constraint
+    /// `Interval(Real, 0, 1, closed="neither")` at `:525`). Only used when
+    /// [`early_stopping`](Self::early_stopping) is `true`; validated to the open
+    /// interval `(0, 1)` at fit time.
+    #[must_use]
+    pub fn with_validation_fraction(mut self, validation_fraction: F) -> Self {
+        self.validation_fraction = validation_fraction;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDRegressor<F> {
@@ -2081,6 +2572,8 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         fit_intercept: reg.fit_intercept,
         one_class: false,
         average: reg.average,
+        early_stopping: reg.early_stopping,
+        validation_fraction: reg.validation_fraction,
     }
 }
 
@@ -2105,6 +2598,7 @@ fn train_regressor_sgd<F, L>(
     hyper: &SGDHyper<F>,
     initial_t: usize,
     sample_w: &[F],
+    val_set: Option<(&Array2<F>, &Array1<F>)>,
 ) -> (F, usize)
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
@@ -2115,8 +2609,14 @@ where
     let mut t = initial_t;
     // Epoch-end convergence state, mirroring `_sgd_fast.pyx.tp:525,532-534`:
     // `best_loss = INFINITY`, `no_improvement_count = 0`. `current_eta` carries
-    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`).
+    // the adaptive-schedule eta (`eta = eta / 5` decay, `:700`). Under early
+    // stopping `best_score = -INFINITY` (higher score is better, `:533`).
     let mut best_loss = F::infinity();
+    let mut best_score = F::neg_infinity();
+    // Early stopping uses the validation-R^2 branch only when a validation set
+    // was split off in the `Fit` path (`_stochastic_gradient.py:79`,
+    // `RegressorMixin.score` -> `r2_score`).
+    let early_stopping = hyper.early_stopping && val_set.is_some();
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
     // `tol = None` upstream becomes `-INFINITY`, disabling the stop rule
@@ -2254,21 +2754,40 @@ where
             }
         }
 
-        // `epoch_loss` is now the epoch `sumloss` (no mean division). The
-        // epoch-end stop rule mirrors `_sgd_fast.pyx.tp:688-707` exactly.
+        // `epoch_loss` is now the epoch `sumloss` (no mean division).
         total_loss = epoch_loss;
 
-        if convergence_tail(
-            epoch_loss,
-            &mut best_loss,
-            &mut no_improve_count,
-            &mut current_eta,
-            tol_active,
-            hyper.tol,
-            n_samples,
-            hyper.n_iter_no_change,
-            matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
-        ) {
+        // Epoch-end stop rule (`_sgd_fast.pyx.tp:678-707`). When early stopping
+        // is active, score the CURRENT weights on the held-out validation set
+        // (R^2, `_stochastic_gradient.py:79`) and run the score-based branch
+        // (`best_score` init `-inf`, higher is better, `:678-687`); otherwise the
+        // training-loss branch (`sumloss` vs `best_loss`, `:688-695`).
+        let should_break = if let (true, Some((x_val, y_val))) = (early_stopping, val_set) {
+            let score = r2_score(weights, *intercept, x_val, y_val);
+            convergence_tail_score(
+                score,
+                &mut best_score,
+                &mut no_improve_count,
+                &mut current_eta,
+                tol_active,
+                hyper.tol,
+                hyper.n_iter_no_change,
+                matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+            )
+        } else {
+            convergence_tail(
+                epoch_loss,
+                &mut best_loss,
+                &mut no_improve_count,
+                &mut current_eta,
+                tol_active,
+                hyper.tol,
+                n_samples,
+                hyper.n_iter_no_change,
+                matches!(hyper.learning_rate, LearningRateSchedule::Adaptive),
+            )
+        };
+        if should_break {
             break;
         }
     }
@@ -2305,11 +2824,20 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
     hyper: &SGDHyper<F>,
     initial_t: usize,
     sample_w: &[F],
+    val_set: Option<(&Array2<F>, &Array1<F>)>,
 ) -> (F, usize) {
     match loss_enum {
-        RegressorLoss::SquaredError => {
-            train_regressor_sgd(x, y, w, b, &SquaredError, hyper, initial_t, sample_w)
-        }
+        RegressorLoss::SquaredError => train_regressor_sgd(
+            x,
+            y,
+            w,
+            b,
+            &SquaredError,
+            hyper,
+            initial_t,
+            sample_w,
+            val_set,
+        ),
         RegressorLoss::Huber(eps) => train_regressor_sgd(
             x,
             y,
@@ -2319,6 +2847,7 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             hyper,
             initial_t,
             sample_w,
+            val_set,
         ),
         RegressorLoss::EpsilonInsensitive(eps) => train_regressor_sgd(
             x,
@@ -2329,6 +2858,7 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             hyper,
             initial_t,
             sample_w,
+            val_set,
         ),
         RegressorLoss::SquaredEpsilonInsensitive(eps) => train_regressor_sgd(
             x,
@@ -2339,6 +2869,7 @@ fn dispatch_train_regressor<F: Float + Send + Sync + ScalarOperand + 'static>(
             hyper,
             initial_t,
             sample_w,
+            val_set,
         ),
     }
 }
@@ -2364,6 +2895,10 @@ pub struct FittedSGDRegressor<F> {
 }
 
 /// Validate regressor input shapes and parameters.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads each validated parameter"
+)]
 fn validate_reg_params<F: Float>(
     x: &Array2<F>,
     y: &Array1<F>,
@@ -2372,6 +2907,7 @@ fn validate_reg_params<F: Float>(
     alpha: F,
     l1_ratio: F,
     loss: &RegressorLoss<F>,
+    validation_fraction: F,
 ) -> Result<(), FerroError> {
     let n_samples = x.nrows();
     if n_samples != y.len() {
@@ -2426,6 +2962,7 @@ fn validate_reg_params<F: Float>(
             reason: "must be in the range [0, inf)".into(),
         });
     }
+    validate_validation_fraction(validation_fraction)?;
     Ok(())
 }
 
@@ -2481,6 +3018,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDRegressor<F> {
             self.alpha,
             self.l1_ratio,
             &self.loss,
+            self.validation_fraction,
         )?;
 
         let n_samples = x.nrows();
@@ -2498,7 +3036,46 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDRegressor<F> {
         let mut b = F::zero();
         let sw = sample_weight.to_vec();
 
-        let (_, t) = dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sw);
+        // Early-stopping validation split (`ShuffleSplit`,
+        // `_stochastic_gradient.py:282-287`). The hold-out is split off BEFORE
+        // training; the kernel trains on the train subset and scores its R^2 on
+        // the held-out validation subset each epoch. sklearn does NOT refit on
+        // the full data — the train-subset weights are final.
+        let t = if hyper.early_stopping {
+            let (train_idx, val_idx) = make_validation_split(
+                n_samples,
+                hyper.validation_fraction,
+                hyper.random_state,
+                None,
+            )
+            .ok_or_else(|| FerroError::InvalidParameter {
+                name: "validation_fraction".into(),
+                reason: "early_stopping split led to an empty train or validation set; \
+                         increase the number of samples or change validation_fraction"
+                    .into(),
+            })?;
+            let x_tr = gather_rows(x, &train_idx);
+            let y_tr = gather(y, &train_idx);
+            let sw_tr: Vec<F> = train_idx.iter().map(|&i| sw[i]).collect();
+            let x_val = gather_rows(x, &val_idx);
+            let y_val = gather(y, &val_idx);
+            let (_, t) = dispatch_train_regressor(
+                &x_tr,
+                &y_tr,
+                &mut w,
+                &mut b,
+                &self.loss,
+                &hyper,
+                0,
+                &sw_tr,
+                Some((&x_val, &y_val)),
+            );
+            t
+        } else {
+            let (_, t) =
+                dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sw, None);
+            t
+        };
 
         Ok(FittedSGDRegressor {
             weights: w,
@@ -2587,6 +3164,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             &hyper,
             self.t,
             &sample_w,
+            None,
         );
         self.t = t;
 
@@ -2620,6 +3198,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             self.alpha,
             self.l1_ratio,
             &self.loss,
+            self.validation_fraction,
         )?;
 
         let n_features = x.ncols();
@@ -2631,7 +3210,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         let sample_w: Vec<F> = vec![F::one(); x.nrows()];
 
         let (_, t) =
-            dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sample_w);
+            dispatch_train_regressor(x, y, &mut w, &mut b, &self.loss, &hyper, 0, &sample_w, None);
 
         Ok(FittedSGDRegressor {
             weights: w,
@@ -2922,6 +3501,11 @@ impl<F: Float> SGDOneClassSVM<F> {
             // sklearn's `SGDOneClassSVM` has no `average` parameter — averaging is
             // always off on the one-class path (`_stochastic_gradient.py:2245-2281`).
             average: 0,
+            // The one-class SVM exposes no `early_stopping`/`validation_fraction`
+            // (`_stochastic_gradient.py:2245-2281`); the early-stop score branch
+            // is always off, leaving the one-class trajectory byte-identical.
+            early_stopping: false,
+            validation_fraction: cst(0.1),
         };
 
         // `y = np.ones(n_samples)` (`_stochastic_gradient.py:2289`).
@@ -2935,7 +3519,9 @@ impl<F: Float> SGDOneClassSVM<F> {
         // weight is uniform `1.0` (byte-identical to the pre-weighting kernel).
         let sample_w: Vec<F> = vec![F::one(); n_samples];
 
-        let (_, _t) = train_binary_sgd(x, &y_ones, &mut w, &mut b, &Hinge, &hyper, 0, &sample_w);
+        let (_, _t) = train_binary_sgd(
+            x, &y_ones, &mut w, &mut b, &Hinge, &hyper, 0, &sample_w, None,
+        );
 
         // `offset_ = 1 - intercept` (`_stochastic_gradient.py:2377`).
         let offset = F::one() - b;
@@ -3072,6 +3658,73 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
 mod tests {
     use super::*;
     use ndarray::array;
+
+    // -----------------------------------------------------------------------
+    // Early-stopping validation-score helpers (REQ-13)
+    //
+    // These pin the DETERMINISTIC per-epoch validation score against the live
+    // sklearn 1.5.2 oracle (`sklearn.metrics.r2_score` / `accuracy_score`, the
+    // regressor/classifier `_ValidationScoreCallback`,
+    // `_stochastic_gradient.py:79`). The validation-set SELECTION is numpy-RNG
+    // coupled and NOT verified here (same barrier as `shuffle`); the SCORE math
+    // on a GIVEN (weights, intercept, val set) is fully deterministic.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_validation_r2_matches_sklearn() {
+        // Oracle:
+        //   python3 -c "import numpy as np; from sklearn.metrics import r2_score; \
+        //     X=np.array([[1.,2.],[3.,1.],[0.,4.]]); w=np.array([1.,-2.]); b=0.5; \
+        //     y=np.array([-2.,4.,-7.]); print(r2_score(y, X@w+b))"
+        //   -> 0.8887362637362637
+        let weights = array![1.0_f64, -2.0];
+        let x_val = array![[1.0_f64, 2.0], [3.0, 1.0], [0.0, 4.0]];
+        let y_val = array![-2.0_f64, 4.0, -7.0];
+        let got = r2_score(&weights, 0.5, &x_val, &y_val);
+        assert!(
+            (got - 0.8887362637362637).abs() < 1e-12,
+            "r2 {got} != sklearn 0.8887362637362637"
+        );
+    }
+
+    #[test]
+    fn test_validation_r2_constant_y_edge_cases() {
+        // sklearn `r2_score` with SS_tot == 0 (constant y_val): perfect const
+        // prediction -> 1.0, imperfect -> 0.0.
+        //   python3 -c "from sklearn.metrics import r2_score; \
+        //     print(r2_score([5,5,5],[5,5,5]), r2_score([5,5,5],[4,4,4]))"
+        //   -> 1.0 0.0
+        let weights = array![0.0_f64, 0.0];
+        let x = array![[1.0_f64, 2.0], [3.0, 1.0], [0.0, 4.0]];
+        let y_const = array![5.0_f64, 5.0, 5.0];
+        // weights=0, intercept=5 -> all predictions 5 -> perfect -> 1.0.
+        let got_perfect = r2_score(&weights, 5.0, &x, &y_const);
+        assert!(
+            (got_perfect - 1.0).abs() < 1e-12,
+            "perfect-const r2 {got_perfect} != 1.0"
+        );
+        // weights=0, intercept=4 -> all predictions 4, y all 5 -> imperfect -> 0.0.
+        let got_imperfect = r2_score(&weights, 4.0, &x, &y_const);
+        assert!(
+            got_imperfect.abs() < 1e-12,
+            "imperfect-const r2 {got_imperfect} != 0.0"
+        );
+    }
+
+    #[test]
+    fn test_validation_binary_accuracy_matches_sklearn() {
+        // Oracle:
+        //   python3 -c "import numpy as np; from sklearn.metrics import accuracy_score; \
+        //     X=np.array([[1.,1.],[2.,2.],[0.,0.],[3.,1.]]); w=np.array([1.,1.]); b=-3.; \
+        //     dec=X@w+b; pred=np.where(dec>=0,1.,-1.); y=np.array([1.,1.,-1.,1.]); \
+        //     print(accuracy_score(y,pred))"
+        //   -> 0.75  (dec=[-1,1,-3,1] -> pred=[-1,1,-1,1], y=[1,1,-1,1] -> 3/4)
+        let weights = array![1.0_f64, 1.0];
+        let x_val = array![[1.0_f64, 1.0], [2.0, 2.0], [0.0, 0.0], [3.0, 1.0]];
+        let y_val = array![1.0_f64, 1.0, -1.0, 1.0];
+        let got = binary_accuracy(&weights, -3.0, &x_val, &y_val);
+        assert!((got - 0.75).abs() < 1e-12, "accuracy {got} != sklearn 0.75");
+    }
 
     // -----------------------------------------------------------------------
     // Loss function tests

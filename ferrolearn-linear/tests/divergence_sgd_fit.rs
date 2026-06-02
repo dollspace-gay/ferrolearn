@@ -1719,3 +1719,205 @@ fn sgd_average_classifier() {
          intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-13 / #533 — early_stopping + validation_fraction.
+//
+// sklearn site: `_stochastic_gradient.py:114-115` (defaults
+// `early_stopping=False`, `validation_fraction=0.1`), `:257-310`
+// (`_make_validation_split` via `ShuffleSplit`/`StratifiedShuffleSplit`),
+// `:63-79` (`_ValidationScoreCallback` = `est.score(X_val, y_val)` = R^2 for the
+// regressor / accuracy for the classifier), `:524-525` (constraints
+// `early_stopping: boolean`, `validation_fraction: Interval(Real, 0, 1,
+// closed="neither")`), `_sgd_fast.pyx.tp:678-687` (the validation-score
+// convergence branch, `best_score` init `-inf`).
+//
+// # THE RNG-PARITY BOUNDARY (read carefully)
+//
+// sklearn selects the validation subset with a numpy Mersenne-Twister
+// permutation (`ShuffleSplit`/`StratifiedShuffleSplit` over
+// `np.random.RandomState`, `_stochastic_gradient.py:284-287`); ferrolearn uses
+// a seeded `StdRng` permutation. The two PRNGs pick DIFFERENT held-out indices
+// from the same seed, so a FULL fitted-coef parity test against the oracle is
+// INFEASIBLE — the SAME barrier as `shuffle` (see the module header). These pins
+// therefore verify only the DETERMINISTIC pieces:
+//   (a) the per-epoch validation score (R^2 / accuracy) on a GIVEN val set —
+//       unit-tested directly against `sklearn.metrics.r2_score`/`accuracy_score`
+//       in `sgd.rs`'s `mod tests` (`test_validation_r2_matches_sklearn`,
+//       `test_validation_binary_accuracy_matches_sklearn`);
+//   (b) the `validation_fraction` constraint (open interval `(0, 1)`);
+//   (c) the BEHAVIORAL contract: `early_stopping=true` yields a valid model that
+//       DIFFERS from `early_stopping=false` (it trains on a held-out subset and
+//       stops on the validation score, not the training loss).
+// ---------------------------------------------------------------------------
+
+/// `validation_fraction` outside the open interval `(0, 1)` is rejected at fit
+/// time, mirroring sklearn's constructor constraint
+/// `Interval(Real, 0, 1, closed="neither")` (`_stochastic_gradient.py:525`).
+/// Both bounds are EXCLUSIVE, so `0.0`, `1.0` and `1.5` all raise; sklearn
+/// raises `InvalidParameterError` (a `ValueError`), ferrolearn returns
+/// `FerroError::InvalidParameter`.
+///
+/// Oracle (the constraint, not a fitted value):
+/// ```text
+/// python3 -c "from sklearn.linear_model import SGDRegressor; import numpy as np; \
+///   try: SGDRegressor(early_stopping=True, validation_fraction=1.5).fit(np.zeros((4,2)), np.zeros(4)); \
+///   except Exception as e: print(type(e).__name__)"
+/// -> InvalidParameterError
+/// ```
+#[test]
+fn sgd_validation_fraction_invalid() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 4.0, 5.0, 5.0, 6.0, 6.0, 7.0],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+    // validation_fraction = 1.5 (> 1) -> Err.
+    let too_big = SGDRegressor::<f64>::new()
+        .with_early_stopping(true)
+        .with_validation_fraction(1.5)
+        .with_shuffle(false)
+        .with_random_state(0)
+        .fit(&x, &y);
+    assert!(
+        too_big.is_err(),
+        "validation_fraction=1.5 must be rejected (open interval (0,1))"
+    );
+
+    // validation_fraction = 0.0 (boundary, exclusive) -> Err.
+    let zero = SGDRegressor::<f64>::new()
+        .with_early_stopping(true)
+        .with_validation_fraction(0.0)
+        .with_shuffle(false)
+        .with_random_state(0)
+        .fit(&x, &y);
+    assert!(
+        zero.is_err(),
+        "validation_fraction=0.0 must be rejected (open interval (0,1))"
+    );
+
+    // Classifier path: same constraint.
+    let yc = Array1::from_vec(vec![0usize, 0, 0, 1, 1, 1]);
+    let clf_bad = SGDClassifier::<f64>::new()
+        .with_early_stopping(true)
+        .with_validation_fraction(1.5)
+        .with_shuffle(false)
+        .with_random_state(0)
+        .fit(&x, &yc);
+    assert!(
+        clf_bad.is_err(),
+        "classifier validation_fraction=1.5 must be rejected"
+    );
+}
+
+/// Behavioral: `early_stopping=true` produces a VALID model that DIFFERS from
+/// `early_stopping=false`.
+///
+/// This is NOT an oracle-coef pin (the validation-split SELECTION is numpy-RNG
+/// coupled and not cross-impl reproducible — see the boundary note above and the
+/// `shuffle` barrier). It pins the OBSERVABLE behavioral contract:
+///   - with `early_stopping=false` the fit uses ALL samples and converges on the
+///     training loss (`_sgd_fast.pyx.tp:688-695`);
+///   - with `early_stopping=true` a `validation_fraction` slice is held out, the
+///     model trains on the remaining samples and stops on the validation R^2
+///     (`:678-687`), so it sees fewer samples and a different stop criterion —
+///     yielding a different (but finite, valid) coefficient vector.
+#[test]
+fn sgd_early_stopping_stops_early() {
+    let x = Array2::from_shape_vec(
+        (10, 2),
+        vec![
+            0.0, 0.0, 1.0, 1.0, 2.0, 1.0, 3.0, 2.0, 4.0, 3.0, 5.0, 4.0, 6.0, 4.0, 7.0, 5.0, 8.0,
+            6.0, 9.0, 7.0,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![0.0, 2.0, 3.0, 5.0, 7.0, 9.0, 10.0, 12.0, 14.0, 16.0]);
+
+    let base = || {
+        SGDRegressor::<f64>::new()
+            .with_loss(RegressorLoss::SquaredError)
+            .with_learning_rate(LearningRateSchedule::Constant)
+            .with_eta0(0.01)
+            .with_alpha(0.0001)
+            .with_max_iter(200)
+            .with_tol(1e-3)
+            .with_shuffle(false)
+            .with_random_state(0)
+    };
+
+    let full = base()
+        .fit(&x, &y)
+        .expect("early_stopping=false fit must succeed");
+    let early = base()
+        .with_early_stopping(true)
+        .with_validation_fraction(0.1)
+        .fit(&x, &y)
+        .expect("early_stopping=true fit must succeed");
+
+    let full_coef = full.coefficients();
+    let early_coef = early.coefficients();
+
+    assert!(
+        full_coef.iter().all(|v| v.is_finite()) && full.intercept().is_finite(),
+        "early_stopping=false model must be finite, got {full_coef:?}"
+    );
+    assert!(
+        early_coef.iter().all(|v| v.is_finite()) && early.intercept().is_finite(),
+        "early_stopping=true model must be finite, got {early_coef:?}"
+    );
+
+    let differs = (full_coef[0] - early_coef[0]).abs() > 1e-9
+        || (full_coef[1] - early_coef[1]).abs() > 1e-9
+        || (full.intercept() - early.intercept()).abs() > 1e-9;
+    assert!(
+        differs,
+        "early_stopping=true must produce a different model than \
+         early_stopping=false; full coef={full_coef:?} intercept={} \
+         early coef={early_coef:?} intercept={}",
+        full.intercept(),
+        early.intercept()
+    );
+}
+
+/// Classifier early stopping is wired the same way: a stratified held-out split
+/// is taken, each One-vs-All subproblem stops on its binary validation accuracy
+/// (`_stochastic_gradient.py:451-454,796`), and the resulting model is valid and
+/// usable for prediction. Behavioral only (split SELECTION is RNG-bounded).
+#[test]
+fn sgd_early_stopping_classifier_valid() {
+    let x = Array2::from_shape_vec(
+        (10, 2),
+        vec![
+            1.0, 2.0, 2.0, 3.0, 3.0, 1.0, 1.5, 2.5, 2.5, 1.5, 8.0, 7.0, 9.0, 8.0, 7.0, 9.0, 8.5,
+            8.5, 9.5, 7.5,
+        ],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![0usize, 0, 0, 0, 0, 1, 1, 1, 1, 1]);
+
+    let model = SGDClassifier::<f64>::new()
+        .with_loss(ClassifierLoss::Hinge)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.0001)
+        .with_max_iter(100)
+        .with_tol(1e-3)
+        .with_shuffle(false)
+        .with_early_stopping(true)
+        .with_validation_fraction(0.2)
+        .with_random_state(0);
+
+    let fitted = model
+        .fit(&x, &y)
+        .expect("classifier early_stopping fit must succeed");
+    let coef = fitted.coefficients();
+    assert!(
+        coef.iter().all(|v| v.is_finite()) && fitted.intercept().is_finite(),
+        "classifier early_stopping model must be finite, got {coef:?}"
+    );
+    let preds = fitted.predict(&x).expect("predict must succeed");
+    assert_eq!(preds.len(), 10);
+}
