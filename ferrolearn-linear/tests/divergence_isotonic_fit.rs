@@ -142,3 +142,54 @@ fn isotonic_make_unique_duplicate_x() {
         );
     }
 }
+
+/// Parity: `IsotonicRegression::fit_with_sample_weight` reproduces sklearn's
+/// weighted fit. `sample_weight` enters `IsotonicRegression.fit(X, y,
+/// sample_weight)` (`sklearn/isotonic.py:251`, dispatched into `_build_y` at
+/// `isotonic.py:300-328`): the weighted `_make_unique` collapses equal-X runs
+/// to the sample-weighted mean and summed weight, and `isotonic_regression`
+/// pools with those weights. Up-weighting the X=3 sample (`w=5` vs `1`) drags
+/// the pooled [2,3] block toward y=2, giving 2.1666… instead of the unweighted
+/// 2.5.
+///
+/// Oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.isotonic import IsotonicRegression; \
+///   m=IsotonicRegression().fit(np.array([1.,2.,3.,4.]),np.array([1.,3.,2.,5.]),sample_weight=np.array([1.,1.,5.,1.])); \
+///   print(repr(m.predict([1.,2.,3.,4.]).tolist()))"
+///   # -> [1.0, 2.1666666666666665, 2.1666666666666665, 5.0]
+/// ```
+/// (unweighted on the same X,y is `[1.0, 2.5, 2.5, 5.0]`). All query X are
+/// in-range, so the default out_of_bounds='nan' never fires.
+///
+/// Tracking: #568
+#[test]
+fn isotonic_sample_weight() {
+    let x = Array2::from_shape_vec((4, 1), vec![1.0_f64, 2.0, 3.0, 4.0]).unwrap();
+    let y = array![1.0_f64, 3.0, 2.0, 5.0];
+    let sample_weight = array![1.0_f64, 1.0, 5.0, 1.0];
+
+    let fitted = IsotonicRegression::<f64>::new()
+        .fit_with_sample_weight(&x, &y, &sample_weight)
+        .unwrap();
+
+    let preds = fitted.predict(&x).unwrap();
+
+    // sklearn 1.5.2 oracle (recorded above): all four X are in the training
+    // range [1, 4], so default 'nan' out_of_bounds is irrelevant.
+    let oracle = [
+        1.0_f64,
+        2.166_666_666_666_666_5,
+        2.166_666_666_666_666_5,
+        5.0,
+    ];
+    for (i, &exp) in oracle.iter().enumerate() {
+        assert!(
+            (preds[i] - exp).abs() < 1e-9,
+            "weighted fit predict({}): sklearn (fit sample_weight, isotonic.py:251) \
+             returns {exp}, ferrolearn fit_with_sample_weight returned {}",
+            [1.0, 2.0, 3.0, 4.0][i],
+            preds[i]
+        );
+    }
+}

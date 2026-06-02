@@ -33,14 +33,14 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (increasing PAVA fit) | SHIPPED | `fn pav_increasing` → `pav_increasing_unique_weighted`; distinct-X fit matches the live oracle (`X=[1..6],y=[1,4,2,5,3,7]` → `[1,3,3,4,4,7]`). Consumer: `Fit for IsotonicRegression`. |
+//! | REQ-1 (increasing PAVA fit) | SHIPPED | `fn make_unique` → `pav_increasing_unique_weighted`; distinct-X fit matches the live oracle (`X=[1..6],y=[1,4,2,5,3,7]` → `[1,3,3,4,4,7]`). Consumer: `Fit for IsotonicRegression`. |
 //! | REQ-2 (decreasing) | SHIPPED | negate-fit-negate path; decreasing dup-X `[4,2,3,1]` → `[3,3,1]` matches oracle. |
 //! | REQ-3 (predict piecewise-LINEAR interpolation) | SHIPPED | `predict_single` does `y0 + t*(y1-y0)` (`scipy interp1d(kind='linear')`); test `test_interpolation`. |
 //! | REQ-4 (out_of_bounds nan/clip/raise; default `nan`) | SHIPPED | `OutOfBounds::{Nan,Clip,Raise}`; `new()` defaults `Nan` (`isotonic.py:274`); test `isotonic_default_out_of_bounds_nan`. Closed #565. |
 //! | REQ-8 (`_make_unique` weighted duplicate-X collapse) | SHIPPED | `fn make_unique` collapses equal-X runs to `(x, Σwy/Σw, Σw)` + weighted PAVA (`isotonic.py:308-325`); test `isotonic_make_unique_duplicate_x` (`[1,1,2,3]/[1,3,2,4]` → `[2,2,4]`). Closed #569. |
 //! | REQ-5 (y_min/y_max clipping) | NOT-STARTED | #566. |
 //! | REQ-6 (increasing='auto' via Spearman) | NOT-STARTED | #567. |
-//! | REQ-7 (sample_weight public API) | NOT-STARTED | #568 (weighted PAVA already exists internally). |
+//! | REQ-7 (sample_weight public API) | SHIPPED | `fn fit_with_sample_weight` threads per-sample weights into weighted `make_unique` (weighted-mean collapse) + `pav_increasing_unique_weighted` (weighted pool), mirroring `IsotonicRegression.fit(X,y,sample_weight)` → `_build_y` `_make_unique`/`isotonic_regression` (`isotonic.py:251`,`:300-328`). Consumer: `Fit::fit` delegates with an all-ones weight vector. Test: `isotonic_sample_weight` (divergence suite). Closed #568. |
 //! | REQ-9 (X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_) | NOT-STARTED | #570. |
 //! | REQ-10 (free `isotonic_regression` + `check_increasing`) | NOT-STARTED | #571. |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | #572 (crate-wide-deferred, cf. ridge #391). |
@@ -85,6 +85,139 @@ pub struct IsotonicRegression<F> {
     /// Strategy for predictions outside the training range.
     pub out_of_bounds: OutOfBounds,
     _marker: std::marker::PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> IsotonicRegression<F> {
+    /// Fit the isotonic regression model with per-sample weights.
+    ///
+    /// This is the weighted generalization of [`Fit::fit`]. Each sample
+    /// `(x[i], y[i])` carries weight `sample_weight[i]`; the weights flow into
+    /// the `_make_unique` duplicate-`X` collapse (each equal-`X` run collapses
+    /// to its sample-weighted mean `Σ wᵢ yᵢ / Σ wᵢ` and summed weight) and into
+    /// the weighted PAV pool, mirroring scikit-learn's
+    /// `IsotonicRegression.fit(X, y, sample_weight)` → `_build_y`
+    /// (`sklearn/isotonic.py:300-328`, the `_make_unique` + `isotonic_regression`
+    /// weighted pipeline) at tag 1.5.2.
+    ///
+    /// Zero-weight samples are removed before fitting, matching
+    /// `_build_y`'s `mask = sample_weight > 0` filter (`isotonic.py:314-315`).
+    ///
+    /// [`Fit::fit`] is exactly this method with an all-ones weight vector, so
+    /// the default (unweighted) path is byte-identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x` does not have exactly one
+    /// column, or if `y`/`sample_weight` lengths do not match the sample count.
+    /// Returns [`FerroError::InvalidParameter`] if any weight is negative
+    /// (mirroring sklearn's `_check_sample_weight` non-negativity contract).
+    /// Returns [`FerroError::InsufficientSamples`] if fewer than 2 positively
+    /// weighted samples remain.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: &Array1<F>,
+    ) -> Result<FittedIsotonicRegression<F>, FerroError> {
+        let (n_samples, n_features) = x.dim();
+
+        if n_features != 1 {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples, 1],
+                actual: vec![n_samples, n_features],
+                context: "IsotonicRegression requires exactly 1 feature".into(),
+            });
+        }
+
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        if n_samples != sample_weight.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sample_weight.len()],
+                context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        if n_samples < 2 {
+            return Err(FerroError::InsufficientSamples {
+                required: 2,
+                actual: n_samples,
+                context: "IsotonicRegression requires at least 2 samples".into(),
+            });
+        }
+
+        // Non-negativity: sklearn's `_check_sample_weight` rejects negative
+        // weights (and `_build_y` then drops the zero-weight rows).
+        if sample_weight.iter().any(|&w| w < F::zero()) {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "sample weights must be non-negative".into(),
+            });
+        }
+
+        // Extract the single feature column, dropping zero-weight rows
+        // (`isotonic.py:314-315`: `mask = sample_weight > 0`).
+        let mut xs: Vec<F> = Vec::with_capacity(n_samples);
+        let mut ys: Vec<F> = Vec::with_capacity(n_samples);
+        let mut ws: Vec<F> = Vec::with_capacity(n_samples);
+        let col = x.column(0);
+        for i in 0..n_samples {
+            if sample_weight[i] > F::zero() {
+                xs.push(col[i]);
+                ys.push(y[i]);
+                ws.push(sample_weight[i]);
+            }
+        }
+
+        if xs.len() < 2 {
+            return Err(FerroError::InsufficientSamples {
+                required: 2,
+                actual: xs.len(),
+                context: "IsotonicRegression requires at least 2 positively weighted samples"
+                    .into(),
+            });
+        }
+
+        let (mut result_x, mut result_y) = if self.increasing {
+            let (ux, uy, uw) = make_unique(&xs, &ys, &ws);
+            pav_increasing_unique_weighted(&ux, &uy, &uw)
+        } else {
+            // For decreasing: negate y, run weighted increasing PAV, negate
+            // result — threading the same per-sample weights through.
+            let neg_ys: Vec<F> = ys.iter().map(|&v| -v).collect();
+            let (ux, uy, uw) = make_unique(&xs, &neg_ys, &ws);
+            let (rx, ry) = pav_increasing_unique_weighted(&ux, &uy, &uw);
+            let ry_neg: Vec<F> = ry.iter().map(|&v| -v).collect();
+            (rx, ry_neg)
+        };
+
+        // Ensure at least 2 breakpoints.
+        if result_x.len() < 2 {
+            // All same x value: duplicate.
+            if result_x.len() == 1 {
+                result_x.push(result_x[0]);
+                result_y.push(result_y[0]);
+            } else {
+                return Err(FerroError::NumericalInstability {
+                    message: "PAV produced no breakpoints".into(),
+                });
+            }
+        }
+
+        Ok(FittedIsotonicRegression {
+            x_thresholds: result_x,
+            y_thresholds: result_y,
+            out_of_bounds: self.out_of_bounds,
+            increasing: self.increasing,
+        })
+    }
 }
 
 impl<F: Float> IsotonicRegression<F> {
@@ -363,20 +496,6 @@ fn pav_increasing_unique_weighted<F: Float>(xs: &[F], ys: &[F], ws: &[F]) -> (Ve
     (result_x, result_y)
 }
 
-/// Run the unweighted PAV algorithm to produce a monotonically non-decreasing
-/// sequence of `(x, y)` breakpoints.
-///
-/// This is the equal-weight special case of the pipeline used by [`Fit`]:
-/// every input point carries unit weight, so the weighted block mean reduces
-/// to the plain mean. It first collapses duplicate `X` via [`make_unique`]
-/// (matching sklearn's `_make_unique` pre-pool step) and then pools adjacent
-/// violators via [`pav_increasing_unique_weighted`].
-fn pav_increasing<F: Float>(xs: &[F], ys: &[F]) -> (Vec<F>, Vec<F>) {
-    let ws = vec![F::one(); xs.len()];
-    let (ux, uy, uw) = make_unique(xs, ys, &ws);
-    pav_increasing_unique_weighted(&ux, &uy, &uw)
-}
-
 // ---------------------------------------------------------------------------
 // Fit and Predict
 // ---------------------------------------------------------------------------
@@ -385,9 +504,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for IsotonicReg
     type Fitted = FittedIsotonicRegression<F>;
     type Error = FerroError;
 
-    /// Fit the isotonic regression model using PAV.
+    /// Fit the isotonic regression model using PAV (equal sample weights).
     ///
     /// The input `x` must have exactly one column (univariate regression).
+    ///
+    /// This delegates to [`IsotonicRegression::fit_with_sample_weight`] with an
+    /// all-ones weight vector. With unit weights no row is dropped (none has
+    /// zero weight) and the weighted `make_unique`/PAV reduce to the plain-mean
+    /// special case, so this path is byte-identical to the prior unweighted
+    /// implementation.
     ///
     /// # Errors
     ///
@@ -396,65 +521,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for IsotonicReg
     /// Returns [`FerroError::InsufficientSamples`] if there are fewer than
     /// 2 samples.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedIsotonicRegression<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
-
-        if n_features != 1 {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples, 1],
-                actual: vec![n_samples, n_features],
-                context: "IsotonicRegression requires exactly 1 feature".into(),
-            });
-        }
-
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if n_samples < 2 {
-            return Err(FerroError::InsufficientSamples {
-                required: 2,
-                actual: n_samples,
-                context: "IsotonicRegression requires at least 2 samples".into(),
-            });
-        }
-
-        // Extract the single feature column.
-        let xs: Vec<F> = x.column(0).to_vec();
-        let ys: Vec<F> = y.to_vec();
-
-        let (mut result_x, mut result_y) = if self.increasing {
-            pav_increasing(&xs, &ys)
-        } else {
-            // For decreasing: negate y, run increasing PAV, negate result.
-            let neg_ys: Vec<F> = ys.iter().map(|&v| -v).collect();
-            let (rx, ry) = pav_increasing(&xs, &neg_ys);
-            let ry_neg: Vec<F> = ry.iter().map(|&v| -v).collect();
-            (rx, ry_neg)
-        };
-
-        // Ensure at least 2 breakpoints.
-        if result_x.len() < 2 {
-            // All same x value: duplicate.
-            if result_x.len() == 1 {
-                result_x.push(result_x[0]);
-                result_y.push(result_y[0]);
-            } else {
-                return Err(FerroError::NumericalInstability {
-                    message: "PAV produced no breakpoints".into(),
-                });
-            }
-        }
-
-        Ok(FittedIsotonicRegression {
-            x_thresholds: result_x,
-            y_thresholds: result_y,
-            out_of_bounds: self.out_of_bounds,
-            increasing: self.increasing,
-        })
+        let sample_weight = Array1::<F>::from_elem(y.len(), F::one());
+        self.fit_with_sample_weight(x, y, &sample_weight)
     }
 }
 
