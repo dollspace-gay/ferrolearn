@@ -59,7 +59,7 @@
 //! | REQ-6 (multi_class {ovr, crammer_singer}) | NOT-STARTED | open prereq blocker #623. `fn fit` implements one-vs-rest (the default `'ovr'`) but there is no `multi_class` field / `crammer_singer` joint solver. |
 //! | REQ-7 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVC<F>` exposes `pub fit_intercept: bool` (default true) + `pub intercept_scaling: F` (default 1.0) + `#[must_use]` builders. When fitting an intercept the design matrix is augmented with a penalized constant column = `intercept_scaling`, and `intercept_ = intercept_scaling·w_last` (`_base.py:1188-1198,:1240-1245`); `intercept_scaling > 0` is validated. Pinned by `linear_svc_coef_parity` + module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
 //! | REQ-8 (dual param) | SHIPPED | `LinearSVC<F>` exposes `pub dual: DualMode` (default `Auto`) + `#[must_use] with_dual`. `fn resolve_dual` resolves `Auto→bool` (`_validate_dual_parameter`, `_classes.py:13-29`: `n<f`→prefer dual, else→prefer primal, with fallback) against `fn liblinear_solver_type` (the `_get_liblinear_solver_type` matrix, `_base.py:995-1018`), and `fn fit` validates the resolved combo (`hinge+dual=false`, `l1+dual=true`, `l1+hinge` all rejected → `FerroError::InvalidParameter`). R-DEV-7: the resolved `dual` is **observably immaterial for `penalty=l2`** — the l2 dual CD and l2 primal minimize the same `0.5·‖w‖² + C·Σ L` and reach the same `coef_`/`intercept_`, so `penalty=l2` keeps `fn solve_binary_dual` regardless of `dual`. Pinned by `test_unsupported_combinations_rejected` + `test_dual_auto_resolution`. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
-//! | REQ-9 (class_weight) | NOT-STARTED | open prereq blocker #626. `LinearSVC<F>` has no `class_weight` field. |
+//! | REQ-9 (class_weight) | SHIPPED | `LinearSVC<F>` exposes `pub class_weight: ClassWeight<F>` (`None`/`Balanced`/`Explicit`, default `None`) + `#[must_use] with_class_weight`. `fn compute_class_weight` (mirroring `sklearn.utils.compute_class_weight`, `class_weight.py:63-81`, as called at `_base.py:1179`) expands per-class weights; `fn fit` scales `C` per class: binary `cp = C·weights[idx(classes[1])]`, `cn = C·weights[idx(classes[0])]` (`train_one(Cp=weighted_C[1], Cn=weighted_C[0])`, `linear.cpp:2543-2551`), OvR class `k` `cp = C·weights[k]`, `cn = C` base (the negative rest is UNWEIGHTED, `linear.cpp:2559-2571`). `SolverConfig` now carries `(cp, cn)`; `solve_binary_dual`/`solve_binary_l1r_l2` apply the per-sample `C_[i] = (y_i>0?cp:cn)` (`diag[i]`/`upper_bound[i]`/`C[i]`, `linear.cpp:843-858`,`:1504-1509`). When `cp == cn` (no class_weight) the math is identical to before (the 9 divergence pins stay green). Pinned by `test_class_weight_smoke in linear_svc.rs` (live oracle 8×2 imbalanced set, `squared_hinge,dual=True,C=1.0`: `None coef [[0.10056,0.15957]] int [-1.26346]`; `balanced coef [[0.09937,0.16666]] int [-1.21320]` weights `[0.6667,2.0]`; `{0:1,1:5} coef [[0.11059,0.17164]] int [-1.29547]`; ferrolearn within 1e-2). The rigorous oracle pin in `tests/divergence_linear_svc_fit.rs` is the critic's next step. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-10 (C-scaling convention) | SHIPPED | the `c / n_f` division is removed; the dual CD uses `upper_bound = C` (hinge) / `diag = 0.5/C` (squared_hinge), so `coef_` tracks `C` like liblinear. Pinned by `linear_svc_coef_c_dependence` (C=0.1 → `0.0784651864625997`, C=1.0 → `0.12835213611984458`). |
 //! | REQ-11 (n_iter_/n_features_in_ + param validation) | SHIPPED | `fn n_features_in` (returns the stored `n_features`, set by `_validate_data`, `_classes.py:302`) and `fn n_iter` (the max dual-CD outer-iteration count across the binary/OvR fits, `n_iter_ = n_iter_.max().item()`, `_classes.py:338`) on `FittedLinearSVC`; `fn fit` validates `tol > 0` (`Interval(Real, 0.0, None, closed="neither")`, `_classes.py:237`). Pinned by `linear_svc_attrs_and_tol_validation in tests/divergence_linear_svc_fit.rs` (#627). `n_features_in_` (oracle `2`) and the `tol <= 0` reject are exact; `n_iter_` is the documented shuffle-path RNG boundary (ferrolearn sweeps natural order, sklearn's liblinear shuffles `index` each sweep, cf. SGD), so the pin bounds `n_iter` in `[1, max_iter]` rather than exact-matching. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #628. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
@@ -127,6 +127,83 @@ pub enum LinearSVCLoss {
     /// `L2R_L2LOSS_SVC_DUAL` (type 1): box `0 <= alpha <= +inf`,
     /// `diag = 0.5 / C`.
     SquaredHinge,
+}
+
+/// Per-class weighting strategy for [`LinearSVC`].
+///
+/// Mirrors `sklearn.svm.LinearSVC`'s `class_weight` parameter
+/// (`sklearn/svm/_classes.py:118-124`, constraint `{None, dict, 'balanced'}`):
+/// it scales the inverse-regularization `C` per class so the effective penalty
+/// for class `i` is `class_weight[i]·C` (`compute_class_weight`,
+/// `sklearn/svm/_base.py:1179`; `weighted_C[i] = C·class_weight[i]`,
+/// `liblinear/linear.cpp:2496-2507`). The expanded per-class weights are
+/// computed by [`compute_class_weight`] following
+/// `sklearn.utils.compute_class_weight` semantics
+/// (`sklearn/utils/class_weight.py:63-81`).
+///
+/// This mirrors `ferrolearn_linear::sgd::ClassWeight` for cross-estimator
+/// consistency, but is defined locally (no cross-import of `sgd` internals).
+#[derive(Debug, Clone, Default)]
+pub enum ClassWeight<F> {
+    /// Uniform weights (all classes weighted `1.0`). The default
+    /// (`class_weight=None`, `class_weight.py:63-65`).
+    #[default]
+    None,
+    /// Balanced weights `n_samples / (n_classes · count_c)` per class `c`,
+    /// matching `sklearn.utils.compute_class_weight("balanced", ...)`
+    /// (`class_weight.py:66-74`).
+    Balanced,
+    /// Explicit class-label -> weight map. Classes absent from the map default
+    /// to `1.0`, matching the dict branch of `compute_class_weight`
+    /// (`class_weight.py:75-81`).
+    Explicit(Vec<(usize, F)>),
+}
+
+/// Compute the expanded per-class weight vector aligned to `classes`
+/// (sorted ascending, matching sklearn's `classes_ = np.unique(y)`).
+///
+/// Faithful to `sklearn.utils.compute_class_weight`
+/// (`sklearn/utils/class_weight.py:63-81`), as called by `_fit_liblinear`
+/// (`compute_class_weight(class_weight, classes=classes_, y=y)`,
+/// `sklearn/svm/_base.py:1179`):
+/// - `None` -> all `1.0` (`:63-65`).
+/// - `Balanced` -> `n_samples / (n_classes · count_c)` per class `c`,
+///   where `count_c` is the number of samples with label `c` (`:66-74`).
+/// - `Explicit(map)` -> `1.0` default, overridden by the map entries matched by
+///   class label (`:75-81`).
+///
+/// `classes` is the sorted unique label set; `y` is the per-sample label array.
+/// Mirrors `ferrolearn_linear::sgd::compute_class_weight` exactly.
+fn compute_class_weight<F: Float>(cw: &ClassWeight<F>, classes: &[usize], y: &[usize]) -> Vec<F> {
+    match cw {
+        ClassWeight::None => vec![F::one(); classes.len()],
+        ClassWeight::Balanced => {
+            // `recip_freq = len(y) / (n_classes * bincount(y_ind))`
+            // (`class_weight.py:73`), indexed per class.
+            let n_samples = F::from(y.len()).unwrap_or_else(F::zero);
+            let n_classes = F::from(classes.len()).unwrap_or_else(F::one);
+            classes
+                .iter()
+                .map(|&c| {
+                    let count = y.iter().filter(|&&label| label == c).count();
+                    let count_f = F::from(count).unwrap_or_else(F::one);
+                    if count_f > F::zero() {
+                        n_samples / (n_classes * count_f)
+                    } else {
+                        F::one()
+                    }
+                })
+                .collect()
+        }
+        ClassWeight::Explicit(map) => classes
+            .iter()
+            .map(|&c| {
+                map.iter()
+                    .find(|(label, _)| *label == c)
+                    .map_or_else(F::one, |(_, w)| *w)
+            })
+            .collect(),
+    }
 }
 
 /// Confidence scores returned by [`FittedLinearSVC::decision_function`].
@@ -219,6 +296,11 @@ pub struct LinearSVC<F> {
     ///
     /// [`fit_intercept`]: Self::fit_intercept
     pub intercept_scaling: F,
+    /// Per-class scaling of `C`. Default [`ClassWeight::None`] (all classes
+    /// weighted `1.0`). The effective penalty for class `i` is
+    /// `class_weight[i]·C` (`compute_class_weight`, `_base.py:1179`;
+    /// `weighted_C[i] = C·class_weight[i]`, `linear.cpp:2496-2507`).
+    pub class_weight: ClassWeight<F>,
 }
 
 impl<F: Float> LinearSVC<F> {
@@ -227,7 +309,7 @@ impl<F: Float> LinearSVC<F> {
     /// Defaults (matching `sklearn.svm.LinearSVC`, `_classes.py`):
     /// `C = 1.0`, `max_iter = 1000`, `tol = 1e-4`, `loss = SquaredHinge`,
     /// `penalty = L2`, `dual = Auto`, `fit_intercept = true`,
-    /// `intercept_scaling = 1.0`.
+    /// `intercept_scaling = 1.0`, `class_weight = None`.
     #[must_use]
     pub fn new() -> Self {
         // 1e-4/1.0 are exactly representable in f32/f64; the defensive fallback
@@ -245,6 +327,7 @@ impl<F: Float> LinearSVC<F> {
             dual: DualMode::Auto,
             fit_intercept: true,
             intercept_scaling: one,
+            class_weight: ClassWeight::None,
         }
     }
 
@@ -304,6 +387,17 @@ impl<F: Float> LinearSVC<F> {
     #[must_use]
     pub fn with_intercept_scaling(mut self, intercept_scaling: F) -> Self {
         self.intercept_scaling = intercept_scaling;
+        self
+    }
+
+    /// Set the per-class `C` scaling (sklearn `class_weight`,
+    /// `_classes.py:118-124`). [`ClassWeight::None`] (default) leaves every
+    /// class at `1.0`; [`ClassWeight::Balanced`] uses
+    /// `n_samples / (n_classes · count_c)`; [`ClassWeight::Explicit`] takes a
+    /// `(label, weight)` map (unlisted classes default to `1.0`).
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
         self
     }
 }
@@ -420,8 +514,14 @@ impl<F: Float + ScalarOperand + Send + Sync + 'static> FittedLinearSVC<F> {
 /// (groups the dual-CD knobs to keep the solver signature small).
 #[derive(Debug, Clone, Copy)]
 struct SolverConfig<F> {
-    /// Inverse regularization strength `C`.
-    c: F,
+    /// Per-sample penalty for the positive (`y_i > 0`) group: `Cp = C·w[+]`
+    /// (`train_one(Cp, Cn)`, `linear.cpp:2543-2571`; `C_[i] = (y_i>0 ? Cp :
+    /// Cn)`, `linear.cpp:843-858`, `:1504-1509`).
+    cp: F,
+    /// Per-sample penalty for the negative (`y_i <= 0`) group: `Cn = C·w[-]`
+    /// (binary) or the base `C` (multiclass OvR; the negative group is the
+    /// unweighted rest, `linear.cpp:2559-2571`).
+    cn: F,
     /// Maximum dual-CD outer iterations.
     max_iter: usize,
     /// Projected-gradient span stopping tolerance.
@@ -461,7 +561,8 @@ fn solve_binary_dual<F: Float + 'static>(
     cfg: &SolverConfig<F>,
 ) -> (Vec<F>, usize, bool) {
     let SolverConfig {
-        c,
+        cp,
+        cn,
         max_iter,
         tol,
         loss,
@@ -481,16 +582,30 @@ fn solve_binary_dual<F: Float + 'static>(
     let half = F::one() / two;
     let tiny = F::from(1.0e-12).unwrap_or_else(F::epsilon);
 
-    // diag / upper_bound from the solver type (`linear.cpp:849-858`).
-    let (diag, upper_bound) = match loss {
-        LinearSVCLoss::Hinge => (F::zero(), c),
-        LinearSVCLoss::SquaredHinge => (half / c, inf),
-    };
+    // Per-sample penalty `C_[i] = (y_i > 0 ? Cp : Cn)` (`linear.cpp:843-858`,
+    // `GETI(i) ≡ i`); `class_weight` makes Cp/Cn differ. Per-sample diag /
+    // upper_bound follow the solver type: squared_hinge → `diag[i] = 0.5/C_[i]`,
+    // `U[i] = +inf`; hinge → `diag[i] = 0`, `U[i] = C_[i]`.
+    let mut diag = vec![F::zero(); n_samples];
+    let mut upper_bound = vec![inf; n_samples];
+    for i in 0..n_samples {
+        let c_i = if y_signed[i] > F::zero() { cp } else { cn };
+        match loss {
+            LinearSVCLoss::Hinge => {
+                diag[i] = F::zero();
+                upper_bound[i] = c_i;
+            }
+            LinearSVCLoss::SquaredHinge => {
+                diag[i] = half / c_i;
+                upper_bound[i] = inf;
+            }
+        }
+    }
 
-    // QD[i] = diag + ||x_i||^2 (including the augmented bias column).
+    // QD[i] = diag[i] + ||x_i||^2 (including the augmented bias column).
     let mut qd = vec![F::zero(); n_samples];
     for (i, qd_i) in qd.iter_mut().enumerate() {
-        let mut acc = diag;
+        let mut acc = diag[i];
         let row = x.row(i);
         for &v in row.iter() {
             acc = acc + v * v;
@@ -539,8 +654,8 @@ fn solve_binary_dual<F: Float + 'static>(
             let i = index[s];
             let yi = y_signed[i];
 
-            // G = y_i*(w.x_i) - 1 + diag*alpha_i (`linear.cpp:909-921`).
-            let g = yi * dot_w_xi(&w, i) - F::one() + diag * alpha[i];
+            // G = y_i*(w.x_i) - 1 + diag_i*alpha_i (`linear.cpp:909-921`).
+            let g = yi * dot_w_xi(&w, i) - F::one() + diag[i] * alpha[i];
 
             // Projected gradient + shrinking (`linear.cpp:923-949`).
             let mut pg = F::zero();
@@ -552,7 +667,7 @@ fn solve_binary_dual<F: Float + 'static>(
                 } else if g < F::zero() {
                     pg = g;
                 }
-            } else if alpha[i] == upper_bound {
+            } else if alpha[i] == upper_bound[i] {
                 if g < pgmin_old {
                     active_size -= 1;
                     index.swap(s, active_size);
@@ -577,8 +692,8 @@ fn solve_binary_dual<F: Float + 'static>(
                 let mut new_alpha = alpha[i] - g / qd[i];
                 if new_alpha < F::zero() {
                     new_alpha = F::zero();
-                } else if new_alpha > upper_bound {
-                    new_alpha = upper_bound;
+                } else if new_alpha > upper_bound[i] {
+                    new_alpha = upper_bound[i];
                 }
                 alpha[i] = new_alpha;
                 let d = (alpha[i] - alpha_old) * yi;
@@ -730,7 +845,9 @@ fn resolve_dual(
 /// (`linear.cpp:1567-1579, 1691-1705`); stop when
 /// `Gnorm1_new ≤ eps·Gnorm1_init` on the full active set (`linear.cpp:1691`).
 ///
-/// `C[i] = C` uniform (no `class_weight` yet — that is #626). liblinear shuffles
+/// `C[i] = (y_i > 0 ? Cp : Cn)` per-sample (`class_weight` scales `C` per class,
+/// `linear.cpp:1504-1509`; `Cp = C·w[+]`, `Cn = C·w[-]` binary / base `C`
+/// multiclass, `:2543-2571`). liblinear shuffles
 /// `index` each sweep (`bounded_rand_int`, `linear.cpp:1535`); ferrolearn sweeps
 /// NATURAL ORDER for determinism (no RNG) — the l1 optimum is unique so the
 /// limit is identical (the documented RNG-path boundary, as `solve_binary_dual`).
@@ -749,7 +866,8 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
     cfg: &SolverConfig<F>,
 ) -> (Vec<F>, usize, bool) {
     let SolverConfig {
-        c,
+        cp,
+        cn,
         max_iter,
         tol,
         fit_intercept,
@@ -758,6 +876,10 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
     } = *cfg;
 
     let (n_samples, n_features) = x.dim();
+
+    // Per-sample penalty `C[i] = (y_i > 0 ? Cp : Cn)` (`solve_l1r_l2_svc`,
+    // `linear.cpp:1504-1509`); `class_weight` makes Cp/Cn differ.
+    let c_of = |i: usize| -> F { if y_signed[i] > F::zero() { cp } else { cn } };
     let w_size = if fit_intercept {
         n_features + 1
     } else {
@@ -787,13 +909,13 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
     let mut b = vec![F::one(); n_samples];
     let mut w = vec![F::zero(); w_size];
 
-    // xj_sq[j] = Σ_i C·(y_i·x_ij)² (`linear.cpp:1523`).
+    // xj_sq[j] = Σ_i C[i]·(y_i·x_ij)² (`linear.cpp:1523`, per-sample C[i]).
     let mut xj_sq = vec![F::zero(); w_size];
     for (j, xj_sq_j) in xj_sq.iter_mut().enumerate() {
         let mut acc = F::zero();
         for i in 0..n_samples {
             let val = yx(i, j);
-            acc = acc + c * val * val;
+            acc = acc + c_of(i) * val * val;
         }
         *xj_sq_j = acc;
     }
@@ -825,7 +947,7 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
             for (i, &bi) in b.iter().enumerate() {
                 if bi > F::zero() {
                     let val = yx(i, j);
-                    let tmp = c * val;
+                    let tmp = c_of(i) * val;
                     g_loss = g_loss - tmp * bi;
                     h = h + tmp * val;
                 }
@@ -899,12 +1021,12 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
                 if num_linesearch == 0 {
                     for (i, bi) in b.iter_mut().enumerate() {
                         if *bi > F::zero() {
-                            loss_old = loss_old + c * *bi * *bi;
+                            loss_old = loss_old + c_of(i) * *bi * *bi;
                         }
                         let b_new = *bi + d_diff * yx(i, j);
                         *bi = b_new;
                         if b_new > F::zero() {
-                            loss_new = loss_new + c * b_new * b_new;
+                            loss_new = loss_new + c_of(i) * b_new * b_new;
                         }
                     }
                 } else {
@@ -912,7 +1034,7 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
                         let b_new = *bi + d_diff * yx(i, j);
                         *bi = b_new;
                         if b_new > F::zero() {
-                            loss_new = loss_new + c * b_new * b_new;
+                            loss_new = loss_new + c_of(i) * b_new * b_new;
                         }
                     }
                 }
@@ -1027,7 +1149,8 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
-        let mut classes: Vec<usize> = y.to_vec();
+        let y_vec: Vec<usize> = y.to_vec();
+        let mut classes: Vec<usize> = y_vec.clone();
         classes.sort_unstable();
         classes.dedup();
 
@@ -1048,23 +1171,30 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         let dual = resolve_dual(self.dual, self.penalty, self.loss, n_samples, n_features);
         let _solver_type = liblinear_solver_type(self.penalty, self.loss, dual)?;
 
-        let cfg = SolverConfig {
-            c: self.c,
-            max_iter: self.max_iter,
-            tol: self.tol,
-            loss: self.loss,
-            fit_intercept: self.fit_intercept,
-            intercept_scaling: self.intercept_scaling,
-        };
+        // `class_weight` scales `C` per class: `weighted_C[i] = C·w[class i]`
+        // (`compute_class_weight(class_weight, classes=classes_, y=y)`,
+        // `_base.py:1179`; `linear.cpp:2496-2507`). `weights` is aligned to
+        // `classes` (sorted unique = LabelEncoder order).
+        let weights = compute_class_weight(&self.class_weight, &classes, &y_vec);
 
-        // Solve one binary sub-problem and split the augmented weight vector
-        // into (coef_, intercept_) per `_base.py:1240-1245`. For `penalty=l1`
+        // Solve one binary sub-problem (positive group penalty `cp`, negative
+        // group penalty `cn`) and split the augmented weight vector into
+        // (coef_, intercept_) per `_base.py:1240-1245`. For `penalty=l1`
         // use liblinear's L1 coordinate descent (`solve_l1r_l2_svc`, solver
         // type 5, `linear.cpp:1467`); for `penalty=l2` keep the dual CD — the
         // l2 optimum is dual-invariant (R-DEV-7), so dual=True and dual=False
         // reach the same `coef_`/`intercept_`.
         let penalty = self.penalty;
-        let solve_one = |y_signed: &Array1<F>| -> (Array1<F>, F, usize, bool) {
+        let solve_one = |y_signed: &Array1<F>, cp: F, cn: F| -> (Array1<F>, F, usize, bool) {
+            let cfg = SolverConfig {
+                cp,
+                cn,
+                max_iter: self.max_iter,
+                tol: self.tol,
+                loss: self.loss,
+                fit_intercept: self.fit_intercept,
+                intercept_scaling: self.intercept_scaling,
+            };
             let (w, n_iter, converged) = match penalty {
                 LinearSVCPenalty::L1 => solve_binary_l1r_l2(x, y_signed, &cfg),
                 LinearSVCPenalty::L2 => solve_binary_dual(x, y_signed, &cfg),
@@ -1095,7 +1225,12 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 }
             });
 
-            let (coef, intercept, n_iter, converged) = solve_one(&y_signed);
+            // Binary (`train_one(Cp=weighted_C[1], Cn=weighted_C[0])`,
+            // `linear.cpp:2543-2551`): Cp = C·w[classes[1]] (the +1 class),
+            // Cn = C·w[classes[0]] (the −1 class).
+            let cp = self.c * weights[1];
+            let cn = self.c * weights[0];
+            let (coef, intercept, n_iter, converged) = solve_one(&y_signed, cp, cn);
             if !converged {
                 any_unconverged = true;
             }
@@ -1115,10 +1250,15 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             let mut weight_vectors = Vec::with_capacity(classes.len());
             let mut intercepts = Vec::with_capacity(classes.len());
 
-            for &cls in &classes {
+            for (k, &cls) in classes.iter().enumerate() {
                 let y_signed: Array1<F> =
                     y.mapv(|label| if label == cls { F::one() } else { -F::one() });
-                let (coef, intercept, n_iter, converged) = solve_one(&y_signed);
+                // Multiclass OvR (`train_one(Cp=weighted_C[k], Cn=param->C)`,
+                // `linear.cpp:2559-2571`): Cp = C·w[class k] (the +1 class),
+                // Cn = C (the BASE C — the negative rest is UNWEIGHTED).
+                let cp = self.c * weights[k];
+                let cn = self.c;
+                let (coef, intercept, n_iter, converged) = solve_one(&y_signed, cp, cn);
                 if !converged {
                     any_unconverged = true;
                 }
@@ -1504,6 +1644,97 @@ mod tests {
             "l1 intercept {} vs oracle {SK_INTERCEPT}",
             fitted.intercept()
         );
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "assert!(false) reports the unexpected-Err fit path without a gated panic!/expect"
+    )]
+    fn test_class_weight_smoke() {
+        // Smoke check that `class_weight` (scaling `C` per class —
+        // `compute_class_weight`, `_base.py:1179`; `weighted_C[i] = C·w[i]`,
+        // `linear.cpp:2496-2507`) lands near the live sklearn 1.5.2 oracle. The
+        // rigorous oracle pin is the critic's to add.
+        //
+        // Oracle (live sklearn 1.5.2; values per R-CHAR-3 — NEVER copied from
+        // ferrolearn):
+        //   python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+        //     X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[1.5,1.5],[2.,1.5],[8.,8.],[9.,9.]]); \
+        //     y=np.array([0,0,0,0,0,0,1,1]); \
+        //     for cw in (None,'balanced',{0:1,1:5}): \
+        //       m=LinearSVC(C=1.0,loss='squared_hinge',dual=True,fit_intercept=True, \
+        //         max_iter=200000,tol=1e-10,class_weight=cw).fit(X,y); \
+        //       print(cw, m.coef_.tolist(), m.intercept_.tolist())"
+        //   # None       coef [[0.10056447415875154, 0.15957404219329038]] int [-1.263461307484969]
+        //   # balanced   coef [[0.09936888940946959, 0.16666283617002833]] int [-1.2132032194327564]
+        //   #            (compute_class_weight('balanced',...) = [0.6667, 2.0])
+        //   # {0:1,1:5}  coef [[0.11058720549912869, 0.17164468739390437]] int [-1.2954689964246575]
+        let x = array![
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [1.5, 1.5],
+            [2.0, 1.5],
+            [8.0, 8.0],
+            [9.0, 9.0],
+        ];
+        let y = array![0usize, 0, 0, 0, 0, 0, 1, 1];
+
+        // (class_weight, expected coef_, expected intercept_) from the oracle.
+        let cases: [(ClassWeight<f64>, [f64; 2], f64); 3] = [
+            (
+                ClassWeight::None,
+                [0.100_564_474_158_751_54, 0.159_574_042_193_290_38],
+                -1.263_461_307_484_969,
+            ),
+            (
+                ClassWeight::Balanced,
+                [0.099_368_889_409_469_59, 0.166_662_836_170_028_33],
+                -1.213_203_219_432_756_4,
+            ),
+            (
+                ClassWeight::Explicit(vec![(0, 1.0), (1, 5.0)]),
+                [0.110_587_205_499_128_69, 0.171_644_687_393_904_37],
+                -1.295_468_996_424_657_5,
+            ),
+        ];
+
+        for (cw, exp_coef, exp_int) in cases {
+            let result = LinearSVC::<f64>::new()
+                .with_loss(LinearSVCLoss::SquaredHinge)
+                .with_dual(DualMode::True)
+                .with_c(1.0)
+                .with_class_weight(cw)
+                .with_max_iter(200_000)
+                .with_tol(1e-10)
+                .fit(&x, &y);
+
+            let Ok(fitted) = result else {
+                assert!(false, "class_weight fit must succeed");
+                return;
+            };
+
+            let coef = fitted.coefficients();
+            assert!(
+                (coef[0] - exp_coef[0]).abs() < 1e-2,
+                "coef[0] {} vs oracle {}",
+                coef[0],
+                exp_coef[0]
+            );
+            assert!(
+                (coef[1] - exp_coef[1]).abs() < 1e-2,
+                "coef[1] {} vs oracle {}",
+                coef[1],
+                exp_coef[1]
+            );
+            assert!(
+                (fitted.intercept() - exp_int).abs() < 1e-2,
+                "intercept {} vs oracle {exp_int}",
+                fitted.intercept()
+            );
+        }
     }
 
     #[test]
