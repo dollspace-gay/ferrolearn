@@ -66,7 +66,7 @@
 //! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
 //! | REQ-17 (multiclass one-vs-all) | SHIPPED | `fn fit_ova` (one binary per class) + `fn predict` argmax (`_stochastic_gradient.py:788-844`). Consumer: `Fit for SGDClassifier` -> `PipelineEstimator`. Test: `test_sgd_classifier_multiclass`. |
 //! | REQ-18 (SGDOneClassSVM) | SHIPPED | `pub struct SGDOneClassSVM<F>` (`nu`/`fit_intercept`/`max_iter`/`tol`/`shuffle`/`learning_rate`/`eta0`/`power_t`/`random_state`/`n_iter_no_change` + `new`/`#[must_use]` builders, defaults `_stochastic_gradient.py:2245-2281`) with `fn fit_one_class` + `impl Fit<Array2<F>, ()> for SGDOneClassSVM` (X-only fit, `y` ignored, `_stochastic_gradient.py:2554`): builds `y = ones(n)`, `alpha = nu/2` (`:2588`), `penalty = L2`, `l1_ratio = 0`, `one_class = true` (`:2262-2289,2312`), inits the SGD intercept `b = 1` (offset init 0 -> `1 - 0`, `:2238,2325`), calls the reused `fn train_binary_sgd` Hinge kernel, then stores `coef_ = w`, `offset_ = 1 - b` (`:2377`). The one-class intercept term lives in `fn train_binary_sgd`: when `hyper.one_class` the gated intercept update gains `- 2*eta*alpha` (`intercept_update = -eta*grad - 2*eta*alpha`), mirroring `_sgd_fast.pyx.tp:641-642` (`if one_class: intercept_update -= 2.*eta*alpha`); `pub one_class: bool` was added to `SGDHyper` (default `false` via `fn clf_hyper`/`reg_hyper`, leaving the clf/reg intercept update byte-identical — the existing 15 divergence tests stay green). `pub struct FittedSGDOneClassSVM<F>` exposes `coef()`/`offset()`/`decision_function()` (`X·coef_ - offset_`, `:2622`)/`score_samples()` (`+ offset_ = X·coef_`, `:2639`) and `impl Predict<Array2<F>>` returning `Array1<isize>` of `+1`/`-1` (`(decision >= 0) ? +1 : -1`, `:2655-2657`). Consumer: `pub use sgd::{SGDOneClassSVM, FittedSGDOneClassSVM}` from `ferrolearn-linear/src/lib.rs` (the grandfathered public-API boundary, matching `SGDClassifier`/`SGDRegressor`). Tests: divergence `sgd_one_class_svm_decision` (live oracle nu=0.5/eta0=0.05/constant/max_iter=10/shuffle=false: coef `[0.009883660184666337, 0.009883660184666337]`, offset `1.1102230246251565e-16`, 1e-7) and `sgd_one_class_svm_predict` (nu=0.8/eta0=0.1/max_iter=15: coef `[0.20020636453962284, 0.12292535592963398]`, offset `0.10000000000000009`, predict `[1,-1,1,-1]`). `_stochastic_gradient.py:2084-2668` / `_sgd_fast.pyx.tp:639-644`. Closes #536. |
-//! | REQ-19 (anti-pattern cleanup) | NOT-STARTED | blocker #537. `fn compute_lr`'s `_Phantom` arm now returns `eta0` (unreach macro removed); the loss/lr kernels still use `F::from(..).unwrap()` constants (R-CODE-2) tracked here. |
+//! | REQ-19 (anti-pattern cleanup) | SHIPPED | `fn compute_lr`'s `_Phantom` arm returns `eta0` (the `unreachable!()` macro was removed earlier), and every production `F::from(<f64 literal>).unwrap()` / `F::from(<literal>).unwrap_or_else(|| ...)` constant-construction site is now `fn cst<F: Float>(x: f64) -> F { F::from(x).unwrap_or_else(F::zero) }` (a private module-level infallible-for-f32/f64 constant helper, defined after the imports). 23 call sites replaced: LogLoss `18.0`/`-18.0`/`1e18` (`_sgd_fast.pyx.tp:267-283`), SquaredError/Huber `0.5` (`:291-295,315-331`), ModifiedHuber `4.0`/`-2.0` (`:178-194`), SquaredHinge/SquaredEpsilonInsensitive/intercept/one-class `2.0` (`:254-258,379-387,641-642,2588`), and the `SGDClassifier`/`SGDRegressor`/`SGDOneClassSVM` `::new` defaults (`0.0`/`0.0001`/`0.15`/`1e-3`/`0.5`/`0.25`/`0.01`/`0.01`/`0.5`, `_stochastic_gradient.py:1242-1256,2042-2068,2245-2281`). No numeric literal changed -> byte-identical for f32/f64; all 25 `divergence_sgd_fit` + full lib/doctest suites stay green. No production panicking constant-conversion remains outside `#[cfg(test)]` in `sgd.rs` (verified by grep). Per R-APG-1 / R-CODE-2. The runtime `F::from(<usize>)` conversions (`t`, `n_samples`, `num_iter`, `count`, `from_usize`) and the deliberately-non-zero-fallback constants (`max_dloss` `1e12`->`F::max_value`, `eta_floor` `1e-6`, `divisor` `5.0`) already used `unwrap_or_else` and were already gate-compliant. Closes #537. |
 //! | REQ-20 (ferray substrate migration) | NOT-STARTED | blocker #538. Still `ndarray` + `StdRng` (R-SUBSTRATE-1). |
 
 use ferrolearn_core::error::FerroError;
@@ -77,6 +77,15 @@ use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
+
+/// Convert an `f64` literal constant to `F`. The conversion is infallible for
+/// the supported real types (`f32`/`f64`); the `F::zero()` fallback is
+/// unreachable for those and exists only to keep the call non-panicking
+/// (no `.unwrap()` in production, per the anti-pattern gate R-APG-1 / R-CODE-2).
+#[inline]
+fn cst<F: Float>(x: f64) -> F {
+    F::from(x).unwrap_or_else(F::zero)
+}
 
 // ---------------------------------------------------------------------------
 // Loss functions
@@ -142,7 +151,7 @@ impl<F: Float> Loss<F> for SquaredHinge {
         // `_sgd_fast.pyx.tp:254-258`: `z = threshold - p*y; -2*y*z if z > 0 else 0`.
         let z = F::one() - y_pred * y_true;
         if z > F::zero() {
-            -F::from(2.0).unwrap_or_else(|| F::one() + F::one()) * y_true * z
+            -cst::<F>(2.0) * y_true * z
         } else {
             F::zero()
         }
@@ -184,9 +193,9 @@ pub struct LogLoss;
 impl<F: Float> Loss<F> for LogLoss {
     fn loss(&self, y_true: F, y_pred: F) -> F {
         let z = y_true * y_pred;
-        if z > F::from(18.0).unwrap() {
+        if z > cst(18.0) {
             (-z).exp()
-        } else if z < F::from(-18.0).unwrap() {
+        } else if z < cst(-18.0) {
             -z
         } else {
             (F::one() + (-z).exp()).ln()
@@ -195,10 +204,10 @@ impl<F: Float> Loss<F> for LogLoss {
 
     fn gradient(&self, y_true: F, y_pred: F) -> F {
         let z = y_true * y_pred;
-        let exp_nz = if z > F::from(18.0).unwrap() {
+        let exp_nz = if z > cst(18.0) {
             (-z).exp()
-        } else if z < F::from(-18.0).unwrap() {
-            F::from(1e18).unwrap()
+        } else if z < cst(-18.0) {
+            cst(1e18)
         } else {
             (-z).exp()
         };
@@ -215,7 +224,7 @@ pub struct SquaredError;
 impl<F: Float> Loss<F> for SquaredError {
     fn loss(&self, y_true: F, y_pred: F) -> F {
         let diff = y_true - y_pred;
-        F::from(0.5).unwrap() * diff * diff
+        cst::<F>(0.5) * diff * diff
     }
 
     fn gradient(&self, y_true: F, y_pred: F) -> F {
@@ -245,7 +254,7 @@ impl<F: Float> Loss<F> for ModifiedHuber {
                 F::zero()
             }
         } else {
-            -F::from(4.0).unwrap() * z
+            -cst::<F>(4.0) * z
         }
     }
 
@@ -253,12 +262,12 @@ impl<F: Float> Loss<F> for ModifiedHuber {
         let z = y_true * y_pred;
         if z >= -F::one() {
             if z < F::one() {
-                F::from(-2.0).unwrap() * y_true * (F::one() - z)
+                cst::<F>(-2.0) * y_true * (F::one() - z)
             } else {
                 F::zero()
             }
         } else {
-            -F::from(4.0).unwrap() * y_true
+            -cst::<F>(4.0) * y_true
         }
     }
 }
@@ -278,9 +287,9 @@ impl<F: Float + Send + Sync> Loss<F> for Huber<F> {
         let diff = y_true - y_pred;
         let abs_diff = diff.abs();
         if abs_diff <= self.epsilon {
-            F::from(0.5).unwrap() * diff * diff
+            cst::<F>(0.5) * diff * diff
         } else {
-            self.epsilon * (abs_diff - F::from(0.5).unwrap() * self.epsilon)
+            self.epsilon * (abs_diff - cst::<F>(0.5) * self.epsilon)
         }
     }
 
@@ -355,7 +364,7 @@ impl<F: Float + Send + Sync> Loss<F> for SquaredEpsilonInsensitive<F> {
     fn gradient(&self, y_true: F, y_pred: F) -> F {
         // `_sgd_fast.pyx.tp:379-387`: `z = y - p;
         // -2*(z-epsilon) if z > epsilon; 2*(-z-epsilon) if z < -epsilon; else 0`.
-        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        let two = cst::<F>(2.0);
         let z = y_true - y_pred;
         if z > self.epsilon {
             -two * (z - self.epsilon)
@@ -741,14 +750,14 @@ impl<F: Float> SGDClassifier<F> {
         Self {
             loss: ClassifierLoss::Hinge,
             learning_rate: LearningRateSchedule::Optimal,
-            eta0: F::from(0.0).unwrap_or_else(F::zero),
-            alpha: F::from(0.0001).unwrap_or_else(F::zero),
+            eta0: cst(0.0),
+            alpha: cst(0.0001),
             penalty: Penalty::L2,
-            l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
+            l1_ratio: cst(0.15),
             max_iter: 1000,
-            tol: F::from(1e-3).unwrap_or_else(F::zero),
+            tol: cst(1e-3),
             random_state: None,
-            power_t: F::from(0.5).unwrap_or_else(F::zero),
+            power_t: cst(0.5),
             shuffle: true,
             n_iter_no_change: 5,
             fit_intercept: true,
@@ -1117,7 +1126,7 @@ where
             // sample weight. When `fit_intercept` is false the intercept is never
             // modified and stays at its init value (`0` clf/reg, `1` one-class).
             if hyper.fit_intercept {
-                let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+                let two = cst::<F>(2.0);
                 let mut intercept_update = -eta * g;
                 if hyper.one_class {
                     intercept_update = intercept_update - two * eta * hyper.alpha;
@@ -1913,14 +1922,14 @@ impl<F: Float> SGDRegressor<F> {
             fit_intercept: true,
             shuffle: true,
             penalty: Penalty::L2,
-            l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
+            l1_ratio: cst(0.15),
             learning_rate: LearningRateSchedule::InvScaling,
-            eta0: F::from(0.01).unwrap(),
-            alpha: F::from(0.0001).unwrap(),
+            eta0: cst(0.01),
+            alpha: cst(0.0001),
             max_iter: 1000,
-            tol: F::from(1e-3).unwrap(),
+            tol: cst(1e-3),
             random_state: None,
-            power_t: F::from(0.25).unwrap(),
+            power_t: cst(0.25),
         }
     }
 
@@ -2764,14 +2773,14 @@ impl<F: Float> SGDOneClassSVM<F> {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            nu: F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one())),
+            nu: cst(0.5),
             fit_intercept: true,
             max_iter: 1000,
-            tol: F::from(1e-3).unwrap_or_else(F::zero),
+            tol: cst(1e-3),
             shuffle: true,
             learning_rate: LearningRateSchedule::Optimal,
-            eta0: F::from(0.0).unwrap_or_else(F::zero),
-            power_t: F::from(0.5).unwrap_or_else(F::zero),
+            eta0: cst(0.0),
+            power_t: cst(0.5),
             random_state: None,
             n_iter_no_change: 5,
         }
@@ -2894,7 +2903,7 @@ impl<F: Float> SGDOneClassSVM<F> {
         let n_features = x.ncols();
         // sklearn: `alpha = self.nu / 2` (`_stochastic_gradient.py:2588`),
         // `penalty="l2"`, `l1_ratio=0`, `loss="hinge"` (`:2262-2265`).
-        let two = F::from(2.0).unwrap_or_else(|| F::one() + F::one());
+        let two = cst::<F>(2.0);
         let alpha = self.nu / two;
         let hyper = SGDHyper {
             learning_rate: self.learning_rate,
