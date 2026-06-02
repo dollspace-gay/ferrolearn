@@ -36,7 +36,7 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::linear_svr::{LinearSVR, LinearSVRLoss};
+use ferrolearn_linear::linear_svr::{DualMode, LinearSVR, LinearSVRLoss};
 use ndarray::{Array1, Array2, array};
 
 /// Divergence (#609, REQ-3): sklearn's `LinearSVR` constructor defaults
@@ -345,5 +345,231 @@ fn linear_svr_n_iter() {
         (1..=MAX_ITER).contains(&n_iter),
         "n_iter must satisfy 1 <= n_iter <= max_iter ({MAX_ITER}), got {n_iter} \
          (mirrors sklearn LinearSVR.n_iter_, _classes.py:603)"
+    );
+}
+
+/// #612 (REQ-6): sklearn's `dual` defaults to `"auto"`, and for the default
+/// `epsilon_insensitive` loss `_validate_dual_parameter` resolves to the dual
+/// solver (`_classes.py:13-29`; the loss is dual-only, solver type 13,
+/// `_base.py:1015`). ferrolearn models this as `DualMode` with default `Auto`;
+/// `with_dual(Auto)` and `with_dual(True)` must produce the SAME `coef_` as the
+/// default fit AND match the live oracle — `dual` is a solver-path choice on a
+/// strongly-convex objective (R-DEV-7), so the minimizer is invariant.
+///
+/// Oracle (live sklearn 1.5.2, X=[[1]..[5]], y=2x, eps=0.1, C=1.0):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([2.,4.,6.,8.,10.]); \
+///   print([LinearSVR(epsilon=0.1,C=1.0,dual=d,fit_intercept=True, \
+///          max_iter=200000,tol=1e-10).fit(X,y).coef_.tolist() \
+///          for d in ('auto', True)])"
+/// # dual='auto' -> coef [1.9499999999701896], dual=True -> coef [1.9499999999871787]
+/// ```
+#[test]
+fn linear_svr_dual_auto_true() {
+    // Live sklearn 1.5.2: dual in {'auto', True} both give coef ~1.95 (same as
+    // the default fit pinned by linear_svr_coef_parity).
+    const SK_COEF: f64 = 1.9499999999856916;
+
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    let build = |dual: DualMode| {
+        LinearSVR::<f64>::new()
+            .with_epsilon(0.1)
+            .with_c(1.0)
+            .with_dual(dual)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&x, &y)
+            .unwrap()
+    };
+
+    // Default fit (DualMode::Auto is the constructor default).
+    let default_fit = LinearSVR::<f64>::new()
+        .with_epsilon(0.1)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+    let coef_default = default_fit.coefficients()[0];
+
+    let coef_auto = build(DualMode::Auto).coefficients()[0];
+    let coef_true = build(DualMode::True).coefficients()[0];
+
+    // Structural: Auto and True equal the default fit byte-for-byte (same solver
+    // path — Auto resolves to True, both are the existing dual CD).
+    assert_eq!(
+        coef_auto, coef_default,
+        "dual=Auto must be byte-identical to the default fit (Auto->True->dual CD)"
+    );
+    assert_eq!(
+        coef_true, coef_default,
+        "dual=True must be byte-identical to the default fit (the existing dual CD)"
+    );
+
+    // Oracle: both match live sklearn's coef ~1.95.
+    assert!(
+        (coef_auto - SK_COEF).abs() < 1e-3,
+        "dual=Auto coef parity: sklearn {SK_COEF}, ferrolearn {coef_auto}"
+    );
+    assert!(
+        (coef_true - SK_COEF).abs() < 1e-3,
+        "dual=True coef parity: sklearn {SK_COEF}, ferrolearn {coef_true}"
+    );
+}
+
+/// #612 (REQ-6): `dual=False` with the default `epsilon_insensitive` loss is an
+/// unsupported `(loss, dual)` combination — sklearn's
+/// `_get_liblinear_solver_type` has no `{False: …}` entry for that loss
+/// (`_base.py:1015`) and raises `ValueError("Unsupported set of arguments…")`
+/// (`_base.py:1047`). ferrolearn must return `Err` (FerroError::InvalidParameter,
+/// the R-DEV-2 analog of sklearn's ValueError).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([2.,4.,6.,8.,10.]); \
+///   LinearSVR(dual=False).fit(X,y)"
+/// # ValueError: Unsupported set of arguments: The combination of penalty='l2'
+/// #   and loss='epsilon_insensitive' ... is not supported
+/// ```
+#[test]
+fn linear_svr_dual_false_eps_rejected() {
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    // Default loss is EpsilonInsensitive; dual=False is unsupported -> Err.
+    let result = LinearSVR::<f64>::new()
+        .with_dual(DualMode::False)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y);
+    assert!(
+        result.is_err(),
+        "dual=False with epsilon_insensitive loss must return Err (sklearn \
+         raises ValueError 'Unsupported set of arguments', _base.py:1047)"
+    );
+}
+
+/// #612 (REQ-6): `dual=False` with `squared_epsilon_insensitive` is SUPPORTED —
+/// sklearn selects primal solver type 11 (`_base.py:1016`), while `dual=True`
+/// selects dual type 12. Both minimize the SAME strongly-convex objective
+/// `0.5·‖w‖² + C·Σ max(0,|r|−ε)²` and reach the SAME unique optimum, so
+/// ferrolearn's dual CD (R-DEV-7: implementation differs, observable coef
+/// matches) reproduces sklearn's `dual=False` coef.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([2.,4.,6.,8.,10.]); \
+///   m=LinearSVR(dual=False,loss='squared_epsilon_insensitive',epsilon=0.1, \
+///     C=1.0,fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// # coef [1.8912820512820514] intercept [0.28205128205128216]
+/// ```
+#[test]
+fn linear_svr_dual_false_squared() {
+    // Live sklearn 1.5.2: dual=False, loss='squared_epsilon_insensitive'.
+    // Identical to the dual=True squared fit (same optimum).
+    const SK_COEF: f64 = 1.8912820512820514;
+    const SK_INTERCEPT: f64 = 0.28205128205128216;
+
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    let fitted = LinearSVR::<f64>::new()
+        .with_dual(DualMode::False)
+        .with_loss(LinearSVRLoss::SquaredEpsilonInsensitive)
+        .with_epsilon(0.1)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coefficients()[0];
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef - SK_COEF).abs() < 1e-3,
+        "dual=False squared-loss coef parity: sklearn {SK_COEF}, \
+         ferrolearn {coef} (gap {:.4}). R-DEV-7: dual CD reaches liblinear's \
+         primal optimum.",
+        (coef - SK_COEF).abs()
+    );
+    assert!(
+        (intercept - SK_INTERCEPT).abs() < 1e-3,
+        "dual=False squared-loss intercept parity: sklearn {SK_INTERCEPT}, \
+         ferrolearn {intercept} (gap {:.4}).",
+        (intercept - SK_INTERCEPT).abs()
+    );
+}
+
+/// #614 (REQ-9): sklearn constrains `tol` strictly positive
+/// (`"tol": [Interval(Real, 0.0, None, closed="neither")]`, `_classes.py:508`),
+/// so `tol <= 0` raises a `ValueError` at validation. ferrolearn must return
+/// `Err` (FerroError::InvalidParameter) for `tol = 0` (and negative).
+///
+/// Oracle (live sklearn 1.5.2 — constraint at `_classes.py:508`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.]]); y=np.array([1.,2.,3.]); \
+///   LinearSVR(tol=0.0).fit(X,y)"
+/// # InvalidParameterError: The 'tol' parameter ... must be a float in the
+/// #   range (0.0, inf). Got 0.0 instead.
+/// ```
+#[test]
+fn linear_svr_tol_validation() {
+    let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
+    let y: Array1<f64> = array![1.0, 2.0, 3.0];
+
+    // tol = 0 is rejected (interval is open at 0).
+    let zero = LinearSVR::<f64>::new().with_tol(0.0).fit(&x, &y);
+    assert!(
+        zero.is_err(),
+        "tol=0.0 must return Err (sklearn Interval open at 0, _classes.py:508)"
+    );
+
+    // Negative tol is rejected too.
+    let neg = LinearSVR::<f64>::new().with_tol(-1e-4).fit(&x, &y);
+    assert!(
+        neg.is_err(),
+        "negative tol must return Err (sklearn Interval(Real,0,None,'neither'))"
+    );
+}
+
+/// #614 (REQ-9): sklearn sets the standard `n_features_in_` fitted attribute
+/// (number of columns of the `X` seen in `fit`, via `_validate_data`,
+/// `_classes.py:569-576`). ferrolearn's `FittedLinearSVR::n_features_in()` must
+/// return the number of features (`X.ncols()`).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.zeros((6,3)); X[:,0]=np.arange(6); y=np.arange(6.); \
+///   print(LinearSVR().fit(X,y).n_features_in_)"
+/// # 3
+/// ```
+#[test]
+fn linear_svr_n_features_in() {
+    // X has p=3 features; n_features_in_ must be 3 (sklearn _classes.py:569-576).
+    const P: usize = 3;
+    let mut x = Array2::<f64>::zeros((6, P));
+    for i in 0..6 {
+        x[[i, 0]] = i as f64;
+    }
+    let y: Array1<f64> = array![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+
+    let fitted = LinearSVR::<f64>::new()
+        .with_max_iter(5000)
+        .fit(&x, &y)
+        .unwrap();
+    assert_eq!(
+        fitted.n_features_in(),
+        P,
+        "n_features_in must equal X.ncols() = {P} (sklearn n_features_in_, \
+         _classes.py:569-576)"
     );
 }

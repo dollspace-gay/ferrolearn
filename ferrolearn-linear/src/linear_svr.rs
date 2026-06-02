@@ -47,10 +47,10 @@
 //! | REQ-3 (epsilon default = 0.0) | SHIPPED | `LinearSVR::new` sets `epsilon = F::zero()` (`_classes.py:522`). Pinned by `linear_svr_default_epsilon`. |
 //! | REQ-4 (loss param + squared objective) | SHIPPED | the `SquaredEpsilonInsensitive` branch sets `lambda = 0.5/C`, `upper_bound = +inf` (the `L2R_L2LOSS_SVR_DUAL` path, `linear.cpp:1078-1081`), no `1/n`. Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_squared_loss` (`loss='squared_epsilon_insensitive'`, epsilon=0.1, C=1.0 → live oracle `coef [1.8913]`, `intercept [0.2821]`, `predict([[1.5]]) ≈ 3.119`). |
 //! | REQ-5 (fit_intercept + intercept_scaling) | SHIPPED | augmented synthetic column = `intercept_scaling`, penalized in ‖w‖² (`_base.py:1189-1198`), `intercept_ = intercept_scaling·w_last`. Pinned by `linear_svr_coef_parity`, module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
-//! | REQ-6 (dual param) | NOT-STARTED | open prereq blocker #612. No `dual` parameter; optimum is dual-invariant but the constructor ABI differs (R-DEV-2). |
+//! | REQ-6 (dual param) | SHIPPED | `LinearSVR` exposes `pub dual: DualMode` (default `Auto`) + `#[must_use] with_dual`, modeling sklearn's `"dual": ["boolean", StrOptions({"auto"})]` (`_classes.py:513`, default `"auto"` `:528`). `fn fit` resolves `Auto`→dual solver and rejects `dual=False` + `EpsilonInsensitive` with `FerroError::InvalidParameter` (sklearn's `ValueError "Unsupported set of arguments"`, `_get_liblinear_solver_type`, `_base.py:1015,:1047`); `dual=False` + `SquaredEpsilonInsensitive` reuses the dual CD (same strongly-convex minimizer, R-DEV-7). Pinned by `tests/divergence_linear_svr_fit.rs::{linear_svr_dual_auto_true, linear_svr_dual_false_eps_rejected, linear_svr_dual_false_squared}`. Consumer: `pub use linear_svr::{…}` (`lib.rs`) + `PipelineEstimator` impl. |
 //! | REQ-7 (C-scaling convention) | SHIPPED | the `/n` division is removed; dual CD uses `upper_bound = C` (L1) / `lambda = 0.5/C` (L2). Pinned by `linear_svr_coef_c_dependence`. |
 //! | REQ-8 (tol/max_iter + n_iter_) | SHIPPED | `fn fit` counts dual-CD outer iterations into `FittedLinearSVR::n_iter`, exposed via `#[must_use] pub fn n_iter` (mirrors `n_iter_ = n_iter_.max().item()`, `_classes.py:603`); emits the `ConvergenceWarning`-equivalent via `eprintln!` at `max_iter` (`_base.py:1234-1238`, crate qda/lda warning channel). Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_n_iter` (`1 <= n_iter <= max_iter`). |
-//! | REQ-9 (fitted-attr contract + param validation) | NOT-STARTED | open prereq blocker #614. `intercept_` is a scalar (not length-1 ndarray); `tol>0`/`max_iter>=0`/`n_features_in_` not surfaced; `epsilon>=0` reject is stricter than sklearn's `Real`. |
+//! | REQ-9 (param validation + n_features_in_) | SHIPPED | `fn fit` validates `tol > 0` → `FerroError::InvalidParameter` (sklearn `"tol": [Interval(Real, 0.0, None, closed="neither")]`, `_classes.py:508`); `max_iter` is `usize` so `>= 0` always (sklearn `Interval(Integral,0,None,closed="left")`, `:516`) — documented, no check. Keeps `C>0`/`epsilon>=0` (both match sklearn's empirical fit-time behavior — negative epsilon raises ValueError at fit). `FittedLinearSVR` stores `n_features_in` (= `X.ncols()`), exposed via `#[must_use] pub fn n_features_in` mirroring `n_features_in_` (`_validate_data`, `_classes.py:569-576`). Pinned by `tests/divergence_linear_svr_fit.rs::{linear_svr_tol_validation, linear_svr_n_features_in}`. The `intercept_`-shape (length-1 ndarray vs scalar) sub-item is a binding-ABI concern deferred to the ferrolearn-python layer (cf. #600); `intercept()` keeps returning the scalar. Consumer: `pub use linear_svr::{…}` (`lib.rs`) + `PipelineEstimator` impl. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #615. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
@@ -69,6 +69,37 @@ pub enum LinearSVRLoss {
     /// Squared epsilon-insensitive loss: `max(0, |y - f(x)| - epsilon)^2` (L2).
     /// liblinear solver `L2R_L2LOSS_SVR_DUAL` (type 12).
     SquaredEpsilonInsensitive,
+}
+
+/// Solver selection for [`LinearSVR`], mirroring sklearn's `dual` parameter
+/// (`sklearn/svm/_classes.py:506-516` `_parameter_constraints`:
+/// `"dual": ["boolean", StrOptions({"auto"})]`, default `"auto"`).
+///
+/// sklearn's `dual` selects the liblinear dual (`True`) or primal (`False`)
+/// solver; `"auto"` resolves to one of them based on `n_samples`/`n_features`
+/// and whether the loss supports that solver
+/// (`_validate_dual_parameter`, `_classes.py:13-29`). For SVR the
+/// `epsilon_insensitive` loss is **dual-only** (solver type 13 — no `{False:…}`
+/// entry, `_base.py:1015`), so `dual=False` with that loss raises a
+/// `ValueError`; `squared_epsilon_insensitive` supports both
+/// (primal type 11 / dual type 12, `_base.py:1016`).
+///
+/// The minimizer of the strongly-convex objective is solver-invariant (R-DEV-7),
+/// so ferrolearn always uses its dual coordinate descent for the resolved
+/// solver and produces the same observable `coef_`/`intercept_`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DualMode {
+    /// `"auto"`: resolve automatically. For SVR this resolves to the dual
+    /// solver (the supported solver for both losses), matching sklearn's
+    /// `_validate_dual_parameter` (`_classes.py:13-29`).
+    Auto,
+    /// `True`: use the dual liblinear solver.
+    True,
+    /// `False`: use the primal solver. For `EpsilonInsensitive` this is
+    /// unsupported (sklearn raises `ValueError`); for
+    /// `SquaredEpsilonInsensitive` it reaches the same optimum as the dual
+    /// solver (R-DEV-7).
+    False,
 }
 
 /// Linear Support Vector Regressor (primal objective, liblinear dual CD).
@@ -105,6 +136,9 @@ pub struct LinearSVR<F> {
     ///
     /// [`fit_intercept`]: Self::fit_intercept
     pub intercept_scaling: F,
+    /// Solver selection (sklearn `dual`, default [`DualMode::Auto`]). See
+    /// [`DualMode`] for resolution semantics.
+    pub dual: DualMode,
 }
 
 impl<F: Float> LinearSVR<F> {
@@ -113,7 +147,7 @@ impl<F: Float> LinearSVR<F> {
     /// Defaults (matching `sklearn.svm.LinearSVR`, `_classes.py:519-532`):
     /// `C = 1.0`, `epsilon = 0.0`, `max_iter = 1000`, `tol = 1e-4`,
     /// `loss = EpsilonInsensitive`, `fit_intercept = true`,
-    /// `intercept_scaling = 1.0`.
+    /// `intercept_scaling = 1.0`, `dual = Auto`.
     ///
     /// # Panics
     ///
@@ -138,6 +172,7 @@ impl<F: Float> LinearSVR<F> {
             loss: LinearSVRLoss::EpsilonInsensitive,
             fit_intercept: true,
             intercept_scaling: one,
+            dual: DualMode::Auto,
         }
     }
 
@@ -190,6 +225,13 @@ impl<F: Float> LinearSVR<F> {
         self.intercept_scaling = intercept_scaling;
         self
     }
+
+    /// Set the solver selection (sklearn `dual`). See [`DualMode`].
+    #[must_use]
+    pub fn with_dual(mut self, dual: DualMode) -> Self {
+        self.dual = dual;
+        self
+    }
 }
 
 impl<F: Float> Default for LinearSVR<F> {
@@ -217,6 +259,11 @@ pub struct FittedLinearSVR<F> {
     /// liblinear's bookkeeping; it is a structural attribute satisfying
     /// `1 <= n_iter <= max_iter`.
     n_iter: usize,
+    /// Number of features seen during `fit` (the number of columns of `X`).
+    ///
+    /// Mirrors sklearn's standard `n_features_in_` fitted attribute
+    /// (set by `_validate_data` in `LinearSVR.fit`, `_classes.py:569-576`).
+    n_features_in: usize,
 }
 
 impl<F> FittedLinearSVR<F> {
@@ -230,6 +277,16 @@ impl<F> FittedLinearSVR<F> {
     #[must_use]
     pub fn n_iter(&self) -> usize {
         self.n_iter
+    }
+
+    /// Number of features seen during `fit`.
+    ///
+    /// Mirrors `sklearn.svm.LinearSVR.n_features_in_` (the standard scikit-learn
+    /// fitted attribute set by `_validate_data`, `_classes.py:569-576`): the
+    /// number of columns of the `X` passed to `fit`.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.n_features_in
     }
 }
 
@@ -248,8 +305,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InvalidParameter`] — `C` not positive, `epsilon`
-    ///   negative, or `intercept_scaling` not positive (when fitting an
-    ///   intercept).
+    ///   negative, `tol` not positive, `intercept_scaling` not positive (when
+    ///   fitting an intercept), or `dual = False` with `EpsilonInsensitive`
+    ///   loss (sklearn's unsupported `(loss, dual)` combination).
     /// - [`FerroError::InsufficientSamples`] — no samples provided.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLinearSVR<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
@@ -281,6 +339,36 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             return Err(FerroError::InvalidParameter {
                 name: "epsilon".into(),
                 reason: "must be non-negative".into(),
+            });
+        }
+
+        // `tol` must be strictly positive (sklearn
+        // `"tol": [Interval(Real, 0.0, None, closed="neither")]`,
+        // `_classes.py:508`). `max_iter` is `usize` so `>= 0` always holds
+        // (sklearn `Interval(Integral, 0, None, closed="left")`,
+        // `_classes.py:516`) — no runtime check is needed.
+        if self.tol <= F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "tol".into(),
+                reason: "must be greater than 0".into(),
+            });
+        }
+
+        // Resolve `dual` and reject unsupported (loss, dual) combinations,
+        // mirroring sklearn's `_validate_dual_parameter` (`_classes.py:13-29`)
+        // + `_get_liblinear_solver_type` (`_base.py:995-1047`). `"auto"`
+        // resolves to the dual solver (the supported solver for both SVR
+        // losses); `dual=False` with `epsilon_insensitive` is unsupported
+        // (solver dict has no `{False:…}` entry, `_base.py:1015`) → ValueError.
+        // The minimizer is solver-invariant (strongly convex; R-DEV-7), so for
+        // the supported combinations ferrolearn keeps using its dual CD and
+        // produces the oracle-matching `coef_`/`intercept_`.
+        if matches!(self.dual, DualMode::False)
+            && matches!(self.loss, LinearSVRLoss::EpsilonInsensitive)
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "dual".into(),
+                reason: "dual=False is not supported for epsilon_insensitive loss".into(),
             });
         }
 
@@ -500,6 +588,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             coefficients,
             intercept,
             n_iter,
+            n_features_in: n_features,
         })
     }
 }
