@@ -41,12 +41,16 @@ analog at all**.
 **Consequence (the REQ split).** The mean residual IS the L2-optimal leaf
 (`HalfSquaredError` update is the identity, `:155-157`/`:186`), so ferrolearn
 matches sklearn **exactly** for `GradientBoostingRegressor(loss='squared_error')`
-— **live-verified end-to-end** (see REQ-4 / Verification). For
-`AbsoluteError`/`Huber` (median / median+clipped) and `LogLoss` (Newton step)
-ferrolearn diverges from sklearn from round 1's leaf onward (it ships L2-shaped
-leaves regardless of loss). These three terminal-region updates form **one
-coherent builder-scale change** in `gradient_boosting.rs` — REQ-5/REQ-6/REQ-7
-below, blockers #734/#735/#736.
+— **live-verified end-to-end** (see REQ-4 / Verification).
+
+**SHIPPED (the terminal-region update).** ferrolearn now performs the
+`_update_terminal_regions` line-search before applying `lr*leaf` in all three fit
+loops: `group_samples_by_leaf` buckets the in-bag samples by leaf, then a per-loss
+helper replaces the leaf — `lad_leaf_value` (median), `huber_leaf_value`
+(median + clipped-mean, with `huber_stage_delta`), `binary_newton_leaf` and
+`multiclass_newton_leaf` (Newton step via `safe_divide`). `LeastSquares` keeps the
+identity (mean-residual leaf untouched) so the REQ-4 linchpin stays exact. This is
+the ONE coherent builder-scale change — REQ-5/REQ-6/REQ-7 below, now SHIPPED.
 
 ferrolearn ships the unfitted `GradientBoostingRegressor<F>` /
 `GradientBoostingClassifier<F>` + their `Fitted*` types, the `RegressionLoss`
@@ -297,9 +301,9 @@ S5/R-DEFER-1). Cites use symbol anchors (ferrolearn) / `file:line`
 | REQ-2 (negative-gradient pseudo-residuals per loss) | SHIPPED | `compute_regression_residuals` returns `y-f` (`LeastSquares`), `sign(y-f)` (`Lad`), clipped residual via `quantile_f` δ (`Huber`); GBC `fit_binary` residual `yi - sigmoid(f_vals[i])`, `fit_multiclass` `yi_k - probs[k][i]` (softmax). Mirrors `-loss.gradient` (`_fit_stage:454-458`) — squared `y-raw`, absolute `sign`, binomial `y-expit`, multinomial `y_onehot-softmax`. Consumer: feeds the per-round tree build in all three fit loops, reached via crate re-export + PyO3 `fit`. Tests: `test_regression_residuals_least_squares`, `test_regression_residuals_lad`, `test_regression_residuals_huber`. NOTE: residuals are the GRADIENT only; the leaf VALUE that consumes them is the L2 mean (REQ-5/6/7 divergence). |
 | REQ-3 (init prior) | SHIPPED | GBR `init = sum(y)/n` (`LeastSquares`) / `median_f(y)` (`Lad`/`Huber`) in `fit` mirrors `_init_state:542-547` (`DummyRegressor(strategy='mean')` / `quantile=0.5`); GBC `fit_binary` `init_val = (p_clipped/(1-p_clipped)).ln()` (log-odds prior), `fit_multiclass` `init[k] = (cnt/n).max(eps).ln()` (log-prior) mirror the `DummyClassifier(strategy='prior')` raw-prediction. Consumer: stored as `Fitted*.init`, consumed by `predict`/`predict_proba`/`decision_function` + PyO3 `predict`. Tests: covered indirectly by `test_gbr_simple_least_squares` (init=mean=3.0), `test_gbc_binary_simple`; `fitted.init()` accessor exercised. |
 | REQ-4 (GBR squared_error end-to-end parity, LINCHPIN) | SHIPPED | The L2 `_update_terminal_regions` is the identity (`_gb.py:155-157`/`:186`), so ferrolearn's mean-residual leaf (`f_vals[i] += lr*value` in the GBR `fit` loop) equals sklearn's optimal leaf, validating the entire init→residual→tree→shrinkage→predict framework array-by-array. Deterministic at `subsample=1.0`. Consumer: `FittedGradientBoostingRegressor::predict` + `RsGradientBoostingRegressor.predict` (`extras.rs:336`). LIVE-VERIFIED (R-CHAR-3): on `X=[[1..8]], y=[1,1,1,1,5,5,5,5]`, `n_estimators=5, lr=0.1, max_depth=1` ferrolearn `predict` == sklearn `[2.18098×4, 3.81902×4]` exactly; on a generic 30×3 random dataset (`n_estimators=20, max_depth=3`) ferrolearn `[-0.5098813394742213, 0.06836662653713442, -0.7685960570544793, -0.7685960570544793, -1.0872496275174468]` == sklearn `[-0.50988134, 0.06836663, -0.76859606, -0.76859606, -1.08724963]` to printed precision. Tests: `test_gbr_simple_least_squares` (in-crate, directional); the array-by-array oracle pin belongs in `ferrolearn-tree/tests/divergence_gradient_boosting.rs` (AC-4). |
-| REQ-5 (LAD terminal-region median update, HEADLINE) | NOT-STARTED | open prereq blocker #734. The GBR `fit` loop adds the regression tree's mean-residual leaf directly (`f_vals[i] += lr*value`) for ALL losses; there is NO `_update_terminal_regions` analog. sklearn replaces each leaf with the WEIGHTED MEDIAN of the leaf's residuals `y[idx]-raw[idx]` (`_update_terminal_regions` generic `else` `_gb.py:241-247` → `AbsoluteError.fit_intercept_only` `loss.py:565-574`). Live-verified divergence: skewed dataset `X=[[1..8]], y=[0,0,0,10,1,1,1,20]`, `loss='absolute_error', n_estimators=3, lr=1.0, max_depth=1` → sklearn `predict=[0,0,0,1,1,1,1,1]` (clean L1 leaves), whereas ferrolearn's L2-mean leaf yields the squared-error-shaped `[1.757, …, 19.357]` family. Part of the ONE coherent builder-scale terminal-region change (with #735/#736): after building each leaf, group its samples, compute the loss-optimal leaf value, replace it, then apply `lr*leaf`. |
-| REQ-6 (Huber terminal-region update) | NOT-STARTED | open prereq blocker #735. Same root cause as REQ-5 — no terminal-region update. sklearn leaf = `median(d) + average(sign(d)·min(δ,|d|))` over the leaf's residuals `d = y[idx]-raw[idx]` (`_update_terminal_regions` generic `else` `:241-247` → `HuberLoss.fit_intercept_only` `loss.py:694-710`), with δ from `set_huber_delta` = `weighted_percentile(|y-raw|, 100*quantile)` (`:267-272`). ferrolearn adds the clipped-residual MEAN leaf unchanged. Part of the coherent terminal-region change (#734/#735/#736). |
-| REQ-7 (LogLoss Newton terminal-region update, binary + multiclass, HEADLINE) | NOT-STARTED | open prereq blocker #736. GBC `fit_binary`/`fit_multiclass` add the regression tree's mean-residual leaf directly (`f_vals += lr*value`); NO Newton update. sklearn replaces each leaf with the single Newton-Raphson step: binary `Σw(y-p)/Σw·p(1-p)` (`_gb.py:191-206`), multiclass `(K-1)/K · Σw·neg_g/Σw·p(1-p)` (`:208-225`), with `p = y - neg_g = expit(raw)` / softmax. ferrolearn's L2-mean leaf is NOT the Newton step → `decision_function`/`predict_proba` diverge from round 1. Part of the coherent terminal-region change (#734/#735/#736); the binary and multiclass updates share the `Σw·p(1-p)` Hessian denominator. |
+| REQ-5 (LAD terminal-region median update, HEADLINE) | SHIPPED | The GBR `fit` loop now runs the terminal-region line-search before `f_vals[i] += lr*value`: `group_samples_by_leaf` buckets the in-bag samples by leaf, then for `RegressionLoss::Lad` `lad_leaf_value` replaces each leaf with `median(y[idx]-f_vals[idx])` (`AbsoluteError.fit_intercept_only`, `_loss/loss.py:565-574` → `_update_terminal_regions` generic `else` `_gb.py:241-247`). Companion fix: `compute_regression_residuals` Lad branch now matches sklearn's `CyAbsoluteError` gradient tie convention (`+1 if y >= f else -1`; the zero residual contributes `+1`, not `0`) so the leaf grouping matches sklearn's tree structure. Consumer: GBR `fit` (reached via crate re-export `lib.rs` + `RsGradientBoostingRegressor` `extras.rs:336`) → `FittedGradientBoostingRegressor::predict`. Tests: `divergence_lad_median_terminal_region` (live oracle `predict=[0.729×3,1.0×5]`, GREEN), `test_lad_leaf_value_median`, `test_group_samples_by_leaf`, `test_regression_residuals_lad` (tie convention). |
+| REQ-6 (Huber terminal-region update) | SHIPPED | The GBR `fit` loop runs `huber_stage_delta` once per stage (`_weighted_percentile(|y-f|, 100*alpha)` over the in-bag set, `set_huber_delta` `_gb.py:267-272` via `weighted_percentile_uniform` matching `utils/stats.py:_weighted_percentile`), then `huber_leaf_value` replaces each leaf with `median(d) + mean(sign(d-median)·min(δ,|d-median|))` over the leaf residuals `d = y[idx]-f_vals[idx]` (`HuberLoss.fit_intercept_only` `_loss/loss.py:694-710`). Consumer: GBR `fit` → `FittedGradientBoostingRegressor::predict` (crate re-export + `RsGradientBoostingRegressor`). Live-verified: `loss='huber', alpha=0.9, n_estimators=3, lr=0.1, max_depth=2` on `y=[0,0,0,10,1,1,1,20]` → `predict=[0.729×3, 1.60975×4, 6.149]` matches sklearn to 1e-4 (covered by `test_gbr_huber_loss` + the ephemeral oracle check). |
+| REQ-7 (LogLoss Newton terminal-region update, binary + multiclass, HEADLINE) | SHIPPED | GBC `fit_binary` runs `binary_newton_leaf` (= `Σ(y-p)/Σ p(1-p)` over the leaf, `np.average` form, `HalfBinomialLoss` branch `_gb.py:191-206`) and `fit_multiclass` runs `multiclass_newton_leaf` (= `(K-1)/K · Σ neg_g/Σ p(1-p)`, `HalfMultinomialLoss` branch `:208-225`) to replace each leaf before `f_vals += lr*value`; both go through `safe_divide` (`_safe_divide` `_gb.py:66-78`, `|den|<1e-150 → 0`). Consumer: GBC `fit` → `predict`/`predict_proba`/`decision_function` (crate re-export `lib.rs` + `RsGradientBoostingClassifier` `extras.rs:670`). Live-verified: binary `predict_proba[:,1]=[0.297947…×4, 0.702052…×4]` (`divergence_logloss_newton_terminal_region_binary`, GREEN); multiclass `predict_proba` row0 `[0.626013,0.186993,0.186993]` matches sklearn exactly (the `decision_function` raw scores differ only by the softmax-invariant `ln(K)` init-prior offset, REQ-3). Tests: `divergence_logloss_newton_terminal_region_binary`, `test_binary_newton_leaf_value` (incl. zero-Hessian guard). |
 | REQ-8 (friedman_mse criterion + feature_importances) | NOT-STARTED | open prereq blocker #737. GB trees use `criterion='friedman_mse'` (`_fit_stage:472`, constraint `:361`); ferrolearn's `build_regression_tree_with_feature_subset` uses MSE. SPLIT selection is identical (Friedman improvement is monotone in single-split MSE reduction → same threshold, same structure at `subsample=1.0`), but the node-impurity used for `compute_feature_importances` differs, so `feature_importances_` MAGNITUDES diverge from sklearn (ordering typically preserved). ferrolearn exposes no explicit `criterion` param. |
 | REQ-9 (subsample bootstrap RNG) | NOT-STARTED | open prereq blocker #738 (RNG-boundary). At `subsample<1.0` the GBR/GBC fit loops draw `rand::seq::index::sample(&mut StdRng, ...)`; sklearn draws its bootstrap mask from numpy-MT `random_state` (`_fit_stages:855-862`). Different PRNG streams → different per-round subsamples → no array-by-array parity (the documented numpy-MT-vs-StdRng boundary). At `subsample=1.0` (the default) both short-circuit to all samples and agree — that path is covered by REQ-4. ferrolearn reproducibility within its own RNG holds (`test_gbr_reproducibility`, `test_gbc_reproducibility`). |
 | REQ-10 (missing param surface + early stopping + staged API) | NOT-STARTED | open prereq blocker #739. ferrolearn exposes none of: `n_iter_no_change`/`validation_fraction`/`tol` early stopping (`_fit_stages:840-945`), explicit `criterion` (`:472`), `ccp_alpha` (`:482`), `max_features` (`:479`), `min_impurity_decrease` (`:478`), `max_leaf_nodes`, `min_weight_fraction_leaf` (`:477`), the pluggable `init` estimator (`_init_state:538`), `staged_predict`/`staged_decision_function`, nor GBR `alpha`/`loss='quantile'` (PinballLoss, `_init_state:544`). |
@@ -315,27 +319,32 @@ boundary types (public hyperparameter fields + `with_*` builders + `Default`).
 **GBR `fit`:** `init = mean(y)` (L2) / `median_f(y)` (LAD/Huber); each round
 (1) `compute_regression_residuals` (REQ-2), (2) optional subsample
 (`StdRng`, REQ-9), (3) `build_regression_tree_with_feature_subset` on the
-residuals (MSE, REQ-8), (4) **add the tree's mean-residual leaf directly**
-`f_vals[i] += lr*value` — **no `_update_terminal_regions`** (REQ-5/REQ-6
-divergence). After the loop, `compute_feature_importances` (REQ-8) builds the
+residuals (MSE, REQ-8), (4) **terminal-region line-search**: for `Lad`/`Huber`,
+`group_samples_by_leaf` then replace each leaf with `lad_leaf_value` /
+`huber_leaf_value` (`LeastSquares` is the identity — leaf untouched), then
+`f_vals[i] += lr*value` (REQ-5/REQ-6, SHIPPED). After the loop,
+`compute_feature_importances` (REQ-8) builds the
 normalized `feature_importances`. `FittedGradientBoostingRegressor::predict`
 sums `init + Σ lr*leaf` over the stored trees.
 
 **GBC `fit`** dispatches on `n_classes`: `fit_binary` (single tree sequence on
 log-odds residuals `y - σ(f)`, init log-odds prior) or `fit_multiclass`
-(`K` trees per round on `y_onehot_k - softmax_k`, init log-prior). Both add the
-mean-residual leaf directly — **no Newton terminal-region update** (REQ-7).
+(`K` trees per round on `y_onehot_k - softmax_k`, init log-prior). Both now run
+the Newton terminal-region update (`binary_newton_leaf` / `multiclass_newton_leaf`
+via `group_samples_by_leaf` + `safe_divide`) to replace each leaf before
+`f_vals += lr*value` (REQ-7, SHIPPED).
 `predict`/`predict_proba`/`decision_function`/`predict_log_proba` traverse the
 stored trees and apply `sigmoid` (binary) / `softmax` (multiclass) to the
 cumulative raw score.
 
 **Invariants held:** default-matching param surface; correct per-loss negative
-gradients; correct init priors; L2 identity-update parity (REQ-4); deterministic
-`subsample=1.0` path; own-RNG reproducibility; feature-count guard on predict.
-**Invariants NOT held vs sklearn:** (a) NO `_update_terminal_regions` — leaves
-are the L2 mean residual for every loss, so LAD/Huber/LogLoss diverge from round
-1 (REQ-5/6/7, the ONE coherent builder-scale change: group leaf samples →
-compute loss-optimal leaf value → replace → apply `lr*leaf`); (b) MSE instead of
+gradients (incl. the LAD `+1`-at-tie convention); correct init priors;
+L2 identity-update parity (REQ-4); **the `_update_terminal_regions` line-search
+leaf update for Lad/Huber/LogLoss (REQ-5/6/7) — group leaf samples → compute the
+loss-optimal leaf value (median / median+clipped-mean / Newton step) → replace →
+apply `lr*leaf`, with the L2 identity preserved**; deterministic `subsample=1.0`
+path; own-RNG reproducibility; feature-count guard on predict.
+**Invariants NOT held vs sklearn:** (b) MSE instead of
 friedman_mse impurity → `feature_importances_` magnitude divergence (REQ-8);
 (c) `StdRng` vs numpy-MT at `subsample<1.0` (REQ-9, boundary); (d) missing early
 stopping / `criterion` / `ccp_alpha` / `max_features` / `init` / `alpha` / staged

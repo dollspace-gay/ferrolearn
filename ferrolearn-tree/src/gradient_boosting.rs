@@ -37,6 +37,33 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 8);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.GradientBoostingClassifier` /
+//! `GradientBoostingRegressor` (`sklearn/ensemble/_gb.py` + `sklearn/_loss`).
+//! See `.design/tree/gradient_boosting.md`. Non-test consumers: crate
+//! re-export + `RsGradientBoostingRegressor`/`RsGradientBoostingClassifier`
+//! PyO3 bindings (`ferrolearn-python/src/extras.rs`).
+//!
+//! **Determinism:** at the default `subsample=1.0` the fit is fully
+//! deterministic and end-to-end-comparable to sklearn; `subsample<1.0` draws
+//! `StdRng` vs numpy MT19937 — a documented stochastic-GB boundary (#743).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param defaults: `n_estimators=100`, `learning_rate=0.1`, `max_depth=3`, `subsample=1.0` | SHIPPED |
+//! | REQ-2 | Negative-gradient pseudo-residuals per loss (L2/LAD/Huber/LogLoss; LAD tie `+1 if y>=F`) | SHIPPED |
+//! | REQ-3 | Init prior: mean (L2) / median (LAD,Huber) / log-odds (binary) (multiclass raw `ln(K)` offset = #742) | SHIPPED |
+//! | REQ-4 | `GradientBoostingRegressor(squared_error)` end-to-end parity (subsample=1.0) | SHIPPED |
+//! | REQ-5 | LAD terminal region = `_weighted_percentile(y-F, 50)` per leaf (`_gb.py:241-247`, `loss.py:565-574`) | SHIPPED |
+//! | REQ-6 | Huber terminal region = median + clipped-mean, stage `delta` percentile (`loss.py:694-710`, `_gb.py:267-272`) | SHIPPED |
+//! | REQ-7 | LogLoss Newton terminal region: binary `Σ(y-p)/Σp(1-p)`, multiclass `(K-1)/K·Σr/Σp(1-p)` (`_gb.py:191-225`) | SHIPPED |
+//! | REQ-8 | `friedman_mse` criterion + feature_importances (trees use mse — same splits; importance may differ) | NOT-STARTED (#740) |
+//! | REQ-8b | decision_tree exact-MSE-tie split-feature choice (→ multiclass GBC predict_proba drift) | NOT-STARTED (#739) |
+//! | REQ-9 | `subsample<1.0` numpy-parity (stochastic GB) | NOT-STARTED (#743, RNG boundary) |
+//! | REQ-10 | Early stopping (`n_iter_no_change`/`validation_fraction`/`tol`) + `ccp_alpha`/`max_features`/`min_impurity_decrease`/`init`/`staged_predict` | NOT-STARTED (#741) |
+//! | REQ-12 | ferray substrate migration | NOT-STARTED (#744) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -322,7 +349,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for GradientBoo
             };
 
             // Build a regression tree on the pseudo-residuals.
-            let tree = build_regression_tree_with_feature_subset(
+            let mut tree = build_regression_tree_with_feature_subset(
                 x,
                 &residuals,
                 &sample_indices,
@@ -330,7 +357,35 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for GradientBoo
                 &params,
             );
 
-            // Update predictions.
+            // Terminal-region (line-search) leaf update over the in-bag leaf
+            // samples (`_update_terminal_regions`, `_gb.py:129-264`). L2 is the
+            // identity (`:155-157`/:186) — leave the mean-residual leaf untouched
+            // so the REQ-4 linchpin stays exact. Lad/Huber replace each leaf with
+            // the loss-optimal value before `f_vals += lr*leaf`.
+            match self.loss {
+                RegressionLoss::LeastSquares => {}
+                RegressionLoss::Lad => {
+                    let groups = group_samples_by_leaf(&tree, x, &sample_indices);
+                    for (&leaf_idx, leaf_samples) in &groups {
+                        let v = lad_leaf_value(y, &f_vals, leaf_samples);
+                        if let Node::Leaf { value, .. } = &mut tree[leaf_idx] {
+                            *value = v;
+                        }
+                    }
+                }
+                RegressionLoss::Huber => {
+                    let delta = huber_stage_delta(y, &f_vals, &sample_indices, self.huber_alpha);
+                    let groups = group_samples_by_leaf(&tree, x, &sample_indices);
+                    for (&leaf_idx, leaf_samples) in &groups {
+                        let v = huber_leaf_value(y, &f_vals, leaf_samples, delta);
+                        if let Node::Leaf { value, .. } = &mut tree[leaf_idx] {
+                            *value = v;
+                        }
+                    }
+                }
+            }
+
+            // Update predictions with the (possibly replaced) leaf values.
             for i in 0..n_samples {
                 let row = x.row(i);
                 let leaf_idx = decision_tree::traverse(&tree, &row);
@@ -781,7 +836,7 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
             };
 
             // Build tree on residuals.
-            let tree = build_regression_tree_with_feature_subset(
+            let mut tree = build_regression_tree_with_feature_subset(
                 x,
                 &residuals,
                 &sample_indices,
@@ -789,7 +844,18 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
                 params,
             );
 
-            // Update f_vals.
+            // Terminal-region Newton-step leaf update (`HalfBinomialLoss` branch,
+            // `_gb.py:191-206`): replace each leaf with `Σ(y-p) / Σ p(1-p)` over
+            // its in-bag samples (`p = sigmoid(raw) = probs[i]`), then add lr*leaf.
+            let groups = group_samples_by_leaf(&tree, x, &sample_indices);
+            for (&leaf_idx, leaf_samples) in &groups {
+                let v = binary_newton_leaf(&residuals, &probs, leaf_samples);
+                if let Node::Leaf { value, .. } = &mut tree[leaf_idx] {
+                    *value = v;
+                }
+            }
+
+            // Update f_vals with the replaced leaf values.
             for i in 0..n_samples {
                 let row = x.row(i);
                 let leaf_idx = decision_tree::traverse(&tree, &row);
@@ -889,7 +955,7 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
                     residuals[i] = yi_k - probs[k][i];
                 }
 
-                let tree = build_regression_tree_with_feature_subset(
+                let mut tree = build_regression_tree_with_feature_subset(
                     x,
                     &residuals,
                     &sample_indices,
@@ -897,7 +963,19 @@ impl<F: Float + Send + Sync + 'static> GradientBoostingClassifier<F> {
                     params,
                 );
 
-                // Update f_vals for class k.
+                // Terminal-region Newton-step leaf update (`HalfMultinomialLoss`
+                // branch, `_gb.py:208-225`): replace each leaf with
+                // `(K-1)/K · Σ neg_g / Σ p(1-p)` over its in-bag samples
+                // (`p = probs[k][i]`), then add lr*leaf.
+                let groups = group_samples_by_leaf(&tree, x, &sample_indices);
+                for (&leaf_idx, leaf_samples) in &groups {
+                    let v = multiclass_newton_leaf(&residuals, &probs[k], leaf_samples, n_classes);
+                    if let Node::Leaf { value, .. } = &mut tree[leaf_idx] {
+                        *value = v;
+                    }
+                }
+
+                // Update f_vals for class k with the replaced leaf values.
                 for (i, fv) in f_vals[k].iter_mut().enumerate() {
                     let row = x.row(i);
                     let leaf_idx = decision_tree::traverse(&tree, &row);
@@ -1332,16 +1410,20 @@ fn compute_regression_residuals<F: Float>(
             residuals
         }
         RegressionLoss::Lad => {
-            // negative gradient of |y - f| is sign(y - f)
+            // Negative gradient of |y - f|. scikit-learn's `CyAbsoluteError`
+            // gradient (`sklearn/_loss/_loss.pyx`, exposed via
+            // `AbsoluteError.gradient`) uses the tie-break `gradient = -1 if
+            // y >= raw else +1`, so the NEGATIVE gradient is `+1 if y >= raw else
+            // -1` — a sample with a ZERO residual (`y == f`) contributes `+1`, NOT
+            // `0`. Matching this is load-bearing: the tie must not introduce a
+            // spurious within-leaf split (R-DEV-1; live-verified, see
+            // `test_regression_residuals_lad`).
             let mut residuals = Array1::zeros(n);
             for i in 0..n {
-                let diff = y[i] - f_vals[i];
-                residuals[i] = if diff > F::zero() {
+                residuals[i] = if y[i] >= f_vals[i] {
                     F::one()
-                } else if diff < F::zero() {
-                    -F::one()
                 } else {
-                    F::zero()
+                    -F::one()
                 };
             }
             residuals
@@ -1364,6 +1446,221 @@ fn compute_regression_residuals<F: Float>(
             }
             residuals
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Terminal-region (leaf-value) line-search updates
+// ---------------------------------------------------------------------------
+//
+// After fitting a regression tree to the negative gradient, scikit-learn's
+// `_update_terminal_regions` (`sklearn/ensemble/_gb.py:129-264`) REPLACES each
+// leaf's value with the loss-optimal line-search value
+// (`argmin_x loss(y, raw_old + x*value)`, `:149-151`) computed over the in-bag
+// samples that fall in that leaf, THEN applies `raw += learning_rate * leaf`
+// (`:262-264`). `HalfSquaredError`'s update is the IDENTITY (`:155-157`/`:186`),
+// so only Lad/Huber/LogLoss need the replacement.
+
+/// Convert an `f64` constant to `F` without an `.unwrap()` (R-CODE-2): every
+/// constant used here (`2.0`, `n`, `(K-1)/K`, `1e-150`) is finite, so `F::from`
+/// succeeds; the `F::zero()` fallback can only fire on an unreachable `None`.
+fn f_from<F: Float>(v: f64) -> F {
+    F::from(v).unwrap_or_else(F::zero)
+}
+
+/// Group the in-bag `sample_indices` by the flat-`Vec<Node>` leaf index they
+/// traverse to.
+///
+/// Mirrors the leaf bucketing in `_update_terminal_regions`
+/// (`sklearn/ensemble/_gb.py:184` `terminal_regions = tree.apply(X)`, masked to
+/// the in-bag `sample_mask` at `:188-189`). At `subsample == 1.0`,
+/// `sample_indices` is `0..n_samples` (all samples); for `subsample < 1.0` it is
+/// the subsampled in-bag set, matching sklearn's mask.
+///
+/// Returns `(leaf_idx -> Vec<sample_idx>)` keyed by the leaf's position in the
+/// flat tree.
+fn group_samples_by_leaf<F: Float>(
+    tree: &[Node<F>],
+    x: &Array2<F>,
+    sample_indices: &[usize],
+) -> std::collections::HashMap<usize, Vec<usize>> {
+    let mut groups: std::collections::HashMap<usize, Vec<usize>> = std::collections::HashMap::new();
+    for &i in sample_indices {
+        let row = x.row(i);
+        let leaf_idx = decision_tree::traverse(tree, &row);
+        groups.entry(leaf_idx).or_default().push(i);
+    }
+    groups
+}
+
+/// Loss-optimal leaf value for `AbsoluteError` (LAD): the median of the leaf's
+/// residuals `diff = y[idx] - f_vals[idx]`.
+///
+/// Mirrors `_update_terminal_regions` generic `else`
+/// (`sklearn/ensemble/_gb.py:241-247`) →
+/// `AbsoluteError.fit_intercept_only` (`sklearn/_loss/loss.py:565-574`). Because
+/// `fit` always passes `sample_weight = _check_sample_weight(None, X) = np.ones`
+/// (never `None`, `_gb.py:255`), the loss takes the
+/// `_weighted_percentile(y_true, sample_weight, 50)` branch — the LOWER weighted
+/// percentile (`sklearn/utils/stats.py:53-68`), NOT `np.median`. For an even
+/// count this is a single sorted element (the lower-middle), never the average of
+/// the two middles. sklearn 1.5.2 has no `_averaged_weighted_percentile`.
+fn lad_leaf_value<F: Float>(y: &Array1<F>, f_vals: &Array1<F>, idx: &[usize]) -> F {
+    let diffs: Vec<F> = idx.iter().map(|&i| y[i] - f_vals[i]).collect();
+    weighted_percentile_uniform(&diffs, 50.0)
+}
+
+/// Lower weighted percentile with uniform weights, matching
+/// `sklearn.utils.stats._weighted_percentile` (`sklearn/utils/stats.py:6`) used
+/// by `set_huber_delta` (`sklearn/ensemble/_gb.py:267-272`).
+///
+/// Sorts `vals`, takes the cumulative (uniform) weight CDF, and returns the value
+/// at the first sorted index whose CDF reaches `percentile/100 * total_weight`
+/// (`np.searchsorted`, left side). With uniform weights of 1, `total = n`,
+/// `target = percentile/100 * n`, and the index is the first `i` with
+/// `i + 1 >= target` clipped to `n-1` — the LOWER percentile sklearn computes.
+/// (`percentile == 0` is special-cased to skip leading zero-weight observations;
+/// with all-ones weights the nudged target still lands on index 0.)
+fn weighted_percentile_uniform<F: Float>(vals: &[F], percentile: f64) -> F {
+    let n = vals.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let mut sorted: Vec<F> = vals.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let total = n as f64;
+    let mut adjusted = percentile / 100.0 * total;
+    if adjusted == 0.0 {
+        // GH20528: nudge off exactly zero so the search skips leading
+        // zero-weight observations; with uniform weights this stays at index 0.
+        adjusted = f64::MIN_POSITIVE;
+    }
+    // weight_cdf[i] = i + 1; searchsorted (left) finds first i with i+1 >= target.
+    let mut idx = n - 1;
+    for i in 0..n {
+        if (i + 1) as f64 >= adjusted {
+            idx = i;
+            break;
+        }
+    }
+    sorted[idx]
+}
+
+/// Per-stage Huber `delta`, computed ONCE per stage over the in-bag samples like
+/// sklearn's `set_huber_delta` (`sklearn/ensemble/_gb.py:267-272`):
+/// `_weighted_percentile(|y - raw|, sample_weight, 100 * quantile)`.
+fn huber_stage_delta<F: Float>(
+    y: &Array1<F>,
+    f_vals: &Array1<F>,
+    sample_indices: &[usize],
+    huber_alpha: f64,
+) -> F {
+    let abserr: Vec<F> = sample_indices
+        .iter()
+        .map(|&i| (y[i] - f_vals[i]).abs())
+        .collect();
+    weighted_percentile_uniform(&abserr, 100.0 * huber_alpha)
+}
+
+/// Loss-optimal leaf value for `HuberLoss`: `median(diff) + average(sign(diff -
+/// median) * min(delta, |diff - median|))` over the leaf's residuals
+/// `diff = y[idx] - f_vals[idx]`.
+///
+/// Mirrors `HuberLoss.fit_intercept_only` (`sklearn/_loss/loss.py:694-710`) with
+/// `delta` from [`huber_stage_delta`]. The `median` term is
+/// `_weighted_percentile(y_true, sample_weight, 50)` — the LOWER weighted
+/// percentile — because `fit` always passes `sample_weight = np.ones` (never
+/// `None`, `_gb.py:255`); for an even count this is a single sorted element, NOT
+/// `np.median`'s average of the two middles. Unweighted (`subsample == 1.0`):
+/// `np.average` is the arithmetic mean.
+fn huber_leaf_value<F: Float>(y: &Array1<F>, f_vals: &Array1<F>, idx: &[usize], delta: F) -> F {
+    let n = idx.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let diffs: Vec<F> = idx.iter().map(|&i| y[i] - f_vals[i]).collect();
+    let median = weighted_percentile_uniform(&diffs, 50.0);
+    let mut term_sum = F::zero();
+    for &d in &diffs {
+        let resid = d - median;
+        let sign = if resid > F::zero() {
+            F::one()
+        } else if resid < F::zero() {
+            -F::one()
+        } else {
+            F::zero()
+        };
+        let clipped = delta.min(resid.abs());
+        term_sum = term_sum + sign * clipped;
+    }
+    median + term_sum / f_from(n as f64)
+}
+
+/// Loss-optimal leaf value for `HalfBinomialLoss` — the single Newton-Raphson
+/// step `average(neg_g) / average(p(1-p))` over the leaf's samples, with
+/// `p = y - neg_g = sigmoid(raw)`.
+///
+/// Mirrors the `HalfBinomialLoss` branch of `_update_terminal_regions`
+/// (`sklearn/ensemble/_gb.py:191-206`): `numerator = average(neg_g)`,
+/// `denominator = average(prob*(1-prob))`, `_safe_divide(num, den)` returning
+/// `0.0` when `|den| < 1e-150` (`:66-78`). `neg_g[i] = residual[i] = y[i] - p[i]`.
+fn binary_newton_leaf<F: Float>(residuals: &Array1<F>, probs: &[F], idx: &[usize]) -> F {
+    let n = idx.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let nf = f_from::<F>(n as f64);
+    let mut num = F::zero();
+    let mut den = F::zero();
+    for &i in idx {
+        let p = probs[i];
+        num = num + residuals[i];
+        den = den + p * (F::one() - p);
+    }
+    safe_divide(num / nf, den / nf)
+}
+
+/// Loss-optimal leaf value for `HalfMultinomialLoss` (class-`k` tree) — the
+/// Newton step `(K-1)/K * average(neg_g) / average(p(1-p))` over the leaf's
+/// samples, with `p` the softmax probability of class `k`.
+///
+/// Mirrors the `HalfMultinomialLoss` branch of `_update_terminal_regions`
+/// (`sklearn/ensemble/_gb.py:208-225`): `numerator = average(neg_g) * (K-1)/K`,
+/// `denominator = average(prob*(1-prob))`, `_safe_divide(num, den)`.
+fn multiclass_newton_leaf<F: Float>(
+    residuals: &Array1<F>,
+    probs_k: &[F],
+    idx: &[usize],
+    n_classes: usize,
+) -> F {
+    let n = idx.len();
+    if n == 0 {
+        return F::zero();
+    }
+    let nf = f_from::<F>(n as f64);
+    let mut num = F::zero();
+    let mut den = F::zero();
+    for &i in idx {
+        let p = probs_k[i];
+        num = num + residuals[i];
+        den = den + p * (F::one() - p);
+    }
+    let k_factor = f_from::<F>((n_classes - 1) as f64 / n_classes as f64);
+    safe_divide((num / nf) * k_factor, den / nf)
+}
+
+/// Division guarding a near-zero (or exactly zero) Hessian denominator, returning
+/// `0.0` when `|denominator| < 1e-150`.
+///
+/// Mirrors `_safe_divide` (`sklearn/ensemble/_gb.py:66-78`): a zero Hessian
+/// (`proba == 0` or `1` exactly) means no loss improvement, so the leaf value is
+/// set to zero.
+fn safe_divide<F: Float>(numerator: F, denominator: F) -> F {
+    let threshold = f_from::<F>(1e-150);
+    if denominator.abs() < threshold {
+        F::zero()
+    } else {
+        numerator / denominator
     }
 }
 
@@ -1897,12 +2194,114 @@ mod tests {
 
     #[test]
     fn test_regression_residuals_lad() {
+        // sklearn's `AbsoluteError.gradient` tie convention is `gradient = -1 if
+        // y >= raw else +1`, so the NEGATIVE gradient is `+1 if y >= raw else -1`.
+        // The zero-residual sample (`y == f`) yields `+1`, NOT `0` (live-probed:
+        // `AbsoluteError().gradient(y=[1.], raw=[1.]) == [-1.0]`, neg == +1.0).
         let y = array![1.0, 2.0, 3.0];
         let f = array![0.5, 2.5, 3.0];
         let r = compute_regression_residuals(&y, &f, RegressionLoss::Lad, 0.9);
-        assert_relative_eq!(r[0], 1.0, epsilon = 1e-10);
-        assert_relative_eq!(r[1], -1.0, epsilon = 1e-10);
-        assert_relative_eq!(r[2], 0.0, epsilon = 1e-10);
+        assert_relative_eq!(r[0], 1.0, epsilon = 1e-10); // y>f -> +1
+        assert_relative_eq!(r[1], -1.0, epsilon = 1e-10); // y<f -> -1
+        assert_relative_eq!(r[2], 1.0, epsilon = 1e-10); // y==f tie -> +1 (sklearn)
+    }
+
+    // -- Terminal-region (leaf-value) line-search updates (REQ-5/6/7) --
+
+    #[test]
+    fn test_group_samples_by_leaf() {
+        // Build a depth-1 tree on a clean step target so the split lands at 3.5,
+        // bucketing samples {0,1,2} into the left leaf and {3,..,7} into the right.
+        let x = array![[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0], [8.0]];
+        let residuals = array![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+        let params = decision_tree::TreeParams {
+            max_depth: Some(1),
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+        };
+        let idx: Vec<usize> = (0..8).collect();
+        let tree = build_regression_tree_with_feature_subset(&x, &residuals, &idx, &[0], &params);
+        let groups = group_samples_by_leaf(&tree, &x, &idx);
+        // Every sample is grouped under exactly one leaf; the partition is {0,1,2}
+        // and {3,4,5,6,7} (split at 3.5).
+        let total: usize = groups.values().map(std::vec::Vec::len).sum();
+        assert_eq!(total, 8);
+        assert_eq!(groups.len(), 2);
+        let mut sizes: Vec<usize> = groups.values().map(std::vec::Vec::len).collect();
+        sizes.sort_unstable();
+        assert_eq!(sizes, vec![3, 5]);
+    }
+
+    #[test]
+    fn test_lad_leaf_value_median() {
+        // sklearn replaces the leaf with `np.median(y[idx] - raw[idx])`
+        // (`AbsoluteError.fit_intercept_only`, `_loss/loss.py:565-574`). For the
+        // skewed leaf {3,4,5,6,7} of the divergence fixture (y=[10,1,1,1,20],
+        // raw=1.0) the residuals are [9,0,0,0,19], whose median is 0.0 — the
+        // exact `value=0.0` sklearn assigns (live-verified tree dump, stage 0).
+        let y = array![0.0, 0.0, 0.0, 10.0, 1.0, 1.0, 1.0, 20.0];
+        let f = Array1::from_elem(8, 1.0);
+        let leaf = vec![3usize, 4, 5, 6, 7];
+        assert_relative_eq!(lad_leaf_value(&y, &f, &leaf), 0.0, epsilon = 1e-12);
+        // The left leaf {0,1,2}: residuals [-1,-1,-1], median -1.0 (sklearn value).
+        let leaf_l = vec![0usize, 1, 2];
+        assert_relative_eq!(lad_leaf_value(&y, &f, &leaf_l), -1.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn test_binary_newton_leaf_value() {
+        // sklearn's `HalfBinomialLoss` leaf = `Σ(y-p) / Σ p(1-p)` over the leaf
+        // (`_gb.py:191-206`; with uniform weights `np.average` = mean, the n
+        // cancels). Hand-computed: residuals = y - p with p = 0.5 (init log-odds
+        // 0 -> sigmoid 0.5). For a leaf {0,1,2,3} of class-1 samples
+        // (y_mapped=1), residual = 1 - 0.5 = 0.5 each; p(1-p) = 0.25 each.
+        // leaf = (4*0.5) / (4*0.25) = 2.0 / 1.0 = 2.0.
+        let residuals = array![0.5, 0.5, 0.5, 0.5, -0.5, -0.5, -0.5, -0.5];
+        let probs = vec![0.5f64; 8];
+        let leaf = vec![0usize, 1, 2, 3];
+        assert_relative_eq!(
+            binary_newton_leaf(&residuals, &probs, &leaf),
+            2.0,
+            epsilon = 1e-12
+        );
+        // Zero-Hessian guard: a leaf with p == 1 exactly gives denominator 0 ->
+        // sklearn `_safe_divide` returns 0.0 (`_gb.py:66-78`).
+        let probs_deg = vec![1.0f64; 8];
+        assert_relative_eq!(
+            binary_newton_leaf(&residuals, &probs_deg, &leaf),
+            0.0,
+            epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn test_least_squares_leaf_identity() {
+        // The L2 terminal-region update is the IDENTITY (`_gb.py:155-157`/:186):
+        // the GBR fit loop must NOT touch the mean-residual leaf for
+        // `LeastSquares`. Confirm the built leaf for the skewed right group keeps
+        // the residual MEAN (5.6), which differs sharply from the LAD median (0.0)
+        // — proving the L2 path keeps the mean, not a median/Newton value.
+        let x = array![[1.0], [2.0], [3.0], [4.0], [5.0], [6.0], [7.0], [8.0]];
+        let y = array![0.0, 0.0, 0.0, 10.0, 1.0, 1.0, 1.0, 20.0];
+        let residuals = array![-1.0, -1.0, -1.0, 9.0, 0.0, 0.0, 0.0, 19.0];
+        let params = decision_tree::TreeParams {
+            max_depth: Some(1),
+            min_samples_split: 2,
+            min_samples_leaf: 1,
+        };
+        let idx: Vec<usize> = (0..8).collect();
+        let tree = build_regression_tree_with_feature_subset(&x, &residuals, &idx, &[0], &params);
+        let groups = group_samples_by_leaf(&tree, &x, &idx);
+        let f0 = Array1::from_elem(8, 0.0);
+        for samples in groups.values() {
+            if samples.len() == 5 {
+                let lad = lad_leaf_value(&y, &f0, samples);
+                let mean: f64 =
+                    samples.iter().map(|&i| residuals[i]).sum::<f64>() / samples.len() as f64;
+                assert_relative_eq!(mean, 5.6, epsilon = 1e-12);
+                assert!((lad - mean).abs() > 1.0, "median must differ from mean");
+            }
+        }
     }
 
     #[test]
