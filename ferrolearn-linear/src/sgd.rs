@@ -58,7 +58,7 @@
 //! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) divides `current_eta` by 5 (not 2) when `no_improve_count >= n_iter_no_change` AND the schedule is `Adaptive` AND `eta > 1e-6`, resetting the count — the SAME `best_loss`/`sumloss > best_loss - tol*n` machinery as convergence (`_sgd_fast.pyx.tp:697-707`). The old `>= prev_loss` 5-epoch `/2` trigger is deleted. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_adaptive_schedule_divisor` (live oracle coef `[0.8065190275590332, 0.15336844797680402]` intercept `0.12731338963662575`, n_iter_ 80). Closes #528. |
 //! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`fit_intercept`, `epsilon`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. (`penalty`/`l1_ratio` shipped under REQ-5; `shuffle` under REQ-12; `n_iter_no_change` folded into REQ-10.) |
 //! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | SHIPPED | `fn convergence_tail` (shared by `fn train_binary_sgd`/`train_regressor_sgd`) tracks `best_loss` (running min, init `+inf`) and increments `no_improve_count` when `tol_active && sumloss > best_loss - tol*n_samples`, resetting otherwise; breaks once `no_improve_count >= hyper.n_iter_no_change` (non-adaptive), exactly mirroring `_sgd_fast.pyx.tp:688-707`. `sumloss` is now the SUM of per-sample losses over the epoch (the `/= n_samples` mean division is removed, `_sgd_fast.pyx.tp:597`); `tol_active = hyper.tol > -inf` encodes sklearn's `tol=None -> -INFINITY` disable (`:690`). The per-sample gradient is clipped to `[-1e12, 1e12]` via `fn max_dloss` before the update (`_sgd_fast.pyx.tp:546,613-620`). `n_iter_no_change` is now a settable `pub` field (default 5) with `fn with_n_iter_no_change` on both estimators, threaded through `SGDHyper`/`clf_hyper`/`reg_hyper` (`_stochastic_gradient.py` `n_iter_no_change=5`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_convergence_n_iter_no_change` (live oracle coef `[0.8037686404055491, 0.16059017315681692]` intercept `0.12903834217696583`, n_iter_ 49). Closes #530. |
-//! | REQ-11 (fit_intercept) | NOT-STARTED | blocker #531. No field; intercept always fit (`_sgd_fast.pyx.tp:639`). |
+//! | REQ-11 (fit_intercept) | SHIPPED | `pub fit_intercept: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_fit_intercept` builders (default `true`, sklearn `_stochastic_gradient.py` `fit_intercept=True`, constraint `["boolean"]` at `:86`), threaded through `SGDHyper.fit_intercept` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the intercept update: `if hyper.fit_intercept { *intercept = *intercept - eta * grad; }`, mirroring `if fit_intercept == 1: intercept_update = update; ... intercept += intercept_update * intercept_decay` (`_sgd_fast.pyx.tp:639-644`, `intercept_decay=1` on the standard path). When `false` the intercept is never modified and stays at its init value `0` (`b = F::zero()` before training in `fn fit_ova`/regressor `Fit::fit`), so `coef_` matches sklearn and `intercept_` is exactly `0`. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_fit_intercept_false` (live oracle coef `[0.5326796739094939, 0.44573604649819804]`, intercept exactly `0.0`). Closes #531. |
 //! | REQ-12 (shuffle flag) | SHIPPED | `pub shuffle: bool` field on `SGDClassifier`/`SGDRegressor` + `fn with_shuffle` builders (default `true`, `_stochastic_gradient.py:107` `shuffle=True`, constraint `["boolean"]` at `:89`), threaded through `SGDHyper.shuffle` + `fn clf_hyper`/`reg_hyper`. `fn train_binary_sgd`/`train_regressor_sgd` gate the per-epoch shuffle: `if hyper.shuffle { indices.shuffle(&mut rng); }`, mirroring `if shuffle: dataset.shuffle(seed)` (`_sgd_fast.pyx.tp:579-580`); when off, `indices` stays `0..n-1` each epoch matching sklearn's no-shuffle index order (`:581` `for i in range(n_samples)`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_shuffle_false_multisample_kernel_parity` (4-sample/2-feature/5-epoch L2 oracle coef `[0.5103165909636498, 0.42319810364130317]` intercept `0.16255331549195393`; elasticnet l1_ratio=0.3 oracle coef `[0.5102136050112174, 0.4230749783888256]` intercept `0.16265294456399926`). Closes #532. This `shuffle=false` parity ALSO validates REQ-4/REQ-5/REQ-6 (L2 shrink + elasticnet truncated gradient + constant schedule) over MULTIPLE samples and epochs against the live oracle — previously only single-sample. |
 //! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
 //! | REQ-14 (average / ASGD) | NOT-STARTED | blocker #534. No averaged coef/intercept (`_sgd_fast.pyx.tp:646-654`). |
@@ -639,6 +639,12 @@ pub struct SGDClassifier<F> {
     /// `eta` is divided by 5. Defaults to `5` (sklearn
     /// `_stochastic_gradient.py` `n_iter_no_change=5`, `_sgd_fast.pyx.tp:698`).
     pub n_iter_no_change: usize,
+    /// Whether to fit (update) the intercept. Defaults to `true` (sklearn
+    /// `SGDClassifier(fit_intercept=True)`, `_stochastic_gradient.py:104`,
+    /// constraint `["boolean"]` at `:86`). When `false` the intercept is never
+    /// updated and stays at its init value `0` (`_sgd_fast.pyx.tp:639-644`: the
+    /// intercept update is gated on `if fit_intercept == 1`).
+    pub fit_intercept: bool,
 }
 
 impl<F: Float> SGDClassifier<F> {
@@ -664,6 +670,7 @@ impl<F: Float> SGDClassifier<F> {
             power_t: F::from(0.5).unwrap_or_else(F::zero),
             shuffle: true,
             n_iter_no_change: 5,
+            fit_intercept: true,
         }
     }
 
@@ -761,6 +768,19 @@ impl<F: Float> SGDClassifier<F> {
         self.n_iter_no_change = n_iter_no_change;
         self
     }
+
+    /// Set whether the intercept (bias) term is fit.
+    ///
+    /// Mirrors sklearn's `fit_intercept` parameter (default `True`,
+    /// `_stochastic_gradient.py:104`, constraint `["boolean"]` at `:86`). With
+    /// `false` the intercept update is skipped every step
+    /// (`_sgd_fast.pyx.tp:639-644`: `if fit_intercept == 1: ... intercept += ...`)
+    /// and the intercept stays at its init value `0`.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDClassifier<F> {
@@ -783,6 +803,7 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         l1_ratio: clf.l1_ratio,
         shuffle: clf.shuffle,
         n_iter_no_change: clf.n_iter_no_change,
+        fit_intercept: clf.fit_intercept,
     }
 }
 
@@ -806,6 +827,9 @@ struct SGDHyper<F> {
     /// adaptive-eta decay triggers (`_stochastic_gradient.py` default 5,
     /// `_sgd_fast.pyx.tp:698`).
     n_iter_no_change: usize,
+    /// Whether to fit (update) the intercept each step. When `false` the
+    /// intercept update is skipped (`_sgd_fast.pyx.tp:639-644`).
+    fit_intercept: bool,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -921,9 +945,15 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] - eta * grad * xi[j];
             }
-            // The intercept is NOT regularized (`intercept_decay=1`,
-            // `_sgd_fast.pyx.tp:639-644`).
-            *intercept = *intercept - eta * grad;
+            // The intercept update is gated on `fit_intercept` and is NOT
+            // regularized (`intercept_decay=1`, `_sgd_fast.pyx.tp:639-644`:
+            // `if fit_intercept == 1: intercept_update = update; ...
+            // intercept += intercept_update * intercept_decay`). When
+            // `fit_intercept` is false the intercept is never modified and
+            // stays at its init value `0` (`intercept` enters this fn as `0`).
+            if hyper.fit_intercept {
+                *intercept = *intercept - eta * grad;
+            }
 
             // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
             // the gradient add only for L1/ElasticNet (`_sgd_fast.pyx.tp:656-658`,
@@ -1522,6 +1552,12 @@ pub struct SGDRegressor<F> {
     /// `eta` is divided by 5. Defaults to `5` (sklearn
     /// `_stochastic_gradient.py` `n_iter_no_change=5`, `_sgd_fast.pyx.tp:698`).
     pub n_iter_no_change: usize,
+    /// Whether to fit (update) the intercept. Defaults to `true` (sklearn
+    /// `SGDRegressor(fit_intercept=True)`, `_stochastic_gradient.py:2031`,
+    /// constraint `["boolean"]` at `:86`). When `false` the intercept is never
+    /// updated and stays at its init value `0` (`_sgd_fast.pyx.tp:639-644`: the
+    /// intercept update is gated on `if fit_intercept == 1`).
+    pub fit_intercept: bool,
 }
 
 impl<F: Float> SGDRegressor<F> {
@@ -1537,6 +1573,7 @@ impl<F: Float> SGDRegressor<F> {
         Self {
             loss: RegressorLoss::SquaredError,
             n_iter_no_change: 5,
+            fit_intercept: true,
             shuffle: true,
             penalty: Penalty::L2,
             l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
@@ -1644,6 +1681,19 @@ impl<F: Float> SGDRegressor<F> {
         self.n_iter_no_change = n_iter_no_change;
         self
     }
+
+    /// Set whether the intercept (bias) term is fit.
+    ///
+    /// Mirrors sklearn's `fit_intercept` parameter (default `True`,
+    /// `_stochastic_gradient.py:2031`, constraint `["boolean"]` at `:86`). With
+    /// `false` the intercept update is skipped every step
+    /// (`_sgd_fast.pyx.tp:639-644`: `if fit_intercept == 1: ... intercept += ...`)
+    /// and the intercept stays at its init value `0`.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
 }
 
 impl<F: Float> Default for SGDRegressor<F> {
@@ -1666,6 +1716,7 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         l1_ratio: reg.l1_ratio,
         shuffle: reg.shuffle,
         n_iter_no_change: reg.n_iter_no_change,
+        fit_intercept: reg.fit_intercept,
     }
 }
 
@@ -1773,8 +1824,15 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] - eta * grad * xi[j];
             }
-            // The intercept is NOT regularized.
-            *intercept = *intercept - eta * grad;
+            // The intercept update is gated on `fit_intercept` and is NOT
+            // regularized (`_sgd_fast.pyx.tp:639-644`: `if fit_intercept == 1:
+            // intercept_update = update; ... intercept += intercept_update *
+            // intercept_decay`). When `fit_intercept` is false the intercept is
+            // never modified and stays at its init value `0` (`intercept` enters
+            // this fn as `0`).
+            if hyper.fit_intercept {
+                *intercept = *intercept - eta * grad;
+            }
 
             // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
             // the gradient add only for L1/ElasticNet (`_sgd_fast.pyx.tp:656-658`,

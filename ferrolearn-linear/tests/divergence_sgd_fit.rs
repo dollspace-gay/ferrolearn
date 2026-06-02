@@ -729,6 +729,84 @@ fn sgd_adaptive_schedule_divisor() {
 }
 
 // ---------------------------------------------------------------------------
+// REQ-11 / #531 — `fit_intercept=False` skips the intercept update.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:639-644`
+//   `if fit_intercept == 1:`
+//   `    intercept_update = update`
+//   `    if one_class: ...`
+//   `    if intercept_update != 0:`
+//   `        intercept += intercept_update * intercept_decay`
+//   so with `fit_intercept=0` the intercept update is NEVER executed; the
+//   intercept stays at its init value `0`. `fit_intercept` defaults to `True`
+//   (`_stochastic_gradient.py`), constraint `["boolean"]` at `:86`.
+//
+// ferrolearn site: `ferrolearn-linear/src/sgd.rs` `train_regressor_sgd` /
+//   `train_binary_sgd` — the intercept update is gated
+//   `if hyper.fit_intercept { *intercept = *intercept - eta * grad; }`. The
+//   intercept enters training as `0` (`b = F::zero()` in the regressor `Fit::fit`
+//   / `fit_ova`), so with `fit_intercept=false` it remains EXACTLY `0`.
+//
+// Multi-sample / multi-epoch, `shuffle=false`, constant schedule, `tol=None`,
+// so the full update kernel is deterministic and cross-impl comparable. The
+// `coef_` must match sklearn's `fit_intercept=False` `coef_` to ULP precision,
+// and BOTH intercepts must be exactly `0.0` (no leakage from the init).
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation (live scikit-learn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]]); y=np.array([1.,2.,3.,4.]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l2',alpha=0.01, \
+///   learning_rate='constant',eta0=0.01,max_iter=5,tol=None,shuffle=False, \
+///   fit_intercept=False,random_state=0).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+/// -> coef [0.5326796739094939, 0.44573604649819804]   intercept [0.0]
+///
+/// Compare against the `fit_intercept=True` companion
+/// (`sgd_shuffle_false_multisample_kernel_parity`, intercept
+/// `0.16255331549195393`): turning the flag off zeroes the intercept and shifts
+/// the coefficients onto the through-origin fit, exactly as sklearn does.
+#[test]
+fn sgd_fit_intercept_false() {
+    const SK_COEF0: f64 = 0.5326796739094939;
+    const SK_COEF1: f64 = 0.44573604649819804;
+    const SK_INTERCEPT: f64 = 0.0;
+
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0]).unwrap();
+    let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 4.0]);
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L2)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.01)
+        .with_alpha(0.01)
+        .with_max_iter(5)
+        .with_tol(-1.0) // disable convergence early-exit (tol=None analog)
+        .with_shuffle(false) // index order 0..n-1 each epoch, matches sklearn
+        .with_fit_intercept(false)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-9 && (coef[1] - SK_COEF1).abs() < 1e-9,
+        "fit_intercept=false coef diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}]; \
+         ferrolearn coef={coef:?}"
+    );
+    // The intercept must be EXACTLY 0.0 on both sides (no init leakage).
+    assert_eq!(
+        intercept, SK_INTERCEPT,
+        "fit_intercept=false must leave the intercept at exactly 0.0 (sklearn \
+         intercept_ == 0.0); ferrolearn intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // REQ-2 / #523 — `squared_hinge` classifier loss
 // (`SquaredHinge(threshold=1.0)`).
 //
