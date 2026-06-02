@@ -56,7 +56,7 @@
 //! | REQ-3 (predict + classes_) | SHIPPED | `fn predict` uses the sign of the binary decision (`>= 0 → classes_[1]`) / argmax of the OvR scores; `HasClasses::classes` = sorted unique `y` (`classes_ = np.unique(y)`, `_classes.py:311`). The labels are downstream of the liblinear-parity fit and pinned against the live oracle by `linear_svc_predict_parity in tests/divergence_linear_svc_fit.rs` (#620; 8×2 set: `predict [0,0,0,0,1,1,1,1]`, `classes_ [0,1]`). |
 //! | REQ-4 (loss {hinge, squared_hinge}) | SHIPPED | The dual CD solves BOTH the true `hinge` (`U=C`, `diag=0`) and `squared_hinge` (`U=∞`, `diag=0.5/C`) optima (`solve_l2r_l1l2_svc`, `linear.cpp:849-858`). The `hinge` optimum is pinned against the live oracle by `linear_svc_hinge_coef_parity in tests/divergence_linear_svc_fit.rs` (#621; 8×2 set, `loss='hinge'`, `C=1.0`: `coef_ [[0.15384615383852776, 0.15384615383915584]]`, `intercept_ [-1.4615384615168394]`). |
 //! | REQ-5 (penalty {l1, l2}) | SHIPPED | `LinearSVC<F>` exposes `pub penalty: LinearSVCPenalty` (default `L2`) + `#[must_use] with_penalty`. `penalty=l1` routes to `fn solve_binary_l1r_l2` — liblinear's feature-major coordinate descent (`solve_l1r_l2_svc`, `linear.cpp:1467`, solver type 5, `_base.py:1014`) minimizing `‖w‖₁ + C·Σ max(0,1−yf)²` (sparse `coef_`); `penalty=l2` keeps `fn solve_binary_dual`. `liblinear_solver_type` rejects `('l1','hinge')` (`_base.py:1013`). Pinned by `test_l1_penalty_smoke` (live oracle 8×2 `l1,squared_hinge,dual=False,C=1`: `coef_ [[0.1283185834966579, 0.12831858464059265]]`, `intercept_ [-1.2079646017762715]`; ferrolearn lands within ~1.2e-9) + `test_unsupported_combinations_rejected`. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
-//! | REQ-6 (multi_class {ovr, crammer_singer}) | NOT-STARTED | open prereq blocker #623. `fn fit` implements one-vs-rest (the default `'ovr'`) but there is no `multi_class` field / `crammer_singer` joint solver. |
+//! | REQ-6 (multi_class {ovr, crammer_singer}) | SHIPPED | `LinearSVC<F>` exposes `pub multi_class: MultiClass` (`Ovr`/`CrammerSinger`, default `Ovr`, `_classes.py:239`) + `#[must_use] with_multi_class`. `multi_class=CrammerSinger` selects liblinear solver type 4 REGARDLESS of penalty/loss/dual (`_get_liblinear_solver_type`, `_base.py:1017,1020-1021`), so `fn fit` short-circuits to `fn fit_crammer_singer` (ignoring penalty/loss/dual) which runs ONE joint solve `fn solve_crammer_singer` — a faithful transcription of `Solver_MCSVM_CS` (`linear.cpp:510`, the class at `:493-787`): flattened `w[feature*nr_class + m]`, `alpha[i*nr_class + m]` with `Σ_m alpha=0`, `C[i] = weighted_C[y_i]`, per-sample shrinking (`active_size_i`/`alpha_index`/`be_shrunk`), the simplex inner solve `fn cs_solve_sub_problem` (sort-descending breakpoint, `linear.cpp:541-564`), and the two-level `eps_shrink = max(10·tol, 1)` stopping (`linear.cpp:738-753`). Extraction: `coef_[m][feature] = w[feature*nr_class + m]`, `intercept_[m] = intercept_scaling·w[n_features*nr_class + m]` (`_base.py:1240-1245`). BINARY: collapse to a single weight vector `coef_ = row_1 − row_0`, `intercept_ = int_1 − int_0` (`_classes.py:340-344`), `is_binary=true`. ferrolearn sweeps natural order (no `bounded_rand_int` shuffle, `linear.cpp:629`); the CS optimum is unique so the limit is identical (documented RNG/shrink-path boundary). Pinned by `test_crammer_singer_smoke in linear_svc.rs` (live oracle 3-class set `coef [[-0.06762,-0.24341],[0.30048,0.02171],[-0.23286,0.22171]]`, `int [0.91078,-0.62206,-0.28873]`, predict all-correct; binary 8×2 collapse `coef [[0.15504,0.15504]]`, `int [-1.48062]`; within 1e-2). The rigorous oracle pin in `tests/divergence_linear_svc_fit.rs` is the critic's next step. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-7 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVC<F>` exposes `pub fit_intercept: bool` (default true) + `pub intercept_scaling: F` (default 1.0) + `#[must_use]` builders. When fitting an intercept the design matrix is augmented with a penalized constant column = `intercept_scaling`, and `intercept_ = intercept_scaling·w_last` (`_base.py:1188-1198,:1240-1245`); `intercept_scaling > 0` is validated. Pinned by `linear_svc_coef_parity` + module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
 //! | REQ-8 (dual param) | SHIPPED | `LinearSVC<F>` exposes `pub dual: DualMode` (default `Auto`) + `#[must_use] with_dual`. `fn resolve_dual` resolves `Auto→bool` (`_validate_dual_parameter`, `_classes.py:13-29`: `n<f`→prefer dual, else→prefer primal, with fallback) against `fn liblinear_solver_type` (the `_get_liblinear_solver_type` matrix, `_base.py:995-1018`), and `fn fit` validates the resolved combo (`hinge+dual=false`, `l1+dual=true`, `l1+hinge` all rejected → `FerroError::InvalidParameter`). R-DEV-7: the resolved `dual` is **observably immaterial for `penalty=l2`** — the l2 dual CD and l2 primal minimize the same `0.5·‖w‖² + C·Σ L` and reach the same `coef_`/`intercept_`, so `penalty=l2` keeps `fn solve_binary_dual` regardless of `dual`. Pinned by `test_unsupported_combinations_rejected` + `test_dual_auto_resolution`. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
 //! | REQ-9 (class_weight) | SHIPPED | `LinearSVC<F>` exposes `pub class_weight: ClassWeight<F>` (`None`/`Balanced`/`Explicit`, default `None`) + `#[must_use] with_class_weight`. `fn compute_class_weight` (mirroring `sklearn.utils.compute_class_weight`, `class_weight.py:63-81`, as called at `_base.py:1179`) expands per-class weights; `fn fit` scales `C` per class: binary `cp = C·weights[idx(classes[1])]`, `cn = C·weights[idx(classes[0])]` (`train_one(Cp=weighted_C[1], Cn=weighted_C[0])`, `linear.cpp:2543-2551`), OvR class `k` `cp = C·weights[k]`, `cn = C` base (the negative rest is UNWEIGHTED, `linear.cpp:2559-2571`). `SolverConfig` now carries `(cp, cn)`; `solve_binary_dual`/`solve_binary_l1r_l2` apply the per-sample `C_[i] = (y_i>0?cp:cn)` (`diag[i]`/`upper_bound[i]`/`C[i]`, `linear.cpp:843-858`,`:1504-1509`). When `cp == cn` (no class_weight) the math is identical to before (the 9 divergence pins stay green). Pinned by `test_class_weight_smoke in linear_svc.rs` (live oracle 8×2 imbalanced set, `squared_hinge,dual=True,C=1.0`: `None coef [[0.10056,0.15957]] int [-1.26346]`; `balanced coef [[0.09937,0.16666]] int [-1.21320]` weights `[0.6667,2.0]`; `{0:1,1:5} coef [[0.11059,0.17164]] int [-1.29547]`; ferrolearn within 1e-2). The rigorous oracle pin in `tests/divergence_linear_svc_fit.rs` is the critic's next step. Consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). |
@@ -115,6 +115,28 @@ pub enum DualMode {
     True,
     /// Solve the primal optimization problem.
     False,
+}
+
+/// Multiclass strategy for [`LinearSVC`].
+///
+/// Mirrors `sklearn.svm.LinearSVC`'s `multi_class` parameter
+/// (`sklearn/svm/_classes.py:239`, constraint `{"ovr", "crammer_singer"}`,
+/// default `"ovr"`). `Ovr` trains one binary classifier per class (the default,
+/// using the penalty/loss/dual solver matrix); `CrammerSinger` runs the joint
+/// Crammer-Singer multiclass SVM solver (`Solver_MCSVM_CS`,
+/// `liblinear/linear.cpp:493-787`, solver type 4).
+///
+/// When `CrammerSinger` is selected, `_get_liblinear_solver_type` returns 4
+/// **regardless of penalty/loss/dual** (`_base.py:1017,1020-1021`), so the
+/// penalty/loss/dual parameters are ignored and the joint solver runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MultiClass {
+    /// One-vs-rest: one binary sub-problem per class (the default).
+    #[default]
+    Ovr,
+    /// Joint Crammer-Singer multiclass SVM (`Solver_MCSVM_CS`, solver type 4,
+    /// `linear.cpp:493-787`). Ignores penalty/loss/dual (`_base.py:1017`).
+    CrammerSinger,
 }
 
 /// Loss function for [`LinearSVC`].
@@ -301,6 +323,10 @@ pub struct LinearSVC<F> {
     /// `class_weight[i]·C` (`compute_class_weight`, `_base.py:1179`;
     /// `weighted_C[i] = C·class_weight[i]`, `linear.cpp:2496-2507`).
     pub class_weight: ClassWeight<F>,
+    /// Multiclass strategy. Default [`MultiClass::Ovr`] (one-vs-rest).
+    /// [`MultiClass::CrammerSinger`] runs the joint Crammer-Singer solver,
+    /// ignoring penalty/loss/dual (`_base.py:1017`, `_classes.py:239`).
+    pub multi_class: MultiClass,
 }
 
 impl<F: Float> LinearSVC<F> {
@@ -309,7 +335,7 @@ impl<F: Float> LinearSVC<F> {
     /// Defaults (matching `sklearn.svm.LinearSVC`, `_classes.py`):
     /// `C = 1.0`, `max_iter = 1000`, `tol = 1e-4`, `loss = SquaredHinge`,
     /// `penalty = L2`, `dual = Auto`, `fit_intercept = true`,
-    /// `intercept_scaling = 1.0`, `class_weight = None`.
+    /// `intercept_scaling = 1.0`, `class_weight = None`, `multi_class = Ovr`.
     #[must_use]
     pub fn new() -> Self {
         // 1e-4/1.0 are exactly representable in f32/f64; the defensive fallback
@@ -328,6 +354,7 @@ impl<F: Float> LinearSVC<F> {
             fit_intercept: true,
             intercept_scaling: one,
             class_weight: ClassWeight::None,
+            multi_class: MultiClass::Ovr,
         }
     }
 
@@ -398,6 +425,16 @@ impl<F: Float> LinearSVC<F> {
     #[must_use]
     pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
         self.class_weight = class_weight;
+        self
+    }
+
+    /// Set the multiclass strategy (sklearn `multi_class`, `_classes.py:239`).
+    /// [`MultiClass::Ovr`] (default) trains one-vs-rest binary classifiers;
+    /// [`MultiClass::CrammerSinger`] runs the joint Crammer-Singer solver
+    /// (ignoring penalty/loss/dual, `_base.py:1017`).
+    #[must_use]
+    pub fn with_multi_class(mut self, multi_class: MultiClass) -> Self {
+        self.multi_class = multi_class;
         self
     }
 }
@@ -1093,6 +1130,340 @@ fn solve_binary_l1r_l2<F: Float + 'static>(
     (w, n_iter, converged)
 }
 
+/// Solve the joint Crammer-Singer multiclass SVM, transcribing liblinear's
+/// `Solver_MCSVM_CS` (`sklearn/svm/src/liblinear/linear.cpp:493-787`,
+/// solver type 4, `_base.py:1017`).
+///
+/// Minimizes the Crammer-Singer objective over a single joint weight matrix
+/// `w` flattened as `(w_size × nr_class)` with `w[feature*nr_class + m]`. The
+/// dual variables `alpha[i*nr_class + m]` satisfy `Σ_m alpha[i,m] = 0`,
+/// `alpha[i,m] <= C[i]` if `y_i == m` else `alpha[i,m] <= 0`. Per sample,
+/// `C[i] = W[i] · weighted_C[y_i]` (`linear.cpp:521-522`); here `W[i] = 1` and
+/// `weighted_C[c] = C · class_weight[c]` (`= C` when `class_weight=None`).
+///
+/// `y_class[i]` is the class index (`0..nr_class`, the sorted-`classes`
+/// position) of sample `i`. When `fit_intercept`, the design matrix is augmented
+/// with the constant column `intercept_scaling` at feature index `n_features`
+/// (it IS part of `QD` and `w`, `linear.cpp:512`/`608-618` over the augmented
+/// row).
+///
+/// State / sweep / shrinking (`linear.cpp:576-754`) is transcribed faithfully,
+/// including per-sample shrinking (`active_size_i`, `alpha_index`) and the
+/// two-level stopping (`eps_shrink = max(10·eps, 1)`). liblinear shuffles the
+/// `index` set each sweep (`bounded_rand_int`, `linear.cpp:629`); ferrolearn
+/// sweeps NATURAL ORDER (no RNG) — the Crammer-Singer optimum is unique, so the
+/// limit is identical (the documented RNG/shrink-path boundary, as the dual/l1
+/// solvers). `eps = tol` (the solver receives `param->eps` directly,
+/// `linear.cpp:2535`).
+///
+/// Returns `(w_flat, n_iter, converged)` where `w_flat[feature*nr_class + m]`.
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    reason = "faithful transcription of liblinear Solver_MCSVM_CS (linear.cpp:493-787); \
+              the args mirror the solver's ctor + Solve() inputs (prob/nr_class/weighted_C/\
+              eps/max_iter/bias) and grouping them would obscure the 1:1 transcription"
+)]
+fn solve_crammer_singer<F: Float + 'static>(
+    x: &Array2<F>,
+    y_class: &[usize],
+    nr_class: usize,
+    weighted_c: &[F],
+    max_iter: usize,
+    tol: F,
+    fit_intercept: bool,
+    intercept_scaling: F,
+) -> (Vec<F>, usize, bool) {
+    let (l, n_features) = x.dim();
+    let w_size = if fit_intercept {
+        n_features + 1
+    } else {
+        n_features
+    };
+
+    let inf = F::infinity();
+    let ten = F::from(10).unwrap_or_else(|| {
+        let two = F::one() + F::one();
+        two + two + two + two + two
+    });
+    let tiny = F::from(1.0e-12).unwrap_or_else(F::epsilon);
+
+    // `C[i] = W[i] · weighted_C[y_i]`; `W[i] = 1` (`linear.cpp:521-522`).
+    let c_per_sample: Vec<F> = y_class.iter().map(|&yi| weighted_c[yi]).collect();
+
+    // `x_val(i, feat)` over the augmented row (feature index `n_features` is the
+    // constant intercept_scaling column when fit_intercept).
+    let x_val = |i: usize, feat: usize| -> F {
+        if feat < n_features {
+            x[[i, feat]]
+        } else {
+            intercept_scaling
+        }
+    };
+
+    // alpha[i*nr_class + m], w[feature*nr_class + m] (`linear.cpp:580-602`).
+    let mut alpha = vec![F::zero(); l * nr_class];
+    let mut w = vec![F::zero(); w_size * nr_class];
+
+    // alpha_index[i*nr_class + m] = m; QD[i] = ||x_i||^2 over the augmented row;
+    // active_size_i[i] = nr_class; y_index[i] = y_class[i] (`linear.cpp:603-622`).
+    let mut alpha_index = vec![0usize; l * nr_class];
+    let mut qd = vec![F::zero(); l];
+    let mut active_size_i = vec![nr_class; l];
+    let mut y_index = y_class.to_vec();
+    let mut index: Vec<usize> = (0..l).collect();
+    for i in 0..l {
+        for m in 0..nr_class {
+            alpha_index[i * nr_class + m] = m;
+        }
+        let mut acc = F::zero();
+        for feat in 0..w_size {
+            let v = x_val(i, feat);
+            acc = acc + v * v;
+        }
+        qd[i] = acc;
+    }
+
+    // Scratch buffers reused per sample (`B`, `G`, `alpha_new`,
+    // `linear.cpp:518-519,581`).
+    let mut b_buf = vec![F::zero(); nr_class];
+    let mut g_buf = vec![F::zero(); nr_class];
+    let mut alpha_new = vec![F::zero(); nr_class];
+
+    let mut active_size = l;
+    // eps_shrink = max(10·eps, 1) (`linear.cpp:590`).
+    let mut eps_shrink = (ten * tol).max(F::one());
+    let mut start_from_all = true;
+
+    let mut iter = 0usize;
+    let mut converged = false;
+
+    while iter < max_iter {
+        let mut stopping = -inf;
+
+        // liblinear shuffles index[0..active_size] here (`linear.cpp:627-631`);
+        // ferrolearn sweeps natural order (no RNG); the unique optimum is
+        // unchanged at the limit.
+
+        let mut s = 0;
+        while s < active_size {
+            let i = index[s];
+            let ai = qd[i];
+
+            if ai > F::zero() {
+                let asi = active_size_i[i];
+                // G[m] = (m==y_i ? 0 : 1) + w_{alpha_index[m]} · x_i
+                // (`linear.cpp:641-653`).
+                for g in g_buf.iter_mut().take(asi) {
+                    *g = F::one();
+                }
+                if y_index[i] < asi {
+                    g_buf[y_index[i]] = F::zero();
+                }
+                for feat in 0..w_size {
+                    let xv = x_val(i, feat);
+                    if xv == F::zero() {
+                        continue;
+                    }
+                    let base = feat * nr_class;
+                    for m in 0..asi {
+                        let idx = alpha_index[i * nr_class + m];
+                        g_buf[m] = g_buf[m] + w[base + idx] * xv;
+                    }
+                }
+
+                // minG over {alpha_i[idx]<0} ∪ {y_i if alpha_i[y_i]<C[i]};
+                // maxG over all active m (`linear.cpp:655-666`).
+                let mut min_g = inf;
+                let mut max_g = -inf;
+                for m in 0..asi {
+                    let idx = alpha_index[i * nr_class + m];
+                    if alpha[i * nr_class + idx] < F::zero() && g_buf[m] < min_g {
+                        min_g = g_buf[m];
+                    }
+                    if g_buf[m] > max_g {
+                        max_g = g_buf[m];
+                    }
+                }
+                if y_index[i] < asi
+                    && alpha[i * nr_class + y_class[i]] < c_per_sample[i]
+                    && g_buf[y_index[i]] < min_g
+                {
+                    min_g = g_buf[y_index[i]];
+                }
+
+                // Per-sample shrinking via be_shrunk (`linear.cpp:668-697`).
+                let mut m = 0;
+                while m < active_size_i[i] {
+                    let idx_m = alpha_index[i * nr_class + m];
+                    if cs_be_shrunk(
+                        c_per_sample[i],
+                        m,
+                        y_index[i],
+                        alpha[i * nr_class + idx_m],
+                        g_buf[m],
+                        min_g,
+                    ) {
+                        active_size_i[i] -= 1;
+                        while active_size_i[i] > m {
+                            let asi_top = active_size_i[i];
+                            let idx_top = alpha_index[i * nr_class + asi_top];
+                            if !cs_be_shrunk(
+                                c_per_sample[i],
+                                asi_top,
+                                y_index[i],
+                                alpha[i * nr_class + idx_top],
+                                g_buf[asi_top],
+                                min_g,
+                            ) {
+                                alpha_index.swap(i * nr_class + m, i * nr_class + asi_top);
+                                g_buf.swap(m, asi_top);
+                                if y_index[i] == asi_top {
+                                    y_index[i] = m;
+                                } else if y_index[i] == m {
+                                    y_index[i] = asi_top;
+                                }
+                                break;
+                            }
+                            active_size_i[i] -= 1;
+                        }
+                    }
+                    m += 1;
+                }
+
+                if active_size_i[i] <= 1 {
+                    active_size -= 1;
+                    index.swap(s, active_size);
+                    continue; // re-process the swapped-in element at `s`
+                }
+
+                if max_g - min_g <= tiny {
+                    s += 1;
+                    continue;
+                }
+                stopping = stopping.max(max_g - min_g);
+
+                // B[m] = G[m] - Ai·alpha_i[idx] (`linear.cpp:704-705`).
+                let asi = active_size_i[i];
+                for m in 0..asi {
+                    let idx = alpha_index[i * nr_class + m];
+                    b_buf[m] = g_buf[m] - ai * alpha[i * nr_class + idx];
+                }
+
+                cs_solve_sub_problem(ai, y_index[i], c_per_sample[i], asi, &b_buf, &mut alpha_new);
+
+                // Apply d = alpha_new[m] - alpha_i[idx] and update w
+                // (`linear.cpp:708-728`).
+                let mut d_nz: Vec<(usize, F)> = Vec::new();
+                for m in 0..asi {
+                    let idx = alpha_index[i * nr_class + m];
+                    let d = alpha_new[m] - alpha[i * nr_class + idx];
+                    alpha[i * nr_class + idx] = alpha_new[m];
+                    if d.abs() >= tiny {
+                        d_nz.push((idx, d));
+                    }
+                }
+                if !d_nz.is_empty() {
+                    for feat in 0..w_size {
+                        let xv = x_val(i, feat);
+                        if xv == F::zero() {
+                            continue;
+                        }
+                        let base = feat * nr_class;
+                        for &(idx, d) in &d_nz {
+                            w[base + idx] = w[base + idx] + d * xv;
+                        }
+                    }
+                }
+            }
+
+            s += 1;
+        }
+
+        iter += 1;
+
+        // Two-level stopping (`linear.cpp:738-753`).
+        if stopping < eps_shrink {
+            if stopping < tol && start_from_all {
+                converged = true;
+                break;
+            }
+            active_size = l;
+            for asi in active_size_i.iter_mut() {
+                *asi = nr_class;
+            }
+            eps_shrink = (eps_shrink / (F::one() + F::one())).max(tol);
+            start_from_all = true;
+        } else {
+            start_from_all = false;
+        }
+    }
+
+    (w, iter, converged)
+}
+
+/// `Solver_MCSVM_CS::be_shrunk` (`linear.cpp:566-574`): shrink class `m` of
+/// sample `i` when its dual variable is at its bound and the gradient is below
+/// `minG`. `bound = C[i]` if `m == yi` (the class index), else `0`.
+fn cs_be_shrunk<F: Float>(c_yi: F, m: usize, yi: usize, alpha_i: F, g_m: F, min_g: F) -> bool {
+    let bound = if m == yi { c_yi } else { F::zero() };
+    alpha_i == bound && g_m < min_g
+}
+
+/// `Solver_MCSVM_CS::solve_sub_problem` (`linear.cpp:541-564`): the per-sample
+/// simplex-projection inner solve. `B[..active_i]` is the gradient offset
+/// buffer; the result is written to `alpha_new[..active_i]`.
+///
+/// Clones `B → D`, adds `Ai·C_yi` to `D[yi]` (when `yi < active_i`), sorts `D`
+/// DESCENDING, then finds the breakpoint `beta` and projects each coordinate:
+/// `alpha_new[r] = min(C_yi, (beta-B[r])/Ai)` for `r == yi`, else
+/// `min(0, (beta-B[r])/Ai)`.
+fn cs_solve_sub_problem<F: Float + 'static>(
+    ai: F,
+    yi: usize,
+    c_yi: F,
+    active_i: usize,
+    b_buf: &[F],
+    alpha_new: &mut [F],
+) {
+    // clone(D, B, active_i); D[yi] += Ai·C_yi (`linear.cpp:546-548`).
+    let mut d: Vec<F> = b_buf[..active_i].to_vec();
+    if yi < active_i {
+        d[yi] = d[yi] + ai * c_yi;
+    }
+    // qsort DESCENDING (compare_double returns -1 when a > b, `linear.cpp:532-538`).
+    d.sort_by(|a, b| match b.partial_cmp(a) {
+        Some(ord) => ord,
+        None => core::cmp::Ordering::Equal,
+    });
+
+    // beta = D[0] - Ai·C_yi; for r=1; r<active_i && beta<r·D[r]; r++ { beta+=D[r]; }
+    // beta /= r (`linear.cpp:551-554`).
+    let mut beta = d[0] - ai * c_yi;
+    let mut r = 1usize;
+    while r < active_i {
+        let r_f = F::from(r).unwrap_or_else(F::one);
+        if beta < r_f * d[r] {
+            beta = beta + d[r];
+            r += 1;
+        } else {
+            break;
+        }
+    }
+    let r_f = F::from(r).unwrap_or_else(F::one);
+    beta = beta / r_f;
+
+    // Project each coordinate (`linear.cpp:556-562`).
+    for (rr, an) in alpha_new.iter_mut().enumerate().take(active_i) {
+        let cand = (beta - b_buf[rr]) / ai;
+        *an = if rr == yi {
+            c_yi.min(cand)
+        } else {
+            F::zero().min(cand)
+        };
+    }
+}
+
 impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>>
     for LinearSVC<F>
 {
@@ -1162,6 +1533,21 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
+        // `class_weight` scales `C` per class: `weighted_C[i] = C·w[class i]`
+        // (`compute_class_weight(class_weight, classes=classes_, y=y)`,
+        // `_base.py:1179`; `linear.cpp:2496-2507`). `weights` is aligned to
+        // `classes` (sorted unique = LabelEncoder order). Used by BOTH the OvR
+        // path (below) and the Crammer-Singer joint solver.
+        let weights = compute_class_weight(&self.class_weight, &classes, &y_vec);
+
+        // `multi_class='crammer_singer'` selects liblinear solver type 4
+        // REGARDLESS of penalty/loss/dual (`_get_liblinear_solver_type` returns
+        // 4 for crammer_singer, `_base.py:1017,1020-1021`), so penalty/loss/dual
+        // are IGNORED and the joint Crammer-Singer solver runs.
+        if self.multi_class == MultiClass::CrammerSinger {
+            return self.fit_crammer_singer(x, &classes, &y_vec, &weights);
+        }
+
         // Resolve `dual` (auto → bool via `_validate_dual_parameter`,
         // `_classes.py:13-29`) then validate the penalty×loss×dual combination
         // against the liblinear solver matrix (`_get_liblinear_solver_type`,
@@ -1170,12 +1556,6 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         // sub-problem solver below.
         let dual = resolve_dual(self.dual, self.penalty, self.loss, n_samples, n_features);
         let _solver_type = liblinear_solver_type(self.penalty, self.loss, dual)?;
-
-        // `class_weight` scales `C` per class: `weighted_C[i] = C·w[class i]`
-        // (`compute_class_weight(class_weight, classes=classes_, y=y)`,
-        // `_base.py:1179`; `linear.cpp:2496-2507`). `weights` is aligned to
-        // `classes` (sorted unique = LabelEncoder order).
-        let weights = compute_class_weight(&self.class_weight, &classes, &y_vec);
 
         // Solve one binary sub-problem (positive group penalty `cp`, negative
         // group penalty `cn`) and split the augmented weight vector into
@@ -1285,6 +1665,105 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         }
 
         Ok(fitted)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> LinearSVC<F> {
+    /// Fit via the joint Crammer-Singer multiclass solver (solver type 4,
+    /// `_base.py:1017`). Runs ONE joint solve over all classes
+    /// ([`solve_crammer_singer`], `Solver_MCSVM_CS`, `linear.cpp:493-787`),
+    /// extracts per-class `coef_`/`intercept_` from the flattened
+    /// `w[feature*nr_class + m]`, and applies the binary collapse
+    /// (`_classes.py:340-344`).
+    ///
+    /// `classes` is the sorted unique label set; `y_vec` the per-sample labels;
+    /// `weights` the per-class `class_weight` multipliers aligned to `classes`.
+    fn fit_crammer_singer(
+        &self,
+        x: &Array2<F>,
+        classes: &[usize],
+        y_vec: &[usize],
+        weights: &[F],
+    ) -> Result<FittedLinearSVC<F>, FerroError> {
+        let (_n_samples, n_features) = x.dim();
+        let nr_class = classes.len();
+
+        // Map each sample's label to its class index (`0..nr_class`, the sorted
+        // `classes` position — liblinear's LabelEncoder order). `y_class[i]`
+        // indexes `w[..][m]` and `weighted_C[m]`.
+        let y_class: Vec<usize> = y_vec
+            .iter()
+            .map(|label| classes.iter().position(|c| c == label).unwrap_or(0))
+            .collect();
+
+        // weighted_C[c] = C · class_weight[c] (`linear.cpp:2496-2507`,
+        // `weighted_C[i] = param->C` then `*= weight`). `weights` already holds
+        // the per-class multipliers (1.0 when class_weight=None).
+        let weighted_c: Vec<F> = weights.iter().map(|&wc| self.c * wc).collect();
+
+        let (w, n_iter, converged) = solve_crammer_singer(
+            x,
+            &y_class,
+            nr_class,
+            &weighted_c,
+            self.max_iter,
+            self.tol,
+            self.fit_intercept,
+            self.intercept_scaling,
+        );
+
+        if !converged {
+            eprintln!("Liblinear failed to converge, increase the number of iterations.");
+        }
+
+        // Extract coef_[m][feature] = w[feature*nr_class + m] and
+        // intercept_[m] = intercept_scaling · w[n_features*nr_class + m]
+        // (the augmented-column weight), per `_base.py:1240-1245`.
+        let mut weight_vectors: Vec<Array1<F>> = Vec::with_capacity(nr_class);
+        let mut intercepts: Vec<F> = Vec::with_capacity(nr_class);
+        for m in 0..nr_class {
+            let mut row = Array1::<F>::zeros(n_features);
+            for (feat, r) in row.iter_mut().enumerate() {
+                *r = w[feat * nr_class + m];
+            }
+            weight_vectors.push(row);
+            let intercept = if self.fit_intercept {
+                self.intercept_scaling * w[n_features * nr_class + m]
+            } else {
+                F::zero()
+            };
+            intercepts.push(intercept);
+        }
+
+        // Binary collapse (`_classes.py:340-344`): with 2 classes, the joint
+        // solve yields two rows; sklearn collapses them to a single weight
+        // vector `coef_ = row_1 - row_0` and `intercept_ = int_1 - int_0`, so
+        // the binary sign decision path is used.
+        if nr_class == 2 {
+            let collapsed_coef = &weight_vectors[1] - &weight_vectors[0];
+            let collapsed_intercept = if self.fit_intercept {
+                intercepts[1] - intercepts[0]
+            } else {
+                F::zero()
+            };
+            return Ok(FittedLinearSVC {
+                weight_vectors: vec![collapsed_coef],
+                intercepts: vec![collapsed_intercept],
+                classes: classes.to_vec(),
+                is_binary: true,
+                n_features,
+                n_iter,
+            });
+        }
+
+        Ok(FittedLinearSVC {
+            weight_vectors,
+            intercepts,
+            classes: classes.to_vec(),
+            is_binary: false,
+            n_features,
+            n_iter,
+        })
     }
 }
 
@@ -1793,6 +2272,174 @@ mod tests {
                 .fit(&x, &y)
                 .is_ok(),
             "auto must fall back to dual=true for hinge+l2"
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::assertions_on_constants,
+        reason = "assert!(false) reports the unexpected-Err fit path without a gated panic!/expect"
+    )]
+    fn test_crammer_singer_smoke() {
+        // Smoke check that the joint Crammer-Singer solver (solve_crammer_singer,
+        // Solver_MCSVM_CS, `linear.cpp:493-787`, solver type 4, `_base.py:1017`)
+        // lands near the live sklearn 1.5.2 oracle for BOTH multiclass and the
+        // binary collapse (`_classes.py:340-344`). The rigorous oracle pin is the
+        // critic's to add.
+        //
+        // Oracle (live sklearn 1.5.2; values per R-CHAR-3 — NEVER copied from
+        // ferrolearn):
+        //   python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+        //     X=np.array([[0,0],[0.5,0.2],[0.2,0.5],[1,1],[4,4],[4.5,4.2],[4.2,4.5],[5,5],\
+        //       [0,5],[0.5,5.2],[0.2,4.8],[1,6]],dtype=float); \
+        //     y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+        //     m=LinearSVC(multi_class='crammer_singer',C=1.0,fit_intercept=True, \
+        //       max_iter=200000,tol=1e-10).fit(X,y); \
+        //     print(m.coef_.tolist(), m.intercept_.tolist(), m.predict(X).tolist())"
+        //   # coef [[-0.06761865903618029,-0.24341085269880958],
+        //   #       [0.30047599619312043,0.021705426371714007],
+        //   #       [-0.23285733712058276,0.22170542636345167]]
+        //   # int [0.9107847137145293,-0.622059023505724,-0.2887256901997209]
+        //   # pred [0,0,0,0,1,1,1,1,2,2,2,2]
+        let x = array![
+            [0.0, 0.0],
+            [0.5, 0.2],
+            [0.2, 0.5],
+            [1.0, 1.0],
+            [4.0, 4.0],
+            [4.5, 4.2],
+            [4.2, 4.5],
+            [5.0, 5.0],
+            [0.0, 5.0],
+            [0.5, 5.2],
+            [0.2, 4.8],
+            [1.0, 6.0],
+        ];
+        let y = array![0usize, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+
+        // Per-class oracle coef_/intercept_ (rows aligned to classes_ [0,1,2]).
+        let exp_coef: [[f64; 2]; 3] = [
+            [-0.067_618_659_036_180_29, -0.243_410_852_698_809_58],
+            [0.300_475_996_193_120_43, 0.021_705_426_371_714_007],
+            [-0.232_857_337_120_582_76, 0.221_705_426_363_451_67],
+        ];
+        let exp_int: [f64; 3] = [
+            0.910_784_713_714_529_3,
+            -0.622_059_023_505_724,
+            -0.288_725_690_199_720_9,
+        ];
+
+        let Ok(fitted) = LinearSVC::<f64>::new()
+            .with_multi_class(MultiClass::CrammerSinger)
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&x, &y)
+        else {
+            assert!(false, "crammer_singer multiclass fit must succeed");
+            return;
+        };
+
+        assert!(!fitted.is_binary, "3-class CS must be multiclass");
+        let rows = fitted.weight_vectors();
+        let ints = fitted.intercepts();
+        assert_eq!(rows.len(), 3);
+        for m in 0..3 {
+            assert!(
+                (rows[m][0] - exp_coef[m][0]).abs() < 1e-2,
+                "CS coef[{m}][0] {} vs oracle {}",
+                rows[m][0],
+                exp_coef[m][0]
+            );
+            assert!(
+                (rows[m][1] - exp_coef[m][1]).abs() < 1e-2,
+                "CS coef[{m}][1] {} vs oracle {}",
+                rows[m][1],
+                exp_coef[m][1]
+            );
+            assert!(
+                (ints[m] - exp_int[m]).abs() < 1e-2,
+                "CS intercept[{m}] {} vs oracle {}",
+                ints[m],
+                exp_int[m]
+            );
+        }
+
+        // predict is all-correct (argmax over the per-class scores).
+        let Ok(preds) = fitted.predict(&x) else {
+            assert!(false, "CS multiclass predict must succeed");
+            return;
+        };
+        assert_eq!(
+            preds.to_vec(),
+            y.to_vec(),
+            "CS multiclass predict must be all-correct"
+        );
+
+        // Binary collapse (`_classes.py:340-344`): with 2 classes the joint solve
+        // collapses to a SINGLE weight vector (`coef_` shape (1,2)) +
+        // `intercept_ = int_1 - int_0`.
+        //   python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+        //     X=np.array([[1,1],[1,2],[2,1],[2,2],[8,8],[8,9],[9,8],[9,9]],dtype=float); \
+        //     y=np.array([0,0,0,0,1,1,1,1]); \
+        //     m=LinearSVC(multi_class='crammer_singer',C=1.0,fit_intercept=True, \
+        //       max_iter=200000,tol=1e-10).fit(X,y); \
+        //     print(m.coef_.tolist(), m.intercept_.tolist())"
+        //   # coef [[0.15503875968992287,0.15503875968992295]] int [-1.4806201550387597]
+        const BIN_COEF_0: f64 = 0.155_038_759_689_922_87;
+        const BIN_COEF_1: f64 = 0.155_038_759_689_922_95;
+        const BIN_INT: f64 = -1.480_620_155_038_759_7;
+
+        let xb = array![
+            [1.0, 1.0],
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [2.0, 2.0],
+            [8.0, 8.0],
+            [8.0, 9.0],
+            [9.0, 8.0],
+            [9.0, 9.0],
+        ];
+        let yb = array![0usize, 0, 0, 0, 1, 1, 1, 1];
+
+        let Ok(fitted_b) = LinearSVC::<f64>::new()
+            .with_multi_class(MultiClass::CrammerSinger)
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&xb, &yb)
+        else {
+            assert!(false, "crammer_singer binary fit must succeed");
+            return;
+        };
+
+        assert!(fitted_b.is_binary, "2-class CS must collapse to binary");
+        let coef = fitted_b.coefficients();
+        assert_eq!(coef.len(), 2, "binary collapse → single (1,2) weight row");
+        assert!(
+            (coef[0] - BIN_COEF_0).abs() < 1e-2,
+            "CS binary coef[0] {} vs oracle {BIN_COEF_0}",
+            coef[0]
+        );
+        assert!(
+            (coef[1] - BIN_COEF_1).abs() < 1e-2,
+            "CS binary coef[1] {} vs oracle {BIN_COEF_1}",
+            coef[1]
+        );
+        assert!(
+            (fitted_b.intercept() - BIN_INT).abs() < 1e-2,
+            "CS binary intercept {} vs oracle {BIN_INT}",
+            fitted_b.intercept()
+        );
+
+        let Ok(preds_b) = fitted_b.predict(&xb) else {
+            assert!(false, "CS binary predict must succeed");
+            return;
+        };
+        assert_eq!(
+            preds_b.to_vec(),
+            yb.to_vec(),
+            "CS binary predict all-correct"
         );
     }
 

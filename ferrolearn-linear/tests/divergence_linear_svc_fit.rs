@@ -49,7 +49,7 @@
 use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::linear_svc::{
-    ClassWeight, DualMode, LinearSVC, LinearSVCLoss, LinearSVCPenalty,
+    ClassWeight, DualMode, LinearSVC, LinearSVCLoss, LinearSVCPenalty, MultiClass,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -1059,4 +1059,327 @@ fn linear_svc_class_weight_multiclass_ovr() {
         wv[1][0],
         none_wv[1][0]
     );
+}
+
+/// PIN 1 (#623, REQ-6 — crammer_singer multiclass per-class coef_/intercept_).
+/// Certifies the joint Crammer-Singer solver (`fn solve_crammer_singer` /
+/// `fn fit_crammer_singer`, transcribing `Solver_MCSVM_CS`,
+/// `sklearn/svm/src/liblinear/linear.cpp:510-787`, solver type 4 selected by
+/// `_get_liblinear_solver_type` regardless of penalty/loss/dual,
+/// `_base.py:1017`) reaches liblinear's CS optimum on a 3-class set. The CS
+/// optimum is STRUCTURALLY DIFFERENT from the OvR (squared_hinge) per-class fit
+/// — the joint solve couples all classes — so this pin would FAIL for an OvR
+/// fit. It genuinely certifies the joint solver, not just argmax accuracy.
+///
+/// crammer_singer's solver shuffles coordinates with `random_state=None`, so
+/// `coef_` jitters at ~1e-6 run-to-run; pinned with tolerance 1e-2 (well above
+/// the jitter — verified stable to 1e-6 across 5 live runs).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[0,0],[0.5,0.2],[0.2,0.5],[1,1],[4,4],[4.5,4.2],[4.2,4.5],[5,5],\
+///     [0,5],[0.5,5.2],[0.2,4.8],[1,6]],dtype=float); \
+///   y=np.array([0,0,0,0,1,1,1,1,2,2,2,2]); \
+///   m=LinearSVC(multi_class='crammer_singer',C=1.0,fit_intercept=True,\
+///     max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist()); print(m.intercept_.tolist()); \
+///   print(m.predict(X).tolist(), m.decision_function(X).shape, m.classes_.tolist())"
+/// # coef [[-0.0676186590442972, -0.24341085270819274],
+/// #       [0.30047599617968584, 0.021705426356784154],
+/// #       [-0.2328573371281444, 0.22170542635865179]]
+/// # int [0.9107847137081447, -0.6220590235061476, -0.28872569020018457]
+/// # predict [0,0,0,0,1,1,1,1,2,2,2,2]  df.shape (12, 3)  classes [0,1,2]
+/// ```
+#[test]
+fn linear_svc_crammer_singer_multiclass_parity() {
+    // Live sklearn 1.5.2: 3-class CS set, C=1.0, fit_intercept=True,
+    // max_iter=200000, tol=1e-10. CS optimum (stable to 1e-6 run-to-run).
+    const SK_COEF: [[f64; 2]; 3] = [
+        [-0.0676186590442972, -0.24341085270819274],
+        [0.30047599617968584, 0.021705426356784154],
+        [-0.2328573371281444, 0.22170542635865179],
+    ];
+    const SK_INT: [f64; 3] = [
+        0.9107847137081447,
+        -0.6220590235061476,
+        -0.28872569020018457,
+    ];
+
+    let x = Array2::from_shape_vec(
+        (12, 2),
+        vec![
+            0.0, 0.0, 0.5, 0.2, 0.2, 0.5, 1.0, 1.0, 4.0, 4.0, 4.5, 4.2, 4.2, 4.5, 5.0, 5.0, 0.0,
+            5.0, 0.5, 5.2, 0.2, 4.8, 1.0, 6.0,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2];
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_multi_class(MultiClass::CrammerSinger)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    assert_eq!(fitted.classes(), &[0, 1, 2], "classes_ must be [0,1,2]");
+
+    // Per-class CS coef_/intercept_ rows match the oracle ROW-BY-ROW (1e-2).
+    // class k is weight_vectors()[k] / intercepts()[k].
+    let wv = fitted.weight_vectors();
+    let ints = fitted.intercepts();
+    assert_eq!(
+        wv.len(),
+        3,
+        "CS multiclass must have 3 per-class weight vectors"
+    );
+    assert_eq!(ints.len(), 3, "CS multiclass must have 3 intercepts");
+    for k in 0..3 {
+        assert!(
+            (wv[k][0] - SK_COEF[k][0]).abs() < 1e-2
+                && (wv[k][1] - SK_COEF[k][1]).abs() < 1e-2
+                && (ints[k] - SK_INT[k]).abs() < 1e-2,
+            "CS class {k} coef/int: sklearn coef {:?} int {}; ferrolearn coef [{}, {}] int {} \
+             (gaps coef0 {:.5}, coef1 {:.5}, int {:.5}). The CS optimum is joint — \
+             this would FAIL for an OvR fit (linear.cpp:510, _base.py:1017).",
+            SK_COEF[k],
+            SK_INT[k],
+            wv[k][0],
+            wv[k][1],
+            ints[k],
+            (wv[k][0] - SK_COEF[k][0]).abs(),
+            (wv[k][1] - SK_COEF[k][1]).abs(),
+            (ints[k] - SK_INT[k]).abs()
+        );
+    }
+
+    // predict is all-correct on the training set (the joint solve separates it).
+    let preds = fitted.predict(&x).unwrap();
+    for (i, &yi) in y.iter().enumerate() {
+        assert_eq!(
+            preds[i], yi,
+            "CS predict[{i}]: expected {yi}, ferrolearn {} (the live oracle is all-correct)",
+            preds[i]
+        );
+    }
+
+    // decision_function(X) is the multiclass (12, 3) score matrix.
+    let df = fitted.decision_function(&x).unwrap();
+    let mc = df
+        .as_multiclass()
+        .expect("CS multiclass decision_function is (n, n_classes)");
+    assert_eq!(
+        mc.dim(),
+        (12, 3),
+        "CS decision_function shape must be (12, 3); got {:?}",
+        mc.dim()
+    );
+}
+
+/// PIN 2 (#623, REQ-6 — crammer_singer binary collapse). Certifies the binary
+/// collapse (`_classes.py:340-344`: with 2 classes the joint CS solve yields two
+/// rows, collapsed to `coef_ = row_1 − row_0`, `intercept_ = int_1 − int_0`,
+/// a SINGLE-row `coef_` of shape `(1, n_features)`). The collapsed CS coef
+/// (0.15504) is DISTINCT from BOTH the squared_hinge OvR optimum (0.12835) and
+/// the hinge OvR optimum (0.15385) on the same 8x2 set — so a green pin proves
+/// it is the collapsed CS solution, not a different solver path.
+///
+/// crammer_singer shuffles coordinates with `random_state=None`; pinned with
+/// tolerance 1e-2.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   m=LinearSVC(multi_class='crammer_singer',C=1.0,fit_intercept=True,\
+///     max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist(), m.coef_.shape, m.intercept_.tolist(), \
+///     m.decision_function(X).shape, m.predict(X).tolist())"
+/// # coef [[0.15503875968992292, 0.1550387596899228]] shape (1, 2)
+/// # int [-1.4806201550387605]  df.shape (8,)  predict [0,0,0,0,1,1,1,1]
+/// ```
+#[test]
+fn linear_svc_crammer_singer_binary_collapse() {
+    // Live sklearn 1.5.2: binary 8x2 set, multi_class='crammer_singer', C=1.0,
+    // fit_intercept=True, max_iter=200000, tol=1e-10. Collapsed CS optimum.
+    const SK_COEF: f64 = 0.15503876; // both columns equal by symmetry
+    const SK_INTERCEPT: f64 = -1.48062;
+    const SK_PREDICT: [usize; 8] = [0, 0, 0, 0, 1, 1, 1, 1];
+
+    let (x, y) = binary_set();
+
+    let fitted = LinearSVC::<f64>::new()
+        .with_multi_class(MultiClass::CrammerSinger)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    // The binary collapse produces a SINGLE weight vector of length n_features=2
+    // (coef_ shape (1, 2)).
+    let coef = fitted.coefficients();
+    assert_eq!(
+        coef.len(),
+        2,
+        "collapsed CS binary coef_ must have length 2 (shape (1, 2)); got {}",
+        coef.len()
+    );
+    let coef0 = coef[0];
+    let coef1 = coef[1];
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef0 - SK_COEF).abs() < 1e-2,
+        "CS binary coef_[0]: sklearn (collapsed row_1−row_0) {SK_COEF}, ferrolearn {coef0} \
+         (gap {:.5}). Distinct from squared_hinge OvR 0.12835 and hinge OvR 0.15385.",
+        (coef0 - SK_COEF).abs()
+    );
+    assert!(
+        (coef1 - SK_COEF).abs() < 1e-2,
+        "CS binary coef_[1]: sklearn {SK_COEF}, ferrolearn {coef1} (gap {:.5}).",
+        (coef1 - SK_COEF).abs()
+    );
+    assert!(
+        (intercept - SK_INTERCEPT).abs() < 1e-2,
+        "CS binary intercept_: sklearn (int_1−int_0) {SK_INTERCEPT}, ferrolearn {intercept} \
+         (gap {:.5}).",
+        (intercept - SK_INTERCEPT).abs()
+    );
+
+    // The binary collapse means decision_function is 1-D (8,) (sklearn ravels
+    // the single column, _base.py:365), and predict uses the sign path.
+    let df = fitted.decision_function(&x).unwrap();
+    let binary = df
+        .as_binary()
+        .expect("collapsed CS binary decision_function is 1-D (n,)");
+    assert_eq!(
+        binary.len(),
+        8,
+        "collapsed CS binary decision_function shape is (8,)"
+    );
+
+    let preds = fitted.predict(&x).unwrap();
+    for (i, &sk) in SK_PREDICT.iter().enumerate() {
+        assert_eq!(
+            preds[i], sk,
+            "CS binary predict[{i}]: sklearn {sk}, ferrolearn {}",
+            preds[i]
+        );
+    }
+}
+
+/// PIN 3 (#623, REQ-6 — crammer_singer ignores penalty/loss/dual). Certifies
+/// that `multi_class='crammer_singer'` selects liblinear solver type 4
+/// REGARDLESS of penalty/loss/dual (`_get_liblinear_solver_type` returns 4 for
+/// crammer_singer, `sklearn/svm/_base.py:1017,1020-1021`), so penalty/loss/dual
+/// are IGNORED — combinations that would be REJECTED under OvR (e.g.
+/// `l1`+`hinge`, `l2`+`hinge`+`dual=False`) all FIT under crammer_singer and
+/// give the SAME collapsed-CS `coef_`.
+///
+/// Verified live: under crammer_singer, `(l1,hinge,dual=True)`,
+/// `(l2,hinge,dual=True)`, `(l1,squared_hinge,dual=False)`, and
+/// `(l2,squared_hinge,dual=True)` ALL fit (no ValueError) and ALL give the same
+/// collapsed coef ~0.155039 / intercept ~-1.48062 on the 8x2 set.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np,warnings; from sklearn.svm import LinearSVC; \
+///   X=np.array([[1.,1.],[1.,2.],[2.,1.],[2.,2.],[8.,8.],[8.,9.],[9.,8.],[9.,9.]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   for p,l,d in [('l1','hinge',True),('l2','hinge',True),('l1','squared_hinge',False),('l2','squared_hinge',True)]: \
+///     m=LinearSVC(multi_class='crammer_singer',penalty=p,loss=l,dual=d,C=1.0,\
+///       fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///     print(p,l,d,'OK',m.coef_.tolist(),m.intercept_.tolist())"
+/// # l1 hinge True          OK coef [[0.1550387596899227, 0.1550387596899228]] int [-1.480620155038757]
+/// # l2 hinge True          OK coef [[0.1550387596899226, 0.15503875968992242]] int [-1.4806201550387592]
+/// # l1 squared_hinge False OK coef [[0.1550387596899231, 0.15503875968992303]] int [-1.4806201550387585]
+/// # l2 squared_hinge True  OK coef [[0.15503875968992253, 0.15503875968992248]] int [-1.4806201550387592]
+/// # (all the same collapsed-CS optimum — penalty/loss/dual ignored, _base.py:1017)
+/// ```
+#[test]
+fn linear_svc_crammer_singer_ignores_penalty_loss() {
+    // Live sklearn 1.5.2: under crammer_singer, penalty/loss/dual are ignored
+    // (solver type 4); the collapsed-CS coef is ~0.155039, int ~-1.48062.
+    const SK_COEF: f64 = 0.15503876;
+    const SK_INTERCEPT: f64 = -1.48062;
+
+    let (x, y) = binary_set();
+
+    // Plain crammer_singer (default penalty=l2, loss=squared_hinge, dual=auto)
+    // — the reference collapsed-CS solution.
+    let plain = LinearSVC::<f64>::new()
+        .with_multi_class(MultiClass::CrammerSinger)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+    let plain_coef = plain.coefficients();
+    let plain_c0 = plain_coef[0];
+    let plain_c1 = plain_coef[1];
+    let plain_int = plain.intercept();
+
+    // The plain CS fit matches the live oracle (sanity — the reference is real).
+    assert!(
+        (plain_c0 - SK_COEF).abs() < 1e-2
+            && (plain_c1 - SK_COEF).abs() < 1e-2
+            && (plain_int - SK_INTERCEPT).abs() < 1e-2,
+        "plain CS must match live oracle coef ~{SK_COEF}, int ~{SK_INTERCEPT}; \
+         got coef [{plain_c0}, {plain_c1}] int {plain_int}",
+    );
+
+    // Combinations that OvR REJECTS — under crammer_singer they MUST fit (solver
+    // type 4 is penalty/loss/dual-agnostic, _base.py:1017) and give the SAME
+    // collapsed-CS coef within 1e-6 (penalty/loss/dual are ignored).
+    let combos = [
+        (LinearSVCPenalty::L1, LinearSVCLoss::Hinge, DualMode::True),
+        (LinearSVCPenalty::L2, LinearSVCLoss::Hinge, DualMode::True),
+        (
+            LinearSVCPenalty::L1,
+            LinearSVCLoss::SquaredHinge,
+            DualMode::False,
+        ),
+        (
+            LinearSVCPenalty::L2,
+            LinearSVCLoss::SquaredHinge,
+            DualMode::True,
+        ),
+    ];
+    for (p, l, d) in combos {
+        let fitted = LinearSVC::<f64>::new()
+            .with_multi_class(MultiClass::CrammerSinger)
+            .with_penalty(p)
+            .with_loss(l)
+            .with_dual(d)
+            .with_c(1.0)
+            .with_max_iter(200_000)
+            .with_tol(1e-10)
+            .fit(&x, &y);
+        assert!(
+            fitted.is_ok(),
+            "crammer_singer with penalty={p:?}, loss={l:?}, dual={d:?} must FIT \
+             (solver type 4 ignores penalty/loss/dual, _base.py:1017); got Err",
+        );
+        let fitted = fitted.unwrap();
+        let c = fitted.coefficients();
+        assert!(
+            (c[0] - plain_c0).abs() < 1e-6
+                && (c[1] - plain_c1).abs() < 1e-6
+                && (fitted.intercept() - plain_int).abs() < 1e-6,
+            "crammer_singer with penalty={p:?}, loss={l:?}, dual={d:?} must give the \
+             SAME collapsed-CS coef as plain CS (penalty/loss/dual ignored, _base.py:1017): \
+             plain coef [{plain_c0}, {plain_c1}] int {plain_int}; \
+             got coef [{}, {}] int {} (gaps c0 {:.8}, c1 {:.8}, int {:.8})",
+            c[0],
+            c[1],
+            fitted.intercept(),
+            (c[0] - plain_c0).abs(),
+            (c[1] - plain_c1).abs(),
+            (fitted.intercept() - plain_int).abs()
+        );
+    }
 }
