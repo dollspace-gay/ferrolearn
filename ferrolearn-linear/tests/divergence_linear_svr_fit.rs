@@ -35,7 +35,7 @@
 //! #609 (epsilon default 0.0 vs 0.1).
 
 use ferrolearn_core::introspection::HasCoefficients;
-use ferrolearn_core::traits::Fit;
+use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::linear_svr::{LinearSVR, LinearSVRLoss};
 use ndarray::{Array1, Array2, array};
 
@@ -206,5 +206,144 @@ fn linear_svr_coef_parity() {
         "intercept parity: sklearn (liblinear) {SK_INTERCEPT}, \
          ferrolearn {intercept} (gap {:.4}).",
         (intercept - SK_INTERCEPT).abs()
+    );
+}
+
+/// Divergence (#610, REQ-4): the `squared_epsilon_insensitive` (L2) loss must
+/// reproduce the live `sklearn.svm.LinearSVR(loss='squared_epsilon_insensitive')`
+/// `coef_`/`intercept_`. liblinear's `L2R_L2LOSS_SVR_DUAL` solver
+/// (`sklearn/svm/src/liblinear/linear.cpp:1078-1081`, selected by
+/// `_get_liblinear_solver_type`, `_base.py:1015-1016`) minimizes
+/// `0.5·‖w‖² + C·Σ max(0,|r|−ε)²` with the dual CD using `lambda = 0.5/C`,
+/// `upper_bound = +inf` — and crucially NO `1/n` averaging. A correct ferrolearn
+/// `SquaredEpsilonInsensitive` branch (`linear_svr.rs fn fit`, `(half/c, inf)`)
+/// converges to the same optimum.
+///
+/// Oracle (live sklearn 1.5.2, fit_intercept=True to match ferrolearn's API):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([2.,4.,6.,8.,10.]); \
+///   m=LinearSVR(loss='squared_epsilon_insensitive',epsilon=0.1,C=1.0, \
+///     fit_intercept=True,max_iter=200000,tol=1e-10).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist(), m.predict([[1.5]]).tolist())"
+/// # coef [1.8912820512820514] intercept [0.28205128205128216] predict(1.5) [3.1189743589743593]
+/// ```
+#[test]
+fn linear_svr_squared_loss() {
+    // Live sklearn 1.5.2: X=[[1]..[5]], y=2x, loss='squared_epsilon_insensitive',
+    // epsilon=0.1, C=1.0, fit_intercept=True, max_iter=200000, tol=1e-10.
+    const SK_COEF: f64 = 1.8912820512820514;
+    const SK_INTERCEPT: f64 = 0.28205128205128216;
+    const SK_PREDICT_1_5: f64 = 3.1189743589743593;
+
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    let fitted = LinearSVR::<f64>::new()
+        .with_loss(LinearSVRLoss::SquaredEpsilonInsensitive)
+        .with_epsilon(0.1)
+        .with_c(1.0)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let coef = fitted.coefficients()[0];
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef - SK_COEF).abs() < 1e-3,
+        "squared-loss coef parity: sklearn (liblinear L2R_L2LOSS_SVR_DUAL) \
+         {SK_COEF}, ferrolearn {coef} (gap {:.4}).",
+        (coef - SK_COEF).abs()
+    );
+    assert!(
+        (intercept - SK_INTERCEPT).abs() < 1e-3,
+        "squared-loss intercept parity: sklearn {SK_INTERCEPT}, \
+         ferrolearn {intercept} (gap {:.4}).",
+        (intercept - SK_INTERCEPT).abs()
+    );
+
+    // predict([[1.5]]) = 1.5*coef + intercept against the live oracle.
+    let x_new = Array2::from_shape_vec((1, 1), vec![1.5]).unwrap();
+    let pred = fitted.predict(&x_new).unwrap()[0];
+    assert!(
+        (pred - SK_PREDICT_1_5).abs() < 1e-3,
+        "squared-loss predict(1.5) parity: sklearn {SK_PREDICT_1_5}, \
+         ferrolearn {pred} (gap {:.4}).",
+        (pred - SK_PREDICT_1_5).abs()
+    );
+}
+
+/// Divergence (#608, REQ-2): `predict(X) = X @ coef_ + intercept_` must match the
+/// live `sklearn.svm.LinearSVR.predict` on held-out rows for an oracle-matched
+/// fit. With the default (epsilon-insensitive) loss, `epsilon=0.1`, `C=1.0`,
+/// `fit_intercept=True`, the live oracle yields `coef [1.95]`, `intercept [0.15]`
+/// (cf. `linear_svr_coef_parity`), so `predict([[2.5]]) = 2.5*1.95 + 0.15`.
+/// `fn predict in linear_svr.rs` computes `x.dot(&coefficients) + intercept`,
+/// mirroring `LinearModel.predict` (`X @ coef_.T + intercept_`).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import LinearSVR; \
+///   X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([2.,4.,6.,8.,10.]); \
+///   m=LinearSVR(epsilon=0.1,C=1.0,fit_intercept=True,max_iter=200000,tol=1e-10) \
+///     .fit(X,y); print(m.predict([[2.5]]).tolist())"
+/// # [5.025000000054111]
+/// ```
+#[test]
+fn linear_svr_predict() {
+    // Live sklearn 1.5.2: same fit as linear_svr_coef_parity (eps=0.1, C=1.0).
+    const SK_PREDICT_2_5: f64 = 5.025000000054111;
+
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    let fitted = LinearSVR::<f64>::new()
+        .with_epsilon(0.1)
+        .with_c(1.0)
+        .with_loss(LinearSVRLoss::EpsilonInsensitive)
+        .with_max_iter(200_000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let x_new = Array2::from_shape_vec((1, 1), vec![2.5]).unwrap();
+    let pred = fitted.predict(&x_new).unwrap()[0];
+    assert!(
+        (pred - SK_PREDICT_2_5).abs() < 1e-3,
+        "predict(2.5) parity: sklearn (liblinear) {SK_PREDICT_2_5}, \
+         ferrolearn {pred} (gap {:.4}). predict = X@coef + intercept.",
+        (pred - SK_PREDICT_2_5).abs()
+    );
+}
+
+/// Structural (#613, REQ-8): `FittedLinearSVR::n_iter()` exposes the dual-CD
+/// outer-iteration count, mirroring `sklearn.svm.LinearSVR.n_iter_`
+/// (`sklearn/svm/_classes.py:467-468`, set to `n_iter_.max().item()` at
+/// `_classes.py:603`; the liblinear iteration count from `_base.py:1215, :1247`).
+/// ferrolearn's dual CD is a distinct implementation, so the exact count need
+/// NOT match liblinear's bookkeeping — `n_iter_` is a STRUCTURAL attribute. The
+/// invariant `1 <= n_iter <= max_iter` is what sklearn guarantees (the warning
+/// at `_base.py:1234-1238` fires precisely when `n_iter >= max_iter`).
+#[test]
+fn linear_svr_n_iter() {
+    let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+    let y: Array1<f64> = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+    const MAX_ITER: usize = 200_000;
+    let fitted = LinearSVR::<f64>::new()
+        .with_epsilon(0.1)
+        .with_c(1.0)
+        .with_max_iter(MAX_ITER)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .unwrap();
+
+    let n_iter = fitted.n_iter();
+    assert!(
+        (1..=MAX_ITER).contains(&n_iter),
+        "n_iter must satisfy 1 <= n_iter <= max_iter ({MAX_ITER}), got {n_iter} \
+         (mirrors sklearn LinearSVR.n_iter_, _classes.py:603)"
     );
 }

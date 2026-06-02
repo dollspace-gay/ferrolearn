@@ -198,20 +198,24 @@ binding for LinearSVR yet). As of the liblinear-parity rewrite
 `tests/divergence_linear_svr_fit.rs::{linear_svr_coef_parity,
 linear_svr_coef_c_dependence, linear_svr_default_epsilon}` pin `coef_`/
 `intercept_`/`epsilon` against the live sklearn 1.5.2 oracle to 1e-3 and are
-GREEN — so REQ-1/REQ-3/REQ-5/REQ-7 are SHIPPED. `conformance_linear_svr in
+GREEN — so REQ-1/REQ-3/REQ-5/REQ-7 are SHIPPED. The follow-on pins
+`linear_svr_predict` (predict on a held-out row), `linear_svr_squared_loss`
+(`squared_epsilon_insensitive` `coef_`/`intercept_`/predict), and
+`linear_svr_n_iter` (the `n_iter_` structural invariant) are likewise GREEN —
+so REQ-2/REQ-4/REQ-8 are now SHIPPED. `conformance_linear_svr in
 tests/conformance_wave1.rs` (R² ≥ 0.40 floor) now passes comfortably
-(sklearn ~0.97).
+(sklearn ~0.97). REQ-6/REQ-9/REQ-10 remain NOT-STARTED (#612/#614/#615).
 
 | REQ | Status | Evidence |
 |---|---|---|
 | REQ-1 (fit parity — coef_/intercept_ vs liblinear oracle) | SHIPPED | `linear_svr.rs fn fit` now minimizes liblinear's objective `0.5·‖w‖² + C·Σ L_ε` (no `1/n`) via the dual coordinate descent `solve_l2r_l1l2_svr` (`sklearn/svm/src/liblinear/linear.cpp:1051`; selected by `_get_liblinear_solver_type`, `_base.py:1015-1016`). Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_coef_parity` (X=[[1]..[5]], y=2x, ε=0.1, C=1.0, intercept on → live sklearn `coef [1.95]`, `intercept [0.15]`, matched to 1e-3). Consumer: `pub use linear_svr::{…}` (`lib.rs:89`) + `PipelineEstimator` impl (`linear_svr.rs`). |
-| REQ-2 (predict = X·coef + intercept) | NOT-STARTED | open prereq blocker #608. `fn predict in linear_svr.rs` correctly computes `x.dot(&self.coefficients) + self.intercept`, mirroring `LinearModel.predict` (`X @ coef_ + intercept_`). Now INCIDENTALLY parity-correct because the fitted `coef_`/`intercept_` are oracle-matched (REQ-1 SHIPPED), but no test yet pins `predict` output on held-out rows against the oracle — leave open for #608's explicit predict-vs-oracle pin. |
+| REQ-2 (predict = X·coef + intercept) | SHIPPED | `fn predict in linear_svr.rs` computes `x.dot(&self.coefficients) + self.intercept`, mirroring `LinearModel.predict` (`X @ coef_ + intercept_`). Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_predict`: the default-loss fit (ε=0.1, C=1.0, intercept on) reproduces the live oracle `predict([[2.5]]) ≈ 5.0251` to 1e-3 (held-out row, `coef [1.95]`/`intercept [0.15]`). Consumer: `predict_pipeline` (`FittedPipelineEstimator for FittedLinearSVR in linear_svr.rs`). |
 | REQ-3 (epsilon default = 0.0) | SHIPPED | `LinearSVR::new` now sets `epsilon = F::zero()` matching sklearn's `epsilon=0.0` (`_classes.py:378, :522, :535`); `test_default_constructor` asserts `m.epsilon == 0.0`. Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_default_epsilon` (sklearn `file:line` symbolic constant `_classes.py:522`). |
-| REQ-4 (loss param + squared objective) | NOT-STARTED | open prereq blocker #610. The squared branch now solves the correct objective: `solve_l2r_l1l2_svr` sets `lambda = 0.5/C`, `upper_bound = +inf` (the `L2R_L2LOSS_SVR_DUAL` path, `linear.cpp:1078-1081`), with no `1/n` — the C-scaling defect is gone. But no test yet pins `squared_epsilon_insensitive` `coef_`/`intercept_` against the live oracle (`test_squared_epsilon_insensitive` checks only `preds.len()==5`). Leave open for #610's explicit squared-loss oracle pin. |
+| REQ-4 (loss param + squared objective) | SHIPPED | the squared branch solves the correct objective: `fn fit` sets `lambda = 0.5/C`, `upper_bound = +inf` (the `L2R_L2LOSS_SVR_DUAL` path, `linear.cpp:1078-1081`, selected by `_get_liblinear_solver_type`, `_base.py:1015-1016`), with no `1/n`. Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_squared_loss`: `LinearSVR(loss='squared_epsilon_insensitive', epsilon=0.1, C=1.0, fit_intercept=True)` → live oracle `coef [1.8913]`, `intercept [0.2821]`, `predict([[1.5]]) ≈ 3.119`, all matched to 1e-3. Consumer: `pub use linear_svr::{…}` + `PipelineEstimator` impl. |
 | REQ-5 (fit_intercept + intercept_scaling) | SHIPPED | `LinearSVR` now exposes `pub fit_intercept: bool` (default `true`) + `pub intercept_scaling: F` (default `1.0`) with `with_fit_intercept`/`with_intercept_scaling`. `fn fit` augments the design matrix with a synthetic constant column equal to `intercept_scaling`, **penalizes** the augmented weight in ‖w‖² (liblinear convention, `_base.py:1189-1198`), and returns `intercept_ = intercept_scaling · w_last`; `fit_intercept=false → intercept_ = 0`. Validates `intercept_scaling > 0` when fitting an intercept (`_base.py:1190-1196`) → `FerroError::InvalidParameter`. Pinned GREEN by `linear_svr_coef_parity` (intercept `0.15` matched), `linear_svr_coef_c_dependence` (both C fits, intercept on), and module tests `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
 | REQ-6 (dual param) | NOT-STARTED | open prereq blocker #612. ferrolearn has no `dual` parameter; it always does primal sub-gradient CD. sklearn exposes `dual ∈ {"auto" (default), True, False}` (`_classes.py:418-428, :513, :528`) selecting the liblinear solver type (`epsilon_insensitive` is dual-only → 13; `squared_epsilon_insensitive` → 11 primal / 12 dual; `_get_liblinear_solver_type`, `_base.py:1015-1016`). The optimum is dual-invariant, but the parameter is part of the constructor ABI (R-DEV-2) and `"auto"` resolution is observable. |
 | REQ-7 (C-scaling convention) | SHIPPED | the `/n_f` division is removed; `fn fit` minimizes liblinear's `0.5·‖w‖² + C·Σ L` (the dual CD uses `upper_bound = C` for L1 loss, `lambda = 0.5/C` for L2 loss, `linear.cpp:1076-1089`). Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_coef_c_dependence`: live sklearn (fit_intercept=True, ε=0) `C=0.1 → coef [0.58]`, `C=1.0 → coef [1.2941]`, both matched to 1e-3 — the C-dependence now tracks liblinear (was flattened by `C/n`). |
-| REQ-8 (tol/max_iter + n_iter_) | NOT-STARTED | open prereq blocker #613. `fn fit` stops on `max|Δw| < tol` over a fixed-step descent (`linear_svr.rs:265`); liblinear stops on its own KKT/projected-gradient criterion and reports `n_iter_ = n_iter_.max().item()` (`_base.py:603, :1233`). `FittedLinearSVR<F>` (`linear_svr.rs:124-129`) stores only `coefficients`/`intercept` — no `n_iter` field/accessor, and no `ConvergenceWarning`-equivalent at `max_iter`. |
+| REQ-8 (tol/max_iter + n_iter_) | SHIPPED | `fn fit` counts the dual-CD outer iterations into `FittedLinearSVR::n_iter`, exposed via `#[must_use] pub fn n_iter`, mirroring `n_iter_ = n_iter_.max().item()` (`_classes.py:603`; the liblinear iteration count, `_base.py:1215, :1247`). It emits the `ConvergenceWarning`-equivalent via `eprintln!("Liblinear failed to converge…")` when the criterion is unmet at `max_iter` (`_base.py:1234-1238`, the crate's qda/lda warning channel). ferrolearn's dual CD is a distinct implementation, so the count is STRUCTURAL (need not equal liblinear's). Pinned GREEN by `tests/divergence_linear_svr_fit.rs::linear_svr_n_iter` (`1 <= n_iter <= max_iter`). |
 | REQ-9 (fitted-attr contract + param validation) | NOT-STARTED | open prereq blocker #614. `FittedLinearSVR` exposes `coefficients: Array1<F>` and a SCALAR `intercept: F` (`linear_svr.rs:126-128`) via `HasCoefficients`; sklearn's `intercept_` is a length-1 ndarray and `coef_` is 1-D after `ravel` (`_classes.py:445-468`, `_base.py:598`). `fn fit` validates `C>0` and `epsilon>=0` (`linear_svr.rs:161-173`) but not `tol>0`, `intercept_scaling>0`, or `max_iter>=0`, and `epsilon` is unconstrained `Real` in sklearn (`_parameter_constraints`, `_classes.py:506-517`) — ferrolearn's `epsilon>=0` reject is stricter than sklearn (which accepts any real `epsilon`). `n_features_in_` is not surfaced. |
 | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #615. `linear_svr.rs` imports `ndarray::{Array1, Array2, ScalarOperand}` (`linear_svr.rs:28`) and computes on `ndarray`, not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). Consistent with the crate-wide deferral (cf. `ridge.md`/`glm.md` keep substrate NOT-STARTED). |
 
@@ -255,7 +259,8 @@ print(m.epsilon, m.C, m.loss, m.dual, m.fit_intercept, m.intercept_scaling)"
 
 A NOT-STARTED REQ closes only when its fix lands AND a divergence test (expected
 values from the live oracle / a sklearn `file:line` constant per R-CHAR-3) goes
-green; see the REQ-status table for the current split (all 10 NOT-STARTED).
+green; see the REQ-status table for the current split (REQ-1/2/3/4/5/7/8 SHIPPED,
+REQ-6/9/10 NOT-STARTED).
 
 ## Blockers to open
 
@@ -266,11 +271,14 @@ green; see the REQ-status table for the current split (all 10 NOT-STARTED).
   line-searched primal) so fitted `coef_`/`intercept_` match the live oracle.
 - **#608** — REQ-2 of linear_svr: pin `predict` output against the live
   `LinearSVR` oracle on held-out rows (gated on #607's parity-correct fit).
+  RESOLVED — `linear_svr_predict` pins `predict([[2.5]]) ≈ 5.0251` GREEN.
 - **#609** — REQ-3 of linear_svr: change `LinearSVR::new` default `epsilon`
   from `0.1` to `0.0` (`_classes.py:522`) and fix `test_default_constructor`.
 - **#610** — REQ-4 of linear_svr: pin `squared_epsilon_insensitive`
   `coef_`/`intercept_` against the live `LinearSVR(loss="squared_epsilon_insensitive")`
   oracle (depends on the #607 objective fix for the squared branch).
+  RESOLVED — `linear_svr_squared_loss` pins `coef [1.8913]`/`intercept [0.2821]`
+  GREEN.
 - **#611** — REQ-5 of linear_svr: add `fit_intercept` (default `True`) +
   `intercept_scaling` (default `1.0`) with the liblinear augmented-feature,
   penalized-intercept convention (`intercept_ = intercept_scaling·w_last`;
@@ -280,6 +288,8 @@ green; see the REQ-status table for the current split (all 10 NOT-STARTED).
   solver-type/`auto`-resolution semantics.
 - **#613** — REQ-8 of linear_svr: expose `n_iter_` on `FittedLinearSVR`
   (`= n_iter_.max()`) and emit a `ConvergenceWarning`-equivalent at `max_iter`.
+  RESOLVED — `FittedLinearSVR::n_iter` + `eprintln!` warning; `linear_svr_n_iter`
+  pins `1 <= n_iter <= max_iter` GREEN.
 - **#614** — REQ-9 of linear_svr: match the fitted-attribute contract
   (`intercept_` as a length-1 array, `n_features_in_`) and the
   `_parameter_constraints` validation (`tol>0`, `intercept_scaling>0`,

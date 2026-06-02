@@ -30,6 +30,28 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 5);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2): SHIPPED = impl + non-test production consumer + tests +
+//! green oracle verification; NOT-STARTED = open blocker `#`. `LinearSVR`/
+//! `FittedLinearSVR`/`LinearSVRLoss` are boundary estimator types re-exported at
+//! the crate root (`pub use linear_svr::{…} in lib.rs`); under S5/R-DEFER-1 the
+//! public estimator type + the `PipelineEstimator` impl ARE the consumer surface
+//! (no `ferrolearn-python` LinearSVR binding yet). See `.design/linear/linear_svr.md`.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (fit parity — coef_/intercept_ vs liblinear oracle) | SHIPPED | `fn fit` minimizes liblinear's `0.5·‖w‖² + C·Σ L_ε` via dual CD (`solve_l2r_l1l2_svr`, `linear.cpp:1051`). Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_coef_parity`. |
+//! | REQ-2 (predict = X·coef + intercept) | SHIPPED | `fn predict` computes `x.dot(&coefficients) + intercept` (mirrors `LinearModel.predict`, `_base.py`). Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_predict` (epsilon=0.1, C=1.0 fit → `predict([[2.5]]) ≈ 5.0251` live oracle). Consumer: `predict_pipeline` (`FittedPipelineEstimator` impl). |
+//! | REQ-3 (epsilon default = 0.0) | SHIPPED | `LinearSVR::new` sets `epsilon = F::zero()` (`_classes.py:522`). Pinned by `linear_svr_default_epsilon`. |
+//! | REQ-4 (loss param + squared objective) | SHIPPED | the `SquaredEpsilonInsensitive` branch sets `lambda = 0.5/C`, `upper_bound = +inf` (the `L2R_L2LOSS_SVR_DUAL` path, `linear.cpp:1078-1081`), no `1/n`. Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_squared_loss` (`loss='squared_epsilon_insensitive'`, epsilon=0.1, C=1.0 → live oracle `coef [1.8913]`, `intercept [0.2821]`, `predict([[1.5]]) ≈ 3.119`). |
+//! | REQ-5 (fit_intercept + intercept_scaling) | SHIPPED | augmented synthetic column = `intercept_scaling`, penalized in ‖w‖² (`_base.py:1189-1198`), `intercept_ = intercept_scaling·w_last`. Pinned by `linear_svr_coef_parity`, module `test_fit_intercept_false_zero_intercept`/`test_invalid_intercept_scaling`. |
+//! | REQ-6 (dual param) | NOT-STARTED | open prereq blocker #612. No `dual` parameter; optimum is dual-invariant but the constructor ABI differs (R-DEV-2). |
+//! | REQ-7 (C-scaling convention) | SHIPPED | the `/n` division is removed; dual CD uses `upper_bound = C` (L1) / `lambda = 0.5/C` (L2). Pinned by `linear_svr_coef_c_dependence`. |
+//! | REQ-8 (tol/max_iter + n_iter_) | SHIPPED | `fn fit` counts dual-CD outer iterations into `FittedLinearSVR::n_iter`, exposed via `#[must_use] pub fn n_iter` (mirrors `n_iter_ = n_iter_.max().item()`, `_classes.py:603`); emits the `ConvergenceWarning`-equivalent via `eprintln!` at `max_iter` (`_base.py:1234-1238`, crate qda/lda warning channel). Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_n_iter` (`1 <= n_iter <= max_iter`). |
+//! | REQ-9 (fitted-attr contract + param validation) | NOT-STARTED | open prereq blocker #614. `intercept_` is a scalar (not length-1 ndarray); `tol>0`/`max_iter>=0`/`n_features_in_` not surfaced; `epsilon>=0` reject is stricter than sklearn's `Real`. |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #615. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -187,6 +209,28 @@ pub struct FittedLinearSVR<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+    /// Number of dual coordinate-descent outer iterations actually run.
+    ///
+    /// Mirrors `sklearn.svm.LinearSVR.n_iter_` (`_classes.py:467-468, :603`,
+    /// `n_iter_ = n_iter_.max().item()`). Because ferrolearn's dual CD is a
+    /// distinct implementation from liblinear's, the exact count need not match
+    /// liblinear's bookkeeping; it is a structural attribute satisfying
+    /// `1 <= n_iter <= max_iter`.
+    n_iter: usize,
+}
+
+impl<F> FittedLinearSVR<F> {
+    /// Number of dual coordinate-descent outer iterations run during `fit`.
+    ///
+    /// Mirrors `sklearn.svm.LinearSVR.n_iter_` (`sklearn/svm/_classes.py:467`,
+    /// set to `n_iter_.max().item()` at `_classes.py:603`). A value equal to
+    /// `max_iter` indicates the solver did not converge (a
+    /// `ConvergenceWarning` is emitted on the crate's warning channel in that
+    /// case, mirroring `_base.py:1234-1238`).
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>> for LinearSVR<F> {
@@ -310,7 +354,13 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             acc
         };
 
+        // Count of dual-CD outer iterations actually run (for `n_iter_`) and
+        // whether the convergence criterion was met before `max_iter`.
+        let mut n_iter: usize = 0;
+        let mut converged = false;
+
         for iter in 0..self.max_iter {
+            n_iter = iter + 1;
             let mut gmax_new = F::zero();
             let mut gnorm1_new = F::zero();
 
@@ -416,6 +466,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             // active set, reactivate all and re-check once (liblinear pattern).
             if gnorm1_new <= self.tol * gnorm1_init {
                 if active_size == n_samples {
+                    converged = true;
                     break;
                 }
                 active_size = n_samples;
@@ -426,6 +477,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             gmax_old = gmax_new;
         }
 
+        // liblinear warns when the iteration count reaches `max_iter` without
+        // satisfying the stopping criterion (`_base.py:1234-1238`). The crate's
+        // warning channel is `eprintln!` (cf. qda.rs collinearity, lda.rs
+        // priors renormalization).
+        if !converged && n_iter >= self.max_iter {
+            eprintln!("Liblinear failed to converge, increase the number of iterations.");
+        }
+
         // Extract coef_ / intercept_ (`_base.py:598`, `_classes.py:581-598`).
         let coefficients = Array1::from_iter(w.iter().take(n_features).copied());
         let intercept = if self.fit_intercept {
@@ -434,9 +493,13 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             F::zero()
         };
 
+        // `n_iter` is at least 1 (the loop body always runs once for
+        // `max_iter >= 1`; a zero `max_iter` leaves it at 0, the degenerate
+        // sklearn case where no iteration runs).
         Ok(FittedLinearSVR {
             coefficients,
             intercept,
+            n_iter,
         })
     }
 }
