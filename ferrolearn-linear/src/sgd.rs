@@ -52,7 +52,7 @@
 //! | REQ-2 (squared_hinge, perceptron) | NOT-STARTED | blocker #523. `enum ClassifierLoss` lacks `SquaredHinge` and a per-loss `threshold` (`_sgd_fast.pyx.tp:232-258,512`). |
 //! | REQ-3 (regressor losses incl. squared_epsilon_insensitive) | NOT-STARTED | blocker #524. `enum RegressorLoss` lacks `SquaredEpsilonInsensitive` (`_sgd_fast.pyx.tp:364-387`). |
 //! | REQ-4 (L2 penalty = clamped wscale shrink) | SHIPPED | `fn train_binary_sgd`/`train_regressor_sgd` apply `shrink = max(0, 1 - eta*alpha)` then `w = w*shrink - eta*grad*x`, mirroring `w.scale(max(0, 1-eta*alpha))` (`_sgd_fast.pyx.tp:632-635`); intercept unregularized. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_l2_wscale_clamp`. Closed #525. |
-//! | REQ-5 (l1/elasticnet + l1_ratio) | NOT-STARTED | blocker #526. No `penalty`/`l1_ratio`; no `u`/`q` truncated-gradient (`_sgd_fast.pyx.tp:656-658,750-778`). |
+//! | REQ-5 (l1/elasticnet + l1_ratio) | SHIPPED | `enum Penalty {L2,L1,ElasticNet}` + `pub penalty`/`pub l1_ratio` fields on `SGDClassifier`/`SGDRegressor` with `fn with_penalty`/`fn with_l1_ratio` builders (defaults `L2`/`0.15`, `_stochastic_gradient.py:1231-1256`). `fn train_binary_sgd`/`train_regressor_sgd` derive `eff` via `fn effective_l1_ratio` (`L2->0`, `L1->1`, `ElasticNet->l1_ratio`, `_sgd_fast.pyx.tp:558-561`), apply the L2 shrink `max(0, 1-(1-eff)*eta*alpha)` BEFORE the gradient add (`:632-635`), then the Tsuruoka cumulative-penalty L1 truncation with fit-persistent scalar `u` and per-feature `q` AFTER (`:656-658,750-778`, `wscale=1`). Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Tests: divergence `sgd_l1_truncated_gradient` (live oracle coef [0.9204,-0.4452]), `sgd_elasticnet_l1_ratio` (l1_ratio=0.3, coef [0.92340705,-0.45723495]). Closed #526. NOTE (partial_fit+l1): `u`/`q` are scoped per `train_*_sgd` call, so they persist across the epochs of a single `fit` (the parity-critical path) but reset per `partial_fit` call. This MATCHES sklearn, which re-allocates `q=np.zeros(...)`/`u=0.0` at the top of every `_plain_sgd` call (`_sgd_fast.pyx.tp:551-556`) and only carries `t_` across `partial_fit` (`_stochastic_gradient.py` re-invokes `_plain_sgd` per call). The full `fit` path is exact. |
 //! | REQ-6 (constant + invscaling schedules) | SHIPPED | `fn compute_lr`: `Constant => eta0`, `InvScaling => eta0 / t^power_t` (`_sgd_fast.pyx.tp:479,593-594`). Consumer: per-step in `fn train_binary_sgd`/`train_regressor_sgd`. Tests: `test_constant_lr`, `test_invscaling_lr`. |
 //! | REQ-7 (optimal schedule t0 offset) | SHIPPED | `fn compute_lr` Optimal arm now `1/(alpha*(optimal_init + t - 1))` with `optimal_init` from `fn optimal_init` (`typw=sqrt(1/sqrt(alpha))`, `e0=typw/max(1,|gradient(1,-typw)|)`, `optimal_init=1/(e0*alpha)`), mirroring `_sgd_fast.pyx.tp:565-570,592`. Computed once per fit before the epoch loop. Consumer: `fn train_*_sgd`. Tests: `test_optimal_lr`, `test_optimal_init_matches_oracle`, divergence `sgd_optimal_schedule_t0_offset`. Closed #527. |
 //! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | NOT-STARTED | blocker #528. Divides by 2 on a 5-epoch mean-loss trigger; sklearn /5 on `n_iter_no_change`/`best_loss` (`_sgd_fast.pyx.tp:698-701`). |
@@ -349,6 +349,38 @@ where
 }
 
 // ---------------------------------------------------------------------------
+// Penalty (regularization term)
+// ---------------------------------------------------------------------------
+
+/// Regularization penalty for SGD.
+///
+/// Mirrors sklearn's `penalty` parameter
+/// (`_stochastic_gradient.py:997-1012`). The effective `l1_ratio` passed to the
+/// kernel is derived per `_sgd_fast.pyx.tp:558-561`: `l2 -> 0.0`, `l1 -> 1.0`,
+/// `elasticnet -> user l1_ratio`.
+#[derive(Debug, Clone, Copy)]
+pub enum Penalty {
+    /// L2 (ridge) penalty — multiplicative `wscale` shrink only (the default).
+    L2,
+    /// L1 (lasso) penalty — Tsuruoka cumulative-penalty truncated gradient.
+    L1,
+    /// Elastic-net — convex mix of L2 and L1 controlled by `l1_ratio`.
+    ElasticNet,
+}
+
+/// Compute the effective `l1_ratio` for the truncated-gradient kernel.
+///
+/// Mirrors `_sgd_fast.pyx.tp:558-561`: `L2 -> 0.0`, `L1 -> 1.0`,
+/// `ElasticNet -> user l1_ratio`.
+fn effective_l1_ratio<F: Float>(penalty: Penalty, l1_ratio: F) -> F {
+    match penalty {
+        Penalty::L2 => F::zero(),
+        Penalty::L1 => F::one(),
+        Penalty::ElasticNet => l1_ratio,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Classifier loss enum
 // ---------------------------------------------------------------------------
 
@@ -414,8 +446,13 @@ pub struct SGDClassifier<F> {
     pub learning_rate: LearningRateSchedule<F>,
     /// Initial learning rate.
     pub eta0: F,
-    /// L2 regularization strength.
+    /// Regularization strength (`alpha`).
     pub alpha: F,
+    /// Regularization penalty (`l2`/`l1`/`elasticnet`). Defaults to `L2`.
+    pub penalty: Penalty,
+    /// Elastic-net mixing parameter; only used when `penalty == ElasticNet`.
+    /// Defaults to `0.15` (sklearn default).
+    pub l1_ratio: F,
     /// Maximum number of passes over the training data.
     pub max_iter: usize,
     /// Convergence tolerance. Training stops when the loss improvement
@@ -431,9 +468,10 @@ impl<F: Float> SGDClassifier<F> {
     /// Create a new `SGDClassifier` with default settings.
     ///
     /// Defaults match scikit-learn's `SGDClassifier.__init__`
-    /// (`_stochastic_gradient.py:1242-1244`): `loss = Hinge`,
+    /// (`_stochastic_gradient.py:1231-1256`): `loss = Hinge`,
     /// `learning_rate = Optimal`, `eta0 = 0.0`, `alpha = 0.0001`,
-    /// `max_iter = 1000`, `tol = 1e-3`, `power_t = 0.5`.
+    /// `penalty = L2`, `l1_ratio = 0.15`, `max_iter = 1000`, `tol = 1e-3`,
+    /// `power_t = 0.5`.
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -441,6 +479,8 @@ impl<F: Float> SGDClassifier<F> {
             learning_rate: LearningRateSchedule::Optimal,
             eta0: F::from(0.0).unwrap_or_else(F::zero),
             alpha: F::from(0.0001).unwrap_or_else(F::zero),
+            penalty: Penalty::L2,
+            l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
             max_iter: 1000,
             tol: F::from(1e-3).unwrap_or_else(F::zero),
             random_state: None,
@@ -469,10 +509,25 @@ impl<F: Float> SGDClassifier<F> {
         self
     }
 
-    /// Set the L2 regularization strength.
+    /// Set the regularization strength.
     #[must_use]
     pub fn with_alpha(mut self, alpha: F) -> Self {
         self.alpha = alpha;
+        self
+    }
+
+    /// Set the regularization penalty (`l2`/`l1`/`elasticnet`).
+    #[must_use]
+    pub fn with_penalty(mut self, penalty: Penalty) -> Self {
+        self.penalty = penalty;
+        self
+    }
+
+    /// Set the elastic-net mixing parameter (`l1_ratio`, used only when
+    /// `penalty == ElasticNet`).
+    #[must_use]
+    pub fn with_l1_ratio(mut self, l1_ratio: F) -> Self {
+        self.l1_ratio = l1_ratio;
         self
     }
 
@@ -521,6 +576,8 @@ fn clf_hyper<F: Float>(clf: &SGDClassifier<F>) -> SGDHyper<F> {
         tol: clf.tol,
         random_state: clf.random_state,
         power_t: clf.power_t,
+        penalty: clf.penalty,
+        l1_ratio: clf.l1_ratio,
     }
 }
 
@@ -534,6 +591,10 @@ struct SGDHyper<F> {
     tol: F,
     random_state: Option<u64>,
     power_t: F,
+    /// Regularization penalty (l2/l1/elasticnet).
+    penalty: Penalty,
+    /// Elastic-net mixing parameter (only meaningful for `ElasticNet`).
+    l1_ratio: F,
 }
 
 /// Train a single binary classifier via SGD, updating `weights` and
@@ -564,6 +625,18 @@ where
     // and alpha, so it is computed once per fit, before the epoch loop
     // (`_sgd_fast.pyx.tp:565-570`).
     let opt_init = optimal_init(loss_fn, hyper.alpha);
+
+    // Effective l1_ratio from the penalty (`_sgd_fast.pyx.tp:558-561`):
+    // `L2 -> 0.0`, `L1 -> 1.0`, `ElasticNet -> user l1_ratio`.
+    let eff = effective_l1_ratio(hyper.penalty, hyper.l1_ratio);
+    let apply_l1 = matches!(hyper.penalty, Penalty::L1 | Penalty::ElasticNet);
+    // Tsuruoka cumulative-penalty state. `u` (scalar) accumulates the total L1
+    // penalty applied so far; `q` (per-feature) records how much penalty has
+    // actually been applied to each weight. Both persist for the WHOLE fit —
+    // allocated once before the epoch loop, mirroring `q = np.zeros(...)` and
+    // `u = 0.0` allocated once per `_plain_sgd` call (`_sgd_fast.pyx.tp:551-556`).
+    let mut u = F::zero();
+    let mut q: Array1<F> = Array1::zeros(n_features);
 
     // Build the RNG for shuffling.
     let mut rng = match hyper.random_state {
@@ -602,17 +675,39 @@ where
             let grad = loss_fn.gradient(y_binary[i], y_pred);
             epoch_loss = epoch_loss + loss_fn.loss(y_binary[i], y_pred);
 
-            // L2 penalty: scale the whole weight vector by the CLAMPED shrink
-            // factor `max(0, 1 - eta*alpha)` (l1_ratio=0 for pure L2) BEFORE the
-            // gradient add, mirroring sklearn `w.scale(max(0, 1-eta*alpha))`
-            // (`_sgd_fast.pyx.tp:632-635`). When `eta*alpha > 1` the factor is
-            // clamped to 0 (zeroing the weights) instead of going negative.
-            let shrink = (F::one() - eta * hyper.alpha).max(F::zero());
+            // L2 shrink: scale the whole weight vector by the CLAMPED factor
+            // `max(0, 1 - (1-eff)*eta*alpha)` BEFORE the gradient add, mirroring
+            // `w.scale(max(0, 1 - (1-l1_ratio)*eta*alpha))`
+            // (`_sgd_fast.pyx.tp:632-635`). For pure L2 (`eff=0`) this is
+            // `max(0, 1-eta*alpha)`; for L1 (`eff=1`) it is `max(0, 1) = 1`
+            // (no L2 shrink); for elasticnet the `(1-eff)` weakens the L2 part.
+            let shrink = (F::one() - (F::one() - eff) * eta * hyper.alpha).max(F::zero());
             for j in 0..n_features {
-                weights[j] = weights[j] * shrink - eta * grad * xi[j];
+                weights[j] = weights[j] * shrink;
             }
-            // The intercept is NOT regularized.
+            // Gradient add `w.add(x, -eta*grad)` (`_sgd_fast.pyx.tp:637-638`).
+            for j in 0..n_features {
+                weights[j] = weights[j] - eta * grad * xi[j];
+            }
+            // The intercept is NOT regularized (`intercept_decay=1`,
+            // `_sgd_fast.pyx.tp:639-644`).
             *intercept = *intercept - eta * grad;
+
+            // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
+            // the gradient add only for L1/ElasticNet (`_sgd_fast.pyx.tp:656-658`,
+            // `l1penalty` at `:750-778` with `wscale = 1`).
+            if apply_l1 {
+                u = u + eff * eta * hyper.alpha;
+                for j in 0..n_features {
+                    let z = weights[j];
+                    if weights[j] > F::zero() {
+                        weights[j] = (weights[j] - (u + q[j])).max(F::zero());
+                    } else if weights[j] < F::zero() {
+                        weights[j] = (weights[j] + (u - q[j])).min(F::zero());
+                    }
+                    q[j] = q[j] + (weights[j] - z);
+                }
+            }
         }
 
         epoch_loss = epoch_loss / F::from(n_samples).unwrap();
@@ -1151,8 +1246,13 @@ pub struct SGDRegressor<F> {
     pub learning_rate: LearningRateSchedule<F>,
     /// Initial learning rate.
     pub eta0: F,
-    /// L2 regularization strength.
+    /// Regularization strength (`alpha`).
     pub alpha: F,
+    /// Regularization penalty (`l2`/`l1`/`elasticnet`). Defaults to `L2`.
+    pub penalty: Penalty,
+    /// Elastic-net mixing parameter; only used when `penalty == ElasticNet`.
+    /// Defaults to `0.15` (sklearn default).
+    pub l1_ratio: F,
     /// Maximum number of passes over the training data.
     pub max_iter: usize,
     /// Convergence tolerance.
@@ -1166,13 +1266,17 @@ pub struct SGDRegressor<F> {
 impl<F: Float> SGDRegressor<F> {
     /// Create a new `SGDRegressor` with default settings.
     ///
-    /// Defaults: `loss = SquaredError`, `learning_rate = InvScaling`,
-    /// `eta0 = 0.01`, `alpha = 0.0001`, `max_iter = 1000`,
-    /// `tol = 1e-3`, `power_t = 0.25`.
+    /// Defaults match scikit-learn's `SGDRegressor.__init__`
+    /// (`_stochastic_gradient.py:2042-2068`): `loss = SquaredError`,
+    /// `learning_rate = InvScaling`, `eta0 = 0.01`, `alpha = 0.0001`,
+    /// `penalty = L2`, `l1_ratio = 0.15`, `max_iter = 1000`, `tol = 1e-3`,
+    /// `power_t = 0.25`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             loss: RegressorLoss::SquaredError,
+            penalty: Penalty::L2,
+            l1_ratio: F::from(0.15).unwrap_or_else(F::zero),
             learning_rate: LearningRateSchedule::InvScaling,
             eta0: F::from(0.01).unwrap(),
             alpha: F::from(0.0001).unwrap(),
@@ -1204,10 +1308,25 @@ impl<F: Float> SGDRegressor<F> {
         self
     }
 
-    /// Set the L2 regularization strength.
+    /// Set the regularization strength.
     #[must_use]
     pub fn with_alpha(mut self, alpha: F) -> Self {
         self.alpha = alpha;
+        self
+    }
+
+    /// Set the regularization penalty (`l2`/`l1`/`elasticnet`).
+    #[must_use]
+    pub fn with_penalty(mut self, penalty: Penalty) -> Self {
+        self.penalty = penalty;
+        self
+    }
+
+    /// Set the elastic-net mixing parameter (`l1_ratio`, used only when
+    /// `penalty == ElasticNet`).
+    #[must_use]
+    pub fn with_l1_ratio(mut self, l1_ratio: F) -> Self {
+        self.l1_ratio = l1_ratio;
         self
     }
 
@@ -1256,6 +1375,8 @@ fn reg_hyper<F: Float>(reg: &SGDRegressor<F>) -> SGDHyper<F> {
         tol: reg.tol,
         random_state: reg.random_state,
         power_t: reg.power_t,
+        penalty: reg.penalty,
+        l1_ratio: reg.l1_ratio,
     }
 }
 
@@ -1285,6 +1406,15 @@ where
     // and alpha, so it is computed once per fit, before the epoch loop
     // (`_sgd_fast.pyx.tp:565-570`).
     let opt_init = optimal_init(loss_fn, hyper.alpha);
+
+    // Effective l1_ratio from the penalty (`_sgd_fast.pyx.tp:558-561`):
+    // `L2 -> 0.0`, `L1 -> 1.0`, `ElasticNet -> user l1_ratio`.
+    let eff = effective_l1_ratio(hyper.penalty, hyper.l1_ratio);
+    let apply_l1 = matches!(hyper.penalty, Penalty::L1 | Penalty::ElasticNet);
+    // Tsuruoka cumulative-penalty state (`u` scalar, `q` per-feature), allocated
+    // once and persisting for the whole fit (`_sgd_fast.pyx.tp:551-556`).
+    let mut u = F::zero();
+    let mut q: Array1<F> = Array1::zeros(n_features);
 
     let mut rng = match hyper.random_state {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
@@ -1321,15 +1451,36 @@ where
             let grad = loss_fn.gradient(y[i], y_pred);
             epoch_loss = epoch_loss + loss_fn.loss(y[i], y_pred);
 
-            // L2 penalty: clamped multiplicative shrink `max(0, 1 - eta*alpha)`
-            // applied to the whole weight vector BEFORE the gradient add
-            // (`_sgd_fast.pyx.tp:632-635`); clamped to 0 when `eta*alpha > 1`.
-            let shrink = (F::one() - eta * hyper.alpha).max(F::zero());
+            // L2 shrink: clamped multiplicative factor
+            // `max(0, 1 - (1-eff)*eta*alpha)` applied to the whole weight vector
+            // BEFORE the gradient add (`_sgd_fast.pyx.tp:632-635`); for pure L2
+            // (`eff=0`) this is `max(0, 1-eta*alpha)`, for L1 (`eff=1`) it is 1.
+            let shrink = (F::one() - (F::one() - eff) * eta * hyper.alpha).max(F::zero());
             for j in 0..n_features {
-                weights[j] = weights[j] * shrink - eta * grad * xi[j];
+                weights[j] = weights[j] * shrink;
+            }
+            // Gradient add `w.add(x, -eta*grad)` (`_sgd_fast.pyx.tp:637-638`).
+            for j in 0..n_features {
+                weights[j] = weights[j] - eta * grad * xi[j];
             }
             // The intercept is NOT regularized.
             *intercept = *intercept - eta * grad;
+
+            // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
+            // the gradient add only for L1/ElasticNet (`_sgd_fast.pyx.tp:656-658`,
+            // `l1penalty` at `:750-778` with `wscale = 1`).
+            if apply_l1 {
+                u = u + eff * eta * hyper.alpha;
+                for j in 0..n_features {
+                    let z = weights[j];
+                    if weights[j] > F::zero() {
+                        weights[j] = (weights[j] - (u + q[j])).max(F::zero());
+                    } else if weights[j] < F::zero() {
+                        weights[j] = (weights[j] + (u - q[j])).min(F::zero());
+                    }
+                    q[j] = q[j] + (weights[j] - z);
+                }
+            }
         }
 
         epoch_loss = epoch_loss / F::from(n_samples).unwrap();

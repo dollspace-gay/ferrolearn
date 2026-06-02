@@ -9,6 +9,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(sgd): REQ-5 penalty l1/elasticnet + l1_ratio via Tsuruoka truncated gradient (u/q cumulative penalty) (#526)
+- translate(sgd): REQ-9 default params (classifier learning_rate=optimal/eta0=0.0/power_t=0.5; epsilon=0.1) (#529)
+- translate(sgd): REQ-7 optimal schedule omits t0 (optimal_init) offset (#527)
+- translate(sgd): REQ-4 L2 update — global wscale shrink-before-gradient, not inline per-feature (#525)
 - translate(ransac): REQ-6 n_inliers_best=1 init and >= acceptance gate (#514)
 - translate(ransac): REQ-5 refit-once-after-loop + inlier_mask_ from subset model (#513)
 - translate(ransac): REQ-9 MAD-zero parity — remove 1e-6 substitution (#517)
@@ -156,6 +160,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: SGD Hinge::gradient diverges from sklearn/linear_model/_sgd_fast.pyx.tp:224 at z==threshold boundary (#539)
 - translate: ferrolearn-linear/ransac.rs — RANSACRegressor sklearn parity (iter 24) (#511)
 - QuantileRegressor: scale alpha by n_samples for sklearn parity (#332)
 - Blocker for REQ-1/REQ-3 of quantile_regressor: intercept recovered via X/y centering is invalid for quantile regression (sklearn _quantile.py:177 'centering y and X does not work for quantile regression'). ferrolearn's FittedQuantileRegressor intercept is computed as y_mean - x_mean.dot(w), giving the SAME intercept for every quantile; sklearn's LP makes the intercept a free LP variable (s0-t0). Live oracle q=0.8 alpha=0: ferro intercept=0.2988 vs sklearn 0.8815 (3x). Fix: fit intercept as an LP variable, not by centering — requires the LP solver (#340). (#506)

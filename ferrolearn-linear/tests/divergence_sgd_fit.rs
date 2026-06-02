@@ -27,7 +27,7 @@
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
 use ferrolearn_linear::sgd::{
-    Hinge, LearningRateSchedule, Loss, RegressorLoss, SGDClassifier, SGDRegressor,
+    Hinge, LearningRateSchedule, Loss, Penalty, RegressorLoss, SGDClassifier, SGDRegressor,
 };
 use ndarray::{Array1, Array2};
 
@@ -240,5 +240,123 @@ fn sgd_hinge_gradient_boundary() {
         (g_pos - SK_DLOSS_YPOS).abs() < 1e-12 && (g_neg - SK_DLOSS_YNEG).abs() < 1e-12,
         "Hinge gradient at margin boundary z=1 diverges: sklearn dloss=({SK_DLOSS_YPOS}, \
          {SK_DLOSS_YNEG}); ferrolearn=({g_pos}, {g_neg})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-5 / #526 — `penalty='l1'` via the Tsuruoka cumulative-penalty
+// truncated gradient.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:560-561,656-658,750-778`
+//   `elif penalty_type == L1: l1_ratio = 1.0`            (`:560-561`)
+//   `u += (l1_ratio * eta * alpha)`                      (`:657`)
+//   `l1penalty(w, q, x_ind, xnnz, u)`                    (`:658`)
+//   where `l1penalty` (`:750-778`) pushes each touched coordinate toward 0 by
+//   `(u ± q[idx])` (clamped not to cross 0) and accumulates the applied penalty
+//   in `q[idx]`. With penalty='l1', eff=1.0 so the L2 shrink factor is
+//   `max(0, 1 - 0) = 1` (no multiplicative L2 decay).
+//
+// Single sample, squared_error loss, constant schedule (eta=eta0 identical in
+// both impls), so the only moving parts are the gradient add and the L1
+// truncation — fully deterministic.
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[2.0,-1.0]]); y=np.array([3.0]); \
+/// m=SGDRegressor(loss='squared_error',penalty='l1',alpha=0.1,l1_ratio=0.15, \
+///   learning_rate='constant',eta0=0.1,max_iter=3,tol=None,random_state=0, \
+///   fit_intercept=True,shuffle=False).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+/// -> coef [0.9204, -0.4452], intercept [0.4752]
+///
+/// (l1_ratio=0.15 is ignored under penalty='l1' since eff is forced to 1.0;
+///  it is passed only to confirm ferrolearn also ignores it.)
+#[test]
+fn sgd_l1_truncated_gradient() {
+    const SK_COEF0: f64 = 0.9204;
+    const SK_COEF1: f64 = -0.4452;
+    const SK_INTERCEPT: f64 = 0.4752;
+
+    let x = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
+    let y = Array1::from_vec(vec![3.0]);
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::L1)
+        .with_l1_ratio(0.15)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.1)
+        .with_max_iter(3)
+        .with_tol(-1.0) // disable convergence early-exit (tol=None analog)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-9
+            && (coef[1] - SK_COEF1).abs() < 1e-9
+            && (intercept - SK_INTERCEPT).abs() < 1e-9,
+        "l1 truncated gradient diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-5 / #526 — `penalty='elasticnet'` with a non-default `l1_ratio`.
+//
+// sklearn site: `sklearn/linear_model/_sgd_fast.pyx.tp:632-635,656-658`
+//   ElasticNet keeps the user `l1_ratio` (no override at `:558-561`), so BOTH
+//   the L2 shrink `max(0, 1 - (1-l1_ratio)*eta*alpha)` (`:635`) AND the L1
+//   truncation `u += l1_ratio*eta*alpha; l1penalty(...)` (`:657-658`) fire.
+//
+// Single sample, squared_error, constant schedule, l1_ratio=0.3 (non-default).
+// ---------------------------------------------------------------------------
+
+/// Oracle invocation:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import SGDRegressor; \
+/// X=np.array([[2.0,-1.0]]); y=np.array([3.0]); \
+/// m=SGDRegressor(loss='squared_error',penalty='elasticnet',alpha=0.1,l1_ratio=0.3, \
+///   learning_rate='constant',eta0=0.1,max_iter=3,tol=None,random_state=0, \
+///   fit_intercept=True,shuffle=False).fit(X,y); \
+///   print(m.coef_.tolist(), m.intercept_.tolist())"
+/// ```
+/// -> coef [0.9234070529999999, -0.457234953], intercept [0.4712037]
+#[test]
+fn sgd_elasticnet_l1_ratio() {
+    const SK_COEF0: f64 = 0.9234070529999999;
+    const SK_COEF1: f64 = -0.457234953;
+    const SK_INTERCEPT: f64 = 0.4712037;
+
+    let x = Array2::from_shape_vec((1, 2), vec![2.0, -1.0]).unwrap();
+    let y = Array1::from_vec(vec![3.0]);
+
+    let model = SGDRegressor::<f64>::new()
+        .with_loss(RegressorLoss::SquaredError)
+        .with_penalty(Penalty::ElasticNet)
+        .with_l1_ratio(0.3)
+        .with_learning_rate(LearningRateSchedule::Constant)
+        .with_eta0(0.1)
+        .with_alpha(0.1)
+        .with_max_iter(3)
+        .with_tol(-1.0)
+        .with_random_state(0);
+
+    let fitted = model.fit(&x, &y).unwrap();
+    let coef = fitted.coefficients();
+    let intercept = fitted.intercept();
+
+    assert!(
+        (coef[0] - SK_COEF0).abs() < 1e-9
+            && (coef[1] - SK_COEF1).abs() < 1e-9
+            && (intercept - SK_INTERCEPT).abs() < 1e-9,
+        "elasticnet (l1_ratio=0.3) diverges: sklearn coef=[{SK_COEF0}, {SK_COEF1}] \
+         intercept={SK_INTERCEPT}; ferrolearn coef={coef:?} intercept={intercept}"
     );
 }
