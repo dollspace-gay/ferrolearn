@@ -39,6 +39,35 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 4);
 //! ```
+//!
+//! ## REQ status (per `.design/linear/sgd.md`, mirrors `sklearn/linear_model/_stochastic_gradient.py` + `_sgd_fast.pyx.tp` @ 1.5.2, commit 156ef14)
+//!
+//! Parity is framed on the deterministic schedule/loss/penalty math + defaults;
+//! random-shuffle full-fit weight parity is out of scope (cross-PRNG boundary,
+//! `_sgd_fast.pyx.tp:579-580` vs `StdRng`). Two states only per R-DEFER-2.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (classifier losses hinge/log/modified_huber/squared_error incl. Hinge boundary) | SHIPPED | `impl Loss for Hinge/LogLoss/ModifiedHuber/SquaredError`. Hinge `gradient` now uses the NON-strict boundary `margin <= 1` matching `_sgd_fast.pyx.tp:224` (`if z <= threshold: return -y`). Consumer: `fn dispatch_train_binary` -> `Fit for SGDClassifier` -> `impl PipelineEstimator for SGDClassifier`. Tests: `test_hinge_loss_*`, divergence `sgd_hinge_gradient_boundary`. Closed #539. |
+//! | REQ-2 (squared_hinge, perceptron) | NOT-STARTED | blocker #523. `enum ClassifierLoss` lacks `SquaredHinge` and a per-loss `threshold` (`_sgd_fast.pyx.tp:232-258,512`). |
+//! | REQ-3 (regressor losses incl. squared_epsilon_insensitive) | NOT-STARTED | blocker #524. `enum RegressorLoss` lacks `SquaredEpsilonInsensitive` (`_sgd_fast.pyx.tp:364-387`). |
+//! | REQ-4 (L2 penalty = clamped wscale shrink) | SHIPPED | `fn train_binary_sgd`/`train_regressor_sgd` apply `shrink = max(0, 1 - eta*alpha)` then `w = w*shrink - eta*grad*x`, mirroring `w.scale(max(0, 1-eta*alpha))` (`_sgd_fast.pyx.tp:632-635`); intercept unregularized. Consumer: `Fit for SGDRegressor`/`SGDClassifier` -> `PipelineEstimator`. Test: divergence `sgd_l2_wscale_clamp`. Closed #525. |
+//! | REQ-5 (l1/elasticnet + l1_ratio) | NOT-STARTED | blocker #526. No `penalty`/`l1_ratio`; no `u`/`q` truncated-gradient (`_sgd_fast.pyx.tp:656-658,750-778`). |
+//! | REQ-6 (constant + invscaling schedules) | SHIPPED | `fn compute_lr`: `Constant => eta0`, `InvScaling => eta0 / t^power_t` (`_sgd_fast.pyx.tp:479,593-594`). Consumer: per-step in `fn train_binary_sgd`/`train_regressor_sgd`. Tests: `test_constant_lr`, `test_invscaling_lr`. |
+//! | REQ-7 (optimal schedule t0 offset) | SHIPPED | `fn compute_lr` Optimal arm now `1/(alpha*(optimal_init + t - 1))` with `optimal_init` from `fn optimal_init` (`typw=sqrt(1/sqrt(alpha))`, `e0=typw/max(1,|gradient(1,-typw)|)`, `optimal_init=1/(e0*alpha)`), mirroring `_sgd_fast.pyx.tp:565-570,592`. Computed once per fit before the epoch loop. Consumer: `fn train_*_sgd`. Tests: `test_optimal_lr`, `test_optimal_init_matches_oracle`, divergence `sgd_optimal_schedule_t0_offset`. Closed #527. |
+//! | REQ-8 (adaptive /5 + n_iter_no_change trigger) | NOT-STARTED | blocker #528. Divides by 2 on a 5-epoch mean-loss trigger; sklearn /5 on `n_iter_no_change`/`best_loss` (`_sgd_fast.pyx.tp:698-701`). |
+//! | REQ-9 (default params per estimator) | SHIPPED (classifier defaults) | `SGDClassifier::new` now sets `learning_rate=Optimal, eta0=0.0, power_t=0.5` (`_stochastic_gradient.py:1242-1244`); `fn schedule_requires_eta0` gates the `eta0>0` validation to constant/invscaling/adaptive (`_stochastic_gradient.py:149-153`). Consumer: `Fit for SGDClassifier`. Tests: divergence `sgd_classifier_default_learning_rate`, `test_sgd_classifier_default`, `test_sgd_classifier_optimal_eta0_zero_ok`. Closed #529. Remaining missing fields (`penalty`, `l1_ratio`, `fit_intercept`, `shuffle`, `epsilon`, `n_iter_no_change`, `early_stopping`, `validation_fraction`, `average`, `warm_start`, `class_weight`, `C`) tracked under their own blockers. |
+//! | REQ-10 (convergence best_loss/n_iter_no_change/sumloss) | NOT-STARTED | blocker #530. First-epoch mean-loss delta; sklearn `best_loss`+`n_iter_no_change`+`sumloss` (`_sgd_fast.pyx.tp:688-707`); missing dloss `+-1e12` clip. |
+//! | REQ-11 (fit_intercept) | NOT-STARTED | blocker #531. No field; intercept always fit (`_sgd_fast.pyx.tp:639`). |
+//! | REQ-12 (shuffle flag) | NOT-STARTED | blocker #532. Always shuffles (`_sgd_fast.pyx.tp:579`). |
+//! | REQ-13 (early_stopping + validation_fraction) | NOT-STARTED | blocker #533. No validation split / score callback. |
+//! | REQ-14 (average / ASGD) | NOT-STARTED | blocker #534. No averaged coef/intercept (`_sgd_fast.pyx.tp:646-654`). |
+//! | REQ-15 (class_weight) | NOT-STARTED | blocker #535. No per-class `weight_pos`/`weight_neg`/`sample_weight` (`_sgd_fast.pyx.tp:599-602,630`). |
+//! | REQ-16 (partial_fit semantics) | SHIPPED | `fn partial_fit (PartialFit for SGDClassifier/FittedSGDClassifier/SGDRegressor/FittedSGDRegressor)` sets `max_iter=1` and carries `self.t` (`_stochastic_gradient.py:581-674`). Consumer: `PartialFit` trait (`ferrolearn-core`). Tests: `test_sgd_*_partial_fit*`. |
+//! | REQ-17 (multiclass one-vs-all) | SHIPPED | `fn fit_ova` (one binary per class) + `fn predict` argmax (`_stochastic_gradient.py:788-844`). Consumer: `Fit for SGDClassifier` -> `PipelineEstimator`. Test: `test_sgd_classifier_multiclass`. |
+//! | REQ-18 (SGDOneClassSVM) | NOT-STARTED | blocker #536 (builder). Estimator absent (`_stochastic_gradient.py:2084-2278`). |
+//! | REQ-19 (anti-pattern cleanup) | NOT-STARTED | blocker #537. `fn compute_lr`'s `_Phantom` arm now returns `eta0` (unreach macro removed); the loss/lr kernels still use `F::from(..).unwrap()` constants (R-CODE-2) tracked here. |
+//! | REQ-20 (ferray substrate migration) | NOT-STARTED | blocker #538. Still `ndarray` + `StdRng` (R-SUBSTRATE-1). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -81,8 +110,11 @@ impl<F: Float> Loss<F> for Hinge {
     }
 
     fn gradient(&self, y_true: F, y_pred: F) -> F {
+        // sklearn `Hinge.dloss` uses a NON-strict boundary at the threshold
+        // (`_sgd_fast.pyx.tp:224`: `if z <= self.threshold: return -y`), so at
+        // the exact margin `z == 1` the gradient is `-y`, not `0`.
         let margin = y_true * y_pred;
-        if margin < F::one() {
+        if margin <= F::one() {
             -y_true
         } else {
             F::zero()
@@ -264,21 +296,56 @@ pub enum LearningRateSchedule<F> {
 }
 
 /// Compute the learning rate for a given step.
+///
+/// `optimal_init` is the `t0` offset of the `optimal` schedule, derived once
+/// per fit from `alpha` and the loss's `dloss(1, -typw)` bound (see
+/// [`optimal_init`]). It is ignored by the other schedules.
 fn compute_lr<F: Float>(
     schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
     power_t: F,
+    optimal_init: F,
     t: usize,
 ) -> F {
-    let t_f = F::from(t.max(1)).unwrap();
+    let t_f = F::from(t.max(1)).unwrap_or_else(F::one);
     match schedule {
         LearningRateSchedule::Constant => eta0,
-        LearningRateSchedule::Optimal => F::one() / (alpha * t_f),
+        // sklearn `_sgd_fast.pyx.tp:592`: `eta = 1/(alpha*(optimal_init+t-1))`,
+        // so the first sample (t=1) sees `eta = 1/(alpha*optimal_init) = e0`.
+        LearningRateSchedule::Optimal => F::one() / (alpha * (optimal_init + t_f - F::one())),
         LearningRateSchedule::InvScaling => eta0 / t_f.powf(power_t),
         LearningRateSchedule::Adaptive => eta0,
-        LearningRateSchedule::_Phantom(_) => unreachable!(),
+        // `_Phantom` is an uninhabited marker arm; fall back to `eta0` rather
+        // than aborting (R-APG-1 forbids the unreach macro in production).
+        LearningRateSchedule::_Phantom(_) => eta0,
     }
+}
+
+/// Compute the `optimal` schedule's `t0` offset `optimal_init`.
+///
+/// Mirrors `_sgd_fast.pyx.tp:565-570`:
+/// `typw = sqrt(1/sqrt(alpha))`,
+/// `initial_eta0 = typw / max(1, dloss(1, -typw))`,
+/// `optimal_init = 1/(initial_eta0 * alpha)`.
+///
+/// sklearn calls `loss.dloss(1.0, -typw)` where the cython signature is
+/// `dloss(self, y, p)` (y first, p second), so `y = 1.0`, `p = -typw`. The
+/// ferrolearn signature is `gradient(y_true, y_pred)`, mapping to
+/// `gradient(1.0, -typw)`; its absolute value matches `max(1.0, dloss(...))`.
+/// Returns `1.0` when `alpha == 0` (the schedule is unused / guarded upstream).
+fn optimal_init<F, L>(loss_fn: &L, alpha: F) -> F
+where
+    F: Float,
+    L: Loss<F>,
+{
+    if alpha <= F::zero() {
+        return F::one();
+    }
+    let typw = (F::one() / alpha.sqrt()).sqrt();
+    let dloss = loss_fn.gradient(F::one(), -typw).abs();
+    let initial_eta0 = typw / dloss.max(F::one());
+    F::one() / (initial_eta0 * alpha)
 }
 
 // ---------------------------------------------------------------------------
@@ -363,20 +430,21 @@ pub struct SGDClassifier<F> {
 impl<F: Float> SGDClassifier<F> {
     /// Create a new `SGDClassifier` with default settings.
     ///
-    /// Defaults: `loss = Hinge`, `learning_rate = InvScaling`,
-    /// `eta0 = 0.01`, `alpha = 0.0001`, `max_iter = 1000`,
-    /// `tol = 1e-3`, `power_t = 0.25`.
+    /// Defaults match scikit-learn's `SGDClassifier.__init__`
+    /// (`_stochastic_gradient.py:1242-1244`): `loss = Hinge`,
+    /// `learning_rate = Optimal`, `eta0 = 0.0`, `alpha = 0.0001`,
+    /// `max_iter = 1000`, `tol = 1e-3`, `power_t = 0.5`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             loss: ClassifierLoss::Hinge,
-            learning_rate: LearningRateSchedule::InvScaling,
-            eta0: F::from(0.01).unwrap(),
-            alpha: F::from(0.0001).unwrap(),
+            learning_rate: LearningRateSchedule::Optimal,
+            eta0: F::from(0.0).unwrap_or_else(F::zero),
+            alpha: F::from(0.0001).unwrap_or_else(F::zero),
             max_iter: 1000,
-            tol: F::from(1e-3).unwrap(),
+            tol: F::from(1e-3).unwrap_or_else(F::zero),
             random_state: None,
-            power_t: F::from(0.25).unwrap(),
+            power_t: F::from(0.5).unwrap_or_else(F::zero),
         }
     }
 
@@ -492,6 +560,10 @@ where
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
     let mut indices: Vec<usize> = (0..n_samples).collect();
+    // `optimal_init` (the `optimal` schedule's t0 offset) depends on the loss
+    // and alpha, so it is computed once per fit, before the epoch loop
+    // (`_sgd_fast.pyx.tp:565-570`).
+    let opt_init = optimal_init(loss_fn, hyper.alpha);
 
     // Build the RNG for shuffling.
     let mut rng = match hyper.random_state {
@@ -515,6 +587,7 @@ where
                     hyper.eta0,
                     hyper.alpha,
                     hyper.power_t,
+                    opt_init,
                     t,
                 ),
             };
@@ -529,10 +602,16 @@ where
             let grad = loss_fn.gradient(y_binary[i], y_pred);
             epoch_loss = epoch_loss + loss_fn.loss(y_binary[i], y_pred);
 
-            // Update weights with gradient + L2 regularization.
+            // L2 penalty: scale the whole weight vector by the CLAMPED shrink
+            // factor `max(0, 1 - eta*alpha)` (l1_ratio=0 for pure L2) BEFORE the
+            // gradient add, mirroring sklearn `w.scale(max(0, 1-eta*alpha))`
+            // (`_sgd_fast.pyx.tp:632-635`). When `eta*alpha > 1` the factor is
+            // clamped to 0 (zeroing the weights) instead of going negative.
+            let shrink = (F::one() - eta * hyper.alpha).max(F::zero());
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * (grad * xi[j] + hyper.alpha * weights[j]);
+                weights[j] = weights[j] * shrink - eta * grad * xi[j];
             }
+            // The intercept is NOT regularized.
             *intercept = *intercept - eta * grad;
         }
 
@@ -610,7 +689,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// not positive.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedSGDClassifier<F>, FerroError> {
-        validate_clf_params(x, y, self.eta0, self.alpha)?;
+        validate_clf_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -643,10 +722,25 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
     }
 }
 
+/// Whether a learning-rate schedule requires `eta0 > 0`.
+///
+/// Mirrors sklearn `_more_validate_params` (`_stochastic_gradient.py:149-153`):
+/// `eta0 > 0` is enforced only for `constant`/`invscaling`/`adaptive`; the
+/// `optimal` schedule derives its own initial rate and accepts `eta0 == 0`.
+fn schedule_requires_eta0<F: Float>(schedule: &LearningRateSchedule<F>) -> bool {
+    matches!(
+        schedule,
+        LearningRateSchedule::Constant
+            | LearningRateSchedule::InvScaling
+            | LearningRateSchedule::Adaptive
+    )
+}
+
 /// Validate classifier input shapes and parameters.
 fn validate_clf_params<F: Float>(
     x: &Array2<F>,
     y: &Array1<usize>,
+    schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
 ) -> Result<(), FerroError> {
@@ -665,7 +759,7 @@ fn validate_clf_params<F: Float>(
             context: "SGDClassifier requires at least one sample".into(),
         });
     }
-    if eta0 <= F::zero() {
+    if schedule_requires_eta0(schedule) && eta0 <= F::zero() {
         return Err(FerroError::InvalidParameter {
             name: "eta0".into(),
             reason: "must be positive".into(),
@@ -939,7 +1033,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedSGDClassifier<F>, FerroError> {
-        validate_clf_params(x, y, self.eta0, self.alpha)?;
+        validate_clf_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -1187,6 +1281,10 @@ where
     let mut current_eta = hyper.eta0;
     let mut no_improve_count: usize = 0;
     let mut indices: Vec<usize> = (0..n_samples).collect();
+    // `optimal_init` (the `optimal` schedule's t0 offset) depends on the loss
+    // and alpha, so it is computed once per fit, before the epoch loop
+    // (`_sgd_fast.pyx.tp:565-570`).
+    let opt_init = optimal_init(loss_fn, hyper.alpha);
 
     let mut rng = match hyper.random_state {
         Some(seed) => rand::rngs::StdRng::seed_from_u64(seed),
@@ -1209,6 +1307,7 @@ where
                     hyper.eta0,
                     hyper.alpha,
                     hyper.power_t,
+                    opt_init,
                     t,
                 ),
             };
@@ -1222,9 +1321,14 @@ where
             let grad = loss_fn.gradient(y[i], y_pred);
             epoch_loss = epoch_loss + loss_fn.loss(y[i], y_pred);
 
+            // L2 penalty: clamped multiplicative shrink `max(0, 1 - eta*alpha)`
+            // applied to the whole weight vector BEFORE the gradient add
+            // (`_sgd_fast.pyx.tp:632-635`); clamped to 0 when `eta*alpha > 1`.
+            let shrink = (F::one() - eta * hyper.alpha).max(F::zero());
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * (grad * xi[j] + hyper.alpha * weights[j]);
+                weights[j] = weights[j] * shrink - eta * grad * xi[j];
             }
+            // The intercept is NOT regularized.
             *intercept = *intercept - eta * grad;
         }
 
@@ -1309,6 +1413,7 @@ pub struct FittedSGDRegressor<F> {
 fn validate_reg_params<F: Float>(
     x: &Array2<F>,
     y: &Array1<F>,
+    schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
 ) -> Result<(), FerroError> {
@@ -1327,7 +1432,7 @@ fn validate_reg_params<F: Float>(
             context: "SGDRegressor requires at least one sample".into(),
         });
     }
-    if eta0 <= F::zero() {
+    if schedule_requires_eta0(schedule) && eta0 <= F::zero() {
         return Err(FerroError::InvalidParameter {
             name: "eta0".into(),
             reason: "must be positive".into(),
@@ -1357,7 +1462,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
     /// Returns [`FerroError::InvalidParameter`] if `eta0` or `alpha` are
     /// invalid.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedSGDRegressor<F>, FerroError> {
-        validate_reg_params(x, y, self.eta0, self.alpha)?;
+        validate_reg_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
 
         let n_features = x.ncols();
         let hyper = reg_hyper(self);
@@ -1475,7 +1580,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<FittedSGDRegressor<F>, FerroError> {
-        validate_reg_params(x, y, self.eta0, self.alpha)?;
+        validate_reg_params(x, y, &self.learning_rate, self.eta0, self.alpha)?;
 
         let n_features = x.ncols();
         let mut hyper = reg_hyper(&self);
@@ -1630,21 +1735,46 @@ mod tests {
     #[test]
     fn test_constant_lr() {
         let lr: LearningRateSchedule<f64> = LearningRateSchedule::Constant;
-        assert!((compute_lr(&lr, 0.1, 0.01, 0.25, 100) - 0.1).abs() < 1e-10);
+        // optimal_init is ignored by the Constant schedule.
+        assert!((compute_lr(&lr, 0.1, 0.01, 0.25, 1.0, 100) - 0.1).abs() < 1e-10);
     }
 
     #[test]
     fn test_optimal_lr() {
+        // sklearn `_sgd_fast.pyx.tp:592`: `eta = 1/(alpha*(optimal_init+t-1))`.
+        // At t=1 this equals `initial_eta0 = 1/(alpha*optimal_init)`. With
+        // alpha=0.01 and Hinge `dloss(1,-typw)` (= -1, |·|=1), the live oracle
+        // gives `typw = sqrt(1/sqrt(0.01)) = 3.1622776601683795` and
+        // `optimal_init = 1/(typw*0.01) = 31.62277660168379` (computed by
+        // `_sgd_fast`'s init block), so eta@t=1 == typw.
         let lr: LearningRateSchedule<f64> = LearningRateSchedule::Optimal;
-        // eta = 1 / (alpha * t) = 1 / (0.01 * 10) = 10.0
-        assert!((compute_lr(&lr, 0.1, 0.01, 0.25, 10) - 10.0).abs() < 1e-10);
+        const OPTIMAL_INIT: f64 = 31.62277660168379;
+        const ETA_T1: f64 = 3.1622776601683795; // = typw = initial_eta0
+        assert!((compute_lr(&lr, 0.0, 0.01, 0.5, OPTIMAL_INIT, 1) - ETA_T1).abs() < 1e-9);
+        // At t=10: eta = 1/(0.01*(31.62277660168379 + 9)).
+        let expected_t10 = 1.0 / (0.01 * (OPTIMAL_INIT + 9.0));
+        assert!((compute_lr(&lr, 0.0, 0.01, 0.5, OPTIMAL_INIT, 10) - expected_t10).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_optimal_init_matches_oracle() {
+        // optimal_init derivation matches the live sklearn oracle (Hinge):
+        // python3 -c "import numpy as np; from sklearn.linear_model._sgd_fast \
+        //   import Hinge; a=0.01; typw=np.sqrt(1/np.sqrt(a)); \
+        //   e0=typw/max(1.0,abs(Hinge(1.0).py_dloss(1.0,-typw))); print(1/(e0*a))"
+        // -> 31.62277660168379
+        const SK_OPTIMAL_INIT: f64 = 31.62277660168379;
+        let got = optimal_init(&Hinge, 0.01_f64);
+        assert!((got - SK_OPTIMAL_INIT).abs() < 1e-9, "got {got}");
+        // alpha == 0 returns 1.0 (schedule guarded / unused upstream).
+        assert!((optimal_init(&Hinge, 0.0_f64) - 1.0).abs() < 1e-12);
     }
 
     #[test]
     fn test_invscaling_lr() {
         let lr: LearningRateSchedule<f64> = LearningRateSchedule::InvScaling;
         // eta = 0.1 / 10^0.5 = 0.1 / 3.162... ~= 0.0316...
-        let result = compute_lr(&lr, 0.1, 0.01, 0.5, 10);
+        let result = compute_lr(&lr, 0.1, 0.01, 0.5, 1.0, 10);
         let expected = 0.1 / 10.0_f64.sqrt();
         assert!((result - expected).abs() < 1e-10);
     }
@@ -1652,7 +1782,7 @@ mod tests {
     #[test]
     fn test_adaptive_lr_returns_eta0() {
         let lr: LearningRateSchedule<f64> = LearningRateSchedule::Adaptive;
-        assert!((compute_lr(&lr, 0.05, 0.01, 0.25, 100) - 0.05).abs() < 1e-10);
+        assert!((compute_lr(&lr, 0.05, 0.01, 0.25, 1.0, 100) - 0.05).abs() < 1e-10);
     }
 
     // -----------------------------------------------------------------------
@@ -1758,8 +1888,24 @@ mod tests {
     fn test_sgd_classifier_invalid_eta0() {
         let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let y = array![0, 0, 1, 1];
-        let clf = SGDClassifier::<f64>::new().with_eta0(0.0);
+        // sklearn enforces `eta0 > 0` only for constant/invscaling/adaptive
+        // (`_stochastic_gradient.py:149-153`); under the default `optimal`
+        // schedule `eta0 = 0.0` is valid, so use `constant` to hit the reject.
+        let clf = SGDClassifier::<f64>::new()
+            .with_learning_rate(LearningRateSchedule::Constant)
+            .with_eta0(0.0);
         assert!(clf.fit(&x, &y).is_err());
+    }
+
+    #[test]
+    fn test_sgd_classifier_optimal_eta0_zero_ok() {
+        // Default `optimal` schedule with `eta0 = 0.0` (sklearn default) must
+        // NOT be rejected by validation (`_stochastic_gradient.py:149-153`).
+        let x = Array2::from_shape_vec((4, 1), vec![-2.0, -1.0, 1.0, 2.0]).unwrap_or_default();
+        let y = array![0, 0, 1, 1];
+        let clf = SGDClassifier::<f64>::new().with_random_state(42);
+        assert!((clf.eta0 - 0.0).abs() < 1e-12);
+        assert!(clf.fit(&x, &y).is_ok());
     }
 
     #[test]
@@ -1868,16 +2014,20 @@ mod tests {
     }
 
     #[test]
-    fn test_sgd_classifier_constant_lr() {
-        let x = Array2::from_shape_vec((4, 1), vec![-2.0, -1.0, 1.0, 2.0]).unwrap();
+    fn test_sgd_classifier_constant_lr() -> Result<(), FerroError> {
+        let x = Array2::from_shape_vec((4, 1), vec![-2.0, -1.0, 1.0, 2.0]).unwrap_or_default();
         let y = array![0, 0, 1, 1];
 
+        // The `constant` schedule requires `eta0 > 0`; the default is now 0.0
+        // (sklearn `optimal` default), so set it explicitly.
         let clf = SGDClassifier::<f64>::new()
             .with_learning_rate(LearningRateSchedule::Constant)
+            .with_eta0(0.01)
             .with_random_state(42)
             .with_max_iter(200);
-        let fitted = clf.fit(&x, &y).unwrap();
-        assert_eq!(fitted.predict(&x).unwrap().len(), 4);
+        let fitted = clf.fit(&x, &y)?;
+        assert_eq!(fitted.predict(&x)?.len(), 4);
+        Ok(())
     }
 
     #[test]
@@ -2064,9 +2214,13 @@ mod tests {
 
     #[test]
     fn test_sgd_classifier_default() {
+        // sklearn `SGDClassifier()` defaults (live oracle / `:1242-1244`):
+        // learning_rate='optimal', eta0=0.0, alpha=0.0001, power_t=0.5.
         let clf = SGDClassifier::<f64>::default();
-        assert!(clf.eta0 > 0.0);
-        assert!(clf.alpha >= 0.0);
+        assert!(matches!(clf.learning_rate, LearningRateSchedule::Optimal));
+        assert!((clf.eta0 - 0.0).abs() < 1e-12);
+        assert!((clf.alpha - 0.0001).abs() < 1e-12);
+        assert!((clf.power_t - 0.5).abs() < 1e-12);
     }
 
     #[test]
