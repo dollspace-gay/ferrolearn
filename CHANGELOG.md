@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(glm): REQ-11 warm_start (#557)
+- translate(glm): REQ-11 warm_start (#557)
+- translate(glm): REQ-10 solver param lbfgs/newton-cholesky + gradient-norm stop (#556)
+- translate(glm): REQ-13 score(X,y)=D2 deviance score (#559)
+- translate(glm): REQ-14 expose n_iter_ + per-family y-domain validation (#560)
+- translate(glm): REQ-12 sample_weight (#558)
+- translate(glm): REQ-3 pin Tweedie(power) vs oracle for log-link powers (#550)
+- translate(glm): REQ-2 pin Gamma vs oracle + reject y<=0 domain (#549)
+- translate(glm): REQ-1 pin Poisson coef_/intercept_ vs live oracle (#548)
 - translate(glm): REQ-5 intercept init = link(weighted_mean(y)) (#552)
 - translate(glm): REQ-9 TweedieRegressor default power 1.5 -> 0.0 (#555)
 - translate(glm): REQ-8 TweedieRegressor link param auto/identity/log (#554)
