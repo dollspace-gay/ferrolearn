@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(qda): REQ-4 pin predict_log_proba + smallest_normal floor + expose (#578)
+- translate(qda): REQ-9 store_covariance + covariance_ accessor (#582)
+- translate(qda): REQ-6 provided priors (None=empirical, array verbatim) (#580)
+- translate(qda): REQ-11 expose means_/priors_/scalings_/rotations_/covariance_ (#584)
+- translate(qda): REQ-10 tol + collinearity warning + SVD/pseudo-inverse for rank-deficient (#583)
+- translate(qda): REQ-5 pin regularized decision vs Q(reg_param=0.5) (#579)
+- translate(qda): REQ-3 pin predict_proba + expose on RsQDA (#577)
+- translate(qda): REQ-2 pin predict label-for-label vs oracle (#576)
+- translate(qda): REQ-1 pin decision_function vs live _decision_function (Cholesky-inv == SVD) (#575)
 - translate(isotonic): REQ-10 free isotonic_regression() + check_increasing() (#571)
 - translate(isotonic): REQ-9 expose X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_ (#570)
 - translate(isotonic): REQ-6 increasing='auto' via Spearman check_increasing (#567)

@@ -1,0 +1,433 @@
+# Linear Discriminant Analysis
+
+<!--
+tier: 3-component
+status: draft
+baseline-commit: 83e73bf4
+upstream: scikit-learn 1.5.2 (commit 156ef14)
+upstream-paths:
+  - sklearn/discriminant_analysis.py
+ferrolearn-module: ferrolearn-linear/src/lda.rs
+parity-op: LinearDiscriminantAnalysis
+crosslink-issue: 587
+-->
+
+## Summary
+
+`ferrolearn-linear/src/lda.rs` is intended to mirror scikit-learn's
+`sklearn.discriminant_analysis.LinearDiscriminantAnalysis`
+(`discriminant_analysis.py:175-759`): a classifier with a linear decision
+boundary (Gaussian densities with a **shared** covariance + Bayes' rule) that
+doubles as a supervised dimensionality-reduction transformer. sklearn's default
+`solver="svd"` whitens the within-class data via an SVD, derives
+`scalings_`/`xbar_`, then forms `coef_`/`intercept_` (which embed `log priors_`)
+so that `decision_function = X @ coef_.T + intercept_`, `predict` = argmax of
+that, and `predict_proba` = softmax (binary: `expit`) of it.
+
+ferrolearn implements a **different algorithm**: the classical
+generalized-eigenvalue formulation. `fn fit in lda.rs` builds the within-class
+scatter `Sw` (sum of outer products, **un-averaged**, plus a `1e-6` ridge), the
+between-class scatter `Sb = Σ n_c (μ_c-μ)(μ_c-μ)ᵀ`, solves `Sw⁻¹Sb v = λv` via a
+hand-rolled Jacobi eigensolver (`fn jacobi_eigen_f`) over a Gaussian-elimination
+inverse (`fn sw_inv_sb` / `fn gaussian_solve_f`), and keeps the top-`k`
+eigenvectors as `scalings`. `transform` projects via raw `X @ scalings` (no
+`xbar_` centering, no within-std whitening). `predict`/`predict_proba`/
+`predict_log_proba`/`decision_function` use a **nearest-centroid / equal-priors
+approximation** in the projected space (`-½‖z-μ_c‖²`), which the module
+doc-comment itself admits (`lda.rs:147-150`).
+
+**Crux finding (verified against the live oracle).** The one quantity that
+matches is `explained_variance_ratio_`: the eigenvalue ratio `λ_k/Σλ` from
+ferrolearn's `Sw⁻¹Sb` formulation numerically equals sklearn's SVD-solver
+`S²/ΣS²` (iris: both `[0.991213, 0.008787]`). Everything else diverges in
+**value**:
+
+- `decision_function` is a different function entirely — sklearn's affine
+  `X@coef_.T + intercept_` (which carries `log priors_`) vs ferrolearn's
+  projected-space `-½‖z-μ_c‖²`. Even with **uniform** priors the per-sample
+  values differ (sklearn iris row 0 = `[31.34, -17.96, -64.41]`); only the
+  argmax happens to agree when priors are uniform.
+- `transform` values diverge: sklearn `(X-xbar_)@scalings_` with whitened
+  scalings (iris row 0 = `[8.06, -0.30]`) vs ferrolearn raw `X@scalings`
+  (`[-1.50, -1.89]`).
+- With **imbalanced/empirical or provided** priors the missing `log(prior_k)`
+  term shifts the boundary: on a 40-vs-4 class split (priors `[0.909, 0.091]`)
+  sklearn's `coef_/intercept_` push the boundary toward the minority class while
+  ferrolearn's equal-prior nearest-centroid ignores it.
+- The binary `decision_function` shape is `(n,)` in sklearn (the log-likelihood
+  ratio `log p(y=1|x)-log p(y=0|x)`), but ferrolearn always returns
+  `(n, n_classes)`.
+
+ferrolearn has **no** `coef_`/`intercept_`/`xbar_`/`priors_`/`covariance_`
+attributes, **no** constructor params besides `n_components` (no `solver`,
+`shrinkage`, `priors`, `store_covariance`, `tol`), and **only** the SVD-analog
+single solver — `lsqr`/`eigen` solvers and shrinkage are absent. The estimator
+is re-exported at the crate root (`pub use lda::{FittedLDA, LDA} in lib.rs`) but
+is **not** registered in the `ferrolearn-python` binding, so its inference
+methods have no non-test production consumer. Substrate is `ndarray` throughout
+(ferray NOT-STARTED).
+
+Under R-DEFER-2 every REQ below is binary. The single SHIPPED row (REQ-6,
+`n_components` bound) is the one piece whose behavior is structurally checkable,
+present, consumed, and tested; even `explained_variance_ratio_`, though it
+numerically matches the oracle, is NOT-STARTED because it has no R-CHAR-3
+live-oracle pin and the underlying `transform`/`scalings_` it derives from
+diverge.
+
+## Algorithm (sklearn — the contract)
+
+`LinearDiscriminantAnalysis(solver="svd", shrinkage=None, priors=None,
+n_components=None, store_covariance=False, tol=1e-4, covariance_estimator=None)`
+(`discriminant_analysis.py:347-363`); `_parameter_constraints` at `:337-345`
+(`solver ∈ {svd, lsqr, eigen}`, `shrinkage ∈ {"auto", [0,1] float, None}`,
+`n_components ≥ 1 or None`, `priors` array-like or None, `tol ≥ 0`).
+
+### fit — solver dispatch (`discriminant_analysis.py:565-659`)
+1. Validate `ensure_min_samples=2`; `classes_ = unique_labels(y)`; reject
+   `n_samples == n_classes` (`:589-599`).
+2. **priors_** (`:601-612`): `priors is None` → empirical `cnts/n` per class;
+   else `np.asarray(priors)`. Reject negative; renormalize (with a `UserWarning`)
+   if `|Σ-1| > 1e-5`.
+3. `max_components = min(n_classes-1, n_features)`; `_max_components` =
+   `n_components` (error if `> max_components`) or the max (`:614-625`).
+4. Dispatch on `solver` (`:627-650`): `svd` (default; `shrinkage`/
+   `covariance_estimator` raise), `lsqr` (`_solve_lstsq`), `eigen`
+   (`_solve_eigen`).
+5. **Binary special-case** (`:651-657`): if 2 classes, collapse to
+   `coef_ = coef_[1]-coef_[0]` (shape `(1, n_features)`) and
+   `intercept_ = intercept_[1]-intercept_[0]` (shape `(1,)`).
+
+### _solve_svd (`discriminant_analysis.py:487-559`) — the default
+- `means_ = _class_means(X, y)` (`:508`); `xbar_ = priors_ @ means_` (`:517`).
+- Center per class, stack `Xc`; within-std `std` (`:519-524`).
+- `X = sqrt(1/(n-K)) * (Xc/std)`; `U,S,Vt = svd(X)` (`:528-530`).
+- `rank = Σ(S > tol)`; `scalings = (Vt[:rank]/std).T / S[:rank]` — the within
+  whitening (`:532-534`).
+- Between scaling: weight centered class means by `sqrt(n·priors_·1/(K-1))`,
+  project onto `scalings`, second SVD (`:535-545`).
+- `explained_variance_ratio_ = (S²/ΣS²)[:_max_components]` (`:550-552`).
+- `scalings_ = scalings @ Vt.T[:, :rank]` (`:555`).
+- `coef = (means_ - xbar_) @ scalings_`;
+  `intercept_ = -0.5·Σ(coef²) + log(priors_)`;
+  `coef_ = coef @ scalings_.T`; `intercept_ -= xbar_ @ coef_.T` (`:556-559`).
+
+### _solve_eigen (`discriminant_analysis.py:421-485`)
+`covariance_ = _class_cov(X,y,priors_,shrinkage)` (the **prior-weighted, biased**
+within covariance); `St = _cov(X,shrinkage)`; `Sb = St - Sw`; generalized
+`eigh(Sb, Sw)`; `explained_variance_ratio_ = sort(evals/Σevals)[::-1]`;
+`scalings_ = evecs`; `coef_ = (means_ @ evecs) @ evecs.T`;
+`intercept_ = -0.5·diag(means_ @ coef_.T) + log(priors_)`. Supports shrinkage.
+
+### _solve_lstsq (`discriminant_analysis.py:365-419`)
+`covariance_ = _class_cov(...)`; `coef_ = lstsq(covariance_, means_.T)[0].T`;
+`intercept_ = -0.5·diag(means_ @ coef_.T) + log(priors_)`. **No** `transform`
+(raises `NotImplementedError`, `:676-679`). Supports shrinkage.
+
+### transform (`discriminant_analysis.py:661-689`)
+`svd` → `(X - xbar_) @ scalings_`; `eigen` → `X @ scalings_`; sliced to
+`[:, :_max_components]`. `lsqr` raises.
+
+### decision_function (`LinearClassifierMixin`, referenced `:739-759`)
+`X @ coef_.T + intercept_`; binary → `(n,)` (positive-class log-likelihood
+ratio), multiclass → `(n, n_classes)`.
+
+### predict / predict_proba / predict_log_proba (`:691-738`)
+`predict` = `classes_.take(argmax(decision_function, axis=1))` (mixin).
+`predict_proba`: binary → `stack([1-expit(d), expit(d)])`; multiclass →
+`softmax(decision_function)` (`:706-711`). `predict_log_proba` = `log` of that
+with a `smallest_normal` floor on exact zeros (`:726-737`).
+
+## ferrolearn (what exists)
+
+`LDA<F> { n_components: Option<usize> }` (`lda.rs`), `LDA::new(Option<usize>)`,
+`n_components` getter, `Default` (= `None`). The `Fit<Array2<F>, Array1<usize>>`
+impl (`impl Fit for LDA in lda.rs`) checks `y` length / `n_samples ≥ 2` /
+`n_classes ≥ 2`, validates `n_components ∈ [1, min(n_classes-1, n_features)]`,
+computes the overall mean + per-class means, the **un-averaged** within scatter
+`Sw = Σ_c Σ_{x∈c} (x-μ_c)(x-μ_c)ᵀ` with a `1e-6` diagonal ridge, the between
+scatter `Sb = Σ_c n_c (μ_c-μ)(μ_c-μ)ᵀ`, then `M = Sw⁻¹Sb` (`fn sw_inv_sb` via
+`fn gaussian_solve_f`), a Jacobi eigendecomposition (`fn jacobi_eigen_f`),
+descending-eigenvalue sort, `explained_variance_ratio = clamp(λ_k,0)/Σclamp(λ,0)`,
+`scalings` = top-`k` eigenvectors, and projected class `means = class_means @
+scalings`.
+
+`FittedLDA<F> { scalings, means, explained_variance_ratio, classes, n_features }`
+(`lda.rs`) exposes `scalings`/`means`/`explained_variance_ratio`/`classes`
+accessors. `Transform` (`fn transform in lda.rs`) returns raw `x.dot(&scalings)`
+(no centering). `Predict` (`fn predict in lda.rs`) is nearest-centroid in the
+projected space. `fn decision_function in lda.rs` returns `(n, n_classes)` of
+`-½‖z-μ_c‖²`; `fn predict_proba` is the softmax of those; `fn predict_log_proba`
+= `crate::log_proba(&predict_proba)`. `LDA` also implements `PipelineEstimator`.
+Re-exported as `pub use lda::{FittedLDA, LDA} in lib.rs`; **not** present in
+`ferrolearn-python`.
+
+## Requirements
+
+- REQ-1: **svd-solver fit + decision_function parity** — the default
+  `solver="svd"` produces `coef_`/`intercept_`/`xbar_`/`scalings_` such that
+  `decision_function(X) = X @ coef_.T + intercept_` matches the live
+  `LinearDiscriminantAnalysis().fit(X,y).decision_function(X)` oracle, including
+  the `log(priors_)` term (`discriminant_analysis.py:487-559, 739-759`).
+- REQ-2: **predict (argmax)** — `predict` = `classes_.take(argmax of the
+  affine decision_function)`, matching the oracle's labels including on
+  **imbalanced** classes where the prior shifts the boundary
+  (`discriminant_analysis.py:691-711` via the mixin).
+- REQ-3: **predict_proba** — binary → `[1-expit(d), expit(d)]`, multiclass →
+  `softmax(decision_function)`, over the **prior-aware** affine decision, rows
+  sum to 1, matching the oracle (`discriminant_analysis.py:691-711`).
+- REQ-4: **predict_log_proba** — `log(predict_proba)` with sklearn's
+  `smallest_normal` zero-floor (`discriminant_analysis.py:713-737`).
+- REQ-5: **transform (projection) parity** — `(X - xbar_) @ scalings_` sliced to
+  `_max_components`, with the SVD-whitened `scalings_`, matching the oracle
+  `transform(X)` (`discriminant_analysis.py:684-689, 532-555`).
+- REQ-6: **n_components bound** — `n_components ≤ min(n_classes-1, n_features)`,
+  `None` → the max; `n_components` out of range → error
+  (`discriminant_analysis.py:614-625`).
+- REQ-7: **priors (None=empirical + provided)** — `priors=None` → empirical
+  `cnts/n`; a provided array used (renormalized with warning if `|Σ-1|>1e-5`,
+  rejected if negative), and `priors_` exposed (`discriminant_analysis.py:601-612`).
+- REQ-8: **fitted attributes coef_/intercept_/xbar_** — expose
+  `coef_`/`intercept_`/`xbar_` matching the oracle arrays
+  (`discriminant_analysis.py:556-559, 517`).
+- REQ-9: **lsqr solver** — the `solver="lsqr"` least-squares path
+  (`coef_ = lstsq(covariance_, means_.T)[0].T`), `transform` raising
+  `NotImplementedError` (`discriminant_analysis.py:365-419, 676-679`).
+- REQ-10: **eigen solver** — the `solver="eigen"` generalized-eigenvalue path
+  (`eigh(Sb, Sw)`, `scalings_ = evecs`, `coef_`/`intercept_` from means+priors)
+  (`discriminant_analysis.py:421-485`).
+- REQ-11: **shrinkage (None/auto/float)** — the `shrinkage` parameter
+  (None / 'auto' Ledoit-Wolf / float) on `lsqr`/`eigen`, rejected on `svd`
+  (`discriminant_analysis.py:339, 628-629`, `_cov`/`_class_cov`).
+- REQ-12: **store_covariance / covariance_** — the `store_covariance` flag and
+  the weighted within `covariance_ = Σ_k prior_k·C_k` attribute
+  (`discriminant_analysis.py:280-285, 509-510`).
+- REQ-13: **explained_variance_ratio_** — `(S²/ΣS²)[:_max_components]` matching
+  the oracle (`discriminant_analysis.py:550-552`).
+- REQ-14: **decision_function shape/sign (binding ABI)** — binary → `(n,)`
+  (log-likelihood ratio of the positive class), multiclass → `(n, n_classes)`
+  (`discriminant_analysis.py:651-657, 739-759`). cf. #581/#454.
+- REQ-15: **tol** — the SVD-solver rank threshold `Σ(S > tol)` and
+  `Σ(S > tol·S[0])` (`discriminant_analysis.py:354, 532, 554`).
+- REQ-16: **ferray substrate migration** — `lda.rs` owns its computation on
+  `ferray-core` arrays / `ferray::linalg` (SVD, eig, solve), not `ndarray` +
+  hand-rolled Jacobi/Gaussian elimination (R-SUBSTRATE).
+
+## Acceptance criteria
+
+- AC-1 (REQ-1): on iris (3-class, balanced), ferrolearn's `decision_function(X)`
+  matches `L().fit(X,y).decision_function(X)` (the affine `X@coef_.T+intercept_`,
+  e.g. row 0 = `[31.34, -17.96, -64.41]`) within `1e-8`. **Currently diverges**:
+  ferrolearn returns `-½‖z-μ_c‖²` in projected space, a different function.
+- AC-2 (REQ-2): on a 40-vs-4 imbalanced 2-class set (priors `[0.909, 0.091]`),
+  `predict` of a borderline point matches `L().predict` (which uses
+  `log(priors_)`). **Currently the equal-prior nearest-centroid can disagree.**
+- AC-3 (REQ-3): `predict_proba(X)` matches `L().predict_proba(X)` within `1e-8`
+  (binary `expit` path + multiclass softmax of the affine decision); rows sum
+  to 1. **Currently diverges (softmax of the wrong decision).**
+- AC-4 (REQ-4): `predict_log_proba(X)` matches `L().predict_log_proba(X)` within
+  `1e-8` where proba > 0.
+- AC-5 (REQ-5): on iris, `transform(X)` matches `L().transform(X)` (row 0 ≈
+  `[8.0618, -0.3004]`) within `1e-6` up to per-column sign. **Currently
+  diverges**: ferrolearn returns `[-1.50, -1.89]` (raw, un-centered, eigvecs not
+  std-whitened).
+- AC-6 (REQ-6): `LDA::new(Some(k))` with `k > min(n_classes-1, n_features)`
+  errors; `None` → `k = min(n_classes-1, n_features)`; `Some(0)` errors.
+- AC-7 (REQ-7): `L(priors=[0.9,0.1]).fit(X,y).priors_ == [0.9,0.1]`; `None` →
+  empirical; ferrolearn exposes `priors_` and its predictions reflect it.
+- AC-8 (REQ-8): `coef_`/`intercept_`/`xbar_` equal the oracle arrays (binary:
+  `coef_` shape `(1, n_features)`, `intercept_` shape `(1,)`).
+- AC-9 (REQ-9): `L(solver="lsqr").fit(X,y).coef_` matches the oracle;
+  `transform` raises.
+- AC-10 (REQ-10): `L(solver="eigen").fit(X,y)` `coef_`/`scalings_`/
+  `explained_variance_ratio_` match the oracle.
+- AC-11 (REQ-11): `L(solver="eigen", shrinkage=0.5)` and `shrinkage="auto"`
+  match the oracle; `L(solver="svd", shrinkage=0.5)` raises.
+- AC-12 (REQ-12): `L(store_covariance=True).fit(X,y).covariance_` matches the
+  weighted within covariance.
+- AC-13 (REQ-13): `explained_variance_ratio_` matches `L().fit(X,y).
+  explained_variance_ratio_` within `1e-8` (iris `[0.991213, 0.008787]`).
+- AC-14 (REQ-14): binary `decision_function(X).shape == (n,)`; multiclass
+  `(n, n_classes)`; the binding reproduces the binary `(n,)` shape.
+- AC-15 (REQ-15): a singular value below `tol` is dropped from the rank; varying
+  `tol` changes `scalings_`/`transform` output dimensionality.
+- AC-16 (REQ-16): `lda.rs` operates on `ferray-core` arrays and
+  `ferray::linalg`, not `ndarray` + the hand-rolled Jacobi/Gaussian helpers.
+
+## REQ status
+
+Binary classification (R-DEFER-2): SHIPPED = impl + non-test production consumer
++ a sklearn-grounded test (R-CHAR-3) + green oracle verification; NOT-STARTED =
+concrete open blocker referenced by `#`-number. `LDA`/`FittedLDA` are boundary
+estimator types re-exported at the crate root (`pub use lda::{FittedLDA, LDA} in
+lib.rs`); under S5/R-DEFER-1 the public estimator type IS the consumer surface
+(grandfathered). However, unlike the sibling estimators, **LDA is NOT registered
+in `ferrolearn-python`** (no `RsLDA`; `grep LDA ferrolearn-python/src` is empty),
+so the only callers of `predict`/`predict_proba`/`transform`/`decision_function`
+are the crate-root re-export and tests (`api_proof_lda in api_proof.rs`,
+`conformance_lda in conformance_wave1.rs`).
+
+Per goal.md the pre-existing in-repo conformance suite is **explicitly excluded**
+("Ignore the pre-existing in-repo conformance suite — it is not the contract
+here"). `conformance_lda in conformance_wave1.rs` is that suite, pins against a
+static `fixtures/lda.json`, and explicitly only asserts an **accuracy floor**
+(`acc >= 0.90`) while commenting that "ferrolearn LDA's predict_proba divergence
+from sklearn is larger than" tolerance and discarding the proba comparison — so
+it is **not** R-CHAR-3 parity evidence and in fact documents the divergence. The
+`lda.rs` unit tests assert structural facts (shapes, accessors, accuracy floors,
+sign-of-projection) — none pins a `decision_function`/`transform`/`proba`
+**value** against a live `LinearDiscriminantAnalysis` oracle.
+
+| REQ | Status | Evidence |
+|---|---|---|
+| REQ-1 (svd fit + decision_function parity) | NOT-STARTED | open prereq blocker #588. `fn decision_function in lda.rs` returns `(n,n_classes)` of `neg_half * dist_sq` = `-½‖z-μ_c‖²` in the projected space — NOT sklearn's affine `X @ coef_.T + intercept_` (`discriminant_analysis.py:739-759`), which embeds `log(priors_)` and the whitened `scalings_`. Live oracle: balanced iris `decision_function` row 0 = `[31.34,-17.96,-64.41]`; ferrolearn computes a different function whose values disagree even when the argmax coincides. There is no SVD solver, no `coef_`/`intercept_`/`xbar_`, and no live-oracle decision pin. |
+| REQ-2 (predict argmax) | NOT-STARTED | open prereq blocker #589. `fn predict in lda.rs` (the `Predict` impl) is nearest-centroid in projected space (`best_dist`/`best_class` over `dist`), an equal-priors approximation (`lda.rs:147-150`). sklearn's `predict` is `argmax(X@coef_.T+intercept_)` with `log(priors_)`. Live oracle: on a 40-vs-4 split (priors `[0.909,0.091]`) the prior term moves the boundary; ferrolearn's prior-free centroid can disagree. No live-oracle label-parity test (the only label check is the excluded `conformance_lda` accuracy floor). |
+| REQ-3 (predict_proba) | NOT-STARTED | open prereq blocker #590. `fn predict_proba in lda.rs` softmaxes `-½‖z-μ_c‖²` (the equal-prior projected distance), not sklearn's `softmax(X@coef_.T+intercept_)` / binary `expit` (`discriminant_analysis.py:706-711`). The `conformance_lda` fixture test itself records that "predict_proba divergence from sklearn is larger than" tolerance (`conformance_wave1.rs`). No production consumer (LDA absent from the Python binding) and no live-oracle proba pin. |
+| REQ-4 (predict_log_proba) | NOT-STARTED | open prereq blocker #591. `fn predict_log_proba in lda.rs` returns `crate::log_proba(&self.predict_proba(x)?)` — the log of the diverging REQ-3 proba, so it inherits the divergence; it also omits sklearn's `smallest_normal` zero-floor (`discriminant_analysis.py:729-736`). No production consumer, no live-oracle pin. |
+| REQ-5 (transform projection parity) | NOT-STARTED | open prereq blocker #592. `fn transform in lda.rs` returns raw `x.dot(&self.scalings)` with NO `xbar_` centering and eigenvectors that are NOT within-std-whitened, whereas sklearn's svd `transform` is `(X - xbar_) @ scalings_` (`discriminant_analysis.py:684-689`). Live oracle (iris): sklearn row 0 = `[8.0618,-0.3004]`, ferrolearn = `[-1.50,-1.89]` — different scale and offset, not merely a sign flip. Consumer `api_proof_lda in api_proof.rs` is test-only; no live-oracle transform pin. |
+| REQ-6 (n_components bound) | SHIPPED | impl `fn fit in lda.rs` computes `let max_components = (n_classes - 1).min(n_features);`, defaults `None` to `max_components`, returns `InvalidParameter` for `Some(0)` and for `Some(k)` with `k > max_components` — mirroring sklearn `max_components = min(n_classes - 1, X.shape[1])` and the `ValueError("n_components cannot be larger than min(n_features, n_classes - 1).")` (`discriminant_analysis.py:614-625`). Consumer: `fn fit` reads `self.n_components` (production), reached via the crate-root `pub use` boundary and `api_proof_lda in api_proof.rs`. Verified: `test_lda_default_n_components`, `test_lda_error_zero_n_components`, `test_lda_error_n_components_too_large`, `test_lda_n_components_getter`, `test_lda_fit_returns_fitted` (`scalings().ncols()==1` for 2 classes) in `lda.rs` pin the `min(n_classes-1, n_features)` rule against the sklearn-documented bound (R-CHAR-3: the bound is a sklearn `file:line` structural constant, not a copied value). |
+| REQ-7 (priors None + provided) | NOT-STARTED | open prereq blocker #593. `LDA<F>` has only an `n_components` field; there is no `priors` constructor parameter and `FittedLDA` does not store `priors_`. sklearn estimates empirical `cnts/n` or accepts a provided array, renormalizing with a `UserWarning` if `|Σ-1|>1e-5` and rejecting negatives (`discriminant_analysis.py:601-612`). The missing `priors_` is the root cause of the REQ-1/2/3 prior divergence. |
+| REQ-8 (coef_/intercept_/xbar_) | NOT-STARTED | open prereq blocker #594. `FittedLDA<F>` stores only `scalings`/`means`/`explained_variance_ratio`/`classes`/`n_features` — there are no `coef_`/`intercept_`/`xbar_` accessors. sklearn derives them in `_solve_svd` (`coef = (means_-xbar_)@scalings_`; `intercept_ = -0.5·Σcoef² + log(priors_)`; `coef_ = coef@scalings_.T`; `intercept_ -= xbar_@coef_.T`, `discriminant_analysis.py:556-559`) and collapses the binary case to `(1, n_features)`/`(1,)` (`:651-657`). Absent. |
+| REQ-9 (lsqr solver) | NOT-STARTED | open prereq blocker #595. ferrolearn implements a single (eigen-style) solver; there is no `solver` constructor parameter and no `_solve_lstsq` analog (`coef_ = lstsq(covariance_, means_.T)[0].T`, `discriminant_analysis.py:365-419`), nor the `transform` `NotImplementedError` for `lsqr`. |
+| REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. ferrolearn's `Sw⁻¹Sb` Jacobi path is NOT sklearn's `eigen` solver: sklearn solves the generalized `eigh(Sb, Sw)` on the **prior-weighted biased** `_class_cov`/`_cov` (`discriminant_analysis.py:421-485`), sets `scalings_ = evecs`, and derives `coef_`/`intercept_` (with `log priors_`). ferrolearn uses an un-averaged scatter + `1e-6` ridge, raw eigenvectors as `scalings`, no `coef_`/`intercept_`. No `solver="eigen"` selector, and the numerical path diverges. |
+| REQ-11 (shrinkage) | NOT-STARTED | open prereq blocker #597. No `shrinkage` parameter; no Ledoit-Wolf `'auto'` path (`_cov`/`_class_cov`, `discriminant_analysis.py:339, 128-172`) and no `NotImplementedError("shrinkage not supported with 'svd' solver.")` guard (`:628-629`). |
+| REQ-12 (store_covariance / covariance_) | NOT-STARTED | open prereq blocker #598. No `store_covariance` parameter and no `covariance_` attribute (`Σ_k prior_k·C_k`, `discriminant_analysis.py:280-285, 509-510`). ferrolearn's `Sw` is the un-averaged within scatter + ridge, never the prior-weighted covariance, and is not exposed. |
+| REQ-13 (explained_variance_ratio_) | NOT-STARTED | open prereq blocker #599. `fn fit in lda.rs` DOES compute `explained_variance_ratio` as `clamp(λ_k,0)/Σclamp(λ,0)`, and the live oracle confirms it numerically equals sklearn's `S²/ΣS²` on iris (both `[0.991213, 0.008787]`) — but it derives from the diverging `scalings`/eigenvalue path, has NO live-oracle pin (the only tests assert `v >= 0` and `Σ <= 1`, `test_lda_explained_variance_ratio_positive`/`_le_1`), and is consumed only by test/accessor code. Under R-HONEST-3 it is an honest underclaim pending a `file:line`-grounded pin. |
+| REQ-14 (decision_function shape/sign) | NOT-STARTED | open prereq blocker #600. `fn decision_function in lda.rs` ALWAYS returns `Array2<F>` shape `(n_samples, n_classes)` (`out: Array2::<F>::zeros((n_samples, n_classes))`). sklearn collapses binary to `(n,)` = `log p(y=1|x)-log p(y=0|x)` (live oracle: shape `(7,)` on the binary set), multiclass `(n, n_classes)` (`discriminant_analysis.py:739-759`). A shape/sign ABI divergence (R-DEV-3), parallel to QDA #581. |
+| REQ-15 (tol) | NOT-STARTED | open prereq blocker #601. No `tol` parameter; `fn fit in lda.rs` uses a fixed `1e-6` ridge and the Jacobi `1e-12` convergence threshold, not sklearn's SVD rank thresholds `Σ(S > tol)` / `Σ(S > tol·S[0])` (`discriminant_analysis.py:354, 532, 554`). |
+| REQ-16 (ferray substrate) | NOT-STARTED | open prereq blocker #602. `lda.rs` imports `ndarray::{Array1, Array2}` and runs all linear algebra on hand-rolled `fn jacobi_eigen_f` / `fn gaussian_solve_f` / `fn sw_inv_sb` over `ndarray`, with no `ferray-core`/`ferray::linalg` usage. Consistent with the crate-wide substrate deferral (cf. `qda.md` REQ-12 #585, `bayesian_ridge.md` REQ-10 #471). |
+
+## Architecture
+
+### sklearn (the contract)
+
+`LinearDiscriminantAnalysis(ClassNamePrefixFeaturesOutMixin,
+LinearClassifierMixin, TransformerMixin, BaseEstimator)`
+(`discriminant_analysis.py:175-180`), keyword-defaulted
+`(solver="svd", shrinkage=None, priors=None, n_components=None,
+store_covariance=False, tol=1e-4, covariance_estimator=None)` (`:347-363`).
+The **classifier** identity is the affine map `decision_function = X@coef_.T +
+intercept_` (from `LinearClassifierMixin`); the **transformer** identity is the
+projection onto `scalings_`. The default `svd` solver never forms the covariance
+(SVD whitening of the centered/std-scaled data → `scalings_`, then `coef_`/
+`intercept_` from `means_`, `xbar_`, and `log priors_`). `lsqr`/`eigen` form the
+prior-weighted within covariance (`_class_cov`) and support `shrinkage`. The
+binary case collapses `coef_`/`intercept_` to the class-1-minus-class-0
+difference, so `decision_function` is `(n,)`.
+
+### ferrolearn (what exists)
+
+`LDA<F> { n_components }` (`lda.rs`) → `fn fit` builds `Sw` (un-averaged within
+scatter + `1e-6` ridge), `Sb = Σ n_c (μ_c-μ)(μ_c-μ)ᵀ`, `M = Sw⁻¹Sb` (`fn
+sw_inv_sb` via `fn gaussian_solve_f`), Jacobi eigendecomposition (`fn
+jacobi_eigen_f`), descending sort, `scalings` = top-`k` eigenvectors,
+`explained_variance_ratio = clamp(λ)/Σclamp(λ)`, and projected `means`.
+`FittedLDA<F> { scalings, means, explained_variance_ratio, classes, n_features }`.
+`transform` = raw `X@scalings`; `predict`/`decision_function`/`predict_proba`/
+`predict_log_proba` = nearest-centroid / softmax of `-½‖z-μ_c‖²` in projected
+space (equal-priors approximation). Re-exported at the crate root; **not** bound
+in `ferrolearn-python`.
+
+### Why ferrolearn diverges (and the one match)
+
+ferrolearn answers a *related but distinct* mathematical question. The classical
+`Sw⁻¹Sb` Fisher discriminant gives the same **discriminant directions** (so the
+eigenvalue ratio `λ_k/Σλ` equals sklearn's `S²/ΣS²` — REQ-13's numerical
+coincidence, verified ~exact on iris), and for **balanced** classes the
+nearest-centroid argmax coincides with sklearn's `argmax(X@coef_.T+intercept_)`.
+But: (a) `transform` is uncentered and unwhitened, so its **values** differ
+(REQ-5); (b) `decision_function`/`predict_proba` are a Euclidean-distance
+softmax, not the affine log-posterior, so their **values** differ even for
+uniform priors (REQ-1/3); (c) without `priors_`, the `log(prior_k)` term is
+absent, so **predictions flip** on imbalanced/provided priors (REQ-2/7); (d) the
+binary decision is `(n, n_classes)`, not sklearn's `(n,)` log-likelihood ratio
+(REQ-14); (e) no `coef_`/`intercept_`/`xbar_`/`covariance_` attributes
+(REQ-8/12); (f) only one solver, no shrinkage, no `tol`, no `priors` parameter
+(REQ-9/10/11/15); (g) `ndarray` + hand-rolled linalg, not ferray (REQ-16).
+
+## Verification
+
+Library-crate gauntlet (baseline `83e73bf4`):
+
+- `cargo test -p ferrolearn-linear lda` — the module unit tests (shapes,
+  accessors, accuracy floors, projection sign). These do NOT pin a
+  `decision_function`/`transform`/`proba`/`coef_` **value** against the live
+  oracle, so they do not establish REQ-1..5/8/13/14 parity (R-CHAR-3).
+- `cargo clippy -p ferrolearn-linear --all-targets -- -D warnings`,
+  `cargo fmt --all --check`.
+
+Live sklearn oracle (establishes the divergences; expected values come from
+sklearn, never copied from ferrolearn, per R-CHAR-3):
+
+```bash
+python3 -c "
+import numpy as np
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L
+from sklearn.datasets import load_iris
+Xi,yi=load_iris(return_X_y=True); mi=L().fit(Xi,yi)
+print('evr', mi.explained_variance_ratio_.round(6).tolist())      # [0.991213, 0.008787]
+print('transform[0]', mi.transform(Xi)[0].round(4).tolist())      # [8.0618, -0.3004]
+print('decision[0]', mi.decision_function(Xi)[0].round(2).tolist())# [31.34, -17.96, -64.41]
+# imbalanced -> empirical priors non-uniform -> log(prior) shifts the boundary
+rng=np.random.RandomState(0)
+X=np.vstack([rng.randn(40,2)+[0,0], rng.randn(4,2)+[2.,0]]); y=np.array([0]*40+[1]*4)
+m=L().fit(X,y); print('priors_', m.priors_.round(4).tolist())     # [0.9091, 0.0909]
+print('binary dec shape', m.decision_function(X).shape)           # (44,)
+print('provided priors', L(priors=[0.9,0.1]).fit(X,y).priors_.tolist())  # [0.9, 0.1]
+"
+```
+
+Observed: `explained_variance_ratio_` matches ferrolearn's eigenvalue ratio
+(REQ-13 numerical coincidence, but unpinned); `transform`/`decision_function`
+**values** and the binary `(n,)` shape diverge from ferrolearn; empirical/
+provided priors are honored by sklearn and absent in ferrolearn. A NOT-STARTED
+REQ closes only when its fix lands AND a divergence test (expected values from
+the live oracle / a sklearn `file:line` constant) goes green; the
+`conformance_lda`/`fixtures/lda.json` suite is excluded by goal.md (it asserts an
+accuracy floor and explicitly discards the proba comparison) and is not a
+substitute.
+
+## Blockers to open
+
+- **#588** — REQ-1 of lda: implement the `svd` solver (`scalings_`, `xbar_`,
+  `coef_`, `intercept_` with `log priors_`) and pin `decision_function =
+  X@coef_.T+intercept_` against the live `L().decision_function` oracle (iris,
+  within `1e-8`), replacing the projected-distance approximation.
+- **#589** — REQ-2 of lda: pin `predict` label-for-label against `L().predict`
+  on an **imbalanced** 2-class set (prior shifts the boundary), not an accuracy
+  floor.
+- **#590** — REQ-3 of lda: implement prior-aware `predict_proba` (binary `expit`,
+  multiclass softmax of the affine decision), pin against `L().predict_proba`,
+  and add a non-test production consumer (register LDA in `ferrolearn-python`).
+- **#591** — REQ-4 of lda: pin `predict_log_proba` against the live oracle and
+  replicate sklearn's `smallest_normal` zero-floor.
+- **#592** — REQ-5 of lda: implement `transform = (X - xbar_) @ scalings_` with
+  the SVD-whitened scalings and pin it against `L().transform` (iris, within
+  `1e-6` up to per-column sign).
+- **#593** — REQ-7 of lda: add a `priors` constructor parameter (None →
+  empirical `cnts/n`, array → used, renormalized-with-warning if `|Σ-1|>1e-5`,
+  reject negatives) and store/expose `priors_`
+  (`discriminant_analysis.py:601-612`).
+- **#594** — REQ-8 of lda: expose `coef_`/`intercept_`/`xbar_` on `FittedLDA`
+  (with the binary `(1, n_features)`/`(1,)` collapse,
+  `discriminant_analysis.py:556-559, 651-657`).
+- **#595** — REQ-9 of lda: add the `solver="lsqr"` least-squares path and the
+  `transform` `NotImplementedError` for it.
+- **#596** — REQ-10 of lda: add the `solver="eigen"` generalized-eigenvalue path
+  (`eigh(Sb, Sw)` on prior-weighted `_class_cov`, `coef_`/`intercept_` from
+  means+priors), distinct from the existing `Sw⁻¹Sb` Jacobi approximation.
+- **#597** — REQ-11 of lda: add `shrinkage` (None/'auto' Ledoit-Wolf/float) on
+  `lsqr`/`eigen` plus the `NotImplementedError` on `svd`.
+- **#598** — REQ-12 of lda: add `store_covariance` + a `covariance_` accessor
+  (`Σ_k prior_k·C_k`).
+- **#599** — REQ-13 of lda: pin `explained_variance_ratio_` against
+  `L().explained_variance_ratio_` (iris `[0.991213, 0.008787]`) via the SVD
+  solver's `S²/ΣS²`.
+- **#600** — REQ-14 of lda: collapse the binary `decision_function` to shape
+  `(n,)` = `log p(y=1|x)-log p(y=0|x)` (multiclass unchanged), matching
+  `discriminant_analysis.py:739-759` (parallel to QDA #581).
+- **#601** — REQ-15 of lda: add the `tol` parameter and the SVD rank thresholds
+  `Σ(S > tol)` / `Σ(S > tol·S[0])`.
+- **#602** — REQ-16 of lda: migrate `lda.rs` off `ndarray` + hand-rolled Jacobi/
+  Gaussian elimination onto the ferray substrate (`ferray-core` arrays,
+  `ferray::linalg` SVD/eig/solve).
+```
