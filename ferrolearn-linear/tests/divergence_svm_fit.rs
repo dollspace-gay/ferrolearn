@@ -17,7 +17,7 @@
 //! the binary 1-D `SvmScores::Binary` enum-variant contract (#637).
 
 use ferrolearn_core::{Fit, Predict};
-use ferrolearn_linear::svm::{LinearKernel, RbfKernel, SVC, SVR, SvmDecisionShape};
+use ferrolearn_linear::svm::{Gamma, LinearKernel, RbfKernel, SVC, SVR, SvmDecisionShape};
 use ndarray::{Array1, Array2, array};
 
 /// Binary 6x2 training set shared by PIN 1 / PIN 2 / PIN 3.
@@ -785,5 +785,177 @@ fn divergence_pin11_ovo_vote_tie_break_lower_index() {
         "ovo vote-tie predict: ferrolearn={} (last-max -> higher index), \
          sklearn=1 (libsvm lower-index tie-break, _base.py:814)",
         tie_pred[0]
+    );
+}
+
+/// PIN 12 — REQ-1: `gamma='auto'` via `Gamma::Auto` (#634).
+///
+/// Pins the NEW `Gamma::Auto` resolution path: `RbfKernel` with
+/// `gamma=Gamma::Auto` must resolve `_gamma = 1 / n_features`
+/// (`sklearn/svm/_base.py:240-241`: `self._gamma = 1.0 / X.shape[1]`) at fit
+/// time (`fn resolve_gamma`/`fn resolved_for_fit in svm.rs`), so on the binary
+/// 6x2 set (n_features=2) `_gamma=0.5`. This must NOT silently fall back to the
+/// `Gamma::Scale` default (`_gamma=0.118421` here): the second half asserts the
+/// `Auto` and `Scale` fits produce DIFFERENT decision values, so the pin would
+/// FAIL if `Auto` resolved to scale.
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]]); y=np.array([0,0,0,1,1,1]); \
+///   ma=SVC(kernel='rbf',C=1.0,gamma='auto').fit(X,y); \
+///   print(ma._gamma, np.round(ma.decision_function(X),4).tolist()); \
+///   ms=SVC(kernel='rbf',C=1.0).fit(X,y); \
+///   print(ms._gamma, float(np.max(np.abs(ma.decision_function(X)-ms.decision_function(X)))))"
+/// # auto  _gamma 0.5    df [-0.9996,-0.9999,-0.9999,0.9999,0.9999,0.9996]
+/// # scale _gamma 0.118421   max|auto-scale| df gap 0.014168  (> 0.01)
+/// ```
+///
+/// Tracking: #634
+#[test]
+fn divergence_pin12_rbf_gamma_auto() {
+    let (x, y) = binary_6x2();
+
+    // gamma='auto' (Gamma::Auto): _gamma = 1/n_features = 0.5.
+    let auto_model = SVC::new(RbfKernel::<f64> { gamma: Gamma::Auto })
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let auto_fit = auto_model.fit(&x, &y).unwrap();
+    let auto_df = auto_fit.decision_function(&x).unwrap();
+    let auto_bin = auto_df
+        .as_binary()
+        .expect("binary decision_function is 1-D");
+
+    // Live oracle SVC(kernel='rbf',C=1.0,gamma='auto').decision_function(X).
+    let oracle_auto: [f64; 6] = [-0.9996, -0.9999, -0.9999, 0.9999, 0.9999, 0.9996];
+    for (i, &exp) in oracle_auto.iter().enumerate() {
+        let got = auto_bin[i];
+        assert!(
+            (got - exp).abs() < 1e-2,
+            "gamma='auto' decision_function[{i}]: ferrolearn={got}, \
+             sklearn(gamma=auto=0.5)={exp}, gap={}",
+            (got - exp).abs()
+        );
+    }
+
+    // gamma='scale' (default): _gamma = 1/(n_features*X.var()) = 0.118421.
+    // Auto and Scale MUST differ — guards against `Auto` silently falling back
+    // to `Scale`. Live oracle max|auto-scale| df gap = 0.014168 (> 0.01).
+    let scale_model = SVC::new(RbfKernel::<f64>::with_gamma_scale())
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000);
+    let scale_fit = scale_model.fit(&x, &y).unwrap();
+    let scale_df = scale_fit.decision_function(&x).unwrap();
+    let scale_bin = scale_df
+        .as_binary()
+        .expect("binary decision_function is 1-D");
+
+    let max_gap = (0..6)
+        .map(|i| (auto_bin[i] - scale_bin[i]).abs())
+        .fold(0.0_f64, f64::max);
+    assert!(
+        max_gap > 0.01,
+        "gamma='auto' and gamma='scale' fits must differ (>0.01) at some sample \
+         (else 'auto' silently fell back to 'scale'); ferrolearn max|auto-scale|={max_gap}, \
+         sklearn oracle gap=0.014168"
+    );
+}
+
+/// PIN 13 — REQ-8: `break_ties` ovr-argmax vs libsvm vote (#641).
+///
+/// Pins the NEW `break_ties` flag (`with_break_ties`, `fn predict in svm.rs`).
+/// On the #638 4-class tie geometry (`four_class_tie_12x2`, each class has >=2
+/// SVs so ferrolearn's SMO matches libsvm — see PIN 11) at the query
+/// `q=(-0.21,-8.976)` the ovo VOTE is `(0,2,2,2)` — a 3-way tie among classes
+/// 1/2/3 — and the two predict paths DIVERGE:
+///
+/// - `break_ties=false` (libsvm vote, `_base.py:813`): lower-index tie-break
+///   -> class **1**.
+/// - `break_ties=true` + ovr + n_classes>2 (`_base.py:806-811`):
+///   `argmax(decision_function(q))` -> class **3** (the ovr confidence winner).
+///
+/// Also pins the rejected combo: `break_ties=true` + `decision_function_shape
+/// ='ovo'` raises (`_base.py:801-804`).
+///
+/// Live oracle, re-derived this session (R-CHAR-3):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.svm import SVC; \
+///   X=np.array([[0,5],[0.4,5],[0,5.4],[-5,-3],[-5.4,-3],[-5,-3.4], \
+///               [5,-3],[5.4,-3],[5,-3.4],[0,-1],[0.4,-1],[0,-1.4]],dtype=float); \
+///   y=np.array([0,0,0,1,1,1,2,2,2,3,3,3]); q=np.array([[-0.21,-8.976]]); \
+///   print(SVC(kernel='linear',C=1.0).n_support_ if False else \
+///         SVC(kernel='linear',C=1.0).fit(X,y).n_support_.tolist()); \
+///   print('vote', int(SVC(kernel='linear',C=1.0).fit(X,y).predict(q)[0])); \
+///   print('ovr-argmax', int(SVC(kernel='linear',C=1.0,break_ties=True, \
+///         decision_function_shape='ovr').fit(X,y).predict(q)[0]))"
+/// # n_support_ [2, 2, 2, 3]
+/// # vote 1            (break_ties=False, libsvm lower-index tie-break)
+/// # ovr-argmax 3      (break_ties=True, argmax of ovr decision_function)
+/// # ovr-dec at q = [-0.2903, 2.2018, 2.2033, 2.2618] -> argmax index 3,
+/// #   top-runnerup margin 0.0585 (> 1e-2, so robustly reproduced)
+/// # SVC(...,break_ties=True,decision_function_shape='ovo').predict(q) raises
+/// #   ValueError: break_ties must be False when decision_function_shape is 'ovo'
+/// ```
+///
+/// Tracking: #641
+#[test]
+fn divergence_pin13_break_ties_ovr_argmax() {
+    let (x, y) = four_class_tie_12x2();
+    let q = Array2::from_shape_vec((1, 2), vec![-0.21, -8.976]).unwrap();
+
+    // break_ties=false (default): libsvm vote -> lower-index tie-break -> class 1.
+    let vote_model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_break_ties(false);
+    let vote_fit = vote_model.fit(&x, &y).unwrap();
+    let vote_pred = vote_fit.predict(&q).unwrap();
+    assert_eq!(
+        vote_pred[0], 1usize,
+        "break_ties=false vote predict: ferrolearn={}, sklearn=1 \
+         (libsvm lower-index tie-break, _base.py:813)",
+        vote_pred[0]
+    );
+
+    // break_ties=true + ovr (default shape) + n_classes>2: argmax(ovr decision)
+    // -> class 3 (`_base.py:806-811`).
+    let bt_model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_break_ties(true)
+        .with_decision_function_shape(SvmDecisionShape::Ovr);
+    let bt_fit = bt_model.fit(&x, &y).unwrap();
+    let bt_pred = bt_fit.predict(&q).unwrap();
+    assert_eq!(
+        bt_pred[0], 3usize,
+        "break_ties=true ovr-argmax predict: ferrolearn={}, sklearn=3 \
+         (argmax of ovr decision_function, _base.py:806-811)",
+        bt_pred[0]
+    );
+
+    // The two paths MUST diverge at q (else break_ties is a no-op).
+    assert_ne!(
+        vote_pred[0], bt_pred[0],
+        "break_ties must change the label at the tie query (vote=1 vs ovr-argmax=3)"
+    );
+
+    // break_ties=true + decision_function_shape=Ovo: sklearn raises ValueError
+    // (`_base.py:801-804`); ferrolearn must return Err at predict time.
+    let ovo_model = SVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_c(1.0)
+        .with_tol(1e-6)
+        .with_max_iter(1_000_000)
+        .with_break_ties(true)
+        .with_decision_function_shape(SvmDecisionShape::Ovo);
+    let ovo_fit = ovo_model.fit(&x, &y).unwrap();
+    let ovo_res = ovo_fit.predict(&q);
+    assert!(
+        ovo_res.is_err(),
+        "break_ties=true + Ovo must be Err (sklearn raises ValueError, _base.py:801-804); \
+         ferrolearn returned Ok"
     );
 }

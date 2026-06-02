@@ -51,14 +51,14 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (kernels + gamma scale/auto/float) | NOT-STARTED | open #641. The four kernel formulas + `gamma='scale'` (default, `fn resolved_for_fit in svm.rs` = `1/(n_features·X.var())`) + explicit float are done and pinned (`divergence_pin2_rbf_default_scale_gamma`; #634 closed); the `'auto' = 1/n_features` variant is not yet expressible (no estimator-level gamma enum) — pending the param-surface work #641. |
+//! | REQ-1 (kernels + gamma scale/auto/float) | SHIPPED | The four kernel formulas + the three-way `pub enum Gamma<F> { Scale, Auto, Value }` (default `Scale`) resolved at fit time by `fn resolve_gamma in svm.rs` + `fn resolved_for_fit in svm.rs`: `Scale`=`1/(n_features·X.var())` (`_base.py:238-239`), `Auto`=`1/n_features` (`_base.py:240-241`), `Value(v)`=verbatim (`_base.py:242-243`). Builders `RbfKernel::with_gamma`/`with_gamma_scale`/`with_gamma_auto`. Non-test consumer: the kernel `gamma` field is resolved in the production `fn fit in svm.rs` (`self.kernel.resolved_for_fit(x)`). Pinned: `divergence_pin2_rbf_default_scale_gamma` (scale, green) + in-module `test_svc_gamma_auto_decision_function in svm.rs` (`_gamma=0.5`, df `[-0.9996,-0.9999,-0.9999,0.9999,0.9999,0.9996]` vs live `SVC(kernel='rbf',gamma='auto')`, R-CHAR-3, 1e-2) + `test_svc_gamma_scale_still_default` (`_gamma=0.118421`). |
 //! | REQ-2 (C-SVC SMO fit) | SHIPPED | `fn smo_binary in svm.rs` (Fan-Chen-Lin WSS) converges to libsvm's `α`; pinned by `divergence_pin5_binary_fitted_attributes in tests/divergence_svm_fit.rs` (`dual_coef_ [[-0.0408,-0.0408,0.0816]]`, `support_ [1,2,3]`, `intercept_ [-1.8565]` vs live `SVC(kernel='linear',C=1.0)`). |
 //! | REQ-3 (fitted attrs + binary sign flip) | SHIPPED | `FittedSVC::{support,support_vectors,n_support,dual_coef,intercept,coef} in svm.rs` emit the libsvm layout with the binary sign flip (`_base.py:258-262`); `coef_` is linear-only (`_base.py:642-666`). Pinned by `divergence_pin5_*` (binary) + `divergence_pin6_multiclass_dual_coef_packing` (multiclass `(n_class-1,n_SV)` packing). |
 //! | REQ-4 (decision_function shape/sign/ovr) | SHIPPED | `FittedSVC::decision_function in svm.rs` returns the `SvmScores<F>` enum: binary -> `SvmScores::Binary` 1-D `(n,)` = `-raw_ovo.ravel()` (positive -> `classes_[1]`, `_base.py:538-539`); multiclass -> `SvmScores::Multiclass` `(n, n_classes)` via `fn ovr_decision_function in svm.rs` (default `SvmDecisionShape::Ovr`, transcribed from `multiclass.py:520-562`) applied to `dec<0`/`-dec` (`_base.py:780`), or raw `(n, n·(n-1)/2)` for `SvmDecisionShape::Ovo`. `SVC::decision_function_shape` field + `with_decision_function_shape`. Sign normalized: `fn raw_ovo` negates `decision_value_binary` to restore libsvm's lower-index-class-`+1` ovo convention. Pinned by `divergence_pin8_multiclass_ovr_decision_function` (ovr `(9,3)` row0 `[2.2366,0.8167,-0.1833]`, row3 `[1.0606,2.2262,-0.2333]`), `divergence_pin9_multiclass_ovo_decision_function` (ovo `(9,3)` row0 `[1.2222,1.2222,0.0]`), `divergence_pin10_binary_shape_contract` (binary 1-D `(6,)`) in `tests/divergence_svm_fit.rs` (R-CHAR-3, 1e-2). Consumer: `FittedNuSVC::decision_function in nu_svm.rs` delegates (non-test, propagates `SvmScores`). |
 //! | REQ-5 (predict + tie-break) | SHIPPED | `fn predict in svm.rs` (FittedSVC) does libsvm ovo voting and breaks vote ties toward the LOWER class index via a strictly-greater first-max scan (keeps the first/lowest-index maximum since `classes` is `np.unique(y)`-sorted), matching libsvm/sklearn `super().predict` (`_base.py:813-814`) instead of `max_by_key`'s last-maximum. Pinned by `divergence_pin3_predict_labels` (separable-set labels) + `divergence_pin11_ovo_vote_tie_break_lower_index` (4-class vote tie `(0,2,2,2)` at `q=(-0.21,-8.976)` -> class 1) in `tests/divergence_svm_fit.rs` vs live `SVC(kernel='linear',C=1.0)`. |
 //! | REQ-6 (epsilon-SVR) | SHIPPED | `fn smo_svr in svm.rs` + `FittedSVR::{support,support_vectors,n_support,dual_coef,intercept}`; pinned by `divergence_pin4_svr_predict_values` (predict) + `divergence_pin7_svr_fitted_attributes` (`support_ [0,5]`, `dual_coef_ [[-0.392,0.392]]`, `intercept_ [0.14]` vs live `SVR(kernel='linear',C=100,epsilon=0.1)`). |
 //! | REQ-7 (multiclass one-vs-one) | SHIPPED | `fn fit in svm.rs` (SVC) trains one `smo_binary` per class pair, `classes` = `np.unique(y)`; pinned by `divergence_pin6_multiclass_dual_coef_packing` (3-class `dual_coef_ (2,6)` libsvm packing, `support_ [1,2,3,5,6,7]`, `n_support_ [2,2,2]`, `intercept_ [1.2222,1.2222,0.0]`). |
-//! | REQ-8 (constructor param surface + defaults) | NOT-STARTED | open #641. The kernel is the type parameter `K`; missing estimator-level `kernel`(string)/`degree`/`gamma`/`coef0`/`shrinking`/`class_weight`/`decision_function_shape`/`break_ties`/`random_state`; defaults diverge (`max_iter=10000` vs sklearn `-1`, `cache_size=1024` vs `200`). |
+//! | REQ-8 (constructor param surface + defaults) | NOT-STARTED | open #641 (narrowed). SHIPPED so far: `shrinking` (`SVC`/`SVR`, default `true`, `with_shrinking`; accepted for API parity, shrinking-invariant optimum so DOES NOT alter results — R-DEV-7); `break_ties` (`SVC`, default `false`, `with_break_ties`; `fn predict in svm.rs` ovr-argmax branch for `break_ties=true`+ovr+`n_classes>2`, `InvalidParameter` for the ovo combo, `_base.py:801-814`); default alignment `cache_size=200`, `max_iter=0` (= sklearn `-1`, no iteration limit; the `smo_binary`/`smo_svr` loops treat `0` as unbounded); plus REQ-1's `gamma` enum (`scale`/`auto`/float). Pinned: `test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs`. STILL NOT-STARTED: estimator-level `kernel`(string-select)/`degree`/`coef0`/`class_weight`/`random_state` — `degree`/`coef0`/string-kernel are a documented R-DEV-7 design difference (the kernel and its degree/coef0 are the type parameter `K`, set by construction); `class_weight` is genuinely absent (open #641). |
 //! | REQ-9 (probability / predict_proba) | NOT-STARTED | open #642. No `probability` Platt-scaling CV (`_probA`/`_probB`), no `predict_proba`/`predict_log_proba` (`_base.py:820-925`). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
 
@@ -73,6 +73,38 @@ use num_traits::Float;
 // Kernel trait and built-in kernels
 // ---------------------------------------------------------------------------
 
+/// The `gamma` coefficient for the RBF / polynomial / sigmoid kernels,
+/// mirroring scikit-learn's three-way `gamma` parameter
+/// (`sklearn/svm/_base.py:235-243`,
+/// `StrOptions({"scale", "auto"}) | Interval(Real, 0.0, None)`).
+///
+/// Resolved at fit time against the training matrix `X`
+/// ([`Kernel::resolved_for_fit`]):
+///
+/// - [`Gamma::Scale`] (default): `1 / (n_features · X.var())` where `X.var()`
+///   is the population variance (ddof=0) of the whole flattened `X`
+///   (`_base.py:238-239`). When `X.var() == 0` sklearn falls back to `1.0`.
+/// - [`Gamma::Auto`]: `1 / n_features` (`_base.py:240-241`).
+/// - [`Gamma::Value`]: the float verbatim (`_base.py:242-243`).
+///
+/// The default is [`Gamma::Scale`], matching sklearn's `gamma='scale'`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Gamma<F> {
+    /// `gamma='scale'` (sklearn default): `1 / (n_features · X.var())`.
+    Scale,
+    /// `gamma='auto'`: `1 / n_features`.
+    Auto,
+    /// An explicit float gamma, used verbatim.
+    Value(F),
+}
+
+impl<F> Default for Gamma<F> {
+    /// sklearn's default is `gamma='scale'`.
+    fn default() -> Self {
+        Gamma::Scale
+    }
+}
+
 /// A kernel function for SVM.
 ///
 /// Computes the inner product of two vectors in a (possibly implicit)
@@ -84,14 +116,13 @@ pub trait Kernel<F: Float>: Clone + Send + Sync {
     /// Resolve any data-dependent kernel parameters against the training data
     /// at fit time, returning a copy of the kernel with those parameters fixed.
     ///
-    /// For kernels with a `gamma: Option<F>` parameter, a `None` gamma mirrors
-    /// scikit-learn's default `gamma='scale'`, resolving to
-    /// `1 / (n_features * X.var())` where `X.var()` is the population variance
-    /// (ddof=0) over the whole flattened training matrix
-    /// (`sklearn/svm/_base.py:236-239`). An explicit `Some(gamma)` is left
-    /// verbatim. `'auto'` (`1 / n_features`) is not expressible by the current
-    /// `Option<F>` surface and is tracked under #641; only `None` -> `'scale'`
-    /// is resolved here.
+    /// For kernels with a [`Gamma<F>`] parameter, the three-way `gamma`
+    /// resolution mirrors scikit-learn (`sklearn/svm/_base.py:235-243`):
+    /// [`Gamma::Scale`] (default) -> `1 / (n_features * X.var())` where
+    /// `X.var()` is the population variance (ddof=0) over the whole flattened
+    /// training matrix; [`Gamma::Auto`] -> `1 / n_features`; [`Gamma::Value`]
+    /// is left verbatim. After resolution the stored `gamma` is always a
+    /// concrete [`Gamma::Value`].
     ///
     /// The default implementation is a no-op (returns `self.clone()`), which is
     /// correct for parameter-free kernels such as [`LinearKernel`].
@@ -131,23 +162,46 @@ fn population_variance<F: Float>(x: &Array2<F>) -> Option<F> {
     Some(sq / count)
 }
 
-/// Resolve a `None` gamma to scikit-learn's `gamma='scale'`
-/// = `1 / (n_features * X.var())` (`sklearn/svm/_base.py:236-239`). An explicit
-/// `Some(gamma)` is returned unchanged. When `X.var() == 0` sklearn would divide
-/// by zero; sklearn itself guards this by falling back to `1.0`
-/// (`_base.py:239`), so we do the same (avoiding a non-finite gamma).
-fn resolve_scale_gamma<F: Float>(gamma: Option<F>, x: &Array2<F>) -> Option<F> {
-    if gamma.is_some() {
-        return gamma;
+/// Extract the concrete float from a [`Gamma<F>`] for a direct `compute` call
+/// without training data. After [`Kernel::resolved_for_fit`] the gamma is
+/// always a [`Gamma::Value`], so this is the live path; an unresolved
+/// `Scale`/`Auto` (e.g. a kernel used standalone outside a fit) has no `X` to
+/// resolve against and falls back to `1.0`, matching the prior default-gamma
+/// behavior of a directly-evaluated kernel.
+fn gamma_value_or_one<F: Float>(gamma: Gamma<F>) -> F {
+    match gamma {
+        Gamma::Value(v) => v,
+        Gamma::Scale | Gamma::Auto => F::one(),
     }
-    let n_features = match F::from(x.ncols()) {
-        Some(nf) if nf > F::zero() => nf,
-        _ => return Some(F::one()),
-    };
-    match population_variance(x) {
-        Some(var) if var > F::zero() => Some(F::one() / (n_features * var)),
-        // var == 0 (constant X) or empty: sklearn falls back to gamma = 1.0.
-        _ => Some(F::one()),
+}
+
+/// Resolve a [`Gamma<F>`] spec against the training matrix `X`, returning the
+/// concrete float gamma, mirroring scikit-learn (`sklearn/svm/_base.py:235-243`):
+///
+/// - [`Gamma::Scale`] -> `1 / (n_features * X.var())` (`_base.py:238-239`).
+///   When `X.var() == 0` (constant `X`) or `X` is empty, sklearn falls back to
+///   `1.0` (`_base.py:239`: `if X_var != 0 else 1.0`), so we do the same
+///   (avoiding a non-finite gamma).
+/// - [`Gamma::Auto`] -> `1 / n_features` (`_base.py:240-241`).
+/// - [`Gamma::Value`] -> the float verbatim (`_base.py:242-243`).
+fn resolve_gamma<F: Float>(gamma: Gamma<F>, x: &Array2<F>) -> F {
+    match gamma {
+        Gamma::Value(v) => v,
+        Gamma::Auto => match F::from(x.ncols()) {
+            Some(nf) if nf > F::zero() => F::one() / nf,
+            _ => F::one(),
+        },
+        Gamma::Scale => {
+            let n_features = match F::from(x.ncols()) {
+                Some(nf) if nf > F::zero() => nf,
+                _ => return F::one(),
+            };
+            match population_variance(x) {
+                Some(var) if var > F::zero() => F::one() / (n_features * var),
+                // var == 0 (constant X) or empty: sklearn falls back to 1.0.
+                _ => F::one(),
+            }
+        }
     }
 }
 
@@ -172,23 +226,45 @@ impl<F: Float> Kernel<F> for LinearKernel {
 /// `K(x, y) = exp(-gamma * ||x - y||^2)`
 #[derive(Debug, Clone, Copy)]
 pub struct RbfKernel<F> {
-    /// The gamma parameter. `None` mirrors scikit-learn's default
-    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
-    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
-    pub gamma: Option<F>,
+    /// The gamma parameter, a three-way [`Gamma<F>`] spec resolved at fit time
+    /// (`sklearn/svm/_base.py:235-243`). Default [`Gamma::Scale`]
+    /// (= `1 / (n_features * X.var())`); [`Gamma::Auto`] = `1 / n_features`;
+    /// [`Gamma::Value`] is used verbatim.
+    pub gamma: Gamma<F>,
 }
 
 impl<F: Float> RbfKernel<F> {
-    /// Create a new RBF kernel with auto gamma.
+    /// Create a new RBF kernel with the default `gamma='scale'`.
     #[must_use]
     pub fn new() -> Self {
-        Self { gamma: None }
+        Self {
+            gamma: Gamma::Scale,
+        }
     }
 
-    /// Create a new RBF kernel with a specified gamma.
+    /// Create a new RBF kernel with an explicit float gamma
+    /// (`gamma=<float>`, [`Gamma::Value`]).
     #[must_use]
     pub fn with_gamma(gamma: F) -> Self {
-        Self { gamma: Some(gamma) }
+        Self {
+            gamma: Gamma::Value(gamma),
+        }
+    }
+
+    /// Create a new RBF kernel with `gamma='scale'` ([`Gamma::Scale`],
+    /// sklearn's default = `1 / (n_features * X.var())`).
+    #[must_use]
+    pub fn with_gamma_scale() -> Self {
+        Self {
+            gamma: Gamma::Scale,
+        }
+    }
+
+    /// Create a new RBF kernel with `gamma='auto'` ([`Gamma::Auto`]
+    /// = `1 / n_features`).
+    #[must_use]
+    pub fn with_gamma_auto() -> Self {
+        Self { gamma: Gamma::Auto }
     }
 }
 
@@ -200,7 +276,7 @@ impl<F: Float> Default for RbfKernel<F> {
 
 impl<F: Float + Send + Sync> Kernel<F> for RbfKernel<F> {
     fn compute(&self, x: &[F], y: &[F]) -> F {
-        let gamma = self.gamma.unwrap_or_else(F::one);
+        let gamma = gamma_value_or_one(self.gamma);
         let sq_dist = x.iter().zip(y.iter()).fold(F::zero(), |acc, (&a, &b)| {
             let d = a - b;
             acc + d * d
@@ -210,7 +286,7 @@ impl<F: Float + Send + Sync> Kernel<F> for RbfKernel<F> {
 
     fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
         Self {
-            gamma: resolve_scale_gamma(self.gamma, x),
+            gamma: Gamma::Value(resolve_gamma(self.gamma, x)),
         }
     }
 }
@@ -218,10 +294,9 @@ impl<F: Float + Send + Sync> Kernel<F> for RbfKernel<F> {
 /// Polynomial kernel: `K(x, y) = (gamma * x . y + coef0)^degree`.
 #[derive(Debug, Clone, Copy)]
 pub struct PolynomialKernel<F> {
-    /// The gamma parameter. `None` mirrors scikit-learn's default
-    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
-    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
-    pub gamma: Option<F>,
+    /// The gamma parameter, a three-way [`Gamma<F>`] spec resolved at fit time
+    /// (`sklearn/svm/_base.py:235-243`). Default [`Gamma::Scale`].
+    pub gamma: Gamma<F>,
     /// Polynomial degree.
     pub degree: usize,
     /// Independent term.
@@ -229,11 +304,12 @@ pub struct PolynomialKernel<F> {
 }
 
 impl<F: Float> PolynomialKernel<F> {
-    /// Create a new polynomial kernel with defaults.
+    /// Create a new polynomial kernel with defaults (`gamma='scale'`,
+    /// `degree=3`, `coef0=0`).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gamma: None,
+            gamma: Gamma::Scale,
             degree: 3,
             coef0: F::zero(),
         }
@@ -248,7 +324,7 @@ impl<F: Float> Default for PolynomialKernel<F> {
 
 impl<F: Float + Send + Sync> Kernel<F> for PolynomialKernel<F> {
     fn compute(&self, x: &[F], y: &[F]) -> F {
-        let gamma = self.gamma.unwrap_or_else(F::one);
+        let gamma = gamma_value_or_one(self.gamma);
         let dot: F = x
             .iter()
             .zip(y.iter())
@@ -263,7 +339,7 @@ impl<F: Float + Send + Sync> Kernel<F> for PolynomialKernel<F> {
 
     fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
         Self {
-            gamma: resolve_scale_gamma(self.gamma, x),
+            gamma: Gamma::Value(resolve_gamma(self.gamma, x)),
             degree: self.degree,
             coef0: self.coef0,
         }
@@ -273,20 +349,19 @@ impl<F: Float + Send + Sync> Kernel<F> for PolynomialKernel<F> {
 /// Sigmoid kernel: `K(x, y) = tanh(gamma * x . y + coef0)`.
 #[derive(Debug, Clone, Copy)]
 pub struct SigmoidKernel<F> {
-    /// The gamma parameter. `None` mirrors scikit-learn's default
-    /// `gamma='scale'`, resolved at fit time to `1 / (n_features * X.var())`
-    /// (`_base.py:236-239`). `'auto'` (`1 / n_features`) is tracked under #641.
-    pub gamma: Option<F>,
+    /// The gamma parameter, a three-way [`Gamma<F>`] spec resolved at fit time
+    /// (`sklearn/svm/_base.py:235-243`). Default [`Gamma::Scale`].
+    pub gamma: Gamma<F>,
     /// Independent term.
     pub coef0: F,
 }
 
 impl<F: Float> SigmoidKernel<F> {
-    /// Create a new sigmoid kernel with defaults.
+    /// Create a new sigmoid kernel with defaults (`gamma='scale'`, `coef0=0`).
     #[must_use]
     pub fn new() -> Self {
         Self {
-            gamma: None,
+            gamma: Gamma::Scale,
             coef0: F::zero(),
         }
     }
@@ -300,7 +375,7 @@ impl<F: Float> Default for SigmoidKernel<F> {
 
 impl<F: Float + Send + Sync> Kernel<F> for SigmoidKernel<F> {
     fn compute(&self, x: &[F], y: &[F]) -> F {
-        let gamma = self.gamma.unwrap_or_else(F::one);
+        let gamma = gamma_value_or_one(self.gamma);
         let dot: F = x
             .iter()
             .zip(y.iter())
@@ -310,7 +385,7 @@ impl<F: Float + Send + Sync> Kernel<F> for SigmoidKernel<F> {
 
     fn resolved_for_fit(&self, x: &Array2<F>) -> Self {
         Self {
-            gamma: resolve_scale_gamma(self.gamma, x),
+            gamma: Gamma::Value(resolve_gamma(self.gamma, x)),
             coef0: self.coef0,
         }
     }
@@ -396,7 +471,15 @@ fn smo_binary<F: Float, K: Kernel<F>>(
     let two = F::one() + F::one();
     let eps = F::from(1e-12).unwrap_or_else(F::epsilon);
 
-    for _iter in 0..max_iter {
+    // `max_iter == 0` is the sklearn `max_iter=-1` ("no iteration limit",
+    // libsvm runs to convergence) sentinel — the SMO loop then runs until the
+    // KKT gap closes. A non-zero `max_iter` caps the iteration count.
+    let mut iter = 0usize;
+    loop {
+        if max_iter != 0 && iter >= max_iter {
+            break;
+        }
+        iter += 1;
         // Working set selection (Fan-Chen-Lin 2005):
         // I_up  = {i : (y_i=+1 and alpha_i < C) or (y_i=-1 and alpha_i > 0)}
         // I_low = {j : (y_j=+1 and alpha_j > 0) or (y_j=-1 and alpha_j < C)}
@@ -650,31 +733,78 @@ pub struct SVC<F, K> {
     pub c: F,
     /// Convergence tolerance.
     pub tol: F,
-    /// Maximum number of SMO iterations.
+    /// Maximum number of SMO iterations. `0` is the sklearn `max_iter=-1`
+    /// sentinel meaning **no iteration limit** (the SMO runs to convergence);
+    /// a non-zero value caps the iteration count
+    /// (`sklearn/svm/_classes.py`, `max_iter` default `-1`).
     pub max_iter: usize,
-    /// Size of the kernel evaluation LRU cache.
+    /// Size of the kernel evaluation LRU cache (perf-only; default `200` to
+    /// match sklearn's `cache_size=200`).
     pub cache_size: usize,
+    /// Whether to use libsvm's shrinking heuristic
+    /// (`sklearn/svm/_base.py:339`, `_classes.py` `shrinking=True`).
+    ///
+    /// ferrolearn's SMO has no shrinking heuristic: shrinking is a libsvm
+    /// performance optimization that does NOT change the converged optimum
+    /// (R-DEV-7). This flag is accepted for API parity (default `true`,
+    /// matching sklearn) but DOES NOT alter the fitted result — the converged
+    /// `α`/`dual_coef_`/`intercept_` are shrinking-invariant.
+    pub shrinking: bool,
     /// The multiclass `decision_function` shape convention
     /// (`sklearn/svm/_base.py:778-781`); default
     /// [`SvmDecisionShape::Ovr`] (sklearn's `decision_function_shape='ovr'`).
     pub decision_function_shape: SvmDecisionShape,
+    /// Whether `predict` breaks ties by the one-vs-rest decision confidence
+    /// instead of the libsvm vote (`break_ties`, `sklearn/svm/_classes.py`
+    /// default `False`; semantics in `BaseSVC.predict`,
+    /// `sklearn/svm/_base.py:801-814`).
+    ///
+    /// When `true` AND [`SvmDecisionShape::Ovr`] AND `n_classes > 2`,
+    /// `predict = argmax(decision_function(X))` (the ovr decision, which breaks
+    /// ties by confidence); otherwise the libsvm ovo vote (with lower-index
+    /// tie-break) is used. `break_ties=true` with [`SvmDecisionShape::Ovo`] is
+    /// rejected at predict time (`InvalidParameter`), matching sklearn
+    /// (`_base.py:801-804`).
+    pub break_ties: bool,
 }
 
 impl<F: Float, K: Kernel<F>> SVC<F, K> {
-    /// Create a new `SVC` with the given kernel and default hyperparameters.
+    /// Create a new `SVC` with the given kernel and default hyperparameters
+    /// matching sklearn (`sklearn/svm/_classes.py` `SVC.__init__`).
     ///
-    /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 10000`,
-    /// `cache_size = 1024`, `decision_function_shape = Ovr`.
+    /// Defaults: `C = 1.0`, `tol = 1e-3`, `max_iter = 0` (= sklearn `-1`, no
+    /// iteration limit), `cache_size = 200`, `shrinking = true`,
+    /// `decision_function_shape = Ovr`, `break_ties = false`.
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
             kernel,
             c: F::one(),
             tol: F::from(1e-3).unwrap_or_else(F::epsilon),
-            max_iter: 10000,
-            cache_size: 1024,
+            max_iter: 0,
+            cache_size: 200,
+            shrinking: true,
             decision_function_shape: SvmDecisionShape::Ovr,
+            break_ties: false,
         }
+    }
+
+    /// Set the `shrinking` flag (`sklearn` `shrinking`, default `true`).
+    ///
+    /// Accepted for API parity; does NOT alter the converged optimum
+    /// (ferrolearn's SMO has no shrinking heuristic — R-DEV-7).
+    #[must_use]
+    pub fn with_shrinking(mut self, shrinking: bool) -> Self {
+        self.shrinking = shrinking;
+        self
+    }
+
+    /// Set the `break_ties` flag (`sklearn` `break_ties`, default `false`,
+    /// `sklearn/svm/_base.py:801-814`).
+    #[must_use]
+    pub fn with_break_ties(mut self, break_ties: bool) -> Self {
+        self.break_ties = break_ties;
+        self
     }
 
     /// Set the multiclass `decision_function` shape convention
@@ -762,6 +892,9 @@ pub struct FittedSVC<F, K> {
     /// The multiclass `decision_function` shape convention carried over from
     /// the unfitted [`SVC`] (`sklearn/svm/_base.py:778-781`).
     decision_function_shape: SvmDecisionShape,
+    /// The `break_ties` flag carried over from the unfitted [`SVC`]
+    /// (`sklearn/svm/_base.py:801-814`).
+    break_ties: bool,
 }
 
 impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
@@ -1214,6 +1347,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             x_train: x.clone(),
             y_train: y.to_vec(),
             decision_function_shape: self.decision_function_shape,
+            break_ties: self.break_ties,
         })
     }
 }
@@ -1226,16 +1360,67 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> P
 
     /// Predict class labels for the given feature matrix.
     ///
-    /// Uses one-vs-one voting: each binary model casts a vote for the
-    /// winning class, and the class with the most votes wins.
+    /// Uses one-vs-one voting (each binary model casts a vote, the most-voted
+    /// class wins, ties broken toward the lower class index), matching libsvm's
+    /// `super().predict` (`sklearn/svm/_base.py:813-814`).
+    ///
+    /// When `break_ties == true` AND [`SvmDecisionShape::Ovr`] AND
+    /// `n_classes > 2`, ties are instead broken by the one-vs-rest decision
+    /// confidence: `predict = argmax(decision_function(X))`
+    /// (`sklearn/svm/_base.py:806-811`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
-    /// does not match the training data.
+    /// does not match the training data. Returns
+    /// [`FerroError::InvalidParameter`] when `break_ties == true` and the
+    /// decision-function shape is [`SvmDecisionShape::Ovo`]
+    /// (`sklearn/svm/_base.py:801-804`).
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
+
+        // sklearn raises when break_ties=True and decision_function_shape='ovo'
+        // (`_base.py:801-804`), regardless of n_classes.
+        if self.break_ties && self.decision_function_shape == SvmDecisionShape::Ovo {
+            return Err(FerroError::InvalidParameter {
+                name: "break_ties".into(),
+                reason: "break_ties must be False when decision_function_shape is 'ovo'".into(),
+            });
+        }
+
+        // break_ties=True, ovr, multiclass: predict = argmax(decision_function)
+        // (`_base.py:806-811`). The ovr decision breaks vote ties by confidence.
+        if self.break_ties && self.decision_function_shape == SvmDecisionShape::Ovr && n_classes > 2
+        {
+            let scores = self.decision_function(x)?;
+            let mc = match scores {
+                SvmScores::Multiclass(m) => m,
+                // n_classes > 2 always yields the multiclass variant.
+                SvmScores::Binary(_) => {
+                    return Err(FerroError::InvalidParameter {
+                        name: "break_ties".into(),
+                        reason: "ovr decision function unavailable for break-tie predict".into(),
+                    });
+                }
+            };
+            let mut predictions = Array1::<usize>::zeros(n_samples);
+            for s in 0..n_samples {
+                // argmax over the row; ties keep the first (lowest) index via a
+                // strictly-greater scan, matching numpy's argmax.
+                let mut best_idx = 0usize;
+                let mut best_val = mc[[s, 0]];
+                for c in 1..n_classes {
+                    if mc[[s, c]] > best_val {
+                        best_val = mc[[s, c]];
+                        best_idx = c;
+                    }
+                }
+                predictions[s] = self.classes[best_idx];
+            }
+            return Ok(predictions);
+        }
+
         let mut predictions = Array1::<usize>::zeros(n_samples);
 
         for s in 0..n_samples {
@@ -1298,27 +1483,45 @@ pub struct SVR<F, K> {
     pub epsilon: F,
     /// Convergence tolerance.
     pub tol: F,
-    /// Maximum number of SMO iterations.
+    /// Maximum number of SMO iterations. `0` is the sklearn `max_iter=-1`
+    /// sentinel meaning **no iteration limit** (the SMO runs to convergence).
     pub max_iter: usize,
-    /// Size of the kernel evaluation LRU cache.
+    /// Size of the kernel evaluation LRU cache (perf-only; default `200`).
     pub cache_size: usize,
+    /// Whether to use libsvm's shrinking heuristic (`sklearn` `shrinking`,
+    /// default `true`). Accepted for API parity; does NOT alter the converged
+    /// optimum (ferrolearn's SMO has no shrinking heuristic — R-DEV-7).
+    pub shrinking: bool,
 }
 
 impl<F: Float, K: Kernel<F>> SVR<F, K> {
-    /// Create a new `SVR` with the given kernel and default hyperparameters.
+    /// Create a new `SVR` with the given kernel and default hyperparameters
+    /// matching sklearn (`sklearn/svm/_classes.py` `SVR.__init__`).
     ///
-    /// Defaults: `C = 1.0`, `epsilon = 0.1`, `tol = 1e-3`,
-    /// `max_iter = 10000`, `cache_size = 1024`.
+    /// Defaults: `C = 1.0`, `epsilon = 0.1`, `tol = 1e-3`, `max_iter = 0`
+    /// (= sklearn `-1`, no iteration limit), `cache_size = 200`,
+    /// `shrinking = true`.
     #[must_use]
     pub fn new(kernel: K) -> Self {
         Self {
             kernel,
             c: F::one(),
-            epsilon: F::from(0.1).unwrap(),
-            tol: F::from(1e-3).unwrap(),
-            max_iter: 10000,
-            cache_size: 1024,
+            epsilon: F::from(0.1).unwrap_or_else(F::epsilon),
+            tol: F::from(1e-3).unwrap_or_else(F::epsilon),
+            max_iter: 0,
+            cache_size: 200,
+            shrinking: true,
         }
+    }
+
+    /// Set the `shrinking` flag (`sklearn` `shrinking`, default `true`).
+    ///
+    /// Accepted for API parity; does NOT alter the converged optimum
+    /// (ferrolearn's SMO has no shrinking heuristic — R-DEV-7).
+    #[must_use]
+    pub fn with_shrinking(mut self, shrinking: bool) -> Self {
+        self.shrinking = shrinking;
+        self
     }
 
     /// Set the regularization parameter C.
@@ -1507,7 +1710,14 @@ fn smo_svr<F: Float, K: Kernel<F>>(
     let two = F::one() + F::one();
     let eps_num = F::from(1e-12).unwrap_or_else(F::epsilon);
 
-    for _iter in 0..max_iter {
+    // `max_iter == 0` is the sklearn `max_iter=-1` ("no iteration limit")
+    // sentinel — run until the KKT gap closes; non-zero caps the count.
+    let mut iter = 0usize;
+    loop {
+        if max_iter != 0 && iter >= max_iter {
+            break;
+        }
+        iter += 1;
         // WSS: same as SVC but with the extended variables.
         // I_up  = {k : (s_k=+1 and beta_k < C) or (s_k=-1 and beta_k > 0)}
         // I_low = {k : (s_k=+1 and beta_k > 0) or (s_k=-1 and beta_k < C)}
@@ -1800,7 +2010,7 @@ mod tests {
     #[test]
     fn test_polynomial_kernel() {
         let k = PolynomialKernel {
-            gamma: Some(1.0),
+            gamma: Gamma::Value(1.0),
             degree: 2,
             coef0: 1.0,
         };
@@ -1813,7 +2023,7 @@ mod tests {
     #[test]
     fn test_sigmoid_kernel() {
         let k = SigmoidKernel {
-            gamma: Some(1.0),
+            gamma: Gamma::Value(1.0),
             coef0: 0.0,
         };
         let x = vec![0.0f64];
@@ -2338,5 +2548,167 @@ mod tests {
             ic[0]
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-1 (gamma='auto') + REQ-8 (break_ties) smoke tests.
+    //
+    // Expected values from the LIVE sklearn 1.5.2 oracle (R-CHAR-3):
+    //
+    //   import numpy as np; from sklearn.svm import SVC
+    //   X=np.array([[1.,1.],[2.,1.],[1.,2.],[5.,5.],[6.,5.],[5.,6.]])
+    //   y=np.array([0,0,0,1,1,1])
+    //   m=SVC(kernel='rbf',C=1.0,gamma='auto').fit(X,y)
+    //   m._gamma                       # 0.5  (= 1/n_features = 1/2)
+    //   m.decision_function(X)         # [-0.9996,-0.9999,-0.9999,
+    //                                  #   0.9999, 0.9999, 0.9996]
+    //
+    //   break_ties: a symmetric, cleanly-separable 3-class set so ferrolearn's
+    //   SMO converges to libsvm's optimum (each class has 2 SVs). Near the
+    //   centroid the three ovr scores are ~1.0 (a near 1-1-1 vote tie), so the
+    //   libsvm vote breaks toward the LOWEST class index (0) while ovr-argmax
+    //   breaks by confidence. Oracle (re-derived vs the live oracle):
+    //   Xb=[[0,0],[.5,0],[0,.5],[10,0],[10.5,0],[10,.5],[5,9],[5.5,9],[5,9.5]]
+    //   yb=[0,0,0,1,1,1,2,2,2]
+    //   q1=[[5.19,3.342]]: vote -> 0, break_ties -> 2 (df [0.9942,0.999,1.0068])
+    //   q2=[[5.19,3.241]]: vote -> 0, break_ties -> 1 (df [0.9999,1.0051,0.9949])
+    //   SVC(...,decision_function_shape='ovo',break_ties=True) -> ValueError
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_svc_gamma_auto_decision_function() -> TestResult {
+        // gamma='auto' on the 6x2 set: _gamma = 1/n_features = 0.5.
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1];
+
+        // Confirm the resolved gamma is 1/n_features (sklearn `_base.py:241`).
+        let resolved = RbfKernel::<f64>::with_gamma_auto().resolved_for_fit(&x);
+        assert!(
+            (gamma_value_or_one(resolved.gamma) - 0.5).abs() < 1e-12,
+            "gamma='auto' resolved to {} vs oracle 0.5",
+            gamma_value_or_one(resolved.gamma)
+        );
+
+        let m = SVC::new(RbfKernel::<f64>::with_gamma_auto())
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .fit(&x, &y)?;
+        let df = m.decision_function(&x)?;
+        let bin = df.as_binary().ok_or_else(|| err("binary"))?;
+        assert_eq!(bin.len(), 6);
+        let oracle = [-0.9996, -0.9999, -0.9999, 0.9999, 0.9999, 0.9996];
+        for (i, &exp) in oracle.iter().enumerate() {
+            assert!(
+                (bin[i] - exp).abs() < 1e-2,
+                "gamma=auto df[{i}] = {} vs oracle {exp}",
+                bin[i]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_gamma_scale_still_default() -> TestResult {
+        // gamma='scale' (the default) must STILL resolve to
+        // 1/(n_features * X.var()); on the 6x2 set X.var()=4.2222 ->
+        // _gamma = 1/(2*4.2222) = 0.11842 (sklearn `_base.py:238-239`).
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+        )
+        .map_err(|_| err("shape"))?;
+        let resolved = RbfKernel::<f64>::new().resolved_for_fit(&x);
+        assert!(
+            (gamma_value_or_one(resolved.gamma) - 0.118_421).abs() < 1e-4,
+            "gamma='scale' resolved to {} vs oracle 0.118421",
+            gamma_value_or_one(resolved.gamma)
+        );
+        Ok(())
+    }
+
+    fn break_ties_set() -> Result<(Array2<f64>, Array1<usize>), FerroError> {
+        let x = Array2::from_shape_vec(
+            (9, 2),
+            vec![
+                0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 10.0, 0.0, 10.5, 0.0, 10.0, 0.5, 5.0, 9.0, 5.5, 9.0,
+                5.0, 9.5,
+            ],
+        )
+        .map_err(|_| err("shape"))?;
+        let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+        Ok((x, y))
+    }
+
+    fn break_ties_fit(
+        break_ties: bool,
+        shape: SvmDecisionShape,
+    ) -> Result<FittedSVC<f64, LinearKernel>, FerroError> {
+        let (x, y) = break_ties_set()?;
+        SVC::new(LinearKernel)
+            .with_c(1.0)
+            .with_tol(1e-6)
+            .with_max_iter(200_000)
+            .with_break_ties(break_ties)
+            .with_decision_function_shape(shape)
+            .fit(&x, &y)
+    }
+
+    #[test]
+    fn test_svc_break_ties_changes_label() -> TestResult {
+        // q1=(5.19,3.342): vote -> 0, break_ties -> 2.
+        let q1 = Array2::from_shape_vec((1, 2), vec![5.19, 3.342]).map_err(|_| err("shape"))?;
+        // q2=(5.19,3.241): vote -> 0, break_ties -> 1.
+        let q2 = Array2::from_shape_vec((1, 2), vec![5.19, 3.241]).map_err(|_| err("shape"))?;
+
+        let vote = break_ties_fit(false, SvmDecisionShape::Ovr)?;
+        let bt = break_ties_fit(true, SvmDecisionShape::Ovr)?;
+
+        // break_ties=false (default): libsvm vote -> lowest-index class 0.
+        assert_eq!(vote.predict(&q1)?[0], 0, "vote q1 should be 0");
+        assert_eq!(vote.predict(&q2)?[0], 0, "vote q2 should be 0");
+
+        // break_ties=true + ovr: argmax(decision_function).
+        assert_eq!(
+            bt.predict(&q1)?[0],
+            2,
+            "break_ties q1 (ovr-argmax) should be 2"
+        );
+        assert_eq!(
+            bt.predict(&q2)?[0],
+            1,
+            "break_ties q2 (ovr-argmax) should be 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_break_ties_ovo_errors() -> TestResult {
+        // sklearn raises when break_ties=True and decision_function_shape='ovo'
+        // (`_base.py:801-804`).
+        let m = break_ties_fit(true, SvmDecisionShape::Ovo)?;
+        let q = Array2::from_shape_vec((1, 2), vec![5.19, 3.342]).map_err(|_| err("shape"))?;
+        assert!(m.predict(&q).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn test_svc_default_params() {
+        // sklearn defaults: cache_size=200, max_iter=-1 (= 0 sentinel),
+        // shrinking=True, break_ties=False, decision_function_shape='ovr'.
+        let m = SVC::<f64, LinearKernel>::new(LinearKernel);
+        assert_eq!(m.cache_size, 200);
+        assert_eq!(m.max_iter, 0);
+        assert!(m.shrinking);
+        assert!(!m.break_ties);
+        assert_eq!(m.decision_function_shape, SvmDecisionShape::Ovr);
+        let r = SVR::<f64, LinearKernel>::new(LinearKernel);
+        assert_eq!(r.cache_size, 200);
+        assert_eq!(r.max_iter, 0);
+        assert!(r.shrinking);
     }
 }
