@@ -9,6 +9,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- translate(isotonic): REQ-10 free isotonic_regression() + check_increasing() (#571)
+- translate(isotonic): REQ-9 expose X_min_/X_max_/X_thresholds_/y_thresholds_/increasing_ (#570)
+- translate(isotonic): REQ-6 increasing='auto' via Spearman check_increasing (#567)
+- translate(isotonic): REQ-5 y_min/y_max clipping of fitted range (#566)
+- translate(isotonic): REQ-7 sample_weight weighted PAVA (#568)
+- translate(isotonic): REQ-2 pin decreasing-PAVA pooled values vs oracle (#564)
+- translate(isotonic): REQ-1 pin increasing-PAVA pooled y_thresholds_ vs oracle (#563)
+- translate(isotonic): REQ-8 _make_unique weighted duplicate-X collapse (#569)
+- translate(isotonic): REQ-4 default out_of_bounds Clip -> Nan (#565)
 - translate(glm): REQ-11 warm_start (#557)
 - translate(glm): REQ-11 warm_start (#557)
 - translate(glm): REQ-10 solver param lbfgs/newton-cholesky + gradient-norm stop (#556)
@@ -191,6 +200,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Translation unit: ferrolearn-linear/src/isotonic.rs — out_of_bounds='nan' default + _make_unique weighted collapse (#573)
 - Divergence: SGDRegressor/SGDClassifier do not validate l1_ratio to [0,1] (sklearn/linear_model/_stochastic_gradient.py:2018,1217) (#540)
 - Divergence: SGD Hinge::gradient diverges from sklearn/linear_model/_sgd_fast.pyx.tp:224 at z==threshold boundary (#539)
 - translate: ferrolearn-linear/ransac.rs — RANSACRegressor sklearn parity (iter 24) (#511)
