@@ -622,3 +622,142 @@ fn lda_predict_log_proba() {
         }
     }
 }
+
+// ===========================================================================
+// #598 (REQ-12) — store_covariance / covariance_.
+//
+// sklearn's svd-solver stores the SHARED within-class covariance only when
+// `store_covariance=True` (default `False`, `discriminant_analysis.py:353`):
+// `if self.store_covariance: self.covariance_ = _class_cov(X, y, self.priors_)`
+// (`:509-510`). `_class_cov` (`:128-172`) returns
+// `Σ_k priors_[k] · cov(X_k)`, where `cov(X_k)` is the MAXIMUM-LIKELIHOOD
+// empirical covariance of class k's samples — `empirical_covariance` calls
+// `np.cov(Xg.T, bias=1)` (`covariance/_empirical_covariance.py:109`),
+// i.e. normalized by `n_k` (NOT `n_k - 1`). When `store_covariance=False`
+// (the default), the attribute does not exist; ferrolearn returns `None`.
+// ===========================================================================
+
+fn cov_x() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 1.0, 2.0, 0.5, 0.5, 2.0, // class 0
+            5.0, 5.0, 6.0, 4.5, 4.5, 6.0, 5.5, 5.5, // class 1
+        ],
+    )
+    .unwrap()
+}
+
+fn cov_y() -> Array1<usize> {
+    Array1::from(vec![0, 0, 0, 0, 1, 1, 1, 1])
+}
+
+/// #598 (REQ-12): `LDA::with_store_covariance(true)` populates
+/// `FittedLDA::covariance` with the shared within-class covariance
+/// `Σ_k priors_[k] · cov(X_k)` (`discriminant_analysis.py:509-510`, `_class_cov`
+/// `:128-172`). Per-class `cov(X_k)` is the maximum-likelihood empirical
+/// covariance (`np.cov(..., bias=1)`, ÷`n_k`). The default / `false` path leaves
+/// `covariance() == None` (sklearn only defines the attribute when the flag is
+/// set).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,.5],[.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); \
+///   print(repr(L(store_covariance=True).fit(X,y).covariance_.tolist()))"
+/// # [[0.4296875, -0.1328125], [-0.1328125, 0.4296875]]
+/// ```
+#[test]
+fn lda_store_covariance() {
+    // Live sklearn 1.5.2 covariance_ for store_covariance=True (shape (2, 2)).
+    const SK_COV: [[f64; 2]; 2] = [[0.4296875, -0.1328125], [-0.1328125, 0.4296875]];
+
+    let x = cov_x();
+    let y = cov_y();
+
+    // store_covariance=True ⇒ covariance() is Some and matches the oracle.
+    let fitted = LDA::<f64>::new(None)
+        .with_store_covariance(true)
+        .fit(&x, &y)
+        .unwrap();
+    let cov = fitted
+        .covariance()
+        .expect("covariance() must be Some when store_covariance=true");
+    assert_eq!(cov.dim(), (2, 2), "covariance_ shape");
+    for a in 0..2 {
+        for b in 0..2 {
+            assert!(
+                (cov[[a, b]] - SK_COV[a][b]).abs() < 1e-9,
+                "covariance_[{a}][{b}]: sklearn {}, ferrolearn {}",
+                SK_COV[a][b],
+                cov[[a, b]]
+            );
+        }
+    }
+
+    // store_covariance=false (explicit) ⇒ covariance() is None.
+    let fitted_false = LDA::<f64>::new(None)
+        .with_store_covariance(false)
+        .fit(&x, &y)
+        .unwrap();
+    assert!(
+        fitted_false.covariance().is_none(),
+        "covariance() must be None when store_covariance=false"
+    );
+
+    // Default (sklearn `store_covariance=False`, :353) ⇒ covariance() is None.
+    let fitted_default = LDA::<f64>::new(None).fit(&x, &y).unwrap();
+    assert!(
+        fitted_default.covariance().is_none(),
+        "covariance() must be None by default (sklearn store_covariance=False)"
+    );
+}
+
+// ===========================================================================
+// #601 (REQ-15) — tol parameter.
+//
+// sklearn's svd-solver `tol` (constructor default `1e-4`,
+// `discriminant_analysis.py:354`, validated `Interval(Real, 0, None)` :343)
+// drives BOTH SVD rank thresholds: `rank = sum(S > self.tol)` (`:532`) and
+// `rank2 = sum(S > self.tol * S[0])` (`:554`). ferrolearn previously hardcoded
+// `1e-4`; it is now a constructor parameter (`LDA::with_tol`) threaded into both
+// rank cutoffs. The default `1e-4` keeps the svd fit byte-identical (the other
+// oracle tests in this file remain green), so the structural assertion below
+// (default value + plumb-through) plus the unchanged fit oracles fully pin it.
+// ===========================================================================
+
+/// #601 (REQ-15): `LDA::tol` defaults to sklearn's `1e-4`
+/// (`discriminant_analysis.py:354`) and `with_tol` sets it. The default value is
+/// the sklearn `file:line` symbolic constant (the constructor default at `:354`,
+/// not a value copied from ferrolearn).
+#[test]
+fn lda_tol_param() {
+    // sklearn constructor default `tol=1e-4` (discriminant_analysis.py:354).
+    const SK_TOL_DEFAULT: f64 = 1e-4;
+
+    // Default tol == sklearn's 1e-4.
+    let lda = LDA::<f64>::new(None);
+    assert!(
+        (lda.tol() - SK_TOL_DEFAULT).abs() < 1e-18,
+        "default tol must be sklearn's 1e-4, got {}",
+        lda.tol()
+    );
+
+    // with_tol sets the field.
+    let lda = lda.with_tol(0.5);
+    assert!(
+        (lda.tol() - 0.5).abs() < 1e-18,
+        "with_tol(0.5) must set tol, got {}",
+        lda.tol()
+    );
+
+    // Default tol still produces a valid fit (byte-identical svd path: the
+    // other oracle tests assert exact values; here we confirm the threaded
+    // default does not change the fitted shape).
+    let x = cov_x();
+    let y = cov_y();
+    let fitted = LDA::<f64>::new(None).fit(&x, &y).unwrap();
+    assert_eq!(fitted.scalings().nrows(), 2);
+}

@@ -56,9 +56,9 @@
 //! | REQ-9 (lsqr solver) | NOT-STARTED | open prereq blocker #595. Only the `svd` solver exists; no `solver` parameter, no `_solve_lstsq` (`discriminant_analysis.py:365-419`). |
 //! | REQ-10 (eigen solver) | NOT-STARTED | open prereq blocker #596. No `solver="eigen"` generalized-eigenvalue path (`discriminant_analysis.py:421-485`). |
 //! | REQ-11 (shrinkage) | NOT-STARTED | open prereq blocker #597. No `shrinkage` parameter / Ledoit-Wolf `'auto'` (`discriminant_analysis.py:339,628-629`). |
-//! | REQ-12 (store_covariance / covariance_) | NOT-STARTED | open prereq blocker #598. No `store_covariance` flag / `covariance_` attribute (`discriminant_analysis.py:509-510`). |
+//! | REQ-12 (store_covariance / covariance_) | SHIPPED | `LDA::with_store_covariance` sets the flag (sklearn default `false`, `discriminant_analysis.py:353`); when `true`, `fn fit` computes the shared within-class covariance `covariance_ = Σ_k priors_[k] · cov(X_k)` (`:509-510`, `_class_cov` `:128-172`) with the maximum-likelihood (`bias=1`, ÷`n_k`) per-class empirical covariance (`empirical_covariance`, `np.cov(...,bias=1)`), stored on `FittedLDA::covariance` (`None` when the flag is unset, matching sklearn). Consumer: `fn fit` reads `self.store_covariance`/`priors`/`means` and populates the field; `FittedLDA::covariance` exposes it. Test `lda_store_covariance` matches the live oracle `LinearDiscriminantAnalysis(store_covariance=True).fit(X,y).covariance_` to 1e-9 and asserts `None` for the default/`false` path. #598. |
 //! | REQ-14 (binary decision_function shape `(n,)`) | NOT-STARTED | open prereq blocker #600. `fn decision_function` always returns `(n, n_classes)`; sklearn collapses binary to `(n,)` (`discriminant_analysis.py:651-657,739`). Binding-ABI layer (parallel to QDA #581). |
-//! | REQ-15 (tol parameter) | NOT-STARTED | open prereq blocker #601. The SVD rank thresholds use a fixed `tol = 1e-4` (sklearn's default); no `tol` constructor parameter (`discriminant_analysis.py:354,532,554`). |
+//! | REQ-15 (tol parameter) | SHIPPED | `LDA::with_tol` sets the svd-solver rank threshold (sklearn default `1e-4`, `discriminant_analysis.py:354,362`); `fn fit` reads `self.tol` into BOTH rank cutoffs `rank = Σ(S > tol)` (`:532`) and `rank2 = Σ(S2 > tol·S2[0])` (`:554`), REPLACING the prior hardcoded `1e-4`. Default `1e-4` ⇒ byte-identical to prior behavior (all existing svd-fit oracle tests stay green). Consumer: `fn fit` reads `self.tol` in both rank thresholds. Test `lda_tol_param` (field default `1e-4` + `with_tol` plumb-through). #601. |
 //! | REQ-16 (ferray array-type substrate) | NOT-STARTED | open prereq blocker #602. The two SVDs run on `ferray::linalg::svd`; the owned array type is still `ndarray` (crate-wide deferral, cf. qda.rs REQ-12 #585). |
 //!
 //! # Examples
@@ -120,6 +120,19 @@ pub struct LDA<F> {
     /// `priors_` (matching sklearn `:605`, `self.priors_ = xp.asarray(self.priors)`).
     priors: Option<Array1<F>>,
 
+    /// Whether to compute and store the shared within-class covariance matrix
+    /// `covariance_` during fit (sklearn's `store_covariance`, default `false`,
+    /// `discriminant_analysis.py:353,361`). When `true`, the svd-solver `fit`
+    /// computes `covariance_ = Σ_k priors_[k] · cov(X_k)` (`:509-510`,
+    /// `_class_cov` `:128-172`).
+    store_covariance: bool,
+
+    /// Singular-value rank threshold used by the svd-solver (sklearn's `tol`,
+    /// default `1e-4`, `discriminant_analysis.py:354,362`). It drives the two
+    /// rank cutoffs `rank = Σ(S > tol)` (`:532`) and
+    /// `rank2 = Σ(S2 > tol·S2[0])` (`:554`).
+    tol: F,
+
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -133,6 +146,12 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
         Self {
             n_components,
             priors: None,
+            store_covariance: false,
+            // sklearn default `tol=1e-4` (`discriminant_analysis.py:354`).
+            // `1e-4` is exactly representable in f32/f64; the fallback to
+            // `F::epsilon()` is unreachable for those but keeps `new`
+            // panic-free for any conforming `Float`.
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             _marker: std::marker::PhantomData,
         }
     }
@@ -162,6 +181,45 @@ impl<F: Float + Send + Sync + 'static> LDA<F> {
     #[must_use]
     pub fn priors(&self) -> Option<&Array1<F>> {
         self.priors.as_ref()
+    }
+
+    /// Set whether to compute and store the shared within-class covariance
+    /// matrix `covariance_` during fit (sklearn's `store_covariance`,
+    /// `discriminant_analysis.py:353,361`). Default `false`.
+    ///
+    /// When `true`, [`Fit::fit`] computes `covariance_ = Σ_k priors_[k] ·
+    /// cov(X_k)` (`:509-510`, `_class_cov` `:128-172`) and
+    /// [`FittedLDA::covariance`] returns `Some`. When `false` it returns `None`
+    /// (matching sklearn, where the attribute only exists when the flag is set).
+    #[must_use]
+    pub fn with_store_covariance(mut self, store_covariance: bool) -> Self {
+        self.store_covariance = store_covariance;
+        self
+    }
+
+    /// Return whether `covariance_` will be stored during fit (sklearn's
+    /// `store_covariance`, `discriminant_analysis.py:353`).
+    #[must_use]
+    pub fn store_covariance(&self) -> bool {
+        self.store_covariance
+    }
+
+    /// Set the singular-value rank threshold `tol` used by the svd-solver
+    /// (sklearn's `tol`, `discriminant_analysis.py:354,362`). Default `1e-4`.
+    ///
+    /// It drives the two rank cutoffs `rank = Σ(S > tol)` (`:532`) and
+    /// `rank2 = Σ(S2 > tol·S2[0])` (`:554`).
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Return the configured svd-solver rank threshold `tol`. Mirrors sklearn's
+    /// constructor `tol` (`discriminant_analysis.py:354`, default `1e-4`).
+    #[must_use]
+    pub fn tol(&self) -> F {
+        self.tol
     }
 }
 
@@ -215,6 +273,14 @@ pub struct FittedLDA<F> {
     /// `max_components`. Mirrors sklearn's `explained_variance_ratio_`
     /// (`discriminant_analysis.py:550-552`).
     explained_variance_ratio: Array1<F>,
+
+    /// Shared within-class covariance matrix `covariance_`, shape
+    /// `(n_features, n_features)`, present only when the model was configured
+    /// with [`LDA::with_store_covariance`]`(true)`. Mirrors sklearn's
+    /// `covariance_` (`discriminant_analysis.py:509-510`, `_class_cov`
+    /// `:128-172`): `Σ_k priors_[k] · cov(X_k)`. `None` otherwise (matching
+    /// sklearn, where the attribute only exists when `store_covariance=True`).
+    covariance: Option<Array2<F>>,
 
     /// Class labels corresponding to rows of `means`/`coef`.
     classes: Vec<usize>,
@@ -277,6 +343,23 @@ impl<F: Float + Send + Sync + 'static> FittedLDA<F> {
     #[must_use]
     pub fn explained_variance_ratio(&self) -> &Array1<F> {
         &self.explained_variance_ratio
+    }
+
+    /// Shared within-class covariance matrix `covariance_`, shape
+    /// `(n_features, n_features)`. Mirrors sklearn's `covariance_`
+    /// (`discriminant_analysis.py:509-510`, `_class_cov` `:128-172`):
+    /// `Σ_k priors_[k] · cov(X_k)` where `cov(X_k)` is the maximum-likelihood
+    /// empirical covariance of class `k`'s samples (`np.cov(..., bias=1)`,
+    /// normalized by `n_k`, via `empirical_covariance`,
+    /// `covariance/_empirical_covariance.py:109`).
+    ///
+    /// Returns `Some` only when the model was configured with
+    /// [`LDA::with_store_covariance`]`(true)`; `None` otherwise — matching
+    /// sklearn, where the `covariance_` attribute only exists when
+    /// `store_covariance=True`.
+    #[must_use]
+    pub fn covariance(&self) -> Option<&Array2<F>> {
+        self.covariance.as_ref()
     }
 
     /// Sorted class labels as seen during fitting.
@@ -611,6 +694,36 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
             xbar[j] = acc;
         }
 
+        // --- covariance_  (sklearn :509-510, `_class_cov` :128-172) -----------
+        // When `store_covariance` is set, compute the shared within-class
+        // covariance `Σ_k priors_[k] · cov(X_k)`, where `cov(X_k)` is the
+        // MAXIMUM-LIKELIHOOD empirical covariance of class k's samples —
+        // `empirical_covariance` calls `np.cov(Xg.T, bias=1)`
+        // (`covariance/_empirical_covariance.py:109`), i.e. centered on the
+        // class mean and normalized by `n_k` (NOT `n_k - 1`). Verified against
+        // the live oracle: class-0 of the dispatch fixture yields the documented
+        // `[[0.4296875, …], …]` only under the `bias=1` (÷n_k) normalization.
+        let covariance = if self.store_covariance {
+            let mut cov = Array2::<F>::zeros((n_features, n_features));
+            for (idx, indices) in class_indices.iter().enumerate() {
+                let nk = usize_to_f::<F>(indices.len())?;
+                let prior_k = priors[idx];
+                // cov(X_k)[a, b] = (1/n_k) Σ_i (x_ia - μ_ka)(x_ib - μ_kb).
+                for a in 0..n_features {
+                    for b in 0..n_features {
+                        let mut acc = <F as num_traits::Zero>::zero();
+                        for &i in indices {
+                            acc += (x[[i, a]] - means[[idx, a]]) * (x[[i, b]] - means[[idx, b]]);
+                        }
+                        cov[[a, b]] += prior_k * (acc / nk);
+                    }
+                }
+            }
+            Some(cov)
+        } else {
+            None
+        };
+
         // --- Xc = each sample minus its class mean (stacked; sklearn :512-519) -
         let mut xc = Array2::<F>::zeros((n_samples, n_features));
         for (idx, indices) in class_indices.iter().enumerate() {
@@ -657,7 +770,10 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
         }
 
         // --- first SVD: within whitening (sklearn :530-534) -------------------
-        let tol = F::from(1e-4).unwrap_or_else(F::epsilon);
+        // sklearn's svd-solver rank threshold `tol` (constructor default `1e-4`,
+        // `discriminant_analysis.py:354,362`), now configurable via
+        // `LDA::with_tol`. Default `1e-4` ⇒ byte-identical to the prior hardcode.
+        let tol = self.tol;
         let (s1, vt1) = svd_s_vt::<F>(&xw)?;
         let rank1 = s1.iter().filter(|&&v| v > tol).count();
         if rank1 == 0 {
@@ -776,6 +892,7 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
             coef,
             intercept,
             explained_variance_ratio,
+            covariance,
             classes,
             max_components: user_max,
             n_features,
