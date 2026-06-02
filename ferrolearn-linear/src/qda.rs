@@ -25,34 +25,22 @@
 //! propagates exactly as in scikit-learn (which emits a "Variables are
 //! collinear" warning and still predicts), reproducing the upstream behavior.
 //!
-//! # REQ status
+//! ## REQ status (per `.design/linear/qda.md`, mirrors `sklearn/discriminant_analysis.py` @ 1.5.2)
 //!
-//! Mirrors `sklearn/discriminant_analysis.py:940-976`
-//! (`QuadraticDiscriminantAnalysis`). Full table in `.design/linear/qda.md`;
-//! the REQs touched by the SVD migration are summarized here.
-//!
-//! - **REQ-1 (fit + decision_function parity) — SHIPPED.** `fn fit` builds the
-//!   per-class thin SVD (`fn svd_s_vt` → `ferray::linalg::svd`) and
-//!   `fn raw_decision` computes the SVD log-posterior
-//!   `-½(‖(x-μ)·R·S^(-½)‖² + Σ log S) + log π` (`discriminant_analysis.py:962-976`).
-//!   Consumer: `fn decision_function` / `fn predict` (`Predict` impl) and the
-//!   Python binding `RsQDA::predict`. Verified to the live `_decision_function`
-//!   oracle to <1e-6 (`qda_decision_function_multiclass`).
-//! - **REQ-10 (tol + rank-deficient SVD, no error) — SHIPPED.** `with_tol` adds
-//!   the `tol` field (default `1e-4`); `fn fit` computes `rank = sum(S > tol)`
-//!   and warns "Variables are collinear" when `rank < n_features` instead of
-//!   erroring, mirroring `discriminant_analysis.py:945-947`. Consumer: `fn fit`
-//!   → `FittedQDA` → `RsQDA::predict`. Verified: `qda_rank_deficient_class`
-//!   (collinear class ⇒ `predict == [0;8]`, matching the live oracle).
-//! - **REQ-11 (scalings_/rotations_ attributes) — SHIPPED.** `FittedQDA::scalings`
-//!   / `FittedQDA::rotations` expose the materialized `S²/(n_k-1)` scalings and
-//!   `Vtᵀ` rotations (`discriminant_analysis.py:948-954`). Consumer: `fn
-//!   raw_decision` reads them every prediction. Verified: `qda_scalings_rotations`
-//!   (scalings to the oracle; `R·diag(S2)·Rᵀ` reconstructs the oracle covariance).
-//! - **REQ-12 (ferray substrate) — NOT-STARTED (#585):** the per-class SVD now
-//!   runs on `ferray::linalg::svd` (bridged ndarray↔ferray at `fn svd_s_vt`,
-//!   R-SUBSTRATE-4), but the owned array type is still `ndarray::Array2`, so the
-//!   full array-type migration off `ndarray` is not done.
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (fit + decision_function parity) | SHIPPED | `fn fit` per-class thin SVD (`fn svd_s_vt` → `ferray::linalg::svd`) + `fn raw_decision` SVD log-posterior `-½(‖(x-μ)·R·S^(-½)‖² + Σ log S) + log π` (`discriminant_analysis.py:962-976`). Consumer: `Predict for FittedQDA` + `RsQDA::predict`. Test `qda_decision_function_multiclass` <1e-6. #575. |
+//! | REQ-2 (predict argmax) | SHIPPED | `Predict::predict` argmax of `raw_decision` (numpy first-NaN-wins replicated). Test `qda_predict_multiclass`. #576. |
+//! | REQ-3 (predict_proba softmax) | SHIPPED | `FittedQDA::predict_proba`. Test `qda_predict_proba_multiclass` <1e-6. #577. |
+//! | REQ-5 (reg_param) | SHIPPED | `with_reg_param`; `scalings = (1-reg)·(S²/(n_k-1)) + reg` (== sklearn singular-value blend). Test `qda_reg_param`. #579. |
+//! | REQ-8 (covariance n_k-1 normalization) | SHIPPED | `S²/(n_k-1)` in `fn fit` (`discriminant_analysis.py:948`). |
+//! | REQ-10 (tol + rank-deficient SVD, no error) | SHIPPED | `with_tol` (default 1e-4); `rank = Σ(S>tol)`, collinearity warning, no error (`:945-947`). Test `qda_rank_deficient_class` (`predict == [0;8]`). #583. |
+//! | REQ-11 (scalings_/rotations_/means_ attrs) | SHIPPED | `FittedQDA::{scalings,rotations,means}` (`:948-954`). Test `qda_scalings_rotations`. #584. |
+//! | REQ-4 (predict_log_proba pin + consumer) | NOT-STARTED | #578. |
+//! | REQ-6 (provided priors) | NOT-STARTED | #580 (constructor `priors` arg). |
+//! | REQ-7 (binary decision_function shape `(n,)`) | NOT-STARTED | #581 (binding-ABI layer, cf. logistic #454; lib returns `(n,2)`, binding applies `col1-col0`). |
+//! | REQ-9 (store_covariance + covariance_) | NOT-STARTED | #582. |
+//! | REQ-12 (ferray array-type substrate) | NOT-STARTED | #585 (per-class SVD already on `ferray::linalg::svd`; owned array still `ndarray`, crate-wide-deferred cf. ridge #391). |
 //!
 //! # Examples
 //!
