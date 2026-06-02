@@ -402,6 +402,104 @@ fn lda_provided_priors() {
     );
 }
 
+/// #603 (REQ-7): sklearn LDA `fit` rejects negative provided priors
+/// (`discriminant_analysis.py:607-608`, `if xp.any(self.priors_ < 0): raise
+/// ValueError("priors must be non-negative")`). UNLIKE QDA, LDA validates the
+/// provided `priors_`. ferrolearn previously used them verbatim; it must now
+/// `Err`.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,0.5],[0.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); L(priors=[-0.1,1.1]).fit(X,y)"
+/// # ValueError: priors must be non-negative
+/// ```
+#[test]
+fn lda_priors_negative_rejected() {
+    let x = pp_x();
+    let y = pp_y(); // 2 classes
+    let result = LDA::<f64>::new(None)
+        .with_priors(array![-0.1, 1.1])
+        .fit(&x, &y);
+    assert!(
+        result.is_err(),
+        "negative provided priors must error (sklearn raises ValueError, \
+         discriminant_analysis.py:607-608)"
+    );
+}
+
+/// #603 (REQ-7): sklearn LDA `fit` renormalizes the provided priors when they
+/// do not sum to 1 (`discriminant_analysis.py:610-612`, `if
+/// xp.abs(xp.sum(self.priors_) - 1.0) > 1e-5: warnings.warn(...); self.priors_
+/// = self.priors_ / self.priors_.sum()`). With `priors=[0.5, 0.6]` (sum 1.1),
+/// `priors_` becomes `[0.4545..., 0.5454...]` and `predict_proba` matches the
+/// live oracle (which renormalizes internally) to 1e-6.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np,warnings; \
+///   from sklearn.discriminant_analysis import LinearDiscriminantAnalysis as L; \
+///   X=np.array([[0.,0.],[1.,1.],[2.,0.5],[0.5,2.],[5.,5.],[6.,4.5],[4.5,6.],[5.5,5.5]]); \
+///   y=np.array([0,0,0,0,1,1,1,1]); warnings.simplefilter('ignore'); \
+///   m=L(priors=[0.5,0.6]).fit(X,y); \
+///   print(repr(m.priors_.tolist()), repr(m.predict_proba(X).tolist()))"
+/// # [0.45454545454545453, 0.5454545454545454]
+/// # [[1.0, 4.77e-30], [1.0, 1.90e-20], [1.0, 4.77e-18], [1.0, 4.77e-18],
+/// #  [0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]
+/// ```
+#[test]
+fn lda_priors_renormalized() {
+    // Live sklearn 1.5.2 renormalized `priors_` for the provided [0.5, 0.6].
+    const SK_PRIORS: [f64; 2] = [0.45454545454545453, 0.5454545454545454];
+    // Live sklearn 1.5.2 predict_proba with priors=[0.5, 0.6] (renormalized).
+    const SK_PROBA: [[f64; 2]; 8] = [
+        [1.0, 4.7707614513299825e-30],
+        [1.0, 1.900122111878563e-20],
+        [1.0, 4.773423474470688e-18],
+        [1.0, 4.773423474470688e-18],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+        [0.0, 1.0],
+    ];
+
+    let x = pp_x();
+    let y = pp_y();
+
+    let fitted = LDA::<f64>::new(None)
+        .with_priors(array![0.5, 0.6])
+        .fit(&x, &y)
+        .unwrap();
+
+    // priors_ is renormalized to sum 1 (sklearn :610-612).
+    let priors = fitted.priors();
+    assert_eq!(priors.len(), 2);
+    for c in 0..2 {
+        assert!(
+            (priors[c] - SK_PRIORS[c]).abs() < 1e-12,
+            "renormalized priors_[{c}]: sklearn {}, ferrolearn {}",
+            SK_PRIORS[c],
+            priors[c]
+        );
+    }
+
+    // predict_proba matches the live oracle (which renormalizes internally).
+    let proba = fitted.predict_proba(&x).unwrap();
+    assert_eq!(proba.dim(), (8, 2), "predict_proba shape");
+    for i in 0..8 {
+        for c in 0..2 {
+            assert!(
+                (proba[[i, c]] - SK_PROBA[i][c]).abs() < 1e-6,
+                "renormalized predict_proba[{i}][{c}]: sklearn {}, ferrolearn {}",
+                SK_PROBA[i][c],
+                proba[[i, c]]
+            );
+        }
+    }
+}
+
 /// #593 (REQ-7, R-DEV-4): a `priors` vector whose length does not match the
 /// number of classes is rejected (sklearn would silently mis-index it when
 /// computing `xbar_`/`intercept_`, `:517,540,557`). `with_priors([0.3,0.3,0.4])`

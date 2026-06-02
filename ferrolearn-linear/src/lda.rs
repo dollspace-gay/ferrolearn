@@ -49,7 +49,7 @@
 //! | REQ-3 (predict_proba prior-aware) | SHIPPED | `FittedLDA::predict_proba` = `softmax(decision_function)` (`discriminant_analysis.py:711`); rows sum to 1. Test `lda_imbalanced_priors_predict` proba block <1e-6 vs live oracle. #590 (partial: multiclass softmax; binary `expit` collapse pends #600). |
 //! | REQ-5 (transform parity) | SHIPPED | `fn transform` = `((X - xbar_) @ scalings_)[:, :max_components]` (`discriminant_analysis.py:684-689`). Test `lda_transform_parity` <1e-6 (per-column sign) vs live oracle. #592. |
 //! | REQ-6 (n_components bound) | SHIPPED | `fn fit` computes `max_components = min(n_classes-1, n_features)`, defaults `None` to it, errors `Some(0)`/`Some(k>max)` (`discriminant_analysis.py:614-625`). Tests `test_lda_default_n_components`, `test_lda_error_zero_n_components`, `test_lda_error_n_components_too_large`. |
-//! | REQ-7 (priors: None=empirical + provided) | SHIPPED | `fn fit` resolves `priors_`: empirical `n_k/n` when `priors` is `None` (`discriminant_analysis.py:601-603`), else the provided `LDA::with_priors` array VERBATIM (`:605`); R-DEV-4 length check (`p.len() != n_classes` → `ShapeMismatch`, sklearn would mis-index `:540,557`). The resolved priors flow into `xbar_ = priors_ @ means_` (`:517`), the between-class scaling `sqrt(n·priors_·fac)` (`:540`), and `intercept_ += log(priors_)` (`:557`). `FittedLDA::priors` exposes `priors_`. (Empirical was already done; this commit completes provided.) Consumer: the resolved `priors` is read by `fn fit` (xbar_/scaling/intercept_); `Predict for FittedLDA` consumes the prior-shifted decision. Tests: `lda_imbalanced_priors_predict` (empirical `[0.9091,0.0909]` flips the label), `lda_provided_priors` (`with_priors([0.9,0.1])` `predict_proba` <1e-6 vs live oracle; empirical default differs). #593. |
+//! | REQ-7 (priors: None=empirical + provided) | SHIPPED | `fn fit` resolves `priors_`: empirical `n_k/n` when `priors` is `None` (`discriminant_analysis.py:601-603`), else the provided `LDA::with_priors` array, now VALIDATED like sklearn LDA (`:607-612`, unlike QDA): R-DEV-4 length check (`p.len() != n_classes` → `ShapeMismatch`, sklearn would mis-index `:540,557`); negative entries → `InvalidParameter` (`:607-608`, `raise ValueError("priors must be non-negative")`); renormalized `p / p.sum()` with an `eprintln!` warning (the crate's warning channel, cf. qda.rs) when `|Σ-1| > 1e-5` (`:610-612`). The resolved priors flow into `xbar_ = priors_ @ means_` (`:517`), the between-class scaling `sqrt(n·priors_·fac)` (`:540`), and `intercept_ += log(priors_)` (`:557`). `FittedLDA::priors` exposes `priors_`. Consumer: the resolved `priors` is read by `fn fit` (xbar_/scaling/intercept_); `Predict for FittedLDA` consumes the prior-shifted decision. Tests: `lda_imbalanced_priors_predict` (empirical `[0.9091,0.0909]` flips the label), `lda_provided_priors` (`with_priors([0.9,0.1])` `predict_proba` <1e-6 vs live oracle; empirical default differs), `lda_priors_negative_rejected` (`[-0.1,1.1]` → `Err`), `lda_priors_renormalized` (`[0.5,0.6]` → `priors_=[0.4545…,0.5454…]`, `predict_proba` <1e-6 vs the live oracle which renormalizes internally). #593, #603. |
 //! | REQ-8 (coef_/intercept_/xbar_) | SHIPPED | `FittedLDA::{coef, intercept, xbar}` accessors expose the `_solve_svd` arrays (`discriminant_analysis.py:556-559,517`). Consumer: `fn decision_function` reads `coef_`/`intercept_`; `fn transform` reads `xbar_`. Verified via `lda_decision_function_parity` (decision = `X@coef_.T+intercept_`) + `lda_transform_parity` (uses `xbar_`). |
 //! | REQ-13 (explained_variance_ratio_) | SHIPPED | `fn fit` sets `explained_variance_ratio_ = (S2²/ΣS2²)[:max_components]` from the SECOND (between-class) SVD (`discriminant_analysis.py:550-552`). Test `test_lda_explained_variance_ratio_oracle` <1e-9 vs live `L().explained_variance_ratio_`. #599. |
 //! | REQ-4 (predict_log_proba smallest_normal floor) | SHIPPED | `FittedLDA::predict_log_proba` mirrors sklearn exactly (`discriminant_analysis.py:713-737`): `predict_proba` then `prediction[prediction == 0.0] += smallest_normal` (`F::min_positive_value()` = numpy `finfo.smallest_normal`, `:729-736`) before `log`, so nonzero probas keep their true `ln` and exact zeros become `log(MIN_POSITIVE)` (not `-inf`). Consumer: shares `FittedLDA::predict_proba` (the `Predict` path). Test `lda_predict_log_proba` (overlapping 3-class, all-finite log-probas) <1e-6 vs live `LinearDiscriminantAnalysis().predict_log_proba`. #591. |
@@ -572,7 +572,32 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
                         context: "LDA: priors length must match number of classes".into(),
                     });
                 }
-                p.clone()
+                let mut p = p.clone();
+                // sklearn rejects negative priors (:607-608,
+                // `if xp.any(self.priors_ < 0): raise ValueError("priors must
+                // be non-negative")`).
+                if p.iter().any(|&v| v < <F as num_traits::Zero>::zero()) {
+                    return Err(FerroError::InvalidParameter {
+                        name: "priors".into(),
+                        reason: "priors must be non-negative".into(),
+                    });
+                }
+                // sklearn renormalizes (with a UserWarning) when the priors do
+                // not sum to 1 (:610-612, `if xp.abs(xp.sum(self.priors_) - 1.0)
+                // > 1e-5: warnings.warn(...); self.priors_ = self.priors_ /
+                // self.priors_.sum()`). FerroError has no warning channel; the
+                // crate emits warnings via `eprintln!` (cf. qda.rs collinearity
+                // warning, `discriminant_analysis.py:947`). The observable
+                // contract is the renormalized `priors_`.
+                let s = p.sum();
+                let tol_sum = F::from(1e-5).unwrap_or_else(F::epsilon);
+                if (s - <F as num_traits::One>::one()).abs() > tol_sum {
+                    eprintln!("The priors do not sum to 1. Renormalizing");
+                    for v in p.iter_mut() {
+                        *v /= s;
+                    }
+                }
+                p
             }
         };
 
