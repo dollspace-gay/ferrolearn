@@ -43,6 +43,49 @@
 //! let fitted = model.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.labels().len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. **`SpectralClustering` has NO PyO3 binding** — there is
+//! no `_RsSpectralClustering` and no `ferrolearn.SpectralClustering` (confirmed
+//! by grep: zero `SpectralClustering`/`RsSpectral` hits under
+//! `ferrolearn-python/`). The non-test production consumer is therefore the
+//! crate re-export at the crate root (`pub use
+//! spectral::{FittedSpectralClustering, SpectralClustering}` in
+//! `ferrolearn-cluster/src/lib.rs`), exposing `fit` / `fit_predict` /
+//! `labels()`. **Honest underclaim (R-HONEST-3): this unit is a SIMPLIFIED
+//! spectral-clustering VARIANT and does NOT achieve `SpectralClustering` label
+//! parity** — the embedding diverges (ferrolearn row-L2-normalized top-k of
+//! `D^{-1/2}AD^{-1/2}` vs sklearn `_spectral_embedding` bottom-k of
+//! `I − D^{-1/2}AD^{-1/2}` scaled by `1/dd`), affinity/assign_labels modes and
+//! most params are missing, and there is no binding. The ONLY contract that
+//! VALUE-matches the live oracle with a real consumer is gamma/`n_clusters`
+//! parameter validation (the gamma `[0, inf)` interval just landed via #930).
+//! Green verification = the in-tree `spectral` lib tests plus the live-sklearn
+//! pins / guards (`ferrolearn-cluster/tests/divergence_spectral.rs`): the RED
+//! pin `divergence_spectral_gamma_zero_allowed` (#930), now PASSING after the
+//! over-rejection fix; plus the green guards
+//! `green_spectral_gamma_negative_rejected` (#930),
+//! `green_spectral_n_clusters_zero_rejected`,
+//! `green_spectral_insufficient_samples`. Cites use symbol anchors (ferrolearn)
+//! / `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle = installed
+//! sklearn 1.5.2. (REQ numbering follows `.design/cluster/spectral.md`.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-7 (gamma `[0, inf)` validation: `gamma >= 0` accepted / `gamma < 0` rejected; `n_clusters >= 1`; `n_samples >= n_clusters`) | SHIPPED (validation contract only) | `fn fit` for `SpectralClustering` rejects ONLY `self.gamma < F::zero()` with `FerroError::InvalidParameter { name: "gamma", reason: "gamma must be >= 0 (sklearn Interval[0, inf))" }`, mirroring `SpectralClustering._parameter_constraints["gamma"] = Interval(Real, 0, None, closed="left")` (`_spectral.py:612`) — `gamma = 0.0` is INSIDE the closed-left interval so it is ACCEPTED (RBF collapses to all-ones affinity); `n_clusters == 0` rejected per `Interval(Integral, 1, None, closed="left")` (`_spectral.py:607`); `n_samples < n_clusters` rejected with `FerroError::InsufficientSamples`. Non-test consumer: crate re-export of `fit` / `fit_predict` / `labels()` (`lib.rs`). Verified: green pin `divergence_spectral_gamma_zero_allowed` (#930, now PASSING after the over-rejection fix): `with_gamma(0.0).fit(X, &())` returns `Ok` (sklearn `SpectralClustering(gamma=0.0).fit(X)` runs, NO error); green guards `green_spectral_gamma_negative_rejected` (`with_gamma(-1.0).fit` → `Err`), `green_spectral_n_clusters_zero_rejected` (`new(0).fit` → `Err`), `green_spectral_insufficient_samples` (`new(3).fit(X_1row)` → `Err`). GAP (NOT-STARTED, REQ-6): `n_clusters=8` default and the sklearn `InvalidParameterError`/`ValueError` error ABI are absent — ferrolearn requires `n_clusters` and uses `FerroError`. |
+//! | REQ-1 (RBF affinity VALUE) | NOT-STARTED | open prereq blocker **#934**. `fn affinity_matrix` computes `exp(-gamma*||xi-xj||^2)` (diagonal forced `1.0`), VALUE-matching `pairwise_kernels(X, metric='rbf')` (`_spectral.py:730`) to full f64 precision (`rbf_kernel(blobs, gamma=0.1)[0,1] = 0.9950124791926823`). BUT `fn affinity_matrix` is a PRIVATE helper with no public accessor and no non-test consumer (no `affinity_matrix_`, REQ-8) — cannot be SHIPPED standalone (R-HONEST-2/R-DEFER-1). |
+//! | REQ-2 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker **#929** (depends on #934 KMeans). `fit` / `fit_predict` produce `labels_` via a DIFFERENT pipeline (`fn normalized_laplacian` + `fn top_k_eigenvectors` + `fn row_normalize` + ferrolearn `KMeans`) than sklearn `_spectral_embedding` + `k_means` (`_spectral.py:756-766`). On `make_circles(…, random_state=0)` at `gamma=10`, sklearn vs ferrolearn `fit_predict` differ at indices 10,19 (2/30). Agreement on blobs / circles@0.1 is COINCIDENTAL (shared subspace) — NOT value parity. |
+//! | REQ-3 (spectral embedding algorithm — `I − D^{-1/2}AD^{-1/2}` + `embedding/dd` + sign-flip) | NOT-STARTED | open prereq blocker **#929**. sklearn `_spectral_embedding` (`_spectral_embedding.py:300-469`): `L = csgraph_laplacian(A, normed=True) = I − D^{-1/2}AD^{-1/2}` (`:333`), SMALLEST-eigenvalue eigenvectors, `embedding = embedding / dd` (`:378`/`:443`), `_deterministic_vector_sign_flip` (`:465`). ferrolearn `fn normalized_laplacian` builds `D^{-1/2}AD^{-1/2}` (NO `I−`), `fn top_k_eigenvectors` takes the LARGEST, `fn row_normalize` does unit-L2 per row (NOT `/dd`), no sign flip — blobs `gamma=0.1` sklearn embedding row-magnitude ≈ `0.158` (`=1/dd`) vs ferrolearn `1.0`. The root-cause divergence. |
+//! | REQ-4 (affinity modes nearest_neighbors/precomputed/poly/sigmoid) | NOT-STARTED | open prereq blocker **#931**. sklearn builds affinity via `kneighbors_graph` (`'nearest_neighbors'`, `:709-713`), passthrough (`'precomputed'`, `:720-721`), or any `pairwise_kernels` metric (`:730`). ferrolearn `fn affinity_matrix` is hard-coded RBF only; no `affinity` parameter. |
+//! | REQ-5 (assign_labels discretize/cluster_qr) | NOT-STARTED | open prereq blocker **#932**. sklearn `assign_labels ∈ {'kmeans','discretize','cluster_qr'}` (`_spectral.py:625`, branch `:755-766`). ferrolearn `fn fit` hard-codes `KMeans`; no `assign_labels` parameter. |
+//! | REQ-6 (missing params eigen_solver/n_components/eigen_tol/n_neighbors/degree/coef0/kernel_params/n_jobs/verbose/affinity + `n_clusters=8` default) | NOT-STARTED | open prereq blocker **#933**. sklearn `__init__` (`_spectral.py:633-666`) takes 16 params with `n_clusters=8` default (`:635`). `SpectralClustering<F>` (`fn new` + builders) has only `n_clusters` (REQUIRED, no default) / `gamma` / `n_init` / `random_state`. |
+//! | REQ-8 (fitted attrs `affinity_matrix_`/`n_features_in_`) | NOT-STARTED | open prereq blocker **#934**. sklearn exposes `affinity_matrix_` + `n_features_in_` (`_spectral.py:524-538`). `FittedSpectralClustering<F>` stores only private `labels_` (+ `PhantomData`), exposes only `labels()`. No `affinity_matrix_` accessor — so the value-matching affinity (REQ-1) has no consumer. |
+//! | REQ-9 (KMeans assign-labels parity) | NOT-STARTED | open prereq blocker **#934** (kmeans.rs unit). sklearn `k_means(maps, n_clusters, n_init, random_state)` uses k-means++ init with NumPy RNG (`_spectral.py:756`). ferrolearn `KMeans::new(k).with_n_init` is a separate unit with its own init/RNG — even a matched embedding would not guarantee identical labels. |
+//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker **#935**. `grep -rln SpectralClustering ferrolearn-python/` is EMPTY — no `_RsSpectralClustering`, so `import ferrolearn` cannot reach `SpectralClustering`. The only non-test consumer of `fit` / `fit_predict` / `labels()` is the crate re-export (`lib.rs`). |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#935**. `spectral.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `ferrolearn_core::NdarrayFaerBackend` (`eigh`); not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
 
 use crate::kmeans::KMeans;
 use ferrolearn_core::NdarrayFaerBackend;
@@ -93,7 +136,7 @@ impl<F: Float> SpectralClustering<F> {
 
     /// Set the RBF kernel parameter `gamma`.
     ///
-    /// Must be positive.
+    /// Must be non-negative (`>= 0`).
     #[must_use]
     pub fn with_gamma(mut self, gamma: F) -> Self {
         self.gamma = gamma;
@@ -224,7 +267,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SpectralClustering
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `n_clusters == 0`, `gamma <= 0`,
+    /// - [`FerroError::InvalidParameter`] if `n_clusters == 0`, `gamma < 0`,
     ///   or `n_init == 0`.
     /// - [`FerroError::InsufficientSamples`] if `n_samples < n_clusters`.
     /// - [`FerroError::NumericalInstability`] if the eigendecomposition fails.
@@ -238,10 +281,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SpectralClustering
                 reason: "must be at least 1".into(),
             });
         }
-        if self.gamma <= F::zero() {
+        if self.gamma < F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "gamma".into(),
-                reason: "must be positive".into(),
+                reason: "gamma must be >= 0 (sklearn Interval[0, inf))".into(),
             });
         }
         if n_samples == 0 {
@@ -397,12 +440,16 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_gamma_zero() {
+    fn test_gamma_zero_allowed() {
+        // sklearn `gamma: Interval(Real, 0, None, closed="left")`
+        // (_spectral.py:612) → [0.0, inf), so gamma=0.0 is ACCEPTED (RBF
+        // collapses to an all-ones affinity). Mirror that contract (R-HONEST-4):
+        // the prior assertion `is_err()` pinned a non-sklearn over-rejection.
         let x = two_blobs();
         let result = SpectralClustering::<f64>::new(2)
             .with_gamma(0.0)
             .fit(&x, &());
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
