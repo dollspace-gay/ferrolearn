@@ -26,12 +26,76 @@ fn argsort_desc<F: Float>(arr: &Array1<F>) -> Vec<usize> {
     indices
 }
 
-/// Compute the raw DCG at position `k` given a relevance ordering.
-fn compute_dcg<F: Float>(relevances: &[F], k: usize) -> F {
+/// Per-rank discount cumulative sum: `discount[i] = 1 / log2(i + 2)`, with
+/// `discount[i] = 0` for `i >= k` (the DCG@k cutoff zeroes the discount past
+/// rank `k` *before* the cumsum), then cumulative-summed over all `n` ranks.
+///
+/// Mirrors sklearn `_dcg_sample_scores` (`sklearn/metrics/_ranking.py:1511-1519`).
+fn discount_cumsum<F: Float>(n: usize, k: usize) -> Vec<F> {
+    let mut cum = Vec::with_capacity(n);
+    let mut acc = F::zero();
+    for i in 0..n {
+        if i < k {
+            // discount_i = 1 / log2(i + 2)
+            let d = F::one() / F::from(i + 2).unwrap_or_else(F::one).log2();
+            acc = acc + d;
+        }
+        cum.push(acc);
+    }
+    cum
+}
+
+/// Compute the raw DCG with sklearn's default tie-averaging (`ignore_ties=False`).
+///
+/// Samples tied on `y_score` (in the descending-score order) form a group; each
+/// group's gain is the mean `y_true` of its members times the sum of discounts
+/// over the consecutive ranks the group spans. With all scores distinct this
+/// reduces to the plain `sum_i y_true[ranked_i] / log2(i + 2)`.
+///
+/// Mirrors sklearn `_tie_averaged_dcg` (`sklearn/metrics/_ranking.py:1565-1573`).
+fn compute_dcg_tie_averaged<F: Float>(y_true: &Array1<F>, y_score: &Array1<F>, k: usize) -> F {
+    let n = y_true.len();
+    let cum = discount_cumsum::<F>(n, k);
+
+    // Order samples by descending y_score (ties keep their relative index order),
+    // then walk consecutive equal-score runs as groups.
+    let ranked_indices = argsort_desc(y_score);
+
+    let mut dcg = F::zero();
+    let mut prev_group_end_cumsum = F::zero();
+    let mut group_start = 0usize;
+    while group_start < n {
+        // Extend the group while the score equals the group's first score.
+        let group_score = y_score[ranked_indices[group_start]];
+        let mut group_end = group_start;
+        let mut gain_sum = F::zero();
+        let mut count = 0usize;
+        while group_end < n && y_score[ranked_indices[group_end]] == group_score {
+            gain_sum = gain_sum + y_true[ranked_indices[group_end]];
+            count += 1;
+            group_end += 1;
+        }
+        // Last 0-based rank index this group spans is `group_end - 1`.
+        let group_cumsum = cum[group_end - 1];
+        let discount_sum = group_cumsum - prev_group_end_cumsum;
+        let count_f = F::from(count).unwrap_or_else(F::one);
+        let mean_gain = gain_sum / count_f;
+        dcg = dcg + mean_gain * discount_sum;
+
+        prev_group_end_cumsum = group_cumsum;
+        group_start = group_end;
+    }
+    dcg
+}
+
+/// Compute the raw DCG ignoring ties (plain DCG over a pre-sorted relevance
+/// ordering). Used for the ideal/normalizing DCG, where sklearn passes
+/// `ignore_ties=True` (`sklearn/metrics/_ranking.py:1753`).
+fn compute_dcg_plain<F: Float>(relevances: &[F], k: usize) -> F {
     let mut dcg = F::zero();
     for (i, &rel) in relevances.iter().take(k).enumerate() {
         // DCG_i = rel_i / log2(i + 2)
-        let denom = F::from(i + 2).unwrap().log2();
+        let denom = F::from(i + 2).unwrap_or_else(F::one).log2();
         dcg = dcg + rel / denom;
     }
     dcg
@@ -94,10 +158,7 @@ pub fn dcg_score<F: Float + Send + Sync + 'static>(
     }
 
     let k = k.unwrap_or(n).min(n);
-    let ranked_indices = argsort_desc(y_score);
-    let ranked_relevances: Vec<F> = ranked_indices.iter().map(|&i| y_true[i]).collect();
-
-    Ok(compute_dcg(&ranked_relevances, k))
+    Ok(compute_dcg_tie_averaged(y_true, y_score, k))
 }
 
 /// Compute the Normalized Discounted Cumulative Gain (NDCG).
@@ -163,17 +224,26 @@ pub fn ndcg_score<F: Float + Send + Sync + 'static>(
         });
     }
 
+    // sklearn/metrics/_ranking.py:1868-1869: raise ValueError when y_true.min() < 0
+    if y_true.iter().any(|&v| v < F::zero()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y_true".into(),
+            reason: "ndcg_score should not be used on negative y_true values".into(),
+        });
+    }
+
     let k = k.unwrap_or(n).min(n);
 
-    // Actual DCG: sort by y_score descending.
-    let ranked_indices = argsort_desc(y_score);
-    let ranked_relevances: Vec<F> = ranked_indices.iter().map(|&i| y_true[i]).collect();
-    let dcg = compute_dcg(&ranked_relevances, k);
+    // Actual DCG: tie-averaged over the order induced by y_score (sklearn
+    // default ignore_ties=False).
+    let dcg = compute_dcg_tie_averaged(y_true, y_score, k);
 
-    // Ideal DCG: sort y_true descending.
+    // Ideal (normalizing) DCG: sort y_true descending. sklearn normalizes with
+    // ignore_ties=True (_ranking.py:1753) — permuting tied y_true entries does
+    // not change the re-ordered relevances, so the plain DCG is used here.
     let mut ideal_relevances: Vec<F> = y_true.iter().copied().collect();
     ideal_relevances.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let ideal_dcg = compute_dcg(&ideal_relevances, k);
+    let ideal_dcg = compute_dcg_plain(&ideal_relevances, k);
 
     if ideal_dcg == F::zero() {
         return Ok(F::zero());
@@ -340,14 +410,16 @@ where
     let n_labels = y_true.ncols();
 
     let mut totals = F::zero();
-    let mut counted = 0usize;
     for i in 0..n_samples {
         let row_true = y_true.row(i);
         let row_score = y_score.row(i);
         let positives: Vec<usize> = (0..n_labels).filter(|&j| row_true[j] > 0).collect();
         let negatives: Vec<usize> = (0..n_labels).filter(|&j| row_true[j] == 0).collect();
         if positives.is_empty() || negatives.is_empty() {
-            // Degenerate samples contribute 0 to the loss in sklearn.
+            // Degenerate rows (all-relevant or all-irrelevant) contribute 0 to
+            // the loss and are still counted in the denominator.
+            // sklearn/metrics/_ranking.py:1463-1465: loss[i] = 0 for degenerate
+            // rows, then `np.average(loss, ...)` divides by n_samples.
             continue;
         }
         let mut bad_pairs = 0usize;
@@ -361,13 +433,12 @@ where
         let denom = positives.len() * negatives.len();
         let frac = F::from(bad_pairs).unwrap_or(F::zero()) / F::from(denom).unwrap_or(F::one());
         totals = totals + frac;
-        counted += 1;
     }
-    if counted == 0 {
-        return Ok(F::zero());
-    }
-    let n_f = F::from(counted).ok_or_else(|| FerroError::InvalidParameter {
-        name: "counted".into(),
+    // Divide by n_samples (not by the non-degenerate count) so that degenerate
+    // rows contribute 0 to the average — matching sklearn's np.average call at
+    // sklearn/metrics/_ranking.py:1465.
+    let n_f = F::from(n_samples).ok_or_else(|| FerroError::InvalidParameter {
+        name: "n_samples".into(),
         reason: "could not convert".into(),
     })?;
     Ok(totals / n_f)
