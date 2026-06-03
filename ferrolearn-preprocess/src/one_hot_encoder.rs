@@ -9,6 +9,29 @@
 //! Input column with categories {0, 1, 2}:
 //!   [0, 1, 2, 1]  →  [[1,0,0],[0,1,0],[0,0,1],[0,1,0]]
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_encoders.py` (`class OneHotEncoder`
+//! `:458`). Design doc: `.design/preprocess/one_hot_encoder.md`. Expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export (`lib.rs:120`, grandfathered S5).
+//! HONEST (R-HONEST-3): ferrolearn ships a SIMPLIFIED integer-only DENSE encoder — `fit` learns
+//! `n_categories[j]=max(col)+1` (assumes contiguous `0..max`), NOT sklearn's `categories_=_unique`
+//! sorted-set. It matches sklearn `sparse_output=False` dense output ONLY for contiguous `0..max`
+//! integer columns; non-contiguous/string categories, sparse-by-default, and most of sklearn's
+//! surface DIVERGE structurally and are NOT-STARTED. Verify-and-document iteration.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (dense one-hot of contiguous 0..max integer columns) | SHIPPED (scoped) | `Transform::transform for FittedOneHotEncoder` zero-fills then sets `out[[i, col_offset+cat]]=1` per element (per-column offset layout), mirroring `_BaseEncoder._transform` one-hot (`_encoders.py:186-`). Critic-verified bit-identical to live sklearn `sparse_output=False`: `guard_single_contiguous_column/multi_column_contiguous/within_block_column_order/fit_transform_equals_*/out_of_range_both_error/zero_row_fit_both_error` in `tests/divergence_one_hot_encoder.rs` (6 green). Consumer: re-export `lib.rs:120`. CAVEAT: only when each column is contiguous `0..max` integers (where `max+1==len(_unique)`); else REQ-3. |
+//! | REQ-2 (sparse-by-default output) | NOT-STARTED | open prereq blocker #1149. Dense `Array2<F>` only; sklearn defaults `sparse_output=True` → scipy CSR (`:531`,`:748`). |
+//! | REQ-3 (categories_ = sorted unique set) | NOT-STARTED | open prereq blocker #1150 (STRUCTURAL HEADLINE). `fit` uses `max(col)+1`, not `categories_=_unique(col)` (`_fit:99`); diverges on non-contiguous integers ([2,5,9]: ferro 10 cols vs sklearn 3) + cannot represent strings/floats. Not minimal-fixable. |
+//! | REQ-4 (handle_unknown + set-membership error) | NOT-STARTED | open prereq blocker #1151. Error is `cat>=max+1` (`InvalidParameter`), not `categories_` membership (sklearn `ValueError`); no `ignore`/`infrequent_if_exist` (`:541`). R-DEV-2. |
+//! | REQ-5 (drop + infrequent grouping) | NOT-STARTED | open prereq blocker #1152. No `drop` (`:498-516`) / `min_frequency`/`max_categories` (`:566-`). |
+//! | REQ-6 (inverse_transform + get_feature_names_out) | NOT-STARTED | open prereq blocker #1153. Neither (`:1068`, `:1187`). |
+//! | REQ-7 (ctor + dtype + _parameter_constraints) | NOT-STARTED | open prereq blocker #1154. `new()` takes no params/validates nothing (`:728-762`). |
+//! | REQ-8 (PyO3 binding) | NOT-STARTED | open prereq blocker #1155. No `ferrolearn-python` registration (R-DEFER-1). |
+//! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #1156. `ndarray::Array2`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
