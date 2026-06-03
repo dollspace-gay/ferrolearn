@@ -42,6 +42,37 @@
 //! let labels = fitted.predict(&x).unwrap();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/mixture/_bayesian_mixture.py`
+//! (`class BayesianGaussianMixture`) + `sklearn/mixture/_base.py` (`BaseMixture`).
+//! Design doc: `.design/cluster/bayesian_gmm.md`. Cites use ferrolearn symbol
+//! anchors / sklearn `file:line` (commit 156ef14); expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). **Structural carve-out (honesty headline):
+//! `bayesian_gmm.rs` is a HEURISTIC plain ML-EM approximation, NOT sklearn's
+//! variational Bayes** — no digamma-weight E-step, no Wishart precisions
+//! (`degrees_of_freedom_`/`mean_precision_`/`precisions_cholesky_`), the `Full`/`Tied`
+//! responsibility/score path reads only the covariance DIAGONAL (`compute_responsibilities`
+//! `Full | Tied` arm), and `lower_bound_` is a proxy (mean responsibility log-likelihood),
+//! not the true ELBO. There is NO PyO3 binding (only `_RsGaussianMixture` for the plain
+//! GMM). Only consumer is the crate re-export.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION matches sklearn) | NOT-STARTED | open prereq blocker #1067. ferrolearn does NOT replicate sklearn's automatic DP component pruning, so the partition diverges whenever sklearn prunes: on two blobs at (0,0)/(20,20) with `n_components=5`, live sklearn prunes to ONE dominant component (`fit_predict -> [1;8]`, `weights_ ~ [0.12,0.86,...]`) while ferrolearn keeps two. A prior draft green-guarded a FABRICATED 2-blob expected (R-CHAR-3 violation) — removed (R-HONEST-4). The `char_bgm_three_blob_no_prune_partition_matches_sklearn` characterization (live-oracle-verified) shows they coincide ONLY on no-prune fixtures; the general partition-match is gated on the VB/DP algorithm (REQ-3 #1057). |
+//! | REQ-2 (API/output contracts: predict_proba row-stochastic, weights sum to 1, shapes) | SHIPPED | impl `predict_proba` (`compute_responsibilities`) rows sum to 1 over `(n_samples, n_components)`; `weights()` sums to 1; `means()` `(n_components, n_features)`; `score_samples` `(n_samples,)`. Consumer: crate re-export. Guards: `green_req2_predict_proba_shape_and_row_stochastic`, `green_req2_weights_sum_to_one`, `green_req2_means_and_score_samples_shapes`. Underclaim: shape/stochasticity CONTRACT only — VALUES diverge (heuristic, REQ-3/REQ-4/REQ-5). |
+//! | REQ-9 (matching defaults) | SHIPPED | impl `fn new` defaults `covariance_type=Full`, `max_iter=100`, `tol=1e-3`, `weight_concentration_prior_type=DirichletProcess` = sklearn `covariance_type="full"`/`max_iter=100`/`tol=1e-3`/`weight_concentration_prior_type="dirichlet_process"` (`_bayesian_mixture.py:373,374,376,379`). Guard: `green_req9_defaults_match_sklearn_observably`. |
+//! | REQ-3 (variational Bayes E/M — digamma weights + Wishart precisions) | NOT-STARTED | open prereq blocker #1057. sklearn `_estimate_log_prob_resp` (digamma `_estimate_log_weights` + Wishart `_estimate_log_prob`) + conjugate M-step (`_estimate_weights`/`_estimate_means` mean_precision shrinkage/`_estimate_precisions` inverse-Wishart); ferrolearn `fn run_variational_em` does plain ML mean/cov + simplified Dirichlet `alpha`. Whole algorithm diverges (builder-scale). |
+//! | REQ-4 (Full/Tied full-covariance Mahalanobis) | NOT-STARTED | open prereq blocker #1058. `compute_responsibilities`/`unnormalized_log_prob` `Full \| Tied` arm reads only the diagonal `covariances[[offset+j, j]]` (comment "diagonal only for robustness"), using `Σ d²/var_jj` not the true `dᵀΣ⁻¹d` + `log\|Σ\|` — wrong on correlated data (merges close-axis blobs). Needs full-cov Cholesky-solve rewrite. |
+//! | REQ-5 (true ELBO `lower_bound_`) | NOT-STARTED | open prereq blocker #1059. sklearn `_compute_lower_bound` includes Dirichlet/Wishart KL terms; ferrolearn `elbo` = mean over samples of `logsumexp(log resp)` (a proxy). |
+//! | REQ-6 (Bayesian fitted attributes) | NOT-STARTED | open prereq blocker #1060. sklearn exposes `weight_concentration_`/`mean_precision_`/`degrees_of_freedom_`/`precisions_`/`precisions_cholesky_`; `FittedBayesianGaussianMixture` exposes `weights_`/`means_`/`covariances_`(ML)/`converged_`/`lower_bound_`(proxy)/`n_features_` only. |
+//! | REQ-7 (Bayesian priors + n_init/warm_start/reg_covar) | NOT-STARTED | open prereq blocker #1061. sklearn `mean_precision_prior`/`mean_prior`/`degrees_of_freedom_prior`/`covariance_prior` + `n_init`/`warm_start`/`reg_covar`; ferrolearn hardcodes `reg=1e-6`, has none of these. |
+//! | REQ-8 (`init_params` kmeans default + ctor surface + error ABI) | NOT-STARTED | open prereq blocker #1062. sklearn `init_params` default `'kmeans'` (+ k-means++/random/random_from_data); ferrolearn `fn init_means` samples k random rows + jitter. Plus `n_components=1` default + `InvalidParameterError` ABI. |
+//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1063. No `_RsBayesianGaussianMixture` (only `_RsGaussianMixture` for the plain GMM); `import ferrolearn` cannot reach `BayesianGaussianMixture`. |
+//! | REQ-11 (`n_iter_` attribute) | NOT-STARTED | open prereq blocker #1064. sklearn exposes `n_iter_`; ferrolearn has `converged_` but no `n_iter_`. |
+//! | REQ-12 (`random_state` numpy-RNG parity + None=nondeterministic) | NOT-STARTED | open prereq blocker #1065. sklearn `check_random_state` + numpy RNG (None nondeterministic); ferrolearn `StdRng`, `random_state.unwrap_or(42)` seeds 42 when None. Exact values blocked (R-SUBSTRATE-5). |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1066. `bayesian_gmm.rs` imports `ndarray`/`num-traits`/`rand`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
