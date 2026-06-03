@@ -7,8 +7,10 @@
 //! # Key design choices
 //!
 //! - **Feature binning**: continuous features are discretised into up to
-//!   `max_bins` (default 256) bins using quantile-based bin edges. NaN values
-//!   are assigned a dedicated bin.
+//!   `max_bins` (default 255) bins using scikit-learn's `_BinMapper` rule —
+//!   distinct-value midpoints when `n_unique <= max_bins`, otherwise
+//!   `np.percentile(method="midpoint")` thresholds. NaN values are assigned a
+//!   dedicated bin.
 //! - **Histogram-based split finding**: at each node, gradient/hessian sums are
 //!   accumulated into per-bin histograms, making split finding O(n_bins) instead
 //!   of O(n log n).
@@ -46,6 +48,36 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 8);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.ensemble.HistGradientBoostingClassifier` /
+//! `HistGradientBoostingRegressor` (`sklearn/ensemble/_hist_gradient_boosting/`).
+//! See `.design/tree/hist_gradient_boosting.md`. Non-test consumers: crate
+//! re-export + `RsHistGradientBoosting{Regressor,Classifier}` PyO3 bindings
+//! (`ferrolearn-python/src/extras.rs`).
+//!
+//! **Determinism:** `early_stopping='auto'` is OFF for `n_samples <= 10000`,
+//! so the default small-data fit is fully deterministic and end-to-end
+//! parity with sklearn is verified to ~1e-8 (regressor both binning branches
+//! and NaN routing; classifier binary and multiclass). `early_stopping`
+//! (validation split) and `max_features` introduce numpy-MT vs StdRng RNG
+//! boundaries.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Param default VALUES: `max_iter=100`, `learning_rate=0.1`, `min_samples_leaf=20`, `max_bins=255`, `l2_regularization=0.0`, `max_leaf_nodes=31` | SHIPPED |
+//! | REQ-2 | Binning thresholds: distinct-value midpoints (`n_unique<=max_bins`) else `np.percentile(method="midpoint")`, half-open `thr[i-1]<x<=thr[i]` (`binning.py:43-68`) | SHIPPED |
+//! | REQ-3 | Per-bin gradient/hessian histograms + subtraction trick | SHIPPED |
+//! | REQ-4 | Split gain `G_L²/(H_L+λ)+G_R²/(H_R+λ)-G_p²/(H_p+λ)` (`splitting.pyx`) | SHIPPED |
+//! | REQ-5 | Leaf value `-ΣG/(ΣH+λ)` + shrinkage by `learning_rate` (`grower.py`) | SHIPPED |
+//! | REQ-6 | Best-first grower / `max_leaf_nodes` / `min_samples_leaf` | SHIPPED |
+//! | REQ-7 | End-to-end parity (HGBR both branches + NaN; HGBC binary + multiclass) at `early_stopping` off, verified ~1e-8 | SHIPPED |
+//! | REQ-8 | Param NAME `n_estimators` → sklearn `max_iter` (R-DEV-2) | NOT-STARTED (#747) |
+//! | REQ-9 | `early_stopping`/`validation_fraction`/`n_iter_no_change`/`tol` | NOT-STARTED (#748, RNG boundary) |
+//! | REQ-10 | `max_features` per-split subsampling | NOT-STARTED (#749, RNG boundary) |
+//! | REQ-11 | Classifier sum-zero raw init (softmax-invariant; predict_proba already matches) | NOT-STARTED (#750) |
+//! | REQ-12 | ferray substrate migration | NOT-STARTED (#752) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -123,24 +155,47 @@ const NAN_BIN: u16 = u16::MAX;
 /// Bin edges for a single feature, plus the number of non-NaN bins.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FeatureBinInfo<F> {
-    /// Sorted bin edges (upper thresholds). `edges[b]` is the upper bound
-    /// for bin `b`. The last bin captures everything above `edges[len-2]`.
+    /// Sorted bin upper-bound thresholds (the increasing values separating
+    /// adjacent bins). A value `x` is mapped to bin `i` iff
+    /// `edges[i - 1] < x <= edges[i]`; values above the last threshold land
+    /// in the final bin. There are `n_bins - 1` thresholds (matching
+    /// scikit-learn's `_BinMapper.bin_thresholds_`).
     edges: Vec<F>,
-    /// Number of non-NaN bins for this feature (at most `max_bins`).
+    /// Number of non-NaN bins for this feature (`edges.len() + 1`, at most
+    /// `max_bins`).
     n_bins: u16,
     /// Whether any NaN was observed for this feature during binning.
     has_nan: bool,
 }
 
-/// Compute quantile-based bin edges for every feature.
+/// A large finite cap used in place of `+inf` thresholds, matching sklearn's
+/// `ALMOST_INF = 1e300` (`_hist_gradient_boosting/common.pyx`). `+inf`
+/// thresholds are reserved for "split on NaN" situations, which ferrolearn
+/// handles via the dedicated NaN bin instead.
+const ALMOST_INF: f64 = 1e300;
+
+/// Compute per-feature bin thresholds matching scikit-learn's
+/// `_BinMapper._find_binning_thresholds`
+/// (`sklearn/ensemble/_hist_gradient_boosting/binning.py:23-69`, v1.5.2).
+///
+/// For each feature, NaNs are dropped and the distinct values sorted. If the
+/// number of distinct values is `<= max_bins`, the thresholds are the
+/// consecutive midpoints `(distinct[i] + distinct[i+1]) / 2` (`binning.py:53-55`).
+/// Otherwise the thresholds are `np.percentile(col, p, method="midpoint")`
+/// over `p = linspace(0, 100, max_bins + 1)[1:-1]` (`binning.py:61-63`). All
+/// thresholds are clipped to `< ALMOST_INF` (`binning.py:68`). There is no
+/// trailing raw-max edge: a value above the last threshold maps to the final
+/// bin via the `edges[i-1] < x <= edges[i]` contract (`binning.py:43`).
 fn compute_bin_edges<F: Float>(x: &Array2<F>, max_bins: u16) -> Vec<FeatureBinInfo<F>> {
     let n_features = x.ncols();
     let n_samples = x.nrows();
     let mut infos = Vec::with_capacity(n_features);
+    let almost_inf = F::from(ALMOST_INF).unwrap_or_else(F::max_value);
+    let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
 
     for j in 0..n_features {
         let col = x.column(j);
-        // Separate non-NaN values and sort them.
+        // Separate non-NaN values and sort them (sklearn `np.sort`).
         let mut vals: Vec<F> = col.iter().copied().filter(|v| !v.is_nan()).collect();
         vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -156,48 +211,57 @@ fn compute_bin_edges<F: Float>(x: &Array2<F>, max_bins: u16) -> Vec<FeatureBinIn
             continue;
         }
 
-        // Deduplicate to find unique values.
+        // Deduplicate to find the distinct values (sklearn `np.unique`).
         let mut unique: Vec<F> = Vec::new();
         for &v in &vals {
-            if unique.is_empty() || (v - *unique.last().unwrap()).abs() > F::epsilon() {
+            let is_new = match unique.last() {
+                None => true,
+                Some(last) => (v - *last).abs() > F::epsilon(),
+            };
+            if is_new {
                 unique.push(v);
             }
         }
 
         let n_unique = unique.len();
-        let actual_bins = (max_bins as usize).min(n_unique);
+        let max_bins = max_bins as usize;
 
-        if actual_bins <= 1 {
-            // Only one unique value — one bin, edge is that value.
-            infos.push(FeatureBinInfo {
-                edges: vec![unique[0]],
-                n_bins: 1,
-                has_nan,
-            });
-            continue;
-        }
+        let mut edges: Vec<F> = if n_unique <= max_bins {
+            // binning.py:53-55 — midpoints between consecutive distinct values
+            // (length n_unique - 1; empty when there is a single distinct value).
+            (0..n_unique.saturating_sub(1))
+                .map(|i| (unique[i] + unique[i + 1]) * half)
+                .collect()
+        } else {
+            // binning.py:61-63 — np.percentile(col_data, p, method="midpoint")
+            // over p = linspace(0, 100, max_bins + 1)[1:-1] (length max_bins - 1).
+            // `vals` is already sorted, so we read percentiles directly off it.
+            let n = vals.len();
+            (1..max_bins)
+                .map(|k| {
+                    // p = 100 * k / max_bins  =>  rank = p/100 * (n - 1).
+                    let rank = (k as f64) / (max_bins as f64) * (n as f64 - 1.0);
+                    let lo = rank.floor() as usize;
+                    let hi = rank.ceil() as usize;
+                    if lo == hi {
+                        vals[lo]
+                    } else {
+                        // method="midpoint": (a[floor] + a[ceil]) / 2.
+                        (vals[lo] + vals[hi]) * half
+                    }
+                })
+                .collect()
+        };
 
-        // Compute quantile-based bin edges.
-        let mut edges = Vec::with_capacity(actual_bins);
-        for b in 1..actual_bins {
-            let frac = b as f64 / actual_bins as f64;
-            let idx_f = frac * (n_unique as f64 - 1.0);
-            let lo = idx_f.floor() as usize;
-            let hi = (lo + 1).min(n_unique - 1);
-            let t = F::from(idx_f - lo as f64).unwrap();
-            let edge = unique[lo] * (F::one() - t) + unique[hi] * t;
-            // Avoid duplicate edges.
-            if edges.is_empty() || (edge - *edges.last().unwrap()).abs() > F::epsilon() {
-                edges.push(edge);
+        // binning.py:68 — clip thresholds to < ALMOST_INF.
+        for e in &mut edges {
+            if *e > almost_inf {
+                *e = almost_inf;
             }
         }
-        // Add a final edge for the upper bound (max value).
-        let last = *unique.last().unwrap();
-        if edges.is_empty() || (last - *edges.last().unwrap()).abs() > F::epsilon() {
-            edges.push(last);
-        }
 
-        let n_bins = edges.len() as u16;
+        // n_bins_non_missing = thresholds + 1 (binning.py:235).
+        let n_bins = (edges.len() + 1) as u16;
         infos.push(FeatureBinInfo {
             edges,
             n_bins,
@@ -208,7 +272,13 @@ fn compute_bin_edges<F: Float>(x: &Array2<F>, max_bins: u16) -> Vec<FeatureBinIn
     infos
 }
 
-/// Map a single feature value to its bin index given bin edges.
+/// Map a single feature value to its bin index given bin thresholds.
+///
+/// Implements sklearn's `_map_to_bins` contract (`binning.py:43`): bin `i` is
+/// chosen iff `edges[i - 1] < value <= edges[i]`. With `k = edges.len()`
+/// thresholds there are `k + 1` bins; a value above the last threshold lands
+/// in bin `k` (the final bin). Equivalent to `searchsorted(edges, value,
+/// side="left")`.
 #[inline]
 fn map_to_bin<F: Float>(value: F, info: &FeatureBinInfo<F>) -> u16 {
     if value.is_nan() {
@@ -217,7 +287,7 @@ fn map_to_bin<F: Float>(value: F, info: &FeatureBinInfo<F>) -> u16 {
     if info.n_bins == 0 {
         return NAN_BIN;
     }
-    // Binary search: find the first edge >= value.
+    // Binary search: find the first threshold >= value (searchsorted side=left).
     let edges = &info.edges;
     let mut lo: usize = 0;
     let mut hi: usize = edges.len();
@@ -229,11 +299,8 @@ fn map_to_bin<F: Float>(value: F, info: &FeatureBinInfo<F>) -> u16 {
             hi = mid;
         }
     }
-    if lo >= edges.len() {
-        (info.n_bins - 1).min(edges.len() as u16 - 1)
-    } else {
-        lo as u16
-    }
+    // `lo` is in `0..=edges.len()`; `edges.len()` is the final bin index.
+    lo as u16
 }
 
 /// Bin all samples for all features.
@@ -999,7 +1066,7 @@ fn softmax_matrix<F: Float>(
 
 /// Histogram-based gradient boosting regressor.
 ///
-/// Uses quantile-based feature binning and gradient/hessian histograms for
+/// Uses scikit-learn-compatible feature binning and gradient/hessian histograms for
 /// O(n_bins) split finding per node. This is significantly faster than the
 /// standard [`GradientBoostingRegressor`](crate::GradientBoostingRegressor)
 /// for larger datasets.
@@ -2193,17 +2260,20 @@ mod tests {
 
     #[test]
     fn test_map_to_bin_basic() {
+        // sklearn `_BinMapper` contract (binning.py:43): with k thresholds
+        // there are k + 1 bins, and value x -> bin i iff edges[i-1] < x <= edges[i].
+        // For edges [2,4,6,8] (4 thresholds) there are 5 bins (0..=4).
         let info = FeatureBinInfo {
             edges: vec![2.0, 4.0, 6.0, 8.0],
-            n_bins: 4,
+            n_bins: 5,
             has_nan: false,
         };
-        assert_eq!(map_to_bin(1.0, &info), 0);
-        assert_eq!(map_to_bin(2.0, &info), 0);
-        assert_eq!(map_to_bin(3.0, &info), 1);
-        assert_eq!(map_to_bin(5.0, &info), 2);
-        assert_eq!(map_to_bin(7.0, &info), 3);
-        assert_eq!(map_to_bin(9.0, &info), 3);
+        assert_eq!(map_to_bin(1.0, &info), 0); // 1 <= 2
+        assert_eq!(map_to_bin(2.0, &info), 0); // 2 <= 2
+        assert_eq!(map_to_bin(3.0, &info), 1); // 2 < 3 <= 4
+        assert_eq!(map_to_bin(5.0, &info), 2); // 4 < 5 <= 6
+        assert_eq!(map_to_bin(7.0, &info), 3); // 6 < 7 <= 8
+        assert_eq!(map_to_bin(9.0, &info), 4); // 9 > 8 -> final bin
         assert_eq!(map_to_bin(f64::NAN, &info), NAN_BIN);
     }
 
