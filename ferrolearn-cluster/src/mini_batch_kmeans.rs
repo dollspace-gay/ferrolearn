@@ -39,6 +39,38 @@
 //! let labels = fitted.predict(&x).unwrap();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_kmeans.py`
+//! (`class MiniBatchKMeans(_BaseKMeans)`; `_mini_batch_step`,
+//! `_mini_batch_convergence`, `partial_fit`; `_check_params_vs_input` base `:875`).
+//! Design doc: `.design/cluster/mini_batch_kmeans.md`. Cites use ferrolearn symbol
+//! anchors / sklearn `file:line` (commit 156ef14); expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). MiniBatchKMeans has a PyO3 consumer
+//! (`_RsMiniBatchKMeans`, `ferrolearn-python/src/extras.rs`). Verify-and-document
+//! unit: the `labels_` PARTITION (up to a label permutation, well-separated regime),
+//! `predict`/`transform` contracts, the (thin) PyO3 marshalling, and the `n_init`
+//! default match sklearn and SHIP. Exact `cluster_centers_`/`inertia_` VALUES +
+//! `labels_` integers DIVERGE — ferrolearn runs `n_init` FULL per-center-LR runs with
+//! max-shift convergence, vs sklearn's single best-of-init-trials + EWA-inertia early
+//! stopping + low-count reassignment (#1050/#1054) on the numpy RNG (#1049).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `Fit::fit` (k-means++/random init → mini-batch per-center-LR loop → best-of-`n_init` → final `fn assign_clusters_mb`) recovers sklearn's grouping on well-separated data. Consumers: PyO3 `RsMiniBatchKMeans::fit` (`extras.rs`) + crate re-export `pub use mini_batch_kmeans::{...}` (`lib.rs`). Guards: `green_req1_partition_two_blobs`, `green_req1_partition_three_blobs` in `tests/divergence_mini_batch_kmeans.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `labels_` integers + `cluster_centers_`/`inertia_` VALUES (REQ-9) diverge. |
+//! | REQ-2 (`predict` nearest-center contract + `predict==labels_`) | SHIPPED | impl `Predict::predict` (`fn assign_clusters_mb`) returns argmin-squared-euclidean center index; `fn fit` computes `labels_` via the same `assign_clusters_mb` against the FINAL centers, so `fit(X).predict(X) == labels_` holds (no KMeans-style swap bug). Consumers: PyO3 `RsMiniBatchKMeans::predict` + crate re-export. Guards: `green_req2_predict_equals_labels`. |
+//! | REQ-3 (`transform` distance-to-centers contract) | SHIPPED | impl `Transform::transform` returns shape `(n_samples, n_clusters)`, column j = Euclidean distance to center j, `argmin(1) == predict`. Consumer: crate re-export (the thin PyO3 binding omits `transform` — REQ-11). Guards: `green_req3_transform_argmin_equals_predict`, `green_req3_transform_shape_nonneg`. Underclaim: CONTRACT only — distances track `cluster_centers_` (REQ-9). |
+//! | REQ-4 (PyO3 binding marshalling) | SHIPPED | impl `#[pyclass(name="_RsMiniBatchKMeans")]` (`ferrolearn-python/src/extras.rs`) marshals `fit`/`predict` + `labels_`; registered in `ferrolearn-python/src/lib.rs`, wrapped `class MiniBatchKMeans(_ClusterWrapper)` in `python/ferrolearn/_extras.py`, exported in `__init__.py`. Verification: `maturin develop` + binding smoke test. Underclaim: the binding is THIN — it exposes only `fit`/`predict`/`labels_` (no `transform`/`cluster_centers_`/`inertia_`/`n_iter_`) and its ctor omits `n_init`/`batch_size`/`tol` (REQ-11); fitted VALUES inherit REQ-9. |
+//! | REQ-5 (`n_init` constructor default = 1) | SHIPPED | impl `fn new` defaults `n_init: 1`, matching sklearn `MiniBatchKMeans(n_init="auto")` → 1 for the default `init="k-means++"` (`_kmeans.py:886-888`; live oracle `_n_init==1`). Guard: `pin_req5_n_init_default_is_one` (`MiniBatchKMeans::<f64>::new(3).n_init == 1`). Fixed #1047. (`batch_size=1024`/`max_iter=100`/`tol=0.0` defaults already matched.) |
+//! | REQ-6 (ctor/fit surface max_no_improvement/reassignment_ratio/init_size/compute_labels/verbose/sample_weight + n_clusters=8 + error ABI) | NOT-STARTED | open prereq blocker #1048. sklearn `__init__` + `fit(sample_weight)` + `_check_params_vs_input` (`InvalidParameterError`); ferrolearn `MiniBatchKMeans<F>` has `n_clusters/batch_size/max_iter/tol/n_init/random_state/init` only + `FerroError` ABI + requires explicit `n_clusters`. |
+//! | REQ-7 (`random_state` numpy-RNG parity) | NOT-STARTED | open prereq blocker #1049. sklearn `check_random_state` + numpy RNG; ferrolearn `StdRng`. Exact centers/labels/inertia cannot match (R-SUBSTRATE-5); blocks REQ-9. |
+//! | REQ-8 (algorithm structure: init-trials-on-subsample + EWA convergence + early stop + `n_steps_`/`n_iter_`) | NOT-STARTED | open prereq blocker #1050. sklearn does ONE k-means++ init best-of-`n_init` INIT trials on an `init_size` subsample, then one mini-batch optimization with EWA-inertia convergence + `max_no_improvement` early stopping (`_mini_batch_step`/`_mini_batch_convergence`), exposing `n_steps_` AND `n_iter_`; ferrolearn runs `n_init` FULL runs with per-center-LR + max-shift<tol, exposes only `n_iter_`. |
+//! | REQ-9 (`cluster_centers_`/`inertia_`/label-integers VALUE parity) | NOT-STARTED | open prereq blocker #1051. Exact values diverge via numpy-RNG (REQ-7), algorithm structure (REQ-8), and missing low-count reassignment (REQ-12). Gated on those. |
+//! | REQ-10 (`partial_fit` online) | NOT-STARTED | open prereq blocker #1052. sklearn `partial_fit` processes one mini-batch per call; ferrolearn has none. |
+//! | REQ-11 (PyO3 binding thin surface + dtype) | NOT-STARTED | open prereq blocker #1053. `RsMiniBatchKMeans` exposes only `fit`/`predict`/`labels_` + ctor `(n_clusters,max_iter,random_state)` — omits `transform`/`cluster_centers_`/`inertia_`/`n_iter_` and `n_init`/`batch_size`/`tol`; marshals `labels_` as `int64` not sklearn `int32` (R-DEFER-7 last layer). |
+//! | REQ-12 (low-count cluster reassignment) | NOT-STARTED | open prereq blocker #1054. sklearn `_mini_batch_step` reassigns clusters whose counts fall below `reassignment_ratio*max_count` to random high-density points; ferrolearn `fn update_centers_mini_batch` has no reassignment. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1055. `mini_batch_kmeans.rs` imports `ndarray`/`num-traits`/`rand`/`rayon`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2; RNG entangled with REQ-7). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -96,14 +128,13 @@ impl<F: Float> MiniBatchKMeans<F> {
     /// Create a new `MiniBatchKMeans` with the given number of clusters.
     ///
     /// Uses default values: `batch_size = 1024`, `max_iter = 100`,
-    /// `tol = 0.0` (no per-batch early stopping), `n_init = 3`,
+    /// `tol = 0.0` (no per-batch early stopping), `n_init = 1`,
     /// `random_state = None`, `init = KMeansPlusPlus`.
     ///
-    /// `batch_size`, `max_iter`, and `tol` match scikit-learn ≥ 1.4
-    /// defaults. The previous combination (`batch_size = 100`,
-    /// `tol = 1e-4`) caused noisy minibatch updates that hit the tolerance
-    /// well before reaching the global structure of the data — measured at
-    /// -0.16 ARI vs sklearn at n=5000.
+    /// These match scikit-learn's `MiniBatchKMeans` defaults: `batch_size`,
+    /// `max_iter`, and `tol` match directly, and sklearn's
+    /// `n_init="auto"` resolves to `1` for the default `init="k-means++"`
+    /// (`sklearn/cluster/_kmeans.py:886-888`).
     #[must_use]
     pub fn new(n_clusters: usize) -> Self {
         Self {
@@ -111,7 +142,7 @@ impl<F: Float> MiniBatchKMeans<F> {
             batch_size: 1024,
             max_iter: 100,
             tol: F::zero(),
-            n_init: 3,
+            n_init: 1,
             random_state: None,
             init: MiniBatchKMeansInit::KMeansPlusPlus,
         }
