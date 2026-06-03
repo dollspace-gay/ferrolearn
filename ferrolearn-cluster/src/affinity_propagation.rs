@@ -14,7 +14,7 @@
 //!
 //! 1. Compute a similarity matrix `S` using negative squared Euclidean distance.
 //! 2. Set diagonal preferences (self-similarity). If `preference` is `None`,
-//!    the median of the off-diagonal similarities is used.
+//!    the median of the full similarity matrix is used.
 //! 3. Initialize responsibility (`R`) and availability (`A`) matrices to zero.
 //! 4. Iteratively update `R` and `A` with damping until convergence:
 //!    - **Responsibility** `R[i,k]`: how well-suited point `k` is to serve as
@@ -70,7 +70,7 @@ pub struct AffinityPropagation<F> {
     /// Number of iterations with no change in exemplars before declaring
     /// convergence.
     convergence_iter: usize,
-    /// Self-similarity preference. If `None`, the median of the off-diagonal
+    /// Self-similarity preference. If `None`, the median of the full
     /// similarity matrix is used, which tends to produce a moderate number of
     /// clusters.
     preference: Option<F>,
@@ -115,7 +115,7 @@ impl<F: Float> AffinityPropagation<F> {
     /// Set the preference (self-similarity) value.
     ///
     /// Lower values produce fewer clusters; higher values produce more.
-    /// If not set, the median of the off-diagonal similarity matrix is used.
+    /// If not set, the median of the full similarity matrix is used.
     #[must_use]
     pub fn with_preference(mut self, preference: F) -> Self {
         self.preference = Some(preference);
@@ -276,15 +276,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for AffinityPropagatio
         let pref = if let Some(p) = self.preference {
             p
         } else {
-            // Compute median of off-diagonal similarities.
-            let mut off_diag: Vec<F> = Vec::with_capacity(n * (n - 1) / 2);
+            // Compute median over the FULL n*n similarity matrix as it stands
+            // before the diagonal preference is written. This matches sklearn's
+            // `preference = np.median(self.affinity_matrix_)`
+            // (`_affinity_propagation.py:519-520`), where `affinity_matrix_`
+            // has a zero diagonal at this point: the n self-distances are 0 and
+            // the symmetric off-diagonal pairs are each counted twice.
+            let mut all_entries: Vec<F> = Vec::with_capacity(n * n);
             for i in 0..n {
-                for k in (i + 1)..n {
-                    off_diag.push(s[[i, k]]);
+                for j in 0..n {
+                    all_entries.push(s[[i, j]]);
                 }
             }
-            off_diag.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-            median_of_sorted(&off_diag)
+            all_entries.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            median_of_sorted(&all_entries)
         };
 
         for i in 0..n {
