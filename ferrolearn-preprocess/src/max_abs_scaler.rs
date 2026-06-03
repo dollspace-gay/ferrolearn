@@ -5,6 +5,31 @@
 //! making it suitable for sparse data.
 //!
 //! Columns where `max_abs = 0` (all-zero features) are left unchanged.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_data.py` (`class MaxAbsScaler`
+//! `:1116`, `maxabs_scale` `:1351`). Design doc: `.design/preprocess/max_abs_scaler.md`. Expected
+//! values from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumers: PyO3 `_RsMaxAbsScaler`
+//! (`ferrolearn-python/src/extras.rs:1156`) + `PipelineTransformer` impl + crate re-export (S5).
+//! HONEST (R-HONEST-3): verify-and-document — the dense max-abs path matches sklearn including
+//! the zero-max_abs edge (which, unlike Min/StandardScaler, does NOT diverge: a zero-max_abs
+//! column is all-zero, and `x/scale_(1) = x` equals ferrolearn's leave-unchanged).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (per-column max-abs value match) | SHIPPED | `Fit::fit` learns per-column `max_abs=max(|x|)`; `Transform::transform` = `x/max_abs`, mirroring sklearn `max_abs_=_nanmax(abs(X))` (`_data.py:1263`) / `scale_=_handle_zeros_in_scale(max_abs_)` (`:1272`) / `X/=scale_` (`:1305`). Critic-verified bit-identical to live oracle: `divergence_max_abs_scaler.rs` green guards (`[[-3,1],[0,-2],[2,4]]` → `[[-1,0.25],[0,-0.5],[0.6667,1]]`, all-negative, mixed, f32). Consumers: PyO3 `_RsMaxAbsScaler` + `FittedPipelineTransformer` + re-export. |
+//! | REQ-2 (zero-max_abs column → identity, MATCHES sklearn) | SHIPPED | A zero-max_abs column is all-zero; sklearn `scale_=_handle_zeros_in_scale(0)=1` → `x/1=x` = ferrolearn's leave-unchanged for ANY input. Critic-verified MATCH (discriminating: `fit([[0],[0]]).transform([[5]])==[[5.0]]` in both). NOT a divergence (contrast Min/StandardScaler). |
+//! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*max_abs` (zero-max_abs left unchanged), mirroring sklearn `X *= scale_` (`_data.py:1337`); `inverse_transform(transform(X))==X` (green guard). Consumer: re-export boundary (S5). |
+//! | REQ-4 (PyO3 binding) | SHIPPED | `_RsMaxAbsScaler` (`extras.rs:1156`, registered `lib.rs:82`) marshals `fit`/`transform` over `FittedMaxAbsScaler<f64>` — a real CPython consumer; maturin smoke. |
+//! | REQ-5 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1202. Fold NaN-ignoring incidental; no `force_all_finite=allow-nan` contract (`_data.py:1256`,`:1263`). Must ALLOW NaN. |
+//! | REQ-6 (scale_/n_samples_seen_ attrs) | NOT-STARTED | open prereq blocker #1203. Only `max_abs`; no `scale_`/`n_samples_seen_` (`_data.py:1266`,`:1272`). |
+//! | REQ-7 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1204. Single-shot (`_data.py:1232-1273`). |
+//! | REQ-8 (maxabs_scale free fn + axis) | NOT-STARTED | open prereq blocker #1205. No `maxabs_scale` / axis=1 (`_data.py:1351`). |
+//! | REQ-9 (copy param + _parameter_constraints) | NOT-STARTED | open prereq blocker #1206. No `copy` (`_data.py:1188`,`:1190`). |
+//! | REQ-10 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1207. Dense-only; MaxAbsScaler is sklearn's flagship sparse-safe scaler (`_data.py:1260-1261`,`:1303`). |
+//! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1208. None (OneToOneFeatureMixin). |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1209. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
