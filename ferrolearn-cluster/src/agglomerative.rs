@@ -47,6 +47,34 @@
 //! let fitted = model.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.labels().len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_agglomerative.py`
+//! (`class AgglomerativeClustering(ClusterMixin, BaseEstimator)` `:781`).
+//! Design doc: `.design/cluster/agglomerative.md`. Cites use ferrolearn symbol
+//! anchors / sklearn `file:line` (commit 156ef14); expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). This is a verify-and-document unit: the
+//! `labels_` PARTITION (up to a label permutation) genuinely ships on separable
+//! data through real consumers, but the absolute `labels_` numbering and the full
+//! `children_` dendrogram DIVERGE — both rooted in ferrolearn's truncated-tree +
+//! ascending-slot relabel vs sklearn's full dendrogram + `_hc_cut` heap cut
+//! (the shared #938 root cause, also gating `birch.rs` / `feature_agglomeration.rs`).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | `fn agglomerate` (Lance–Williams merge-until-`n_clusters` via `find_min_pair`/`pairwise_sq_dists`) → `Fit::fit` builds `labels_`, mirroring the merge clustering of sklearn `_fit` (`_agglomerative.py:992-1106`). Partition value-matches the oracle for all 4 linkages. Consumers: `_RsAgglomerativeClustering` (`ferrolearn-python/src/extras.rs`), `birch.rs fn fit`, `feature_agglomeration.rs fn fit`. Guards: `green_two_blobs_partition_all_linkages`, `green_three_blobs_partition_all_linkages` in `tests/divergence_agglomerative.rs`. |
+//! | REQ-2 (`n_clusters_` == requested) | SHIPPED | `Fit::fit` sets `n_clusters_: self.n_clusters`, mirroring `self.n_clusters_ = self.n_clusters` when `distance_threshold is None` (`_agglomerative.py:1095`). Guards above assert `n_clusters_` 2 and 3; `n_clusters()` accessor consumed by `birch.rs`/`feature_agglomeration.rs`. |
+//! | REQ-3 (four linkage criteria — partition) | SHIPPED | `enum Linkage` + `match linkage` arms in `fn agglomerate` (Single=min, Complete=max, Average=size-weighted mean, Ward=size-weighted Lance–Williams) mirror `_TREE_BUILDERS` (`_agglomerative.py:720-725`). Partition matches the oracle for all four (guards above). Caveat: PARTITION only — merge-distance VALUES/ties differ (squared-Euclidean LW vs sklearn heap/nn-chain), see REQ-9. |
+//! | REQ-4 (`n_clusters=2` ctor default + sklearn error ABI) | NOT-STARTED | open prereq blocker #963. sklearn `__init__` defaults `n_clusters=2` (`_agglomerative.py:951`); ferrolearn `fn new(n_clusters)` requires it. Validation errors are `FerroError::InvalidParameter`/`InsufficientSamples` (crate-wide port convention), not sklearn's `ValueError`/`InvalidParameterError`. |
+//! | REQ-5 (`ensure_min_samples=2` validation) | NOT-STARTED | open prereq blocker #964. sklearn `fit` → `_validate_data(X, ensure_min_samples=2)` (`_agglomerative.py:989`) rejects `n_samples < 2`; ferrolearn `fn fit` accepts a single sample when `n_clusters <= 1` (`test_single_sample_single_cluster`). Coupled fix: `birch.rs fn fit` calls `AgglomerativeClustering::new(1)` on a 1-row matrix in the single-subcluster path, so this is a multi-file change, not minimal in `agglomerative.rs` alone. |
+//! | REQ-6 (`children_` full-dendrogram format) | NOT-STARTED | open prereq blocker #938. sklearn `children_` is shape `(n_samples-1, 2)` with internal-node IDs `>= n_samples` (`_agglomerative.py:902-908`); ferrolearn `FittedAgglomerativeClustering::children_` is length `n_samples - n_clusters` of reused merged-into-slot pairs (`fn agglomerate`: `children.push((ci, cj))`). Different length AND ID semantics — full-dendrogram rewrite, not minimal. |
+//! | REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | NOT-STARTED | open prereq blocker #938. sklearn numbers labels by a negated-id min-heap pop over the top-`n_clusters` dendrogram nodes (`_hc_cut`, `_agglomerative.py:760-775`); ferrolearn relabels by ascending surviving-slot order via a `HashMap` (`fn agglomerate` relabel loop). Same partition (REQ-1), permuted integers. Requires the full `children_` (REQ-6) then `_hc_cut`. |
+//! | REQ-8 (`metric` / `connectivity`) | NOT-STARTED | open prereq blocker #965. sklearn `metric` ∈ {euclidean,l1,l2,manhattan,cosine,precomputed} default `'euclidean'` with the ward-requires-euclidean rule (`_agglomerative.py:795-799`, `:1034-1038`) and `connectivity` for structured clustering (`:812-822`). ferrolearn `fn sq_euclidean`/`fn pairwise_sq_dists` are Euclidean-only, unstructured. |
+//! | REQ-9 (`distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_`) | NOT-STARTED | open prereq blocker #966. sklearn `distance_threshold` (XOR with `n_clusters`, `_agglomerative.py:1022-1027`; `n_clusters_` derived `:1090-1093`), `compute_full_tree='auto'` (`:1051-1064`), `compute_distances` → `distances_` (`:1087-1088`). ferrolearn has only `n_clusters` + `linkage`, no `distances_`, and the merge-distance VALUES differ. |
+//! | REQ-10 (`n_leaves_`/`n_connected_components_` + `memory`) | NOT-STARTED | open prereq blocker #967. sklearn sets `n_leaves_`/`n_connected_components_` from the tree builder (`_agglomerative.py:1083-1085`) and caches via `memory` (`:1006`/`:1076`). `FittedAgglomerativeClustering` exposes `labels()`/`n_clusters()`/`children()` only. |
+//! | REQ-11 (PyO3 binding parity) | SHIPPED | `#[pyclass(name="_RsAgglomerativeClustering")]` (`ferrolearn-python/src/extras.rs`): `fn new(n_clusters=2)`, `fn fit` → `ferrolearn_cluster::AgglomerativeClustering::<f64>::new(self.n_clusters)`, `#[getter] labels_`; registered in `ferrolearn-python/src/lib.rs`, wrapped `class AgglomerativeClustering(_ClusterWrapper)` in `python/ferrolearn/_extras.py`, exported in `__init__.py`. `ferrolearn.AgglomerativeClustering(n_clusters=2).fit(X).labels_` matches sklearn up to label permutation (REQ-1). Hard-wires Ward (no `linkage`/`metric`/`distance_threshold` arg). |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #968. `agglomerative.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`; the PyO3 boundary uses `numpy2_to_ndarray`, not `ferray::numpy_interop` (R-SUBSTRATE). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
