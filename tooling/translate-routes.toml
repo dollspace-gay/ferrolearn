@@ -461,7 +461,7 @@ parity_ops = ["_BaseNB", "_BaseDiscreteNB"]
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/lib.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/base.md"
+design = ".design/bayes/lib.md"
 parity_ops = ["re-export boundary"]
 
 # =====================================================================

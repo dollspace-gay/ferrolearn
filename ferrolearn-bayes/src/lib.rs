@@ -51,6 +51,21 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2) for the crate-root RE-EXPORT BOUNDARY (this file is the public-API
+//! surface + one cross-cutting helper, not an estimator). Mirrors `sklearn/naive_bayes.py`
+//! `__all__` (`:30-36`) + `_BaseNB.predict_log_proba` (`:105-126`, `jll − logsumexp(jll,axis=1)`).
+//! Design doc: `.design/bayes/lib.md`. Per-variant REQs live in the sibling modules' routed docs
+//! (`.design/bayes/{gaussian,multinomial,bernoulli,categorical,complement,base}.md`). The
+//! `clamp_alpha = base::check_alpha` re-export alias is owned by `base.rs` (REQ in `base.md`).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block re-exports `BaseNB` + the 5 NB variants (`GaussianNB`/`MultinomialNB`/`BernoulliNB`/`CategoricalNB`/`ComplementNB` + their `Fitted*`), mirroring sklearn `naive_bayes.__all__` (`naive_bayes.py:30-36`). Consumers: meta-crate `pub use ferrolearn_bayes as bayes` + PyO3 pyclasses `RsGaussianNB` (`classifiers.rs`), `RsMultinomialNB`/`RsBernoulliNB`/`RsComplementNB` (`extras.rs`). Verification: `cargo test -p ferrolearn-bayes` green + `tests/api_proof.rs`. |
+//! | REQ-2 (`log_softmax_rows` == jll − logsumexp(jll)) | SHIPPED | `pub(crate) fn log_softmax_rows` is the numerically stable (max-subtraction) form of `_BaseNB.predict_log_proba` (`naive_bayes.py:105-126`; `logsumexp` = `scipy.special.logsumexp`). Consumers: `BaseNB::nb_predict_log_proba in base.rs` + every `Fitted*NB::predict_log_proba`/`predict_proba`. Critic-verified vs live oracle: `green_log_softmax_*` in `tests/divergence_lib.rs` (4 green) — GaussianNB end-to-end ~1e-12, all-`-inf` row → NaN (matches scipy), single-col → 0.0, large-magnitude `[[1000,1001]]` finite (no `exp` overflow). |
+//! | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker #1110. `log_softmax_rows` + the boundary run on `ndarray::Array2` + `num_traits::Float`, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1); the helper migrates with the NB variants' per-variant blockers (#898/#903/#910/#917/#925). |
 
 pub mod base;
 pub mod bernoulli;
