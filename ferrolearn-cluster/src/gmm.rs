@@ -42,6 +42,35 @@
 //! let labels = fitted.predict(&x).unwrap();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/mixture/_gaussian_mixture.py`
+//! (`class GaussianMixture`) + `sklearn/mixture/_base.py` (`BaseMixture`). Design doc:
+//! `.design/cluster/gmm.md`. Cites use ferrolearn symbol anchors / sklearn `file:line`
+//! (commit 156ef14); expected values from the live sklearn 1.5.2 oracle (R-CHAR-3).
+//! GMM has a (thin) PyO3 consumer (`_RsGaussianMixture`, `ferrolearn-python/src/extras.rs`).
+//! On well-separated data, ferrolearn's EM converges to the SAME optimum as sklearn —
+//! `weights_`/`means_`/`covariances_` value-match to ~1e-9, and (after the iter-132
+//! log-density fix) `score`/`lower_bound_`/`aic`/`bic` match too. Off-separated exact
+//! value parity is blocked by the different `init_params='kmeans'` init + numpy RNG.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_`/predict PARTITION up-to-permutation, well-separated) | SHIPPED | impl `Fit::fit`/`Predict::predict` (EM via `fn run_em`, k-means++ init, argmax responsibility) match sklearn on well-separated data. Consumers: PyO3 `RsGaussianMixture::predict` (`extras.rs:1038`) + crate re-export. Guard: `req1_partition_two_blobs_up_to_permutation` in `tests/divergence_gmm.rs` (live-oracle). |
+//! | REQ-2 (`predict_proba` contract) | SHIPPED | impl `predict_proba` (`fn log_responsibilities` → `log_sum_exp_rows` → exp) returns `(n,k)` rows summing to 1. Consumer: crate re-export. Guard: `req2_predict_proba_shape_and_rows_sum_to_one`. |
+//! | REQ-3 (`weights_`/`means_`/`covariances_` VALUE-match, well-separated) | SHIPPED | impl `fn run_em` (k-means++ seed + EM) converges to sklearn's optimum on well-separated data: `weights_`/`means_` match <1e-9, `covariances_` <1e-8 up to component permutation. Consumer: crate re-export. Guard: `req3_well_separated_value_match`. Underclaim: well-separated regime ONLY — off-separated/overlapping parity is REQ-12 (init + RNG). |
+//! | REQ-4 (matching defaults) | SHIPPED | impl `fn new` defaults `covariance_type=Full`, `max_iter=100`, `tol=1e-3`, `n_init=1` = sklearn `GaussianMixture` defaults. Guard: `req4_defaults_match_sklearn`. |
+//! | REQ-5 (`score`/`score_samples`/`lower_bound_`/`aic`/`bic` VALUE) | SHIPPED | impl `fn log_responsibilities` Full/Tied arm now adds `-0.5·maha` only (`log_norm` already folds `-0.5·log|Σ|`, matching sklearn `_estimate_log_gaussian_prob` `_gaussian_mixture.py:507`) — was double-counting `log|Σ|`; and `fn cholesky` no longer re-adds `reg=1e-6` on top of the M-step `reg_covar` (was regularizing twice). `score`/`score_samples`/`lower_bound_`/`aic`/`bic` now value-match the oracle within 1e-6. Guards: `req5_score_full_matches_sklearn` + `diag_score_control_matches_sklearn`. Fixed #1093. |
+//! | REQ-6 (`covariances_` 3D shape) | NOT-STARTED | open prereq blocker #1094. sklearn `covariances_` for Full is `(n_components, d, d)` 3D (tied `(d,d)`); ferrolearn stacks as 2D `(n_components·d, d)`. Shape/layout divergence (R-DEV-3). |
+//! | REQ-7 (PyO3 binding fit/predict marshalling) | SHIPPED | impl `#[pyclass(name="_RsGaussianMixture")]` (`extras.rs:1038`) marshals `fit`/`predict` over the boundary; registered in `lib.rs`, wrapped `class GaussianMixture` in `python/ferrolearn/_extras.py`, exported in `__init__.py`. Verification: `maturin develop` + binding smoke test. Underclaim: THIN — ctor `(n_components,max_iter,random_state)` omits `covariance_type`/`tol`/`n_init`, no `weights_`/`means_`/`covariances_`/`predict_proba`/`score`/`aic`/`bic`/`n_iter_` getters (REQ-13). |
+//! | REQ-8 (`precisions_`/`precisions_cholesky_` attrs) | NOT-STARTED | open prereq blocker #1095. sklearn exposes `precisions_` + `precisions_cholesky_` (the primary internal repr); ferrolearn `FittedGaussianMixture` exposes `covariances_` only. |
+//! | REQ-9 (`n_iter_` attribute) | NOT-STARTED | open prereq blocker #1096. sklearn exposes `n_iter_`; ferrolearn has `converged_`/`lower_bound_` but no `n_iter_`. |
+//! | REQ-10 (`sample()` method) | NOT-STARTED | open prereq blocker #1097. sklearn `GaussianMixture.sample(n_samples)`; ferrolearn has none. |
+//! | REQ-11 (`init_params='kmeans'` full-fit + `reg_covar`/`weights_init`/`means_init`/`precisions_init`/`warm_start`) | NOT-STARTED | open prereq blocker #1098. sklearn `init_params` default `'kmeans'` runs a FULL KMeans for the initial responsibilities (+ k-means++/random/random_from_data); ferrolearn `fn init_means` does greedy k-means++ seeding + uniform weights + identity covs only, no `init_params`/`reg_covar`/`*_init`/`warm_start` params. |
+//! | REQ-12 (off-well-separated VALUE parity) | NOT-STARTED | open prereq blocker #1099. exact `weights_`/`means_`/`covariances_` parity on overlapping/general data blocked by the different init (REQ-11) + numpy RNG (R-SUBSTRATE-5). |
+//! | REQ-13 (PyO3 binding full surface) | NOT-STARTED | open prereq blocker #1100. `RsGaussianMixture` omits `covariance_type`/`tol`/`n_init` params + `weights_`/`means_`/`covariances_`/`predict_proba`/`score`/`aic`/`bic`/`n_iter_` getters (R-DEFER-7 last layer). |
+//! | REQ-14 (ferray substrate) | NOT-STARTED | open prereq blocker #1101. `gmm.rs` imports `ndarray`/`num-traits`/`rand`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -346,16 +375,19 @@ impl<F: Float> FittedGaussianMixture<F> {
                     let cov_block = self
                         .covariances_
                         .slice(ndarray::s![cov_offset..cov_offset + n_features, ..]);
-                    let (ld, ln) =
+                    // `log_norm` already folds in `-0.5·log|Σ|` (see
+                    // `log_det_and_norm_full`); the per-sample term below adds
+                    // only `-0.5·maha`, matching sklearn `_estimate_log_gaussian_prob`
+                    // (`_gaussian_mixture.py:507`), which counts `log|Σ|` once.
+                    let (_ld, ln) =
                         log_det_and_norm_full(&cov_block.to_owned(), n_features, two_pi)?;
-                    log_det = ld;
                     log_norm = ln;
 
                     for ni in 0..n_samples {
                         let diff: Vec<F> = (0..n_features).map(|j| x[[ni, j]] - mean[j]).collect();
                         let maha = mahalanobis_full(&diff, &cov_block.to_owned(), n_features)?;
-                        log_resp[[ni, ki]] =
-                            log_w + log_norm - F::from(0.5).unwrap() * (log_det + maha);
+                        let half = F::from(0.5).unwrap_or_else(F::epsilon);
+                        log_resp[[ni, ki]] = log_w + log_norm - half * maha;
                     }
                 }
                 CovarianceType::Diag => {
@@ -451,17 +483,16 @@ fn mahalanobis_full<F: Float>(diff: &[F], cov: &Array2<F>, d: usize) -> Result<F
 
 /// Compute the lower-triangular Cholesky factor `L` such that `Σ = L L^T`.
 ///
-/// Adds a small regularisation `reg = 1e-6` to the diagonal to ensure
-/// positive definiteness in the presence of numerical noise.
+/// The covariance passed in is already regularised by the M-step
+/// (`reg_covar = 1e-6` added to the diagonal, matching sklearn's single
+/// `reg_covar` regularisation), so no further diagonal jitter is added here:
+/// doing so would regularise twice and shift the absolute log-density away
+/// from sklearn (`_estimate_log_gaussian_prob`, `_gaussian_mixture.py:507`).
 fn cholesky<F: Float>(cov: &Array2<F>, d: usize) -> Result<Array2<F>, FerroError> {
-    let reg = F::from(1e-6).unwrap_or_else(F::epsilon);
     let mut l = Array2::zeros((d, d));
     for i in 0..d {
         for j in 0..=i {
             let mut s = cov[[i, j]];
-            if i == j {
-                s = s + reg;
-            }
             for p in 0..j {
                 s = s - l[[i, p]] * l[[j, p]];
             }
