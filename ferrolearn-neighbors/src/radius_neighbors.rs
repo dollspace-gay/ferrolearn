@@ -31,6 +31,48 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.RadiusNeighborsClassifier`
+//! (`sklearn/neighbors/_classification.py`) and `RadiusNeighborsRegressor`
+//! (`sklearn/neighbors/_regression.py`), both thin estimators over the shared
+//! `RadiusNeighborsMixin` / `NeighborsBase` machinery (`sklearn/neighbors/_base.py`).
+//! See `.design/neighbors/radius_neighbors.md`. `RadiusNeighbors{Classifier,Regressor}`
+//! and their fitted types are existing pub APIs re-exported via
+//! `pub use radius_neighbors::{...}` in `lib.rs`. Non-test consumers (verified by
+//! grep): `graph.rs` `pub fn radius_neighbors_graph` (constructs a
+//! `RadiusNeighborsClassifier`, `clf.fit(x, &dummy_y)` → `fitted.radius_neighbors`)
+//! and the `FittedRadiusNeighbors{Classifier,Regressor}::radius_neighbors_graph`
+//! methods (`self.radius_neighbors(...)`); the in-crate
+//! `FittedRadiusNeighbors{Classifier,Regressor}Pipeline::predict_pipeline`
+//! production trait impls (`self.0.predict(x)`). Cites use symbol anchors
+//! (ferrolearn) / `file:line` (sklearn 1.5.2). Live oracle = installed sklearn
+//! 1.5.2, run from `/tmp`. Binary classification (R-DEFER-2); honest underclaim
+//! (R-HONEST-3): a REQ is SHIPPED only with impl + a NON-test consumer.
+//! `predict_proba`, `score` (clf + reg), and `classes`/`n_classes` are
+//! value-correct (green guards pass) but reach NO non-test consumer — `graph.rs`
+//! uses only `radius_neighbors`, the pipeline wrappers use only `predict`, and
+//! there is no PyO3 `RadiusNeighbors*` binding (verified absent by
+//! `grep -ni radiusneighbors ferrolearn-python/src/`) — so they are NOT-STARTED
+//! under #887.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | clf `predict` VALUE + smallest-label tie-break + `outlier_label=Some(in-class)`/`None`: per-row `fn find_radius_neighbors` → `fn weighted_vote` over `fn class_score_vec` (argmax replaces on strict `>` so ties keep the smaller, earlier, sorted-`classes` label), empty neighborhood → `outlier_label` if `Some` else `Err`, mirroring `RadiusNeighborsClassifier.predict` (`_classification.py:678-718`; `np.argmax` first-max `:707`; outlier assign `:710-713`). Non-test consumer: `FittedRadiusNeighborsClassifierPipeline::predict_pipeline` (`self.0.predict(x)`). Green `green_classifier_predict_value_uniform_and_distance`, `green_classifier_outlier_label_some`. | SHIPPED |
+//! | REQ-2 | clf `predict_proba` VALUE (with neighbors) + FIXED out-of-class outlier all-zero row: normalized weighted class-vote shares in `classes_` order + zero-distance branch; empty row one-hots only an in-`classes_` outlier label else stays all-zero, mirroring `predict_proba` (`_classification.py:720-836`, all-zero + normalize-to-0 `:813-829`). `pub fn predict_proba` is value-correct (green `green_classifier_predict_proba_value` + `divergence_classifier_predict_proba_outlier_not_in_classes_all_zero`) but has NO non-test consumer (no PyO3 binding; `graph.rs`/pipeline never call `predict_proba`). The #881 all-zero fix shipped, but the method still lacks a production consumer. | NOT-STARTED (#887) |
+//! | REQ-3 | clf `score` (mean accuracy), the `ClassifierMixin.score` analog. `pub fn score` (`correct/n` over `predict`) is value-correct (green `green_classifier_score_accuracy`) but has NO non-test consumer. | NOT-STARTED (#887) |
+//! | REQ-4 | reg `predict` VALUE, 1-D `y`, uniform + distance + zero-distance + FIXED no-neighbor NaN: per-row `fn weighted_mean`, empty row → `F::nan()` (not error), mirroring `RadiusNeighborsRegressor.predict` (`_regression.py:459-514`; `empty_obs = np.full_like(_y[0], np.nan)` `:482`). Non-test consumer: `FittedRadiusNeighborsRegressorPipeline::predict_pipeline` (`self.0.predict(x)`). Green `green_regressor_predict_value_uniform_and_distance` + `divergence_regressor_no_neighbor_returns_nan_not_error` (#882). | SHIPPED |
+//! | REQ-5 | reg `score` R²: `RegressorMixin.score` = `r2_score(multioutput='uniform_average')`, constant-`y` → `1.0`/`-inf`. `pub fn score` → `crate::knn::r2_score` is value-correct but has NO non-test consumer. | NOT-STARTED (#887) |
+//! | REQ-6 | shared `radius_neighbors` search VALUE/SET: per-row in-radius `(distances, indices)` SET, the kernel both `predict` paths consume, mirroring `RadiusNeighborsMixin.radius_neighbors` (`_base.py`). `pub fn radius_neighbors` (both fitted types) → `pub(crate) fn radius_neighbors_impl` → per-row `fn find_radius_neighbors`. Non-test consumer: `graph.rs` `radius_neighbors_graph` free fn + `FittedRadiusNeighbors{Classifier,Regressor}::radius_neighbors_graph` methods. Green `green_radius_neighbors_set`. | SHIPPED |
+//! | REQ-7 | clf `classes`/`n_classes` (`HasClasses` analog): sorted-unique class labels, lexicographic order (`classes_`). `pub fn classes` / `pub fn n_classes` exist but have NO non-test consumer — `graph.rs` `radius_neighbors_graph` builds the clf with `dummy_y` and calls only `radius_neighbors` (verified: `graph.rs` never calls `.classes()`); no PyO3 binding. In-tree `test_classifier_classes` only. | NOT-STARTED (#887) |
+//! | REQ-8 | clf `outlier_label='most_frequent'` + out-of-class-label-not-added-to-`classes_`: sklearn assigns the training mode to outliers (`_classification.py:636-642`; live oracle `outlier_label_==[0]`) and keeps `classes_` unchanged for a manual out-of-class label. `outlier_label: Option<usize>` has NO `'most_frequent'` mode. (The manual-label `predict_proba` all-zero half of #881 SHIPPED — see REQ-2; the `'most_frequent'` half remains.) | NOT-STARTED (#881) |
+//! | REQ-9 | `radius_neighbors` `sort_results` default order + `X=None`: sklearn default `sort_results=False` → native (tree/brute) order (`_base.py`); `fn find_radius_neighbors` ALWAYS sorts ascending (matches `sort_results=True`), no toggle, no `X=None` self-exclusion. SET matches, default ORDER diverges. | NOT-STARTED (#883) |
+//! | REQ-10 | reg multi-output 2-D `y`: `_y.ndim > 1` → `(n_queries, n_outputs)` (`_regression.py:478-514`). `FittedRadiusNeighborsRegressor` stores `y_train: Array1<F>` and `impl Fit<Array2<F>, Array1<F>>` — 1-D `y` only; no 2-D surface. | NOT-STARTED (#884) |
+//! | REQ-11 | constructor params + callable weights: `leaf_size=30`/`p=2`/`metric='minkowski'`/`metric_params=None`/`n_jobs=None` (`_classification.py:584-589`, `_regression.py:418-422`) and `weights` as a callable (`:573`/`:408`). Both estimators expose only `radius`/`weights ∈ {Uniform, Distance}`/`algorithm` (+ clf `outlier_label`) — Euclidean-only, no callable. | NOT-STARTED (#885) |
+//! | REQ-12 | clf no-neighbor error type/message: sklearn raises `ValueError("No neighbors found for test samples %r, ...")` (`_classification.py:781-787`); `fn predict`/`pub fn predict_proba` empty branch raise `FerroError::InvalidParameter` with a different message (type/message surfaces at the PyO3 boundary). | NOT-STARTED (#886) |
+//! | REQ-13 | PyO3 binding + meta-crate re-export: no `RsRadiusNeighbors{Classifier,Regressor}` in `ferrolearn-python/src/` (verified absent by `grep -ni radiusneighbors`) and no meta-crate re-export; `import ferrolearn` cannot construct either estimator. | NOT-STARTED (#887) |
+//! | REQ-14 | ferray substrate: `radius_neighbors.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#888) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -439,9 +481,12 @@ impl<F: Float + Send + Sync + 'static> FittedRadiusNeighborsClassifier<F> {
     /// Predict class probabilities for the given feature matrix.
     ///
     /// For each sample, finds all training points within `radius` and
-    /// returns the normalized (weighted) class vote shares. Query points
-    /// with no neighbors fall back to the `outlier_label` (one-hot) when
-    /// set, else uniform `1 / n_classes` per row.
+    /// returns the normalized (weighted) class vote shares. A query point
+    /// with no neighbors is one-hot on the `outlier_label` only when that
+    /// label is one of `classes_`; else (outlier_label absent or out-of-class)
+    /// the row is left all-zero, mirroring sklearn `predict_proba`
+    /// (`sklearn/neighbors/_classification.py:813-829` — zero-sum rows are
+    /// divided by a normalizer reset to 1.0 and stay zero, NOT uniform).
     ///
     /// # Errors
     ///
@@ -472,12 +517,15 @@ impl<F: Float + Send + Sync + 'static> FittedRadiusNeighborsClassifier<F> {
                     && let Ok(ci) = self.classes.binary_search(&label)
                 {
                     proba[[i, ci]] = F::one();
-                } else {
-                    let u = F::one() / F::from(n_classes).unwrap();
-                    for ci in 0..n_classes {
-                        proba[[i, ci]] = u;
-                    }
                 }
+                // else: no neighbors and outlier_label is absent or out-of-class
+                // -> row stays all-zero. sklearn `predict_proba`
+                // (`_classification.py:813-824`) only one-hots the row when the
+                // outlier label IS one of `classes_` (`label_index.size == 1`);
+                // otherwise it warns and leaves the row at zero, and the per-row
+                // normalization (`:826-829` `normalizer[normalizer == 0.0] = 1.0;
+                // proba_k /= normalizer`) divides a zero-sum row by 1.0, keeping
+                // it all-zero (NOT uniform `1/n_classes`).
             } else {
                 let scores = self.class_score_vec(&neighbors);
                 let total: F = scores.iter().copied().fold(F::zero(), |a, b| a + b);
@@ -798,8 +846,13 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRadiusNeighb
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features
     /// does not match the training data.
-    /// Returns [`FerroError::InvalidParameter`] if any query point has no
-    /// neighbors within the radius.
+    ///
+    /// A query point with no neighbors within `radius` yields `NaN` for that
+    /// row (it is *not* an error), mirroring sklearn's
+    /// `RadiusNeighborsRegressor.predict` (`sklearn/neighbors/_regression.py:482`,
+    /// `empty_obs = np.full_like(_y[0], np.nan)`). sklearn additionally emits a
+    /// `UserWarning` (`_regression.py:504-509`); ferrolearn has no standardized
+    /// warning channel, so the binding contract is the `NaN` value itself.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let n_features = x.ncols();
         let train_features = self.x_train.ncols();
@@ -821,16 +874,14 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRadiusNeighb
                 find_radius_neighbors(&self.x_train, &query, self.radius, &self.spatial_index);
 
             if neighbors.is_empty() {
-                return Err(FerroError::InvalidParameter {
-                    name: "radius".into(),
-                    reason: format!(
-                        "query sample {i} has no neighbors within radius={}",
-                        self.radius.to_f64().unwrap_or(0.0)
-                    ),
-                });
+                // sklearn `RadiusNeighborsRegressor.predict` assigns `np.nan` to a
+                // query row with no in-radius neighbor (and warns) rather than
+                // raising (`_regression.py:482` `empty_obs = np.full_like(_y[0],
+                // np.nan)`). Match that NaN value; continue so other rows predict.
+                predictions.push(F::nan());
+            } else {
+                predictions.push(self.weighted_mean(&neighbors));
             }
-
-            predictions.push(self.weighted_mean(&neighbors));
         }
 
         Ok(Array1::from_vec(predictions))
@@ -1228,7 +1279,10 @@ mod tests {
     }
 
     #[test]
-    fn test_regressor_no_neighbors_errors() {
+    fn test_regressor_no_neighbors_returns_nan() {
+        // sklearn `RadiusNeighborsRegressor.predict` returns `np.nan` (not an
+        // error) for a query with no in-radius neighbor
+        // (`sklearn/neighbors/_regression.py:482`).
         let x = Array2::from_shape_vec((2, 1), vec![0.0, 10.0]).unwrap();
         let y = array![0.0, 100.0];
 
@@ -1236,7 +1290,11 @@ mod tests {
         let fitted = reg.fit(&x, &y).unwrap();
 
         let query = Array2::from_shape_vec((1, 1), vec![5.0]).unwrap();
-        assert!(fitted.predict(&query).is_err());
+        let result = fitted.predict(&query);
+        assert!(result.is_ok());
+        if let Ok(preds) = result {
+            assert!(preds[0].is_nan());
+        }
     }
 
     #[test]
