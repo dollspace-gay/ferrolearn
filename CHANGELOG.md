@@ -243,6 +243,9 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-metrics::label_ranking_loss diverges from sklearn/metrics/_ranking.py:1463-1465 (degenerate-row denominator: divides by non-degenerate count instead of n_samples) (#756)
+- Divergence: ferrolearn-metrics::ndcg_score diverges from sklearn/metrics/_ranking.py:1749,1868 (no tie-averaging + missing negative-y_true ValueError guard) (#755)
+- Divergence: ferrolearn-metrics::dcg_score diverges from sklearn/metrics/_ranking.py:1528 (no tie-averaging; default ignore_ties=False) (#754)
 - Audit: corrected hist_gradient_boosting REQ-7 overclaim — HGBC multiclass predict_proba is a float32 grad/hessian saturation artifact, NOT-STARTED (#758); fixed REQ-table cites + dropped/omitted REQ rows across tree-ensemble modules (#757)
 - Divergence: ferrolearn-tree::compute_bin_edges diverges from sklearn/ensemble/_hist_gradient_boosting/binning.py:53-55 (distinct-value midpoints vs quantile interpolation) (#746)
 - Divergence: gradient_boosting::huber_leaf_value median uses np.median tie (mean of two middles) instead of _weighted_percentile lower-percentile; Huber predict off by ~6.6e-4 vs sklearn (#738)
