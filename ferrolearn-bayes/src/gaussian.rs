@@ -24,6 +24,36 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. The non-test production consumer is `_RsGaussianNB`
+//! (`ferrolearn-python/src/classifiers.rs`), which exercises `fit` /
+//! `predict` / `predict_proba` / `classes_` against the library `FittedGaussianNB`
+//! and is surfaced as `ferrolearn.GaussianNB`; plus the in-crate
+//! `impl PipelineEstimator for GaussianNB` (`fit_pipeline` / `predict_pipeline`).
+//! Green verification = the in-tree `gaussian` lib tests + the live-sklearn
+//! divergence pins (`ferrolearn-bayes/tests/divergence_gaussian.rs`:
+//! `divergence_gaussian_epsilon_global_var_no_floor` (#891),
+//! `divergence_gaussian_priors_sum_not_one_rejected` (#893),
+//! `green_gaussian_predict_labels`, `green_gaussian_predict_proba_sums_to_one`,
+//! `green_gaussian_score_accuracy` — all passing). Cites use symbol anchors
+//! (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle =
+//! installed sklearn 1.5.2.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`epsilon_` — global per-feature variance `var_smoothing * np.var(X, axis=0).max()`, no floor) | SHIPPED | `fn fit` for `GaussianNB` computes `global_max_var` as `np.var(X, axis=0).max()` (population variance, ddof=0, over ALL rows irrespective of class) and `let epsilon = self.var_smoothing * global_max_var` — no `.max(1.0)` floor — mirroring `epsilon_ = self.var_smoothing * np.var(X, axis=0).max()` (`sklearn/naive_bayes.py:431`). Non-test consumer: `_RsGaussianNB::fit` (`classifiers.rs`) → `FittedGaussianNB`. Verified: green pin `divergence_gaussian_epsilon_global_var_no_floor` (#891): on `X=[[1,2],[1.5,1.8],[2,2.5],[6,7],[6.5,6.8],[7,7.5]]`, `y=[0,0,0,1,1,1]`, sklearn `epsilon_=6.416666666666667e-9`; `predict_joint_log_proba([[1.2,2.1],[6.6,7.1]])[0][0] = -0.6823015899121332`, ferrolearn matches to ≤1e-9. |
+//! | REQ-2 (`priors` validation — length + sum≈1 + non-negative) | SHIPPED | `fn fit` validates `priors.len() != n_classes`, then `(prior_sum - 1).abs() > 1e-9` → "The sum of the priors should be 1." and `priors.iter().any(|&p| p < 0)` → "Priors must be non-negative.", mirroring `naive_bayes.py:448-455`. Non-test consumer: `_RsGaussianNB::fit` (maps `FerroError` → `PyValueError`). Verified: green pin `divergence_gaussian_priors_sum_not_one_rejected` (#893): `with_class_prior([0.5,0.3]).fit(X,y)` returns `Err` (sklearn raises `ValueError("The sum of the priors should be 1.")`). |
+//! | REQ-3 (`_joint_log_likelihood` + `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `impl BaseNB::joint_log_likelihood` for `FittedGaussianNB` computes `log_prior[ci] - 0.5*(log(2*pi*var) + (x-mu)^2/var)` summed over features (`naive_bayes.py:506-515`); the four `predict_*` delegate to the `BaseNB` provided methods. After the REQ-1 epsilon fix the smoothed `var` matches sklearn, so the VALUES match to ~1e-9. Non-test consumer: `_RsGaussianNB::predict`/`predict_proba` (`classifiers.rs`). Verified: green pins `divergence_gaussian_epsilon_global_var_no_floor` (`predict_joint_log_proba` value ≤1e-9), `green_gaussian_predict_labels` (`[0,1]`), `green_gaussian_predict_proba_sums_to_one` (rows sum to 1.0). |
+//! | REQ-4 (`theta_` per-class mean + data-derived `log_prior` / `class_prior_` + `score`) | SHIPPED | `fn fit` computes the per-class per-feature mean into `theta` (`np.mean(X_class, axis=0)`, `naive_bayes.py:324`) and `log_prior[ci] = ln(count_c / n_total)` (empirical `class_prior_ = class_count_ / class_count_.sum()`, `naive_bayes.py:502`); `pub fn score` is mean accuracy (`ClassifierMixin.score` analog). Non-test consumer: `_RsGaussianNB::predict`/`classes_` → `fitted.predict`/`fitted.classes()`. Verified: `green_gaussian_score_accuracy` (`score(X,y)=1.0`), `green_gaussian_predict_labels` (`[0,1]`), in-tree `test_gaussian_nb_has_classes`/`test_gaussian_nb_three_classes`. |
+//! | REQ-5 (`sample_weight` in `fit`) | NOT-STARTED | open prereq blocker **#894**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:239`) supports weighted `theta_`/`var_`/`class_count_` via `_update_mean_variance` (`np.average(..., weights=sw)`, `naive_bayes.py:319-320`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — no `sample_weight` parameter on `fit` or `partial_fit`. |
+//! | REQ-6 (`partial_fit` epsilon-once semantics) | NOT-STARTED | open prereq blocker **#895**. sklearn fixes `epsilon_` at the first fit and does the subtract-before / re-add-after dance (`var_ -= epsilon_` `naive_bayes.py:465`, `var_ += epsilon_` `naive_bayes.py:497`). `FittedGaussianNB::partial_fit` RECOMPUTES `epsilon = var_smoothing * max_var.max(F::one())` from the current `sigma` each call (the `max_var`/`epsilon` block) — different smoothing per call (also still per-class-max with a `1.0` floor, unlike the now-fixed `fit`). |
+//! | REQ-7 (fitted accessors `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_`) | NOT-STARTED | open prereq blocker **#896**. sklearn exposes these (`naive_bayes.py:171-202`). `FittedGaussianNB` stores `theta` / `sigma` / `raw_sigma` / `class_counts` / `log_prior` / `var_smoothing` as PRIVATE fields with no accessor; only `classes()` (via `HasClasses`) is public — no `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_` getter. |
+//! | REQ-8 (PyO3 surface — `var_smoothing` / `priors` / `sample_weight` + getters) | NOT-STARTED | open prereq blocker **#897**. `_RsGaussianNB` (`ferrolearn-python/src/classifiers.rs`) exposes `new(var_smoothing)` / `fit` / `predict` / `predict_proba` / `classes_` only — no `priors` kwarg, no `sample_weight` on `fit`, no `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_` getters, no `predict_log_proba` / `score` / `partial_fit`. The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker **#898**. `gaussian.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -190,12 +220,23 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Gaussia
         // Store raw (unsmoothed) variance for partial_fit.
         let raw_sigma = sigma.clone();
 
-        // Apply variance smoothing: add var_smoothing * max(variance_all_features).
-        // Following scikit-learn: epsilon = var_smoothing * max of all variances.
-        let max_var = sigma
-            .iter()
-            .fold(F::zero(), |acc, &v| if v > acc { v } else { acc });
-        let epsilon = self.var_smoothing * max_var.max(F::one());
+        // Apply variance smoothing, mirroring scikit-learn
+        // (`naive_bayes.py:431`): epsilon_ = var_smoothing * np.var(X, axis=0).max()
+        // — the GLOBAL per-feature population variance (ddof=0) over ALL samples
+        // (every row, irrespective of class), reduced by .max() over features,
+        // times var_smoothing. No floor.
+        let mut global_max_var = F::zero();
+        for j in 0..n_features {
+            let mean_j = (0..n_samples).fold(F::zero(), |acc, i| acc + x[[i, j]]) / n_f;
+            let var_j = (0..n_samples).fold(F::zero(), |acc, i| {
+                let diff = x[[i, j]] - mean_j;
+                acc + diff * diff
+            }) / n_f;
+            if var_j > global_max_var {
+                global_max_var = var_j;
+            }
+        }
+        let epsilon = self.var_smoothing * global_max_var;
         sigma.mapv_inplace(|v| v + epsilon);
 
         // Use user-supplied class priors if provided.
@@ -208,6 +249,26 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Gaussia
                         priors.len(),
                         n_classes
                     ),
+                });
+            }
+            // sklearn `GaussianNB._partial_fit` (naive_bayes.py:451-452):
+            //   if not np.isclose(priors.sum(), 1.0):
+            //       raise ValueError("The sum of the priors should be 1.")
+            let prior_sum = priors.iter().fold(F::zero(), |acc, &p| acc + p);
+            let tol = F::from(1e-9).unwrap_or_else(F::epsilon);
+            if (prior_sum - F::one()).abs() > tol {
+                return Err(FerroError::InvalidParameter {
+                    name: "class_prior".into(),
+                    reason: "The sum of the priors should be 1.".into(),
+                });
+            }
+            // sklearn (naive_bayes.py:454-455):
+            //   if (priors < 0).any():
+            //       raise ValueError("Priors must be non-negative.")
+            if priors.iter().any(|&p| p < F::zero()) {
+                return Err(FerroError::InvalidParameter {
+                    name: "class_prior".into(),
+                    reason: "Priors must be non-negative.".into(),
                 });
             }
             for (ci, &p) in priors.iter().enumerate() {
