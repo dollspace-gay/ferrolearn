@@ -9,7 +9,7 @@ upstream-paths:
   - sklearn/cluster/_mean_shift.py          # estimate_bandwidth (:43-106); _mean_shift_single_seed (:110-130); mean_shift function (:137-246); get_bin_seeds (:249-299); class MeanShift(ClusterMixin, BaseEstimator) (:302-578); _parameter_constraints (:439-447); __init__ (:449-466); fit (:468-560); predict (:562-578)
 ferrolearn-module: ferrolearn-cluster/src/mean_shift.rs
 parity-ops: MeanShift (.__init__, .fit, .predict, .fit_predict, .cluster_centers_, .labels_, .n_iter_); estimate_bandwidth
-crosslink-issue: TBD-director
+crosslink-issue: 983
 -->
 
 ## Summary
@@ -23,20 +23,24 @@ impl assigning to the nearest center, and a `fit_predict` convenience mirroring
 `ClusterMixin.fit_predict`. It is re-exported at the crate root (`pub use
 mean_shift::{FittedMeanShift, MeanShift}` in `ferrolearn-cluster/src/lib.rs`).
 
-**Under honest underclaim (R-HONEST-3), the only behavior that VALUE-matches the
-live sklearn 1.5.2 oracle end-to-end is the explicit-bandwidth clustering on
-well-separated data — and even there only the *partition* (label co-membership)
-matches, not the `cluster_centers_` values, the `labels_` integer values, nor
-`n_iter_`.** The two load-bearing divergences:
+**Under honest underclaim (R-HONEST-3), two behaviors VALUE-match the live sklearn
+1.5.2 oracle and SHIP through the crate re-export: (i) the explicit-bandwidth
+*partition* (label co-membership up to a permutation) on well-separated data
+(REQ-1), and (ii) the `estimate_bandwidth` kNN VALUE on the default (no-subsampling)
+path (REQ-3, fixed iter 123 / #985).** What does NOT ship: the `cluster_centers_`
+values, the `labels_` integer values, and `n_iter_`. The remaining load-bearing
+divergence:
 
-1. **Auto-bandwidth is the WRONG heuristic.** sklearn's `estimate_bandwidth`
+1. **`estimate_bandwidth` (REQ-3) — FIXED iter 123.** Previously ferrolearn computed
+   the **median of all pairwise distances**; sklearn's `estimate_bandwidth`
    (`_mean_shift.py:43-106`) is a **kNN** heuristic: `mean over all points of (max
-   distance to its `k` nearest neighbours)`, where `k = int(n_samples * quantile)`,
-   default `quantile=0.3`. ferrolearn's `fn estimate_bandwidth` computes the
-   **median of all pairwise distances** — a different statistic that produces a
-   different value (Probe 2). On the `two_blobs` fixture sklearn returns `0.19073`
-   (→ 4 clusters); ferrolearn's median returns `14.001` (→ everything merged into
-   1 cluster). They are not the same algorithm and do not value-match.
+   distance among its `k = int(n_samples * quantile)` nearest neighbours, self
+   included)`, default `quantile=0.3`. ferrolearn now implements this kNN heuristic
+   (`pub fn estimate_bandwidth(x, quantile)`), so `MeanShift().fit(X)` (auto) yields
+   sklearn's cluster count on the default path (the `divergence_auto_bandwidth_n_clusters`
+   guard: fresh 3-blob fixture → 3 clusters, was 1). The `n_samples`/`random_state`
+   subsampling + `n_jobs` params remain unimplemented (they only change the large-data
+   approximation, not the default VALUE).
 2. **De-duplication keeps the highest-intensity mode; ferrolearn averages the
    group.** sklearn sorts converged modes by `(intensity, coordinate)` descending,
    then greedily marks all modes within `bandwidth` of a retained mode as duplicates
@@ -258,28 +262,28 @@ literal-copied from ferrolearn (R-CHAR-3). Fixtures: `docs` =
 Binary (R-DEFER-2). `MeanShift` / `FittedMeanShift` are existing pub APIs re-exported
 at the crate root (the only non-test consumer; grandfathered S5/R-DEFER-1). Cites use
 symbol anchors (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle
-= installed sklearn 1.5.2, run from `/tmp`. Honest underclaim (R-HONEST-3): **no REQ
-value-matches the `MeanShift` contract end-to-end with a non-test consumer** — the
-explicit-bandwidth PARTITION agrees on well-separated data (REQ-1) but the
-`cluster_centers_` values, the `labels_` integers, and `n_iter_` all diverge, and
-the load-bearing auto-bandwidth heuristic is the wrong statistic (REQ-3). Every REQ is
-NOT-STARTED. Suggested blocker numbers are SUGGESTIONS — the director creates the real
-issues.
+= installed sklearn 1.5.2, run from `/tmp`. Honest assessment (R-HONEST-3): **two REQs
+SHIP** — the explicit-bandwidth PARTITION up-to-permutation on well-separated data
+(REQ-1) and the `estimate_bandwidth` kNN VALUE on the default path (REQ-3, fixed iter
+123 / #985) — both through the crate re-export. The `cluster_centers_` values, the
+`labels_` integers, and `n_iter_` DIVERGE (the merge keeps a group mean in seed order,
+not sklearn's intensity-sorted retained mode). Blocker numbers below are the real
+filed issues.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (explicit-bw PARTITION) | NOT-STARTED | open prereq blocker **#960** (depends on #961/#963). impl `fn fit` (seed-per-point `mean_shift_single` + merge loop) recovers the correct 2-way grouping on `blobs`/`docs` (Probe 3, AC-1), so the PARTITION matches — but the `cluster_centers_` VALUES (group mean vs sklearn's retained converged mode, REQ-2), the `labels_` INTEGERS (no intensity sort, REQ-4), and `n_iter_` (REQ-9) diverge. Not a full value-parity claim; the only consumer of `fit` is the crate re-export (no binding, REQ-11). |
-| REQ-2 (`cluster_centers_` value + intensity order) | NOT-STARTED | open prereq blocker **#961**. sklearn sorts converged modes by `(intensity, coord)` descending and retains the actual highest-intensity mode per `bandwidth`-ball (`_mean_shift.py:529-546`); `cluster_centers_` on `docs` = `[[3.333…,6.0],[1.333…,0.666…]]` (AC-2). ferrolearn `fn fit` averages each merged group (`group` loop → `center = mean(group)`) and emits centers in seed order with no intensity sort — different values and ordering. |
-| REQ-3 (`estimate_bandwidth` kNN heuristic) | NOT-STARTED | open prereq blocker **#962**. sklearn `estimate_bandwidth` = `sum(max(kNN_dist,axis=1))/n` with `k=int(n*quantile)`, `quantile=0.3` (`_mean_shift.py:95-106`); `estimate_bandwidth(blobs)=0.19073262114491085` (AC-3). ferrolearn `fn estimate_bandwidth` computes the MEDIAN of all pairwise distances = `14.00142849854971` on `blobs` — a different statistic → auto-`MeanShift` yields 1 cluster vs sklearn's 4. No `quantile`/`n_samples`/`random_state`/`n_jobs` params; private helper, no public `estimate_bandwidth`. NOTE on `mean_shift.rs:201`: the `dists.len() % 2 == 0` two-sided median IS a correct sample median of the pairwise-distance vector, but sklearn's `estimate_bandwidth` does NOT take a median of pairwise distances at all (it is kNN, not pdist-median) — so the median computation is internally fine yet implements the wrong heuristic. |
-| REQ-4 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker **#960** (depends on #961). sklearn `labels_` indexes into intensity-sorted `cluster_centers_` (`_mean_shift.py:548-557`); on `docs` = `[1,1,1,0,0,0]` (AC-1). ferrolearn assigns the nearest of its seed-ordered, group-mean centers (`fn fit` label loop) — same partition on benign fixtures, permuted integers. Gated on REQ-2 (center ordering) + REQ-6 (orphan `-1`). |
-| REQ-5 (ctor surface seeds/bin_seeding/min_bin_freq/cluster_all/n_jobs; drop `tol`) | NOT-STARTED | open prereq blocker **#964**. sklearn `__init__` (`_mean_shift.py:449-466`) = `bandwidth, seeds, bin_seeding, min_bin_freq, cluster_all, n_jobs, max_iter`. ferrolearn `MeanShift<F>` = `bandwidth/max_iter/tol` (`fn new` + builders) — missing 5 sklearn params; `tol` is non-sklearn (sklearn hard-codes `1e-3*bandwidth`, `:113`). |
-| REQ-6 (`cluster_all=False` orphan `-1`) | NOT-STARTED | open prereq blocker **#965**. sklearn fills `labels=-1` then assigns only within-`bandwidth` points (`_mean_shift.py:552-557`); orphans stay `-1` (AC-5). ferrolearn `labels_: Array1<usize>` (`FittedMeanShift`) cannot represent `-1` and always assigns the nearest center (`fn fit` / `Predict::predict`). Type change + `cluster_all` param required. |
-| REQ-7 (`bin_seeding` / `get_bin_seeds` / `min_bin_freq`) | NOT-STARTED | open prereq blocker **#966**. sklearn `get_bin_seeds(X, bandwidth, min_bin_freq)` bins to a `bandwidth`-grid, seeds from bins with `>=min_bin_freq` members (`_mean_shift.py:249-299`); `fit` selects seeding via `bin_seeding` (`:491-495`). ferrolearn always seeds from every data point (`fn fit` seed loop) — no binning, no `bin_seeding`/`min_bin_freq`/`seeds`. |
-| REQ-8 (stop-threshold `1e-3*bandwidth`) | NOT-STARTED | open prereq blocker **#967**. sklearn `stop_thresh = 1e-3 * bandwidth` (`_mean_shift.py:113`), convergence `||Δmean|| <= stop_thresh` (`:124-127`). ferrolearn `fn mean_shift_single` stops at `shift < tol` with default `tol=1e-3` (ABSOLUTE, unscaled) — diverges for any `bandwidth != 1`; `tol` is also a non-sklearn user knob (REQ-5). |
-| REQ-9 (`n_iter_` semantics) | NOT-STARTED | open prereq blocker **#968**. sklearn `n_iter_ = max(completed_iterations)`, incremented AFTER the convergence/`max_iter` check (`_mean_shift.py:124-129,514`); on `docs` = `2` (AC-4). ferrolearn `fn fit` takes `max(iter+1)` from `mean_shift_single` (loop counter) — off-by-one / different convention. |
-| REQ-10 (error ABI `InvalidParameterError` + no-neighbour `ValueError`) | NOT-STARTED | open prereq blocker **#969**. sklearn rejects `bandwidth<=0` with `InvalidParameterError` (`(0,inf)`, `_mean_shift.py:440`) and raises `ValueError` when no seed has neighbours (`:516-522`). ferrolearn `fn fit` raises `FerroError::InvalidParameter` (matching bound, different type/message ABI) and cannot hit the no-neighbour case (each seed is a data point so always self-neighbours). |
-| REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker **#970**. `grep -rln "MeanShift\|RsMeanShift" ferrolearn-python/` is EMPTY — `RsKMeans` is registered (`ferrolearn-python/src/lib.rs:24`) but no `RsMeanShift`, so `import ferrolearn` cannot reach `MeanShift`. The only non-test consumer of `fit`/`predict`/`fit_predict`/accessors is the crate re-export (`lib.rs`). |
-| REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker **#971**. `mean_shift.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`; not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
+| REQ-1 (explicit-bw PARTITION up-to-permutation) | SHIPPED | impl `fn fit` (seed-per-point `mean_shift_single` + merge loop) recovers sklearn's grouping for an explicit `bandwidth` on well-separated data (Probe 3). Consumer: crate re-export `pub use mean_shift::{FittedMeanShift, MeanShift}` (`lib.rs`). Guards: `green_two_blobs_partition_matches_sklearn_bw2`, `green_three_blobs_partition_matches_sklearn_bw15`, `green_fresh_three_blobs_partition_matches_sklearn_bw3` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `cluster_centers_` VALUES (REQ-2), `labels_` INTEGERS (REQ-4), `n_iter_` (REQ-9) diverge. |
+| REQ-3 (`estimate_bandwidth` kNN heuristic, default path) | SHIPPED | impl `pub fn estimate_bandwidth(x, quantile)` mirrors sklearn `estimate_bandwidth(X, quantile=0.3)` (`_mean_shift.py:95-106`): `k=int(n*quantile)` clip `>=1`, per-point max among the `k` nearest (self at 0), averaged. Consumer: `fn fit` None-bandwidth path. Guard: `divergence_auto_bandwidth_n_clusters` (fresh 3-blob → 3 clusters matching sklearn, was 1 under median-pairwise). Fixed #985. Caveat: `n_samples`/`random_state` subsampling + `n_jobs` NOT implemented — they only change the large-data approximation, not the default VALUE. |
+| REQ-2 (`cluster_centers_` value + intensity order) | NOT-STARTED | open prereq blocker **#984**. sklearn sorts converged modes by `(intensity, coord)` descending and retains the actual highest-intensity mode per `bandwidth`-ball (`_mean_shift.py:529-546`); `cluster_centers_` on `docs` = `[[3.333…,6.0],[1.333…,0.666…]]` (AC-2). ferrolearn `fn fit` averages each merged group (`group` loop → `center = mean(group)`) and emits centers in seed order with no intensity sort — different values and ordering. |
+| REQ-4 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker **#986** (depends on #984). sklearn `labels_` indexes into intensity-sorted `cluster_centers_` (`_mean_shift.py:548-557`); on `docs` = `[1,1,1,0,0,0]` (AC-1). ferrolearn assigns the nearest of its seed-ordered, group-mean centers (`fn fit` label loop) — same partition on benign fixtures, permuted integers. Gated on REQ-2 (center ordering) + REQ-6 (orphan `-1`). |
+| REQ-5 (ctor surface seeds/bin_seeding/min_bin_freq/cluster_all/n_jobs; drop `tol`) | NOT-STARTED | open prereq blocker **#987**. sklearn `__init__` (`_mean_shift.py:449-466`) = `bandwidth, seeds, bin_seeding, min_bin_freq, cluster_all, n_jobs, max_iter`. ferrolearn `MeanShift<F>` = `bandwidth/max_iter/tol` (`fn new` + builders) — missing 5 sklearn params; `tol` is non-sklearn (sklearn hard-codes `1e-3*bandwidth`, `:113`). |
+| REQ-6 (`cluster_all=False` orphan `-1`) | NOT-STARTED | open prereq blocker **#988**. sklearn fills `labels=-1` then assigns only within-`bandwidth` points (`_mean_shift.py:552-557`); orphans stay `-1` (AC-5). ferrolearn `labels_: Array1<usize>` (`FittedMeanShift`) cannot represent `-1` and always assigns the nearest center (`fn fit` / `Predict::predict`). Type change + `cluster_all` param required. |
+| REQ-7 (`bin_seeding` / `get_bin_seeds` / `min_bin_freq`) | NOT-STARTED | open prereq blocker **#989**. sklearn `get_bin_seeds(X, bandwidth, min_bin_freq)` bins to a `bandwidth`-grid, seeds from bins with `>=min_bin_freq` members (`_mean_shift.py:249-299`); `fit` selects seeding via `bin_seeding` (`:491-495`). ferrolearn always seeds from every data point (`fn fit` seed loop) — no binning, no `bin_seeding`/`min_bin_freq`/`seeds`. |
+| REQ-8 (stop-threshold `1e-3*bandwidth`) | NOT-STARTED | open prereq blocker **#990**. sklearn `stop_thresh = 1e-3 * bandwidth` (`_mean_shift.py:113`), convergence `||Δmean|| <= stop_thresh` (`:124-127`). ferrolearn `fn mean_shift_single` stops at `shift < tol` with default `tol=1e-3` (ABSOLUTE, unscaled) — diverges for any `bandwidth != 1`; `tol` is also a non-sklearn user knob (REQ-5). |
+| REQ-9 (`n_iter_` semantics) | NOT-STARTED | open prereq blocker **#991**. sklearn `n_iter_ = max(completed_iterations)`, incremented AFTER the convergence/`max_iter` check (`_mean_shift.py:124-129,514`); on `docs` = `2` (AC-4). ferrolearn `fn fit` takes `max(iter+1)` from `mean_shift_single` (loop counter) — off-by-one / different convention. |
+| REQ-10 (error ABI `InvalidParameterError` + no-neighbour `ValueError`) | NOT-STARTED | open prereq blocker **#992**. sklearn rejects `bandwidth<=0` with `InvalidParameterError` (`(0,inf)`, `_mean_shift.py:440`) and raises `ValueError` when no seed has neighbours (`:516-522`). ferrolearn `fn fit` raises `FerroError::InvalidParameter` (matching bound, different type/message ABI) and cannot hit the no-neighbour case (each seed is a data point so always self-neighbours). |
+| REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker **#993**. `grep -rln "MeanShift\|RsMeanShift" ferrolearn-python/` is EMPTY — `RsKMeans` is registered (`ferrolearn-python/src/lib.rs:24`) but no `RsMeanShift`, so `import ferrolearn` cannot reach `MeanShift`. The only non-test consumer of `fit`/`predict`/`fit_predict`/accessors is the crate re-export (`lib.rs`). |
+| REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker **#994**. `mean_shift.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`; not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
 
 ## Architecture
 
@@ -388,32 +392,32 @@ asserting `ferrolearn.MeanShift` exists and exposes `cluster_centers_` / `labels
 `n_iter_` / the sklearn parameter surface, matching `sklearn.cluster.MeanShift` on
 the AC fixtures.
 
-## Blockers to open
+## Blockers (filed iter 123)
 
-(Director creates the real issues; all numbers are SUGGESTIONS.)
+REQ-1 (partition) and REQ-3 (estimate_bandwidth, fixed #985) SHIP — no blocker. The
+remaining NOT-STARTED REQs:
 
-- **#960** — REQ-1/REQ-4: align the explicit-bandwidth label INTEGERS with sklearn
-  (depends on #961 center ordering); the partition already matches.
-- **#961** — REQ-2 (**core, pin FIRST**): replace group-mean merge with sklearn's
-  de-dup — sort modes by `(intensity, coord)` descending, retain the actual
-  highest-intensity converged mode per `bandwidth`-ball (`_mean_shift.py:529-546`).
-- **#962** — REQ-3 (**core, pin FIRST**): replace median-pairwise
-  `estimate_bandwidth` with sklearn's kNN heuristic + `quantile`/`n_samples`/
-  `random_state`/`n_jobs` params (`_mean_shift.py:43-106`); expose a public
-  `estimate_bandwidth`.
-- **#964** — REQ-5: add `seeds`/`bin_seeding`/`min_bin_freq`/`cluster_all`/`n_jobs`
+- **#984** — REQ-2 (**core**): replace group-mean merge with sklearn's de-dup — sort
+  modes by `(intensity, coord)` descending, retain the actual highest-intensity
+  converged mode per `bandwidth`-ball (`_mean_shift.py:529-546`).
+- **#986** — REQ-4: align the explicit-bandwidth label INTEGERS with sklearn (depends
+  on #984 center ordering); the partition already matches (REQ-1).
+- **#987** — REQ-5: add `seeds`/`bin_seeding`/`min_bin_freq`/`cluster_all`/`n_jobs`
   ctor params; drop the non-sklearn `tol` (`_mean_shift.py:449-466`).
-- **#965** — REQ-6: support `cluster_all=False` orphan `-1` labelling (requires a
+- **#988** — REQ-6: support `cluster_all=False` orphan `-1` labelling (requires a
   signed label type) (`_mean_shift.py:552-557`).
-- **#966** — REQ-7: implement `get_bin_seeds` + `bin_seeding`/`min_bin_freq`/`seeds`
+- **#989** — REQ-7: implement `get_bin_seeds` + `bin_seeding`/`min_bin_freq`/`seeds`
   seeding (`_mean_shift.py:249-299,491-495`).
-- **#967** — REQ-8: stop-threshold `1e-3 * bandwidth` (drop the absolute `tol`)
+- **#990** — REQ-8: stop-threshold `1e-3 * bandwidth` (drop the absolute `tol`)
   (`_mean_shift.py:113,124-127`).
-- **#968** — REQ-9: `n_iter_` = `max(completed_iterations)` per sklearn convention
+- **#991** — REQ-9: `n_iter_` = `max(completed_iterations)` per sklearn convention
   (`_mean_shift.py:124-129,514`).
-- **#969** — REQ-10: `InvalidParameterError` error ABI + no-neighbour `ValueError`
+- **#992** — REQ-10: `InvalidParameterError` error ABI + no-neighbour `ValueError`
   (`_mean_shift.py:440,516-522`).
-- **#970** — REQ-11: add `RsMeanShift` to `ferrolearn-python` (fit / predict /
+- **#993** — REQ-11: add `RsMeanShift` to `ferrolearn-python` (fit / predict /
   fit_predict / cluster_centers_ / labels_ / n_iter_ + parameter surface).
-- **#971** — REQ-12: migrate `mean_shift.rs` off `ndarray`/`num-traits` to
+- **#994** — REQ-12: migrate `mean_shift.rs` off `ndarray`/`num-traits` to
   `ferray-core` / `ferray::linalg` (R-SUBSTRATE).
+- **#985** — REQ-3: estimate_bandwidth kNN heuristic — **CLOSED iter 123** (`pub fn
+  estimate_bandwidth(x, quantile)` with the kNN statistic; `n_samples`/`random_state`
+  subsampling deferred).
