@@ -56,13 +56,7 @@ use ndarray::{Array2, array};
 /// The fixed dataset used across the oracle calls below.
 /// `X = [[0,0],[1,0],[0,1],[1,1],[10,10]]` (n_samples = 5).
 fn five_points() -> Array2<f64> {
-    array![
-        [0.0, 0.0],
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [1.0, 1.0],
-        [10.0, 10.0]
-    ]
+    array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [10.0, 10.0]]
 }
 
 // sqrt(0.5) — the common tie distance from (0.5,0.5) to all four unit-square
@@ -163,7 +157,11 @@ fn green_query_k4_tie_set_and_sorted_distances() {
     // Neighbor SET is invariant: {0,1,2,3}; index 4 (at (10,10)) excluded.
     let mut idx: Vec<usize> = neighbors.iter().map(|n| n.0).collect();
     idx.sort_unstable();
-    assert_eq!(idx, vec![0, 1, 2, 3], "tie neighbor set must be {{0,1,2,3}}");
+    assert_eq!(
+        idx,
+        vec![0, 1, 2, 3],
+        "tie neighbor set must be {{0,1,2,3}}"
+    );
 
     // Every distance is sqrt(0.5) (multiset of distances is invariant).
     for (i, n) in neighbors.iter().enumerate() {

@@ -26,6 +26,23 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.NearestCentroid`
+//! (`sklearn/neighbors/_nearest_centroid.py`). See
+//! `.design/neighbors/nearest_centroid.md`. Non-test consumer: crate re-export
+//! + the `RsNearestCentroid` PyO3 binding (`ferrolearn-python/src/extras.rs`).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Euclidean per-class-mean `centroids_` + nearest-centroid `predict` + `classes_` ordering (`_nearest_centroid.py:171,:217`) | SHIPPED |
+//! | REQ-2 | `shrink_threshold` shrunken centroids: `s = sqrt(var/(n-K))`, `s += median(s)` (`:183-184`), soft-threshold `sign·max(\|dev\|−thr,0)`, `centroid = dataset_centroid + m·s·signed_dev`; verified on 3-class/full/partial/partial-constant inputs | SHIPPED |
+//! | REQ-3 | `n_classes < 2` → `ValueError` (`:147-151`) | SHIPPED |
+//! | REQ-4 | All-features-zero-variance + shrink → `ValueError` (`:174-175`) | SHIPPED |
+//! | REQ-5 | `metric` param + `metric='manhattan'` median centroid | NOT-STARTED (#841) |
+//! | REQ-6 | `shrink_threshold > 0` constraint (sklearn `InvalidParameterError` on 0/negative) | NOT-STARTED (#842) |
+//! | REQ-7 | PyO3 binding fidelity + ferray substrate | NOT-STARTED (#843) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -139,6 +156,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
         classes.dedup();
         let n_classes = classes.len();
 
+        // sklearn `_nearest_centroid.py:147-151`: raise ValueError when fewer
+        // than two classes are present.
+        if n_classes < 2 {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: format!(
+                    "The number of classes has to be greater than one; got {n_classes} class"
+                ),
+            });
+        }
+
         // Compute per-class centroids.
         let mut centroids = Array2::<F>::zeros((n_classes, n_features));
 
@@ -162,6 +190,27 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
 
         // Apply shrinkage if requested.
         if let Some(threshold) = self.shrink_threshold {
+            // sklearn `_nearest_centroid.py:174-175`: raise ValueError when all
+            // features have zero variance (ptp == 0 for every feature).
+            // `np.ptp(X, axis=0)` is per-feature range (max - min); the check
+            // `np.all(... == 0)` fires only when EVERY feature is constant.
+            let all_zero_variance = (0..n_features).all(|j| {
+                let (col_min, col_max) =
+                    (0..n_samples).fold((x[[0, j]], x[[0, j]]), |(mn, mx), i| {
+                        (
+                            if x[[i, j]] < mn { x[[i, j]] } else { mn },
+                            if x[[i, j]] > mx { x[[i, j]] } else { mx },
+                        )
+                    });
+                col_max - col_min == F::zero()
+            });
+            if all_zero_variance {
+                return Err(FerroError::InvalidParameter {
+                    name: "X".into(),
+                    reason: "All features have zero variance. Division by zero.".into(),
+                });
+            }
+
             // Compute overall centroid.
             let mut overall = Array1::<F>::zeros(n_features);
             for j in 0..n_features {
@@ -190,10 +239,30 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
 
             let denom = F::from(n_samples - n_classes).unwrap().max(F::one());
             for j in 0..n_features {
+                // sklearn `_nearest_centroid.py:183`: `s = np.sqrt(variance/(n_samples-n_classes))`.
+                // No clamp: a constant feature yields s=0 here, which is correct.
+                // The all-zero-variance guard above prevents the all-constant case
+                // (where median(s)=0 would produce a zero denominator).
                 pooled_var[j] = (pooled_var[j] / denom).sqrt();
-                if pooled_var[j] < F::from(1e-10).unwrap() {
-                    pooled_var[j] = F::one(); // Avoid division by zero.
-                }
+            }
+
+            // sklearn `_nearest_centroid.py:184`: `s += np.median(s)` — add the
+            // median of the per-feature pooled std to every feature's std "to
+            // deter outliers from affecting the results." `np.median` averages
+            // the two middle elements for an even-length vector.
+            let mut sorted_s: Vec<F> = pooled_var.iter().copied().collect();
+            sorted_s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let median_s = if sorted_s.is_empty() {
+                F::zero()
+            } else if sorted_s.len() % 2 == 1 {
+                sorted_s[sorted_s.len() / 2]
+            } else {
+                let mid = sorted_s.len() / 2;
+                let two = F::one() + F::one();
+                (sorted_s[mid - 1] + sorted_s[mid]) / two
+            };
+            for j in 0..n_features {
+                pooled_var[j] = pooled_var[j] + median_s;
             }
 
             // Soft-threshold the deviation of each class centroid from the overall centroid.
@@ -461,10 +530,13 @@ mod tests {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 1.0, 1.5, 1.0, 1.0, 1.5]).unwrap();
         let y = array![5usize, 5, 5];
         let model = NearestCentroid::<f64>::new();
-        let fitted = model.fit(&x, &y).unwrap();
-        assert_eq!(fitted.classes(), &[5]);
-        let preds = fitted.predict(&x).unwrap();
-        assert!(preds.iter().all(|&p| p == 5));
+        // sklearn `_nearest_centroid.py:147-151` raises ValueError on single class (R-CHAR-3).
+        let result = model.fit(&x, &y);
+        assert!(
+            result.is_err(),
+            "sklearn raises ValueError on a single class (:147-151); \
+             ferrolearn must return Err, got Ok"
+        );
     }
 
     #[test]
