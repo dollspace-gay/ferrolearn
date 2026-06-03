@@ -3,6 +3,25 @@
 //! Learns an ordered mapping from unique string labels to consecutive integers
 //! `0, 1, ..., n_classes - 1`. Supports forward (`label → int`) and reverse
 //! (`int → label`) transformation.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_label.py` (`class LabelEncoder`
+//! `:34`). Design doc: `.design/preprocess/label_encoder.md`. Expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export (`lib.rs:116`, grandfathered S5).
+//! HONEST (R-HONEST-3): ferrolearn is `Array1<String>`-only; sklearn `LabelEncoder` accepts any
+//! hashable+comparable dtype. The non-empty string path value-matches the oracle exactly.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (string fit → sorted-unique classes_) | SHIPPED | `Fit::fit` collects unique labels, `Vec<String>::sort` (lexicographic), builds `label_to_index`; mirrors sklearn `classes_ = _unique(y)` (`_label.py:98`). Critic-verified vs live oracle: `green_fit_classes_sorted` (`["bird","cat","dog"]`), `green_sort_order_mixed_ascii_matches_numpy` (`["10","2","A","B","a","b"]` == np.unique). Consumer: crate re-export `lib.rs:116`. |
+//! | REQ-2 (inverse_transform) | SHIPPED | `FittedLabelEncoder::inverse_transform` = `classes[idx]` with out-of-range → `InvalidParameter`; mirrors sklearn `classes_[y]` + `setdiff1d` guard (`:158-162`). Critic-verified: `green_inverse_transform_roundtrip`, out-of-range rejected. |
+//! | REQ-3 (transform + fit_transform) | SHIPPED | `transform` = `label_to_index.get` (unknown → `InvalidParameter`), mirrors `_encode` (`:137`); `fit_transform` mirrors `_unique(return_inverse=True)` (`:115`). Critic-verified: `green_transform` (`[1,2,1,0]`), `green_fit_transform_equals_fit_then_transform`, empty transform/inverse → empty (`:134-135`,`:155-156`). |
+//! | REQ-5 (empty-fit parity) | SHIPPED | FIXED #1134. Removed the `if x.is_empty()` → `InsufficientSamples` guard; `fit([])` now yields an empty `FittedLabelEncoder` matching sklearn `_unique([])` (`:98`). Critic-verified: `divergence_empty_fit_succeeds` + 4 post-empty-fit guards; in-module `test_empty_fit_yields_empty_classes` (R-HONEST-4). |
+//! | REQ-4 (numeric/generic dtype) | NOT-STARTED | open prereq blocker #1135. `Array1<String>`-only; sklearn accepts any dtype, numeric sort `[10,2,1]→[1,2,10]` (`np.unique`) unrepresentable (R-DEV-3). |
+//! | REQ-6 (error-contract parity, R-DEV-2) | NOT-STARTED | open prereq blocker #1136. Unseen-label message ("unknown label" vs "y contains previously unseen labels", `:137,160`) + unfitted-transform `InvalidParameter` vs `NotFittedError` (`:131`). Both REJECT (type maps to FerroError); message/NotFitted-analog gap. |
+//! | REQ-7 (PyO3 binding) | NOT-STARTED | open prereq blocker #1137. No `ferrolearn-python` registration (R-DEFER-1). LabelEncoder has no `n_features_in_`/`get_feature_names_out` (target encoder). |
+//! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #1138. `ndarray::Array1<String>` + `std::HashMap`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -107,18 +126,13 @@ impl Fit<Array1<String>, ()> for LabelEncoder {
     ///
     /// Labels are sorted alphabetically; the first label maps to `0`.
     ///
+    /// Empty input is accepted (matching scikit-learn): it yields a fitted
+    /// encoder with an empty `classes_` (`n_classes == 0`).
+    ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InsufficientSamples`] if the input is empty.
+    /// This method does not currently return an error.
     fn fit(&self, x: &Array1<String>, _y: &()) -> Result<FittedLabelEncoder, FerroError> {
-        if x.is_empty() {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "LabelEncoder::fit".into(),
-            });
-        }
-
         let mut unique: Vec<String> = x
             .iter()
             .cloned()
@@ -269,10 +283,15 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_input_error() {
+    fn test_empty_fit_yields_empty_classes() {
+        // sklearn LabelEncoder().fit([]) succeeds with classes_ == [] (shape (0,)).
         let enc = LabelEncoder::new();
         let empty: Array1<String> = Array1::from_vec(vec![]);
-        assert!(enc.fit(&empty, &()).is_err());
+        let fitted = enc
+            .fit(&empty, &())
+            .ok()
+            .filter(|f| f.n_classes() == 0 && f.classes().is_empty());
+        assert!(fitted.is_some());
     }
 
     #[test]
