@@ -100,8 +100,7 @@ fn green_three_blobs_partition_matches_sklearn_bw15() {
         .with_bandwidth(1.5)
         .fit(&x, &())
         .unwrap();
-    let sklearn_partition: Vec<Vec<usize>> =
-        vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]];
+    let sklearn_partition: Vec<Vec<usize>> = vec![vec![0, 1, 2], vec![3, 4, 5], vec![6, 7, 8]];
     assert_eq!(
         canonical_partition(fitted.labels().as_slice().unwrap()),
         sklearn_partition,
@@ -164,14 +163,16 @@ fn green_fresh_three_blobs_partition_matches_sklearn_bw3() {
 /// estimate_bandwidth(X)            -> 0.4010125863780225  (quantile=0.3)
 /// MeanShift().fit(X).cluster_centers_.shape[0] -> 3
 /// ```
-/// ferrolearn `fn estimate_bandwidth(X)` = median pairwise = 20.0004998750…,
-/// at which bandwidth even sklearn collapses to 1 cluster — so ferrolearn's
-/// auto-`MeanShift` yields `n_clusters() == 1`, not 3.
+/// Before #985 ferrolearn `fn estimate_bandwidth(X)` was the median pairwise
+/// distance = 20.0004998750…, at which bandwidth even sklearn collapses to 1
+/// cluster — so auto-`MeanShift` yielded `n_clusters() == 1`. After #985 the
+/// estimator is sklearn's kNN heuristic (`quantile = 0.3`), recovering the
+/// sklearn bandwidth and `n_clusters() == 3`.
 ///
-/// sklearn expects 3; ferrolearn returns 1.
+/// sklearn expects 3; ferrolearn now matches (kNN `estimate_bandwidth`,
+/// fixed in #985 / tracking #995).
 /// Tracking: #995
 #[test]
-#[ignore = "divergence: estimate_bandwidth is median-pairwise not the kNN heuristic; tracking #995"]
 fn divergence_auto_bandwidth_n_clusters() {
     let x = Array2::from_shape_vec(
         (12, 2),

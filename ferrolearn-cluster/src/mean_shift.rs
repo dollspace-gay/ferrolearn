@@ -9,8 +9,11 @@
 //!
 //! # Algorithm
 //!
-//! 1. **Bandwidth estimation** (when `bandwidth` is `None`): compute the
-//!    median of all pairwise Euclidean distances and use that value.
+//! 1. **Bandwidth estimation** (when `bandwidth` is `None`): use scikit-learn's
+//!    kNN heuristic — for each point take the distance to its
+//!    `k = int(n_samples * quantile)` nearest neighbour (`quantile = 0.3`,
+//!    `k` clipped to `>= 1`) and average those per-point maxima over all
+//!    points.
 //! 2. **Mean shift iteration**: for each data point (candidate mode), compute
 //!    the mean of all points within `bandwidth` distance and shift the
 //!    candidate to that mean.  Repeat until the shift is smaller than `tol`
@@ -61,7 +64,8 @@ use num_traits::Float;
 #[derive(Debug, Clone)]
 pub struct MeanShift<F> {
     /// Kernel bandwidth (search radius).  When `None` the bandwidth is
-    /// estimated as the median of all pairwise Euclidean distances.
+    /// estimated via [`estimate_bandwidth`] (scikit-learn's kNN heuristic with
+    /// `quantile = 0.3`).
     pub bandwidth: Option<F>,
     /// Maximum number of mean-shift iterations per seed point.
     pub max_iter: usize,
@@ -171,10 +175,20 @@ fn sq_dist<F: Float>(a: &[F], b: &[F]) -> F {
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
 }
 
-/// Estimate bandwidth as the median of all pairwise Euclidean distances.
+/// Estimate the mean-shift bandwidth with scikit-learn's kNN heuristic.
+///
+/// Mirrors `sklearn.cluster.estimate_bandwidth` (`_mean_shift.py:43-106`):
+/// fit `NearestNeighbors(n_neighbors = int(n * quantile))` (clipped to `>= 1`)
+/// on `x`, then return `sum over points of max(distance to its n_neighbors
+/// nearest neighbours) / n_samples`. Because the query set is the SAME `x` the
+/// neighbour index was fit on, each point's nearest-neighbour set includes
+/// itself at distance `0`; the per-point maximum among the `k` nearest
+/// (counting self) is therefore the element at index `k - 1` of that point's
+/// ascending distance list. `quantile = 0.5` recovers (approximately) the
+/// median of pairwise distances; the sklearn default is `quantile = 0.3`.
 ///
 /// Returns an error if the dataset has fewer than 2 points.
-fn estimate_bandwidth<F: Float>(x: &Array2<F>) -> Result<F, FerroError> {
+pub fn estimate_bandwidth<F: Float>(x: &Array2<F>, quantile: F) -> Result<F, FerroError> {
     let n = x.nrows();
     if n < 2 {
         return Err(FerroError::InsufficientSamples {
@@ -184,33 +198,32 @@ fn estimate_bandwidth<F: Float>(x: &Array2<F>) -> Result<F, FerroError> {
         });
     }
 
-    let mut dists: Vec<F> = Vec::with_capacity(n * (n - 1) / 2);
+    // n_neighbors = int(n_samples * quantile), clipped to >= 1
+    // (sklearn `_mean_shift.py:95-97`).
+    let k = {
+        let q = quantile.to_f64().unwrap_or(0.3);
+        let raw = (n as f64 * q) as usize;
+        raw.max(1)
+    };
+
+    // For each point, the max distance among its `k` nearest neighbours
+    // (including itself at distance 0) is the element at index `k - 1` of the
+    // ascending per-point distance list (sklearn `_mean_shift.py:101-106`).
+    let mut sum = F::zero();
     for i in 0..n {
         let ri = x.row(i);
         let si = ri.as_slice().unwrap_or(&[]);
-        for j in (i + 1)..n {
+        let mut dists: Vec<F> = Vec::with_capacity(n);
+        for j in 0..n {
             let rj = x.row(j);
             let sj = rj.as_slice().unwrap_or(&[]);
             dists.push(sq_dist(si, sj).sqrt());
         }
+        dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        sum = sum + dists[k - 1];
     }
 
-    // Partial-sort to find the median.
-    dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = dists.len() / 2;
-    let median = if dists.len().is_multiple_of(2) {
-        (dists[mid - 1] + dists[mid]) / F::from(2.0).unwrap()
-    } else {
-        dists[mid]
-    };
-
-    if median == F::zero() {
-        // Fallback: return the maximum distance so the algorithm does not
-        // put everything in a single trivial cluster.
-        Ok(dists.last().copied().unwrap_or_else(F::one))
-    } else {
-        Ok(median)
-    }
+    Ok(sum / F::from(n).unwrap_or_else(F::one))
 }
 
 /// Perform mean-shift iteration starting from `seed`.
@@ -310,7 +323,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MeanShift<F> {
                 }
                 bw
             }
-            None => estimate_bandwidth(x)?,
+            None => estimate_bandwidth(x, F::from(0.3).unwrap_or_else(F::epsilon))?,
         };
 
         let bw_sq = bandwidth * bandwidth;
