@@ -124,13 +124,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
             });
         }
 
-        if let Some(threshold) = self.shrink_threshold {
-            if threshold < F::zero() {
-                return Err(FerroError::InvalidParameter {
-                    name: "shrink_threshold".into(),
-                    reason: "must be non-negative".into(),
-                });
-            }
+        if let Some(threshold) = self.shrink_threshold
+            && threshold < F::zero()
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "shrink_threshold".into(),
+                reason: "must be non-negative".into(),
+            });
         }
 
         // Collect sorted unique classes.

@@ -312,10 +312,10 @@ impl KdTree {
 
         // Check if we need to search the farther subtree.
         let plane_dist = (query_val - node.split_val).abs();
-        if plane_dist < heap.worst_distance() {
-            if let Some(child) = second {
-                Self::search_recursive(child, data, query, heap);
-            }
+        if plane_dist < heap.worst_distance()
+            && let Some(child) = second
+        {
+            Self::search_recursive(child, data, query, heap);
         }
     }
 }
