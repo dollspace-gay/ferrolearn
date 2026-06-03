@@ -9,7 +9,7 @@ upstream-paths:
   - sklearn/cluster/_optics.py   # class OPTICS(ClusterMixin, BaseEstimator) (:36-393); _parameter_constraints (:242-264); __init__ (:266-297); fit (:303-393); compute_optics_graph (:458-668); _set_reach_dist (:671-714); _compute_core_distances_ (:405-438); cluster_optics_dbscan (:726-788); cluster_optics_xi (:810-918); _extend_region (:921-981); _update_filter_sdas (:984-995); _correct_predecessor (:998-1017); _xi_cluster (:1020-1172); _extract_xi_labels (:1175-1201); _validate_size (:396-401)
 ferrolearn-module: ferrolearn-cluster/src/optics.rs
 parity-ops: OPTICS (.__init__, .fit, .fit_predict, .labels_, .reachability_, .ordering_, .core_distances_, .predecessor_, .cluster_hierarchy_), cluster_optics_xi, cluster_optics_dbscan
-crosslink-issue: TBD-by-director
+crosslink-issue: 1079
 -->
 
 ## Summary
@@ -29,11 +29,13 @@ at the crate root (`pub use optics::{FittedOPTICS, OPTICS}` in
 the per-point `core_distances_` value-matches even on hard fixtures — but the
 `ordering_`, `reachability_`, and `labels_` DIVERGE from the live sklearn oracle
 on the canonical noisy-blob case (probes below), because the traversal uses a
-different seed-selection rule and the Xi extraction drops the
-`min_cluster_size`/`cluster_hierarchy_` semantics.** Under honest underclaim
-(R-HONEST-3) the only attribute that VALUE-matches the oracle end-to-end is
-`core_distances_`; `ordering_` / `reachability_` / `predecessor_` / `labels_` are
-fixture-dependent and not a contract. `OPTICS` / `FittedOPTICS` are existing pub
+different seed-selection rule (BinaryHeap vs sklearn's linear-argmin, REQ-2 #1080 —
+the prime fixable divergence) and the Xi extraction drops the
+`min_cluster_size`/`cluster_hierarchy_` semantics.** Honest assessment (R-HONEST-3):
+`core_distances_` value-matches the oracle even on hard fixtures (REQ-1 SHIPPED,
+green-guarded); `ordering_` / `reachability_` / `predecessor_` / `labels_` match on
+clean/small fixtures (Probe 0) but diverge on noisy data until the REQ-2 traversal
+fix lands. `OPTICS` / `FittedOPTICS` are existing pub
 APIs (grandfathered per S5/R-DEFER-1); their **only** consumer is the crate
 re-export — there is **no `ferrolearn-python` binding**
 (`grep -rln OPTICS ferrolearn-python/` is empty, Probe 6) and no other in-crate
@@ -309,29 +311,30 @@ literal-copied from ferrolearn (R-CHAR-3). Fixtures: `three_blobs` (the in-tree
 Binary (R-DEFER-2). `OPTICS` / `FittedOPTICS` are existing pub APIs re-exported at
 the crate root (the only non-test consumer; grandfathered S5/R-DEFER-1). Cites use
 symbol anchors (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live
-oracle = installed sklearn 1.5.2, run from `/tmp`. Honest underclaim (R-HONEST-3):
-**no attribute value-matches the `OPTICS` contract end-to-end with a non-test
-consumer.** `core_distances_` value-matches (Probe 1) but only through an accessor
-whose sole consumer is the crate re-export and which cannot be validated against
-the oracle without the matching `ordering_` — and the load-bearing `labels_`
-diverges (Probe 3). Every REQ is therefore NOT-STARTED. Suggested blocker numbers
-— the director creates the real issues.
+oracle = installed sklearn 1.5.2, run from `/tmp`. Honest assessment (R-HONEST-3):
+**REQ-1 (`core_distances_` VALUE) SHIPS** — it value-matches the oracle even on the
+hard 60-blob fixture (Probe 1), green-guarded, through the crate re-export consumer
+(grandfathered S5/R-DEFER-1). The load-bearing `ordering_`/`reachability_`/`labels_`
+match on clean fixtures (Probe 0) but DIVERGE on noisy data (Probe 2/3) — the root
+cause is the BinaryHeap traversal (REQ-2 #1080), the prime single-file fixable
+divergence; `labels_` additionally needs the in-Xi `min_cluster_size` (REQ-7) and
+`cluster_hierarchy_` (REQ-8). Blocker numbers below are the real filed issues.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (`core_distances_` VALUE) | NOT-STARTED | open prereq blocker **#NN01**. impl `fn core_distance` (distance to the `(min_samples-1)`-th other point within `max_eps`) value-matches `_compute_core_distances_` = `kneighbors(X,min_samples)[0][:,-1]` (`_optics.py:405-438`, cap `:625`): AC-1 `core_distances_[:5]=[0.3123,0.5942,0.3703,0.2103,0.1848]` on blobs60. BUT consumed only via the `core_distances()` accessor whose **sole non-test consumer is the crate re-export** (Probe 6); no value test pins it against the oracle and no `np.around` rounding (`:626-630`). Blocker: add a live-oracle `#[test]` pinning `core_distances_` + (REQ-12) a binding consumer. |
-| REQ-2 (`ordering_` traversal/tie-break) | NOT-STARTED | open prereq blocker **#NN02** (the core single-file fix). sklearn selects the next seed by **linear `argmin` over ALL unprocessed points** (incl. `inf`) with **smallest-index tie-break**: `index[np.argmin(reachability_[index])]` (`compute_optics_graph` `:641-642`; `:53`/`:639-640` say *no heap*). ferrolearn uses a `BinaryHeap` min-heap + stale-skip + outer component-restart loop (`fn fit`, `fn update_seeds`, `SeedEntry`). Pin (AC-2): blobs60 `min_samples=5` sklearn ordering `[0,3,6,7,4,…]` vs ferro `[0,8,3,6,11,…]` (diverges at pos 1). **Pin FIRST — it is the root cause; REQ-3/REQ-5 cascade from it.** |
-| REQ-3 (`reachability_` VALUE) | NOT-STARTED | open prereq blocker **#NN02** (cascades from REQ-2). `fn update_seeds` arithmetic `max(core_dist_p, dist)` matches `_set_reach_dist` (`:710`), and small fixtures agree (Probe 0), but the reported `reachability_` plot follows the divergent traversal (AC-2) so it diverges on blobs60 (Probe 2). Also missing the `np.around(rdists, decimals=finfo.precision)` rounding (`_optics.py:711`). |
-| REQ-4 (`predecessor_` contract / `-1` sentinel) | NOT-STARTED | open prereq blocker **#NN03**. sklearn `predecessor_` is an int `ndarray` with seeds = `-1` (`:558-560`/`:604-605`); ferrolearn `predecessors()` returns `&[Option<usize>]` (seed = `None`) — a different output object (R-DEV-3). Values agree on `three_blobs`/docstring (Probe 0) but diverge with the traversal (REQ-2). |
-| REQ-5 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker **#NN04** (depends on #NN02 + #NN05 + #NN06). `fit`→`fn xi_cluster_extraction`→`fn filter_small_clusters` produce `labels_` via a divergent plot (REQ-2/3) + dropped Xi size criterion (REQ-7) + missing hierarchy leaf-selection (REQ-8). Pin (AC-3): blobs60 `min_samples=5` sklearn `(labels_==-1).sum()==11` vs ferro `0` (ferro labels all 60 into 3 clusters). The load-bearing parity — NOT a contract until #NN02/#NN05/#NN06 land. |
-| REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | NOT-STARTED | open prereq blocker **#NN05**. sklearn `fit` branch (`_optics.py:374-390`) + free fn `cluster_optics_dbscan` (`:726-788`, linear `cumsum` extraction `:781-787`). ferrolearn has no `cluster_method`/`eps` params and no `cluster_optics_dbscan` (Probe 4, AC-4). |
-| REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker **#NN06**. sklearn enforces size *inside* `_xi_cluster` (`c_end-c_start+1 < min_cluster_size → continue`, `_optics.py:1155-1156`). ferrolearn ignores size inside `fn xi_cluster_extraction` (only drops length-1) and post-filters in `fn filter_small_clusters` (relabel-then-renumber, `optics.rs:706-750`, the collapsible-if clippy site `:717/718/744`) — a different algorithm/fixed point (Probe 3). |
-| REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker **#NN07**. sklearn `cluster_hierarchy_` = `(n_clusters,2)` `[start,end]` ordered by `(end,-start)` (`_optics.py:191-200`, `_xi_cluster` `:1166-1172`); `_extract_xi_labels` (`:1175-1201`) derives leaf labels from it. ferrolearn `fn xi_cluster_extraction` collects intervals into `clusters` then **discards** them; `FittedOPTICS` has no accessor. AC-5: sklearn `[[0,19],[22,30],[20,39],[40,59],[0,59]]`. |
-| REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker **#NN08**. sklearn `bool` default `True` (`:277`), applied conditionally in `_xi_cluster` (`:1147-1150`). ferrolearn `fn correct_predecessor` is unconditional in `fn xi_cluster_extraction`; no parameter on `OPTICS<F>`. |
-| REQ-10 (param surface + `min_samples` default 5 + float fractions) | NOT-STARTED | open prereq blocker **#NN09**. sklearn `__init__` (`_optics.py:266-297`) has 14 params incl. `metric`/`p`/`metric_params`/`algorithm`/`leaf_size`/`memory`/`n_jobs` and `min_samples=5` default accepting `float∈(0,1)` (`:243-246`, normalised `:598-599`). ferrolearn `fn new(min_samples: usize)` requires `min_samples` (no default, no fraction) and exposes only `max_eps`/`xi`/`min_cluster_size` builders (Probe 5, AC-6). |
-| REQ-11 (validation bounds + ABI) | NOT-STARTED | open prereq blocker **#NN10**. sklearn `max_eps∈[0,inf]`, `xi∈[0,1]` (closed-both), `min_samples∈[2,inf)`, raising `InvalidParameterError`/`ValueError` (`_parameter_constraints` `:242-264`). ferrolearn `fn fit` over-rejects `max_eps=0`, `xi∈{0,1}`, permits `min_samples=1`, and raises `FerroError::InvalidParameter`/`InsufficientSamples` — different bounds + ABI (AC-6). |
-| REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker **#NN11**. `grep -rln OPTICS ferrolearn-python/` is EMPTY (Probe 6) — no `_RsOPTICS`, so `import ferrolearn` cannot reach `OPTICS` (AC-7). The only non-test consumer of `fit`/`fit_predict`/the accessors is the crate re-export (`lib.rs`). |
-| REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker **#NN12**. `optics.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `std::collections::{BinaryHeap, HashMap}`; not migrated to `ferray-core` (R-SUBSTRATE-1/2). |
+| REQ-1 (`core_distances_` VALUE) | SHIPPED | impl `fn core_distance` (distance to the `(min_samples-1)`-th other point within `max_eps`) value-matches `_compute_core_distances_` = `kneighbors(X,min_samples)[0][:,-1]` (`_optics.py:405-438`, cap `:625`) EVEN on the hard 60-blob fixture (Probe 1: `core_distances_[:5]=[0.3123,0.5942,0.3703,0.2103,0.1848]` to 4 dp). Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`, grandfathered S5/R-DEFER-1). Guard: live-oracle `#[test]` in `tests/divergence_optics.rs`. OPTICS is deterministic, so this is genuine value-parity. |
+| REQ-2 (`ordering_` traversal value-parity) | SHIPPED | impl `Fit::fit` now selects the next seed by LINEAR ARGMIN over all unprocessed reachability with smallest-index tie-break (single pool, no heap), matching sklearn `compute_optics_graph` (`_optics.py:638-659`, `:53` "we do not employ a heap"). The prior `BinaryHeap` traversal diverged on tie-prone data. Guards: `green_ordering_small10` (sklearn `[0,1,3,9,5,6,7,8,2,4]`; was `[…5,7,8,6…]`) + `green_ordering_three_blobs`/`green_ordering_docstring`. Fixed #1080. |
+| REQ-3 (`reachability_` VALUE) | SHIPPED | impl `fn update_seeds` computes `max(core_dist_p, dist)` then rounds via `fn round_to_precision` (`np.around(decimals=np.finfo(dtype).precision)`, round-ties-even, `_optics.py:711`); with the REQ-2 traversal the reported plot value-matches sklearn. Guards: `green_reachability_docstring` + `green_reachability_small10` (noisy tie fixture, live-oracle). Fixed #1080 (bundled). |
+| REQ-4 (`predecessor_` contract / `-1` sentinel) | NOT-STARTED | open prereq blocker **#1082**. sklearn `predecessor_` is an int `ndarray` with seeds = `-1` (`:558-560`/`:604-605`); ferrolearn `predecessors()` returns `&[Option<usize>]` (seed = `None`) — a different output object (R-DEV-3). Values agree on `three_blobs`/docstring (Probe 0) but diverge with the traversal (REQ-2). |
+| REQ-5 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker **#1083** (depends on REQ-7 #1085 + REQ-8 #1086). `fit`→`fn xi_cluster_extraction`→`fn filter_small_clusters` derive Xi labels via a dropped in-Xi size criterion (REQ-7) + missing hierarchy leaf-selection (REQ-8). With the REQ-2 traversal fixed, the reachability plot now value-matches, so labels AGREE on small/medium fixtures (blobs60 now matches sklearn 11-noise exactly) — but they DIVERGE on harder data: sklearn's canonical OPTICS test (1500 pts, min_samples=9) → sklearn 21 clusters / 1167 noise vs ferrolearn 19 clusters / 1228 noise. NOT a contract until the in-Xi `min_cluster_size` (#1085) + `cluster_hierarchy_` leaf-selection (#1086) land. |
+| REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | NOT-STARTED | open prereq blocker **#1084**. sklearn `fit` branch (`_optics.py:374-390`) + free fn `cluster_optics_dbscan` (`:726-788`, linear `cumsum` extraction `:781-787`). ferrolearn has no `cluster_method`/`eps` params and no `cluster_optics_dbscan` (Probe 4, AC-4). |
+| REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker **#1085**. sklearn enforces size *inside* `_xi_cluster` (`c_end-c_start+1 < min_cluster_size → continue`, `_optics.py:1155-1156`). ferrolearn ignores size inside `fn xi_cluster_extraction` (only drops length-1) and post-filters in `fn filter_small_clusters` (relabel-then-renumber, `optics.rs:706-750`, the collapsible-if clippy site `:717/718/744`) — a different algorithm/fixed point (Probe 3). |
+| REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker **#1086**. sklearn `cluster_hierarchy_` = `(n_clusters,2)` `[start,end]` ordered by `(end,-start)` (`_optics.py:191-200`, `_xi_cluster` `:1166-1172`); `_extract_xi_labels` (`:1175-1201`) derives leaf labels from it. ferrolearn `fn xi_cluster_extraction` collects intervals into `clusters` then **discards** them; `FittedOPTICS` has no accessor. AC-5: sklearn `[[0,19],[22,30],[20,39],[40,59],[0,59]]`. |
+| REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker **#1087**. sklearn `bool` default `True` (`:277`), applied conditionally in `_xi_cluster` (`:1147-1150`). ferrolearn `fn correct_predecessor` is unconditional in `fn xi_cluster_extraction`; no parameter on `OPTICS<F>`. |
+| REQ-10 (param surface + `min_samples` default 5 + float fractions) | NOT-STARTED | open prereq blocker **#1088**. sklearn `__init__` (`_optics.py:266-297`) has 14 params incl. `metric`/`p`/`metric_params`/`algorithm`/`leaf_size`/`memory`/`n_jobs` and `min_samples=5` default accepting `float∈(0,1)` (`:243-246`, normalised `:598-599`). ferrolearn `fn new(min_samples: usize)` requires `min_samples` (no default, no fraction) and exposes only `max_eps`/`xi`/`min_cluster_size` builders (Probe 5, AC-6). |
+| REQ-11 (validation bounds + ABI) | NOT-STARTED | open prereq blocker **#1089**. sklearn `max_eps∈[0,inf]`, `xi∈[0,1]` (closed-both), `min_samples∈[2,inf)`, raising `InvalidParameterError`/`ValueError` (`_parameter_constraints` `:242-264`). ferrolearn `fn fit` over-rejects `max_eps=0`, `xi∈{0,1}`, permits `min_samples=1`, and raises `FerroError::InvalidParameter`/`InsufficientSamples` — different bounds + ABI (AC-6). |
+| REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker **#1090**. `grep -rln OPTICS ferrolearn-python/` is EMPTY (Probe 6) — no `_RsOPTICS`, so `import ferrolearn` cannot reach `OPTICS` (AC-7). The only non-test consumer of `fit`/`fit_predict`/the accessors is the crate re-export (`lib.rs`). |
+| REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker **#1091**. `optics.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `std::collections::{BinaryHeap, HashMap}`; not migrated to `ferray-core` (R-SUBSTRATE-1/2). |
 
 ## Architecture
 
@@ -439,7 +442,7 @@ expected values above and FAILING against current `optics.rs`. (ferrolearn value
 in this doc came from a throwaway `cargo run --example optics_probe`, since
 deleted.)
 
-ferrolearn-python (REQ-12 binding parity, after #NN11 lands):
+ferrolearn-python (REQ-12 binding parity, after #1090 lands):
 ```
 cd /home/doll/ferrolearn/ferrolearn-python && maturin develop
 PYTHONPATH=python python3 -m pytest tests/divergence_optics.py -q
@@ -452,33 +455,32 @@ parameter surface, matching `sklearn.cluster.OPTICS` on the AC fixtures.
 
 (Director creates the real issues; numbers are SUGGESTIONS.)
 
-- **#NN02** — REQ-2/REQ-3: replace the `BinaryHeap` seed traversal + outer
+- **#1080** — REQ-2/REQ-3: replace the `BinaryHeap` seed traversal + outer
   component-restart loop with sklearn's single-pool linear-`argmin`-over-all-
   unprocessed + smallest-index tie-break (`compute_optics_graph` `:638-659`),
   and add the `np.around` reachability rounding (`:711`). **The core single-file
-  fix — pin FIRST.** REQ-5 unblocks once this + #NN06 + #NN07 land.
-- **#NN04** — REQ-5: `labels_` value parity (gated on #NN02/#NN06/#NN07).
-- **#NN05** — REQ-6: add `cluster_method`/`eps` params + the `cluster_optics_dbscan`
+  fix — pin FIRST.** REQ-5 unblocks once this + #1083 + #1083 land.
+- **#1083** — REQ-5: `labels_` value parity (gated on #1083/#1083/#1083).
+- **#1084** — REQ-6: add `cluster_method`/`eps` params + the `cluster_optics_dbscan`
   free function (`_optics.py:726-788`).
-- **#NN06** — REQ-7: move `min_cluster_size` into `_xi_cluster` as criterion 3.a
+- **#1085** — REQ-7: move `min_cluster_size` into `_xi_cluster` as criterion 3.a
   (`_optics.py:1155-1156`); retire the post-hoc `fn filter_small_clusters` (which
   also removes the collapsible-if clippy debt at `optics.rs:717/718/744`).
-- **#NN07** — REQ-8: expose `cluster_hierarchy_` from `fn xi_cluster_extraction`'s
+- **#1086** — REQ-8: expose `cluster_hierarchy_` from `fn xi_cluster_extraction`'s
   collected intervals, ordered `(end,-start)` (`_optics.py:1166-1172`).
-- **#NN08** — REQ-9: add the `predecessor_correction` bool parameter
+- **#1087** — REQ-9: add the `predecessor_correction` bool parameter
   (`_optics.py:277`, `:1147-1150`).
-- **#NN09** — REQ-10: add `metric`/`p`/`metric_params`/`algorithm`/`leaf_size`/
+- **#1088** — REQ-10: add `metric`/`p`/`metric_params`/`algorithm`/`leaf_size`/
   `memory`/`n_jobs` params + `min_samples=5` default + float-fraction
   `min_samples`/`min_cluster_size` (`_optics.py:266-297`, `:598-599`).
-- **#NN10** — REQ-11: `max_eps∈[0,inf]`, `xi∈[0,1]`, `min_samples∈[2,inf)`
+- **#1089** — REQ-11: `max_eps∈[0,inf]`, `xi∈[0,1]`, `min_samples∈[2,inf)`
   endpoint-inclusive bounds + the sklearn `InvalidParameterError`/`ValueError` ABI
   (`_parameter_constraints` `:242-264`).
-- **#NN11** — REQ-12: add `_RsOPTICS` to `ferrolearn-python` (fit / fit_predict /
+- **#1090** — REQ-12: add `_RsOPTICS` to `ferrolearn-python` (fit / fit_predict /
   labels_ / reachability_ / ordering_ / core_distances_ / predecessor_ /
   cluster_hierarchy_ + parameter surface).
-- **#NN12** — REQ-13: migrate `optics.rs` off `ndarray`/`num-traits` to
+- **#1091** — REQ-13: migrate `optics.rs` off `ndarray`/`num-traits` to
   `ferray-core` (R-SUBSTRATE).
-- **#NN01** — REQ-1: add a live-oracle `#[test]` pinning `core_distances_` (the one
-  value-matching attribute) so it has a real verification consumer.
-- **#NN03** — REQ-4: align `predecessor_` to an `isize` `-1`-sentinel array
+- (REQ-1 is SHIPPED — `core_distances_` value-matches the oracle, green-guarded; no blocker.)
+- **#1082** — REQ-4: align `predecessor_` to an `isize` `-1`-sentinel array
   matching sklearn's output object (`_optics.py:558-560`).

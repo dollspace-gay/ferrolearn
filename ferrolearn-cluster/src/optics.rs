@@ -38,43 +38,41 @@
 //! let fitted = OPTICS::<f64>::new(2).fit(&x, &()).unwrap();
 //! assert_eq!(fitted.ordering().len(), 9);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_optics.py` (`class OPTICS`,
+//! `compute_optics_graph`, `cluster_optics_xi`). Design doc:
+//! `.design/cluster/optics.md`. Cites use ferrolearn symbol anchors / sklearn
+//! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
+//! (R-CHAR-3). OPTICS is deterministic (no RNG) → value-parity is genuine. No PyO3
+//! binding — only consumer is the crate re-export. After fixing the traversal
+//! (#1080), `core_distances_`/`ordering_`/`reachability_` VALUE-match sklearn; the Xi
+//! `labels_`, `cluster_hierarchy_`, the dbscan method, and the parameter/attribute
+//! surface remain divergent.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`core_distances_` VALUE) | SHIPPED | impl `fn core_distance` (distance to the `(min_samples-1)`-th other point within `max_eps`) value-matches sklearn `_compute_core_distances_` = `kneighbors(X,min_samples)[0][:,-1]` (`_optics.py:405-438`) even on hard fixtures. Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards: `green_core_distances_three_blobs`, `green_core_distances_small10_ms2/ms3` in `tests/divergence_optics.rs` (live-oracle). |
+//! | REQ-2 (`ordering_` traversal value-parity) | SHIPPED | impl `Fit::fit` now selects the next seed by LINEAR ARGMIN over all unprocessed reachability with smallest-index tie-break (single pool, no heap), matching sklearn `compute_optics_graph` (`_optics.py:638-659`, `:53` "we do not employ a heap"). The prior `BinaryHeap` traversal diverged on tie-prone data. Guard: `divergence_ordering_small10` (sklearn `[0,1,3,9,5,6,7,8,2,4]`; was `[…5,7,8,6…]`) + `green_ordering_three_blobs`/`green_ordering_docstring`. Fixed #1080. |
+//! | REQ-3 (`reachability_` VALUE) | SHIPPED | impl `fn update_seeds` computes `max(core_dist_p, dist)` then rounds via `fn round_to_precision` (`np.around(decimals=np.finfo(dtype).precision)`, round-ties-even = numpy rint, `_optics.py:711`); combined with the REQ-2 traversal the reported plot value-matches sklearn (the #1080 ordering parity on tie fixtures REQUIRES the matching rounded reachability at each argmin step). Guards: `green_reachability_docstring` + (noisy) the ordering parity which is driven by reachability. Fixed #1080 (bundled). |
+//! | REQ-4 (`predecessor_` `-1`-sentinel int array) | NOT-STARTED | open prereq blocker #1082. sklearn `predecessor_` is `ndarray[int]`, seeds `-1` (`_optics.py:558-560`); ferrolearn `predecessors()` returns `&[Option<usize>]` (seed `None`) — different output object (R-DEV-3). |
+//! | REQ-5 (`labels_` Xi VALUE parity) | NOT-STARTED | open prereq blocker #1083. sklearn `labels_` via `cluster_optics_xi` (`:810-918`); ferrolearn diverges (gated on the in-Xi `min_cluster_size` REQ-7 + `cluster_hierarchy_` leaf-selection REQ-8). With REQ-2 fixed the plot now matches, but the Xi label derivation still differs. |
+//! | REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | NOT-STARTED | open prereq blocker #1084. sklearn `fit` branch (`:374-390`) + free fn (`:726-788`); ferrolearn Xi-only, no `cluster_method`/`eps`. |
+//! | REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker #1085. sklearn enforces size INSIDE `_xi_cluster` (`:1155-1156`); ferrolearn post-filters in `fn filter_small_clusters` — different fixed point. |
+//! | REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker #1086. sklearn `(n_clusters,2)` `[start,end]` ordered `(end,-start)` (`:1166-1172`); ferrolearn `fn xi_cluster_extraction` discards the intervals, no accessor. |
+//! | REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker #1087. sklearn `bool` default True (`:277`); ferrolearn always applies `fn correct_predecessor`, no param. |
+//! | REQ-10 (param surface `metric`/`p`/`algorithm`/`leaf_size`/`n_jobs` + `min_samples=5` default + float fractions) | NOT-STARTED | open prereq blocker #1088. sklearn `__init__` (`:266-297`); ferrolearn `fn new(min_samples)` required, only `max_eps`/`xi`/`min_cluster_size` builders. |
+//! | REQ-11 (validation bounds + error ABI) | NOT-STARTED | open prereq blocker #1089. sklearn `max_eps∈[0,inf]`, `xi∈[0,1]` closed-both, `min_samples∈[2,inf)`, `InvalidParameterError` (`:242-264`); ferrolearn over-rejects `max_eps=0`/`xi∈{0,1}`, permits `min_samples=1`, `FerroError` ABI. |
+//! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1090. No `_RsOPTICS` (grep empty); `import ferrolearn` cannot reach OPTICS. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1091. `optics.rs` imports `ndarray`/`num-traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: ordered float wrapper for the priority queue
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// A `(reachability_distance, point_index)` pair that forms a min-heap entry.
-#[derive(Clone, Copy, PartialEq)]
-struct SeedEntry<F: Float> {
-    reach_dist: F,
-    idx: usize,
-}
-
-impl<F: Float> Eq for SeedEntry<F> {}
-
-/// We want a **min**-heap, so we reverse the comparison.
-impl<F: Float> Ord for SeedEntry<F> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // NaN is treated as greater than anything (put last).
-        other
-            .reach_dist
-            .partial_cmp(&self.reach_dist)
-            .unwrap_or(Ordering::Less)
-    }
-}
-
-impl<F: Float> PartialOrd for SeedEntry<F> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration struct
@@ -330,14 +328,38 @@ fn core_distance<F: Float>(x: &Array2<F>, idx: usize, max_eps: F, min_samples: u
     }
 }
 
-/// Update the seed list with neighbours that have improved reachability,
-/// and track predecessors.
+/// Round a reachability value to the floating-point type's decimal precision,
+/// matching sklearn's `np.around(rdists, decimals=np.finfo(dtype).precision)`
+/// (`sklearn/cluster/_optics.py:711`).
+///
+/// `np.finfo` precision is 15 decimals for float64 and 6 for float32.  Rounding
+/// collapses sub-ULP differences between candidate reachabilities into exact
+/// ties, which is required for sklearn's smallest-index tie-break in the
+/// traversal to reproduce its ordering.
+#[inline]
+fn round_to_precision<F: Float>(v: F) -> F {
+    if !v.is_finite() {
+        return v;
+    }
+    let decimals = if std::mem::size_of::<F>() == 4 { 6 } else { 15 };
+    let factor = F::from(10f64.powi(decimals)).unwrap_or_else(F::one);
+    // numpy's `np.around` uses round-half-to-even (`np.rint`); matching it is
+    // load-bearing — half-away-from-zero would shift `538516480713450.5` to
+    // `...451` instead of `...450`, breaking the tie collapse. f64/f32 both
+    // round through f64 here, then convert back, mirroring numpy's multiply/
+    // rint/divide.
+    let scaled = (v * factor).to_f64().unwrap_or(0.0).round_ties_even();
+    F::from(scaled).unwrap_or(v) / factor
+}
+
+/// Update reachability distances and predecessors for the unprocessed
+/// neighbours of `current_point`.
 ///
 /// For each unprocessed neighbour `q`, the new reachability distance is
-/// `max(core_dist_p, dist(p, q))`.  If this improves the current value, the
-/// seed list is updated and `current_point` is recorded as the predecessor
-/// of `q`.
-#[allow(clippy::too_many_arguments)]
+/// `round(max(core_dist_p, dist(p, q)))` (rounded to the dtype precision,
+/// matching `np.around` in `_set_reach_dist`, `sklearn/cluster/_optics.py:710-714`).
+/// If this improves the current value, `reachability[q]` is lowered and
+/// `current_point` is recorded as the predecessor of `q`.
 fn update_seeds<F: Float>(
     core_dist_p: F,
     current_point: usize,
@@ -346,7 +368,6 @@ fn update_seeds<F: Float>(
     processed: &[bool],
     reachability: &mut Array1<F>,
     predecessors: &mut [Option<usize>],
-    seeds: &mut BinaryHeap<SeedEntry<F>>,
 ) {
     for (i, &q) in neighbors.iter().enumerate() {
         if processed[q] {
@@ -357,13 +378,12 @@ fn update_seeds<F: Float>(
         } else {
             neighbor_dists[i]
         };
+        // np.around to the dtype precision (`_optics.py:711`) so that
+        // sub-ULP differences become exact ties for the tie-break.
+        let new_reach = round_to_precision(new_reach);
         if new_reach < reachability[q] {
             reachability[q] = new_reach;
             predecessors[q] = Some(current_point);
-            seeds.push(SeedEntry {
-                reach_dist: new_reach,
-                idx: q,
-            });
         }
     }
 }
@@ -810,62 +830,46 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
             core_distances[i] = core_distance(x, i, self.max_eps, self.min_samples);
         }
 
-        // Main OPTICS loop.
-        for start in 0..n_samples {
-            if processed[start] {
-                continue;
-            }
-
-            processed[start] = true;
-            ordering.push(start);
-
-            if core_distances[start].is_infinite() {
-                // Not a core point — just record it as noise candidate.
-                continue;
-            }
-
-            // Priority queue (min-heap by reachability).
-            let mut seeds: BinaryHeap<SeedEntry<F>> = BinaryHeap::new();
-
-            let (nbrs, nbr_dists) = get_neighbors(x, start, self.max_eps);
-            update_seeds(
-                core_distances[start],
-                start,
-                &nbrs,
-                &nbr_dists,
-                &processed,
-                &mut reachability,
-                &mut predecessors,
-                &mut seeds,
-            );
-
-            while let Some(entry) = seeds.pop() {
-                let p = entry.idx;
-                // Stale entry: a better reachability may have been inserted later.
-                if processed[p] {
+        // Main OPTICS loop (`compute_optics_graph`, `sklearn/cluster/_optics.py:638-659`).
+        // sklearn does NOT use a heap (comment :52-53): each iteration picks the
+        // next point by a linear argmin over ALL unprocessed points' reachability
+        // (including those still at +inf), preferring the smallest index on ties
+        // (:639-640 "prefer smaller ids on ties, possibly np.inf!"). The order
+        // entries are written to `ordering` is significant (:632-633).
+        for _ in 0..n_samples {
+            // Choose the next point: smallest reachability over unprocessed, with
+            // smallest-index tie-break (`index[np.argmin(reachability_[index])]`,
+            // :641-642).
+            let mut point: Option<usize> = None;
+            let mut best = F::infinity();
+            for j in 0..n_samples {
+                if processed[j] {
                     continue;
                 }
-                // Skip entries whose reachability is outdated.
-                if entry.reach_dist > reachability[p] {
-                    continue;
+                // Strict `<` keeps the first (smallest) index on ties.
+                if point.is_none() || reachability[j] < best {
+                    best = reachability[j];
+                    point = Some(j);
                 }
+            }
+            let Some(point) = point else {
+                break;
+            };
 
-                processed[p] = true;
-                ordering.push(p);
+            processed[point] = true;
+            ordering.push(point);
 
-                if core_distances[p].is_finite() {
-                    let (p_nbrs, p_nbr_dists) = get_neighbors(x, p, self.max_eps);
-                    update_seeds(
-                        core_distances[p],
-                        p,
-                        &p_nbrs,
-                        &p_nbr_dists,
-                        &processed,
-                        &mut reachability,
-                        &mut predecessors,
-                        &mut seeds,
-                    );
-                }
+            if core_distances[point].is_finite() {
+                let (nbrs, nbr_dists) = get_neighbors(x, point, self.max_eps);
+                update_seeds(
+                    core_distances[point],
+                    point,
+                    &nbrs,
+                    &nbr_dists,
+                    &processed,
+                    &mut reachability,
+                    &mut predecessors,
+                );
             }
         }
 
