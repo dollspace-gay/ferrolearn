@@ -8,6 +8,23 @@
 //! [`crate::FittedKNeighborsClassifier::kneighbors_graph`] which delegate
 //! to these free functions after a `kneighbors` query against the fitted
 //! data.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors` graph functions (`sklearn/neighbors/_graph.py`).
+//! See `.design/neighbors/graph.md`. Non-test consumer: crate re-export +
+//! the `Fitted*::kneighbors_graph` method forms.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `kneighbors_graph` value: `include_self=False` default (zero diagonal, `n_neighbors` non-self edges via query+1/drop-self, `_graph.py:34-43`) + CSR | SHIPPED |
+//! | REQ-2 | `radius_neighbors_graph` value: self-edge dropped (zero diagonal, `_graph.py:255`) | SHIPPED |
+//! | REQ-3 | `GraphMode`/`mode` value mapping: connectivity → 1.0, distance → actual (`_graph.py`) | SHIPPED |
+//! | REQ-4 | CSR output contract: `(n×n)` shape, ascending column indices per row | SHIPPED |
+//! | REQ-5 | `sort_graph_by_row_values` ascending-stored-value sort (`_base.py:271-289`) | NOT-STARTED (#825, blocked on ferrolearn-sparse `CsrMatrix::new_unchecked` #826) |
+//! | REQ-6 | `include_self=True` toggle + `metric`/`p`/`metric_params`/`n_jobs` params | NOT-STARTED (#827) |
+//! | REQ-7 | `KNeighborsTransformer` + `RadiusNeighborsTransformer` estimators | NOT-STARTED (#828) |
+//! | REQ-8 | PyO3 binding + ferray sparse substrate | NOT-STARTED (#829) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -49,12 +66,60 @@ pub fn kneighbors_graph<F: Float + Send + Sync + 'static>(
     n_neighbors: usize,
     mode: GraphMode,
 ) -> Result<CsrMatrix<F>, FerroError> {
+    // sklearn's `kneighbors_graph` defaults `include_self=False`, routing the
+    // query through `_query_include_self` (`sklearn/neighbors/_graph.py:34-43`:
+    // "if not include_self: X = None") so each sample's OWN row is excluded —
+    // the graph has a zero diagonal and reports `n_neighbors` NON-self
+    // neighbors per row. We emulate that `X=None` semantics by querying
+    // `n_neighbors + 1` neighbors and dropping each row's self entry. When
+    // `n_neighbors >= n_samples` sklearn errors; querying `n_neighbors + 1`
+    // preserves that (the underlying `kneighbors` rejects `k > n_train`).
+    let query_k = n_neighbors + 1;
     let nn = NearestNeighbors::<F>::new()
-        .with_n_neighbors(n_neighbors)
+        .with_n_neighbors(query_k)
         .with_algorithm(Algorithm::Auto)
         .fit(x, &())?;
-    let (distances, indices) = nn.kneighbors(x, Some(n_neighbors))?;
+    let (distances, indices) = nn.kneighbors(x, Some(query_k))?;
+    let (distances, indices) = drop_self_neighbors(&distances, &indices, n_neighbors);
     knn_to_csr(&distances, &indices, x.nrows(), x.nrows(), mode)
+}
+
+/// Drop each query row's self entry from `(distances, indices)` results.
+///
+/// Mirrors sklearn's `include_self=False` (`X=None`) query semantics: the
+/// query is the fitted data itself, so each row `i` contains its own index as
+/// a 0-distance neighbor. We remove the FIRST occurrence of `index == i`; if no
+/// self entry is present (only possible with exact-duplicate points, where the
+/// self-match may not sort first), we drop the last/farthest entry so the
+/// output stays exactly `n_neighbors` wide. Inputs are `(n_rows, n_neighbors+1)`
+/// arrays; the output is `(n_rows, n_neighbors)`.
+fn drop_self_neighbors<F: Float>(
+    distances: &Array2<F>,
+    indices: &Array2<usize>,
+    n_neighbors: usize,
+) -> (Array2<F>, Array2<usize>) {
+    let n_rows = indices.nrows();
+    let query_k = indices.ncols();
+    let mut out_dist = Array2::<F>::zeros((n_rows, n_neighbors));
+    let mut out_idx = Array2::<usize>::zeros((n_rows, n_neighbors));
+
+    for i in 0..n_rows {
+        // Index of the entry to drop: the first self-match, else the last.
+        let drop = (0..query_k)
+            .find(|&j| indices[[i, j]] == i)
+            .unwrap_or(query_k - 1);
+        let mut out_col = 0;
+        for j in 0..query_k {
+            if j == drop || out_col == n_neighbors {
+                continue;
+            }
+            out_dist[[i, out_col]] = distances[[i, j]];
+            out_idx[[i, out_col]] = indices[[i, j]];
+            out_col += 1;
+        }
+    }
+
+    (out_dist, out_idx)
 }
 
 /// Compute the (weighted) graph of radius-based neighbors for points in
@@ -77,7 +142,27 @@ pub fn radius_neighbors_graph<F: Float + Send + Sync + 'static>(
         .with_algorithm(Algorithm::Auto);
     let fitted = clf.fit(x, &dummy_y)?;
     let (distances, indices) = fitted.radius_neighbors(x, Some(radius))?;
-    radius_to_csr(&distances, &indices, x.nrows(), x.nrows(), mode)
+    // sklearn's `radius_neighbors_graph` defaults `include_self=False`, routing
+    // through `_query_include_self` (`sklearn/neighbors/_graph.py:255`:
+    // "if not include_self: X = None") so the always-within-radius distance-0
+    // self-edge is excluded — the graph has a zero diagonal. Unlike kneighbors
+    // (fixed-width output), radius returns variable-length rows, so we simply
+    // drop any entry where neighbor index == query row index.
+    let n_rows = x.nrows();
+    let distances_no_self: Vec<Vec<F>> = (0..n_rows)
+        .map(|i| {
+            distances[i]
+                .iter()
+                .zip(indices[i].iter())
+                .filter(|&(_, &j)| j != i)
+                .map(|(&d, _)| d)
+                .collect()
+        })
+        .collect();
+    let indices_no_self: Vec<Vec<usize>> = (0..n_rows)
+        .map(|i| indices[i].iter().filter(|&&j| j != i).copied().collect())
+        .collect();
+    radius_to_csr(&distances_no_self, &indices_no_self, n_rows, n_rows, mode)
 }
 
 /// Build a CSR matrix from k-neighbor query results.
