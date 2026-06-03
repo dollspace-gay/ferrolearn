@@ -5,6 +5,27 @@
 //!
 //! - [`dcg_score`] — Discounted Cumulative Gain
 //! - [`ndcg_score`] — Normalized Discounted Cumulative Gain
+//!
+//! ## REQ status
+//!
+//! Mirrors scikit-learn ranking metrics (`sklearn/metrics/_ranking.py`). See
+//! `.design/metrics/ranking.md`. Non-test consumer: crate re-export. The
+//! dcg/ndcg/label_ranking value divergences (#754/#755/#756) are fixed; the
+//! remaining gaps are the 2D-multisample + `sample_weight` signature
+//! extensions and the ROC/PR surface (owned by `classification.rs`).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `dcg_score` 1D tie-averaged DCG (default `ignore_ties=False`, `_ranking.py:1528`): tied `y_score` share the mean discount over the ranks they span | SHIPPED |
+//! | REQ-2 | `ndcg_score` 1D tie-averaged + negative-`y_true` `ValueError` guard (`_ranking.py:1770,:1868-1869`); ideal-DCG plain (`:1753`) | SHIPPED |
+//! | REQ-3 | `coverage_error` 1D value: tie max-rank, empty-row → 0 (`_ranking.py:1301`) | SHIPPED |
+//! | REQ-4 | `label_ranking_average_precision_score` 1D value (`_ranking.py:1202`) | SHIPPED |
+//! | REQ-5 | `label_ranking_loss` 1D value: degenerate rows → 0, averaged over all `n_samples` (`_ranking.py:1461-1465`) | SHIPPED |
+//! | REQ-6 | `dcg_score`/`ndcg_score` 2D `(n_samples,n_labels)` sample-mean + `sample_weight` + `log_base` | NOT-STARTED (#761) |
+//! | REQ-7 | `coverage_error`/LRAP/`label_ranking_loss` `sample_weight` | NOT-STARTED (#762) |
+//! | REQ-8 | ROC/PR surface (`auc`/`roc_auc_score`/`roc_curve`/`precision_recall_curve`/`average_precision_score`/`det_curve`/`top_k_accuracy_score`) currently in `classification.rs` | NOT-STARTED (#763) |
+//! | REQ-9 | PyO3 binding for ranking metrics | NOT-STARTED (#764) |
+//! | REQ-10 | ferray substrate migration | NOT-STARTED (#765) |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
