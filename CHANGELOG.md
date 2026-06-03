@@ -243,6 +243,9 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: scorer.rs REQ-5 mis-frames d2_absolute_error_score as blocked on heterogeneous Scorer type #781 — it is a regression fn(&Array1,&Array1) metric registerable now (sklearn _sign==+1, _scorer.py:788) (#787)
+- Divergence: ferrolearn-metrics scorer registry diverges from sklearn/metrics/_scorer.py:761 (neg_max_error is not a sklearn name; max_error missing) (#780)
+- Divergence: ferrolearn-metrics::Scorer::score diverges from sklearn/metrics/_scorer.py:376 (sign not applied) (#779)
 - Divergence: d2_score_with / d2_tweedie_score diverge from sklearn/metrics/_regression.py:1736-1739,1599 on n>=2 constant-y_true (zero denominator) (#771)
 - Divergence: ferrolearn_metrics d2_* (absolute_error/pinball/tweedie) diverge from sklearn/metrics/_regression.py:1699-1702,1584-1587 (<2 samples -> nan, not Ok(0.0)) (#770)
 - Divergence: ferrolearn_metrics::mean_absolute_percentage_error diverges from sklearn/metrics/_regression.py:403-404 (eps clamp vs skip-zero-y_true) (#769)
