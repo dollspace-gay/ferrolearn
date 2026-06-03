@@ -14,6 +14,38 @@
 //! - [`average_precision_score`] — average precision from precision-recall curve
 //! - [`confusion_matrix`] — matrix of true/predicted class counts
 //! - [`log_loss`] — cross-entropy loss for probabilistic classifiers
+//!
+//! ## REQ status
+//!
+//! Mirrors scikit-learn classification metrics (`sklearn/metrics/_classification.py`)
+//! + the ranking curves it hosts (`sklearn/metrics/_ranking.py`). See
+//!   `.design/metrics/classification.md`. Non-test consumer: crate re-export. The
+//!   present functions are value-correct on their supported (default) signature
+//!   vs the live oracle; the `zero_division`/`average='samples'`/`pos_label`/
+//!   `sample_weight`/multiclass-roc_auc/arbitrary-label extensions are NOT-STARTED.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `accuracy_score` / `hamming_loss` / `zero_one_loss` value (`_classification.py`) | SHIPPED |
+//! | REQ-2 | `precision`/`recall`/`f1`/`fbeta`/`jaccard_score` value: binary (`pos_label=1`) + micro/macro/weighted, `zero_division=0.0` default (`_classification.py`) | SHIPPED |
+//! | REQ-3 | `confusion_matrix` + `multilabel_confusion_matrix` value (default) (`_classification.py`) | SHIPPED |
+//! | REQ-4 | `matthews_corrcoef` (zero-denom → 0) + `cohen_kappa_score` (unweighted) + `balanced_accuracy_score` (`+adjusted`) value (`_classification.py`) | SHIPPED |
+//! | REQ-5 | `roc_auc_score` (binary) + `auc` value (`_ranking.py`) | SHIPPED |
+//! | REQ-6 | `roc_curve` (`drop_intermediate=True`, `_ranking.py:1158`) + `precision_recall_curve` + `det_curve` (no `+inf` endpoint, `_ranking.py:351-376`) value | SHIPPED |
+//! | REQ-7 | `average_precision_score` step integration `Σ(R_n−R_{n−1})·P_n` (`_ranking.py`) | SHIPPED |
+//! | REQ-8 | `log_loss` clip `eps = f64::EPSILON` (`_classification.py:2951`) + `d2_log_loss_score` | SHIPPED |
+//! | REQ-9 | `calibration_curve` `np.searchsorted(linspace(0,1,n_bins+1)[1:-1], prob)` binning (`calibration.py:1035`) | SHIPPED |
+//! | REQ-10 | `top_k_accuracy_score` value + mergesort tie-break (higher index first, `_ranking.py:2043`) | SHIPPED |
+//! | REQ-11 | `brier_score_loss` (binary) + `hinge_loss` (binary) value (`_classification.py`) | SHIPPED |
+//! | REQ-12 | `zero_division` param options (`0.0`/`1.0`/`nan` + `UndefinedMetricWarning`) | NOT-STARTED (#813) |
+//! | REQ-13 | `average='samples'`/`None` + `pos_label` for the averaged metrics | NOT-STARTED (#814) |
+//! | REQ-14 | `roc_auc_score` `multi_class='ovr'/'ovo'` + `average` + 2D score input | NOT-STARTED (#815) |
+//! | REQ-15 | `cohen_kappa_score` `weights` + `classification_report` `digits`/format + `precision_recall_fscore_support` per-class output | NOT-STARTED (#816) |
+//! | REQ-16 | `sample_weight` (all metrics) + `confusion_matrix` `normalize` + `labels` | NOT-STARTED (#817) |
+//! | REQ-17 | Arbitrary-label substrate (str/negative/non-contiguous via LabelEncoder); currently `Array1<usize>` | NOT-STARTED (#818) |
+//! | REQ-18 | `d2_brier_score` has NO sklearn 1.5.2 analog — out of scope (`translate, not innovate`) | NOT-STARTED (#819) |
+//! | REQ-19 | PyO3 binding | NOT-STARTED (#820) |
+//! | REQ-20 | ferray substrate migration | NOT-STARTED (#821) |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -487,7 +519,9 @@ pub fn confusion_matrix(
 /// `log_loss = -1/n * sum_i sum_k y_{i,k} * log(p_{i,k})`
 ///
 /// Labels in `y_true` are used as column indices into `y_prob`. Probabilities
-/// are clipped to `[eps, 1-eps]` with `eps = 1e-15` to avoid `log(0)`.
+/// are clipped to `[eps, 1-eps]` with `eps = f64::EPSILON`
+/// (= `np.finfo(float64).eps` = 2.220446049250313e-16, matching sklearn 1.5.2
+/// `_classification.py:2951`) to avoid `log(0)`.
 ///
 /// # Arguments
 ///
@@ -534,7 +568,9 @@ pub fn log_loss(y_true: &Array1<usize>, y_prob: &Array2<f64>) -> Result<f64, Fer
     }
 
     let n_classes = y_prob.ncols();
-    const EPS: f64 = 1e-15;
+    // sklearn 1.5.2 `_classification.py:2951`: eps = np.finfo(y_pred.dtype).eps
+    // For float64 that is 2.220446049250313e-16 == f64::EPSILON.
+    let eps = f64::EPSILON;
 
     let mut total = 0.0_f64;
     for (i, &label) in y_true.iter().enumerate() {
@@ -546,7 +582,7 @@ pub fn log_loss(y_true: &Array1<usize>, y_prob: &Array2<f64>) -> Result<f64, Fer
                 ),
             });
         }
-        let p = y_prob[[i, label]].clamp(EPS, 1.0 - EPS);
+        let p = y_prob[[i, label]].clamp(eps, 1.0 - eps);
         total += p.ln();
     }
 
@@ -653,17 +689,14 @@ where
     let (n_pos, n_neg) = validate_binary_scores(y_true, y_score, "roc_curve")?;
     let pairs = sort_by_score_desc(y_true, y_score);
 
-    let mut fpr_vec: Vec<F> = Vec::new();
-    let mut tpr_vec: Vec<F> = Vec::new();
-    let mut thresh_vec: Vec<F> = Vec::new();
-
-    // Start at (0, 0) with threshold = +infinity.
-    fpr_vec.push(F::zero());
-    tpr_vec.push(F::zero());
-    thresh_vec.push(F::infinity());
-
-    let n_pos_f = F::from(n_pos).unwrap();
-    let n_neg_f = F::from(n_neg).unwrap();
+    // Cumulative false/true positive counts at each distinct threshold, in
+    // descending-score order — mirrors sklearn's `_binary_clf_curve`
+    // (_ranking.py:1145) output `fps`/`tps` BEFORE the (0,0)/+inf prepend and
+    // BEFORE normalization. Kept as integer counts so the `drop_intermediate`
+    // second-difference test below is exact.
+    let mut fps: Vec<usize> = Vec::new();
+    let mut tps: Vec<usize> = Vec::new();
+    let mut raw_thresh: Vec<F> = Vec::new();
 
     let mut tp: usize = 0;
     let mut fp: usize = 0;
@@ -680,9 +713,72 @@ where
             }
             i += 1;
         }
-        fpr_vec.push(F::from(fp).unwrap() / n_neg_f);
-        tpr_vec.push(F::from(tp).unwrap() / n_pos_f);
-        thresh_vec.push(score);
+        fps.push(fp);
+        tps.push(tp);
+        raw_thresh.push(score);
+    }
+
+    // drop_intermediate (sklearn default `True`, _ranking.py:1158): drop
+    // thresholds collinear with their neighbours on the step curve. Keep index
+    // 0, the last index, and any interior index `j` where the second difference
+    // of `fps` OR `tps` is non-zero (a point is dropped only if it lies on a
+    // straight segment of BOTH step curves). Guarded by `len(fps) > 2`.
+    if fps.len() > 2 {
+        let n = fps.len();
+        let mut k_fps = Vec::with_capacity(n);
+        let mut k_tps = Vec::with_capacity(n);
+        let mut k_thr = Vec::with_capacity(n);
+        for j in 0..n {
+            let keep = j == 0
+                || j == n - 1
+                || (fps[j + 1] + fps[j - 1] != 2 * fps[j])
+                || (tps[j + 1] + tps[j - 1] != 2 * tps[j]);
+            if keep {
+                k_fps.push(fps[j]);
+                k_tps.push(tps[j]);
+                k_thr.push(raw_thresh[j]);
+            }
+        }
+        fps = k_fps;
+        tps = k_tps;
+        raw_thresh = k_thr;
+    }
+
+    let n_pos_f =
+        num_traits::cast::<usize, F>(n_pos).ok_or_else(|| FerroError::InvalidParameter {
+            name: "n_pos".into(),
+            reason: "positive count not representable in F".to_string(),
+        })?;
+    let n_neg_f =
+        num_traits::cast::<usize, F>(n_neg).ok_or_else(|| FerroError::InvalidParameter {
+            name: "n_neg".into(),
+            reason: "negative count not representable in F".to_string(),
+        })?;
+
+    // Prepend the (0, 0) point with threshold = +infinity, then normalize the
+    // cumulative counts into rates (sklearn _ranking.py:1168-1180).
+    let mut fpr_vec: Vec<F> = Vec::with_capacity(fps.len() + 1);
+    let mut tpr_vec: Vec<F> = Vec::with_capacity(tps.len() + 1);
+    let mut thresh_vec: Vec<F> = Vec::with_capacity(raw_thresh.len() + 1);
+
+    fpr_vec.push(F::zero());
+    tpr_vec.push(F::zero());
+    thresh_vec.push(F::infinity());
+
+    for j in 0..fps.len() {
+        let fp_f =
+            num_traits::cast::<usize, F>(fps[j]).ok_or_else(|| FerroError::InvalidParameter {
+                name: "fps".into(),
+                reason: "count not representable in F".to_string(),
+            })?;
+        let tp_f =
+            num_traits::cast::<usize, F>(tps[j]).ok_or_else(|| FerroError::InvalidParameter {
+                name: "tps".into(),
+                reason: "count not representable in F".to_string(),
+            })?;
+        fpr_vec.push(fp_f / n_neg_f);
+        tpr_vec.push(tp_f / n_pos_f);
+        thresh_vec.push(raw_thresh[j]);
     }
 
     Ok((
@@ -1142,6 +1238,7 @@ pub fn top_k_accuracy_score(
             row[b]
                 .partial_cmp(&row[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then(b.cmp(&a))
         });
         let top_k = &indices[..k.min(n_classes)];
         if top_k.contains(&label) {
@@ -1236,16 +1333,34 @@ where
     }
 
     let n_bins_f = F::from(n_bins).unwrap();
+    // Build interior edges matching numpy linspace(0, 1, n_bins+1)[1:-1].
+    // numpy linspace: step = 1.0/n_bins, bins[k] = k*step for k < n_bins.
+    // Interior edges are bins[1..n_bins]: edge_j = j*step, j = 1..n_bins-1.
+    // sklearn calibration.py:1028 & 1035:
+    //   bins = np.linspace(0.0, 1.0, n_bins + 1)
+    //   binids = np.searchsorted(bins[1:-1], y_prob)
+    let step = F::one() / n_bins_f;
+    let mut interior_edges: Vec<F> = Vec::with_capacity(n_bins.saturating_sub(1));
+    {
+        let mut edge = step;
+        for _ in 1..n_bins {
+            interior_edges.push(edge);
+            edge = edge + step;
+        }
+    }
+
     let mut bin_pos_sum = vec![F::zero(); n_bins];
     let mut bin_prob_sum = vec![F::zero(); n_bins];
     let mut bin_count = vec![0usize; n_bins];
 
     for (&label, &prob) in y_true.iter().zip(y_prob.iter()) {
-        // Determine bin index: floor(prob * n_bins), clamped to [0, n_bins-1].
-        let mut bin = (prob * n_bins_f).to_usize().unwrap_or(0);
-        if bin >= n_bins {
-            bin = n_bins - 1;
-        }
+        // searchsorted(interior_edges, prob, side='left'):
+        // count the number of interior edges strictly less than prob.
+        // This faithfully mirrors np.searchsorted(bins[1:-1], y_prob)
+        // (default side='left') against the ACTUAL float linspace values,
+        // avoiding the fract()==0 shortcut that assumed exact k/n_bins edges.
+        let bin = interior_edges.iter().filter(|&&e| e < prob).count();
+        let bin = bin.min(n_bins - 1);
         bin_count[bin] += 1;
         bin_prob_sum[bin] = bin_prob_sum[bin] + prob;
         if label == 1 {
@@ -1808,8 +1923,13 @@ pub fn classification_report(
 
 /// Compute the Detection Error Tradeoff (DET) curve.
 ///
-/// Returns `(fpr, fnr, thresholds)`. Like [`roc_curve`] but the y-axis is the
-/// false-negative rate `(FNR = 1 - TPR)` instead of the true-positive rate.
+/// Returns `(fpr, fnr, thresholds)` in increasing-threshold order. Like
+/// [`roc_curve`] the y-axis is the false-negative rate `(FNR = 1 - TPR)`, but —
+/// matching sklearn's `det_curve` (`_ranking.py:351-376`) — the curve does NOT
+/// carry the ROC `(0, 0)`/`+inf` endpoint and does NOT apply `roc_curve`'s
+/// `drop_intermediate` collinear thinning: it slices off the redundant leading
+/// `fps == fps[0]` points and the trailing `tps < tps[-1]` points, then keeps
+/// every remaining real threshold.
 ///
 /// # Errors
 ///
@@ -1818,10 +1938,93 @@ pub fn det_curve<F>(y_true: &Array1<usize>, y_score: &Array1<F>) -> CurveResult<
 where
     F: Float + Send + Sync + 'static,
 {
-    let (fpr, tpr, thresh) = roc_curve(y_true, y_score)?;
-    let one = F::one();
-    let fnr = tpr.mapv(|v| one - v);
-    Ok((fpr, fnr, thresh))
+    let (n_pos, n_neg) = validate_binary_scores(y_true, y_score, "det_curve")?;
+    let pairs = sort_by_score_desc(y_true, y_score);
+
+    // Cumulative false/true positive counts at each distinct threshold, in
+    // descending-score order — sklearn's `_binary_clf_curve` `fps`/`tps`
+    // (_ranking.py:351). No `drop_intermediate`: sklearn's `det_curve` keeps
+    // every real threshold.
+    let mut fps: Vec<usize> = Vec::new();
+    let mut tps: Vec<usize> = Vec::new();
+    let mut raw_thresh: Vec<F> = Vec::new();
+
+    let mut tp: usize = 0;
+    let mut fp: usize = 0;
+    let mut i = 0;
+    while i < pairs.len() {
+        let score = pairs[i].0;
+        while i < pairs.len() && pairs[i].0 == score {
+            if pairs[i].1 == 1 {
+                tp += 1;
+            } else {
+                fp += 1;
+            }
+            i += 1;
+        }
+        fps.push(fp);
+        tps.push(tp);
+        raw_thresh.push(score);
+    }
+
+    // `fns = tps[-1] - tps`; `p_count = tps[-1]`; `n_count = fps[-1]`
+    // (_ranking.py:361-363).
+    let p_count = *tps.last().unwrap_or(&0);
+    let n_count = *fps.last().unwrap_or(&0);
+
+    // Drop the redundant collinear leading entries (all sharing `fps[0]`) down
+    // to the last of them, and the trailing entries before `tps` reaches its
+    // max — sklearn's `sl = slice(first_ind, last_ind)` (_ranking.py:366-373).
+    let fps0 = fps[0];
+    let first_ind = fps
+        .iter()
+        .take_while(|&&v| v == fps0)
+        .count()
+        .saturating_sub(1);
+    let last_ind = tps
+        .iter()
+        .position(|&v| v == p_count)
+        .map_or(tps.len(), |j| j + 1);
+
+    let n_pos_f =
+        num_traits::cast::<usize, F>(n_pos).ok_or_else(|| FerroError::InvalidParameter {
+            name: "n_pos".into(),
+            reason: "positive count not representable in F".to_string(),
+        })?;
+    let n_neg_f =
+        num_traits::cast::<usize, F>(n_neg).ok_or_else(|| FerroError::InvalidParameter {
+            name: "n_neg".into(),
+            reason: "negative count not representable in F".to_string(),
+        })?;
+    debug_assert_eq!(n_pos, p_count);
+    debug_assert_eq!(n_neg, n_count);
+
+    // Reverse the slice so thresholds increase (sklearn `[sl][::-1]`).
+    let mut fpr_vec: Vec<F> = Vec::with_capacity(last_ind - first_ind);
+    let mut fnr_vec: Vec<F> = Vec::with_capacity(last_ind - first_ind);
+    let mut thresh_vec: Vec<F> = Vec::with_capacity(last_ind - first_ind);
+    for j in (first_ind..last_ind).rev() {
+        let fp_f =
+            num_traits::cast::<usize, F>(fps[j]).ok_or_else(|| FerroError::InvalidParameter {
+                name: "fps".into(),
+                reason: "count not representable in F".to_string(),
+            })?;
+        let fn_f = num_traits::cast::<usize, F>(p_count - tps[j]).ok_or_else(|| {
+            FerroError::InvalidParameter {
+                name: "fns".into(),
+                reason: "count not representable in F".to_string(),
+            }
+        })?;
+        fpr_vec.push(fp_f / n_neg_f);
+        fnr_vec.push(fn_f / n_pos_f);
+        thresh_vec.push(raw_thresh[j]);
+    }
+
+    Ok((
+        Array1::from_vec(fpr_vec),
+        Array1::from_vec(fnr_vec),
+        Array1::from_vec(thresh_vec),
+    ))
 }
 
 // ---------------------------------------------------------------------------
