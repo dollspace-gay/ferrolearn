@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/knn: KNeighborsClassifier predict + smallest-label tie-break, KNeighborsRegressor predict (uniform+distance), kneighbors value, and HasClasses verified value-correct vs live sklearn 1.5.2 (7 green guards + ferrolearn-python/pipeline/graph.rs consumers); REQ table (5 SHIPPED, 7 NOT-STARTED — predict_proba/score value-correct but unbound #877, reg multi-output #875, missing params #876) (#873)
 - neighbors/nearest_neighbors: NearestNeighbors kneighbors (explicit-X k-NN value), radius_neighbors (value/set), and query-time error guards verified value-correct vs live sklearn 1.5.2 (4 green guards + non-test consumers in graph.rs); REQ table (4 SHIPPED, 7 NOT-STARTED — X=None self-exclusion #866, radius sort_results default #867, metric/p/radius params #868) (#864)
 - neighbors/balltree: BallTree query k-NN value, tie-SET, and within_radius value contracts verified value-correct vs live sklearn 1.5.2 (5 green guards + real non-test consumers in knn/nearest_neighbors/radius_neighbors); REQ table (3 SHIPPED, 9 NOT-STARTED — metric/kernel_density/two_point_correlation, k>n+empty-X ValueError #858 blocked on query->Result threading cf #831) (#854)
 - neighbors/local_outlier_factor: LocalOutlierFactor contamination="auto" default (Contamination enum) + offset_ (-1.5/percentile) + negative_outlier_factor_ contract, predict via nof<offset_, decision_function=score_samples-offset_; REQ table (5 SHIPPED, 6 NOT-STARTED) critic-verified vs sklearn 1.5.2 (#844 #847 #848 #849)
@@ -251,6 +252,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- neighbors/knn: KNeighborsClassifier::fit and KNeighborsRegressor::fit no longer error when n_neighbors > n_samples — sklearn defers that check to predict/kneighbors() call time (sklearn/neighbors/_base.py:828); removed the non-sklearn fit-time InsufficientSamples guard from both fits, kept the n_neighbors>=1 + X/y shape validation (#874 #879)
 - neighbors/nearest_neighbors: NearestNeighbors::fit no longer errors when n_neighbors > n_samples — sklearn defers that check to kneighbors() call time (sklearn/neighbors/_base.py:828); removed the non-sklearn fit-time InsufficientSamples guard, kept the n_neighbors>=1 fit validation (#872)
 - LOF score_samples/decision_function convention (#849)
 - LOF predict/fit_predict labels via negative_outlier_factor_<offset_ (#848)
