@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/graph: kneighbors_graph + radius_neighbors_graph self-exclusion (include_self=False default, zero diagonal) + REQ table; cleared 2 crate clippy debts (#822 #823 #824)
 - metrics/classification: log_loss eps + roc_curve drop_intermediate + det_curve endpoint + calibration searchsorted + top_k tie-break edge-parity fixes; REQ table (completes ferrolearn-metrics) (#806)
 - metrics/pairwise: REQ table + 11 value-contract guards (present distance/kernel functions verified value-correct to ULP vs live sklearn) (#788)
 - translate(svm): REQ-1/8 gamma='auto' (Gamma enum scale/auto/value) + shrinking/break_ties/default alignment (#641 partial)
@@ -245,6 +246,8 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-neighbors::radius_neighbors_graph keeps self-edge vs sklearn/neighbors/_graph.py:164 default include_self=False (#824)
+- Divergence: ferrolearn-neighbors::kneighbors_graph includes self (zero-diagonal missing) vs sklearn/neighbors/_graph.py:59 default include_self=False (#823)
 - Divergence: ferrolearn-metrics::top_k_accuracy_score diverges from sklearn/_ranking.py:2043 on tie-breaking (#812)
 - Divergence: ferrolearn-metrics::calibration_curve diverges from sklearn/calibration.py:1035 on float-edge binning (#811)
 - Divergence: ferrolearn-metrics calibration_curve bins by floor(prob*n_bins); sklearn calibration.py:1035 uses searchsorted(bins[1:-1], prob) (#810)
