@@ -38,6 +38,41 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. The non-test production consumer is `_RsMultinomialNB`
+//! / `RsMultinomialNB` (`ferrolearn-python/src/extras.rs`, built via the
+//! `py_classifier!` macro), which exercises `new(alpha, fit_prior)` / `fit` /
+//! `predict` against the library `FittedMultinomialNB` and is surfaced as
+//! `ferrolearn.MultinomialNB` (`_extras.py`, `class MultinomialNB`); plus the
+//! in-crate `impl PipelineEstimator for MultinomialNB` (`fit_pipeline` /
+//! `predict_pipeline`). Green verification = the in-tree `multinomial` lib tests
+//! plus the live-sklearn pins (`ferrolearn-bayes/tests/divergence_multinomial.rs`):
+//! `divergence_multinomial_negative_alpha_rejected` (#904, now PASSING after the
+//! `alpha < 0` reject landed), then the green guards
+//! `green_multinomial_predict_proba_log_proba_value`,
+//! `green_multinomial_class_prior_length_only_accepts_non_unit_sum`,
+//! `green_multinomial_score_accuracy`,
+//! `green_multinomial_negative_features_rejected`,
+//! `green_multinomial_partial_fit_equals_fit` — all passing. Cites use symbol
+//! anchors (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live
+//! oracle = installed sklearn 1.5.2.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`feature_log_prob_` smoothing + `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `fn fit` for `MultinomialNB` sets `log_theta[[ci,j]] = ((count + alpha) / (total_count + alpha * n_features)).ln()`, the algebraic identity of `_update_feature_log_prob` (`naive_bayes.py:885-892`, `log(fc+alpha) - log((fc+alpha).sum(axis=1))`); `impl BaseNB::joint_log_likelihood` for `FittedMultinomialNB` computes `log_prior[ci] + sum_j x*log_theta[ci,j]`, mirroring `X @ feature_log_prob_.T + class_log_prior_` (`naive_bayes.py:894-896`); the four `predict_*` delegate to the `BaseNB` provided methods. Non-test consumer: `RsMultinomialNB::fit`/`predict` (`ferrolearn-python/src/extras.rs`, `py_classifier!`) → `FittedMultinomialNB`, surfaced as `ferrolearn.MultinomialNB`; plus `impl PipelineEstimator`. Verified: green guard `green_multinomial_predict_proba_log_proba_value` — on `X=[[3,1,0],[2,0,1],[4,2,0],[0,1,4],[1,0,3],[0,2,5]]`, `y=[0,0,0,1,1,1]`, `q=[[2,1,1],[0,1,3]]`, sklearn `predict_proba(q) = [[0.8843694464372913, 0.11563055356270838], [0.007188876743869827, 0.9928111232561301]]`, `predict_log_proba(q) = [[-0.12288037781713079, -2.1573550534903774], [-4.935220344228254, -0.007214841230117397]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. In-tree `test_multinomial_nb_fit_predict` / `test_multinomial_nb_predict_proba_sums_to_one`. |
+//! | REQ-2 (`alpha >= 0` validation) | SHIPPED | `fn fit` rejects `self.alpha < F::zero()` with `FerroError::InvalidParameter { name: "alpha", reason: "alpha must be >= 0 (sklearn Interval[0, inf))" }`, mirroring `MultinomialNB._parameter_constraints` `alpha: [Interval(Real, 0, None, closed="left"), "array-like"]` (`naive_bayes.py:530`) — the HARD `>= 0` reject `_validate_params` enforces at `fit` (distinct from `_check_alpha`'s `1e-10` floor, `naive_bayes.py:604-626`, which only fires under `force_alpha=false`; `alpha=0` stays allowed). Non-test consumer: `RsMultinomialNB::fit` maps the `FerroError` → `PyValueError`. Verified: green pin `divergence_multinomial_negative_alpha_rejected` (#904, now PASSING): `with_alpha(-0.5).fit(X,y)` returns `Err` (sklearn raises `InvalidParameterError`, "The 'alpha' parameter of MultinomialNB must be a float in the range [0.0, inf) … Got -0.5 instead."). |
+//! | REQ-3 (`class_log_prior_` empirical / uniform VALUE) | SHIPPED | `fn fit` sets the empirical `log_prior[ci] = (n_c / n).ln()` (default) and the uniform `(1 / n_classes).ln()` (`fit_prior == false`), mirroring `class_log_prior_ = log(class_count_) - log(class_count_.sum())` (`naive_bayes.py:600`) and `np.full(n_classes, -np.log(n_classes))` (`naive_bayes.py:602`). Non-test consumer: `RsMultinomialNB::predict` → `fitted.predict` (the `class_log_prior_` term enters the jll additively). Verified: on the balanced fixture the empirical prior is `log(0.5)` for both classes; `predict(q) = [0, 1]` (green `green_multinomial_predict_proba_log_proba_value`). In-tree `test_multinomial_nb_fit_predict`. |
+//! | REQ-4 (`class_prior` explicit + LENGTH-only validation — MATCH) | SHIPPED | `fn fit` validates ONLY `priors.len() != n_classes` then sets `log_prior[ci] = p.ln()`, mirroring `_update_class_log_prior` (`naive_bayes.py:589-591`, `if len != n_classes: ValueError; class_log_prior_ = np.log(class_prior)`) — discrete NB has NO sum-to-1 / non-negativity check (UNLIKE GaussianNB, which rejects a non-unit-sum prior). A deliberate MATCH. Non-test consumer: `RsMultinomialNB` builds `MultinomialNB`; the `with_class_prior` path is exercised in-crate + pipeline. Verified: green guard `green_multinomial_class_prior_length_only_accepts_non_unit_sum` — `with_class_prior([0.5, 0.3]).fit(X,y)` SUCCEEDS (sklearn `class_log_prior_ = log([0.5,0.3])`, inter-class gap `0.5108256237659908`), `with_class_prior([0.5]).fit` errors. In-tree `test_multinomial_nb_class_prior` / `test_multinomial_nb_class_prior_wrong_length`. (Wrong-length error TYPE differs — `InvalidParameter` vs `ValueError` — folded into REQ-9's surface gap.) |
+//! | REQ-5 (negative-feature guard — both reject) | SHIPPED | `fn fit` rejects any `x[i,j] < F::zero()` with `FerroError::InvalidParameter { name: "X", reason: "MultinomialNB requires non-negative feature values" }`, mirroring `check_non_negative(X, "MultinomialNB (input X)")` → `ValueError` (`naive_bayes.py:881`). Both REJECT. Non-test consumer: `RsMultinomialNB::fit` maps the `FerroError` → `PyValueError`. Verified: green guard `green_multinomial_negative_features_rejected` — `fit(X_neg, y)` returns `Err` (sklearn raises `ValueError("Negative values in data passed to MultinomialNB (input X)")`). In-tree `test_multinomial_nb_negative_features_error`. The exact sklearn MESSAGE text is NOT matched — that message-parity sub-item is captured under REQ-9 (the binding maps to `PyValueError` so the Python-facing TYPE coincides; the text differs). |
+//! | REQ-6 (`force_alpha` floor + `fit_prior` toggle) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` floor `1e-10` unless `force_alpha`, `naive_bayes.py:604-626`) and selects empirical/uniform prior on `fit_prior`. Non-test consumer: `RsMultinomialNB` passes `fit_prior` through `with_fit_prior` and `alpha` through `with_alpha`. Verified: `alpha=0` (in `[0,inf)`, `force_alpha=true` default) is accepted — ferrolearn `clamp_alpha(0, true) = 0` matches; `score(X,y) = 1.0` (green `green_multinomial_score_accuracy`). In-tree `test_multinomial_nb_alpha_smoothing_effect` / `test_multinomial_nb_default`; `base.rs` `test_check_alpha_*`. |
+//! | REQ-7 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedMultinomialNB::partial_fit` accumulates `class_counts` / `feature_counts` for each existing class then recomputes `log_theta` / `log_prior` (same smoothing), mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-resmooth (`naive_bayes.py:628-709`, `_count` → `_update_feature_log_prob` → `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: green guard `green_multinomial_partial_fit_equals_fit` — two-chunk `partial_fit(X[:4],y[:4])` + `partial_fit(X[4:],y[4:])` reproduces the whole-`fit` `predict_proba` to ≤1e-12 (sklearn `np.allclose(feature_log_prob_) == True`). In-tree `test_multinomial_nb_partial_fit` / `test_multinomial_nb_partial_fit_shape_mismatch`. KNOWN GAP: `partial_fit` has NO `classes=` argument — `FittedMultinomialNB::partial_fit(&mut self, x, y)` loops only over the already-fitted `self.classes`, so a brand-new label is silently dropped (sklearn's `_BaseDiscreteNB.partial_fit` requires `classes=` at the first call, `naive_bayes.py:628-709`); this `classes=`/unseen-label path is NOT-STARTED (needs the multi-file surface change under #902) and is documented-not-pinned in the divergence header. |
+//! | REQ-8 (`sample_weight`) | NOT-STARTED | open prereq blocker **#901**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` (`Y *= sample_weight.T`, `naive_bayes.py:751`) so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` become weighted (e.g. `fit(X,y,sample_weight=[1,2,1,1,1,3])` → `feature_count_ = [[11,3,2],[1,7,22]]`, `class_count_ = [4,5]`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`. |
+//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#902**. sklearn exposes `feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_` + the `_BaseDiscreteNB` `coef_ = feature_log_prob_[1:]` / `intercept_ = class_log_prior_[1:]` properties. `FittedMultinomialNB` stores `log_theta` / `log_prior` / `feature_counts` / `class_counts` as PRIVATE fields with no accessor — only `classes()` (via `HasClasses`) is public; no `coef_` / `intercept_`. `_RsMultinomialNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior)` + `fit` + `predict` — no `class_prior` / `force_alpha` kwargs, no `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` / `score` / `partial_fit` (which the library HAS), no fitted-attr getters. Also subsumes the negative-feature MESSAGE-parity sub-item (REQ-5) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#903**. `multinomial.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -180,6 +215,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Multino
             return Err(FerroError::InvalidParameter {
                 name: "X".into(),
                 reason: "MultinomialNB requires non-negative feature values".into(),
+            });
+        }
+
+        // Reject alpha < 0 — sklearn `MultinomialNB._parameter_constraints`
+        // declares `alpha: Interval(Real, 0, None, closed="left")`
+        // (naive_bayes.py:530), a HARD `>= 0` reject enforced at `fit` by
+        // `_validate_params` (distinct from `_check_alpha`'s 1e-10 floor, which
+        // only fires under `force_alpha=false`). alpha=0 stays allowed.
+        if self.alpha < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "alpha must be >= 0 (sklearn Interval[0, inf))".into(),
             });
         }
 
