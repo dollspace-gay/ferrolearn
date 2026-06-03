@@ -34,6 +34,39 @@
 //! let labels = fitted.predict(&x).unwrap();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_kmeans.py`
+//! (`class KMeans(_BaseKMeans)` `:1196`; `__init__` `:1388`; `_kmeans_single_lloyd`
+//! `:631`; `_tolerance` `:286`; `_check_params_vs_input` `:875`). Design doc:
+//! `.design/cluster/kmeans.md`. Cites use ferrolearn symbol anchors / sklearn
+//! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
+//! (R-CHAR-3). KMeans has a REAL CPython consumer: `_RsKMeans`
+//! (`ferrolearn-python/src/clusterers.rs`) → `ferrolearn.KMeans`. Verify-and-document
+//! unit: the `labels_` PARTITION (up to a label permutation, well-separated regime),
+//! `predict`/`transform` contracts, the PyO3 marshalling, the labels_/inertia_↔centers
+//! consistency, and the `n_init` default match sklearn and SHIP. Exact
+//! `cluster_centers_`/`inertia_` VALUES + `labels_` integers + `n_iter_` DIVERGE —
+//! blocked by numpy-RNG init parity (#1039), the convergence criterion + relative tol
+//! (#1036), and empty-cluster relocation (#1040).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `Fit::fit` (greedy k-means++ `fn kmeans_plus_plus` → Lloyd `fn assign_clusters_into`/`fn recompute_centroids_into` → best-of-`n_init`) recovers sklearn's grouping on well-separated data. Consumers: PyO3 `RsKMeans::fit` (`clusterers.rs`) + crate re-export `pub use kmeans::{FittedKMeans, KMeans}` (`lib.rs`). Guards: `green_req1_two_blob_partition`, `green_req1_three_blob_partition` in `tests/divergence_kmeans.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `labels_` integers + `cluster_centers_`/`inertia_` VALUES (REQ-9) diverge. |
+//! | REQ-2 (`predict` nearest-center contract) | SHIPPED | impl `Predict::predict` (`fn nearest_center`) returns argmin-squared-euclidean center index + `FerroError::ShapeMismatch`; `transform(X).argmin(1) == predict(X)`. Consumers: PyO3 `RsKMeans::predict` + crate re-export. Guard: `green_req2_predict_is_transform_argmin`. |
+//! | REQ-3 (`transform` distance-to-centers contract) | SHIPPED | impl `Transform::transform` returns shape `(n_samples, n_clusters)`, column j = Euclidean distance to center j (= sklearn `_BaseKMeans.transform`). Consumers: PyO3 `RsKMeans::transform` + crate re-export. Guard: `green_req3_transform_shape_and_nonneg`. Underclaim: CONTRACT only — distances track `cluster_centers_` (REQ-9). |
+//! | REQ-4 (PyO3 binding marshalling) | SHIPPED | impl `#[pyclass(name="_RsKMeans")] RsKMeans` (`ferrolearn-python/src/clusterers.rs`) marshals `fit`/`predict`/`transform` + `cluster_centers_`/`labels_`/`inertia_`/`n_iter_` getters; registered in `ferrolearn-python/src/lib.rs`, wrapped `class KMeans(...)` in `python/ferrolearn/_clusterers.py`, exported in `__init__.py`. Verification: `maturin develop` + `pytest tests/ -q`. Underclaim: marshalling/shape contract — the binding's `n_init=10` signature default + `int64` label dtype diverge (REQ-12); fitted VALUES inherit REQ-9. |
+//! | REQ-6 (`labels_`/`inertia_` consistency with final centers) | SHIPPED | impl `Fit::fit` runs a final E-step (`inertia = assign_clusters_into(&mut labels, x, &centers)`) after the Lloyd loop so `labels_`/`inertia_` match the post-swap `cluster_centers_`, mirroring sklearn's post-loop E-step re-run (`_kmeans.py:605-625`). Invariant `fit(X).predict(X) == labels_` now holds. Guard: `pin_req6_predict_equals_labels`. Fixed #1037. |
+//! | REQ-14 (`n_init` constructor default = 1) | SHIPPED | impl `fn new` defaults `n_init: 1`, matching sklearn `n_init="auto"` → 1 for the default `init="k-means++"` (`_kmeans.py:886-896`). Guard: `pin_req14_n_init_default_is_one`. Fixed #1045. (The PyO3 binding's `n_init=10` signature default is the separate REQ-12.) |
+//! | REQ-5 (convergence criterion + relative tol) | NOT-STARTED | open prereq blocker #1036. sklearn converges on label-no-change OR `(center_shift**2).sum() <= mean(var(X))*tol` (`_kmeans.py:286-294,586-601`); ferrolearn uses absolute `tol` + `max_shift < tol` MAX-euclidean-shift (`fn recompute_centroids_into` + `fn fit`). Different threshold/reduction → different `n_iter_` + stop point. |
+//! | REQ-7 (`init` param + random/array/callable + exact k-means++) | NOT-STARTED | open prereq blocker #1038. sklearn `init ∈ {"k-means++","random"}|callable|array` default `"k-means++"` (`_kmeans.py:1391`); ferrolearn has NO `init` param (always greedy k-means++, `fn kmeans_plus_plus`). Default matches; param surface + non-default inits missing; exact k-means++ diverges (numpy RNG, REQ-8). |
+//! | REQ-8 (`random_state` numpy-RNG parity) | NOT-STARTED | open prereq blocker #1039. sklearn `check_random_state` + numpy RNG; ferrolearn `StdRng::seed_from_u64` (`fn fit`). Different RNG → exact centers/labels/inertia/n_iter cannot match. Depends on a ferray `random` analog (R-SUBSTRATE-5); blocks REQ-9. |
+//! | REQ-9 (centers/inertia/label-integers/n_iter VALUE parity) | NOT-STARTED | open prereq blocker #1040. Exact values diverge via numpy-RNG (REQ-8), convergence + relative tol (REQ-5), and empty-cluster relocation — sklearn moves an emptied center to the farthest sample (`_relocate_empty_clusters_dense`), ferrolearn keeps the old center (`fn recompute_centroids_into` else-branch). Gated on REQ-5/REQ-8. |
+//! | REQ-10 (ctor/fit surface init/algorithm/copy_x/verbose/sample_weight + n_clusters=8 + error ABI) | NOT-STARTED | open prereq blocker #1041. sklearn `__init__` (`_kmeans.py:1387-1411`) + `fit(sample_weight)` + `_check_params_vs_input` (`InvalidParameterError`, `:875-908`) + `n_features_in_`; ferrolearn `KMeans<F>` has `n_clusters/max_iter/tol/n_init/random_state` only + `FerroError` ABI. |
+//! | REQ-11 (`score` + `fit_transform`) | NOT-STARTED | open prereq blocker #1042. sklearn `KMeans.score(X) = -inertia` (`_kmeans.py:1156-1184`) + `fit_transform`; ferrolearn `FittedKMeans` has neither (only `fn fit_predict`); `RsKMeans` has no `score`/`fit_transform`. |
+//! | REQ-12 (ferrolearn-python binding `n_init` default + `labels_` dtype) | NOT-STARTED | open prereq blocker #1043. PyO3 `RsKMeans::new` signature `n_init=10` + Python `ferrolearn.KMeans` `n_init=10` diverge from sklearn's effective `1` for k-means++ (R-DEFER-7 last layer); binding marshals `labels_` to `int64`, not sklearn `int32`. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1044. `kmeans.rs` imports `ndarray`/`num-traits`/`rand`/`rayon`, not `ferray-core`/`ferray::linalg`/`ferray::random` (R-SUBSTRATE-1/2; RNG entangled with REQ-8). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -71,14 +104,19 @@ impl<F: Float> KMeans<F> {
     /// Create a new `KMeans` with the given number of clusters.
     ///
     /// Uses default values: `max_iter = 300`, `tol = 1e-4`,
-    /// `n_init = 10`, `random_state = None`.
+    /// `n_init = 1`, `random_state = None`.
+    ///
+    /// `n_init = 1` mirrors scikit-learn's `n_init="auto"`, which resolves to
+    /// `1` for the default `init="k-means++"`
+    /// (`sklearn/cluster/_kmeans.py:886-888`; docstring `:359-361`). ferrolearn
+    /// always uses k-means++ seeding, so the sklearn-matching default is `1`.
     #[must_use]
     pub fn new(n_clusters: usize) -> Self {
         Self {
             n_clusters,
             max_iter: 300,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
-            n_init: 10,
+            n_init: 1,
             random_state: None,
         }
     }
@@ -456,11 +494,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
             let mut centers = kmeans_plus_plus(x, self.n_clusters, &mut rng);
 
             let mut n_iter = 0;
-            let mut inertia = F::max_value();
 
             for iter in 0..self.max_iter {
-                // Assign step (serial or parallel depending on size).
-                inertia = assign_clusters_into(&mut labels, x, &centers);
+                // Assign step (serial or parallel depending on size). The
+                // inertia is recomputed in the final E-step below, so the
+                // per-iteration value is not retained here.
+                let _ = assign_clusters_into(&mut labels, x, &centers);
 
                 // Recompute centroids using pre-allocated buffers.
                 let max_shift = recompute_centroids_into(
@@ -479,6 +518,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
                     break;
                 }
             }
+
+            // Final E-step: re-assign labels to the converged centers so that
+            // labels_/inertia_ are consistent with cluster_centers_ (sklearn
+            // _kmeans.py:605-623). Without this, `cluster_centers_` is one M-step
+            // ahead of `labels`/`inertia` and `predict(X)` can disagree with
+            // `labels_`. n_iter_ is intentionally left as the loop count (REQ-9).
+            let inertia = assign_clusters_into(&mut labels, x, &centers);
 
             let candidate = FittedKMeans {
                 cluster_centers_: centers,
