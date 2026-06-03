@@ -243,6 +243,11 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: d2_score_with / d2_tweedie_score diverge from sklearn/metrics/_regression.py:1736-1739,1599 on n>=2 constant-y_true (zero denominator) (#771)
+- Divergence: ferrolearn_metrics d2_* (absolute_error/pinball/tweedie) diverge from sklearn/metrics/_regression.py:1699-1702,1584-1587 (<2 samples -> nan, not Ok(0.0)) (#770)
+- Divergence: ferrolearn_metrics::mean_absolute_percentage_error diverges from sklearn/metrics/_regression.py:403-404 (eps clamp vs skip-zero-y_true) (#769)
+- Divergence: ferrolearn_metrics::explained_variance_score diverges from sklearn/metrics/_regression.py:889-891 (force_finite on constant y_true) (#768)
+- Divergence: ferrolearn_metrics::r2_score diverges from sklearn/metrics/_regression.py:889-891 (force_finite on constant y_true) (#767)
 - Divergence: ferrolearn-metrics::label_ranking_loss diverges from sklearn/metrics/_ranking.py:1463-1465 (degenerate-row denominator: divides by non-degenerate count instead of n_samples) (#756)
 - Divergence: ferrolearn-metrics::ndcg_score diverges from sklearn/metrics/_ranking.py:1749,1868 (no tie-averaging + missing negative-y_true ValueError guard) (#755)
 - Divergence: ferrolearn-metrics::dcg_score diverges from sklearn/metrics/_ranking.py:1528 (no tie-averaging; default ignore_ties=False) (#754)
