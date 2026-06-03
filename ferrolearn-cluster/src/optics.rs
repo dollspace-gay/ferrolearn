@@ -714,12 +714,11 @@ fn filter_small_clusters(labels: &mut Array1<isize>, min_cluster_size: usize) {
 
     // Relabel small clusters as noise.
     for label in labels.iter_mut() {
-        if *label >= 0 {
-            if let Some(&size) = cluster_sizes.get(label) {
-                if size < min_cluster_size {
-                    *label = -1;
-                }
-            }
+        if *label >= 0
+            && let Some(&size) = cluster_sizes.get(label)
+            && size < min_cluster_size
+        {
+            *label = -1;
         }
     }
 
@@ -741,10 +740,10 @@ fn filter_small_clusters(labels: &mut Array1<isize>, min_cluster_size: usize) {
     }
 
     for label in labels.iter_mut() {
-        if *label >= 0 {
-            if let Some(&new_id) = remap.get(label) {
-                *label = new_id;
-            }
+        if *label >= 0
+            && let Some(&new_id) = remap.get(label)
+        {
+            *label = new_id;
         }
     }
 }

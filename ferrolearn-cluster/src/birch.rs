@@ -349,13 +349,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for Birch<F> {
             });
         }
 
-        if let Some(k) = self.n_clusters {
-            if k == 0 {
-                return Err(FerroError::InvalidParameter {
-                    name: "n_clusters".into(),
-                    reason: "must be at least 1".into(),
-                });
-            }
+        if let Some(k) = self.n_clusters
+            && k == 0
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "n_clusters".into(),
+                reason: "must be at least 1".into(),
+            });
         }
 
         let n_samples = x.nrows();

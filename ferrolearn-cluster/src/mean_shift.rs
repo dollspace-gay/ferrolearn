@@ -198,7 +198,7 @@ fn estimate_bandwidth<F: Float>(x: &Array2<F>) -> Result<F, FerroError> {
     // Partial-sort to find the median.
     dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = dists.len() / 2;
-    let median = if dists.len() % 2 == 0 {
+    let median = if dists.len().is_multiple_of(2) {
         (dists[mid - 1] + dists[mid]) / F::from(2.0).unwrap()
     } else {
         dists[mid]
