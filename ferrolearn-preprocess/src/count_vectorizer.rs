@@ -1,7 +1,32 @@
 //! Count vectorizer: convert text documents to a term-count matrix.
 //!
-//! Tokenizes documents by splitting on non-alphanumeric characters, builds a
+//! Tokenizes documents into runs of 2+ word characters (the Rust analog of
+//! scikit-learn's default `token_pattern=r"(?u)\b\w\w+\b"`,
+//! `sklearn/feature_extraction/text.py:1161`), builds an alphabetically-sorted
 //! vocabulary, and produces a term-count matrix of shape `(n_docs, n_vocab)`.
+//!
+//! Translation target: scikit-learn 1.5.2 `class CountVectorizer` (`text.py:929`).
+//! Design: `.design/preprocess/count_vectorizer.md`. Tracking: #1216.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 default fit/transform, sorted vocab, count matrix | SHIPPED (scoped: dense) | `CountVectorizer::fit` / `FittedCountVectorizer::transform`; sklearn `_count_vocab` `text.py:1242-1305` |
+//! | REQ-2 default token_pattern (drop length-1, `_` word char) | SHIPPED (#1217) | `fn tokenize`; sklearn `text.py:1161`, `build_tokenizer:350` |
+//! | REQ-3 binary count clipping | SHIPPED | `FittedCountVectorizer::transform`; sklearn `text.py:1374` |
+//! | REQ-4 lowercase toggle | SHIPPED | `fn tokenize`; sklearn `text.py:1157`,`:323` |
+//! | REQ-5 max_df/min_df int-vs-float duality + threshold errors | NOT-STARTED (#1219; ceil sub-fix shipped #1218) | `fit` df-filter; sklearn `text.py:1379-1382`,`:1236-1239` |
+//! | REQ-6 ngram_range word n-grams | NOT-STARTED (#1220) | sklearn `_word_ngrams` `text.py:242` |
+//! | REQ-7 max_features top-N + tie/sort | SHIPPED (scoped) | `fit`; sklearn `_limit_features` `text.py:1222-1227` |
+//! | REQ-8 tokenizer/token_pattern/preprocessor/analyzer/strip_accents | NOT-STARTED (#1221) | sklearn `build_analyzer` `text.py:419` |
+//! | REQ-9 stop_words | NOT-STARTED (#1222) | sklearn `get_stop_words` `text.py:370` |
+//! | REQ-10 fixed vocabulary param + dtype | NOT-STARTED (#1223) | sklearn `_count_vocab` `text.py:1242-1244`,`:1147` |
+//! | REQ-11 sparse CSR output | NOT-STARTED (#1224) | sklearn `_count_vocab` `text.py:1299-1304` |
+//! | REQ-12 get_feature_names_out contract | NOT-STARTED (#1225) | sklearn `text.py:1455` |
+//! | REQ-13 HashingVectorizer | NOT-STARTED (#1226) | sklearn `class HashingVectorizer` `text.py:562` |
+//! | REQ-14 full 16-param ctor + _parameter_constraints + empty-vocab error | NOT-STARTED (#1227) | sklearn `text.py:1124-1148`,`:1236-1239` |
+//! | REQ-15 PyO3 binding | NOT-STARTED (#1228) | `ferrolearn-python/src/transformers.rs` (absent) |
 
 use std::collections::HashMap;
 
@@ -132,10 +157,18 @@ impl CountVectorizer {
         }
 
         // Filter by min_df and max_df.
-        let max_df_abs = (self.max_df * n_docs as f64).ceil() as usize;
+        //
+        // sklearn 1.5.2 computes `max_doc_count = max_df * n_doc` as a FLOAT with
+        // NO rounding (`sklearn/feature_extraction/text.py:1379`) and keeps terms
+        // with `df <= max_doc_count` (`_limit_features`, `text.py:1219`:
+        // `mask &= dfs <= high`). We mirror that exactly: compare the integer
+        // document count against the un-rounded float threshold. (Note: sklearn
+        // also accepts an integer `max_df` as an absolute count; that int-vs-float
+        // duality is a separate gap and is intentionally not implemented here.)
+        let max_df_count = self.max_df * n_docs as f64;
         let mut vocab: Vec<String> = df_counts
             .into_iter()
-            .filter(|(_, count)| *count >= self.min_df && *count <= max_df_abs)
+            .filter(|(_, count)| *count >= self.min_df && (*count as f64) <= max_df_count)
             .map(|(term, _)| term)
             .collect();
         vocab.sort();
@@ -257,7 +290,14 @@ impl FittedCountVectorizer {
 // Tokenizer
 // ---------------------------------------------------------------------------
 
-/// Tokenize a document by splitting on non-alphanumeric boundaries.
+/// Tokenize a document, matching scikit-learn's default `token_pattern`.
+///
+/// sklearn 1.5.2 defaults to `token_pattern=r"(?u)\b\w\w+\b"`
+/// (`sklearn/feature_extraction/text.py:1161`), which matches maximal runs of
+/// 2+ word characters where `\w = [A-Za-z0-9_]` (Unicode-aware via `(?u)`).
+/// We therefore treat a char as part of a token iff it is alphanumeric or `_`
+/// (`char::is_alphanumeric` is Unicode-aware, the faithful analog of `\w`), and
+/// keep only tokens of length >= 2, dropping single-char tokens.
 fn tokenize(doc: &str, lowercase: bool) -> Vec<String> {
     let text = if lowercase {
         doc.to_lowercase()
@@ -265,8 +305,8 @@ fn tokenize(doc: &str, lowercase: bool) -> Vec<String> {
         doc.to_string()
     };
 
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|s| !s.is_empty())
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .filter(|s| !s.is_empty() && s.chars().count() >= 2)
         .map(std::string::ToString::to_string)
         .collect()
 }
@@ -332,12 +372,24 @@ mod tests {
         assert_eq!(fitted.vocabulary().len(), 2);
     }
 
+    /// max_features keeps the top-N terms by total corpus frequency.
+    ///
+    /// LIVE oracle (sklearn 1.5.2):
+    ///   CountVectorizer(max_features=3).fit_transform(
+    ///       ['cat cat cat dog dog bird ant','cat dog bird'])
+    ///   sorted(get_feature_names_out()) -> ['bird','cat','dog']
+    ///   ('ant' has corpus frequency 1, the lowest, so it is dropped)
     #[test]
     fn test_count_vectorizer_max_features() {
-        let docs = vec!["a b c d e f".to_string()];
+        let docs = vec![
+            "cat cat cat dog dog bird ant".to_string(),
+            "cat dog bird".to_string(),
+        ];
         let cv = CountVectorizer::new().max_features(3);
         let fitted = cv.fit(&docs).unwrap();
-        assert_eq!(fitted.vocabulary().len(), 3);
+        let mut vocab = fitted.vocabulary().to_vec();
+        vocab.sort();
+        assert_eq!(vocab, vec!["bird", "cat", "dog"]);
     }
 
     #[test]
