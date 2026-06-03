@@ -45,6 +45,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -261,17 +262,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
         }
 
         // Validate class_prior length if provided.
-        if let Some(ref priors) = self.class_prior {
-            if priors.len() != n_classes {
-                return Err(FerroError::InvalidParameter {
-                    name: "class_prior".into(),
-                    reason: format!(
-                        "length {} does not match number of classes {}",
-                        priors.len(),
-                        n_classes
-                    ),
-                });
-            }
+        if let Some(ref priors) = self.class_prior
+            && priors.len() != n_classes
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "class_prior".into(),
+                reason: format!(
+                    "length {} does not match number of classes {}",
+                    priors.len(),
+                    n_classes
+                ),
+            });
         }
 
         Ok(FittedComplementNB {
@@ -400,116 +401,49 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
         Ok(())
     }
 
-    /// Compute the joint log-likelihood scores for each class.
-    ///
-    /// Returns `X @ feature_log_prob_.T` (shape `(n_samples, n_classes)`).
-    /// With ferrolearn's sklearn-parity sign for `feature_log_prob_`,
-    /// **higher is better** and `argmax(scores, axis=1)` predicts the class.
-    fn complement_scores(&self, x: &Array2<F>) -> Array2<F> {
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let n_features = x.ncols();
-
-        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            for ci in 0..n_classes {
-                let mut score = F::zero();
-                for j in 0..n_features {
-                    score = score + x[[i, j]] * self.weights[[ci, j]];
-                }
-                scores[[i, ci]] = score;
-            }
-        }
-
-        scores
-    }
-
     /// Predict class probabilities for the given feature matrix.
     ///
-    /// Converts complement scores (lower=better) to probabilities by negating
-    /// and applying softmax.
-    ///
     /// Returns shape `(n_samples, n_classes)` where each row sums to 1.
+    /// Delegates to [`BaseNB::nb_predict_proba`] — with ComplementNB's
+    /// sklearn-parity sign, the joint log-likelihood is `X @ weights.T`
+    /// directly, so `exp(jll - logsumexp(jll))` is the softmax of the
+    /// complement scores.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.weights.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted ComplementNB".into(),
-            });
-        }
-
-        // scores are joint log-likelihoods (sklearn convention, higher=better).
-        // softmax directly without negation.
-        let scores = self.complement_scores(x);
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let mut proba = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            let max_score = scores
-                .row(i)
-                .iter()
-                .fold(F::neg_infinity(), |a, &b| a.max(b));
-
-            let mut row_sum = F::zero();
-            for ci in 0..n_classes {
-                let p = (scores[[i, ci]] - max_score).exp();
-                proba[[i, ci]] = p;
-                row_sum = row_sum + p;
-            }
-            for ci in 0..n_classes {
-                proba[[i, ci]] = proba[[i, ci]] / row_sum;
-            }
-        }
-
-        Ok(proba)
+        BaseNB::nb_predict_proba(self, x)
     }
 
     /// Compute the joint log-likelihood scores using sklearn's sign
     /// convention: argmax(jll) gives the predicted class.
     ///
-    /// Returns shape `(n_samples, n_classes)`. ComplementNB's complement
-    /// scoring is "lower=better", so this method returns
-    /// `-complement_scores` to match sklearn's convention where higher is
-    /// better. Matches sklearn `ComplementNB._joint_log_likelihood`.
+    /// Returns shape `(n_samples, n_classes)`. With the sklearn-parity sign,
+    /// `X @ weights.T` IS the joint log-likelihood. Matches sklearn
+    /// `ComplementNB._joint_log_likelihood`. Delegates to
+    /// [`BaseNB::nb_predict_joint_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_joint_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.weights.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted ComplementNB".into(),
-            });
-        }
-        // With the sklearn-parity sign, complement_scores IS the joint
-        // log-likelihood directly (no negation needed).
-        Ok(self.complement_scores(x))
+        BaseNB::nb_predict_joint_log_proba(self, x)
     }
 
     /// Compute log of class probabilities (numerically stable).
     ///
-    /// Returns shape `(n_samples, n_classes)`.
+    /// Returns shape `(n_samples, n_classes)`. Delegates to
+    /// [`BaseNB::nb_predict_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let jll = self.predict_joint_log_proba(x)?;
-        Ok(crate::log_softmax_rows(&jll))
+        BaseNB::nb_predict_log_proba(self, x)
     }
 
     /// Mean accuracy on the given test data and labels.
@@ -538,19 +472,14 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
     }
 }
 
-impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedComplementNB<F> {
-    type Output = Array1<usize>;
-    type Error = FerroError;
-
-    /// Predict class labels for the given feature matrix.
+impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedComplementNB<F> {
+    /// Compute the joint log-likelihood scores for each class — sklearn
+    /// `ComplementNB._joint_log_likelihood`.
     ///
-    /// Predicts the class with the *lowest* complement score.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
-    /// not match the fitted model.
-    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+    /// Returns `X @ feature_log_prob_.T` (shape `(n_samples, n_classes)`).
+    /// With ferrolearn's sklearn-parity sign for `feature_log_prob_`,
+    /// **higher is better** and `argmax(scores, axis=1)` predicts the class.
+    fn joint_log_likelihood(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features_fitted = self.weights.ncols();
         if x.ncols() != n_features_fitted {
             return Err(FerroError::ShapeMismatch {
@@ -560,26 +489,45 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedComplementNB
             });
         }
 
-        let scores = self.complement_scores(x);
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
+        let n_features = x.ncols();
 
-        let mut predictions = Array1::<usize>::zeros(n_samples);
+        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
+
         for i in 0..n_samples {
-            // Argmax: with sklearn-parity sign, higher joint-log-likelihood
-            // wins.
-            let mut best_class = 0;
-            let mut best_score = scores[[i, 0]];
-            for ci in 1..n_classes {
-                if scores[[i, ci]] > best_score {
-                    best_score = scores[[i, ci]];
-                    best_class = ci;
+            for ci in 0..n_classes {
+                let mut score = F::zero();
+                for j in 0..n_features {
+                    score = score + x[[i, j]] * self.weights[[ci, j]];
                 }
+                scores[[i, ci]] = score;
             }
-            predictions[i] = self.classes[best_class];
         }
 
-        Ok(predictions)
+        Ok(scores)
+    }
+
+    fn nb_classes(&self) -> &[usize] {
+        &self.classes
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedComplementNB<F> {
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    /// Predict class labels for the given feature matrix.
+    ///
+    /// With ComplementNB's sklearn-parity sign, the highest joint
+    /// log-likelihood wins. Delegates to [`BaseNB::nb_predict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        BaseNB::nb_predict(self, x)
     }
 }
 

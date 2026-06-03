@@ -409,41 +409,60 @@ parity_ops = ["BallTree"]
 # Layer 1 — ferrolearn-bayes (naive_bayes.py)
 # =====================================================================
 
+# The five NB variants share the `_BaseNB` predict pipeline lifted onto
+# `base.rs` (issue #889). Their per-variant value design docs
+# (.design/bayes/{gaussian,multinomial,...}.md) were never authored; for the
+# base-delegation iteration the design that governs the touched surface is
+# .design/bayes/base.md (the shared `_BaseNB`/`_BaseDiscreteNB` contract). When
+# a per-variant value-parity iteration runs, acto-doc-author authors the
+# per-variant doc and the route's `design` is re-pointed back.
+
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/gaussian.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/gaussian.md"
+design = ".design/bayes/base.md"
 parity_ops = ["GaussianNB"]
 
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/multinomial.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/multinomial.md"
+design = ".design/bayes/base.md"
 parity_ops = ["MultinomialNB"]
 
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/bernoulli.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/bernoulli.md"
+design = ".design/bayes/base.md"
 parity_ops = ["BernoulliNB"]
 
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/complement.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/complement.md"
+design = ".design/bayes/base.md"
 parity_ops = ["ComplementNB"]
 
 [[route]]
 crate_pattern = "ferrolearn-bayes/src/categorical.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/categorical.md"
+design = ".design/bayes/base.md"
 parity_ops = ["CategoricalNB"]
 
 [[route]]
-crate_pattern = "ferrolearn-bayes/src/conjugate.rs"
+crate_pattern = "ferrolearn-bayes/src/base.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
-design = ".design/bayes/conjugate.md"
+design = ".design/bayes/base.md"
 parity_ops = ["_BaseNB", "_BaseDiscreteNB"]
+
+# The crate-root re-export aggregator (mirrors the ferrolearn-linear/src/lib.rs
+# precedent). Not itself a translation unit; it re-exports the per-variant NB
+# modules + the shared base as the public API boundary (the grandfathered
+# R-DEFER-1 production consumer). Routed against naive_bayes.py / base.md so the
+# translate-discipline gate is satisfied by the same reads governing base.rs.
+[[route]]
+crate_pattern = "ferrolearn-bayes/src/lib.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/naive_bayes.py"]
+design = ".design/bayes/base.md"
+parity_ops = ["re-export boundary"]
 
 # =====================================================================
 # Layer 1 — ferrolearn-cluster (cluster + mixture + semi_supervised)

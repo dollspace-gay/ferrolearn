@@ -39,6 +39,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -383,122 +384,46 @@ impl<F: Float + Send + Sync + 'static> FittedBernoulliNB<F> {
         Ok(())
     }
 
-    /// Compute joint log-likelihood for each class.
-    ///
-    /// Returns shape `(n_samples, n_classes)`.
-    fn joint_log_likelihood(&self, x: &Array2<F>) -> Array2<F> {
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let n_features = x.ncols();
-
-        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            for ci in 0..n_classes {
-                let mut score = self.log_prior[ci];
-                for j in 0..n_features {
-                    let xij = x[[i, j]];
-                    // log P(x_j | c) = x_j * log(p_cj) + (1-x_j) * log(1-p_cj)
-                    score = score
-                        + xij * self.log_prob[[ci, j]]
-                        + (F::one() - xij) * self.log_neg_prob[[ci, j]];
-                }
-                scores[[i, ci]] = score;
-            }
-        }
-
-        scores
-    }
-
     /// Predict class probabilities for the given feature matrix.
     ///
     /// Returns shape `(n_samples, n_classes)` where each row sums to 1.
     /// If binarize was set during fitting, features are binarized before
-    /// prediction.
+    /// prediction. Delegates to [`BaseNB::nb_predict_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.log_prob.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted BernoulliNB".into(),
-            });
-        }
-
-        let x_bin = if let Some(threshold) = self.binarize {
-            binarize_array(x, threshold)
-        } else {
-            x.clone()
-        };
-
-        let log_scores = self.joint_log_likelihood(&x_bin);
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let mut proba = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            let max_score = log_scores
-                .row(i)
-                .iter()
-                .fold(F::neg_infinity(), |a, &b| a.max(b));
-
-            let mut row_sum = F::zero();
-            for ci in 0..n_classes {
-                let p = (log_scores[[i, ci]] - max_score).exp();
-                proba[[i, ci]] = p;
-                row_sum = row_sum + p;
-            }
-            for ci in 0..n_classes {
-                proba[[i, ci]] = proba[[i, ci]] / row_sum;
-            }
-        }
-
-        Ok(proba)
+        BaseNB::nb_predict_proba(self, x)
     }
 
     /// Compute the unnormalized joint log-likelihood `log P(c) + log P(x|c)`.
     ///
     /// If binarize was set during fitting, features are binarized first.
     /// Returns shape `(n_samples, n_classes)`. Matches sklearn
-    /// `BernoulliNB._joint_log_likelihood`.
+    /// `BernoulliNB._joint_log_likelihood`. Delegates to
+    /// [`BaseNB::nb_predict_joint_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_joint_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.log_prob.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted BernoulliNB".into(),
-            });
-        }
-        let x_bin = if let Some(threshold) = self.binarize {
-            binarize_array(x, threshold)
-        } else {
-            x.clone()
-        };
-        Ok(self.joint_log_likelihood(&x_bin))
+        BaseNB::nb_predict_joint_log_proba(self, x)
     }
 
     /// Compute log of class probabilities (numerically stable).
     ///
-    /// Returns shape `(n_samples, n_classes)`.
+    /// Returns shape `(n_samples, n_classes)`. Delegates to
+    /// [`BaseNB::nb_predict_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let jll = self.predict_joint_log_proba(x)?;
-        Ok(crate::log_softmax_rows(&jll))
+        BaseNB::nb_predict_log_proba(self, x)
     }
 
     /// Mean accuracy on the given test data and labels.
@@ -527,20 +452,13 @@ impl<F: Float + Send + Sync + 'static> FittedBernoulliNB<F> {
     }
 }
 
-impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedBernoulliNB<F> {
-    type Output = Array1<usize>;
-    type Error = FerroError;
-
-    /// Predict class labels for the given feature matrix.
+impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedBernoulliNB<F> {
+    /// Compute joint log-likelihood for each class — sklearn
+    /// `BernoulliNB._joint_log_likelihood`.
     ///
-    /// If binarize was set during fitting, features are binarized before
-    /// prediction.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
-    /// not match the fitted model.
-    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+    /// If binarize was set during fitting, features are binarized first.
+    /// Returns shape `(n_samples, n_classes)`.
+    fn joint_log_likelihood(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features_fitted = self.log_prob.ncols();
         if x.ncols() != n_features_fitted {
             return Err(FerroError::ShapeMismatch {
@@ -556,24 +474,49 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedBernoulliNB<
             x.clone()
         };
 
-        let scores = self.joint_log_likelihood(&x_bin);
-        let n_samples = x.nrows();
+        let n_samples = x_bin.nrows();
         let n_classes = self.classes.len();
+        let n_features = x_bin.ncols();
 
-        let mut predictions = Array1::<usize>::zeros(n_samples);
+        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
+
         for i in 0..n_samples {
-            let mut best_class = 0;
-            let mut best_score = scores[[i, 0]];
-            for ci in 1..n_classes {
-                if scores[[i, ci]] > best_score {
-                    best_score = scores[[i, ci]];
-                    best_class = ci;
+            for ci in 0..n_classes {
+                let mut score = self.log_prior[ci];
+                for j in 0..n_features {
+                    let xij = x_bin[[i, j]];
+                    // log P(x_j | c) = x_j * log(p_cj) + (1-x_j) * log(1-p_cj)
+                    score = score
+                        + xij * self.log_prob[[ci, j]]
+                        + (F::one() - xij) * self.log_neg_prob[[ci, j]];
                 }
+                scores[[i, ci]] = score;
             }
-            predictions[i] = self.classes[best_class];
         }
 
-        Ok(predictions)
+        Ok(scores)
+    }
+
+    fn nb_classes(&self) -> &[usize] {
+        &self.classes
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedBernoulliNB<F> {
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    /// Predict class labels for the given feature matrix.
+    ///
+    /// If binarize was set during fitting, features are binarized before
+    /// prediction. Delegates to [`BaseNB::nb_predict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        BaseNB::nb_predict(self, x)
     }
 }
 

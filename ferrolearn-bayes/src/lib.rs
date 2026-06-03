@@ -52,6 +52,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+pub mod base;
 pub mod bernoulli;
 pub mod categorical;
 pub mod complement;
@@ -60,26 +61,20 @@ pub mod gaussian;
 pub mod multinomial;
 
 // Re-export all public types at the crate root.
+pub use base::BaseNB;
 pub use bernoulli::{BernoulliNB, FittedBernoulliNB};
 pub use categorical::{CategoricalNB, FittedCategoricalNB};
 pub use complement::{ComplementNB, FittedComplementNB};
 pub use gaussian::{FittedGaussianNB, GaussianNB};
 pub use multinomial::{FittedMultinomialNB, MultinomialNB};
 
+// The `_BaseDiscreteNB._check_alpha` smoothing floor lives in `base.rs`
+// (re-homed from the former `clamp_alpha`). Re-export under the original
+// `clamp_alpha` name so the discrete variants' fit call sites are unchanged.
+pub(crate) use base::check_alpha as clamp_alpha;
+
 use ndarray::Array2;
 use num_traits::Float;
-
-/// Smoothing-floor used when `force_alpha = false` to mirror scikit-learn's
-/// legacy "raise alpha to 1e-10" behavior. When `force_alpha = true`
-/// (the default), the user-supplied alpha is returned as-is, even if zero.
-pub(crate) fn clamp_alpha<F: Float>(alpha: F, force_alpha: bool) -> F {
-    if force_alpha {
-        alpha
-    } else {
-        let floor = F::from(1e-10).unwrap();
-        if alpha < floor { floor } else { alpha }
-    }
-}
 
 /// Numerically stable row-wise log-softmax: returns `jll - logsumexp(jll, axis=1)`.
 ///

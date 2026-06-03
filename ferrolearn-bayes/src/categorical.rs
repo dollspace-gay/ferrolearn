@@ -41,6 +41,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -516,103 +517,44 @@ impl<F: Float + Send + Sync + 'static> FittedCategoricalNB<F> {
         }
     }
 
-    /// Compute joint log-likelihood for each class.
-    ///
-    /// Returns shape `(n_samples, n_classes)`.
-    fn joint_log_likelihood(&self, x: &Array2<F>) -> Array2<F> {
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-
-        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            for ci in 0..n_classes {
-                let mut score = self.class_log_prior[ci];
-                for j in 0..self.n_features {
-                    let cat_value = x[[i, j]].to_usize().unwrap_or(0);
-                    score = score + self.log_prob_for(j, ci, cat_value);
-                }
-                scores[[i, ci]] = score;
-            }
-        }
-
-        scores
-    }
-
     /// Predict class probabilities for the given feature matrix.
     ///
     /// Returns shape `(n_samples, n_classes)` where each row sums to 1.
+    /// Delegates to [`BaseNB::nb_predict_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        if x.ncols() != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted CategoricalNB".into(),
-            });
-        }
-
-        let log_scores = self.joint_log_likelihood(x);
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let mut proba = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            // Numerically stable softmax: subtract row max before exp.
-            let max_score = log_scores
-                .row(i)
-                .iter()
-                .fold(F::neg_infinity(), |a, &b| a.max(b));
-
-            let mut row_sum = F::zero();
-            for ci in 0..n_classes {
-                let p = (log_scores[[i, ci]] - max_score).exp();
-                proba[[i, ci]] = p;
-                row_sum = row_sum + p;
-            }
-            for ci in 0..n_classes {
-                proba[[i, ci]] = proba[[i, ci]] / row_sum;
-            }
-        }
-
-        Ok(proba)
+        BaseNB::nb_predict_proba(self, x)
     }
 
     /// Compute the unnormalized joint log-likelihood `log P(c) + log P(x|c)`.
     ///
     /// Returns shape `(n_samples, n_classes)`. Matches sklearn
-    /// `CategoricalNB._joint_log_likelihood`.
+    /// `CategoricalNB._joint_log_likelihood`. Delegates to
+    /// [`BaseNB::nb_predict_joint_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_joint_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        if x.ncols() != self.n_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![self.n_features],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted CategoricalNB".into(),
-            });
-        }
-        Ok(self.joint_log_likelihood(x))
+        BaseNB::nb_predict_joint_log_proba(self, x)
     }
 
     /// Compute log of class probabilities (numerically stable).
     ///
-    /// Returns shape `(n_samples, n_classes)`.
+    /// Returns shape `(n_samples, n_classes)`. Delegates to
+    /// [`BaseNB::nb_predict_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let jll = self.predict_joint_log_proba(x)?;
-        Ok(crate::log_softmax_rows(&jll))
+        BaseNB::nb_predict_log_proba(self, x)
     }
 
     /// Mean accuracy on the given test data and labels.
@@ -641,17 +583,12 @@ impl<F: Float + Send + Sync + 'static> FittedCategoricalNB<F> {
     }
 }
 
-impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedCategoricalNB<F> {
-    type Output = Array1<usize>;
-    type Error = FerroError;
-
-    /// Predict class labels for the given feature matrix.
+impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedCategoricalNB<F> {
+    /// Compute joint log-likelihood for each class — sklearn
+    /// `CategoricalNB._joint_log_likelihood`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
-    /// not match the fitted model.
-    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+    /// Returns shape `(n_samples, n_classes)`.
+    fn joint_log_likelihood(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         if x.ncols() != self.n_features {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![self.n_features],
@@ -660,24 +597,44 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedCategoricalN
             });
         }
 
-        let scores = self.joint_log_likelihood(x);
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
 
-        let mut predictions = Array1::<usize>::zeros(n_samples);
+        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
+
         for i in 0..n_samples {
-            let mut best_class = 0;
-            let mut best_score = scores[[i, 0]];
-            for ci in 1..n_classes {
-                if scores[[i, ci]] > best_score {
-                    best_score = scores[[i, ci]];
-                    best_class = ci;
+            for ci in 0..n_classes {
+                let mut score = self.class_log_prior[ci];
+                for j in 0..self.n_features {
+                    let cat_value = x[[i, j]].to_usize().unwrap_or(0);
+                    score = score + self.log_prob_for(j, ci, cat_value);
                 }
+                scores[[i, ci]] = score;
             }
-            predictions[i] = self.classes[best_class];
         }
 
-        Ok(predictions)
+        Ok(scores)
+    }
+
+    fn nb_classes(&self) -> &[usize] {
+        &self.classes
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedCategoricalNB<F> {
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    /// Predict class labels for the given feature matrix.
+    ///
+    /// Delegates to [`BaseNB::nb_predict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        BaseNB::nb_predict(self, x)
     }
 }
 

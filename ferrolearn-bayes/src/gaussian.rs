@@ -25,6 +25,7 @@
 //! assert_eq!(preds.len(), 6);
 //! ```
 
+use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -403,117 +404,46 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianNB<F> {
         Ok(())
     }
 
-    /// Compute the joint log-likelihood for each class.
-    ///
-    /// Returns an array of shape `(n_samples, n_classes)` containing the
-    /// unnormalized log-posterior scores.
-    fn joint_log_likelihood(&self, x: &Array2<F>) -> Array2<F> {
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let n_features = x.ncols();
-
-        let two = F::from(2.0).unwrap();
-        let pi = F::from(std::f64::consts::PI).unwrap();
-        let log_two_pi = (two * pi).ln();
-
-        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
-
-        for ci in 0..n_classes {
-            for i in 0..n_samples {
-                let mut log_likelihood = self.log_prior[ci];
-                for j in 0..n_features {
-                    let mu = self.theta[[ci, j]];
-                    let var = self.sigma[[ci, j]];
-                    let diff = x[[i, j]] - mu;
-                    // log N(x; mu, var) = -0.5 * (log(2*pi*var) + (x-mu)^2/var)
-                    log_likelihood =
-                        log_likelihood - (log_two_pi + var.ln()) / two - diff * diff / (two * var);
-                }
-                scores[[i, ci]] = log_likelihood;
-            }
-        }
-
-        scores
-    }
-
     /// Predict class probabilities for the given feature matrix.
     ///
     /// Returns an array of shape `(n_samples, n_classes)` where each row
-    /// sums to 1.
+    /// sums to 1. Delegates to [`BaseNB::nb_predict_proba`] (the shared
+    /// `_BaseNB.predict_proba` pipeline).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.theta.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted GaussianNB".into(),
-            });
-        }
-
-        let log_scores = self.joint_log_likelihood(x);
-        let n_samples = x.nrows();
-        let n_classes = self.classes.len();
-        let mut proba = Array2::<F>::zeros((n_samples, n_classes));
-
-        for i in 0..n_samples {
-            // Numerically stable softmax: subtract row max before exp.
-            let max_score = log_scores
-                .row(i)
-                .iter()
-                .fold(F::neg_infinity(), |a, &b| a.max(b));
-
-            let mut row_sum = F::zero();
-            for ci in 0..n_classes {
-                let p = (log_scores[[i, ci]] - max_score).exp();
-                proba[[i, ci]] = p;
-                row_sum = row_sum + p;
-            }
-            for ci in 0..n_classes {
-                proba[[i, ci]] = proba[[i, ci]] / row_sum;
-            }
-        }
-
-        Ok(proba)
+        BaseNB::nb_predict_proba(self, x)
     }
 
     /// Compute the unnormalized joint log-likelihood `log P(c) + log P(x|c)`.
     ///
     /// Returns shape `(n_samples, n_classes)`. Matches sklearn
-    /// `GaussianNB._joint_log_likelihood`.
+    /// `GaussianNB._joint_log_likelihood`. Delegates to
+    /// [`BaseNB::nb_predict_joint_log_proba`].
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_joint_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let n_features_fitted = self.theta.ncols();
-        if x.ncols() != n_features_fitted {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_features_fitted],
-                actual: vec![x.ncols()],
-                context: "number of features must match fitted GaussianNB".into(),
-            });
-        }
-        Ok(self.joint_log_likelihood(x))
+        BaseNB::nb_predict_joint_log_proba(self, x)
     }
 
     /// Compute log of class probabilities (numerically stable).
     ///
     /// Returns shape `(n_samples, n_classes)` where each row's exponential
-    /// sums to 1.
+    /// sums to 1. Delegates to [`BaseNB::nb_predict_log_proba`] (the shared
+    /// `_BaseNB.predict_log_proba` = `jll - logsumexp(jll)` pipeline).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the fitted model.
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let jll = self.predict_joint_log_proba(x)?;
-        Ok(crate::log_softmax_rows(&jll))
+        BaseNB::nb_predict_log_proba(self, x)
     }
 
     /// Mean accuracy on the given test data and labels.
@@ -543,17 +473,13 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianNB<F> {
     }
 }
 
-impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGaussianNB<F> {
-    type Output = Array1<usize>;
-    type Error = FerroError;
-
-    /// Predict class labels for the given feature matrix.
+impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedGaussianNB<F> {
+    /// Compute the joint log-likelihood for each class — sklearn
+    /// `GaussianNB._joint_log_likelihood`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
-    /// not match the fitted model.
-    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+    /// Returns an array of shape `(n_samples, n_classes)` containing the
+    /// unnormalized log-posterior scores.
+    fn joint_log_likelihood(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features_fitted = self.theta.ncols();
         if x.ncols() != n_features_fitted {
             return Err(FerroError::ShapeMismatch {
@@ -563,24 +489,55 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGaussianNB<F
             });
         }
 
-        let scores = self.joint_log_likelihood(x);
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
+        let n_features = x.ncols();
 
-        let mut predictions = Array1::<usize>::zeros(n_samples);
-        for i in 0..n_samples {
-            let mut best_class = 0;
-            let mut best_score = scores[[i, 0]];
-            for ci in 1..n_classes {
-                if scores[[i, ci]] > best_score {
-                    best_score = scores[[i, ci]];
-                    best_class = ci;
+        let two = F::one() + F::one();
+        // PI converts exactly for f32/f64; the fallback is never reached.
+        let pi = F::from(std::f64::consts::PI).unwrap_or_else(F::nan);
+        let log_two_pi = (two * pi).ln();
+
+        let mut scores = Array2::<F>::zeros((n_samples, n_classes));
+
+        for ci in 0..n_classes {
+            for i in 0..n_samples {
+                let mut log_likelihood = self.log_prior[ci];
+                for j in 0..n_features {
+                    let mu = self.theta[[ci, j]];
+                    let var = self.sigma[[ci, j]];
+                    let diff = x[[i, j]] - mu;
+                    // log N(x; mu, var) = -0.5 * (log(2*pi*var) + (x-mu)^2/var)
+                    log_likelihood =
+                        log_likelihood - (log_two_pi + var.ln()) / two - diff * diff / (two * var);
                 }
+                scores[[i, ci]] = log_likelihood;
             }
-            predictions[i] = self.classes[best_class];
         }
 
-        Ok(predictions)
+        Ok(scores)
+    }
+
+    fn nb_classes(&self) -> &[usize] {
+        &self.classes
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGaussianNB<F> {
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    /// Predict class labels for the given feature matrix.
+    ///
+    /// Delegates to [`BaseNB::nb_predict`] (the shared `_BaseNB.predict` =
+    /// `classes_[argmax(jll)]` pipeline, first-max tie-break).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does
+    /// not match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        BaseNB::nb_predict(self, x)
     }
 }
 
