@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- metrics/classification: log_loss eps + roc_curve drop_intermediate + det_curve endpoint + calibration searchsorted + top_k tie-break edge-parity fixes; REQ table (completes ferrolearn-metrics) (#806)
 - metrics/pairwise: REQ table + 11 value-contract guards (present distance/kernel functions verified value-correct to ULP vs live sklearn) (#788)
 - translate(svm): REQ-1/8 gamma='auto' (Gamma enum scale/auto/value) + shrinking/break_ties/default alignment (#641 partial)
 - translate(linear_svc): REQ-6 multi_class {ovr, crammer_singer} + per-class coef pin (#623)
@@ -244,6 +245,12 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-metrics::top_k_accuracy_score diverges from sklearn/_ranking.py:2043 on tie-breaking (#812)
+- Divergence: ferrolearn-metrics::calibration_curve diverges from sklearn/calibration.py:1035 on float-edge binning (#811)
+- Divergence: ferrolearn-metrics calibration_curve bins by floor(prob*n_bins); sklearn calibration.py:1035 uses searchsorted(bins[1:-1], prob) (#810)
+- Divergence: ferrolearn-metrics det_curve retains the (0,0)/+inf ROC endpoint sklearn _ranking.py:362-376 drops (#809)
+- Divergence: ferrolearn-metrics roc_curve has no drop_intermediate (sklearn _ranking.py:1054 default True); keeps all distinct-score thresholds (#808)
+- Divergence: ferrolearn-metrics log_loss clips to EPS=1e-15, sklearn _classification.py:2951 clips to np.finfo(float64).eps=2.22e-16 (#807)
 - Divergence: ferrolearn-metrics::rand_score diverges from sklearn/metrics/cluster/_supervised.py:337 for single-sample input (#800)
 - Divergence: ferrolearn-metrics homogeneity/completeness/v_measure/hcv error on empty input (sklearn returns 1.0/(1,1,1)) vs sklearn/metrics/cluster/_supervised.py:531-532 (#799)
 - Divergence: ferrolearn-metrics::calinski_harabasz_score returns inf (not 1.0) when intra_disp==0 vs sklearn/metrics/cluster/_unsupervised.py:387-389 (#798)
