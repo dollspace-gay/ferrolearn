@@ -42,6 +42,37 @@
 //! let labels = fitted.predict(&x).unwrap();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_bisect_k_means.py`
+//! (`class BisectingKMeans(_BaseKMeans)` `:77`; `_BisectingTree` `:24`; `_bisect`
+//! `:287`; `fit` `:353`; `predict`/`_predict_recursive` `:446`). Design doc:
+//! `.design/cluster/bisecting_kmeans.md`. Cites use ferrolearn symbol anchors / sklearn
+//! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
+//! (R-CHAR-3). Verify-and-document unit: the `labels_` PARTITION (up to a label
+//! permutation, well-separated regime), the `transform` distance-to-centers CONTRACT,
+//! and the `bisecting_strategy`/`n_init` defaults match sklearn and SHIP through the
+//! crate re-export. Exact `cluster_centers_`/`inertia_` VALUES, the `labels_` integer
+//! numbering, and `predict` semantics DIVERGE — blocked by numpy-RNG init parity
+//! (#1030), mean-subtraction (#1028), the inner Lloyd/tol algorithm, the tree-DFS label
+//! order (#1027), and tree-descent predict (#1029). No CPython binding (#1033).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `Fit::fit` (recursive bisection via `fn run_2means` + `BisectingStrategy` selection) recovers sklearn's grouping on well-separated data. Consumer: crate re-export `pub use bisecting_kmeans::{BisectingKMeans, BisectingStrategy, FittedBisectingKMeans}` (`lib.rs:102`). Guards: `green_req1_two_blob_partition_up_to_permutation`, `green_req1_three_blob_partition_up_to_permutation` in `tests/divergence_bisecting_kmeans.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `cluster_centers_`/`inertia_` VALUES (REQ-2) + absolute label integers (REQ-5) diverge. |
+//! | REQ-3 (`bisecting_strategy` default = `biggest_inertia`) | SHIPPED | impl `fn new` defaults `bisecting_strategy: BisectingStrategy::LargestSSE` (= sklearn `"biggest_inertia"`, `_bisect_k_means.py:229`). Guard: in-module `test_default_bisecting_strategy_is_largest_sse`. Fixed #1025. |
+//! | REQ-4 (`n_init` default = 1) | SHIPPED | impl `fn new` defaults `n_init: 1` (= sklearn `n_init=1`, `_bisect_k_means.py:222`). Guard: in-module `test_default_n_init_is_one`. Fixed #1026. |
+//! | REQ-13 (`transform` distance-to-centers contract) | SHIPPED | impl `Transform::transform` returns shape `(n_samples, n_clusters)` with column `j` = Euclidean distance to center `j`, mirroring sklearn `_BaseKMeans.transform`. Guard: `green_req13_transform_contract_shape_and_argmin_equals_predict` (argmin-over-columns == predict). Consumer: crate re-export. Underclaim: distance VALUES track `cluster_centers_` (REQ-2) — agree on separable data, diverge where centers diverge. |
+//! | REQ-2 (`cluster_centers_` / `inertia_` VALUE parity) | NOT-STARTED | open prereq blocker #1024. Exact centers/inertia diverge from sklearn (numpy-RNG init #1030, mean-subtraction #1028, inner Lloyd/tol algorithm). Blocked on those prereqs. |
+//! | REQ-5 (`labels_` numbering via tree-DFS `iter_leaves`) | NOT-STARTED | open prereq blocker #1027. sklearn numbers labels by `_BisectingTree.iter_leaves()` depth-first order (`_bisect_k_means.py:426-428`); ferrolearn numbers by flat `Vec<ClusterInfo>` push order (`Fit::fit`). Partition matches up-to-permutation; absolute integers diverge. |
+//! | REQ-6 (mean-subtraction for numerical accuracy) | NOT-STARTED | open prereq blocker #1028. sklearn subtracts `X_mean` then adds back to `cluster_centers_` (`_bisect_k_means.py:402-404,433-435`); ferrolearn does not. |
+//! | REQ-7 (`predict` tree-descent vs flat nearest-center) | NOT-STARTED | open prereq blocker #1029. sklearn `_predict_recursive` descends the `_BisectingTree` (`:446-527`); ferrolearn `Predict::predict` uses the nearest of the FINAL leaf centers (flat). Different rule in general. |
+//! | REQ-8 (numpy-RNG parity for centroid init) | NOT-STARTED | open prereq blocker #1030. sklearn `check_random_state` + numpy RNG through `_init_centroids`; ferrolearn `StdRng` + per-split derived seed (`Fit::fit`). Exact init/labels/centers cannot match without a numpy-RNG analog. |
+//! | REQ-9 (ctor surface `init`/k-means++/`tol`/`sample_weight`/`algorithm`/`verbose`/`copy_x` + `n_clusters=8`) | NOT-STARTED | open prereq blocker #1031. sklearn `__init__` (`_bisect_k_means.py:217-243`) exposes all; ferrolearn `BisectingKMeans<F>` has `n_clusters`/`max_iter`/`n_init`/`random_state`/`bisecting_strategy` only, `fn run_2means` is a basic Lloyd (no `tol`, random-index init). |
+//! | REQ-10 (validation / error ABI) | NOT-STARTED | open prereq blocker #1032. sklearn `_parameter_constraints`/`InvalidParameterError` + `_check_params_vs_input` (`:208-215,389`); ferrolearn raises `FerroError::InvalidParameter`/`InsufficientSamples` (different type/ABI). |
+//! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1033. `grep BisectingKMeans ferrolearn-python/` is EMPTY — no binding. Only consumer is the crate re-export. |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1034. `bisecting_kmeans.rs` imports `ndarray`/`num-traits`/`rand`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -87,16 +118,16 @@ pub struct BisectingKMeans<F> {
 impl<F: Float> BisectingKMeans<F> {
     /// Create a new `BisectingKMeans` with the given target number of clusters.
     ///
-    /// Defaults: `max_iter = 300`, `n_init = 10`, `random_state = None`,
-    /// `bisecting_strategy = LargestCluster`.
+    /// Defaults: `max_iter = 300`, `n_init = 1`, `random_state = None`,
+    /// `bisecting_strategy = LargestSSE`.
     #[must_use]
     pub fn new(n_clusters: usize) -> Self {
         Self {
             n_clusters,
             max_iter: 300,
-            n_init: 10,
+            n_init: 1,
             random_state: None,
-            bisecting_strategy: BisectingStrategy::LargestCluster,
+            bisecting_strategy: BisectingStrategy::LargestSSE,
             _marker: PhantomData,
         }
     }
@@ -607,6 +638,21 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedBisectingK
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_default_bisecting_strategy_is_largest_sse() {
+        // sklearn BisectingKMeans default bisecting_strategy="biggest_inertia"
+        // (= LargestSSE), sklearn/cluster/_bisect_k_means.py:229.
+        let model = BisectingKMeans::<f64>::new(3);
+        assert_eq!(model.bisecting_strategy, BisectingStrategy::LargestSSE);
+    }
+
+    #[test]
+    fn test_default_n_init_is_one() {
+        // sklearn BisectingKMeans default n_init=1, sklearn/cluster/_bisect_k_means.py:222.
+        let model = BisectingKMeans::<f64>::new(3);
+        assert_eq!(model.n_init, 1);
+    }
 
     /// Create well-separated 2D blobs for testing.
     fn make_blobs() -> Array2<f64> {

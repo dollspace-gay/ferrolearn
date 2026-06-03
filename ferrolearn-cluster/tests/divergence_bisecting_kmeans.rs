@@ -27,13 +27,11 @@ fn canonical_partition(labels: &[isize]) -> Vec<usize> {
     let mut first_seen: Vec<isize> = Vec::new();
     labels
         .iter()
-        .map(|&l| {
-            match first_seen.iter().position(|&x| x == l) {
-                Some(p) => p,
-                None => {
-                    first_seen.push(l);
-                    first_seen.len() - 1
-                }
+        .map(|&l| match first_seen.iter().position(|&x| x == l) {
+            Some(p) => p,
+            None => {
+                first_seen.push(l);
+                first_seen.len() - 1
             }
         })
         .collect()
@@ -146,7 +144,11 @@ fn green_req13_transform_contract_shape_and_argmin_equals_predict() {
         .unwrap();
 
     let t = fitted.transform(&x).unwrap();
-    assert_eq!(t.dim(), sk_shape, "transform shape must be (n_samples, n_clusters)");
+    assert_eq!(
+        t.dim(),
+        sk_shape,
+        "transform shape must be (n_samples, n_clusters)"
+    );
 
     // Column-to-center correspondence: argmin over the distance columns must equal
     // the predict label (sklearn: transform(X).argmin(axis=1) == predict(X)).
@@ -170,7 +172,10 @@ fn green_req13_transform_contract_shape_and_argmin_equals_predict() {
     // its center, hence non-negative, and the per-row minimum is the predicted
     // cluster's distance (a non-negative finite quantity on well-separated data).
     for v in t.iter() {
-        assert!(*v >= 0.0, "transform distances are non-negative euclidean norms");
+        assert!(
+            *v >= 0.0,
+            "transform distances are non-negative euclidean norms"
+        );
         assert!(v.is_finite(), "transform distances are finite");
     }
 }
