@@ -5,6 +5,26 @@
 //!
 //! This transformer is **stateless** — no fitting is required. Call
 //! [`Transform::transform`] directly.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_data.py` (`class Binarizer`
+//! `:2177`, `binarize` `:2120`). Design doc: `.design/preprocess/binarizer.md`. Expected
+//! values from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export
+//! (`lib.rs:106`, grandfathered S5). Two SHIPPED REQs are critic-verified vs the oracle;
+//! the remaining surface is NOT-STARTED with concrete blockers.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (dense strict-greater transform) | SHIPPED | `Transform::transform` = `x.mapv(\|v\| if v > threshold { 1 } else { 0 })`, strict `>`, shape-preserving; `Default` threshold 0.0. Mirrors sklearn `binarize` dense path (`_data.py:2170-2173`). Critic-verified bit-identical to live sklearn (`guard_binarizer_*` in `tests/divergence_binarizer.rs`: thr 0.5 → `[[0,1,0],[1,0,0]]`, default, negative, f32). Consumer: `pub use binarizer::Binarizer` (`lib.rs:106`). |
+//! | REQ-9 (transform input validation per check_array) | SHIPPED | FIXED #1123/#1124/#1125. `transform` rejects (in sklearn order) zero-samples → `InsufficientSamples` (`validation.py:1084`), zero-features → `InvalidParameter` (`:1093`), non-finite NaN/±inf → `InvalidParameter` (`:1063`, force_all_finite=True) — matching sklearn `Binarizer.transform` `_validate_data` (`_data.py:2301`). 13 live-oracle tests green; finite extremes (1e308/-0.0/subnormal) not over-rejected. Two-round critic-verified CLEAN. |
+//! | REQ-2 (copy param) | NOT-STARTED | open prereq blocker #1126. No `copy` ctor/transform param (sklearn `:2253`,`:2298-2307`). |
+//! | REQ-3 (fit + parameter-constraints validation) | NOT-STARTED | open prereq blocker #1127. No `fit`/`_parameter_constraints` (threshold is Real → InvalidParameterError; sklearn `:2248-2278`). Transform-time INPUT validation is REQ-9; this is fit-time PARAMETER validation. |
+//! | REQ-4 (binarize free function) | NOT-STARTED | open prereq blocker #1128. No standalone `binarize` fn (sklearn `:2120-2174`). |
+//! | REQ-5 (n_features_in_ / feature names) | NOT-STARTED | open prereq blocker #1129. No `n_features_in_`/`get_feature_names_out` (OneToOneFeatureMixin; sklearn `:2277`). Depends on REQ-3. |
+//! | REQ-6 (sparse support) | NOT-STARTED | open prereq blocker #1130. Dense-only; no CSR/CSC path, no `threshold<0` guard, no `eliminate_zeros` (sklearn `:2161-2168`). |
+//! | REQ-7 (PyO3 binding) | NOT-STARTED | open prereq blocker #1131. No `ferrolearn-python` registration. |
+//! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #1132. `ndarray`/`num_traits`, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Transform;
@@ -73,8 +93,49 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for Binarizer<F> {
     ///
     /// # Errors
     ///
-    /// This implementation never returns an error for well-formed inputs.
+    /// Returns [`FerroError::InsufficientSamples`] if `x` has zero rows. This
+    /// mirrors scikit-learn's `Binarizer.transform`
+    /// (`sklearn/preprocessing/_data.py:2301`), whose `_validate_data` ->
+    /// `check_array` min-samples check raises `ValueError: Found array with 0
+    /// sample(s) ... while a minimum of 1 is required by Binarizer.`
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if `x` has zero features
+    /// (columns). This mirrors scikit-learn's `Binarizer.transform`
+    /// (`sklearn/preprocessing/_data.py:2301`), whose `_validate_data` ->
+    /// `check_array` min-features check (`utils/validation.py:1093`,
+    /// `ensure_min_features=1`) raises `ValueError: Found array with 0
+    /// feature(s) (shape=(3, 0)) while a minimum of 1 is required by Binarizer.`
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if `x` contains any non-finite
+    /// value (NaN, +inf, or -inf). This mirrors scikit-learn's
+    /// `Binarizer.transform` (`sklearn/preprocessing/_data.py:2301`), which
+    /// validates input via `check_array(force_all_finite=True)` and raises
+    /// `ValueError: Input X contains NaN.` / `Input X contains infinity ...`
+    /// before applying the threshold comparison.
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        if x.nrows() == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "Binarizer::transform".into(),
+            });
+        }
+        if x.ncols() == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "X".to_string(),
+                reason: "Found array with 0 feature(s); a minimum of 1 is required \
+                         by Binarizer"
+                    .to_string(),
+            });
+        }
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".to_string(),
+                reason: "Input X contains non-finite values (NaN or infinity); \
+                         Binarizer requires all-finite input"
+                    .to_string(),
+            });
+        }
         let out = x.mapv(|v| {
             if v > self.threshold {
                 F::one()
