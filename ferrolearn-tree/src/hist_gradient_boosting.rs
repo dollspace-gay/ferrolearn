@@ -60,9 +60,10 @@
 //! **Determinism:** `early_stopping='auto'` is OFF for `n_samples <= 10000`,
 //! so the default small-data fit is fully deterministic and end-to-end
 //! parity with sklearn is verified to ~1e-8 (regressor both binning branches
-//! and NaN routing; classifier binary and multiclass). `early_stopping`
-//! (validation split) and `max_features` introduce numpy-MT vs StdRng RNG
-//! boundaries.
+//! and NaN routing; classifier BINARY). The classifier MULTICLASS path
+//! diverges (~3e-4) by a float32 gradient/hessian saturation artifact (#758,
+//! below). `early_stopping` (validation split) and `max_features` introduce
+//! numpy-MT vs StdRng RNG boundaries.
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
@@ -72,11 +73,12 @@
 //! | REQ-4 | Split gain `G_L²/(H_L+λ)+G_R²/(H_R+λ)-G_p²/(H_p+λ)` (`splitting.pyx`) | SHIPPED |
 //! | REQ-5 | Leaf value `-ΣG/(ΣH+λ)` + shrinkage by `learning_rate` (`grower.py`) | SHIPPED |
 //! | REQ-6 | Best-first grower / `max_leaf_nodes` / `min_samples_leaf` | SHIPPED |
-//! | REQ-7 | End-to-end parity (HGBR both branches + NaN; HGBC binary + multiclass) at `early_stopping` off, verified ~1e-8 | SHIPPED |
+//! | REQ-7 | End-to-end parity at `early_stopping` off, ~1e-8: HGBR (both binning branches + NaN) + HGBC **binary** predict_proba | SHIPPED |
+//! | REQ-7b | HGBC **multiclass** predict_proba exact parity — sklearn stores per-sample grad/hessian as float32 (`G_H_DTYPE`, `common.pyx:10`); ferrolearn's f64 keeps class symmetry sklearn breaks near saturation (~3e-4) | NOT-STARTED (#758) |
 //! | REQ-8 | Param NAME `n_estimators` → sklearn `max_iter` (R-DEV-2) | NOT-STARTED (#747) |
 //! | REQ-9 | `early_stopping`/`validation_fraction`/`n_iter_no_change`/`tol` | NOT-STARTED (#748, RNG boundary) |
 //! | REQ-10 | `max_features` per-split subsampling | NOT-STARTED (#749, RNG boundary) |
-//! | REQ-11 | Classifier sum-zero raw init (softmax-invariant; predict_proba already matches) | NOT-STARTED (#750) |
+//! | REQ-11 | Classifier sum-zero raw init `log(p_k)-mean_k log(p_k)` (softmax-invariant; not the multiclass-parity blocker — see #758) | NOT-STARTED (#750) |
 //! | REQ-12 | ferray substrate migration | NOT-STARTED (#752) |
 
 use ferrolearn_core::error::FerroError;
