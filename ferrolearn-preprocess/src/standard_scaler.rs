@@ -1,7 +1,33 @@
 //! Standard scaler: zero-mean, unit-variance scaling.
 //!
-//! Each feature is transformed as `(x - mean) / std`. Zero-variance
-//! columns are left unchanged (the feature value is not modified).
+//! Each feature is transformed as `(x - mean) / std`. Constant
+//! (zero-variance) columns use an effective scale of 1, so each entry maps to
+//! `(x - mean) / 1 = 0` (matching scikit-learn `_handle_zeros_in_scale`).
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_data.py` (`class StandardScaler`
+//! `:696`, `scale` `:133`). Design doc: `.design/preprocess/standard_scaler.md`. Expected values
+//! from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumers: PyO3 `_RsStandardScaler`
+//! (`ferrolearn-python/src/transformers.rs:12`) + `PipelineTransformer` impl + crate re-export
+//! (`lib.rs`, grandfathered S5). HONEST (R-HONEST-3): always centers+scales (no with_mean/with_std
+//! params); the per-column standardize VALUES match sklearn on the default path.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (per-column standardize value match, non-constant) | SHIPPED | `Fit::fit` learns per-column `mean`/`std=sqrt(population var ddof=0)`; `Transform::transform` = `(x-mean)/std`, mirroring sklearn `X -= mean_; X /= scale_` (`_data.py:1064-1067`). Critic-verified bit-identical to live oracle: `green_req1_value_match_non_constant` (`[[-1.2247..],[0],[1.2247..]]`), `green_req1_mean_and_scale_attributes` (mean()/std() == sklearn mean_/scale_ on non-constant), `green_req1_negative_decimal_fixture`. Consumers: PyO3 `_RsStandardScaler` + `FittedPipelineTransformer` + re-export. |
+//! | REQ-2 (constant / zero-variance column → 0) | SHIPPED | FIXED #1191. `transform` uses `s_eff = if s==0 {1} else {s}` → constant col `(x-mean)/1 = 0`, matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,`:1019-1021`); `inverse_transform` aligned to `x*s_eff+m`. Critic two-round CLEAN: 9 tests incl. constant→0 (default/single-row/mixed) + inverse non-round-trip on constant col matches `x*1+mean`. In-module test corrected (R-HONEST-4). |
+//! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*s_eff + mean`, mirroring sklearn `X *= scale_; X += mean_` (`_data.py:1106-1109`); `inverse_transform(transform(X))==X` (`green_req3_inverse_roundtrip`). Consumer: PyO3 `_RsStandardScaler::inverse_transform`. |
+//! | REQ-4 (PyO3 binding) | SHIPPED | `_RsStandardScaler` (`transformers.rs:12`, registered `lib.rs:22`) marshals `fit`/`transform`/`inverse_transform`/`mean_` over `FittedStandardScaler<f64>` — a real CPython consumer. |
+//! | REQ-5 (var_/scale_/n_samples_seen_ attrs) | NOT-STARTED | open prereq blocker #1192. Only `mean`/`std`; no `var_`/`scale_`/`n_samples_seen_` (`_data.py:1013-1023`). |
+//! | REQ-6 (with_mean/with_std/copy params) | NOT-STARTED | open prereq blocker #1193. Always centers+scales (`_data.py:829-838`,`:1064-1067`). |
+//! | REQ-7 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1194. Fold propagates NaN; sklearn ignores NaN (`_data.py:918`,`:1112-1113`). Not a rejection. |
+//! | REQ-8 (scale free fn + axis) | NOT-STARTED | open prereq blocker #1195. No `scale` fn / axis=1 (`_data.py:133`). |
+//! | REQ-9 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1196. Single-shot (`_data.py:880-1025`). |
+//! | REQ-10 (sample_weight) | NOT-STARTED | open prereq blocker #1197. Unweighted (`_data.py:923-924`). |
+//! | REQ-11 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1198. Dense-only (`_data.py:940-983`). |
+//! | REQ-12 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1199. None (OneToOneFeatureMixin). |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1200. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -18,7 +44,8 @@ use num_traits::Float;
 /// Calling [`Fit::fit`] learns the per-column means and standard deviations
 /// and returns a [`FittedStandardScaler`] that can transform new data.
 ///
-/// Zero-variance columns (std = 0) are left unchanged after transformation.
+/// Constant (zero-variance) columns use an effective scale of 1, so each entry
+/// maps to `(x - mean) / 1 = 0` after transformation.
 ///
 /// # Examples
 ///
@@ -84,7 +111,9 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
 
     /// Inverse-transform scaled data back to original space.
     ///
-    /// Applies `x_orig = x_scaled * std + mean` per column.
+    /// Applies `x_orig = x_scaled * scale + mean` per column, where constant
+    /// (zero-variance) columns use an effective scale of 1 (matching sklearn
+    /// `_handle_zeros_in_scale`, `_data.py:88`, `:1106-1109`).
     ///
     /// # Errors
     ///
@@ -105,8 +134,11 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
             .into_iter()
             .zip(self.mean.iter().zip(self.std.iter()))
         {
+            // Constant (zero-variance) columns use an effective scale of 1,
+            // matching sklearn's `scale_` (`_data.py:88`, `:1106-1109`).
+            let s_eff = if s == F::zero() { F::one() } else { s };
             for v in &mut col {
-                *v = *v * s + m;
+                *v = *v * s_eff + m;
             }
         }
         Ok(out)
@@ -164,7 +196,9 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedStandardSc
 
     /// Transform data by subtracting the mean and dividing by the standard deviation.
     ///
-    /// Columns with zero standard deviation are left unchanged.
+    /// Constant (zero-variance) columns use an effective scale of 1, so each
+    /// entry maps to `(x - mean) / 1 = 0` (matching scikit-learn
+    /// `_handle_zeros_in_scale`).
     ///
     /// # Errors
     ///
@@ -185,12 +219,12 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedStandardSc
             .into_iter()
             .zip(self.mean.iter().zip(self.std.iter()))
         {
-            if s == F::zero() {
-                // Zero-variance column: leave unchanged.
-                continue;
-            }
+            // Constant (zero-variance) columns use an effective scale of 1,
+            // matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,
+            // `:1019-1021`): `(x - mean) / 1 = 0` since `x == mean`.
+            let s_eff = if s == F::zero() { F::one() } else { s };
             for v in &mut col {
-                *v = (*v - m) / s;
+                *v = (*v - m) / s_eff;
             }
         }
         Ok(out)
@@ -313,16 +347,16 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_variance_column_unchanged() {
+    fn test_constant_column_maps_to_zero() {
         let scaler = StandardScaler::<f64>::new();
         // Column 1 is constant: std = 0
         let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
         let fitted = scaler.fit(&x, &()).unwrap();
         assert_abs_diff_eq!(fitted.std()[1], 0.0, epsilon = 1e-15);
         let scaled = fitted.transform(&x).unwrap();
-        // Constant column should remain 5.0 (unchanged)
+        // Constant column maps to (x - mean)/1 = 0 (sklearn with_mean=True).
         for i in 0..3 {
-            assert_abs_diff_eq!(scaled[[i, 1]], 5.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(scaled[[i, 1]], 0.0, epsilon = 1e-10);
         }
     }
 
