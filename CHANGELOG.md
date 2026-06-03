@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/balltree: BallTree query k-NN value, tie-SET, and within_radius value contracts verified value-correct vs live sklearn 1.5.2 (5 green guards + real non-test consumers in knn/nearest_neighbors/radius_neighbors); REQ table (3 SHIPPED, 9 NOT-STARTED — metric/kernel_density/two_point_correlation, k>n+empty-X ValueError #858 blocked on query->Result threading cf #831) (#854)
 - neighbors/local_outlier_factor: LocalOutlierFactor contamination="auto" default (Contamination enum) + offset_ (-1.5/percentile) + negative_outlier_factor_ contract, predict via nof<offset_, decision_function=score_samples-offset_; REQ table (5 SHIPPED, 6 NOT-STARTED) critic-verified vs sklearn 1.5.2 (#844 #847 #848 #849)
 - neighbors/nearest_centroid: shrink_threshold s+=median(s) + clamp removal, n_classes<2 + zero-variance ValueError; REQ table (#836 #837 #838 #839 #840)
 - neighbors/kdtree: KDTree single-row k-NN query verified value-correct vs live sklearn (REQ table; k>n error contract NOT-STARTED #831, blocked on consumer Result-threading) (#830)
