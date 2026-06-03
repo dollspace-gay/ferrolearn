@@ -8,6 +8,30 @@
 //!
 //! This transformer is **stateless** — no fitting is needed. Call
 //! [`Transform::transform`] directly.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_polynomial.py` (`class
+//! PolynomialFeatures` `:99`). Design doc: `.design/preprocess/polynomial_features.md`. Expected
+//! values from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumers: `PipelineTransformer` impl +
+//! crate re-export (`lib.rs`, grandfathered S5). HONEST (R-HONEST-3): a stateless dense int-degree
+//! transformer — the polynomial VALUES + column ORDER match sklearn exactly; the stateful surface
+//! (`fit`/`n_features_in_`/`powers_`/`get_feature_names_out`), degree-tuple, `order`, sparse are
+//! NOT-STARTED.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (int-degree dense values + column order) | SHIPPED | `Transform::transform` × `fn feature_combinations` (bias=empty combo, DFS interaction_only strictly-increasing / else non-decreasing, sort by degree-then-lex) reproduces sklearn `_combinations` itertools order (`_polynomial.py:209-220`) column-for-column. Critic-verified bit-identical to live oracle (8 green guards in `tests/divergence_polynomial_features.rs`): 2-feat default `[1,2,3,4,6,9]`, 3-feat default `[1,2,3,5,4,6,10,9,15,25]`, 3-feat interaction `[1,2,3,5,6,10,15]`, deg-3 interaction no-bias `[2,3,5,6,10,15,30]`, multi-row. Consumers: `FittedPipelineTransformer` + re-export. |
+//! | REQ-8 (input validation per check_array) | SHIPPED | FIXED #1180. `transform` guards (sklearn order) zero-samples → `InsufficientSamples`, zero-features → `InvalidParameter`, non-finite NaN/±inf → `InvalidParameter` — matching sklearn `transform` → `_validate_data` (`_polynomial.py:433-435`). Mirrors converged binarizer/normalizer. Critic two-round CLEAN: 13 tests incl. finite input (1e308) with overflowing product correctly ACCEPTED (input-only validation). |
+//! | REQ-2 (degree tuple / min_degree) | NOT-STARTED | open prereq blocker #1181. Single `usize` degree, always starts at degree 1 (sklearn `:334-360`). |
+//! | REQ-3 (order C/F param) | NOT-STARTED | open prereq blocker #1182. No `order` (sklearn `:201`,`:132-134`). |
+//! | REQ-4 (stateful fit + n_features_in_/n_output_features_ + count check) | NOT-STARTED | open prereq blocker #1183. Stateless; no fit/feature-count guard (sklearn `:306-435`). |
+//! | REQ-5 (powers_ attribute) | NOT-STARTED | open prereq blocker #1184. None (sklearn `:250-264`). Depends on REQ-4. |
+//! | REQ-6 (get_feature_names_out) | NOT-STARTED | open prereq blocker #1185. None (sklearn `:266-303`). Depends on REQ-5. |
+//! | REQ-7 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1186. Dense-only (sklearn `:402-`,`:38-96`). |
+//! | REQ-9 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1187. Positional `new`, degree==0 only (sklearn `:194-207`). |
+//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1188. No `ferrolearn-python` registration (R-DEFER-1). |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker #1189. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -176,15 +200,47 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for PolynomialFeatur
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if the input has zero columns.
+    /// Mirrors scikit-learn's `PolynomialFeatures.transform`
+    /// (`sklearn/preprocessing/_polynomial.py:433`, `self._validate_data(...)` ->
+    /// `check_array`), validating in `check_array` order
+    /// (samples -> features -> finite):
+    ///
+    /// - Returns [`FerroError::InsufficientSamples`] if `x` has zero rows
+    ///   (`check_array` `ensure_min_samples=1`; sklearn raises `ValueError:
+    ///   Found array with 0 sample(s) ... a minimum of 1 is required`).
+    /// - Returns [`FerroError::InvalidParameter`] if `x` has zero columns
+    ///   (`check_array` `ensure_min_features=1`; sklearn raises `ValueError:
+    ///   Found array with 0 feature(s) ... a minimum of 1 is required`).
+    /// - Returns [`FerroError::InvalidParameter`] if `x` contains any non-finite
+    ///   value (NaN, +inf, or -inf; `check_array` `force_all_finite=True`;
+    ///   sklearn raises `ValueError: Input X contains NaN` / `infinity ...`).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "PolynomialFeatures::transform".into(),
+            });
+        }
+
         if n_features == 0 {
             return Err(FerroError::InvalidParameter {
-                name: "x".into(),
-                reason: "input must have at least one column".into(),
+                name: "X".into(),
+                reason: "Found array with 0 feature(s); a minimum of 1 is required \
+                         by PolynomialFeatures"
+                    .into(),
+            });
+        }
+
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains non-finite values (NaN or infinity); \
+                         PolynomialFeatures requires all-finite input"
+                    .into(),
             });
         }
 
