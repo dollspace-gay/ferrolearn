@@ -37,6 +37,56 @@
 //! let labels = fitted.labels();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification + symbol-anchor + sklearn
+//! `file:line`; NOT-STARTED carries the open prereq blocker. **Unlike the
+//! `feature_agglomeration.rs` / `spectral.rs` siblings, `DBSCAN` HAS a real PyO3
+//! binding** — `#[pyclass(name = "_RsDBSCAN")] struct RsDBSCAN` in
+//! `ferrolearn-python/src/extras.rs` (its `fn fit` calls
+//! `ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples)`
+//! and `#[getter] labels_` surfaces `f.labels()`), registered via
+//! `m.add_class::<extras::RsDBSCAN>()` in `ferrolearn-python/src/lib.rs`, surfaced
+//! as `ferrolearn.DBSCAN` (`fit_predict` / `labels_`). So
+//! `import ferrolearn; ferrolearn.DBSCAN(...).fit(X).labels_` is the non-test
+//! production consumer of the core contract. **Honest assessment (R-HONEST-3):
+//! this unit's CORE contract genuinely SHIPS** — DBSCAN is deterministic (no RNG,
+//! no iterative optimizer), so on the Euclidean / no-`sample_weight` path
+//! `labels_` and `core_sample_indices_` VALUE-match the live sklearn 1.5.2 oracle
+//! EXACTLY (element-wise, including the shared-border tie-break and the noise
+//! `-1` set), backed by green guards in
+//! `ferrolearn-cluster/tests/divergence_dbscan.rs`. The divergence appears ONLY
+//! on a neighbor edge where ferrolearn's `sum-of-squares ≤ eps²` and sklearn's
+//! `euclidean_distances` (dot-product) / tree distance round to OPPOSITE SIDES of
+//! the `eps` boundary — e.g. coords whose true distance is within a ULP of `eps`
+//! (the two forms then disagree on inclusion, flipping core status / merging
+//! clusters). When the boundary value is exactly representable the two agree
+//! (the green guards include Fixture C with edges exactly at `eps=1.0`, where
+//! `1.0²` is exact and both include). This exact-boundary distance-form parity is
+//! carved out as REQ-11 (NOT-STARTED, #952), tied to the neighbor-search
+//! algorithm surface (#949). The NOT-STARTED surface is the
+//! unimplemented parameter/attribute surface (`sample_weight`, `metric`/`p`,
+//! `algorithm`/`leaf_size`/`n_jobs`, the `eps=0.5` Rust-constructor default + error
+//! ABI, the `components_` attribute, the ferray substrate), each carrying an open
+//! prereq blocker. Cites use symbol anchors (ferrolearn) / `file:line`
+//! (sklearn 1.5.2, commit 156ef14). Live oracle = installed sklearn 1.5.2. (REQ
+//! numbering follows `.design/cluster/dbscan.md`.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` VALUE parity, Euclidean / no `sample_weight`) | SHIPPED | impl `Fit::fit` (index-ordered cluster expansion via `VecDeque` BFS) + `fn fit_predict` in `dbscan.rs` mirror `dbscan_inner` (`sklearn/cluster/_dbscan_inner.pyx`) + `_dbscan.py:431-439` (`labels = np.full(n, -1)`, `dbscan_inner(...)`): clusters numbered by the first unlabeled core in index order, noise `= -1`, a border point reachable from two clusters joins the FIRST-reaching cluster (guard `if labels[neighbor] == -1`). VALUE-matches sklearn EXACTLY element-wise on the tested fixtures; diverges only when ferrolearn's `sum-sq ≤ eps²` and sklearn's `euclidean_distances`/tree distance round to opposite sides of the `eps` boundary (true distance within a ULP of `eps`) — carved out as REQ-11 (NOT-STARTED, #952). Non-test consumer: `ferrolearn.DBSCAN.fit(X).labels_` via `RsDBSCAN::labels_` (`ferrolearn-python/src/extras.rs`). Green guards (`tests/divergence_dbscan.rs`): `green_dbscan_labels_two_clusters`, `green_dbscan_labels_three_clusters`, `green_dbscan_shared_border_tie`, `green_dbscan_noise_and_core_indices`. |
+//! | REQ-2 (`core_sample_indices_` VALUE parity) | SHIPPED | impl `core_sample_indices = (0..n).filter(\|&i\| is_core[i]).collect()` in `Fit::fit` + accessor `fn core_sample_indices` in `dbscan.rs`, mirroring `core_sample_indices_ = np.where(core_samples)[0]` (`_dbscan.py:438`), core `= neighborhoods[i].len() >= min_samples` (`:435`). VALUE-matches ascending EXACTLY on non-eps-boundary inputs (the eps-boundary case flips a point's core status — REQ-11/#952). Non-test consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate accessor (the PyO3 layer surfaces only `labels_`, not `core_sample_indices_`). Green guards: `green_dbscan_shared_border_tie` (Fixture C core `[0,1,2,3,5,6,7,8]`, border idx4 excluded), `green_dbscan_noise_and_core_indices` (Fixture D core `[0,1,2,4,6,7,8,9,13]`). |
+//! | REQ-3 (`eps>0` / `min_samples>=1` validation boundary) | SHIPPED | impl `Fit::fit` guards `self.eps <= F::zero()` → `Err(FerroError::InvalidParameter { name: "eps" })` and `self.min_samples == 0` → `Err(FerroError::InvalidParameter { name: "min_samples" })`, matching the accept/reject boundary of `_parameter_constraints` `"eps": [Interval(Real, 0.0, None, closed="neither")]` / `"min_samples": [Interval(Integral, 1, None, closed="left")]` (`_dbscan.py:332-333`). Non-test consumer: `RsDBSCAN::fit` maps the error to `PyValueError` (`ferrolearn-python/src/extras.rs`). Green guards: `green_dbscan_eps_zero_rejected` (`eps=0` → `Err`), `green_dbscan_min_samples_one_self_core` (`min_samples=1` accepted, self-core). GAP: the error TYPE is `FerroError::InvalidParameter`, not sklearn's `InvalidParameterError`/`ValueError` ABI — the boundary itself matches; the ABI nuance is tracked under REQ-4. |
+//! | REQ-4 (`eps=0.5` Rust-constructor default + sklearn error ABI) | NOT-STARTED | open prereq blocker **#946**. sklearn `__init__` `eps=0.5` default (`_dbscan.py:347`); ferrolearn `fn new(eps: F)` REQUIRES `eps` — no default. (The PyO3 layer DOES default `eps=0.5` in `RsDBSCAN::new`, but the Rust constructor `DBSCAN::new` does not.) Also validation errors are `FerroError::InvalidParameter`, not the sklearn `InvalidParameterError`/`ValueError` ABI (R-DEV-2). |
+//! | REQ-5 (`sample_weight` — alters core determination) | NOT-STARTED | open prereq blocker **#947**. sklearn `fit(X, sample_weight=w)` sets `n_neighbors = sum(sample_weight[neighbors])` (`_dbscan.py:427-429`), so a high-weight point becomes core with fewer neighbors (oracle: `w0=5` → `[0,-1,-1]` vs unweighted `[-1,-1,-1]`). ferrolearn `Fit<Array2<F>, ()>` has the unit `()` target — no weight; core is purely `neighborhoods[i].len() >= min_samples` (`Fit::fit`). Missing surface. |
+//! | REQ-6 (`metric` / `p` / `metric_params`) | NOT-STARTED | open prereq blocker **#948**. sklearn accepts any `pairwise_distances` metric (`_dbscan.py:334-337`), `p` for Minkowski (`:341`), default `'euclidean'` (`:350`). ferrolearn `fn region_query` / `fn squared_euclidean` (`dbscan.rs`) is Euclidean-ONLY; no `metric`/`p`/`metric_params` param (oracle: `metric='manhattan'` → `[-1,0,0]` vs euclidean `[0,0,0]`). Missing surface. |
+//! | REQ-7 (`algorithm` / `leaf_size` / `n_jobs`) | NOT-STARTED | open prereq blocker **#949**. sklearn routes neighbor search through `NearestNeighbors(radius, algorithm, leaf_size, ..., n_jobs)` (`_dbscan.py:411-422`; constraints `:339-342`). ferrolearn uses a fixed brute-force `O(n^2)` `fn region_query` with no parameter. (Brute force value-matches the default `'auto'`; the divergence is the absent parameter surface.) Missing surface. |
+//! | REQ-8 (`components_` fitted attribute) | NOT-STARTED | open prereq blocker **#950**. sklearn `self.components_ = X[self.core_sample_indices_].copy()` (`_dbscan.py:441-446`). `FittedDBSCAN` exposes `fn core_sample_indices` but has NO `components_` accessor and does not retain `X`. Missing attribute. |
+//! | REQ-9 (PyO3 binding VALUE parity) | SHIPPED | impl `#[pyclass(name = "_RsDBSCAN")] RsDBSCAN` (`ferrolearn-python/src/extras.rs`): `fn new(eps=0.5, min_samples=5)`, `fn fit` calling `ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples)`, `#[getter] labels_`; registered via `m.add_class::<extras::RsDBSCAN>()` (`ferrolearn-python/src/lib.rs`), surfaced as `ferrolearn.DBSCAN` (`fit_predict` / `labels_`). Non-test consumer: `import ferrolearn; ferrolearn.DBSCAN(...).fit(X).labels_`. Since the Rust core value-matches (REQ-1/2), `import ferrolearn` matches `import sklearn` on the Euclidean / no-`sample_weight` path. The binding does NOT yet re-expose `core_sample_indices_` / `components_` / `sample_weight` / `metric` (only `labels_` via `#[getter]`) — those ride their own REQs. |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#951**. `dbscan.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `std::collections::VecDeque`; not migrated to `ferray-core` (R-SUBSTRATE-1/2). The PyO3 boundary uses `numpy2_to_ndarray` (`extras.rs`), an `ndarray` bridge, not `ferray::numpy_interop`. |
+//! | REQ-11 (exact eps-boundary neighbor parity) | NOT-STARTED | open prereq blocker **#952**. `fn region_query` (`dbscan.rs`) includes a neighbor when `squared_euclidean ≤ eps*eps`; sklearn routes through `NearestNeighbors(radius=eps).radius_neighbors` (`_dbscan.py:411-422`) whose `euclidean_distances`/tree distance computation rounds differently at the exact boundary. For an edge whose true distance ≈ `eps` (e.g. exactly `1.3` with `eps=1.3`, or `0.9999999999999998` with `eps=1.0`), the two disagree on inclusion → flips core status / merges clusters, diverging from the oracle `labels_`/`core_sample_indices_`. Reproducing sklearn's exact boundary requires its `euclidean_distances` dot-product rounding AND its `algorithm`-dependent neighbor search (#949) — not a single-file fix. Documented (no committed failing test per R-DEFER-6 / the kdtree #831 + balltree #858 convention). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
