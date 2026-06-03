@@ -29,6 +29,22 @@
 //! let neighbors = tree.query(&data, &query, 2);
 //! assert_eq!(neighbors[0].0, 0); // closest is (0,0)
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.KDTree` (`sklearn/neighbors/_kd_tree.pyx.tp` +
+//! `_binary_tree.pxi.tp`). See `.design/neighbors/kdtree.md`. Non-test
+//! consumer: the `SpatialIndex::KdTree` acceleration path in `knn.rs` /
+//! `nearest_neighbors.rs` (`Algorithm::KdTree`/`Auto`).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Single-row k-NN `query`: true euclidean distances + indices, nearest-first; distinct-distance order matches the live oracle, tie set + sorted distances match (order is leaf_size/traversal-dependent in sklearn) | SHIPPED |
+//! | REQ-2 | `query` k>n_samples error contract (sklearn `ValueError`, `_binary_tree.pxi.tp:1140-1142`) | NOT-STARTED (#831, blocked on `query`→`Result` threading through knn/nearest_neighbors consumers) |
+//! | REQ-3 | `query_radius` method (radius search on the tree) | NOT-STARTED (#832) |
+//! | REQ-4 | `leaf_size` param + node bounds; non-euclidean metric set (minkowski/p/manhattan/chebyshev) | NOT-STARTED (#833) |
+//! | REQ-5 | Batched multi-row query + `sort_results`/`dualtree`/`breadth_first` flags + empty-X `ValueError` | NOT-STARTED (#834) |
+//! | REQ-6 | PyO3 binding + ferray substrate | NOT-STARTED (#835) |
 
 use ndarray::Array2;
 use num_traits::Float;
