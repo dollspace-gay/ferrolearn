@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/nearest_centroid: shrink_threshold s+=median(s) + clamp removal, n_classes<2 + zero-variance ValueError; REQ table (#836 #837 #838 #839 #840)
 - neighbors/kdtree: KDTree single-row k-NN query verified value-correct vs live sklearn (REQ table; k>n error contract NOT-STARTED #831, blocked on consumer Result-threading) (#830)
 - neighbors/graph: kneighbors_graph + radius_neighbors_graph self-exclusion (include_self=False default, zero diagonal) + REQ table; cleared 2 crate clippy debts (#822 #823 #824)
 - metrics/classification: log_loss eps + roc_curve drop_intermediate + det_curve endpoint + calibration searchsorted + top_k tie-break edge-parity fixes; REQ table (completes ferrolearn-metrics) (#806)
@@ -247,6 +248,10 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-neighbors NearestCentroid::fit shrink centroids diverge from sklearn/neighbors/_nearest_centroid.py:226-227 vs :183-184 on partial-constant features (#840)
+- Divergence: ferrolearn-neighbors::NearestCentroid::fit clamps zero-variance to 1.0 instead of raising (sklearn/neighbors/_nearest_centroid.py:174-175) (#839)
+- Divergence: ferrolearn-neighbors::NearestCentroid::fit accepts single-class y (sklearn/neighbors/_nearest_centroid.py:147-151 raises ValueError) (#838)
+- Divergence: ferrolearn-neighbors::NearestCentroid::fit shrink_threshold omits s += median(s) (sklearn/neighbors/_nearest_centroid.py:184) (#837)
 - Divergence: ferrolearn-neighbors::radius_neighbors_graph keeps self-edge vs sklearn/neighbors/_graph.py:164 default include_self=False (#824)
 - Divergence: ferrolearn-neighbors::kneighbors_graph includes self (zero-diagonal missing) vs sklearn/neighbors/_graph.py:59 default include_self=False (#823)
 - Divergence: ferrolearn-metrics::top_k_accuracy_score diverges from sklearn/_ranking.py:2043 on tie-breaking (#812)
