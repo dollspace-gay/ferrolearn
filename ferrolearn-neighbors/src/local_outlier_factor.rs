@@ -31,6 +31,32 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 8);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.LocalOutlierFactor`
+//! (`sklearn/neighbors/_lof.py`). See
+//! `.design/neighbors/local_outlier_factor.md`. Non-test consumer: crate
+//! re-export `pub use local_outlier_factor::{FittedLocalOutlierFactor,
+//! LocalOutlierFactor}` (`ferrolearn-neighbors/src/lib.rs`). SHIPPED claims are
+//! backed by green pins in
+//! `ferrolearn-neighbors/tests/divergence_local_outlier_factor.rs` (live
+//! sklearn 1.5.2 oracle). Binary classification (R-DEFER-2); honest underclaim
+//! (R-HONEST-3) — all value parity is verified ONLY on the tie-free fixture.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1a | `contamination="auto"` default via `Contamination::Auto` (`new`); Fraction path validated to `(0, 0.5]` (`_lof.py:205,:188-191`); pinned `test_lof_default` + `divergence_default_contamination_mislabels_mild_point` | SHIPPED |
+//! | REQ-1b | Missing constructor params `metric`/`p`/`leaf_size`/`metric_params`/`n_jobs` (`_lof.py:196-208`) | NOT-STARTED (#845) |
+//! | REQ-2a | LOF pipeline (k-distance → reach_dist → lrd → LOF) → `negative_outlier_factor_ = -lof` (`fn compute_lof_scores`, `negative_outlier_factor`; `_lof.py:486-511,:310`); value-matched on the tie-free 4-point fixture (`green_negative_outlier_factor_value_via_lof_scores_tiefree`) | SHIPPED |
+//! | REQ-2b | Equidistant-tie neighbor-ordering parity (`knn_brute_force` tie order ≠ sklearn `kneighbors`, Δ≈0.004) + omitted `+1e-10` lrd damping (`_lof.py:511`) | NOT-STARTED (#846) |
+//! | REQ-3 | `offset_` = `-1.5` (Auto) / `percentile(nof, 100*c)` (Fraction) (`fn fit`, `offset`; `_lof.py:312-318`); pinned `divergence_offset_and_decision_function_novelty` (`offset()==-1.5`) | SHIPPED |
+//! | REQ-4 | `fit_predict`/`predict` labels via `nof < offset_` (`_lof.py:380-381`); pinned `divergence_default_contamination_mislabels_mild_point` | SHIPPED |
+//! | REQ-5 | `score_samples = -lof` (`_lof.py:481-484`) + `decision_function = score_samples - offset_` (`_lof.py:424`); pinned `green_score_samples_inlier_sign` + the `df - ss == -offset_` shift in `divergence_offset_and_decision_function_novelty` | SHIPPED |
+//! | REQ-6 | `n_neighbors_` attribute + `warnings.warn` on clamp (`_lof.py:282-289`) | NOT-STARTED (#850) |
+//! | REQ-7 | Novelty `available_if` method gating (`_lof.py:221-227,:322-331,:385-396,:426-436`) | NOT-STARTED (#851) |
+//! | REQ-8 | PyO3 binding + meta-crate re-export | NOT-STARTED (#852) |
+//! | REQ-9 | ferray array substrate (currently `ndarray` + `num-traits`) | NOT-STARTED (#853) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -42,6 +68,23 @@ use crate::knn::Algorithm;
 // ---------------------------------------------------------------------------
 // LocalOutlierFactor
 // ---------------------------------------------------------------------------
+
+/// Contamination setting for [`LocalOutlierFactor`].
+///
+/// Mirrors sklearn's `contamination` parameter
+/// (`sklearn/neighbors/_lof.py:188-191,205`): either the string `"auto"`
+/// (the constructor default) or a float in `(0, 0.5]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Contamination {
+    /// `contamination="auto"`: the proportion of outliers is not given; the
+    /// decision threshold `offset_` is fixed at `-1.5`
+    /// (`sklearn/neighbors/_lof.py:312-314`).
+    Auto,
+    /// `contamination=c` with `c ∈ (0, 0.5]`: the expected fraction of
+    /// outliers; `offset_` is the `100*c`-th percentile of
+    /// `negative_outlier_factor_` (`sklearn/neighbors/_lof.py:316-318`).
+    Fraction(f64),
+}
 
 /// Local Outlier Factor for outlier detection.
 ///
@@ -56,8 +99,9 @@ use crate::knn::Algorithm;
 pub struct LocalOutlierFactor<F> {
     /// Number of neighbors to use. Default: `20`.
     pub n_neighbors: usize,
-    /// The fraction of data expected to be outliers. Default: `0.1`.
-    pub contamination: f64,
+    /// Contamination setting. Default: [`Contamination::Auto`] (mirrors
+    /// sklearn's `contamination="auto"`, `sklearn/neighbors/_lof.py:205`).
+    pub contamination: Contamination,
     /// The algorithm to use for neighbor search. Default: `Auto`.
     pub algorithm: Algorithm,
     /// When `true`, the fitted estimator is intended to detect outliers in
@@ -73,13 +117,14 @@ pub struct LocalOutlierFactor<F> {
 impl<F: Float> LocalOutlierFactor<F> {
     /// Create a new `LocalOutlierFactor` with default settings.
     ///
-    /// Defaults: `n_neighbors = 20`, `contamination = 0.1`,
+    /// Defaults: `n_neighbors = 20`, `contamination = Contamination::Auto`
+    /// (mirrors sklearn `contamination="auto"`, `sklearn/neighbors/_lof.py:205`),
     /// `algorithm = Auto`, `novelty = false`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             n_neighbors: 20,
-            contamination: 0.1,
+            contamination: Contamination::Auto,
             algorithm: Algorithm::Auto,
             novelty: false,
             _marker: std::marker::PhantomData,
@@ -93,10 +138,13 @@ impl<F: Float> LocalOutlierFactor<F> {
         self
     }
 
-    /// Set the contamination fraction.
+    /// Set the contamination fraction (`Contamination::Fraction(c)`).
+    ///
+    /// `c` must lie in `(0, 0.5]` (validated at fit time, mirroring sklearn's
+    /// `Interval(Real, 0, 0.5, closed="right")`, `sklearn/neighbors/_lof.py:190`).
     #[must_use]
     pub fn with_contamination(mut self, contamination: f64) -> Self {
-        self.contamination = contamination;
+        self.contamination = Contamination::Fraction(contamination);
         self
     }
 
@@ -139,18 +187,24 @@ impl<F: Float> Default for LocalOutlierFactor<F> {
 
 /// Fitted Local Outlier Factor model.
 ///
-/// Stores the computed LOF scores and a threshold for classification.
-/// Points with LOF above the threshold are outliers.
+/// Stores the computed LOF scores, the `negative_outlier_factor_` (`-lof`),
+/// and the decision `offset_`. A training sample is an outlier when its
+/// `negative_outlier_factor_ < offset_` (`sklearn/neighbors/_lof.py:380-381`).
 #[derive(Debug, Clone)]
 pub struct FittedLocalOutlierFactor<F> {
     /// The training data (needed for prediction on new points).
     x_train: Array2<F>,
-    /// LOF scores for each training sample.
+    /// LOF scores for each training sample (positive LOF).
     lof_scores: Vec<F>,
+    /// `negative_outlier_factor_` (`-lof_scores`), the sklearn fitted attribute
+    /// (`sklearn/neighbors/_lof.py:310`).
+    negative_outlier_factor_: Vec<F>,
     /// Number of neighbors used.
     n_neighbors: usize,
-    /// Threshold LOF score: points above this are outliers.
-    threshold: F,
+    /// Decision `offset_`: a training sample with
+    /// `negative_outlier_factor_ < offset_` is an outlier
+    /// (`sklearn/neighbors/_lof.py:312-318,380-381`).
+    offset_: F,
 }
 
 /// Compute Euclidean distance between two slices.
@@ -248,6 +302,28 @@ fn compute_lof_scores<F: Float>(data: &[Vec<F>], k: usize) -> Vec<F> {
         .collect()
 }
 
+/// numpy `np.percentile` with the default `'linear'` interpolation, given a
+/// pre-sorted (ascending) slice and a quantile expressed as a fraction in
+/// `[0, 1]` (i.e. `q_frac = q/100`). Mirrors numpy's position formula
+/// `rank = q_frac * (n - 1)`; `result = s[lo] + frac*(s[lo+1] - s[lo])`
+/// (`sklearn/neighbors/_lof.py:316-318` calls `np.percentile`).
+fn percentile_linear<F: Float>(sorted: &[F], q_frac: f64) -> F {
+    if sorted.is_empty() {
+        return F::zero();
+    }
+    let n = sorted.len();
+    if n == 1 {
+        return sorted[0];
+    }
+    let rank = q_frac * (n - 1) as f64;
+    let lo = rank.floor() as usize;
+    if lo + 1 >= n {
+        return sorted[n - 1];
+    }
+    let frac = F::from(rank - lo as f64).unwrap_or_else(F::zero);
+    sorted[lo] + frac * (sorted[lo + 1] - sorted[lo])
+}
+
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor<F> {
     type Fitted = FittedLocalOutlierFactor<F>;
     type Error = FerroError;
@@ -257,7 +333,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor
     /// # Errors
     ///
     /// - [`FerroError::InvalidParameter`] if `n_neighbors` is zero or
-    ///   `contamination` is not in `(0, 0.5]`.
+    ///   `contamination` is a `Fraction` not in `(0, 0.5]`.
     /// - [`FerroError::InsufficientSamples`] if there are fewer than 2 samples.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedLocalOutlierFactor<F>, FerroError> {
         let n_samples = x.nrows();
@@ -269,7 +345,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor
             });
         }
 
-        if self.contamination <= 0.0 || self.contamination > 0.5 {
+        // `Contamination::Auto` skips the interval check; a `Fraction` must lie
+        // in `(0, 0.5]` (`sklearn/neighbors/_lof.py:190`,
+        // `Interval(Real, 0, 0.5, closed="right")`).
+        if let Contamination::Fraction(c) = self.contamination
+            && (c <= 0.0 || c > 0.5)
+        {
             return Err(FerroError::InvalidParameter {
                 name: "contamination".into(),
                 reason: "must be in (0, 0.5]".into(),
@@ -287,24 +368,27 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor
         let data: Vec<Vec<F>> = (0..n_samples).map(|i| x.row(i).to_vec()).collect();
         let lof_scores = compute_lof_scores(&data, self.n_neighbors);
 
-        // Determine threshold from contamination: the (1 - contamination)-th
-        // percentile of LOF scores. Points with LOF > threshold are outliers.
-        let mut sorted_scores: Vec<F> = lof_scores.clone();
-        sorted_scores.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // `negative_outlier_factor_ = -lof` (`sklearn/neighbors/_lof.py:310`).
+        let negative_outlier_factor_: Vec<F> = lof_scores.iter().map(|&l| -l).collect();
 
-        // The number of expected outliers.
-        let n_outliers = (self.contamination * n_samples as f64).ceil().max(1.0) as usize;
-        let n_outliers = n_outliers.min(n_samples - 1);
-        // Threshold = the LOF score at position (n - n_outliers - 1), i.e., the
-        // highest inlier score. Points strictly above this are outliers.
-        let threshold_idx = n_samples - n_outliers - 1;
-        let threshold = sorted_scores[threshold_idx];
+        // `offset_` (`sklearn/neighbors/_lof.py:312-318`): `-1.5` for "auto",
+        // else `np.percentile(negative_outlier_factor_, 100*contamination)`.
+        let offset_ = match self.contamination {
+            Contamination::Auto => F::from(-1.5).unwrap_or_else(F::zero),
+            Contamination::Fraction(c) => {
+                let mut sorted_nof: Vec<F> = negative_outlier_factor_.clone();
+                sorted_nof.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+                // q = 100*c, position fraction = q/100 = c.
+                percentile_linear(&sorted_nof, c)
+            }
+        };
 
         Ok(FittedLocalOutlierFactor {
             x_train: x.clone(),
             lof_scores,
+            negative_outlier_factor_,
             n_neighbors: self.n_neighbors,
-            threshold,
+            offset_,
         })
     }
 }
@@ -315,18 +399,35 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedLocalOutlier
 
     /// Predict inlier (+1) or outlier (-1) labels.
     ///
-    /// For training data, uses the pre-computed LOF scores.
-    /// For new data, recomputes LOF scores against the training set.
+    /// For training data, labels each sample `-1` where
+    /// `negative_outlier_factor_ < offset_` (`sklearn/neighbors/_lof.py:380-381`).
+    /// For new data, labels `-1` where `score_samples < offset_`
+    /// (equivalently `decision_function < 0`, `sklearn/neighbors/_lof.py:375-378`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of features does
     /// not match the training data.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<isize>, FerroError> {
-        let scores = self.compute_lof(x)?;
-        let mut predictions = Array1::<isize>::zeros(x.nrows());
-        for (i, &score) in scores.iter().enumerate() {
-            predictions[i] = if score <= self.threshold { 1 } else { -1 };
+        let n_features = x.ncols();
+        let n_samples = x.nrows();
+        let is_training = n_samples == self.x_train.nrows()
+            && n_features == self.x_train.ncols()
+            && (0..n_samples).all(|i| (0..n_features).all(|j| x[[i, j]] == self.x_train[[i, j]]));
+
+        let mut predictions = Array1::<isize>::zeros(n_samples);
+        if is_training {
+            // Training data: `is_inlier[negative_outlier_factor_ < offset_] = -1`.
+            for (i, &nof) in self.negative_outlier_factor_.iter().enumerate() {
+                predictions[i] = if nof < self.offset_ { -1 } else { 1 };
+            }
+        } else {
+            // New data: `score_samples = -lof`; outlier when `score_samples < offset_`.
+            let lof = self.compute_lof(x)?;
+            for (i, &l) in lof.iter().enumerate() {
+                let score_sample = -l;
+                predictions[i] = if score_sample < self.offset_ { -1 } else { 1 };
+            }
         }
         Ok(predictions)
     }
@@ -341,10 +442,20 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
         &self.lof_scores
     }
 
-    /// Get the threshold used for inlier/outlier classification.
+    /// Get the `negative_outlier_factor_` (`-lof_scores`) for the training
+    /// samples (`sklearn/neighbors/_lof.py:310`). The lower (more negative),
+    /// the more abnormal.
     #[must_use]
-    pub fn threshold(&self) -> F {
-        self.threshold
+    pub fn negative_outlier_factor(&self) -> &[F] {
+        &self.negative_outlier_factor_
+    }
+
+    /// Get the decision `offset_`: a training sample with
+    /// `negative_outlier_factor_ < offset_` is an outlier
+    /// (`sklearn/neighbors/_lof.py:312-318`).
+    #[must_use]
+    pub fn offset(&self) -> F {
+        self.offset_
     }
 
     /// Compute the LOF score for each row of `x`.
@@ -477,8 +588,9 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
     }
 
     /// Shifted opposite-of-LOF: positive values indicate inliers, negative
-    /// outliers. `decision_function = -lof - (-threshold) = threshold - lof`,
-    /// so a sample with LOF exactly at the threshold gets `0`. Mirrors
+    /// outliers. `decision_function = score_samples - offset_ = (-lof) - offset_`
+    /// (`sklearn/neighbors/_lof.py:424`), so a sample whose `score_samples`
+    /// equals `offset_` gets `0`. Mirrors
     /// sklearn `LocalOutlierFactor.decision_function`.
     ///
     /// # Errors
@@ -487,7 +599,7 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
     pub fn decision_function(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let lof = self.compute_lof(x)?;
         Ok(Array1::from_iter(
-            lof.into_iter().map(|v| self.threshold - v),
+            lof.into_iter().map(|v| (-v) - self.offset_),
         ))
     }
 }
@@ -615,7 +727,8 @@ mod tests {
     fn test_lof_default() {
         let model = LocalOutlierFactor::<f64>::default();
         assert_eq!(model.n_neighbors, 20);
-        assert!((model.contamination - 0.1).abs() < 1e-10);
+        // sklearn default is `contamination="auto"` (`_lof.py:205`).
+        assert_eq!(model.contamination, Contamination::Auto);
     }
 
     #[test]
@@ -650,7 +763,7 @@ mod tests {
             .with_algorithm(Algorithm::BruteForce);
 
         assert_eq!(model.n_neighbors, 10);
-        assert!((model.contamination - 0.2).abs() < 1e-10);
+        assert_eq!(model.contamination, Contamination::Fraction(0.2));
         assert_eq!(model.algorithm, Algorithm::BruteForce);
     }
 }

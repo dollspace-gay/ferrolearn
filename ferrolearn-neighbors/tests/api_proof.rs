@@ -12,7 +12,7 @@
 //!   radius_neighbors_graph, n_samples_fit, shape
 //! - NearestCentroid: fit, predict, score, centroids
 //! - LocalOutlierFactor: fit, fit_predict, predict, decision_function,
-//!   score_samples, lof_scores, threshold, with_novelty
+//!   score_samples, lof_scores, offset, negative_outlier_factor, with_novelty
 //! - KdTree, BallTree: build + query smoke
 //! - Free functions: kneighbors_graph, radius_neighbors_graph,
 //!   sort_graph_by_row_values
@@ -312,13 +312,14 @@ fn api_proof_local_outlier_factor() {
 
     let dec = f.decision_function(&x).unwrap();
     assert_eq!(dec.len(), 10);
-    // decision_function = threshold - lof, so outliers (lof > threshold) are < 0.
+    // decision_function = score_samples - offset_, so outliers are < 0.
     assert!(dec[8] < 0.0);
     assert!(dec[9] < 0.0);
 
     let lof = f.lof_scores();
     assert_eq!(lof.len(), 10);
-    let _ = f.threshold();
+    let _ = f.offset();
+    let _ = f.negative_outlier_factor();
 
     let _: LocalOutlierFactor<f64> = Default::default();
 }
