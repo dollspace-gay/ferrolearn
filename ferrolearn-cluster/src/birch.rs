@@ -32,6 +32,61 @@
 //! let fitted = model.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.labels().len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification + symbol-anchor + sklearn
+//! `file:line`; NOT-STARTED carries the open prereq blocker. `Birch` /
+//! `FittedBirch` are existing pub APIs re-exported at the crate root (`pub use
+//! birch::{Birch, FittedBirch}` in `ferrolearn-cluster/src/lib.rs`) with a real
+//! PyO3 binding — `#[pyclass(name = "_RsBirch")] struct RsBirch` in
+//! `ferrolearn-python/src/extras.rs` (its `fn fit` calls
+//! `ferrolearn_cluster::Birch::<f64>::new().with_threshold(...).with_n_clusters(...)`
+//! then `.fit(...)`, and `#[getter] labels_` surfaces `f.labels()`), registered
+//! via `m.add_class::<extras::RsBirch>()` in `ferrolearn-python/src/lib.rs`,
+//! surfaced as `ferrolearn.Birch` (`fit` / `labels_`). So
+//! `import ferrolearn; ferrolearn.Birch(...).fit(X).labels_` is the non-test
+//! production consumer of the core fit/labels contract (the binding exposes ONLY
+//! `n_clusters`/`threshold`/`fit`/`labels_` — not `subcluster_centers_`,
+//! `predict`, or `transform`).
+//!
+//! **Honest assessment (R-HONEST-3).** The mean-based `subcluster_centers_` (CF
+//! centroid `LS/N`, REQ-1) and the `labels_` PARTITION via the global
+//! Agglomerative-Ward step (REQ-3) genuinely VALUE-match the live sklearn 1.5.2
+//! oracle — but ONLY in the regime where the number of leaf subclusters stays
+//! `<= branching_factor`. The CF data structure ferrolearn implements is a FLAT
+//! `Vec<ClusteringFeature>` (`fn build_cf_tree`), NOT a balanced CF-tree: once the
+//! subcluster count would exceed `branching_factor` it MERGES the two closest
+//! subclusters (`fn find_closest_pair` + `fn merge`) instead of splitting a leaf
+//! node and growing the tree, so the leaf-subcluster count is capped at
+//! `branching_factor`. sklearn's `_split_node` (`_birch.py:48-108`) splits a full
+//! leaf into two and grows the tree, so its leaf-subcluster count is unbounded —
+//! the root structural divergence (REQ-2, #954): on `spread60`
+//! (`RandomState(1).rand(60,2)*20`) at `branching_factor=5`, sklearn yields 37
+//! leaf subclusters, ferrolearn caps at 5. Scope caveats on the SHIPPED rows:
+//! REQ-1 matches as a SET of centroid rows (sklearn leaf-order vs ferrolearn
+//! insertion-order differ; the VALUES match, not row order) and REQ-3 matches the
+//! partition UP TO A LABEL PERMUTATION (Agglomerative-Ward label ordering), NOT
+//! absolute labels. The whole `predict`/`transform`/`partial_fit`/
+//! `subcluster_labels_` surface and the `compute_labels`/`copy` params are absent.
+//! Cites use symbol anchors (ferrolearn) / `file:line` (sklearn 1.5.2, commit
+//! 156ef14). Live oracle = installed sklearn 1.5.2, run from `/tmp`. (REQ
+//! numbering follows `.design/cluster/birch.md`.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`subcluster_centers_` VALUE, in `n_subclusters <= branching_factor` regime) | SHIPPED | impl `fn centroid in birch.rs` (CF `ls[i]/n`) → `Fit::fit` builds `subcluster_centers_`; value-matches sklearn `_CFSubcluster.update` centroid (`_birch.py:319`) read off leaves (`_birch.py:590-591`) to full f64 **as a SET of centroid rows** (sklearn leaf-order vs ferrolearn insertion-order differ; VALUES match, not row order). Non-test consumer: `RsBirch` (`ferrolearn-python/src/extras.rs`, via `Birch::fit`) + crate re-export. Green guards (`tests/divergence_birch.rs`): `green_birch_subcluster_centers_blobs8` (`blobs8` `[[0.0375,…],[10.0375,…]]`), `green_birch_subcluster_centers_blobs20` (all 10 centroids ~1e-9). **Caveat (REQ-2/#954): contract holds only when sklearn yields `<= branching_factor` subclusters** — diverges otherwise (`spread60`: sklearn 37 vs ferrolearn 5). |
+//! | REQ-2 (CF-tree leaf splitting) | NOT-STARTED | open prereq blocker **#954**. sklearn `_CFNode.insert_cf_subcluster` (`_birch.py:196-263`) recurses into child nodes and `_split_node` (`_birch.py:48-108`) splits a full leaf into two leaves, so leaf-subcluster count is unbounded by `branching_factor`. ferrolearn `fn build_cf_tree` keeps a FLAT `Vec<ClusteringFeature>` capped at `branching_factor`, MERGING the two closest CFs on overflow (`fn find_closest_pair` + `fn merge`). Live oracle (`spread60` = `RandomState(1).rand(60,2)*20`, `branching_factor=5`): sklearn 37 subclusters vs ferrolearn 5. **Root structural divergence — a CF-tree rewrite, not a minimal fix.** |
+//! | REQ-3 (`labels_` partition via global Agglo-Ward, up to a label permutation, in-regime) | SHIPPED | impl `Fit::fit in birch.rs` runs `AgglomerativeClustering::new(k).with_linkage(Linkage::Ward)` on `subcluster_centers_`, mirroring `_global_clustering` int branch (`_birch.py:703-738`, default Agglomerative = Ward). PARTITION value-matches sklearn **up to a label permutation** on few-subcluster fixtures (absolute label values differ — Agglomerative label ordering). Non-test consumer: `RsBirch::labels_` (`ferrolearn-python/src/extras.rs`) + crate re-export. Green guard: `green_birch_labels_partition_blobs8` (`blobs8` co-membership; sklearn `[1,1,1,1,0,0,0,0]` vs ferrolearn label-swapped, same partition). **Caveat**: gated on REQ-2 (#954) in the `> branching_factor` regime and on REQ-5 (#956) for the out-of-sample `_predict` path. |
+//! | REQ-4 (`n_clusters=3` default + estimator form + error ABI) | NOT-STARTED | open prereq blocker **#955**. sklearn `n_clusters=3` default (`_birch.py:496`), accepts `None`/`int>=1`/a `sklearn.cluster` estimator (`_birch.py:486`, `:731-735`), raises `InvalidParameterError`. ferrolearn `fn new()` defaults `None`, `Option<usize>` (no estimator-instance form), errors `FerroError::InvalidParameter`. `Birch().n_clusters` = 3 (sklearn) vs `None` (ferrolearn + binding). |
+//! | REQ-5 (`predict` + `transform` out-of-sample) | NOT-STARTED | open prereq blocker **#956**. sklearn `predict`/`_predict` = `pairwise_distances_argmin(X, subcluster_centers_)` → `subcluster_labels_[argmin]` (`_birch.py:651-679`); `transform` = `euclidean_distances(X, subcluster_centers_)` (`_birch.py:681-701`). `FittedBirch<F>` has neither (`transform(docstring6)[0]=[0,2]`, `predict=[0,0,0,1,1,1]`). Also: ferrolearn `labels_` threads points through their insertion CF, NOT argmin over final centroids. |
+//! | REQ-6 (`subcluster_labels_` attribute) | NOT-STARTED | open prereq blocker **#957**. sklearn `subcluster_labels_` = global label per subcluster (`_birch.py:723`/`:735`), the bridge `predict` uses. `FittedBirch` exposes `labels()`/`subcluster_centers()`/`n_clusters()` but no `subcluster_labels_` accessor; `RsBirch` cannot surface it. |
+//! | REQ-7 (`not_enough_centroids` skip + ConvergenceWarning) | NOT-STARTED | open prereq blocker **#958**. sklearn, when `len(centroids) < n_clusters`, SKIPS the global step, sets `subcluster_labels_ = arange(len)`, warns `ConvergenceWarning` (`_birch.py:716`/`:722-730`). ferrolearn `Fit::fit` CLAMPS `k.min(n_subclusters)` and runs Agglomerative on the clamped k — no warning, `n_clusters_` silently clamped. |
+//! | REQ-8 (`partial_fit` online learning) | NOT-STARTED | open prereq blocker **#959**. sklearn `partial_fit` (`_birch.py:613-638`) incrementally inserts without rebuilding (`X=None` → global step only). ferrolearn offers only batch `Fit::fit`; no incremental API. |
+//! | REQ-9 (`compute_labels` + `copy` params) | NOT-STARTED | open prereq blocker **#960**. sklearn `compute_labels=True` (`_birch.py:497`, gates `labels_` `:709`/`:737`) + `copy=True` (`_birch.py:498`, gates in-place `:534`). `Birch<F>` (`threshold`/`branching_factor`/`n_clusters`) has neither. |
+//! | REQ-10 (threshold criterion form) | SHIPPED | impl `fn would_exceed_threshold in birch.rs` computes `variance = new_ss/n - centroid_sq_norm`, `radius = sqrt(max(0,variance))`, tests `radius > threshold` — algebraically EQUIVALENT to sklearn `sq_radius <= threshold**2` (`_CFSubcluster.merge_subcluster`, `_birch.py:340-342`; `r>t <=> r^2>t^2` for non-negative `r,t`), including the negative-variance clamp (sklearn `sqrt(max(0,...))`). Consumer: `fn build_cf_tree` (in-crate) → `Fit::fit` → `RsBirch`. Green guard: `green_birch_threshold_validation` covers the `threshold>0` / `branching_factor>=2` bounds (sklearn `InvalidParameterError`). |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#961**. `birch.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`; not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
 
 use crate::agglomerative::{AgglomerativeClustering, Linkage};
 use ferrolearn_core::error::FerroError;
