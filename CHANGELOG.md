@@ -243,6 +243,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-tree::compute_bin_edges diverges from sklearn/ensemble/_hist_gradient_boosting/binning.py:53-55 (distinct-value midpoints vs quantile interpolation) (#746)
 - Divergence: gradient_boosting::huber_leaf_value median uses np.median tie (mean of two middles) instead of _weighted_percentile lower-percentile; Huber predict off by ~6.6e-4 vs sklearn (#738)
 - Divergence: gradient_boosting::lad_leaf_value diverges from sklearn AbsoluteError leaf-update (uses np.median not _weighted_percentile lower-percentile) (#737)
 - Divergence: ferrolearn-tree GradientBoostingRegressor(loss=Huber) diverges from sklearn/_loss/loss.py:694-710 — missing median+clipped-mean terminal-region update (#736)
