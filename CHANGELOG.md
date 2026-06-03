@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/local_outlier_factor: LocalOutlierFactor contamination="auto" default (Contamination enum) + offset_ (-1.5/percentile) + negative_outlier_factor_ contract, predict via nof<offset_, decision_function=score_samples-offset_; REQ table (5 SHIPPED, 6 NOT-STARTED) critic-verified vs sklearn 1.5.2 (#844 #847 #848 #849)
 - neighbors/nearest_centroid: shrink_threshold s+=median(s) + clamp removal, n_classes<2 + zero-variance ValueError; REQ table (#836 #837 #838 #839 #840)
 - neighbors/kdtree: KDTree single-row k-NN query verified value-correct vs live sklearn (REQ table; k>n error contract NOT-STARTED #831, blocked on consumer Result-threading) (#830)
 - neighbors/graph: kneighbors_graph + radius_neighbors_graph self-exclusion (include_self=False default, zero diagonal) + REQ table; cleared 2 crate clippy debts (#822 #823 #824)
@@ -248,6 +249,9 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- LOF score_samples/decision_function convention (#849)
+- LOF predict/fit_predict labels via negative_outlier_factor_<offset_ (#848)
+- LOF offset_ ('auto'=-1.5 + percentile) (#847)
 - Divergence: ferrolearn-neighbors NearestCentroid::fit shrink centroids diverge from sklearn/neighbors/_nearest_centroid.py:226-227 vs :183-184 on partial-constant features (#840)
 - Divergence: ferrolearn-neighbors::NearestCentroid::fit clamps zero-variance to 1.0 instead of raising (sklearn/neighbors/_nearest_centroid.py:174-175) (#839)
 - Divergence: ferrolearn-neighbors::NearestCentroid::fit accepts single-class y (sklearn/neighbors/_nearest_centroid.py:147-151 raises ValueError) (#838)
