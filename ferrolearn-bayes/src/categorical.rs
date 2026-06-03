@@ -40,6 +40,46 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. **CategoricalNB has NO PyO3 binding** — there is no
+//! `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs` and no
+//! `ferrolearn.CategoricalNB` (confirmed by grep: zero hits for `CategoricalNB`
+//! under `ferrolearn-python/`, unlike its discrete-NB siblings
+//! `_RsMultinomialNB` / `_RsBernoulliNB` / `_RsComplementNB`). The non-test
+//! production consumer is therefore the in-crate `impl PipelineEstimator<F> for
+//! CategoricalNB<F>` (`fn fit_pipeline`) plus `FittedCategoricalNBPipeline` (`fn
+//! predict_pipeline`) — the `Box<dyn FittedPipelineEstimator<F>>`-producing
+//! surface the same as `pipeline.rs` cites for GaussianNB/BernoulliNB. The
+//! missing PyO3 binding is the REQ-9 gap (#923). Green verification = the
+//! in-tree `categorical` lib tests plus the live-sklearn pins / guards
+//! (`ferrolearn-bayes/tests/divergence_categorical.rs`): the two RED pins
+//! `divergence_categorical_alpha_zero_allowed` (#921) and
+//! `divergence_categorical_negative_features_rejected` (#922), now PASSING after
+//! the fixes landed; plus the green guards `green_categorical_predict_value`,
+//! `green_categorical_min_categories`,
+//! `green_categorical_class_prior_length_only`,
+//! `green_categorical_score_accuracy`. Cites use symbol anchors (ferrolearn) /
+//! `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle = installed sklearn
+//! 1.5.2. (REQ numbering follows `.design/bayes/categorical.md`; blocker numbers
+//! continue the bayes layer past complement #914-917.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`feature_log_prob_` smoothing + `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `fn recompute_feature_log_prob` computes `((N_cjk + alpha) / (N_c + alpha*K_j)).ln()` per (feature, class, category) — the algebraic identity of `_update_feature_log_prob` (`naive_bayes.py:1498-1506`: `smoothed_cat_count = category_count_[i] + alpha`; `feature_log_prob_[i] = log(smoothed_cat_count) - log(smoothed_cat_count.sum(axis=1).reshape(-1,1))`, since `category_count_[i].sum(axis=1) == N_c`); `impl BaseNB::joint_log_likelihood` for `FittedCategoricalNB` computes `scores[[i,ci]] = class_log_prior[ci] + sum_j log_prob_for(j, ci, x[i,j])`, mirroring `jll += feature_log_prob_[i][:, X[:,i]].T; jll += class_log_prior_` (`naive_bayes.py:1508-1515`); the four `predict_*` delegate to the `BaseNB` provided methods. Non-test consumer: `impl PipelineEstimator for CategoricalNB` / `FittedCategoricalNBPipeline` (`fn fit_pipeline` / `fn predict_pipeline`). Verified: green guard `green_categorical_predict_value` — on `X=[[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y=[0,0,0,1,1,1]`, `q=[[0,0],[2,1]]`, sklearn `predict_proba(q) = [[0.8181818181818182, 0.18181818181818182], [0.18181818181818182, 0.8181818181818182]]`, `predict_joint_log_proba(q) = [[-1.8971199848858809, -3.401197381662155], [-3.401197381662155, -1.8971199848858809]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. |
+//! | REQ-2 (`alpha = 0` accepted + `alpha < 0` rejected) | SHIPPED | `fn fit` for `CategoricalNB` rejects ONLY `self.alpha < F::zero()` with `FerroError::InvalidParameter { name: "alpha", reason: "alpha must be >= 0 (sklearn Interval[0, inf))" }`, mirroring `CategoricalNB._parameter_constraints` which OVERRIDES `alpha` to `Interval(Real, 0, None, closed="left")` (`naive_bayes.py:1333`) — `alpha = 0` is INSIDE the closed-left interval so it is ACCEPTED (used as-is under the default `force_alpha=true`; only a divide-by-zero RuntimeWarning where a count is zero, NOT an error). Non-test consumer: `fit_pipeline` → `fit` propagates the `FerroError`. Verified: green pin `divergence_categorical_alpha_zero_allowed` (#921, now PASSING after the over-rejection fix): `with_alpha(0.0).fit(X,y)` returns `Ok` (sklearn `CategoricalNB(alpha=0.0).fit(X,y)` → "fit ok"); `test_categorical_nb_invalid_alpha_negative` confirms `with_alpha(-1.0).fit` still errors. |
+//! | REQ-3 (negative-feature reject AT FIT) | SHIPPED (fit path) | `fn fit` rejects `x.iter().any(\|&v\| v < F::zero())` with `FerroError::InvalidParameter { name: "X", reason: "Negative values in data passed to CategoricalNB (input X)" }`, mirroring `_check_X_y` → `check_non_negative(X, "CategoricalNB (input X)")` (`naive_bayes.py:1435-1440`) → `ValueError`. Non-test consumer: `fit_pipeline` → `fit`. Verified: green pin `divergence_categorical_negative_features_rejected` (#922, now PASSING): `CategoricalNB().fit(X_with_neg, y)` returns `Err` (sklearn raises `ValueError("Negative values in data passed to CategoricalNB (input X)")`). GAP (NOT-STARTED, folded into #920): the reject landed in `fn fit` ONLY — `partial_fit` and the predict path still silently map a negative value to category 0 via `x[[i,j]].to_usize().unwrap_or(0)`. sklearn's predict-path `_check_X` runs `check_non_negative` too (`naive_bayes.py:1432`); the predict-path non-negative validation is part of #920 (the partial_fit negative-validation sub-gap is folded into #924). |
+//! | REQ-4 (`min_categories` / `n_categories_` semantics) | SHIPPED | `fn fit` ensures `categories[j]` covers `0..min_cats[j]` (`MinCategories::Scalar` broadcast / `MinCategories::PerFeature` length-validated against `n_features`), mirroring `_validate_n_categories` (`naive_bayes.py:1446-1466`, `n_categories_ = max(X.max(0)+1, min_categories)`) + the `_count` `np.pad` padding (`naive_bayes.py:1491-1493`) so an allocated-but-unobserved category gets the smoothed `alpha/(N_c+alpha*K_j)` weight. Non-test consumer: `fit_pipeline` → `fit`. Verified: green guard `green_categorical_min_categories` — `CategoricalNB(min_categories=4).fit(X,y)` sklearn `n_categories_ = [4,4]`, `predict_joint_log_proba([[3,0]]) = [[-3.4863551900024623, -3.891820298110627]]`, `predict_proba([[3,0]]) = [[0.6000000000000001, 0.39999999999999997]]`, `predict([[3,0]]) = [0]`; ferrolearn `with_min_categories(4)` matches to ≤1e-12. (Scalar path only; a category `>= n_categories_` at predict is the REQ-? unseen-category divergence #920.) |
+//! | REQ-5 (`class_log_prior_` empirical / uniform + `class_prior` LENGTH-only — MATCH) | SHIPPED | `fn resolve_class_log_prior` validates ONLY `priors.len() != n_classes` (then `p.ln()`), else empirical `ln(count_c / total)` (`fit_prior`), else uniform `(1/n_classes).ln()` — mirroring `_update_class_log_prior` (`naive_bayes.py:580-602`: LENGTH-only check `:589-591`, empirical `log(class_count_) - log(class_count_.sum())` `:600`, uniform `-log(n_classes)` `:602`). Discrete NB has NO sum-to-1 / non-negativity check — a deliberate MATCH. Non-test consumer: `fit_pipeline` → `fit` (the `fit_prior=true` empirical path; `with_class_prior` exercised in-crate). Verified: green guard `green_categorical_class_prior_length_only` — `with_class_prior([0.5,0.3]).fit(X,y)` SUCCEEDS (sum 0.8; sklearn `class_log_prior_ = log([0.5,0.3]) = [-0.6931471805599453, -1.2039728043259361]`, NO error); `test_categorical_nb_default` covers the empirical path. (Wrong-length error TYPE differs — `InvalidParameter` vs sklearn `ValueError("Number of priors must match number of classes.")` — folded into REQ-9's surface gap.) |
+//! | REQ-6 (`force_alpha` floor + `fit_prior` toggle + `score`) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` `1e-10` floor unless `force_alpha`, `naive_bayes.py:604-626`); `fn resolve_class_log_prior` selects empirical vs uniform on `fit_prior`; `pub fn score` returns mean accuracy (`ClassifierMixin.score` analog). Non-test consumer: `fit_pipeline` passes `force_alpha`/`fit_prior` through the builder. Verified: green guard `green_categorical_score_accuracy` — `CategoricalNB().fit(X,y).score(X,y) = 1.0` (sklearn oracle) on the separable fixture; `clamp_alpha(1, true) = 1`. In-tree `test_categorical_nb_alpha_smoothing_effect`. |
+//! | REQ-7 (`partial_fit` VALUE — same-categories/classes path) | SHIPPED (same-categories path) | `FittedCategoricalNB::partial_fit` increments the per-(feature, class, category) `category_counts` / `class_counts` for existing categories/classes, then recomputes `feature_log_prob` (same `recompute_feature_log_prob` smoothing) and `class_log_prior` (`resolve_class_log_prior`), mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-recompute (`naive_bayes.py:628-709` → `_count` → `_update_feature_log_prob` / `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` surface is REQ-9). Verified: in-tree fit-then-predict coverage on within-fitted data. EXTENSION + GAPS (NOT-STARTED, folded into #924): `partial_fit` APPENDS never-seen category values to `categories[j]` and INSERTS never-seen class labels into `classes` (a non-sklearn flexibility — documented in the method doc-comment; sklearn keeps `n_categories_` fixed and `IndexError`s a category `>= n_categories_`, and binarizes against the full `classes=` list); `partial_fit` also has NO `sample_weight` and NO negative-feature validation. |
+//! | REQ-8 (unseen-category at predict + predict-path negative validation) | NOT-STARTED | open prereq blocker **#920**. sklearn requires category indices `< n_categories_[i]`; the `_joint_log_likelihood` fancy-index `feature_log_prob_[i][:, X[:,i]]` (`naive_bayes.py:1513`) raises `IndexError("index 5 is out of bounds for axis 1 with size 2")` for an index `>= n_categories_`, and `_check_X` runs `check_non_negative` on the predict path (`naive_bayes.py:1432`). `fn log_prob_for` returns a uniform `(1/(n_known_cats+1)).ln()` fallback for any unknown category — NO error (`predict([[5,0]])` → `[0]`, `predict_proba` → `[[0.5,0.5]]`); the predict path also maps a negative value to 0 via `to_usize().unwrap_or(0)` with no guard. Matching sklearn's `IndexError` / predict-path reject requires threading a `Result` through `log_prob_for` / `joint_log_likelihood` — not a one-line fix. |
+//! | REQ-9 (fitted-attribute accessors + PyO3 surface) | NOT-STARTED | open prereq blocker **#923**. sklearn exposes `category_count_` / `feature_log_prob_` / `class_count_` / `class_log_prior_` / `n_categories_` / `classes_` / `n_features_in_` (`naive_bayes.py:1266-1303`). `FittedCategoricalNB` exposes ONLY `classes()` (via `HasClasses`); `feature_log_prob` / `category_counts` / `categories` / `class_log_prior` / `class_counts` are PRIVATE fields with no accessor. **CategoricalNB has NO PyO3 binding** — no `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs`, no `ferrolearn.CategoricalNB` (grep confirms zero `CategoricalNB` hits under `ferrolearn-python/`), so `import ferrolearn` cannot reach it. Also subsumes the wrong-length `class_prior` TYPE sub-item (REQ-5) and the negative-feature MESSAGE/TYPE-parity sub-item (REQ-3). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-10 (`sample_weight` + `partial_fit` new-category/new-class extension + negative validation) | NOT-STARTED | open prereq blocker **#924**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:1353`, `:712`) weights the binarized `Y` so `class_count_ = Y.sum(axis=0)` and the `np.bincount(X_feature[mask], weights=...)` per-category counts become weighted (`naive_bayes.py:1468-1496`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` is `fn fit(&self, x, y)` — NO `sample_weight` on `fit` or `partial_fit`; also the `partial_fit` new-category/new-class EXTENSION (R-DEV-7 deviation) and `partial_fit` negative-validation gap carved out of REQ-7 live here. |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#925**. `categorical.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -215,7 +255,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
     ///
     /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers of rows.
     /// - [`FerroError::InsufficientSamples`] if there are no samples.
-    /// - [`FerroError::InvalidParameter`] if `alpha <= 0`.
+    /// - [`FerroError::InvalidParameter`] if `alpha < 0`.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedCategoricalNB<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -235,15 +275,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
             });
         }
 
-        if self.alpha <= F::zero() && self.force_alpha {
+        if self.alpha < F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
-                reason: "alpha must be positive for CategoricalNB \
-                    (or set force_alpha=false to clamp to 1e-10)"
-                    .into(),
+                reason: "alpha must be >= 0 (sklearn Interval[0, inf))".into(),
             });
         }
         let alpha = crate::clamp_alpha(self.alpha, self.force_alpha);
+
+        // Reject negative feature values (sklearn `CategoricalNB._check_X_y`
+        // calls `check_non_negative(X, "CategoricalNB (input X)")`,
+        // naive_bayes.py:1435-1440). Without this guard, a negative value
+        // would silently map to category 0 via `to_usize().unwrap_or(0)`.
+        if x.iter().any(|&v| v < F::zero()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Negative values in data passed to CategoricalNB (input X)".into(),
+            });
+        }
 
         // Validate min_categories shape against n_features (only relevant
         // for PerFeature; Scalar broadcasts to all).
@@ -759,14 +808,24 @@ mod tests {
     }
 
     #[test]
-    fn test_categorical_nb_invalid_alpha_zero() {
+    fn test_categorical_nb_alpha_zero_allowed() {
+        // sklearn `CategoricalNB._parameter_constraints` overrides `alpha` to
+        // `Interval(Real, 0, None, closed="left")` (naive_bayes.py:1333) — 0 is
+        // INSIDE the interval, so `alpha = 0` is ACCEPTED at fit (used as-is
+        // under the default `force_alpha=True`; only a divide-by-zero
+        // RuntimeWarning where a count is zero, NOT an error). Only `alpha < 0`
+        // is rejected.
         let (x, y) = make_categorical_data();
         let model = CategoricalNB::<f64>::new().with_alpha(0.0);
         let result = model.fit(&x, &y);
-        assert!(result.is_err());
-        match result.unwrap_err() {
-            FerroError::InvalidParameter { name, .. } => assert_eq!(name, "alpha"),
-            e => panic!("expected InvalidParameter, got {e:?}"),
+        assert!(
+            result.is_ok(),
+            "alpha=0 should be allowed (sklearn accepts)"
+        );
+        // predict still runs on the fitted model.
+        if let Ok(fitted) = result {
+            let preds = fitted.predict(&x);
+            assert!(preds.is_ok());
         }
     }
 
