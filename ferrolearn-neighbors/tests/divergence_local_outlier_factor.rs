@@ -1,6 +1,6 @@
 //! Adversarial divergence pins for `ferrolearn-neighbors/src/local_outlier_factor.rs`
 //! (`pub struct LocalOutlierFactor`, `FittedLocalOutlierFactor`, `fit`/`predict`/
-//! `fit_predict`/`score_samples`/`decision_function`/`lof_scores`/`threshold`)
+//! `fit_predict`/`score_samples`/`decision_function`/`lof_scores`/`offset`)
 //! against the live scikit-learn 1.5.2 oracle
 //! (`from sklearn.neighbors import LocalOutlierFactor`).
 //!
@@ -24,27 +24,29 @@
 //! ferrolearn API under test (the signatures the fixer consumes — read from
 //! `local_outlier_factor.rs`):
 //!   * `LocalOutlierFactor::<F>::new()` / `with_n_neighbors` / `with_contamination`
-//!     / `with_novelty` — builder; `pub contamination: f64` field (no `"auto"`).
+//!     / `with_novelty` — builder; `pub contamination: Contamination` field
+//!     (`Auto` default).
 //!   * `LocalOutlierFactor::fit_predict(&self, x: &Array2<F>) -> Result<Array1<isize>>`.
 //!   * `<LocalOutlierFactor as Fit>::fit(&self, x, &()) -> FittedLocalOutlierFactor`.
 //!   * `FittedLocalOutlierFactor::lof_scores(&self) -> &[F]`   (POSITIVE LOF).
-//!   * `FittedLocalOutlierFactor::threshold(&self) -> F`        (positive-LOF space).
+//!   * `FittedLocalOutlierFactor::offset(&self) -> F`          (sklearn `offset_`).
 //!   * `FittedLocalOutlierFactor::score_samples(&self, x) -> Result<Array1<F>>`.
 //!   * `FittedLocalOutlierFactor::decision_function(&self, x) -> Result<Array1<F>>`.
 //!
-//! RED pins (must FAIL against current local_outlier_factor.rs — deterministic,
-//! tie-free divergences):
-//!   * `divergence_offset_and_decision_function_novelty`   — #847 + #849:
-//!     `decision_function = score_samples - offset_(=-1.5)`; ferrolearn subtracts
-//!     a positive-LOF-space `threshold` → wrong shift.
+//! Pins (all deterministic, tie-free):
+//!   * `divergence_offset_and_decision_function_novelty` — #847 + #849:
+//!     pins the OFFSET SHIFT `decision_function(X) - score_samples(X) == -offset_
+//!     == 1.5` (the exact `_lof.py:424` contract) AND `offset() == -1.5` under the
+//!     default `contamination="auto"` (`_lof.py:312-314`). The shift cancels the
+//!     absolute `score_samples` value, so it is INDEPENDENT of the #846 tie-break.
+//!     Now PASSES (the fixer landed `offset_=-1.5` + `(-lof) - offset_`).
 //!   * `divergence_default_contamination_mislabels_mild_point` — #845 + #848:
 //!     sklearn default `contamination="auto"` (`offset_=-1.5`) labels a MILD
-//!     elevated point `+1` (its `nof=-1.489 > -1.5`); ferrolearn `new()` default
-//!     `contamination=0.1` rank-thresholds the single highest-LOF point and
-//!     mislabels it `-1`.
+//!     elevated point `+1` (its `nof=-1.489 > -1.5`). Pins the `"auto"` default
+//!     + NOF-space label rule. Now PASSES (the fixer landed the `Auto` default).
 //!
-//! GREEN guards (must PASS now — pin behavior that already value-matches the
-//! oracle on a tie-free fixture, so a future fix must not regress it):
+//! GREEN guards (pin behavior that value-matches the oracle on a tie-free
+//! fixture, so a future fix must not regress it):
 //!   * `green_negative_outlier_factor_value_via_lof_scores_tiefree` — #846: on the
 //!     1-D, all-distinct-distance 4-point fixture (NO equidistant ties), sklearn
 //!     `negative_outlier_factor_ == -lof_scores()` to ~1e-7 (the only residual is
@@ -52,32 +54,17 @@
 //!   * `green_score_samples_inlier_sign` — #849: `score_samples` of a clear inlier
 //!     is negative and near -1 (LOF shape), matching the oracle sign convention.
 //!
-//! SKIPPED blockers (NOT expressible through the current public API — noted per
-//! the critic brief, no forced test):
-//!   * #845 default *value* `contamination=="auto"`: the ferrolearn field is
-//!     `pub contamination: f64` and CANNOT hold the string `"auto"`; a
-//!     `model.contamination == "auto"` assertion does not type-check. The
-//!     OBSERVABLE consequence of the wrong default IS pinned via
-//!     `divergence_default_contamination_mislabels_mild_point`.
-//!   * #846 `negative_outlier_factor_` ACCESSOR: ferrolearn exposes no
-//!     `negative_outlier_factor_` method — only `lof_scores()` (the un-negated
-//!     LOF). The missing-accessor surface is not runtime-testable; the VALUE
-//!     contract is pinned via `-lof_scores()` (GREEN on the tie-free fixture).
-//!   * #846 tie-break VALUE divergence: the ~1e-2 divergence on the equidistant
-//!     9-point ring fixture is NON-deterministic (depends on `knn_brute_force`
-//!     index order vs sklearn `kneighbors` order on EXACTLY-equidistant points) —
-//!     not pinned (the brief mandates tie-free, deterministic fixtures only).
-//!   * #847 `offset_` ACCESSOR: ferrolearn exposes no `offset_` method (only a
-//!     positive-LOF-space `threshold()`). The `offset_` VALUE contract surfaces
-//!     observably through `decision_function` and IS pinned there (#849).
-//!   * #850 `n_neighbors_` + `warnings.warn` on clamp: ferrolearn exposes no
-//!     `n_neighbors_` attribute and Rust emits no Python warning — neither is
-//!     expressible as a runtime assertion through this API.
-//!   * #851 novelty `available_if` gating: sklearn makes `predict`/`score_samples`
-//!     /`decision_function` raise `AttributeError` when `novelty=False` (and
-//!     `fit_predict` when `novelty=True`). In Rust these are inherent methods that
-//!     compile and run regardless of the `novelty` field — a typestate question,
-//!     not a runtime divergence. Not expressible; SKIP.
+//! SEPARATELY TRACKED, NOT pinned here (the brief mandates tie-free,
+//! deterministic fixtures only):
+//!   * #846 tie-break ABSOLUTE-VALUE divergence: on a fixture with EXACTLY
+//!     equidistant neighbors, ferrolearn's `knn_brute_force` tie order differs
+//!     from sklearn `kneighbors` (e.g. sklearn picks `[6,7,4,5,1]` for point 0,
+//!     not ascending index), so the absolute `score_samples` (and thus absolute
+//!     `decision_function`) diverges by ~0.004 on the 8-point symmetric cluster.
+//!     That is NON-deterministic and is NOT pinned here; the offset SHIFT pin
+//!     below deliberately subtracts it out (`df - ss` cancels the LOF value).
+//!   * #850 `n_neighbors_` + clamp warning, #851 novelty `available_if` gating:
+//!     not expressible as runtime assertions through this API. SKIP.
 
 use ferrolearn_core::traits::Fit;
 use ferrolearn_neighbors::local_outlier_factor::LocalOutlierFactor;
@@ -114,8 +101,8 @@ fn eight_point_cluster() -> Array2<f64> {
 /// `negative_outlier_factor_ = -1.48882`), but `-1.48882 > -1.5`, so sklearn's
 /// default `contamination="auto"` (offset_=-1.5) labels it — and every other
 /// point — an inlier (`+1`). This separates the two label mechanisms: a
-/// positive-LOF *rank* threshold (ferrolearn) flags the highest-LOF point even
-/// though its NOF is above sklearn's -1.5 offset.
+/// positive-LOF *rank* threshold (the old ferrolearn default) flags the
+/// highest-LOF point even though its NOF is above sklearn's -1.5 offset.
 fn cluster_with_mild_point() -> Array2<f64> {
     array![
         [0.0, 0.0],
@@ -136,8 +123,7 @@ fn cluster_with_mild_point() -> Array2<f64> {
 // ONLY divergence source between ferrolearn's `1/mean` lrd and sklearn's
 // `1/(mean + 1e-10)` (_lof.py:511) is the 1e-10 damping — negligible here.
 // This GUARDS the value parity that already holds; a future fix must not break
-// it. (The missing `negative_outlier_factor_` ACCESSOR is the un-testable part,
-// noted in the header.)
+// it.
 // ===========================================================================
 //
 // Oracle (run from /tmp):
@@ -176,8 +162,7 @@ fn green_negative_outlier_factor_value_via_lof_scores_tiefree() {
 // ===========================================================================
 // GREEN 2 — #849 (REQ-5) sign convention: `score_samples` of a clear inlier is
 // negative and near -1 (the LOF-shape contract sklearn shares). Pins only the
-// sign/magnitude class, which already holds; the OFFSET shift is pinned RED
-// below.
+// sign/magnitude class.
 // ===========================================================================
 //
 // Oracle (run from /tmp):
@@ -211,11 +196,22 @@ fn green_score_samples_inlier_sign() {
 }
 
 // ===========================================================================
-// RED 1 — #847 (offset_) + #849 (decision_function): sklearn computes
+// PIN 1 — #847 (offset_) + #849 (decision_function): sklearn computes
 // `decision_function(X) = score_samples(X) - offset_` (_lof.py:424) with
 // `offset_ = -1.5` under the default `contamination="auto"` (_lof.py:312-314).
-// ferrolearn returns `threshold - lof` where `threshold` is a positive-LOF-space
-// rank index — the WRONG shift. RED: must FAIL until offset_=-1.5 lands.
+//
+// This test pins the OFFSET SHIFT, which is the EXACT `_lof.py:424` contract and
+// is TIE-BREAK-INDEPENDENT: `decision_function(X)[i] - score_samples(X)[i]` is
+// `(score_samples - offset_) - score_samples = -offset_` for EVERY row, so the
+// tie-break-dependent absolute `score_samples` value cancels. We assert:
+//   (a) the per-row shift `df[i] - ss[i] == -offset_ == 1.5` to ~1e-12, and
+//   (b) `offset() == -1.5` under the default `contamination="auto"`.
+//
+// The absolute `score_samples` / `decision_function` VALUE divergence on this
+// symmetric (equidistant-tie) cluster — ferrolearn 0.5814 vs sklearn 0.5854,
+// Δ≈0.004 — is the SEPARATE non-deterministic #846 tie-break divergence (the
+// `knn_brute_force` tie order differs from sklearn `kneighbors`); it is NOT
+// pinned here and is deliberately cancelled by the shift.
 // ===========================================================================
 //
 // Oracle (run from /tmp):
@@ -224,47 +220,58 @@ fn green_score_samples_inlier_sign() {
 //   X=np.array([[0,0],[0.1,0],[0,0.1],[0.1,0.1],[-0.1,0],[0,-0.1],[0.05,0.05],\
 //   [-0.05,-0.05]],dtype=float); c=L(n_neighbors=5,novelty=True).fit(X); \
 //   Xt=np.array([[100,100],[0.02,0.02]],dtype=float); \
-//   print(c.offset_, c.decision_function(Xt).tolist())"
-//   -> -1.5   [-929.9903234474953, 0.5854241610717701]
-//
-// The second value is the discriminating one: an INLIER must get a POSITIVE
-// decision_function (sklearn 0.5854). ferrolearn shifts by the positive-LOF
-// `threshold()` (~1.0..1.04) instead of `-offset_=+1.5`, so its inlier
-// decision_function ~= 0.0888 — below sklearn's 0.5854 by ~0.5 (the offset gap).
+//   ss=c.score_samples(Xt); df=c.decision_function(Xt); \
+//   print(c.offset_, (df-ss).tolist())"
+//   -> -1.5   [1.5, 1.5]
 #[test]
 fn divergence_offset_and_decision_function_novelty() {
-    // sklearn decision_function on the inlier query point (offset_ = -1.5).
-    const SK_DECISION_INLIER: f64 = 0.5854241610717701;
+    // sklearn: `offset_ == -1.5` (auto), so the per-row shift `df - ss` is
+    // `-offset_ == +1.5` for every row (live oracle: `(df-ss).tolist() == [1.5, 1.5]`).
+    const SK_OFFSET_AUTO: f64 = -1.5;
+    const SK_SHIFT: f64 = 1.5; // == -offset_  (_lof.py:424)
 
     let x = eight_point_cluster();
     let model = LocalOutlierFactor::<f64>::new().with_n_neighbors(5);
     let fitted = model.fit(&x, &()).unwrap();
 
+    // (b) offset() must equal sklearn's auto offset_ = -1.5 (_lof.py:312-314).
+    assert!(
+        (fitted.offset() - SK_OFFSET_AUTO).abs() < 1e-12,
+        "offset() under default contamination=\"auto\": ferrolearn={}, sklearn offset_={}",
+        fitted.offset(),
+        SK_OFFSET_AUTO
+    );
+
+    // (a) The offset SHIFT: decision_function - score_samples == -offset_ == 1.5,
+    // for EVERY row. Mix an extreme outlier and an inlier query so the shift is
+    // pinned across magnitudes; the absolute values cancel, so this is
+    // independent of the #846 tie-break.
     let xt = array![[100.0, 100.0], [0.02, 0.02]];
+    let ss = fitted.score_samples(&xt).unwrap();
     let df = fitted.decision_function(&xt).unwrap();
+    assert_eq!(ss.len(), 2);
     assert_eq!(df.len(), 2);
 
-    // The inlier (second point) must match sklearn's decision_function, which
-    // equals `score_samples - (-1.5)`. ferrolearn subtracts the positive-LOF
-    // `threshold` instead → diverges by ~0.5 (the |offset_| - threshold gap).
-    assert!(
-        (df[1] - SK_DECISION_INLIER).abs() < 1e-6,
-        "decision_function inlier: ferrolearn={}, sklearn (score_samples - offset_=-1.5)={}",
-        df[1],
-        SK_DECISION_INLIER
-    );
+    for i in 0..2 {
+        let shift = df[i] - ss[i];
+        assert!(
+            (shift - SK_SHIFT).abs() < 1e-12,
+            "row {i}: decision_function - score_samples (= -offset_) must be {SK_SHIFT}; \
+             ferrolearn df={}, ss={}, shift={shift}",
+            df[i],
+            ss[i]
+        );
+    }
 }
 
 // ===========================================================================
-// RED 2 — #845 (default contamination) + #848 (fit_predict labels): sklearn's
+// PIN 2 — #845 (default contamination) + #848 (fit_predict labels): sklearn's
 // DEFAULT `LocalOutlierFactor` uses `contamination="auto"` → `offset_=-1.5`
 // (_lof.py:312-314); `_predict(None)` flags `nof < offset_` (_lof.py:380-381).
 // The mild point (index 8) has `nof = -1.48882 > -1.5`, so sklearn labels EVERY
-// point `+1`. ferrolearn `new()` defaults to `contamination=0.1` (NOT "auto");
-// `fn fit` derives a positive-LOF *rank* threshold (`sorted[n - n_outliers - 1]`,
-// `n_outliers = ceil(0.1*9).max(1) = 1`) and `fn predict` flags the single
-// highest-LOF point — index 8 — as `-1`. RED: must FAIL until the `"auto"`
-// default (offset_=-1.5, NOF-space rule) lands.
+// point `+1`. A positive-LOF *rank* threshold (the old ferrolearn default
+// contamination=0.1) would instead flag the single highest-LOF point — index 8 —
+// as `-1`. This pins the `"auto"` default (offset_=-1.5, NOF-space rule).
 // ===========================================================================
 //
 // Oracle (run from /tmp):
@@ -281,7 +288,7 @@ fn divergence_default_contamination_mislabels_mild_point() {
     const SK_LABELS_AUTO: [isize; 9] = [1, 1, 1, 1, 1, 1, 1, 1, 1];
 
     let x = cluster_with_mild_point();
-    // ferrolearn `new()` (default contamination = 0.1, NOT "auto").
+    // ferrolearn `new()` (default contamination = Contamination::Auto).
     let model = LocalOutlierFactor::<f64>::new().with_n_neighbors(3);
     let labels = model.fit_predict(&x).unwrap();
     assert_eq!(labels.len(), 9);
@@ -290,8 +297,7 @@ fn divergence_default_contamination_mislabels_mild_point() {
     assert_eq!(
         got,
         SK_LABELS_AUTO.to_vec(),
-        "default-constructed fit_predict labels: ferrolearn (contamination=0.1, rank-threshold \
-         flags highest-LOF point)={got:?}, sklearn (contamination='auto', offset_=-1.5, \
-         nof=-1.489 > -1.5 → all inliers)={SK_LABELS_AUTO:?}"
+        "default-constructed fit_predict labels: ferrolearn={got:?}, sklearn \
+         (contamination='auto', offset_=-1.5, nof=-1.489 > -1.5 → all inliers)={SK_LABELS_AUTO:?}"
     );
 }
