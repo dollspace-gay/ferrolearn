@@ -4,6 +4,29 @@
 //! `x_scaled = (x - min) / (max - min) * (range_max - range_min) + range_min`
 //!
 //! The default feature range is `[0, 1]`.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_data.py` (`class MinMaxScaler`
+//! `:291`, `minmax_scale` `:589`). Design doc: `.design/preprocess/min_max_scaler.md`. Expected
+//! values from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumers: PyO3 `_RsMinMaxScaler`
+//! (`ferrolearn-python/src/extras.rs:1148`) + `PipelineTransformer` impl + crate re-export
+//! (`lib.rs:118`, grandfathered S5).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (per-column min-max value match, non-constant) | SHIPPED | `Fit::fit` learns per-column `data_min`/`data_max`; `Transform::transform` = `(x-min)/(max-min)*range_width+range_min`, mirroring sklearn affine `scale_=(fr1-fr0)/data_range` (`_data.py:508`), `min_=fr0-data_min*scale_` (`:511`). Critic-verified bit-identical to live oracle: `req1_default_range_value_match`, `req1_custom_range_value_match`, `req1_data_min_max_attributes`, `req1_nontrivial_negative_decimal_value_match` in `tests/divergence_min_max_scaler.rs`. Consumers: PyO3 `_RsMinMaxScaler` + `FittedPipelineTransformer` + re-export `lib.rs:118`. |
+//! | REQ-2 (constant column → feature_range[0]) | SHIPPED | FIXED #1170. `transform` zero-span branch now sets a constant column to `range_min`, matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,`:508-511`). Critic two-round CLEAN: 11 tests incl. constant col → `fr[0]` for default/(−1,1)/(2,5), mixed fixture, negative/zero constant, single-row fit. In-module test corrected (R-HONEST-4). |
+//! | REQ-3 (feature_range validation) | SHIPPED | `with_feature_range` returns `Err(InvalidParameter)` when `range_min >= range_max`, matching sklearn "Minimum of desired feature range must be smaller than maximum" (`_data.py:476-480`). Guard `req3_feature_range_validation_rejects`. |
+//! | REQ-7 (PyO3 binding) | SHIPPED | `_RsMinMaxScaler` (`extras.rs:1148`, registered `lib.rs:81`) marshals `fit`/`transform` over `FittedMinMaxScaler<f64>` (default range) — a real CPython consumer of REQ-1/REQ-2. |
+//! | REQ-4 (NaN tolerance: allow-nan + nanmin/nanmax) | NOT-STARTED | open prereq blocker #1171. `fit` reduce-min/max poisons on NaN; sklearn `force_all_finite='allow-nan'` + `_nanmin`/`_nanmax` (`_data.py:490-499`). |
+//! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | NOT-STARTED | open prereq blocker #1172. Only `data_min`/`data_max` stored (`_data.py:508-514`). |
+//! | REQ-6 (inverse_transform) | NOT-STARTED | open prereq blocker #1173. None (`_data.py:549-587`). |
+//! | REQ-8 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1174. Single-shot fit (`_data.py:489-515`). |
+//! | REQ-9 (minmax_scale free fn + axis) | NOT-STARTED | open prereq blocker #1175. No free fn / axis=1 (`_data.py:589`). |
+//! | REQ-10 (copy / clip params) | NOT-STARTED | open prereq blocker #1176. No `copy`/`clip`/`_parameter_constraints` (`_data.py:447-459`,`:542-543`). |
+//! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1177. None (OneToOneFeatureMixin). |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1178. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -20,8 +43,8 @@ use num_traits::Float;
 /// Calling [`Fit::fit`] learns the per-column minimum and maximum values and
 /// returns a [`FittedMinMaxScaler`] that can transform new data.
 ///
-/// Columns where `max == min` are treated as zero-range and are left
-/// unchanged after transformation.
+/// Constant columns where `max == min` are mapped to `feature_range[0]`
+/// after transformation (matching scikit-learn).
 ///
 /// # Examples
 ///
@@ -175,7 +198,8 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMinMaxScal
 
     /// Transform data by scaling each feature to the configured range.
     ///
-    /// Columns where `data_max == data_min` are left unchanged.
+    /// Constant columns where `data_max == data_min` are mapped to
+    /// `feature_range[0]` (matching scikit-learn).
     ///
     /// # Errors
     ///
@@ -200,7 +224,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMinMaxScal
             let max = self.data_max[j];
             let span = max - min;
             if span == F::zero() {
-                // Zero-range column: leave unchanged.
+                // Constant column: sklearn maps it to feature_range[0]
+                // (_handle_zeros_in_scale, _data.py:88,508-511).
+                for v in &mut col {
+                    *v = range_min;
+                }
                 continue;
             }
             for v in &mut col {
@@ -328,14 +356,18 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_range_column_unchanged() {
+    fn test_constant_column_maps_to_range_min() {
         let scaler = MinMaxScaler::<f64>::new();
         let x = array![[5.0, 1.0], [5.0, 2.0], [5.0, 3.0]];
         let fitted = scaler.fit(&x, &()).unwrap();
         let scaled = fitted.transform(&x).unwrap();
-        // Constant column (col 0) should remain 5.0
+        // Constant column (col 0) maps to feature_range[0] = 0.0 (sklearn parity).
+        // Live oracle: MinMaxScaler().fit_transform([[5,1],[5,2],[5,3]])
+        //   -> [[0.0, 0.0], [0.0, 0.5], [0.0, 1.0]].
+        let expected_col1 = [0.0, 0.5, 1.0];
         for i in 0..3 {
-            assert_abs_diff_eq!(scaled[[i, 0]], 5.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(scaled[[i, 0]], 0.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(scaled[[i, 1]], expected_col1[i], epsilon = 1e-10);
         }
     }
 
