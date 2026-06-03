@@ -4,6 +4,31 @@
 //! **lexicographic order** (matching scikit-learn's `OrdinalEncoder`).
 //! Unknown categories seen during
 //! `transform` produce an error.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_encoders.py` (`class OrdinalEncoder`
+//! `:1235`). Design doc: `.design/preprocess/ordinal_encoder.md`. Expected values from the live
+//! sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export (`lib.rs:121`, grandfathered S5).
+//! HONEST (R-HONEST-3): a FAITHFUL String-only ordinal encoder — `categories_`=sorted-unique and
+//! the ordinal VALUES match sklearn bit-for-bit on the string path; divergences are the output
+//! container dtype (`usize` vs float64), String-only input, and the absent param/feature surface.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (string fit → sorted-unique categories_) | SHIPPED | `Fit::fit` per column → `categories_`=sorted-unique (`Vec<String>::sort`, lexicographic) + index map; rejects 0 rows (`InsufficientSamples`, matches sklearn `check_array`). Mirrors `_BaseEncoder._fit` `categories_=_unique(Xi)` (`_encoders.py:99`). Critic-verified vs live oracle: `green_value_match_and_categories` (`[['bird','cat','dog'],['large','medium','small']]`), `green_lexicographic_sort_matches_np_unique` + `green_non_ascii_codepoint_order` (== `np.unique`), `green_empty_fit_rejected_matches_sklearn`. Consumer: re-export `lib.rs:121`. |
+//! | REQ-2 (transform + fit_transform, ordinal values + unknown rejection) | SHIPPED | `Transform::transform` maps category→`usize` ordinal index, unknown → `InvalidParameter` (matches `handle_unknown='error'` default `ValueError`), ncols-mismatch → `ShapeMismatch`. Critic-verified: ordinal VALUES `[[1,2],[2,0],[1,1],[0,2]]` == live oracle (integer-equal to sklearn float), `green_unknown_category_rejected`, `green_fit_transform_equals_oracle`. Consumer: re-export `lib.rs:121`. |
+//! | REQ-3 (output dtype float64 + dtype param) | NOT-STARTED | open prereq blocker #1158. `Array2<usize>` output; sklearn defaults float64 (`:1262`) + `dtype` param. Values equal, container dtype diverges (R-DEV-3); coupled to NaN-sentinel features (REQ-5/6). |
+//! | REQ-4 (numeric/mixed-dtype input) | NOT-STARTED | open prereq blocker #1159. `Array2<String>`-only; sklearn accepts int/str/object (`np.unique` numeric sort). |
+//! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | NOT-STARTED | open prereq blocker #1160. Unknowns always error (`:1265`,`:1274`). |
+//! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
+//! | REQ-7 (explicit categories param) | NOT-STARTED | open prereq blocker #1162. Always `'auto'` (`:1252`). |
+//! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
+//! | REQ-9 (inverse_transform) | NOT-STARTED | open prereq blocker #1164. None. |
+//! | REQ-10 (get_feature_names_out + n_features_in_) | NOT-STARTED | open prereq blocker #1165. Only `n_features()`. |
+//! | REQ-11 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1166. `new()` takes no params (`:1320-1386`). |
+//! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1167. No `ferrolearn-python` registration (R-DEFER-1). |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1168. `ndarray`+`HashMap`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
