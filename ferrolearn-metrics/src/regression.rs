@@ -15,6 +15,30 @@
 //! - [`root_mean_squared_log_error`] — square root of MSLE
 //!
 //! All functions are generic over `F: num_traits::Float + Send + Sync + 'static`.
+//!
+//! ## REQ status
+//!
+//! Mirrors scikit-learn regression metrics (`sklearn/metrics/_regression.py`).
+//! See `.design/metrics/regression.md`. Non-test consumer: crate re-export.
+//! The 1D (single-output, unweighted) value contracts are verified against the
+//! live oracle; the 2D / `multioutput` / `sample_weight` API extensions are
+//! NOT-STARTED.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Error metrics 1D value: `mean_squared_error`, `mean_absolute_error`, `root_mean_squared_error`, `mean_squared_log_error`, `root_mean_squared_log_error`, `median_absolute_error`, `max_error` | SHIPPED |
+//! | REQ-2 | `r2_score` 1D value + `force_finite` (constant `y_true` → 0.0/1.0, `_regression.py:866-891`) | SHIPPED |
+//! | REQ-3 | `explained_variance_score` 1D value + `force_finite` (`_regression.py:866-891`) | SHIPPED |
+//! | REQ-4 | `mean_absolute_percentage_error` 1D value: per-sample `/max(|y|, eps)` (`_regression.py:403-404`) | SHIPPED |
+//! | REQ-5 | Tweedie deviances 1D value: `mean_poisson_deviance`, `mean_gamma_deviance`, `mean_tweedie_deviance` | SHIPPED |
+//! | REQ-6 | `mean_pinball_loss` 1D value | SHIPPED |
+//! | REQ-7 | d2 metrics 1D value: `d2_absolute_error_score`, `d2_pinball_score`, `d2_tweedie_score` — `<2`-samples NaN (`_regression.py:1584-1587,:1699-1702`); zero-den force_finite for pinball/absolute (`:1736-1739`), natural IEEE for tweedie (`:1599`) | SHIPPED |
+//! | REQ-8 | `sample_weight` across all metrics | NOT-STARTED (#772) |
+//! | REQ-9 | 2D `(n_samples,n_outputs)` + `multioutput` modes | NOT-STARTED (#773) |
+//! | REQ-10 | keyword-only/default args (`mean_pinball_loss` `alpha=0.5`, `mean_tweedie_deviance` `power=0`) | NOT-STARTED (#774) |
+//! | REQ-11 | Input-validation exceptions (`max_error` multi-output, negative-input domain `ValueError`) | NOT-STARTED (#775) |
+//! | REQ-12 | PyO3 binding for regression metrics | NOT-STARTED (#776) |
+//! | REQ-13 | ferray substrate migration | NOT-STARTED (#777) |
 
 use ferrolearn_core::FerroError;
 use ndarray::Array1;
@@ -195,8 +219,10 @@ where
 ///
 /// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
 /// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
-/// Returns [`FerroError::NumericalInstability`] if `SS_tot` is zero (all
-/// `y_true` values are identical), making R² undefined.
+///
+/// When `SS_tot` is zero (constant `y_true`), this does **not** error: matching
+/// scikit-learn's default `force_finite=True`, it returns `1.0` for perfect
+/// predictions (zero residual sum) and `0.0` otherwise.
 ///
 /// # Examples
 ///
@@ -225,12 +251,6 @@ where
         acc + diff * diff
     });
 
-    if ss_tot == F::zero() {
-        return Err(FerroError::NumericalInstability {
-            message: "r2_score: SS_tot is zero — all y_true values are constant".into(),
-        });
-    }
-
     let ss_res = y_true
         .iter()
         .zip(y_pred.iter())
@@ -239,25 +259,39 @@ where
             acc + diff * diff
         });
 
+    // sklearn's default `force_finite=True` (`_assemble_r2_explained_variance`,
+    // `sklearn/metrics/_regression.py:877-891`): when the denominator is zero
+    // (constant `y_true`), never error — a zero numerator (perfect prediction)
+    // yields 1.0; a non-zero numerator (imperfect) is arbitrarily set to 0.0.
+    if ss_tot == F::zero() {
+        if ss_res == F::zero() {
+            return Ok(F::one());
+        }
+        return Ok(F::zero());
+    }
+
     Ok(F::one() - ss_res / ss_tot)
 }
 
 /// Compute the mean absolute percentage error (MAPE).
 ///
-/// `MAPE = (1/n) * sum |( y_true - y_pred ) / y_true|`
+/// `MAPE = (1/n) * sum |( y_pred - y_true ) / max(|y_true|, eps)|`
+///
+/// where `eps = f64::EPSILON` (≈ 2.220446049250313e-16), matching
+/// `numpy.finfo(numpy.float64).eps` used by scikit-learn
+/// (`sklearn/metrics/_regression.py:403-404`).
 ///
 /// Returns the MAPE as a **fraction** (not multiplied by 100) to match
 /// scikit-learn's `mean_absolute_percentage_error`. Perfect predictions
-/// yield 0.0; predictions that are off by 10% on average yield 0.10.
+/// yield 0.0. No sample is skipped — a zero `y_true` contributes a large
+/// finite term (division by `eps`).
 ///
-/// (Earlier versions multiplied by 100 — see #335.)
-///
-/// Note: samples where `y_true == 0` are skipped to avoid division by zero.
-/// If all `y_true` values are zero, `MAPE` is returned as `F::infinity()`.
+/// (Earlier versions multiplied by 100 — see #335; earlier versions also
+/// skipped zero-`y_true` samples — corrected in #769.)
 ///
 /// # Arguments
 ///
-/// * `y_true` — ground-truth target values (non-zero for meaningful MAPE).
+/// * `y_true` — ground-truth target values.
 /// * `y_pred` — predicted values.
 ///
 /// # Errors
@@ -292,21 +326,22 @@ where
     let n = y_true.len();
     check_non_empty(n, "mean_absolute_percentage_error")?;
 
-    let mut sum = F::zero();
-    let mut count = 0usize;
+    // sklearn uses `eps = np.finfo(np.float64).eps` as the minimum denominator
+    // so that zero `y_true` yields a huge finite term instead of being skipped.
+    // `sklearn/metrics/_regression.py:403-404`:
+    //   epsilon = np.finfo(np.float64).eps
+    //   mape = np.abs(y_pred - y_true) / np.maximum(np.abs(y_true), epsilon)
+    let eps = F::from(f64::EPSILON).unwrap_or(F::zero());
 
-    for (&t, &p) in y_true.iter().zip(y_pred.iter()) {
-        if t != F::zero() {
-            sum = sum + ((t - p) / t).abs();
-            count += 1;
-        }
-    }
+    let sum = y_true
+        .iter()
+        .zip(y_pred.iter())
+        .fold(F::zero(), |acc, (&t, &p)| {
+            let denom = t.abs().max(eps);
+            acc + (p - t).abs() / denom
+        });
 
-    if count == 0 {
-        return Ok(F::infinity());
-    }
-
-    Ok(sum / F::from(count).unwrap())
+    Ok(sum / F::from(n).unwrap_or(F::one()))
 }
 
 /// Compute the explained variance score.
@@ -327,8 +362,10 @@ where
 ///
 /// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
 /// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
-/// Returns [`FerroError::NumericalInstability`] if `Var(y_true)` is zero
-/// (all targets are identical), making EVS undefined.
+///
+/// When `Var(y_true)` is zero (constant targets), this does **not** error:
+/// matching scikit-learn's default `force_finite=True`, it returns `1.0` for
+/// perfect predictions (zero residual variance) and `0.0` otherwise.
 ///
 /// # Examples
 ///
@@ -358,13 +395,6 @@ where
         acc + diff * diff
     }) / n_f;
 
-    if var_true == F::zero() {
-        return Err(FerroError::NumericalInstability {
-            message: "explained_variance_score: Var(y_true) is zero — all targets are constant"
-                .into(),
-        });
-    }
-
     // Variance of residuals (y_true - y_pred).
     let residuals: Vec<F> = y_true
         .iter()
@@ -377,6 +407,17 @@ where
         let diff = r - mean_res;
         acc + diff * diff
     }) / n_f;
+
+    // sklearn's default `force_finite=True` (`_assemble_r2_explained_variance`,
+    // `sklearn/metrics/_regression.py:877-891`): when the denominator is zero
+    // (constant `y_true`), never error — a zero numerator (perfect prediction)
+    // yields 1.0; a non-zero numerator (imperfect) is arbitrarily set to 0.0.
+    if var_true == F::zero() {
+        if var_res == F::zero() {
+            return Ok(F::one());
+        }
+        return Ok(F::zero());
+    }
 
     Ok(F::one() - var_res / var_true)
 }
@@ -1021,6 +1062,13 @@ where
     check_same_length(y_true, y_pred, context)?;
     let n = y_true.len();
     check_non_empty(n, context)?;
+    // sklearn: D^2 is not well-defined with fewer than two samples — it warns
+    // `UndefinedMetricWarning` and returns NaN before computing the deviance
+    // ratio (`sklearn/metrics/_regression.py:1699-1702`, d2_pinball_score /
+    // d2_absolute_error_score).
+    if n < 2 {
+        return Ok(F::nan());
+    }
     let mut num = F::zero();
     let mut den = F::zero();
     for (&t, &p) in y_true.iter().zip(y_pred.iter()) {
@@ -1028,6 +1076,13 @@ where
         den = den + deviance(t, constant);
     }
     if den == F::zero() {
+        // sklearn force_finite assembly (`_regression.py:1736-1739`): scores are
+        // initialised to 1.0 and only overwritten with 0.0 where the numerator is
+        // nonzero AND the denominator is zero. A zero numerator with a zero
+        // denominator therefore keeps the default 1.0.
+        if num == F::zero() {
+            return Ok(F::one());
+        }
         return Ok(F::zero());
     }
     Ok(F::one() - num / den)
@@ -1144,6 +1199,12 @@ where
     check_same_length(y_true, y_pred, "d2_tweedie_score")?;
     let n = y_true.len();
     check_non_empty(n, "d2_tweedie_score")?;
+    // sklearn: D^2 is not well-defined with fewer than two samples — it warns
+    // `UndefinedMetricWarning` and returns NaN before computing the deviance
+    // ratio (`sklearn/metrics/_regression.py:1584-1587`, d2_tweedie_score).
+    if n < 2 {
+        return Ok(F::nan());
+    }
 
     let constant = mean(y_true);
 
@@ -1179,12 +1240,13 @@ where
         num = num + dev(t, p);
         den = den + dev(t, constant);
     }
-    if den == F::zero() {
-        return Ok(F::zero());
-    }
-    let two = F::from(2.0).unwrap();
-    let n_f = F::from(n).unwrap();
-    Ok(F::one() - (two * num / n_f) / (two * den / n_f))
+    // sklearn `d2_tweedie_score` has NO force_finite — it returns `1 - num/den`
+    // literally (`_regression.py:1599`). A zero denominator therefore yields the
+    // natural IEEE-754 result: `1 - 0/0 = NaN` (constant-perfect) or
+    // `1 - x/0 = -inf` (constant-imperfect). No special-casing. The previous
+    // `(2*num/n)/(2*den/n)` reduces exactly to `num/den` (the `2/n` factors
+    // cancel), so the IEEE division produces the natural result directly.
+    Ok(F::one() - num / den)
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,9 +1390,16 @@ mod tests {
 
     #[test]
     fn test_r2_constant_y_true() {
+        // sklearn default force_finite=True (`_regression.py:877-891`): constant
+        // y_true never errors. Perfect prediction (zero numerator) -> 1.0.
+        // Oracle: r2_score([3,3,3],[3,3,3]) -> 1.0
         let y_true = array![3.0_f64, 3.0, 3.0];
         let y_pred = array![3.0_f64, 3.0, 3.0];
-        assert!(r2_score(&y_true, &y_pred).is_err());
+        assert!(matches!(r2_score(&y_true, &y_pred), Ok(v) if (v - 1.0).abs() < 1e-12));
+        // Imperfect prediction (non-zero numerator) -> 0.0.
+        // Oracle: r2_score([3,3,3],[3,3,2]) -> 0.0
+        let y_pred_imperfect = array![3.0_f64, 3.0, 2.0];
+        assert!(matches!(r2_score(&y_true, &y_pred_imperfect), Ok(v) if v.abs() < 1e-12));
     }
 
     #[test]
@@ -1368,25 +1437,38 @@ mod tests {
     }
 
     #[test]
-    fn test_mape_skips_zero_true() {
-        // y_true=0 at index 1 should be skipped.
+    fn test_mape_zero_true_eps_clamp() {
+        // sklearn divides by max(|y_true|, eps) — zero y_true is NOT skipped.
+        // `sklearn/metrics/_regression.py:403-404`: eps = np.finfo(np.float64).eps
+        // Oracle: mean_absolute_percentage_error([100,0,200],[110,999,200])
+        //   -> 1.4996986759143752e+18
         let y_true = array![100.0_f64, 0.0, 200.0];
         let y_pred = array![110.0_f64, 999.0, 200.0];
-        // index 0: |10/100| = 0.1; index 2: |0/200| = 0.0; count=2
-        // MAPE = (0.1 + 0.0) / 2 = 0.05 (sklearn-convention fraction)
-        assert_abs_diff_eq!(
-            mean_absolute_percentage_error(&y_true, &y_pred).unwrap(),
-            0.05,
-            epsilon = 1e-10
+        const SK_ORACLE: f64 = 1.499_698_675_914_375_2e18;
+        // index 1: |999 - 0| / eps -> huge finite term dominates.
+        assert!(
+            matches!(mean_absolute_percentage_error(&y_true, &y_pred), Ok(v) if {
+                let rel = (v - SK_ORACLE).abs() / SK_ORACLE.abs();
+                v.is_finite() && rel < 1e-9
+            }),
+            "mape eps-clamp: sklearn={SK_ORACLE:e}"
         );
     }
 
     #[test]
-    fn test_mape_all_zero_true_returns_inf() {
+    fn test_mape_all_zero_true_finite() {
+        // sklearn: all-zero y_true -> divide each |y_pred| by eps -> huge finite, not inf.
+        // Oracle: mean_absolute_percentage_error([0,0],[1,2]) -> 6755399441055744.0
         let y_true = array![0.0_f64, 0.0];
         let y_pred = array![1.0_f64, 2.0];
-        let mape = mean_absolute_percentage_error(&y_true, &y_pred).unwrap();
-        assert!(mape.is_infinite());
+        const SK_ORACLE: f64 = 6_755_399_441_055_744.0;
+        assert!(
+            matches!(mean_absolute_percentage_error(&y_true, &y_pred), Ok(v) if {
+                let rel = (v - SK_ORACLE).abs() / SK_ORACLE.abs();
+                v.is_finite() && rel < 1e-9
+            }),
+            "mape all-zero eps-clamp: sklearn={SK_ORACLE:e}"
+        );
     }
 
     #[test]
@@ -1427,9 +1509,18 @@ mod tests {
 
     #[test]
     fn test_evs_constant_y_true() {
+        // sklearn default force_finite=True (`_regression.py:877-891`): constant
+        // y_true never errors. Imperfect prediction (non-zero numerator) -> 0.0.
+        // Oracle: explained_variance_score([5,5,5],[1,2,3]) -> 0.0
         let y_true = array![5.0_f64, 5.0, 5.0];
         let y_pred = array![1.0_f64, 2.0, 3.0];
-        assert!(explained_variance_score(&y_true, &y_pred).is_err());
+        assert!(matches!(explained_variance_score(&y_true, &y_pred), Ok(v) if v.abs() < 1e-12));
+        // Perfect prediction (zero numerator) -> 1.0.
+        // Oracle: explained_variance_score([5,5,5],[5,5,5]) -> 1.0
+        let y_pred_perfect = array![5.0_f64, 5.0, 5.0];
+        assert!(
+            matches!(explained_variance_score(&y_true, &y_pred_perfect), Ok(v) if (v - 1.0).abs() < 1e-12)
+        );
     }
 
     #[test]
