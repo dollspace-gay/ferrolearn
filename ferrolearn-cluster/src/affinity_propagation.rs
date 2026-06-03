@@ -46,6 +46,38 @@
 //! let labels = fitted.labels();
 //! assert_eq!(labels.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_affinity_propagation.py`
+//! (`class AffinityPropagation(ClusterMixin, BaseEstimator)` `:312`; main loop
+//! `_affinity_propagation` `:36-177`). Design doc:
+//! `.design/cluster/affinity_propagation.md`. Cites use ferrolearn symbol anchors /
+//! sklearn `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2
+//! oracle (R-CHAR-3). Verify-and-document unit: the message-passing math and the
+//! resulting PARTITION (up to a label permutation, well-separated regime) VALUE-match
+//! the algorithm sklearn runs and SHIP through the crate re-export. Exact
+//! `labels_`/`cluster_centers_indices_`/`n_iter_` VALUE parity does NOT ship — it is
+//! blocked by the degeneracy-noise injection (#972), the convergence-window criterion
+//! (#973), and the exemplar-refinement pass (#974), none of which ferrolearn
+//! implements. There is no CPython binding (no `_RsAffinityPropagation`; #978).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (message-passing math) | SHIPPED | impl `fn fit` responsibility update (`s[[i,k]] - max_{k'!=k}(a+s)`) + availability update (`A[k,k]=Σmax(0,R)`, `A[i,k]=min(0, R[k,k]+Σ)`) with damping — algebraically EQUIVALENT to sklearn's `Y`/`Y2` argmax form (`_affinity_propagation.py:88-102`) and colsum/clip form (`:104-117`), numeric diff 0.0 (critic-verified). Consumer: crate re-export `pub use affinity_propagation::{AffinityPropagation, FittedAffinityPropagation}` (`lib.rs`). Guards: `green_guard_responsibility_availability_equivalence`, `green_guard_two_blob_partition` in `tests/divergence_affinity_propagation.rs`. |
+//! | REQ-2 (default preference) | SHIPPED | impl `fn fit` `pref` else-branch medians ALL `n²` entries of `s` (n zero diagonal + each off-diagonal twice) via `all_entries` + `median_of_sorted`, matching `np.median(self.affinity_matrix_)` (`_affinity_propagation.py:519-520`) — `-9.0` on docstring `X`, not the old `-13.0`. Guard: `pin_req2_default_preference_partition` (live fixture `make_blobs(15,centers=3,cluster_std=0.5,random_state=5)`: ferrolearn default now k=3 matching sklearn, was k=2). Fixed in #971. |
+//! | REQ-3 (partition / n_clusters) | SHIPPED | impl `fn fit` exemplar detection (`r[[k,k]]+a[[k,k]] > 0`) + nearest-exemplar assignment yields the same co-membership as sklearn on separated data. Guards: `green_guard_blobs_partition_default` (sklearn `make_blobs(12,centers=3,cluster_std=0.4,random_state=42)` → 3 clusters, canonical partition match), `green_guard_two_blob_partition`; in-tree `test_two_clusters`/`test_three_clusters`. Underclaim: PARTITION up-to-permutation in the well-separated regime only — absolute label/exemplar VALUES are NOT-STARTED (REQ-4/6). |
+//! | REQ-4 (random_state + degeneracy noise) | NOT-STARTED | open prereq blocker #972. No `random_state` field; `fn fit` injects no noise into `s`. sklearn `:78-80` adds `(eps*S + tiny*100)*random_state.standard_normal(...)`; couples to ferray::random (REQ-14). Blocks exact `labels_`/`n_iter_` VALUE parity. |
+//! | REQ-5 (convergence criterion) | NOT-STARTED | open prereq blocker #973. `fn fit` counts consecutive iterations with an unchanged exemplar SET; sklearn `:119-131` tracks the per-sample membership window `e` and tests `se==convergence_iter or se==0` for all n. Different `n_iter_`. |
+//! | REQ-6 (exemplar refinement + labeling) | NOT-STARTED | open prereq blocker #974. `fn fit` assigns by raw squared distance with an argmax fallback and labels by `exemplar_indices` position; sklearn `:149-162` refines each cluster's exemplar (`argmax Σ S[ii,ii]`) then relabels via `np.unique`+`np.searchsorted`. |
+//! | REQ-7 (predict) | NOT-STARTED | open prereq blocker #975. No `Predict` impl; sklearn `predict` (`:547-580`) uses `pairwise_distances_argmin(X, cluster_centers_)`. |
+//! | REQ-8 (affinity param) | NOT-STARTED | open prereq blocker #976. euclidean-only (`fn fit` Step 1 hardcodes `S=-squared_euclidean`); no `affinity` field, no `'precomputed'` path (sklearn `:343`, `:506-511`). |
+//! | REQ-9 (affinity_matrix_ / cluster_centers_indices_ attrs) | NOT-STARTED | open prereq blocker #977. `FittedAffinityPropagation` exposes `cluster_centers_`/`labels_`/`exemplar_indices_`/`n_iter_` but not `affinity_matrix_` (sklearn `:508`/`:511`) nor an `ndarray` `cluster_centers_indices_` (sklearn `:528`; `exemplar_indices()` is `Vec<usize>` under a different name). |
+//! | REQ-10 (CPython binding) | NOT-STARTED | open prereq blocker #978. No `_RsAffinityPropagation` in `ferrolearn-python` (grep empty); siblings `_RsDBSCAN`/`_RsBirch` exist. Only consumer is the crate re-export. |
+//! | REQ-11 (non-convergence semantics) | NOT-STARTED | open prereq blocker #979. `fn fit` returns `Err(FerroError::ConvergenceFailure)` when no exemplars; sklearn `:163-172` returns `labels=[-1]*n` + empty `cluster_centers_indices_` + `ConvergenceWarning` (R-DEV-2). |
+//! | REQ-12 (equal-similarities short-circuit) | NOT-STARTED | open prereq blocker #980. No `_equal_similarities_and_preferences` analog; `fn fit` runs the full loop for identical points. sklearn `:22-67` returns n or 1 clusters + a warning. |
+//! | REQ-13 (copy / verbose params) | NOT-STARTED | open prereq blocker #981. `AffinityPropagation` has `damping`/`max_iter`/`convergence_iter`/`preference` only; sklearn `__init__` `:468`/`:471` also has `copy=True`/`verbose=False`. |
+//! | REQ-14 (ferray substrate) | NOT-STARTED | open prereq blocker #982. imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`; no RNG layer (couples to REQ-4 needing `ferray::random`). R-SUBSTRATE-2. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
