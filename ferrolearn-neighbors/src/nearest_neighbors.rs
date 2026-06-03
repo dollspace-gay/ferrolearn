@@ -31,6 +31,34 @@
 //! assert_eq!(distances.nrows(), 6);
 //! assert_eq!(indices.nrows(), 6);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.NearestNeighbors` (`sklearn/neighbors/_unsupervised.py`,
+//! a thin estimator over the shared `KNeighborsMixin.kneighbors` /
+//! `RadiusNeighborsMixin.radius_neighbors` in `sklearn/neighbors/_base.py`). See
+//! `.design/neighbors/nearest_neighbors.md`. `NearestNeighbors` /
+//! `FittedNearestNeighbors` are existing pub APIs re-exported via
+//! `pub use nearest_neighbors::{FittedNearestNeighbors, NearestNeighbors}` in
+//! `lib.rs` and consumed non-test by `graph.rs`: `fn kneighbors_graph` (free fn,
+//! `nn.kneighbors(x, Some(query_k))`), `FittedNearestNeighbors::kneighbors_graph`
+//! (`self.kneighbors(x, n_neighbors)`), and
+//! `FittedNearestNeighbors::radius_neighbors_graph` (`self.radius_neighbors(x,
+//! radius)`). Binary classification (R-DEFER-2); honest underclaim (R-HONEST-3).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `kneighbors` explicit-`X` k-NN VALUE contract: `(distances, indices)` of shape `(n_queries, k)`, true-Euclidean, nearest-first; full-precision match to the live `NearestNeighbors.kneighbors` oracle on a tie-free fixture. `pub fn kneighbors` (per-row `fn find_knn` → `KdTree::query`/`BallTree::query`/`kdtree::brute_force_knn`) mirrors `KNeighborsMixin.kneighbors` explicit-`X` path (`_base.py:751`; sort `_base.py:741-746`). Green guards `green_kneighbors_value_explicit_x_tiefree`, `green_kneighbors_self_query_includes_self`. Consumers: `graph.rs` `fn kneighbors_graph` + `FittedNearestNeighbors::kneighbors_graph`. | SHIPPED |
+//! | REQ-2 | `radius_neighbors` VALUE/SET contract: per-row in-radius `(distances, indices)` set + true distances, matching `radius_neighbors(X, radius, return_distance=True)` as a set (and the `sort_results=True` ascending order). `pub fn radius_neighbors` (per-row `fn find_radius` → `BallTree::within_radius`/`fn brute_force_radius`, then `neighbors.sort_by` ascending) mirrors `RadiusNeighborsMixin.radius_neighbors` (`_base.py`). Green guard `green_radius_neighbors_set_match`. Consumer: `FittedNearestNeighbors::radius_neighbors_graph`. | SHIPPED |
+//! | REQ-3 | Query-time error guards EXIST: `kneighbors` rejects `k == 0`, `k > n_train`, and feature-dimension mismatch (the raises-on-overflow / shape-check behavior of `_base.py:808` + the `n_neighbors > n_samples_fit` defer at `_base.py:828`). `pub fn kneighbors` returns `InvalidParameter`/`ShapeMismatch`. Green guard `green_kneighbors_k_too_large_errors`; in-module `test_kneighbors_k_zero`, `test_kneighbors_shape_mismatch`. Exact `ValueError` type/message is REQ-4. | SHIPPED |
+//! | REQ-3b | Fit-time-timing parity: `fit` no longer errors when `n_neighbors > n_samples` — sklearn defers the `n_neighbors <= n_samples_fit` check to query time (`KNeighborsMixin.kneighbors`, `_base.py:828`), so `fit` succeeds and only `kneighbors` errors. `pub fn fit` validates only `n_neighbors == 0`; the fit-time `n_samples < n_neighbors` guard was removed. Green `divergence_fit_does_not_error_when_n_neighbors_gt_n_samples` + in-module `test_fit_succeeds_kneighbors_errors_when_k_gt_n`. | SHIPPED (#872) |
+//! | REQ-4 | Exact `ValueError` type/message for `k > n_train` ("Expected n_neighbors <= n_samples_fit, ...", `_base.py:828-832`) and `k == 0` ("Expected n_neighbors > 0. Got 0", `_base.py:808`). `pub fn kneighbors` raises `FerroError::InvalidParameter` with a different message; `FerroError` carries no Python message/type. | NOT-STARTED (#865) |
+//! | REQ-5 | `kneighbors(X=None)` self-exclusion path: query the training data and drop each row's self-match (`query_is_train = X is None`, `_base.py:815`; `n_neighbors + 1` query + `sample_range`/`dup` removal, `_base.py:931-939`). `pub fn kneighbors` REQUIRES a query matrix `x` — no `X=None` surface; passing the training matrix returns the self-match (index `i`, distance 0). | NOT-STARTED (#866) |
+//! | REQ-6 | `radius_neighbors` `sort_results` default: sklearn's default is `sort_results=False` → native (tree/brute) order (`RadiusNeighborsMixin.radius_neighbors`). `pub fn radius_neighbors` ALWAYS sorts ascending (matches `sort_results=True`, diverges from the default order); no `sort_results` toggle. | NOT-STARTED (#867) |
+//! | REQ-7 | Constructor `radius=1.0` / `metric='minkowski'` / `p=2` / `metric_params=None` / `n_jobs=None` (`_unsupervised.py:135-142`). `pub struct NearestNeighbors` has only `n_neighbors`/`algorithm`/`leaf_size` — Euclidean-only; no `radius` field (radius is only a `radius_neighbors` argument). | NOT-STARTED (#868) |
+//! | REQ-8 | Estimator-level `kneighbors_graph` / `radius_neighbors_graph` with `X=None`/`include_self` zero-diagonal semantics (`KNeighborsMixin.kneighbors_graph`). `graph.rs` has standalone free fns + `FittedNearestNeighbors` methods, but the estimator has no `X=None`/`include_self` method contract of its own. | NOT-STARTED (#869) |
+//! | REQ-9 | PyO3 `NearestNeighbors` binding + meta-crate re-export (`import sklearn.neighbors` exposes `NearestNeighbors`). `ferrolearn-python` exposes no shim and the meta-crate no re-export. | NOT-STARTED (#870) |
+//! | REQ-10 | ferray substrate: `nearest_neighbors.rs` imports `ndarray::Array2` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#871) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -196,26 +224,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NearestNeighbors<F
     /// # Errors
     ///
     /// Returns [`FerroError::InvalidParameter`] if `n_neighbors` is zero.
-    /// Returns [`FerroError::InsufficientSamples`] if there are fewer
-    /// samples than `n_neighbors`.
+    ///
+    /// Mirrors `sklearn.neighbors.NearestNeighbors.fit`, which validates only
+    /// `n_neighbors >= 1` (`_parameter_constraints`); the
+    /// `n_neighbors <= n_samples_fit` check is deferred to query time
+    /// (`KNeighborsMixin.kneighbors`, `sklearn/neighbors/_base.py:828`), so a
+    /// fit with `n_neighbors > n_samples` succeeds and only `kneighbors` errors.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedNearestNeighbors<F>, FerroError> {
-        let n_samples = x.nrows();
-
         if self.n_neighbors == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_neighbors".into(),
                 reason: "must be at least 1".into(),
-            });
-        }
-
-        if n_samples < self.n_neighbors {
-            return Err(FerroError::InsufficientSamples {
-                required: self.n_neighbors,
-                actual: n_samples,
-                context: format!(
-                    "NearestNeighbors requires at least n_neighbors={} samples",
-                    self.n_neighbors
-                ),
             });
         }
 
@@ -470,10 +489,25 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_insufficient_samples() {
-        let x = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 1.0]).unwrap();
+    fn test_fit_succeeds_kneighbors_errors_when_k_gt_n() {
+        // sklearn defers the `n_neighbors <= n_samples_fit` check to query time
+        // (`KNeighborsMixin.kneighbors`, `_base.py:828`): `fit` SUCCEEDS even
+        // when n_neighbors > n_samples; the error surfaces at `kneighbors`.
+        let x = ndarray::array![[0.0_f64, 0.0], [1.0, 1.0]];
         let nn = NearestNeighbors::<f64>::new().with_n_neighbors(5);
-        assert!(nn.fit(&x, &()).is_err());
+
+        let fitted = nn.fit(&x, &());
+        assert!(
+            fitted.is_ok(),
+            "fit must succeed (sklearn defers k<=n check to query time)"
+        );
+        // k = 5 > n_train = 2 -> error at query time.
+        let queried_errors = fitted.ok().map(|f| f.kneighbors(&x, None).is_err());
+        assert_eq!(
+            queried_errors,
+            Some(true),
+            "kneighbors must error when k > n_train"
+        );
     }
 
     #[test]
