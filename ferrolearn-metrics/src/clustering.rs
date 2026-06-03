@@ -16,6 +16,29 @@
 //! Noise points (label == -1, as used by DBSCAN) are excluded from all
 //! silhouette and Calinski-Harabasz computations but are counted in
 //! contingency-based metrics.
+//!
+//! ## REQ status
+//!
+//! Mirrors scikit-learn clustering metrics (`sklearn/metrics/cluster/_supervised.py` + `_unsupervised.py`). See `.design/metrics/clustering.md`. Non-test consumer: crate re-export. The present functions are value-correct vs the live oracle (verified incl. EMI to ~1e-9); the `average_method` default / `beta` param / silhouette subsampling / missing-surface gaps are NOT-STARTED.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `silhouette_score` / `silhouette_samples` value (euclidean, full-sample) (`_unsupervised.py`) | SHIPPED |
+//! | REQ-2 | `davies_bouldin_score` value (`_unsupervised.py`) | SHIPPED |
+//! | REQ-3 | `calinski_harabasz_score` value incl. `intra_disp==0 → 1.0` (`_unsupervised.py:387-389`) | SHIPPED |
+//! | REQ-4 | `adjusted_rand_score` value (`_supervised.py`) | SHIPPED |
+//! | REQ-5 | `rand_score` value via `pair_confusion_matrix`, `denominator==0 → 1.0` (`_supervised.py:333-343`) | SHIPPED |
+//! | REQ-6 | `adjusted_mutual_info` + `_with_method` (EMI; arithmetic default, min/max/geometric) (`_supervised.py`) | SHIPPED |
+//! | REQ-7 | `normalized_mutual_info_score` value (explicit `NmiMethod`) (`_supervised.py`) | SHIPPED |
+//! | REQ-8 | `homogeneity`/`completeness`/`v_measure`/`homogeneity_completeness_v_measure` value incl. empty → 1.0 (`_supervised.py:531-532`) | SHIPPED |
+//! | REQ-9 | `fowlkes_mallows_score` value (`_supervised.py`) | SHIPPED |
+//! | REQ-10 | `mutual_info_score` value (`_supervised.py`) | SHIPPED |
+//! | REQ-11 | `contingency_matrix` + `pair_confusion_matrix` value (`_supervised.py`) | SHIPPED |
+//! | REQ-12 | NMI `average_method='arithmetic'` DEFAULT + `v_measure_score` `beta` param | NOT-STARTED (#801) |
+//! | REQ-13 | `silhouette` `sample_size`/`random_state` subsampling + `metric=` | NOT-STARTED (#802, RNG boundary) |
+//! | REQ-14 | Missing surface: public `entropy`, `contingency_matrix` `eps`/`sparse`, `mutual_info_score` `contingency=`, crate-root `AmiMethod` re-export | NOT-STARTED (#803) |
+//! | REQ-15 | PyO3 binding | NOT-STARTED (#804) |
+//! | REQ-16 | ferray substrate migration | NOT-STARTED (#805) |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -1108,8 +1131,8 @@ where
 
     // CH = (B / (k-1)) / (W / (n-k))
     if w_ss == F::zero() {
-        // Perfect clustering — all points coincide with centroids.
-        return Ok(F::infinity());
+        // sklearn _unsupervised.py:387-389: `if intra_disp == 0.0: return 1.0`
+        return Ok(F::one());
     }
 
     Ok((b_ss / (k_f - one)) / (w_ss / (n_f - k_f)))
@@ -1188,11 +1211,8 @@ pub fn homogeneity_score(
     let n = labels_true.len();
     check_labels_same_length(n, labels_pred.len(), "homogeneity_score")?;
     if n == 0 {
-        return Err(FerroError::InsufficientSamples {
-            required: 1,
-            actual: 0,
-            context: "homogeneity_score".into(),
-        });
+        // sklearn _supervised.py:531-532: `if len(labels_true) == 0: return 1.0, 1.0, 1.0`
+        return Ok(1.0);
     }
 
     let n_f = n as f64;
@@ -1276,11 +1296,8 @@ pub fn completeness_score(
     let n = labels_true.len();
     check_labels_same_length(n, labels_pred.len(), "completeness_score")?;
     if n == 0 {
-        return Err(FerroError::InsufficientSamples {
-            required: 1,
-            actual: 0,
-            context: "completeness_score".into(),
-        });
+        // sklearn _supervised.py:531-532: `if len(labels_true) == 0: return 1.0, 1.0, 1.0`
+        return Ok(1.0);
     }
 
     let n_f = n as f64;
@@ -1393,7 +1410,6 @@ pub fn v_measure_score(
 /// # Errors
 ///
 /// Returns [`FerroError::ShapeMismatch`] if the arrays have different lengths.
-/// Returns [`FerroError::InsufficientSamples`] if the arrays have fewer than 2 elements.
 ///
 /// # Examples
 ///
@@ -1411,55 +1427,31 @@ pub fn rand_score(
 ) -> Result<f64, FerroError> {
     let n = labels_true.len();
     check_labels_same_length(n, labels_pred.len(), "rand_score")?;
-    if n < 2 {
-        return Err(FerroError::InsufficientSamples {
-            required: 2,
-            actual: n,
-            context: "rand_score requires at least 2 samples".into(),
-        });
+    // sklearn does not reject n<2.  For n==0, pair_confusion_matrix errors,
+    // but sklearn returns 1.0 (denominator==0 branch, _supervised.py:337-341).
+    if n == 0 {
+        return Ok(1.0);
     }
 
-    // Build the contingency table.
-    let mut classes_true: Vec<isize> = labels_true.iter().copied().collect();
-    classes_true.sort_unstable();
-    classes_true.dedup();
+    // RI = (agreeing pairs) / (total pairs), computed via pair_confusion_matrix
+    // exactly as sklearn (_supervised.py:333-343):
+    //   numerator   = C[0,0] + C[1,1]   (diagonal sum)
+    //   denominator = C.sum()
+    //   if numerator == denominator or denominator == 0: return 1.0
+    //   else: return numerator / denominator
+    //
+    // Using pair_confusion_matrix avoids the u64 subtraction underflow in the
+    // old `d = comb_n - sum_comb_a - sum_comb_b + sum_comb_c` formula (which
+    // panicked in debug on degenerate labelings such as [0,0,1,1]/[0,0,0,0]).
+    let c = pair_confusion_matrix(labels_true, labels_pred)?;
+    let numerator = c[[0, 0]] + c[[1, 1]];
+    let denominator = c[[0, 0]] + c[[0, 1]] + c[[1, 0]] + c[[1, 1]];
 
-    let mut classes_pred: Vec<isize> = labels_pred.iter().copied().collect();
-    classes_pred.sort_unstable();
-    classes_pred.dedup();
-
-    let r = classes_true.len();
-    let s = classes_pred.len();
-
-    let mut contingency = vec![vec![0u64; s]; r];
-    for (&lt, &lp) in labels_true.iter().zip(labels_pred.iter()) {
-        let ri = classes_true.partition_point(|&c| c < lt);
-        let ci = classes_pred.partition_point(|&c| c < lp);
-        contingency[ri][ci] += 1;
+    if numerator == denominator || denominator == 0 {
+        return Ok(1.0);
     }
 
-    let a: Vec<u64> = contingency.iter().map(|row| row.iter().sum()).collect();
-    let b: Vec<u64> = (0..s)
-        .map(|j| contingency.iter().map(|row| row[j]).sum())
-        .collect();
-
-    let comb_n = n_choose_2(n as u64);
-
-    // a = number of pairs in same cluster in both = sum of C(n_ij, 2)
-    let sum_comb_c: u64 = contingency
-        .iter()
-        .flat_map(|row| row.iter())
-        .map(|&v| n_choose_2(v))
-        .sum();
-
-    let sum_comb_a: u64 = a.iter().map(|&ai| n_choose_2(ai)).sum();
-    let sum_comb_b: u64 = b.iter().map(|&bj| n_choose_2(bj)).sum();
-
-    // d = C(n,2) - sum_comb_a - sum_comb_b + sum_comb_c
-    // (pairs that differ in both = total pairs - pairs_same_in_true - pairs_same_in_pred + pairs_same_in_both)
-    let d = comb_n - sum_comb_a - sum_comb_b + sum_comb_c;
-
-    Ok((sum_comb_c + d) as f64 / comb_n as f64)
+    Ok(numerator as f64 / denominator as f64)
 }
 
 // ---------------------------------------------------------------------------
@@ -2250,9 +2242,14 @@ mod tests {
 
     #[test]
     fn test_homogeneity_empty() {
+        // sklearn _supervised.py:531-532: empty input -> 1.0
         let lt = Array1::<isize>::from_vec(vec![]);
         let lp = Array1::<isize>::from_vec(vec![]);
-        assert!(homogeneity_score(&lt, &lp).is_err());
+        let result = homogeneity_score(&lt, &lp);
+        assert!(result.is_ok(), "expected Ok(1.0), got {result:?}");
+        if let Ok(score) = result {
+            assert_abs_diff_eq!(score, 1.0, epsilon = 1e-10);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2283,9 +2280,14 @@ mod tests {
 
     #[test]
     fn test_completeness_empty() {
+        // sklearn _supervised.py:531-532: empty input -> 1.0
         let lt = Array1::<isize>::from_vec(vec![]);
         let lp = Array1::<isize>::from_vec(vec![]);
-        assert!(completeness_score(&lt, &lp).is_err());
+        let result = completeness_score(&lt, &lp);
+        assert!(result.is_ok(), "expected Ok(1.0), got {result:?}");
+        if let Ok(score) = result {
+            assert_abs_diff_eq!(score, 1.0, epsilon = 1e-10);
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -2316,9 +2318,14 @@ mod tests {
 
     #[test]
     fn test_v_measure_empty() {
+        // sklearn _supervised.py:531-532: empty input -> 1.0
         let lt = Array1::<isize>::from_vec(vec![]);
         let lp = Array1::<isize>::from_vec(vec![]);
-        assert!(v_measure_score(&lt, &lp).is_err());
+        let result = v_measure_score(&lt, &lp);
+        assert!(result.is_ok(), "expected Ok(1.0), got {result:?}");
+        if let Ok(score) = result {
+            assert_abs_diff_eq!(score, 1.0, epsilon = 1e-10);
+        }
     }
 }
 
@@ -2448,9 +2455,16 @@ mod kani_proofs {
     }
 
     #[test]
-    fn test_rand_score_too_few_samples() {
+    fn test_rand_score_single_sample_is_one() {
+        // sklearn `rand_score([0],[0])` returns 1.0: pair_confusion_matrix gives
+        // [[0,0],[0,0]], denominator==0, _supervised.py:337-341 fires -> 1.0.
         let labels = array![0isize];
-        assert!(rand_score(&labels, &labels).is_err());
+        let result = rand_score(&labels, &labels);
+        assert!(
+            result.is_ok(),
+            "rand_score n=1 should be Ok, got {result:?}"
+        );
+        assert_abs_diff_eq!(result.ok().unwrap_or(f64::NAN), 1.0, epsilon = 1e-12);
     }
 
     // -----------------------------------------------------------------------
