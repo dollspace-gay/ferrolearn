@@ -1,14 +1,14 @@
-//! Divergence tests for the `ferrolearn-linear` crate-root score helpers
-//! (`r2_score` / `mean_accuracy`) reached through the public score traits.
+//! Divergence tests for the `ferrolearn-linear` crate-root score/log helpers
+//! (`r2_score` / `mean_accuracy` / `log_proba`) reached through public surfaces.
 //!
 //! Expected values are obtained from the LIVE scikit-learn 1.5.2 oracle (see
 //! the per-test doc comment for the exact `python3 -c` invocation), never
 //! copied from the ferrolearn side (R-CHAR-3).
 
 use ferrolearn_core::error::FerroError;
-use ferrolearn_core::traits::Predict;
-use ferrolearn_linear::RegressorScore;
-use ndarray::{Array1, Array2};
+use ferrolearn_core::traits::{Fit, Predict};
+use ferrolearn_linear::{RegressorScore, QDA};
+use ndarray::{array, Array1, Array2};
 
 /// A minimal regressor whose `predict` returns predictions supplied by the
 /// test, so the test fully controls `y_pred` while `score(&x, &y)` supplies
@@ -111,5 +111,68 @@ fn r2_in_regime_matches_oracle() {
     assert!(
         (score - SK_R2_IN_REGIME).abs() < 1e-8,
         "in-regime R^2: sklearn {SK_R2_IN_REGIME}, ferrolearn {score}",
+    );
+}
+
+/// Divergence: ferrolearn's `log_proba` (`ferrolearn-linear/src/lib.rs:231-234`)
+/// clamps probabilities below `1e-300` to `ln(1e-300)` (~ -690.7755), so an
+/// exact-`0.0` class probability maps to a finite ~ -690.78 instead of `-inf`.
+///
+/// scikit-learn does NOT clamp: `predict_log_proba` is `return np.log(probas_)`
+/// (`sklearn/discriminant_analysis.py:1059`), so a `0.0` probability yields
+/// `-inf` (with a divide-by-zero RuntimeWarning).
+///
+/// This is reached through the public `FittedQDA::predict_log_proba`
+/// (`ferrolearn-linear/src/qda.rs:397`: `Ok(crate::log_proba(&proba))`). On an
+/// extreme test point the QDA `predict_proba` underflows to exactly `[0.0, 1.0]`
+/// in BOTH sklearn and ferrolearn (verified: ferrolearn proba == [0.0, 1.0],
+/// matching the sklearn oracle below) — so the difference is isolated to the
+/// `log_proba` clamp, not QDA fit math.
+///
+/// Live oracle (sklearn 1.5.2):
+///   python3 -c "import warnings,numpy as np
+///     from sklearn.discriminant_analysis import QuadraticDiscriminantAnalysis
+///     warnings.simplefilter('ignore')
+///     X=np.array([[0.],[1.],[100.],[200.]]); y=np.array([0,0,1,1])
+///     q=QuadraticDiscriminantAnalysis().fit(X,y)
+///     print(q.predict_proba([[-1e6]]).tolist())      # [[0.0, 1.0]]
+///     print(q.predict_log_proba([[-1e6]]).tolist())" # [[-inf, 0.0]]
+///
+/// sklearn log_proba[0,0] == -inf; ferrolearn log_proba[0,0] == ~ -690.78.
+/// Tracking: #1105 (release-blocker; left un-ignored).
+#[test]
+fn divergence_log_proba_zero_clamps_instead_of_neg_inf() {
+    let x: Array2<f64> = array![[0.0], [1.0], [100.0], [200.0]];
+    let y = Array1::from(vec![0usize, 0, 1, 1]);
+    let fitted = QDA::new().fit(&x, &y).expect("QDA fit should succeed");
+
+    let xq: Array2<f64> = array![[-1.0e6]];
+
+    // Precondition: ferrolearn QDA underflows to an EXACT zero probability for
+    // class 0, matching the sklearn oracle proba [[0.0, 1.0]]. This isolates
+    // the divergence to the log_proba clamp.
+    let proba = fitted.predict_proba(&xq).expect("predict_proba");
+    assert_eq!(
+        proba[[0, 0]],
+        0.0,
+        "precondition: ferrolearn QDA proba[0,0] must underflow to exact 0.0 \
+         (sklearn oracle proba == [[0.0, 1.0]]); got {}",
+        proba[[0, 0]],
+    );
+
+    let logp = fitted
+        .predict_log_proba(&xq)
+        .expect("predict_log_proba should succeed");
+
+    // Live-oracle expected value, NOT copied from ferrolearn: sklearn
+    // discriminant_analysis.py:1059 `np.log(0.0)` == -inf.
+    let sk_log_proba_of_zero = f64::NEG_INFINITY;
+
+    assert_eq!(
+        logp[[0, 0]],
+        sk_log_proba_of_zero,
+        "log of exact-0 probability: sklearn np.log gives -inf \
+         (discriminant_analysis.py:1059), ferrolearn clamp gives {} (tracking #1105)",
+        logp[[0, 0]],
     );
 }
