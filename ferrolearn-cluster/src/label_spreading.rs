@@ -15,9 +15,9 @@
 //!    is exceeded.
 //!
 //! The `alpha` parameter controls the trade-off between the initial label
-//! information and the graph structure. With `alpha = 0`, labels are fixed
-//! at the initial values; with `alpha = 1`, labels are fully determined by
-//! graph propagation.
+//! information and the graph structure. It must lie in the open interval
+//! `(0, 1)` (both `0` and `1` are rejected): lower values keep labels closer
+//! to the initial values, higher values give more weight to graph propagation.
 //!
 //! Labels of `-1` in the target vector indicate unlabeled points.
 //!
@@ -38,6 +38,39 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! assert_eq!(fitted.labels().len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/semi_supervised/_label_propagation.py`
+//! (`class LabelSpreading(BaseLabelPropagation)` `:486`, `_variant="spreading"`; base
+//! `fit`/`predict`/`predict_proba` `:233-335`; `_build_graph` `:609-623`). Design doc:
+//! `.design/cluster/label_spreading.md`. Cites use ferrolearn symbol anchors / sklearn
+//! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
+//! (R-CHAR-3). Verify-and-document unit: the contiguous-label transduction PARTITION
+//! (REQ-1), the `alpha ∈ (0,1)` validation (REQ-2), and the `classes_`/`n_classes`/
+//! label-VALUE mapping (REQ-4) match sklearn and SHIP through the crate re-export. The
+//! `label_distributions_` VALUES DIVERGE — ferrolearn's normalized-Laplacian degree
+//! excludes the RBF self-affinity, inits unlabeled rows UNIFORM, row-normalizes every
+//! iteration, and converges on L2-at-end, vs sklearn's degree-incl-self + zero-init +
+//! no-per-iter-norm + L1-at-start (#1010/#1012). `predict`/`predict_proba` are
+//! nearest-neighbor, not sklearn's kernel-weighted combination (#1014). No CPython
+//! binding (#1020).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (contiguous-label transduction PARTITION) | SHIPPED | impl `fn fit` (graph build → `fn normalized_laplacian` → `fn spread` → per-row argmax) recovers sklearn's transduction on well-separated CONTIGUOUS-label data. Consumer: crate re-export `pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel}` (`lib.rs:111`). Guards: `green_guard_req1_contiguous_partition_2blob`/`_3blob`/`_fresh` in `tests/divergence_label_spreading.rs` (live-oracle). Underclaim: contiguous separable data only — `label_distributions_` VALUES (REQ-3) diverge. |
+//! | REQ-2 (`alpha ∈ (0,1)` open-interval validation) | SHIPPED | impl `fn fit` now rejects `alpha <= 0 || alpha >= 1` (reason "must be in (0, 1)"), matching sklearn `_parameter_constraints["alpha"] = [Interval(Real, 0, 1, closed="neither")]` (`_label_propagation.py:585`) — alpha=0 AND alpha=1 both rejected. Guard: `divergence_req2_alpha_zero_rejected` + `confirm_alpha_one_already_rejected` + in-tree `test_alpha_zero_rejected`/`test_invalid_alpha`. Fixed #1009. |
+//! | REQ-4 (`classes_` / `n_classes` / label-VALUE mapping) | SHIPPED | impl `fn fit` now builds `classes_` = sorted unique non-(-1) labels, `n_classes = classes_.len()`, one-hot indexed by class POSITION, and maps the final argmax index through `classes_` — matching sklearn `classes_ = unique(y)\{-1}` + `transduction_ = classes_[argmax]` (`:272-274,333`). Guard: `divergence_req4_noncontiguous_classes_mapping` (`{0,2}` fixture → `n_classes()==2`, `labels ⊆ {0,2}` = sklearn `[0,0,0,0,2,2,2,2]`; was `n_classes()==3` phantom). Fixed #1011. |
+//! | REQ-3 (`label_distributions_` value — Laplacian degree + uniform-init + per-iter norm) | NOT-STARTED | open prereq blocker #1010. sklearn `_build_graph` uses `csgraph_laplacian(rbf_kernel(X,X) diag=1, normed)` (degree INCLUDES self-affinity) + iteration `alpha*(graph@F)+y_static` (y_static one-hot*(1-alpha), unlabeled=0), NO per-iter normalization (`:316-330`). ferrolearn `fn build_rbf_affinity` zeroes the W diagonal + `fn normalized_laplacian` excludes self in the degree, `fn spread` uses uniform unlabeled init + row-normalizes every iteration. |
+//! | REQ-5 (convergence — L1-at-start vs L2-at-end) | NOT-STARTED | open prereq blocker #1012. sklearn `|Δ|.sum() < tol` at loop START (`:301`); ferrolearn `fn spread` L2 sqrt-sum-of-squares at END. Different stopping rule + `n_iter_`. |
+//! | REQ-6 (`tol` default `1e-3`) | NOT-STARTED | open prereq blocker #1013. sklearn LabelSpreading `tol=1e-3` (`:595`); ferrolearn `fn new` `tol=1e-4`. Default divergence (R-DEV-2). |
+//! | REQ-7 (`predict`/`predict_proba` kernel-weighted) | NOT-STARTED | open prereq blocker #1014. sklearn `predict_proba = rbf_kernel(X_train,X).T @ label_distributions_` row-normalized, `predict = classes_[argmax]` (`:190-231`); ferrolearn `fn predict`/`fn predict_proba` return the NEAREST training row's distribution. R-DEV-3. |
+//! | REQ-8 (`transduction_`/`classes_`/`n_iter_`/`X_` attrs) | NOT-STARTED | open prereq blocker #1015. sklearn exposes `transduction_`/`classes_`/`n_iter_`/`X_`/`n_features_in_`; ferrolearn `FittedLabelSpreading` exposes `labels_` (not `transduction_`)/`label_distributions_`/`n_classes_` — no public `classes_`/`n_iter_`. |
+//! | REQ-9 (`ConvergenceWarning` + `n_iter_`) | NOT-STARTED | open prereq blocker #1016. sklearn warns `ConvergenceWarning` + `n_iter_ += 1` at `max_iter` (`:321-326`); ferrolearn `fn spread` breaks silently, no `n_iter_`. |
+//! | REQ-10 (KNN connectivity graph — directed vs symmetrized) | NOT-STARTED | open prereq blocker #1017. sklearn knn → `kneighbors_graph(mode="connectivity")` directed (`:156-157`); ferrolearn `fn build_knn_affinity` SYMMETRIZES (`w[i,j]=w[j,i]=1`). Different graph. |
+//! | REQ-11 (validation / error ABI) | NOT-STARTED | open prereq blocker #1018. sklearn `check_classification_targets` + `_parameter_constraints` raising `InvalidParameterError` (`:110-118,265`); ferrolearn `fn fit` raises `FerroError::InvalidParameter` (different type/ABI) and rejects `gamma>0` (stricter than sklearn's `[0,∞)`). |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1019. `label_spreading.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1/2). |
+//! | REQ-13 (PyO3 binding) | NOT-STARTED | open prereq blocker #1020. `grep LabelSpreading ferrolearn-python/` is EMPTY — no binding; `import ferrolearn` cannot reach `LabelSpreading`. Only consumer is the crate re-export. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -75,7 +108,7 @@ pub struct LabelSpreading<F> {
     /// Convergence tolerance.
     pub tol: F,
     /// Clamping factor: controls the balance between initial labels and
-    /// graph structure. Must be in `[0, 1)`.
+    /// graph structure. Must be in `(0, 1)`.
     pub alpha: F,
 }
 
@@ -133,9 +166,10 @@ impl<F: Float> LabelSpreading<F> {
 
     /// Set the clamping factor `alpha`.
     ///
-    /// Must be in `[0, 1)`. A value of `0` means labels are fully determined
-    /// by the initial labels (no spreading). Higher values give more weight
-    /// to the graph structure.
+    /// Must be in the open interval `(0, 1)` (both `0` and `1` are rejected,
+    /// matching sklearn `_parameter_constraints["alpha"]`). Lower values keep
+    /// labels closer to the initial labels; higher values give more weight to
+    /// the graph structure.
     #[must_use]
     pub fn with_alpha(mut self, alpha: F) -> Self {
         self.alpha = alpha;
@@ -421,7 +455,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if `alpha` is not in `[0, 1)`,
+    /// Returns [`FerroError::InvalidParameter`] if `alpha` is not in `(0, 1)`,
     /// `gamma` is not positive (for RBF), or there are no labeled points.
     fn fit(&self, x: &Array2<F>, y: &Array1<isize>) -> Result<FittedLabelSpreading<F>, FerroError> {
         let n_samples = x.nrows();
@@ -443,10 +477,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
             });
         }
 
-        if self.alpha < F::zero() || self.alpha >= F::one() {
+        if self.alpha <= F::zero() || self.alpha >= F::one() {
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
-                reason: "must be in [0, 1)".into(),
+                reason: "must be in (0, 1)".into(),
             });
         }
 
@@ -473,14 +507,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
             });
         }
 
-        // Find number of classes.
-        let n_classes = y
-            .iter()
-            .filter(|&&l| l >= 0)
-            .map(|&l| l as usize)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        // Classes are the sorted unique non-negative labels (sklearn
+        // `classes_ = np.unique(y); classes_ = classes_[classes_ != -1]`,
+        // `_label_propagation.py:272-274`). `n_classes = len(classes_)`.
+        let classes_: Vec<isize> = {
+            let mut c: Vec<isize> = y.iter().copied().filter(|&l| l >= 0).collect();
+            c.sort_unstable();
+            c.dedup();
+            c
+        };
+        let n_classes = classes_.len();
 
         // Build the affinity matrix.
         let w = match self.kernel {
@@ -495,7 +531,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
         let mut initial_y = Array2::from_elem((n_samples, n_classes), F::zero());
         for (i, &label) in y.iter().enumerate() {
             if label >= 0 {
-                let c = label as usize;
+                // Index by the POSITION of the label in `classes_`, not its raw
+                // value (sklearn one-hots `classes_ == label`, `:283-284`).
+                let c = classes_.iter().position(|&v| v == label).unwrap_or(0);
                 if c < n_classes {
                     initial_y[[i, c]] = F::one();
                 }
@@ -523,7 +561,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
                             best_c = c;
                         }
                     }
-                    best_c as isize
+                    // Map the argmax column INDEX through `classes_`
+                    // (sklearn `transduction_ = classes_[argmax(...)]`, `:333`).
+                    classes_.get(best_c).copied().unwrap_or(0)
                 })
                 .collect(),
         );
@@ -628,20 +668,16 @@ mod tests {
     }
 
     #[test]
-    fn test_alpha_zero_recovers_initial() {
-        // With alpha = 0: F = (1-0)*Y = Y, so labels are the initial ones.
+    fn test_alpha_zero_rejected() {
+        // sklearn `_parameter_constraints["alpha"] = [Interval(Real, 0, 1,
+        // closed="neither")]` (`_label_propagation.py:585`) — the OPEN interval
+        // (0, 1) rejects alpha=0. Mirror that: fit with alpha=0 must be Err.
         let x = Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 0.1, 0.0, 10.0, 10.0, 10.1, 10.0])
             .unwrap();
         let y = Array1::from_vec(vec![0, 0, 1, 1]);
 
         let model = LabelSpreading::<f64>::new().with_alpha(0.0);
-        let fitted = model.fit(&x, &y).unwrap();
-
-        // All labeled, alpha=0 means Y is unchanged.
-        assert_eq!(fitted.labels()[0], 0);
-        assert_eq!(fitted.labels()[1], 0);
-        assert_eq!(fitted.labels()[2], 1);
-        assert_eq!(fitted.labels()[3], 1);
+        assert!(model.fit(&x, &y).is_err());
     }
 
     #[test]
