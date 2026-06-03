@@ -36,6 +36,55 @@
 //! let reduced = fitted.transform(&x).unwrap();
 //! assert_eq!(reduced.ncols(), 3);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification + symbol-anchor + sklearn
+//! `file:line`; NOT-STARTED carries the open prereq blocker. **`FeatureAgglomeration`
+//! has NO PyO3 binding** — `grep -rln FeatureAgglomeration ferrolearn-python/` is
+//! EMPTY (no `_RsFeatureAgglomeration`, no `ferrolearn.FeatureAgglomeration`). The
+//! non-test production consumer is therefore the crate re-export at the crate root
+//! (`pub use feature_agglomeration::{AgglomerativeLinkage, FeatureAgglomeration,
+//! FittedFeatureAgglomeration, PoolingFunc}` in `ferrolearn-cluster/src/lib.rs`),
+//! exposing `fit` / `transform` / `feature_labels()`. **Honest underclaim
+//! (R-HONEST-3): this unit does NOT achieve `FeatureAgglomeration` end-to-end VALUE
+//! parity** — the feature PARTITION matches sklearn (`{0,1}`/`{2,3}`/`{4,5}` on the
+//! fixture), but the integer `labels_` index is PERMUTED (sklearn `_hc_cut`
+//! `_agglomerative.py:1099` + `np.searchsorted(np.unique(labels), labels)` `:1105` →
+//! `[0,0,2,2,1,1]`; ferrolearn relabels by `active`-slot order in
+//! `agglomerative.rs::agglomerate` → `[0,0,1,1,2,2]`), which cascades into the
+//! `transform` output COLUMN ORDER (sklearn orders columns by `np.unique(labels_)`,
+//! `_feature_agglomeration.py:62`). The root cause is OWNED by the
+//! AgglomerativeClustering unit (`agglomerative.rs`), so `labels_`/transform-VALUE
+//! parity is NOT-STARTED here. The ONLY contracts that VALUE-match the live oracle
+//! with a real consumer are the validation guards (`ensure_min_features=2`,
+//! `n_clusters >= 1`, `n_features >= n_clusters`), the transform output SHAPE
+//! `(n_samples, n_clusters)`, and the pooling ARITHMETIC as an unordered set.
+//! Green verification = the in-tree `feature_agglom` lib tests plus the live-sklearn
+//! pin/guards (`ferrolearn-cluster/tests/divergence_feature_agglomeration.rs`): the
+//! now-PASSING pin `divergence_feature_agglom_min_features_two` (#944) and the green
+//! guards `green_feature_agglom_transform_shape`,
+//! `green_feature_agglom_mean_pooling_as_set`,
+//! `green_feature_agglom_n_clusters_zero_rejected`,
+//! `green_feature_agglom_too_many_clusters_rejected`. Cites use symbol anchors
+//! (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle =
+//! installed sklearn 1.5.2. (REQ numbering follows
+//! `.design/cluster/feature_agglomeration.md`.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-4 (validation guards: `ensure_min_features=2`; `n_clusters >= 1`; `n_features >= n_clusters`; non-empty `X` — SHAPE/validation contract only) | SHIPPED (validation + shape + pooling-as-set contract only) | `fn fit` for `FeatureAgglomeration` rejects a 1-feature `X` with `FerroError::InvalidParameter { name: "X", reason: "Found array with {n} feature(s) while a minimum of 2 is required by FeatureAgglomeration" }`, mirroring `self._validate_data(X, ensure_min_features=2)` (`_agglomerative.py:1338`); rejects `n_clusters == 0` per `Interval(Integral, 1, None, closed="left")` (`:1281`); rejects `n_features < n_clusters` ("Cannot extract more clusters than samples", from `_hc_cut`); rejects empty `X` with `FerroError::InsufficientSamples`. The `Transform` impl (`fn transform`) returns output of SHAPE `(n_samples, n_clusters)`. Non-test consumer: crate re-export of `fit` / `transform` / `feature_labels()` (`lib.rs`). Verified: now-PASSING pin `divergence_feature_agglom_min_features_two` (#944): `new(1).fit(X_(4,1))` returns `Err` (sklearn `FeatureAgglomeration(n_clusters=1).fit(X_1col)` raises `ValueError`); green guards `green_feature_agglom_transform_shape` (`transform(X).dim() == (5, 3)`), `green_feature_agglom_mean_pooling_as_set` (per-row pooled values match sklearn as a SORTED set), `green_feature_agglom_n_clusters_zero_rejected` (`new(0).fit` → `Err`), `green_feature_agglom_too_many_clusters_rejected` (`new(10).fit(X_6col)` → `Err`). GAP (NOT-STARTED): the sklearn `ValueError`/`InvalidParameterError` error ABI is NOT matched — ferrolearn uses `FerroError`. Column-ordered transform VALUE and `labels_` VALUE are NOT claimed here (REQ-1/2/3). |
+//! | REQ-1 (`transform` mean-pooling VALUE) | NOT-STARTED | open prereq blocker **#938** (depends on REQ-3). `fn transform` (`PoolingFunc::Mean`) computes per-cluster mean (`sum/count`) into `(n_samples, n_clusters)`, mirroring the `bincount` fast path of `AgglomerationTransform.transform` (`_feature_agglomeration.py:51-57`). The pooling ARITHMETIC is correct (guard `green_feature_agglom_mean_pooling_as_set`), but the output COLUMN ORDER diverges from sklearn (which orders by `np.unique(labels_)`, `:62`) because the underlying label index is permuted (REQ-3): sklearn `transform(X)[0] = [1.05, 9.05, 5.05]` vs ferrolearn `[1.05, 5.05, 9.05]`. Equal only as an unordered column set. Unblocks once REQ-3 lands. |
+//! | REQ-2 (`transform` max-pooling VALUE) | NOT-STARTED | open prereq blocker **#938** (depends on REQ-3). `fn transform` (`PoolingFunc::Max`) takes per-cluster max, mirroring the general pooling path (`_feature_agglomeration.py:58-63`, `np.max` callable). Per-cluster max is correct; column order diverges identically: sklearn `transform(X)[0] = [1.1, 9.1, 5.1]` vs ferrolearn `[1.1, 5.1, 9.1]`. Gated on REQ-3. |
+//! | REQ-3 (`labels_` feature-cluster VALUE parity) | NOT-STARTED | open prereq blocker **#938** (owned by the `agglomerative.rs` unit; the ROOT cause). `fn fit` delegates to `AgglomerativeClustering::new(n_clusters).with_linkage(...)` on `X.T`, storing `feature_labels_`, mirroring `super()._fit(X.T)` (`_agglomerative.py:1339`). The PARTITION matches sklearn (`{0,1}`/`{2,3}`/`{4,5}`) but integer labels are PERMUTED: sklearn `_hc_cut` (`:1099`) + `np.searchsorted(np.unique(labels), labels)` (`:1105`) → `[0,0,2,2,1,1]`; ferrolearn `agglomerative.rs::agglomerate` relabels by `active`-slot order → `[0,0,1,1,2,2]`. Fixing the `_hc_cut`/`searchsorted` label-numbering in `agglomerative.rs` is the single root cause; REQ-1/REQ-2 unblock once it lands. |
+//! | REQ-5 (linkage variants ward/complete/average/single) | NOT-STARTED | open prereq blocker **#938** (shares the REQ-3 root cause). `fn map_linkage` maps all four `AgglomerativeLinkage` variants to `Linkage`, delegated to `AgglomerativeClustering`, mirroring `_TREE_BUILDERS` (`_agglomerative.py:1290`). The partition matches across all four on the fixture, but `labels_`/transform VALUE is gated on REQ-3. |
+//! | REQ-6 (`n_clusters=2` default + missing params metric/memory/connectivity/compute_full_tree/distance_threshold/compute_distances) | NOT-STARTED | open prereq blocker **#941**. sklearn `__init__` (`_agglomerative.py:1296-1319`) takes 9 params with `n_clusters=2` default. `FeatureAgglomeration<F>` REQUIRES `n_clusters` (`fn new`, no default) and has only `linkage`/`pooling_func`. `distance_threshold` (cut by distance with `n_clusters=None`, `:1281`/`:1091-1092`) is materially absent. |
+//! | REQ-7 (`pooling_func` as arbitrary callable) | NOT-STARTED | open prereq blocker **#941**. sklearn `_parameter_constraints["pooling_func"] = [callable]` (`_agglomerative.py:1291`) accepts any callable (default `np.mean`, `:1305`). ferrolearn offers only the closed `PoolingFunc::{Mean, Max}` enum (`fn with_pooling_func`). |
+//! | REQ-8 (`inverse_transform`) | NOT-STARTED | open prereq blocker **#940**. sklearn `AgglomerationTransform.inverse_transform` broadcasts pooled values back via `X[..., np.unique(labels_, return_inverse=True)[1]]` (`_feature_agglomeration.py:66-92`). `FittedFeatureAgglomeration` impls only `Transform` — no `inverse_transform`. |
+//! | REQ-9 (fitted attrs labels_/n_leaves_/n_connected_components_/children_/distances_) | NOT-STARTED | open prereq blocker **#942**. sklearn `_fit` sets `labels_`/`n_clusters_`/`n_leaves_`/`n_connected_components_`/`children_`/`distances_` (`_agglomerative.py:1083-1095`). `FittedFeatureAgglomeration` exposes `feature_labels_` (wrong name vs `labels_`, R-DEV-3), `n_clusters_`, `n_features_` — missing `n_leaves_`/`n_connected_components_`/`children_`/`distances_`. |
+//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker **#943**. `grep -rln FeatureAgglomeration ferrolearn-python/` is EMPTY — no `_RsFeatureAgglomeration`, so `import ferrolearn` cannot reach `FeatureAgglomeration`. The only non-test consumer of `fit` / `transform` / `feature_labels()` is the crate re-export (`lib.rs`). |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#943**. `feature_agglomeration.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`; the delegated `agglomerative.rs` is likewise on `ndarray`. Not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -222,6 +271,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FeatureAgglomerati
             return Err(FerroError::InvalidParameter {
                 name: "n_clusters".into(),
                 reason: "must be at least 1".into(),
+            });
+        }
+        if n_features < 2 {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: format!(
+                    "Found array with {n_features} feature(s) while a minimum of 2 is required by FeatureAgglomeration"
+                ),
             });
         }
         if n_features < self.n_clusters {
