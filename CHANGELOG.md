@@ -244,6 +244,10 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Divergence: ferrolearn-metrics::rand_score diverges from sklearn/metrics/cluster/_supervised.py:337 for single-sample input (#800)
+- Divergence: ferrolearn-metrics homogeneity/completeness/v_measure/hcv error on empty input (sklearn returns 1.0/(1,1,1)) vs sklearn/metrics/cluster/_supervised.py:531-532 (#799)
+- Divergence: ferrolearn-metrics::calinski_harabasz_score returns inf (not 1.0) when intra_disp==0 vs sklearn/metrics/cluster/_unsupervised.py:387-389 (#798)
+- Divergence: ferrolearn-metrics::rand_score panics (u64 subtract overflow) vs sklearn/metrics/cluster/_supervised.py:337-343 (#797)
 - Divergence: scorer.rs REQ-5 mis-frames d2_absolute_error_score as blocked on heterogeneous Scorer type #781 — it is a regression fn(&Array1,&Array1) metric registerable now (sklearn _sign==+1, _scorer.py:788) (#787)
 - Divergence: ferrolearn-metrics scorer registry diverges from sklearn/metrics/_scorer.py:761 (neg_max_error is not a sklearn name; max_error missing) (#780)
 - Divergence: ferrolearn-metrics::Scorer::score diverges from sklearn/metrics/_scorer.py:376 (sign not applied) (#779)
