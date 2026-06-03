@@ -40,6 +40,33 @@
 //! let labels = fitted.labels();
 //! assert_eq!(labels.len(), 8);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/cluster/_hdbscan/hdbscan.py`
+//! (`class HDBSCAN`). Design doc: `.design/cluster/hdbscan.md`. Cites use ferrolearn
+//! symbol anchors / sklearn `file:line` (commit 156ef14); expected values from the
+//! live sklearn 1.5.2 oracle (R-CHAR-3). HDBSCAN is deterministic (no RNG), so the
+//! partition value-parity is genuine. No PyO3 binding — only consumer is the crate
+//! re-export. ferrolearn implements the correct algorithm SHAPE (core-dist →
+//! mutual-reachability → MST → condensed tree → EOM stability), but the condensed-tree
+//! stability/probability formulas and the parameter/attribute surface diverge.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`labels_` PARTITION + noise set matches sklearn, well-separated data) | SHIPPED | impl `Fit::fit` (`compute_core_distances` → `build_mst` Prim → `extract_clusters` single-linkage + EOM) produces the SAME co-membership partition + `-1` noise set as sklearn `HDBSCAN` on well-separated/dense blobs (deterministic — genuine value-parity, not just up-to-permutation, on these fixtures). Consumer: crate re-export `pub use hdbscan::{FittedHdbscan, Hdbscan}` (`lib.rs`). Guards: `req1_partition_two_blobs_matches_sklearn`, `req1_partition_outliers_matches_sklearn` in `tests/divergence_hdbscan.rs` (live-oracle, robust to the REQ-5 fix). Underclaim: the absolute label INTEGERS (REQ-6) and behavior on borderline-density data (gated on the exact condensed-tree algorithm) may differ. |
+//! | REQ-2 (`probabilities_` range + noise-prob-0 contract) | SHIPPED | impl `extract_clusters` yields `probabilities_` ∈ [0,1] with noise points at 0. Consumer: crate re-export. Guard: `req2_probabilities_range_and_noise_zero`. Underclaim: CONTRACT (range + noise-0) only — the exact GLOSH probability VALUES diverge (REQ-4 #1069). |
+//! | REQ-3 (defaults) | SHIPPED | impl `fn new` defaults `min_cluster_size=5`, `min_samples=None`, `cluster_selection_epsilon=0.0` = sklearn `HDBSCAN` defaults (`hdbscan.py:674-676`); `min_cluster_size>=2` validation matches sklearn `Interval(Integral,2,None)`. Guard: `req3_defaults_match_sklearn`. |
+//! | REQ-5 (core-distance index matches sklearn) | SHIPPED | impl `fn compute_core_distances` now takes `sorted_dists[min_samples-1]` (the `min_samples`-NN query includes self at index 0) = sklearn `core_distances = neighbors_distances[:, -1]` (`hdbscan.py:351-352`). Was `dists[min_samples]` (one neighbor too far → ferrolearn ms=k reproduced sklearn ms=k+1). Guard: `divergence_core_distance_off_by_one_partition` (min_samples-sensitive fixture: ferrolearn ms=3 now == sklearn ms=3). Fixed #1070. |
+//! | REQ-4 (`probabilities_` GLOSH VALUES) | NOT-STARTED | open prereq blocker #1069. sklearn probability = `lambda_p / max_lambda_in_cluster` (GLOSH, `_hdbscan/_tree.pyx`); ferrolearn `extract_clusters` uses `(child_lambda - birth)/(death - birth)`. Different formula → values diverge (two_blobs: sklearn `[1,0.707,...]` vs ferrolearn all `1.0`). |
+//! | REQ-6 (`labels_` integer numbering) | NOT-STARTED | open prereq blocker #1071. sklearn numbers clusters by its condensed-tree/EOM traversal; ferrolearn by `label_counter` selection order (`extract_clusters`). Partition matches up-to-permutation; absolute integers diverge. |
+//! | REQ-7 (`cluster_selection_method` eom/leaf + allow_single_cluster + max_cluster_size) | NOT-STARTED | open prereq blocker #1072. sklearn `cluster_selection_method` default `'eom'` + `'leaf'`, `allow_single_cluster`, `max_cluster_size`; ferrolearn EOM-only, none of these params. |
+//! | REQ-8 (`metric`/`alpha`/`algorithm`/`leaf_size`/`n_jobs`) | NOT-STARTED | open prereq blocker #1073. sklearn `metric` (many), `alpha` (1.0), `algorithm` (auto/brute/kd_tree/ball_tree), `leaf_size`, `n_jobs`; ferrolearn euclidean-only Prim O(n²), none. |
+//! | REQ-9 (PyO3 binding) | NOT-STARTED | open prereq blocker #1074. No `_RsHDBSCAN` (grep empty); `import ferrolearn` cannot reach HDBSCAN. |
+//! | REQ-10 (`centroids_`/`medoids_`/`n_features_in_` + `store_centers`) | NOT-STARTED | open prereq blocker #1075. sklearn `store_centers` → `centroids_`/`medoids_`, plus `n_features_in_`; `FittedHdbscan` exposes `labels_`/`probabilities_` only (+ `n_clusters()` helper sklearn lacks). |
+//! | REQ-11 (error ABI + n_samples==1) | NOT-STARTED | open prereq blocker #1076. sklearn `InvalidParameterError` vs ferrolearn `FerroError`; single-point/edge handling vs sklearn. |
+//! | REQ-12 (`cluster_selection_epsilon` exact semantics) | NOT-STARTED | open prereq blocker #1077. sklearn DBSCAN-like flat-cut epsilon in `_tree.pyx`; ferrolearn `extract_clusters` `above_epsilon = split_dist > eps` is a simplified approximation. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1078. `hdbscan.rs` imports `ndarray`/`num-traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -164,8 +191,12 @@ fn sq_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
 }
 
-/// Compute the core distance for each point: distance to the k-th nearest
-/// neighbor (0-indexed, so we need the (k-1)-th element after sorting).
+/// Compute the core distance for each point: the distance to its
+/// `min_samples`-th nearest neighbor, where the `min_samples`-nearest-neighbors
+/// query INCLUDES the point itself (self at sorted index 0, distance 0). This is
+/// therefore `sorted_dists[min_samples - 1]`, matching sklearn
+/// (`sklearn/cluster/_hdbscan/hdbscan.py:351-352`,
+/// `core_distances = neighbors_distances[:, -1]` of the `min_samples` NN query).
 fn compute_core_distances<F: Float>(x: &Array2<F>, min_samples: usize) -> Vec<F> {
     let n = x.nrows();
     let mut core_dists = vec![F::zero(); n];
@@ -183,8 +214,11 @@ fn compute_core_distances<F: Float>(x: &Array2<F>, min_samples: usize) -> Vec<F>
             })
             .collect();
         dists.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        // k-th nearest neighbor (index min_samples since index 0 is self with dist 0)
-        let k = min_samples.min(n - 1);
+        // sklearn core distance = sorted_dists[min_samples-1] (the min_samples-nearest-
+        // neighbors query includes self at index 0), sklearn/cluster/_hdbscan/hdbscan.py:351-352.
+        // `fn fit` validates min_samples >= 1, so this never underflows; saturating_sub
+        // is defensive and clamped to the last valid index.
+        let k = min_samples.saturating_sub(1).min(n - 1);
         *cd = dists[k];
     }
     core_dists
