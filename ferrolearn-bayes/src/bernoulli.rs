@@ -38,6 +38,45 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. The non-test production consumer is `_RsBernoulliNB` /
+//! `RsBernoulliNB` (`ferrolearn-python/src/extras.rs`, built via the
+//! `py_classifier!` macro), which exercises `new(alpha, fit_prior, binarize)` /
+//! `fit` / `predict` against the library `FittedBernoulliNB` and is surfaced as
+//! `ferrolearn.BernoulliNB`; plus the in-crate `impl PipelineEstimator for
+//! BernoulliNB` (`fit_pipeline` / `predict_pipeline`). Green verification = the
+//! in-tree `bernoulli` lib tests plus the live-sklearn pins / guards
+//! (`ferrolearn-bayes/tests/divergence_bernoulli.rs`):
+//! `divergence_bernoulli_binarize_default_is_zero` (#911, now PASSING after
+//! `new()` defaults `binarize = Some(0.0)`) and
+//! `divergence_bernoulli_negative_alpha_rejected` (#912, now PASSING after the
+//! `alpha < 0` reject landed), then the green guards
+//! `green_bernoulli_value_on_binary_data`,
+//! `green_bernoulli_with_binarize_threshold_value`,
+//! `green_bernoulli_class_prior_length_only`,
+//! `green_bernoulli_score_accuracy` — all passing. Cites use symbol anchors
+//! (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live oracle =
+//! installed sklearn 1.5.2. (Note: this table follows the in-tree pin numbering
+//! and REQ grouping; the design doc `.design/bayes/bernoulli.md` uses a wider
+//! REQ split — REQ-3/#906 binarize-default and REQ-6/#907 alpha-reject there
+//! correspond to the now-green #911 / #912 pins here.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`feature_log_prob_` smoothing + Bernoulli `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `fn fit` for `BernoulliNB` sets `p = (fc + alpha) / (n_c + 2*alpha)`, `log_prob[[ci,j]] = p.ln()`, `log_neg_prob[[ci,j]] = (1-p).ln()` — the algebraic identity of `_update_feature_log_prob` (`naive_bayes.py:1194-1201`, `log(fc+alpha) - log(cc+alpha*2)`); `impl BaseNB::joint_log_likelihood` for `FittedBernoulliNB` computes `log_prior[ci] + sum_j [x*log_prob + (1-x)*log_neg_prob]`, the row-wise form of `X @ (flp-neg).T + class_log_prior_ + neg.sum(axis=1)` (`naive_bayes.py:1203-1219`); the four `predict_*` delegate to the `BaseNB` provided methods. Non-test consumer: `RsBernoulliNB::fit`/`predict` (`ferrolearn-python/src/extras.rs`, `py_classifier!`) → `FittedBernoulliNB`, surfaced as `ferrolearn.BernoulliNB`; plus `impl PipelineEstimator`. Verified: green guard `green_bernoulli_value_on_binary_data` — on `Xbin=[[1,1,0],[1,0,0],[1,1,0],[0,0,1],[0,1,1],[0,0,1]]`, `y=[0,0,0,1,1,1]`, `q=[[1,0,0],[0,1,1]]` (where sklearn `binarize=0.0` ≡ ferro path, `np.allclose==True`), sklearn `predict_proba(q) = [[0.9142857142857143, 0.08571428571428572], [0.08571428571428567, 0.9142857142857145]]`, `predict_log_proba(q) = [[-0.0896121586896872, -2.456735772821304], [-2.4567357728213044, -0.08961215868968697]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. In-tree `test_bernoulli_nb_fit_predict` / `test_bernoulli_nb_predict_proba_sums_to_one` / `test_bernoulli_nb_predict_proba_ordering`. |
+//! | REQ-2 (`binarize` DEFAULT `0.0` + strictly-greater threshold-application VALUE) | SHIPPED | `pub fn new` sets `binarize: Some(F::zero())`, mirroring `BernoulliNB.__init__(..., binarize=0.0, ...)` (`naive_bayes.py:1164`), and `fn binarize_array` is `x.mapv(\|v\| if v > threshold { 1 } else { 0 })` — strictly-greater — applied in `fit`/`partial_fit`/`joint_log_likelihood` when `binarize` is `Some`, mirroring `binarize(X, threshold=self.binarize)` (strictly `X > threshold`) invoked by `_check_X_y`/`_check_X` only when `binarize is not None` (`naive_bayes.py:1176-1187`). Non-test consumer: `RsBernoulliNB` builds `with_binarize(binarize)` (default `0.0`); the threshold path feeds `fit`/`predict`. Verified: green pin `divergence_bernoulli_binarize_default_is_zero` (#911, now PASSING) — on NON-binary `Xc=[[2,0,1],[0,3,0],[1,1,2],[0,0,4]]`, `yc=[0,0,1,1]`, `BernoulliNB::new().predict(Xc) = [1,0,1,1]` and `predict_proba(Xc)[1] = [0.6666666666666669, 0.3333333333333332]` (sklearn default-binarize values); plus green guard `green_bernoulli_with_binarize_threshold_value` — `with_binarize(0.5)` on continuous data matches sklearn `BernoulliNB(binarize=0.5)` `predict_proba`/`predict` to ≤1e-12 (`0.5→0`, strictly-greater). In-tree `test_bernoulli_nb_default` / `test_bernoulli_nb_binarize_threshold` / `test_bernoulli_nb_binarize_zero_threshold`. |
+//! | REQ-3 (`alpha >= 0` validation) | SHIPPED | `fn fit` rejects `self.alpha < F::zero()` with `FerroError::InvalidParameter { name: "alpha", reason: "alpha must be >= 0 (sklearn Interval[0, inf))" }`, mirroring the shared `_BaseDiscreteNB._parameter_constraints` `alpha: [Interval(Real, 0, None, closed="left"), "array-like"]` (`naive_bayes.py:530`) merged into `BernoulliNB._parameter_constraints` (`naive_bayes.py:1154-1157`) — the HARD `>= 0` reject `_validate_params` enforces at `fit` (distinct from `_check_alpha`'s `1e-10` floor, `naive_bayes.py:604-626`, which only fires under `force_alpha=false`; `alpha=0` stays allowed). Non-test consumer: `RsBernoulliNB::fit` maps the `FerroError` → `PyValueError`. Verified: green pin `divergence_bernoulli_negative_alpha_rejected` (#912, now PASSING): `with_alpha(-0.5).fit(Xc,yc)` returns `Err` (sklearn raises `InvalidParameterError`, "The 'alpha' parameter of BernoulliNB must be a float in the range [0.0, inf) or an array-like. Got -0.5 instead."). |
+//! | REQ-4 (`class_log_prior_` empirical/uniform/explicit + LENGTH-only validation — MATCH) | SHIPPED | `fn fit` sets the empirical `log_prior[ci] = (n_c / n).ln()` (default), the uniform `(1 / n_classes).ln()` (`fit_prior == false`), and the explicit `log_prior[ci] = p.ln()` after validating ONLY `priors.len() != n_classes`, mirroring `_update_class_log_prior` (`naive_bayes.py:580-602`: `log(class_count_)-log(class_count_.sum())` `:600`, `-log(n_classes)` `:602`, `log(class_prior)` after length-only check `:589-591`) — discrete NB has NO sum-to-1 / non-negativity check (UNLIKE GaussianNB). A deliberate MATCH. Non-test consumer: `RsBernoulliNB::predict` → `fitted.predict` (the `class_log_prior_` term enters the jll additively); `with_fit_prior` passes `fit_prior` through. Verified: green guard `green_bernoulli_class_prior_length_only` — `with_class_prior([0.5,0.3]).fit(Xbin,y)` SUCCEEDS (sum 0.8; sklearn `class_log_prior_ = log([0.5,0.3])`, inter-class gap `0.5108256237659908`), `with_class_prior([0.5]).fit` errors. In-tree `test_bernoulli_nb_class_prior` / `test_bernoulli_nb_class_prior_wrong_length`. (Wrong-length error TYPE differs — `InvalidParameter` vs `ValueError` — folded into REQ-9's surface gap.) |
+//! | REQ-5 (`force_alpha` floor + `fit_prior` toggle) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` floor `1e-10` unless `force_alpha`, `naive_bayes.py:604-626`) and selects empirical/uniform prior on `fit_prior`. Non-test consumer: `RsBernoulliNB` passes `fit_prior` through `with_fit_prior`; `alpha` through `with_alpha`. Verified: with `force_alpha=true` default and `alpha=1`, `score(Xbin,y) = 1.0` (green `green_bernoulli_score_accuracy`); `clamp_alpha(1, true) = 1`. In-tree `test_bernoulli_nb_default`; `base.rs` `test_check_alpha_*`. |
+//! | REQ-6 (`score` mean accuracy) | SHIPPED | `FittedBernoulliNB::score` computes `correct / n` over `predict`, the `ClassifierMixin.score` analog. Non-test consumer: in-crate + the library surface (the PyO3 `score` exposure gap is REQ-9). Verified: green guard `green_bernoulli_score_accuracy` — `BernoulliNB::new().fit(Xbin,y).score(Xbin,y) = 1.0` (sklearn `BernoulliNB().fit(Xbin,y).score(Xbin,y) == 1.0`). |
+//! | REQ-7 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedBernoulliNB::partial_fit` binarizes when `binarize` is `Some`, accumulates `class_counts`/`feature_counts` for each EXISTING class, then recomputes `log_prob`/`log_neg_prob` (same `p=(fc+alpha)/(n_c+2*alpha)` smoothing) and `log_prior`, mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-resmooth (`naive_bayes.py:629-708`, `_count` → `_update_feature_log_prob` → `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: in-tree `test_bernoulli_nb_partial_fit` / `test_bernoulli_nb_partial_fit_shape_mismatch` — chunked `partial_fit` over already-fitted classes reproduces the accumulate-then-resmooth path (sklearn `partial_fit` over chunks == `fit` on the whole). KNOWN GAP: `partial_fit` has NO `classes=` argument — `FittedBernoulliNB::partial_fit(&mut self, x, y)` loops only over the already-fitted `self.classes`, so a brand-new label is silently dropped (sklearn's `_BaseDiscreteNB.partial_fit` binarizes against the full `classes=` list from the first call, `naive_bayes.py:629-708`); this `classes=`/unseen-label path is NOT-STARTED (folded into #908) and is documented-not-pinned in the divergence header. |
+//! | REQ-8 (`sample_weight` + `partial_fit` `classes=`) | NOT-STARTED | open prereq blocker **#908**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` become weighted (`naive_bayes.py:1189-1192`) — e.g. `BernoulliNB().fit(Xbin,y,sample_weight=[1,2,1,1,1,3]).feature_count_ = [[4,2,0],[0,1,5]]`, `class_count_ = [4,5]`. ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`; also no `classes=` argument on `partial_fit` (the unseen-label sub-gap of REQ-7). |
+//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#909**. sklearn exposes `feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_` (`naive_bayes.py:1088-1117`); `hasattr(fitted, 'coef_') == False` — `BernoulliNB` in 1.5.2 exposes NO `coef_`/`intercept_` (the deprecated `_BaseDiscreteNB` properties are gone), so those are NOT a gap. `FittedBernoulliNB` stores `log_prob`/`log_neg_prob`/`log_prior`/`feature_counts`/`class_counts` as PRIVATE fields with no accessor — only `classes()` (via `HasClasses`) is public. `_RsBernoulliNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, binarize)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters. Also subsumes the `class_prior` wrong-length MESSAGE/TYPE-parity sub-item (REQ-4: `InvalidParameter` vs `ValueError`) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#910**. `bernoulli.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -61,6 +100,8 @@ pub struct BernoulliNB<F> {
     pub alpha: F,
     /// Optional threshold for binarizing features. Values strictly above this
     /// threshold are set to 1; others to 0. If `None`, features are used as-is.
+    /// Default: `Some(0.0)` (binarize at 0), mirroring scikit-learn's
+    /// `BernoulliNB(binarize=0.0)` (`sklearn/naive_bayes.py:1164`).
     pub binarize: Option<F>,
     /// Optional user-supplied class priors. If set, these are used
     /// instead of computing priors from the data.
@@ -78,13 +119,18 @@ pub struct BernoulliNB<F> {
 impl<F: Float> BernoulliNB<F> {
     /// Create a new `BernoulliNB` with default settings.
     ///
-    /// Default: `alpha = 1.0`, `binarize = None`, `class_prior = None`,
-    /// `fit_prior = true`, `force_alpha = true`.
+    /// Default: `alpha = 1.0`, `binarize = Some(0.0)`, `class_prior = None`,
+    /// `fit_prior = true`, `force_alpha = true`. The `binarize = Some(0.0)`
+    /// default mirrors scikit-learn's `BernoulliNB(binarize=0.0)`
+    /// (`sklearn/naive_bayes.py:1164`): by default `X` is binarized at threshold
+    /// `0.0` (values `> 0` become `1`) on every fit/predict. Set the field to
+    /// `None` (e.g. via direct assignment) to disable binarization, matching
+    /// sklearn's explicit `binarize=None`.
     #[must_use]
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
-            binarize: None,
+            binarize: Some(F::zero()),
             class_prior: None,
             fit_prior: true,
             force_alpha: true,
@@ -208,6 +254,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Bernoul
         } else {
             x.clone()
         };
+
+        if self.alpha < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "alpha must be >= 0 (sklearn Interval[0, inf))".into(),
+            });
+        }
 
         // Collect sorted unique classes.
         let mut classes: Vec<usize> = y.to_vec();
@@ -684,7 +737,8 @@ mod tests {
     fn test_bernoulli_nb_default() {
         let model = BernoulliNB::<f64>::default();
         assert_relative_eq!(model.alpha, 1.0, epsilon = 1e-15);
-        assert!(model.binarize.is_none());
+        // sklearn default: binarize=0.0 (naive_bayes.py:1164).
+        assert_eq!(model.binarize, Some(0.0));
     }
 
     #[test]

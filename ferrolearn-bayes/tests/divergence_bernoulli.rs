@@ -171,7 +171,6 @@ fn nonbinary_fixture() -> (Array2<f64>, Array1<usize>) {
 /// `predict(Xc)=[1,0,1,1]`; ferrolearn (binarize=None, raw counts) diverges at
 /// rows 1 and 2. Tracking: #911
 #[test]
-#[ignore = "divergence: BernoulliNB::new() defaults binarize=None vs sklearn binarize=0.0; tracking #911"]
 fn divergence_bernoulli_binarize_default_is_zero() {
     let (xc, yc) = nonbinary_fixture();
     let fitted = BernoulliNB::<f64>::new().fit(&xc, &yc).unwrap();
@@ -241,7 +240,6 @@ fn divergence_bernoulli_binarize_default_is_zero() {
 /// passes -0.5 through unchanged (the floor only fires under force_alpha=false).
 /// Tracking: #912
 #[test]
-#[ignore = "divergence: BernoulliNB::fit accepts alpha<0 vs sklearn InvalidParameterError; tracking #912"]
 fn divergence_bernoulli_negative_alpha_rejected() {
     let (xc, yc) = nonbinary_fixture();
 
