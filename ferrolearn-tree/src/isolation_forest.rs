@@ -45,7 +45,7 @@
 //! | REQ-4 | `score_samples = -2^(-mean/c)` ∈ [-1,0], higher = normal (`_iforest.py:451`) | SHIPPED |
 //! | REQ-5 | `decision_function = score_samples - offset_` (`_iforest.py:410`) | SHIPPED |
 //! | REQ-6 | `offset_` = `-0.5` for `Contamination::Auto`, else numpy-percentile of train scores (`_iforest.py:341-353`); `Contamination{Auto,Value}` enum | SHIPPED |
-//! | REQ-8 | `predict` = `-1 where decision_function(X) < 0 else 1` (`_iforest.py:360-372`) | SHIPPED |
+//! | REQ-8 | `predict` = `-1 where decision_function(X) < 0 else 1` (`_iforest.py:374-378`) | SHIPPED |
 //! | REQ-9 | `random_state` reproducibility (ferrolearn-internal; numpy-MT parity = RNG boundary #730) | SHIPPED |
 //! | REQ-7a | `max_features` + `bootstrap` params + `max_samples` int/'auto'-string representation | NOT-STARTED (#728) |
 //! | REQ-7b | Subsample WITHOUT replacement (`bootstrap=False`) | NOT-STARTED (#729) |

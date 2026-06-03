@@ -63,6 +63,7 @@
 //! | REQ-8b | decision_tree exact-MSE-tie split-feature choice (→ multiclass GBC predict_proba drift) | NOT-STARTED (#739) |
 //! | REQ-9 | `subsample<1.0` numpy-parity (stochastic GB) | NOT-STARTED (#743, RNG boundary) |
 //! | REQ-10 | Early stopping (`n_iter_no_change`/`validation_fraction`/`tol`) + `ccp_alpha`/`max_features`/`min_impurity_decrease`/`init`/`staged_predict` | NOT-STARTED (#741) |
+//! | REQ-11 | PyO3 binding fidelity — RsGradientBoosting{Regressor,Classifier} thin (no loss/subsample/predict_proba/feature_importances_/classes_) | NOT-STARTED (#759) |
 //! | REQ-12 | ferray substrate migration | NOT-STARTED (#744) |
 
 use ferrolearn_core::error::FerroError;

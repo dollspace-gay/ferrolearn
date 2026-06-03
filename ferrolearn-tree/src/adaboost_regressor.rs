@@ -32,7 +32,7 @@
 //! **Resampling boundary:** ferrolearn fits each tree on a *deterministic
 //! systematic resample* (`resample_weighted`, no RNG) where sklearn uses a
 //! *numpy weighted bootstrap-with-replacement* draw (`random_state.choice`,
-//! `_weight_boosting.py:1160`). End-to-end prediction parity with sklearn is
+//! `_weight_boosting.py:1162-1167`). End-to-end prediction parity with sklearn is
 //! therefore infeasible (#705), but ferrolearn's fit is fully deterministic
 //! and reproducible — the per-step formulas below are oracle-grounded.
 //!
@@ -41,7 +41,7 @@
 //! | REQ-1 | Param defaults: `n_estimators=50`, `learning_rate=1.0`, `loss=Linear`, base `max_depth=Some(3)` | SHIPPED |
 //! | REQ-2 | `AdaBoostLoss` Linear/Square/Exponential loss normalization by `error_max` (`_weight_boosting.py:1183-1188`) | SHIPPED |
 //! | REQ-3 | `beta = err/(1-err)`, `estimator_weight = learning_rate * ln(1/beta)`, reweight `beta^((1-loss)*learning_rate)` (`:1203,:1206,:1209-1211`) | SHIPPED |
-//! | REQ-4 | Weighted-median `predict` = first sorted position whose weight CDF >= 0.5 * total (`_get_median_predict` `:799-809`) | SHIPPED |
+//! | REQ-4 | Weighted-median `predict` = first sorted position whose weight CDF >= 0.5 * total (`_get_median_predict` `:1215-1230`) | SHIPPED |
 //! | REQ-8 | `feature_importances_` = weighted-normalized mean of per-tree importances | SHIPPED |
 //! | REQ-6 | Pluggable base estimator + `estimator_errors_` attribute | NOT-STARTED (#704) |
 //! | REQ-7 | numpy weighted-bootstrap resampling / end-to-end sklearn parity | NOT-STARTED (#705, boundary) |

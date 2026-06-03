@@ -49,6 +49,7 @@
 //! | REQ-4 | Worse-than-random stop `err >= 1 - 1/K` (`:685`) | SHIPPED |
 //! | REQ-6 | Weighted base-estimator fit (deterministic, no resample) — `predict` matches sklearn SAMME end-to-end (`:664`; verified on iris N≤50, K=3) | SHIPPED |
 //! | REQ-7 | Perfect-fit `err<=0 → estimator_weight=1.0` + stop, before worse-than-random check (`:679-680`) | SHIPPED |
+//! | REQ-11 | End-to-end SAMME `predict` parity vs live `AdaBoostClassifier(algorithm='SAMME')` — 0 mismatches (iris K=3 N≤50, binary N≤50) | SHIPPED |
 //! | REQ-10 | `feature_importances_` = weighted-normalized mean of per-stump importances | SHIPPED |
 //! | REQ-5 | `decision_function`/`predict_proba` exact form (`decision/(K-1)` scaling + softmax, `:799-870`) | NOT-STARTED (#712) |
 //! | REQ-8 | SAMME.R `_boost_real` reweight correct for `K>2` (full `y_coding` xlogy, `:644-656`) | NOT-STARTED (#711) |
