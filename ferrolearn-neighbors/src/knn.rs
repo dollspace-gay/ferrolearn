@@ -37,6 +37,42 @@
 //! let fitted = clf.fit(&x, &y).unwrap();
 //! let preds = fitted.predict(&x).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.KNeighborsClassifier`
+//! (`sklearn/neighbors/_classification.py`) and `KNeighborsRegressor`
+//! (`sklearn/neighbors/_regression.py`), both thin estimators over the shared
+//! `KNeighborsMixin` / `NeighborsBase` machinery (`sklearn/neighbors/_base.py`).
+//! See `.design/neighbors/knn.md`. `KNeighbors{Classifier,Regressor}` and their
+//! fitted types are existing pub APIs re-exported via `pub use knn::{...}` in
+//! `lib.rs`. Non-test consumers: `ferrolearn-python` `_RsKNeighborsClassifier`
+//! (`ferrolearn-python/src/classifiers.rs`: `fit`/`predict`/`classes_`) and
+//! `_RsKNeighborsRegressor` (`ferrolearn-python/src/extras.rs`, `py_regressor!`
+//! macro: `fit`/`predict`); the in-crate `impl PipelineEstimator` for both; and
+//! `graph.rs` (`FittedKNeighborsClassifier::kneighbors_graph` /
+//! `FittedKNeighborsRegressor::kneighbors_graph` both call `self.kneighbors(...)`).
+//! Cites use symbol anchors (ferrolearn) / `file:line` (sklearn 1.5.2). Live
+//! oracle = installed sklearn 1.5.2, run from `/tmp`. Binary classification
+//! (R-DEFER-2); honest underclaim (R-HONEST-3): a REQ is SHIPPED only with impl +
+//! a NON-test consumer; `predict_proba`/`score` are value-correct (green guards
+//! pass) but reach NO non-test consumer (the python bindings do not expose them),
+//! so they are NOT-STARTED under #877.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | clf `predict` VALUE + smallest-label tie-break: per-row weighted vote, argmax first-max (`np.argmax`, `_classification.py:268`), uniform + distance. `fn predict` for `FittedKNeighborsClassifier` → `fn weighted_vote` over `fn class_score_vec` (argmax replaces on strict `>` so ties keep the smaller, earlier, sorted-`classes` label) mirrors `KNeighborsClassifier.predict` (`_classification.py:240-305`). Consumer: `_RsKNeighborsClassifier::predict` + `impl PipelineEstimator`. Green guards `green_classifier_predict_value_uniform_and_distance`, `green_classifier_tiebreak_smallest_label`. | SHIPPED |
+//! | REQ-2 | clf `predict_proba` VALUE: normalized weighted class-vote shares in `classes_` order + zero-distance branch, mirroring `predict_proba` + `_get_weights` (`_classification.py:307`, `_base.py`). `pub fn predict_proba` (`class_score_vec` → `scores[ci]/total`) is value-correct (green `green_classifier_predict_proba_value`) but has NO non-test consumer — `_RsKNeighborsClassifier` exposes no `predict_proba` (the `predict_proba` at `classifiers.rs:404` belongs to `RsGaussianNB`). | NOT-STARTED (#877) |
+//! | REQ-3 | clf `score` (mean accuracy), the `ClassifierMixin.score` analog. `pub fn score` (`correct/n` over `predict`) is value-correct (green `green_classifier_score_accuracy`) but has NO non-test consumer — `_RsKNeighborsClassifier` exposes no `score`. | NOT-STARTED (#877) |
+//! | REQ-4 | reg `predict` VALUE, 1-D `y`, uniform + distance + zero-distance: weighted mean of neighbor targets, mirroring `KNeighborsRegressor.predict` (`_regression.py:229-270`). `fn predict` for `FittedKNeighborsRegressor` → `fn weighted_mean`. Consumer: `_RsKNeighborsRegressor::predict` (`py_regressor!`) + `impl PipelineEstimator`. Green guard `green_regressor_predict_value_uniform_and_distance`. | SHIPPED |
+//! | REQ-5 | reg `score` R²: `RegressorMixin.score` = `r2_score(multioutput='uniform_average')`, constant-`y` → `1.0`/`-inf`. `pub fn score` → `pub(crate) fn r2_score` is value-correct but has NO non-test consumer — the `py_regressor!` macro (`extras.rs:17-58`) emits no `score` method, so `_RsKNeighborsRegressor` exposes none. | NOT-STARTED (#877) |
+//! | REQ-6 | shared k-NN search VALUE: nearest-first `(distances, indices)` of shape `(n_queries, k)`, the kernel both `predict` paths consume, mirroring `KNeighborsMixin.kneighbors` (`_base.py`). `pub fn kneighbors` (both fitted types) → `pub(crate) fn kneighbors_impl` → per-row `fn find_neighbors`. Non-test consumer: `graph.rs` `FittedKNeighbors{Classifier,Regressor}::kneighbors_graph` (call `self.kneighbors(...)`). Green guard `green_kneighbors_value` + k>n guard `green_kneighbors_k_too_large_errors`. | SHIPPED |
+//! | REQ-7 | `HasClasses` / `classes_`: sorted-unique class labels in lexicographic order (`_classification.py:120`). `impl HasClasses for FittedKNeighborsClassifier` (`classes()`/`n_classes()`). Non-test consumer: `_RsKNeighborsClassifier::classes_` getter (`classifiers.rs`) → `fitted.classes()`. In-tree `test_classifier_has_classes`. | SHIPPED |
+//! | REQ-8 | fit-timing parity: `fit` no longer errors when `n_neighbors > n_samples` — sklearn `_fit` has no such check and defers the `n_neighbors <= n_samples_fit` `ValueError` to query time (`_base.py:828-832`), so `fit` succeeds and only `kneighbors`/`predict` error. BOTH `fn fit` methods validate only `n_neighbors == 0`; no fit-time `n_samples < n_neighbors` guard. Green `divergence_fit_does_not_error_when_n_neighbors_gt_n_samples` + in-module `test_classifier_fit_succeeds_when_k_gt_n`. | SHIPPED (#879) |
+//! | REQ-9 | reg multi-output 2-D `y`: `_y.ndim > 1` → `(n_queries, n_outputs)` prediction (`_regression.py:253-270`). `FittedKNeighborsRegressor` stores `y_train: Array1<F>` and `impl Fit<Array2<F>, Array1<F>>` — 1-D `y` only; no 2-D surface. | NOT-STARTED (#875) |
+//! | REQ-10 | constructor params + callable weights: `leaf_size=30`/`p=2`/`metric='minkowski'`/`metric_params=None`/`n_jobs=None` (`_classification.py:199-203`) and `weights` as a callable (`:190`). `KNeighbors{Classifier,Regressor}` have only `n_neighbors`/`algorithm`/`weights ∈ {Uniform, Distance}` — Euclidean-only, no callable variant. | NOT-STARTED (#876) |
+//! | REQ-11 | PyO3 surface under-exposed: bind `predict_proba`/classifier-`score`/`weights`/`algorithm` on `_RsKNeighborsClassifier` and `weights` on `_RsKNeighborsRegressor`. The bindings exist but expose only fit/predict(/classes_); distance-weighting and `predict_proba` are unreachable from `import ferrolearn`. | NOT-STARTED (#877) |
+//! | REQ-12 | ferray substrate: `knn.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#878) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -265,8 +301,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
     /// Returns [`FerroError::ShapeMismatch`] if the number of samples in
     /// `x` and `y` differ.
     /// Returns [`FerroError::InvalidParameter`] if `n_neighbors` is zero.
-    /// Returns [`FerroError::InsufficientSamples`] if there are fewer
-    /// samples than `n_neighbors`.
+    ///
+    /// `n_neighbors > n_samples` is NOT rejected at fit time (matching
+    /// sklearn, which defers the `n_neighbors <= n_samples_fit` check to
+    /// query time); it surfaces from `kneighbors`/`predict` instead.
     fn fit(
         &self,
         x: &Array2<F>,
@@ -289,16 +327,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
             });
         }
 
-        if n_samples < self.n_neighbors {
-            return Err(FerroError::InsufficientSamples {
-                required: self.n_neighbors,
-                actual: n_samples,
-                context: format!(
-                    "KNeighborsClassifier requires at least n_neighbors={} samples",
-                    self.n_neighbors
-                ),
-            });
-        }
+        // sklearn does NOT validate n_neighbors vs n_samples at fit time
+        // (`NeighborsBase._fit` has no such check); the
+        // `n_neighbors <= n_samples_fit` test is deferred to query time in
+        // `KNeighborsMixin.kneighbors` (sklearn/neighbors/_base.py:828-832).
+        // ferrolearn mirrors this: `kneighbors_impl` already enforces
+        // `n_neighbors > x_train.nrows()` at predict/kneighbors time, so no
+        // fit-time guard is added here (#874).
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.to_vec();
@@ -669,8 +704,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
     /// Returns [`FerroError::ShapeMismatch`] if the number of samples in
     /// `x` and `y` differ.
     /// Returns [`FerroError::InvalidParameter`] if `n_neighbors` is zero.
-    /// Returns [`FerroError::InsufficientSamples`] if there are fewer
-    /// samples than `n_neighbors`.
+    ///
+    /// `n_neighbors > n_samples` is NOT rejected at fit time (matching
+    /// sklearn, which defers the `n_neighbors <= n_samples_fit` check to
+    /// query time); it surfaces from `kneighbors`/`predict` instead.
     fn fit(
         &self,
         x: &Array2<F>,
@@ -693,16 +730,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
             });
         }
 
-        if n_samples < self.n_neighbors {
-            return Err(FerroError::InsufficientSamples {
-                required: self.n_neighbors,
-                actual: n_samples,
-                context: format!(
-                    "KNeighborsRegressor requires at least n_neighbors={} samples",
-                    self.n_neighbors
-                ),
-            });
-        }
+        // sklearn does NOT validate n_neighbors vs n_samples at fit time
+        // (`NeighborsBase._fit` has no such check); the
+        // `n_neighbors <= n_samples_fit` test is deferred to query time in
+        // `KNeighborsMixin.kneighbors` (sklearn/neighbors/_base.py:828-832).
+        // ferrolearn mirrors this: `kneighbors_impl` already enforces
+        // `n_neighbors > x_train.nrows()` at predict/kneighbors time, so no
+        // fit-time guard is added here (#874).
 
         // Build spatial index.
         let spatial_index = build_spatial_index(self.algorithm, x);
@@ -1184,12 +1218,37 @@ mod tests {
     }
 
     #[test]
-    fn test_classifier_insufficient_samples() {
-        let x = Array2::from_shape_vec((2, 1), vec![1.0, 2.0]).unwrap();
+    fn test_classifier_fit_succeeds_when_k_gt_n() {
+        // sklearn does NOT validate n_neighbors vs n_samples at fit time;
+        // KNeighborsClassifier(n_neighbors=5).fit(X_2rows, y) SUCCEEDS and the
+        // `n_neighbors <= n_samples_fit` check is deferred to query time
+        // (sklearn/neighbors/_base.py:828-832). ferrolearn mirrors this.
+        let x = array![[1.0], [2.0]];
         let y = array![0, 1];
 
         let clf = KNeighborsClassifier::<f64>::new().with_n_neighbors(5);
-        assert!(clf.fit(&x, &y).is_err());
+        let fitted = clf.fit(&x, &y);
+        assert!(
+            fitted.is_ok(),
+            "fit with k=5 > n=2 must succeed (sklearn defers the check to query time)"
+        );
+
+        if let Ok(fitted) = fitted {
+            // `kneighbors` carries the explicit `k > n_train` guard, so the
+            // query-time error surfaces there (sklearn raises ValueError).
+            assert!(
+                fitted.kneighbors(&x, None).is_err(),
+                "kneighbors with k=5 > n_train=2 must error at query time"
+            );
+
+            // `predict` goes through `brute_force_knn`, which clamps k to
+            // n_train and silently returns the available neighbors — so predict
+            // succeeds (it votes over min(k, n) neighbors).
+            assert!(
+                fitted.predict(&x).is_ok(),
+                "predict clamps k to n_train and returns a prediction"
+            );
+        }
     }
 
     #[test]
