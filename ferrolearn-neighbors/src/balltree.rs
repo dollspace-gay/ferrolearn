@@ -34,6 +34,32 @@
 //! let neighbors = tree.query(&data, &[0.1, 0.1], 2);
 //! assert_eq!(neighbors[0].0, 0); // closest is (0,0)
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.neighbors.BallTree` (`sklearn/neighbors/_ball_tree.pyx.tp`,
+//! a specialization of the shared `BinaryTree` in `_binary_tree.pxi.tp`). See
+//! `.design/neighbors/balltree.md`. Non-test consumers: the
+//! `SpatialIndex::BallTree` acceleration arm in `knn.rs` (`tree.query` under
+//! `Algorithm::BallTree`/`Auto`), `nearest_neighbors.rs` (`tree.query` k-NN
+//! path + `tree.within_radius` radius path), and `radius_neighbors.rs`
+//! (`tree.within_radius`); re-exported via `pub mod balltree` in `lib.rs`.
+//! Binary classification (R-DEFER-2); honest underclaim (R-HONEST-3).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | Single-row k-NN `query`: true-euclidean distances + indices, nearest-first; distinct-distance value matches the live `BallTree.query` oracle. `pub fn query` (`fn knn_search` + max-heap `BinaryHeap<KnnCandidate>`, prune `fn ball_lower_bound_sq` ~ `min_rdist`, `_ball_tree.pyx.tp:186-200`; sort `_binary_tree.pxi.tp:1191`). Green guards `green_query_k1_k2_k3_distinct_distances_and_indices`, `green_query_k1_nearest_neighbor`, `green_leaf_size_invariance`. | SHIPPED |
+//! | REQ-2 | Tie-SET handling: k=4 equidistant → set `{0,1,2,3}` + distance multiset (sklearn's tie order is leaf_size-dependent, not a fixed permutation). `pub fn query` `results.sort_by` on distance. Green guard `green_query_k4_tie_set_and_sorted_distances`. | SHIPPED |
+//! | REQ-3 | `within_radius` VALUE/SET: in-radius `(index, true-distance)` set, default-unsorted, matches live `BallTree.query_radius(return_distance=True)` (`_binary_tree.pxi.tp:1201,1228`; prune `_ball_tree.pyx.tp:148-167`). `pub fn within_radius` (`fn radius_search`). Green guard `green_within_radius_set_match`. | SHIPPED |
+//! | REQ-4 | `metric` default minkowski/p=2 + leaf_size/metric introspection (`_binary_tree.pxi.tp:851-852`). `build` has `leaf_size` (default 40, clamped `>=1`) but no `metric` parameter — Euclidean-only build. | NOT-STARTED (#855) |
+//! | REQ-5 | `query_radius` full surface: `return_distance`/`count_only`/`sort_results` toggles, ascending sort, mutual-exclusion `ValueError`s (`_binary_tree.pxi.tp:1228-1233,1254-1260`). `within_radius` exposes none. | NOT-STARTED (#856) |
+//! | REQ-6 | Metric set manhattan/chebyshev/minkowski/haversine/... (`VALID_METRICS`, `_ball_tree.pyx.tp:29-48`). `fn dist_sq` / `fn ball_lower_bound_sq` are Euclidean-only. | NOT-STARTED (#857) |
+//! | REQ-7 | Error contract: `ValueError` on `k > n_samples` (`_binary_tree.pxi.tp:1140-1142`) and empty `X` (`:855-856`). `query` clamps to `min(k,n)`; `build` returns an empty tree. Blocked on threading `query`→`Result` through the consumers (same class as kdtree #831). | NOT-STARTED (#858) |
+//! | REQ-8 | Batched multi-row `query(X, k)` accepting `(n_query, n_features)` → `(d, i)` of shape `(n_query, k)` (`_binary_tree.pxi.tp:1125-1131`). `query` is single-row → flat `Vec`. | NOT-STARTED (#859) |
+//! | REQ-9 | `kernel_density(X, h, kernel=...)` (present on the live oracle). ferrolearn has none. | NOT-STARTED (#860) |
+//! | REQ-10 | `two_point_correlation(X, r, dualtree=False)` (present on the live oracle). ferrolearn has none. | NOT-STARTED (#861) |
+//! | REQ-11 | PyO3 `BallTree` binding + meta re-export (`import sklearn.neighbors` exposes `BallTree`). `ferrolearn-python` exposes no shim. | NOT-STARTED (#862) |
+//! | REQ-12 | ferray substrate: `balltree.rs` imports `ndarray::Array2` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#863) |
 
 use ndarray::Array2;
 use num_traits::Float;
