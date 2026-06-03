@@ -201,14 +201,14 @@ impl<F: Float + Send + Sync + 'static> FittedTfidfTransformer<F> {
             });
         }
 
-        if let Some(ref idf) = self.idf {
-            if counts.ncols() != idf.len() {
-                return Err(FerroError::ShapeMismatch {
-                    expected: vec![counts.nrows(), idf.len()],
-                    actual: vec![counts.nrows(), counts.ncols()],
-                    context: "FittedTfidfTransformer::transform".into(),
-                });
-            }
+        if let Some(ref idf) = self.idf
+            && counts.ncols() != idf.len()
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![counts.nrows(), idf.len()],
+                actual: vec![counts.nrows(), counts.ncols()],
+                context: "FittedTfidfTransformer::transform".into(),
+            });
         }
 
         let mut result = counts.to_owned();

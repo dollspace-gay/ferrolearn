@@ -141,27 +141,27 @@ impl CountVectorizer {
         vocab.sort();
 
         // Apply max_features: keep the top-N by total corpus frequency.
-        if let Some(max_f) = self.max_features {
-            if vocab.len() > max_f {
-                // Re-count total frequencies for the remaining terms.
-                let mut total_freq: HashMap<String, usize> = HashMap::new();
-                for doc in docs {
-                    let tokens = tokenize(doc, self.lowercase);
-                    for tok in tokens {
-                        if vocab.binary_search(&tok).is_ok() {
-                            *total_freq.entry(tok).or_insert(0) += 1;
-                        }
+        if let Some(max_f) = self.max_features
+            && vocab.len() > max_f
+        {
+            // Re-count total frequencies for the remaining terms.
+            let mut total_freq: HashMap<String, usize> = HashMap::new();
+            for doc in docs {
+                let tokens = tokenize(doc, self.lowercase);
+                for tok in tokens {
+                    if vocab.binary_search(&tok).is_ok() {
+                        *total_freq.entry(tok).or_insert(0) += 1;
                     }
                 }
-                // Sort by descending frequency, then alphabetically for ties.
-                vocab.sort_by(|a, b| {
-                    let fa = total_freq.get(a).unwrap_or(&0);
-                    let fb = total_freq.get(b).unwrap_or(&0);
-                    fb.cmp(fa).then_with(|| a.cmp(b))
-                });
-                vocab.truncate(max_f);
-                vocab.sort(); // restore alphabetical order for consistent indexing
             }
+            // Sort by descending frequency, then alphabetically for ties.
+            vocab.sort_by(|a, b| {
+                let fa = total_freq.get(a).unwrap_or(&0);
+                let fb = total_freq.get(b).unwrap_or(&0);
+                fb.cmp(fa).then_with(|| a.cmp(b))
+            });
+            vocab.truncate(max_f);
+            vocab.sort(); // restore alphabetical order for consistent indexing
         }
 
         // Build vocabulary mapping.

@@ -6,6 +6,30 @@
 //!
 //! This transformer is **stateless** — no fitting is required. Call
 //! [`Transform::transform`] directly.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/preprocessing/_function_transformer.py`
+//! (`class FunctionTransformer(TransformerMixin, BaseEstimator)`). Design doc:
+//! `.design/preprocess/function_transformer.md`. Expected values from the live sklearn 1.5.2
+//! oracle (R-CHAR-3). HONEST (R-HONEST-3): ferrolearn ships a THIN element-wise wrapper —
+//! `func` is a scalar `Fn(F) -> F` applied via `mapv`, NOT sklearn's whole-array `func(X)`;
+//! matches sklearn only on the element-wise/ufunc subset. Consumer: crate re-export
+//! (`lib.rs`, grandfathered S5).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (element-wise forward transform) | SHIPPED (scoped) | `Transform::transform` = `x.mapv(\|v\| (self.func)(v))`, shape-preserving, infallible; mirrors sklearn `_transform` (`_function_transformer.py:375-379`) for element-wise ufunc `func`. Critic-verified bit-identical to live sklearn: `guard_log1p_/expm1_/sqrt_/log_nan_inf_/empty_matrix_*` (5 green) in `tests/divergence_function_transformer.rs`. Consumer: `pub use function_transformer::FunctionTransformer` (`lib.rs:114`). Caveat: scalar `Fn(F)->F`, not array `Fn(X)->X`. |
+//! | REQ-2 (func=None identity default) | NOT-STARTED | open prereq blocker #1112. `new` requires a closure; no identity default (`_identity`, `:22-24`). |
+//! | REQ-3 (whole-array func, headline) | NOT-STARTED | open prereq blocker #1113. `Box<dyn Fn(F)->F>` cannot read the array / change shape; sklearn `func(X)` is array→array (`:375-379`). |
+//! | REQ-4 (inverse_func / inverse_transform) | NOT-STARTED | open prereq blocker #1114. No inverse path (sklearn `:309-325`). |
+//! | REQ-5 (validate / accept_sparse) | NOT-STARTED | open prereq blocker #1115. No input validation (sklearn `:173-182`). |
+//! | REQ-6 (fit / check_inverse / is_fitted) | NOT-STARTED | open prereq blocker #1116. No fit/check_inverse (sklearn `:213-235`, `:184-210`). |
+//! | REQ-7 (feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1117. None (sklearn `:327-373`). |
+//! | REQ-8 (kw_args / inv_kw_args) | NOT-STARTED | open prereq blocker #1118. No kwarg forwarding (sklearn `:93-101`,`:379`). |
+//! | REQ-9 (ctor surface + _parameter_constraints) | NOT-STARTED | open prereq blocker #1119. Only `func`; 7 params + validation missing (R-DEV-2, sklearn `:141-171`). |
+//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1120. No `ferrolearn-python` registration. |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker #1121. `ndarray`/`num_traits`, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Transform;

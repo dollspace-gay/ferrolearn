@@ -16,7 +16,7 @@
 
 use ferrolearn_core::traits::Transform;
 use ferrolearn_preprocess::FunctionTransformer;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Green guard (REQ-1 / AC-1): element-wise `np.log1p` ufunc.
 ///
@@ -33,6 +33,10 @@ use ndarray::{array, Array2};
 /// ```
 /// np.log1p(x) = ln(1+x); Rust analog `f64::ln_1p`.
 #[test]
+#[allow(
+    clippy::approx_constant,
+    reason = "exact live-sklearn-1.5.2 oracle value ln(2)=log1p(1); R-CHAR-3, not the std constant"
+)]
 fn guard_log1p_matches_sklearn_oracle() {
     // oracle: FunctionTransformer(np.log1p).transform([[0,1],[2,3]])
     let expected: [[f64; 2]; 2] = [
@@ -146,6 +150,10 @@ fn guard_sqrt_matches_sklearn_oracle() {
 /// -> [[-Infinity, 0.0], [NaN, 0.6931471805599453]]
 /// ```
 #[test]
+#[allow(
+    clippy::approx_constant,
+    reason = "exact live-sklearn-1.5.2 oracle value ln(2)=log(2); R-CHAR-3, not the std constant"
+)]
 fn guard_log_nan_inf_propagation_matches_sklearn_oracle() {
     let ft = FunctionTransformer::<f64>::new(|v: f64| v.ln());
     let x = array![[0.0, 1.0], [-1.0, 2.0]];
@@ -160,7 +168,11 @@ fn guard_log_nan_inf_propagation_matches_sklearn_oracle() {
     // oracle: np.log(1.0) -> 0.0
     assert_eq!(out[[0, 1]].to_bits(), 0.0_f64.to_bits());
     // oracle: np.log(-1.0) -> NaN
-    assert!(out[[1, 0]].is_nan(), "expected NaN at [1,0], got {}", out[[1, 0]]);
+    assert!(
+        out[[1, 0]].is_nan(),
+        "expected NaN at [1,0], got {}",
+        out[[1, 0]]
+    );
     // oracle: np.log(2.0) -> 0.6931471805599453
     assert_eq!(
         out[[1, 1]].to_bits(),
