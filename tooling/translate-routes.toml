@@ -195,8 +195,11 @@ parity_ops = ["SGDClassifier", "SGDRegressor", "SGDOneClassSVM"]
 # by the same upstream/design reads that govern that estimator's edit.
 [[route]]
 crate_pattern = "ferrolearn-linear/src/lib.rs"
-upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_stochastic_gradient.py"]
-design = ".design/linear/sgd.md"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/__init__.py",
+  "/home/doll/scikit-learn/sklearn/base.py",
+]
+design = ".design/linear/lib.md"
 parity_ops = ["re-export boundary"]
 
 [[route]]

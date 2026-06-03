@@ -7,8 +7,8 @@
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::{RegressorScore, QDA};
-use ndarray::{array, Array1, Array2};
+use ferrolearn_linear::{QDA, RegressorScore};
+use ndarray::{Array1, Array2, array};
 
 /// A minimal regressor whose `predict` returns predictions supplied by the
 /// test, so the test fully controls `y_pred` while `score(&x, &y)` supplies

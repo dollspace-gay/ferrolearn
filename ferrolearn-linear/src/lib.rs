@@ -39,6 +39,28 @@
 //!
 //! All models are generic over `F: num_traits::Float + Send + Sync + 'static`,
 //! supporting both `f32` and `f64`.
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2) for the crate-root RE-EXPORT BOUNDARY (this file is the public-API
+//! surface, not an estimator). Mirrors `sklearn/linear_model/__init__.py` `__all__`
+//! (`:48-98`) + the `score` mixins `sklearn/base.py` `ClassifierMixin.score` (`:738-764`,
+//! accuracy) / `RegressorMixin.score` (`:805-849`, R²). Design doc: `.design/linear/lib.md`.
+//! Per-estimator REQs live in the sibling modules' own routed docs. Score traits
+//! (`ClassifierScore`/`RegressorScore`) are pre-existing crate-root `pub trait`s re-exported
+//! via the meta-crate (`ferrolearn::linear`) — grandfathered public API (goal.md S5); honest
+//! underclaim (R-HONEST-3): no production `.score()` caller yet, and `sample_weight` is
+//! unsupported (REQ-6).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block re-exports every implemented linear/svm/discriminant_analysis/isotonic estimator at the crate root, mirroring sklearn `linear_model.__all__` (`__init__.py:48-98`), broadened per goal.md scope §2. Consumers: meta-crate `pub use ferrolearn_linear as linear` + PyO3 shim `ferrolearn-python/src/{regressors,classifiers,extras}.rs`. |
+//! | REQ-2 (`ClassifierScore::score` == mean accuracy) | SHIPPED | `ClassifierScore` blanket impl body `mean_accuracy` (`correct / n`) mirrors `ClassifierMixin.score` → `accuracy_score` (`base.py:738-764`); critic-verified vs live oracle (`accuracy_score([0,1,2,1],[0,1,1,1])=0.75`). Consumer: grandfathered crate/meta re-export (S5). Underclaim: no production `.score()` caller; single-label (`Output=Array1<usize>`). |
+//! | REQ-3 (`RegressorScore::score` == in-regime R²) | SHIPPED | `RegressorScore` blanket impl body `r2_score` = `1 − ss_res/ss_tot` mirrors `RegressorMixin.score` → `metrics.r2_score` (`base.py:805-849`); matches live oracle `r2_score([3.,5.,2.,7.],[2.5,5.,2.,8.])=0.9152542372881356` (`r2_in_regime_matches_oracle`). Consumer: grandfathered re-export (S5). |
+//! | REQ-4 (constant-y R² edge parity) | SHIPPED | FIXED #1104. `r2_score` now returns `0.0` (was `neg_infinity()`) when `ss_tot==0 ∧ ss_res!=0`, matching `metrics.r2_score` (`_regression.py:891`); zero-residual stays `1.0`. Green: `divergence_r2_constant_ytrue_nonzero_residual_returns_zero` + `r2_constant_ytrue_zero_residual_returns_one`. |
+//! | REQ-5 (`log_proba` behind predict_log_proba) | SHIPPED | FIXED #1105. `log_proba` is now the unclamped `p.ln()`, matching sklearn `predict_log_proba = np.log(predict_proba)` (`discriminant_analysis.py:1059`); `0.0`→`-inf`. Consumers: `logistic_regression.rs`/`logistic_regression_cv.rs`/`qda.rs` `predict_log_proba`. Green: `divergence_log_proba_zero_clamps_instead_of_neg_inf`. |
+//! | REQ-6 (sample_weight on score) | NOT-STARTED | open prereq blocker #1106. The score traits take only `(&self, x, y)`; sklearn `score(self, X, y, sample_weight=None)` (`base.py:738`,`:805`) forwards `sample_weight` into `accuracy_score`/`r2_score`. |
+//! | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker #1107. Helpers + score traits run on `ndarray::{Array1,Array2}` + `num_traits::Float`, not `ferray-core` arrays (R-SUBSTRATE-1). |
 
 pub mod ard;
 pub mod bayesian_ridge;
@@ -199,7 +221,10 @@ pub(crate) fn mean_accuracy<F: Float>(predictions: &Array1<usize>, targets: &Arr
 /// R² coefficient of determination: `1 - SSres / SStot`. Used as the
 /// body of every regressor `score(&self, x, y)` method to mirror
 /// sklearn's `RegressorMixin.score`. Constant-y returns `1.0` if
-/// predictions are also constant-perfect, else `F::neg_infinity()`.
+/// predictions are also constant-perfect (zero residual), else `0.0`
+/// when the residual is non-zero — matching `sklearn.metrics.r2_score`
+/// (`_regression.py:891`: `output_scores[nonzero_numerator &
+/// ~nonzero_denominator] = 0.0`).
 pub(crate) fn r2_score<F: Float>(y_pred: &Array1<F>, y_true: &Array1<F>) -> F {
     let n = y_true.len();
     if n == 0 {
@@ -218,17 +243,19 @@ pub(crate) fn r2_score<F: Float>(y_pred: &Array1<F>, y_true: &Array1<F>) -> F {
         if ss_res == F::zero() {
             F::one()
         } else {
-            F::neg_infinity()
+            F::zero()
         }
     } else {
         F::one() - ss_res / ss_tot
     }
 }
 
-/// Element-wise log of a probability matrix, used as the body of every
-/// classifier `predict_log_proba` method in this crate. Clamps values
-/// below `1e-300` to avoid `-inf` / `NaN`.
+/// Element-wise natural log of a probability matrix, used as the body of every
+/// classifier `predict_log_proba` method in this crate. Unclamped, mirroring
+/// scikit-learn `predict_log_proba = np.log(predict_proba)`
+/// (`sklearn/discriminant_analysis.py:1059`: `return np.log(probas_)`): a `0.0`
+/// probability maps to `-inf`. Inputs are always in `[0, 1]`, so the result is
+/// either finite or `-inf` (never `NaN`).
 pub(crate) fn log_proba<F: Float>(proba: &Array2<F>) -> Array2<F> {
-    let eps = F::from(1e-300).unwrap();
-    proba.mapv(|p| if p > eps { p.ln() } else { eps.ln() })
+    proba.mapv(|p| p.ln())
 }
