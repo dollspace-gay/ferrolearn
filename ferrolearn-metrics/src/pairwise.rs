@@ -12,6 +12,31 @@
 //! - [`cosine_distances`] — `1 - cosine_similarity`
 //! - [`pairwise_distances`] — dispatcher that selects the above via the
 //!   [`Metric`] enum
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.metrics.pairwise` (`sklearn/metrics/pairwise.py`). See
+//! `.design/metrics/pairwise.md`. Non-test consumer: crate re-export. The
+//! present distance/kernel functions are value-correct vs the live oracle
+//! (verified to ULP); the missing kernels / `paired_*` family / `cosine_similarity`
+//! / `haversine` / ABI params are NOT-STARTED.
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `euclidean_distances` value: `\|\|a\|\|²+\|\|b\|\|²-2a·b`, negative-clamp, self-pair diagonal == 0 (`pairwise.py:410-415`) | SHIPPED |
+//! | REQ-2 | `manhattan_distances` + `chebyshev_distances` value (`pairwise.py:1034`; chebyshev via `metric='chebyshev'`) | SHIPPED |
+//! | REQ-3 | `cosine_distances` value: `1 - cos_sim`, clip `[0,2]`, zero-vector → 1, opposite → 2 (`pairwise.py:1094-1137`) | SHIPPED |
+//! | REQ-4 | `nan_euclidean_distances` value: `weight = n_features/n_present` rescaling, all-NaN pair → NaN (`pairwise.py:430-540`) | SHIPPED |
+//! | REQ-5 | `pairwise_distances` dispatcher via `Metric` enum (== direct functions == sklearn) (`pairwise.py:2196`) | SHIPPED |
+//! | REQ-6 | `pairwise_distances_argmin` / `_argmin_min`: value + tie-break to first index (`pairwise.py:692,:841`) | SHIPPED |
+//! | REQ-7 | `pairwise_kernels` value for the present kernels (linear/polynomial/rbf/sigmoid/laplacian) (`pairwise.py:2469`) | SHIPPED |
+//! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | NOT-STARTED (#789) |
+//! | REQ-9 | `paired_*` family (euclidean/manhattan/cosine/distances, `(n,)` output) | NOT-STARTED (#790) |
+//! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | NOT-STARTED (#791) |
+//! | REQ-11 | ABI params: `squared=`, `missing_values=`, string-metric aliases (`l1`/`l2`/`cityblock`), kernel defaults + chi2/additive_chi2/cosine in the kernel registry | NOT-STARTED (#792) |
+//! | REQ-12 | `Y=None` self-distance API + arbitrary-magnitude diagonal-zeroing contract (`pairwise.py:414-415`) | NOT-STARTED (#793) |
+//! | REQ-13 | PyO3 binding | NOT-STARTED (#794) |
+//! | REQ-14 | ferray substrate migration | NOT-STARTED (#795) |
 
 use ferrolearn_core::FerroError;
 use ndarray::Array2;
