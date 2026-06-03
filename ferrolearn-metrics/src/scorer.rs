@@ -6,6 +6,25 @@
 //! `mean_squared_error` has `greater_is_better = false`.
 //!
 //! Use [`make_scorer`] to create a scorer from a plain function pointer.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.metrics` scorer machinery (`sklearn/metrics/_scorer.py`).
+//! See `.design/metrics/scorer.md`. Non-test consumer: crate re-export.
+//! ferrolearn registers the regression scorer subset; sklearn's full set is
+//! 56 names — the classification/clustering scorers are blocked on a
+//! heterogeneous `Scorer` type (#781).
+//!
+//! | REQ | Description | Status |
+//! |-----|-------------|--------|
+//! | REQ-1 | `Scorer`/`make_scorer`/`get_scorer`/`get_scorer_names` machinery + sign application `score() = sign * metric` (`_scorer.py:376,:754`) | SHIPPED |
+//! | REQ-2 | Regression-scorer registry complete + canonical (incl. `max_error` not `neg_max_error` `_scorer.py:761`, `d2_absolute_error_score` `_scorer.py:788`) + correct `greater_is_better`/`_sign` metadata | SHIPPED |
+//! | REQ-3 | `make_scorer` ABI: `greater_is_better=True` default + `response_method` kwarg | NOT-STARTED (#782) |
+//! | REQ-4 | Heterogeneous `Scorer` type (wrap label / probability / score-array metrics) | NOT-STARTED (#781, architectural) |
+//! | REQ-5 | Classification scorers registry (`accuracy`/`f1_*`/`precision_*`/`recall_*`/`jaccard_*`/`roc_auc_*`/`average_precision`/`top_k`/`neg_log_loss`/`neg_brier_score`/`matthews_corrcoef`/likelihood-ratios) | NOT-STARTED (#783, blocked on #781) |
+//! | REQ-6 | Clustering scorers registry (`adjusted_rand`/`rand`/`mutual_info`/`v_measure`/`homogeneity`/`completeness`/`fowlkes_mallows`) | NOT-STARTED (#784, blocked on #781) |
+//! | REQ-7 | PyO3 binding (`get_scorer`/`get_scorer_names`/`make_scorer`) | NOT-STARTED (#785) |
+//! | REQ-8 | ferray substrate migration | NOT-STARTED (#786) |
 
 use ferrolearn_core::FerroError;
 use ndarray::Array1;
@@ -61,7 +80,11 @@ impl<F: Float> Scorer<F> {
     ///
     /// Propagates any error from the underlying scoring function.
     pub fn score(&self, y_true: &Array1<F>, y_pred: &Array1<F>) -> Result<F, FerroError> {
-        (self.score_fn)(y_true, y_pred)
+        // sklearn `_Scorer._score` returns `self._sign * self._score_func(y_true, y_pred)`
+        // (`_scorer.py:376`); `sign = 1 if greater_is_better else -1` (`_scorer.py:754`).
+        // Baking the sign in here means callers always maximise: a neg_* scorer returns
+        // the negated loss, so a maximiser correctly minimises the underlying loss.
+        Ok(self.sign() * (self.score_fn)(y_true, y_pred)?)
     }
 
     /// Return the sign multiplier for optimisation.
@@ -128,11 +151,12 @@ pub const BUILTIN_SCORER_NAMES: &[&str] = &[
     "neg_root_mean_squared_log_error",
     "neg_mean_absolute_percentage_error",
     "neg_median_absolute_error",
-    "neg_max_error",
+    "max_error",
     "r2",
     "explained_variance",
     "neg_mean_poisson_deviance",
     "neg_mean_gamma_deviance",
+    "d2_absolute_error_score",
 ];
 
 /// Return all built-in scorer names recognised by [`get_scorer`].
@@ -152,9 +176,10 @@ pub fn get_scorer_names() -> &'static [&'static str] {
 /// [`BUILTIN_SCORER_NAMES`].
 pub fn get_scorer(name: &str) -> Result<Scorer<f64>, FerroError> {
     use crate::regression::{
-        explained_variance_score, max_error, mean_absolute_error, mean_absolute_percentage_error,
-        mean_gamma_deviance, mean_poisson_deviance, mean_squared_error, mean_squared_log_error,
-        median_absolute_error, r2_score, root_mean_squared_error, root_mean_squared_log_error,
+        d2_absolute_error_score, explained_variance_score, max_error, mean_absolute_error,
+        mean_absolute_percentage_error, mean_gamma_deviance, mean_poisson_deviance,
+        mean_squared_error, mean_squared_log_error, median_absolute_error, r2_score,
+        root_mean_squared_error, root_mean_squared_log_error,
     };
     let scorer = match name {
         "neg_mean_absolute_error" => make_scorer(mean_absolute_error, false, name),
@@ -166,11 +191,14 @@ pub fn get_scorer(name: &str) -> Result<Scorer<f64>, FerroError> {
             make_scorer(mean_absolute_percentage_error, false, name)
         }
         "neg_median_absolute_error" => make_scorer(median_absolute_error, false, name),
-        "neg_max_error" => make_scorer(max_error, false, name),
+        "max_error" => make_scorer(max_error, false, name),
         "r2" => make_scorer(r2_score, true, name),
         "explained_variance" => make_scorer(explained_variance_score, true, name),
         "neg_mean_poisson_deviance" => make_scorer(mean_poisson_deviance, false, name),
         "neg_mean_gamma_deviance" => make_scorer(mean_gamma_deviance, false, name),
+        // sklearn _scorer.py:788 — `make_scorer(d2_absolute_error_score)` uses
+        // greater_is_better=True default (_sign == +1); registered at _scorer.py:881.
+        "d2_absolute_error_score" => make_scorer(d2_absolute_error_score, true, name),
         other => {
             return Err(FerroError::InvalidParameter {
                 name: "scoring".into(),
@@ -248,7 +276,9 @@ mod tests {
         let y_true = array![1.0_f64, 2.0, 3.0];
         let y_pred = array![1.5_f64, 2.0, 2.5];
         let result = scorer.score(&y_true, &y_pred).unwrap();
-        assert_abs_diff_eq!(result, 1.0 / 3.0, epsilon = 1e-10);
+        // greater_is_better=false -> sign == -1 -> score() returns sign*raw = -(1/3).
+        // sklearn `_Scorer._score`: `return self._sign * self._score_func(...)` (`_scorer.py:376`).
+        assert_abs_diff_eq!(result, -(1.0 / 3.0), epsilon = 1e-10);
     }
 
     #[test]
