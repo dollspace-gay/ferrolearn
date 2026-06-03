@@ -3,6 +3,25 @@
 //! Transforms a list of label sets into a multi-hot binary indicator matrix.
 //! Each sample can belong to zero or more classes simultaneously.
 //!
+//! Translation target: scikit-learn 1.5.2 `class MultiLabelBinarizer`
+//! (`sklearn/preprocessing/_label.py:688`). Design:
+//! `.design/preprocess/multi_label_binarizer.md`. Tracking: #1229.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 fit → sorted-unique classes_ (usize) | SHIPPED | `MultiLabelBinarizer::fit`; sklearn `_label.py:779` |
+//! | REQ-2 transform → dense multi-hot (known labels) | SHIPPED | `FittedMultiLabelBinarizer::transform`; sklearn `_label.py:869-907` |
+//! | REQ-3 transform unknown-label: ignore, no error | SHIPPED (#1230) | `transform` skips unknown via `class_to_idx.get`; sklearn `_label.py:889-902` |
+//! | REQ-4 inverse_transform 0/1 validation | SHIPPED (#1231) | `inverse_transform` rejects non-0/1, selects `== 1.0`; sklearn `_label.py:941-947` |
+//! | REQ-5 `classes` ctor param | NOT-STARTED (#1232) | sklearn `_label.py:756`,`:780-785` |
+//! | REQ-6 sparse_output CSR | NOT-STARTED (#1233) | sklearn `_label.py:858-859`,`:905-907` |
+//! | REQ-7 arbitrary orderable+hashable labels + object dtype | NOT-STARTED (#1234) | sklearn `_label.py:788` (usize-only, R-DEV-3) |
+//! | REQ-8 optimized single-pass fit_transform | NOT-STARTED (#1235) | sklearn `_label.py:814-835` |
+//! | REQ-9 PyO3 binding | NOT-STARTED (#1236) | `ferrolearn-python/src/` (absent) |
+//! | REQ-1 edge: empty-`y` fit yields empty classes_ (no error) | NOT-STARTED (#1237) | sklearn `_label.py:779` |
+//!
 //! # Examples
 //!
 //! ```
@@ -71,12 +90,22 @@ impl FittedMultiLabelBinarizer {
 
     /// Map a multi-hot indicator matrix back to label sets.
     ///
-    /// Each column value is thresholded at 0.5: values >= 0.5 are included.
+    /// The indicator matrix must contain only exact `0.0` and `1.0` values; a
+    /// class is included for a sample iff its cell is exactly `1.0`. This
+    /// mirrors scikit-learn 1.5.2 `MultiLabelBinarizer.inverse_transform`
+    /// (`sklearn/preprocessing/_label.py:941-947`), which validates the matrix
+    /// with `np.setdiff1d(yt, [0, 1])` and raises `ValueError` on any value
+    /// outside `{0, 1}` before selecting classes where the cell `== 1`.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of columns does
-    /// not match the number of classes.
+    /// not match the number of classes. Returns [`FerroError::InvalidParameter`]
+    /// if any cell value is not exactly `0.0` or `1.0`.
+    #[allow(
+        clippy::float_cmp,
+        reason = "indicator matrix must be exactly 0/1 per sklearn _label.py:941-947"
+    )]
     pub fn inverse_transform(&self, y: &Array2<f64>) -> Result<Vec<Vec<usize>>, FerroError> {
         let k = self.classes.len();
         if y.ncols() != k {
@@ -87,13 +116,22 @@ impl FittedMultiLabelBinarizer {
             });
         }
 
+        // Validate the indicator contains only 0s and 1s, matching sklearn's
+        // `np.setdiff1d(yt, [0, 1])` check (_label.py:941-947).
+        if let Some(&v) = y.iter().find(|&&v| v != 0.0 && v != 1.0) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: format!("Expected only 0s and 1s in label indicator, got {v}"),
+            });
+        }
+
         let n = y.nrows();
         let mut result = Vec::with_capacity(n);
 
         for i in 0..n {
             let mut labels = Vec::new();
             for (j, &cls) in self.classes.iter().enumerate() {
-                if y[[i, j]] >= 0.5 {
+                if y[[i, j]] == 1.0 {
                     labels.push(cls);
                 }
             }
@@ -147,10 +185,15 @@ impl Transform<Vec<Vec<usize>>> for FittedMultiLabelBinarizer {
     /// Each row has a `1.0` in every column corresponding to one of its labels
     /// and `0.0` elsewhere.
     ///
-    /// # Errors
+    /// Labels not seen during fitting are silently ignored: the indicator is
+    /// built only from known labels (mirroring scikit-learn 1.5.2
+    /// `MultiLabelBinarizer._transform`, `sklearn/preprocessing/_label.py:889-902`).
+    /// scikit-learn additionally emits a `warnings.warn("unknown class(es) ...
+    /// will be ignored")`; that warning is intentionally not emitted here because
+    /// the crate has no logging facade and adding one would be out of scope.
     ///
-    /// Returns [`FerroError::InvalidParameter`] if any label was not seen
-    /// during fitting.
+    /// The [`Result`] return type is retained because the [`Transform`] trait
+    /// requires it; `transform` always returns [`Ok`].
     fn transform(&self, y: &Vec<Vec<usize>>) -> Result<Array2<f64>, FerroError> {
         let k = self.classes.len();
         let n = y.len();
@@ -167,14 +210,11 @@ impl Transform<Vec<Vec<usize>>> for FittedMultiLabelBinarizer {
 
         for (i, labels) in y.iter().enumerate() {
             for &label in labels {
-                let &idx =
-                    class_to_idx
-                        .get(&label)
-                        .ok_or_else(|| FerroError::InvalidParameter {
-                            name: "y".into(),
-                            reason: format!("unknown label {label} not seen during fit"),
-                        })?;
-                out[[i, idx]] = 1.0;
+                // Unknown labels (not seen during fit) are silently ignored,
+                // matching scikit-learn's `_transform` (_label.py:889-902).
+                if let Some(&idx) = class_to_idx.get(&label) {
+                    out[[i, idx]] = 1.0;
+                }
             }
         }
 
@@ -228,12 +268,21 @@ mod tests {
     }
 
     #[test]
-    fn test_transform_unknown_label_error() {
+    fn test_transform_unknown_label_ignored() {
+        // Live oracle (sklearn 1.5.2):
+        //   python3 -c "from sklearn.preprocessing import MultiLabelBinarizer; \
+        //     import warnings; warnings.simplefilter('ignore'); \
+        //     mlb=MultiLabelBinarizer().fit([[0,1]]); \
+        //     print(mlb.transform([[0,5]]).tolist())"
+        //   => [[1, 0]]
+        // Unknown labels are skipped, not errored (_label.py:889-902).
         let mlb = MultiLabelBinarizer::new();
         let y = vec![vec![0, 1]];
-        let fitted = mlb.fit(&y, &()).unwrap();
-        let y2 = vec![vec![0, 5]]; // 5 not in {0, 1}
-        assert!(fitted.transform(&y2).is_err());
+        let fitted = mlb.fit(&y, &()).map_err(|e| format!("{e:?}"));
+        let y2 = vec![vec![0, 5]]; // 5 not in {0, 1} → ignored
+        // Transform must NOT error on the unknown label 5; it is skipped.
+        let got = fitted.and_then(|f| f.transform(&y2).map_err(|e| format!("{e:?}")));
+        assert_eq!(got, Ok(array![[1.0, 0.0]]));
     }
 
     #[test]
@@ -314,13 +363,33 @@ mod tests {
     }
 
     #[test]
-    fn test_inverse_threshold() {
+    fn test_inverse_rejects_non_01() {
+        // sklearn 1.5.2 validates the indicator with `np.setdiff1d(yt, [0, 1])`
+        // and raises `ValueError` on any value outside {0, 1}
+        // (sklearn/preprocessing/_label.py:941-947). It does NOT threshold.
+        //
+        // Live oracle (sklearn 1.5.2), valid 0/1 round-trip (R-CHAR-3):
+        //   python3 -c "import numpy as np; \
+        //     from sklearn.preprocessing import MultiLabelBinarizer; \
+        //     mlb=MultiLabelBinarizer().fit([[0,1,2]]); \
+        //     print(mlb.inverse_transform(np.array([[1,0,1]])))"
+        //   => [(0, 2)]  ==  vec![vec![0, 2]]
         let mlb = MultiLabelBinarizer::new();
         let y = vec![vec![0, 1, 2]];
-        let fitted = mlb.fit(&y, &()).unwrap();
-        // Values below 0.5 → not included
-        let mat = array![[0.4, 0.6, 0.5]];
-        let recovered = fitted.inverse_transform(&mat).unwrap();
-        assert_eq!(recovered, vec![vec![1, 2]]); // 0.4 < 0.5 so label 0 excluded
+        let fitted = mlb.fit(&y, &()).map_err(|e| format!("{e:?}"));
+
+        // Non-0/1 values are rejected (sklearn raises ValueError).
+        let bad = array![[0.4, 0.6, 0.5]];
+        let rejected = fitted
+            .as_ref()
+            .map_err(|e| e.clone())
+            .map(|f| f.inverse_transform(&bad).is_err());
+        assert_eq!(rejected, Ok(true));
+
+        // A valid 0/1 indicator round-trips to the live-oracle result.
+        let good = array![[1.0, 0.0, 1.0]];
+        let recovered =
+            fitted.and_then(|f| f.inverse_transform(&good).map_err(|e| format!("{e:?}")));
+        assert_eq!(recovered, Ok(vec![vec![0, 2]]));
     }
 }
