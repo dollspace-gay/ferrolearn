@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 Workspace-wide minor bump (0.3.0 → 0.4.0) accompanying 11 sklearn-parity bug fixes surfaced by the new conformance test suite. All fixes change observable behaviour at the same hyperparameters, justifying a minor version increment.
 
 ### Added
+- neighbors/kdtree: KDTree single-row k-NN query verified value-correct vs live sklearn (REQ table; k>n error contract NOT-STARTED #831, blocked on consumer Result-threading) (#830)
 - neighbors/graph: kneighbors_graph + radius_neighbors_graph self-exclusion (include_self=False default, zero diagonal) + REQ table; cleared 2 crate clippy debts (#822 #823 #824)
 - metrics/classification: log_loss eps + roc_curve drop_intermediate + det_curve endpoint + calibration searchsorted + top_k tie-break edge-parity fixes; REQ table (completes ferrolearn-metrics) (#806)
 - metrics/pairwise: REQ table + 11 value-contract guards (present distance/kernel functions verified value-correct to ULP vs live sklearn) (#788)
