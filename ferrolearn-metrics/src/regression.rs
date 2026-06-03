@@ -428,7 +428,7 @@ where
         .collect();
     errors.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-    let median = if n % 2 == 0 {
+    let median = if n.is_multiple_of(2) {
         (errors[n / 2 - 1] + errors[n / 2]) / F::from(2.0).unwrap()
     } else {
         errors[n / 2]
