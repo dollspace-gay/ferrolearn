@@ -44,6 +44,43 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary classification (R-DEFER-2): two states only — SHIPPED needs impl + a
+//! non-test production consumer + green verification; NOT-STARTED carries the
+//! open prereq blocker. The non-test production consumer is `_RsComplementNB` /
+//! `RsComplementNB` (`ferrolearn-python/src/extras.rs`, built via the
+//! `py_classifier!` macro), which exercises `new(alpha, fit_prior, norm)` / `fit`
+//! / `predict` against the library `FittedComplementNB` and is surfaced as
+//! `ferrolearn.ComplementNB`; plus the in-crate `impl PipelineEstimator for
+//! ComplementNB` (`fit_pipeline` / `predict_pipeline`). Green verification = the
+//! in-tree `complement` lib tests plus the live-sklearn pin / guards
+//! (`ferrolearn-bayes/tests/divergence_complement.rs`):
+//! `divergence_complement_negative_alpha_rejected` (#914, now PASSING after the
+//! `alpha < 0` reject landed in `fn fit`), then the green guards
+//! `green_complement_predict_value_norm_false`,
+//! `green_complement_predict_value_norm_true`,
+//! `green_complement_class_prior_length_only`,
+//! `green_complement_score_accuracy`,
+//! `green_complement_negative_features_rejected` — all passing. Cites use symbol
+//! anchors (ferrolearn) / `file:line` (sklearn 1.5.2, commit 156ef14). Live
+//! oracle = installed sklearn 1.5.2. (REQ numbering follows the design doc
+//! `.design/bayes/complement.md`; suggested blocker numbers continue the bayes
+//! layer past bernoulli #905-910.)
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (`feature_log_prob_` complement-weight + `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE, norm=False) | SHIPPED | `fn fit` for `ComplementNB` sets `weights[[ci,j]] = -((total_feature_counts[j] - class_feature_counts[ci,j] + alpha) / (complement_total + alpha*n_features)).ln()` — the algebraic identity of `_update_feature_log_prob`'s `-logged` (`naive_bayes.py:1032-1042`: `comp_count = feature_all_ + alpha - feature_count_`; `logged = log(comp_count / comp_count.sum(axis=1, keepdims=True))`; `feature_log_prob_ = -logged`); `impl BaseNB::joint_log_likelihood` for `FittedComplementNB` computes `X @ weights.T` (`scores[[i,ci]] = sum_j x[i,j] * weights[ci,j]`), mirroring `jll = safe_sparse_dot(X, feature_log_prob_.T)` (`naive_bayes.py:1046`); the four `predict_*` delegate to the `BaseNB` provided methods. The single-class `+ class_log_prior_` add (`naive_bayes.py:1047-1048`) is omitted and BENIGN — single-class `class_log_prior_ = [0.0]` and one-column softmax is always `[[1.0]]`. Non-test consumer: `RsComplementNB::fit`/`predict` (`ferrolearn-python/src/extras.rs`, `py_classifier!`) → `FittedComplementNB`, surfaced as `ferrolearn.ComplementNB`; plus `impl PipelineEstimator`. Verified: green guard `green_complement_predict_value_norm_false` — on `X=[[5,1,0],[4,2,0],[6,0,1],[0,1,5],[1,0,4],[0,2,6]]`, `y=[0,0,0,1,1,1]`, `q=[[3,1,1],[0,1,4]]`, sklearn `predict_proba(q) = [[0.9846153846153846, 0.015384615384615375], [0.0002440810349035878, 0.9997559189650967]]`, `predict_joint_log_proba(q) = [[9.216887641752072, 5.058004558392399], [2.9785630167125636, 11.296329183431908]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. In-tree `test_complement_nb_fit_predict` / `test_complement_nb_predict_proba_sums_to_one` / `test_complement_nb_imbalanced_data` / `test_complement_nb_three_classes` / `test_complement_nb_single_class`. |
+//! | REQ-2 (`alpha >= 0` validation) | SHIPPED | `fn fit` rejects `self.alpha < F::zero()` with `FerroError::InvalidParameter { name: "alpha", reason: "alpha must be >= 0 (sklearn Interval[0, inf))" }`, mirroring the shared `_BaseDiscreteNB._parameter_constraints` `alpha: [Interval(Real, 0, None, closed="left"), "array-like"]` (`naive_bayes.py:530`) inherited by `ComplementNB._parameter_constraints` (`naive_bayes.py:1000-1003`) — the HARD `>= 0` reject `_validate_params` enforces at `fit`, DISTINCT from `_check_alpha`'s `1e-10` floor (`naive_bayes.py:604-626`, `force_alpha`-only; `alpha=0` stays allowed). Non-test consumer: `RsComplementNB::fit` (`extras.rs`) maps the `FerroError` → `PyErr`. Verified: green pin `divergence_complement_negative_alpha_rejected` (#914, now PASSING): `with_alpha(-0.5).fit(X,y)` returns `Err` (sklearn raises `InvalidParameterError`, "The 'alpha' parameter of ComplementNB must be a float in the range [0.0, inf) or an array-like. Got -0.5 instead."). |
+//! | REQ-3 (`norm=True` VALUE) | SHIPPED | `fn fit` / `partial_fit` call `fn apply_norm_inplace`, which divides each `weights` row (= `-logged`) by its row sum — the algebraic identity of sklearn's `feature_log_prob_ = logged / logged.sum(axis=1, keepdims=True)` (`naive_bayes.py:1037-1039`); the two minus signs in `(-logged)/sum(-logged)` cancel. Non-test consumer: `RsComplementNB` threads `norm` through `with_norm(norm)` (`extras.rs`); surfaced as `ferrolearn.ComplementNB(norm=...)`. Verified: green guard `green_complement_predict_value_norm_true` — `ComplementNB(norm=True).fit(X,y)` sklearn `predict_proba(q) = [[0.7192390704948571, 0.2807609295051429], [0.13223037910101987, 0.8677696208989801]]`, `predict(q) = [0, 1]`; ferrolearn `with_norm(true)` produces the IDENTICAL proba/labels to ≤1e-12. |
+//! | REQ-4 (`class_prior` LENGTH-only validation — MATCH) | SHIPPED | `fn fit` validates ONLY `priors.len() != n_classes` (then carries the priors), mirroring `_update_class_log_prior` (`naive_bayes.py:589-591`: `if len(class_prior) != n_classes: ValueError; class_log_prior_ = log(class_prior)`) — discrete NB has NO sum-to-1 / non-negativity check. A deliberate MATCH. Non-test consumer: `RsComplementNB` builds `ComplementNB` (the `with_class_prior` path is exercised in-crate + pipeline). Verified: green guard `green_complement_class_prior_length_only` — `with_class_prior([0.5,0.3]).fit(X,y)` SUCCEEDS (sum 0.8; sklearn `class_log_prior_ = log([0.5,0.3])`, NO error), `with_class_prior([0.5]).fit` errors. In-tree `test_complement_nb_class_prior` / `test_complement_nb_class_prior_wrong_length`. (Wrong-length error TYPE differs — `InvalidParameter` vs `ValueError` — folded into REQ-9's surface gap. For ComplementNB `class_prior` is "Not used" in multi-class predict, `naive_bayes.py:929` — only the length decision is observable.) |
+//! | REQ-5 (`force_alpha` floor + `fit_prior` carry) | SHIPPED | `fn fit` / `partial_fit` call `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` floor `1e-10` unless `force_alpha`, `naive_bayes.py:604-626`); `fit_prior` is stored (matching sklearn, only the single-class edge case consults the prior — benign here). Non-test consumer: `RsComplementNB` passes `fit_prior` through `with_fit_prior`, `alpha` through `with_alpha`. Verified: with `force_alpha=true` default and `alpha=1`, `score(X,y) = 1.0` (green `green_complement_score_accuracy`); `clamp_alpha(1, true) = 1`. In-tree `test_complement_nb_default`; `base.rs` `test_check_alpha_*`. |
+//! | REQ-6 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedComplementNB::partial_fit` accumulates `class_counts` / `feature_counts` for each EXISTING class, then re-derives `total_feature_counts` (the `feature_all_` analog) / `total_all` and recomputes `weights` (same `-log` complement smoothing), re-applying `apply_norm_inplace` when `norm`, mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-recompute (`naive_bayes.py:628-709`, `_count` re-deriving `feature_all_` → `_update_feature_log_prob`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: in-tree `test_complement_nb_partial_fit` / `test_complement_nb_partial_fit_shape_mismatch` — chunked `partial_fit` over already-fitted classes reproduces the accumulate-then-recompute path (sklearn two-chunk `partial_fit` == `fit` on the whole, `np.allclose == True`). KNOWN GAP: `partial_fit` has NO `classes=` argument — it loops only over the already-fitted `self.classes`, so a brand-new later-chunk label is silently dropped (sklearn binarizes against the full `classes=` list from the first call, `naive_bayes.py:628-709`); this `classes=`/unseen-label path is NOT-STARTED (folded into #915). |
+//! | REQ-7 (negative-feature guard — both reject) | SHIPPED | `fn fit` (and `partial_fit`) reject any `x[i,j] < 0` with `FerroError::InvalidParameter { name: "X", reason: "ComplementNB requires non-negative feature values" }`, mirroring `check_non_negative(X, "ComplementNB (input X)")` → `ValueError` (`naive_bayes.py:1027`; ComplementNB DOES guard non-negativity, unlike BernoulliNB). Both REJECT. Non-test consumer: `RsComplementNB::fit` (`extras.rs`) maps the `FerroError` to a `PyErr`. Verified: green guard `green_complement_negative_features_rejected` — `ComplementNB().fit(X_neg, y)` returns `Err` (sklearn `ValueError("Negative values in data passed to ComplementNB (input X)")`). In-tree `test_complement_nb_negative_features_error`. The exact sklearn MESSAGE/TYPE is NOT matched — that sub-item is captured under REQ-9. |
+//! | REQ-8 (`sample_weight` + `partial_fit` `classes=`) | NOT-STARTED | open prereq blocker **#915**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` / `feature_all_ = feature_count_.sum(axis=0)` become weighted (`naive_bayes.py:1025-1030`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`; also no `classes=` argument on `partial_fit` (the unseen-label sub-gap of REQ-6). |
+//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#916**. sklearn exposes `feature_log_prob_` / `feature_all_` / `feature_count_` / `class_count_` / `class_log_prior_` / `classes_` / `n_features_in_` (`naive_bayes.py:937-970`); `hasattr(fitted, 'coef_') == False` — the deprecated `_BaseDiscreteNB` `coef_`/`intercept_` are gone by 1.5.2, so those are NOT a gap. `FittedComplementNB` stores `weights` / `feature_counts` / `class_counts` as PRIVATE fields with no accessor (and computes no `feature_all_` / `class_log_prior_`) — only `classes()` (via `HasClasses`) is public. `_RsComplementNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, norm)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters. Also subsumes the negative-feature MESSAGE/TYPE-parity sub-item (REQ-7: `InvalidParameter` vs `ValueError`) and the `class_prior` wrong-length TYPE sub-item (REQ-4). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#917**. `complement.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -207,6 +244,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
         let n_classes = classes.len();
 
         let n_feat_f = F::from(n_features).unwrap();
+        // sklearn rejects alpha < 0 at fit via _parameter_constraints
+        // `alpha: Interval(Real, 0, None, closed="left")` (naive_bayes.py:530,
+        // inherited by ComplementNB at :1000-1003) — a HARD reject distinct
+        // from `_check_alpha`'s 1e-10 floor (:619, force_alpha-only).
+        if self.alpha < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "alpha must be >= 0 (sklearn Interval[0, inf))".into(),
+            });
+        }
+
         let alpha = crate::clamp_alpha(self.alpha, self.force_alpha);
 
         // Compute per-class feature count sums, shape (n_classes, n_features).
