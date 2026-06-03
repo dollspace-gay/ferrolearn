@@ -35,6 +35,37 @@
 //! let fitted = model.fit(&x, &y).unwrap();
 //! assert_eq!(fitted.labels().len(), 6);
 //! ```
+//!
+//! # `## REQ status`
+//!
+//! Binary (R-DEFER-2), translating `sklearn/semi_supervised/_label_propagation.py`
+//! (`class LabelPropagation(BaseLabelPropagation)` `:338`, `_variant="propagation"`;
+//! base `fit`/`predict`/`predict_proba` `:233-335`). Design doc:
+//! `.design/cluster/label_propagation.md`. Cites use ferrolearn symbol anchors /
+//! sklearn `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2
+//! oracle (R-CHAR-3). Verify-and-document unit: the contiguous-label transduction
+//! PARTITION (REQ-1) and the `classes_`/`n_classes`/label-VALUE mapping (REQ-4) match
+//! sklearn and SHIP through the crate re-export. The `label_distributions_` VALUES
+//! DIVERGE — ferrolearn zeroes the RBF self-affinity diagonal + inits unlabeled rows
+//! UNIFORM + converges on L2-at-end, while sklearn uses `rbf_kernel` diagonal 1 +
+//! zero-init + L1-at-start (#997/#998). `predict`/`predict_proba` are nearest-neighbor,
+//! not sklearn's kernel-weighted combination (#1001). There is no CPython binding
+//! (#1006).
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (contiguous-label transduction PARTITION) | SHIPPED | impl `fn fit` (graph build → `fn row_normalize` → `fn propagate` → per-row argmax) recovers sklearn's transduction on well-separated CONTIGUOUS-label data. Consumer: crate re-export `pub use label_propagation::{FittedLabelPropagation, LabelPropagation, LabelPropagationKernel}` (`lib.rs:110`). Guards: `green_guard_req1_contiguous_partition_2blob`, `green_guard_req1_contiguous_partition_3blob` in `tests/divergence_label_propagation.rs` (live-oracle). Underclaim: contiguous separable data only — `label_distributions_` VALUES (REQ-2/3) diverge. |
+//! | REQ-4 (`classes_` / `n_classes` / label-VALUE mapping) | SHIPPED | impl `fn fit` now builds `classes_` = sorted unique non-(-1) labels, `n_classes = classes_.len()`, one-hot indexed by class POSITION, and maps the final argmax index through `classes_` — matching sklearn `classes_ = unique(y)\{-1}` + `transduction_ = classes_[argmax]` (`_label_propagation.py:272-274,333`). Guard: `divergence_req4_noncontiguous_classes_mapping` (`{0,2}`-label fixture: ferrolearn now `n_classes()==2`, `labels ⊆ {0,2}` matching sklearn `[0,0,0,0,2,2,2,2]`; was `n_classes()==3` with a phantom class). Fixed #999. |
+//! | REQ-2 (`label_distributions_` value — RBF diagonal + zero-init) | NOT-STARTED | open prereq blocker #997. sklearn `rbf_kernel(X,X)` self-affinity diagonal `=1` (`:147`) + unlabeled rows START at zero (`y_static[unlabeled]=0`, `:282-289`); ferrolearn `fn build_rbf_affinity` zeroes the diagonal (`:281-282`) + inits unlabeled rows UNIFORM (`fn fit`). Different steady-state values. |
+//! | REQ-3 (convergence — L1-at-start vs L2-at-end) | NOT-STARTED | open prereq blocker #998. sklearn checks `|Δ|.sum() < tol` at loop START (`:301`); ferrolearn `fn propagate` checks `sqrt(Σd²) < tol` at loop END. Different stopping rule + `n_iter_`. |
+//! | REQ-5 (`tol` default `1e-3`) | NOT-STARTED | open prereq blocker #1000. sklearn `tol=1e-3` (`:435`); ferrolearn `fn new` `tol=1e-4`. Default divergence (R-DEV-2). |
+//! | REQ-6 (`predict`/`predict_proba` kernel-weighted) | NOT-STARTED | open prereq blocker #1001. sklearn `predict_proba = rbf_kernel(X_train,X).T @ label_distributions_` row-normalized, `predict = classes_[argmax]` (`:190-231`); ferrolearn `fn predict`/`fn predict_proba` return the NEAREST training row's distribution. R-DEV-3. |
+//! | REQ-7 (`transduction_`/`classes_`/`n_iter_`/`X_` attrs) | NOT-STARTED | open prereq blocker #1002. sklearn exposes `transduction_`/`classes_`/`n_iter_`/`X_`/`n_features_in_` (`:264,274,300,333`); ferrolearn `FittedLabelPropagation` exposes `labels_` (named, not `transduction_`)/`label_distributions_`/`n_classes_` — no public `classes_`/`n_iter_` accessor. |
+//! | REQ-8 (`ConvergenceWarning` + `n_iter_`) | NOT-STARTED | open prereq blocker #1003. sklearn warns `ConvergenceWarning` + `n_iter_ += 1` at `max_iter` (`:321-326`); ferrolearn `fn propagate` breaks silently, no `n_iter_`. |
+//! | REQ-9 (KNN connectivity graph + column-normalization) | NOT-STARTED | open prereq blocker #1004. sklearn knn → `kneighbors_graph(mode="connectivity")` directed (`:156-157`) + column-sum normalization (`:457-461`); ferrolearn `fn build_knn_affinity` SYMMETRIZES (`w[i,j]=w[j,i]=1`) + `fn row_normalize` row-sums (coincides only on the symmetric RBF graph). |
+//! | REQ-10 (validation / error ABI) | NOT-STARTED | open prereq blocker #1005. sklearn `check_classification_targets` + `_parameter_constraints` (`gamma∈[0,∞)`, etc.) raising `InvalidParameterError` (`:110-118,265`); ferrolearn `fn fit` raises `FerroError::InvalidParameter` (different type/ABI) and rejects `gamma>0` (stricter than sklearn's `[0,∞)`). |
+//! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1006. `grep LabelPropagation ferrolearn-python/` is EMPTY — no binding; `import ferrolearn` cannot reach `LabelPropagation`. Only consumer is the crate re-export. |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1007. `label_propagation.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -456,14 +487,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelPr
             });
         }
 
-        // Find the number of classes.
-        let n_classes = y
-            .iter()
-            .filter(|&&l| l >= 0)
-            .map(|&l| l as usize)
-            .max()
-            .unwrap_or(0)
-            + 1;
+        // Classes are the sorted unique non-negative labels (sklearn
+        // `classes_ = np.unique(y); classes_ = classes_[classes_ != -1]`,
+        // `_label_propagation.py:272-274`). `n_classes = len(classes_)`.
+        let classes_: Vec<isize> = {
+            let mut c: Vec<isize> = y.iter().copied().filter(|&l| l >= 0).collect();
+            c.sort_unstable();
+            c.dedup();
+            c
+        };
+        let n_classes = classes_.len();
 
         // Build the affinity matrix.
         let mut w = match self.kernel {
@@ -478,7 +511,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelPr
         let mut initial_y = Array2::from_elem((n_samples, n_classes), F::zero());
         for (i, &label) in y.iter().enumerate() {
             if label >= 0 {
-                let c = label as usize;
+                // Index by the POSITION of the label in `classes_`, not its raw
+                // value (sklearn one-hots `classes_ == label`, `:283-284`).
+                let c = classes_.iter().position(|&v| v == label).unwrap_or(0);
                 if c < n_classes {
                     initial_y[[i, c]] = F::one();
                 }
@@ -506,7 +541,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelPr
                             best_c = c;
                         }
                     }
-                    best_c as isize
+                    // Map the argmax column INDEX through `classes_`
+                    // (sklearn `transduction_ = classes_[argmax(...)]`, `:333`).
+                    classes_.get(best_c).copied().unwrap_or(0)
                 })
                 .collect(),
         );
