@@ -68,6 +68,26 @@
 //! let scaled = StandardScaler::<f64>::new().fit_transform(&x).unwrap();
 //! // scaled columns now have mean ≈ 0 and std ≈ 1
 //! ```
+//!
+//! ## REQ status
+//!
+//! Binary (R-DEFER-2) for the crate-root RE-EXPORT BOUNDARY — this file is the
+//! public-API surface, NOT an estimator. Mirrors the `__all__` of six sklearn
+//! modules: `preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`,
+//! `feature_extraction/text.py:34-43`, `impute/__init__.py:13`,
+//! `random_projection.py:50-54`, `compose/__init__.py:15-20`. Design doc:
+//! `.design/preprocess/lib.md`. Per-estimator value parity lives in the sibling
+//! routed module docs; this table covers only the boundary surface + the ferray
+//! substrate gap. Tracking: #1361.
+//!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block (`:106-163`) surfaces every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums and the `chi2`/`f_classif`/`f_regression` scoring fns), mirroring the six modules' `__all__`. The surfaced set is the documented subset that is implemented; not-yet-translated names (`KernelCenterer`, `GenericUnivariateSelect`, `MissingIndicator`, `HashingVectorizer`/`TfidfVectorizer`, `mutual_info_*`, the preprocessing free fns, `johnson_lindenstrauss_min_dim`, `make_column_selector`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
+//! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across all 33 submodules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
+//!
+//! `BinaryEncoder`/`FittedBinaryEncoder` (`:129`) is a `category_encoders`-style
+//! extension with no sklearn `__all__` analog — an extension of the boundary, not
+//! a sklearn-parity item and not a blocker.
 
 pub mod binarizer;
 pub mod binary_encoder;
