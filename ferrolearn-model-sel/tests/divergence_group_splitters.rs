@@ -200,7 +200,6 @@ fn gss_test_group_count_round_vs_ceil() {
 //
 // Tracking: #1752
 #[test]
-#[ignore = "divergence: StratifiedGroupKFold size-sort/SSE objective != sklearn std-of-class-dist + _find_best_fold; tracking #1752"]
 fn sgkf_objective_diverges() {
     let y = array![0usize, 0, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0];
     let groups = array![1usize, 1, 2, 2, 3, 3, 3, 4, 5, 5, 5, 5, 6, 6, 7, 8, 8];

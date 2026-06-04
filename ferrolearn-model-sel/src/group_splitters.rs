@@ -28,6 +28,22 @@ fn unique_groups(groups: &Array1<usize>) -> Vec<usize> {
     g
 }
 
+/// Population standard deviation (ddof=0) of a slice, matching `np.std`.
+fn population_std(xs: &[f64]) -> f64 {
+    if xs.is_empty() {
+        return 0.0;
+    }
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let var = xs.iter().map(|&x| (x - mean) * (x - mean)).sum::<f64>() / n;
+    var.sqrt()
+}
+
+/// `np.isclose(a, b)` with the default `rtol=1e-5, atol=1e-8`.
+fn is_close(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 1e-8 + 1e-5 * b.abs()
+}
+
 fn check_non_empty(groups: &Array1<usize>, context: &str) -> Result<(), FerroError> {
     if groups.is_empty() {
         return Err(FerroError::InsufficientSamples {
@@ -390,49 +406,57 @@ impl StratifiedGroupKFold {
             }
         }
 
-        // Greedy assignment: process groups by descending size, place each
-        // into the fold where it minimises the per-class deviation from the
-        // target proportions.
-        let target_per_fold: Vec<f64> = total_per_class
-            .iter()
-            .map(|&t| t as f64 / self.n_splits as f64)
-            .collect();
-        let mut fold_class_counts = vec![vec![0usize; n_classes]; self.n_splits];
-        let mut group_to_fold: HashMap<usize, usize> = HashMap::new();
+        // Port scikit-learn's StratifiedGroupKFold._iter_test_indices greedy
+        // (`sklearn/model_selection/_split.py:1015-1059`, v1.5.2). `group_counts`
+        // is keyed by ASCENDING unique group id, so collecting it yields rows in
+        // the same order as numpy's `np.unique(groups)` ascending-sorted unique
+        // list; `group_to_fold` therefore maps raw group id -> fold.
+        let y_cnt: Vec<f64> = total_per_class.iter().map(|&t| t as f64).collect();
+        let ordered: Vec<(usize, Vec<usize>)> = group_counts.into_iter().collect();
 
-        let mut ordered: Vec<(usize, Vec<usize>)> = group_counts.into_iter().collect();
-        ordered.sort_by(|a, b| {
-            let sa: usize = a.1.iter().sum();
-            let sb: usize = b.1.iter().sum();
-            sb.cmp(&sa)
+        // Order groups by DESCENDING population std (ddof=0) of their class-count
+        // row, ties broken by ASCENDING group id. `ordered` is already ascending
+        // by group id and `sort_by` is stable, so sorting on the descending-std
+        // key reproduces numpy's `argsort(-std(...), kind="mergesort")`.
+        let mut sort_idx: Vec<usize> = (0..ordered.len()).collect();
+        let group_std: Vec<f64> = ordered
+            .iter()
+            .map(|(_, counts)| {
+                population_std(&counts.iter().map(|&c| c as f64).collect::<Vec<_>>())
+            })
+            .collect();
+        sort_idx.sort_by(|&a, &b| {
+            group_std[b]
+                .partial_cmp(&group_std[a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        for (group, counts) in ordered {
-            let mut best_fold = 0usize;
-            let mut best_score = f64::INFINITY;
-            for (k, fold_counts) in fold_class_counts.iter().enumerate() {
-                let mut score = 0.0_f64;
-                for c in 0..n_classes {
-                    let new_count = (fold_counts[c] + counts[c]) as f64;
-                    let dev = new_count - target_per_fold[c];
-                    score += dev * dev;
-                }
-                if score < best_score {
-                    best_score = score;
-                    best_fold = k;
-                }
-            }
+        let mut fold_class_counts = vec![vec![0.0_f64; n_classes]; self.n_splits];
+        let mut group_to_fold: HashMap<usize, usize> = HashMap::new();
+
+        for &idx in &sort_idx {
+            let (group, counts) = &ordered[idx];
+            let group_y_counts: Vec<f64> = counts.iter().map(|&c| c as f64).collect();
+            let best_fold =
+                Self::find_best_fold(&fold_class_counts, &y_cnt, &group_y_counts, self.n_splits);
             for c in 0..n_classes {
-                fold_class_counts[best_fold][c] += counts[c];
+                fold_class_counts[best_fold][c] += group_y_counts[c];
             }
-            group_to_fold.insert(group, best_fold);
+            group_to_fold.insert(*group, best_fold);
         }
 
         let mut folds: Vec<(Vec<usize>, Vec<usize>)> = (0..self.n_splits)
             .map(|_| (Vec::new(), Vec::new()))
             .collect();
         for (i, &g) in groups.iter().enumerate() {
-            let fold_idx = *group_to_fold.get(&g).unwrap();
+            // Infallible: every unique group id received a fold above; the
+            // fallible accessor avoids a bare `unwrap` per R-CODE-2.
+            let fold_idx = *group_to_fold
+                .get(&g)
+                .ok_or_else(|| FerroError::InvalidParameter {
+                    name: "groups".into(),
+                    reason: "StratifiedGroupKFold: group missing from fold assignment".into(),
+                })?;
             for (k, (train, test)) in folds.iter_mut().enumerate() {
                 if k == fold_idx {
                     test.push(i);
@@ -442,6 +466,51 @@ impl StratifiedGroupKFold {
             }
         }
         Ok(folds)
+    }
+
+    /// Port of scikit-learn's `StratifiedGroupKFold._find_best_fold`
+    /// (`sklearn/model_selection/_split.py:1039-1059`, v1.5.2). Returns the fold
+    /// index that, after tentatively adding `group_y_counts`, minimises the mean
+    /// per-class population std of `y_counts_per_fold / y_cnt`, tie-broken
+    /// (`np.isclose`) by the fewest samples currently in the fold.
+    fn find_best_fold(
+        y_counts_per_fold: &[Vec<f64>],
+        y_cnt: &[f64],
+        group_y_counts: &[f64],
+        n_splits: usize,
+    ) -> usize {
+        let n_classes = y_cnt.len();
+        let mut best_fold = 0usize;
+        let mut min_eval = f64::INFINITY;
+        let mut min_samples_in_fold = f64::INFINITY;
+        for i in 0..n_splits {
+            // For each class, population std (axis=0, over folds) of the
+            // tentatively-updated y_counts_per_fold[.][c] / y_cnt[c].
+            let mut std_sum = 0.0_f64;
+            for c in 0..n_classes {
+                let col: Vec<f64> = (0..n_splits)
+                    .map(|f| {
+                        let mut v = y_counts_per_fold[f][c];
+                        if f == i {
+                            v += group_y_counts[c];
+                        }
+                        v / y_cnt[c]
+                    })
+                    .collect();
+                std_sum += population_std(&col);
+            }
+            let fold_eval = std_sum / n_classes as f64;
+            let samples_in_fold: f64 = y_counts_per_fold[i].iter().sum();
+            // Replicate sklearn precedence: (a<b) or (isclose and c<d).
+            let is_better = fold_eval < min_eval
+                || (is_close(fold_eval, min_eval) && samples_in_fold < min_samples_in_fold);
+            if is_better {
+                min_eval = fold_eval;
+                min_samples_in_fold = samples_in_fold;
+                best_fold = i;
+            }
+        }
+        best_fold
     }
 }
 
