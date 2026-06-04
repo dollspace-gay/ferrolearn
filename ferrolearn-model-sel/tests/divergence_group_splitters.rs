@@ -116,7 +116,6 @@ fn lpgo_combination_order_parity() {
 //
 // Tracking: #1750
 #[test]
-#[ignore = "divergence: GroupKFold HashMap-ordered greedy != sklearn argsort[::-1] tie-break (non-deterministic); tracking #1750"]
 fn gkf_greedy_ordering_diverges() {
     let groups = array![0usize, 0, 1, 1, 2, 2, 3, 3];
     let g: Vec<usize> = groups.to_vec();

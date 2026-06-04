@@ -78,18 +78,26 @@ impl GroupKFold {
             });
         }
 
-        // Sort groups by descending size, assign each to the smallest-load fold.
-        let mut sizes: HashMap<usize, usize> = HashMap::new();
+        // Reproduce sklearn's GroupKFold._iter_test_indices exactly
+        // (`sklearn/model_selection/_split.py:614-636`): weight each group by its
+        // sample count, then distribute the most frequent groups first into the
+        // lightest fold. The ordering must be DETERMINISTIC — `unique` is sorted
+        // ascending, and sklearn's `np.argsort(counts)[::-1]` (stable argsort +
+        // reversal) visits equal-count groups in DESCENDING group-id order, so we
+        // sort by `(count desc, group_id desc)` over a deterministic Vec (never a
+        // HashMap, whose iteration order is non-deterministic).
+        let mut count_of: BTreeMap<usize, usize> = BTreeMap::new();
         for &g in groups.iter() {
-            *sizes.entry(g).or_insert(0) += 1;
+            *count_of.entry(g).or_insert(0) += 1;
         }
-        let mut ordered: Vec<(usize, usize)> = sizes.into_iter().collect();
-        ordered.sort_by_key(|t| std::cmp::Reverse(t.1));
+        let mut ordered: Vec<(usize, usize)> = unique.iter().map(|&g| (g, count_of[&g])).collect();
+        // Descending count, ties broken by descending group id.
+        ordered.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
 
         let mut fold_size = vec![0usize; self.n_splits];
         let mut group_to_fold: HashMap<usize, usize> = HashMap::new();
         for (group, count) in ordered {
-            // pick fold with smallest current size
+            // pick fold with smallest current size (first/lowest index on ties)
             let mut min_idx = 0usize;
             let mut min_val = fold_size[0];
             for (i, &v) in fold_size.iter().enumerate().skip(1) {
