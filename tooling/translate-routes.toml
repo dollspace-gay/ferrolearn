@@ -990,3 +990,9 @@ crate_pattern = "ferrolearn-model-sel/src/dummy.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/dummy.py"]
 design = ".design/model-sel/dummy.md"
 parity_ops = ["DummyClassifier", "DummyRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/param_grid.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
+design = ".design/model-sel/param_grid.md"
+parity_ops = ["ParameterGrid"]
