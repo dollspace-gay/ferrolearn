@@ -998,6 +998,12 @@ design = ".design/model-sel/dummy.md"
 parity_ops = ["DummyClassifier", "DummyRegressor"]
 
 [[route]]
+crate_pattern = "ferrolearn-model-sel/src/split.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_split.py"]
+design = ".design/model-sel/split.md"
+parity_ops = ["train_test_split"]
+
+[[route]]
 crate_pattern = "ferrolearn-model-sel/src/param_grid.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
 design = ".design/model-sel/param_grid.md"
