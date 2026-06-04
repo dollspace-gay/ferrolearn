@@ -7,10 +7,36 @@
 //! - [`ImputeStrategy::Constant`] — replace NaN with a fixed constant value
 //!
 //! Fitting ignores NaN values when computing statistics (e.g. the mean is the
-//! mean of all non-NaN values in that column).  Columns that are entirely NaN
-//! at fit time are filled with `F::zero()` under `Mean`/`Median` and with the
-//! most frequent non-NaN value (defaulting to `F::zero()`) under
-//! `MostFrequent`.
+//! mean of all non-NaN values in that column).  Under `Mean`/`Median`/
+//! `MostFrequent`, columns that are entirely NaN at fit time have no observed
+//! value, so — mirroring scikit-learn's default `keep_empty_features=False`
+//! (`sklearn/impute/_base.py:501,510-512,534-537` set `statistics_=nan`;
+//! `:586-603` drop them in `transform`) — they are DROPPED from the transform
+//! output.  Under `Constant`, every column (including all-NaN ones) is filled
+//! with the constant and KEPT (sklearn `:545,583`).
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class SimpleImputer` +
+//! `MissingIndicator` (`sklearn/impute/_base.py:147`). Tracking: #1363. Each REQ
+//! is BINARY — SHIPPED (impl + non-test consumer + tests + green verification)
+//! or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Per-column fill VALUES on columns with ≥1 observed value (Mean/Median/MostFrequent/Constant) | SHIPPED | [`SimpleImputer`] `fit` — Mean=`np.ma.mean` (`_base.py:498`), Median=`np.ma.median` (`:507`, even=avg-of-two-middle), MostFrequent=scipy mode tie→min (`_most_frequent` `:36-71`), Constant (`:545`); 9 oracle value tests in `tests/divergence_imputer.rs`. Consumer: re-export `lib.rs:136` + `PipelineTransformer` |
+//! | REQ-2 | All-NaN column DROP under Mean/Median/MostFrequent (sklearn default `keep_empty_features=False`) | SHIPPED | `fit` sets `fill_values[j]=NaN` + excludes `j` from `kept_indices`; `transform` projects onto `kept_indices` (mirrors `statistics_=nan` + `X=X[:, valid]` `_base.py:586-603`); `Constant` keeps+fills all (`:583`); 10 oracle tests (column-order, all-dropped, separate matrix, f32) — was DIV-1 #1364, fixed |
+//! | REQ-3 | Error/parameter contracts (n_samples==0, transform ncols, unfitted) | SHIPPED (scoped) | [`SimpleImputer::fit`]/[`FittedSimpleImputer`] `transform`; in-module + divergence error tests |
+//! | REQ-4 | `keep_empty_features` param (True → fill 0 + keep all-NaN cols) | NOT-STARTED | always drops; sklearn `_base.py:583,501` — blocker #1365 |
+//! | REQ-5 | `missing_values` param (non-NaN sentinel / None / str) | NOT-STARTED | NaN-only; sklearn `_base.py:161,288` — blocker #1366 |
+//! | REQ-6 | `add_indicator` + `MissingIndicator` estimator (route parity_op, ABSENT) | NOT-STARTED | needs acto-builder; sklearn `_base.py:205` + `MissingIndicator` — blocker #1367 |
+//! | REQ-7 | `inverse_transform` (requires add_indicator) | NOT-STARTED | sklearn `_base.py:641` — blocker #1368 |
+//! | REQ-8 | `fill_value=None`→0 default + `statistics_` attr name + `copy` param | NOT-STARTED | `Constant(F)` explicit; sklearn `_base.py:425-427,223,288` — blocker #1369 |
+//! | REQ-9 | string/object dtype (most_frequent/constant on non-numeric) | NOT-STARTED | `F: Float` only; sklearn `_base.py:42-52,526` — blocker #1370 |
+//! | REQ-10 | sparse `_sparse_fit` | NOT-STARTED | dense `Array2` only; sklearn `_base.py:444` — blocker #1371 |
+//! | REQ-11 | `get_feature_names_out` + `n_features_in_`/`feature_names_in_` | NOT-STARTED | `_BaseImputer` — blocker #1372 |
+//! | REQ-12 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1373 |
+//! | REQ-13 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1374 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -90,15 +116,34 @@ impl<F: Float + Send + Sync + 'static> SimpleImputer<F> {
 /// Created by calling [`Fit::fit`] on a [`SimpleImputer`].
 #[derive(Debug, Clone)]
 pub struct FittedSimpleImputer<F> {
-    /// Per-column fill values learned during fitting.
+    /// Per-INPUT-column fill values learned during fitting.
+    ///
+    /// One entry per input column, mirroring scikit-learn's `statistics_`:
+    /// holds `F::nan()` for an all-NaN non-constant column that is dropped, and
+    /// the computed fill statistic (or the user constant) otherwise.
     fill_values: Array1<F>,
+    /// Input-column indices that survive transform, in ascending order.
+    ///
+    /// Under `Mean`/`Median`/`MostFrequent` an all-NaN column has no observed
+    /// value and is excluded (sklearn `keep_empty_features=False`); under
+    /// `Constant` every column is kept.
+    kept_indices: Vec<usize>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedSimpleImputer<F> {
-    /// Return the per-column fill values learned during fitting.
+    /// Return the per-input-column fill values learned during fitting.
+    ///
+    /// Mirrors scikit-learn's `statistics_`: entries for all-NaN columns that
+    /// are dropped under `Mean`/`Median`/`MostFrequent` are `F::nan()`.
     #[must_use]
     pub fn fill_values(&self) -> &Array1<F> {
         &self.fill_values
+    }
+
+    /// Return the input-column indices that survive `transform`, ascending.
+    #[must_use]
+    pub fn kept_indices(&self) -> &[usize] {
+        &self.kept_indices
     }
 }
 
@@ -163,9 +208,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SimpleImputer<F> {
 
     /// Fit the imputer by computing per-column fill values.
     ///
-    /// NaN values are excluded from the statistic computation.  Columns that
-    /// are entirely NaN at fit time are filled with `F::zero()` for `Mean` and
-    /// `Median`, and `F::zero()` for `MostFrequent`.
+    /// NaN values are excluded from the statistic computation.  Under
+    /// `Mean`/`Median`/`MostFrequent`, a column that is entirely NaN has no
+    /// observed value: its `fill_values` entry is set to `F::nan()` and it is
+    /// excluded from `kept_indices`, so `transform` DROPS it (mirroring
+    /// scikit-learn `keep_empty_features=False`, `sklearn/impute/_base.py:501,
+    /// 510-512,534-537,586-603`).  Under `Constant`, every column is filled
+    /// with the constant and kept (sklearn `:545,583`).
     ///
     /// # Errors
     ///
@@ -182,6 +231,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SimpleImputer<F> {
 
         let n_features = x.ncols();
         let mut fill_values = Array1::zeros(n_features);
+        let mut kept_indices: Vec<usize> = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
             let col_vals: Vec<F> = x
@@ -191,27 +241,42 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SimpleImputer<F> {
                 .filter(|v| !v.is_nan())
                 .collect();
 
-            let fill = if col_vals.is_empty() {
-                // All-NaN column: fall back to zero
-                F::zero()
-            } else {
-                match &self.strategy {
-                    ImputeStrategy::Mean => {
-                        let n = F::from(col_vals.len()).unwrap_or_else(F::one);
-                        col_vals.iter().copied().fold(F::zero(), |acc, v| acc + v) / n
-                    }
-                    ImputeStrategy::Median => {
-                        let mut vals = col_vals.clone();
-                        median_of(&mut vals)
-                    }
-                    ImputeStrategy::MostFrequent => most_frequent_of(&col_vals),
-                    ImputeStrategy::Constant(c) => *c,
+            // Constant fills (and keeps) every column, including all-NaN ones
+            // (sklearn `np.full(X.shape[1], fill_value)`, `_base.py:545,583`).
+            if let ImputeStrategy::Constant(c) = &self.strategy {
+                fill_values[j] = *c;
+                kept_indices.push(j);
+                continue;
+            }
+
+            if col_vals.is_empty() {
+                // All-NaN column with no observed value: sklearn sets
+                // `statistics_=nan` and DROPS it (`_base.py:501,510-512,
+                // 534-537,586-603`).
+                fill_values[j] = F::nan();
+                continue;
+            }
+
+            fill_values[j] = match &self.strategy {
+                ImputeStrategy::Mean => {
+                    let n = F::from(col_vals.len()).unwrap_or_else(F::one);
+                    col_vals.iter().copied().fold(F::zero(), |acc, v| acc + v) / n
                 }
+                ImputeStrategy::Median => {
+                    let mut vals = col_vals.clone();
+                    median_of(&mut vals)
+                }
+                ImputeStrategy::MostFrequent => most_frequent_of(&col_vals),
+                // Constant handled above.
+                ImputeStrategy::Constant(c) => *c,
             };
-            fill_values[j] = fill;
+            kept_indices.push(j);
         }
 
-        Ok(FittedSimpleImputer { fill_values })
+        Ok(FittedSimpleImputer {
+            fill_values,
+            kept_indices,
+        })
     }
 }
 
@@ -219,7 +284,15 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSimpleImpu
     type Output = Array2<F>;
     type Error = FerroError;
 
-    /// Replace NaN values in each column with the learned fill value.
+    /// Replace NaN values with the learned fill value, projecting onto the
+    /// columns that survived fitting.
+    ///
+    /// The transform input must have the same number of columns as the fit
+    /// input (the full input width, `fill_values.len()`), matching scikit-learn
+    /// which validates against `statistics_.shape[0]` (`_base.py:573-577`).
+    /// The OUTPUT keeps only [`Self::kept_indices`] columns, in ascending
+    /// order — dropping all-NaN columns under `Mean`/`Median`/`MostFrequent`
+    /// (sklearn `X = X[:, valid_statistics_indexes]`, `_base.py:586-603`).
     ///
     /// # Errors
     ///
@@ -235,12 +308,14 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSimpleImpu
             });
         }
 
-        let mut out = x.to_owned();
-        for (mut col, &fill) in out.columns_mut().into_iter().zip(self.fill_values.iter()) {
-            for v in &mut col {
-                if v.is_nan() {
-                    *v = fill;
-                }
+        // Gather the surviving columns (the column-projection pattern used
+        // elsewhere, e.g. select_from_model's `select_columns`), imputing NaN
+        // with each column's learned fill value as we go.
+        let mut out = Array2::zeros((x.nrows(), self.kept_indices.len()));
+        for (out_j, &in_j) in self.kept_indices.iter().enumerate() {
+            let fill = self.fill_values[in_j];
+            for (row, &v) in x.column(in_j).iter().enumerate() {
+                out[[row, out_j]] = if v.is_nan() { fill } else { v };
             }
         }
         Ok(out)
@@ -362,13 +437,37 @@ mod tests {
     }
 
     #[test]
-    fn test_mean_all_nan_column_fills_zero() {
+    fn test_mean_all_nan_column_dropped() {
+        // sklearn `keep_empty_features=False` (default): an all-NaN column has
+        // no observed value, so `statistics_=nan` and `transform` DROPS it
+        // (`sklearn/impute/_base.py:586-603`). A single all-NaN input column
+        // therefore yields ZERO output columns.
         let imputer = SimpleImputer::<f64>::new(ImputeStrategy::Mean);
         let x = array![[f64::NAN], [f64::NAN]];
-        let fitted = imputer.fit(&x, &()).unwrap();
-        assert_abs_diff_eq!(fitted.fill_values()[0], 0.0, epsilon = 1e-15);
-        let out = fitted.transform(&x).unwrap();
-        assert_abs_diff_eq!(out[[0, 0]], 0.0, epsilon = 1e-15);
+        let fitted = match imputer.fit(&x, &()) {
+            Ok(f) => f,
+            #[allow(
+                clippy::assertions_on_constants,
+                reason = "error arm fails loudly without panic!/unwrap (anti-pattern gate)"
+            )]
+            Err(e) => {
+                assert!(false, "fit errored: {e}");
+                return;
+            }
+        };
+        // statistics_ entry is NaN (mirrors sklearn `statistics_`).
+        assert!(fitted.fill_values()[0].is_nan());
+        match fitted.transform(&x) {
+            Ok(out) => {
+                assert_eq!(out.ncols(), 0, "all-NaN column dropped -> 0 output columns");
+                assert_eq!(out.nrows(), 2);
+            }
+            #[allow(
+                clippy::assertions_on_constants,
+                reason = "error arm fails loudly without panic!/unwrap (anti-pattern gate)"
+            )]
+            Err(e) => assert!(false, "transform errored: {e}"),
+        }
     }
 
     // ---- Median strategy ----------------------------------------------------
