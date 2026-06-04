@@ -195,3 +195,62 @@ fn divergence_load_qid_token_ignored() {
     assert_eq!(x.dim(), (1, 2), "shape must match sklearn (1, 2)");
     assert_eq!(x, sklearn_x, "dense X must match sklearn's toarray()");
 }
+
+/// Divergence (NEW, found re-auditing #1642/#1643): `load_svmlight_files`
+/// resolves the `zero_based="auto"` base offset PER FILE, whereas sklearn
+/// decides it GLOBALLY across all files. sklearn
+/// (`sklearn/datasets/_svmlight_format_io.py:402-406`):
+/// ```text
+///     if (zero_based is False
+///         or zero_based == "auto"
+///         and all(len(tmp[1]) and np.min(tmp[1]) > 0 for tmp in r)):
+///         for _, indices, _, _, _ in r:
+///             indices -= 1
+/// ```
+/// The shift is applied to EVERY file iff ALL files have min index > 0. When a
+/// SINGLE file contains a `0:` column the whole batch is treated as 0-based and
+/// NO file is shifted. ferrolearn's `load_svmlight_files`
+/// (`svmlight.rs` fn `load_svmlight_files`: `paths.iter().map(... auto_base_offset(pf.min_index))`)
+/// computes the offset independently per file, so a 1-based file alongside a
+/// 0-based file gets shifted when sklearn would not.
+///
+/// Live oracle (sklearn 1.5.2, from /tmp):
+/// ```python
+/// import io
+/// from sklearn.datasets import load_svmlight_files
+/// a=io.BytesIO(b'1 1:1.0 2:2.0\n'); b=io.BytesIO(b'0 0:3.0 4:9.0\n')
+/// Xa,ya,Xb,yb=load_svmlight_files([a,b])
+/// Xa.shape          # -> (1, 5)
+/// Xa.toarray()      # -> [[0., 1., 2., 0., 0.]]   (NO shift: file b has index 0)
+/// Xb.toarray()      # -> [[3., 0., 0., 0., 9.]]
+/// ```
+/// ferrolearn shifts file A independently (its min index is 1) and returns
+/// `Xa = [[1., 2., 0., 0., 0.]]` — columns off by one vs sklearn.
+/// Tracking: #1650
+#[test]
+#[ignore = "divergence: load_svmlight_files auto base is per-file not global; tracking #1650"]
+fn divergence_load_files_global_zero_based_auto() {
+    // sklearn dense X for file A under the GLOBAL auto rule (live oracle above):
+    // because file B carries a `0:` column, all(min>0) is False, so neither file
+    // is shifted; file A's `1:1.0 2:2.0` lands in columns 1 and 2.
+    let sklearn_xa: Array2<f64> = ndarray::array![[0.0, 1.0, 2.0, 0.0, 0.0]];
+    let sklearn_xb: Array2<f64> = ndarray::array![[3.0, 0.0, 0.0, 0.0, 9.0]];
+
+    let dir = tmpdir("globalauto");
+    let pa = dir.join("a.svmlight");
+    let pb = dir.join("b.svmlight");
+    fs::write(&pa, "1 1:1.0 2:2.0\n").unwrap();
+    fs::write(&pb, "0 0:3.0 4:9.0\n").unwrap();
+
+    let results = load_svmlight_files(&[pa, pb], None).unwrap();
+
+    assert_eq!(
+        results[0].0, sklearn_xa,
+        "file A must NOT be shifted: sklearn decides zero_based=auto globally, \
+         and file B's `0:` column makes the whole batch 0-based"
+    );
+    assert_eq!(
+        results[1].0, sklearn_xb,
+        "file B dense X must match sklearn's toarray()"
+    );
+}
