@@ -210,7 +210,6 @@ fn green_ledoit_wolf_parity() {
 // Tracking: #1701
 // ===========================================================================
 #[test]
-#[ignore = "divergence: OAS uses pre-1.5 formula vs sklearn _shrunk_covariance.py:79-87; tracking #1701"]
 #[allow(
     clippy::needless_range_loop,
     reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"

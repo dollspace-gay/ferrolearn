@@ -883,30 +883,31 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OAS<F> {
 
         let s = empirical_cov(x, &location, self.assume_centered);
 
-        let n_f = F::from(n).unwrap();
-        let p_f = F::from(p).unwrap();
-        let two = F::from(2.0).unwrap();
+        let n_f = F::from(n).ok_or_else(|| FerroError::NumericalInstability {
+            message: "OAS::fit: cannot convert n_samples to float".into(),
+        })?;
+        let p_f = F::from(p).ok_or_else(|| FerroError::NumericalInstability {
+            message: "OAS::fit: cannot convert n_features to float".into(),
+        })?;
 
-        let tr_s = trace(&s);
-        let tr_s2 = trace_sq(&s);
+        // sklearn 1.5.2 `oas` (_shrunk_covariance.py:79-87) on the empirical
+        // (biased MLE, ddof=0) covariance `emp`:
+        //   mu    = trace(emp) / n_features
+        //   alpha = mean(emp ** 2)          # sum(emp_ij^2) / n_features^2
+        //   num   = alpha + mu^2
+        //   den   = (n_samples + 1) * (alpha - mu^2 / n_features)
+        //   shrinkage = 1.0 if den == 0 else min(num / den, 1.0)
+        let mu = trace(&s) / p_f;
+        let alpha = trace_sq(&s) / (p_f * p_f);
+        let mu_sq = mu * mu;
+        let num = alpha + mu_sq;
+        let den = (n_f + F::one()) * (alpha - mu_sq / p_f);
 
-        // OAS formula:
-        // rho_num = (1 - 2/p) * trace(S^2) + trace(S)^2
-        // rho_den = (n + 1 - 2/p) * (trace(S^2) - trace(S)^2 / p)
-        let rho_num = (F::one() - two / p_f) * tr_s2 + tr_s * tr_s;
-        let rho_den = (n_f + F::one() - two / p_f) * (tr_s2 - tr_s * tr_s / p_f);
-
-        let shrinkage = if rho_den.abs() < F::from(1e-15).unwrap_or_else(F::epsilon) {
+        let shrinkage = if den == F::zero() {
             F::one()
         } else {
-            let ratio = rho_num / rho_den;
-            if ratio < F::zero() {
-                F::zero()
-            } else if ratio > F::one() {
-                F::one()
-            } else {
-                ratio
-            }
+            let ratio = num / den;
+            if ratio > F::one() { F::one() } else { ratio }
         };
 
         let cov = shrink_covariance(&s, shrinkage, p);
