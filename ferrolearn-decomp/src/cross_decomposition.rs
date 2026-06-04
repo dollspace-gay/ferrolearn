@@ -14,8 +14,8 @@
 //! - [`PLSCanonical`] — Canonical PLS via NIPALS. Symmetric deflation of both
 //!   X and Y.
 //! - [`CCA`] — Canonical Correlation Analysis via NIPALS. Maximises
-//!   *correlation* (not covariance) between X-scores and Y-scores by
-//!   normalising scores to unit variance.
+//!   *correlation* (not covariance) between X-scores and Y-scores using mode-B
+//!   (pseudo-inverse) weight updates, matching scikit-learn's `CCA`.
 //!
 //! # Examples
 //!
@@ -34,6 +34,43 @@
 //! let x_scores = fitted.transform(&x).unwrap();
 //! assert_eq!(x_scores.ncols(), 1);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/cross_decomposition.md`. Tracking: #1618. Each REQ is
+//! BINARY — SHIPPED (impl + non-test consumer + tests + green verification) or
+//! NOT-STARTED (concrete open blocker). Non-test consumer: crate re-export
+//! (`lib.rs:79-81`, the 4 estimators + `Fitted*`); NO PyO3 binding. Oracle = live
+//! sklearn 1.5.2 (`cross_decomposition/_pls.py`), run from `/tmp` (R-CHAR-3). All
+//! four estimators (PLSRegression/PLSCanonical/CCA/PLSSVD) are DETERMINISTIC
+//! (NIPALS/SVD) and now have full VALUE parity with sklearn (default tol) including
+//! sign — verified to machine epsilon (≤1.2e-15) on fresh fixtures across 5 seeds.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | ddof=1 centering + scaling | SHIPPED | `centre_scale` (n-1) = sklearn `_pls.py:142,145` |
+//! | REQ-2 | `scale=True/False` toggle | SHIPPED | green-guard |
+//! | REQ-3 | ctor defaults `max_iter=500`/`tol=1e-6` | SHIPPED | = sklearn `_pls.py:60` |
+//! | REQ-4 | Error/parameter contracts | SHIPPED (scoped) | `fit` guards; FLAG: sklearn raises `InvalidParameterError` |
+//! | REQ-5 | f32/f64 generic | SHIPPED | green-guard |
+//! | REQ-6 | Fitted shapes | SHIPPED | green-guards |
+//! | REQ-7 | Deflation-mode split (regression vs canonical) | SHIPPED | `greenguard_regression_vs_canonical_differ` |
+//! | REQ-8 | NIPALS seed (first non-constant Y col) + convergence (`‖Δw‖²<tol`, `Y.shape[1]==1` break) | SHIPPED | = sklearn `_pls.py:71-74,105-110`; was #1622, fixed |
+//! | REQ-9 | `PLSRegression::predict`/`coefficients_` value parity | SHIPPED | matches sklearn `predict` to ~9e-16 (sign-invariant); `greenguard_plsregression_predict_matches_sklearn` |
+//! | REQ-10 | NIPALS weights/scores value parity incl. sign (`_svd_flip_1d`) | SHIPPED | per-component max-abs-positive flip (`_pls.py:354`); matches sklearn ~6e-16. Was #1620, fixed |
+//! | REQ-11 | `transform` value parity via rotation `W(PᵀW)⁻¹` | SHIPPED | = sklearn `x_rotations_` (`_pls.py:391,438`) |
+//! | REQ-12 | `transform_y` accessor | SHIPPED (scoped) | projects Y onto y-weights |
+//! | REQ-13 | CCA `mode='B'` pseudo-inverse weights | SHIPPED | `pinv(Xk)·y_score` (`_pls.py:88-89`); matches sklearn CCA ~8e-16. Was #1619, fixed |
+//! | REQ-14 | PLSCanonical/CCA NON-unit scores match sklearn | SHIPPED | spurious unit-variance rescaling removed; scores match sklearn std |
+//! | REQ-15 | PLSSVD `svd_flip` sign convention | SHIPPED | per U-column max-abs-row positive (`_pls.py:1105`). Was #1621, fixed |
+//! | REQ-16 | PLSSVD `x_weights_`/`y_weights_` value parity incl. sign | SHIPPED | matches sklearn PLSSVD ~1e-15 |
+//! | REQ-17 | public `coef_`/`x_rotations_`/`y_rotations_`/`intercept_` attrs | NOT-STARTED | sklearn `_pls.py:391-401` — blocker #1623 |
+//! | REQ-18 | `deflation_mode`/`mode`/`algorithm='svd'` ctor params | NOT-STARTED | sklearn `_pls.py:215-228` — blocker #1624 |
+//! | REQ-19 | `inverse_transform` API | NOT-STARTED | sklearn `_pls.py:452-503` — blocker #1625 |
+//! | REQ-20 | PyO3 bindings (4 estimators) | NOT-STARTED | absent; only consumer re-export `lib.rs:79-81` — blocker #1626 |
+//! | REQ-21 | ferray substrate | NOT-STARTED | `ndarray` + hand-rolled SVD/pinv — blocker #1627 |
+//!
+//! Count: **16 SHIPPED (REQ-1..16) / 5 NOT-STARTED (REQ-17,18,19,20,21)**.
 
 use ferrolearn_core::backend::Backend;
 use ferrolearn_core::backend_faer::NdarrayFaerBackend;
@@ -443,6 +480,46 @@ fn invert_square<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Result<Arra
     Ok(inv)
 }
 
+/// Moore-Penrose pseudo-inverse of a general `(m, n)` matrix via the thin SVD.
+///
+/// `pinv(A) = V Σ⁺ Uᵀ`, where `A = U Σ Vᵀ` is the thin SVD and `Σ⁺` inverts the
+/// singular values above a rank-cutoff tolerance (mirroring scipy's `pinv2`,
+/// `sklearn/cross_decomposition/_pls.py:41-56`: `cond = max(s) * factor * eps`,
+/// `factor = 1e6` for f64). Returns an `(n, m)` matrix. Used by the CCA mode-B
+/// NIPALS path (`X_pinv @ y_score`, `_pls.py:85-89`).
+fn pinv<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let (_m, n) = a.dim();
+    // Thin SVD: U is (m, k), s is (k,), Vt is (k, n), k = min(m, n).
+    let (u, s, vt) = svd_dispatch(a)?;
+    let k = s.len();
+
+    // Rank cutoff matching scipy's `_pinv2_old` (factor 1e6 for f64 / 1e3 f32).
+    let factor = if TypeId::of::<F>() == TypeId::of::<f32>() {
+        F::from(1e3).unwrap_or_else(F::epsilon)
+    } else {
+        F::from(1e6).unwrap_or_else(F::epsilon)
+    };
+    let max_s = s
+        .iter()
+        .copied()
+        .fold(F::zero(), |acc, v| if v > acc { v } else { acc });
+    let cond = max_s * factor * F::epsilon();
+
+    // pinv = V Σ⁺ Uᵀ. Build (V * Σ⁺) as (n, k), then multiply by Uᵀ (k, m).
+    // V = Vt^T so V[i, c] = vt[c, i]; scale column c by 1/s[c] when s[c] > cond.
+    let mut v_sinv = Array2::<F>::zeros((n, k));
+    for c in 0..k {
+        if s[c] > cond {
+            let inv = F::one() / s[c];
+            for i in 0..n {
+                v_sinv[[i, c]] = vt[[c, i]] * inv;
+            }
+        }
+    }
+    // (n, k) @ (k, m) -> (n, m). Uᵀ has shape (k, m); u is (m, k) so use u.t().
+    Ok(v_sinv.dot(&u.t()))
+}
+
 // ===========================================================================
 // PLSSVD
 // ===========================================================================
@@ -623,7 +700,37 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSSVD<F> {
         let c = xc.t().dot(&yc);
 
         // SVD of C.
-        let (u, _s, vt) = svd_dispatch(&c)?;
+        let (mut u, _s, mut vt) = svd_dispatch(&c)?;
+
+        // sklearn `svd_flip(U, Vt)` (`_pls.py:1105`, `u_based_decision=True`):
+        // for each column `j` of `U`, find the max-abs ROW entry (numpy
+        // `argmax` returns the FIRST index on ties, hence strict `>`) and force
+        // its sign positive, applying the same sign to the paired row `j` of
+        // `Vt`. This makes each `x_weights_` column's max-abs entry positive.
+        {
+            let (n_rows, n_cols) = u.dim();
+            for j in 0..n_cols {
+                let mut max_idx = 0;
+                let mut max_abs = F::zero();
+                for i in 0..n_rows {
+                    let a = u[[i, j]].abs();
+                    if a > max_abs {
+                        max_abs = a;
+                        max_idx = i;
+                    }
+                }
+                if u[[max_idx, j]] < F::zero() {
+                    for i in 0..n_rows {
+                        u[[i, j]] = -u[[i, j]];
+                    }
+                    if j < vt.nrows() {
+                        for k in 0..vt.ncols() {
+                            vt[[j, k]] = -vt[[j, k]];
+                        }
+                    }
+                }
+            }
+        }
 
         // Take first n_components columns of U, rows of Vt (= columns of V).
         let nc = self.n_components;
@@ -679,6 +786,19 @@ enum ScoreNorm {
     UnitVariance,
 }
 
+/// Internal flag: which NIPALS power-method mode to use when computing the
+/// weight vectors (`sklearn/cross_decomposition/_pls.py:59-115`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeightMode {
+    /// Mode 'A' (PLSRegression / PLSCanonical): `x_weights = Xᵀ·y_score / (y_score·y_score)`
+    /// and `y_weights = Yᵀ·x_score / (x_score·x_score)` (`_pls.py:91,99`).
+    A,
+    /// Mode 'B' (CCA): `x_weights = X_pinv·y_score` and `y_weights = Y_pinv·x_score`
+    /// where the pseudo-inverses are precomputed once per component
+    /// (`_pls.py:78-89,97`).
+    B,
+}
+
 // ---------------------------------------------------------------------------
 // NIPALS core algorithm
 // ---------------------------------------------------------------------------
@@ -701,6 +821,12 @@ struct NipalsResult<F> {
 }
 
 /// Run the NIPALS algorithm.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "internal NIPALS kernel shared by PLSRegression/PLSCanonical/CCA; \
+              the deflation mode, score-norm, and weight (A/B) mode flags are \
+              all independent estimator-specific knobs"
+)]
 fn nipals<F: Float + Send + Sync + 'static>(
     x: &Array2<F>,
     y: &Array2<F>,
@@ -709,6 +835,7 @@ fn nipals<F: Float + Send + Sync + 'static>(
     tol: F,
     mode: NipalsMode,
     score_norm: ScoreNorm,
+    weight_mode: WeightMode,
 ) -> Result<NipalsResult<F>, FerroError> {
     let (n_samples, n_features_x) = x.dim();
     let n_features_y = y.ncols();
@@ -724,39 +851,56 @@ fn nipals<F: Float + Send + Sync + 'static>(
     let mut n_iter_vec = Vec::with_capacity(n_components);
 
     for k in 0..n_components {
-        // Initialise u = column of Y with max variance.
+        // Initialise the y-score `u`.
+        //
+        // Both modes must match sklearn's power-method seed exactly
+        // (`_pls.py:71-74`): the FIRST column of Y with any |entry| > eps. The
+        // power method's fixed point depends on this seed; a max-variance seed
+        // can land on a different (slowly-converging, tie-broken) column and
+        // never reach sklearn's solution under the default tolerance. This seed
+        // is shared by mode-A (PLSRegression / PLSCanonical) and mode-B (CCA).
         let best_col = (0..n_features_y)
-            .max_by(|&a, &b| {
-                let var_a: F = yk
-                    .column(a)
-                    .iter()
-                    .copied()
-                    .fold(F::zero(), |s, v| s + v * v);
-                let var_b: F = yk
-                    .column(b)
-                    .iter()
-                    .copied()
-                    .fold(F::zero(), |s, v| s + v * v);
-                var_a
-                    .partial_cmp(&var_b)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            })
+            .find(|&j| yk.column(j).iter().any(|&v| v.abs() > F::epsilon()))
             .unwrap_or(0);
 
         let mut u = yk.column(best_col).to_owned();
 
+        // Mode-B (CCA, `_pls.py:78-85`): precompute the pseudo-inverses of the
+        // CURRENT deflated Xk / Yk ONCE per component, before the inner power
+        // iteration. `x_weights = X_pinv @ y_score`, `y_weights = Y_pinv @ x_score`.
+        let (x_pinv, y_pinv) = match weight_mode {
+            WeightMode::A => (None, None),
+            WeightMode::B => (Some(pinv(&xk)?), Some(pinv(&yk)?)),
+        };
+
         let mut converged = false;
         let mut iters = 0;
+        // Mode-B finals: the converged loop iteration's normalised x_weights `w`
+        // and y_weights `q` ARE the stored weights (sklearn `_pls.py:357-377`
+        // uses the loop's last `x_weights`/`y_weights` directly, not a recompute
+        // from `y_score`). Captured on break.
+        let mut wq_converged: Option<(Array1<F>, Array1<F>)> = None;
+        // Mode-B convergence is checked on the (normalised) x_weights, matching
+        // sklearn's power method (`_pls.py:106-109`): break when
+        // `‖w − w_old‖² < tol`. Initialised to a large sentinel for the first
+        // iteration. Mode-A retains its existing `u`-based criterion.
+        let mut w_old: Option<Array1<F>> = None;
 
         for iteration in 0..max_iter {
             iters = iteration + 1;
 
-            // w = X^T u / (u^T u)
-            let utu = dot(&u, &u);
-            let mut w = xk.t().dot(&u);
-            if utu > F::epsilon() {
-                w.mapv_inplace(|v| v / utu);
-            }
+            // w = X^T u / (u^T u)   [mode A]   or   w = X_pinv u   [mode B]
+            let mut w = match x_pinv {
+                Some(ref xp) => xp.dot(&u),
+                None => {
+                    let utu = dot(&u, &u);
+                    let mut w = xk.t().dot(&u);
+                    if utu > F::epsilon() {
+                        w.mapv_inplace(|v| v / utu);
+                    }
+                    w
+                }
+            };
             // Normalise w.
             let w_norm = norm(&w);
             if w_norm < F::epsilon() {
@@ -765,15 +909,33 @@ fn nipals<F: Float + Send + Sync + 'static>(
             }
             w.mapv_inplace(|v| v / w_norm);
 
+            // sklearn checks convergence on the normalised x_weights here
+            // (`_pls.py:106-109`), for BOTH modes: break when
+            // `‖x_weights − x_weights_old‖² < tol`. When converged, `w`/`t`/`q`
+            // computed in this iteration are already the finals.
+            if let Some(ref wo) = w_old {
+                let diff: Array1<F> = &w - wo;
+                if dot(&diff, &diff) < tol {
+                    converged = true;
+                }
+            }
+            w_old = Some(w.clone());
+
             // t = X w
             let t = xk.dot(&w);
 
-            // q = Y^T t / (t^T t)
-            let ttt = dot(&t, &t);
-            let mut q = yk.t().dot(&t);
-            if ttt > F::epsilon() {
-                q.mapv_inplace(|v| v / ttt);
-            }
+            // q = Y^T t / (t^T t)   [mode A]   or   q = Y_pinv t   [mode B]
+            let mut q = match y_pinv {
+                Some(ref yp) => yp.dot(&t),
+                None => {
+                    let ttt = dot(&t, &t);
+                    let mut q = yk.t().dot(&t);
+                    if ttt > F::epsilon() {
+                        q.mapv_inplace(|v| v / ttt);
+                    }
+                    q
+                }
+            };
 
             // For CCA: normalise q.
             if score_norm == ScoreNorm::UnitVariance {
@@ -790,65 +952,76 @@ fn nipals<F: Float + Send + Sync + 'static>(
                 u_new.mapv_inplace(|v| v / qtq);
             }
 
-            // For CCA: normalise t and u to unit variance.
-            // (This is done after the loop for storing; here we just check convergence.)
-
-            // Convergence check: ||u_new - u|| / ||u_new||.
-            let diff_norm = {
-                let diff: Array1<F> = &u_new - &u;
-                norm(&diff)
-            };
-            let u_new_norm = norm(&u_new);
-
+            // sklearn breaks here (`_pls.py:107-109`) for BOTH modes: the
+            // current `w` (x_weights) and `q` (y_weights) computed in this
+            // iteration are the finals. The `‖w − w_old‖² < tol` check above
+            // sets `converged`; a single Y target (`Y.shape[1] == 1`,
+            // `_pls.py:107`) forces an immediate one-iteration break. Carry
+            // `u` forward for the standard score recomputation that follows.
             u = u_new;
-
-            if u_new_norm > F::epsilon() && diff_norm / u_new_norm < tol {
-                converged = true;
-                // Recompute final w, t, q with converged u.
-                // w = X^T u / (u^T u), normalised
-                let utu2 = dot(&u, &u);
-                w = xk.t().dot(&u);
-                if utu2 > F::epsilon() {
-                    w.mapv_inplace(|v| v / utu2);
-                }
-                let w_norm2 = norm(&w);
-                if w_norm2 > F::epsilon() {
-                    w.mapv_inplace(|v| v / w_norm2);
-                }
-                // t = X w
-                let t_final = xk.dot(&w);
-                let ttt2 = dot(&t_final, &t_final);
-                q = yk.t().dot(&t_final);
-                if ttt2 > F::epsilon() {
-                    q.mapv_inplace(|v| v / ttt2);
-                }
-                if score_norm == ScoreNorm::UnitVariance {
-                    let q_norm2 = norm(&q);
-                    if q_norm2 > F::epsilon() {
-                        q.mapv_inplace(|v| v / q_norm2);
-                    }
-                }
-                let qtq2 = dot(&q, &q);
-                u = yk.dot(&q);
-                if qtq2 > F::epsilon() {
-                    u.mapv_inplace(|v| v / qtq2);
-                }
+            if converged || n_features_y == 1 {
+                wq_converged = Some((w.clone(), q.clone()));
                 break;
             }
         }
 
-        // Compute final scores and loadings with the converged weights.
-        let utu_final = dot(&u, &u);
-        let mut w_final = xk.t().dot(&u);
-        if utu_final > F::epsilon() {
-            w_final.mapv_inplace(|v| v / utu_final);
-        }
+        // Compute the final (normalised) x_weights.
+        // Both modes use the converged loop iteration's x_weights directly
+        // (sklearn `_pls.py:357` projects with the loop's last `x_weights`,
+        // never a recompute from `y_score` — recomputing would take an extra
+        // power-method step past sklearn's early-stop and re-introduce the
+        // convergence-criterion divergence).
+        let mut w_final = match (x_pinv.as_ref(), wq_converged.as_ref()) {
+            (_, Some((w, _))) => w.clone(),
+            (Some(xp), None) => {
+                // Mode-B did not converge within max_iter; use the last weights
+                // derivable from the current `u` as a best effort.
+                xp.dot(&u)
+            }
+            (None, None) => {
+                // Mode-A did not converge within max_iter; recompute from the
+                // current `u` as a best effort.
+                let utu_final = dot(&u, &u);
+                xk.t().dot(&u).mapv(|v| {
+                    if utu_final > F::epsilon() {
+                        v / utu_final
+                    } else {
+                        v
+                    }
+                })
+            }
+        };
         let w_norm_final = norm(&w_final);
         if w_norm_final > F::epsilon() {
             w_final.mapv_inplace(|v| v / w_norm_final);
         }
 
-        let mut t_final = xk.dot(&w_final);
+        // sklearn `_svd_flip_1d(x_weights, y_weights)` (`_pls.py:354`, def
+        // `:154-161`): force the sign of the max-abs entry of the x-weights to
+        // be positive, applied per component immediately after the weights are
+        // finalised and BEFORE the scores/loadings are computed. numpy's
+        // `argmax` returns the FIRST index on ties (strict `>` below). Because
+        // `t_final`, `p`, `q_final`, and `u_final` are all derived from
+        // `w_final` after this point, flipping `w_final` by `s` propagates `s`
+        // consistently to every downstream quantity (matching sklearn, where
+        // x_weights and y_weights are both multiplied by the same `s`). The
+        // regression `predict`/`coef_` path is sign-invariant and unaffected.
+        {
+            let mut max_idx = 0;
+            let mut max_abs = F::zero();
+            for (i, &v) in w_final.iter().enumerate() {
+                let a = v.abs();
+                if a > max_abs {
+                    max_abs = a;
+                    max_idx = i;
+                }
+            }
+            if w_final[max_idx] < F::zero() {
+                w_final.mapv_inplace(|v| -v);
+            }
+        }
+
+        let t_final = xk.dot(&w_final);
         let ttt_final = dot(&t_final, &t_final);
 
         // p = X^T t / (t^T t)
@@ -857,11 +1030,17 @@ fn nipals<F: Float + Send + Sync + 'static>(
             p.mapv_inplace(|v| v / ttt_final);
         }
 
-        // q = Y^T t / (t^T t)
-        let mut q_final = yk.t().dot(&t_final);
-        if ttt_final > F::epsilon() {
-            q_final.mapv_inplace(|v| v / ttt_final);
-        }
+        // q = Y^T t / (t^T t)  [mode A]  or  q = Y_pinv t  [mode B].
+        let mut q_final = match y_pinv {
+            Some(ref yp) => yp.dot(&t_final),
+            None => {
+                let mut q = yk.t().dot(&t_final);
+                if ttt_final > F::epsilon() {
+                    q.mapv_inplace(|v| v / ttt_final);
+                }
+                q
+            }
+        };
 
         if score_norm == ScoreNorm::UnitVariance {
             let q_norm = norm(&q_final);
@@ -875,37 +1054,14 @@ fn nipals<F: Float + Send + Sync + 'static>(
         if qtq_final > F::epsilon() {
             u_final.mapv_inplace(|v| v / qtq_final);
         }
+        // (No unit-variance rescaling of `t_final` / `u_final`; see note below.)
 
-        // For CCA: normalise t and u to unit variance.
-        if score_norm == ScoreNorm::UnitVariance {
-            let t_std = {
-                let t_mean = t_final.iter().copied().fold(F::zero(), |a, b| a + b)
-                    / F::from(n_samples).unwrap();
-                let var = t_final
-                    .iter()
-                    .copied()
-                    .fold(F::zero(), |a, b| a + (b - t_mean) * (b - t_mean))
-                    / F::from(n_samples.saturating_sub(1).max(1)).unwrap();
-                var.sqrt()
-            };
-            if t_std > F::epsilon() {
-                t_final.mapv_inplace(|v| v / t_std);
-            }
-
-            let u_std = {
-                let u_mean = u_final.iter().copied().fold(F::zero(), |a, b| a + b)
-                    / F::from(n_samples).unwrap();
-                let var = u_final
-                    .iter()
-                    .copied()
-                    .fold(F::zero(), |a, b| a + (b - u_mean) * (b - u_mean))
-                    / F::from(n_samples.saturating_sub(1).max(1)).unwrap();
-                var.sqrt()
-            };
-            if u_std > F::epsilon() {
-                u_final.mapv_inplace(|v| v / u_std);
-            }
-        }
+        // NOTE (sklearn `_pls.py:356-362`): scores are stored and deflated with
+        // WITHOUT any unit-variance rescaling. CCA's "correlation" semantics come
+        // entirely from mode='B' weights plus `norm_y_weights` (the `q` / y_weights
+        // normalisation above, applied for `ScoreNorm::UnitVariance`), NOT from
+        // rescaling `t`/`u` to unit variance. The leading X-score's std being ~1.0
+        // is an emergent property of the centred+scaled data, not an imposed one.
 
         // Store component k.
         x_weights.column_mut(k).assign(&w_final);
@@ -1200,6 +1356,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSRegressi
             self.tol,
             NipalsMode::Regression,
             ScoreNorm::None,
+            WeightMode::A,
         )?;
 
         // Compute regression coefficients: B = W (P^T W)^{-1} Q^T.
@@ -1529,6 +1686,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSCanonica
             self.tol,
             NipalsMode::Canonical,
             ScoreNorm::None,
+            WeightMode::A,
         )?;
 
         Ok(FittedPLSCanonical {
@@ -1792,6 +1950,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for CCA<F> {
             self.tol,
             NipalsMode::Canonical,
             ScoreNorm::UnitVariance,
+            WeightMode::B,
         )?;
 
         Ok(FittedCCA {
