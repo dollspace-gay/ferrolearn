@@ -27,6 +27,37 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/minibatch_nmf.md`. Tracking: #1485. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumer: crate re-export (`lib.rs:96`); there
+//! is NO PyO3 binding. Oracle = live sklearn 1.5.2 (`_nmf.py`, `class MiniBatchNMF`),
+//! run from `/tmp` (R-CHAR-3). ferrolearn is a SIMPLIFIED reimplementation (5-iter
+//! coordinate-descent W + plain MU H, deterministic batching, no forget_factor/EWA),
+//! so component VALUES are a carve-out (different algorithm + RNG).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: components shape `(n_components,n_features)`, finite `reconstruction_err_`, `n_iter_` in `[1, max_iter]`, seed-determinism | SHIPPED (scoped) | `fit` (`minibatch_nmf.rs:365`) stores `components_` shape, finite Frobenius `reconstruction_err_`, positive `n_iter_`; seeded `StdRng` ⇒ deterministic. Green-guards in `tests/divergence_minibatch_nmf.rs` + in-module tests. STRUCTURAL only, NOT component values (REQ-4) |
+//! | REQ-2 | Non-negativity of `components_` (H) and `transform` (W) — NMF invariant | SHIPPED | `fit` clamps H ≥ 0 (`:468-470`); `update_w_batch` clamps W ≥ 0 (`:340-344`). Green-guard `guard_nonnegative` + `test_minibatch_nmf_components_nonnegative` |
+//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, negative input, 0 samples, transform col mismatch) | SHIPPED (scoped) | `fit` guards (`:368-399`); `transform` `ShapeMismatch` (`:509-515`). FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features` |
+//! | REQ-4 | EXACT `components_` value parity with sklearn online MU | NOT-STARTED | CARVE-OUT (R-DEFER-3): NNDSVDa + EWA aggregates A/B + `forget_factor` rho + numpy RNG (`_nmf.py:2254-2349`) vs ferrolearn CD-W + plain-MU-H + deterministic batching — blocker #1486 |
+//! | REQ-5 | `transform` = `_solve_W` MU formula | NOT-STARTED | CARVE-OUT, folds into REQ-4: critic confirmed (live oracle) ferrolearn's 5-iter CD reaches the SAME convex NNLS optimum as sklearn `_solve_W` (residual match relative ~1.4e-5 on its own H); not observable — blocker #1487 |
+//! | REQ-6 | `beta_loss` (kullback-leibler/itakura-saito) + `_gamma` | NOT-STARTED | sklearn `_nmf.py:2011,:2057-2062,:89`; ferrolearn is Frobenius-only — blocker #1488 |
+//! | REQ-7 | `solver` / multiplicative-update for W | NOT-STARTED | sklearn MU `_multiplicative_update_w` (`_nmf.py:530,:2118`); ferrolearn uses 5-iter coordinate descent — blocker #1489 |
+//! | REQ-8 | `forget_factor`/`_rho` + EWA online aggregates A/B for H | NOT-STARTED | sklearn `_nmf.py:2054,:2130-2141,:2312-2313`; ferrolearn H update is plain per-batch MU (no A/B, no rho) — blocker #1490 |
+//! | REQ-9 | `_minibatch_convergence` EWA cost + `max_no_improvement` early stop | NOT-STARTED | sklearn `_nmf.py:2149-2208`; ferrolearn uses whole-X relative-reconstruction-error stop — blocker #1491 |
+//! | REQ-10 | Real NNDSVDa SVD init + `random_state` batch shuffle | NOT-STARTED | sklearn `_nmf.py:225,:2308,:2319-2320`; ferrolearn `init_nndsvd_simple` is power-iteration pseudo-NNDSVD, deterministic `rotate_left` batching — blocker #1492 |
+//! | REQ-11 | Regularization `alpha_W`/`alpha_H`/`l1_ratio` | NOT-STARTED | sklearn `_nmf.py:2013-2016,:1275`; ferrolearn unpenalised — blocker #1493 |
+//! | REQ-12 | `fresh_restarts`/`fresh_restarts_max_iter` | NOT-STARTED | sklearn `_nmf.py:2019-2020,:2117`; ferrolearn warm-continues W per batch — blocker #1494 |
+//! | REQ-13 | `partial_fit` online out-of-core fit | NOT-STARTED | sklearn `_nmf.py:2373+`; ferrolearn has only batch `Fit::fit` — blocker #1495 |
+//! | REQ-14 | Fitted attrs `n_components_`/`n_features_in_`/`n_steps_` | NOT-STARTED | `FittedMiniBatchNMF` exposes only `components()`/`reconstruction_err()`/`n_iter()` — blocker #1496 |
+//! | REQ-15 | PyO3 binding | NOT-STARTED | no `_RsMiniBatchNMF`; only consumer is the re-export `lib.rs:96` — blocker #1497 |
+//! | REQ-16 | ferray substrate | NOT-STARTED | dense `ndarray::Array2` + `rand` `StdRng` — blocker #1498 |
+//!
+//! Count: **3 SHIPPED (REQ-1,2,3) / 13 NOT-STARTED (REQ-4..16)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
