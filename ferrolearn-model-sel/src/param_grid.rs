@@ -19,6 +19,24 @@
 //! // 3 alphas × 2 fit_intercept values = 6 combinations.
 //! assert_eq!(grid.len(), 6);
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/model_selection/_search.py` `ParameterGrid`
+//! (`:63`, tag 1.5.2). Deterministic Cartesian-product enumeration.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | Cartesian-product contents | SHIPPED | `param_grid!` iterative product = `itertools.product` contents; `guard_cartesian_product_contents_match` (set equality vs live oracle) |
+//! | REQ-2 | enumeration order (sorted keys) | SHIPPED | macro sorts axes `axes.sort_by(\|a,b\| a.0.cmp(&b.0))` = sklearn `sorted(p.items())` (`_search.py:157`, fixed #1698); `divergence_enumeration_order_sorted_keys` |
+//! | REQ-3 | list-of-dicts grid (union of sub-grids) | NOT-STARTED | `param_grid!` is single-dict only (`_search.py:114-117`) — blocker #1700 |
+//! | REQ-4 | `len`/indexing surface | SHIPPED | native `Vec` `.len()`/`[i]` (R-DEV-7); sklearn's lazy O(1) `__getitem__` not ported (eager materialization) |
+//! | REQ-5 | empty-value-list rejection | NOT-STARTED | `param_grid!{ "a"=>[] }` yields `[]`; sklearn raises `ValueError` (`_search.py:138-142`); a macro has no `Result` channel — blocker #1699 (empty-dict → `[{}]` matches) |
+//! | REQ-6 | `ParamValue` type coverage | SHIPPED | enum + `From` for f64/f32/i64/i32/usize/bool/String/&str |
+//! | REQ-7 | non-test production consumer | SHIPPED | `ParamSet`/`param_grid!` consumed by `grid_search.rs` + `random_search.rs` |
+//! | REQ-8 | ferray substrate | SHIPPED (N/A) | no array layer (strings/values only) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use std::collections::HashMap;
 
