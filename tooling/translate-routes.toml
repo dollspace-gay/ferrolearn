@@ -968,3 +968,13 @@ crate_pattern = "ferrolearn-kernel/src/rbf_sampler.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/kernel_approximation.py"]
 design = ".design/kernel/rbf_sampler.md"
 parity_ops = ["RBFSampler"]
+
+# =====================================================================
+# Layer 2 — ferrolearn-model-sel (model_selection + compose + multiclass)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/feature_union.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/pipeline.py"]
+design = ".design/model-sel/feature_union.md"
+parity_ops = ["FeatureUnion"]
