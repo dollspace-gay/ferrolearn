@@ -32,6 +32,27 @@
 //! let fitted = lle.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.embedding().ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class LocallyLinearEmbedding`
+//! (`sklearn/manifold/_locally_linear.py`, `method='standard'`). Tracking:
+//! #1459. Each REQ is BINARY — SHIPPED (impl + non-test consumer + tests + green
+//! verification) or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Standard-LLE embedding VALUE parity (sign-robust: bottom `M` eigenvectors) | SHIPPED | `fit` `M=(I-W)ᵀ(I-W)` bottom eigenvectors match sklearn `null_space` (`_locally_linear.py:192-196`) up to per-component sign; element-wise (sign-aligned) matches live sklearn across n_neighbors/reg/n_components/larger/higher-D fixtures (tol 1e-6) in `tests/divergence_lle.rs` (was #1460, fixed). Consumer: re-export `lib.rs:94` |
+//! | REQ-2 | Reconstruction weights `W` (local least-squares + reg + normalize) | SHIPPED | `compute_weights` reg `R = reg·trace if trace>0 else reg` matches `barycenter_weights` (`_locally_linear.py:72-79`, NO /k — fixed #1460); `w/Σw` normalize; verified via the embedding parity |
+//! | REQ-3 | `M = (I-W)ᵀ(I-W)` + bottom-eigenvector extraction (skip trivial) | SHIPPED | `fit`; matches `null_space(M, n_components, k_skip=1)` `_locally_linear.py:295-301` selection |
+//! | REQ-4 | Structural (embedding shape, deterministic, columns centered) | SHIPPED (scoped) | shape + determinism + column-centering guards |
+//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, n_neighbors 0/≥n, negative reg) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-6 | `method` ∈ {hessian, modified, ltsa} | NOT-STARTED | standard only; sklearn `_locally_linear.py:201-460` — blocker #1461 |
+//! | REQ-7 | `eigen_solver='arpack'` + `random_state` + per-component sign convention (CARVE-OUT) | NOT-STARTED | dense faer; sklearn `_locally_linear.py:173-188` — blocker #1462 |
+//! | REQ-8 | `transform` out-of-sample (barycenter weights on new points) | NOT-STARTED | sklearn `_locally_linear.py:851` — blocker #1463 |
+//! | REQ-9 | `reconstruction_error_`/`nbrs_`/`embedding_` attrs + `neighbors_algorithm` + `tol`/`max_iter` | NOT-STARTED | sklearn `_locally_linear.py:785` — blocker #1464 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1465 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1466 |
 
 use crate::mds::eigh_faer;
 use ferrolearn_core::error::FerroError;
@@ -182,11 +203,10 @@ fn compute_weights(
         // Local covariance: C = Z * Z^T
         let mut c = z.dot(&z.t());
 
-        // Regularization: C += reg * trace(C) * I / k
+        // Regularization (sklearn barycenter_weights, _locally_linear.py:72-77):
+        // trace = np.trace(G); R = reg * trace if trace > 0 else reg.
         let trace: f64 = (0..k).map(|j| c[[j, j]]).sum();
-        let reg_val = reg * trace / k as f64;
-        // If trace is zero (degenerate), use a small fixed regularization.
-        let reg_val = if reg_val.abs() < 1e-15 { reg } else { reg_val };
+        let reg_val = if trace > 0.0 { reg * trace } else { reg };
         for j in 0..k {
             c[[j, j]] += reg_val;
         }
