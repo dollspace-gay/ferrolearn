@@ -39,6 +39,26 @@
 //! let out = fitted.transform(&x).unwrap();
 //! assert_eq!(out.ncols(), 6); // 3 + 3
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/pipeline.py` `FeatureUnion` (`:1329`, tag
+//! 1.5.2). Deterministic composition meta-transformer; satisfies the core
+//! `pipeline.rs` FeatureUnion REQ (blocker #366).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | core: independent fit + registration-order horizontal concat | SHIPPED | `fn fit` + `FittedFeatureUnion::transform` (`ndarray::concatenate(Axis(1), ...)`); `green_req1_identity_doubler_concat_parity`, `green_req1_scaler_union_value_parity` match live sklearn `_hstack` (`pipeline.py:1820`) |
+//! | REQ-2 | `transformer_weights` (per-block scaling) | SHIPPED | `fn add_weighted` + weight applied in `transform` (sklearn `pipeline.py:1558`,`:1565`, fixed #1677); `divergence_req2_transformer_weights` |
+//! | REQ-3 | `'drop'`/`'passthrough'` sentinels | NOT-STARTED | no skip/passthrough mechanism (`pipeline.py:1530`,`:1561`) — blocker #1678 |
+//! | REQ-4 | `get_feature_names_out` (`<transformer>__<feat>`) | NOT-STARTED | only `transformer_names()` (`pipeline.py:1567`) — blocker #1679 |
+//! | REQ-5 | y-optional `fit(X, y=None)` | NOT-STARTED | `fn fit` requires `y: &Array1<F>` (`pipeline.py:1643`) — blocker #1680 |
+//! | REQ-6 | empty transformer-list rejected | SHIPPED | `fn fit` returns `InvalidParameter`; sklearn raises `ValueError` (`green_req6_empty_union_rejected`) |
+//! | REQ-7 | clippy-clean (no `collapsible_if`) | SHIPPED | `transform` uses a let-chain; `cargo clippy -p ferrolearn-model-sel -- -D warnings` green |
+//! | REQ-8 | ferray substrate | NOT-STARTED | on `ndarray`, not `ferray-core` — blocker #1681 |
+//! | REQ-9 | non-test production consumer | SHIPPED | `make_union` in `helpers.rs`; re-export `lib.rs:85`; `impl PipelineTransformer` composability |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
