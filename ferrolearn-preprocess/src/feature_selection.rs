@@ -11,6 +11,31 @@
 //!
 //! All three implement the standard ferrolearn `Fit` / `Transform` pattern
 //! and integrate with the dynamic [`ferrolearn_core::pipeline::Pipeline`].
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `VarianceThreshold`
+//! (`sklearn/feature_selection/_variance_threshold.py`) + `SelectKBest` +
+//! `GenericUnivariateSelect` (`sklearn/feature_selection/_univariate_selection.py`).
+//! Tracking: #1424. Each REQ is BINARY — SHIPPED (impl + non-test consumer +
+//! tests + green verification) or NOT-STARTED (with a concrete open blocker).
+//! The basic [`SelectFromModel`] here duplicates the richer
+//! `select_from_model.rs::SelectFromModelExt` — its parity is covered by
+//! `.design/preprocess/select_from_model.md` (REQ-9).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | [`VarianceThreshold`] mask (`var > threshold`, strict) + population variances | SHIPPED | `fit` Welford population variance matches `np.nanvar` + `_variance_threshold.py:133` on the common case; oracle tests in `tests/divergence_feature_selection.rs`. Consumer: re-export `lib.rs:110` + `PipelineTransformer` |
+//! | REQ-2 | [`SelectKBest`] ANOVA F-score VALUES (finite / non-constant) | SHIPPED | `anova_f_scores` matches `f_oneway` `_univariate_selection.py:43-117`; oracle score tests (tol 1e-9) |
+//! | REQ-3 | [`SelectKBest`] top-k SELECTION (tie-break + constant-feature + k-boundary) | SHIPPED | matches sklearn `mask[argsort(scores, mergesort)[-k:]]` `:794` (ties → higher index) + `_clean_nans` `:24-33` (constant feature → NaN → finfo.min → ranks last) + `k>n_features` clamp-keep-all `:774-779`; constant `anova_f_scores` now NaN (was +inf), verified across multi-tie/multi-constant/k∈{0,all,>n}/mixed/f32 (21 oracle tests — was DIV-A/B #1425 + DIV-C #1426, fixed) |
+//! | REQ-4 | Error/parameter contracts (VarianceThreshold threshold<0/zero-rows; SelectKBest zero-rows/y-mismatch) | SHIPPED (scoped) | per-fn guards; divergence error tests |
+//! | REQ-5 | VarianceThreshold `threshold==0` peak-to-peak guard (`min(var, ptp)>0`) + `np.nanvar` NaN-handling | NOT-STARTED | sklearn `_variance_threshold.py:113-120` — blocker #1427 |
+//! | REQ-6 | SelectKBest `k='all'` string + pluggable `score_func` (chi2/f_regression/mutual_info) + general `_clean_nans` | NOT-STARTED | `usize` k + `FClassif` only; sklearn `_univariate_selection.py:770-795` — blocker #1428 |
+//! | REQ-7 | `GenericUnivariateSelect` (mode meta-selector) | NOT-STARTED | absent (route parity_op); sklearn `_univariate_selection.py:1054` — blocker #1429 |
+//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) + `scores_`/`pvalues_`/`n_features_in_` attrs | NOT-STARTED | sklearn `_univariate_selection.py:526` — blocker #1430 |
+//! | REQ-9 | Basic `SelectFromModel` here duplicates `SelectFromModelExt` | NOT-STARTED | tech-debt; parity in `.design/preprocess/select_from_model.md` — blocker #1431 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1432 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array1`/`Array2` + `num_traits::Float` only — blocker #1433 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -422,7 +447,16 @@ fn anova_f_scores<F: Float>(x: &Array2<F>, y: &Array1<usize>) -> Vec<F> {
             let ms_between = ss_between / df_between;
             let ms_within = ss_within / df_within;
             if ms_within == F::zero() {
-                F::infinity()
+                // sklearn `f_oneway` computes msb/msw. When msw == 0 the result
+                // is +inf for a genuine perfect separator (msb > 0) but 0/0 =
+                // NaN for a CONSTANT feature (msb == 0). NaN later flows through
+                // `_clean_nans` -> `finfo.min`, ranking the constant feature
+                // LAST; a bare +inf would wrongly rank it FIRST.
+                if ms_between > F::zero() {
+                    F::infinity()
+                } else {
+                    F::nan()
+                }
             } else {
                 ms_between / ms_within
             }
@@ -447,9 +481,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for SelectK
     /// # Errors
     ///
     /// - [`FerroError::InsufficientSamples`] if the input has zero rows.
-    /// - [`FerroError::InvalidParameter`] if `k` exceeds the number of features.
     /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers
     ///   of rows.
+    ///
+    /// When `k` exceeds the number of features, all features are selected
+    /// (matching scikit-learn `_check_params`, `_univariate_selection.py:774-779`,
+    /// which warns rather than raising).
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedSelectKBest<F>, FerroError> {
         let n_samples = x.nrows();
         if n_samples == 0 {
@@ -467,15 +504,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for SelectK
             });
         }
         let n_features = x.ncols();
-        if self.k > n_features {
-            return Err(FerroError::InvalidParameter {
-                name: "k".into(),
-                reason: format!(
-                    "k ({}) cannot exceed the number of features ({})",
-                    self.k, n_features
-                ),
-            });
-        }
+        // sklearn `_check_params` (`_univariate_selection.py:774-779`) only WARNS
+        // (does NOT raise) when k > n_features and keeps ALL features. Clamp the
+        // effective k to the feature count so `idx[n_features - k_eff..]` selects
+        // everything in that case (matching warn+keep-all), and is unchanged when
+        // k <= n_features.
+        let k_eff = self.k.min(n_features);
 
         let raw_scores = match self.score_func {
             ScoreFunc::FClassif => anova_f_scores(x, y),
@@ -483,18 +517,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for SelectK
 
         let scores = Array1::from_vec(raw_scores.clone());
 
-        // Determine the top-k indices (stable: break ties by preferring the
-        // lower column index so results are deterministic).
-        let mut ranked: Vec<usize> = (0..n_features).collect();
-        ranked.sort_by(|&a, &b| {
-            raw_scores[b]
-                .partial_cmp(&raw_scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                // Tie: keep lower column index
-                .then(a.cmp(&b))
+        // Replicate sklearn `_get_support_mask`:
+        //   scores = _clean_nans(scores_); argsort(kind="mergesort")[-k:]
+        // `_clean_nans` maps NaN -> finfo.min (most-negative finite, NOT -inf),
+        // so constant features rank LAST; a genuine +inf perfect separator stays
+        // highest. The ASCENDING + STABLE sort means a k-boundary tie keeps the
+        // HIGHER column index (it appears later, so it lands in the last-k slice).
+        let cleaned: Vec<F> = raw_scores
+            .iter()
+            .map(|&v| if v.is_nan() { F::min_value() } else { v })
+            .collect();
+        let mut idx: Vec<usize> = (0..n_features).collect();
+        idx.sort_by(|&a, &b| {
+            cleaned[a]
+                .partial_cmp(&cleaned[b])
+                .unwrap_or(core::cmp::Ordering::Equal)
         });
 
-        let mut selected_indices: Vec<usize> = ranked[..self.k].to_vec();
+        let mut selected_indices: Vec<usize> = idx[n_features - k_eff..].to_vec();
         // Return in original column order for a stable output layout
         selected_indices.sort_unstable();
 
@@ -886,11 +926,21 @@ mod tests {
     }
 
     #[test]
-    fn test_select_k_best_k_exceeds_n_features_error() {
+    fn test_select_k_best_k_exceeds_n_features_keeps_all() {
+        // sklearn `_check_params` (`_univariate_selection.py:774-779`) only WARNS
+        // (does NOT raise) when k > n_features and keeps ALL features.
         let sel = SelectKBest::<f64>::new(5, ScoreFunc::FClassif);
         let x = array![[1.0, 2.0], [3.0, 4.0]];
         let y: Array1<usize> = array![0, 1];
-        assert!(sel.fit(&x, &y).is_err());
+        let fitted = sel.fit(&x, &y);
+        assert!(
+            fitted.is_ok(),
+            "k>n_features must keep all features, not error: {fitted:?}"
+        );
+        if let Ok(f) = fitted {
+            assert_eq!(f.selected_indices().len(), x.ncols());
+            assert_eq!(f.selected_indices(), &[0usize, 1][..]);
+        }
     }
 
     #[test]
