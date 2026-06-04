@@ -98,7 +98,7 @@ where
     }
 
     // Compute the number of test samples (at least 1).
-    let n_test = ((n_samples as f64) * test_size).round() as usize;
+    let n_test = ((n_samples as f64) * test_size).ceil() as usize;
     let n_test = n_test.max(1).min(n_samples - 1);
     let n_train = n_samples - n_test;
 
