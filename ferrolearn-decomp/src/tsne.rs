@@ -39,6 +39,37 @@
 //! let fitted = tsne.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.embedding().dim(), (20, 2));
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/tsne.md`. Tracking: #1596. Each REQ is BINARY — SHIPPED
+//! (impl + non-test consumer + tests + green verification) or NOT-STARTED (concrete
+//! open blocker). Non-test consumer: crate re-export (`lib.rs:102`); there is NO
+//! PyO3 binding and NO `Transform` (t-SNE has no out-of-sample projection — matches
+//! sklearn). Oracle = live sklearn 1.5.2 (`manifold/_t_sne.py`), run from `/tmp`
+//! (R-CHAR-3). The embedding is RNG-coupled (random init) + non-convex → identifiable
+//! only up to rotation/reflection/translation/local-optimum, so exact values are a
+//! carve-out; the meaningful correctness check is cluster separation.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: embedding shape + early-exag/momentum/Barnes-Hut(or exact) GD runs + determinism | SHIPPED (scoped) | `fit` (`tsne.rs:538`); `test_tsne_basic_shape`/`_3d_embedding`/`_exact_mode`/`_reproducibility` |
+//! | REQ-2 | Perplexity binary-search affinities → valid symmetric joint P | SHIPPED (scoped) | `compute_pij_row` (`:410`) + `compute_joint_probabilities` (`:467`); P internal (no accessor). `/2n` ≡ sklearn `/sum(P)` (conditional rows sum to 1, verified) |
+//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples<2, perplexity ≤0/≥n, learning_rate ≤0, theta <0) | SHIPPED (scoped) | `fit` guards (`:554-593`). FLAG: sklearn raises `InvalidParameterError`, enforces `early_exaggeration in [1,inf)`, `max_iter>=250`, `angle in [0,1]`, `n_components<4` for barnes_hut |
+//! | REQ-4 | Cluster SEPARATION (the "did t-SNE work" check) + finite kl_divergence_≥0 + n_iter_ | SHIPPED (scoped) | `test_tsne_separates_clusters` (3-NN recovery > 0.8) + `compute_kl_divergence` (`:496`); green-guard `separates_clusters_knn_recovery` |
+//! | REQ-5 | EXACT `embedding_`/`kl_divergence_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): random Xoshiro init vs sklearn deterministic PCA default + non-convex local minima + learning_rate 200-vs-auto + Barnes-Hut — blocker #1597 |
+//! | REQ-6 | `init='pca'` default + `init='random'`(`1e-4*randn`) + ndarray init | NOT-STARTED | sklearn `_t_sne.py:837,:1019-1036`; ferrolearn always random — blocker #1598 |
+//! | REQ-7 | `learning_rate='auto'` default (`max(N/early_ex/4, 50)`) | NOT-STARTED | sklearn `_t_sne.py:876-879`; ferrolearn fixed 200 — blocker #1599 |
+//! | REQ-8 | `n_iter_without_progress`/`min_grad_norm` early stopping | NOT-STARTED | sklearn `_t_sne.py:431,:439`; ferrolearn fixed n_iter — blocker #1600 |
+//! | REQ-9 | `metric` (precomputed/non-euclidean) + `metric_params` | NOT-STARTED | sklearn `_t_sne.py:835`; ferrolearn squared-Euclidean only — blocker #1601 |
+//! | REQ-10 | `method='exact'` (sparse-P barnes_hut) + `/sum(P)` normalization | NOT-STARTED | sklearn `_t_sne.py:840`; ferrolearn dense-P only (`/2n` ≡ `/sum(P)`) — blocker #1602 |
+//! | REQ-11 | `n_iter`→`max_iter` rename + deprecation + `max_iter≥250` | NOT-STARTED | sklearn `_t_sne.py:832,:843`; ferrolearn `n_iter` — blocker #1603 |
+//! | REQ-12 | fitted attrs `learning_rate_`/`n_features_in_` | NOT-STARTED | blocker #1604 |
+//! | REQ-13 | generic `F`/f32 (currently f64-only) | NOT-STARTED | blocker #1605 |
+//! | REQ-14 | PyO3 binding | NOT-STARTED | absent; only consumer re-export `lib.rs:102` — blocker #1606 |
+//! | REQ-15 | ferray substrate | NOT-STARTED | `ndarray` + `rand` — blocker #1607 |
+//!
+//! Count: **4 SHIPPED (REQ-1,2,3,4) / 11 NOT-STARTED (REQ-5..15)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
