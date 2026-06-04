@@ -164,10 +164,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RBFSampler<F> {
         let n_components = self.n_components;
 
         // Standard deviation for the weight distribution: sqrt(2 * gamma)
-        let std_dev = (F::from(2.0).unwrap() * self.gamma)
-            .sqrt()
-            .to_f64()
-            .unwrap();
+        let two = F::from(2.0).ok_or_else(|| FerroError::NumericalInstability {
+            message: "RBFSampler: f64->F conversion of constant 2.0 failed".into(),
+        })?;
+        let std_dev =
+            (two * self.gamma)
+                .sqrt()
+                .to_f64()
+                .ok_or_else(|| FerroError::NumericalInstability {
+                    message: "RBFSampler: F->f64 conversion of std_dev failed".into(),
+                })?;
 
         let mut rng = match self.random_state {
             Some(seed) => rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed),
@@ -182,7 +188,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RBFSampler<F> {
 
         let mut w_data = Vec::with_capacity(n_features * n_components);
         for _ in 0..(n_features * n_components) {
-            w_data.push(F::from(normal.sample(&mut rng)).unwrap());
+            w_data.push(F::from(normal.sample(&mut rng)).ok_or_else(|| {
+                FerroError::NumericalInstability {
+                    message: "RBFSampler: f64->F conversion of sampled weight failed".into(),
+                }
+            })?);
         }
         let random_weights =
             Array2::from_shape_vec((n_features, n_components), w_data).map_err(|e| {
@@ -199,12 +209,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RBFSampler<F> {
         })?;
         let mut b_data = Vec::with_capacity(n_components);
         for _ in 0..n_components {
-            b_data.push(F::from(uniform.sample(&mut rng)).unwrap());
+            b_data.push(F::from(uniform.sample(&mut rng)).ok_or_else(|| {
+                FerroError::NumericalInstability {
+                    message: "RBFSampler: f64->F conversion of sampled offset failed".into(),
+                }
+            })?);
         }
         let random_offset = Array1::from_vec(b_data);
 
         // Scale factor: sqrt(2 / n_components)
-        let scale = (F::from(2.0).unwrap() / F::from(n_components).unwrap()).sqrt();
+        let n_components_f =
+            F::from(n_components).ok_or_else(|| FerroError::NumericalInstability {
+                message: "RBFSampler: usize->F conversion of n_components failed".into(),
+            })?;
+        let scale = (two / n_components_f).sqrt();
 
         Ok(FittedRBFSampler {
             random_weights,
