@@ -6,16 +6,23 @@
 //!
 //! # Algorithm
 //!
-//! Maintains a running mean and uses an incremental SVD update:
-//!
-//! For each batch `X_batch`:
-//! 1. Centre the batch using the running (cumulative) mean.
-//! 2. Stack the centred batch with the existing components scaled by their
-//!    singular values: `M = vstack([components * sqrt(n_samples_seen - 1), X_centred])`.
-//! 3. Compute a thin SVD of `M`.
-//! 4. Extract updated `components` (rows of V^T), `singular_values`, and
-//!    `explained_variance` from the SVD.
-//! 5. Update the running mean.
+//! Mirrors scikit-learn's `IncrementalPCA.partial_fit`. Maintains a running
+//! per-feature mean and variance (Youngs-Cramer / Chan update) and performs an
+//! incremental SVD update. For each batch `X_batch` (with `n` samples already
+//! seen):
+//! 1. Update the running `(mean, var, n_samples_seen)` via the numerically
+//!    stable incremental mean-and-variance combination.
+//! 2. If this is the first batch, centre by the column mean: `M = X_centred`.
+//!    Otherwise centre the batch by its **own batch mean** and stack three
+//!    blocks: `M = vstack([singular_values * components, X_batch_centred,
+//!    mean_correction])`, where `mean_correction = sqrt((n / n_total) * n_batch)
+//!    * (running_mean - batch_mean)`.
+//! 3. Compute a thin SVD of `M` and apply `svd_flip` (per component row, the
+//!    max-abs entry is made positive) for a deterministic sign.
+//! 4. Extract updated `components` (rows of `V^T`), `singular_values`,
+//!    `explained_variance = S^2 / (n_total - 1)`, and
+//!    `explained_variance_ratio = S^2 / sum(var * n_total)` (fraction of total
+//!    feature variance).
 //!
 //! The [`Fit::fit`] method processes the dataset in `batch_size` chunks
 //! internally. Use [`IncrementalPCA::partial_fit`] to update the model with
@@ -34,6 +41,41 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 1);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/incremental_pca.md`. Tracking: #1584. Each REQ is
+//! BINARY — SHIPPED (impl + non-test consumer + tests + green verification) or
+//! NOT-STARTED (concrete open blocker). Non-test consumers: crate re-export
+//! (`lib.rs:88`) + the PyO3 `_RsIncrementalPCA` binding
+//! (`ferrolearn-python/src/extras.rs:1094`, registered `lib.rs:72`). Oracle = live
+//! sklearn 1.5.2 (`_incremental_pca.py`), run from `/tmp` (R-CHAR-3). `partial_fit`
+//! is DETERMINISTIC and now ports sklearn faithfully — full value parity (single +
+//! multi-batch).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | `svd_flip` sign + `components_`/`transform` value parity | SHIPPED | per-Vt-row max-abs-positive after `thin_svd` (= `_incremental_pca.py:357`); matches sklearn incl. sign (single 2.2e-16, multi 6.3e-15). Was #1585, fixed. Test `divergence_svd_flip_sign` |
+//! | REQ-2 | Multi-batch `mean_correction` + batch-mean centering (3-block SVD stack) | SHIPPED | `partial_fit_batch` ports `_incremental_pca.py:342-354`; multi-batch components/EV/SV match sklearn ≤2.8e-14. Was #1586, fixed. Test `divergence_multibatch_mean_correction` |
+//! | REQ-3 | `explained_variance_ratio_` = `S²/Σ(var·n_total)` (total feature variance) + running `var_` | SHIPPED | `= _incremental_pca.py:359`; running variance via Youngs-Cramer port (`extmath.py:1057-1180`); ratio + `var_` match sklearn (var_ exact). Was #1587, fixed. Test `divergence_explained_variance_ratio_denominator` |
+//! | REQ-4 | Running mean (incremental) | SHIPPED | matches sklearn `mean_` element-wise (1e-9, multi-batch); `test_mean_is_correct`, `test_batch_size_*` |
+//! | REQ-5 | `components_` shape `(n_components, n_features)` | SHIPPED | `test_fit_output_shape`/`_two_components`; matches sklearn element-wise (REQ-1) |
+//! | REQ-6 | `explained_variance_` = `S²/(n_total−1)` | SHIPPED | matches sklearn (single 1.8e-15); `test_explained_variance_positive` |
+//! | REQ-7 | `singular_values_` | SHIPPED | matches sklearn (single 1.3e-15) |
+//! | REQ-8 | `components_` rows unit-norm | SHIPPED | `test_components_approx_unit_length` |
+//! | REQ-9 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`partial_fit`/`transform` guards. FLAG: ferrolearn rejects `n_components>=n_features`; sklearn allows `n_components==n_features ≤ min(n,p)` (REQ-14 #1590) |
+//! | REQ-10 | `n_samples_seen` accumulation + `partial_fit` chaining + batch chunking | SHIPPED | `test_partial_fit_chaining`, `test_n_samples_seen`, `test_batch_size_*` |
+//! | REQ-12 | f32/f64 generic | SHIPPED | `test_f32_support` |
+//! | REQ-15 | running `var_` fitted attr + accessor | SHIPPED | `var_` field + `var()` accessor; matches sklearn `var_` exactly (was #1591, retired into REQ-3) |
+//! | REQ-11 | `PipelineTransformer` integration | NOT-STARTED | no impl (cf. `pca.rs:565`) — blocker #1588 |
+//! | REQ-13 | `batch_size` auto-default = `5*n_features` | NOT-STARTED | ferrolearn defaults to full-data — blocker #1589 |
+//! | REQ-14 | `n_components=None` + `n_components==n_features` acceptance | NOT-STARTED | sklearn `_incremental_pca.py:294-308` — blocker #1590 |
+//! | REQ-16 | `noise_variance_` attr | NOT-STARTED | sklearn `_incremental_pca.py:369-372` — blocker #1592 |
+//! | REQ-17 | `whiten` + `copy` ctor params | NOT-STARTED | sklearn `_incremental_pca.py:194-198` — blocker #1593 |
+//! | REQ-18 | `n_features_in_` attr | NOT-STARTED | blocker #1594 |
+//! | REQ-19 | ferray substrate | NOT-STARTED | `ndarray` + hand-rolled Jacobi — blocker #1595 |
+//!
+//! Count: **12 SHIPPED (REQ-1..10,12,15) / 7 NOT-STARTED (REQ-11,13,14,16,17,18,19)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -118,6 +160,11 @@ pub struct FittedIncrementalPCA<F> {
     explained_variance_ratio_: Array1<F>,
     /// Per-feature running mean.
     mean_: Array1<F>,
+    /// Per-feature running population variance (ddof=0), tracked via the
+    /// Youngs-Cramer / Chan parallel-variance update (sklearn
+    /// `_incremental_mean_and_var`). Used as the denominator of
+    /// `explained_variance_ratio_`.
+    var_: Array1<F>,
     /// Number of samples seen so far.
     n_samples_seen_: usize,
     /// Singular values of the current incremental SVD.
@@ -147,6 +194,13 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
     #[must_use]
     pub fn mean(&self) -> &Array1<F> {
         &self.mean_
+    }
+
+    /// Running per-feature population variance (ddof=0), as tracked by the
+    /// incremental Youngs-Cramer update. Mirrors sklearn `IncrementalPCA.var_`.
+    #[must_use]
+    pub fn var(&self) -> &Array1<F> {
+        &self.var_
     }
 
     /// Number of samples seen during fitting.
@@ -219,47 +273,101 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
         }
 
         let n_components = self.components_.nrows();
-
-        // ----------------------------------------------------------------
-        // Step 1 & 5: Update running mean and centre the batch.
-        // ----------------------------------------------------------------
-        let batch_mean = column_mean(x_batch);
-
-        let new_n = self.n_samples_seen_ + batch_n;
+        let last_count = self.n_samples_seen_;
+        let new_n = last_count + batch_n;
         let new_n_f = F::from(new_n).unwrap_or_else(F::one);
 
-        // Incremental mean update: new_mean = (old_n * old_mean + batch_n * batch_mean) / new_n
-        let updated_mean = if self.n_samples_seen_ == 0 {
-            batch_mean
-        } else {
-            let old_n_f = F::from(self.n_samples_seen_).unwrap_or_else(F::zero);
-            let batch_n_f = F::from(batch_n).unwrap_or_else(F::one);
-            let mut m = Array1::zeros(n_features);
-            for j in 0..n_features {
-                m[j] = (old_n_f * self.mean_[j] + batch_n_f * batch_mean[j]) / new_n_f;
-            }
-            m
-        };
+        // ----------------------------------------------------------------
+        // Update running per-feature mean and (population) variance via the
+        // Youngs-Cramer / Chan parallel-variance formula, porting sklearn
+        // `_incremental_mean_and_var` (`sklearn/utils/extmath.py:1057-1180`).
+        // `last_sample_count` is the scalar `n_samples_seen_` broadcast over
+        // all features (`_incremental_pca.py:329-334`), so the per-feature
+        // counts are equal and we can use scalars.
+        // ----------------------------------------------------------------
+        let last_count_f = F::from(last_count).unwrap_or_else(F::zero);
+        let new_count_f = F::from(batch_n).unwrap_or_else(F::one);
 
-        // Centre the batch using the *updated* mean.
-        let mut x_centred = x_batch.to_owned();
-        for mut row in x_centred.rows_mut() {
-            for (v, &m) in row.iter_mut().zip(updated_mean.iter()) {
-                *v = *v - m;
+        // new_sum = X.sum(axis=0); batch_mean = new_sum / new_count.
+        let mut new_sum = Array1::<F>::zeros(n_features);
+        for row in x_batch.rows() {
+            for (s, &v) in new_sum.iter_mut().zip(row.iter()) {
+                *s = *s + v;
+            }
+        }
+        let mut col_batch_mean = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            col_batch_mean[j] = new_sum[j] / new_count_f;
+        }
+
+        // last_sum = last_mean * last_count (per feature).
+        // updated_mean = (last_sum + new_sum) / updated_count.
+        let mut col_mean = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            let last_sum = self.mean_[j] * last_count_f;
+            col_mean[j] = (last_sum + new_sum[j]) / new_n_f;
+        }
+
+        // new_unnormalized_variance = sum((X - T)^2) - correction^2 / new_count
+        // where T = batch_mean and correction = sum(X - T) (the corrected
+        // 2-pass term, `extmath.py:1142-1162`).
+        let mut new_unnorm_var = Array1::<F>::zeros(n_features);
+        {
+            let mut correction = Array1::<F>::zeros(n_features);
+            for row in x_batch.rows() {
+                for j in 0..n_features {
+                    let temp = row[j] - col_batch_mean[j];
+                    correction[j] = correction[j] + temp;
+                    new_unnorm_var[j] = new_unnorm_var[j] + temp * temp;
+                }
+            }
+            for j in 0..n_features {
+                new_unnorm_var[j] = new_unnorm_var[j] - correction[j] * correction[j] / new_count_f;
             }
         }
 
+        // Combine with the prior unnormalized variance (Chan update). When
+        // last_count == 0 the combined value is just the batch's.
+        let mut col_var = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            let updated_unnorm_var = if last_count == 0 {
+                new_unnorm_var[j]
+            } else {
+                let last_sum = self.mean_[j] * last_count_f;
+                let last_unnorm_var = self.var_[j] * last_count_f;
+                let last_over_new_count = last_count_f / new_count_f;
+                let diff = last_sum / last_over_new_count - new_sum[j];
+                last_unnorm_var + new_unnorm_var[j] + last_over_new_count / new_n_f * diff * diff
+            };
+            col_var[j] = updated_unnorm_var / new_n_f;
+        }
+
         // ----------------------------------------------------------------
-        // Step 2: Stack old components (weighted by singular values) with
-        //         the centred batch.
+        // Whitening + build the stacked matrix M (`_incremental_pca.py:337-354`).
+        // First step: centre by `col_mean`, M = X_centred. Otherwise centre by
+        // the BATCH mean and stack THREE blocks:
+        //   [ singular_values * components ; X_batch_centred ; mean_correction ]
+        // with mean_correction a single length-`n_features` row
+        //   sqrt((n_samples_seen / n_total) * n_batch) * (mean_ - col_batch_mean).
         // ----------------------------------------------------------------
-        // The stacked matrix M has shape (n_components + batch_n, n_features).
-        // If n_samples_seen == 0, M is just x_centred.
-        let m_mat: Array2<F> = if self.n_samples_seen_ == 0 || n_components == 0 {
-            x_centred.clone()
+        let m_mat: Array2<F> = if last_count == 0 || n_components == 0 {
+            let mut x_centred = x_batch.to_owned();
+            for mut row in x_centred.rows_mut() {
+                for (v, &m) in row.iter_mut().zip(col_mean.iter()) {
+                    *v = *v - m;
+                }
+            }
+            x_centred
         } else {
-            // Scale components by singular values:
-            // weighted_components[k, :] = singular_values[k] * components[k, :]
+            // Batch-mean-centred data.
+            let mut x_centred = x_batch.to_owned();
+            for mut row in x_centred.rows_mut() {
+                for (v, &m) in row.iter_mut().zip(col_batch_mean.iter()) {
+                    *v = *v - m;
+                }
+            }
+
+            // Block 1: singular_values[:,None] * components_.
             let mut weighted = Array2::zeros((n_components, n_features));
             for k in 0..n_components {
                 let sv = self.singular_values_[k];
@@ -267,16 +375,26 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
                     weighted[[k, j]] = sv * self.components_[[k, j]];
                 }
             }
-            // Stack: [weighted; x_centred]
-            stack_vertical(&weighted, &x_centred)
+
+            // Block 3: mean_correction row.
+            let scale = (last_count_f / new_n_f * new_count_f).sqrt();
+            let mut mean_correction = Array2::zeros((1, n_features));
+            for j in 0..n_features {
+                mean_correction[[0, j]] = scale * (self.mean_[j] - col_batch_mean[j]);
+            }
+
+            // Stack: [weighted ; x_centred ; mean_correction].
+            let top = stack_vertical(&weighted, &x_centred);
+            stack_vertical(&top, &mean_correction)
         };
 
         // ----------------------------------------------------------------
-        // Step 3: Thin SVD of M.
+        // Thin SVD of M.
         // ----------------------------------------------------------------
         let max_rank = m_mat.nrows().min(m_mat.ncols()).min(n_components);
         if max_rank == 0 {
-            self.mean_ = updated_mean;
+            self.mean_ = col_mean;
+            self.var_ = col_var;
             self.n_samples_seen_ = new_n;
             return Ok(());
         }
@@ -284,14 +402,33 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
         let (_, sigma, vt) = thin_svd(&m_mat, max_rank)?;
 
         // ----------------------------------------------------------------
-        // Step 4: Update components, singular values, and explained variance.
+        // Update components and singular values, applying
+        // `svd_flip(u_based_decision=False)` (`_incremental_pca.py:357`,
+        // `extmath.py:897-905`): for each Vt row find the column index of the
+        // max ABS value (numpy `argmax` → FIRST on ties, via strict `>`); if
+        // that entry is negative, negate the WHOLE row so its max-abs entry is
+        // positive. Same convention as `pca.rs`.
         // ----------------------------------------------------------------
-        // vt has shape (max_rank, n_features); each row is a component.
         for k in 0..n_components.min(max_rank) {
             for j in 0..n_features {
                 self.components_[[k, j]] = vt[[k, j]];
             }
             self.singular_values_[k] = if k < sigma.len() { sigma[k] } else { F::zero() };
+
+            let mut j_max = 0usize;
+            let mut max_abs = self.components_[[k, 0]].abs();
+            for j in 1..n_features {
+                let abs_j = self.components_[[k, j]].abs();
+                if abs_j > max_abs {
+                    max_abs = abs_j;
+                    j_max = j;
+                }
+            }
+            if self.components_[[k, j_max]] < F::zero() {
+                for j in 0..n_features {
+                    self.components_[[k, j]] = -self.components_[[k, j]];
+                }
+            }
         }
         // Zero out any components beyond max_rank if n_components > max_rank.
         for k in max_rank..n_components {
@@ -301,19 +438,27 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
             self.singular_values_[k] = F::zero();
         }
 
-        // Recompute explained variance.
-        // explained_variance[k] = sigma[k]^2 / (n_samples_seen - 1)
+        // ----------------------------------------------------------------
+        // Explained variance / ratio (`_incremental_pca.py:358-359`):
+        //   explained_variance      = S^2 / (n_total - 1)
+        //   explained_variance_ratio = S^2 / sum(col_var * n_total)
+        // The ratio denominator is the TOTAL feature variance, NOT the sum of
+        // the retained explained variances.
+        // ----------------------------------------------------------------
         let denom = F::from(new_n.saturating_sub(1).max(1)).unwrap_or_else(F::one);
-        let mut total_var = F::zero();
         for k in 0..n_components {
             let sv = self.singular_values_[k];
             self.explained_variance_[k] = sv * sv / denom;
-            total_var = total_var + self.explained_variance_[k];
         }
 
-        if total_var > F::zero() {
+        let mut total_feature_var = F::zero();
+        for j in 0..n_features {
+            total_feature_var = total_feature_var + col_var[j] * new_n_f;
+        }
+        if total_feature_var > F::zero() {
             for k in 0..n_components {
-                self.explained_variance_ratio_[k] = self.explained_variance_[k] / total_var;
+                let sv = self.singular_values_[k];
+                self.explained_variance_ratio_[k] = sv * sv / total_feature_var;
             }
         } else {
             for k in 0..n_components {
@@ -322,7 +467,8 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
         }
 
         // Update state.
-        self.mean_ = updated_mean;
+        self.mean_ = col_mean;
+        self.var_ = col_var;
         self.n_samples_seen_ = new_n;
 
         Ok(())
@@ -383,6 +529,7 @@ impl<F: Float + Send + Sync + 'static> IncrementalPCA<F> {
             explained_variance_: Array1::zeros(self.n_components),
             explained_variance_ratio_: Array1::zeros(self.n_components),
             mean_: Array1::zeros(n_features),
+            var_: Array1::zeros(n_features),
             n_samples_seen_: 0,
             singular_values_: Array1::zeros(self.n_components),
         });
@@ -512,18 +659,6 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedIncrementa
 // ---------------------------------------------------------------------------
 // Internal linear algebra helpers (no external SVD library needed)
 // ---------------------------------------------------------------------------
-
-/// Compute the per-column mean of a matrix.
-fn column_mean<F: Float>(x: &Array2<F>) -> Array1<F> {
-    let (n, p) = x.dim();
-    let n_f = F::from(n).unwrap_or_else(F::one);
-    let mut mean = Array1::zeros(p);
-    for j in 0..p {
-        let s = x.column(j).iter().copied().fold(F::zero(), |a, b| a + b);
-        mean[j] = s / n_f;
-    }
-    mean
-}
 
 /// Stack two matrices vertically: `[a; b]`.
 fn stack_vertical<F: Float>(a: &Array2<F>, b: &Array2<F>) -> Array2<F> {
