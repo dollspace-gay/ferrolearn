@@ -276,15 +276,14 @@ fn green_req6_empty_union_rejected() {
 /// This test asserts the WEIGHTED oracle; ferrolearn produces the unweighted
 /// matrix, so it FAILS — pinning the missing weights surface.
 #[test]
-#[ignore = "divergence: FeatureUnion has no transformer_weights (REQ-2); tracking #1676"]
 fn divergence_req2_transformer_weights() {
     let x = fixture_x();
     let y = Array1::<f64>::zeros(3);
-    // ferrolearn cannot express transformer_weights={'b':10}; the union below is
-    // the closest reachable construction and produces the UNWEIGHTED result.
+    // ferrolearn now expresses transformer_weights={'b':10} via add_weighted:
+    // block 'b' (the doubler) is scaled by 10 before concatenation.
     let fu = FeatureUnion::<f64>::new()
         .add("a", Box::new(Identity))
-        .add("b", Box::new(Doubler));
+        .add_weighted("b", Box::new(Doubler), 10.0);
     let out = fu.fit(&x, &y).unwrap().transform(&x).unwrap();
 
     // Live sklearn oracle WITH transformer_weights={'b':10}.

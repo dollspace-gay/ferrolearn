@@ -55,8 +55,8 @@ use num_traits::Float;
 /// at transform time each transformer's output is computed and the results
 /// are stacked column-wise.
 pub struct FeatureUnion<F: Float + Send + Sync + 'static> {
-    /// Named transformer steps.
-    transformers: Vec<(String, Box<dyn PipelineTransformer<F>>)>,
+    /// Named transformer steps, each paired with its output weight.
+    transformers: Vec<(String, Box<dyn PipelineTransformer<F>>, F)>,
 }
 
 impl<F: Float + Send + Sync + 'static> FeatureUnion<F> {
@@ -67,13 +67,31 @@ impl<F: Float + Send + Sync + 'static> FeatureUnion<F> {
         }
     }
 
-    /// Add a named transformer step.
+    /// Add a named transformer step (output weight defaults to 1).
     ///
     /// Transformers are fitted independently and their outputs concatenated
     /// in the order they are added.
     #[must_use]
-    pub fn add(mut self, name: &str, transformer: Box<dyn PipelineTransformer<F>>) -> Self {
-        self.transformers.push((name.to_owned(), transformer));
+    pub fn add(self, name: &str, transformer: Box<dyn PipelineTransformer<F>>) -> Self {
+        self.add_weighted(name, transformer, F::one())
+    }
+
+    /// Add a named transformer step with an explicit output weight.
+    ///
+    /// At transform time each transformer's output block is multiplied
+    /// element-wise by `weight` before horizontal concatenation, mirroring
+    /// scikit-learn's `FeatureUnion(transformer_weights={name: weight})`
+    /// (`sklearn/pipeline.py:1558,:1565`). A weight of `1` (the default used by
+    /// [`add`](Self::add)) is a no-op.
+    #[must_use]
+    pub fn add_weighted(
+        mut self,
+        name: &str,
+        transformer: Box<dyn PipelineTransformer<F>>,
+        weight: F,
+    ) -> Self {
+        self.transformers
+            .push((name.to_owned(), transformer, weight));
         self
     }
 
@@ -86,7 +104,10 @@ impl<F: Float + Send + Sync + 'static> FeatureUnion<F> {
     /// Return the names of all transformer steps.
     #[must_use]
     pub fn transformer_names(&self) -> Vec<&str> {
-        self.transformers.iter().map(|(n, _)| n.as_str()).collect()
+        self.transformers
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect()
     }
 
     /// Fit all transformers and return a [`FittedFeatureUnion`].
@@ -103,12 +124,12 @@ impl<F: Float + Send + Sync + 'static> FeatureUnion<F> {
             });
         }
 
-        let mut fitted_transformers: Vec<(String, Box<dyn FittedPipelineTransformer<F>>)> =
+        let mut fitted_transformers: Vec<(String, Box<dyn FittedPipelineTransformer<F>>, F)> =
             Vec::with_capacity(self.transformers.len());
 
-        for (name, t) in &self.transformers {
+        for (name, t, weight) in &self.transformers {
             let fitted = t.fit_pipeline(x, y)?;
-            fitted_transformers.push((name.clone(), fitted));
+            fitted_transformers.push((name.clone(), fitted, *weight));
         }
 
         Ok(FittedFeatureUnion {
@@ -152,15 +173,18 @@ impl<F: Float + Send + Sync + 'static> PipelineTransformer<F> for FeatureUnion<F
 ///
 /// Created by [`FeatureUnion::fit`].
 pub struct FittedFeatureUnion<F: Float + Send + Sync + 'static> {
-    /// Fitted transformer steps.
-    transformers: Vec<(String, Box<dyn FittedPipelineTransformer<F>>)>,
+    /// Fitted transformer steps, each paired with its output weight.
+    transformers: Vec<(String, Box<dyn FittedPipelineTransformer<F>>, F)>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedFeatureUnion<F> {
     /// Return the names of all transformer steps.
     #[must_use]
     pub fn transformer_names(&self) -> Vec<&str> {
-        self.transformers.iter().map(|(n, _)| n.as_str()).collect()
+        self.transformers
+            .iter()
+            .map(|(n, _, _)| n.as_str())
+            .collect()
     }
 
     /// Return the number of transformer steps.
@@ -180,19 +204,24 @@ impl<F: Float + Send + Sync + 'static> FittedFeatureUnion<F> {
     pub fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let mut parts: Vec<Array2<F>> = Vec::with_capacity(self.transformers.len());
 
-        for (name, t) in &self.transformers {
-            let part = t.transform_pipeline(x)?;
-            if let Some(first) = parts.first() {
-                if part.nrows() != first.nrows() {
-                    return Err(FerroError::ShapeMismatch {
-                        expected: vec![first.nrows()],
-                        actual: vec![part.nrows()],
-                        context: format!(
-                            "FittedFeatureUnion::transform — transformer '{}' produced different row count",
-                            name
-                        ),
-                    });
-                }
+        for (name, t, weight) in &self.transformers {
+            let mut part = t.transform_pipeline(x)?;
+            if let Some(first) = parts.first()
+                && part.nrows() != first.nrows()
+            {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![first.nrows()],
+                    actual: vec![part.nrows()],
+                    context: format!(
+                        "FittedFeatureUnion::transform — transformer '{}' produced different row count",
+                        name
+                    ),
+                });
+            }
+            // Scale the block by its weight (weight = 1 is a no-op), mirroring
+            // sklearn's `transformer_weights` (`sklearn/pipeline.py:1565`).
+            if *weight != F::one() {
+                part.mapv_inplace(|v| v * *weight);
             }
             parts.push(part);
         }
