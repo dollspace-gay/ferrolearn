@@ -7,6 +7,27 @@
 //!
 //! This is useful for making features more Gaussian-like, which can improve
 //! the performance of many machine learning algorithms.
+//!
+//! Translation target: scikit-learn 1.5.2 `class QuantileTransformer`
+//! (`sklearn/preprocessing/_data.py:2540`) + `quantile_transform` (`:2978`).
+//! Design: `.design/preprocess/quantile_transformer.md`. Tracking: #1319.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 forward-CDF value surface (uniform + normal, distinct + tied) | SHIPPED | `fit` references/landmarks (#1322) + `transform`; sklearn `_data.py:2694`,`:2702`,`:2795` |
+//! | REQ-2 forward+reversed AVERAGED interpolation | SHIPPED (#1321) | `interpolate_cdf`/`np_interp`; sklearn `_data.py:2843-2846` |
+//! | REQ-3 Normal output accuracy (Acklam ppf + clip) | SHIPPED (#1320) | `probit`; sklearn `_data.py:2855-2862` |
+//! | REQ-5 error/parameter contracts (scoped) | SHIPPED | `fit`/`transform` guards; sklearn `_data.py:2654` |
+//! | REQ-4 `np.maximum.accumulate` monotonic repair (unobservable) | NOT-STARTED (#1323) | sklearn `_data.py:2707` |
+//! | REQ-6 random subsample + random_state + n_quantiles>subsample error | NOT-STARTED (#1324) | sklearn `_data.py:2696-2700`,`:2774-2779` |
+//! | REQ-7 `inverse_transform` | NOT-STARTED (#1325) | sklearn `_data.py:2947`,`:2848` |
+//! | REQ-8 `ignore_implicit_zeros` + sparse CSC | NOT-STARTED (#1326) | sklearn `_data.py:2709-2752` |
+//! | REQ-9 `quantile_transform` free function | NOT-STARTED (#1327) | sklearn `_data.py:2978` |
+//! | REQ-10 `copy` + OneToOneFeatureMixin fitted-attr surface | NOT-STARTED (#1328) | sklearn `_data.py:2540`,`:2790-2795` |
+//! | REQ-11 PyO3 binding | NOT-STARTED (#1329) | `ferrolearn-python/src/` (absent) |
+//! | REQ-12 ferray substrate | NOT-STARTED (#1330) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -146,82 +167,126 @@ impl<F: Float + Send + Sync + 'static> FittedQuantileTransformer<F> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Approximate the inverse normal CDF (probit function) using the rational
-/// approximation by Abramowitz and Stegun.
+/// Inverse of the standard normal CDF (probit / norm.ppf), accurate to ~1e-9
+/// via Acklam's rational approximation. Mirrors scipy `stats.norm.ppf` as used
+/// by sklearn QuantileTransformer (`_data.py:2856`), with the output clipped to
+/// +/- norm.ppf(1e-7 - spacing(1)) = +/- 5.199337582605575 (`_data.py:2860-2862`).
 fn probit<F: Float>(p: F) -> F {
-    // Clamp to avoid infinities
-    let eps = F::from(1e-7).unwrap_or_else(F::min_positive_value);
-    let p = if p < eps {
-        eps
-    } else if p > F::one() - eps {
-        F::one() - eps
+    let clip = F::from(5.199337582605575).unwrap_or_else(F::max_value);
+    let cf = |k: f64| F::from(k).unwrap_or_else(F::zero);
+    if p <= F::zero() {
+        return -clip;
+    }
+    if p >= F::one() {
+        return clip;
+    }
+    let a = [
+        -3.969683028665376e+01,
+        2.209460984245205e+02,
+        -2.759285104469687e+02,
+        1.38357751867269e+02,
+        -3.066479806614716e+01,
+        2.506628277459239e+00,
+    ];
+    let b = [
+        -5.447609879822406e+01,
+        1.615858368580409e+02,
+        -1.556989798598866e+02,
+        6.680131188771972e+01,
+        -1.328068155288572e+01,
+    ];
+    let c = [
+        -7.784894002430293e-03,
+        -3.223964580411365e-01,
+        -2.400758277161838e+00,
+        -2.549732539343734e+00,
+        4.374664141464968e+00,
+        2.938163982698783e+00,
+    ];
+    let d = [
+        7.784695709041462e-03,
+        3.224671290700398e-01,
+        2.445134137142996e+00,
+        3.754408661907416e+00,
+    ];
+    let p_low = F::from(0.02425).unwrap_or_else(F::zero);
+    let p_high = F::one() - p_low;
+    let two = F::from(2.0).unwrap_or_else(F::one);
+    let half = F::from(0.5).unwrap_or_else(F::zero);
+    let x = if p < p_low {
+        let qv = (-two * p.ln()).sqrt();
+        (((((cf(c[0]) * qv + cf(c[1])) * qv + cf(c[2])) * qv + cf(c[3])) * qv + cf(c[4])) * qv
+            + cf(c[5]))
+            / ((((cf(d[0]) * qv + cf(d[1])) * qv + cf(d[2])) * qv + cf(d[3])) * qv + F::one())
+    } else if p <= p_high {
+        let qv = p - half;
+        let r = qv * qv;
+        (((((cf(a[0]) * r + cf(a[1])) * r + cf(a[2])) * r + cf(a[3])) * r + cf(a[4])) * r
+            + cf(a[5]))
+            * qv
+            / (((((cf(b[0]) * r + cf(b[1])) * r + cf(b[2])) * r + cf(b[3])) * r + cf(b[4])) * r
+                + F::one())
     } else {
-        p
+        let qv = (-two * (F::one() - p).ln()).sqrt();
+        -(((((cf(c[0]) * qv + cf(c[1])) * qv + cf(c[2])) * qv + cf(c[3])) * qv + cf(c[4])) * qv
+            + cf(c[5]))
+            / ((((cf(d[0]) * qv + cf(d[1])) * qv + cf(d[2])) * qv + cf(d[3])) * qv + F::one())
     };
-
-    // Rational approximation for the probit function
-    let half = F::from(0.5).unwrap();
-    if p < half {
-        // Use symmetry: probit(p) = -probit(1-p)
-        let t = (-F::from(2.0).unwrap() * p.ln()).sqrt();
-        let c0 = F::from(2.515517).unwrap();
-        let c1 = F::from(0.802853).unwrap();
-        let c2 = F::from(0.010328).unwrap();
-        let d1 = F::from(1.432788).unwrap();
-        let d2 = F::from(0.189269).unwrap();
-        let d3 = F::from(0.001308).unwrap();
-        let num = c0 + c1 * t + c2 * t * t;
-        let den = F::one() + d1 * t + d2 * t * t + d3 * t * t * t;
-        -(t - num / den)
+    if x < -clip {
+        -clip
+    } else if x > clip {
+        clip
     } else {
-        let t = (-F::from(2.0).unwrap() * (F::one() - p).ln()).sqrt();
-        let c0 = F::from(2.515517).unwrap();
-        let c1 = F::from(0.802853).unwrap();
-        let c2 = F::from(0.010328).unwrap();
-        let d1 = F::from(1.432788).unwrap();
-        let d2 = F::from(0.189269).unwrap();
-        let d3 = F::from(0.001308).unwrap();
-        let num = c0 + c1 * t + c2 * t * t;
-        let den = F::one() + d1 * t + d2 * t * t + d3 * t * t * t;
-        t - num / den
+        x
     }
 }
 
-/// Linearly interpolate: find the quantile level for a given value in a
-/// sorted quantile reference vector.
-fn interpolate_cdf<F: Float>(value: F, quantiles: &[F], references: &[F]) -> F {
-    if quantiles.is_empty() {
-        return F::from(0.5).unwrap();
+/// numpy-`np.interp`-faithful 1-D linear interpolation (`xp` ascending, may have
+/// duplicate landmarks). Used twice (ascending + reversed) and averaged in the
+/// CDF lookup to mirror sklearn `_transform_col` (`_data.py:2843-2846`).
+fn np_interp<F: Float>(x: F, xp: &[F], fp: &[F]) -> F {
+    let n = xp.len();
+    if n == 0 {
+        return F::zero();
     }
-
-    // Clamp to range
-    if value <= quantiles[0] {
-        return references[0];
+    if x <= xp[0] {
+        return fp[0];
     }
-    if value >= quantiles[quantiles.len() - 1] {
-        return references[references.len() - 1];
+    if x >= xp[n - 1] {
+        return fp[n - 1];
     }
-
-    // Binary search for the interval
-    let mut lo = 0;
-    let mut hi = quantiles.len() - 1;
-    while lo < hi - 1 {
-        let mid = usize::midpoint(lo, hi);
-        if quantiles[mid] <= value {
-            lo = mid;
+    // first index with xp[idx] > x (numpy searchsorted side='right'); interval (idx-1, idx)
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if xp[mid] <= x {
+            lo = mid + 1;
         } else {
             hi = mid;
         }
     }
-
-    // Linear interpolation
-    let denom = quantiles[hi] - quantiles[lo];
+    let i = lo - 1;
+    let denom = xp[i + 1] - xp[i];
     if denom == F::zero() {
-        references[lo]
+        fp[i]
     } else {
-        let frac = (value - quantiles[lo]) / denom;
-        references[lo] + frac * (references[hi] - references[lo])
+        fp[i] + (x - xp[i]) / denom * (fp[i + 1] - fp[i])
     }
+}
+
+/// Map `value` to its quantile level by averaging the ascending and reversed
+/// linear interpolations, mirroring sklearn `_transform_col`
+/// (`_data.py:2843-2846`) so plateaus map to the midpoint of their span.
+fn interpolate_cdf<F: Float>(value: F, quantiles: &[F], references: &[F]) -> F {
+    if quantiles.is_empty() {
+        return F::from(0.5).unwrap_or_else(F::zero);
+    }
+    let forward = np_interp(value, quantiles, references);
+    let neg_q: Vec<F> = quantiles.iter().rev().map(|&qv| -qv).collect();
+    let neg_r: Vec<F> = references.iter().rev().map(|&rv| -rv).collect();
+    let backward = np_interp(-value, &neg_q, &neg_r);
+    F::from(0.5).unwrap_or_else(F::zero) * (forward - backward)
 }
 
 // ---------------------------------------------------------------------------
@@ -257,10 +322,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for QuantileTransforme
         let n_features = x.ncols();
         let effective_quantiles = self.n_quantiles.min(n_samples);
 
-        // Build evenly spaced reference levels in [0, 1]
-        let references: Vec<F> = (0..effective_quantiles)
-            .map(|i| F::from(i).unwrap() / F::from(effective_quantiles - 1).unwrap_or_else(F::one))
+        // numpy np.linspace(0,1,K): step = 1/(K-1) computed once, y[i] = i*step,
+        // endpoint y[K-1] pinned to exactly 1.0 (_data.py:2795).
+        let k = effective_quantiles;
+        let denom = F::from(k.saturating_sub(1)).unwrap_or_else(F::one);
+        let step = F::one() / denom;
+        let mut references: Vec<F> = (0..k)
+            .map(|i| F::from(i).unwrap_or_else(F::zero) * step)
             .collect();
+        if k >= 2 {
+            let last = references.len() - 1;
+            references[last] = F::one();
+        }
 
         let mut quantiles = Vec::with_capacity(n_features);
 
@@ -285,10 +358,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for QuantileTransforme
             let n = col_vals.len();
             let mut feature_quantiles = Vec::with_capacity(effective_quantiles);
             for &ref_level in &references {
-                let pos = ref_level * F::from(n.saturating_sub(1)).unwrap();
+                // sklearn: np.nanpercentile(X, references_*100); numpy 'linear' virtual
+                // index is q/100*(n-1). Replicate the *100 then /100 round-trip
+                // (_data.py:2694,:2702).
+                let hundred = F::from(100.0).unwrap_or_else(F::one);
+                let q = ref_level * hundred;
+                let pos = (q / hundred) * F::from(n.saturating_sub(1)).unwrap_or_else(F::one);
                 let lo = pos.floor().to_usize().unwrap_or(0).min(n.saturating_sub(1));
                 let hi = pos.ceil().to_usize().unwrap_or(0).min(n.saturating_sub(1));
-                let frac = pos - F::from(lo).unwrap();
+                let frac = pos - F::from(lo).unwrap_or_else(F::zero);
                 let val = if lo == hi {
                     col_vals[lo]
                 } else {
