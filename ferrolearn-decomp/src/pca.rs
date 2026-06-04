@@ -27,6 +27,40 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 1);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/pca.md`. Tracking: #1499. Each REQ is BINARY — SHIPPED
+//! (impl + non-test consumer + tests + green verification) or NOT-STARTED (concrete
+//! open blocker). Non-test consumers: crate re-export (`lib.rs:98`), the PyO3
+//! `_RsPCA` binding (`ferrolearn-python/src/transformers.rs:89`, registered
+//! `lib.rs:23`), and `PipelineTransformer` (`pca.rs:509-536`). Oracle = live sklearn
+//! 1.5.2 (`_pca.py`), run from `/tmp` (R-CHAR-3). ferrolearn's `fit` exactly mirrors
+//! sklearn's `covariance_eigh` solver (`_pca.py:593-644`) including the `svd_flip`
+//! sign step.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | `components_` sign via `svd_flip(u_based_decision=False)` + EXACT value parity (`components_`/`transform`/`explained_variance_`/`ratio`/`singular_values_`) | SHIPPED | `fit` (`pca.rs:461-481`) applies the per-row max-abs-positive flip (numpy `argmax` first-on-ties via strict `>`, whole-row negate) = sklearn `svd_flip` (`_pca.py:647`, `extmath.py:897-905`). `tests/divergence_pca.rs` matches the live sklearn `PCA` oracle element-wise incl. sign to 1e-6 (3 DIV tests, fixtures 6×3/7×4/near-tie). Was #1500, fixed |
+//! | REQ-2 | Degenerate/repeated-eigenvalue + rank-deficient component VALUE parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): repeated eigenvalues → faer/LAPACK pick different orthonormal bases (same class as spectral_embedding) — blocker #1501 |
+//! | REQ-3 | Components orthonormality (unit rows + mutual orthogonality) | SHIPPED | `test_pca_components_orthonormal` + green-guard; eigenvectors of symmetric covariance |
+//! | REQ-4 | `explained_variance_` ordering/non-negativity + `explained_variance_ratio_` (÷ sum of ALL eigenvalues = sklearn `total_var`) | SHIPPED | matches sklearn element-wise to 1e-6 (critic green-guards); `test_pca_explained_variance_*`, `test_pca_n_components_equals_n_features` |
+//! | REQ-5 | `singular_values_` = `sqrt(eigval·(n−1))` ≥ 0 | SHIPPED | matches sklearn to 1e-6 (green-guard); `test_pca_singular_values_positive` |
+//! | REQ-6 | `inverse_transform` round-trip exact when `n_components == n_features` | SHIPPED | `test_pca_inverse_transform_roundtrip`/`_approx` + green-guard (sign-invariant) |
+//! | REQ-7 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch) | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards; FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None` |
+//! | REQ-8 | f32 generic support | SHIPPED | `test_pca_f32`; faer f32 eigensolver path |
+//! | REQ-9 | `PipelineTransformer` integration | SHIPPED | `pca.rs:509-536`; `test_pca_pipeline_integration` |
+//! | REQ-10 | PyO3 `_RsPCA` binding (fit/transform/inverse_transform + components_/explained_variance_/explained_variance_ratio_/mean_/singular_values_ getters) | SHIPPED | `transformers.rs:89`, registered `lib.rs:23`; inherits REQ-1's deterministic signs |
+//! | REQ-11 | `whiten` (transform /sqrt(explained_variance_), inverse un-scale) | NOT-STARTED | sklearn `_base.py:157-165,:192-196`; ferrolearn no `whiten` — blocker #1502 |
+//! | REQ-12 | `svd_solver` param + full-SVD/randomized/arpack paths | NOT-STARTED | sklearn `_pca.py:519-548,:575-591,:711-778`; ferrolearn covariance_eigh only — blocker #1503 |
+//! | REQ-13 | `n_components` as float (variance ratio) / "mle" / None-default | NOT-STARTED | sklearn `_pca.py:657-691`; ferrolearn requires explicit `usize` — blocker #1504 |
+//! | REQ-14 | `get_covariance` / `get_precision` | NOT-STARTED | sklearn `_base.py:30-101`; depends on `noise_variance_` (REQ-15) — blocker #1505 |
+//! | REQ-15 | `score` / `score_samples` (Gaussian log-likelihood) + `noise_variance_` | NOT-STARTED | sklearn `_pca.py:685-688`; ferrolearn discards the eigenvalue tail — blocker #1507 |
+//! | REQ-16 | Fitted attrs `n_components_` / `n_features_in_` | NOT-STARTED | derivable but not exposed — blocker #1508 |
+//! | REQ-17 | ctor params `tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy` | NOT-STARTED | sklearn `_pca.py:407-423`; ferrolearn has `n_components` only — blocker #1509 |
+//! | REQ-18 | ferray substrate | NOT-STARTED | dense `ndarray` + direct `faer`/Jacobi — blocker #1510 |
+//!
+//! Count: **9 SHIPPED (REQ-1,3,4,5,6,7,8,9,10) / 9 NOT-STARTED (REQ-2,11,12,13,14,15,16,17,18)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -456,6 +490,28 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
             // of `components_`.
             for j in 0..n_features {
                 components[[k, j]] = eigenvectors[[j, idx]];
+            }
+
+            // Sign convention: mirror sklearn `svd_flip(U, Vt,
+            // u_based_decision=False)` (`_pca.py:647`, `extmath.py:897-905`).
+            // For each component row, find the column with the maximum absolute
+            // value (numpy `argmax` → FIRST on ties: iterate from 0 and update
+            // only on STRICT `>`). If that entry is negative, negate the whole
+            // row so its max-abs entry is positive. This pins the otherwise
+            // arbitrary faer eigenvector signs deterministically.
+            let mut j_max = 0usize;
+            let mut max_abs = components[[k, 0]].abs();
+            for j in 1..n_features {
+                let abs_j = components[[k, j]].abs();
+                if abs_j > max_abs {
+                    max_abs = abs_j;
+                    j_max = j;
+                }
+            }
+            if components[[k, j_max]] < F::zero() {
+                for j in 0..n_features {
+                    components[[k, j]] = -components[[k, j]];
+                }
             }
         }
 
