@@ -9,6 +9,30 @@
 //! - [`BinStrategy::KMeans`] — bins based on 1D k-means clustering.
 //!
 //! The output can be ordinal-encoded (integers 0..k-1) or one-hot encoded.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class KBinsDiscretizer`
+//! (`sklearn/preprocessing/_discretization.py:184`). Tracking: #1375. Each REQ
+//! is BINARY — SHIPPED (impl + non-test consumer + tests + green verification)
+//! or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Uniform + Quantile bin EDGES + ordinal/onehot transform VALUES (non-degenerate features) | SHIPPED | [`KBinsDiscretizer`] `fit` — Uniform=`np.linspace` (`_discretization.py:271`), Quantile=`np.percentile` (`:276`); `assign_bin` ≡ `searchsorted(edges[1:-1], side="right")` (`:377`); oracle value tests in `tests/divergence_kbins_discretizer.rs`. Consumer: re-export `lib.rs:151` |
+//! | REQ-2 | KMeans bin edges/transform on well-separated data | SHIPPED (scoped) | `kmeans_1d` deterministic uniform-midpoint init (`:289-290`) matches sklearn Lloyd on well-separated data (edges [0,2.6,7.6,10.2]); EXACT parity on degenerate/duplicate-heavy data (sklearn empty-cluster relocation) is NOT-STARTED — carve-out #1378 |
+//! | REQ-3 | Error/parameter contracts (n_samples<2, n_bins<2, transform ncols, unfitted) | SHIPPED (scoped) | [`KBinsDiscretizer::fit`]/[`FittedKBinsDiscretizer`] `transform`; in-module + divergence error tests |
+//! | REQ-4 | Constant feature → bin 0 + per-feature `n_bins_=1` (`col_min==col_max`) | SHIPPED | `fit` sets `bin_edges=[-inf,+inf]` + `n_bins_per_feature[j]=1`; `assign_bin` → bin 0 (mirrors `_discretization.py:262-268`); 3 oracle tests — was DIV-1 #1376, fixed |
+//! | REQ-5 | Small-bin removal (quantile/kmeans near-duplicate edge collapse → per-feature `n_bins_`) + onehot variable width | SHIPPED | `fit` collapse `gap > 1e-8` (mirrors `ediff1d > 1e-8` `:302-312`); `transform` onehot width = `sum(n_bins_per_feature)` cumulative offsets; oracle tests (quantile collapse, onehot variable width, threshold boundary) — was DIV-2 #1377, fixed |
+//! | REQ-6 | `subsample` (default 200000) + `random_state` resample for quantile/kmeans | NOT-STARTED | sklearn `_discretization.py:242-249` — blocker #1379 |
+//! | REQ-7 | `n_bins` as per-feature array + `_validate_n_bins` | NOT-STARTED | scalar only; sklearn `_discretization.py:329-352` — blocker #1380 |
+//! | REQ-8 | encode='onehot' SPARSE default + sklearn ctor defaults (encode=onehot, strategy=quantile) | NOT-STARTED | dense only, defaults Ordinal/Uniform; sklearn `_discretization.py:185,320` — blocker #1381 |
+//! | REQ-9 | `dtype` param + `sample_weight` (weighted percentile/kmeans) | NOT-STARTED | sklearn `_discretization.py:228,235,295` — blocker #1382 |
+//! | REQ-10 | `inverse_transform` | NOT-STARTED | sklearn `_discretization.py:393` — blocker #1383 |
+//! | REQ-11 | `get_feature_names_out` + `bin_edges_`/`n_bins_` attr names + `PipelineTransformer` impl | NOT-STARTED | absent — blocker #1384 |
+//! | REQ-12 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1385 |
+//! | REQ-13 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1386 |
+//! | REQ-14 | KMeans EXACT parity on degenerate/duplicate-heavy data (empty-cluster relocation) | NOT-STARTED | `kmeans_1d` keeps empty clusters; sklearn relocates (`cluster/_kmeans.py`) — carve-out blocker #1378 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -121,9 +145,15 @@ impl<F: Float + Send + Sync + 'static> Default for KBinsDiscretizer<F> {
 /// Created by calling [`Fit::fit`] on a [`KBinsDiscretizer`].
 #[derive(Debug, Clone)]
 pub struct FittedKBinsDiscretizer<F> {
-    /// Bin edges per feature. `bin_edges[j]` has `n_bins + 1` edges.
+    /// Bin edges per feature. `bin_edges[j]` has `n_bins_per_feature[j] + 1`
+    /// edges (which may be fewer than `n_bins + 1` for constant or collapsed
+    /// features).
     bin_edges: Vec<Vec<F>>,
-    /// Number of bins.
+    /// Per-feature bin count (mirrors sklearn `n_bins_`). A constant feature
+    /// collapses to 1 bin; quantile/kmeans features may shrink when
+    /// near-duplicate edges are removed.
+    n_bins_per_feature: Vec<usize>,
+    /// Requested number of bins (the global `n_bins` argument).
     n_bins: usize,
     /// Encoding method.
     encode: BinEncoding,
@@ -136,7 +166,13 @@ impl<F: Float + Send + Sync + 'static> FittedKBinsDiscretizer<F> {
         &self.bin_edges
     }
 
-    /// Return the number of bins.
+    /// Return the per-feature bin count (sklearn `n_bins_`).
+    #[must_use]
+    pub fn n_bins_per_feature(&self) -> &[usize] {
+        &self.n_bins_per_feature
+    }
+
+    /// Return the requested number of bins.
     #[must_use]
     pub fn n_bins(&self) -> usize {
         self.n_bins
@@ -286,6 +322,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KBinsDiscretizer<F
 
         let n_features = x.ncols();
         let mut bin_edges = Vec::with_capacity(n_features);
+        let mut n_bins_per_feature = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
             let mut col_vals: Vec<F> = x.column(j).iter().copied().collect();
@@ -294,7 +331,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KBinsDiscretizer<F
             let min_val = col_vals[0];
             let max_val = col_vals[col_vals.len() - 1];
 
-            let edges = match self.strategy {
+            // Constant feature (sklearn :262-268): collapse to a single bin
+            // spanning [-inf, +inf] so transform maps every value to bin 0.
+            if min_val == max_val {
+                bin_edges.push(vec![F::neg_infinity(), F::infinity()]);
+                n_bins_per_feature.push(1);
+                continue;
+            }
+
+            let edges: Vec<F> = match self.strategy {
                 BinStrategy::Uniform => (0..=self.n_bins)
                     .map(|i| {
                         min_val
@@ -318,11 +363,34 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KBinsDiscretizer<F
                 BinStrategy::KMeans => kmeans_1d(&col_vals, self.n_bins, 100),
             };
 
-            bin_edges.push(edges);
+            // Small-bin removal for quantile and kmeans only (sklearn
+            // :302-312): keep the first edge, then keep each subsequent edge
+            // only if its gap to the previously kept edge exceeds 1e-8.
+            // Uniform is never collapsed.
+            match self.strategy {
+                BinStrategy::Quantile | BinStrategy::KMeans => {
+                    let tol = F::from(1e-8).unwrap_or_else(F::epsilon);
+                    let mut kept: Vec<F> = Vec::with_capacity(edges.len());
+                    for &edge in &edges {
+                        match kept.last() {
+                            None => kept.push(edge),
+                            Some(&last) if edge - last > tol => kept.push(edge),
+                            Some(_) => {}
+                        }
+                    }
+                    n_bins_per_feature.push(kept.len() - 1);
+                    bin_edges.push(kept);
+                }
+                BinStrategy::Uniform => {
+                    n_bins_per_feature.push(self.n_bins);
+                    bin_edges.push(edges);
+                }
+            }
         }
 
         Ok(FittedKBinsDiscretizer {
             bin_edges,
+            n_bins_per_feature,
             n_bins: self.n_bins,
             encode: self.encode,
         })
@@ -364,11 +432,21 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKBinsDiscr
                 Ok(out)
             }
             BinEncoding::OneHot => {
-                let n_out = n_features * self.n_bins;
+                // Output width is the sum of the per-feature bin counts, and
+                // feature `j`'s columns start at the cumulative sum of the
+                // preceding features' bin counts (sklearn one-hot over
+                // `n_bins_`).
+                let mut offsets = Vec::with_capacity(n_features + 1);
+                let mut acc = 0usize;
+                for &nb in &self.n_bins_per_feature {
+                    offsets.push(acc);
+                    acc += nb;
+                }
+                let n_out = acc;
                 let mut out = Array2::zeros((n_samples, n_out));
                 for j in 0..n_features {
                     let edges = &self.bin_edges[j];
-                    let col_offset = j * self.n_bins;
+                    let col_offset = offsets[j];
                     for i in 0..n_samples {
                         let bin = assign_bin(x[[i, j]], edges);
                         out[[i, col_offset + bin]] = F::one();
