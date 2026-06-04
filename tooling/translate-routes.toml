@@ -1025,6 +1025,12 @@ design = ".design/model-sel/time_series_split.md"
 parity_ops = ["TimeSeriesSplit"]
 
 [[route]]
+crate_pattern = "ferrolearn-model-sel/src/splitters.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_split.py"]
+design = ".design/model-sel/splitters.md"
+parity_ops = ["LeaveOneOut", "LeavePOut", "ShuffleSplit", "StratifiedShuffleSplit", "RepeatedKFold", "RepeatedStratifiedKFold", "PredefinedSplit"]
+
+[[route]]
 crate_pattern = "ferrolearn-model-sel/src/param_grid.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
 design = ".design/model-sel/param_grid.md"
