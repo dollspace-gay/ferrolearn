@@ -8,6 +8,27 @@
 //!
 //! - [`KnotStrategy::Uniform`] — knots are evenly spaced between min and max.
 //! - [`KnotStrategy::Quantile`] — knots are placed at quantiles of the data.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class SplineTransformer`
+//! (`sklearn/preprocessing/_polynomial.py:580`). Tracking: #1331.
+//! Each REQ is BINARY — SHIPPED (impl + non-test consumer + tests + green
+//! verification) or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Output dimensions (`n_knots+degree-1` cols/feature) + B-spline structural properties (partition-of-unity, non-negativity) | SHIPPED | [`FittedSplineTransformer::transform`]; sklearn `n_splines` `_polynomial.py:875`; tests `green_guard_column_count_per_feature` / `_partition_of_unity` / `_non_negativity` |
+//! | REQ-2 | Uniform-knot basis VALUE parity — EXTENDED edge-spacing knots + scipy `BSpline` design matrix | SHIPPED | [`FittedSplineTransformer`] knot construction matches sklearn `_polynomial.py:908-923` + `:925-940`; verified across degree∈{1,2,3}, multi-feature, both base endpoints in `tests/divergence_spline_transformer.rs` (was DIV-1 #1332) |
+//! | REQ-3 | `extrapolation` param (`constant`/`linear`/`continue`/`periodic`/`error`) for out-of-base-interval values | NOT-STARTED | no param; sklearn `_polynomial.py:619-633,721,1023-1123` — blocker #1333 |
+//! | REQ-4 | `include_bias` param (drop one column when `false`) | NOT-STARTED | no param; sklearn `_polynomial.py:635,942` — blocker #1334 |
+//! | REQ-5 | Quantile knots via `np.percentile`-exact (ferrolearn uses linear-interp percentile) | NOT-STARTED | `spline_transformer.rs` Quantile path; sklearn `_polynomial.py:747-753` — blocker #1335 |
+//! | REQ-6 | Error/parameter contracts (`n_samples<2`, `n_knots<2`, `degree==0`, transform ncols, unfitted) | SHIPPED (scoped) | [`SplineTransformer::fit`]; NOTE divergence — sklearn allows `degree==0` & has no `n_samples>=2` requirement (`_parameter_constraints`) — see blocker #1336 |
+//! | REQ-7 | `sparse_output` + `order` params | NOT-STARTED | no params; sklearn `_polynomial.py:716-730` — blocker #1337 |
+//! | REQ-8 | `sample_weight` (weighted knot placement) | NOT-STARTED | sklearn `fit(X, y=None, sample_weight=None)` `_polynomial.py:811` — blocker #1338 |
+//! | REQ-9 | `get_feature_names_out` (`{feat}_sp_{j}`) + `bsplines_`/`n_features_out_` fitted attrs | NOT-STARTED | sklearn `_polynomial.py:781-809,942` — blocker #1339 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` binding — blocker #1340 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1341 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -158,21 +179,27 @@ fn bspline_basis<F: Float>(x: F, knots: &[F], degree: usize, n_basis: usize) -> 
     let mut basis = vec![F::zero(); n_intervals];
 
     // Degree 0: indicator functions using half-open intervals [t_i, t_{i+1}).
-    // Special case: when x equals the rightmost knot, assign it to the last
-    // non-degenerate interval so the Cox-de Boor recursion can propagate
-    // the value up through knot spans with non-zero width.
-    let last_knot = knots[knots.len() - 1];
-    if x >= last_knot {
-        // Find the last interval with non-zero width and activate it
+    // Special case: with sklearn's EXTENDED knot vector the base interval is
+    // `[knots[degree], knots[n_basis]]` (knots[n_basis] is the right end of the
+    // base support, NOT the rightmost extended knot). scipy's `design_matrix`
+    // includes the right endpoint of the base interval, so a value at
+    // `x == knots[n_basis]` must be evaluated as the limit from the left rather
+    // than returning all-zero under a naive half-open `t_i <= x < t_{i+1}`.
+    // Activate the last non-degenerate interval that LIES AT OR BEFORE the base
+    // right endpoint so the Cox-de Boor recursion propagates a non-zero value.
+    let base_right = knots[n_basis];
+    if x >= base_right {
+        // Find the last interval ending at the base right endpoint with
+        // non-zero width and activate it (the closed-right base span).
         let mut found = false;
         for i in (0..n_intervals).rev() {
-            if knots[i] < knots[i + 1] {
+            if knots[i + 1] <= base_right && knots[i] < knots[i + 1] {
                 basis[i] = F::one();
                 found = true;
                 break;
             }
         }
-        // Fallback: if all intervals are degenerate, activate the last one
+        // Fallback: if all such intervals are degenerate, activate the last one
         if !found {
             basis[n_intervals - 1] = F::one();
         }
@@ -293,18 +320,49 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
                 }
             };
 
-            // Build full knot vector with boundary knots of multiplicity (degree + 1)
-            let mut full_knots = Vec::new();
-            // Left boundary knots
-            for _ in 0..self.degree {
-                full_knots.push(min_val);
-            }
-            // Interior knots
-            full_knots.extend_from_slice(&interior_knots);
-            // Right boundary knots
-            for _ in 0..self.degree {
-                full_knots.push(max_val);
-            }
+            // Build full knot vector using sklearn's EXTENDED edge-spacing
+            // construction (`_polynomial.py:908-923`). sklearn explicitly
+            // REJECTS the clamped/`np.tile` repeated-boundary construction
+            // (`:898-906`, Eilers & Marx) in favour of reusing the spacing of
+            // the two first/last base knots:
+            //   dist_min = base[1] - base[0]; dist_max = base[-1] - base[-2]
+            //   left  = linspace(base[0] - degree*dist_min, base[0] - dist_min, degree)
+            //   right = linspace(base[-1] + dist_max, base[-1] + degree*dist_max, degree)
+            //   knots = [left, base, right]
+            // numpy `linspace(a, b, num)` is inclusive of both endpoints.
+            let base = &interior_knots;
+            let nb = base.len();
+            let dist_min = base[1] - base[0];
+            let dist_max = base[nb - 1] - base[nb - 2];
+            let degree = self.degree;
+            let deg_f = F::from(degree).unwrap_or_else(F::one);
+
+            // numpy linspace with `num` inclusive endpoints. For num == 1 numpy
+            // returns just [a]; for num >= 2 it includes both a and b.
+            let linspace = |a: F, b: F, num: usize| -> Vec<F> {
+                if num == 1 {
+                    return vec![a];
+                }
+                let denom = F::from(num - 1).unwrap_or_else(F::one);
+                (0..num)
+                    .map(|i| {
+                        let t = F::from(i).unwrap_or_else(F::zero) / denom;
+                        a + (b - a) * t
+                    })
+                    .collect()
+            };
+
+            let left = linspace(base[0] - deg_f * dist_min, base[0] - dist_min, degree);
+            let right = linspace(
+                base[nb - 1] + dist_max,
+                base[nb - 1] + deg_f * dist_max,
+                degree,
+            );
+
+            let mut full_knots = Vec::with_capacity(left.len() + nb + right.len());
+            full_knots.extend_from_slice(&left);
+            full_knots.extend_from_slice(base);
+            full_knots.extend_from_slice(&right);
 
             knot_vectors.push(full_knots);
         }
