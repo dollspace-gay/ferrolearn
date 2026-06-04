@@ -30,6 +30,27 @@
 //! matrices, which is adequate for small/medium datasets. For very large
 //! sparse data, prefer streaming directly into a sparse matrix (out of scope
 //! here; tracked as a NOT-STARTED REQ).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | load 1-based parse (`<label> idx:val`, `#` comment, blanks) | SHIPPED | `fn parse_line` + `fn load_svmlight_str`; tests `parse_basic_line`/`round_trip_dense` |
+//! | REQ-2 | load `zero_based="auto"` (global min-index rule) | SHIPPED | `fn auto_base_offset_global` + `fn load_svmlight_str` (sklearn `_svmlight_format_io.py:402-409`); `divergence_load_zero_based_auto` |
+//! | REQ-3 | load sparse CSR return | NOT-STARTED | returns dense `Array2<f64>`; needs ferray / ferrolearn-sparse CSR type — blocker #1647 |
+//! | REQ-4 | `load_svmlight_files` common n_features + global base | SHIPPED | `fn load_svmlight_files` (`:410-419`); `divergence_load_files_common_n_features`, `divergence_load_files_global_zero_based_auto` |
+//! | REQ-5 | load optional params (`query_id` return, `multilabel`, `offset`/`length`, `dtype`) | NOT-STARTED | qid-ignore slice SHIPPED (`fn parse_line`, `divergence_load_qid_token_ignored`); remaining params absent — blocker #1651 |
+//! | REQ-6 | dump 0-based index default | SHIPPED | `fn dump_svmlight_file` writes `{j}:{v}` (`:474-483`, `:596`); `divergence_dump_index_base...` |
+//! | REQ-7 | dump `%.16g` value/label text formatting | SHIPPED | `fn format_g16` = C `printf("%.16g")` (`_svmlight_format_fast.pyx:199`, `:203`); `divergence_dump_value_formatting_scientific` (oracle byte-exact) |
+//! | REQ-8 | dump comment header + `zero_based`/`query_id`/`multilabel` params | NOT-STARTED | only data lines, no params/header (`:434-445`) — blocker #1648 |
+//! | REQ-9 | `load_files` Bunch contract + shuffle | NOT-STARTED | returns 3-tuple, no Bunch/filenames; exact shuffle is an RNG carve-out (`_base.py`) — blocker #1646 |
+//! | REQ-10 | ferray substrate | NOT-STARTED | on `ndarray`, not `ferray-core` — blocker #1649 |
+//! | REQ-11 | non-test production consumer | SHIPPED | `load_files` consumed by `ferrolearn-fetch/src/newsgroups.rs`; svmlight fns boundary re-export in `lib.rs` |
+//!
+//! RNG carve-out (R-DEFER-3, no failing test): `load_files` exact shuffle order
+//! (sklearn numpy `RandomState` permutation vs Rust RNG) — folded into #1646.
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -396,7 +417,7 @@ fn format_g16(v: f64) -> String {
 /// (`_svmlight_format_io.py:474-483`): only nonzero entries are written, column
 /// indices are emitted ZERO-based (sklearn default `zero_based=True`, `:596`),
 /// and labels and values are formatted with C `%.16g` semantics
-/// (`_svmlight_format_fast.pyx:199,:203`) via [`format_g16`].
+/// (`_svmlight_format_fast.pyx:199,:203`) via the private `format_g16` helper.
 ///
 /// # Errors
 ///
