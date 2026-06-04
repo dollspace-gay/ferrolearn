@@ -17,6 +17,26 @@
 //! y < 0, λ ≠ 2:  -((1 - y)^(2-λ) - 1) / (2 - λ)
 //! y < 0, λ = 2:  -ln(1 - y)
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class PowerTransformer` +
+//! `power_transform` (`sklearn/preprocessing/_data.py:3122`, `:3549`).
+//! Tracking: #1342. Each REQ is BINARY — SHIPPED (impl + non-test consumer +
+//! tests + green verification) or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Yeo-Johnson lambda estimate + forward-transform VALUE parity (positive, all-negative, mixed-sign, multi-feature, standardize, negative-optimal-λ) | SHIPPED | [`PowerTransformer::fit`] log-likelihood jacobian `sign(y)·ln(\|y\|+1)` matches sklearn `_data.py:3485` + `_yeo_johnson_transform` `:3426-3446`; bounded-Brent `[-3,3]` lands on sklearn `optimize.brent(brack=(-2,2))` optimum `:3493`; 13 oracle value tests in `tests/divergence_power_transformer.rs` (was DIV-1 #1343, fixed). Consumers: `_RsPowerTransformer` PyO3 (`ferrolearn-python/src/extras.rs:1171`, `lib.rs:84`) + `PipelineTransformer` + re-export |
+//! | REQ-2 | Error/parameter contracts (`n_samples==0`, transform ncols, unfitted) | SHIPPED (scoped) | [`PowerTransformer::fit`]/[`FittedPowerTransformer::transform`]; in-module + divergence error-contract tests |
+//! | REQ-3 | `box-cox` method (`stats.boxcox` optimize + transform + check_positive) | NOT-STARTED | Yeo-Johnson only; sklearn `_data.py:3285,3448,3525` — blocker #1344 |
+//! | REQ-4 | `inverse_transform` (Yeo-Johnson + box-cox inverse) | NOT-STARTED | absent; sklearn `_data.py:3347-3424` — blocker #1345 |
+//! | REQ-5 | `power_transform` free function | NOT-STARTED | absent; sklearn `_data.py:3549` — blocker #1346 |
+//! | REQ-6 | Constant-feature → λ=1.0 skip + StandardScaler zero-scale handling | NOT-STARTED | ferrolearn optimizes constant cols (var=0 → -inf), `if s>0` skip; sklearn `_data.py:3300-3302` + `_handle_zeros_in_scale` — blocker #1347 |
+//! | REQ-7 | NaN-drop in optimize + `check_positive` box-cox error | NOT-STARTED | ferrolearn maps NaN→0; sklearn drops NaN `_data.py:3491`, box-cox `:3525` — blocker #1348 |
+//! | REQ-8 | `method`/`copy` ctor params + `_parameter_constraints` | NOT-STARTED | only `standardize`; sklearn `_data.py:3222,3226` — blocker #1349 |
+//! | REQ-9 | `get_feature_names_out` + `n_features_in_`/`feature_names_in_` fitted-attr surface (`lambdas_` accessor exists) | NOT-STARTED | `OneToOneFeatureMixin`; sklearn `_data.py` — blocker #1350 |
+//! | REQ-10 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1351 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -98,13 +118,22 @@ fn log_likelihood_yj<F: Float>(col: &[F], lambda: F) -> F {
     // Simplified: -n/2 * ln(2π*var) - n/2
     let normal_ll = -n / two * (pi2 * variance).ln() - n / two;
 
-    // Jacobian contribution from Yeo-Johnson
-    // For both y >= 0 and y < 0, the Jacobian term is ln(|y| + 1).
+    // Jacobian contribution from Yeo-Johnson.
+    // sklearn `_data.py:3485` computes
+    // `(lmbda - 1) * (np.sign(x) * np.log1p(np.abs(x))).sum()`, so each term is
+    // `sign(y) * ln(|y| + 1)`. The explicit three-way sign makes y == 0
+    // contribute exactly 0 (numpy `np.sign(0) == 0`).
     let lambda_minus_1 = lambda - one;
-    let jacobian: F = col
-        .iter()
-        .copied()
-        .fold(F::zero(), |acc, y| acc + (y.abs() + one).ln());
+    let jacobian: F = col.iter().copied().fold(F::zero(), |acc, y| {
+        let sign = if y > F::zero() {
+            F::one()
+        } else if y < F::zero() {
+            -F::one()
+        } else {
+            F::zero()
+        };
+        acc + sign * (y.abs() + one).ln()
+    });
     let jacobian_ll = lambda_minus_1 * jacobian;
 
     normal_ll + jacobian_ll
