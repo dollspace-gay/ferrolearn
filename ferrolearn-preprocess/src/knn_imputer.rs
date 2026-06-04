@@ -142,10 +142,15 @@ fn partial_euclidean_distance<F: Float>(row_a: &[F], row_b: &[F]) -> (F, usize) 
     if n_valid == 0 {
         (F::infinity(), 0)
     } else {
-        // Scale distance to account for missing dimensions:
-        // d_full = d_partial * sqrt(n_total / n_valid)
-        // But we keep it simple here: just use sqrt(sum_sq)
-        (sum_sq.sqrt(), n_valid)
+        // Scale distance to account for missing dimensions, matching sklearn
+        // `nan_euclidean_distances`: `dist = sqrt(sum_sq * n_features / present_count)`
+        // (`sklearn/metrics/pairwise.py:543-547`: `distances /= present_count;
+        // distances *= X.shape[1]; np.sqrt(...)`). Here `present_count == n_valid`
+        // (features present in BOTH rows) and `n_features == row_a.len()`.
+        let n_features = row_a.len();
+        let scale =
+            F::from(n_features).unwrap_or_else(F::one) / F::from(n_valid).unwrap_or_else(F::one);
+        ((sum_sq * scale).sqrt(), n_valid)
     }
 }
 
