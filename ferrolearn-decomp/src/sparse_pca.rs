@@ -34,6 +34,30 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 1);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/sparse_pca.md`. Tracking: #1476. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumers: crate re-export (`lib.rs:99`) and
+//! the `_RsSparsePCA` PyO3 binding (`extras.rs:1129`, registered `lib.rs:77`).
+//! Oracle = live sklearn 1.5.2 (`_sparse_pca.py`), run from `/tmp` (R-CHAR-3).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | `transform` = RIDGE regression (`ridge_alpha=0.01`), not plain projection | SHIPPED | `transform` solves `U = (X−mean_)·Cᵀ·(C·Cᵀ + 0.01·I)⁻¹` == `ridge_regression(components_.T, X_centered.T, 0.01, solver="cholesky")` (sklearn `_sparse_pca.py:119-121`); matches the sklearn ridge oracle on ferrolearn's own fitted components to 1e-6 in `tests/divergence_sparse_pca.rs::divergence_transform_is_ridge_not_projection` (was #1477, fixed). Consumers: re-export `lib.rs:99`, `_RsSparsePCA` `extras.rs:1129` |
+//! | REQ-2 | Structural: components sparsity (L1→exact zeros), shape `(n_components,n_features)`, mean centering, error-decrease, determinism | SHIPPED (scoped) | `fn fit` centers via per-feature `mean` (= `mean_ = X.mean(axis=0)` `_sparse_pca.py:83`), alternating soft-threshold sparse-coding + dictionary update, seeded `StdRng` ⇒ deterministic. Green-guards in `tests/divergence_sparse_pca.rs` + in-module tests. STRUCTURAL only, NOT component VALUES (REQ-4) |
+//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, <2 samples, transform col mismatch) | SHIPPED (scoped) | `fn fit` guards (`InvalidParameter`/`InsufficientSamples`); `transform` `ShapeMismatch`. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features`/`n_samples<2` |
+//! | REQ-4 | EXACT `components_` value parity with sklearn `dict_learning` | NOT-STARTED | CARVE-OUT (R-DEFER-3): LARS lasso + numpy RNG + `svd_flip` + per-feature alpha scaling (`_sparse_pca.py:308-336`, `_dict_learning.py:120`) vs ferrolearn random-init soft-threshold-CD + LS update — blocker #1478 |
+//! | REQ-5 | `ridge_alpha` ctor/builder param exposure | NOT-STARTED | sklearn `SparsePCA(ridge_alpha=0.01)` `_sparse_pca.py:284`; ferrolearn hard-codes 0.01 in `transform` (REQ-1) — blocker #1479 |
+//! | REQ-6 | `method` (`lars`/`cd`) field + LARS sparse-coding path | NOT-STARTED | sklearn `method="lars"` → `dict_learning(method=)` `_sparse_pca.py:287/:319`; ferrolearn single soft-threshold CD coder — blocker #1480 |
+//! | REQ-7 | `U_init`/`V_init` warm restart + alpha/n_features scaling | NOT-STARTED | sklearn `_sparse_pca.py:289-290`, `_dict_learning.py:120`; ferrolearn always random-inits `V`, un-scaled alpha — blocker #1481 |
+//! | REQ-8 | `MiniBatchSparsePCA` online variant | NOT-STARTED | sklearn `class MiniBatchSparsePCA(_BaseSparsePCA)` `_sparse_pca.py:339-552`; ABSENT in ferrolearn — blocker #1482 |
+//! | REQ-9 | `inverse_transform` + `error_`/`n_components_`/`n_features_in_` attrs | NOT-STARTED | sklearn `_sparse_pca.py:125-146/:223/:226/:238`; `FittedSparsePCA` exposes only `components()`/`mean()`/`n_iter()` — blocker #1483 |
+//! | REQ-10 | PyO3 binding surface (thin: `n_components` ctor + `fit` + `transform`) | SHIPPED (scoped) | `_RsSparsePCA` (`extras.rs:1129`, registered `lib.rs:77`) via `py_transformer!`; inherits the REQ-1 ridge transform. NOT `alpha`/`tol`/`random_state` params, NOT `components_` accessor, NOT `inverse_transform` (REQ-5/9) |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `ndarray` + hand-rolled `invert_small_symmetric` — blocker #1484 |
+//!
+//! Count: **4 SHIPPED (REQ-1,2,3,10) / 7 NOT-STARTED (REQ-4,5,6,7,8,9,11)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -152,6 +176,8 @@ pub struct FittedSparsePCA<F> {
     mean_: Array1<F>,
     /// Number of outer iterations performed.
     n_iter_: usize,
+    /// Ridge shrinkage applied during `transform` (sklearn default `0.01`).
+    ridge_alpha: f64,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedSparsePCA<F> {
@@ -395,6 +421,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SparsePCA<F> {
             components_: v,
             mean_: mean,
             n_iter_: actual_iter,
+            ridge_alpha: 0.01,
         })
     }
 }
@@ -477,14 +504,23 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSparsePCA<
     type Output = Array2<F>;
     type Error = FerroError;
 
-    /// Project data onto the sparse components.
+    /// Least-squares projection of the data onto the sparse components.
     ///
-    /// Computes `(X - mean) @ components^T`.
+    /// Because the sparse `components_` are not orthonormal, a plain linear
+    /// projection is incorrect (see scikit-learn `_BaseSparsePCA.transform`,
+    /// `_sparse_pca.py:93-123`). Instead this computes the ridge-regularised
+    /// least-squares fit
+    /// `U = ridge_regression(components_.T, X_centered.T, ridge_alpha)`, i.e.
+    /// `U = (X - mean) · Cᵀ · (C·Cᵀ + ridge_alpha·I)⁻¹` with `C = components_`
+    /// and `ridge_alpha = 0.01` (sklearn default).
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
-    /// match the number of features seen during fitting.
+    /// - Returns [`FerroError::ShapeMismatch`] if the number of columns does not
+    ///   match the number of features seen during fitting.
+    /// - Returns [`FerroError::NumericalInstability`] if the ridge system
+    ///   `C·Cᵀ + ridge_alpha·I` is singular (should not occur for
+    ///   `ridge_alpha > 0`).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.mean_.len();
         if x.ncols() != n_features {
@@ -502,7 +538,25 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSparsePCA<
             }
         }
 
-        Ok(x_centered.dot(&self.components_.t()))
+        // Plain projection onto the (non-orthonormal) components.
+        let proj = x_centered.dot(&self.components_.t());
+
+        // Ridge system M = C·Cᵀ + ridge_alpha·I  (n_components × n_components,
+        // symmetric positive-definite for ridge_alpha > 0).
+        let ridge_alpha =
+            F::from(self.ridge_alpha).unwrap_or_else(|| F::from(0.01).unwrap_or_else(F::epsilon));
+        let mut m = self.components_.dot(&self.components_.t());
+        for i in 0..m.nrows() {
+            m[[i, i]] = m[[i, i]] + ridge_alpha;
+        }
+
+        // U = proj · M⁻¹  (M symmetric PD, so M⁻¹ = (M⁻¹)ᵀ).
+        let m_inv = invert_small_symmetric(&m).ok_or_else(|| FerroError::NumericalInstability {
+            message: "FittedSparsePCA::transform: ridge system (C·Cᵀ + ridge_alpha·I) is singular"
+                .into(),
+        })?;
+
+        Ok(proj.dot(&m_inv))
     }
 }
 
