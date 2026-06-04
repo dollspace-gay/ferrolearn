@@ -97,10 +97,21 @@ where
         indices.shuffle(&mut rng);
     }
 
-    // Compute the number of test samples (at least 1).
+    // Compute the number of test samples (sklearn uses ceil; #1724).
     let n_test = ((n_samples as f64) * test_size).ceil() as usize;
-    let n_test = n_test.max(1).min(n_samples - 1);
     let n_train = n_samples - n_test;
+
+    // sklearn `_validate_shuffle_split` (`_split.py:2414`) RAISES rather than
+    // clamping when the resulting train (or test) set would be empty. Mirror
+    // that with `InvalidParameter` (the R-DEV-2 analog of `ValueError`).
+    if n_train == 0 || n_test == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "test_size".into(),
+            reason: format!(
+                "With n_samples={n_samples} and test_size={test_size}, the resulting train set will be empty; reduce test_size"
+            ),
+        });
+    }
 
     let train_idx = &indices[..n_train];
     let test_idx = &indices[n_train..];
