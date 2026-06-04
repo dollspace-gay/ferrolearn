@@ -37,6 +37,40 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 1);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/truncated_svd.md`. Tracking: #1553. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumers: crate re-export (`lib.rs:101`), the
+//! PyO3 `_RsTruncatedSVD` binding (`ferrolearn-python/src/extras.rs:1101`, registered
+//! `lib.rs:73`), `PipelineTransformer`. Oracle = live sklearn 1.5.2
+//! (`_truncated_svd.py`, `algorithm='arpack'` for the deterministic value oracle),
+//! run from `/tmp` (R-CHAR-3). ferrolearn uses randomized SVD (Halko 2011); the
+//! top-k singular triplet matches the true SVD to ~8 sig figs.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | `components_` sign via `svd_flip(u_based_decision=False)` + EXACT value parity | SHIPPED | `fit` applies per-row max-abs-positive flip (= sklearn `_truncated_svd.py:255`); matches sklearn arpack incl. sign ~1e-12. Was #1556, fixed. Test `divergence_components_max_abs_positive_svd_flip` |
+//! | REQ-2 | `explained_variance_` = centered `np.var(X_transformed, axis=0)` | SHIPPED | `fit` computes centered variance of `X @ components.T` (= `_truncated_svd.py:269`); matches sklearn ~1e-9. Was #1554, fixed. Test `divergence_explained_variance_centered` |
+//! | REQ-3 | `explained_variance_ratio_` = EV / centered `np.var(X,axis=0).sum()` | SHIPPED | `fit` uses centered per-feature variance sum denominator (= `_truncated_svd.py:274`); matches sklearn ~1e-11. Was #1555, fixed. Test `divergence_explained_variance_ratio_centered_denominator` |
+//! | REQ-4 | `n_iter` power iterations | NOT-STARTED | ferrolearn does ZERO; sklearn `randomized_svd(n_iter=5)`. Top-k matches true SVD ~8 sig figs on tested fixtures; needed for slow-decay spectra — blocker #1557 |
+//! | REQ-5 | `components_` shape `(n_components,n_features)` | SHIPPED | `test_truncated_svd_correct_dimensions` + green-guard |
+//! | REQ-6 | `singular_values_` length + ≥0 + descending | SHIPPED | `test_truncated_svd_singular_values_positive`/`_sorted_descending` |
+//! | REQ-7 | `components_` rows unit-norm | SHIPPED | `test_truncated_svd_components_unit_length` |
+//! | REQ-8 | NO centering (vs PCA) | SHIPPED | `test_truncated_svd_no_centering` |
+//! | REQ-9 | `explained_variance_ratio_` sums ≤ 1 (centered denom) | SHIPPED | verified over 200 fixtures; `test_truncated_svd_explained_variance_ratio_le_1` |
+//! | REQ-10 | `transform`/`inverse_transform` shape + algebra | SHIPPED | `X @ components.T` / `X @ components`; shape tests |
+//! | REQ-11 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards. FLAG: sklearn raises `ValueError`, rejects only `>n_features` (randomized), requires `ensure_min_features=2` |
+//! | REQ-12 | f32/f64 generic | SHIPPED | `test_truncated_svd_f32` |
+//! | REQ-13 | `random_state` determinism (scoped, not bit-exact-vs-sklearn) | SHIPPED | `test_truncated_svd_random_state_reproducibility` |
+//! | REQ-14 | `PipelineTransformer` integration | SHIPPED | `test_truncated_svd_pipeline_integration` |
+//! | REQ-15 | PyO3 `_RsTruncatedSVD` binding (fit/transform only) | SHIPPED (scoped) | `extras.rs:1101`, registered `lib.rs:73`; NO getters/inverse_transform/random_state (REQ-17) |
+//! | REQ-16 | bit-exact sklearn RANDOMIZED-output parity for a seed | NOT-STARTED | CARVE-OUT (R-DEFER-3): numpy RandomState vs Rust StdRng; parity targets the true SVD — blocker #1558 |
+//! | REQ-17 | `algorithm='arpack'` + n_iter/n_oversamples/power_iteration_normalizer/tol params + n_features_in_ + PyO3 getter/inverse/random_state gap | NOT-STARTED | sklearn `_truncated_svd.py:173-185,:233-238` — blocker #1559 |
+//! | REQ-18 | ferray substrate | NOT-STARTED | `ndarray`+`rand`+hand-rolled QR/Jacobi — blocker #1560 |
+//!
+//! Count: **14 SHIPPED (REQ-1,2,3,5,6,7,8,9,10,11,12,13,14,15) / 4 NOT-STARTED (REQ-4,16,17,18)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -588,24 +622,70 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for TruncatedSVD<F> {
             }
         }
 
-        // Compute explained variance with population-variance normalization
-        // (`/ n_samples`, ddof=0) to match scikit-learn's TruncatedSVD which
-        // uses `np.var(X_transformed, axis=0)`. Earlier versions used `n-1`
-        // (Bessel correction) and produced values off by `n/(n-1)` (#342).
-        let n_f = F::from(n_samples.max(1)).unwrap();
-        let explained_variance = singular_values.mapv(|s| s * s / n_f);
-
-        // Total variance: same population normalization.
-        let total_var = {
-            let mut ss = F::zero();
-            for &v in x {
-                ss = ss + v * v;
+        // FIX-A (#1556): sklearn `svd_flip(U, VT, u_based_decision=False)`
+        // (`_truncated_svd.py:255`, `extmath.py:897-905`). For each component
+        // row, find the column with the maximum absolute value (numpy `argmax`
+        // → FIRST on ties: iterate from 0 and update only on STRICT `>`). If
+        // that entry is negative, negate the whole row so its max-abs entry is
+        // positive. This pins the otherwise arbitrary Jacobi eigenvector signs
+        // deterministically (same convention as `pca.rs:495-515`).
+        for i in 0..n_comp {
+            let mut j_max = 0usize;
+            let mut max_abs = components[[i, 0]].abs();
+            for j in 1..n_features {
+                let abs_j = components[[i, j]].abs();
+                if abs_j > max_abs {
+                    max_abs = abs_j;
+                    j_max = j;
+                }
             }
-            ss / n_f
-        };
+            if components[[i, j_max]] < F::zero() {
+                for j in 0..n_features {
+                    components[[i, j]] = -components[[i, j]];
+                }
+            }
+        }
 
-        let explained_variance_ratio = if total_var > F::zero() {
-            explained_variance.mapv(|v| v / total_var)
+        let n_f = F::from(n_samples.max(1)).unwrap_or_else(F::one);
+
+        // FIX-B (#1554): explained_variance_ = np.var(X_transformed, axis=0)
+        // (`_truncated_svd.py:269`), the CENTERED (ddof=0) variance of the
+        // transformed columns, where X_transformed = X @ components_.T
+        // (`:264`, using the FINAL flipped components). NOT the uncentered
+        // second moment `sigma^2 / n`. Computed as mean(t^2) - mean(t)^2 to
+        // match numpy's `np.var`.
+        let x_transformed = x.dot(&components.t());
+        let mut explained_variance = Array1::<F>::zeros(n_comp);
+        for i in 0..n_comp {
+            let mut sum = F::zero();
+            let mut sum_sq = F::zero();
+            for s in 0..n_samples {
+                let t = x_transformed[[s, i]];
+                sum = sum + t;
+                sum_sq = sum_sq + t * t;
+            }
+            let mean = sum / n_f;
+            explained_variance[i] = sum_sq / n_f - mean * mean;
+        }
+
+        // FIX-C (#1555): full_var = np.var(X, axis=0).sum()
+        // (`_truncated_svd.py:274`), the CENTERED per-feature variance summed
+        // over all features. NOT the uncentered `Sum(x^2)/n`.
+        let mut full_var = F::zero();
+        for j in 0..n_features {
+            let mut sum = F::zero();
+            let mut sum_sq = F::zero();
+            for s in 0..n_samples {
+                let v = x[[s, j]];
+                sum = sum + v;
+                sum_sq = sum_sq + v * v;
+            }
+            let mean = sum / n_f;
+            full_var = full_var + (sum_sq / n_f - mean * mean);
+        }
+
+        let explained_variance_ratio = if full_var > F::zero() {
+            explained_variance.mapv(|v| v / full_var)
         } else {
             Array1::zeros(n_comp)
         };
