@@ -36,6 +36,38 @@
 //! let fitted = est.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.covariance().dim(), (2, 2));
 //! ```
+//!
+//! Mirrors `sklearn/covariance/` (tag 1.5.2): `_empirical_covariance.py`,
+//! `_shrunk_covariance.py`, `_robust_covariance.py`, `_elliptic_envelope.py`.
+//! The 4 shrinkage/empirical estimators are deterministic (value parity);
+//! MinCovDet/EllipticEnvelope are RNG-coupled (FastMCD) carve-outs.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | EmpiricalCovariance `covariance_`/`location_` (biased MLE) | SHIPPED | `fn fit` (`empirical_cov`, ddof=0); `green_empirical_covariance_parity` vs live oracle |
+//! | REQ-1b | `precision_` exact (sklearn `pinvh`) | NOT-STARTED | `cholesky` adds `reg=1e-8` to the diagonal → `precision_` off `~1.7e-8` (`_empirical_covariance.py:216`) — blocker #1705 |
+//! | REQ-2 | ShrunkCovariance `(1-s)·emp + s·(tr/p)·I` | SHIPPED | `fn fit`; `green_shrunk_covariance_parity` |
+//! | REQ-3 | LedoitWolf `shrinkage_` + `covariance_` | SHIPPED | `fn fit`; `green_ledoit_wolf_parity` |
+//! | REQ-4 | OAS shrinkage formula (sklearn 1.5.2) | SHIPPED | `fn fit` = `num=alpha+mu²`, `den=(n+1)(alpha−mu²/p)` (`_shrunk_covariance.py:79-87`, fixed #1702); `divergence_oas_formula` |
+//! | REQ-5 | MinCovDet exact `support_`/`raw_*`/`covariance_` | NOT-STARTED | FastMCD RNG carve-out (numpy MT vs Xoshiro), R-DEFER-3 — blocker #1706 |
+//! | REQ-6 | MCD support size `h` | SHIPPED | structural (`h` from `support_fraction`) |
+//! | REQ-7 | MCD consistency correction + reweighting | SHIPPED | structural (SPD output; chi² uses Wilson-Hilferty approx vs scipy `chi2.isf`, see #1706) |
+//! | REQ-8 | MCD `raw_location_`/`raw_covariance_`/`dist_`/`correction_` attrs | NOT-STARTED | not exposed — blocker #1708 |
+//! | REQ-9 | EllipticEnvelope `offset_` empirical percentile | NOT-STARTED | theoretical chi² quantile vs sklearn `percentile(-dist_, 100·contamination)` — blocker #1708 |
+//! | REQ-10 | EllipticEnvelope predict/decision sign (±1) | SHIPPED | structural |
+//! | REQ-11 | contamination interval `(0, 0.5]` | SHIPPED | `fn fit` rejects `≤0` / `>0.5` (`_elliptic_envelope.py:147` closed-right, fixed #1704); `divergence_contamination_right_endpoint` |
+//! | REQ-12 | EllipticEnvelope exact inlier/outlier labels | NOT-STARTED | RNG carve-out via MCD, R-DEFER-3 — blocker #1706 |
+//! | REQ-13 | `mahalanobis` returns SQUARED distance | NOT-STARTED | returns sqrt; sklearn squared (`_empirical_covariance.py:340,353`); coupled to #1705 — blocker #1703 |
+//! | REQ-14 | `score`/log-likelihood method | NOT-STARTED | absent — blocker #1707 |
+//! | REQ-15 | `error_norm` method | NOT-STARTED | absent — blocker #1707 |
+//! | REQ-16 | `get_precision`/`store_precision` | NOT-STARTED | absent — blocker #1707 |
+//! | REQ-17 | clippy-clean (no `collapsible_if`) | SHIPPED | let-chains at the MCD `log_det`/`spd_inverse` sites; crate clippy `-D warnings` green |
+//! | REQ-18 | ferray substrate | NOT-STARTED | `ndarray` + faer/hand-rolled `spd_inverse`, not `ferray` — blocker #1709 |
+//! | REQ-19 | non-test production consumer | SHIPPED | re-exported `lib.rs`; `helpers.rs` + `graphical_lasso.rs` construct these types |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
