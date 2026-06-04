@@ -34,6 +34,38 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/nmf.md`. Tracking: #1608. Each REQ is BINARY — SHIPPED
+//! (impl + non-test consumer + tests + green verification) or NOT-STARTED (concrete
+//! open blocker). Non-test consumers: crate re-export (`lib.rs:97`), the PyO3
+//! `_RsNMF` binding (`ferrolearn-python/src/extras.rs:1116`, registered `lib.rs:75`),
+//! `PipelineTransformer`. Oracle = live sklearn 1.5.2 (`_nmf.py`, `class NMF`), run
+//! from `/tmp` (R-CHAR-3). ferrolearn defaults to MU + random init + pseudo-NNDSVD;
+//! exact component VALUES are a carve-out (sklearn default cd + nndsvda + numpy RNG;
+//! NMF identifiable only up to permutation/scaling).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: `components_` shape `(n_components,n_features)`, transform W shape, finite + decreasing `reconstruction_err_`, `n_iter_`, seed-determinism | SHIPPED (scoped) | `fit` (`nmf.rs:617`); green-guards + in-module tests. STRUCTURAL, NOT values (REQ-5) |
+//! | REQ-2 | Non-negativity of `components_` (H) + transform (W) | SHIPPED | MU multiplicative + CD clamp; `test_nmf_components_non_negative`/`_transform_non_negative` |
+//! | REQ-3 | Both solvers (MU/CD) × both inits (Random/pseudo-NNDSVD) run | SHIPPED | `fit` dispatch (`:657-670`); 4-combo tests |
+//! | REQ-4 | Reconstruction QUALITY (`‖X−WH‖` small/decreasing — "did NMF work") | SHIPPED | `reconstruction_error` (`:247`) monotone-decreasing + small residual; `test_nmf_*` |
+//! | REQ-5 | EXACT `components_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): random-init/MU-default/pseudo-NNDSVD/numpy-RNG vs sklearn cd+nndsvda; perm/scale identifiable — blocker #1609 |
+//! | REQ-6 | real `init="nndsvda"` default + SVD `nndsvd`/`nndsvdar`/`custom` | NOT-STARTED | sklearn `_nmf.py:225-374,:1000`; ferrolearn pseudo-NNDSVD (Jacobi of XᵀX), default Random — blocker #1610 |
+//! | REQ-7 | `solver="cd"` DEFAULT | NOT-STARTED | sklearn `_nmf.py:917`; ferrolearn defaults MU — blocker #1611 |
+//! | REQ-8 | `beta_loss` (kullback-leibler/itakura-saito) + `_gamma` | NOT-STARTED | sklearn `_nmf.py:89,:919`; ferrolearn Frobenius-only — blocker #1612 |
+//! | REQ-9 | `transform` NNLS-W VALUE | NOT-STARTED | CARVE-OUT, folds into REQ-5 (downstream of carved-out H, no injectable-H API) — blocker #1613 |
+//! | REQ-10 | `inverse_transform` = `W·H` | SHIPPED | `nmf.rs:229` (`= _nmf.py:1238`); exact algebra + col-mismatch `ShapeMismatch` |
+//! | REQ-11 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, doesn't pre-reject `>min(n,p)` |
+//! | REQ-12 | PyO3 `_RsNMF` binding (thin n_components ctor + fit + transform) | SHIPPED (scoped) | `extras.rs:1116`, registered `lib.rs:75`; NO params/getters/inverse_transform |
+//! | REQ-13 | `n_components=None` default | NOT-STARTED | sklearn `_nmf.py:914` → min(n,p); ferrolearn requires explicit usize — blocker #1614 |
+//! | REQ-14 | `alpha_W`/`alpha_H`/`l1_ratio` regularization | NOT-STARTED | sklearn `_nmf.py:921-923,:1275` — blocker #1615 |
+//! | REQ-15 | `shuffle` (CD) + fitted attrs `n_components_`/`n_features_in_` | NOT-STARTED | sklearn `_nmf.py:924` — blocker #1616 |
+//! | REQ-16 | ferray substrate | NOT-STARTED | `ndarray` + `rand` + hand-rolled Jacobi — blocker #1617 |
+//!
+//! Count: **7 SHIPPED (REQ-1,2,3,4,10,11,12) / 9 NOT-STARTED (REQ-5,6,7,8,9,13,14,15,16)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
