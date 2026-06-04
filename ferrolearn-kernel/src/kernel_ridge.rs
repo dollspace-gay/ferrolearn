@@ -36,6 +36,28 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 5);
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/kernel_ridge.py` (tag 1.5.2, `KernelRidge`).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | dual solve `(K + alpha·I) dual_coef = y` | SHIPPED | `fn fit` + `fn cholesky_solve`/`fn gaussian_solve` = sklearn `_solve_cholesky_kernel`; `fn predict` = `K · dual_coef` (`kernel_ridge.py:201-237`) |
+//! | REQ-2 | linear kernel value parity | SHIPPED | `parity_linear_dual_coef_and_predict` matches live sklearn `~1e-9` |
+//! | REQ-3 | rbf kernel value parity (`gamma=None`→`1/n_features` + explicit) | SHIPPED | `parity_rbf_default_and_explicit_gamma` `~1e-9` |
+//! | REQ-4 | poly/sigmoid kernel formula (explicit coef0) | SHIPPED | `fn compute_kernel_matrix` (`nystroem.rs`); `parity_poly_explicit_coef0` |
+//! | REQ-5 | `coef0` default = 1 | SHIPPED | `KernelRidge::new` sets `coef0 = F::one()` (sklearn `kernel_ridge.py:153`, fixed #1662); `divergence_poly_default_coef0` |
+//! | REQ-6 | multi-output y `(n_samples, n_targets)` | NOT-STARTED | `impl Fit<Array2<F>, Array1<F>>` single-output only (`kernel_ridge.py:183`,`:204-212`) — blocker #1665 |
+//! | REQ-7 | `sample_weight` | NOT-STARTED | `fn fit` has no sample_weight (`kernel_ridge.py:174`,`:198-199`) — blocker #1665 |
+//! | REQ-8 | array-valued `alpha` (per-target) | NOT-STARTED | `alpha: F` scalar (`kernel_ridge.py:202`) — blocker #1665 |
+//! | REQ-9 | kernel coverage (laplacian/chi2/additive_chi2/cosine/precomputed/callable/kernel_params) | NOT-STARTED | `KernelType` = Rbf/Polynomial/Linear/Sigmoid only — blocker #1666 |
+//! | REQ-10 | parameter validation (alpha≥0, gamma≥0 or None) | SHIPPED | `fn fit` rejects `alpha<0` + `gamma<0` (sklearn `_parameter_constraints` `:134-144`, fixed #1663); `divergence_negative_gamma_not_rejected` |
+//! | REQ-11 | sklearn fitted-attr names (`X_fit_`/`n_features_in_`) | NOT-STARTED | accessors are `dual_coef()`/`x_fit()`; no `n_features_in_` — blocker #1667 |
+//! | REQ-12 | ferray substrate | NOT-STARTED | `ndarray` + hand-rolled cholesky/gaussian, not `ferray-core`/`ferray::linalg` — blocker #1668 |
+//! | REQ-13 | non-test production consumer | SHIPPED | `RsKernelRidge` in `ferrolearn-python` (`extras.rs` + `_extras.py`); param-plumbing gap (only `alpha`) — blocker #1664 |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
