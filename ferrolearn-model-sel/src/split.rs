@@ -2,6 +2,28 @@
 //!
 //! This module provides [`train_test_split`], which shuffles and partitions
 //! a dataset into training and test subsets.
+//!
+//! Mirrors scikit-learn's `sklearn/model_selection/_split.py` `train_test_split`
+//! (`:2686`, tag 1.5.2). Sizes are deterministic; the shuffle is an RNG carve-out.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | `test_size` in (0,1) validation | SHIPPED | `fn train_test_split` rejects `<=0`/`>=1` (`_split.py:2357-2359`); `guard_test_size_validation_req1` |
+//! | REQ-2 | `n_test = ceil(test_size·n)` sizing | SHIPPED | `fn train_test_split` uses `.ceil()` (`_split.py:2390`, fixed #1724); `divergence_n_test_sizing_ceil_*` |
+//! | REQ-3 | exact split membership | NOT-STARTED | RNG carve-out (`SmallRng` vs numpy `RandomState.permutation`), R-DEFER-3 — blocker #1726 |
+//! | REQ-4 | structural partition (disjoint, exhaustive) | SHIPPED | `guard_structural_partition_req4` (train∪test = `0..n` once) |
+//! | REQ-5 | `test_size=None` default 0.25 | NOT-STARTED | `test_size: f64` required (`_split.py:2348-2349`) — blocker #1727 |
+//! | REQ-6 | `train_size` param | NOT-STARTED | absent (`_split.py:2394-2402`) — blocker #1727 |
+//! | REQ-7 | `shuffle=False` sequential split | NOT-STARTED | always shuffles (`_split.py:2789-2796`) — blocker #1727 |
+//! | REQ-8 | `stratify` (StratifiedShuffleSplit) | NOT-STARTED | absent (`_split.py:2799-2806`) — blocker #1727 |
+//! | REQ-9 | int `test_size` + variadic `*arrays` | NOT-STARTED | float + single `(x, y)` only — blocker #1727 |
+//! | REQ-10 | empty-split raises | SHIPPED | `fn train_test_split` errors when `n_train==0` (`_split.py:2414`, fixed #1725); `divergence_empty_train_set_raises_*` |
+//! | REQ-11 | ferray substrate | NOT-STARTED | `ndarray` + `SmallRng`, not `ferray` — blocker #1728 |
+//! | REQ-12 | non-test production consumer | SHIPPED | boundary re-export `lib.rs` (S5) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
