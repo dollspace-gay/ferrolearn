@@ -11,6 +11,28 @@
 //! directly or passed to [`SelectKBest`](crate::feature_selection::SelectKBest)
 //! / [`SelectPercentile`](crate::select_percentile::SelectPercentile) via the
 //! [`ScoreFunc`](crate::feature_selection::ScoreFunc) enum.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `f_classif`/`f_regression`/`chi2`
+//! (`sklearn/feature_selection/_univariate_selection.py`). Tracking: #1416.
+//! DETERMINISTIC numeric-parity unit — statistics + p-values verified against
+//! the live scipy/sklearn oracle. Each REQ is BINARY — SHIPPED (impl + non-test
+//! consumer + tests + green verification) or NOT-STARTED (open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | [`f_classif`] F-statistic value parity (one-way ANOVA) | SHIPPED | matches sklearn `f_oneway` `_univariate_selection.py:43-117`; oracle stat tests (tol 1e-9) in `tests/divergence_feature_scoring.rs`. Consumer: re-export `lib.rs:173` |
+//! | REQ-2 | [`f_regression`] F-statistic value parity (Pearson-F) | SHIPPED | `F=r²·(n-2)/(1-r²)` matches sklearn `:405+`; oracle stat tests (tol 1e-9) |
+//! | REQ-3 | [`chi2`] statistic value parity | SHIPPED | matches sklearn `_chisquare` `:176-192`; oracle stat tests (tol 1e-9) |
+//! | REQ-4 | p-values for all three (F-distribution + chi2 survival functions) | SHIPPED | `f_distribution_sf` (rewritten `regularized_incomplete_beta` + `betacf` Lentz CF, was DIV-1 #1417 fixed) matches scipy `fdtrc`; `chi2_distribution_sf` matches `chdtrc`; verified across small-p (1e-23 tail), large-p, moderate, varied df1∈{1,2,4}/df2∈{3..48} (29 oracle tests, ~13-15 sig figs) |
+//! | REQ-5 | Error/parameter contracts (empty, shape mismatch, <2 classes, <3 samples f_regression, negative chi2 features) | SHIPPED (scoped) | per-fn guards; divergence error tests |
+//! | REQ-6 | `f_regression` `center=False` + `force_finite` (nan/inf handling) | NOT-STARTED | sklearn `:300-449` — blocker #1418 |
+//! | REQ-7 | `r_regression` free function (signed Pearson correlation) | NOT-STARTED | sklearn `:300-393` — blocker #1419 |
+//! | REQ-8 | sparse `chi2` (CSR `observed = Y.T@X`) | NOT-STARTED | dense only; sklearn `:202-288` — blocker #1420 |
+//! | REQ-9 | `mutual_info_classif`/`mutual_info_regression` | NOT-STARTED | `sklearn/feature_selection/_mutual_info.py` — blocker #1421 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1422 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array1`/`Array2` + `num_traits::Float` only — blocker #1423 |
 
 use ferrolearn_core::error::FerroError;
 use ndarray::{Array1, Array2};
@@ -517,11 +539,16 @@ fn lower_regularized_gamma_series<F: Float>(a: F, x: F) -> F {
     }
 }
 
-/// Regularized incomplete beta function I_x(a, b) using a continued fraction
-/// (Lentz's method).
+/// Regularized incomplete beta function I_x(a, b).
+///
+/// Numerical Recipes (§6.4) algorithm: the `front` prefactor
+/// `x^a (1-x)^b / (a · B(a,b))` times the Lentz-method continued fraction
+/// [`betacf`], using the symmetry relation `I_x(a,b) = 1 - I_{1-x}(b,a)` so the
+/// continued fraction is only evaluated in its fast-converging regime
+/// `x < (a+1)/(a+b+2)`.
 fn regularized_incomplete_beta<F: Float>(x: F, a: F, b: F) -> F {
     let one = F::one();
-    let two = F::from(2.0).unwrap();
+    let two = F::from(2.0).unwrap_or_else(F::one);
 
     if x <= F::zero() {
         return F::zero();
@@ -530,73 +557,76 @@ fn regularized_incomplete_beta<F: Float>(x: F, a: F, b: F) -> F {
         return one;
     }
 
-    // Use the symmetry relation if x > (a+1)/(a+b+2) for better convergence
-    if x > (a + one) / (a + b + two) {
-        return one - regularized_incomplete_beta(one - x, b, a);
+    // front = x^a (1-x)^b / (a · B(a,b)), computed in log space for stability.
+    let ln_front = a * x.ln() + b * (one - x).ln() - ln_beta(a, b);
+    let front = ln_front.exp();
+
+    if x < (a + one) / (a + b + two) {
+        front * betacf(a, b, x) / a
+    } else {
+        one - front * betacf(b, a, one - x) / b
     }
+}
 
-    // Prefix: x^a * (1-x)^b / (a * Beta(a,b))
-    let log_prefix = a * x.ln() + b * (one - x).ln() - ln_beta(a, b) - a.ln();
-    let prefix = log_prefix.exp();
+/// Lentz-method continued fraction for the regularized incomplete beta
+/// function (Numerical Recipes §6.4 `betacf`). Converges rapidly only when
+/// `x < (a+1)/(a+b+2)`; callers use the symmetry relation otherwise.
+fn betacf<F: Float>(a: F, b: F, x: F) -> F {
+    let one = F::one();
+    let two = F::from(2.0).unwrap_or_else(F::one);
+    let tiny = F::from(1.0e-30).unwrap_or_else(F::min_positive_value);
+    let eps = F::from(1.0e-12).unwrap_or_else(F::epsilon);
+    const MAXIT: usize = 200;
 
-    // Continued fraction (Lentz's algorithm)
-    let eps = F::from(1.0e-12).unwrap();
-    let tiny = F::from(1.0e-30).unwrap();
+    let qab = a + b;
+    let qap = a + one;
+    let qam = a - one;
 
-    let mut f = tiny;
-    let mut c = tiny;
-    let mut d = one;
+    let mut c = one;
+    let mut d = one - qab * x / qap;
+    if d.abs() < tiny {
+        d = tiny;
+    }
+    d = one / d;
+    let mut h = d;
 
-    for m in 0..200 {
-        let m_f = F::from(m).unwrap();
-        let (a_m, b_m) = if m == 0 {
-            (one, one)
-        } else if m % 2 == 0 {
-            // Even: d_{2m} term
-            let k = m_f / two;
-            let num = k * (b - k) * x / ((a + two * k - one) * (a + two * k));
-            (num, one)
-        } else {
-            // Odd: d_{2m+1} term
-            let k = (m_f - one) / two;
-            let num = -((a + k) * (a + b + k) * x) / ((a + two * k) * (a + two * k + one));
-            (num, one)
-        };
+    for m in 1..=MAXIT {
+        let m_f = F::from(m).unwrap_or_else(F::one);
+        let m2 = two * m_f;
 
-        if m == 0 {
-            f = b_m;
-            c = b_m;
-            d = one / b_m;
-            continue;
-        }
-
-        d = b_m + a_m * d;
+        // Even step.
+        let aa = m_f * (b - m_f) * x / ((qam + m2) * (a + m2));
+        d = one + aa * d;
         if d.abs() < tiny {
             d = tiny;
         }
-        d = one / d;
-
-        c = b_m + a_m / c;
+        c = one + aa / c;
         if c.abs() < tiny {
             c = tiny;
         }
+        d = one / d;
+        h = h * d * c;
 
-        let delta = c * d;
-        f = f * delta;
+        // Odd step.
+        let aa = -(a + m_f) * (qab + m_f) * x / ((a + m2) * (qap + m2));
+        d = one + aa * d;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = one + aa / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = one / d;
+        let del = d * c;
+        h = h * del;
 
-        if (delta - one).abs() < eps {
+        if (del - one).abs() < eps {
             break;
         }
     }
 
-    let result = prefix * f;
-    if result < F::zero() {
-        F::zero()
-    } else if result > one {
-        one
-    } else {
-        result
-    }
+    h
 }
 
 /// Log of the beta function: ln(Beta(a, b)) = lnGamma(a) + lnGamma(b) - lnGamma(a+b).
