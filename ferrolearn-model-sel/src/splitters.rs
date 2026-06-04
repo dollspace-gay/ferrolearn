@@ -17,6 +17,35 @@
 //! [`cross_val_score`]: crate::cross_validation::cross_val_score
 //! [`cross_validate`]: crate::cross_validation::cross_validate
 //! [`cross_val_predict`]: crate::cross_validation::cross_val_predict
+//!
+//! Mirrors `sklearn/model_selection/_split.py` (tag 1.5.2): LeaveOneOut/LeavePOut/
+//! PredefinedSplit (deterministic index parity); ShuffleSplit/StratifiedShuffleSplit/
+//! RepeatedKFold/RepeatedStratifiedKFold (deterministic sizes; exact membership is
+//! an RNG carve-out).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-LOO-1 | LeaveOneOut split index parity | SHIPPED | n folds, fold i test=`{i}` (`_split.py:222-228`); `green_loo_index_parity_n5` |
+//! | REQ-LOO-2 | LeaveOneOut `get_n_splits == n` + validation | SHIPPED | `fn get_n_splits` |
+//! | REQ-LPO-1 | LeavePOut combination-order parity | SHIPPED | `C(n,p)` folds in `itertools.combinations` lex order (`_split.py:316-325`); `green_lpo_combination_order_n4_p2` |
+//! | REQ-LPO-2 | LeavePOut error semantics (`p>=n`) | SHIPPED | `fn split` validation |
+//! | REQ-PS-1 | PredefinedSplit index parity + `-1` exclusion | SHIPPED | sorted unique non-`-1` folds (`_split.py:2466-2470`); `green_predefined_split_index_parity` |
+//! | REQ-PS-2 | PredefinedSplit n_splits + length validation | SHIPPED | `fn fold_indices` (`test_fold.len()==n`) |
+//! | REQ-SS-1 | ShuffleSplit structural (count, partition, reproducible) | SHIPPED | `fn fold_indices` |
+//! | REQ-SS-2 | ShuffleSplit `n_test = ceil(test_size·n)` | SHIPPED | `.ceil()` (`_validate_shuffle_split` `:2390`, fixed #1745); `divergence_shuffle_split_size_round_vs_ceil_*` |
+//! | REQ-SSS-1 | StratifiedShuffleSplit structural (class proportions) | SHIPPED | `fn split` |
+//! | REQ-SSS-2 | StratifiedShuffleSplit global ceil + `_approximate_mode` sizing | SHIPPED | `fn approximate_mode` distributes `ceil(test_size·n)` across classes (`utils/extmath.py:1322`, fixed #1746); `divergence_stratified_shuffle_split_total_size` |
+//! | REQ-RKF-1 | Repeated(Stratified)KFold fold count + per-repeat partition | SHIPPED | `fn split` (`n_splits·n_repeats` folds) |
+//! | REQ-X-2 | non-test production consumer | SHIPPED | `impl CrossValidator`; consumed by `cross_val_score`/`cross_validate` |
+//! | REQ-SS-3 | ShuffleSplit exact membership + default `test_size=0.1` | NOT-STARTED | RNG carve-out (`SmallRng` vs numpy) — blocker #1747; default — blocker #1748 |
+//! | REQ-SSS-3 | StratifiedShuffleSplit default test_size + `CrossValidator` impl | NOT-STARTED | requires explicit `test_size` — blocker #1748 |
+//! | REQ-RKF-2 | RepeatedKFold defaults (`n_splits=5`, `n_repeats=10`) | NOT-STARTED | both required — blocker #1748 |
+//! | REQ-RKF-3 | Repeated/Shuffle exact split membership | NOT-STARTED | RNG carve-out, R-DEFER-3 — blocker #1747 |
+//! | REQ-X-1 | ferray substrate | NOT-STARTED | `ndarray` + `rand`, not `ferray` — blocker #1748 |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use std::collections::HashMap;
 
