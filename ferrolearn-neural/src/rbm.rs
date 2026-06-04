@@ -56,6 +56,15 @@ pub struct BernoulliRBM<F> {
     n_iter: usize,
     batch_size: usize,
     random_state: Option<u64>,
+    /// Persistent incremental state for [`partial_fit`](BernoulliRBM::partial_fit).
+    ///
+    /// `None` until the first `partial_fit` call; thereafter it carries the
+    /// accumulated `components_`/intercepts/`h_samples_` AND the live RNG across
+    /// calls, mirroring sklearn's `first_pass = not hasattr(self, "components_")`
+    /// (`_rbm.py:292`): only the first call initializes, every later call runs one
+    /// `_fit` step onto the EXISTING state (`_rbm.py:315`). `fit` does not touch
+    /// this field.
+    partial_state: Option<(FittedBernoulliRBM<F>, Xoshiro256PlusPlus)>,
 }
 
 impl<F: Float + Send + Sync + 'static> BernoulliRBM<F> {
@@ -76,6 +85,7 @@ impl<F: Float + Send + Sync + 'static> BernoulliRBM<F> {
             n_iter: 10,
             batch_size: 10,
             random_state: None,
+            partial_state: None,
         }
     }
 
@@ -143,17 +153,24 @@ impl<F: Float + Send + Sync + 'static> BernoulliRBM<F> {
         Ok(())
     }
 
-    /// Fit the model to a single segment of data `x`, mirroring sklearn's
-    /// `partial_fit` (`_rbm.py:276-315`): the model is (re)initialized
-    /// (`components_` from `N(0, 0.01)`, intercepts and the persistent particle
-    /// state `h_samples_` to zeros) and one inner SML step ([`_fit`]) is run
-    /// over the whole of `x` treated as one minibatch.
+    /// Fit the model to a single segment of data `x` INCREMENTALLY, mirroring
+    /// sklearn's `partial_fit` (`_rbm.py:276-315`).
     ///
-    /// Conforms to ferrolearn's immutable Fit -> Fitted world (cf.
-    /// `ferrolearn-decomp::IncrementalPCA::partial_fit`): it consumes `&mut
-    /// self` for API symmetry with sklearn's mutating `partial_fit` and returns
-    /// a freshly built [`FittedBernoulliRBM`]. The `y` argument is the unit
-    /// `()` placeholder (RBM is unsupervised).
+    /// On the FIRST call the persistent state is initialized exactly once
+    /// (`components_` from `N(0, 0.01)`, intercepts and the persistent particle
+    /// state `h_samples_` to zeros, plus the RNG), mirroring
+    /// `first_pass = not hasattr(self, "components_")` (`_rbm.py:292-313`). On
+    /// EVERY call (including the first) one inner SML step ([`_fit`],
+    /// `_rbm.py:315`) is run over the whole of `x` treated as one minibatch,
+    /// ACCUMULATING onto the existing state and advancing the SAME persistent
+    /// RNG. A subsequent `partial_fit` therefore continues from the prior call's
+    /// non-zero parameters/particles and yields a different `components_`.
+    ///
+    /// Conforms to ferrolearn's immutable Fit -> Fitted world: the accumulated
+    /// state lives in `self` (cf. the `Option`-threaded state of
+    /// `ferrolearn-decomp::IncrementalPCA::partial_fit`); each call returns a
+    /// clone of the current [`FittedBernoulliRBM`] snapshot. The `y` argument is
+    /// the unit `()` placeholder (RBM is unsupervised).
     ///
     /// [`_fit`]: BernoulliRBM
     pub fn partial_fit(
@@ -172,30 +189,43 @@ impl<F: Float + Send + Sync + 'static> BernoulliRBM<F> {
             });
         }
 
-        let mut rng = self.make_rng();
-        let mut components = init_components::<F>(self.n_components, n_features, &mut rng)?;
-        let mut intercept_hidden = Array1::<F>::zeros(self.n_components);
-        let mut intercept_visible = Array1::<F>::zeros(n_features);
-        // Persistent particles, zero-initialized (sklearn `_rbm.py:313`).
-        let mut h_samples = Array2::<F>::zeros((self.batch_size, self.n_components));
+        // First pass (`_rbm.py:292`): initialize state ONLY if absent. Later
+        // passes reuse the accumulated parameters, particles, and RNG.
+        if self.partial_state.is_none() {
+            let mut rng = self.make_rng();
+            let components = init_components::<F>(self.n_components, n_features, &mut rng)?;
+            let fitted = FittedBernoulliRBM {
+                components_: components,
+                intercept_hidden_: Array1::<F>::zeros(self.n_components),
+                intercept_visible_: Array1::<F>::zeros(n_features),
+                // Persistent particles, zero-initialized (sklearn `_rbm.py:313`).
+                h_samples_: Array2::<F>::zeros((self.batch_size, self.n_components)),
+                n_iter_: 0,
+            };
+            self.partial_state = Some((fitted, rng));
+        }
 
+        let (fitted, rng) =
+            self.partial_state
+                .as_mut()
+                .ok_or_else(|| FerroError::InvalidParameter {
+                    name: "partial_state".into(),
+                    reason: "partial_fit state was unexpectedly absent after init".into(),
+                })?;
+
+        // One inner SML step onto the EXISTING state (sklearn `_rbm.py:315`).
         sml_step(
             x,
             self.learning_rate,
-            &mut components,
-            &mut intercept_hidden,
-            &mut intercept_visible,
-            &mut h_samples,
-            &mut rng,
+            &mut fitted.components_,
+            &mut fitted.intercept_hidden_,
+            &mut fitted.intercept_visible_,
+            &mut fitted.h_samples_,
+            rng,
         )?;
+        fitted.n_iter_ += 1;
 
-        Ok(FittedBernoulliRBM {
-            components_: components,
-            intercept_hidden_: intercept_hidden,
-            intercept_visible_: intercept_visible,
-            h_samples_: h_samples,
-            n_iter_: 1,
-        })
+        Ok(fitted.clone())
     }
 
     /// Build the RNG, mapping `random_state = None` to the fixed seed

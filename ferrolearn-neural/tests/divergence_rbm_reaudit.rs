@@ -124,7 +124,6 @@ use ferrolearn_neural::rbm::BernoulliRBM;
 ///
 /// Tracking: #1639
 #[test]
-#[ignore = "divergence: partial_fit re-inits instead of accumulating; tracking #1639"]
 fn divergence_partial_fit_is_not_incremental() {
     let mut rbm = BernoulliRBM::<f64>::new(3)
         .batch_size(2)
