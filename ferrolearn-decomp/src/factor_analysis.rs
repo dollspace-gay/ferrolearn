@@ -40,14 +40,48 @@
 //! let scores = fitted.transform(&x).unwrap();
 //! assert_eq!(scores.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/factor_analysis.md`. Tracking: #1526. Each REQ is BINARY
+//! — SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumers: crate re-export (`lib.rs:86`), the
+//! PyO3 `_RsFactorAnalysis` binding (`ferrolearn-python/src/extras.rs:1137`,
+//! registered `lib.rs:78`), `PipelineTransformer`. Oracle = live sklearn 1.5.2
+//! (`_factor_analysis.py`, `svd_method='lapack'`), run from `/tmp` (R-CHAR-3).
+//! ferrolearn's `fit` now implements sklearn's deterministic SVD-based EM
+//! (`_factor_analysis.py:250-311`).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | FA VALUE parity vs `svd_method='lapack'`: rotation-invariant `noise_variance_`/implied-covariance `WWᵀ+diag(ψ)`/log-likelihood + `components_`/`transform` up to per-component sign | SHIPPED | `fit` = sklearn SVD-EM (`_factor_analysis.py:250-311`); matches sklearn `lapack` ~1e-13 on fresh 12×5 (noise 2.5e-14, cov 7.1e-15, ll 1.4e-14, n_iter 48==48, components after sign-align 4.8e-14). Was #1527, fixed. Tests `divergence_fa_rotation_invariant_covariance`/`_simple_data_loglike` |
+//! | REQ-2 | exact `components_` per-component SIGN parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): faer vs LAPACK SVD sign; sklearn FA applies no `svd_flip`, no canonical sign — blocker #1528 |
+//! | REQ-3 | SVD-EM algorithm = sklearn `lapack` (incl. one-sided convergence) | SHIPPED | `fit` mirrors `_factor_analysis.py:250-311`; faer thin SVD dispatched f64/f32 via `factor_analysis_svd` (TypeId, mirrors `pca.rs::eigen_dispatch`) |
+//! | REQ-4 | Structural: shapes, ψ>0, mean, n_iter≥1, finite ll, determinism | SHIPPED | in-module `test_fa_*` (17/17) + divergence green-guards; deterministic algorithm |
+//! | REQ-5 | `inverse_transform` structural round-trip | SHIPPED | `Z @ Wᵀ + mean` (transposed layout); col-mismatch `ShapeMismatch`; `green_inverse_transform_*` |
+//! | REQ-6 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch) | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, allows n_components 0/None, doesn't pre-reject n_samples<2 |
+//! | REQ-7 | `PipelineTransformer` integration | SHIPPED | `fit_pipeline`/`transform_pipeline`; `test_fa_pipeline_transformer` |
+//! | REQ-8 | PyO3 `_RsFactorAnalysis` binding (scoped: fit/transform, scores up to sign) | SHIPPED | `extras.rs:1137`, registered `lib.rs:78`; f64-only, NO noise_variance_/loglike_/score getters |
+//! | REQ-9 | `svd_method='randomized'` + `iterated_power` RNG path | NOT-STARTED | sklearn `_factor_analysis.py:266-276`; ferrolearn lapack-only — blocker #1529 |
+//! | REQ-10 | `rotation` varimax/quartimax | NOT-STARTED | sklearn `_factor_analysis.py:307-308,:428-460` — blocker #1530 |
+//! | REQ-11 | `noise_variance_init` | NOT-STARTED | sklearn `_factor_analysis.py:239-248`; ferrolearn psi hard-init ones — blocker #1531 |
+//! | REQ-12 | `loglike_` per-iteration LIST attr | NOT-STARTED | ferrolearn keeps only final scalar — blocker #1532 |
+//! | REQ-13 | `score`/`score_samples` Gaussian log-likelihood | NOT-STARTED | sklearn `_factor_analysis.py:388-426` — blocker #1533 |
+//! | REQ-14 | `get_covariance`/`get_precision` METHODS | NOT-STARTED | value matches via accessors but no method — blocker #1534 |
+//! | REQ-15 | `n_components=None` default + `copy` + `n_features_in_` | NOT-STARTED | sklearn `_factor_analysis.py:228-229` — blocker #1535 |
+//! | REQ-16 | `tol` DEFAULT 1e-3 vs sklearn 1e-2 (criterion now matches) | NOT-STARTED | blocker #1536 |
+//! | REQ-17 | `components_` ORIENTATION (ferro `(n_features,n_components)` = sklearn `components_.T`) | NOT-STARTED | blocker #1537 |
+//! | REQ-18 | production `assert_eq!` debug-assert in `transform` (R-CODE-2) | NOT-STARTED | blocker #1538 |
+//! | REQ-19 | ferray substrate | NOT-STARTED | `ndarray` + faer-direct + hand-rolled Cholesky — blocker #1539 |
+//!
+//! Count: **7 SHIPPED (REQ-1,3,4,5,6,7,8) / 12 NOT-STARTED (REQ-2,9..19)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
-use rand::SeedableRng;
-use rand_distr::{Distribution, StandardNormal};
+use std::any::TypeId;
 
 // ---------------------------------------------------------------------------
 // FactorAnalysis (unfitted)
@@ -264,127 +298,86 @@ fn cholesky_inv<F: Float>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
     Ok(inv)
 }
 
-/// Compute the log-likelihood under the factor analysis model.
+/// Compute the singular values and the top-`k` right singular vectors of an
+/// `(n × p)` matrix `y` via faer's SVD, mirroring sklearn's `my_svd` for the
+/// `svd_method='lapack'` branch (`_factor_analysis.py:258-264`).
 ///
-/// `log p(X) = -n/2 * [p*log(2π) + log|Σ| + tr(Σ⁻¹ S)]`
-/// where `Σ = W W^T + diag(ψ)` and `S = X_c^T X_c / n`.
-fn compute_log_likelihood<F: Float + Send + Sync + 'static>(
-    x_centered: &Array2<F>,
-    w: &Array2<F>,
-    psi: &Array1<F>,
-) -> F {
-    let (n, p) = x_centered.dim();
-    let k = w.ncols();
-    // Σ = W W^T + diag(ψ)
-    // We use the Woodbury identity for the log-det and trace.
-    // log|Σ| = log|I_k + W^T Ψ⁻¹ W| + Σ_j log ψ_j
-    let two_pi = F::from(2.0 * std::f64::consts::PI).unwrap();
-    let n_f = F::from(n).unwrap();
-    let p_f = F::from(p).unwrap();
+/// Returns `(s, vt_top)` where `s` is the full vector of singular values
+/// (sorted descending, length `min(n, p)`) and `vt_top` is the `(k × p)`
+/// matrix whose row `c` is the `c`-th right singular vector (`Vᵀ[0..k]`).
+fn factor_analysis_svd_f64(
+    y: &Array2<f64>,
+    k: usize,
+) -> Result<(Array1<f64>, Array2<f64>), FerroError> {
+    let (n, p) = y.dim();
+    let mat = faer::Mat::from_fn(n, p, |i, j| y[[i, j]]);
+    let svd = mat
+        .thin_svd()
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("FactorAnalysis: faer SVD failed: {e:?}"),
+        })?;
+    let size = n.min(p);
+    let s = Array1::from_shape_fn(size, |i| svd.S().column_vector()[i]);
+    // V is (p × size); right singular vector c is column c of V, so
+    // Vt_top[c, j] = V[j, c].
+    let v = svd.V();
+    let vt_top = Array2::from_shape_fn((k, p), |(c, j)| v[(j, c)]);
+    Ok((s, vt_top))
+}
 
-    // W^T Ψ⁻¹ W: k × k
-    let mut wtpsiw = Array2::<F>::zeros((k, k));
-    for i in 0..k {
-        for j in 0..k {
-            let mut s = F::zero();
-            for d in 0..p {
-                s = s + w[[d, i]] * w[[d, j]] / psi[d];
-            }
-            wtpsiw[[i, j]] = s;
-        }
-    }
-    // Add identity.
-    for i in 0..k {
-        wtpsiw[[i, i]] = wtpsiw[[i, i]] + F::one();
-    }
-    // log det of (I + W^T Ψ⁻¹ W) via Cholesky.
-    let mut log_det_inner = F::zero();
-    {
-        let mut l = Array2::<F>::zeros((k, k));
-        for i in 0..k {
-            for j in 0..=i {
-                let mut s = wtpsiw[[i, j]];
-                for kk in 0..j {
-                    s = s - l[[i, kk]] * l[[j, kk]];
-                }
-                if i == j {
-                    s = if s > F::zero() {
-                        s
-                    } else {
-                        F::from(1e-30).unwrap()
-                    };
-                    l[[i, j]] = s.sqrt();
-                    log_det_inner = log_det_inner + l[[i, j]].ln();
-                } else {
-                    l[[i, j]] = s / l[[j, j]];
-                }
-            }
-        }
-        log_det_inner = log_det_inner * F::from(2.0).unwrap();
-    }
-    let log_det_psi: F = psi
-        .iter()
-        .copied()
-        .map(|v| {
-            let v_clamped = if v > F::zero() {
-                v
-            } else {
-                F::from(1e-30).unwrap()
-            };
-            v_clamped.ln()
+/// f32 specialisation of [`factor_analysis_svd_f64`].
+fn factor_analysis_svd_f32(
+    y: &Array2<f32>,
+    k: usize,
+) -> Result<(Array1<f32>, Array2<f32>), FerroError> {
+    let (n, p) = y.dim();
+    let mat = faer::Mat::from_fn(n, p, |i, j| y[[i, j]]);
+    let svd = mat
+        .thin_svd()
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("FactorAnalysis: faer SVD failed: {e:?}"),
+        })?;
+    let size = n.min(p);
+    let s = Array1::from_shape_fn(size, |i| svd.S().column_vector()[i]);
+    let v = svd.V();
+    let vt_top = Array2::from_shape_fn((k, p), |(c, j)| v[(j, c)]);
+    Ok((s, vt_top))
+}
+
+/// Dispatch the SVD used by the LAPACK-style FA EM to faer for f64/f32.
+///
+/// Returns `(s, vt_top)` with `s` the full descending singular-value vector and
+/// `vt_top` the `(k × p)` top-`k` right singular vectors.
+fn factor_analysis_svd<F: Float + Send + Sync + 'static>(
+    y: &Array2<F>,
+    k: usize,
+) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    if TypeId::of::<F>() == TypeId::of::<f64>() {
+        // SAFETY: TypeId confirms F == f64, so reinterpreting the reference and
+        // transmuting the results between identical types is sound.
+        let y_f64: &Array2<f64> = unsafe { &*(std::ptr::from_ref(y).cast::<Array2<f64>>()) };
+        let (s, vt) = factor_analysis_svd_f64(y_f64, k)?;
+        // SAFETY: F == f64; transmute_copy reinterprets identical types.
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f64>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f64>, Array2<F>>(&vt) };
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Ok((s_f, vt_f))
+    } else if TypeId::of::<F>() == TypeId::of::<f32>() {
+        // SAFETY: TypeId confirms F == f32.
+        let y_f32: &Array2<f32> = unsafe { &*(std::ptr::from_ref(y).cast::<Array2<f32>>()) };
+        let (s, vt) = factor_analysis_svd_f32(y_f32, k)?;
+        // SAFETY: F == f32; transmute_copy reinterprets identical types.
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f32>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f32>, Array2<F>>(&vt) };
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Ok((s_f, vt_f))
+    } else {
+        Err(FerroError::NumericalInstability {
+            message: "FactorAnalysis: SVD only supported for f32/f64".into(),
         })
-        .fold(F::zero(), |a, b| a + b);
-    let log_det_sigma = log_det_inner + log_det_psi;
-
-    // Sample covariance S = X_c^T X_c / n.
-    // tr(Σ⁻¹ S) using Woodbury: Σ⁻¹ = Ψ⁻¹ - Ψ⁻¹ W M⁻¹ W^T Ψ⁻¹
-    // where M = I + W^T Ψ⁻¹ W.
-    // tr(Σ⁻¹ S) = (1/n) Σ_i x_i^T Σ⁻¹ x_i
-    // We compute it directly sample-by-sample for simplicity.
-    // For efficiency, we use the factored form:
-    // x^T Σ⁻¹ x = x^T Ψ⁻¹ x - (Ψ⁻¹ W m)^T M⁻¹ (W^T Ψ⁻¹ x)
-    // where m = W^T Ψ⁻¹ x.
-
-    // Invert M = I + W^T Ψ⁻¹ W.
-    let m_inv = match cholesky_inv(&wtpsiw) {
-        Ok(inv) => inv,
-        Err(_) => return F::neg_infinity(),
-    };
-
-    let mut trace_sum = F::zero();
-    for i in 0..n {
-        // Ψ⁻¹ x_i
-        let mut psi_inv_x = Array1::<F>::zeros(p);
-        let mut xpsiinvx = F::zero();
-        for d in 0..p {
-            psi_inv_x[d] = x_centered[[i, d]] / psi[d];
-            xpsiinvx = xpsiinvx + x_centered[[i, d]] * psi_inv_x[d];
-        }
-        // W^T Ψ⁻¹ x_i  (k-vector)
-        let mut wtpx = Array1::<F>::zeros(k);
-        for kk in 0..k {
-            let mut s = F::zero();
-            for d in 0..p {
-                s = s + w[[d, kk]] * psi_inv_x[d];
-            }
-            wtpx[kk] = s;
-        }
-        // (W^T Ψ⁻¹ x)^T M⁻¹ (W^T Ψ⁻¹ x)
-        let mut quad = F::zero();
-        for ii in 0..k {
-            let mut s = F::zero();
-            for jj in 0..k {
-                s = s + m_inv[[ii, jj]] * wtpx[jj];
-            }
-            quad = quad + wtpx[ii] * s;
-        }
-        trace_sum = trace_sum + xpsiinvx - quad;
     }
-    let trace_term = trace_sum / n_f;
-
-    // log p = -n/2 * [p*log(2π) + log|Σ| + tr(Σ⁻¹ S)]
-    let half = F::from(0.5).unwrap();
-    -n_f * half * (p_f * two_pi.ln() + log_det_sigma + trace_term)
 }
 
 // ---------------------------------------------------------------------------
@@ -445,130 +438,110 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FactorAnalysis<F> 
             }
         }
 
-        // Initialise W randomly, ψ = 1.
-        let seed = self.random_state.unwrap_or(42);
-        let mut rng = rand_xoshiro::Xoshiro256PlusPlus::seed_from_u64(seed);
-        let std_normal = StandardNormal;
-        let mut w = Array2::<F>::zeros((p, k));
-        let scale = F::from(0.01).unwrap();
-        for i in 0..p {
-            for j in 0..k {
-                let v: f64 = std_normal.sample(&mut rng);
-                w[[i, j]] = F::from(v).unwrap() * scale;
-            }
+        // Deterministic SVD-based EM, mirroring scikit-learn's
+        // `svd_method='lapack'` branch (`_factor_analysis.py:235-311`). The
+        // `random_state` field is retained for API stability but does not
+        // affect the result (LAPACK FA is deterministic).
+        //
+        // Convert an `f64` constant into `F`, propagating an error rather than
+        // panicking if the (in practice impossible) conversion fails.
+        let to_f = |v: f64| -> Result<F, FerroError> {
+            F::from(v).ok_or_else(|| FerroError::NumericalInstability {
+                message: "FactorAnalysis: failed to convert constant into target float type".into(),
+            })
+        };
+        let nsqrt = n_f.sqrt();
+        let two_pi = to_f(2.0 * std::f64::consts::PI)?;
+        // llconst = n_features * ln(2π) + n_components   (:236)
+        let llconst = to_f(p as f64)? * two_pi.ln() + to_f(k as f64)?;
+        // var[j] = (1/n) Σ_i Xc[i,j]²  (mean already removed)   (:237)
+        let mut var = Array1::<F>::zeros(p);
+        for j in 0..p {
+            let s = xc
+                .column(j)
+                .iter()
+                .copied()
+                .map(|v| v * v)
+                .fold(F::zero(), |a, b| a + b);
+            var[j] = s / n_f;
         }
-        let mut psi = Array1::<F>::from_elem(p, F::one());
 
-        let mut prev_ll = F::neg_infinity();
+        let small = to_f(1e-12)?; // SMALL (:252)
+        let two = to_f(2.0)?;
+        let mut psi = Array1::<F>::from_elem(p, F::one()); // (:239-240)
+        let mut w = Array2::<F>::zeros((p, k)); // stored as Wᵀ (p × k)
+        let mut old_ll = F::neg_infinity();
+        let mut last_ll = F::neg_infinity();
         let mut n_iter = 0usize;
-        let tol_f = F::from(self.tol).unwrap();
+        let tol_f = to_f(self.tol)?;
 
         for iter in 0..self.max_iter {
-            // --- E-step --------------------------------------------------------
-            // Σ_z = (I_k + W^T Ψ⁻¹ W)⁻¹   shape k × k
-            let mut wzw = Array2::<F>::zeros((k, k));
-            for i in 0..k {
-                for j in 0..k {
-                    let mut s = F::zero();
-                    for d in 0..p {
-                        s = s + w[[d, i]] * w[[d, j]] / psi[d];
-                    }
-                    wzw[[i, j]] = s;
-                }
-            }
-            for i in 0..k {
-                wzw[[i, i]] = wzw[[i, i]] + F::one();
-            }
-            let sigma_z = cholesky_inv(&wzw).map_err(|_| FerroError::NumericalInstability {
-                message: "FactorAnalysis: (I + W^T Ψ⁻¹ W) is singular".into(),
-            })?;
+            // sqrt_psi = sqrt(psi) + SMALL   (:280)
+            let sqrt_psi: Array1<F> = psi.mapv(|v| v.sqrt() + small);
 
-            // β = Σ_z W^T Ψ⁻¹   shape k × p
-            let mut beta = Array2::<F>::zeros((k, p));
-            for i in 0..k {
-                for d in 0..p {
-                    let mut s = F::zero();
-                    for j in 0..k {
-                        s = s + sigma_z[[i, j]] * w[[d, j]];
-                    }
-                    beta[[i, d]] = s / psi[d];
+            // Y[i,j] = Xc[i,j] / (sqrt_psi[j] * nsqrt)   (:281)
+            let mut y = Array2::<F>::zeros((n_samples, p));
+            for i in 0..n_samples {
+                for j in 0..p {
+                    y[[i, j]] = xc[[i, j]] / (sqrt_psi[j] * nsqrt);
                 }
             }
 
-            // E[Z | X] = β X_c^T   shape k × n
-            let ez = beta.dot(&xc.t()); // k × n
+            // my_svd: top-k singular values/vectors + unexplained variance.
+            let (s_all, vt_top) = factor_analysis_svd(&y, k)?;
+            // unexp_var = squared_norm(s[k..])   (:263)
+            let unexp_var = s_all
+                .iter()
+                .skip(k)
+                .copied()
+                .map(|v| v * v)
+                .fold(F::zero(), |a, b| a + b);
 
-            // E[Z Z^T | X] summed over samples = n * Σ_z + Σ_i e_i e_i^T
-            // We keep the average: E_zzt = Σ_z + (1/n) Σ_i e_i e_i^T
-            // shape k × k
-            let ezz_t_sum = sigma_z.mapv(|v| v * n_f) + ez.dot(&ez.t()); // k × k
-
-            // --- M-step --------------------------------------------------------
-            // W_new = (Σ_i x_i e_i^T) (Σ_i e_i e_i^T)⁻¹
-            //       = X_c^T E[Z|X]^T * (n Σ_z + E[Z|X] E[Z|X]^T)⁻¹
-
-            // X_c^T E[Z|X]^T: xc^T is p×n, ez^T is n×k → result is p×k
-            let xc_ez_t = xc.t().dot(&ez.t()); // p × k
-
-            // ezz_t_sum is k × k
-            let ezz_t_inv =
-                cholesky_inv(&ezz_t_sum).map_err(|_| FerroError::NumericalInstability {
-                    message: "FactorAnalysis: E[ZZ^T] is singular in M-step".into(),
-                })?;
-
-            let w_new = xc_ez_t.dot(&ezz_t_inv); // p × k
-
-            // ψ_new[d] = (1/n) Σ_i (x_id² - w_new[d,:] e_i x_id)
-            //          = (1/n) [Σ_i x_id² - w_new[d,:] Σ_i e_i x_id^T]
-            //          = S[d,d] - (w_new[d,:] @ (1/n) Σ_i e_i x_id^T)
-            // (1/n) Σ_i e_i x_id = (1/n) ez[:,i] * x_i[d] = (1/n) ez @ x_c[:,d]
-            // = (1/n) ez @ xc[:, d]
-
-            let mut psi_new = Array1::<F>::zeros(p);
-            for d in 0..p {
-                // Sample variance of feature d.
-                let var_d = xc
-                    .column(d)
-                    .iter()
-                    .copied()
-                    .map(|v| v * v)
-                    .fold(F::zero(), |a, b| a + b)
-                    / n_f;
-                // w_new[d,:] @ (1/n) ez @ xc[:,d]
-                // (1/n) ez @ xc[:,d] is (1/n) Σ_i ez[:,i] * xc[i,d] — k-vector
-                let mut ez_xd = Array1::<F>::zeros(k);
-                for kk in 0..k {
-                    let s = (0..n_samples)
-                        .map(|i| ez[[kk, i]] * xc[[i, d]])
-                        .fold(F::zero(), |a, b| a + b);
-                    ez_xd[kk] = s / n_f;
-                }
-                let wd = w_new.row(d);
-                let corr = wd
-                    .iter()
-                    .zip(ez_xd.iter())
-                    .map(|(&wi, &ei)| wi * ei)
-                    .fold(F::zero(), |a, b| a + b);
-                let psi_d = var_d - corr;
-                psi_new[d] = if psi_d > F::from(1e-6).unwrap() {
-                    psi_d
-                } else {
-                    F::from(1e-6).unwrap()
-                };
+            // s **= 2  (:282)  (only the top-k singular values are needed)
+            let mut s_sq = Array1::<F>::zeros(k);
+            for c in 0..k {
+                s_sq[c] = s_all[c] * s_all[c];
             }
+
+            // W = sqrt(max(s_sq - 1, 0))[:,None] * Vt_top; W *= sqrt_psi
+            // (:284, :286). Stored transposed: w[j,c] = W[c,j].
+            let mut w_new = Array2::<F>::zeros((p, k));
+            for c in 0..k {
+                let coef = (s_sq[c] - F::one()).max(F::zero()).sqrt();
+                for j in 0..p {
+                    w_new[[j, c]] = coef * vt_top[[c, j]] * sqrt_psi[j];
+                }
+            }
+
+            // ll = llconst + Σ_c ln(s_sq[c]) + unexp_var + Σ_j ln(psi[j])
+            // ll *= -n/2   (:289-291)
+            let mut ll = llconst + unexp_var;
+            for c in 0..k {
+                ll = ll + s_sq[c].ln();
+            }
+            for j in 0..p {
+                ll = ll + psi[j].ln();
+            }
+            ll = ll * (-n_f / two);
 
             w = w_new;
-            psi = psi_new;
-
-            // --- Convergence check ------------------------------------------
-            let ll = compute_log_likelihood(&xc, &w, &psi);
-            let ll_change = (ll - prev_ll).abs();
+            last_ll = ll;
             n_iter = iter + 1;
-            if ll_change < tol_f && iter > 0 {
-                prev_ll = ll;
+
+            // One-sided convergence: (ll - old_ll) < tol   (:293)
+            if ll - old_ll < tol_f {
                 break;
             }
-            prev_ll = ll;
+            old_ll = ll;
+
+            // psi[j] = max(var[j] - Σ_c W[c,j]², SMALL)   (:297)
+            for j in 0..p {
+                let mut sw = F::zero();
+                for c in 0..k {
+                    sw = sw + w[[j, c]] * w[[j, c]];
+                }
+                psi[j] = (var[j] - sw).max(small);
+            }
         }
 
         Ok(FittedFactorAnalysis {
@@ -576,7 +549,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FactorAnalysis<F> 
             noise_variance: psi,
             mean,
             n_iter,
-            log_likelihood: prev_ll,
+            log_likelihood: last_ll,
         })
     }
 }
