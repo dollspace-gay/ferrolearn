@@ -35,6 +35,30 @@
 //! assert_eq!(out.ncols(), 4);
 //! assert_eq!(out.nrows(), 3);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `ColumnTransformer` +
+//! `make_column_transformer` (`sklearn/compose/_column_transformer.py:59`).
+//! Tracking: #1434. Each REQ is BINARY — SHIPPED (impl + non-test consumer +
+//! tests + green verification) or NOT-STARTED (with a concrete open blocker).
+//! DETERMINISTIC composition meta-transformer: this unit owns the column
+//! routing / output ordering / remainder; sub-transformer VALUES come from
+//! their own routed units (StandardScaler, MinMaxScaler, …).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Column routing + output ORDERING (transformer outputs in registration/list order, remainder appended LAST in ascending column order) + `Drop`/`Passthrough` + OVERLAPPING columns + combined output VALUES (index selectors) | SHIPPED | [`ColumnTransformer`] `fit`/`transform` (hstack in list order + remainder `(0..n).filter(!covered)` ascending) matches sklearn `_hstack` `_column_transformer.py:976-1006,1091` + `_validate_remainder` `sorted(set(range)-cols)` `:546`; 8 oracle tests in `tests/divergence_column_transformer.rs`. Consumer: re-export `lib.rs:128` + `PipelineTransformer` |
+//! | REQ-2 | [`make_column_transformer`] builds a composing `ColumnTransformer` | SHIPPED (scoped) | auto-names `transformer-N` (sklearn uses lowercased class names — naming gap folded into REQ-7); oracle value test |
+//! | REQ-3 | Error/parameter contracts (out-of-range column index, transform ncols mismatch) | SHIPPED (scoped) | [`ColumnTransformer::fit`]/[`FittedColumnTransformer`] `transform`; divergence error tests |
+//! | REQ-4 | Non-index `ColumnSelector`s (str/slice/bool-mask/callable) + `make_column_selector` | NOT-STARTED | `Indices` only; sklearn `_column_transformer.py:1468` — blocker #1435 |
+//! | REQ-5 | `remainder` as an estimator + `'drop'`/`'passthrough'` as a STEP transformer | NOT-STARTED | sklearn `_column_transformer.py:277-281,460-462` — blocker #1436 |
+//! | REQ-6 | `sparse_threshold` + sparse output + `transformer_weights` + `n_jobs`/`verbose` | NOT-STARTED | dense only; sklearn `_column_transformer.py:282,998,1091-1200` — blocker #1437 |
+//! | REQ-7 | `get_feature_names_out` + `verbose_feature_names_out` (`name__feature`) + class-name auto-naming | NOT-STARTED | sklearn `_column_transformer.py:599,662,1456-1465` — blocker #1438 |
+//! | REQ-8 | `named_transformers_`/`transformers_`/`n_features_in_`/`feature_names_in_` fitted-attr surface | NOT-STARTED | sklearn `_column_transformer.py:574-582,694-726` — blocker #1439 |
+//! | REQ-9 | Generic `F` (currently `f64`-only) | NOT-STARTED | R-DEV-3 — blocker #1440 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1441 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2<f64>` only — blocker #1442 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
