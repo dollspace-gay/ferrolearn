@@ -7,6 +7,28 @@
 //! - [`DummyClassifier`] supports the strategies most_frequent, prior,
 //!   stratified, uniform, and constant.
 //! - [`DummyRegressor`] supports mean, median, quantile, and constant.
+//!
+//! Mirrors scikit-learn's `sklearn/dummy.py` `DummyClassifier` (`:35`) and
+//! `DummyRegressor` (`:465`, tag 1.5.2). Deterministic strategies have full
+//! value parity; `stratified`/`uniform` are RNG carve-outs.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | classifier `most_frequent`/`prior`/`constant` predict | SHIPPED | `impl Predict for FittedDummyClassifier` + `fn most_frequent` (first-max tie-break = sklearn `np.argmax(class_prior_)`, `dummy.py:311`); oracle green guards |
+//! | REQ-2 | `predict_proba`/`predict_log_proba` | NOT-STARTED | absent on `FittedDummyClassifier` (the only Prior-vs-MostFrequent behavioral difference) — blocker #1691 |
+//! | REQ-3 | `stratified`/`uniform` exact parity | NOT-STARTED | RNG carve-out (`SmallRng` vs numpy `RandomState`), R-DEFER-3 — blocker #1695 |
+//! | REQ-4 | constant ∉ classes rejected | SHIPPED | `fn fit` returns `Err`; sklearn raises `ValueError` (behavior parity, R-DEV-2 family; variant-name note #1692) |
+//! | REQ-5 | classifier attributes (`classes_`/`n_classes_`) | SHIPPED | `impl HasClasses` + `fn most_frequent` |
+//! | REQ-6 | regressor `mean`/`median`/`quantile`/`constant` value parity | SHIPPED | `fn fit` + `fn quantile_value` (numpy `method='linear'` + even-n median); oracle `~1e-12` (mean/median/quantile q=.25/.9, even+odd n) |
+//! | REQ-7 | quantile range validation (`q ∈ [0,1]`) | SHIPPED | `fn quantile_value` rejects out-of-range |
+//! | REQ-8 | `sample_weight` (weighted mean/percentile) | NOT-STARTED | neither `fit` accepts sample_weight (`dummy.py`) — blocker #1693 |
+//! | REQ-9 | multi-output 2D y | NOT-STARTED | `Fit<.., Array1<..>>` single-output only (`MultiOutputMixin`) — blocker #1694 |
+//! | REQ-10 | ferray substrate | NOT-STARTED | on `ndarray` + `rand::SmallRng`, not `ferray-core`/`ferray::random` — blocker #1696 |
+//! | REQ-11 | non-test production consumer | SHIPPED | boundary estimator re-export `lib.rs:82` (S5) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use std::collections::HashMap;
 
