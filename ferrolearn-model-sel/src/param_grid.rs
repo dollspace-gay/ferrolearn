@@ -84,7 +84,7 @@ macro_rules! param_grid {
     // compute the Cartesian product.
     ( $( $key:expr => [ $( $val:expr ),* $(,)? ] ),* $(,)? ) => {{
         // Build a Vec of (name, Vec<ParamValue>) entries.
-        let axes: Vec<(String, Vec<$crate::ParamValue>)> = vec![
+        let mut axes: Vec<(String, Vec<$crate::ParamValue>)> = vec![
             $(
                 (
                     $key.to_string(),
@@ -92,6 +92,11 @@ macro_rules! param_grid {
                 )
             ),*
         ];
+
+        // Sort axes by key name to match scikit-learn's `sorted(p.items())`
+        // (sklearn/model_selection/_search.py:157) before the Cartesian
+        // product, so the enumeration order matches `ParameterGrid`.
+        axes.sort_by(|a, b| a.0.cmp(&b.0));
 
         // Compute Cartesian product iteratively.
         let mut result: Vec<$crate::ParamSet> = vec![$crate::ParamSet::new()];
