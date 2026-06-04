@@ -8,19 +8,98 @@
 //!
 //! # Smoothing
 //!
-//! The encoded value for category `c` is:
+//! The encoded value for category `c` is (matching scikit-learn
+//! `_target_encoder_fast.pyx:60-75` — the accumulator is seeded with
+//! `smooth * global_mean` then the category's targets are added, divided by
+//! `smooth + count(c)`):
 //!
 //! ```text
-//! encoded(c) = (count(c) * mean_c + smooth * global_mean) / (count(c) + smooth)
+//! encoded(c) = (smooth * global_mean + sum_of_targets(c)) / (smooth + count(c))
 //! ```
 //!
 //! where `smooth` controls the degree of regularisation.
+//!
+//! Translation target: scikit-learn 1.5.2 `class TargetEncoder`
+//! (`sklearn/preprocessing/_target_encoder.py`). Design:
+//! `.design/preprocess/target_encoder.md`. Tracking: #1260.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 manual-`smooth` m-estimate value match (f64, bit-exact) | SHIPPED | `TargetEncoder::fit` / `transform`; sklearn `_target_encoder_fast.pyx:60-75`, `_target_encoder.py:289`,`:383` (#1261 pairwise sum, #1262 formula) |
+//! | REQ-2 unseen category → `target_mean_` (global mean) | SHIPPED | `transform` `unwrap_or(global_mean)`; sklearn `_target_encoder.py:324-345` |
+//! | REQ-3 InsufficientSamples / ShapeMismatch / InvalidParameter errors | SHIPPED | `fit` / `transform` guards; sklearn `_target_encoder.py:189` |
+//! | REQ-4 `smooth="auto"` empirical-Bayes default | NOT-STARTED (#1264) | sklearn `_target_encoder.py:85-89`,`:189` |
+//! | REQ-5 cross-fitting `fit_transform` (KFold/StratifiedKFold) | NOT-STARTED (#1265) | sklearn `_target_encoder.py:232`,`:254-303` |
+//! | REQ-6 `target_type` binary/multiclass | NOT-STARTED (#1266) | sklearn `_target_encoder.py:269-273`,`:376-379` |
+//! | REQ-7 `categories` param + `categories_`/`target_type_`/`classes_` | NOT-STARTED (#1267) | sklearn `_target_encoder.py:197`,`:358-381` |
+//! | REQ-8 `cv`/`shuffle`/`random_state` params | NOT-STARTED (#1268) | sklearn `_target_encoder.py:200-209` |
+//! | REQ-9 string/object categories | NOT-STARTED (#1269) | usize-only, R-DEV-3 |
+//! | REQ-10 `get_feature_names_out`/`n_features_in_` | NOT-STARTED (#1270) | sklearn `OneToOneFeatureMixin` |
+//! | REQ-11 PyO3 binding | NOT-STARTED (#1271) | `ferrolearn-python/src/` (absent) |
+//! | REQ-12 ferray substrate | NOT-STARTED (#1272) | R-SUBSTRATE |
+//! | REQ-13 f32 accumulates in lower precision than sklearn's f64 | NOT-STARTED (#1263) | sklearn `_target_encoder_fast.pyx:42,44,68` (always f64); f64 path CLEAN |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::collections::HashMap;
+
+/// Sum a slice reproducing NumPy's pairwise summation (the algorithm behind
+/// `np.add.reduce` / `np.mean`), so a ferrolearn mean bit-matches sklearn's
+/// `np.mean` on ill-conditioned mixed-magnitude inputs.
+///
+/// sklearn sets `target_mean_ = np.mean(y, axis=0)`
+/// (`sklearn/preprocessing/_target_encoder.py:383`), and `np.mean` reduces via
+/// NumPy pairwise summation, which rounds differently from a naive left-fold on
+/// targets that mix magnitudes.
+///
+/// Mirrors NumPy `pairwise_sum` (numpy/_core/src/umath/loops_utils.h.src):
+/// - `n < 8`        : straight sequential sum seeded from the first element.
+/// - `8 <= n <= 128`: 8 partial accumulators, unrolled by 8, combined as
+///   `((r0+r1)+(r2+r3)) + ((r4+r5)+(r6+r7))`, then the tail.
+/// - `n > 128`      : split at `n2 = (n/2)` rounded DOWN to a multiple of 8, recurse.
+fn pairwise_sum<F: Float>(data: &[F]) -> F {
+    let n = data.len();
+    if n == 0 {
+        return F::zero();
+    }
+    if n < 8 {
+        // Seed from the first element, then fold the rest left-to-right (numpy).
+        data[1..].iter().fold(data[0], |a, &v| a + v)
+    } else if n <= 128 {
+        let mut r0 = data[0];
+        let mut r1 = data[1];
+        let mut r2 = data[2];
+        let mut r3 = data[3];
+        let mut r4 = data[4];
+        let mut r5 = data[5];
+        let mut r6 = data[6];
+        let mut r7 = data[7];
+        let bound = n - (n % 8);
+        let mut i = 8;
+        while i < bound {
+            r0 = r0 + data[i];
+            r1 = r1 + data[i + 1];
+            r2 = r2 + data[i + 2];
+            r3 = r3 + data[i + 3];
+            r4 = r4 + data[i + 4];
+            r5 = r5 + data[i + 5];
+            r6 = r6 + data[i + 6];
+            r7 = r7 + data[i + 7];
+            i += 8;
+        }
+        let res = ((r0 + r1) + (r2 + r3)) + ((r4 + r5) + (r6 + r7));
+        // Add the remainder (indices `bound..n`) left-to-right (numpy tail).
+        data[bound..].iter().fold(res, |a, &v| a + v)
+    } else {
+        let mut n2 = n / 2;
+        n2 -= n2 % 8;
+        pairwise_sum(&data[..n2]) + pairwise_sum(&data[n2..])
+    }
+}
 
 // ---------------------------------------------------------------------------
 // TargetEncoder (unfitted)
@@ -145,28 +224,42 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<usize>, Array1<F>> for TargetE
         }
 
         let n_features = x.ncols();
-        let global_mean = y.iter().copied().fold(F::zero(), |a, v| a + v)
-            / F::from(n_samples).unwrap_or_else(F::one);
+        // sklearn: target_mean_ = np.mean(y, axis=0) (_target_encoder.py:383),
+        // which reduces via NumPy pairwise summation. Reproduce it bit-for-bit so
+        // the mean matches on mixed-magnitude targets.
+        let global_mean = if let Some(slice) = y.as_slice() {
+            pairwise_sum(slice)
+        } else {
+            let v: Vec<F> = y.iter().copied().collect();
+            pairwise_sum(&v)
+        } / F::from(n_samples).unwrap_or_else(F::one);
 
         let mut category_maps = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
-            // Collect (sum, count) per category
+            // Collect (sum, count) per category. Match sklearn's
+            // `_target_encoder_fast.pyx:60-75` bit-for-bit: seed each category's
+            // accumulator with `smooth * y_mean` FIRST (`:60` `sums[cat]=smooth_sum`),
+            // then add each target sequentially in row order (`:68` `sums[cat]+=y[i]`).
+            // So the accumulated F is `smooth*y_mean + y[0] + y[1] + ...`.
             let mut cat_stats: HashMap<usize, (F, usize)> = HashMap::new();
             for i in 0..n_samples {
                 let cat = x[[i, j]];
-                let entry = cat_stats.entry(cat).or_insert_with(|| (F::zero(), 0));
+                let entry = cat_stats
+                    .entry(cat)
+                    .or_insert_with(|| (self.smooth * global_mean, 0usize));
                 entry.0 = entry.0 + y[i];
                 entry.1 += 1;
             }
 
-            // Compute smoothed mean per category
+            // Per category: `encoding = sums[cat] / counts[cat]`
+            // (`_target_encoder_fast.pyx:75`), where `counts[cat] = smooth + count`
+            // (count seeded from `smooth` at `:61`) and `sums[cat]` already includes
+            // the `smooth*y_mean` seed. i.e. `(smooth*y_mean + Σyᵢ) / (smooth + count)`.
             let mut cat_map: HashMap<usize, F> = HashMap::new();
             for (&cat, &(sum, count)) in &cat_stats {
                 let count_f = F::from(count).unwrap_or_else(F::one);
-                let cat_mean = sum / count_f;
-                let encoded =
-                    (count_f * cat_mean + self.smooth * global_mean) / (count_f + self.smooth);
+                let encoded = sum / (self.smooth + count_f);
                 cat_map.insert(cat, encoded);
             }
 
