@@ -12,6 +12,30 @@
 //!
 //! All three take a pre-computed vector of p-values (one per feature) at fit
 //! time, allowing integration with any upstream scoring function.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `SelectFpr`/`SelectFdr`/`SelectFwe`
+//! (`sklearn/feature_selection/_univariate_selection.py:801,881,972`). Tracking:
+//! #1396. (The route's `parity_ops` lists the score functions
+//! `f_classif`/`f_regression`/`chi2` — those are translated in the sibling
+//! `feature_scoring.rs`; this unit owns the FPR/FDR/FWE selectors.) Each REQ is
+//! BINARY — SHIPPED (impl + non-test consumer + tests + green verification) or
+//! NOT-STARTED (with a concrete open blocker). HONEST scope: ferrolearn takes a
+//! static p-value vector; sklearn's `_BaseFilter` wraps a `score_func` and
+//! computes `pvalues_` internally — that wrapping is NOT-STARTED.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | SelectFpr mask `p < alpha` (given static p-values) | SHIPPED | [`SelectFpr`] `fit` matches sklearn `_get_support_mask` `_univariate_selection.py:878` (strict `<`); oracle tests in `tests/divergence_stat_selectors.rs`. Consumer: re-export `lib.rs:181` |
+//! | REQ-2 | SelectFdr Benjamini-Hochberg mask (ties + non-monotone gap + none/all) | SHIPPED | [`SelectFdr`] `fit` (highest-qualifying-rank + `ranked[..=k]`) ≡ sklearn `pvalues_ <= sv[sv<=alpha/n·arange].max()` (`:959-969`); oracle tests (tie `[0.01,0.025,0.025,0.9]` → `[0,1,2]`, gap `[0.001,0.04,0.045,0.011]` → all) |
+//! | REQ-3 | SelectFwe mask `p < alpha/n` (given static p-values) | SHIPPED | [`SelectFwe`] `fit` matches sklearn `_get_support_mask` `:1044` (Bonferroni, strict `<`); oracle tests |
+//! | REQ-4 | Error/parameter contracts (empty p-values, `alpha ∈ [0,1]` closed-both, transform ncols) | SHIPPED | `validate_inputs` accepts `alpha=0` (matches sklearn `_parameter_constraints` `Interval(Real,0,1,closed="both")` `:868`, fixed #1397, see Changed); divergence error tests |
+//! | REQ-5 | `score_func` wrapping (f_classif/f_regression/chi2 → `scores_`/`pvalues_` at `fit(X,y)`) | NOT-STARTED | takes p-values directly; sklearn `_BaseFilter` `:526,569-570` — blocker #1398 |
+//! | REQ-6 | `_BaseFilter`/`SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | NOT-STARTED | sklearn `_univariate_selection.py:526` — blocker #1399 |
+//! | REQ-7 | Computed `scores_`/`pvalues_` fitted attrs + `n_features_in_`/`feature_names_in_` | NOT-STARTED | sklearn `:569-570` — blocker #1400 |
+//! | REQ-8 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1401 |
+//! | REQ-9 | ferray substrate | NOT-STARTED | dense `Array1`/`Array2` + `num_traits::Float` only — blocker #1402 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -46,10 +70,10 @@ fn validate_inputs(n_features: usize, alpha: f64) -> Result<(), FerroError> {
             reason: "p-value vector must not be empty".into(),
         });
     }
-    if alpha <= 0.0 || alpha > 1.0 {
+    if !(0.0..=1.0).contains(&alpha) {
         return Err(FerroError::InvalidParameter {
             name: "alpha".into(),
-            reason: format!("alpha must be in (0, 1], got {alpha}"),
+            reason: format!("alpha must be in [0, 1], got {alpha}"),
         });
     }
     Ok(())
@@ -517,12 +541,30 @@ mod tests {
 
     #[test]
     fn test_fpr_invalid_alpha() {
-        let sel = SelectFpr::<f64>::new(0.0);
+        // sklearn `_parameter_constraints` alpha: Interval(Real, 0, 1,
+        // closed="both") (_univariate_selection.py:868) -> only alpha < 0 or
+        // alpha > 1 are rejected; alpha == 0 is VALID.
         let p = array![0.01];
-        assert!(sel.fit(&p, &()).is_err());
+
+        let neg = SelectFpr::<f64>::new(-0.1);
+        assert!(neg.fit(&p, &()).is_err());
 
         let sel2 = SelectFpr::<f64>::new(1.5);
         assert!(sel2.fit(&p, &()).is_err());
+    }
+
+    #[test]
+    fn test_fpr_alpha_zero_valid() {
+        // alpha == 0 is the lower endpoint of sklearn's closed="both" interval
+        // (_univariate_selection.py:868): fit succeeds and the FPR mask
+        // `pvalues_ < 0` selects nothing for positive p-values.
+        let sel = SelectFpr::<f64>::new(0.0);
+        let p = array![0.01, 0.5, 0.03];
+        let fitted = sel.fit(&p, &());
+        assert!(fitted.is_ok(), "alpha=0 is valid (closed=both)");
+        if let Ok(f) = fitted {
+            assert_eq!(f.n_features_selected(), 0);
+        }
     }
 
     #[test]
@@ -608,9 +650,28 @@ mod tests {
 
     #[test]
     fn test_fdr_invalid_alpha() {
-        let sel = SelectFdr::<f64>::new(0.0);
+        // sklearn closed="both" (_univariate_selection.py:952): alpha == 0 is
+        // VALID; only out-of-range values (< 0 or > 1) are rejected.
         let p = array![0.01];
-        assert!(sel.fit(&p, &()).is_err());
+
+        let neg = SelectFdr::<f64>::new(-0.1);
+        assert!(neg.fit(&p, &()).is_err());
+
+        let big = SelectFdr::<f64>::new(1.5);
+        assert!(big.fit(&p, &()).is_err());
+    }
+
+    #[test]
+    fn test_fdr_alpha_zero_valid() {
+        // alpha == 0 lower endpoint (_univariate_selection.py:952): BH
+        // threshold is all-zero, so no positive p-value qualifies -> empty.
+        let sel = SelectFdr::<f64>::new(0.0);
+        let p = array![0.01, 0.5, 0.03];
+        let fitted = sel.fit(&p, &());
+        assert!(fitted.is_ok(), "alpha=0 is valid (closed=both)");
+        if let Ok(f) = fitted {
+            assert_eq!(f.n_features_selected(), 0);
+        }
     }
 
     #[test]
@@ -679,9 +740,28 @@ mod tests {
 
     #[test]
     fn test_fwe_invalid_alpha() {
-        let sel = SelectFwe::<f64>::new(0.0);
+        // sklearn closed="both" (_univariate_selection.py:1034): alpha == 0 is
+        // VALID; only out-of-range values (< 0 or > 1) are rejected.
         let p = array![0.01];
-        assert!(sel.fit(&p, &()).is_err());
+
+        let neg = SelectFwe::<f64>::new(-0.1);
+        assert!(neg.fit(&p, &()).is_err());
+
+        let big = SelectFwe::<f64>::new(1.5);
+        assert!(big.fit(&p, &()).is_err());
+    }
+
+    #[test]
+    fn test_fwe_alpha_zero_valid() {
+        // alpha == 0 lower endpoint (_univariate_selection.py:1034): the
+        // Bonferroni mask `pvalues_ < 0/n` selects nothing for positive p.
+        let sel = SelectFwe::<f64>::new(0.0);
+        let p = array![0.01, 0.5, 0.03];
+        let fitted = sel.fit(&p, &());
+        assert!(fitted.is_ok(), "alpha=0 is valid (closed=both)");
+        if let Ok(f) = fitted {
+            assert_eq!(f.n_features_selected(), 0);
+        }
     }
 
     #[test]
