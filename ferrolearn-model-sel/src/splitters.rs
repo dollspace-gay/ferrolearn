@@ -176,7 +176,7 @@ impl CrossValidator for ShuffleSplit {
                 context: "ShuffleSplit".into(),
             });
         }
-        let n_test = ((n_samples as f64) * self.test_size).round().max(1.0) as usize;
+        let n_test = ((n_samples as f64) * self.test_size).ceil().max(1.0) as usize;
         let n_test = n_test.min(n_samples - 1);
         let mut folds = Vec::with_capacity(self.n_splits);
         for split in 0..self.n_splits {

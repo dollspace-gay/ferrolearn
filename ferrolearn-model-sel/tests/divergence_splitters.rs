@@ -123,7 +123,6 @@ fn green_predefined_split_index_parity() {
 ///   .split(np.arange(7))` test fold size == 3.
 /// The MEMBERSHIP is an RNG carve-out; the SIZE is deterministic and pinned here.
 #[test]
-#[ignore = "divergence: ShuffleSplit n_test uses round() not ceil(); tracking #1744"]
 fn divergence_shuffle_split_size_round_vs_ceil_n7() {
     const SKLEARN_TEST_SIZE: usize = 3; // live ShuffleSplit(test_size=0.3).split(np.arange(7))
     let folds = ShuffleSplit::new(1, 0.3)
@@ -148,7 +147,6 @@ fn divergence_shuffle_split_size_round_vs_ceil_n7() {
 /// Live oracle `ShuffleSplit(n_splits=1, test_size=0.33, random_state=0)
 ///   .split(np.arange(10))` test fold size == 4.
 #[test]
-#[ignore = "divergence: ShuffleSplit n_test uses round() not ceil(); tracking #1744"]
 fn divergence_shuffle_split_size_round_vs_ceil_n10() {
     const SKLEARN_TEST_SIZE: usize = 4; // live ShuffleSplit(test_size=0.33).split(np.arange(10))
     let folds = ShuffleSplit::new(1, 0.33)
