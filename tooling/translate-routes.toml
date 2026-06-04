@@ -978,3 +978,9 @@ crate_pattern = "ferrolearn-model-sel/src/feature_union.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/pipeline.py"]
 design = ".design/model-sel/feature_union.md"
 parity_ops = ["FeatureUnion"]
+
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/transformed_target.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/compose/_target.py"]
+design = ".design/model-sel/transformed_target.md"
+parity_ops = ["TransformedTargetRegressor"]
