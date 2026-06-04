@@ -30,6 +30,23 @@
 //! fixed seed `0xC0FFEE` (deterministic-by-default), a documented divergence
 //! from sklearn's non-deterministic `None`.
 //!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | Constructor defaults + parameter validation | SHIPPED | `fn validate_params` rejects `n_components < 1` / `learning_rate <= 0` / `batch_size < 1` (sklearn `_parameter_constraints`, `_rbm.py:134-141`); tests in `tests/divergence_rbm_validation.rs` |
+//! | REQ-2 | `transform` / `_mean_hiddens` value parity | SHIPPED | `fn transform in FittedBernoulliRBM`; matches live sklearn to `<1e-12` (`tests/divergence_rbm.rs`, `_rbm.py:180-195`) |
+//! | REQ-3 | SML/PCD persistent `h_samples_` particles | SHIPPED | `fn fit` + `fn sml_step`; particles carried across batches and epochs (`_rbm.py:317-345`, `:417`) |
+//! | REQ-4 | Fixed `gen_even_slices` batching (no per-epoch shuffle) | SHIPPED | `fn gen_even_slices` matches sklearn `_chunking.py:124-135` exactly on all tested shapes |
+//! | REQ-5 | Binary Bernoulli sampling of visibles/hiddens | SHIPPED | `fn sample_visibles` + `fn gibbs` use `uniform < p` (`_rbm.py:216-235`, `:254-273`) |
+//! | REQ-6 | SML update + `lr / batch_rows` scaling | SHIPPED | `fn sml_step`: `(v_pos.T @ h_pos).T - h_neg.T @ v_neg`, intercepts per `_rbm.py:335-342` |
+//! | REQ-7 | `free_energy` / `score_samples` / incremental `partial_fit` / `h_samples_` | SHIPPED | oracle parity `<1e-10` (`tests/divergence_rbm_missing_api.rs`); incremental `partial_fit` accumulates (`tests/divergence_rbm_reaudit.rs`, `_rbm.py:237-386`) |
+//! | REQ-8 | ferray substrate (R-SUBSTRATE) | NOT-STARTED | built on `ndarray` + `rand_distr` + `rand_xoshiro`, not `ferray` — blocker #1636 |
+//! | REQ-9 | non-test production consumer (`ferrolearn-python` registration) | NOT-STARTED | only test-only callers; no neural binding in `ferrolearn-python` — blocker #1637 |
+//!
+//! RNG carve-out (R-DEFER-3, no failing test): post-`fit` `components_`/intercepts/`h_samples_`
+//! exact values (numpy Mersenne-Twister vs `Xoshiro256PlusPlus`) — blocker #1635.
+//!
 //! [`transform`]: FittedBernoulliRBM::transform
 //! [`free_energy`]: FittedBernoulliRBM::free_energy
 //! [`score_samples_with_corruption`]: FittedBernoulliRBM::score_samples_with_corruption
