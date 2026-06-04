@@ -11,6 +11,30 @@
 //! - [`LeavePGroupsOut`] — one fold per `p`-sized subset of groups.
 //! - [`StratifiedGroupKFold`] — group-aware folding that also tries to
 //!   preserve class balance per fold.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn/model_selection/_split.py` (1.5.2). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED (end-to-end functional + non-test consumer + tests +
+//! verification) or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-GKF-1 (greedy mechanics: argmin-load, no group straddle, validation) | SHIPPED | first-min argmin over fold loads mirrors `np.argmin(n_samples_per_fold)` (`:628-636`); rejects `n_splits < 2` and `n_splits > n_groups`. |
+//! | REQ-GKF-2 (deterministic descending-size ordering + oracle membership) | SHIPPED | `(count desc, group_id desc)` over a `BTreeMap` reproduces `np.argsort(np.bincount)[::-1]` (`:618`); deterministic (no HashMap feeds ordering); matches live oracle `GroupKFold(3).split([0,0,1,1,2,2,3,3])` → `[[0,3],[2],[1]]`. Test `gkf_greedy_ordering_diverges`. CARVE-OUT #1755: the exact tie order among equal-count distinct-id groups follows numpy's UNSTABLE quicksort — a numpy-version-defined artifact with no stable sklearn contract; ferrolearn uses a deterministic rule, guarded by `gkf_tiebreak_deterministic_and_balanced` (determinism + balance, not numpy internals). |
+//! | REQ-GKF-3 (default `n_splits=5`) | NOT-STARTED | API-shape gap — `new(n_splits)` requires it positionally; no-arg sklearn form unrepresentable. Blocker #1754. |
+//! | REQ-SGKF-1 (greedy objective parity — std-minimisation) | SHIPPED | ports `_iter_test_indices` + `_find_best_fold` (`:1015-1059`): descending per-group population-std (ddof=0) ordering (stable, tie ascending group index) + fold choice minimising mean per-class std of `y_counts_per_fold / y_cnt`, `np.isclose` tie-break on fewest samples. Matches live oracle `StratifiedGroupKFold(3)` → `[[3,6,7],[1,2,8],[4,5]]`; empty-fold bug gone. Test `sgkf_objective_diverges`. |
+//! | REQ-SGKF-2 (structural + length/n_splits validation) | SHIPPED | `y.len()==groups.len()` → `ShapeMismatch`; whole groups; `n_splits` folds; rejects `n_splits < 2`/`> n_groups`. |
+//! | REQ-SGKF-3 (per-class-count `ValueError` + UserWarning + default `n_splits`) | NOT-STARTED | no per-class-member check, no warning channel, requires explicit `n_splits` (`:987-999`). Blocker #1754. |
+//! | REQ-LOGO-1 (split-index parity) | SHIPPED | one fold per ascending unique group (`:1330-1337`); oracle `[0,0,1,1,2]` → `([2,3,4],[0,1])`/`([0,1,4],[2,3])`/`([0,1,2,3],[4])`. Guard `logo_split_index_parity`. |
+//! | REQ-LOGO-2 (`< 2` unique-groups rejection) | SHIPPED | `unique.len() < 2` → `InvalidParameter` (`:1331-1335`). |
+//! | REQ-LPGO-1 (combination-order parity) | SHIPPED | lexicographic next-combination reproduces `combinations(range(n_groups), p)` ORDER (`:1465-1470`); oracle `[0,1,2,3]`,p=2 → `{0,1},{0,2},{0,3},{1,2},{1,3},{2,3}`. Guard `lpgo_combination_order_parity`. |
+//! | REQ-LPGO-2 (error semantics) | SHIPPED | `p == 0` and `unique.len() <= p` → `InvalidParameter` (`:1458-1464`). |
+//! | REQ-GSS-1 (structural contract) | SHIPPED | per-split group shuffle → first `n_test` as test groups → sample-level disjoint covering partition; `random_state` reproducible. |
+//! | REQ-GSS-2 (test-GROUP-count sizing parity) | SHIPPED | `n_test = ceil(test_size * n_groups)` mirrors `_validate_shuffle_split` (`:2389-2390`); oracle 7 groups @ 0.3 → 3. Test `gss_test_group_count_round_vs_ceil`. |
+//! | REQ-GSS-3 (default `test_size`/`n_splits` + exact-membership carve-out) | NOT-STARTED | (a) `new(n_splits, test_size)` requires both; no-arg sklearn form unrepresentable (default `n_splits=5`/`test_size=0.2`). (b) exact group SELECTION is an RNG carve-out (`SmallRng` vs numpy permutation) — R-DEFER-3 blocker, NO failing test. Blockers #1753 (RNG), #1754 (defaults). |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | production uses `ndarray::Array1` + `rand`/`SmallRng`; destination is `ferray-core`/`ferray::random` (R-SUBSTRATE-1). Blocker #1754. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use group_splitters::{…}` in `lib.rs` (boundary API, S5/R-DEFER-1). None implements `CrossValidator` (no group/label channel), so the re-export is the sole production reach. |
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
