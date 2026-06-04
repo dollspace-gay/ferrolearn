@@ -1031,6 +1031,12 @@ design = ".design/model-sel/splitters.md"
 parity_ops = ["LeaveOneOut", "LeavePOut", "ShuffleSplit", "StratifiedShuffleSplit", "RepeatedKFold", "RepeatedStratifiedKFold", "PredefinedSplit"]
 
 [[route]]
+crate_pattern = "ferrolearn-model-sel/src/group_splitters.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_split.py"]
+design = ".design/model-sel/group_splitters.md"
+parity_ops = ["GroupKFold", "StratifiedGroupKFold", "LeaveOneGroupOut", "LeavePGroupsOut", "GroupShuffleSplit"]
+
+[[route]]
 crate_pattern = "ferrolearn-model-sel/src/param_grid.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
 design = ".design/model-sel/param_grid.md"
