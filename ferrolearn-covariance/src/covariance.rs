@@ -1446,7 +1446,7 @@ impl<F: Float + Send + Sync + 'static> EllipticEnvelope<F> {
         }
     }
 
-    /// Set the contamination fraction (must be in `(0, 0.5)`).
+    /// Set the contamination fraction (must be in `(0, 0.5]`).
     #[must_use]
     pub fn contamination(mut self, c: f64) -> Self {
         self.contamination = c;
@@ -1541,13 +1541,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for EllipticEnvelope<F
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `contamination` is outside `(0, 0.5)`.
+    /// - [`FerroError::InvalidParameter`] if `contamination` is outside `(0, 0.5]`.
     /// - Propagates errors from [`MinCovDet::fit`].
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedEllipticEnvelope<F>, FerroError> {
-        if self.contamination <= 0.0 || self.contamination >= 0.5 {
+        if self.contamination <= 0.0 || self.contamination > 0.5 {
             return Err(FerroError::InvalidParameter {
                 name: "contamination".into(),
-                reason: "must be in (0, 0.5)".into(),
+                reason: "must be in (0, 0.5]".into(),
             });
         }
 
@@ -2110,7 +2110,8 @@ mod tests {
         let x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0],];
         assert!(est.fit(&x, &()).is_err());
 
-        let est2 = EllipticEnvelope::<f64>::new().contamination(0.5);
+        // sklearn Interval(Real, 0, 0.5, closed="right"): 0.5 is VALID, > 0.5 invalid.
+        let est2 = EllipticEnvelope::<f64>::new().contamination(0.6);
         assert!(est2.fit(&x, &()).is_err());
     }
 

@@ -290,7 +290,6 @@ fn divergence_mahalanobis_squared() {
 // Tracking: #1701
 // ===========================================================================
 #[test]
-#[ignore = "divergence: contamination=0.5 over-rejected vs sklearn _elliptic_envelope.py:147 closed-right; tracking #1701"]
 fn divergence_contamination_right_endpoint() {
     // sklearn accepts contamination == 0.5 (closed right). ferrolearn must too.
     let result = EllipticEnvelope::<f64>::new()
