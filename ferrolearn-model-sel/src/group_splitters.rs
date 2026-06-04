@@ -173,7 +173,12 @@ impl GroupShuffleSplit {
                 reason: "GroupShuffleSplit needs at least 2 distinct groups".into(),
             });
         }
-        let n_test = ((n_groups as f64) * self.test_size).round().max(1.0) as usize;
+        // Mirror sklearn `_validate_shuffle_split` (`_split.py:2389-2390`),
+        // applied to the NUMBER OF GROUPS: `n_test = ceil(test_size * n_groups)`.
+        // (round() would give round(2.1)=2 for 7 groups @ 0.3; ceil gives 3.)
+        let n_test = ((n_groups as f64) * self.test_size).ceil().max(1.0) as usize;
+        // sklearn raises ValueError on an empty or full test split; clamp keeps
+        // 0 < n_test < n_groups so train = n_groups - n_test stays non-empty.
         let n_test = n_test.min(n_groups - 1);
 
         let mut folds = Vec::with_capacity(self.n_splits);

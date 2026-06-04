@@ -156,7 +156,6 @@ fn gkf_greedy_ordering_diverges() {
 //
 // Tracking: #1751
 #[test]
-#[ignore = "divergence: GroupShuffleSplit n_test uses round() not ceil(); tracking #1751"]
 fn gss_test_group_count_round_vs_ceil() {
     let groups = array![0usize, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6];
     let g: Vec<usize> = groups.to_vec();
