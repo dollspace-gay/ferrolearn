@@ -1,8 +1,27 @@
 //! Select features by percentile of highest scores.
 //!
-//! [`SelectPercentile`] retains features whose ANOVA F-score ranks in the top
-//! `percentile` percent. It reuses the scoring infrastructure from
-//! [`crate::feature_selection`].
+//! [`SelectPercentile`] retains features whose ANOVA F-score exceeds the
+//! `(100 - percentile)`-th percentile of all scores (sklearn `_get_support_mask`).
+//! It reuses the scoring infrastructure from [`crate::feature_selection`].
+//!
+//! Translation target: scikit-learn 1.5.2 `class SelectPercentile`
+//! (`sklearn/feature_selection/_univariate_selection.py:589`) + `f_classif`
+//! (`:127`). Design: `.design/preprocess/select_percentile.md`. Tracking: #1273.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 ANOVA F-score value match (f_classif, finite) | SHIPPED | `anova_f_scores`; sklearn `_univariate_selection.py:127`,`:43-117` |
+//! | REQ-2 selection mask `_get_support_mask` (threshold + tie-fill) | SHIPPED (#1274) | `SelectPercentile::fit` `numpy_percentile`; sklearn `_univariate_selection.py:669-686` |
+//! | REQ-3 InsufficientSamples / ShapeMismatch / InvalidParameter errors | SHIPPED | `fit` / `transform` guards; sklearn `_univariate_selection.py:662` |
+//! | REQ-4 `_clean_nans` (NaN scores → dtype.min) | NOT-STARTED (#1275) | sklearn `_univariate_selection.py:24`,`:678` |
+//! | REQ-5 pluggable score_func (chi2/f_regression/mutual_info_*) | NOT-STARTED (#1276) | sklearn `_univariate_selection.py:202`,`:405`,`:596-599` |
+//! | REQ-6 SelectorMixin (get_support/inverse_transform/get_feature_names_out) | NOT-STARTED (#1277) | sklearn `feature_selection/_base.py` |
+//! | REQ-7 `pvalues_` fitted attribute | NOT-STARTED (#1278) | sklearn `_univariate_selection.py:567-573`,`:116` |
+//! | REQ-8 fractional `percentile` (`Interval(Real,0,100)`) | NOT-STARTED (#1279) | sklearn `_univariate_selection.py:662` |
+//! | REQ-9 PyO3 binding | NOT-STARTED (#1280) | `ferrolearn-python/src/` (absent) |
+//! | REQ-10 ferray substrate | NOT-STARTED (#1281) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -71,6 +90,30 @@ fn anova_f_scores<F: Float>(x: &Array2<F>, y: &Array1<usize>) -> Vec<F> {
     }
 
     scores
+}
+
+/// Compute `np.percentile(sorted, q)` with the default `'linear'` interpolation.
+///
+/// `sorted` must be ascending. `q` is in `[0, 100]`. Mirrors numpy's default
+/// percentile (linear interpolation), the same idiom as `quantile_sorted` in
+/// `robust_scaler.rs`. Used to reproduce sklearn `_get_support_mask`
+/// (`_univariate_selection.py:679`).
+fn numpy_percentile<F: Float>(sorted: &[F], q: f64) -> F {
+    let n = sorted.len();
+    if n == 0 {
+        return F::nan();
+    }
+    if n == 1 {
+        return sorted[0];
+    }
+    let idx = (q / 100.0) * (n - 1) as f64;
+    let lo = idx.floor() as usize;
+    let hi = idx.ceil() as usize;
+    if lo == hi {
+        return sorted[lo];
+    }
+    let frac = F::from(idx - lo as f64).unwrap_or_else(F::zero);
+    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
 /// Build a new `Array2<F>` containing only the columns listed in `indices`.
@@ -239,21 +282,51 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for SelectP
         };
         let scores = Array1::from_vec(raw_scores.clone());
 
-        // Compute how many features to keep
-        let k = (n_features * self.percentile).div_ceil(100);
-        let k = k.min(n_features);
+        // Selection mirrors sklearn `_get_support_mask`
+        // (`_univariate_selection.py:669-686`): an np.percentile threshold with
+        // STRICT `>` plus an int()-floor tie-fill in ascending index order —
+        // NOT a ceil rank-top-k rule.
+        let selected_indices: Vec<usize> = if self.percentile == 100 {
+            // :673-674 — keep all features.
+            (0..n_features).collect()
+        } else if self.percentile == 0 {
+            // :675-676 — keep none.
+            Vec::new()
+        } else {
+            // :679 — threshold = np.percentile(scores, 100 - percentile).
+            let mut sorted = raw_scores.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let threshold = numpy_percentile(&sorted, 100.0 - self.percentile as f64);
 
-        // Rank features by score (descending)
-        let mut ranked: Vec<usize> = (0..n_features).collect();
-        ranked.sort_by(|&a, &b| {
-            raw_scores[b]
-                .partial_cmp(&raw_scores[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then(a.cmp(&b))
-        });
+            // :680 — mask = scores > threshold (strict greater), collected in
+            // ascending index order.
+            #[allow(
+                clippy::float_cmp,
+                reason = "mirrors sklearn np.where(scores == threshold), _univariate_selection.py:681"
+            )]
+            let mut selected: Vec<usize> = (0..n_features)
+                .filter(|&j| raw_scores[j] > threshold)
+                .collect();
 
-        let mut selected_indices: Vec<usize> = ranked[..k].to_vec();
-        selected_indices.sort_unstable();
+            // :681-685 — fill ties (scores == threshold) in ascending index
+            // order up to max_feats = int(n * percentile / 100) (floor).
+            #[allow(
+                clippy::float_cmp,
+                reason = "mirrors sklearn np.where(scores == threshold), _univariate_selection.py:681"
+            )]
+            let ties: Vec<usize> = (0..n_features)
+                .filter(|&j| raw_scores[j] == threshold)
+                .collect();
+            if !ties.is_empty() {
+                let max_feats = ((n_features as f64) * (self.percentile as f64) / 100.0) as usize;
+                let fill = max_feats.saturating_sub(selected.len());
+                for &t in ties.iter().take(fill) {
+                    selected.push(t);
+                }
+            }
+            selected.sort_unstable();
+            selected
+        };
 
         Ok(FittedSelectPercentile {
             n_features_in: n_features,
@@ -324,8 +397,12 @@ mod tests {
     #[test]
     fn test_select_percentile_selects_highest_scoring() {
         let sel = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif);
-        // Feature 0 perfectly separates classes, feature 1 does not
-        let x = array![[0.0, 5.0], [0.0, 5.5], [10.0, 5.0], [10.0, 5.5]];
+        // Feature 0 separates classes far better than feature 1 (finite scores).
+        // Live sklearn 1.5.2 oracle (R-CHAR-3): f_classif -> [162.0, 0.0],
+        // SelectPercentile(percentile=50).get_support(indices=True) -> [0].
+        // (The previous fixture had an inf F-score for feature 0, exercising the
+        // NaN/inf _clean_nans path which is REQ-4 NOT-STARTED — out of scope.)
+        let x = array![[0.0, 5.0], [1.0, 5.5], [10.0, 5.0], [9.0, 5.5]];
         let y: Array1<usize> = array![0, 0, 1, 1];
         let fitted = sel.fit(&x, &y).unwrap();
         // Feature 0 should be selected
