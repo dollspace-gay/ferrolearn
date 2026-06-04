@@ -28,6 +28,28 @@
 //! let z = fitted.transform(&x).unwrap();
 //! assert_eq!(z.ncols(), 100); // default n_components
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/kernel_approximation.py` (tag 1.5.2,
+//! `RBFSampler`). RNG-coupled (random Fourier features): the transform formula
+//! and the sampling distribution structure are deterministic and match sklearn;
+//! the exact `random_weights_`/`random_offset_` draws are an RNG carve-out.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | transform formula `sqrt(2/n)·cos(X·W + b)` | SHIPPED | `fn transform` (sklearn `kernel_approximation.py:404-407`); `green_transform_formula_parity` ≤1e-12 |
+//! | REQ-2 | sampling distributions `W ~ N(0, sqrt(2·gamma))`, `b ~ U(0, 2π)` (structure) | SHIPPED | `fn fit`; `green_sampling_structure` (shapes / support / std) |
+//! | REQ-3 | `gamma=0` accepted (`gamma ≥ 0`) | SHIPPED | `fn fit` rejects only `gamma < 0` (sklearn `_parameter_constraints` `:330` closed-left, fixed #1670); `divergence_gamma_zero_accepted` |
+//! | REQ-4 | `gamma='scale'` (`1/(n_features·X.var())`) | NOT-STARTED | `gamma: F` numeric-only (`:253-259`,`:366-369`) — blocker #1673 |
+//! | REQ-5 | no production `unwrap` (R-CODE-2) | SHIPPED | `fn fit` conversions propagate `FerroError` via `ok_or_else(...)?` (fixed #1671) |
+//! | REQ-6 | `n_components ≥ 1` validation | SHIPPED | `fn fit` rejects 0 (sklearn `:332`); `green_n_components_zero_rejected` |
+//! | REQ-7 | `n_features_in_` attribute | NOT-STARTED | only `random_weights()`/`random_offset()` accessors — blocker #1674 |
+//! | REQ-8 | exact `random_weights_`/`random_offset_` RNG parity | NOT-STARTED | Xoshiro256++ vs numpy Mersenne-Twister — carve-out blocker #1672 |
+//! | REQ-9 | ferray substrate | NOT-STARTED | `ndarray` + `rand_distr` + `rand_xoshiro`, not `ferray-core` — blocker #1675 |
+//! | REQ-10 | non-test production consumer | SHIPPED | `RsRBFSampler` in `ferrolearn-python` (`extras.rs:1188`, `lib.rs:88`) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
