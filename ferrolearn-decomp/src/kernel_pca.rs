@@ -39,6 +39,41 @@
 //! let projected = fitted.transform(&x).unwrap();
 //! assert_eq!(projected.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/kernel_pca.md`. Tracking: #1561. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumers: crate re-export (`lib.rs:90`), the
+//! PyO3 `_RsKernelPCA` binding (`ferrolearn-python/src/extras.rs:1122`), and
+//! `PipelineTransformer`. Oracle = live sklearn 1.5.2 (`_kernel_pca.py`,
+//! `eigen_solver='dense'` for the deterministic value oracle), run from `/tmp`
+//! (R-CHAR-3). The centered-kernel eigendecomposition is deterministic, so the
+//! embedding has full value parity with sklearn (incl. sign) for distinct
+//! eigenvalues.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | 4 kernels (Linear/RBF/Polynomial/Sigmoid) kernel values | SHIPPED | `kernel_value` (`kernel_pca.rs:222`); in-module per-kernel tests |
+//! | REQ-2 | KernelCenterer double-centering (train + test gram) | SHIPPED | `centre_kernel_matrix` (`:299`) + transform re-centering (`:579-592`) = sklearn `KernelCenterer` |
+//! | REQ-3 | `svd_flip` sign convention + embedding value parity | SHIPPED | `fit` applies per-COLUMN max-abs-row-positive flip on `alphas` (`:523-545` = sklearn `svd_flip(u=eigenvectors_, v=None)` `_kernel_pca.py:373`); matches sklearn dense incl. sign across all 4 kernels (linear 5.8e-13, rbf 3.4e-13, poly 2.2e-15, sigmoid 3.3e-14). Was #1562, fixed. Tests `divergence_svd_flip_*` |
+//! | REQ-4 | `coef0` default = 1 | SHIPPED | `KernelPCA::new` `coef0: 1.0` (`:102` = sklearn `_kernel_pca.py:289`). Was #1563, fixed. Test `divergence_coef0_default` |
+//! | REQ-5 | eigenvalues non-negative | SHIPPED | clamp negatives to 0 (`:504-509`); `test_kernel_pca_eigenvalues_non_negative` |
+//! | REQ-6 | eigenvalues sorted descending | SHIPPED | sort (`:491-496`); `test_kernel_pca_eigenvalues_sorted_descending` |
+//! | REQ-7 | embedding shape + `1/sqrt(eigval)` scaling | SHIPPED | `alphas = eigvec/sqrt(eigval)` (`:511-520`); shape tests |
+//! | REQ-8 | transform of NEW data (train-kernel centering) | SHIPPED | `transform` (`:550`); `test_kernel_pca_transform_new_data` |
+//! | REQ-9 | auto-gamma `1/n_features` | SHIPPED | `effective_gamma = gamma or 1/n_features` (`:465`); `test_kernel_pca_auto_gamma` |
+//! | REQ-10 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform` guards (n_components 0/>n_samples, n_samples<2, feature mismatch) |
+//! | REQ-11 | f32/f64 generic | SHIPPED | `test_kernel_pca_f32` |
+//! | REQ-12 | `eigen_solver` arpack/randomized + tol/max_iter/iterated_power/random_state | NOT-STARTED | sklearn `_kernel_pca.py:340-366`; ferrolearn dense Jacobi only — blocker #1564 |
+//! | REQ-13 | `remove_zero_eig` | NOT-STARTED | sklearn `_kernel_pca.py:381-383` — blocker #1565 |
+//! | REQ-14 | `fit_inverse_transform`/`inverse_transform`/`alpha` ridge + `dual_coef_`/`X_transformed_fit_` | NOT-STARTED | sklearn `_kernel_pca.py:406-416,:514-563` — blocker #1566 |
+//! | REQ-15 | `n_components=None` + `kernel='precomputed'` + cosine/laplacian/chi2 kernels + kernel_params | NOT-STARTED | sklearn `_kernel_pca.py:319-326` — blocker #1567 |
+//! | REQ-16 | fitted attrs `n_features_in_`/`X_fit_` | NOT-STARTED | blocker #1568 |
+//! | REQ-17 | degenerate/repeated-eigenvalue subspace basis ambiguity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Jacobi vs LAPACK eigh — blocker #1569 |
+//! | REQ-18 | ferray substrate | NOT-STARTED | `ndarray` + hand-rolled Jacobi — blocker #1570 |
+//!
+//! Count: **11 SHIPPED (REQ-1..11) / 7 NOT-STARTED (REQ-12..18)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -91,7 +126,7 @@ impl<F: Float + Send + Sync + 'static> KernelPCA<F> {
     /// Create a new `KernelPCA` that retains `n_components` components.
     ///
     /// Defaults: kernel=`Linear`, gamma=`None` (auto: `1/n_features`),
-    /// degree=3, coef0=0.
+    /// degree=3, coef0=1.
     #[must_use]
     pub fn new(n_components: usize) -> Self {
         Self {
@@ -99,7 +134,7 @@ impl<F: Float + Send + Sync + 'static> KernelPCA<F> {
             kernel: Kernel::Linear,
             gamma: None,
             degree: 3,
-            coef0: 0.0,
+            coef0: 1.0,
             _marker: std::marker::PhantomData,
         }
     }
@@ -517,6 +552,30 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KernelPCA<F> {
 
             for i in 0..n_samples {
                 alphas[[i, k_idx]] = eigenvectors[[i, eigen_idx]] * scale;
+            }
+        }
+
+        // svd_flip(u=eigenvectors_, v=None): u_based_decision=True
+        // (`_kernel_pca.py:373`, `extmath.py:888-894`). For each eigenvector
+        // COLUMN, numpy `argmax(abs(u), axis=0)` selects the FIRST max-abs ROW
+        // (strict `>` => first-max-wins) and `signs = sign(u[max_abs_row, col])`
+        // is applied so that column's max-abs entry becomes POSITIVE. The
+        // positive `1/sqrt(eigenvalue)` scale preserves sign, so flipping the
+        // scaled `alphas` column matches flipping the raw eigenvector column.
+        for k_idx in 0..n_comp {
+            let mut i_max = 0usize;
+            let mut max_abs = F::zero();
+            for i in 0..n_samples {
+                let a = alphas[[i, k_idx]].abs();
+                if a > max_abs {
+                    max_abs = a;
+                    i_max = i;
+                }
+            }
+            if alphas[[i_max, k_idx]] < F::zero() {
+                for i in 0..n_samples {
+                    alphas[[i, k_idx]] = -alphas[[i, k_idx]];
+                }
             }
         }
 
