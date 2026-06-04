@@ -94,6 +94,7 @@ pub mod quantile_transformer;
 pub mod random_projection;
 pub mod rfe;
 pub mod robust_scaler;
+pub mod select_from_model;
 pub mod select_percentile;
 pub mod sequential_feature_selector;
 pub mod spline_transformer;
@@ -133,6 +134,7 @@ pub use quantile_transformer::{
     FittedQuantileTransformer, OutputDistribution, QuantileTransformer,
 };
 pub use rfe::{RFE, RFECV};
+pub use select_from_model::{FittedSelectFromModelExt, SelectFromModelExt, ThresholdStrategy};
 pub use select_percentile::{FittedSelectPercentile, SelectPercentile};
 pub use spline_transformer::{FittedSplineTransformer, KnotStrategy, SplineTransformer};
 pub use target_encoder::{FittedTargetEncoder, TargetEncoder};

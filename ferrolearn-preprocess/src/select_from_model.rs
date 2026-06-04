@@ -17,6 +17,33 @@
 //!
 //! When `max_features` is set, at most that many features are retained
 //! (in descending importance order) regardless of the threshold.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class SelectFromModel`
+//! (`sklearn/feature_selection/_from_model.py:256`). Tracking: #1352. Each REQ
+//! is BINARY — SHIPPED (impl + non-test consumer + tests + green verification)
+//! or NOT-STARTED (with a concrete open blocker). HONEST scope: this unit ships
+//! the threshold + selection-mask + `max_features` core GIVEN a static
+//! importance vector; sklearn wraps a fitted estimator and extracts its
+//! importances — that estimator machinery is NOT-STARTED.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Threshold (mean/median/value) + selection mask (`score >= threshold`) + `max_features` top-k cap, given a static importance vector | SHIPPED | [`SelectFromModelExt`] `fit` matches sklearn `_get_support_mask` `_from_model.py:299-312` + `_calculate_threshold` `:24-71` (mean=`np.mean`, median=`np.median`); threshold-then-cap is algebraically equivalent to sklearn cap-then-threshold (exhaustive-grid oracle-verified); 15 oracle value tests in `tests/divergence_select_from_model.rs`. Consumer: boundary re-export `lib.rs` (grandfathered S5/R-DEFER-1) + `PipelineTransformer` |
+//! | REQ-2 | Error/parameter contracts (empty importances, `Percentile` range, transform ncols mismatch) | SHIPPED (scoped) | [`SelectFromModelExt::fit`]/[`FittedSelectFromModelExt`] `transform`; in-module + divergence error tests |
+//! | REQ-3 | Estimator wrapping + `coef_`/`feature_importances_` extraction (`_get_feature_importances`) | NOT-STARTED | takes importances directly; sklearn `_from_model.py:299-304` — blocker #1353 |
+//! | REQ-4 | `norm_order` multi-output coef norm | NOT-STARTED | scalar importances only; sklearn `_from_model.py:303` — blocker #1354 |
+//! | REQ-5 | Scaled-string `scale*mean`/`scale*median` thresholds + default-from-estimator (l1→1e-5) | NOT-STARTED | sklearn `_from_model.py:30-55` — blocker #1355 |
+//! | REQ-6 | `prefit` + `importance_getter` params | NOT-STARTED | sklearn `_from_model.py:256-271,277-284` — blocker #1356 |
+//! | REQ-7 | `max_features` callable + `_check_max_features` range validation `[0, n_features]` | NOT-STARTED | int cap only; sklearn `_from_model.py:315-331` — blocker #1357 |
+//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | NOT-STARTED | sklearn `_base.py` `SelectorMixin` — blocker #1358 |
+//! | REQ-9 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1359 |
+//! | REQ-10 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1360 |
+//!
+//! NOTE: [`ThresholdStrategy::Percentile`] is a ferrolearn EXTENSION with NO
+//! sklearn `SelectFromModel` analog (sklearn supports only mean/median/`scale*ref`/
+//! float); it is not a sklearn-parity REQ and carries no blocker.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -165,7 +192,7 @@ fn compute_median<F: Float>(values: &[F]) -> F {
     let mut sorted: Vec<F> = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = sorted.len();
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         let two = F::one() + F::one();
         (sorted[n / 2 - 1] + sorted[n / 2]) / two
     } else {
@@ -229,11 +256,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array1<F>, ()> for SelectFromModelExt
     ///
     /// - [`FerroError::InvalidParameter`] if the importance vector is empty,
     ///   or if `Percentile` value is not in `(0, 100]`.
-    fn fit(
-        &self,
-        x: &Array1<F>,
-        _y: &(),
-    ) -> Result<FittedSelectFromModelExt<F>, FerroError> {
+    fn fit(&self, x: &Array1<F>, _y: &()) -> Result<FittedSelectFromModelExt<F>, FerroError> {
         let n = x.len();
         if n == 0 {
             return Err(FerroError::InvalidParameter {
@@ -256,10 +279,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array1<F>, ()> for SelectFromModelExt
                 if pct <= 0.0 || pct > 100.0 {
                     return Err(FerroError::InvalidParameter {
                         name: "percentile".into(),
-                        reason: format!(
-                            "percentile must be in (0, 100], got {}",
-                            pct
-                        ),
+                        reason: format!("percentile must be in (0, 100], got {}", pct),
                     });
                 }
                 compute_percentile_threshold(&values, pct)
@@ -275,18 +295,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array1<F>, ()> for SelectFromModelExt
             .collect();
 
         // Apply max_features cap: keep only the top-k by importance
-        if let Some(max_f) = self.max_features {
-            if selected_indices.len() > max_f {
-                // Sort selected by importance descending, keep top max_f
-                selected_indices.sort_by(|&a, &b| {
-                    values[b]
-                        .partial_cmp(&values[a])
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                selected_indices.truncate(max_f);
-                // Re-sort in column order
-                selected_indices.sort_unstable();
-            }
+        if let Some(max_f) = self.max_features
+            && selected_indices.len() > max_f
+        {
+            // Sort selected by importance descending, keep top max_f
+            selected_indices.sort_by(|&a, &b| {
+                values[b]
+                    .partial_cmp(&values[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            selected_indices.truncate(max_f);
+            // Re-sort in column order
+            selected_indices.sort_unstable();
         }
 
         Ok(FittedSelectFromModelExt {

@@ -750,6 +750,18 @@ upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_from_model.py"]
 design = ".design/preprocess/select_from_model.md"
 parity_ops = ["SelectFromModel"]
 
+# The crate-root re-export aggregator (mirrors the ferrolearn-linear/src/lib.rs
+# and ferrolearn-bayes/src/lib.rs precedent: routed against the crate's public
+# API boundary __init__.py). Re-exports the per-transformer modules as the
+# grandfathered R-DEFER-1 / S5 production consumer. Its own re-export-boundary
+# REQ table is a dedicated future iteration (design doc .design/preprocess/lib.md
+# not yet written).
+[[route]]
+crate_pattern = "ferrolearn-preprocess/src/lib.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/__init__.py"]
+design = ".design/preprocess/lib.md"
+parity_ops = ["re-export boundary"]
+
 [[route]]
 crate_pattern = "ferrolearn-preprocess/src/sequential_feature_selector.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/feature_selection/_sequential.py"]
