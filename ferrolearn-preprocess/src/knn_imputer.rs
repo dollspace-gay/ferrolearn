@@ -9,7 +9,31 @@
 //!
 //! - [`KNNWeights::Uniform`] — all neighbors contribute equally.
 //! - [`KNNWeights::Distance`] — neighbors are weighted by the inverse of their
-//!   distance (closer neighbors contribute more).
+//!   distance (closer neighbors contribute more); an exact-match (distance 0)
+//!   donor takes weight 1 and all others 0 (matching sklearn `_get_weights`).
+//!
+//! Translation target: scikit-learn 1.5.2 `class KNNImputer`
+//! (`sklearn/impute/_knn.py:69`) + `nan_euclidean_distances`
+//! (`sklearn/metrics/pairwise.py:430`). Design: `.design/preprocess/knn_imputer.md`.
+//! Tracking: #1304.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 KNN imputation value surface (scaled distance, donor avg, column-mean fallback) | SHIPPED | `FittedKNNImputer::transform`; sklearn `_knn.py:184-204`,`:329-356` (#1305/#1306/#1307/#1308/#1309) |
+//! | REQ-2 nan_euclidean distance SCALING `sqrt(sum_sq·n/present)` | SHIPPED (#1305) | `partial_euclidean_distance`; sklearn `pairwise.py:539-547` |
+//! | REQ-3 empty-donor → masked training column mean | SHIPPED (#1306) | `transform`; sklearn `_knn.py:329-337` |
+//! | REQ-9 error/clamp contracts (n_neighbors>n_samples clamps, not errors) | SHIPPED (#1307) | `fit` guards; sklearn `_knn.py:132`,`:349` |
+//! | REQ-4 valid_mask all-missing column dropping | NOT-STARTED (#1311) | sklearn `_knn.py:240`,`:289` |
+//! | REQ-5 `missing_values` non-NaN sentinel | NOT-STARTED (#1312) | sklearn `_knn.py:239`,`:276` |
+//! | REQ-6 `add_indicator` MissingIndicator | NOT-STARTED (#1313) | sklearn `_knn.py:242`,`:280` |
+//! | REQ-7 `keep_empty_features` | NOT-STARTED (#1314) | sklearn `_knn.py:285-287` |
+//! | REQ-8 callable `weights`/`metric` (exact-match dist==0 done #1308) | NOT-STARTED (#1315) | sklearn `_knn.py:133-134` |
+//! | REQ-10 `_BaseImputer` surface + fitted attrs | NOT-STARTED (#1316) | sklearn `_knn.py:238-242` |
+//! | REQ-11 PyO3 binding | NOT-STARTED (#1317) | `ferrolearn-python/src/` (absent) |
+//! | REQ-12 ferray substrate | NOT-STARTED (#1318) | R-SUBSTRATE |
+//! | DIV-6 exact-distance-tie donor selection (carve-out) | NOT-STARTED edge (#1310) | numpy argpartition unspecified tie order |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -167,8 +191,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KNNImputer<F> {
     /// # Errors
     ///
     /// - [`FerroError::InsufficientSamples`] if the input has zero rows.
-    /// - [`FerroError::InvalidParameter`] if `n_neighbors` is zero or exceeds
-    ///   the number of samples.
+    /// - [`FerroError::InvalidParameter`] if `n_neighbors` is zero.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedKNNImputer<F>, FerroError> {
         let n_samples = x.nrows();
         if n_samples == 0 {
@@ -184,15 +207,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KNNImputer<F> {
                 reason: "n_neighbors must be at least 1".into(),
             });
         }
-        if self.n_neighbors > n_samples {
-            return Err(FerroError::InvalidParameter {
-                name: "n_neighbors".into(),
-                reason: format!(
-                    "n_neighbors ({}) exceeds the number of training samples ({})",
-                    self.n_neighbors, n_samples
-                ),
-            });
-        }
+        // sklearn does NOT cap n_neighbors at n_samples: `_parameter_constraints`
+        // only requires `n_neighbors >= 1` (`sklearn/impute/_knn.py:132`). When
+        // fewer donors are available than `n_neighbors`, `transform` clamps
+        // per-column via `n_neighbors = min(self.n_neighbors,
+        // len(potential_donors_idx))` (`_knn.py:349`). Our transform loop
+        // naturally collects only the donors that exist, so no guard is needed.
 
         Ok(FittedKNNImputer {
             train_data: x.to_owned(),
@@ -243,10 +263,15 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKNNImputer
             let mut dists: Vec<(usize, F)> = Vec::with_capacity(n_train);
             for t in 0..n_train {
                 let train_row: Vec<F> = self.train_data.row(t).to_vec();
-                let (d, n_valid) = partial_euclidean_distance(&row_slice, &train_row);
-                if n_valid > 0 {
-                    dists.push((t, d));
-                }
+                let (d, _n_valid) = partial_euclidean_distance(&row_slice, &train_row);
+                // Always push the donor, even when the receiver shares no present
+                // feature with it (`d == inf`). sklearn `_calc_impute`
+                // (`sklearn/impute/_knn.py:184-204`) selects donors via
+                // `argpartition` over the FULL potential-donor set; NaN-distance
+                // donors sort LAST but are still selected to fill the
+                // `n_neighbors` quota when finite-distance donors run short. The
+                // sort below orders finite distances ascending with `inf` last.
+                dists.push((t, d));
             }
             // Sort by distance
             dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
@@ -270,9 +295,28 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKNNImputer
                     }
                 }
 
-                if neighbor_vals.is_empty() {
-                    // No valid neighbors found — leave as NaN or fill with zero
-                    out[[i, j]] = F::zero();
+                let all_inf = neighbor_vals.iter().all(|(_, d)| d.is_infinite());
+                if neighbor_vals.is_empty() || all_inf {
+                    // No reachable donor: impute the masked training column mean
+                    // (sklearn `_knn.py:329-337`: receivers with all-NaN distances
+                    // get `np.ma.array(fit_X[:,col], mask=...).mean()` — the mean of
+                    // the non-NaN training values in column `j`).
+                    let mut col_sum = F::zero();
+                    let mut col_count = 0usize;
+                    for t in 0..n_train {
+                        let v = self.train_data[[t, j]];
+                        if !v.is_nan() {
+                            col_sum = col_sum + v;
+                            col_count += 1;
+                        }
+                    }
+                    out[[i, j]] = if col_count > 0 {
+                        col_sum / F::from(col_count).unwrap_or_else(F::one)
+                    } else {
+                        // training column all-NaN: fall back to 0 (sklearn would
+                        // drop this column, REQ-4 NOT-STARTED).
+                        F::zero()
+                    };
                     continue;
                 }
 
@@ -285,24 +329,35 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKNNImputer
                         sum / F::from(neighbor_vals.len()).unwrap_or_else(F::one)
                     }
                     KNNWeights::Distance => {
-                        // Inverse distance weighting
-                        let mut weight_sum = F::zero();
-                        let mut val_sum = F::zero();
                         let epsilon = F::from(1e-12).unwrap_or_else(F::min_positive_value);
-                        for &(val, dist) in &neighbor_vals {
-                            let w = if dist <= epsilon {
-                                // Exact match — give very high weight
-                                F::from(1e12).unwrap_or_else(F::max_value)
-                            } else {
-                                F::one() / dist
-                            };
-                            weight_sum = weight_sum + w;
-                            val_sum = val_sum + w * val;
-                        }
-                        if weight_sum > F::zero() {
-                            val_sum / weight_sum
+                        let exact: Vec<F> = neighbor_vals
+                            .iter()
+                            .filter(|(_, d)| *d <= epsilon)
+                            .map(|(v, _)| *v)
+                            .collect();
+                        if !exact.is_empty() {
+                            // sklearn `_get_weights` (sklearn/neighbors/_base.py:119-121):
+                            // when a receiver has one or more zero-distance (exact-match)
+                            // donors, `dist[inf_row] = inf_mask[inf_row]` sets those donors'
+                            // weights to 1 and ALL other donors' weights to 0. So the imputed
+                            // value is the uniform mean of ONLY the exact-match donors, with
+                            // zero leakage from far donors.
+                            let sum = exact.iter().fold(F::zero(), |a, &v| a + v);
+                            sum / F::from(exact.len()).unwrap_or_else(F::one)
                         } else {
-                            neighbor_vals[0].0
+                            // No exact match: inverse-distance weighting.
+                            let mut weight_sum = F::zero();
+                            let mut val_sum = F::zero();
+                            for &(val, dist) in &neighbor_vals {
+                                let w = F::one() / dist;
+                                weight_sum = weight_sum + w;
+                                val_sum = val_sum + w * val;
+                            }
+                            if weight_sum > F::zero() {
+                                val_sum / weight_sum
+                            } else {
+                                neighbor_vals[0].0
+                            }
                         }
                     }
                 };
@@ -434,11 +489,16 @@ mod tests {
         assert!(imputer.fit(&x, &()).is_err());
     }
 
+    /// sklearn does NOT reject `n_neighbors > n_samples`: its
+    /// `_parameter_constraints` only requires `n_neighbors >= 1`
+    /// (`sklearn/impute/_knn.py:132`), and `transform` clamps per-column via
+    /// `min(self.n_neighbors, len(potential_donors_idx))` (`_knn.py:349`). So
+    /// `fit` must return `Ok` here, not `Err`.
     #[test]
-    fn test_knn_imputer_too_many_neighbors_error() {
+    fn test_knn_imputer_too_many_neighbors_ok() {
         let imputer = KNNImputer::<f64>::new(10, KNNWeights::Uniform);
         let x = array![[1.0, 2.0], [3.0, 4.0]];
-        assert!(imputer.fit(&x, &()).is_err());
+        assert!(imputer.fit(&x, &()).is_ok());
     }
 
     #[test]
