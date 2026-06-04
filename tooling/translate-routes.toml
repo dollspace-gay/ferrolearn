@@ -643,12 +643,6 @@ design = ".design/preprocess/ordinal_encoder.md"
 parity_ops = ["OrdinalEncoder"]
 
 [[route]]
-crate_pattern = "ferrolearn-preprocess/src/binary_encoder.rs"
-upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_encoders.py"]
-design = ".design/preprocess/binary_encoder.md"
-parity_ops = ["OneHotEncoder"]
-
-[[route]]
 crate_pattern = "ferrolearn-preprocess/src/label_encoder.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/preprocessing/_label.py"]
 design = ".design/preprocess/label_encoder.md"
