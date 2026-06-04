@@ -48,7 +48,7 @@
 
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_decomp::MiniBatchNMF;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// The fixed 6x4 non-negative fixture used across the transform probe / guards.
 fn fixture_x() -> Array2<f64> {
