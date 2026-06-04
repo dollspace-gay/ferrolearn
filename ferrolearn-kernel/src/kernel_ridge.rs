@@ -64,18 +64,18 @@ pub struct KernelRidge<F> {
     gamma: Option<F>,
     /// Polynomial degree (default 3).
     degree: usize,
-    /// Coefficient for Polynomial/Sigmoid (default 0.0).
+    /// Coefficient for Polynomial/Sigmoid (default 1.0, matching sklearn).
     coef0: F,
 }
 
 impl<F: Float + Send + Sync + 'static> KernelRidge<F> {
     /// Create a new `KernelRidge` with default settings.
     ///
-    /// Defaults: `alpha = 1.0`, `kernel = Rbf`, `gamma = None` (auto),
-    /// `degree = 3`, `coef0 = 0.0`.
+    /// Defaults: `alpha = 1.0`, `kernel = Linear`, `gamma = None` (auto),
+    /// `degree = 3`, `coef0 = 1.0`.
     ///
-    /// The default kernel is `Linear` to match scikit-learn
-    /// (`KernelRidge(kernel='linear')`).
+    /// The default kernel is `Linear` and the default `coef0` is `1.0` to match
+    /// scikit-learn (`KernelRidge(kernel='linear', coef0=1)`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -83,7 +83,7 @@ impl<F: Float + Send + Sync + 'static> KernelRidge<F> {
             kernel: KernelType::Linear,
             gamma: None,
             degree: 3,
-            coef0: F::zero(),
+            coef0: F::one(),
         }
     }
 
@@ -115,7 +115,7 @@ impl<F: Float + Send + Sync + 'static> KernelRidge<F> {
         self
     }
 
-    /// Set the coefficient for Polynomial/Sigmoid kernels.
+    /// Set the coefficient for Polynomial/Sigmoid kernels (default 1.0).
     #[must_use]
     pub fn with_coef0(mut self, coef0: F) -> Self {
         self.coef0 = coef0;
