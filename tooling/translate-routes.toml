@@ -1013,6 +1013,12 @@ design = ".design/model-sel/inspection.md"
 parity_ops = ["partial_dependence", "permutation_importance"]
 
 [[route]]
+crate_pattern = "ferrolearn-model-sel/src/threshold.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_classification_threshold.py"]
+design = ".design/model-sel/threshold.md"
+parity_ops = ["FixedThresholdClassifier", "TunedThresholdClassifierCV"]
+
+[[route]]
 crate_pattern = "ferrolearn-model-sel/src/param_grid.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
 design = ".design/model-sel/param_grid.md"
