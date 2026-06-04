@@ -7,7 +7,25 @@
 //!
 //! - [`FixedThresholdClassifier`] applies a user-supplied threshold.
 //! - [`TunedThresholdClassifierCV`] picks the threshold by maximising a user-
-//!   supplied scoring function over an out-of-fold prediction grid.
+//!   supplied scoring function, averaged per-threshold across CV folds.
+//!
+//! Mirrors `sklearn/model_selection/_classification_threshold.py` (tag 1.5.2,
+//! `FixedThresholdClassifier` `:233`, `TunedThresholdClassifierCV`).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | FixedThresholdClassifier predict (`score >= threshold`) | SHIPPED | `FittedFixedThresholdClassifier::predict` (`_classification_threshold.py:57-66`, `>=` edge → class 1); `fixed_threshold_predict_ge_edge_parity_green` matches live `[0,1,0,1,1]` |
+//! | REQ-2 | `threshold='auto'` default (0.5 proba / 0.0 decision) | NOT-STARTED | explicit `threshold: f64` required (`:256`) — blocker #1738 |
+//! | REQ-3 | `pos_label` / `classes_` ordering | NOT-STARTED | binary `{0, 1}` usize only (`:62-66`) — blocker #1739 |
+//! | REQ-4 | wrapped-estimator + `response_method` (predict_proba) | NOT-STARTED | `fit_fn` closure returns a `ScoreFn` (R-DEV-7); no proba/response dispatch — blocker #1740 |
+//! | REQ-5 | TunedThresholdClassifierCV per-fold-mean threshold selection | SHIPPED | `TunedThresholdClassifierCV::fit` scores per fold then means per threshold + first-max argmax (`_classification_threshold.py:591-616`,`:928-931`, fixed #1737); `tuned_threshold_fold_combination_divergence` (best=0.6) |
+//! | REQ-6 | Tuned defaults (`scoring='balanced_accuracy'`, `thresholds=100` auto grid, StratifiedKFold, refit) | NOT-STARTED | explicit scoring/grid/KFold required — blocker #1741 |
+//! | REQ-7 | ferray substrate | NOT-STARTED | `ndarray`, not `ferray` — blocker #1742 |
+//! | REQ-8 | non-test production consumer | SHIPPED | boundary re-export `lib.rs` (S5) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
