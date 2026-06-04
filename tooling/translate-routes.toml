@@ -933,3 +933,16 @@ crate_pattern = "ferrolearn-neural/src/rbm.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/neural_network/_rbm.py"]
 design = ".design/neural/rbm.md"
 parity_ops = ["BernoulliRBM"]
+
+# =====================================================================
+# Layer 2 — ferrolearn-datasets (datasets)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
+  "/home/doll/scikit-learn/sklearn/datasets/_base.py",
+]
+design = ".design/datasets/svmlight.md"
+parity_ops = ["load_svmlight_file", "load_svmlight_files", "dump_svmlight_file", "load_files"]
