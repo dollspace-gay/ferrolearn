@@ -962,3 +962,9 @@ crate_pattern = "ferrolearn-kernel/src/kernel_ridge.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/kernel_ridge.py"]
 design = ".design/kernel/kernel_ridge.md"
 parity_ops = ["KernelRidge"]
+
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/rbf_sampler.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/kernel_approximation.py"]
+design = ".design/kernel/rbf_sampler.md"
+parity_ops = ["RBFSampler"]
