@@ -3,7 +3,33 @@
 //! Each feature is transformed as `(x - median) / IQR` where
 //! `IQR = Q75 - Q25`. This scaler is robust to outliers.
 //!
-//! Columns where IQR = 0 are left unchanged after transformation.
+//! A zero-IQR column is centered (`x - median`) then divided by an effective
+//! scale of 1, matching scikit-learn `_handle_zeros_in_scale`
+//! (`_data.py:88`, `:1635`, `:1673-1675`); a constant column therefore maps to 0.
+//!
+//! Translation target: scikit-learn 1.5.2 `class RobustScaler`
+//! (`sklearn/preprocessing/_data.py:1445`) + `robust_scale` (`:1719`). Design:
+//! `.design/preprocess/robust_scaler.md`. Tracking: #1247.
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 per-column median/IQR value match (non-constant) | SHIPPED | `RobustScaler::fit` / `FittedRobustScaler::transform`; sklearn `_data.py:1614`,`:1630-1634`,`:1672-1675` |
+//! | REQ-2 zero-IQR / constant column → 0 (center, scale_eff=1) | SHIPPED (#1248) | `transform` `scale_eff = if iqr==0 {1} else {iqr}`; sklearn `_data.py:88`,`:1635` |
+//! | REQ-3 InsufficientSamples / ShapeMismatch error contracts | SHIPPED | `fit` / `transform` guards; sklearn `_data.py:1658-1666` |
+//! | REQ-11 PyO3 binding (`_RsRobustScaler`) | SHIPPED | `ferrolearn-python/src/extras.rs:1163`, `lib.rs:83` |
+//! | REQ-4 quantile_range ctor param + validation | NOT-STARTED (#1249) | sklearn `_data.py:1567`,`:1604-1606`,`:1630` |
+//! | REQ-5 with_centering / with_scaling ctor params | NOT-STARTED (#1250) | sklearn `_data.py:1672-1675`,`:1616`,`:1640` |
+//! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
+//! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
+//! | REQ-8 `robust_scale` free function + axis | NOT-STARTED (#1253) | sklearn `_data.py:1719` |
+//! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | NOT-STARTED (#1254) | sklearn `_data.py:1601`,`:1614`,`:1630` |
+//! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | NOT-STARTED (#1255) | sklearn `_data.py:1505-1514`,`:1635` |
+//! | REQ-12 copy ctor param + in-place semantics | NOT-STARTED (#1256) | sklearn `_data.py:1568`,`:1661` |
+//! | REQ-13 sparse CSC/CSR support | NOT-STARTED (#1257) | sklearn `_data.py:1609-1612`,`:1668-1670` |
+//! | REQ-14 get_feature_names_out / n_features_in_ | NOT-STARTED (#1258) | sklearn `OneToOneFeatureMixin` |
+//! | REQ-15 ferray substrate | NOT-STARTED (#1259) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -43,7 +69,9 @@ fn quantile_sorted<F: Float>(sorted: &[F], q: f64) -> F {
 /// (IQR = Q75 − Q25) and returns a [`FittedRobustScaler`] that can transform
 /// new data.
 ///
-/// Columns with IQR = 0 are left unchanged after transformation.
+/// A zero-IQR column is centered then divided by an effective scale of 1
+/// (matching scikit-learn `_handle_zeros_in_scale`), so a constant column
+/// maps to 0.
 ///
 /// # Examples
 ///
@@ -159,7 +187,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
 
     /// Transform data by subtracting the median and dividing by the IQR.
     ///
-    /// Columns with IQR = 0 are left unchanged.
+    /// A zero-IQR column uses an effective scale of 1 (matching scikit-learn
+    /// `_handle_zeros_in_scale`, `_data.py:88`, `:1635`, `:1673-1675`), so it is
+    /// still centered: a constant column maps to 0 and a non-constant zero-IQR
+    /// column maps to `x - median`.
     ///
     /// # Errors
     ///
@@ -179,12 +210,14 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
             let med = self.median[j];
             let iqr = self.iqr[j];
-            if iqr == F::zero() {
-                // Zero-IQR column: leave unchanged.
-                continue;
-            }
+            // A zero IQR is replaced by an effective scale of 1, matching sklearn
+            // `_handle_zeros_in_scale` (`_data.py:88`, called at `:1635`). The column
+            // is still centered (`X -= center_`, `:1673`) then divided by the
+            // effective scale (`X /= scale_`, `:1675`), so a constant column maps to 0
+            // and a non-constant zero-IQR column maps to `x - median`.
+            let scale_eff = if iqr == F::zero() { F::one() } else { iqr };
             for v in &mut col {
-                *v = (*v - med) / iqr;
+                *v = (*v - med) / scale_eff;
             }
         }
         Ok(out)
@@ -281,16 +314,22 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_iqr_column_unchanged() {
+    fn test_zero_iqr_column_centered_to_zero() {
+        // A constant (zero-IQR) column is centered then divided by an effective
+        // scale of 1 (sklearn `_handle_zeros_in_scale`), so it maps to 0.
+        //
+        // LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+        //   RobustScaler().fit_transform([[7.,1.],[7.,2.],[7.,3.]]).tolist()
+        //   == [[0.0, -1.0], [0.0, 0.0], [0.0, 1.0]]
         let scaler = RobustScaler::<f64>::new();
         // Column 0 is constant: IQR = 0
         let x = array![[7.0, 1.0], [7.0, 2.0], [7.0, 3.0]];
         let fitted = scaler.fit(&x, &()).unwrap();
         assert_abs_diff_eq!(fitted.iqr()[0], 0.0, epsilon = 1e-15);
         let scaled = fitted.transform(&x).unwrap();
-        // Constant column should remain 7.0
+        // Constant column maps to 0 (centered, effective scale 1).
         for i in 0..3 {
-            assert_abs_diff_eq!(scaled[[i, 0]], 7.0, epsilon = 1e-10);
+            assert_abs_diff_eq!(scaled[[i, 0]], 0.0, epsilon = 1e-10);
         }
     }
 
