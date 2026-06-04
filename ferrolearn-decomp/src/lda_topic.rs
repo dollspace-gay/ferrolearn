@@ -34,6 +34,37 @@
 //! let topics = fitted.transform(&dtm).unwrap();
 //! assert_eq!(topics.dim(), (4, 2));
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/lda_topic.md`. Tracking: #1540. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumer: crate re-export (`lib.rs:91`); there
+//! is NO PyO3 binding. Oracle = live sklearn 1.5.2 (`_lda.py`,
+//! `class LatentDirichletAllocation` — topic model, NOT LDA-discriminant), run from
+//! `/tmp` (R-CHAR-3). ferrolearn is a SIMPLIFIED f64-only variational Bayes
+//! reimplementation; exact component/topic VALUES are a carve-out (Uniform+beta init
+//! vs sklearn Gamma(100,0.01) + numpy RNG).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: `components_` shape `(n_topics,n_words)`, `n_iter_`==max_iter, seed-determinism, digamma accuracy | SHIPPED (scoped) | `fit` stores `components_=lambda` (`:440`), `n_iter_=max_iter` (`:443`, matches sklearn default `evaluate_every=-1` `_lda.py:695`); `digamma` (`:277`) matches scipy.special.psi ~1.17e-10; green-guards + in-module tests. STRUCTURAL, NOT values (REQ-4) |
+//! | REQ-2 | `components_` non-negativity | SHIPPED | M-step adds non-negative suff-stats to non-negative init; `test_lda_components_non_negative` + green-guard |
+//! | REQ-3 | transform doc-topic shape + each row sums to 1 + topic separation + error contracts | SHIPPED (scoped) | `transform` normalizes gamma rows (`:642-654` = sklearn `_lda.py:745`); fit/transform guards. FLAG: sklearn raises `ValueError`, defaults n_components=10, doesn't pre-reject 0 words |
+//! | REQ-4 | EXACT `components_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Uniform+beta/Xoshiro init vs Gamma(100,0.01)/numpy RandomState VI (`_lda.py:419-421`) — blocker #1541 |
+//! | REQ-5 | transform doc-topic VALUE parity | NOT-STARTED | CARVE-OUT, folds into REQ-4 (downstream of components_, no injectable API) — blocker #1542 |
+//! | REQ-6 | Gamma(100,0.01) init (components + per-doc gamma) | NOT-STARTED | sklearn `_lda.py:96-99,:419-421` — blocker #1543 |
+//! | REQ-7 | `exp_dirichlet_component_` representation/attr | NOT-STARTED | sklearn `_lda.py:424`; ferrolearn log-space on the fly — blocker #1544 |
+//! | REQ-8 | `perplexity`/`score`/`_approx_bound` | NOT-STARTED | sklearn `_lda.py:748,:827,:896` — blocker #1545 |
+//! | REQ-9 | `evaluate_every`/`perp_tol` perplexity early stop | NOT-STARTED | sklearn `_lda.py:676-691`; ferrolearn fixed max_iter loop — blocker #1546 |
+//! | REQ-10 | `batch_size`/`total_samples` online mini-batching | NOT-STARTED | sklearn `_lda.py:662,:535-538`; ferrolearn batch-of-1 — blocker #1547 |
+//! | REQ-11 | fitted attrs `n_features_in_`/`bound_` | NOT-STARTED | sklearn `_lda.py:701-703` — blocker #1548 |
+//! | REQ-12 | `n_jobs`/`verbose` | NOT-STARTED | sklearn `_lda.py:378-379` — blocker #1549 |
+//! | REQ-13 | generic `F` (f32+f64) | NOT-STARTED | f64-only — blocker #1550 |
+//! | REQ-14 | PyO3 binding | NOT-STARTED | absent; only consumer re-export `lib.rs:91` — blocker #1551 |
+//! | REQ-15 | ferray substrate | NOT-STARTED | `ndarray`+`rand`+hand-rolled digamma — blocker #1552 |
+//!
+//! Count: **3 SHIPPED (REQ-1,2,3) / 12 NOT-STARTED (REQ-4..15)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
