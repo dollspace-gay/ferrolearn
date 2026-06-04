@@ -952,3 +952,13 @@ crate_pattern = "ferrolearn-datasets/src/toy.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/datasets/_base.py"]
 design = ".design/datasets/toy.md"
 parity_ops = ["load_iris", "load_wine", "load_breast_cancer", "load_diabetes", "load_digits", "load_linnerud"]
+
+# =====================================================================
+# Layer 2 — ferrolearn-kernel (kernel_ridge + kernel_approximation)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/kernel_ridge.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/kernel_ridge.py"]
+design = ".design/kernel/kernel_ridge.md"
+parity_ops = ["KernelRidge"]
