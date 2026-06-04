@@ -176,7 +176,6 @@ fn divergence_shuffle_split_size_round_vs_ceil_n10() {
 ///   .split(X, y)` total test size == 3.
 /// The per-class MEMBERSHIP is an RNG carve-out; the TOTAL SIZE is deterministic.
 #[test]
-#[ignore = "divergence: StratifiedShuffleSplit per-class round() not global ceil(); tracking #1744"]
 fn divergence_stratified_shuffle_split_total_size() {
     const SKLEARN_TOTAL_TEST_SIZE: usize = 3; // live StratifiedShuffleSplit(test_size=0.3) total |test|
     let y = array![0usize, 0, 0, 0, 1, 1, 1, 1];

@@ -264,19 +264,35 @@ impl StratifiedShuffleSplit {
             }
         }
 
+        // Sort classes ascending so the per-class allocation is deterministic
+        // (sklearn iterates classes in `np.unique` sorted order, `_split.py:2247`).
+        let mut classes: Vec<usize> = by_class.keys().copied().collect();
+        classes.sort_unstable();
+        let class_counts: Vec<usize> = classes.iter().map(|c| by_class[c].len()).collect();
+
+        // GLOBAL test count, matching sklearn `_validate_shuffle_split`
+        // (`sklearn/model_selection/_split.py:2390`): `n_test = ceil(test_size * n)`.
+        // Then keep at least one test and one train sample overall.
+        let n_test = ((n as f64) * self.test_size).ceil().max(1.0) as usize;
+        let n_test = n_test.min(n - 1);
+
         let mut folds = Vec::with_capacity(self.n_splits);
         for split in 0..self.n_splits {
             let mut rng = match self.random_state {
                 Some(seed) => SmallRng::seed_from_u64(seed.wrapping_add(split as u64)),
                 None => SmallRng::from_os_rng(),
             };
+            // Distribute the global `n_test` across classes via `_approximate_mode`
+            // (port of `sklearn/utils/extmath.py:1322`): per-class counts sum to
+            // exactly `n_test`. RNG breaks ties on equal fractional remainder.
+            let per_class_test = approximate_mode(&class_counts, n_test, &mut rng);
+
             let mut test = Vec::new();
             let mut train = Vec::new();
-            for samples in by_class.values() {
-                let mut idx = samples.clone();
+            for (ci, &cls) in classes.iter().enumerate() {
+                let mut idx = by_class[&cls].clone();
                 idx.shuffle(&mut rng);
-                let n_class_test = ((idx.len() as f64) * self.test_size).round().max(1.0) as usize;
-                let n_class_test = n_class_test.min(idx.len() - 1);
+                let n_class_test = per_class_test[ci].min(idx.len());
                 test.extend_from_slice(&idx[..n_class_test]);
                 train.extend_from_slice(&idx[n_class_test..]);
             }
@@ -286,6 +302,60 @@ impl StratifiedShuffleSplit {
         }
         Ok(folds)
     }
+}
+
+/// Approximate mode of a multivariate hypergeometric — a port of
+/// `sklearn/utils/extmath.py::_approximate_mode` (`:1322`).
+///
+/// Distributes `n_draws` draws across classes whose populations are
+/// `class_counts`, returning per-class draw counts that sum to EXACTLY
+/// `n_draws`. Each class gets `floor(class_count / total * n_draws)`, then the
+/// `n_draws - sum(floored)` leftover draws are handed to the classes with the
+/// largest fractional remainder, descending. Ties on equal remainder are broken
+/// by random choice among the tied classes using `rng` (matching sklearn's
+/// `rng.choice`); the TOTAL is unaffected by the tie-break.
+fn approximate_mode(class_counts: &[usize], n_draws: usize, rng: &mut SmallRng) -> Vec<usize> {
+    let total: usize = class_counts.iter().sum();
+    if total == 0 || n_draws == 0 {
+        return vec![0; class_counts.len()];
+    }
+    let continuous: Vec<f64> = class_counts
+        .iter()
+        .map(|&c| (c as f64) / (total as f64) * (n_draws as f64))
+        .collect();
+    let mut floored: Vec<usize> = continuous.iter().map(|&v| v.floor() as usize).collect();
+    let floored_sum: usize = floored.iter().sum();
+    let mut need_to_add = n_draws.saturating_sub(floored_sum);
+    if need_to_add > 0 {
+        let remainder: Vec<f64> = continuous
+            .iter()
+            .zip(&floored)
+            .map(|(&c, &f)| c - (f as f64))
+            .collect();
+        // Distinct remainder values, descending.
+        let mut values: Vec<f64> = remainder.clone();
+        values.sort_unstable_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        values.dedup();
+        for value in values {
+            if need_to_add == 0 {
+                break;
+            }
+            let mut inds: Vec<usize> = remainder
+                .iter()
+                .enumerate()
+                .filter(|&(_, &r)| r == value)
+                .map(|(i, _)| i)
+                .collect();
+            let add_now = inds.len().min(need_to_add);
+            // Break ties randomly among classes with equal remainder.
+            inds.shuffle(rng);
+            for &i in inds.iter().take(add_now) {
+                floored[i] += 1;
+            }
+            need_to_add -= add_now;
+        }
+    }
+    floored
 }
 
 /// Repeated K-Fold cross-validator.
