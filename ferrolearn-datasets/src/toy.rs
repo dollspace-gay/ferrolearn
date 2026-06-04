@@ -4,6 +4,29 @@
 //! use with ferrolearn estimators. Classification datasets return
 //! `(Array2<F>, Array1<usize>)`, regression datasets return
 //! `(Array2<F>, Array1<F>)`.
+//!
+//! Mirrors scikit-learn's bundled toy loaders in `sklearn/datasets/_base.py`
+//! (tag 1.5.2). The embedded data files in `ferrolearn-datasets/data/` are
+//! byte-identical copies of `sklearn/datasets/data/` (the `.csv.gz` originals
+//! decompressed). ferrolearn returns bare `(X, y)` tuples — equivalent to
+//! sklearn's `return_X_y=True`; the full `Bunch` is a NOT-STARTED REQ.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | `load_iris` value parity | SHIPPED | `fn load_iris` parses embedded `data/iris.csv`; `guard_iris_oracle_parity` (`X[0]`/`X[149]`/counts vs live oracle) |
+//! | REQ-2 | `load_linnerud` multi-output parity | SHIPPED | `fn load_linnerud` embedded consts; `guard_linnerud_full_oracle_parity` (all 20×3 X+y vs oracle) |
+//! | REQ-3 | `load_wine` value parity | SHIPPED | `fn load_wine` parses embedded `data/wine_data.csv` (sklearn `_base.py:496`); `divergence_wine_x0` (byte-identical data, full-matrix re-audit) |
+//! | REQ-4 | `load_breast_cancer` value parity | SHIPPED | `fn load_breast_cancer` parses `data/breast_cancer.csv` (`:750`); `divergence_breast_cancer_x0` (y 0=malignant/1=benign, not inverted) |
+//! | REQ-5 | `load_diabetes` scaled=True parity | SHIPPED | `fn scale_diabetes_columns` = `(x-mean)/std_pop/sqrt(442)` (sklearn `_base.py:1132-1134`); `divergence_diabetes_x0_y` (full-matrix ≤1e-7, raw integer y) |
+//! | REQ-6 | `load_digits` full real data parity | SHIPPED | `fn load_digits` parses `data/digits.csv` full `(1797, 64)` not truncated (`:907`); `divergence_digits_shape_and_x0` (pixels 0..=16) |
+//! | REQ-7 | `Bunch` contract + loader params (`return_X_y`/`as_frame`, `load_digits` `n_class`) | NOT-STARTED | returns bare `(X, y)` tuples; no `feature_names`/`target_names`/`DESCR`/`frame`; `n_class` not exposed — blocker #1657 |
+//! | REQ-8 | `load_olivetti_faces` real dataset | NOT-STARTED | synthetic stub; sklearn's is `fetch_olivetti_faces` (network, `_olivetti_faces.py`), not a `_base.py` toy loader — blocker #1658 |
+//! | REQ-9 | ferray substrate | NOT-STARTED | on `ndarray` + `rand_xoshiro`, not `ferray-core` — blocker #1659 |
+//! | REQ-10 | non-test production consumer | NOT-STARTED | only crate-root re-export (`lib.rs`); no internal / `ferrolearn-python` consumer — blocker #1660 |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
