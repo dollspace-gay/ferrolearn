@@ -934,6 +934,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/neural_network/_rbm.py"]
 design = ".design/neural/rbm.md"
 parity_ops = ["BernoulliRBM"]
 
+[[route]]
+crate_pattern = "ferrolearn-neural/src/mlp.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neural_network/_multilayer_perceptron.py"]
+design = ".design/neural/mlp.md"
+parity_ops = ["MLPClassifier", "MLPRegressor"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-datasets (datasets)
 # =====================================================================
