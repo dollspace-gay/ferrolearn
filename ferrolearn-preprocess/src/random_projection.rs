@@ -4,6 +4,31 @@
 //!
 //! - [`GaussianRandomProjection`] — dense Gaussian random matrix
 //! - [`SparseRandomProjection`] — sparse random matrix with `{-1, 0, +1}` entries
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `GaussianRandomProjection` +
+//! `SparseRandomProjection` (`sklearn/random_projection.py`). Tracking: #1387.
+//! Each REQ is BINARY — SHIPPED (impl + non-test consumer + tests + green
+//! verification) or NOT-STARTED (with a concrete open blocker). RNG-COUPLED
+//! unit: ferrolearn uses Rust `SmallRng`, sklearn numpy `RandomState`, so exact
+//! projection-matrix VALUE parity is impossible (carve-out); the SHIPPED claims
+//! are the projection DISTRIBUTION/scale (vs the sklearn formula) + transform
+//! contract + determinism, not bit-exact matrix values.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Gaussian projection DISTRIBUTION `N(0, 1/n_components)` + transform `X@R` + determinism-given-seed | SHIPPED | [`GaussianRandomProjection`] `fit` scale `1/sqrt(n_components)` matches sklearn `_gaussian_random_matrix` `random_projection.py:200`; empirical variance ≈ 1/k guard + determinism + transform tests in `tests/divergence_random_projection.rs`. Consumer: re-export `lib.rs:167` + `PipelineTransformer` |
+//! | REQ-2 | Sparse projection DISTRIBUTION (support `±sqrt(1/(d·n_components))`, probs `{d/2, 1-d, d/2}`, default density `1/sqrt(n_features)`, `density=1` case) + transform | SHIPPED | [`SparseRandomProjection`] `fit` scale/support/probs match sklearn `_sparse_random_matrix` `:301` + `_check_density` `:148-149`; nonzero-entry == ±scale (exact, tol 1e-12) + default-density + density=1 tests |
+//! | REQ-3 | Error/parameter contracts (n_components==0, density∉(0,1], zero rows, transform ncols, unfitted) | SHIPPED (scoped) | both `fit`/`Fitted*` `transform`; in-module + divergence error tests |
+//! | REQ-4 | Exact projection-matrix VALUE parity (numpy `RandomState` stream) | NOT-STARTED | RNG-coupled CARVE-OUT (Rust `SmallRng` ≠ numpy MT19937), no committed failing test — blocker #1388 |
+//! | REQ-5 | Sparse sampling METHOD (per-row `binomial` + `sample_without_replacement` vs per-entry Bernoulli) | NOT-STARTED | sklearn `random_projection.py:281-301` — blocker #1389 |
+//! | REQ-6 | `n_components='auto'` + `eps` + `johnson_lindenstrauss_min_dim` | NOT-STARTED | explicit `n_components` only; sklearn `random_projection.py:64,388-390` — blocker #1390 |
+//! | REQ-7 | `components_` CSR sparse storage + `(n_components, n_features)` orientation + `dense_output` | NOT-STARTED | dense `(n_features, n_components)`; sklearn `:294-301,810` — blocker #1391 |
+//! | REQ-8 | `inverse_transform` + `compute_inverse_components` | NOT-STARTED | sklearn `random_projection.py:356,431-458` — blocker #1392 |
+//! | REQ-9 | `n_components > n_features` warning + `components_`/`n_components_`/`n_features_in_`/`density_` attrs + `get_feature_names_out` | NOT-STARTED | sklearn `random_projection.py:407-414` — blocker #1393 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1394 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1395 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
