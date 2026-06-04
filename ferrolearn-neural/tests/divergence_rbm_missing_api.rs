@@ -25,6 +25,7 @@ fn known_fitted() -> FittedBernoulliRBM<f64> {
         components_,
         intercept_hidden_,
         intercept_visible_,
+        h_samples_: Array2::zeros((0, 2)),
         n_iter_: 0,
     }
 }

@@ -923,3 +923,13 @@ crate_pattern = "ferrolearn-decomp/src/spectral_embedding.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/manifold/_spectral_embedding.py"]
 design = ".design/decomp/spectral_embedding.md"
 parity_ops = ["SpectralEmbedding"]
+
+# =====================================================================
+# Layer 2 — ferrolearn-neural (neural_network)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-neural/src/rbm.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neural_network/_rbm.py"]
+design = ".design/neural/rbm.md"
+parity_ops = ["BernoulliRBM"]
