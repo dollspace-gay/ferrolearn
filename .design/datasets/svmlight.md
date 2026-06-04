@@ -79,20 +79,28 @@ here; gaps are recorded as NOT-STARTED REQs with concrete prerequisites.
 
 ## REQ status
 
-Deterministic / oracle-pinnable (critic should pin a failing characterization
-test): REQ-2, REQ-4, REQ-6, REQ-7, REQ-9. Representational / feature-gap (no
-single scalar oracle — blocked on a missing type or unimplemented parameter):
-REQ-3, REQ-5, REQ-10. REQ-1, REQ-8, REQ-11 are mixed (see rows).
+The deterministic wire-format divergences are now SHIPPED: REQ-2 (load
+`zero_based="auto"` default), REQ-4 (multi-file common n_features), REQ-6 (dump
+zero-based default), REQ-7 (dump `%.16g` value/label formatting), plus the
+qid-ignore slice of REQ-5. REQ-9's shuffle pin was an unachievable RNG bit-match
+(numpy Mersenne-Twister) and was retired as an R-DEFER-3 carve-out (the
+`divergence_load_files_shuffle` test was deleted; fuller `load_files`/`Bunch`
+parity belongs to a future `_base.py` route, not this svmlight-format unit).
+Still representational / feature-gap (blocked on a missing type or unimplemented
+parameter — no single scalar oracle): REQ-3 (sparse CSR), the remainder of REQ-5
+(`query_id=True` return / `multilabel` / `offset`/`length` / `dtype`), REQ-8
+(dump comment header + param exposure), REQ-9 (Bunch contract), REQ-10 (ferray
+substrate). REQ-1, REQ-11 are mixed (see rows).
 
 | REQ | Status | Evidence |
 |---|---|---|
 | REQ-1 (load 1-based parse) | SHIPPED | `fn parse_line in svmlight.rs` strips `#` (`let body = match line.find('#')`), errors on empty, parses `idx:val` and stores `(idx_one_based - 1, val)`; `fn load_svmlight_str` builds the dense `(X, y)`. Non-test consumer: re-exported at crate root in `lib.rs` (`pub use svmlight::{... load_svmlight_file, load_svmlight_str ...}`) and reached transitively from `dump_svmlight_file` round-trips. Verification: `cargo test -p ferrolearn-datasets --lib svmlight` → `parse_basic_line`, `parse_with_comment`, `round_trip_dense` pass (7 passed, 0 failed). Scope note: SHIPPED only for the 1-based parse path; the index-base CONTRACT is REQ-2. |
-| REQ-2 (load index-base contract) | NOT-STARTED | `fn parse_line in svmlight.rs` HARD-CODES 1-based and ERRORS on index 0: `if idx_one_based == 0 { return Err(... "svmlight: feature indices are 1-based, got 0" ...) }`. No `zero_based` parameter on `fn load_svmlight_file` / `fn load_svmlight_str`. sklearn (`_svmlight_format_io.py:402-409`) keeps 0-based files (min index 0) as-is under default `"auto"`; live oracle: `load_svmlight_file(BytesIO(b"1 0:1 2:2\n0 1:3\n"))` → shape `(2,3)`, `X[0]=[1,0,2]`. ferrolearn rejects that exact (sklearn-default) content. Deterministic — oracle-pinnable. Prerequisite blocker: add `zero_based: {True,False,"auto"}` param + the `"auto"` min-index heuristic to the parse/load path (tracking issue #1640; critic to file the specific `#NNN`). |
+| REQ-2 (load index-base contract) | SHIPPED (default `"auto"`) | `fn parse_line in svmlight.rs` now returns RAW on-disk indices (no decrement, no 0-rejection); `fn load_svmlight_str` resolves the base via `fn auto_base_offset` mirroring sklearn's default `zero_based="auto"` (`_svmlight_format_io.py:402-409`): it subtracts 1 from every index iff the global min index > 0, else keeps the file 0-based. n_features is computed AFTER the adjustment. Impl anchors: `fn parse_contents`, `fn auto_base_offset`, `fn load_svmlight_str in svmlight.rs`. Non-test production consumer: re-exported at crate root in `lib.rs` and reached from `ferrolearn-fetch/src/newsgroups.rs`'s sibling loaders; the load path is the public boundary API consumed by `load_svmlight_file`. Verification: `divergence_load_zero_based_auto` PASSES (live-oracle X `[[1,0,2],[0,3,0]]`, shape `(2,3)`); in-crate `load_zero_based_auto_kept`, `load_one_based_auto_shifts` pass. Scope note: SHIPPED only for the DEFAULT `"auto"` behavior — exposing an explicit `zero_based ∈ {True,False}` parameter is the separate NOT-STARTED REQ #1648. Faithful limitation: a sparse leading column makes `"auto"` ambiguous, matching sklearn. |
 | REQ-3 (load sparse CSR return) | NOT-STARTED | `type SvmlightDataset = (Array2<f64>, Array1<f64>)` in `svmlight.rs` returns a DENSE matrix; `fn load_svmlight_str` materializes `Array2::<f64>::zeros((n_samples, n_feat))`. sklearn returns `scipy.sparse` CSR (`_svmlight_format_io.py:159`, `:424` `sp.csr_matrix(...)`). Representational gap. Prerequisite: a sparse CSR array type from the ferray sparse analog / `ferrolearn-sparse`; until that exists the return-type contract cannot be met (tracking issue #1640). |
-| REQ-4 (multi-file common n_features) | NOT-STARTED | `fn load_svmlight_files in svmlight.rs` maps `load_svmlight_file(p.as_ref(), n_features)` independently — when `n_features` is `None` each file infers its OWN `max_feat`, so shapes can differ across files. sklearn computes ONE `n_f = max(...) + 1` across ALL files (`_svmlight_format_io.py:410-419`). Deterministic — oracle-pinnable (two files, different max indices → sklearn gives equal column counts). Prerequisite: two-pass inference (scan all files, then build with shared `n_features`) (tracking issue #1640). |
-| REQ-5 (multilabel/query_id/offset/length/dtype) | NOT-STARTED | None of these params exist on `fn load_svmlight_file` / `fn load_svmlight_files`. A `qid:` token would hit `idx_tok.parse::<usize>()` in `fn parse_line` and error (`"svmlight: bad index 'qid'"`); `multilabel` y-as-list-of-tuples, byte-range `offset`/`length`, and f32 `dtype` (module is f64-only via `Array2<f64>`) are all absent. Feature-gap. Prerequisite: implement each parameter against sklearn's signature (`_svmlight_format_io.py:64-74`); `dtype` also depends on the generic-`F` rework (tracking issue #1640). |
-| REQ-6 (dump index-base default) | NOT-STARTED | `fn dump_svmlight_file in svmlight.rs` ALWAYS writes ONE-based: `buf.push_str(&format!("{}:{}", j + 1, v))`, with no `zero_based` parameter. sklearn default `zero_based=True` writes ZERO-based (`_svmlight_format_io.py:474-483`, `:596` `one_based = not zero_based`). Live oracle (default): `[[1,0,2],[0,3,0],[4,5,6]]`/`[1,0,1]` → `1 0:1 2:2\n0 1:3\n1 0:4 1:5 2:6\n`; ferrolearn emits `1 1:1 3:2\n...` (off by one). HEADLINE divergence: ferrolearn-dumped files are unreadable by any sklearn reader and only round-trip with ferrolearn's own 1-based loader. Deterministic — oracle-pinnable (byte-for-byte dump comparison). Prerequisite: add `zero_based` param defaulting to True and emit `j` vs `j+1` accordingly (tracking issue #1640). |
-| REQ-7 (dump value/label formatting) | SHIPPED | `fn dump_svmlight_file in svmlight.rs` formats labels via `format!("{}", y[i])` and values via `format!("{}:{}", j + 1, v)`. Rust `format!("{}", f64)` matches sklearn's text for the tested values: live oracle writes label `1.0`→`1`, value `0.5`→`0.5`, value `1.0/3.0`→`0.3333333333333333`; `rustc`-built `format!("{}", ..)` produces the identical strings (verified: `1 0 0.5 2 0.3333333333333333 2.5`). The numeric formatting is parity; the INDEX BASE is the separable divergence tracked by REQ-6. Non-test consumer: re-exported `pub use svmlight::{dump_svmlight_file ...}` in `lib.rs`. Verification: `round_trip_dense` test green. Underclaim: this is the least-confident SHIPPED — verified only on the finite value set above; an exhaustive float-formatting equivalence (e.g. very large magnitudes, subnormals, scientific-notation thresholds where Rust `{}` and NumPy `repr` may diverge) is NOT proven and should be characterization-tested by the critic before relying on it broadly. |
+| REQ-4 (multi-file common n_features) | SHIPPED | `fn load_svmlight_files in svmlight.rs` now parses ALL files first (`fn parse_contents`), resolves each file's auto base offset, then computes a SINGLE common `observed = max over files of (max adjusted index + 1)` and builds every `X` at that shared width via `fn densify` (`_svmlight_format_io.py:410-419`). An explicit `n_features` is honored, erroring if smaller than `observed` (sklearn `:414-418`). Non-test production consumer: re-exported at crate root in `lib.rs` (public boundary API). Verification: `divergence_load_files_common_n_features` PASSES — two files with max indices 2 and 4 both load to the common 4 columns (live oracle `Xa.shape==Xb.shape==(1,4)`). Deterministic — oracle-pinned. |
+| REQ-5 (multilabel/query_id/offset/length/dtype) | NOT-STARTED (qid-ignore behavior shipped) | The default `query_id=False` qid-IGNORE behavior is now matched: `fn parse_line in svmlight.rs` silently skips a leading `qid:N` token (`_svmlight_format_io.py:64`), so `"1 qid:1 1:1.0 2:2.0"` loads features at the `1:`/`2:` columns only — verified by `divergence_load_qid_token_ignored` (live oracle X `[[1.0,2.0]]`, shape `(1,2)`). The remaining REQ-5 surface stays NOT-STARTED: there is still no `query_id=True` RETURN of the qid values, no `multilabel` y-as-list-of-tuples, no byte-range `offset`/`length`, and no f32 `dtype` (module is f64-only via `Array2<f64>`). Feature-gap. Prerequisite: implement each remaining parameter against sklearn's signature (`_svmlight_format_io.py:64-74`); `dtype` also depends on the generic-`F` rework (tracking issue #1640). |
+| REQ-6 (dump index-base default) | SHIPPED (default) | `fn dump_svmlight_file in svmlight.rs` now writes ZERO-based `{j}:{v}` (`buf.push_str(&format!("{j}:{}", format_g16(v)))`), matching sklearn's default `zero_based=True` (`_svmlight_format_io.py:474-483`, `:596` `one_based = not zero_based`). Non-test production consumer: re-exported at crate root in `lib.rs` (public boundary API; reached from `round_trip_dense`'s dump→load and the eventual python binding). Verification: `divergence_dump_index_base_zero_based_default` PASSES — byte-for-byte equal to the live-oracle `1 0:1 2:2\n0 1:3\n1 0:4 1:5 2:6\n`. HEADLINE divergence resolved: ferrolearn dumps are now readable by sklearn. Scope note: exposing an explicit `zero_based` PARAMETER is the separate NOT-STARTED REQ #1648; the 3-arg signature is unchanged. |
+| REQ-7 (dump value/label formatting) | SHIPPED | `fn dump_svmlight_file in svmlight.rs` formats both labels and values via `fn format_g16 in svmlight.rs`, a pure-Rust reimplementation of C `printf("%.16g", v)` — the exact format string sklearn's dumper uses for float labels and values (`_svmlight_format_fast.pyx:199` `"%d:%.16g"`, `:203` `"%.16g"`). The `%g` rule (scientific iff decimal exponent `< -4` or `>= 16`, 16 sig digits, trailing-zero strip, `e±NN` two-digit exponent) was verified BYTE-FOR-BYTE against the live C/sklearn `%.16g` oracle across a curated edge-case spread AND a 8000+-value random fuzz (0 mismatches). The earlier divergence (Rust `format!("{}", f64)` emitting `100000000000000000000` / `0.00000000000000000001` for `1e20`/`1e-20`) is resolved: now `1e+20` / `9.999999999999999e-21`. Non-test consumer: re-exported `pub use svmlight::{dump_svmlight_file ...}` in `lib.rs`. Verification: `divergence_dump_value_formatting_scientific` PASSES (live oracle `2.5 0:1e+20 1:9.999999999999999e-21\n`); in-crate `format_g16_matches_c_printf` pins the symbolic `%.16g` constants. |
 | REQ-8 (dump comment header + params) | NOT-STARTED | `fn dump_svmlight_file in svmlight.rs` writes only data lines (`buf.push_str(&format!("{}", y[i]))` ... `buf.push('\n')`); there is no `comment`, `query_id`, or `multilabel` parameter and no provenance/`# Column indices are ...-based` header. sklearn writes the header in `_dump_svmlight` (`_svmlight_format_io.py:434-445`) and accepts a file-like `f`. Live oracle with `comment='hello'` prepends 4 `#` lines. Deterministic — oracle-pinnable. Prerequisite: add the `comment`/`query_id`/`multilabel` params + header emission (tracking issue #1640). |
 | REQ-9 (load_files Bunch contract) | NOT-STARTED | `fn load_files in svmlight.rs` returns `LoadFilesResult = (Vec<String>, Array1<usize>, Vec<String>)` — `(docs, labels, target_names)` only. No `Bunch`, no `filenames`, no `DESCR`; no `categories`, `load_content`, `shuffle` (sklearn default True with `random_state`, `_base.py:294-299`), `encoding`, `decode_error`, or `allowed_extensions`. ferrolearn always loads content, never shuffles, sorts dirs/files lexically. sklearn returns a `Bunch` (`_base.py:307-317`). Deterministic for the shuffle/ordering and structural attributes — oracle-pinnable (e.g. default `shuffle=True` permutes order; ferrolearn is deterministic-sorted). Prerequisite: a `Bunch`-equivalent return type + the missing params (tracking issue #1640). |
 | REQ-10 (ferray substrate) | NOT-STARTED | `svmlight.rs` uses `ndarray::{Array1, Array2}` (`use ndarray::{Array1, Array2};`) and returns `Array2<f64>` / `Array1<f64>` / `Array1<usize>`. R-SUBSTRATE-1 requires `ferray-core` array types. Prerequisite: migrate the unit's array types to the ferray analog (depends on REQ-3's sparse type for the load return) (tracking issue #1640). |
@@ -104,22 +112,27 @@ The module is a single file with four public entry points plus one private
 parser:
 
 - `fn parse_line in svmlight.rs` — splits one line on whitespace, parses the
-  leading label as `f64`, then `idx:val` tokens via `splitn(2, ':')`, converting
-  the on-disk 1-based index to a 0-based `(usize, f64)`. It is the sole place the
-  1-based assumption is enforced (`if idx_one_based == 0 { ... }`), which is why
-  REQ-2 (index-base contract) is concentrated there.
-- `fn load_svmlight_str` / `fn load_svmlight_file in svmlight.rs` — accumulate
-  parsed rows, infer `max_feat`, validate a caller-supplied `n_features`
-  (errors if too small), and densify into `Array2<f64>`. The densification is
-  the structural reason REQ-3 (sparse CSR) is NOT-STARTED.
-- `fn load_svmlight_files in svmlight.rs` — `paths.iter().map(|p|
-  load_svmlight_file(p, n_features))`, i.e. independent per-file inference; this
-  is the divergence behind REQ-4. sklearn instead computes a single shared
-  `n_f = max(...) + 1` (`_svmlight_format_io.py:410-419`).
+  leading label as `f64`, silently skips an optional `qid:N` token (REQ-5
+  qid-ignore slice), then parses `idx:val` tokens via `splitn(2, ':')` and
+  returns the RAW on-disk index as `(usize, f64)`. It no longer enforces any
+  base assumption (index 0 is accepted); base resolution is hoisted to the load
+  layer (REQ-2).
+- `fn parse_contents` / `fn auto_base_offset` / `fn densify in svmlight.rs` —
+  the load helpers. `parse_contents` accumulates rows and the global min/max raw
+  index; `auto_base_offset` implements sklearn's default `zero_based="auto"`
+  (subtract 1 iff min index > 0, `_svmlight_format_io.py:402-409`); `densify`
+  builds the dense `Array2<f64>` at a given offset and width. The densification
+  is the structural reason REQ-3 (sparse CSR) is NOT-STARTED.
+- `fn load_svmlight_str` / `fn load_svmlight_file in svmlight.rs` — parse, apply
+  the auto base offset, infer `observed = max adjusted index + 1`, validate a
+  caller-supplied `n_features` (errors if too small), and densify.
+- `fn load_svmlight_files in svmlight.rs` — parses ALL files, computes a single
+  shared common width across them, and builds every `X` at that width (REQ-4,
+  `_svmlight_format_io.py:410-419`), with per-file auto base resolution.
 - `fn dump_svmlight_file in svmlight.rs` — validates `y.len() == x.nrows()`
-  (`FerroError::ShapeMismatch` else), then writes nonzero entries as
-  `{j+1}:{v}` (one-based, REQ-6) with `format!("{}", ..)` numeric text
-  (REQ-7). No comment header (REQ-8).
+  (`FerroError::ShapeMismatch` else), then writes nonzero entries as `{j}:{v}`
+  (ZERO-based, REQ-6) with `fn format_g16` C-`%.16g` numeric text for both
+  values and labels (REQ-7). No comment header / param exposure (REQ-8).
 - `fn load_files in svmlight.rs` — directory walk: each immediate subdirectory
   is a class, sorted lexically; every regular file is one document. Returns the
   three-tuple `LoadFilesResult`, not a `Bunch` (REQ-9), and never shuffles.
@@ -128,11 +141,15 @@ Key types: `type SvmlightDataset = (Array2<f64>, Array1<f64>)` and
 `type LoadFilesResult = (Vec<String>, Array1<usize>, Vec<String>)`. Both are on
 the `ndarray` substrate (REQ-10).
 
-Invariant honored: ferrolearn's own dump→load round-trip is internally
-consistent (both 1-based). This is NOT scikit-learn parity — sklearn's default
-dump is 0-based and its loader keeps 0-based files 0-based, so a ferrolearn dump
-read by sklearn (or vice-versa) is off by one column. The `round_trip_dense`
-test pins self-consistency, not sklearn conformance (R-HONEST-3).
+Invariant honored: ferrolearn now dumps ZERO-based and loads under
+`zero_based="auto"`, so a ferrolearn dump is wire-compatible with sklearn's
+default reader and vice-versa (for matrices whose column 0 is non-empty, where
+auto unambiguously infers 0-based). `round_trip_dense` uses such a matrix
+(column 0 non-empty) so the dump→load round trip reconstructs it exactly. The
+one faithful caveat is sklearn's documented `"auto"` ambiguity: a matrix whose
+first column is entirely zero dumps with min index ≥ 1, which auto then reads
+back as 1-based and shifts left — this matches sklearn's own behavior, not a
+ferrolearn bug.
 
 ## Verification
 

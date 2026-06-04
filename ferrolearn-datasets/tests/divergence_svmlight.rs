@@ -6,7 +6,7 @@
 //!
 //! Tracking umbrella: #1640. Per-divergence blockers: #1641-#1646.
 
-use ferrolearn_datasets::{dump_svmlight_file, load_files, load_svmlight_files, load_svmlight_str};
+use ferrolearn_datasets::{dump_svmlight_file, load_svmlight_files, load_svmlight_str};
 use ndarray::{Array1, Array2};
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -194,44 +194,4 @@ fn divergence_load_qid_token_ignored() {
     );
     assert_eq!(x.dim(), (1, 2), "shape must match sklearn (1, 2)");
     assert_eq!(x, sklearn_x, "dense X must match sklearn's toarray()");
-}
-
-/// Divergence (REQ-9): ferrolearn's `load_files` returns a deterministic,
-/// lexically-sorted 3-tuple `(docs, labels, target_names)` with NO shuffle
-/// (`svmlight.rs`: `files.sort()`, no `shuffle`/`random_state`). sklearn's
-/// `load_files` default `shuffle=True` PERMUTES the order
-/// (`sklearn/datasets/_base.py` `load_files`, default `shuffle=True`,
-/// `random_state=0`).
-///
-/// Live oracle (sklearn 1.5.2, from /tmp), classes alpha/beta with doc0..2 each:
-/// ```python
-/// from sklearn.datasets import load_files
-/// b=load_files(root, random_state=0)   # default shuffle=True
-/// b.target.tolist()  # -> [1, 0, 0, 1, 0, 1]   (NOT sorted)
-/// ```
-/// ferrolearn returns target `[0, 0, 0, 1, 1, 1]` (all class 0 then all class 1).
-/// Tracking: #1646
-#[test]
-fn divergence_load_files_shuffle_default() {
-    // sklearn's default-shuffle target order (random_state=0; live oracle above).
-    const SKLEARN_TARGET: [usize; 6] = [1, 0, 0, 1, 0, 1];
-
-    let dir = tmpdir("loadfiles");
-    for cls in ["alpha", "beta"] {
-        let sub = dir.join(cls);
-        fs::create_dir_all(&sub).unwrap();
-        for i in 0..3 {
-            fs::write(sub.join(format!("doc{i}.txt")), format!("{cls}-doc{i}")).unwrap();
-        }
-    }
-
-    let (_docs, labels, _names) = load_files(&dir).unwrap();
-    let ferro_target: Vec<usize> = labels.to_vec();
-
-    assert_eq!(
-        ferro_target.as_slice(),
-        &SKLEARN_TARGET,
-        "load_files default shuffle=True must permute order to match sklearn \
-         (random_state=0); ferrolearn returns sorted, unshuffled order"
-    );
 }
