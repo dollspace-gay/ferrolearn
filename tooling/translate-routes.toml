@@ -984,3 +984,9 @@ crate_pattern = "ferrolearn-model-sel/src/transformed_target.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/compose/_target.py"]
 design = ".design/model-sel/transformed_target.md"
 parity_ops = ["TransformedTargetRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/dummy.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/dummy.py"]
+design = ".design/model-sel/dummy.md"
+parity_ops = ["DummyClassifier", "DummyRegressor"]
