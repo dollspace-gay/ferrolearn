@@ -1183,15 +1183,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinCovDet<F> {
                 cov[[i, i]] = cov[[i, i]] + reg;
             }
 
-            if let Ok(ld) = log_det_spd(&cov) {
-                if ld < best_log_det {
-                    best_log_det = ld;
-                    best_location = loc;
-                    best_cov = cov;
-                    best_support = vec![false; n];
-                    for &idx in &subset {
-                        best_support[idx] = true;
-                    }
+            if let Ok(ld) = log_det_spd(&cov)
+                && ld < best_log_det
+            {
+                best_log_det = ld;
+                best_location = loc;
+                best_cov = cov;
+                best_support = vec![false; n];
+                for &idx in &subset {
+                    best_support[idx] = true;
                 }
             }
         }
@@ -1251,10 +1251,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinCovDet<F> {
                 }
                 Err(_) => false,
             };
-            if well_conditioned {
-                if let Ok(inv) = spd_inverse(m) {
-                    return Ok(inv);
-                }
+            if well_conditioned && let Ok(inv) = spd_inverse(m) {
+                return Ok(inv);
             }
             // Apply trace-relative shrinkage *off-diagonal* zero +
             // diagonal-target shrinkage. Use a large enough alpha that a

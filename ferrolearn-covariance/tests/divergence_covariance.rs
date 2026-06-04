@@ -45,6 +45,10 @@ fn probe_sym() -> Array2<f64> {
 // (precision_ is pinned separately as a divergence — see below.)
 // ===========================================================================
 #[test]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"
+)]
 fn green_empirical_covariance_parity() {
     // sklearn live oracle (Xa):
     let sk_cov = [
@@ -88,6 +92,10 @@ fn green_empirical_covariance_parity() {
 // ===========================================================================
 #[test]
 #[ignore = "divergence: precision_ inverts cov+1e-8*I (cholesky reg) vs sklearn exact pinvh _empirical_covariance.py:216; tracking #1701"]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"
+)]
 fn divergence_empirical_precision_regularization() {
     // sklearn 1.5.2 live oracle (Xa) precision_:
     let sk_prec = [
@@ -128,6 +136,10 @@ fn divergence_empirical_precision_regularization() {
 //   _shrunk_covariance.py:153-156
 // ===========================================================================
 #[test]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"
+)]
 fn green_shrunk_covariance_parity() {
     let sk_cov = [
         [4.148148148148149, 4.3999999999999995, 3.4499999999999997],
@@ -152,6 +164,10 @@ fn green_shrunk_covariance_parity() {
 // Oracle: LedoitWolf().fit(Xa) — sklearn 1.5.2
 // ===========================================================================
 #[test]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"
+)]
 fn green_ledoit_wolf_parity() {
     let sk_shrinkage = 0.4087180724344861;
     let sk_cov = [
@@ -195,6 +211,10 @@ fn green_ledoit_wolf_parity() {
 // ===========================================================================
 #[test]
 #[ignore = "divergence: OAS uses pre-1.5 formula vs sklearn _shrunk_covariance.py:79-87; tracking #1701"]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"
+)]
 fn divergence_oas_formula() {
     // sklearn 1.5.2 live oracle (Xa):
     let sk_shrinkage = 0.6705854984555868;
