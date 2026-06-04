@@ -22,6 +22,26 @@
 //!     |y| y.exp(),
 //! );
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/compose/_target.py` `TransformedTargetRegressor`
+//! (`:24`, tag 1.5.2) in func/inverse_func mode. Deterministic meta-estimator.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | func/inverse value parity (single-output) | SHIPPED | `fn fit` (`y.mapv(func)` → inner `Pipeline` fit) + `fn predict` (`predict.mapv(inverse_func)`); `green_guard_log_exp_value_parity_vs_oracle` matches live sklearn `<1e-9` (`_target.py:271-288`,`:295`) |
+//! | REQ-2 | transformer-object mode | NOT-STARTED | only `func`/`inverse_func` callables (sklearn `_target.py:168-175`) — blocker #1684 |
+//! | REQ-3 | `check_inverse` subset warning | NOT-STARTED | no inverse check / warning channel (`_target.py:205-218`) — blocker #1685 |
+//! | REQ-4 | `regressor=None` → LinearRegression default | NOT-STARTED | `new` requires a `Pipeline<F>` (`_target.py:281-284`) — blocker #1686 |
+//! | REQ-5 | func/inverse both-required validation | SHIPPED | `fn new(regressor, func, inverse_func)` type-enforces BOTH, matching sklearn's both-required check (`_target.py:177-189`) |
+//! | REQ-6 | 2D y / multi-output | NOT-STARTED | `impl Fit<Array2<F>, Array1<F>>` single-output only (`_target.py:263-279`) — blocker #1687 |
+//! | REQ-7 | `fit_params`/`predict_params` passthrough | NOT-STARTED | no passthrough to inner regressor (`_target.py:236-316`) — blocker #1688 |
+//! | REQ-8 | non-finite transformed-y rejected | SHIPPED | `fn fit` rejects `!is_finite()` (NaN + inf, fixed #1683) matching sklearn `force_all_finite`; error type is a sanctioned R-DEV-4 choice; `green_guard_nan_func_returns_err`, `divergence_inf_func_output_not_rejected` |
+//! | REQ-9 | ferray substrate | NOT-STARTED | on `ndarray`, not `ferray-core` — blocker #1689 |
+//! | REQ-10 | non-test production consumer | SHIPPED | boundary estimator re-export `lib.rs:118` (S5: boundary estimator types ARE the public API) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::Pipeline;
