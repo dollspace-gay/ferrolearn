@@ -38,7 +38,6 @@ use ndarray::{Array2, array};
 ///
 /// Tracking: #1670
 #[test]
-#[ignore = "divergence: RBFSampler rejects gamma=0; sklearn accepts it; tracking #1670"]
 fn divergence_gamma_zero_accepted() {
     let x: Array2<f64> = array![[1.0, 2.0], [3.0, 4.0]];
     let fitted = RBFSampler::<f64>::new()

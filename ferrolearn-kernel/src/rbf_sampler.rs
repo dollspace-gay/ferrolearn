@@ -136,14 +136,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RBFSampler<F> {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if `gamma` is non-positive
+    /// Returns [`FerroError::InvalidParameter`] if `gamma` is negative
     /// or `n_components` is zero.
     /// Returns [`FerroError::InsufficientSamples`] if `x` has zero rows.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedRBFSampler<F>, FerroError> {
-        if self.gamma <= F::zero() {
+        if self.gamma < F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "gamma".into(),
-                reason: "must be positive".into(),
+                reason: "must be non-negative".into(),
             });
         }
         if self.n_components == 0 {
@@ -369,10 +369,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_gamma() {
+    fn accepts_zero_gamma() {
+        // sklearn 1.5.2 (kernel_approximation.py:330,
+        // gamma: Interval(Real, 0.0, None, closed="left")) accepts gamma=0,
+        // yielding all-zero random_weights_ since sqrt(2*0) == 0.
         let x = make_data(10, 3, 42);
-        let sampler = RBFSampler::<f64>::new().with_gamma(0.0);
-        assert!(sampler.fit(&x, &()).is_err());
+        let sampler = RBFSampler::<f64>::new()
+            .with_gamma(0.0)
+            .with_random_state(42);
+        let result = sampler.fit(&x, &());
+        assert!(result.is_ok(), "gamma=0 must be accepted, got {result:?}");
+        if let Ok(fitted) = result {
+            for &w in fitted.random_weights().iter() {
+                assert_eq!(w, 0.0, "gamma=0 yields all-zero random_weights_");
+            }
+        }
     }
 
     #[test]
