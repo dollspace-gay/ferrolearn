@@ -145,7 +145,6 @@ fn green_guard_nan_func_returns_err() {
 // Tracking: #1683 (specific blocker), parent #1682.
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "divergence: ferrolearn fit does not reject infinite func output (only NaN); sklearn check_array errors; tracking #1683"]
 fn divergence_inf_func_output_not_rejected() {
     let ttr = TransformedTargetRegressor::new(mean_pipeline(), |y: f64| 1.0 / y, |y: f64| 1.0 / y);
     let x = array![[1.0], [2.0], [3.0], [4.0]];

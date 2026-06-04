@@ -83,7 +83,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for Transformed
     ///
     /// # Errors
     ///
-    /// - [`FerroError::NumericalInstability`] if `func` produces NaN values.
+    /// - [`FerroError::NumericalInstability`] if `func` produces non-finite
+    ///   (NaN or infinite) values.
     /// - Propagates errors from the inner pipeline's `fit`.
     fn fit(
         &self,
@@ -92,10 +93,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for Transformed
     ) -> Result<FittedTransformedTargetRegressor<F>, FerroError> {
         let y_transformed = y.mapv(self.func);
 
-        // Check for NaN in transformed target
-        if y_transformed.iter().any(|&v| v.is_nan()) {
+        // Check for non-finite (NaN or infinite) values in transformed target,
+        // matching sklearn's `check_array(force_all_finite=True)`.
+        if y_transformed.iter().any(|&v| !v.is_finite()) {
             return Err(FerroError::NumericalInstability {
-                message: "TransformedTargetRegressor: func produced NaN values in y".into(),
+                message: "TransformedTargetRegressor: func produced non-finite (NaN or infinite) values in y".into(),
             });
         }
 
