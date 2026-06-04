@@ -157,30 +157,42 @@ impl TunedThresholdClassifierCV {
             });
         }
 
-        // Collect out-of-fold scores via CrossValidator::fold_indices.
+        // Collect per-fold scores via CrossValidator::fold_indices.
         let kf = KFold::new(self.cv);
         let folds = kf.fold_indices(n)?;
 
-        // For each fold, fit base on train rows and score test rows.
-        let mut oof_scores = Array1::<f64>::from_elem(n, f64::NAN);
+        // sklearn scores each candidate threshold PER FOLD on that fold's
+        // validation set, then AVERAGES the per-fold scores per threshold
+        // (`sklearn/model_selection/_classification_threshold.py:591-616`
+        // `_mean_interpolated_score`, `:928-931` argmax) rather than pooling
+        // all out-of-fold predictions into one global score vector. Because
+        // every fold is scored at the same fixed `self.thresholds` grid, no
+        // interpolation is needed: the combination is exactly the per-threshold
+        // MEAN of the per-fold scores.
+        let n_thr = self.thresholds.len();
+        let mut score_sums = vec![0.0_f64; n_thr];
         for (train_idx, test_idx) in &folds {
             let train_x = subset_rows(x, train_idx);
             let train_y = subset_rows_1d(y, train_idx);
-            let test_x = subset_rows(x, test_idx);
+            let val_x = subset_rows(x, test_idx);
+            let val_y = subset_rows_1d(y, test_idx);
             let predictor = (self.fit_fn)(&train_x, &train_y)?;
-            let test_scores = predictor(&test_x)?;
-            for (k, &i) in test_idx.iter().enumerate() {
-                oof_scores[i] = test_scores[k];
+            let val_scores = predictor(&val_x)?;
+            for (ti, &thr) in self.thresholds.iter().enumerate() {
+                let preds: Array1<usize> = val_scores.mapv(|s| if s >= thr { 1usize } else { 0 });
+                score_sums[ti] += (self.scoring)(&val_y, &preds);
             }
         }
 
-        // For each candidate threshold, score the OOF predictions.
+        // Mean across folds per threshold, then `np.argmax` (FIRST maximum:
+        // strict `>` so the lowest-index threshold wins on ties, matching
+        // `objective_scores.argmax()` at `:931`).
+        let n_folds = folds.len() as f64;
         let mut best_thr = self.thresholds[0];
         let mut best_score = f64::NEG_INFINITY;
-        let mut all_scores = Vec::with_capacity(self.thresholds.len());
-        for &thr in &self.thresholds {
-            let preds: Array1<usize> = oof_scores.mapv(|s| if s >= thr { 1usize } else { 0 });
-            let score = (self.scoring)(y, &preds);
+        let mut all_scores = Vec::with_capacity(n_thr);
+        for (ti, &thr) in self.thresholds.iter().enumerate() {
+            let score = score_sums[ti] / n_folds;
             all_scores.push(score);
             if score > best_score {
                 best_score = score;

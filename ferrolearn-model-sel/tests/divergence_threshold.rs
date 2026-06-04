@@ -122,7 +122,6 @@ fn fixed_threshold_predict_ge_edge_parity_green() {
 ///
 /// Tracking: #1736 (per-REQ blocker filed below).
 #[test]
-#[ignore = "divergence: TunedThresholdClassifierCV pools OOF folds vs sklearn per-fold-mean-interpolation; tracking #1736"]
 fn tuned_threshold_fold_combination_divergence() {
     let x = array![
         [0.528, 0.0],
