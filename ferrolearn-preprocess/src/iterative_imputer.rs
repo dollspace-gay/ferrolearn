@@ -11,6 +11,35 @@
 //! Before the iterative process begins, missing values are filled using a simple
 //! strategy (mean by default). This initial imputation provides a starting point
 //! for the regression models.
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class IterativeImputer`
+//! (`sklearn/impute/_iterative.py:51`, EXPERIMENTAL). Tracking: #1403. Each REQ
+//! is BINARY — SHIPPED (impl + non-test consumer + tests + green verification)
+//! or NOT-STARTED (with a concrete open blocker). HONEST scope: ferrolearn
+//! implements the round-robin regression STRUCTURE but with `Ridge(alpha=1)`
+//! (sklearn default is `BayesianRidge`), column-order (sklearn default
+//! `ascending`), L2-relative convergence (sklearn inf-norm), and no value
+//! clipping — so the exact iterated imputed VALUES diverge (carve-out). The
+//! SHIPPED claims are structural/contract + the initial-fill VALUES.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Round-robin STRUCTURE + initial fill (mean/median == `SimpleImputer`) + non-missing values preserved + output shape | SHIPPED (scoped) | [`IterativeImputer`] `fit`/`transform`; initial-fill VALUES match `SimpleImputer` (oracle); non-missing-preserved + shape + no-NaN tests in `tests/divergence_iterative_imputer.rs`. Consumer: re-export `lib.rs:150` |
+//! | REQ-2 | Determinism (no RNG) + termination (≤ max_iter, tol break) + `n_iter` accessor | SHIPPED (scoped) | [`FittedIterativeImputer::n_iter`]; determinism + bounded-termination tests |
+//! | REQ-3 | Error/parameter contracts (n_samples==0, transform ncols, unfitted) + `max_iter==0` → initial fill | SHIPPED | [`IterativeImputer::fit`] accepts `max_iter==0` (returns initial fill, `n_iter=0`, matches sklearn `_iterative.py:750-752`, fixed #1404, see Changed); divergence + error tests |
+//! | REQ-4 | Exact iterated imputed-VALUE parity (BayesianRidge default + ascending order + inf-norm tol + min/max clip) | NOT-STARTED | algorithm divergence CARVE-OUT (Ridge(alpha=1)≠BayesianRidge), no committed failing test — blocker #1405 |
+//! | REQ-5 | `estimator` param (pluggable; default BayesianRidge) + `sample_posterior` | NOT-STARTED | `Ridge(alpha=1)` hard-coded; sklearn `_iterative.py:74,307` — blocker #1406 |
+//! | REQ-6 | `imputation_order` param (ascending/descending/roman/arabic/random) | NOT-STARTED | column-order only (= 'roman'); sklearn `:504-542` — blocker #1407 |
+//! | REQ-7 | `min_value`/`max_value` clipping | NOT-STARTED | no clip; sklearn `:455-457` — blocker #1408 |
+//! | REQ-8 | `n_nearest_features` + abs-correlation feature selection | NOT-STARTED | uses all other features; sklearn `:468-502` — blocker #1409 |
+//! | REQ-9 | `initial_strategy` most_frequent/constant + `fill_value` + non-NaN `missing_values` | NOT-STARTED | Mean/Median only, NaN-only; sklearn `:112,183,743` — blocker #1410 |
+//! | REQ-10 | `random_state` + `skip_complete` + `add_indicator` + `keep_empty_features` + `verbose` | NOT-STARTED | sklearn `:305-343` — blocker #1411 |
+//! | REQ-11 | inf-norm convergence (`tol·max\|X\|`) | NOT-STARTED | L2-relative; sklearn `:780,811,818` — blocker #1412 |
+//! | REQ-12 | `get_feature_names_out` + `imputation_sequence_`/`n_iter_`/`n_features_in_`/`random_state_` attrs | NOT-STARTED | sklearn `:739` — blocker #1413 |
+//! | REQ-13 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1414 |
+//! | REQ-14 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1415 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -387,7 +416,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IterativeImputer<F
     /// # Errors
     ///
     /// - [`FerroError::InsufficientSamples`] if the input has zero rows.
-    /// - [`FerroError::InvalidParameter`] if `max_iter` is zero.
+    ///
+    /// `max_iter == 0` is valid (matching sklearn `_iterative.py:750-752`, whose
+    /// `_parameter_constraints` allows `Interval(Integral, 0, None, closed="left")`):
+    /// the iteration loop runs zero times and `fit` returns the initial fill with
+    /// `n_iter() == 0`.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedIterativeImputer<F>, FerroError> {
         let n_samples = x.nrows();
         if n_samples == 0 {
@@ -395,12 +428,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IterativeImputer<F
                 required: 1,
                 actual: 0,
                 context: "IterativeImputer::fit".into(),
-            });
-        }
-        if self.max_iter == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "max_iter".into(),
-                reason: "max_iter must be at least 1".into(),
             });
         }
 
@@ -761,10 +788,37 @@ mod tests {
     }
 
     #[test]
-    fn test_iterative_imputer_zero_max_iter_error() {
+    fn test_iterative_imputer_zero_max_iter_returns_initial_fill() {
+        // sklearn `_iterative.py:750-752`: max_iter == 0 is VALID — fit_transform
+        // sets n_iter_ = 0 and returns the initial SimpleImputer fill with NO
+        // regression rounds. (_parameter_constraints allows Integral >= 0.)
         let imputer = IterativeImputer::<f64>::new(0, 1e-3, InitialStrategy::Mean);
-        let x = array![[1.0, 2.0]];
-        assert!(imputer.fit(&x, &()).is_err());
+        let x = array![[1.0, 2.0], [f64::NAN, 3.0], [5.0, f64::NAN], [7.0, 8.0]];
+
+        let fit_res = imputer.fit(&x, &());
+        assert!(
+            fit_res.is_ok(),
+            "max_iter=0 must be accepted (sklearn parity), got {fit_res:?}"
+        );
+        let Ok(fitted) = fit_res else { return };
+        // Zero iterations performed.
+        assert_eq!(fitted.n_iter(), 0);
+
+        let out_res = fitted.transform(&x);
+        assert!(
+            out_res.is_ok(),
+            "transform after max_iter=0 fit failed: {out_res:?}"
+        );
+        let Ok(out) = out_res else { return };
+        // Per-column mean initial fill (cols share mean 13/3), observed preserved.
+        let mean_fill = 13.0 / 3.0;
+        let expected = array![[1.0, 2.0], [mean_fill, 3.0], [5.0, mean_fill], [7.0, 8.0]];
+        for (got, want) in out.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() < 1e-9,
+                "max_iter=0 output {got} != initial fill {want}"
+            );
+        }
     }
 
     #[test]
