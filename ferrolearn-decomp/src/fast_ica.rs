@@ -43,6 +43,38 @@
 //! let sources = fitted.transform(&x).unwrap();
 //! assert_eq!(sources.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/fast_ica.md`. Tracking: #1571. Each REQ is BINARY —
+//! SHIPPED (impl + non-test consumer + tests + green verification) or NOT-STARTED
+//! (concrete open blocker). Non-test consumers: crate re-export (`lib.rs:87`), the
+//! PyO3 `_RsFastICA` binding (`ferrolearn-python/src/extras.rs:1109`), and
+//! `PipelineTransformer`. Oracle = live sklearn 1.5.2 (`_fastica.py`), run from
+//! `/tmp` (R-CHAR-3). ICA components/sources are identifiable only up to
+//! permutation+sign+scale; combined with the RNG `w_init` and the eigh-vs-svd
+//! whitening solver, exact VALUES are a carve-out (the algorithm structure matches
+//! sklearn `_ica_par`/`_ica_def` + `_sym_decorrelation`).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: whitening + 3 nonlinearities (LogCosh/Exp/Cube) × 2 algorithms (Parallel/Deflation) recover finite sources `(n_samples,n_components)`, n_iter≥1, determinism, g(0)=0, + ICA source-recovery up to perm+sign+scale + whitening→identity covariance | SHIPPED (scoped) | `fit` (`fast_ica.rs:452`); green-guards `ica_correctness_recovers_known_sources` (abs-corr > 0.9), `whitening_produces_identity_covariance` + in-module tests. STRUCTURAL only, NOT exact values (REQ-4) |
+//! | REQ-2 | Fitted-attr shapes (components k×k, mixing n_features×k, mean) | SHIPPED | accessors `:205-229`; `fitted_attribute_shapes` |
+//! | REQ-3 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform feature mismatch) | SHIPPED (scoped) | `fit`/`transform` guards (`:455-476`,`:687`) |
+//! | REQ-4 | EXACT `components`/source value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Xoshiro vs numpy RNG `w_init` + covariance-eigh vs SVD-default whitening + ICA perm/sign/scale identifiability — blocker #1572 |
+//! | REQ-5 | `components_ = W@K` attribute semantics | NOT-STARTED | ferrolearn `components()` returns `W` (k×k) + `whitening` (K) separately; sklearn `components_=W@K` (k×n_features, `_fastica.py:683`) — transform output matches — blocker #1573 |
+//! | REQ-6 | `mixing_ = pinv(components_)` | NOT-STARTED | ferrolearn `Kᵀ·Wᵀ` (`:657`) vs sklearn `pinv(components_)` (`_fastica.py:689`) — blocker #1574 |
+//! | REQ-7 | `whiten_solver` svd(default)/eigh + `whiten` modes + `X1*=sqrt(n)` + unit-variance `S_std` rescale | NOT-STARTED | sklearn `_fastica.py:605-631,:676-681` — blocker #1575 |
+//! | REQ-8 | `fun` as callable + `fun_args` (alpha) | NOT-STARTED | sklearn `_fastica.py:141-150`; ferrolearn 3-enum only — blocker #1576 |
+//! | REQ-9 | `w_init` custom init param | NOT-STARTED | sklearn `_fastica.py:638-641` — blocker #1577 |
+//! | REQ-10 | `n_components=None` auto-default | NOT-STARTED | sklearn `_fastica.py:591-592` — blocker #1578 |
+//! | REQ-11 | `inverse_transform` | NOT-STARTED | sklearn `_fastica.py:764+` — blocker #1579 |
+//! | REQ-12 | fitted attrs `whitening_`/`n_features_in_`/`n_iter_`/`mixing_` naming | NOT-STARTED | blocker #1580 |
+//! | REQ-13 | numpy-RandomState `w_init` parity | NOT-STARTED | CARVE-OUT (Xoshiro ≠ numpy) — blocker #1581 |
+//! | REQ-14 | PyO3 `_RsFastICA` binding surface (n_components/fit/transform only) | NOT-STARTED | blocker #1582 |
+//! | REQ-15 | ferray substrate | NOT-STARTED | `ndarray` + `rand` + hand-rolled Jacobi — blocker #1583 |
+//!
+//! Count: **3 SHIPPED (REQ-1,2,3) / 12 NOT-STARTED (REQ-4..15)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
