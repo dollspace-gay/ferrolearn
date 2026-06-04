@@ -30,6 +30,38 @@
 //! let codes = fitted.transform(&x).unwrap();
 //! assert_eq!(codes.dim(), (20, 5));
 //! ```
+//!
+//! ## REQ status
+//!
+//! Design: `.design/decomp/dictionary_learning.md`. Tracking: #1512. Each REQ is
+//! BINARY — SHIPPED (impl + non-test consumer + tests + green verification) or
+//! NOT-STARTED (concrete open blocker). Non-test consumer: crate re-export
+//! (`lib.rs:83`); there is NO PyO3 binding. Oracle = live sklearn 1.5.2
+//! (`_dict_learning.py`, `class DictionaryLearning`), run from `/tmp` (R-CHAR-3).
+//! ferrolearn is a SIMPLIFIED f64-only reimplementation (random-Gaussian init +
+//! soft-threshold CD + normal-equations dict update) — exact component VALUES are a
+//! carve-out (SVD init + LARS + `_update_dict` resampling + RNG all differ).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |---|---|---|---|
+//! | REQ-1 | Structural: `components_` shape `(n_components,n_features)`, transform codes shape, OMP n-nonzero cap + LassoCd sparsity, finite `reconstruction_err_`, `n_iter_` in `[1, max_iter]`, seed-determinism | SHIPPED (scoped) | `fit`/`transform` (`dictionary_learning.rs:495`/`:622`); green-guards in `tests/divergence_dictionary_learning.rs` + in-module tests. STRUCTURAL only, NOT component values (REQ-4) |
+//! | REQ-2 | Dictionary atoms unit L2-norm | SHIPPED | `normalise_dictionary` (`:251`); `test_dictlearn_dictionary_atoms_normalised` + green-guard. FLAG: sklearn `_update_dict` projects onto the unit BALL `/= max(norm,1)` (`_dict_learning.py:548`) so sklearn atoms have norm ≤ 1; ferrolearn uses the unit SPHERE (norm == 1) — coincide at convergence, folds into REQ-7 carve-out |
+//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples 0, n_features 0, alpha<0, transform col mismatch) | SHIPPED (scoped) | `fit`/`transform` guards (`:499-523`,`:624`); FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None` |
+//! | REQ-4 | EXACT `components_` value parity with sklearn `_dict_learning` | NOT-STARTED | CARVE-OUT (R-DEFER-3): SVD init + LARS lasso + `_update_dict` BCD/resampling + numpy RNG vs ferrolearn random-Gaussian-init + CD + normal-equations; all value candidates gated on the RNG-coupled dictionary (no injectable-dict API) — blocker #1513 |
+//! | REQ-5 | `fit_algorithm="lars"` / LARS solver | NOT-STARTED | sklearn default `_dict_learning.py:1595,:1671`; ferrolearn CD-only (`DictFitAlgorithm::CoordinateDescent`) — blocker #1514 |
+//! | REQ-6 | SVD-based `dict_init`/`code_init` init | NOT-STARTED | sklearn `_dict_learning.py:581-584`; ferrolearn random Gaussian — blocker #1515 |
+//! | REQ-7 | `_update_dict` BCD + unused-atom resampling + unit-BALL projection | NOT-STARTED | sklearn `_dict_learning.py:474-551`; ferrolearn normal-equations LS + unit-SPHERE — blocker #1516 |
+//! | REQ-8 | `transform_alpha` + lasso_lars/lars/threshold algorithms + alpha/n_features scaling | NOT-STARTED | sklearn `_dict_learning.py:141,:1141`; ferrolearn Omp/LassoCd only, raw alpha — blocker #1517 |
+//! | REQ-9 | `split_sign` | NOT-STARTED | sklearn `_dict_learning.py:1131-1137` — blocker #1518 |
+//! | REQ-10 | `positive_code`/`positive_dict` | NOT-STARTED | sklearn `_dict_learning.py:544-545` — blocker #1519 |
+//! | REQ-11 | `transform_max_iter` ctor param | NOT-STARTED | sklearn `_dict_learning.py:1608` — blocker #1520 |
+//! | REQ-12 | `MiniBatchDictionaryLearning` online variant | NOT-STARTED | sklearn `_dict_learning.py:1715`; ABSENT in ferrolearn — blocker #1521 |
+//! | REQ-13 | Fitted attrs `error_`/`n_components_`/`n_features_in_` | NOT-STARTED | sklearn `_dict_learning.py:1700`; ferrolearn has `n_iter_`/`reconstruction_err_` only — blocker #1522 |
+//! | REQ-14 | Generic `F` support | NOT-STARTED | f64-only (`Fit<Array2<f64>, ()>` `:483`) — blocker #1523 |
+//! | REQ-15 | PyO3 binding | NOT-STARTED | no `_RsDictionaryLearning`; only consumer is re-export `lib.rs:83` — blocker #1524 |
+//! | REQ-16 | ferray substrate | NOT-STARTED | dense `ndarray::Array2` + `rand`/`rand_distr` — blocker #1525 |
+//!
+//! Count: **3 SHIPPED (REQ-1,2,3) / 13 NOT-STARTED (REQ-4..16)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -528,7 +560,11 @@ impl Fit<Array2<f64>, ()> for DictionaryLearning {
 
         // Initialise dictionary from random Gaussian, then normalise.
         let mut rng = Xoshiro256PlusPlus::seed_from_u64(seed);
-        let normal = Normal::new(0.0, 1.0).unwrap();
+        let normal = Normal::new(0.0, 1.0).map_err(|e| FerroError::NumericalInstability {
+            message: format!(
+                "DictionaryLearning::fit: failed to construct Normal(0,1) for dictionary init: {e}"
+            ),
+        })?;
         let mut d = Array2::<f64>::zeros((n_components, n_features));
         for elem in &mut d {
             *elem = normal.sample(&mut rng);
