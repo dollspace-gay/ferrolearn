@@ -28,6 +28,32 @@
 //! let fitted = mds.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.embedding().ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class MDS` + `smacof`
+//! (`sklearn/manifold/_mds.py`). Tracking: #1451. Each REQ is BINARY — SHIPPED
+//! (impl + non-test consumer + tests + green verification) or NOT-STARTED (with
+//! a concrete open blocker). ALGORITHM DIVERGENCE: ferrolearn implements
+//! CLASSICAL (metric) MDS / PCoA (closed-form eigendecomposition); sklearn `MDS`
+//! is SMACOF (iterative stress majorization, numpy-RNG-initialized, multi-restart)
+//! — so exact coordinate parity is impossible (REQ-1 carve-out). The SHIPPED
+//! claim is the classical-MDS distance-preservation property, not SMACOF
+//! coordinate parity.
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Exact coordinate parity with sklearn SMACOF | NOT-STARTED | algorithm divergence CARVE-OUT (classical MDS ≠ SMACOF + numpy RNG + rotation), no committed failing test (R-DEFER-3) — blocker #1452 |
+//! | REQ-2 | Classical-MDS DISTANCE-PRESERVATION (embedding pairwise distances reconstruct the input Euclidean dissimilarities — exact at full rank `n_components ≥ rank`, best low-rank approximation otherwise) | SHIPPED | `classical_mds` double-centre `B=-0.5 J D² J` + eigendecomp + `X_k=v_k·√max(λ_k,0)`; reconstructs the input distance matrix to ~1e-15 (full-rank 2D/3D + precomputed oracle tests in `tests/divergence_mds.rs`). Consumers: re-export `lib.rs:95` + `isomap.rs:38,339` (Isomap on geodesic distances) |
+//! | REQ-3 | Structural (embedding shape `(n_samples, n_components)`, deterministic given input) | SHIPPED (scoped) | `fit`; shape + determinism guards |
+//! | REQ-4 | Kruskal stress-1 computation | SHIPPED (scoped) | `kruskal_stress` `√(Σ(d_o-d_e)²/Σ d_o²)`; stress≈0 on a perfect embedding. NOTE sklearn `stress_` is raw SSR `((dis-disparities)²)/2` — a DIFFERENT definition (REQ-8) |
+//! | REQ-5 | Error/parameter contracts (n_components 0 / > n_samples) | SHIPPED (scoped) | `fit` guards. NOTE ferrolearn rejects `n_components > n_samples`; sklearn has no such upper bound (ABI divergence, REQ-8) |
+//! | REQ-6 | SMACOF algorithm (iterative stress majorization + `n_init`=4 restarts + `random_state`) | NOT-STARTED | sklearn `_mds.py:22-167,348-387` — blocker #1453 |
+//! | REQ-7 | `metric=False` non-metric MDS (IsotonicRegression on disparities) | NOT-STARTED | sklearn `_mds.py:130-144` — blocker #1454 |
+//! | REQ-8 | `normalized_stress` + sklearn `stress_` (raw SSR) definition + `max_iter`/`eps` | NOT-STARTED | sklearn `_mds.py:147,160-165` — blocker #1455 |
+//! | REQ-9 | `dissimilarity_matrix_`/`n_iter_`/`embedding_` fitted attrs + `fit_transform` (SMACOF-on-precomputed) | NOT-STARTED | sklearn `_mds.py:395` — blocker #1456 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1457 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1458 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
