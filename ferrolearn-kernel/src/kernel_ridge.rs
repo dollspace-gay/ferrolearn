@@ -307,7 +307,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KernelRidge
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if `alpha` is negative.
+    /// Returns [`FerroError::InvalidParameter`] if `alpha` is negative or if
+    /// `gamma` is set to a negative value.
     /// Returns [`FerroError::ShapeMismatch`] if `x` and `y` have different
     /// numbers of samples.
     /// Returns [`FerroError::InsufficientSamples`] if `x` has zero rows.
@@ -333,6 +334,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KernelRidge
         if self.alpha < F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
+        if let Some(g) = self.gamma
+            && g < F::zero()
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "gamma".into(),
                 reason: "must be non-negative".into(),
             });
         }
