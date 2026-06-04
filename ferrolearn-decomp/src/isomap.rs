@@ -34,6 +34,27 @@
 //! let emb = fitted.embedding();
 //! assert_eq!(emb.ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class Isomap`
+//! (`sklearn/manifold/_isomap.py` — `KernelPCA` on the centered geodesic kernel).
+//! Tracking: #1467. Each REQ is BINARY — SHIPPED (impl + non-test consumer +
+//! tests + green verification) or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | Isomap embedding VALUE parity (classical MDS on geodesic distances + KernelPCA `svd_flip` deterministic sign) | SHIPPED | `fit` applies the per-column max-abs-positive sign flip (sklearn `svd_flip` `_kernel_pca.py:373`); element-wise matches live sklearn EXACTLY (no sign alignment) across n_neighbors {3,4,5}, n_components {1,2,3}, 3 fixtures in `tests/divergence_isomap.rs` (was #1468, fixed). Consumer: re-export `lib.rs:89` |
+//! | REQ-2 | Geodesic distance matrix parity (kNN graph + Dijkstra == sklearn `dist_matrix_`) | SHIPPED | `build_knn_graph` + `all_pairs_shortest_paths` match sklearn `kneighbors_graph(mode=distance)` + `shortest_path` (`_isomap.py:242-299`); verified via sign-robust embedding + embedding-distance equality |
+//! | REQ-3 | Structural (embedding shape, deterministic) | SHIPPED (scoped) | shape + determinism guards. NOTE disconnected-graph: ferrolearn errors (NumericalInstability), sklearn warns+completes (REQ-9) |
+//! | REQ-4 | Error/parameter contracts (n_components 0/>n, n_neighbors 0/≥n, <2 samples, disconnected) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-5 | `transform` out-of-sample (geodesic-graph-linked, not Euclidean) | NOT-STARTED | `transform` uses raw Euclidean to-train distances; sklearn `_isomap.py:419-460` — blocker #1469 |
+//! | REQ-6 | `radius` mode + `radius_neighbors_graph` | NOT-STARTED | sklearn `_isomap.py:253-261` — blocker #1470 |
+//! | REQ-7 | `path_method` (FW/Floyd-Warshall vs D/Dijkstra) + `eigen_solver`/`tol`/`max_iter` | NOT-STARTED | sklearn `_isomap.py:299,233-240` — blocker #1471 |
+//! | REQ-8 | `metric`/`p` (non-Euclidean minkowski) + `metric_params` | NOT-STARTED | Euclidean only; sklearn `_isomap.py:194-195` — blocker #1472 |
+//! | REQ-9 | `reconstruction_error()`/`dist_matrix_`/`kernel_pca_`/`nbrs_` attrs + `neighbors_algorithm` + disconnected-graph completion + degenerate-eigenvalue subspace (CARVE-OUT) | NOT-STARTED | sklearn `_isomap.py:267-335` — blocker #1473 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1474 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1475 |
 
 use crate::mds::{classical_mds, eigh_faer, pairwise_sq_distances};
 use ferrolearn_core::error::FerroError;
@@ -336,7 +357,33 @@ impl Fit<Array2<f64>, ()> for Isomap {
         }
         grand_mean /= n_f * n_f;
 
-        let (embedding, _stress) = classical_mds(&geo_sq, self.n_components)?;
+        let (mut embedding, _stress) = classical_mds(&geo_sq, self.n_components)?;
+
+        // Apply KernelPCA's `svd_flip` sign convention for deterministic signs
+        // (`sklearn/decomposition/_kernel_pca.py:373`, rule at
+        // `sklearn/utils/extmath.py:888-896`): for each embedding column, find
+        // the row of maximum absolute value (first occurrence on ties, like
+        // numpy `argmax`) and flip the column's sign so that entry is positive.
+        // `classical_mds` scales each eigenvector by `sqrt(lambda_k) >= 0`, a
+        // positive per-column constant, so `argmax(|scaled|)` equals
+        // `argmax(|eigenvector|)` and this matches svd_flip on the unit vector.
+        for k in 0..embedding.ncols() {
+            let mut max_abs = 0.0_f64;
+            let mut neg = false;
+            for i in 0..n {
+                let v = embedding[[i, k]];
+                let a = v.abs();
+                if a > max_abs {
+                    max_abs = a;
+                    neg = v < 0.0;
+                }
+            }
+            if neg {
+                for i in 0..n {
+                    embedding[[i, k]] = -embedding[[i, k]];
+                }
+            }
+        }
 
         // Eigendecompose for Nystroem extension storage
         let mut b = Array2::<f64>::zeros((n, n));
