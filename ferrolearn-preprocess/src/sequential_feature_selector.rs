@@ -14,6 +14,30 @@
 //! **Backward**: Start with all features. At each step, try removing each
 //! remaining feature, evaluate the score, and keep the removal that yields
 //! the highest score. Repeat until `n_features_to_select` features remain.
+//!
+//! Translation target: scikit-learn 1.5.2 `class SequentialFeatureSelector`
+//! (`sklearn/feature_selection/_sequential.py:19`). Design:
+//! `.design/preprocess/sequential_feature_selector.md`. Tracking: #1283.
+//!
+//! Note: ferrolearn scores subsets via a user-supplied callback; sklearn uses a
+//! wrapped estimator + cross-validation (`cross_val_score(...).mean()`). The
+//! greedy search shape matches; the estimator/CV scoring is NOT-STARTED (#1286).
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 greedy forward/backward search + lowest-index tie-break | SHIPPED | `fit`/`forward_search`/`backward_search`; sklearn `_sequential.py:280-294` |
+//! | REQ-2 error contracts (n=0, >n_features, 0-rows, y-len, score_fn) | SHIPPED | `fit` / `transform` guards; sklearn `_sequential.py:211-216` |
+//! | REQ-8 `< n_features` + `ensure_min_features=2` validation | SHIPPED (#1284, #1285) | `fit` guards; sklearn `_sequential.py:214`,`:227-228` |
+//! | REQ-3 wrapped estimator + cross_val_score scoring | NOT-STARTED (#1286) | sklearn `_sequential.py:286-293` |
+//! | REQ-4 `n_features_to_select="auto"` default | NOT-STARTED (#1287) | sklearn `_sequential.py:219-225` |
+//! | REQ-5 `tol` early-stop + forward tol>0 validation | NOT-STARTED (#1288) | sklearn `_sequential.py:233-236`,`:258-259` |
+//! | REQ-6 float `n_features_to_select` fraction | NOT-STARTED (#1289) | sklearn `_sequential.py:159`,`:230-231` |
+//! | REQ-7 `cv` / `scoring` / `n_jobs` params | NOT-STARTED (#1290) | sklearn `_sequential.py:164-166` |
+//! | REQ-9 SelectorMixin surface + `n_features_to_select_` | NOT-STARTED (#1291) | sklearn `_sequential.py:297-299`,`:268` |
+//! | REQ-10 PyO3 binding | NOT-STARTED (#1292) | `ferrolearn-python/src/` (absent) |
+//! | REQ-11 ferray substrate | NOT-STARTED (#1293) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Transform;
@@ -125,17 +149,36 @@ impl SequentialFeatureSelector {
         let n_features = x.ncols();
         let n_samples = x.nrows();
 
+        // sklearn validates a minimum feature count BEFORE resolving
+        // `n_features_to_select`, so a 1-feature X is rejected for the
+        // "minimum of 2" reason regardless of `n_features_to_select`.
+        // Mirrors `_sequential.py:214`:
+        //   `X = self._validate_data(X, ..., ensure_min_features=2, ...)`
+        if n_features < 2 {
+            return Err(FerroError::InvalidParameter {
+                name: "x".into(),
+                reason: format!(
+                    "Found array with {n_features} feature(s) while a minimum of 2 is required by SequentialFeatureSelector"
+                ),
+            });
+        }
+
         if self.n_features_to_select == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_features_to_select".into(),
                 reason: "must be at least 1".into(),
             });
         }
-        if self.n_features_to_select > n_features {
+        // sklearn requires strictly `n_features_to_select < n_features`; it
+        // rejects `>= n_features` (selecting all features is disallowed).
+        // Mirrors `_sequential.py:227-228`:
+        //   `if self.n_features_to_select >= n_features:`
+        //   `    raise ValueError("n_features_to_select must be < n_features.")`
+        if self.n_features_to_select >= n_features {
             return Err(FerroError::InvalidParameter {
                 name: "n_features_to_select".into(),
                 reason: format!(
-                    "n_features_to_select ({}) exceeds number of features ({})",
+                    "n_features_to_select ({}) must be < number of features ({})",
                     self.n_features_to_select, n_features
                 ),
             });
@@ -372,13 +415,18 @@ mod tests {
         assert_eq!(fitted.selected_indices(), &[1, 2]);
     }
 
+    /// `n_features_to_select == n_features` is REJECTED.
+    ///
+    /// sklearn `_sequential.py:227-228` requires strictly
+    /// `n_features_to_select < n_features` and raises
+    /// `ValueError("n_features_to_select must be < n_features.")` for
+    /// `>= n_features`, so selecting all features is disallowed.
     #[test]
-    fn test_select_all_features() {
+    fn test_select_all_features_rejected() {
         let sfs = SequentialFeatureSelector::new(3, Direction::Forward);
         let x = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
         let y = array![1.0, 2.0];
-        let fitted = sfs.fit(&x, &y, mean_sum_score).unwrap();
-        assert_eq!(fitted.n_features_selected(), 3);
+        assert!(sfs.fit(&x, &y, mean_sum_score).is_err());
     }
 
     #[test]
