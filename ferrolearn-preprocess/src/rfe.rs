@@ -10,6 +10,33 @@
 //! Because `ferrolearn-preprocess` cannot depend on estimator crates (to avoid
 //! circular dependencies), these implementations accept feature importance
 //! vectors directly rather than wrapping fitted estimators.
+//!
+//! Translation target: scikit-learn 1.5.2 `class RFE` / `class RFECV`
+//! (`sklearn/feature_selection/_rfe.py`). Design: `.design/preprocess/rfe.md`.
+//! Tracking: #1294.
+//!
+//! Note: ferrolearn takes a static importance vector (RFE) / pre-computed CV
+//! scores (RFECV); sklearn wraps an estimator and re-fits it each elimination
+//! round, recomputing squared importances (RFE), and runs cross-validation
+//! internally (RFECV). The ranking/elimination + optimal-count SHAPE matches;
+//! the estimator/re-fit/CV machinery is NOT-STARTED (#1295/#1300).
+//!
+//! `## REQ status`
+//!
+//! | REQ | Status | Anchor |
+//! |---|---|---|
+//! | REQ-1 RFE ranking/support/elimination (static importances) | SHIPPED | `RFE::new`; sklearn `_rfe.py:337`,`:345-346` |
+//! | REQ-2 RFE transform + error contracts (scoped) | SHIPPED | `RFE::new` / `transform` guards; sklearn `_rfe.py:199-212` |
+//! | REQ-4 `n_features_to_select > n_features` → keep all | SHIPPED (#1296) | `RFE::new` clamp; sklearn `_rfe.py:290-297`,`:314` |
+//! | REQ-9 RFECV optimal-count selection (static scores) | SHIPPED | `RFECV::new` argmax first-max; sklearn `_rfe.py:786-788` |
+//! | REQ-3 wrapped estimator + per-round re-fit + squared importances | NOT-STARTED (#1295) | sklearn `_rfe.py:319-331` |
+//! | REQ-5 `n_features_to_select=None` default + float fraction | NOT-STARTED (#1297) | sklearn `_rfe.py:286-299` |
+//! | REQ-6 float `step` in (0,1) | NOT-STARTED (#1298) | sklearn `_rfe.py:301-302` |
+//! | REQ-7 `importance_getter` + `verbose` | NOT-STARTED (#1299) | sklearn `_rfe.py:211`,`:326-330` |
+//! | REQ-8 RFECV internal cross-validation | NOT-STARTED (#1300) | sklearn `_rfe.py:736-815` |
+//! | REQ-10 SelectorMixin surface + `estimator_`/`n_features_` | NOT-STARTED (#1301) | sklearn `_rfe.py:348-359` |
+//! | REQ-11 PyO3 binding | NOT-STARTED (#1302) | `ferrolearn-python/src/` (absent) |
+//! | REQ-12 ferray substrate | NOT-STARTED (#1303) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Transform;
@@ -83,7 +110,10 @@ impl<F: Float + Send + Sync + 'static> RFE<F> {
     /// # Errors
     ///
     /// - [`FerroError::InvalidParameter`] if `importances` is empty, `step` is
-    ///   zero, or `n_features_to_select` exceeds the number of features.
+    ///   zero, or `n_features_to_select` is zero. If `n_features_to_select`
+    ///   exceeds the number of features it is clamped (all features kept),
+    ///   matching scikit-learn's warn-and-keep-all behavior
+    ///   (`_rfe.py:290-297`).
     pub fn new(
         importances: &Array1<F>,
         n_features_to_select: usize,
@@ -102,7 +132,7 @@ impl<F: Float + Send + Sync + 'static> RFE<F> {
                 reason: "step must be at least 1".into(),
             });
         }
-        if n_features_to_select == 0 || n_features_to_select > n_features {
+        if n_features_to_select == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_features_to_select".into(),
                 reason: format!(
@@ -110,6 +140,11 @@ impl<F: Float + Send + Sync + 'static> RFE<F> {
                 ),
             });
         }
+        // sklearn does NOT raise when n_features_to_select > n_features: it warns
+        // and keeps ALL features (`_rfe.py:290-297`), and the elimination loop
+        // (`_rfe.py:314`) never runs. Clamp so the loop below is a no-op and all
+        // features are kept. The UserWarning has no Rust analog (no log facade).
+        let n_features_to_select = n_features_to_select.min(n_features);
 
         // Simulate the elimination process.
         // Track which round each feature is eliminated in; features removed in
@@ -436,10 +471,19 @@ mod tests {
         assert!(RFE::<f64>::new(&imp, 1, 0).is_err());
     }
 
+    /// sklearn does not raise when `n_features_to_select > n_features`: it warns
+    /// and keeps ALL features (`sklearn/feature_selection/_rfe.py:290-297`), with
+    /// `support_` all true and `ranking_` all 1. We clamp to keep all features.
     #[test]
-    fn test_rfe_n_features_too_large_error() {
+    fn test_rfe_n_features_too_large_keeps_all() {
         let imp = array![0.5, 0.3];
-        assert!(RFE::<f64>::new(&imp, 5, 1).is_err());
+        let result = RFE::<f64>::new(&imp, 5, 1);
+        assert!(result.is_ok());
+        if let Ok(rfe) = result {
+            assert!(rfe.support().iter().all(|&s| s));
+            assert!(rfe.ranking().iter().all(|&r| r == 1));
+            assert_eq!(rfe.n_features_selected(), 2);
+        }
     }
 
     #[test]
