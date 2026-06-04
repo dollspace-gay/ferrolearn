@@ -22,6 +22,7 @@
 //!     requires injecting `coefs_`/`intercepts_`, which is impossible here.
 //!   - REQ-4 (Adam eps / SGD nesterov): `apply_adam_update` / `apply_sgd_update`
 //!     are private free fns, unreachable from this external test crate.
+//!
 //! These are therefore filed as BLOCKERS referencing #1710, NOT failing tests
 //! (R-CHAR: a deterministic value test would need the weight-injection ctor
 //! that ferrolearn lacks). The blocker for the gap itself is filed too.

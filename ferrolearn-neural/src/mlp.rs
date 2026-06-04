@@ -38,6 +38,34 @@
 //! let preds = fitted.predict(&x).unwrap();
 //! assert_eq!(preds.len(), 4);
 //! ```
+//!
+//! Mirrors `sklearn/neural_network/_multilayer_perceptron.py` (tag 1.5.2,
+//! `MLPClassifier` `:762`, `MLPRegressor` `:1261`). RNG-coupled (random init +
+//! SGD/Adam minibatch shuffle): exact fitted weights are an R-DEFER-3 carve-out;
+//! the deterministic math (activations/forward/loss/optimizer) is the parity
+//! target — currently value-untestable through the public API (no weight
+//! injection, blocker #1711).
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | activations (relu/tanh/logistic/identity) | NOT-STARTED | math matches sklearn `ACTIVATIONS` but value-untestable (private fns, no weight injection) — blocker #1711 |
+//! | REQ-2 | L2 penalty in the reported loss | NOT-STARTED | `alpha` in gradient only, not the reported loss (`_multilayer_perceptron.py:334-338`) — blocker #1712 |
+//! | REQ-3 | forward-pass / predict value parity (fixed weights) | NOT-STARTED | no `coefs_`/`intercepts_` injection API to value-test — blocker #1711 |
+//! | REQ-4 | Adam eps / bias-correction placement | NOT-STARTED | textbook `m_hat/(sqrt(v_hat)+eps)` vs sklearn `lr_t`-fold + eps on `sqrt(v)` (~1e-9, `_stochastic_optimizers.py`) — blocker #1713 |
+//! | REQ-5 | exact fitted weights/predictions | NOT-STARTED | RNG carve-out (numpy MT vs Rust RNG; init zeros biases + Glorot-6, R-DEFER-3) — blockers #1720 / #1719 |
+//! | REQ-6 | lbfgs solver | NOT-STARTED | only Adam/SGD (`Solver` enum) — blocker #1716 |
+//! | REQ-7 | SGD lr schedule + nesterov + power_t/momentum | NOT-STARTED | constant lr, no nesterov — blocker #1714 |
+//! | REQ-8 | convergence `n_iter_no_change` | NOT-STARTED | single-epoch `\|Δloss\| < tol` vs sklearn 10-consecutive — blocker #1715 |
+//! | REQ-9 | constructor params (shuffle/warm_start/max_fun/n_iter_no_change/…) | NOT-STARTED | many absent — blocker #1717 |
+//! | REQ-10 | fitted attrs (`coefs_`/`loss_curve_`/`n_iter_`/`best_loss_`) | NOT-STARTED | not exposed — blocker #1718 |
+//! | REQ-11 | predict/predict_proba output contract (shape, softmax/binary sum-to-1, argmax) | SHIPPED | `forward_output`/`softmax_rows`; green structural guards in `tests/divergence_mlp.rs` (`_multilayer_perceptron.py:1252-1253`) |
+//! | REQ-12 | clippy-clean (no `collapsible_if`) | SHIPPED | let-chain at the early-stopping site; crate clippy `-D warnings` green |
+//! | REQ-13 | ferray substrate | NOT-STARTED | `ndarray` + `rand`, not `ferray` — blocker #1721 |
+//! | REQ-14 | non-test production consumer | NOT-STARTED | re-export only; no `ferrolearn-python` MLP binding — blocker #1722 |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -1403,27 +1431,25 @@ fn train_network<F: Float + ScalarOperand>(
         epoch_loss = epoch_loss / F::from(n_batches).unwrap();
 
         // Early stopping check.
-        if early_stopping {
-            if let (Some(xv), Some(yv)) = (&x_val, &y_val) {
-                let val_loss = compute_loss(
-                    xv,
-                    yv,
-                    layers,
-                    hidden_activation,
-                    output_activation,
-                    is_multiclass,
-                    is_classifier,
-                );
-                if val_loss < best_val_loss {
-                    best_val_loss = val_loss;
-                    best_layers = layers.clone();
-                    patience_counter = 0;
-                } else {
-                    patience_counter += 1;
-                    if patience_counter >= patience {
-                        *layers = best_layers;
-                        return Ok(());
-                    }
+        if early_stopping && let (Some(xv), Some(yv)) = (&x_val, &y_val) {
+            let val_loss = compute_loss(
+                xv,
+                yv,
+                layers,
+                hidden_activation,
+                output_activation,
+                is_multiclass,
+                is_classifier,
+            );
+            if val_loss < best_val_loss {
+                best_val_loss = val_loss;
+                best_layers = layers.clone();
+                patience_counter = 0;
+            } else {
+                patience_counter += 1;
+                if patience_counter >= patience {
+                    *layers = best_layers;
+                    return Ok(());
                 }
             }
         }
