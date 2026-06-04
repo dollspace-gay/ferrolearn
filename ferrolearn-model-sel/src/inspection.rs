@@ -5,6 +5,27 @@
 //!   (the "brute-force" partial dependence).
 //! - [`permutation_importance`] — importance of each feature measured by
 //!   the drop in score when its values are shuffled.
+//!
+//! Mirrors `sklearn/inspection/_partial_dependence.py` (brute PD) and
+//! `_permutation_importance.py` (tag 1.5.2). PD averaging is deterministic;
+//! permutation importance is structural + an RNG-shuffle carve-out.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | PD brute averaging `mean(predict(X with feat=v))` | SHIPPED | `fn partial_dependence` (`_partial_dependence.py:308` `np.average(pred, axis=0)`); `divergence_pd_brute_value_parity_linear_oracle` matches live `[1.5,2.0,2.5,6.5]` + mean-not-sum guard |
+//! | REQ-2 | predict-closure API (vs estimator) | SHIPPED | `Fn(&Array2)->Result<Array1>` closure = Rust analog of sklearn estimator + `response_method` (R-DEV-7); regressor parity via REQ-1 |
+//! | REQ-3 | PD grid from percentiles (`_grid_from_X`) | NOT-STARTED | requires an explicit `grid` (sklearn `percentiles=(0.05,0.95)`, `grid_resolution=100`) — blocker #1731 |
+//! | REQ-4 | PD multi-feature 2D + ICE (`kind`) | NOT-STARTED | single `feature_idx`, average only (`_partial_dependence.py:684`) — blocker #1732 |
+//! | REQ-5 | PD `sample_weight` + `method='recursion'` | NOT-STARTED | unweighted brute only — blocker #1733 |
+//! | REQ-6 | permutation_importance structure (sign, shapes, std ddof=0) | SHIPPED | `fn permutation_importance` `baseline - permuted` (`_permutation_importance.py:103-107`); `divergence_permutation_{sign_and_shape,std_ddof0_oracle,std_two_value_oracle}` |
+//! | REQ-7 | exact per-repeat importances | NOT-STARTED | RNG carve-out (`SmallRng` per-(j,r) vs numpy shared stream), R-DEFER-3 — blocker #1730 |
+//! | REQ-8 | permutation `scoring`/`sample_weight`/`max_samples` | NOT-STARTED | score-closure only (`_permutation_importance.py:276-307`) — blocker #1734 |
+//! | REQ-9 | ferray substrate | NOT-STARTED | `ndarray` + `rand`, not `ferray` — blocker #1735 |
+//! | REQ-10 | non-test production consumer | SHIPPED | boundary re-export `lib.rs` (S5) |
+//!
+//! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
