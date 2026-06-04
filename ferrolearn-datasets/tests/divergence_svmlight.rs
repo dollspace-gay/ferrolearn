@@ -228,7 +228,6 @@ fn divergence_load_qid_token_ignored() {
 /// `Xa = [[1., 2., 0., 0., 0.]]` — columns off by one vs sklearn.
 /// Tracking: #1650
 #[test]
-#[ignore = "divergence: load_svmlight_files auto base is per-file not global; tracking #1650"]
 fn divergence_load_files_global_zero_based_auto() {
     // sklearn dense X for file A under the GLOBAL auto rule (live oracle above):
     // because file B carries a `0:` column, all(min>0) is False, so neither file

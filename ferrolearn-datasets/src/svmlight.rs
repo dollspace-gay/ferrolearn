@@ -176,15 +176,23 @@ fn parse_contents(contents: &str) -> Result<ParsedFile, FerroError> {
     })
 }
 
-/// Resolve sklearn's default `zero_based="auto"` base offset for a single file
-/// (`_svmlight_format_io.py:402-409`): subtract 1 from every index iff the file
-/// has at least one feature AND its minimum raw index is strictly positive
-/// (a 1-based file). A file that already contains a `0:` column is kept as-is.
-fn auto_base_offset(min_index: Option<usize>) -> usize {
-    match min_index {
-        Some(m) if m > 0 => 1,
-        _ => 0,
-    }
+/// Resolve sklearn's default `zero_based="auto"` base offset GLOBALLY across a
+/// batch of parsed files (`_svmlight_format_io.py:402-409`):
+///
+/// ```text
+///     all(len(indices) and np.min(indices) > 0 for each file)
+/// ```
+///
+/// Subtract 1 from EVERY file's indices iff ALL files have at least one feature
+/// AND every file's minimum raw index is strictly positive (i.e. every file is
+/// 1-based). If a single file contains a `0:` column (min index 0), or any file
+/// has no features at all, the whole batch is treated as 0-based and NO file is
+/// shifted. Returns the common offset (0 or 1) applied to all files.
+fn auto_base_offset_global(files: &[ParsedFile]) -> usize {
+    let all_one_based = files
+        .iter()
+        .all(|pf| matches!(pf.min_index, Some(m) if m > 0));
+    usize::from(all_one_based)
 }
 
 /// Materialize parsed rows into a dense `(X, y)` given the base offset to
@@ -214,7 +222,10 @@ pub fn load_svmlight_str(
     n_features: Option<usize>,
 ) -> Result<SvmlightDataset, FerroError> {
     let parsed = parse_contents(contents)?;
-    let offset = auto_base_offset(parsed.min_index);
+    // Single-file auto resolution is just the global rule (sklearn routes the
+    // single-file loader through `load_svmlight_files([f])`) evaluated over one
+    // file: subtract 1 iff this file has features and its min index > 0.
+    let offset = auto_base_offset_global(std::slice::from_ref(&parsed));
     // After the base adjustment, the highest column index is `max_index -
     // offset`, so n_features = (max_index - offset) + 1.
     let observed = parsed.max_index.map_or(0, |m| m - offset + 1);
@@ -237,13 +248,15 @@ pub fn load_svmlight_str(
 
 /// Load multiple SVMlight files at once, returning one `(X, y)` per path.
 ///
-/// Mirrors sklearn (`_svmlight_format_io.py:410-419`): a SINGLE shared
-/// `n_features = max adjusted column index + 1` is computed across ALL files,
-/// and every returned `X` uses that common width. Each file's index base is
-/// resolved independently via the `zero_based="auto"` heuristic (sklearn applies
-/// the base adjustment per file before taking the global max). An explicit
-/// `n_features` is honored, erroring if it is smaller than the observed common
-/// width.
+/// Mirrors sklearn (`_svmlight_format_io.py:402-419`): the `zero_based="auto"`
+/// index-base decision is made ONCE, GLOBALLY across ALL files — every file's
+/// indices are shifted by 1 iff every file is 1-based (`all(len(indices) and
+/// np.min(indices) > 0 for each file)`); if a single file carries a `0:` column
+/// the whole batch stays 0-based and no file is shifted. After that shared
+/// offset is applied, a SINGLE common `n_features = max adjusted column index +
+/// 1` is computed across ALL files, and every returned `X` uses that common
+/// width. An explicit `n_features` is honored, erroring if it is smaller than
+/// the observed common width.
 pub fn load_svmlight_files<P: AsRef<Path>>(
     paths: &[P],
     n_features: Option<usize>,
@@ -256,15 +269,11 @@ pub fn load_svmlight_files<P: AsRef<Path>>(
         })
         .collect::<Result<_, _>>()?;
 
-    // Per-file auto base offset, then the global common width across all files.
-    let offsets: Vec<usize> = parsed
-        .iter()
-        .map(|pf| auto_base_offset(pf.min_index))
-        .collect();
+    // Single GLOBAL auto base offset across all files, then the common width.
+    let offset = auto_base_offset_global(&parsed);
     let observed = parsed
         .iter()
-        .zip(&offsets)
-        .map(|(pf, &off)| pf.max_index.map_or(0, |m| m - off + 1))
+        .map(|pf| pf.max_index.map_or(0, |m| m - offset + 1))
         .max()
         .unwrap_or(0);
 
@@ -285,8 +294,7 @@ pub fn load_svmlight_files<P: AsRef<Path>>(
 
     Ok(parsed
         .into_iter()
-        .zip(offsets)
-        .map(|(pf, off)| densify(pf.rows, off, n_feat))
+        .map(|pf| densify(pf.rows, offset, n_feat))
         .collect())
 }
 
