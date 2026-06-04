@@ -33,6 +33,27 @@
 //! let fitted = se.fit(&x, &()).unwrap();
 //! assert_eq!(fitted.embedding().ncols(), 2);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Translation target: scikit-learn 1.5.2 `class SpectralEmbedding` +
+//! `spectral_embedding` (`sklearn/manifold/_spectral_embedding.py`). Tracking:
+//! #1443. Each REQ is BINARY — SHIPPED (impl + non-test consumer + tests + green
+//! verification) or NOT-STARTED (with a concrete open blocker).
+//!
+//! | REQ | Scope | Status | Evidence / Blocker |
+//! |-----|-------|--------|--------------------|
+//! | REQ-1 | RBF embedding VALUE parity (distinct eigenvalues) — eigenvectors of `L_sym`, `1/dd` rescale, deterministic sign-flip | SHIPPED | [`SpectralEmbedding::fit`] rescales by `1/dd` (`degree`=off-diagonal row-sum, matching scipy `csgraph_laplacian` which ignores self-loops, `_spectral_embedding.py:443`) + per-column sign-flip (`:465`); element-wise matches live sklearn (gamma=0.3 asymmetric fixture, tol 1e-6) in `tests/divergence_spectral_embedding.rs` (was #1444, fixed). Consumer: re-export `lib.rs:100` |
+//! | REQ-2 | Structural embedding (shape `(n_samples, n_components)`, well-separated clusters separate, deterministic) | SHIPPED (scoped) | in-module + divergence structural guards |
+//! | REQ-3 | Normalized symmetric Laplacian `L_sym = I - D^{-1/2} W D^{-1/2}` (diagonal excluded, matching scipy) | SHIPPED | `normalised_laplacian`; matches `csgraph_laplacian(normed=True)` |
+//! | REQ-4 | RBF affinity off-diagonal `exp(-gamma·‖·‖²)` | SHIPPED (scoped) | `build_affinity_matrix` matches `rbf_kernel` off-diagonal (diagonal correctly 0 for the embedding Laplacian) |
+//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, <2 samples, kNN n_neighbors 0/≥n, gamma≤0) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-6 | kNN affinity GRAPH parity (`kneighbors_graph(include_self=True)` symmetrized `0.5(A+Aᵀ)`) | NOT-STARTED | sklearn `_spectral_embedding.py:689-710` — blocker #1445 |
+//! | REQ-7 | `eigen_solver`/`random_state` + degenerate-eigenvalue subspace basis (CARVE-OUT) + symmetric-fixture sign-flip ULP tie | NOT-STARTED | sklearn `_spectral_embedding.py:347-465` — blocker #1446 |
+//! | REQ-8 | Default `affinity='nearest_neighbors'` + `gamma=None→1/n_features` + precomputed/callable affinity | NOT-STARTED | sklearn `_spectral_embedding.py:660-715` — blocker #1447 |
+//! | REQ-9 | `affinity_matrix_`/`n_neighbors_` fitted attrs + transform out-of-sample | NOT-STARTED | sklearn `_spectral_embedding.py:472` — blocker #1448 |
+//! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1449 |
+//! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1450 |
 
 use crate::mds::eigh_faer;
 use ferrolearn_core::error::FerroError;
@@ -150,7 +171,11 @@ fn build_affinity_matrix(x: &Array2<f64>, affinity: &Affinity) -> Array2<f64> {
                     w[[i, j]] = val;
                     w[[j, i]] = val;
                 }
-                // Diagonal is 0 (no self-loops).
+                // Diagonal is 0 (no self-loops). scipy's
+                // `csgraph_laplacian(W, normed=True)` treats W as a graph
+                // adjacency and ignores the diagonal, computing
+                // `degree[i] = Σ_{j≠i} W[i,j]`. Setting `W_ii=0` makes the
+                // degree/Laplacian/`dd` match scipy (and hence sklearn) exactly.
             }
             w
         }
@@ -270,13 +295,13 @@ impl Fit<Array2<f64>, ()> for SpectralEmbedding {
             }
         }
 
-        if let Affinity::RBF { gamma } = self.affinity {
-            if gamma <= 0.0 {
-                return Err(FerroError::InvalidParameter {
-                    name: "gamma".into(),
-                    reason: "must be positive".into(),
-                });
-            }
+        if let Affinity::RBF { gamma } = self.affinity
+            && gamma <= 0.0
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "gamma".into(),
+                reason: "must be positive".into(),
+            });
         }
 
         // Step 1: Build affinity matrix.
@@ -296,12 +321,46 @@ impl Fit<Array2<f64>, ()> for SpectralEmbedding {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        // sklearn rescales the eigenvectors by `dd = sqrt(degree)`
+        // (`_spectral_embedding.py:443`, `embedding = embedding / dd`), where
+        // `degree[i] = Σ_j W[i,j]`. With the RBF diagonal at 0 this off-diagonal
+        // row-sum matches scipy's `csgraph_laplacian` degree exactly.
+        let mut dd = vec![0.0; n];
+        for i in 0..n {
+            let degree: f64 = (0..n).map(|j| w[[i, j]]).sum();
+            dd[i] = degree.sqrt();
+        }
+
         // Skip the first (trivial, eigenvalue ~ 0) eigenvector, take next n_components.
         let n_comp = self.n_components;
         let mut embedding = Array2::<f64>::zeros((n, n_comp));
         for (k, &idx) in indices.iter().skip(1).take(n_comp).enumerate() {
             for i in 0..n {
-                embedding[[i, k]] = eigenvectors[[i, idx]];
+                let v = eigenvectors[[i, idx]];
+                // Divide by `dd` of the row (guard against zero degree, mirroring
+                // the `deg > 1e-15` guard in `normalised_laplacian`).
+                embedding[[i, k]] = if dd[i] > 1e-15 { v / dd[i] } else { v };
+            }
+        }
+
+        // sklearn applies `_deterministic_vector_sign_flip`
+        // (`_spectral_embedding.py:465`) AFTER the `/dd` rescale: for each column,
+        // find the row with the maximum absolute value; if that entry is negative,
+        // negate the entire column.
+        for k in 0..n_comp {
+            let mut max_abs = 0.0;
+            let mut sign = 1.0;
+            for i in 0..n {
+                let v = embedding[[i, k]];
+                if v.abs() > max_abs {
+                    max_abs = v.abs();
+                    sign = if v < 0.0 { -1.0 } else { 1.0 };
+                }
+            }
+            if sign < 0.0 {
+                for i in 0..n {
+                    embedding[[i, k]] = -embedding[[i, k]];
+                }
             }
         }
 
