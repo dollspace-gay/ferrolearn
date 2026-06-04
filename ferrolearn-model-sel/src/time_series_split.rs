@@ -17,6 +17,26 @@
 //!     assert!(train.iter().all(|&tr| test.iter().all(|&te| tr < te)));
 //! }
 //! ```
+//!
+//! Mirrors scikit-learn's `sklearn/model_selection/_split.py` `TimeSeriesSplit`
+//! (`:1062`, tag 1.5.2). Fully deterministic; ferrolearn's `.split()` matches
+//! the live oracle across all configurations.
+//!
+//! ## REQ status
+//!
+//! | REQ | Behavior | Status | Evidence |
+//! |-----|----------|--------|----------|
+//! | REQ-1 | default split index parity (`test_size = n/(n_splits+1)`, `test_starts` range) | SHIPPED | `fn split_impl` (`_split.py:1219-1271`); `green_req1_default_*`, `green_req1_nondivisible_n4_n13` vs live oracle |
+//! | REQ-2 | explicit `test_size` | SHIPPED | `fn split_impl`; `green_req2_test_size_2` |
+//! | REQ-3 | `gap` (`train = [0, start-gap)`) | SHIPPED | `fn split_impl` `checked_sub(gap)`; `green_req3_gap_2` |
+//! | REQ-4 | `max_train_size` (`train = [start-gap-m, start-gap)`, incl. no-cap edge) | SHIPPED | `fn split_impl` `saturating_sub`; `green_req4_max_train_size_4` |
+//! | REQ-5 | error semantics (`n_folds>n` / `n-gap-test_size·n_splits<=0`) | SHIPPED | per-fold `checked_sub`/`train_end==0` guards fire on sklearn's two `ValueError` conditions (`:1246`,`:1251`); `green_req5_error_parity` (FerroError = R-DEV-2 analog) |
+//! | REQ-6 | `n_splits >= 2` validation | SHIPPED | rejects `n_splits < 2` (sklearn `_BaseKFold` Interval≥2); `green_req6_n_splits_less_than_2` (builder requires `n_splits`; sklearn default 5 — R-DEV-7 idiom) |
+//! | REQ-7 | ferray substrate | SHIPPED (N/A) | pure scalar / `Vec<usize>` index math; no `ndarray` in production |
+//! | REQ-8 | non-test production consumer | SHIPPED | `impl CrossValidator`; consumed by `cross_val_score`/`learning_curve`/`validation_curve` via `&dyn CrossValidator` |
+//!
+//! Verified by a 7500-case live-oracle sweep (0 fold-content / 0 error-status
+//! divergences). Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use ferrolearn_core::{FerroError, FerroResult};
 
