@@ -946,3 +946,9 @@ upstream = [
 ]
 design = ".design/datasets/svmlight.md"
 parity_ops = ["load_svmlight_file", "load_svmlight_files", "dump_svmlight_file", "load_files"]
+
+[[route]]
+crate_pattern = "ferrolearn-datasets/src/toy.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_base.py"]
+design = ".design/datasets/toy.md"
+parity_ops = ["load_iris", "load_wine", "load_breast_cancer", "load_diabetes", "load_digits", "load_linnerud"]
