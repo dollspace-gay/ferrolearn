@@ -27,7 +27,7 @@
 //! | REQ-5 (alpha≥0 validation; ≥2-class guard) | SHIPPED | negative-alpha → `InvalidParameter`; <2 classes → error. |
 //! | REQ-6 (class_weight / solver variants / solver_ / positive) | NOT-STARTED | blocker #393. |
 //! | REQ-7 (max_iter/tol + n_iter_) | NOT-STARTED | blocker #394. |
-//! | REQ-8 (sample_weight) | NOT-STARTED | blocker #395. |
+//! | REQ-8 (sample_weight) | SHIPPED | `RidgeClassifier::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` forwards weights into the underlying weighted ridge on the indicator matrix `Y`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off[t]=Σwᵢ·Y[i,t]/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescale of `X`/`Y` (sklearn `_rescale_data`, `_ridge.py:682-688`), per-target `linalg::solve_ridge` with `alpha` UNSCALED, `intercept[t]=y_off[t]−Σⱼ x_off[j]·coef[j,t]`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body). Mirrors `RidgeClassifier.fit(X, y, sample_weight=None)` (`_ridge.py:1220`) forwarding through `_prepare_data` (`_ridge.py:1305`) into `_BaseRidge.fit`. Oracle tests `ridge_classifier_sample_weight_matches_sklearn` (alpha=1 binary coef `[0.25333333, 0.36]`, intercept `-1.70666667`, differs from unweighted `[0.31840796, 0.31840796]`), `ridge_classifier_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #395. |
 //! | REQ-9 (RidgeClassifierCV) | NOT-STARTED | blocker #396. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | solve_ridge already on ferray::linalg fallback; coef storage ndarray (tied to #359). |
 //!
@@ -181,6 +181,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     /// Fit the Ridge Classifier by converting labels to a binary indicator
     /// matrix and solving multivariate Ridge regression.
     ///
+    /// Equivalent to [`RidgeClassifier::fit_with_sample_weight`] with
+    /// `sample_weight = None`.
+    ///
     /// # Errors
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
@@ -190,6 +193,49 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         &self,
         x: &Array2<F>,
         y: &Array1<usize>,
+    ) -> Result<FittedRidgeClassifier<F>, FerroError> {
+        // Unweighted fit is the `sample_weight=None` arm of the weighted fit,
+        // mirroring sklearn `RidgeClassifier.fit(X, y, sample_weight=None)`
+        // (`_ridge.py:1220`, default `sample_weight=None`).
+        self.fit_with_sample_weight(x, y, None)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    RidgeClassifier<F>
+{
+    /// Fit the Ridge Classifier with optional per-sample weights.
+    ///
+    /// Mirrors scikit-learn's `RidgeClassifier.fit(X, y, sample_weight=None)`
+    /// (`sklearn/linear_model/_ridge.py:1220`). The target is encoded as an
+    /// indicator matrix `Y` (binary `{-1, +1}` single column, multiclass
+    /// one-hot) via `LabelBinarizer(pos_label=1, neg_label=-1)`
+    /// (`_ridge.py:1300-1301`), then the underlying weighted ridge is solved on
+    /// `(X, Y)`: `sample_weight` is forwarded into `_BaseRidge.fit` which does
+    /// weighted `_preprocess_data` (weighted offsets) + `_rescale_data` (`√w`
+    /// row-rescale, `_ridge.py:682-688`).
+    ///
+    /// When `sample_weight` is `Some(w)` and `fit_intercept` is `true`, the
+    /// weighted offsets `x_off[j] = Σᵢ wᵢ·x[i,j] / Σwᵢ`,
+    /// `y_off[t] = Σᵢ wᵢ·Y[i,t] / Σwᵢ` center `X`/`Y`, then each row is rescaled
+    /// by `√wᵢ` before the per-target ridge solve, and
+    /// `intercept[t] = y_off[t] − Σⱼ x_off[j]·coef[j,t]`. With `fit_intercept`
+    /// `false` only the `√w` row-rescale is applied and the intercept is `0`.
+    ///
+    /// `sample_weight = None` is BYTE-IDENTICAL to [`Fit::fit`] (the unweighted
+    /// centering + per-target `linalg::solve_ridge` path).
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::ShapeMismatch`] — sample count mismatch, or
+    ///   `sample_weight.len() != n_samples`.
+    /// - [`FerroError::InvalidParameter`] — negative alpha.
+    /// - [`FerroError::InsufficientSamples`] — fewer than 2 classes / no samples.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+        sample_weight: Option<&Array1<F>>,
     ) -> Result<FittedRidgeClassifier<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
@@ -209,6 +255,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             return Err(FerroError::InvalidParameter {
                 name: "alpha".into(),
                 reason: "must be non-negative".into(),
+            });
+        }
+
+        if let Some(w) = sample_weight
+            && w.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![w.len()],
+                context: "sample_weight length must match number of samples in X".into(),
             });
         }
 
@@ -250,29 +306,82 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         } else {
             // Multiclass: one-hot.
             for i in 0..n_samples {
-                let ci = classes.iter().position(|&c| c == y[i]).unwrap();
+                // `classes` is the sorted-deduped image of `y`, so `y[i]` is
+                // always present; fall back to a typed error rather than panic.
+                let ci = classes.iter().position(|&c| c == y[i]).ok_or_else(|| {
+                    FerroError::NumericalInstability {
+                        message: "class label missing from class set".into(),
+                    }
+                })?;
                 y_indicator[[i, ci]] = <F as num_traits::One>::one();
             }
         }
 
-        // Center data if fit_intercept.
-        let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute column means".into(),
-                })?;
-            let y_mean =
-                y_indicator
-                    .mean_axis(Axis(0))
-                    .ok_or_else(|| FerroError::NumericalInstability {
-                        message: "failed to compute target means".into(),
+        // Center data if fit_intercept. With sample_weight the offsets are the
+        // weighted means and the rows are √w-rescaled before the solve
+        // (sklearn `_preprocess_data` weighted + `_rescale_data`,
+        // `_ridge.py:682-688`); the penalty `alpha` stays UNSCALED since
+        // (√w·Xc)ᵀ(√w·Xc) == Xcᵀ·W·Xc.
+        let (x_work, y_work, x_off, y_off) = match sample_weight {
+            None => {
+                if self.fit_intercept {
+                    let x_mean =
+                        x.mean_axis(Axis(0))
+                            .ok_or_else(|| FerroError::NumericalInstability {
+                                message: "failed to compute column means".into(),
+                            })?;
+                    let y_mean = y_indicator.mean_axis(Axis(0)).ok_or_else(|| {
+                        FerroError::NumericalInstability {
+                            message: "failed to compute target means".into(),
+                        }
                     })?;
-            let x_c = x - &x_mean;
-            let y_c = &y_indicator - &y_mean;
-            (x_c, y_c, Some(x_mean), Some(y_mean))
-        } else {
-            (x.clone(), y_indicator.clone(), None, None)
+                    let x_c = x - &x_mean;
+                    let y_c = &y_indicator - &y_mean;
+                    (x_c, y_c, Some(x_mean), Some(y_mean))
+                } else {
+                    (x.clone(), y_indicator.clone(), None, None)
+                }
+            }
+            Some(w) => {
+                // Per-row √w factor (sklearn `_rescale_data`, `_ridge.py:682-688`).
+                let w_sqrt = w.mapv(<F as Float>::sqrt);
+
+                if self.fit_intercept {
+                    // WEIGHTED offsets: x_off[j] = Σ wᵢ x[i,j] / Σ wᵢ,
+                    // y_off[t] = Σ wᵢ Y[i,t] / Σ wᵢ.
+                    let w_sum = w.sum();
+                    if w_sum <= <F as num_traits::Zero>::zero() {
+                        return Err(FerroError::NumericalInstability {
+                            message: "sum of sample_weight must be positive to center".into(),
+                        });
+                    }
+
+                    let mut x_mean = Array1::<F>::zeros(n_features);
+                    for (i, row) in x.outer_iter().enumerate() {
+                        let wi = w[i];
+                        x_mean = &x_mean + &row.mapv(|v| v * wi);
+                    }
+                    x_mean.mapv_inplace(|v| v / w_sum);
+
+                    let mut y_mean = Array1::<F>::zeros(n_targets);
+                    for (i, row) in y_indicator.outer_iter().enumerate() {
+                        let wi = w[i];
+                        y_mean = &y_mean + &row.mapv(|v| v * wi);
+                    }
+                    y_mean.mapv_inplace(|v| v / w_sum);
+
+                    let x_centered = x - &x_mean;
+                    let y_centered = &y_indicator - &y_mean;
+                    let x_scaled = &x_centered * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = &y_centered * &w_sqrt.view().insert_axis(Axis(1));
+                    (x_scaled, y_scaled, Some(x_mean), Some(y_mean))
+                } else {
+                    // No centering; just √w row-rescaling, intercept 0.
+                    let x_scaled = x * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = &y_indicator * &w_sqrt.view().insert_axis(Axis(1));
+                    (x_scaled, y_scaled, None, None)
+                }
+            }
         };
 
         // Solve Ridge for each target column.
@@ -286,7 +395,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         }
 
         // Compute intercepts.
-        let intercept_vec = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
+        let intercept_vec = if let (Some(xm), Some(ym)) = (&x_off, &y_off) {
             let xm_dot = xm.dot(&coef_matrix);
             ym - &xm_dot
         } else {
@@ -394,6 +503,92 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> HasClasses for FittedRidg
 mod tests {
     use super::*;
     use ndarray::array;
+
+    #[test]
+    fn ridge_classifier_sample_weight_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import RidgeClassifier; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.],[1.,1.],[4.,4.]]); \
+        //     y=np.array([0,0,1,1,1,0,1]); w=np.array([1.,3.,1.,1.,2.,1.,1.]); \
+        //     m=RidgeClassifier(alpha=1.0).fit(X,y,sample_weight=w); \
+        //     print([round(c,8) for c in m.coef_[0]], round(m.intercept_[0],8))"
+        //   -> weighted   coef_ [0.25333333, 0.36],       intercept_ -1.70666667
+        //   -> unweighted coef_ [0.31840796, 0.31840796], intercept_ -1.67661692
+        let x = Array2::from_shape_vec(
+            (7, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0, 5.0, 5.0, 1.0, 1.0, 4.0, 4.0,
+            ],
+        )
+        .unwrap();
+        let y = array![0usize, 0, 1, 1, 1, 0, 1];
+        let w = array![1.0, 3.0, 1.0, 1.0, 2.0, 1.0, 1.0];
+
+        let model = RidgeClassifier::<f64>::new().with_alpha(1.0);
+        let fitted = model.fit_with_sample_weight(&x, &y, Some(&w)).unwrap();
+
+        // Binary => single target column 0; coef_matrix is (n_features, n_targets).
+        let coef = fitted.coef_matrix();
+        assert!(
+            (coef[[0, 0]] - 0.253_333_33).abs() < 1e-6,
+            "coef[0]={} expected 0.25333333",
+            coef[[0, 0]]
+        );
+        assert!(
+            (coef[[1, 0]] - 0.36).abs() < 1e-6,
+            "coef[1]={} expected 0.36",
+            coef[[1, 0]]
+        );
+        assert!(
+            (fitted.intercept_vec()[0] - (-1.706_666_67)).abs() < 1e-6,
+            "intercept={} expected -1.70666667",
+            fitted.intercept_vec()[0]
+        );
+
+        // Non-tautological: must differ from the unweighted fit.
+        let unweighted = model.fit(&x, &y).unwrap();
+        let uw = unweighted.coef_matrix();
+        assert!(
+            (uw[[0, 0]] - 0.318_407_96).abs() < 1e-6 && (uw[[1, 0]] - 0.318_407_96).abs() < 1e-6,
+            "unweighted oracle mismatch: [{}, {}]",
+            uw[[0, 0]],
+            uw[[1, 0]]
+        );
+        assert!(
+            (coef[[0, 0]] - uw[[0, 0]]).abs() > 1e-3,
+            "weighted fit must differ from unweighted fit"
+        );
+    }
+
+    #[test]
+    fn ridge_classifier_none_sample_weight_equals_unweighted() {
+        // `fit_with_sample_weight(.., None)` must be byte-identical to `fit`.
+        let x = Array2::from_shape_vec(
+            (7, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0, 5.0, 5.0, 1.0, 1.0, 4.0, 4.0,
+            ],
+        )
+        .unwrap();
+        let y = array![0usize, 0, 1, 1, 1, 0, 1];
+
+        let model = RidgeClassifier::<f64>::new().with_alpha(1.0);
+        let via_fit = model.fit(&x, &y).unwrap();
+        let via_none = model.fit_with_sample_weight(&x, &y, None).unwrap();
+
+        assert_eq!(via_fit.coef_matrix(), via_none.coef_matrix());
+        assert_eq!(via_fit.intercept_vec(), via_none.intercept_vec());
+
+        // Same for fit_intercept=false.
+        let model_ni = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_fit_intercept(false);
+        let via_fit_ni = model_ni.fit(&x, &y).unwrap();
+        let via_none_ni = model_ni.fit_with_sample_weight(&x, &y, None).unwrap();
+        assert_eq!(via_fit_ni.coef_matrix(), via_none_ni.coef_matrix());
+        assert_eq!(via_fit_ni.intercept_vec(), via_none_ni.intercept_vec());
+    }
 
     #[test]
     fn test_default_constructor() {
