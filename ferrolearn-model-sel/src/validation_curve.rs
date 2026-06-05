@@ -78,9 +78,11 @@ pub struct ValidationCurveResult {
 ///
 /// Note: per-cell estimator failures (a `fit`, `predict`, or `scoring` error
 /// for a single `(param, fold)` cell) do NOT abort the call. Mirroring
-/// scikit-learn's default `error_score=np.nan`, the failing cell's train and
-/// test scores are filled with [`f64::NAN`] and the curve continues, preserving
-/// the full `(n_params, n_folds)` shape.
+/// scikit-learn's default `error_score=np.nan`, the affected scores are filled
+/// with [`f64::NAN`] and the curve continues, preserving the full
+/// `(n_params, n_folds)` shape. Train and test are scored independently: a `fit`
+/// failure NaN-fills BOTH the train and test cells, but an independent train- or
+/// test-side `predict`/`scoring` failure NaN-fills only that one side.
 pub fn validation_curve(
     x: &Array2<f64>,
     y: &Array1<f64>,
@@ -150,22 +152,31 @@ pub fn validation_curve(
             let y_test: Array1<f64> = test_idx.iter().map(|&i| y[i]).collect();
 
             // Fit and score this (param, fold) cell. Mirroring scikit-learn's
-            // default `error_score=np.nan`, any estimator failure to
-            // fit/predict/score for this single cell fills BOTH the train and
-            // test scores with NaN and CONTINUES the curve — it does NOT abort.
-            let cell: Result<(f64, f64), FerroError> = (|| {
-                let fitted = pipeline.fit(&x_train, &y_train)?;
-
-                let y_train_pred = fitted.predict(&x_train)?;
-                let train_score = scoring(&y_train, &y_train_pred)?;
-
-                let y_test_pred = fitted.predict(&x_test)?;
-                let test_score = scoring(&y_test, &y_test_pred)?;
-
-                Ok((train_score, test_score))
-            })();
-
-            let (train_score, test_score) = cell.unwrap_or((f64::NAN, f64::NAN));
+            // default `error_score=np.nan`, any estimator failure for this
+            // single cell fills the affected scores with NaN and CONTINUES the
+            // curve — it does NOT abort. Train and test are scored INDEPENDENTLY
+            // (sklearn `_fit_and_score`, `_validation.py:910` test `_score` and
+            // `:915` train `_score`): a FIT failure NaN-fills BOTH cells, but a
+            // predict/scoring failure on only one side NaN-fills only that side.
+            let (train_score, test_score) = match pipeline.fit(&x_train, &y_train) {
+                // Fit failure ⇒ BOTH cells NaN (sklearn _fit_and_score :890-905).
+                Err(_) => (f64::NAN, f64::NAN),
+                Ok(fitted) => {
+                    // Independent train/test scoring (sklearn two _score calls
+                    // :910/:915); a failure on one side does not affect the other.
+                    let train_score = (|| {
+                        let p = fitted.predict(&x_train)?;
+                        scoring(&y_train, &p)
+                    })()
+                    .unwrap_or(f64::NAN);
+                    let test_score = (|| {
+                        let p = fitted.predict(&x_test)?;
+                        scoring(&y_test, &p)
+                    })()
+                    .unwrap_or(f64::NAN);
+                    (train_score, test_score)
+                }
+            };
             train_scores_data.push(train_score);
             test_scores_data.push(test_score);
         }

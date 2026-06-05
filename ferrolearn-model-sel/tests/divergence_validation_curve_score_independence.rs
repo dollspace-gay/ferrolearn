@@ -65,10 +65,7 @@ impl FittedPipelineEstimator<f64> for FittedConstant {
 /// the train fold by `y_true.len() == 20`, exactly mirroring the live-oracle
 /// `make_scorer` that raises when `len(y_true) == 20`. On the test fold this
 /// returns neg-MSE, the same metric ferrolearn computes elsewhere.
-fn neg_mse_raise_on_train(
-    y_true: &Array1<f64>,
-    y_pred: &Array1<f64>,
-) -> Result<f64, FerroError> {
+fn neg_mse_raise_on_train(y_true: &Array1<f64>, y_pred: &Array1<f64>) -> Result<f64, FerroError> {
     if y_true.len() == 20 {
         return Err(FerroError::InvalidParameter {
             name: "train_scorer".into(),
@@ -122,7 +119,6 @@ fn neg_mse_raise_on_train(
 /// train-side failure does not clobber the (sklearn-finite) test score.
 // #1762
 #[test]
-#[ignore = "divergence: train-scoring failure clobbers test score (coupled closure); sklearn scores independently; tracking #1762"]
 fn divergence_train_score_failure_clobbers_test_score() {
     let y: Array1<f64> = (0..30).map(f64::from).collect();
     let x = Array2::<f64>::zeros((30, 2));
@@ -138,8 +134,16 @@ fn divergence_train_score_failure_clobbers_test_score() {
     )
     .expect("sklearn returns a partial nan-bearing curve (train nan, test finite), not an error");
 
-    assert_eq!(result.train_scores.shape(), &[1, 3], "shape (n_params, n_folds)");
-    assert_eq!(result.test_scores.shape(), &[1, 3], "shape (n_params, n_folds)");
+    assert_eq!(
+        result.train_scores.shape(),
+        &[1, 3],
+        "shape (n_params, n_folds)"
+    );
+    assert_eq!(
+        result.test_scores.shape(),
+        &[1, 3],
+        "shape (n_params, n_folds)"
+    );
 
     // sklearn nan-fills ONLY the failing (train) set.
     for j in 0..3usize {
