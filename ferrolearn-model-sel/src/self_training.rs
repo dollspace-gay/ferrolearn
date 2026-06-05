@@ -151,39 +151,32 @@ impl SelfTrainingClassifier {
         // Working copy of labels — we'll fill in pseudo-labels.
         let mut labels: Vec<usize> = y.to_vec();
 
-        let mut predict_fn: Option<PredictFn> = None;
         let mut n_iter = 0;
 
-        for _iter in 0..self.max_iter {
+        // Self-training loop, mirroring sklearn's while-semantics
+        // (`sklearn/semi_supervised/_self_training.py:247-282`): iterate only
+        // while unlabeled samples remain AND the iteration cap is not reached.
+        // `n_iter` is incremented INSIDE the loop, so all-labeled input never
+        // increments it (`n_iter == 0`).
+        while labeled_mask.iter().any(|&m| !m) && n_iter < self.max_iter {
             n_iter += 1;
 
-            // Gather labeled indices.
+            // Gather labeled indices and refit on the currently-labeled set.
             let labeled_idx: Vec<usize> = labeled_mask
                 .iter()
                 .enumerate()
                 .filter_map(|(i, &m)| if m { Some(i) } else { None })
                 .collect();
-
-            // Build labeled subsets.
             let x_labeled = select_rows(x, &labeled_idx);
             let y_labeled = Array1::from_vec(labeled_idx.iter().map(|&i| labels[i]).collect());
-
-            // Fit on labeled data.
             let pred_fn = (self.fit_fn)(&x_labeled, &y_labeled)?;
 
-            // Find unlabeled indices.
+            // Predict on the current unlabeled set.
             let unlabeled_idx: Vec<usize> = labeled_mask
                 .iter()
                 .enumerate()
                 .filter_map(|(i, &m)| if m { None } else { Some(i) })
                 .collect();
-
-            if unlabeled_idx.is_empty() {
-                predict_fn = Some(pred_fn);
-                break;
-            }
-
-            // Predict on unlabeled data.
             let x_unlabeled = select_rows(x, &unlabeled_idx);
             let scores = pred_fn(&x_unlabeled)?;
 
@@ -207,39 +200,21 @@ impl SelfTrainingClassifier {
             }
 
             if new_labels_count == 0 {
-                // Converged — no new pseudo-labels.
-                predict_fn = Some(pred_fn);
+                // Converged — no new pseudo-labels (sklearn 'no_change').
                 break;
-            }
-
-            // If this is the last iteration, save the predict function.
-            if _iter == self.max_iter - 1 {
-                // Re-fit on the final labeled set.
-                let final_labeled_idx: Vec<usize> = labeled_mask
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &m)| if m { Some(i) } else { None })
-                    .collect();
-                let x_final = select_rows(x, &final_labeled_idx);
-                let y_final =
-                    Array1::from_vec(final_labeled_idx.iter().map(|&i| labels[i]).collect());
-                predict_fn = Some((self.fit_fn)(&x_final, &y_final)?);
             }
         }
 
-        // If we exhausted iterations without breaking, do a final fit.
-        let final_predict = if let Some(pf) = predict_fn {
-            pf
-        } else {
-            let labeled_idx: Vec<usize> = labeled_mask
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &m)| if m { Some(i) } else { None })
-                .collect();
-            let x_final = select_rows(x, &labeled_idx);
-            let y_final = Array1::from_vec(labeled_idx.iter().map(|&i| labels[i]).collect());
-            (self.fit_fn)(&x_final, &y_final)?
-        };
+        // One final fit on ALL currently-labeled samples, matching sklearn's
+        // post-loop `base_estimator_.fit(...)` (`_self_training.py:295`).
+        let final_labeled_idx: Vec<usize> = labeled_mask
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &m)| if m { Some(i) } else { None })
+            .collect();
+        let x_final = select_rows(x, &final_labeled_idx);
+        let y_final = Array1::from_vec(final_labeled_idx.iter().map(|&i| labels[i]).collect());
+        let final_predict = (self.fit_fn)(&x_final, &y_final)?;
 
         let final_labels = Array1::from_vec(labels);
 
@@ -266,7 +241,8 @@ pub struct FittedSelfTrainingClassifier {
     /// assigned during self-training. Samples that were never pseudo-labeled
     /// retain the [`UNLABELED`] sentinel.
     transduced_labels: Array1<usize>,
-    /// Number of self-training iterations performed.
+    /// Number of productive self-training iterations performed (0 if all
+    /// samples were labeled to begin with), mirroring sklearn's `n_iter_`.
     n_iter: usize,
 }
 
@@ -352,7 +328,8 @@ mod tests {
         for (i, &l) in fitted.transduced_labels().iter().enumerate() {
             assert_eq!(l, y[i]);
         }
-        assert_eq!(fitted.n_iter(), 1);
+        // All-labeled input: the while-body never runs (sklearn n_iter_==0).
+        assert_eq!(fitted.n_iter(), 0);
     }
 
     #[test]

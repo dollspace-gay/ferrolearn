@@ -228,7 +228,6 @@ fn divergence_threshold_bound_zero_accepted_1842() {
 /// (ferrolearn's own `test_self_training_all_labeled` asserts the divergent `1`.)
 /// Tracking: #1846.
 #[test]
-#[ignore = "divergence: ferrolearn n_iter==1 for all-labeled input vs sklearn n_iter_==0; tracking #1846"]
 fn divergence_all_labeled_n_iter_1846() {
     let x = Array2::from_shape_vec((4, 1), vec![0.0, 0.1, 0.9, 1.0]).unwrap();
     let y = Array1::from_vec(vec![0, 0, 1, 1]); // fully labeled, no UNLABELED
