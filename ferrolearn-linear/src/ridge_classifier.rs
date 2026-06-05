@@ -26,7 +26,8 @@
 //! | REQ-4 (coef_/intercept_/classes_ introspection) | SHIPPED | `HasCoefficients`/`HasClasses`; values match oracle. NOTE: `coef_matrix` is `(n_features, n_targets)`, transposed vs sklearn `coef_` `(n_classes, n_features)` — orientation contract owned by the `ferrolearn-python` binding layer. |
 //! | REQ-5 (alpha≥0 validation; ≥2-class guard) | SHIPPED | negative-alpha → `InvalidParameter`; <2 classes → error. |
 //! | REQ-6a (positive=True) | SHIPPED | `RidgeClassifier<F>` adds `pub positive: bool` (default `false`, `_ridge.py:902`/`:911`) + `with_positive(bool)` builder. When `self.positive`, `fit_with_sample_weight` solves EACH indicator-target column via `crate::linalg::nonneg_ridge_cd` (shared projected-coordinate-descent kernel — `wⱼ = max(0, (A[:,j]ᵀr + col_sq[j]·wⱼ)/(col_sq[j] + alpha))`, `max_iter=self.max_iter.unwrap_or(1000)`/`self.tol`) on the SAME centered/√w-rescaled design `solve_ridge` uses; intercept recovery (`y_off[t] − x_off·coef[:,t]`) UNCHANGED. Mirrors the optimum sklearn reaches with L-BFGS-B for `positive=True` (`_ridge.py:329`, objective `0.5·‖Xw−y‖²+0.5·alpha·‖w‖²`, bounds `[(0,inf)]`). `n_iter_ = Some(worst-case iters over targets)` on the positive path, `None` otherwise. `positive=false` (default) is byte-identical to the unconstrained closed-form path. Oracle tests `ridge_classifier_positive_matches_sklearn` (alpha=1 binary coef `[0.52631579, 0.0]`, intercept `-1.43609023`, all ≥ 0, differs from unconstrained `[0.35294118, -0.23529412]`), `ridge_classifier_positive_false_unchanged` (byte-identical guard). Split from REQ-6 of blocker #393. |
-//! | REQ-6b (class_weight / solver variants / solver_) | NOT-STARTED | blocker #393 (positive done — see REQ-6a). No `class_weight` (`_ridge.py:1398`), no `solver` selection or `solver_` attribute (`_ridge.py:1406-1484`). |
+//! | REQ-6b-i (class_weight) | SHIPPED | `RidgeClassifier<F>` adds `pub class_weight: ClassWeight<F>` (enum `None`/`Balanced`/`Explicit(HashMap<usize,F>)`, default `None`, `_ridge.py:1398`/`:1400`) + `with_class_weight` builder. `fit_with_sample_weight` computes a per-class weight (`Balanced`: `n_samples/(n_classes·count[c])`, `_ridge.py:1402-1404` + `class_weight.py:73`; `Explicit`: `map[c]` else `1.0`, `class_weight.py:77-81`), multiplies it into the user `sample_weight` (or ones) and feeds the EXISTING weighted ridge — mirroring `_ridge.py:1305-1307` (`sample_weight = sample_weight * compute_sample_weight(self.class_weight, y)`). `ClassWeight::None` leaves the unweighted/sample-weighted paths byte-identical. Oracle tests `ridge_classifier_class_weight_balanced_matches_sklearn` (coef `[0.26923077,0.26923077]`, intercept `-2.01923077`), `ridge_classifier_class_weight_dict_matches_sklearn` (`{0:1,1:3}` → `[0.27096774,0.27096774]`, `-2.03225806`), `ridge_classifier_class_weight_none_unchanged` (byte-identical guard), `ridge_classifier_class_weight_explicit_equals_balanced`. Split from REQ-6b of blocker #393. |
+//! | REQ-6b-ii (solver / solver_) | NOT-STARTED | blocker #393 (class_weight done — see REQ-6b-i; positive done — see REQ-6a). No `solver` selection or `solver_` attribute (`_ridge.py:1406-1484`). |
 //! | REQ-7 (max_iter/tol + n_iter_) | SHIPPED | `RidgeClassifier<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidgeClassifier<F>` adds `n_iter_: Option<usize>` (always `None` for the direct solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:1520-1521`) and `n_iter_` (`_ridge.py:1464`); `max_iter`/`tol` are no-ops for the direct solver — matching sklearn when the direct path yields `n_iter_=None`. Test: `ridge_classifier_max_iter_tol_niter_defaults_and_builders`. Closes #394. |
 //! | REQ-8 (sample_weight) | SHIPPED | `RidgeClassifier::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` forwards weights into the underlying weighted ridge on the indicator matrix `Y`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off[t]=Σwᵢ·Y[i,t]/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescale of `X`/`Y` (sklearn `_rescale_data`, `_ridge.py:682-688`), per-target `linalg::solve_ridge` with `alpha` UNSCALED, `intercept[t]=y_off[t]−Σⱼ x_off[j]·coef[j,t]`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body). Mirrors `RidgeClassifier.fit(X, y, sample_weight=None)` (`_ridge.py:1220`) forwarding through `_prepare_data` (`_ridge.py:1305`) into `_BaseRidge.fit`. Oracle tests `ridge_classifier_sample_weight_matches_sklearn` (alpha=1 binary coef `[0.25333333, 0.36]`, intercept `-1.70666667`, differs from unweighted `[0.31840796, 0.31840796]`), `ridge_classifier_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #395. |
 //! | REQ-9 (RidgeClassifierCV) | NOT-STARTED | blocker #396. |
@@ -64,6 +65,34 @@ use num_traits::{Float, FromPrimitive};
 
 use crate::linalg;
 
+/// Per-class weighting strategy for [`RidgeClassifier`] (sklearn
+/// `class_weight`, `sklearn/linear_model/_ridge.py:1398`).
+///
+/// Mirrors `sklearn.utils.class_weight.compute_class_weight`: the chosen
+/// per-class weight multiplies into any user `sample_weight` BEFORE the
+/// weighted ridge fit (`_ridge.py:1305-1307`,
+/// `sample_weight = sample_weight * compute_sample_weight(self.class_weight, y)`).
+///
+/// - [`ClassWeight::None`] — all classes weight `1.0` (sklearn `None`,
+///   `_ridge.py:1400`).
+/// - [`ClassWeight::Balanced`] — `n_samples / (n_classes * bincount(y))`
+///   (sklearn `'balanced'`, `_ridge.py:1402-1404`,
+///   `class_weight.py:73`).
+/// - [`ClassWeight::Explicit`] — map of class label → weight; classes absent
+///   from the map keep weight `1.0` (sklearn dict, `class_weight.py:77-81`).
+#[derive(Debug, Clone, Default)]
+pub enum ClassWeight<F> {
+    /// All classes have weight `1.0` (sklearn `None`).
+    #[default]
+    None,
+    /// Inversely proportional to class frequency:
+    /// `n_samples / (n_classes * count[c])` (sklearn `'balanced'`).
+    Balanced,
+    /// Explicit per-class weights; classes not present default to `1.0`
+    /// (sklearn dict).
+    Explicit(std::collections::HashMap<usize, F>),
+}
+
 /// Ridge Classifier.
 ///
 /// Applies Ridge regression (L2-regularized least squares) to classification
@@ -97,6 +126,14 @@ pub struct RidgeClassifier<F> {
     /// optimum sklearn reaches with its L-BFGS-B solver for `positive=True`
     /// (`_ridge.py:329`). Default `false`, matching sklearn (`_ridge.py:902`).
     pub positive: bool,
+    /// Per-class sample weighting (sklearn `class_weight`,
+    /// `_ridge.py:1398`). Reweights samples by class membership before the
+    /// weighted ridge fit, multiplying into any user `sample_weight`
+    /// (`_ridge.py:1305-1307`, mirroring
+    /// `sklearn.utils.class_weight.compute_class_weight`). Default
+    /// [`ClassWeight::None`] (all classes weight `1.0`,
+    /// matching sklearn `class_weight=None`, `_ridge.py:1400`).
+    pub class_weight: ClassWeight<F>,
 }
 
 impl<F: Float> RidgeClassifier<F> {
@@ -114,6 +151,7 @@ impl<F: Float> RidgeClassifier<F> {
             max_iter: None,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             positive: false,
+            class_weight: ClassWeight::None,
         }
     }
 
@@ -166,6 +204,20 @@ impl<F: Float> RidgeClassifier<F> {
     #[must_use]
     pub fn with_positive(mut self, positive: bool) -> Self {
         self.positive = positive;
+        self
+    }
+
+    /// Set the per-class sample weighting strategy (sklearn `class_weight`,
+    /// `_ridge.py:1398`).
+    ///
+    /// The selected per-class weight reweights samples by class membership and
+    /// multiplies into any user `sample_weight` before the weighted ridge fit
+    /// (`_ridge.py:1305-1307`, mirroring
+    /// `sklearn.utils.class_weight.compute_class_weight`). [`ClassWeight::None`]
+    /// (default) leaves the unweighted fit byte-identical.
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
         self
     }
 }
@@ -367,6 +419,83 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                 context: "RidgeClassifier requires at least one sample".into(),
             });
         }
+
+        // Per-class reweighting (sklearn `class_weight`, `_ridge.py:1398`).
+        // `compute_class_weight` (`class_weight.py`) yields a per-class weight;
+        // it then multiplies into the (defaulted-to-ones) user `sample_weight`
+        // (`_ridge.py:1305-1307`,
+        // `sample_weight = sample_weight * compute_sample_weight(...)`). We only
+        // synthesize a weight vector for Balanced/Explicit; `ClassWeight::None`
+        // leaves `sample_weight` untouched so the unweighted fast-path stays
+        // byte-identical.
+        let class_weighted = match &self.class_weight {
+            ClassWeight::None => None,
+            ClassWeight::Balanced => {
+                // w_class[c] = n_samples / (n_classes * count[c]).
+                let n_classes = classes.len();
+                let n_samples_f =
+                    F::from(n_samples).ok_or_else(|| FerroError::NumericalInstability {
+                        message: "failed to convert n_samples to float".into(),
+                    })?;
+                let n_classes_f =
+                    F::from(n_classes).ok_or_else(|| FerroError::NumericalInstability {
+                        message: "failed to convert n_classes to float".into(),
+                    })?;
+                let mut w_class = vec![<F as num_traits::One>::one(); n_classes];
+                for (ci, &c) in classes.iter().enumerate() {
+                    let count = y.iter().filter(|&&label| label == c).count();
+                    let count_f =
+                        F::from(count).ok_or_else(|| FerroError::NumericalInstability {
+                            message: "failed to convert class count to float".into(),
+                        })?;
+                    w_class[ci] = n_samples_f / (n_classes_f * count_f);
+                }
+                Some(w_class)
+            }
+            ClassWeight::Explicit(map) => {
+                // w_class[c] = map[c] if present else 1.0.
+                let mut w_class = Vec::with_capacity(classes.len());
+                for &c in &classes {
+                    w_class.push(
+                        map.get(&c)
+                            .copied()
+                            .unwrap_or(<F as num_traits::One>::one()),
+                    );
+                }
+                Some(w_class)
+            }
+        };
+
+        // Materialize the effective per-sample weight vector when class
+        // weighting is active, multiplying the per-class weight into the
+        // user-supplied base (or ones). Keep it alive for the borrow below.
+        let effective_weight: Option<Array1<F>> = match &class_weighted {
+            None => None,
+            Some(w_class) => {
+                let mut eff = Array1::<F>::zeros(n_samples);
+                for i in 0..n_samples {
+                    let ci = classes.iter().position(|&c| c == y[i]).ok_or_else(|| {
+                        FerroError::NumericalInstability {
+                            message: "class label missing from class set".into(),
+                        }
+                    })?;
+                    let base = match sample_weight {
+                        Some(sw) => sw[i],
+                        None => <F as num_traits::One>::one(),
+                    };
+                    eff[i] = w_class[ci] * base;
+                }
+                Some(eff)
+            }
+        };
+
+        // Route the effective weights into the SAME weighted solve below.
+        // `None` (ClassWeight::None) preserves the original `sample_weight`
+        // (incl. the byte-identical unweighted `None` fast-path).
+        let sample_weight: Option<&Array1<F>> = match &effective_weight {
+            Some(eff) => Some(eff),
+            None => sample_weight,
+        };
 
         let is_binary = classes.len() == 2;
 
@@ -970,6 +1099,191 @@ mod tests {
         assert_eq!(via_default.coef_matrix(), via_false.coef_matrix());
         assert_eq!(via_default.intercept_vec(), via_false.intercept_vec());
         assert_eq!(via_default.n_iter(), via_false.n_iter());
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_class_weight_balanced_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import RidgeClassifier; \
+        //     X=np.array([[1,2],[2,1],[3,1],[1,3],[2,2],[3,3],[6,5],[5,6]],float); \
+        //     y=np.array([0,0,0,0,0,0,1,1]); \
+        //     m=RidgeClassifier(alpha=1.0,class_weight='balanced').fit(X,y); \
+        //     print([round(c,10) for c in m.coef_[0]], round(m.intercept_[0],10))"
+        //   -> coef_ [0.2692307692, 0.2692307692], intercept_ -2.0192307692
+        // balanced per-class weights: class0 = 8/(2*6) = 0.6666666667,
+        //                             class1 = 8/(2*2) = 2.0.
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 1.0, 1.0, 3.0, 2.0, 2.0, 3.0, 3.0, 6.0, 5.0, 5.0, 6.0,
+            ],
+        )
+        .map_err(|e| FerroError::NumericalInstability {
+            message: e.to_string(),
+        })?;
+        let y = array![0usize, 0, 0, 0, 0, 0, 1, 1];
+
+        let model = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_class_weight(ClassWeight::Balanced);
+        let fitted = model.fit(&x, &y)?;
+        let coef = fitted.coef_matrix();
+        assert!(
+            (coef[[0, 0]] - 0.269_230_769_2).abs() < 1e-6,
+            "coef[0]={} expected 0.2692307692",
+            coef[[0, 0]]
+        );
+        assert!(
+            (coef[[1, 0]] - 0.269_230_769_2).abs() < 1e-6,
+            "coef[1]={} expected 0.2692307692",
+            coef[[1, 0]]
+        );
+        assert!(
+            (fitted.intercept_vec()[0] - (-2.019_230_769_2)).abs() < 1e-6,
+            "intercept={} expected -2.0192307692",
+            fitted.intercept_vec()[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_class_weight_dict_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import RidgeClassifier; \
+        //     X=np.array([[1,2],[2,1],[3,1],[1,3],[2,2],[3,3],[6,5],[5,6]],float); \
+        //     y=np.array([0,0,0,0,0,0,1,1]); \
+        //     m=RidgeClassifier(alpha=1.0,class_weight={0:1.0,1:3.0}).fit(X,y); \
+        //     print([round(c,10) for c in m.coef_[0]], round(m.intercept_[0],10))"
+        //   -> coef_ [0.2709677419, 0.2709677419], intercept_ -2.0322580645
+        use std::collections::HashMap;
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 1.0, 1.0, 3.0, 2.0, 2.0, 3.0, 3.0, 6.0, 5.0, 5.0, 6.0,
+            ],
+        )
+        .map_err(|e| FerroError::NumericalInstability {
+            message: e.to_string(),
+        })?;
+        let y = array![0usize, 0, 0, 0, 0, 0, 1, 1];
+
+        let model = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_class_weight(ClassWeight::Explicit(HashMap::from([
+                (0usize, 1.0),
+                (1usize, 3.0),
+            ])));
+        let fitted = model.fit(&x, &y)?;
+        let coef = fitted.coef_matrix();
+        assert!(
+            (coef[[0, 0]] - 0.270_967_741_9).abs() < 1e-6,
+            "coef[0]={} expected 0.2709677419",
+            coef[[0, 0]]
+        );
+        assert!(
+            (coef[[1, 0]] - 0.270_967_741_9).abs() < 1e-6,
+            "coef[1]={} expected 0.2709677419",
+            coef[[1, 0]]
+        );
+        assert!(
+            (fitted.intercept_vec()[0] - (-2.032_258_064_5)).abs() < 1e-6,
+            "intercept={} expected -2.0322580645",
+            fitted.intercept_vec()[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_class_weight_none_unchanged() -> Result<(), FerroError> {
+        // Default (ClassWeight::None) must be byte-identical to a plain fit.
+        // Live sklearn 1.5.2 oracle (R-CHAR-3): RidgeClassifier(alpha=1.0) on
+        // this data -> coef_ [0.2576687117, 0.2576687117], intercept -1.981595092.
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 1.0, 1.0, 3.0, 2.0, 2.0, 3.0, 3.0, 6.0, 5.0, 5.0, 6.0,
+            ],
+        )
+        .map_err(|e| FerroError::NumericalInstability {
+            message: e.to_string(),
+        })?;
+        let y = array![0usize, 0, 0, 0, 0, 0, 1, 1];
+
+        let model = RidgeClassifier::<f64>::new().with_alpha(1.0);
+        let plain = model.fit(&x, &y)?;
+        let none = model
+            .clone()
+            .with_class_weight(ClassWeight::None)
+            .fit(&x, &y)?;
+
+        // Byte-identical to the plain fit.
+        assert_eq!(plain.coef_matrix(), none.coef_matrix());
+        assert_eq!(plain.intercept_vec(), none.intercept_vec());
+
+        // And matches the sklearn None oracle.
+        let coef = plain.coef_matrix();
+        assert!(
+            (coef[[0, 0]] - 0.257_668_711_7).abs() < 1e-6
+                && (coef[[1, 0]] - 0.257_668_711_7).abs() < 1e-6,
+            "None oracle mismatch: [{}, {}]",
+            coef[[0, 0]],
+            coef[[1, 0]]
+        );
+        assert!(
+            (plain.intercept_vec()[0] - (-1.981_595_092)).abs() < 1e-6,
+            "intercept={} expected -1.981595092",
+            plain.intercept_vec()[0]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_class_weight_explicit_equals_balanced() -> Result<(), FerroError> {
+        // Explicit({0:8/(2*6), 1:8/(2*2)}) must equal Balanced (confirms the
+        // n_samples/(n_classes*count) formula). Class0=0.6666666667, class1=2.0.
+        use std::collections::HashMap;
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1.0, 2.0, 2.0, 1.0, 3.0, 1.0, 1.0, 3.0, 2.0, 2.0, 3.0, 3.0, 6.0, 5.0, 5.0, 6.0,
+            ],
+        )
+        .map_err(|e| FerroError::NumericalInstability {
+            message: e.to_string(),
+        })?;
+        let y = array![0usize, 0, 0, 0, 0, 0, 1, 1];
+
+        let balanced = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_class_weight(ClassWeight::Balanced)
+            .fit(&x, &y)?;
+        let explicit = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_class_weight(ClassWeight::Explicit(HashMap::from([
+                (0usize, 0.666_666_666_7),
+                (1usize, 2.0),
+            ])))
+            .fit(&x, &y)?;
+
+        let cb = balanced.coef_matrix();
+        let ce = explicit.coef_matrix();
+        assert!(
+            (cb[[0, 0]] - ce[[0, 0]]).abs() < 1e-9 && (cb[[1, 0]] - ce[[1, 0]]).abs() < 1e-9,
+            "explicit-balanced coef mismatch: [{}, {}] vs [{}, {}]",
+            ce[[0, 0]],
+            ce[[1, 0]],
+            cb[[0, 0]],
+            cb[[1, 0]]
+        );
+        assert!(
+            (balanced.intercept_vec()[0] - explicit.intercept_vec()[0]).abs() < 1e-9,
+            "explicit-balanced intercept mismatch: {} vs {}",
+            explicit.intercept_vec()[0],
+            balanced.intercept_vec()[0]
+        );
         Ok(())
     }
 
