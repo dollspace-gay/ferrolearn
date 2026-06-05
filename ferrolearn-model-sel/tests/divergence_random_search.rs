@@ -447,7 +447,6 @@ fn green_1784_choice_with_replacement_no_cap() {
 /// DETERMINISTIC count divergence on the empty-grid edge. Tracking #1788
 /// (new-blocker).
 #[test]
-#[ignore = "divergence: empty param_distributions -> sklearn runs 1 empty candidate, ferrolearn errors; tracking #1788"]
 fn divergence_empty_param_distributions() {
     // sklearn (oracle): empty grid -> exactly ONE empty candidate.
     const SK_N_CANDIDATES: usize = 1;

@@ -117,21 +117,20 @@ impl<'a> RandomizedSearchCV<'a> {
     /// Samples `n_iter` parameter combinations, builds a pipeline for each,
     /// runs cross-validation, and stores the results internally.
     ///
+    /// An empty `param_distributions` mirrors sklearn's empty-grid behavior:
+    /// it evaluates a single trivial candidate with an empty [`ParamSet`]
+    /// (`grid_size == 1`, so the effective iteration count is capped to 1),
+    /// rather than erroring.
+    ///
     /// # Errors
     ///
-    /// Returns a [`FerroError`] if `n_iter` is zero, if the distribution list
-    /// is empty, if any pipeline fails to fit, or if the cross-validator fails.
+    /// Returns a [`FerroError`] if `n_iter` is zero, if any pipeline fails to
+    /// fit, or if the cross-validator fails.
     pub fn fit(&mut self, x: &Array2<f64>, y: &Array1<f64>) -> Result<(), FerroError> {
         if self.n_iter == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_iter".into(),
                 reason: "n_iter must be > 0".into(),
-            });
-        }
-        if self.param_distributions.is_empty() {
-            return Err(FerroError::InvalidParameter {
-                name: "param_distributions".into(),
-                reason: "distribution list must not be empty".into(),
             });
         }
 
@@ -142,7 +141,16 @@ impl<'a> RandomizedSearchCV<'a> {
 
         let mut results = CvResults::new();
 
-        for _ in 0..self.n_iter {
+        // Empty distributions => one trivial empty candidate (sklearn's empty
+        // grid has grid_size == 1, capping n_iter to 1). The non-empty path is
+        // unchanged: it loops exactly n_iter times with replacement.
+        let n_eval = if self.param_distributions.is_empty() {
+            1
+        } else {
+            self.n_iter
+        };
+
+        for _ in 0..n_eval {
             let params = self.sample_params(&mut rng);
             let pipeline = (self.pipeline_factory)(&params);
             let scores = cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?;
