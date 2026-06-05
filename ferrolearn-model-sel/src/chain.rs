@@ -299,7 +299,8 @@ fn fit_chain(
 /// via an error-correcting output code.
 ///
 /// `code_size` controls how many binary classifiers are trained:
-/// `n_codes = max(2, ceil(code_size * K))`. Each row of the code matrix is
+/// `n_codes = int(code_size * K)` (floor). `code_size > 0` is required.
+/// Each row of the code matrix is
 /// the binary signature of one class; predictions are made by computing the
 /// row in the code matrix closest (in Hamming distance) to the per-classifier
 /// vote.
@@ -367,8 +368,17 @@ impl OutputCodeClassifier {
             });
         }
 
+        if !self.code_size.is_finite() || self.code_size <= 0.0 {
+            return Err(FerroError::InvalidParameter {
+                name: "code_size".into(),
+                reason: "code_size must be > 0".into(),
+            });
+        }
+
         // Generate code matrix: shape (k, n_codes), entries in {-1, +1}.
-        let n_codes = ((self.code_size * k as f64).ceil() as usize).max(2);
+        // Matches sklearn `int(n_classes * code_size)` (multiclass.py:1189):
+        // `as usize` truncates toward zero, = floor for the positive product.
+        let n_codes = (self.code_size * k as f64) as usize;
         let mut rng = match self.random_state {
             Some(seed) => SmallRng::seed_from_u64(seed),
             None => SmallRng::from_os_rng(),

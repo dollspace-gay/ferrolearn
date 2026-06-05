@@ -345,7 +345,6 @@ fn output_code_mechanic_structure() {
 // ferrolearn: ceil(4.5).max(2) == 5  =>  this assertion FAILS today.
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "divergence: OCC n_codes ceil().max(2) vs sklearn int() floor; tracking #1830"]
 fn divergence_occ_n_codes_floor() {
     let x = Array2::<f64>::zeros((9, 2));
     let y = Array1::from(vec![0usize, 0, 0, 1, 1, 1, 2, 2, 2]); // k = 3
@@ -378,7 +377,6 @@ fn divergence_occ_n_codes_floor() {
 // successfully (no error) => this assertion FAILS today.
 // ---------------------------------------------------------------------------
 #[test]
-#[ignore = "divergence: OCC code_size<=0 masked by .max(2); sklearn raises InvalidParameterError; tracking #1830"]
 fn divergence_occ_code_size_zero_should_error() {
     let x = Array2::<f64>::zeros((9, 2));
     let y = Array1::from(vec![0usize, 0, 0, 1, 1, 1, 2, 2, 2]);
