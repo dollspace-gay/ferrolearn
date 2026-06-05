@@ -1081,6 +1081,15 @@ upstream = ["/home/doll/scikit-learn/sklearn/calibration.py"]
 design = ".design/model-sel/calibration.md"
 parity_ops = ["CalibratedClassifierCV", "calibration_curve"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/multiclass.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/multiclass.py",
+  "/home/doll/scikit-learn/sklearn/utils/multiclass.py",
+]
+design = ".design/model-sel/multiclass.md"
+parity_ops = ["OneVsRestClassifier", "OneVsOneClassifier"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

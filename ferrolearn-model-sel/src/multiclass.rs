@@ -28,6 +28,26 @@
 //!
 //! let ovr = OneVsRestClassifier::new(factory);
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.multiclass` (`OneVsRestClassifier` `sklearn/multiclass.py:196`,
+//! `OneVsOneClassifier :665`, `_ovr_decision_function` `utils/multiclass.py:520`) at
+//! v1.5.2. Base estimator supplied as a `PipelineFactory` closure (R-DEV-7). Every
+//! REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-OVR-PREDICT (OvR predict, LAST-on-tie) | SHIPPED | per-row `max_by` over `decision_function` columns picks the LAST (highest) class on a score tie, matching sklearn's `argmaxima[maxima==pred]=i` overwrite (`:497-499`, also last-on-tie — NOT np.argmax). Guard `ovr_predict_last_on_tie_matches_sklearn`. |
+//! | REQ-OVR-MECH (OvR fit + decision_function + classes_) | SHIPPED | one binary estimator per sorted class; `decision_function` → `(n, K)`; rejects `< 2` classes. Guard `ovr_mechanic_k_estimators_sorted_classes_df_shape`. |
+//! | REQ-OVO-DECISION (OvO predict = argmax(votes + confidence)) | SHIPPED | ported `_ovr_decision_function`: `votes + sum_of_confidences/(3*(|sum|+1))` with `conf = 0.5 - s` (sklearn convention favoring the higher class), then `argmax` (FIRST-on-tie) — was pure integer votes with last-on-tie (fixed #1812). Matches live oracle at the VALUE level (<1e-9) across 3/4-class vote-tie cases. Tests `ovo_predict_confidence_tiebreak_diverges`, `ovo_decision_function_values_4class_tiebreak_matches_oracle`, `ovo_predict_exact_tie_first_on_tie_matches_sklearn`. |
+//! | REQ-OVO-DECISION-FN (OvO decision_function method) | SHIPPED | `FittedOneVsOneClassifier::decision_function` returns `(n, K)` = `votes + transformed_confidences` (`:941-986`), and `predict` routes through it (fixed #1813, coupled to #1812). |
+//! | REQ-PREDICT-PROBA (OvR/OvO predict_proba) | NOT-STARTED | neither estimator defines `predict_proba`; sklearn OvR normalizes per-class probs (`:514-552`). Blocker #1814. |
+//! | REQ-OUTPUT-CODE (OutputCodeClassifier) | NOT-STARTED | ECOC strategy absent (`:1025`). Missing estimator. Blocker #1815. |
+//! | REQ-SAMPLE-WEIGHT/NJOBS/FIT-PARAMS | NOT-STARTED | `new`/`fit` expose no `n_jobs`/`verbose`/`sample_weight`/`fit_params` (`:316`,`:748`). Blocker #1816. |
+//! | REQ-MULTILABEL (OvR multilabel-indicator y) | NOT-STARTED | `fit` takes `Array1<usize>` only; sklearn supports indicator `Y` via `LabelBinarizer` (`:362-382`). Blocker #1817. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1818. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use multiclass::{OneVsRestClassifier, OneVsOneClassifier, Fitted...}` in `lib.rs` (boundary meta-estimator API, S5/R-DEFER-1). No internal caller, no Python binding (honest underclaim). |
 
 use ferrolearn_core::pipeline::{FittedPipeline, Pipeline};
 use ferrolearn_core::{FerroError, Fit, Predict};
