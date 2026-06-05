@@ -25,7 +25,8 @@
 //! | REQ-3 (fit_intercept incl. false) | SHIPPED | centering; matches oracle. |
 //! | REQ-4 (coef_/intercept_/classes_ introspection) | SHIPPED | `HasCoefficients`/`HasClasses`; values match oracle. NOTE: `coef_matrix` is `(n_features, n_targets)`, transposed vs sklearn `coef_` `(n_classes, n_features)` — orientation contract owned by the `ferrolearn-python` binding layer. |
 //! | REQ-5 (alpha≥0 validation; ≥2-class guard) | SHIPPED | negative-alpha → `InvalidParameter`; <2 classes → error. |
-//! | REQ-6 (class_weight / solver variants / solver_ / positive) | NOT-STARTED | blocker #393. |
+//! | REQ-6a (positive=True) | SHIPPED | `RidgeClassifier<F>` adds `pub positive: bool` (default `false`, `_ridge.py:902`/`:911`) + `with_positive(bool)` builder. When `self.positive`, `fit_with_sample_weight` solves EACH indicator-target column via `crate::linalg::nonneg_ridge_cd` (shared projected-coordinate-descent kernel — `wⱼ = max(0, (A[:,j]ᵀr + col_sq[j]·wⱼ)/(col_sq[j] + alpha))`, `max_iter=self.max_iter.unwrap_or(1000)`/`self.tol`) on the SAME centered/√w-rescaled design `solve_ridge` uses; intercept recovery (`y_off[t] − x_off·coef[:,t]`) UNCHANGED. Mirrors the optimum sklearn reaches with L-BFGS-B for `positive=True` (`_ridge.py:329`, objective `0.5·‖Xw−y‖²+0.5·alpha·‖w‖²`, bounds `[(0,inf)]`). `n_iter_ = Some(worst-case iters over targets)` on the positive path, `None` otherwise. `positive=false` (default) is byte-identical to the unconstrained closed-form path. Oracle tests `ridge_classifier_positive_matches_sklearn` (alpha=1 binary coef `[0.52631579, 0.0]`, intercept `-1.43609023`, all ≥ 0, differs from unconstrained `[0.35294118, -0.23529412]`), `ridge_classifier_positive_false_unchanged` (byte-identical guard). Split from REQ-6 of blocker #393. |
+//! | REQ-6b (class_weight / solver variants / solver_) | NOT-STARTED | blocker #393 (positive done — see REQ-6a). No `class_weight` (`_ridge.py:1398`), no `solver` selection or `solver_` attribute (`_ridge.py:1406-1484`). |
 //! | REQ-7 (max_iter/tol + n_iter_) | SHIPPED | `RidgeClassifier<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidgeClassifier<F>` adds `n_iter_: Option<usize>` (always `None` for the direct solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:1520-1521`) and `n_iter_` (`_ridge.py:1464`); `max_iter`/`tol` are no-ops for the direct solver — matching sklearn when the direct path yields `n_iter_=None`. Test: `ridge_classifier_max_iter_tol_niter_defaults_and_builders`. Closes #394. |
 //! | REQ-8 (sample_weight) | SHIPPED | `RidgeClassifier::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` forwards weights into the underlying weighted ridge on the indicator matrix `Y`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off[t]=Σwᵢ·Y[i,t]/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescale of `X`/`Y` (sklearn `_rescale_data`, `_ridge.py:682-688`), per-target `linalg::solve_ridge` with `alpha` UNSCALED, `intercept[t]=y_off[t]−Σⱼ x_off[j]·coef[j,t]`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body). Mirrors `RidgeClassifier.fit(X, y, sample_weight=None)` (`_ridge.py:1220`) forwarding through `_prepare_data` (`_ridge.py:1305`) into `_BaseRidge.fit`. Oracle tests `ridge_classifier_sample_weight_matches_sklearn` (alpha=1 binary coef `[0.25333333, 0.36]`, intercept `-1.70666667`, differs from unweighted `[0.31840796, 0.31840796]`), `ridge_classifier_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #395. |
 //! | REQ-9 (RidgeClassifierCV) | NOT-STARTED | blocker #396. |
@@ -89,14 +90,22 @@ pub struct RidgeClassifier<F> {
     /// on the computed result. Default `1e-4`, matching sklearn's default
     /// (`_ridge.py:1521`).
     pub tol: F,
+    /// When `true`, constrain the coefficients to be non-negative (sklearn
+    /// `positive`, `_ridge.py:902`/`:911`). The per-target indicator-ridge solve
+    /// is routed through projected coordinate descent
+    /// (`crate::linalg::nonneg_ridge_cd`) using `max_iter`/`tol`, mirroring the
+    /// optimum sklearn reaches with its L-BFGS-B solver for `positive=True`
+    /// (`_ridge.py:329`). Default `false`, matching sklearn (`_ridge.py:902`).
+    pub positive: bool,
 }
 
 impl<F: Float> RidgeClassifier<F> {
     /// Create a new `RidgeClassifier` with default settings.
     ///
     /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `max_iter = None`,
-    /// `tol = 1e-4` — mirroring sklearn's ctor defaults
-    /// (`sklearn/linear_model/_ridge.py:1514-1526`).
+    /// `tol = 1e-4`, `positive = false` — mirroring sklearn's ctor defaults
+    /// (`sklearn/linear_model/_ridge.py:1514-1526`, `positive=False`
+    /// `_ridge.py:902`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -104,6 +113,7 @@ impl<F: Float> RidgeClassifier<F> {
             fit_intercept: true,
             max_iter: None,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
+            positive: false,
         }
     }
 
@@ -144,6 +154,20 @@ impl<F: Float> RidgeClassifier<F> {
         self.tol = tol;
         self
     }
+
+    /// Constrain the fitted coefficients to be non-negative (sklearn
+    /// `positive`, `_ridge.py:902`/`:911`).
+    ///
+    /// When `true`, each indicator-target ridge solve is routed through
+    /// projected coordinate descent (`crate::linalg::nonneg_ridge_cd`) using
+    /// `max_iter`/`tol`, yielding the same optimum sklearn reaches with its
+    /// L-BFGS-B solver for `positive=True` (`_ridge.py:329`). `false` (default)
+    /// is byte-identical to the unconstrained closed-form path.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
+        self
+    }
 }
 
 impl<F: Float> Default for RidgeClassifier<F> {
@@ -172,10 +196,10 @@ pub struct FittedRidgeClassifier<F> {
     is_binary: bool,
     /// Number of features.
     n_features: usize,
-    /// Number of iterations run by an iterative solver, or `None` for direct
-    /// solvers (sklearn `n_iter_`, `_ridge.py:1464`). ferrolearn implements
-    /// only the direct dense path, so this is always `None` — matching
-    /// sklearn's behaviour when the direct solver is used.
+    /// Number of iterations run by an iterative solver, or `None` for the
+    /// direct solver (sklearn `n_iter_`, `_ridge.py:1464`). `None` on the
+    /// unconstrained direct dense path; `Some(iters)` (worst-case over target
+    /// columns) on the `positive=true` projected-coordinate-descent path.
     n_iter_: Option<usize>,
 }
 
@@ -195,9 +219,9 @@ impl<F: Float> FittedRidgeClassifier<F> {
     /// Return the number of iterations run by an iterative solver, or `None`
     /// for the direct solver (sklearn `n_iter_`, `_ridge.py:1464`).
     ///
-    /// ferrolearn implements only the direct dense path, so this is always
-    /// `None` — matching sklearn's `RidgeClassifier(alpha=1.0).fit(X,y).n_iter_`
-    /// which is `None` for the direct solver.
+    /// `None` on the unconstrained direct path (matching
+    /// `RidgeClassifier(alpha=1.0).fit(X,y).n_iter_`); `Some(iters)` on the
+    /// `positive=true` projected-coordinate-descent path.
     #[must_use]
     pub fn n_iter(&self) -> Option<usize> {
         self.n_iter_
@@ -440,13 +464,38 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             }
         };
 
-        // Solve Ridge for each target column.
+        // Solve Ridge for each target column. When `self.positive`, the
+        // coefficient solve is constrained to be non-negative via projected
+        // coordinate descent (`crate::linalg::nonneg_ridge_cd`, the same kernel
+        // `Ridge` uses), mirroring sklearn's `positive=True` L-BFGS-B optimum
+        // (`_ridge.py:329`); otherwise the unconstrained closed-form
+        // `linalg::solve_ridge` path is byte-identical to before.
         let mut coef_matrix = Array2::<F>::zeros((n_features, n_targets));
-        for t in 0..n_targets {
-            let y_col = y_work.column(t).to_owned();
-            let w = linalg::solve_ridge(&x_work, &y_col, self.alpha)?;
-            for j in 0..n_features {
-                coef_matrix[[j, t]] = w[j];
+        let mut n_iter_ = None;
+        if self.positive {
+            let max_iter = self.max_iter.unwrap_or(1000);
+            let mut max_iters_over_targets = 0usize;
+            for t in 0..n_targets {
+                let y_col = y_work.column(t).to_owned();
+                let (w, iters) =
+                    linalg::nonneg_ridge_cd(&x_work, &y_col, self.alpha, max_iter, self.tol);
+                if iters > max_iters_over_targets {
+                    max_iters_over_targets = iters;
+                }
+                for j in 0..n_features {
+                    coef_matrix[[j, t]] = w[j];
+                }
+            }
+            // The positive path is iterative; report the worst-case iteration
+            // count across target columns (mirrors `Ridge`'s positive `n_iter_`).
+            n_iter_ = Some(max_iters_over_targets);
+        } else {
+            for t in 0..n_targets {
+                let y_col = y_work.column(t).to_owned();
+                let w = linalg::solve_ridge(&x_work, &y_col, self.alpha)?;
+                for j in 0..n_features {
+                    coef_matrix[[j, t]] = w[j];
+                }
             }
         }
 
@@ -469,7 +518,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             classes,
             is_binary,
             n_features,
-            n_iter_: None,
+            n_iter_,
         })
     }
 }
@@ -830,6 +879,97 @@ mod tests {
             fitted_mi.intercept_vec(),
             "max_iter/tol must not change intercept for the direct solver"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_positive_matches_sklearn() -> Result<(), Box<dyn std::error::Error>> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import RidgeClassifier; \
+        //     X=np.array([[1.,5.],[2.,4.],[3.,3.],[4.,2.],[5.,1.],[1.,4.],[5.,2.]]); \
+        //     y=np.array([0,0,1,1,1,0,1]); \
+        //     m=RidgeClassifier(alpha=1.0,positive=True).fit(X,y); \
+        //     print([round(c,8) for c in m.coef_[0]], round(m.intercept_[0],8))"
+        //   -> positive=True   coef_ [0.52631579, 0.0],         intercept_ -1.43609023
+        //   -> unconstrained   coef_ [0.35294118, -0.23529412], intercept_ -0.21008403
+        let x = Array2::from_shape_vec(
+            (7, 2),
+            vec![
+                1.0, 5.0, 2.0, 4.0, 3.0, 3.0, 4.0, 2.0, 5.0, 1.0, 1.0, 4.0, 5.0, 2.0,
+            ],
+        )?;
+        let y = array![0usize, 0, 1, 1, 1, 0, 1];
+
+        let model = RidgeClassifier::<f64>::new()
+            .with_alpha(1.0)
+            .with_positive(true);
+        let fitted = model.fit(&x, &y)?;
+
+        // Binary => single target column 0; coef_matrix is (n_features, n_targets).
+        let coef = fitted.coef_matrix();
+        assert!(
+            (coef[[0, 0]] - 0.526_315_79).abs() < 1e-5,
+            "coef[0]={} expected 0.52631579",
+            coef[[0, 0]]
+        );
+        assert!(
+            (coef[[1, 0]] - 0.0).abs() < 1e-5,
+            "coef[1]={} expected 0.0",
+            coef[[1, 0]]
+        );
+        assert!(
+            (fitted.intercept_vec()[0] - (-1.436_090_23)).abs() < 1e-4,
+            "intercept={} expected -1.43609023",
+            fitted.intercept_vec()[0]
+        );
+
+        // All coefficients must be non-negative.
+        for &c in coef.iter() {
+            assert!(c >= 0.0, "positive=true coefficient {c} must be >= 0");
+        }
+
+        // Non-tautological: must DIFFER from the unconstrained fit
+        // [0.35294118, -0.23529412] (the negative feature-1 coef clamps to 0).
+        let unconstrained = RidgeClassifier::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let uc = unconstrained.coef_matrix();
+        assert!(
+            (uc[[0, 0]] - 0.352_941_18).abs() < 1e-5 && (uc[[1, 0]] - (-0.235_294_12)).abs() < 1e-5,
+            "unconstrained oracle mismatch: [{}, {}]",
+            uc[[0, 0]],
+            uc[[1, 0]]
+        );
+        assert!(
+            (coef[[1, 0]] - uc[[1, 0]]).abs() > 1e-2,
+            "positive fit must differ from unconstrained fit"
+        );
+
+        // The positive (iterative CD) path reports an iteration count.
+        assert!(
+            fitted.n_iter().is_some(),
+            "positive path should report n_iter_"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_classifier_positive_false_unchanged() -> Result<(), Box<dyn std::error::Error>> {
+        // `with_positive(false)` (default) must be byte-identical to plain `fit`.
+        let x = Array2::from_shape_vec(
+            (7, 2),
+            vec![
+                1.0, 5.0, 2.0, 4.0, 3.0, 3.0, 4.0, 2.0, 5.0, 1.0, 1.0, 4.0, 5.0, 2.0,
+            ],
+        )?;
+        let y = array![0usize, 0, 1, 1, 1, 0, 1];
+
+        let baseline = RidgeClassifier::<f64>::new().with_alpha(1.0);
+        let via_default = baseline.fit(&x, &y)?;
+        let via_false = baseline.clone().with_positive(false).fit(&x, &y)?;
+
+        assert_eq!(via_default.coef_matrix(), via_false.coef_matrix());
+        assert_eq!(via_default.intercept_vec(), via_false.intercept_vec());
+        assert_eq!(via_default.n_iter(), via_false.n_iter());
         Ok(())
     }
 

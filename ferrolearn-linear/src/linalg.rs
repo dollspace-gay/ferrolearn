@@ -592,6 +592,80 @@ pub(crate) fn solve_ridge<F: LinalgFloat>(
         .or_else(|_| solve_lstsq(x, y).map(|(w, _rank, _singular)| w))
 }
 
+/// Solve the non-negative ridge problem
+/// `min 0.5·‖A·w − b‖² + 0.5·alpha·‖w‖²` subject to `w ≥ 0` via projected
+/// coordinate descent.
+///
+/// Mirrors the unique optimum scikit-learn reaches with its L-BFGS-B solver
+/// (`_solve_lbfgs`, `sklearn/linear_model/_ridge.py:300`, objective
+/// `0.5·‖Xw−y‖² + 0.5·alpha·‖w‖²` with bounds `[(0, inf)]`, dispatched for
+/// `positive=True` at `_ridge.py:329`). For a smooth strongly-convex QP with
+/// box constraints, coordinate descent with per-coordinate projection
+/// converges to that exact optimum.
+///
+/// Per-coordinate update:
+/// `wⱼ ← max(0, (A[:,j]ᵀ·r + col_sq[j]·wⱼ) / (col_sq[j] + alpha))` with an
+/// incremental residual `r = b − A·w`. A column with `‖A[:,j]‖² + alpha == 0`
+/// keeps its coordinate at zero (no division by zero).
+///
+/// Returns `(coef, n_iter)`. Shared by both `Ridge` and `RidgeClassifier` so
+/// the non-negative coefficient constraint is solved identically on each.
+pub(crate) fn nonneg_ridge_cd<F: LinalgFloat>(
+    a: &Array2<F>,
+    b: &Array1<F>,
+    alpha: F,
+    max_iter: usize,
+    tol: F,
+) -> (Array1<F>, usize) {
+    let n_features = a.ncols();
+    let zero = <F as num_traits::Zero>::zero();
+
+    // col_sq[j] = ‖A[:,j]‖²
+    let mut col_sq = Array1::<F>::zeros(n_features);
+    for j in 0..n_features {
+        let col = a.column(j);
+        col_sq[j] = col.dot(&col);
+    }
+
+    let mut w = Array1::<F>::zeros(n_features);
+    // r = b − A·w  (= b initially since w = 0)
+    let mut r = b.clone();
+
+    let mut iters = 0;
+    for _ in 0..max_iter {
+        iters += 1;
+        let mut max_change = zero;
+        for j in 0..n_features {
+            let col = a.column(j);
+            let old = w[j];
+            let denom = col_sq[j] + alpha;
+            if denom <= zero {
+                // All-zero column with alpha == 0: coordinate stays 0.
+                continue;
+            }
+            // rho = A[:,j]ᵀ·r + col_sq[j]·old = A[:,j]ᵀ(b − A·w + A[:,j]·w[j])
+            let rho = col.dot(&r) + col_sq[j] * old;
+            let candidate = rho / denom;
+            let new = if candidate > zero { candidate } else { zero };
+            if new != old {
+                let delta = new - old;
+                // Incremental residual update: r -= A[:,j]·delta
+                r.scaled_add(-delta, &col);
+                w[j] = new;
+                let abs_change = <F as Float>::abs(delta);
+                if abs_change > max_change {
+                    max_change = abs_change;
+                }
+            }
+        }
+        if max_change < tol {
+            break;
+        }
+    }
+
+    (w, iters)
+}
+
 /// Solve `(X^T X + alpha * I) @ W = X^T Y` (multi-output Ridge regression).
 ///
 /// `X` is `(n_samples, n_features)`, `Y` is `(n_samples, n_targets)`, and

@@ -254,57 +254,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     /// Returns `(coef, n_iter)`. A column with `‖A[:,j]‖² + alpha == 0` keeps
     /// its coordinate at zero (no division by zero).
     fn solve_nonneg_ridge(&self, a: &Array2<F>, b: &Array1<F>) -> (Array1<F>, usize) {
-        let n_features = a.ncols();
-        let alpha = self.alpha;
-        let zero = <F as num_traits::Zero>::zero();
-
-        // col_sq[j] = ‖A[:,j]‖²
-        let mut col_sq = Array1::<F>::zeros(n_features);
-        for j in 0..n_features {
-            let col = a.column(j);
-            col_sq[j] = col.dot(&col);
-        }
-
-        let mut w = Array1::<F>::zeros(n_features);
-        // r = b − A·w  (= b initially since w = 0)
-        let mut r = b.clone();
-
-        let max_iter = self.max_iter.unwrap_or(1000);
-        let tol = self.tol;
-
-        let mut iters = 0;
-        for _ in 0..max_iter {
-            iters += 1;
-            let mut max_change = zero;
-            for j in 0..n_features {
-                let col = a.column(j);
-                let old = w[j];
-                let denom = col_sq[j] + alpha;
-                if denom <= zero {
-                    // All-zero column with alpha == 0: coordinate stays 0.
-                    continue;
-                }
-                // rho = A[:,j]ᵀ·r + col_sq[j]·old = A[:,j]ᵀ(b − A·w + A[:,j]·w[j])
-                let rho = col.dot(&r) + col_sq[j] * old;
-                let candidate = rho / denom;
-                let new = if candidate > zero { candidate } else { zero };
-                if new != old {
-                    let delta = new - old;
-                    // Incremental residual update: r -= A[:,j]·delta
-                    r.scaled_add(-delta, &col);
-                    w[j] = new;
-                    let abs_change = <F as Float>::abs(delta);
-                    if abs_change > max_change {
-                        max_change = abs_change;
-                    }
-                }
-            }
-            if max_change < tol {
-                break;
-            }
-        }
-
-        (w, iters)
+        // Delegate to the shared projected-coordinate-descent kernel
+        // (`crate::linalg::nonneg_ridge_cd`) so `Ridge` and `RidgeClassifier`
+        // solve the non-negative ridge problem identically. Behaviour is
+        // byte-identical to the prior in-impl loop (same update, same
+        // `max_iter`/`tol` defaults).
+        crate::linalg::nonneg_ridge_cd(a, b, self.alpha, self.max_iter.unwrap_or(1000), self.tol)
     }
 
     pub fn fit_with_sample_weight(
