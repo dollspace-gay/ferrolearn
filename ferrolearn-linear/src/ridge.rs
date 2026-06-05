@@ -24,7 +24,7 @@
 //! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedRidge`. |
 //! | REQ-5 (alpha≥0 validation; alpha=0 → OLS incl. rank-deficient min-norm) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 singular falls back `solve_ridge` → `solve_lstsq` (ferray min-norm), mirroring sklearn cholesky→SVD (`_ridge.py:752-756`). Closed #392; test `divergence_ridge_alpha_zero_rank_deficient_min_norm`. |
 //! | REQ-6 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | `FittedRidgeMulti` exists, no production consumer (#384). |
-//! | REQ-7 (per-target alpha array) | NOT-STARTED | #385. |
+//! | REQ-7 (per-target alpha array) | SHIPPED | `Ridge<F>` adds `pub alpha_per_target: Option<Array1<F>>` (default `None`) + `with_alpha_per_target(Array1<F>)` builder. On the multi-output `Fit<Array2, Array2>` path, when `Some(alphas)` it validates `alphas.len() == n_targets` (else `ShapeMismatch`) and each `alphas[k] >= 0` (else `InvalidParameter`), then solves each target column `k` independently with its own penalty via `linalg::solve_ridge` on the SAME centered (fit_intercept) / raw design the scalar path uses — mathematically identical to an independent scalar-`alpha` Ridge per column, mirroring sklearn's array-valued `alpha` (`_ridge.py:701-712`). `None` is byte-identical to the historic scalar `solve_ridge_multi` path. Oracle tests: `ridge_per_target_alpha_matches_sklearn` (alpha `[0.5, 2.0]`, coef col0 `[0.79891892, 1.43891892]`/col1 `[0.78, 0.355]`, intercepts `[-0.75351351, -0.065]`), `ridge_per_target_alpha_equals_independent_scalar_fits`, `ridge_per_target_alpha_length_mismatch_errors`, `ridge_multi_scalar_alpha_unchanged` (regression guard). Closes #385. |
 //! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
 //! | REQ-9 (positive=True) | SHIPPED | `Ridge<F>` adds `pub positive: bool` (default `false`, `_ridge.py:902`/`:911`) + `with_positive(bool)` builder. When `self.positive`, `fit_with_sample_weight` routes the coefficient solve through `solve_nonneg_ridge` — projected coordinate descent minimizing `0.5·‖A·w−b‖² + 0.5·alpha·‖w‖²` s.t. `w ≥ 0` (`new = max(0, (A[:,j]ᵀr + col_sq[j]·old)/(col_sq[j] + alpha))`, incremental residual update, `max_iter=self.max_iter.unwrap_or(1000)`/`self.tol`) on the SAME centered (and `√w`-rescaled) design `solve_ridge` uses, then recovers `intercept = y_off − x_off·coef` (fit_intercept) / `0` identically — the same unique optimum sklearn's L-BFGS-B (`_solve_lbfgs`, `_ridge.py:300`, objective `0.5·‖Xw−y‖²+0.5·alpha·‖w‖²`, bounds `[(0,inf)]`) reaches, dispatched at `_ridge.py:923-928`. `n_iter_ = Some(iters)` on the positive (iterative CD) path; `None` for the direct Cholesky path. `positive=false` (default) is byte-identical to the unconstrained Cholesky path. Oracle tests: `ridge_positive_matches_sklearn` (alpha=1, fit_intercept coef `[1.19891304, 0.0]`, intercept `-6.17744565`, all ≥ 0, differs from unconstrained `[0.95708502, -1.85401484]`), `ridge_positive_false_unchanged` (byte-identical guard), `ridge_positive_all_nonneg_equals_unconstrained` (inactive-constraint sanity). Closes #387. |
 //! | REQ-10 (max_iter/tol + n_iter_) | SHIPPED | `Ridge<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidge<F>` adds `n_iter_: Option<usize>` (always `None` for the direct Cholesky solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:899-900`) and `n_iter_` set at `_ridge.py:994`; `max_iter`/`tol` are no-ops for the direct solver (closed-form normal equations, no iteration) — matching sklearn's direct `cholesky`/`svd` paths which also yield `n_iter_=None`. Test: `ridge_max_iter_tol_niter_defaults_and_builders`. Closes #388. |
@@ -74,6 +74,15 @@ pub struct Ridge<F> {
     /// Regularization strength. Larger values specify stronger
     /// regularization.
     pub alpha: F,
+    /// Optional per-target L2 penalties for the multi-output
+    /// `Fit<Array2, Array2>` path (sklearn accepts `alpha` as an array of
+    /// shape `(n_targets,)`, validated at
+    /// `sklearn/linear_model/_ridge.py:701-712`). When `Some`, each target
+    /// column `k` is fitted with its own penalty `alpha[k]`, overriding the
+    /// scalar [`alpha`](Self::alpha); this is mathematically identical to
+    /// fitting each target column with an independent scalar-`alpha` Ridge.
+    /// Default `None` (the scalar `alpha` applies to every target).
+    pub alpha_per_target: Option<Array1<F>>,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
     /// Whether `X` may be overwritten during fit (sklearn `copy_X`,
@@ -126,6 +135,7 @@ impl<F: Float> Ridge<F> {
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
+            alpha_per_target: None,
             fit_intercept: true,
             copy_x: true,
             random_state: None,
@@ -139,6 +149,22 @@ impl<F: Float> Ridge<F> {
     #[must_use]
     pub fn with_alpha(mut self, alpha: F) -> Self {
         self.alpha = alpha;
+        self
+    }
+
+    /// Set per-target L2 penalties for the multi-output
+    /// `Fit<Array2, Array2>` path (sklearn array-valued `alpha`,
+    /// `sklearn/linear_model/_ridge.py:701-712`).
+    ///
+    /// When set, each target column `k` of `Y` is fitted with its own penalty
+    /// `alphas[k]`, overriding the scalar [`alpha`](Self::alpha) on the
+    /// multi-output fit. This is mathematically identical to fitting each
+    /// target column with an independent scalar-`alpha` Ridge. The array
+    /// length must equal the number of target columns and every entry must be
+    /// non-negative (validated at fit time).
+    #[must_use]
+    pub fn with_alpha_per_target(mut self, alphas: Array1<F>) -> Self {
+        self.alpha_per_target = Some(alphas);
         self
     }
 
@@ -559,8 +585,8 @@ impl<F: Float> FittedRidgeMulti<F> {
     }
 }
 
-impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array2<F>>
-    for Ridge<F>
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    Fit<Array2<F>, Array2<F>> for Ridge<F>
 {
     type Fitted = FittedRidgeMulti<F>;
     type Error = FerroError;
@@ -587,13 +613,6 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        if self.alpha < F::zero() {
-            return Err(FerroError::InvalidParameter {
-                name: "alpha".into(),
-                reason: "must be non-negative".into(),
-            });
-        }
-
         if n_samples == 0 {
             return Err(FerroError::InsufficientSamples {
                 required: 1,
@@ -603,6 +622,75 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         }
 
         let n_targets = y.ncols();
+
+        // Per-target alpha array (sklearn array-valued `alpha`,
+        // `sklearn/linear_model/_ridge.py:701-712`) — validate the array and
+        // solve each target column independently with its own penalty. When
+        // `None`, fall through to the byte-identical scalar-alpha path below.
+        if let Some(alphas) = &self.alpha_per_target {
+            if alphas.len() != n_targets {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![n_targets],
+                    actual: vec![alphas.len()],
+                    context: "alpha array length must equal number of targets".into(),
+                });
+            }
+            for &a in alphas.iter() {
+                if a < <F as num_traits::Zero>::zero() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "alpha".into(),
+                        reason: "must be non-negative".into(),
+                    });
+                }
+            }
+
+            let n_features = x.ncols();
+            let mut coefficients = Array2::<F>::zeros((n_features, n_targets));
+            let mut intercepts = Array1::<F>::zeros(n_targets);
+
+            if self.fit_intercept {
+                // Center once (identical to the scalar path), then solve each
+                // centered target column with its own alpha.
+                let x_mean =
+                    x.mean_axis(Axis(0))
+                        .ok_or_else(|| FerroError::NumericalInstability {
+                            message: "failed to compute column means of X".into(),
+                        })?;
+                let y_mean =
+                    y.mean_axis(Axis(0))
+                        .ok_or_else(|| FerroError::NumericalInstability {
+                            message: "failed to compute column means of Y".into(),
+                        })?;
+
+                let x_centered = x - &x_mean;
+                let y_centered = y - &y_mean;
+
+                for k in 0..n_targets {
+                    let y_col = y_centered.column(k).to_owned();
+                    let w_col = linalg::solve_ridge(&x_centered, &y_col, alphas[k])?;
+                    intercepts[k] = y_mean[k] - x_mean.dot(&w_col);
+                    coefficients.column_mut(k).assign(&w_col);
+                }
+            } else {
+                for k in 0..n_targets {
+                    let y_col = y.column(k).to_owned();
+                    let w_col = linalg::solve_ridge(x, &y_col, alphas[k])?;
+                    coefficients.column_mut(k).assign(&w_col);
+                }
+            }
+
+            return Ok(FittedRidgeMulti {
+                coefficients,
+                intercepts,
+            });
+        }
+
+        if self.alpha < <F as num_traits::Zero>::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
 
         if self.fit_intercept {
             // Center the data to handle the intercept (per-target).
@@ -1400,6 +1488,135 @@ mod tests {
             unconstrained.intercept(),
             epsilon = 1e-4
         );
+        Ok(())
+    }
+
+    // -- per-target alpha array (REQ-7) ------------------------------------
+
+    /// Build the shared 5x2 fixture `X` and 5x2 `Y` used by the per-target
+    /// alpha tests.
+    fn per_target_fixture() -> Result<(Array2<f64>, Array2<f64>), FerroError> {
+        let shape_err = |e: ndarray::ShapeError| FerroError::ShapeMismatch {
+            expected: vec![5, 2],
+            actual: vec![],
+            context: e.to_string(),
+        };
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(shape_err)?;
+        let y = Array2::from_shape_vec(
+            (5, 2),
+            vec![3.0, 1.0, 2.5, 2.0, 7.1, 3.5, 6.0, 4.2, 11.2, 6.0],
+        )
+        .map_err(shape_err)?;
+        Ok((x, y))
+    }
+
+    #[test]
+    fn ridge_per_target_alpha_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (per-target alpha [0.5, 2.0]):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     Y=np.array([[3.,1.],[2.5,2.],[7.1,3.5],[6.,4.2],[11.2,6.]]); \
+        //     m=Ridge(alpha=np.array([0.5,2.0])).fit(X,Y); \
+        //     print(m.coef_.tolist(), m.intercept_.tolist())"
+        //   -> coef_ (n_targets, n_features) = [[0.79891892, 1.43891892],
+        //                                       [0.78, 0.355]]
+        //      intercept_ = [-0.75351351, -0.065]
+        // ferrolearn stores coefficients as (n_features, n_targets) = the
+        // TRANSPOSE: column 0 = target 0, column 1 = target 1.
+        let (x, y) = per_target_fixture()?;
+
+        let model = Ridge::<f64>::new().with_alpha_per_target(array![0.5, 2.0]);
+        let fitted = model.fit(&x, &y)?;
+
+        let c0 = fitted.coefficients().column(0).to_owned();
+        let c1 = fitted.coefficients().column(1).to_owned();
+        assert_relative_eq!(c0[0], 0.798_918_92, epsilon = 1e-6);
+        assert_relative_eq!(c0[1], 1.438_918_92, epsilon = 1e-6);
+        assert_relative_eq!(c1[0], 0.78, epsilon = 1e-6);
+        assert_relative_eq!(c1[1], 0.355, epsilon = 1e-6);
+
+        assert_relative_eq!(fitted.intercepts()[0], -0.753_513_51, epsilon = 1e-6);
+        assert_relative_eq!(fitted.intercepts()[1], -0.065, epsilon = 1e-6);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_per_target_alpha_equals_independent_scalar_fits() -> Result<(), FerroError> {
+        // The per-target array path must reproduce, column by column, what an
+        // independent scalar-alpha Ridge produces on each target column via the
+        // single-output (1-D) `fit` path.
+        let (x, y) = per_target_fixture()?;
+        let alphas = array![0.5, 2.0];
+
+        let multi = Ridge::<f64>::new()
+            .with_alpha_per_target(alphas.clone())
+            .fit(&x, &y)?;
+
+        for k in 0..2 {
+            let y_col = y.column(k).to_owned();
+            let scalar = Ridge::<f64>::new().with_alpha(alphas[k]).fit(&x, &y_col)?;
+            for j in 0..2 {
+                assert_relative_eq!(
+                    multi.coefficients()[[j, k]],
+                    scalar.coefficients()[j],
+                    epsilon = 1e-9
+                );
+            }
+            assert_relative_eq!(multi.intercepts()[k], scalar.intercept(), epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_per_target_alpha_length_mismatch_errors() -> Result<(), FerroError> {
+        // alpha array of length 1 with 2 target columns must error.
+        let (x, y) = per_target_fixture()?;
+
+        let model = Ridge::<f64>::new().with_alpha_per_target(array![0.5]);
+        let result = <Ridge<f64> as Fit<Array2<f64>, Array2<f64>>>::fit(&model, &x, &y);
+        assert!(matches!(result, Err(FerroError::ShapeMismatch { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_multi_scalar_alpha_unchanged() -> Result<(), FerroError> {
+        // Regression guard: with NO per-target array, the multi-output scalar
+        // path is byte-identical to the historic `solve_ridge_multi` behavior.
+        //
+        // Live sklearn 1.5.2 oracle (scalar alpha=1.0):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     Y=np.array([[3.,1.],[2.5,2.],[7.1,3.5],[6.,4.2],[11.2,6.]]); \
+        //     m=Ridge(alpha=1.0).fit(X,Y); \
+        //     print(m.coef_.tolist(), m.intercept_.tolist())"
+        let (x, y) = per_target_fixture()?;
+
+        let baseline = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let explicit_none = Ridge::<f64> {
+            alpha_per_target: None,
+            ..Ridge::<f64>::new().with_alpha(1.0)
+        }
+        .fit(&x, &y)?;
+
+        for j in 0..2 {
+            for k in 0..2 {
+                assert_eq!(
+                    baseline.coefficients()[[j, k]].to_bits(),
+                    explicit_none.coefficients()[[j, k]].to_bits(),
+                    "coef_[{j},{k}] must be byte-identical without per-target alpha"
+                );
+            }
+        }
+        for k in 0..2 {
+            assert_eq!(
+                baseline.intercepts()[k].to_bits(),
+                explicit_none.intercepts()[k].to_bits(),
+                "intercept_[{k}] must be byte-identical without per-target alpha"
+            );
+        }
         Ok(())
     }
 }
