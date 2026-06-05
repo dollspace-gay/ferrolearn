@@ -561,9 +561,16 @@ fn solve_glasso<F: Float>(
 ///
 /// Minimises `0.5 w^T Q w - q^T w + alpha*||w||_1` over `w` in place, starting
 /// from the warm-started `w`. `Q` is the Gram matrix (`sub_covariance`), `q` is
-/// the right-hand side (`row`). Convergence uses sklearn's max-change criterion:
-/// after each coordinate sweep, break when `w_max == 0` or
-/// `d_w_max / w_max < enet_tol`.
+/// the right-hand side (`row`); the graphical-lasso caller passes `row` as both
+/// `q` AND the target `y`.
+///
+/// Convergence follows sklearn's duality-gap criterion (`_cd_fast.pyx:685-727`):
+/// the max-coefficient-change rule `w_max == 0 || d_w_max / w_max < enet_tol`
+/// (or the last iteration) is only a GATE; when gated, the full enet duality
+/// gap is computed and the loop breaks only when `gap < enet_tol * y_norm2`
+/// (`:635` rescales `tol` by `y_norm2 = dot(y, y)`, `:725` breaks on
+/// `gap < tol`). On near-singular Gram matrices this runs longer than (or stops
+/// differently from) the max-change rule alone.
 fn enet_coordinate_descent_gram<F: Float>(
     w: &mut Array1<F>,
     alpha: F,
@@ -573,6 +580,9 @@ fn enet_coordinate_descent_gram<F: Float>(
     enet_tol: F,
 ) {
     let n = w.len();
+    let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+    let two = F::one() + F::one();
+
     // H = Q @ w.
     let mut h = Array1::<F>::zeros(n);
     for a in 0..n {
@@ -583,7 +593,15 @@ fn enet_coordinate_descent_gram<F: Float>(
         h[a] = acc;
     }
 
-    for _ in 0..max_iter {
+    // y_norm2 = dot(y, y) with y = qvec; tol_scaled = enet_tol * y_norm2
+    // (`_cd_fast.pyx:629,635`).
+    let mut y_norm2 = F::zero();
+    for i in 0..n {
+        y_norm2 = y_norm2 + qvec[i] * qvec[i];
+    }
+    let tol_scaled = enet_tol * y_norm2;
+
+    for it in 0..max_iter {
         let mut w_max = F::zero();
         let mut d_w_max = F::zero();
         for j in 0..n {
@@ -612,8 +630,47 @@ fn enet_coordinate_descent_gram<F: Float>(
                 w_max = aw;
             }
         }
-        if w_max == F::zero() || d_w_max / w_max < enet_tol {
-            break;
+
+        // GATE: max-change rule or last iteration (`_cd_fast.pyx:685`).
+        if w_max == F::zero() || d_w_max / w_max < enet_tol || it == max_iter - 1 {
+            // Duality gap (`_cd_fast.pyx:690-723`), beta = 0.
+            // q_dot_w = dot(w, q)
+            let mut q_dot_w = F::zero();
+            for i in 0..n {
+                q_dot_w = q_dot_w + w[i] * qvec[i];
+            }
+            // XtA[i] = q[i] - H[i] (beta term = 0); dual_norm_XtA = max|XtA|.
+            let mut dual_norm_xta = F::zero();
+            for i in 0..n {
+                let a = (qvec[i] - h[i]).abs();
+                if a > dual_norm_xta {
+                    dual_norm_xta = a;
+                }
+            }
+            // tmp = sum(w * H) = w^T Q w; R_norm2 = y_norm2 + w^T Q w - 2*q_dot_w.
+            let mut wh = F::zero();
+            for i in 0..n {
+                wh = wh + w[i] * h[i];
+            }
+            let r_norm2 = y_norm2 + wh - two * q_dot_w;
+            // l1 = ||w||_1.
+            let mut l1 = F::zero();
+            for i in 0..n {
+                l1 = l1 + w[i].abs();
+            }
+
+            let (const_, mut gap) = if dual_norm_xta > alpha {
+                let c = alpha / dual_norm_xta;
+                (c, half * (r_norm2 + r_norm2 * c * c))
+            } else {
+                (F::one(), r_norm2)
+            };
+            // gap += alpha*||w||_1 - const*y_norm2 + const*q_dot_w (beta term = 0).
+            gap = gap + alpha * l1 - const_ * y_norm2 + const_ * q_dot_w;
+
+            if gap < tol_scaled {
+                break;
+            }
         }
     }
 }

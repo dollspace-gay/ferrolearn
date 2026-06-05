@@ -138,7 +138,6 @@ fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 ///
 /// Tracking: #1889 (new-blocker).
 #[test]
-#[ignore = "divergence: inner enet_coordinate_descent_gram stops on max-change not duality-gap (no y_norm2 tol scaling), diverges ~3.9e-3 on ill-conditioned emp_cov; tracking #1889"]
 fn divergence_graphical_lasso_ill_conditioned_inner_cd_alpha_0_01() {
     // #1889 new-blocker
     let x = ill_conditioned_x();
