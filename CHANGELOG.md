@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for REQ-11 of lasso.md: FittedLasso lacks n_iter_ and dual_gap_ fitted attributes exposed by sklearn Lasso (#411)
 - Blocker for REQ-12 of ridge.md: copy_X and random_state constructor params — Ridge<F> omits both; sklearn ctor _ridge.py:898/:903, copy_X drives _preprocess_data copy (:963), random_state seeds sag/saga (#390)
 - ferrolearn-linear elastic_net.rs REQ-8: positive=True (non-negative CD clamp) (#2083)
 - Blocker for REQ-7 of lasso.md: Lasso lacks positive=True (force non-negative coefficients) — sklearn ctor param positive=False, _cd_fast.pyx clips w[ii] to >=0 (#407)

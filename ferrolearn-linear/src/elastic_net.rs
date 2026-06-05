@@ -31,7 +31,8 @@
 //! | REQ-6 (HasCoefficients) | SHIPPED | `HasCoefficients for FittedElasticNet`. |
 //! | REQ-7 (alpha/l1_ratio validation; l1_ratio∈[0,1]) | SHIPPED | matches sklearn's `_parameter_constraints` (l1_ratio=0 accepted by the class; the auto-grid error is owned by elastic_net_cv). |
 //! | REQ-8 (positive=True) | SHIPPED | `positive` field + `with_positive` builder; CD loop branches on `self.positive` to `soft_threshold_positive(rho_j, alpha_l1) / denominators[j]` (non-negative soft-threshold, L2 in the denominator unchanged), mirroring sklearn's `positive` param (`_coordinate_descent.py:800`) clip `if positive and tmp < 0: w[ii] = 0.0` (`_cd_fast.pyx:191-195`). Oracle test `elasticnet_positive_matches_sklearn` → coef `[1.13685345, 0.0]`, intercept `-5.96023707` (live sklearn 1.5.2, differs from unconstrained `[0.9081389, -1.7687475]`); `elasticnet_positive_false_unchanged` regression guard. |
-//! | REQ-9..15 NOT-STARTED | warm_start (#408), selection='random' (#409), precompute (#410), dual-gap stopping (#412), n_iter_/dual_gap_ (#417), MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-12 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedElasticNet<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `ElasticNet.n_iter_` (`_coordinate_descent.py:827`) and `dual_gap_` (`:831`). `fn enet_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·l1_ratio·n`, `beta = α·(1−l1_ratio)·n`, the `XtA = XᵀR − beta·w` term + `0.5·beta·(1+const²)·‖w‖²`) with a final `/n` mapping to the `(1/2n)` objective; reduces to `lasso_dual_gap` when `l1_ratio = 1` (`beta = 0`). HONEST NOTE: `n_iter_`'s VALUE differs from sklearn (ferrolearn stops on max-coef-change, not dual gap — REQ-13 #412); `dual_gap_` matches sklearn's formula/value (`0.0001057556` vs sklearn `0.00010575563` at `alpha=0.3, l1_ratio=0.5` on the fixture). This REQ ships the ATTRIBUTES; exact `n_iter_` value-parity stays coupled to REQ-13. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_dual_gap_formula_matches_numpy`, `enet_fitted_dual_gap_and_n_iter`, `enet_fields_dont_change_coef`). |
+//! | REQ-9..11, 13..15 NOT-STARTED | warm_start (#408), selection='random' (#409), precompute (#410), dual-gap stopping (#412), MultiTaskElasticNet (#418), ferray substrate (#419). |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -171,6 +172,11 @@ pub struct FittedElasticNet<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+    /// Number of full coordinate-descent sweeps performed before
+    /// convergence/break (mirrors sklearn `ElasticNet.n_iter_`).
+    n_iter: usize,
+    /// Duality gap at the returned solution (mirrors sklearn `ElasticNet.dual_gap_`).
+    dual_gap: F,
 }
 
 impl<F: Float> FittedElasticNet<F> {
@@ -178,6 +184,83 @@ impl<F: Float> FittedElasticNet<F> {
     pub fn intercept(&self) -> F {
         self.intercept
     }
+
+    /// Number of coordinate-descent sweeps run by the solver.
+    ///
+    /// Mirrors sklearn's `ElasticNet.n_iter_` attribute
+    /// (`_coordinate_descent.py:827`). Note: ferrolearn's stopping criterion
+    /// is max-coefficient-change (REQ-13 #412), so this VALUE can differ from
+    /// sklearn's dual-gap-based count even at the same optimum.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+
+    /// Duality gap at the returned solution, on the `(1/2n)`-scaled objective.
+    ///
+    /// Mirrors sklearn's `ElasticNet.dual_gap_` attribute
+    /// (`_coordinate_descent.py:831`); computed by [`enet_dual_gap`] on the same
+    /// (centered/raw) design the coordinate descent solved.
+    #[must_use]
+    pub fn dual_gap(&self) -> F {
+        self.dual_gap
+    }
+}
+
+/// ElasticNet duality gap on the `(1/2n)`-scaled objective, mirroring sklearn's
+/// `enet_coordinate_descent` gap (`_cd_fast.pyx:216-247`) with the final `/n`
+/// mapping sklearn's un-normalized `(1/2)||y−Xw||² + l1_reg·||w||₁ +
+/// (1/2)·l2_reg·||w||²` (`l1_reg = alpha·l1_ratio·n`, `l2_reg =
+/// alpha·(1−l1_ratio)·n`, `_coordinate_descent.py:655-656`) back to ferrolearn's
+/// `(1/2n)` scaling. Reduces to the Lasso gap when `l1_ratio = 1` (`beta = 0`).
+///
+/// `xc`/`yc` are the design the coordinate descent actually solved on
+/// (centered when `fit_intercept`, raw otherwise); `w` is the fitted coef.
+pub(crate) fn enet_dual_gap<F>(
+    xc: &Array2<F>,
+    yc: &Array1<F>,
+    w: &Array1<F>,
+    alpha: F,
+    l1_ratio: F,
+) -> F
+where
+    F: Float + ScalarOperand + 'static,
+{
+    let n = xc.nrows();
+    let n_f = F::from(n).unwrap_or_else(F::one);
+
+    // R = yc − Xc·w
+    let residual = yc - &xc.dot(w);
+
+    // l1_reg = alpha · l1_ratio · n ; beta = alpha · (1 − l1_ratio) · n.
+    let l1_reg = alpha * l1_ratio * n_f;
+    let beta = alpha * (F::one() - l1_ratio) * n_f;
+
+    // XtA = Xcᵀ·R − beta·w ; dual_norm_XtA = max(|XtA[j]|).
+    let xt_a = xc.t().dot(&residual) - &(w * beta);
+    let dual_norm_xt_a = xt_a.iter().fold(F::zero(), |acc, &v| acc.max(v.abs()));
+
+    let r_norm2 = residual.dot(&residual);
+    let w_norm2 = w.dot(w);
+
+    let (const_factor, mut gap) = if dual_norm_xt_a > l1_reg {
+        let c = l1_reg / dual_norm_xt_a;
+        let half = F::from(0.5).unwrap_or_else(F::one);
+        (c, half * (r_norm2 + r_norm2 * c * c))
+    } else {
+        (F::one(), r_norm2)
+    };
+
+    // l1_norm = ‖w‖₁
+    let l1_norm = w.iter().fold(F::zero(), |acc, &wj| acc + wj.abs());
+    // R · yc
+    let r_dot_y = residual.dot(yc);
+    let half = F::from(0.5).unwrap_or_else(F::one);
+
+    gap = gap + l1_reg * l1_norm - const_factor * r_dot_y
+        + half * beta * (F::one() + const_factor * const_factor) * w_norm2;
+
+    gap / n_f
 }
 
 /// Soft-thresholding operator used in coordinate descent for L1 penalty.
@@ -293,9 +376,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let denominators: Vec<F> = col_norms.iter().map(|&cn| cn + alpha_l2).collect();
 
         let mut w = Array1::<F>::zeros(n_features);
+        // Keep the (centered/raw) target for the final dual-gap computation;
+        // the CD loop consumes a working copy into `residual`.
+        let target = y_work.clone();
         let mut residual = y_work;
 
-        for _iter in 0..self.max_iter {
+        let mut n_iter = 0_usize;
+        for iter in 0..self.max_iter {
+            n_iter = iter + 1;
             let mut max_change = F::zero();
 
             for j in 0..n_features {
@@ -344,18 +432,24 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
             if max_change < self.tol {
                 let intercept = compute_intercept(&x_mean, &y_mean, &w);
+                let dual_gap = enet_dual_gap(&x_work, &target, &w, self.alpha, self.l1_ratio);
                 return Ok(FittedElasticNet {
                     coefficients: w,
                     intercept,
+                    n_iter,
+                    dual_gap,
                 });
             }
         }
 
         // Return best solution found even without full convergence.
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
+        let dual_gap = enet_dual_gap(&x_work, &target, &w, self.alpha, self.l1_ratio);
         Ok(FittedElasticNet {
             coefficients: w,
             intercept,
+            n_iter,
+            dual_gap,
         })
     }
 }
@@ -765,5 +859,91 @@ mod tests {
             "positive=false must be byte-identical to the default fit"
         );
         assert_eq!(default_fit.intercept(), explicit_false.intercept());
+    }
+
+    // ---- n_iter_ / dual_gap_ (REQ-12) ----
+
+    /// Centered fixture for the dual-gap oracle (R-CHAR-3):
+    /// `X = [[1,2],[2,1],[3,4],[4,3],[5,5]]`, `y = [3,2.5,7.1,6,11.2]`,
+    /// centered by column mean / target mean (the design the CD solves under
+    /// `fit_intercept`).
+    fn centered_dual_gap_fixture() -> Option<(Array2<f64>, Array1<f64>)> {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        let x_mean = x.mean_axis(Axis(0))?;
+        let y_mean = y.mean()?;
+        Some((&x - &x_mean, &y - y_mean))
+    }
+
+    fn raw_dual_gap_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        (x, y)
+    }
+
+    #[test]
+    fn enet_dual_gap_formula_matches_numpy() {
+        // numpy/sklearn-computed oracle points (NOT from ferrolearn),
+        // alpha=0.3, l1_ratio=0.5:
+        //   gap(w=[0.5,1.0])                     = 0.6369296296 (far-from-optimum)
+        //   gap(w=[0.77323348,1.35480299])       = 0.0001057556 (the optimum)
+        let (xc, yc) = match centered_dual_gap_fixture() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let far = enet_dual_gap(&xc, &yc, &array![0.5, 1.0], 0.3, 0.5);
+        assert_relative_eq!(far, 0.6369296296, epsilon = 1e-5);
+
+        let opt = enet_dual_gap(&xc, &yc, &array![0.77323348, 1.35480299], 0.3, 0.5);
+        assert_relative_eq!(opt, 0.0001057556, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn enet_fitted_dual_gap_and_n_iter() {
+        // ElasticNet(alpha=0.3, l1_ratio=0.5) on the same fixture: dual_gap_
+        // converged near sklearn's 0.000106; n_iter_ within [1, max_iter].
+        let (x, y) = raw_dual_gap_fixture();
+
+        let fit_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y);
+        assert!(fit_res.is_ok(), "fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let gap = fitted.dual_gap();
+        assert!(gap >= 0.0, "dual_gap should be non-negative, got {gap}");
+        assert!(gap < 1e-3, "dual_gap should be converged-small, got {gap}");
+
+        let n_iter = fitted.n_iter();
+        assert!(n_iter >= 1, "n_iter should be at least 1, got {n_iter}");
+        assert!(n_iter <= 1000, "n_iter should be <= max_iter, got {n_iter}");
+    }
+
+    #[test]
+    fn enet_fields_dont_change_coef() {
+        // Regression guard: the additive n_iter_/dual_gap_ fields must not
+        // perturb coef_/intercept_. Compared against sklearn's converged
+        // coef_ = [0.77323348, 1.35480299] at a loose tolerance: ferrolearn's
+        // max-coef-change stop reaches the same optimum modulo REQ-13's looser
+        // stopping measure, and the additive fields leave it unchanged.
+        let (x, y) = raw_dual_gap_fixture();
+
+        let fit_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y);
+        assert!(fit_res.is_ok(), "fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        assert_relative_eq!(fitted.coefficients()[0], 0.77323348, epsilon = 1e-3);
+        assert_relative_eq!(fitted.coefficients()[1], 1.35480299, epsilon = 1e-3);
     }
 }
