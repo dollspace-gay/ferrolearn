@@ -25,7 +25,7 @@
 //! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
 //! | REQ-8 `robust_scale` free function + axis | SHIPPED (#1253) | `robust_scale` free fn delegating to `RobustScaler` (`axis=0` native, `axis=1` transpose→fit_transform→transpose); sklearn `_data.py:1719`,`:1845-1848` |
 //! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | NOT-STARTED (#1254) | sklearn `_data.py:1601`,`:1614`,`:1630` |
-//! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | NOT-STARTED (#1255) | sklearn `_data.py:1505-1514`,`:1635` |
+//! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | SHIPPED (#1255) | `FittedRobustScaler::center` (= `median`) / `scale` (= `scale_` field = `_handle_zeros_in_scale(iqr)`, `1.0` on zero-IQR columns); `fit` sets `scale_ = iqr.mapv(\|v\| if v==0 {1} else {v})`; sklearn `_data.py:1505-1514`,`:1634-1635` |
 //! | REQ-12 copy ctor param + in-place semantics | NOT-STARTED (#1256) | sklearn `_data.py:1568`,`:1661` |
 //! | REQ-13 sparse CSC/CSR support | NOT-STARTED (#1257) | sklearn `_data.py:1609-1612`,`:1668-1670` |
 //! | REQ-14 get_feature_names_out / n_features_in_ | NOT-STARTED (#1258) | sklearn `OneToOneFeatureMixin` |
@@ -208,6 +208,13 @@ pub struct FittedRobustScaler<F> {
     pub(crate) median: Array1<F>,
     /// Per-column interquartile ranges (Q75 − Q25) learned during fitting.
     pub(crate) iqr: Array1<F>,
+    /// Per-column effective scale: `_handle_zeros_in_scale(iqr)`, i.e. the raw
+    /// IQR on non-constant columns and `1.0` on zero-IQR/constant columns.
+    ///
+    /// Mirrors sklearn `RobustScaler.scale_`
+    /// (`_data.py:1634-1635`: `self.scale_ = quantiles[1] - quantiles[0];`
+    /// `self.scale_ = _handle_zeros_in_scale(self.scale_, copy=False)`).
+    pub(crate) scale_: Array1<F>,
     /// Whether `transform` centers (subtracts the median).
     ///
     /// Copied from the unfitted [`RobustScaler::with_centering`] in [`Fit::fit`];
@@ -231,6 +238,27 @@ impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
     #[must_use]
     pub fn iqr(&self) -> &Array1<F> {
         &self.iqr
+    }
+
+    /// Return the per-column centers (the medians) learned during fitting.
+    ///
+    /// Mirrors sklearn `RobustScaler.center_` — "The median value for each
+    /// feature in the training set" (`_data.py:1505-1514`). Equal to
+    /// [`median`](Self::median).
+    #[must_use]
+    pub fn center(&self) -> &Array1<F> {
+        &self.median
+    }
+
+    /// Return the per-column scales learned during fitting.
+    ///
+    /// Mirrors sklearn `RobustScaler.scale_` = `_handle_zeros_in_scale(iqr)`
+    /// (`_data.py:1634-1635`, `:88`): equal to the raw [`iqr`](Self::iqr) on
+    /// non-constant columns, but `1.0` on zero-IQR/constant columns (so it
+    /// differs from [`iqr`](Self::iqr) there).
+    #[must_use]
+    pub fn scale(&self) -> &Array1<F> {
+        &self.scale_
     }
 }
 
@@ -280,9 +308,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
             iqr_arr[j] = q_hi - q_lo;
         }
 
+        // scale_ = _handle_zeros_in_scale(iqr): the raw IQR on non-constant
+        // columns, 1.0 on zero-IQR/constant columns (sklearn `_data.py:1635`,
+        // `:88`). This is the effective scale `transform` already divides by.
+        let scale_arr = iqr_arr.mapv(|v| if v == F::zero() { F::one() } else { v });
+
         Ok(FittedRobustScaler {
             median: median_arr,
             iqr: iqr_arr,
+            scale_: scale_arr,
             with_centering: self.with_centering,
             with_scaling: self.with_scaling,
         })
@@ -844,5 +878,60 @@ mod tests {
             robust_scale(&x, 2, true, true, (25.0, 75.0)),
             Err(FerroError::InvalidParameter { .. })
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-10: center_ / scale_ attribute names + _handle_zeros scale_
+    // (sklearn _data.py:1505-1514, :1634-1635). Live sklearn 1.5.2 oracle
+    // (R-CHAR-3), computed from /tmp, never copied from the ferrolearn side.
+    //
+    // Oracle X: col0 = [1,3,5,7,9], col1 = [5,5,5,5,5] (col1 constant -> IQR 0).
+    //   from sklearn.preprocessing import RobustScaler
+    //   r = RobustScaler().fit(X)
+    //   r.center_.tolist() -> [5.0, 5.0]
+    //   r.scale_.tolist()  -> [4.0, 1.0]   (constant col -> _handle_zeros -> 1.0)
+    // -----------------------------------------------------------------------
+
+    fn req10_oracle_x() -> Array2<f64> {
+        array![[1.0, 5.0], [3.0, 5.0], [5.0, 5.0], [7.0, 5.0], [9.0, 5.0]]
+    }
+
+    /// `center()` / `scale()` match the live sklearn `center_` / `scale_`:
+    /// `center_ = [5.0, 5.0]`, `scale_ = [4.0, 1.0]` (the constant column's
+    /// scale is EXACTLY `1.0` via `_handle_zeros_in_scale`).
+    #[test]
+    fn robust_center_scale_match_sklearn() -> Result<(), FerroError> {
+        let x = req10_oracle_x();
+        let fitted = RobustScaler::<f64>::new().fit(&x, &())?;
+
+        assert_abs_diff_eq!(fitted.center()[0], 5.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.center()[1], 5.0, epsilon = 1e-9);
+
+        assert_abs_diff_eq!(fitted.scale()[0], 4.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(fitted.scale()[1], 1.0, epsilon = 1e-12);
+        // The constant column's scale is EXACTLY 1.0 (_handle_zeros).
+        assert_eq!(fitted.scale()[1], 1.0);
+        Ok(())
+    }
+
+    /// `scale_` differs from the raw `iqr` on a constant column (`iqr==0` but
+    /// `scale_==1.0`), is unchanged on a non-constant column, and `center_`
+    /// equals `median`.
+    #[test]
+    fn robust_scale_differs_from_iqr_on_constant_col() -> Result<(), FerroError> {
+        let x = req10_oracle_x();
+        let fitted = RobustScaler::<f64>::new().fit(&x, &())?;
+
+        // Constant column: raw IQR is 0, but scale_ is handled to 1.0.
+        assert_eq!(fitted.iqr()[1], 0.0);
+        assert_eq!(fitted.scale()[1], 1.0);
+
+        // Non-constant column: scale_ == raw IQR (unchanged).
+        assert_eq!(fitted.scale()[0], fitted.iqr()[0]);
+
+        // center_ == median on every column.
+        assert_eq!(fitted.center()[0], fitted.median()[0]);
+        assert_eq!(fitted.center()[1], fitted.median()[1]);
+        Ok(())
     }
 }
