@@ -474,3 +474,54 @@ fn divergence_1768_error_score_nan_continue() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PINNED DIVERGENCE — #1769: all-integer-valued FLOAT > 1.0 -> ValueError
+// vs treated-as-absolute (NEW, introduced by the #1764-#1767 port)
+// ---------------------------------------------------------------------------
+
+/// Divergence (NEW, distinct from the in-code `[1.0]` residual): ferrolearn's
+/// `_translate_train_sizes` port chooses fraction-vs-absolute mode by VALUE
+/// integrality (`ferrolearn-model-sel/src/learning_curve.rs:156`
+/// `train_sizes.iter().all(|&s| s.fract() == 0.0)`), whereas sklearn keys off
+/// the array's float-vs-int DTYPE (`sklearn/model_selection/_validation.py:2020`
+/// `if np.issubdtype(train_sizes_abs.dtype, np.floating):`).
+///
+/// For an all-integer-VALUED but FLOAT-dtype input like `[2.0, 3.0]`:
+///   - ferrolearn: `fract() == 0.0` for every entry ⇒ ABSOLUTE mode; `max=3 <=
+///     n_max=20` ⇒ `Ok([2, 3])`.
+///   - sklearn: `np.asarray([2.0, 3.0])` is float dtype ⇒ FRACTION mode; with
+///     `n_max_required_samples = 3.0 > 1.0` ⇒ `ValueError` (`:2021-2027`).
+///
+/// This is a STRONGER divergence class than the documented `[1.0]` residual: the
+/// in-code NOTE (`:152-155`) covers only the `<= 1.0` value-DIFFERENCE subcase
+/// (ferrolearn `[1.0]` ⇒ 1 sample vs sklearn ⇒ 20 samples, both succeed). It does
+/// NOT cover the `> 1.0` RAISE-vs-SUCCEED subcase introduced when the port added
+/// the float-fraction `max > 1.0` ValueError guard: there sklearn RAISES while
+/// ferrolearn SUCCEEDS, which the documented residual does not contemplate.
+///
+/// LIVE sklearn 1.5.2 oracle:
+/// `_translate_train_sizes(np.asarray([2.0, 3.0]), 20)` raises `ValueError`;
+/// ferrolearn returns `Ok` with ticks `[2, 3]`.
+///
+/// Tracking: #1769 new-blocker.
+// #1769 new-blocker
+#[ignore = "divergence: all-integer-valued FLOAT >1.0 raises in sklearn (float dtype -> fraction mode) but ferrolearn treats as absolute; tracking #1769"]
+#[test]
+fn divergence_1769_integer_valued_float_gt_one_should_error() {
+    let y: Array1<f64> = (0..30).map(f64::from).collect();
+    let x = Array2::<f64>::zeros((30, 2));
+    let kf = KFold::new(3); // first fold train length == 20 == oracle n_max
+    let pipeline = Pipeline::new().estimator_step("mean", Box::new(MeanEstimator));
+
+    // sklearn: np.asarray([2.0, 3.0]) is float dtype -> fraction mode ->
+    // max 3.0 > 1.0 -> ValueError. ferrolearn must error too.
+    let result = learning_curve(&pipeline, &x, &y, &kf, &[2.0, 3.0], neg_mse);
+
+    assert!(
+        result.is_err(),
+        "sklearn raises ValueError for the float-dtype array [2.0, 3.0] \
+         (fraction mode, max 3.0 > 1.0); ferrolearn's value-integrality heuristic \
+         treats it as absolute counts [2, 3] and returns Ok",
+    );
+}
