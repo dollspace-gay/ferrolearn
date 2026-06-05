@@ -24,7 +24,7 @@
 //! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedLinearRegression`. Mirrors fitted attrs `_base.py:499/511`. |
 //! | REQ-5 (min-norm for rank-deficient / underdetermined X) | SHIPPED | `Fit for LinearRegression` calls `crate::linalg::solve_lstsq` → `ferray::linalg::lstsq` (`ferray-linalg/src/solve.rs:208`), the single-SVD gelsd-equivalent min-norm solver mirroring `_base.py:687`. Closes #376 (rank-deficient min-norm) + #377 (underdetermined accepted). Tests now passing (`#[ignore]` removed): `divergence_rank_deficient_no_intercept_min_norm`, `divergence_rank_deficient_with_intercept_min_norm`, `divergence_underdetermined_accepted_min_norm` in `tests/divergence_linreg_minnorm.rs`. |
 //! | REQ-6 (positive=True / NNLS) | NOT-STARTED | blocker #371 (`_base.py:574/645`). |
-//! | REQ-7 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | blocker #372 (fit takes `Array1` only). |
+//! | REQ-7 (multi-output 2-D Y → 2-D coef_) | SHIPPED | Additive `Fit<Array2<F>, Array2<F>>` arm (does NOT touch the 1-D `Fit`/`FittedLinearRegression`/`Predict`) producing `FittedMultiOutputLinearRegression<F>` — `coefficients` shape `(n_targets, n_features)` (sklearn `coef_` orientation, `coef_.T` of the lstsq solution, `_base.py:688`), `intercepts` `(n_targets,)`, `rank_`/`singular_`. Solves all targets in one SVD via `linalg::solve_lstsq_multi` → `ferray::linalg::lstsq` with a 2-D `b` (mirrors `linalg.lstsq(X, Y)`, `_base.py:687`); shared X-centering + per-target y-offset, `intercepts = y_off − coefficients · x_off` (`_set_intercept`, `_base.py:322`); `fit_intercept=false` → raw solve, intercepts 0. `Predict<Array2<F>, Output=Array2<F>>` returns `X · coef_.T + intercepts` shape `(n_samples, n_targets)` (`_base.py:290`). Oracle tests `linreg_multioutput_coef_intercept_match_sklearn` (coef `[[2.06666667,-0.06666667],[0.86666667,0.23333333]]`, intercept `[-0.06666667,0.13333333]`), `linreg_multioutput_predict_shape_and_values` (`predict(X[:2]) = [[2.0,1.0],[4.0,2.1]]`), `linreg_multioutput_no_intercept` (coef `[[2.0195121951,-0.0097560976],[0.9609756098,0.1195121951]]`, intercepts 0), `linreg_single_output_unchanged` (1-D path byte-identical). Closes #372. |
 //! | REQ-8 (sample_weight in fit) | SHIPPED | `LinearRegression::fit_with_sample_weight` solves WEIGHTED least squares `min Σᵢ wᵢ(yᵢ−xᵢ·w)²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (mirrors `_average(...,weights=sample_weight)`, `_base.py:193`/`:198`), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_base.py:641`), `linalg::solve_lstsq` on the rescaled design, `intercept = y_off − x_off·coef` (`_set_intercept`, `_base.py:320`); `fit_intercept=false` skips centering, intercept 0. `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None path byte-identical to the historic OLS body). Oracle tests `linreg_fit_sample_weight_with_intercept_matches_sklearn` (coef 2.0935828877, intercept −0.2326203209), `linreg_fit_sample_weight_no_intercept_matches_sklearn` (coef 2.0350877193, intercept 0), `linreg_fit_none_sample_weight_equals_unweighted`. Mirrors `fit(..., sample_weight=None)` (`_base.py:582`). Closes #373. |
 //! | REQ-9 (rank_/singular_/copy_X/n_jobs) | SHIPPED | `FittedLinearRegression` stores `rank_`/`singular_` (captured from `linalg::solve_lstsq` on the matrix actually solved — centered `X` when `fit_intercept`, raw `X` otherwise, matching sklearn `_base.py:687`), exposed via `rank()`/`singular_values()`; `LinearRegression` adds `copy_x` (default `true`) + `n_jobs` (default `None`) fields with `with_copy_x`/`with_n_jobs` builders, mirroring `_parameter_constraints` (`_base.py:561`) and the ctor (`_base.py:572-573`). `copy_x` is ABI-only (fit never mutates `x`); `n_jobs` stored-but-ignored (single-threaded). Oracle tests `linreg_rank_singular_match_sklearn_with_intercept` (rank 2, singular `[1.61803399, 0.61803399]` on centered X), `linreg_singular_no_intercept_matches_raw_x` (singular `[5.25371017, 0.63129192]` on raw X), `linreg_copy_x_default_and_builder`. Closes #374. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 — OLS solve now on `ferray::linalg::lstsq`, but `LinearRegression`'s coef storage is still `ndarray` (coef return type tied to #359); fully on-substrate when the boundary `ndarray` types migrate. |
@@ -375,6 +375,207 @@ impl<
         // (centering + `solve_lstsq`), mirroring sklearn's single `fit` entry
         // (`_base.py:582`, `sample_weight=None` default).
         self.fit_with_sample_weight(x, y, None)
+    }
+}
+
+/// Fitted multi-output ordinary least squares linear regression model.
+///
+/// The 2-D-target companion to [`FittedLinearRegression`]: produced by
+/// `Fit<Array2<F>, Array2<F>>` when fitting a 2-D `Y` of shape
+/// `(n_samples, n_targets)`. Mirrors scikit-learn's multi-output
+/// `LinearRegression` (`MultiOutputMixin`, `_base.py:465`), whose `coef_` is a
+/// 2-D array of shape `(n_targets, n_features)` and `intercept_` an array of
+/// shape `(n_targets,)` (`_base.py:499`/`:511`). Stored in sklearn's `coef_`
+/// orientation (target rows), so `coefficients()` maps directly onto
+/// `sklearn.coef_`.
+#[derive(Debug, Clone)]
+pub struct FittedMultiOutputLinearRegression<F> {
+    /// Learned coefficient matrix in sklearn `coef_` orientation: shape
+    /// `(n_targets, n_features)`, row `t` the coefficients for target `t`
+    /// (`_base.py:499`).
+    coefficients: Array2<F>,
+    /// Learned per-target intercepts, shape `(n_targets,)` (sklearn
+    /// `intercept_`, `_base.py:511`).
+    intercepts: Array1<F>,
+    /// Effective rank of the design matrix actually solved (sklearn `rank_`,
+    /// `_base.py:505`/`:687`) — the centered `X` when `fit_intercept`, the raw
+    /// `X` otherwise.
+    rank_: usize,
+    /// Singular values of the design matrix actually solved (sklearn
+    /// `singular_`, `_base.py:508`/`:687`).
+    singular_: Array1<F>,
+}
+
+impl<F: Float> FittedMultiOutputLinearRegression<F> {
+    /// Learned coefficient matrix, shape `(n_targets, n_features)` (sklearn
+    /// `coef_`, `_base.py:499`).
+    #[must_use]
+    pub fn coefficients(&self) -> &Array2<F> {
+        &self.coefficients
+    }
+
+    /// Learned per-target intercepts, shape `(n_targets,)` (sklearn
+    /// `intercept_`, `_base.py:511`).
+    #[must_use]
+    pub fn intercepts(&self) -> &Array1<F> {
+        &self.intercepts
+    }
+
+    /// Effective rank of the design matrix (sklearn `rank_`, `_base.py:505`).
+    #[must_use]
+    pub fn rank(&self) -> usize {
+        self.rank_
+    }
+
+    /// Singular values of the design matrix (sklearn `singular_`,
+    /// `_base.py:508`).
+    #[must_use]
+    pub fn singular_values(&self) -> &Array1<F> {
+        &self.singular_
+    }
+}
+
+impl<
+    F: Float
+        + Send
+        + Sync
+        + ScalarOperand
+        + num_traits::FromPrimitive
+        + ferray::linalg::LinalgFloat
+        + 'static,
+> Fit<Array2<F>, Array2<F>> for LinearRegression<F>
+{
+    type Fitted = FittedMultiOutputLinearRegression<F>;
+    type Error = FerroError;
+
+    /// Fit the multi-output linear regression model on a 2-D target `Y`.
+    ///
+    /// Mirrors scikit-learn's multi-output dense path: `linalg.lstsq(X, Y)`
+    /// with `Y` of shape `(n_samples, n_targets)` solves all targets in one
+    /// SVD, yielding `coef_` of shape `(n_targets, n_features)` and a per-target
+    /// `intercept_` of shape `(n_targets,)` (`sklearn/linear_model/_base.py:687`,
+    /// `coef_.T`; intercept `_set_intercept`, `_base.py:308`/`:322`). When
+    /// `fit_intercept` is true, `X` and each column of `Y` are centered by their
+    /// column means and the intercept is recovered as
+    /// `y_off − coefficients · x_off` per target; when false, the solve runs on
+    /// raw `X`/`Y` and the intercepts are all `0`.
+    ///
+    /// The 1-D `Fit<Array2<F>, Array1<F>>` impl is unaffected — this is an
+    /// additive 2-D arm.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of samples in `x`
+    /// and `y` differ.
+    /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
+    /// Returns [`FerroError::NumericalInstability`] if the system is singular.
+    fn fit(
+        &self,
+        x: &Array2<F>,
+        y: &Array2<F>,
+    ) -> Result<FittedMultiOutputLinearRegression<F>, FerroError> {
+        let n_samples = x.nrows();
+        let n_targets = y.ncols();
+
+        if n_samples != y.nrows() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.nrows()],
+                context: "Y rows must match number of samples in X".into(),
+            });
+        }
+
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "LinearRegression requires at least one sample".into(),
+            });
+        }
+
+        if self.fit_intercept {
+            // Same column-centering as the 1-D fit, generalized to Y's columns
+            // (sklearn `_preprocess_data` centers X and every column of Y by
+            // their per-column means, `_base.py:193`/`:198`).
+            let x_off = x
+                .mean_axis(Axis(0))
+                .ok_or_else(|| FerroError::InsufficientSamples {
+                    required: 1,
+                    actual: 0,
+                    context: "cannot compute feature means of an empty design".into(),
+                })?;
+            let y_off = y
+                .mean_axis(Axis(0))
+                .ok_or_else(|| FerroError::InsufficientSamples {
+                    required: 1,
+                    actual: 0,
+                    context: "cannot compute target means of an empty Y".into(),
+                })?;
+
+            let x_centered = x - &x_off;
+            let y_centered = y - &y_off;
+
+            // coef_ft is (n_features, n_targets); store in sklearn `coef_`
+            // orientation (n_targets, n_features) via transpose.
+            let (coef_ft, rank, singular) = linalg::solve_lstsq_multi(&x_centered, &y_centered)?;
+            let coefficients = coef_ft.t().to_owned();
+
+            // intercept_[t] = y_off[t] − coefficients[t] · x_off
+            // (sklearn `_set_intercept`: `y_offset − X_offset @ coef_.T`,
+            // `_base.py:322`).
+            let intercepts = &y_off - &coefficients.dot(&x_off);
+
+            Ok(FittedMultiOutputLinearRegression {
+                coefficients,
+                intercepts,
+                rank_: rank,
+                singular_: singular,
+            })
+        } else {
+            let (coef_ft, rank, singular) = linalg::solve_lstsq_multi(x, y)?;
+            let coefficients = coef_ft.t().to_owned();
+            let intercepts = Array1::<F>::zeros(n_targets);
+
+            Ok(FittedMultiOutputLinearRegression {
+                coefficients,
+                intercepts,
+                rank_: rank,
+                singular_: singular,
+            })
+        }
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
+    for FittedMultiOutputLinearRegression<F>
+{
+    type Output = Array2<F>;
+    type Error = FerroError;
+
+    /// Predict 2-D target values for the given feature matrix.
+    ///
+    /// Computes `X @ coefficients.T + intercepts` (broadcasting the per-target
+    /// intercepts over rows), shape `(n_samples, n_targets)`, mirroring sklearn's
+    /// 2-D `_decision_function` arm `X @ coef_.T + self.intercept_`
+    /// (`_base.py:290`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
+    /// match the fitted model.
+    fn predict(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_features = x.ncols();
+        if n_features != self.coefficients.ncols() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.coefficients.ncols()],
+                actual: vec![n_features],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+
+        // X (n_samples, n_features) @ coef_.T (n_features, n_targets) -> (n_samples, n_targets)
+        let preds = x.dot(&self.coefficients.t());
+        Ok(preds + &self.intercepts)
     }
 }
 
@@ -729,6 +930,128 @@ mod tests {
             via_fit_ni.intercept().to_bits(),
             via_none_ni.intercept().to_bits()
         );
+    }
+
+    #[test]
+    fn linreg_multioutput_coef_intercept_match_sklearn() {
+        // Live sklearn 1.5.2 oracle (multi-output, fit_intercept=True):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.,0.],[2.,1.],[3.,1.],[4.,2.],[5.,3.]]); \
+        //     Y=np.array([[2.1,1.0],[3.9,2.1],[6.2,2.9],[7.7,4.2],[10.3,5.1]]); \
+        //     m=LinearRegression().fit(X,Y); print(m.coef_.shape); \
+        //     print([[round(v,8) for v in r] for r in m.coef_]); \
+        //     print([round(v,8) for v in m.intercept_])"
+        //   -> (2, 2)
+        //      [[2.06666667, -0.06666667], [0.86666667, 0.23333333]]
+        //      [-0.06666667, 0.13333333]
+        let x = Array2::from_shape_vec(
+            (5, 2),
+            vec![1.0, 0.0, 2.0, 1.0, 3.0, 1.0, 4.0, 2.0, 5.0, 3.0],
+        )
+        .unwrap();
+        let y = Array2::from_shape_vec(
+            (5, 2),
+            vec![2.1, 1.0, 3.9, 2.1, 6.2, 2.9, 7.7, 4.2, 10.3, 5.1],
+        )
+        .unwrap();
+
+        let model = LinearRegression::<f64>::new();
+        let fitted = Fit::<Array2<f64>, Array2<f64>>::fit(&model, &x, &y).unwrap();
+
+        assert_eq!(fitted.coefficients().dim(), (2, 2));
+        let c = fitted.coefficients();
+        assert_relative_eq!(c[[0, 0]], 2.066_666_67, epsilon = 1e-7);
+        assert_relative_eq!(c[[0, 1]], -0.066_666_67, epsilon = 1e-7);
+        assert_relative_eq!(c[[1, 0]], 0.866_666_67, epsilon = 1e-7);
+        assert_relative_eq!(c[[1, 1]], 0.233_333_33, epsilon = 1e-7);
+
+        let b = fitted.intercepts();
+        assert_eq!(b.len(), 2);
+        assert_relative_eq!(b[0], -0.066_666_67, epsilon = 1e-7);
+        assert_relative_eq!(b[1], 0.133_333_33, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn linreg_multioutput_predict_shape_and_values() {
+        // Oracle (same model as above): predict(X).shape == (5, 2);
+        //   m.predict(X[:2]) -> [[2.0, 1.0], [4.0, 2.1]]
+        let x = Array2::from_shape_vec(
+            (5, 2),
+            vec![1.0, 0.0, 2.0, 1.0, 3.0, 1.0, 4.0, 2.0, 5.0, 3.0],
+        )
+        .unwrap();
+        let y = Array2::from_shape_vec(
+            (5, 2),
+            vec![2.1, 1.0, 3.9, 2.1, 6.2, 2.9, 7.7, 4.2, 10.3, 5.1],
+        )
+        .unwrap();
+
+        let model = LinearRegression::<f64>::new();
+        let fitted = Fit::<Array2<f64>, Array2<f64>>::fit(&model, &x, &y).unwrap();
+
+        let preds = fitted.predict(&x).unwrap();
+        assert_eq!(preds.dim(), (5, 2));
+
+        let x2 = x.slice(ndarray::s![0..2, ..]).to_owned();
+        let preds2 = fitted.predict(&x2).unwrap();
+        assert_eq!(preds2.dim(), (2, 2));
+        assert_relative_eq!(preds2[[0, 0]], 2.0, epsilon = 1e-6);
+        assert_relative_eq!(preds2[[0, 1]], 1.0, epsilon = 1e-6);
+        assert_relative_eq!(preds2[[1, 0]], 4.0, epsilon = 1e-6);
+        assert_relative_eq!(preds2[[1, 1]], 2.1, epsilon = 1e-6);
+    }
+
+    #[test]
+    fn linreg_multioutput_no_intercept() {
+        // Live sklearn 1.5.2 oracle (multi-output, fit_intercept=False):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.,0.],[2.,1.],[3.,1.],[4.,2.],[5.,3.]]); \
+        //     Y=np.array([[2.1,1.0],[3.9,2.1],[6.2,2.9],[7.7,4.2],[10.3,5.1]]); \
+        //     m=LinearRegression(fit_intercept=False).fit(X,Y); \
+        //     print([[round(v,10) for v in r] for r in m.coef_]); print(m.intercept_)"
+        //   -> [[2.0195121951, -0.0097560976], [0.9609756098, 0.1195121951]]
+        //      0.0
+        let x = Array2::from_shape_vec(
+            (5, 2),
+            vec![1.0, 0.0, 2.0, 1.0, 3.0, 1.0, 4.0, 2.0, 5.0, 3.0],
+        )
+        .unwrap();
+        let y = Array2::from_shape_vec(
+            (5, 2),
+            vec![2.1, 1.0, 3.9, 2.1, 6.2, 2.9, 7.7, 4.2, 10.3, 5.1],
+        )
+        .unwrap();
+
+        let model = LinearRegression::<f64>::new().with_fit_intercept(false);
+        let fitted = Fit::<Array2<f64>, Array2<f64>>::fit(&model, &x, &y).unwrap();
+
+        let c = fitted.coefficients();
+        assert_eq!(c.dim(), (2, 2));
+        assert_relative_eq!(c[[0, 0]], 2.019_512_195_1, epsilon = 1e-7);
+        assert_relative_eq!(c[[0, 1]], -0.009_756_097_6, epsilon = 1e-7);
+        assert_relative_eq!(c[[1, 0]], 0.960_975_609_8, epsilon = 1e-7);
+        assert_relative_eq!(c[[1, 1]], 0.119_512_195_1, epsilon = 1e-7);
+
+        let b = fitted.intercepts();
+        assert_eq!(b.len(), 2);
+        assert_eq!(b[0], 0.0);
+        assert_eq!(b[1], 0.0);
+    }
+
+    #[test]
+    fn linreg_single_output_unchanged() {
+        // Regression guard: the additive 2-D arm must not disturb the 1-D path.
+        // y = 2*x + 1 (same fixture as `test_simple_linear_regression`).
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y1 = array![3.0, 5.0, 7.0, 9.0, 11.0];
+
+        let model = LinearRegression::<f64>::new();
+        let fitted = model.fit(&x, &y1).unwrap();
+
+        assert_relative_eq!(fitted.coefficients()[0], 2.0, epsilon = 1e-10);
+        assert_relative_eq!(fitted.intercept(), 1.0, epsilon = 1e-10);
     }
 
     #[test]

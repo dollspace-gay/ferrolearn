@@ -133,6 +133,86 @@ pub(crate) fn solve_lstsq<F: LinalgFloat>(
     ))
 }
 
+/// Solve the multi-output least squares problem `X @ W = Y` for `W`.
+///
+/// The 2-D companion to [`solve_lstsq`]: `Y` is `(n_samples, n_targets)` and
+/// the returned solution `W` is `(n_features, n_targets)` — column `t` is the
+/// minimum-norm least-squares solution of `X @ w = Y[:, t]`. Routes through the
+/// same single-SVD [`ferray::linalg::lstsq`] (`ferray-linalg/src/solve.rs:208`),
+/// which natively accepts a 2-D `b` (its `match b_shape.len()` arm) and returns
+/// the `(n_features, n_targets)` solution row-major. This mirrors
+/// scikit-learn's dense multi-output path `linalg.lstsq(X, Y)` with `Y` of
+/// shape `(n_samples, n_targets)` (`sklearn/linear_model/_base.py:687`), where
+/// the LAPACK-`gelsd` solve handles all targets in one SVD.
+///
+/// The same `Some(F::epsilon())` cutoff as the 1-D wrapper is used, pinning the
+/// singular-value rank decision to scipy's `cond=eps` (`eps * s_max`).
+///
+/// Returns `(solution, rank, singular_values)`: the `(n_features, n_targets)`
+/// minimum-norm solution, the effective rank of `X` (sklearn `rank_`), and the
+/// singular values of `X` (sklearn `singular_`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the underlying SVD fails or
+/// the ferray↔ndarray bridge encounters a shape inconsistency.
+pub(crate) fn solve_lstsq_multi<F: LinalgFloat>(
+    x: &Array2<F>,
+    y: &Array2<F>,
+) -> Result<(Array2<F>, usize, Array1<F>), FerroError> {
+    let (n_samples, n_features) = x.dim();
+    let n_targets = y.ncols();
+
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4): flat row-major Vec + shape.
+    let x_flat: Vec<F> = x.iter().copied().collect();
+    let a =
+        FerrayArray::<F, ferray::Ix2>::from_vec(ferray::Ix2::new([n_samples, n_features]), x_flat)
+            .map_err(|e| FerroError::NumericalInstability {
+                message: format!("ferray lstsq_multi: failed to build design matrix: {e}"),
+            })?;
+
+    // Build the 2-D ferray `b` as `[n_samples, n_targets]` from Y's row-major
+    // flat data; ferray's lstsq dispatches on `b_shape.len() == 2`.
+    let y_flat: Vec<F> = y.iter().copied().collect();
+    let b = FerrayArray::<F, IxDyn>::from_vec(IxDyn::new(&[n_samples, n_targets]), y_flat)
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray lstsq_multi: failed to build target matrix: {e}"),
+        })?;
+
+    // Single-SVD gelsd-equivalent solve for all targets at once. `Some(eps)`
+    // pins the cutoff to scipy's `cond=eps` (see [`solve_lstsq`]).
+    let (solution, _residuals, rank, singular) = ferray::linalg::lstsq(&a, &b, Some(F::epsilon()))
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray lstsq_multi solve failed: {e}"),
+        })?;
+
+    // Bridge the `(n_features, n_targets)` solution ferray -> ndarray. ferray
+    // returns it as a 2-D `IxDyn` array, row-major; rebuild the owned
+    // `Array2<F>` callers expect.
+    let solution_nd = solution.into_ndarray();
+    let sol_vec: Vec<F> = solution_nd.iter().copied().collect();
+    if sol_vec.len() != n_features * n_targets {
+        return Err(FerroError::NumericalInstability {
+            message: format!(
+                "ferray lstsq_multi: solution length {} does not match {} features x {} targets",
+                sol_vec.len(),
+                n_features,
+                n_targets
+            ),
+        });
+    }
+    let coef = Array2::from_shape_vec((n_features, n_targets), sol_vec).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray lstsq_multi: failed to reshape solution: {e}"),
+        }
+    })?;
+
+    let singular_nd = singular.into_ndarray();
+    let singular_vec: Vec<F> = singular_nd.iter().copied().collect();
+
+    Ok((coef, rank, Array1::from_vec(singular_vec)))
+}
+
 /// Solve a symmetric positive-definite system `A @ x = b` via Cholesky.
 fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
     let n = a.nrows();
@@ -418,6 +498,36 @@ mod tests {
         let w = solve_lstsq(&x, &y).unwrap();
         assert_relative_eq!(w.0[0], 1.0, epsilon = 1e-10);
         assert_relative_eq!(w.0[1], 2.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn test_solve_lstsq_multi_two_targets() {
+        // Multi-output min-norm lstsq: solve X @ W = Y for a 2-target Y on a
+        // full-rank X. Oracle (scipy.linalg.lstsq handles 2-D b):
+        //   python3 -c "import numpy as np; from scipy.linalg import lstsq; \
+        //     X=np.array([[1.,0.],[2.,1.],[3.,1.],[4.,2.],[5.,3.]]); \
+        //     Y=np.array([[2.1,1.0],[3.9,2.1],[6.2,2.9],[7.7,4.2],[10.3,5.1]]); \
+        //     print([[round(v,8) for v in r] for r in lstsq(X,Y)[0]])"
+        //   -> [[2.0195122, 0.96097561], [-0.0097561, 0.1195122]]
+        // (solution is (n_features, n_targets); column t solves X @ w = Y[:, t].)
+        let x = Array2::from_shape_vec(
+            (5, 2),
+            vec![1.0, 0.0, 2.0, 1.0, 3.0, 1.0, 4.0, 2.0, 5.0, 3.0],
+        )
+        .unwrap();
+        let y = Array2::from_shape_vec(
+            (5, 2),
+            vec![2.1, 1.0, 3.9, 2.1, 6.2, 2.9, 7.7, 4.2, 10.3, 5.1],
+        )
+        .unwrap();
+        let (w, rank, sing) = solve_lstsq_multi(&x, &y).unwrap();
+        assert_eq!(w.dim(), (2, 2));
+        assert_eq!(rank, 2);
+        assert_eq!(sing.len(), 2);
+        assert_relative_eq!(w[[0, 0]], 2.019_512_2, epsilon = 1e-7);
+        assert_relative_eq!(w[[1, 0]], -0.009_756_1, epsilon = 1e-7);
+        assert_relative_eq!(w[[0, 1]], 0.960_975_61, epsilon = 1e-7);
+        assert_relative_eq!(w[[1, 1]], 0.119_512_2, epsilon = 1e-7);
     }
 
     #[test]
