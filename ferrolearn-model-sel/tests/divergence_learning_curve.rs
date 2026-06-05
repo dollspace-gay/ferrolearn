@@ -440,7 +440,6 @@ fn divergence_1767_dedup_row_count() {
 /// Tracking: #1768.
 // #1768
 #[test]
-#[ignore = "divergence: per-cell fit/score failure aborts instead of nan-filling and continuing; tracking #1768"]
 fn divergence_1768_error_score_nan_continue() {
     let y: Array1<f64> = (0..30).map(f64::from).collect();
     let x = Array2::<f64>::zeros((30, 2));
