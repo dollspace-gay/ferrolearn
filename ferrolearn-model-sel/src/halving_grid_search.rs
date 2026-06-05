@@ -29,6 +29,29 @@
 //! // hs.fit(&x, &y).unwrap();
 //! // println!("Best: {:?}", hs.best_params());
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.HalvingGridSearchCV` /
+//! `BaseSuccessiveHalving` (`sklearn/model_selection/_search_successive_halving.py:63`)
+//! at v1.5.2. ferrolearn is an APPROXIMATE/heuristic successive-halving — its
+//! resource SCHEDULE diverges from sklearn end-to-end; the SHIPPED surface is the
+//! loop SHAPE + keep-count arithmetic only. Base = `PipelineFactory` closure
+//! (R-DEV-7), shares `CvResults` with `grid_search`. Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-HALVING-MECHANIC (loop shape + keep-count + best-of-final) | SHIPPED | evaluate active candidates on a budget, keep the top `ceil(n/factor)`, grow the budget, repeat; best via the shared (fixed) `CvResults::best_index`. The keep-count `n.div_ceil(factor)` MATCHES sklearn `_top_k` `n_candidates_to_keep = ceil(n_candidates/factor)` (`:359`) — re-verified vs live `n_candidates_` for (5,3)/(10,3)/(9,3)/(7,2)/(4,2). `factor<2`/empty-grid ⇒ Err. Guards `keep_count_matches_oracle` + mechanic guards. (NOT end-to-end schedule parity — the budgets diverge, REQ-MIN-RESOURCES/N-ITERATIONS.) |
+//! | REQ-MIN-RESOURCES (min_resources_ formula) | NOT-STARTED | ferrolearn `ceil(max_res/factor^n_rounds)` heuristic; sklearn `n_splits*magic_factor(2)*[n_classes if clf]` + exhaust adjustment (`:154-282`). Architectural. Blocker #1851. |
+//! | REQ-N-ITERATIONS (n_iterations + n_resources schedule + termination) | NOT-STARTED | sklearn `n_iterations = min(n_possible, n_required)`, `n_resources = int(factor^power*min_res)`, records the last iteration's survivor set (`:272-322`); ferrolearn loops budget*=factor until budget>=max_res/≤1 candidate (last-iter survivor count diverges even with matched min/max). Blocker #1852. |
+//! | REQ-CV-RESULTS (cv_results_ all iterations + iter/n_resources) | NOT-STARTED | records only the FINAL round's survivors; sklearn records every (iter, candidate) with `iter`/`n_resources` columns + `_select_best_index` over the last iteration (`:192-216`). Blocker #1853. |
+//! | REQ-SUBSAMPLE (resource subsampling) | NOT-STARTED | slices the FIRST `budget` rows; sklearn `_SubsampleMetaSplitter` random fraction subsample (`:335`, RNG-coupled). Blocker #1854. |
+//! | REQ-REFIT (refit + best_estimator_ + predict/score) | NOT-STARTED | search-only; sklearn `refit=True` default (BaseSearchCV). Blocker #1855. |
+//! | REQ-ATTRS (n_resources_/n_candidates_/n_remaining_candidates_/n_iterations_) | NOT-STARTED | none exposed (`:307-325`). Blocker #1856. |
+//! | REQ-DEFAULTS (factor=3 / min_resources='exhaust' / max_resources='auto' / resource='n_samples') | NOT-STARTED | no `'exhaust'`/`'auto'` strings, no classifier-aware schedule (`:97-126`). Blocker #1857. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1858. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use halving_grid_search::HalvingGridSearchCV` in `lib.rs`; consumes the shared `CvResults`. |
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::pipeline::Pipeline;
