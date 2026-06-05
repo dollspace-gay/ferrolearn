@@ -30,6 +30,30 @@
 //! // );
 //! // rs.fit(&x, &y).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.RandomizedSearchCV` + `ParameterSampler`
+//! (`sklearn/model_selection/_search.py:1576` / `:216`, v1.5.2). Every REQ is
+//! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). Shares
+//! the `CvResults` type (and its fixed `best_index`) with `grid_search.rs`.
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (random-sampling mechanic — continuous WITH-replacement) | SHIPPED | `fit` draws `n_iter` ParamSets (one value per distribution) and `cross_val_score`s each; mirrors `ParameterSampler.__iter__` else-branch (`:330-341`), `__len__` = `n_iter` non-all-lists (`:349`). Tests `green_req1_continuous_with_replacement_count`, `test_random_search_samples_correct_n_iter`. |
+//! | REQ-2 (seed determinism across runs — structural) | SHIPPED | `SmallRng::seed_from_u64(seed)` ⇒ same seed → same draws; mirrors the `random_state` reproducibility contract (`:309`, R-DEV-1). Exact numpy values NOT claimed (carve-out #1786). Guard `green_req2_seed_determinism_across_runs`. |
+//! | REQ-BESTIDX-MEAN (best_index + unweighted mean via shared CvResults) | SHIPPED | `best_params`/`best_score` route through the FIXED `CvResults::best_index` (first-on-tie, NaN-worst — grid_search #1776/#1782) and `push` mean = `scores.mean()` = `np.average(weights=None)` (`:840`, `:1097`). Guards `green_reqbestidx_first_on_tie_through_random_search`, `green_reqbestidx_nan_worst_through_random_search`. |
+//! | REQ-EMPTY-GRID (empty param_distributions ⇒ 1 empty candidate) | SHIPPED | empty `param_distributions` now evaluates exactly ONE empty `ParamSet` (capped to 1), matching sklearn's empty-grid ⇒ `grid_size 1` ⇒ `min(n_iter,1)` (`:313-328`,`:345-347`) — was rejected with `InvalidParameter`. Test `divergence_empty_param_distributions` (#1788). |
+//! | REQ-RNG-EXACT (exact sampled values / draw order) | NOT-STARTED | R-DEFER-3 carve-out (NO failing test): `SmallRng` vs numpy `check_random_state` (`:309`), insertion vs `sorted(dist.items())` draw order (`:334`) — bit-exact match needs `ferray::random`. Blocker #1786. |
+//! | REQ-WITHOUT-REPLACEMENT (all-discrete ⇒ without-replacement + cap + warning) | NOT-STARTED | sklearn `_is_all_lists` samples distinct + caps `n_iter` at grid_size + UserWarning (`:313-328`); ferrolearn always with-replacement. `Distribution` trait has no cardinality/discreteness — architectural. Blocker #1784. |
+//! | REQ-LIST-OF-DICTS (list of distribution-dicts + per-iter rng.choice) | NOT-STARTED | `param_distributions` is a single `Vec<(name, dist)>`; sklearn accepts a list of dicts and `rng.choice`s one per iter (`:332`). Blocker #1785. |
+//! | REQ-REFIT (refit + best_estimator_ + delegating predict/score) | NOT-STARTED | search-only struct; sklearn `refit=True` default (`:1046-1061`). Blocker #1777 (shared with grid_search). |
+//! | REQ-CVRESULTS (cv_results_ richness) | NOT-STARTED | shared `CvResults` lacks std/rank/split/times/`param_<name>` (`:1095`,`:1117`,`:1129`). Blocker #1778 (shared). |
+//! | REQ-DEFAULT-CV/SCORING/N-ITER (n_iter=10, cv=None 5-fold, scoring=None) | NOT-STARTED | all mandatory; no `check_cv`/`check_scoring`/default n_iter (`:1576`,`:928`,`:857`). Blocker #1779 (shared). |
+//! | REQ-PARALLEL (n_jobs/pre_dispatch/verbose/return_train_score/multimetric) | NOT-STARTED | none exposed (`:1576` init). Blocker #1780 (shared). |
+//! | REQ-ERROR-SCORE (error_score=np.nan continue) | NOT-STARTED | CROSS-UNIT — `fit` delegates to `cross_val_score` which `?`-propagates; sklearn nan-fills + continues (`:996`). Owned by `cross_validation.rs` per S8. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random` (R-SUBSTRATE-1). Blocker #1781. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use random_search::RandomizedSearchCV` in `lib.rs` (boundary estimator API, S5/R-DEFER-1); shared `CvResults` cross-consumed by halving searches. |
 
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
