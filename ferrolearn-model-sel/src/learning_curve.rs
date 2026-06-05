@@ -20,6 +20,31 @@
 //! // let result = learning_curve(&pipeline, &x, &y, &KFold::new(5),
 //! //     &[0.2, 0.4, 0.6, 0.8, 1.0], neg_mse).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.learning_curve`
+//! (`sklearn/model_selection/_validation.py:1724`, helper `_translate_train_sizes`
+//! `:1992`, v1.5.2). Every REQ is BINARY (R-DEFER-2): SHIPPED (end-to-end
+//! functional + non-test consumer + tests + verification) or NOT-STARTED (with a
+//! concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (core (size,fold) mechanic + iteration-order/orientation equivalence — KEY) | SHIPPED | `(size outer, fold inner)` row-major `(n_sizes, n_folds)` fill is element-for-element identical to sklearn's `(fold outer, size inner)` `.reshape(-1, n_unique_ticks).T` (`:1949-1976`); train subset = FIRST `n_train` of the fold's train indices (`:1952`). Guard `req1_orientation_and_first_n_train_end_to_end`. |
+//! | REQ-2 (train scores always + shape `(n_ticks, n_cv_folds)`) | SHIPPED | unconditional train scoring (= hardcoded `return_train_score=True` `:1967`); both matrices `(n_sizes, n_folds)` (`:1861-1864`). Guard `req2_train_scores_returned_with_shape`. |
+//! | REQ-A (fraction→absolute: FLOOR not CEIL) | SHIPPED | `(s * n_max) as usize` truncates toward zero = `np.astype(int)` (`:2028-2030`) then `.clamp(1, n_max)` = `np.clip` (`:2031`). Oracle `_translate_train_sizes([0.33], 20)` → `[6]`. Test `divergence_1764_fraction_floor_vs_ceil`. |
+//! | REQ-B (float entry `> 1.0` → error) | SHIPPED | non-integer `train_sizes` ⇒ FRACTION mode; `max > 1.0` ⇒ `InvalidParameter` (mirrors the dtype-float `ValueError` `:2021-2027`). Test `divergence_1765_float_gt_one_should_error`. |
+//! | REQ-C (absolute `> n_max` → error not clamp) | SHIPPED | integer-valued `train_sizes` ⇒ ABSOLUTE mode; `max > n_max` ⇒ `InvalidParameter` (mirrors `:2033-2046`), no clamp. Test `divergence_1766_absolute_overshoot_should_error`. |
+//! | REQ-D (dedup + sort via np.unique) | SHIPPED | `sort_unstable()` + `dedup()` reproduces `np.unique` (`:2048`); `n_sizes` = deduped length drives both score matrices and `train_sizes`. Tests `divergence_1767_sort_ascending`, `divergence_1767_dedup_row_count`. |
+//! | REQ-E (error_score=np.nan continue-the-curve) | SHIPPED | per-`(size, fold)` fit failure NaN-fills both train+test; independent train/test scorer failures NaN-fill only their own side; curve continues — matching `_fit_and_score` (`:890-905` fit-failure, `:910`/`:915` independent `_score`). Pre-loop validation still hard-errors. Test `divergence_1768_error_score_nan_continue`. |
+//! | REQ-DEFAULTS (default train_sizes / cv / scoring) | NOT-STARTED | `train_sizes`/`cv`/`scoring` all mandatory; no `linspace(0.1,1,5)` default, no `check_cv`/`check_scoring` (`:1730`, `:1908`, `:1912`). Blocker #1769. |
+//! | REQ-SHUFFLE (shuffle + random_state prefix) | NOT-STARTED | always takes `&train_idx[..n]`; no `shuffle`/`random_state` permutation (`:1925-1927`). Blocker #1770. |
+//! | REQ-GROUPS (groups channel for Group cv) | NOT-STARTED | `CrossValidator::fold_indices(n_samples)` has no group channel (`:1910`). Blocker #1771. |
+//! | REQ-EXTRAS (return_times / exploit_incremental_learning / fit_params) | NOT-STARTED | none exposed (`:1929-1947`, `:1964`, `:1979-1982`). Blocker #1772. |
+//! | REQ-DTYPE-MODE (float-vs-int dtype dispatch) | NOT-STARTED | `train_sizes: &[f64]` cannot carry numpy's float-vs-int dtype distinction; sklearn float `[2.0, 3.0]` ⇒ fraction mode ⇒ `ValueError`, int `[2, 3]` ⇒ `[2, 3]` (`:2020`). ferrolearn uses value-integrality (all-integer ⇒ absolute) — faithful parity needs a typed train-sizes API. Guard `guard_1774_value_based_train_sizes_mode_detection` pins current behavior. Blocker #1774. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | production uses `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1773. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use learning_curve::{LearningCurveResult, learning_curve}` in `lib.rs` (boundary API, S5/R-DEFER-1); no internal caller, no Python binding. |
 
 use ferrolearn_core::pipeline::Pipeline;
 use ferrolearn_core::{FerroError, Fit, Predict};
