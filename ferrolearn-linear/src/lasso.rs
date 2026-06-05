@@ -26,7 +26,7 @@
 //! | REQ-5 (HasCoefficients) | SHIPPED | `HasCoefficients for FittedLasso`. |
 //! | REQ-6 (alpha≥0 validation; alpha=0 → OLS) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 matches sklearn to 1e-6. Defaults max_iter=1000/tol=1e-4 match sklearn. |
 //! | REQ-7 (positive=True) | NOT-STARTED | #407. |
-//! | REQ-8 (warm_start) | NOT-STARTED | #408. |
+//! | REQ-8 (warm_start) | SHIPPED | `Lasso<F>` carries `pub warm_start: bool` (default `false`) + `pub coef_init: Option<Array1<F>>` (default `None`) with `with_warm_start`/`with_coef_init` builders, mirroring sklearn `Lasso(warm_start=False)` (`_coordinate_descent.py:795`). R-DEV-4 adaptation: ferrolearn estimators are immutable value types — there is no mutable `self.coef_` carried across repeated `.fit()` calls like sklearn's mutable estimator (`_coordinate_descent.py:1062` reuses `self.coef_` when `warm_start`), so the prior coefficient vector is supplied EXPLICITLY via `coef_init` (sklearn's path solver seeds the same way: `_coordinate_descent.py:648-651`, `coef_ = np.zeros(...)` when `coef_init is None` else `np.asfortranarray(coef_init, ...)`). In `Fit::fit`, when `warm_start && coef_init.is_some()` the init vector is length-validated (`ShapeMismatch` on mismatch) and `w` is cloned from it (the direct path also seeds `residual = y_work − X_work·w`; the Gram path's `H = Q·w` already derives from the actual `w`); otherwise `w = zeros` — BYTE-IDENTICAL to the cold path. The numerics are identical, only the CD start point changes, so warm-from-converged reaches the same unique optimum in fewer sweeps. Verification (live sklearn 1.5.2 oracle, R-CHAR-3): cold `Lasso(alpha=0.5)` → coef `[0.6113455722, 1.4109235423]`, `n_iter_=20`; warm (refit from converged coef) → coef `[0.6112611662, 1.4109910671]`, `n_iter_=1`. Tests `lasso_warm_start_from_converged_matches_sklearn`, `lasso_warm_start_default_unchanged`, `lasso_warm_start_none_coef_init_equals_cold`, `lasso_warm_start_coef_init_wrong_len_errors`. |
 //! | REQ-9 (selection='random' + random_state) | SHIPPED | `pub enum CoordSelection { Cyclic, Random }` + `pub selection`/`pub random_state` fields on `Lasso` with `with_selection`/`with_random_state` builders, mirroring sklearn `Lasso(selection=..., random_state=...)` (`_coordinate_descent.py` `__init__`). `Fit::fit`'s CD loop visits `0..n_features` in order for `Cyclic` (BYTE-IDENTICAL to the prior cyclic path) and shuffles a reused index `Vec` each sweep for `Random` via `StdRng::seed_from_u64(random_state.unwrap_or(0))` (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch picks `ii` instead of `f_iter`); per-coordinate update math + dual-gap stopping are unchanged. The Lasso optimum is unique, so `Random` converges to the same optimum (≈1e-3 from cyclic due to stopping-within-tol). Exact bit-match to sklearn's `selection='random'` is numpy-MT19937-RNG-blocked (Rust `StdRng` ≠ numpy MT), so the random path verifies convergence-to-the-unique-optimum, not bitwise sklearn parity; the cyclic default IS bit-exact. Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_selection_cyclic_default_unchanged`, `lasso_selection_random_converges_to_optimum`). |
 //! | REQ-10 (precompute/Gram) | SHIPPED | `pub precompute: bool` field (default `false`) on `Lasso` + `with_precompute` builder, mirroring sklearn `Lasso(precompute=False)` (`_coordinate_descent.py:774`). When `true`, `Fit::fit` runs CD on the precomputed `Q = Xcᵀ Xc` / `q = Xcᵀ yc` with an incrementally-maintained `H = Q·w` (sklearn `_cd_fast.pyx enet_coordinate_descent_gram`); `tmp = (q[j]−H[j])/n + col_norms[j]·w[j] ≡` the direct path's `rho` since `Xⱼᵀr = q[j]−(Q·w)[j]`, so it reaches the SAME unique optimum (to ~1e-13 fp reassociation) with the SAME coordinate order + dual-gap stopping. `precompute=false` (default) is the byte-identical direct path. Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_precompute_matches_sklearn`, `lasso_precompute_default_false_unchanged`, `lasso_precompute_equals_direct`). |
 //! | REQ-11 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedLasso<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `Lasso.n_iter_` (`_coordinate_descent.py:1103`) and `dual_gap_` (`:1108`). `fn lasso_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·n`, `beta=0`) with a final `/n` mapping to the `(1/2n)` objective. With REQ-12's dual-gap stopping criterion now landed, `n_iter_`'s VALUE matches sklearn exactly (`n_iter_ == 20` at alpha=0.3 and alpha=0.1 on the fixture); `dual_gap_` matches sklearn's formula/value (`0.00011701482` at alpha=0.3). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_formula_matches_numpy`, `lasso_fitted_dual_gap_and_n_iter`, `lasso_fields_dont_change_coef`, `lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`). |
@@ -119,6 +119,33 @@ pub struct Lasso<F> {
     /// Mirrors sklearn `Lasso(random_state=...)` (default `None`). `None`
     /// falls back to seed `0`.
     pub random_state: Option<u64>,
+    /// When `true`, initialize coordinate descent from [`Lasso::coef_init`]
+    /// (the prior solution) instead of zeros.
+    ///
+    /// Mirrors sklearn `Lasso(warm_start=False)` (`_coordinate_descent.py:795`),
+    /// which "reuse[s] the solution of the previous call to fit as
+    /// initialization" (`:796`). In sklearn the prior solution is the mutable
+    /// estimator's own `self.coef_`, reused when `warm_start` is set
+    /// (`_coordinate_descent.py:1062`: `if not self.warm_start or not
+    /// hasattr(self, "coef_"): coef_ = np.zeros(...)`).
+    ///
+    /// R-DEV-4 adaptation: ferrolearn estimators are immutable value types —
+    /// there is no mutable `self.coef_` carried across repeated `.fit()` calls.
+    /// So the prior coefficient vector is supplied EXPLICITLY through
+    /// [`Lasso::coef_init`] rather than read off the estimator. The numerics are
+    /// identical: CD starts from `coef_init` instead of zeros.
+    pub warm_start: bool,
+    /// Explicit coordinate-descent initialization vector used when
+    /// [`Lasso::warm_start`] is `true` (the R-DEV-4 stand-in for sklearn's
+    /// reused `self.coef_`).
+    ///
+    /// Mirrors the `coef_init` seed fed to the path solver
+    /// (`_coordinate_descent.py:648-651`: `coef_ = np.zeros(...)` when
+    /// `coef_init is None`, else `coef_ = np.asfortranarray(coef_init, ...)`).
+    /// `None` (the default) — or `warm_start == false` — initializes `w` to
+    /// zeros, the byte-identical cold-start path. When `Some`, its length must
+    /// equal `n_features`.
+    pub coef_init: Option<Array1<F>>,
 }
 
 impl<F: Float> Lasso<F> {
@@ -137,6 +164,8 @@ impl<F: Float> Lasso<F> {
             precompute: false,
             selection: CoordSelection::Cyclic,
             random_state: None,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -203,6 +232,36 @@ impl<F: Float> Lasso<F> {
     #[must_use]
     pub fn with_random_state(mut self, seed: u64) -> Self {
         self.random_state = Some(seed);
+        self
+    }
+
+    /// Enable/disable warm-start coordinate-descent initialization.
+    ///
+    /// Mirrors `sklearn.linear_model.Lasso(warm_start=...)`
+    /// (`_coordinate_descent.py:795`): when `true`, "reuse the solution of the
+    /// previous call to fit as initialization". R-DEV-4: ferrolearn estimators
+    /// are immutable value types with no mutable `self.coef_` carried across
+    /// `.fit()` calls, so the prior solution is supplied explicitly via
+    /// [`Lasso::with_coef_init`]; `warm_start` only gates whether that vector
+    /// (when present) is used instead of zeros.
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Provide the explicit coordinate-descent initialization vector used when
+    /// [`Lasso::warm_start`] is `true`.
+    ///
+    /// R-DEV-4 adaptation of sklearn's reused `self.coef_`
+    /// (`_coordinate_descent.py:1062`, seeded into the path solver's
+    /// `coef_init` at `:648-651`): because ferrolearn estimators are immutable
+    /// value types, the prior coefficient vector is passed in explicitly rather
+    /// than read off a mutated estimator. Its length must equal `n_features` at
+    /// fit time, else [`Fit::fit`] returns [`FerroError::ShapeMismatch`].
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>) -> Self {
+        self.coef_init = Some(coef);
         self
     }
 }
@@ -367,8 +426,25 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             })
             .collect();
 
-        // Initialize coefficients to zero.
-        let mut w = Array1::<F>::zeros(n_features);
+        // Initialize coefficients. Cold start (default) is zeros; warm start
+        // reuses the explicit `coef_init` (the R-DEV-4 stand-in for sklearn's
+        // reused mutable `self.coef_`, `_coordinate_descent.py:1062`/`:648-651`).
+        // `warm_start == false` or `coef_init == None` is the byte-identical
+        // zeros path.
+        let mut w = if self.warm_start
+            && let Some(coef) = &self.coef_init
+        {
+            if coef.len() != n_features {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![n_features],
+                    actual: vec![coef.len()],
+                    context: "coef_init length must equal number of features".into(),
+                });
+            }
+            coef.clone()
+        } else {
+            Array1::<F>::zeros(n_features)
+        };
         // Keep the (centered/raw) target for the final dual-gap computation;
         // the CD loop consumes a working copy into `residual`.
         let target = y_work.clone();
@@ -401,10 +477,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // SAME `(1/n)` normalization, coordinate visiting order, and dual-gap
         // stopping criterion as the direct path so `n_iter_` matches.
         if self.precompute {
-            // Q = Xcᵀ Xc  (n_features × n_features); q = Xcᵀ yc.
+            // Q = Xcᵀ Xc  (n_features × n_features); q = Xcᵀ yc (here `residual`
+            // still equals the centered/raw target — it is not yet adjusted for
+            // a warm-start `w` since the Gram path tracks `H = Q·w` instead).
             let gram = x_work.t().dot(&x_work);
             let q = x_work.t().dot(&residual);
-            // H = Q·w  (zeros initially, since w is zeros).
+            // H = Q·w  (zeros for a cold start where `w == 0`; the actual `Q·w`
+            // for a warm start, so `tmp = (q[j] − H[j])/n + col_norms[j]·w[j]`
+            // is correct from the first sweep regardless of the init).
             let mut h = gram.dot(&w);
 
             for iter in 0..self.max_iter {
@@ -492,6 +572,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 n_iter,
                 dual_gap,
             });
+        }
+
+        // Direct path: the CD loop maintains `residual = y_work − X_work·w`,
+        // adding back `X_j·w_old` per coordinate before recomputing `rho`. With
+        // a non-zero warm-start `w`, seed the residual with that running
+        // contribution removed. For the cold path (`w == 0`) `X_work·w` is the
+        // zero vector and the subtraction is a byte-identical no-op, so this is
+        // gated on warm start to leave the default path provably untouched.
+        if self.warm_start && self.coef_init.is_some() {
+            residual = &residual - &x_work.dot(&w);
         }
 
         for iter in 0..self.max_iter {
@@ -1235,6 +1325,124 @@ mod tests {
             epsilon = 1e-6
         );
         Ok(())
+    }
+
+    /// Oracle fixture for the warm-start tests (R-CHAR-3, live sklearn 1.5.2):
+    /// `X = [[1,2],[2,1],[3,4],[4,3],[5,5]]`, `y = [3,2.5,7.1,6,11.2]`,
+    /// `alpha=0.5`.
+    fn warm_start_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        (x, y)
+    }
+
+    #[test]
+    fn lasso_warm_start_from_converged_matches_sklearn() -> Result<(), FerroError> {
+        // REQ-8: warm_start reuses the prior solution as CD init.
+        // Live sklearn 1.5.2 oracle (R-CHAR-3): on X=[[1,2],[2,1],[3,4],[4,3],
+        // [5,5]], y=[3,2.5,7.1,6,11.2]:
+        //   cold Lasso(alpha=0.5)             -> coef_ [0.6113455722, 1.4109235423], n_iter_ 20
+        //   warm (refit from the converged coef, warm_start=True)
+        //                                     -> coef_ [0.6112611662, 1.4109910671], n_iter_ 1
+        let (x, y) = warm_start_fixture();
+
+        let cold = Lasso::<f64>::new().with_alpha(0.5).fit(&x, &y)?;
+        assert_relative_eq!(cold.coefficients()[0], 0.6113455722, epsilon = 1e-6);
+        assert_relative_eq!(cold.coefficients()[1], 1.4109235423, epsilon = 1e-6);
+        assert_eq!(cold.n_iter(), 20, "cold n_iter_ must match sklearn's 20");
+
+        let warm = Lasso::<f64>::new()
+            .with_alpha(0.5)
+            .with_warm_start(true)
+            .with_coef_init(cold.coefficients().to_owned())
+            .fit(&x, &y)?;
+        assert_relative_eq!(warm.coefficients()[0], 0.6112611662, epsilon = 1e-6);
+        assert_relative_eq!(warm.coefficients()[1], 1.4109910671, epsilon = 1e-6);
+        // Converges in a single sweep starting from the converged coef.
+        assert_eq!(warm.n_iter(), 1, "warm n_iter_ must match sklearn's 1");
+        assert!(
+            warm.n_iter() < cold.n_iter(),
+            "warm start must converge in fewer iterations than cold"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn lasso_warm_start_default_unchanged() -> Result<(), FerroError> {
+        // Defaults: warm_start == false, coef_init == None. A default-config fit
+        // must be byte-identical (to_bits) to the pre-warm_start cold fit.
+        assert!(
+            !Lasso::<f64>::new().warm_start,
+            "default warm_start is false"
+        );
+        assert!(
+            Lasso::<f64>::new().coef_init.is_none(),
+            "default coef_init is None"
+        );
+
+        let (x, y) = warm_start_fixture();
+
+        let a = Lasso::<f64>::new().with_alpha(0.5).fit(&x, &y)?;
+        let b = Lasso::<f64>::new().with_alpha(0.5).fit(&x, &y)?;
+
+        for (ca, cb) in a.coefficients().iter().zip(b.coefficients().iter()) {
+            assert_eq!(
+                ca.to_bits(),
+                cb.to_bits(),
+                "default fit must be byte-identical"
+            );
+        }
+        assert_eq!(a.intercept().to_bits(), b.intercept().to_bits());
+        assert_eq!(a.n_iter(), b.n_iter());
+        Ok(())
+    }
+
+    #[test]
+    fn lasso_warm_start_none_coef_init_equals_cold() -> Result<(), FerroError> {
+        // warm_start=true but NO coef_init -> the init falls back to zeros, so
+        // the fit is byte-identical to the plain cold fit.
+        let (x, y) = warm_start_fixture();
+
+        let cold = Lasso::<f64>::new().with_alpha(0.5).fit(&x, &y)?;
+        let warm_no_init = Lasso::<f64>::new()
+            .with_alpha(0.5)
+            .with_warm_start(true)
+            .fit(&x, &y)?;
+
+        for (cc, cw) in cold
+            .coefficients()
+            .iter()
+            .zip(warm_no_init.coefficients().iter())
+        {
+            assert_eq!(
+                cc.to_bits(),
+                cw.to_bits(),
+                "warm_start without coef_init must equal the cold fit"
+            );
+        }
+        assert_eq!(
+            cold.intercept().to_bits(),
+            warm_no_init.intercept().to_bits()
+        );
+        assert_eq!(cold.n_iter(), warm_no_init.n_iter());
+        Ok(())
+    }
+
+    #[test]
+    fn lasso_warm_start_coef_init_wrong_len_errors() {
+        // coef_init length (1) != n_features (2) -> ShapeMismatch.
+        let (x, y) = warm_start_fixture();
+
+        let result = Lasso::<f64>::new()
+            .with_alpha(0.5)
+            .with_warm_start(true)
+            .with_coef_init(array![0.0])
+            .fit(&x, &y);
+
+        assert!(
+            matches!(result, Err(FerroError::ShapeMismatch { .. })),
+            "wrong-length coef_init must return ShapeMismatch, got {result:?}"
+        );
     }
 
     #[test]
