@@ -39,7 +39,7 @@
 //! The Ridge path retains its hand-rolled Cholesky kernels (PD for `alpha > 0`).
 
 use ferray::linalg::LinalgFloat;
-use ferray::{Array as FerrayArray, IxDyn};
+use ferray::{Array as FerrayArray, Ix2, IxDyn};
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -590,6 +590,115 @@ pub(crate) fn solve_ridge<F: LinalgFloat>(
         // The lstsq fallback now returns (solution, rank, singular); the Ridge
         // path consumes only the coefficient solution.
         .or_else(|_| solve_lstsq(x, y).map(|(w, _rank, _singular)| w))
+}
+
+/// Solve the ridge problem `min ‖X·w − y‖² + alpha·‖w‖²` via the SVD of `X`.
+///
+/// With the thin SVD `X = U·diag(s)·Vᵀ` (U `(n×k)`, s length `k`, Vᵀ `(k×p)`,
+/// `k = min(n, p)`), the closed-form ridge solution is
+///
+/// ```text
+/// w = V · diag(sᵢ / (sᵢ² + alpha)) · Uᵀ·y
+/// ```
+///
+/// This is the Rust analog of scikit-learn's `'svd'` solver `_solve_svd`
+/// (`sklearn/linear_model/_ridge.py:200-216` @ 1.5.2), where
+/// `d = s / (s**2 + alpha)` and `coef = (Vt.T * d) @ (U.T @ y)`. For a strictly
+/// convex ridge problem (`alpha > 0`, or `alpha = 0` with full-rank `X`) the
+/// solution is unique, so this is numerically identical to the Cholesky path
+/// [`solve_ridge`] (both solve the same normal equations) to within rounding.
+///
+/// `alpha = 0` / tiny-singular handling: a singular value with
+/// `sᵢ² + alpha == 0` contributes a zero term (sklearn `_solve_svd` masks the
+/// same `idx = s > 1e-15` directions, `_ridge.py:210`), which yields the
+/// minimum-norm solution rather than dividing by zero.
+///
+/// This is called on the SAME centered (`fit_intercept=true`) or raw
+/// (`fit_intercept=false`) design [`solve_ridge`] receives, so the centering /
+/// intercept recovery in `ridge.rs` is unchanged.
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if the ferray↔ndarray bridge
+/// fails or the underlying SVD does not converge.
+pub(crate) fn solve_ridge_svd<F: LinalgFloat>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    alpha: F,
+) -> Result<Array1<F>, FerroError> {
+    let (n_samples, n_features) = x.dim();
+
+    // Bridge ndarray -> ferray (R-SUBSTRATE-4): flat row-major Vec + shape.
+    let x_flat: Vec<F> = x.iter().copied().collect();
+    let a = FerrayArray::<F, Ix2>::from_vec(Ix2::new([n_samples, n_features]), x_flat).map_err(
+        |e| FerroError::NumericalInstability {
+            message: format!("ridge svd: failed to build design matrix: {e}"),
+        },
+    )?;
+
+    // Thin SVD: U is (n, k), s length k, Vt is (k, p) with k = min(n, p)
+    // (the same `ferray::linalg::svd(.., false)` entry point ridge_cv.rs uses).
+    let (u, s, vt) =
+        ferray::linalg::svd(&a, false).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ridge svd: SVD failed: {e}"),
+        })?;
+
+    let u_nd = ferray_to_ndarray2(&u)?;
+    let s_nd = ferray_to_ndarray1(&s)?;
+    let vt_nd = ferray_to_ndarray2(&vt)?;
+
+    let k = s_nd.len();
+    let zero = <F as num_traits::Zero>::zero();
+
+    // d[i] = s[i] / (s[i]² + alpha); a zero denominator contributes 0
+    // (min-norm direction, sklearn `_ridge.py:210` masks the same way).
+    let mut d = Array1::<F>::zeros(k);
+    for i in 0..k {
+        let denom = s_nd[i] * s_nd[i] + alpha;
+        d[i] = if denom > zero { s_nd[i] / denom } else { zero };
+    }
+
+    // uty[i] = Σ_row U[row, i] · y[row]   (i.e. Uᵀ·y, length k).
+    let mut uty = Array1::<F>::zeros(k);
+    for i in 0..k {
+        let mut acc = zero;
+        for row in 0..n_samples {
+            acc += u_nd[[row, i]] * y[row];
+        }
+        uty[i] = acc;
+    }
+
+    // coef[j] = Σ_i Vt[i, j] · d[i] · uty[i]   (V = Vtᵀ is (p, k)).
+    let mut coef = Array1::<F>::zeros(n_features);
+    for j in 0..n_features {
+        let mut acc = zero;
+        for i in 0..k {
+            acc += vt_nd[[i, j]] * (d[i] * uty[i]);
+        }
+        coef[j] = acc;
+    }
+
+    Ok(coef)
+}
+
+/// Bridge a ferray 2-D array back to `ndarray::Array2` (R-SUBSTRATE-4).
+fn ferray_to_ndarray2<F: LinalgFloat>(a: &FerrayArray<F, Ix2>) -> Result<Array2<F>, FerroError> {
+    let shape = a.shape();
+    let (rows, cols) = (shape[0], shape[1]);
+    let nd = a.clone().into_ndarray();
+    let flat: Vec<F> = nd.iter().copied().collect();
+    Array2::from_shape_vec((rows, cols), flat).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ridge svd: ferray→ndarray (2-D) bridge failed: {e}"),
+    })
+}
+
+/// Bridge a ferray 1-D array back to `ndarray::Array1` (R-SUBSTRATE-4).
+fn ferray_to_ndarray1<F: LinalgFloat>(
+    a: &FerrayArray<F, ferray::Ix1>,
+) -> Result<Array1<F>, FerroError> {
+    let nd = a.clone().into_ndarray();
+    let flat: Vec<F> = nd.iter().copied().collect();
+    Ok(Array1::from_vec(flat))
 }
 
 /// Solve the non-negative ridge problem

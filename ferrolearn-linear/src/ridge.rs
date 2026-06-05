@@ -25,7 +25,8 @@
 //! | REQ-5 (alpha≥0 validation; alpha=0 → OLS incl. rank-deficient min-norm) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 singular falls back `solve_ridge` → `solve_lstsq` (ferray min-norm), mirroring sklearn cholesky→SVD (`_ridge.py:752-756`). Closed #392; test `divergence_ridge_alpha_zero_rank_deficient_min_norm`. |
 //! | REQ-6 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | `FittedRidgeMulti` exists, no production consumer (#384). |
 //! | REQ-7 (per-target alpha array) | SHIPPED | `Ridge<F>` adds `pub alpha_per_target: Option<Array1<F>>` (default `None`) + `with_alpha_per_target(Array1<F>)` builder. On the multi-output `Fit<Array2, Array2>` path, when `Some(alphas)` it validates `alphas.len() == n_targets` (else `ShapeMismatch`) and each `alphas[k] >= 0` (else `InvalidParameter`), then solves each target column `k` independently with its own penalty via `linalg::solve_ridge` on the SAME centered (fit_intercept) / raw design the scalar path uses — mathematically identical to an independent scalar-`alpha` Ridge per column, mirroring sklearn's array-valued `alpha` (`_ridge.py:701-712`). `None` is byte-identical to the historic scalar `solve_ridge_multi` path. Oracle tests: `ridge_per_target_alpha_matches_sklearn` (alpha `[0.5, 2.0]`, coef col0 `[0.79891892, 1.43891892]`/col1 `[0.78, 0.355]`, intercepts `[-0.75351351, -0.065]`), `ridge_per_target_alpha_equals_independent_scalar_fits`, `ridge_per_target_alpha_length_mismatch_errors`, `ridge_multi_scalar_alpha_unchanged` (regression guard). Closes #385. |
-//! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
+//! | REQ-8a (dense solver variants auto/cholesky/svd + solver_) | SHIPPED | `pub enum RidgeSolver { #[default] Auto, Cholesky, Svd }` + `Ridge<F>` gains `pub solver: RidgeSolver` (default `Auto`) + `with_solver`; `FittedRidge<F>` gains `solver_` + `pub fn solver()`. The single-output `fit_with_sample_weight` resolves `Auto`→`Cholesky` (`resolve_solver`, `_ridge.py:830`) and dispatches the unconstrained dense solve via `solve_unconstrained`: `Svd` → `linalg::solve_ridge_svd` (`coef = V·diag(sᵢ/(sᵢ²+alpha))·Uᵀy` from the thin SVD via `ferray::linalg::svd`, the analog of sklearn `_solve_svd` `_ridge.py:200-216`); `Cholesky`/`Auto` → the unchanged `linalg::solve_ridge` (byte-identical). All dense solvers yield the IDENTICAL unique solution (strictly convex). `solver_` stores the resolved value. Governs only the single-output unconstrained dense path. Consumer: `Fit<Array2, Array1>::fit for Ridge` (production: `RsRidge::fit` in `ferrolearn-python/src/regressors.rs`; `ridge_cv.rs`). Oracle tests `ridge_solver_svd_matches_sklearn_and_cholesky` (coef `[0.8228070175, 1.3561403509]`, intercept `-0.5768421053`), `ridge_solver_resolution`, `ridge_solver_default_cholesky_unchanged`, `ridge_solver_svd_no_intercept`. Closes #386 (8a). |
+//! | REQ-8b (iterative solver variants lsqr/sparse_cg/sag/saga/lbfgs) | NOT-STARTED | #386 — needs iterative/SGD substrate + RNG. Not represented as `RidgeSolver` variants until the substrate lands. |
 //! | REQ-9 (positive=True) | SHIPPED | `Ridge<F>` adds `pub positive: bool` (default `false`, `_ridge.py:902`/`:911`) + `with_positive(bool)` builder. When `self.positive`, `fit_with_sample_weight` routes the coefficient solve through `solve_nonneg_ridge` — projected coordinate descent minimizing `0.5·‖A·w−b‖² + 0.5·alpha·‖w‖²` s.t. `w ≥ 0` (`new = max(0, (A[:,j]ᵀr + col_sq[j]·old)/(col_sq[j] + alpha))`, incremental residual update, `max_iter=self.max_iter.unwrap_or(1000)`/`self.tol`) on the SAME centered (and `√w`-rescaled) design `solve_ridge` uses, then recovers `intercept = y_off − x_off·coef` (fit_intercept) / `0` identically — the same unique optimum sklearn's L-BFGS-B (`_solve_lbfgs`, `_ridge.py:300`, objective `0.5·‖Xw−y‖²+0.5·alpha·‖w‖²`, bounds `[(0,inf)]`) reaches, dispatched at `_ridge.py:923-928`. `n_iter_ = Some(iters)` on the positive (iterative CD) path; `None` for the direct Cholesky path. `positive=false` (default) is byte-identical to the unconstrained Cholesky path. Oracle tests: `ridge_positive_matches_sklearn` (alpha=1, fit_intercept coef `[1.19891304, 0.0]`, intercept `-6.17744565`, all ≥ 0, differs from unconstrained `[0.95708502, -1.85401484]`), `ridge_positive_false_unchanged` (byte-identical guard), `ridge_positive_all_nonneg_equals_unconstrained` (inactive-constraint sanity). Closes #387. |
 //! | REQ-10 (max_iter/tol + n_iter_) | SHIPPED | `Ridge<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidge<F>` adds `n_iter_: Option<usize>` (always `None` for the direct Cholesky solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:899-900`) and `n_iter_` set at `_ridge.py:994`; `max_iter`/`tol` are no-ops for the direct solver (closed-form normal equations, no iteration) — matching sklearn's direct `cholesky`/`svd` paths which also yield `n_iter_=None`. Test: `ridge_max_iter_tol_niter_defaults_and_builders`. Closes #388. |
 //! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
@@ -60,6 +61,53 @@ use ndarray::{Array1, Array2, Axis, ScalarOperand};
 use num_traits::{Float, FromPrimitive};
 
 use crate::linalg;
+
+/// Solver used for the dense single-output Ridge coefficient solve.
+///
+/// Mirrors a (dense) subset of scikit-learn's `solver` parameter
+/// (`sklearn/linear_model/_ridge.py:830` `resolve_solver`). Only the
+/// closed-form dense solvers are implemented here; the iterative solvers
+/// (`lsqr`/`sparse_cg`/`sag`/`saga`/`lbfgs`) are tracked separately as
+/// REQ-8b (blocker #386) and are intentionally NOT represented as variants
+/// until their iterative/SGD substrate lands.
+///
+/// Every dense solver returns the IDENTICAL ridge solution — the problem is
+/// strictly convex (`alpha > 0`, or `alpha = 0` with full-rank `X`), so the
+/// minimizer is unique. The variant therefore only governs *how* the unique
+/// solution is computed, not *what* it is.
+///
+/// This governs only the single-output (`Fit<Array2, Array1>`) dense
+/// unconstrained solve. The multi-output (`Fit<Array2, Array2>`) path and the
+/// `positive=true` constrained path are unaffected by this setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RidgeSolver {
+    /// `'auto'` — resolve automatically. For the dense path this resolves to
+    /// [`Cholesky`](RidgeSolver::Cholesky) (sklearn `resolve_solver`,
+    /// `_ridge.py:830`: dense, non-positive data → `'cholesky'`).
+    #[default]
+    Auto,
+    /// `'cholesky'` — solve the normal equations `(XᵀX + alpha·I)·w = Xᵀy`
+    /// via a Cholesky factorization (`_solve_cholesky`, `_ridge.py:741`).
+    Cholesky,
+    /// `'svd'` — solve via the singular value decomposition of `X`
+    /// (`_solve_svd`, `_ridge.py:200`). Numerically identical to
+    /// [`Cholesky`](RidgeSolver::Cholesky) on the strictly-convex ridge
+    /// problem (unique minimizer).
+    Svd,
+}
+
+impl RidgeSolver {
+    /// Resolve `Auto` to the concrete dense solver scikit-learn picks for the
+    /// dense, non-positive path: `'cholesky'` (sklearn `resolve_solver`,
+    /// `_ridge.py:830`). `Cholesky`/`Svd` resolve to themselves.
+    #[must_use]
+    fn resolve(self) -> RidgeSolver {
+        match self {
+            RidgeSolver::Auto => RidgeSolver::Cholesky,
+            other => other,
+        }
+    }
+}
 
 /// Ridge regression (L2-regularized least squares).
 ///
@@ -122,6 +170,18 @@ pub struct Ridge<F> {
     /// `positive=False` (`_ridge.py:902`); `positive=false` is byte-identical
     /// to the unconstrained Cholesky path.
     pub positive: bool,
+    /// Closed-form dense solver for the single-output unconstrained solve
+    /// (sklearn `solver`, `_ridge.py:830` `resolve_solver`). One of
+    /// [`RidgeSolver::Auto`] (default, resolves to `Cholesky` for the dense
+    /// path), [`RidgeSolver::Cholesky`], or [`RidgeSolver::Svd`]. All dense
+    /// solvers yield the IDENTICAL (unique) ridge solution; this only selects
+    /// the factorization used. Governs ONLY the single-output
+    /// (`Fit<Array2, Array1>`) unconstrained path — the multi-output and
+    /// `positive=true` paths ignore it. The iterative solvers
+    /// (`lsqr`/`sparse_cg`/`sag`/`saga`/`lbfgs`) are tracked as REQ-8b (#386).
+    /// Default [`RidgeSolver::Auto`], matching sklearn's `solver='auto'`
+    /// (`_ridge.py:903`).
+    pub solver: RidgeSolver,
 }
 
 impl<F: Float> Ridge<F> {
@@ -129,7 +189,7 @@ impl<F: Float> Ridge<F> {
     ///
     /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `copy_x = true`,
     /// `random_state = None`, `max_iter = None`, `tol = 1e-4`,
-    /// `positive = false` — mirroring sklearn's ctor defaults
+    /// `positive = false`, `solver = Auto` — mirroring sklearn's ctor defaults
     /// (`sklearn/linear_model/_ridge.py:895-903`).
     #[must_use]
     pub fn new() -> Self {
@@ -142,6 +202,7 @@ impl<F: Float> Ridge<F> {
             max_iter: None,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
             positive: false,
+            solver: RidgeSolver::Auto,
         }
     }
 
@@ -235,6 +296,21 @@ impl<F: Float> Ridge<F> {
         self.positive = positive;
         self
     }
+
+    /// Set the dense closed-form solver for the single-output unconstrained
+    /// solve (sklearn `solver`, `_ridge.py:830`).
+    ///
+    /// [`RidgeSolver::Auto`] (default) resolves to [`RidgeSolver::Cholesky`]
+    /// for the dense path; [`RidgeSolver::Svd`] solves the same unique ridge
+    /// problem via the SVD of `X`. All dense solvers yield the identical
+    /// coefficients (the minimizer is unique); only the factorization differs.
+    /// This governs ONLY the single-output (`Fit<Array2, Array1>`)
+    /// unconstrained path.
+    #[must_use]
+    pub fn with_solver(mut self, solver: RidgeSolver) -> Self {
+        self.solver = solver;
+        self
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static> Ridge<F> {
@@ -288,6 +364,32 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         crate::linalg::nonneg_ridge_cd(a, b, self.alpha, self.max_iter.unwrap_or(1000), self.tol)
     }
 
+    /// Solve the unconstrained dense ridge system on the given (already
+    /// centered / `√w`-rescaled) design, dispatching on the RESOLVED solver.
+    ///
+    /// - [`RidgeSolver::Svd`] → `linalg::solve_ridge_svd` (`_solve_svd`,
+    ///   `_ridge.py:200`).
+    /// - [`RidgeSolver::Cholesky`] / [`RidgeSolver::Auto`] →
+    ///   `linalg::solve_ridge` (Cholesky normal equations, `_ridge.py:741`) —
+    ///   byte-identical to the historic path.
+    ///
+    /// `resolved` is `self.solver.resolve()` (precomputed by the caller). Every
+    /// dense solver returns the same unique minimizer; the choice only affects
+    /// the factorization.
+    fn solve_unconstrained(
+        &self,
+        resolved: RidgeSolver,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Array1<F>, FerroError> {
+        match resolved {
+            RidgeSolver::Svd => linalg::solve_ridge_svd(x, y, self.alpha),
+            // `Auto` is resolved to `Cholesky` before this point; matched here
+            // for exhaustiveness with byte-identical behaviour.
+            RidgeSolver::Cholesky | RidgeSolver::Auto => linalg::solve_ridge(x, y, self.alpha),
+        }
+    }
+
     pub fn fit_with_sample_weight(
         &self,
         x: &Array2<F>,
@@ -332,6 +434,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             });
         }
 
+        // Resolve the dense solver once (sklearn `resolve_solver`,
+        // `_ridge.py:830`): `Auto` → `Cholesky` for the dense path. This is the
+        // value stored as the fitted `solver_`. It governs only the
+        // unconstrained dense solve; the `positive` path reports the same
+        // resolved dense value (the `solver` field does not select the
+        // constrained CD solver — see the `solver` field doc).
+        let resolved = self.solver.resolve();
+
         match sample_weight {
             None => {
                 // Unweighted path — identical to the original `Fit::fit` body.
@@ -354,7 +464,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         (coef, Some(iters))
                     } else {
                         (
-                            linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?,
+                            self.solve_unconstrained(resolved, &x_centered, &y_centered)?,
                             None,
                         )
                     };
@@ -364,13 +474,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         coefficients: w,
                         intercept,
                         n_iter_,
+                        solver_: resolved,
                     })
                 } else {
                     let (w, n_iter_) = if self.positive {
                         let (coef, iters) = self.solve_nonneg_ridge(x, y);
                         (coef, Some(iters))
                     } else {
-                        (linalg::solve_ridge(x, y, self.alpha)?, None)
+                        (self.solve_unconstrained(resolved, x, y)?, None)
                     };
 
                     Ok(FittedRidge {
@@ -379,6 +490,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         // (both in scope under the `LinalgFloat` bound).
                         intercept: <F as num_traits::Zero>::zero(),
                         n_iter_,
+                        solver_: resolved,
                     })
                 }
             }
@@ -424,7 +536,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         let (c, iters) = self.solve_nonneg_ridge(&x_scaled, &y_scaled);
                         (c, Some(iters))
                     } else {
-                        (linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?, None)
+                        (
+                            self.solve_unconstrained(resolved, &x_scaled, &y_scaled)?,
+                            None,
+                        )
                     };
                     let intercept = y_off - x_off.dot(&coef);
 
@@ -432,6 +547,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         coefficients: coef,
                         intercept,
                         n_iter_,
+                        solver_: resolved,
                     })
                 } else {
                     // No centering; just √w row-rescaling, intercept 0.
@@ -442,13 +558,17 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         let (c, iters) = self.solve_nonneg_ridge(&x_scaled, &y_scaled);
                         (c, Some(iters))
                     } else {
-                        (linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?, None)
+                        (
+                            self.solve_unconstrained(resolved, &x_scaled, &y_scaled)?,
+                            None,
+                        )
                     };
 
                     Ok(FittedRidge {
                         coefficients: coef,
                         intercept: <F as num_traits::Zero>::zero(),
                         n_iter_,
+                        solver_: resolved,
                     })
                 }
             }
@@ -478,6 +598,11 @@ pub struct FittedRidge<F> {
     /// sklearn's behaviour when `solver='cholesky'` or `solver='svd'` resolve
     /// the normal equations in closed form.
     n_iter_: Option<usize>,
+    /// The RESOLVED dense solver actually used for the coefficient solve
+    /// (sklearn `solver_`, the resolution of `solver='auto'`,
+    /// `_ridge.py:830`/`:994`). `Auto` resolves to [`RidgeSolver::Cholesky`]
+    /// for the dense path; an explicit `Cholesky`/`Svd` resolves to itself.
+    solver_: RidgeSolver,
 }
 
 impl<F> FittedRidge<F> {
@@ -490,6 +615,17 @@ impl<F> FittedRidge<F> {
     #[must_use]
     pub fn n_iter(&self) -> Option<usize> {
         self.n_iter_
+    }
+
+    /// Return the RESOLVED dense solver used for the coefficient solve
+    /// (sklearn `solver_`, `_ridge.py:830`/`:994`).
+    ///
+    /// [`RidgeSolver::Auto`] resolves to [`RidgeSolver::Cholesky`] for the
+    /// dense path, so a default-`solver` fit reports `Cholesky`; an explicit
+    /// `Svd` reports `Svd`.
+    #[must_use]
+    pub fn solver(&self) -> RidgeSolver {
+        self.solver_
     }
 }
 
@@ -1617,6 +1753,159 @@ mod tests {
                 "intercept_[{k}] must be byte-identical without per-target alpha"
             );
         }
+        Ok(())
+    }
+
+    // -- solver variants (auto/cholesky/svd) + solver_ (REQ-8a) ------------
+
+    /// Build the shared 5x2 fixture `X` and 1-D `y` used by the solver tests.
+    fn solver_fixture() -> Result<(Array2<f64>, Array1<f64>), FerroError> {
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        Ok((x, y))
+    }
+
+    #[test]
+    fn ridge_solver_svd_matches_sklearn_and_cholesky() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (alpha=1, fit_intercept=True, solver='svd'):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     y=np.array([3.0,2.5,7.1,6.0,11.2]); \
+        //     m=Ridge(alpha=1.0,solver='svd').fit(X,y); \
+        //     print([round(c,10) for c in m.coef_], round(m.intercept_,10))"
+        //   -> [0.8228070175, 1.3561403509] -0.5768421053
+        // Every dense solver returns this same unique ridge solution.
+        let (x, y) = solver_fixture()?;
+
+        let svd_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Svd)
+            .fit(&x, &y)?;
+
+        assert_relative_eq!(svd_fit.coefficients()[0], 0.822_807_017_5, epsilon = 1e-7);
+        assert_relative_eq!(svd_fit.coefficients()[1], 1.356_140_350_9, epsilon = 1e-7);
+        assert_relative_eq!(svd_fit.intercept(), -0.576_842_105_3, epsilon = 1e-7);
+
+        // SVD and Cholesky solve the same strictly-convex (unique) problem, so
+        // they must agree to ~1e-9.
+        let chol_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Cholesky)
+            .fit(&x, &y)?;
+        for j in 0..2 {
+            assert_relative_eq!(
+                svd_fit.coefficients()[j],
+                chol_fit.coefficients()[j],
+                epsilon = 1e-9
+            );
+        }
+        assert_relative_eq!(svd_fit.intercept(), chol_fit.intercept(), epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_solver_resolution() -> Result<(), FerroError> {
+        // Default `solver` is Auto; the fitted `solver_` resolves Auto→Cholesky
+        // for the dense path (sklearn `resolve_solver`, `_ridge.py:830`).
+        assert_eq!(Ridge::<f64>::new().solver, RidgeSolver::Auto);
+
+        let (x, y) = solver_fixture()?;
+
+        let auto_fit = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        assert_eq!(
+            auto_fit.solver(),
+            RidgeSolver::Cholesky,
+            "Auto must resolve to Cholesky for the dense path"
+        );
+
+        let svd_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Svd)
+            .fit(&x, &y)?;
+        assert_eq!(svd_fit.solver(), RidgeSolver::Svd);
+
+        let chol_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Cholesky)
+            .fit(&x, &y)?;
+        assert_eq!(chol_fit.solver(), RidgeSolver::Cholesky);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_solver_default_cholesky_unchanged() -> Result<(), FerroError> {
+        // Regression guard: the default (Auto→Cholesky) coef_/intercept_ are
+        // BYTE-IDENTICAL to a pre-existing direct `fit` (no `with_solver`).
+        let (x, y) = solver_fixture()?;
+
+        let direct = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let explicit_chol = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Cholesky)
+            .fit(&x, &y)?;
+        let explicit_auto = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_solver(RidgeSolver::Auto)
+            .fit(&x, &y)?;
+
+        for j in 0..2 {
+            assert_eq!(
+                direct.coefficients()[j].to_bits(),
+                explicit_chol.coefficients()[j].to_bits(),
+                "coef_[{j}] must be byte-identical for explicit Cholesky"
+            );
+            assert_eq!(
+                direct.coefficients()[j].to_bits(),
+                explicit_auto.coefficients()[j].to_bits(),
+                "coef_[{j}] must be byte-identical for explicit Auto"
+            );
+        }
+        assert_eq!(
+            direct.intercept().to_bits(),
+            explicit_chol.intercept().to_bits()
+        );
+        assert_eq!(
+            direct.intercept().to_bits(),
+            explicit_auto.intercept().to_bits()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_solver_svd_no_intercept() -> Result<(), FerroError> {
+        // With fit_intercept=false, the SVD solver must match the Cholesky
+        // no-intercept fit (same unique solution) to ~1e-9. sklearn:
+        //   Ridge(alpha=1.0, fit_intercept=False, solver='svd') ==
+        //   Ridge(alpha=1.0, fit_intercept=False, solver='cholesky').
+        let (x, y) = solver_fixture()?;
+
+        let svd_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_fit_intercept(false)
+            .with_solver(RidgeSolver::Svd)
+            .fit(&x, &y)?;
+        let chol_fit = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_fit_intercept(false)
+            .with_solver(RidgeSolver::Cholesky)
+            .fit(&x, &y)?;
+
+        for j in 0..2 {
+            assert_relative_eq!(
+                svd_fit.coefficients()[j],
+                chol_fit.coefficients()[j],
+                epsilon = 1e-9
+            );
+        }
+        assert_eq!(svd_fit.intercept(), 0.0);
+        assert_eq!(chol_fit.intercept(), 0.0);
+        assert_eq!(svd_fit.solver(), RidgeSolver::Svd);
         Ok(())
     }
 }
