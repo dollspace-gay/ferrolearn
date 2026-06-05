@@ -213,6 +213,154 @@ pub(crate) fn solve_lstsq_multi<F: LinalgFloat>(
     Ok((coef, rank, Array1::from_vec(singular_vec)))
 }
 
+/// Solve the non-negative least squares (NNLS) problem.
+///
+/// Returns `x ≥ 0` minimizing `||A·x − b||₂` via the classic Lawson-Hanson
+/// active-set algorithm, mirroring `scipy.optimize.nnls`, which
+/// scikit-learn calls for `LinearRegression(positive=True)`
+/// (`self.coef_ = optimize.nnls(X, y)[0]`,
+/// `sklearn/linear_model/_base.py:647`).
+///
+/// The passive-set unconstrained least-squares subproblems are solved by
+/// [`solve_lstsq`] on the submatrix of `A`'s passive columns (the same
+/// single-SVD gelsd-equivalent solver the unconstrained OLS path uses),
+/// scattering the solution back into the length-`n` vector.
+///
+/// Outer iterations are capped at `3 * n` to guarantee termination (the
+/// current best `x` is returned if the cap is reached); production never
+/// panics or loops forever.
+///
+/// # Errors
+///
+/// Returns [`FerroError::NumericalInstability`] if a passive-set
+/// least-squares solve fails.
+pub(crate) fn nnls<F: LinalgFloat>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
+    let (m, n) = a.dim();
+
+    // x = 0 (length n); passive set P tracked as a boolean mask.
+    let mut x = Array1::<F>::zeros(n);
+    let mut passive = vec![false; n];
+
+    // Tolerance ≈ 10·eps·||A||_inf·max(m, n), matching the scale of the
+    // termination test in Lawson-Hanson / scipy's NNLS.
+    let a_inf = a.iter().fold(<F as num_traits::Zero>::zero(), |acc, &v| {
+        let av = <F as Float>::abs(v);
+        if av > acc { av } else { acc }
+    });
+    let max_mn = <F as num_traits::NumCast>::from(m.max(n).max(1))
+        .unwrap_or_else(<F as num_traits::One>::one);
+    let ten = <F as num_traits::NumCast>::from(10).unwrap_or_else(<F as num_traits::One>::one);
+    let mut tol = ten * <F as Float>::epsilon() * a_inf * max_mn;
+    let tol_positive = tol > <F as num_traits::Zero>::zero() && <F as Float>::is_finite(tol);
+    if !tol_positive {
+        // Degenerate scale (all-zero A or non-finite): fall back to a fixed
+        // small positive tolerance so the loop still terminates cleanly.
+        tol = ten * <F as Float>::epsilon();
+    }
+
+    let at = a.t();
+    let max_outer = 3 * n;
+
+    for _ in 0..max_outer {
+        // Gradient w = Aᵀ(b − A·x).
+        let residual = b - &a.dot(&x);
+        let w = at.dot(&residual);
+
+        // Pick j* = argmax_{j ∉ P} w[j]; stop if none exceeds tol.
+        let mut best_j: Option<usize> = None;
+        let mut best_w = tol;
+        for j in 0..n {
+            if !passive[j] && w[j] > best_w {
+                best_w = w[j];
+                best_j = Some(j);
+            }
+        }
+        let Some(jstar) = best_j else {
+            break;
+        };
+        passive[jstar] = true;
+
+        // Inner loop: solve unconstrained LS on the passive columns, moving
+        // any column that goes non-positive back to the active set.
+        loop {
+            let passive_idx: Vec<usize> = (0..n).filter(|&j| passive[j]).collect();
+            if passive_idx.is_empty() {
+                break;
+            }
+
+            // Build A[:, P] and solve the unconstrained LS subproblem.
+            let mut a_p = Array2::<F>::zeros((m, passive_idx.len()));
+            for (col, &j) in passive_idx.iter().enumerate() {
+                for row in 0..m {
+                    a_p[[row, col]] = a[[row, j]];
+                }
+            }
+            let (z_p, _rank, _singular) = solve_lstsq(&a_p, b)?;
+
+            // Scatter z_P into a length-n z (0 for active columns).
+            let mut z = Array1::<F>::zeros(n);
+            for (col, &j) in passive_idx.iter().enumerate() {
+                z[j] = z_p[col];
+            }
+
+            // If all passive components are strictly positive, accept z.
+            let all_positive = passive_idx
+                .iter()
+                .all(|&j| z[j] > <F as num_traits::Zero>::zero());
+            if all_positive {
+                for &j in &passive_idx {
+                    x[j] = z[j];
+                }
+                break;
+            }
+
+            // α = min_{j∈P, z[j] ≤ 0} x[j] / (x[j] − z[j]).
+            let mut alpha = <F as Float>::infinity();
+            for &j in &passive_idx {
+                if z[j] <= <F as num_traits::Zero>::zero() {
+                    let denom = x[j] - z[j];
+                    if denom > <F as num_traits::Zero>::zero() {
+                        let ratio = x[j] / denom;
+                        if ratio < alpha {
+                            alpha = ratio;
+                        }
+                    }
+                }
+            }
+            if !<F as Float>::is_finite(alpha) {
+                // No valid step (numerical edge): accept z's positive part
+                // and stop to guarantee progress/termination.
+                for &j in &passive_idx {
+                    x[j] = if z[j] > <F as num_traits::Zero>::zero() {
+                        z[j]
+                    } else {
+                        <F as num_traits::Zero>::zero()
+                    };
+                }
+                break;
+            }
+
+            // x = x + α·(z − x).
+            for j in 0..n {
+                x[j] = x[j] + alpha * (z[j] - x[j]);
+            }
+
+            // Remove from P every column with x[j] ≈ 0.
+            for &j in &passive_idx {
+                if x[j] <= tol {
+                    passive[j] = false;
+                    x[j] = <F as num_traits::Zero>::zero();
+                }
+            }
+        }
+    }
+
+    // Clamp any tiny residual negatives to exactly zero (non-negativity).
+    let zero = <F as num_traits::Zero>::zero();
+    x.mapv_inplace(|v| if v < zero { zero } else { v });
+    Ok(x)
+}
+
 /// Solve a symmetric positive-definite system `A @ x = b` via Cholesky.
 fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
     let n = a.nrows();
@@ -480,6 +628,50 @@ pub(crate) fn solve_ridge_multi<F: Float + Send + Sync + 'static>(
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use ndarray::array;
+
+    #[test]
+    fn nnls_matches_scipy() {
+        // Live oracle (scipy.optimize.nnls, the solver sklearn uses for
+        // LinearRegression(positive=True), `_base.py:647`):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from scipy.optimize import nnls; \
+        //     X=np.array([[1.,1.],[1.,2.],[2.,1.],[3.,2.],[2.,3.]]); \
+        //     y=np.array([1.,0.5,3.,5.,1.5]); \
+        //     print([round(c,8) for c in nnls(X,y)[0]])"
+        //   -> [1.34210526, 0.0]
+        let x = array![[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [3.0, 2.0], [2.0, 3.0]];
+        let y = array![1.0, 0.5, 3.0, 5.0, 1.5];
+        let res = nnls(&x, &y);
+        assert!(res.is_ok());
+        if let Ok(coef) = res {
+            assert_eq!(coef.len(), 2);
+            assert_relative_eq!(coef[0], 1.342_105_26, epsilon = 1e-6);
+            assert_relative_eq!(coef[1], 0.0, epsilon = 1e-6);
+            // Non-negativity contract.
+            assert!(coef.iter().all(|&c| c >= 0.0));
+        }
+    }
+
+    #[test]
+    fn nnls_equals_ols_when_unconstrained_nonneg() {
+        // When the unconstrained least-squares optimum is already
+        // all-non-negative, NNLS must not distort it. Oracle:
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from scipy.optimize import nnls; from scipy.linalg import lstsq; \
+        //     X=np.array([[1.,0.],[0.,1.],[1.,1.]]); y=np.array([1.,2.,3.]); \
+        //     print([round(c,8) for c in nnls(X,y)[0]], \
+        //           [round(c,8) for c in lstsq(X,y)[0]])"
+        //   -> [1.0, 2.0] [1.0, 2.0]
+        let x = array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        let y = array![1.0, 2.0, 3.0];
+        let res = nnls(&x, &y);
+        assert!(res.is_ok());
+        if let Ok(coef) = res {
+            assert_relative_eq!(coef[0], 1.0, epsilon = 1e-8);
+            assert_relative_eq!(coef[1], 2.0, epsilon = 1e-8);
+        }
+    }
 
     #[test]
     fn test_solve_lstsq_simple() {

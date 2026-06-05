@@ -23,7 +23,7 @@
 //! | REQ-3 (fit_intercept incl. false) | SHIPPED | `with_fit_intercept`; `fit_intercept=false` forces intercept 0. Mirrors `_base.py:571`. |
 //! | REQ-4 (HasCoefficients introspection) | SHIPPED | `HasCoefficients for FittedLinearRegression`. Mirrors fitted attrs `_base.py:499/511`. |
 //! | REQ-5 (min-norm for rank-deficient / underdetermined X) | SHIPPED | `Fit for LinearRegression` calls `crate::linalg::solve_lstsq` → `ferray::linalg::lstsq` (`ferray-linalg/src/solve.rs:208`), the single-SVD gelsd-equivalent min-norm solver mirroring `_base.py:687`. Closes #376 (rank-deficient min-norm) + #377 (underdetermined accepted). Tests now passing (`#[ignore]` removed): `divergence_rank_deficient_no_intercept_min_norm`, `divergence_rank_deficient_with_intercept_min_norm`, `divergence_underdetermined_accepted_min_norm` in `tests/divergence_linreg_minnorm.rs`. |
-//! | REQ-6 (positive=True / NNLS) | NOT-STARTED | blocker #371 (`_base.py:574/645`). |
+//! | REQ-6 (positive=True / NNLS) | SHIPPED | `LinearRegression<F>` adds `pub positive: bool` (default `false`, `_base.py:574`) + `with_positive(bool)` builder. `fit_with_sample_weight`'s coefficient solve routes through `solve_coef`, which calls `crate::linalg::nnls` (Lawson-Hanson active-set NNLS solving the passive-set unconstrained LS via `solve_lstsq` on the passive columns) instead of `solve_lstsq` when `self.positive`, on the SAME centered-and-`√w`-rescaled design — mirroring sklearn's `self.coef_ = optimize.nnls(X, y)[0]` (`_base.py:647`) after `_preprocess_data`/`_rescale_data`. Intercept recovered identically (`y_off − x_off·coef` when fit_intercept, else 0; `_set_intercept`, `_base.py:692`). `rank_`/`singular_` are still taken from the `solve_lstsq` SVD of the design (sklearn leaves them unset on the positive path; ferrolearn reports the design's SVD as a documented analog). `positive=false` (default) is byte-identical to the unconstrained OLS path. Oracle tests: `linreg_positive_matches_sklearn` (coef `[2.03571429, 0.0]`, intercept `-1.46428571`, all ≥ 0, differs from unconstrained `[2.25, -0.75]`), `linreg_positive_no_intercept_matches_sklearn` (raw `nnls(X,y)` `[1.34210526, 0.0]`), `linreg_positive_false_unchanged` (byte-identical guard); `nnls_matches_scipy`/`nnls_equals_ols_when_unconstrained_nonneg` in `linalg.rs`. Closes #371. |
 //! | REQ-7 (multi-output 2-D Y → 2-D coef_) | SHIPPED | Additive `Fit<Array2<F>, Array2<F>>` arm (does NOT touch the 1-D `Fit`/`FittedLinearRegression`/`Predict`) producing `FittedMultiOutputLinearRegression<F>` — `coefficients` shape `(n_targets, n_features)` (sklearn `coef_` orientation, `coef_.T` of the lstsq solution, `_base.py:688`), `intercepts` `(n_targets,)`, `rank_`/`singular_`. Solves all targets in one SVD via `linalg::solve_lstsq_multi` → `ferray::linalg::lstsq` with a 2-D `b` (mirrors `linalg.lstsq(X, Y)`, `_base.py:687`); shared X-centering + per-target y-offset, `intercepts = y_off − coefficients · x_off` (`_set_intercept`, `_base.py:322`); `fit_intercept=false` → raw solve, intercepts 0. `Predict<Array2<F>, Output=Array2<F>>` returns `X · coef_.T + intercepts` shape `(n_samples, n_targets)` (`_base.py:290`). Oracle tests `linreg_multioutput_coef_intercept_match_sklearn` (coef `[[2.06666667,-0.06666667],[0.86666667,0.23333333]]`, intercept `[-0.06666667,0.13333333]`), `linreg_multioutput_predict_shape_and_values` (`predict(X[:2]) = [[2.0,1.0],[4.0,2.1]]`), `linreg_multioutput_no_intercept` (coef `[[2.0195121951,-0.0097560976],[0.9609756098,0.1195121951]]`, intercepts 0), `linreg_single_output_unchanged` (1-D path byte-identical). Closes #372. |
 //! | REQ-8 (sample_weight in fit) | SHIPPED | `LinearRegression::fit_with_sample_weight` solves WEIGHTED least squares `min Σᵢ wᵢ(yᵢ−xᵢ·w)²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (mirrors `_average(...,weights=sample_weight)`, `_base.py:193`/`:198`), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_base.py:641`), `linalg::solve_lstsq` on the rescaled design, `intercept = y_off − x_off·coef` (`_set_intercept`, `_base.py:320`); `fit_intercept=false` skips centering, intercept 0. `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None path byte-identical to the historic OLS body). Oracle tests `linreg_fit_sample_weight_with_intercept_matches_sklearn` (coef 2.0935828877, intercept −0.2326203209), `linreg_fit_sample_weight_no_intercept_matches_sklearn` (coef 2.0350877193, intercept 0), `linreg_fit_none_sample_weight_equals_unweighted`. Mirrors `fit(..., sample_weight=None)` (`_base.py:582`). Closes #373. |
 //! | REQ-9 (rank_/singular_/copy_X/n_jobs) | SHIPPED | `FittedLinearRegression` stores `rank_`/`singular_` (captured from `linalg::solve_lstsq` on the matrix actually solved — centered `X` when `fit_intercept`, raw `X` otherwise, matching sklearn `_base.py:687`), exposed via `rank()`/`singular_values()`; `LinearRegression` adds `copy_x` (default `true`) + `n_jobs` (default `None`) fields with `with_copy_x`/`with_n_jobs` builders, mirroring `_parameter_constraints` (`_base.py:561`) and the ctor (`_base.py:572-573`). `copy_x` is ABI-only (fit never mutates `x`); `n_jobs` stored-but-ignored (single-threaded). Oracle tests `linreg_rank_singular_match_sklearn_with_intercept` (rank 2, singular `[1.61803399, 0.61803399]` on centered X), `linreg_singular_no_intercept_matches_raw_x` (singular `[5.25371017, 0.63129192]` on raw X), `linreg_copy_x_default_and_builder`. Closes #374. |
@@ -81,6 +81,14 @@ pub struct LinearRegression<F> {
     /// ignored — parallelism is a no-op here and behaviour matches sklearn's
     /// `n_jobs=None` single-job default. Default `None` (`_base.py:573`).
     pub n_jobs: Option<usize>,
+    /// When `true`, constrains the fitted coefficients to be non-negative via
+    /// non-negative least squares (sklearn `positive`, `_base.py:574`). sklearn
+    /// solves the (centered, `√w`-rescaled) coefficient system with
+    /// `scipy.optimize.nnls` instead of `linalg.lstsq` when `positive=True`
+    /// (`_base.py:645-647`). Default `false`, matching sklearn's
+    /// `positive=False` (`_base.py:574`); when `false`, the fit is
+    /// byte-identical to the unconstrained OLS path.
+    pub positive: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -124,6 +132,30 @@ impl<
     /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
     /// Returns [`FerroError::NumericalInstability`] if the system is singular or
     /// the weighted-offset denominator (`Σwᵢ`) cannot be formed.
+    /// Solve the coefficient system on the (already centered / `√w`-rescaled)
+    /// design `a` and target `b`, returning `(coef, rank_, singular_)`.
+    ///
+    /// `rank_`/`singular_` always come from the unconstrained `linalg.lstsq`
+    /// SVD of the design `a` (matching sklearn's `linalg.lstsq(X, y)` operands,
+    /// `_base.py:687`). When `self.positive`, the COEFFICIENTS are overridden by
+    /// the non-negative least-squares solution (`scipy.optimize.nnls`,
+    /// `_base.py:647`) on the same design; otherwise the lstsq coefficients are
+    /// returned unchanged, keeping the `positive=false` path byte-identical to
+    /// the unconstrained OLS solve.
+    fn solve_coef(
+        &self,
+        a: &Array2<F>,
+        b: &Array1<F>,
+    ) -> Result<(Array1<F>, usize, Array1<F>), FerroError> {
+        let (coef, rank, singular) = linalg::solve_lstsq(a, b)?;
+        if self.positive {
+            let coef_pos = linalg::nnls(a, b)?;
+            Ok((coef_pos, rank, singular))
+        } else {
+            Ok((coef, rank, singular))
+        }
+    }
+
     pub fn fit_with_sample_weight(
         &self,
         x: &Array2<F>,
@@ -185,7 +217,7 @@ impl<
                     let x_centered = x - &x_mean;
                     let y_centered = y - y_mean;
 
-                    let (w, rank, singular) = linalg::solve_lstsq(&x_centered, &y_centered)?;
+                    let (w, rank, singular) = self.solve_coef(&x_centered, &y_centered)?;
 
                     let intercept = y_mean - x_mean.dot(&w);
 
@@ -196,7 +228,7 @@ impl<
                         singular_: singular,
                     })
                 } else {
-                    let (w, rank, singular) = linalg::solve_lstsq(x, y)?;
+                    let (w, rank, singular) = self.solve_coef(x, y)?;
 
                     Ok(FittedLinearRegression {
                         coefficients: w,
@@ -243,7 +275,7 @@ impl<
                     let x_scaled = &x_centered * &w_sqrt.view().insert_axis(Axis(1));
                     let y_scaled = &y_centered * &w_sqrt;
 
-                    let (coef, rank, singular) = linalg::solve_lstsq(&x_scaled, &y_scaled)?;
+                    let (coef, rank, singular) = self.solve_coef(&x_scaled, &y_scaled)?;
 
                     let intercept = y_off - x_off.dot(&coef);
 
@@ -258,7 +290,7 @@ impl<
                     let x_scaled = x * &w_sqrt.view().insert_axis(Axis(1));
                     let y_scaled = y * &w_sqrt;
 
-                    let (coef, rank, singular) = linalg::solve_lstsq(&x_scaled, &y_scaled)?;
+                    let (coef, rank, singular) = self.solve_coef(&x_scaled, &y_scaled)?;
 
                     Ok(FittedLinearRegression {
                         coefficients: coef,
@@ -275,14 +307,16 @@ impl<
 impl<F: Float> LinearRegression<F> {
     /// Create a new `LinearRegression` with default settings.
     ///
-    /// Defaults: `fit_intercept = true`, `copy_x = true`, `n_jobs = None`
-    /// (mirroring sklearn's ctor defaults, `_base.py:571-573`).
+    /// Defaults: `fit_intercept = true`, `copy_x = true`, `n_jobs = None`,
+    /// `positive = false` (mirroring sklearn's ctor defaults,
+    /// `_base.py:571-574`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             fit_intercept: true,
             copy_x: true,
             n_jobs: None,
+            positive: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -310,6 +344,17 @@ impl<F: Float> LinearRegression<F> {
     #[must_use]
     pub fn with_n_jobs(mut self, n_jobs: Option<usize>) -> Self {
         self.n_jobs = n_jobs;
+        self
+    }
+
+    /// Set the `positive` flag (sklearn `positive`, `_base.py:574`).
+    ///
+    /// When `true`, the fitted coefficients are constrained to be non-negative,
+    /// solved via non-negative least squares (`scipy.optimize.nnls`,
+    /// `_base.py:647`) instead of unconstrained OLS. Default `false`.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
         self
     }
 }
@@ -1052,6 +1097,103 @@ mod tests {
 
         assert_relative_eq!(fitted.coefficients()[0], 2.0, epsilon = 1e-10);
         assert_relative_eq!(fitted.intercept(), 1.0, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn linreg_positive_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle (positive=True, fit_intercept=True →
+        // centers, runs scipy.optimize.nnls on the centered design, recovers
+        // intercept = y_off − X_off·coef):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.,1.],[1.,2.],[2.,1.],[3.,2.],[2.,3.]]); \
+        //     y=np.array([1.,0.5,3.,5.,1.5]); \
+        //     m=LinearRegression(positive=True).fit(X,y); \
+        //     print([round(c,8) for c in m.coef_], round(m.intercept_,8))"
+        //   -> [2.03571429, 0.0] -1.46428571
+        // The 2nd coef CLAMPS to 0; the unconstrained fit is [2.25, -0.75].
+        let x = array![[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [3.0, 2.0], [2.0, 3.0]];
+        let y = array![1.0, 0.5, 3.0, 5.0, 1.5];
+
+        let model = LinearRegression::<f64>::new().with_positive(true);
+        let res = model.fit(&x, &y);
+        let unc_res = LinearRegression::<f64>::new().fit(&x, &y);
+        assert!(res.is_ok());
+        assert!(unc_res.is_ok());
+        if let (Ok(fitted), Ok(unconstrained)) = (res, unc_res) {
+            assert_relative_eq!(fitted.coefficients()[0], 2.035_714_29, epsilon = 1e-6);
+            assert_relative_eq!(fitted.coefficients()[1], 0.0, epsilon = 1e-6);
+            assert_relative_eq!(fitted.intercept(), -1.464_285_71, epsilon = 1e-6);
+
+            // Non-negativity contract.
+            assert!(fitted.coefficients().iter().all(|&c| c >= 0.0));
+
+            // Non-tautological: the constrained result MUST differ from the
+            // unconstrained OLS fit (oracle coef_ [2.25, -0.75]).
+            assert_relative_eq!(unconstrained.coefficients()[0], 2.25, epsilon = 1e-6);
+            assert_relative_eq!(unconstrained.coefficients()[1], -0.75, epsilon = 1e-6);
+            assert!((fitted.coefficients()[1] - unconstrained.coefficients()[1]).abs() > 0.5);
+        }
+    }
+
+    #[test]
+    fn linreg_positive_false_unchanged() {
+        // Regression guard: with_positive(false) (the default) is
+        // BYTE-IDENTICAL to the historic unconstrained fit.
+        let x = array![[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [3.0, 2.0], [2.0, 3.0]];
+        let y = array![1.0, 0.5, 3.0, 5.0, 1.5];
+
+        let d_res = LinearRegression::<f64>::new().fit(&x, &y);
+        let e_res = LinearRegression::<f64>::new()
+            .with_positive(false)
+            .fit(&x, &y);
+        assert!(d_res.is_ok());
+        assert!(e_res.is_ok());
+        if let (Ok(default), Ok(explicit)) = (d_res, e_res) {
+            assert_eq!(
+                default.coefficients()[0].to_bits(),
+                explicit.coefficients()[0].to_bits()
+            );
+            assert_eq!(
+                default.coefficients()[1].to_bits(),
+                explicit.coefficients()[1].to_bits()
+            );
+            assert_eq!(
+                default.intercept().to_bits(),
+                explicit.intercept().to_bits()
+            );
+
+            // And matches the unconstrained oracle (coef_ [2.25, -0.75]).
+            assert_relative_eq!(default.coefficients()[0], 2.25, epsilon = 1e-6);
+            assert_relative_eq!(default.coefficients()[1], -0.75, epsilon = 1e-6);
+        }
+    }
+
+    #[test]
+    fn linreg_positive_no_intercept_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle (positive=True, fit_intercept=False →
+        // raw nnls(X, y), intercept 0):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.,1.],[1.,2.],[2.,1.],[3.,2.],[2.,3.]]); \
+        //     y=np.array([1.,0.5,3.,5.,1.5]); \
+        //     m=LinearRegression(positive=True,fit_intercept=False).fit(X,y); \
+        //     print([round(c,8) for c in m.coef_], round(m.intercept_,8))"
+        //   -> [1.34210526, 0.0] 0.0  (== raw nnls(X, y))
+        let x = array![[1.0, 1.0], [1.0, 2.0], [2.0, 1.0], [3.0, 2.0], [2.0, 3.0]];
+        let y = array![1.0, 0.5, 3.0, 5.0, 1.5];
+
+        let res = LinearRegression::<f64>::new()
+            .with_positive(true)
+            .with_fit_intercept(false)
+            .fit(&x, &y);
+        assert!(res.is_ok());
+        if let Ok(fitted) = res {
+            assert_relative_eq!(fitted.coefficients()[0], 1.342_105_26, epsilon = 1e-6);
+            assert_relative_eq!(fitted.coefficients()[1], 0.0, epsilon = 1e-6);
+            assert_eq!(fitted.intercept(), 0.0);
+            assert!(fitted.coefficients().iter().all(|&c| c >= 0.0));
+        }
     }
 
     #[test]
