@@ -1153,3 +1153,9 @@ upstream = [
 ]
 design = ".design/covariance/helpers.md"
 parity_ops = ["empirical_covariance", "shrunk_covariance", "ledoit_wolf", "ledoit_wolf_shrinkage", "oas", "log_likelihood", "fast_mcd"]
+
+[[route]]
+crate_pattern = "ferrolearn-covariance/src/graphical_lasso.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/covariance/_graph_lasso.py"]
+design = ".design/covariance/graphical_lasso.md"
+parity_ops = ["GraphicalLasso", "GraphicalLassoCV", "graphical_lasso"]

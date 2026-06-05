@@ -10,12 +10,32 @@
 //! where `S` is the empirical covariance and `alpha` is the L1 penalty.
 //! [`GraphicalLassoCV`] picks `alpha` by k-fold cross-validation over a grid.
 //!
-//! The solver ([`solve_glasso`]) is a faithful port of scikit-learn 1.5.2's
+//! The solver (`solve_glasso`) is a faithful port of scikit-learn 1.5.2's
 //! `_graphical_lasso` (`mode="cd"`): initialise with the `0.95`-shrunk empirical
 //! covariance (diagonal restored) and a `pinvh` precision seed; per feature, run
 //! a warm-started Gram coordinate-descent lasso, then update the precision and
-//! covariance blocks; stop on the dual-gap criterion. See [`solve_glasso`] for
+//! covariance blocks; stop on the dual-gap criterion. See `solve_glasso` for
 //! the line-by-line correspondence.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.covariance` `GraphicalLasso`/`GraphicalLassoCV`/`graphical_lasso`
+//! (`sklearn/covariance/_graph_lasso.py`) at v1.5.2. Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-GLASSO-VALUE (covariance_/precision_ value parity) | SHIPPED | `solve_glasso` ports `_graphical_lasso` mode='cd' (`:70-200`): `0.95`-shrunk init + restored diagonal + `pinvh` seed, per-feature warm-started Gram-CD, dual-gap convergence. Matches the live oracle to ≤1e-12 across alpha∈{0.01..0.5}, p=4 and p=6, well-conditioned AND ill-conditioned (was 1.7e-2/2.7e-1, fixed #1880). Tests `divergence_graphical_lasso_value_alpha_0_1`, `_precision_diag_alpha_0_2`, sparsity guard. |
+//! | REQ-GLASSO-FN (graphical_lasso function) | SHIPPED | the free `graphical_lasso(emp_cov, alpha, max_iter, tol)` shares `solve_glasso`; matches live `sklearn.covariance.graphical_lasso`. Test `divergence_graphical_lasso_function_alpha_0_1`. |
+//! | REQ-CONVERGENCE (outer dual-gap + inner enet duality-gap) | SHIPPED | outer breaks on `|_dual_gap| < tol` (`:57-66`,`:184`); inner Gram-CD uses sklearn's duality-gap stop `gap < enet_tol*y_norm2` (max-change gate, `_cd_fast.pyx:685-727`) — was Frobenius-W (outer) + max-change-only (inner), fixed #1881/#1889. n_iter matches sklearn `n_iter_`. Test `divergence_graphical_lasso_ill_conditioned_inner_cd_alpha_0_01`. |
+//! | REQ-ENET-TOL (separate public enet_tol param) | NOT-STARTED | inner uses `enet_tol=1e-4` (sklearn default — value-correct), but it is not exposed as a public parameter (`:425`). Blocker #1883. |
+//! | REQ-GLASSOCV-CV (CV fold scheme + scoring) | NOT-STARTED | sequential consecutive-row folds (n_folds=3); sklearn `cv=None` ⇒ KFold(5); per-fold log-likelihood scoring now consumes the correct precision. Downstream of #1884 defaults. |
+//! | REQ-GLASSOCV-REFINEMENT (adaptive alpha grid + n_refinements) | NOT-STARTED | sklearn refines the alpha grid around the best `n_refinements=4` times from an `alpha_max`-generated grid; ferrolearn takes an explicit `alphas` Vec, no refinement. Architectural. Blocker #1882. |
+//! | REQ-DEFAULTS (alpha=0.01, max_iter=100, n_folds 3-vs-5, n_refinements=4) | NOT-STARTED | `new(alpha)` requires alpha; GraphicalLassoCV requires explicit alphas + n_folds=3. Blocker #1884. |
+//! | REQ-MODE-LARS (mode='lars') | NOT-STARTED | CD-only; sklearn supports `mode='lars'` (`:151-161`). Blocker #1885. |
+//! | REQ-REFIT-ESTIMATOR (GraphicalLassoCV cv_results_/alpha_ attrs) | NOT-STARTED | has `best_alpha`/`cv_scores`; sklearn exposes `alpha_`/`cv_results_`. Blocker #1886. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + hand-rolled Cholesky/pinvh CD; destination `ferray-core`/`ferray::linalg`. Blocker #1887. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use graphical_lasso::{GraphicalLasso, GraphicalLassoCV, graphical_lasso}` in `lib.rs` (boundary API, S5/R-DEFER-1). |
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::traits::Fit;
