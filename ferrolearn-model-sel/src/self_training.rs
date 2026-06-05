@@ -189,7 +189,8 @@ impl SelfTrainingClassifier {
 
             // Pseudo-label high-confidence samples.
             // Scores are treated as probabilities; samples with
-            // max(score, 1-score) >= threshold are pseudo-labeled.
+            // max(score, 1-score) > threshold are pseudo-labeled (strict `>`,
+            // mirroring sklearn `_self_training.py:262`).
             let mut new_labels_count = 0;
             for (local_i, &global_i) in unlabeled_idx.iter().enumerate() {
                 let score = scores[local_i];
@@ -197,7 +198,7 @@ impl SelfTrainingClassifier {
                 let prob = score.clamp(0.0, 1.0);
                 let max_prob = prob.max(1.0 - prob);
 
-                if max_prob >= self.threshold {
+                if max_prob > self.threshold {
                     let predicted_label = if prob >= 0.5 { 1 } else { 0 };
                     labels[global_i] = predicted_label;
                     labeled_mask[global_i] = true;

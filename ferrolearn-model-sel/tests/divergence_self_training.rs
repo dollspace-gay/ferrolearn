@@ -134,7 +134,6 @@ fn guard_selftrain_loop_non_confident_keeps_sentinel() {
 /// This test asserts the sklearn behavior and therefore FAILS un-ignored.
 /// Tracking: #1841. Single-spot fixable (`>=` -> `>`).
 #[test]
-#[ignore = "divergence: ferrolearn selection >= vs sklearn strict > at max_prob==threshold; tracking #1841"]
 fn divergence_threshold_strict_boundary_1841() {
     // Two labeled rows (forces >=1 labeled), one unlabeled row.
     let x = Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 5.0]).unwrap();
