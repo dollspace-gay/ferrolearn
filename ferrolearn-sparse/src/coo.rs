@@ -4,6 +4,27 @@
 //! primarily useful for incrementally building a sparse matrix before
 //! converting it to [`CsrMatrix`](crate::CsrMatrix) or
 //! [`CscMatrix`](crate::CscMatrix) for computation.
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.sparse.coo_matrix` (`scipy/sparse/_coo.py`; live oracle scipy
+//! 1.17, deterministic construction/conversion). Design doc: `.design/sparse/coo.md`
+//! (8 REQs). Every REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a
+//! concrete blocker). Behavior is oracle-verified vs the live scipy (R-CHAR-3) —
+//! see `tests/divergence_coo.rs`.
+//!
+//! **5 SHIPPED / 3 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-CONSTRUCT (from_triplets/push/shape) | SHIPPED | `from_triplets`/`new`/`with_capacity`/`push` mirror `coo_matrix((data,(row,col)),shape)`; `to_dense()` matches scipy `.toarray()`; `n_rows`/`n_cols` match `.shape`. Guards `coo_construct_to_dense_matches_scipy_toarray`/`coo_shape_matches_scipy`. |
+//! | REQ-TOARRAY-DUP (duplicate summing) | SHIPPED | `to_dense()` sums duplicate entries at the same position, matching scipy `.toarray()` (e.g. `(0,0)` twice → 3). Guards `coo_to_dense_duplicate_summed_matches_scipy`/`coo_push_duplicate_nnz_counts_both`. |
+//! | REQ-NNZ (stored-count semantics) | SHIPPED | `nnz()` counts STORED entries incl. duplicates (matching scipy coo `.nnz = len(data)`); CSR conversion coalesces (nnz 3→2). Guard `coo_nnz_counts_duplicates_csr_coalesces`. |
+//! | REQ-ERR (construction validation) | SHIPPED | `from_triplets`/`push` return `Err(FerroError)` on out-of-bounds index / mismatched lengths, at the same point scipy raises `ValueError`. Guards `coo_from_triplets_*_is_err`/`coo_push_out_of_bounds_is_err`. |
+//! | REQ-CONSUMER (production consumer) | SHIPPED | consumed in-crate by `csr.rs`/`csc.rs` (COO→CSR/CSC conversion) and `helpers.rs` (`eye`/`diags`/`hstack`/`vstack` build via COO) — real non-test callers (S5 crate boundary). |
+//! | REQ-API-ACCESSORS (shape/data/row/col) | NOT-STARTED | no `.shape` tuple, no public `.data`/`.row`/`.col` (behind `inner()`). Blocker #1996. |
+//! | REQ-MISSING-METHODS (COO methods) | NOT-STARTED | no `.tocsr`/`.tocsc`/`.transpose`/`.sum`/`.diagonal`/`.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.astype`/`.copy` as `CooMatrix` methods. Blocker #1997. |
+//! | REQ-FERRAY (ferray sparse substrate) | NOT-STARTED | `sprs::TriMat` + `ndarray` vs ferray's sparse COO analog (R-SUBSTRATE-1; ferray has no sparse layer yet). Blocker #1998. |
 
 use ferrolearn_core::FerroError;
 use ndarray::Array2;

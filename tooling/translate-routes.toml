@@ -1254,3 +1254,17 @@ upstream = [
 ]
 design = ".design/numerical/optimize.md"
 parity_ops = ["minimize_newton_cg", "minimize_trust_ncg", "minimize_powell", "minimize_scalar_bounded"]
+
+# =====================================================================
+# Layer 4 — ferrolearn-sparse (scipy.sparse analog: coo/csr/csc/helpers)
+# scipy.sparse is the analog upstream (the sparse substrate sklearn uses).
+# Per R-SUBSTRATE the destination is ferray's sparse analog (not sprs).
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-sparse/src/coo.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/sparse/_coo.py",
+]
+design = ".design/sparse/coo.md"
+parity_ops = ["coo_matrix"]
