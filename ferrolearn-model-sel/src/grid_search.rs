@@ -23,6 +23,27 @@
 //! // gs.fit(&x, &y).unwrap();
 //! // println!("Best: {:?}", gs.best_params());
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.GridSearchCV` / `BaseSearchCV`
+//! (`sklearn/model_selection/_search.py:1210` / `:436`, v1.5.2). Every REQ is
+//! BINARY (R-DEFER-2): SHIPPED (end-to-end functional + non-test consumer + tests
+//! + verification) or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (exhaustive search mechanic) | SHIPPED | `fit` runs `cross_val_score` for every `ParamSet` in grid order (= `ParameterGrid` sorted-key order); mirrors `evaluate_candidates(ParameterGrid(...))` (`:1571`). Factory closure = R-DEV-7 analog of `clone(estimator).set_params`. Guard `green_req1_exhaustive_mechanic_and_order`. |
+//! | REQ-2 (mean_test_score = unweighted fold mean) | SHIPPED | `CvResults::push` mean = `scores.mean()` = `np.average(array, axis=1, weights=None)` (`:1097`). Guard `green_req2_unweighted_fold_mean`. |
+//! | REQ-BESTIDX (best_index = rank argmin: first-on-tie, NaN tied-worst) | SHIPPED | `CvResults::best_index` returns the max mean with strict-`>` (first index wins ties) and NaN treated as worse than any finite (all-NaN ⇒ index 0) — reproducing `best_index_ = rank_test_score.argmin()` over `rankdata(-means, "min")` with `nan_to_num` (`:840`, `:1123-1129`). Was `max_by` (LAST on tie, trailing-NaN could win). Tests `best_index_first_on_tie` (#1776), `best_index_nan_mean_tied_worst` (#1782). |
+//! | REQ-REFIT (refit + best_estimator_ + delegating predict/score) | NOT-STARTED | search-only struct; sklearn `refit=True` default refits best params on full data and delegates predict/score (`:1046-1061`, `:577`). Blocker #1777. |
+//! | REQ-CVRESULTS (cv_results_ richness) | NOT-STARTED | `CvResults` has only params/mean_scores/all_scores; missing `std_/rank_/split{i}_test_score`, fit/score times, `param_<name>` (`:1095`,`:1117`,`:1129`,`:1134`). Blocker #1778. |
+//! | REQ-DEFAULT-CV (default cv=None ⇒ 5-fold classifier-aware) | NOT-STARTED | `cv` mandatory; no `check_cv` / StratifiedKFold dispatch (`:928`). Blocker #1779. |
+//! | REQ-DEFAULT-SCORING (default scoring=None ⇒ estimator scorer) | NOT-STARTED | `scoring` mandatory; no `check_scoring` r2/accuracy default (`:857`). Blocker #1779. |
+//! | REQ-PARALLEL (n_jobs/pre_dispatch/verbose/return_train_score/multimetric) | NOT-STARTED | none exposed (`:1210` init). Blocker #1780. |
+//! | REQ-ERROR-SCORE (error_score=np.nan continue) | NOT-STARTED | CROSS-UNIT — `fit` delegates to `cross_val_score`, which `?`-propagates; sklearn nan-fills a failing (candidate, split) cell and continues (`:996`). Owned by `cross_validation.rs` per S8, not a grid_search blocker. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1781. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use grid_search::{CvResults, GridSearchCV}` in `lib.rs`; `CvResults` further consumed by `random_search.rs`, `halving_grid_search.rs`, `halving_random_search.rs` (the `best_index` fix benefits all). |
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::pipeline::Pipeline;
