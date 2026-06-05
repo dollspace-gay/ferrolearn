@@ -33,6 +33,31 @@
 //! // hs.fit(&x, &y).unwrap();
 //! // println!("Best: {:?}", hs.best_params());
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.HalvingRandomSearchCV` /
+//! `BaseSuccessiveHalving` (`sklearn/model_selection/_search_successive_halving.py:717`)
+//! at v1.5.2. Sibling of `halving_grid_search` — the halving loop is identical
+//! (approximate heuristic schedule), the only difference is RANDOM candidate
+//! sampling. Base = `PipelineFactory` closure (R-DEV-7), shares `CvResults`. Every
+//! REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-HALVING-MECHANIC (loop shape + keep-count + best-of-final) | SHIPPED | keep top `ceil(n/factor)`, grow budget, best via shared (fixed) `CvResults::best_index`. `n.div_ceil(factor)` MATCHES sklearn `_top_k` `ceil(n_candidates/factor)` (`:359`) — re-verified vs live `n_candidates_` for (9,3)/(8,2)/(7,2)/(10,3). `n_candidates==0`/empty-dist/`factor<2` ⇒ Err. Guards `keep_count_per_round_matches_oracle` + mechanic guards. (NOT end-to-end schedule parity.) |
+//! | REQ-RANDOM-SAMPLING (sample n_candidates up-front + seed-determinism) | SHIPPED | `(0..n_candidates).map(sample_params)` draws one value per distribution via `SmallRng`; same `random_state` ⇒ identical candidates across runs. Sampled COUNT matches sklearn `ParameterSampler(..., n_candidates)`. Guards `sampled_count_consistent_with_oracle`, `same_seed_deterministic_across_runs`. Exact candidates are RNG carve-out #1861. |
+//! | REQ-N-CANDIDATES-EXHAUST (n_candidates='exhaust' default) | NOT-STARTED | `n_candidates: usize` mandatory; sklearn default `'exhaust'` ⇒ `max_resources_ // min_resources_` (`:1035`). Blocker #1860. |
+//! | REQ-RNG-EXACT (exact sampled candidates / draw order) | NOT-STARTED | `SmallRng` vs numpy `ParameterSampler`, insertion vs sorted-key draw order — R-DEFER-3 carve-out (NO failing test). Blocker #1861. |
+//! | REQ-MIN-RESOURCES (min_resources_ formula) | NOT-STARTED | ferrolearn `ceil(max_res/factor^n_rounds)` heuristic; sklearn `n_splits*magic_factor*[n_classes]` (default `'smallest'`, `:154-189`). Blocker #1862. |
+//! | REQ-N-ITERATIONS (n_iterations + n_resources schedule + termination) | NOT-STARTED | sklearn `n_iterations = min(n_possible, n_required)`, last-iteration survivor set; ferrolearn loops budget*=factor (diverges even with matched min/max). Blocker #1863. |
+//! | REQ-CV-RESULTS (cv_results_ all iterations + iter/n_resources) | NOT-STARTED | records only the final round; sklearn records every (iter, candidate) (`:351-352`). Blocker #1864. |
+//! | REQ-SUBSAMPLE (resource subsampling) | NOT-STARTED | first `budget` rows; sklearn `_SubsampleMetaSplitter` random fraction (`:335`, RNG-coupled). Blocker #1865. |
+//! | REQ-REFIT (refit + best_estimator_ + predict/score) | NOT-STARTED | search-only; sklearn `refit=True` default. Blocker #1866. |
+//! | REQ-ATTRS (n_resources_/n_candidates_/n_remaining_candidates_/...) | NOT-STARTED | none exposed. Blocker #1867. |
+//! | REQ-DEFAULTS (n_candidates/factor/min_resources/max_resources string defaults) | NOT-STARTED | no `'exhaust'`/`'smallest'`/`'auto'` strings, no classifier-aware. Blocker #1868. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random`. Blocker #1869. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use halving_random_search::HalvingRandomSearchCV` in `lib.rs`; consumes the shared `CvResults`. |
 
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
