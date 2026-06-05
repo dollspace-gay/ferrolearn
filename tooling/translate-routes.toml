@@ -1054,6 +1054,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_validation.py"]
 design = ".design/model-sel/learning_curve.md"
 parity_ops = ["learning_curve"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/grid_search.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
+design = ".design/model-sel/grid_search.md"
+parity_ops = ["GridSearchCV"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================
