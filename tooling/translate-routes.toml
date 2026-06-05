@@ -1096,6 +1096,15 @@ upstream = ["/home/doll/scikit-learn/sklearn/multioutput.py"]
 design = ".design/model-sel/multioutput.md"
 parity_ops = ["MultiOutputClassifier", "MultiOutputRegressor"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/chain.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/multioutput.py",
+  "/home/doll/scikit-learn/sklearn/multiclass.py",
+]
+design = ".design/model-sel/chain.md"
+parity_ops = ["ClassifierChain", "RegressorChain", "OutputCodeClassifier"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

@@ -8,6 +8,30 @@
 //! - [`RegressorChain`] — same idea for regression.
 //! - [`OutputCodeClassifier`] — reduces a `K`-class problem to a sequence of
 //!   binary problems via a random ±1 code matrix.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn` `ClassifierChain`/`RegressorChain` (`_BaseChain`
+//! `sklearn/multioutput.py:700`) and `OutputCodeClassifier`
+//! (`sklearn/multiclass.py:1025`) at v1.5.2. Base estimator = `PipelineFactory`
+//! closure (R-DEV-7). Every REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED
+//! (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-CHAIN-CORE (chain fit/predict, cv=None default + un-permute) | SHIPPED | fit feeds TRUE `y[:,t]` (chain order) as cascade features (matches `cv=None`, `:773-810`); predict feeds PRIOR PREDICTIONS and writes `out[[i, order[step]]]` ⇒ ORIGINAL column order (`:816-831`). Verified vs live oracle column-by-column incl. non-identity `order=[1,0]` (no chain-order leak, no fit/predict feature misalignment). Guards `regressor_chain_core_*`, `classifier_chain_core_recovers_y_both_orders`. |
+//! | REQ-CHAIN-ORDER (explicit order list) | SHIPPED | `.order(Vec)` or default `0..K`; length mismatch ⇒ `InvalidParameter`; single-target ⇒ `(n,1)`. |
+//! | REQ-OCC-NCODES (OutputCodeClassifier n_codes formula + validation) | SHIPPED | `n_codes = (code_size*k) as usize` = `int(n_classes*code_size)` floor (`multiclass.py:1189`) — was `ceil(..).max(2)` (fixed #1830; code_size=1.5,k=3 ⇒ 4 not 5); rejects `code_size <= 0`/non-finite (#1830) and the degenerate `int(code_size*k)==0` (#1839; sklearn IndexErrors at `:1215`). Tests `divergence_occ_n_codes_floor`, `divergence_occ_code_size_zero_should_error`, `divergence_occ_degenerate_zero_codes_should_error`. |
+//! | REQ-OCC-MECH (OutputCodeClassifier structure: per-column binary fit + euclidean nearest-code argmin) | SHIPPED | one binary estimator per code column; predict = euclidean-argmin (first-on-tie, matching `pairwise_distances_argmin`); sorted `classes()`. Guard `output_code_mechanic_structure`. (Exact labels are RNG carve-out #1836.) |
+//! | REQ-OCC-PREDICT (code values + raw-vs-thresholded predict) | NOT-STARTED | ferrolearn codes `{-1,+1}` + euclidean on thresholded votes; sklearn `{0,1}` (predict-only base) + euclidean on RAW `_predict_binary` Y (`:1222`). RNG-coupled. Blocker #1831. |
+//! | REQ-CHAIN-CV (cv-based leakage-free chain features) | NOT-STARTED | always uses true Y; sklearn `cv` ⇒ `cross_val_predict` cascade features (`:790-810`). Blocker #1832. |
+//! | REQ-CHAIN-RANDOM-ORDER (order='random' + random_state) | NOT-STARTED | only explicit-list/default; sklearn `order='random'` permutation. Blocker #1833. |
+//! | REQ-CHAIN-METHOD (ClassifierChain chain_method=predict_proba) | NOT-STARTED | cascades `predict` output only (`:880`). Blocker #1834. |
+//! | REQ-CHAIN-PROBA (predict_proba/predict_log_proba/classes_) | NOT-STARTED | absent (`:1035`,`:1050`). Blocker #1835. |
+//! | REQ-OCC-RNG (OutputCodeClassifier exact code book) | NOT-STARTED | `SmallRng` vs numpy uniform — R-DEFER-3 carve-out (NO failing test); seed-determinism-across-runs is the structural shipped part. Blocker #1836. |
+//! | REQ-SAMPLE-WEIGHT-NJOBS (sample_weight / n_jobs) | NOT-STARTED | no `sample_weight`/`n_jobs` channel. Blocker #1837. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random`. Blocker #1838. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use chain::{ClassifierChain, RegressorChain, OutputCodeClassifier, Fitted...}` in `lib.rs` (boundary API, S5/R-DEFER-1). No internal caller, no Python binding (honest underclaim). |
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::pipeline::{FittedPipeline, Pipeline};
