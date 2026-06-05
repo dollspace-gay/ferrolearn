@@ -19,7 +19,7 @@
 //! | REQ-2 zero-IQR / constant column → 0 (center, scale_eff=1) | SHIPPED (#1248) | `transform` `scale_eff = if iqr==0 {1} else {iqr}`; sklearn `_data.py:88`,`:1635` |
 //! | REQ-3 InsufficientSamples / ShapeMismatch error contracts | SHIPPED | `fit` / `transform` guards; sklearn `_data.py:1658-1666` |
 //! | REQ-11 PyO3 binding (`_RsRobustScaler`) | SHIPPED | `ferrolearn-python/src/extras.rs:1163`, `lib.rs:83` |
-//! | REQ-4 quantile_range ctor param + validation | NOT-STARTED (#1249) | sklearn `_data.py:1567`,`:1604-1606`,`:1630` |
+//! | REQ-4 quantile_range ctor param + validation | SHIPPED (#1249) | `RobustScaler::quantile_range` field (default `(25,75)`) + `with_quantile_range` validating builder (non-strict `0 <= q_min <= q_max <= 100`, matching sklearn's `if not 0 <= q_min <= q_max <= 100`); `fit` uses `Q(q_max_frac) − Q(q_min_frac)`; sklearn `_data.py:1567`,`:1604-1606`,`:1630` |
 //! | REQ-5 with_centering / with_scaling ctor params | NOT-STARTED (#1250) | sklearn `_data.py:1672-1675`,`:1616`,`:1640` |
 //! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
 //! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
@@ -87,16 +87,54 @@ fn quantile_sorted<F: Float>(sorted: &[F], q: f64) -> F {
 /// ```
 #[derive(Debug, Clone)]
 pub struct RobustScaler<F> {
+    /// The `(q_min, q_max)` percentile pair (each in `0..=100`) whose difference
+    /// `Q(q_max) − Q(q_min)` defines the per-column scale. Defaults to
+    /// `(25.0, 75.0)` (the interquartile range), mirroring sklearn
+    /// `RobustScaler(quantile_range=(25.0, 75.0))` (`_data.py:1567`).
+    pub quantile_range: (F, F),
     _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> RobustScaler<F> {
-    /// Create a new `RobustScaler`.
+    /// Create a new `RobustScaler` with the default quantile range `(25.0, 75.0)`
+    /// (the interquartile range).
     #[must_use]
     pub fn new() -> Self {
+        // `F::from` on these in-range literals is infallible for f32/f64; fall
+        // back to (25, 75) via integer `from` (also infallible) if it ever isn't.
+        let q_min = F::from(25.0).unwrap_or_else(|| F::from(25u8).unwrap_or_else(F::zero));
+        let q_max = F::from(75.0).unwrap_or_else(|| F::from(75u8).unwrap_or_else(F::zero));
         Self {
+            quantile_range: (q_min, q_max),
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set the `(q_min, q_max)` percentile pair used to compute the per-column
+    /// scale `Q(q_max) − Q(q_min)`, returning the reconfigured scaler.
+    ///
+    /// Mirrors sklearn's `quantile_range` constructor parameter (`_data.py:1567`)
+    /// and its non-strict `0 <= q_min <= q_max <= 100` validation
+    /// (`_data.py:1604-1606`, which raises only on `not 0 <= q_min <= q_max <= 100`).
+    /// A degenerate equal range (`q_min == q_max`) is accepted: it yields a zero
+    /// scale on every column, which the transform then handles via
+    /// `_handle_zeros_in_scale` (effective scale 1). The median (`center_`, `Q50`)
+    /// is unaffected by `quantile_range`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] unless `0 <= q_min <= q_max <= 100`.
+    #[must_use = "with_quantile_range returns a reconfigured scaler; use the returned value"]
+    pub fn with_quantile_range(mut self, q_min: F, q_max: F) -> Result<Self, FerroError> {
+        let hundred = F::from(100.0).unwrap_or_else(|| F::from(100u8).unwrap_or_else(F::zero));
+        if !(q_min >= F::zero() && q_min <= q_max && q_max <= hundred) {
+            return Err(FerroError::InvalidParameter {
+                name: "quantile_range".into(),
+                reason: "must satisfy 0 <= q_min <= q_max <= 100".into(),
+            });
+        }
+        self.quantile_range = (q_min, q_max);
+        Ok(self)
     }
 }
 
@@ -162,16 +200,23 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         let mut median_arr = Array1::zeros(n_features);
         let mut iqr_arr = Array1::zeros(n_features);
 
+        // Convert the F percentiles (0..=100) to the f64 fractions (0..=1) that
+        // `quantile_sorted` expects, mirroring sklearn's per-column
+        // `np.nanpercentile(column_data, quantile_range)` (`_data.py:1630`).
+        let q_min_frac = self.quantile_range.0.to_f64().unwrap_or(25.0) / 100.0;
+        let q_max_frac = self.quantile_range.1.to_f64().unwrap_or(75.0) / 100.0;
+
         for j in 0..n_features {
             let mut col: Vec<F> = x.column(j).iter().copied().collect();
             col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let med = quantile_sorted(&col, 0.5);
-            let q25 = quantile_sorted(&col, 0.25);
-            let q75 = quantile_sorted(&col, 0.75);
+            let q_lo = quantile_sorted(&col, q_min_frac);
+            let q_hi = quantile_sorted(&col, q_max_frac);
 
             median_arr[j] = med;
-            iqr_arr[j] = q75 - q25;
+            // scale_ = Q(q_max) − Q(q_min) (sklearn `_data.py:1634`).
+            iqr_arr[j] = q_hi - q_lo;
         }
 
         Ok(FittedRobustScaler {
@@ -369,5 +414,110 @@ mod tests {
         let scaler = RobustScaler::<f64>::new();
         let x: Array2<f64> = Array2::zeros((0, 3));
         assert!(scaler.fit(&x, &()).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-4: quantile_range constructor parameter (sklearn _data.py:1567,
+    // :1604-1606, :1630-1634). Live sklearn 1.5.2 oracle values (R-CHAR-3),
+    // computed from /tmp, never copied from the ferrolearn side.
+    //
+    // Oracle X: col0 = [1,2,...,10], col1 = [100,200,...,1000] (10 rows).
+    //   RobustScaler().fit(X)
+    //     -> center_ = [5.5, 550.0], scale_ = [4.5, 450.0]    (IQR 25-75)
+    //   RobustScaler(quantile_range=(10.,90.)).fit(X)
+    //     -> center_ = [5.5, 550.0], scale_ = [7.2, 720.0]
+    //     transform([[1.,100.]]) -> [[-0.625, -0.625]]  (= (1-5.5)/7.2)
+    // -----------------------------------------------------------------------
+
+    /// Default scaler is byte-identical to the prior default (25/75) behavior:
+    /// `center_ ≈ [5.5, 550]`, `scale_ ≈ [4.5, 450]`.
+    #[test]
+    fn robust_quantile_range_default_unchanged() -> Result<(), FerroError> {
+        let mut x = Array2::<f64>::zeros((10, 2));
+        for i in 0..10 {
+            x[[i, 0]] = (i + 1) as f64;
+            x[[i, 1]] = ((i + 1) * 100) as f64;
+        }
+        let fitted = RobustScaler::<f64>::new().fit(&x, &())?;
+        assert_abs_diff_eq!(fitted.median()[0], 5.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.median()[1], 550.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.iqr()[0], 4.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.iqr()[1], 450.0, epsilon = 1e-9);
+        Ok(())
+    }
+
+    /// `with_quantile_range(10, 90)` matches the live sklearn oracle:
+    /// `scale_ ≈ [7.2, 720]`, `center_ ≈ [5.5, 550]`,
+    /// `transform(X[:1]) ≈ [[-0.625, -0.625]]`.
+    #[test]
+    fn robust_quantile_range_10_90_matches_sklearn() -> Result<(), FerroError> {
+        let mut x = Array2::<f64>::zeros((10, 2));
+        for i in 0..10 {
+            x[[i, 0]] = (i + 1) as f64;
+            x[[i, 1]] = ((i + 1) * 100) as f64;
+        }
+        let fitted = RobustScaler::<f64>::new()
+            .with_quantile_range(10.0, 90.0)?
+            .fit(&x, &())?;
+        assert_abs_diff_eq!(fitted.median()[0], 5.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.median()[1], 550.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.iqr()[0], 7.2, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.iqr()[1], 720.0, epsilon = 1e-9);
+
+        let row0 = array![[1.0, 100.0]];
+        let scaled = fitted.transform(&row0)?;
+        assert_abs_diff_eq!(scaled[[0, 0]], -0.625, epsilon = 1e-9);
+        assert_abs_diff_eq!(scaled[[0, 1]], -0.625, epsilon = 1e-9);
+        Ok(())
+    }
+
+    /// Validation rejects ranges outside the non-strict `0 <= q_min <= q_max <= 100`
+    /// (sklearn `_data.py:1604-1606`: raises only on `not 0 <= q_min <= q_max <= 100`).
+    #[test]
+    fn robust_quantile_range_validation_rejects() {
+        // q_min > q_max (live sklearn: (75,25) -> ValueError "Invalid quantile range")
+        assert!(matches!(
+            RobustScaler::<f64>::new().with_quantile_range(75.0, 25.0),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        // q_min < 0
+        assert!(matches!(
+            RobustScaler::<f64>::new().with_quantile_range(-1.0, 50.0),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        // q_max > 100
+        assert!(matches!(
+            RobustScaler::<f64>::new().with_quantile_range(50.0, 110.0),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+    }
+
+    /// A degenerate equal range (`q_min == q_max`) is accepted, matching live
+    /// sklearn 1.5.2: `RobustScaler(quantile_range=(50.,50.))` -> OK with
+    /// `scale_ = [1.0, 1.0]` (zero IQR -> `_handle_zeros_in_scale` -> 1) and
+    /// `center_ = [5.5, 550.0]` on the oracle X (col0 `[1..10]`, col1 `[100..1000]`).
+    #[test]
+    fn robust_quantile_range_equal_bounds_accepted() -> Result<(), FerroError> {
+        let mut x = Array2::<f64>::zeros((10, 2));
+        for i in 0..10 {
+            x[[i, 0]] = (i + 1) as f64;
+            x[[i, 1]] = ((i + 1) * 100) as f64;
+        }
+        let fitted = RobustScaler::<f64>::new()
+            .with_quantile_range(50.0, 50.0)?
+            .fit(&x, &())?;
+        // center_ == median == [5.5, 550.0] (unaffected by quantile_range).
+        assert_abs_diff_eq!(fitted.median()[0], 5.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.median()[1], 550.0, epsilon = 1e-9);
+        // Raw IQR (Q50 - Q50) is exactly 0 on every column.
+        assert_abs_diff_eq!(fitted.iqr()[0], 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(fitted.iqr()[1], 0.0, epsilon = 1e-12);
+        // Transform uses the effective scale 1 (_handle_zeros), so scale_ == [1, 1]:
+        // the centered values are not rescaled.
+        let scaled = fitted.transform(&x)?;
+        // Row with col0 == 1 (i = 0): (1 - 5.5) / 1 = -4.5; (100 - 550) / 1 = -450.
+        assert_abs_diff_eq!(scaled[[0, 0]], -4.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(scaled[[0, 1]], -450.0, epsilon = 1e-9);
+        Ok(())
     }
 }
