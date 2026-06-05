@@ -1,8 +1,45 @@
-//! Additional PyO3 bindings (Phase 2 binding expansion) — covers everything
-//! beyond the 12 originally-bound estimators so the head-to-head bench can
-//! exercise the full ferrolearn surface against scikit-learn.
-
-#![allow(non_snake_case)]
+//! PyO3 bindings for the extended estimator surface (~40 estimators beyond the
+//! core regressor/classifier/transformer/clusterer bindings), so `import ferrolearn`
+//! mirrors the breadth of `import sklearn` and the head-to-head bench can exercise
+//! the full ferrolearn surface against scikit-learn.
+//!
+//! ## REQ status
+//!
+//! ~40 `sklearn` estimator binding shims (via the `py_regressor!`/`py_classifier!`/
+//! `py_transformer!` macros + hand-written pyclasses) over
+//! `ferrolearn_linear`/`ferrolearn_tree`/`ferrolearn_neighbors`/`ferrolearn_bayes`/
+//! `ferrolearn_cluster`/`ferrolearn_decomp`/`ferrolearn_preprocess`/`ferrolearn_kernel`,
+//! wrapped by the `_extras.py` mixin wrappers (`_RegressorWrapper`/`_ClassifierWrapper`/
+//! `_ClusterWrapper`/`_TransformerWrapper` + a LabelEncoder-equivalent `_encode`).
+//! This unit owns the sklearn-API marshalling surface only (constructor ABI,
+//! method/attribute exposure, array coercion); the estimator MATH lives downstream
+//! in the eight respective crates (pre-existing audited). Verification model B:
+//! pytest comparing `import ferrolearn` against `import sklearn` 1.5.2. Design doc:
+//! `.design/python/extras.md` (17 REQs). Every REQ is BINARY (R-DEFER-2): SHIPPED
+//! or NOT-STARTED (with a concrete blocker). Verified via
+//! `tests/divergence_extras.py` + the per-category divergence suites (595 pytest pass).
+//!
+//! **12 SHIPPED / 5 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-REGRESSOR-API-CONFORM (fit/predict, 11 regressors) | SHIPPED | `py_regressor!` macro + hand-written `Rs*Regressor` expose fit/predict, wrapped by `_extras.py::_RegressorWrapper` (+ `n_features_in_`/`score`). Mirrors the sklearn regressor fit/predict contract across `ensemble`/`linear_model`/`neighbors`/`kernel_ridge`/`tree`. |
+//! | REQ-CLASSIFIER-API-CONFORM (fit/predict + LabelEncoder, 13 classifiers) | SHIPPED | `py_classifier!` macro + hand-written classifiers expose fit/predict, wrapped by `_extras.py::_ClassifierWrapper` whose `_encode` (np.unique+searchsorted) sets `classes_` and round-trips arbitrary label dtypes through the Rust `usize`-label core. |
+//! | REQ-CLUSTERER-API-CONFORM (fit + labels_, 5 clusterers incl. GMM) | SHIPPED | `RsMiniBatchKMeans`/`RsDBSCAN`/`RsAgglomerativeClustering`/`RsBirch` expose fit + `labels_` (+ predict for MiniBatchKMeans), `RsGaussianMixture` fit/predict; wrapped by `_extras.py::_ClusterWrapper` (+ `fit_predict`). |
+//! | REQ-TRANSFORMER-API-CONFORM (fit/transform, 13 transformers) | SHIPPED | `py_transformer!` macro exposes fit/transform for the decomp/preprocess/kernel transformers, wrapped by `_extras.py::_TransformerWrapper` (+ `fit_transform`). |
+//! | REQ-REGRESSOR-VALUE-PARITY (default-path predict parity) | SHIPPED | deterministic default path: the deterministic regressors' predict parity is verified downstream in `ferrolearn_linear`/`_tree`/`_neighbors`/`_kernel` REQ tables. (Seeded-RNG ensembles → REQ-VALUE-PARITY-RNG.) |
+//! | REQ-CLASSIFIER-VALUE-PARITY (default-path label parity) | SHIPPED | deterministic default path: decoded label predictions of the deterministic classifiers match sklearn after the `_encode`/decode round-trip; verified downstream in `ferrolearn_linear`/`_bayes`/`_tree`. |
+//! | REQ-CLUSTERER-VALUE-PARITY (default-path partition parity) | SHIPPED | deterministic default path: `labels_` for `DBSCAN`/`AgglomerativeClustering`/`Birch` match sklearn's partition up to label permutation; verified in `ferrolearn_cluster`. |
+//! | REQ-TRANSFORMER-VALUE-PARITY (default-path transform parity) | SHIPPED | deterministic default path: transformed output for the deterministic transformers matches the sklearn oracle (sign/permutation invariance where applicable); verified in `ferrolearn_decomp`/`_preprocess`/`_kernel`. |
+//! | REQ-CTOR-ABI-POSITIONAL (16 positional primaries) | SHIPPED | FIXED #2055: the 16 `_extras.py` wrappers whose primary hyperparameter sklearn makes positional-or-keyword now place it before the `*` (`RandomForestRegressor`/`ExtraTreesRegressor` `n_estimators`, `KNeighborsRegressor` `n_neighbors`, `RidgeClassifier`/`KernelRidge` `alpha`, `MiniBatchKMeans`/`AgglomerativeClustering` `n_clusters`, `DBSCAN` `eps`, `GaussianMixture`/`TruncatedSVD`/`FastICA`/`NMF`/`IncrementalPCA`/`KernelPCA`/`SparsePCA`/`FactorAnalysis` `n_components`). Parametrized guard `test_red_extras_primary_param_positional` (16 cases). |
+//! | REQ-MODULE-ALLOW (no module-root `#![allow]`) | SHIPPED | FIXED #2056: the module-root `#![allow(non_snake_case)]` was removed (it was dead — all field names are snake_case); `cargo clippy -p ferrolearn-python --all-targets -- -D warnings` stays green (R-CODE-3/R-APG-1). |
+//! | REQ-PHASE-FRAMING (no Phase-N deferral framing) | SHIPPED | the `//!` (this header) and `_extras.py` docstring were reworded to describe the extras binding surface without "Phase N" framing (R-DEFER-4), and this `## REQ status` table was added. |
+//! | REQ-DECOMP-NCOMPONENTS-DEFAULT (n_components default) | NOT-STARTED | the 5-6 decomp transformers hardcode `n_components=2` vs sklearn `None` (`IncrementalPCA`/`FastICA`/`KernelPCA`/`SparsePCA`/`FactorAnalysis`) / `'warn'`→None (`NMF`); the `None`-auto-rank behavior is owned downstream by `ferrolearn_decomp`. (`TruncatedSVD` default 2 MATCHES.) |
+//! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
+//! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. |
+//! | REQ-VALUE-PARITY-RNG (seeded stochastic parity) | NOT-STARTED | the stochastic estimators (RF/ET/GB/HistGB/Bagging/AdaBoost/MiniBatchKMeans/GMM/FastICA/NMF) pass `random_state: Option<u64>` to a non-numpy RNG, so a shared `random_state` will not reproduce sklearn's numpy-MT/PCG64 draws (R-SUBSTRATE-5; needs `ferray::random`). |
+//! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: the `_extras.py` wrappers + `GaussianMixture` construct their `_Rs*` class via `_make_rs` and drive fit/predict/transform; `ferrolearn/__init__.py` re-exports all ~40; `lib.rs` registers every `_Rs*`; the head-to-head bench drives them vs sklearn (595 pytest pass). |
+//! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
 use crate::conversions::*;
 use ferrolearn_core::{Fit, Predict, Transform};

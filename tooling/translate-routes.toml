@@ -1343,3 +1343,38 @@ upstream = [
 ]
 design = ".design/python/classifiers.md"
 parity_ops = ["LogisticRegression", "DecisionTreeClassifier", "RandomForestClassifier", "KNeighborsClassifier", "GaussianNB"]
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/extras.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/ensemble/_forest.py",
+  "/home/doll/scikit-learn/sklearn/ensemble/_gb.py",
+  "/home/doll/scikit-learn/sklearn/ensemble/_weight_boosting.py",
+  "/home/doll/scikit-learn/sklearn/ensemble/_bagging.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_bayes.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_huber.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_quantile.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_ridge.py",
+  "/home/doll/scikit-learn/sklearn/svm/_classes.py",
+  "/home/doll/scikit-learn/sklearn/discriminant_analysis.py",
+  "/home/doll/scikit-learn/sklearn/naive_bayes.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_regression.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_nearest_centroid.py",
+  "/home/doll/scikit-learn/sklearn/kernel_ridge.py",
+  "/home/doll/scikit-learn/sklearn/cluster/_kmeans.py",
+  "/home/doll/scikit-learn/sklearn/cluster/_dbscan.py",
+  "/home/doll/scikit-learn/sklearn/cluster/_agglomerative.py",
+  "/home/doll/scikit-learn/sklearn/cluster/_birch.py",
+  "/home/doll/scikit-learn/sklearn/mixture/_gaussian_mixture.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_incremental_pca.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_truncated_svd.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_fastica.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_nmf.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_kernel_pca.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_sparse_pca.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_factor_analysis.py",
+  "/home/doll/scikit-learn/sklearn/preprocessing/_data.py",
+  "/home/doll/scikit-learn/sklearn/kernel_approximation.py",
+]
+design = ".design/python/extras.md"
+parity_ops = ["RandomForestRegressor", "GradientBoostingRegressor", "HistGradientBoostingRegressor", "ExtraTreesRegressor", "BayesianRidge", "ARDRegression", "HuberRegressor", "QuantileRegressor", "DecisionTreeRegressor", "KNeighborsRegressor", "KernelRidge", "RidgeClassifier", "LinearSVC", "QuadraticDiscriminantAnalysis", "MultinomialNB", "BernoulliNB", "ComplementNB", "ExtraTreeClassifier", "ExtraTreesClassifier", "AdaBoostClassifier", "GradientBoostingClassifier", "HistGradientBoostingClassifier", "BaggingClassifier", "NearestCentroid", "MiniBatchKMeans", "DBSCAN", "AgglomerativeClustering", "Birch", "GaussianMixture", "IncrementalPCA", "TruncatedSVD", "FastICA", "NMF", "KernelPCA", "SparsePCA", "FactorAnalysis", "MinMaxScaler", "MaxAbsScaler", "RobustScaler", "PowerTransformer", "Nystroem", "RBFSampler"]

@@ -1,6 +1,6 @@
-"""Phase-2 binding wrappers — sklearn-compatible Python classes for the
-~40 estimators added in extras.rs. Minimal API: __init__, fit, predict
-or transform. Inherits sklearn mixins for `.score()` / `fit_transform()`.
+"""sklearn-compatible Python wrappers for the ~40 extended-surface estimators
+bound in extras.rs. Minimal API: __init__, fit, predict or transform. Inherits
+sklearn mixins for `.score()` / `fit_transform()`.
 """
 
 import numpy as np
@@ -154,7 +154,7 @@ class DecisionTreeRegressor(_RegressorWrapper):
 
 
 class RandomForestRegressor(_RegressorWrapper):
-    def __init__(self, *, n_estimators=100, max_depth=None,
+    def __init__(self, n_estimators=100, *, max_depth=None,
                  min_samples_split=2, min_samples_leaf=1, random_state=None):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
@@ -171,7 +171,7 @@ class RandomForestRegressor(_RegressorWrapper):
 
 
 class ExtraTreesRegressor(_RegressorWrapper):
-    def __init__(self, *, n_estimators=100, max_depth=None, random_state=None):
+    def __init__(self, n_estimators=100, *, max_depth=None, random_state=None):
         self.n_estimators = n_estimators
         self.max_depth = max_depth
         self.random_state = random_state
@@ -211,7 +211,7 @@ class HistGradientBoostingRegressor(_RegressorWrapper):
 
 
 class KNeighborsRegressor(_RegressorWrapper):
-    def __init__(self, *, n_neighbors=5):
+    def __init__(self, n_neighbors=5):
         self.n_neighbors = n_neighbors
 
     def _make_rs(self):
@@ -219,7 +219,7 @@ class KNeighborsRegressor(_RegressorWrapper):
 
 
 class KernelRidge(_RegressorWrapper):
-    def __init__(self, *, alpha=1.0):
+    def __init__(self, alpha=1.0):
         self.alpha = alpha
 
     def _make_rs(self):
@@ -248,7 +248,7 @@ class _ClassifierWrapper(ClassifierMixin, BaseEstimator):
 
 
 class RidgeClassifier(_ClassifierWrapper):
-    def __init__(self, *, alpha=1.0, fit_intercept=True):
+    def __init__(self, alpha=1.0, *, fit_intercept=True):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
 
@@ -406,7 +406,7 @@ class _ClusterWrapper(ClusterMixin, BaseEstimator):
 
 
 class MiniBatchKMeans(_ClusterWrapper):
-    def __init__(self, *, n_clusters=8, max_iter=100, random_state=None):
+    def __init__(self, n_clusters=8, *, max_iter=100, random_state=None):
         self.n_clusters = n_clusters
         self.max_iter = max_iter
         self.random_state = random_state
@@ -421,7 +421,7 @@ class MiniBatchKMeans(_ClusterWrapper):
 
 
 class DBSCAN(_ClusterWrapper):
-    def __init__(self, *, eps=0.5, min_samples=5):
+    def __init__(self, eps=0.5, *, min_samples=5):
         self.eps = eps
         self.min_samples = min_samples
 
@@ -430,7 +430,7 @@ class DBSCAN(_ClusterWrapper):
 
 
 class AgglomerativeClustering(_ClusterWrapper):
-    def __init__(self, *, n_clusters=2):
+    def __init__(self, n_clusters=2):
         self.n_clusters = n_clusters
 
     def _make_rs(self):
@@ -450,7 +450,7 @@ class GaussianMixture(BaseEstimator):
     """sklearn places GaussianMixture in `sklearn.mixture` (not cluster);
     we mirror that style — fit/predict/labels_."""
 
-    def __init__(self, *, n_components=1, max_iter=100, random_state=None):
+    def __init__(self, n_components=1, *, max_iter=100, random_state=None):
         self.n_components = n_components
         self.max_iter = max_iter
         self.random_state = random_state
@@ -486,7 +486,7 @@ class _TransformerWrapper(TransformerMixin, BaseEstimator):
 
 
 class IncrementalPCA(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -494,7 +494,7 @@ class IncrementalPCA(_TransformerWrapper):
 
 
 class TruncatedSVD(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -502,7 +502,7 @@ class TruncatedSVD(_TransformerWrapper):
 
 
 class FastICA(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -510,7 +510,7 @@ class FastICA(_TransformerWrapper):
 
 
 class NMF(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -518,7 +518,7 @@ class NMF(_TransformerWrapper):
 
 
 class KernelPCA(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -526,7 +526,7 @@ class KernelPCA(_TransformerWrapper):
 
 
 class SparsePCA(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
@@ -534,7 +534,7 @@ class SparsePCA(_TransformerWrapper):
 
 
 class FactorAnalysis(_TransformerWrapper):
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=2):
         self.n_components = n_components
 
     def _make_rs(self):
