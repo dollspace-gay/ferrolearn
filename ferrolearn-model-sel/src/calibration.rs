@@ -378,8 +378,21 @@ fn fit_isotonic(
     // PAV algorithm — maintain blocks of (sum, count, leftmost_score, rightmost_score).
     let mut blocks: Vec<(f64, usize, f64, f64)> = Vec::with_capacity(n);
 
-    for &(score, label) in &indexed {
-        blocks.push((label, 1, score, score));
+    // Pre-merge EXACT-duplicate scores into one weighted initial block,
+    // mirroring sklearn `_make_unique` (sklearn/isotonic.py:319): tied-X
+    // samples collapse into ONE point carrying the averaged y (sum/count)
+    // BEFORE the PAV pass. Then PAV operates over unique-score blocks.
+    let mut i = 0;
+    while i < indexed.len() {
+        let (score, _) = indexed[i];
+        let mut run_sum = 0.0_f64;
+        let mut run_count = 0_usize;
+        while i < indexed.len() && indexed[i].0 == score {
+            run_sum += indexed[i].1;
+            run_count += 1;
+            i += 1;
+        }
+        blocks.push((run_sum, run_count, score, score));
 
         // Merge while the last block's mean exceeds the previous block's mean.
         while blocks.len() > 1 {

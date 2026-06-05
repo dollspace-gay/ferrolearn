@@ -239,8 +239,7 @@ fn divergence_isotonic_breakpoints_1800() {
 /// ```
 /// ferrolearn produces `[0.0, 0.5, 0.5, 0.5, 1.0]` at the same queries
 /// (MAX ABS DIFF 0.5 at q=1.0 and q=2.0).
-/// Tracking: // #NNNN new-blocker
-#[ignore = "divergence: isotonic does not pre-average tied scores (_make_unique); tracking #NNNN"]
+/// Tracking: // #1810
 #[test]
 fn divergence_isotonic_tied_scores_make_unique() {
     let scores = [1.0, 1.0, 2.0, 2.0];
