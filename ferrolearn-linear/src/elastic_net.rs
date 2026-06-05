@@ -35,7 +35,8 @@
 //! | REQ-12 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedElasticNet<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `ElasticNet.n_iter_` (`_coordinate_descent.py:827`) and `dual_gap_` (`:831`). `fn enet_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·l1_ratio·n`, `beta = α·(1−l1_ratio)·n`, the `XtA = XᵀR − beta·w` term + `0.5·beta·(1+const²)·‖w‖²`) with a final `/n` mapping to the `(1/2n)` objective; reduces to `lasso_dual_gap` when `l1_ratio = 1` (`beta = 0`). With REQ-13's dual-gap stopping criterion now landed, `n_iter_`'s VALUE matches sklearn exactly (`n_iter_ == 16` at alpha=0.3, `== 19` at alpha=0.1 on the fixture); `dual_gap_` matches sklearn's formula/value (`0.00010575563` at `alpha=0.3, l1_ratio=0.5`). Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_dual_gap_formula_matches_numpy`, `enet_fitted_dual_gap_and_n_iter`, `enet_fields_dont_change_coef`, `enet_dual_gap_stopping_matches_sklearn_coef_and_niter`). |
 //! | REQ-13 (dual-gap stopping criterion) | SHIPPED | `Fit::fit for ElasticNet` now uses sklearn's two-level criterion (`_cd_fast.pyx:167-249`): `tol_scaled = tol·(target·target)` (`:167-168`), per sweep track `w_max`/`d_w_max`, gate on `w_max==0 || d_w_max/w_max < tol || last_iter` (`:207-211`), and inside the gate break only when the UN-normalized gap `enet_dual_gap(...)·n < tol_scaled` (`:249`) — `enet_dual_gap` already carries the L2/beta term. Matches sklearn's `coef_` to ≤1e-7 and `n_iter_` exactly (16 at alpha=0.3, 19 at alpha=0.1). Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_dual_gap_stopping_matches_sklearn_coef_and_niter`, `enet_dual_gap_stopping_second_alpha`). |
 //! | REQ-10 (selection='random' + random_state) | SHIPPED | Reuses `pub enum CoordSelection { Cyclic, Random }` from `lasso.rs` + `pub selection`/`pub random_state` fields on `ElasticNet` with `with_selection`/`with_random_state` builders, mirroring sklearn `ElasticNet(selection=..., random_state=...)` (`_coordinate_descent.py` `__init__`). `Fit::fit`'s CD loop visits `0..n_features` in order for `Cyclic` (BYTE-IDENTICAL to the prior cyclic path, so coef_/`n_iter_`/dual-gap stay unchanged) and shuffles a reused index `Vec` each sweep for `Random` via `StdRng::seed_from_u64(random_state.unwrap_or(0))` (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch picks `ii` instead of `f_iter`); per-coordinate update math + dual-gap stopping (REQ-13) are unchanged. The ElasticNet optimum is unique, so `Random` converges to the same optimum (≈3e-4 from cyclic due to stopping-within-tol). Exact bit-match to sklearn's `selection='random'` is numpy-MT19937-RNG-blocked (Rust `StdRng` ≠ numpy MT), so the random path verifies convergence-to-the-unique-optimum, not bitwise sklearn parity; the cyclic default IS bit-exact. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_selection_cyclic_default_unchanged`, `enet_selection_random_converges_to_optimum`). |
-//! | REQ-9, 11, 14..15 NOT-STARTED | warm_start (#408), precompute (#410), MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-11 (precompute/Gram) | SHIPPED | `pub precompute: bool` field (default `false`) on `ElasticNet` + `with_precompute` builder, mirroring sklearn `ElasticNet(precompute=False)` (`_coordinate_descent.py:774`). When `true`, `Fit::fit` runs CD on the precomputed `Q = Xcᵀ Xc` / `q = Xcᵀ yc` with an incrementally-maintained `H = Q·w` (sklearn `_cd_fast.pyx enet_coordinate_descent_gram`); `tmp = (q[j]−H[j])/n + col_norms[j]·w[j] ≡` the direct path's `rho_j + (XⱼᵀXⱼ/n)·w_old` since `Xⱼᵀr = q[j]−(Q·w)[j]`, then `soft_threshold(tmp, α·l1_ratio)/(col_norm + α·(1−l1_ratio))` keeps the L2 term in the denominator, so it reaches the SAME unique optimum (to ~1e-10 fp reassociation) with the SAME coordinate order + dual-gap stopping. `precompute=false` (default) is the byte-identical direct path. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_precompute_matches_sklearn`, `enet_precompute_default_false_unchanged`, `enet_precompute_equals_direct`). |
+//! | REQ-9, 14..15 NOT-STARTED | warm_start (#408), MultiTaskElasticNet (#418), ferray substrate (#419). |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -95,6 +96,16 @@ pub struct ElasticNet<F> {
     pub fit_intercept: bool,
     /// When `true`, constrain coefficients to be non-negative.
     pub positive: bool,
+    /// When `true`, run coordinate descent on the precomputed Gram matrix
+    /// `Q = Xcᵀ Xc` and `q = Xcᵀ yc` instead of recomputing residuals each
+    /// pass.
+    ///
+    /// Mirrors sklearn `ElasticNet(precompute=False)` (`_coordinate_descent.py:774`);
+    /// the Gram path runs sklearn's `enet_coordinate_descent_gram`
+    /// (`_cd_fast.pyx`) with the ElasticNet L2 term `α·(1−l1_ratio)` in the
+    /// denominator. Reaches the same unique optimum (differing only at
+    /// floating-point reassociation level, ~1e-10).
+    pub precompute: bool,
     /// Order in which coordinates are visited each coordinate-descent sweep.
     ///
     /// Mirrors sklearn `ElasticNet(selection=...)` (default `Cyclic`).
@@ -120,6 +131,7 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
             tol: F::from(1e-4).unwrap(),
             fit_intercept: true,
             positive: false,
+            precompute: false,
             selection: CoordSelection::Cyclic,
             random_state: None,
         }
@@ -169,6 +181,18 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
     #[must_use]
     pub fn with_positive(mut self, positive: bool) -> Self {
         self.positive = positive;
+        self
+    }
+
+    /// Set whether to run coordinate descent on the precomputed Gram matrix.
+    ///
+    /// Mirrors `sklearn.linear_model.ElasticNet(precompute=...)`
+    /// (`_coordinate_descent.py:774`); `true` selects sklearn's
+    /// `enet_coordinate_descent_gram` (`_cd_fast.pyx`), with the ElasticNet
+    /// L2 term `α·(1−l1_ratio)` in the per-coordinate denominator.
+    #[must_use]
+    pub fn with_precompute(mut self, precompute: bool) -> Self {
+        self.precompute = precompute;
         self
     }
 
@@ -436,6 +460,106 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let mut order: Vec<usize> = (0..n_features).collect();
 
         let mut n_iter = 0_usize;
+
+        // REQ-11: Gram (precompute) coordinate-descent path. Mirrors sklearn's
+        // `enet_coordinate_descent_gram` (`_cd_fast.pyx`): run CD on the
+        // precomputed `Q = Xcᵀ Xc` and `q = Xcᵀ yc`, maintaining `H = Q·w`
+        // incrementally instead of recomputing residuals each sweep.
+        // Algebraically identical to the direct path (`Xⱼᵀr = q[j] − (Q·w)[j]`),
+        // so it converges to the same unique optimum (to fp reassociation,
+        // ~1e-10). Keeps the SAME `(1/n)` normalization, the same L1 threshold
+        // `alpha_l1` and L2-in-the-denominator `alpha_l2`, the same coordinate
+        // visiting order, and the same dual-gap stopping criterion as the direct
+        // path so `n_iter_` matches.
+        if self.precompute {
+            // Q = Xcᵀ Xc  (n_features × n_features); q = Xcᵀ yc.
+            let gram = x_work.t().dot(&x_work);
+            let q = x_work.t().dot(&residual);
+            // H = Q·w  (zeros initially, since w is zeros).
+            let mut h = gram.dot(&w);
+
+            for iter in 0..self.max_iter {
+                n_iter = iter + 1;
+                let mut w_max = F::zero();
+                let mut d_w_max = F::zero();
+
+                if self.selection == CoordSelection::Random {
+                    order.shuffle(&mut rng);
+                }
+
+                for &j in &order {
+                    let w_old = w[j];
+                    // tmp ≡ direct `rho_j` + (XⱼᵀXⱼ/n)·w_old:
+                    // (q[j] − H[j])/n + col_norms[j]·w[j], since
+                    // Xⱼᵀr = q[j] − (Q·w)[j] and col_norms[j] = Q[j,j]/n.
+                    let tmp = (q[j] - h[j]) / n_f + col_norms[j] * w_old;
+
+                    // Soft-threshold for L1 (alpha_l1), then divide by the
+                    // ElasticNet denominator (col_norm + alpha_l2). Identical
+                    // to the direct path's per-coordinate update, just
+                    // Gram-sourced.
+                    let w_new = if denominators[j] > F::zero() {
+                        let thresholded = if self.positive {
+                            soft_threshold_positive(tmp, alpha_l1)
+                        } else {
+                            soft_threshold(tmp, alpha_l1)
+                        };
+                        thresholded / denominators[j]
+                    } else {
+                        F::zero()
+                    };
+
+                    if w_new != w_old {
+                        // H += (w_new − w_old) · Q.column(j).
+                        let delta = w_new - w_old;
+                        let col = gram.column(j);
+                        for i in 0..n_features {
+                            h[i] = h[i] + delta * col[i];
+                        }
+                    }
+
+                    let change = (w_new - w_old).abs();
+                    if change > d_w_max {
+                        d_w_max = change;
+                    }
+                    if w_new.abs() > w_max {
+                        w_max = w_new.abs();
+                    }
+
+                    w[j] = w_new;
+                }
+
+                // SAME dual-gap stopping as the direct path: reuse the
+                // residual-based `enet_dual_gap` on (x_work, target) — equal to
+                // the Gram gap to fp precision, so `n_iter_` matches.
+                let last_iter = iter == self.max_iter - 1;
+                if w_max == F::zero() || d_w_max / w_max < d_w_tol || last_iter {
+                    let dual_gap = enet_dual_gap(&x_work, &target, &w, self.alpha, self.l1_ratio);
+                    let gap_raw = dual_gap * n_f;
+
+                    if gap_raw < tol_scaled {
+                        let intercept = compute_intercept(&x_mean, &y_mean, &w);
+                        return Ok(FittedElasticNet {
+                            coefficients: w,
+                            intercept,
+                            n_iter,
+                            dual_gap,
+                        });
+                    }
+                }
+            }
+
+            // Did not converge within max_iter; return the current solution.
+            let intercept = compute_intercept(&x_mean, &y_mean, &w);
+            let dual_gap = enet_dual_gap(&x_work, &target, &w, self.alpha, self.l1_ratio);
+            return Ok(FittedElasticNet {
+                coefficients: w,
+                intercept,
+                n_iter,
+                dual_gap,
+            });
+        }
+
         for iter in 0..self.max_iter {
             n_iter = iter + 1;
             let mut w_max = F::zero();
@@ -1186,5 +1310,89 @@ mod tests {
         // Support set matches: both coefficients strictly positive.
         assert!(coef[0] > 0.0, "coef[0] should be in the support");
         assert!(coef[1] > 0.0, "coef[1] should be in the support");
+    }
+
+    // ---- precompute / Gram path (REQ-11) ----
+
+    #[test]
+    fn enet_precompute_matches_sklearn() -> Result<(), FerroError> {
+        // REQ-11: Gram (precompute=True) coordinate-descent path.
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   X=[[1,2],[2,1],[3,4],[4,3],[5,5]], y=[3,2.5,7.1,6,11.2]
+        //   ElasticNet(alpha=0.3, l1_ratio=0.5, precompute=True).fit(X,y)
+        //     -> coef_=[0.7732334821, 1.3548029901], n_iter_=16
+        //   (same optimum as precompute=False to ~1e-10).
+        let (x, y) = raw_dual_gap_fixture();
+
+        let fitted = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_precompute(true)
+            .fit(&x, &y)?;
+
+        assert_relative_eq!(fitted.coefficients()[0], 0.7732334821, epsilon = 1e-7);
+        assert_relative_eq!(fitted.coefficients()[1], 1.3548029901, epsilon = 1e-7);
+        assert_eq!(fitted.n_iter(), 16, "n_iter_ must match sklearn's 16");
+        Ok(())
+    }
+
+    #[test]
+    fn enet_precompute_default_false_unchanged() -> Result<(), FerroError> {
+        // Default `precompute` is `false`; the default fit must be byte-identical
+        // to an explicitly-direct (precompute=false) fit (no perturbation).
+        assert!(
+            !ElasticNet::<f64>::new().precompute,
+            "default precompute is false"
+        );
+
+        let (x, y) = raw_dual_gap_fixture();
+
+        let default_fit = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y)?;
+        let explicit_direct = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_precompute(false)
+            .fit(&x, &y)?;
+
+        assert_eq!(
+            default_fit.coefficients(),
+            explicit_direct.coefficients(),
+            "explicit precompute=false must be byte-identical to the default"
+        );
+        assert_eq!(default_fit.intercept(), explicit_direct.intercept());
+        Ok(())
+    }
+
+    #[test]
+    fn enet_precompute_equals_direct() -> Result<(), FerroError> {
+        // The Gram path reaches the SAME unique optimum as the direct path,
+        // via different (reassociated) arithmetic — coef within 1e-6.
+        let (x, y) = raw_dual_gap_fixture();
+
+        let direct = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_precompute(false)
+            .fit(&x, &y)?;
+        let gram = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_precompute(true)
+            .fit(&x, &y)?;
+
+        assert_relative_eq!(
+            gram.coefficients()[0],
+            direct.coefficients()[0],
+            epsilon = 1e-6
+        );
+        assert_relative_eq!(
+            gram.coefficients()[1],
+            direct.coefficients()[1],
+            epsilon = 1e-6
+        );
+        Ok(())
     }
 }
