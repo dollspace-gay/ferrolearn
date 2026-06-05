@@ -966,6 +966,12 @@ design = ".design/datasets/covtype.md"
 parity_ops = ["fetch_covtype"]
 
 [[route]]
+crate_pattern = "ferrolearn-fetch/src/newsgroups.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_twenty_newsgroups.py"]
+design = ".design/datasets/newsgroups.md"
+parity_ops = ["fetch_20newsgroups"]
+
+[[route]]
 crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
 upstream = [
   "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
