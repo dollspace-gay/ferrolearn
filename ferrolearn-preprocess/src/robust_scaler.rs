@@ -20,7 +20,7 @@
 //! | REQ-3 InsufficientSamples / ShapeMismatch error contracts | SHIPPED | `fit` / `transform` guards; sklearn `_data.py:1658-1666` |
 //! | REQ-11 PyO3 binding (`_RsRobustScaler`) | SHIPPED | `ferrolearn-python/src/extras.rs:1163`, `lib.rs:83` |
 //! | REQ-4 quantile_range ctor param + validation | SHIPPED (#1249) | `RobustScaler::quantile_range` field (default `(25,75)`) + `with_quantile_range` validating builder (non-strict `0 <= q_min <= q_max <= 100`, matching sklearn's `if not 0 <= q_min <= q_max <= 100`); `fit` uses `Q(q_max_frac) − Q(q_min_frac)`; sklearn `_data.py:1567`,`:1604-1606`,`:1630` |
-//! | REQ-5 with_centering / with_scaling ctor params | NOT-STARTED (#1250) | sklearn `_data.py:1672-1675`,`:1616`,`:1640` |
+//! | REQ-5 with_centering / with_scaling ctor params | SHIPPED (#1250) | `RobustScaler::with_centering`/`with_scaling` fields (default `true`) + `with_with_centering`/`with_with_scaling` builders, threaded into `FittedRobustScaler`; `transform` is conditional `if with_centering: X -= center_` then `if with_scaling: X /= scale_`, mirroring sklearn `_data.py:1672-1675`,`:1616`,`:1640`. R-DEV-4: ferrolearn always materializes `median`/`iqr`; sklearn nulls `center_`/`scale_` when the flag is `False` (flags govern transform APPLICATION so OUTPUT matches sklearn exactly). |
 //! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
 //! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
 //! | REQ-8 `robust_scale` free function + axis | NOT-STARTED (#1253) | sklearn `_data.py:1719` |
@@ -92,6 +92,20 @@ pub struct RobustScaler<F> {
     /// `(25.0, 75.0)` (the interquartile range), mirroring sklearn
     /// `RobustScaler(quantile_range=(25.0, 75.0))` (`_data.py:1567`).
     pub quantile_range: (F, F),
+    /// Whether to center the data (subtract the per-column median) on transform.
+    ///
+    /// Mirrors sklearn `RobustScaler(with_centering=True)` (`_data.py:1616`):
+    /// when `false`, [`Transform::transform`] does NOT subtract the median
+    /// (`if self.with_centering: X -= self.center_`, `_data.py:1672-1673`).
+    /// Default `true`.
+    pub with_centering: bool,
+    /// Whether to scale the data (divide by the per-column IQR) on transform.
+    ///
+    /// Mirrors sklearn `RobustScaler(with_scaling=True)` (`_data.py:1640`):
+    /// when `false`, [`Transform::transform`] does NOT divide by the scale
+    /// (`if self.with_scaling: X /= self.scale_`, `_data.py:1674-1675`).
+    /// Default `true`.
+    pub with_scaling: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -106,8 +120,34 @@ impl<F: Float + Send + Sync + 'static> RobustScaler<F> {
         let q_max = F::from(75.0).unwrap_or_else(|| F::from(75u8).unwrap_or_else(F::zero));
         Self {
             quantile_range: (q_min, q_max),
+            with_centering: true,
+            with_scaling: true,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set whether to center (subtract the median) on transform, returning the
+    /// reconfigured scaler.
+    ///
+    /// Mirrors sklearn's `with_centering` constructor parameter
+    /// (`_data.py:1616`): `false` disables centering
+    /// (`if self.with_centering: X -= self.center_`, `_data.py:1672-1673`).
+    #[must_use]
+    pub fn with_with_centering(mut self, with_centering: bool) -> Self {
+        self.with_centering = with_centering;
+        self
+    }
+
+    /// Set whether to scale (divide by the IQR) on transform, returning the
+    /// reconfigured scaler.
+    ///
+    /// Mirrors sklearn's `with_scaling` constructor parameter (`_data.py:1640`):
+    /// `false` disables scaling
+    /// (`if self.with_scaling: X /= self.scale_`, `_data.py:1674-1675`).
+    #[must_use]
+    pub fn with_with_scaling(mut self, with_scaling: bool) -> Self {
+        self.with_scaling = with_scaling;
+        self
     }
 
     /// Set the `(q_min, q_max)` percentile pair used to compute the per-column
@@ -151,12 +191,33 @@ impl<F: Float + Send + Sync + 'static> Default for RobustScaler<F> {
 /// A fitted robust scaler holding per-column medians and IQRs.
 ///
 /// Created by calling [`Fit::fit`] on a [`RobustScaler`].
+///
+/// # Deviation (R-DEV-4): fitted attributes are always materialized
+///
+/// sklearn sets `center_` / `scale_` to `None` when the corresponding flag
+/// (`with_centering` / `with_scaling`) is `False` (`_data.py:1616`,`:1640`).
+/// ferrolearn always materializes `median`/`iqr` regardless of the flags,
+/// because the `&Array1<F>` getters cannot return `None` without changing their
+/// return type. The `with_centering`/`with_scaling` flags instead govern
+/// *application* in [`Transform::transform`] (`if with_centering: X -= center_`,
+/// `if with_scaling: X /= scale_`, `_data.py:1672-1675`), so the transform
+/// OUTPUT matches sklearn exactly. The getters are intentionally NOT `Option`.
 #[derive(Debug, Clone)]
 pub struct FittedRobustScaler<F> {
     /// Per-column medians learned during fitting.
     pub(crate) median: Array1<F>,
     /// Per-column interquartile ranges (Q75 − Q25) learned during fitting.
     pub(crate) iqr: Array1<F>,
+    /// Whether `transform` centers (subtracts the median).
+    ///
+    /// Copied from the unfitted [`RobustScaler::with_centering`] in [`Fit::fit`];
+    /// governs `if with_centering: X -= center_` (`_data.py:1672-1673`).
+    pub(crate) with_centering: bool,
+    /// Whether `transform` scales (divides by the IQR).
+    ///
+    /// Copied from the unfitted [`RobustScaler::with_scaling`] in [`Fit::fit`];
+    /// governs `if with_scaling: X /= scale_` (`_data.py:1674-1675`).
+    pub(crate) with_scaling: bool,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
@@ -222,6 +283,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         Ok(FittedRobustScaler {
             median: median_arr,
             iqr: iqr_arr,
+            with_centering: self.with_centering,
+            with_scaling: self.with_scaling,
         })
     }
 }
@@ -261,8 +324,17 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
             // effective scale (`X /= scale_`, `:1675`), so a constant column maps to 0
             // and a non-constant zero-IQR column maps to `x - median`.
             let scale_eff = if iqr == F::zero() { F::one() } else { iqr };
+            // Conditional center/scale mirroring sklearn `transform`
+            // (`_data.py:1672-1675`): `if with_centering: X -= center_` then
+            // `if with_scaling: X /= scale_`. When `with_centering && with_scaling`
+            // this is byte-identical to the prior path.
             for v in &mut col {
-                *v = (*v - med) / scale_eff;
+                if self.with_centering {
+                    *v = *v - med;
+                }
+                if self.with_scaling {
+                    *v = *v / scale_eff;
+                }
             }
         }
         Ok(out)
@@ -518,6 +590,107 @@ mod tests {
         // Row with col0 == 1 (i = 0): (1 - 5.5) / 1 = -4.5; (100 - 550) / 1 = -450.
         assert_abs_diff_eq!(scaled[[0, 0]], -4.5, epsilon = 1e-9);
         assert_abs_diff_eq!(scaled[[0, 1]], -450.0, epsilon = 1e-9);
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-5: with_centering / with_scaling constructor parameters
+    // (sklearn _data.py:1616, :1640, :1672-1675). Live sklearn 1.5.2 oracle
+    // (R-CHAR-3), X col0 = [1,3,5,7,9], col1 = [100,300,500,700,900] (5 rows):
+    //   center_ = [5, 500], scale_ = [4, 400].
+    //   RobustScaler(with_centering=True,  with_scaling=True ).transform(X[:2])
+    //     -> [[-1, -1], [-0.5, -0.5]]
+    //   RobustScaler(with_centering=True,  with_scaling=False).transform(X[:2])
+    //     -> [[-4, -400], [-2, -200]]    (center only)
+    //   RobustScaler(with_centering=False, with_scaling=True ).transform(X[:2])
+    //     -> [[0.25, 0.25], [0.75, 0.75]] (scale only)
+    //   RobustScaler(with_centering=False, with_scaling=False).transform(X[:2])
+    //     -> [[1, 100], [3, 300]]         (identity)
+    // -----------------------------------------------------------------------
+
+    fn oracle_x() -> Array2<f64> {
+        array![
+            [1.0, 100.0],
+            [3.0, 300.0],
+            [5.0, 500.0],
+            [7.0, 700.0],
+            [9.0, 900.0]
+        ]
+    }
+
+    /// Default (with_centering=true, with_scaling=true) matches the live sklearn
+    /// oracle AND is byte-identical to a pre-existing default fit.
+    #[test]
+    fn robust_with_centering_scaling_default_matches_sklearn() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let fitted = RobustScaler::<f64>::new().fit(&x, &())?;
+        let head = x.slice(ndarray::s![0..2, ..]).to_owned();
+        let scaled = fitted.transform(&head)?;
+
+        let expected = array![[-1.0, -1.0], [-0.5, -0.5]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+
+        // Regression guard: default config must be BYTE-identical to a plain
+        // default fit produced the same way.
+        let default_fitted = RobustScaler::<f64>::new().fit(&x, &())?;
+        let default_scaled = default_fitted.transform(&head)?;
+        for (a, b) in scaled.iter().zip(default_scaled.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        Ok(())
+    }
+
+    /// `with_with_scaling(false)` (T,F) centers only.
+    #[test]
+    fn robust_with_scaling_false() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let fitted = RobustScaler::<f64>::new()
+            .with_with_scaling(false)
+            .fit(&x, &())?;
+        let head = x.slice(ndarray::s![0..2, ..]).to_owned();
+        let scaled = fitted.transform(&head)?;
+
+        let expected = array![[-4.0, -400.0], [-2.0, -200.0]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// `with_with_centering(false)` (F,T) scales only.
+    #[test]
+    fn robust_with_centering_false() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let fitted = RobustScaler::<f64>::new()
+            .with_with_centering(false)
+            .fit(&x, &())?;
+        let head = x.slice(ndarray::s![0..2, ..]).to_owned();
+        let scaled = fitted.transform(&head)?;
+
+        let expected = array![[0.25, 0.25], [0.75, 0.75]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// Both `false` (F,F) is the identity.
+    #[test]
+    fn robust_both_false_identity() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let fitted = RobustScaler::<f64>::new()
+            .with_with_centering(false)
+            .with_with_scaling(false)
+            .fit(&x, &())?;
+        let head = x.slice(ndarray::s![0..2, ..]).to_owned();
+        let scaled = fitted.transform(&head)?;
+
+        let expected = array![[1.0, 100.0], [3.0, 300.0]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-12);
+        }
         Ok(())
     }
 }
