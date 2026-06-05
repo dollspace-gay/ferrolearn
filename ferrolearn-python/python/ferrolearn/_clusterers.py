@@ -2,7 +2,7 @@
 
 import numpy as np
 from sklearn.base import BaseEstimator, ClusterMixin, TransformerMixin
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import _RsKMeans
 
@@ -39,7 +39,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         self.random_state = random_state
 
     def fit(self, X, y=None):
-        X = validate_data(self, X, dtype="float64")
+        X = self._validate_data(X, dtype="float64")
         self._rs = _RsKMeans(
             n_clusters=self.n_clusters,
             max_iter=self.max_iter,
@@ -57,7 +57,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -65,7 +65,7 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()

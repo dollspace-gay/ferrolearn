@@ -5,7 +5,7 @@ import re
 import numpy as np
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.multiclass import type_of_target
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
     _RsDecisionTreeClassifier,
@@ -105,7 +105,7 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64")
+        X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
@@ -133,7 +133,7 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -142,7 +142,7 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
 
     def predict_proba(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -170,7 +170,7 @@ class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
         self.min_samples_leaf = min_samples_leaf
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64")
+        X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
@@ -193,7 +193,7 @@ class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -202,7 +202,7 @@ class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
 
     def predict_proba(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -242,7 +242,7 @@ class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
         self.random_state = random_state
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64")
+        X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
@@ -269,7 +269,7 @@ class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -290,7 +290,7 @@ class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimato
         self.n_neighbors = n_neighbors
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64")
+        X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
@@ -305,7 +305,7 @@ class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimato
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -326,7 +326,7 @@ class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
         self.var_smoothing = var_smoothing
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64")
+        X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
@@ -341,7 +341,7 @@ class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
@@ -350,7 +350,7 @@ class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
 
     def predict_proba(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if not hasattr(self, "_rs"):
             self._rebuild_rs()

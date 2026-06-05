@@ -4,7 +4,7 @@ import re
 
 import numpy as np
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
     _RsElasticNet,
@@ -57,7 +57,7 @@ class LinearRegression(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64", y_numeric=True)
+        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsLinearRegression(fit_intercept=self.fit_intercept)
         _fit_rust(self._rs, X, y)
@@ -67,7 +67,7 @@ class LinearRegression(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))
@@ -98,7 +98,7 @@ class Ridge(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64", y_numeric=True)
+        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsRidge(alpha=self.alpha, fit_intercept=self.fit_intercept)
         _fit_rust(self._rs, X, y)
@@ -108,7 +108,7 @@ class Ridge(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))
@@ -145,7 +145,7 @@ class Lasso(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64", y_numeric=True)
+        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsLasso(
             alpha=self.alpha,
@@ -161,7 +161,7 @@ class Lasso(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))
@@ -203,7 +203,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = validate_data(self, X, y, dtype="float64", y_numeric=True)
+        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsElasticNet(
             alpha=self.alpha,
@@ -220,7 +220,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))

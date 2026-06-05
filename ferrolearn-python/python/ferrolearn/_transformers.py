@@ -4,7 +4,7 @@ import re
 
 import numpy as np
 from sklearn.base import BaseEstimator, TransformerMixin
-from sklearn.utils.validation import check_is_fitted, validate_data
+from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import _RsPCA, _RsStandardScaler
 
@@ -44,7 +44,7 @@ class StandardScaler(TransformerMixin, BaseEstimator):
         self.with_std = with_std
 
     def fit(self, X, y=None):
-        X = validate_data(self, X, dtype="float64", accept_sparse=False)
+        X = self._validate_data(X, dtype="float64", accept_sparse=False)
         self._rs = _RsStandardScaler()
         _fit_rust(self._rs, _ensure_f64(X))
         self.mean_ = np.array(self._rs.mean_)
@@ -56,7 +56,7 @@ class StandardScaler(TransformerMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.transform(X))
@@ -107,7 +107,7 @@ class PCA(TransformerMixin, BaseEstimator):
         self.n_components = n_components
 
     def fit(self, X, y=None):
-        X = validate_data(self, X, dtype="float64")
+        X = self._validate_data(X, dtype="float64")
         self._rs = _RsPCA(n_components=self.n_components)
         _fit_rust(self._rs, _ensure_f64(X))
         self.components_ = np.array(self._rs.components_)
@@ -120,7 +120,7 @@ class PCA(TransformerMixin, BaseEstimator):
 
     def transform(self, X):
         check_is_fitted(self)
-        X = validate_data(self, X, reset=False, dtype="float64")
+        X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
         if hasattr(self, "_rs"):
             return np.array(self._rs.transform(X))
