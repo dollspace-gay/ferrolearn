@@ -1230,3 +1230,11 @@ upstream = [
 ]
 design = ".design/numerical/distributions.md"
 parity_ops = ["norm", "chi2", "f", "t", "beta", "gamma", "dirichlet", "chi2_sf", "f_sf", "norm_sf"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/integrate.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/integrate/__init__.py",
+]
+design = ".design/numerical/integrate.md"
+parity_ops = ["quad", "fixed_quad"]

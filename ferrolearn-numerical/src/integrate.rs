@@ -9,6 +9,28 @@
 //!   Gauss-Legendre nodes and weights. Orders 1--10 use hardcoded tables;
 //!   orders 11--20 are computed on-the-fly via the Golub-Welsch algorithm.
 //!
+//! ## REQ status
+//!
+//! Mirrors `scipy.integrate` quadrature (`scipy/integrate/__init__.py`; live oracle
+//! scipy 1.17 + numpy `leggauss`, deterministic). Design doc:
+//! `.design/numerical/integrate.md` (9 REQs). Every REQ is BINARY (R-DEFER-2):
+//! SHIPPED or NOT-STARTED (with a concrete blocker). Values are oracle-verified
+//! element-wise (R-CHAR-3) — see `tests/divergence_integrate.rs`.
+//!
+//! **3 SHIPPED / 6 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (`gauss_legendre` value parity, orders 1–20) | SHIPPED | matches the unique n-point Gauss-Legendre rule (numpy `leggauss` / `scipy.integrate.fixed_quad`) for EVERY n in 1..=20 — both the hardcoded order-1..10 tables and the Golub-Welsch order-11..20 path — max abs diff ≤1.11e-15 (exp on 0..1) / 2.00e-15 (cos on 0..2). Guards `gauss_legendre_{exp,cos}_all_orders_match_leggauss`. |
+//! | REQ-2 (`gauss_legendre_composite`) | SHIPPED | per-panel GL sum; `composite(sin,0,π,5,10)=2.0` (diff 0.0). Guard `gauss_legendre_composite_sin_matches_true_two`. |
+//! | REQ-3 (`quad` value convergence) | SHIPPED | adaptive Simpson + Richardson converges to the true integral = `scipy.integrate.quad`'s value within `tol` (exp diff 6.7e-16, sin 8.9e-16, arctan 1.7e-14 at tol=1e-10) — value-to-tolerance, not bit-exact with QUADPACK. Guards `quad_*_converges_to_scipy_value`. |
+//! | REQ-4 (`quad` API / return contract) | NOT-STARTED | scipy.integrate.quad returns `(value, abserr)` + epsabs/epsrel/limit/points/weight; `fixed_quad` needs a vectorized func. ferrolearn `quad(f,a,b,tol)→QuadratureResult`, `gauss_legendre` scalar `Fn`. Blocker #1972. |
+//! | REQ-5 (missing scipy.integrate fns) | NOT-STARTED | no `trapezoid`/`simpson`/`romberg`/`cumulative_*`/`newton_cotes`/`dblquad`/`quad_vec` + ODE family (solve_ivp/odeint/RK45). Blocker #1973. |
+//! | REQ-6 (infinite bounds / singularities / weights) | NOT-STARTED | only finite smooth `[a,b]`; `±inf` → nan, no `points=`/`weight=` (scipy qagi → √π). Blocker #1974. |
+//! | REQ-7 (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`; `quad` has no error channel. Blocker #1975. |
+//! | REQ-8 (production consumer) | NOT-STARTED | no non-test caller (standalone module). Blocker #1976. |
+//! | REQ-9 (ferray substrate) | NOT-STARTED | hand-rolled Golub-Welsch QR eigensolver vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1977. |
+//!
 //! # Examples
 //!
 //! ```
