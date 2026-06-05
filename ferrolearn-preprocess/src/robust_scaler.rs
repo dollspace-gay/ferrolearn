@@ -23,7 +23,7 @@
 //! | REQ-5 with_centering / with_scaling ctor params | SHIPPED (#1250) | `RobustScaler::with_centering`/`with_scaling` fields (default `true`) + `with_with_centering`/`with_with_scaling` builders, threaded into `FittedRobustScaler`; `transform` is conditional `if with_centering: X -= center_` then `if with_scaling: X /= scale_`, mirroring sklearn `_data.py:1672-1675`,`:1616`,`:1640`. R-DEV-4: ferrolearn always materializes `median`/`iqr`; sklearn nulls `center_`/`scale_` when the flag is `False` (flags govern transform APPLICATION so OUTPUT matches sklearn exactly). |
 //! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
 //! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
-//! | REQ-8 `robust_scale` free function + axis | NOT-STARTED (#1253) | sklearn `_data.py:1719` |
+//! | REQ-8 `robust_scale` free function + axis | SHIPPED (#1253) | `robust_scale` free fn delegating to `RobustScaler` (`axis=0` native, `axis=1` transpose→fit_transform→transpose); sklearn `_data.py:1719`,`:1845-1848` |
 //! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | NOT-STARTED (#1254) | sklearn `_data.py:1601`,`:1614`,`:1630` |
 //! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | NOT-STARTED (#1255) | sklearn `_data.py:1505-1514`,`:1635` |
 //! | REQ-12 copy ctor param + in-place semantics | NOT-STARTED (#1256) | sklearn `_data.py:1568`,`:1661` |
@@ -374,6 +374,65 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for RobustScaler<
 }
 
 // ---------------------------------------------------------------------------
+// robust_scale (free function)
+// ---------------------------------------------------------------------------
+
+/// Standardize a dataset along an axis by centering to the median and scaling
+/// by the interquartile range — the functional form of [`RobustScaler`].
+///
+/// This is the translation of scikit-learn's `robust_scale`
+/// (`sklearn/preprocessing/_data.py:1719`). It delegates to [`RobustScaler`]
+/// rather than reimplementing the quantile math:
+///
+/// - `axis == 0` (default in sklearn): independently scale each FEATURE/column —
+///   the estimator's native behavior, `s.fit_transform(X)` (`_data.py:1846`).
+/// - `axis == 1`: independently scale each SAMPLE/row by transposing first,
+///   running the column-wise scaler, then transposing back —
+///   `s.fit_transform(X.T).T` (`_data.py:1848`).
+///
+/// sklearn's `unit_variance` (#1251) and `copy` (#1256) parameters are NOT
+/// exposed here; they are tracked as separate REQs.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `axis` is not `0` or `1`, if the
+/// `quantile_range` is invalid (propagated from
+/// [`RobustScaler::with_quantile_range`]), or [`FerroError::InsufficientSamples`]
+/// if the input (or its transpose, for `axis == 1`) has zero rows.
+#[must_use = "robust_scale returns the scaled array; use the returned value"]
+pub fn robust_scale<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    axis: usize,
+    with_centering: bool,
+    with_scaling: bool,
+    quantile_range: (F, F),
+) -> Result<Array2<F>, FerroError> {
+    if axis != 0 && axis != 1 {
+        return Err(FerroError::InvalidParameter {
+            name: "axis".into(),
+            reason: "must be 0 or 1".into(),
+        });
+    }
+
+    let scaler = RobustScaler::new()
+        .with_with_centering(with_centering)
+        .with_with_scaling(with_scaling)
+        .with_quantile_range(quantile_range.0, quantile_range.1)?;
+
+    if axis == 0 {
+        // Column-wise = the estimator's native behavior (`_data.py:1846`).
+        let fitted = scaler.fit(x, &())?;
+        fitted.transform(x)
+    } else {
+        // axis == 1: sklearn's `s.fit_transform(X.T).T` (`_data.py:1848`).
+        let xt = x.t().to_owned();
+        let fitted = scaler.fit(&xt, &())?;
+        let result = fitted.transform(&xt)?;
+        Ok(result.t().to_owned())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline integration (generic)
 // ---------------------------------------------------------------------------
 
@@ -692,5 +751,98 @@ mod tests {
             assert_abs_diff_eq!(a, b, epsilon = 1e-12);
         }
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-8: robust_scale free function + axis (sklearn _data.py:1719,
+    // :1845-1848). Live sklearn 1.5.2 oracle (R-CHAR-3), computed from /tmp,
+    // never copied from the ferrolearn side.
+    //
+    // Oracle X: col0 = [1,3,5,7,9], col1 = [100,300,500,700,900] (5 rows).
+    //   from sklearn.preprocessing import robust_scale
+    //   robust_scale(X, axis=0).tolist()
+    //     -> [[-1,-1],[-0.5,-0.5],[0,0],[0.5,0.5],[1,1]]
+    //   robust_scale(X, axis=0, with_centering=False).tolist()
+    //     -> [[0.25,0.25],[0.75,0.75],[1.25,1.25],[1.75,1.75],[2.25,2.25]]
+    //   robust_scale([[1,2,3,4,5]], axis=1).tolist()
+    //     -> [[-1,-0.5,0,0.5,1]]
+    //   robust_scale(X, axis=0, quantile_range=(10.,90.)).tolist()
+    //     -> [[-0.625,-0.625],[-0.3125,-0.3125],[0,0],[0.3125,0.3125],[0.625,0.625]]
+    // -----------------------------------------------------------------------
+
+    /// `robust_scale(X, axis=0)` (defaults) matches the live sklearn oracle.
+    #[test]
+    fn robust_scale_axis0_default_matches_sklearn() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let scaled = robust_scale(&x, 0, true, true, (25.0, 75.0))?;
+        let expected = array![
+            [-1.0, -1.0],
+            [-0.5, -0.5],
+            [0.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 1.0]
+        ];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// `robust_scale(X, axis=0, with_centering=False)` scales only.
+    #[test]
+    fn robust_scale_no_centering_matches_sklearn() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let scaled = robust_scale(&x, 0, false, true, (25.0, 75.0))?;
+        let expected = array![
+            [0.25, 0.25],
+            [0.75, 0.75],
+            [1.25, 1.25],
+            [1.75, 1.75],
+            [2.25, 2.25]
+        ];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// `robust_scale(row, axis=1)` scales each sample/row (transpose path).
+    #[test]
+    fn robust_scale_axis1_matches_sklearn() -> Result<(), FerroError> {
+        let row = array![[1.0, 2.0, 3.0, 4.0, 5.0]];
+        let scaled = robust_scale(&row, 1, true, true, (25.0, 75.0))?;
+        let expected = array![[-1.0, -0.5, 0.0, 0.5, 1.0]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// `robust_scale(X, axis=0, quantile_range=(10,90))` matches the oracle.
+    #[test]
+    fn robust_scale_quantile_range_matches_sklearn() -> Result<(), FerroError> {
+        let x = oracle_x();
+        let scaled = robust_scale(&x, 0, true, true, (10.0, 90.0))?;
+        let expected = array![
+            [-0.625, -0.625],
+            [-0.3125, -0.3125],
+            [0.0, 0.0],
+            [0.3125, 0.3125],
+            [0.625, 0.625]
+        ];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// An out-of-range `axis` returns [`FerroError::InvalidParameter`].
+    #[test]
+    fn robust_scale_invalid_axis_errors() {
+        let x = oracle_x();
+        assert!(matches!(
+            robust_scale(&x, 2, true, true, (25.0, 75.0)),
+            Err(FerroError::InvalidParameter { .. })
+        ));
     }
 }
