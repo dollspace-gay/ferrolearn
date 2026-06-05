@@ -396,30 +396,36 @@ impl FittedOneVsOneClassifier {
     pub fn n_estimators(&self) -> usize {
         self.estimators.len()
     }
-}
 
-impl Predict<Array2<f64>> for FittedOneVsOneClassifier {
-    type Output = Array1<usize>;
-    type Error = FerroError;
-
-    /// Predict class labels using majority voting.
+    /// Compute the one-vs-one decision function.
     ///
-    /// For each sample, every pairwise classifier votes for one of its two
-    /// classes. The score determines which class receives the vote: if the
-    /// score exceeds 0.5, the vote goes to class i; otherwise to class j.
-    /// The class with the most votes is predicted.
+    /// Ports scikit-learn's `_ovr_decision_function`
+    /// (`sklearn/utils/multiclass.py:540-562`): for each pairwise classifier
+    /// `(cls_i, cls_j)` with `cls_i < cls_j`, ferrolearn trains `cls_i` as the
+    /// positive (`1.0`) class, so the base score `s` favors `cls_i` (higher `s`
+    /// ⇒ more `cls_i`). The sklearn-convention confidence (positive favoring the
+    /// higher class `cls_j`) is therefore `conf = 0.5 - s`. Each sample casts an
+    /// integer vote for `cls_i` when `s > 0.5`, else for `cls_j`, and the summed
+    /// confidence is accumulated with `sum_of_confidences[i] -= conf`,
+    /// `sum_of_confidences[j] += conf`. The result is
+    /// `votes + sum_of_confidences / (3 * (|sum_of_confidences| + 1))`, where the
+    /// confidence term lies in `(-1/3, 1/3)` so it breaks vote ties without
+    /// overriding a ≥1-vote margin.
+    ///
+    /// Returns an `Array2<f64>` of shape `(n_samples, n_classes)`.
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError`] if any pairwise classifier fails to predict.
-    fn predict(&self, x: &Array2<f64>) -> Result<Array1<usize>, FerroError> {
+    /// Returns [`FerroError`] if any pairwise classifier fails to predict, or if
+    /// a stored pair references a class missing from `classes`.
+    pub fn decision_function(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
 
-        // Vote matrix: votes[sample][class_index]
-        let mut votes = vec![vec![0u32; n_classes]; n_samples];
+        let mut votes = Array2::<f64>::zeros((n_samples, n_classes));
+        let mut sum_of_confidences = Array2::<f64>::zeros((n_samples, n_classes));
 
-        // Map class label -> index for vote accumulation.
+        // Map class label -> index for accumulation.
         let class_to_idx: std::collections::HashMap<usize, usize> = self
             .classes
             .iter()
@@ -427,29 +433,83 @@ impl Predict<Array2<f64>> for FittedOneVsOneClassifier {
             .map(|(i, &c)| (c, i))
             .collect();
 
+        // Iterate stored pairs in their existing (cls_i < cls_j) order, which
+        // matches sklearn's `for i: for j in i+1..` ordering.
         for (cls_i, cls_j, est) in &self.estimators {
             let preds = est.predict(x)?;
-            let idx_i = class_to_idx[cls_i];
-            let idx_j = class_to_idx[cls_j];
+            let idx_i = *class_to_idx
+                .get(cls_i)
+                .ok_or_else(|| FerroError::InvalidParameter {
+                    name: "estimators".into(),
+                    reason: "OneVsOneClassifier::decision_function: pair class i not in classes"
+                        .into(),
+                })?;
+            let idx_j = *class_to_idx
+                .get(cls_j)
+                .ok_or_else(|| FerroError::InvalidParameter {
+                    name: "estimators".into(),
+                    reason: "OneVsOneClassifier::decision_function: pair class j not in classes"
+                        .into(),
+                })?;
 
             for s in 0..n_samples {
+                // sklearn-convention confidence: positive favors the higher
+                // class (cls_j), negative favors the lower class (cls_i).
+                let conf = 0.5 - preds[s];
+                sum_of_confidences[[s, idx_i]] -= conf;
+                sum_of_confidences[[s, idx_j]] += conf;
+
                 if preds[s] > 0.5 {
-                    votes[s][idx_i] += 1;
+                    votes[[s, idx_i]] += 1.0;
                 } else {
-                    votes[s][idx_j] += 1;
+                    votes[[s, idx_j]] += 1.0;
                 }
             }
         }
 
-        // Select the class with the most votes for each sample.
+        // Monotonically transform sum_of_confidences into (-1/3, 1/3) and add
+        // it to the integer votes. The (-1/3, 1/3) bound guarantees the
+        // confidence term cannot overturn a decision made by a ≥1-vote margin.
+        let transformed = &sum_of_confidences / &(3.0 * (sum_of_confidences.mapv(f64::abs) + 1.0));
+        Ok(votes + transformed)
+    }
+}
+
+impl Predict<Array2<f64>> for FittedOneVsOneClassifier {
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    /// Predict class labels via the votes-plus-confidence decision function.
+    ///
+    /// Each sample is scored by [`decision_function`](Self::decision_function),
+    /// which mirrors scikit-learn's `_ovr_decision_function`: every pairwise
+    /// classifier casts an integer vote (score `> 0.5` ⇒ the lower class,
+    /// otherwise the higher class) and contributes a summed-confidence term in
+    /// `(-1/3, 1/3)` that breaks vote ties without overriding a ≥1-vote margin.
+    /// The predicted class is the `argmax` of that decision row, resolved
+    /// FIRST-on-tie to match NumPy's `np.argmax` (sklearn OvO `predict` is
+    /// `classes_[decision_function(X).argmax(axis=1)]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] if any pairwise classifier fails to predict.
+    fn predict(&self, x: &Array2<f64>) -> Result<Array1<usize>, FerroError> {
+        let dec = self.decision_function(x)?;
+        let n_samples = x.nrows();
+
         let mut predictions = Vec::with_capacity(n_samples);
-        for sample_votes in &votes {
-            let best_idx = sample_votes
-                .iter()
-                .enumerate()
-                .max_by_key(|&(_, v)| *v)
-                .map(|(k, _)| k)
-                .unwrap_or(0);
+        for s in 0..n_samples {
+            let row = dec.row(s);
+            // np.argmax: FIRST-on-tie. Replace the running best only on a
+            // STRICT improvement so the lowest index wins exact ties.
+            let mut best_idx = 0;
+            let mut best_val = row[0];
+            for (k, &v) in row.iter().enumerate().skip(1) {
+                if v > best_val {
+                    best_val = v;
+                    best_idx = k;
+                }
+            }
             predictions.push(self.classes[best_idx]);
         }
 

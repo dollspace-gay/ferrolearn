@@ -360,7 +360,6 @@ fn ovr_ovo_clean_case_end_to_end_agree() {
 ///
 /// Tracking: #1819 (doc REQ-OVO-DECISION planned #1812)
 #[test]
-#[ignore = "divergence: OvO predict lacks _ovr_decision_function confidence tie-break; tracking #1819"]
 fn ovo_predict_confidence_tiebreak_diverges() {
     // Column 0 is an arbitrary feature; column 1 encodes the per-class value
     // that produces the target per-pair mean score (see doc comment).
