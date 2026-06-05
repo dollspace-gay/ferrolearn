@@ -1304,3 +1304,11 @@ upstream = [
 ]
 design = ".design/python/conversions.md"
 parity_ops = ["check_array", "numpy_interop"]
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/clusterers.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/cluster/_kmeans.py",
+]
+design = ".design/python/clusterers.md"
+parity_ops = ["KMeans"]

@@ -23,14 +23,15 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         Maximum number of iterations.
     tol : float, default=1e-4
         Relative tolerance for convergence.
-    n_init : int, default=10
-        Number of initializations to run.
+    n_init : 'auto' or int, default='auto'
+        Number of initializations to run. When ``n_init='auto'``, the number of
+        runs is 1 for the default ``init='k-means++'``.
     random_state : int or None, default=None
         Random seed for reproducibility.
     """
 
     def __init__(
-        self, *, n_clusters=8, max_iter=300, tol=1e-4, n_init=10, random_state=None
+        self, n_clusters=8, *, max_iter=300, tol=1e-4, n_init="auto", random_state=None
     ):
         self.n_clusters = n_clusters
         self.max_iter = max_iter
@@ -40,11 +41,15 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
 
     def fit(self, X, y=None):
         X = self._validate_data(X, dtype="float64")
+        # sklearn keeps n_init='auto' verbatim and resolves it at fit time
+        # (sklearn/cluster/_kmeans.py:1240-1243): 'auto' -> 1 for the default
+        # init='k-means++' (the only init ferrolearn_cluster supports).
+        n_init = 1 if self.n_init == "auto" else self.n_init
         self._rs = _RsKMeans(
             n_clusters=self.n_clusters,
             max_iter=self.max_iter,
             tol=self.tol,
-            n_init=self.n_init,
+            n_init=n_init,
             random_state=self.random_state,
         )
         self._rs.fit(_ensure_f64(X))
@@ -72,11 +77,12 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
         return np.array(self._rs.transform(X))
 
     def _rebuild_rs(self):
+        n_init = 1 if self.n_init == "auto" else self.n_init
         self._rs = _RsKMeans(
             n_clusters=self.n_clusters,
             max_iter=self.max_iter,
             tol=self.tol,
-            n_init=self.n_init,
+            n_init=n_init,
             random_state=self.random_state,
         )
         self._rs.fit(_ensure_f64(self._fit_X))
