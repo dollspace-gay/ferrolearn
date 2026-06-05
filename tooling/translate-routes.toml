@@ -960,6 +960,12 @@ design = ".design/datasets/openml.md"
 parity_ops = ["fetch_openml"]
 
 [[route]]
+crate_pattern = "ferrolearn-fetch/src/covtype.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_covtype.py"]
+design = ".design/datasets/covtype.md"
+parity_ops = ["fetch_covtype"]
+
+[[route]]
 crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
 upstream = [
   "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
