@@ -18,6 +18,35 @@
 //! | [`ProductKernel`] | `k = k1 * k2` |
 //!
 //! Kernels can be composed via `+` and `*` operators on `Box<dyn GPKernel<F>>`.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.gaussian_process.kernels` (`kernels.py`, v1.5.2 commit
+//! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (15 REQs). Every REQ is
+//! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GP
+//! kernels are DETERMINISTIC, so the existing kernels' matrix values are directly
+//! oracle-verified element-wise (18 green guards in `tests/divergence_gp_kernels.rs`).
+//! The gaps are missing-feature / prerequisite blockers, not value errors.
+//!
+//! **7 SHIPPED / 8 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (`RBFKernel`) | SHIPPED | `exp(-‖x−x'‖²/(2·length_scale²))` matches `RBF(length_scale)` (`kernels.py:1445`); oracle element-wise <1e-12. |
+//! | REQ-2 (`MaternKernel`, nu ∈ {0.5, 1.5, 2.5}) | SHIPPED | the three closed-form Matern formulas match `Matern(length_scale, nu)` (`:1598`) for the supported nu; oracle <1e-12. (General nu is REQ-10.) |
+//! | REQ-3 (`ConstantKernel`) | SHIPPED | `k = constant_value` matches `ConstantKernel(constant_value)` (`:1184`); oracle. |
+//! | REQ-4 (`DotProductKernel`) | SHIPPED | `k = sigma_0² + x·x'` matches `DotProduct(sigma_0)` (`:2099`); oracle. |
+//! | REQ-5 (`SumKernel` / `ProductKernel`) | SHIPPED | `k1 ± k2` / `k1·k2` element-wise + diagonal match sklearn `Sum`/`Product` (`:796`,`:893`); theta concatenation order (k1 then k2) matches. |
+//! | REQ-6 (log-space `get_params`/`set_params`) | SHIPPED | hyperparameters round-trip in log space, matching sklearn `theta` (e.g. `(RBF(1.5)+White(0.1)).theta == [ln1.5, ln0.1]`); oracle-verified. |
+//! | REQ-7 (production consumer) | SHIPPED | `GaussianProcessRegressor`/`GaussianProcessClassifier` (`gaussian_process.rs`, `gp_classifier.rs`) consume `compute`/`diagonal` in `fit`/`predict`; re-exported via `lib.rs`. |
+//! | REQ-8 (`eval_gradient` / dK/dθ) | NOT-STARTED | trait has `compute`/`diagonal` only; sklearn `__call__(eval_gradient=True)` returns `(K, K_gradient)` shape `(n,n,n_dims)` for the GPR LML optimizer. Blocker #1912. |
+//! | REQ-9 (theta/bounds/Hyperparameter machinery) | NOT-STARTED | no `bounds`/`Hyperparameter`/`fixed`/`n_dims`; only flat log-space params (`:272-358`). Blocker #1913. |
+//! | REQ-10 (Matern general nu) | NOT-STARTED | `compute` falls back to RBF for nu ∉ {0.5,1.5,2.5}; sklearn uses the modified-Bessel general formula + nu=∞→RBF (`:1646-1660`). Oracle `Matern(1.0,3.5)[0,1]=0.5449` vs ferrolearn RBF `0.6065`. Needs a `kv`/`gamma` special function. Blocker #1914. |
+//! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
+//! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
+//! | REQ-13 (missing kernels) | NOT-STARTED | no `RationalQuadratic` (`:1798`), `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). Blocker #1917. |
+//! | REQ-14 (constructor defaults / `Default`) | NOT-STARTED | `new()` requires explicit args; no `Default` matching sklearn's keyword defaults (constant_value=1, sigma_0=1, length_scale=1, nu=1.5, noise_level=1). Blocker #1918. |
+//! | REQ-15 (ferray substrate) | NOT-STARTED | `ndarray` arrays vs `ferray-core` (R-SUBSTRATE-1). Blocker #1919. |
 
 use ndarray::{Array1, Array2};
 use num_traits::Float;

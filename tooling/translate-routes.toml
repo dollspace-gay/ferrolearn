@@ -993,6 +993,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/kernel_approximation.py"]
 design = ".design/kernel/nystroem.md"
 parity_ops = ["Nystroem"]
 
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/gp_kernels.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/kernels.py"]
+design = ".design/kernel/gp_kernels.md"
+parity_ops = ["RBF", "Matern", "ConstantKernel", "WhiteKernel", "DotProduct", "Sum", "Product"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-model-sel (model_selection + compose + multiclass)
 # =====================================================================
