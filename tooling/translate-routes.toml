@@ -1205,3 +1205,11 @@ crate_pattern = "ferrolearn-numerical/src/special.rs"
 upstream = ["/home/doll/.local/lib/python3.13/site-packages/scipy/special/__init__.py"]
 design = ".design/numerical/special.md"
 parity_ops = ["gamma", "gammaln", "digamma", "psi", "beta", "betaln", "erf", "erfc"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/sparse_graph.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/sparse/csgraph/__init__.py",
+]
+design = ".design/numerical/sparse_graph.md"
+parity_ops = ["dijkstra", "connected_components", "minimum_spanning_tree", "shortest_path"]

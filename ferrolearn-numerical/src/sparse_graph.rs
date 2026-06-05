@@ -9,6 +9,30 @@
 //!   (treating the graph as undirected).
 //! - **[`minimum_spanning_tree`]** — Minimum spanning tree via Kruskal's algorithm
 //!   with union-find.
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.sparse.csgraph` (live oracle: installed scipy 1.17; graph
+//! algorithms are deterministic). Design doc: `.design/numerical/sparse_graph.md`
+//! (11 REQs). Every REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a
+//! concrete blocker). Values are oracle-verified element-wise vs the live scipy
+//! (R-CHAR-3) — see `tests/divergence_sparse_graph.rs`.
+//!
+//! **4 SHIPPED / 7 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-DIJ-DIST (`dijkstra` distances) | SHIPPED | single-source distances match `scipy.sparse.csgraph.dijkstra(g, indices=src)` element-wise (oracle row0 `[0,1,3,4]`, `inf` for unreachable). Guards `dijkstra_single_source_matches_scipy`/`dijkstra_disconnected_inf_matches_scipy`. |
+//! | REQ-ALLPAIRS (`dijkstra_all_pairs`) | SHIPPED | matches the full `dijkstra(g)` matrix. Guard `dijkstra_all_pairs_matches_scipy`. |
+//! | REQ-CC-LABELS (`connected_components`) | SHIPPED | `n_components` AND the label array match `scipy.sparse.csgraph.connected_components` (ascending node-discovery order; `{0,1,2}\|{3,4}` → `(2,[0,0,0,1,1])`). Guards `connected_components_labels_match_scipy*`. |
+//! | REQ-MST-REPR (`minimum_spanning_tree`) | SHIPPED | FIXED #1948: returns ONE entry per edge in upper-triangular `i<j` orientation (`nnz=n_edges`, entry-sum = MST weight), matching `scipy.sparse.csgraph.minimum_spanning_tree` — was symmetric (both directions, `nnz=2·edges`, sum doubled). Oracle (4-node) `[[0,1,0,0],[0,0,2,0],[0,0,0,3],[0,0,0,0]]`. Pinned by `mst_representation_upper_triangular`. |
+//! | REQ-DIJ-SIG (`dijkstra` signature/flags) | NOT-STARTED | single-source struct vs scipy's `directed`/`indices`/`unweighted`/`limit`/`min_only` (multi-source). Blocker #1949. |
+//! | REQ-PRED-SENTINEL (predecessor sentinel) | NOT-STARTED | `usize::MAX` vs scipy `-9999`. Blocker #1950. |
+//! | REQ-CC-PARAMS (cc directed/connection) | NOT-STARTED | undirected (weak)-only; no `directed`/`connection='strong'`. Blocker #1951. |
+//! | REQ-MISSING-FNS (missing csgraph fns) | NOT-STARTED | no `shortest_path`/`floyd_warshall`/`bellman_ford`/`johnson`/`breadth_first_order`/`depth_first_order`/`laplacian`/`reconstruct_path`/etc. Blocker #1952. |
+//! | REQ-ERR-TYPE (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`/scipy exceptions. Blocker #1953. |
+//! | REQ-CONSUMER (production consumer) | NOT-STARTED | no non-test caller (standalone module; isomap.rs hand-rolls its own dijkstra). Blocker #1954. |
+//! | REQ-FERRAY (ferray substrate) | NOT-STARTED | `sprs::CsMat`+`ndarray` vs ferray's sparse/csgraph analog (R-SUBSTRATE-1). Blocker #1955. |
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
@@ -215,8 +239,12 @@ pub fn connected_components(graph: &CsMat<f64>) -> Result<ConnectedComponentsRes
 /// non-zero entry `(i, j)` with `i < j` is treated as one undirected edge of
 /// the given weight.
 ///
-/// Returns a symmetric CSR matrix containing only the MST edges. If the graph
-/// is disconnected the result is a minimum spanning *forest*.
+/// Returns a CSR matrix with ONE entry per MST edge in upper-triangular
+/// (`i < j`) orientation, so `nnz == n_edges` and the entry-sum equals the MST
+/// weight — matching `scipy.sparse.csgraph.minimum_spanning_tree` (which
+/// returns a directed spanning-tree representation, upper-triangular for a
+/// symmetric input). If the graph is disconnected the result is a minimum
+/// spanning *forest*.
 ///
 /// # Errors
 ///
@@ -278,9 +306,11 @@ pub fn minimum_spanning_tree(graph: &CsMat<f64>) -> Result<CsMat<f64>, String> {
     let mut mst_triplets: Vec<(usize, usize, f64)> = Vec::new();
     for (w, u, v) in edges {
         if union(&mut parent, &mut rank, u, v) {
-            // Store both directions for a symmetric matrix.
+            // Store ONE oriented entry per edge in upper-triangular `i < j`
+            // orientation, matching scipy.sparse.csgraph.minimum_spanning_tree.
+            // The collected `edges` already satisfy `u < v` (collected with
+            // `if i < j`), so `(u, v, w)` is already upper-triangular.
             mst_triplets.push((u, v, w));
-            mst_triplets.push((v, u, w));
         }
     }
 
@@ -469,22 +499,24 @@ mod tests {
         let mst = minimum_spanning_tree(&graph).unwrap();
 
         // MST should have edges: 0-1 (1), 1-2 (2), 2-3 (3). Total weight = 6.
-        // Since the MST is stored symmetrically, sum of all entries = 12.
+        // scipy stores ONE entry per edge (upper-triangular i<j), so the sum of
+        // all entries equals the MST weight = 6.0 (not 12.0).
         let total_weight: f64 = mst.iter().map(|(&w, _)| w).sum();
-        assert_abs_diff_eq!(total_weight, 12.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(total_weight, 6.0, epsilon = 1e-12);
 
-        // MST should have exactly 3 undirected edges = 6 entries in symmetric matrix.
+        // MST should have exactly 3 undirected edges = 3 entries (one per edge).
         let nnz = mst.nnz();
-        assert_eq!(nnz, 6);
+        assert_eq!(nnz, 3);
 
-        // Verify the specific edges are present.
+        // Verify the upper-triangular (i<j) entries are present; the
+        // lower-triangular mirrors are zero (pins scipy's orientation).
         let mst_dense = mst.to_dense();
         assert_abs_diff_eq!(mst_dense[[0, 1]], 1.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(mst_dense[[1, 0]], 1.0, epsilon = 1e-12);
         assert_abs_diff_eq!(mst_dense[[1, 2]], 2.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(mst_dense[[2, 1]], 2.0, epsilon = 1e-12);
         assert_abs_diff_eq!(mst_dense[[2, 3]], 3.0, epsilon = 1e-12);
-        assert_abs_diff_eq!(mst_dense[[3, 2]], 3.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(mst_dense[[1, 0]], 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(mst_dense[[2, 1]], 0.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(mst_dense[[3, 2]], 0.0, epsilon = 1e-12);
     }
 
     // -----------------------------------------------------------------------
