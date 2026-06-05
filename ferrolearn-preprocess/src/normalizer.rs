@@ -26,7 +26,7 @@
 //! | REQ-1 (row-wise L1/L2/Max transform) | SHIPPED | `Transform::transform` divides each row by its norm (L1=Σ\|v\|, L2=√Σv², Max=max\|v\|; zero-norm row unchanged), default L2; mirrors sklearn dense `normalize` (`_data.py:1962-1969`, `_handle_zeros_in_scale` `:1968`). Critic-verified bit-identical to live oracle: `guard_l1/l2/max/zero_row/f32_matches_oracle` in `tests/divergence_normalizer.rs`. Consumers: `FittedPipelineTransformer::transform_pipeline` + crate re-export `lib.rs:119`. |
 //! | REQ-2 (transform input validation per check_array) | SHIPPED | FIXED #1140. `transform` guards (sklearn order) zero-samples → `InsufficientSamples` (`validation.py:1084`), zero-features → `InvalidParameter` (`:1093`), non-finite NaN/±inf → `InvalidParameter` (`:1063`) — matching `Normalizer.transform` → `normalize` → `check_array` (`_data.py:1933-1940`). Mirrors converged `binarizer.rs`. Critic two-round CLEAN: 6 rejection pins + finite-not-over-rejected guards (zero-NORM-row/1e308/subnormal/-0.0); pipeline consumer inherits validation. |
 //! | REQ-3 (validating fit + parameter constraints) | NOT-STARTED | open prereq blocker #1141. No `Fit`/fitted type/`_parameter_constraints` (norm StrOptions → InvalidParameterError; sklearn `:2053-2083`). |
-//! | REQ-4 (normalize free fn: axis / return_norm) | NOT-STARTED | open prereq blocker #1142. No standalone `normalize`; missing axis=0 column-normalize + return_norm (`:1866`,`:1926-1942`,`:1971-1975`). |
+//! | REQ-4 (normalize free fn: axis / return_norm) | SHIPPED | FIXED #1142. `pub fn normalize` + `pub fn normalize_with_norms` (free fns) mirror sklearn `normalize(X, norm, *, axis=1, copy=True, return_norm=False)` (`_data.py:1866`). Shared `row_norm` helper computes L1=Σ\|v\|, L2=√Σv², Max=max\|v\| (`:1962-1967`); `_handle_zeros_in_scale` zero→1 (`:1968`); `X /= norms` (`:1969`). `axis=1` row-normalizes; `axis=0` column-normalizes (sklearn transpose `:1926-1942`,`:1971-1972`); `axis ∉ {0,1}` → `InvalidParameter`. `normalize_with_norms` returns `(normalized, raw_norms)` (return_norm `:1974-1975`; raw, NOT zero-handled). Same validation as `Transform::transform` (REQ-2). Oracle-grounded tests in `#[cfg(test)]`: `normalize_l2/l1/max_axis1_matches_sklearn`, `normalize_l2_axis0_matches_sklearn`, `normalize_return_norm_l2_and_l1`, `normalize_invalid_axis_errors`. |
 //! | REQ-5 (copy parameter) | NOT-STARTED | open prereq blocker #1143. No `copy` param; `transform` always `to_owned()`s (`:2058`,`:2085-2106`). |
 //! | REQ-6 (n_features_in_ / feature names) | NOT-STARTED | open prereq blocker #1144. No `n_features_in_`/`get_feature_names_out` (OneToOneFeatureMixin, `:2082`). Depends on REQ-3. |
 //! | REQ-7 (sparse support) | NOT-STARTED | open prereq blocker #1145. Dense-only; no CSR `inplace_csr_row_normalize_l1/l2` / `min_max_axis` Max (`:1944-1960`). |
@@ -36,7 +36,7 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
 use ferrolearn_core::traits::Transform;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1};
 use num_traits::Float;
 
 // ---------------------------------------------------------------------------
@@ -209,6 +209,164 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for Normalizer<F> {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone `normalize` free function (sklearn `normalize`, `_data.py:1866`)
+// ---------------------------------------------------------------------------
+
+/// Compute the `norm` of a single 1-D slice (one row or one column).
+///
+/// Mirrors sklearn's dense `normalize` per-vector norms (`_data.py:1962-1967`):
+/// L1 = Σ|v|, L2 = √Σv², Max = max|v|.
+fn row_norm<F: Float>(row: ArrayView1<F>, norm: NormType) -> F {
+    match norm {
+        NormType::L1 => row.iter().copied().fold(F::zero(), |acc, v| acc + v.abs()),
+        NormType::L2 => row
+            .iter()
+            .copied()
+            .fold(F::zero(), |acc, v| acc + v * v)
+            .sqrt(),
+        NormType::Max => {
+            row.iter().copied().fold(
+                F::zero(),
+                |acc, v| {
+                    if v.abs() > acc { v.abs() } else { acc }
+                },
+            )
+        }
+    }
+}
+
+/// Run the shared `check_array` input validation (REQ-2) used by both
+/// [`Normalizer`]'s `transform` and the free [`normalize`]/[`normalize_with_norms`]
+/// functions, in sklearn's `check_array` order (zero-samples → zero-features →
+/// non-finite; `sklearn/utils/validation.py:1084`, `:1093`, `:1063`).
+fn validate_normalize_input<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.nrows() == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "normalize".into(),
+        });
+    }
+    if x.ncols() == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "X".to_string(),
+            reason: "Found array with 0 feature(s); a minimum of 1 is required \
+                     by the normalize function"
+                .to_string(),
+        });
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".to_string(),
+            reason: "Input X contains non-finite values (NaN or infinity); \
+                     the normalize function requires all-finite input"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Shared core of [`normalize`] / [`normalize_with_norms`]: validate `axis` and
+/// input, then return the normalized array plus the per-axis **raw** norm vector.
+///
+/// The returned `norms` are the actual computed norms (NOT zero-handled): a
+/// zero-norm row/column appears as `0.0` even though the division used `1`
+/// (`_handle_zeros_in_scale`, `_data.py:1968`) to leave it unchanged. This
+/// matches sklearn's `normalize(..., return_norm=True)` (`:1974-1975`).
+fn normalize_inner<F: Float>(
+    x: &Array2<F>,
+    norm: NormType,
+    axis: usize,
+) -> Result<(Array2<F>, Array1<F>), FerroError> {
+    if axis != 0 && axis != 1 {
+        return Err(FerroError::InvalidParameter {
+            name: "axis".into(),
+            reason: "must be 0 or 1".into(),
+        });
+    }
+    validate_normalize_input(x)?;
+
+    let mut out = x.to_owned();
+    if axis == 1 {
+        // Row-normalize (sklearn default axis=1).
+        let mut norms = Array1::<F>::zeros(out.nrows());
+        for (i, mut row) in out.rows_mut().into_iter().enumerate() {
+            let n = row_norm(row.view(), norm);
+            norms[i] = n;
+            // _handle_zeros_in_scale: a zero norm divides by 1 (row unchanged).
+            let eff = if n == F::zero() { F::one() } else { n };
+            for v in &mut row {
+                *v = *v / eff;
+            }
+        }
+        Ok((out, norms))
+    } else {
+        // axis == 0: column-normalize. sklearn transposes, runs the axis=1
+        // path, then transposes back (`_data.py:1926-1942`, `:1971-1972`).
+        let mut norms = Array1::<F>::zeros(out.ncols());
+        for (j, mut col) in out.columns_mut().into_iter().enumerate() {
+            let n = row_norm(col.view(), norm);
+            norms[j] = n;
+            let eff = if n == F::zero() { F::one() } else { n };
+            for v in &mut col {
+                *v = *v / eff;
+            }
+        }
+        Ok((out, norms))
+    }
+}
+
+/// Scale input vectors individually to unit norm — the standalone, estimator-less
+/// API mirroring scikit-learn's `normalize` free function
+/// (`sklearn/preprocessing/_data.py:1866`).
+///
+/// With `axis == 1` (sklearn's default) each **row** (sample) is divided by its
+/// `norm` (L1 = Σ|v|, L2 = √Σv², Max = max|v|); with `axis == 0` each **column**
+/// (feature) is normalized instead (sklearn transposes, row-normalizes, and
+/// transposes back — `:1926-1942`, `:1971-1972`). A row/column whose norm is zero
+/// is left unchanged, matching `_handle_zeros_in_scale` (`:1968`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `axis` is not `0` or `1`. Also
+/// applies the same `check_array` input validation as [`Normalizer`]'s
+/// `transform` (REQ-2): [`FerroError::InsufficientSamples`] for zero rows, and
+/// [`FerroError::InvalidParameter`] for zero features or any non-finite value
+/// (`_data.py:1933-1940`).
+#[must_use = "normalize returns a new array; the input is not modified"]
+pub fn normalize<F: Float>(
+    x: &Array2<F>,
+    norm: NormType,
+    axis: usize,
+) -> Result<Array2<F>, FerroError> {
+    let (out, _norms) = normalize_inner(x, norm, axis)?;
+    Ok(out)
+}
+
+/// Like [`normalize`] but also returns the per-axis norm vector — the
+/// `return_norm=True` form of scikit-learn's `normalize`
+/// (`sklearn/preprocessing/_data.py:1971-1975`).
+///
+/// Returns `(normalized, norms)` where `norms` is the per-row vector for
+/// `axis == 1` (length = n_rows) or the per-column vector for `axis == 0`
+/// (length = n_cols). The norms are the **raw** computed norms, NOT
+/// zero-handled: a zero norm appears as `0.0` in the returned vector even though
+/// the division used `1` to leave that row/column unchanged (sklearn returns the
+/// raw `norms` array — `:1974-1975`).
+///
+/// # Errors
+///
+/// Same as [`normalize`].
+#[must_use = "normalize_with_norms returns a new array and the norm vector"]
+pub fn normalize_with_norms<F: Float>(
+    x: &Array2<F>,
+    norm: NormType,
+    axis: usize,
+) -> Result<(Array2<F>, Array1<F>), FerroError> {
+    normalize_inner(x, norm, axis)
+}
+
+// ---------------------------------------------------------------------------
 // Pipeline integration (generic)
 // ---------------------------------------------------------------------------
 
@@ -363,5 +521,80 @@ mod tests {
         let out = norm.transform(&x).unwrap();
         assert!((out[[0, 0]] - 0.6f32).abs() < 1e-6);
         assert!((out[[0, 1]] - 0.8f32).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-4 — standalone `normalize` / `normalize_with_norms` free functions.
+    // Oracle: live sklearn 1.5.2 (R-CHAR-3), X = [[1,2,2],[0,3,4]].
+    //   normalize(X, l2, axis=1) -> [[.33333333,.66666667,.66666667],[0,.6,.8]]
+    //   normalize(X, l1, axis=1) -> [[.2,.4,.4],[0,.42857143,.57142857]]
+    //   normalize(X, max,axis=1) -> [[.5,1,1],[0,.75,1]]
+    //   normalize(X, l2, axis=0) -> [[1,.5547002,.4472136],[0,.83205029,.89442719]]
+    //   return_norm l2 axis=1 norms -> [3,5]; l1 axis=1 norms -> [5,7]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn normalize_l2_axis1_matches_sklearn() -> Result<(), FerroError> {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+        let out = normalize(&x, NormType::L2, 1)?;
+        let expected = array![[0.33333333, 0.66666667, 0.66666667], [0.0, 0.6, 0.8]];
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_l1_axis1_matches_sklearn() -> Result<(), FerroError> {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+        let out = normalize(&x, NormType::L1, 1)?;
+        let expected = array![[0.2, 0.4, 0.4], [0.0, 0.42857143, 0.57142857]];
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_max_axis1_matches_sklearn() -> Result<(), FerroError> {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+        let out = normalize(&x, NormType::Max, 1)?;
+        let expected = array![[0.5, 1.0, 1.0], [0.0, 0.75, 1.0]];
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_l2_axis0_matches_sklearn() -> Result<(), FerroError> {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+        let out = normalize(&x, NormType::L2, 0)?;
+        let expected = array![[1.0, 0.5547002, 0.4472136], [0.0, 0.83205029, 0.89442719]];
+        for (a, b) in out.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_return_norm_l2_and_l1() -> Result<(), FerroError> {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+
+        let (_out_l2, norms_l2) = normalize_with_norms(&x, NormType::L2, 1)?;
+        assert_abs_diff_eq!(norms_l2[0], 3.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(norms_l2[1], 5.0, epsilon = 1e-9);
+
+        let (_out_l1, norms_l1) = normalize_with_norms(&x, NormType::L1, 1)?;
+        assert_abs_diff_eq!(norms_l1[0], 5.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(norms_l1[1], 7.0, epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn normalize_invalid_axis_errors() {
+        let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0]];
+        let err = normalize(&x, NormType::L2, 2);
+        assert!(matches!(err, Err(FerroError::InvalidParameter { .. })));
     }
 }
