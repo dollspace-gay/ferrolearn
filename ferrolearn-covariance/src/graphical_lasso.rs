@@ -10,10 +10,12 @@
 //! where `S` is the empirical covariance and `alpha` is the L1 penalty.
 //! [`GraphicalLassoCV`] picks `alpha` by k-fold cross-validation over a grid.
 //!
-//! The implementation follows the coordinate-descent (Friedman, Hastie &
-//! Tibshirani, 2008) outer iteration: at each pass over the columns, solve a
-//! lasso regression of column `i` against the other columns, then update the
-//! covariance and precision blocks accordingly.
+//! The solver ([`solve_glasso`]) is a faithful port of scikit-learn 1.5.2's
+//! `_graphical_lasso` (`mode="cd"`): initialise with the `0.95`-shrunk empirical
+//! covariance (diagonal restored) and a `pinvh` precision seed; per feature, run
+//! a warm-started Gram coordinate-descent lasso, then update the precision and
+//! covariance blocks; stop on the dual-gap criterion. See [`solve_glasso`] for
+//! the line-by-line correspondence.
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -31,8 +33,7 @@ pub struct GraphicalLasso<F> {
     max_iter: usize,
     /// Coordinate-descent inner iteration cap.
     max_inner_iter: usize,
-    /// Convergence tolerance on the change in covariance between outer
-    /// iterations (Frobenius norm).
+    /// Convergence tolerance on the dual gap between outer iterations.
     tol: F,
     /// If `true`, skip mean centering during the empirical covariance step.
     assume_centered: bool,
@@ -370,9 +371,32 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Coordinate-descent solver (Friedman et al., 2008)
+// Graphical-lasso solver — faithful port of scikit-learn 1.5.2
+// `sklearn/covariance/_graph_lasso.py:70-200` (`_graphical_lasso`, mode="cd").
 // ---------------------------------------------------------------------------
 
+/// Solve the graphical-lasso problem for an empirical covariance `emp_cov`.
+///
+/// This is a faithful port of scikit-learn's `_graphical_lasso` (`mode="cd"`).
+/// The algorithm:
+///
+/// * **Init** (`_graph_lasso.py:91-104`): `covariance_ = emp_cov * 0.95` with the
+///   empirical diagonal restored, then `precision_ = pinvh(covariance_)`. The
+///   `covariance_` diagonal stays equal to the empirical diagonal for the whole
+///   run (no `W = S + alpha*I` shift — only off-diagonals move).
+/// * **Outer loop** (`:120-185`): for each feature `idx`, warm-start the inner
+///   lasso from `-precision_[!=idx, idx] / (precision_[idx,idx] + 1000*eps)`
+///   (`:135-138`), run a Gram coordinate-descent lasso
+///   ([`enet_coordinate_descent_gram`], `:139-150`) over `sub_covariance` (the
+///   `idx`-deleted `covariance_`) and `row = emp_cov[idx, !=idx]`, then update
+///   `precision_` (`:163-168`) and `covariance_` off-diagonals (`:169-171`).
+/// * **Convergence** (`:176-185`): break when `|dual_gap| < tol`, with
+///   `dual_gap = sum(emp_cov*precision_) - p + alpha*(|precision_|.sum()
+///   - |diag(precision_)|.sum())` (`_dual_gap`, `:57-66`).
+///
+/// `max_inner_iter` caps the inner Gram coordinate descent (sklearn passes the
+/// outer `max_iter`; either works as long as it is large enough to converge).
+/// Returns `(covariance_, precision_, n_iter)`.
 fn solve_glasso<F: Float>(
     emp_cov: &Array2<F>,
     alpha: F,
@@ -381,183 +405,220 @@ fn solve_glasso<F: Float>(
     tol: F,
 ) -> (Array2<F>, Array2<F>, usize) {
     let p = emp_cov.nrows();
-    // Friedman, Hastie & Tibshirani (2008) initialise W = S + alpha * I
-    // for numerical stability of the inner block solves; sklearn does
-    // not include this shift in `covariance_` output (it strips the
-    // diagonal back to the empirical diagonal — see the trim step at
-    // the bottom of this function). #343.
-    let mut w = emp_cov.clone();
-    for i in 0..p {
-        w[[i, i]] = w[[i, i]] + alpha;
+    let eps = F::epsilon();
+
+    // alpha == 0: early return without regularisation (`:83-89`).
+    if alpha == F::zero() {
+        let precision = match spd_inverse(emp_cov) {
+            Ok(inv) => inv,
+            // pinvh-style fallback: a symmetric pseudo-inverse via Jacobi eigen.
+            Err(()) => pinvh(emp_cov),
+        };
+        return (emp_cov.clone(), precision, 0);
     }
-    // Inverse-style precision matrix bookkeeping; we recompute at the end
-    // via a Cholesky-style block decomposition.
+
+    // Init: shrink off-diagonals to 0.95, restore the empirical diagonal,
+    // seed precision_ = pinvh(covariance_) (`:91-104`).
+    let mut covariance = emp_cov.clone();
+    let scale = F::from(0.95).unwrap_or_else(F::one);
+    for a in 0..p {
+        for b in 0..p {
+            covariance[[a, b]] = covariance[[a, b]] * scale;
+        }
+    }
+    for i in 0..p {
+        covariance[[i, i]] = emp_cov[[i, i]];
+    }
+    // covariance_ is SPD after the 0.95-shrink + diagonal restore; use a
+    // Cholesky-based inverse, falling back to the symmetric pseudo-inverse.
+    let mut precision = match spd_inverse(&covariance) {
+        Ok(inv) => inv,
+        Err(()) => pinvh(&covariance),
+    };
+
+    let thousand_eps = F::from(1000.0).unwrap_or_else(F::one) * eps;
+    let enet_tol = F::from(1e-4).unwrap_or(eps);
+
     let mut iter = 0usize;
     for it in 0..max_iter {
         iter = it + 1;
-        let w_old = w.clone();
-        for j in 0..p {
-            // Build W_11 = W with row j and column j removed (size (p-1)x(p-1))
-            // and s_12 = emp_cov column j (excluding diagonal).
-            let mut w11 = Array2::<F>::zeros((p - 1, p - 1));
-            let mut s12 = Array1::<F>::zeros(p - 1);
-            let mut idx_a = 0usize;
+        for idx in 0..p {
+            // sub_covariance = covariance_ with row/column `idx` removed.
+            let mut sub_cov = Array2::<F>::zeros((p - 1, p - 1));
+            let mut ia = 0usize;
             for a in 0..p {
-                if a == j {
+                if a == idx {
                     continue;
                 }
-                let mut idx_b = 0usize;
+                let mut ib = 0usize;
                 for b in 0..p {
-                    if b == j {
+                    if b == idx {
                         continue;
                     }
-                    w11[[idx_a, idx_b]] = w[[a, b]];
-                    idx_b += 1;
+                    sub_cov[[ia, ib]] = covariance[[a, b]];
+                    ib += 1;
                 }
-                s12[idx_a] = emp_cov[[a, j]];
-                idx_a += 1;
+                ia += 1;
+            }
+            // row = emp_cov[idx, indices != idx].
+            let mut row = Array1::<F>::zeros(p - 1);
+            let mut k = 0usize;
+            for a in 0..p {
+                if a == idx {
+                    continue;
+                }
+                row[k] = emp_cov[[a, idx]];
+                k += 1;
             }
 
-            // Solve lasso: minimise 0.5 * beta^T W11 beta - s12^T beta + alpha ||beta||_1
-            let beta = coord_descent_lasso(&w11, &s12, alpha, max_inner_iter, tol);
-            // Update W column/row j: w_12 = W_11 * beta
-            let mut w12 = Array1::<F>::zeros(p - 1);
-            for a in 0..(p - 1) {
+            // Warm start: coefs = -precision_[!=idx, idx] / (precision_[idx,idx]
+            // + 1000*eps)  (`:135-138`).
+            let denom_ws = precision[[idx, idx]] + thousand_eps;
+            let mut coefs = Array1::<F>::zeros(p - 1);
+            let mut k = 0usize;
+            for a in 0..p {
+                if a == idx {
+                    continue;
+                }
+                coefs[k] = -(precision[[a, idx]] / denom_ws);
+                k += 1;
+            }
+
+            // Inner Gram lasso (`:139-150`).
+            enet_coordinate_descent_gram(
+                &mut coefs,
+                alpha,
+                &sub_cov,
+                &row,
+                max_inner_iter,
+                enet_tol,
+            );
+
+            // Update precision_ (`:163-168`). Use the CURRENT covariance_ column
+            // (before the covariance update below).
+            let mut dot = F::zero();
+            let mut k = 0usize;
+            for a in 0..p {
+                if a == idx {
+                    continue;
+                }
+                dot = dot + covariance[[a, idx]] * coefs[k];
+                k += 1;
+            }
+            let prec_ii = F::one() / (covariance[[idx, idx]] - dot);
+            precision[[idx, idx]] = prec_ii;
+            let mut k = 0usize;
+            for a in 0..p {
+                if a == idx {
+                    continue;
+                }
+                let v = -prec_ii * coefs[k];
+                precision[[a, idx]] = v;
+                precision[[idx, a]] = v;
+                k += 1;
+            }
+
+            // Update covariance_ off-diagonals: coefs_full = sub_cov @ coefs
+            // (`:169-171`).
+            let mut k = 0usize;
+            for a in 0..p {
+                if a == idx {
+                    continue;
+                }
                 let mut acc = F::zero();
                 for b in 0..(p - 1) {
-                    acc = acc + w11[[a, b]] * beta[b];
+                    acc = acc + sub_cov[[k, b]] * coefs[b];
                 }
-                w12[a] = acc;
-            }
-            let mut idx = 0usize;
-            for a in 0..p {
-                if a == j {
-                    continue;
-                }
-                w[[a, j]] = w12[idx];
-                w[[j, a]] = w12[idx];
-                idx += 1;
+                covariance[[a, idx]] = acc;
+                covariance[[idx, a]] = acc;
+                k += 1;
             }
         }
-        // Convergence: change in W
-        let mut diff = F::zero();
-        for i in 0..p {
-            for j in 0..p {
-                let d = w[[i, j]] - w_old[[i, j]];
-                diff = diff + d * d;
-            }
-        }
-        if diff.sqrt() < tol {
-            break;
-        }
-    }
 
-    // Build precision matrix from final W via the standard glasso identity.
-    // For each column j: theta_jj = 1 / (W_jj - w_12^T beta_j); theta_12 = -beta_j * theta_jj
-    let mut prec = Array2::<F>::zeros((p, p));
-    for j in 0..p {
-        let mut w11 = Array2::<F>::zeros((p - 1, p - 1));
-        let mut w_12 = Array1::<F>::zeros(p - 1);
-        let mut idx_a = 0usize;
+        // Dual-gap convergence (`_dual_gap` :57-66, break :184).
+        let mut gap = F::zero();
+        let mut abs_sum = F::zero();
+        let mut abs_diag = F::zero();
         for a in 0..p {
-            if a == j {
-                continue;
-            }
-            let mut idx_b = 0usize;
             for b in 0..p {
-                if b == j {
-                    continue;
-                }
-                w11[[idx_a, idx_b]] = w[[a, b]];
-                idx_b += 1;
+                gap = gap + emp_cov[[a, b]] * precision[[a, b]];
+                abs_sum = abs_sum + precision[[a, b]].abs();
             }
-            w_12[idx_a] = w[[a, j]];
-            idx_a += 1;
+            abs_diag = abs_diag + precision[[a, a]].abs();
         }
-        let mut s12 = Array1::<F>::zeros(p - 1);
-        let mut k = 0usize;
-        for a in 0..p {
-            if a == j {
-                continue;
-            }
-            s12[k] = emp_cov[[a, j]];
-            k += 1;
-        }
-        let beta = coord_descent_lasso(&w11, &s12, alpha, max_inner_iter, tol);
-        let mut dot = F::zero();
-        for a in 0..(p - 1) {
-            dot = dot + w_12[a] * beta[a];
-        }
-        let denom = w[[j, j]] - dot;
-        let theta_jj = if denom.abs() > F::epsilon() {
-            F::one() / denom
-        } else {
-            F::one() / F::epsilon()
-        };
-        prec[[j, j]] = theta_jj;
-        let mut idx = 0usize;
-        for a in 0..p {
-            if a == j {
-                continue;
-            }
-            let v = -beta[idx] * theta_jj;
-            prec[[a, j]] = v;
-            prec[[j, a]] = v;
-            idx += 1;
-        }
-    }
-
-    // Strip the +alpha shift from the diagonal of W before returning so
-    // `covariance_` matches sklearn's GraphicalLasso output, where the
-    // diagonal equals the empirical-covariance diagonal exactly. The
-    // precision matrix was computed using the un-stripped W (per the
-    // Friedman et al. 2008 inversion identity) so it stays correct.
-    // #343.
-    for i in 0..p {
-        w[[i, i]] = w[[i, i]] - alpha;
-    }
-    (w, prec, iter)
-}
-
-/// Coordinate-descent lasso solver for the inner sub-problem
-/// `min 0.5 beta^T W beta - s^T beta + alpha ||beta||_1`.
-fn coord_descent_lasso<F: Float>(
-    w: &Array2<F>,
-    s: &Array1<F>,
-    alpha: F,
-    max_iter: usize,
-    tol: F,
-) -> Array1<F> {
-    let n = s.len();
-    let mut beta = Array1::<F>::zeros(n);
-    for _ in 0..max_iter {
-        let mut max_change = F::zero();
-        for j in 0..n {
-            let mut residual = s[j];
-            for k in 0..n {
-                if k != j {
-                    residual = residual - w[[j, k]] * beta[k];
-                }
-            }
-            let denom = w[[j, j]];
-            let new_val = if denom > F::epsilon() {
-                soft_threshold(residual, alpha) / denom
-            } else {
-                F::zero()
-            };
-            let change = (new_val - beta[j]).abs();
-            if change > max_change {
-                max_change = change;
-            }
-            beta[j] = new_val;
-        }
-        if max_change < tol {
+        let pf = F::from(p).unwrap_or_else(F::zero);
+        let d_gap = gap - pf + alpha * (abs_sum - abs_diag);
+        if d_gap.abs() < tol {
             break;
         }
     }
-    beta
+
+    (covariance, precision, iter)
 }
 
+/// Gram coordinate-descent lasso — port of scikit-learn's
+/// `enet_coordinate_descent_gram` (`linear_model/_cd_fast.pyx`) with `l2 = 0`.
+///
+/// Minimises `0.5 w^T Q w - q^T w + alpha*||w||_1` over `w` in place, starting
+/// from the warm-started `w`. `Q` is the Gram matrix (`sub_covariance`), `q` is
+/// the right-hand side (`row`). Convergence uses sklearn's max-change criterion:
+/// after each coordinate sweep, break when `w_max == 0` or
+/// `d_w_max / w_max < enet_tol`.
+fn enet_coordinate_descent_gram<F: Float>(
+    w: &mut Array1<F>,
+    alpha: F,
+    q: &Array2<F>,
+    qvec: &Array1<F>,
+    max_iter: usize,
+    enet_tol: F,
+) {
+    let n = w.len();
+    // H = Q @ w.
+    let mut h = Array1::<F>::zeros(n);
+    for a in 0..n {
+        let mut acc = F::zero();
+        for b in 0..n {
+            acc = acc + q[[a, b]] * w[b];
+        }
+        h[a] = acc;
+    }
+
+    for _ in 0..max_iter {
+        let mut w_max = F::zero();
+        let mut d_w_max = F::zero();
+        for j in 0..n {
+            let q_jj = q[[j, j]];
+            if q_jj == F::zero() {
+                continue;
+            }
+            let w_j = w[j];
+            // Gradient excluding coordinate j: H[j] = (Q@w)[j] includes
+            // Q[j,j]*w[j], so add it back to remove j's self-term.
+            let tmp = qvec[j] - h[j] + q_jj * w_j;
+            let new_wj = soft_threshold(tmp, alpha) / q_jj;
+            w[j] = new_wj;
+            if new_wj != w_j {
+                let delta = new_wj - w_j;
+                for a in 0..n {
+                    h[a] = h[a] + q[[a, j]] * delta;
+                }
+            }
+            let change = (new_wj - w_j).abs();
+            if change > d_w_max {
+                d_w_max = change;
+            }
+            let aw = new_wj.abs();
+            if aw > w_max {
+                w_max = aw;
+            }
+        }
+        if w_max == F::zero() || d_w_max / w_max < enet_tol {
+            break;
+        }
+    }
+}
+
+/// Soft-thresholding operator `sign(x) * max(|x| - gamma, 0)`.
 #[inline]
 fn soft_threshold<F: Float>(x: F, gamma: F) -> F {
     if x > gamma {
@@ -567,6 +628,145 @@ fn soft_threshold<F: Float>(x: F, gamma: F) -> F {
     } else {
         F::zero()
     }
+}
+
+/// Invert a symmetric positive-definite matrix via its Cholesky factor
+/// `A = L L^T`, solving `A X = I` column by column. Returns `Err(())` if `A`
+/// is not strictly positive definite (a non-positive pivot is encountered).
+fn spd_inverse<F: Float>(a: &Array2<F>) -> Result<Array2<F>, ()> {
+    let n = a.nrows();
+    // Lower Cholesky factor L.
+    let mut l = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[[i, j]];
+            for k in 0..j {
+                sum = sum - l[[i, k]] * l[[j, k]];
+            }
+            if i == j {
+                if sum <= F::zero() {
+                    return Err(());
+                }
+                l[[i, j]] = sum.sqrt();
+            } else {
+                l[[i, j]] = sum / l[[j, j]];
+            }
+        }
+    }
+
+    // Solve A x = e_c for each column c via forward/back substitution.
+    let mut inv = Array2::<F>::zeros((n, n));
+    for c in 0..n {
+        // Forward solve L y = e_c.
+        let mut y = Array1::<F>::zeros(n);
+        for i in 0..n {
+            let mut sum = if i == c { F::one() } else { F::zero() };
+            for k in 0..i {
+                sum = sum - l[[i, k]] * y[k];
+            }
+            y[i] = sum / l[[i, i]];
+        }
+        // Back solve L^T x = y.
+        for i in (0..n).rev() {
+            let mut sum = y[i];
+            for k in (i + 1)..n {
+                sum = sum - l[[k, i]] * inv[[k, c]];
+            }
+            inv[[i, c]] = sum / l[[i, i]];
+        }
+    }
+    Ok(inv)
+}
+
+/// Symmetric pseudo-inverse (`scipy.linalg.pinvh` analogue) via a Jacobi
+/// eigendecomposition: `A = V diag(λ) V^T`, then `A^+ = V diag(1/λ) V^T` with
+/// eigenvalues below `eps * max|λ|` zeroed. Used as a fallback when the
+/// Cholesky inverse fails (matrix not strictly positive definite).
+fn pinvh<F: Float>(a: &Array2<F>) -> Array2<F> {
+    let n = a.nrows();
+    // Jacobi eigenvalue algorithm on a copy of the symmetric matrix.
+    let mut m = a.clone();
+    let mut v = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        v[[i, i]] = F::one();
+    }
+    let max_sweeps = 100usize;
+    for _ in 0..max_sweeps {
+        // Largest off-diagonal magnitude.
+        let mut off = F::zero();
+        for p in 0..n {
+            for q in (p + 1)..n {
+                off = off + m[[p, q]] * m[[p, q]];
+            }
+        }
+        if off.sqrt() <= F::epsilon() {
+            break;
+        }
+        for p in 0..n {
+            for q in (p + 1)..n {
+                if m[[p, q]] == F::zero() {
+                    continue;
+                }
+                let app = m[[p, p]];
+                let aqq = m[[q, q]];
+                let apq = m[[p, q]];
+                let two = F::one() + F::one();
+                let theta = (aqq - app) / (two * apq);
+                let t = {
+                    let sign = if theta >= F::zero() {
+                        F::one()
+                    } else {
+                        -F::one()
+                    };
+                    sign / (theta.abs() + (theta * theta + F::one()).sqrt())
+                };
+                let c = F::one() / (t * t + F::one()).sqrt();
+                let s = t * c;
+                // Rotate rows/columns p, q.
+                for k in 0..n {
+                    let mkp = m[[k, p]];
+                    let mkq = m[[k, q]];
+                    m[[k, p]] = c * mkp - s * mkq;
+                    m[[k, q]] = s * mkp + c * mkq;
+                }
+                for k in 0..n {
+                    let mpk = m[[p, k]];
+                    let mqk = m[[q, k]];
+                    m[[p, k]] = c * mpk - s * mqk;
+                    m[[q, k]] = s * mpk + c * mqk;
+                }
+                for k in 0..n {
+                    let vkp = v[[k, p]];
+                    let vkq = v[[k, q]];
+                    v[[k, p]] = c * vkp - s * vkq;
+                    v[[k, q]] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    // Eigenvalues are the diagonal of m; eigenvectors are columns of v.
+    let mut max_eig = F::zero();
+    for i in 0..n {
+        let e = m[[i, i]].abs();
+        if e > max_eig {
+            max_eig = e;
+        }
+    }
+    let cutoff = F::epsilon() * max_eig;
+    let mut inv = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = F::zero();
+            for k in 0..n {
+                let lam = m[[k, k]];
+                if lam.abs() > cutoff {
+                    acc = acc + v[[i, k]] * (F::one() / lam) * v[[j, k]];
+                }
+            }
+            inv[[i, j]] = acc;
+        }
+    }
+    inv
 }
 
 #[cfg(test)]

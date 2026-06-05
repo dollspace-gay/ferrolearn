@@ -490,7 +490,6 @@ fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 /// Tracking: #1880 (covers REQ-GLASSO-VALUE; root causes REQ-CONVERGENCE #1881,
 /// REQ-ENET-TOL #1883).
 #[test]
-#[ignore = "divergence: GraphicalLasso covariance_/precision_ differ from sklearn _graphical_lasso; tracking #1880"]
 fn divergence_graphical_lasso_value_alpha_0_1() {
     let x = probe_x();
     let fitted = GraphicalLasso::<f64>::new(0.1).fit(&x, &()).unwrap();
@@ -531,7 +530,6 @@ fn divergence_graphical_lasso_value_alpha_0_1() {
 ///
 /// Tracking: #1880 (REQ-GLASSO-FN; same coupled fix as the class path).
 #[test]
-#[ignore = "divergence: graphical_lasso() fn differs from sklearn.covariance.graphical_lasso; tracking #1880"]
 fn divergence_graphical_lasso_function_alpha_0_1() {
     let x = probe_x();
     // ferrolearn's `empirical_covariance` is sklearn's empirical_covariance
@@ -562,7 +560,6 @@ fn divergence_graphical_lasso_function_alpha_0_1() {
 ///
 /// Tracking: #1880.
 #[test]
-#[ignore = "divergence: precision diagonal diverges and grows with alpha; tracking #1880"]
 fn divergence_graphical_lasso_precision_diag_alpha_0_2() {
     let x = probe_x();
     let fitted = GraphicalLasso::<f64>::new(0.2).fit(&x, &()).unwrap();
