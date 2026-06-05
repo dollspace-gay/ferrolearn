@@ -1075,6 +1075,12 @@ upstream = [
 design = ".design/model-sel/cross_validation.md"
 parity_ops = ["cross_val_score", "cross_validate", "cross_val_predict", "permutation_test_score", "KFold", "StratifiedKFold"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/calibration.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/calibration.py"]
+design = ".design/model-sel/calibration.md"
+parity_ops = ["CalibratedClassifierCV", "calibration_curve"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

@@ -22,6 +22,28 @@
 //! The returned [`FittedCalibratedClassifierCV`] re-fits the base model on
 //! the **full** training set and applies the learned calibration mapping at
 //! prediction time.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.calibration` (`CalibratedClassifierCV` `sklearn/calibration.py:66`,
+//! `_sigmoid_calibration :770`, `IsotonicRegression`, `calibration_curve :937`) at
+//! v1.5.2. ferrolearn implements the `ensemble=False` BINARY path with a `FitFn`
+//! closure base estimator (R-DEV-7). Every REQ is BINARY (R-DEFER-2): SHIPPED or
+//! NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-SIGMOID (Platt calibrated probabilities) | SHIPPED | `fit_sigmoid` Newton on the convex Platt NLL with targets `t_pos=(n_pos+1)/(n_pos+2)`, `t_neg=1/(n_neg+2)` (`:827-829`); same convex minimum as sklearn `_sigmoid_calibration` L-BFGS-B (sign reparam `a=-A`). Matches live oracle to 6.66e-9 for scores under the rescale threshold. Guards `green_sigmoid_well_separated_matches_oracle`, `green_sigmoid_mixed_nonseparable_matches_oracle`. |
+//! | REQ-ISOTONIC (isotonic calibrated probabilities) | SHIPPED | `fit_isotonic` PAV with sklearn `_make_unique` tie pre-averaging (`isotonic.py:319-322`, fixed #1810) + block-ENDPOINT breakpoints `(lo,mean)`/`(hi,mean)` reproducing `IsotonicRegression(out_of_bounds="clip")` `X_thresholds_`/`y_thresholds_` (flat-within-block, ramp-between) — was block-midpoint breakpoints (fixed #1800). Matches live oracle across monotone/heavy-pool/OOB/single-block/decreasing/tied cases. Tests `divergence_isotonic_breakpoints_1800`, `divergence_isotonic_tied_scores_make_unique`. |
+//! | REQ-ENSEMBLE (ensemble=True default — K averaged calibrators) | NOT-STARTED | ferrolearn does the `ensemble=False` single-calibrator path; sklearn default `ensemble=True` averages K per-fold calibrated classifiers (`:411-426`,`:474-500`). Architectural. Blocker #1801. |
+//! | REQ-STRATIFIED-CV (cv=None ⇒ StratifiedKFold) | NOT-STARTED | plain non-stratified `kfold_indices`; sklearn `check_cv(classifier=True)` ⇒ 5-fold StratifiedKFold (`:409`). Blocker #1802. |
+//! | REQ-MULTICLASS (predict_proba (n,n_classes) + OvR + classes_) | NOT-STARTED | binary-only `Array1<f64>`; no per-class calibrators / normalization / `classes_` (`:664-674`,`:709-765`). Architectural. Blocker #1803. |
+//! | REQ-CALIBRATION-CURVE (`calibration_curve` function) | NOT-STARTED | absent in ferrolearn; sklearn bins y_prob → per-bin (prob_true, prob_pred) (`:937`). Missing function. Blocker #1804. |
+//! | REQ-SAMPLE-WEIGHT (sample_weight channel) | NOT-STARTED | `fit_sigmoid`/`fit_isotonic` take only `(scores, labels)`; sklearn weights priors/PAV (`:821-823`,`:673`). Blocker #1805. |
+//! | REQ-SIGMOID-RESCALE (large-score rescaling) | NOT-STARTED | no `max_abs_prediction_threshold=30` rescaling (`:811-815`); coincides for scores under threshold (REQ-SIGMOID), diverges in conditioning for very large scores. Blocker #1806. |
+//! | REQ-METHOD-DEFAULT (default method='sigmoid' / cv=None) | NOT-STARTED | `new(fit_fn, method, cv)` mandatory; sklearn defaults `method="sigmoid"`/`cv=None` (`:268-281`). Blocker #1807. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1808. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use calibration::{CalibratedClassifierCV, CalibrationMethod, FittedCalibratedClassifierCV}` in `lib.rs` (boundary meta-estimator API, S5/R-DEFER-1). No internal caller, no Python binding (honest underclaim). |
 
 use ferrolearn_core::{FerroError, Predict};
 use ndarray::{Array1, Array2};
