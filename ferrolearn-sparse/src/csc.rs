@@ -3,6 +3,33 @@
 //! [`CscMatrix<T>`] is a newtype wrapper around [`sprs::CsMat<T>`] in CSC
 //! storage. CSC matrices are efficient for column-wise operations and are the
 //! natural choice when algorithms need to iterate over columns.
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.sparse.csc_matrix` (`scipy/sparse/_csc.py`; live oracle scipy
+//! 1.17, deterministic) — the column-symmetric analog of [`CsrMatrix`].
+//! Design doc: `.design/sparse/csc.md` (14 REQs). Every REQ is BINARY (R-DEFER-2):
+//! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
+//! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
+//!
+//! **7 SHIPPED / 7 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-CONSTRUCT-CONVERT | SHIPPED | `from_coo`/`from_dense`/`from_csr` + `to_dense`/`to_coo`/`to_csr` + `nnz` mirror `csc_matrix(...)`/`.toarray()`/`.tocsr()`/`.tocoo()`/`.nnz` (oracle nnz=5; round-trips). Guards `csc_from_*`/`csc_to_csr_roundtrip_matches_scipy`. |
+//! | REQ-MATVEC | SHIPPED | `mul_vec(v)` == scipy `A@v` (`[7,6,19]`). Guard `csc_mul_vec_matches_scipy`. |
+//! | REQ-ADD | SHIPPED | `add(&B)` == scipy `A+B` (elementwise). Guards `csc_add_self_matches_scipy`/`csc_add_other_matches_scipy`. |
+//! | REQ-SCALAR-MUL | SHIPPED | `mul_scalar(s)`/`scale(s)` == scipy `A*s`. Guard `csc_scalar_mul_matches_scipy`. |
+//! | REQ-COL-SLICE | SHIPPED | `col_slice(a,b)` == scipy `A[:,a:b]` (`[[1,0],[0,3],[4,0]]`; method vs Python-slice API, column analog of CSR `row_slice`). Guard `csc_col_slice_matches_scipy`. |
+//! | REQ-ERR | SHIPPED | `add`/`mul_vec` return `Err(FerroError::ShapeMismatch)` where scipy raises `ValueError`. Guards `csc_*_shape_mismatch_is_err`. |
+//! | REQ-CONSUMER | SHIPPED | in-crate CSR↔CSC conversion consumer (`csr.rs` `from_csc`/`to_csc`) + `lib.rs` re-export (grandfathered boundary type, R-DEFER-1/S5). NOTE: no cross-crate ESTIMATOR consumer (weaker than CSR's neighbors/graph.rs). |
+//! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)`. Blocker #2008. |
+//! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2009. |
+//! | REQ-MISSING-REDUCE | NOT-STARTED | no `.sum(axis=)`/`.diagonal()`. Blocker #2010. |
+//! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2011. |
+//! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`astype`/`copy`/`max`/`min`. Blocker #2012. |
+//! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2013. |
+//! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSC analog (R-SUBSTRATE-1). Blocker #2014. |
 
 use std::ops::{Add, AddAssign, Mul, MulAssign};
 
