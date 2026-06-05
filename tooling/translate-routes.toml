@@ -1246,3 +1246,11 @@ upstream = [
 ]
 design = ".design/numerical/sparse_eig.md"
 parity_ops = ["eigsh"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/optimize.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/optimize/__init__.py",
+]
+design = ".design/numerical/optimize.md"
+parity_ops = ["minimize_newton_cg", "minimize_trust_ncg", "minimize_powell", "minimize_scalar_bounded"]

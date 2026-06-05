@@ -23,6 +23,32 @@
 //! value and gradient, plus a second closure for Hessian-vector products.
 //! `Powell` requires only the objective.
 //!
+//! ## REQ status
+//!
+//! Mirrors `scipy.optimize.minimize`/`minimize_scalar` (`scipy/optimize/__init__.py`;
+//! live oracle scipy 1.17; optimizers converge to the unique minimum). Design doc:
+//! `.design/numerical/optimize.md` (13 REQs). Every REQ is BINARY (R-DEFER-2):
+//! SHIPPED or NOT-STARTED (with a concrete blocker). Converged minima are
+//! oracle-verified (R-CHAR-3) — see `tests/divergence_optimize.rs`.
+//!
+//! **5 SHIPPED / 8 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (`NewtonCG` converged x*) | SHIPPED | `minimize(method='newton-cg')` analog reaches scipy's minimum (`0.5(x0²+2x1²)` from `[5,3]` → `[0,0]` ≤1e-8). Guard `newton_cg_quadratic_reaches_scipy_minimum`. |
+//! | REQ-2 (`TrustRegionNCG` converged x*) | SHIPPED | `method='trust-ncg'` analog reaches `[0,0]` (quadratic) and Rosenbrock `[1,1]` (≤1e-4). Guards `trust_ncg_*`. |
+//! | REQ-3 (`Powell` converged x*) | SHIPPED | derivative-free `method='powell'` analog reaches `[1,2]` (shifted quad) and Rosenbrock `[1,1]` with `fun<1e-8` — verified without gradient. Guards `powell_*`. |
+//! | REQ-4 (`brent_bounded` converged x*) | SHIPPED | `minimize_scalar(method='bounded')` analog: `(x-2)²` on `[0,5]` → `2.0`; `sin` on `[0,2π]` → `3π/2`. Guards `brent_bounded_*`. |
+//! | REQ-11 (`brent_bounded` production consumer) | SHIPPED | consumed by `ferrolearn-preprocess/src/power_transformer.rs` (PowerTransformer Box-Cox/Yeo-Johnson lambda search). |
+//! | REQ-5 (OptimizeResult attribute contract) | NOT-STARTED | missing `nfev`/`njev`/`jac`/`hess_inv`/`status`/`message`; name drift `n_iter`↔`nit`, `converged`↔`success`. Blocker #1987. |
+//! | REQ-6 (missing `minimize` methods) | NOT-STARTED | no BFGS/L-BFGS-B/CG/Nelder-Mead/SLSQP/TNC/... (L-BFGS-B is the GPR/GPC hyperparam-opt prereq #1922/#1934). Blocker #1988. |
+//! | REQ-7 (missing scipy.optimize functions) | NOT-STARTED | no root/least_squares/curve_fit/brentq/fsolve/linprog/nnls/root_scalar + minimize_scalar brent/golden. Blocker #1989. |
+//! | REQ-8 (bounds / constraints) | NOT-STARTED | multivariate optimizers are unconstrained (only `brent_bounded` has an interval). Blocker #1990. |
+//! | REQ-9 (API contract) | NOT-STARTED | builder `NewtonCG::new().with_*().minimize(...)` vs scipy `minimize(fun, x0, method=, ...)`. Blocker #1991. |
+//! | REQ-10 (error handling) | NOT-STARTED | `converged: bool` flag (+ `Result<_, String>`) vs scipy `success`/`status`/`message` / `FerroError`. Blocker #1992. |
+//! | REQ-12 (NewtonCG/TrustRegionNCG/Powell consumer) | NOT-STARTED | no non-test caller for the three multivariate optimizers (only `brent_bounded` is consumed). Blocker #1993. |
+//! | REQ-13 (ferray substrate) | NOT-STARTED | hand-rolled `ndarray` vector algebra vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1994. |
+//!
 //! # Example
 //!
 //! ```
