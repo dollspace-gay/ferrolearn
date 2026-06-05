@@ -220,7 +220,6 @@ fn green_req2_unweighted_fold_mean() {
 /// halving searches also consume it, so the fix benefits all of them; pinned
 /// here only via grid_search.
 #[test]
-#[ignore = "divergence: best_index picks last (not first) on tie; tracking #1776"]
 fn best_index_first_on_tie() {
     let grid = param_grid! { "c" => [4.0_f64, 6.0_f64] };
     let mut gs = GridSearchCV::new(
@@ -288,7 +287,6 @@ fn best_index_first_on_tie() {
 /// ferrolearn `best_index()` on means `[0.0, NaN]` returns `Some(1)` (the NaN
 /// candidate). Tracking #1782 (new-blocker).
 #[test]
-#[ignore = "divergence: NaN mean wins when last instead of tied-worst; tracking #1782"]
 fn best_index_nan_mean_tied_worst() {
     // Estimator that predicts NaN when the param flags it, otherwise a constant.
     struct MaybeNan {

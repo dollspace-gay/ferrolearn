@@ -67,13 +67,39 @@ impl CvResults {
 
     /// Return the index of the parameter set with the highest mean score.
     ///
+    /// Mirrors scikit-learn's `best_index_ = results["rank_test_score"].argmin()`
+    /// (`sklearn/model_selection/_search.py:840`) over
+    /// `rankdata(-array_means, method="min")` with NaN means mapped to tied-worst
+    /// (`nan_to_num(array_means, nan=nanmin-1)`, `:1127-1129`). Concretely:
+    ///
+    /// - Ties on the maximum mean are broken by the FIRST (lowest) index, since
+    ///   `np.argmin` returns the first occurrence of rank 1 (strict improvement
+    ///   only replaces the running best).
+    /// - A NaN mean is treated as worse than any finite mean: a finite candidate
+    ///   always outranks a NaN one regardless of position, and a NaN never beats
+    ///   a finite one.
+    /// - If every mean is NaN, all ranks are 1, so `argmin` is index 0.
+    ///
     /// Returns `None` if no results have been recorded.
     pub fn best_index(&self) -> Option<usize> {
-        self.mean_scores
-            .iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i)
+        if self.mean_scores.is_empty() {
+            return None;
+        }
+        let mut best_i = 0usize;
+        let mut best = self.mean_scores[0];
+        for (i, &m) in self.mean_scores.iter().enumerate().skip(1) {
+            let better = match (best.is_nan(), m.is_nan()) {
+                (true, false) => true,      // finite candidate beats a NaN running-best
+                (false, true) => false,     // NaN candidate never beats a finite best
+                (true, true) => false,      // both NaN: keep the earlier index
+                (false, false) => m > best, // strict > ⇒ first index wins on ties
+            };
+            if better {
+                best = m;
+                best_i = i;
+            }
+        }
+        Some(best_i)
     }
 }
 
