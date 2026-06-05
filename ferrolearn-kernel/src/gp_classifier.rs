@@ -14,6 +14,38 @@
 //!    covariance `(K^{-1} + W)^{-1}`, where `W = diag(pi * (1 - pi))`.
 //!
 //! For multi-class problems, we use one-vs-rest binary GP classifiers.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.gaussian_process.GaussianProcessClassifier` (`_gpc.py:487`,
+//! and its internal `_BinaryGaussianProcessClassifierLaplace` `:37`, v1.5.2 commit
+//! 156ef14). Design doc: `.design/kernel/gp_classifier.md` (17 REQs). Every REQ is
+//! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GPC is
+//! DETERMINISTIC (fixed kernel) so predict/predict_proba/LML are oracle-verified
+//! element-wise against the live sklearn 1.5.2 (`optimizer=None`); the headline
+//! gap is the absent hyperparameter optimization (deps gp_kernels #1912/#1913).
+//!
+//! **11 SHIPPED / 6 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (binary posterior mode f̂/π̂) | SHIPPED | `fit_binary_gpc` Newton/Laplace loop (`_gpc.py:438-450`); oracle `pi_` match. |
+//! | REQ-2 (binary latent-sign predict) | SHIPPED | FIXED #1932: binary `predict` now decides by the sign of `f̄* = K*·(y−π̂)` (`np.where(f_star>0, ...)`, `_gpc.py:289-291`), NOT argmax-of-proba; pinned by `divergence_binary_predict_latent_sign` (was `[0,0,1]` vs sklearn `[0,1,1]` at `f̄*=+6.9e-17`). |
+//! | REQ-3 (binary LML value) | SHIPPED | `binary_log_marginal_likelihood` algebraically equals sklearn's `Z` (`_gpc.py:454-458`); oracle `-3.5259`. |
+//! | REQ-4 (score / mean accuracy) | SHIPPED | `score` = accuracy on `predict` (sklearn `ClassifierMixin.score`); oracle `1.0`. |
+//! | REQ-5 (classes ordering) | SHIPPED | sorted-unique `classes`, matching `np.unique(y)` (`_gpc.py:721`). |
+//! | REQ-6 (max_iter_predict default 100) | SHIPPED | `new` sets `max_iter=100` (`_gpc.py:159`,`:665`). |
+//! | REQ-7 (n_classes==1 error) | SHIPPED | `fit` errors on `<2` classes, matching sklearn `ValueError` (`_gpc.py:723-728`). |
+//! | REQ-8 (production consumer) | SHIPPED | `lib.rs` re-export — the boundary estimator API (no Python GP binding, R-DEFER-1/S5). |
+//! | REQ-9 (predict_proba LAMBDAS/COEFS squash) | SHIPPED | FIXED #1931: `predict_binary_proba` now uses sklearn's 5-term LAMBDAS/COEFS erf approximation (`_gpc.py:31-37`,`:324-331`) via `statrs` `erf`, not the MacKay probit; oracle-verified element-wise (~1e-13) across high/low/boundary/far/coincident points. Pinned by `divergence_binary_predict_proba_squashing`. |
+//! | REQ-10 (hyperparameter optimization) | NOT-STARTED | `fit` never optimizes; sklearn default `optimizer="fmin_l_bfgs_b"` (`_gpc.py:215-254`). Needs gp_kernels `eval_gradient` #1912 + `bounds` #1913 + L-BFGS-B. Blocker #1934. |
+//! | REQ-11 (posterior-mode convergence + W-clamp) | NOT-STARTED | converges on max-f-change<tol + clamps W to 1e-12; sklearn uses LML-change<1e-10, no clamp (`_gpc.py:454-462`). Benign at the fixtures (π̂ matches). Blocker #1935. |
+//! | REQ-12 (multi-class LML aggregation) | SHIPPED | FIXED #1933: `log_marginal_likelihood` now returns the MEAN of per-binary LMLs for multi-class (`np.mean`, `_gpc.py:743-749`), not the sum; oracle `-5.2469` (3-class). Pinned by `divergence_multiclass_lml_mean_vs_sum`. |
+//! | REQ-13 (OvR predict_proba normalization) | SHIPPED | multi-class `predict_proba` row-normalizes the per-class LAMBDAS/COEFS probabilities; with REQ-9 fixed, the full `n×n_classes` matrix matches sklearn's OvR `predict_proba` (`_gpc.py:779-807`) element-wise (~1e-13). Guard `green_audit_multiclass_ovr_predict_proba`. |
+//! | REQ-14 (multi_class one_vs_one) | NOT-STARTED | OvR-only; sklearn supports `multi_class="one_vs_one"` (`_gpc.py:734-737`). Blocker #1937. |
+//! | REQ-15 (LML theta-arg + gradient API) | NOT-STARTED | `log_marginal_likelihood` evaluates only at the fitted theta; sklearn's takes `theta`+gradient (`_gpc.py:335-412`). Needs #1912. Blocker #1936. |
+//! | REQ-16 (constructor surface) | NOT-STARTED | no `kernel=None`→`C(1.0)*RBF(1.0)`, `optimizer`, `n_restarts_optimizer`, `warm_start`, `copy_X_train`, `multi_class`, `random_state`, `n_jobs` (`_gpc.py:659-680`). Blocker #1938. |
+//! | REQ-17 (ferray substrate) | NOT-STARTED | `ndarray` + hand-rolled cholesky + `statrs` erf vs `ferray-core`/`ferray::linalg`/`ferray::stats`. Blocker #1940. |
 
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -21,6 +53,22 @@ use num_traits::Float;
 use ferrolearn_core::{FerroError, Fit, Predict};
 
 use crate::gp_kernels::{GPKernel, RBFKernel};
+
+/// Lambda coefficients for approximating the logistic sigmoid by a linear
+/// combination of 5 error functions (Williams & Barber). Verbatim from
+/// scikit-learn `sklearn/gaussian_process/_gpc.py:31`.
+const LAMBDAS: [f64; 5] = [0.41, 0.4, 0.37, 0.44, 0.39];
+
+/// Coefficients paired with [`LAMBDAS`] for the 5-term error-function
+/// approximation of the logistic sigmoid. Verbatim from scikit-learn
+/// `sklearn/gaussian_process/_gpc.py:32-34`.
+const COEFS: [f64; 5] = [
+    -1854.8214151,
+    3516.89893646,
+    221.29346712,
+    128.12323805,
+    -2010.49422654,
+];
 
 /// Gaussian Process classifier using Laplace approximation.
 ///
@@ -150,16 +198,29 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianProcessClassifier<F> {
     /// Computes the Laplace approximation to the GP log marginal likelihood
     /// (Rasmussen & Williams "Gaussian Processes for Machine Learning"
     /// eq. 3.32 / Algorithm 5.1). For one-vs-rest multi-class models the
-    /// per-class binary log marginal likelihoods are summed.
+    /// per-class binary log marginal likelihoods are AVERAGED (mean), matching
+    /// scikit-learn's `GaussianProcessClassifier.log_marginal_likelihood`
+    /// (`sklearn/gaussian_process/_gpc.py:743-749`,
+    /// `np.mean([estimator.log_marginal_likelihood() ...])` for `n_classes_ > 2`).
+    /// For the binary case there is a single estimator, so the mean equals that
+    /// estimator's value (`_gpc.py:751-753`).
     ///
     /// This value is the standard objective for kernel hyperparameter
     /// selection and model comparison.
     #[must_use]
     pub fn log_marginal_likelihood(&self) -> F {
-        self.binary_models
+        let sum = self
+            .binary_models
             .iter()
             .map(binary_log_marginal_likelihood)
-            .fold(F::zero(), |a, b| a + b)
+            .fold(F::zero(), |a, b| a + b);
+        // Mean of the per-binary LMLs (sklearn `_gpc.py:743-749`). `binary_models`
+        // is never empty after a successful fit (>= 2 classes => >= 1 model);
+        // guard against a zero divisor to avoid producing NaN.
+        match F::from(self.binary_models.len()) {
+            Some(n) if !n.is_zero() => sum / n,
+            _ => F::zero(),
+        }
     }
 
     /// Class labels seen at fit time, in sorted order.
@@ -434,14 +495,54 @@ fn binary_log_marginal_likelihood<F: Float + Send + Sync + 'static>(
     quadratic + log_lik - log_det_half
 }
 
+/// Predictive latent posterior mean `f_bar* = K* @ (y - pi_hat)` for one
+/// binary GP at new points (Rasmussen & Williams Algorithm 3.2, eq. 3.21 /
+/// `_gpc.py:289`).
+///
+/// This is the latent decision function whose SIGN sklearn uses for the hard
+/// binary class decision (`np.where(f_star > 0, classes_[1], classes_[0])`,
+/// `_gpc.py:291`) — NOT the squashed `predict_proba`. It is the same quantity
+/// computed at the top of [`predict_binary_proba`].
+fn predict_binary_latent_mean<F: Float + Send + Sync + 'static>(
+    model: &FittedBinaryGPC<F>,
+    x: &Array2<F>,
+) -> Result<Array1<F>, FerroError> {
+    if x.ncols() != model.x_train.ncols() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![x.nrows(), model.x_train.ncols()],
+            actual: vec![x.nrows(), x.ncols()],
+            context: "predict feature count must match training data".into(),
+        });
+    }
+
+    // K* = k(X_new, X_train), shape (n_pred, n_train).
+    let k_star = model.kernel.compute(x, &model.x_train);
+
+    // Gradient at convergence: y - pi_hat.
+    let y_minus_pi: Array1<F> = model
+        .y_binary
+        .iter()
+        .zip(model.pi_hat.iter())
+        .map(|(&yi, &pi)| yi - pi)
+        .collect();
+
+    // Predictive latent mean: f_bar* = K* (y - pi_hat).
+    Ok(k_star.dot(&y_minus_pi))
+}
+
 /// Predict binary class probabilities at new points using Rasmussen &
 /// Williams Algorithm 3.2 (Laplace approximation with predictive variance).
 ///
 /// 1. Predictive latent mean: `f_bar* = K* @ (y - pi_hat)` (eq. 3.21).
 /// 2. Predictive latent variance: `v = L^{-1} sqrt(W) K*^T`,
 ///    `var* = k(x*, x*) - sum(v^2)` (eq. 3.24).
-/// 3. Class probability via MacKay's probit approximation:
-///    `pi_bar* = Phi(f_bar* / sqrt(1 + pi*var*/8))` (eq. 3.25).
+/// 3. Class probability via the 5-term LAMBDAS/COEFS error-function
+///    approximation of the logistic sigmoid (Williams & Barber), mirroring
+///    scikit-learn `sklearn/gaussian_process/_gpc.py:324-331`:
+///    `alpha = 1/(2 var*)`, `gamma = LAMBDAS * f_bar*`,
+///    `integrals = sqrt(pi/alpha) * erf(gamma * sqrt(alpha/(alpha + LAMBDAS^2)))
+///                 / (2 sqrt(var* * 2 pi))`,
+///    `pi* = (COEFS * integrals).sum() + 0.5 * COEFS.sum()`.
 fn predict_binary_proba<F: Float + Send + Sync + 'static>(
     model: &FittedBinaryGPC<F>,
     x: &Array2<F>,
@@ -460,16 +561,9 @@ fn predict_binary_proba<F: Float + Send + Sync + 'static>(
     // K* = k(X_new, X_train), shape (n_pred, n_train).
     let k_star = model.kernel.compute(x, &model.x_train);
 
-    // Gradient at convergence: y - pi_hat.
-    let y_minus_pi: Array1<F> = model
-        .y_binary
-        .iter()
-        .zip(model.pi_hat.iter())
-        .map(|(&yi, &pi)| yi - pi)
-        .collect();
-
-    // Predictive latent mean: f_bar* = K* (y - pi_hat).
-    let f_bar = k_star.dot(&y_minus_pi);
+    // Predictive latent mean: f_bar* = K* (y - pi_hat) (same quantity sklearn
+    // uses for the latent-sign decision, `_gpc.py:289`).
+    let f_bar = predict_binary_latent_mean(model, x)?;
 
     // sqrt(W) at convergence: w_i = pi_i (1 - pi_i), clamped consistently with fit.
     let eps = F::from(1e-12).unwrap();
@@ -486,12 +580,18 @@ fn predict_binary_proba<F: Float + Send + Sync + 'static>(
         })
         .collect();
 
-    // Compute predictive variance for each test point and apply MacKay's
-    // probit approximation. Avoids forming the full (n_pred, n_train)
-    // intermediate matrix V = L^{-1} sqrt(W) K*^T explicitly.
-    let pi_const = F::from(std::f64::consts::PI).unwrap();
-    let one_eighth = F::from(0.125).unwrap();
+    // Compute predictive variance for each test point and squash via the
+    // LAMBDAS/COEFS error-function approximation (`_gpc.py:324-331`). Avoids
+    // forming the full (n_pred, n_train) intermediate matrix
+    // V = L^{-1} sqrt(W) K*^T explicitly.
     let mut probs = Array1::<F>::zeros(n_pred);
+
+    // Conversion fallback for the f64 -> F squash result.
+    let to_f = |x: f64| -> Result<F, FerroError> {
+        F::from(x).ok_or_else(|| FerroError::NumericalInstability {
+            message: "predict_proba: squashed probability not representable in F".into(),
+        })
+    };
 
     for i in 0..n_pred {
         // k_i = K(x_train, x_i), shape (n_train,).
@@ -516,15 +616,32 @@ fn predict_binary_proba<F: Float + Send + Sync + 'static>(
         let v_sq: F = v.iter().map(|&vi| vi * vi).fold(F::zero(), |a, b| a + b);
         let var_star = (k_xx - v_sq).max(F::zero());
 
-        // MacKay probit approximation: kappa = 1 / sqrt(1 + pi * var/8).
-        let kappa = (F::one() + pi_const * var_star * one_eighth).sqrt().recip();
-        let scaled = f_bar[i] * kappa;
+        // 5-term LAMBDAS/COEFS error-function approximation of the logistic
+        // sigmoid (`_gpc.py:324-331`). Computed in f64 regardless of F.
+        // `f_star`/`var_f_star` here mirror sklearn's predictive mean/variance.
+        let f_star = f_bar[i].to_f64().unwrap_or(0.0);
+        let mut var_f_star = var_star.to_f64().unwrap_or(0.0);
+        // `alpha = 1 / (2 var*)` blows up at var* ~ 0; floor var* so the erf
+        // integral stays finite (matches numpy's finite-precision behavior).
+        if var_f_star <= 0.0 {
+            var_f_star = f64::MIN_POSITIVE;
+        }
+        let alpha = 1.0 / (2.0 * var_f_star);
+        let mut pi_star = 0.0_f64;
+        let mut coefs_sum = 0.0_f64;
+        for (lambda_k, coef_k) in LAMBDAS.iter().zip(COEFS.iter()) {
+            let gamma = lambda_k * f_star;
+            let integral = (std::f64::consts::PI / alpha).sqrt()
+                * statrs::function::erf::erf(
+                    gamma * (alpha / (alpha + lambda_k * lambda_k)).sqrt(),
+                )
+                / (2.0 * (var_f_star * 2.0 * std::f64::consts::PI).sqrt());
+            pi_star += coef_k * integral;
+            coefs_sum += coef_k;
+        }
+        pi_star += 0.5 * coefs_sum;
 
-        // sigmoid(scaled) is a close, monotonic approximation to Phi(scaled)
-        // on the integration `int sigmoid(f) N(f; mu, sigma^2) df` and is the
-        // formulation used in scikit-learn's GaussianProcessClassifier. See
-        // R&W §3.4.2 for the exact erf-based variant.
-        probs[i] = sigmoid(scaled);
+        probs[i] = to_f(pi_star)?;
     }
 
     Ok(probs)
@@ -675,20 +792,38 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGaussianProc
     type Error = FerroError;
 
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
-        let proba = self.predict_proba(x)?;
         let n_samples = x.nrows();
         let mut predictions = Array1::<usize>::zeros(n_samples);
 
-        for i in 0..n_samples {
-            let mut best_class = 0;
-            let mut best_prob = proba[[i, 0]];
-            for c in 1..self.classes.len() {
-                if proba[[i, c]] > best_prob {
-                    best_prob = proba[[i, c]];
-                    best_class = c;
-                }
+        if self.classes.len() == 2 {
+            // Binary: decide by the SIGN of the latent posterior mean f_bar*,
+            // matching sklearn `np.where(f_star > 0, classes_[1], classes_[0])`
+            // (`_gpc.py:291`) — NOT argmax of the squashed predict_proba. The
+            // squash crosses 0.5 only approximately at f_bar* = 0, so the two
+            // rules disagree at the decision boundary. Strict `> 0` puts the
+            // exact-zero (and negative) case in classes_[0], as sklearn does.
+            let f_bar = predict_binary_latent_mean(&self.binary_models[0], x)?;
+            for i in 0..n_samples {
+                predictions[i] = if f_bar[i] > F::zero() {
+                    self.classes[1]
+                } else {
+                    self.classes[0]
+                };
             }
-            predictions[i] = self.classes[best_class];
+        } else {
+            // Multi-class OvR: argmax over the per-class probabilities.
+            let proba = self.predict_proba(x)?;
+            for i in 0..n_samples {
+                let mut best_class = 0;
+                let mut best_prob = proba[[i, 0]];
+                for c in 1..self.classes.len() {
+                    if proba[[i, c]] > best_prob {
+                        best_prob = proba[[i, c]];
+                        best_class = c;
+                    }
+                }
+                predictions[i] = self.classes[best_class];
+            }
         }
 
         Ok(predictions)
@@ -853,15 +988,26 @@ mod tests {
     }
 
     #[test]
-    fn log_marginal_likelihood_multiclass_sums_components() {
-        // For OvR multi-class, total LML equals the number of binary components.
+    fn log_marginal_likelihood_multiclass_means_components() {
+        // For OvR multi-class, sklearn returns the MEAN of the per-binary LMLs
+        // (`np.mean([...])`, `_gpc.py:743-749`), NOT their sum.
         let (x, y) = make_multiclass_data();
         let gpc = GaussianProcessClassifier::new(Box::new(RBFKernel::new(1.0)));
         let fitted = gpc.fit(&x, &y).unwrap();
-        let lml = fitted.log_marginal_likelihood();
-        assert!(lml.is_finite());
-        // Should be sum of per-class contributions; each negative => total < 0.
-        assert!(lml < 0.0);
+        let n_models = fitted.classes().len();
+        assert!(n_models > 2, "multi-class fixture must have > 2 classes");
+        let mean = fitted.log_marginal_likelihood();
+        assert!(mean.is_finite());
+        // Every per-class LML is negative, so the mean is negative.
+        assert!(mean < 0.0);
+        // The aggregate is the MEAN (sum / n), not the SUM: reconstructing the
+        // sum from the mean must yield a value strictly below the mean (n > 1).
+        let implied_sum = mean * (n_models as f64);
+        assert!(
+            implied_sum < mean,
+            "aggregate must be the MEAN of per-binary LMLs, not the SUM: \
+             mean={mean}, implied sum={implied_sum}"
+        );
     }
 
     #[test]

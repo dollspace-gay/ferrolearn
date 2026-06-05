@@ -1005,6 +1005,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/_gpr.py"]
 design = ".design/kernel/gaussian_process.md"
 parity_ops = ["GaussianProcessRegressor"]
 
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/gp_classifier.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/_gpc.py"]
+design = ".design/kernel/gp_classifier.md"
+parity_ops = ["GaussianProcessClassifier"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-model-sel (model_selection + compose + multiclass)
 # =====================================================================
