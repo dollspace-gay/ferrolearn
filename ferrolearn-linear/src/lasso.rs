@@ -80,6 +80,8 @@ pub struct Lasso<F> {
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// When `true`, constrain coefficients to be non-negative.
+    pub positive: bool,
 }
 
 impl<F: Float> Lasso<F> {
@@ -94,6 +96,7 @@ impl<F: Float> Lasso<F> {
             max_iter: 1000,
             tol: F::from(1e-4).unwrap(),
             fit_intercept: true,
+            positive: false,
         }
     }
 
@@ -122,6 +125,15 @@ impl<F: Float> Lasso<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set whether to constrain coefficients to be non-negative.
+    ///
+    /// Mirrors `sklearn.linear_model.Lasso(positive=...)`.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
         self
     }
 }
@@ -155,6 +167,16 @@ fn soft_threshold<F: Float>(x: F, threshold: F) -> F {
     } else {
         F::zero()
     }
+}
+
+/// Non-negative soft-thresholding operator for `positive=True` Lasso.
+///
+/// Returns `max(x - threshold, 0)`, dropping the negative branch so the
+/// coordinate is never negative. Mirrors sklearn `_cd_fast.pyx:191-194`
+/// (`if positive and tmp < 0: w[ii] = 0.0`).
+fn soft_threshold_positive<F: Float>(x: F, threshold: F) -> F {
+    let z = x - threshold;
+    if z > F::zero() { z } else { F::zero() }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
@@ -247,9 +269,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 // Compute the unpenalized update: X_j^T r / n.
                 let rho = col_j.dot(&residual) / n_f;
 
-                // Apply soft-thresholding.
+                // Apply soft-thresholding. For `positive=True`, use the
+                // non-negative soft-threshold so the coefficient is never
+                // negative (sklearn `_cd_fast.pyx:191-194`).
                 let w_new = if col_norms[j] > F::zero() {
-                    soft_threshold(rho, self.alpha) / col_norms[j]
+                    let thresholded = if self.positive {
+                        soft_threshold_positive(rho, self.alpha)
+                    } else {
+                        soft_threshold(rho, self.alpha)
+                    };
+                    thresholded / col_norms[j]
                 } else {
                     F::zero()
                 };
@@ -476,6 +505,141 @@ mod tests {
         let fitted = model.fit_pipeline(&x, &y).unwrap();
         let preds = fitted.predict_pipeline(&x).unwrap();
         assert_eq!(preds.len(), 4);
+    }
+
+    #[test]
+    fn test_soft_threshold_positive() {
+        // Non-negative branch: max(x - t, 0). Negative side clamps to 0.
+        assert_relative_eq!(soft_threshold_positive(5.0_f64, 1.0), 4.0);
+        assert_relative_eq!(soft_threshold_positive(-5.0_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(0.5_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(-0.5_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(0.0_f64, 1.0), 0.0);
+    }
+
+    /// Oracle fixture from live sklearn 1.5.2 (R-CHAR-3):
+    /// `X = [[1,3],[2,1],[3,4],[4,2],[5,5],[6,1],[2,4],[5,2]]`,
+    /// `y = X[:,0] - 2*X[:,1] + noise`.
+    fn positive_oracle_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![
+            [1.0, 3.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 2.0],
+            [5.0, 5.0],
+            [6.0, 1.0],
+            [2.0, 4.0],
+            [5.0, 2.0],
+        ];
+        let noise = array![0.1, -0.2, 0.15, 0.0, -0.1, 0.05, 0.2, -0.05];
+        let y: Array1<f64> = (0..8)
+            .map(|i| 1.0 * x[[i, 0]] - 2.0 * x[[i, 1]] + noise[i])
+            .collect();
+        (x, y)
+    }
+
+    #[test]
+    fn lasso_positive_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle:
+        //   Lasso(alpha=0.3, positive=True) -> coef_ [1.14431818, 0.0],
+        //   intercept_ -5.98636364
+        //   (unconstrained Lasso(alpha=0.3) -> coef_ [0.8946582, -1.83087261]).
+        let (x, y) = positive_oracle_fixture();
+
+        let fit_res = Lasso::<f64>::new()
+            .with_alpha(0.3)
+            .with_positive(true)
+            .fit(&x, &y);
+        assert!(fit_res.is_ok(), "positive fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let coef = fitted.coefficients();
+        assert_relative_eq!(coef[0], 1.14431818, epsilon = 1e-5);
+        assert_relative_eq!(coef[1], 0.0, epsilon = 1e-5);
+        assert_relative_eq!(fitted.intercept(), -5.98636364, epsilon = 1e-4);
+
+        // All coefficients are non-negative.
+        for &c in coef.iter() {
+            assert!(c >= 0.0, "coefficient {c} should be non-negative");
+        }
+
+        // Differs materially from the unconstrained solution (~1.8 gap on
+        // feature 1), confirming the constraint is non-tautological.
+        let unc_res = Lasso::<f64>::new().with_alpha(0.3).fit(&x, &y);
+        assert!(unc_res.is_ok(), "unconstrained fit should succeed");
+        let unconstrained = match unc_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        assert!((coef[1] - unconstrained.coefficients()[1]).abs() > 1.0);
+    }
+
+    #[test]
+    fn lasso_positive_false_unchanged() {
+        // positive=false (default) must be byte-identical to the plain fit.
+        let (x, y) = positive_oracle_fixture();
+
+        let default_res = Lasso::<f64>::new().with_alpha(0.3).fit(&x, &y);
+        assert!(default_res.is_ok(), "default fit should succeed");
+        let default_fit = match default_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let false_res = Lasso::<f64>::new()
+            .with_alpha(0.3)
+            .with_positive(false)
+            .fit(&x, &y);
+        assert!(
+            false_res.is_ok(),
+            "explicit positive=false fit should succeed"
+        );
+        let explicit_false = match false_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        assert_eq!(
+            default_fit.coefficients(),
+            explicit_false.coefficients(),
+            "positive=false must be byte-identical to the default fit"
+        );
+        assert_eq!(default_fit.intercept(), explicit_false.intercept());
+    }
+
+    #[test]
+    fn lasso_positive_all_nonneg_unconstrained_equals() {
+        // When the unconstrained solution is already non-negative, the
+        // positive constraint is inactive and yields the same coefficients
+        // (NNLS-style sanity). y = 2*x is positively correlated.
+        let x: Array2<f64> = array![[1.0], [2.0], [3.0], [4.0], [5.0]];
+        let y = array![2.0, 4.0, 6.0, 8.0, 10.0];
+
+        let unc_res = Lasso::<f64>::new().with_alpha(0.1).fit(&x, &y);
+        assert!(unc_res.is_ok(), "unconstrained fit should succeed");
+        let unconstrained = match unc_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        assert!(unconstrained.coefficients()[0] >= 0.0);
+
+        let pos_res = Lasso::<f64>::new()
+            .with_alpha(0.1)
+            .with_positive(true)
+            .fit(&x, &y);
+        assert!(pos_res.is_ok(), "positive fit should succeed");
+        let positive = match pos_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        assert_relative_eq!(
+            positive.coefficients()[0],
+            unconstrained.coefficients()[0],
+            epsilon = 1e-10
+        );
     }
 
     #[test]

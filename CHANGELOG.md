@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for REQ-11 of ridge.md: sample_weight support — Ridge<F>.fit takes (X, y) only; sklearn rescales X,y by sqrt(sample_weight) (_ridge.py:682-688), _check_sample_weight at :956 (#389)
 - Blocker for REQ-5 of linear_regression: needs positive=True NNLS path (scipy.optimize.nnls analog); ferrolearn LinearRegression has no positive param (#371)
 - Blocker for REQ-6 of linear_regression: needs multi-output Y (2-D), coef_ shape (n_targets,n_features); ferrolearn Fit takes Array1 y only (#372)
 - Blocker for REQ-7 of linear_regression: needs sample_weight in fit (_rescale_data sqrt-weight rescaling per _base.py:641); ferrolearn fit has no sample_weight (#373)
