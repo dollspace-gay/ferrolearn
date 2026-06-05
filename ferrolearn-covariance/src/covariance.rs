@@ -59,7 +59,7 @@
 //! | REQ-10 | EllipticEnvelope predict/decision sign (±1) | SHIPPED | structural |
 //! | REQ-11 | contamination interval `(0, 0.5]` | SHIPPED | `fn fit` rejects `≤0` / `>0.5` (`_elliptic_envelope.py:147` closed-right, fixed #1704); `divergence_contamination_right_endpoint` |
 //! | REQ-12 | EllipticEnvelope exact inlier/outlier labels | NOT-STARTED | RNG carve-out via MCD, R-DEFER-3 — blocker #1706 |
-//! | REQ-13 | `mahalanobis` returns SQUARED distance | NOT-STARTED | returns sqrt; sklearn squared (`_empirical_covariance.py:340,353`); coupled to #1705 — blocker #1703 |
+//! | REQ-13 | `mahalanobis` returns SQUARED distance | SHIPPED | `FittedCovariance::mahalanobis` squares the helper output (`.mapv(\|d\| d * d)`); sklearn squared (`_empirical_covariance.py:340,353`); oracle `X=[[0,0],[2,0],[0,2],[2,2]]` → `[2,2,2,2]`; `mahalanobis_returns_squared_matches_sklearn` |
 //! | REQ-14 | `score`/log-likelihood method | NOT-STARTED | absent — blocker #1707 |
 //! | REQ-15 | `error_norm` method | NOT-STARTED | absent — blocker #1707 |
 //! | REQ-16 | `get_precision`/`store_precision` | NOT-STARTED | absent — blocker #1707 |
@@ -367,10 +367,12 @@ impl<F: Float + Send + Sync + 'static> FittedCovariance<F> {
         &self.precision_
     }
 
-    /// Compute per-sample Mahalanobis distances.
+    /// Compute per-sample squared Mahalanobis distances.
     ///
     /// Returns an array of length `n` where each entry is
-    /// `sqrt((x_i - location)^T precision (x_i - location))`.
+    /// `(x_i - location)^T precision (x_i - location)` (the SQUARED
+    /// Mahalanobis distance), matching sklearn's
+    /// `EmpiricalCovariance.mahalanobis` (`_empirical_covariance.py:340,353`).
     ///
     /// # Errors
     ///
@@ -385,7 +387,12 @@ impl<F: Float + Send + Sync + 'static> FittedCovariance<F> {
                 context: "FittedCovariance::mahalanobis".into(),
             });
         }
-        Ok(mahalanobis_distances(x, &self.location_, &self.precision_))
+        // sklearn returns the SQUARED Mahalanobis distance; the private
+        // `mahalanobis_distances` helper returns the (non-squared) distance,
+        // so square at the public API boundary only. Internal MCD/EllipticEnvelope
+        // fitting call sites use the helper directly and keep non-squared
+        // semantics. (`_empirical_covariance.py:340,353`)
+        Ok(mahalanobis_distances(x, &self.location_, &self.precision_).mapv(|d| d * d))
     }
 }
 
@@ -1560,8 +1567,10 @@ impl<F: Float + Send + Sync + 'static> FittedEllipticEnvelope<F> {
     /// Returns [`FerroError::ShapeMismatch`] if `x` has wrong number of columns.
     pub fn decision_function(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         let dists = self.mcd.mahalanobis(x)?;
+        // `mahalanobis` now returns the SQUARED distance (REQ-13), so compare
+        // it directly against the chi-squared threshold (no extra squaring).
         // decision = threshold - dist^2 (positive = inlier)
-        Ok(dists.mapv(|d| self.threshold_ - d * d))
+        Ok(dists.mapv(|d2| self.threshold_ - d2))
     }
 }
 
@@ -1621,7 +1630,9 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedEllipticEnve
     /// Returns [`FerroError::ShapeMismatch`] if `x` has wrong number of columns.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<i32>, FerroError> {
         let dists = self.mcd.mahalanobis(x)?;
-        Ok(dists.mapv(|d| if d * d > self.threshold_ { -1 } else { 1 }))
+        // `mahalanobis` now returns the SQUARED distance (REQ-13); compare it
+        // directly against the squared chi-squared threshold (no extra square).
+        Ok(dists.mapv(|d2| if d2 > self.threshold_ { -1 } else { 1 }))
     }
 }
 
@@ -1691,6 +1702,31 @@ mod tests {
         assert_abs_diff_eq!(dists[0], dists[1], epsilon = 1e-8);
         assert_abs_diff_eq!(dists[0], dists[2], epsilon = 1e-8);
         assert_abs_diff_eq!(dists[0], dists[3], epsilon = 1e-8);
+    }
+
+    #[test]
+    fn mahalanobis_returns_squared_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   from sklearn.covariance import EmpiricalCovariance
+        //   import numpy as np
+        //   X = np.array([[0,0],[2,0],[0,2],[2,2]], float)
+        //   EmpiricalCovariance().fit(X).mahalanobis(X) -> [2., 2., 2., 2.]
+        // (SQUARED Mahalanobis distance, _empirical_covariance.py:340,353).
+        // Pre-fix ferrolearn returned the non-squared sqrt(2) ~= 1.41421356.
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![[0.0, 0.0], [2.0, 0.0], [0.0, 2.0], [2.0, 2.0]];
+        let fitted = est.fit(&x, &())?;
+        let dists = fitted.mahalanobis(&x)?;
+        assert_eq!(dists.len(), 4);
+        for &d in &dists {
+            // Tolerance 1e-7 absorbs the ~2e-8 residual from the precision
+            // Cholesky `reg=1e-8` diagonal regularization (REQ-1b, blocker
+            // #1705), doubled by squaring. This still pins the squared-vs-
+            // non-squared divergence: the bug returned sqrt(2) ~= 1.41421356,
+            // off from 2.0 by ~0.586.
+            assert_abs_diff_eq!(d, 2.0, epsilon = 1e-7);
+        }
+        Ok(())
     }
 
     #[test]
