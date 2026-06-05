@@ -20,7 +20,7 @@
 //! | REQ-3 (feature_range validation) | SHIPPED | `with_feature_range` returns `Err(InvalidParameter)` when `range_min >= range_max`, matching sklearn "Minimum of desired feature range must be smaller than maximum" (`_data.py:476-480`). Guard `req3_feature_range_validation_rejects`. |
 //! | REQ-7 (PyO3 binding) | SHIPPED | `_RsMinMaxScaler` (`extras.rs:1148`, registered `lib.rs:81`) marshals `fit`/`transform` over `FittedMinMaxScaler<f64>` (default range) — a real CPython consumer of REQ-1/REQ-2. |
 //! | REQ-4 (NaN tolerance: allow-nan + nanmin/nanmax) | NOT-STARTED | open prereq blocker #1171. `fit` reduce-min/max poisons on NaN; sklearn `force_all_finite='allow-nan'` + `_nanmin`/`_nanmax` (`_data.py:490-499`). |
-//! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | NOT-STARTED | open prereq blocker #1172. Only `data_min`/`data_max` stored (`_data.py:508-514`). |
+//! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | SHIPPED | FIXED #1172. `Fit::fit` computes `data_range_[j]=data_max[j]-data_min[j]`, `scale_[j]=(fr1-fr0)/handle_zeros(data_range_[j])`, `min_[j]=fr0-data_min[j]*scale_[j]`, `n_samples_seen_=n_rows`, mirroring sklearn (`_data.py:507-514`, `_handle_zeros_in_scale` `:88`). Additive: getters `scale()`/`min()`/`data_range()`/`n_samples_seen()`; `transform`/`inverse_transform` unchanged. Live-oracle tests `min_max_attrs_match_sklearn`, `min_max_scale_handles_zero_range_constant_col`. |
 //! | REQ-6 (inverse_transform) | SHIPPED | FIXED #1173. `FittedMinMaxScaler::inverse_transform` reverses the affine map: per column `j`, `x_orig = (x_scaled - fr0) * span / range_width + data_min[j]` (`span = data_max[j]-data_min[j]`, `range_width = fr1-fr0`), matching sklearn `X -= self.min_; X /= self.scale_` (`_data.py:549-587`,`:508-511`,`:88`). The single formula round-trips both regular and constant columns (`span==0 -> data_min[j]`). `ShapeMismatch` on column-count mismatch (mirrors `transform`). Oracle-grounded in-module tests: `min_max_inverse_roundtrip_matches_sklearn`, `min_max_inverse_custom_range_matches_sklearn`, `min_max_inverse_constant_col`, `min_max_inverse_shape_mismatch`. Consumer: crate re-export (`lib.rs:118`, grandfathered S5). |
 //! | REQ-8 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1174. Single-shot fit (`_data.py:489-515`). |
 //! | REQ-9 (minmax_scale free fn + axis) | NOT-STARTED | open prereq blocker #1175. No free fn / axis=1 (`_data.py:589`). |
@@ -119,6 +119,17 @@ pub struct FittedMinMaxScaler<F> {
     pub(crate) data_max: Array1<F>,
     /// The target output range `(range_min, range_max)`.
     pub(crate) feature_range: (F, F),
+    /// Per-column affine scale `scale_[j] = (fr1 - fr0) / handle_zeros(data_range_[j])`
+    /// (`sklearn/preprocessing/_data.py:508-510`, `:88`).
+    pub(crate) scale_: Array1<F>,
+    /// Per-column affine offset `min_[j] = fr0 - data_min[j] * scale_[j]`
+    /// (`sklearn/preprocessing/_data.py:511`).
+    pub(crate) min_: Array1<F>,
+    /// Per-column raw data range `data_range_[j] = data_max[j] - data_min[j]`
+    /// (`sklearn/preprocessing/_data.py:507`,`:514`).
+    pub(crate) data_range_: Array1<F>,
+    /// Number of samples seen during fitting (`sklearn/preprocessing/_data.py:501`).
+    pub(crate) n_samples_seen_: usize,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedMinMaxScaler<F> {
@@ -138,6 +149,41 @@ impl<F: Float + Send + Sync + 'static> FittedMinMaxScaler<F> {
     #[must_use]
     pub fn feature_range(&self) -> (F, F) {
         self.feature_range
+    }
+
+    /// Return the per-column affine scale learned during fitting.
+    ///
+    /// `scale_[j] = (feature_range.1 - feature_range.0) / handle_zeros(data_range_[j])`,
+    /// where `handle_zeros(d) = if d == 0 { 1 } else { d }`
+    /// (`sklearn/preprocessing/_data.py:508-510`, `_handle_zeros_in_scale` `:88`).
+    #[must_use]
+    pub fn scale(&self) -> &Array1<F> {
+        &self.scale_
+    }
+
+    /// Return the per-column affine offset learned during fitting.
+    ///
+    /// `min_[j] = feature_range.0 - data_min[j] * scale_[j]`
+    /// (`sklearn/preprocessing/_data.py:511`).
+    #[must_use]
+    pub fn min(&self) -> &Array1<F> {
+        &self.min_
+    }
+
+    /// Return the per-column raw data range learned during fitting.
+    ///
+    /// `data_range_[j] = data_max[j] - data_min[j]` (`0` on a constant column;
+    /// `sklearn/preprocessing/_data.py:507`,`:514`).
+    #[must_use]
+    pub fn data_range(&self) -> &Array1<F> {
+        &self.data_range_
+    }
+
+    /// Return the number of samples seen during fitting
+    /// (`sklearn/preprocessing/_data.py:501`).
+    #[must_use]
+    pub fn n_samples_seen(&self) -> usize {
+        self.n_samples_seen_
     }
 
     /// Undo the scaling of `x` according to `feature_range`, mapping scaled
@@ -231,10 +277,32 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinMaxScaler<F> {
             data_max[j] = max;
         }
 
+        // Derived affine attributes mirroring sklearn (_data.py:507-514, :88).
+        let (fr0, fr1) = self.feature_range;
+        let range_width = fr1 - fr0;
+        let data_range_ = &data_max - &data_min;
+        let mut scale_ = Array1::zeros(n_features);
+        let mut min_ = Array1::zeros(n_features);
+        for j in 0..n_features {
+            // _handle_zeros_in_scale (_data.py:88): a zero (constant-column)
+            // range is replaced by 1 to avoid division by zero.
+            let denom = if data_range_[j] == F::zero() {
+                F::one()
+            } else {
+                data_range_[j]
+            };
+            scale_[j] = range_width / denom;
+            min_[j] = fr0 - data_min[j] * scale_[j];
+        }
+
         Ok(FittedMinMaxScaler {
             data_min,
             data_max,
             feature_range: self.feature_range,
+            scale_,
+            min_,
+            data_range_,
+            n_samples_seen_: n_samples,
         })
     }
 }
@@ -521,6 +589,59 @@ mod tests {
             assert_abs_diff_eq!(recovered[[i, 0]], sk_col0[i], epsilon = 1e-9);
             assert_abs_diff_eq!(recovered[[i, 1]], 5.0, epsilon = 1e-9);
         }
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-5: scale_/min_/data_range_/n_samples_seen_ fitted attributes
+    // (sklearn _data.py:507-514, _handle_zeros_in_scale :88). Live sklearn
+    // 1.5.2 oracle values (R-CHAR-3).
+    // -----------------------------------------------------------------------
+
+    /// Fitted affine attributes match sklearn (default range, non-constant cols).
+    /// Live oracle: `m=MinMaxScaler().fit([[1.,10.],[2.,20.],[3.,30.],[5.,50.]])`
+    ///   -> `m.scale_=[0.25,0.025]`, `m.min_=[-0.25,-0.25]`,
+    ///      `m.data_range_=[4.,40.]`, `m.n_samples_seen_=4`.
+    #[test]
+    fn min_max_attrs_match_sklearn() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::new();
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [5.0, 50.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        let scale = fitted.scale();
+        let min = fitted.min();
+        let data_range = fitted.data_range();
+
+        assert_abs_diff_eq!(scale[0], 0.25, epsilon = 1e-9);
+        assert_abs_diff_eq!(scale[1], 0.025, epsilon = 1e-9);
+        assert_abs_diff_eq!(min[0], -0.25, epsilon = 1e-9);
+        assert_abs_diff_eq!(min[1], -0.25, epsilon = 1e-9);
+        assert_abs_diff_eq!(data_range[0], 4.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(data_range[1], 40.0, epsilon = 1e-9);
+        assert_eq!(fitted.n_samples_seen(), 4);
+        Ok(())
+    }
+
+    /// Constant column: `data_range_=0` is replaced by 1 in `scale_`
+    /// (_handle_zeros_in_scale, _data.py:88). Live oracle:
+    ///   `m=MinMaxScaler(feature_range=(-1,1)).fit([[1.,5.],[2.,5.],[3.,5.]])`
+    ///   -> `m.data_range_=[2.,0.]`, `m.scale_=[1.,2.]`, `m.min_=[-2.,-11.]`.
+    #[test]
+    fn min_max_scale_handles_zero_range_constant_col() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::with_feature_range(-1.0, 1.0)?;
+        let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        let scale = fitted.scale();
+        let min = fitted.min();
+        let data_range = fitted.data_range();
+
+        assert_abs_diff_eq!(data_range[0], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(data_range[1], 0.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(scale[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(scale[1], 2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(min[0], -2.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(min[1], -11.0, epsilon = 1e-9);
         Ok(())
     }
 
