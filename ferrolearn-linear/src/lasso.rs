@@ -27,7 +27,7 @@
 //! | REQ-6 (alpha≥0 validation; alpha=0 → OLS) | SHIPPED | negative-alpha → `InvalidParameter`; alpha=0 matches sklearn to 1e-6. Defaults max_iter=1000/tol=1e-4 match sklearn. |
 //! | REQ-7 (positive=True) | NOT-STARTED | #407. |
 //! | REQ-8 (warm_start) | NOT-STARTED | #408. |
-//! | REQ-9 (selection='random' + random_state) | NOT-STARTED | #409. |
+//! | REQ-9 (selection='random' + random_state) | SHIPPED | `pub enum CoordSelection { Cyclic, Random }` + `pub selection`/`pub random_state` fields on `Lasso` with `with_selection`/`with_random_state` builders, mirroring sklearn `Lasso(selection=..., random_state=...)` (`_coordinate_descent.py` `__init__`). `Fit::fit`'s CD loop visits `0..n_features` in order for `Cyclic` (BYTE-IDENTICAL to the prior cyclic path) and shuffles a reused index `Vec` each sweep for `Random` via `StdRng::seed_from_u64(random_state.unwrap_or(0))` (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch picks `ii` instead of `f_iter`); per-coordinate update math + dual-gap stopping are unchanged. The Lasso optimum is unique, so `Random` converges to the same optimum (≈1e-3 from cyclic due to stopping-within-tol). Exact bit-match to sklearn's `selection='random'` is numpy-MT19937-RNG-blocked (Rust `StdRng` ≠ numpy MT), so the random path verifies convergence-to-the-unique-optimum, not bitwise sklearn parity; the cyclic default IS bit-exact. Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_selection_cyclic_default_unchanged`, `lasso_selection_random_converges_to_optimum`). |
 //! | REQ-10 (precompute/Gram) | NOT-STARTED | #410. |
 //! | REQ-11 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedLasso<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `Lasso.n_iter_` (`_coordinate_descent.py:1103`) and `dual_gap_` (`:1108`). `fn lasso_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·n`, `beta=0`) with a final `/n` mapping to the `(1/2n)` objective. With REQ-12's dual-gap stopping criterion now landed, `n_iter_`'s VALUE matches sklearn exactly (`n_iter_ == 20` at alpha=0.3 and alpha=0.1 on the fixture); `dual_gap_` matches sklearn's formula/value (`0.00011701482` at alpha=0.3). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_formula_matches_numpy`, `lasso_fitted_dual_gap_and_n_iter`, `lasso_fields_dont_change_coef`, `lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`). |
 //! | REQ-12 (dual-gap stopping criterion) | SHIPPED | `Fit::fit for Lasso` now uses sklearn's two-level criterion (`_cd_fast.pyx:167-249`): `tol_scaled = tol·(target·target)` (`:167-168`), per sweep track `w_max`/`d_w_max`, gate on `w_max==0 || d_w_max/w_max < tol || last_iter` (`:207-211`), and inside the gate break only when the UN-normalized gap `lasso_dual_gap(...)·n < tol_scaled` (`:249`). Matches sklearn's `coef_` to ≤1e-7 and `n_iter_` exactly (20 at alpha=0.3 and alpha=0.1). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`, `lasso_dual_gap_stopping_second_alpha`). |
@@ -59,6 +59,25 @@ use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2, Axis, ScalarOperand};
 use num_traits::{Float, FromPrimitive};
+use rand::SeedableRng;
+use rand::seq::SliceRandom;
+
+/// Coordinate-selection order for the coordinate-descent solver.
+///
+/// Mirrors sklearn's `Lasso(selection=...)` / `ElasticNet(selection=...)`
+/// parameter (`_coordinate_descent.py`, `__init__` default `'cyclic'`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CoordSelection {
+    /// Sweep coordinates `0..n_features` in order each pass (sklearn default,
+    /// `selection='cyclic'`). Bit-exact to sklearn's cyclic path.
+    #[default]
+    Cyclic,
+    /// Visit coordinates in a random order each pass (sklearn
+    /// `selection='random'`). Often converges faster when features are
+    /// correlated; the Lasso optimum is unique here so it reaches the same
+    /// limit (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch).
+    Random,
+}
 
 /// Lasso regression (L1-regularized least squares).
 ///
@@ -82,6 +101,15 @@ pub struct Lasso<F> {
     pub fit_intercept: bool,
     /// When `true`, constrain coefficients to be non-negative.
     pub positive: bool,
+    /// Order in which coordinates are visited each coordinate-descent sweep.
+    ///
+    /// Mirrors sklearn `Lasso(selection=...)` (default `Cyclic`).
+    pub selection: CoordSelection,
+    /// Seed for the RNG used when `selection == CoordSelection::Random`.
+    ///
+    /// Mirrors sklearn `Lasso(random_state=...)` (default `None`). `None`
+    /// falls back to seed `0`.
+    pub random_state: Option<u64>,
 }
 
 impl<F: Float> Lasso<F> {
@@ -97,6 +125,8 @@ impl<F: Float> Lasso<F> {
             tol: F::from(1e-4).unwrap(),
             fit_intercept: true,
             positive: false,
+            selection: CoordSelection::Cyclic,
+            random_state: None,
         }
     }
 
@@ -134,6 +164,24 @@ impl<F: Float> Lasso<F> {
     #[must_use]
     pub fn with_positive(mut self, positive: bool) -> Self {
         self.positive = positive;
+        self
+    }
+
+    /// Set the coordinate-selection order for coordinate descent.
+    ///
+    /// Mirrors `sklearn.linear_model.Lasso(selection=...)`.
+    #[must_use]
+    pub fn with_selection(mut self, selection: CoordSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Set the RNG seed used when `selection == CoordSelection::Random`.
+    ///
+    /// Mirrors `sklearn.linear_model.Lasso(random_state=...)`.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
         self
     }
 }
@@ -313,13 +361,25 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let d_w_tol = self.tol;
         let tol_scaled = self.tol * target.dot(&target);
 
+        // For `selection == Random`, build the RNG ONCE before the sweep loop
+        // and reuse a reusable index buffer; each sweep shuffles the visiting
+        // order (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random`
+        // branch picks `ii` via `rand_int` instead of the cyclic `f_iter`).
+        // `Cyclic` keeps the byte-identical `0..n_features` order.
+        let mut rng = rand::rngs::StdRng::seed_from_u64(self.random_state.unwrap_or(0));
+        let mut order: Vec<usize> = (0..n_features).collect();
+
         let mut n_iter = 0_usize;
         for iter in 0..self.max_iter {
             n_iter = iter + 1;
             let mut w_max = F::zero();
             let mut d_w_max = F::zero();
 
-            for j in 0..n_features {
+            if self.selection == CoordSelection::Random {
+                order.shuffle(&mut rng);
+            }
+
+            for &j in &order {
                 let col_j = x_work.column(j);
 
                 // Compute partial residual: r + X_j * w_j
@@ -877,6 +937,105 @@ mod tests {
         assert_relative_eq!(fitted.coefficients()[1], 1.52201988, epsilon = 1e-7);
         assert_eq!(fitted.n_iter(), 20, "n_iter_ must match sklearn's 20");
         assert_relative_eq!(fitted.dual_gap(), 0.00013156578, epsilon = 1e-7);
+    }
+
+    /// Oracle fixture for the selection tests (R-CHAR-3, live sklearn 1.5.2):
+    /// `X = [[1,2],[2,1],[3,4],[4,3],[5,5]]`, `y = [3,2.5,7.1,6,11.2]`,
+    /// `alpha=0.3`.
+    fn selection_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        (x, y)
+    }
+
+    #[test]
+    fn lasso_selection_cyclic_default_unchanged() {
+        // Default Lasso selection is Cyclic; coef must stay byte-identical to
+        // the prior cyclic path. Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   Lasso(alpha=0.3, selection='cyclic') -> coef_ [0.66691036, 1.46647171].
+        let (x, y) = selection_fixture();
+
+        // Default selection is Cyclic.
+        assert_eq!(Lasso::<f64>::new().selection, CoordSelection::Cyclic);
+
+        let default_res = Lasso::<f64>::new().with_alpha(0.3).fit(&x, &y);
+        assert!(default_res.is_ok(), "default fit should succeed");
+        let default_fit = match default_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        // Matches sklearn's cyclic oracle tightly.
+        assert_relative_eq!(default_fit.coefficients()[0], 0.66691036, epsilon = 1e-7);
+        assert_relative_eq!(default_fit.coefficients()[1], 1.46647171, epsilon = 1e-7);
+
+        // Explicitly-constructed Cyclic is byte-identical to the default.
+        let explicit_res = Lasso::<f64>::new()
+            .with_alpha(0.3)
+            .with_selection(CoordSelection::Cyclic)
+            .fit(&x, &y);
+        assert!(explicit_res.is_ok(), "explicit cyclic fit should succeed");
+        let explicit_cyclic = match explicit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        assert_eq!(
+            default_fit.coefficients(),
+            explicit_cyclic.coefficients(),
+            "explicit Cyclic must be byte-identical to the default"
+        );
+        assert_eq!(default_fit.intercept(), explicit_cyclic.intercept());
+    }
+
+    // HONEST CAVEAT: exact bit-match to sklearn's `selection='random'` is
+    // numpy-MT19937-RNG-blocked (Rust `StdRng` != numpy MT19937), so the random
+    // path below verifies convergence-to-the-unique-optimum, NOT bitwise sklearn
+    // parity. The cyclic default IS bit-exact to sklearn (test above).
+    #[test]
+    fn lasso_selection_random_converges_to_optimum() {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   Lasso(alpha=0.3, selection='random', random_state=0)
+        //     -> coef_ [0.66645032, 1.46683974]  (same unique optimum,
+        //        ~1e-3 from cyclic [0.66691036, 1.46647171] due to
+        //        stopping-within-tol; NOT bit-identical to cyclic).
+        let (x, y) = selection_fixture();
+
+        let fit_res = Lasso::<f64>::new()
+            .with_alpha(0.3)
+            .with_selection(CoordSelection::Random)
+            .with_random_state(0)
+            .fit(&x, &y);
+        assert!(fit_res.is_ok(), "random-selection fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let coef = fitted.coefficients();
+
+        // Every coefficient finite.
+        for &c in coef.iter() {
+            assert!(c.is_finite(), "coefficient {c} must be finite");
+        }
+
+        // Converges to the unique cyclic optimum within tol.
+        let cyclic = [0.66691036_f64, 1.46647171_f64];
+        assert!(
+            (coef[0] - cyclic[0]).abs() < 1e-2,
+            "coef[0]={} should be within 1e-2 of cyclic {}",
+            coef[0],
+            cyclic[0]
+        );
+        assert!(
+            (coef[1] - cyclic[1]).abs() < 1e-2,
+            "coef[1]={} should be within 1e-2 of cyclic {}",
+            coef[1],
+            cyclic[1]
+        );
+
+        // Support set matches: both coefficients strictly positive.
+        assert!(coef[0] > 0.0, "coef[0] should be in the support");
+        assert!(coef[1] > 0.0, "coef[1] should be in the support");
     }
 
     #[test]
