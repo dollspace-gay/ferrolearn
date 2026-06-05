@@ -395,3 +395,142 @@ fn ovo_predict_confidence_tiebreak_diverges() {
         preds[0]
     );
 }
+
+// ===========================================================================
+// REQ-OVO-DECISION (SHIPPED #1813) — decision_function VALUES + 4-class
+// vote-tie break. GREEN GUARD (re-audit of fix 382b6663).
+// ===========================================================================
+
+/// Re-audit guard (#1813): ferrolearn OvO `decision_function`
+/// (`ferrolearn-model-sel/src/multiclass.rs:421-475`) must reproduce the
+/// EXACT per-class values of sklearn `_ovr_decision_function`
+/// (`sklearn/utils/multiclass.py:540-562`), not merely the argmax — this pins
+/// the per-pair `sum_of_confidences[i]-=conf / [j]+=conf` sign & accumulation
+/// AND the `votes + sum/(3*(|sum|+1))` transform for a 4-class (6-pair) problem
+/// whose integer votes TIE (1,2,2,1) and are broken by confidence.
+///
+/// Fixture: `Col1MeanScore` base; per-class feature-column-1 value is
+/// class0=0.0, class1=1.4, class2=0.2, class3=0.9. Each pair (i<j) score is the
+/// filtered col1 mean = (c_i + c_j)/2, giving pair scores
+/// [(0,1)=0.7,(0,2)=0.1,(0,3)=0.45,(1,2)=0.8,(1,3)=1.15,(2,3)=0.55].
+///
+/// Map to sklearn: `prediction = 0 if s>0.5 else 1`, `confidence = 0.5 - s`.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// import numpy as np
+/// from sklearn.utils.multiclass import _ovr_decision_function
+/// c=[0.0,1.4,0.2,0.9]; K=4
+/// pairs=[(i,j) for i in range(K) for j in range(i+1,K)]
+/// scores=[(c[i]+c[j])/2 for (i,j) in pairs]
+/// preds=np.array([[0 if s>0.5 else 1 for s in scores]])
+/// confs=np.array([[0.5-s for s in scores]])
+/// Y=_ovr_decision_function(preds,confs,K)[0]
+/// # -> [0.93333333333333335, 2.1428571428571428,
+/// #     2.0434782608695654, 0.86868686868686873], argmax 1
+/// ```
+#[test]
+fn ovo_decision_function_values_4class_tiebreak_matches_oracle() {
+    // Column 1 carries the per-class value c_k; column 0 is an arbitrary feature.
+    // class0 col1=0.0, class1 col1=1.4, class2 col1=0.2, class3 col1=0.9.
+    let x = Array2::from_shape_vec(
+        (8, 2),
+        vec![
+            0.0, 0.0, 1.0, 0.0, // class 0
+            2.0, 1.4, 3.0, 1.4, // class 1
+            4.0, 0.2, 5.0, 0.2, // class 2
+            6.0, 0.9, 7.0, 0.9, // class 3
+        ],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![0, 0, 1, 1, 2, 2, 3, 3]);
+
+    let fitted = OneVsOneClassifier::new(col1_mean_factory())
+        .fit(&x, &y)
+        .unwrap();
+    let query = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+
+    // EXACT decision_function VALUES from the live oracle (per-pair sign &
+    // accumulation, not just argmax).
+    const SK_ROW: [f64; 4] = [
+        0.933_333_333_333_333_3,
+        2.142_857_142_857_143,
+        2.043_478_260_869_565_4,
+        0.868_686_868_686_868_7,
+    ];
+    let df = fitted.decision_function(&query).unwrap();
+    for k in 0..4 {
+        assert!(
+            (df[[0, k]] - SK_ROW[k]).abs() < 1e-9,
+            "class {k}: ferrolearn decision={} but sklearn _ovr_decision_function={}",
+            df[[0, k]],
+            SK_ROW[k]
+        );
+    }
+
+    // Vote tie (1,2,2,1) broken by confidence -> class 1 (argmax of oracle row).
+    const SK_PRED: usize = 1;
+    let preds = fitted.predict(&query).unwrap();
+    assert_eq!(
+        preds[0], SK_PRED,
+        "4-class OvO vote-tie must break by summed confidence to class {SK_PRED} (sklearn)"
+    );
+}
+
+/// Re-audit guard (#1813): on an EXACT decision-value tie, ferrolearn OvO
+/// `predict` (`ferrolearn-model-sel/src/multiclass.rs:496-517`, strict `>`)
+/// must pick the LOWEST class index (`np.argmax` FIRST-on-tie), matching
+/// sklearn OvO `classes_[decision_function(X).argmax(1)]`
+/// (`sklearn/multiclass.py:935-939`) — the OPPOSITE of OvR's LAST-on-tie.
+///
+/// Fixture: `Col1MeanScore`; per-class col1 = class0=0.8, class1=-0.4,
+/// class2=0.8 -> pair scores (0,1)=0.2,(0,2)=0.8,(1,2)=0.2.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// import numpy as np
+/// from sklearn.utils.multiclass import _ovr_decision_function
+/// scores=[0.2,0.8,0.2]
+/// preds=np.array([[0 if s>0.5 else 1 for s in scores]])
+/// confs=np.array([[0.5-s for s in scores]])
+/// Y=_ovr_decision_function(preds,confs,3)[0]   # -> [1.0, 1.0, 1.0]
+/// int(np.argmax(Y))                            # -> 0  (FIRST-on-tie)
+/// ```
+#[test]
+fn ovo_predict_exact_tie_first_on_tie_matches_sklearn() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![
+            0.0, 0.8, 1.0, 0.8, // class 0  (col1 = 0.8)
+            2.0, -0.4, 3.0, -0.4, // class 1  (col1 = -0.4)
+            4.0, 0.8, 5.0, 0.8, // class 2  (col1 = 0.8)
+        ],
+    )
+    .unwrap();
+    let y = Array1::from_vec(vec![0, 0, 1, 1, 2, 2]);
+
+    let fitted = OneVsOneClassifier::new(col1_mean_factory())
+        .fit(&x, &y)
+        .unwrap();
+    let query = Array2::from_shape_vec((1, 2), vec![0.0, 0.0]).unwrap();
+
+    // Decision row is an exact 3-way tie at 1.0.
+    let df = fitted.decision_function(&query).unwrap();
+    for k in 0..3 {
+        assert!(
+            (df[[0, k]] - 1.0).abs() < 1e-12,
+            "class {k}: expected exact-tie value 1.0, got {}",
+            df[[0, k]]
+        );
+    }
+
+    // np.argmax FIRST-on-tie -> class 0 (lowest index), NOT class 2.
+    const SK_PRED: usize = 0;
+    let preds = fitted.predict(&query).unwrap();
+    assert_eq!(
+        preds[0], SK_PRED,
+        "OvO exact tie must resolve FIRST-on-tie to class {SK_PRED} (sklearn argmax), \
+         got {}",
+        preds[0]
+    );
+}
