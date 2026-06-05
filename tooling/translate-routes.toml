@@ -1284,3 +1284,11 @@ upstream = [
 ]
 design = ".design/sparse/csc.md"
 parity_ops = ["csc_matrix"]
+
+[[route]]
+crate_pattern = "ferrolearn-sparse/src/helpers.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/sparse/_construct.py",
+]
+design = ".design/sparse/helpers.md"
+parity_ops = ["eye", "diags", "hstack", "vstack"]
