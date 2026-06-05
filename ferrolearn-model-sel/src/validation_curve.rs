@@ -21,6 +21,27 @@
 //! //     |alpha| make_pipeline(alpha),
 //! //     neg_mse).unwrap();
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.model_selection.validation_curve`
+//! (`sklearn/model_selection/_validation.py:2149`, v1.5.2). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED (end-to-end functional + non-test consumer + tests +
+//! verification) or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (core mechanic + iteration-order equivalence — KEY) | SHIPPED | `(param outer, fold inner)` row-major fill yields a `(n_params, n_folds)` matrix element-for-element identical to sklearn's `(fold outer, param inner)` flat list `.reshape(-1, n_params).T` (`:2306-2314`). Guard `req1_orientation_end_to_end_transpose_detector` (distinct per-cell values detect any transpose/swap). |
+//! | REQ-2 (train scores always returned) | SHIPPED | unconditionally computes + returns `train_scores`, matching hardcoded `return_train_score=True` (`:2303`). Guard `req2_req3_train_scores_returned_with_shape`. |
+//! | REQ-3 (shape/orientation `(n_ticks, n_cv_folds)`) | SHIPPED | both matrices `(n_params, n_folds)` (`:2257-2261`). Same guard. |
+//! | REQ-4 (vary-one-param via `make_pipeline` closure) | SHIPPED | R-DEV-7: the `Fn(f64) -> Pipeline` closure is the sanctioned Rust analog of `clone` + `set_params` (`:2292`/`:2299`) for `f64` params. Guard `req4_param_threads_into_model`. Param-TYPE generality is REQ-9. |
+//! | REQ-5 (default cv: 5-fold + classifier-aware StratifiedKFold/KFold) | NOT-STARTED | `cv: &dyn CrossValidator` is mandatory; no `check_cv` default / `is_classifier` dispatch (`:2286`, `:2206-2214`). Blocker #1757. |
+//! | REQ-6 (default scoring: r2/accuracy via `check_scoring`) | NOT-STARTED | `scoring: fn(...)` is mandatory; no default-scorer resolution (`:2287`). Blocker #1757. |
+//! | REQ-7 (error_score=np.nan continue-the-curve) | SHIPPED | per-`(param, fold)` fit failure NaN-fills both train+test; independent train/test scorer failures NaN-fill only their own side; the curve continues — matching sklearn's default `error_score=np.nan` (`_fit_and_score` `:890-905` fit-failure, `:910`/`:915` independent `_score`). Pre-loop input validation still hard-errors. Tests `req7_error_score_nan_continue`, `divergence_train_score_failure_clobbers_test_score`. The `error_score='raise'`/numeric parameter generality is not exposed (default behavior only). |
+//! | REQ-8 (groups channel for Group cv) | NOT-STARTED | `CrossValidator::fold_indices(n_samples)` has no group channel (`:2307`). Blocker #1759. |
+//! | REQ-9 (arbitrary param TYPE) | NOT-STARTED | `param_values: &[f64]` is float-only; sklearn varies int/str/bool via `set_params` (`:2299`). Blocker #1760. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | production uses `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1761. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use validation_curve::{ValidationCurveResult, validation_curve}` in `lib.rs` (boundary API, S5/R-DEFER-1); no internal caller, no Python binding — the function IS the public surface. |
 
 use ferrolearn_core::pipeline::Pipeline;
 use ferrolearn_core::{FerroError, Fit, Predict};
