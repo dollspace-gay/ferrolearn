@@ -26,7 +26,7 @@
 //! | REQ-6 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | `FittedRidgeMulti` exists, no production consumer (#384). |
 //! | REQ-7 (per-target alpha array) | NOT-STARTED | #385. |
 //! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
-//! | REQ-9 (positive=True) | NOT-STARTED | #387. |
+//! | REQ-9 (positive=True) | SHIPPED | `Ridge<F>` adds `pub positive: bool` (default `false`, `_ridge.py:902`/`:911`) + `with_positive(bool)` builder. When `self.positive`, `fit_with_sample_weight` routes the coefficient solve through `solve_nonneg_ridge` — projected coordinate descent minimizing `0.5·‖A·w−b‖² + 0.5·alpha·‖w‖²` s.t. `w ≥ 0` (`new = max(0, (A[:,j]ᵀr + col_sq[j]·old)/(col_sq[j] + alpha))`, incremental residual update, `max_iter=self.max_iter.unwrap_or(1000)`/`self.tol`) on the SAME centered (and `√w`-rescaled) design `solve_ridge` uses, then recovers `intercept = y_off − x_off·coef` (fit_intercept) / `0` identically — the same unique optimum sklearn's L-BFGS-B (`_solve_lbfgs`, `_ridge.py:300`, objective `0.5·‖Xw−y‖²+0.5·alpha·‖w‖²`, bounds `[(0,inf)]`) reaches, dispatched at `_ridge.py:923-928`. `n_iter_ = Some(iters)` on the positive (iterative CD) path; `None` for the direct Cholesky path. `positive=false` (default) is byte-identical to the unconstrained Cholesky path. Oracle tests: `ridge_positive_matches_sklearn` (alpha=1, fit_intercept coef `[1.19891304, 0.0]`, intercept `-6.17744565`, all ≥ 0, differs from unconstrained `[0.95708502, -1.85401484]`), `ridge_positive_false_unchanged` (byte-identical guard), `ridge_positive_all_nonneg_equals_unconstrained` (inactive-constraint sanity). Closes #387. |
 //! | REQ-10 (max_iter/tol + n_iter_) | SHIPPED | `Ridge<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidge<F>` adds `n_iter_: Option<usize>` (always `None` for the direct Cholesky solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:899-900`) and `n_iter_` set at `_ridge.py:994`; `max_iter`/`tol` are no-ops for the direct solver (closed-form normal equations, no iteration) — matching sklearn's direct `cholesky`/`svd` paths which also yield `n_iter_=None`. Test: `ridge_max_iter_tol_niter_defaults_and_builders`. Closes #388. |
 //! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
 //! | REQ-12 (copy_X/random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders. `copy_x` ABI-only (fit never mutates `x`); `random_state` stored-but-no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
@@ -104,14 +104,24 @@ pub struct Ridge<F> {
     /// iterative solver is added (future REQ-8 #386), this will control
     /// convergence. Default `1e-4`, matching sklearn's default (`_ridge.py:900`).
     pub tol: F,
+    /// When `true`, constrain the fitted coefficients to be non-negative
+    /// (sklearn `positive`, `_ridge.py:902`/`:911`). sklearn solves the
+    /// non-negative ridge QP `min 0.5·‖X·w − y‖² + 0.5·alpha·‖w‖²` subject to
+    /// `w ≥ 0` via the L-BFGS-B solver (`_solve_lbfgs`, `_ridge.py:300`,
+    /// dispatched at `:923-928`); ferrolearn solves the same unique optimum
+    /// with projected coordinate descent. Default `false`, matching sklearn's
+    /// `positive=False` (`_ridge.py:902`); `positive=false` is byte-identical
+    /// to the unconstrained Cholesky path.
+    pub positive: bool,
 }
 
 impl<F: Float> Ridge<F> {
     /// Create a new `Ridge` with default settings.
     ///
     /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `copy_x = true`,
-    /// `random_state = None`, `max_iter = None`, `tol = 1e-4` — mirroring
-    /// sklearn's ctor defaults (`sklearn/linear_model/_ridge.py:895-903`).
+    /// `random_state = None`, `max_iter = None`, `tol = 1e-4`,
+    /// `positive = false` — mirroring sklearn's ctor defaults
+    /// (`sklearn/linear_model/_ridge.py:895-903`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -121,6 +131,7 @@ impl<F: Float> Ridge<F> {
             random_state: None,
             max_iter: None,
             tol: F::from(1e-4).unwrap_or_else(F::epsilon),
+            positive: false,
         }
     }
 
@@ -184,6 +195,20 @@ impl<F: Float> Ridge<F> {
         self.tol = tol;
         self
     }
+
+    /// Set whether to constrain the fitted coefficients to be non-negative
+    /// (sklearn `positive`, `_ridge.py:902`/`:911`).
+    ///
+    /// When `true`, ferrolearn solves the non-negative ridge QP
+    /// `min 0.5·‖X·w − y‖² + 0.5·alpha·‖w‖²` subject to `w ≥ 0` via projected
+    /// coordinate descent — the same unique optimum sklearn reaches with its
+    /// L-BFGS-B solver (`_solve_lbfgs`, `_ridge.py:300`). `false` (default)
+    /// uses the unconstrained Cholesky path, byte-identical to today.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
+        self
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static> Ridge<F> {
@@ -216,6 +241,72 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
     /// Returns [`FerroError::NumericalInstability`] if the weighted-offset
     /// denominator (`Σwᵢ`) cannot be formed or a mean cannot be computed.
+    /// Solve the non-negative ridge problem
+    /// `min 0.5·‖A·w − b‖² + 0.5·alpha·‖w‖²` subject to `w ≥ 0` via projected
+    /// coordinate descent.
+    ///
+    /// Mirrors the unique optimum sklearn reaches with its L-BFGS-B solver
+    /// (`_solve_lbfgs`, `sklearn/linear_model/_ridge.py:300`, objective
+    /// `0.5·‖Xw−y‖² + 0.5·alpha·‖w‖²` with bounds `[(0, inf)]`). For a smooth
+    /// strongly-convex QP with box constraints, coordinate descent with
+    /// per-coordinate projection converges to that exact optimum.
+    ///
+    /// Returns `(coef, n_iter)`. A column with `‖A[:,j]‖² + alpha == 0` keeps
+    /// its coordinate at zero (no division by zero).
+    fn solve_nonneg_ridge(&self, a: &Array2<F>, b: &Array1<F>) -> (Array1<F>, usize) {
+        let n_features = a.ncols();
+        let alpha = self.alpha;
+        let zero = <F as num_traits::Zero>::zero();
+
+        // col_sq[j] = ‖A[:,j]‖²
+        let mut col_sq = Array1::<F>::zeros(n_features);
+        for j in 0..n_features {
+            let col = a.column(j);
+            col_sq[j] = col.dot(&col);
+        }
+
+        let mut w = Array1::<F>::zeros(n_features);
+        // r = b − A·w  (= b initially since w = 0)
+        let mut r = b.clone();
+
+        let max_iter = self.max_iter.unwrap_or(1000);
+        let tol = self.tol;
+
+        let mut iters = 0;
+        for _ in 0..max_iter {
+            iters += 1;
+            let mut max_change = zero;
+            for j in 0..n_features {
+                let col = a.column(j);
+                let old = w[j];
+                let denom = col_sq[j] + alpha;
+                if denom <= zero {
+                    // All-zero column with alpha == 0: coordinate stays 0.
+                    continue;
+                }
+                // rho = A[:,j]ᵀ·r + col_sq[j]·old = A[:,j]ᵀ(b − A·w + A[:,j]·w[j])
+                let rho = col.dot(&r) + col_sq[j] * old;
+                let candidate = rho / denom;
+                let new = if candidate > zero { candidate } else { zero };
+                if new != old {
+                    let delta = new - old;
+                    // Incremental residual update: r -= A[:,j]·delta
+                    r.scaled_add(-delta, &col);
+                    w[j] = new;
+                    let abs_change = <F as Float>::abs(delta);
+                    if abs_change > max_change {
+                        max_change = abs_change;
+                    }
+                }
+            }
+            if max_change < tol {
+                break;
+            }
+        }
+
+        (w, iters)
+    }
+
     pub fn fit_with_sample_weight(
         &self,
         x: &Array2<F>,
@@ -277,23 +368,36 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     let x_centered = x - &x_mean;
                     let y_centered = y - y_mean;
 
-                    let w = linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?;
+                    let (w, n_iter_) = if self.positive {
+                        let (coef, iters) = self.solve_nonneg_ridge(&x_centered, &y_centered);
+                        (coef, Some(iters))
+                    } else {
+                        (
+                            linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?,
+                            None,
+                        )
+                    };
                     let intercept = y_mean - x_mean.dot(&w);
 
                     Ok(FittedRidge {
                         coefficients: w,
                         intercept,
-                        n_iter_: None,
+                        n_iter_,
                     })
                 } else {
-                    let w = linalg::solve_ridge(x, y, self.alpha)?;
+                    let (w, n_iter_) = if self.positive {
+                        let (coef, iters) = self.solve_nonneg_ridge(x, y);
+                        (coef, Some(iters))
+                    } else {
+                        (linalg::solve_ridge(x, y, self.alpha)?, None)
+                    };
 
                     Ok(FittedRidge {
                         coefficients: w,
                         // Disambiguate `Element::zero` vs `num_traits::Zero::zero`
                         // (both in scope under the `LinalgFloat` bound).
                         intercept: <F as num_traits::Zero>::zero(),
-                        n_iter_: None,
+                        n_iter_,
                     })
                 }
             }
@@ -335,25 +439,35 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     let x_scaled = &x_centered * &w_sqrt.view().insert_axis(Axis(1));
                     let y_scaled = &y_centered * &w_sqrt;
 
-                    let coef = linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?;
+                    let (coef, n_iter_) = if self.positive {
+                        let (c, iters) = self.solve_nonneg_ridge(&x_scaled, &y_scaled);
+                        (c, Some(iters))
+                    } else {
+                        (linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?, None)
+                    };
                     let intercept = y_off - x_off.dot(&coef);
 
                     Ok(FittedRidge {
                         coefficients: coef,
                         intercept,
-                        n_iter_: None,
+                        n_iter_,
                     })
                 } else {
                     // No centering; just √w row-rescaling, intercept 0.
                     let x_scaled = x * &w_sqrt.view().insert_axis(Axis(1));
                     let y_scaled = y * &w_sqrt;
 
-                    let coef = linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?;
+                    let (coef, n_iter_) = if self.positive {
+                        let (c, iters) = self.solve_nonneg_ridge(&x_scaled, &y_scaled);
+                        (c, Some(iters))
+                    } else {
+                        (linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?, None)
+                    };
 
                     Ok(FittedRidge {
                         coefficients: coef,
                         intercept: <F as num_traits::Zero>::zero(),
-                        n_iter_: None,
+                        n_iter_,
                     })
                 }
             }
@@ -1184,6 +1298,153 @@ mod tests {
         assert_eq!(with_max_iter.n_iter(), None);
         assert_eq!(with_tol.n_iter(), None);
 
+        Ok(())
+    }
+
+    // -- positive=True non-negative ridge (REQ-9) --------------------------
+
+    #[test]
+    fn ridge_positive_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (non-negative ridge, alpha=1, positive=True):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,3.],[2.,1.],[3.,4.],[4.,2.],[5.,5.],[6.,1.],[2.,4.],[5.,2.]]); \
+        //     y=1.0*X[:,0]-2.0*X[:,1]+np.array([0.1,-0.2,0.15,0.0,-0.1,0.05,0.2,-0.05]); \
+        //     m=Ridge(alpha=1.0,positive=True).fit(X,y); \
+        //     print([round(c,8) for c in m.coef_], round(m.intercept_,8))"
+        //   -> [1.19891304, 0.0] -6.17744565
+        let x = Array2::from_shape_vec(
+            (8, 2),
+            vec![
+                1., 3., 2., 1., 3., 4., 4., 2., 5., 5., 6., 1., 2., 4., 5., 2.,
+            ],
+        )
+        .map_err(|e| FerroError::ShapeMismatch {
+            expected: vec![8, 2],
+            actual: vec![],
+            context: e.to_string(),
+        })?;
+        let raw = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 5.0];
+        let f1 = [3.0, 1.0, 4.0, 2.0, 5.0, 1.0, 4.0, 2.0];
+        let noise = [0.1, -0.2, 0.15, 0.0, -0.1, 0.05, 0.2, -0.05];
+        let y: Array1<f64> = (0..8).map(|i| raw[i] - 2.0 * f1[i] + noise[i]).collect();
+
+        let model = Ridge::<f64>::new().with_alpha(1.0).with_positive(true);
+        let fitted = model.fit(&x, &y)?;
+
+        assert_relative_eq!(fitted.coefficients()[0], 1.198_913_04, epsilon = 1e-5);
+        assert_relative_eq!(fitted.coefficients()[1], 0.0, epsilon = 1e-5);
+        assert_relative_eq!(fitted.intercept(), -6.177_445_65, epsilon = 1e-4);
+
+        // All coefficients are non-negative.
+        for &c in fitted.coefficients().iter() {
+            assert!(
+                c >= 0.0,
+                "coef {c} must be non-negative under positive=True"
+            );
+        }
+
+        // Non-tautological: the constrained fit MUST differ from the
+        // unconstrained ridge (oracle unconstrained coef_
+        // [0.95708502, -1.85401484], intercept -0.23250675 — feature 1
+        // is strongly negative and clamps to 0).
+        let unconstrained = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        assert_relative_eq!(
+            unconstrained.coefficients()[0],
+            0.957_085_02,
+            epsilon = 1e-5
+        );
+        assert_relative_eq!(
+            unconstrained.coefficients()[1],
+            -1.854_014_84,
+            epsilon = 1e-5
+        );
+        assert!(
+            (fitted.coefficients()[1] - unconstrained.coefficients()[1]).abs() > 1e-2,
+            "positive fit must differ from unconstrained on the clamped coordinate"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_positive_false_unchanged() -> Result<(), FerroError> {
+        // Regression guard: positive=false (default) is BYTE-IDENTICAL to the
+        // current unconstrained Cholesky `fit`.
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+
+        let model = Ridge::<f64>::new().with_alpha(1.0);
+        let baseline = model.fit(&x, &y)?;
+        let explicit_false = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_positive(false)
+            .fit(&x, &y)?;
+
+        for j in 0..2 {
+            assert_eq!(
+                baseline.coefficients()[j].to_bits(),
+                explicit_false.coefficients()[j].to_bits(),
+                "coef_[{j}] must be byte-identical with positive=false"
+            );
+        }
+        assert_eq!(
+            baseline.intercept().to_bits(),
+            explicit_false.intercept().to_bits()
+        );
+        // positive=false keeps the direct-solver n_iter_ = None contract.
+        assert_eq!(explicit_false.n_iter(), None);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_positive_all_nonneg_equals_unconstrained() -> Result<(), FerroError> {
+        // Sanity: data whose unconstrained ridge is already non-negative —
+        // the box constraint is inactive, so positive=True must reproduce the
+        // unconstrained coefficients.
+        //
+        // Live sklearn 1.5.2 oracle:
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     y=np.array([3.0,2.5,7.1,6.0,11.2]); \
+        //     u=Ridge(alpha=1.0).fit(X,y); p=Ridge(alpha=1.0,positive=True).fit(X,y); \
+        //     print([round(c,8) for c in u.coef_], [round(c,8) for c in p.coef_])"
+        //   -> [0.82280702, 1.35614035] [0.82280702, 1.35614035]
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+
+        let unconstrained = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let positive = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_positive(true)
+            .fit(&x, &y)?;
+
+        for j in 0..2 {
+            assert!(unconstrained.coefficients()[j] >= 0.0);
+            // CD converges to the unconstrained optimum at the default
+            // tol=1e-4; sklearn's own L-BFGS-B agrees only to ~1e-6 on this
+            // fixture (oracle: 0.82280707 vs 0.82280702).
+            assert_relative_eq!(
+                positive.coefficients()[j],
+                unconstrained.coefficients()[j],
+                epsilon = 1e-4
+            );
+        }
+        assert_relative_eq!(
+            positive.intercept(),
+            unconstrained.intercept(),
+            epsilon = 1e-4
+        );
         Ok(())
     }
 }
