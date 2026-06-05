@@ -30,7 +30,8 @@
 //! | REQ-5 (L1 sparsity) | SHIPPED | exact-zero support set bit-identical to sklearn. |
 //! | REQ-6 (HasCoefficients) | SHIPPED | `HasCoefficients for FittedElasticNet`. |
 //! | REQ-7 (alpha/l1_ratio validation; l1_ratio∈[0,1]) | SHIPPED | matches sklearn's `_parameter_constraints` (l1_ratio=0 accepted by the class; the auto-grid error is owned by elastic_net_cv). |
-//! | REQ-8..15 NOT-STARTED | positive (#407), warm_start (#408), selection='random' (#409), precompute (#410), dual-gap stopping (#412), n_iter_/dual_gap_ (#417), MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-8 (positive=True) | SHIPPED | `positive` field + `with_positive` builder; CD loop branches on `self.positive` to `soft_threshold_positive(rho_j, alpha_l1) / denominators[j]` (non-negative soft-threshold, L2 in the denominator unchanged), mirroring sklearn's `positive` param (`_coordinate_descent.py:800`) clip `if positive and tmp < 0: w[ii] = 0.0` (`_cd_fast.pyx:191-195`). Oracle test `elasticnet_positive_matches_sklearn` → coef `[1.13685345, 0.0]`, intercept `-5.96023707` (live sklearn 1.5.2, differs from unconstrained `[0.9081389, -1.7687475]`); `elasticnet_positive_false_unchanged` regression guard. |
+//! | REQ-9..15 NOT-STARTED | warm_start (#408), selection='random' (#409), precompute (#410), dual-gap stopping (#412), n_iter_/dual_gap_ (#417), MultiTaskElasticNet (#418), ferray substrate (#419). |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -85,6 +86,8 @@ pub struct ElasticNet<F> {
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// When `true`, constrain coefficients to be non-negative.
+    pub positive: bool,
 }
 
 impl<F: Float + FromPrimitive> ElasticNet<F> {
@@ -100,6 +103,7 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
             max_iter: 1000,
             tol: F::from(1e-4).unwrap(),
             fit_intercept: true,
+            positive: false,
         }
     }
 
@@ -138,6 +142,15 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set whether to constrain coefficients to be non-negative.
+    ///
+    /// Mirrors `sklearn.linear_model.ElasticNet(positive=...)`.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
         self
     }
 }
@@ -179,6 +192,18 @@ fn soft_threshold<F: Float>(x: F, threshold: F) -> F {
     } else {
         F::zero()
     }
+}
+
+/// Non-negative soft-thresholding operator for `positive=True` ElasticNet.
+///
+/// Returns `max(x - threshold, 0)`, dropping the negative branch so the
+/// coordinate is never negative. Mirrors sklearn `_cd_fast.pyx:191-195`
+/// (`if positive and tmp < 0: w[ii] = 0.0`); the L2 term lives in the
+/// denominator and is unaffected.
+#[inline]
+fn soft_threshold_positive<F: Float>(x: F, threshold: F) -> F {
+    let z = x - threshold;
+    if z > F::zero() { z } else { F::zero() }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
@@ -288,8 +313,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 let rho_j = col_j.dot(&residual) / n_f;
 
                 // Apply soft-threshold for L1, then divide by (col_norm + alpha_l2).
+                // For `positive=True`, use the non-negative soft-threshold so the
+                // coefficient is never negative (sklearn `_cd_fast.pyx:191-195`); the
+                // L2 term in the denominator is unchanged.
                 let w_new = if denominators[j] > F::zero() {
-                    soft_threshold(rho_j, alpha_l1) / denominators[j]
+                    let thresholded = if self.positive {
+                        soft_threshold_positive(rho_j, alpha_l1)
+                    } else {
+                        soft_threshold(rho_j, alpha_l1)
+                    };
+                    thresholded / denominators[j]
                 } else {
                     F::zero()
                 };
@@ -619,5 +652,118 @@ mod tests {
         let fitted_pipe = model.fit_pipeline(&x, &y).unwrap();
         let preds = fitted_pipe.predict_pipeline(&x).unwrap();
         assert_eq!(preds.len(), 4);
+    }
+
+    // ---- positive=True (REQ-8) ----
+
+    #[test]
+    fn test_soft_threshold_positive_helper() {
+        // Non-negative branch: max(x - t, 0). Negative side clamps to 0.
+        assert_relative_eq!(soft_threshold_positive(5.0_f64, 1.0), 4.0);
+        assert_relative_eq!(soft_threshold_positive(-5.0_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(0.5_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(-0.5_f64, 1.0), 0.0);
+        assert_relative_eq!(soft_threshold_positive(0.0_f64, 1.0), 0.0);
+    }
+
+    /// Oracle fixture from live sklearn 1.5.2 (R-CHAR-3):
+    /// `X = [[1,3],[2,1],[3,4],[4,2],[5,5],[6,1],[2,4],[5,2]]`,
+    /// `y = X[:,0] - 2*X[:,1] + noise`.
+    fn positive_oracle_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![
+            [1.0, 3.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 2.0],
+            [5.0, 5.0],
+            [6.0, 1.0],
+            [2.0, 4.0],
+            [5.0, 2.0],
+        ];
+        let noise = array![0.1, -0.2, 0.15, 0.0, -0.1, 0.05, 0.2, -0.05];
+        let y: Array1<f64> = (0..8)
+            .map(|i| 1.0 * x[[i, 0]] - 2.0 * x[[i, 1]] + noise[i])
+            .collect();
+        (x, y)
+    }
+
+    #[test]
+    fn elasticnet_positive_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle:
+        //   ElasticNet(alpha=0.3, l1_ratio=0.5, positive=True)
+        //     -> coef_ [1.13685345, 0.0], intercept_ -5.96023707
+        //   (unconstrained ElasticNet(alpha=0.3, l1_ratio=0.5)
+        //     -> coef_ [0.9081389, -1.7687475], intercept_ -0.29568051).
+        let (x, y) = positive_oracle_fixture();
+
+        let fit_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_positive(true)
+            .fit(&x, &y);
+        assert!(fit_res.is_ok(), "positive fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let coef = fitted.coefficients();
+        assert_relative_eq!(coef[0], 1.13685345, epsilon = 1e-5);
+        assert_relative_eq!(coef[1], 0.0, epsilon = 1e-5);
+        assert_relative_eq!(fitted.intercept(), -5.96023707, epsilon = 1e-4);
+
+        // All coefficients are non-negative.
+        for &c in coef.iter() {
+            assert!(c >= 0.0, "coefficient {c} should be non-negative");
+        }
+
+        // Differs materially from the unconstrained solution (~1.77 gap on
+        // feature 1), confirming the constraint is non-tautological.
+        let unc_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y);
+        assert!(unc_res.is_ok(), "unconstrained fit should succeed");
+        let unconstrained = match unc_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        assert!((coef[1] - unconstrained.coefficients()[1]).abs() > 1.0);
+    }
+
+    #[test]
+    fn elasticnet_positive_false_unchanged() {
+        // positive=false (default) must be byte-identical to the plain fit.
+        let (x, y) = positive_oracle_fixture();
+
+        let default_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y);
+        assert!(default_res.is_ok(), "default fit should succeed");
+        let default_fit = match default_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let false_res = ElasticNet::<f64>::new()
+            .with_alpha(0.3)
+            .with_l1_ratio(0.5)
+            .with_positive(false)
+            .fit(&x, &y);
+        assert!(
+            false_res.is_ok(),
+            "explicit positive=false fit should succeed"
+        );
+        let explicit_false = match false_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        assert_eq!(
+            default_fit.coefficients(),
+            explicit_false.coefficients(),
+            "positive=false must be byte-identical to the default fit"
+        );
+        assert_eq!(default_fit.intercept(), explicit_false.intercept());
     }
 }
