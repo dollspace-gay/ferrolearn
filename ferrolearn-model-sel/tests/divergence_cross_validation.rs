@@ -258,7 +258,6 @@ fn guard_permutation_test_score_pvalue_formula() {
 /// not a NaN-bearing array. This pin asserts the sklearn contract (Ok + a NaN
 /// in the failing fold) and so FAILS today.
 #[test]
-#[ignore = "divergence: cross_val_score ?-aborts a failing fold instead of NaN-filling and continuing; tracking #1790"]
 fn pin_1790_error_score_nan_continue() {
     // n=6, KFold(3) folds (non-shuffled): test [0,1],[2,3],[4,5].
     // Sentinel at sample 0 => folds 1 and 2 TRAIN on sample 0 (fail); fold 0

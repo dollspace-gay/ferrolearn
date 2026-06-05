@@ -401,8 +401,12 @@ impl StratifiedKFold {
 ///
 /// # Errors
 ///
-/// Propagates any error from fold splitting, model fitting, predicting, or
-/// scoring.
+/// Propagates structural errors from input validation and fold splitting
+/// (e.g. `y` length mismatch, invalid `n_splits`, or subset construction).
+/// Per-fold ESTIMATOR failures (fit / predict / scoring) do NOT abort the
+/// call: mirroring scikit-learn's default `error_score=np.nan`, the failing
+/// fold's score is set to `f64::NAN` and evaluation continues. The returned
+/// array may therefore contain NaN entries.
 ///
 /// # Examples
 ///
@@ -471,15 +475,21 @@ pub fn cross_val_score(
         })?;
         let y_test: Array1<f64> = test_idx.iter().map(|&i| y[i]).collect();
 
-        // Fit pipeline on training data.
-        let fitted = pipeline.fit(&x_train, &y_train)?;
-
-        // Predict on test data.
-        let y_pred = fitted.predict(&x_test)?;
-
-        // Score.
-        let score = scoring(&y_test, &y_pred)?;
-        scores.push(score);
+        // Fit, predict, and score this fold. Mirroring scikit-learn's default
+        // `error_score=np.nan` in `_fit_and_score` (`_validation.py:890-915`):
+        // a fit failure substitutes `error_score` (NaN) for the fold and
+        // CONTINUES; on a successful fit, a predict/score failure substitutes
+        // NaN for only this fold. Per-fold ESTIMATOR failures never abort the
+        // whole call (structural/shape errors above remain hard errors).
+        let test_score = match pipeline.fit(&x_train, &y_train) {
+            Err(_) => f64::NAN,
+            Ok(fitted) => (|| {
+                let y_pred = fitted.predict(&x_test)?;
+                scoring(&y_test, &y_pred)
+            })()
+            .unwrap_or(f64::NAN),
+        };
+        scores.push(test_score);
     }
 
     Ok(Array1::from_vec(scores))
@@ -538,8 +548,14 @@ pub struct CrossValidateResult {
 ///
 /// # Errors
 ///
-/// Propagates any error from fold splitting, model fitting, predicting, or
-/// scoring.
+/// Propagates structural errors from input validation and fold splitting
+/// (e.g. `y` length mismatch, invalid `n_splits`, or subset construction).
+/// Per-fold ESTIMATOR failures (fit / predict / scoring) do NOT abort the
+/// call: mirroring scikit-learn's default `error_score=np.nan`, a fit failure
+/// sets both the test and (when `return_train_score`) train score for that
+/// fold to `f64::NAN`, and a predict/score failure sets only the affected
+/// score to NaN. Evaluation then continues, so the returned scores may
+/// contain NaN entries.
 pub fn cross_validate(
     pipeline: &Pipeline,
     x: &Array2<f64>,
@@ -603,23 +619,54 @@ pub fn cross_validate(
 
         // Fit pipeline (timed).
         let fit_start = Instant::now();
-        let fitted = pipeline.fit(&x_train, &y_train)?;
+        let fit_result = pipeline.fit(&x_train, &y_train);
         let fit_elapsed = fit_start.elapsed().as_secs_f64();
         fit_times.push(fit_elapsed);
 
-        // Score on test set (timed).
+        // Score (timed). Mirroring scikit-learn's default `error_score=np.nan`
+        // in `_fit_and_score` (`_validation.py:890-915`): a fit failure
+        // substitutes `error_score` (NaN) for BOTH the test and (when
+        // requested) the train score and CONTINUES. On a successful fit, the
+        // test and train scores are computed via TWO INDEPENDENT score
+        // closures (`:910`/`:915`), each substituting NaN for only its own
+        // failing scorer. Per-fold ESTIMATOR failures never abort the whole
+        // call (structural/shape errors above remain hard errors).
         let score_start = Instant::now();
-        let y_pred = fitted.predict(&x_test)?;
-        let test_score = scoring(&y_test, &y_pred)?;
+        let (test_score, train_score_opt) = match fit_result {
+            Err(_) => (
+                f64::NAN,
+                if return_train_score {
+                    Some(f64::NAN)
+                } else {
+                    None
+                },
+            ),
+            Ok(fitted) => {
+                let test_score = (|| {
+                    let y_pred = fitted.predict(&x_test)?;
+                    scoring(&y_test, &y_pred)
+                })()
+                .unwrap_or(f64::NAN);
+                let train_score = if return_train_score {
+                    Some(
+                        (|| {
+                            let y_train_pred = fitted.predict(&x_train)?;
+                            scoring(&y_train, &y_train_pred)
+                        })()
+                        .unwrap_or(f64::NAN),
+                    )
+                } else {
+                    None
+                };
+                (test_score, train_score)
+            }
+        };
         let score_elapsed = score_start.elapsed().as_secs_f64();
         score_times.push(score_elapsed);
         test_scores.push(test_score);
 
-        // Optionally score on training set.
-        if let Some(ref mut ts) = train_scores_vec {
-            let y_train_pred = fitted.predict(&x_train)?;
-            let train_score = scoring(&y_train, &y_train_pred)?;
-            ts.push(train_score);
+        if let (Some(ref mut ts), Some(tr)) = (train_scores_vec.as_mut(), train_score_opt) {
+            ts.push(tr);
         }
     }
 
