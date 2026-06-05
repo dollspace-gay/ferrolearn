@@ -203,3 +203,60 @@ fn divergence_isotonic_breakpoints_1800() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-ISOTONIC — NEW DIVERGENCE PIN: tied scores not pre-averaged
+// ===========================================================================
+
+/// Divergence: ferrolearn isotonic calibrator diverges from
+/// `sklearn/isotonic.py:319` (`unique_X, unique_y, unique_sample_weight =
+/// _make_unique(X, y, sample_weight)`) reached via
+/// `sklearn/calibration.py:670` (`IsotonicRegression(out_of_bounds="clip")`).
+///
+/// sklearn collapses tied-X samples into ONE point carrying the (weighted)
+/// AVERAGE y BEFORE running PAV (`isotonic.py:322`,
+/// `y = isotonic_regression(unique_y, ...)`). ferrolearn `fit_isotonic`
+/// (calibration.rs:381) pushes each raw sample as its own PAV block and never
+/// pre-averages duplicate scores, so tied scores with mixed labels produce a
+/// different mapping.
+///
+/// Input: scores=[1,1,2,2] labels=[0,1,0,1] (two ties, each split 0/1).
+/// sklearn `_make_unique` -> X=[1,2] y=[0.5,0.5]; already monotone ->
+/// X_thresholds_=[1,2] y_thresholds_=[0.5,0.5] -> predict == 0.5 everywhere.
+/// ferrolearn keeps four PAV inputs [0,1,0,1] at scores [1,1,2,2], merges the
+/// trailing violator into one block but still ramps from the leading 0-block,
+/// yielding a non-flat mapping.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// from sklearn.isotonic import IsotonicRegression
+/// import numpy as np
+/// s=np.array([1.,1.,2.,2.]); y=np.array([0,1,0,1],dtype=float)
+/// ir=IsotonicRegression(out_of_bounds='clip').fit(s,y)
+/// ir.X_thresholds_ -> [1.0, 2.0]
+/// ir.y_thresholds_ -> [0.5, 0.5]
+/// q=np.array([1.,1.25,1.5,1.75,2.]); ir.predict(q) -> [0.5,0.5,0.5,0.5,0.5]
+/// ```
+/// ferrolearn produces `[0.0, 0.5, 0.5, 0.5, 1.0]` at the same queries
+/// (MAX ABS DIFF 0.5 at q=1.0 and q=2.0).
+/// Tracking: // #NNNN new-blocker
+#[ignore = "divergence: isotonic does not pre-average tied scores (_make_unique); tracking #NNNN"]
+#[test]
+fn divergence_isotonic_tied_scores_make_unique() {
+    let scores = [1.0, 1.0, 2.0, 2.0];
+    let labels = [0, 1, 0, 1];
+    let queries = [1.0, 1.25, 1.5, 1.75, 2.0];
+    let got = calibrate_and_predict(CalibrationMethod::Isotonic, 2, &scores, &labels, &queries);
+
+    // sklearn IsotonicRegression(out_of_bounds="clip").predict(q) — flat 0.5
+    // because _make_unique averages each tied X to y=0.5 before PAV.
+    let oracle = [0.5, 0.5, 0.5, 0.5, 0.5];
+    for (i, (&g, &o)) in got.iter().zip(oracle.iter()).enumerate() {
+        assert!(
+            (g - o).abs() < 1e-6,
+            "isotonic prob[{i}] (q={}) ferro={g} sklearn={o} diff={}",
+            queries[i],
+            (g - o).abs()
+        );
+    }
+}
