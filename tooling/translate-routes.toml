@@ -1123,6 +1123,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search_successive_
 design = ".design/model-sel/halving_random_search.md"
 parity_ops = ["HalvingRandomSearchCV"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/helpers.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/pipeline.py"]
+design = ".design/model-sel/helpers.md"
+parity_ops = ["make_pipeline", "make_union"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

@@ -3,6 +3,21 @@
 //!
 //! These auto-generate step names of the form `step0`, `step1`, ... so that
 //! callers don't have to invent meaningful names when they're not needed.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.pipeline.make_pipeline` (`sklearn/pipeline.py:1220`),
+//! `make_union` (`:1889`), `_name_estimators` (`:1196`) at v1.5.2. Every REQ is
+//! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-MAKE-PIPELINE-MECHANIC (build a Pipeline from steps + final estimator) | SHIPPED | `make_pipeline(Vec<steps>, Option<estimator>)` assembles a `Pipeline` preserving input order; N steps + estimator. R-DEV-7 explicit `(Vec, Option)` split vs sklearn variadic `*steps` with last-is-estimator inference. Guards `step_names().len()==3`, single-step, input-order (non-commuting transforms), fit/predict. |
+//! | REQ-MAKE-UNION-MECHANIC (build a FeatureUnion from transformers) | SHIPPED | `make_union(Vec<transformers>)` ⇒ `n_transformers()==N`; mirrors `make_union` (`:1889`). Guard `n_transformers()==2`. (`n_jobs`/`verbose` absent — REQ-MEMORY-VERBOSE-NJOBS.) |
+//! | REQ-STEP-NAMING (class-name + `-N` dedup names) | NOT-STARTED | sklearn `_name_estimators` names steps by lowercased class name with `-N` dedup (`:1196`; `make_pipeline(SS, SS, LogReg)` → `standardscaler-1/standardscaler-2/logisticregression`); ferrolearn uses positional `step{i}`/`"estimator"`/`fu{i}`. ARCHITECTURAL: `Box<dyn PipelineStep>` erases the concrete type and the core trait exposes no type-name channel (`std::any` on a boxed `dyn` yields the trait type, not the class), so the fix needs a `PipelineStep::type_name` method in `ferrolearn-core` first. Blocker #1871. |
+//! | REQ-MEMORY-VERBOSE-NJOBS (make_pipeline memory/verbose, make_union n_jobs/verbose) | NOT-STARTED | absent; multi-file (helper signatures + core `Pipeline`/`FeatureUnion` constructors). Blocker #1872. |
+//! | REQ-X-1 (R-SUBSTRATE) | SHIPPED | pure construction over `num_traits::Float` + core `Pipeline` types; no direct `ndarray` array layer — R-SUBSTRATE N/A for this unit. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use helpers::{make_pipeline, make_union}` in `lib.rs` (boundary API, S5/R-DEFER-1). |
 
 use ferrolearn_core::pipeline::{Pipeline, PipelineEstimator, PipelineStep, PipelineTransformer};
 use num_traits::Float;
