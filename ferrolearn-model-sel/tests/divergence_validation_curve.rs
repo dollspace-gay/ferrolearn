@@ -300,7 +300,6 @@ fn req4_param_threads_into_model() {
 /// the per-cell fit/score, replacing the `?` propagation) — see report for the
 /// signature-vs-default-behavior judgment.
 #[test]
-#[ignore = "divergence: error_score=np.nan continue-the-curve not implemented (ferrolearn aborts via ?); tracking #1758"]
 fn req7_error_score_nan_continue() {
     let y: Array1<f64> = (0..30).map(f64::from).collect();
     let x = Array2::<f64>::zeros((30, 2));

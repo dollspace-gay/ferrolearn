@@ -73,8 +73,14 @@ pub struct ValidationCurveResult {
 /// # Errors
 ///
 /// - [`FerroError::InvalidParameter`] if `param_values` is empty.
-/// - Propagates any error from fold splitting, pipeline construction, model
-///   fitting, predicting, or scoring.
+/// - [`FerroError::ShapeMismatch`] if `y`'s length differs from `x`'s row count.
+/// - Propagates structural errors from fold splitting and subset construction.
+///
+/// Note: per-cell estimator failures (a `fit`, `predict`, or `scoring` error
+/// for a single `(param, fold)` cell) do NOT abort the call. Mirroring
+/// scikit-learn's default `error_score=np.nan`, the failing cell's train and
+/// test scores are filled with [`f64::NAN`] and the curve continues, preserving
+/// the full `(n_params, n_folds)` shape.
 pub fn validation_curve(
     x: &Array2<f64>,
     y: &Array1<f64>,
@@ -143,15 +149,24 @@ pub fn validation_curve(
                 })?;
             let y_test: Array1<f64> = test_idx.iter().map(|&i| y[i]).collect();
 
-            // Fit and score.
-            let fitted = pipeline.fit(&x_train, &y_train)?;
+            // Fit and score this (param, fold) cell. Mirroring scikit-learn's
+            // default `error_score=np.nan`, any estimator failure to
+            // fit/predict/score for this single cell fills BOTH the train and
+            // test scores with NaN and CONTINUES the curve — it does NOT abort.
+            let cell: Result<(f64, f64), FerroError> = (|| {
+                let fitted = pipeline.fit(&x_train, &y_train)?;
 
-            let y_train_pred = fitted.predict(&x_train)?;
-            let train_score = scoring(&y_train, &y_train_pred)?;
+                let y_train_pred = fitted.predict(&x_train)?;
+                let train_score = scoring(&y_train, &y_train_pred)?;
+
+                let y_test_pred = fitted.predict(&x_test)?;
+                let test_score = scoring(&y_test, &y_test_pred)?;
+
+                Ok((train_score, test_score))
+            })();
+
+            let (train_score, test_score) = cell.unwrap_or((f64::NAN, f64::NAN));
             train_scores_data.push(train_score);
-
-            let y_test_pred = fitted.predict(&x_test)?;
-            let test_score = scoring(&y_test, &y_test_pred)?;
             test_scores_data.push(test_score);
         }
     }
