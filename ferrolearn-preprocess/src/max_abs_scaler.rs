@@ -23,7 +23,7 @@
 //! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*max_abs` (zero-max_abs left unchanged), mirroring sklearn `X *= scale_` (`_data.py:1337`); `inverse_transform(transform(X))==X` (green guard). Consumer: re-export boundary (S5). |
 //! | REQ-4 (PyO3 binding) | SHIPPED | `_RsMaxAbsScaler` (`extras.rs:1156`, registered `lib.rs:82`) marshals `fit`/`transform` over `FittedMaxAbsScaler<f64>` — a real CPython consumer; maturin smoke. |
 //! | REQ-5 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1202. Fold NaN-ignoring incidental; no `force_all_finite=allow-nan` contract (`_data.py:1256`,`:1263`). Must ALLOW NaN. |
-//! | REQ-6 (scale_/n_samples_seen_ attrs) | NOT-STARTED | open prereq blocker #1203. Only `max_abs`; no `scale_`/`n_samples_seen_` (`_data.py:1266`,`:1272`). |
+//! | REQ-6 (scale_/n_samples_seen_ attrs) | SHIPPED | `FittedMaxAbsScaler<F>` stores `scale_ = max_abs.mapv(\|m\| if m==0 {1} else {m})` (mirroring sklearn `scale_ = _handle_zeros_in_scale(max_abs_)` `_data.py:1272`,`:88` — `1.0` on all-zero columns) and `n_samples_seen_ = n_samples` (`:1266`), set in `Fit::fit`. Getters `scale()`/`n_samples_seen()` (`#[must_use]`). Oracle (`MaxAbsScaler().fit([[1,0],[-3,0],[2,0]])` → `max_abs_=[3,0]`, `scale_=[3,1]`, `n_samples_seen_=3`): tests `max_abs_scale_nsamples_match_sklearn`, `max_abs_scale_differs_from_max_abs_on_zero_col`. `transform`/`inverse_transform` unchanged (still divide/multiply by `max_abs`; identical to dividing by `scale_` since they coincide off the all-zero columns). |
 //! | REQ-7 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1204. Single-shot (`_data.py:1232-1273`). |
 //! | REQ-8 (maxabs_scale free fn + axis) | NOT-STARTED | open prereq blocker #1205. No `maxabs_scale` / axis=1 (`_data.py:1351`). |
 //! | REQ-9 (copy param + _parameter_constraints) | NOT-STARTED | open prereq blocker #1206. No `copy` (`_data.py:1188`,`:1190`). |
@@ -94,6 +94,10 @@ impl<F: Float + Send + Sync + 'static> Default for MaxAbsScaler<F> {
 pub struct FittedMaxAbsScaler<F> {
     /// Per-column maximum absolute values learned during fitting.
     pub(crate) max_abs: Array1<F>,
+    /// Per-column scaling factors, `max_abs` with all-zero columns replaced by `1.0`.
+    pub(crate) scale_: Array1<F>,
+    /// Number of samples (rows) seen during fitting.
+    pub(crate) n_samples_seen_: usize,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedMaxAbsScaler<F> {
@@ -101,6 +105,26 @@ impl<F: Float + Send + Sync + 'static> FittedMaxAbsScaler<F> {
     #[must_use]
     pub fn max_abs(&self) -> &Array1<F> {
         &self.max_abs
+    }
+
+    /// Return the per-column scaling factors used to divide each feature.
+    ///
+    /// Mirrors sklearn `MaxAbsScaler.scale_ = _handle_zeros_in_scale(max_abs_)`
+    /// (`sklearn/preprocessing/_data.py:1272`): equal to `max_abs` on nonzero
+    /// columns and exactly `1.0` on all-zero columns, so dividing by `scale_`
+    /// leaves an all-zero column unchanged.
+    #[must_use]
+    pub fn scale(&self) -> &Array1<F> {
+        &self.scale_
+    }
+
+    /// Return the number of samples (rows) seen during fitting.
+    ///
+    /// Mirrors sklearn `MaxAbsScaler.n_samples_seen_`
+    /// (`sklearn/preprocessing/_data.py:1266`).
+    #[must_use]
+    pub fn n_samples_seen(&self) -> usize {
+        self.n_samples_seen_
     }
 
     /// Inverse-transform scaled data back to the original space.
@@ -170,7 +194,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MaxAbsScaler<F> {
             max_abs[j] = col_max_abs;
         }
 
-        Ok(FittedMaxAbsScaler { max_abs })
+        // sklearn: scale_ = _handle_zeros_in_scale(max_abs_) (`_data.py:1272`,`:88`):
+        // a max_abs of 0 (all-zero column) becomes 1.0 so dividing leaves it unchanged.
+        let scale_ = max_abs.mapv(|m| if m == F::zero() { F::one() } else { m });
+        // sklearn: n_samples_seen_ = X.shape[0] (`_data.py:1266`).
+        let n_samples_seen_ = n_samples;
+
+        Ok(FittedMaxAbsScaler {
+            max_abs,
+            scale_,
+            n_samples_seen_,
+        })
     }
 }
 
@@ -399,6 +433,40 @@ mod tests {
         let result = fitted.transform_pipeline(&x).unwrap();
         assert_abs_diff_eq!(result[[0, 0]], 1.0, epsilon = 1e-10);
         assert_abs_diff_eq!(result[[1, 1]], -0.5, epsilon = 1e-10);
+    }
+
+    #[test]
+    fn max_abs_scale_nsamples_match_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   MaxAbsScaler().fit([[1,0],[-3,0],[2,0]])
+        //   -> max_abs_ = [3.0, 0.0], scale_ = [3.0, 1.0], n_samples_seen_ = 3
+        // column 1 is all-zero: scale_ = _handle_zeros_in_scale(0) = 1 (_data.py:1272,:88).
+        let scaler = MaxAbsScaler::<f64>::new();
+        let x = array![[1.0, 0.0], [-3.0, 0.0], [2.0, 0.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        assert_abs_diff_eq!(fitted.scale()[0], 3.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(fitted.scale()[1], 1.0, epsilon = 1e-12);
+        // Exactly 1.0 on the all-zero column (not merely close).
+        assert!(fitted.scale()[1] == 1.0);
+        assert_eq!(fitted.n_samples_seen(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn max_abs_scale_differs_from_max_abs_on_zero_col() -> Result<(), FerroError> {
+        // scale_ differs from max_abs_ exactly on all-zero columns: sklearn
+        // max_abs_ = [3.0, 0.0] but scale_ = [3.0, 1.0] (_data.py:1272,:88).
+        let scaler = MaxAbsScaler::<f64>::new();
+        let x = array![[1.0, 0.0], [-3.0, 0.0], [2.0, 0.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        // All-zero column: max_abs_ == 0.0 but scale_ == 1.0.
+        assert!(fitted.max_abs()[1] == 0.0);
+        assert!(fitted.scale()[1] == 1.0);
+        // Nonzero column: scale_ unchanged from max_abs_.
+        assert!(fitted.scale()[0] == fitted.max_abs()[0]);
+        Ok(())
     }
 
     #[test]
