@@ -1238,3 +1238,11 @@ upstream = [
 ]
 design = ".design/numerical/integrate.md"
 parity_ops = ["quad", "fixed_quad"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/sparse_eig.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/sparse/linalg/__init__.py",
+]
+design = ".design/numerical/sparse_eig.md"
+parity_ops = ["eigsh"]

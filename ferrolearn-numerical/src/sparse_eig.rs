@@ -24,6 +24,30 @@
 //!    factorisation is compressed, then extended again. This is repeated
 //!    until convergence or the iteration budget is exhausted.
 //!
+//! ## REQ status
+//!
+//! Mirrors `scipy.sparse.linalg.eigsh` (ARPACK; `scipy/sparse/linalg/__init__.py`;
+//! live oracle scipy 1.17, deterministic eigenvalues). Design doc:
+//! `.design/numerical/sparse_eig.md` (11 REQs). Every REQ is BINARY (R-DEFER-2):
+//! SHIPPED or NOT-STARTED (with a concrete blocker). Eigenvalues are oracle-verified
+//! element-wise (R-CHAR-3) — see `tests/divergence_sparse_eig.rs`.
+//!
+//! **4 SHIPPED / 7 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (eigenvalue parity — LargestAlgebraic) | SHIPPED | `eigsh(·, which=LargestAlgebraic)` matches `scipy.sparse.linalg.eigsh(which='LA')` ≤1e-8 on a diagonal and an indefinite 6×6 (eigenvalues `[-3,-1,0.5,2,4,7]`); LA k=3 → `[2,4,7]`. Guards `green_largest_algebraic_*`. |
+//! | REQ-2 (eigenvalue parity — SmallestAlgebraic) | SHIPPED | matches `which='SA'`; indefinite k=3 → `[-3,-1,0.5]`. Guard `green_smallest_algebraic_*`. |
+//! | REQ-3 (eigenvalue parity — LargestMagnitude) | SHIPPED | matches `which='LM'`; the strict indefinite check k=3 → `[-3,4,7]` (`|-3|>|2|`). Guard `green_largest_magnitude_dense_indefinite_strict`. |
+//! | REQ-4 (eigenvector residual + orthonormality) | SHIPPED | Ritz vectors satisfy `‖A·vᵢ − λᵢ·vᵢ‖ ≤ 1e-7` (actual ≤1.3e-14) and `‖VᵀV − I‖ ≤ 1e-8`. Guard `green_eigenvector_residual_and_orthonormality`. |
+//! | REQ-5 (missing which — SM/BE) | NOT-STARTED | no `BothEnds`; `SmallestMagnitude` works only when Lanczos spans the spectrum (small matrices) — general interior eigenvalues need shift-invert (REQ-6). Blocker #1979. |
+//! | REQ-6 (missing modes/params — sigma/M/v0/ncv/return_eigenvectors) | NOT-STARTED | no shift-invert `sigma`, generalized `M`, user `v0`, or `return_eigenvectors=False` (`scipy/sparse/linalg/__init__.py` eigsh signature). Blocker #1980. |
+//! | REQ-7 (missing companions — eigs/svds/lobpcg) | NOT-STARTED | no non-symmetric `eigs`, sparse `svds` (the `TruncatedSVD(algorithm='arpack')` prereq), or `lobpcg`. Blocker #1981. |
+//! | REQ-8 (edge cases — k≥n / non-convergence / k=0) | NOT-STARTED | ferrolearn accepts `k==n` (scipy raises `TypeError`); non-convergence → `Err(String)` vs scipy `ArpackNoConvergence`. Blocker #1982. |
+//! | REQ-9 (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError` / scipy `ValueError`/`ArpackNoConvergence`. Blocker #1983. |
+//! | REQ-10 (production consumer) | NOT-STARTED | no non-test caller — spectral estimators hand-roll dense faer eigensolve instead of wiring this module. Blocker #1984. |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | hand-rolled Lanczos + tridiagonal QR on `ndarray`/`sprs` vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1985. |
+//!
 //! # Examples
 //!
 //! ```
