@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for REQ-12 of lasso.md: Lasso CD uses absolute max-coef-change<tol stopping; sklearn cd_fast uses relative d_w_max/w_max<tol THEN dual gap<tol*||y||^2 (_cd_fast.pyx:208-249) — likely numerical divergence at a given tol (#412)
 - Blocker for REQ-10/11 of ridge_classifier: RidgeClassifier missing max_iter/tol/n_iter_ and sample_weight support (#394)
 - Blocker for REQ-12 of ridge_classifier: RidgeClassifierCV estimator (sklearn _ridge.py:2676) has no ferrolearn type (#395)
 - Blocker for REQ-9 of ridge.md: positive=True constrained fitting (lbfgs solver only) — Ridge<F> has no positive param; sklearn _ridge.py:923-928, _solve_lbfgs (_ridge.py:795) (#387)
