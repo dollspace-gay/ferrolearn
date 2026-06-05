@@ -20,7 +20,7 @@
 //! | REQ-9 (transform input validation per check_array) | SHIPPED | FIXED #1123/#1124/#1125. `transform` rejects (in sklearn order) zero-samples → `InsufficientSamples` (`validation.py:1084`), zero-features → `InvalidParameter` (`:1093`), non-finite NaN/±inf → `InvalidParameter` (`:1063`, force_all_finite=True) — matching sklearn `Binarizer.transform` `_validate_data` (`_data.py:2301`). 13 live-oracle tests green; finite extremes (1e308/-0.0/subnormal) not over-rejected. Two-round critic-verified CLEAN. |
 //! | REQ-2 (copy param) | NOT-STARTED | open prereq blocker #1126. No `copy` ctor/transform param (sklearn `:2253`,`:2298-2307`). |
 //! | REQ-3 (fit + parameter-constraints validation) | NOT-STARTED | open prereq blocker #1127. No `fit`/`_parameter_constraints` (threshold is Real → InvalidParameterError; sklearn `:2248-2278`). Transform-time INPUT validation is REQ-9; this is fit-time PARAMETER validation. |
-//! | REQ-4 (binarize free function) | NOT-STARTED | open prereq blocker #1128. No standalone `binarize` fn (sklearn `:2120-2174`). |
+//! | REQ-4 (binarize free function) | SHIPPED | FIXED #1128. Standalone [`binarize`] (`x.mapv(\|v\| if v > threshold { 1 } else { 0 })`, strict `>`, shape-preserving) mirrors sklearn `binarize` dense path (`_data.py:2120-2174`); keyword default `threshold=0.0` documented. `Transform::transform` delegates its mapping to `binarize`, so the two are byte-identical. Critic-verified vs the live sklearn 1.5.2 oracle (`binarize_*_matches_sklearn`). |
 //! | REQ-5 (n_features_in_ / feature names) | NOT-STARTED | open prereq blocker #1129. No `n_features_in_`/`get_feature_names_out` (OneToOneFeatureMixin; sklearn `:2277`). Depends on REQ-3. |
 //! | REQ-6 (sparse support) | NOT-STARTED | open prereq blocker #1130. Dense-only; no CSR/CSC path, no `threshold<0` guard, no `eliminate_zeros` (sklearn `:2161-2168`). |
 //! | REQ-7 (PyO3 binding) | NOT-STARTED | open prereq blocker #1131. No `ferrolearn-python` registration. |
@@ -30,6 +30,45 @@ use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Transform;
 use ndarray::Array2;
 use num_traits::Float;
+
+// ---------------------------------------------------------------------------
+// binarize (free function)
+// ---------------------------------------------------------------------------
+
+/// Boolean thresholding of a dense array, element by element.
+///
+/// Values **strictly greater** than `threshold` become `1.0`; all other values
+/// (less than *or equal to* the threshold) become `0.0`. The result is a new,
+/// shape-preserving array.
+///
+/// This is the estimator-less functional form of [`Binarizer`], mirroring
+/// scikit-learn's `binarize(X, *, threshold=0.0, copy=True)`
+/// (`sklearn/preprocessing/_data.py:2120-2174`), whose dense path is
+/// `cond = X > threshold; X[cond] = 1; X[not_cond] = 0` (`:2170-2173`) — the
+/// load-bearing strict greater-than. scikit-learn's keyword default is
+/// `threshold=0.0` (only positive values map to `1.0`); here the caller passes
+/// the threshold explicitly.
+///
+/// [`Binarizer`]'s [`Transform::transform`] delegates its element mapping to
+/// this function, so the two share one implementation.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_preprocess::binarizer::binarize;
+/// use ndarray::array;
+///
+/// let x = array![[0.4, 0.6, 0.5], [0.6, 0.1, 0.2]];
+/// let out = binarize(&x, 0.5);
+/// // out = [[0.0, 1.0, 0.0], [1.0, 0.0, 0.0]]
+/// ```
+#[must_use]
+pub fn binarize<F>(x: &Array2<F>, threshold: F) -> Array2<F>
+where
+    F: Float,
+{
+    x.mapv(|v| if v > threshold { F::one() } else { F::zero() })
+}
 
 // ---------------------------------------------------------------------------
 // Binarizer
@@ -136,14 +175,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for Binarizer<F> {
                     .to_string(),
             });
         }
-        let out = x.mapv(|v| {
-            if v > self.threshold {
-                F::one()
-            } else {
-                F::zero()
-            }
-        });
-        Ok(out)
+        Ok(binarize(x, self.threshold))
     }
 }
 
@@ -240,6 +272,39 @@ mod tests {
         assert!((out[[0, 0]] - 1.0f32).abs() < 1e-6);
         assert!((out[[0, 1]] - 0.0f32).abs() < 1e-6);
         assert!((out[[0, 2]] - 0.0f32).abs() < 1e-6);
+    }
+
+    // -- binarize free function (REQ-4) -- oracle-grounded vs live sklearn 1.5.2 --
+    // X = [[1,-1,2],[2,0,0],[0,1,-1]]
+    // python3 -c "from sklearn.preprocessing import binarize; import numpy as np; \
+    //   print(binarize(np.array([[1.,-1,2],[2,0,0],[0,1,-1]])).tolist())"
+    //   -> [[1,0,1],[1,0,0],[0,1,0]]   (threshold 0.0, strict >)
+    // python3 -c "from sklearn.preprocessing import binarize; import numpy as np; \
+    //   print(binarize(np.array([[1.,-1,2],[2,0,0],[0,1,-1]]), threshold=-0.5).tolist())"
+    //   -> [[1,0,1],[1,1,1],[1,1,0]]
+
+    #[test]
+    fn binarize_default_threshold_matches_sklearn() {
+        let x = array![[1.0, -1.0, 2.0], [2.0, 0.0, 0.0], [0.0, 1.0, -1.0]];
+        let out = binarize(&x, 0.0);
+        let expected = array![[1.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn binarize_negative_threshold_matches_sklearn() {
+        let x = array![[1.0, -1.0, 2.0], [2.0, 0.0, 0.0], [0.0, 1.0, -1.0]];
+        let out = binarize(&x, -0.5);
+        let expected = array![[1.0, 0.0, 1.0], [1.0, 1.0, 1.0], [1.0, 1.0, 0.0]];
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn binarize_matches_estimator_transform() {
+        let x = array![[1.0, -1.0, 2.0], [2.0, 0.0, 0.0], [0.0, 1.0, -1.0]];
+        let free = binarize(&x, 0.5);
+        let est = Binarizer::<f64>::new(0.5).transform(&x).ok();
+        assert_eq!(est, Some(free));
     }
 
     #[test]
