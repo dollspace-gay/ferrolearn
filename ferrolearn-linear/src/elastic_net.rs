@@ -36,7 +36,8 @@
 //! | REQ-13 (dual-gap stopping criterion) | SHIPPED | `Fit::fit for ElasticNet` now uses sklearn's two-level criterion (`_cd_fast.pyx:167-249`): `tol_scaled = tol·(target·target)` (`:167-168`), per sweep track `w_max`/`d_w_max`, gate on `w_max==0 || d_w_max/w_max < tol || last_iter` (`:207-211`), and inside the gate break only when the UN-normalized gap `enet_dual_gap(...)·n < tol_scaled` (`:249`) — `enet_dual_gap` already carries the L2/beta term. Matches sklearn's `coef_` to ≤1e-7 and `n_iter_` exactly (16 at alpha=0.3, 19 at alpha=0.1). Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_dual_gap_stopping_matches_sklearn_coef_and_niter`, `enet_dual_gap_stopping_second_alpha`). |
 //! | REQ-10 (selection='random' + random_state) | SHIPPED | Reuses `pub enum CoordSelection { Cyclic, Random }` from `lasso.rs` + `pub selection`/`pub random_state` fields on `ElasticNet` with `with_selection`/`with_random_state` builders, mirroring sklearn `ElasticNet(selection=..., random_state=...)` (`_coordinate_descent.py` `__init__`). `Fit::fit`'s CD loop visits `0..n_features` in order for `Cyclic` (BYTE-IDENTICAL to the prior cyclic path, so coef_/`n_iter_`/dual-gap stay unchanged) and shuffles a reused index `Vec` each sweep for `Random` via `StdRng::seed_from_u64(random_state.unwrap_or(0))` (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch picks `ii` instead of `f_iter`); per-coordinate update math + dual-gap stopping (REQ-13) are unchanged. The ElasticNet optimum is unique, so `Random` converges to the same optimum (≈3e-4 from cyclic due to stopping-within-tol). Exact bit-match to sklearn's `selection='random'` is numpy-MT19937-RNG-blocked (Rust `StdRng` ≠ numpy MT), so the random path verifies convergence-to-the-unique-optimum, not bitwise sklearn parity; the cyclic default IS bit-exact. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_selection_cyclic_default_unchanged`, `enet_selection_random_converges_to_optimum`). |
 //! | REQ-11 (precompute/Gram) | SHIPPED | `pub precompute: bool` field (default `false`) on `ElasticNet` + `with_precompute` builder, mirroring sklearn `ElasticNet(precompute=False)` (`_coordinate_descent.py:774`). When `true`, `Fit::fit` runs CD on the precomputed `Q = Xcᵀ Xc` / `q = Xcᵀ yc` with an incrementally-maintained `H = Q·w` (sklearn `_cd_fast.pyx enet_coordinate_descent_gram`); `tmp = (q[j]−H[j])/n + col_norms[j]·w[j] ≡` the direct path's `rho_j + (XⱼᵀXⱼ/n)·w_old` since `Xⱼᵀr = q[j]−(Q·w)[j]`, then `soft_threshold(tmp, α·l1_ratio)/(col_norm + α·(1−l1_ratio))` keeps the L2 term in the denominator, so it reaches the SAME unique optimum (to ~1e-10 fp reassociation) with the SAME coordinate order + dual-gap stopping. `precompute=false` (default) is the byte-identical direct path. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_precompute_matches_sklearn`, `enet_precompute_default_false_unchanged`, `enet_precompute_equals_direct`). |
-//! | REQ-9, 14..15 NOT-STARTED | warm_start (#408), MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-9 (warm_start) | SHIPPED | `ElasticNet<F>` carries `pub warm_start: bool` (default `false`) + `pub coef_init: Option<Array1<F>>` (default `None`) with `with_warm_start`/`with_coef_init` builders, mirroring sklearn `ElasticNet(warm_start=False)` (`_coordinate_descent.py:795`). R-DEV-4 adaptation: ferrolearn estimators are immutable value types — there is no mutable `self.coef_` carried across repeated `.fit()` calls like sklearn's mutable estimator (`_coordinate_descent.py:1062-1063` reuses `self.coef_` when `warm_start`), so the prior coefficient vector is supplied EXPLICITLY via `coef_init` (sklearn's path solver seeds the same way: `_coordinate_descent.py:648-651`, `coef_ = np.zeros(...)` when `coef_init is None` else `np.asfortranarray(coef_init, ...)`). In `Fit::fit`, when `warm_start && coef_init.is_some()` the init vector is length-validated (`ShapeMismatch` on mismatch) and `w` is cloned from it (the direct path also seeds `residual = y_work − X_work·w`; the Gram path's `H = Q·w` already derives from the actual `w`); otherwise `w = zeros` — BYTE-IDENTICAL to the cold path. The numerics are identical, only the CD start point changes, so warm-from-converged reaches the same unique optimum in fewer sweeps. Verification (live sklearn 1.5.2 oracle, R-CHAR-3): cold `ElasticNet(alpha=0.5, l1_ratio=0.5)` → coef `[0.7643620892, 1.2564536255]`, `n_iter_=14`; warm (refit from converged coef) → coef `[0.7642996441, 1.2564980309]`, `n_iter_=1`. Tests `enet_warm_start_from_converged_matches_sklearn`, `enet_warm_start_default_unchanged`, `enet_warm_start_none_coef_init_equals_cold`, `enet_warm_start_coef_init_wrong_len_errors`. |
+//! | REQ-14..15 NOT-STARTED | MultiTaskElasticNet (#418), ferray substrate (#419). |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -115,6 +116,33 @@ pub struct ElasticNet<F> {
     /// Mirrors sklearn `ElasticNet(random_state=...)` (default `None`). `None`
     /// falls back to seed `0`.
     pub random_state: Option<u64>,
+    /// When `true`, initialize coordinate descent from [`ElasticNet::coef_init`]
+    /// (the prior solution) instead of zeros.
+    ///
+    /// Mirrors sklearn `ElasticNet(warm_start=False)`
+    /// (`_coordinate_descent.py:795`), which "reuse[s] the solution of the
+    /// previous call to fit as initialization" (`:796`). In sklearn the prior
+    /// solution is the mutable estimator's own `self.coef_`, reused when
+    /// `warm_start` is set (`_coordinate_descent.py:1062-1063`: `if not
+    /// self.warm_start or not hasattr(self, "coef_"): coef_ = np.zeros(...)`).
+    ///
+    /// R-DEV-4 adaptation: ferrolearn estimators are immutable value types —
+    /// there is no mutable `self.coef_` carried across repeated `.fit()` calls.
+    /// So the prior coefficient vector is supplied EXPLICITLY through
+    /// [`ElasticNet::coef_init`] rather than read off the estimator. The numerics
+    /// are identical: CD starts from `coef_init` instead of zeros.
+    pub warm_start: bool,
+    /// Explicit coordinate-descent initialization vector used when
+    /// [`ElasticNet::warm_start`] is `true` (the R-DEV-4 stand-in for sklearn's
+    /// reused `self.coef_`).
+    ///
+    /// Mirrors the `coef_init` seed fed to the path solver
+    /// (`_coordinate_descent.py:648-651`: `coef_ = np.zeros(...)` when
+    /// `coef_init is None`, else `coef_ = np.asfortranarray(coef_init, ...)`).
+    /// `None` (the default) — or `warm_start == false` — initializes `w` to
+    /// zeros, the byte-identical cold-start path. When `Some`, its length must
+    /// equal `n_features`.
+    pub coef_init: Option<Array1<F>>,
 }
 
 impl<F: Float + FromPrimitive> ElasticNet<F> {
@@ -134,6 +162,8 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
             precompute: false,
             selection: CoordSelection::Cyclic,
             random_state: None,
+            warm_start: false,
+            coef_init: None,
         }
     }
 
@@ -211,6 +241,36 @@ impl<F: Float + FromPrimitive> ElasticNet<F> {
     #[must_use]
     pub fn with_random_state(mut self, seed: u64) -> Self {
         self.random_state = Some(seed);
+        self
+    }
+
+    /// Enable/disable warm-start coordinate-descent initialization.
+    ///
+    /// Mirrors `sklearn.linear_model.ElasticNet(warm_start=...)`
+    /// (`_coordinate_descent.py:795`): when `true`, "reuse the solution of the
+    /// previous call to fit as initialization". R-DEV-4: ferrolearn estimators
+    /// are immutable value types with no mutable `self.coef_` carried across
+    /// `.fit()` calls, so the prior solution is supplied explicitly via
+    /// [`ElasticNet::with_coef_init`]; `warm_start` only gates whether that
+    /// vector (when present) is used instead of zeros.
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Provide the explicit coordinate-descent initialization vector used when
+    /// [`ElasticNet::warm_start`] is `true`.
+    ///
+    /// R-DEV-4 adaptation of sklearn's reused `self.coef_`
+    /// (`_coordinate_descent.py:1062-1063`, seeded into the path solver's
+    /// `coef_init` at `:648-651`): because ferrolearn estimators are immutable
+    /// value types, the prior coefficient vector is passed in explicitly rather
+    /// than read off a mutated estimator. Its length must equal `n_features` at
+    /// fit time, else [`Fit::fit`] returns [`FerroError::ShapeMismatch`].
+    #[must_use]
+    pub fn with_coef_init(mut self, coef: Array1<F>) -> Self {
+        self.coef_init = Some(coef);
         self
     }
 }
@@ -435,7 +495,25 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // Effective denominator per column: (X_j^T X_j / n) + alpha_l2.
         let denominators: Vec<F> = col_norms.iter().map(|&cn| cn + alpha_l2).collect();
 
-        let mut w = Array1::<F>::zeros(n_features);
+        // Initialize coefficients. Cold start (default) is zeros; warm start
+        // reuses the explicit `coef_init` (the R-DEV-4 stand-in for sklearn's
+        // reused mutable `self.coef_`, `_coordinate_descent.py:1062-1063`/
+        // `:648-651`). `warm_start == false` or `coef_init == None` is the
+        // byte-identical zeros path.
+        let mut w = if self.warm_start
+            && let Some(coef) = &self.coef_init
+        {
+            if coef.len() != n_features {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![n_features],
+                    actual: vec![coef.len()],
+                    context: "coef_init length must equal number of features".into(),
+                });
+            }
+            coef.clone()
+        } else {
+            Array1::<F>::zeros(n_features)
+        };
         // Keep the (centered/raw) target for the final dual-gap computation;
         // the CD loop consumes a working copy into `residual`.
         let target = y_work.clone();
@@ -472,10 +550,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // visiting order, and the same dual-gap stopping criterion as the direct
         // path so `n_iter_` matches.
         if self.precompute {
-            // Q = Xcᵀ Xc  (n_features × n_features); q = Xcᵀ yc.
+            // Q = Xcᵀ Xc  (n_features × n_features); q = Xcᵀ yc (here `residual`
+            // still equals the centered/raw target — it is not yet adjusted for
+            // a warm-start `w` since the Gram path tracks `H = Q·w` instead).
             let gram = x_work.t().dot(&x_work);
             let q = x_work.t().dot(&residual);
-            // H = Q·w  (zeros initially, since w is zeros).
+            // H = Q·w  (zeros for a cold start where `w == 0`; the actual `Q·w`
+            // for a warm start, so `tmp = (q[j] − H[j])/n + col_norms[j]·w[j]`
+            // is correct from the first sweep regardless of the init).
             let mut h = gram.dot(&w);
 
             for iter in 0..self.max_iter {
@@ -558,6 +640,16 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 n_iter,
                 dual_gap,
             });
+        }
+
+        // Direct path: the CD loop maintains `residual = y_work − X_work·w`,
+        // adding back `X_j·w_old` per coordinate before recomputing `rho_j`. With
+        // a non-zero warm-start `w`, seed the residual with that running
+        // contribution removed. For the cold path (`w == 0`) `X_work·w` is the
+        // zero vector and the subtraction is a byte-identical no-op, so this is
+        // gated on warm start to leave the default path provably untouched.
+        if self.warm_start && self.coef_init.is_some() {
+            residual = &residual - &x_work.dot(&w);
         }
 
         for iter in 0..self.max_iter {
@@ -1394,5 +1486,137 @@ mod tests {
             epsilon = 1e-6
         );
         Ok(())
+    }
+
+    // ---- warm_start (REQ-9) ----
+
+    /// Oracle fixture for the warm-start tests (R-CHAR-3, live sklearn 1.5.2):
+    /// `X = [[1,2],[2,1],[3,4],[4,3],[5,5]]`, `y = [3,2.5,7.1,6,11.2]`,
+    /// `alpha=0.5`, `l1_ratio=0.5`.
+    fn warm_start_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        (x, y)
+    }
+
+    #[test]
+    fn enet_warm_start_from_converged_matches_sklearn() -> Result<(), FerroError> {
+        // REQ-9: warm-start coordinate descent from the prior converged coef.
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   ElasticNet(alpha=0.5, l1_ratio=0.5).fit(X,y)
+        //     -> coef_=[0.7643620892, 1.2564536255], n_iter_=14   (cold)
+        //   refit ElasticNet(alpha=0.5, l1_ratio=0.5, warm_start=True) from the
+        //   converged coef_
+        //     -> coef_=[0.7642996441, 1.2564980309], n_iter_=1     (warm)
+        let (x, y) = warm_start_fixture();
+
+        let cold = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y)?;
+        assert_relative_eq!(cold.coefficients()[0], 0.7643620892, epsilon = 1e-6);
+        assert_relative_eq!(cold.coefficients()[1], 1.2564536255, epsilon = 1e-6);
+        assert_eq!(cold.n_iter(), 14, "cold n_iter_ must match sklearn's 14");
+
+        let warm = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .with_warm_start(true)
+            .with_coef_init(cold.coefficients().to_owned())
+            .fit(&x, &y)?;
+
+        assert_relative_eq!(warm.coefficients()[0], 0.7642996441, epsilon = 1e-6);
+        assert_relative_eq!(warm.coefficients()[1], 1.2564980309, epsilon = 1e-6);
+        assert_eq!(warm.n_iter(), 1, "warm n_iter_ must match sklearn's 1");
+        Ok(())
+    }
+
+    #[test]
+    fn enet_warm_start_default_unchanged() -> Result<(), FerroError> {
+        // Default `warm_start=false`/`coef_init=None`; the default fit must be
+        // byte-identical to before (the cold zeros-init path is untouched).
+        assert!(
+            !ElasticNet::<f64>::new().warm_start,
+            "default warm_start is false"
+        );
+        assert!(
+            ElasticNet::<f64>::new().coef_init.is_none(),
+            "default coef_init is None"
+        );
+
+        let (x, y) = warm_start_fixture();
+
+        let default_fit = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y)?;
+        let explicit_cold = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .with_warm_start(false)
+            .fit(&x, &y)?;
+
+        // Bit-identical: same coordinate-descent start point (zeros).
+        assert_eq!(
+            default_fit.coefficients()[0].to_bits(),
+            explicit_cold.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            default_fit.coefficients()[1].to_bits(),
+            explicit_cold.coefficients()[1].to_bits()
+        );
+        assert_eq!(
+            default_fit.intercept().to_bits(),
+            explicit_cold.intercept().to_bits()
+        );
+        assert_eq!(default_fit.n_iter(), explicit_cold.n_iter());
+        Ok(())
+    }
+
+    #[test]
+    fn enet_warm_start_none_coef_init_equals_cold() -> Result<(), FerroError> {
+        // `warm_start=true` but no `coef_init` falls back to the zeros init,
+        // byte-identical to a plain cold fit (warm_start gates only whether
+        // `coef_init`, when present, is used).
+        let (x, y) = warm_start_fixture();
+
+        let cold = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .fit(&x, &y)?;
+        let warm_no_init = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .with_warm_start(true)
+            .fit(&x, &y)?;
+
+        assert_eq!(
+            cold.coefficients()[0].to_bits(),
+            warm_no_init.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            cold.coefficients()[1].to_bits(),
+            warm_no_init.coefficients()[1].to_bits()
+        );
+        assert_eq!(cold.n_iter(), warm_no_init.n_iter());
+        Ok(())
+    }
+
+    #[test]
+    fn enet_warm_start_coef_init_wrong_len_errors() {
+        // `coef_init` length (1) != n_features (2) must raise ShapeMismatch.
+        let (x, y) = warm_start_fixture();
+
+        let result = ElasticNet::<f64>::new()
+            .with_alpha(0.5)
+            .with_l1_ratio(0.5)
+            .with_warm_start(true)
+            .with_coef_init(array![0.0])
+            .fit(&x, &y);
+
+        assert!(
+            matches!(result, Err(FerroError::ShapeMismatch { .. })),
+            "wrong-length coef_init must return ShapeMismatch, got {result:?}"
+        );
     }
 }
