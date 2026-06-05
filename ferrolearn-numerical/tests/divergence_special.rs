@@ -436,7 +436,6 @@ fn green_lgamma_poles_reflection_and_large_matches_scipy() {
 /// `scipy.special.gamma(171.0)` is the finite `7.257415615308e+306`.
 /// Tracking: #1946
 #[test]
-#[ignore = "divergence: gamma(171) overflows to inf vs scipy finite 7.26e306; tracking #1946"]
 fn divergence_gamma_large_x_overflows() {
     // Live scipy oracle: sp.gamma(171.0) == 7.257415615308e+306 (finite).
     const SP_GAMMA_171: f64 = 7.257_415_615_308e306;

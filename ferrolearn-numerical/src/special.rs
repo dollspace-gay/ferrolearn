@@ -12,8 +12,30 @@
 //! - [`digamma`] — ψ(x) = d/dx ln Γ(x).
 //! - [`beta`] — B(a, b).
 //! - [`lbeta`] — log B(a, b).
-//! - [`erf`] — error function via Abramowitz & Stegun 7.1.26 polynomial.
-//! - [`erfc`] — 1 - erf(x), computed for accuracy in the tails.
+//! - [`erf`] — error function, delegating to `libm::erf` (machine precision).
+//! - [`erfc`] — complementary error function, delegating to `libm::erfc`.
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.special` scalar functions (the scipy substrate sklearn is
+//! built on; live oracle: installed scipy 1.17, version-stable math functions).
+//! Design doc: `.design/numerical/special.md` (8 REQs). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). All values are
+//! oracle-verified element-wise against the live scipy (R-CHAR-3) — see
+//! `tests/divergence_special.rs`.
+//!
+//! **6 SHIPPED / 2 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (`gamma`) | SHIPPED | Lanczos g=7 n=9 (scipy's coeffs) + reflection; evaluated in LOG-space for x≥0.5 to avoid premature overflow (FIXED #1946: `gamma(171)=7.257e306` finite, `+inf` at ≥172, matching scipy); negative-integer poles → `NaN`, `gamma(0)=+inf` (FIXED #1943). Oracle-verified across integers/half-integers/large(20,171)/negative-non-integer within 1e-12. |
+//! | REQ-2 (`lgamma`) | SHIPPED | log\|Γ\| via Lanczos + reflection; non-positive-integer poles → `+inf` matching `scipy.special.gammaln` (FIXED #1943). Oracle-verified ≤1e-12. |
+//! | REQ-3 (`digamma`) | SHIPPED | recurrence to z≥6 + 5-term Bernoulli asymptotic; matches `scipy.special.digamma` ≤~2e-11 (the truncation floor). |
+//! | REQ-4 (`beta` / `lbeta`) | SHIPPED | via `lgamma`; matches `scipy.special.beta`/`betaln` ≤1e-12. |
+//! | REQ-5 (`erf` / `erfc`) | SHIPPED | FIXED #1942: delegate to `libm::erf`/`libm::erfc` (Cephes/musl, machine precision) — was Abramowitz & Stegun 7.1.26 (~1.5e-7). Matches `scipy.special.erf`/`erfc` ≤1e-12 across the range incl. negatives and the tail (erfc(10)≈2.09e-45). |
+//! | REQ-6 (pole / inf / nan handling) | SHIPPED | gamma negative-integer `NaN`, gamma(0)/erf(∞)/erfc(∞) edge values, lgamma non-positive-integer `+inf` — all match scipy (FIXED #1943; guards `green_erf_inf_and_gamma_zero_pole`, `green_gamma_poles_*`). |
+//! | REQ-7 (production consumer) | NOT-STARTED | no non-test workspace caller — crates needing erf use `statrs`/`libm` directly; special.rs is currently a standalone public-API module. Future consumer: gp_kernels Matern-general-nu (#1914) needs `gamma`. Blocker #1944. |
+//! | REQ-8 (ferray substrate) | NOT-STARTED | hand-rolled scipy.special reimplementation (+ `libm` transitional) vs the `ferray::stats`/ferray special-functions destination (R-SUBSTRATE-1/5). Blocker #1945. |
 
 use std::f64::consts::PI;
 
@@ -36,8 +58,24 @@ const LANCZOS_COEFFS: [f64; 9] = [
 /// Compute Γ(x) for any real `x`.
 ///
 /// Uses Lanczos's approximation; reflection formula handles negative `x`.
+///
+/// For `x >= 0.5` the Lanczos product is evaluated in **log-space** and
+/// exponentiated at the end (`exp(0.5·ln(2π) + (z+0.5)·ln t − t + ln a)`) to
+/// avoid the premature overflow of the `t^(z+0.5)` intermediate; this keeps the
+/// result finite up to `x ≈ 171` and overflows to `+inf` only at `x >= 172`,
+/// matching `scipy.special.gamma` (`gamma(171.0) ≈ 7.257e306`, `gamma(172.0) = inf`).
+///
+/// At the poles of Γ this matches `scipy.special.gamma`: `gamma(0.0)` is `+inf`
+/// (via the reflection `π / (sin(0) · …)` where `sin(0) == 0` exactly), and
+/// every negative integer is a pole returning `NaN`.
 #[must_use]
 pub fn gamma(x: f64) -> f64 {
+    if x < 0.0 && x == x.floor() {
+        // Negative-integer poles: scipy.special.gamma returns nan. The
+        // reflection formula would otherwise yield huge finite garbage because
+        // sin(π·n) is a tiny nonzero float rather than exactly 0.
+        return f64::NAN;
+    }
     if x < 0.5 {
         // reflection: Γ(x) Γ(1-x) = π / sin(π x)
         PI / ((PI * x).sin() * gamma(1.0 - x))
@@ -48,20 +86,30 @@ pub fn gamma(x: f64) -> f64 {
             a += c / (z + i as f64);
         }
         let t = z + LANCZOS_G + 0.5;
-        (2.0 * PI).sqrt() * t.powf(z + 0.5) * (-t).exp() * a
+        // Evaluate in log-space and exponentiate at the end. The direct product
+        // `√(2π)·t^(z+0.5)·e^(−t)·a` forms the intermediate `t^(z+0.5)` which
+        // overflows f64 to `+inf` for large x (e.g. x≈170 ⇒ t^(z+0.5)≈exp(864))
+        // BEFORE the tiny `e^(−t)` factor brings it back down — even though the
+        // true product is finite. `exp(0.5·ln(2π) + (z+0.5)·ln t − t + ln a)` is
+        // algebraically identical (it is exactly what `lgamma` computes for this
+        // branch) but never forms the overflowing intermediate, so it stays
+        // finite up to the TRUE overflow point (≈171), matching scipy. For
+        // x ≥ 0.5 the Lanczos sum `a` is positive, so `a.ln()` is finite.
+        (0.5 * (2.0 * PI).ln() + (z + 0.5) * t.ln() - t + a.ln()).exp()
     }
 }
 
 /// Compute ln|Γ(x)|.
 ///
-/// Returns NaN for non-positive integer `x` (poles of Γ).
+/// At the poles of Γ (non-positive integers) this matches
+/// `scipy.special.gammaln`, returning `+inf`. A `NaN` input is passed through.
 #[must_use]
 pub fn lgamma(x: f64) -> f64 {
     if x.is_nan() {
         return x;
     }
     if x <= 0.0 && x == x.floor() {
-        return f64::NAN;
+        return f64::INFINITY;
     }
     if x < 0.5 {
         let s = (PI * x).sin().abs();
@@ -127,36 +175,24 @@ pub fn lbeta(a: f64, b: f64) -> f64 {
     lgamma(a) + lgamma(b) - lgamma(a + b)
 }
 
-/// Compute the error function erf(x) using Abramowitz & Stegun 7.1.26.
+/// Compute the error function erf(x).
 ///
-/// Maximum error is < 1.5e-7 over `(-∞, ∞)` — adequate for normal-CDF
-/// downstream uses.
+/// Delegates to [`libm::erf`] (the FreeBSD/Sun msun Cephes-family
+/// implementation, machine precision ~1e-16) — the `scipy.special.erf`
+/// analog. Matches `scipy.special.erf` to ~machine precision.
 #[must_use]
 pub fn erf(x: f64) -> f64 {
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let x_abs = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x_abs);
-    let poly = ((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736)
-        * t
-        + 0.254_829_592;
-    let y = 1.0 - poly * t * (-x_abs * x_abs).exp();
-    sign * y
+    libm::erf(x)
 }
 
 /// Compute the complementary error function erfc(x) = 1 - erf(x).
 ///
-/// Computed via the same polynomial as [`erf`] without the `1 -` cancellation,
-/// which preserves accuracy in the tails.
+/// Delegates to [`libm::erfc`] (the same Cephes-family implementation as
+/// [`erf`], machine precision) — the `scipy.special.erfc` analog, with good
+/// relative accuracy in the tails.
 #[must_use]
 pub fn erfc(x: f64) -> f64 {
-    if x < 0.0 {
-        return 2.0 - erfc(-x);
-    }
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let poly = ((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736)
-        * t
-        + 0.254_829_592;
-    poly * t * (-x * x).exp()
+    libm::erfc(x)
 }
 
 #[cfg(test)]
@@ -210,9 +246,14 @@ mod tests {
 
     #[test]
     fn lgamma_pole_at_nonpositive_int() {
-        assert!(lgamma(0.0).is_nan());
-        assert!(lgamma(-1.0).is_nan());
-        assert!(lgamma(-5.0).is_nan());
+        // scipy.special.gammaln returns +inf at non-positive integer poles.
+        for x in [0.0_f64, -1.0, -5.0] {
+            let lg = lgamma(x);
+            assert!(
+                lg.is_infinite() && lg > 0.0,
+                "lgamma({x})={lg} expected +inf"
+            );
+        }
     }
 
     #[test]

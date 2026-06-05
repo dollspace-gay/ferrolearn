@@ -50,6 +50,16 @@ except ImportError:
 # Reads under this prefix satisfy the "upstream" requirement.
 UPSTREAM_ROOT = "/home/doll/scikit-learn/"
 
+# Additional analog-upstream roots. scikit-learn is built on numpy/scipy; the
+# ferrolearn substrate crates (e.g. ferrolearn-numerical mirrors scipy.special/
+# optimize/...) route to the installed scipy/numpy sources as their upstream.
+# Reads under these prefixes ALSO satisfy the "upstream" requirement, so a route
+# whose `upstream` cites a scipy/numpy site-packages path can pass the gate.
+EXTRA_UPSTREAM_ROOTS = (
+    "/home/doll/.local/lib/python3.13/site-packages/scipy/",
+    "/home/doll/.local/lib/python3.13/site-packages/numpy/",
+)
+
 # Workspace crate prefixes gated by this hook. Every ferrolearn-* crate's
 # src/ is a translation surface mirroring some scikit-learn module.
 TARGET_CRATE_PREFIXES = ("ferrolearn-",)
@@ -162,6 +172,8 @@ def find_routes(rel_path, routes):
 def is_tracked_read(file_path, repo_root):
     """Is this Read a source we care about tracking?"""
     if file_path.startswith(UPSTREAM_ROOT):
+        return True
+    if any(file_path.startswith(root) for root in EXTRA_UPSTREAM_ROOTS):
         return True
     if file_path.startswith(str(repo_root / ".design") + "/"):
         return True

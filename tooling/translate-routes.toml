@@ -1195,3 +1195,13 @@ crate_pattern = "ferrolearn-covariance/src/graphical_lasso.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/covariance/_graph_lasso.py"]
 design = ".design/covariance/graphical_lasso.md"
 parity_ops = ["GraphicalLasso", "GraphicalLassoCV", "graphical_lasso"]
+
+# =====================================================================
+# Layer 4 — ferrolearn-numerical (scipy.special / optimize substrate)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/special.rs"
+upstream = ["/home/doll/.local/lib/python3.13/site-packages/scipy/special/__init__.py"]
+design = ".design/numerical/special.md"
+parity_ops = ["gamma", "gammaln", "digamma", "psi", "beta", "betaln", "erf", "erfc"]

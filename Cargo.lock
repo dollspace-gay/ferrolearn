@@ -1085,6 +1085,7 @@ version = "0.4.0"
 dependencies = [
  "approx 0.5.1",
  "ferrolearn-test-oracle",
+ "libm",
  "ndarray",
  "num-traits",
  "rand 0.9.4",
