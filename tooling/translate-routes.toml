@@ -1066,6 +1066,15 @@ upstream = ["/home/doll/scikit-learn/sklearn/model_selection/_search.py"]
 design = ".design/model-sel/random_search.md"
 parity_ops = ["RandomizedSearchCV", "ParameterSampler"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/cross_validation.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/model_selection/_validation.py",
+  "/home/doll/scikit-learn/sklearn/model_selection/_split.py",
+]
+design = ".design/model-sel/cross_validation.md"
+parity_ops = ["cross_val_score", "cross_validate", "cross_val_predict", "permutation_test_score", "KFold", "StratifiedKFold"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

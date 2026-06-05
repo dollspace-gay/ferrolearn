@@ -7,6 +7,31 @@
 //! - [`CrossValidator`] — a trait abstracting over fold-index generators.
 //! - [`cross_val_score`] — run a [`ferrolearn_core::pipeline::Pipeline`]
 //!   through each fold and collect scores.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn/model_selection/_validation.py` (cross_val_score :560,
+//! cross_validate :122, cross_val_predict :1054, permutation_test_score :1502,
+//! _fit_and_score :729) and `_split.py` (KFold :441, StratifiedKFold :665,
+//! _make_test_folds :746) at v1.5.2. Every REQ is BINARY (R-DEFER-2): SHIPPED or
+//! NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-KFOLD (non-shuffled KFold membership) | SHIPPED | consecutive folds, first `n%k` get +1 (`:521`); oracle `KFold(3).split(10)` → `[[0,1,2,3],[4,5,6],[7,8,9]]`. Guard `guard_kfold_membership_n10_k3`. |
+//! | REQ-SKFOLD (non-shuffled StratifiedKFold membership) | SHIPPED | ported `_make_test_folds` (`:746-806`): appearance-order class encoding, `allocation[i][k]=bincount(y_order[i::n_splits])`, block-assign — was lexicographic-sort + rotating fold_offset. Matches oracle `[[0,1,4,8],[2,5,6,9],[3,7,10,11]]` (fixed #1791). Test `pin_1791_stratified_kfold_allocation`. |
+//! | REQ-SKFOLD-ERRWARN (error only if ALL classes too small) | SHIPPED | errors only when every class count < n_splits (`:770-774`); a single small class still splits — was erroring if ANY class < n_splits (fixed #1792). Test `pin_1792_stratified_kfold_one_small_class_warns_not_errors`. (sklearn's UserWarning has no Rust analog.) |
+//! | REQ-CVS (cross_val_score mechanic) | SHIPPED | per-fold fit/predict/score → per-fold test scores; mirrors `cv_results["test_score"]` (`:560`). Guard `guard_cross_val_score_per_fold_negmse`. |
+//! | REQ-CVALIDATE (cross_validate test/train + timing) | SHIPPED | test+optional train scores + fit/score times (`:122`). Guard `guard_cross_validate_train_test_and_timing`. (return_estimator/return_indices/multimetric absent — REQ-DEFAULTS.) |
+//! | REQ-CVPREDICT (original-order OOF placement) | SHIPPED | each OOF prediction placed at its original index (`:1054`). Guard `guard_cross_val_predict_original_order_placement`. |
+//! | REQ-CVPREDICT-PARTITION (non-partition ⇒ error) | SHIPPED | requires a partition cv; non-partition (uncovered/duplicate/out-of-range test index) ⇒ `InvalidParameter`, mirroring `_check_is_permutation` (`:1054`) — was 0.0-filling silently (fixed #1793). Test `pin_1793_cross_val_predict_non_partition_must_error`. |
+//! | REQ-PERM (permutation_test_score p-value) | SHIPPED | `(count(perm>=real)+1)/(n_perm+1)` (`:1697`), real_score = mean CV. Guard `guard_permutation_test_score_pvalue_formula`. Exact perm scores are RNG carve-out. |
+//! | REQ-ERROR-SCORE (error_score=np.nan continue) | SHIPPED | `cross_val_score`/`cross_validate` NaN-fill a failing fold (fit ⇒ both; independent test/train scoring) and continue, matching default `error_score=np.nan` (`_fit_and_score :890-915`) — was `?`-aborting. Test `pin_1790_error_score_nan_continue`. This unit OWNS the blocker grid/random/curve units deferred here (S8). |
+//! | REQ-SKFOLD-CV (StratifiedKFold as CrossValidator) | NOT-STARTED | trait `fold_indices(n_samples)` has no y channel, so `StratifiedKFold` can't be passed to `cross_val_score`/`GridSearchCV`. Architectural. Blocker #1794. |
+//! | REQ-SHUFFLE-RNG (shuffle / permutation exact membership) | NOT-STARTED | `SmallRng` vs numpy — R-DEFER-3 carve-out (NO failing test); structural (sizes, partition, seed-determinism-across-runs) is SHIPPED. Blocker #1795. |
+//! | REQ-DEFAULTS (cv=None/scoring=None/groups/n_jobs/return_estimator/multimetric) | NOT-STARTED | `cv`/`scoring` mandatory; no `check_cv`/`check_scoring`/groups/n_jobs (`:560`,`:122`). Blocker #1796. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random`. Blocker #1797. |
+//! | REQ-X-2 (non-test production consumer — widest in crate) | SHIPPED | `cross_val_score` called by `GridSearchCV`/`RandomizedSearchCV`/halving searches; `KFold` flows as `&dyn CrossValidator`; whole surface re-exported in `lib.rs`. |
 
 use std::collections::HashMap;
 use std::time::Instant;
