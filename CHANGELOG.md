@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for ferrolearn-linear lib.rs REQ-6: score methods lack sample_weight — ClassifierScore::score/RegressorScore::score take only (&self,x,y); sklearn ClassifierMixin.score/RegressorMixin.score (base.py:738,805) forward sample_weight into accuracy_score/r2_score. Needs a weighted path through mean_accuracy/r2_score. (#1106)
 - Sklearn parity audit + ferrolearn-python head-to-head bench (#330)
 - Author .design/covariance/graphical_lasso.md (GraphicalLasso/GraphicalLassoCV/graphical_lasso contract vs sklearn 1.5.2) (#1888)
 - incremental_pca: REQ-15 var_ running-variance fitted attr + _incremental_mean_and_var (_incremental_pca.py:365,:1057) (#1591)

@@ -59,6 +59,12 @@ use num_traits::Float;
 /// Any `m × n` shape is accepted, including `n_samples < n_features`
 /// (underdetermined), exactly as `linalg.lstsq` does.
 ///
+/// Returns `(solution, rank, singular_values)`: the minimum-norm
+/// least-squares solution, the effective rank of `X` (sklearn `rank_`), and
+/// the singular values of `X` (sklearn `singular_`), exactly the values
+/// sklearn captures via `self.coef_, _, self.rank_, self.singular_ =
+/// linalg.lstsq(X, y)` (`sklearn/linear_model/_base.py:687`).
+///
 /// # Errors
 ///
 /// Returns [`FerroError::NumericalInstability`] if the underlying SVD fails
@@ -66,7 +72,7 @@ use num_traits::Float;
 pub(crate) fn solve_lstsq<F: LinalgFloat>(
     x: &Array2<F>,
     y: &Array1<F>,
-) -> Result<Array1<F>, FerroError> {
+) -> Result<(Array1<F>, usize, Array1<F>), FerroError> {
     let (n_samples, n_features) = x.dim();
 
     // Bridge ndarray -> ferray (R-SUBSTRATE-4). Build from a flat,
@@ -93,11 +99,9 @@ pub(crate) fn solve_lstsq<F: LinalgFloat>(
     // DIFFERENT rank decision for singular-value ratios in `(eps, max(m,n)*eps)`.
     // Passing `Some(F::epsilon())` pins ferray to scipy's `cond=eps` cutoff so
     // the rank decision matches scipy/sklearn.
-    let (solution, _residuals, _rank, _singular) =
-        ferray::linalg::lstsq(&a, &b, Some(F::epsilon())).map_err(|e| {
-            FerroError::NumericalInstability {
-                message: format!("ferray lstsq solve failed: {e}"),
-            }
+    let (solution, _residuals, rank, singular) = ferray::linalg::lstsq(&a, &b, Some(F::epsilon()))
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray lstsq solve failed: {e}"),
         })?;
 
     // Bridge ferray -> ndarray: solution is a 1-D `IxDyn` array of length
@@ -114,7 +118,19 @@ pub(crate) fn solve_lstsq<F: LinalgFloat>(
             ),
         });
     }
-    Ok(Array1::from_vec(w_vec))
+
+    // Bridge the singular values (sklearn `singular_`) ferray -> ndarray, the
+    // same flat-collect pattern as the solution. `rank` (sklearn `rank_`) is a
+    // plain `usize`. These are exactly the values sklearn captures from
+    // `linalg.lstsq(X, y)` (`sklearn/linear_model/_base.py:687`).
+    let singular_nd = singular.into_ndarray();
+    let singular_vec: Vec<F> = singular_nd.iter().copied().collect();
+
+    Ok((
+        Array1::from_vec(w_vec),
+        rank,
+        Array1::from_vec(singular_vec),
+    ))
 }
 
 /// Solve a symmetric positive-definite system `A @ x = b` via Cholesky.
@@ -343,7 +359,9 @@ pub(crate) fn solve_ridge<F: LinalgFloat>(
 
     cholesky_solve(&xtx, &xty)
         .or_else(|_| gaussian_solve(n, &xtx, &xty))
-        .or_else(|_| solve_lstsq(x, y))
+        // The lstsq fallback now returns (solution, rank, singular); the Ridge
+        // path consumes only the coefficient solution.
+        .or_else(|_| solve_lstsq(x, y).map(|(w, _rank, _singular)| w))
 }
 
 /// Solve `(X^T X + alpha * I) @ W = X^T Y` (multi-output Ridge regression).
@@ -389,7 +407,7 @@ mod tests {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = Array1::from_vec(vec![2.0, 4.0, 6.0]);
         let w = solve_lstsq(&x, &y).unwrap();
-        assert_relative_eq!(w[0], 2.0, epsilon = 1e-10);
+        assert_relative_eq!(w.0[0], 2.0, epsilon = 1e-10);
     }
 
     #[test]
@@ -398,8 +416,8 @@ mod tests {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
         let y = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let w = solve_lstsq(&x, &y).unwrap();
-        assert_relative_eq!(w[0], 1.0, epsilon = 1e-10);
-        assert_relative_eq!(w[1], 2.0, epsilon = 1e-10);
+        assert_relative_eq!(w.0[0], 1.0, epsilon = 1e-10);
+        assert_relative_eq!(w.0[1], 2.0, epsilon = 1e-10);
     }
 
     #[test]
@@ -427,8 +445,8 @@ mod tests {
         let x = Array2::from_shape_vec((3, 2), vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]).unwrap();
         let y = Array1::from_vec(vec![1.0, 2.0, 3.0]);
         let w = solve_lstsq(&x, &y).unwrap();
-        assert_relative_eq!(w[0], 0.5, epsilon = 1e-10);
-        assert_relative_eq!(w[1], 0.5, epsilon = 1e-10);
+        assert_relative_eq!(w.0[0], 0.5, epsilon = 1e-10);
+        assert_relative_eq!(w.0[1], 0.5, epsilon = 1e-10);
     }
 
     #[test]
@@ -442,8 +460,8 @@ mod tests {
         let x = Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).unwrap();
         let y = Array1::from_vec(vec![1.0, 2.0]);
         let w = solve_lstsq(&x, &y).unwrap();
-        assert_relative_eq!(w[0], -0.055_555_555_555_555_83, epsilon = 1e-8);
-        assert_relative_eq!(w[1], 0.111_111_111_111_111_12, epsilon = 1e-8);
-        assert_relative_eq!(w[2], 0.277_777_777_777_778, epsilon = 1e-8);
+        assert_relative_eq!(w.0[0], -0.055_555_555_555_555_83, epsilon = 1e-8);
+        assert_relative_eq!(w.0[1], 0.111_111_111_111_111_12, epsilon = 1e-8);
+        assert_relative_eq!(w.0[2], 0.277_777_777_777_778, epsilon = 1e-8);
     }
 }
