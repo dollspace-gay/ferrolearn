@@ -25,7 +25,7 @@
 //! | REQ-5 (min-norm for rank-deficient / underdetermined X) | SHIPPED | `Fit for LinearRegression` calls `crate::linalg::solve_lstsq` → `ferray::linalg::lstsq` (`ferray-linalg/src/solve.rs:208`), the single-SVD gelsd-equivalent min-norm solver mirroring `_base.py:687`. Closes #376 (rank-deficient min-norm) + #377 (underdetermined accepted). Tests now passing (`#[ignore]` removed): `divergence_rank_deficient_no_intercept_min_norm`, `divergence_rank_deficient_with_intercept_min_norm`, `divergence_underdetermined_accepted_min_norm` in `tests/divergence_linreg_minnorm.rs`. |
 //! | REQ-6 (positive=True / NNLS) | NOT-STARTED | blocker #371 (`_base.py:574/645`). |
 //! | REQ-7 (multi-output 2-D Y → 2-D coef_) | NOT-STARTED | blocker #372 (fit takes `Array1` only). |
-//! | REQ-8 (sample_weight in fit) | NOT-STARTED | blocker #373 (`_base.py` `fit(..., sample_weight=None)`). |
+//! | REQ-8 (sample_weight in fit) | SHIPPED | `LinearRegression::fit_with_sample_weight` solves WEIGHTED least squares `min Σᵢ wᵢ(yᵢ−xᵢ·w)²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (mirrors `_average(...,weights=sample_weight)`, `_base.py:193`/`:198`), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_base.py:641`), `linalg::solve_lstsq` on the rescaled design, `intercept = y_off − x_off·coef` (`_set_intercept`, `_base.py:320`); `fit_intercept=false` skips centering, intercept 0. `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None path byte-identical to the historic OLS body). Oracle tests `linreg_fit_sample_weight_with_intercept_matches_sklearn` (coef 2.0935828877, intercept −0.2326203209), `linreg_fit_sample_weight_no_intercept_matches_sklearn` (coef 2.0350877193, intercept 0), `linreg_fit_none_sample_weight_equals_unweighted`. Mirrors `fit(..., sample_weight=None)` (`_base.py:582`). Closes #373. |
 //! | REQ-9 (rank_/singular_/copy_X/n_jobs) | SHIPPED | `FittedLinearRegression` stores `rank_`/`singular_` (captured from `linalg::solve_lstsq` on the matrix actually solved — centered `X` when `fit_intercept`, raw `X` otherwise, matching sklearn `_base.py:687`), exposed via `rank()`/`singular_values()`; `LinearRegression` adds `copy_x` (default `true`) + `n_jobs` (default `None`) fields with `with_copy_x`/`with_n_jobs` builders, mirroring `_parameter_constraints` (`_base.py:561`) and the ctor (`_base.py:572-573`). `copy_x` is ABI-only (fit never mutates `x`); `n_jobs` stored-but-ignored (single-threaded). Oracle tests `linreg_rank_singular_match_sklearn_with_intercept` (rank 2, singular `[1.61803399, 0.61803399]` on centered X), `linreg_singular_no_intercept_matches_raw_x` (singular `[5.25371017, 0.63129192]` on raw X), `linreg_copy_x_default_and_builder`. Closes #374. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 — OLS solve now on `ferray::linalg::lstsq`, but `LinearRegression`'s coef storage is still `ndarray` (coef return type tied to #359); fully on-substrate when the boundary `ndarray` types migrate. |
 //!
@@ -82,6 +82,194 @@ pub struct LinearRegression<F> {
     /// `n_jobs=None` single-job default. Default `None` (`_base.py:573`).
     pub n_jobs: Option<usize>,
     _marker: std::marker::PhantomData<F>,
+}
+
+impl<
+    F: Float
+        + Send
+        + Sync
+        + ScalarOperand
+        + num_traits::FromPrimitive
+        + ferray::linalg::LinalgFloat
+        + 'static,
+> LinearRegression<F>
+{
+    /// Fit the linear regression model with optional per-sample weights.
+    ///
+    /// Mirrors scikit-learn's `LinearRegression.fit(X, y, sample_weight=None)`
+    /// (`sklearn/linear_model/_base.py:582`). When `sample_weight` is `Some(w)`,
+    /// this solves the WEIGHTED least-squares problem `min Σᵢ wᵢ (yᵢ − xᵢ·w)²`:
+    ///
+    /// - `fit_intercept=true`: offsets are the WEIGHTED means
+    ///   `x_off[j] = Σᵢ wᵢ·x[i,j] / Σwᵢ`, `y_off = Σᵢ wᵢ·yᵢ / Σwᵢ`
+    ///   (sklearn `_preprocess_data` → `_average(..., weights=sample_weight)`,
+    ///   `_base.py:193`/`:198`). `X` and `y` are centered by those offsets, each
+    ///   row is then rescaled by `√wᵢ` (sklearn `_rescale_data`, `_base.py:641`),
+    ///   `linalg.lstsq` solves for `coef`, and
+    ///   `intercept = y_off − x_off · coef` (`_set_intercept`, `_base.py:320`).
+    /// - `fit_intercept=false`: no centering; each row is rescaled by `√wᵢ`, the
+    ///   solve runs on the rescaled `X`, and `intercept = 0`.
+    ///
+    /// `sample_weight=None` is BYTE-IDENTICAL to [`Fit::fit`] (the unweighted
+    /// centering + `solve_lstsq` path), which delegates here.
+    ///
+    /// `rank_`/`singular_` are captured from `solve_lstsq` on the matrix actually
+    /// solved (centered-and-rescaled `X` when `fit_intercept`, rescaled `X`
+    /// otherwise), matching sklearn's `linalg.lstsq` operands (`_base.py:687`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of samples in `x` and
+    /// `y` (or, when provided, `sample_weight`) differ.
+    /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
+    /// Returns [`FerroError::NumericalInstability`] if the system is singular or
+    /// the weighted-offset denominator (`Σwᵢ`) cannot be formed.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<FittedLinearRegression<F>, FerroError> {
+        let (n_samples, n_features) = x.dim();
+
+        // Validate input shapes.
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "LinearRegression requires at least one sample".into(),
+            });
+        }
+
+        if let Some(w) = sample_weight
+            && w.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![w.len()],
+                context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        match sample_weight {
+            None => {
+                // Unweighted path — identical to the original `Fit::fit` body.
+                if self.fit_intercept {
+                    // Centering trick: center X and y, solve the (uncentered)
+                    // OLS problem on the centered design, then recover the
+                    // intercept as y_mean - x_mean . w. sklearn centers
+                    // identically before its `linalg.lstsq` call (`_base.py`
+                    // `_preprocess_data` + `:687`).
+                    let n = <F as num_traits::NumCast>::from(n_samples).ok_or_else(|| {
+                        FerroError::NumericalInstability {
+                            message: "could not represent n_samples as the float type".into(),
+                        }
+                    })?;
+                    let x_mean =
+                        x.mean_axis(Axis(0))
+                            .ok_or_else(|| FerroError::InsufficientSamples {
+                                required: 1,
+                                actual: 0,
+                                context: "cannot compute feature means of an empty design".into(),
+                            })?;
+                    let y_mean = y.sum() / n;
+
+                    let x_centered = x - &x_mean;
+                    let y_centered = y - y_mean;
+
+                    let (w, rank, singular) = linalg::solve_lstsq(&x_centered, &y_centered)?;
+
+                    let intercept = y_mean - x_mean.dot(&w);
+
+                    Ok(FittedLinearRegression {
+                        coefficients: w,
+                        intercept,
+                        rank_: rank,
+                        singular_: singular,
+                    })
+                } else {
+                    let (w, rank, singular) = linalg::solve_lstsq(x, y)?;
+
+                    Ok(FittedLinearRegression {
+                        coefficients: w,
+                        intercept: <F as num_traits::Zero>::zero(),
+                        rank_: rank,
+                        singular_: singular,
+                    })
+                }
+            }
+            Some(w) => {
+                // Per-row √w factor (sklearn `_rescale_data`, `_base.py:641`).
+                let w_sqrt = w.mapv(<F as Float>::sqrt);
+
+                if self.fit_intercept {
+                    // WEIGHTED centering: offsets are the weighted means
+                    // x_off[j] = Σ wᵢ x[i,j] / Σ wᵢ, y_off = Σ wᵢ yᵢ / Σ wᵢ
+                    // (sklearn `_average(..., weights=sample_weight)`,
+                    // `_base.py:193`/`:198`).
+                    let w_sum = w.sum();
+                    if w_sum <= <F as num_traits::Zero>::zero() {
+                        return Err(FerroError::NumericalInstability {
+                            message: "sum of sample_weight must be positive to center".into(),
+                        });
+                    }
+
+                    let mut x_off = Array1::<F>::zeros(n_features);
+                    for (i, row) in x.outer_iter().enumerate() {
+                        let wi = w[i];
+                        x_off = &x_off + &row.mapv(|v| v * wi);
+                    }
+                    x_off.mapv_inplace(|v| v / w_sum);
+
+                    let y_off = y
+                        .iter()
+                        .zip(w.iter())
+                        .fold(<F as num_traits::Zero>::zero(), |acc, (&yi, &wi)| {
+                            acc + wi * yi
+                        })
+                        / w_sum;
+
+                    // Center, then row-rescale by √w.
+                    let x_centered = x - &x_off;
+                    let y_centered = y - y_off;
+                    let x_scaled = &x_centered * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = &y_centered * &w_sqrt;
+
+                    let (coef, rank, singular) = linalg::solve_lstsq(&x_scaled, &y_scaled)?;
+
+                    let intercept = y_off - x_off.dot(&coef);
+
+                    Ok(FittedLinearRegression {
+                        coefficients: coef,
+                        intercept,
+                        rank_: rank,
+                        singular_: singular,
+                    })
+                } else {
+                    // No centering; just √w row-rescaling, intercept 0.
+                    let x_scaled = x * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = y * &w_sqrt;
+
+                    let (coef, rank, singular) = linalg::solve_lstsq(&x_scaled, &y_scaled)?;
+
+                    Ok(FittedLinearRegression {
+                        coefficients: coef,
+                        intercept: <F as num_traits::Zero>::zero(),
+                        rank_: rank,
+                        singular_: singular,
+                    })
+                }
+            }
+        }
+    }
 }
 
 impl<F: Float> LinearRegression<F> {
@@ -182,77 +370,11 @@ impl<
     /// than features.
     /// Returns [`FerroError::NumericalInstability`] if the system is singular.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLinearRegression<F>, FerroError> {
-        let (n_samples, _n_features) = x.dim();
-
-        // Validate input shapes.
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if n_samples == 0 {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "LinearRegression requires at least one sample".into(),
-            });
-        }
-
-        if self.fit_intercept {
-            // Centering trick: center X and y, solve the (uncentered) OLS
-            // problem on the centered design, then recover the intercept as
-            // y_mean - x_mean . w. sklearn centers identically before its
-            // `linalg.lstsq` call (`_base.py` `_preprocess_data` + `:687`).
-            let n = <F as num_traits::NumCast>::from(n_samples).ok_or_else(|| {
-                FerroError::NumericalInstability {
-                    message: "could not represent n_samples as the float type".into(),
-                }
-            })?;
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::InsufficientSamples {
-                    required: 1,
-                    actual: 0,
-                    context: "cannot compute feature means of an empty design".into(),
-                })?;
-            let y_mean = y.sum() / n;
-
-            let x_centered = x - &x_mean;
-            let y_centered = y - y_mean;
-
-            // SVD-based minimum-norm least squares (gelsd-equivalent), so
-            // rank-deficient designs yield the min-norm split, not an
-            // arbitrary basic solution (#376). `rank`/`singular` are captured
-            // on the CENTERED design — exactly what sklearn does, since it
-            // calls `linalg.lstsq` on the centered `X` when `fit_intercept`
-            // (`_base.py` `_preprocess_data` centers, then `:687`).
-            let (w, rank, singular) = linalg::solve_lstsq(&x_centered, &y_centered)?;
-
-            let intercept = y_mean - x_mean.dot(&w);
-
-            Ok(FittedLinearRegression {
-                coefficients: w,
-                intercept,
-                rank_: rank,
-                singular_: singular,
-            })
-        } else {
-            // SVD-based minimum-norm least squares; accepts underdetermined
-            // (n_samples < n_features) input as sklearn does (#377). With no
-            // intercept, sklearn passes the RAW `X` to `linalg.lstsq`, so
-            // `rank`/`singular` are captured on `x` directly (`_base.py:687`).
-            let (w, rank, singular) = linalg::solve_lstsq(x, y)?;
-
-            Ok(FittedLinearRegression {
-                coefficients: w,
-                intercept: <F as num_traits::Zero>::zero(),
-                rank_: rank,
-                singular_: singular,
-            })
-        }
+        // Unweighted OLS is the `sample_weight=None` arm of the weighted fit;
+        // delegating keeps the None path byte-identical to the historic body
+        // (centering + `solve_lstsq`), mirroring sklearn's single `fit` entry
+        // (`_base.py:582`, `sample_weight=None` default).
+        self.fit_with_sample_weight(x, y, None)
     }
 }
 
@@ -524,6 +646,88 @@ mod tests {
             fitted_copy.intercept(),
             fitted_nocopy.intercept(),
             epsilon = 1e-12
+        );
+    }
+
+    #[test]
+    fn linreg_fit_sample_weight_with_intercept_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle (WEIGHTED OLS, fit_intercept=True):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.],[2.],[3.],[4.],[5.]]); \
+        //     y=np.array([2.1,3.9,6.2,7.7,10.3]); w=np.array([1.,5.,1.,1.,5.]); \
+        //     m=LinearRegression().fit(X,y,sample_weight=w); \
+        //     print(round(m.coef_[0],10), round(m.intercept_,10))"
+        //   -> 2.0935828877 -0.2326203209
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y = array![2.1, 3.9, 6.2, 7.7, 10.3];
+        let w = array![1.0, 5.0, 1.0, 1.0, 5.0];
+
+        let model = LinearRegression::<f64>::new();
+        let fitted = model.fit_with_sample_weight(&x, &y, Some(&w)).unwrap();
+
+        assert_relative_eq!(fitted.coefficients()[0], 2.093_582_887_7, epsilon = 1e-7);
+        assert_relative_eq!(fitted.intercept(), -0.232_620_320_9, epsilon = 1e-7);
+
+        // Non-tautological: the weighted result MUST differ from the unweighted
+        // fit (oracle unweighted coef_ 2.02, intercept_ -0.02).
+        let unweighted = model.fit(&x, &y).unwrap();
+        assert_relative_eq!(unweighted.coefficients()[0], 2.02, epsilon = 1e-7);
+        assert!((fitted.coefficients()[0] - unweighted.coefficients()[0]).abs() > 1e-3);
+        assert!((fitted.intercept() - unweighted.intercept()).abs() > 1e-3);
+    }
+
+    #[test]
+    fn linreg_fit_sample_weight_no_intercept_matches_sklearn() {
+        // Live sklearn 1.5.2 oracle (WEIGHTED OLS, fit_intercept=False):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import LinearRegression; \
+        //     X=np.array([[1.],[2.],[3.],[4.],[5.]]); \
+        //     y=np.array([2.1,3.9,6.2,7.7,10.3]); w=np.array([1.,5.,1.,1.,5.]); \
+        //     m=LinearRegression(fit_intercept=False).fit(X,y,sample_weight=w); \
+        //     print(round(m.coef_[0],10))"
+        //   -> 2.0350877193
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y = array![2.1, 3.9, 6.2, 7.7, 10.3];
+        let w = array![1.0, 5.0, 1.0, 1.0, 5.0];
+
+        let model = LinearRegression::<f64>::new().with_fit_intercept(false);
+        let fitted = model.fit_with_sample_weight(&x, &y, Some(&w)).unwrap();
+
+        assert_relative_eq!(fitted.coefficients()[0], 2.035_087_719_3, epsilon = 1e-7);
+        assert_eq!(fitted.intercept(), 0.0);
+    }
+
+    #[test]
+    fn linreg_fit_none_sample_weight_equals_unweighted() {
+        // Regression guard: the `None` path is BYTE-IDENTICAL to `fit`.
+        let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        let y = array![2.1, 3.9, 6.2, 7.7, 10.3];
+
+        let model = LinearRegression::<f64>::new();
+        let via_fit = model.fit(&x, &y).unwrap();
+        let via_none = model.fit_with_sample_weight(&x, &y, None).unwrap();
+
+        assert_eq!(
+            via_fit.coefficients()[0].to_bits(),
+            via_none.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            via_fit.intercept().to_bits(),
+            via_none.intercept().to_bits()
+        );
+
+        // Same for fit_intercept=false.
+        let model_ni = LinearRegression::<f64>::new().with_fit_intercept(false);
+        let via_fit_ni = model_ni.fit(&x, &y).unwrap();
+        let via_none_ni = model_ni.fit_with_sample_weight(&x, &y, None).unwrap();
+        assert_eq!(
+            via_fit_ni.coefficients()[0].to_bits(),
+            via_none_ni.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            via_fit_ni.intercept().to_bits(),
+            via_none_ni.intercept().to_bits()
         );
     }
 
