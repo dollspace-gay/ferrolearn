@@ -29,7 +29,7 @@
 //! | REQ-9 (positive=True) | NOT-STARTED | #387. |
 //! | REQ-10 (max_iter/tol + n_iter_) | NOT-STARTED | #388. |
 //! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
-//! | REQ-12 (copy_X/random_state) | NOT-STARTED | #390. |
+//! | REQ-12 (copy_X/random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders. `copy_x` ABI-only (fit never mutates `x`); `random_state` stored-but-no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
 //!
 //! acto-critic: core L2 numerics (coef/intercept, alpha scaling, fit_intercept, f32) match the
@@ -76,17 +76,34 @@ pub struct Ridge<F> {
     pub alpha: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// Whether `X` may be overwritten during fit (sklearn `copy_X`,
+    /// `_ridge.py:898`). ferrolearn's `fit` never mutates `x` (it reads
+    /// via `.mean_axis()`/`.outer_iter()`), so the observable
+    /// non-mutation contract holds regardless; the field is exposed for
+    /// ABI parity with sklearn. Default `true`, matching sklearn's
+    /// `copy_X=True` default (`_ridge.py:898`).
+    pub copy_x: bool,
+    /// Random seed for the `sag`/`saga` solvers (sklearn `random_state`,
+    /// `_ridge.py:903`). ferrolearn's default solver is deterministic
+    /// Cholesky (`solver='auto'`→`'cholesky'`), so this field is stored
+    /// for ABI parity and has no effect on the computed coefficients.
+    /// Default `None`, matching sklearn's `random_state=None` (`_ridge.py:903`).
+    pub random_state: Option<u64>,
 }
 
 impl<F: Float> Ridge<F> {
     /// Create a new `Ridge` with default settings.
     ///
-    /// Defaults: `alpha = 1.0`, `fit_intercept = true`.
+    /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `copy_x = true`,
+    /// `random_state = None` — mirroring sklearn's ctor defaults
+    /// (`sklearn/linear_model/_ridge.py:895-903`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
             fit_intercept: true,
+            copy_x: true,
+            random_state: None,
         }
     }
 
@@ -101,6 +118,27 @@ impl<F: Float> Ridge<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the `copy_X` flag (sklearn `copy_X`, `_ridge.py:898`).
+    ///
+    /// ferrolearn's fit never mutates `x`, so this is exposed for ABI
+    /// parity with sklearn and does not change the computed result.
+    #[must_use]
+    pub fn with_copy_x(mut self, copy_x: bool) -> Self {
+        self.copy_x = copy_x;
+        self
+    }
+
+    /// Set the `random_state` seed (sklearn `random_state`, `_ridge.py:903`).
+    ///
+    /// Only used by sklearn's `sag`/`saga` solvers. ferrolearn's default
+    /// solver is deterministic Cholesky, so this is stored for ABI parity
+    /// and has no effect on the computed coefficients.
+    #[must_use]
+    pub fn with_random_state(mut self, random_state: Option<u64>) -> Self {
+        self.random_state = random_state;
         self
     }
 }
@@ -745,6 +783,87 @@ mod tests {
         assert_eq!(
             via_fit_ni.intercept().to_bits(),
             via_none_ni.intercept().to_bits()
+        );
+        Ok(())
+    }
+
+    // -- copy_x / random_state ABI-parity ----------------------------------
+
+    #[test]
+    fn ridge_copy_x_random_state_defaults_and_builders() -> Result<(), FerroError> {
+        // Defaults mirror sklearn Ridge(copy_X=True, random_state=None)
+        // (`sklearn/linear_model/_ridge.py:898`/`:903`).
+        assert!(Ridge::<f64>::new().copy_x, "copy_x default must be true");
+        assert_eq!(
+            Ridge::<f64>::new().random_state,
+            None,
+            "random_state default must be None"
+        );
+
+        // Builders store the supplied value.
+        assert!(!Ridge::<f64>::new().with_copy_x(false).copy_x);
+        assert!(Ridge::<f64>::new().with_copy_x(true).copy_x);
+        assert_eq!(
+            Ridge::<f64>::new().with_random_state(Some(42)).random_state,
+            Some(42)
+        );
+        assert_eq!(
+            Ridge::<f64>::new().with_random_state(None).random_state,
+            None
+        );
+
+        // No behavior change: fit produces byte-identical coef_/intercept_
+        // regardless of copy_x or random_state (deterministic Cholesky
+        // solver is unaffected by either param).
+        //
+        // Live sklearn oracle (alpha=1.0, fit_intercept=true):
+        //   python3 -c "import numpy as np; from sklearn.linear_model import Ridge;
+        //     X=np.array([[1.,2.],[3.,4.],[5.,6.],[7.,8.],[9.,10.]]);
+        //     y=np.array([1.,2.,3.,4.,5.]);
+        //     m=Ridge(alpha=1.0).fit(X,y); print(m.coef_.tolist(), m.intercept_)"
+        //   -> [0.07692307692307693, 0.4230769230769231] 0.0
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 3., 4., 5., 6., 7., 8., 9., 10.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![1., 2., 3., 4., 5.];
+
+        let ref_fitted = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let copy_false = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_copy_x(false)
+            .fit(&x, &y)?;
+        let rs_some = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_random_state(Some(42))
+            .fit(&x, &y)?;
+
+        // Byte-identical (deterministic Cholesky, no mutation).
+        assert_eq!(
+            ref_fitted.coefficients()[0].to_bits(),
+            copy_false.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            ref_fitted.coefficients()[1].to_bits(),
+            copy_false.coefficients()[1].to_bits()
+        );
+        assert_eq!(
+            ref_fitted.intercept().to_bits(),
+            copy_false.intercept().to_bits()
+        );
+        assert_eq!(
+            ref_fitted.coefficients()[0].to_bits(),
+            rs_some.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            ref_fitted.coefficients()[1].to_bits(),
+            rs_some.coefficients()[1].to_bits()
+        );
+        assert_eq!(
+            ref_fitted.intercept().to_bits(),
+            rs_some.intercept().to_bits()
         );
         Ok(())
     }
