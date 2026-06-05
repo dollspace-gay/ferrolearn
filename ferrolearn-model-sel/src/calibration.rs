@@ -348,7 +348,12 @@ fn fit_sigmoid(scores: &Array1<f64>, labels: &Array1<usize>) -> Result<(f64, f64
 
 /// Fit isotonic regression using the pool-adjacent-violators algorithm.
 ///
-/// Returns a sorted list of `(score, probability)` breakpoints.
+/// Returns a sorted list of `(score, probability)` breakpoints mirroring
+/// scikit-learn's `IsotonicRegression(out_of_bounds="clip")`. Each PAV block
+/// contributes TWO breakpoints — its leftmost (`lo`) and rightmost (`hi`)
+/// score — both carrying the block's pooled mean. This makes the calibrator
+/// FLAT at the pooled mean within a block (from `lo` to `hi`) and a linear
+/// ramp BETWEEN blocks, matching sklearn's `X_thresholds_` / `y_thresholds_`.
 fn fit_isotonic(
     scores: &Array1<f64>,
     labels: &Array1<usize>,
@@ -393,13 +398,16 @@ fn fit_isotonic(
         }
     }
 
-    // Build the breakpoint mapping.
-    let mut mapping: Vec<(f64, f64)> = Vec::with_capacity(blocks.len());
+    // Build the breakpoint mapping: two endpoints per PAV block (lo, hi),
+    // both carrying the block's pooled mean. Mirrors sklearn's
+    // `X_thresholds_` / `y_thresholds_` (flat within block, ramp between).
+    // PAV processes scores in sorted order with non-overlapping blocks
+    // (block_i.hi <= block_{i+1}.lo), so `mapping` is non-decreasing in X.
+    let mut mapping: Vec<(f64, f64)> = Vec::with_capacity(2 * blocks.len());
     for &(sum, cnt, lo, hi) in &blocks {
         let prob = sum / cnt as f64;
-        // Use the midpoint of the score range for this block.
-        let score = f64::midpoint(lo, hi);
-        mapping.push((score, prob));
+        mapping.push((lo, prob));
+        mapping.push((hi, prob));
     }
 
     Ok(mapping)

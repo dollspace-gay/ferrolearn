@@ -186,7 +186,6 @@ fn green_sigmoid_mixed_nonseparable_matches_oracle() {
 /// breakpoints `[0,1,2.25,3.5,4,5]`) — MAX ABS DIFF 0.18.
 /// Tracking: #1800
 #[test]
-#[ignore = "divergence: isotonic block-midpoint breakpoints vs sklearn X-thresholds; tracking #1800"]
 fn divergence_isotonic_breakpoints_1800() {
     let scores = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 2.5, 1.5, 3.5];
     let labels = [0, 0, 1, 0, 1, 1, 0, 1, 1];
