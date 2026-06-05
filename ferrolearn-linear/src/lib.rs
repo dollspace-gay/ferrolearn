@@ -90,6 +90,7 @@ pub mod quantile_regressor;
 pub mod ransac;
 pub mod ridge;
 pub mod ridge_classifier;
+pub mod ridge_classifier_cv;
 pub mod ridge_cv;
 pub mod sgd;
 pub mod svm;
@@ -123,6 +124,7 @@ pub use quantile_regressor::{FittedQuantileRegressor, QuantileRegressor};
 pub use ransac::{FittedRANSACRegressor, RANSACRegressor};
 pub use ridge::{FittedRidge, FittedRidgeMulti, Ridge};
 pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
+pub use ridge_classifier_cv::{FittedRidgeClassifierCV, RidgeClassifierCV};
 pub use ridge_cv::{FittedRidgeCV, RidgeCV};
 pub use sgd::{
     FittedSGDClassifier, FittedSGDOneClassSVM, FittedSGDRegressor, SGDClassifier, SGDOneClassSVM,
