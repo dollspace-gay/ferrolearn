@@ -1090,6 +1090,12 @@ upstream = [
 design = ".design/model-sel/multiclass.md"
 parity_ops = ["OneVsRestClassifier", "OneVsOneClassifier"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/multioutput.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/multioutput.py"]
+design = ".design/model-sel/multioutput.md"
+parity_ops = ["MultiOutputClassifier", "MultiOutputRegressor"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================

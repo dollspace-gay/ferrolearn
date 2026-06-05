@@ -22,6 +22,27 @@
 //!
 //! let mor = MultiOutputRegressor::new(Box::new(|| Pipeline::<f64>::new()));
 //! ```
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.multioutput` (`_MultiOutputEstimator` `sklearn/multioutput.py:103`,
+//! `MultiOutputRegressor :342`, `MultiOutputClassifier :445`) at v1.5.2. Base
+//! estimator supplied as a `PipelineFactory` closure (R-DEV-7). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-FIT-PER-COLUMN (one estimator per output column) | SHIPPED | `fit` fits a fresh pipeline per `y.column(t)`, mirroring `Parallel(_fit_estimator(estimator, X, y[:,i]))` (`:278-289`, `:62`); `n_estimators()==n_targets`. Guard `guard_fit_per_column_count`. |
+//! | REQ-PREDICT-STACK (predict = column-stack, original order) | SHIPPED | `result[[i,t]] = est_t.predict(x)[i]` ⇒ `(n_samples, n_targets)`, matching `np.asarray([e.predict(X) for e]).T` (`:333-339`). Verified vs live oracle column-by-column incl. an n=outputs transpose stress and column-order/independence. Guards `guard_predict_stack_exact_ols`, `guard_predict_stack_column_order`, `guard_predict_stack_square_no_transpose_bug`, `guard_predict_stack_column_independence`, `guard_moc_predict_labels_column_order`. |
+//! | REQ-VALIDATION (shape + empty-y) | SHIPPED | `y.nrows()!=x.nrows()` ⇒ `ShapeMismatch`; `n_targets==0` ⇒ `InvalidParameter` (sklearn raises `ValueError` for both — both reject, compatible). Single-column 2D y ⇒ `(n,1)` (`guard_single_column_y_shape`). Guards `guard_validation_row_mismatch`, `guard_validation_empty_y`. |
+//! | REQ-PREDICT-PROBA (MultiOutputClassifier predict_proba) | NOT-STARTED | no `predict_proba` (list of per-output `(n, n_classes)` arrays, `:559-607`). Blocker #1821. |
+//! | REQ-CLASSES (MultiOutputClassifier classes_ per output) | NOT-STARTED | no `classes_` (`= [est.classes_ ...]`, `:555`). Blocker #1822. |
+//! | REQ-SCORE (MOC subset accuracy / MOR r2) | NOT-STARTED | no `score` (MOC subset accuracy `:609`; MOR r2 uniform-avg). Blocker #1823. |
+//! | REQ-SAMPLE-WEIGHT (sample_weight threading) | NOT-STARTED | `fit` takes only `(x, y)`; sklearn threads `sample_weight` per `_fit_estimator` (`:280`). Blocker #1824. |
+//! | REQ-PARTIAL-FIT (incremental partial_fit) | NOT-STARTED | absent (`:119`,`:412`). Blocker #1825. |
+//! | REQ-NJOBS-FIT-PARAMS (n_jobs / fit_params) | NOT-STARTED | no `n_jobs`/`**fit_params` channel. Blocker #1826. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::Array2`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1827. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use multioutput::{MultiOutputClassifier, MultiOutputRegressor, Fitted...}` in `lib.rs` (boundary meta-estimator API, S5/R-DEFER-1). No internal caller, no Python binding (honest underclaim). |
 
 use ferrolearn_core::pipeline::{FittedPipeline, Pipeline};
 use ferrolearn_core::{FerroError, Fit, Predict};
