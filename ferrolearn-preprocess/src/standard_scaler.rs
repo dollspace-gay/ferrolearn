@@ -19,7 +19,7 @@
 //! | REQ-2 (constant / zero-variance column → 0) | SHIPPED | FIXED #1191. `transform` uses `s_eff = if s==0 {1} else {s}` → constant col `(x-mean)/1 = 0`, matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,`:1019-1021`); `inverse_transform` aligned to `x*s_eff+m`. Critic two-round CLEAN: 9 tests incl. constant→0 (default/single-row/mixed) + inverse non-round-trip on constant col matches `x*1+mean`. In-module test corrected (R-HONEST-4). |
 //! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*s_eff + mean`, mirroring sklearn `X *= scale_; X += mean_` (`_data.py:1106-1109`); `inverse_transform(transform(X))==X` (`green_req3_inverse_roundtrip`). Consumer: PyO3 `_RsStandardScaler::inverse_transform`. |
 //! | REQ-4 (PyO3 binding) | SHIPPED | `_RsStandardScaler` (`transformers.rs:12`, registered `lib.rs:22`) marshals `fit`/`transform`/`inverse_transform`/`mean_` over `FittedStandardScaler<f64>` — a real CPython consumer. |
-//! | REQ-5 (var_/scale_/n_samples_seen_ attrs) | NOT-STARTED | open prereq blocker #1192. Only `mean`/`std`; no `var_`/`scale_`/`n_samples_seen_` (`_data.py:1013-1023`). |
+//! | REQ-5 (var_/scale_/n_samples_seen_ attrs) | SHIPPED | FIXED #1192. `FittedStandardScaler<F>` now stores `var_` (population variance ddof=0, `0.0` on a constant column), `scale_` (= `_handle_zeros_in_scale(sqrt(var_))`: `std` on non-constant cols, `1.0` on constant cols — same zero-handling as `transform`'s `s_eff`), and `n_samples_seen_` (= n_rows), set in `Fit::fit`; exposed by getters `var()`/`scale()`/`n_samples_seen()` mirroring sklearn `var_`/`scale_`/`n_samples_seen_` (`_data.py:1013-1023`). Critic-grounded vs live oracle `X=[[1,5],[2,5],[3,5]]` (`var_=[0.6666666666666666,0.0]`, `scale_=[0.816496580927726,1.0]`, `n_samples_seen_=3`): `standard_scaler_var_scale_nsamples_match_sklearn`, `standard_scaler_scale_differs_from_std_on_constant_col`, `standard_scaler_var_equals_std_squared_nonconstant`. Additive getters; `transform`/`inverse_transform` unchanged. |
 //! | REQ-6 (with_mean/with_std/copy params) | NOT-STARTED | open prereq blocker #1193. Always centers+scales (`_data.py:829-838`,`:1064-1067`). |
 //! | REQ-7 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1194. Fold propagates NaN; sklearn ignores NaN (`_data.py:918`,`:1112-1113`). Not a rejection. |
 //! | REQ-8 (scale free fn + axis) | NOT-STARTED | open prereq blocker #1195. No `scale` fn / axis=1 (`_data.py:133`). |
@@ -94,6 +94,18 @@ pub struct FittedStandardScaler<F> {
     pub(crate) mean: Array1<F>,
     /// Per-column standard deviations learned during fitting.
     pub(crate) std: Array1<F>,
+    /// Per-column population variance (ddof=0) learned during fitting.
+    ///
+    /// Mirrors sklearn `StandardScaler.var_` (`_data.py:1013-1023`).
+    pub(crate) var_: Array1<F>,
+    /// Per-column scale with zeros replaced by 1 (`_handle_zeros_in_scale`).
+    ///
+    /// Mirrors sklearn `StandardScaler.scale_` (`_data.py:1013-1023`).
+    pub(crate) scale_: Array1<F>,
+    /// Number of samples (rows) seen during fitting.
+    ///
+    /// Mirrors sklearn `StandardScaler.n_samples_seen_` (`_data.py:1013-1023`).
+    pub(crate) n_samples_seen_: usize,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
@@ -107,6 +119,33 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
     #[must_use]
     pub fn std(&self) -> &Array1<F> {
         &self.std
+    }
+
+    /// Return the per-column population variance (ddof=0) learned during fitting.
+    ///
+    /// Mirrors sklearn `StandardScaler.var_` (`_data.py:1013-1023`): the raw
+    /// variance, which is `0.0` on a constant column.
+    #[must_use]
+    pub fn var(&self) -> &Array1<F> {
+        &self.var_
+    }
+
+    /// Return the per-column scale learned during fitting.
+    ///
+    /// Mirrors sklearn `StandardScaler.scale_` (`_data.py:1013-1023`,
+    /// `_handle_zeros_in_scale`, `:88`): equals `std()` on non-constant columns
+    /// and `1.0` on constant (zero-variance) columns.
+    #[must_use]
+    pub fn scale(&self) -> &Array1<F> {
+        &self.scale_
+    }
+
+    /// Return the number of samples (rows) seen during fitting.
+    ///
+    /// Mirrors sklearn `StandardScaler.n_samples_seen_` (`_data.py:1013-1023`).
+    #[must_use]
+    pub fn n_samples_seen(&self) -> usize {
+        self.n_samples_seen_
     }
 
     /// Inverse-transform scaled data back to original space.
@@ -172,6 +211,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
         let n_features = x.ncols();
         let mut mean = Array1::zeros(n_features);
         let mut std_arr = Array1::zeros(n_features);
+        let mut var_arr = Array1::zeros(n_features);
 
         for j in 0..n_features {
             let col = x.column(j);
@@ -183,10 +223,22 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
                 .fold(F::zero(), |acc, v| acc + v)
                 / n;
             mean[j] = m;
+            var_arr[j] = variance;
             std_arr[j] = variance.sqrt();
         }
 
-        Ok(FittedStandardScaler { mean, std: std_arr })
+        // `scale_` mirrors sklearn `_handle_zeros_in_scale(sqrt(var_))`
+        // (`_data.py:88`, `:1019-1021`): the std with zero-variance columns
+        // replaced by 1.0 — exactly the `s_eff` used in `transform`.
+        let scale_ = std_arr.mapv(|s| if s == F::zero() { F::one() } else { s });
+
+        Ok(FittedStandardScaler {
+            mean,
+            std: std_arr,
+            var_: var_arr,
+            scale_,
+            n_samples_seen_: n_samples,
+        })
     }
 }
 
@@ -386,6 +438,56 @@ mod tests {
         let scaler = StandardScaler::<f64>::new();
         let x: Array2<f64> = Array2::zeros((0, 3));
         assert!(scaler.fit(&x, &()).is_err());
+    }
+
+    // sklearn 1.5.2 oracle (R-CHAR-3), X = [[1,5],[2,5],[3,5]] (col 1 constant):
+    //   StandardScaler().fit(X) -> mean_ = [2.0, 5.0],
+    //     var_   = [0.6666666666666666, 0.0],
+    //     scale_ = [0.816496580927726, 1.0],
+    //     n_samples_seen_ = 3.
+    #[test]
+    fn standard_scaler_var_scale_nsamples_match_sklearn() -> Result<(), FerroError> {
+        let scaler = StandardScaler::<f64>::new();
+        let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        assert_abs_diff_eq!(fitted.var()[0], 0.6666666666666666, epsilon = 1e-9);
+        assert_abs_diff_eq!(fitted.var()[1], 0.0, epsilon = 1e-9);
+
+        assert_abs_diff_eq!(fitted.scale()[0], 0.816496580927726, epsilon = 1e-12);
+        // scale_[1] is EXACTLY 1.0 on the constant column (_handle_zeros), not 0.0.
+        assert_eq!(fitted.scale()[1], 1.0);
+
+        assert_eq!(fitted.n_samples_seen(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_scale_differs_from_std_on_constant_col() -> Result<(), FerroError> {
+        let scaler = StandardScaler::<f64>::new();
+        let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        // Constant column: raw std is 0.0 but scale_ is 1.0 (_handle_zeros).
+        assert_eq!(fitted.std()[1], 0.0);
+        assert_eq!(fitted.scale()[1], 1.0);
+        // Non-constant column: scale_ equals raw std unchanged.
+        assert_eq!(fitted.scale()[0], fitted.std()[0]);
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_var_equals_std_squared_nonconstant() -> Result<(), FerroError> {
+        let scaler = StandardScaler::<f64>::new();
+        let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        assert_abs_diff_eq!(
+            fitted.var()[0],
+            fitted.std()[0] * fitted.std()[0],
+            epsilon = 1e-12
+        );
+        Ok(())
     }
 
     #[test]
