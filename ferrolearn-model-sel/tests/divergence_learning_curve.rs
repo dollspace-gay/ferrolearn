@@ -251,7 +251,6 @@ fn req2_train_scores_returned_with_shape() {
 /// Tracking: #1764.
 // #1764
 #[test]
-#[ignore = "divergence: fraction->absolute uses ceil() not floor; tracking #1764"]
 fn divergence_1764_fraction_floor_vs_ceil() {
     // Oracle: _translate_train_sizes(np.asarray([0.33]), 20).tolist() == [6]
     const SKLEARN_FLOOR_TICK: usize = 6;
@@ -288,7 +287,6 @@ fn divergence_1764_fraction_floor_vs_ceil() {
 /// Tracking: #1765.
 // #1765
 #[test]
-#[ignore = "divergence: float entry > 1.0 treated as absolute instead of ValueError; tracking #1765"]
 fn divergence_1765_float_gt_one_should_error() {
     let y: Array1<f64> = (0..30).map(f64::from).collect();
     let x = Array2::<f64>::zeros((30, 2));
@@ -324,7 +322,6 @@ fn divergence_1765_float_gt_one_should_error() {
 /// Tracking: #1766.
 // #1766
 #[test]
-#[ignore = "divergence: absolute size > n_max clamped instead of ValueError; tracking #1766"]
 fn divergence_1766_absolute_overshoot_should_error() {
     let y: Array1<f64> = (0..30).map(f64::from).collect();
     let x = Array2::<f64>::zeros((30, 2));
@@ -358,7 +355,6 @@ fn divergence_1766_absolute_overshoot_should_error() {
 /// Tracking: #1767.
 // #1767
 #[test]
-#[ignore = "divergence: train_sizes not sorted ascending via np.unique; tracking #1767"]
 fn divergence_1767_sort_ascending() {
     // Oracle: _translate_train_sizes(np.asarray([1.0, 0.5]), 20).tolist() == [10, 20]
     const SKLEARN_SORTED: [usize; 2] = [10, 20];
@@ -388,7 +384,6 @@ fn divergence_1767_sort_ascending() {
 /// Tracking: #1767.
 // #1767
 #[test]
-#[ignore = "divergence: duplicate train_sizes not de-duplicated via np.unique; tracking #1767"]
 fn divergence_1767_dedup_row_count() {
     // Oracle: _translate_train_sizes(np.asarray([0.5, 0.5]), 20).tolist() == [10]
     const SKLEARN_N_UNIQUE_TICKS: usize = 1;

@@ -53,9 +53,18 @@ pub struct LearningCurveResult {
 ///
 /// For each value in `train_sizes`:
 ///
-/// 1. Determine the absolute number of training samples. Values in `(0, 1]`
-///    are treated as fractions of the full training fold; values `> 1` are
-///    treated as absolute counts (truncated to `usize`).
+/// 1. Determine the absolute number of training samples (port of scikit-learn's
+///    `_translate_train_sizes`). The mode is chosen by integrality of the whole
+///    `train_sizes` slice, mirroring sklearn's float-vs-int dtype switch:
+///    - If *any* value is non-integer ⇒ **fraction mode**: every value must be
+///      within `(0, 1]`, interpreted as a fraction of the max training fold
+///      size, truncated toward zero and clamped to `[1, n_max]`.
+///    - If *all* values are integer-valued ⇒ **absolute mode**: each value is a
+///      sample count within `(0, n_max]`.
+///
+///    Duplicate ticks are removed and the ticks are sorted ascending, so the
+///    returned `train_sizes` (and the score-matrix row count) reflect the
+///    de-duplicated, sorted set.
 /// 2. For each cross-validation fold, take the first `size` samples from the
 ///    training fold, fit the pipeline, then score on both the training
 ///    subset and the full test fold.
@@ -66,8 +75,10 @@ pub struct LearningCurveResult {
 /// - `x` — Feature matrix with shape `(n_samples, n_features)`.
 /// - `y` — Target array of length `n_samples`.
 /// - `cv` — A [`CrossValidator`] that produces fold indices.
-/// - `train_sizes` — Fractions (`(0, 1]`) or absolute sample counts for the
-///   training subset at each point on the curve.
+/// - `train_sizes` — Either fractions in `(0, 1]` (if any entry is non-integer)
+///   or absolute sample counts in `(0, n_max]` (if all entries are
+///   integer-valued) for the training subset at each point on the curve.
+///   Duplicates are removed and ticks are sorted ascending.
 /// - `scoring` — A function `(y_true, y_pred) -> Result<f64, FerroError>`.
 ///
 /// # Returns
@@ -76,8 +87,9 @@ pub struct LearningCurveResult {
 ///
 /// # Errors
 ///
-/// - [`FerroError::InvalidParameter`] if `train_sizes` is empty or any value
-///   is non-positive.
+/// - [`FerroError::InvalidParameter`] if `train_sizes` is empty, any value is
+///   non-positive, a non-integer (fraction-mode) value exceeds `1.0`, or an
+///   integer-valued (absolute-mode) value exceeds `n_max`.
 /// - Propagates any error from fold splitting, model fitting, predicting, or
 ///   scoring.
 pub fn learning_curve(
@@ -117,27 +129,65 @@ pub fn learning_curve(
     let folds = cv.fold_indices(n_samples)?;
     let n_folds = folds.len();
     let n_features = x.ncols();
-    let n_sizes = train_sizes.len();
 
     // Pre-compute the absolute sizes based on the first fold's training set
     // size as the reference (all folds should have approximately the same
     // training size, so the first one is representative).
     let reference_train_len = folds[0].0.len();
+    let n_max = reference_train_len;
 
-    let abs_sizes: Vec<usize> = train_sizes
-        .iter()
-        .map(|&s| {
-            if s <= 1.0 {
-                // Fraction of training fold.
-                ((s * reference_train_len as f64).ceil() as usize)
-                    .max(1)
-                    .min(reference_train_len)
-            } else {
-                // Absolute count.
-                (s as usize).max(1).min(reference_train_len)
-            }
-        })
-        .collect();
+    // Faithful port of scikit-learn's `_translate_train_sizes`
+    // (`sklearn/model_selection/_validation.py:1992-2057`, tag 1.5.2).
+    //
+    // sklearn picks fraction-vs-absolute mode by the input array's dtype: a
+    // float array is fraction mode, an integer array is absolute mode. Our
+    // input is `&[f64]`, so we detect the mode by integrality: if every entry
+    // is integer-valued we treat it as absolute counts, otherwise as fractions.
+    //
+    // NOTE: this integrality heuristic makes an all-integer-valued float like
+    // `[1.0]` ABSOLUTE (1 sample), whereas sklearn's float dtype would read it
+    // as the fraction 100% (= n_max). This dtype-vs-value ambiguity cannot be
+    // resolved without an API/type change, so it is documented but not fixed.
+    let all_integral = train_sizes.iter().all(|&s| s.fract() == 0.0);
+
+    // Per-element positivity/finiteness is already validated above.
+    let max_size = train_sizes.iter().copied().fold(f64::MIN, f64::max);
+
+    let mut abs_sizes: Vec<usize> = if all_integral {
+        // Absolute mode: sklearn raises if max > n_max (no clamp), `:2033-2046`.
+        if max_size > n_max as f64 {
+            return Err(FerroError::InvalidParameter {
+                name: "train_sizes".into(),
+                reason: format!("interpreted as absolute sizes and must be within (0, {n_max}]"),
+            });
+        }
+        // `s as usize` truncates toward zero, matching `.astype(int)`.
+        train_sizes.iter().map(|&s| s as usize).collect()
+    } else {
+        // Fraction mode: every entry must be in (0, 1], else ValueError,
+        // `:2020-2027`.
+        if max_size > 1.0 {
+            return Err(FerroError::InvalidParameter {
+                name: "train_sizes".into(),
+                reason: "interpreted as fractions of the max training set size \
+                         and must be within (0, 1]"
+                    .into(),
+            });
+        }
+        // `(s * n_max) as usize` truncates toward zero (= floor for positives,
+        // matching `.astype(int)`), then clamp to [1, n_max] (`np.clip`).
+        train_sizes
+            .iter()
+            .map(|&s| ((s * n_max as f64) as usize).clamp(1, n_max))
+            .collect()
+    };
+
+    // `np.unique` (`:2048`): sort ascending and remove duplicate ticks.
+    abs_sizes.sort_unstable();
+    abs_sizes.dedup();
+
+    // The (deduped, sorted) tick count drives the score-matrix row dimension.
+    let n_sizes = abs_sizes.len();
 
     let mut train_scores_data = Vec::with_capacity(n_sizes * n_folds);
     let mut test_scores_data = Vec::with_capacity(n_sizes * n_folds);
