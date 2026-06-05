@@ -978,6 +978,12 @@ design = ".design/datasets/kddcup99.md"
 parity_ops = ["fetch_kddcup99"]
 
 [[route]]
+crate_pattern = "ferrolearn-fetch/src/california_housing.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_california_housing.py"]
+design = ".design/datasets/california_housing.md"
+parity_ops = ["fetch_california_housing"]
+
+[[route]]
 crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
 upstream = [
   "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
