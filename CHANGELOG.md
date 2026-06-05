@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for REQ-12 of ridge_classifier: RidgeClassifierCV estimator (sklearn _ridge.py:2676) has no ferrolearn type (#395)
 - Blocker for REQ-9 of ridge.md: positive=True constrained fitting (lbfgs solver only) — Ridge<F> has no positive param; sklearn _ridge.py:923-928, _solve_lbfgs (_ridge.py:795) (#387)
 - Blocker for REQ-10 of ridge.md: max_iter/tol + n_iter_ attribute for iterative solvers — Ridge<F> has no max_iter/tol/n_iter_; closed-form Cholesky has no iteration count; sklearn ctor _ridge.py:899-900, sets n_iter_ at :994 (#388)
 - Blocker for REQ-11 of elastic_net.md: FittedElasticNet exposes no n_iter_/dual_gap_ attrs; sklearn ElasticNet exposes n_iter_ (_coordinate_descent.py:827) and dual_gap_ (:831). dual_gap_ unavailable until shared dual-gap stopping criterion (#412) lands. (#417)

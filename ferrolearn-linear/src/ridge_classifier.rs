@@ -26,7 +26,7 @@
 //! | REQ-4 (coef_/intercept_/classes_ introspection) | SHIPPED | `HasCoefficients`/`HasClasses`; values match oracle. NOTE: `coef_matrix` is `(n_features, n_targets)`, transposed vs sklearn `coef_` `(n_classes, n_features)` — orientation contract owned by the `ferrolearn-python` binding layer. |
 //! | REQ-5 (alpha≥0 validation; ≥2-class guard) | SHIPPED | negative-alpha → `InvalidParameter`; <2 classes → error. |
 //! | REQ-6 (class_weight / solver variants / solver_ / positive) | NOT-STARTED | blocker #393. |
-//! | REQ-7 (max_iter/tol + n_iter_) | NOT-STARTED | blocker #394. |
+//! | REQ-7 (max_iter/tol + n_iter_) | SHIPPED | `RidgeClassifier<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidgeClassifier<F>` adds `n_iter_: Option<usize>` (always `None` for the direct solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:1520-1521`) and `n_iter_` (`_ridge.py:1464`); `max_iter`/`tol` are no-ops for the direct solver — matching sklearn when the direct path yields `n_iter_=None`. Test: `ridge_classifier_max_iter_tol_niter_defaults_and_builders`. Closes #394. |
 //! | REQ-8 (sample_weight) | SHIPPED | `RidgeClassifier::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` forwards weights into the underlying weighted ridge on the indicator matrix `Y`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off[t]=Σwᵢ·Y[i,t]/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescale of `X`/`Y` (sklearn `_rescale_data`, `_ridge.py:682-688`), per-target `linalg::solve_ridge` with `alpha` UNSCALED, `intercept[t]=y_off[t]−Σⱼ x_off[j]·coef[j,t]`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body). Mirrors `RidgeClassifier.fit(X, y, sample_weight=None)` (`_ridge.py:1220`) forwarding through `_prepare_data` (`_ridge.py:1305`) into `_BaseRidge.fit`. Oracle tests `ridge_classifier_sample_weight_matches_sklearn` (alpha=1 binary coef `[0.25333333, 0.36]`, intercept `-1.70666667`, differs from unweighted `[0.31840796, 0.31840796]`), `ridge_classifier_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #395. |
 //! | REQ-9 (RidgeClassifierCV) | NOT-STARTED | blocker #396. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | solve_ridge already on ferray::linalg fallback; coef storage ndarray (tied to #359). |
@@ -77,17 +77,33 @@ pub struct RidgeClassifier<F> {
     pub alpha: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// Maximum number of iterations for iterative solvers (sklearn `max_iter`,
+    /// `_ridge.py:1520`). Exposed for sklearn ABI parity; ferrolearn implements
+    /// only the direct dense solver, so this field is stored but has no effect
+    /// on the computed result. Default `None`, matching sklearn's default
+    /// (`_ridge.py:1520`).
+    pub max_iter: Option<usize>,
+    /// Convergence tolerance for iterative solvers (sklearn `tol`,
+    /// `_ridge.py:1521`). Exposed for sklearn ABI parity; ferrolearn implements
+    /// only the direct dense solver, so this field is stored but has no effect
+    /// on the computed result. Default `1e-4`, matching sklearn's default
+    /// (`_ridge.py:1521`).
+    pub tol: F,
 }
 
 impl<F: Float> RidgeClassifier<F> {
     /// Create a new `RidgeClassifier` with default settings.
     ///
-    /// Defaults: `alpha = 1.0`, `fit_intercept = true`.
+    /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `max_iter = None`,
+    /// `tol = 1e-4` — mirroring sklearn's ctor defaults
+    /// (`sklearn/linear_model/_ridge.py:1514-1526`).
     #[must_use]
     pub fn new() -> Self {
         Self {
             alpha: F::one(),
             fit_intercept: true,
+            max_iter: None,
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
         }
     }
 
@@ -102,6 +118,30 @@ impl<F: Float> RidgeClassifier<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the maximum number of iterations for iterative solvers (sklearn
+    /// `max_iter`, `_ridge.py:1520`).
+    ///
+    /// ferrolearn's direct solver solves in closed form with no iteration, so
+    /// this is stored for sklearn ABI parity and does not affect the computed
+    /// result.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: Option<usize>) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance for iterative solvers (sklearn `tol`,
+    /// `_ridge.py:1521`).
+    ///
+    /// ferrolearn's direct solver solves in closed form with no iteration, so
+    /// this is stored for sklearn ABI parity and does not affect the computed
+    /// result.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
         self
     }
 }
@@ -132,6 +172,11 @@ pub struct FittedRidgeClassifier<F> {
     is_binary: bool,
     /// Number of features.
     n_features: usize,
+    /// Number of iterations run by an iterative solver, or `None` for direct
+    /// solvers (sklearn `n_iter_`, `_ridge.py:1464`). ferrolearn implements
+    /// only the direct dense path, so this is always `None` — matching
+    /// sklearn's behaviour when the direct solver is used.
+    n_iter_: Option<usize>,
 }
 
 impl<F: Float> FittedRidgeClassifier<F> {
@@ -145,6 +190,17 @@ impl<F: Float> FittedRidgeClassifier<F> {
     #[must_use]
     pub fn intercept_vec(&self) -> &Array1<F> {
         &self.intercept_vec
+    }
+
+    /// Return the number of iterations run by an iterative solver, or `None`
+    /// for the direct solver (sklearn `n_iter_`, `_ridge.py:1464`).
+    ///
+    /// ferrolearn implements only the direct dense path, so this is always
+    /// `None` — matching sklearn's `RidgeClassifier(alpha=1.0).fit(X,y).n_iter_`
+    /// which is `None` for the direct solver.
+    #[must_use]
+    pub fn n_iter(&self) -> Option<usize> {
+        self.n_iter_
     }
 }
 
@@ -413,6 +469,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             classes,
             is_binary,
             n_features,
+            n_iter_: None,
         })
     }
 }
@@ -715,6 +772,65 @@ mod tests {
 
         let x_bad = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         assert!(fitted.predict(&x_bad).is_err());
+    }
+
+    #[test]
+    fn ridge_classifier_max_iter_tol_niter_defaults_and_builders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Verify sklearn ABI parity for max_iter/tol/n_iter_ (REQ-7, closes #394).
+        //
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   python3 -c "from sklearn.linear_model import RidgeClassifier; \
+        //     import numpy as np; \
+        //     m=RidgeClassifier(); print(m.max_iter, m.tol); \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.]],float); \
+        //     y=np.array([0,0,1,1]); f=m.fit(X,y); print(f.n_iter_)"
+        //   -> None 0.0001
+        //      None
+
+        // Default constructor fields match sklearn defaults.
+        let m = RidgeClassifier::<f64>::new();
+        assert_eq!(m.max_iter, None, "default max_iter should be None");
+        assert!(
+            (m.tol - 1e-4_f64).abs() < 1e-12,
+            "default tol should be 1e-4, got {}",
+            m.tol
+        );
+
+        // Builder round-trips.
+        let m2 = RidgeClassifier::<f64>::new().with_max_iter(Some(500));
+        assert_eq!(m2.max_iter, Some(500));
+
+        let m3 = RidgeClassifier::<f64>::new().with_tol(1e-6);
+        assert!((m3.tol - 1e-6_f64).abs() < 1e-15, "got {}", m3.tol);
+
+        // n_iter_ is always None for the direct solver (oracle: None).
+        let x = Array2::from_shape_vec((4, 2), vec![1.0_f64, 2.0, 2.0, 1.0, 3.0, 4.0, 4.0, 3.0])?;
+        let y = array![0usize, 0, 1, 1];
+
+        let fitted = RidgeClassifier::<f64>::new().fit(&x, &y)?;
+        assert_eq!(
+            fitted.n_iter(),
+            None,
+            "direct solver must report n_iter_=None"
+        );
+
+        // max_iter/tol are no-ops: coef/intercept byte-identical regardless.
+        let fitted_mi = RidgeClassifier::<f64>::new()
+            .with_max_iter(Some(500))
+            .with_tol(1e-6)
+            .fit(&x, &y)?;
+        assert_eq!(
+            fitted.coef_matrix(),
+            fitted_mi.coef_matrix(),
+            "max_iter/tol must not change coef for the direct solver"
+        );
+        assert_eq!(
+            fitted.intercept_vec(),
+            fitted_mi.intercept_vec(),
+            "max_iter/tol must not change intercept for the direct solver"
+        );
+        Ok(())
     }
 
     #[test]
