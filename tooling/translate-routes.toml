@@ -1331,3 +1331,15 @@ upstream = [
 ]
 design = ".design/python/regressors.md"
 parity_ops = ["LinearRegression", "Ridge", "Lasso", "ElasticNet"]
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/classifiers.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/_logistic.py",
+  "/home/doll/scikit-learn/sklearn/tree/_classes.py",
+  "/home/doll/scikit-learn/sklearn/ensemble/_forest.py",
+  "/home/doll/scikit-learn/sklearn/neighbors/_classification.py",
+  "/home/doll/scikit-learn/sklearn/naive_bayes.py",
+]
+design = ".design/python/classifiers.md"
+parity_ops = ["LogisticRegression", "DecisionTreeClassifier", "RandomForestClassifier", "KNeighborsClassifier", "GaussianNB"]

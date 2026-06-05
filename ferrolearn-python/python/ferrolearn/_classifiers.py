@@ -90,7 +90,7 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
     ----------
     C : float, default=1.0
         Inverse of regularization strength.
-    max_iter : int, default=1000
+    max_iter : int, default=100
         Maximum number of iterations.
     tol : float, default=1e-4
         Tolerance for convergence.
@@ -98,7 +98,7 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
         Whether to calculate the intercept for this model.
     """
 
-    def __init__(self, *, C=1.0, max_iter=1000, tol=1e-4, fit_intercept=True):
+    def __init__(self, *, C=1.0, max_iter=100, tol=1e-4, fit_intercept=True):
         self.C = C
         self.max_iter = max_iter
         self.tol = tol
@@ -180,6 +180,7 @@ class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
             min_samples_leaf=self.min_samples_leaf,
         )
         _fit_rust(self._rs, X, y_encoded)
+        self.feature_importances_ = np.array(self._rs.feature_importances_)
         self._store_training_data(X, y_encoded)
         return self
 
@@ -228,8 +229,8 @@ class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
 
     def __init__(
         self,
-        *,
         n_estimators=100,
+        *,
         max_depth=None,
         min_samples_split=2,
         min_samples_leaf=1,
@@ -254,6 +255,7 @@ class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
             random_state=self.random_state,
         )
         _fit_rust(self._rs, X, y_encoded)
+        self.feature_importances_ = np.array(self._rs.feature_importances_)
         self._store_training_data(X, y_encoded)
         return self
 
@@ -286,7 +288,7 @@ class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimato
         Number of neighbors to use.
     """
 
-    def __init__(self, *, n_neighbors=5):
+    def __init__(self, n_neighbors=5):
         self.n_neighbors = n_neighbors
 
     def fit(self, X, y):
