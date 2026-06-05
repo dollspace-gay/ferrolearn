@@ -1213,3 +1213,11 @@ upstream = [
 ]
 design = ".design/numerical/sparse_graph.md"
 parity_ops = ["dijkstra", "connected_components", "minimum_spanning_tree", "shortest_path"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/interpolate.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/interpolate/_cubic.py",
+]
+design = ".design/numerical/interpolate.md"
+parity_ops = ["CubicSpline"]

@@ -10,6 +10,29 @@
 //! - **Not-a-knot** — third derivative is continuous at the second and
 //!   second-to-last knots, giving exact reproduction of cubic polynomials.
 //!
+//! ## REQ status
+//!
+//! Mirrors `scipy.interpolate.CubicSpline` (`scipy/interpolate/_cubic.py`; live
+//! oracle scipy 1.17, deterministic). Design doc: `.design/numerical/interpolate.md`
+//! (14 REQs). Every REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a
+//! concrete blocker). Values are oracle-verified element-wise vs the live scipy
+//! (R-CHAR-3) — see `tests/divergence_interpolate.rs`.
+//!
+//! **8 SHIPPED / 6 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-NAT-EVAL / REQ-NAT-DERIV / REQ-NAT-INTEG (natural) | SHIPPED | `eval`/`derivative`/`second_derivative`/`integrate` for `bc_type='natural'` match scipy element-wise ≤1e-14 (oracle eval `[0.339,2.232,6.232,12.339]`, d1@1.5=3.0357, integ(0,4)=21.4286). Guards `green_natural_*`. |
+//! | REQ-NAK-EVAL / REQ-NAK-DERIV / REQ-NAK-INTEG (not-a-knot, n≥4) | SHIPPED | match scipy default `bc_type='not-a-knot'` (oracle reproduces x³ exactly; eval `[0.25,2.25,6.25,12.25]`, d1@1.5=3.0, integ=21.3333). Guards `green_not_a_knot_*`. |
+//! | REQ-EXTRAP (extrapolation) | SHIPPED | `find_interval` clamps to the first/last cubic, matching scipy `extrapolate=True` default (oracle natural `[-0.339, 19.661]`, ≤1e-13). Guard `green_extrapolation`. |
+//! | REQ-FEWPOINT (3-point not-a-knot) | SHIPPED | FIXED #1957: `solve_not_a_knot` special-cases `n==2` (1 interior knot) — the two not-a-knot conditions are degenerate, so the spline is the unique PARABOLA through the 3 points (`c` = constant second divided difference), matching scipy `_cubic.py:824` (`CubicSpline([0,1,2],[0,1,4],not-a-knot)([0.5,1.5])=[0.25,2.25]`; was `[0.125,2.375]`). Pinned by `divergence_three_point_not_a_knot_parabola`. |
+//! | REQ-DEFAULT-BC (default bc_type) | NOT-STARTED | `new` requires an explicit `BoundaryCondition`; scipy defaults `bc_type='not-a-knot'`. Blocker #1958. |
+//! | REQ-MISSING-BC (clamped/periodic/custom) | NOT-STARTED | only Natural + NotAKnot; scipy also `'clamped'`/`'periodic'`/custom `((order,value),…)`. Blocker #1959. |
+//! | REQ-PPOLY-API (PPoly methods/attrs) | NOT-STARTED | no general-`nu` call, spline-returning `derivative()`/`antiderivative()`, `roots()`/`solve()`, `.c`/`.x`, `extrapolate=False`. Blocker #1960. |
+//! | REQ-ERR-TYPE (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`/scipy `ValueError`. Blocker #1961. |
+//! | REQ-CONSUMER (production consumer) | NOT-STARTED | no non-test caller (standalone module). Blocker #1962. |
+//! | REQ-FERRAY (ferray substrate) | NOT-STARTED | `ndarray` + hand-rolled Thomas solve vs ferray interpolate/banded-solve (R-SUBSTRATE-1). Blocker #1963. |
+//!
 //! # Examples
 //!
 //! ```
@@ -332,9 +355,30 @@ fn solve_natural(n: usize, h: &[f64], y: &[f64]) -> Vec<f64> {
 ///
 /// Combined with the n-1 interior equations this yields an (n+1) x (n+1)
 /// system solved by a modified Thomas algorithm.
+///
+/// # 3-point special case (n == 2)
+///
+/// With exactly 3 data points (one interior knot) the left and right
+/// not-a-knot conditions are identical, so the general degenerate system has
+/// no unique solution. scipy handles this by constructing the unique parabola
+/// through the 3 points (`scipy/interpolate/_cubic.py:824` — "In this case
+/// 'not-a-knot' can't be handled regularly as the both conditions are
+/// identical. We handle this case by constructing a parabola passing through
+/// given points."). A parabola has a constant second derivative, so every
+/// knot's `c` value (here `c_i = S''(x_i)/2`) equals the second divided
+/// difference and `d_i = (c_{i+1} - c_i)/(3*h_i) = 0` (no cubic term).
 fn solve_not_a_knot(n: usize, h: &[f64], y: &[f64]) -> Vec<f64> {
     if n <= 1 {
         return vec![0.0; n + 1];
+    }
+    if n == 2 {
+        // 3-point not-a-knot: the two end conditions are identical, so the
+        // spline is the unique parabola through the 3 points
+        // (scipy/interpolate/_cubic.py:824). A parabola has constant S'', so
+        // c is constant across the knots, equal to the second divided
+        // difference; this yields d_i = 0 and reproduces the parabola exactly.
+        let dd = ((y[2] - y[1]) / h[1] - (y[1] - y[0]) / h[0]) / (h[0] + h[1]);
+        return vec![dd, dd, dd];
     }
     solve_not_a_knot_general(n, h, y)
 }
