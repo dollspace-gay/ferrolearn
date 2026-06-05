@@ -987,6 +987,12 @@ upstream = ["/home/doll/scikit-learn/sklearn/kernel_approximation.py"]
 design = ".design/kernel/rbf_sampler.md"
 parity_ops = ["RBFSampler"]
 
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/nystroem.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/kernel_approximation.py"]
+design = ".design/kernel/nystroem.md"
+parity_ops = ["Nystroem"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-model-sel (model_selection + compose + multiclass)
 # =====================================================================

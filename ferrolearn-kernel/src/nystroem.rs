@@ -14,6 +14,35 @@
 //! where `K_qq` is the kernel matrix of the sampled basis points and `K_nq`
 //! is the kernel between all points and the basis.
 //!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.kernel_approximation.Nystroem` (`kernel_approximation.py:827`,
+//! v1.5.2 commit 156ef14). Design doc: `.design/kernel/nystroem.md` (12 REQs).
+//! Every REQ is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete
+//! blocker). The dominant value-parity blocker is the RNG substrate (REQ-8):
+//! basis selection uses `Xoshiro256++` + an unpermuted full-basis path, vs
+//! sklearn's numpy Mersenne-Twister `permutation` — so exact element-wise
+//! `transform` parity is impossible until `ferray::random` ships (R-SUBSTRATE-5).
+//! The permutation- and rotation-invariant kernel reconstruction `Z·Zᵀ ≈ K`
+//! ships regardless.
+//!
+//! **6 SHIPPED / 6 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (kernel reconstruction at full basis) | SHIPPED | `Z·Zᵀ = K_nq·K_qq⁻¹·K_qn` matches sklearn at `n_components == n_samples` (rotation/permutation-invariant); oracle `max|Z·Zᵀ − rbf_kernel(X,X,γ)| ≈ 1.5e-15`. Guard `green_rbf_reconstruction_full_basis` in `tests/divergence_nystroem.rs`. |
+//! | REQ-2 (default gamma = 1/n_features) | SHIPPED | `effective_gamma = gamma.unwrap_or(1/n_features)` matches sklearn's pairwise rbf default (`gamma=None → 1/n_features`). In-crate `default_gamma_scales_with_features`. |
+//! | REQ-3 (kernel value formulas) | SHIPPED | `kernel_value` rbf/polynomial/linear/sigmoid match sklearn's `*_kernel` when gamma/degree/coef0 are explicit. |
+//! | REQ-5 (n_components ≥ 1 validation) | SHIPPED | `fit` errors on `n_components == 0`, matching `_parameter_constraints` (`:952`). In-crate `rejects_zero_components`. |
+//! | REQ-9 (poly/sigmoid default coef0) | SHIPPED | FIXED #1903: `Nystroem::new` default `coef0` `0.0 -> 1.0`, matching sklearn's `coef0=None` -> `pairwise_kernels` default `1` for polynomial/sigmoid (`:962`, `:1068-1086`); unused by rbf/linear. Pinned by `divergence_poly_default_coef0` (poly degree=1 full-basis reconstruction vs the live oracle, was off by exactly 1.0). |
+//! | REQ-12 (production consumer) | SHIPPED | `lib.rs` re-export + Python binding `RsNystroem` in `ferrolearn-python/src/extras.rs` (registered in its `lib.rs`, wrapped by `_extras.py`). |
+//! | REQ-4 (n_components > n_samples warning) | NOT-STARTED | clamp is correct (`n_components.min(n_samples)`) but sklearn also `warnings.warn` (`:1008-1012`); no Rust warnings analog. Blocker #1908. |
+//! | REQ-6 (normalization form / transform parity) | NOT-STARTED | `normalization = V·D^{-1/2}` + `transform = K_new·normalization` vs sklearn symmetric `(U/sqrt(max(S,1e-12)))·V = K_qq^{-1/2}` + `embedded·normalizationᵀ` (`:1032`,`:1066`); element-wise `Z` rotated by `Vᵀ` (Z·Zᵀ identical). Prerequisite for value parity even with matching RNG. Blocker #1905. |
+//! | REQ-7 (eigenvalue floor) | NOT-STARTED | zeroes columns with `ev ≤ 1e-12` vs sklearn `S = max(S, 1e-12)` keeps the column (`:1031`); diverges on rank-deficient `K_qq`. Also SVD (singular values) vs `self_adjoint_eigen` (signed) diverges on indefinite poly/sigmoid kernels. Blockers #1907 / #1906. |
+//! | REQ-8 (basis permutation / exact value parity) | NOT-STARTED | `Xoshiro256++` + unpermuted full-basis path vs numpy Mersenne-Twister `permutation` (always permutes, `:1017`). RNG-substrate carve-out, no failing test. Blocker #1904. |
+//! | REQ-10 (fitted-attr + constructor surface) | NOT-STARTED | missing `component_indices_`/`normalization_` accessors; `kernel` enum vs sklearn string/callable/precomputed + `kernel_params` + `n_jobs` (`:957-976`); the Python binding hardcodes defaults (no params plumbed). Blocker #1909. |
+//! | REQ-11 (ferray substrate) | NOT-STARTED | `ndarray` + `faer` + `rand_xoshiro` vs `ferray-core`/`ferray::linalg`/`ferray::random`. Blocker #1910 (linked to #1904). |
+//!
 //! # Examples
 //!
 //! ```
@@ -66,7 +95,14 @@ pub struct Nystroem<F> {
     gamma: Option<F>,
     /// Polynomial degree (default 3).
     degree: usize,
-    /// Coefficient for Polynomial/Sigmoid (default 0.0).
+    /// Coefficient for Polynomial/Sigmoid (default 1.0).
+    ///
+    /// Matches sklearn's effective default for the polynomial and sigmoid
+    /// kernels: `Nystroem.__init__` has `coef0=None`
+    /// (`sklearn/kernel_approximation.py:962`), and `_get_kernel_params`
+    /// (`:1068-1086`) omits `coef0` when it is `None`, so `pairwise_kernels`
+    /// falls back to `polynomial_kernel`/`sigmoid_kernel`'s own default
+    /// `coef0=1`. Unused by the Rbf and Linear kernels (see `kernel_value`).
     coef0: F,
     /// Number of basis functions / components (default 100).
     n_components: usize,
@@ -82,7 +118,7 @@ impl<F: Float + Send + Sync + 'static> Nystroem<F> {
             kernel: KernelType::Rbf,
             gamma: None,
             degree: 3,
-            coef0: F::zero(),
+            coef0: F::one(),
             n_components: 100,
             random_state: None,
         }
