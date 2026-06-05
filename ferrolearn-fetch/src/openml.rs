@@ -12,6 +12,29 @@
 //! Callers that need parquet, sparse matrices, or the full type-coercion
 //! machinery should download the file via [`crate::fetch_file`] and parse it
 //! with their own ARFF / parquet reader.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.datasets.fetch_openml` (`sklearn/datasets/_openml.py` +
+//! `_arff_parser.py`; live oracle 1.5.2). Verification model A (cargo test +
+//! sklearn source contract; full numerical value-parity needs a live OpenML
+//! download, so it is NOT-STARTED offline — the SHIPPED rows are the
+//! offline-verifiable contract: API endpoints, ARFF parsing, cache integration,
+//! public surface). Design doc: `.design/datasets/openml.md` (8 REQs). Every REQ
+//! is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! **5 SHIPPED / 3 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-OPENML-API-ENDPOINTS | SHIPPED | `DATA_INFO_URL` + `fetch_openml` build `api/v1/json/data/{id}` and read `data_set_description.url`/`default_target_attribute`, matching sklearn `_DATA_INFO` (`_openml.py:34`) + `_get_data_description_by_id` (`:367`). (Host `www.openml.org` vs sklearn `api.openml.org` + download-route delta folded into REQ-VALUE-PARITY.) |
+//! | REQ-ARFF-PARSE | SHIPPED | `parse_arff`/`parse_attribute`/`split_attribute_name` classify numeric vs nominal `{a,b,c}` attributes, 0-based level-encode nominal values, and unquote single-quoted names — mirroring sklearn's LIAC-ARFF `encode_nominal` path (`_arff_parser.py:167-179`). 4 in-crate unit tests pass. (Sparse/pandas/string/date ARFF paths NOT covered — REQ-FULL-PARAMS.) |
+//! | REQ-CACHE-INTEGRATION | SHIPPED | `fetch_openml` caches via `dataset_dir("openml/{id}", data_home)` (`cache.rs`) + `fetch_file` first-use download, mirroring sklearn's `cache=True` `data_home` keying (`_openml.py:43-44`). (Uncompressed `openml/{id}/` vs sklearn gzip `openml.org/{path}.gz` — folded into REQ-VALUE-PARITY.) |
+//! | REQ-CODE-HYGIENE | SHIPPED | FIXED #2062: `split_attribute_name`'s nested `if let { if let }` (which rust-1.95 clippy flagged as `collapsible_if` under `-D warnings`, R-DEFER-5 toolchain drift) collapsed into a single let-chain; `cargo clippy -p ferrolearn-fetch --all-targets -- -D warnings` now green. No behavior change. |
+//! | REQ-CONSUMER | SHIPPED | `pub fn fetch_openml` + `pub struct OpenmlDataset` re-exported at the crate root (`lib.rs` `pub use openml::{OpenmlDataset, fetch_openml}`) — public boundary API (R-DEFER-1/S5; external users + the eventual ferrolearn-python datasets binding). Underclaim: no in-workspace non-test function caller. |
+//! | REQ-VALUE-PARITY | NOT-STARTED | `fetch_openml` → `fetch_file` → `ureq::get(url).call()` needs network + a live OpenML download; element-wise `(data, target)` parity vs `sklearn.datasets.fetch_openml(data_id=61)` is unreachable offline (network-gated, NOT a code bug). Blocker #2060. |
+//! | REQ-FULL-PARAMS | NOT-STARTED | signature `fetch_openml(data_id, target_column, data_home)` omits sklearn's `name`/`version` resolution, list/None `target_column`, `cache`/`return_X_y`/`as_frame`/`n_retries`/`delay`/`parser`/`read_csv_kwargs` (`_openml.py:770-784`). Blocker #2061. |
+//! | REQ-SUBSTRATE | NOT-STARTED | uses `ndarray::{Array1, Array2}` for `OpenmlDataset`, not `ferray-core` (R-SUBSTRATE-1); shares the sibling fetchers' `ndarray` types. Tracked under #2060's migration follow-up. |
 
 use std::fs;
 use std::path::Path;
@@ -192,12 +215,12 @@ fn parse_arff(raw: &str, target_name: &str) -> Result<OpenmlDataset, FerroError>
     }
 
     fn split_attribute_name(body: &str) -> Result<(String, String), FerroError> {
-        if let Some(stripped) = body.strip_prefix('\'') {
-            if let Some(end) = stripped.find('\'') {
-                let name = stripped[..end].to_string();
-                let rest = stripped[end + 1..].trim_start().to_string();
-                return Ok((name, rest));
-            }
+        if let Some(stripped) = body.strip_prefix('\'')
+            && let Some(end) = stripped.find('\'')
+        {
+            let name = stripped[..end].to_string();
+            let rest = stripped[end + 1..].trim_start().to_string();
+            return Ok((name, rest));
         }
         let mut parts = body.splitn(2, char::is_whitespace);
         let name = parts.next().unwrap_or("").to_string();

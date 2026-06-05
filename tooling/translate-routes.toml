@@ -945,6 +945,21 @@ parity_ops = ["MLPClassifier", "MLPRegressor"]
 # =====================================================================
 
 [[route]]
+crate_pattern = "ferrolearn-fetch/src/cache.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_base.py"]
+design = ".design/datasets/cache.md"
+parity_ops = ["get_data_home", "clear_data_home"]
+
+[[route]]
+crate_pattern = "ferrolearn-fetch/src/openml.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/datasets/_openml.py",
+  "/home/doll/scikit-learn/sklearn/datasets/_arff_parser.py",
+]
+design = ".design/datasets/openml.md"
+parity_ops = ["fetch_openml"]
+
+[[route]]
 crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
 upstream = [
   "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
