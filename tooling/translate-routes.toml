@@ -972,6 +972,12 @@ design = ".design/datasets/newsgroups.md"
 parity_ops = ["fetch_20newsgroups"]
 
 [[route]]
+crate_pattern = "ferrolearn-fetch/src/kddcup99.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_kddcup99.py"]
+design = ".design/datasets/kddcup99.md"
+parity_ops = ["fetch_kddcup99"]
+
+[[route]]
 crate_pattern = "ferrolearn-datasets/src/svmlight.rs"
 upstream = [
   "/home/doll/scikit-learn/sklearn/datasets/_svmlight_format_io.py",
