@@ -17,6 +17,28 @@
 //! # Sentinel Value
 //!
 //! Unlabeled samples are identified by `y[i] == usize::MAX`.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.semi_supervised.SelfTrainingClassifier`
+//! (`sklearn/semi_supervised/_self_training.py:39`) at v1.5.2. ferrolearn is a
+//! SIMPLIFIED BINARY version: a `FitFn` closure base (R-DEV-7), a single score
+//! interpreted as P(class 1), threshold criterion only. Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-SELFTRAIN-LOOP (binary threshold self-training iteration + n_iter) | SHIPPED | `while not-all-labeled && n_iter < max_iter { n_iter+=1; refit on labeled; predict unlabeled; pseudo-label confident; if 0 selected break }` then ONE final fit on all labeled — mirrors `_self_training.py:247-297`; `n_iter` matches sklearn `n_iter_` (all-labeled ⇒ 0, no_change/converge/max_iter cases oracle-verified). Guards `guard_selftrain_loop_pseudo_labels_confident_rows`, `guard_selftrain_loop_non_confident_keeps_sentinel`, `divergence_all_labeled_n_iter_1846`. |
+//! | REQ-THRESHOLD-STRICT (selection `>` not `>=`) | SHIPPED | `max_prob > threshold` (strict), matching `selected = max_proba > self.threshold` (`:262`) — a sample at exactly the threshold is NOT selected (was `>=`, fixed #1841). Test `divergence_threshold_strict_boundary_1841`. |
+//! | REQ-THRESHOLD-BOUND (threshold ∈ [0,1)) | SHIPPED | rejects `< 0.0`, `>= 1.0`, non-finite — matching `Interval(Real, 0.0, 1.0, closed="left")` (`:164`); accepts 0.0, rejects 1.0 (was `(0,1]`, fixed #1842). Tests `divergence_threshold_bound_one_rejected_1842`, `divergence_threshold_bound_zero_accepted_1842`. |
+//! | REQ-MULTICLASS (predict_proba argmax + classes_) | NOT-STARTED | binary-only labels {0,1} from a single score; sklearn `classes_[argmax(predict_proba)]` (`:256-257`). Architectural. Blocker #1843. |
+//! | REQ-CRITERION-KBEST (criterion='k_best' + k_best) | NOT-STARTED | no `criterion`/`k_best` params (`:264-269`). Blocker #1844. |
+//! | REQ-PREDICT-LABELS (predict returns class labels) | NOT-STARTED | `Predict` returns raw `f64` scores; sklearn `predict` returns labels via `base_estimator_.predict` (`:322`). Blocker #1845. |
+//! | REQ-ATTRS (termination_condition_ / labeled_iter_) | NOT-STARTED | `n_iter` count is correct (REQ-SELFTRAIN-LOOP) but the `termination_condition_`/`labeled_iter_` attributes are absent (`:121`,`:242`). Blocker #1846. |
+//! | REQ-MAX-ITER (max_iter=0 / max_iter=None) | NOT-STARTED | `max_iter: usize` rejects 0, no unlimited `None` (`:167`). Blocker #1847. |
+//! | REQ-PROBA-DELEGATION (predict_proba/decision_function/score) | NOT-STARTED | no proba/decision/score delegation to the base (`:324+`). Blocker #1848. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray::{Array1, Array2}`; destination `ferray-core` (R-SUBSTRATE-1). Blocker #1849. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use self_training::{SelfTrainingClassifier, FittedSelfTrainingClassifier, UNLABELED}` in `lib.rs` (boundary API, S5/R-DEFER-1). No internal caller, no Python binding (honest underclaim). |
 
 use ferrolearn_core::{FerroError, Predict};
 use ndarray::{Array1, Array2};

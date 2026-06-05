@@ -1105,6 +1105,12 @@ upstream = [
 design = ".design/model-sel/chain.md"
 parity_ops = ["ClassifierChain", "RegressorChain", "OutputCodeClassifier"]
 
+[[route]]
+crate_pattern = "ferrolearn-model-sel/src/self_training.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/semi_supervised/_self_training.py"]
+design = ".design/model-sel/self_training.md"
+parity_ops = ["SelfTrainingClassifier"]
+
 # =====================================================================
 # Layer 2 — ferrolearn-covariance (covariance)
 # =====================================================================
