@@ -113,7 +113,8 @@ fn api_proof_classification_extras() {
     let (x, y) = make_hastie_10_2::<f64>(40, Some(7)).unwrap();
     assert_eq!((x.nrows(), x.ncols()), (40, 10));
     assert_eq!(y.len(), 40);
-    assert!(y.iter().all(|&v| v == 0 || v == 1));
+    // sklearn label contract: float64 {-1.0, +1.0} (_samples_generator.py:567-568).
+    assert!(y.iter().all(|&v| v == -1.0 || v == 1.0));
 
     let (x, y) = make_multilabel_classification::<f64>(30, 5, 4, 2, Some(7)).unwrap();
     assert_eq!((x.nrows(), x.ncols()), (30, 5));

@@ -3,6 +3,44 @@
 //! All generators accept an optional `random_state` seed for full
 //! reproducibility. When `random_state` is `None` a random seed is drawn
 //! from the OS.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn/datasets/_samples_generator.py` (v1.5.2, commit 156ef14).
+//! Design doc: `.design/datasets/generators.md` (22 REQs). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). The dominant
+//! blocker is the RNG substrate (REQ-20): ferrolearn samples from `SmallRng` +
+//! `rand_distr`, sklearn from numpy's Mersenne-Twister `RandomState`, so exact
+//! element-wise value parity for every *stochastic* generator is impossible until
+//! `ferray::random` ships (R-SUBSTRATE-5). The DETERMINISTIC (RNG-independent)
+//! divergences are oracle-pinnable now; two are fixed this iteration.
+//!
+//! **4 SHIPPED / 18 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-4 (`make_moons` deterministic geometry) | SHIPPED | `make_moons` now uses `theta = PI * i / (m - 1)` (`n_upper.saturating_sub(1).max(1)`), matching `np.linspace(0, pi, m)` endpoint=True (`_samples_generator.py:901-904`). Element-wise vs the live oracle (`make_moons(shuffle=False, noise=None)`) at n=10 and edge cases n=2/3/11 (odd splits, single-point `linspace(0,pi,1)==[0.0]`) within 1e-12. Tests: `divergence_moons_geometry`, `guard_moons_*` in `tests/divergence_generators*.rs`. The `shuffle` default + Gaussian-noise value parity are REQ-5 (NOT-STARTED, RNG). |
+//! | REQ-6 (`make_circles` deterministic geometry) | SHIPPED | `theta = 2*PI*i/n_outer` + inner radius `factor` match `np.linspace(0,2pi,n,endpoint=False)` (`_samples_generator.py:813-818`); element-wise vs live `make_circles(shuffle=False, noise=None, factor=0.5)` within 1e-12 (`guard_circles_geometry_oracle_parity`). `shuffle`/`factor` default + noise parity are REQ-7 (NOT-STARTED). |
+//! | REQ-18 (`make_hastie_10_2` label encoding) | SHIPPED | returns `Array1<F>` with labels `{-1.0, +1.0}` (`if s > 9.34 { F::one() } else { -F::one() }`), matching sklearn's float64 `{-1.0,+1.0}` (`_samples_generator.py:567-568`); strict `> 9.34` threshold preserved. Pinned by `divergence_hastie_label_encoding` (label set + dtype, oracle-grounded, no RNG match needed). The X *values* remain RNG-blocked (REQ-20). |
+//! | REQ-22 (production consumer) | SHIPPED | all 17 generators re-exported at the crate root (`lib.rs` `pub use generators::{...}`) — the grandfathered boundary surface (R-DEFER-1/S5). |
+//! | REQ-1 (`make_classification` algo+sig) | NOT-STARTED | one-blob-per-class + `i % n_classes` vs sklearn hypercube-vertex method; missing 11 params. Blocker #1894 (+ RNG #1893). |
+//! | REQ-2 (`make_regression` sig+parity) | NOT-STARTED | missing `n_targets`/`bias`/`effective_rank`/`tail_strength`/`shuffle`/`coef`; `Uniform(-10,10)` vs `100*uniform`. Blocker #1895 (+ RNG #1893). |
+//! | REQ-3 (`make_blobs` sig+assignment) | NOT-STARTED | `i % centers` interleave vs contiguous per-center blocks; missing `center_box`/per-center-std/`shuffle`/`return_centers`. Blocker #1895 (+ RNG #1893). |
+//! | REQ-5 (`make_moons` shuffle+parity) | NOT-STARTED | no `shuffle`; noise via `rand_distr`. Blocker: RNG #1893 + `shuffle`. |
+//! | REQ-7 (`make_circles` shuffle+parity) | NOT-STARTED | no `shuffle`; `factor` required (sklearn default 0.8); noise RNG. Blocker: RNG #1893. |
+//! | REQ-8 (`make_swiss_roll` parity+hole) | NOT-STARTED | missing `hole`; value parity RNG. Blocker: RNG #1893. |
+//! | REQ-9 (`make_s_curve` parity) | NOT-STARTED | value parity RNG. Blocker: RNG #1893. |
+//! | REQ-10 (`make_sparse_uncorrelated` weights+parity) | NOT-STARTED | 5 weights `[1,2,3,4,5]` + noise-free y vs sklearn 4 weights `[1,2,-2,-1.5]` and `y~N(.,1)`. Blocker #1896 (+ RNG #1893). |
+//! | REQ-11 (`make_friedman1` parity) | NOT-STARTED | formula matches; value parity RNG. Blocker: RNG #1893. |
+//! | REQ-12 (`make_friedman2` parity+order) | NOT-STARTED | per-row vs whole-matrix draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
+//! | REQ-13 (`make_friedman3` 1e-6+parity) | NOT-STARTED | spurious `+1e-6` on X0; draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
+//! | REQ-14 (`make_low_rank_matrix` algo+sig) | NOT-STARTED | `A*B` approximation vs QR `U*S*V^T`; wrong singular profile. Blocker #1898 (+ RNG #1893). |
+//! | REQ-15 (`make_spd_matrix` algo+sig) | NOT-STARTED | `X^T X + nI` vs SVD `U*(1+diag(uniform))*V^T`; `n` vs `n_dim`. Blocker #1898 (+ RNG #1893). |
+//! | REQ-16 (`make_sparse_spd_matrix` algo+sig) | NOT-STARTED | precision-off-diagonal zeroing vs Cholesky-factor sparsity; missing 4 params. Blocker #1898 (+ RNG #1893). |
+//! | REQ-17 (`make_gaussian_quantiles` contract+sig) | NOT-STARTED | X not reordered (rank-label in place) vs argsort-reorder; missing `mean`/`cov`/`shuffle`. Blocker #1899 (+ RNG #1893). |
+//! | REQ-19 (`make_multilabel_classification` algo+return) | NOT-STARTED | distinct-class pick + fabricated X vs Poisson/Multinomial; missing CSR/indicator + `p_c`/`p_w_c` + 5 params. Blocker #1900 (+ RNG #1893). |
+//! | REQ-20 (RNG substrate) | NOT-STARTED | `SmallRng` + `rand_distr` vs numpy `RandomState`; gates every value-parity REQ. Blocker #1893 / #1901 (ferray::random). |
+//! | REQ-21 (ferray array substrate) | NOT-STARTED | `ndarray::{Array1,Array2}` vs `ferray-core`. Blocker #1901. |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -441,7 +479,11 @@ where
 
     // Upper moon (class 0): angles in [0, π].
     for i in 0..n_upper {
-        let theta = PI * (i as f64) / (n_upper.max(1) as f64);
+        // sklearn: np.linspace(0, pi, n_samples_out) with endpoint=True ->
+        // theta_i = pi * i / (n_upper - 1) (_samples_generator.py:901-902).
+        // numpy edge convention: linspace(0, pi, 1) == [0.0], so for n_upper == 1
+        // the single angle is 0.0 -> use (n_upper - 1).max(1) as the denominator.
+        let theta = PI * (i as f64) / (n_upper.saturating_sub(1).max(1) as f64);
         let mut px = theta.cos();
         let mut py = theta.sin();
         if let Some(ref nd) = noise_dist {
@@ -455,7 +497,11 @@ where
 
     // Lower moon (class 1): angles in [0, π], offset by (1, -0.5).
     for i in 0..n_lower {
-        let theta = PI * (i as f64) / (n_lower.max(1) as f64);
+        // sklearn: np.linspace(0, pi, n_samples_in) with endpoint=True ->
+        // theta_i = pi * i / (n_lower - 1) (_samples_generator.py:903-904).
+        // numpy edge convention: linspace(0, pi, 1) == [0.0], so for n_lower == 1
+        // the single angle is 0.0 -> use (n_lower - 1).max(1) as the denominator.
+        let theta = PI * (i as f64) / (n_lower.saturating_sub(1).max(1) as f64);
         let mut px = 1.0 - theta.cos();
         let mut py = 1.0 - theta.sin() - 0.5;
         if let Some(ref nd) = noise_dist {
@@ -1325,12 +1371,15 @@ where
 /// Generate Hastie's binary classification benchmark from
 /// "Elements of Statistical Learning" (Ex 10.2).
 ///
-/// Produces 10-dimensional standard-normal inputs; the binary label is
-/// `1` iff `sum(x_i^2) > 9.34`.
+/// Produces 10-dimensional standard-normal inputs; the target `y` is returned
+/// as float (matching sklearn's `np.float64` dtype) with the `{-1.0, +1.0}`
+/// label set: `+1.0` iff `sum(x_i^2) > 9.34`, else `-1.0`
+/// (`sklearn/datasets/_samples_generator.py:567-568`:
+/// `y = ((X**2.0).sum(axis=1) > 9.34).astype(np.float64); y[y == 0.0] = -1.0`).
 pub fn make_hastie_10_2<F>(
     n_samples: usize,
     random_state: Option<u64>,
-) -> Result<(Array2<F>, Array1<usize>), FerroError>
+) -> Result<(Array2<F>, Array1<F>), FerroError>
 where
     F: Float + Send + Sync + 'static,
 {
@@ -1340,7 +1389,7 @@ where
         reason: e.to_string(),
     })?;
     let mut x = Array2::<F>::zeros((n_samples, 10));
-    let mut y = Array1::<usize>::zeros(n_samples);
+    let mut y = Array1::<F>::zeros(n_samples);
     for i in 0..n_samples {
         let mut s = 0.0_f64;
         for j in 0..10 {
@@ -1351,8 +1400,10 @@ where
                 reason: "could not convert".into(),
             })?;
         }
-        // 9.34 ≈ median of chi-squared with 10 df
-        y[i] = if s > 9.34 { 1 } else { 0 };
+        // 9.34 ≈ median of chi-squared with 10 df. sklearn label contract:
+        // {-1.0, +1.0} float (`_samples_generator.py:567-568`). The threshold
+        // comparison stays in f64, exactly as sklearn's `> 9.34`.
+        y[i] = if s > 9.34 { F::one() } else { -F::one() };
     }
     Ok((x, y))
 }

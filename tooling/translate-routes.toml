@@ -959,6 +959,18 @@ upstream = ["/home/doll/scikit-learn/sklearn/datasets/_base.py"]
 design = ".design/datasets/toy.md"
 parity_ops = ["load_iris", "load_wine", "load_breast_cancer", "load_diabetes", "load_digits", "load_linnerud"]
 
+[[route]]
+crate_pattern = "ferrolearn-datasets/src/generators.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/datasets/_samples_generator.py"]
+design = ".design/datasets/generators.md"
+parity_ops = [
+  "make_classification", "make_regression", "make_blobs", "make_moons", "make_circles",
+  "make_swiss_roll", "make_s_curve", "make_sparse_uncorrelated", "make_friedman1",
+  "make_friedman2", "make_friedman3", "make_low_rank_matrix", "make_spd_matrix",
+  "make_sparse_spd_matrix", "make_gaussian_quantiles", "make_hastie_10_2",
+  "make_multilabel_classification",
+]
+
 # =====================================================================
 # Layer 2 — ferrolearn-kernel (kernel_ridge + kernel_approximation)
 # =====================================================================
