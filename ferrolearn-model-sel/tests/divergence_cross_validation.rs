@@ -299,7 +299,6 @@ fn pin_1790_error_score_nan_continue() {
 /// (`:798-805`). ferrolearn sorts classes LEXICOGRAPHICALLY + rotating
 /// `fold_offset` round-robin => `[[0,4,5,8],[1,6,9,10],[2,3,7,11]]`. DIVERGES.
 #[test]
-#[ignore = "divergence: StratifiedKFold lexicographic-sort + rotating-offset allocation differs from sklearn appearance-order bincount allocation; tracking #1791"]
 fn pin_1791_stratified_kfold_allocation() {
     let y: Array1<usize> = Array1::from(vec![2, 2, 2, 2, 0, 0, 0, 0, 1, 1, 1, 1]);
     let folds = StratifiedKFold::new(3).split(&y).unwrap();
@@ -321,7 +320,6 @@ fn pin_1791_stratified_kfold_allocation() {
 /// class count < n_splits. This pin asserts the split SUCCEEDS (3 folds), so it
 /// FAILS today.
 #[test]
-#[ignore = "divergence: StratifiedKFold errors if ANY class < n_splits; sklearn only errors if ALL classes < n_splits, else warns+splits; tracking #1792"]
 fn pin_1792_stratified_kfold_one_small_class_warns_not_errors() {
     let y: Array1<usize> = Array1::from(vec![0, 0, 0, 0, 0, 1, 1]);
     let result = StratifiedKFold::new(3).split(&y);

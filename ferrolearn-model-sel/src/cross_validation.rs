@@ -255,8 +255,12 @@ impl StratifiedKFold {
     /// # Errors
     ///
     /// - [`FerroError::InvalidParameter`] if `n_splits < 2`.
-    /// - [`FerroError::InsufficientSamples`] if any class has fewer samples
-    ///   than `n_splits`.
+    /// - [`FerroError::InsufficientSamples`] if `n_samples < n_splits`, or if
+    ///   EVERY class has fewer than `n_splits` members. Mirroring scikit-learn's
+    ///   `StratifiedKFold._make_test_folds` (`_split.py:770-781`), an error is
+    ///   raised only when ALL classes are too small; if only SOME classes are
+    ///   too small the split still proceeds (sklearn emits a `UserWarning`
+    ///   there, which ferrolearn has no channel for).
     ///
     /// # Examples
     ///
@@ -291,79 +295,106 @@ impl StratifiedKFold {
             });
         }
 
-        // Group sample indices by class label.
-        let mut class_indices: HashMap<usize, Vec<usize>> = HashMap::new();
-        for (i, &label) in y.iter().enumerate() {
-            class_indices.entry(label).or_default().push(i);
+        // Faithful port of scikit-learn's
+        // `StratifiedKFold._make_test_folds` (`_split.py:746-806`).
+
+        // (a) Encode classes by ORDER OF APPEARANCE in `y` (`:760-765`): the
+        // first distinct label seen gets encoding 0, the next 1, etc.
+        let mut encoding: HashMap<usize, usize> = HashMap::new();
+        let mut y_encoded: Vec<usize> = Vec::with_capacity(n_samples);
+        for &label in y.iter() {
+            let next = encoding.len();
+            let code = *encoding.entry(label).or_insert(next);
+            y_encoded.push(code);
+        }
+        let n_classes = encoding.len();
+
+        // y_counts = number of samples in each encoded class (`:768`).
+        let mut y_counts = vec![0usize; n_classes];
+        for &code in &y_encoded {
+            y_counts[code] += 1;
         }
 
-        // Sort classes for deterministic behaviour.
-        let mut classes: Vec<usize> = class_indices.keys().copied().collect();
-        classes.sort_unstable();
+        // (#1792) error-vs-warn: sklearn raises ONLY when EVERY class is too
+        // small (`:770-774`); if only SOME are too small it warns and still
+        // splits (`:775-781`). ferrolearn has no warning channel, so it simply
+        // proceeds in the warn-case.
+        if y_counts.iter().all(|&c| c < self.n_splits) {
+            return Err(FerroError::InsufficientSamples {
+                required: self.n_splits,
+                actual: y_counts.iter().copied().min().unwrap_or(0),
+                context: format!(
+                    "StratifiedKFold: n_splits={} cannot be greater than the \
+                     number of members in each class",
+                    self.n_splits
+                ),
+            });
+        }
 
-        // Optionally shuffle within each class stratum.
-        if self.shuffle {
-            let mut rng: SmallRng = match self.random_state {
+        // (b) Allocation: for fold i and class k, the count of class-k labels
+        // among every `n_splits`-th element of the sorted encoded y, i.e.
+        // `bincount(y_order[i::n_splits])` (`:786-792`).
+        let mut y_order = y_encoded.clone();
+        y_order.sort_unstable();
+        let mut allocation: Vec<Vec<usize>> = vec![vec![0usize; n_classes]; self.n_splits];
+        for (i, alloc_row) in allocation.iter_mut().enumerate() {
+            let mut pos = i;
+            while pos < y_order.len() {
+                alloc_row[y_order[pos]] += 1;
+                pos += self.n_splits;
+            }
+        }
+
+        // Optional RNG for shuffling fold blocks (exact shuffled membership is
+        // an RNG carve-out, #1795).
+        let mut rng: Option<SmallRng> = if self.shuffle {
+            Some(match self.random_state {
                 Some(seed) => SmallRng::seed_from_u64(seed),
                 None => SmallRng::from_os_rng(),
-            };
-            for class in &classes {
-                class_indices.get_mut(class).unwrap().shuffle(&mut rng);
+            })
+        } else {
+            None
+        };
+
+        // (c) Assignment: for each class k, build `folds_for_class` = fold index
+        // f repeated `allocation[f][k]` times (`:798-805`), optionally shuffle,
+        // then walk the original-order samples of class k and assign their fold.
+        let mut test_fold_of = vec![0usize; n_samples];
+        for k in 0..n_classes {
+            let mut folds_for_class: Vec<usize> = Vec::with_capacity(y_counts[k]);
+            for (f, alloc_row) in allocation.iter().enumerate() {
+                for _ in 0..alloc_row[k] {
+                    folds_for_class.push(f);
+                }
+            }
+            if let Some(rng) = rng.as_mut() {
+                folds_for_class.shuffle(rng);
+            }
+            // Walk class-k samples in ascending original index. By construction
+            // `folds_for_class.len() == y_counts[k]`, so every slot is filled.
+            let mut j = 0;
+            for (i, &code) in y_encoded.iter().enumerate() {
+                if code == k {
+                    if let Some(&f) = folds_for_class.get(j) {
+                        test_fold_of[i] = f;
+                    }
+                    j += 1;
+                }
             }
         }
 
-        // Validate that every class has enough samples.
-        for &class in &classes {
-            let count = class_indices[&class].len();
-            if count < self.n_splits {
-                return Err(FerroError::InsufficientSamples {
-                    required: self.n_splits,
-                    actual: count,
-                    context: format!("StratifiedKFold: class {class} has too few samples"),
-                });
-            }
-        }
-
-        // For each class, assign its samples to folds in round-robin fashion.
-        // fold_test_indices[fold] accumulates the test indices for that fold.
-        //
-        // A global `fold_offset` rotates which folds receive the extra samples
-        // when `class_count % n_splits != 0`. This matches sklearn's behaviour
-        // and avoids front-loading the first few folds.
-        let mut fold_test_indices: Vec<Vec<usize>> = vec![Vec::new(); self.n_splits];
-        let mut fold_offset: usize = 0;
-        for class in &classes {
-            let idx = &class_indices[class];
-            let base = idx.len() / self.n_splits;
-            let extra = idx.len() % self.n_splits;
-            let mut pos = 0;
-            for (fold_idx, bucket) in fold_test_indices.iter_mut().enumerate() {
-                // This fold gets an extra sample if it falls within the `extra`
-                // slots starting at `fold_offset` (wrapping around).
-                let gets_extra = if extra > 0 {
-                    // Distance from fold_offset, modulo n_splits
-                    let d = (fold_idx + self.n_splits - fold_offset) % self.n_splits;
-                    d < extra
-                } else {
-                    false
-                };
-                let size = base + if gets_extra { 1 } else { 0 };
-                bucket.extend_from_slice(&idx[pos..pos + size]);
-                pos += size;
-            }
-            fold_offset = (fold_offset + extra) % self.n_splits;
-        }
-
-        // Build (train, test) pairs.
-        let all_indices: Vec<usize> = (0..n_samples).collect();
+        // (d) Build (train, test) pairs in ascending index order.
         let mut folds = Vec::with_capacity(self.n_splits);
-        for test in fold_test_indices {
-            let test_set: std::collections::HashSet<usize> = test.iter().copied().collect();
-            let train: Vec<usize> = all_indices
-                .iter()
-                .copied()
-                .filter(|i| !test_set.contains(i))
-                .collect();
+        for f in 0..self.n_splits {
+            let mut test: Vec<usize> = Vec::new();
+            let mut train: Vec<usize> = Vec::new();
+            for (i, &fold) in test_fold_of.iter().enumerate() {
+                if fold == f {
+                    test.push(i);
+                } else {
+                    train.push(i);
+                }
+            }
             folds.push((train, test));
         }
         Ok(folds)
@@ -1002,11 +1033,29 @@ mod tests {
     }
 
     #[test]
-    fn test_skfold_class_too_small() {
-        // Class 2 has only 1 sample but n_splits=3.
+    fn test_skfold_one_small_class_still_splits() {
+        // Class 2 has only 1 sample (< n_splits=3) but classes 0 and 1 each
+        // have 3 >= 3. Mirroring sklearn's `_make_test_folds` (`_split.py:770`),
+        // an error is raised ONLY when EVERY class is too small; here only one
+        // class is, so sklearn warns and still splits. Live sklearn 1.5.2 oracle
+        // for y=[0,0,0,1,1,1,2], StratifiedKFold(3) => 3 folds partitioning 0..7.
         let y = array![0usize, 0, 0, 1, 1, 1, 2];
-        let skf = StratifiedKFold::new(3);
-        assert!(skf.split(&y).is_err());
+        let result = StratifiedKFold::new(3).split(&y);
+        assert!(result.is_ok(), "one-small-class split should succeed");
+        let folds = result.unwrap_or_default();
+        assert_eq!(folds.len(), 3);
+        let mut all_test: Vec<usize> = folds.iter().flat_map(|(_, t)| t.iter().copied()).collect();
+        all_test.sort_unstable();
+        assert_eq!(all_test, (0..7).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_skfold_all_classes_too_small_errors() {
+        // EVERY class has fewer than n_splits members => sklearn raises and so
+        // does ferrolearn. y=[0,1] with n_splits=3: both classes have 1 < 3
+        // (also n_samples=2 < n_splits=3, the sklearn-correct earlier guard).
+        let y = array![0usize, 1];
+        assert!(StratifiedKFold::new(3).split(&y).is_err());
     }
 
     // -- cross_val_score tests ------------------------------------------------
