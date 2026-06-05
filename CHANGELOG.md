@@ -436,6 +436,7 @@ Coordinated workspace bump for all crates from `0.2.0` (and `ferrolearn-bayes 0.
   - `NormalNormalPosterior { mean, var }` — typed posterior summary.
 
 ### Changed
+- Blocker for REQ-12 of ridge.md: copy_X and random_state constructor params — Ridge<F> omits both; sklearn ctor _ridge.py:898/:903, copy_X drives _preprocess_data copy (:963), random_state seeds sag/saga (#390)
 - ferrolearn-linear elastic_net.rs REQ-8: positive=True (non-negative CD clamp) (#2083)
 - Blocker for REQ-7 of lasso.md: Lasso lacks positive=True (force non-negative coefficients) — sklearn ctor param positive=False, _cd_fast.pyx clips w[ii] to >=0 (#407)
 - Blocker for REQ-11 of ridge.md: sample_weight support — Ridge<F>.fit takes (X, y) only; sklearn rescales X,y by sqrt(sample_weight) (_ridge.py:682-688), _check_sample_weight at :956 (#389)

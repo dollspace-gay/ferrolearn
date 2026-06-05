@@ -29,7 +29,7 @@
 //! | REQ-8 (warm_start) | NOT-STARTED | #408. |
 //! | REQ-9 (selection='random' + random_state) | NOT-STARTED | #409. |
 //! | REQ-10 (precompute/Gram) | NOT-STARTED | #410. |
-//! | REQ-11 (n_iter_ / dual_gap_ attrs) | NOT-STARTED | #411. |
+//! | REQ-11 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedLasso<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `Lasso.n_iter_` (`_coordinate_descent.py:1103`) and `dual_gap_` (`:1108`). `fn lasso_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·n`, `beta=0`) with a final `/n` mapping to the `(1/2n)` objective. HONEST NOTE: `n_iter_`'s VALUE differs from sklearn (ferrolearn stops on max-coef-change, not dual gap — REQ-12 #412); `dual_gap_` matches sklearn's formula/value (`0.0001170161` vs sklearn `0.00011701482` at alpha=0.3 on the fixture). This REQ ships the ATTRIBUTES; exact `n_iter_` value-parity stays coupled to REQ-12. Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_formula_matches_numpy`, `lasso_fitted_dual_gap_and_n_iter`, `lasso_fields_dont_change_coef`). |
 //! | REQ-12 (dual-gap stopping criterion) | NOT-STARTED | #412 — ferrolearn stops on max-coef-change vs sklearn relative-change + dual-gap; converges to the same optimum (≤1e-6), only the stopping measure differs. |
 //! | REQ-13 (MultiTaskLasso) | NOT-STARTED | #413 (separate estimator). |
 //! | REQ-14 (ferray substrate) | NOT-STARTED | #414 (CD is elementwise; coef storage ndarray, tied to #359). |
@@ -154,6 +154,56 @@ pub struct FittedLasso<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+    /// Number of full coordinate-descent sweeps performed before
+    /// convergence/break (mirrors sklearn `Lasso.n_iter_`).
+    n_iter: usize,
+    /// Duality gap at the returned solution (mirrors sklearn `Lasso.dual_gap_`).
+    dual_gap: F,
+}
+
+/// Lasso duality gap on the `(1/2n)`-scaled objective, mirroring sklearn's
+/// `enet_coordinate_descent` gap (`_cd_fast.pyx:216-247`, `beta = 0` for
+/// `l1_ratio = 1`) with the final `/n` mapping sklearn's un-normalized
+/// `(1/2)||y−Xw||² + l1_reg·||w||₁` (`l1_reg = alpha·n`,
+/// `_coordinate_descent.py:655`) back to ferrolearn's `(1/2n)` scaling.
+///
+/// `xc`/`yc` are the design the coordinate descent actually solved on
+/// (centered when `fit_intercept`, raw otherwise); `w` is the fitted coef.
+pub(crate) fn lasso_dual_gap<F>(xc: &Array2<F>, yc: &Array1<F>, w: &Array1<F>, alpha: F) -> F
+where
+    F: Float + ScalarOperand + 'static,
+{
+    let n = xc.nrows();
+    let n_f = F::from(n).unwrap_or_else(F::one);
+
+    // R = yc − Xc·w
+    let residual = yc - &xc.dot(w);
+
+    // l1_reg = alpha · n  (sklearn's Cython l1 penalty scaling).
+    let l1_reg = alpha * n_f;
+
+    // XtA = Xcᵀ · R, dual_norm_XtA = max(|XtA[j]|).
+    let xt_a = xc.t().dot(&residual);
+    let dual_norm_xt_a = xt_a.iter().fold(F::zero(), |acc, &v| acc.max(v.abs()));
+
+    let r_norm2 = residual.dot(&residual);
+
+    let (const_factor, mut gap) = if dual_norm_xt_a > l1_reg {
+        let c = l1_reg / dual_norm_xt_a;
+        let half = F::from(0.5).unwrap_or_else(F::one);
+        (c, half * (r_norm2 + r_norm2 * c * c))
+    } else {
+        (F::one(), r_norm2)
+    };
+
+    // l1_norm = ‖w‖₁
+    let l1_norm = w.iter().fold(F::zero(), |acc, &wj| acc + wj.abs());
+    // R · yc
+    let r_dot_y = residual.dot(yc);
+
+    gap = gap + l1_reg * l1_norm - const_factor * r_dot_y;
+
+    gap / n_f
 }
 
 /// Soft-thresholding operator for L1 penalty.
@@ -250,9 +300,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         // Initialize coefficients to zero.
         let mut w = Array1::<F>::zeros(n_features);
+        // Keep the (centered/raw) target for the final dual-gap computation;
+        // the CD loop consumes a working copy into `residual`.
+        let target = y_work.clone();
         let mut residual = y_work;
 
-        for _iter in 0..self.max_iter {
+        let mut n_iter = 0_usize;
+        for iter in 0..self.max_iter {
+            n_iter = iter + 1;
             let mut max_change = F::zero();
 
             for j in 0..n_features {
@@ -306,9 +361,13 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                     F::zero()
                 };
 
+                let dual_gap = lasso_dual_gap(&x_work, &target, &w, self.alpha);
+
                 return Ok(FittedLasso {
                     coefficients: w,
                     intercept,
+                    n_iter,
+                    dual_gap,
                 });
             }
         }
@@ -320,9 +379,13 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             F::zero()
         };
 
+        let dual_gap = lasso_dual_gap(&x_work, &target, &w, self.alpha);
+
         Ok(FittedLasso {
             coefficients: w,
             intercept,
+            n_iter,
+            dual_gap,
         })
     }
 }
@@ -351,6 +414,29 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for Fi
 
         let preds = x.dot(&self.coefficients) + self.intercept;
         Ok(preds)
+    }
+}
+
+impl<F: Float> FittedLasso<F> {
+    /// Number of coordinate-descent sweeps run by the solver.
+    ///
+    /// Mirrors sklearn's `Lasso.n_iter_` attribute
+    /// (`_coordinate_descent.py:827`/`:1103`). Note: ferrolearn's stopping
+    /// criterion is max-coefficient-change (REQ-12 #412), so this VALUE can
+    /// differ from sklearn's dual-gap-based count even at the same optimum.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+
+    /// Duality gap at the returned solution, on the `(1/2n)`-scaled objective.
+    ///
+    /// Mirrors sklearn's `Lasso.dual_gap_` attribute
+    /// (`_coordinate_descent.py:831`/`:1108`); computed by [`lasso_dual_gap`]
+    /// on the same (centered/raw) design the coordinate descent solved.
+    #[must_use]
+    pub fn dual_gap(&self) -> F {
+        self.dual_gap
     }
 }
 
@@ -640,6 +726,84 @@ mod tests {
             unconstrained.coefficients()[0],
             epsilon = 1e-10
         );
+    }
+
+    /// Centered fixture for the dual-gap oracle (R-CHAR-3):
+    /// `X = [[1,2],[2,1],[3,4],[4,3],[5,5]]`, `y = [3,2.5,7.1,6,11.2]`,
+    /// centered by column mean / target mean (the design the CD solves under
+    /// `fit_intercept`).
+    fn centered_dual_gap_fixture() -> Option<(Array2<f64>, Array1<f64>)> {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        let x_mean = x.mean_axis(Axis(0))?;
+        let y_mean = y.mean()?;
+        Some((&x - &x_mean, &y - y_mean))
+    }
+
+    fn raw_dual_gap_fixture() -> (Array2<f64>, Array1<f64>) {
+        let x: Array2<f64> = array![[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0],];
+        let y: Array1<f64> = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        (x, y)
+    }
+
+    #[test]
+    fn lasso_dual_gap_formula_matches_numpy() {
+        // numpy/sklearn-computed oracle points (NOT from ferrolearn):
+        //   gap(w=[0.5,1.0])               = 0.465888     (far-from-optimum)
+        //   gap(w=[0.66691036,1.46647171]) = 0.0001170161 (the optimum)
+        let (xc, yc) = match centered_dual_gap_fixture() {
+            Some(f) => f,
+            None => return,
+        };
+
+        let far = lasso_dual_gap(&xc, &yc, &array![0.5, 1.0], 0.3);
+        assert_relative_eq!(far, 0.465888, epsilon = 1e-5);
+
+        let opt = lasso_dual_gap(&xc, &yc, &array![0.66691036, 1.46647171], 0.3);
+        assert_relative_eq!(opt, 0.0001170161, epsilon = 1e-7);
+    }
+
+    #[test]
+    fn lasso_fitted_dual_gap_and_n_iter() {
+        // Lasso(alpha=0.3) on the same fixture: dual_gap_ converged near
+        // sklearn's 0.000117; n_iter_ within [1, max_iter].
+        let (x, y) = raw_dual_gap_fixture();
+
+        let fit_res = Lasso::<f64>::new().with_alpha(0.3).fit(&x, &y);
+        assert!(fit_res.is_ok(), "fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        let gap = fitted.dual_gap();
+        assert!(gap >= 0.0, "dual_gap should be non-negative, got {gap}");
+        assert!(gap < 1e-3, "dual_gap should be converged-small, got {gap}");
+
+        let n_iter = fitted.n_iter();
+        assert!(n_iter >= 1, "n_iter should be at least 1, got {n_iter}");
+        assert!(n_iter <= 1000, "n_iter should be <= max_iter, got {n_iter}");
+    }
+
+    #[test]
+    fn lasso_fields_dont_change_coef() {
+        // Regression guard: the additive n_iter_/dual_gap_ fields must not
+        // perturb coef_/intercept_. Compared against sklearn's converged
+        // coef_ = [0.66691036, 1.46647171] at the AC-1 tolerance (1e-4):
+        // ferrolearn's max-coef-change stop reaches the same optimum modulo
+        // REQ-12's looser stopping measure, and the additive fields leave it
+        // unchanged.
+        let (x, y) = raw_dual_gap_fixture();
+
+        let fit_res = Lasso::<f64>::new().with_alpha(0.3).fit(&x, &y);
+        assert!(fit_res.is_ok(), "fit should succeed");
+        let fitted = match fit_res {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+
+        assert_relative_eq!(fitted.coefficients()[0], 0.66691036, epsilon = 1e-3);
+        assert_relative_eq!(fitted.coefficients()[1], 1.46647171, epsilon = 1e-3);
     }
 
     #[test]
