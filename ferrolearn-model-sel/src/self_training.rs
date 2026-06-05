@@ -107,7 +107,7 @@ impl SelfTrainingClassifier {
     /// Returns [`FerroError`] if:
     /// - `x` and `y` have mismatched lengths.
     /// - No labeled samples are present.
-    /// - The threshold is outside `(0, 1]`.
+    /// - The threshold is outside `[0, 1)` (or non-finite).
     /// - The base model fails to fit or predict.
     pub fn fit(
         &self,
@@ -123,10 +123,10 @@ impl SelfTrainingClassifier {
                 context: "SelfTrainingClassifier::fit: y length must equal x rows".into(),
             });
         }
-        if self.threshold <= 0.0 || self.threshold > 1.0 {
+        if !self.threshold.is_finite() || self.threshold < 0.0 || self.threshold >= 1.0 {
             return Err(FerroError::InvalidParameter {
                 name: "threshold".into(),
-                reason: format!("must be in (0, 1], got {}", self.threshold),
+                reason: format!("must be in [0, 1), got {}", self.threshold),
             });
         }
         if self.max_iter == 0 {
@@ -373,14 +373,15 @@ mod tests {
 
     #[test]
     fn test_self_training_high_threshold_no_labels() {
-        // With threshold = 1.0, scores < 1.0 should never qualify.
+        // With threshold = 0.99, scores whose max_prob <= 0.99 never qualify.
+        // (threshold must be in [0, 1); 1.0 is rejected — see #1842.)
         let x = Array2::from_shape_vec((4, 1), vec![0.1, 0.9, 0.4, 0.6]).unwrap();
         let y = Array1::from_vec(vec![0, 1, UNLABELED, UNLABELED]);
 
-        let st = SelfTrainingClassifier::new(feature0_fit_fn()).threshold(1.0);
+        let st = SelfTrainingClassifier::new(feature0_fit_fn()).threshold(0.99);
         let fitted = st.fit(&x, &y).unwrap();
 
-        // Unlabeled samples should remain UNLABELED.
+        // Unlabeled samples should remain UNLABELED (max_prob 0.9 < 0.99).
         assert_eq!(fitted.transduced_labels()[2], UNLABELED);
         assert_eq!(fitted.transduced_labels()[3], UNLABELED);
     }
@@ -408,7 +409,8 @@ mod tests {
         let x = Array2::from_elem((4, 1), 0.5);
         let y = Array1::from_vec(vec![0, 1, UNLABELED, UNLABELED]);
 
-        let st = SelfTrainingClassifier::new(feature0_fit_fn()).threshold(0.0);
+        // Negative thresholds are out of the [0, 1) interval (#1842).
+        let st = SelfTrainingClassifier::new(feature0_fit_fn()).threshold(-0.1);
         assert!(st.fit(&x, &y).is_err());
 
         let st2 = SelfTrainingClassifier::new(feature0_fit_fn()).threshold(1.5);

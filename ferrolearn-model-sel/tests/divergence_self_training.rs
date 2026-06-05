@@ -167,7 +167,6 @@ fn divergence_threshold_strict_boundary_1841() {
 /// ACTUAL: ferrolearn returns `Ok` (1.0 is inside its `(0, 1]`). FAILS un-ignored.
 /// Tracking: #1842.
 #[test]
-#[ignore = "divergence: ferrolearn accepts threshold=1.0 but sklearn rejects ([0,1)); tracking #1842"]
 fn divergence_threshold_bound_one_rejected_1842() {
     let x = Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
     let y = Array1::from_vec(vec![0, 1, UNLABELED, UNLABELED]);
@@ -193,7 +192,6 @@ fn divergence_threshold_bound_one_rejected_1842() {
 /// ACTUAL: ferrolearn returns `Err` ("must be in (0, 1]"). FAILS un-ignored.
 /// Tracking: #1842.
 #[test]
-#[ignore = "divergence: ferrolearn rejects threshold=0.0 but sklearn accepts ([0,1)); tracking #1842"]
 fn divergence_threshold_bound_zero_accepted_1842() {
     let x = Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
     let y = Array1::from_vec(vec![0, 1, UNLABELED, UNLABELED]);
