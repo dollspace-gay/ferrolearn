@@ -3,6 +3,33 @@
 //! [`CsrMatrix<T>`] is a newtype wrapper around [`sprs::CsMat<T>`] in CSR
 //! storage. CSR matrices are efficient for row-wise operations, matrix-vector
 //! products, and row slicing.
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.sparse.csr_matrix` (`scipy/sparse/_csr.py`; live oracle scipy
+//! 1.17, deterministic). Design doc: `.design/sparse/csr.md` (14 REQs). Every REQ
+//! is BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//! Behavior is oracle-verified vs the live scipy (R-CHAR-3) — see
+//! `tests/divergence_csr.rs`.
+//!
+//! **7 SHIPPED / 7 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-CONSTRUCT-CONVERT | SHIPPED | `from_coo`/`from_dense`/`from_csc` + `to_dense`/`to_coo`/`to_csc` + `nnz` mirror `csr_matrix(...)`/`.toarray()`/`.tocsc()`/`.tocoo()`/`.nnz` (oracle nnz=5; round-trips). Guards `csr_from_*`/`csr_to_csc_roundtrip_matches_scipy`. |
+//! | REQ-MATVEC | SHIPPED | `mul_vec(v)` == scipy `A@v` (`[7,6,19]`). Guard `csr_mul_vec_matches_scipy`. |
+//! | REQ-ADD | SHIPPED | `add(&B)` == scipy `A+B` (elementwise). Guards `csr_add_self_matches_scipy`/`csr_add_other_matches_scipy`. |
+//! | REQ-SCALAR-MUL | SHIPPED | `mul_scalar(s)`/`scale(s)` == scipy `A*s`. Guard `csr_scalar_mul_matches_scipy`. |
+//! | REQ-ROW-SLICE | SHIPPED | `row_slice(a,b)` == scipy `A[a:b]` (method vs Python-slice API). Guard `csr_row_slice_matches_scipy`. |
+//! | REQ-ERR | SHIPPED | `add`/`mul_vec` return `Err(FerroError::ShapeMismatch)` where scipy raises `ValueError`. Guards `csr_*_shape_mismatch_is_err`. |
+//! | REQ-CONSUMER | SHIPPED | real estimator consumers: `ferrolearn-neighbors/src/graph.rs` (`kneighbors_graph`/`radius_neighbors_graph` return CSR) + `ferrolearn-core/src/dataset.rs` (sparse `Dataset` arm); also `helpers.rs`/`csc.rs`. |
+//! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)` (`_compressed.py`). Blocker #2000. |
+//! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2001. |
+//! | REQ-MISSING-REDUCE | NOT-STARTED | no `.sum(axis=)`/`.diagonal()`. Blocker #2002. |
+//! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2003. |
+//! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`sum_duplicates`/`astype`/`copy`/`max`/`min`. Blocker #2004. |
+//! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2005. |
+//! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSR analog (R-SUBSTRATE-1). Blocker #2006. |
 
 use std::ops::{Add, AddAssign, Mul, MulAssign};
 
