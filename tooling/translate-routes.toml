@@ -1143,3 +1143,13 @@ upstream = [
 ]
 design = ".design/covariance/covariance.md"
 parity_ops = ["EmpiricalCovariance", "ShrunkCovariance", "LedoitWolf", "OAS", "MinCovDet", "EllipticEnvelope"]
+
+[[route]]
+crate_pattern = "ferrolearn-covariance/src/helpers.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/covariance/_empirical_covariance.py",
+  "/home/doll/scikit-learn/sklearn/covariance/_shrunk_covariance.py",
+  "/home/doll/scikit-learn/sklearn/covariance/_robust_covariance.py",
+]
+design = ".design/covariance/helpers.md"
+parity_ops = ["empirical_covariance", "shrunk_covariance", "ledoit_wolf", "ledoit_wolf_shrinkage", "oas", "log_likelihood", "fast_mcd"]

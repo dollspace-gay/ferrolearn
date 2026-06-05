@@ -3,6 +3,26 @@
 //! These are stateless equivalents of the methods on the corresponding
 //! estimator structs, mirroring the function exports in
 //! `sklearn.covariance`.
+//!
+//! ## REQ status
+//!
+//! Mirrors `sklearn.covariance` function exports (`_empirical_covariance.py`,
+//! `_shrunk_covariance.py`, `_robust_covariance.py`) at v1.5.2. These delegate to
+//! the `covariance.rs` estimators (audited under #1701). Every REQ is BINARY
+//! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker).
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-EMPIRICAL (empirical_covariance) | SHIPPED | delegates `EmpiricalCovariance` (biased MLE `X^T X / n`), `:67`; matches live oracle element-wise (assume_centered true/false). Guards `guard_empirical_covariance_*`. |
+//! | REQ-SHRUNK (shrunk_covariance formula) | SHIPPED | `(1-s)*emp_cov + s*(trace/n)*I`, `:111`; matches live oracle for s=0.1/0.3. Guards `guard_shrunk_covariance_*`. |
+//! | REQ-LEDOIT-WOLF (ledoit_wolf + ledoit_wolf_shrinkage) | SHIPPED | delegates `LedoitWolf` (`:409`/`:299`); returns `(cov, shrinkage)`; matches live oracle (shrinkage ~1e-10). Guard `guard_ledoit_wolf`. |
+//! | REQ-OAS (oas) | SHIPPED | delegates `OAS` (1.5.2 formula, #1702); shrinkage ~0.67 (not pre-1.5 ~0.54), `:619`; matches live oracle. Guards `guard_oas`, `guard_return_order_cov_then_shrinkage`. |
+//! | REQ-LOG-LIKELIHOOD (SPD precision value parity) | SHIPPED | `0.5*(logdet(precision) - tr - p*log(2π))` = sklearn `(-tr + logdet - p*log(2π))/2` (`:33`); bit-exact on identity/scaled/anisotropic/cross-term SPD precisions vs live oracle. Guards `guard_log_likelihood_anisotropic`, `guard_log_likelihood_cross_terms`. |
+//! | REQ-LOG-LIKELIHOOD-NONPD (non-PD precision ⇒ -inf) | NOT-STARTED | sklearn `fast_logdet` (`utils/extmath.py:108`) returns `-inf` when `slogdet` sign ≤ 0; ferrolearn `log_det_spd` adds adaptive regularization and returns a finite value (out-of-contract input). Faithful parity needs a sign-aware `slogdet` (LU determinant) — the crate has only the regularizing Cholesky `log_det_spd` (kept for graphical_lasso). Test `divergence_log_likelihood_nonpd`. Blocker #1878. |
+//! | REQ-DEFAULTS (shrunk_covariance shrinkage=0.1, ledoit_wolf block_size=1000) | NOT-STARTED | `shrinkage` mandatory; no `block_size` (memory-only, no value impact). API-shape gap. Blocker #1874. |
+//! | REQ-FAST-MCD (fast_mcd) | NOT-STARTED | FastMCD RNG-dependent (`SmallRng`/Xoshiro vs numpy `RandomState`, `:358`) — R-DEFER-3 carve-out (NO failing value test); structural shapes hold. Blocker #1875. |
+//! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + hand-rolled `log_det_spd`; destination `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1). Blocker #1876. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use helpers::{empirical_covariance, shrunk_covariance, ledoit_wolf, ledoit_wolf_shrinkage, oas, log_likelihood, fast_mcd}` in `lib.rs` (boundary function API, S5/R-DEFER-1). |
 
 use ferrolearn_core::FerroError;
 use ferrolearn_core::traits::Fit;
