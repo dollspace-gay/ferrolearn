@@ -108,6 +108,15 @@ design = ".design/linear/lasso.md"
 parity_ops = ["Lasso"]
 
 [[route]]
+crate_pattern = "ferrolearn-linear/src/multi_task_lasso.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_cd_fast.pyx",
+]
+design = ".design/linear/lasso.md"
+parity_ops = ["MultiTaskLasso"]
+
+[[route]]
 crate_pattern = "ferrolearn-linear/src/lasso_cv.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
 design = ".design/linear/lasso_cv.md"
