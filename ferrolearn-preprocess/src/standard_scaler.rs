@@ -10,8 +10,9 @@
 //! `:696`, `scale` `:133`). Design doc: `.design/preprocess/standard_scaler.md`. Expected values
 //! from the live sklearn 1.5.2 oracle (R-CHAR-3). Consumers: PyO3 `_RsStandardScaler`
 //! (`ferrolearn-python/src/transformers.rs:12`) + `PipelineTransformer` impl + crate re-export
-//! (`lib.rs`, grandfathered S5). HONEST (R-HONEST-3): always centers+scales (no with_mean/with_std
-//! params); the per-column standardize VALUES match sklearn on the default path.
+//! (`lib.rs`, grandfathered S5). HONEST (R-HONEST-3): `with_mean`/`with_std` constructor params
+//! gate conditional center/scale (`_data.py:1064-1067`); the per-column standardize VALUES match
+//! sklearn on every flag configuration.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -20,7 +21,7 @@
 //! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*s_eff + mean`, mirroring sklearn `X *= scale_; X += mean_` (`_data.py:1106-1109`); `inverse_transform(transform(X))==X` (`green_req3_inverse_roundtrip`). Consumer: PyO3 `_RsStandardScaler::inverse_transform`. |
 //! | REQ-4 (PyO3 binding) | SHIPPED | `_RsStandardScaler` (`transformers.rs:12`, registered `lib.rs:22`) marshals `fit`/`transform`/`inverse_transform`/`mean_` over `FittedStandardScaler<f64>` — a real CPython consumer. |
 //! | REQ-5 (var_/scale_/n_samples_seen_ attrs) | SHIPPED | FIXED #1192. `FittedStandardScaler<F>` now stores `var_` (population variance ddof=0, `0.0` on a constant column), `scale_` (= `_handle_zeros_in_scale(sqrt(var_))`: `std` on non-constant cols, `1.0` on constant cols — same zero-handling as `transform`'s `s_eff`), and `n_samples_seen_` (= n_rows), set in `Fit::fit`; exposed by getters `var()`/`scale()`/`n_samples_seen()` mirroring sklearn `var_`/`scale_`/`n_samples_seen_` (`_data.py:1013-1023`). Critic-grounded vs live oracle `X=[[1,5],[2,5],[3,5]]` (`var_=[0.6666666666666666,0.0]`, `scale_=[0.816496580927726,1.0]`, `n_samples_seen_=3`): `standard_scaler_var_scale_nsamples_match_sklearn`, `standard_scaler_scale_differs_from_std_on_constant_col`, `standard_scaler_var_equals_std_squared_nonconstant`. Additive getters; `transform`/`inverse_transform` unchanged. |
-//! | REQ-6 (with_mean/with_std/copy params) | NOT-STARTED | open prereq blocker #1193. Always centers+scales (`_data.py:829-838`,`:1064-1067`). |
+//! | REQ-6 (with_mean/with_std/copy params) | SHIPPED | FIXED #1193. `StandardScaler<F>` now carries `with_mean`/`with_std`/`copy` (default `true`, `new()`/`Default`), mirroring sklearn `__init__(*, copy=True, with_mean=True, with_std=True)` + `_parameter_constraints` (`_data.py:829-838`), with `#[must_use]` builders `with_with_mean`/`with_with_std`/`with_copy`. `with_mean`/`with_std` thread into `FittedStandardScaler<F>` (set in `Fit::fit`); `transform` is conditional `if with_mean: X -= mean_; if with_std: X /= scale_` and `inverse_transform` mirrors `if with_std: X *= scale_; if with_mean: X += mean_` (`_data.py:1064-1067`,`:1106-1109`). `copy` is ABI-only (fit/transform operate on owned copies). Critic-grounded vs live oracle `X=[[1,10],[2,20],[3,30]]`: default (T,T) → `[[-1.2247..],[0],[1.2247..]]` (regression-guarded bit-identical to pre-existing default fit), with_std=false (T,F) → center-only `[[-1,-10],[0,0],[1,10]]`, with_mean=false (F,T) → scale-only `[[1.2247..],[2.4495..],[3.6742..]]`, both-false (F,F) → identity, and inverse round-trip for all 4 configs. R-DEV-4 DEVIATION: sklearn nulls `mean_`/`scale_`/`var_` when a flag is `False`; ferrolearn always materializes them (getters return `&Array1`, not `Option`) — the flags govern transform APPLICATION so OUTPUT matches sklearn exactly. |
 //! | REQ-7 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1194. Fold propagates NaN; sklearn ignores NaN (`_data.py:918`,`:1112-1113`). Not a rejection. |
 //! | REQ-8 (scale free fn + axis) | NOT-STARTED | open prereq blocker #1195. No `scale` fn / axis=1 (`_data.py:133`). |
 //! | REQ-9 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1196. Single-shot (`_data.py:880-1025`). |
@@ -62,16 +63,74 @@ use num_traits::Float;
 /// ```
 #[derive(Debug, Clone)]
 pub struct StandardScaler<F> {
+    /// Whether to center the data (subtract the per-column mean) on transform.
+    ///
+    /// Mirrors sklearn `StandardScaler(with_mean=True)` (`_data.py:835-838`):
+    /// when `false`, [`Transform::transform`] does NOT subtract the mean
+    /// (`if with_mean: X -= mean_`, `_data.py:1064-1065`). Default `true`.
+    pub with_mean: bool,
+    /// Whether to scale the data (divide by the per-column scale) on transform.
+    ///
+    /// Mirrors sklearn `StandardScaler(with_std=True)` (`_data.py:835-838`):
+    /// when `false`, [`Transform::transform`] does NOT divide by the scale
+    /// (`if with_std: X /= scale_`, `_data.py:1066-1067`). Default `true`.
+    pub with_std: bool,
+    /// Whether `fit`/`transform` should copy the input rather than mutate it.
+    ///
+    /// Mirrors sklearn `StandardScaler(copy=True)` (`_data.py:835-838`). In
+    /// ferrolearn this is ABI-only: `fit`/`transform` never mutate the caller's
+    /// array (they operate on owned copies), so this flag is stored for API
+    /// parity but does not change observable behavior. Default `true`.
+    pub copy: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> StandardScaler<F> {
     /// Create a new `StandardScaler` with default configuration.
+    ///
+    /// Defaults mirror sklearn `StandardScaler(*, copy=True, with_mean=True,
+    /// with_std=True)` (`_data.py:835-838`).
     #[must_use]
     pub fn new() -> Self {
         Self {
+            with_mean: true,
+            with_std: true,
+            copy: true,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set whether to center (subtract the mean) on transform.
+    ///
+    /// Mirrors sklearn's `with_mean` constructor parameter (`_data.py:835-838`):
+    /// `false` disables centering (`if with_mean: X -= mean_`,
+    /// `_data.py:1064-1065`).
+    #[must_use]
+    pub fn with_with_mean(mut self, with_mean: bool) -> Self {
+        self.with_mean = with_mean;
+        self
+    }
+
+    /// Set whether to scale (divide by the scale) on transform.
+    ///
+    /// Mirrors sklearn's `with_std` constructor parameter (`_data.py:835-838`):
+    /// `false` disables scaling (`if with_std: X /= scale_`,
+    /// `_data.py:1066-1067`).
+    #[must_use]
+    pub fn with_with_std(mut self, with_std: bool) -> Self {
+        self.with_std = with_std;
+        self
+    }
+
+    /// Set the `copy` flag (ABI-only in ferrolearn).
+    ///
+    /// Mirrors sklearn's `copy` constructor parameter (`_data.py:835-838`).
+    /// ferrolearn always operates on owned copies, so this does not change
+    /// observable behavior.
+    #[must_use]
+    pub fn with_copy(mut self, copy: bool) -> Self {
+        self.copy = copy;
+        self
     }
 }
 
@@ -88,6 +147,18 @@ impl<F: Float + Send + Sync + 'static> Default for StandardScaler<F> {
 /// A fitted standard scaler holding per-column means and standard deviations.
 ///
 /// Created by calling [`Fit::fit`] on a [`StandardScaler`].
+///
+/// # Deviation (R-DEV-4): fitted attributes are always materialized
+///
+/// sklearn sets `mean_` / `scale_` / `var_` to `None` when the corresponding
+/// flag (`with_mean` / `with_std`) is `False` (`_data.py:986-991`,`:1019-1021`).
+/// ferrolearn always materializes `mean`/`var_`/`scale_`/`n_samples_seen_`
+/// regardless of the flags, because the `&Array1<F>` getters cannot return
+/// `None` without changing their return type. The `with_mean`/`with_std` flags
+/// instead govern *application* in [`Transform::transform`] /
+/// [`FittedStandardScaler::inverse_transform`] (`if with_mean: X -= mean_`,
+/// `if with_std: X /= scale_`, `_data.py:1064-1067`), so the transform OUTPUT
+/// matches sklearn exactly. The getters are intentionally NOT `Option`.
 #[derive(Debug, Clone)]
 pub struct FittedStandardScaler<F> {
     /// Per-column means learned during fitting.
@@ -106,6 +177,16 @@ pub struct FittedStandardScaler<F> {
     ///
     /// Mirrors sklearn `StandardScaler.n_samples_seen_` (`_data.py:1013-1023`).
     pub(crate) n_samples_seen_: usize,
+    /// Whether `transform`/`inverse_transform` center (subtract/add the mean).
+    ///
+    /// Copied from the unfitted [`StandardScaler::with_mean`] in [`Fit::fit`];
+    /// governs `if with_mean: X -= mean_` (`_data.py:1064-1065`).
+    pub(crate) with_mean: bool,
+    /// Whether `transform`/`inverse_transform` scale (divide/multiply by scale).
+    ///
+    /// Copied from the unfitted [`StandardScaler::with_std`] in [`Fit::fit`];
+    /// governs `if with_std: X /= scale_` (`_data.py:1066-1067`).
+    pub(crate) with_std: bool,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
@@ -171,13 +252,19 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
         for (mut col, (&m, &s)) in out
             .columns_mut()
             .into_iter()
-            .zip(self.mean.iter().zip(self.std.iter()))
+            .zip(self.mean.iter().zip(self.scale_.iter()))
         {
-            // Constant (zero-variance) columns use an effective scale of 1,
-            // matching sklearn's `scale_` (`_data.py:88`, `:1106-1109`).
-            let s_eff = if s == F::zero() { F::one() } else { s };
+            // Conditional un-scale/un-center mirroring sklearn `inverse_transform`
+            // (`_data.py:1106-1109`): `if with_std: X *= scale_` then
+            // `if with_mean: X += mean_`. `scale_` has zero-variance columns
+            // replaced by 1 (`_handle_zeros_in_scale`, `_data.py:88`).
             for v in &mut col {
-                *v = *v * s_eff + m;
+                if self.with_std {
+                    *v = *v * s;
+                }
+                if self.with_mean {
+                    *v = *v + m;
+                }
             }
         }
         Ok(out)
@@ -238,6 +325,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
             var_: var_arr,
             scale_,
             n_samples_seen_: n_samples,
+            with_mean: self.with_mean,
+            with_std: self.with_std,
         })
     }
 }
@@ -269,14 +358,21 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedStandardSc
         for (mut col, (&m, &s)) in out
             .columns_mut()
             .into_iter()
-            .zip(self.mean.iter().zip(self.std.iter()))
+            .zip(self.mean.iter().zip(self.scale_.iter()))
         {
-            // Constant (zero-variance) columns use an effective scale of 1,
-            // matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,
-            // `:1019-1021`): `(x - mean) / 1 = 0` since `x == mean`.
-            let s_eff = if s == F::zero() { F::one() } else { s };
+            // Conditional center/scale mirroring sklearn `transform`
+            // (`_data.py:1064-1067`): `if with_mean: X -= mean_` then
+            // `if with_std: X /= scale_`. `scale_` already has zero-variance
+            // columns replaced by 1 (`_handle_zeros_in_scale`, `_data.py:88`),
+            // so a constant column maps to `(x - mean) / 1 = 0`. When
+            // `with_mean && with_std` this is byte-identical to the prior path.
             for v in &mut col {
-                *v = (*v - m) / s_eff;
+                if self.with_mean {
+                    *v = *v - m;
+                }
+                if self.with_std {
+                    *v = *v / s;
+                }
             }
         }
         Ok(out)
@@ -487,6 +583,108 @@ mod tests {
             fitted.std()[0] * fitted.std()[0],
             epsilon = 1e-12
         );
+        Ok(())
+    }
+
+    // sklearn 1.5.2 oracle (R-CHAR-3), X = [[1,10],[2,20],[3,30]]:
+    //   StandardScaler(with_mean=True,  with_std=True ).fit_transform(X)
+    //     -> [[-1.224744871391589,-1.224744871391589],[0,0],[1.224744871391589,1.224744871391589]]
+    //   StandardScaler(with_mean=True,  with_std=False).fit_transform(X)
+    //     -> [[-1,-10],[0,0],[1,10]]                       (center only)
+    //   StandardScaler(with_mean=False, with_std=True ).fit_transform(X)
+    //     -> [[1.224744871391589,1.224744871391589],
+    //         [2.449489742783178,2.449489742783178],
+    //         [3.6742346141747673,3.6742346141747673]]     (scale only)
+    //   StandardScaler(with_mean=False, with_std=False).fit_transform(X)
+    //     -> X                                              (identity)
+    #[test]
+    fn standard_scaler_with_mean_std_default_matches_sklearn() -> Result<(), FerroError> {
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
+        let scaler = StandardScaler::<f64>::new();
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        let expected = array![
+            [-1.224744871391589, -1.224744871391589],
+            [0.0, 0.0],
+            [1.224744871391589, 1.224744871391589]
+        ];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+
+        // Regression guard: default (with_mean=true, with_std=true) must be
+        // BYTE-identical to a plain default fit produced the same way.
+        let default_fitted = StandardScaler::<f64>::new().fit(&x, &())?;
+        let default_scaled = default_fitted.transform(&x)?;
+        for (a, b) in scaled.iter().zip(default_scaled.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_with_std_false() -> Result<(), FerroError> {
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
+        let scaler = StandardScaler::<f64>::new().with_with_std(false);
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        let expected = array![[-1.0, -10.0], [0.0, 0.0], [1.0, 10.0]];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_with_mean_false() -> Result<(), FerroError> {
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
+        let scaler = StandardScaler::<f64>::new().with_with_mean(false);
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        let expected = array![
+            [1.224744871391589, 1.224744871391589],
+            [2.449489742783178, 2.449489742783178],
+            [3.6742346141747673, 3.6742346141747673]
+        ];
+        for (a, b) in scaled.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-7);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_both_false_identity() -> Result<(), FerroError> {
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
+        let scaler = StandardScaler::<f64>::new()
+            .with_with_mean(false)
+            .with_with_std(false);
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        for (a, b) in scaled.iter().zip(x.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn standard_scaler_inverse_roundtrip_each_config() -> Result<(), FerroError> {
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]];
+        for &(with_mean, with_std) in &[(true, true), (true, false), (false, true), (false, false)]
+        {
+            let scaler = StandardScaler::<f64>::new()
+                .with_with_mean(with_mean)
+                .with_with_std(with_std);
+            let fitted = scaler.fit(&x, &())?;
+            let scaled = fitted.transform(&x)?;
+            let recovered = fitted.inverse_transform(&scaled)?;
+            for (a, b) in x.iter().zip(recovered.iter()) {
+                assert_abs_diff_eq!(a, b, epsilon = 1e-9);
+            }
+        }
         Ok(())
     }
 
