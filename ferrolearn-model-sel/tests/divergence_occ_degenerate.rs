@@ -65,7 +65,6 @@ fn mean_factory() -> PipelineFactory {
 // n_estimators()==0. This assertion (fit must be Err, mirroring the sklearn
 // raise) FAILS against the current implementation: ferrolearn returns Ok.
 #[test]
-#[ignore = "divergence: OCC fit succeeds with n_codes==0 where sklearn raises (multiclass.py:1215); tracking #1839"]
 fn divergence_occ_degenerate_zero_codes_should_error() {
     let x = Array2::<f64>::zeros((9, 2));
     let y = Array1::from(vec![0usize, 0, 0, 1, 1, 1, 2, 2, 2]); // k = 3

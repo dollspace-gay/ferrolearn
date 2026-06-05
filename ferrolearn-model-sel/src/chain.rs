@@ -299,8 +299,10 @@ fn fit_chain(
 /// via an error-correcting output code.
 ///
 /// `code_size` controls how many binary classifiers are trained:
-/// `n_codes = int(code_size * K)` (floor). `code_size > 0` is required.
-/// Each row of the code matrix is
+/// `n_codes = int(code_size * K)` (floor). `code_size > 0` is required, and it
+/// must be large enough that `int(code_size * K) >= 1` so that at least one
+/// binary classifier is trained; otherwise `fit` returns
+/// [`FerroError::InvalidParameter`]. Each row of the code matrix is
 /// the binary signature of one class; predictions are made by computing the
 /// row in the code matrix closest (in Hamming distance) to the per-classifier
 /// vote.
@@ -379,6 +381,21 @@ impl OutputCodeClassifier {
         // Matches sklearn `int(n_classes * code_size)` (multiclass.py:1189):
         // `as usize` truncates toward zero, = floor for the positive product.
         let n_codes = (self.code_size * k as f64) as usize;
+        // `0 < code_size` can still floor to zero codes (e.g. code_size=0.1,
+        // k=3 => int(0.30000000000000004)==0). sklearn then fits an empty
+        // code book and RAISES IndexError at multiclass.py:1215
+        // (`self.estimators_[0].n_features_in_`). Mirror that failure with a
+        // clean error rather than silently fitting zero binary classifiers.
+        if n_codes == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "code_size".into(),
+                reason: format!(
+                    "code_size * n_classes must be >= 1 to fit at least one binary \
+                     classifier (got code_size={}, n_classes={k} -> 0 classifiers)",
+                    self.code_size
+                ),
+            });
+        }
         let mut rng = match self.random_state {
             Some(seed) => SmallRng::seed_from_u64(seed),
             None => SmallRng::from_os_rng(),
