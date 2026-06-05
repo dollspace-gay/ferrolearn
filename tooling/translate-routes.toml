@@ -1221,3 +1221,12 @@ upstream = [
 ]
 design = ".design/numerical/interpolate.md"
 parity_ops = ["CubicSpline"]
+
+[[route]]
+crate_pattern = "ferrolearn-numerical/src/distributions.rs"
+upstream = [
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/stats/_continuous_distns.py",
+  "/home/doll/.local/lib/python3.13/site-packages/scipy/stats/__init__.py",
+]
+design = ".design/numerical/distributions.md"
+parity_ops = ["norm", "chi2", "f", "t", "beta", "gamma", "dirichlet", "chi2_sf", "f_sf", "norm_sf"]

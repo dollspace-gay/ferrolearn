@@ -26,6 +26,32 @@
 //!
 //! Several free functions compute common p-values used in ML hypothesis tests:
 //! [`chi2_sf`], [`f_sf`], [`t_test_two_tailed`], and [`norm_sf`].
+//!
+//! ## REQ status
+//!
+//! Mirrors `scipy.stats` continuous distributions (`scipy/stats/_continuous_distns.py`;
+//! live oracle scipy 1.17, version-stable math). Design doc:
+//! `.design/numerical/distributions.md` (13 REQs). Every REQ is BINARY (R-DEFER-2):
+//! SHIPPED or NOT-STARTED (with a concrete blocker). pdf/cdf/sf/ppf are oracle-verified
+//! element-wise (R-CHAR-3) — see `tests/divergence_distributions.rs`.
+//!
+//! **9 SHIPPED / 4 NOT-STARTED.**
+//!
+//! | REQ | Status | Notes |
+//! |---|---|---|
+//! | REQ-1 (Normal cdf/sf) | SHIPPED | FIXED #1965: `Normal::cdf`/`sf` now compute via `libm::erf`/`erfc` (machine precision: `cdf = 0.5(1+erf((x-μ)/(σ√2)))`, `sf = 0.5·erfc(...)`), replacing statrs's ~1e-11 erf approximation; matches `scipy.stats.norm` ≤1e-13. `pdf`/`ppf` unchanged (already exact). |
+//! | REQ-2 (ChiSquared) | SHIPPED | statrs `ChiSquared` pdf/cdf/sf/ppf match `scipy.stats.chi2` ≤1e-15. Guard `green_chi2`. |
+//! | REQ-3 (FDist) | SHIPPED | statrs `FisherSnedecor` matches `scipy.stats.f` incl. tail (rel 1.9e-15). Guard `green_f`. |
+//! | REQ-4 (StudentsT) | SHIPPED | statrs `StudentsT` matches `scipy.stats.t` incl. tail. Guard `green_t`. |
+//! | REQ-5 (Beta) | SHIPPED | statrs `Beta` matches `scipy.stats.beta` ≤1e-15. Guard `green_beta`. |
+//! | REQ-6 (Gamma + rate convention) | SHIPPED | statrs `Gamma(shape, rate)` matches `scipy.stats.gamma(a, scale=1/rate)` ≤1e-15 (rate=1/scale confirmed both directions). Guard `green_gamma_rate_convention`. |
+//! | REQ-7 (ppf / inverse_cdf) | SHIPPED | statrs `inverse_cdf` is machine-precision for chi2/f/t/beta/gamma (rel ≤3e-15) and closed-form for Normal — matches `scipy.stats.*.ppf`. |
+//! | REQ-8 (convenience p-value fns) | SHIPPED | `chi2_sf`/`f_sf`/`t_test_two_tailed`/`norm_sf` match scipy at valid params; `norm_sf` now machine-precision (via REQ-1); the three return `nan` on invalid params matching scipy (FIXED #1966, was panic). Guard `green_convenience_valid_params` + `red_*_invalid_df_returns_nan`. |
+//! | REQ-9 (Dirichlet ln_pdf) | SHIPPED | `ln_pdf` matches `scipy.stats.dirichlet.logpdf` ≤1e-14. Guard `green_dirichlet_logpdf`. (`sample` value parity is numpy-RNG-blocked, REQ-12.) |
+//! | REQ-10 (no-panic on invalid params) | NOT-STARTED | the convenience fns now return `nan` (#1966), but `unwrap_stat` (`mean`/`variance`) still `panic!` and `Dirichlet::ln_pdf`/`sample` still `assert!`/`expect` on user-reachable input (scipy returns nan). Blocker #1970. |
+//! | REQ-11 (FerroError error type) | NOT-STARTED | constructors return `Result<_, String>` not `FerroError`. Blocker #1967. |
+//! | REQ-12 (ferray substrate) | NOT-STARTED | `statrs`/`rand_distr` vs `ferray::stats`/`ferray::random` (R-SUBSTRATE-1). Blocker #1968. |
+//! | REQ-13 (production consumer) | NOT-STARTED | no non-test caller (model-sel uses a different `distributions` module). Blocker #1969. |
 
 use ndarray::Array1;
 use statrs::distribution::{self as sd, Continuous, ContinuousCDF};
@@ -88,10 +114,18 @@ fn unwrap_stat(opt: Option<f64>, name: &str, stat: &str) -> f64 {
 /// Wrapper around `statrs::distribution::Normal`.
 ///
 /// Represents a normal (Gaussian) distribution with given mean and standard
-/// deviation.
+/// deviation. The `pdf`/`ppf` forward to `statrs`, but `cdf`/`sf` are computed
+/// directly through `libm::erf`/`libm::erfc` for machine-precision parity with
+/// `scipy.stats.norm` (statrs's Gaussian cdf is an erf approximation accurate
+/// only to ~1e-11).
 #[derive(Debug, Clone)]
 pub struct Normal {
     inner: sd::Normal,
+    /// Mean of the distribution (retained for the `libm`-based cdf/sf).
+    mean: f64,
+    /// Standard deviation of the distribution (retained for the `libm`-based
+    /// cdf/sf).
+    std_dev: f64,
 }
 
 impl Normal {
@@ -103,7 +137,11 @@ impl Normal {
     /// is NaN.
     pub fn new(mean: f64, std_dev: f64) -> Result<Self, String> {
         sd::Normal::new(mean, std_dev)
-            .map(|inner| Self { inner })
+            .map(|inner| Self {
+                inner,
+                mean,
+                std_dev,
+            })
             .map_err(|e| format!("Normal::new failed: {e}"))
     }
 }
@@ -113,12 +151,22 @@ impl ContinuousDistribution for Normal {
         Continuous::pdf(&self.inner, x)
     }
 
+    /// Cumulative distribution function via `libm::erf` for machine-precision
+    /// parity with `scipy.stats.norm` (`scipy/stats/_continuous_distns.py:430`,
+    /// `_cdf` → Cephes `ndtr`). statrs's `Normal::cdf` uses an erf approximation
+    /// accurate to only ~1e-11; computing `0.5 * (1 + erf((x - μ)/(σ·√2)))`
+    /// directly through `libm::erf` matches scipy to machine precision.
     fn cdf(&self, x: f64) -> f64 {
-        ContinuousCDF::cdf(&self.inner, x)
+        0.5 * (1.0 + libm::erf((x - self.mean) / (self.std_dev * std::f64::consts::SQRT_2)))
     }
 
+    /// Survival function via `libm::erfc` for machine-precision parity with
+    /// `scipy.stats.norm` (`scipy/stats/_continuous_distns.py:436`, `_sf`).
+    /// Computes `0.5 * erfc((x - μ)/(σ·√2))` directly through `libm::erfc`,
+    /// which is machine-precision in the tail (unlike statrs's `1 - cdf` erf
+    /// approximation).
     fn sf(&self, x: f64) -> f64 {
-        ContinuousCDF::sf(&self.inner, x)
+        0.5 * libm::erfc((x - self.mean) / (self.std_dev * std::f64::consts::SQRT_2))
     }
 
     fn ppf(&self, p: f64) -> f64 {
@@ -547,12 +595,13 @@ impl Dirichlet {
 /// Returns the p-value for a chi-squared test statistic `x` with `df`
 /// degrees of freedom.
 ///
-/// # Panics
-///
-/// Panics if `df` is not positive.
+/// Returns [`f64::NAN`] for invalid parameters (non-positive `df`),
+/// matching `scipy.stats.chi2.sf` (e.g. `chi2.sf(5, -1) -> nan`).
 pub fn chi2_sf(x: f64, df: f64) -> f64 {
-    let d = ChiSquared::new(df).expect("chi2_sf: invalid df");
-    d.sf(x)
+    match ChiSquared::new(df) {
+        Ok(d) => d.sf(x),
+        Err(_) => f64::NAN,
+    }
 }
 
 /// Survival function (1 - CDF) for the F-distribution.
@@ -560,12 +609,13 @@ pub fn chi2_sf(x: f64, df: f64) -> f64 {
 /// Returns the p-value for an F-test statistic `x` with `df1` and `df2`
 /// degrees of freedom.
 ///
-/// # Panics
-///
-/// Panics if either `df1` or `df2` is not positive.
+/// Returns [`f64::NAN`] for invalid parameters (non-positive `df1`/`df2`),
+/// matching `scipy.stats.f.sf` (e.g. `f.sf(3, -1, 10) -> nan`).
 pub fn f_sf(x: f64, df1: f64, df2: f64) -> f64 {
-    let d = FDist::new(df1, df2).expect("f_sf: invalid degrees of freedom");
-    d.sf(x)
+    match FDist::new(df1, df2) {
+        Ok(d) => d.sf(x),
+        Err(_) => f64::NAN,
+    }
 }
 
 /// Two-tailed p-value for a t-test statistic.
@@ -573,12 +623,13 @@ pub fn f_sf(x: f64, df1: f64, df2: f64) -> f64 {
 /// Returns `2 * P(T > |t_stat|)` where `T` follows a Student's
 /// t-distribution with `df` degrees of freedom.
 ///
-/// # Panics
-///
-/// Panics if `df` is not positive.
+/// Returns [`f64::NAN`] for invalid parameters (non-positive `df`),
+/// matching `scipy.stats` (e.g. `2 * t.sf(2, -1) -> nan`).
 pub fn t_test_two_tailed(t_stat: f64, df: f64) -> f64 {
-    let d = StudentsT::new(df).expect("t_test_two_tailed: invalid df");
-    2.0 * d.sf(t_stat.abs())
+    match StudentsT::new(df) {
+        Ok(d) => 2.0 * d.sf(t_stat.abs()),
+        Err(_) => f64::NAN,
+    }
 }
 
 /// Survival function (1 - CDF) for the standard normal distribution.
