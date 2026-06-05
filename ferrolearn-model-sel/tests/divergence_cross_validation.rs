@@ -361,7 +361,6 @@ impl CrossValidator for NonPartitionCv {
 /// returns `Ok`. The `NonPartitionCv` above omits sample 0; this pin asserts
 /// ferrolearn returns `Err` (the sklearn contract), so it FAILS today.
 #[test]
-#[ignore = "divergence: cross_val_predict 0.0-fills omitted samples on a non-partition cv; sklearn raises ValueError; tracking #1793"]
 fn pin_1793_cross_val_predict_non_partition_must_error() {
     let x = Array2::<f64>::zeros((10, 2));
     let y: Array1<f64> = Array1::from_iter((0..10).map(f64::from));

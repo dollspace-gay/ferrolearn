@@ -734,6 +734,13 @@ pub fn cross_validate(
 /// # Errors
 ///
 /// Propagates any error from fold splitting, model fitting, or predicting.
+/// Additionally, mirroring scikit-learn's `_check_is_permutation`
+/// (`sklearn/model_selection/_validation.py:1054`), the per-fold test indices
+/// MUST form a partition (permutation) of `0..n_samples`: every sample must
+/// appear in exactly one test fold. If the `cv` is not a partition (a sample is
+/// never tested, or is tested more than once, or an index is out of range),
+/// returns `Err(FerroError::InvalidParameter)` rather than silently 0.0-filling
+/// untested samples.
 pub fn cross_val_predict(
     pipeline: &Pipeline,
     x: &Array2<f64>,
@@ -751,6 +758,36 @@ pub fn cross_val_predict(
     }
 
     let folds = cv.fold_indices(n_samples)?;
+
+    // Mirror scikit-learn's `_check_is_permutation` (`_validation.py:1054`):
+    // the concatenated per-fold test indices must be a permutation of
+    // `0..n_samples` (every sample tested exactly once). Otherwise sklearn
+    // raises `ValueError("cross_val_predict only works for partitions")`; we
+    // map that to `InvalidParameter` (R-DEV-2) instead of silently 0.0-filling
+    // untested samples.
+    let mut covered = vec![false; n_samples];
+    for (_, test_idx) in &folds {
+        for &i in test_idx {
+            if i >= n_samples || covered[i] {
+                return Err(FerroError::InvalidParameter {
+                    name: "cv".into(),
+                    reason: "cross_val_predict only works for partitions \
+                             (each sample must appear in exactly one test fold)"
+                        .into(),
+                });
+            }
+            covered[i] = true;
+        }
+    }
+    if covered.iter().any(|&c| !c) {
+        return Err(FerroError::InvalidParameter {
+            name: "cv".into(),
+            reason: "cross_val_predict only works for partitions \
+                     (each sample must appear in exactly one test fold)"
+                .into(),
+        });
+    }
+
     let n_features = x.ncols();
 
     let mut predictions = Array1::<f64>::zeros(n_samples);
