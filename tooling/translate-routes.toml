@@ -1321,3 +1321,13 @@ upstream = [
 ]
 design = ".design/python/transformers.md"
 parity_ops = ["StandardScaler", "PCA"]
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/regressors.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/_base.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_ridge.py",
+  "/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py",
+]
+design = ".design/python/regressors.md"
+parity_ops = ["LinearRegression", "Ridge", "Lasso", "ElasticNet"]

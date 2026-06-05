@@ -93,7 +93,7 @@ class Ridge(RegressorMixin, BaseEstimator):
         Whether to calculate the intercept for this model.
     """
 
-    def __init__(self, *, alpha=1.0, fit_intercept=True):
+    def __init__(self, alpha=1.0, *, fit_intercept=True):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
 
@@ -138,7 +138,7 @@ class Lasso(RegressorMixin, BaseEstimator):
         Whether to calculate the intercept for this model.
     """
 
-    def __init__(self, *, alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=True):
+    def __init__(self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True):
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
@@ -194,7 +194,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
     """
 
     def __init__(
-        self, *, alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True
+        self, alpha=1.0, *, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True
     ):
         self.alpha = alpha
         self.l1_ratio = l1_ratio
