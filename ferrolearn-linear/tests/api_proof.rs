@@ -89,7 +89,7 @@ fn api_proof_linear_regression() {
     let f = m.fit(&x, &y).unwrap();
     let preds = f.predict(&x).unwrap();
     assert_eq!(preds.len(), 10);
-    let r2 = f.score(&x, &y).unwrap();
+    let r2 = f.score(&x, &y, None).unwrap();
     assert!(r2 > 0.99);
 }
 
@@ -99,7 +99,7 @@ fn api_proof_ridge_family() {
 
     let f = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y).unwrap();
     let _ = f.predict(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 
     let f_cv = RidgeCV::<f64>::new()
         .with_alphas(vec![0.1, 1.0, 10.0])
@@ -108,7 +108,7 @@ fn api_proof_ridge_family() {
         .fit(&x, &y)
         .unwrap();
     let _ = f_cv.predict(&x).unwrap();
-    let _ = f_cv.score(&x, &y).unwrap();
+    let _ = f_cv.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -116,14 +116,14 @@ fn api_proof_lasso_family() {
     let (x, y) = regression_data();
     let f = Lasso::<f64>::new().with_alpha(0.01).fit(&x, &y).unwrap();
     let _ = f.predict(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 
     let f_cv = LassoCV::<f64>::new()
         .with_n_alphas(5)
         .with_cv(3)
         .fit(&x, &y)
         .unwrap();
-    let _ = f_cv.score(&x, &y).unwrap();
+    let _ = f_cv.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -134,9 +134,9 @@ fn api_proof_elastic_net_family() {
         .with_l1_ratio(0.5)
         .fit(&x, &y)
         .unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
     let f_cv = ElasticNetCV::<f64>::new().fit(&x, &y).unwrap();
-    let _ = f_cv.score(&x, &y).unwrap();
+    let _ = f_cv.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -146,12 +146,12 @@ fn api_proof_bayesian_ridge_and_ard() {
         .with_max_iter(50)
         .fit(&x, &y)
         .unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
     let f2 = ARDRegression::<f64>::new()
         .with_max_iter(50)
         .fit(&x, &y)
         .unwrap();
-    let _ = f2.score(&x, &y).unwrap();
+    let _ = f2.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -162,12 +162,12 @@ fn api_proof_huber_and_quantile() {
         .with_alpha(1e-4)
         .fit(&x, &y)
         .unwrap();
-    let _ = h.score(&x, &y).unwrap();
+    let _ = h.score(&x, &y, None).unwrap();
     let q = QuantileRegressor::<f64>::new()
         .with_quantile(0.5)
         .fit(&x, &y)
         .unwrap();
-    let _ = q.score(&x, &y).unwrap();
+    let _ = q.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -199,12 +199,12 @@ fn api_proof_lars_family() {
         .with_n_nonzero_coefs(1)
         .fit(&x, &y)
         .unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
     let f2 = LassoLars::<f64>::new()
         .with_alpha(0.01)
         .fit(&x, &y)
         .unwrap();
-    let _ = f2.score(&x, &y).unwrap();
+    let _ = f2.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -214,7 +214,7 @@ fn api_proof_omp() {
         .with_n_nonzero_coefs(1)
         .fit(&x, &y)
         .unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -228,7 +228,7 @@ fn api_proof_ransac() {
         .fit(&x, &y)
         .unwrap();
     let _ = f.predict(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 }
 
 // =============================================================================
@@ -249,7 +249,7 @@ fn api_proof_logistic_regression() {
     let _ = f.predict_log_proba(&x).unwrap();
     let dec = f.decision_function(&x).unwrap();
     assert_eq!(dec.dim(), (10, 1));
-    assert!(f.score(&x, &y).unwrap() > 0.9);
+    assert!(f.score(&x, &y, None).unwrap() > 0.9);
     assert_eq!(f.classes(), &[0, 1]);
 }
 
@@ -267,7 +267,7 @@ fn api_proof_logistic_regression_cv() {
     assert_proba_well_formed(&proba, 10, 2);
     let _ = f.predict_log_proba(&x).unwrap();
     let _ = f.decision_function(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
     let _ = f.best_c();
     let _ = f.cv_scores();
 }
@@ -283,7 +283,7 @@ fn api_proof_lda() {
     let _ = f.predict_log_proba(&x).unwrap();
     let dec = f.decision_function(&x).unwrap();
     assert_eq!(dec.dim(), (10, 2));
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
     let _ = f.scalings();
     let _ = f.means();
     let _ = f.explained_variance_ratio();
@@ -299,7 +299,7 @@ fn api_proof_qda() {
     assert_proba_well_formed(&proba, 10, 2);
     let _ = f.predict_log_proba(&x).unwrap();
     let _ = f.decision_function(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -313,7 +313,7 @@ fn api_proof_ridge_classifier() {
     let _ = f.predict(&x).unwrap();
     let dec = f.decision_function(&x).unwrap();
     assert_eq!(dec.nrows(), 10);
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 }
 
 #[test]
@@ -329,7 +329,7 @@ fn api_proof_sgd_classifier_and_regressor() {
         .with_random_state(42);
     let f = cls.fit(&x, &y_cls).unwrap();
     let _ = f.predict(&x).unwrap();
-    let _ = f.score(&x, &y_cls).unwrap();
+    let _ = f.score(&x, &y_cls, None).unwrap();
 
     let reg = SGDRegressor::<f64>::new()
         .with_loss(RegressorLoss::SquaredError)
@@ -339,7 +339,7 @@ fn api_proof_sgd_classifier_and_regressor() {
         .with_random_state(42);
     let f = reg.fit(&xr, &yr).unwrap();
     let _ = f.predict(&xr).unwrap();
-    let _ = f.score(&xr, &yr).unwrap();
+    let _ = f.score(&xr, &yr, None).unwrap();
 }
 
 // =============================================================================
@@ -362,7 +362,7 @@ fn api_proof_linear_svc() {
         let dec = f.decision_function(&x).unwrap();
         assert_eq!(dec.n_samples(), 10);
         assert!(dec.as_binary().is_some());
-        let _ = f.score(&x, &y).unwrap();
+        let _ = f.score(&x, &y, None).unwrap();
     }
 }
 
@@ -380,7 +380,7 @@ fn api_proof_linear_svr() {
             .fit(&x, &y)
             .unwrap();
         let _ = f.predict(&x).unwrap();
-        let _ = f.score(&x, &y).unwrap();
+        let _ = f.score(&x, &y, None).unwrap();
     }
 }
 
@@ -398,7 +398,7 @@ fn api_proof_kernel_svm_family() {
     let f = svc.fit(&x, &y).unwrap();
     let _ = f.predict(&x).unwrap();
     let _ = f.decision_function(&x).unwrap();
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 
     let svr = SVR::new(RbfKernel::with_gamma(0.5))
         .with_c(1.0)
@@ -406,7 +406,7 @@ fn api_proof_kernel_svm_family() {
         .with_max_iter(200);
     let f = svr.fit(&xr, &yr).unwrap();
     let _ = f.predict(&xr).unwrap();
-    let _ = f.score(&xr, &yr).unwrap();
+    let _ = f.score(&xr, &yr, None).unwrap();
 
     let nusvc = NuSVC::new(LinearKernel).with_nu(0.5).with_max_iter(200);
     let f = nusvc.fit(&x, &y).unwrap();
@@ -439,7 +439,7 @@ fn api_proof_isotonic_regression() {
         .unwrap();
     let preds = f.predict(&x).unwrap();
     assert_eq!(preds.len(), 6);
-    let _ = f.score(&x, &y).unwrap();
+    let _ = f.score(&x, &y, None).unwrap();
 }
 
 // =============================================================================

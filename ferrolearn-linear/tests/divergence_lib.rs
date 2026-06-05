@@ -7,7 +7,7 @@
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::{QDA, RegressorScore};
+use ferrolearn_linear::{ClassifierScore, QDA, RegressorScore};
 use ndarray::{Array1, Array2, array};
 
 /// A minimal regressor whose `predict` returns predictions supplied by the
@@ -20,6 +20,22 @@ struct FixedRegressor {
 
 impl Predict<Array2<f64>> for FixedRegressor {
     type Output = Array1<f64>;
+    type Error = FerroError;
+
+    fn predict(&self, _x: &Array2<f64>) -> Result<Self::Output, Self::Error> {
+        Ok(self.preds.clone())
+    }
+}
+
+/// A minimal classifier whose `predict` returns class labels supplied by the
+/// test, reaching the `pub(crate)` `weighted_accuracy` helper through the
+/// public `ClassifierScore::score` blanket impl.
+struct FixedClassifier {
+    preds: Array1<usize>,
+}
+
+impl Predict<Array2<f64>> for FixedClassifier {
+    type Output = Array1<usize>;
     type Error = FerroError;
 
     fn predict(&self, _x: &Array2<f64>) -> Result<Self::Output, Self::Error> {
@@ -59,7 +75,7 @@ fn divergence_r2_constant_ytrue_nonzero_residual_returns_zero() {
     let x = Array2::<f64>::zeros((3, 1)); // ignored by FixedRegressor
     let y = Array1::from(vec![5.0_f64, 5.0, 5.0]); // constant y_true
 
-    let score = reg.score(&x, &y).expect("score should succeed");
+    let score = reg.score(&x, &y, None).expect("score should succeed");
 
     assert_eq!(
         score, SK_R2_CONST_Y_RESID,
@@ -84,7 +100,7 @@ fn r2_constant_ytrue_zero_residual_returns_one() {
     let x = Array2::<f64>::zeros((3, 1));
     let y = Array1::from(vec![5.0_f64, 5.0, 5.0]);
 
-    let score = reg.score(&x, &y).expect("score should succeed");
+    let score = reg.score(&x, &y, None).expect("score should succeed");
 
     assert_eq!(score, SK_R2_CONST_Y_PERFECT);
 }
@@ -106,7 +122,7 @@ fn r2_in_regime_matches_oracle() {
     let x = Array2::<f64>::zeros((4, 1));
     let y = Array1::from(vec![3.0_f64, 5.0, 2.0, 7.0]);
 
-    let score = reg.score(&x, &y).expect("score should succeed");
+    let score = reg.score(&x, &y, None).expect("score should succeed");
 
     assert!(
         (score - SK_R2_IN_REGIME).abs() < 1e-8,
@@ -175,4 +191,98 @@ fn divergence_log_proba_zero_clamps_instead_of_neg_inf() {
          (discriminant_analysis.py:1059), ferrolearn clamp gives {} (tracking #1105)",
         logp[[0, 0]],
     );
+}
+
+/// REQ-6: `ClassifierScore::score(x, y, Some(w))` returns the *weighted* mean
+/// accuracy `Σ wᵢ·[predᵢ==yᵢ] / Σ wᵢ`, matching sklearn `ClassifierMixin.score`
+/// → `accuracy_score(y, pred, sample_weight=w)` (`base.py:738-764`).
+///
+/// Live oracle (sklearn 1.5.2), NOT copied from ferrolearn:
+///   python3 -c "import numpy as np; from sklearn.metrics import accuracy_score;
+///     print(accuracy_score(np.array([0,1,1,0,1]), np.array([0,1,0,0,1]),
+///                          sample_weight=np.array([1.,2.,3.,1.,1.])))"  -> 0.625
+/// Here predictions = [0,1,0,0,1], y_true = [0,1,1,0,1], weights = [1,2,3,1,1].
+#[test]
+fn classifier_score_weighted_matches_sklearn() {
+    const SK_WEIGHTED_ACC: f64 = 0.625;
+
+    let clf = FixedClassifier {
+        preds: Array1::from(vec![0usize, 1, 0, 0, 1]),
+    };
+    let x = Array2::<f64>::zeros((5, 1)); // ignored by FixedClassifier
+    let y = Array1::from(vec![0usize, 1, 1, 0, 1]);
+    let w = Array1::from(vec![1.0_f64, 2.0, 3.0, 1.0, 1.0]);
+
+    let score = clf
+        .score(&x, &y, Some(&w))
+        .expect("weighted score should succeed");
+
+    assert!(
+        (score - SK_WEIGHTED_ACC).abs() < 1e-12,
+        "weighted accuracy: sklearn {SK_WEIGHTED_ACC}, ferrolearn {score}",
+    );
+}
+
+/// REQ-6: `RegressorScore::score(x, y, Some(w))` returns the *weighted* R²,
+/// `1 − Σwᵢ(yᵢ−predᵢ)² / Σwᵢ(yᵢ−ȳ_w)²`, matching sklearn `RegressorMixin.score`
+/// → `r2_score(y, pred, sample_weight=w)` (`base.py:805-849`).
+///
+/// Live oracle (sklearn 1.5.2), NOT copied from ferrolearn:
+///   python3 -c "import numpy as np; from sklearn.metrics import r2_score;
+///     print(r2_score(np.array([1.,2.,3.,4.,5.]), np.array([1.1,1.9,3.2,3.7,5.1]),
+///                    sample_weight=np.array([1.,2.,3.,1.,1.])))"
+///     -> 0.9770114942528736
+/// Here y_true = [1,2,3,4,5], y_pred = [1.1,1.9,3.2,3.7,5.1], weights = [1,2,3,1,1].
+#[test]
+fn regressor_score_weighted_matches_sklearn() {
+    const SK_WEIGHTED_R2: f64 = 0.9770114942528736;
+
+    let reg = FixedRegressor {
+        preds: Array1::from(vec![1.1_f64, 1.9, 3.2, 3.7, 5.1]),
+    };
+    let x = Array2::<f64>::zeros((5, 1));
+    let y = Array1::from(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0]);
+    let w = Array1::from(vec![1.0_f64, 2.0, 3.0, 1.0, 1.0]);
+
+    let score = reg
+        .score(&x, &y, Some(&w))
+        .expect("weighted score should succeed");
+
+    assert!(
+        (score - SK_WEIGHTED_R2).abs() < 1e-12,
+        "weighted R^2: sklearn {SK_WEIGHTED_R2}, ferrolearn {score}",
+    );
+}
+
+/// REQ-6 regression guard: `score(x, y, None)` is byte-identical to the legacy
+/// unweighted result. Reuses the in-regime fixture from
+/// `r2_in_regime_matches_oracle` (oracle 0.9152542372881356) and asserts the
+/// `None` path equals it exactly — proving `None` did not change behavior.
+#[test]
+fn score_none_sample_weight_equals_unweighted() {
+    let reg = FixedRegressor {
+        preds: Array1::from(vec![2.5_f64, 5.0, 2.0, 8.0]),
+    };
+    let x = Array2::<f64>::zeros((4, 1));
+    let y = Array1::from(vec![3.0_f64, 5.0, 2.0, 7.0]);
+
+    let none_score = reg.score(&x, &y, None).expect("score None should succeed");
+
+    // Unweighted oracle value (live sklearn r2_score([3,5,2,7],[2.5,5,2,8])).
+    const SK_R2_IN_REGIME: f64 = 0.9152542372881356;
+    assert_eq!(
+        none_score, SK_R2_IN_REGIME,
+        "score(x, y, None) must be byte-identical to the unweighted R^2",
+    );
+
+    // And the classifier None path equals the plain (correct/n) accuracy.
+    let clf = FixedClassifier {
+        preds: Array1::from(vec![0usize, 1, 0, 0, 1]),
+    };
+    let yc = Array1::from(vec![0usize, 1, 1, 0, 1]);
+    let acc_none = clf
+        .score(&Array2::<f64>::zeros((5, 1)), &yc, None)
+        .expect("classifier None score");
+    // 4 of 5 correct (index 2 differs) -> 0.8.
+    assert_eq!(acc_none, 0.8_f64);
 }

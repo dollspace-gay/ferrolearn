@@ -49,8 +49,8 @@
 //! Per-estimator REQs live in the sibling modules' own routed docs. Score traits
 //! (`ClassifierScore`/`RegressorScore`) are pre-existing crate-root `pub trait`s re-exported
 //! via the meta-crate (`ferrolearn::linear`) — grandfathered public API (goal.md S5); honest
-//! underclaim (R-HONEST-3): no production `.score()` caller yet, and `sample_weight` is
-//! unsupported (REQ-6).
+//! underclaim (R-HONEST-3): no production `.score()` caller yet. `sample_weight` is
+//! supported via the `Option<&Array1<F>>` last param on both traits (REQ-6, #1106).
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -59,7 +59,7 @@
 //! | REQ-3 (`RegressorScore::score` == in-regime R²) | SHIPPED | `RegressorScore` blanket impl body `r2_score` = `1 − ss_res/ss_tot` mirrors `RegressorMixin.score` → `metrics.r2_score` (`base.py:805-849`); matches live oracle `r2_score([3.,5.,2.,7.],[2.5,5.,2.,8.])=0.9152542372881356` (`r2_in_regime_matches_oracle`). Consumer: grandfathered re-export (S5). |
 //! | REQ-4 (constant-y R² edge parity) | SHIPPED | FIXED #1104. `r2_score` now returns `0.0` (was `neg_infinity()`) when `ss_tot==0 ∧ ss_res!=0`, matching `metrics.r2_score` (`_regression.py:891`); zero-residual stays `1.0`. Green: `divergence_r2_constant_ytrue_nonzero_residual_returns_zero` + `r2_constant_ytrue_zero_residual_returns_one`. |
 //! | REQ-5 (`log_proba` behind predict_log_proba) | SHIPPED | FIXED #1105. `log_proba` is now the unclamped `p.ln()`, matching sklearn `predict_log_proba = np.log(predict_proba)` (`discriminant_analysis.py:1059`); `0.0`→`-inf`. Consumers: `logistic_regression.rs`/`logistic_regression_cv.rs`/`qda.rs` `predict_log_proba`. Green: `divergence_log_proba_zero_clamps_instead_of_neg_inf`. |
-//! | REQ-6 (sample_weight on score) | NOT-STARTED | open prereq blocker #1106. The score traits take only `(&self, x, y)`; sklearn `score(self, X, y, sample_weight=None)` (`base.py:738`,`:805`) forwards `sample_weight` into `accuracy_score`/`r2_score`. |
+//! | REQ-6 (sample_weight on score) | SHIPPED | FIXED #1106. Both score traits now take `sample_weight: Option<&Array1<F>>` as the LAST param, matching sklearn `score(self, X, y, sample_weight=None)` (`base.py:738`,`:805`). `ClassifierScore::score` → `weighted_accuracy` (`Σ wᵢ·[predᵢ==yᵢ] / Σ wᵢ`, the `accuracy_score(..., sample_weight=w)` analog); `RegressorScore::score` → `weighted_r2_score` (`1 − Σwᵢ(yᵢ−predᵢ)² / Σwᵢ(yᵢ−ȳ_w)²`, ȳ_w = `Σwᵢyᵢ/Σwᵢ`, the `r2_score(..., sample_weight=w)` analog). `None` is byte-identical to `mean_accuracy`/`r2_score`. Oracle-verified (live sklearn 1.5.2): `weighted_accuracy([0,1,0,0,1],[0,1,1,0,1],[1,2,3,1,1])=0.625`, `weighted_r2_score([1.1,1.9,3.2,3.7,5.1],[1,2,3,4,5],[1,2,3,1,1])=0.9770114942528736` in `tests/divergence_lib.rs` (`classifier_score_weighted_matches_sklearn`, `regressor_score_weighted_matches_sklearn`, `score_none_sample_weight_equals_unweighted`). |
 //! | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker #1107. Helpers + score traits run on `ndarray::{Array1,Array2}` + `num_traits::Float`, not `ferray-core` arrays (R-SUBSTRATE-1). |
 
 pub mod ard;
@@ -141,13 +141,24 @@ use num_traits::Float;
 /// `fitted.score(&x, &y)` and get the same result as sklearn's
 /// `ClassifierMixin.score`.
 pub trait ClassifierScore<F: Float> {
-    /// Mean accuracy on the given test data and labels.
+    /// (Optionally weighted) mean accuracy on the given test data and labels.
+    ///
+    /// Mirrors sklearn `ClassifierMixin.score(self, X, y, sample_weight=None)`
+    /// (`base.py:738`) → `accuracy_score(y, predict(X), sample_weight=...)`.
+    /// Passing `None` for `sample_weight` reproduces the unweighted
+    /// `correct / n` accuracy.
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`,
-    /// or any error forwarded from the inner `predict`.
-    fn score(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<F, FerroError>;
+    /// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`, or if a
+    /// non-`None` `sample_weight` has a length other than `y.len()`, or any
+    /// error forwarded from the inner `predict`.
+    fn score(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<F, FerroError>;
 }
 
 impl<T, F> ClassifierScore<F> for T
@@ -155,7 +166,12 @@ where
     T: Predict<Array2<F>, Output = Array1<usize>, Error = FerroError>,
     F: Float,
 {
-    fn score(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<F, FerroError> {
+    fn score(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<F, FerroError> {
         if x.nrows() != y.len() {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![x.nrows()],
@@ -164,7 +180,7 @@ where
             });
         }
         let preds = self.predict(x)?;
-        Ok(mean_accuracy(&preds, y))
+        weighted_accuracy(&preds, y, sample_weight)
     }
 }
 
@@ -174,13 +190,24 @@ where
 /// Users just `use ferrolearn_linear::RegressorScore;` to call
 /// `fitted.score(&x, &y)`.
 pub trait RegressorScore<F: Float> {
-    /// R² coefficient of determination on the given test data and targets.
+    /// (Optionally weighted) R² coefficient of determination on the given test
+    /// data and targets.
+    ///
+    /// Mirrors sklearn `RegressorMixin.score(self, X, y, sample_weight=None)`
+    /// (`base.py:805`) → `r2_score(y, predict(X), sample_weight=...)`. Passing
+    /// `None` for `sample_weight` reproduces the unweighted `1 − SSres/SStot`.
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`,
-    /// or any error forwarded from the inner `predict`.
-    fn score(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError>;
+    /// Returns [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`, or if a
+    /// non-`None` `sample_weight` has a length other than `y.len()`, or any
+    /// error forwarded from the inner `predict`.
+    fn score(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<F, FerroError>;
 }
 
 impl<T, F> RegressorScore<F> for T
@@ -188,7 +215,12 @@ where
     T: Predict<Array2<F>, Output = Array1<F>, Error = FerroError>,
     F: Float,
 {
-    fn score(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError> {
+    fn score(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<F, FerroError> {
         if x.nrows() != y.len() {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![x.nrows()],
@@ -197,7 +229,7 @@ where
             });
         }
         let preds = self.predict(x)?;
-        Ok(r2_score(&preds, y))
+        weighted_r2_score(&preds, y, sample_weight)
     }
 }
 
@@ -215,7 +247,49 @@ pub(crate) fn mean_accuracy<F: Float>(predictions: &Array1<usize>, targets: &Arr
         .zip(targets.iter())
         .filter(|(p, t)| p == t)
         .count();
-    F::from(correct).unwrap() / F::from(n).unwrap()
+    F::from(correct).map_or(F::zero(), |c| c / F::from(n).unwrap_or(F::one()))
+}
+
+/// (Optionally) weighted mean accuracy:
+/// `sum_i(w_i · [pred_i == y_i]) / sum_i(w_i)`.
+///
+/// Mirrors sklearn `ClassifierMixin.score` → `accuracy_score(y, pred,
+/// sample_weight=...)` (`base.py:738-764`; `metrics._classification.accuracy_score`
+/// forwards `sample_weight` into `_weighted_sum`). When `sample_weight` is
+/// `None`, the result is byte-identical to [`mean_accuracy`] (`correct / n`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if a non-`None` `sample_weight` has a
+/// length other than `targets.len()`.
+pub(crate) fn weighted_accuracy<F: Float>(
+    predictions: &Array1<usize>,
+    targets: &Array1<usize>,
+    sample_weight: Option<&Array1<F>>,
+) -> Result<F, FerroError> {
+    let Some(w) = sample_weight else {
+        return Ok(mean_accuracy(predictions, targets));
+    };
+    let n = targets.len();
+    if w.len() != n {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n],
+            actual: vec![w.len()],
+            context: "sample_weight length must match number of samples".into(),
+        });
+    }
+    if n == 0 {
+        return Ok(F::zero());
+    }
+    let mut num = F::zero();
+    let mut den = F::zero();
+    for i in 0..n {
+        den = den + w[i];
+        if predictions[i] == targets[i] {
+            num = num + w[i];
+        }
+    }
+    Ok(num / den)
 }
 
 /// R² coefficient of determination: `1 - SSres / SStot`. Used as the
@@ -247,6 +321,66 @@ pub(crate) fn r2_score<F: Float>(y_pred: &Array1<F>, y_true: &Array1<F>) -> F {
         }
     } else {
         F::one() - ss_res / ss_tot
+    }
+}
+
+/// (Optionally) weighted R² coefficient of determination:
+/// `1 − SSres_w / SStot_w`, where `SSres_w = Σ w_i·(y_i − pred_i)²`,
+/// `SStot_w = Σ w_i·(y_i − ȳ_w)²`, and `ȳ_w = Σ w_i·y_i / Σ w_i`.
+///
+/// Mirrors sklearn `RegressorMixin.score` → `r2_score(y, pred,
+/// sample_weight=...)` (`base.py:805-849`; `metrics._regression.r2_score`
+/// weights both numerator and denominator by `sample_weight`). When
+/// `sample_weight` is `None`, the result is byte-identical to [`r2_score`].
+/// The constant-`y` edge (`SStot_w == 0`) matches the unweighted convention:
+/// `1.0` if the (weighted) residual is also `0`, else `0.0`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if a non-`None` `sample_weight` has a
+/// length other than `y_true.len()`.
+pub(crate) fn weighted_r2_score<F: Float>(
+    y_pred: &Array1<F>,
+    y_true: &Array1<F>,
+    sample_weight: Option<&Array1<F>>,
+) -> Result<F, FerroError> {
+    let Some(w) = sample_weight else {
+        return Ok(r2_score(y_pred, y_true));
+    };
+    let n = y_true.len();
+    if w.len() != n {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n],
+            actual: vec![w.len()],
+            context: "sample_weight length must match number of samples".into(),
+        });
+    }
+    if n == 0 {
+        return Ok(F::zero());
+    }
+    let mut w_sum = F::zero();
+    let mut wy_sum = F::zero();
+    for i in 0..n {
+        w_sum = w_sum + w[i];
+        wy_sum = wy_sum + w[i] * y_true[i];
+    }
+    let mean = wy_sum / w_sum;
+    let mut ss_res = F::zero();
+    let mut ss_tot = F::zero();
+    for i in 0..n {
+        let r = y_true[i] - y_pred[i];
+        let t = y_true[i] - mean;
+        ss_res = ss_res + w[i] * r * r;
+        ss_tot = ss_tot + w[i] * t * t;
+    }
+    if ss_tot == F::zero() {
+        if ss_res == F::zero() {
+            Ok(F::one())
+        } else {
+            Ok(F::zero())
+        }
+    } else {
+        Ok(F::one() - ss_res / ss_tot)
     }
 }
 
