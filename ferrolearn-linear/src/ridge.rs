@@ -27,7 +27,7 @@
 //! | REQ-7 (per-target alpha array) | NOT-STARTED | #385. |
 //! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
 //! | REQ-9 (positive=True) | NOT-STARTED | #387. |
-//! | REQ-10 (max_iter/tol + n_iter_) | NOT-STARTED | #388. |
+//! | REQ-10 (max_iter/tol + n_iter_) | SHIPPED | `Ridge<F>` adds `pub max_iter: Option<usize>` (default `None`) and `pub tol: F` (default `1e-4`) with `with_max_iter`/`with_tol` builders. `FittedRidge<F>` adds `n_iter_: Option<usize>` (always `None` for the direct Cholesky solver) with `pub fn n_iter(&self) -> Option<usize>`. Mirrors sklearn ctor `max_iter=None, tol=1e-4` (`_ridge.py:899-900`) and `n_iter_` set at `_ridge.py:994`; `max_iter`/`tol` are no-ops for the direct solver (closed-form normal equations, no iteration) — matching sklearn's direct `cholesky`/`svd` paths which also yield `n_iter_=None`. Test: `ridge_max_iter_tol_niter_defaults_and_builders`. Closes #388. |
 //! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
 //! | REQ-12 (copy_X/random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders. `copy_x` ABI-only (fit never mutates `x`); `random_state` stored-but-no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
@@ -89,14 +89,29 @@ pub struct Ridge<F> {
     /// for ABI parity and has no effect on the computed coefficients.
     /// Default `None`, matching sklearn's `random_state=None` (`_ridge.py:903`).
     pub random_state: Option<u64>,
+    /// Maximum number of iterations for iterative solvers (sklearn `max_iter`,
+    /// `_ridge.py:899`). Exposed for sklearn ABI parity; the implemented
+    /// direct Cholesky solver solves the normal equations in closed form with
+    /// no iteration, so this field is stored but has no effect on the computed
+    /// result. When an iterative solver is added (future REQ-8 #386), this
+    /// will control convergence. Default `None`, matching sklearn's default
+    /// (`_ridge.py:899`).
+    pub max_iter: Option<usize>,
+    /// Tolerance for iterative solvers (sklearn `tol`, `_ridge.py:900`).
+    /// Exposed for sklearn ABI parity; the implemented direct Cholesky solver
+    /// solves the normal equations in closed form with no iteration, so this
+    /// field is stored but has no effect on the computed result. When an
+    /// iterative solver is added (future REQ-8 #386), this will control
+    /// convergence. Default `1e-4`, matching sklearn's default (`_ridge.py:900`).
+    pub tol: F,
 }
 
 impl<F: Float> Ridge<F> {
     /// Create a new `Ridge` with default settings.
     ///
     /// Defaults: `alpha = 1.0`, `fit_intercept = true`, `copy_x = true`,
-    /// `random_state = None` — mirroring sklearn's ctor defaults
-    /// (`sklearn/linear_model/_ridge.py:895-903`).
+    /// `random_state = None`, `max_iter = None`, `tol = 1e-4` — mirroring
+    /// sklearn's ctor defaults (`sklearn/linear_model/_ridge.py:895-903`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -104,6 +119,8 @@ impl<F: Float> Ridge<F> {
             fit_intercept: true,
             copy_x: true,
             random_state: None,
+            max_iter: None,
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
         }
     }
 
@@ -139,6 +156,32 @@ impl<F: Float> Ridge<F> {
     #[must_use]
     pub fn with_random_state(mut self, random_state: Option<u64>) -> Self {
         self.random_state = random_state;
+        self
+    }
+
+    /// Set the maximum number of iterations for iterative solvers (sklearn
+    /// `max_iter`, `_ridge.py:899`).
+    ///
+    /// ferrolearn's direct Cholesky solver solves the normal equations in
+    /// closed form with no iteration, so this is stored for sklearn ABI
+    /// parity and does not affect the computed result. When an iterative
+    /// solver is added (future REQ-8 #386), this will take effect.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: Option<usize>) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance for iterative solvers (sklearn `tol`,
+    /// `_ridge.py:900`).
+    ///
+    /// ferrolearn's direct Cholesky solver solves the normal equations in
+    /// closed form with no iteration, so this is stored for sklearn ABI
+    /// parity and does not affect the computed result. When an iterative
+    /// solver is added (future REQ-8 #386), this will take effect.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
         self
     }
 }
@@ -240,6 +283,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     Ok(FittedRidge {
                         coefficients: w,
                         intercept,
+                        n_iter_: None,
                     })
                 } else {
                     let w = linalg::solve_ridge(x, y, self.alpha)?;
@@ -249,6 +293,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         // Disambiguate `Element::zero` vs `num_traits::Zero::zero`
                         // (both in scope under the `LinalgFloat` bound).
                         intercept: <F as num_traits::Zero>::zero(),
+                        n_iter_: None,
                     })
                 }
             }
@@ -296,6 +341,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     Ok(FittedRidge {
                         coefficients: coef,
                         intercept,
+                        n_iter_: None,
                     })
                 } else {
                     // No centering; just √w row-rescaling, intercept 0.
@@ -307,6 +353,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     Ok(FittedRidge {
                         coefficients: coef,
                         intercept: <F as num_traits::Zero>::zero(),
+                        n_iter_: None,
                     })
                 }
             }
@@ -330,6 +377,25 @@ pub struct FittedRidge<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+    /// Number of iterations run by an iterative solver, or `None` for direct
+    /// solvers (sklearn `n_iter_`, `_ridge.py:994`). ferrolearn's Cholesky
+    /// solver is direct (no iteration), so this is always `None` — matching
+    /// sklearn's behaviour when `solver='cholesky'` or `solver='svd'` resolve
+    /// the normal equations in closed form.
+    n_iter_: Option<usize>,
+}
+
+impl<F> FittedRidge<F> {
+    /// Return the number of iterations run by an iterative solver, or `None`
+    /// for the direct Cholesky solver (sklearn `n_iter_`, `_ridge.py:994`).
+    ///
+    /// ferrolearn implements only the direct Cholesky path, so this is always
+    /// `None`. When an iterative solver is added (future REQ-8 #386), it will
+    /// return `Some(n)`.
+    #[must_use]
+    pub fn n_iter(&self) -> Option<usize> {
+        self.n_iter_
+    }
 }
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
@@ -1028,5 +1094,96 @@ mod tests {
         }
         // Intercepts agree.
         assert_relative_eq!(single.intercept(), multi.intercepts()[0], epsilon = 1e-10);
+    }
+
+    // -- max_iter / tol / n_iter_ ABI-parity (REQ-10) ----------------------
+
+    #[test]
+    fn ridge_max_iter_tol_niter_defaults_and_builders() -> Result<(), FerroError> {
+        // Defaults mirror sklearn Ridge(max_iter=None, tol=1e-4)
+        // (`sklearn/linear_model/_ridge.py:899-900`).
+        assert_eq!(
+            Ridge::<f64>::new().max_iter,
+            None,
+            "max_iter default must be None"
+        );
+        assert!(
+            (Ridge::<f64>::new().tol - 1e-4_f64).abs() < 1e-12,
+            "tol default must be 1e-4"
+        );
+
+        // Builders store the supplied value.
+        assert_eq!(
+            Ridge::<f64>::new().with_max_iter(Some(500)).max_iter,
+            Some(500)
+        );
+        assert_eq!(Ridge::<f64>::new().with_max_iter(None).max_iter, None);
+        assert!(
+            (Ridge::<f64>::new().with_tol(1e-6_f64).tol - 1e-6_f64).abs() < 1e-18,
+            "with_tol must store the supplied value"
+        );
+
+        // n_iter_ is always None for the direct Cholesky solver, matching
+        // sklearn: Ridge(alpha=1.0).fit(X,y).n_iter_ is None when
+        // solver='auto' resolves to 'cholesky' (`_ridge.py:994`).
+        let x = Array2::from_shape_vec((4, 2), vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 2.0])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![4, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![1.0, 2.0, 3.0, 6.0];
+
+        let fitted = Ridge::<f64>::new().fit(&x, &y)?;
+        assert_eq!(
+            fitted.n_iter(),
+            None,
+            "n_iter_ must be None for direct Cholesky"
+        );
+
+        // No behavior change: fit produces byte-identical coef_/intercept_
+        // regardless of max_iter or tol (direct Cholesky is unaffected).
+        //
+        // Live sklearn oracle (alpha=1.0, fit_intercept=true):
+        //   python3 -c "import numpy as np; from sklearn.linear_model import Ridge;
+        //     X=np.array([[1.,0.],[0.,1.],[1.,1.],[2.,2.]]);
+        //     y=np.array([1.,2.,3.,6.]);
+        //     m=Ridge(alpha=1.0).fit(X,y); print(m.coef_.tolist(), m.intercept_)"
+        //   -> [0.875, 1.375] 0.75
+        let ref_fitted = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y)?;
+        let with_max_iter = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_max_iter(Some(500))
+            .fit(&x, &y)?;
+        let with_tol = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_tol(1e-6_f64)
+            .fit(&x, &y)?;
+
+        // Byte-identical (deterministic Cholesky, max_iter/tol are no-ops).
+        for j in 0..2 {
+            assert_eq!(
+                ref_fitted.coefficients()[j].to_bits(),
+                with_max_iter.coefficients()[j].to_bits(),
+                "coef_[{j}] must be byte-identical regardless of max_iter"
+            );
+            assert_eq!(
+                ref_fitted.coefficients()[j].to_bits(),
+                with_tol.coefficients()[j].to_bits(),
+                "coef_[{j}] must be byte-identical regardless of tol"
+            );
+        }
+        assert_eq!(
+            ref_fitted.intercept().to_bits(),
+            with_max_iter.intercept().to_bits()
+        );
+        assert_eq!(
+            ref_fitted.intercept().to_bits(),
+            with_tol.intercept().to_bits()
+        );
+        assert_eq!(with_max_iter.n_iter(), None);
+        assert_eq!(with_tol.n_iter(), None);
+
+        Ok(())
     }
 }
