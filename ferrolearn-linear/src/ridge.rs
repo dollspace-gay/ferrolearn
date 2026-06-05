@@ -28,7 +28,7 @@
 //! | REQ-8 (solver variants + solver_) | NOT-STARTED | #386. |
 //! | REQ-9 (positive=True) | NOT-STARTED | #387. |
 //! | REQ-10 (max_iter/tol + n_iter_) | NOT-STARTED | #388. |
-//! | REQ-11 (sample_weight) | NOT-STARTED | #389. |
+//! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
 //! | REQ-12 (copy_X/random_state) | NOT-STARTED | #390. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
 //!
@@ -105,6 +105,177 @@ impl<F: Float> Ridge<F> {
     }
 }
 
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static> Ridge<F> {
+    /// Fit the Ridge regression model with optional per-sample weights.
+    ///
+    /// Mirrors scikit-learn's `Ridge.fit(X, y, sample_weight=None)`
+    /// (`sklearn/linear_model/_ridge.py`). When `sample_weight` is `Some(w)`,
+    /// this solves the WEIGHTED ridge problem
+    /// `min Σᵢ wᵢ (yᵢ − xᵢ·coef)² + alpha·‖coef‖²`:
+    ///
+    /// - `fit_intercept=true`: offsets are the WEIGHTED means
+    ///   `x_off[j] = Σᵢ wᵢ·x[i,j] / Σwᵢ`, `y_off = Σᵢ wᵢ·yᵢ / Σwᵢ`. `X` and `y`
+    ///   are centered by those offsets, each row is then rescaled by `√wᵢ`
+    ///   (sklearn `_rescale_data`, `_ridge.py:682-688`), the cholesky ridge solve
+    ///   runs on the rescaled design with the penalty `alpha` UNSCALED (because
+    ///   `Xsᵀ·Xs == Xᵀ·W·X`), and `intercept = y_off − x_off·coef`.
+    /// - `fit_intercept=false`: no centering; each row is rescaled by `√wᵢ`, the
+    ///   ridge solve runs on the rescaled `X`/`y`, and `intercept = 0`.
+    ///
+    /// `sample_weight=None` is BYTE-IDENTICAL to [`Fit::fit`] (the unweighted
+    /// centering + `linalg::solve_ridge` path), which delegates here. The
+    /// `alpha=0` → OLS min-norm fallback is preserved (handled inside
+    /// `linalg::solve_ridge`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of samples in `x` and
+    /// `y` (or, when provided, `sample_weight`) differ.
+    /// Returns [`FerroError::InvalidParameter`] if `alpha` is negative.
+    /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
+    /// Returns [`FerroError::NumericalInstability`] if the weighted-offset
+    /// denominator (`Σwᵢ`) cannot be formed or a mean cannot be computed.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<FittedRidge<F>, FerroError> {
+        let (n_samples, n_features) = x.dim();
+
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
+        // `ferray::Element` (which also defines a `zero`) into scope, so a bare
+        // `F::zero()` is ambiguous between `Element` and `num_traits::Zero`.
+        if self.alpha < <F as num_traits::Zero>::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
+
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "Ridge requires at least one sample".into(),
+            });
+        }
+
+        if let Some(w) = sample_weight
+            && w.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![w.len()],
+                context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        match sample_weight {
+            None => {
+                // Unweighted path — identical to the original `Fit::fit` body.
+                if self.fit_intercept {
+                    // Center the data to handle the intercept.
+                    let x_mean =
+                        x.mean_axis(Axis(0))
+                            .ok_or_else(|| FerroError::NumericalInstability {
+                                message: "failed to compute column means".into(),
+                            })?;
+                    let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
+                        message: "failed to compute target mean".into(),
+                    })?;
+
+                    let x_centered = x - &x_mean;
+                    let y_centered = y - y_mean;
+
+                    let w = linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?;
+                    let intercept = y_mean - x_mean.dot(&w);
+
+                    Ok(FittedRidge {
+                        coefficients: w,
+                        intercept,
+                    })
+                } else {
+                    let w = linalg::solve_ridge(x, y, self.alpha)?;
+
+                    Ok(FittedRidge {
+                        coefficients: w,
+                        // Disambiguate `Element::zero` vs `num_traits::Zero::zero`
+                        // (both in scope under the `LinalgFloat` bound).
+                        intercept: <F as num_traits::Zero>::zero(),
+                    })
+                }
+            }
+            Some(w) => {
+                // Per-row √w factor (sklearn `_rescale_data`, `_ridge.py:682-688`).
+                let w_sqrt = w.mapv(<F as Float>::sqrt);
+
+                if self.fit_intercept {
+                    // WEIGHTED centering: offsets are the weighted means
+                    // x_off[j] = Σ wᵢ x[i,j] / Σ wᵢ, y_off = Σ wᵢ yᵢ / Σ wᵢ
+                    // (sklearn `_preprocess_data` weighted `_average`).
+                    let w_sum = w.sum();
+                    if w_sum <= <F as num_traits::Zero>::zero() {
+                        return Err(FerroError::NumericalInstability {
+                            message: "sum of sample_weight must be positive to center".into(),
+                        });
+                    }
+
+                    let mut x_off = Array1::<F>::zeros(n_features);
+                    for (i, row) in x.outer_iter().enumerate() {
+                        let wi = w[i];
+                        x_off = &x_off + &row.mapv(|v| v * wi);
+                    }
+                    x_off.mapv_inplace(|v| v / w_sum);
+
+                    let y_off = y
+                        .iter()
+                        .zip(w.iter())
+                        .fold(<F as num_traits::Zero>::zero(), |acc, (&yi, &wi)| {
+                            acc + wi * yi
+                        })
+                        / w_sum;
+
+                    // Center, then row-rescale by √w. Penalty `alpha` is UNSCALED:
+                    // (√w·Xc)ᵀ(√w·Xc) == Xcᵀ·W·Xc, so the closed form
+                    // (Xsᵀ·Xs + alpha·I)·coef = Xsᵀ·ys IS the weighted ridge solve.
+                    let x_centered = x - &x_off;
+                    let y_centered = y - y_off;
+                    let x_scaled = &x_centered * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = &y_centered * &w_sqrt;
+
+                    let coef = linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?;
+                    let intercept = y_off - x_off.dot(&coef);
+
+                    Ok(FittedRidge {
+                        coefficients: coef,
+                        intercept,
+                    })
+                } else {
+                    // No centering; just √w row-rescaling, intercept 0.
+                    let x_scaled = x * &w_sqrt.view().insert_axis(Axis(1));
+                    let y_scaled = y * &w_sqrt;
+
+                    let coef = linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)?;
+
+                    Ok(FittedRidge {
+                        coefficients: coef,
+                        intercept: <F as num_traits::Zero>::zero(),
+                    })
+                }
+            }
+        }
+    }
+}
+
 impl<F: Float> Default for Ridge<F> {
     fn default() -> Self {
         Self::new()
@@ -139,65 +310,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     /// `x` and `y` differ.
     /// Returns [`FerroError::InvalidParameter`] if `alpha` is negative.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedRidge<F>, FerroError> {
-        let (n_samples, _n_features) = x.dim();
-
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
-        // `ferray::Element` (which also defines a `zero`) into scope, so a bare
-        // `F::zero()` is ambiguous between `Element` and `num_traits::Zero`.
-        if self.alpha < <F as num_traits::Zero>::zero() {
-            return Err(FerroError::InvalidParameter {
-                name: "alpha".into(),
-                reason: "must be non-negative".into(),
-            });
-        }
-
-        if n_samples == 0 {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "Ridge requires at least one sample".into(),
-            });
-        }
-
-        if self.fit_intercept {
-            // Center the data to handle the intercept.
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute column means".into(),
-                })?;
-            let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
-                message: "failed to compute target mean".into(),
-            })?;
-
-            let x_centered = x - &x_mean;
-            let y_centered = y - y_mean;
-
-            let w = linalg::solve_ridge(&x_centered, &y_centered, self.alpha)?;
-            let intercept = y_mean - x_mean.dot(&w);
-
-            Ok(FittedRidge {
-                coefficients: w,
-                intercept,
-            })
-        } else {
-            let w = linalg::solve_ridge(x, y, self.alpha)?;
-
-            Ok(FittedRidge {
-                coefficients: w,
-                // Disambiguate `Element::zero` vs `num_traits::Zero::zero`
-                // (both in scope under the `LinalgFloat` bound).
-                intercept: <F as num_traits::Zero>::zero(),
-            })
-        }
+        // Unweighted ridge is the `sample_weight=None` arm of the weighted fit;
+        // delegating keeps the None path byte-identical to the historic body
+        // (centering + `solve_ridge`), mirroring sklearn's single `fit` entry
+        // (`_ridge.py`, `sample_weight=None` default).
+        self.fit_with_sample_weight(x, y, None)
     }
 }
 
@@ -511,6 +628,125 @@ mod tests {
         let fitted = model.fit(&x, &y).unwrap();
 
         assert_eq!(fitted.coefficients().len(), 2);
+    }
+
+    #[test]
+    fn ridge_fit_sample_weight_with_intercept_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (WEIGHTED ridge, alpha=1, fit_intercept=True):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     y=np.array([3.0,2.5,7.1,6.0,11.2]); w=np.array([1.,4.,1.,1.,3.]); \
+        //     m=Ridge(alpha=1.0).fit(X,y,sample_weight=w); \
+        //     print([round(c,10) for c in m.coef_], round(m.intercept_,10))"
+        //   -> [0.9233502538, 1.39678511] -0.8033840948
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        let w = array![1.0, 4.0, 1.0, 1.0, 3.0];
+
+        let model = Ridge::<f64>::new().with_alpha(1.0);
+        let fitted = model.fit_with_sample_weight(&x, &y, Some(&w))?;
+
+        assert_relative_eq!(fitted.coefficients()[0], 0.923_350_253_8, epsilon = 1e-7);
+        assert_relative_eq!(fitted.coefficients()[1], 1.396_785_11, epsilon = 1e-7);
+        assert_relative_eq!(fitted.intercept(), -0.803_384_094_8, epsilon = 1e-7);
+
+        // Non-tautological: the weighted result MUST differ from the unweighted
+        // fit (oracle unweighted coef_ [0.8228070175, 1.3561403509]).
+        let unweighted = model.fit(&x, &y)?;
+        assert_relative_eq!(
+            unweighted.coefficients()[0],
+            0.822_807_017_5,
+            epsilon = 1e-7
+        );
+        assert_relative_eq!(
+            unweighted.coefficients()[1],
+            1.356_140_350_9,
+            epsilon = 1e-7
+        );
+        assert!((fitted.coefficients()[0] - unweighted.coefficients()[0]).abs() > 1e-3);
+        assert!((fitted.intercept() - unweighted.intercept()).abs() > 1e-3);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_fit_sample_weight_no_intercept_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (WEIGHTED ridge, alpha=2, fit_intercept=False):
+        //   cd /tmp && python3 -c "import numpy as np; \
+        //     from sklearn.linear_model import Ridge; \
+        //     X=np.array([[1.,2.],[2.,1.],[3.,4.],[4.,3.],[5.,5.]]); \
+        //     y=np.array([3.0,2.5,7.1,6.0,11.2]); w=np.array([1.,4.,1.,1.,3.]); \
+        //     m=Ridge(alpha=2.0,fit_intercept=False).fit(X,y,sample_weight=w); \
+        //     print([round(c,10) for c in m.coef_])"
+        //   -> [0.7273779983, 1.3737799835]
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+        let w = array![1.0, 4.0, 1.0, 1.0, 3.0];
+
+        let model = Ridge::<f64>::new()
+            .with_alpha(2.0)
+            .with_fit_intercept(false);
+        let fitted = model.fit_with_sample_weight(&x, &y, Some(&w))?;
+
+        assert_relative_eq!(fitted.coefficients()[0], 0.727_377_998_3, epsilon = 1e-7);
+        assert_relative_eq!(fitted.coefficients()[1], 1.373_779_983_5, epsilon = 1e-7);
+        assert_eq!(fitted.intercept(), 0.0);
+        Ok(())
+    }
+
+    #[test]
+    fn ridge_fit_none_sample_weight_equals_unweighted() -> Result<(), FerroError> {
+        // Regression guard: the `None` path is BYTE-IDENTICAL to `fit`.
+        let x = Array2::from_shape_vec((5, 2), vec![1., 2., 2., 1., 3., 4., 4., 3., 5., 5.])
+            .map_err(|e| FerroError::ShapeMismatch {
+                expected: vec![5, 2],
+                actual: vec![],
+                context: e.to_string(),
+            })?;
+        let y = array![3.0, 2.5, 7.1, 6.0, 11.2];
+
+        let model = Ridge::<f64>::new().with_alpha(1.0);
+        let via_fit = model.fit(&x, &y)?;
+        let via_none = model.fit_with_sample_weight(&x, &y, None)?;
+
+        assert_eq!(
+            via_fit.coefficients()[0].to_bits(),
+            via_none.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            via_fit.coefficients()[1].to_bits(),
+            via_none.coefficients()[1].to_bits()
+        );
+        assert_eq!(
+            via_fit.intercept().to_bits(),
+            via_none.intercept().to_bits()
+        );
+
+        // Same for fit_intercept=false.
+        let model_ni = Ridge::<f64>::new()
+            .with_alpha(1.0)
+            .with_fit_intercept(false);
+        let via_fit_ni = model_ni.fit(&x, &y)?;
+        let via_none_ni = model_ni.fit_with_sample_weight(&x, &y, None)?;
+        assert_eq!(
+            via_fit_ni.coefficients()[0].to_bits(),
+            via_none_ni.coefficients()[0].to_bits()
+        );
+        assert_eq!(
+            via_fit_ni.intercept().to_bits(),
+            via_none_ni.intercept().to_bits()
+        );
+        Ok(())
     }
 
     // -- Multi-output Ridge -------------------------------------------------
