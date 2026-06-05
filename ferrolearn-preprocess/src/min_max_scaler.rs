@@ -21,7 +21,7 @@
 //! | REQ-7 (PyO3 binding) | SHIPPED | `_RsMinMaxScaler` (`extras.rs:1148`, registered `lib.rs:81`) marshals `fit`/`transform` over `FittedMinMaxScaler<f64>` (default range) — a real CPython consumer of REQ-1/REQ-2. |
 //! | REQ-4 (NaN tolerance: allow-nan + nanmin/nanmax) | NOT-STARTED | open prereq blocker #1171. `fit` reduce-min/max poisons on NaN; sklearn `force_all_finite='allow-nan'` + `_nanmin`/`_nanmax` (`_data.py:490-499`). |
 //! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | NOT-STARTED | open prereq blocker #1172. Only `data_min`/`data_max` stored (`_data.py:508-514`). |
-//! | REQ-6 (inverse_transform) | NOT-STARTED | open prereq blocker #1173. None (`_data.py:549-587`). |
+//! | REQ-6 (inverse_transform) | SHIPPED | FIXED #1173. `FittedMinMaxScaler::inverse_transform` reverses the affine map: per column `j`, `x_orig = (x_scaled - fr0) * span / range_width + data_min[j]` (`span = data_max[j]-data_min[j]`, `range_width = fr1-fr0`), matching sklearn `X -= self.min_; X /= self.scale_` (`_data.py:549-587`,`:508-511`,`:88`). The single formula round-trips both regular and constant columns (`span==0 -> data_min[j]`). `ShapeMismatch` on column-count mismatch (mirrors `transform`). Oracle-grounded in-module tests: `min_max_inverse_roundtrip_matches_sklearn`, `min_max_inverse_custom_range_matches_sklearn`, `min_max_inverse_constant_col`, `min_max_inverse_shape_mismatch`. Consumer: crate re-export (`lib.rs:118`, grandfathered S5). |
 //! | REQ-8 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1174. Single-shot fit (`_data.py:489-515`). |
 //! | REQ-9 (minmax_scale free fn + axis) | NOT-STARTED | open prereq blocker #1175. No free fn / axis=1 (`_data.py:589`). |
 //! | REQ-10 (copy / clip params) | NOT-STARTED | open prereq blocker #1176. No `copy`/`clip`/`_parameter_constraints` (`_data.py:447-459`,`:542-543`). |
@@ -138,6 +138,53 @@ impl<F: Float + Send + Sync + 'static> FittedMinMaxScaler<F> {
     #[must_use]
     pub fn feature_range(&self) -> (F, F) {
         self.feature_range
+    }
+
+    /// Undo the scaling of `x` according to `feature_range`, mapping scaled
+    /// data back to the original feature space.
+    ///
+    /// This reverses the affine map applied by [`Transform::transform`]. For
+    /// each column `j` with `span = data_max[j] - data_min[j]` and
+    /// `range_width = feature_range.1 - feature_range.0`:
+    /// `x_orig = (x_scaled - feature_range.0) * span / range_width + data_min[j]`.
+    ///
+    /// This single formula is correct for both regular and constant columns:
+    /// for a constant column (`span == 0`, whose forward image is
+    /// `feature_range.0`) it yields `data_min[j]`. It mirrors sklearn's
+    /// `X -= self.min_; X /= self.scale_` where `scale_` divides by
+    /// `_handle_zeros_in_scale(data_range)`
+    /// (`sklearn/preprocessing/_data.py:549-587`,`:508-511`,`:88`).
+    ///
+    /// `range_width` is guaranteed nonzero because
+    /// [`MinMaxScaler::with_feature_range`] rejects `range_min >= range_max`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
+    /// match the number of features seen during fitting.
+    pub fn inverse_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_features = self.data_min.len();
+        if x.ncols() != n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), n_features],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedMinMaxScaler::inverse_transform".into(),
+            });
+        }
+
+        let (range_min, range_max) = self.feature_range;
+        let range_width = range_max - range_min;
+
+        let mut out = x.to_owned();
+        for (j, mut col) in out.columns_mut().into_iter().enumerate() {
+            let min = self.data_min[j];
+            let max = self.data_max[j];
+            let span = max - min;
+            for v in &mut col {
+                *v = (*v - range_min) * span / range_width + min;
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -390,5 +437,104 @@ mod tests {
         let fitted = scaler.fit(&x_train, &()).unwrap();
         let x_bad = array![[1.0]];
         assert!(fitted.transform(&x_bad).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // REQ-6: inverse_transform (sklearn _data.py:549-587). Live sklearn 1.5.2
+    // oracle values (run from /tmp) — never copied from the ferrolearn side
+    // (R-CHAR-3).
+    // -----------------------------------------------------------------------
+
+    /// inverse_transform(transform(X)) round-trips to X (default range).
+    /// Live oracle: `MinMaxScaler().fit_transform([[1.,10.],[2.,20.],[3.,30.],[5.,50.]])`
+    ///   -> `[[0.,0.],[0.25,0.25],[0.5,0.5],[1.,1.]]`; inverse_transform of that
+    ///   returns the original X.
+    #[test]
+    fn min_max_inverse_roundtrip_matches_sklearn() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::new();
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [5.0, 50.0]];
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        // Live sklearn 1.5.2 oracle for the forward transform.
+        let sk_scaled = [[0.0_f64, 0.0], [0.25, 0.25], [0.5, 0.5], [1.0, 1.0]];
+        for i in 0..4 {
+            for j in 0..2 {
+                assert_abs_diff_eq!(scaled[[i, j]], sk_scaled[i][j], epsilon = 1e-9);
+            }
+        }
+
+        let recovered = fitted.inverse_transform(&scaled)?;
+        for i in 0..4 {
+            for j in 0..2 {
+                assert_abs_diff_eq!(recovered[[i, j]], x[[i, j]], epsilon = 1e-9);
+            }
+        }
+        Ok(())
+    }
+
+    /// inverse_transform with custom range `(-1, 1)`.
+    /// Live oracle: fit `MinMaxScaler(feature_range=(-1,1))` on
+    ///   `[[1.,10.],[2.,20.],[3.,30.],[5.,50.]]`, then
+    ///   `inverse_transform([[0.,0.],[1.,1.]])` -> `[[3.,30.],[5.,50.]]`.
+    #[test]
+    fn min_max_inverse_custom_range_matches_sklearn() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::with_feature_range(-1.0, 1.0)?;
+        let x = array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [5.0, 50.0]];
+        let fitted = scaler.fit(&x, &())?;
+
+        let scaled = array![[0.0, 0.0], [1.0, 1.0]];
+        // Live sklearn 1.5.2 oracle.
+        let sk = [[3.0_f64, 30.0], [5.0, 50.0]];
+
+        let recovered = fitted.inverse_transform(&scaled)?;
+        for i in 0..2 {
+            for j in 0..2 {
+                assert_abs_diff_eq!(recovered[[i, j]], sk[i][j], epsilon = 1e-9);
+            }
+        }
+        Ok(())
+    }
+
+    /// inverse_transform of a constant column recovers `data_min` for every row.
+    /// Fit on `[[1.,5.],[2.,5.],[3.,5.]]`: col 1 is constant -> forward maps to
+    /// fr[0] = 0.0; inverse of that recovers 5.0 (= data_min). Col 0 round-trips
+    /// to `[1,2,3]`. Live oracle:
+    ///   `m=MinMaxScaler().fit([[1.,5.],[2.,5.],[3.,5.]]);
+    ///    m.inverse_transform(m.transform([[1.,5.],[2.,5.],[3.,5.]]))`
+    ///   -> `[[1.,5.],[2.,5.],[3.,5.]]`.
+    #[test]
+    fn min_max_inverse_constant_col() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::new();
+        let x = array![[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]];
+        let fitted = scaler.fit(&x, &())?;
+        let scaled = fitted.transform(&x)?;
+
+        // Constant col 1 maps to fr[0] = 0.0 forward (REQ-2).
+        for i in 0..3 {
+            assert_abs_diff_eq!(scaled[[i, 1]], 0.0, epsilon = 1e-9);
+        }
+
+        let recovered = fitted.inverse_transform(&scaled)?;
+        let sk_col0 = [1.0_f64, 2.0, 3.0];
+        for i in 0..3 {
+            assert_abs_diff_eq!(recovered[[i, 0]], sk_col0[i], epsilon = 1e-9);
+            assert_abs_diff_eq!(recovered[[i, 1]], 5.0, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    /// inverse_transform with the wrong number of columns -> ShapeMismatch.
+    #[test]
+    fn min_max_inverse_shape_mismatch() -> Result<(), FerroError> {
+        let scaler = MinMaxScaler::<f64>::new();
+        let x_train = array![[1.0, 2.0], [3.0, 4.0]];
+        let fitted = scaler.fit(&x_train, &())?;
+        let x_bad = array![[0.0], [1.0]];
+        assert!(matches!(
+            fitted.inverse_transform(&x_bad),
+            Err(FerroError::ShapeMismatch { .. })
+        ));
+        Ok(())
     }
 }
