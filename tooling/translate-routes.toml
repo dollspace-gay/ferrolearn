@@ -1292,3 +1292,15 @@ upstream = [
 ]
 design = ".design/sparse/helpers.md"
 parity_ops = ["eye", "diags", "hstack", "vstack"]
+
+# =====================================================================
+# Layer 6 — ferrolearn-python (PyO3 binding shim; verified via pytest vs sklearn)
+# =====================================================================
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/conversions.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/utils/validation.py",
+]
+design = ".design/python/conversions.md"
+parity_ops = ["check_array", "numpy_interop"]
