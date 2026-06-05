@@ -99,16 +99,24 @@ class PCA(TransformerMixin, BaseEstimator):
 
     Parameters
     ----------
-    n_components : int, default=2
-        Number of components to keep.
+    n_components : int, default=None
+        Number of components to keep. If None, all
+        ``min(n_samples, n_features)`` components are kept (resolved at fit),
+        matching ``sklearn.decomposition.PCA`` (``sklearn/decomposition/_pca.py:409``).
     """
 
-    def __init__(self, *, n_components=2):
+    def __init__(self, n_components=None):
         self.n_components = n_components
 
     def fit(self, X, y=None):
         X = self._validate_data(X, dtype="float64")
-        self._rs = _RsPCA(n_components=self.n_components)
+        # sklearn stores n_components=None verbatim and resolves it to
+        # min(n_samples, n_features) at fit (`_pca.py:523-529`). The Rust
+        # binding expects a usize, so resolve None here.
+        n_components = (
+            self.n_components if self.n_components is not None else min(X.shape)
+        )
+        self._rs = _RsPCA(n_components=n_components)
         _fit_rust(self._rs, _ensure_f64(X))
         self.components_ = np.array(self._rs.components_)
         self.explained_variance_ = np.array(self._rs.explained_variance_)
@@ -143,5 +151,10 @@ class PCA(TransformerMixin, BaseEstimator):
     def __setstate__(self, state):
         self.__dict__.update(state)
         if hasattr(self, "_fit_X"):
-            self._rs = _RsPCA(n_components=self.n_components)
+            n_components = (
+                self.n_components
+                if self.n_components is not None
+                else min(self._fit_X.shape)
+            )
+            self._rs = _RsPCA(n_components=n_components)
             self._rs.fit(_ensure_f64(self._fit_X))

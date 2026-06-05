@@ -1312,3 +1312,12 @@ upstream = [
 ]
 design = ".design/python/clusterers.md"
 parity_ops = ["KMeans"]
+
+[[route]]
+crate_pattern = "ferrolearn-python/src/transformers.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/preprocessing/_data.py",
+  "/home/doll/scikit-learn/sklearn/decomposition/_pca.py",
+]
+design = ".design/python/transformers.md"
+parity_ops = ["StandardScaler", "PCA"]
