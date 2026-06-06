@@ -45,7 +45,7 @@
 //! | REQ-7 (missing scipy.optimize functions) | NOT-STARTED | no root/least_squares/curve_fit/brentq/fsolve/linprog/nnls/root_scalar + minimize_scalar brent/golden. Blocker #1989. |
 //! | REQ-8 (bounds / constraints) | NOT-STARTED | multivariate optimizers are unconstrained (only `brent_bounded` has an interval). Blocker #1990. |
 //! | REQ-9 (API contract) | NOT-STARTED | builder `NewtonCG::new().with_*().minimize(...)` vs scipy `minimize(fun, x0, method=, ...)`. Blocker #1991. |
-//! | REQ-10 (error handling) | NOT-STARTED | `converged: bool` flag (+ `Result<_, String>`) vs scipy `success`/`status`/`message` / `FerroError`. Blocker #1992. |
+//! | REQ-10 (error handling) | PARTIAL — error-TYPE SHIPPED, result-remodel NOT-STARTED | error TYPE migrated: `NewtonCG::minimize`/`TrustRegionNCG::minimize` now return `Result<OptimizeResult, FerroError>` and raise `FerroError::InvalidParameter` on empty `x0` (CLAUDE.md error contract; analog of scipy's `ValueError` on invalid `x0`). STILL NOT-STARTED (blocker #1992): the `converged: bool` flag is not yet remodeled into scipy's `success`/`status`/`message`, and `Powell::minimize`/`brent_bounded` still return bare results (no `Result`). |
 //! | REQ-12 (NewtonCG/TrustRegionNCG/Powell consumer) | NOT-STARTED | no non-test caller for the three multivariate optimizers (only `brent_bounded` is consumed). Blocker #1993. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | hand-rolled `ndarray` vector algebra vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1994. |
 //!
@@ -71,6 +71,7 @@
 //! assert!(result.converged);
 //! ```
 
+use ferrolearn_core::error::FerroError;
 use ndarray::Array1;
 
 /// Result of an optimization run.
@@ -171,25 +172,29 @@ impl NewtonCG {
     ///
     /// # Returns
     ///
-    /// An [`OptimizeResult`] on success, or an error message if the input is
+    /// An [`OptimizeResult`] on success, or a [`FerroError`] if the input is
     /// invalid (e.g., zero-length initial guess).
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `x0` has length zero.
+    /// Returns [`FerroError::InvalidParameter`] (the analog of scipy's
+    /// `ValueError` on invalid `x0`) if `x0` has length zero.
     pub fn minimize<FG, HP>(
         &self,
         mut fun_grad: FG,
         mut hessp: HP,
         x0: Array1<f64>,
-    ) -> Result<OptimizeResult, String>
+    ) -> Result<OptimizeResult, FerroError>
     where
         FG: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
         HP: FnMut(&Array1<f64>, &Array1<f64>) -> Array1<f64>,
     {
         let n = x0.len();
         if n == 0 {
-            return Err("initial guess x0 must have at least one element".into());
+            return Err(FerroError::InvalidParameter {
+                name: "x0".into(),
+                reason: "initial guess x0 must have at least one element".into(),
+            });
         }
 
         let mut x = x0;
@@ -418,25 +423,29 @@ impl TrustRegionNCG {
     ///
     /// # Returns
     ///
-    /// An [`OptimizeResult`] on success, or an error message if the input is
+    /// An [`OptimizeResult`] on success, or a [`FerroError`] if the input is
     /// invalid (e.g., zero-length initial guess).
     ///
     /// # Errors
     ///
-    /// Returns `Err` if `x0` has length zero.
+    /// Returns [`FerroError::InvalidParameter`] (the analog of scipy's
+    /// `ValueError` on invalid `x0`) if `x0` has length zero.
     pub fn minimize<FG, HP>(
         &self,
         mut fun_grad: FG,
         mut hessp: HP,
         x0: Array1<f64>,
-    ) -> Result<OptimizeResult, String>
+    ) -> Result<OptimizeResult, FerroError>
     where
         FG: FnMut(&Array1<f64>) -> (f64, Array1<f64>),
         HP: FnMut(&Array1<f64>, &Array1<f64>) -> Array1<f64>,
     {
         let n = x0.len();
         if n == 0 {
-            return Err("initial guess x0 must have at least one element".into());
+            return Err(FerroError::InvalidParameter {
+                name: "x0".into(),
+                reason: "initial guess x0 must have at least one element".into(),
+            });
         }
 
         let eta = 1e-4; // step acceptance threshold
@@ -1408,5 +1417,28 @@ mod tests {
         assert_abs_diff_eq!(r.x[0], 1.5, epsilon = 1e-4);
         assert_abs_diff_eq!(r.x[1], -0.25, epsilon = 1e-4);
         assert!(nfev > 0, "closure should have been called");
+    }
+
+    #[test]
+    fn optimize_empty_x0_returns_ferroerror() {
+        // REQ-10 (error TYPE): scipy `minimize` raises `ValueError` on an
+        // empty/invalid `x0` (`scipy/optimize/_minimize.py:591`); ferrolearn
+        // mirrors that with `FerroError::InvalidParameter`. The validation
+        // fires BEFORE the closures are evaluated, so trivial stubs suffice.
+        let fg = |_x: &Array1<f64>| (0.0_f64, Array1::<f64>::zeros(0));
+        let hp = |_x: &Array1<f64>, _p: &Array1<f64>| Array1::<f64>::zeros(0);
+        let empty = Array1::<f64>::zeros(0);
+
+        let newton = NewtonCG::new().minimize(fg, hp, empty.clone());
+        assert!(
+            matches!(newton, Err(FerroError::InvalidParameter { .. })),
+            "NewtonCG empty x0 should be FerroError::InvalidParameter, got {newton:?}"
+        );
+
+        let trust = TrustRegionNCG::new().minimize(fg, hp, empty);
+        assert!(
+            matches!(trust, Err(FerroError::InvalidParameter { .. })),
+            "TrustRegionNCG empty x0 should be FerroError::InvalidParameter, got {trust:?}"
+        );
     }
 }
