@@ -331,6 +331,96 @@ fn coo_eliminate_zeros_matches_scipy() -> Result<(), FerroError> {
     Ok(())
 }
 
+/// REQ-MISSING-METHODS (`sum_duplicates`). `sum_duplicates()` collapses duplicate
+/// `(row, col)` entries by SUMMING their values, in canonical `(row, col)`-sorted
+/// order, mirroring scipy `coo_matrix.sum_duplicates()` (`scipy/sparse/_coo.py:768`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([3.,5.,2.,1.]),(np.array([0,0,2,2]),np.array([0,0,2,2]))),
+///     shape=(3,3));
+///   A.sum_duplicates();
+///   print(A.nnz, A.row.tolist(), A.col.tolist(), A.data.tolist(),
+///         A.toarray().tolist())"`):
+/// `2 [0, 2] [0, 2] [8.0, 3.0] [[8.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 3.0]]`.
+#[test]
+fn coo_sum_duplicates_matches_scipy() -> Result<(), FerroError> {
+    let a = CooMatrix::<f64>::from_triplets(
+        3,
+        3,
+        vec![0, 0, 2, 2],
+        vec![0, 0, 2, 2],
+        vec![3.0, 5.0, 2.0, 1.0],
+    )?;
+
+    let s = a.sum_duplicates()?;
+    // scipy nnz == 2 (the two duplicate groups collapsed)
+    assert_eq!(s.nnz(), 2);
+    // scipy row == [0, 2], col == [0, 2], data == [8, 3]
+    assert_eq!(s.row(), &[0, 2]);
+    assert_eq!(s.col(), &[0, 2]);
+    assert_eq!(s.data(), &[8.0, 3.0]);
+
+    // scipy toarray() == [[8,0,0],[0,0,0],[0,0,3]]
+    let expected = [[8.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 3.0]];
+    let d = s.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "sum_duplicates mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`sum_duplicates`). A group of duplicates that cancel to
+/// zero is PRESERVED as a single zero-valued stored entry — `sum_duplicates()`
+/// only canonicalizes; removing zeros is `eliminate_zeros`'s separate job
+/// (scipy `coo_matrix.sum_duplicates`, `scipy/sparse/_coo.py:768`, does not
+/// eliminate zeros).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   B=sp.coo_matrix((np.array([4.,-4.,7.]),(np.array([0,0,1]),np.array([0,0,1]))),
+///     shape=(2,2));
+///   B.sum_duplicates();
+///   print(B.nnz, B.row.tolist(), B.col.tolist(), B.data.tolist(),
+///         B.toarray().tolist())"`):
+/// `2 [0, 1] [0, 1] [0.0, 7.0] [[0.0, 0.0], [0.0, 7.0]]`.
+#[test]
+fn coo_sum_duplicates_preserves_zero_sum() -> Result<(), FerroError> {
+    let b = CooMatrix::<f64>::from_triplets(
+        2,
+        2,
+        vec![0, 0, 1],
+        vec![0, 0, 1],
+        vec![4.0, -4.0, 7.0], // (0,0)=4+(-4)=0 — zero-sum, must be preserved
+    )?;
+
+    let s = b.sum_duplicates()?;
+    // scipy nnz == 2 (the zero-sum (0,0) entry is preserved, NOT dropped)
+    assert_eq!(s.nnz(), 2);
+    // scipy row == [0, 1], col == [0, 1], data == [0, 7]
+    assert_eq!(s.row(), &[0, 1]);
+    assert_eq!(s.col(), &[0, 1]);
+    assert_eq!(s.data(), &[0.0, 7.0]);
+
+    // scipy toarray() == [[0,0],[0,7]]
+    let expected = [[0.0, 0.0], [0.0, 7.0]];
+    let d = s.to_dense();
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "sum_duplicates zero-sum mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
+
 /// REQ-MISSING-METHODS (`max`/`min`). For an all-NEGATIVE sparse diagonal that is
 /// not fully dense, the implicit zero wins the `max()` (folded in), while `min()`
 /// is the most-negative stored value, mirroring scipy `coo_matrix.max()`/`.min()`

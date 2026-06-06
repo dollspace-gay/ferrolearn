@@ -24,9 +24,10 @@
 //! | REQ-ERR (construction validation) | SHIPPED | `from_triplets`/`push` return `Err(FerroError)` on out-of-bounds index / mismatched lengths, at the same point scipy raises `ValueError`. Guards `coo_from_triplets_*_is_err`/`coo_push_out_of_bounds_is_err`. |
 //! | REQ-CONSUMER (production consumer) | SHIPPED | consumed in-crate by `csr.rs`/`csc.rs` (COO→CSR/CSC conversion) and `helpers.rs` (`eye`/`diags`/`hstack`/`vstack` build via COO) — real non-test callers (S5 crate boundary). |
 //! | REQ-API-ACCESSORS (shape/data/row/col) | SHIPPED (#1996) | first-class `shape()`/`data()`/`row()`/`col()` accessors mirror scipy `.shape` (`_coo.py:32`/`:39` ctor tuple) and `.data`/`.row`/`.col` (`_coo.py:64`/`:106`/`:122`), the COO `(data, (row, col))` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `row()` → `&[usize]` (`inner.row_inds()`); `col()` → `&[usize]` (`inner.col_inds()`) — all borrow `&self` (sprs `TriMat` accessors return slices). Live oracle (R-CHAR-3): `coo_matrix(([3,5,2],([0,2,1],[0,1,2])),shape=(3,3))` → `shape=(3,3)`, `data=[3,5,2]`, `row=[0,2,1]`, `col=[0,1,2]` (insertion order preserved). Guard `coo_shape_data_row_col_match_scipy`. |
-//! | REQ-MISSING-METHODS (COO methods) | SHIPPED (#1997) | conversion + transpose: `to_csr()`/`to_csc()` delegate to `CsrMatrix::from_coo`/`CscMatrix::from_coo` (both summing duplicate `(row,col)` entries), mirroring scipy `coo_matrix.tocsr` (`_coo.py:349`)/`tocsc` (`_coo.py:316`); `transpose()` swaps the row/col index arrays and the `(M,N)` shape to `(n_cols,n_rows)`, mirroring scipy `coo_matrix.transpose`/`.T` with `axes=(1,0)` (`_coo.py:229` — `permuted_coords`/`permuted_shape`). Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` → `tocsr/tocsc.toarray()`=`[[3,0,0],[0,0,2],[0,5,0]]`, `transpose.toarray()`=`[[3,0,0],[0,0,5],[0,2,0]]` (shape `(3,3)`); non-square `from_triplets(2,3,[0,1],[2,0],[7,9])` → `transpose.toarray()`=`[[0,9],[0,0],[7,0]]` (shape `(3,2)`). Guards `coo_to_csr_matches_scipy`/`coo_to_csc_matches_scipy`/`coo_transpose_matches_scipy`/`coo_transpose_non_square`. Reductions (#1997, continuing): `sum()` (Σ all `data()` from `T::zero()`, scipy `_coo.py:1429` axis=None), `sum_axis0()` (column sums, length `n_cols`), `sum_axis1()` (row sums, length `n_rows`) — each computed from the triplets (`row()`/`col()`/`data()`), so DUPLICATE `(row,col)` entries are SUMMED (matching scipy); `diagonal()` (length `min(n_rows,n_cols)`, `out[r] += v` when `r==c`, diagonal duplicates summed, scipy `_coo.py:458`). Bounds `T: Copy + Zero + Add<Output=T>`. Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` = `[[3,0,0],[0,0,2],[0,5,0]]` → `sum()`=10.0, `sum_axis0()`=`[3,5,2]`, `sum_axis1()`=`[3,2,5]`, `diagonal()`=`[3,0,0]`; duplicate `coo_matrix(([3,5],([0,0],[0,0])),shape=(2,2))` → `sum()`=8.0, `diagonal()`=`[8,0]`. Guards `coo_sum_matches_scipy`/`coo_sum_axis0_matches_scipy`/`coo_sum_axis1_matches_scipy`/`coo_diagonal_matches_scipy`/`coo_sum_diagonal_sum_duplicates`. `copy()` (`scipy/sparse/_data.py:94`) returns an identical matrix preserving all stored entries incl. explicit zeros/duplicates (bound `T: Clone`); `eliminate_zeros()` (`scipy/sparse/_coo.py:798`) returns a new matrix keeping only triplets with `data[k] != T::zero()` (bound `T: Clone + Zero + PartialEq`). Guards `coo_copy_preserves_stored_zero`/`coo_eliminate_zeros_matches_scipy`. Scalar reductions (#1997): `max()`/`min()` (`scipy/sparse/_data.py:208`-`:224`, `_minmax_mixin._min_or_max` axis=None) reduce over `data()` and fold an implicit `T::zero()` when the matrix is not fully dense (`data().len() < n_rows*n_cols`, scipy `:222`), returning `zero` for an empty matrix (scipy `:219`); bound `T: Copy + Zero + PartialOrd`. Live oracle (R-CHAR-3): all-negative diag `([-3,-1,-5],([0,1,2],[0,1,2]),(3,3))` → `max()`=0.0 (implicit zero wins), `min()`=-5.0; all-positive diag `([3,1,5],…)` → `max()`=5.0, `min()`=0.0; fully-dense `([2,7],([0,0],[0,1]),(1,2))` → `max()`=7.0, `min()`=2.0 (no implicit zero). Guards `coo_max_folds_implicit_zero`/`coo_min_folds_implicit_zero`/`coo_max_min_dense_no_implicit_zero`. Sub-note: `.sum_duplicates`/`.multiply`/`.dot`/arithmetic/`.power`/`.astype` remain NOT-STARTED. |
+//! | REQ-MISSING-METHODS (COO methods) | SHIPPED (#1997) | conversion + transpose: `to_csr()`/`to_csc()` delegate to `CsrMatrix::from_coo`/`CscMatrix::from_coo` (both summing duplicate `(row,col)` entries), mirroring scipy `coo_matrix.tocsr` (`_coo.py:349`)/`tocsc` (`_coo.py:316`); `transpose()` swaps the row/col index arrays and the `(M,N)` shape to `(n_cols,n_rows)`, mirroring scipy `coo_matrix.transpose`/`.T` with `axes=(1,0)` (`_coo.py:229` — `permuted_coords`/`permuted_shape`). Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` → `tocsr/tocsc.toarray()`=`[[3,0,0],[0,0,2],[0,5,0]]`, `transpose.toarray()`=`[[3,0,0],[0,0,5],[0,2,0]]` (shape `(3,3)`); non-square `from_triplets(2,3,[0,1],[2,0],[7,9])` → `transpose.toarray()`=`[[0,9],[0,0],[7,0]]` (shape `(3,2)`). Guards `coo_to_csr_matches_scipy`/`coo_to_csc_matches_scipy`/`coo_transpose_matches_scipy`/`coo_transpose_non_square`. Reductions (#1997, continuing): `sum()` (Σ all `data()` from `T::zero()`, scipy `_coo.py:1429` axis=None), `sum_axis0()` (column sums, length `n_cols`), `sum_axis1()` (row sums, length `n_rows`) — each computed from the triplets (`row()`/`col()`/`data()`), so DUPLICATE `(row,col)` entries are SUMMED (matching scipy); `diagonal()` (length `min(n_rows,n_cols)`, `out[r] += v` when `r==c`, diagonal duplicates summed, scipy `_coo.py:458`). Bounds `T: Copy + Zero + Add<Output=T>`. Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` = `[[3,0,0],[0,0,2],[0,5,0]]` → `sum()`=10.0, `sum_axis0()`=`[3,5,2]`, `sum_axis1()`=`[3,2,5]`, `diagonal()`=`[3,0,0]`; duplicate `coo_matrix(([3,5],([0,0],[0,0])),shape=(2,2))` → `sum()`=8.0, `diagonal()`=`[8,0]`. Guards `coo_sum_matches_scipy`/`coo_sum_axis0_matches_scipy`/`coo_sum_axis1_matches_scipy`/`coo_diagonal_matches_scipy`/`coo_sum_diagonal_sum_duplicates`. `copy()` (`scipy/sparse/_data.py:94`) returns an identical matrix preserving all stored entries incl. explicit zeros/duplicates (bound `T: Clone`); `eliminate_zeros()` (`scipy/sparse/_coo.py:798`) returns a new matrix keeping only triplets with `data[k] != T::zero()` (bound `T: Clone + Zero + PartialEq`). Guards `coo_copy_preserves_stored_zero`/`coo_eliminate_zeros_matches_scipy`. Scalar reductions (#1997): `max()`/`min()` (`scipy/sparse/_data.py:208`-`:224`, `_minmax_mixin._min_or_max` axis=None) reduce over `data()` and fold an implicit `T::zero()` when the matrix is not fully dense (`data().len() < n_rows*n_cols`, scipy `:222`), returning `zero` for an empty matrix (scipy `:219`); bound `T: Copy + Zero + PartialOrd`. Live oracle (R-CHAR-3): all-negative diag `([-3,-1,-5],([0,1,2],[0,1,2]),(3,3))` → `max()`=0.0 (implicit zero wins), `min()`=-5.0; all-positive diag `([3,1,5],…)` → `max()`=5.0, `min()`=0.0; fully-dense `([2,7],([0,0],[0,1]),(1,2))` → `max()`=7.0, `min()`=2.0 (no implicit zero). Guards `coo_max_folds_implicit_zero`/`coo_min_folds_implicit_zero`/`coo_max_min_dense_no_implicit_zero`. `sum_duplicates()` (`scipy/sparse/_coo.py:768`, via `_sum_duplicates` `:779`) returns a new matrix collapsing duplicate `(row,col)` entries by SUMMING their values, in canonical `(row,col)`-sorted order (BTreeMap accumulation), and PRESERVES zero-sum entries (canonicalization only — removing zeros is `eliminate_zeros`'s separate job); bound `T: Copy + Zero + Add<Output=T>`. Live oracle (R-CHAR-3): `coo_matrix(([3,5,2,1],([0,0,2,2],[0,0,2,2])),(3,3))` → `nnz=2`, `row=[0,2]`, `col=[0,2]`, `data=[8,3]`; `coo_matrix(([4,-4,7],([0,0,1],[0,0,1])),(2,2))` → `nnz=2`, `data=[0,7]` (the zero-sum `(0,0)` preserved). Guards `coo_sum_duplicates_matches_scipy`/`coo_sum_duplicates_preserves_zero_sum`. Sub-note: `.multiply`/`.dot`/arithmetic/`.power`/`.astype` remain NOT-STARTED. |
 //! | REQ-FERRAY (ferray sparse substrate) | NOT-STARTED | `sprs::TriMat` + `ndarray` vs ferray's sparse COO analog (R-SUBSTRATE-1; ferray has no sparse layer yet). Blocker #1998. |
 
+use std::collections::BTreeMap;
 use std::ops::Add;
 
 use ferrolearn_core::FerroError;
@@ -430,6 +431,57 @@ where
             out[r] = out[r] + val;
         }
         out
+    }
+
+    /// Collapse duplicate `(row, col)` entries by **summing** their values,
+    /// returning a **new** matrix in canonical `(row, col)`-sorted order.
+    ///
+    /// Mirrors scipy `coo_matrix.sum_duplicates()` (`scipy/sparse/_coo.py:768`,
+    /// delegating to `_sum_duplicates`, `:779`), which canonicalizes the matrix:
+    /// it lexsorts the coordinates (`order = np.lexsort(coords[::-1])`, `:786`) so
+    /// the entries end up in `(row, col)` order, then adds together the values of
+    /// every group of identical coordinates (`np.add.reduceat`, `:795`). scipy
+    /// mutates in place; here we return a new [`CooMatrix`] (functional style,
+    /// consistent with the other COO methods that return new matrices).
+    ///
+    /// Crucially, this **only canonicalizes** — it does NOT drop entries whose
+    /// summed value is zero. Removing zeros is the separate job of
+    /// [`eliminate_zeros`](Self::eliminate_zeros) (scipy's `sum_duplicates` and
+    /// `eliminate_zeros` are distinct methods). A group of duplicates that cancel
+    /// to zero is preserved as a single zero-valued stored entry.
+    ///
+    /// A [`BTreeMap`] keyed on `(row, col)` accumulates the values (adding into
+    /// the entry on collision) and yields keys in sorted `(row, col)` order,
+    /// matching scipy's canonical form.
+    ///
+    /// Live oracle (R-CHAR-3): for
+    /// `sp.coo_matrix(([3.,5.,2.,1.],([0,0,2,2],[0,0,2,2])),shape=(3,3))`,
+    /// `sum_duplicates()` yields `nnz == 2`, `row == [0, 2]`, `col == [0, 2]`,
+    /// `data == [8, 3]` (`(0,0)=3+5`, `(2,2)=2+1`); for
+    /// `sp.coo_matrix(([4.,-4.,7.],([0,0,1],[0,0,1])),shape=(2,2))`, it yields
+    /// `nnz == 2`, `row == [0, 1]`, `col == [0, 1]`, `data == [0, 7]` — the
+    /// zero-sum `(0,0)` entry is **preserved**.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`from_triplets`](Self::from_triplets);
+    /// infallible for any structurally valid `CooMatrix` (the accumulated indices
+    /// stay in bounds of the unchanged shape).
+    pub fn sum_duplicates(&self) -> Result<CooMatrix<T>, FerroError> {
+        let mut acc: BTreeMap<(usize, usize), T> = BTreeMap::new();
+        for ((&r, &c), &val) in self.row().iter().zip(self.col()).zip(self.data()) {
+            let entry = acc.entry((r, c)).or_insert_with(T::zero);
+            *entry = *entry + val;
+        }
+        let mut row = Vec::with_capacity(acc.len());
+        let mut col = Vec::with_capacity(acc.len());
+        let mut data = Vec::with_capacity(acc.len());
+        for ((r, c), val) in acc {
+            row.push(r);
+            col.push(c);
+            data.push(val);
+        }
+        Self::from_triplets(self.n_rows(), self.n_cols(), row, col, data)
     }
 
     /// Main diagonal, a length-`min(n_rows, n_cols)` vector.
