@@ -53,7 +53,7 @@
 //! | REQ-8 | array-valued `alpha` (per-target) | NOT-STARTED | `alpha: F` scalar (`kernel_ridge.py:202`) — blocker #1665 |
 //! | REQ-9 | kernel coverage (laplacian/chi2/additive_chi2/cosine/precomputed/callable/kernel_params) | NOT-STARTED | `KernelType` = Rbf/Polynomial/Linear/Sigmoid only — blocker #1666 |
 //! | REQ-10 | parameter validation (alpha≥0, gamma≥0 or None) | SHIPPED | `fn fit` rejects `alpha<0` + `gamma<0` (sklearn `_parameter_constraints` `:134-144`, fixed #1663); `divergence_negative_gamma_not_rejected` |
-//! | REQ-11 | sklearn fitted-attr names (`X_fit_`/`n_features_in_`) | NOT-STARTED | accessors are `dual_coef()`/`x_fit()`; no `n_features_in_` — blocker #1667 |
+//! | REQ-11 | sklearn fitted-attr names (`X_fit_`/`n_features_in_`) | SHIPPED | `x_fit()` is the `X_fit_` analog; added `n_features_in()` (= `x_fit.ncols()`, sklearn `kernel_ridge.py:93`); `kernel_ridge_n_features_in_matches_sklearn`. (PyO3 re-export of `X_fit_`/`n_features_in_` rides REQ-substrate/binding.) |
 //! | REQ-12 | ferray substrate | NOT-STARTED | `ndarray` + hand-rolled cholesky/gaussian, not `ferray-core`/`ferray::linalg` — blocker #1668 |
 //! | REQ-13 | non-test production consumer | SHIPPED | `RsKernelRidge` in `ferrolearn-python` (`extras.rs` + `_extras.py`); param-plumbing gap (only `alpha`) — blocker #1664 |
 //!
@@ -178,10 +178,20 @@ impl<F: Float + Send + Sync + 'static> FittedKernelRidge<F> {
         &self.dual_coef
     }
 
-    /// Return a reference to the stored training data.
+    /// Return a reference to the stored training data (sklearn `X_fit_`,
+    /// `kernel_ridge.py:88`).
     #[must_use]
     pub fn x_fit(&self) -> &Array2<F> {
         &self.x_fit
+    }
+
+    /// Number of features seen during fitting (sklearn `n_features_in_`,
+    /// `kernel_ridge.py:93`).
+    ///
+    /// Equals the number of columns of the stored training matrix `X_fit_`.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.x_fit.ncols()
     }
 
     /// R² coefficient of determination on the given test data.
@@ -466,6 +476,17 @@ mod tests {
         for &p in preds.iter() {
             assert!(p.is_finite());
         }
+    }
+
+    #[test]
+    fn kernel_ridge_n_features_in_matches_sklearn() -> Result<(), FerroError> {
+        // sklearn KernelRidge().fit(X 3x2,y).n_features_in_ == 2 (= X_fit_.shape[1]).
+        let x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0f64]];
+        let y = array![1.0, 2.0, 3.0f64];
+        let fitted = KernelRidge::<f64>::new().fit(&x, &y)?;
+        assert_eq!(fitted.n_features_in(), 2);
+        assert_eq!(fitted.n_features_in(), fitted.x_fit().ncols());
+        Ok(())
     }
 
     #[test]
