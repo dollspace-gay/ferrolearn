@@ -66,15 +66,16 @@ summing properties (REQ-4), `singular_values_` non-negativity (REQ-5),
 `inverse_transform` round-trip exactness when `n_components == n_features` (REQ-6),
 the error/parameter contracts (REQ-7), f32 generic support (REQ-8), `PipelineTransformer`
 integration (REQ-9), and the PyO3 `_RsPCA` binding surface (REQ-10) are SHIPPED
-scoped, and the `svd_flip` sign convention + exact value parity (REQ-1, was
-`#1500`, fixed this iteration) is now SHIPPED. NOT-STARTED: degenerate value
-carve-out (REQ-2, `#1501`); `whiten` (REQ-11, `#1502`); `svd_solver` +
+scoped, the `svd_flip` sign convention + exact value parity (REQ-1, was `#1500`,
+fixed) is SHIPPED, `whiten` (REQ-11, was `#1502`, fixed) is SHIPPED, and — as of
+this iteration — `get_covariance`/`get_precision` (REQ-14, was `#1505`, fixed) and
+`score`/`score_samples` + `noise_variance_` (REQ-15, was `#1507`, fixed) are SHIPPED.
+NOT-STARTED: degenerate value carve-out (REQ-2, `#1501`); `svd_solver` +
 `full`-SVD/`randomized`/`arpack` paths (REQ-12, `#1503`); `n_components` as float /
-"mle" / None-default (REQ-13, `#1504`); `get_covariance`/`get_precision` (REQ-14,
-`#1505`); `score`/`score_samples` + `noise_variance_` (REQ-15, `#1507`);
-`n_components_`/`n_features_in_` fitted attrs (REQ-16, `#1508`);
-`tol`/`iterated_power`/`n_oversamples`/`random_state`/`copy` ctor params (REQ-17,
-`#1509`); the ferray substrate (REQ-18, `#1510`) — **9 SHIPPED / 9 NOT-STARTED**.
+"mle" / None-default (REQ-13, `#1504`); `n_components_`/`n_features_in_` fitted attrs
+(REQ-16, `#1508`); `tol`/`iterated_power`/`n_oversamples`/`random_state`/`copy` ctor
+params (REQ-17, `#1509`); the ferray substrate (REQ-18, `#1510`) — **12 SHIPPED /
+6 NOT-STARTED**.
 
 `PCA` / `FittedPCA` are existing pub APIs whose non-test consumers are the crate
 re-export (`lib.rs:98`, boundary public API, grandfathered S5/R-DEFER-1), the
@@ -321,21 +322,51 @@ mv=PCA(n_components=0.95).fit(X); print('float n_components=0.95 -> n_components
   ferrolearn's `PCA::new(n_components: usize)` (`pca.rs:62`) requires an explicit
   integer count — no float / "mle" / None postprocessing.
 
-- REQ-14: **`get_covariance` / `get_precision` (NOT-STARTED; `#1505`).** sklearn's
-  `_BasePCA.get_covariance` (`_base.py:30-56`) reconstructs `cov = components_ᵀ ·
-  exp_var_diff · components_ + noise_variance_·I` and `get_precision`
-  (`_base.py:58-101`) its inverse via the matrix-inversion lemma (Probe 4:
-  `get_covariance` shape `(2,2)`). `FittedPCA<F>` (`pca.rs:87`) exposes neither — it
-  has no `noise_variance_` field (REQ-15) on which both depend.
+- REQ-14: **`get_covariance` / `get_precision` (SHIPPED; was `#1505`, fixed).**
+  sklearn's `_BasePCA.get_covariance` (`_base.py:30-56`) reconstructs `cov =
+  components_ᵀ · exp_var_diff · components_ + noise_variance_·I` (with `exp_var_diff[k]
+  = max(explained_variance_[k] − noise_variance_, 0)`) and `get_precision`
+  (`_base.py:58-101`) its inverse via the matrix-inversion lemma. `FittedPCA<F>` now
+  exposes both: `get_covariance` (symbol `FittedPCA::get_covariance`) accumulates `Σ_k
+  exp_var_diff[k]·(component_k ⊗ component_k)` and adds `noise_variance_` to the
+  diagonal = `_base.py:54-55`; `get_precision` (symbol `FittedPCA::get_precision`,
+  sharing `precision_and_logdet`) symmetric-eigendecomposes `get_covariance` via the
+  SAME `eigen_dispatch` faer `self_adjoint_eigen` routine `fn fit` uses (`pca.rs`),
+  yielding `precision = V·diag(1/λ)·Vᵀ` — the unique inverse of the PD covariance,
+  element-wise equal to sklearn's lemma result. It returns
+  `Err(NumericalInstability)` if `whiten` is enabled, the eigendecomposition fails, or
+  any covariance eigenvalue `≤ 0`. Verification (live sklearn 1.5.2, R-CHAR-3,
+  `X=[[1,2,3],[4,5,6],[7,8,10],[2,1,0],[5,3,2]]`, `n_components=2`):
+  `get_covariance = [[5.7,5.7,6.8],[5.7,7.7,10.55],[6.8,10.55,15.2]]`,
+  `get_precision = [[8.91262136,−23.14563107,12.0776699],…]` — matched element-wise to
+  1e-6 by `pca_get_covariance_matches_sklearn` / `pca_get_precision_matches_sklearn`.
+  Non-test consumers: `score_samples`/`score` (via `precision_and_logdet`), re-export
+  `lib.rs:98`.
 
 - REQ-15: **`score` / `score_samples` (Gaussian log-likelihood) + `noise_variance_`
-  (NOT-STARTED; `#1507`).** sklearn's `PCA` exposes `score_samples`/`score` (the
-  per-sample / average Gaussian log-likelihood under the probabilistic-PCA model,
-  using `get_precision` and `noise_variance_`; Probe 4: `score = -1.355761`) and the
-  fitted `noise_variance_ = mean(explained_variance_[n_components:])` (`_pca.py:686`,
-  Probe 4: `0.049083`). `FittedPCA<F>` (`pca.rs:87`) has no `noise_variance_`,
-  `score`, or `score_samples` — it never retains the discarded-eigenvalue tail
-  (`fn fit` keeps only the top `n_comp`, `pca.rs:438`).
+  (SHIPPED; was `#1507`, fixed).** sklearn's `PCA` exposes `score_samples`/`score`
+  (the per-sample / average Gaussian log-likelihood under the probabilistic-PCA model,
+  using `get_precision` and `noise_variance_`) and the fitted `noise_variance_ =
+  mean(explained_variance_[n_components:min(n_samples,n_features)])` (`_pca.py:685-688`).
+  `fn fit` now captures the FULL eigenvalue spectrum BEFORE truncating and, when
+  `n_comp < min(n_samples, n_features)`, sets `noise_variance_ =
+  mean(sorted_eigenvalues[n_comp..min_dim])` (negatives clipped to 0, matching the
+  `explained_variance_` clip `_pca.py:637`; the `cov` is already `XᵀX/(n−1)` so its
+  eigenvalues ARE the explained variances), else `0` — exposed via the
+  `FittedPCA::noise_variance` getter. `FittedPCA::score_samples` computes `Xr = X −
+  mean_`; `ll_i = −0.5·(Xr_i·precision·Xr_iᵀ) − 0.5·(p·ln(2π) − logdet(precision))`
+  where `logdet(precision) = −Σ ln(λ)` (λ = eigenvalues of `get_covariance`, obtained
+  in the same eigendecomposition as the precision via `precision_and_logdet`) =
+  sklearn `_pca.py:805-830`; `FittedPCA::score = mean(score_samples)` = `_pca.py:832-853`.
+  Shape-guards `x.ncols() == mean_.len()` (`ShapeMismatch`); propagates
+  `get_precision`'s `NumericalInstability`. Scope: `whiten=false` path only (the
+  `whiten=true` un-scaling, `_base.py:46-47,88-89`, returns `NumericalInstability`).
+  Verification (live sklearn 1.5.2, R-CHAR-3, same fixture): `noise_variance_ =
+  0.011251254758681639`, `score_samples(X) = [−4.09775823, −3.66086503, −3.78707862,
+  −3.35018542, −3.78707862]`, `score(X) = −3.736593186111911` — matched to 1e-6 by
+  `pca_noise_variance_matches_sklearn` / `pca_score_samples_matches_sklearn` /
+  `pca_score_matches_sklearn`. Non-test consumers: re-export `lib.rs:98`,
+  `noise_variance_`+`get_precision` consumed by the score chain.
 
 - REQ-16: **Fitted attrs `n_components_` / `n_features_in_` (NOT-STARTED; `#1508`).**
   sklearn exposes `n_components_` (the resolved count after float/"mle"/None
@@ -454,8 +485,8 @@ confirmed `components_`/`transform`/`explained_variance_`/`explained_variance_ra
 `singular_values_` match sklearn element-wise to 1e-6 on non-degenerate fixtures);
 ferrolearn's `explained_variance_ratio_` correctly divides by the sum of ALL
 eigenvalues (`pca.rs:430` = sklearn `total_var = sum(explained_variance_)`
-`_pca.py:652`). #1499 is this doc's crosslink tracking issue. Count: **9 SHIPPED
-(REQ-1,3,4,5,6,7,8,9,10) / 9 NOT-STARTED (REQ-2,11,12,13,14,15,16,17,18)**.
+`_pca.py:652`). #1499 is this doc's crosslink tracking issue. Count: **12 SHIPPED
+(REQ-1,3,4,5,6,7,8,9,10,11,14,15) / 6 NOT-STARTED (REQ-2,12,13,16,17,18)**.
 
 | REQ | Status | Evidence |
 |---|---|---|
@@ -472,8 +503,8 @@ eigenvalues (`pca.rs:430` = sklearn `total_var = sum(explained_variance_)`
 | REQ-11 (`whiten`) | SHIPPED | `PCA<F>` gains `pub whiten: bool` (default `false`) + `with_whiten` builder + `whiten()` getter (`_pca.py:412`), threaded into `FittedPCA`. `Transform::transform` computes `(X−mean)·componentsᵀ` then, when `whiten`, divides each component column `j` by `sqrt(explained_variance_[j])` (clipping `scale < ε` to `ε`, mirroring sklearn `_base.py:162-165`); `inverse_transform` multiplies each input column by `sqrt(explained_variance_[j])` before `·components_ + mean_` (`_base.py:192-196`). `whiten=false` byte-identical (to_bits regression-guarded). Verification (live sklearn 1.5.2, R-CHAR-3, `X=[[1,2,3],[4,5,6],[7,8,10],[2,1,0],[5,3,2]]`, `n_components=2`, `explained_variance_=[26.42340146,2.16534729]`): whiten transform `[[-0.57668477,-1.31079008],…,[-0.31105272,1.41883338]]`; inverse round-trip matches sklearn (≤1e-6 incl. sign). Tests `pca_whiten_transform_matches_sklearn`, `pca_whiten_false_unchanged`, `pca_whiten_inverse_matches_sklearn`. |
 | REQ-12 (`svd_solver` + full-SVD / randomized / arpack paths) | NOT-STARTED | open prereq blocker **#1503**. sklearn `PCA(svd_solver="auto")` (`_pca.py:413`) auto-selects covariance_eigh/full/randomized (`:531-543`); `_fit_full` full branch (`:575-591`) SVDs centered X (`explained_variance_ = S²/(n−1)` `:591`); `_fit_truncated` (`:711-778`) drives ARPACK `svds` (`:755`) / `randomized_svd` (`:764`). ferrolearn implements ONLY the covariance_eigh-equivalent eigendecomposition (`fn fit` `pca.rs:369`, `eigen_dispatch` `pca.rs:316`) — no `svd_solver` field, no SVD-of-X / randomized / ARPACK path. |
 | REQ-13 (`n_components` as float / "mle" / None-default) | NOT-STARTED | open prereq blocker **#1504**. sklearn accepts `n_components=None` (→ `min(X.shape)` `_pca.py:523-527`), float in `(0,1)` via cumulative-ratio cumsum (`_pca.py:659-681`, Probe 4: `0.95 → n_components_ 1`), and `"mle"` (`_infer_dimension` `:657-658`). ferrolearn `PCA::new(n_components: usize)` (`pca.rs:62`) requires an explicit integer — no float / "mle" / None postprocessing. |
-| REQ-14 (`get_covariance` / `get_precision`) | NOT-STARTED | open prereq blocker **#1505**. sklearn `_BasePCA.get_covariance` (`_base.py:30-56`) = `components_ᵀ·exp_var_diff·components_ + noise_variance_·I`; `get_precision` (`_base.py:58-101`) its inverse via the matrix-inversion lemma (Probe 4: `get_covariance` shape `(2,2)`). `FittedPCA<F>` (`pca.rs:87`) exposes neither — no `noise_variance_` field (REQ-15) on which both depend. |
-| REQ-15 (`score` / `score_samples` + `noise_variance_`) | NOT-STARTED | open prereq blocker **#1507**. sklearn `PCA` exposes `score_samples`/`score` (per-sample / average Gaussian log-likelihood under probabilistic PCA, using `get_precision` + `noise_variance_`; Probe 4: `score = -1.355761`) and fitted `noise_variance_ = mean(explained_variance_[n_components:])` (`_pca.py:686`, Probe 4: `0.049083`). `FittedPCA<F>` (`pca.rs:87`) has no `noise_variance_`/`score`/`score_samples` — `fn fit` keeps only the top `n_comp` (`pca.rs:438`), discarding the eigenvalue tail. |
+| REQ-14 (`get_covariance` / `get_precision`) | SHIPPED | was blocker **#1505** (FIXABLE), now fixed. sklearn `_BasePCA.get_covariance` (`_base.py:30-56`) = `components_ᵀ·exp_var_diff·components_ + noise_variance_·I` (`exp_var_diff[k] = max(explained_variance_[k] − noise_variance_, 0)` `:48-53`); `get_precision` (`_base.py:58-101`) its inverse via the matrix-inversion lemma. ferrolearn `FittedPCA::get_covariance` (symbol `get_covariance`) accumulates `Σ_k exp_var_diff[k]·(component_k ⊗ component_k)` and adds `noise_variance_` to the diagonal (= `_base.py:54-55`); `FittedPCA::get_precision` (symbol `get_precision`, sharing `precision_and_logdet`) symmetric-eigendecomposes `get_covariance` via the SAME faer `eigen_dispatch`/`self_adjoint_eigen` routine `fn fit` uses → `precision = V·diag(1/λ)·Vᵀ`, the unique inverse of the PD covariance, element-wise equal to sklearn's lemma result; returns `Err(NumericalInstability)` for `whiten=true`, eigendecomposition failure, or any eigenvalue `≤ 0`. Non-test consumers: `score_samples`/`score` (via `precision_and_logdet`), re-export `lib.rs:98`. Verification: `cargo test -p ferrolearn-decomp pca` → `pca_get_covariance_matches_sklearn` (oracle `[[5.7,5.7,6.8],[5.7,7.7,10.55],[6.8,10.55,15.2]]`), `pca_get_precision_matches_sklearn` (oracle `[[8.91262136,−23.14563107,12.0776699],…]`) match the live sklearn 1.5.2 oracle element-wise to 1e-6 (`X=[[1,2,3],[4,5,6],[7,8,10],[2,1,0],[5,3,2]]`, `n_components=2`, `whiten=false`). |
+| REQ-15 (`score` / `score_samples` + `noise_variance_`) | SHIPPED | was blocker **#1507** (FIXABLE), now fixed. sklearn `PCA` exposes `score_samples`/`score` (per-sample / average Gaussian log-likelihood under probabilistic PCA, `ll_i = −0.5·(Xr_i·precision·Xr_iᵀ) − 0.5·(p·ln(2π) − fast_logdet(precision))` `_pca.py:805-830`; `score = mean(score_samples)` `:832-853`) and fitted `noise_variance_ = mean(explained_variance_[n_components:min(n_samples,n_features)])` (`_pca.py:685-688`). `fn fit` now captures the FULL eigenvalue spectrum before truncation and sets `noise_variance_ = mean(sorted_eigenvalues[n_comp..min_dim])` (negatives clipped to 0, `cov` already `XᵀX/(n−1)` so eigenvalues == explained variances), else 0 — getter `FittedPCA::noise_variance`. `FittedPCA::score_samples` computes `Xr = X − mean_` then the per-row quadratic with `logdet(precision) = −Σ ln(λ)` (λ from the same `precision_and_logdet` eigendecomposition); `FittedPCA::score = mean(score_samples)`. Shape-guards `x.ncols() == mean_.len()` (`ShapeMismatch`); propagates `get_precision`'s `NumericalInstability`; `whiten=true` path returns `NumericalInstability` (scoped). Non-test consumers: re-export `lib.rs:98`, the score chain consumes `noise_variance_`+`get_precision`. Verification: `cargo test -p ferrolearn-decomp pca` → `pca_noise_variance_matches_sklearn` (oracle `0.011251254758681639`), `pca_score_samples_matches_sklearn` (oracle `[−4.09775823,−3.66086503,−3.78707862,−3.35018542,−3.78707862]`), `pca_score_matches_sklearn` (oracle `−3.736593186111911`) match the live sklearn 1.5.2 oracle to 1e-6 (same fixture, `whiten=false`). |
 | REQ-16 (fitted attrs `n_components_` / `n_features_in_`) | NOT-STARTED | open prereq blocker **#1508**. sklearn exposes `n_components_` (resolved count after float/"mle"/None postprocess `_pca.py:691`; Probe 4: `1`) and `n_features_in_` (Probe 4: `2`). `FittedPCA<F>` (`pca.rs:87`) exposes `components()`/`explained_variance()`/`explained_variance_ratio()`/`mean()`/`singular_values()` (`pca.rs:109-135`) — no `n_components_` accessor (derivable from `components_.nrows()`), no `n_features_in_` (derivable from `mean_.len()`). |
 | REQ-17 (`tol`/`iterated_power`/`n_oversamples`/`random_state`/`copy` ctor params) | NOT-STARTED | open prereq blocker **#1509**. sklearn `PCA.__init__` (`_pca.py:407-423`) takes `copy=True`, `tol=0.0`, `iterated_power="auto"`, `n_oversamples=10`, `power_iteration_normalizer="auto"`, `random_state=None` (Probe 3) — governing the randomized/arpack truncated solvers (REQ-12) and in-place copy. ferrolearn `PCA<F>` (`pca.rs:48`) has the `n_components` field ONLY — none of these exist. |
 | REQ-18 (ferray substrate) | NOT-STARTED | open prereq blocker **#1510**. `pca.rs` computes on `ndarray::{Array1, Array2}` (`pca.rs:34`) and eigendecomposes via `faer` (`faer_eigen_f64`/`faer_eigen_f32` `pca.rs:279`/`:296`) + a hand-rolled Jacobi fallback (`jacobi_eigen` `pca.rs:175`), not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). |
@@ -540,18 +571,20 @@ subclass adds `score`/`score_samples`.
 **The remaining gap.** ferrolearn ships the STRUCTURAL orthonormality (REQ-3),
 variance ordering / ratio-sum (REQ-4), singular-value magnitudes (REQ-5), exact
 round-trip inverse (REQ-6), the scoped error & parameter contracts (REQ-7), f32
-support (REQ-8), pipeline integration (REQ-9), the rich PyO3 binding (REQ-10), and —
-as of this iteration — the `svd_flip` sign convention + exact value parity (REQ-1,
-was `#1500`, fixed): its fit mirrors sklearn's `covariance_eigh` solver exactly,
-including the deterministic sign step. It lacks: the degenerate/rank-deficient VALUE
-carve-out (REQ-2, `#1501`); `whiten` (REQ-11, `#1502`); `svd_solver` +
-full-SVD/randomized/arpack (REQ-12, `#1503`); float/"mle"/None `n_components`
-(REQ-13, `#1504`); `get_covariance`/`get_precision` (REQ-14, `#1505`);
-`score`/`score_samples` + `noise_variance_` (REQ-15, `#1507`);
+support (REQ-8), pipeline integration (REQ-9), the rich PyO3 binding (REQ-10), the
+`svd_flip` sign convention + exact value parity (REQ-1, was `#1500`, fixed: its fit
+mirrors sklearn's `covariance_eigh` solver exactly, including the deterministic sign
+step), `whiten` (REQ-11, was `#1502`, fixed), and — as of this iteration — the
+probabilistic-PCA chain `get_covariance`/`get_precision` (REQ-14, was `#1505`, fixed)
+and `score`/`score_samples` + `noise_variance_` (REQ-15, was `#1507`, fixed; via the
+discarded-eigenvalue-tail mean and a symmetric eigendecomposition of
+`get_covariance`, `whiten=false` path). It lacks: the degenerate/rank-deficient VALUE
+carve-out (REQ-2, `#1501`); `svd_solver` + full-SVD/randomized/arpack (REQ-12,
+`#1503`); float/"mle"/None `n_components` (REQ-13, `#1504`);
 `n_components_`/`n_features_in_` attrs (REQ-16, `#1508`); the
 `tol`/`iterated_power`/`n_oversamples`/`random_state`/`copy` ctor params (REQ-17,
 `#1509`); and the ferray substrate (REQ-18, `#1510`). This is a
-**value-parity-SHIPPED-API-surface-NOT-STARTED** unit (9 SHIPPED / 9 NOT-STARTED),
+**value-parity-SHIPPED-API-surface-PARTIAL** unit (12 SHIPPED / 6 NOT-STARTED),
 where REQ-2 is a genuine eigensolver carve-out.
 
 ## Verification
