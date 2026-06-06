@@ -51,7 +51,7 @@
 //! | REQ-8 | f32 generic support | SHIPPED | `test_pca_f32`; faer f32 eigensolver path |
 //! | REQ-9 | `PipelineTransformer` integration | SHIPPED | `pca.rs:509-536`; `test_pca_pipeline_integration` |
 //! | REQ-10 | PyO3 `_RsPCA` binding (fit/transform/inverse_transform + components_/explained_variance_/explained_variance_ratio_/mean_/singular_values_ getters) | SHIPPED | `transformers.rs:89`, registered `lib.rs:23`; inherits REQ-1's deterministic signs |
-//! | REQ-11 | `whiten` (transform /sqrt(explained_variance_), inverse un-scale) | NOT-STARTED | sklearn `_base.py:157-165,:192-196`; ferrolearn no `whiten` — blocker #1502 |
+//! | REQ-11 | `whiten` (transform /sqrt(explained_variance_), inverse un-scale) | SHIPPED | `PCA::with_whiten` sets `whiten` (threaded into `FittedPCA`); `Transform::transform` divides each column j by `sqrt(explained_variance_[j])` (eps-clipped) = sklearn `_base.py:157-165`, and `inverse_transform` multiplies back = `_base.py:192-196`. `whiten=false` byte-identical to default. In-module `pca_whiten_transform_matches_sklearn`/`pca_whiten_false_unchanged`/`pca_whiten_inverse_matches_sklearn` match the live sklearn 1.5.2 oracle to 1e-6. Was #1502, fixed |
 //! | REQ-12 | `svd_solver` param + full-SVD/randomized/arpack paths | NOT-STARTED | sklearn `_pca.py:519-548,:575-591,:711-778`; ferrolearn covariance_eigh only — blocker #1503 |
 //! | REQ-13 | `n_components` as float (variance ratio) / "mle" / None-default | NOT-STARTED | sklearn `_pca.py:657-691`; ferrolearn requires explicit `usize` — blocker #1504 |
 //! | REQ-14 | `get_covariance` / `get_precision` | NOT-STARTED | sklearn `_base.py:30-101`; depends on `noise_variance_` (REQ-15) — blocker #1505 |
@@ -60,7 +60,7 @@
 //! | REQ-17 | ctor params `tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy` | NOT-STARTED | sklearn `_pca.py:407-423`; ferrolearn has `n_components` only — blocker #1509 |
 //! | REQ-18 | ferray substrate | NOT-STARTED | dense `ndarray` + direct `faer`/Jacobi — blocker #1510 |
 //!
-//! Count: **9 SHIPPED (REQ-1,3,4,5,6,7,8,9,10) / 9 NOT-STARTED (REQ-2,11,12,13,14,15,16,17,18)**.
+//! Count: **10 SHIPPED (REQ-1,3,4,5,6,7,8,9,10,11) / 8 NOT-STARTED (REQ-2,12,13,14,15,16,17,18)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -82,11 +82,21 @@ use std::any::TypeId;
 pub struct PCA<F> {
     /// The number of principal components to retain.
     n_components: usize,
+    /// When `true`, [`Transform::transform`] divides each projected component
+    /// by `sqrt(explained_variance_)` so the transformed output has unit
+    /// component-wise variance, and [`FittedPCA::inverse_transform`]
+    /// re-multiplies before reconstructing. Mirrors sklearn `PCA(whiten=...)`
+    /// (`sklearn/decomposition/_base.py:157-165` for the transform scale,
+    /// `:192-196` for the inverse un-scale). Defaults to `false`.
+    whiten: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> PCA<F> {
     /// Create a new `PCA` that retains `n_components` principal components.
+    ///
+    /// Whitening is disabled by default (sklearn `whiten=False`); enable it
+    /// with [`PCA::with_whiten`].
     ///
     /// # Panics
     ///
@@ -96,14 +106,33 @@ impl<F: Float + Send + Sync + 'static> PCA<F> {
     pub fn new(n_components: usize) -> Self {
         Self {
             n_components,
+            whiten: false,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Enable or disable whitening (sklearn `PCA(whiten=...)`).
+    ///
+    /// When `whiten` is `true`, [`Transform::transform`] divides each projected
+    /// component by `sqrt(explained_variance_)`
+    /// (`sklearn/decomposition/_base.py:157-165`), and
+    /// [`FittedPCA::inverse_transform`] re-multiplies it back (`:192-196`).
+    #[must_use]
+    pub fn with_whiten(mut self, whiten: bool) -> Self {
+        self.whiten = whiten;
+        self
     }
 
     /// Return the number of components this PCA is configured to retain.
     #[must_use]
     pub fn n_components(&self) -> usize {
         self.n_components
+    }
+
+    /// Return whether whitening is enabled.
+    #[must_use]
+    pub fn whiten(&self) -> bool {
+        self.whiten
     }
 }
 
@@ -135,6 +164,11 @@ pub struct FittedPCA<F> {
 
     /// Singular values corresponding to each component.
     singular_values_: Array1<F>,
+
+    /// Whether whitening is applied in `transform`/`inverse_transform`.
+    /// Propagated from the unfitted [`PCA::whiten`] setting. Mirrors sklearn
+    /// `PCA(whiten=...)` (`sklearn/decomposition/_base.py:157-165,:192-196`).
+    whiten: bool,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedPCA<F> {
@@ -170,7 +204,13 @@ impl<F: Float + Send + Sync + 'static> FittedPCA<F> {
 
     /// Reconstruct approximate original data from the reduced representation.
     ///
-    /// Computes `X_approx = X_reduced @ components + mean`.
+    /// Computes `X_approx = X_reduced @ components + mean`. When whitening is
+    /// enabled, each input column j is first multiplied by
+    /// `sqrt(explained_variance_[j])` to reverse the `transform` scaling,
+    /// mirroring sklearn `inverse_transform`
+    /// (`sklearn/decomposition/_base.py:192-196`:
+    /// `scaled_components = sqrt(explained_variance_)[:, newaxis] * components_;
+    /// X @ scaled_components + mean_`).
     ///
     /// # Errors
     ///
@@ -185,8 +225,27 @@ impl<F: Float + Send + Sync + 'static> FittedPCA<F> {
                 context: "FittedPCA::inverse_transform".into(),
             });
         }
-        // X_approx = X_reduced @ components + mean
-        let mut result = x_reduced.dot(&self.components_);
+
+        // Whitening: multiply each column j by sqrt(explained_variance_[j])
+        // BEFORE projecting back, reversing the `transform` divide. This is
+        // algebraically identical to sklearn folding the scale into the
+        // components (`_base.py:192-196`). When `whiten` is false the input is
+        // used unchanged.
+        let x_scaled = if self.whiten {
+            let mut x_scaled = x_reduced.to_owned();
+            for j in 0..n_components {
+                let scale = self.explained_variance_[j].sqrt();
+                for v in x_scaled.column_mut(j) {
+                    *v = *v * scale;
+                }
+            }
+            std::borrow::Cow::Owned(x_scaled)
+        } else {
+            std::borrow::Cow::Borrowed(x_reduced)
+        };
+
+        // X_approx = X_scaled @ components + mean
+        let mut result = x_scaled.dot(&self.components_);
         for mut row in result.rows_mut() {
             for (v, &m) in row.iter_mut().zip(self.mean_.iter()) {
                 *v = *v + m;
@@ -521,6 +580,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
             explained_variance_ratio_: explained_variance_ratio,
             mean_: mean,
             singular_values_: singular_values,
+            whiten: self.whiten,
         })
     }
 }
@@ -554,7 +614,30 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPCA<F> {
         }
 
         // Project: X_centered @ components^T
-        Ok(x_centered.dot(&self.components_.t()))
+        let mut result = x_centered.dot(&self.components_.t());
+
+        // Whitening: divide each column j by sqrt(explained_variance_[j]) so
+        // the transformed output has unit component-wise variance. Mirrors
+        // sklearn `_transform` (`sklearn/decomposition/_base.py:157-165`):
+        // `scale = sqrt(explained_variance_); scale[scale < eps] = eps;
+        // X_transformed /= scale`. The eps clip guards against components with
+        // a variance arbitrarily close to zero on rank-deficient data
+        // (`_base.py:158-164`). When `whiten` is false this block is skipped,
+        // leaving the result byte-identical to the plain projection.
+        if self.whiten {
+            let min_scale = F::epsilon();
+            for j in 0..result.ncols() {
+                let mut scale = self.explained_variance_[j].sqrt();
+                if scale < min_scale {
+                    scale = min_scale;
+                }
+                for v in result.column_mut(j) {
+                    *v = *v / scale;
+                }
+            }
+        }
+
+        Ok(result)
     }
 }
 
@@ -877,5 +960,96 @@ mod tests {
         let fitted = pipeline.fit(&x, &y).unwrap();
         let preds = fitted.predict(&x).unwrap();
         assert_eq!(preds.len(), 4);
+    }
+
+    // ---- REQ-11: whiten (sklearn _base.py:157-165,:192-196) --------------
+    //
+    // Oracle = live scikit-learn 1.5.2 (R-CHAR-3), run from /tmp:
+    //   X = [[1,2,3],[4,5,6],[7,8,10],[2,1,0],[5,3,2]]
+    //   m = PCA(n_components=2, whiten=<...>).fit(X)
+    //   m.transform(X) / m.inverse_transform(m.transform(X))
+    // PCA component signs are deterministic per REQ-1's svd_flip, so the
+    // element-wise comparison (including sign) is valid.
+
+    fn whiten_fixture() -> Array2<f64> {
+        array![
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [7.0, 8.0, 10.0],
+            [2.0, 1.0, 0.0],
+            [5.0, 3.0, 2.0],
+        ]
+    }
+
+    #[test]
+    fn pca_whiten_transform_matches_sklearn() -> Result<(), FerroError> {
+        let x = whiten_fixture();
+        let fitted = PCA::<f64>::new(2).with_whiten(true).fit(&x, &())?;
+
+        // sklearn explained_variance_ sanity (oracle [26.42340146, 2.16534729]).
+        let ev = fitted.explained_variance();
+        assert_abs_diff_eq!(ev[0], 26.423_401_46, epsilon = 1e-6);
+        assert_abs_diff_eq!(ev[1], 2.165_347_29, epsilon = 1e-6);
+
+        let got = fitted.transform(&x)?;
+        let expected = array![
+            [-0.576_684_77, -1.310_790_08],
+            [0.402_024_00, -0.444_643_84],
+            [1.525_646_44, 0.083_497_24],
+            [-1.039_932_95, 0.253_103_31],
+            [-0.311_052_72, 1.418_833_38],
+        ];
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-6);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pca_whiten_false_unchanged() -> Result<(), FerroError> {
+        let x = whiten_fixture();
+
+        // whiten=false must match the no-whiten sklearn oracle.
+        let fitted = PCA::<f64>::new(2).with_whiten(false).fit(&x, &())?;
+        let got = fitted.transform(&x)?;
+        let expected = array![
+            [-2.964_372_97, -1.928_843_21],
+            [2.066_552_01, -0.654_298_71],
+            [7.842_386_84, 0.122_867_18],
+            [-5.345_639_88, 0.372_444_53],
+            [-1.598_926_00, 2.087_830_21],
+        ];
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-6);
+        }
+
+        // Regression guard: whiten=false MUST be byte-identical to the default
+        // (no-whiten) transform — the whiten block is purely additive.
+        let default_fitted = PCA::<f64>::new(2).fit(&x, &())?;
+        let default_got = default_fitted.transform(&x)?;
+        for (a, b) in got.iter().zip(default_got.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pca_whiten_inverse_matches_sklearn() -> Result<(), FerroError> {
+        let x = whiten_fixture();
+        let fitted = PCA::<f64>::new(2).with_whiten(true).fit(&x, &())?;
+
+        let transformed = fitted.transform(&x)?;
+        let got = fitted.inverse_transform(&transformed)?;
+        let expected = array![
+            [0.965_922_29, 2.092_258_20, 2.951_174_68],
+            [4.045_247_61, 4.877_501_66, 6.064_829_15],
+            [6.986_571_28, 8.036_355_42, 9.980_759_81],
+            [2.022_846_87, 0.938_146_92, 0.032_734_18],
+            [4.979_411_95, 3.055_737_80, 1.970_502_18],
+        ];
+        for (a, b) in got.iter().zip(expected.iter()) {
+            assert_abs_diff_eq!(a, b, epsilon = 1e-6);
+        }
+        Ok(())
     }
 }
