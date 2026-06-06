@@ -32,7 +32,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Eigenvalues are oracle-verified
 //! element-wise (R-CHAR-3) — see `tests/divergence_sparse_eig.rs`.
 //!
-//! **4 SHIPPED / 7 NOT-STARTED.**
+//! **5 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -44,7 +44,7 @@
 //! | REQ-6 (missing modes/params — sigma/M/v0/ncv/return_eigenvectors) | NOT-STARTED | no shift-invert `sigma`, generalized `M`, user `v0`, or `return_eigenvectors=False` (`scipy/sparse/linalg/__init__.py` eigsh signature). Blocker #1980. |
 //! | REQ-7 (missing companions — eigs/svds/lobpcg) | NOT-STARTED | no non-symmetric `eigs`, sparse `svds` (the `TruncatedSVD(algorithm='arpack')` prereq), or `lobpcg`. Blocker #1981. |
 //! | REQ-8 (edge cases — k≥n / non-convergence / k=0) | NOT-STARTED | ferrolearn accepts `k==n` (scipy raises `TypeError`); non-convergence → `Err(String)` vs scipy `ArpackNoConvergence`. Blocker #1982. |
-//! | REQ-9 (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError` / scipy `ValueError`/`ArpackNoConvergence`. Blocker #1983. |
+//! | REQ-9 (error type) | SHIPPED | `solve`/`solve_sparse`/`solve_impl`/`eigsh` return `Result<_, FerroError>`. Validation errors (non-square, `k==0`, `k>n`, `ncv<k+1`) → `FerroError::InvalidParameter` (scipy `eigsh` `ValueError`: `arpack.py:324` `"k must be positive"`, `:557` `"k must be less than ndim(A)"`, `:566` `"ncv must be k<ncv<=n"`); non-convergence → `FerroError::NumericalInstability` (scipy `ArpackNoConvergence`, `arpack.py:422`). Guard `sparse_eig_invalid_params_return_ferroerror`. Closes #1983. |
 //! | REQ-10 (production consumer) | NOT-STARTED | no non-test caller — spectral estimators hand-roll dense faer eigensolve instead of wiring this module. Blocker #1984. |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | hand-rolled Lanczos + tridiagonal QR on `ndarray`/`sprs` vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1985. |
 //!
@@ -65,6 +65,7 @@
 //! assert_eq!(result.eigenvalues.len(), 2);
 //! ```
 
+use ferrolearn_core::error::FerroError;
 use ndarray::{Array1, Array2, s};
 
 // ---------------------------------------------------------------------------
@@ -160,10 +161,11 @@ impl LanczosSolver {
     ///
     /// # Errors
     ///
-    /// Returns an error if:
-    /// - `k` is zero or exceeds `n`.
-    /// - The solver fails to converge within `max_iter` restarts.
-    pub fn solve<F>(&self, n: usize, matvec: F) -> Result<EigenResult, String>
+    /// - [`FerroError::InvalidParameter`] if `k` is zero, exceeds `n`, or `ncv`
+    ///   is too small (scipy `eigsh` raises `ValueError`).
+    /// - [`FerroError::NumericalInstability`] if the solver fails to converge
+    ///   within `max_iter` restarts (scipy raises `ArpackNoConvergence`).
+    pub fn solve<F>(&self, n: usize, matvec: F) -> Result<EigenResult, FerroError>
     where
         F: FnMut(&Array1<f64>) -> Array1<f64>,
     {
@@ -177,12 +179,17 @@ impl LanczosSolver {
     ///
     /// # Errors
     ///
-    /// Returns an error if the matrix is not square or if the solver
-    /// fails to converge.
-    pub fn solve_sparse(&self, mat: &sprs::CsMat<f64>) -> Result<EigenResult, String> {
+    /// - [`FerroError::InvalidParameter`] if the matrix is not square, or if
+    ///   `k`/`ncv` are invalid (scipy `eigsh` raises `ValueError`).
+    /// - [`FerroError::NumericalInstability`] if the solver fails to converge
+    ///   (scipy raises `ArpackNoConvergence`).
+    pub fn solve_sparse(&self, mat: &sprs::CsMat<f64>) -> Result<EigenResult, FerroError> {
         let (rows, cols) = mat.shape();
         if rows != cols {
-            return Err(format!("Matrix must be square, got shape ({rows}, {cols})"));
+            return Err(FerroError::InvalidParameter {
+                name: "mat".to_string(),
+                reason: format!("Matrix must be square, got shape ({rows}, {cols})"),
+            });
         }
         let n = rows;
         let mat_csr = mat.to_csr();
@@ -194,18 +201,22 @@ impl LanczosSolver {
     // -----------------------------------------------------------------------
 
     /// Core Lanczos iteration with implicit restarts.
-    fn solve_impl<F>(&self, n: usize, mut matvec: F) -> Result<EigenResult, String>
+    fn solve_impl<F>(&self, n: usize, mut matvec: F) -> Result<EigenResult, FerroError>
     where
         F: FnMut(&Array1<f64>) -> Array1<f64>,
     {
         let k = self.k;
         if k == 0 {
-            return Err("k must be at least 1".to_string());
+            return Err(FerroError::InvalidParameter {
+                name: "k".to_string(),
+                reason: "k must be at least 1".to_string(),
+            });
         }
         if k > n {
-            return Err(format!(
-                "k ({k}) must not exceed the matrix dimension n ({n})"
-            ));
+            return Err(FerroError::InvalidParameter {
+                name: "k".to_string(),
+                reason: format!("k ({k}) must not exceed the matrix dimension n ({n})"),
+            });
         }
 
         // Special case: k == n, just build full Lanczos factorisation.
@@ -217,7 +228,10 @@ impl LanczosSolver {
         let ncv = ncv.min(n);
 
         if ncv < k + 1 && k < n {
-            return Err(format!("ncv ({ncv}) must be at least k+1 ({})", k + 1));
+            return Err(FerroError::InvalidParameter {
+                name: "ncv".to_string(),
+                reason: format!("ncv ({ncv}) must be at least k+1 ({})", k + 1),
+            });
         }
 
         // Lanczos vectors (columns of V), tridiagonal entries.
@@ -385,10 +399,12 @@ impl LanczosSolver {
             );
         }
 
-        Err(format!(
-            "Lanczos solver did not converge within {} iterations",
-            self.max_iter
-        ))
+        Err(FerroError::NumericalInstability {
+            message: format!(
+                "Lanczos solver did not converge within {} iterations",
+                self.max_iter
+            ),
+        })
     }
 }
 
@@ -402,13 +418,15 @@ impl LanczosSolver {
 ///
 /// # Errors
 ///
-/// Returns an error if the matrix is not square or the solver fails to
-/// converge.
+/// - [`FerroError::InvalidParameter`] if the matrix is not square or `k` is
+///   invalid (scipy `eigsh` raises `ValueError`).
+/// - [`FerroError::NumericalInstability`] if the solver fails to converge
+///   (scipy raises `ArpackNoConvergence`).
 pub fn eigsh(
     mat: &sprs::CsMat<f64>,
     k: usize,
     which: WhichEigenvalues,
-) -> Result<EigenResult, String> {
+) -> Result<EigenResult, FerroError> {
     LanczosSolver::new(k).with_which(which).solve_sparse(mat)
 }
 

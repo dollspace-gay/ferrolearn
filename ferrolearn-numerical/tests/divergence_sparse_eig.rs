@@ -63,7 +63,8 @@
 //! blocker` issues, NOT pinned as failing tests — they are structural facts,
 //! not numerical assertions on this module's current numerical surface.
 
-use ferrolearn_numerical::sparse_eig::{EigenResult, WhichEigenvalues, eigsh};
+use ferrolearn_core::error::FerroError;
+use ferrolearn_numerical::sparse_eig::{EigenResult, LanczosSolver, WhichEigenvalues, eigsh};
 use ndarray::Array2;
 
 // ---------------------------------------------------------------------------
@@ -304,4 +305,37 @@ fn green_k_equals_n_returns_full_spectrum() {
     // scipy would raise here; ferrolearn returns the full (correct) spectrum.
     let r = eigsh(&sparse_diag(&DIAG5), 5, WhichEigenvalues::LargestAlgebraic).unwrap();
     assert_close_set(&sorted_eigvals(&r), &DIAG5, 1e-7, "k==n full spectrum");
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD — REQ-9: error TYPE is `FerroError`, not `String`.
+// scipy `eigsh` raises typed `ValueError` on invalid k / non-square input
+// (confirmed live: `eigsh(diag5, k=0)` → `ValueError("k must be positive…")`,
+// `arpack.py:324`; non-square → `ValueError("expected square matrix")`).
+// ferrolearn expresses these as `FerroError::InvalidParameter` (CLAUDE.md error
+// contract; R-DEV-2 exception-type parity). Asserted via `matches!` — no
+// `.unwrap_err()` string comparison, since the contract is the VARIANT, not the
+// message text.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sparse_eig_invalid_params_return_ferroerror() {
+    // Non-square 2×3 sparse matrix: `solve_sparse` validates squareness and
+    // must reject it with `FerroError::InvalidParameter` (scipy `ValueError`).
+    let non_square: sprs::CsMat<f64> =
+        sprs::CsMat::new((2, 3), vec![0, 1, 2], vec![0, 1], vec![1.0, 1.0]);
+    let non_square_err = LanczosSolver::new(1).solve_sparse(&non_square);
+    assert!(
+        matches!(non_square_err, Err(FerroError::InvalidParameter { .. })),
+        "non-square solve_sparse should be Err(InvalidParameter), got {non_square_err:?}"
+    );
+
+    // k == 0 on a valid square matrix: scipy `eigsh(A, k=0)` raises
+    // `ValueError("k must be positive, k=0")` (arpack.py:324). ferrolearn must
+    // return `FerroError::InvalidParameter`.
+    let k0_err = eigsh(&sparse_diag(&DIAG5), 0, WhichEigenvalues::LargestAlgebraic);
+    assert!(
+        matches!(k0_err, Err(FerroError::InvalidParameter { .. })),
+        "eigsh(diag5, k=0) should be Err(InvalidParameter), got {k0_err:?}"
+    );
 }
