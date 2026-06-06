@@ -23,7 +23,7 @@
 //! | REQ-3 | `extrapolation` param (`constant`/`linear`/`continue`/`periodic`/`error`) for out-of-base-interval values | NOT-STARTED | no param; sklearn `_polynomial.py:619-633,721,1023-1123` — blocker #1333 |
 //! | REQ-4 | `include_bias` param (drop one column when `false`) | NOT-STARTED | no param; sklearn `_polynomial.py:635,942` — blocker #1334 |
 //! | REQ-5 | Quantile knots via `np.percentile`-exact (ferrolearn uses linear-interp percentile) | NOT-STARTED | `spline_transformer.rs` Quantile path; sklearn `_polynomial.py:747-753` — blocker #1335 |
-//! | REQ-6 | Error/parameter contracts (`n_samples<2`, `n_knots<2`, `degree==0`, transform ncols, unfitted) | SHIPPED (scoped) | [`SplineTransformer::fit`]; NOTE divergence — sklearn allows `degree==0` & has no `n_samples>=2` requirement (`_parameter_constraints`) — see blocker #1336 |
+//! | REQ-6 | Error/parameter contracts (`n_samples<2`, `n_knots<2`, transform ncols, unfitted) | SHIPPED | [`SplineTransformer::fit`]; `degree==0` is now ALLOWED (piecewise-constant), matching sklearn `_parameter_constraints` `degree: Interval(Integral, 0, None, closed="left")` (`_polynomial.py:705`). `n_knots<2` rejection matches `n_knots: Interval(Integral, 2, None, closed="left")` (`:704`). The `n_samples>=2` requirement also MATCHES sklearn (`_validate_data(..., ensure_min_samples=2)`, `_polynomial.py:830`) — NOT a divergence. (blocker #1336) |
 //! | REQ-7 | `sparse_output` + `order` params | NOT-STARTED | no params; sklearn `_polynomial.py:716-730` — blocker #1337 |
 //! | REQ-8 | `sample_weight` (weighted knot placement) | NOT-STARTED | sklearn `fit(X, y=None, sample_weight=None)` `_polynomial.py:811` — blocker #1338 |
 //! | REQ-9 | `get_feature_names_out` (`{feat}_sp_{j}`) + `bsplines_`/`n_features_out_` fitted attrs | NOT-STARTED | sklearn `_polynomial.py:781-809,942` — blocker #1339 |
@@ -261,7 +261,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
     /// # Errors
     ///
     /// - [`FerroError::InsufficientSamples`] if the input has fewer than 2 rows.
-    /// - [`FerroError::InvalidParameter`] if `n_knots` < 2 or `degree` is 0.
+    /// - [`FerroError::InvalidParameter`] if `n_knots` < 2.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedSplineTransformer<F>, FerroError> {
         let n_samples = x.nrows();
         if n_samples < 2 {
@@ -275,12 +275,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
             return Err(FerroError::InvalidParameter {
                 name: "n_knots".into(),
                 reason: "n_knots must be at least 2".into(),
-            });
-        }
-        if self.degree == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "degree".into(),
-                reason: "degree must be at least 1".into(),
             });
         }
 
@@ -337,9 +331,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
             let degree = self.degree;
             let deg_f = F::from(degree).unwrap_or_else(F::one);
 
-            // numpy linspace with `num` inclusive endpoints. For num == 1 numpy
-            // returns just [a]; for num >= 2 it includes both a and b.
+            // numpy linspace with `num` inclusive endpoints. For num == 0 numpy
+            // returns an empty array; for num == 1 just [a]; for num >= 2 it
+            // includes both a and b. num == 0 occurs for degree == 0 (no
+            // edge-extension knots — the knot vector is the base knots alone).
             let linspace = |a: F, b: F, num: usize| -> Vec<F> {
+                if num == 0 {
+                    return Vec::new();
+                }
                 if num == 1 {
                     return vec![a];
                 }
@@ -536,10 +535,17 @@ mod tests {
     }
 
     #[test]
-    fn test_spline_zero_degree_error() {
+    fn test_spline_zero_degree_allowed() -> Result<(), FerroError> {
+        // sklearn allows degree==0 (piecewise-constant B-spline):
+        // `_parameter_constraints` `degree: Interval(Integral, 0, None,
+        // closed="left")` (`_polynomial.py:705`). degree==0 must fit, not error.
         let st = SplineTransformer::<f64>::new(5, 0, KnotStrategy::Uniform);
         let x = array![[0.0], [1.0]];
-        assert!(st.fit(&x, &()).is_err());
+        let fitted = st.fit(&x, &())?;
+        // n_basis = n_knots + degree - 1 = 5 + 0 - 1 = 4
+        let out = fitted.transform(&x)?;
+        assert_eq!(out.ncols(), 4);
+        Ok(())
     }
 
     #[test]

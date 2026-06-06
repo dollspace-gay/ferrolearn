@@ -31,6 +31,7 @@
 //!   print(np.round(st.transform(X),9).tolist())"
 //! ```
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::spline_transformer::{KnotStrategy, SplineTransformer};
 use ndarray::{Array2, array};
@@ -256,6 +257,57 @@ fn probe_f_left_endpoint_xmin_shifted_range() {
     ];
     let rows: Vec<&[f64]> = oracle.iter().map(|r| r.as_slice()).collect();
     assert_matches_oracle(&x, 3, 1, &rows, 1e-6, "f_xmin_shifted");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-6 — parameter-contract DIVERGENCE (blocker #1336): sklearn allows
+// `degree == 0` (piecewise-constant B-spline) via `_parameter_constraints`
+// `degree: Interval(Integral, 0, None, closed="left")` (`_polynomial.py:705`),
+// but ferrolearn previously rejected it. ferrolearn's `n_samples >= 2`
+// requirement is NOT a divergence — sklearn also enforces it via
+// `_validate_data(..., ensure_min_samples=2)` (`_polynomial.py:830`).
+// ---------------------------------------------------------------------------
+
+/// DIV (REQ-6, blocker #1336): `degree == 0` must be ACCEPTED and produce the
+/// scipy piecewise-constant B-spline design matrix, not a rejected parameter.
+///
+/// Live sklearn 1.5.2 ORACLE (run from /tmp, R-CHAR-3 — NOT copied from
+/// ferrolearn):
+/// ```text
+/// import numpy as np; from sklearn.preprocessing import SplineTransformer
+/// X = np.array([[0.],[1.],[2.],[3.],[4.]])
+/// st = SplineTransformer(n_knots=3, degree=0, knots='uniform').fit(X)
+/// st.transform(np.array([[0.5],[2.5]]))
+/// # -> shape (2, 2); [[1.0, 0.0], [0.0, 1.0]]
+/// ```
+/// Columns = `n_knots + degree - 1 = 3 + 0 - 1 = 2`. 0.5 falls in the first
+/// knot interval -> `[1, 0]`; 2.5 in the second -> `[0, 1]`.
+#[test]
+fn spline_degree_zero_allowed_matches_sklearn() -> Result<(), FerroError> {
+    let st = SplineTransformer::<f64>::new(3, 0, KnotStrategy::Uniform);
+    let x = array![[0.0], [1.0], [2.0], [3.0], [4.0]];
+    let fitted = st.fit(&x, &())?;
+
+    let q = array![[0.5], [2.5]];
+    let out = fitted.transform(&q)?;
+
+    // n_knots + degree - 1 = 3 + 0 - 1 = 2 columns.
+    assert_eq!(out.ncols(), 2, "degree-0 column count (n_knots+degree-1)");
+    assert_eq!(out.nrows(), 2, "row count");
+
+    // sklearn 1.5.2 live oracle.
+    let oracle: [[f64; 2]; 2] = [[1.0, 0.0], [0.0, 1.0]];
+    for (i, orow) in oracle.iter().enumerate() {
+        for (j, &b) in orow.iter().enumerate() {
+            let a = out[[i, j]];
+            assert!(
+                (a - b).abs() < 1e-9,
+                "row {i} col {j}: ferrolearn {a} vs sklearn {b} (diff {})",
+                (a - b).abs()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
