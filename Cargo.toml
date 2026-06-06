@@ -43,7 +43,7 @@ repository = "https://github.com/dollspace-gay/ferrolearn"
 # ferray::random, ferray-ufunc) as part of that unit's ACToR iteration.
 # `ferray-core` (array type) and `ferray-stats` are unconditional; linalg /
 # random / numpy-bridge are feature-gated.
-ferray = { path = "../ferray/ferray", default-features = false, features = ["linalg", "random", "numpy"] }
+ferray = { path = "../ferray/ferray", default-features = false, features = ["linalg", "random", "numpy", "openblas"] }
 # Legacy numpy-like crates below are MIGRATION TARGETS, not the destination.
 # They remain only until the per-unit loop has moved each consumer onto
 # ferray; do not add NEW usages (acto-critic flags new numpy-like-crate

@@ -12,6 +12,10 @@ categories = ["science", "algorithms"]
 
 [dependencies]
 ferrolearn-core.workspace = true
+# ferray is ferrolearn's numpy substrate (R-SUBSTRATE-1). PCA's full-SVD path
+# routes through `ferray::linalg::svd_lapack` (LAPACK gesdd, bit-identical to
+# scipy), which requires the workspace `openblas` feature on the ferray dep.
+ferray.workspace = true
 ndarray.workspace = true
 num-traits.workspace = true
 rand.workspace = true

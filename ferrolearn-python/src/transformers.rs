@@ -18,7 +18,7 @@
 //! `tests/divergence_transformers.py` + `tests/test_check_estimator.py`
 //! (534 pytest pass).
 //!
-//! **13 SHIPPED / 2 NOT-STARTED.**
+//! **14 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -27,11 +27,12 @@
 //! | REQ-PCA-API-CONFORM (fit/transform/inverse_transform + 5 attrs, default solver) | SHIPPED | `RsPCA::fit`/`transform`/`inverse_transform` + getters `components_`/`explained_variance_`/`explained_variance_ratio_`/`mean_`/`singular_values_`, wrapped by `_transformers.py::PCA` (+ `n_features_in_`), inheriting `fit_transform` — mirroring `_pca.py:691-707`/`:489` with the `svd_flip` sign (`_pca.py:647`). Live default-solver oracle matches element-wise incl. sign. |
 //! | REQ-PCA-VALUE-PARITY (components/variance/singular/mean parity incl. svd_flip sign) | SHIPPED | default solver: all five arrays marshalled from the `RsPCA` getters; downstream `ferrolearn-decomp` REQ-1/4/5 match the sklearn oracle ≤1e-6 incl. per-row `svd_flip(u_based_decision=False)` sign. (Repeated-eigenvalue/rank-deficient case downstream #1501; whiten/alt-solver #1502/#1503.) |
 //! | REQ-PCA-NCOMP-POSITIONAL (n_components positional ABI) | SHIPPED | FIXED #2035: `_transformers.py::PCA.__init__(self, n_components=2)` drops the keyword-only `*`, so `ferrolearn.PCA(2).n_components == 2` matching sklearn `__init__(self, n_components=None, *, ...)` (`_pca.py:407`). Guard `test_red_pca_n_components_positional`. |
-//! | REQ-PCA-NCOMP-DEFAULT-NONE (n_components default None) | SHIPPED | FIXED #2036: wrapper default `n_components=None` stored verbatim (`PCA().n_components is None` matching `_pca.py:409`), resolved at fit time to `min(X.shape)` before constructing `_RsPCA` (and the same resolution in `__setstate__`); an explicit int passes through. Guard `test_red_pca_n_components_default_none`. |
+//! | REQ-PCA-NCOMP-DEFAULT-NONE (n_components default None) | SHIPPED | FIXED #2036: wrapper default `n_components=None` stored verbatim (`PCA().n_components is None` matching `_pca.py:409`), resolved at fit time before constructing `_RsPCA`; an explicit int/float passes through. Guard `test_red_pca_n_components_default_none`. |
+//! | REQ-PCA-NCOMP-FLOAT-RATIO (n_components int/float-ratio/None all threaded) | SHIPPED (#2109) | FIXED — the downstream `PCA` ships THREE `NComponents` constructors (`ferrolearn-decomp/src/pca.rs`): `PCA::new(usize)` → `NComponents::Count`, `PCA::with_variance_ratio(f64)` → `NComponents::Ratio` (resolves the count AFTER the eigendecomposition via `searchsorted(ratio_cumsum, r, "right")+1`, matching sklearn `_pca.py:659-681`), `PCA::auto()` → `NComponents::Auto` (= `min(n_samples, n_features)`, sklearn `_pca.py:523-525`). The binding now carries a resolved spec `count: Option<usize>` + `ratio: Option<f64>` (was a bare `usize`) and `fit` dispatches `(_, Some(r)) => with_variance_ratio(r)`, `(Some(c), None) => new(c)`, `(None, None) => auto()`, mapping `FerroError -> PyValueError` so an out-of-range ratio surfaces as `ValueError`. Non-test consumer: `_transformers.py::PCA` — the module-level `_resolve_n_components(nc)` classifier maps the verbatim ctor `n_components` (None → `(None, None)`; int (not bool) → `(int(nc), None)`; float in `(0, 1)` → `(None, float(nc))`; else → `ValueError`) into the binding's `(count, ratio)` kwargs at FIT time (so `PCA(n_components=2.0)` constructs but `.fit()` raises, matching sklearn's `_validate_params`-at-fit), called from `fit`/`__setstate__`/`_ensure_rs`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(n_components=0.95)` → `n_components_=2`; `PCA(0.5)` → `1`; `PCA(0.999)` → `3`; `PCA(2.0).fit` → `ValueError`. Guards `test_red_pca_n_components_float_ratio_matches_sklearn` + `test_pca_n_components_float_ratio_variants_match_sklearn`. |
 //! | REQ-SS-WITH-MEAN-STD (with_mean/with_std honored) | SHIPPED | FIXED #2037: `RsStandardScaler` now carries `with_mean`/`with_std`/`copy` (`#[pyo3(signature = (with_mean=true, with_std=true, copy=true))]`) and `fit` threads them into the downstream scaler via `StandardScaler::<f64>::new().with_with_mean(..).with_with_std(..).with_copy(..)` (`ferrolearn-preprocess` REQ-6, #1193), so `transform` honors them. The wrapper `_transformers.py::StandardScaler.fit` nulls the fitted attrs to match sklearn: `mean_ = array if (with_mean or with_std) else None`, `scale_`/`var_ = array if with_std else None` (`_data.py:993-995`,`:1022-1023`). Live oracle `X=[[1,10],[2,20],[3,30]]` (R-CHAR-3): (T,T) `transform[0]=[-1.224745,-1.224745]`; (T,F) `scale_=var_=None`, `transform[0]=[-1,-10]`; (F,T) `mean_=[2,20]`, `transform[0]=[1.224745,1.224745]`; (F,F) `mean_=scale_=var_=None`, `transform[0]=[1,10]`. Consumer: `_transformers.py::StandardScaler`. Verified `tests/divergence_transformers.py::test_red_standardscaler_*`. |
 //! | REQ-SS-COPY (copy ctor param) | SHIPPED | FIXED #2037: `_transformers.py::StandardScaler.__init__(self, *, copy=True, with_mean=True, with_std=True)` (sklearn param order, `_data.py:835`) stores `self.copy` and threads it into `_RsStandardScaler(self.with_mean, self.with_std, self.copy)` → `StandardScaler::with_copy` (ABI-only downstream: `fit`/`transform` operate on owned copies, so non-mutation holds either way). Verified `tests/divergence_transformers.py::test_red_standardscaler_copy_roundtrip`. |
 //! | REQ-PCA-WHITEN (whiten ctor param) | SHIPPED (#2098) | FIXED — the downstream `PCA::with_whiten` builder (`ferrolearn-decomp/src/pca.rs:180`, REQ-11 #1502) already ships sklearn's whitening (`Transform::transform` divides each column by `sqrt(explained_variance_)`, `inverse_transform` re-multiplies; `_base.py:157-165`/`:192-196`), so the binding now threads the param. `RsPCA` carries `whiten: bool` (`#[pyo3(signature = (n_components=2, whiten=false))]`) and `fit` builds `PCA::<f64>::new(self.n_components).with_whiten(self.whiten)`. Non-test consumer: `_transformers.py::PCA.__init__(self, n_components=None, *, whiten=False)` stores `self.whiten` and `fit` passes `whiten=self.whiten` into `_RsPCA(...)` (and `__setstate__` rebuilds with `whiten=getattr(self, "whiten", False)`). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2, whiten=True).fit_transform(X)` matches sklearn element-wise to 1e-6; `whiten=False` is byte-identical to the default path. Guard `tests/divergence_transformers.py::test_pca_whiten_transform_matches_sklearn`. |
-//! | REQ-PCA-PARAMS (copy/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | the wrapper exposes `n_components`+`whiten` only; sklearn `_pca.py:407-423`. The remaining params' default `svd_solver` MATCHES, so only the param surface + non-default paths are missing — owned downstream #1503/#1509. (`whiten` is now SHIPPED, see REQ-PCA-WHITEN.) |
+//! | REQ-PCA-PARAMS (copy/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | PARTIAL: `random_state` is now SHIPPED (#2115) — `RsPCA` carries a `random_state: Option<u64>` ctor param (`#[pyo3(signature = (count=None, ratio=None, whiten=false, random_state=None))]`) threaded into `PCA::with_random_state`, and `_transformers.py::PCA.__init__(self, n_components=None, *, whiten=False, random_state=None)` stores `self.random_state` and passes `_resolve_random_state(self.random_state)` into `_RsPCA(...)` (fit/`_ensure_rs`/`__setstate__`). The `'auto'`-selected `randomized` solver (downstream REQ-12) consumes it; live oracle pin `tests/divergence_transformers.py::test_red_pca_auto_solver_randomized_branch_matches_sklearn` (600×100, seed 42) green. STILL NOT-STARTED: `copy`/`svd_solver`/`tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer` are NOT exposed (defaults match sklearn) — owned downstream #1503/#1509. (`whiten` SHIPPED, see REQ-PCA-WHITEN.) |
 //! | REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | FIXED — the downstream prereqs (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`) already SHIPPED, so the binding now exposes both. `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs:283`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs:304`) — the full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept (`_pca.py:686-688`). Consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (non-zero); `PCA(3)` → `noise_variance_=0.0`. Verified `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
 //! | REQ-PCA-SCORE (score + score_samples Gaussian log-likelihood) | SHIPPED (#2099) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-15 #1507): `FittedPCA::score_samples` (`ferrolearn-decomp/src/pca.rs:484`) is the per-sample log-likelihood `-0.5*sum(Xr*(Xr@precision),1) - 0.5*(n_features*log(2pi) - logdet(precision))`, and `FittedPCA::score` (`pca.rs:533`) is its mean, both matching the live sklearn 1.5.2 oracle to 1e-6. The binding now surfaces them: `RsPCA::score_samples` (returns a `(n_samples,)` numpy array via `ndarray1_to_numpy`) + `RsPCA::score` (returns `f64`), each mapping `FerroError -> PyValueError`. Mirrors sklearn `PCA.score_samples`/`PCA.score` (`sklearn/decomposition/_pca.py:805-853`). Non-test consumer: `_transformers.py::PCA.score_samples` + `_transformers.py::PCA.score` (`check_is_fitted` + `_validate_data(reset=False)` + `_ensure_f64`, rebuilding `_rs` as `__setstate__` does if absent). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `score(X)=-5.358925927374854`, `score_samples(X)=[-4.6972115,-5.3570670,-5.8335549,-5.7184482,-5.4976041,-5.0496698]`. Guard `tests/divergence_transformers.py::test_pca_score_and_score_samples_match_sklearn`. |
 //! | REQ-PCA-COVARIANCE-PRECISION (get_covariance + get_precision) | SHIPPED (#2100) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-14 #1505): `FittedPCA::get_covariance` (`ferrolearn-decomp/src/pca.rs:328`) is the INFALLIBLE data covariance `components_ᵀ·diag(exp_var_diff)·components_ + noise_variance_·I`, and `FittedPCA::get_precision` (`pca.rs:390`) is its eigendecomposed inverse (returns a `Result`), both matching the live sklearn 1.5.2 oracle to 1e-6. The binding now surfaces them: `RsPCA::get_covariance` (returns a `(n_features, n_features)` numpy array via `ndarray2_to_numpy`, no error mapping — infallible) + `RsPCA::get_precision` (same shape, mapping `FerroError -> PyValueError`). Neither takes an `X` (the model's own data covariance / its inverse). Mirrors sklearn `PCA.get_covariance`/`PCA.get_precision` (`sklearn/decomposition/_base.py:30-101`). Non-test consumer: `_transformers.py::PCA.get_covariance` + `_transformers.py::PCA.get_precision` (`check_is_fitted` + `_ensure_rs`, no `_validate_data` since there is no `X` — matching sklearn's `get_covariance(self)`/`get_precision(self)` signatures). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `get_covariance()` diag `[8.0, 5.3666667, 4.6666667]`; `get_precision()` diag `[0.7432854, 2.0460427, 0.7745159]`. Guard `tests/divergence_transformers.py::test_pca_get_covariance_and_precision_match_sklearn`. |
@@ -160,26 +161,55 @@ impl RsStandardScaler {
 
 #[pyclass(name = "_RsPCA")]
 pub struct RsPCA {
-    n_components: usize,
+    count: Option<usize>,
+    ratio: Option<f64>,
     whiten: bool,
+    /// Seed for the `'auto'`-selected `randomized` SVD solver (sklearn
+    /// `PCA(random_state=...)`, `sklearn/decomposition/_pca.py:418`). Threaded
+    /// into `PCA::with_random_state`; `None` is sklearn's default (the randomized
+    /// branch then uses a fixed reproducible draw, see `PCA::random_state`).
+    random_state: Option<u64>,
     fitted: Option<ferrolearn_decomp::FittedPCA<f64>>,
 }
 
 #[pymethods]
 impl RsPCA {
+    /// `n_components` is threaded as a resolved spec rather than a bare `usize`,
+    /// so the binding never type-sniffs a `PyAny`. The Python wrapper classifies
+    /// the verbatim ctor value (sklearn `_pca.py:147-166`/`:386-391`) into:
+    /// `count` (an explicit integer count, [`NComponents::Count`]); `ratio` (a
+    /// float in `(0, 1)` selected AFTER the SVD by cumulative
+    /// `explained_variance_ratio_`, [`NComponents::Ratio`], sklearn float branch
+    /// `_pca.py:659-681`); or neither (`n_components=None`, [`NComponents::Auto`]
+    /// = `min(n_samples, n_features)`, sklearn `_pca.py:523-525`). An out-of-range
+    /// `ratio` is rejected by the downstream `with_variance_ratio` validation and
+    /// surfaces here as `PyValueError`.
     #[new]
-    #[pyo3(signature = (n_components=2, whiten=false))]
-    fn new(n_components: usize, whiten: bool) -> Self {
+    #[pyo3(signature = (count=None, ratio=None, whiten=false, random_state=None))]
+    fn new(
+        count: Option<usize>,
+        ratio: Option<f64>,
+        whiten: bool,
+        random_state: Option<u64>,
+    ) -> Self {
         Self {
-            n_components,
+            count,
+            ratio,
             whiten,
+            random_state,
             fitted: None,
         }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
-        let model = ferrolearn_decomp::PCA::<f64>::new(self.n_components).with_whiten(self.whiten);
+        let model = match (self.count, self.ratio) {
+            (_, Some(r)) => ferrolearn_decomp::PCA::<f64>::with_variance_ratio(r),
+            (Some(c), None) => ferrolearn_decomp::PCA::<f64>::new(c),
+            (None, None) => ferrolearn_decomp::PCA::<f64>::auto(),
+        }
+        .with_whiten(self.whiten)
+        .with_random_state(self.random_state);
         let fitted = model
             .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

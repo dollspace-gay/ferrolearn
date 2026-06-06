@@ -845,41 +845,56 @@ _XW_WIDE = np.array(
 
 
 def test_red_pca_whiten_precision_rank_deficient_matches_sklearn():
-    """Divergence: PCA(whiten=True).get_precision/score raise on a rank-deficient fit.
+    """PCA(whiten=True) on a rank-deficient (n_samples < n_features) fit:
+    get_covariance / get_precision match sklearn, and score is FINITE.
 
-    With n_samples < n_features the data covariance is singular (zero
-    eigenvalues). sklearn `get_precision` uses the matrix-inversion lemma
-    (`sklearn/decomposition/_base.py:85-101`) and returns FINITE
-    precision/score/score_samples for whiten=True; ferrolearn's
-    `FittedPCA::precision_and_logdet` (`ferrolearn-decomp/src/pca.rs`) inverts
-    `get_covariance` by eigendecomposing and taking `1/lambda`, hitting the
-    `lambda <= 0` guard on the zero eigenvalues and raising ValueError.
+    sklearn `get_precision` uses the matrix-inversion lemma
+    (`sklearn/decomposition/_base.py:85-101`) and returns finite values for this
+    singular-covariance fit. ferrolearn now mirrors that: `FittedPCA::fit` routes
+    the SVD through ferray's LAPACK `gesdd` (#2116) so `noise_variance_` is
+    bit-identical to scipy, `precision_via_lemma` routes the inner inverse through
+    ferray `inv_lapack` (LAPACK getri) + the products through ferray `gemm`
+    (openblas) left-to-right (#2117), and `fast_logdet` uses LAPACK `getrf` — so
+    `get_precision` matches sklearn (rtol 1e-6) and `score_samples`/`score` are
+    finite (the prior code raised / returned -inf on the zero eigenvalues).
 
-    Tracking: #2110.
+    DELIBERATELY NOT asserted (documented R-DEV-1 / S8 judgment, issue #2110,
+    user-approved): the exact `score_samples`/`score` VALUE on this fit. The
+    score is `Xr·precision·Xrᵀ` on a precision with condition number ~6.7e15
+    (the lemma's inner-P off-diagonal is cancelling rounding noise
+    ~2e-16 / noise_variance_ ~1e-31). A 1-ULP precision perturbation swings the
+    score 25-83%, and the host openblas is a different build than scipy's bundled
+    one (a 3-ULP `inv` delta that this conditioning amplifies). Both sklearn's and
+    ferrolearn's values are numerically meaningless noise of opposite sign
+    (sklearn ~-3.5e15, ferrolearn ~+3.3e15) in this degenerate n<p regime, so the
+    VALUE is implementation-defined and not a meaningful divergence. Matching it
+    would require linking scipy's exact openblas build. We assert the meaningful
+    contract: the model (precision, covariance, noise_variance_) matches and the
+    score is computable (finite), not the rounding of singular-matrix noise.
+
+    Tracking: #2110 (meaningful parity SHIPPED; exact rank-deficient score value
+    is NOT-STARTED / won't-fix per the above).
     """
     sk = SkPCA(n_components=3, whiten=True).fit(_XW_WIDE)
     fr = fl.PCA(n_components=3, whiten=True).fit(_XW_WIDE)
 
-    # Oracle invariants: sklearn returns finite values for this rank-deficient
+    # Oracle invariant: sklearn returns finite values for this rank-deficient
     # whiten=True fit (pins the test to sklearn's actual behavior).
     sk_prec = sk.get_precision()
-    sk_ss = sk.score_samples(_XW_WIDE)
-    sk_score = sk.score(_XW_WIDE)
     assert np.all(np.isfinite(sk_prec))
-    assert np.all(np.isfinite(sk_ss))
-    assert np.isfinite(sk_score)
+    assert np.isfinite(sk.score(_XW_WIDE))
 
-    # ferrolearn's get_covariance under whiten=True already matches sklearn here,
-    # so the divergence is purely in the inverse/score path.
-    np.testing.assert_allclose(
-        fr.get_covariance(), sk.get_covariance(), atol=1e-6
-    )
-
-    # ferrolearn must NOT raise and must match the live oracle. Magnitudes are
-    # ~1e15 (noise_variance_ ~ 1e-31), so compare with relative tolerance.
+    # Meaningful parity: get_covariance + get_precision match the live oracle.
+    np.testing.assert_allclose(fr.get_covariance(), sk.get_covariance(), atol=1e-6)
     np.testing.assert_allclose(fr.get_precision(), sk_prec, rtol=1e-6)
-    np.testing.assert_allclose(fr.score_samples(_XW_WIDE), sk_ss, rtol=1e-6)
-    assert abs(fr.score(_XW_WIDE) - sk_score) <= 1e-6 * abs(sk_score)
+
+    # ferrolearn must NOT raise and must produce FINITE score_samples/score
+    # (the prior bug: ValueError / -inf). The exact value is intentionally not
+    # asserted (see docstring).
+    fr_ss = fr.score_samples(_XW_WIDE)
+    assert fr_ss.shape == sk.score_samples(_XW_WIDE).shape
+    assert np.all(np.isfinite(fr_ss))
+    assert np.isfinite(fr.score(_XW_WIDE))
 
 
 # ---------------------------------------------------------------------------
@@ -1029,10 +1044,14 @@ def test_red_pca_auto_solver_randomized_branch_matches_sklearn():
     sk = SkPCA(n_components=10, svd_solver="auto", random_state=42).fit(X)
     assert sk._fit_svd_solver == "randomized"  # documents the policy outcome
 
-    fr = fl.PCA(n_components=10).fit(X)
+    # Pass the SAME seed as the oracle: the randomized solver's range-finder
+    # draw is stochastic, so reproducing sklearn's spectrum requires the matching
+    # random_state. ferrolearn's RNG (ferray::random::RandomState) is bit-identical
+    # to numpy's RandomState, so seed 42 reproduces sklearn's seed-42 draw.
+    fr = fl.PCA(n_components=10, random_state=42).fit(X)
 
     # ferrolearn must reproduce sklearn's 'auto' (randomized) spectrum for the
-    # SAME (X, n_components). It does not: it returns the exact full-SVD result.
+    # SAME (X, n_components, random_state).
     np.testing.assert_allclose(
         np.asarray(fr.explained_variance_),
         sk.explained_variance_,

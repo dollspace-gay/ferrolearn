@@ -14,6 +14,92 @@ def _ensure_f64(arr):
     return np.ascontiguousarray(arr, dtype=np.float64)
 
 
+def _resolve_n_components(nc):
+    """Classify the verbatim PCA `n_components` ctor value into binding kwargs.
+
+    Mirrors sklearn's `PCA` `n_components` parameter semantics
+    (`sklearn/decomposition/_pca.py:147-166`, `_parameter_constraints` `:386-391`):
+
+      * ``None`` -> ``(None, None)`` — keep ``min(n_samples, n_features)``
+        components (resolved by the Rust ``PCA::auto`` / ``NComponents::Auto``,
+        `_pca.py:523-525`).
+      * ``int >= 1`` -> ``(int(nc), None)`` — an exact component count (Rust
+        ``PCA::new`` / ``NComponents::Count``). A ``bool`` is an ``int`` subclass
+        and is ACCEPTED here, matching sklearn's ``Interval(Integral, ...)``
+        constraint (`_pca.py:386-391`; ``bool`` is ``Integral``): ``True`` -> 1
+        component, ``False`` -> 0 (which the Rust ``Count(0)`` validation rejects
+        at fit, like sklearn's strictly-positive component count).
+      * ``float`` in ``(0, 1)`` -> ``(None, float(nc))`` — select the smallest
+        count whose cumulative ``explained_variance_ratio_`` is ``>= nc``, AFTER
+        the SVD (Rust ``PCA::with_variance_ratio`` / ``NComponents::Ratio``,
+        `_pca.py:659-681`).
+      * anything else (float ``>= 1`` or ``<= 0``, or an unsupported type)
+        -> ``ValueError`` matching sklearn's constraint-message shape.
+
+    Returns a ``(count, ratio)`` tuple where exactly one is non-None (or both None
+    for the Auto case). Validation happens at FIT time (matching sklearn's
+    `_validate_params`-at-fit), so ``PCA(n_components=2.0)`` constructs fine and
+    only ``.fit()`` raises.
+    """
+    if nc is None:
+        return (None, None)
+    # Booleans are an int subclass; sklearn accepts them via the
+    # Interval(Integral, ...) constraint (bool is Integral), so True -> 1 and
+    # False -> 0. Check the int branch FIRST so a bool routes to Count, not the
+    # float path. (False -> Count(0), which the Rust validation rejects at fit,
+    # matching sklearn's strictly-positive component count.)
+    if isinstance(nc, (int, np.integer)):
+        if int(nc) < 1:
+            raise ValueError(
+                f"The 'n_components' parameter of PCA must be an int in the "
+                f"range [0, inf), a float in the range (0, 1), 'mle' or None. "
+                f"Got {nc!r} instead."
+            )
+        return (int(nc), None)
+    if isinstance(nc, (float, np.floating)):
+        if 0.0 < float(nc) < 1.0:
+            return (None, float(nc))
+        raise ValueError(
+            f"The 'n_components' parameter of PCA must be an int in the range "
+            f"[0, inf), a float in the range (0, 1), 'mle' or None. Got {nc!r} "
+            f"instead."
+        )
+    raise ValueError(
+        f"The 'n_components' parameter of PCA must be an int in the range "
+        f"[0, inf), a float in the range (0, 1), 'mle' or None. Got {nc!r} instead."
+    )
+
+
+def _resolve_random_state(random_state):
+    """Classify the verbatim PCA `random_state` ctor value into the binding seed.
+
+    Mirrors sklearn's `PCA(random_state=...)` semantics
+    (`sklearn/decomposition/_pca.py:418`, consumed only by the `'auto'`-selected
+    `randomized`/`arpack` solvers, `:738`,`:771`):
+
+      * ``None`` -> ``None`` — sklearn's default; the downstream Rust randomized
+        branch then uses a fixed reproducible draw (it cannot reproduce numpy's
+        GLOBAL RNG state).
+      * ``int >= 0`` -> ``int(random_state)`` — the seed fed to
+        ``ferray::random::RandomState::new(seed)`` (bit-identical to
+        ``numpy.random.RandomState(seed)``), so the randomized spectrum
+        reproduces sklearn's for that seed. ``np.random.RandomState`` instances
+        and negative ints are not supported by the ``u64`` binding and raise.
+    """
+    if random_state is None:
+        return None
+    if isinstance(random_state, (int, np.integer)) and not isinstance(random_state, bool):
+        if int(random_state) < 0:
+            raise ValueError(
+                f"random_state must be a non-negative int or None, got "
+                f"{random_state!r}"
+            )
+        return int(random_state)
+    raise ValueError(
+        f"random_state must be a non-negative int or None, got {random_state!r}"
+    )
+
+
 def _fit_rust(rs, X, y=None):
     """Call rs.fit() and translate Rust errors to sklearn-conforming messages."""
     try:
@@ -147,19 +233,25 @@ class PCA(TransformerMixin, BaseEstimator):
         the Rust ``PCA::with_whiten`` builder (``ferrolearn-decomp/src/pca.rs:180``).
     """
 
-    def __init__(self, n_components=None, *, whiten=False):
+    def __init__(self, n_components=None, *, whiten=False, random_state=None):
         self.n_components = n_components
         self.whiten = whiten
+        self.random_state = random_state
 
     def fit(self, X, y=None):
         X = self._validate_data(X, dtype="float64")
-        # sklearn stores n_components=None verbatim and resolves it to
-        # min(n_samples, n_features) at fit (`_pca.py:523-529`). The Rust
-        # binding expects a usize, so resolve None here.
-        n_components = (
-            self.n_components if self.n_components is not None else min(X.shape)
+        # sklearn stores n_components verbatim and validates/resolves it at fit
+        # (`_pca.py:523-529`/`:659-681`; `_validate_params`-at-fit). Classify the
+        # verbatim value into the binding's (count, ratio) spec — None -> Auto,
+        # int -> Count, float in (0,1) -> Ratio (selected after the SVD), else a
+        # ValueError matching sklearn.
+        count, ratio = _resolve_n_components(self.n_components)
+        self._rs = _RsPCA(
+            count=count,
+            ratio=ratio,
+            whiten=self.whiten,
+            random_state=_resolve_random_state(self.random_state),
         )
-        self._rs = _RsPCA(n_components=n_components, whiten=self.whiten)
         _fit_rust(self._rs, _ensure_f64(X))
         self.components_ = np.array(self._rs.components_)
         self.explained_variance_ = np.array(self._rs.explained_variance_)
@@ -196,14 +288,12 @@ class PCA(TransformerMixin, BaseEstimator):
         # does, threading the resolved n_components + whiten. score/score_samples
         # have no closed-form Python fallback, so _rs must exist.
         if not hasattr(self, "_rs") and hasattr(self, "_fit_X"):
-            n_components = (
-                self.n_components
-                if self.n_components is not None
-                else min(self._fit_X.shape)
-            )
+            count, ratio = _resolve_n_components(self.n_components)
             self._rs = _RsPCA(
-                n_components=n_components,
+                count=count,
+                ratio=ratio,
                 whiten=getattr(self, "whiten", False),
+                random_state=_resolve_random_state(getattr(self, "random_state", None)),
             )
             self._rs.fit(_ensure_f64(self._fit_X))
 
@@ -262,13 +352,11 @@ class PCA(TransformerMixin, BaseEstimator):
     def __setstate__(self, state):
         self.__dict__.update(state)
         if hasattr(self, "_fit_X"):
-            n_components = (
-                self.n_components
-                if self.n_components is not None
-                else min(self._fit_X.shape)
-            )
+            count, ratio = _resolve_n_components(self.n_components)
             self._rs = _RsPCA(
-                n_components=n_components,
+                count=count,
+                ratio=ratio,
                 whiten=getattr(self, "whiten", False),
+                random_state=_resolve_random_state(getattr(self, "random_state", None)),
             )
             self._rs.fit(_ensure_f64(self._fit_X))
