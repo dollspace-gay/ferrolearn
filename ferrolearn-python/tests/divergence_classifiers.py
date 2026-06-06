@@ -278,3 +278,47 @@ def test_green_gaussian_nb_api_conformance():
     proba = np.asarray(fl.predict_proba(X))
     assert proba.shape == (X.shape[0], len(sk.classes_))
     np.testing.assert_allclose(proba.sum(axis=1), np.ones(X.shape[0]), atol=1e-9)
+
+
+def test_classifiers_predict_log_proba():
+    """REQ #2093: GaussianNB/LogisticRegression/DecisionTreeClassifier expose
+    `predict_log_proba` = log(predict_proba).
+
+    sklearn DecisionTree/LogisticRegression return `np.log(predict_proba)`
+    verbatim; GaussianNB computes `jll - logsumexp(jll)` which equals
+    log(predict_proba) where finite. For the deterministic classifiers
+    (GaussianNB, DecisionTree) the value matches sklearn's `predict_log_proba`
+    element-wise; for all three the `predict_log_proba == log(predict_proba)`
+    contract holds (LogisticRegression's value vs sklearn differs only by the
+    pre-existing solver-precision gap in `predict_proba`).
+    """
+    import warnings
+
+    from sklearn.naive_bayes import GaussianNB as SkGNB
+    from sklearn.tree import DecisionTreeClassifier as SkDTC
+
+    Xl = np.array(
+        [[1.0, 2.0], [1.2, 1.9], [2.0, 2.5], [5.0, 5.0], [5.1, 4.8], [4.8, 5.2]]
+    )
+    yl = np.array([0, 0, 0, 1, 1, 1])
+    q = np.array([[1.5, 2.0], [5.0, 5.0]])
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # log(0) -> -inf, sklearn does the same
+        # Contract: predict_log_proba == log(predict_proba) for all three.
+        for name in ("GaussianNB", "LogisticRegression", "DecisionTreeClassifier"):
+            m = getattr(ferrolearn, name)().fit(Xl, yl)
+            assert np.allclose(
+                m.predict_log_proba(q), np.log(m.predict_proba(q)), equal_nan=True
+            )
+
+        # Value parity vs sklearn for the deterministic classifiers.
+        fg = ferrolearn.GaussianNB().fit(Xl, yl)
+        sg = SkGNB().fit(Xl, yl)
+        assert np.allclose(fg.predict_log_proba(q), sg.predict_log_proba(q), atol=1e-6)
+
+        fd = ferrolearn.DecisionTreeClassifier().fit(Xl, yl)
+        sd = SkDTC(random_state=0).fit(Xl, yl)
+        assert np.allclose(
+            fd.predict_log_proba(q), sd.predict_log_proba(q), atol=1e-6, equal_nan=True
+        )

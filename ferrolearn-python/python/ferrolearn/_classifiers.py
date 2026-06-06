@@ -148,6 +148,11 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
             self._rebuild_rs()
         return np.array(self._rs.predict_proba(X))
 
+    def predict_log_proba(self, X):
+        # sklearn LogisticRegression.predict_log_proba is log_softmax, i.e.
+        # log(predict_proba) (sklearn/linear_model/_logistic.py).
+        return np.log(self.predict_proba(X))
+
 
 class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
     """Decision Tree Classifier backed by Rust.
@@ -208,6 +213,11 @@ class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
         return np.array(self._rs.predict_proba(X))
+
+    def predict_log_proba(self, X):
+        # sklearn DecisionTreeClassifier.predict_log_proba returns
+        # np.log(predict_proba) (sklearn/tree/_classes.py).
+        return np.log(self.predict_proba(X))
 
 
 class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
@@ -357,3 +367,8 @@ class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
         if not hasattr(self, "_rs"):
             self._rebuild_rs()
         return np.array(self._rs.predict_proba(X))
+
+    def predict_log_proba(self, X):
+        # sklearn GaussianNB.predict_log_proba = jll - logsumexp(jll), which
+        # equals log(predict_proba) where finite (sklearn/naive_bayes.py).
+        return np.log(self.predict_proba(X))
