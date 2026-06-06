@@ -371,3 +371,24 @@ fn csr_geometry_matches_scipy() {
     assert_eq!(a.n_features(), 3);
     assert!(a.is_sparse());
 }
+
+/// REQ-API-ACCESSORS. The first-class `shape()`/`data()`/`indices()`/`indptr()`
+/// accessors expose the same geometry + CSR `(data, indices, indptr)` triple
+/// scipy exposes as `.shape`/`.data`/`.indices`/`.indptr`.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+///   print(A.shape, A.data.tolist(), A.indices.tolist(), A.indptr.tolist())"`):
+/// `(3, 3) [1.0, 2.0, 3.0, 4.0, 5.0] [0, 2, 1, 0, 2] [0, 2, 3, 5]`.
+#[test]
+fn csr_shape_data_indices_indptr_match_scipy() {
+    let a = sample_a();
+    // scipy A.shape == (3, 3)
+    assert_eq!(a.shape(), (3, 3));
+    // scipy A.data == [1,2,3,4,5]
+    assert_eq!(a.data(), &[1.0, 2.0, 3.0, 4.0, 5.0]);
+    // scipy A.indices == [0,2,1,0,2] (CSR column indices)
+    assert_eq!(a.indices(), &[0, 2, 1, 0, 2]);
+    // scipy A.indptr == [0,2,3,5] (row pointers, length n_rows+1)
+    assert_eq!(a.indptr(), vec![0, 2, 3, 5]);
+}

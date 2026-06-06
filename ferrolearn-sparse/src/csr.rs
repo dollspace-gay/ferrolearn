@@ -12,7 +12,7 @@
 //! Behavior is oracle-verified vs the live scipy (R-CHAR-3) — see
 //! `tests/divergence_csr.rs`.
 //!
-//! **11 SHIPPED / 3 NOT-STARTED.**
+//! **12 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -28,7 +28,7 @@
 //! | REQ-MISSING-REDUCE | SHIPPED | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csr_sum_matches_scipy`/`csr_sum_axis0_matches_scipy`/`csr_sum_axis1_matches_scipy`/`csr_diagonal_matches_scipy`/`csr_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2003) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csr_multiply_matches_scipy`/`csr_sub_matches_scipy`/`csr_multiply_shape_mismatch_is_err`/`csr_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`sum_duplicates`/`astype`/`copy`/`max`/`min`. Blocker #2004. |
-//! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2005. |
+//! | REQ-API-ACCESSORS | SHIPPED (#2005) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSR `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSR column indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (row pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,2,3,4,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`. Guard `csr_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSR analog (R-SUBSTRATE-1). Blocker #2006. |
 
 use std::ops::{Add, AddAssign, Mul, MulAssign};
@@ -118,6 +118,60 @@ where
     /// Consume this matrix and return the underlying [`sprs::CsMat<T>`].
     pub fn into_inner(self) -> CsMat<T> {
         self.inner
+    }
+
+    /// Returns the matrix shape as a `(n_rows, n_cols)` tuple.
+    ///
+    /// Mirrors scipy `csr_matrix.shape` (the `self._shape` tuple,
+    /// `scipy/sparse/_compressed.py:38`), which is the `(M, N)` dimension pair.
+    /// Equivalent to `(self.n_rows(), self.n_cols())`. Live oracle:
+    /// `sp.csr_matrix([[1,0,2],[0,3,0],[4,0,5]]).shape == (3, 3)`.
+    #[must_use]
+    pub fn shape(&self) -> (usize, usize) {
+        (self.n_rows(), self.n_cols())
+    }
+
+    /// Returns the stored non-zero values, one per stored entry, in row-major
+    /// CSR order.
+    ///
+    /// Mirrors scipy `csr_matrix.data` (`scipy/sparse/_compressed.py:76-78`),
+    /// the `data` array of the CSR `(data, indices, indptr)` triple ferrolearn
+    /// stores identically. Length equals [`nnz`](Self::nnz). Live oracle:
+    /// `sp.csr_matrix([[1,0,2],[0,3,0],[4,0,5]]).data == [1,2,3,4,5]`.
+    #[must_use]
+    pub fn data(&self) -> &[T] {
+        self.inner.data()
+    }
+
+    /// Returns the column index of each stored non-zero entry, aligned with
+    /// [`data`](Self::data), in row-major CSR order.
+    ///
+    /// Mirrors scipy `csr_matrix.indices` (`scipy/sparse/_compressed.py:76-78`),
+    /// the `indices` array of the CSR `(data, indices, indptr)` triple — for CSR
+    /// these are the column indices. Length equals [`nnz`](Self::nnz). Live
+    /// oracle: `sp.csr_matrix([[1,0,2],[0,3,0],[4,0,5]]).indices == [0,2,1,0,2]`.
+    #[must_use]
+    pub fn indices(&self) -> &[usize] {
+        self.inner.indices()
+    }
+
+    /// Returns the row pointer array, of length `n_rows + 1`.
+    ///
+    /// Mirrors scipy `csr_matrix.indptr` (`scipy/sparse/_compressed.py:76-78`),
+    /// the `indptr` array of the CSR `(data, indices, indptr)` triple ferrolearn
+    /// stores identically: `indptr[i]..indptr[i+1]` is the slice of
+    /// [`data`](Self::data) / [`indices`](Self::indices) belonging to row `i`.
+    ///
+    /// Returns an owned `Vec<usize>` rather than a borrowed slice (unlike
+    /// [`data`](Self::data) / [`indices`](Self::indices)) because the sprs
+    /// `CsMat::indptr` accessor yields an owned `IndPtrView` value whose
+    /// `raw_storage()` slice borrows that temporary, so no `&[usize]` tied to
+    /// `&self` can be returned through the public sprs API; the row-pointer
+    /// storage is materialized via `IndPtrView::raw_storage().to_vec()`. Live
+    /// oracle: `sp.csr_matrix([[1,0,2],[0,3,0],[4,0,5]]).indptr == [0,2,3,5]`.
+    #[must_use]
+    pub fn indptr(&self) -> Vec<usize> {
+        self.inner.indptr().raw_storage().to_vec()
     }
 
     /// Construct a [`CsrMatrix`] from a [`CooMatrix`] by converting to CSR.
