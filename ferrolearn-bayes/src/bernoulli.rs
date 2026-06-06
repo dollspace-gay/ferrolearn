@@ -158,6 +158,15 @@ impl<F: Float> BernoulliNB<F> {
         self
     }
 
+    /// Sets the binarization threshold directly, including `None` to DISABLE
+    /// binarization (sklearn `binarize=None`, `naive_bayes.py:1179`). The
+    /// existing [`BernoulliNB::with_binarize`] is the `Some(threshold)` convenience.
+    #[must_use]
+    pub fn with_binarize_option(mut self, threshold: Option<F>) -> Self {
+        self.binarize = threshold;
+        self
+    }
+
     /// Set user-supplied class priors.
     ///
     /// The priors must sum to 1.0 and have length equal to the number
@@ -769,6 +778,62 @@ mod tests {
         let preds = fitted.predict(&x).unwrap();
         assert_eq!(preds[0], 0);
         assert_eq!(preds[3], 1);
+    }
+
+    #[test]
+    fn test_bernoulli_nb_with_binarize_option_none_disables_binarization() -> Result<(), FerroError>
+    {
+        // sklearn `binarize=None` SKIPS binarization (`naive_bayes.py:1179,1185`),
+        // so `feature_count_` accumulates the RAW (here fractional) per-class
+        // column sums. `with_binarize_option(None)` must reproduce that raw path
+        // and DIFFER from the binarizing `Some(0.0)` default.
+        //
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   X = [[0.2,0.8,0.0],[0.9,0.1,0.0],[0.7,0.6,0.0],
+        //        [0.0,0.0,0.9],[0.1,0.7,0.8],[0.0,0.3,0.6]], y = [0,0,0,1,1,1]
+        //   BernoulliNB(binarize=None).fit(X,y).feature_count_
+        //     = [[1.8, 1.5, 0.0], [0.1, 1.0, 2.3]]   (raw column sums)
+        //   BernoulliNB(binarize=0.0).fit(X,y).feature_count_
+        //     = [[3.0, 3.0, 0.0], [1.0, 2.0, 3.0]]   (binarized, all >0 -> 1)
+        let x = array![
+            [0.2, 0.8, 0.0],
+            [0.9, 0.1, 0.0],
+            [0.7, 0.6, 0.0],
+            [0.0, 0.0, 0.9],
+            [0.1, 0.7, 0.8],
+            [0.0, 0.3, 0.6],
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+
+        let fitted_none = BernoulliNB::<f64>::new()
+            .with_binarize_option(None)
+            .fit(&x, &y)?;
+        let expected_fc_none = array![[1.8, 1.5, 0.0], [0.1, 1.0, 2.3]];
+        let fc_none = fitted_none.feature_count();
+        assert_eq!(fc_none.dim(), (2, 3));
+        for ((i, j), &e) in expected_fc_none.indexed_iter() {
+            assert_relative_eq!(fc_none[[i, j]], e, epsilon = 1e-9);
+        }
+
+        // `Some(0.0)` (the default) binarizes: raw fractional counts collapse to
+        // integral presence counts — observably DIFFERENT from the `None` path.
+        let fitted_zero = BernoulliNB::<f64>::new()
+            .with_binarize_option(Some(0.0))
+            .fit(&x, &y)?;
+        let fc_zero = fitted_zero.feature_count();
+        let expected_fc_zero = array![[3.0, 3.0, 0.0], [1.0, 2.0, 3.0]];
+        for ((i, j), &e) in expected_fc_zero.indexed_iter() {
+            assert_relative_eq!(fc_zero[[i, j]], e, epsilon = 1e-9);
+        }
+
+        // The two paths must produce DIFFERENT feature counts on non-binary X.
+        assert_ne!(fc_none, fc_zero);
+
+        // And `with_binarize_option(Some(0.0))` must equal the `with_binarize(0.0)`
+        // convenience (both set `binarize = Some(0.0)`).
+        let fitted_conv = BernoulliNB::<f64>::new().with_binarize(0.0).fit(&x, &y)?;
+        assert_eq!(fitted_conv.feature_count(), fc_zero);
+        Ok(())
     }
 
     #[test]

@@ -19,7 +19,7 @@
 //! or NOT-STARTED (with a concrete blocker). Verified via
 //! `tests/divergence_extras.py` + the per-category divergence suites (595 pytest pass).
 //!
-//! **12 SHIPPED / 5 NOT-STARTED.**
+//! **13 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -35,6 +35,8 @@
 //! | REQ-MODULE-ALLOW (no module-root `#![allow]`) | SHIPPED | FIXED #2056: the module-root `#![allow(non_snake_case)]` was removed (it was dead — all field names are snake_case); `cargo clippy -p ferrolearn-python --all-targets -- -D warnings` stays green (R-CODE-3/R-APG-1). |
 //! | REQ-PHASE-FRAMING (no Phase-N deferral framing) | SHIPPED | the `//!` (this header) and `_extras.py` docstring were reworded to describe the extras binding surface without "Phase N" framing (R-DEFER-4), and this `## REQ status` table was added. |
 //! | REQ-DECOMP-NCOMPONENTS-DEFAULT (n_components default) | NOT-STARTED | the 5-6 decomp transformers hardcode `n_components=2` vs sklearn `None` (`IncrementalPCA`/`FastICA`/`KernelPCA`/`SparsePCA`/`FactorAnalysis`) / `'warn'`→None (`NMF`); the `None`-auto-rank behavior is owned downstream by `ferrolearn_decomp`. (`TruncatedSVD` default 2 MATCHES.) |
+//! | REQ-DISCRETE-NB-FITTED-ATTRS (feature_log_prob_/class_log_prior_/feature_count_/class_count_) | SHIPPED | FIXED #2103: `MultinomialNB`/`BernoulliNB`/`ComplementNB` expose the four `_BaseDiscreteNB` fitted attrs (sklearn/naive_bayes.py:880-892/580-602/1032-1042). A SECOND `#[pymethods] impl Rs{Multinomial,Bernoulli,Complement}NB` block (pyo3 `multiple-pymethods`) adds four `#[getter]`s each over the Rust fitted types (`FittedMultinomialNB` multinomial.rs:489/499/509/520, `FittedBernoulliNB` bernoulli.rs:520/530/540/551, `FittedComplementNB` complement.rs:535/586/545/556); `py_classifier!` macro + its 18 invocations UNCHANGED. ComplementNB `feature_log_prob_` is the `-logged` complement weight (positive) per sklearn. Non-test consumer: `_extras.py::_DiscreteNBWrapper.fit` sets `self.{feature_log_prob_,class_log_prior_,feature_count_,class_count_}` from `self._rs.*` (the three NB wrappers subclass it). Verification (model B): `tests/divergence_extras.py::test_{multinomial,bernoulli,complement}_discrete_nb_fitted_attrs_match_sklearn` (live sklearn 1.5.2 oracle, atol 1e-7). |
+//! | REQ-BERNOULLI-BINARIZE-NONE (`binarize=None` skips binarization) | SHIPPED | FIXED #2104: `_RsBernoulliNB` now types `binarize: Option<f64> = Some(0.0)` (was `f64 = 0.0`) and builds via `BernoulliNB::with_binarize_option(binarize)` (bernoulli.rs), so pyo3 maps Python `None`→`Option::None` (skips binarization, sklearn/naive_bayes.py:1076,1156,1179,1185) and a float→`Some(f64)`. `feature_count_` then accumulates raw X. Non-test consumer: `_extras.py::BernoulliNB.__init__(binarize=0.0)` passes `self.binarize` straight through (default 0.0 unchanged). Verification (model B): `tests/divergence_extras.py::test_red_bernoulli_binarize_none_feature_count_matches_sklearn` (live sklearn 1.5.2 oracle, atol 1e-9). |
 //! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
 //! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. |
 //! | REQ-VALUE-PARITY-RNG (seeded stochastic parity) | NOT-STARTED | the stochastic estimators (RF/ET/GB/HistGB/Bagging/AdaBoost/MiniBatchKMeans/GMM/FastICA/NMF) pass `random_state: Option<u64>` to a non-numpy RNG, so a shared `random_state` will not reproduce sklearn's numpy-MT/PCG64 draws (R-SUBSTRATE-5; needs `ferray::random`). |
@@ -560,15 +562,108 @@ py_classifier!(
     }
 );
 
+// Discrete-NB fitted attributes (#2103): the four `_BaseDiscreteNB` attrs
+// sklearn exposes (`feature_log_prob_`/`class_log_prior_`/`feature_count_`/
+// `class_count_`, sklearn/naive_bayes.py:885-892/580-602/880-883). Added as a
+// SECOND `#[pymethods]` block (requires pyo3 `multiple-pymethods`) so the
+// `py_classifier!` macro stays UNCHANGED. The Rust fitted type already computes
+// all four (FittedMultinomialNB, multinomial.rs:489/499/509/520).
+#[pymethods]
+impl RsMultinomialNB {
+    #[getter]
+    fn feature_log_prob_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_log_prob()))
+    }
+
+    #[getter]
+    fn class_log_prior_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.class_log_prior()))
+    }
+
+    #[getter]
+    fn feature_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_count()))
+    }
+
+    #[getter]
+    fn class_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cc = fitted.class_count();
+        Ok(ndarray1_to_numpy(py, &cc))
+    }
+}
+
 py_classifier!(
     RsBernoulliNB, "_RsBernoulliNB",
     ferrolearn_bayes::FittedBernoulliNB<f64>,
-    (alpha: f64 = 1.0, fit_prior: bool = true, binarize: f64 = 0.0),
+    (alpha: f64 = 1.0, fit_prior: bool = true, binarize: Option<f64> = Some(0.0)),
     {
+        // sklearn `binarize : float or None, default=0.0` (naive_bayes.py:1076,1156);
+        // `None` SKIPS binarization (naive_bayes.py:1179,1185). pyo3 maps Python
+        // `None` -> `Option::None` and a float -> `Some(f64)`, so both
+        // `_RsBernoulliNB(binarize=None)` and `_RsBernoulliNB(binarize=0.5)` work.
         ferrolearn_bayes::BernoulliNB::<f64>::new()
-            .with_alpha(alpha).with_fit_prior(fit_prior).with_binarize(binarize)
+            .with_alpha(alpha).with_fit_prior(fit_prior).with_binarize_option(binarize)
     }
 );
+
+// Discrete-NB fitted attributes (#2103): FittedBernoulliNB computes all four
+// (bernoulli.rs:520/530/540/551). Second `#[pymethods]` block keeps the
+// `py_classifier!` macro UNCHANGED. sklearn/naive_bayes.py:880-892/580-602.
+#[pymethods]
+impl RsBernoulliNB {
+    #[getter]
+    fn feature_log_prob_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_log_prob()))
+    }
+
+    #[getter]
+    fn class_log_prior_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.class_log_prior()))
+    }
+
+    #[getter]
+    fn feature_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_count()))
+    }
+
+    #[getter]
+    fn class_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cc = fitted.class_count();
+        Ok(ndarray1_to_numpy(py, &cc))
+    }
+}
 
 py_classifier!(
     RsComplementNB, "_RsComplementNB",
@@ -579,6 +674,52 @@ py_classifier!(
             .with_alpha(alpha).with_fit_prior(fit_prior).with_norm(norm)
     }
 );
+
+// Discrete-NB fitted attributes (#2103): FittedComplementNB computes all four
+// (complement.rs:535/586/545/556). `feature_log_prob_` is the `-logged`
+// complement weight (positive) — this is what sklearn exposes
+// (sklearn/naive_bayes.py:1032-1042). `class_log_prior()` and `class_count()`
+// return OWNED `Array1<F>` here, so bind to a local before marshalling.
+#[pymethods]
+impl RsComplementNB {
+    #[getter]
+    fn feature_log_prob_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_log_prob()))
+    }
+
+    #[getter]
+    fn class_log_prior_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let clp = fitted.class_log_prior();
+        Ok(ndarray1_to_numpy(py, &clp))
+    }
+
+    #[getter]
+    fn feature_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.feature_count()))
+    }
+
+    #[getter]
+    fn class_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cc = fitted.class_count();
+        Ok(ndarray1_to_numpy(py, &cc))
+    }
+}
 
 // ===========================================================================
 // Tree classifiers (extras)

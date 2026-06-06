@@ -281,7 +281,24 @@ class QuadraticDiscriminantAnalysis(_ClassifierWrapper):
         return _RsQDA(reg_param=self.reg_param)
 
 
-class MultinomialNB(_ClassifierWrapper):
+class _DiscreteNBWrapper(_ClassifierWrapper):
+    """Discrete naive-Bayes wrapper (#2103): in addition to the base
+    `_ClassifierWrapper` `classes_`/`n_features_in_`, surfaces the four
+    `_BaseDiscreteNB` fitted attributes sklearn exposes
+    (`feature_log_prob_`/`class_log_prior_`/`feature_count_`/`class_count_`,
+    sklearn/naive_bayes.py). The values are computed by the Rust fitted types
+    and read off the `_Rs*` getters added in extras.rs."""
+
+    def fit(self, X, y):
+        super().fit(X, y)
+        self.feature_log_prob_ = np.array(self._rs.feature_log_prob_)
+        self.class_log_prior_ = np.array(self._rs.class_log_prior_)
+        self.feature_count_ = np.array(self._rs.feature_count_)
+        self.class_count_ = np.array(self._rs.class_count_)
+        return self
+
+
+class MultinomialNB(_DiscreteNBWrapper):
     def __init__(self, *, alpha=1.0, fit_prior=True):
         self.alpha = alpha
         self.fit_prior = fit_prior
@@ -290,7 +307,7 @@ class MultinomialNB(_ClassifierWrapper):
         return _RsMultinomialNB(alpha=self.alpha, fit_prior=self.fit_prior)
 
 
-class BernoulliNB(_ClassifierWrapper):
+class BernoulliNB(_DiscreteNBWrapper):
     def __init__(self, *, alpha=1.0, fit_prior=True, binarize=0.0):
         self.alpha = alpha
         self.fit_prior = fit_prior
@@ -301,7 +318,7 @@ class BernoulliNB(_ClassifierWrapper):
                               binarize=self.binarize)
 
 
-class ComplementNB(_ClassifierWrapper):
+class ComplementNB(_DiscreteNBWrapper):
     def __init__(self, *, alpha=1.0, fit_prior=True, norm=False):
         self.alpha = alpha
         self.fit_prior = fit_prior
