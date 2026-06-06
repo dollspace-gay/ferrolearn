@@ -553,3 +553,74 @@ fn coo_astype_to_f32_preserves_structure() -> Result<(), FerroError> {
     assert_eq!(c.nnz(), 3);
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`power`). `power(n)` raises every STORED value to the
+/// power `n`, preserving the sparsity structure (row/col indices, shape, nnz),
+/// mirroring scipy `coo_matrix.power(n)` (`scipy/sparse/_data.py:99` — operates
+/// on `self.data` only; implicit zeros stay zero since `0^n=0` for `n>0`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([2.,-3.,4.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   p2=m.power(2); p3=m.power(3);
+///   print(p2.data.tolist(), p2.row.tolist(), p2.col.tolist(), p2.nnz,
+///         p2.toarray().tolist(), p3.data.tolist())"`):
+/// `[4.0, 9.0, 16.0] [0, 1, 2] [0, 1, 2] 3
+///   [[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]] [8.0, -27.0, 64.0]`.
+#[test]
+fn coo_power_squares_matches_scipy() -> Result<(), FerroError> {
+    let m =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 1, 2], vec![0, 1, 2], vec![2.0, -3.0, 4.0])?;
+
+    let p2 = m.power(2.0)?;
+    // scipy p2.data == [4, 9, 16] (each stored value squared)
+    assert_eq!(p2.data(), &[4.0, 9.0, 16.0]);
+    // scipy p2.row == [0,1,2], p2.col == [0,1,2], p2.nnz == 3 (structure preserved)
+    assert_eq!(p2.row(), &[0, 1, 2]);
+    assert_eq!(p2.col(), &[0, 1, 2]);
+    assert_eq!(p2.nnz(), 3);
+
+    // scipy p2.toarray() == [[4,0,0],[0,9,0],[0,0,16]]
+    let expected = [[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
+    let d = p2.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "power(2) mismatch at ({r},{col})"
+            );
+        }
+    }
+
+    let p3 = m.power(3.0)?;
+    // scipy p3.data == [8, -27, 64] (sign-preserving odd power)
+    assert_eq!(p3.data(), &[8.0, -27.0, 64.0]);
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`power`). Fractional power: `power(0.5)` takes the
+/// element-wise square root of each stored value, preserving structure, mirroring
+/// scipy `coo_matrix.power(0.5)` (`scipy/sparse/_data.py:99`). Square roots of
+/// perfect squares are bit-exact in f64.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([4.,9.,16.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   p=m.power(0.5);
+///   print(p.data.tolist(), p.row.tolist(), p.col.tolist(), p.nnz)"`):
+/// `[2.0, 3.0, 4.0] [0, 1, 2] [0, 1, 2] 3`.
+#[test]
+fn coo_power_sqrt_matches_scipy() -> Result<(), FerroError> {
+    let m =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 1, 2], vec![0, 1, 2], vec![4.0, 9.0, 16.0])?;
+
+    let p = m.power(0.5)?;
+    // scipy p.data == [2, 3, 4] (exact sqrt of perfect squares)
+    assert_eq!(p.data(), &[2.0, 3.0, 4.0]);
+    // structure preserved
+    assert_eq!(p.row(), &[0, 1, 2]);
+    assert_eq!(p.col(), &[0, 1, 2]);
+    assert_eq!(p.nnz(), 3);
+    Ok(())
+}
