@@ -56,7 +56,7 @@
 //! | REQ-13 | `n_components` as float (variance ratio) / "mle" / None-default | NOT-STARTED | sklearn `_pca.py:657-691`; ferrolearn requires explicit `usize` — blocker #1504 |
 //! | REQ-14 | `get_covariance` / `get_precision` | SHIPPED | `FittedPCA::get_covariance` (`pca.rs` symbol `get_covariance`) builds `components_ᵀ·diag(exp_var_diff)·components_ + noise_variance_·I` = sklearn `_base.py:30-56`; `get_precision` (symbol `get_precision`/`precision_and_logdet`) symmetric-eigendecomposes it (same faer `eigen_dispatch` as `fit`) → `V diag(1/λ) Vᵀ` = the unique inverse of sklearn's lemma result (`_base.py:58-101`). In-module `pca_get_covariance_matches_sklearn`/`pca_get_precision_matches_sklearn` match the live sklearn 1.5.2 oracle element-wise to 1e-6. Consumer: `score_samples`/`score` call `precision_and_logdet`; re-export `lib.rs:98`. Was #1505, fixed |
 //! | REQ-15 | `score` / `score_samples` (Gaussian log-likelihood) + `noise_variance_` | SHIPPED | `fit` captures the FULL eigenvalue spectrum and sets `noise_variance_ = mean(sorted_eigenvalues[n_comp..min_dim])` = sklearn `_pca.py:685-688` (getter symbol `noise_variance`). `FittedPCA::score_samples` computes `ll_i = −0.5·(Xr_i·precision·Xr_iᵀ) − 0.5·(p·ln(2π) − logdet(precision))` (`logdet = −Σ ln(λ)`) = sklearn `_pca.py:805-830`; `score = mean(score_samples)` = `_pca.py:832-853`. In-module `pca_noise_variance_matches_sklearn`/`pca_score_samples_matches_sklearn`/`pca_score_matches_sklearn` match the live sklearn 1.5.2 oracle to 1e-6 (`whiten=false`). Consumer: `score`/`score_samples` consume `noise_variance_`+`get_precision`; re-export `lib.rs:98`. Was #1507, fixed |
-//! | REQ-16 | Fitted attrs `n_components_` / `n_features_in_` | NOT-STARTED | derivable but not exposed — blocker #1508 |
+//! | REQ-16 | Fitted attrs `n_components_` / `n_features_in_` | SHIPPED | `FittedPCA::n_components_()` (= `components_.nrows()`) + `n_features_in_()` (= `mean_.len()`); `pca_n_components_and_n_features_in_match_sklearn` |
 //! | REQ-17 | ctor params `tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy` | NOT-STARTED | sklearn `_pca.py:407-423`; ferrolearn has `n_components` only — blocker #1509 |
 //! | REQ-18 | ferray substrate | NOT-STARTED | dense `ndarray` + direct `faer`/Jacobi — blocker #1510 |
 //!
@@ -209,6 +209,25 @@ impl<F: Float + Send + Sync + 'static> FittedPCA<F> {
     #[must_use]
     pub fn singular_values(&self) -> &Array1<F> {
         &self.singular_values_
+    }
+
+    /// The resolved number of retained components, `n_components_`.
+    ///
+    /// Equals the number of rows of `components_`. Mirrors sklearn
+    /// `PCA.n_components_` (`sklearn/decomposition/_pca.py:691`), the count
+    /// after any `n_components` float/`"mle"`/`None` post-processing.
+    #[must_use]
+    pub fn n_components_(&self) -> usize {
+        self.components_.nrows()
+    }
+
+    /// The number of features seen during fitting, `n_features_in_`.
+    ///
+    /// Equals the length of `mean_`. Mirrors sklearn's `n_features_in_`
+    /// fitted attribute.
+    #[must_use]
+    pub fn n_features_in_(&self) -> usize {
+        self.mean_.len()
     }
 
     /// Estimated noise covariance of the probabilistic-PCA model.
@@ -1364,6 +1383,16 @@ mod tests {
             0.011_251_254_758_681_639,
             epsilon = 1e-6
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pca_n_components_and_n_features_in_match_sklearn() -> Result<(), FerroError> {
+        // sklearn PCA(n_components=2).fit(X 5x3): n_components_ == 2, n_features_in_ == 3.
+        let x = prob_fixture();
+        let fitted = PCA::<f64>::new(2).fit(&x, &())?;
+        assert_eq!(fitted.n_components_(), 2);
+        assert_eq!(fitted.n_features_in_(), 3);
         Ok(())
     }
 
