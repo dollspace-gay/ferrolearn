@@ -974,3 +974,77 @@ def test_red_pca_ncomp_bool_accepted_by_sklearn():
     # raises ValueError in _resolve_n_components).
     fr = fl.PCA(n_components=True).fit(X)
     assert int(fr.n_components_) == int(sk.n_components_)
+
+
+# ---------------------------------------------------------------------------
+# RED pin #2115: PCA 'auto' solver-selection diverges from sklearn on the
+# medium-large, not-tall-skinny shape where sklearn's documented 'auto' policy
+# selects the `randomized` truncated solver.
+#
+# sklearn's 'auto' policy (sklearn/decomposition/_pca.py:531-543):
+#   - covariance_eigh  if n_features <= 1000 and n_samples >= 10*n_features
+#   - full             elif max(X.shape) <= 500 or n_components == 'mle'
+#   - randomized       elif 1 <= n_components < 0.8 * min(X.shape)
+#   - full             else
+# ferrolearn's migrated `fit` (ferrolearn-decomp/src/pca.rs:1297) only implements
+#   use_covariance_eigh = n_features <= 1000 and n_samples >= 10*n_features
+# and routes EVERYTHING ELSE to the `full` SVD path -- the `randomized` branch is
+# folded into `full` (REQ-12 NOT-STARTED). So for a shape that lands in sklearn's
+# `randomized` branch, ferrolearn returns the EXACT full-SVD spectrum while
+# sklearn returns the (different) randomized-SVD approximation.
+#
+# Fixture 600x100, n_components=10: max(shape)=600>500 (not full-by-size),
+# 600 < 10*100=1000 (not covariance_eigh), and 1 <= 10 < 0.8*100=80, so sklearn
+# selects `randomized`. The randomized solver with random_state=None is
+# stochastic, but the gap vs ferrolearn's full SVD (~0.02-0.06 on
+# explained_variance_[0]) is two orders of magnitude beyond rtol=1e-6 and stable
+# across seeds; we pin the oracle with a fixed seed for reproducibility.
+#
+# R-CHAR-3: the expected spectrum is computed by the LIVE sklearn 1.5.2 'auto'
+# oracle in-test (seeded for determinism); nothing is copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+
+def test_red_pca_auto_solver_randomized_branch_matches_sklearn():
+    """Divergence: PCA 'auto' picks full where sklearn 'auto' picks randomized.
+
+    For a 600x100 fixture with n_components=10, sklearn's 'auto' policy
+    (`sklearn/decomposition/_pca.py:539-540`) selects the `randomized` truncated
+    SVD solver (max(shape)=600>500, 600<10*100, and 1<=10<0.8*100). ferrolearn's
+    migrated `fit` (`ferrolearn-decomp/src/pca.rs:1297`) has no `randomized`
+    solver and falls back to the exact `full` SVD, so for the SAME (X, n_components)
+    its explained_variance_/singular_values_/noise_variance_ differ from sklearn's
+    'auto' output by ~1e-2 -- far beyond rtol=1e-6.
+
+    R-CHAR-3: the oracle is the live sklearn 1.5.2 'auto' fit in this test
+    (random_state fixed only to make the stochastic randomized result
+    reproducible); ferrolearn values are never copied into the expectation.
+
+    Tracking: #2115.
+    """
+    rng = np.random.RandomState(0)
+    X = rng.randn(600, 100)
+
+    # Live oracle: sklearn 'auto' selects `randomized` here.
+    sk = SkPCA(n_components=10, svd_solver="auto", random_state=42).fit(X)
+    assert sk._fit_svd_solver == "randomized"  # documents the policy outcome
+
+    fr = fl.PCA(n_components=10).fit(X)
+
+    # ferrolearn must reproduce sklearn's 'auto' (randomized) spectrum for the
+    # SAME (X, n_components). It does not: it returns the exact full-SVD result.
+    np.testing.assert_allclose(
+        np.asarray(fr.explained_variance_),
+        sk.explained_variance_,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        np.asarray(fr.singular_values_),
+        sk.singular_values_,
+        rtol=1e-6,
+        atol=1e-6,
+    )
+    assert abs(float(fr.noise_variance_) - float(sk.noise_variance_)) <= 1e-6 * abs(
+        float(sk.noise_variance_)
+    )
