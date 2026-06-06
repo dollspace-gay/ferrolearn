@@ -356,3 +356,132 @@ def test_red_hist_gradient_boosting_uses_max_iter_not_n_estimators():
     # `n_estimators` is not a sklearn HGB param -> must be rejected.
     with pytest.raises(TypeError):
         fl.HistGradientBoostingRegressor(n_estimators=10)
+
+
+# ---------------------------------------------------------------------------
+# Discrete-NB fitted attributes (#2103): the four `_BaseDiscreteNB` attrs
+# (`feature_log_prob_`/`class_log_prior_`/`feature_count_`/`class_count_`,
+# sklearn/naive_bayes.py) surfaced on MultinomialNB/BernoulliNB/ComplementNB.
+# Expected values come from the LIVE sklearn 1.5.2 oracle in-test (R-CHAR-3),
+# never copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+def _assert_discrete_nb_attrs_match(fl_est, sk_est, X, y):
+    fl_est.fit(X, y)
+    sk_est.fit(X, y)
+
+    for attr in (
+        "feature_log_prob_",
+        "class_log_prior_",
+        "feature_count_",
+        "class_count_",
+    ):
+        assert hasattr(fl_est, attr), f"ferrolearn missing {attr}"
+        assert hasattr(sk_est, attr), f"sklearn missing {attr}"
+        np.testing.assert_allclose(
+            np.asarray(getattr(fl_est, attr)),
+            np.asarray(getattr(sk_est, attr)),
+            atol=1e-7,
+            err_msg=f"{attr} diverges from sklearn",
+        )
+
+
+def test_multinomial_discrete_nb_fitted_attrs_match_sklearn():
+    """MultinomialNB exposes feature_log_prob_/class_log_prior_/feature_count_/
+    class_count_ matching the live sklearn 1.5.2 oracle (sklearn/naive_bayes.py
+    _BaseDiscreteNB attrs)."""
+    X = np.array(
+        [[2, 1, 0], [0, 3, 1], [1, 1, 2], [0, 0, 4], [3, 0, 1], [1, 2, 2]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 1, 0, 1, 0, 1])
+    _assert_discrete_nb_attrs_match(fl.MultinomialNB(), SkMultinomialNB(), X, y)
+
+
+def test_bernoulli_discrete_nb_fitted_attrs_match_sklearn():
+    """BernoulliNB exposes the four `_BaseDiscreteNB` fitted attrs matching the
+    live sklearn 1.5.2 oracle."""
+    X = np.array(
+        [[1, 1, 0], [1, 0, 0], [1, 1, 0], [0, 0, 1], [0, 1, 1], [0, 0, 1]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 0, 1, 1, 1])
+    _assert_discrete_nb_attrs_match(fl.BernoulliNB(), SkBernoulliNB(), X, y)
+
+
+def test_complement_discrete_nb_fitted_attrs_match_sklearn():
+    """ComplementNB exposes the four `_BaseDiscreteNB` fitted attrs matching the
+    live sklearn 1.5.2 oracle. `feature_log_prob_` is the `-logged` complement
+    weight (positive) — sklearn's exposed value (naive_bayes.py:1032-1042)."""
+    X = np.array(
+        [[5, 1, 0], [4, 2, 0], [6, 0, 1], [0, 1, 5], [1, 0, 4], [0, 2, 6]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 0, 1, 1, 1])
+    _assert_discrete_nb_attrs_match(fl.ComplementNB(), SkComplementNB(), X, y)
+
+
+# ---------------------------------------------------------------------------
+# RED pin (#2104): BernoulliNB(binarize=None) divergence.
+#
+# sklearn documents `binarize : float or None, default=0.0`
+# (sklearn/naive_bayes.py:1076); the param constraint admits `None`
+# (`"binarize": [None, Interval(Real, 0, None, closed="left")]`,
+# naive_bayes.py:1156); and when `binarize is None` sklearn SKIPS binarization
+# (`if self.binarize is not None: X = binarize(X, ...)`, naive_bayes.py:1179,
+# 1185). Consequently `feature_count_` (one of the four #2103 fitted attrs) is
+# accumulated from the RAW, non-binarized X.
+#
+# ferrolearn's `_RsBernoulliNB` binds `binarize: f64` (extras.rs:613), so the
+# `_extras.py::BernoulliNB(binarize=None)` -> `_RsBernoulliNB(binarize=None)`
+# call raises `TypeError: argument 'binarize': must be real number, not
+# NoneType` at fit time. The sklearn-correct `feature_count_` is unreachable.
+# Expected value is computed from the live sklearn oracle in-test (R-CHAR-3).
+# ---------------------------------------------------------------------------
+
+def test_red_bernoulli_binarize_none_feature_count_matches_sklearn():
+    """RED (#2104): `BernoulliNB(binarize=None)` is valid in sklearn 1.5.2 and
+    skips binarization, so `feature_count_` accumulates RAW X
+    (sklearn/naive_bayes.py:1076,1156,1179,1185). ferrolearn raises TypeError
+    because `_RsBernoulliNB` types `binarize` as f64 (extras.rs:613), so the
+    surfaced `feature_count_` for this documented param value is unreachable.
+
+    Live oracle (R-CHAR-3): the expected `feature_count_` is computed from
+    sklearn in-test, never copied from ferrolearn.
+    """
+    # Non-binary (fractional) feature values so binarize=None vs the default
+    # binarize=0.0 are OBSERVABLY different in feature_count_.
+    X = np.array(
+        [
+            [0.2, 0.8, 0.0],
+            [0.9, 0.1, 0.0],
+            [0.7, 0.6, 0.0],
+            [0.0, 0.0, 0.9],
+            [0.1, 0.7, 0.8],
+            [0.0, 0.3, 0.6],
+        ],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 0, 1, 1, 1])
+
+    # --- Live sklearn oracle: binarize=None is accepted and skips binarization.
+    sk = SkBernoulliNB(binarize=None).fit(X, y)
+    expected_feature_count = np.asarray(sk.feature_count_)
+    # Sanity: with binarize=None this is the raw per-class column sum, which is
+    # NOT integral here (distinguishes it from the binarized default path).
+    assert not np.array_equal(
+        expected_feature_count, np.round(expected_feature_count)
+    ), "oracle invariant broken: binarize=None should sum raw (fractional) X"
+
+    # --- ferrolearn must mirror: binarize=None skips binarization and surfaces
+    # the same feature_count_. Currently raises TypeError at fit (extras.rs:613).
+    fl_est = fl.BernoulliNB(binarize=None).fit(X, y)
+    np.testing.assert_allclose(
+        np.asarray(fl_est.feature_count_),
+        expected_feature_count,
+        atol=1e-9,
+        err_msg=(
+            "BernoulliNB(binarize=None).feature_count_ diverges from sklearn "
+            "naive_bayes.py:1179 (None skips binarization)"
+        ),
+    )
