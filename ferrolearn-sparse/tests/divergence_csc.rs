@@ -772,3 +772,82 @@ fn csc_argmax_ties_earliest() -> Result<(), FerroError> {
     assert_eq!(p.argmin()?, 1);
     Ok(())
 }
+
+// REQ-MISSING-INDEX (maintenance: sort_indices/sum_duplicates) — live scipy
+// oracle (R-CHAR-3). Canonical `A = [[1,0,2],[0,3,0],[4,0,5]]` (CSC
+// `data=[1,4,3,2,5]`, `indices(rows)=[0,2,1,0,2]`, `indptr(cols)=[0,2,3,5]`).
+// `CscMatrix` is canonical-by-construction (sprs `try_new_csc` rejects
+// unsorted/duplicate within-column row indices), so both methods are idempotent
+// here — exercised against canonical input, expecting the identity. Expected
+// values from `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   A.sort_indices()
+//   print(A.data.tolist(), A.indices.tolist(), A.indptr.tolist())  # [1,4,3,2,5] [0,2,1,0,2] [0,2,3,5]
+//   B=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   B.sum_duplicates()
+//   print(B.data.tolist(), B.indices.tolist(), B.indptr.tolist())  # [1,4,3,2,5] [0,2,1,0,2] [0,2,3,5]"`.
+
+/// REQ-MISSING-INDEX (maintenance). `sort_indices()` returns the within-column
+/// row indices in sorted (canonical) order. Idempotent on the already-canonical
+/// `A`, matching scipy `csc_matrix.sort_indices()`.
+///
+/// Oracle: `A` CSC `data=[1,4,3,2,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`
+/// -> identity; dense `[[1,0,2],[0,3,0],[4,0,5]]` unchanged.
+#[test]
+fn csc_sort_indices_canonical() -> Result<(), FerroError> {
+    let a = sample_a();
+    let sorted = a.sort_indices()?;
+    assert_eq!(sorted.data(), &[1.0, 4.0, 3.0, 2.0, 5.0]);
+    assert_eq!(sorted.indices(), &[0, 2, 1, 0, 2]);
+    assert_eq!(sorted.indptr(), vec![0, 2, 3, 5]);
+    let expected = [[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]];
+    assert_dense_eq(&sorted.to_dense(), &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `sum_duplicates()` canonicalizes by summing
+/// duplicate `(row, col)` entries per column. Idempotent on the
+/// already-canonical `A`, matching scipy `csc_matrix.sum_duplicates()`.
+///
+/// Oracle: `A` CSC `data=[1,4,3,2,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`
+/// -> identity; dense `[[1,0,2],[0,3,0],[4,0,5]]` unchanged.
+#[test]
+fn csc_sum_duplicates_canonical() -> Result<(), FerroError> {
+    let a = sample_a();
+    let coalesced = a.sum_duplicates()?;
+    assert_eq!(coalesced.data(), &[1.0, 4.0, 3.0, 2.0, 5.0]);
+    assert_eq!(coalesced.indices(), &[0, 2, 1, 0, 2]);
+    assert_eq!(coalesced.indptr(), vec![0, 2, 3, 5]);
+    let expected = [[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]];
+    assert_dense_eq(&coalesced.to_dense(), &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `sum_duplicates()` PRESERVES an
+/// explicitly-stored zero entry (it canonicalizes, it does not prune — dropping
+/// zeros is `eliminate_zeros`' job), matching scipy `sum_duplicates()` which
+/// keeps zero sums. A stored zero at a distinct row IS constructible via `new`
+/// (sprs accepts a stored `0.0`, only rejecting unsorted/duplicate indices).
+///
+/// Input: CSC `data=[3,0,5]`, `indices(rows)=[0,1,2]`, `indptr(cols)=[0,1,2,3]`,
+/// shape `(3,3)` (a stored zero at row 1, col 1) -> `sum_duplicates()` keeps all
+/// three entries (`nnz==3`, including the stored zero).
+#[test]
+fn csc_sum_duplicates_preserves_zero_sum() -> Result<(), FerroError> {
+    let m = CscMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![3.0_f64, 0.0, 5.0],
+    )?;
+    assert_eq!(m.nnz(), 3);
+    let coalesced = m.sum_duplicates()?;
+    // The stored zero at (1,1) is preserved — sum_duplicates does not prune.
+    assert_eq!(coalesced.nnz(), 3);
+    assert_eq!(coalesced.data(), &[3.0, 0.0, 5.0]);
+    assert_eq!(coalesced.indices(), &[0, 1, 2]);
+    assert_eq!(coalesced.indptr(), vec![0, 1, 2, 3]);
+    Ok(())
+}

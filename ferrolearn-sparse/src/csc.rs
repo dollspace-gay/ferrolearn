@@ -12,10 +12,10 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **14 SHIPPED / 1 NOT-STARTED** (REQ-MISSING-INDEX is a SPLIT: element access
-//! `get(i,j)`, rows/cols `getrow`/`getcol`, and the maintenance surface
-//! `max`/`min`/`argmax`/`argmin`/`astype`/`copy`/`eliminate_zeros`/`power` all
-//! SHIPPED; `sort_indices`/`sum_duplicates` remain NOT-STARTED).
+//! **15 SHIPPED** (REQ-MISSING-INDEX is a SPLIT: element access `get(i,j)`,
+//! rows/cols `getrow`/`getcol`, and the maintenance surface
+//! `max`/`min`/`argmax`/`argmin`/`astype`/`copy`/`eliminate_zeros`/`power`/
+//! `sort_indices`/`sum_duplicates` all SHIPPED).
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -32,10 +32,11 @@
 //! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2011) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csc_multiply_matches_scipy`/`csc_sub_matches_scipy`/`csc_multiply_shape_mismatch_is_err`/`csc_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
 //! | REQ-MISSING-INDEX (element access `A[i,j]`) | SHIPPED (#2012) | `get(i,j) -> Result<T, FerroError>` returns the stored value at `(i,j)` or `T::zero()` if structurally absent (sprs `CsMat::get(i,j).copied().unwrap_or_else(T::zero)`), with an out-of-bounds `i`/`j` → `Err(FerroError::InvalidParameter)` — the column-symmetric port of the CSR `get` (sprs `get(i,j)` indexes by `(row,col)` regardless of storage), mirroring scipy `A[i,j]` (`IndexMixin.__getitem__` -> `_get_intXint`, `_index.py:29`). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `A[1,1]=3`, `A[0,1]=0` (absent), `A[0,0]=1`, `A[0,2]=2`, `A[2,0]=4`; out-of-bounds → `Err`. Guards `csc_get_element_matches_scipy`/`csc_get_absent_is_zero`/`csc_get_out_of_bounds_is_err`. |
 //! | REQ-MISSING-INDEX (rows/cols) | SHIPPED (#2012) | `getcol(j)` returns column `j` as a `(n_rows, 1)` CSC (single-column case of `col_slice`, delegates to `self.col_slice(j, j + 1)`), mirroring scipy `getcol(j)` (`_matrix.py:104` → `_getcol`, "(m x 1) column vector"); `getrow(i)` returns row `i` as a `(1, n_cols)` CSC via `self.transpose().getcol(i)?.transpose()`, mirroring scipy `getrow(i)` (`_matrix.py:110` → `_getrow`, "(1 x n) row vector"). Both bounds-check (`j >= n_cols()`/`i >= n_rows()` → `Err(FerroError::InvalidParameter)`, scipy `IndexError`, R-DEV-2). CSC is column-natural, so `getcol` delegates to `col_slice` (the mirror of CSR's `getrow`→`row_slice`). Live oracle (R-CHAR-3): `A.getrow(0).toarray()`=`[[1,0,2]]`, `A.getrow(1).toarray()`=`[[0,3,0]]`, `A.getcol(0).toarray()`=`[[1],[0],[4]]`, `A.getcol(2).toarray()`=`[[2],[0],[5]]`. Guards `csc_getrow_matches_scipy`/`csc_getcol_matches_scipy`/`csc_getrow_getcol_out_of_bounds_is_err`. |
-//! | REQ-MISSING-INDEX (maintenance) | SHIPPED (#2012) | `max()`/`min()` (`T: Copy + Zero + PartialOrd`) fold over [`data()`](CscMatrix::data) and, when not fully dense, fold an implicit zero, mirroring scipy `_minmax_mixin._min_or_max` `axis=None` (`_data.py:208`-`:224`); `argmax()`/`argmin()` (`T: Copy + Zero + PartialOrd`) return the C-order flat index `r*n_cols+c` of the extreme element over all positions (stored + implicit zeros), ties to the smallest flat index, via a dense C-order scan (R-DEV-7 perf deviation, result-identical to scipy `_minmax_mixin._argminmax` `axis=None`, `_data.py:271`-`:333`/`:537`/`:569`); empty matrix → `Err` (scipy `ValueError`, `:288`-`:290`). Live oracle (R-CHAR-3): `csc_matrix([[1,0,2],[0,5,0],[4,0,3]]).argmax()==4`/`.argmin()==1`; `[[-1,-2],[-3,-4]].argmax()==0`/`.argmin()==3`; `[[-1,0],[-3,-4]].argmax()==1`; all-zeros → `0`; `[[5,5],[1,5]].argmax()==0` (earliest tie). Guards `csc_argmax_matches_scipy`/`csc_argmin_dense_all_negative`/`csc_argmax_implicit_zero`/`csc_argmax_all_zero`/`csc_argmax_ties_earliest`. `astype(cast)` (closure-based dtype cast, `_data.py:69`, R-DEV-4) and `copy()` (= `clone`, `_data.py:94`) preserve `(indptr, indices, shape)`; `eliminate_zeros()` walks COLUMNS via the column-pointer `indptr`, dropping `val == 0` and rebuilding the triple (`_compressed.py:1025`, functional/new-matrix R-DEV-4); `power(n)` (`T: Float`) maps `data()` through `powf(n)` (`_data.py:99`). Storage-agnostic ports of the CSR maintenance surface; for CSC `indices` are ROW indices and `indptr` the COLUMN pointer. Live oracle (R-CHAR-3): `csc_matrix(diag(-3,-1,-5)).max()==0`, `.min()==-5`; `csc_matrix(diag(3,1,5)).max()==5`, `.min()==0`; `astype(int64)` of `[3.7,-2.9,5.0]` -> `[3,-2,5]` (truncation); `eliminate_zeros` of CSC `data=[3,0,5]`/`indices=[0,1,2]`/`indptr=[0,1,2,3]` -> `nnz=2`, `data=[3,5]`, `indices=[0,2]`, `indptr=[0,1,1,2]`; `power(2)` of `[2,-3]` -> `[4,9]`, `power(3)` -> `[8,-27]`. Guards `csc_max_min_folds_implicit_zero`/`csc_astype_truncates`/`csc_copy_preserves_structure`/`csc_eliminate_zeros_matches_scipy`/`csc_power_matches_scipy`. Still NOT-STARTED: `sort_indices`/`sum_duplicates`. |
+//! | REQ-MISSING-INDEX (maintenance) | SHIPPED (#2012) | `max()`/`min()` (`T: Copy + Zero + PartialOrd`) fold over [`data()`](CscMatrix::data) and, when not fully dense, fold an implicit zero, mirroring scipy `_minmax_mixin._min_or_max` `axis=None` (`_data.py:208`-`:224`); `argmax()`/`argmin()` (`T: Copy + Zero + PartialOrd`) return the C-order flat index `r*n_cols+c` of the extreme element over all positions (stored + implicit zeros), ties to the smallest flat index, via a dense C-order scan (R-DEV-7 perf deviation, result-identical to scipy `_minmax_mixin._argminmax` `axis=None`, `_data.py:271`-`:333`/`:537`/`:569`); empty matrix → `Err` (scipy `ValueError`, `:288`-`:290`). Live oracle (R-CHAR-3): `csc_matrix([[1,0,2],[0,5,0],[4,0,3]]).argmax()==4`/`.argmin()==1`; `[[-1,-2],[-3,-4]].argmax()==0`/`.argmin()==3`; `[[-1,0],[-3,-4]].argmax()==1`; all-zeros → `0`; `[[5,5],[1,5]].argmax()==0` (earliest tie). Guards `csc_argmax_matches_scipy`/`csc_argmin_dense_all_negative`/`csc_argmax_implicit_zero`/`csc_argmax_all_zero`/`csc_argmax_ties_earliest`. `astype(cast)` (closure-based dtype cast, `_data.py:69`, R-DEV-4) and `copy()` (= `clone`, `_data.py:94`) preserve `(indptr, indices, shape)`; `eliminate_zeros()` walks COLUMNS via the column-pointer `indptr`, dropping `val == 0` and rebuilding the triple (`_compressed.py:1025`, functional/new-matrix R-DEV-4); `power(n)` (`T: Float`) maps `data()` through `powf(n)` (`_data.py:99`). Storage-agnostic ports of the CSR maintenance surface; for CSC `indices` are ROW indices and `indptr` the COLUMN pointer. Live oracle (R-CHAR-3): `csc_matrix(diag(-3,-1,-5)).max()==0`, `.min()==-5`; `csc_matrix(diag(3,1,5)).max()==5`, `.min()==0`; `astype(int64)` of `[3.7,-2.9,5.0]` -> `[3,-2,5]` (truncation); `eliminate_zeros` of CSC `data=[3,0,5]`/`indices=[0,1,2]`/`indptr=[0,1,2,3]` -> `nnz=2`, `data=[3,5]`, `indices=[0,2]`, `indptr=[0,1,1,2]`; `power(2)` of `[2,-3]` -> `[4,9]`, `power(3)` -> `[8,-27]`. Guards `csc_max_min_folds_implicit_zero`/`csc_astype_truncates`/`csc_copy_preserves_structure`/`csc_eliminate_zeros_matches_scipy`/`csc_power_matches_scipy`. `sum_duplicates()` (`T: Copy + Zero + Add`) canonicalizes by per-COLUMN `BTreeMap<row, T>` accumulation (sorted rows, sum on collision, zero sums PRESERVED — dropping zeros is `eliminate_zeros`' job), mirroring scipy `csc_matrix.sum_duplicates()` (`_compressed.py:1063`); `sort_indices()` (`T: Clone`) returns a CSC with within-column row indices in sorted order, mirroring scipy `csc_matrix.sort_indices()` (`_compressed.py:1110`). Both are storage-agnostic ports of the CSR maintenance methods (#2004), row-walk swapped for column-walk, rebuilt via [`CscMatrix::new`] (R-DEV-4: scipy mutates in place). HONESTY: sprs `CsMat::try_new_csc` rejects unsorted/duplicate within-column row indices (canonical-by-construction), so a duplicate-bearing/unsorted `CscMatrix` is unconstructible via `new`/`from_coo` — both are therefore **idempotent** here, shipped for scipy API parity and exercised against canonical inputs. Live oracle (R-CHAR-3, canonical CSC of `[[1,0,2],[0,3,0],[4,0,5]]`: `data=[1,4,3,2,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`): both yield the identity (data/indices/indptr/dense unchanged). Guards `csc_sort_indices_canonical`/`csc_sum_duplicates_canonical`. |
 //! | REQ-API-ACCESSORS | SHIPPED (#2013) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSC `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSC ROW indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (COLUMN pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Column-symmetric port of the CSR accessors (#2005). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,4,3,2,5]` (column-major), `indices=[0,2,1,0,2]` (row indices), `indptr=[0,2,3,5]` (column pointer). Guard `csc_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSC analog (R-SUBSTRATE-1). Blocker #2014. |
 
+use std::collections::BTreeMap;
 use std::ops::{Add, AddAssign, Mul, MulAssign};
 
 use ferrolearn_core::FerroError;
@@ -699,6 +700,120 @@ where
             indptr2.push(data2.len());
         }
         Self::new(self.n_rows(), n_cols, indptr2, indices2, data2)
+    }
+
+    /// Return a new CSC matrix in canonical form, summing duplicate
+    /// `(row, col)` entries within each column.
+    ///
+    /// Mirrors scipy `csc_matrix.sum_duplicates()`
+    /// (`scipy/sparse/_compressed.py:1063` — `sort_indices()` then
+    /// `csr_sum_duplicates(...)` on the swapped `(M, N)` then `self.prune()`),
+    /// which sorts each column's row indices and adds together any entries that
+    /// share the same `(row, col)` position. For each column `c`, the stored
+    /// slice `indptr[c]..indptr[c+1]` is accumulated into a
+    /// [`BTreeMap<usize, T>`](std::collections::BTreeMap) keyed by ROW index,
+    /// summing on collision; the `BTreeMap` yields rows in sorted order, giving
+    /// scipy's canonical `(sorted indices, no duplicates)` form. **Every**
+    /// accumulated entry is kept — including positions whose duplicates sum to
+    /// `0` — because canonicalization is the only job here; dropping zeros is
+    /// [`eliminate_zeros`](Self::eliminate_zeros)' responsibility (scipy's
+    /// `sum_duplicates` likewise keeps zero sums and only `prune`s the
+    /// allocation). Storage-agnostic port of the CSR
+    /// [`sum_duplicates`](crate::CsrMatrix::sum_duplicates), with the row-walk
+    /// swapped for a column-walk — for CSC `indices` are ROW indices and `indptr`
+    /// the COLUMN pointer.
+    ///
+    /// **Deviation (R-DEV-4):** scipy mutates in place; ferrolearn returns a NEW
+    /// matrix (functional style, consistent with the other `CscMatrix` methods).
+    ///
+    /// **Idempotent in ferrolearn (honest note).** This crate's `CscMatrix` is
+    /// **canonical-by-construction**: [`new`](Self::new) builds via sprs
+    /// `CsMat::try_new_csc`, which **rejects** unsorted or duplicate within-column
+    /// row indices, so a duplicate-bearing `CscMatrix` is unconstructible via
+    /// `new`/`from_coo`. The per-column `BTreeMap` pass is therefore a scipy-parity
+    /// API exercised against already-canonical inputs (an identity that preserves
+    /// sorted row order and zero sums).
+    ///
+    /// Live oracle (R-CHAR-3): for the canonical CSC of
+    /// `[[1,0,2],[0,3,0],[4,0,5]]` (`data=[1,4,3,2,5]`, `indices=[0,2,1,0,2]`,
+    /// `indptr=[0,2,3,5]`), `sum_duplicates()` is the identity — `data`,
+    /// `indices`, `indptr`, and the dense form are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CscMatrix` (the accumulated rows stay in bounds of
+    /// the unchanged shape and `BTreeMap` ordering keeps within-column indices
+    /// sorted).
+    pub fn sum_duplicates(&self) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let indptr = self.indptr();
+        let indices = self.indices();
+        let data = self.data();
+        let n_cols = self.n_cols();
+
+        let mut indptr2 = Vec::with_capacity(n_cols + 1);
+        let mut indices2 = Vec::new();
+        let mut data2 = Vec::new();
+        indptr2.push(0usize);
+        for c in 0..n_cols {
+            let mut acc: BTreeMap<usize, T> = BTreeMap::new();
+            for k in indptr[c]..indptr[c + 1] {
+                let entry = acc.entry(indices[k]).or_insert_with(T::zero);
+                *entry = *entry + data[k];
+            }
+            for (row, val) in acc {
+                indices2.push(row);
+                data2.push(val);
+            }
+            indptr2.push(data2.len());
+        }
+        Self::new(self.n_rows(), n_cols, indptr2, indices2, data2)
+    }
+
+    /// Return a copy of this matrix with each column's row indices in sorted
+    /// (canonical) order.
+    ///
+    /// Mirrors scipy `csc_matrix.sort_indices()`
+    /// (`scipy/sparse/_compressed.py:1110` — `csr_sort_indices(...)` on the
+    /// swapped `(M, N)`), which sorts the within-column row indices (and the
+    /// aligned data) into ascending order. Storage-agnostic port of the CSR
+    /// [`sort_indices`](crate::CsrMatrix::sort_indices) — for CSC the outer walk
+    /// is over COLUMNS and the inner indices are ROW indices.
+    ///
+    /// **Idempotent in ferrolearn (honest note).** This crate's `CscMatrix` is
+    /// **canonical-by-construction**: [`new`](Self::new) builds via sprs
+    /// `CsMat::try_new_csc`, which **rejects** unsorted or duplicate within-column
+    /// row indices, and `from_coo`/`from_dense` coalesce on the way in. The stored
+    /// matrix therefore **always already has sorted row indices**, so
+    /// `sort_indices` has no reordering work to do — it returns an equivalent
+    /// canonical matrix rebuilt via [`new`](Self::new) from the current
+    /// (already-sorted) `indptr`/`indices` and `data`. Shipped for scipy API
+    /// parity; it cannot be exercised on unsorted input because such a
+    /// `CscMatrix` is unconstructible here.
+    ///
+    /// Live oracle (R-CHAR-3): for the canonical CSC of
+    /// `[[1,0,2],[0,3,0],[4,0,5]]` (`data=[1,4,3,2,5]`, `indices=[0,2,1,0,2]`,
+    /// `indptr=[0,2,3,5]`, already sorted), `sort_indices()` is the identity —
+    /// `indices`, `indptr`, `data`, and the dense form are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CscMatrix` (its components are already canonical).
+    pub fn sort_indices(&self) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Clone,
+    {
+        Self::new(
+            self.n_rows(),
+            self.n_cols(),
+            self.indptr(),
+            self.indices().to_vec(),
+            self.data().to_vec(),
+        )
     }
 
     /// Cast every stored value to a new scalar type `U` via a caller-supplied
