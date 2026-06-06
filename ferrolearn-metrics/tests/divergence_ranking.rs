@@ -113,7 +113,7 @@ fn divergence_ndcg_negative_y_true_guard() {
 fn divergence_label_ranking_loss_degenerate_denominator() {
     let y_true: Array2<usize> = array![[1, 0, 0], [0, 0, 0]];
     let y_score: Array2<f64> = array![[0.75, 0.5, 1.0], [0.9, 0.8, 0.7]];
-    let got = label_ranking_loss(&y_true, &y_score).unwrap();
+    let got = label_ranking_loss(&y_true, &y_score, None).unwrap();
     // sklearn 1.5.2 live oracle:
     const SK_LRL_DEGEN: f64 = 0.25;
     assert!(
@@ -136,7 +136,7 @@ fn divergence_label_ranking_loss_degenerate_denominator() {
 fn green_coverage_error_basic() {
     let y_true: Array2<usize> = array![[1, 0, 0], [0, 0, 1]];
     let y_score: Array2<f64> = array![[0.1, 0.2, 0.3], [0.7, 0.6, 0.5]];
-    let got = coverage_error(&y_true, &y_score).unwrap();
+    let got = coverage_error(&y_true, &y_score, None).unwrap();
     const SK_COV_BASIC: f64 = 3.0;
     assert!(
         (got - SK_COV_BASIC).abs() < 1e-9,
@@ -154,7 +154,7 @@ fn green_coverage_error_basic() {
 fn green_lrap_basic() {
     let y_true: Array2<usize> = array![[1, 0, 0], [0, 1, 1]];
     let y_score: Array2<f64> = array![[0.1, 0.2, 0.3], [0.7, 0.6, 0.5]];
-    let got = label_ranking_average_precision_score(&y_true, &y_score).unwrap();
+    let got = label_ranking_average_precision_score(&y_true, &y_score, None).unwrap();
     const SK_LRAP_BASIC: f64 = 0.458_333_333_333_333_26;
     assert!(
         (got - SK_LRAP_BASIC).abs() < 1e-9,

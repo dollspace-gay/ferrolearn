@@ -23,7 +23,7 @@
 //! | REQ-5 | `label_ranking_loss` 1D value: degenerate rows → 0, averaged over all `n_samples` (`_ranking.py:1461-1465`) | SHIPPED |
 //! | REQ-6a | `dcg_score` `log_base` parameter (`_ranking.py:1511`, discount `ln(base)/ln(i+2)`); validated to `(0,∞)\{1}`; `ndcg_score` is base-invariant so its signature is unchanged | SHIPPED |
 //! | REQ-6b | `dcg_score`/`ndcg_score` 2D `(n_samples,n_labels)` sample-mean + `sample_weight` | NOT-STARTED (#761) |
-//! | REQ-7 | `coverage_error`/LRAP/`label_ranking_loss` `sample_weight` | NOT-STARTED (#762) |
+//! | REQ-7 | `coverage_error`/LRAP/`label_ranking_loss` `sample_weight`: weighted mean `sum_i(w_i * v_i)/sum_i(w_i)` (`_ranking.py:1365,:1281-1288,:1465`) | SHIPPED |
 //! | REQ-8 | ROC/PR surface (`auc`/`roc_auc_score`/`roc_curve`/`precision_recall_curve`/`average_precision_score`/`det_curve`/`top_k_accuracy_score`) currently in `classification.rs` | NOT-STARTED (#763) |
 //! | REQ-9 | PyO3 binding for ranking metrics | NOT-STARTED (#764) |
 //! | REQ-10 | ferray substrate migration | NOT-STARTED (#765) |
@@ -350,7 +350,11 @@ fn check_ranking_inputs<F: Float>(
 ///
 /// Returns [`FerroError::ShapeMismatch`] if `y_true` and `y_score` differ.
 /// Returns [`FerroError::InsufficientSamples`] if either is empty.
-pub fn coverage_error<F>(y_true: &Array2<usize>, y_score: &Array2<F>) -> Result<F, FerroError>
+pub fn coverage_error<F>(
+    y_true: &Array2<usize>,
+    y_score: &Array2<F>,
+    sample_weight: Option<&Array1<F>>,
+) -> Result<F, FerroError>
 where
     F: Float + Send + Sync + 'static,
 {
@@ -358,13 +362,25 @@ where
     let n_samples = y_true.nrows();
     let n_labels = y_true.ncols();
 
-    let n_f = F::from(n_samples).ok_or_else(|| FerroError::InvalidParameter {
-        name: "n_samples".into(),
-        reason: "could not convert".into(),
-    })?;
+    if let Some(w) = sample_weight
+        && w.len() != n_samples
+    {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![w.len()],
+            context: "coverage_error: sample_weight".into(),
+        });
+    }
 
-    let mut acc = F::zero();
+    // sklearn returns `np.average(coverage, weights=sample_weight)`
+    // (`_ranking.py:1365`): the per-sample coverage is averaged with
+    // `sum_i(w_i * cov_i) / sum_i(w_i)`; with `sample_weight=None` every
+    // `w_i = 1`, recovering the plain `sum/n_samples` mean.
+    let mut weighted_acc = F::zero();
+    let mut weight_sum = F::zero();
     for i in 0..n_samples {
+        let w_i = sample_weight.map_or_else(F::one, |w| w[i]);
+        weight_sum = weight_sum + w_i;
         let row_true = y_true.row(i);
         let row_score = y_score.row(i);
         // Find the lowest score among the true (positive) labels for this row.
@@ -379,7 +395,10 @@ where
             }
         }
         if !any {
-            // No positive labels — sklearn convention skips this sample.
+            // No positive labels — sklearn's masked min yields a coverage of 0
+            // (`coverage.filled(0)`, `_ranking.py:1363`); the row still counts in
+            // the average denominator (it contributes `0 * w_i` to the numerator
+            // while `w_i` is added to `weight_sum`).
             continue;
         }
         // Coverage = number of labels with score >= min_pos_score
@@ -389,9 +408,9 @@ where
                 cov += 1;
             }
         }
-        acc = acc + F::from(cov).unwrap_or(F::zero());
+        weighted_acc = weighted_acc + w_i * F::from(cov).unwrap_or(F::zero());
     }
-    Ok(acc / n_f)
+    Ok(weighted_acc / weight_sum)
 }
 
 /// Compute the label-ranking average precision (LRAP) score.
@@ -407,6 +426,7 @@ where
 pub fn label_ranking_average_precision_score<F>(
     y_true: &Array2<usize>,
     y_score: &Array2<F>,
+    sample_weight: Option<&Array1<F>>,
 ) -> Result<F, FerroError>
 where
     F: Float + Send + Sync + 'static,
@@ -415,15 +435,31 @@ where
     let n_samples = y_true.nrows();
     let n_labels = y_true.ncols();
 
-    let mut sample_scores: Vec<F> = Vec::with_capacity(n_samples);
+    if let Some(w) = sample_weight
+        && w.len() != n_samples
+    {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![w.len()],
+            context: "label_ranking_average_precision_score: sample_weight".into(),
+        });
+    }
+
+    // sklearn accumulates `out += aux * sample_weight[i]` and divides by
+    // `np.sum(sample_weight)` (`_ranking.py:1281-1288`); with `sample_weight=None`
+    // each weight is 1 and the divisor is `n_samples`.
+    let mut weighted_acc = F::zero();
+    let mut weight_sum = F::zero();
     for i in 0..n_samples {
+        let w_i = sample_weight.map_or_else(F::one, |w| w[i]);
+        weight_sum = weight_sum + w_i;
         let row_true = y_true.row(i);
         let row_score = y_score.row(i);
         let positives: Vec<usize> = (0..n_labels).filter(|&j| row_true[j] > 0).collect();
         if positives.is_empty() || positives.len() == n_labels {
             // sklearn convention: degenerate samples (all-positive or
             // all-negative) score 1.0.
-            sample_scores.push(F::one());
+            weighted_acc = weighted_acc + w_i * F::one();
             continue;
         }
         let mut sample_acc = F::zero();
@@ -443,14 +479,10 @@ where
             sample_acc =
                 sample_acc + F::from(tp).unwrap_or(F::zero()) / F::from(rank).unwrap_or(F::one());
         }
-        sample_scores.push(sample_acc / F::from(positives.len()).unwrap_or(F::one()));
+        let aux = sample_acc / F::from(positives.len()).unwrap_or(F::one());
+        weighted_acc = weighted_acc + w_i * aux;
     }
-    let n_f = F::from(sample_scores.len()).ok_or_else(|| FerroError::InvalidParameter {
-        name: "n_samples".into(),
-        reason: "could not convert".into(),
-    })?;
-    let total = sample_scores.iter().copied().fold(F::zero(), |a, b| a + b);
-    Ok(total / n_f)
+    Ok(weighted_acc / weight_sum)
 }
 
 /// Compute the label-ranking loss: the average number of badly-ordered
@@ -463,7 +495,11 @@ where
 ///
 /// Returns [`FerroError::ShapeMismatch`] if `y_true` and `y_score` differ.
 /// Returns [`FerroError::InsufficientSamples`] if either is empty.
-pub fn label_ranking_loss<F>(y_true: &Array2<usize>, y_score: &Array2<F>) -> Result<F, FerroError>
+pub fn label_ranking_loss<F>(
+    y_true: &Array2<usize>,
+    y_score: &Array2<F>,
+    sample_weight: Option<&Array1<F>>,
+) -> Result<F, FerroError>
 where
     F: Float + Send + Sync + 'static,
 {
@@ -471,17 +507,34 @@ where
     let n_samples = y_true.nrows();
     let n_labels = y_true.ncols();
 
-    let mut totals = F::zero();
+    if let Some(w) = sample_weight
+        && w.len() != n_samples
+    {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![w.len()],
+            context: "label_ranking_loss: sample_weight".into(),
+        });
+    }
+
+    // sklearn returns `np.average(loss, weights=sample_weight)`
+    // (`_ranking.py:1465`); degenerate rows have loss 0 and still count in the
+    // denominator. With `sample_weight=None` every weight is 1 (mean over
+    // n_samples).
+    let mut weighted_acc = F::zero();
+    let mut weight_sum = F::zero();
     for i in 0..n_samples {
+        let w_i = sample_weight.map_or_else(F::one, |w| w[i]);
+        weight_sum = weight_sum + w_i;
         let row_true = y_true.row(i);
         let row_score = y_score.row(i);
         let positives: Vec<usize> = (0..n_labels).filter(|&j| row_true[j] > 0).collect();
         let negatives: Vec<usize> = (0..n_labels).filter(|&j| row_true[j] == 0).collect();
         if positives.is_empty() || negatives.is_empty() {
             // Degenerate rows (all-relevant or all-irrelevant) contribute 0 to
-            // the loss and are still counted in the denominator.
+            // the loss numerator and are still counted in the denominator.
             // sklearn/metrics/_ranking.py:1463-1465: loss[i] = 0 for degenerate
-            // rows, then `np.average(loss, ...)` divides by n_samples.
+            // rows, then `np.average(loss, ...)` divides by sum(weights).
             continue;
         }
         let mut bad_pairs = 0usize;
@@ -494,16 +547,9 @@ where
         }
         let denom = positives.len() * negatives.len();
         let frac = F::from(bad_pairs).unwrap_or(F::zero()) / F::from(denom).unwrap_or(F::one());
-        totals = totals + frac;
+        weighted_acc = weighted_acc + w_i * frac;
     }
-    // Divide by n_samples (not by the non-degenerate count) so that degenerate
-    // rows contribute 0 to the average — matching sklearn's np.average call at
-    // sklearn/metrics/_ranking.py:1465.
-    let n_f = F::from(n_samples).ok_or_else(|| FerroError::InvalidParameter {
-        name: "n_samples".into(),
-        reason: "could not convert".into(),
-    })?;
-    Ok(totals / n_f)
+    Ok(weighted_acc / weight_sum)
 }
 
 // ---------------------------------------------------------------------------
@@ -684,5 +730,75 @@ mod tests {
         assert!(dcg_score(&yt, &ys, None, Some(1.0)).is_err());
         assert!(dcg_score(&yt, &ys, None, Some(0.0)).is_err());
         assert!(dcg_score(&yt, &ys, None, Some(-2.0)).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // sample_weight divergence pins (#762, REQ-7). Expected values from
+    // the live sklearn 1.5.2 oracle:
+    //   import numpy as np
+    //   from sklearn.metrics import (coverage_error,
+    //       label_ranking_average_precision_score as lrap,
+    //       label_ranking_loss)
+    //   yt=np.array([[1,0,0],[0,0,1],[0,1,1]])
+    //   ys=np.array([[0.75,0.5,1.0],[1.0,0.2,0.1],[0.3,0.6,0.9]])
+    //   coverage_error(yt,ys)                              -> 2.3333333333
+    //   coverage_error(yt,ys,sample_weight=[3,1,1])        -> 2.2
+    //   lrap(yt,ys)                                        -> 0.6111111111
+    //   lrap(yt,ys,sample_weight=[1,2,3])                  -> 0.6944444444
+    //   label_ranking_loss(yt,ys)                          -> 0.5
+    //   label_ranking_loss(yt,ys,sample_weight=[1,2,3])    -> 0.4166666667
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn coverage_error_sample_weight_matches_sklearn() -> Result<(), FerroError> {
+        let yt = array![[1usize, 0, 0], [0, 0, 1], [0, 1, 1]];
+        let ys = array![[0.75_f64, 0.5, 1.0], [1.0, 0.2, 0.1], [0.3, 0.6, 0.9]];
+        let none = coverage_error(&yt, &ys, None)?;
+        assert!((none - 2.333_333_333_3).abs() < 1e-9, "none {none}");
+        let w = array![3.0_f64, 1.0, 1.0];
+        let weighted = coverage_error(&yt, &ys, Some(&w))?;
+        assert!((weighted - 2.2).abs() < 1e-9, "weighted {weighted}");
+        Ok(())
+    }
+
+    #[test]
+    fn lrap_sample_weight_matches_sklearn() -> Result<(), FerroError> {
+        let yt = array![[1usize, 0, 0], [0, 0, 1], [0, 1, 1]];
+        let ys = array![[0.75_f64, 0.5, 1.0], [1.0, 0.2, 0.1], [0.3, 0.6, 0.9]];
+        let none = label_ranking_average_precision_score(&yt, &ys, None)?;
+        assert!((none - 0.611_111_111_1).abs() < 1e-9, "none {none}");
+        let w = array![1.0_f64, 2.0, 3.0];
+        let weighted = label_ranking_average_precision_score(&yt, &ys, Some(&w))?;
+        assert!(
+            (weighted - 0.694_444_444_4).abs() < 1e-9,
+            "weighted {weighted}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn label_ranking_loss_sample_weight_matches_sklearn() -> Result<(), FerroError> {
+        let yt = array![[1usize, 0, 0], [0, 0, 1], [0, 1, 1]];
+        let ys = array![[0.75_f64, 0.5, 1.0], [1.0, 0.2, 0.1], [0.3, 0.6, 0.9]];
+        let none = label_ranking_loss(&yt, &ys, None)?;
+        assert!((none - 0.5).abs() < 1e-9, "none {none}");
+        let w = array![1.0_f64, 2.0, 3.0];
+        let weighted = label_ranking_loss(&yt, &ys, Some(&w))?;
+        assert!(
+            (weighted - 0.416_666_666_7).abs() < 1e-9,
+            "weighted {weighted}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ranking_sample_weight_length_mismatch_errors() {
+        let yt = array![[1usize, 0, 0], [0, 0, 1], [0, 1, 1]];
+        let ys = array![[0.75_f64, 0.5, 1.0], [1.0, 0.2, 0.1], [0.3, 0.6, 0.9]];
+        // Wrong-length sample_weight (2 != n_samples=3) must error on all three.
+        let bad = array![1.0_f64, 2.0];
+        assert!(coverage_error(&yt, &ys, Some(&bad)).is_err());
+        assert!(label_ranking_average_precision_score(&yt, &ys, Some(&bad)).is_err());
+        assert!(label_ranking_loss(&yt, &ys, Some(&bad)).is_err());
     }
 }
