@@ -55,8 +55,10 @@ use crate::Ridge;
 ///   prediction errors are computed in closed form and the alpha minimising
 ///   the mean squared LOO error is selected.
 /// - **`cv = Some(k)`** — brute-force k-fold cross-validation (mirroring
-///   sklearn's `GridSearchCV` branch, `_ridge.py:2413-2439`): each candidate
-///   alpha is scored by averaging the per-fold MSE.
+///   sklearn's `GridSearchCV` branch, `_ridge.py:2429-2434`): each candidate
+///   alpha is scored by averaging the per-fold R² (sklearn `GridSearchCV`
+///   default scoring, `scoring=None` → `RegressorMixin.score` = R²), and the
+///   alpha with the MAXIMUM averaged R² is selected.
 ///
 /// # Type Parameters
 ///
@@ -171,11 +173,36 @@ fn kfold_indices(n_samples: usize, k: usize) -> Vec<Vec<usize>> {
     folds
 }
 
-/// Compute mean squared error between two arrays.
-fn mse<F: Float + FromPrimitive + 'static>(y_true: &Array1<F>, y_pred: &Array1<F>) -> F {
-    let n = F::from(y_true.len()).unwrap();
-    let diff = y_true - y_pred;
-    diff.dot(&diff) / n
+/// Compute the R² (coefficient of determination) score between true and
+/// predicted targets, mirroring sklearn `r2_score`
+/// (`sklearn/metrics/_regression.py:1220-1228` numerator/denominator, then
+/// `_assemble_r2_explained_variance`, `_regression.py:872-891`) for the
+/// single-output `multioutput='uniform_average'` case: `1 - SS_res/SS_tot`,
+/// with the `SS_tot == 0` edge returning `1.0` when `SS_res == 0` (perfect)
+/// else `0.0`. This is the default `GridSearchCV` scorer (`RegressorMixin`'s
+/// `.score()`) that sklearn `RidgeCV(cv=k, scoring=None)` maximizes
+/// (`_ridge.py:2429-2434`).
+fn r2_score<F: Float + FromPrimitive + 'static>(y_true: &Array1<F>, y_pred: &Array1<F>) -> F {
+    let n = F::from(y_true.len()).unwrap_or_else(F::one);
+    let mean = y_true.iter().copied().fold(F::zero(), |a, b| a + b) / n;
+    let ss_res = y_true
+        .iter()
+        .zip(y_pred.iter())
+        .map(|(&t, &p)| (t - p) * (t - p))
+        .fold(F::zero(), |a, b| a + b);
+    let ss_tot = y_true
+        .iter()
+        .map(|&t| (t - mean) * (t - mean))
+        .fold(F::zero(), |a, b| a + b);
+    if ss_tot == F::zero() {
+        if ss_res == F::zero() {
+            F::one()
+        } else {
+            F::zero()
+        }
+    } else {
+        F::one() - ss_res / ss_tot
+    }
 }
 
 /// Gather rows from a 2-D array by index.
@@ -272,8 +299,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
 
 impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static> RidgeCV<F> {
     /// Brute-force k-fold alpha selection (sklearn `GridSearchCV` branch,
-    /// `_ridge.py:2413-2439`). For each candidate alpha, average the per-fold
-    /// MSE of a `Ridge` refit and keep the minimiser.
+    /// `_ridge.py:2429-2434`). For each candidate alpha, average the per-fold
+    /// R² of a `Ridge` refit (sklearn's default `scoring=None` →
+    /// `RegressorMixin.score` = R²) and keep the MAXIMISER.
     fn select_alpha_kfold(&self, x: &Array2<F>, y: &Array1<F>, k: usize) -> Result<F, FerroError> {
         let n_samples = x.nrows();
 
@@ -295,10 +323,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         let folds = kfold_indices(n_samples, k);
 
         let mut best_alpha = self.alphas[0];
-        let mut best_mse = F::infinity();
+        let mut best_r2 = F::neg_infinity();
 
         for &alpha in &self.alphas {
-            let mut total_mse = <F as num_traits::Zero>::zero();
+            let mut total_r2 = <F as num_traits::Zero>::zero();
 
             for fold_idx in 0..k {
                 let test_indices = &folds[fold_idx];
@@ -320,13 +348,13 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
 
                 let fitted = model.fit(&x_train, &y_train)?;
                 let preds = fitted.predict(&x_test)?;
-                total_mse += mse(&y_test, &preds);
+                total_r2 += r2_score(&y_test, &preds);
             }
 
-            let avg_mse = total_mse / F::from(k).unwrap_or_else(<F as num_traits::One>::one);
+            let avg_r2 = total_r2 / F::from(k).unwrap_or_else(<F as num_traits::One>::one);
 
-            if avg_mse < best_mse {
-                best_mse = avg_mse;
+            if avg_r2 > best_r2 {
+                best_r2 = avg_r2;
                 best_alpha = alpha;
             }
         }
@@ -854,21 +882,18 @@ mod tests {
     }
 
     /// End-to-end `RidgeCV` with explicit `cv = Some(4)` on a fixed fixture
-    /// (no RNG), isolating the CONTIGUOUS-fold contract from the scoring
-    /// metric. ferrolearn's k-fold path averages per-fold MSE, so the matching
-    /// oracle is sklearn under `scoring='neg_mean_squared_error'` (live sklearn
-    /// 1.5.2): `RidgeCV(alphas=[0.1,1.0,10.0], cv=4,
-    /// scoring='neg_mean_squared_error').fit(X, y)` → `alpha_ = 0.1`,
-    /// `coef_ = [1.200451, 0.551174, 0.370867]`, `intercept_ = -0.048887`.
-    /// This pins that the contiguous folds (`_ridge.py:2429`
-    /// `GridSearchCV(cv=k)` → `KFold(shuffle=False)`) drive the train/test
-    /// partition correctly.
-    ///
-    /// NOTE: sklearn's DEFAULT `GridSearchCV` scoring for a regressor is R²,
-    /// under which the same call selects `alpha_ = 1.0`. ferrolearn's MSE
-    /// scoring is a SEPARATE divergence from this fold fix (issue #429) and is
-    /// out of scope here (R-FIX-1: one divergence per dispatch); it is reported
-    /// as a spillover finding.
+    /// (no RNG), verifying the sklearn-DEFAULT scoring contract: with
+    /// `scoring=None` sklearn `RidgeCV(cv=k)` routes through
+    /// `GridSearchCV(Ridge(), {'alpha': alphas}, cv=k, scoring=None)`
+    /// (`_ridge.py:2429-2434`), whose default scorer is the regressor's R²
+    /// (`RegressorMixin.score`), averaged per fold and MAXIMIZED. Oracle (live
+    /// sklearn 1.5.2): `RidgeCV(alphas=[0.1,1.0,10.0], cv=4).fit(X, y)` →
+    /// per-alpha averaged R² `{0.1: 0.279276, 1.0: 0.283149, 10.0: -0.593329}`
+    /// → `alpha_ = 1.0`, `coef_ = [1.054289, 0.387522, 0.231554]`,
+    /// `intercept_ = 0.44811`. The contiguous folds (`_ridge.py:2429`
+    /// `GridSearchCV(cv=k)` → `KFold(shuffle=False)`, fixed in #429) drive the
+    /// train/test partition; the R² maximization (NOT neg-MSE) drives the
+    /// selection.
     #[test]
     fn ridge_cv_explicit_cv4_selects_alpha_matches_sklearn() -> Result<(), FerroError> {
         let x = Array2::from_shape_vec(
@@ -894,14 +919,34 @@ mod tests {
             .with_cv(4);
         let fitted = model.fit(&x, &y)?;
 
-        assert_relative_eq!(fitted.best_alpha(), 0.1, epsilon = 1e-9);
+        assert_relative_eq!(fitted.best_alpha(), 1.0, epsilon = 1e-9);
 
         let coef = fitted.coefficients();
-        assert_relative_eq!(coef[0], 1.200_451, epsilon = 1e-5);
-        assert_relative_eq!(coef[1], 0.551_174, epsilon = 1e-5);
-        assert_relative_eq!(coef[2], 0.370_867, epsilon = 1e-5);
-        assert_relative_eq!(fitted.intercept(), -0.048_887, epsilon = 1e-5);
+        assert_relative_eq!(coef[0], 1.054_289, epsilon = 1e-5);
+        assert_relative_eq!(coef[1], 0.387_522, epsilon = 1e-5);
+        assert_relative_eq!(coef[2], 0.231_554, epsilon = 1e-5);
+        assert_relative_eq!(fitted.intercept(), 0.448_11, epsilon = 1e-5);
 
         Ok(())
+    }
+
+    /// `r2_score` must match sklearn `r2_score`
+    /// (`sklearn/metrics/_regression.py:1220-1228` + edge cases at
+    /// `_regression.py:872-891`) for the single-output case, including the
+    /// `SS_tot == 0` edge: perfect prediction of a constant target → `1.0`,
+    /// imperfect prediction of a constant target → `0.0`. Oracle (live sklearn
+    /// 1.5.2): `r2_score([5,5],[5,5]) == 1.0`, `r2_score([5,5],[5,6]) == 0.0`,
+    /// `r2_score([1,2,3],[1,2,3]) == 1.0`.
+    #[test]
+    fn r2_score_matches_sklearn_edge_cases() {
+        // SS_tot == 0, SS_res == 0 → 1.0 (perfect prediction of constant y).
+        assert_eq!(r2_score(&array![5.0, 5.0], &array![5.0, 5.0]), 1.0);
+        // SS_tot == 0, SS_res != 0 → 0.0 (imperfect prediction of constant y).
+        assert_eq!(r2_score(&array![5.0, 5.0], &array![5.0, 6.0]), 0.0);
+        // Normal case: perfect prediction → 1.0.
+        assert_eq!(
+            r2_score(&array![1.0, 2.0, 3.0], &array![1.0, 2.0, 3.0]),
+            1.0
+        );
     }
 }
