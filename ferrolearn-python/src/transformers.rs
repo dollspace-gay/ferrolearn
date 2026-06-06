@@ -18,7 +18,7 @@
 //! `tests/divergence_transformers.py` + `tests/test_check_estimator.py`
 //! (534 pytest pass).
 //!
-//! **9 SHIPPED / 3 NOT-STARTED.**
+//! **10 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -31,7 +31,7 @@
 //! | REQ-SS-WITH-MEAN-STD (with_mean/with_std honored) | SHIPPED | FIXED #2037: `RsStandardScaler` now carries `with_mean`/`with_std`/`copy` (`#[pyo3(signature = (with_mean=true, with_std=true, copy=true))]`) and `fit` threads them into the downstream scaler via `StandardScaler::<f64>::new().with_with_mean(..).with_with_std(..).with_copy(..)` (`ferrolearn-preprocess` REQ-6, #1193), so `transform` honors them. The wrapper `_transformers.py::StandardScaler.fit` nulls the fitted attrs to match sklearn: `mean_ = array if (with_mean or with_std) else None`, `scale_`/`var_ = array if with_std else None` (`_data.py:993-995`,`:1022-1023`). Live oracle `X=[[1,10],[2,20],[3,30]]` (R-CHAR-3): (T,T) `transform[0]=[-1.224745,-1.224745]`; (T,F) `scale_=var_=None`, `transform[0]=[-1,-10]`; (F,T) `mean_=[2,20]`, `transform[0]=[1.224745,1.224745]`; (F,F) `mean_=scale_=var_=None`, `transform[0]=[1,10]`. Consumer: `_transformers.py::StandardScaler`. Verified `tests/divergence_transformers.py::test_red_standardscaler_*`. |
 //! | REQ-SS-COPY (copy ctor param) | SHIPPED | FIXED #2037: `_transformers.py::StandardScaler.__init__(self, *, copy=True, with_mean=True, with_std=True)` (sklearn param order, `_data.py:835`) stores `self.copy` and threads it into `_RsStandardScaler(self.with_mean, self.with_std, self.copy)` → `StandardScaler::with_copy` (ABI-only downstream: `fit`/`transform` operate on owned copies, so non-mutation holds either way). Verified `tests/divergence_transformers.py::test_red_standardscaler_copy_roundtrip`. |
 //! | REQ-PCA-PARAMS (copy/whiten/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | the wrapper exposes `n_components` only; sklearn `_pca.py:407-423`. Default `svd_solver`/`whiten=False` MATCHES, so only the param surface + non-default paths are missing — owned downstream #1502/#1503/#1509. |
-//! | REQ-PCA-ATTRS (n_components_ + noise_variance_) | NOT-STARTED | `_RsPCA` has no `n_components_`/`noise_variance_` getter; `FittedPCA` discards the eigenvalue tail. sklearn `_pca.py:691`/`:686-688`. The binding cannot expose attrs the library does not compute — downstream #1508/#1507. |
+//! | REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | FIXED — the downstream prereqs (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`) already SHIPPED, so the binding now exposes both. `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs:283`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs:304`) — the full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept (`_pca.py:686-688`). Consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (non-zero); `PCA(3)` → `noise_variance_=0.0`. Verified `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` and `::PCA` constructs `_RsPCA(...)`, driving fit/transform/inverse_transform + attr reads; `ferrolearn/__init__.py` re-exports both; `test_check_estimator.py` runs each through `parametrize_with_checks` (534 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
@@ -260,5 +260,33 @@ impl RsPCA {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(ndarray1_to_numpy(py, fitted.singular_values()))
+    }
+
+    /// The resolved number of retained components, `n_components_` (int).
+    /// Marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs`,
+    /// REQ-16), the row count of `components_`. Mirrors sklearn
+    /// `PCA.n_components_` (`sklearn/decomposition/_pca.py:691`).
+    #[getter]
+    fn n_components_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_components_())
+    }
+
+    /// Estimated noise covariance of the probabilistic-PCA model,
+    /// `noise_variance_` (float). Marshals `FittedPCA::noise_variance()`
+    /// (`ferrolearn-decomp/src/pca.rs`, REQ-15) — the mean of the discarded tail
+    /// eigenvalues `mean(explained_variance_[n_components_:min(n, p)])`, or `0.0`
+    /// when all components are kept. Mirrors sklearn `PCA.noise_variance_`
+    /// (`sklearn/decomposition/_pca.py:686-688`).
+    #[getter]
+    fn noise_variance_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.noise_variance())
     }
 }

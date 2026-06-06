@@ -158,6 +158,11 @@ class PCA(TransformerMixin, BaseEstimator):
         self.explained_variance_ratio_ = np.array(self._rs.explained_variance_ratio_)
         self.mean_ = np.array(self._rs.mean_)
         self.singular_values_ = np.array(self._rs.singular_values_)
+        # n_components_ is the resolved component count (row count of components_)
+        # and noise_variance_ is the mean of the discarded tail eigenvalues, or
+        # 0.0 when all components are kept (sklearn/decomposition/_pca.py:686-691).
+        self.n_components_ = int(self._rs.n_components_)
+        self.noise_variance_ = float(self._rs.noise_variance_)
         self._fit_X = X.copy()
         return self
 

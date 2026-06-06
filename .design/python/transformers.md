@@ -69,8 +69,10 @@ Divergence classes:
    `copy`; PCA lacks `copy`/`whiten`/`svd_solver`/`tol`/`iterated_power`/
    `n_oversamples`/`power_iteration_normalizer`/`random_state`. Behavior owned
    downstream (StandardScaler #1193; PCA #1502/#1503/#1509).
-5. **missing fitted attrs (NOT-STARTED, R-DEV-3)** — PCA does not expose
-   `n_components_` or `noise_variance_` (downstream #1508/#1507).
+5. **missing fitted attrs (SHIPPED #2097, R-DEV-3)** — PCA now exposes
+   `n_components_` (int) and `noise_variance_` (float) via the `RsPCA` getters
+   over `FittedPCA::n_components_()`/`noise_variance()`, set by
+   `_transformers.py::PCA.fit` (downstream prereqs #1505/#1507 SHIPPED).
 6. **value parity off the default path (NOT-STARTED, R-DEV-1)** — exact array
    parity for non-default `with_mean`/`with_std`, `whiten`, alternate
    `svd_solver`, and the PCA repeated-eigenvalue sign/basis case is owned
@@ -218,9 +220,10 @@ Grouped by estimator (`REQ-SS-*`, `REQ-PCA-*`) plus shared `REQ-CONSUMER`/
   owned downstream: `whiten` `ferrolearn-decomp` REQ-11 #1502; `svd_solver` REQ-12
   #1503; the remaining ctor params REQ-17 #1509.]
 - REQ-PCA-ATTRS: `ferrolearn.PCA` exposes `n_components_` (int) and
-  `noise_variance_` (float) fitted attrs (`_pca.py:691`/`:686-688`). [Owned
-  downstream: `n_components_`/`n_features_in_` `ferrolearn-decomp` REQ-16 #1508;
-  `noise_variance_` REQ-15 #1507.]
+  `noise_variance_` (float) fitted attrs (`_pca.py:691`/`:686-688`). [SHIPPED
+  #2097 — the binding surfaces `FittedPCA::n_components_()`/`noise_variance()`
+  (downstream prereqs `ferrolearn-decomp` REQ-16 #1505, REQ-15 #1507 SHIPPED),
+  set by `_transformers.py::PCA.fit`.]
 - REQ-PCA-VALUE-PARITY: `components_`/`explained_variance_`/
   `explained_variance_ratio_`/`singular_values_`/`mean_` match sklearn
   array-by-array (R-DEV-1), including the deterministic `svd_flip` sign on the
@@ -299,13 +302,14 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
   → all 8). ferrolearn has NONE. A critic pins FAILING pytests asserting each ∈
   `inspect.signature(ferrolearn.PCA.__init__).parameters`. FAIL until the binding +
   wrapper add them (behavior owned by `ferrolearn-decomp` #1502/#1503/#1509).
-- AC-PCA-ATTRS (REQ-PCA-ATTRS): sklearn exposes them
-  (`cd /tmp && python3 -c "import numpy as np; from sklearn.decomposition import PCA; m=PCA(2).fit(np.array([[0.,0.],[1.,1.],[2.,4.],[3.,9.]])); print(m.n_components_, m.noise_variance_)"`
-  → `2 0.0`). ferrolearn FAILS:
-  `hasattr(ferrolearn.PCA(n_components=2).fit(X), 'n_components_')` and
-  `'noise_variance_'` are both `False` (live). A critic pins FAILING pytests.
-  FAIL until the downstream attrs land (`ferrolearn-decomp` #1508 for
-  `n_components_`, #1507 for `noise_variance_`).
+- AC-PCA-ATTRS (REQ-PCA-ATTRS): SHIPPED #2097. sklearn oracle on a rank>2
+  fixture (so `noise_variance_` is meaningfully non-zero)
+  `cd /tmp && python3 -c "import numpy as np; from sklearn.decomposition import PCA; m=PCA(2).fit(np.array([[1.,2.,3.],[4.,5.,7.],[2.,0.,1.],[8.,6.,5.],[3.,3.,2.],[0.,1.,4.]])); print(m.n_components_, m.noise_variance_)"`
+  → `2 0.3132465241238894`. `ferrolearn.PCA(n_components=2).fit(X)` now exposes
+  `n_components_ == 2` and `noise_variance_` matching the oracle to <1e-9 (via
+  `RsPCA::n_components_`/`noise_variance_` over `FittedPCA::n_components_()`/
+  `noise_variance()`, set in `_transformers.py::PCA.fit`). Guard
+  `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`.
 - AC-PCA-VALUE-PARITY (REQ-PCA-VALUE-PARITY): the default-solver arrays match
   element-wise (covered by AC-PCA-API-CONFORM). The repeated-eigenvalue
   sign/basis case (`whiten`, alternate `svd_solver`) does NOT — a critic pins a
@@ -338,7 +342,7 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
 | REQ-PCA-NCOMP-POSITIONAL (n_components positional ABI) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 constructor ABI; single-wrapper-fixable). sklearn `__init__(self, n_components=None, *, ...)` (`_pca.py:407-409`) makes `n_components` positional-or-keyword — `PCA(2).n_components` → `2`. ferrolearn `_transformers.py::PCA.__init__(self, *, n_components=2)` makes it keyword-only — live: `ferrolearn.PCA(2)` → `TypeError: __init__() takes 1 positional argument but 2 were given`. Single-line Python-wrapper fix: move `n_components` before the `*`. |
 | REQ-PCA-NCOMP-DEFAULT-NONE (n_components default None) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 default value; single-wrapper-fixable). sklearn default `n_components=None` keeps `min(n_samples, n_features)` components (`_pca.py:409`; oracle `PCA().n_components` → `None`, `PCA().fit(X).components_.shape` → `(2,2)`). ferrolearn defaults to `2` (`_transformers.py::PCA.__init__` + `RsPCA::new` `#[pyo3(signature = (n_components=2))]`). Wrapper-level fix: default `None` and resolve to `min(n,p)` before constructing `_RsPCA` (the Rust binding needs a usize, so the wrapper resolves None at fit). |
 | REQ-PCA-PARAMS (copy/whiten/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | open prereq blockers #1502 (`whiten`, `ferrolearn-decomp` REQ-11), #1503 (`svd_solver`, REQ-12), #1509 (`tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy`, REQ-17). sklearn `_pca.py:407-423`/`:393-405`. ferrolearn `_transformers.py::PCA.__init__` exposes `n_components` only; `RsPCA::new` takes only `n_components`. The default `svd_solver`/`whiten=False` behavior MATCHES (covariance-eigh, no whitening), so only the param surface + non-default paths are missing — owned downstream; the binding cannot expose what the library lacks. |
-| REQ-PCA-ATTRS (n_components_ + noise_variance_) | NOT-STARTED | open prereq blockers #1508 (`n_components_`/`n_features_in_`, `ferrolearn-decomp` REQ-16) + #1507 (`noise_variance_`, REQ-15). sklearn `_pca.py:691` (`n_components_`), `:686-688` (`noise_variance_`); oracle `PCA(2).fit(X)` → `n_components_=2`, `noise_variance_=0.0`. ferrolearn `_RsPCA` has NO `n_components_`/`noise_variance_` getter and `FittedPCA` discards the eigenvalue tail (`noise_variance_`); live `hasattr(fitted, 'n_components_')`/`'noise_variance_'` → `False`. The binding cannot expose attrs the library does not compute — owned downstream. |
+| REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | the downstream prereqs already SHIPPED (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`), so the binding now exposes both. impl: `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs::n_components_`, the row count of `components_`, `_pca.py:691`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs::noise_variance`, full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept, `_pca.py:686-688`). Non-test consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (NON-ZERO — tail-mean path); `PCA(3)` → `noise_variance_=0.0`. Guard `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
 | REQ-PCA-VALUE-PARITY (components_/explained_variance_/ratio/singular_values_/mean_ array parity incl. svd_flip sign) | SHIPPED | on the DEFAULT solver path. `_transformers.py::PCA.fit` marshals all five arrays from the `RsPCA` getters (over `FittedPCA`), and the downstream `ferrolearn-decomp` REQ-1/4/5 are critic-verified to MATCH the live sklearn `PCA` oracle element-wise to 1e-6 INCLUDING the per-row `svd_flip(u_based_decision=False)` sign (`tests/divergence_pca.rs`, `_pca.py:647`). Live (R-CHAR-3): ferrolearn `PCA(n_components=2).fit(X)` equals the oracle element-wise (values above). Non-test consumer: `_transformers.py::PCA` + re-export. (The repeated-eigenvalue/rank-deficient sign-and-basis case is owned downstream REQ-2 #1501; `whiten`/alternate-`svd_solver` value parity is owned downstream #1502/#1503.) |
 | REQ-CONSUMER (binding IS the public API) | SHIPPED | the binding boundary types ARE the public API (R-DEFER-1/S5: boundary estimator types ARE the public surface; grandfathered existing pub API). Non-test production consumers: `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` and `_transformers.py::PCA` constructs `_RsPCA(n_components=...)`, each calling `fit`/`transform`/`inverse_transform` + reading the fitted-attr getters (`grep -n "_RsStandardScaler\|_RsPCA" python/ferrolearn/_transformers.py`); `ferrolearn/__init__.py:12` re-exports both `StandardScaler` and `PCA`; `test_check_estimator.py:31-32` is the verification consumer + external users. Verification (model B): pytest → 524 passed (both estimators run through `parametrize_with_checks`). |
 | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | open prereq blocker = `conversions.md` REQ-FERRAY #2027. `transformers.rs` marshals via `use crate::conversions::*` + `use numpy::{PyArray1, PyArray2, PyReadonlyArray2}` (rust-numpy) and the conversions produce `ndarray::Array{1,2}` — the WRONG substrate per R-SUBSTRATE-1 (destination `ferray::numpy_interop` + `ferray-core`). ferray exposes no PyO3 numpy-interop bridge yet (R-SUBSTRATE-5). Owned by the conversions unit, surfaced here. |

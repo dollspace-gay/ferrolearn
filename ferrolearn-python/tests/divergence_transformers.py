@@ -425,3 +425,52 @@ def test_standardscaler_pca_get_feature_names_out():
         pca.get_feature_names_out().tolist()
         == SkPCA(n_components=2).fit(X).get_feature_names_out().tolist()
     )
+
+
+# ---------------------------------------------------------------------------
+# PCA n_components_ + noise_variance_ fitted attrs (unit #2097, R-DEV-3).
+#
+# The wrapper previously exposed only components_/explained_variance_/
+# explained_variance_ratio_/mean_/singular_values_. The Rust
+# FittedPCA::n_components_()/noise_variance() already match sklearn (downstream
+# ferrolearn-decomp REQ-16 #1505 / REQ-15 #1507); this surfaces them on the
+# binding. noise_variance_ is the mean of the discarded tail eigenvalues over
+# the FULL spectrum (`sklearn/decomposition/_pca.py:686-688`), so with
+# n_components=2 on a rank>2 fixture it is NON-ZERO (a meaningful regression
+# guard, not the trivial 0.0 all-components-kept case).
+# ---------------------------------------------------------------------------
+
+
+def test_pca_n_components_and_noise_variance_match_sklearn():
+    """PCA exposes n_components_ (int) and noise_variance_ (float) matching sklearn.
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn. The fixture has 6 samples ×
+    3 features so with n_components=2 one eigenvalue is discarded and
+    noise_variance_ is non-zero — exercising the tail-mean path, not just 0.0.
+    """
+    X = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 7.0],
+            [2.0, 0.0, 1.0],
+            [8.0, 6.0, 5.0],
+            [3.0, 3.0, 2.0],
+            [0.0, 1.0, 4.0],
+        ]
+    )
+
+    fr = fl.PCA(n_components=2).fit(X)
+    sk = SkPCA(n_components=2).fit(X)
+
+    # The attributes are present on the ferrolearn wrapper.
+    assert hasattr(fr, "n_components_")
+    assert hasattr(fr, "noise_variance_")
+
+    # n_components_ matches the live oracle exactly.
+    assert fr.n_components_ == sk.n_components_
+
+    # noise_variance_ matches the live oracle. It is meaningfully non-zero here
+    # (one discarded eigenvalue), so this is not the trivial 0.0 path.
+    assert sk.noise_variance_ > 0.0
+    assert abs(float(fr.noise_variance_) - float(sk.noise_variance_)) < 1e-9
