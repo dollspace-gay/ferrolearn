@@ -336,3 +336,69 @@ fn csc_sub_shape_mismatch_is_err() {
         "shape-mismatched sub must return Err (scipy raises ValueError)"
     );
 }
+
+// REQ-MISSING-MATMUL — live scipy oracle (R-CHAR-3). Expected values from
+// `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   B=sp.csc_matrix(np.array([[1.,1,0],[0,1,1],[0,0,1]]))
+//   C=sp.csc_matrix(np.array([[1.,2],[3,4],[5,6]]))
+//   print((A@B).toarray().tolist(), (A@C).toarray().tolist())"`
+//   -> [[1,1,2],[0,3,3],[4,4,5]] [[11,14],[9,12],[29,38]].
+
+/// Non-square helper `C = [[1,2],[3,4],[5,6]]` (3×2) in CSC form, built via
+/// `from_dense` (infallible, no unwrap) to match the test idiom.
+fn sample_c() -> CscMatrix<f64> {
+    let dense = array![[1.0_f64, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    CscMatrix::from_dense(&dense.view(), 0.0)
+}
+
+/// REQ-MISSING-MATMUL. `matmul(&B)` matches scipy `A @ B` (sparse-sparse
+/// product, SMMP).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `(A@B).toarray() == [[1,1,2],[0,3,3],[4,4,5]]`.
+#[test]
+fn csc_matmul_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b_elmul();
+    let prod = a.matmul(&b).unwrap();
+    let expected = [[1.0, 1.0, 2.0], [0.0, 3.0, 3.0], [4.0, 4.0, 5.0]];
+    assert_dense_eq(&prod.to_dense(), &expected);
+}
+
+/// REQ-MISSING-MATMUL. `matmul(&C)` for a non-square right operand matches scipy
+/// `A @ C`, including the `(3,2)` output shape.
+///
+/// Oracle: C = [[1,2],[3,4],[5,6]];
+/// `(A@C).toarray() == [[11,14],[9,12],[29,38]]`, shape `(3,2)`.
+#[test]
+fn csc_matmul_non_square() {
+    let a = sample_a();
+    let c = sample_c();
+    let prod = a.matmul(&c).unwrap();
+    assert_eq!(prod.n_rows(), 3);
+    assert_eq!(prod.n_cols(), 2);
+    let d = prod.to_dense();
+    let expected = [[11.0, 14.0], [9.0, 12.0], [29.0, 38.0]];
+    for (r, row) in expected.iter().enumerate() {
+        for (col, &v) in row.iter().enumerate() {
+            assert_eq!(d[[r, col]], v, "matmul mismatch at ({r},{col})");
+        }
+    }
+}
+
+/// REQ-MISSING-MATMUL / REQ-ERR. `matmul` with an incompatible inner dimension
+/// returns `Err`, where scipy raises `ValueError: dimension mismatch`.
+///
+/// Oracle: `A` has 3 cols; `D` is 2×2 (2 rows != 3) -> dimension mismatch.
+#[test]
+fn csc_matmul_shape_mismatch_is_err() {
+    let a = sample_a();
+    // 2x2 matrix: D.n_rows() (2) != A.n_cols() (3)
+    let d = CscMatrix::<f64>::new(2, 2, vec![0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.matmul(&d).is_err(),
+        "inner-dimension-mismatched matmul must return Err (scipy raises ValueError)"
+    );
+}
