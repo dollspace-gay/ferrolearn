@@ -12,7 +12,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **7 SHIPPED / 7 NOT-STARTED.**
+//! **8 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -25,7 +25,7 @@
 //! | REQ-CONSUMER | SHIPPED | in-crate CSR↔CSC conversion consumer (`csr.rs` `from_csc`/`to_csc`) + `lib.rs` re-export (grandfathered boundary type, R-DEFER-1/S5). NOTE: no cross-crate ESTIMATOR consumer (weaker than CSR's neighbors/graph.rs). |
 //! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)`. Blocker #2008. |
 //! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2009. |
-//! | REQ-MISSING-REDUCE | NOT-STARTED | no `.sum(axis=)`/`.diagonal()`. Blocker #2010. |
+//! | REQ-MISSING-REDUCE | SHIPPED (#2010) | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csc_sum_matches_scipy`/`csc_sum_axis0_matches_scipy`/`csc_sum_axis1_matches_scipy`/`csc_diagonal_matches_scipy`/`csc_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2011. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`astype`/`copy`/`max`/`min`. Blocker #2012. |
 //! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2013. |
@@ -275,6 +275,86 @@ where
         let result = &self.inner * rhs;
         Ok(result)
     }
+
+    /// Sum of all stored values.
+    ///
+    /// Mirrors scipy `csc_matrix.sum()` with `axis=None`
+    /// (`scipy/sparse/_compressed.py:492`), which reduces over both rows and
+    /// columns to a scalar. Structural zeros contribute nothing, so this is the
+    /// running total of the stored non-zero entries accumulated from
+    /// [`T::zero()`].
+    #[must_use]
+    pub fn sum(&self) -> T
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut acc = T::zero();
+        for (&val, _) in &self.inner {
+            acc = acc + val;
+        }
+        acc
+    }
+
+    /// Column sums, a length-`n_cols` vector.
+    ///
+    /// Mirrors scipy `csc_matrix.sum(axis=0)`
+    /// (`scipy/sparse/_compressed.py:492`), which returns a `(1, n_cols)`
+    /// row vector of per-column sums; here it is returned as a length-`n_cols`
+    /// [`Array1`]. For each stored entry `(row, col, val)`, `val` is added to
+    /// `out[col]`.
+    #[must_use]
+    pub fn sum_axis0(&self) -> Array1<T>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut out = Array1::<T>::zeros(self.n_cols());
+        for (&val, (_, c)) in &self.inner {
+            out[c] = out[c] + val;
+        }
+        out
+    }
+
+    /// Row sums, a length-`n_rows` vector.
+    ///
+    /// Mirrors scipy `csc_matrix.sum(axis=1)`
+    /// (`scipy/sparse/_compressed.py:492`), which returns an `(n_rows, 1)`
+    /// column vector of per-row sums; here it is returned as a length-`n_rows`
+    /// [`Array1`]. For each stored entry `(row, col, val)`, `val` is added to
+    /// `out[row]`.
+    #[must_use]
+    pub fn sum_axis1(&self) -> Array1<T>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut out = Array1::<T>::zeros(self.n_rows());
+        for (&val, (r, _)) in &self.inner {
+            out[r] = out[r] + val;
+        }
+        out
+    }
+
+    /// Main diagonal, a length-`min(n_rows, n_cols)` vector.
+    ///
+    /// Mirrors scipy `csc_matrix.diagonal()` with `k=0`
+    /// (`scipy/sparse/_compressed.py:476`): `out[i] == A[i, i]` for
+    /// `i in 0..min(n_rows, n_cols)`. Positions absent from the CSC structure
+    /// are structural zeros, so `out[i]` defaults to [`T::zero()`]. For CSC,
+    /// `outer_iterator()` yields columns, so the `i`-th column's row-`i` entry
+    /// is `A[i, i]`.
+    #[must_use]
+    pub fn diagonal(&self) -> Array1<T>
+    where
+        T: Copy + Zero,
+    {
+        let len = self.n_rows().min(self.n_cols());
+        let mut out = Array1::<T>::zeros(len);
+        for (i, col) in self.inner.outer_iterator().enumerate().take(len) {
+            if let Some(&val) = col.get(i) {
+                out[i] = val;
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -427,6 +507,51 @@ mod tests {
         let m = sample_csc();
         let v = Array1::from(vec![1.0_f64, 2.0]);
         assert!(m.mul_vec(&v).is_err());
+    }
+
+    // REQ-MISSING-REDUCE — live scipy 1.x oracle (R-CHAR-3). Expected values
+    // from `python3 -c "import numpy as np, scipy.sparse as sp;
+    //   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+    //   print(A.sum(), A.sum(axis=0).tolist(), A.sum(axis=1).tolist(),
+    //         A.diagonal().tolist())"`
+    //   -> 15.0 [[5.0,3.0,7.0]] [[3.0],[3.0],[9.0]] [1.0,3.0,5.0]
+    // and B=[[1,2,3],[4,5,6]] -> B.diagonal().tolist() == [1.0,5.0].
+
+    fn sample_csc_b() -> CscMatrix<f64> {
+        // 2x3 dense matrix B = [[1,2,3],[4,5,6]] (no zeros). Built via
+        // from_dense (infallible, no unwrap) to match the test idiom.
+        let dense = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        CscMatrix::from_dense(&dense.view(), 0.0)
+    }
+
+    #[test]
+    fn csc_sum_matches_scipy() {
+        let m = sample_csc();
+        assert_abs_diff_eq!(m.sum(), 15.0);
+    }
+
+    #[test]
+    fn csc_sum_axis0_matches_scipy() {
+        let m = sample_csc();
+        assert_eq!(m.sum_axis0(), array![5.0, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn csc_sum_axis1_matches_scipy() {
+        let m = sample_csc();
+        assert_eq!(m.sum_axis1(), array![3.0, 3.0, 9.0]);
+    }
+
+    #[test]
+    fn csc_diagonal_matches_scipy() {
+        let m = sample_csc();
+        assert_eq!(m.diagonal(), array![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn csc_diagonal_non_square() {
+        let m = sample_csc_b();
+        assert_eq!(m.diagonal(), array![1.0, 5.0]);
     }
 }
 
