@@ -39,7 +39,7 @@
 //! | REQ-10 `get_feature_names_out`/`n_features_in_` | NOT-STARTED (#1270) | sklearn `OneToOneFeatureMixin` |
 //! | REQ-11 PyO3 binding | NOT-STARTED (#1271) | `ferrolearn-python/src/` (absent) |
 //! | REQ-12 ferray substrate | NOT-STARTED (#1272) | R-SUBSTRATE |
-//! | REQ-13 f32 accumulates in lower precision than sklearn's f64 | NOT-STARTED (#1263) | sklearn `_target_encoder_fast.pyx:42,44,68` (always f64); f64 path CLEAN |
+//! | REQ-13 per-category sums accumulate in f64 (always), matching sklearn's C `double` | SHIPPED | `fit` accumulates `cat_stats: HashMap<usize,(f64,usize)>` seeded with `smooth_f64*global_mean_f64`, `+= y[i].to_f64()`, then `F::from(sum/(smooth_f64+count))`; sklearn `_target_encoder_fast.pyx:42,44,68` (`double sums[]`/`counts[]`, `sums[cat]+=y[i]` regardless of `Y_DTYPE`), `encodings_` always float64 (`_target_encoder.py:335`). f64 path identity (bit-exact unchanged); `TargetEncoder<f32>` now captures `2^24+1` (#1263) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -236,31 +236,41 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<usize>, Array1<F>> for TargetE
 
         let mut category_maps = Vec::with_capacity(n_features);
 
+        // sklearn accumulates the per-category sums/counts and the smoothing seed
+        // in C `double` REGARDLESS of the input `Y_DTYPE`, and `encodings_` is
+        // always float64 (`_target_encoder_fast.pyx:42,44,68` `double sums[...]`,
+        // `double counts[...]`, `sums[cat] += y[i]`). So accumulate per category in
+        // f64 even when `F = f32`, then cast the final per-category encoding to `F`.
+        // For `F = f64` this round-trip is the identity (#1263).
+        let smooth_f64 = self.smooth.to_f64().unwrap_or(0.0);
+        let global_mean_f64 = global_mean.to_f64().unwrap_or(0.0);
+
         for j in 0..n_features {
             // Collect (sum, count) per category. Match sklearn's
             // `_target_encoder_fast.pyx:60-75` bit-for-bit: seed each category's
             // accumulator with `smooth * y_mean` FIRST (`:60` `sums[cat]=smooth_sum`),
             // then add each target sequentially in row order (`:68` `sums[cat]+=y[i]`).
-            // So the accumulated F is `smooth*y_mean + y[0] + y[1] + ...`.
-            let mut cat_stats: HashMap<usize, (F, usize)> = HashMap::new();
+            // So the accumulated f64 is `smooth*y_mean + y[0] + y[1] + ...`.
+            let mut cat_stats: HashMap<usize, (f64, usize)> = HashMap::new();
             for i in 0..n_samples {
                 let cat = x[[i, j]];
                 let entry = cat_stats
                     .entry(cat)
-                    .or_insert_with(|| (self.smooth * global_mean, 0usize));
-                entry.0 = entry.0 + y[i];
+                    .or_insert_with(|| (smooth_f64 * global_mean_f64, 0usize));
+                entry.0 += y[i].to_f64().unwrap_or(0.0);
                 entry.1 += 1;
             }
 
             // Per category: `encoding = sums[cat] / counts[cat]`
             // (`_target_encoder_fast.pyx:75`), where `counts[cat] = smooth + count`
             // (count seeded from `smooth` at `:61`) and `sums[cat]` already includes
-            // the `smooth*y_mean` seed. i.e. `(smooth*y_mean + Σyᵢ) / (smooth + count)`.
+            // the `smooth*y_mean` seed. i.e. `(smooth*y_mean + Σyᵢ) / (smooth + count)`,
+            // all in f64 (matching sklearn's C double), then cast to `F`.
             let mut cat_map: HashMap<usize, F> = HashMap::new();
             for (&cat, &(sum, count)) in &cat_stats {
-                let count_f = F::from(count).unwrap_or_else(F::one);
-                let encoded = sum / (self.smooth + count_f);
-                cat_map.insert(cat, encoded);
+                let count_f = count as f64;
+                let encoded_f64 = sum / (smooth_f64 + count_f);
+                cat_map.insert(cat, F::from(encoded_f64).unwrap_or_else(F::zero));
             }
 
             category_maps.push(cat_map);

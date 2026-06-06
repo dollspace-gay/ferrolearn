@@ -2203,3 +2203,85 @@ fn green_hunt3_multifeature_3x3_full_matrix() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// PINNED DIVERGENCE — REQ-13 (#1263): accumulate per-category sums in f64 always,
+// matching sklearn's C `double` accumulators regardless of input dtype.
+// ---------------------------------------------------------------------------
+
+/// GREEN guard — REQ-13 f64 path UNCHANGED (identity under the f64-accumulator
+/// fix). sklearn accumulates per-category sums in C `double`
+/// (`_target_encoder_fast.pyx:42,44,68`); for `F=f64` promoting to f64 and back
+/// is the identity, so the exact `2^24+1+1+1 = 16777219` sum, /4, is preserved.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// >>> import numpy as np
+/// >>> y = np.array([16777216.0,1.0,1.0,1.0], dtype=np.float64)
+/// >>> e = TargetEncoder(smooth=0.0, target_type='continuous').fit([[0]]*4, y)
+/// >>> float(e.encodings_[0][0])   -> 4194304.75
+/// ```
+/// Tracking: #1263
+#[test]
+fn target_encoder_f64_sum_exact() -> Result<(), FerroError> {
+    // Oracle: sklearn encodings_[0][0] for y=[2^24,1,1,1], smooth=0.0.
+    const SK_ENC: f64 = 4_194_304.75; // (16777216 + 1 + 1 + 1) / 4
+    let x: Array2<usize> = array![[0usize], [0], [0], [0]];
+    let y: Array1<f64> = array![16_777_216.0_f64, 1.0, 1.0, 1.0];
+
+    let fitted = TargetEncoder::<f64>::new(0.0).fit(&x, &y)?;
+    let enc = fitted.category_maps()[0][&0];
+    assert_eq!(
+        enc.to_bits(),
+        SK_ENC.to_bits(),
+        "f64: ferro encoding={enc} (bits {:#x}) != sklearn {SK_ENC} (bits {:#x})",
+        enc.to_bits(),
+        SK_ENC.to_bits()
+    );
+    Ok(())
+}
+
+/// PINNED DIVERGENCE — REQ-13 (#1263). `TargetEncoder<f32>` must accumulate the
+/// per-category sums in f64 internally (matching sklearn's C `double`,
+/// `_target_encoder_fast.pyx:42,44,68`, and `encodings_` always float64,
+/// `_target_encoder.py:335`), then cast the final per-category encoding to f32.
+/// Accumulating in f32 would lose the three `+1`s past 2^24 (`2^24 + 1 == 2^24`
+/// in f32), giving `4194304.0`. The faithful result is sklearn's f64 oracle
+/// (`4194304.75`) rounded to the nearest f32.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// >>> import numpy as np
+/// >>> y = np.array([16777216.0,1.0,1.0,1.0], dtype=np.float32)
+/// >>> e = TargetEncoder(smooth=0.0, target_type='continuous').fit([[0]]*4, y)
+/// >>> float(e.encodings_[0][0])      -> 4194304.75   (still f64; accumulated in double)
+/// >>> np.float32(4194304.75)         -> 4194305.0    (best f32 of the f64 answer)
+/// ```
+/// Tracking: #1263
+#[test]
+fn target_encoder_f32_accumulates_in_f64() -> Result<(), FerroError> {
+    // Oracle: sklearn's f64 encoding 4194304.75 rounded to f32 (np.float32).
+    const SK_ENC_F32: f32 = 4_194_304.75_f64 as f32; // == 4194305.0_f32
+    // The old (buggy) f32-accumulator result that the fix must NOT produce.
+    const BUGGY_F32: f32 = 4_194_304.0_f32;
+    let x: Array2<usize> = array![[0usize], [0], [0], [0]];
+    let y: Array1<f32> = array![16_777_216.0_f32, 1.0, 1.0, 1.0];
+
+    let fitted = TargetEncoder::<f32>::new(0.0_f32).fit(&x, &y)?;
+    let enc = fitted.category_maps()[0][&0];
+
+    // Faithful to sklearn's always-f64 accumulation, cast to f32.
+    assert_eq!(
+        enc.to_bits(),
+        SK_ENC_F32.to_bits(),
+        "f32: ferro encoding={enc} (bits {:#x}) != sklearn-f64-as-f32 {SK_ENC_F32} (bits {:#x})",
+        enc.to_bits(),
+        SK_ENC_F32.to_bits()
+    );
+    // The +1 increments past 2^24 are captured (NOT lost to f32 accumulation).
+    assert_ne!(
+        enc, BUGGY_F32,
+        "f32 must not collapse to the old f32-accumulator value {BUGGY_F32}"
+    );
+    Ok(())
+}
