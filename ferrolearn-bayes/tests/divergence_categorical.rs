@@ -473,3 +473,27 @@ fn green_categorical_score_accuracy() {
         "score = {acc}, want {SK_SCORE}"
     );
 }
+
+/// Divergence (#2092): `partial_fit` must reject negative feature values, like
+/// `fit` and the predict path. sklearn `_check_X_y` runs `check_non_negative`
+/// on the partial_fit path (`naive_bayes.py:1435-1439`) → `ValueError`.
+///
+/// Oracle (live sklearn 1.5.2): `CategoricalNB().partial_fit(X, y, classes=[0,1])`
+/// then `.partial_fit([[-1,0]], [0])` → `ValueError("Negative values in data
+/// passed to CategoricalNB (input X)")`.
+#[test]
+fn categorical_partial_fit_negative_rejected() -> Result<(), FerroError> {
+    let (x, y) = categorical_fixture();
+    let mut fitted = CategoricalNB::<f64>::new().fit(&x, &y)?;
+
+    let x_neg = array![[-1.0_f64, 0.0]];
+    let y_neg = ndarray::array![0usize];
+    let result = fitted.partial_fit(&x_neg, &y_neg);
+
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "partial_fit on a negative feature must return Err(InvalidParameter) \
+         (sklearn: ValueError), got {result:?} (#2092)"
+    );
+    Ok(())
+}

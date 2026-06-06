@@ -499,6 +499,16 @@ impl<F: Float + Send + Sync + 'static> FittedCategoricalNB<F> {
             });
         }
 
+        // sklearn `_check_X_y` runs `check_non_negative` on the partial_fit
+        // path too (`naive_bayes.py:1435-1439`), raising `ValueError` for any
+        // negative feature value. Mirror that here (as in `fn fit`).
+        if x.iter().any(|&v| v < F::zero()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Negative values in data passed to CategoricalNB (input X)".into(),
+            });
+        }
+
         // Discover and integrate any new class labels (preserving sorted
         // order so `classes` stays a sorted unique list).
         for &label in y {
