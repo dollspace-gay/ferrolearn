@@ -17,7 +17,7 @@
 //! | REQ | Behavior | Status | Evidence |
 //! |-----|----------|--------|----------|
 //! | REQ-1 | classifier `most_frequent`/`prior`/`constant` predict | SHIPPED | `impl Predict for FittedDummyClassifier` + `fn most_frequent` (first-max tie-break = sklearn `np.argmax(class_prior_)`, `dummy.py:311`); oracle green guards |
-//! | REQ-2 | `predict_proba`/`predict_log_proba` | NOT-STARTED | absent on `FittedDummyClassifier` (the only Prior-vs-MostFrequent behavioral difference) — blocker #1691 |
+//! | REQ-2 | `predict_proba`/`predict_log_proba` | SHIPPED | `fn predict_proba`/`fn predict_log_proba` on `FittedDummyClassifier`: `prior`→`class_prior_` row, `most_frequent`/`constant`→one-hot at `argmax(class_prior_)`, `uniform`→`1/n_classes`, `log_proba`→elementwise `ln` (`0`→`-inf`); mirrors `dummy.py:340-423`. Deterministic strategies oracle-pinned (`dummy_predict_proba_*`/`dummy_predict_log_proba_matches_sklearn`); `stratified` proba is an R-DEFER-3 RNG carve-out (SmallRng draw, not oracle-pinned). Closes #1691 |
 //! | REQ-3 | `stratified`/`uniform` exact parity | NOT-STARTED | RNG carve-out (`SmallRng` vs numpy `RandomState`), R-DEFER-3 — blocker #1695 |
 //! | REQ-4 | constant ∉ classes rejected | SHIPPED | `fn fit` returns `Err`; sklearn raises `ValueError` (behavior parity, R-DEV-2 family; variant-name note #1692) |
 //! | REQ-5 | classifier attributes (`classes_`/`n_classes_`) | SHIPPED | `impl HasClasses` + `fn most_frequent` |
@@ -173,6 +173,96 @@ impl FittedDummyClassifier {
             }
         }
         *self.classes.last().expect("at least one class")
+    }
+
+    /// Index (into [`Self::classes`]) of the most-frequent class
+    /// (`np.argmax(class_prior_)`, first-on-ties), mirroring sklearn
+    /// `dummy.py:311,377`.
+    fn most_frequent_index(&self) -> usize {
+        let mut best = 0usize;
+        let mut best_p = self.class_priors[0];
+        for (i, &p) in self.class_priors.iter().enumerate() {
+            if p > best_p {
+                best_p = p;
+                best = i;
+            }
+        }
+        best
+    }
+
+    /// Per-class probability estimates, one row per sample.
+    ///
+    /// Returns an `(n_samples, n_classes)` matrix where `n_samples = x.nrows()`
+    /// and `n_classes = self.classes.len()`. Mirrors sklearn
+    /// `DummyClassifier.predict_proba` (`dummy.py:340-389`, tag 1.5.2):
+    /// - `MostFrequent`/`Constant`: a one-hot row at the chosen class index.
+    /// - `Prior`: the class-prior distribution repeated for every sample.
+    /// - `Uniform`: `1 / n_classes` for every entry.
+    /// - `Stratified`: an independent random one-hot per sample drawn from the
+    ///   class prior (R-DEFER-3 RNG carve-out — uses the SAME `SmallRng`/seed
+    ///   mechanism as [`Predict::predict`]; not oracle-pinned, cannot bit-match
+    ///   numpy's `RandomState.multinomial`).
+    #[must_use]
+    pub fn predict_proba<F: Float + Send + Sync + 'static>(&self, x: &Array2<F>) -> Array2<f64> {
+        let n = x.nrows();
+        let k = self.classes.len();
+        match &self.strategy {
+            // sklearn's `predict` is identical for prior/most_frequent, but
+            // `predict_proba` diverges: prior returns the class_prior_ row
+            // (`dummy.py:380-381`) while most_frequent returns a one-hot at
+            // `argmax(class_prior_)` (`dummy.py:376-379`).
+            DummyClassifierStrategy::Prior => {
+                let mut out = Array2::<f64>::zeros((n, k));
+                for mut row in out.rows_mut() {
+                    for (j, &p) in self.class_priors.iter().enumerate() {
+                        row[j] = p;
+                    }
+                }
+                out
+            }
+            DummyClassifierStrategy::MostFrequent => {
+                let ind = self.most_frequent_index();
+                let mut out = Array2::<f64>::zeros((n, k));
+                out.column_mut(ind).fill(1.0);
+                out
+            }
+            DummyClassifierStrategy::Constant(c) => {
+                let mut out = Array2::<f64>::zeros((n, k));
+                // `c` is validated to be a member of `classes` during `fit`,
+                // so `position` always finds it; the `if let` keeps this branch
+                // panic-free without an `unwrap`/`expect` (R-CODE-2).
+                if let Some(ind) = self.classes.iter().position(|&cls| cls == *c) {
+                    out.column_mut(ind).fill(1.0);
+                }
+                out
+            }
+            DummyClassifierStrategy::Uniform => Array2::<f64>::from_elem((n, k), 1.0 / k as f64),
+            DummyClassifierStrategy::Stratified => {
+                let mut rng = self.make_rng(0);
+                let mut out = Array2::<f64>::zeros((n, k));
+                for mut row in out.rows_mut() {
+                    let cls = self.weighted_choice(&mut rng);
+                    // `weighted_choice` only ever returns a member of `classes`.
+                    if let Some(ind) = self.classes.iter().position(|&c| c == cls) {
+                        row[ind] = 1.0;
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Per-class log-probability estimates, `ln(predict_proba(x))` elementwise.
+    ///
+    /// Mirrors sklearn `DummyClassifier.predict_log_proba`
+    /// (`dummy.py:391-423`, tag 1.5.2): a `0.0` probability maps to `-inf`
+    /// (matching `np.log(0.0)`).
+    #[must_use]
+    pub fn predict_log_proba<F: Float + Send + Sync + 'static>(
+        &self,
+        x: &Array2<F>,
+    ) -> Array2<f64> {
+        self.predict_proba(x).mapv(f64::ln)
     }
 }
 
@@ -392,6 +482,86 @@ mod tests {
         for p in preds.iter() {
             assert!(matches!(*p, 0..=2));
         }
+    }
+
+    // y = [0,0,1,1,2] -> classes_ [0,1,2], class_prior_ [0.4,0.4,0.2].
+    // Oracle values from live sklearn 1.5.2 DummyClassifier.predict_proba
+    // (sklearn/dummy.py:340-389). See .design/model-sel/dummy.md Verification.
+    fn proba_y() -> Array1<usize> {
+        array![0usize, 0, 1, 1, 2]
+    }
+
+    #[test]
+    fn dummy_predict_proba_prior_matches_sklearn() -> Result<(), FerroError> {
+        let clf = DummyClassifier::new(DummyClassifierStrategy::Prior);
+        let fitted = clf.fit(&x(), &proba_y())?;
+        let xq = Array2::<f64>::zeros((2, 2));
+        let proba = fitted.predict_proba(&xq);
+        assert_eq!(proba.shape(), &[2, 3]);
+        for row in proba.rows() {
+            assert!((row[0] - 0.4).abs() <= 1e-9);
+            assert!((row[1] - 0.4).abs() <= 1e-9);
+            assert!((row[2] - 0.2).abs() <= 1e-9);
+            assert!((row.sum() - 1.0).abs() <= 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dummy_predict_proba_most_frequent_matches_sklearn() -> Result<(), FerroError> {
+        let clf = DummyClassifier::new(DummyClassifierStrategy::MostFrequent);
+        let fitted = clf.fit(&x(), &proba_y())?;
+        let xq = Array2::<f64>::zeros((2, 2));
+        let proba = fitted.predict_proba(&xq);
+        assert_eq!(proba.shape(), &[2, 3]);
+        for row in proba.rows() {
+            assert!((row[0] - 1.0).abs() <= 1e-9);
+            assert!((row[1] - 0.0).abs() <= 1e-9);
+            assert!((row[2] - 0.0).abs() <= 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dummy_predict_proba_uniform_matches_sklearn() -> Result<(), FerroError> {
+        let clf = DummyClassifier::new(DummyClassifierStrategy::Uniform);
+        let fitted = clf.fit(&x(), &proba_y())?;
+        let xq = Array2::<f64>::zeros((2, 2));
+        let proba = fitted.predict_proba(&xq);
+        assert_eq!(proba.shape(), &[2, 3]);
+        for row in proba.rows() {
+            for &v in row {
+                assert!((v - 1.0 / 3.0).abs() <= 1e-9);
+            }
+            assert!((row.sum() - 1.0).abs() <= 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dummy_predict_log_proba_matches_sklearn() -> Result<(), FerroError> {
+        // prior: ln([0.4,0.4,0.2]) elementwise.
+        let clf = DummyClassifier::new(DummyClassifierStrategy::Prior);
+        let fitted = clf.fit(&x(), &proba_y())?;
+        let xq = Array2::<f64>::zeros((2, 2));
+        let logp = fitted.predict_log_proba(&xq);
+        assert_eq!(logp.shape(), &[2, 3]);
+        for row in logp.rows() {
+            assert!((row[0] - 0.4f64.ln()).abs() <= 1e-9);
+            assert!((row[1] - 0.4f64.ln()).abs() <= 1e-9);
+            assert!((row[2] - 0.2f64.ln()).abs() <= 1e-9);
+        }
+
+        // most_frequent: zero-probability entries map to -inf (np.log(0.0)).
+        let clf = DummyClassifier::new(DummyClassifierStrategy::MostFrequent);
+        let fitted = clf.fit(&x(), &proba_y())?;
+        let logp = fitted.predict_log_proba(&xq);
+        for row in logp.rows() {
+            assert!((row[0] - 0.0).abs() <= 1e-9);
+            assert!(row[1].is_infinite() && row[1].is_sign_negative());
+            assert!(row[2].is_infinite() && row[2].is_sign_negative());
+        }
+        Ok(())
     }
 
     #[test]
