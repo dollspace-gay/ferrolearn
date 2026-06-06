@@ -1,9 +1,11 @@
 """sklearn-compatible wrappers for ferrolearn regression models."""
 
 import re
+import warnings
 
 import numpy as np
 from sklearn.base import BaseEstimator, MultiOutputMixin, RegressorMixin
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
@@ -32,6 +34,23 @@ def _predict_linear(X, coef, intercept):
     """
     coef = np.asarray(coef)
     return X @ coef.T + intercept
+
+
+def _warn_convergence(gap, tol_scaled):
+    """Emit sklearn's coordinate-descent non-convergence warning.
+
+    Matches sklearn 1.5.2's exact wording from
+    `sklearn/linear_model/_cd_fast.pyx:256-260` (note the British spelling
+    "regularisation"), raised once per non-converged fit when the CD loop hits
+    `max_iter` without the duality gap dropping below the scaled tolerance.
+    """
+    warnings.warn(
+        f"Objective did not converge. You might want to increase the number "
+        f"of iterations, check the scale of the features or consider "
+        f"increasing regularisation. Duality gap: {gap:.3e}, tolerance: "
+        f"{tol_scaled:.3e}",
+        ConvergenceWarning,
+    )
 
 
 def _fit_rust(rs, X, y=None):
@@ -255,9 +274,21 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
                 intercept_list.append(float(rs_j.intercept_))
-                n_iter_list.append(int(rs_j.n_iter_))
-                dual_gap_list.append(float(rs_j.dual_gap_))
+                n_iter_j = int(rs_j.n_iter_)
+                dual_gap_j = float(rs_j.dual_gap_)
+                n_iter_list.append(n_iter_j)
+                dual_gap_list.append(dual_gap_j)
                 self._rs_list.append(rs_j)
+                # Per-target ConvergenceWarning: sklearn's CD loop warns once per
+                # non-converged target (`_cd_fast.pyx:256-269`), driven here by the
+                # real per-target `n_iter_` hitting `max_iter` (#2127).
+                if n_iter_j >= self.max_iter:
+                    yc_j = y[:, j] - y[:, j].mean() if self.fit_intercept else y[:, j]
+                    tol_scaled_j = self.tol * float(np.dot(yc_j, yc_j))
+                    # sklearn's message prints the RAW cd_fast gap, whereas the
+                    # stored `dual_gap_` is `raw / n_samples`
+                    # (`_coordinate_descent.py:709`), so re-scale for the message.
+                    _warn_convergence(dual_gap_j * X.shape[0], tol_scaled_j)
             n_targets = y.shape[1]
             if n_targets == 1:
                 # Collapse coef_/n_iter_/dual_gap_ for the single target
@@ -290,6 +321,18 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.intercept_ = float(self._rs.intercept_)
         self.n_iter_ = int(self._rs.n_iter_)
         self.dual_gap_ = float(self._rs.dual_gap_)
+        # ConvergenceWarning when the CD loop hit `max_iter` without the duality
+        # gap reaching the scaled tolerance, matching sklearn (`_cd_fast.pyx:
+        # 256-269`). `tol_scaled = tol * ||yc||^2` with `yc` the centered target
+        # the CD operates on (`y - y.mean()` when `fit_intercept`, else `y`),
+        # mirroring `_coordinate_descent.py` `tol *= np.dot(y, y)` on the
+        # already-centered target (#2127).
+        if self.n_iter_ >= self.max_iter:
+            yc = y - y.mean() if self.fit_intercept else y
+            tol_scaled = self.tol * float(np.dot(yc, yc))
+            # sklearn's message prints the RAW cd_fast gap; the stored `dual_gap_`
+            # is `raw / n_samples` (`_coordinate_descent.py:709`), so re-scale.
+            _warn_convergence(self.dual_gap_ * X.shape[0], tol_scaled)
         return self
 
     def predict(self, X):
@@ -382,9 +425,21 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
                 intercept_list.append(float(rs_j.intercept_))
-                n_iter_list.append(int(rs_j.n_iter_))
-                dual_gap_list.append(float(rs_j.dual_gap_))
+                n_iter_j = int(rs_j.n_iter_)
+                dual_gap_j = float(rs_j.dual_gap_)
+                n_iter_list.append(n_iter_j)
+                dual_gap_list.append(dual_gap_j)
                 self._rs_list.append(rs_j)
+                # Per-target ConvergenceWarning: sklearn's CD loop warns once per
+                # non-converged target (`_cd_fast.pyx:256-269`), driven here by the
+                # real per-target `n_iter_` hitting `max_iter` (#2127).
+                if n_iter_j >= self.max_iter:
+                    yc_j = y[:, j] - y[:, j].mean() if self.fit_intercept else y[:, j]
+                    tol_scaled_j = self.tol * float(np.dot(yc_j, yc_j))
+                    # sklearn's message prints the RAW cd_fast gap, whereas the
+                    # stored `dual_gap_` is `raw / n_samples`
+                    # (`_coordinate_descent.py:709`), so re-scale for the message.
+                    _warn_convergence(dual_gap_j * X.shape[0], tol_scaled_j)
             n_targets = y.shape[1]
             if n_targets == 1:
                 # Collapse coef_/n_iter_/dual_gap_ for the single target
@@ -418,6 +473,18 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.intercept_ = float(self._rs.intercept_)
         self.n_iter_ = int(self._rs.n_iter_)
         self.dual_gap_ = float(self._rs.dual_gap_)
+        # ConvergenceWarning when the CD loop hit `max_iter` without the duality
+        # gap reaching the scaled tolerance, matching sklearn (`_cd_fast.pyx:
+        # 256-269`). `tol_scaled = tol * ||yc||^2` with `yc` the centered target
+        # the CD operates on (`y - y.mean()` when `fit_intercept`, else `y`),
+        # mirroring `_coordinate_descent.py` `tol *= np.dot(y, y)` on the
+        # already-centered target (#2127).
+        if self.n_iter_ >= self.max_iter:
+            yc = y - y.mean() if self.fit_intercept else y
+            tol_scaled = self.tol * float(np.dot(yc, yc))
+            # sklearn's message prints the RAW cd_fast gap; the stored `dual_gap_`
+            # is `raw / n_samples` (`_coordinate_descent.py:709`), so re-scale.
+            _warn_convergence(self.dual_gap_ * X.shape[0], tol_scaled)
         return self
 
     def predict(self, X):
