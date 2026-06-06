@@ -678,3 +678,97 @@ fn csc_power_matches_scipy() -> Result<(), FerroError> {
     assert_eq!(p3.data(), &[8.0, -27.0]);
     Ok(())
 }
+
+// REQ-MISSING-INDEX (maintenance: argmax/argmin) — live scipy oracle (R-CHAR-3).
+// argmax/argmin (axis=None) return the flattened C-order (row-major) index
+// `r*n_cols+c` of the extreme element over ALL positions (stored values AND
+// implicit zeros), with ties broken to the smallest flat index. Expected values
+// from `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,5,0],[4,0,3]]))
+//   print(A.argmax(), A.argmin())                          # 4 1
+//   B=sp.csc_matrix(np.array([[-1.,-2],[-3,-4]]))
+//   print(B.argmax(), B.argmin())                          # 0 3
+//   C=sp.csc_matrix(np.array([[-1.,0],[-3,-4]]))
+//   print(C.argmax(), C.argmin())                          # 1 3
+//   Z=sp.csc_matrix(np.zeros((2,3)))
+//   print(Z.argmax(), Z.argmin())                          # 0 0
+//   T=sp.csc_matrix(np.array([[5.,5],[1,5]]))
+//   print(T.argmax())                                      # 0
+//   P=sp.csc_matrix(np.array([[2.,0,2]]))
+//   print(P.argmax(), P.argmin())"`                        # 0 1
+
+/// REQ-MISSING-INDEX (maintenance). `argmax`/`argmin` (axis=None) return the
+/// C-order flat index of the extreme element, implicit zeros participating,
+/// matching scipy `csc_matrix.argmax()`/`.argmin()`.
+///
+/// Oracle: A = [[1,0,2],[0,5,0],[4,0,3]];
+/// `A.argmax() == 4` (the 5 at (1,1)), `A.argmin() == 1` (implicit zero at (0,1)).
+#[test]
+fn csc_argmax_matches_scipy() -> Result<(), FerroError> {
+    let dense = array![[1.0_f64, 0.0, 2.0], [0.0, 5.0, 0.0], [4.0, 0.0, 3.0]];
+    let a = CscMatrix::from_dense(&dense.view(), 0.0);
+    assert_eq!(a.argmax()?, 4);
+    assert_eq!(a.argmin()?, 1);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). For a fully dense all-negative matrix, no
+/// implicit zero exists, so the extremes are stored values.
+///
+/// Oracle: B = [[-1,-2],[-3,-4]] (fully dense);
+/// `B.argmax() == 0` (the -1 at (0,0)), `B.argmin() == 3` (the -4 at (1,1)).
+#[test]
+fn csc_argmin_dense_all_negative() -> Result<(), FerroError> {
+    let dense = array![[-1.0_f64, -2.0], [-3.0, -4.0]];
+    let b = CscMatrix::from_dense(&dense.view(), 0.0);
+    assert_eq!(b.argmax()?, 0);
+    assert_eq!(b.argmin()?, 3);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). An implicit zero participates and can be the
+/// maximum when every stored value is negative.
+///
+/// Oracle: C = [[-1,0],[-3,-4]];
+/// `C.argmax() == 1` (the zero at (0,1) beats all negatives), `C.argmin() == 3`.
+#[test]
+fn csc_argmax_implicit_zero() -> Result<(), FerroError> {
+    let dense = array![[-1.0_f64, 0.0], [-3.0, -4.0]];
+    let c = CscMatrix::from_dense(&dense.view(), 0.0);
+    assert_eq!(c.argmax()?, 1);
+    assert_eq!(c.argmin()?, 3);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). An all-implicit-zeros matrix returns flat
+/// index 0 for both argmax and argmin (the first position, tie to smallest).
+///
+/// Oracle: Z = zeros((2,3)); `Z.argmax() == 0`, `Z.argmin() == 0`.
+#[test]
+fn csc_argmax_all_zero() -> Result<(), FerroError> {
+    let dense = array![[0.0_f64, 0.0, 0.0], [0.0, 0.0, 0.0]];
+    let z = CscMatrix::from_dense(&dense.view(), 0.0);
+    assert_eq!(z.nnz(), 0);
+    assert_eq!(z.argmax()?, 0);
+    assert_eq!(z.argmin()?, 0);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). Ties resolve to the EARLIEST (smallest
+/// C-order flat) index.
+///
+/// Oracle: T = [[5,5],[1,5]]; `T.argmax() == 0` (first 5 in C-order). And
+/// P = [[2,0,2]]; `P.argmax() == 0` (first 2), `P.argmin() == 1` (implicit zero).
+#[test]
+fn csc_argmax_ties_earliest() -> Result<(), FerroError> {
+    let t_dense = array![[5.0_f64, 5.0], [1.0, 5.0]];
+    let t = CscMatrix::from_dense(&t_dense.view(), 0.0);
+    assert_eq!(t.argmax()?, 0);
+
+    let p_dense = array![[2.0_f64, 0.0, 2.0]];
+    let p = CscMatrix::from_dense(&p_dense.view(), 0.0);
+    assert_eq!(p.argmax()?, 0);
+    assert_eq!(p.argmin()?, 1);
+    Ok(())
+}
