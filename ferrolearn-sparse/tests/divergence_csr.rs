@@ -656,3 +656,105 @@ fn csr_copy_preserves_structure() -> Result<(), FerroError> {
     assert_dense_eq(&a.to_dense(), &expected);
     Ok(())
 }
+
+// REQ-MISSING-INDEX (maintenance: eliminate_zeros / sum_duplicates) — live
+// scipy oracle (R-CHAR-3). Expected values from:
+//   cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csr_matrix((np.array([3.,0.,5.]),np.array([0,1,2]),np.array([0,1,2,3])),shape=(3,3))
+//   A.eliminate_zeros()
+//   print(A.nnz, A.data.tolist(), A.indices.tolist(), A.indptr.tolist(), A.toarray().tolist())
+//   B=sp.csr_matrix((np.array([3.,5.,2.,1.]),np.array([0,0,2,2]),np.array([0,2,2,4])),shape=(3,3))
+//   B.sum_duplicates()
+//   print(B.nnz, B.data.tolist(), B.indices.tolist(), B.indptr.tolist(), B.toarray().tolist())
+//   C=sp.csr_matrix((np.array([4.,-4.,7.]),np.array([0,0,1]),np.array([0,2,3])),shape=(2,2))
+//   C.sum_duplicates()
+//   print(C.nnz, C.data.tolist(), C.indices.tolist())"
+//   ->
+//   2 [3.0, 5.0] [0, 2] [0, 1, 1, 2] [[3.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,5.0]]
+//   2 [8.0, 3.0] [0, 2] [0, 1, 1, 2] [[8.0,0.0,0.0],[0.0,0.0,0.0],[0.0,0.0,3.0]]
+//   2 [0.0, 7.0] [0, 1]
+//
+// CONSTRUCTOR LIMITATION: sprs `CsMat::try_new` (the backing of
+// `CsrMatrix::new`) rejects duplicate column indices within a row ("Indices are
+// not sorted"), and `from_coo`/`from_dense` coalesce on the way in, so a
+// CsrMatrix that actually HOLDS duplicate (row,col) entries is unconstructible
+// in this crate — CSR storage here is canonical-by-construction. The
+// eliminate_zeros input (a stored zero at a DISTINCT column) IS constructible,
+// so its test feeds the exact scipy CSR triple. The sum_duplicates tests feed
+// the scipy-canonicalized result (B/C after sum_duplicates) and assert the
+// method is the identity on canonical input with sorted columns and PRESERVED
+// zero sums — exercising the per-row BTreeMap pass-through, ordering, and
+// zero-retention contract the coalescing path guarantees.
+
+/// REQ-MISSING-INDEX (maintenance) — `eliminate_zeros` drops explicitly-stored
+/// zeros, matching scipy `csr_matrix.eliminate_zeros()`
+/// (`scipy/sparse/_compressed.py:1025`).
+#[test]
+fn csr_eliminate_zeros_matches_scipy() -> Result<(), FerroError> {
+    // scipy input CSR: data=[3,0,5], indices=[0,1,2], indptr=[0,1,2,3], (3,3).
+    // The stored zero is at column 1 (distinct), so `new` accepts it; nnz==3.
+    let m = CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![3.0_f64, 0.0, 5.0],
+    )?;
+    assert_eq!(
+        m.nnz(),
+        3,
+        "explicit stored zero present before elimination"
+    );
+
+    let e = m.eliminate_zeros()?;
+    // scipy: nnz 2, data [3,5], indices [0,2], indptr [0,1,1,2].
+    assert_eq!(e.nnz(), 2);
+    assert_eq!(e.data(), &[3.0_f64, 5.0]);
+    assert_eq!(e.indices(), &[0, 2]);
+    assert_eq!(e.indptr(), vec![0, 1, 1, 2]);
+    // scipy dense [[3,0,0],[0,0,0],[0,0,5]].
+    let d = e.to_dense();
+    let expected = [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
+    assert_dense_eq(&d, &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `sum_duplicates` yields canonical
+/// (sorted, deduplicated) CSR, matching scipy `csr_matrix.sum_duplicates()`
+/// (`scipy/sparse/_compressed.py:1063`). Input is matrix B's
+/// scipy-canonicalized form (duplicate-bearing storage is unconstructible —
+/// see the constructor-limitation note above); the method is the identity on
+/// canonical input.
+#[test]
+fn csr_sum_duplicates_matches_scipy() -> Result<(), FerroError> {
+    // scipy B after sum_duplicates: data=[8,3], indices=[0,2], indptr=[0,1,1,2].
+    let b = CsrMatrix::new(3, 3, vec![0, 1, 1, 2], vec![0, 2], vec![8.0_f64, 3.0])?;
+    let s = b.sum_duplicates()?;
+    // scipy: nnz 2, indptr [0,1,1,2], indices [0,2], data [8,3].
+    assert_eq!(s.nnz(), 2);
+    assert_eq!(s.indptr(), vec![0, 1, 1, 2]);
+    assert_eq!(s.indices(), &[0, 2]);
+    assert_eq!(s.data(), &[8.0_f64, 3.0]);
+    // scipy dense [[8,0,0],[0,0,0],[0,0,3]].
+    let expected = [[8.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 3.0]];
+    assert_dense_eq(&s.to_dense(), &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `sum_duplicates` PRESERVES a zero-sum
+/// entry (canonicalization only; dropping zeros is `eliminate_zeros`' job),
+/// matching scipy `csr_matrix.sum_duplicates()` which keeps the zero-sum
+/// position. Input is matrix C's scipy-canonicalized form.
+#[test]
+fn csr_sum_duplicates_preserves_zero_sum() -> Result<(), FerroError> {
+    // scipy C after sum_duplicates: data=[0,7], indices=[0,1], indptr=[0,2,3].
+    let c = CsrMatrix::new(2, 2, vec![0, 1, 2], vec![0, 1], vec![0.0_f64, 7.0])?;
+    assert_eq!(c.nnz(), 2, "the zero-sum (0,0) entry is stored, not absent");
+    let s = c.sum_duplicates()?;
+    // scipy: nnz 2, indices [0,1], data [0,7] — the zero at (0,0) is preserved.
+    assert_eq!(s.nnz(), 2);
+    assert_eq!(s.indices(), &[0, 1]);
+    assert_eq!(s.data(), &[0.0_f64, 7.0]);
+    Ok(())
+}

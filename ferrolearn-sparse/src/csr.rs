@@ -13,7 +13,9 @@
 //! `tests/divergence_csr.rs`.
 //!
 //! **12 SHIPPED / 2 NOT-STARTED** (REQ-MISSING-INDEX is a SPLIT: element access
-//! `get(i,j)` SHIPPED; rows/cols/maintenance ops NOT-STARTED).
+//! `get(i,j)`, rows/cols `getrow`/`getcol`, max/min, and maintenance
+//! `astype`/`copy`/`eliminate_zeros`/`sum_duplicates` SHIPPED; `sort_indices`
+//! NOT-STARTED).
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -32,10 +34,12 @@
 //! | REQ-MISSING-INDEX (rows/cols) | SHIPPED (#2004) | `getrow(i)` returns row `i` as a `(1, n_cols)` CSR (single-row case of `row_slice`, delegates to `self.row_slice(i, i + 1)`), mirroring scipy `getrow(i)` (`_matrix.py:110` → `_getrow`, `_base.py:1116`, "(1 x n) row vector"); `getcol(j)` returns column `j` as a `(n_rows, 1)` CSR via `self.transpose().getrow(j)?.transpose()`, mirroring scipy `getcol(j)` (`_matrix.py:104` → `_getcol`, `_base.py:1097`, "(m x 1) column vector"). Both bounds-check (`i >= n_rows()`/`j >= n_cols()` → `Err(FerroError::InvalidParameter)`, scipy `IndexError`, R-DEV-2). Live oracle (R-CHAR-3): `A.getrow(0).toarray()`=`[[1,0,2]]`, `A.getrow(1).toarray()`=`[[0,3,0]]`, `A.getcol(0).toarray()`=`[[1],[0],[4]]`, `A.getcol(2).toarray()`=`[[2],[0],[5]]`. Guards `csr_getrow_matches_scipy`/`csr_getcol_matches_scipy`/`csr_getrow_getcol_out_of_bounds_is_err`. |
 //! | REQ-MISSING-INDEX (max/min) | SHIPPED (#2004) | `max()`/`min()` (`T: Copy + Zero + PartialOrd`) reduce over the stored `data()` and fold an implicit `T::zero()` when not fully dense (`nnz < n_rows*n_cols`); empty → `zero`. Mirrors scipy `_minmax_mixin._min_or_max(axis=None)` (`scipy/sparse/_data.py:208`-`:224`: stored-data reduce then `min_or_max(zero, m)` for the non-dense case). Live oracle (R-CHAR-3): `csr_matrix(diag(-3,-1,-5)).max()==0`, `.min()==-5`; `csr_matrix(diag(3,1,5)).max()==5`, `.min()==0`; dense `csr_matrix([[2,7]]).max()==7`, `.min()==2`. Guards `csr_max_folds_implicit_zero`/`csr_min_folds_implicit_zero`/`csr_max_min_dense_no_implicit_zero`. Direct analog of `CooMatrix::max()/min()`. |
 //! | REQ-MISSING-INDEX (maintenance: astype/copy) | SHIPPED (#2004) | `astype<U,Fc>(cast)` (`scipy/sparse/_data.py:69`) casts every stored value to a new type `U` via a caller-supplied closure (Rust has no runtime dtype object — R-DEV-4 deviation; a plain `as`-cast closure reproduces numpy's C-cast float→int truncation toward zero), preserving the `indptr`/`indices` structure, `(n_rows,n_cols)` shape, and `nnz`; rebuilds via [`CsrMatrix::new`] from the original `indptr()`/`indices()` and the cast data (bound `T: Clone`, plus `U: Clone` as `new` requires). `copy()` (`scipy/sparse/_data.py:94`) clones preserving all structure including explicit stored zeros (delegates to `self.clone()`, `CsrMatrix` derives `Clone`; `#[must_use]`). Live oracle (R-CHAR-3): `csr_matrix([[3.7,0,0],[0,-2.9,0],[0,0,5.0]])` (`data=[3.7,-2.9,5.0]`, `indptr=[0,1,2,3]`, `indices=[0,1,2]`) → `astype(np.int64)` `data=[3,-2,5]` (truncated), dense `[[3,0,0],[0,-2,0],[0,0,5]]`; `astype(np.float32)` `data=[3.7f32,-2.9f32,5.0f32]`; `copy()` `nnz=3`, `data=[3.7,-2.9,5.0]`, dense unchanged. Guards `csr_astype_float_to_int_truncates`/`csr_astype_to_f32_preserves_structure`/`csr_copy_preserves_structure`. |
-//! | REQ-MISSING-INDEX (maintenance: remainder) | NOT-STARTED | no `eliminate_zeros`/`sort_indices`/`sum_duplicates`. Blocker #2004. |
+//! | REQ-MISSING-INDEX (maintenance: eliminate_zeros/sum_duplicates) | SHIPPED (#2004) | `eliminate_zeros()` (`T: Clone + Zero + PartialEq`) drops every explicitly-stored `0` entry and rebuilds the CSR triple per row (mirrors scipy `csr_eliminate_zeros`, `scipy/sparse/_compressed.py:1025`); `sum_duplicates()` (`T: Copy + Zero + Add`) canonicalizes by per-row `BTreeMap<col, T>` accumulation (sorted columns, sum on collision, zero sums PRESERVED — dropping zeros is `eliminate_zeros`' job), mirroring scipy `csr_sum_duplicates` (`scipy/sparse/_compressed.py:1063`). Both return a NEW matrix via [`CsrMatrix::new`] (R-DEV-4: scipy mutates in place). Live oracle (R-CHAR-3): eliminate `data=[3,0,5],indices=[0,1,2],indptr=[0,1,2,3]` → nnz 2, `data=[3,5]`, `indices=[0,2]`, `indptr=[0,1,1,2]`; sum_duplicates B `data=[3,5,2,1],indices=[0,0,2,2],indptr=[0,2,2,4]` → nnz 2, `data=[8,3]`, `indices=[0,2]`, `indptr=[0,1,1,2]`; C zero-sum `data=[4,-4,7],indices=[0,0,1],indptr=[0,2,3]` → `data=[0,7]`, `indices=[0,1]`. Guards `csr_eliminate_zeros_matches_scipy`/`csr_sum_duplicates_matches_scipy`/`csr_sum_duplicates_preserves_zero_sum`. NOTE: sprs `CsMat::try_new` rejects duplicate column indices within a row (canonical-by-construction), so a duplicate-bearing `CsrMatrix` is unconstructible via `new`/`from_coo`; `sum_duplicates`' coalescing is a scipy-parity API exercised here against canonical inputs (idempotent — already-canonical pass-through, zero sums preserved). |
+//! | REQ-MISSING-INDEX (maintenance: sort_indices) | NOT-STARTED | no `sort_indices` (sprs CSR is sorted-by-construction). Blocker #2004. |
 //! | REQ-API-ACCESSORS | SHIPPED (#2005) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSR `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSR column indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (row pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,2,3,4,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`. Guard `csr_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSR analog (R-SUBSTRATE-1). Blocker #2006. |
 
+use std::collections::BTreeMap;
 use std::ops::{Add, AddAssign, Mul, MulAssign};
 
 use ferrolearn_core::{Dataset, FerroError};
@@ -639,6 +643,119 @@ where
     #[must_use]
     pub fn copy(&self) -> CsrMatrix<T> {
         self.clone()
+    }
+
+    /// Return a new CSR matrix with all explicitly-stored zero entries removed.
+    ///
+    /// Mirrors scipy `csr_matrix.eliminate_zeros()`
+    /// (`scipy/sparse/_compressed.py:1025` — `csr_eliminate_zeros(...)` then
+    /// `self.prune()`), which drops every stored entry whose value equals `0`
+    /// and rebuilds the CSR `(data, indices, indptr)` triple. Walks each row
+    /// `r` over its stored slice `indptr[r]..indptr[r+1]` and keeps the
+    /// `(col, val)` pair only when `val != 0`, accumulating the kept count into a
+    /// fresh `indptr2`. Within-row column order is preserved (scipy keeps the
+    /// existing sorted order), so the result stays canonical.
+    ///
+    /// **Deviation (R-DEV-4):** scipy mutates in place; ferrolearn returns a NEW
+    /// matrix (functional style, consistent with the other `CsrMatrix` methods).
+    ///
+    /// Live oracle (R-CHAR-3): for CSR `data=[3,0,5]`, `indices=[0,1,2]`,
+    /// `indptr=[0,1,2,3]`, shape `(3,3)`, `eliminate_zeros()` yields `nnz == 2`,
+    /// `data == [3, 5]`, `indices == [0, 2]`, `indptr == [0, 1, 1, 2]`, dense
+    /// `[[3,0,0],[0,0,0],[0,0,5]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CsrMatrix` (filtering keeps every kept index in
+    /// bounds of the unchanged shape and preserves sorted within-row order).
+    pub fn eliminate_zeros(&self) -> Result<CsrMatrix<T>, FerroError>
+    where
+        T: Clone + Zero + PartialEq,
+    {
+        let zero = T::zero();
+        let indptr = self.indptr();
+        let indices = self.indices();
+        let data = self.data();
+        let n_rows = self.n_rows();
+
+        let mut indptr2 = Vec::with_capacity(n_rows + 1);
+        let mut indices2 = Vec::new();
+        let mut data2 = Vec::new();
+        indptr2.push(0usize);
+        for r in 0..n_rows {
+            for k in indptr[r]..indptr[r + 1] {
+                if data[k] != zero {
+                    indices2.push(indices[k]);
+                    data2.push(data[k].clone());
+                }
+            }
+            indptr2.push(data2.len());
+        }
+        Self::new(n_rows, self.n_cols(), indptr2, indices2, data2)
+    }
+
+    /// Return a new CSR matrix in canonical form, summing duplicate
+    /// `(row, col)` entries.
+    ///
+    /// Mirrors scipy `csr_matrix.sum_duplicates()`
+    /// (`scipy/sparse/_compressed.py:1063` — `sort_indices()` then
+    /// `csr_sum_duplicates(...)` then `self.prune()`), which sorts each row's
+    /// column indices and adds together any entries that share the same
+    /// `(row, col)` position. For each row `r`, the stored slice
+    /// `indptr[r]..indptr[r+1]` is accumulated into a
+    /// [`BTreeMap<usize, T>`](std::collections::BTreeMap) keyed by column, summing
+    /// on collision; the `BTreeMap` yields columns in sorted order, giving scipy's
+    /// canonical `(sorted indices, no duplicates)` form. **Every** accumulated
+    /// entry is kept — including positions whose duplicates sum to `0` — because
+    /// canonicalization is the only job here; dropping zeros is
+    /// [`eliminate_zeros`](Self::eliminate_zeros)' responsibility (scipy's
+    /// `sum_duplicates` likewise keeps zero sums and only `prune`s the
+    /// allocation).
+    ///
+    /// **Deviation (R-DEV-4):** scipy mutates in place; ferrolearn returns a NEW
+    /// matrix (functional style, consistent with the other `CsrMatrix` methods).
+    ///
+    /// Live oracle (R-CHAR-3): for CSR `data=[3,5,2,1]`, `indices=[0,0,2,2]`,
+    /// `indptr=[0,2,2,4]`, shape `(3,3)` (row 0 has col 0 twice `{3,5}`, row 2
+    /// has col 2 twice `{2,1}`), `sum_duplicates()` yields `nnz == 2`,
+    /// `indptr == [0,1,1,2]`, `indices == [0,2]`, `data == [8,3]`; for
+    /// `data=[4,-4,7]`, `indices=[0,0,1]`, `indptr=[0,2,3]`, shape `(2,2)`
+    /// (row 0 has col 0 twice `{4,-4}`), it yields `nnz == 2`, `indices == [0,1]`,
+    /// `data == [0,7]` — the zero-sum `(0,0)` entry is **preserved**.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CsrMatrix` (the accumulated columns stay in bounds
+    /// of the unchanged shape and `BTreeMap` ordering keeps within-row indices
+    /// sorted).
+    pub fn sum_duplicates(&self) -> Result<CsrMatrix<T>, FerroError>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let indptr = self.indptr();
+        let indices = self.indices();
+        let data = self.data();
+        let n_rows = self.n_rows();
+
+        let mut indptr2 = Vec::with_capacity(n_rows + 1);
+        let mut indices2 = Vec::new();
+        let mut data2 = Vec::new();
+        indptr2.push(0usize);
+        for r in 0..n_rows {
+            let mut acc: BTreeMap<usize, T> = BTreeMap::new();
+            for k in indptr[r]..indptr[r + 1] {
+                let entry = acc.entry(indices[k]).or_insert_with(T::zero);
+                *entry = *entry + data[k];
+            }
+            for (col, val) in acc {
+                indices2.push(col);
+                data2.push(val);
+            }
+            indptr2.push(data2.len());
+        }
+        Self::new(n_rows, self.n_cols(), indptr2, indices2, data2)
     }
 }
 
