@@ -705,3 +705,83 @@ fn coo_dot_nonsquare_matches_scipy() -> Result<(), FerroError> {
     }
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`multiply`). COO element-wise (Hadamard) product,
+/// mirroring scipy `coo_matrix.multiply` (`scipy/sparse/_base.py:490` → `_elmul_`):
+/// COO has no native element-wise multiply, so scipy routes through `tocsr()` and
+/// returns a **CSR** result (arithmetic defaults to CSR, `_base.py:484`).
+/// `multiply()` delegates `self.to_csr()?.multiply(&rhs.to_csr()?)`, so its result
+/// is a `CsrMatrix`; the dense form is compared. Only positions stored (non-zero)
+/// in BOTH operands survive (INTERSECTION sparsity).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([1.,2.,3.]),(np.array([0,0,1]),np.array([0,1,1]))),
+///     shape=(2,2));
+///   B=sp.coo_matrix((np.array([4.,5.,6.]),(np.array([0,1,1]),np.array([0,0,1]))),
+///     shape=(2,2));
+///   print(A.multiply(B).toarray().tolist())"`): `[[4.0, 0.0], [0.0, 18.0]]`.
+/// A=[[1,2],[0,3]], B=[[4,0],[5,6]]; overlaps (0,0)=1*4=4 and (1,1)=3*6=18.
+#[test]
+fn coo_multiply_hadamard_matches_scipy() -> Result<(), FerroError> {
+    // A = [[1,2],[0,3]]
+    let a =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 0, 1], vec![0, 1, 1], vec![1.0, 2.0, 3.0])?;
+    // B = [[4,0],[5,6]]
+    let b =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 1, 1], vec![0, 0, 1], vec![4.0, 5.0, 6.0])?;
+
+    let c = a.multiply(&b)?;
+    // scipy A.multiply(B).toarray() == [[4,0],[0,18]]
+    let expected = [[4.0, 0.0], [0.0, 18.0]];
+    let d = c.to_dense();
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "multiply mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`multiply`). Partial-overlap operands: the off-diagonal
+/// positions overlap and the diagonal positions do not, exercising the
+/// INTERSECTION sparsity of scipy `coo_matrix.multiply` (`scipy/sparse/_base.py:490`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   D=sp.coo_matrix((np.array([2.,3.,4.]),(np.array([0,0,1]),np.array([0,1,0]))),
+///     shape=(2,2));
+///   E=sp.coo_matrix((np.array([5.,6.,7.]),(np.array([0,1,1]),np.array([1,0,1]))),
+///     shape=(2,2));
+///   print(D.multiply(E).toarray().tolist())"`): `[[0.0, 15.0], [24.0, 0.0]]`.
+/// D=[[2,3],[4,0]], E=[[0,5],[6,7]]; overlaps (0,1)=3*5=15 and (1,0)=4*6=24.
+#[test]
+fn coo_multiply_partial_overlap_matches_scipy() -> Result<(), FerroError> {
+    // D = [[2,3],[4,0]]
+    let d_coo =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 0, 1], vec![0, 1, 0], vec![2.0, 3.0, 4.0])?;
+    // E = [[0,5],[6,7]]
+    let e_coo =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 1, 1], vec![1, 0, 1], vec![5.0, 6.0, 7.0])?;
+
+    let c = d_coo.multiply(&e_coo)?;
+    // scipy D.multiply(E).toarray() == [[0,15],[24,0]]
+    let expected = [[0.0, 15.0], [24.0, 0.0]];
+    let dense = c.to_dense();
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(
+                dense[[r, col]],
+                expected[r][col],
+                "multiply partial-overlap mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
