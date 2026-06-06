@@ -392,3 +392,51 @@ fn csr_shape_data_indices_indptr_match_scipy() {
     // scipy A.indptr == [0,2,3,5] (row pointers, length n_rows+1)
     assert_eq!(a.indptr(), vec![0, 2, 3, 5]);
 }
+
+/// REQ-MISSING-INDEX (element access). `get(i, j)` returns the scalar `A[i, j]`
+/// stored value, matching scipy `A[i, j]` (`IndexMixin.__getitem__` ->
+/// `_get_intXint`, `_index.py:29`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+///   print(A[1,1], A[0,0], A[0,2], A[2,0])"`): `3.0 1.0 2.0 4.0`.
+#[test]
+fn csr_get_element_matches_scipy() {
+    let a = sample_a();
+    assert_eq!(a.get(1, 1).unwrap(), 3.0);
+    assert_eq!(a.get(0, 0).unwrap(), 1.0);
+    assert_eq!(a.get(0, 2).unwrap(), 2.0);
+    assert_eq!(a.get(2, 0).unwrap(), 4.0);
+}
+
+/// REQ-MISSING-INDEX (element access). `get(i, j)` at a structurally absent
+/// position returns `0`, matching scipy `A[0, 1]`.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]])); print(A[0,1])"`):
+/// `0.0`.
+#[test]
+fn csr_get_absent_is_zero() {
+    let a = sample_a();
+    assert_eq!(a.get(0, 1).unwrap(), 0.0);
+}
+
+/// REQ-MISSING-INDEX (element access) / REQ-ERR. An out-of-bounds index returns
+/// `Err(InvalidParameter)`, where scipy raises `IndexError: index (...) out of
+/// range` (`_index.py:388`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]])); A[3,0]"`):
+/// `IndexError: index (3) out of range`.
+#[test]
+fn csr_get_out_of_bounds_is_err() {
+    let a = sample_a();
+    assert!(matches!(
+        a.get(3, 0),
+        Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+    ));
+    assert!(matches!(
+        a.get(0, 3),
+        Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+    ));
+}
