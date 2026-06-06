@@ -13,7 +13,8 @@
 //! concrete blocker). Behavior is oracle-verified vs the live scipy (R-CHAR-3) —
 //! see `tests/divergence_coo.rs`.
 //!
-//! **6 SHIPPED / 2 NOT-STARTED.**
+//! **6 SHIPPED / 2 NOT-STARTED** (REQ-MISSING-METHODS is a SPLIT: conversion +
+//! transpose `to_csr`/`to_csc`/`transpose` SHIPPED; the rest NOT-STARTED).
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -23,13 +24,18 @@
 //! | REQ-ERR (construction validation) | SHIPPED | `from_triplets`/`push` return `Err(FerroError)` on out-of-bounds index / mismatched lengths, at the same point scipy raises `ValueError`. Guards `coo_from_triplets_*_is_err`/`coo_push_out_of_bounds_is_err`. |
 //! | REQ-CONSUMER (production consumer) | SHIPPED | consumed in-crate by `csr.rs`/`csc.rs` (COO→CSR/CSC conversion) and `helpers.rs` (`eye`/`diags`/`hstack`/`vstack` build via COO) — real non-test callers (S5 crate boundary). |
 //! | REQ-API-ACCESSORS (shape/data/row/col) | SHIPPED (#1996) | first-class `shape()`/`data()`/`row()`/`col()` accessors mirror scipy `.shape` (`_coo.py:32`/`:39` ctor tuple) and `.data`/`.row`/`.col` (`_coo.py:64`/`:106`/`:122`), the COO `(data, (row, col))` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `row()` → `&[usize]` (`inner.row_inds()`); `col()` → `&[usize]` (`inner.col_inds()`) — all borrow `&self` (sprs `TriMat` accessors return slices). Live oracle (R-CHAR-3): `coo_matrix(([3,5,2],([0,2,1],[0,1,2])),shape=(3,3))` → `shape=(3,3)`, `data=[3,5,2]`, `row=[0,2,1]`, `col=[0,1,2]` (insertion order preserved). Guard `coo_shape_data_row_col_match_scipy`. |
-//! | REQ-MISSING-METHODS (COO methods) | NOT-STARTED | no `.tocsr`/`.tocsc`/`.transpose`/`.sum`/`.diagonal`/`.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.astype`/`.copy` as `CooMatrix` methods. Blocker #1997. |
+//! | REQ-MISSING-METHODS (COO methods) | SHIPPED (#1997) | conversion + transpose: `to_csr()`/`to_csc()` delegate to `CsrMatrix::from_coo`/`CscMatrix::from_coo` (both summing duplicate `(row,col)` entries), mirroring scipy `coo_matrix.tocsr` (`_coo.py:349`)/`tocsc` (`_coo.py:316`); `transpose()` swaps the row/col index arrays and the `(M,N)` shape to `(n_cols,n_rows)`, mirroring scipy `coo_matrix.transpose`/`.T` with `axes=(1,0)` (`_coo.py:229` — `permuted_coords`/`permuted_shape`). Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` → `tocsr/tocsc.toarray()`=`[[3,0,0],[0,0,2],[0,5,0]]`, `transpose.toarray()`=`[[3,0,0],[0,0,5],[0,2,0]]` (shape `(3,3)`); non-square `from_triplets(2,3,[0,1],[2,0],[7,9])` → `transpose.toarray()`=`[[0,9],[0,0],[7,0]]` (shape `(3,2)`). Guards `coo_to_csr_matches_scipy`/`coo_to_csc_matches_scipy`/`coo_transpose_matches_scipy`/`coo_transpose_non_square`. Sub-note: `.sum`/`.diagonal`/`.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.power`/`.max`/`.min`/`.astype`/`.copy` remain NOT-STARTED. |
 //! | REQ-FERRAY (ferray sparse substrate) | NOT-STARTED | `sprs::TriMat` + `ndarray` vs ferray's sparse COO analog (R-SUBSTRATE-1; ferray has no sparse layer yet). Blocker #1998. |
+
+use std::ops::Add;
 
 use ferrolearn_core::FerroError;
 use ndarray::Array2;
 use num_traits::Zero;
 use sprs::{SpIndex, TriMat};
+
+use crate::csc::CscMatrix;
+use crate::csr::CsrMatrix;
 
 /// Coordinate-format (COO / triplet) sparse matrix.
 ///
@@ -249,9 +255,74 @@ where
     }
 }
 
+impl<T> CooMatrix<T>
+where
+    T: Clone + Add<Output = T> + 'static,
+{
+    /// Convert this COO matrix to [`CsrMatrix`] (Compressed Sparse Row) format.
+    ///
+    /// Mirrors scipy `coo_matrix.tocsr()` (`scipy/sparse/_coo.py:349`), which
+    /// builds the CSR `(data, indices, indptr)` triple and **sums duplicate**
+    /// `(row, col)` entries (`tocsr` calls `sum_duplicates` for a non-canonical
+    /// matrix). Delegates to [`CsrMatrix::from_coo`], which performs the same
+    /// duplicate-summing conversion via the sprs `TriMat::to_csr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] only if the conversion fails; it is infallible for
+    /// any structurally valid `CooMatrix`.
+    pub fn to_csr(&self) -> Result<CsrMatrix<T>, FerroError> {
+        CsrMatrix::from_coo(self)
+    }
+
+    /// Convert this COO matrix to [`CscMatrix`] (Compressed Sparse Column) format.
+    ///
+    /// Mirrors scipy `coo_matrix.tocsc()` (`scipy/sparse/_coo.py:316`), which
+    /// builds the CSC `(data, indices, indptr)` triple and **sums duplicate**
+    /// `(row, col)` entries (`tocsc` calls `sum_duplicates` for a non-canonical
+    /// matrix). Delegates to [`CscMatrix::from_coo`], which performs the same
+    /// duplicate-summing conversion via the sprs `TriMat::to_csc`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] only if the conversion fails; it is infallible for
+    /// any structurally valid `CooMatrix`.
+    pub fn to_csc(&self) -> Result<CscMatrix<T>, FerroError> {
+        CscMatrix::from_coo(self)
+    }
+
+    /// Transpose: returns a new `(n_cols, n_rows)` COO matrix whose dense form is
+    /// `Aᵀ`.
+    ///
+    /// Mirrors scipy `coo_matrix.transpose()` / `.T` (`scipy/sparse/_coo.py:229`),
+    /// which for a 2-D matrix permutes the coordinate arrays and shape with
+    /// `axes=(1, 0)` (`permuted_coords = tuple(self.coords[i] for i in axes)`,
+    /// `permuted_shape = tuple(self._shape[i] for i in axes)`) — i.e. it swaps the
+    /// row and column index arrays and the `(M, N)` shape, keeping `data`
+    /// unchanged. Here the new row indices are the old column indices, the new
+    /// column indices are the old row indices, and the shape becomes
+    /// `(n_cols, n_rows)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`from_triplets`](Self::from_triplets);
+    /// infallible for any structurally valid `CooMatrix` (the swapped indices stay
+    /// in bounds of the swapped shape).
+    pub fn transpose(&self) -> Result<CooMatrix<T>, FerroError> {
+        Self::from_triplets(
+            self.n_cols(),
+            self.n_rows(),
+            self.col().to_vec(),
+            self.row().to_vec(),
+            self.data().to_vec(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::array;
 
     #[test]
     fn test_coo_new() {
@@ -316,5 +387,69 @@ mod tests {
         assert_eq!(m2.nnz(), 1);
         assert_eq!(m2.n_rows(), 2);
         assert_eq!(m2.n_cols(), 2);
+    }
+
+    // REQ-MISSING-METHODS (conversion + transpose) — live scipy oracle (R-CHAR-3).
+    // Expected values from `cd /tmp && python3 -c "import numpy as np,
+    //   scipy.sparse as sp;
+    //   m=sp.coo_matrix((np.array([3.,5.,2.]),(np.array([0,2,1]),
+    //     np.array([0,1,2]))),shape=(3,3));
+    //   print(m.tocsr().toarray().tolist(), m.tocsc().toarray().tolist(),
+    //         m.transpose().toarray().tolist())"`
+    //   -> [[3,0,0],[0,0,2],[0,5,0]] (csr) [[3,0,0],[0,0,2],[0,5,0]] (csc)
+    //      [[3,0,0],[0,0,5],[0,2,0]] (transpose)
+    // and non-square `sp.coo_matrix((np.array([7.,9.]),(np.array([0,1]),
+    //   np.array([2,0]))),shape=(2,3)).transpose().toarray().tolist()`
+    //   -> [[0,9],[0,0],[7,0]] (shape (3,2)).
+
+    fn sample_coo() -> Result<CooMatrix<f64>, FerroError> {
+        // [[3,0,0],[0,0,2],[0,5,0]]
+        CooMatrix::from_triplets(3, 3, vec![0, 2, 1], vec![0, 1, 2], vec![3.0, 5.0, 2.0])
+    }
+
+    #[test]
+    fn coo_to_csr_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        let csr = m.to_csr()?;
+        assert_eq!(
+            csr.to_dense(),
+            array![[3.0, 0.0, 0.0], [0.0, 0.0, 2.0], [0.0, 5.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coo_to_csc_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        let csc = m.to_csc()?;
+        assert_eq!(
+            csc.to_dense(),
+            array![[3.0, 0.0, 0.0], [0.0, 0.0, 2.0], [0.0, 5.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coo_transpose_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        let t = m.transpose()?;
+        assert_eq!(t.n_rows(), 3);
+        assert_eq!(t.n_cols(), 3);
+        assert_eq!(
+            t.to_dense(),
+            array![[3.0, 0.0, 0.0], [0.0, 0.0, 5.0], [0.0, 2.0, 0.0]]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coo_transpose_non_square() -> Result<(), FerroError> {
+        // [[0,0,7],[9,0,0]] (shape (2,3)); transpose -> [[0,9],[0,0],[7,0]] (3,2)
+        let m = CooMatrix::from_triplets(2, 3, vec![0, 1], vec![2, 0], vec![7.0, 9.0])?;
+        let t = m.transpose()?;
+        assert_eq!(t.n_rows(), 3);
+        assert_eq!(t.n_cols(), 2);
+        assert_eq!(t.to_dense(), array![[0.0, 9.0], [0.0, 0.0], [7.0, 0.0]]);
+        Ok(())
     }
 }
