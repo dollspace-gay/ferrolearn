@@ -153,6 +153,16 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
         # log(predict_proba) (sklearn/linear_model/_logistic.py).
         return np.log(self.predict_proba(X))
 
+    def decision_function(self, X):
+        # sklearn LogisticRegression.decision_function = X @ coef_.T + intercept_
+        # (confidence scores; binary case raveled to 1-D)
+        # (sklearn/linear_model/_base.py LinearClassifierMixin.decision_function).
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False, dtype="float64")
+        X = _ensure_f64(X)
+        scores = X @ self.coef_.T + self.intercept_
+        return scores.ravel() if scores.shape[1] == 1 else scores
+
 
 class DecisionTreeClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
     """Decision Tree Classifier backed by Rust.

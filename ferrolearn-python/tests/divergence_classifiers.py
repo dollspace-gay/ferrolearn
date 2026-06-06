@@ -322,3 +322,37 @@ def test_classifiers_predict_log_proba():
         assert np.allclose(
             fd.predict_log_proba(q), sd.predict_log_proba(q), atol=1e-6, equal_nan=True
         )
+
+
+def test_logreg_decision_function():
+    """REQ #2094: ferrolearn.LogisticRegression exposes `decision_function`
+    = X @ coef_.T + intercept_ (binary -> 1-D), matching sklearn
+    `LinearClassifierMixin.decision_function`.
+
+    Verified by: (a) the contract `decision_function == X @ coef_.T + intercept_`;
+    (b) the predict relationship `predict == classes_[(df > 0).astype(int)]`;
+    (c) value parity with sklearn within the pre-existing LR solver-precision gap.
+    """
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    Xl = np.array(
+        [[1.0, 2.0], [1.2, 1.9], [2.0, 2.5], [5.0, 5.0], [5.1, 4.8], [4.8, 5.2]]
+    )
+    yl = np.array([0, 0, 0, 1, 1, 1])
+    q = np.array([[1.5, 2.0], [5.0, 5.0], [3.0, 3.5]])
+
+    fm = ferrolearn.LogisticRegression().fit(Xl, yl)
+    df = fm.decision_function(q)
+    assert df.shape == (3,)  # binary -> 1-D
+
+    # (a) contract
+    expected = (q @ np.asarray(fm.coef_).T + np.asarray(fm.intercept_)).ravel()
+    assert np.allclose(df, expected)
+
+    # (b) predict relationship: positive score -> class index 1
+    pred = fm.predict(q)
+    assert np.array_equal(pred, fm.classes_[(df > 0).astype(int)])
+
+    # (c) value parity with sklearn (within solver gap)
+    sm = SkLR().fit(Xl, yl)
+    assert np.allclose(df, sm.decision_function(q), atol=1e-2)
