@@ -351,3 +351,56 @@ def test_red_standardscaler_var_constant_column_matches_oracle():
     assert sk_m.scale_[1] == 1.0
     assert sk_m.scale_[1] ** 2 == 1.0  # the value the old buggy var_[1] held
     assert fl_m.var_[1] != sk_m.scale_[1] ** 2  # fixed: 0.0 != 1.0
+
+
+# ---------------------------------------------------------------------------
+# StandardScaler.scale_ on a CONSTANT (zero-variance) column (unit #2087).
+#
+# The `scale_` getter previously marshalled `FittedStandardScaler::std()` (the
+# RAW std), which is 0.0 on a constant column, instead of `scale()` (the
+# `_handle_zeros_in_scale`-clamped value, 1.0 there — what sklearn exposes as
+# `scale_`). sklearn computes `scale_ = _handle_zeros_in_scale(sqrt(var_))`
+# (`sklearn/preprocessing/_data.py:1019-1020`, helper `:88`), clamping the
+# constant column to 1.0 to avoid division by zero. The fix reads the binding's
+# `scale()` getter (`FittedStandardScaler::scale()`, downstream REQ-5 #1192).
+#
+# Oracle (sklearn 1.5.2), X=[[1,5],[2,5],[3,5]] (column 1 constant):
+#   scale_     == [0.816496580927726, 1.0]
+#   raw std    == [0.816496580927726, 0.0]  (the old buggy scale_[1])
+#   transform(X) column 1 all 0.0
+# ---------------------------------------------------------------------------
+
+
+def test_red_standardscaler_scale_constant_column_matches_oracle():
+    """scale_ matches sklearn on a constant column (1.0), not the raw std (0.0).
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn. The previous wrapper read
+    `FittedStandardScaler::std()`; on the constant column the raw std is 0.0,
+    diverging from sklearn's `_handle_zeros_in_scale`-clamped `scale_=1.0`.
+    """
+    fl_m = fl.StandardScaler().fit(_XCONST)
+    sk_m = SkStandardScaler().fit(_XCONST)
+
+    # scale_ matches the live oracle element-wise (tight: it is a deterministic
+    # _handle_zeros_in_scale(sqrt(population variance)) value).
+    np.testing.assert_allclose(fl_m.scale_, sk_m.scale_, rtol=1e-12)
+
+    # The constant column's scale is clamped to exactly 1.0 — NOT the old buggy
+    # raw std of 0.0. The oracle confirms 1.0; ferrolearn now matches.
+    assert sk_m.scale_[1] == 1.0
+    assert fl_m.scale_[1] == 1.0
+
+    # Prove this is the clamped-scale path, not the old raw-std path: sklearn's
+    # raw std on the constant column is 0.0 (the value the OLD buggy getter
+    # returned), so the fixed scale_ must differ from it there.
+    assert np.sqrt(sk_m.var_[1]) == 0.0  # the value the old buggy scale_[1] held
+    assert fl_m.scale_[1] != np.sqrt(sk_m.var_[1])  # fixed: 1.0 != 0.0
+
+    # The change does not perturb transform: the constant column still maps to
+    # 0.0 in both ferrolearn and sklearn (centered then divided by 1.0).
+    np.testing.assert_allclose(
+        fl_m.transform(_XCONST), sk_m.transform(_XCONST), rtol=1e-12, atol=1e-12
+    )
+    assert np.all(sk_m.transform(_XCONST)[:, 1] == 0.0)
+    assert np.all(fl_m.transform(_XCONST)[:, 1] == 0.0)
