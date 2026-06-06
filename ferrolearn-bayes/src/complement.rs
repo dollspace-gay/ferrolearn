@@ -79,7 +79,8 @@
 //! | REQ-6 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedComplementNB::partial_fit` accumulates `class_counts` / `feature_counts` for each EXISTING class, then re-derives `total_feature_counts` (the `feature_all_` analog) / `total_all` and recomputes `weights` (same `-log` complement smoothing), re-applying `apply_norm_inplace` when `norm`, mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-recompute (`naive_bayes.py:628-709`, `_count` re-deriving `feature_all_` → `_update_feature_log_prob`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: in-tree `test_complement_nb_partial_fit` / `test_complement_nb_partial_fit_shape_mismatch` — chunked `partial_fit` over already-fitted classes reproduces the accumulate-then-recompute path (sklearn two-chunk `partial_fit` == `fit` on the whole, `np.allclose == True`). KNOWN GAP: `partial_fit` has NO `classes=` argument — it loops only over the already-fitted `self.classes`, so a brand-new later-chunk label is silently dropped (sklearn binarizes against the full `classes=` list from the first call, `naive_bayes.py:628-709`); this `classes=`/unseen-label path is NOT-STARTED (folded into #915). |
 //! | REQ-7 (negative-feature guard — both reject) | SHIPPED | `fn fit` (and `partial_fit`) reject any `x[i,j] < 0` with `FerroError::InvalidParameter { name: "X", reason: "ComplementNB requires non-negative feature values" }`, mirroring `check_non_negative(X, "ComplementNB (input X)")` → `ValueError` (`naive_bayes.py:1027`; ComplementNB DOES guard non-negativity, unlike BernoulliNB). Both REJECT. Non-test consumer: `RsComplementNB::fit` (`extras.rs`) maps the `FerroError` to a `PyErr`. Verified: green guard `green_complement_negative_features_rejected` — `ComplementNB().fit(X_neg, y)` returns `Err` (sklearn `ValueError("Negative values in data passed to ComplementNB (input X)")`). In-tree `test_complement_nb_negative_features_error`. The exact sklearn MESSAGE/TYPE is NOT matched — that sub-item is captured under REQ-9. |
 //! | REQ-8 (`sample_weight` + `partial_fit` `classes=`) | NOT-STARTED | open prereq blocker **#915**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` / `feature_all_ = feature_count_.sum(axis=0)` become weighted (`naive_bayes.py:1025-1030`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`; also no `classes=` argument on `partial_fit` (the unseen-label sub-gap of REQ-6). |
-//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#916**. sklearn exposes `feature_log_prob_` / `feature_all_` / `feature_count_` / `class_count_` / `class_log_prior_` / `classes_` / `n_features_in_` (`naive_bayes.py:937-970`); `hasattr(fitted, 'coef_') == False` — the deprecated `_BaseDiscreteNB` `coef_`/`intercept_` are gone by 1.5.2, so those are NOT a gap. `FittedComplementNB` stores `weights` / `feature_counts` / `class_counts` as PRIVATE fields with no accessor (and computes no `feature_all_` / `class_log_prior_`) — only `classes()` (via `HasClasses`) is public. `_RsComplementNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, norm)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters. Also subsumes the negative-feature MESSAGE/TYPE-parity sub-item (REQ-7: `InvalidParameter` vs `ValueError`) and the `class_prior` wrong-length TYPE sub-item (REQ-4). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedComplementNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.weights`, sklearn `feature_log_prob_`, `naive_bayes.py:1042`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:961`), `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:951`), `feature_all(&self) -> Array1<F>` (DERIVED `feature_counts.sum_axis(Axis(0))`, sklearn `feature_all_ = feature_count_.sum(axis=0)`, `naive_bayes.py:1029`), and `class_log_prior(&self) -> Array1<F>` (DERIVED empirical `log(class_count_) - log(class_count_.sum())`, sklearn `class_log_prior_`, `naive_bayes.py:600`). `coef_`/`intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`hasattr(ComplementNB().fit(...), 'coef_') == False`), so no `coef_`/`intercept_` getter is added. Live oracle (`X=[[5,1,0],[4,2,0],[6,0,1],[0,1,5],[1,0,4],[0,2,6]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[2.3978952728,1.7047480922,0.3184537311],[0.3184537311,1.7047480922,2.3978952728]]`, `feature_count_ = [[15,3,1],[1,3,15]]`, `class_count_ = [3,3]`, `feature_all_ = [16,6,16]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`. In-tree `complement_feature_log_prob_and_count_match_sklearn` / `complement_feature_all_class_count_prior_match_sklearn`. |
+//! | REQ-9b (PyO3 surface + `sample_weight`) | NOT-STARTED | open prereq blocker **#916**. `_RsComplementNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, norm)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters bridged to Python (`feature_log_prob_` / `feature_all_` / `feature_count_` / `class_count_` / `class_log_prior_` / `classes_` / `n_features_in_`). `coef_`/`intercept_` are deprecated/removed in sklearn 1.5.2 (`hasattr == False`) and stay absent. Also subsumes the negative-feature MESSAGE/TYPE-parity sub-item (REQ-7: `InvalidParameter` vs `ValueError`) and the `class_prior` wrong-length TYPE sub-item (REQ-4). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#917**. `complement.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
@@ -520,6 +521,76 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
+    /// Empirical complement weights (the negated smoothed complement-class
+    /// log-probabilities), shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `ComplementNB.feature_log_prob_`
+    /// (`_update_feature_log_prob`, `naive_bayes.py:1042`).
+    #[must_use]
+    pub fn feature_log_prob(&self) -> &Array2<F> {
+        &self.weights
+    }
+
+    /// Number of samples encountered for each (class, feature) during fitting,
+    /// shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `ComplementNB.feature_count_`
+    /// (`_count`, `naive_bayes.py:961`).
+    #[must_use]
+    pub fn feature_count(&self) -> &Array2<F> {
+        &self.feature_counts
+    }
+
+    /// Number of samples encountered for each class during fitting,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `ComplementNB.class_count_`
+    /// (`_count`, `naive_bayes.py:951`). `class_counts` is stored as integer
+    /// counts; this casts each to `F`.
+    #[must_use]
+    pub fn class_count(&self) -> Array1<F> {
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| F::from(c).unwrap_or_else(F::zero)),
+        )
+    }
+
+    /// Number of samples encountered for each feature during fitting (the
+    /// per-feature total across all classes), shape `(n_features,)`.
+    ///
+    /// Derived (not stored) as `feature_count_.sum(axis=0)`, mirroring sklearn
+    /// `ComplementNB.feature_all_` (`_count`, `feature_all_ =
+    /// feature_count_.sum(axis=0)`, `naive_bayes.py:1029`).
+    #[must_use]
+    pub fn feature_all(&self) -> Array1<F> {
+        self.feature_counts.sum_axis(ndarray::Axis(0))
+    }
+
+    /// Smoothed empirical log probability for each class, shape `(n_classes,)`.
+    ///
+    /// Derived (not stored) as `log(class_count_) - log(class_count_.sum())`,
+    /// mirroring sklearn's EMPIRICAL `class_log_prior_` under the default
+    /// `fit_prior=True` (`_update_class_log_prior`, `naive_bayes.py:600`).
+    /// ComplementNB stores the empirical class-prior derivation; this returns
+    /// the EMPIRICAL prior (matching sklearn's `class_log_prior_` value on any
+    /// fit). Note: ComplementNB only consults `class_log_prior_` in the
+    /// single-class edge case (`naive_bayes.py:1047-1048`); it does not affect
+    /// multi-class predictions.
+    #[must_use]
+    pub fn class_log_prior(&self) -> Array1<F> {
+        let total = self.class_counts.iter().fold(F::zero(), |acc, &c| {
+            acc + F::from(c).unwrap_or_else(F::zero)
+        });
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| (F::from(c).unwrap_or_else(F::zero) / total).ln()),
+        )
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedComplementNB<F> {
     /// Compute the joint log-likelihood scores for each class — sklearn
     /// `ComplementNB._joint_log_likelihood`.
@@ -811,5 +882,84 @@ mod tests {
         let preds = fitted.predict(&x).unwrap();
         let correct = preds.iter().zip(y.iter()).filter(|(p, a)| p == a).count();
         assert!(correct >= 7);
+    }
+
+    // sklearn 1.5.2 oracle fixture (R-CHAR-3) for the REQ-9a fitted accessors.
+    // X = [[5,1,0],[4,2,0],[6,0,1],[0,1,5],[1,0,4],[0,2,6]], y = [0,0,0,1,1,1].
+    fn oracle_xy() -> (Array2<f64>, Array1<usize>) {
+        let x = array![
+            [5.0, 1.0, 0.0],
+            [4.0, 2.0, 0.0],
+            [6.0, 0.0, 1.0],
+            [0.0, 1.0, 5.0],
+            [1.0, 0.0, 4.0],
+            [0.0, 2.0, 6.0],
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        (x, y)
+    }
+
+    #[test]
+    fn complement_feature_log_prob_and_count_match_sklearn() -> Result<(), FerroError> {
+        // sklearn ComplementNB().fit(X, y):
+        //   feature_log_prob_ = [[2.3978952728, 1.7047480922, 0.3184537311],
+        //                        [0.3184537311, 1.7047480922, 2.3978952728]]
+        //   feature_count_    = [[15, 3, 1], [1, 3, 15]]
+        let (x, y) = oracle_xy();
+        let fitted = ComplementNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_flp = array![
+            [2.3978952728, 1.7047480922, 0.3184537311],
+            [0.3184537311, 1.7047480922, 2.3978952728],
+        ];
+        let flp = fitted.feature_log_prob();
+        assert_eq!(flp.dim(), (2, 3));
+        for ((i, j), &e) in expected_flp.indexed_iter() {
+            assert_relative_eq!(flp[[i, j]], e, epsilon = 1e-9);
+        }
+
+        let expected_fc = array![[15.0, 3.0, 1.0], [1.0, 3.0, 15.0]];
+        let fc = fitted.feature_count();
+        assert_eq!(fc.dim(), (2, 3));
+        for ((i, j), &e) in expected_fc.indexed_iter() {
+            assert_relative_eq!(fc[[i, j]], e, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "literal -0.6931471806 is the sklearn class_log_prior_ oracle value ln(0.5), not a use of the LN_2 constant"
+    )]
+    fn complement_feature_all_class_count_prior_match_sklearn() -> Result<(), FerroError> {
+        // sklearn ComplementNB().fit(X, y):
+        //   feature_all_     = [16, 6, 16]
+        //   class_count_     = [3, 3]
+        //   class_log_prior_ = [-0.6931471806, -0.6931471806]
+        let (x, y) = oracle_xy();
+        let fitted = ComplementNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_fa = array![16.0, 6.0, 16.0];
+        let fa = fitted.feature_all();
+        assert_eq!(fa.len(), 3);
+        for (i, &e) in expected_fa.iter().enumerate() {
+            assert_relative_eq!(fa[i], e, epsilon = 1e-9);
+        }
+
+        let expected_cc = array![3.0, 3.0];
+        let cc = fitted.class_count();
+        assert_eq!(cc.len(), 2);
+        for (i, &e) in expected_cc.iter().enumerate() {
+            assert_relative_eq!(cc[i], e, epsilon = 1e-9);
+        }
+
+        let expected_clp = array![-0.6931471806, -0.6931471806];
+        let clp = fitted.class_log_prior();
+        assert_eq!(clp.len(), 2);
+        for (i, &e) in expected_clp.iter().enumerate() {
+            assert_relative_eq!(clp[i], e, epsilon = 1e-9);
+        }
+        Ok(())
     }
 }
