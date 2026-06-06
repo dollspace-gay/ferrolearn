@@ -374,6 +374,18 @@ Grouped by estimator (`REQ-LOGREG-*`, `REQ-DT-*`, `REQ-RF-*`, `REQ-KNN-*`,
   matching sklearn `__init__(self, *, priors=None, var_smoothing=1e-9)`
   (`naive_bayes.py:234`, the `*` is FIRST). Live: both fully keyword-only — this
   ABI MATCHES.
+- REQ-GNB-FITTED-ATTRS (**SHIPPED**, #2102): `ferrolearn.GaussianNB` surfaces the
+  five fitted attributes sklearn exposes — `theta_` (per-class feature means),
+  `var_` (epsilon-smoothed per-class variances), `class_prior_`, `class_count_`,
+  `epsilon_` (`var_smoothing * max(var(X))`) — matching the sklearn `GaussianNB`
+  oracle. The `_RsGaussianNB` getters `theta_`/`var_`/`class_prior_`/
+  `class_count_`/`epsilon_` bind the pre-existing accessors
+  `FittedGaussianNB::theta` (`gaussian.rs:549`), `::var` (`gaussian.rs:557`),
+  `::epsilon` (`gaussian.rs:565`), `::class_count` (`gaussian.rs:572`, owned
+  `Array1`), `::class_prior` (`gaussian.rs:584`, owned `Array1`); the non-test
+  production consumer `_classifiers.py::GaussianNB.fit` assigns all five after
+  `classes_`. Verified by `tests/divergence_classifiers.py::test_gaussiannb_fitted_attrs_match_sklearn`
+  (live sklearn 1.5.2 oracle, R-CHAR-3).
 - REQ-GNB-PARAMS: `ferrolearn.GaussianNB` exposes the `priors` constructor param
   (`naive_bayes.py:234`). The wrapper + `RsGaussianNB::new` take `var_smoothing`
   only. [Library supports `priors` validation (downstream `ferrolearn-bayes`

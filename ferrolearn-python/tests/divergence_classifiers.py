@@ -410,3 +410,36 @@ def test_classifiers_predict_log_proba():
         )
 
 
+def test_gaussiannb_fitted_attrs_match_sklearn():
+    """GREEN (#2102): GaussianNB surfaces theta_/var_/class_prior_/class_count_/
+    epsilon_ matching the live sklearn oracle.
+
+    sklearn `GaussianNB` exposes these five fitted attributes
+    (`sklearn/naive_bayes.py`: `theta_` per-class feature means, `var_`
+    epsilon-smoothed per-class variances, `class_prior_`, `class_count_`,
+    `epsilon_` = `var_smoothing * max(var(X))`). The ferrolearn wrapper
+    `_classifiers.py::GaussianNB.fit` reads them from the pre-existing
+    `FittedGaussianNB` accessors via the new `_RsGaussianNB` getters. Expected
+    values come from the live sklearn 1.5.2 oracle fit in this test (R-CHAR-3),
+    never copied from ferrolearn.
+    """
+    from sklearn.naive_bayes import GaussianNB as SkGNB
+
+    X = np.array(
+        [[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0], [0.0, 1.0]]
+    )
+    y = np.array([0, 0, 1, 1, 1, 0])
+
+    fr = ferrolearn.GaussianNB().fit(X, y)
+    sk = SkGNB().fit(X, y)
+
+    for attr in ("theta_", "var_", "class_prior_", "class_count_", "epsilon_"):
+        assert hasattr(fr, attr), f"GaussianNB missing fitted attribute {attr!r}"
+
+    np.testing.assert_allclose(fr.theta_, sk.theta_, atol=1e-7)
+    np.testing.assert_allclose(fr.var_, sk.var_, atol=1e-7)
+    np.testing.assert_allclose(fr.class_prior_, sk.class_prior_, atol=1e-9)
+    np.testing.assert_allclose(fr.class_count_, sk.class_count_, atol=1e-9)
+    assert abs(fr.epsilon_ - sk.epsilon_) < 1e-15
+
+

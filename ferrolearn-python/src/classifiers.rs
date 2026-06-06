@@ -19,7 +19,7 @@
 //! blocker). Verified via `tests/divergence_classifiers.py` +
 //! `tests/test_check_estimator.py` (553 pytest pass).
 //!
-//! **21 SHIPPED / 7 NOT-STARTED.**
+//! **22 SHIPPED / 7 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -47,6 +47,7 @@
 //! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | NOT-STARTED | the wrapper exposes `n_neighbors` only; sklearn `_classification.py:193`. Default uniform/minkowski/p=2 MATCHES — downstream #876/#877. |
 //! | REQ-GNB-API-CONFORM (fit/predict/predict_proba + classes_, default path) | SHIPPED | `RsGaussianNB::*` + getter, wrapped by `_classifiers.py::GaussianNB` — mirroring `naive_bayes.py:147`/`:128`. Live default-path oracle matches element-wise. |
 //! | REQ-GNB-CTOR-ABI (all params keyword-only) | SHIPPED | `GaussianNB.__init__(self, *, var_smoothing=1e-9)` matches sklearn `naive_bayes.py:234` (the `*` is first). |
+//! | REQ-GNB-FITTED-ATTRS (theta_/var_/class_prior_/class_count_/epsilon_ surfaced) | SHIPPED | FIXED #2102: `RsGaussianNB::{theta_,var_,class_prior_,class_count_,epsilon_}` getters bind the pre-existing `FittedGaussianNB` accessors (`gaussian.rs:549`/:557`/:565`/:572`/:584`); consumer `_classifiers.py::GaussianNB.fit` assigns all five after `classes_`, mirroring sklearn `naive_bayes.py` `theta_`/`var_`/`class_prior_`/`class_count_`/`epsilon_`. Guard `test_gaussiannb_fitted_attrs_match_sklearn` (live oracle, R-CHAR-3). |
 //! | REQ-GNB-VALUE-PARITY (pred/predict_proba parity, default path) | SHIPPED | default path: downstream `ferrolearn-bayes` REQ-1/3/4 match the sklearn `GaussianNB` oracle ~1e-9 (`epsilon_` global var, `_joint_log_likelihood`, predict_proba). |
 //! | REQ-GNB-PARAMS (priors) | NOT-STARTED | the wrapper + `RsGaussianNB::new` expose `var_smoothing` only; sklearn `naive_bayes.py:234` has `priors`. Default data-derived priors MATCH — downstream #897. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: the five `_classifiers.py` wrappers construct their `_Rs*` class and drive fit/predict(/predict_proba) + getter reads; `ferrolearn/__init__.py` re-exports all five; `test_check_estimator.py` runs each through `parametrize_with_checks` (553 pytest pass). Label round-trip covered by `conversions.md` REQ-LABEL-MARSHAL. |
@@ -510,5 +511,67 @@ impl RsGaussianNB {
         let classes = fitted.classes();
         let arr = ndarray::Array1::from_vec(classes.iter().map(|&c| c as i64).collect());
         Ok(PyArray1::from_array(py, &arr))
+    }
+
+    /// Per-class feature means (sklearn `theta_`, `naive_bayes.py:171`;
+    /// `ferrolearn_bayes::FittedGaussianNB::theta` at `gaussian.rs:549`),
+    /// shape `(n_classes, n_features)`.
+    #[getter]
+    fn theta_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.theta()))
+    }
+
+    /// Per-class epsilon-smoothed feature variances (sklearn `var_`,
+    /// `naive_bayes.py:202`; `FittedGaussianNB::var` at `gaussian.rs:557`),
+    /// shape `(n_classes, n_features)`.
+    #[getter]
+    fn var_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.var()))
+    }
+
+    /// Empirical class priors `class_count_ / class_count_.sum()` (sklearn
+    /// `class_prior_`, `naive_bayes.py:176`; `FittedGaussianNB::class_prior`
+    /// at `gaussian.rs:584` — returns an owned `Array1`), shape `(n_classes,)`.
+    #[getter]
+    fn class_prior_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cp = fitted.class_prior();
+        Ok(ndarray1_to_numpy(py, &cp))
+    }
+
+    /// Number of training samples seen per class (sklearn `class_count_`,
+    /// `naive_bayes.py:173`; `FittedGaussianNB::class_count` at `gaussian.rs:572`
+    /// — returns an owned `Array1`), shape `(n_classes,)`.
+    #[getter]
+    fn class_count_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cc = fitted.class_count();
+        Ok(ndarray1_to_numpy(py, &cc))
+    }
+
+    /// Absolute additive variance smoothing `var_smoothing * max(var(X))`
+    /// (sklearn `epsilon_`, `naive_bayes.py:431`; `FittedGaussianNB::epsilon`
+    /// at `gaussian.rs:565`).
+    #[getter]
+    fn epsilon_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.epsilon())
     }
 }

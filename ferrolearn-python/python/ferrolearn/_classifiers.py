@@ -360,6 +360,11 @@ class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
         y_encoded, self.classes_ = _encode_labels(y)
         self._rs = _RsGaussianNB(var_smoothing=self.var_smoothing)
         _fit_rust(self._rs, X, y_encoded)
+        self.theta_ = np.array(self._rs.theta_)
+        self.var_ = np.array(self._rs.var_)
+        self.class_prior_ = np.array(self._rs.class_prior_)
+        self.class_count_ = np.array(self._rs.class_count_)
+        self.epsilon_ = float(self._rs.epsilon_)
         self._store_training_data(X, y_encoded)
         return self
 
