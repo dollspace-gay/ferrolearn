@@ -24,13 +24,13 @@
 //! | REQ-ERR (construction validation) | SHIPPED | `from_triplets`/`push` return `Err(FerroError)` on out-of-bounds index / mismatched lengths, at the same point scipy raises `ValueError`. Guards `coo_from_triplets_*_is_err`/`coo_push_out_of_bounds_is_err`. |
 //! | REQ-CONSUMER (production consumer) | SHIPPED | consumed in-crate by `csr.rs`/`csc.rs` (COO→CSR/CSC conversion) and `helpers.rs` (`eye`/`diags`/`hstack`/`vstack` build via COO) — real non-test callers (S5 crate boundary). |
 //! | REQ-API-ACCESSORS (shape/data/row/col) | SHIPPED (#1996) | first-class `shape()`/`data()`/`row()`/`col()` accessors mirror scipy `.shape` (`_coo.py:32`/`:39` ctor tuple) and `.data`/`.row`/`.col` (`_coo.py:64`/`:106`/`:122`), the COO `(data, (row, col))` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `row()` → `&[usize]` (`inner.row_inds()`); `col()` → `&[usize]` (`inner.col_inds()`) — all borrow `&self` (sprs `TriMat` accessors return slices). Live oracle (R-CHAR-3): `coo_matrix(([3,5,2],([0,2,1],[0,1,2])),shape=(3,3))` → `shape=(3,3)`, `data=[3,5,2]`, `row=[0,2,1]`, `col=[0,1,2]` (insertion order preserved). Guard `coo_shape_data_row_col_match_scipy`. |
-//! | REQ-MISSING-METHODS (COO methods) | SHIPPED (#1997) | conversion + transpose: `to_csr()`/`to_csc()` delegate to `CsrMatrix::from_coo`/`CscMatrix::from_coo` (both summing duplicate `(row,col)` entries), mirroring scipy `coo_matrix.tocsr` (`_coo.py:349`)/`tocsc` (`_coo.py:316`); `transpose()` swaps the row/col index arrays and the `(M,N)` shape to `(n_cols,n_rows)`, mirroring scipy `coo_matrix.transpose`/`.T` with `axes=(1,0)` (`_coo.py:229` — `permuted_coords`/`permuted_shape`). Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` → `tocsr/tocsc.toarray()`=`[[3,0,0],[0,0,2],[0,5,0]]`, `transpose.toarray()`=`[[3,0,0],[0,0,5],[0,2,0]]` (shape `(3,3)`); non-square `from_triplets(2,3,[0,1],[2,0],[7,9])` → `transpose.toarray()`=`[[0,9],[0,0],[7,0]]` (shape `(3,2)`). Guards `coo_to_csr_matches_scipy`/`coo_to_csc_matches_scipy`/`coo_transpose_matches_scipy`/`coo_transpose_non_square`. Sub-note: `.sum`/`.diagonal`/`.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.power`/`.max`/`.min`/`.astype`/`.copy` remain NOT-STARTED. |
+//! | REQ-MISSING-METHODS (COO methods) | SHIPPED (#1997) | conversion + transpose: `to_csr()`/`to_csc()` delegate to `CsrMatrix::from_coo`/`CscMatrix::from_coo` (both summing duplicate `(row,col)` entries), mirroring scipy `coo_matrix.tocsr` (`_coo.py:349`)/`tocsc` (`_coo.py:316`); `transpose()` swaps the row/col index arrays and the `(M,N)` shape to `(n_cols,n_rows)`, mirroring scipy `coo_matrix.transpose`/`.T` with `axes=(1,0)` (`_coo.py:229` — `permuted_coords`/`permuted_shape`). Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` → `tocsr/tocsc.toarray()`=`[[3,0,0],[0,0,2],[0,5,0]]`, `transpose.toarray()`=`[[3,0,0],[0,0,5],[0,2,0]]` (shape `(3,3)`); non-square `from_triplets(2,3,[0,1],[2,0],[7,9])` → `transpose.toarray()`=`[[0,9],[0,0],[7,0]]` (shape `(3,2)`). Guards `coo_to_csr_matches_scipy`/`coo_to_csc_matches_scipy`/`coo_transpose_matches_scipy`/`coo_transpose_non_square`. Reductions (#1997, continuing): `sum()` (Σ all `data()` from `T::zero()`, scipy `_coo.py:1429` axis=None), `sum_axis0()` (column sums, length `n_cols`), `sum_axis1()` (row sums, length `n_rows`) — each computed from the triplets (`row()`/`col()`/`data()`), so DUPLICATE `(row,col)` entries are SUMMED (matching scipy); `diagonal()` (length `min(n_rows,n_cols)`, `out[r] += v` when `r==c`, diagonal duplicates summed, scipy `_coo.py:458`). Bounds `T: Copy + Zero + Add<Output=T>`. Live oracle (R-CHAR-3): `from_triplets(3,3,[0,2,1],[0,1,2],[3,5,2])` = `[[3,0,0],[0,0,2],[0,5,0]]` → `sum()`=10.0, `sum_axis0()`=`[3,5,2]`, `sum_axis1()`=`[3,2,5]`, `diagonal()`=`[3,0,0]`; duplicate `coo_matrix(([3,5],([0,0],[0,0])),shape=(2,2))` → `sum()`=8.0, `diagonal()`=`[8,0]`. Guards `coo_sum_matches_scipy`/`coo_sum_axis0_matches_scipy`/`coo_sum_axis1_matches_scipy`/`coo_diagonal_matches_scipy`/`coo_sum_diagonal_sum_duplicates`. Sub-note: `.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.power`/`.max`/`.min`/`.astype`/`.copy` remain NOT-STARTED. |
 //! | REQ-FERRAY (ferray sparse substrate) | NOT-STARTED | `sprs::TriMat` + `ndarray` vs ferray's sparse COO analog (R-SUBSTRATE-1; ferray has no sparse layer yet). Blocker #1998. |
 
 use std::ops::Add;
 
 use ferrolearn_core::FerroError;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use num_traits::Zero;
 use sprs::{SpIndex, TriMat};
 
@@ -319,6 +319,81 @@ where
     }
 }
 
+impl<T> CooMatrix<T>
+where
+    T: Copy + Zero + Add<Output = T>,
+{
+    /// Sum of all stored values.
+    ///
+    /// Mirrors scipy `coo_matrix.sum()` with `axis=None`
+    /// (`scipy/sparse/_coo.py:1429`, `_sum_nd`), which reduces over both rows and
+    /// columns to a scalar. Computed directly from the stored triplets, so
+    /// **duplicate `(row, col)` entries are summed** (matching scipy, which sums
+    /// duplicates in `.sum()`). The running total is accumulated from
+    /// [`T::zero()`].
+    #[must_use]
+    pub fn sum(&self) -> T {
+        let mut acc = T::zero();
+        for &val in self.data() {
+            acc = acc + val;
+        }
+        acc
+    }
+
+    /// Column sums, a length-`n_cols` vector.
+    ///
+    /// Mirrors scipy `coo_matrix.sum(axis=0)` (`scipy/sparse/_coo.py:1429`,
+    /// `_sum_nd`), which returns a `(1, n_cols)` row vector of per-column sums;
+    /// here it is returned as a length-`n_cols` [`Array1`]. For each stored
+    /// triplet `(row, col, val)`, `val` is added to `out[col]`, so **duplicate
+    /// entries are summed**.
+    #[must_use]
+    pub fn sum_axis0(&self) -> Array1<T> {
+        let mut out = Array1::<T>::zeros(self.n_cols());
+        for (&c, &val) in self.col().iter().zip(self.data()) {
+            out[c] = out[c] + val;
+        }
+        out
+    }
+
+    /// Row sums, a length-`n_rows` vector.
+    ///
+    /// Mirrors scipy `coo_matrix.sum(axis=1)` (`scipy/sparse/_coo.py:1429`,
+    /// `_sum_nd`), which returns an `(n_rows, 1)` column vector of per-row sums;
+    /// here it is returned as a length-`n_rows` [`Array1`]. For each stored
+    /// triplet `(row, col, val)`, `val` is added to `out[row]`, so **duplicate
+    /// entries are summed**.
+    #[must_use]
+    pub fn sum_axis1(&self) -> Array1<T> {
+        let mut out = Array1::<T>::zeros(self.n_rows());
+        for (&r, &val) in self.row().iter().zip(self.data()) {
+            out[r] = out[r] + val;
+        }
+        out
+    }
+
+    /// Main diagonal, a length-`min(n_rows, n_cols)` vector.
+    ///
+    /// Mirrors scipy `coo_matrix.diagonal()` with `k=0`
+    /// (`scipy/sparse/_coo.py:458`): `out[i] == A[i, i]` for
+    /// `i in 0..min(n_rows, n_cols)`. Computed directly from the stored triplets:
+    /// for each `(row, col, val)` with `row == col`, `val` is accumulated into
+    /// `out[row]`, so **duplicate diagonal entries are summed** (scipy's
+    /// `diagonal` calls `_sum_duplicates` on the masked entries). Positions with
+    /// no stored entry default to [`T::zero()`].
+    #[must_use]
+    pub fn diagonal(&self) -> Array1<T> {
+        let len = self.n_rows().min(self.n_cols());
+        let mut out = Array1::<T>::zeros(len);
+        for ((&r, &c), &val) in self.row().iter().zip(self.col()).zip(self.data()) {
+            if r == c && r < len {
+                out[r] = out[r] + val;
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +525,55 @@ mod tests {
         assert_eq!(t.n_rows(), 3);
         assert_eq!(t.n_cols(), 2);
         assert_eq!(t.to_dense(), array![[0.0, 9.0], [0.0, 0.0], [7.0, 0.0]]);
+        Ok(())
+    }
+
+    // REQ-MISSING-METHODS (reductions) — live scipy oracle (R-CHAR-3).
+    // Expected values from `cd /tmp && python3 -c "import numpy as np,
+    //   scipy.sparse as sp;
+    //   m=sp.coo_matrix((np.array([3.,5.,2.]),(np.array([0,2,1]),
+    //     np.array([0,1,2]))),shape=(3,3));
+    //   print(m.sum(), m.sum(axis=0).tolist(), m.sum(axis=1).tolist(),
+    //         m.diagonal().tolist())"`
+    //   -> 10.0  [[3,5,2]] (axis=0 col sums)  [[3],[2],[5]] (axis=1 row sums)
+    //      [3.0, 0.0, 0.0] (diagonal).
+
+    #[test]
+    fn coo_sum_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        assert_eq!(m.sum(), 10.0);
+        Ok(())
+    }
+
+    #[test]
+    fn coo_sum_axis0_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        assert_eq!(m.sum_axis0(), array![3.0, 5.0, 2.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn coo_sum_axis1_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        assert_eq!(m.sum_axis1(), array![3.0, 2.0, 5.0]);
+        Ok(())
+    }
+
+    #[test]
+    fn coo_diagonal_matches_scipy() -> Result<(), FerroError> {
+        let m = sample_coo()?;
+        assert_eq!(m.diagonal(), array![3.0, 0.0, 0.0]);
+        Ok(())
+    }
+
+    // Duplicate-summing reductions — two entries at (0,0). Oracle:
+    // `sp.coo_matrix((np.array([3.,5.]),(np.array([0,0]),np.array([0,0]))),
+    //   shape=(2,2))` -> sum()==8.0, diagonal()==[8.0, 0.0].
+    #[test]
+    fn coo_sum_diagonal_sum_duplicates() -> Result<(), FerroError> {
+        let m = CooMatrix::from_triplets(2, 2, vec![0, 0], vec![0, 0], vec![3.0, 5.0])?;
+        assert_eq!(m.sum(), 8.0);
+        assert_eq!(m.diagonal(), array![8.0, 0.0]);
         Ok(())
     }
 }
