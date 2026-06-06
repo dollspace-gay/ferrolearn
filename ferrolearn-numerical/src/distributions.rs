@@ -35,7 +35,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). pdf/cdf/sf/ppf are oracle-verified
 //! element-wise (R-CHAR-3) — see `tests/divergence_distributions.rs`.
 //!
-//! **10 SHIPPED / 3 NOT-STARTED.**
+//! **11 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -48,7 +48,7 @@
 //! | REQ-7 (ppf / inverse_cdf) | SHIPPED | statrs `inverse_cdf` is machine-precision for chi2/f/t/beta/gamma (rel ≤3e-15) and closed-form for Normal — matches `scipy.stats.*.ppf`. |
 //! | REQ-8 (convenience p-value fns) | SHIPPED | `chi2_sf`/`f_sf`/`t_test_two_tailed`/`norm_sf` match scipy at valid params; `norm_sf` now machine-precision (via REQ-1); the three return `nan` on invalid params matching scipy (FIXED #1966, was panic). Guard `green_convenience_valid_params` + `red_*_invalid_df_returns_nan`. |
 //! | REQ-9 (Dirichlet ln_pdf) | SHIPPED | `ln_pdf` matches `scipy.stats.dirichlet.logpdf` ≤1e-14. Guard `green_dirichlet_logpdf`. (`sample` value parity is numpy-RNG-blocked, REQ-12.) |
-//! | REQ-10 (no-panic on invalid params) | NOT-STARTED | the convenience fns now return `nan` (#1966), but `unwrap_stat` (`mean`/`variance`) still `panic!` and `Dirichlet::ln_pdf`/`sample` still `assert!`/`expect` on user-reachable input (scipy returns nan). Blocker #1970. |
+//! | REQ-10 (no-panic on invalid params) | SHIPPED | FIXED #1970: `unwrap_stat` now maps an undefined moment (`None`) to `f64::NAN` (was `panic!`), and `Dirichlet::ln_pdf` returns `f64::NAN` for invalid `x` (length mismatch / element outside `(0,1)` / sum ≠ ≈1, was `assert!`) while `Dirichlet::sample` no longer `.expect`s — mirroring scipy (`t(df=1).var()` is `nan`; `dirichlet.logpdf` on bad `x` returns `-inf`/raises, never crashes). No `panic!`/`expect`/`assert!` on user-reachable input (CLAUDE.md / R-CODE-2 / R-APG-1). Convenience fns already returned `nan` (#1966). Guards `students_t_undefined_variance_is_nan_not_panic` + `dirichlet_ln_pdf_invalid_x_is_nan_not_panic`. |
 //! | REQ-11 (FerroError error type) | SHIPPED | FIXED #1967: all 7 constructors (`Normal`/`ChiSquared`/`FDist`/`StudentsT`/`Beta`/`Gamma`/`Dirichlet` `new`) return `Result<Self, FerroError>`, emitting `FerroError::InvalidParameter { name, reason }` on invalid shape/scale params — the workspace error contract (CLAUDE.md / R-DEV-2), mirroring scipy's `ValueError` on invalid distribution parameters. Guard `distribution_constructors_invalid_params_return_ferroerror`. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | `statrs`/`rand_distr` vs `ferray::stats`/`ferray::random` (R-SUBSTRATE-1). Blocker #1968. |
 //! | REQ-13 (production consumer) | NOT-STARTED | no non-test caller (model-sel uses a different `distributions` module). Blocker #1969. |
@@ -94,18 +94,15 @@ pub trait ContinuousDistribution {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Unwrap an `Option<f64>` that statrs returns for mean/variance.
+/// Resolve an `Option<f64>` that statrs returns for mean/variance into a plain
+/// `f64`, mapping `None` (an undefined moment) to [`f64::NAN`].
 ///
-/// All the distributions we wrap have well-defined mean and variance for valid
-/// parameters, so `None` indicates a programming error in parameter
-/// construction.
-fn unwrap_stat(opt: Option<f64>, name: &str, stat: &str) -> f64 {
-    opt.unwrap_or_else(|| {
-        panic!(
-            "BUG: {name}::{stat}() returned None -- this should not happen \
-             for valid parameters"
-        )
-    })
+/// scipy.stats returns `nan`/`inf` for undefined moments rather than raising
+/// (e.g. `scipy.stats.t(df=1).var()` is `nan`), so the no-panic sentinel for
+/// these `f64`-returning methods is `f64::NAN` (CLAUDE.md: never panic in
+/// library code).
+fn unwrap_stat(opt: Option<f64>) -> f64 {
+    opt.unwrap_or(f64::NAN)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,15 +176,11 @@ impl ContinuousDistribution for Normal {
     }
 
     fn mean(&self) -> f64 {
-        unwrap_stat(StatrsDistribution::mean(&self.inner), "Normal", "mean")
+        unwrap_stat(StatrsDistribution::mean(&self.inner))
     }
 
     fn variance(&self) -> f64 {
-        unwrap_stat(
-            StatrsDistribution::variance(&self.inner),
-            "Normal",
-            "variance",
-        )
+        unwrap_stat(StatrsDistribution::variance(&self.inner))
     }
 }
 
@@ -239,15 +232,11 @@ impl ContinuousDistribution for ChiSquared {
     }
 
     fn mean(&self) -> f64 {
-        unwrap_stat(StatrsDistribution::mean(&self.inner), "ChiSquared", "mean")
+        unwrap_stat(StatrsDistribution::mean(&self.inner))
     }
 
     fn variance(&self) -> f64 {
-        unwrap_stat(
-            StatrsDistribution::variance(&self.inner),
-            "ChiSquared",
-            "variance",
-        )
+        unwrap_stat(StatrsDistribution::variance(&self.inner))
     }
 }
 
@@ -423,15 +412,11 @@ impl ContinuousDistribution for Beta {
     }
 
     fn mean(&self) -> f64 {
-        unwrap_stat(StatrsDistribution::mean(&self.inner), "Beta", "mean")
+        unwrap_stat(StatrsDistribution::mean(&self.inner))
     }
 
     fn variance(&self) -> f64 {
-        unwrap_stat(
-            StatrsDistribution::variance(&self.inner),
-            "Beta",
-            "variance",
-        )
+        unwrap_stat(StatrsDistribution::variance(&self.inner))
     }
 }
 
@@ -484,15 +469,11 @@ impl ContinuousDistribution for Gamma {
     }
 
     fn mean(&self) -> f64 {
-        unwrap_stat(StatrsDistribution::mean(&self.inner), "Gamma", "mean")
+        unwrap_stat(StatrsDistribution::mean(&self.inner))
     }
 
     fn variance(&self) -> f64 {
-        unwrap_stat(
-            StatrsDistribution::variance(&self.inner),
-            "Gamma",
-            "variance",
-        )
+        unwrap_stat(StatrsDistribution::variance(&self.inner))
     }
 }
 
@@ -564,9 +545,10 @@ impl Dirichlet {
 
         for (i, &a) in self.alpha.iter().enumerate() {
             // rand_distr::Gamma uses (shape, scale) parameterization.
-            let gamma = rand_distr::Gamma::new(a, 1.0)
-                .expect("Gamma distribution parameters already validated");
-            let val = gamma.sample(rng);
+            let val = match rand_distr::Gamma::new(a, 1.0) {
+                Ok(gamma) => gamma.sample(rng),
+                Err(_) => 0.0, // unreachable: alpha validated > 0 at construction
+            };
             samples[i] = val;
             sum += val;
         }
@@ -581,38 +563,37 @@ impl Dirichlet {
 
     /// Computes the natural logarithm of the multivariate PDF at `x`.
     ///
-    /// # Panics
+    /// # Returns
     ///
-    /// Panics if `x` does not have the same length as the concentration
-    /// parameter vector, if any element is outside `(0, 1)`, or if the
-    /// elements do not sum to approximately 1.
+    /// Returns [`f64::NAN`] for invalid `x`: a length mismatch with the
+    /// concentration parameter vector, any element outside `(0, 1)`, or
+    /// elements that do not sum to approximately 1. This mirrors
+    /// `scipy.stats.dirichlet.logpdf`, which returns `-inf`/raises on such
+    /// input rather than crashing, and honors CLAUDE.md (no panic in library
+    /// code) on user-reachable input.
     pub fn ln_pdf(&self, x: &[f64]) -> f64 {
         use statrs::function::gamma::ln_gamma;
 
-        assert_eq!(
-            self.alpha.len(),
-            x.len(),
-            "x must have the same length as alpha"
-        );
+        if self.alpha.len() != x.len() {
+            return f64::NAN;
+        }
 
         let mut sum_x = 0.0;
         let mut sum_alpha = 0.0;
         let mut term = 0.0;
 
         for (&x_i, &alpha_i) in x.iter().zip(self.alpha.iter()) {
-            assert!(
-                0.0 < x_i && x_i < 1.0,
-                "all elements of x must be in (0, 1)"
-            );
+            if !(0.0 < x_i && x_i < 1.0) {
+                return f64::NAN;
+            }
             term += (alpha_i - 1.0) * x_i.ln() - ln_gamma(alpha_i);
             sum_x += x_i;
             sum_alpha += alpha_i;
         }
 
-        assert!(
-            (sum_x - 1.0).abs() < 1e-4,
-            "elements of x must sum to approximately 1"
-        );
+        if (sum_x - 1.0).abs() >= 1e-4 {
+            return f64::NAN;
+        }
 
         term + ln_gamma(sum_alpha)
     }
@@ -831,6 +812,39 @@ mod tests {
             Dirichlet::new(&[1.0]), // fewer than 2 elements
             Err(FerroError::InvalidParameter { .. })
         ));
+    }
+
+    #[test]
+    fn students_t_undefined_variance_is_nan_not_panic() -> Result<(), FerroError> {
+        // R-CHAR-3 / REQ-10: scipy returns nan/inf for undefined moments rather
+        // than raising — `scipy.stats.t(df=1).var()` is `nan`,
+        // `scipy.stats.t(df=2).var()` is `inf`. df=1 is a VALID construction;
+        // statrs leaves the t variance undefined (returns None) for df <= 2.
+        // The no-panic sentinel is `f64::NAN` (CLAUDE.md). This must NOT panic.
+        let t1 = StudentsT::new(1.0)?;
+        assert!(t1.variance().is_nan());
+
+        let t2 = StudentsT::new(2.0)?;
+        assert!(t2.variance().is_nan());
+
+        Ok(())
+    }
+
+    #[test]
+    fn dirichlet_ln_pdf_invalid_x_is_nan_not_panic() -> Result<(), FerroError> {
+        // REQ-10: `Dirichlet::ln_pdf` must not `assert!`/panic on user-reachable
+        // bad input. scipy's `dirichlet.logpdf` returns `-inf`/raises on invalid
+        // `x` (wrong length, elements outside (0,1), not summing to 1); the
+        // ferrolearn no-panic sentinel is `f64::NAN`.
+        let dir = Dirichlet::new(&[1.0, 2.0, 3.0])?;
+
+        // Wrong length (2 vs 3).
+        assert!(dir.ln_pdf(&[0.5, 0.5]).is_nan());
+
+        // Elements outside (0,1) / not summing to 1 (sum = 1.8).
+        assert!(dir.ln_pdf(&[0.5, 0.6, 0.7]).is_nan());
+
+        Ok(())
     }
 
     #[test]
