@@ -12,7 +12,7 @@
 //! Behavior is oracle-verified vs the live scipy (R-CHAR-3) — see
 //! `tests/divergence_csr.rs`.
 //!
-//! **8 SHIPPED / 6 NOT-STARTED.**
+//! **9 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -24,7 +24,7 @@
 //! | REQ-ERR | SHIPPED | `add`/`mul_vec` return `Err(FerroError::ShapeMismatch)` where scipy raises `ValueError`. Guards `csr_*_shape_mismatch_is_err`. |
 //! | REQ-CONSUMER | SHIPPED | real estimator consumers: `ferrolearn-neighbors/src/graph.rs` (`kneighbors_graph`/`radius_neighbors_graph` return CSR) + `ferrolearn-core/src/dataset.rs` (sparse `Dataset` arm); also `helpers.rs`/`csc.rs`. |
 //! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)` (`_compressed.py`). Blocker #2000. |
-//! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2001. |
+//! | REQ-MISSING-TRANSPOSE | SHIPPED (#2001) | `transpose()` returns a `(n_cols, n_rows)` CSR of `Aᵀ` via sprs `transpose_view().to_csr()`, mirroring scipy `A.T` (`_csr.py:22` — CSC view of the same buffers, here materialized as CSR). Live oracle: `A.T.toarray()`=`[[1,0,4],[0,3,0],[2,0,5]]`; non-square `B=[[1,2,3],[4,5,6]]` -> `B.T.toarray()`=`[[1,4],[2,5],[3,6]]` shape `(3,2)`; double-transpose round-trips. Guards `csr_transpose_matches_scipy`/`csr_transpose_non_square`/`csr_transpose_twice_roundtrip`. |
 //! | REQ-MISSING-REDUCE | SHIPPED | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csr_sum_matches_scipy`/`csr_sum_axis0_matches_scipy`/`csr_sum_axis1_matches_scipy`/`csr_diagonal_matches_scipy`/`csr_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2003. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`sum_duplicates`/`astype`/`copy`/`max`/`min`. Blocker #2004. |
@@ -154,6 +154,25 @@ where
         T: Clone + Default + 'static,
     {
         CscMatrix::from_inner(self.inner.to_csc())
+    }
+
+    /// Transpose: returns a new `(n_cols, n_rows)` CSR matrix whose dense form
+    /// is `Aᵀ`.
+    ///
+    /// Mirrors scipy `csr_matrix.transpose()` / `.T` (`scipy/sparse/_csr.py:22`),
+    /// where `A.T` reinterprets the same `(data, indices, indptr)` buffers as a
+    /// CSC container of shape `(N, M)` (a no-allocation storage-order swap).
+    /// Here that CSC-storage view of `Aᵀ` is materialized back into owned CSR
+    /// storage via sprs `transpose_view().to_csr()`, so the result is a
+    /// `CsrMatrix` of `Aᵀ`.
+    #[must_use]
+    pub fn transpose(&self) -> CsrMatrix<T>
+    where
+        T: Clone + Default + 'static,
+    {
+        Self {
+            inner: self.inner.transpose_view().to_csr(),
+        }
     }
 
     /// Convert to [`CooMatrix`].
@@ -622,6 +641,43 @@ mod tests {
     fn csr_diagonal_non_square() {
         let m = sample_csr_b();
         assert_eq!(m.diagonal(), array![1.0, 5.0]);
+    }
+
+    // REQ-MISSING-TRANSPOSE — live scipy oracle (R-CHAR-3). Expected values from
+    // `python3 -c "import numpy as np, scipy.sparse as sp;
+    //   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+    //   B=sp.csr_matrix(np.array([[1.,2,3],[4,5,6]]));
+    //   print(A.T.toarray().tolist(), B.T.toarray().tolist())"`
+    //   -> [[1,0,4],[0,3,0],[2,0,5]] [[1,4],[2,5],[3,6]].
+
+    #[test]
+    fn csr_transpose_matches_scipy() {
+        let a = sample_csr();
+        let at = a.transpose();
+        assert_eq!(at.n_rows(), 3);
+        assert_eq!(at.n_cols(), 3);
+        assert_eq!(
+            at.to_dense(),
+            array![[1.0, 0.0, 4.0], [0.0, 3.0, 0.0], [2.0, 0.0, 5.0]]
+        );
+    }
+
+    #[test]
+    fn csr_transpose_non_square() {
+        let b = sample_csr_b();
+        let bt = b.transpose();
+        assert_eq!(bt.n_rows(), 3);
+        assert_eq!(bt.n_cols(), 2);
+        assert_eq!(bt.to_dense(), array![[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+    }
+
+    #[test]
+    fn csr_transpose_twice_roundtrip() {
+        let b = sample_csr_b();
+        let btt = b.transpose().transpose();
+        assert_eq!(btt.n_rows(), 2);
+        assert_eq!(btt.n_cols(), 3);
+        assert_eq!(btt.to_dense(), b.to_dense());
     }
 
     #[test]
