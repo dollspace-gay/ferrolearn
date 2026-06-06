@@ -12,7 +12,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **8 SHIPPED / 6 NOT-STARTED.**
+//! **9 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -24,7 +24,7 @@
 //! | REQ-ERR | SHIPPED | `add`/`mul_vec` return `Err(FerroError::ShapeMismatch)` where scipy raises `ValueError`. Guards `csc_*_shape_mismatch_is_err`. |
 //! | REQ-CONSUMER | SHIPPED | in-crate CSR↔CSC conversion consumer (`csr.rs` `from_csc`/`to_csc`) + `lib.rs` re-export (grandfathered boundary type, R-DEFER-1/S5). NOTE: no cross-crate ESTIMATOR consumer (weaker than CSR's neighbors/graph.rs). |
 //! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)`. Blocker #2008. |
-//! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2009. |
+//! | REQ-MISSING-TRANSPOSE | SHIPPED (#2009) | `transpose()` returns a `(n_cols, n_rows)` CSC of `Aᵀ` via sprs `transpose_view().to_csc()`, mirroring scipy `A.T` (`_csc.py:20` — CSR view of the same buffers, here materialized as CSC). Live oracle: `A.T.toarray()`=`[[1,0,4],[0,3,0],[2,0,5]]`; non-square `B=[[1,2,3],[4,5,6]]` -> `B.T.toarray()`=`[[1,4],[2,5],[3,6]]` shape `(3,2)`; double-transpose round-trips. Guards `csc_transpose_matches_scipy`/`csc_transpose_non_square`/`csc_transpose_twice_roundtrip`. |
 //! | REQ-MISSING-REDUCE | SHIPPED (#2010) | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csc_sum_matches_scipy`/`csc_sum_axis0_matches_scipy`/`csc_sum_axis1_matches_scipy`/`csc_diagonal_matches_scipy`/`csc_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2011. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`astype`/`copy`/`max`/`min`. Blocker #2012. |
@@ -355,6 +355,25 @@ where
         }
         out
     }
+
+    /// Transpose: returns a new `(n_cols, n_rows)` CSC matrix whose dense form
+    /// is `Aᵀ`.
+    ///
+    /// Mirrors scipy `csc_matrix.transpose()` / `.T` (`scipy/sparse/_csc.py:20`),
+    /// where `A.T` reinterprets the same `(data, indices, indptr)` buffers as a
+    /// CSR container of shape `(N, M)` (a no-allocation storage-order swap). Here
+    /// that CSR-storage view of `Aᵀ` is materialized back into owned CSC storage
+    /// via sprs `transpose_view().to_csc()`, so the result is a `CscMatrix` of
+    /// `Aᵀ`.
+    #[must_use]
+    pub fn transpose(&self) -> CscMatrix<T>
+    where
+        T: Clone + Default + 'static,
+    {
+        Self {
+            inner: self.inner.transpose_view().to_csc(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -552,6 +571,43 @@ mod tests {
     fn csc_diagonal_non_square() {
         let m = sample_csc_b();
         assert_eq!(m.diagonal(), array![1.0, 5.0]);
+    }
+
+    // REQ-MISSING-TRANSPOSE — live scipy oracle (R-CHAR-3). Expected values from
+    // `python3 -c "import numpy as np, scipy.sparse as sp;
+    //   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+    //   B=sp.csc_matrix(np.array([[1.,2,3],[4,5,6]]));
+    //   print(A.T.toarray().tolist(), B.T.toarray().tolist())"`
+    //   -> [[1,0,4],[0,3,0],[2,0,5]] [[1,4],[2,5],[3,6]].
+
+    #[test]
+    fn csc_transpose_matches_scipy() {
+        let a = sample_csc();
+        let at = a.transpose();
+        assert_eq!(at.n_rows(), 3);
+        assert_eq!(at.n_cols(), 3);
+        assert_eq!(
+            at.to_dense(),
+            array![[1.0, 0.0, 4.0], [0.0, 3.0, 0.0], [2.0, 0.0, 5.0]]
+        );
+    }
+
+    #[test]
+    fn csc_transpose_non_square() {
+        let b = sample_csc_b();
+        let bt = b.transpose();
+        assert_eq!(bt.n_rows(), 3);
+        assert_eq!(bt.n_cols(), 2);
+        assert_eq!(bt.to_dense(), array![[1.0, 4.0], [2.0, 5.0], [3.0, 6.0]]);
+    }
+
+    #[test]
+    fn csc_transpose_twice_roundtrip() {
+        let b = sample_csc_b();
+        let btt = b.transpose().transpose();
+        assert_eq!(btt.n_rows(), 2);
+        assert_eq!(btt.n_cols(), 3);
+        assert_eq!(btt.to_dense(), b.to_dense());
     }
 }
 
