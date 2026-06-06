@@ -38,11 +38,13 @@ iteration in a single file).
 """
 
 import inspect
+import warnings
 
 import numpy as np
 import pytest
 
 import ferrolearn as fl
+from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import ElasticNet as SkElasticNet
 from sklearn.linear_model import Lasso as SkLasso
 from sklearn.linear_model import LinearRegression as SkLinearRegression
@@ -950,3 +952,165 @@ def test_lasso_elasticnet_multioutput_pickle_predict_shape():
             fr_un.predict(_X_MO), fr.predict(_X_MO), atol=1e-12
         )
         assert fr_un.predict(_X_MO).shape == (5, 2)
+
+
+# Fixtures for the ConvergenceWarning divergence (#2127). `_X_CONV`/`_y_CONV`
+# do NOT converge in a single CD sweep (sklearn n_iter_ == 1 at max_iter=1), so
+# both ferrolearn and sklearn raise exactly one ConvergenceWarning; at the
+# default max_iter=1000 the CD converges (n_iter_ << 1000) and NEITHER warns.
+_X_CONV = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+_y_CONV = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+# Two targets on DIFFERENT scales so the per-target CD warning messages are
+# byte-distinct on BOTH sides — sklearn emits genuinely 2 warnings (no
+# message-identical dedup), pinning ferrolearn's per-target count to 2.
+_Y_CONV_MO = np.array(
+    [[3.0, 100.0], [2.5, 200.0], [7.1, 300.0], [6.0, 150.0], [11.2, 80.0]]
+)
+
+
+def _capture_convergence_warnings(fit_callable):
+    """Run `fit_callable()` and return the list of ConvergenceWarning messages.
+
+    Uses `simplefilter('always')` so the count reflects every warning the
+    estimator actually emitted (subject only to Python's byte-identical-message
+    collapse, which sklearn's own per-target loop is equally subject to).
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        fit_callable()
+    return [
+        str(w.message)
+        for w in caught
+        if issubclass(w.category, ConvergenceWarning)
+    ]
+
+
+def test_lasso_elasticnet_convergence_warning_at_max_iter():
+    """`ferrolearn.Lasso`/`ElasticNet` emit a `ConvergenceWarning` when the
+    coordinate-descent loop hits `max_iter` without converging — matching
+    sklearn 1.5.2 EXACTLY (#2127).
+
+    sklearn's CD warns once per non-converged fit from `_cd_fast.pyx:256-269`
+    (the `for/else` that runs only when the loop never `break`s on the duality
+    gap), iff `n_iter_ >= max_iter`. ferrolearn surfaces the real `n_iter_`
+    (#2043/#2096), so the wrapper warns on the same condition with sklearn's
+    exact wording (British "regularisation"). Was: ferrolearn emitted NO warning.
+
+    Oracle (R-CHAR-3): the SAME fit on the LIVE sklearn estimator is asserted to
+    warn (max_iter=1) / not warn (max_iter=1000) in this test — the behavior is
+    pinned to sklearn, never copied from ferrolearn.
+    """
+    for fr_cls, sk_cls, kw in (
+        (fl.Lasso, SkLasso, {"alpha": 0.5}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.5}),
+    ):
+        # max_iter=1 does NOT converge: exactly one ConvergenceWarning, and the
+        # live sklearn estimator warns on the identical fit (R-CHAR-3).
+        fr_msgs = _capture_convergence_warnings(
+            lambda c=fr_cls, k=kw: c(max_iter=1, **k).fit(_X_CONV, _y_CONV)
+        )
+        sk_msgs = _capture_convergence_warnings(
+            lambda c=sk_cls, k=kw: c(max_iter=1, **k).fit(_X_CONV, _y_CONV)
+        )
+        assert len(sk_msgs) == 1, f"{sk_cls.__name__} sklearn baseline"
+        assert len(fr_msgs) == 1, f"{fr_cls.__name__} should warn once"
+        assert fr_msgs[0].startswith("Objective did not converge")
+        assert sk_msgs[0].startswith("Objective did not converge")
+
+        # max_iter=1000 converges: NEITHER ferrolearn NOR sklearn warns.
+        fr_conv = _capture_convergence_warnings(
+            lambda c=fr_cls, k=kw: c(max_iter=1000, **k).fit(_X_CONV, _y_CONV)
+        )
+        sk_conv = _capture_convergence_warnings(
+            lambda c=sk_cls, k=kw: c(max_iter=1000, **k).fit(_X_CONV, _y_CONV)
+        )
+        assert len(sk_conv) == 0, f"{sk_cls.__name__} converges, no warning"
+        assert len(fr_conv) == 0, f"{fr_cls.__name__} converges, no warning"
+
+
+def test_lasso_convergence_warning_multioutput_per_target():
+    """Multi-output `ferrolearn.Lasso` emits one `ConvergenceWarning` per
+    non-converged target column, matching sklearn's per-target CD loop count
+    (#2127).
+
+    sklearn fits each target independently (`_coordinate_descent.py:1072-1103`),
+    each `self.path` call warning from `_cd_fast.pyx:269` when that target hits
+    `max_iter`. The wrapper's per-target loop warns on each target's real
+    `n_iter_j >= max_iter`. On `_Y_CONV_MO` the two targets are on different
+    scales so both warning messages are byte-distinct — sklearn genuinely emits
+    2, pinning ferrolearn to 2 (R-CHAR-3).
+    """
+    sk_msgs = _capture_convergence_warnings(
+        lambda: SkLasso(alpha=0.5, max_iter=1).fit(_X_CONV, _Y_CONV_MO)
+    )
+    fr_msgs = _capture_convergence_warnings(
+        lambda: fl.Lasso(alpha=0.5, max_iter=1).fit(_X_CONV, _Y_CONV_MO)
+    )
+    assert len(sk_msgs) == 2, "sklearn baseline: one warning per target"
+    assert len(fr_msgs) == 2, "ferrolearn: one warning per non-converged target"
+    assert all(m.startswith("Objective did not converge") for m in fr_msgs)
+
+
+def _parse_gap(msg):
+    """Parse the `Duality gap: <g>` float out of a ConvergenceWarning message."""
+    import re
+
+    m = re.search(r"Duality gap:\s*([0-9.eE+-]+)", msg)
+    return float(m.group(1)) if m else None
+
+
+def test_red_lasso_elasticnet_convergence_warning_gap_value_matches_sklearn():
+    """Divergence: `ferrolearn.Lasso`/`ElasticNet`'s ConvergenceWarning message
+    prints the WRONG duality-gap number.
+
+    sklearn's coordinate-descent warning is emitted from INSIDE `cd_fast`
+    (`sklearn/linear_model/_cd_fast.pyx:256-260`):
+        ``f"... Duality gap: {gap:.3e}, tolerance: {tol:.3e}"``
+    where `gap` is the RAW cd_fast objective gap (the objective in cd_fast is
+    `n_samples` times the user-facing objective, per the comment at
+    `sklearn/linear_model/_coordinate_descent.py:707-709`
+    ``dual_gaps[i] = dual_gap_ / n_samples``). The fitted attribute
+    `self.dual_gap_` is therefore the cd_fast gap DIVIDED by `n_samples`, while
+    the WARNING MESSAGE shows the UNDIVIDED gap (`n_samples` times larger).
+
+    ferrolearn's `_regressors.py::_warn_convergence(self.dual_gap_, tol_scaled)`
+    (`ferrolearn-python/python/ferrolearn/_regressors.py:330`) passes the
+    rescaled fitted attribute `self.dual_gap_` (== cd_fast gap / n_samples) into
+    the message, so its printed gap is `n_samples`x too small relative to
+    sklearn's. On the 5-sample `_X_CONV`/`_y_CONV` fixture at `max_iter=1`
+    sklearn prints `7.071e+00` (Lasso) while ferrolearn prints `1.414e+00`.
+
+    The STORED `dual_gap_` attribute matches sklearn exactly (that is NOT the
+    divergence); only the human-readable warning text diverges. Note the root:
+    the binding's `_warn_convergence` call site, NOT the Rust crate.
+
+    Oracle (R-CHAR-3): the expected gap is parsed from the LIVE sklearn 1.5.2
+    warning message in this same test, never copied from the ferrolearn side.
+
+    Tracking: #2128 (release-blocker, left un-ignored per goal.md R-DEFER-3).
+    """
+    for fr_cls, sk_cls, kw in (
+        (fl.Lasso, SkLasso, {"alpha": 0.5}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.5}),
+    ):
+        fr_msgs = _capture_convergence_warnings(
+            lambda c=fr_cls, k=kw: c(max_iter=1, **k).fit(_X_CONV, _y_CONV)
+        )
+        sk_msgs = _capture_convergence_warnings(
+            lambda c=sk_cls, k=kw: c(max_iter=1, **k).fit(_X_CONV, _y_CONV)
+        )
+        assert len(sk_msgs) == 1 and len(fr_msgs) == 1
+
+        sk_gap = _parse_gap(sk_msgs[0])
+        fr_gap = _parse_gap(fr_msgs[0])
+        assert sk_gap is not None and fr_gap is not None
+
+        # ferrolearn's printed gap must match sklearn's printed gap (the RAW
+        # cd_fast gap), to 0.1% relative. Currently ferrolearn prints
+        # dual_gap_ == sk_gap / n_samples, so this FAILS by a factor of
+        # n_samples (== 5 on this fixture).
+        assert abs(fr_gap - sk_gap) <= 1e-3 * abs(sk_gap), (
+            f"{fr_cls.__name__}: ferrolearn warning gap {fr_gap:.3e} != "
+            f"sklearn warning gap {sk_gap:.3e} (factor "
+            f"{sk_gap / fr_gap:.2f}, == n_samples)"
+        )
