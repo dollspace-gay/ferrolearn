@@ -76,7 +76,7 @@
 //! | REQ-5 (`class_log_prior_` empirical / uniform + `class_prior` LENGTH-only — MATCH) | SHIPPED | `fn resolve_class_log_prior` validates ONLY `priors.len() != n_classes` (then `p.ln()`), else empirical `ln(count_c / total)` (`fit_prior`), else uniform `(1/n_classes).ln()` — mirroring `_update_class_log_prior` (`naive_bayes.py:580-602`: LENGTH-only check `:589-591`, empirical `log(class_count_) - log(class_count_.sum())` `:600`, uniform `-log(n_classes)` `:602`). Discrete NB has NO sum-to-1 / non-negativity check — a deliberate MATCH. Non-test consumer: `fit_pipeline` → `fit` (the `fit_prior=true` empirical path; `with_class_prior` exercised in-crate). Verified: green guard `green_categorical_class_prior_length_only` — `with_class_prior([0.5,0.3]).fit(X,y)` SUCCEEDS (sum 0.8; sklearn `class_log_prior_ = log([0.5,0.3]) = [-0.6931471805599453, -1.2039728043259361]`, NO error); `test_categorical_nb_default` covers the empirical path. (Wrong-length error TYPE differs — `InvalidParameter` vs sklearn `ValueError("Number of priors must match number of classes.")` — folded into REQ-9's surface gap.) |
 //! | REQ-6 (`force_alpha` floor + `fit_prior` toggle + `score`) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` `1e-10` floor unless `force_alpha`, `naive_bayes.py:604-626`); `fn resolve_class_log_prior` selects empirical vs uniform on `fit_prior`; `pub fn score` returns mean accuracy (`ClassifierMixin.score` analog). Non-test consumer: `fit_pipeline` passes `force_alpha`/`fit_prior` through the builder. Verified: green guard `green_categorical_score_accuracy` — `CategoricalNB().fit(X,y).score(X,y) = 1.0` (sklearn oracle) on the separable fixture; `clamp_alpha(1, true) = 1`. In-tree `test_categorical_nb_alpha_smoothing_effect`. |
 //! | REQ-7 (`partial_fit` VALUE — same-categories/classes path) | SHIPPED (same-categories path) | `FittedCategoricalNB::partial_fit` increments the per-(feature, class, category) `category_counts` / `class_counts` for existing categories/classes, then recomputes `feature_log_prob` (same `recompute_feature_log_prob` smoothing) and `class_log_prior` (`resolve_class_log_prior`), mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-recompute (`naive_bayes.py:628-709` → `_count` → `_update_feature_log_prob` / `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` surface is REQ-9). Verified: in-tree fit-then-predict coverage on within-fitted data. EXTENSION + GAPS (NOT-STARTED, folded into #924): `partial_fit` APPENDS never-seen category values to `categories[j]` and INSERTS never-seen class labels into `classes` (a non-sklearn flexibility — documented in the method doc-comment; sklearn keeps `n_categories_` fixed and `IndexError`s a category `>= n_categories_`, and binarizes against the full `classes=` list); `partial_fit` also has NO `sample_weight` and NO negative-feature validation. |
-//! | REQ-8 (unseen-category at predict + predict-path negative validation) | NOT-STARTED | open prereq blocker **#920**. sklearn requires category indices `< n_categories_[i]`; the `_joint_log_likelihood` fancy-index `feature_log_prob_[i][:, X[:,i]]` (`naive_bayes.py:1513`) raises `IndexError("index 5 is out of bounds for axis 1 with size 2")` for an index `>= n_categories_`, and `_check_X` runs `check_non_negative` on the predict path (`naive_bayes.py:1432`). `fn log_prob_for` returns a uniform `(1/(n_known_cats+1)).ln()` fallback for any unknown category — NO error (`predict([[5,0]])` → `[0]`, `predict_proba` → `[[0.5,0.5]]`); the predict path also maps a negative value to 0 via `to_usize().unwrap_or(0)` with no guard. Matching sklearn's `IndexError` / predict-path reject requires threading a `Result` through `log_prob_for` / `joint_log_likelihood` — not a one-line fix. |
+//! | REQ-8 (unseen-category at predict + predict-path negative validation) | SHIPPED | `impl BaseNB::joint_log_likelihood` for `FittedCategoricalNB` runs an upfront validation pass over every `x[[i,j]]` BEFORE scoring: a negative value returns `FerroError::InvalidParameter { name: "X", reason: "Negative values in data passed to CategoricalNB (input X)" }` (mirroring `_check_X` → `check_non_negative`, `naive_bayes.py:1432` → `ValueError`), and a category index `cat >= self.categories[j].len()` (== `n_categories_[j]`) returns `FerroError::InvalidParameter { name: "X", reason: "index {cat} is out of bounds for axis 1 with size {n_cat}" }` (mirroring the `_joint_log_likelihood` fancy-index `feature_log_prob_[i][:, X[:,i]]`, `naive_bayes.py:1513` → `IndexError`). DEVIATION: ferrolearn maps both sklearn `ValueError` (negative) and `IndexError` (unseen category) to `FerroError::InvalidParameter` — the workspace error analog (R-DEV-2: match the accept/reject decision, error TYPE differs). Every `predict`/`predict_proba`/`predict_log_proba`/`predict_joint_log_proba` delegates to `joint_log_likelihood`, so all reject. The `fn log_prob_for` uniform fallback is now unreachable for invalid indices (left harmless). Non-test consumer: `predict_pipeline` → `predict` → `joint_log_likelihood`. Verified: green pins `categorical_predict_negative_rejected` + `categorical_predict_unseen_category_rejected` (#920): `fitted.predict([[-1,0]])` and `fitted.predict([[5,0]])` (cat 5 ≥ `n_categories_[0]=3`) both return `Err(InvalidParameter)` (sklearn: `ValueError` / `IndexError("index 5 is out of bounds for axis 1 with size 3")`). |
 //! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedCategoricalNB` exposes `feature_log_prob(&self) -> &[Vec<Vec<F>>]` (`&self.feature_log_prob`, sklearn `feature_log_prob_`, `naive_bayes.py:1273`; indexed `[feature][class][category]`), `category_count(&self) -> &[Vec<Vec<usize>>]` (`&self.category_counts`, sklearn `category_count_` — sklearn's are float arrays of the same per-(feature,class,category) counts; ferrolearn stores integer counts, `naive_bayes.py:1266`), `n_categories(&self) -> Vec<usize>` (`self.categories.iter().map(Vec::len).collect()`, sklearn `n_categories_`, `naive_bayes.py:1303`), `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:1273`), and `class_log_prior(&self) -> &[F]` (`&self.class_log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2, so no such getter is added. Live oracle (`X=[[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y=[0,0,0,1,1,1]`): `n_categories_ = [3,2]`, `class_count_ = [3,3]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `category_count_[0] = [[2,1,0],[0,1,2]]`, `category_count_[1] = [[2,1],[1,2]]`, `feature_log_prob_[0] = [[-0.69314718,-1.09861229,-1.79175947],[-1.79175947,-1.09861229,-0.69314718]]`, `feature_log_prob_[1] = [[-0.51082562,-0.91629073],[-0.91629073,-0.51082562]]`. In-tree `categorical_n_categories_class_count_prior_match_sklearn` / `categorical_feature_log_prob_and_category_count_match_sklearn`. |
 //! | REQ-9b (PyO3 binding + sample_weight surface) | NOT-STARTED | open prereq blocker **#923**. **CategoricalNB has NO PyO3 binding** — no `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs`, no `ferrolearn.CategoricalNB` (grep confirms zero `CategoricalNB` hits under `ferrolearn-python/`), so `import ferrolearn` cannot reach it; the Rust fitted accessors (REQ-9a) are not bridged to Python (`feature_log_prob_` / `category_count_` / `class_count_` / `class_log_prior_` / `n_categories_` / `classes_` / `n_features_in_`, `naive_bayes.py:1266-1303`). Also subsumes the wrong-length `class_prior` error-TYPE sub-item (REQ-5) and the negative-feature MESSAGE/TYPE-parity sub-item (REQ-3). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (`sample_weight` + `partial_fit` new-category/new-class extension + negative validation) | NOT-STARTED | open prereq blocker **#924**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:1353`, `:712`) weights the binarized `Y` so `class_count_ = Y.sum(axis=0)` and the `np.bincount(X_feature[mask], weights=...)` per-category counts become weighted (`naive_bayes.py:1468-1496`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` is `fn fit(&self, x, y)` — NO `sample_weight` on `fit` or `partial_fit`; also the `partial_fit` new-category/new-class EXTENSION (R-DEV-7 deviation) and `partial_fit` negative-validation gap carved out of REQ-7 live here. |
@@ -709,6 +709,40 @@ impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedCategoricalNB<F> {
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
 
+        // Upfront predict-path validation mirroring sklearn's `_check_X`
+        // (`naive_bayes.py:1427-1433`) and the `_joint_log_likelihood` fancy
+        // index (`naive_bayes.py:1508-1515`). A negative value raises
+        // `ValueError("Negative values in data passed to CategoricalNB (input
+        // X)")` (`:1432` via `check_non_negative`); a category index not seen
+        // at fit (`>= n_categories_[i]` in sklearn's dense model) makes
+        // `feature_log_prob_[i][:, X[:,i]]` (`:1513`) raise `IndexError`. Both
+        // map to `FerroError::InvalidParameter` (the workspace error analog)
+        // instead of the silent map-to-0 / uniform-fallback divergence. The
+        // known-category set is `self.categories[j]` (the same lookup
+        // `log_prob_for` performs); an unknown value is the divergence's
+        // out-of-bounds case.
+        for i in 0..n_samples {
+            for j in 0..self.n_features {
+                let v = x[[i, j]];
+                if v < F::zero() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: "Negative values in data passed to CategoricalNB (input X)".into(),
+                    });
+                }
+                let cat = v.to_usize().unwrap_or(0);
+                let n_cat = self.categories[j].len();
+                if self.categories[j].binary_search(&cat).is_err() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: format!(
+                            "index {cat} is out of bounds for axis 1 with size {n_cat}"
+                        ),
+                    });
+                }
+            }
+        }
+
         let mut scores = Array2::<F>::zeros((n_samples, n_classes));
 
         for i in 0..n_samples {
@@ -969,8 +1003,13 @@ mod tests {
 
     #[test]
     fn test_categorical_nb_unseen_category() {
-        // Fit on categories {0, 1}, then predict with a sample containing
-        // category 5 (unseen). Should not panic, should return valid probabilities.
+        // Fit on categories {0, 1} (n_categories_ = [2, 2]), then predict with a
+        // sample containing category 5 (>= n_categories_[0] = 2). sklearn's
+        // `_joint_log_likelihood` fancy-index `feature_log_prob_[i][:, X[:,i]]`
+        // (naive_bayes.py:1513) raises `IndexError("index 5 is out of bounds for
+        // axis 1 with size 2")`; ferrolearn now rejects with
+        // `FerroError::InvalidParameter` (#920) instead of the old uniform
+        // graceful-degradation fallback.
         let x = Array2::from_shape_vec(
             (4, 2),
             vec![
@@ -988,14 +1027,12 @@ mod tests {
 
         // Predict with unseen category 5 in feature 0.
         let x_new = Array2::from_shape_vec((1, 2), vec![5.0, 0.0]).unwrap();
-        let preds = fitted.predict(&x_new).unwrap();
-        assert_eq!(preds.len(), 1);
-
-        let proba = fitted.predict_proba(&x_new).unwrap();
-        assert_relative_eq!(proba.row(0).sum(), 1.0, epsilon = 1e-10);
-        // Both probabilities should be between 0 and 1.
-        assert!(proba[[0, 0]] > 0.0 && proba[[0, 0]] < 1.0);
-        assert!(proba[[0, 1]] > 0.0 && proba[[0, 1]] < 1.0);
+        let result = fitted.predict(&x_new);
+        assert!(
+            matches!(result, Err(FerroError::InvalidParameter { .. })),
+            "predict on unseen category 5 (>= n_categories_[0]=2) must return \
+             Err(InvalidParameter) (sklearn IndexError), got {result:?}"
+        );
     }
 
     #[test]

@@ -82,6 +82,7 @@
 //! a substrate migration with no observable-value pin.
 
 use ferrolearn_bayes::CategoricalNB;
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::{Fit, Predict};
 use ndarray::{Array1, Array2, array};
 
@@ -208,6 +209,77 @@ fn divergence_categorical_negative_features_rejected() {
          'Negative values in data passed to CategoricalNB (input X)'), got Ok \
          (#922)"
     );
+}
+
+// ===========================================================================
+// #920 — predict-path validation: negative + unseen-category at predict.
+//
+// sklearn `CategoricalNB._check_X` runs `check_non_negative(X, "CategoricalNB
+// (input X)")` on the predict path (naive_bayes.py:1432) → a negative value
+// raises `ValueError`; and `_joint_log_likelihood`'s fancy-index
+// `feature_log_prob_[i][:, X[:,i]]` (naive_bayes.py:1513) raises `IndexError`
+// for a category index `>= n_categories_[i]`.
+//
+// On `X = [[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y = [0,0,0,1,1,1]`
+// (`n_categories_ = [3,2]`):
+//
+//   python3 -c "from sklearn.naive_bayes import CategoricalNB; import numpy as np
+//   X=np.array([[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]); y=np.array([0,0,0,1,1,1])
+//   m=CategoricalNB().fit(X,y)
+//   for q in ([[-1,0]],[[5,0]]):
+//       try: m.predict(np.array(q)); print('no error')
+//       except Exception as e: print(type(e).__name__,'::',e)"
+//   ->  predict([[-1,0]])  ValueError :: Negative values in data passed to
+//                          CategoricalNB (input X)
+//   ->  predict([[5,0]])   IndexError :: index 5 is out of bounds for axis 1
+//                          with size 3
+//
+// ferrolearn maps both to `FerroError::InvalidParameter` (the workspace error
+// analog) — the predict path now rejects instead of silently mapping `-1 → 0`
+// or returning a uniform fallback for the unseen category. Tracking: #920
+// ===========================================================================
+
+/// Pin #920: ferrolearn's predict path must REJECT a negative feature value
+/// (sklearn `_check_X` → `check_non_negative`, naive_bayes.py:1432 →
+/// `ValueError`). ferrolearn returns `Err(FerroError::InvalidParameter)`.
+#[test]
+fn categorical_predict_negative_rejected() -> Result<(), FerroError> {
+    let (x, y) = categorical_fixture();
+    let fitted = CategoricalNB::<f64>::new().fit(&x, &y)?;
+
+    // q[0,0] = -1.0 — sklearn raises ValueError (oracle above).
+    let q = array![[-1.0_f64, 0.0]];
+    let result = fitted.predict(&q);
+
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "predict on a negative feature must return Err(InvalidParameter) \
+         (sklearn: ValueError 'Negative values in data passed to CategoricalNB \
+         (input X)'), got {result:?} (#920)"
+    );
+    Ok(())
+}
+
+/// Pin #920: ferrolearn's predict path must REJECT an unseen category index
+/// `>= n_categories_[i]` (sklearn `_joint_log_likelihood` fancy-index,
+/// naive_bayes.py:1513 → `IndexError`). Category 5 ≥ `n_categories_[0] = 3`.
+/// ferrolearn returns `Err(FerroError::InvalidParameter)`.
+#[test]
+fn categorical_predict_unseen_category_rejected() -> Result<(), FerroError> {
+    let (x, y) = categorical_fixture();
+    let fitted = CategoricalNB::<f64>::new().fit(&x, &y)?;
+
+    // q[0,0] = 5.0, but n_categories_[0] = 3 — sklearn raises IndexError.
+    let q = array![[5.0_f64, 0.0]];
+    let result = fitted.predict(&q);
+
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "predict on an unseen category (5 >= n_categories_[0]=3) must return \
+         Err(InvalidParameter) (sklearn: IndexError 'index 5 is out of bounds \
+         for axis 1 with size 3'), got {result:?} (#920)"
+    );
+    Ok(())
 }
 
 // ===========================================================================
