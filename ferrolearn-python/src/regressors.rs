@@ -15,9 +15,9 @@
 //! `.design/python/regressors.md` (20 REQs). Every REQ is BINARY (R-DEFER-2):
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Verified via
 //! `tests/divergence_regressors.py` + `tests/test_check_estimator.py` +
-//! `tests/test_cross_val_score.py` (542 pytest pass).
+//! `tests/test_cross_val_score.py` (616 pytest pass).
 //!
-//! **15 SHIPPED / 5 NOT-STARTED.**
+//! **17 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -33,11 +33,13 @@
 //! | REQ-LASSO-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2041: `_regressors.py::Lasso.__init__(self, alpha=1.0, *, ...)` moves `alpha` before the `*`, so `ferrolearn.Lasso(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:1310`. Guard `test_red_lasso_alpha_positional`. |
 //! | REQ-LASSO-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/6 match the sklearn `Lasso` oracle ≤1e-6 for converged coef/intercept + exact-zero support (cyclic CD, `l1_reg=α·n`). (Dual-gap stopping #412, positive/selection='random' downstream.) |
 //! | REQ-LASSO-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsLasso::n_iter_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::Lasso.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedLasso::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-11/12 SHIPPED, #411 closed). Non-test consumer: `_regressors.py::Lasso` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.Lasso(alpha=0.5).fit(X,y).n_iter_ == SkLasso(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
+//! | REQ-LASSO-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsLasso::dual_gap_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::Lasso.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedLasso::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-11). Non-test consumer: `_regressors.py::Lasso` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.Lasso(0.3).dual_gap_ - SkLasso(0.3).dual_gap_) < 1e-9`, live oracle). |
 //! | REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED | the wrapper exposes `alpha`/`max_iter`/`tol`/`fit_intercept` only; sklearn `_coordinate_descent.py:1310-1322`. Default cyclic MATCHES — downstream #407/#408/#409/#410. |
 //! | REQ-ELASTICNET-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsElasticNet::fit`/`predict` + getters, wrapped by `_regressors.py::ElasticNet` (marshals `alpha`/`l1_ratio`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-ELASTICNET-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2042: `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, ...)` moves ONLY `alpha` before the `*` (l1_ratio stays keyword-only), so `ferrolearn.ElasticNet(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:898`. Guard `test_red_elasticnet_alpha_positional`. |
 //! | REQ-ELASTICNET-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/5 match the sklearn `ElasticNet` oracle <1e-5 over the (alpha,l1_ratio) grid (`l1_reg=α·l1_ratio·n`, `l2_reg=α·(1−l1_ratio)·n`), incl. l1_ratio=1↔Lasso / 0↔L2. (Dual-gap #412 downstream.) |
 //! | REQ-ELASTICNET-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsElasticNet::n_iter_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::ElasticNet.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedElasticNet::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-12/13 SHIPPED, #417 closed). Non-test consumer: `_regressors.py::ElasticNet` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.ElasticNet(alpha=0.5).fit(X,y).n_iter_ == SkElasticNet(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
+//! | REQ-ELASTICNET-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsElasticNet::dual_gap_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::ElasticNet.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedElasticNet::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-12). Non-test consumer: `_regressors.py::ElasticNet` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.ElasticNet(0.3).dual_gap_ - SkElasticNet(0.3).dual_gap_) < 1e-9`, live oracle, default l1_ratio=0.5). |
 //! | REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED | the wrapper exposes `alpha`/`l1_ratio`/`max_iter`/`tol`/`fit_intercept` only; sklearn `_coordinate_descent.py:898-912`. Default cyclic MATCHES — downstream #407/#408/#409/#410. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_regressors.py::{LinearRegression,Ridge,Lasso,ElasticNet}` construct their `_Rs*` class and drive fit/predict + coef_/intercept_ reads; `ferrolearn/__init__.py` re-exports all four; `test_check_estimator.py` + `test_cross_val_score.py` exercise them (542 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
@@ -270,6 +272,15 @@ impl RsLasso {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.n_iter())
     }
+
+    #[getter]
+    fn dual_gap_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.dual_gap())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,5 +369,14 @@ impl RsElasticNet {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.n_iter())
+    }
+
+    #[getter]
+    fn dual_gap_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.dual_gap())
     }
 }

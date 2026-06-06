@@ -157,6 +157,7 @@ class Lasso(RegressorMixin, BaseEstimator):
         self.coef_ = np.array(self._rs.coef_)
         self.intercept_ = float(self._rs.intercept_)
         self.n_iter_ = int(self._rs.n_iter_)
+        self.dual_gap_ = float(self._rs.dual_gap_)
         return self
 
     def predict(self, X):
@@ -216,6 +217,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
         self.coef_ = np.array(self._rs.coef_)
         self.intercept_ = float(self._rs.intercept_)
         self.n_iter_ = int(self._rs.n_iter_)
+        self.dual_gap_ = float(self._rs.dual_gap_)
         return self
 
     def predict(self, X):

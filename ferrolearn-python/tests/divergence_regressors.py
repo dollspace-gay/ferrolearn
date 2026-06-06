@@ -276,3 +276,36 @@ def test_lasso_elasticnet_n_iter_matches_sklearn():
     fr_lasso2 = fl.Lasso(alpha=0.1).fit(_X_NITER, _y_NITER)
     assert fr_lasso2.n_iter_ == sk_lasso2.n_iter_
     assert fr_lasso2.n_iter_ < fr_lasso2.max_iter
+
+
+def test_lasso_elasticnet_dual_gap_matches_sklearn():
+    """`ferrolearn.Lasso`/`ElasticNet` expose the `dual_gap_` fitted attribute,
+    matching sklearn's value at the returned solution.
+
+    sklearn sets `self.dual_gap_ = dual_gaps_[0]`
+    (`sklearn/linear_model/_coordinate_descent.py:1108`, single-target collapse;
+    `:1111` multi-target) — the duality gap of the coordinate-descent objective
+    at convergence. The Rust `FittedLasso::dual_gap()` / `FittedElasticNet::dual_gap()`
+    (`ferrolearn-linear` REQ-11/12) are bit-faithful to sklearn's gap; the binding
+    surfaces them via the `_RsLasso`/`_RsElasticNet` `dual_gap_` getter, set in
+    `_regressors.py::{Lasso,ElasticNet}.fit` as `self.dual_gap_ =
+    float(self._rs.dual_gap_)`.
+
+    Oracle (R-CHAR-3): the expected value comes from the LIVE sklearn 1.5.2 call
+    in this test, never copied from the ferrolearn side. Fixture matches the
+    director's verified probe (Lasso dual_gap_ ~1.17e-4, ElasticNet ~1.06e-4).
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    y = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+
+    # Lasso(alpha=0.3): ferrolearn's dual_gap_ matches the live sklearn oracle.
+    sk_lasso = SkLasso(alpha=0.3).fit(X, y)
+    fr_lasso = fl.Lasso(alpha=0.3).fit(X, y)
+    assert hasattr(fr_lasso, "dual_gap_")
+    assert abs(float(fr_lasso.dual_gap_) - float(sk_lasso.dual_gap_)) < 1e-9
+
+    # ElasticNet(alpha=0.3) (default l1_ratio=0.5, matching sklearn): same parity.
+    sk_enet = SkElasticNet(alpha=0.3).fit(X, y)
+    fr_enet = fl.ElasticNet(alpha=0.3).fit(X, y)
+    assert hasattr(fr_enet, "dual_gap_")
+    assert abs(float(fr_enet.dual_gap_) - float(sk_enet.dual_gap_)) < 1e-9
