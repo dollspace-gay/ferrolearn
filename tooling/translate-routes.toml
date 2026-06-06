@@ -1395,6 +1395,19 @@ upstream = [
 design = ".design/python/regressors.md"
 parity_ops = ["LinearRegression", "Ridge", "Lasso", "ElasticNet"]
 
+# The PyO3 #[pymodule] registration boundary (`m.add_class::<...>()`) — the
+# production consumer that exposes each estimator pyclass to `import ferrolearn`.
+# Routed against the estimator module currently extending it (mirrors the
+# ferrolearn-linear/src/lib.rs aggregator precedent) so the translate-discipline
+# gate is satisfied by the same upstream/design reads that govern that edit.
+[[route]]
+crate_pattern = "ferrolearn-python/src/lib.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/linear_model/_ridge.py",
+]
+design = ".design/python/regressors.md"
+parity_ops = ["pymodule registration boundary"]
+
 [[route]]
 crate_pattern = "ferrolearn-python/src/classifiers.rs"
 upstream = [

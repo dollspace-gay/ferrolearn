@@ -17,7 +17,7 @@
 //! `tests/divergence_regressors.py` + `tests/test_check_estimator.py` +
 //! `tests/test_cross_val_score.py` (616 pytest pass).
 //!
-//! **18 SHIPPED / 5 NOT-STARTED.**
+//! **19 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -29,6 +29,7 @@
 //! | REQ-RIDGE-API-CONFORM (fit/predict + coef_/intercept_, default cholesky) | SHIPPED | `RsRidge::fit`/`predict` + getters, wrapped by `_regressors.py::Ridge` (marshals `alpha` via `with_alpha`) — mirroring `_ridge.py:914`. Live default-path oracle matches element-wise. |
 //! | REQ-RIDGE-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2040: `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True)` moves `alpha` before the `*`, so `ferrolearn.Ridge(0.5).alpha == 0.5` matching sklearn `_ridge.py:893`. Guard `test_red_ridge_alpha_positional`. |
 //! | REQ-RIDGE-VALUE-PARITY (coef_/intercept_ array parity, default cholesky) | SHIPPED | default path: downstream `ferrolearn-linear` REQ-1/5 match the sklearn `Ridge` oracle ≤1e-8 across alpha∈{0.1,1,10,100} (closed-form Cholesky, unpenalized intercept). (Per-target alpha #385, multi-output #384, alt solvers downstream.) |
+//! | REQ-RIDGE-MULTIOUTPUT (2-D Y → 2-D coef_) | SHIPPED | `ferrolearn.Ridge.fit` accepts a 2-D `y` of shape `(n_samples, n_targets)` and produces `coef_` `(n_targets, n_features)` + `intercept_` `(n_targets,)`, matching sklearn `Ridge` (`sklearn/linear_model/_ridge.py:543` coef shape, `:550` intercept shape, per-target solve `:207`/`:218`). impl `#[pyclass(name="_RsRidgeMultiOutput")] RsRidgeMultiOutput::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` over `ferrolearn_linear::FittedRidgeMulti<f64>` (the `Fit<Array2,Array2> for Ridge` path, `ferrolearn-linear/src/ridge.rs:725`, producing `FittedRidgeMulti` with `coefficients()` `(n_features,n_targets)` `:713` + `intercepts()` `:719`, shipped #29). The `coef_` getter TRANSPOSES the `(n_features,n_targets)` storage to sklearn's `(n_targets,n_features)` (R-DEV-3). Non-test consumer: `_regressors.py::Ridge.fit` routes the `y.ndim==2 and y.shape[1]>1` path to `_RsRidgeMultiOutput` (registered in `lib.rs`); `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_ridge_multioutput_matches_sklearn` asserts `coef_` `(2,2)`, `intercept_` `(2,)`, and `predict` match the live sklearn oracle ≤1e-8 (R-CHAR-3); `test_ridge_singleoutput_unchanged_by_multioutput_path` guards the 1-D path stays scalar-intercept. Downstream `ferrolearn-linear` REQ-6 #384. |
 //! | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | NOT-STARTED | the wrapper exposes `alpha`/`fit_intercept` only; sklearn `_ridge.py:893-912`. Default cholesky MATCHES, only the param surface is missing — downstream #386/#387/#388/#390. |
 //! | REQ-LASSO-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsLasso::fit`/`predict` + getters, wrapped by `_regressors.py::Lasso` (marshals `alpha`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-LASSO-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2041: `_regressors.py::Lasso.__init__(self, alpha=1.0, *, ...)` moves `alpha` before the `*`, so `ferrolearn.Lasso(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:1310`. Guard `test_red_lasso_alpha_positional`. |
@@ -47,7 +48,7 @@
 
 use crate::conversions::*;
 use ferrolearn_core::{Fit, HasCoefficients, Predict};
-use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
 // ---------------------------------------------------------------------------
@@ -204,6 +205,92 @@ impl RsRidge {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.intercept())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ridge (multi-output 2-D Y)
+// ---------------------------------------------------------------------------
+
+/// Multi-output Ridge binding shim over
+/// [`ferrolearn_linear::FittedRidgeMulti`] (the `Fit<Array2, Array2>` path).
+///
+/// The Python wrapper `_regressors.py::Ridge.fit` routes to this class when
+/// `y.ndim == 2 and y.shape[1] > 1`, mirroring sklearn's
+/// `Ridge.coef_` shape `(n_targets, n_features)` / `intercept_` `(n_targets,)`
+/// (`sklearn/linear_model/_ridge.py:914`). The downstream Rust stores
+/// `coefficients()` as `(n_features, n_targets)`, so `coef_` is TRANSPOSED here
+/// to match the sklearn output contract (R-DEV-3).
+#[pyclass(name = "_RsRidgeMultiOutput")]
+pub struct RsRidgeMultiOutput {
+    alpha: f64,
+    fit_intercept: bool,
+    fitted: Option<ferrolearn_linear::FittedRidgeMulti<f64>>,
+}
+
+#[pymethods]
+impl RsRidgeMultiOutput {
+    #[new]
+    #[pyo3(signature = (alpha=1.0, fit_intercept=true))]
+    fn new(alpha: f64, fit_intercept: bool) -> Self {
+        Self {
+            alpha,
+            fit_intercept,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy2_to_ndarray(y);
+        let model = ferrolearn_linear::Ridge::<f64>::new()
+            .with_alpha(self.alpha)
+            .with_fit_intercept(self.fit_intercept);
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &preds))
+    }
+
+    /// Coefficient matrix, shape `(n_targets, n_features)` — the TRANSPOSE of the
+    /// downstream `(n_features, n_targets)` storage, matching sklearn's `coef_`.
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        // Rust stores (n_features, n_targets); sklearn `coef_` is
+        // (n_targets, n_features). `.t()` gives a view; `.to_owned()` makes a
+        // contiguous owned array for marshalling.
+        let coef_t = fitted.coefficients().t().to_owned();
+        Ok(ndarray2_to_numpy(py, &coef_t))
+    }
+
+    #[getter]
+    fn intercept_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.intercepts()))
     }
 }
 

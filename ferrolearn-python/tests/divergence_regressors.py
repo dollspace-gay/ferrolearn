@@ -340,3 +340,137 @@ def test_linearregression_rank_singular_match_sklearn():
     assert hasattr(fr, "singular_")
     assert fr.rank_ == sk.rank_
     np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)
+
+
+def test_ridge_multioutput_matches_sklearn():
+    """`ferrolearn.Ridge` fits 2-D `Y` (multi-output), matching sklearn EXACTLY.
+
+    sklearn `Ridge` accepts `y` of shape `(n_samples, n_targets)` and sets
+    `coef_` of shape `(n_targets, n_features)` and `intercept_` of shape
+    `(n_targets,)` (`sklearn/linear_model/_ridge.py:543`/`:550`; the per-target
+    closed-form solve at `:207`/`:218`). The Rust `Fit<Array2, Array2> for Ridge`
+    (`ferrolearn-linear/src/ridge.rs:725`) produces `FittedRidgeMulti` with
+    `coefficients()` `(n_features, n_targets)` (`:713`) and `intercepts()`
+    `(n_targets,)` (`:719`), shipped in #29; the binding
+    `_RsRidgeMultiOutput.coef_` getter TRANSPOSES to `(n_targets, n_features)` to
+    match sklearn's output contract, and `_regressors.py::Ridge.fit` routes the
+    2-D-`y` path to it.
+
+    Oracle (R-CHAR-3): every expected value comes from the LIVE sklearn 1.5.2
+    call in this test, never copied from the ferrolearn side.
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    Y = np.array([[3.0, 1.0], [2.5, 2.0], [7.1, 0.0], [6.0, 3.0], [11.2, 1.0]])
+
+    sk = SkRidge(alpha=1.0).fit(X, Y)
+    fr = fl.Ridge(alpha=1.0).fit(X, Y)
+
+    # coef_ is (n_targets, n_features) == (2, 2), matching sklearn.
+    assert fr.coef_.shape == (2, 2)
+    assert fr.coef_.shape == sk.coef_.shape
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+
+    # intercept_ is (n_targets,) == (2,), matching sklearn.
+    assert fr.intercept_.shape == (2,)
+    assert fr.intercept_.shape == sk.intercept_.shape
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-8)
+
+    # predict returns (n_samples, n_targets), matching sklearn element-wise.
+    fr_pred = fr.predict(X[:2])
+    sk_pred = sk.predict(X[:2])
+    assert fr_pred.shape == sk_pred.shape == (2, 2)
+    np.testing.assert_allclose(fr_pred, sk_pred, atol=1e-8)
+
+
+def test_ridge_singleoutput_unchanged_by_multioutput_path():
+    """Single-output `ferrolearn.Ridge` (1-D `y`) is UNCHANGED: `coef_` is 1-D and
+    `intercept_` is a scalar float, matching sklearn (`_ridge.py:670-672` ravel).
+
+    Guards that the multi-output routing in `Ridge.fit` did not regress the 1-D
+    path. Oracle is the live sklearn 1.5.2 call (R-CHAR-3).
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    y = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+
+    sk = SkRidge(alpha=1.0).fit(X, y)
+    fr = fl.Ridge(alpha=1.0).fit(X, y)
+
+    assert fr.coef_.ndim == 1
+    assert fr.coef_.shape == sk.coef_.shape == (2,)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+
+    # intercept_ is a scalar float (not an array), matching the 1-D contract.
+    assert np.isscalar(fr.intercept_) or np.ndim(fr.intercept_) == 0
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) < 1e-8
+
+    fr_pred = fr.predict(X[:2])
+    assert fr_pred.ndim == 1
+    np.testing.assert_allclose(fr_pred, sk.predict(X[:2]), atol=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Multi-output Ridge divergences (unit #2120 adversarial re-audit)
+# ---------------------------------------------------------------------------
+
+
+def test_red_ridge_multioutput_column_vector_y_shape_preserved():
+    """Divergence: `ferrolearn.Ridge.fit` gates multi-output on `y.shape[1] > 1`
+    (`_regressors.py:111`), so a column-vector `y` of shape `(n_samples, 1)`
+    falls to the 1-D path and yields `coef_` 1-D / scalar `intercept_` / 1-D
+    `predict`.
+
+    sklearn `Ridge().fit(X, Y)` with `Y` shape `(n, 1)` PRESERVES the 2-D target
+    structure: `coef_` is `(1, n_features)`, `intercept_` is `(1,)`, and
+    `predict` returns `(n, 1)` (`sklearn/linear_model/_ridge.py:543` coef shape /
+    `_base.py:319-324` ndim-2 intercept branch; multi_output shape preservation).
+
+    On the (6,3)/(6,1) fixture the live oracle yields coef_ (1,3),
+    intercept_ (1,), predict (6,1); ferrolearn yields (3,), scalar, (6,).
+    Tracking: #2121
+    """
+    rng = np.random.RandomState(0)
+    X = rng.rand(6, 3)
+    Y = rng.rand(6, 1)
+
+    sk = SkRidge(alpha=1.0).fit(X, Y)
+    fr = fl.Ridge(alpha=1.0).fit(X, Y)
+
+    # Live-oracle shapes (R-CHAR-3): never literal-copied from ferrolearn.
+    assert sk.coef_.shape == (1, 3)
+    assert np.shape(sk.intercept_) == (1,)
+    assert sk.predict(X).shape == (6, 1)
+
+    # ferrolearn must mirror the sklearn shapes for the (n,1) target.
+    assert fr.coef_.shape == sk.coef_.shape
+    assert np.shape(fr.intercept_) == np.shape(sk.intercept_)
+    assert fr.predict(X).shape == sk.predict(X).shape
+
+
+def test_red_ridge_multioutput_no_intercept_scalar_zero():
+    """Divergence: `ferrolearn.Ridge(fit_intercept=False)` on 2-D `y` exposes
+    `intercept_` as a zero ARRAY of shape `(n_targets,)` (the Rust
+    `FittedRidgeMulti::intercepts()` marshalled by `_RsRidgeMultiOutput.intercept_`,
+    `regressors.rs:287-294`).
+
+    sklearn sets `intercept_` to the scalar `0.0` (shape `()`) whenever
+    `fit_intercept=False`, REGARDLESS of target dimensionality
+    (`sklearn/linear_model/_base.py:327`: `self.intercept_ = 0.0`).
+
+    On the (10,3)/(10,2) fixture the live oracle yields scalar 0.0 (ndim 0);
+    ferrolearn yields array([0., 0.]) (ndim 1, shape (2,)).
+    Tracking: #2122
+    """
+    rng = np.random.RandomState(2)
+    X = rng.rand(10, 3)
+    Y = rng.rand(10, 2)
+    Y[:, 1] *= 100.0
+
+    sk = SkRidge(alpha=2.0, fit_intercept=False).fit(X, Y)
+    fr = fl.Ridge(alpha=2.0, fit_intercept=False).fit(X, Y)
+
+    # Live-oracle ground truth (R-CHAR-3): sklearn intercept_ is scalar 0.0.
+    assert np.ndim(sk.intercept_) == 0
+    assert float(sk.intercept_) == 0.0
+
+    # ferrolearn must mirror sklearn's scalar-0.0 contract, not a zero vector.
+    assert np.ndim(fr.intercept_) == np.ndim(sk.intercept_)

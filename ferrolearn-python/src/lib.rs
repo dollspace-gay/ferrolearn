@@ -12,6 +12,7 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Original 12
     m.add_class::<regressors::RsLinearRegression>()?;
     m.add_class::<regressors::RsRidge>()?;
+    m.add_class::<regressors::RsRidgeMultiOutput>()?;
     m.add_class::<regressors::RsLasso>()?;
     m.add_class::<regressors::RsElasticNet>()?;
     m.add_class::<classifiers::RsLogisticRegression>()?;

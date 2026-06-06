@@ -3,7 +3,7 @@
 import re
 
 import numpy as np
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator, MultiOutputMixin, RegressorMixin
 from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
@@ -11,6 +11,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsLasso,
     _RsLinearRegression,
     _RsRidge,
+    _RsRidgeMultiOutput,
 )
 
 
@@ -84,7 +85,7 @@ class LinearRegression(RegressorMixin, BaseEstimator):
         self.__dict__.update(state)
 
 
-class Ridge(RegressorMixin, BaseEstimator):
+class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
     """Ridge regression backed by Rust.
 
     Parameters
@@ -100,12 +101,37 @@ class Ridge(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
-        X, y = _ensure_f64(X), _ensure_f64(y)
-        self._rs = _RsRidge(alpha=self.alpha, fit_intercept=self.fit_intercept)
-        _fit_rust(self._rs, X, y)
-        self.coef_ = np.array(self._rs.coef_)
-        self.intercept_ = float(self._rs.intercept_)
+        # Detect multi-output BEFORE validation: a 2-D `y` with >1 column routes
+        # to the Rust `Fit<Array2, Array2>` path producing `coef_`
+        # (n_targets, n_features) / `intercept_` (n_targets,), mirroring sklearn
+        # `Ridge` (`sklearn/linear_model/_ridge.py:543`/`:550`). sklearn PRESERVES
+        # a 2-D target shape (incl. a single-column `(n, 1)` `y` -> `coef_` `(1,
+        # n_features)`, `intercept_` `(1,)`), so ANY 2-D `y` routes to the
+        # multi-output path (`_base.py:319-324`).
+        y_arr = np.asarray(y)
+        multioutput = y_arr.ndim == 2
+        if multioutput:
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            self._rs = _RsRidgeMultiOutput(
+                alpha=self.alpha, fit_intercept=self.fit_intercept
+            )
+            _fit_rust(self._rs, X, y)
+            self.coef_ = np.array(self._rs.coef_)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(self._rs.intercept_) if self.fit_intercept else 0.0
+            )
+        else:
+            X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            self._rs = _RsRidge(alpha=self.alpha, fit_intercept=self.fit_intercept)
+            _fit_rust(self._rs, X, y)
+            self.coef_ = np.array(self._rs.coef_)
+            self.intercept_ = float(self._rs.intercept_)
         return self
 
     def predict(self, X):
