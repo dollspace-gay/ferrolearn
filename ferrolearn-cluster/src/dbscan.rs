@@ -69,7 +69,7 @@
 //! algorithm surface (#949). The NOT-STARTED surface is the
 //! unimplemented parameter/attribute surface (`sample_weight`, `metric`/`p`,
 //! `algorithm`/`leaf_size`/`n_jobs`, the `eps=0.5` Rust-constructor default + error
-//! ABI, the `components_` attribute, the ferray substrate), each carrying an open
+//! ABI, the ferray substrate), each carrying an open
 //! prereq blocker. Cites use symbol anchors (ferrolearn) / `file:line`
 //! (sklearn 1.5.2, commit 156ef14). Live oracle = installed sklearn 1.5.2. (REQ
 //! numbering follows `.design/cluster/dbscan.md`.)
@@ -83,7 +83,7 @@
 //! | REQ-5 (`sample_weight` — alters core determination) | NOT-STARTED | open prereq blocker **#947**. sklearn `fit(X, sample_weight=w)` sets `n_neighbors = sum(sample_weight[neighbors])` (`_dbscan.py:427-429`), so a high-weight point becomes core with fewer neighbors (oracle: `w0=5` → `[0,-1,-1]` vs unweighted `[-1,-1,-1]`). ferrolearn `Fit<Array2<F>, ()>` has the unit `()` target — no weight; core is purely `neighborhoods[i].len() >= min_samples` (`Fit::fit`). Missing surface. |
 //! | REQ-6 (`metric` / `p` / `metric_params`) | NOT-STARTED | open prereq blocker **#948**. sklearn accepts any `pairwise_distances` metric (`_dbscan.py:334-337`), `p` for Minkowski (`:341`), default `'euclidean'` (`:350`). ferrolearn `fn region_query` / `fn squared_euclidean` (`dbscan.rs`) is Euclidean-ONLY; no `metric`/`p`/`metric_params` param (oracle: `metric='manhattan'` → `[-1,0,0]` vs euclidean `[0,0,0]`). Missing surface. |
 //! | REQ-7 (`algorithm` / `leaf_size` / `n_jobs`) | NOT-STARTED | open prereq blocker **#949**. sklearn routes neighbor search through `NearestNeighbors(radius, algorithm, leaf_size, ..., n_jobs)` (`_dbscan.py:411-422`; constraints `:339-342`). ferrolearn uses a fixed brute-force `O(n^2)` `fn region_query` with no parameter. (Brute force value-matches the default `'auto'`; the divergence is the absent parameter surface.) Missing surface. |
-//! | REQ-8 (`components_` fitted attribute) | NOT-STARTED | open prereq blocker **#950**. sklearn `self.components_ = X[self.core_sample_indices_].copy()` (`_dbscan.py:441-446`). `FittedDBSCAN` exposes `fn core_sample_indices` but has NO `components_` accessor and does not retain `X`. Missing attribute. |
+//! | REQ-8 (`components_` fitted attribute) | SHIPPED | impl: `Fit::fit` builds `components_: Array2<F>` of shape `(core_sample_indices.len(), n_features)` whose row `k` is `x.row(core_sample_indices[k])`, stored in `FittedDBSCAN`, surfaced via accessor `fn components` in `dbscan.rs` — mirroring `self.components_ = X[self.core_sample_indices_].copy()` (`_dbscan.py:441-446`). VALUE-matches the live sklearn 1.5.2 oracle (`DBSCAN(eps=0.5, min_samples=3)` on the 7-point fixture → `components_` shape `(6,2)` = `[[1,1],[1.2,1.1],[0.9,1.0],[8,8],[8.1,8.2],[8.0,7.9]]`, the rows of `X` at `core_sample_indices_ = [0,1,2,3,4,5]`). Consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate accessor (the PyO3 layer does not yet re-expose `components_`, see REQ-9). Green guard: `dbscan_components_match_sklearn` (`dbscan.rs` tests). |
 //! | REQ-9 (PyO3 binding VALUE parity) | SHIPPED | impl `#[pyclass(name = "_RsDBSCAN")] RsDBSCAN` (`ferrolearn-python/src/extras.rs`): `fn new(eps=0.5, min_samples=5)`, `fn fit` calling `ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples)`, `#[getter] labels_`; registered via `m.add_class::<extras::RsDBSCAN>()` (`ferrolearn-python/src/lib.rs`), surfaced as `ferrolearn.DBSCAN` (`fit_predict` / `labels_`). Non-test consumer: `import ferrolearn; ferrolearn.DBSCAN(...).fit(X).labels_`. Since the Rust core value-matches (REQ-1/2), `import ferrolearn` matches `import sklearn` on the Euclidean / no-`sample_weight` path. The binding does NOT yet re-expose `core_sample_indices_` / `components_` / `sample_weight` / `metric` (only `labels_` via `#[getter]`) — those ride their own REQs. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#951**. `dbscan.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `std::collections::VecDeque`; not migrated to `ferray-core` (R-SUBSTRATE-1/2). The PyO3 boundary uses `numpy2_to_ndarray` (`extras.rs`), an `ndarray` bridge, not `ferray::numpy_interop`. |
 //! | REQ-11 (exact eps-boundary neighbor parity) | NOT-STARTED | open prereq blocker **#952**. `fn region_query` (`dbscan.rs`) includes a neighbor when `squared_euclidean ≤ eps*eps`; sklearn routes through `NearestNeighbors(radius=eps).radius_neighbors` (`_dbscan.py:411-422`) whose `euclidean_distances`/tree distance computation rounds differently at the exact boundary. For an edge whose true distance ≈ `eps` (e.g. exactly `1.3` with `eps=1.3`, or `0.9999999999999998` with `eps=1.0`), the two disagree on inclusion → flips core status / merges clusters, diverging from the oracle `labels_`/`core_sample_indices_`. Reproducing sklearn's exact boundary requires its `euclidean_distances` dot-product rounding AND its `algorithm`-dependent neighbor search (#949) — not a single-file fix. Documented (no committed failing test per R-DEFER-6 / the kdtree #831 + balltree #858 convention). |
@@ -144,6 +144,8 @@ pub struct FittedDBSCAN<F> {
     labels_: Array1<isize>,
     /// Indices of core samples in the training data.
     core_sample_indices_: Vec<usize>,
+    /// Coordinates of the core samples (rows of `X` at `core_sample_indices_`).
+    pub(crate) components_: Array2<F>,
     /// Phantom data to retain the float type parameter.
     _marker: std::marker::PhantomData<F>,
 }
@@ -161,6 +163,17 @@ impl<F: Float> FittedDBSCAN<F> {
     #[must_use]
     pub fn core_sample_indices(&self) -> &[usize] {
         &self.core_sample_indices_
+    }
+
+    /// Return the coordinates of the core samples, of shape
+    /// `(n_core_samples, n_features)`.
+    ///
+    /// Row `k` is the training row `X[core_sample_indices()[k]]`, mirroring
+    /// sklearn's `self.components_ = X[self.core_sample_indices_].copy()`
+    /// (`sklearn/cluster/_dbscan.py:441-446`).
+    #[must_use]
+    pub fn components(&self) -> &Array2<F> {
+        &self.components_
     }
 
     /// Return the number of clusters found (excluding noise).
@@ -226,11 +239,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
         }
 
         let n_samples = x.nrows();
+        let n_features = x.ncols();
 
         if n_samples == 0 {
             return Ok(FittedDBSCAN {
                 labels_: Array1::zeros(0),
                 core_sample_indices_: Vec::new(),
+                components_: Array2::zeros((0, n_features)),
                 _marker: std::marker::PhantomData,
             });
         }
@@ -248,6 +263,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
             .collect();
 
         let core_sample_indices: Vec<usize> = (0..n_samples).filter(|&i| is_core[i]).collect();
+
+        // Retain the coordinates of the core samples, mirroring sklearn's
+        // `self.components_ = X[self.core_sample_indices_].copy()`
+        // (`sklearn/cluster/_dbscan.py:441-446`).
+        let mut components_ = Array2::<F>::zeros((core_sample_indices.len(), n_features));
+        for (k, &idx) in core_sample_indices.iter().enumerate() {
+            components_.row_mut(k).assign(&x.row(idx));
+        }
 
         // Step 3: Expand clusters from core points via BFS.
         let mut labels = Array1::from_elem(n_samples, -1isize);
@@ -301,6 +324,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
         Ok(FittedDBSCAN {
             labels_: labels,
             core_sample_indices_: core_sample_indices,
+            components_,
             _marker: std::marker::PhantomData,
         })
     }
@@ -487,6 +511,9 @@ mod tests {
         assert_eq!(fitted.labels().len(), 0);
         assert!(fitted.core_sample_indices().is_empty());
         assert_eq!(fitted.n_clusters(), 0);
+        // components_ is (0, n_features) on empty input, matching sklearn's
+        // `np.empty((0, X.shape[1]))` (_dbscan.py:446).
+        assert_eq!(fitted.components().shape(), &[0, 2]);
     }
 
     #[test]
@@ -596,6 +623,58 @@ mod tests {
         assert_ne!(labels[0], labels[3]);
         assert_ne!(labels[0], labels[6]);
         assert_ne!(labels[3], labels[6]);
+    }
+
+    #[test]
+    fn dbscan_components_match_sklearn() {
+        // Live sklearn 1.5.2 oracle (run from /tmp):
+        //   X = [[1,1],[1.2,1.1],[0.9,1.0],[8,8],[8.1,8.2],[8.0,7.9],[5,5]]
+        //   DBSCAN(eps=0.5, min_samples=3).fit(X)
+        //   labels_              = [0,0,0,1,1,1,-1]
+        //   core_sample_indices_ = [0,1,2,3,4,5]
+        //   components_          = [[1,1],[1.2,1.1],[0.9,1.0],[8,8],[8.1,8.2],[8.0,7.9]]
+        // Mirrors `self.components_ = X[self.core_sample_indices_].copy()`
+        // (sklearn/cluster/_dbscan.py:441-446).
+        let x = Array2::from_shape_vec(
+            (7, 2),
+            vec![
+                1.0, 1.0, 1.2, 1.1, 0.9, 1.0, 8.0, 8.0, 8.1, 8.2, 8.0, 7.9, 5.0, 5.0,
+            ],
+        )
+        .unwrap();
+
+        let model = DBSCAN::<f64>::new(0.5).with_min_samples(3);
+        let fitted = model.fit(&x, &()).unwrap();
+
+        // core_sample_indices_ oracle.
+        assert_eq!(fitted.core_sample_indices(), &[0, 1, 2, 3, 4, 5]);
+
+        let oracle = Array2::from_shape_vec(
+            (6, 2),
+            vec![1.0, 1.0, 1.2, 1.1, 0.9, 1.0, 8.0, 8.0, 8.1, 8.2, 8.0, 7.9],
+        )
+        .unwrap();
+
+        let components = fitted.components();
+        assert_eq!(components.shape(), &[6, 2]);
+
+        // Element-wise match against the oracle matrix (<= 1e-12).
+        for (got, want) in components.iter().zip(oracle.iter()) {
+            assert!(
+                (got - want).abs() <= 1e-12,
+                "components_ mismatch: got {got}, want {want}"
+            );
+        }
+
+        // Invariant: each row of components_ equals X[core_sample_indices()[k]].
+        for (k, &idx) in fitted.core_sample_indices().iter().enumerate() {
+            for j in 0..x.ncols() {
+                assert!(
+                    (components[[k, j]] - x[[idx, j]]).abs() <= 1e-12,
+                    "row {k} != X[{idx}] at col {j}"
+                );
+            }
+        }
     }
 
     #[test]
