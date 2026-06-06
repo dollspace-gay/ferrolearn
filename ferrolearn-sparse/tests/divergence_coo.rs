@@ -485,3 +485,71 @@ fn coo_max_min_dense_no_implicit_zero() -> Result<(), FerroError> {
     assert_eq!(c.min(), 2.0);
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`astype`). Casting a float COO matrix to integers
+/// truncates each stored value toward zero (numpy C-cast = Rust `as`) while
+/// preserving the row/col index structure and nnz, mirroring scipy
+/// `coo_matrix.astype(np.int64)` (`scipy/sparse/_data.py:69` — casts `self.data`,
+/// keeps the index structure unchanged).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([3.7,-2.9,5.0]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   c=m.astype(np.int64);
+///   print(c.data.tolist(), c.row.tolist(), c.col.tolist(), c.nnz,
+///         c.toarray().tolist())"`):
+/// `[3, -2, 5] [0, 1, 2] [0, 1, 2] 3 [[3, 0, 0], [0, -2, 0], [0, 0, 5]]`.
+#[test]
+fn coo_astype_float_to_int_truncates() -> Result<(), FerroError> {
+    let m =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 1, 2], vec![0, 1, 2], vec![3.7, -2.9, 5.0])?;
+
+    let c: CooMatrix<i64> = m.astype(|&v| v as i64)?;
+    // scipy c.data == [3, -2, 5] (truncated toward zero)
+    assert_eq!(c.data(), &[3, -2, 5]);
+    // scipy c.row == [0, 1, 2], c.col == [0, 1, 2] (structure preserved)
+    assert_eq!(c.row(), &[0, 1, 2]);
+    assert_eq!(c.col(), &[0, 1, 2]);
+    // scipy c.nnz == 3
+    assert_eq!(c.nnz(), 3);
+
+    // scipy c.toarray() == [[3,0,0],[0,-2,0],[0,0,5]]
+    let expected = [[3, 0, 0], [0, -2, 0], [0, 0, 5]];
+    let d = c.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "astype mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`astype`). Casting an f64 COO matrix to f32 narrows each
+/// stored value while preserving the row/col index structure and nnz, mirroring
+/// scipy `coo_matrix.astype(np.float32)` (`scipy/sparse/_data.py:69`). The cast
+/// is compared against the actual f32 literals so it round-trips exactly.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([3.7,-2.9,5.0]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   c=m.astype(np.float32);
+///   print(c.data.tolist(), c.row.tolist(), c.col.tolist(), c.nnz)"`):
+/// `[3.700000047683716, -2.9000000953674316, 5.0] [0, 1, 2] [0, 1, 2] 3`.
+#[test]
+fn coo_astype_to_f32_preserves_structure() -> Result<(), FerroError> {
+    let m =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 1, 2], vec![0, 1, 2], vec![3.7, -2.9, 5.0])?;
+
+    let c: CooMatrix<f32> = m.astype(|&v| v as f32)?;
+    // scipy c.data == [3.7f32, -2.9f32, 5.0f32] (the exact narrowed values)
+    assert_eq!(c.data(), &[3.7f32, -2.9f32, 5.0f32]);
+    // scipy c.row == [0, 1, 2], c.col == [0, 1, 2], c.nnz == 3 (structure preserved)
+    assert_eq!(c.row(), &[0, 1, 2]);
+    assert_eq!(c.col(), &[0, 1, 2]);
+    assert_eq!(c.nnz(), 3);
+    Ok(())
+}
