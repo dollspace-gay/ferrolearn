@@ -75,7 +75,8 @@
 //! | REQ-6 (`score` mean accuracy) | SHIPPED | `FittedBernoulliNB::score` computes `correct / n` over `predict`, the `ClassifierMixin.score` analog. Non-test consumer: in-crate + the library surface (the PyO3 `score` exposure gap is REQ-9). Verified: green guard `green_bernoulli_score_accuracy` — `BernoulliNB::new().fit(Xbin,y).score(Xbin,y) = 1.0` (sklearn `BernoulliNB().fit(Xbin,y).score(Xbin,y) == 1.0`). |
 //! | REQ-7 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedBernoulliNB::partial_fit` binarizes when `binarize` is `Some`, accumulates `class_counts`/`feature_counts` for each EXISTING class, then recomputes `log_prob`/`log_neg_prob` (same `p=(fc+alpha)/(n_c+2*alpha)` smoothing) and `log_prior`, mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-resmooth (`naive_bayes.py:629-708`, `_count` → `_update_feature_log_prob` → `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: in-tree `test_bernoulli_nb_partial_fit` / `test_bernoulli_nb_partial_fit_shape_mismatch` — chunked `partial_fit` over already-fitted classes reproduces the accumulate-then-resmooth path (sklearn `partial_fit` over chunks == `fit` on the whole). KNOWN GAP: `partial_fit` has NO `classes=` argument — `FittedBernoulliNB::partial_fit(&mut self, x, y)` loops only over the already-fitted `self.classes`, so a brand-new label is silently dropped (sklearn's `_BaseDiscreteNB.partial_fit` binarizes against the full `classes=` list from the first call, `naive_bayes.py:629-708`); this `classes=`/unseen-label path is NOT-STARTED (folded into #908) and is documented-not-pinned in the divergence header. |
 //! | REQ-8 (`sample_weight` + `partial_fit` `classes=`) | NOT-STARTED | open prereq blocker **#908**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` become weighted (`naive_bayes.py:1189-1192`) — e.g. `BernoulliNB().fit(Xbin,y,sample_weight=[1,2,1,1,1,3]).feature_count_ = [[4,2,0],[0,1,5]]`, `class_count_ = [4,5]`. ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`; also no `classes=` argument on `partial_fit` (the unseen-label sub-gap of REQ-7). |
-//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#909**. sklearn exposes `feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_` (`naive_bayes.py:1088-1117`); `hasattr(fitted, 'coef_') == False` — `BernoulliNB` in 1.5.2 exposes NO `coef_`/`intercept_` (the deprecated `_BaseDiscreteNB` properties are gone), so those are NOT a gap. `FittedBernoulliNB` stores `log_prob`/`log_neg_prob`/`log_prior`/`feature_counts`/`class_counts` as PRIVATE fields with no accessor — only `classes()` (via `HasClasses`) is public. `_RsBernoulliNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, binarize)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters. Also subsumes the `class_prior` wrong-length MESSAGE/TYPE-parity sub-item (REQ-4: `InvalidParameter` vs `ValueError`) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedBernoulliNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.log_prob`, sklearn `feature_log_prob_`, `naive_bayes.py:1201`), `class_log_prior(&self) -> &Array1<F>` (`&self.log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:1189`), and `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:1190`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`hasattr(BernoulliNB().fit(...), 'coef_') == False`), so no `coef_` / `intercept_` getter is added. Live oracle (`X=[[1,1,0],[1,0,0],[1,1,0],[0,0,1],[0,1,1],[0,0,1]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[-0.2231435513,-0.5108256238,-1.6094379124],[-1.6094379124,-0.9162907319,-0.2231435513]]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `feature_count_ = [[3,2,0],[0,1,3]]`, `class_count_ = [3,3]`. In-tree `bernoulli_feature_log_prob_and_class_log_prior_match_sklearn` / `bernoulli_feature_count_and_class_count_match_sklearn`. |
+//! | REQ-9b (PyO3 surface + `sample_weight`) | NOT-STARTED | open prereq blocker **#909**. `_RsBernoulliNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, binarize)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters bridged to Python (`feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_`). `coef_` / `intercept_` are deprecated/removed in sklearn 1.5.2 (`hasattr == False`) and stay absent. Also subsumes the `class_prior` wrong-length MESSAGE/TYPE-parity sub-item (REQ-4: `InvalidParameter` vs `ValueError`) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#910**. `bernoulli.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
@@ -505,6 +506,53 @@ impl<F: Float + Send + Sync + 'static> FittedBernoulliNB<F> {
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedBernoulliNB<F> {
+    /// Empirical log probability of features given a class,
+    /// shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `BernoulliNB.feature_log_prob_`
+    /// (`_update_feature_log_prob`, `naive_bayes.py:1201`).
+    #[must_use]
+    pub fn feature_log_prob(&self) -> &Array2<F> {
+        &self.log_prob
+    }
+
+    /// Smoothed empirical log probability for each class,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `BernoulliNB.class_log_prior_`
+    /// (`_update_class_log_prior`, `naive_bayes.py:600`).
+    #[must_use]
+    pub fn class_log_prior(&self) -> &Array1<F> {
+        &self.log_prior
+    }
+
+    /// Number of samples encountered for each (class, feature) during fitting,
+    /// shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `BernoulliNB.feature_count_`
+    /// (`_count`, `naive_bayes.py:1189`).
+    #[must_use]
+    pub fn feature_count(&self) -> &Array2<F> {
+        &self.feature_counts
+    }
+
+    /// Number of samples encountered for each class during fitting,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `BernoulliNB.class_count_`
+    /// (`_count`, `naive_bayes.py:1190`). `class_counts` is stored as
+    /// integer counts; this casts each to `F`.
+    #[must_use]
+    pub fn class_count(&self) -> Array1<F> {
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| F::from(c).unwrap_or_else(F::zero)),
+        )
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedBernoulliNB<F> {
     /// Compute joint log-likelihood for each class — sklearn
     /// `BernoulliNB._joint_log_likelihood`.
@@ -803,5 +851,76 @@ mod tests {
         let (x, y) = make_binary_data();
         let model = BernoulliNB::<f64>::new().with_class_prior(vec![0.5, 0.3, 0.2]);
         assert!(model.fit(&x, &y).is_err());
+    }
+
+    // sklearn 1.5.2 oracle fixture (R-CHAR-3) for the REQ-9a fitted accessors.
+    // X = [[1,1,0],[1,0,0],[1,1,0],[0,0,1],[0,1,1],[0,0,1]], y = [0,0,0,1,1,1].
+    fn oracle_xy() -> (Array2<f64>, Array1<usize>) {
+        let x = array![
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [1.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 1.0, 1.0],
+            [0.0, 0.0, 1.0],
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        (x, y)
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "literal -0.6931471806 is the sklearn class_log_prior_ oracle value log(0.5), not a use of the LN_2 constant"
+    )]
+    fn bernoulli_feature_log_prob_and_class_log_prior_match_sklearn() -> Result<(), FerroError> {
+        // sklearn BernoulliNB().fit(X, y):
+        //   feature_log_prob_ = [[-0.2231435513, -0.5108256238, -1.6094379124],
+        //                        [-1.6094379124, -0.9162907319, -0.2231435513]]
+        //   class_log_prior_  = [-0.6931471806, -0.6931471806]
+        let (x, y) = oracle_xy();
+        let fitted = BernoulliNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_flp = array![
+            [-0.2231435513, -0.5108256238, -1.6094379124],
+            [-1.6094379124, -0.9162907319, -0.2231435513],
+        ];
+        let flp = fitted.feature_log_prob();
+        assert_eq!(flp.dim(), (2, 3));
+        for ((i, j), &e) in expected_flp.indexed_iter() {
+            assert_relative_eq!(flp[[i, j]], e, epsilon = 1e-9);
+        }
+
+        let expected_clp = array![-0.6931471806, -0.6931471806];
+        let clp = fitted.class_log_prior();
+        assert_eq!(clp.len(), 2);
+        for (i, &e) in expected_clp.iter().enumerate() {
+            assert_relative_eq!(clp[i], e, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bernoulli_feature_count_and_class_count_match_sklearn() -> Result<(), FerroError> {
+        // sklearn BernoulliNB().fit(X, y):
+        //   feature_count_ = [[3.0, 2.0, 0.0], [0.0, 1.0, 3.0]]
+        //   class_count_   = [3.0, 3.0]
+        let (x, y) = oracle_xy();
+        let fitted = BernoulliNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_fc = array![[3.0, 2.0, 0.0], [0.0, 1.0, 3.0]];
+        let fc = fitted.feature_count();
+        assert_eq!(fc.dim(), (2, 3));
+        for ((i, j), &e) in expected_fc.indexed_iter() {
+            assert_relative_eq!(fc[[i, j]], e, epsilon = 1e-9);
+        }
+
+        let expected_cc = array![3.0, 3.0];
+        let cc = fitted.class_count();
+        assert_eq!(cc.len(), 2);
+        for (i, &e) in expected_cc.iter().enumerate() {
+            assert_relative_eq!(cc[i], e, epsilon = 1e-9);
+        }
+        Ok(())
     }
 }
