@@ -785,3 +785,77 @@ fn coo_multiply_partial_overlap_matches_scipy() -> Result<(), FerroError> {
     }
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`add`). The COO `+` COO sum mirrors scipy
+/// `coo_matrix + coo_matrix` (`scipy/sparse/_base.py:740` `__add__` →
+/// `_add_sparse` `:724`): COO has no native sparse addition, so scipy routes
+/// through `tocsr()` and returns a **CSR** result (arithmetic defaults to CSR,
+/// `_base.py:484`). `add()` delegates `self.to_csr()?.add(&rhs.to_csr()?)`, so its
+/// result is a `CsrMatrix`; the dense form is compared (UNION sparsity).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([1.,2.,3.]),(np.array([0,0,1]),np.array([0,1,1]))),
+///     shape=(2,2));
+///   B=sp.coo_matrix((np.array([4.,5.,6.]),(np.array([0,1,1]),np.array([0,0,1]))),
+///     shape=(2,2));
+///   print((A + B).toarray().tolist())"`): `[[5.0, 2.0], [5.0, 9.0]]`.
+/// A=[[1,2],[0,3]], B=[[4,0],[5,6]].
+#[test]
+fn coo_add_matches_scipy() -> Result<(), FerroError> {
+    // A = [[1,2],[0,3]]
+    let a =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 0, 1], vec![0, 1, 1], vec![1.0, 2.0, 3.0])?;
+    // B = [[4,0],[5,6]]
+    let b =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 1, 1], vec![0, 0, 1], vec![4.0, 5.0, 6.0])?;
+
+    let c = a.add(&b)?;
+    // scipy (A + B).toarray() == [[5,2],[5,9]]
+    let expected = [[5.0, 2.0], [5.0, 9.0]];
+    let d = c.to_dense();
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(d[[r, col]], expected[r][col], "add mismatch at ({r},{col})");
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`sub`). The COO `-` COO difference mirrors scipy
+/// `coo_matrix - coo_matrix` (`scipy/sparse/_base.py:760` `__sub__` →
+/// `_sub_sparse` `:730`): COO has no native sparse subtraction, so scipy routes
+/// through `tocsr()` and returns a **CSR** result (arithmetic defaults to CSR,
+/// `_base.py:484`). `sub()` delegates `self.to_csr()?.sub(&rhs.to_csr()?)`, so its
+/// result is a `CsrMatrix`; the dense form is compared (UNION sparsity).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([1.,2.,3.]),(np.array([0,0,1]),np.array([0,1,1]))),
+///     shape=(2,2));
+///   B=sp.coo_matrix((np.array([4.,5.,6.]),(np.array([0,1,1]),np.array([0,0,1]))),
+///     shape=(2,2));
+///   print((A - B).toarray().tolist())"`): `[[-3.0, 2.0], [-5.0, -3.0]]`.
+/// A=[[1,2],[0,3]], B=[[4,0],[5,6]].
+#[test]
+fn coo_sub_matches_scipy() -> Result<(), FerroError> {
+    // A = [[1,2],[0,3]]
+    let a =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 0, 1], vec![0, 1, 1], vec![1.0, 2.0, 3.0])?;
+    // B = [[4,0],[5,6]]
+    let b =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 1, 1], vec![0, 0, 1], vec![4.0, 5.0, 6.0])?;
+
+    let c = a.sub(&b)?;
+    // scipy (A - B).toarray() == [[-3,2],[-5,-3]]
+    let expected = [[-3.0, 2.0], [-5.0, -3.0]];
+    let d = c.to_dense();
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(d[[r, col]], expected[r][col], "sub mismatch at ({r},{col})");
+        }
+    }
+    Ok(())
+}
