@@ -34,6 +34,10 @@
 //! `predict` / `predict_proba` / `classes_` against the library `FittedGaussianNB`
 //! and is surfaced as `ferrolearn.GaussianNB`; plus the in-crate
 //! `impl PipelineEstimator for GaussianNB` (`fit_pipeline` / `predict_pipeline`).
+//! The pipeline adapter preserves the ORIGINAL labels: `fit_pipeline` sets
+//! `classes_ = np.unique(y)` (sorted unique original float labels,
+//! `naive_bayes.py:264`) and `predict_pipeline` returns those original labels
+//! (`classes_[argmax(jll)]`, `naive_bayes.py:103`), not `0..n_classes` indices.
 //! Green verification = the in-tree `gaussian` lib tests + the live-sklearn
 //! divergence pins (`ferrolearn-bayes/tests/divergence_gaussian.rs`:
 //! `divergence_gaussian_epsilon_global_var_no_floor` (#891),
@@ -669,23 +673,46 @@ impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> PipelineEst
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
-        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
-        let fitted = self.fit(x, &y_usize)?;
-        Ok(Box::new(FittedGaussianNBPipeline(fitted)))
+        // sklearn `GaussianNB.fit` sets `classes_ = np.unique(y)` — the sorted
+        // unique ORIGINAL labels (`naive_bayes.py:264`); `predict` returns
+        // `self.classes_[np.argmax(jll, axis=1)]` — the original labels, NOT
+        // class indices (`naive_bayes.py:103`). Preserve the original float
+        // labels here instead of collapsing them to usize indices.
+        let mut classes_orig: Vec<F> = y.to_vec();
+        classes_orig.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        classes_orig.dedup();
+        // Map each label to its index into `classes_orig` (0..n_classes).
+        let y_idx: Array1<usize> =
+            y.mapv(|v| classes_orig.iter().position(|&c| c == v).unwrap_or(0));
+        let fitted = self.fit(x, &y_idx)?;
+        Ok(Box::new(FittedGaussianNBPipeline {
+            fitted,
+            classes_orig,
+        }))
     }
 }
 
-struct FittedGaussianNBPipeline<F: Float + Send + Sync + 'static>(FittedGaussianNB<F>);
+struct FittedGaussianNBPipeline<F: Float + Send + Sync + 'static> {
+    fitted: FittedGaussianNB<F>,
+    classes_orig: Vec<F>,
+}
 
+// SAFETY: `FittedGaussianNB<F>` and `Vec<F>` are both Send when `F: Send`; this
+// mirrors the existing inner-type bound and adds no interior mutability.
 unsafe impl<F: Float + Send + Sync + 'static> Send for FittedGaussianNBPipeline<F> {}
+// SAFETY: `FittedGaussianNB<F>` and `Vec<F>` are both Sync when `F: Sync`; no
+// shared interior mutability is introduced.
 unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedGaussianNBPipeline<F> {}
 
 impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipelineEstimator<F>
     for FittedGaussianNBPipeline<F>
 {
     fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
-        let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or_else(F::nan)))
+        // `self.fitted.predict` returns the class indices (`0..n_classes`) the
+        // model was trained on; map each back to the original label, mirroring
+        // sklearn `classes_[argmax(jll)]` (`naive_bayes.py:103`).
+        let preds = self.fitted.predict(x)?;
+        Ok(preds.mapv(|i| self.classes_orig.get(i).copied().unwrap_or_else(F::nan)))
     }
 }
 
@@ -1019,5 +1046,49 @@ mod tests {
         let prior = fitted.class_prior();
         assert_relative_eq!(prior[0], 0.5, epsilon = 1e-12);
         assert_relative_eq!(prior[1], 0.5, epsilon = 1e-12);
+    }
+
+    // Live sklearn 1.5.2 oracle (run from /tmp):
+    //   from sklearn.naive_bayes import GaussianNB; import numpy as np
+    //   X=[[1,1],[1.2,0.9],[5,5],[5.1,4.8]]; y=[-1,-1,1,1]
+    //   m=GaussianNB().fit(X,y)
+    //   m.classes_            -> array([-1,  1])
+    //   m.predict([[1.1,1.0],[5.05,4.9]]) -> array([-1.,  1.])
+    //   X2=[[0,0],[0.1,0.1],[5,5],[5.1,5.1],[9,9],[9.1,9.1]]; y2=[10,10,20,20,30,30]
+    //   m2=GaussianNB().fit(X2,y2)
+    //   m2.predict([[0.05,0.05],[9.05,9.05]]) -> array([10., 30.])
+    //
+    // sklearn `classes_ = np.unique(y)` (naive_bayes.py:264) and `predict`
+    // returns `classes_[argmax(jll)]` — the ORIGINAL labels (naive_bayes.py:103),
+    // NOT the `0..n_classes` indices. The pipeline adapter must do the same.
+    #[test]
+    fn gaussian_pipeline_preserves_original_float_labels() -> Result<(), FerroError> {
+        // --- 2-class case with a negative label (-1, not collapsible to usize). ---
+        let x = array![[1.0, 1.0], [1.2, 0.9], [5.0, 5.0], [5.1, 4.8]];
+        let y = array![-1.0_f64, -1.0, 1.0, 1.0];
+        let fitted = GaussianNB::<f64>::new().fit_pipeline(&x, &y)?;
+        let x_test = array![[1.1, 1.0], [5.05, 4.9]];
+        let preds = fitted.predict_pipeline(&x_test)?;
+        // Original labels [-1, 1], NOT class indices [0, 1].
+        assert_relative_eq!(preds[0], -1.0, epsilon = 1e-12);
+        assert_relative_eq!(preds[1], 1.0, epsilon = 1e-12);
+
+        // --- 3-class case with non-contiguous labels (10, 20, 30). ---
+        let x3 = array![
+            [0.0, 0.0],
+            [0.1, 0.1],
+            [5.0, 5.0],
+            [5.1, 5.1],
+            [9.0, 9.0],
+            [9.1, 9.1]
+        ];
+        let y3 = array![10.0_f64, 10.0, 20.0, 20.0, 30.0, 30.0];
+        let fitted3 = GaussianNB::<f64>::new().fit_pipeline(&x3, &y3)?;
+        let x3_test = array![[0.05, 0.05], [9.05, 9.05]];
+        let preds3 = fitted3.predict_pipeline(&x3_test)?;
+        assert_relative_eq!(preds3[0], 10.0, epsilon = 1e-12);
+        assert_relative_eq!(preds3[1], 30.0, epsilon = 1e-12);
+
+        Ok(())
     }
 }
