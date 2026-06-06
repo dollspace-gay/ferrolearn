@@ -51,7 +51,7 @@
 //! | REQ-4 (`theta_` per-class mean + data-derived `log_prior` / `class_prior_` + `score`) | SHIPPED | `fn fit` computes the per-class per-feature mean into `theta` (`np.mean(X_class, axis=0)`, `naive_bayes.py:324`) and `log_prior[ci] = ln(count_c / n_total)` (empirical `class_prior_ = class_count_ / class_count_.sum()`, `naive_bayes.py:502`); `pub fn score` is mean accuracy (`ClassifierMixin.score` analog). Non-test consumer: `_RsGaussianNB::predict`/`classes_` → `fitted.predict`/`fitted.classes()`. Verified: `green_gaussian_score_accuracy` (`score(X,y)=1.0`), `green_gaussian_predict_labels` (`[0,1]`), in-tree `test_gaussian_nb_has_classes`/`test_gaussian_nb_three_classes`. |
 //! | REQ-5 (`sample_weight` in `fit`) | NOT-STARTED | open prereq blocker **#894**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:239`) supports weighted `theta_`/`var_`/`class_count_` via `_update_mean_variance` (`np.average(..., weights=sw)`, `naive_bayes.py:319-320`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — no `sample_weight` parameter on `fit` or `partial_fit`. |
 //! | REQ-6 (`partial_fit` epsilon-once semantics) | NOT-STARTED | open prereq blocker **#895**. sklearn fixes `epsilon_` at the first fit and does the subtract-before / re-add-after dance (`var_ -= epsilon_` `naive_bayes.py:465`, `var_ += epsilon_` `naive_bayes.py:497`). `FittedGaussianNB::partial_fit` RECOMPUTES `epsilon = var_smoothing * max_var.max(F::one())` from the current `sigma` each call (the `max_var`/`epsilon` block) — different smoothing per call (also still per-class-max with a `1.0` floor, unlike the now-fixed `fit`). |
-//! | REQ-7 (fitted accessors `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_`) | NOT-STARTED | open prereq blocker **#896**. sklearn exposes these (`naive_bayes.py:171-202`). `FittedGaussianNB` stores `theta` / `sigma` / `raw_sigma` / `class_counts` / `log_prior` / `var_smoothing` as PRIVATE fields with no accessor; only `classes()` (via `HasClasses`) is public — no `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_` getter. |
+//! | REQ-7 (fitted accessors `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_`) | SHIPPED | sklearn exposes these (`naive_bayes.py:171-202`). `FittedGaussianNB` now provides `#[must_use]` getters mirroring each: `theta()` → `&self.theta` (`theta_`, `:171`), `var()` → `&self.sigma` (smoothed `var_`, `:202`), `epsilon()` → `self.epsilon_` (`epsilon_ = var_smoothing * np.var(X, axis=0).max()`, `:431`, threaded from the `fn fit` `epsilon` local), `class_count()` → `class_counts` cast to `F` (`class_count_`, `:173`), `class_prior()` → `log_prior.mapv(exp)` (empirical `class_prior_ = class_count_ / class_count_.sum()`, `:176`/`:502`). Non-test consumer: `_RsGaussianNB::fit`/`classes_` (`ferrolearn-python/src/classifiers.rs`) → `FittedGaussianNB`. Verified: live-sklearn pins `gaussian_theta_and_var_match_sklearn`, `gaussian_epsilon_matches_sklearn`, `gaussian_class_count_and_prior_match_sklearn` — on `X=[[1,2],[1.5,1.8],[2,2.5],[6,7],[6.5,6.8],[7,7.5]]`, `y=[0,0,0,1,1,1]`, sklearn `theta_=[[1.5,2.1],[6.5,7.1]]`, `var_=[[0.166666673083,0.086666673083],...]`, `epsilon_=6.416666666666667e-9`, `class_count_=[3,3]`, `class_prior_=[0.5,0.5]`; ferrolearn matches. |
 //! | REQ-8 (PyO3 surface — `var_smoothing` / `priors` / `sample_weight` + getters) | NOT-STARTED | open prereq blocker **#897**. `_RsGaussianNB` (`ferrolearn-python/src/classifiers.rs`) exposes `new(var_smoothing)` / `fit` / `predict` / `predict_proba` / `classes_` only — no `priors` kwarg, no `sample_weight` on `fit`, no `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_` getters, no `predict_log_proba` / `score` / `partial_fit`. The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker **#898**. `gaussian.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
@@ -139,6 +139,10 @@ pub struct FittedGaussianNB<F> {
     raw_sigma: Array2<F>,
     /// Variance smoothing parameter carried forward for partial_fit.
     var_smoothing: F,
+    /// Absolute additive smoothing value applied to all variances:
+    /// `var_smoothing * np.var(X, axis=0).max()` (sklearn `epsilon_`,
+    /// `naive_bayes.py:431`).
+    pub(crate) epsilon_: F,
     /// Optional user-supplied class priors.
     class_prior: Option<Vec<F>>,
 }
@@ -290,6 +294,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Gaussia
             class_counts,
             raw_sigma,
             var_smoothing: self.var_smoothing,
+            epsilon_: epsilon,
             class_prior: self.class_prior.clone(),
         })
     }
@@ -451,6 +456,7 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianNB<F> {
             .iter()
             .fold(F::zero(), |acc, &v| if v > acc { v } else { acc });
         let epsilon = self.var_smoothing * max_var.max(F::one());
+        self.epsilon_ = epsilon;
         self.sigma.mapv_inplace(|v| v + epsilon);
 
         // Recompute log priors.
@@ -531,6 +537,48 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianNB<F> {
         }
         let correct = preds.iter().zip(y.iter()).filter(|(p, t)| p == t).count();
         Ok(F::from(correct).unwrap() / F::from(n).unwrap())
+    }
+
+    /// Per-class per-feature mean (sklearn `theta_`, `naive_bayes.py:171`),
+    /// shape `(n_classes, n_features)`.
+    #[must_use]
+    pub fn theta(&self) -> &Array2<F> {
+        &self.theta
+    }
+
+    /// Per-class per-feature smoothed variance (sklearn `var_`,
+    /// `naive_bayes.py:202`) — the raw population variance plus `epsilon_`,
+    /// shape `(n_classes, n_features)`.
+    #[must_use]
+    pub fn var(&self) -> &Array2<F> {
+        &self.sigma
+    }
+
+    /// Absolute additive smoothing value added to all variances:
+    /// `var_smoothing * np.var(X, axis=0).max()` (sklearn `epsilon_`,
+    /// `naive_bayes.py:431`).
+    #[must_use]
+    pub fn epsilon(&self) -> F {
+        self.epsilon_
+    }
+
+    /// Number of training samples observed in each class, as floats
+    /// (sklearn `class_count_`, `naive_bayes.py:173`), shape `(n_classes,)`.
+    #[must_use]
+    pub fn class_count(&self) -> Array1<F> {
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| F::from(c).unwrap_or_else(F::zero)),
+        )
+    }
+
+    /// Probability of each class — the empirical prior
+    /// `class_count_ / class_count_.sum()` (sklearn `class_prior_`,
+    /// `naive_bayes.py:176`), shape `(n_classes,)`. Equals `exp(log_prior)`.
+    #[must_use]
+    pub fn class_prior(&self) -> Array1<F> {
+        self.log_prior.mapv(|lp| lp.exp())
     }
 }
 
@@ -894,5 +942,82 @@ mod tests {
         let (x, y) = make_2class_data();
         let model = GaussianNB::<f64>::new().with_class_prior(vec![0.5, 0.3, 0.2]);
         assert!(model.fit(&x, &y).is_err());
+    }
+
+    // Live sklearn 1.5.2 oracle fixture (R-CHAR-3): X/y below feed
+    // `sklearn.naive_bayes.GaussianNB().fit(X, y)`. Expected attribute values
+    // are taken from that fitted estimator (run from /tmp).
+    fn oracle_fixture() -> Option<(Array2<f64>, Array1<usize>)> {
+        let x = Array2::from_shape_vec(
+            (6, 2),
+            vec![
+                1.0, 2.0, 1.5, 1.8, 2.0, 2.5, // class 0
+                6.0, 7.0, 6.5, 6.8, 7.0, 7.5, // class 1
+            ],
+        )
+        .ok()?;
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        Some((x, y))
+    }
+
+    fn fit_oracle() -> Option<FittedGaussianNB<f64>> {
+        let (x, y) = oracle_fixture()?;
+        GaussianNB::<f64>::new().fit(&x, &y).ok()
+    }
+
+    #[test]
+    fn gaussian_theta_and_var_match_sklearn() {
+        // sklearn GaussianNB().fit(X,y).theta_ / .var_
+        let fitted = fit_oracle();
+        assert!(fitted.is_some(), "oracle fixture fit must succeed");
+        let Some(fitted) = fitted else { return };
+
+        // theta_ = [[1.5, 2.1], [6.5, 7.1]]
+        let theta = fitted.theta();
+        let expected_theta = [[1.5, 2.1], [6.5, 7.1]];
+        for ci in 0..2 {
+            for j in 0..2 {
+                assert_relative_eq!(theta[[ci, j]], expected_theta[ci][j], epsilon = 1e-9);
+            }
+        }
+
+        // var_ = [[0.166666673083, 0.086666673083], [0.166666673083, 0.086666673083]]
+        let var = fitted.var();
+        let expected_var = [
+            [0.166666673083, 0.086666673083],
+            [0.166666673083, 0.086666673083],
+        ];
+        for ci in 0..2 {
+            for j in 0..2 {
+                assert_relative_eq!(var[[ci, j]], expected_var[ci][j], epsilon = 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn gaussian_epsilon_matches_sklearn() {
+        // sklearn GaussianNB().fit(X,y).epsilon_ = 1e-9 * np.var(X,axis=0).max()
+        let fitted = fit_oracle();
+        assert!(fitted.is_some(), "oracle fixture fit must succeed");
+        let Some(fitted) = fitted else { return };
+        assert_relative_eq!(fitted.epsilon(), 6.416666666666667e-9, max_relative = 1e-15);
+    }
+
+    #[test]
+    fn gaussian_class_count_and_prior_match_sklearn() {
+        // sklearn GaussianNB().fit(X,y).class_count_ / .class_prior_
+        let fitted = fit_oracle();
+        assert!(fitted.is_some(), "oracle fixture fit must succeed");
+        let Some(fitted) = fitted else { return };
+
+        // class_count_ = [3.0, 3.0]
+        let count = fitted.class_count();
+        assert_relative_eq!(count[0], 3.0, epsilon = 1e-12);
+        assert_relative_eq!(count[1], 3.0, epsilon = 1e-12);
+
+        // class_prior_ = [0.5, 0.5]
+        let prior = fitted.class_prior();
+        assert_relative_eq!(prior[0], 0.5, epsilon = 1e-12);
+        assert_relative_eq!(prior[1], 0.5, epsilon = 1e-12);
     }
 }
