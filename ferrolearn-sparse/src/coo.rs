@@ -13,7 +13,7 @@
 //! concrete blocker). Behavior is oracle-verified vs the live scipy (R-CHAR-3) —
 //! see `tests/divergence_coo.rs`.
 //!
-//! **5 SHIPPED / 3 NOT-STARTED.**
+//! **6 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -22,7 +22,7 @@
 //! | REQ-NNZ (stored-count semantics) | SHIPPED | `nnz()` counts STORED entries incl. duplicates (matching scipy coo `.nnz = len(data)`); CSR conversion coalesces (nnz 3→2). Guard `coo_nnz_counts_duplicates_csr_coalesces`. |
 //! | REQ-ERR (construction validation) | SHIPPED | `from_triplets`/`push` return `Err(FerroError)` on out-of-bounds index / mismatched lengths, at the same point scipy raises `ValueError`. Guards `coo_from_triplets_*_is_err`/`coo_push_out_of_bounds_is_err`. |
 //! | REQ-CONSUMER (production consumer) | SHIPPED | consumed in-crate by `csr.rs`/`csc.rs` (COO→CSR/CSC conversion) and `helpers.rs` (`eye`/`diags`/`hstack`/`vstack` build via COO) — real non-test callers (S5 crate boundary). |
-//! | REQ-API-ACCESSORS (shape/data/row/col) | NOT-STARTED | no `.shape` tuple, no public `.data`/`.row`/`.col` (behind `inner()`). Blocker #1996. |
+//! | REQ-API-ACCESSORS (shape/data/row/col) | SHIPPED (#1996) | first-class `shape()`/`data()`/`row()`/`col()` accessors mirror scipy `.shape` (`_coo.py:32`/`:39` ctor tuple) and `.data`/`.row`/`.col` (`_coo.py:64`/`:106`/`:122`), the COO `(data, (row, col))` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `row()` → `&[usize]` (`inner.row_inds()`); `col()` → `&[usize]` (`inner.col_inds()`) — all borrow `&self` (sprs `TriMat` accessors return slices). Live oracle (R-CHAR-3): `coo_matrix(([3,5,2],([0,2,1],[0,1,2])),shape=(3,3))` → `shape=(3,3)`, `data=[3,5,2]`, `row=[0,2,1]`, `col=[0,1,2]` (insertion order preserved). Guard `coo_shape_data_row_col_match_scipy`. |
 //! | REQ-MISSING-METHODS (COO methods) | NOT-STARTED | no `.tocsr`/`.tocsc`/`.transpose`/`.sum`/`.diagonal`/`.sum_duplicates`/`.eliminate_zeros`/`.multiply`/`.dot`/arithmetic/`.astype`/`.copy` as `CooMatrix` methods. Blocker #1997. |
 //! | REQ-FERRAY (ferray sparse substrate) | NOT-STARTED | `sprs::TriMat` + `ndarray` vs ferray's sparse COO analog (R-SUBSTRATE-1; ferray has no sparse layer yet). Blocker #1998. |
 
@@ -180,6 +180,56 @@ impl<T> CooMatrix<T> {
     /// Consume this matrix and return the underlying [`sprs::TriMat<T>`].
     pub fn into_inner(self) -> TriMat<T> {
         self.inner
+    }
+
+    /// Returns the matrix shape as a `(n_rows, n_cols)` tuple.
+    ///
+    /// Mirrors scipy `coo_matrix.shape` (the `self._shape` tuple set in the
+    /// `_coo_base` constructor, `scipy/sparse/_coo.py:32`/`:39`/`:58`), the
+    /// `(M, N)` dimension pair. Equivalent to `(self.n_rows(), self.n_cols())`.
+    /// Live oracle: `sp.coo_matrix((data,(row,col)),shape=(3,3)).shape == (3, 3)`.
+    #[must_use]
+    pub fn shape(&self) -> (usize, usize) {
+        (self.n_rows(), self.n_cols())
+    }
+
+    /// Returns the stored values, one per stored triplet, in insertion order.
+    ///
+    /// Mirrors scipy `coo_matrix.data` (`scipy/sparse/_coo.py:64` —
+    /// `self.data = getdata(obj, ...)`), the `data` array of the COO
+    /// `(data, (row, col))` triple ferrolearn stores identically. Borrows the
+    /// underlying `sprs::TriMat::data()` slice (`&[T]`). Length equals
+    /// [`nnz`](Self::nnz) (duplicates counted, no coalescing). Live oracle:
+    /// `sp.coo_matrix(([3.,5.,2.],([0,2,1],[0,1,2])),shape=(3,3)).data == [3,5,2]`.
+    #[must_use]
+    pub fn data(&self) -> &[T] {
+        self.inner.data()
+    }
+
+    /// Returns the row index of each stored triplet, aligned with
+    /// [`data`](Self::data) and [`col`](Self::col), in insertion order.
+    ///
+    /// Mirrors scipy `coo_matrix.row` (`scipy/sparse/_coo.py:106` —
+    /// `return self.coords[-2]`), the row coordinate of each stored entry.
+    /// Borrows the underlying `sprs::TriMat::row_inds()` slice (`&[usize]`).
+    /// Length equals [`nnz`](Self::nnz). Live oracle:
+    /// `sp.coo_matrix(([3.,5.,2.],([0,2,1],[0,1,2])),shape=(3,3)).row == [0,2,1]`.
+    #[must_use]
+    pub fn row(&self) -> &[usize] {
+        self.inner.row_inds()
+    }
+
+    /// Returns the column index of each stored triplet, aligned with
+    /// [`data`](Self::data) and [`row`](Self::row), in insertion order.
+    ///
+    /// Mirrors scipy `coo_matrix.col` (`scipy/sparse/_coo.py:122` —
+    /// `return self.coords[-1]`), the column coordinate of each stored entry.
+    /// Borrows the underlying `sprs::TriMat::col_inds()` slice (`&[usize]`).
+    /// Length equals [`nnz`](Self::nnz). Live oracle:
+    /// `sp.coo_matrix(([3.,5.,2.],([0,2,1],[0,1,2])),shape=(3,3)).col == [0,1,2]`.
+    #[must_use]
+    pub fn col(&self) -> &[usize] {
+        self.inner.col_inds()
     }
 }
 

@@ -203,3 +203,28 @@ fn coo_push_out_of_bounds_is_err() {
     assert!(m.push(2, 0, 1.0).is_err(), "row out of bounds must err");
     assert!(m.push(0, 2, 1.0).is_err(), "col out of bounds must err");
 }
+
+/// REQ-API-ACCESSORS. The first-class `shape()`/`data()`/`row()`/`col()`
+/// accessors expose the same geometry + COO `(data, (row, col))` triple scipy
+/// exposes as `.shape`/`.data`/`.row`/`.col`, in insertion order (COO does not
+/// coalesce or reorder on construction).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([3.,5.,2.]),(np.array([0,2,1]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   print(m.shape, m.data.tolist(), m.row.tolist(), m.col.tolist())"`):
+/// `(3, 3) [3.0, 5.0, 2.0] [0, 2, 1] [0, 1, 2]`.
+#[test]
+fn coo_shape_data_row_col_match_scipy() {
+    let m =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 2, 1], vec![0, 1, 2], vec![3.0, 5.0, 2.0])
+            .unwrap();
+    // scipy m.shape == (3, 3)
+    assert_eq!(m.shape(), (3, 3));
+    // scipy m.data == [3,5,2] (insertion order, no coalescing)
+    assert_eq!(m.data(), &[3.0, 5.0, 2.0]);
+    // scipy m.row == [0,2,1] (row coordinate of each stored triplet)
+    assert_eq!(m.row(), &[0, 2, 1]);
+    // scipy m.col == [0,1,2] (column coordinate of each stored triplet)
+    assert_eq!(m.col(), &[0, 1, 2]);
+}
