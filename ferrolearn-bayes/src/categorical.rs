@@ -77,7 +77,8 @@
 //! | REQ-6 (`force_alpha` floor + `fit_prior` toggle + `score`) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` `1e-10` floor unless `force_alpha`, `naive_bayes.py:604-626`); `fn resolve_class_log_prior` selects empirical vs uniform on `fit_prior`; `pub fn score` returns mean accuracy (`ClassifierMixin.score` analog). Non-test consumer: `fit_pipeline` passes `force_alpha`/`fit_prior` through the builder. Verified: green guard `green_categorical_score_accuracy` — `CategoricalNB().fit(X,y).score(X,y) = 1.0` (sklearn oracle) on the separable fixture; `clamp_alpha(1, true) = 1`. In-tree `test_categorical_nb_alpha_smoothing_effect`. |
 //! | REQ-7 (`partial_fit` VALUE — same-categories/classes path) | SHIPPED (same-categories path) | `FittedCategoricalNB::partial_fit` increments the per-(feature, class, category) `category_counts` / `class_counts` for existing categories/classes, then recomputes `feature_log_prob` (same `recompute_feature_log_prob` smoothing) and `class_log_prior` (`resolve_class_log_prior`), mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-recompute (`naive_bayes.py:628-709` → `_count` → `_update_feature_log_prob` / `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` surface is REQ-9). Verified: in-tree fit-then-predict coverage on within-fitted data. EXTENSION + GAPS (NOT-STARTED, folded into #924): `partial_fit` APPENDS never-seen category values to `categories[j]` and INSERTS never-seen class labels into `classes` (a non-sklearn flexibility — documented in the method doc-comment; sklearn keeps `n_categories_` fixed and `IndexError`s a category `>= n_categories_`, and binarizes against the full `classes=` list); `partial_fit` also has NO `sample_weight` and NO negative-feature validation. |
 //! | REQ-8 (unseen-category at predict + predict-path negative validation) | NOT-STARTED | open prereq blocker **#920**. sklearn requires category indices `< n_categories_[i]`; the `_joint_log_likelihood` fancy-index `feature_log_prob_[i][:, X[:,i]]` (`naive_bayes.py:1513`) raises `IndexError("index 5 is out of bounds for axis 1 with size 2")` for an index `>= n_categories_`, and `_check_X` runs `check_non_negative` on the predict path (`naive_bayes.py:1432`). `fn log_prob_for` returns a uniform `(1/(n_known_cats+1)).ln()` fallback for any unknown category — NO error (`predict([[5,0]])` → `[0]`, `predict_proba` → `[[0.5,0.5]]`); the predict path also maps a negative value to 0 via `to_usize().unwrap_or(0)` with no guard. Matching sklearn's `IndexError` / predict-path reject requires threading a `Result` through `log_prob_for` / `joint_log_likelihood` — not a one-line fix. |
-//! | REQ-9 (fitted-attribute accessors + PyO3 surface) | NOT-STARTED | open prereq blocker **#923**. sklearn exposes `category_count_` / `feature_log_prob_` / `class_count_` / `class_log_prior_` / `n_categories_` / `classes_` / `n_features_in_` (`naive_bayes.py:1266-1303`). `FittedCategoricalNB` exposes ONLY `classes()` (via `HasClasses`); `feature_log_prob` / `category_counts` / `categories` / `class_log_prior` / `class_counts` are PRIVATE fields with no accessor. **CategoricalNB has NO PyO3 binding** — no `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs`, no `ferrolearn.CategoricalNB` (grep confirms zero `CategoricalNB` hits under `ferrolearn-python/`), so `import ferrolearn` cannot reach it. Also subsumes the wrong-length `class_prior` TYPE sub-item (REQ-5) and the negative-feature MESSAGE/TYPE-parity sub-item (REQ-3). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedCategoricalNB` exposes `feature_log_prob(&self) -> &[Vec<Vec<F>>]` (`&self.feature_log_prob`, sklearn `feature_log_prob_`, `naive_bayes.py:1273`; indexed `[feature][class][category]`), `category_count(&self) -> &[Vec<Vec<usize>>]` (`&self.category_counts`, sklearn `category_count_` — sklearn's are float arrays of the same per-(feature,class,category) counts; ferrolearn stores integer counts, `naive_bayes.py:1266`), `n_categories(&self) -> Vec<usize>` (`self.categories.iter().map(Vec::len).collect()`, sklearn `n_categories_`, `naive_bayes.py:1303`), `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:1273`), and `class_log_prior(&self) -> &[F]` (`&self.class_log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2, so no such getter is added. Live oracle (`X=[[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y=[0,0,0,1,1,1]`): `n_categories_ = [3,2]`, `class_count_ = [3,3]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `category_count_[0] = [[2,1,0],[0,1,2]]`, `category_count_[1] = [[2,1],[1,2]]`, `feature_log_prob_[0] = [[-0.69314718,-1.09861229,-1.79175947],[-1.79175947,-1.09861229,-0.69314718]]`, `feature_log_prob_[1] = [[-0.51082562,-0.91629073],[-0.91629073,-0.51082562]]`. In-tree `categorical_n_categories_class_count_prior_match_sklearn` / `categorical_feature_log_prob_and_category_count_match_sklearn`. |
+//! | REQ-9b (PyO3 binding + sample_weight surface) | NOT-STARTED | open prereq blocker **#923**. **CategoricalNB has NO PyO3 binding** — no `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs`, no `ferrolearn.CategoricalNB` (grep confirms zero `CategoricalNB` hits under `ferrolearn-python/`), so `import ferrolearn` cannot reach it; the Rust fitted accessors (REQ-9a) are not bridged to Python (`feature_log_prob_` / `category_count_` / `class_count_` / `class_log_prior_` / `n_categories_` / `classes_` / `n_features_in_`, `naive_bayes.py:1266-1303`). Also subsumes the wrong-length `class_prior` error-TYPE sub-item (REQ-5) and the negative-feature MESSAGE/TYPE-parity sub-item (REQ-3). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (`sample_weight` + `partial_fit` new-category/new-class extension + negative validation) | NOT-STARTED | open prereq blocker **#924**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:1353`, `:712`) weights the binarized `Y` so `class_count_ = Y.sum(axis=0)` and the `np.bincount(X_feature[mask], weights=...)` per-category counts become weighted (`naive_bayes.py:1468-1496`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` is `fn fit(&self, x, y)` — NO `sample_weight` on `fit` or `partial_fit`; also the `partial_fit` new-category/new-class EXTENSION (R-DEV-7 deviation) and `partial_fit` negative-validation gap carved out of REQ-7 live here. |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#925**. `categorical.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
@@ -630,6 +631,65 @@ impl<F: Float + Send + Sync + 'static> FittedCategoricalNB<F> {
         let correct = preds.iter().zip(y.iter()).filter(|(p, t)| p == t).count();
         Ok(F::from(correct).unwrap() / F::from(n).unwrap())
     }
+    /// Empirical log probability of categories given each feature and class.
+    ///
+    /// Returns one array of shape `(n_classes, n_categories[i])` per feature
+    /// `i`, indexed `[feature_idx][class_idx][category_idx]`.
+    ///
+    /// Mirrors sklearn `CategoricalNB.feature_log_prob_`
+    /// (`naive_bayes.py:1273`).
+    #[must_use]
+    pub fn feature_log_prob(&self) -> &[Vec<Vec<F>>] {
+        &self.feature_log_prob
+    }
+
+    /// Number of samples encountered for each class and category of each
+    /// feature.
+    ///
+    /// Returns one array of shape `(n_classes, n_categories[i])` per feature
+    /// `i`, indexed `[feature_idx][class_idx][category_idx]`.
+    ///
+    /// Mirrors sklearn `CategoricalNB.category_count_`
+    /// (`naive_bayes.py:1266`). sklearn stores these as float arrays;
+    /// ferrolearn stores the equivalent integer counts.
+    #[must_use]
+    pub fn category_count(&self) -> &[Vec<Vec<usize>>] {
+        &self.category_counts
+    }
+
+    /// Number of categories for each feature, shape `(n_features,)`.
+    ///
+    /// Mirrors sklearn `CategoricalNB.n_categories_`
+    /// (`naive_bayes.py:1303`).
+    #[must_use]
+    pub fn n_categories(&self) -> Vec<usize> {
+        self.categories.iter().map(Vec::len).collect()
+    }
+
+    /// Number of samples encountered for each class during fitting,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `CategoricalNB.class_count_`
+    /// (`naive_bayes.py:1273`). `class_counts` is stored as integer counts;
+    /// this casts each to `F`.
+    #[must_use]
+    pub fn class_count(&self) -> Array1<F> {
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| F::from(c).unwrap_or_else(F::zero)),
+        )
+    }
+
+    /// Smoothed empirical log probability for each class,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `CategoricalNB.class_log_prior_`
+    /// (`_update_class_log_prior`, `naive_bayes.py:600`).
+    #[must_use]
+    pub fn class_log_prior(&self) -> &[F] {
+        &self.class_log_prior
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedCategoricalNB<F> {
@@ -1024,5 +1084,96 @@ mod tests {
         for i in 3..6 {
             assert_eq!(preds[i], 10);
         }
+    }
+
+    fn accessor_oracle_xy() -> (Array2<f64>, Array1<usize>) {
+        // sklearn `CategoricalNB().fit(X, y)` oracle fixture.
+        let x = array![
+            [0.0, 1.0],
+            [1.0, 0.0],
+            [0.0, 0.0],
+            [2.0, 1.0],
+            [2.0, 0.0],
+            [1.0, 1.0],
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        (x, y)
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "sklearn class_log_prior_ oracle value ln(0.5)"
+    )]
+    fn categorical_n_categories_class_count_prior_match_sklearn() -> Result<(), FerroError> {
+        // sklearn CategoricalNB().fit(X, y):
+        //   n_categories_    = [3, 2]
+        //   class_count_     = [3, 3]
+        //   class_log_prior_ = [-0.6931471806, -0.6931471806]
+        let (x, y) = accessor_oracle_xy();
+        let fitted = CategoricalNB::<f64>::new().fit(&x, &y)?;
+
+        assert_eq!(fitted.n_categories(), vec![3, 2]);
+
+        let expected_cc = [3.0, 3.0];
+        let cc = fitted.class_count();
+        assert_eq!(cc.len(), 2);
+        for (i, &e) in expected_cc.iter().enumerate() {
+            assert_relative_eq!(cc[i], e, epsilon = 1e-9);
+        }
+
+        let expected_clp = [-0.6931471806, -0.6931471806];
+        let clp = fitted.class_log_prior();
+        assert_eq!(clp.len(), 2);
+        for (i, &e) in expected_clp.iter().enumerate() {
+            assert_relative_eq!(clp[i], e, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "sklearn feature_log_prob_ oracle value -0.69314718 = ln(0.5)"
+    )]
+    fn categorical_feature_log_prob_and_category_count_match_sklearn() -> Result<(), FerroError> {
+        // sklearn CategoricalNB().fit(X, y):
+        //   category_count_[0]   = [[2,1,0],[0,1,2]]
+        //   category_count_[1]   = [[2,1],[1,2]]
+        //   feature_log_prob_[0] = [[-0.69314718,-1.09861229,-1.79175947],
+        //                           [-1.79175947,-1.09861229,-0.69314718]]
+        //   feature_log_prob_[1] = [[-0.51082562,-0.91629073],
+        //                           [-0.91629073,-0.51082562]]
+        // ferrolearn `categories[j]` is sorted ascending (cats.sort_unstable()),
+        // so for the contiguous {0,1,2} fixture category index == category value
+        // and the per-category order matches scipy's.
+        let (x, y) = accessor_oracle_xy();
+        let fitted = CategoricalNB::<f64>::new().fit(&x, &y)?;
+
+        let cat_count = fitted.category_count();
+        assert_eq!(cat_count.len(), 2);
+        assert_eq!(cat_count[0], vec![vec![2, 1, 0], vec![0, 1, 2]]);
+        assert_eq!(cat_count[1], vec![vec![2, 1], vec![1, 2]]);
+
+        let flp = fitted.feature_log_prob();
+        assert_eq!(flp.len(), 2);
+
+        let expected_flp0 = [
+            [-0.69314718, -1.09861229, -1.79175947],
+            [-1.79175947, -1.09861229, -0.69314718],
+        ];
+        for (ci, row) in expected_flp0.iter().enumerate() {
+            for (k, &e) in row.iter().enumerate() {
+                assert_relative_eq!(flp[0][ci][k], e, epsilon = 1e-7);
+            }
+        }
+
+        let expected_flp1 = [[-0.51082562, -0.91629073], [-0.91629073, -0.51082562]];
+        for (ci, row) in expected_flp1.iter().enumerate() {
+            for (k, &e) in row.iter().enumerate() {
+                assert_relative_eq!(flp[1][ci][k], e, epsilon = 1e-7);
+            }
+        }
+        Ok(())
     }
 }
