@@ -61,7 +61,8 @@
 //! | REQ-12 | EllipticEnvelope exact inlier/outlier labels | NOT-STARTED | RNG carve-out via MCD, R-DEFER-3 — blocker #1706 |
 //! | REQ-13 | `mahalanobis` returns SQUARED distance | SHIPPED | `FittedCovariance::mahalanobis` squares the helper output (`.mapv(\|d\| d * d)`); sklearn squared (`_empirical_covariance.py:340,353`); oracle `X=[[0,0],[2,0],[0,2],[2,2]]` → `[2,2,2,2]`; `mahalanobis_returns_squared_matches_sklearn` |
 //! | REQ-14 | `score`/log-likelihood method | SHIPPED | `FittedCovariance::score` centers by training `location_`, forms assume_centered empirical cov `(Xc^T Xc)/n`, then `helpers::log_likelihood(test_cov, precision_)` (`_empirical_covariance.py:258`); delegated by all wrappers; oracle `score_on_training_data_matches_sklearn`/`score_on_test_data_matches_sklearn` |
-//! | REQ-15 | `error_norm` method | NOT-STARTED | absent — blocker #1707 |
+//! | REQ-15a | `error_norm` Frobenius norm + `scaling` + `squared` flags | SHIPPED | `FittedCovariance::error_norm` (`error = comp_cov − covariance_`; `squared_norm = Σ error_ij²`; `/n_features` if scaling; `sqrt` if not squared) (`_empirical_covariance.py:289,319-336`); delegated by all wrappers; oracle `error_norm_frobenius_default_matches_sklearn`/`error_norm_unscaled_matches_sklearn`/`error_norm_not_squared_matches_sklearn` |
+//! | REQ-15b | `error_norm` `norm='spectral'` path | NOT-STARTED | needs eigenvalue/SVD substrate (`np.amax(svdvals(error.T @ error))`, `_empirical_covariance.py:323-324`); crate has only `cholesky`/`spd_inverse`/`log_det_spd` — blocker #1707 |
 //! | REQ-16 | `get_precision`/`store_precision` | NOT-STARTED | absent — blocker #1707 |
 //! | REQ-17 | clippy-clean (no `collapsible_if`) | SHIPPED | let-chains at the MCD `log_det`/`spd_inverse` sites; crate clippy `-D warnings` green |
 //! | REQ-18 | ferray substrate | NOT-STARTED | `ndarray` + faer/hand-rolled `spd_inverse`, not `ferray` — blocker #1709 |
@@ -438,6 +439,65 @@ impl<F: Float + Send + Sync + 'static> FittedCovariance<F> {
         test_cov.mapv_inplace(|v| v / n_f);
         log_likelihood(&test_cov, &self.precision_)
     }
+
+    /// Compute the Frobenius error norm between this covariance and
+    /// `comp_cov` (the Mean Squared Error in the Frobenius sense).
+    ///
+    /// Implements the FROBENIUS path (sklearn's default `norm="frobenius"`)
+    /// of `EmpiricalCovariance.error_norm`
+    /// (`_empirical_covariance.py:289`): with `error = comp_cov -
+    /// self.covariance_`, the squared Frobenius norm is `sum(error_ij^2)`
+    /// (`_empirical_covariance.py:322`). If `scaling`, the squared norm is
+    /// divided by `n_features` (`error.shape[0]`,
+    /// `_empirical_covariance.py:331`). If `squared`, the squared norm is
+    /// returned; otherwise its square root
+    /// (`_empirical_covariance.py:333-336`).
+    ///
+    /// Only the Frobenius path is exposed here, so this signature omits the
+    /// `norm` parameter. sklearn's `norm="spectral"` path
+    /// (`_empirical_covariance.py:323-324`) is a separate requirement
+    /// (REQ-15b, not yet supported) because the crate has no
+    /// eigenvalue/SVD routine.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `comp_cov` does not have the
+    /// same `(p, p)` shape as the fitted covariance, or
+    /// [`FerroError::NumericalInstability`] if `n_features` cannot be
+    /// represented in the float type.
+    pub fn error_norm(
+        &self,
+        comp_cov: &Array2<F>,
+        scaling: bool,
+        squared: bool,
+    ) -> Result<F, FerroError> {
+        if comp_cov.dim() != self.covariance_.dim() {
+            let (er, ec) = self.covariance_.dim();
+            let (ar, ac) = comp_cov.dim();
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![er, ec],
+                actual: vec![ar, ac],
+                context: "FittedCovariance::error_norm".into(),
+            });
+        }
+        // error = comp_cov - self.covariance_  (elementwise).
+        let error = comp_cov - &self.covariance_;
+        // Frobenius: squared_norm = sum(error_ij^2).
+        let mut squared_norm = error.iter().fold(F::zero(), |acc, &e| acc + e * e);
+        if scaling {
+            // error.shape[0] = n_features = p.
+            let p = self.covariance_.nrows();
+            let p_f = F::from(p).ok_or_else(|| FerroError::NumericalInstability {
+                message: "FittedCovariance::error_norm: cannot convert n_features to float".into(),
+            })?;
+            squared_norm = squared_norm / p_f;
+        }
+        Ok(if squared {
+            squared_norm
+        } else {
+            squared_norm.sqrt()
+        })
+    }
 }
 
 // ============================================================================
@@ -743,6 +803,25 @@ impl<F: Float + Send + Sync + 'static> FittedLedoitWolf<F> {
     pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
         self.inner.score(x)
     }
+
+    /// Compute the Frobenius error norm against `comp_cov`.
+    ///
+    /// Delegates to [`FittedCovariance::error_norm`]; the Frobenius path of
+    /// sklearn's `EmpiricalCovariance.error_norm`
+    /// (`_empirical_covariance.py:289`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `comp_cov` does not match the
+    /// `(p, p)` shape of the fitted covariance.
+    pub fn error_norm(
+        &self,
+        comp_cov: &Array2<F>,
+        scaling: bool,
+        squared: bool,
+    ) -> Result<F, FerroError> {
+        self.inner.error_norm(comp_cov, scaling, squared)
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LedoitWolf<F> {
@@ -962,6 +1041,25 @@ impl<F: Float + Send + Sync + 'static> FittedOAS<F> {
     pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
         self.inner.score(x)
     }
+
+    /// Compute the Frobenius error norm against `comp_cov`.
+    ///
+    /// Delegates to [`FittedCovariance::error_norm`]; the Frobenius path of
+    /// sklearn's `EmpiricalCovariance.error_norm`
+    /// (`_empirical_covariance.py:289`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `comp_cov` does not match the
+    /// `(p, p)` shape of the fitted covariance.
+    pub fn error_norm(
+        &self,
+        comp_cov: &Array2<F>,
+        scaling: bool,
+        squared: bool,
+    ) -> Result<F, FerroError> {
+        self.inner.error_norm(comp_cov, scaling, squared)
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OAS<F> {
@@ -1158,6 +1256,25 @@ impl<F: Float + Send + Sync + 'static> FittedMinCovDet<F> {
     /// columns.
     pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
         self.inner.score(x)
+    }
+
+    /// Compute the Frobenius error norm against `comp_cov`.
+    ///
+    /// Delegates to [`FittedCovariance::error_norm`]; the Frobenius path of
+    /// sklearn's `EmpiricalCovariance.error_norm`
+    /// (`_empirical_covariance.py:289`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `comp_cov` does not match the
+    /// `(p, p)` shape of the fitted covariance.
+    pub fn error_norm(
+        &self,
+        comp_cov: &Array2<F>,
+        scaling: bool,
+        squared: bool,
+    ) -> Result<F, FerroError> {
+        self.inner.error_norm(comp_cov, scaling, squared)
     }
 }
 
@@ -1653,6 +1770,25 @@ impl<F: Float + Send + Sync + 'static> FittedEllipticEnvelope<F> {
         self.mcd.score(x)
     }
 
+    /// Compute the Frobenius error norm against `comp_cov`.
+    ///
+    /// Delegates to [`FittedMinCovDet::error_norm`]; the Frobenius path of
+    /// sklearn's `EmpiricalCovariance.error_norm`
+    /// (`_empirical_covariance.py:289`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `comp_cov` does not match the
+    /// `(p, p)` shape of the fitted covariance.
+    pub fn error_norm(
+        &self,
+        comp_cov: &Array2<F>,
+        scaling: bool,
+        squared: bool,
+    ) -> Result<F, FerroError> {
+        self.mcd.error_norm(comp_cov, scaling, squared)
+    }
+
     /// Compute the decision function: negative Mahalanobis distance
     /// shifted by the threshold.
     ///
@@ -1879,6 +2015,91 @@ mod tests {
         let bad = array![[1.0, 2.0, 3.0]];
         assert!(matches!(
             fitted.score(&bad),
+            Err(FerroError::ShapeMismatch { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn error_norm_frobenius_default_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   from sklearn.covariance import EmpiricalCovariance
+        //   import numpy as np
+        //   X = np.array([[1,2],[2,1],[3,4],[4,3],[5,5],[2,3]], float)
+        //   comp = np.array([[2.0,0.5],[0.5,2.0]])
+        //   EmpiricalCovariance().fit(X).error_norm(comp) -> 0.7689043209876543
+        // (defaults: norm='frobenius', scaling=True, squared=True;
+        //  `_empirical_covariance.py:289,319-336`).
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 5.0],
+            [2.0, 3.0],
+        ];
+        let comp = array![[2.0, 0.5], [0.5, 2.0]];
+        let fitted = est.fit(&x, &())?;
+        let e = fitted.error_norm(&comp, true, true)?;
+        assert_abs_diff_eq!(e, 0.7689043209876543, epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn error_norm_unscaled_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   EmpiricalCovariance().fit(X).error_norm(comp, scaling=False)
+        //     -> 1.5378086419753085
+        // (sum of squared errors, NOT divided by n_features;
+        //  `_empirical_covariance.py:322,330-331`).
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 5.0],
+            [2.0, 3.0],
+        ];
+        let comp = array![[2.0, 0.5], [0.5, 2.0]];
+        let fitted = est.fit(&x, &())?;
+        let e = fitted.error_norm(&comp, false, true)?;
+        assert_abs_diff_eq!(e, 1.5378086419753085, epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn error_norm_not_squared_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   EmpiricalCovariance().fit(X).error_norm(comp, squared=False)
+        //     -> 0.8768718954258109
+        // (sqrt of the scaled squared norm; `_empirical_covariance.py:333-336`).
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 5.0],
+            [2.0, 3.0],
+        ];
+        let comp = array![[2.0, 0.5], [0.5, 2.0]];
+        let fitted = est.fit(&x, &())?;
+        let e = fitted.error_norm(&comp, true, false)?;
+        assert_abs_diff_eq!(e, 0.8768718954258109, epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn error_norm_shape_mismatch_errors() -> Result<(), FerroError> {
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![[1.0, 2.0], [3.0, 4.0]];
+        let fitted = est.fit(&x, &())?;
+        // comp_cov is (3, 3) but covariance_ is (2, 2).
+        let bad = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],];
+        assert!(matches!(
+            fitted.error_norm(&bad, true, true),
             Err(FerroError::ShapeMismatch { .. })
         ));
         Ok(())
