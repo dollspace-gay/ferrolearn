@@ -71,7 +71,8 @@
 //! | REQ-6 (`force_alpha` floor + `fit_prior` toggle) | SHIPPED | `fn fit` calls `crate::clamp_alpha(self.alpha, self.force_alpha)` (`base::check_alpha`, the `_check_alpha` floor `1e-10` unless `force_alpha`, `naive_bayes.py:604-626`) and selects empirical/uniform prior on `fit_prior`. Non-test consumer: `RsMultinomialNB` passes `fit_prior` through `with_fit_prior` and `alpha` through `with_alpha`. Verified: `alpha=0` (in `[0,inf)`, `force_alpha=true` default) is accepted — ferrolearn `clamp_alpha(0, true) = 0` matches; `score(X,y) = 1.0` (green `green_multinomial_score_accuracy`). In-tree `test_multinomial_nb_alpha_smoothing_effect` / `test_multinomial_nb_default`; `base.rs` `test_check_alpha_*`. |
 //! | REQ-7 (`partial_fit` VALUE — same-classes path) | SHIPPED | `FittedMultinomialNB::partial_fit` accumulates `class_counts` / `feature_counts` for each existing class then recomputes `log_theta` / `log_prior` (same smoothing), mirroring the shared `_BaseDiscreteNB.partial_fit` accumulate-then-resmooth (`naive_bayes.py:628-709`, `_count` → `_update_feature_log_prob` → `_update_class_log_prior`). Non-test consumer: in-crate (the PyO3 `partial_fit` gap is REQ-9). Verified: green guard `green_multinomial_partial_fit_equals_fit` — two-chunk `partial_fit(X[:4],y[:4])` + `partial_fit(X[4:],y[4:])` reproduces the whole-`fit` `predict_proba` to ≤1e-12 (sklearn `np.allclose(feature_log_prob_) == True`). In-tree `test_multinomial_nb_partial_fit` / `test_multinomial_nb_partial_fit_shape_mismatch`. KNOWN GAP: `partial_fit` has NO `classes=` argument — `FittedMultinomialNB::partial_fit(&mut self, x, y)` loops only over the already-fitted `self.classes`, so a brand-new label is silently dropped (sklearn's `_BaseDiscreteNB.partial_fit` requires `classes=` at the first call, `naive_bayes.py:628-709`); this `classes=`/unseen-label path is NOT-STARTED (needs the multi-file surface change under #902) and is documented-not-pinned in the divergence header. |
 //! | REQ-8 (`sample_weight`) | NOT-STARTED | open prereq blocker **#901**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:712`) weights the binarized `Y` (`Y *= sample_weight.T`, `naive_bayes.py:751`) so `feature_count_ = Y.T @ X` / `class_count_ = Y.sum(axis=0)` become weighted (e.g. `fit(X,y,sample_weight=[1,2,1,1,1,3])` → `feature_count_ = [[11,3,2],[1,7,22]]`, `class_count_ = [4,5]`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` has signature `fn fit(&self, x, y)` — NO `sample_weight` parameter on `fit` or `partial_fit`. |
-//! | REQ-9 (fitted-attribute + PyO3 surface) | NOT-STARTED | open prereq blocker **#902**. sklearn exposes `feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_` + the `_BaseDiscreteNB` `coef_ = feature_log_prob_[1:]` / `intercept_ = class_log_prior_[1:]` properties. `FittedMultinomialNB` stores `log_theta` / `log_prior` / `feature_counts` / `class_counts` as PRIVATE fields with no accessor — only `classes()` (via `HasClasses`) is public; no `coef_` / `intercept_`. `_RsMultinomialNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior)` + `fit` + `predict` — no `class_prior` / `force_alpha` kwargs, no `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` / `score` / `partial_fit` (which the library HAS), no fitted-attr getters. Also subsumes the negative-feature MESSAGE-parity sub-item (REQ-5) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
+//! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedMultinomialNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.log_theta`, sklearn `feature_log_prob_`, `naive_bayes.py:892`), `class_log_prior(&self) -> &Array1<F>` (`&self.log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:880`), and `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:879`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`MultinomialNB().coef_` raises `AttributeError`), so no `coef_` / `intercept_` getter is added. Live oracle (`X=[[3,1,0],[2,0,1],[4,2,0],[0,1,4],[1,0,3],[0,2,5]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[-0.4700036292,-1.3862943611,-2.0794415417],[-2.2512917986,-1.558144618,-0.3794896217]]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `feature_count_ = [[9,3,1],[1,3,12]]`, `class_count_ = [3,3]`. In-tree `multinomial_feature_log_prob_and_class_log_prior_match_sklearn` / `multinomial_feature_count_and_class_count_match_sklearn`. |
+//! | REQ-9b (PyO3 surface) | NOT-STARTED | open prereq blocker **#902**. `_RsMultinomialNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior)` + `fit` + `predict` — no `class_prior` / `force_alpha` kwargs, no `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` / `score` / `partial_fit` (which the library HAS), no fitted-attr getters bridged to Python (`feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_`). `coef_` / `intercept_` are deprecated/removed in sklearn 1.5.2 (raise `AttributeError`) and stay absent. Also subsumes the negative-feature MESSAGE-parity sub-item (REQ-5) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#903**. `multinomial.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
 
 use crate::base::BaseNB;
@@ -474,6 +475,53 @@ impl<F: Float + Send + Sync + 'static> FittedMultinomialNB<F> {
     }
 }
 
+impl<F: Float + Send + Sync + 'static> FittedMultinomialNB<F> {
+    /// Empirical log probability of features given a class,
+    /// shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `MultinomialNB.feature_log_prob_`
+    /// (`_update_feature_log_prob`, `naive_bayes.py:892`).
+    #[must_use]
+    pub fn feature_log_prob(&self) -> &Array2<F> {
+        &self.log_theta
+    }
+
+    /// Smoothed empirical log probability for each class,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `MultinomialNB.class_log_prior_`
+    /// (`_update_class_log_prior`, `naive_bayes.py:600`).
+    #[must_use]
+    pub fn class_log_prior(&self) -> &Array1<F> {
+        &self.log_prior
+    }
+
+    /// Number of samples encountered for each (class, feature) during fitting,
+    /// shape `(n_classes, n_features)`.
+    ///
+    /// Mirrors sklearn `MultinomialNB.feature_count_`
+    /// (`_count`, `naive_bayes.py:880`).
+    #[must_use]
+    pub fn feature_count(&self) -> &Array2<F> {
+        &self.feature_counts
+    }
+
+    /// Number of samples encountered for each class during fitting,
+    /// shape `(n_classes,)`.
+    ///
+    /// Mirrors sklearn `MultinomialNB.class_count_`
+    /// (`_count`, `naive_bayes.py:879`). `class_counts` is stored as
+    /// integer counts; this casts each to `F`.
+    #[must_use]
+    pub fn class_count(&self) -> Array1<F> {
+        Array1::from_iter(
+            self.class_counts
+                .iter()
+                .map(|&c| F::from(c).unwrap_or_else(F::zero)),
+        )
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> BaseNB<F> for FittedMultinomialNB<F> {
     /// Compute joint log-likelihood for each class — sklearn
     /// `MultinomialNB._joint_log_likelihood`.
@@ -745,5 +793,76 @@ mod tests {
         let (x, y) = make_count_data();
         let model = MultinomialNB::<f64>::new().with_class_prior(vec![0.5]);
         assert!(model.fit(&x, &y).is_err());
+    }
+
+    // sklearn 1.5.2 oracle fixture (R-CHAR-3) for the REQ-9a fitted accessors.
+    // X = [[3,1,0],[2,0,1],[4,2,0],[0,1,4],[1,0,3],[0,2,5]], y = [0,0,0,1,1,1].
+    fn oracle_xy() -> (Array2<f64>, Array1<usize>) {
+        let x = array![
+            [3.0, 1.0, 0.0],
+            [2.0, 0.0, 1.0],
+            [4.0, 2.0, 0.0],
+            [0.0, 1.0, 4.0],
+            [1.0, 0.0, 3.0],
+            [0.0, 2.0, 5.0],
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        (x, y)
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "literal -0.6931471806 is the sklearn class_log_prior_ oracle value log(0.5), not a use of the LN_2 constant"
+    )]
+    fn multinomial_feature_log_prob_and_class_log_prior_match_sklearn() -> Result<(), FerroError> {
+        // sklearn MultinomialNB().fit(X, y):
+        //   feature_log_prob_ = [[-0.4700036292, -1.3862943611, -2.0794415417],
+        //                        [-2.2512917986, -1.558144618,  -0.3794896217]]
+        //   class_log_prior_  = [-0.6931471806, -0.6931471806]
+        let (x, y) = oracle_xy();
+        let fitted = MultinomialNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_flp = array![
+            [-0.4700036292, -1.3862943611, -2.0794415417],
+            [-2.2512917986, -1.558144618, -0.3794896217],
+        ];
+        let flp = fitted.feature_log_prob();
+        assert_eq!(flp.dim(), (2, 3));
+        for ((i, j), &e) in expected_flp.indexed_iter() {
+            assert_relative_eq!(flp[[i, j]], e, epsilon = 1e-9);
+        }
+
+        let expected_clp = array![-0.6931471806, -0.6931471806];
+        let clp = fitted.class_log_prior();
+        assert_eq!(clp.len(), 2);
+        for (i, &e) in expected_clp.iter().enumerate() {
+            assert_relative_eq!(clp[i], e, epsilon = 1e-9);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn multinomial_feature_count_and_class_count_match_sklearn() -> Result<(), FerroError> {
+        // sklearn MultinomialNB().fit(X, y):
+        //   feature_count_ = [[9.0, 3.0, 1.0], [1.0, 3.0, 12.0]]
+        //   class_count_   = [3.0, 3.0]
+        let (x, y) = oracle_xy();
+        let fitted = MultinomialNB::<f64>::new().fit(&x, &y)?;
+
+        let expected_fc = array![[9.0, 3.0, 1.0], [1.0, 3.0, 12.0]];
+        let fc = fitted.feature_count();
+        assert_eq!(fc.dim(), (2, 3));
+        for ((i, j), &e) in expected_fc.indexed_iter() {
+            assert_relative_eq!(fc[[i, j]], e, epsilon = 1e-9);
+        }
+
+        let expected_cc = array![3.0, 3.0];
+        let cc = fitted.class_count();
+        assert_eq!(cc.len(), 2);
+        for (i, &e) in expected_cc.iter().enumerate() {
+            assert_relative_eq!(cc[i], e, epsilon = 1e-9);
+        }
+        Ok(())
     }
 }
