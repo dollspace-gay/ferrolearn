@@ -1424,3 +1424,451 @@ def test_ridge_unsupported_solver_raises():
     msg = str(excinfo.value)
     assert "lsqr" in msg
     assert "not supported" in msg or "NOT-STARTED" in msg
+
+
+# ---------------------------------------------------------------------------
+# Lasso / ElasticNet remaining constructor params (#2135):
+#   precompute / copy_X / warm_start / selection / random_state
+# All value-affecting params SHIP through the Rust builders; copy_X is ABI-only.
+# Every expected value comes from the live sklearn 1.5.2 oracle (R-CHAR-3).
+# ---------------------------------------------------------------------------
+
+# Well-conditioned full-rank fixture so the unique CD optimum is stable.
+_X_CD_PARAMS = np.array(
+    [[0.0, 0.0], [1.0, 1.0], [2.0, 4.0], [3.0, 9.0], [4.0, 16.0]]
+)
+_y_CD_PARAMS = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+
+
+def test_lasso_precompute_matches_sklearn():
+    """Lasso(precompute=True).coef_/intercept_ match the live sklearn oracle.
+
+    sklearn `Lasso(precompute=...)` (`_coordinate_descent.py:1314`) runs CD on a
+    precomputed Gram matrix; ferrolearn's Gram path reaches the same unique
+    optimum as the direct path. Oracle computed in-test (R-CHAR-3).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    for alpha in (0.05, 0.1, 0.5):
+        sk = SkLasso(alpha=alpha, precompute=True).fit(X, y)
+        fr = fl.Lasso(alpha=alpha, precompute=True).fit(X, y)
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6
+        # precompute=True must reach the SAME support set as default.
+        base = fl.Lasso(alpha=alpha).fit(X, y)
+        np.testing.assert_allclose(fr.coef_, base.coef_, atol=1e-8)
+
+
+def test_elasticnet_precompute_matches_sklearn():
+    """ElasticNet(precompute=True).coef_/intercept_ match the live sklearn oracle.
+
+    sklearn `ElasticNet(precompute=...)` (`_coordinate_descent.py:904`).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    for alpha in (0.05, 0.1, 0.5):
+        sk = SkElasticNet(alpha=alpha, precompute=True).fit(X, y)
+        fr = fl.ElasticNet(alpha=alpha, precompute=True).fit(X, y)
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6
+        base = fl.ElasticNet(alpha=alpha).fit(X, y)
+        np.testing.assert_allclose(fr.coef_, base.coef_, atol=1e-8)
+
+
+def test_lasso_selection_cyclic_default_unchanged():
+    """selection='cyclic' (the sklearn default) is identical to the default path.
+
+    sklearn `_coordinate_descent.py:1321` default `selection='cyclic'`; the
+    explicit cyclic value must produce the byte-identical fit.
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    default = fl.Lasso(alpha=0.1).fit(X, y)
+    cyclic = fl.Lasso(alpha=0.1, selection="cyclic").fit(X, y)
+    np.testing.assert_allclose(cyclic.coef_, default.coef_, atol=0.0)
+    assert cyclic.intercept_ == default.intercept_
+    # And cyclic matches sklearn's cyclic oracle.
+    sk = SkLasso(alpha=0.1, selection="cyclic").fit(X, y)
+    np.testing.assert_allclose(cyclic.coef_, sk.coef_, atol=1e-6)
+
+
+def test_elasticnet_selection_cyclic_default_unchanged():
+    """selection='cyclic' (the sklearn default) is identical to the default path."""
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    default = fl.ElasticNet(alpha=0.1).fit(X, y)
+    cyclic = fl.ElasticNet(alpha=0.1, selection="cyclic").fit(X, y)
+    np.testing.assert_allclose(cyclic.coef_, default.coef_, atol=0.0)
+    assert cyclic.intercept_ == default.intercept_
+    sk = SkElasticNet(alpha=0.1, selection="cyclic").fit(X, y)
+    np.testing.assert_allclose(cyclic.coef_, sk.coef_, atol=1e-6)
+
+
+def test_lasso_selection_random_converges_to_optimum():
+    """selection='random' converges to the unique Lasso optimum.
+
+    NOT a sklearn bit-match: Rust StdRng != numpy MT19937, so the random
+    coordinate order differs from sklearn's. But the Lasso optimum is UNIQUE, so
+    the random path lands at the same optimum as the cyclic path (within the
+    stopping tolerance). We assert ferrolearn's random ~= ferrolearn's cyclic
+    (the unique optimum), NOT random == sklearn-random (bit-parity NOT-STARTED).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    cyclic = fl.Lasso(alpha=0.1).fit(X, y)
+    rnd = fl.Lasso(alpha=0.1, selection="random", random_state=0).fit(X, y)
+    # Same support set (exact zeros) as the unique optimum.
+    np.testing.assert_array_equal(rnd.coef_ == 0.0, cyclic.coef_ == 0.0)
+    # Converges to the same optimum (loose: stops within ~tol of cyclic).
+    np.testing.assert_allclose(rnd.coef_, cyclic.coef_, atol=1e-2)
+    assert abs(rnd.intercept_ - cyclic.intercept_) < 1e-2
+
+
+def test_elasticnet_selection_random_converges_to_optimum():
+    """selection='random' converges to the unique ElasticNet optimum.
+
+    NOT a sklearn bit-match (Rust StdRng != numpy MT19937 — bit-parity
+    NOT-STARTED); asserts convergence to ferrolearn's own cyclic optimum.
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    cyclic = fl.ElasticNet(alpha=0.1).fit(X, y)
+    rnd = fl.ElasticNet(alpha=0.1, selection="random", random_state=0).fit(X, y)
+    np.testing.assert_array_equal(rnd.coef_ == 0.0, cyclic.coef_ == 0.0)
+    np.testing.assert_allclose(rnd.coef_, cyclic.coef_, atol=1e-2)
+    assert abs(rnd.intercept_ - cyclic.intercept_) < 1e-2
+
+
+def test_lasso_warm_start_refit_fewer_iters():
+    """warm_start refit reaches the same optimum in FEWER iters, matching sklearn.
+
+    sklearn `Lasso(warm_start=True)` (`_coordinate_descent.py:1318`) reuses the
+    prior `self.coef_` to seed CD, so the second fit converges in ~1 sweep. The
+    n_iter_ drop pattern is asserted against the live sklearn oracle (R-CHAR-3),
+    and the warm coef must equal the cold optimum.
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    kw = dict(alpha=0.1, tol=1e-7)
+
+    sk = SkLasso(warm_start=True, **kw)
+    sk.fit(X, y)
+    sk_n1 = int(np.ravel(sk.n_iter_)[0])
+    sk.fit(X, y)
+    sk_n2 = int(np.ravel(sk.n_iter_)[0])
+
+    fr = fl.Lasso(warm_start=True, **kw)
+    fr.fit(X, y)
+    fr_n1 = fr.n_iter_
+    cold_coef = fr.coef_.copy()
+    fr.fit(X, y)
+    fr_n2 = fr.n_iter_
+
+    # sklearn drops to far fewer iters on the warm refit; ferrolearn matches.
+    assert sk_n2 < sk_n1
+    assert fr_n2 < fr_n1
+    assert fr_n1 == sk_n1
+    assert fr_n2 == sk_n2
+    # warm refit lands at the same unique optimum.
+    np.testing.assert_allclose(fr.coef_, cold_coef, atol=1e-6)
+    # and matches sklearn's converged coef.
+    sk_cold = SkLasso(**kw).fit(X, y)
+    np.testing.assert_allclose(fr.coef_, sk_cold.coef_, atol=1e-6)
+
+
+def test_elasticnet_warm_start_refit_fewer_iters():
+    """warm_start refit reaches the same optimum in FEWER iters, matching sklearn.
+
+    sklearn `ElasticNet(warm_start=True)` (`_coordinate_descent.py:908`).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    kw = dict(alpha=0.1, tol=1e-7)
+
+    sk = SkElasticNet(warm_start=True, **kw)
+    sk.fit(X, y)
+    sk_n1 = int(np.ravel(sk.n_iter_)[0])
+    sk.fit(X, y)
+    sk_n2 = int(np.ravel(sk.n_iter_)[0])
+
+    fr = fl.ElasticNet(warm_start=True, **kw)
+    fr.fit(X, y)
+    fr_n1 = fr.n_iter_
+    cold_coef = fr.coef_.copy()
+    fr.fit(X, y)
+    fr_n2 = fr.n_iter_
+
+    assert sk_n2 < sk_n1
+    assert fr_n2 < fr_n1
+    assert fr_n1 == sk_n1
+    assert fr_n2 == sk_n2
+    np.testing.assert_allclose(fr.coef_, cold_coef, atol=1e-6)
+    sk_cold = SkElasticNet(**kw).fit(X, y)
+    np.testing.assert_allclose(fr.coef_, sk_cold.coef_, atol=1e-6)
+
+
+def test_lasso_warm_start_false_independent_refits():
+    """warm_start=False (default): each fit is an independent cold start.
+
+    Two fits on the same data give the same coef and the same (full) n_iter_ —
+    no carry-over — matching sklearn `_coordinate_descent.py:1062` (cold-start
+    when not warm_start).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    fr = fl.Lasso(alpha=0.1, tol=1e-7)
+    fr.fit(X, y)
+    n1, c1 = fr.n_iter_, fr.coef_.copy()
+    fr.fit(X, y)
+    assert fr.n_iter_ == n1
+    np.testing.assert_array_equal(fr.coef_, c1)
+
+
+def test_lasso_copy_x_accepted_default_unchanged():
+    """copy_X is accepted (ABI-only) and does not change the fit.
+
+    sklearn `Lasso(copy_X=...)` (`_coordinate_descent.py:1314`); the CD fit never
+    mutates X, so copy_X=False produces the same coef as copy_X=True (and matches
+    the sklearn oracle, which is likewise invariant to copy_X here).
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    a = fl.Lasso(alpha=0.1, copy_X=True).fit(X, y)
+    b = fl.Lasso(alpha=0.1, copy_X=False).fit(X.copy(), y)
+    np.testing.assert_allclose(a.coef_, b.coef_, atol=0.0)
+    sk = SkLasso(alpha=0.1, copy_X=False).fit(X.copy(), y)
+    np.testing.assert_allclose(b.coef_, sk.coef_, atol=1e-6)
+
+
+def test_elasticnet_copy_x_accepted_default_unchanged():
+    """copy_X is accepted (ABI-only) and does not change the ElasticNet fit."""
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    a = fl.ElasticNet(alpha=0.1, copy_X=True).fit(X, y)
+    b = fl.ElasticNet(alpha=0.1, copy_X=False).fit(X.copy(), y)
+    np.testing.assert_allclose(a.coef_, b.coef_, atol=0.0)
+    sk = SkElasticNet(alpha=0.1, copy_X=False).fit(X.copy(), y)
+    np.testing.assert_allclose(b.coef_, sk.coef_, atol=1e-6)
+
+
+def test_lasso_get_params_all_and_clone():
+    """Lasso.get_params() returns sklearn's full param set with matching defaults,
+    and clone() round-trips a non-default config (check_estimator parity).
+
+    Defaults come from the live sklearn `Lasso.__init__` signature (R-CHAR-3).
+    """
+    from sklearn import clone
+
+    sk_params = inspect.signature(SkLasso.__init__).parameters
+    expected = {
+        name: p.default
+        for name, p in sk_params.items()
+        if name != "self" and p.default is not inspect.Parameter.empty
+    }
+    assert set(expected) == {
+        "alpha",
+        "fit_intercept",
+        "precompute",
+        "copy_X",
+        "max_iter",
+        "tol",
+        "warm_start",
+        "positive",
+        "random_state",
+        "selection",
+    }
+    got = fl.Lasso().get_params()
+    assert set(got) == set(expected)
+    for name, default in expected.items():
+        assert got[name] == default, f"{name}: {got[name]!r} != sklearn {default!r}"
+
+    src = fl.Lasso(
+        alpha=0.3,
+        fit_intercept=False,
+        precompute=True,
+        copy_X=False,
+        max_iter=500,
+        tol=1e-8,
+        warm_start=True,
+        positive=False,
+        random_state=7,
+        selection="random",
+    )
+    cloned = clone(src)
+    assert cloned.get_params() == src.get_params()
+
+
+def test_elasticnet_get_params_all_and_clone():
+    """ElasticNet.get_params() returns sklearn's full param set + clone round-trip."""
+    from sklearn import clone
+
+    sk_params = inspect.signature(SkElasticNet.__init__).parameters
+    expected = {
+        name: p.default
+        for name, p in sk_params.items()
+        if name != "self" and p.default is not inspect.Parameter.empty
+    }
+    assert set(expected) == {
+        "alpha",
+        "l1_ratio",
+        "fit_intercept",
+        "precompute",
+        "max_iter",
+        "copy_X",
+        "tol",
+        "warm_start",
+        "positive",
+        "random_state",
+        "selection",
+    }
+    got = fl.ElasticNet().get_params()
+    assert set(got) == set(expected)
+    for name, default in expected.items():
+        assert got[name] == default, f"{name}: {got[name]!r} != sklearn {default!r}"
+
+    src = fl.ElasticNet(
+        alpha=0.3,
+        l1_ratio=0.7,
+        fit_intercept=False,
+        precompute=True,
+        copy_X=False,
+        max_iter=500,
+        tol=1e-8,
+        warm_start=True,
+        positive=False,
+        random_state=7,
+        selection="random",
+    )
+    cloned = clone(src)
+    assert cloned.get_params() == src.get_params()
+
+
+def test_lasso_invalid_selection_raises():
+    """Lasso(selection='bogus').fit(...) raises ValueError.
+
+    sklearn constrains selection to {'cyclic','random'}
+    (`_coordinate_descent.py:893` `StrOptions({"cyclic","random"})`) and raises
+    InvalidParameterError (a ValueError subclass) on any other value. ferrolearn
+    must likewise raise ValueError.
+    """
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    with pytest.raises(ValueError):
+        fl.Lasso(selection="bogus").fit(X, y)
+
+
+def test_elasticnet_invalid_selection_raises():
+    """ElasticNet(selection='bogus').fit(...) raises ValueError."""
+    X, y = _X_CD_PARAMS, _y_CD_PARAMS
+    with pytest.raises(ValueError):
+        fl.ElasticNet(selection="bogus").fit(X, y)
+
+
+def test_lasso_elasticnet_params_signature_matches_sklearn():
+    """The ferrolearn ctor signatures match sklearn's keyword-only ordering.
+
+    `alpha` is positional-or-keyword on both; everything else is keyword-only,
+    matching sklearn `Lasso`/`ElasticNet.__init__` (`_coordinate_descent.py:
+    1310-1322` / `:898-912`).
+    """
+    for fr_cls, sk_cls in ((fl.Lasso, SkLasso), (fl.ElasticNet, SkElasticNet)):
+        fr_sig = inspect.signature(fr_cls.__init__).parameters
+        sk_sig = inspect.signature(sk_cls.__init__).parameters
+        for name, sk_p in sk_sig.items():
+            if name == "self":
+                continue
+            assert name in fr_sig, f"{fr_cls.__name__} missing param {name}"
+            assert fr_sig[name].kind == sk_p.kind, (
+                f"{fr_cls.__name__}.{name}: kind {fr_sig[name].kind} "
+                f"!= sklearn {sk_p.kind}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# RED pins: warm_start refit with a CHANGED n_features (#2136 adversarial
+# re-audit of the just-added warm_start surface). sklearn reuses its mutable
+# `self.coef_` as `coef_init` (`_coordinate_descent.py:1062-1065`/`:1087`); when
+# the refit's `X` has a DIFFERENT number of columns, the stale-length
+# `coef_init` cannot broadcast into the new `(n_features,)` coef array
+# (`_coordinate_descent.py:706`) and sklearn raises ValueError. ferrolearn's
+# wrapper guards `prev.shape[0] == X.shape[1]` (`_regressors.py:538`/`:762`) and,
+# on a mismatch, SILENTLY DROPS coef_init and cold-starts on the new shape ->
+# success where sklearn errors. Every expected value comes from the LIVE sklearn
+# 1.5.2 oracle in the same test (R-CHAR-3); none is literal-copied.
+# ---------------------------------------------------------------------------
+
+
+def test_red_lasso_warm_start_changed_n_features_more():
+    """Divergence: ferrolearn.Lasso(warm_start=True) refit with MORE features
+    silently cold-starts; sklearn raises ValueError.
+
+    sklearn `Lasso(warm_start=True)` reuses the prior `self.coef_` as `coef_init`
+    (`sklearn/linear_model/_coordinate_descent.py:1062-1065`, `:1087`). On a refit
+    whose `X` has more columns than the original, the stale-length `coef_init`
+    cannot broadcast into the new `(n_features,)` array and sklearn raises
+    ValueError (`_coordinate_descent.py:706`, "could not broadcast input array
+    from shape (2,) into shape (3,)").
+
+    ferrolearn's wrapper only seeds `coef_init` when `prev.shape[0] == X.shape[1]`
+    (`_regressors.py:538`), so the changed-shape refit silently cold-starts and
+    SUCCEEDS, diverging from sklearn's observable ValueError.
+
+    Oracle (R-CHAR-3): the live sklearn 1.5.2 call raises ValueError; ferrolearn
+    must mirror that. Tracking: #2136
+    """
+    X = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 4.0], [3.0, 9.0], [4.0, 16.0]])
+    y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    X3 = np.column_stack([X, X[:, 0] * 2.0 + 1.0])  # 3 features
+
+    # Oracle: sklearn warm_start refit with MORE features raises ValueError.
+    sk = SkLasso(alpha=0.1, warm_start=True)
+    sk.fit(X, y)
+    with pytest.raises(ValueError):
+        sk.fit(X3, y)
+
+    # ferrolearn must mirror the sklearn observable behavior.
+    fr = fl.Lasso(alpha=0.1, warm_start=True)
+    fr.fit(X, y)
+    with pytest.raises(ValueError):
+        fr.fit(X3, y)
+
+
+def test_red_lasso_warm_start_changed_n_features_fewer():
+    """Divergence: ferrolearn.Lasso(warm_start=True) refit with FEWER features
+    silently cold-starts; sklearn raises ValueError.
+
+    Same mechanism as the MORE-features pin but shrinking the column count:
+    sklearn cannot broadcast the length-2 `coef_init` into the length-1 coef
+    array (`_coordinate_descent.py:706`) and raises ValueError. ferrolearn's
+    length guard (`_regressors.py:538`) drops coef_init and cold-starts -> success.
+
+    Oracle (R-CHAR-3): the live sklearn 1.5.2 call. Tracking: #2136
+    """
+    X = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 4.0], [3.0, 9.0], [4.0, 16.0]])
+    y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    X1 = X[:, [0]]  # 1 feature
+
+    sk = SkLasso(alpha=0.1, warm_start=True)
+    sk.fit(X, y)
+    with pytest.raises(ValueError):
+        sk.fit(X1, y)
+
+    fr = fl.Lasso(alpha=0.1, warm_start=True)
+    fr.fit(X, y)
+    with pytest.raises(ValueError):
+        fr.fit(X1, y)
+
+
+def test_red_elasticnet_warm_start_changed_n_features_more():
+    """Divergence: ferrolearn.ElasticNet(warm_start=True) refit with MORE features
+    silently cold-starts; sklearn raises ValueError.
+
+    Identical mechanism to the Lasso pin (Lasso subclasses ElasticNet): sklearn
+    reuses `self.coef_` as `coef_init` (`_coordinate_descent.py:1062-1065`) and
+    the stale-length vector cannot broadcast into the new coef array
+    (`_coordinate_descent.py:706`). ferrolearn's wrapper guard
+    (`_regressors.py:762`) silently cold-starts.
+
+    Oracle (R-CHAR-3): the live sklearn 1.5.2 call. Tracking: #2136
+    """
+    X = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 4.0], [3.0, 9.0], [4.0, 16.0]])
+    y = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    X3 = np.column_stack([X, X[:, 0] * 2.0 + 1.0])
+
+    sk = SkElasticNet(alpha=0.1, warm_start=True)
+    sk.fit(X, y)
+    with pytest.raises(ValueError):
+        sk.fit(X3, y)
+
+    fr = fl.ElasticNet(alpha=0.1, warm_start=True)
+    fr.fit(X, y)
+    with pytest.raises(ValueError):
+        fr.fit(X3, y)
