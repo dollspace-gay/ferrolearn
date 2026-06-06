@@ -30,7 +30,7 @@
 //! | REQ-7 (`make_circles` shuffle+parity) | NOT-STARTED | no `shuffle`; `factor` required (sklearn default 0.8); noise RNG. Blocker: RNG #1893. |
 //! | REQ-8 (`make_swiss_roll` parity+hole) | NOT-STARTED | missing `hole`; value parity RNG. Blocker: RNG #1893. |
 //! | REQ-9 (`make_s_curve` parity) | NOT-STARTED | value parity RNG. Blocker: RNG #1893. |
-//! | REQ-10 (`make_sparse_uncorrelated` weights+parity) | NOT-STARTED | 5 weights `[1,2,3,4,5]` + noise-free y vs sklearn 4 weights `[1,2,-2,-1.5]` and `y~N(.,1)`. Blocker #1896 (+ RNG #1893). |
+//! | REQ-10 (`make_sparse_uncorrelated` weights+parity) | NOT-STARTED | weights FIXED #1896: now 4 sklearn weights `[1,2,-2,-1.5]` (`_samples_generator.py:1619-1623`), pinned exact by `make_sparse_uncorrelated_weights_match_sklearn`. Remaining gap: `y~N(loc,1)` additive Gaussian noise still absent (deterministic `y_loc`). Blocker #1893 (RNG). |
 //! | REQ-11 (`make_friedman1` parity) | NOT-STARTED | formula matches; value parity RNG. Blocker: RNG #1893. |
 //! | REQ-12 (`make_friedman2` parity+order) | NOT-STARTED | per-row vs whole-matrix draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
 //! | REQ-13 (`make_friedman3` 1e-6+parity) | NOT-STARTED | spurious `+1e-6` on X0; draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
@@ -874,9 +874,11 @@ where
 
 /// Generate a regression dataset with sparse, uncorrelated features.
 ///
-/// Only the first 5 features are informative (with fixed weights
-/// `[1, 2, 3, 4, 5]`); all remaining features are independent Gaussian noise.
-/// This dataset is designed for testing feature-selection algorithms.
+/// Only the first 4 features are informative (with fixed weights
+/// `[1, 2, -2, -1.5]`, matching scikit-learn
+/// `sklearn/datasets/_samples_generator.py:1619-1623`); all remaining features
+/// are independent Gaussian noise. This dataset is designed for testing
+/// feature-selection algorithms.
 ///
 /// # Parameters
 ///
@@ -890,7 +892,7 @@ where
 /// continuous regression target computed as:
 ///
 /// ```text
-/// y = 1*X[:,0] + 2*X[:,1] + 3*X[:,2] + 4*X[:,3] + 5*X[:,4]
+/// y = 1*X[:,0] + 2*X[:,1] - 2*X[:,2] - 1.5*X[:,3]
 /// ```
 ///
 /// All features are drawn independently from N(0, 1).
@@ -937,8 +939,9 @@ where
         reason: e.to_string(),
     })?;
 
-    // Fixed informative weights for the first 5 features.
-    let weights = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+    // Fixed informative weights for the first 4 features
+    // (sklearn `_samples_generator.py:1619-1623`: y_loc = X0 + 2*X1 - 2*X2 - 1.5*X3).
+    let weights = [1.0_f64, 2.0, -2.0, -1.5];
 
     let mut x_data: Vec<F> = Vec::with_capacity(n_samples * n_features);
     let mut y_data: Vec<F> = Vec::with_capacity(n_samples);
@@ -1951,11 +1954,12 @@ mod tests {
     }
 
     #[test]
-    fn test_make_sparse_uncorrelated_target_from_first_5_features() {
+    fn test_make_sparse_uncorrelated_target_from_first_4_features() {
         // With no noise the target must equal the linear combination of the
-        // first 5 features with fixed weights [1, 2, 3, 4, 5].
+        // first 4 features with sklearn's fixed weights [1, 2, -2, -1.5]
+        // (`_samples_generator.py:1619-1623`).
         let (x, y) = make_sparse_uncorrelated::<f64>(20, 5, Some(7)).unwrap();
-        let weights = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+        let weights = [1.0_f64, 2.0, -2.0, -1.5];
         for i in 0..20 {
             let expected: f64 = weights
                 .iter()
@@ -1969,11 +1973,11 @@ mod tests {
 
     #[test]
     fn test_make_sparse_uncorrelated_informative_features_only() {
-        // The target should depend only on the first 5 features regardless of
+        // The target should depend only on the first 4 features regardless of
         // extra noise columns. Verify by recomputing the target from X directly.
         let (x, y) = make_sparse_uncorrelated::<f64>(30, 10, Some(10)).unwrap();
 
-        let weights = [1.0_f64, 2.0, 3.0, 4.0, 5.0];
+        let weights = [1.0_f64, 2.0, -2.0, -1.5];
         for i in 0..30 {
             let expected: f64 = weights
                 .iter()
@@ -1986,6 +1990,33 @@ mod tests {
                 y[i]
             );
         }
+    }
+
+    #[test]
+    fn make_sparse_uncorrelated_weights_match_sklearn() -> Result<(), FerroError> {
+        // R-CHAR-3: expected weights [1, 2, -2, -1.5] are sklearn's symbolic
+        // constant from `sklearn/datasets/_samples_generator.py:1619-1623`:
+        //   y_loc = X[:,0] + 2*X[:,1] - 2*X[:,2] - 1.5*X[:,3]
+        // NOT the [1,2,3,4,5] the prior pass shipped (blocker #1896).
+        // RNG-independent: whatever X the bit-stream produced, the noise-free
+        // f64 target is EXACTLY this 4-feature combination. The exactness also
+        // proves features 4..n_features carry weight 0 (y equals the 4-term sum,
+        // so any contribution from columns >= 4 would break the equality).
+        // The additive N(0,1) target noise (`scale=np.ones`, :1620-1622) is a
+        // SEPARATE divergence deferred to blocker #1893 (RNG substrate); y here
+        // stays the deterministic y_loc.
+        let (x, y) = make_sparse_uncorrelated::<f64>(50, 8, Some(0))?;
+        assert_eq!(x.shape(), &[50, 8]);
+        assert_eq!(y.len(), 50);
+        for i in 0..50 {
+            let expected = x[[i, 0]] + 2.0 * x[[i, 1]] - 2.0 * x[[i, 2]] - 1.5 * x[[i, 3]];
+            assert!(
+                (y[i] - expected).abs() < 1e-12,
+                "row {i}: sklearn y_loc {expected}, got {}",
+                y[i]
+            );
+        }
+        Ok(())
     }
 
     #[test]
