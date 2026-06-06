@@ -1114,3 +1114,178 @@ def test_red_lasso_elasticnet_convergence_warning_gap_value_matches_sklearn():
             f"sklearn warning gap {sk_gap:.3e} (factor "
             f"{sk_gap / fr_gap:.2f}, == n_samples)"
         )
+
+
+# ---------------------------------------------------------------------------
+# positive= constructor parameter (#2129). sklearn's `positive=True` constrains
+# `coef_ >= 0` for all four estimators (LinearRegression NNLS `_base.py:645-653`;
+# Ridge projected solve `_ridge.py:923-928`; Lasso/ElasticNet non-negative
+# soft-threshold `_cd_fast.pyx:191-195`). `positive` is keyword-only and LAST in
+# every sklearn `__init__` (`_base.py:574`, `_ridge.py:902`,
+# `_coordinate_descent.py:909`). The Rust crates already support + oracle-verify
+# it; this surfaces it through the binding ctors + the Python wrappers.
+#
+# Fixture: an unconstrained fit of this (X, y) has a NEGATIVE 2nd coefficient for
+# LinearRegression/Ridge/ElasticNet, so `positive=True` clamps it to 0.0 and the
+# whole solution differs — the constraint is genuinely ACTIVE (not a no-op).
+# Every expected value is the LIVE sklearn 1.5.2 oracle computed in the same test
+# (R-CHAR-3); none is literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+_X_POS = np.array(
+    [[1.0, 5.0], [2.0, 4.0], [3.0, 3.0], [4.0, 2.0], [5.0, 1.0], [6.0, 2.0]]
+)
+_y_POS = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 5.5])
+
+
+def test_positive_param_keyword_only_last():
+    """`ferrolearn.{LinearRegression,Ridge,Lasso,ElasticNet}` expose `positive`
+    as a KEYWORD-ONLY constructor param, matching sklearn's signature placement
+    (`_base.py:574`, `_ridge.py:902`, `_coordinate_descent.py:909` — `positive`
+    after the `*`). Oracle (R-CHAR-3): sklearn's live signature kind.
+    """
+    pairs = (
+        (fl.LinearRegression, SkLinearRegression),
+        (fl.Ridge, SkRidge),
+        (fl.Lasso, SkLasso),
+        (fl.ElasticNet, SkElasticNet),
+    )
+    for fr_cls, sk_cls in pairs:
+        sk_kind = inspect.signature(sk_cls.__init__).parameters["positive"].kind
+        assert sk_kind == inspect.Parameter.KEYWORD_ONLY, sk_cls.__name__
+        fr_params = inspect.signature(fr_cls.__init__).parameters
+        assert "positive" in fr_params, f"{fr_cls.__name__} missing positive"
+        assert fr_params["positive"].kind == inspect.Parameter.KEYWORD_ONLY
+        # Default is False on both sides.
+        assert sk_cls().positive is False
+        assert fr_cls().positive is False
+
+
+def test_linearregression_positive_matches_sklearn():
+    """`ferrolearn.LinearRegression(positive=True)` constrains `coef_ >= 0` and
+    matches the live sklearn NNLS oracle element-wise (`_base.py:645-647`).
+    Unconstrained 2nd coef is negative here, so the constraint is active.
+    """
+    sk = SkLinearRegression(positive=True).fit(_X_POS, _y_POS)
+    fr = fl.LinearRegression(positive=True).fit(_X_POS, _y_POS)
+
+    assert np.all(np.asarray(fr.coef_) >= 0.0)
+    assert np.any(np.asarray(SkLinearRegression().fit(_X_POS, _y_POS).coef_) < 0.0)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) <= 1e-6
+    np.testing.assert_allclose(fr.predict(_X_POS), sk.predict(_X_POS), atol=1e-6)
+
+
+def test_ridge_positive_matches_sklearn():
+    """`ferrolearn.Ridge(alpha=1.0, positive=True)` constrains `coef_ >= 0` and
+    matches the live sklearn projected oracle (`_ridge.py:923-928`).
+    """
+    sk = SkRidge(alpha=1.0, positive=True).fit(_X_POS, _y_POS)
+    fr = fl.Ridge(alpha=1.0, positive=True).fit(_X_POS, _y_POS)
+
+    assert np.all(np.asarray(fr.coef_) >= 0.0)
+    assert np.any(np.asarray(SkRidge(alpha=1.0).fit(_X_POS, _y_POS).coef_) < 0.0)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) <= 1e-6
+    np.testing.assert_allclose(fr.predict(_X_POS), sk.predict(_X_POS), atol=1e-6)
+
+
+def test_lasso_positive_matches_sklearn():
+    """`ferrolearn.Lasso(alpha=0.3, positive=True)` constrains `coef_ >= 0` and
+    matches the live sklearn non-negative-soft-threshold oracle
+    (`_cd_fast.pyx:191-195`).
+    """
+    sk = SkLasso(alpha=0.3, positive=True).fit(_X_POS, _y_POS)
+    fr = fl.Lasso(alpha=0.3, positive=True).fit(_X_POS, _y_POS)
+
+    assert np.all(np.asarray(fr.coef_) >= 0.0)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) <= 1e-6
+    np.testing.assert_allclose(fr.predict(_X_POS), sk.predict(_X_POS), atol=1e-6)
+
+
+def test_elasticnet_positive_matches_sklearn():
+    """`ferrolearn.ElasticNet(alpha=0.3, positive=True)` constrains `coef_ >= 0`
+    and matches the live sklearn oracle (`_cd_fast.pyx:191-195`). Unconstrained
+    2nd coef is negative here, so the constraint is active.
+    """
+    sk = SkElasticNet(alpha=0.3, positive=True).fit(_X_POS, _y_POS)
+    fr = fl.ElasticNet(alpha=0.3, positive=True).fit(_X_POS, _y_POS)
+
+    assert np.all(np.asarray(fr.coef_) >= 0.0)
+    assert np.any(
+        np.asarray(SkElasticNet(alpha=0.3).fit(_X_POS, _y_POS).coef_) < 0.0
+    )
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) <= 1e-6
+    np.testing.assert_allclose(fr.predict(_X_POS), sk.predict(_X_POS), atol=1e-6)
+
+
+def test_all_four_positive_false_unchanged():
+    """`positive=False` (the DEFAULT) is byte-identical to the unconstrained fit
+    for all four estimators — the new param does not perturb the default path.
+    Oracle (R-CHAR-3): the live sklearn default fit is the ground truth.
+    """
+    configs = (
+        (fl.LinearRegression, SkLinearRegression, {}),
+        (fl.Ridge, SkRidge, {"alpha": 1.0}),
+        (fl.Lasso, SkLasso, {"alpha": 0.3}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.3}),
+    )
+    for fr_cls, sk_cls, kw in configs:
+        sk = sk_cls(**kw).fit(_X_POS, _y_POS)
+        fr_default = fr_cls(**kw).fit(_X_POS, _y_POS)
+        fr_explicit = fr_cls(positive=False, **kw).fit(_X_POS, _y_POS)
+
+        # explicit positive=False == default == sklearn default (element-wise).
+        np.testing.assert_allclose(
+            fr_explicit.coef_, fr_default.coef_, atol=0.0
+        )
+        np.testing.assert_allclose(fr_default.coef_, sk.coef_, atol=1e-6)
+        assert abs(float(fr_default.intercept_) - float(sk.intercept_)) <= 1e-6
+
+
+def test_ridge_positive_multioutput_matches_sklearn():
+    """Multi-output `ferrolearn.Ridge(positive=True)` on a 2-D `Y` constrains each
+    target's `coef_ >= 0`, matching sklearn EXACTLY.
+
+    sklearn's positive Ridge solve is per-target-independent (`_ridge.py:923-928`
+    dispatch; per-target solve `:207`), so multi `coef_` `(n_targets, n_features)`
+    equals the stack of per-target single-output positive fits. The wrapper routes
+    the `positive=True` + 2-D `y` path through a per-target loop over the
+    single-output positive `_RsRidge` (the `_RsRidgeMultiOutput` binding has no
+    positivity support). Oracle (R-CHAR-3): the live sklearn 1.5.2 call.
+
+    Value tolerance: where a target's positivity constraint binds at a vertex
+    (a coef clamped to 0) the agreement is bit-tight; where the optimum is
+    interior, ferrolearn's downstream projected coordinate descent
+    (`ferrolearn-linear` Ridge REQ-9 #387) and sklearn's L-BFGS-B
+    (`_ridge.py:300`) stop at slightly different iterates for a fixed
+    `(max_iter, tol)` — a downstream stopping-criterion gap, NOT a binding bug —
+    so the constrained values agree to ~2e-3, not ULP (cf. the Lasso/ElasticNet
+    CD-stopping caveat). The STRUCTURE (coef_ >= 0, shape, per-target-stack
+    independence) is exact; the binding is a faithful per-target router.
+    """
+    Y = np.array(
+        [[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 2.0], [5.5, 6.0]]
+    )
+    sk = SkRidge(alpha=1.0, positive=True).fit(_X_POS, Y)
+    fr = fl.Ridge(alpha=1.0, positive=True).fit(_X_POS, Y)
+
+    assert fr.coef_.shape == sk.coef_.shape == (2, 2)
+    assert np.all(fr.coef_ >= 0.0)
+    # Target 0 (constraint binds at a vertex) matches bit-tight; target 1
+    # (interior optimum) agrees to the downstream solver-stopping tolerance.
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=2e-3)
+
+    assert fr.intercept_.shape == sk.intercept_.shape == (2,)
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=2e-3)
+
+    np.testing.assert_allclose(fr.predict(_X_POS), sk.predict(_X_POS), atol=2e-3)
+
+    # Independence (EXACT): multi coef_ == stack of per-target single-output
+    # positive fits — proves the wrapper routes per-target, not coupled.
+    stacked = np.vstack(
+        [fl.Ridge(alpha=1.0, positive=True).fit(_X_POS, Y[:, j]).coef_ for j in range(2)]
+    )
+    np.testing.assert_allclose(fr.coef_, stacked, atol=1e-12)

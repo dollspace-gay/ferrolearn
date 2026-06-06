@@ -80,10 +80,14 @@ class LinearRegression(MultiOutputMixin, RegressorMixin, BaseEstimator):
     ----------
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    positive : bool, default=False
+        When True, force the coefficients to be non-negative (NNLS), matching
+        sklearn `LinearRegression(positive=...)` (`_base.py:574`/`:645-653`).
     """
 
-    def __init__(self, *, fit_intercept=True):
+    def __init__(self, *, fit_intercept=True, positive=False):
         self.fit_intercept = fit_intercept
+        self.positive = positive
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation: ANY 2-D `y` routes to the Rust
@@ -96,7 +100,45 @@ class LinearRegression(MultiOutputMixin, RegressorMixin, BaseEstimator):
         # (the `MultiOutputMixin` tag tells `check_supervised_y_2d` so).
         y_arr = np.asarray(y)
         multioutput = y_arr.ndim == 2
-        if multioutput:
+        if multioutput and self.positive:
+            # positive=True multi-output: sklearn fits each target column
+            # INDEPENDENTLY via `optimize.nnls(X, y[:, j])`
+            # (`sklearn/linear_model/_base.py:649-653`), so multi `coef_` is the
+            # stack of per-target single-output positive fits. The
+            # `_RsLinearRegressionMultiOutput` binding does NOT support
+            # positivity, so route through a PER-TARGET LOOP over the
+            # single-output positive `_RsLinearRegression` instead, stacking
+            # `coef_` (n_targets, n_features) and `intercept_` (n_targets,).
+            # sklearn still sets `rank_`/`singular_` from `linalg.lstsq` on the
+            # design REGARDLESS of `positive` (`_base.py:687`), so derive them
+            # once from the unconstrained multi-output binding.
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            coef_list = []
+            intercept_list = []
+            for j in range(y.shape[1]):
+                rs_j = _RsLinearRegression(
+                    fit_intercept=self.fit_intercept, positive=True
+                )
+                _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
+                coef_list.append(np.array(rs_j.coef_))
+                intercept_list.append(float(rs_j.intercept_))
+            self.coef_ = np.vstack(coef_list)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(intercept_list) if self.fit_intercept else 0.0
+            )
+            # rank_/singular_ from the lstsq SVD of the design (sklearn sets them
+            # unconditionally, `_base.py:687`); the unconstrained multi-output
+            # binding gives the same design diagnostics (#2124).
+            rs_diag = _RsLinearRegressionMultiOutput(fit_intercept=self.fit_intercept)
+            _fit_rust(rs_diag, X, y)
+            self.rank_ = int(rs_diag.rank_)
+            self.singular_ = np.array(rs_diag.singular_)
+        elif multioutput:
             X, y = self._validate_data(
                 X, y, dtype="float64", multi_output=True, y_numeric=True
             )
@@ -117,7 +159,9 @@ class LinearRegression(MultiOutputMixin, RegressorMixin, BaseEstimator):
         else:
             X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
             X, y = _ensure_f64(X), _ensure_f64(y)
-            self._rs = _RsLinearRegression(fit_intercept=self.fit_intercept)
+            self._rs = _RsLinearRegression(
+                fit_intercept=self.fit_intercept, positive=self.positive
+            )
             _fit_rust(self._rs, X, y)
             self.coef_ = np.array(self._rs.coef_)
             self.intercept_ = float(self._rs.intercept_)
@@ -155,11 +199,16 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         Regularization strength.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    positive : bool, default=False
+        When True, force the coefficients to be non-negative (projected
+        coordinate descent), matching sklearn `Ridge(positive=...)`
+        (`_ridge.py:902`/`:923-928`).
     """
 
-    def __init__(self, alpha=1.0, *, fit_intercept=True):
+    def __init__(self, alpha=1.0, *, fit_intercept=True, positive=False):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
+        self.positive = positive
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation: a 2-D `y` with >1 column routes
@@ -171,7 +220,35 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         # multi-output path (`_base.py:319-324`).
         y_arr = np.asarray(y)
         multioutput = y_arr.ndim == 2
-        if multioutput:
+        if multioutput and self.positive:
+            # positive=True multi-output: sklearn's L-BFGS-B positive solve is
+            # per-target-independent (`sklearn/linear_model/_ridge.py:923-928`
+            # dispatch; the per-target closed-form/iterative solve at `:207`),
+            # so multi `coef_` is the stack of per-target single-output positive
+            # fits. The `_RsRidgeMultiOutput` binding does NOT support
+            # positivity, so route through a PER-TARGET LOOP over the
+            # single-output positive `_RsRidge` instead, stacking `coef_`
+            # (n_targets, n_features) and `intercept_` (n_targets,).
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            coef_list = []
+            intercept_list = []
+            for j in range(y.shape[1]):
+                rs_j = _RsRidge(
+                    alpha=self.alpha, fit_intercept=self.fit_intercept, positive=True
+                )
+                _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
+                coef_list.append(np.array(rs_j.coef_))
+                intercept_list.append(float(rs_j.intercept_))
+            self.coef_ = np.vstack(coef_list)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(intercept_list) if self.fit_intercept else 0.0
+            )
+        elif multioutput:
             X, y = self._validate_data(
                 X, y, dtype="float64", multi_output=True, y_numeric=True
             )
@@ -189,7 +266,11 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         else:
             X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
             X, y = _ensure_f64(X), _ensure_f64(y)
-            self._rs = _RsRidge(alpha=self.alpha, fit_intercept=self.fit_intercept)
+            self._rs = _RsRidge(
+                alpha=self.alpha,
+                fit_intercept=self.fit_intercept,
+                positive=self.positive,
+            )
             _fit_rust(self._rs, X, y)
             self.coef_ = np.array(self._rs.coef_)
             self.intercept_ = float(self._rs.intercept_)
@@ -225,13 +306,20 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
         Tolerance for convergence.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    positive : bool, default=False
+        When True, force the coefficients to be non-negative (non-negative
+        soft-threshold), matching sklearn `Lasso(positive=...)`
+        (`_coordinate_descent.py:909`; `_cd_fast.pyx:191-195`).
     """
 
-    def __init__(self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True):
+    def __init__(
+        self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False
+    ):
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
         self.fit_intercept = fit_intercept
+        self.positive = positive
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation. sklearn `Lasso` (subclass of
@@ -270,6 +358,7 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
                     max_iter=self.max_iter,
                     tol=self.tol,
                     fit_intercept=self.fit_intercept,
+                    positive=self.positive,
                 )
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
@@ -315,6 +404,7 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
             max_iter=self.max_iter,
             tol=self.tol,
             fit_intercept=self.fit_intercept,
+            positive=self.positive,
         )
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
@@ -373,16 +463,28 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
         Tolerance for convergence.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    positive : bool, default=False
+        When True, force the coefficients to be non-negative (non-negative
+        soft-threshold), matching sklearn `ElasticNet(positive=...)`
+        (`_coordinate_descent.py:909`; `_cd_fast.pyx:191-195`).
     """
 
     def __init__(
-        self, alpha=1.0, *, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True
+        self,
+        alpha=1.0,
+        *,
+        l1_ratio=0.5,
+        max_iter=1000,
+        tol=1e-4,
+        fit_intercept=True,
+        positive=False,
     ):
         self.alpha = alpha
         self.l1_ratio = l1_ratio
         self.max_iter = max_iter
         self.tol = tol
         self.fit_intercept = fit_intercept
+        self.positive = positive
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation. sklearn `ElasticNet`
@@ -421,6 +523,7 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
                     max_iter=self.max_iter,
                     tol=self.tol,
                     fit_intercept=self.fit_intercept,
+                    positive=self.positive,
                 )
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
@@ -467,6 +570,7 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
             max_iter=self.max_iter,
             tol=self.tol,
             fit_intercept=self.fit_intercept,
+            positive=self.positive,
         )
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)

@@ -26,24 +26,24 @@
 //! | REQ-LINREG-VALUE-PARITY (coef_/intercept_ array parity) | SHIPPED | default path: marshalled from the Rust getters; downstream `ferrolearn-linear` REQ-1/5 match the sklearn oracle ≤1e-8 (full-rank/rank-deficient/underdetermined min-norm OLS). (`positive=True` NNLS #371; multi-output 2-D `y` → SHIPPED, see REQ-LINREG-MULTIOUTPUT.) |
 //! | REQ-LINREG-MULTIOUTPUT (2-D Y → 2-D coef_) | SHIPPED | `ferrolearn.LinearRegression.fit` accepts a 2-D `y` of shape `(n_samples, n_targets)` and produces `coef_` `(n_targets, n_features)` + `intercept_` `(n_targets,)`, matching sklearn `LinearRegression` (`sklearn/linear_model/_base.py:687` `coef_.T`, `_set_intercept` `:319-327`). impl `#[pyclass(name="_RsLinearRegressionMultiOutput")] RsLinearRegressionMultiOutput::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` over `ferrolearn_linear::linear_regression::FittedMultiOutputLinearRegression<f64>` (the `Fit<Array2,Array2> for LinearRegression` path, `ferrolearn-linear/src/linear_regression.rs:491`, REQ-7/#372 SHIPPED; `coefficients()` is ALREADY `(n_targets,n_features)` `:458` + `intercepts()` `(n_targets,)` `:465`). UNLIKE the Ridge multi-output shim, the `coef_` getter does NOT transpose — the downstream storage is already in sklearn's `coef_` orientation. fit_intercept=False → scalar `0.0` (set in the wrapper, `_base.py:327`). After a pickle round-trip (`__getstate__` pops `_rs`), `predict` falls back to `_predict_linear(X, coef_, intercept_)` = `X @ coef_.T + intercept_`, matching sklearn's `_decision_function` (`_base.py:290`/`:364` `X @ coef_.T`); the `.T` is a no-op for 1-D single-output `coef_` and gives the correct `(n, n_targets)` orientation for 2-D multi-output `coef_` `(n_targets, n_features)` (#2125 — also repairs the shared Ridge pickle-predict path). Non-test consumer: `_regressors.py::LinearRegression.fit` routes the `y.ndim==2` path to `_RsLinearRegressionMultiOutput` (registered in `lib.rs`); `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_linearregression_multioutput_matches_sklearn` asserts `coef_` `(2,2)`, `intercept_` `(2,)`, and `predict` match the live sklearn oracle ≤1e-8 (R-CHAR-3); `_column_vector_y` ((n,1) → coef_ `(1,n_features)`), `_no_intercept_scalar` (fit_intercept=False → scalar 0.0), a single-output guard, and `test_red_linearregression_multioutput_pickle_predict_shape` (#2125; pickle round-trip predict matches the live sklearn oracle ≤1e-8). Downstream `ferrolearn-linear` REQ-7 #372. |
 //! | REQ-LINREG-RANK-SINGULAR (rank_/singular_ fitted attrs, single AND multi-output) | SHIPPED | impl `RsLinearRegression::rank_` getter (over `FittedLinearRegression<f64>`, via `fitted.rank()`, `linear_regression.rs:471`) + `RsLinearRegression::singular_` getter (via `fitted.singular_values()`, `linear_regression.rs:478`, marshalled through `ndarray1_to_numpy`), surfaced by `_regressors.py::LinearRegression.fit` which sets `self.rank_ = int(self._rs.rank_)` + `self.singular_ = np.array(self._rs.singular_)` (next to `coef_`/`intercept_`). The MULTI-OUTPUT path is identical (#2124): `RsLinearRegressionMultiOutput::rank_`/`singular_` getters (over `FittedMultiOutputLinearRegression<f64>`, via `fitted.rank()`/`fitted.singular_values()`), surfaced in the `y.ndim==2` branch of `_regressors.py::LinearRegression.fit` (`self.rank_ = int(self._rs.rank_)` + `self.singular_ = np.array(self._rs.singular_)`). Mirrors sklearn `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)` set REGARDLESS of single vs multi-output (`_base.py:687`; attr docstrings `rank_` `_base.py:505`, `singular_` `_base.py:508`). The downstream Rust captures both from the single-SVD `solve_lstsq` on the actually-solved (centered-when-`fit_intercept`) matrix, matching sklearn's `linalg.lstsq` operands (`ferrolearn-linear` REQ-9 SHIPPED #374). Non-test consumer: `_regressors.py::LinearRegression` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_linearregression_rank_singular_match_sklearn` (single-output, 5×2 fixture: `rank_=2`, `singular_=[4.24264069, 1.41421356]`) + `test_red_linearregression_multioutput_rank_singular_missing` (#2124; multi-output 8×3/8×2 fixture: asserts `fr.rank_ == sk.rank_` and `assert_allclose(fr.singular_, sk.singular_, atol=1e-8)`, live oracle on the DEFAULT `fit_intercept=True` (centered design) path `rank_=3`, `singular_=[0.9470684906780553, 0.7398714017099933, 0.45797423542006155]`) (R-CHAR-3). |
-//! | REQ-LINREG-PARAMS (copy_X/n_jobs/positive) | NOT-STARTED | the wrapper exposes `fit_intercept` only; sklearn `_base.py:568-579`. Default full-rank OLS MATCHES, only the param surface is missing — downstream #371/#374. (`rank_`/`singular_` surfaced separately — see REQ-LINREG-RANK-SINGULAR SHIPPED.) |
+//! | REQ-LINREG-PARAMS (copy_X/n_jobs/positive) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsLinearRegression::new` takes `positive=false` (LAST, `#[pyo3(signature = (fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::LinearRegression.__init__(self, *, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_base.py:574`) passes it to the single-output `_RsLinearRegression` and (when `positive=True` AND `y` is 2-D) to a PER-TARGET LOOP over the single-output positive binding (sklearn's `optimize.nnls` per-target, `_base.py:649-653`). Downstream NNLS `ferrolearn-linear` REQ-6 SHIPPED #371. Verification: `tests/divergence_regressors.py::test_linearregression_positive_matches_sklearn` (+ multi-output) + `test_linearregression_positive_false_unchanged`. Still MISSING `copy_X`/`n_jobs` — downstream #374. (`rank_`/`singular_` surfaced separately — see REQ-LINREG-RANK-SINGULAR SHIPPED.) |
 //! | REQ-RIDGE-API-CONFORM (fit/predict + coef_/intercept_, default cholesky) | SHIPPED | `RsRidge::fit`/`predict` + getters, wrapped by `_regressors.py::Ridge` (marshals `alpha` via `with_alpha`) — mirroring `_ridge.py:914`. Live default-path oracle matches element-wise. |
 //! | REQ-RIDGE-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2040: `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True)` moves `alpha` before the `*`, so `ferrolearn.Ridge(0.5).alpha == 0.5` matching sklearn `_ridge.py:893`. Guard `test_red_ridge_alpha_positional`. |
 //! | REQ-RIDGE-VALUE-PARITY (coef_/intercept_ array parity, default cholesky) | SHIPPED | default path: downstream `ferrolearn-linear` REQ-1/5 match the sklearn `Ridge` oracle ≤1e-8 across alpha∈{0.1,1,10,100} (closed-form Cholesky, unpenalized intercept). (Per-target alpha #385, multi-output #384, alt solvers downstream.) |
 //! | REQ-RIDGE-MULTIOUTPUT (2-D Y → 2-D coef_) | SHIPPED | `ferrolearn.Ridge.fit` accepts a 2-D `y` of shape `(n_samples, n_targets)` and produces `coef_` `(n_targets, n_features)` + `intercept_` `(n_targets,)`, matching sklearn `Ridge` (`sklearn/linear_model/_ridge.py:543` coef shape, `:550` intercept shape, per-target solve `:207`/`:218`). impl `#[pyclass(name="_RsRidgeMultiOutput")] RsRidgeMultiOutput::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` over `ferrolearn_linear::FittedRidgeMulti<f64>` (the `Fit<Array2,Array2> for Ridge` path, `ferrolearn-linear/src/ridge.rs:725`, producing `FittedRidgeMulti` with `coefficients()` `(n_features,n_targets)` `:713` + `intercepts()` `:719`, shipped #29). The `coef_` getter TRANSPOSES the `(n_features,n_targets)` storage to sklearn's `(n_targets,n_features)` (R-DEV-3). Non-test consumer: `_regressors.py::Ridge.fit` routes the `y.ndim==2 and y.shape[1]>1` path to `_RsRidgeMultiOutput` (registered in `lib.rs`); `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_ridge_multioutput_matches_sklearn` asserts `coef_` `(2,2)`, `intercept_` `(2,)`, and `predict` match the live sklearn oracle ≤1e-8 (R-CHAR-3); `test_ridge_singleoutput_unchanged_by_multioutput_path` guards the 1-D path stays scalar-intercept. Downstream `ferrolearn-linear` REQ-6 #384. |
-//! | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | NOT-STARTED | the wrapper exposes `alpha`/`fit_intercept` only; sklearn `_ridge.py:893-912`. Default cholesky MATCHES, only the param surface is missing — downstream #386/#387/#388/#390. |
+//! | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsRidge::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_ridge.py:902`) passes it to the single-output `_RsRidge` and (when `positive=True` AND `y` is 2-D) routes via a PER-TARGET LOOP over the single-output positive binding (sklearn's L-BFGS-B is per-target-independent, `_ridge.py:923-928`/`:207`). Downstream projected-CD `ferrolearn-linear` REQ-9 SHIPPED #387. Verification: `tests/divergence_regressors.py::test_ridge_positive_matches_sklearn` (+ `test_ridge_positive_multioutput_matches_sklearn`) + `test_ridge_positive_false_unchanged`. Still MISSING `copy_X`/`max_iter`/`tol`/`solver`/`random_state` — downstream #386/#388/#390. |
 //! | REQ-LASSO-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsLasso::fit`/`predict` + getters, wrapped by `_regressors.py::Lasso` (marshals `alpha`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-LASSO-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2041: `_regressors.py::Lasso.__init__(self, alpha=1.0, *, ...)` moves `alpha` before the `*`, so `ferrolearn.Lasso(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:1310`. Guard `test_red_lasso_alpha_positional`. |
 //! | REQ-LASSO-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/6 match the sklearn `Lasso` oracle ≤1e-6 for converged coef/intercept + exact-zero support (cyclic CD, `l1_reg=α·n`). (Dual-gap stopping #412, positive/selection='random' downstream.) |
 //! | REQ-LASSO-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsLasso::n_iter_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::Lasso.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedLasso::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-11/12 SHIPPED, #411 closed). Non-test consumer: `_regressors.py::Lasso` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.Lasso(alpha=0.5).fit(X,y).n_iter_ == SkLasso(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
 //! | REQ-LASSO-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsLasso::dual_gap_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::Lasso.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedLasso::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-11). Non-test consumer: `_regressors.py::Lasso` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.Lasso(0.3).dual_gap_ - SkLasso(0.3).dual_gap_) < 1e-9`, live oracle). |
-//! | REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED | the wrapper exposes `alpha`/`max_iter`/`tol`/`fit_intercept` only; sklearn `_coordinate_descent.py:1310-1322`. Default cyclic MATCHES — downstream #407/#408/#409/#410. |
+//! | REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsLasso::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::Lasso.__init__(self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes it to the single-output `_RsLasso` AND each per-target `_RsLasso` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Downstream non-negative soft-threshold `ferrolearn-linear` REQ (lasso `with_positive`/`lasso_positive_matches_sklearn`). Verification: `tests/divergence_regressors.py::test_lasso_positive_matches_sklearn` (+ multi-output) + `test_lasso_positive_false_unchanged`. Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. |
 //! | REQ-ELASTICNET-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsElasticNet::fit`/`predict` + getters, wrapped by `_regressors.py::ElasticNet` (marshals `alpha`/`l1_ratio`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-ELASTICNET-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2042: `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, ...)` moves ONLY `alpha` before the `*` (l1_ratio stays keyword-only), so `ferrolearn.ElasticNet(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:898`. Guard `test_red_elasticnet_alpha_positional`. |
 //! | REQ-ELASTICNET-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/5 match the sklearn `ElasticNet` oracle <1e-5 over the (alpha,l1_ratio) grid (`l1_reg=α·l1_ratio·n`, `l2_reg=α·(1−l1_ratio)·n`), incl. l1_ratio=1↔Lasso / 0↔L2. (Dual-gap #412 downstream.) |
 //! | REQ-ELASTICNET-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsElasticNet::n_iter_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::ElasticNet.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedElasticNet::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-12/13 SHIPPED, #417 closed). Non-test consumer: `_regressors.py::ElasticNet` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.ElasticNet(alpha=0.5).fit(X,y).n_iter_ == SkElasticNet(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
 //! | REQ-ELASTICNET-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsElasticNet::dual_gap_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::ElasticNet.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedElasticNet::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-12). Non-test consumer: `_regressors.py::ElasticNet` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.ElasticNet(0.3).dual_gap_ - SkElasticNet(0.3).dual_gap_) < 1e-9`, live oracle, default l1_ratio=0.5). |
-//! | REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED | the wrapper exposes `alpha`/`l1_ratio`/`max_iter`/`tol`/`fit_intercept` only; sklearn `_coordinate_descent.py:898-912`. Default cyclic MATCHES — downstream #407/#408/#409/#410. |
+//! | REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsElasticNet::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes it to the single-output `_RsElasticNet` AND each per-target `_RsElasticNet` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Downstream non-negative soft-threshold `ferrolearn-linear` REQ-8 SHIPPED (`elasticnet_positive_matches_sklearn`). Verification: `tests/divergence_regressors.py::test_elasticnet_positive_matches_sklearn` (+ multi-output) + `test_elasticnet_positive_false_unchanged`. Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_regressors.py::{LinearRegression,Ridge,Lasso,ElasticNet}` construct their `_Rs*` class and drive fit/predict + coef_/intercept_ reads; `ferrolearn/__init__.py` re-exports all four; `test_check_estimator.py` + `test_cross_val_score.py` exercise them (542 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
@@ -59,16 +59,18 @@ use pyo3::prelude::*;
 #[pyclass(name = "_RsLinearRegression")]
 pub struct RsLinearRegression {
     fit_intercept: bool,
+    positive: bool,
     fitted: Option<ferrolearn_linear::FittedLinearRegression<f64>>,
 }
 
 #[pymethods]
 impl RsLinearRegression {
     #[new]
-    #[pyo3(signature = (fit_intercept=true))]
-    fn new(fit_intercept: bool) -> Self {
+    #[pyo3(signature = (fit_intercept=true, positive=false))]
+    fn new(fit_intercept: bool, positive: bool) -> Self {
         Self {
             fit_intercept,
+            positive,
             fitted: None,
         }
     }
@@ -77,7 +79,8 @@ impl RsLinearRegression {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray(y);
         let model = ferrolearn_linear::LinearRegression::<f64>::new()
-            .with_fit_intercept(self.fit_intercept);
+            .with_fit_intercept(self.fit_intercept)
+            .with_positive(self.positive);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -259,17 +262,19 @@ impl RsLinearRegressionMultiOutput {
 pub struct RsRidge {
     alpha: f64,
     fit_intercept: bool,
+    positive: bool,
     fitted: Option<ferrolearn_linear::FittedRidge<f64>>,
 }
 
 #[pymethods]
 impl RsRidge {
     #[new]
-    #[pyo3(signature = (alpha=1.0, fit_intercept=true))]
-    fn new(alpha: f64, fit_intercept: bool) -> Self {
+    #[pyo3(signature = (alpha=1.0, fit_intercept=true, positive=false))]
+    fn new(alpha: f64, fit_intercept: bool, positive: bool) -> Self {
         Self {
             alpha,
             fit_intercept,
+            positive,
             fitted: None,
         }
     }
@@ -279,7 +284,8 @@ impl RsRidge {
         let y_nd = numpy1_to_ndarray(y);
         let model = ferrolearn_linear::Ridge::<f64>::new()
             .with_alpha(self.alpha)
-            .with_fit_intercept(self.fit_intercept);
+            .with_fit_intercept(self.fit_intercept)
+            .with_positive(self.positive);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -418,19 +424,21 @@ pub struct RsLasso {
     max_iter: usize,
     tol: f64,
     fit_intercept: bool,
+    positive: bool,
     fitted: Option<ferrolearn_linear::FittedLasso<f64>>,
 }
 
 #[pymethods]
 impl RsLasso {
     #[new]
-    #[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true))]
-    fn new(alpha: f64, max_iter: usize, tol: f64, fit_intercept: bool) -> Self {
+    #[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]
+    fn new(alpha: f64, max_iter: usize, tol: f64, fit_intercept: bool, positive: bool) -> Self {
         Self {
             alpha,
             max_iter,
             tol,
             fit_intercept,
+            positive,
             fitted: None,
         }
     }
@@ -442,7 +450,8 @@ impl RsLasso {
             .with_alpha(self.alpha)
             .with_max_iter(self.max_iter)
             .with_tol(self.tol)
-            .with_fit_intercept(self.fit_intercept);
+            .with_fit_intercept(self.fit_intercept)
+            .with_positive(self.positive);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -514,20 +523,29 @@ pub struct RsElasticNet {
     max_iter: usize,
     tol: f64,
     fit_intercept: bool,
+    positive: bool,
     fitted: Option<ferrolearn_linear::FittedElasticNet<f64>>,
 }
 
 #[pymethods]
 impl RsElasticNet {
     #[new]
-    #[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true))]
-    fn new(alpha: f64, l1_ratio: f64, max_iter: usize, tol: f64, fit_intercept: bool) -> Self {
+    #[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]
+    fn new(
+        alpha: f64,
+        l1_ratio: f64,
+        max_iter: usize,
+        tol: f64,
+        fit_intercept: bool,
+        positive: bool,
+    ) -> Self {
         Self {
             alpha,
             l1_ratio,
             max_iter,
             tol,
             fit_intercept,
+            positive,
             fitted: None,
         }
     }
@@ -540,7 +558,8 @@ impl RsElasticNet {
             .with_l1_ratio(self.l1_ratio)
             .with_max_iter(self.max_iter)
             .with_tol(self.tol)
-            .with_fit_intercept(self.fit_intercept);
+            .with_fit_intercept(self.fit_intercept)
+            .with_positive(self.positive);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
