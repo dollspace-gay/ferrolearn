@@ -196,11 +196,20 @@ Grouped by estimator (`REQ-LINREG-*`, `REQ-RIDGE-*`, `REQ-LASSO-*`,
   (int) and `singular_` (1-D array) fitted attributes, matching sklearn
   `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)`
   (`_base.py:687`; attr docstrings `rank_` `_base.py:505`, `singular_`
-  `_base.py:508`). Surfaced by the `RsLinearRegression` `rank_`/`singular_`
-  getters over `FittedLinearRegression::rank()`/`singular_values()`, set in
-  `_regressors.py::LinearRegression.fit`. NOTE the attribute is `singular_`, not
-  `singular_values_`. [Downstream `ferrolearn-linear` REQ-9 SHIPPED #374 captures
-  both from the single-SVD solve on the centered-when-`fit_intercept` matrix.]
+  `_base.py:508`). sklearn sets BOTH attrs from the dense lstsq solve REGARDLESS
+  of single vs multi-output, so the 2-D-`y` fit exposes them too (#2124).
+  Surfaced by the `RsLinearRegression` `rank_`/`singular_` getters (single-output)
+  AND the `RsLinearRegressionMultiOutput` `rank_`/`singular_` getters
+  (multi-output), each over `rank()`/`singular_values()` on its Fitted struct, set
+  in BOTH branches of `_regressors.py::LinearRegression.fit`
+  (`self.rank_ = int(self._rs.rank_)`, `self.singular_ = np.array(self._rs.singular_)`).
+  NOTE the attribute is `singular_`, not `singular_values_`. [Downstream
+  `ferrolearn-linear` REQ-9 SHIPPED #374 captures both from the single-SVD solve
+  on the centered-when-`fit_intercept` matrix.] Verified by
+  `tests/divergence_regressors.py::test_red_linearregression_multioutput_rank_singular_missing`
+  (#2124; multi-output 8×3/8×2 fixture, live oracle on the DEFAULT
+  `fit_intercept=True` (centered design) path `rank_=3`,
+  `singular_=[0.9470684906780553, 0.7398714017099933, 0.45797423542006155]`).
 - REQ-LINREG-PARAMS: `ferrolearn.LinearRegression` exposes the
   `copy_X`/`n_jobs`/`positive` constructor params (`_base.py:568-579`). [Param
   surface + behavior owned downstream: `positive` `ferrolearn-linear` REQ-6
@@ -209,8 +218,33 @@ Grouped by estimator (`REQ-LINREG-*`, `REQ-RIDGE-*`, `REQ-LASSO-*`,
 - REQ-LINREG-VALUE-PARITY: `coef_`/`intercept_` match sklearn array-by-array on a
   fixed dataset (R-DEV-1) on the DEFAULT path. [Default path is SHIPPED
   (downstream REQ-1/REQ-5 verify full-rank, rank-deficient, and underdetermined
-  OLS to 1e-8); `positive=True` (NNLS) parity is owned downstream #371,
-  multi-output 2-D `y` → 2-D `coef_` #372.]
+  OLS to 1e-8); `positive=True` (NNLS) parity is owned downstream #371.
+  Multi-output 2-D `y` → SHIPPED, see REQ-LINREG-MULTIOUTPUT.]
+- REQ-LINREG-MULTIOUTPUT: `ferrolearn.LinearRegression.fit` accepts a 2-D `y` of
+  shape `(n_samples, n_targets)` and exposes `coef_` `(n_targets, n_features)` +
+  `intercept_` `(n_targets,)`, matching sklearn `LinearRegression`
+  (`_base.py:687` `coef_.T`; `_set_intercept` `:319-327`). Surfaced by the
+  `_RsLinearRegressionMultiOutput` binding over
+  `ferrolearn_linear::linear_regression::FittedMultiOutputLinearRegression`
+  (`Fit<Array2, Array2> for LinearRegression`, `linear_regression.rs:491`,
+  shipped #372); the wrapper routes the `y.ndim==2` path (ANY 2-D `y`, incl. a
+  `(n, 1)` column vector → `coef_` `(1, n_features)`, `intercept_` `(1,)`).
+  UNLIKE the Ridge multi-output shim, the downstream `coefficients()` is ALREADY
+  `(n_targets, n_features)` (`:458`), so the `coef_` getter does NOT transpose.
+  `fit_intercept=False` → scalar `0.0` (`_base.py:327`). The 1-D `y` path
+  (scalar intercept + `rank_`/`singular_` from #2101) is unchanged. The
+  `MultiOutputMixin` (first base, like Ridge) makes `check_supervised_y_2d` see
+  the multioutput tag, so no DataConversionWarning. After a pickle round-trip
+  (`__getstate__` pops `_rs`), `predict` falls back to the shared
+  `_predict_linear(X, coef, intercept)` helper, which now computes
+  `X @ coef.T + intercept` to mirror sklearn's `_decision_function`
+  (`_base.py:290`/`:364` `X @ coef_.T`); `.T` is a no-op for a 1-D single-output
+  `coef` and gives the correct `(n, n_targets)` orientation for a 2-D
+  multi-output `coef` `(n_targets, n_features)` (#2125 — the prior `X @ coef`
+  raised a matmul shape error after unpickle; the same shared helper repairs
+  Ridge's identical pickle-predict path). Verified by
+  `tests/divergence_regressors.py::test_red_linearregression_multioutput_pickle_predict_shape`
+  (#2125; pickle round-trip predict matches the live sklearn oracle ≤1e-8).
 
 ### Ridge
 
@@ -447,7 +481,8 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
 | REQ-LINREG-FIT-INTERCEPT-ABI (fit_intercept keyword-only) | SHIPPED | `_regressors.py::LinearRegression.__init__(self, *, fit_intercept=True)` makes `fit_intercept` keyword-only, MATCHING sklearn `_base.py:568-570` (`__init__(self, *, fit_intercept=True, ...)` — the `*` is first). Marshalled to `RsLinearRegression::new` via `#[pyo3(signature = (fit_intercept=true))]` + `with_fit_intercept`. Live: both `inspect.signature(...).parameters['fit_intercept'].kind` → `KEYWORD_ONLY`. Non-test consumer: `_regressors.py::LinearRegression`. This is the ONLY estimator whose constructor-ABI matches sklearn (Ridge/Lasso/ElasticNet diverge on `alpha`). |
 | REQ-LINREG-RANK-SINGULAR (rank_/singular_ fitted attrs) | SHIPPED | impl `RsLinearRegression::rank_` getter (over `FittedLinearRegression<f64>`, via `fitted.rank()`) + `RsLinearRegression::singular_` getter (via `fitted.singular_values()`, marshalled through `ndarray1_to_numpy`) in `regressors.rs`, surfaced by `_regressors.py::LinearRegression.fit` which sets `self.rank_ = int(self._rs.rank_)` + `self.singular_ = np.array(self._rs.singular_)` (next to `coef_`/`intercept_`). Mirrors sklearn `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)` (`_base.py:687`; attr docstrings `rank_` `_base.py:505`, `singular_` `_base.py:508`). The downstream Rust `FittedLinearRegression::rank()`/`singular_values()` capture both from the single-SVD `solve_lstsq` on the actually-solved (centered-when-`fit_intercept`) matrix, matching sklearn's `linalg.lstsq` operands (`ferrolearn-linear` REQ-9 SHIPPED #374, verified by `linreg_rank_singular_match_sklearn_with_intercept`). Non-test consumer: `_regressors.py::LinearRegression` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_linearregression_rank_singular_match_sklearn` asserts `fr.rank_ == sk.rank_` and `np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)` (live oracle, R-CHAR-3; on the 5×2 fixture sklearn yields `rank_=2`, `singular_=[4.24264069, 1.41421356]`). |
 | REQ-LINREG-PARAMS (copy_X/n_jobs/positive) | NOT-STARTED | open prereq blockers #371 (`positive`/NNLS, `ferrolearn-linear` REQ-6) + #374 (`copy_X`/`n_jobs`, REQ-9; the `rank_`/`singular_` half of #374 is now SHIPPED — see REQ-LINREG-RANK-SINGULAR). sklearn `_base.py:568-579`. ferrolearn `_regressors.py::LinearRegression.__init__` exposes `fit_intercept` only; `RsLinearRegression::new` likewise. The default (full-rank/min-norm OLS, no positivity constraint, copy) MATCHES, so only the param surface + non-default behavior is missing — the binding cannot expose what the library lacks. (The wrapper copies via `_validate_data`, so OBSERVABLE non-mutation holds, but the `copy_X`/`n_jobs`/`positive` ABI params are absent — R-DEV-2.) |
-| REQ-LINREG-VALUE-PARITY (coef_/intercept_ array parity) | SHIPPED | on the DEFAULT path. `_regressors.py::LinearRegression.fit` marshals `coef_`/`intercept_` from the `RsLinearRegression` getters (over `FittedLinearRegression`), and downstream `ferrolearn-linear` REQ-1/REQ-5 are critic-verified to MATCH the live sklearn `LinearRegression` oracle to 1e-8 for full-rank, rank-deficient, and underdetermined OLS (single-SVD min-norm via `ferray::linalg::lstsq`). Live (R-CHAR-3): ferrolearn `LinearRegression().fit(X,y)` `coef_=[1.0,0.0]`, `intercept_=1.0` equal the oracle element-wise. Non-test consumer: `_regressors.py::LinearRegression` + re-export. (`positive=True` NNLS parity is owned downstream #371; multi-output 2-D `y` → 2-D `coef_` #372.) |
+| REQ-LINREG-VALUE-PARITY (coef_/intercept_ array parity) | SHIPPED | on the DEFAULT path. `_regressors.py::LinearRegression.fit` marshals `coef_`/`intercept_` from the `RsLinearRegression` getters (over `FittedLinearRegression`), and downstream `ferrolearn-linear` REQ-1/REQ-5 are critic-verified to MATCH the live sklearn `LinearRegression` oracle to 1e-8 for full-rank, rank-deficient, and underdetermined OLS (single-SVD min-norm via `ferray::linalg::lstsq`). Live (R-CHAR-3): ferrolearn `LinearRegression().fit(X,y)` `coef_=[1.0,0.0]`, `intercept_=1.0` equal the oracle element-wise. Non-test consumer: `_regressors.py::LinearRegression` + re-export. (`positive=True` NNLS parity is owned downstream #371; multi-output 2-D `y` SHIPPED — see REQ-LINREG-MULTIOUTPUT.) |
+| REQ-LINREG-MULTIOUTPUT (2-D Y → 2-D coef_) | SHIPPED | `ferrolearn.LinearRegression.fit` accepts a 2-D `y` `(n_samples, n_targets)` and exposes `coef_` `(n_targets, n_features)` + `intercept_` `(n_targets,)`, matching sklearn `LinearRegression` (`sklearn/linear_model/_base.py:687` `coef_.T`, `_set_intercept` `:319-327`). impl `#[pyclass(name="_RsLinearRegressionMultiOutput")] RsLinearRegressionMultiOutput::fit`/`predict` + `coef_`/`intercept_` getters in `regressors.rs` over `ferrolearn_linear::linear_regression::FittedMultiOutputLinearRegression<f64>` (the `Fit<Array2, Array2> for LinearRegression` path, `ferrolearn-linear/src/linear_regression.rs:491`; `FittedMultiOutputLinearRegression::coefficients()` ALREADY `(n_targets,n_features)` `:458` + `intercepts()` `(n_targets,)` `:465`, shipped #372). UNLIKE the Ridge multi-output shim, the `coef_` getter does NOT transpose — the downstream storage is already in sklearn's `coef_` orientation. `fit_intercept=False` → scalar `0.0` (`_base.py:327`, set in the wrapper). The wrapper adds `MultiOutputMixin` as the first base (like Ridge) so `check_supervised_y_2d` sees the multioutput tag (no DataConversionWarning). Non-test consumer: `_regressors.py::LinearRegression.fit` routes the `y.ndim==2` path to `_RsLinearRegressionMultiOutput` (registered in `lib.rs`) + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_linearregression_multioutput_matches_sklearn` asserts `coef_` `(2,2)`, `intercept_` `(2,)`, `predict` match the live sklearn oracle ≤1e-8 (R-CHAR-3; oracle `coef_=[[0.75,1.55],[0.94444444,-1.05555556]]`, `intercept_=[-0.94,1.73333333]`); `_column_vector_y` ((n,1) → coef_ `(1,3)`, intercept_ `(1,)`), `_no_intercept_scalar` (fit_intercept=False → scalar 0.0), `_singleoutput_unchanged_by_multioutput_path` guards the 1-D path (incl. `rank_`/`singular_`). Downstream `ferrolearn-linear` REQ-7 #372. |
 | REQ-RIDGE-API-CONFORM (fit/predict + coef_/intercept_, default cholesky path) | SHIPPED | impl `RsRidge::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` (over `ferrolearn_linear::FittedRidge<f64>`), wrapped by `Ridge` in `_regressors.py` which marshals `alpha` via `RsRidge::new(alpha=...)` → `Ridge::with_alpha`, sets `coef_`/`intercept_` + `n_features_in_`, inherits `score` from `RegressorMixin` — mirroring `sklearn/linear_model/_ridge.py:914` (fit, default `solver='auto'`→cholesky) + `:968`/`:984` (coef/intercept). Non-test consumer: `_regressors.py::Ridge` + `ferrolearn/__init__.py:4` re-export. Verification (model B): pytest → 534 passed (`test_check_estimator.py:23` + `test_cross_val_score.py:45`). Live default-path oracle MATCHES element-wise: `coef_=[0.33333333,0.2]`, `intercept_=1.3`. |
 | REQ-RIDGE-ALPHA-POSITIONAL (alpha positional ABI) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 constructor ABI; single-wrapper-fixable — HEADLINE 1/3). sklearn `__init__(self, alpha=1.0, *, ...)` (`_ridge.py:893-895`) makes `alpha` positional-or-keyword — `Ridge(0.5).alpha` → `0.5`. ferrolearn `_regressors.py::Ridge.__init__(self, *, alpha=1.0, fit_intercept=True)` makes it keyword-only — live: `ferrolearn.Ridge(0.5)` → `TypeError: __init__() takes 1 positional argument but 2 were given`. Single-line Python-wrapper fix: move `alpha` before the `*`. |
 | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | NOT-STARTED | open prereq blockers #386 (`solver`/`solver_`, `ferrolearn-linear` REQ-8) + #387 (`positive`, REQ-9) + #388 (`max_iter`/`tol`/`n_iter_`, REQ-10) + #390 (`copy_X`/`random_state`, REQ-12). sklearn `_ridge.py:893-912`. ferrolearn `_regressors.py::Ridge.__init__` exposes `alpha`/`fit_intercept` only; `RsRidge::new` takes `alpha`/`fit_intercept`. The default cholesky/no-positivity behavior MATCHES, so only the param surface + non-default paths are missing — owned downstream; the binding cannot expose what the library lacks. |

@@ -10,6 +10,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsElasticNet,
     _RsLasso,
     _RsLinearRegression,
+    _RsLinearRegressionMultiOutput,
     _RsRidge,
     _RsRidgeMultiOutput,
 )
@@ -21,8 +22,16 @@ def _ensure_f64(arr):
 
 
 def _predict_linear(X, coef, intercept):
-    """Fallback linear prediction using stored coefficients."""
-    return X @ coef + intercept
+    """Fallback linear prediction using stored coefficients.
+
+    Mirrors sklearn's `_decision_function` `X @ coef_.T + intercept_`
+    (`sklearn/linear_model/_base.py:290`/`:364`). `coef.T` is a no-op for a 1-D
+    `coef` (single-output, shape `(n_features,)`), so `X @ coef.T == X @ coef`
+    stays `(n,)`; for a 2-D multi-output `coef` `(n_targets, n_features)` it
+    yields the correct `(n, n_targets)` orientation (#2125).
+    """
+    coef = np.asarray(coef)
+    return X @ coef.T + intercept
 
 
 def _fit_rust(rs, X, y=None):
@@ -45,7 +54,7 @@ def _fit_rust(rs, X, y=None):
         raise
 
 
-class LinearRegression(RegressorMixin, BaseEstimator):
+class LinearRegression(MultiOutputMixin, RegressorMixin, BaseEstimator):
     """Ordinary Least Squares regression backed by Rust.
 
     Parameters
@@ -58,14 +67,47 @@ class LinearRegression(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
-        X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
-        X, y = _ensure_f64(X), _ensure_f64(y)
-        self._rs = _RsLinearRegression(fit_intercept=self.fit_intercept)
-        _fit_rust(self._rs, X, y)
-        self.coef_ = np.array(self._rs.coef_)
-        self.intercept_ = float(self._rs.intercept_)
-        self.rank_ = int(self._rs.rank_)
-        self.singular_ = np.array(self._rs.singular_)
+        # Detect multi-output BEFORE validation: ANY 2-D `y` routes to the Rust
+        # `Fit<Array2, Array2>` path producing `coef_` (n_targets, n_features) /
+        # `intercept_` (n_targets,), mirroring sklearn `LinearRegression`
+        # (`sklearn/linear_model/_base.py:687` `coef_.T`). sklearn PRESERVES a
+        # 2-D target shape (incl. a single-column `(n, 1)` `y` -> `coef_` `(1,
+        # n_features)`, `intercept_` `(1,)`), so the gate is on `y.ndim == 2`
+        # (NOT `y.shape[1] > 1`) and there is no DataConversionWarning
+        # (the `MultiOutputMixin` tag tells `check_supervised_y_2d` so).
+        y_arr = np.asarray(y)
+        multioutput = y_arr.ndim == 2
+        if multioutput:
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            self._rs = _RsLinearRegressionMultiOutput(fit_intercept=self.fit_intercept)
+            _fit_rust(self._rs, X, y)
+            self.coef_ = np.array(self._rs.coef_)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(self._rs.intercept_) if self.fit_intercept else 0.0
+            )
+            # sklearn sets `rank_`/`singular_` from `linalg.lstsq(X, y)`
+            # REGARDLESS of single vs multi-output (`_base.py:687`), so the
+            # multi-output path exposes them too (#2124).
+            self.rank_ = int(self._rs.rank_)
+            self.singular_ = np.array(self._rs.singular_)
+        else:
+            X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            self._rs = _RsLinearRegression(fit_intercept=self.fit_intercept)
+            _fit_rust(self._rs, X, y)
+            self.coef_ = np.array(self._rs.coef_)
+            self.intercept_ = float(self._rs.intercept_)
+            # rank_/singular_ are the single-output (1-D) lstsq diagnostics
+            # (#2101). The multi-output branch sets the same attrs from its own
+            # lstsq solve (#2124), so BOTH paths expose them like sklearn
+            # (`_base.py:687`).
+            self.rank_ = int(self._rs.rank_)
+            self.singular_ = np.array(self._rs.singular_)
         return self
 
     def predict(self, X):
