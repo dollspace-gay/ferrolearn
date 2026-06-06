@@ -39,18 +39,26 @@ class StandardScaler(TransformerMixin, BaseEstimator):
     Backed by Rust.
     """
 
-    def __init__(self, *, with_mean=True, with_std=True):
+    def __init__(self, *, copy=True, with_mean=True, with_std=True):
+        self.copy = copy
         self.with_mean = with_mean
         self.with_std = with_std
 
     def fit(self, X, y=None):
         X = self._validate_data(X, dtype="float64", accept_sparse=False)
-        self._rs = _RsStandardScaler()
+        self._rs = _RsStandardScaler(self.with_mean, self.with_std, self.copy)
         _fit_rust(self._rs, _ensure_f64(X))
-        self.mean_ = np.array(self._rs.mean_)
-        self.scale_ = np.array(self._rs.scale_)
+        # sklearn's attribute-nulling rule (`sklearn/preprocessing/_data.py`):
+        #   - `mean_`/`var_` -> None only when with_mean AND with_std are False
+        #     (`_data.py:993-995`); otherwise the mean is materialized (it is
+        #     used even when with_mean=False for the incremental variance).
+        #   - `scale_`/`var_` -> None when with_std is False (`_data.py:1022-1023`).
+        self.mean_ = (
+            np.array(self._rs.mean_) if (self.with_mean or self.with_std) else None
+        )
+        self.scale_ = np.array(self._rs.scale_) if self.with_std else None
+        self.var_ = self.scale_ ** 2 if self.with_std else None
         self.n_samples_seen_ = X.shape[0]
-        self.var_ = self.scale_ ** 2
         self._fit_X = X.copy()
         return self
 
@@ -90,7 +98,11 @@ class StandardScaler(TransformerMixin, BaseEstimator):
         self.__dict__.update(state)
         # Reconstruct _rs if we have training data
         if hasattr(self, "_fit_X"):
-            self._rs = _RsStandardScaler()
+            self._rs = _RsStandardScaler(
+                self.with_mean,
+                self.with_std,
+                getattr(self, "copy", True),
+            )
             self._rs.fit(_ensure_f64(self._fit_X))
 
 

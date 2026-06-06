@@ -210,3 +210,95 @@ def test_green_pca_fit_transform_mixin():
     sk_ft = SkPCA(n_components=2).fit_transform(_X)
     assert fl_ft.shape == sk_ft.shape == (_X.shape[0], 2)
     assert np.allclose(np.abs(fl_ft), np.abs(sk_ft), atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# StandardScaler with_mean/with_std/copy parity (unit #2037, R-DEV-1/-2).
+#
+# The wrapper previously ignored with_mean/with_std/copy: `fit` always built a
+# no-arg `_RsStandardScaler()` (always centers+scales) and always set
+# `mean_`/`scale_`/`var_`. These compare `ferrolearn.StandardScaler` to the live
+# sklearn 1.5.2 oracle across all 4 (with_mean, with_std) configs (R-CHAR-3:
+# expected values come from sklearn in the same test, never literal-copied).
+#
+# Oracle (sklearn 1.5.2), X=[[1,10],[2,20],[3,30]]:
+#   (T,T): mean_=[2,20], scale_=[0.8165..,8.165..], var_=[0.6667,66.667],
+#          transform[0]=[-1.224745,-1.224745]
+#   (T,F): mean_=[2,20], scale_=None, var_=None, transform[0]=[-1,-10]
+#   (F,T): mean_=[2,20], scale_=[0.8165..,8.165..], var_=[0.6667,66.667],
+#          transform[0]=[1.224745,1.224745]
+#   (F,F): mean_=None,  scale_=None, var_=None, transform[0]=[1,10]
+# ---------------------------------------------------------------------------
+
+_XSS = np.array([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0]])
+
+
+def _assert_attr_parity(fl_attr, sk_attr, name):
+    """Assert a fitted attribute matches sklearn, including the None case."""
+    if sk_attr is None:
+        assert fl_attr is None, f"{name}: sklearn is None, ferrolearn is {fl_attr!r}"
+    else:
+        assert fl_attr is not None, f"{name}: sklearn is {sk_attr!r}, ferrolearn None"
+        np.testing.assert_allclose(
+            fl_attr, sk_attr, rtol=1e-9, atol=1e-12, err_msg=f"{name} mismatch"
+        )
+
+
+@pytest.mark.parametrize("with_mean", [True, False])
+@pytest.mark.parametrize("with_std", [True, False])
+def test_red_standardscaler_with_mean_std_transform_matches_oracle(with_mean, with_std):
+    """transform(X) matches sklearn element-wise for every (with_mean, with_std).
+
+    sklearn skips centering when `with_mean=False` and skips scaling when
+    `with_std=False` (`sklearn/preprocessing/_data.py:1064-1067`), so
+    (False, False) is the identity. The previous ferrolearn wrapper ignored both
+    flags and always centered+scaled.
+    """
+    fl_m = fl.StandardScaler(with_mean=with_mean, with_std=with_std).fit(_XSS)
+    sk_m = SkStandardScaler(with_mean=with_mean, with_std=with_std).fit(_XSS)
+
+    np.testing.assert_allclose(
+        fl_m.transform(_XSS), sk_m.transform(_XSS), rtol=1e-9, atol=1e-12
+    )
+
+
+@pytest.mark.parametrize("with_mean", [True, False])
+@pytest.mark.parametrize("with_std", [True, False])
+def test_red_standardscaler_with_mean_std_attrs_match_oracle(with_mean, with_std):
+    """mean_/scale_/var_ match sklearn including the None nulling rule.
+
+    sklearn nulls `mean_`/`var_` when `with_mean=False` AND `with_std=False`
+    (`_data.py:993-995`) and nulls `scale_`/`var_` when `with_std=False`
+    (`_data.py:1022-1023`). Expected None-ness comes from the live oracle.
+    """
+    fl_m = fl.StandardScaler(with_mean=with_mean, with_std=with_std).fit(_XSS)
+    sk_m = SkStandardScaler(with_mean=with_mean, with_std=with_std).fit(_XSS)
+
+    _assert_attr_parity(fl_m.mean_, sk_m.mean_, "mean_")
+    _assert_attr_parity(fl_m.scale_, sk_m.scale_, "scale_")
+    _assert_attr_parity(fl_m.var_, sk_m.var_, "var_")
+
+
+def test_red_standardscaler_copy_param_in_signature():
+    """ferrolearn.StandardScaler exposes the `copy` ctor param like sklearn.
+
+    sklearn `StandardScaler.__init__(self, *, copy=True, with_mean=True,
+    with_std=True)` (`_data.py:835`). The oracle confirms `copy` is present with
+    default True.
+    """
+    import inspect
+
+    sk_params = inspect.signature(SkStandardScaler.__init__).parameters
+    assert "copy" in sk_params
+    assert sk_params["copy"].default is True
+
+    fl_params = inspect.signature(fl.StandardScaler.__init__).parameters
+    assert "copy" in fl_params
+    assert fl_params["copy"].default is True
+
+
+def test_red_standardscaler_copy_roundtrip():
+    """StandardScaler(copy=True) round-trips inverse_transform(transform(X)) ~ X."""
+    fl_m = fl.StandardScaler(copy=True).fit(_XSS)
+    recovered = fl_m.inverse_transform(fl_m.transform(_XSS))
+    np.testing.assert_allclose(recovered, _XSS, rtol=1e-9, atol=1e-12)
