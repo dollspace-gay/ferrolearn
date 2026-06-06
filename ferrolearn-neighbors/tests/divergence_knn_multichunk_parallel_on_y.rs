@@ -48,7 +48,7 @@
 //! where sklearn's default is the MULTI-chunk merge.
 //!
 //! Expected values are the LIVE sklearn oracle, regenerated fresh, NOT copied
-//! from ferrolearn (R-CHAR-3). Tracking: #2.
+//! from ferrolearn (R-CHAR-3). Tracking: #2144.
 
 use ferrolearn_core::traits::Fit;
 use ferrolearn_neighbors::{Algorithm, KNeighborsClassifier};
@@ -83,9 +83,8 @@ fn fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
 /// sklearn DEFAULT (multi-core) order: [5, 250, 260, 390, 6, 2, 4, 3]
 /// ferrolearn (single-heap)     order: [5, 250, 260, 390, 2, 4, 0, 6]
 ///
-/// Tracking: #2
+/// Tracking: #2144
 #[test]
-#[ignore = "divergence: brute parallel_on_Y multi-chunk (n>256) tie SET differs from sklearn default multi-core; tracking #2"]
 fn divergence_knn_multichunk_parallel_on_y_tie_set() {
     let (x, y, q) = fixture();
     let k = 8usize;

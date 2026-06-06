@@ -66,13 +66,15 @@
 //! | REQ-3 | clf `score` (mean accuracy), the `ClassifierMixin.score` analog. `pub fn score` (`correct/n` over `predict`) is value-correct (green `green_classifier_score_accuracy`) but has NO non-test consumer — `_RsKNeighborsClassifier` exposes no `score`. | NOT-STARTED (#877) |
 //! | REQ-4 | reg `predict` VALUE, 1-D `y`, uniform + distance + zero-distance: weighted mean of neighbor targets, mirroring `KNeighborsRegressor.predict` (`_regression.py:229-270`). `fn predict` for `FittedKNeighborsRegressor` → `fn weighted_mean`. Consumer: `_RsKNeighborsRegressor::predict` (`py_regressor!`) + `impl PipelineEstimator`. Green guard `green_regressor_predict_value_uniform_and_distance`. | SHIPPED |
 //! | REQ-5 | reg `score` R²: `RegressorMixin.score` = `r2_score(multioutput='uniform_average')`, constant-`y` → `1.0`/`-inf`. `pub fn score` → `pub(crate) fn r2_score` is value-correct but has NO non-test consumer — the `py_regressor!` macro (`extras.rs:17-58`) emits no `score` method, so `_RsKNeighborsRegressor` exposes none. | NOT-STARTED (#877) |
-//! | REQ-6 | shared k-NN search VALUE: nearest-first `(distances, indices)` of shape `(n_queries, k)`, the kernel both `predict` paths consume, mirroring `KNeighborsMixin.kneighbors` (`_base.py`). `pub fn kneighbors` (both fitted types) → `pub(crate) fn kneighbors_impl` → per-row `fn find_neighbors`. Non-test consumer: `graph.rs` `FittedKNeighbors{Classifier,Regressor}::kneighbors_graph` (call `self.kneighbors(...)`). Green guard `green_kneighbors_value` + k>n guard `green_kneighbors_k_too_large_errors`. | SHIPPED |
+//! | REQ-6 | shared k-NN search VALUE + sklearn DEFAULT-backend exact-tie SET + ORDER (NOT algorithm-invariant): nearest-first `(distances, indices)` of shape `(n_queries, k)`. The f64 selection replicates the backend sklearn's DEFAULT `algorithm='auto'` user actually reaches — which is the `brute` `parallel_on_Y` strategy OR `kd_tree` `KDTree.query`, NEVER the internal `parallel_on_X` single-heap (the prior impl's bug). The auto rule (`_base.py:607-640`) for euclidean/p=2: `n_features > 15` OR `k >= n_samples // 2` → `brute` else `kd_tree`. Brute path = `fn brute_parallel_on_y` (the DOUBLE-HEAP transform of `_argkmin.pyx.tp`: push all train points in index order into heap `h1`, re-push `h1`'s heap-array slots `0..k` in heap order into `h2`, sort). kd_tree path = `crate::sk_kdtree::SkKdTree::{build,query}` (bit-exact `_recursive_build`/`init_node`/`find_node_split_dim` + `_query_single_depthfirst`/`min_rdist`, with `partition_node_indices` delegated to the bit-exact libstdc++ `std::nth_element` port `crate::introselect::nth_element` — the index layout that determines the kd_tree tie SET). Both backends reuse the same `NeighborsHeap` kernel `fn heap_push` (port `sklearn/utils/_heap.pyx:6-85`, ties at boundary REJECTED) + `fn simultaneous_sort` (port `sklearn/utils/_sorting.pyx:18-93`). `pub fn kneighbors` (both fitted types) → `pub(crate) fn kneighbors_impl` → per-row `fn find_neighbors` (routes brute/kd_tree); f32/other `F` retain the `(distance, index)` brute fallback (`kdtree::brute_force_knn`; Python binding is f64-only). Non-test consumer: `graph.rs` `FittedKNeighbors{Classifier,Regressor}::kneighbors_graph` (call `self.kneighbors(...)`). Green guards `green_kneighbors_value`, k>n `green_kneighbors_k_too_large_errors`, `test_knn_tie_break_lowest_index_all_algorithms`, `test_neighbors_heap_matches_sklearn_kneighbors_order`; tie pins `divergence_knn_tiebreak_*` (#2139, #2141) and the DEFAULT-order pin `divergence_kneighbors_order_differs_from_sklearn_default` (#2143, parallel_on_Y `[0,2,3,1,4]`). | SHIPPED |
 //! | REQ-7 | `HasClasses` / `classes_`: sorted-unique class labels in lexicographic order (`_classification.py:120`). `impl HasClasses for FittedKNeighborsClassifier` (`classes()`/`n_classes()`). Non-test consumer: `_RsKNeighborsClassifier::classes_` getter (`classifiers.rs`) → `fitted.classes()`. In-tree `test_classifier_has_classes`. | SHIPPED |
 //! | REQ-8 | fit-timing parity: `fit` no longer errors when `n_neighbors > n_samples` — sklearn `_fit` has no such check and defers the `n_neighbors <= n_samples_fit` `ValueError` to query time (`_base.py:828-832`), so `fit` succeeds and only `kneighbors`/`predict` error. BOTH `fn fit` methods validate only `n_neighbors == 0`; no fit-time `n_samples < n_neighbors` guard. Green `divergence_fit_does_not_error_when_n_neighbors_gt_n_samples` + in-module `test_classifier_fit_succeeds_when_k_gt_n`. | SHIPPED (#879) |
 //! | REQ-9 | reg multi-output 2-D `y`: `_y.ndim > 1` → `(n_queries, n_outputs)` prediction (`_regression.py:253-270`). `FittedKNeighborsRegressor` stores `y_train: Array1<F>` and `impl Fit<Array2<F>, Array1<F>>` — 1-D `y` only; no 2-D surface. | NOT-STARTED (#875) |
 //! | REQ-10 | constructor params + callable weights: `leaf_size=30`/`p=2`/`metric='minkowski'`/`metric_params=None`/`n_jobs=None` (`_classification.py:199-203`) and `weights` as a callable (`:190`). `KNeighbors{Classifier,Regressor}` have only `n_neighbors`/`algorithm`/`weights ∈ {Uniform, Distance}` — Euclidean-only, no callable variant. | NOT-STARTED (#876) |
 //! | REQ-11 | PyO3 surface under-exposed: bind `predict_proba`/classifier-`score`/`weights`/`algorithm` on `_RsKNeighborsClassifier` and `weights` on `_RsKNeighborsRegressor`. The bindings exist but expose only fit/predict(/classes_); distance-weighting and `predict_proba` are unreachable from `import ferrolearn`. | NOT-STARTED (#877) |
 //! | REQ-12 | ferray substrate: `knn.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#878) |
+
+use std::any::TypeId;
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -84,6 +86,7 @@ use rayon::prelude::*;
 
 use crate::balltree::BallTree;
 use crate::kdtree::{self, KdTree};
+use crate::sk_kdtree::SkKdTree;
 
 // ---------------------------------------------------------------------------
 // Configuration enums
@@ -135,34 +138,333 @@ impl std::fmt::Debug for SpatialIndex {
     }
 }
 
+/// Push a `(val, val_idx)` pair onto a fixed-size max-heap held as a
+/// structure-of-arrays (`values` + `indices`).
+///
+/// Faithful Rust port of sklearn's `heap_push`
+/// (`sklearn/utils/_heap.pyx:6-85`). The heap keeps the `size` SMALLEST values
+/// seen, with `values[0]` the current maximum. A candidate is REJECTED when it
+/// is not strictly closer than the root (`val >= values[0]`), so an
+/// exact-distance tie at the boundary is rejected and the incumbent is kept —
+/// this is what produces sklearn's tie-resolution. After replacing the root the
+/// new value sifts down, the children comparison (`>=` on the left, strict `<`
+/// for the swap test) copied verbatim from the upstream `noexcept nogil` kernel.
+///
+/// The math is total over finite, non-negative squared euclidean distances
+/// (no `NaN`); no panic path. Specialised to `f64` because the dense f64
+/// euclidean estimator surface (and the Python binding) is the contract here.
+#[inline]
+pub(crate) fn heap_push(
+    values: &mut [f64],
+    indices: &mut [usize],
+    size: usize,
+    val: f64,
+    val_idx: usize,
+) {
+    // Reject if `val` should not be in the heap (ties at the boundary rejected).
+    if val >= values[0] {
+        return;
+    }
+
+    // Insert `val` at the root and sift it down.
+    values[0] = val;
+    indices[0] = val_idx;
+
+    let mut current = 0usize;
+    loop {
+        let left = 2 * current + 1;
+        let right = left + 1;
+
+        // The `right >= size` and `values[left] >= values[right]` arms both
+        // resolve to `left`/`break`, but on DISTINCT conditions transcribed
+        // verbatim from sklearn `_heap.pyx:59-75`. Collapsing them would
+        // obscure the faithful port; keep the upstream branch shape.
+        #[allow(
+            clippy::if_same_then_else,
+            reason = "faithful 1:1 port of sklearn heap_push branch structure (_heap.pyx:59-75)"
+        )]
+        let swap = if left >= size {
+            break;
+        } else if right >= size {
+            if values[left] > val {
+                left
+            } else {
+                break;
+            }
+        } else if values[left] >= values[right] {
+            if val < values[left] {
+                left
+            } else {
+                break;
+            }
+        } else if val < values[right] {
+            right
+        } else {
+            break;
+        };
+
+        values[current] = values[swap];
+        indices[current] = indices[swap];
+        current = swap;
+    }
+
+    values[current] = val;
+    indices[current] = val_idx;
+}
+
+/// Swap entries `a` and `b` of both `values` and `indices` (sklearn
+/// `dual_swap`, `sklearn/utils/_sorting.pyx:3-16`).
+#[inline]
+fn dual_swap(values: &mut [f64], indices: &mut [usize], a: usize, b: usize) {
+    values.swap(a, b);
+    indices.swap(a, b);
+}
+
+/// In-place recursive median-of-three quicksort that sorts `values` ascending,
+/// permuting `indices` in lockstep.
+///
+/// Faithful Rust port of sklearn's `simultaneous_sort`
+/// (`sklearn/utils/_sorting.pyx:18-93`). The small-array specialisations
+/// (`size == 2` / `size == 3`) and the median-of-three pivot arrangement are
+/// transcribed exactly. Per the upstream note at `_sorting.pyx:39-43` this does
+/// NOT break ties by index — equal-distance entries keep their partition order — so
+/// the tie ORDER is whatever the quicksort partition produces, matching
+/// sklearn. The recursion uses index offsets in place of Cython's pointer
+/// arithmetic (`values + pivot_idx + 1`) so the same buffer is mutated, which
+/// is essential to reproduce the exact tie order.
+pub(crate) fn simultaneous_sort(values: &mut [f64], indices: &mut [usize], size: usize) {
+    if size <= 1 {
+        // nothing to do
+    } else if size == 2 {
+        if values[0] > values[1] {
+            dual_swap(values, indices, 0, 1);
+        }
+    } else if size == 3 {
+        if values[0] > values[1] {
+            dual_swap(values, indices, 0, 1);
+        }
+        if values[1] > values[2] {
+            dual_swap(values, indices, 1, 2);
+            if values[0] > values[1] {
+                dual_swap(values, indices, 0, 1);
+            }
+        }
+    } else {
+        // Median-of-three pivot: smallest -> front, pivot value -> end.
+        let mut pivot_idx = size / 2;
+        if values[0] > values[size - 1] {
+            dual_swap(values, indices, 0, size - 1);
+        }
+        if values[size - 1] > values[pivot_idx] {
+            dual_swap(values, indices, size - 1, pivot_idx);
+            if values[0] > values[size - 1] {
+                dual_swap(values, indices, 0, size - 1);
+            }
+        }
+        let pivot_val = values[size - 1];
+
+        // Partition about the pivot.
+        let mut store_idx = 0usize;
+        for i in 0..size - 1 {
+            if values[i] < pivot_val {
+                dual_swap(values, indices, i, store_idx);
+                store_idx += 1;
+            }
+        }
+        dual_swap(values, indices, store_idx, size - 1);
+        pivot_idx = store_idx;
+
+        // Recurse on each side (offset slices = upstream pointer arithmetic).
+        if pivot_idx > 1 {
+            simultaneous_sort(
+                &mut values[..pivot_idx],
+                &mut indices[..pivot_idx],
+                pivot_idx,
+            );
+        }
+        if pivot_idx + 2 < size {
+            simultaneous_sort(
+                &mut values[pivot_idx + 1..],
+                &mut indices[pivot_idx + 1..],
+                size - pivot_idx - 1,
+            );
+        }
+    }
+}
+
+/// sklearn brute `ArgKmin` DEFAULT strategy (`parallel_on_Y`) over
+/// already-computed SQUARED euclidean distances.
+///
+/// This is the backend the DEFAULT user-facing `KNeighbors*.kneighbors()` /
+/// `predict` reaches for the small-`n` / high-`k` regime (sklearn auto picks
+/// `brute`, brute's auto strategy picks `parallel_on_Y`). For
+/// `n_train < pairwise_dist_chunk_size` (256) there is exactly one Y-chunk and
+/// one thread, so the result is fully deterministic across thread counts.
+///
+/// `parallel_on_Y` differs from `parallel_on_X` (the single-heap result) by a
+/// per-chunk-heap-then-merge reduction, transcribed from
+/// `sklearn/metrics/_pairwise_distances_reduction/_base.pyx.tp` (Y-chunking) +
+/// `_argkmin.pyx.tp:237-261` (`_parallel_on_Y_synchronize`):
+///
+/// 1. Y-chunking (`_base.pyx.tp`): Y is split into `n_chunks = ceil(n / 256)`
+///    contiguous chunks of `pairwise_dist_chunk_size = 256` points
+///    (`Y_n_samples_chunk = min(n, 256)`). For each chunk a per-chunk heap `hc`
+///    of size `k` (init `+inf`/`-1`) is filled by pushing that chunk's points in
+///    INDEX order via `heap_push`; each `hc` then holds its chunk's k smallest
+///    in HEAP-ARRAY layout. For `n <= 256` there is exactly ONE chunk spanning
+///    `0..n`, so this collapses to a single global heap (the single-thread /
+///    `OMP_NUM_THREADS=1` result) — byte-identical to the prior single-heap impl.
+/// 2. `_parallel_on_Y_synchronize` (`_argkmin.pyx.tp:237-261`): the main heap
+///    `h2` of size `k` (init `+inf`/`-1`); for each chunk `c` in `0..n_chunks`
+///    (chunk-major), for `jdx in 0..k` push `(hc.values[jdx], hc.indices[jdx])`
+///    — i.e. re-push each chunk's heap-array slots in heap order, NOT index
+///    order. Re-pushing under-filled sentinel slots is a harmless no-op (the
+///    `val >= values[0]` reject keeps `+inf`/`usize::MAX` out of `h2`). This
+///    per-chunk-then-merge is exactly why the tie SET/ORDER differs from a
+///    single global-index-order heap once `n > 256`.
+/// 3. `simultaneous_sort(h2)` ascending.
+///
+/// Returns `(indices, sorted_squared_distances)` in sklearn's exact default
+/// brute k-NN order.
+fn brute_parallel_on_y(sq_dist: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
+    const CHUNK_SIZE: usize = 256;
+    let n = sq_dist.len();
+    let n_chunks = n.div_ceil(CHUNK_SIZE);
+
+    // Main heap (init `+inf`/`-1`), filled by merging the per-chunk heaps.
+    let mut h2v = vec![f64::INFINITY; k];
+    let mut h2i = vec![usize::MAX; k];
+
+    for c in 0..n_chunks {
+        let start = c * CHUNK_SIZE;
+        let end = ((c + 1) * CHUNK_SIZE).min(n);
+
+        // Per-chunk heap: push this chunk's points in index order. `j` is the
+        // GLOBAL training index (pushed as the heap index), `start + off`.
+        let mut hcv = vec![f64::INFINITY; k];
+        let mut hci = vec![usize::MAX; k];
+        for (off, &d) in sq_dist[start..end].iter().enumerate() {
+            heap_push(&mut hcv, &mut hci, k, d, start + off);
+        }
+
+        // Merge into the main heap (chunk-major): re-push this chunk's
+        // heap-array slots jdx=0..k-1 in heap order.
+        for jdx in 0..k {
+            heap_push(&mut h2v, &mut h2i, k, hcv[jdx], hci[jdx]);
+        }
+    }
+
+    simultaneous_sort(&mut h2v, &mut h2i, k);
+    (h2i, h2v)
+}
+
 /// Find the k nearest neighbors of a query point.
 ///
-/// Returns `(index, distance)` pairs sorted by distance.
+/// Returns `(index, distance)` pairs nearest-first, where `distance` is the
+/// (non-squared) euclidean distance — preserving the contract of
+/// `kdtree::brute_force_knn` so `weights='distance'` weighting stays correct.
+///
+/// # f64 path — sklearn's ACTUAL default backend (NOT algorithm-invariant)
+///
+/// For `F == f64` (the Python-binding surface, dense euclidean `minkowski`
+/// `p=2`) the SELECTION replicates the backend sklearn's DEFAULT
+/// `algorithm='auto'` user actually reaches, which is NOT the single-heap
+/// `parallel_on_X` result and is NOT algorithm-invariant — sklearn's `kd_tree`
+/// and `brute` backends genuinely return different tie SETs/ORDERS on exact
+/// distance ties (#2143). The auto rule (`sklearn/neighbors/_base.py:607-640`)
+/// selects, for `p=2` low-dim:
+///
+/// - `n_features > 15` OR `k >= n_samples // 2` -> **brute**, whose default
+///   strategy is `parallel_on_Y` (`brute_parallel_on_y` — the double-heap
+///   transform of `_argkmin.pyx.tp`).
+/// - else -> **kd_tree**, a single-tree depth-first `KDTree.query`
+///   ([`crate::sk_kdtree::SkKdTree`]), whose leaf push order (hence tie SET)
+///   follows the bit-exact `std::nth_element` build partition.
+///
+/// Both backends push SQUARED euclidean distances onto the same
+/// `NeighborsHeap` kernel (`heap_push` + `simultaneous_sort`); squared keeps
+/// exact ties exact and order-identical to euclidean. The result matches the
+/// live sklearn 1.5.2 oracle for a float64 query array (the dtype/contiguity
+/// that makes sklearn route through the fast backends) bit-for-bit, including
+/// the #2143 default-order pin and the #2139/#2141 unique-resolution fixtures.
+///
+/// The KDTree is rebuilt per query row here. This is wasteful but bit-correct;
+/// the auto choice depends only on `(n_samples, n_features, k)` so it is
+/// identical for every row.
+///
+/// # f32 / other `F` fallback
+///
+/// For non-`f64` `F` the existing stable `(distance, index)` brute top-k
+/// (`kdtree::brute_force_knn`) is used. The Python binding is f64-only, so the
+/// f64 backends cover the entire `import ferrolearn` surface; the f32 fallback
+/// is a Rust-only convenience whose exact-tie order is NOT guaranteed to match
+/// sklearn (sklearn computes f32 KNN through distinct `*32` kernels).
 fn find_neighbors<F: Float + Send + Sync + 'static>(
     data: &Array2<F>,
     query_row: &[F],
     k: usize,
-    index: &SpatialIndex,
+    _index: &SpatialIndex,
 ) -> Vec<(usize, F)> {
-    match index {
-        SpatialIndex::KdTree(tree) => {
-            let query_f64: Vec<f64> = query_row.iter().map(|v| v.to_f64().unwrap()).collect();
-            let results = tree.query(data, &query_f64, k);
-            results
-                .into_iter()
-                .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
-                .collect()
-        }
-        SpatialIndex::BallTree(tree) => {
-            let query_f64: Vec<f64> = query_row.iter().map(|v| v.to_f64().unwrap()).collect();
-            let results = tree.query(data, &query_f64, k);
-            results
-                .into_iter()
-                .map(|(idx, dist)| (idx, F::from(dist).unwrap()))
-                .collect()
-        }
-        SpatialIndex::None => kdtree::brute_force_knn(data, query_row, k),
+    let n_samples = data.nrows();
+    let k_clamped = k.min(n_samples);
+    if k_clamped == 0 {
+        return Vec::new();
     }
+
+    // f64 path: route to the backend sklearn's default `auto` actually uses.
+    if TypeId::of::<F>() == TypeId::of::<f64>() {
+        let n_features = data.ncols();
+
+        // sklearn auto rule (`_base.py:607-640`) for euclidean / p=2:
+        //   n_features > 15 OR k >= n_samples // 2  -> brute (parallel_on_Y)
+        //   else                                    -> kd_tree (KDTree.query)
+        // `n` is n_samples_fit, the same `n` sklearn uses; `k` is the requested
+        // n_neighbors (NOT the clamped value — the caller guards k > n).
+        let use_brute = n_features > 15 || k >= n_samples / 2;
+
+        // Materialize an f64 view of the query row.
+        let q64: Vec<f64> = query_row
+            .iter()
+            .map(|&v| v.to_f64().unwrap_or(0.0))
+            .collect();
+
+        let (hi, hv) = if use_brute {
+            // Squared euclidean distance for every training point, index order.
+            let sq_dist: Vec<f64> = (0..n_samples)
+                .map(|i| {
+                    let mut acc = 0.0f64;
+                    for j in 0..n_features {
+                        let dij = data[[i, j]].to_f64().unwrap_or(0.0) - q64[j];
+                        acc += dij * dij;
+                    }
+                    acc
+                })
+                .collect();
+            let (hi, sq) = brute_parallel_on_y(&sq_dist, k_clamped);
+            // brute returns squared distances; convert to euclidean.
+            let dists: Vec<f64> = sq.into_iter().map(|s| s.max(0.0).sqrt()).collect();
+            (hi, dists)
+        } else {
+            // kd_tree: build a bit-exact sklearn KDTree on an f64 copy and run
+            // the single-tree depth-first query. SkKdTree::query already
+            // returns euclidean (non-squared) distances.
+            let data64: Array2<f64> = data.mapv(|v| v.to_f64().unwrap_or(0.0));
+            let tree = SkKdTree::build(&data64);
+            tree.query(&q64, k_clamped)
+        };
+
+        return hi
+            .into_iter()
+            .zip(hv)
+            .map(|(idx, dist)| {
+                let d = F::from(dist).unwrap_or_else(F::zero);
+                (idx, d)
+            })
+            .collect();
+    }
+
+    // f32 / other F: existing stable (distance, index) brute fallback.
+    kdtree::brute_force_knn(data, query_row, k)
 }
 
 /// Build the appropriate spatial index based on algorithm setting and dimensionality.
@@ -379,6 +681,21 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
             });
         }
 
+        // Query-time `n_neighbors <= n_samples_fit` guard, deferred from fit
+        // (sklearn/neighbors/_base.py:828-838 raises ValueError here). Routes
+        // through the same `InsufficientSamples` error as `kneighbors_impl`
+        // (REQ-6 guard `green_kneighbors_k_too_large_errors`) so both query
+        // paths raise identically rather than silently clamping `k` to the
+        // available neighbors via `find_neighbors`.
+        let n_samples_fit = self.x_train.nrows();
+        if self.n_neighbors > n_samples_fit {
+            return Err(FerroError::InsufficientSamples {
+                required: self.n_neighbors,
+                actual: n_samples_fit,
+                context: "n_neighbors exceeds number of training samples".into(),
+            });
+        }
+
         let n_samples = x.nrows();
 
         // Use a threshold to avoid Rayon overhead on small inputs.
@@ -492,6 +809,18 @@ impl<F: Float + Send + Sync + 'static> FittedKNeighborsClassifier<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time `n_neighbors <= n_samples_fit` guard (see `predict`);
+        // sklearn/neighbors/_base.py:828-838 raises ValueError here rather than
+        // clamping `k`.
+        let n_samples_fit = self.x_train.nrows();
+        if self.n_neighbors > n_samples_fit {
+            return Err(FerroError::InsufficientSamples {
+                required: self.n_neighbors,
+                actual: n_samples_fit,
+                context: "n_neighbors exceeds number of training samples".into(),
             });
         }
 
@@ -773,6 +1102,19 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time `n_neighbors <= n_samples_fit` guard, deferred from fit
+        // (sklearn/neighbors/_base.py:828-838 raises ValueError here for the
+        // regressor too). Routes through the same `InsufficientSamples` error
+        // as `kneighbors_impl` rather than clamping `k` via `find_neighbors`.
+        let n_samples_fit = self.x_train.nrows();
+        if self.n_neighbors > n_samples_fit {
+            return Err(FerroError::InsufficientSamples {
+                required: self.n_neighbors,
+                actual: n_samples_fit,
+                context: "n_neighbors exceeds number of training samples".into(),
             });
         }
 
@@ -1152,6 +1494,132 @@ mod tests {
     }
 
     #[test]
+    fn test_knn_tie_break_lowest_index_all_algorithms() -> Result<(), FerroError> {
+        // k-th-boundary distance tie: query [0,0] coincides with idx0; idx1,
+        // idx2, idx3 are all at distance 1 — a 3-way tie for the single k=2
+        // slot. sklearn's KNeighborsClassifier (argpartition + argsort,
+        // _base.py:738/:740-741) keeps the LOWEST tied index (idx1) and returns
+        // the SAME result for every `algorithm`. ferrolearn must match: the
+        // second neighbor is idx1 for brute/auto/kd_tree/ball_tree alike.
+        let x = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]];
+        let y = array![5usize, 1, 0, 0];
+        let xq = array![[0.0, 0.0]];
+
+        for algo in [
+            Algorithm::BruteForce,
+            Algorithm::Auto,
+            Algorithm::KdTree,
+            Algorithm::BallTree,
+        ] {
+            let fitted = KNeighborsClassifier::<f64>::new()
+                .with_n_neighbors(2)
+                .with_algorithm(algo)
+                .fit(&x, &y)?;
+            let (_, indices) = fitted.kneighbors(&xq, None)?;
+            // Nearest is idx0 (distance 0); the tie-break keeps idx1 (lowest
+            // index among the three equidistant points), ordered second.
+            assert_eq!(indices[[0, 0]], 0, "{algo:?}: nearest must be idx0");
+            assert_eq!(
+                indices[[0, 1]],
+                1,
+                "{algo:?}: k-th tie must break to the lowest index (idx1)"
+            );
+            // predict therefore returns class 1 (sklearn oracle), not class 0.
+            let preds = fitted.predict(&xq)?;
+            assert_eq!(
+                preds[0], 1,
+                "{algo:?}: predict must match sklearn (class 1)"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[allow(
+        clippy::approx_constant,
+        reason = "0.7071 is the exact literal of the #2141 sklearn-oracle fixture, \
+                  not an approximation of FRAC_1_SQRT_2; changing it would change the oracle"
+    )]
+    fn test_neighbors_heap_matches_sklearn_kneighbors_order() -> Result<(), FerroError> {
+        // Characterization (R-CHAR-3): the NeighborsHeap kernel reproduces
+        // sklearn's exact kneighbors INDEX ORDER on exact-tie fixtures. Expected
+        // orders are the LIVE sklearn 1.5.2 oracle (system python3), computed via
+        //   from sklearn.neighbors import KNeighborsClassifier
+        //   KNeighborsClassifier(n_neighbors=k, algorithm=A).fit(x,y).kneighbors([[0,0]])[1]
+        // NOT copied from the ferrolearn side.
+        //
+        // Each fixture below is one where sklearn's order is well-defined (the
+        // tie set resolves to a unique fill), so every algorithm string AND both
+        // ArgKmin strategies agree — and the single-heap kernel matches.
+        struct Case {
+            x: Array2<f64>,
+            k: usize,
+            // sklearn kneighbors index order for query [0,0], all algorithms.
+            order: Vec<usize>,
+        }
+
+        let cases = [
+            // #2141 fixture: idx5/idx6 strictly closer (dist 0.99999041) than the
+            // four unit-axis ties; k=4 keeps exactly one tied point (idx2).
+            // sklearn (brute/kd_tree/ball_tree/auto): [0, 6, 5, 2].
+            Case {
+                x: array![
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [-1.0, 0.0],
+                    [0.0, 1.0],
+                    [0.0, -1.0],
+                    [0.7071, 0.7071],
+                    [-0.7071, 0.7071],
+                ],
+                k: 4,
+                order: vec![0, 6, 5, 2],
+            },
+            // #2139 fixture: idx0 at distance 0; idx1/idx2/idx3 tied at distance 1;
+            // k=2 keeps idx0 then idx1. sklearn (all algorithms): [0, 1].
+            Case {
+                x: array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]],
+                k: 2,
+                order: vec![0, 1],
+            },
+            // Distinct distances (no ties): idx at 0, then 1, then 2 away.
+            // sklearn order [0, 1, 2].
+            Case {
+                x: array![[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0]],
+                k: 3,
+                order: vec![0, 1, 2],
+            },
+        ];
+
+        let y_dummy = |n: usize| Array1::from_iter(0..n);
+        let xq = array![[0.0, 0.0]];
+
+        for case in cases {
+            let n = case.x.nrows();
+            for algo in [
+                Algorithm::BruteForce,
+                Algorithm::Auto,
+                Algorithm::KdTree,
+                Algorithm::BallTree,
+            ] {
+                let fitted = KNeighborsClassifier::<f64>::new()
+                    .with_n_neighbors(case.k)
+                    .with_algorithm(algo)
+                    .fit(&case.x, &y_dummy(n))?;
+                let (_d, indices) = fitted.kneighbors(&xq, Some(case.k))?;
+                let got: Vec<usize> = indices.row(0).to_vec();
+                assert_eq!(
+                    got, case.order,
+                    "{algo:?}: NeighborsHeap order must equal sklearn kneighbors \
+                     order {:?}",
+                    case.order
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn test_classifier_brute_force_algorithm() {
         let x =
             Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
@@ -1241,12 +1709,18 @@ mod tests {
                 "kneighbors with k=5 > n_train=2 must error at query time"
             );
 
-            // `predict` goes through `brute_force_knn`, which clamps k to
-            // n_train and silently returns the available neighbors — so predict
-            // succeeds (it votes over min(k, n) neighbors).
+            // `predict`/`predict_proba` carry the SAME query-time guard
+            // (sklearn raises `ValueError("Expected n_neighbors <=
+            // n_samples_fit, ...")` at predict time, `_base.py:828-838`); they
+            // must NOT clamp k to n_train and silently return a prediction
+            // (#2140).
             assert!(
-                fitted.predict(&x).is_ok(),
-                "predict clamps k to n_train and returns a prediction"
+                fitted.predict(&x).is_err(),
+                "predict with k=5 > n_train=2 must error at query time (sklearn parity)"
+            );
+            assert!(
+                fitted.predict_proba(&x).is_err(),
+                "predict_proba with k=5 > n_train=2 must error at query time (sklearn parity)"
             );
         }
     }
