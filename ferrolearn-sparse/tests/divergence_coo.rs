@@ -30,6 +30,7 @@
 //! missing methods, ferray substrate) are structural blockers filed as `-l blocker`
 //! issues, not pinned here as doomed tests (R-DEFER-3).
 
+use ferrolearn_core::FerroError;
 use ferrolearn_sparse::{CooMatrix, CsrMatrix};
 
 /// REQ-CONSTRUCT + REQ-API geometry. The m2-style matrix (no duplicate) round-trips
@@ -227,4 +228,105 @@ fn coo_shape_data_row_col_match_scipy() {
     assert_eq!(m.row(), &[0, 2, 1]);
     // scipy m.col == [0,1,2] (column coordinate of each stored triplet)
     assert_eq!(m.col(), &[0, 1, 2]);
+}
+
+/// REQ-MISSING-METHODS (`copy`). `copy()` returns an identical matrix preserving
+/// ALL stored entries, including an **explicit stored zero**, mirroring scipy
+/// `coo_matrix.copy()` (`scipy/sparse/_data.py:94`). The original is unchanged.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([3.,0.,5.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   c=m.copy();
+///   print(c.nnz, c.data.tolist(), c.toarray().tolist(), m.toarray().tolist())"`):
+/// `3 [3.0, 0.0, 5.0] [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]]
+///   [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]]`.
+#[test]
+fn coo_copy_preserves_stored_zero() -> Result<(), FerroError> {
+    let m = CooMatrix::<f64>::from_triplets(
+        3,
+        3,
+        vec![0, 1, 2],
+        vec![0, 1, 2],
+        vec![3.0, 0.0, 5.0], // explicit stored 0 at (1,1)
+    )?;
+
+    let c = m.copy();
+    // scipy c.nnz == 3 (explicit stored zero counted)
+    assert_eq!(c.nnz(), 3);
+    // scipy c.data == [3, 0, 5]
+    assert_eq!(c.data(), &[3.0, 0.0, 5.0]);
+
+    // scipy c.toarray() == [[3,0,0],[0,0,0],[0,0,5]]
+    let expected = [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
+    let d = c.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "copy mismatch at ({r},{col})"
+            );
+        }
+    }
+
+    // The original is unchanged.
+    assert_eq!(m.nnz(), 3);
+    assert_eq!(m.data(), &[3.0, 0.0, 5.0]);
+    let dm = m.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                dm[[r, col]],
+                expected[r][col],
+                "original mutated at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`eliminate_zeros`). `eliminate_zeros()` drops the
+/// explicitly stored zero, mirroring scipy `coo_matrix.eliminate_zeros()`
+/// (`scipy/sparse/_coo.py:798`). The dense form is unchanged (a stored zero and
+/// an implicit zero materialize identically).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   m=sp.coo_matrix((np.array([3.,0.,5.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   m.eliminate_zeros();
+///   print(m.nnz, m.row.tolist(), m.col.tolist(), m.data.tolist(),
+///         m.toarray().tolist())"`):
+/// `2 [0, 2] [0, 2] [3.0, 5.0] [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]]`.
+#[test]
+fn coo_eliminate_zeros_matches_scipy() -> Result<(), FerroError> {
+    let m = CooMatrix::<f64>::from_triplets(
+        3,
+        3,
+        vec![0, 1, 2],
+        vec![0, 1, 2],
+        vec![3.0, 0.0, 5.0], // explicit stored 0 at (1,1)
+    )?;
+
+    let e = m.eliminate_zeros()?;
+    // scipy nnz == 2 (the stored zero removed)
+    assert_eq!(e.nnz(), 2);
+    // scipy row == [0, 2], col == [0, 2], data == [3, 5]
+    assert_eq!(e.row(), &[0, 2]);
+    assert_eq!(e.col(), &[0, 2]);
+    assert_eq!(e.data(), &[3.0, 5.0]);
+
+    // scipy toarray() unchanged == [[3,0,0],[0,0,0],[0,0,5]]
+    let expected = [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
+    let d = e.to_dense();
+    for r in 0..3 {
+        for col in 0..3 {
+            assert_eq!(
+                d[[r, col]],
+                expected[r][col],
+                "eliminate_zeros mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
 }
