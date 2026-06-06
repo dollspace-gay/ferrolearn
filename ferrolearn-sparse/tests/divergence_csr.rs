@@ -234,6 +234,62 @@ fn csr_sub_shape_mismatch_is_err() {
     );
 }
 
+/// REQ-MISSING-MATMUL. `matmul(&B)` matches scipy `A @ B` (sparse-sparse matrix
+/// product, `_matmul_sparse`, SMMP).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `(A@B).toarray() == [[1,1,2],[0,3,3],[4,4,5]]`.
+#[test]
+fn csr_matmul_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b();
+    let prod = a.matmul(&b).unwrap();
+    let expected = [[1.0, 1.0, 2.0], [0.0, 3.0, 3.0], [4.0, 4.0, 5.0]];
+    assert_dense_eq(&prod.to_dense(), &expected);
+}
+
+/// REQ-MISSING-MATMUL. `matmul(&C)` with a non-square right operand
+/// `C = [[1,2],[3,4],[5,6]]` (3x2) yields the `(3,2)` product, matching scipy
+/// `A @ C`.
+///
+/// Oracle: `(A@C).toarray() == [[11,14],[9,12],[29,38]]`, shape `(3,2)`.
+#[test]
+fn csr_matmul_non_square() {
+    let a = sample_a();
+    let c = CsrMatrix::new(
+        3,
+        2,
+        vec![0, 2, 4, 6],
+        vec![0, 1, 0, 1, 0, 1],
+        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    )
+    .unwrap();
+    let prod = a.matmul(&c).unwrap();
+    assert_eq!(prod.n_rows(), 3);
+    assert_eq!(prod.n_cols(), 2);
+    let d = prod.to_dense();
+    let expected = [[11.0, 14.0], [9.0, 12.0], [29.0, 38.0]];
+    for (r, row) in expected.iter().enumerate() {
+        for (col, &v) in row.iter().enumerate() {
+            assert_eq!(d[[r, col]], v, "matmul mismatch at ({r},{col})");
+        }
+    }
+}
+
+/// REQ-MISSING-MATMUL / REQ-ERR. `matmul` with an incompatible inner dimension
+/// (`A.n_cols != D.n_rows`) returns `Err`, where scipy raises
+/// `ValueError: dimension mismatch`.
+#[test]
+fn csr_matmul_shape_mismatch_is_err() {
+    let a = sample_a();
+    // D is 2x2: A has 3 cols, D has 2 rows -> inner dims disagree.
+    let d = CsrMatrix::<f64>::new(2, 2, vec![0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.matmul(&d).is_err(),
+        "inner-dimension-mismatched matmul must return Err (scipy raises ValueError)"
+    );
+}
+
 /// REQ-SCALAR-MUL. `mul_scalar(2.0)` (new) and `scale(2.0)` (in place) match
 /// scipy `A * 2`.
 ///

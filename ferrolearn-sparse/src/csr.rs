@@ -12,7 +12,7 @@
 //! Behavior is oracle-verified vs the live scipy (R-CHAR-3) — see
 //! `tests/divergence_csr.rs`.
 //!
-//! **10 SHIPPED / 4 NOT-STARTED.**
+//! **11 SHIPPED / 3 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -23,7 +23,7 @@
 //! | REQ-ROW-SLICE | SHIPPED | `row_slice(a,b)` == scipy `A[a:b]` (method vs Python-slice API). Guard `csr_row_slice_matches_scipy`. |
 //! | REQ-ERR | SHIPPED | `add`/`mul_vec` return `Err(FerroError::ShapeMismatch)` where scipy raises `ValueError`. Guards `csr_*_shape_mismatch_is_err`. |
 //! | REQ-CONSUMER | SHIPPED | real estimator consumers: `ferrolearn-neighbors/src/graph.rs` (`kneighbors_graph`/`radius_neighbors_graph` return CSR) + `ferrolearn-core/src/dataset.rs` (sparse `Dataset` arm); also `helpers.rs`/`csc.rs`. |
-//! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)` (`_compressed.py`). Blocker #2000. |
+//! | REQ-MISSING-MATMUL | SHIPPED (#2000) | `matmul(&B)` returns the `(self.n_rows, rhs.n_cols)` sparse-sparse product `A@B` via the sprs product operator `(&self.inner * &rhs.inner).to_csr()` (`smmp::mul_csr_csr` for two CSR operands), mirroring scipy `_matmul_sparse` (`_compressed.py:415`, SMMP). Shape-checks `self.n_cols() == rhs.n_rows()` first (mismatch → `Err(FerroError::ShapeMismatch)`, scipy `ValueError: dimension mismatch`). Live oracle: `A.matmul(B).toarray()`=`[[1,1,2],[0,3,3],[4,4,5]]`; non-square `A.matmul(C)` for `C=[[1,2],[3,4],[5,6]]`=`[[11,14],[9,12],[29,38]]` shape `(3,2)`. Guards `csr_matmul_matches_scipy`/`csr_matmul_non_square`/`csr_matmul_shape_mismatch_is_err`. |
 //! | REQ-MISSING-TRANSPOSE | SHIPPED (#2001) | `transpose()` returns a `(n_cols, n_rows)` CSR of `Aᵀ` via sprs `transpose_view().to_csr()`, mirroring scipy `A.T` (`_csr.py:22` — CSC view of the same buffers, here materialized as CSR). Live oracle: `A.T.toarray()`=`[[1,0,4],[0,3,0],[2,0,5]]`; non-square `B=[[1,2,3],[4,5,6]]` -> `B.T.toarray()`=`[[1,4],[2,5],[3,6]]` shape `(3,2)`; double-transpose round-trips. Guards `csr_transpose_matches_scipy`/`csr_transpose_non_square`/`csr_transpose_twice_roundtrip`. |
 //! | REQ-MISSING-REDUCE | SHIPPED | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csr_sum_matches_scipy`/`csr_sum_axis0_matches_scipy`/`csr_sum_axis1_matches_scipy`/`csr_diagonal_matches_scipy`/`csr_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2003) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csr_multiply_matches_scipy`/`csr_sub_matches_scipy`/`csr_multiply_shape_mismatch_is_err`/`csr_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
@@ -336,6 +336,37 @@ where
         // both inputs are stored — the element-wise (Hadamard) intersection.
         let result = sprs::binop::mul_mat_same_storage(&self.inner, &rhs.inner);
         Ok(Self { inner: result })
+    }
+
+    /// Sparse-sparse matrix product: `A @ B` (scipy `A.dot(B)`).
+    ///
+    /// Mirrors scipy `csr_matrix @ csr_matrix` (`_matmul_sparse`,
+    /// `scipy/sparse/_compressed.py:415`), the SMMP algorithm: the result is the
+    /// `(self.n_rows(), rhs.n_cols())` matrix product, so `self.n_cols()` must
+    /// equal `rhs.n_rows()`. Computed via the sprs product operator
+    /// `&self.inner * &rhs.inner`, which dispatches to `smmp::mul_csr_csr` for
+    /// two CSR operands and returns a CSR matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `self.n_cols() != rhs.n_rows()`
+    /// (scipy raises `ValueError: dimension mismatch`).
+    pub fn matmul(&self, rhs: &CsrMatrix<T>) -> Result<CsrMatrix<T>, FerroError>
+    where
+        T: Clone + sprs::MulAcc + Zero + Default + Send + Sync + 'static,
+    {
+        if self.n_cols() != rhs.n_rows() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.n_cols()],
+                actual: vec![rhs.n_rows()],
+                context: "CsrMatrix::matmul: A.n_cols must equal B.n_rows".into(),
+            });
+        }
+        // Both operands are CSR storage, so the sprs product `&A * &B` dispatches
+        // to `smmp::mul_csr_csr` and yields CSR; `to_csr()` is a no-op materialize
+        // that guarantees the wrapped `inner` is CSR regardless.
+        let inner = (&self.inner * &rhs.inner).to_csr();
+        Ok(Self { inner })
     }
 
     /// Sparse matrix-dense vector product: computes `self * rhs`.
