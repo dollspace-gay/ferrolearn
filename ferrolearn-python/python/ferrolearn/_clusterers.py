@@ -76,6 +76,23 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
             self._rebuild_rs()
         return np.array(self._rs.transform(X))
 
+    def score(self, X, y=None, sample_weight=None):
+        # sklearn KMeans.score = the negative inertia on X, i.e.
+        # -sum_i sample_weight_i * min_k ||x_i - cluster_centers_[k]||^2
+        # (sklearn/cluster/_kmeans.py:1156-1184, -_labels_inertia).
+        # On the training data this equals -inertia_.
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False, dtype="float64")
+        X = _ensure_f64(X)
+        # Squared distance from each sample to each center, then min over centers.
+        diff = X[:, np.newaxis, :] - self.cluster_centers_[np.newaxis, :, :]
+        sq_dists = np.sum(diff * diff, axis=2)
+        min_sq = sq_dists.min(axis=1)
+        if sample_weight is not None:
+            sw = np.asarray(sample_weight, dtype="float64")
+            return -float(np.sum(min_sq * sw))
+        return -float(np.sum(min_sq))
+
     def _rebuild_rs(self):
         n_init = 1 if self.n_init == "auto" else self.n_init
         self._rs = _RsKMeans(

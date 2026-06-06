@@ -179,3 +179,29 @@ def test_well_separated_partition_matches_sklearn():
     assert len(set(labels[:20].tolist())) == 1
     assert len(set(labels[20:].tolist())) == 1
     assert labels[0] != labels[20]
+
+
+def test_kmeans_score_equals_neg_inertia():
+    """REQ #2032: ferrolearn.KMeans exposes `score` = the negative inertia.
+
+    sklearn `KMeans.score(X)` returns `-_labels_inertia(...)` (the negative sum
+    of squared distances to the nearest center), which on the training data
+    equals `-inertia_` (`sklearn/cluster/_kmeans.py:1156-1184`). This contract
+    is RNG-independent: it relates `score` to `inertia_` for the SAME fit.
+    """
+    X = np.array(
+        [[0.0, 0.0], [0.1, 0.1], [5.0, 5.0], [5.1, 4.9], [10.0, 10.0], [9.9, 10.1]]
+    )
+    # sklearn's own contract: score(X) == -inertia_ on the training data.
+    sk = SkKMeans(n_clusters=3, n_init=10, random_state=0).fit(X)
+    assert np.isclose(sk.score(X), -sk.inertia_)
+
+    # ferrolearn must expose the same `score` contract.
+    fm = fl.KMeans(n_clusters=3, random_state=0).fit(X)
+    assert np.isclose(fm.score(X), -fm.inertia_)
+
+    # sample_weight weights each sample's squared distance.
+    sw = np.array([1.0, 2.0, 1.0, 1.0, 3.0, 1.0])
+    diff = X[:, np.newaxis, :] - np.asarray(fm.cluster_centers_)[np.newaxis, :, :]
+    expected = -float(np.sum(np.sum(diff * diff, axis=2).min(axis=1) * sw))
+    assert np.isclose(fm.score(X, sample_weight=sw), expected)
