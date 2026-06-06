@@ -290,9 +290,9 @@ fn api_proof_pairwise() {
 fn api_proof_ranking() {
     let y_true: Array1<f64> = array![3.0, 2.0, 3.0, 0.0, 1.0];
     let y_score: Array1<f64> = array![0.9, 0.5, 0.8, 0.4, 0.2];
-    let _ = dcg_score::<f64>(&y_true, &y_score, None).unwrap();
+    let _ = dcg_score::<f64>(&y_true, &y_score, None, None).unwrap();
     let _ = ndcg_score::<f64>(&y_true, &y_score, None).unwrap();
-    let _ = dcg_score::<f64>(&y_true, &y_score, Some(3)).unwrap();
+    let _ = dcg_score::<f64>(&y_true, &y_score, Some(3), None).unwrap();
     let _ = ndcg_score::<f64>(&y_true, &y_score, Some(3)).unwrap();
 }
 

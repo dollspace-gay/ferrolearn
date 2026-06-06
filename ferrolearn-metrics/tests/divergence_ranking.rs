@@ -45,7 +45,7 @@ use ndarray::{Array2, array};
 fn divergence_dcg_tie_averaging() {
     let y_true = array![10.0_f64, 0.0, 0.0, 1.0, 5.0];
     let y_score = array![1.0_f64, 0.0, 0.0, 0.0, 1.0];
-    let got = dcg_score(&y_true, &y_score, Some(1)).unwrap();
+    let got = dcg_score(&y_true, &y_score, Some(1), None).unwrap();
     // sklearn 1.5.2 live oracle:
     const SK_DCG_TIE_K1: f64 = 7.5;
     assert!(
@@ -172,7 +172,7 @@ fn green_lrap_basic() {
 fn green_dcg_no_tie() {
     let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
     let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-    let got = dcg_score(&y_true, &y_score, None).unwrap();
+    let got = dcg_score(&y_true, &y_score, None, None).unwrap();
     const SK_DCG_NOTIE: f64 = 6.861_126_688_593_501;
     assert!(
         (got - SK_DCG_NOTIE).abs() < 1e-9,
