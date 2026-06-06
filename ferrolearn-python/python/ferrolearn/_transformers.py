@@ -95,6 +95,23 @@ class StandardScaler(TransformerMixin, BaseEstimator):
             result = result + self.mean_
         return result
 
+    def get_feature_names_out(self, input_features=None):
+        # OneToOneFeatureMixin: a 1:1 transformer's output names == its input
+        # names; default `x0..x{n_features_in_-1}` when none are provided
+        # (sklearn/base.py _OneToOneFeatureMixin.get_feature_names_out).
+        check_is_fitted(self)
+        if input_features is None:
+            return np.asarray(
+                [f"x{i}" for i in range(self.n_features_in_)], dtype=object
+            )
+        input_features = np.asarray(input_features, dtype=object)
+        if input_features.shape[0] != self.n_features_in_:
+            raise ValueError(
+                f"input_features should have length {self.n_features_in_}, "
+                f"got {input_features.shape[0]}"
+            )
+        return input_features
+
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_rs", None)
@@ -160,6 +177,13 @@ class PCA(TransformerMixin, BaseEstimator):
         if hasattr(self, "_rs"):
             return np.array(self._rs.inverse_transform(X))
         return X @ self.components_ + self.mean_
+
+    def get_feature_names_out(self, input_features=None):
+        # ClassNamePrefixFeaturesOutMixin: PCA emits `pca0..pca{n_components_-1}`
+        # (sklearn/decomposition/_base.py / _ClassNamePrefixFeaturesOutMixin).
+        check_is_fitted(self)
+        n_out = self.components_.shape[0]
+        return np.asarray([f"pca{i}" for i in range(n_out)], dtype=object)
 
     def __getstate__(self):
         state = self.__dict__.copy()

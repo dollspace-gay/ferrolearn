@@ -93,6 +93,14 @@ class KMeans(TransformerMixin, ClusterMixin, BaseEstimator):
             return -float(np.sum(min_sq * sw))
         return -float(np.sum(min_sq))
 
+    def get_feature_names_out(self, input_features=None):
+        # KMeans is a transformer (distance-to-centroid); its output feature
+        # names are `kmeans0..kmeans{n_clusters-1}`
+        # (ClassNamePrefixFeaturesOutMixin, sklearn/cluster/_kmeans.py).
+        check_is_fitted(self)
+        n_out = self.cluster_centers_.shape[0]
+        return np.asarray([f"kmeans{i}" for i in range(n_out)], dtype=object)
+
     def _rebuild_rs(self):
         n_init = 1 if self.n_init == "auto" else self.n_init
         self._rs = _RsKMeans(

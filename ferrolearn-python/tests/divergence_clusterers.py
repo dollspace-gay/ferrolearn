@@ -205,3 +205,12 @@ def test_kmeans_score_equals_neg_inertia():
     diff = X[:, np.newaxis, :] - np.asarray(fm.cluster_centers_)[np.newaxis, :, :]
     expected = -float(np.sum(np.sum(diff * diff, axis=2).min(axis=1) * sw))
     assert np.isclose(fm.score(X, sample_weight=sw), expected)
+
+
+def test_kmeans_get_feature_names_out():
+    """REQ #2095: KMeans (a transformer) exposes get_feature_names_out =
+    kmeans0..kmeans{n_clusters-1}, matching sklearn."""
+    X = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 1.0, 0.0], [5.0, 4.0, 3.0]])
+    fm = fl.KMeans(n_clusters=3, random_state=0).fit(X)
+    sm = SkKMeans(n_clusters=3, n_init=10).fit(X)
+    assert fm.get_feature_names_out().tolist() == sm.get_feature_names_out().tolist()

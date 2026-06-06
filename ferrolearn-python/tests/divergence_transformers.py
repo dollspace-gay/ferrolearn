@@ -404,3 +404,24 @@ def test_red_standardscaler_scale_constant_column_matches_oracle():
     )
     assert np.all(sk_m.transform(_XCONST)[:, 1] == 0.0)
     assert np.all(fl_m.transform(_XCONST)[:, 1] == 0.0)
+
+
+def test_standardscaler_pca_get_feature_names_out():
+    """REQ #2095: StandardScaler/PCA expose get_feature_names_out matching sklearn.
+
+    StandardScaler is 1:1 (OneToOneFeatureMixin) → input names (default x0..xn);
+    PCA emits pca0..pca{n_components-1} (ClassNamePrefixFeaturesOutMixin).
+    """
+    from sklearn.decomposition import PCA as SkPCA
+    from sklearn.preprocessing import StandardScaler as SkSS
+
+    X = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0], [2.0, 1.0, 0.0]])
+    ss = fl.StandardScaler().fit(X)
+    assert ss.get_feature_names_out().tolist() == SkSS().fit(X).get_feature_names_out().tolist()
+    assert ss.get_feature_names_out(["a", "b", "c"]).tolist() == ["a", "b", "c"]
+
+    pca = fl.PCA(n_components=2).fit(X)
+    assert (
+        pca.get_feature_names_out().tolist()
+        == SkPCA(n_components=2).fit(X).get_feature_names_out().tolist()
+    )
