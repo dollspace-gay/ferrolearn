@@ -329,3 +329,30 @@ def test_green_transformer_api_conform(name):
     xft = np.asarray(getattr(fl, name)().fit_transform(_XT))
     assert xft.ndim == 2
     assert xft.shape[0] == _XT.shape[0]
+
+
+def test_red_hist_gradient_boosting_uses_max_iter_not_n_estimators():
+    """REQ #2089: sklearn HistGradientBoostingRegressor uses `max_iter` (the
+    number of boosting iterations), NOT `n_estimators`. ferrolearn must mirror
+    the sklearn constructor name.
+
+    Live oracle (R-CHAR-3): sklearn HGB has `max_iter` (default 100) and no
+    `n_estimators` parameter.
+    """
+    from sklearn.ensemble import HistGradientBoostingRegressor as SkHGB
+
+    sk_params = inspect.signature(SkHGB.__init__).parameters
+    assert "max_iter" in sk_params and "n_estimators" not in sk_params
+    assert sk_params["max_iter"].default == 100
+
+    fl_params = inspect.signature(
+        fl.HistGradientBoostingRegressor.__init__
+    ).parameters
+    assert "max_iter" in fl_params and "n_estimators" not in fl_params
+    assert fl_params["max_iter"].default == 100
+
+    est = fl.HistGradientBoostingRegressor(max_iter=20)
+    assert est.max_iter == 20
+    # `n_estimators` is not a sklearn HGB param -> must be rejected.
+    with pytest.raises(TypeError):
+        fl.HistGradientBoostingRegressor(n_estimators=10)

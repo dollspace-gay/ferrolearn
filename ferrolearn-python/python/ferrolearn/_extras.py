@@ -197,16 +197,21 @@ class GradientBoostingRegressor(_RegressorWrapper):
 
 
 class HistGradientBoostingRegressor(_RegressorWrapper):
-    def __init__(self, *, n_estimators=100, learning_rate=0.1,
+    def __init__(self, *, max_iter=100, learning_rate=0.1,
                  max_depth=None, random_state=None):
-        self.n_estimators = n_estimators
+        # sklearn HistGradientBoostingRegressor uses `max_iter` (the number of
+        # boosting iterations), NOT `n_estimators`
+        # (sklearn/ensemble/_hist_gradient_boosting/gradient_boosting.py).
+        self.max_iter = max_iter
         self.learning_rate = learning_rate
         self.max_depth = max_depth
         self.random_state = random_state
 
     def _make_rs(self):
+        # The Rust binding's `n_estimators` IS the boosting-iteration count,
+        # i.e. sklearn's `max_iter`.
         return _RsHistGradientBoostingRegressor(
-            n_estimators=self.n_estimators, learning_rate=self.learning_rate,
+            n_estimators=self.max_iter, learning_rate=self.learning_rate,
             max_depth=self.max_depth, random_state=self.random_state)
 
 
