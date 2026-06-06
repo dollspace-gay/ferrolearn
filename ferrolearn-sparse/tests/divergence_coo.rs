@@ -624,3 +624,84 @@ fn coo_power_sqrt_matches_scipy() -> Result<(), FerroError> {
     assert_eq!(p.nnz(), 3);
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`dot`). The COO `@` COO matrix product mirrors scipy
+/// `coo_matrix.dot(other)` (`scipy/sparse/_base.py:587` → `_matmul_sparse`
+/// `:898`): COO has no native matmul, so scipy routes through `tocsr()` and
+/// returns a **CSR** result (arithmetic defaults to CSR, `_base.py:484`).
+/// `dot()` delegates `self.to_csr()?.matmul(&rhs.to_csr()?)`, so its result is a
+/// `CsrMatrix`; the dense form is compared to avoid coupling to CSR's internal
+/// ordering.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([1.,2.,3.]),(np.array([0,0,1]),np.array([0,1,1]))),
+///     shape=(2,2));
+///   B=sp.coo_matrix((np.array([4.,5.,6.]),(np.array([0,1,1]),np.array([0,0,1]))),
+///     shape=(2,2));
+///   print(A.dot(B).toarray().tolist())"`): `[[14.0, 12.0], [15.0, 18.0]]`.
+/// A=[[1,2],[0,3]], B=[[4,0],[5,6]].
+#[test]
+fn coo_dot_matches_scipy() -> Result<(), FerroError> {
+    // A = [[1,2],[0,3]]
+    let a =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 0, 1], vec![0, 1, 1], vec![1.0, 2.0, 3.0])?;
+    // B = [[4,0],[5,6]]
+    let b =
+        CooMatrix::<f64>::from_triplets(2, 2, vec![0, 1, 1], vec![0, 0, 1], vec![4.0, 5.0, 6.0])?;
+
+    let c = a.dot(&b)?;
+    // scipy A.dot(B).toarray() == [[14,12],[15,18]]
+    let expected = [[14.0, 12.0], [15.0, 18.0]];
+    let d = c.to_dense();
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(d[[r, col]], expected[r][col], "dot mismatch at ({r},{col})");
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`dot`). Non-square operands: `(2×3) @ (3×2) -> (2×2)`,
+/// mirroring scipy `coo_matrix.dot` (`scipy/sparse/_base.py:587` → CSR
+/// `_matmul_sparse`). Result CSR's dense form is compared to the oracle.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   D=sp.coo_matrix((np.array([1.,2.,3.,4.]),(np.array([0,0,1,1]),np.array([0,2,0,1]))),
+///     shape=(2,3));
+///   E=sp.coo_matrix((np.array([5.,6.,7.]),(np.array([0,1,2]),np.array([1,0,1]))),
+///     shape=(3,2));
+///   print(D.dot(E).toarray().tolist())"`): `[[0.0, 19.0], [24.0, 15.0]]`.
+/// D=[[1,0,2],[3,4,0]], E=[[0,5],[6,0],[0,7]].
+#[test]
+fn coo_dot_nonsquare_matches_scipy() -> Result<(), FerroError> {
+    // D = [[1,0,2],[3,4,0]] (2×3)
+    let d_coo = CooMatrix::<f64>::from_triplets(
+        2,
+        3,
+        vec![0, 0, 1, 1],
+        vec![0, 2, 0, 1],
+        vec![1.0, 2.0, 3.0, 4.0],
+    )?;
+    // E = [[0,5],[6,0],[0,7]] (3×2)
+    let e_coo =
+        CooMatrix::<f64>::from_triplets(3, 2, vec![0, 1, 2], vec![1, 0, 1], vec![5.0, 6.0, 7.0])?;
+
+    let c = d_coo.dot(&e_coo)?;
+    // scipy D.dot(E).toarray() == [[0,19],[24,15]] (shape (2,2))
+    assert_eq!(c.n_rows(), 2);
+    assert_eq!(c.n_cols(), 2);
+    let expected = [[0.0, 19.0], [24.0, 15.0]];
+    let dense = c.to_dense();
+    for r in 0..2 {
+        for col in 0..2 {
+            assert_eq!(
+                dense[[r, col]],
+                expected[r][col],
+                "dot non-square mismatch at ({r},{col})"
+            );
+        }
+    }
+    Ok(())
+}
