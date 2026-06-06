@@ -332,6 +332,14 @@ class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimato
         y_encoded = np.asarray(self._rs.predict(X))
         return _decode_labels(y_encoded, self.classes_)
 
+    def predict_proba(self, X):
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False, dtype="float64")
+        X = _ensure_f64(X)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.array(self._rs.predict_proba(X))
+
 
 class GaussianNB(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
     """Gaussian Naive Bayes classifier backed by Rust.

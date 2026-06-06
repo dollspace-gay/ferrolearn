@@ -19,7 +19,7 @@
 //! blocker). Verified via `tests/divergence_classifiers.py` +
 //! `tests/test_check_estimator.py` (553 pytest pass).
 //!
-//! **20 SHIPPED / 8 NOT-STARTED.**
+//! **21 SHIPPED / 7 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -43,7 +43,7 @@
 //! | REQ-KNN-API-CONFORM (fit/predict + classes_, default uniform) | SHIPPED | `RsKNeighborsClassifier::*` + getter, wrapped by `_classifiers.py::KNeighborsClassifier` — mirroring `neighbors/_classification.py:39`/`:240`. |
 //! | REQ-KNN-NNEIGHBORS-POSITIONAL (n_neighbors positional ABI) | SHIPPED | FIXED #2046: `_classifiers.py::KNeighborsClassifier.__init__(self, n_neighbors=5)` drops the keyword-only `*`, so `ferrolearn.KNeighborsClassifier(3).n_neighbors == 3` matching sklearn `_classification.py:193`. Guard `test_red_knn_n_neighbors_positional`. |
 //! | REQ-KNN-VALUE-PARITY (pred parity incl. tie-break) | SHIPPED | default uniform path: downstream `ferrolearn-neighbors` REQ-1 verifies the uniform weighted-vote smallest-label tie-break. (Distance-weighting/2-D-query/non-Euclidean divergences downstream #876.) |
-//! | REQ-KNN-PREDICT-PROBA (predict_proba surfaced) | NOT-STARTED | the wrapper + `RsKNeighborsClassifier` expose no `predict_proba`, though `FittedKNeighborsClassifier::predict_proba` is value-correct; sklearn `_classification.py:307`. Needs a Rust binding addition — #2051 (downstream #877). |
+//! | REQ-KNN-PREDICT-PROBA (predict_proba surfaced) | SHIPPED | FIXED #2051: `RsKNeighborsClassifier::predict_proba` binds the existing `FittedKNeighborsClassifier::predict_proba` (normalized weighted class-vote shares, `knn.rs:487`), surfaced by `_classifiers.py::KNeighborsClassifier.predict_proba` — `(n_samples, n_classes)` rows summing to 1.0, with `predict == classes_[argmax(predict_proba)]` matching sklearn `_classification.py:307`. Guard `test_red_knn_predict_proba_surfaced`. |
 //! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | NOT-STARTED | the wrapper exposes `n_neighbors` only; sklearn `_classification.py:193`. Default uniform/minkowski/p=2 MATCHES — downstream #876/#877. |
 //! | REQ-GNB-API-CONFORM (fit/predict/predict_proba + classes_, default path) | SHIPPED | `RsGaussianNB::*` + getter, wrapped by `_classifiers.py::GaussianNB` — mirroring `naive_bayes.py:147`/`:128`. Live default-path oracle matches element-wise. |
 //! | REQ-GNB-CTOR-ABI (all params keyword-only) | SHIPPED | `GaussianNB.__init__(self, *, var_smoothing=1e-9)` matches sklearn `naive_bayes.py:234` (the `*` is first). |
@@ -406,6 +406,22 @@ impl RsKNeighborsClassifier {
             .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let proba = fitted
+            .predict_proba(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &proba))
     }
 
     #[getter]

@@ -185,6 +185,45 @@ def test_red_rf_predict_proba_surfaced():
     )
 
 
+def test_red_knn_predict_proba_surfaced():
+    """RED: KNeighborsClassifier exposes predict_proba (rows sum to 1.0).
+
+    sklearn `_classification.py:307`: `predict_proba` returns
+    `(n_queries, n_classes)` per-neighbor weighted class shares, rows summing to
+    1.0, with `predict = classes_[argmax(predict_proba)]`. The Rust
+    `FittedKNeighborsClassifier::predict_proba` (`knn.rs:487`) ALREADY exists and
+    is value-correct, but neither `RsKNeighborsClassifier` nor the
+    `_classifiers.py::KNeighborsClassifier` wrapper surfaced it -> the wrapper
+    raised AttributeError. Fix: bind + surface predict_proba.
+
+    Per-row tie/boundary value parity vs sklearn is owned downstream (#876/#877),
+    so we pin the STRUCTURAL contract, not exact per-row values.
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    # sklearn's KNeighborsClassifier exposes predict_proba (oracle invariant).
+    assert hasattr(SkKNN, "predict_proba")
+
+    X_train = np.array(
+        [[0.0, 0.0], [0.1, 0.1], [5.0, 5.0], [5.1, 4.9], [9.0, 9.0], [9.1, 9.1]]
+    )
+    y_train = np.array([0, 0, 1, 1, 2, 2])
+    Xq = np.array([[0.05, 0.05], [5.0, 5.0], [9.05, 9.05], [0.2, 0.1]])
+
+    m = ferrolearn.KNeighborsClassifier(n_neighbors=1).fit(X_train, y_train)
+    proba = np.asarray(m.predict_proba(Xq))
+
+    # (a) shape == (n_query, n_classes)
+    assert proba.shape == (Xq.shape[0], 3)
+    # (b) every row sums to 1.0
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    # (c) predict == classes_[argmax(predict_proba)] (sklearn `_classification.py:307`)
+    assert np.array_equal(
+        np.asarray(m.predict(Xq)),
+        np.asarray(m.classes_)[np.argmax(proba, axis=1)],
+    )
+
+
 def test_red_logreg_max_iter_default():
     """RED: LogisticRegression default max_iter is 100 (matching sklearn).
 
