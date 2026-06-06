@@ -474,3 +474,56 @@ def test_pca_n_components_and_noise_variance_match_sklearn():
     # (one discarded eigenvalue), so this is not the trivial 0.0 path.
     assert sk.noise_variance_ > 0.0
     assert abs(float(fr.noise_variance_) - float(sk.noise_variance_)) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# PCA whiten constructor param (unit #2098, R-DEV-2).
+#
+# The wrapper previously exposed only n_components and built the Rust PCA with
+# whiten=false. The downstream `PCA::with_whiten` builder
+# (`ferrolearn-decomp/src/pca.rs:180`, REQ-11 #1502) already implements sklearn's
+# whitening: `Transform::transform` divides each projected column j by
+# `sqrt(explained_variance_[j])` (`sklearn/decomposition/_base.py:157-165`),
+# `inverse_transform` re-multiplies (`:192-196`). This threads the whiten
+# constructor param (`sklearn/decomposition/_pca.py:412`) through the binding.
+#
+# R-CHAR-3: every expected value is computed by the LIVE sklearn 1.5.2 oracle in
+# the same test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+
+def test_pca_whiten_transform_matches_sklearn():
+    """PCA(whiten=True).fit_transform(X) matches the live sklearn oracle.
+
+    Also guards that whiten defaults to False and that threading the param did
+    not disturb the whiten=False (default) path: fl.PCA(n_components=2) must still
+    equal sklearn's non-whitened transform element-wise.
+    """
+    X = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 7.0],
+            [2.0, 0.0, 1.0],
+            [8.0, 6.0, 5.0],
+            [3.0, 3.0, 2.0],
+            [0.0, 1.0, 4.0],
+        ]
+    )
+
+    # whiten=True: ferrolearn vs the live sklearn oracle, element-wise.
+    fr_t = fl.PCA(n_components=2, whiten=True).fit_transform(X)
+    sk_t = SkPCA(n_components=2, whiten=True).fit_transform(X)
+    assert fr_t.shape == sk_t.shape == (X.shape[0], 2)
+    np.testing.assert_allclose(fr_t, sk_t, atol=1e-6)
+
+    # Default: whiten is False (sklearn stores the ctor param verbatim,
+    # `sklearn/decomposition/_pca.py:412`/`:422`).
+    assert fl.PCA(n_components=2).whiten is False
+    sk_default = inspect.signature(SkPCA.__init__).parameters["whiten"].default
+    assert sk_default is False
+
+    # Regression guard: the whiten=False (default) path still equals sklearn's
+    # non-whitened transform — threading the param did not perturb the default.
+    fr_nw = fl.PCA(n_components=2).fit_transform(X)
+    sk_nw = SkPCA(n_components=2).fit_transform(X)
+    np.testing.assert_allclose(fr_nw, sk_nw, atol=1e-6)

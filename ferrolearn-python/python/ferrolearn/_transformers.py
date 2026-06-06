@@ -138,10 +138,18 @@ class PCA(TransformerMixin, BaseEstimator):
         Number of components to keep. If None, all
         ``min(n_samples, n_features)`` components are kept (resolved at fit),
         matching ``sklearn.decomposition.PCA`` (``sklearn/decomposition/_pca.py:409``).
+    whiten : bool, default=False
+        When True, the projected components are divided by
+        ``sqrt(explained_variance_)`` so the transformed output has unit
+        component-wise variance, matching ``sklearn.decomposition.PCA``
+        (``sklearn/decomposition/_pca.py:412``; whitening at
+        ``sklearn/decomposition/_base.py:157-165``). The whitening math lives in
+        the Rust ``PCA::with_whiten`` builder (``ferrolearn-decomp/src/pca.rs:180``).
     """
 
-    def __init__(self, n_components=None):
+    def __init__(self, n_components=None, *, whiten=False):
         self.n_components = n_components
+        self.whiten = whiten
 
     def fit(self, X, y=None):
         X = self._validate_data(X, dtype="float64")
@@ -151,7 +159,7 @@ class PCA(TransformerMixin, BaseEstimator):
         n_components = (
             self.n_components if self.n_components is not None else min(X.shape)
         )
-        self._rs = _RsPCA(n_components=n_components)
+        self._rs = _RsPCA(n_components=n_components, whiten=self.whiten)
         _fit_rust(self._rs, _ensure_f64(X))
         self.components_ = np.array(self._rs.components_)
         self.explained_variance_ = np.array(self._rs.explained_variance_)
@@ -203,5 +211,8 @@ class PCA(TransformerMixin, BaseEstimator):
                 if self.n_components is not None
                 else min(self._fit_X.shape)
             )
-            self._rs = _RsPCA(n_components=n_components)
+            self._rs = _RsPCA(
+                n_components=n_components,
+                whiten=getattr(self, "whiten", False),
+            )
             self._rs.fit(_ensure_f64(self._fit_X))
