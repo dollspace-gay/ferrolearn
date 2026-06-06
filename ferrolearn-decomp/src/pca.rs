@@ -53,14 +53,16 @@
 //! | REQ-10 | PyO3 `_RsPCA` binding (fit/transform/inverse_transform + components_/explained_variance_/explained_variance_ratio_/mean_/singular_values_ getters) | SHIPPED | `transformers.rs:89`, registered `lib.rs:23`; inherits REQ-1's deterministic signs |
 //! | REQ-11 | `whiten` (transform /sqrt(explained_variance_), inverse un-scale) | SHIPPED | `PCA::with_whiten` sets `whiten` (threaded into `FittedPCA`); `Transform::transform` divides each column j by `sqrt(explained_variance_[j])` (eps-clipped) = sklearn `_base.py:157-165`, and `inverse_transform` multiplies back = `_base.py:192-196`. `whiten=false` byte-identical to default. In-module `pca_whiten_transform_matches_sklearn`/`pca_whiten_false_unchanged`/`pca_whiten_inverse_matches_sklearn` match the live sklearn 1.5.2 oracle to 1e-6. Was #1502, fixed |
 //! | REQ-12 | `svd_solver` param + full-SVD/randomized/arpack paths | NOT-STARTED | sklearn `_pca.py:519-548,:575-591,:711-778`; ferrolearn covariance_eigh only — blocker #1503 |
-//! | REQ-13 | `n_components` as float (variance ratio) / "mle" / None-default | NOT-STARTED | sklearn `_pca.py:657-691`; ferrolearn requires explicit `usize` — blocker #1504 |
+//! | REQ-13a | `n_components` as float (variance ratio) + auto/`None` | SHIPPED | `NComponents<F>` enum (`Count`/`Ratio`/`Auto`) replaces the `usize` field; `PCA::with_variance_ratio`/`PCA::auto` constructors. `fit` resolves the spec AFTER the full eigendecomposition: `Ratio(r)` → `1 + count(ratio_cumsum[i] <= r)` clamped to `min_dim` = sklearn `searchsorted(ratio_cumsum, r, "right")+1` (`_pca.py:680-681`); `Auto` → `min(n_samples, n_features)` (`_pca.py:685`). In-module `pca_n_components_ratio_095_selects_2`/`_05_selects_1`/`_0999_selects_3`/`pca_n_components_auto_selects_all`/`pca_n_components_ratio_validation_rejects` match the live sklearn 1.5.2 oracle (cumsum `[0.898229, 0.987108, 1.0]`). Consumers: re-export `lib.rs:98`, `_RsPCA` `transformers.rs:143` (`PCA::new` backward-compatible → `Count`). Was #1504 |
+//! | REQ-13b | `n_components = "mle"` (Minka automatic dimensionality) | NOT-STARTED | sklearn `_infer_dimension` (`_pca.py:657-658`); `NComponents` has no `Mle` variant — blocker #1504 (carved from REQ-13) |
 //! | REQ-14 | `get_covariance` / `get_precision` | SHIPPED | `FittedPCA::get_covariance` (`pca.rs` symbol `get_covariance`) builds `components_ᵀ·diag(exp_var_diff)·components_ + noise_variance_·I` = sklearn `_base.py:30-56`; `get_precision` (symbol `get_precision`/`precision_and_logdet`) symmetric-eigendecomposes it (same faer `eigen_dispatch` as `fit`) → `V diag(1/λ) Vᵀ` = the unique inverse of sklearn's lemma result (`_base.py:58-101`). In-module `pca_get_covariance_matches_sklearn`/`pca_get_precision_matches_sklearn` match the live sklearn 1.5.2 oracle element-wise to 1e-6. Consumer: `score_samples`/`score` call `precision_and_logdet`; re-export `lib.rs:98`. Was #1505, fixed |
 //! | REQ-15 | `score` / `score_samples` (Gaussian log-likelihood) + `noise_variance_` | SHIPPED | `fit` captures the FULL eigenvalue spectrum and sets `noise_variance_ = mean(sorted_eigenvalues[n_comp..min_dim])` = sklearn `_pca.py:685-688` (getter symbol `noise_variance`). `FittedPCA::score_samples` computes `ll_i = −0.5·(Xr_i·precision·Xr_iᵀ) − 0.5·(p·ln(2π) − logdet(precision))` (`logdet = −Σ ln(λ)`) = sklearn `_pca.py:805-830`; `score = mean(score_samples)` = `_pca.py:832-853`. In-module `pca_noise_variance_matches_sklearn`/`pca_score_samples_matches_sklearn`/`pca_score_matches_sklearn` match the live sklearn 1.5.2 oracle to 1e-6 (`whiten=false`). Consumer: `score`/`score_samples` consume `noise_variance_`+`get_precision`; re-export `lib.rs:98`. Was #1507, fixed |
 //! | REQ-16 | Fitted attrs `n_components_` / `n_features_in_` | SHIPPED | `FittedPCA::n_components_()` (= `components_.nrows()`) + `n_features_in_()` (= `mean_.len()`); `pca_n_components_and_n_features_in_match_sklearn` |
 //! | REQ-17 | ctor params `tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy` | NOT-STARTED | sklearn `_pca.py:407-423`; ferrolearn has `n_components` only — blocker #1509 |
 //! | REQ-18 | ferray substrate | NOT-STARTED | dense `ndarray` + direct `faer`/Jacobi — blocker #1510 |
 //!
-//! Count: **12 SHIPPED (REQ-1,3,4,5,6,7,8,9,10,11,14,15) / 6 NOT-STARTED (REQ-2,12,13,16,17,18)**.
+//! Count: **13 SHIPPED (REQ-1,3,4,5,6,7,8,9,10,11,13a,14,15) / 6 NOT-STARTED
+//! (REQ-2,12,13b,16,17,18)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -73,6 +75,33 @@ use std::any::TypeId;
 // PCA (unfitted)
 // ---------------------------------------------------------------------------
 
+/// Specification of how many principal components to retain.
+///
+/// Mirrors the polymorphic `n_components` argument of sklearn's `PCA`
+/// (`sklearn/decomposition/_pca.py:407`,`:657-688`): an explicit integer, a
+/// variance-ratio float, or `None`. The `"mle"` (Minka automatic dimensionality)
+/// case is NOT yet supported (REQ-13b NOT-STARTED).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NComponents<F> {
+    /// Retain exactly this many components (an explicit integer count).
+    ///
+    /// Validated `1 <= count <= min(n_samples, n_features)` at [`Fit::fit`]
+    /// time. Equivalent to passing an `int` to sklearn `PCA(n_components=int)`.
+    Count(usize),
+    /// Retain the smallest number of components whose CUMULATIVE
+    /// explained-variance ratio is `>=` this value.
+    ///
+    /// The value must lie in `(0, 1]`. Mirrors sklearn's float `n_components`
+    /// branch (`sklearn/decomposition/_pca.py:659-681`): it computes the cumsum
+    /// of the FULL `explained_variance_ratio_` and selects
+    /// `n_components_ = searchsorted(ratio_cumsum, ratio, side="right") + 1`
+    /// (clamped to `min(n_samples, n_features)`).
+    Ratio(F),
+    /// Auto: retain `min(n_samples, n_features)` components (sklearn
+    /// `n_components=None`, `sklearn/decomposition/_pca.py:523-527`,`:685`).
+    Auto,
+}
+
 /// Principal Component Analysis configuration.
 ///
 /// Holds the `n_components` hyperparameter. Calling [`Fit::fit`] centres
@@ -80,8 +109,9 @@ use std::any::TypeId;
 /// and returns a [`FittedPCA`] that can project new data.
 #[derive(Debug, Clone)]
 pub struct PCA<F> {
-    /// The number of principal components to retain.
-    n_components: usize,
+    /// How many principal components to retain (explicit count, variance ratio,
+    /// or auto). See [`NComponents`].
+    n_components: NComponents<F>,
     /// When `true`, [`Transform::transform`] divides each projected component
     /// by `sqrt(explained_variance_)` so the transformed output has unit
     /// component-wise variance, and [`FittedPCA::inverse_transform`]
@@ -89,11 +119,15 @@ pub struct PCA<F> {
     /// (`sklearn/decomposition/_base.py:157-165` for the transform scale,
     /// `:192-196` for the inverse un-scale). Defaults to `false`.
     whiten: bool,
-    _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> PCA<F> {
-    /// Create a new `PCA` that retains `n_components` principal components.
+    /// Create a new `PCA` that retains exactly `n_components` principal
+    /// components (an explicit integer count, [`NComponents::Count`]).
+    ///
+    /// Backward-compatible with the historical `usize`-only constructor. For a
+    /// variance-ratio target use [`PCA::with_variance_ratio`]; for the
+    /// `min(n_samples, n_features)` auto default use [`PCA::auto`].
     ///
     /// Whitening is disabled by default (sklearn `whiten=False`); enable it
     /// with [`PCA::with_whiten`].
@@ -105,9 +139,34 @@ impl<F: Float + Send + Sync + 'static> PCA<F> {
     #[must_use]
     pub fn new(n_components: usize) -> Self {
         Self {
-            n_components,
+            n_components: NComponents::Count(n_components),
             whiten: false,
-            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Create a `PCA` that retains the smallest number of components whose
+    /// cumulative explained-variance ratio is `>= ratio` ([`NComponents::Ratio`]).
+    ///
+    /// `ratio` must lie in `(0, 1]`; this is validated at [`Fit::fit`] time
+    /// (an out-of-range value yields [`FerroError::InvalidParameter`]). Mirrors
+    /// sklearn's float `n_components` branch
+    /// (`sklearn/decomposition/_pca.py:659-681`).
+    #[must_use]
+    pub fn with_variance_ratio(ratio: F) -> Self {
+        Self {
+            n_components: NComponents::Ratio(ratio),
+            whiten: false,
+        }
+    }
+
+    /// Create a `PCA` that retains `min(n_samples, n_features)` components
+    /// ([`NComponents::Auto`], sklearn `n_components=None`,
+    /// `sklearn/decomposition/_pca.py:523-527`).
+    #[must_use]
+    pub fn auto() -> Self {
+        Self {
+            n_components: NComponents::Auto,
+            whiten: false,
         }
     }
 
@@ -123,10 +182,14 @@ impl<F: Float + Send + Sync + 'static> PCA<F> {
         self
     }
 
-    /// Return the number of components this PCA is configured to retain.
+    /// Return the [`NComponents`] specification this PCA is configured with.
+    ///
+    /// This is the requested spec (count / variance-ratio / auto), NOT the
+    /// resolved integer count — that is available on the fitted model via
+    /// [`FittedPCA::n_components_`].
     #[must_use]
-    pub fn n_components(&self) -> usize {
-        self.n_components
+    pub fn n_components(&self) -> &NComponents<F> {
+        &self.n_components
     }
 
     /// Return whether whitening is enabled.
@@ -726,29 +789,41 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `n_components` is zero or exceeds
-    ///   the number of features.
+    /// - [`FerroError::InvalidParameter`] if `n_components` is an explicit count
+    ///   that is zero or exceeds the number of features, or a variance ratio
+    ///   outside `(0, 1]`.
     /// - [`FerroError::InsufficientSamples`] if there are fewer than 2 samples.
     /// - [`FerroError::ConvergenceFailure`] if the Jacobi eigendecomposition
     ///   does not converge.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedPCA<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
-        if self.n_components == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: "must be at least 1".into(),
-            });
+        // Validate the `n_components` SPEC eagerly. The explicit-count checks are
+        // unchanged from the historical `usize` path; the ratio range check is
+        // new (`Ratio`/`Auto` resolution to an integer count happens AFTER the
+        // eigendecomposition, mirroring sklearn `_pca.py:657-688`).
+        match self.n_components {
+            NComponents::Count(0) => {
+                return Err(FerroError::InvalidParameter {
+                    name: "n_components".into(),
+                    reason: "must be at least 1".into(),
+                });
+            }
+            NComponents::Count(k) if k > n_features => {
+                return Err(FerroError::InvalidParameter {
+                    name: "n_components".into(),
+                    reason: format!("n_components ({k}) exceeds n_features ({n_features})"),
+                });
+            }
+            NComponents::Ratio(r) if !(r > F::zero() && r <= F::one()) => {
+                return Err(FerroError::InvalidParameter {
+                    name: "n_components".into(),
+                    reason: "variance ratio must be in (0, 1]".into(),
+                });
+            }
+            _ => {}
         }
-        if self.n_components > n_features {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: format!(
-                    "n_components ({}) exceeds n_features ({})",
-                    self.n_components, n_features
-                ),
-            });
-        }
+
         if n_samples < 2 {
             return Err(FerroError::InsufficientSamples {
                 required: 2,
@@ -794,7 +869,49 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
 
         let total_variance = eigenvalues.iter().copied().fold(F::zero(), |a, b| a + b);
 
-        let n_comp = self.n_components;
+        // Resolve the requested `n_components` SPEC into an integer count
+        // (`n_components_`), mirroring sklearn's post-decomposition postprocess
+        // (`_pca.py:657-688`): the full SVD/eigendecomposition is computed FIRST,
+        // then `None`/float `n_components` is resolved against the FULL spectrum.
+        let min_dim = n_samples.min(n_features);
+        let n_comp = match self.n_components {
+            // Explicit count: validated above; clamp to `min_dim` for the rare
+            // `n_features < k <= ... ` case is unnecessary (k <= n_features), but
+            // when `n_samples < n_features` the trailing components are zero —
+            // sklearn keeps them, so we keep `k` as-is.
+            NComponents::Count(k) => k,
+            // Variance ratio: select the smallest count whose CUMULATIVE
+            // explained-variance ratio is `>=` the threshold. sklearn computes
+            // `n_components_ = searchsorted(ratio_cumsum, r, side="right") + 1`
+            // (`_pca.py:680-681`), which equals `1 + count(ratio_cumsum[i] <= r)`.
+            // The cumsum is over the FULL descending `explained_variance_ratio_`.
+            NComponents::Ratio(r) => {
+                let mut cum = F::zero();
+                let mut count_le = 0usize;
+                for &idx in &indices {
+                    let eigval = eigenvalues[idx];
+                    let eigval_clamped = if eigval < F::zero() {
+                        F::zero()
+                    } else {
+                        eigval
+                    };
+                    let ratio = if total_variance > F::zero() {
+                        eigval_clamped / total_variance
+                    } else {
+                        F::zero()
+                    };
+                    cum = cum + ratio;
+                    if cum <= r {
+                        count_le += 1;
+                    }
+                }
+                (count_le + 1).min(min_dim)
+            }
+            // Auto (sklearn `n_components=None`): keep all `min(n_samples,
+            // n_features)` components (`_pca.py:523-527`,`:685`).
+            NComponents::Auto => min_dim,
+        };
+
         let mut components = Array2::<F>::zeros((n_comp, n_features));
         let mut explained_variance = Array1::<F>::zeros(n_comp);
         let mut explained_variance_ratio = Array1::<F>::zeros(n_comp);
@@ -854,7 +971,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
         // (same `1/(n−1)` scaling as `explained_variance_`), so we average the
         // sorted eigenvalues directly (negatives clipped to 0, matching the
         // `explained_variance_` clip at `_pca.py:637`).
-        let min_dim = n_samples.min(n_features);
         let noise_variance = if n_comp < min_dim {
             let mut tail_sum = F::zero();
             for &idx in indices.iter().take(min_dim).skip(n_comp) {
@@ -1214,7 +1330,7 @@ mod tests {
     #[test]
     fn test_pca_n_components_getter() {
         let pca = PCA::<f64>::new(3);
-        assert_eq!(pca.n_components(), 3);
+        assert_eq!(pca.n_components(), &NComponents::Count(3));
     }
 
     #[test]
@@ -1455,5 +1571,75 @@ mod tests {
         // sklearn m.score(X) = -3.736593186111911
         assert_abs_diff_eq!(fitted.score(&x)?, -3.736_593_186_111_911, epsilon = 1e-6);
         Ok(())
+    }
+
+    // ---- REQ-13a: n_components as variance ratio / auto (None) -----------
+    //
+    // Oracle = live scikit-learn 1.5.2 (R-CHAR-3), run from /tmp:
+    //   X = [[1,2,3],[4,5,6],[7,8,10],[2,1,0],[5,3,2],[6,7,5]]  (6x3)
+    //   PCA(n_components=3).fit(X).explained_variance_ratio_
+    //     = [0.898229, 0.088879, 0.012892]
+    //   cumsum                = [0.898229, 0.987108, 1.0]
+    //   PCA(n_components=0.95 ).fit(X).n_components_ == 2
+    //   PCA(n_components=0.5  ).fit(X).n_components_ == 1
+    //   PCA(n_components=0.999).fit(X).n_components_ == 3
+    //   PCA(n_components=None ).fit(X).n_components_ == 3  (= min(6,3))
+    // sklearn `_pca.py:659-681` (float cumsum) / `:685` (None=auto).
+
+    fn ratio_fixture() -> Array2<f64> {
+        array![
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [7.0, 8.0, 10.0],
+            [2.0, 1.0, 0.0],
+            [5.0, 3.0, 2.0],
+            [6.0, 7.0, 5.0],
+        ]
+    }
+
+    #[test]
+    fn pca_n_components_ratio_095_selects_2() -> Result<(), FerroError> {
+        // cumsum [0.898229, 0.987108, 1.0]: searchsorted(.,0.95,"right")+1 = 1+1 = 2.
+        let x = ratio_fixture();
+        let fitted = PCA::<f64>::with_variance_ratio(0.95).fit(&x, &())?;
+        assert_eq!(fitted.n_components_(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn pca_n_components_ratio_05_selects_1() -> Result<(), FerroError> {
+        // 0.5 < 0.898229 (first cumsum entry): selects 1 component.
+        let x = ratio_fixture();
+        let fitted = PCA::<f64>::with_variance_ratio(0.5).fit(&x, &())?;
+        assert_eq!(fitted.n_components_(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn pca_n_components_ratio_0999_selects_3() -> Result<(), FerroError> {
+        // 0.999 > 0.987108 (second cumsum entry): selects all 3 components.
+        let x = ratio_fixture();
+        let fitted = PCA::<f64>::with_variance_ratio(0.999).fit(&x, &())?;
+        assert_eq!(fitted.n_components_(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn pca_n_components_auto_selects_all() -> Result<(), FerroError> {
+        // sklearn n_components=None -> min(n_samples=6, n_features=3) = 3.
+        let x = ratio_fixture();
+        let fitted = PCA::<f64>::auto().fit(&x, &())?;
+        assert_eq!(fitted.n_components_(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn pca_n_components_ratio_validation_rejects() {
+        // Variance ratio must be in (0, 1]: 0.0 and 1.5 are out of range.
+        let x = ratio_fixture();
+        let too_low = PCA::<f64>::with_variance_ratio(0.0).fit(&x, &());
+        assert!(matches!(too_low, Err(FerroError::InvalidParameter { .. })));
+        let too_high = PCA::<f64>::with_variance_ratio(1.5).fit(&x, &());
+        assert!(matches!(too_high, Err(FerroError::InvalidParameter { .. })));
     }
 }
