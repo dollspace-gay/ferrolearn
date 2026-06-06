@@ -421,6 +421,76 @@ fn csr_get_absent_is_zero() {
     assert_eq!(a.get(0, 1).unwrap(), 0.0);
 }
 
+/// REQ-MISSING-INDEX (rows). `getrow(i)` returns row `i` as a `(1, n_cols)` CSR,
+/// matching scipy `A.getrow(i)` (`_matrix.py:110` -> `_getrow`, `_base.py:1116`,
+/// "(1 x n) row vector").
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+///   print(A.getrow(0).shape, A.getrow(0).toarray().tolist(),
+///         A.getrow(1).toarray().tolist())"`):
+/// `(1, 3) [[1.0, 0.0, 2.0]] [[0.0, 3.0, 0.0]]`.
+#[test]
+fn csr_getrow_matches_scipy() {
+    let a = sample_a();
+    let r0 = a.getrow(0).unwrap();
+    assert_eq!(r0.n_rows(), 1);
+    assert_eq!(r0.n_cols(), 3);
+    let d0 = r0.to_dense();
+    assert_eq!(d0[[0, 0]], 1.0);
+    assert_eq!(d0[[0, 1]], 0.0);
+    assert_eq!(d0[[0, 2]], 2.0);
+
+    let r1 = a.getrow(1).unwrap();
+    let d1 = r1.to_dense();
+    assert_eq!(d1[[0, 0]], 0.0);
+    assert_eq!(d1[[0, 1]], 3.0);
+    assert_eq!(d1[[0, 2]], 0.0);
+}
+
+/// REQ-MISSING-INDEX (cols). `getcol(j)` returns column `j` as a `(n_rows, 1)`
+/// CSR, matching scipy `A.getcol(j)` (`_matrix.py:104` -> `_getcol`,
+/// `_base.py:1097`, "(m x 1) column vector").
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+///   print(A.getcol(0).shape, A.getcol(0).toarray().tolist(),
+///         A.getcol(2).toarray().tolist())"`):
+/// `(3, 1) [[1.0], [0.0], [4.0]] [[2.0], [0.0], [5.0]]`.
+#[test]
+fn csr_getcol_matches_scipy() {
+    let a = sample_a();
+    let c0 = a.getcol(0).unwrap();
+    assert_eq!(c0.n_rows(), 3);
+    assert_eq!(c0.n_cols(), 1);
+    let d0 = c0.to_dense();
+    assert_eq!(d0[[0, 0]], 1.0);
+    assert_eq!(d0[[1, 0]], 0.0);
+    assert_eq!(d0[[2, 0]], 4.0);
+
+    let c2 = a.getcol(2).unwrap();
+    let d2 = c2.to_dense();
+    assert_eq!(d2[[0, 0]], 2.0);
+    assert_eq!(d2[[1, 0]], 0.0);
+    assert_eq!(d2[[2, 0]], 5.0);
+}
+
+/// REQ-MISSING-INDEX (rows/cols) / REQ-ERR. An out-of-bounds row/column index to
+/// `getrow`/`getcol` returns `Err(InvalidParameter)`, where scipy raises
+/// `IndexError("index out of bounds")` (`_base.py:1110`/`:1129`).
+#[test]
+fn csr_getrow_getcol_out_of_bounds_is_err() {
+    let a = sample_a();
+    assert!(matches!(
+        a.getrow(3),
+        Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+    ));
+    assert!(matches!(
+        a.getcol(3),
+        Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+    ));
+}
+
 /// REQ-MISSING-INDEX (element access) / REQ-ERR. An out-of-bounds index returns
 /// `Err(InvalidParameter)`, where scipy raises `IndexError: index (...) out of
 /// range` (`_index.py:388`).
