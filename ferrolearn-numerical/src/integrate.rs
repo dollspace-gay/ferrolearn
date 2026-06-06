@@ -17,7 +17,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Values are oracle-verified
 //! element-wise (R-CHAR-3) — see `tests/divergence_integrate.rs`.
 //!
-//! **3 SHIPPED / 6 NOT-STARTED.**
+//! **4 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -27,7 +27,7 @@
 //! | REQ-4 (`quad` API / return contract) | NOT-STARTED | scipy.integrate.quad returns `(value, abserr)` + epsabs/epsrel/limit/points/weight; `fixed_quad` needs a vectorized func. ferrolearn `quad(f,a,b,tol)→QuadratureResult`, `gauss_legendre` scalar `Fn`. Blocker #1972. |
 //! | REQ-5 (missing scipy.integrate fns) | NOT-STARTED | no `trapezoid`/`simpson`/`romberg`/`cumulative_*`/`newton_cotes`/`dblquad`/`quad_vec` + ODE family (solve_ivp/odeint/RK45). Blocker #1973. |
 //! | REQ-6 (infinite bounds / singularities / weights) | NOT-STARTED | only finite smooth `[a,b]`; `±inf` → nan, no `points=`/`weight=` (scipy qagi → √π). Blocker #1974. |
-//! | REQ-7 (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`; `quad` has no error channel. Blocker #1975. |
+//! | REQ-7 (error type) | SHIPPED | FIXED #1975: `gauss_legendre`/`gauss_legendre_composite`/`gl_nodes_weights` now return `Result<_, FerroError>`; every invalid-parameter site returns `FerroError::InvalidParameter { name, reason }` (the ferrolearn analog of scipy's `ValueError` on an invalid quadrature order / `n_panels`), with the original messages preserved (`"Gauss-Legendre order must be in 1..=20, got {n}"`, `"n_panels must be at least 1"`). Pinned by `gauss_legendre_invalid_order_returns_ferroerror` / `gauss_legendre_composite_invalid_npanels_returns_ferroerror` in `tests/divergence_integrate.rs`. Noted remainder: `quad`/`quad_with_limit` still have no error channel (a bare `QuadratureResult`) — a separate sub-concern, not fixed here. |
 //! | REQ-8 (production consumer) | NOT-STARTED | no non-test caller (standalone module). Blocker #1976. |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | hand-rolled Golub-Welsch QR eigensolver vs `ferray::linalg` (R-SUBSTRATE-1). Blocker #1977. |
 //!
@@ -44,6 +44,8 @@
 //! let result = gauss_legendre(|x| x * x, 0.0, 1.0, 5).unwrap();
 //! assert!((result.value - 1.0 / 3.0).abs() < 1e-14);
 //! ```
+
+use ferrolearn_core::error::FerroError;
 
 // ---------------------------------------------------------------------------
 // Result type
@@ -259,8 +261,10 @@ impl<F: Fn(f64) -> f64> SimpsonContext<F> {
 ///
 /// # Errors
 ///
-/// Returns an error string if `n` is 0 or greater than 20.
-pub fn gauss_legendre<F>(f: F, a: f64, b: f64, n: usize) -> Result<QuadratureResult, String>
+/// Returns [`FerroError::InvalidParameter`] if `n` is 0 or greater than 20
+/// (the ferrolearn analog of scipy's `ValueError` on an invalid quadrature
+/// order).
+pub fn gauss_legendre<F>(f: F, a: f64, b: f64, n: usize) -> Result<QuadratureResult, FerroError>
 where
     F: Fn(f64) -> f64,
 {
@@ -286,20 +290,24 @@ where
 ///
 /// # Errors
 ///
-/// Returns an error string if `n_points` is 0 or greater than 20, or if
-/// `n_panels` is 0.
+/// Returns [`FerroError::InvalidParameter`] if `n_points` is 0 or greater than
+/// 20, or if `n_panels` is 0 (the ferrolearn analog of scipy's `ValueError` on
+/// an invalid quadrature parameter).
 pub fn gauss_legendre_composite<F>(
     f: F,
     a: f64,
     b: f64,
     n_points: usize,
     n_panels: usize,
-) -> Result<QuadratureResult, String>
+) -> Result<QuadratureResult, FerroError>
 where
     F: Fn(f64) -> f64,
 {
     if n_panels == 0 {
-        return Err("n_panels must be at least 1".to_string());
+        return Err(FerroError::InvalidParameter {
+            name: "n_panels".into(),
+            reason: "n_panels must be at least 1".into(),
+        });
     }
 
     let (nodes, weights) = gl_nodes_weights(n_points)?;
@@ -354,9 +362,12 @@ where
 ///
 /// Orders 1--10 use hardcoded tables; orders 11--20 are computed via the
 /// Golub-Welsch algorithm.
-fn gl_nodes_weights(n: usize) -> Result<(Vec<f64>, Vec<f64>), String> {
+fn gl_nodes_weights(n: usize) -> Result<(Vec<f64>, Vec<f64>), FerroError> {
     if n == 0 || n > 20 {
-        return Err(format!("Gauss-Legendre order must be in 1..=20, got {n}"));
+        return Err(FerroError::InvalidParameter {
+            name: "n".into(),
+            reason: format!("Gauss-Legendre order must be in 1..=20, got {n}"),
+        });
     }
 
     if n <= 10 {

@@ -46,6 +46,7 @@
 //! filed as `-l blocker` issues, not pinned as failing tests (they are
 //! structural facts, not numerical assertions).
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_numerical::integrate::{gauss_legendre, gauss_legendre_composite, quad};
 
 /// Exact `n`-point Gauss-Legendre rule for `∫₀¹ eˣ dx`, n = 1..=20, computed
@@ -228,5 +229,45 @@ fn quad_arctan_converges_to_scipy_value() {
     assert!(
         diff <= 1e-9,
         "quad arctan: ferrolearn={got:.17e} scipy-oracle={SCIPY_QUAD_ARCTAN:.17e} diff={diff:.3e} > 1e-9"
+    );
+}
+
+// ===========================================================================
+// (4) GREEN GUARD — REQ-7: error type is `FerroError`.
+//
+// scipy raises `ValueError` on an invalid quadrature parameter (e.g. an
+// invalid Gauss order or panel count). The ferrolearn library error contract
+// (CLAUDE.md / R-CODE-2) expresses that as `FerroError::InvalidParameter`, not
+// the previous `Result<_, String>`. These guards pin the error TYPE.
+// ===========================================================================
+
+/// Green guard: an out-of-range Gauss-Legendre order (`0` and `21`, both
+/// outside the supported `1..=20`) returns `FerroError::InvalidParameter`,
+/// mirroring scipy's `ValueError` on an invalid quadrature order.
+#[test]
+fn gauss_legendre_invalid_order_returns_ferroerror() {
+    let too_small = gauss_legendre(|x: f64| x, 0.0, 1.0, 0);
+    assert!(
+        matches!(too_small, Err(FerroError::InvalidParameter { .. })),
+        "gauss_legendre order 0 should be Err(FerroError::InvalidParameter), got {too_small:?}"
+    );
+
+    let too_large = gauss_legendre(|x: f64| x, 0.0, 1.0, 21);
+    assert!(
+        matches!(too_large, Err(FerroError::InvalidParameter { .. })),
+        "gauss_legendre order 21 should be Err(FerroError::InvalidParameter), got {too_large:?}"
+    );
+}
+
+/// Green guard: `gauss_legendre_composite` with `n_panels = 0` returns
+/// `FerroError::InvalidParameter`, mirroring scipy's `ValueError` on an
+/// invalid quadrature parameter.
+#[test]
+fn gauss_legendre_composite_invalid_npanels_returns_ferroerror() {
+    // Signature: gauss_legendre_composite(f, a, b, n_points, n_panels).
+    let got = gauss_legendre_composite(|x: f64| x, 0.0, 1.0, 5, 0);
+    assert!(
+        matches!(got, Err(FerroError::InvalidParameter { .. })),
+        "gauss_legendre_composite n_panels=0 should be Err(FerroError::InvalidParameter), got {got:?}"
     );
 }
