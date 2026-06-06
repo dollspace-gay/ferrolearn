@@ -156,7 +156,7 @@ class Lasso(RegressorMixin, BaseEstimator):
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
         self.intercept_ = float(self._rs.intercept_)
-        self.n_iter_ = self.max_iter
+        self.n_iter_ = int(self._rs.n_iter_)
         return self
 
     def predict(self, X):
@@ -215,7 +215,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
         self.intercept_ = float(self._rs.intercept_)
-        self.n_iter_ = self.max_iter
+        self.n_iter_ = int(self._rs.n_iter_)
         return self
 
     def predict(self, X):

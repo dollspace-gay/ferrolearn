@@ -231,3 +231,48 @@ def test_green_all_four_score_present():
         est.fit(_X, _y)
         assert hasattr(est, "coef_") and hasattr(est, "intercept_")
         assert len(est.predict(_X)) == _X.shape[0]
+
+
+# Distinct fixture: a 6-sample problem where the CD solver converges in a small,
+# fixed number of sweeps (sklearn n_iter_ == 2 here), so the parity is exact and
+# unambiguously below max_iter (1000) — proving n_iter_ is no longer the FAKE.
+_X_NITER = np.array(
+    [[1.0, 2.0], [3.0, 4.0], [5.0, 7.0], [2.0, 1.0], [0.0, 3.0], [6.0, 5.0]]
+)
+_y_NITER = np.array([1.0, 2.0, 3.0, 1.5, 0.8, 4.2])
+
+
+def test_lasso_elasticnet_n_iter_matches_sklearn():
+    """`ferrolearn.Lasso`/`ElasticNet` expose the REAL coordinate-descent
+    iteration count, matching sklearn EXACTLY — no longer the FAKE `max_iter`.
+
+    Was: `_regressors.py::{Lasso,ElasticNet}.fit` set `self.n_iter_ =
+    self.max_iter` (hardcoded 1000). Now they read the real count from the Rust
+    `_RsLasso`/`_RsElasticNet` `n_iter_` getter over `FittedLasso`/
+    `FittedElasticNet::n_iter()`, which is bit-faithful to sklearn's dual-gap CD
+    stopping (`ferrolearn-linear` REQ-11/12). Mirrors sklearn's actual count
+    `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`,
+    single-target collapse `:1106`).
+
+    Oracle (R-CHAR-3): expected value comes from the LIVE sklearn 1.5.2 call in
+    this test, never copied from ferrolearn. (On this fixture sklearn yields
+    n_iter_ == 2 for all three configs.)
+    """
+    # Lasso(alpha=0.5): exact parity with the live sklearn n_iter_.
+    sk_lasso = SkLasso(alpha=0.5).fit(_X_NITER, _y_NITER)
+    fr_lasso = fl.Lasso(alpha=0.5).fit(_X_NITER, _y_NITER)
+    assert fr_lasso.n_iter_ == sk_lasso.n_iter_
+    # No longer faked at max_iter (1000): the real count is far below it.
+    assert fr_lasso.n_iter_ < fr_lasso.max_iter
+
+    # ElasticNet(alpha=0.5): same exact parity.
+    sk_enet = SkElasticNet(alpha=0.5).fit(_X_NITER, _y_NITER)
+    fr_enet = fl.ElasticNet(alpha=0.5).fit(_X_NITER, _y_NITER)
+    assert fr_enet.n_iter_ == sk_enet.n_iter_
+    assert fr_enet.n_iter_ < fr_enet.max_iter
+
+    # Lasso(alpha=0.1): a second alpha to guard against a coincidental match.
+    sk_lasso2 = SkLasso(alpha=0.1).fit(_X_NITER, _y_NITER)
+    fr_lasso2 = fl.Lasso(alpha=0.1).fit(_X_NITER, _y_NITER)
+    assert fr_lasso2.n_iter_ == sk_lasso2.n_iter_
+    assert fr_lasso2.n_iter_ < fr_lasso2.max_iter
