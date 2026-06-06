@@ -19,7 +19,7 @@
 //! blocker). Verified via `tests/divergence_classifiers.py` +
 //! `tests/test_check_estimator.py` (553 pytest pass).
 //!
-//! **19 SHIPPED / 9 NOT-STARTED.**
+//! **20 SHIPPED / 8 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -38,7 +38,7 @@
 //! | REQ-RF-NESTIMATORS-POSITIONAL (n_estimators positional ABI) | SHIPPED | FIXED #2045: `_classifiers.py::RandomForestClassifier.__init__(self, n_estimators=100, *, ...)` moves `n_estimators` before the `*`, so `ferrolearn.RandomForestClassifier(10).n_estimators == 10` matching sklearn `_forest.py:1494`. Guard `test_red_rf_n_estimators_positional`. |
 //! | REQ-RF-FEATURE-IMPORTANCES (feature_importances_ surfaced) | SHIPPED | FIXED #2048: the wrapper `fit` now reads the pre-existing Rust getter (over `FittedRandomForestClassifier::feature_importances`) — `(n_features,)` summing to 1.0. Guard `test_red_rf_feature_importances_exposed`. |
 //! | REQ-RF-VALUE-PARITY (pred/predict_proba parity at random_state) | SHIPPED | deterministic contract: downstream `ferrolearn-tree` REQ-4/5/9 verify soft-vote argmax + proba-mean + seeded reproducibility. (Exact numpy-MT bootstrap parity is the documented RNG boundary #673.) |
-//! | REQ-RF-PREDICT-PROBA (predict_proba surfaced) | NOT-STARTED | neither the wrapper nor `RsRandomForestClassifier` exposes `predict_proba`, though `FittedRandomForestClassifier::predict_proba` EXISTS; sklearn `_forest.py:922`. Needs a Rust binding addition — #2050. |
+//! | REQ-RF-PREDICT-PROBA (predict_proba surfaced) | SHIPPED | FIXED #2050: `RsRandomForestClassifier::predict_proba` binds the existing `FittedRandomForestClassifier::predict_proba` (soft-vote mean of per-tree class probabilities, `random_forest.rs:432`), surfaced by `_classifiers.py::RandomForestClassifier.predict_proba` — `(n_samples, n_classes)` rows summing to 1.0, with `predict == classes_[argmax(predict_proba)]` matching sklearn `_forest.py:922`/`:883`. Guard `test_red_rf_predict_proba_surfaced`. |
 //! | REQ-RF-PARAMS (criterion/max_features/bootstrap/oob_score/max_samples/class_weight/n_jobs/warm_start/ccp_alpha/max_leaf_nodes/min_impurity_decrease) | NOT-STARTED | the wrapper exposes `n_estimators`/`max_depth`/`min_samples_split`/`min_samples_leaf`/`random_state` only; sklearn `_forest.py:1494`. Default sqrt/gini/bootstrap MATCHES — downstream #671/#672/#675/#676. |
 //! | REQ-KNN-API-CONFORM (fit/predict + classes_, default uniform) | SHIPPED | `RsKNeighborsClassifier::*` + getter, wrapped by `_classifiers.py::KNeighborsClassifier` — mirroring `neighbors/_classification.py:39`/`:240`. |
 //! | REQ-KNN-NNEIGHBORS-POSITIONAL (n_neighbors positional ABI) | SHIPPED | FIXED #2046: `_classifiers.py::KNeighborsClassifier.__init__(self, n_neighbors=5)` drops the keyword-only `*`, so `ferrolearn.KNeighborsClassifier(3).n_neighbors == 3` matching sklearn `_classification.py:193`. Guard `test_red_knn_n_neighbors_positional`. |
@@ -320,6 +320,22 @@ impl RsRandomForestClassifier {
             .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
+    }
+
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let proba = fitted
+            .predict_proba(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &proba))
     }
 
     #[getter]

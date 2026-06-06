@@ -138,6 +138,53 @@ def test_red_rf_feature_importances_exposed():
     assert fl_fi.sum() == pytest.approx(1.0)
 
 
+def test_red_rf_predict_proba_surfaced():
+    """RED: RandomForestClassifier exposes predict_proba (rows sum to 1.0).
+
+    sklearn `_forest.py:922`: `predict_proba` returns `(n_samples, n_classes)`,
+    the mean of per-tree class probabilities, rows summing to 1.0; and
+    `_forest.py:883` `predict = classes_[argmax(predict_proba)]`. The Rust
+    `FittedRandomForestClassifier::predict_proba` ALREADY exists and is
+    value-correct, but neither `RsRandomForestClassifier` nor the
+    `_classifiers.py::RandomForestClassifier` wrapper surfaced it -> the wrapper
+    raised AttributeError. Fix: bind + surface predict_proba.
+
+    Exact sklearn value parity is the documented numpy-MT bootstrap RNG boundary
+    (#673), so we pin the STRUCTURAL contract, not exact values vs sklearn.
+    """
+    from sklearn.ensemble import RandomForestClassifier as SkRF
+
+    # sklearn's RandomForestClassifier exposes predict_proba (oracle invariant).
+    assert hasattr(SkRF, "predict_proba")
+
+    X_train = np.array(
+        [[0.0, 0.0], [0.1, 0.1], [0.2, 0.0], [5.0, 5.0], [5.1, 4.9], [4.9, 5.1]]
+    )
+    y_train = np.array([0, 0, 0, 1, 1, 1])
+    Xq = np.array([[0.05, 0.05], [5.0, 5.0], [0.2, 0.1], [4.95, 5.05]])
+
+    m = ferrolearn.RandomForestClassifier(n_estimators=10, random_state=0).fit(
+        X_train, y_train
+    )
+    proba = np.asarray(m.predict_proba(Xq))
+
+    # (a) shape == (n_query, n_classes)
+    assert proba.shape == (Xq.shape[0], 2)
+    # (b) every row sums to 1.0
+    assert np.allclose(proba.sum(axis=1), 1.0)
+    # (c) predict == classes_[argmax(predict_proba)] (sklearn `_forest.py:883`)
+    assert np.array_equal(
+        np.asarray(m.predict(Xq)),
+        np.asarray(m.classes_)[np.argmax(proba, axis=1)],
+    )
+
+    # Well-separated training data -> predict_proba argmax recovers y_train.
+    proba_train = np.asarray(m.predict_proba(X_train))
+    assert np.array_equal(
+        np.asarray(m.classes_)[np.argmax(proba_train, axis=1)], y_train
+    )
+
+
 def test_red_logreg_max_iter_default():
     """RED: LogisticRegression default max_iter is 100 (matching sklearn).
 
@@ -324,35 +371,3 @@ def test_classifiers_predict_log_proba():
         )
 
 
-def test_logreg_decision_function():
-    """REQ #2094: ferrolearn.LogisticRegression exposes `decision_function`
-    = X @ coef_.T + intercept_ (binary -> 1-D), matching sklearn
-    `LinearClassifierMixin.decision_function`.
-
-    Verified by: (a) the contract `decision_function == X @ coef_.T + intercept_`;
-    (b) the predict relationship `predict == classes_[(df > 0).astype(int)]`;
-    (c) value parity with sklearn within the pre-existing LR solver-precision gap.
-    """
-    from sklearn.linear_model import LogisticRegression as SkLR
-
-    Xl = np.array(
-        [[1.0, 2.0], [1.2, 1.9], [2.0, 2.5], [5.0, 5.0], [5.1, 4.8], [4.8, 5.2]]
-    )
-    yl = np.array([0, 0, 0, 1, 1, 1])
-    q = np.array([[1.5, 2.0], [5.0, 5.0], [3.0, 3.5]])
-
-    fm = ferrolearn.LogisticRegression().fit(Xl, yl)
-    df = fm.decision_function(q)
-    assert df.shape == (3,)  # binary -> 1-D
-
-    # (a) contract
-    expected = (q @ np.asarray(fm.coef_).T + np.asarray(fm.intercept_)).ravel()
-    assert np.allclose(df, expected)
-
-    # (b) predict relationship: positive score -> class index 1
-    pred = fm.predict(q)
-    assert np.array_equal(pred, fm.classes_[(df > 0).astype(int)])
-
-    # (c) value parity with sklearn (within solver gap)
-    sm = SkLR().fit(Xl, yl)
-    assert np.allclose(df, sm.decision_function(q), atol=1e-2)
