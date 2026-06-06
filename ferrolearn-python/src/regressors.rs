@@ -17,14 +17,15 @@
 //! `tests/divergence_regressors.py` + `tests/test_check_estimator.py` +
 //! `tests/test_cross_val_score.py` (616 pytest pass).
 //!
-//! **17 SHIPPED / 5 NOT-STARTED.**
+//! **18 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
 //! | REQ-LINREG-API-CONFORM (fit/predict + coef_/intercept_) | SHIPPED | `RsLinearRegression::fit`/`predict` + getters `coef_`/`intercept_`, wrapped by `_regressors.py::LinearRegression` (+ `n_features_in_`, `score` from `RegressorMixin`) — mirroring `_base.py:582`. Live default-path oracle matches element-wise. |
 //! | REQ-LINREG-FIT-INTERCEPT-ABI (fit_intercept keyword-only) | SHIPPED | `LinearRegression.__init__(self, *, fit_intercept=True)` matches sklearn `_base.py:568` (the `*` is first). The only estimator whose constructor ABI already matched sklearn (Ridge/Lasso/ElasticNet diverged on `alpha`). |
 //! | REQ-LINREG-VALUE-PARITY (coef_/intercept_ array parity) | SHIPPED | default path: marshalled from the Rust getters; downstream `ferrolearn-linear` REQ-1/5 match the sklearn oracle ≤1e-8 (full-rank/rank-deficient/underdetermined min-norm OLS). (`positive=True` NNLS #371; multi-output #372.) |
-//! | REQ-LINREG-PARAMS (copy_X/n_jobs/positive) | NOT-STARTED | the wrapper exposes `fit_intercept` only; sklearn `_base.py:568-579`. Default full-rank OLS MATCHES, only the param surface is missing — downstream #371/#374. |
+//! | REQ-LINREG-RANK-SINGULAR (rank_/singular_ fitted attrs) | SHIPPED | impl `RsLinearRegression::rank_` getter (over `FittedLinearRegression<f64>`, via `fitted.rank()`, `linear_regression.rs:471`) + `RsLinearRegression::singular_` getter (via `fitted.singular_values()`, `linear_regression.rs:478`, marshalled through `ndarray1_to_numpy`), surfaced by `_regressors.py::LinearRegression.fit` which sets `self.rank_ = int(self._rs.rank_)` + `self.singular_ = np.array(self._rs.singular_)` (next to `coef_`/`intercept_`). Mirrors sklearn `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)` (`_base.py:687`; attr docstrings `rank_` `_base.py:505`, `singular_` `_base.py:508`). The downstream Rust captures both from the single-SVD `solve_lstsq` on the actually-solved (centered-when-`fit_intercept`) matrix, matching sklearn's `linalg.lstsq` operands (`ferrolearn-linear` REQ-9 SHIPPED #374). Non-test consumer: `_regressors.py::LinearRegression` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_linearregression_rank_singular_match_sklearn` asserts `fr.rank_ == sk.rank_` and `np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)` (live oracle, R-CHAR-3; on the 5×2 fixture sklearn yields `rank_=2`, `singular_=[4.24264069, 1.41421356]`). |
+//! | REQ-LINREG-PARAMS (copy_X/n_jobs/positive) | NOT-STARTED | the wrapper exposes `fit_intercept` only; sklearn `_base.py:568-579`. Default full-rank OLS MATCHES, only the param surface is missing — downstream #371/#374. (`rank_`/`singular_` surfaced separately — see REQ-LINREG-RANK-SINGULAR SHIPPED.) |
 //! | REQ-RIDGE-API-CONFORM (fit/predict + coef_/intercept_, default cholesky) | SHIPPED | `RsRidge::fit`/`predict` + getters, wrapped by `_regressors.py::Ridge` (marshals `alpha` via `with_alpha`) — mirroring `_ridge.py:914`. Live default-path oracle matches element-wise. |
 //! | REQ-RIDGE-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2040: `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True)` moves `alpha` before the `*`, so `ferrolearn.Ridge(0.5).alpha == 0.5` matching sklearn `_ridge.py:893`. Guard `test_red_ridge_alpha_positional`. |
 //! | REQ-RIDGE-VALUE-PARITY (coef_/intercept_ array parity, default cholesky) | SHIPPED | default path: downstream `ferrolearn-linear` REQ-1/5 match the sklearn `Ridge` oracle ≤1e-8 across alpha∈{0.1,1,10,100} (closed-form Cholesky, unpenalized intercept). (Per-target alpha #385, multi-output #384, alt solvers downstream.) |
@@ -114,6 +115,24 @@ impl RsLinearRegression {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.intercept())
+    }
+
+    #[getter]
+    fn rank_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.rank())
+    }
+
+    #[getter]
+    fn singular_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.singular_values()))
     }
 }
 

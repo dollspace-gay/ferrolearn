@@ -309,3 +309,34 @@ def test_lasso_elasticnet_dual_gap_matches_sklearn():
     fr_enet = fl.ElasticNet(alpha=0.3).fit(X, y)
     assert hasattr(fr_enet, "dual_gap_")
     assert abs(float(fr_enet.dual_gap_) - float(sk_enet.dual_gap_)) < 1e-9
+
+
+def test_linearregression_rank_singular_match_sklearn():
+    """`ferrolearn.LinearRegression` exposes the `rank_`/`singular_` fitted
+    attributes, matching sklearn EXACTLY.
+
+    sklearn sets `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)`
+    on the (centered-when-`fit_intercept`) design matrix
+    (`sklearn/linear_model/_base.py:687`; attr docstrings `rank_` `_base.py:505`
+    `int`, `singular_` `_base.py:508` 1-D array). The Rust
+    `FittedLinearRegression::rank()` / `singular_values()`
+    (`ferrolearn-linear/src/linear_regression.rs:471`/`:478`, REQ-9 #374) capture
+    both from the single-SVD `solve_lstsq` on the same operands; the binding
+    surfaces them via the `_RsLinearRegression` `rank_`/`singular_` getter, set in
+    `_regressors.py::LinearRegression.fit` as `self.rank_ = int(self._rs.rank_)` /
+    `self.singular_ = np.array(self._rs.singular_)`.
+
+    Oracle (R-CHAR-3): the expected values come from the LIVE sklearn 1.5.2 call
+    in this test, never copied from the ferrolearn side. (On this 5x2 fixture
+    sklearn yields `rank_ == 2`, `singular_ == [4.24264069, 1.41421356]`.)
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    y = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+
+    sk = SkLinearRegression().fit(X, y)
+    fr = fl.LinearRegression().fit(X, y)
+
+    assert hasattr(fr, "rank_")
+    assert hasattr(fr, "singular_")
+    assert fr.rank_ == sk.rank_
+    np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)

@@ -63,6 +63,8 @@ class LinearRegression(RegressorMixin, BaseEstimator):
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
         self.intercept_ = float(self._rs.intercept_)
+        self.rank_ = int(self._rs.rank_)
+        self.singular_ = np.array(self._rs.singular_)
         return self
 
     def predict(self, X):
