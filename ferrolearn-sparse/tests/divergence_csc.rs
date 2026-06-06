@@ -402,3 +402,31 @@ fn csc_matmul_shape_mismatch_is_err() {
         "inner-dimension-mismatched matmul must return Err (scipy raises ValueError)"
     );
 }
+
+// REQ-API-ACCESSORS — live scipy oracle (R-CHAR-3). Expected values from
+// `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   print(A.shape, A.data.tolist(), A.indices.tolist(), A.indptr.tolist())"`
+//   -> (3, 3) [1.0,4.0,3.0,2.0,5.0] [0,2,1,0,2] [0,2,3,5].
+// NOTE the CSC `data` order is COLUMN-major `[1,4,3,2,5]` (vs CSR's
+// `[1,2,3,4,5]`); `indices` are ROW indices and `indptr` is the COLUMN pointer.
+
+/// REQ-API-ACCESSORS. `shape()`/`data()`/`indices()`/`indptr()` match scipy's
+/// `.shape`/`.data`/`.indices`/`.indptr` (`_compressed.py:38`, `:76-78`).
+///
+/// `A` is built via `from_dense` so the stored arrays land in scipy's canonical
+/// CSC order; the assertion targets the live scipy CSC oracle exactly.
+#[test]
+fn csc_shape_data_indices_indptr_match_scipy() {
+    let dense = array![[1.0_f64, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]];
+    let a = CscMatrix::from_dense(&dense.view(), 0.0);
+    // scipy A.shape == (3, 3)
+    assert_eq!(a.shape(), (3, 3));
+    // scipy A.data == [1,4,3,2,5] (column-major CSC order)
+    assert_eq!(a.data(), &[1.0, 4.0, 3.0, 2.0, 5.0]);
+    // scipy A.indices == [0,2,1,0,2] (row indices)
+    assert_eq!(a.indices(), &[0, 2, 1, 0, 2]);
+    // scipy A.indptr == [0,2,3,5] (column pointer)
+    assert_eq!(a.indptr(), vec![0, 2, 3, 5]);
+}
