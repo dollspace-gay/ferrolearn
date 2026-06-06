@@ -330,3 +330,68 @@ fn coo_eliminate_zeros_matches_scipy() -> Result<(), FerroError> {
     }
     Ok(())
 }
+
+/// REQ-MISSING-METHODS (`max`/`min`). For an all-NEGATIVE sparse diagonal that is
+/// not fully dense, the implicit zero wins the `max()` (folded in), while `min()`
+/// is the most-negative stored value, mirroring scipy `coo_matrix.max()`/`.min()`
+/// (`_minmax_mixin._min_or_max`, `scipy/sparse/_data.py:208`-`:224` — implicit
+/// zero folded when `nnz != prod(shape)`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.coo_matrix((np.array([-3.,-1.,-5.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   print(A.max(), A.min())"`): `0.0 -5.0`.
+#[test]
+fn coo_max_folds_implicit_zero() -> Result<(), FerroError> {
+    let a = CooMatrix::<f64>::from_triplets(
+        3,
+        3,
+        vec![0, 1, 2],
+        vec![0, 1, 2],
+        vec![-3.0, -1.0, -5.0],
+    )?;
+    // scipy A.max() == 0.0 (implicit zero folded in: nnz 3 < 9)
+    assert_eq!(a.max(), 0.0);
+    // scipy A.min() == -5.0 (most-negative stored value)
+    assert_eq!(a.min(), -5.0);
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`max`/`min`). Symmetric: an all-POSITIVE sparse diagonal
+/// that is not fully dense folds the implicit zero into `min()`, while `max()` is
+/// the largest stored value, mirroring scipy `_minmax_mixin._min_or_max`
+/// (`scipy/sparse/_data.py:222`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   B=sp.coo_matrix((np.array([3.,1.,5.]),(np.array([0,1,2]),np.array([0,1,2]))),
+///     shape=(3,3));
+///   print(B.max(), B.min())"`): `5.0 0.0`.
+#[test]
+fn coo_min_folds_implicit_zero() -> Result<(), FerroError> {
+    let b =
+        CooMatrix::<f64>::from_triplets(3, 3, vec![0, 1, 2], vec![0, 1, 2], vec![3.0, 1.0, 5.0])?;
+    // scipy B.max() == 5.0 (largest stored value)
+    assert_eq!(b.max(), 5.0);
+    // scipy B.min() == 0.0 (implicit zero folded in: nnz 3 < 9)
+    assert_eq!(b.min(), 0.0);
+    Ok(())
+}
+
+/// REQ-MISSING-METHODS (`max`/`min`). A FULLY DENSE matrix (`nnz == n_rows*n_cols`)
+/// has no implicit zero, so `max()`/`min()` reduce over the stored data ONLY,
+/// mirroring scipy `_minmax_mixin._min_or_max` skipping the fold when
+/// `nnz == prod(shape)` (`scipy/sparse/_data.py:222`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   C=sp.coo_matrix((np.array([2.,7.]),(np.array([0,0]),np.array([0,1]))),
+///     shape=(1,2));
+///   print(C.max(), C.min())"`): `7.0 2.0`.
+#[test]
+fn coo_max_min_dense_no_implicit_zero() -> Result<(), FerroError> {
+    let c = CooMatrix::<f64>::from_triplets(1, 2, vec![0, 0], vec![0, 1], vec![2.0, 7.0])?;
+    // scipy C.max() == 7.0 (fully dense, no implicit zero)
+    assert_eq!(c.max(), 7.0);
+    // scipy C.min() == 2.0 (fully dense, no implicit zero)
+    assert_eq!(c.min(), 2.0);
+    Ok(())
+}
