@@ -474,3 +474,240 @@ def test_red_ridge_multioutput_no_intercept_scalar_zero():
 
     # ferrolearn must mirror sklearn's scalar-0.0 contract, not a zero vector.
     assert np.ndim(fr.intercept_) == np.ndim(sk.intercept_)
+
+
+# ---------------------------------------------------------------------------
+# Multi-output LinearRegression (unit #2123) — mirrors the multi-output Ridge
+# fix. The Rust `Fit<Array2, Array2> for LinearRegression`
+# (`ferrolearn-linear/src/linear_regression.rs:491`, REQ-7/#372 SHIPPED) is
+# surfaced via `_RsLinearRegressionMultiOutput` and routed by
+# `_regressors.py::LinearRegression.fit` on `y.ndim == 2`. KEY DIFFERENCE FROM
+# RIDGE: `FittedMultiOutputLinearRegression::coefficients()` (:458) is ALREADY
+# `(n_targets, n_features)`, so the `coef_` getter does NOT transpose.
+# ---------------------------------------------------------------------------
+
+
+def test_linearregression_multioutput_matches_sklearn():
+    """`ferrolearn.LinearRegression` fits 2-D `Y` (multi-output), matching
+    sklearn EXACTLY.
+
+    sklearn `LinearRegression` accepts `y` of shape `(n_samples, n_targets)` and
+    sets `coef_` `(n_targets, n_features)` and `intercept_` `(n_targets,)`
+    (`sklearn/linear_model/_base.py:687` `coef_.T`; `_set_intercept`
+    `:319-324`). The Rust `Fit<Array2, Array2> for LinearRegression`
+    (`ferrolearn-linear/src/linear_regression.rs:491`) produces
+    `FittedMultiOutputLinearRegression` with `coefficients()`
+    `(n_targets, n_features)` (`:458`) and `intercepts()` `(n_targets,)`
+    (`:465`), shipped #372; the binding `_RsLinearRegressionMultiOutput.coef_`
+    marshals it straight through (NO transpose, unlike Ridge), and
+    `_regressors.py::LinearRegression.fit` routes the 2-D-`y` path to it.
+
+    Oracle (R-CHAR-3): every expected value comes from the LIVE sklearn 1.5.2
+    call in this test, never copied from the ferrolearn side.
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    Y = np.array([[3.0, 1.0], [2.5, 2.0], [7.1, 0.0], [6.0, 3.0], [11.2, 1.0]])
+
+    sk = SkLinearRegression().fit(X, Y)
+    fr = fl.LinearRegression().fit(X, Y)
+
+    # coef_ is (n_targets, n_features) == (2, 2), matching sklearn.
+    assert fr.coef_.shape == (2, 2)
+    assert fr.coef_.shape == sk.coef_.shape
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+
+    # intercept_ is (n_targets,) == (2,), matching sklearn.
+    assert fr.intercept_.shape == (2,)
+    assert fr.intercept_.shape == sk.intercept_.shape
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-8)
+
+    # predict returns (n_samples, n_targets), matching sklearn element-wise.
+    fr_pred = fr.predict(X[:2])
+    sk_pred = sk.predict(X[:2])
+    assert fr_pred.shape == sk_pred.shape == (2, 2)
+    np.testing.assert_allclose(fr_pred, sk_pred, atol=1e-8)
+
+
+def test_linearregression_multioutput_column_vector_y():
+    """A column-vector `y` of shape `(n_samples, 1)` PRESERVES the 2-D target
+    structure, matching sklearn EXACTLY.
+
+    sklearn `LinearRegression().fit(X, Y)` with `Y` shape `(n, 1)` yields
+    `coef_` `(1, n_features)`, `intercept_` `(1,)`, and `predict` `(n, 1)`
+    (`_base.py:687` `coef_.T`; multi_output shape preservation; the
+    `MultiOutputMixin` tag means NO DataConversionWarning). ferrolearn gates the
+    multi-output path on `y.ndim == 2` (NOT `y.shape[1] > 1`), so the `(n, 1)`
+    target routes to `_RsLinearRegressionMultiOutput` too.
+
+    Oracle (R-CHAR-3): all expected shapes/values from the live sklearn call.
+    """
+    rng = np.random.RandomState(0)
+    X = rng.rand(6, 3)
+    Y = rng.rand(6, 1)
+
+    sk = SkLinearRegression().fit(X, Y)
+    fr = fl.LinearRegression().fit(X, Y)
+
+    # Live-oracle shapes (R-CHAR-3): never literal-copied from ferrolearn.
+    assert sk.coef_.shape == (1, 3)
+    assert np.shape(sk.intercept_) == (1,)
+    assert sk.predict(X).shape == (6, 1)
+
+    # ferrolearn must mirror the sklearn shapes for the (n, 1) target.
+    assert fr.coef_.shape == sk.coef_.shape
+    assert np.shape(fr.intercept_) == np.shape(sk.intercept_)
+    assert fr.predict(X).shape == sk.predict(X).shape
+
+    # ...and the VALUES too (deterministic OLS, element-wise to 1e-8).
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-8)
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), atol=1e-8)
+
+
+def test_linearregression_multioutput_no_intercept_scalar():
+    """`ferrolearn.LinearRegression(fit_intercept=False)` on 2-D `y` exposes
+    `intercept_` as the scalar `0.0` (ndim 0), matching sklearn EXACTLY.
+
+    sklearn sets `intercept_` to the scalar `0.0` (shape `()`) whenever
+    `fit_intercept=False`, REGARDLESS of target dimensionality
+    (`sklearn/linear_model/_base.py:327`: `self.intercept_ = 0.0`). The wrapper
+    sets `self.intercept_ = 0.0` on the multi-output `fit_intercept=False` path.
+
+    Oracle (R-CHAR-3): the live sklearn call is the ground truth (scalar 0.0).
+    """
+    rng = np.random.RandomState(2)
+    X = rng.rand(10, 3)
+    Y = rng.rand(10, 2)
+    Y[:, 1] *= 100.0
+
+    sk = SkLinearRegression(fit_intercept=False).fit(X, Y)
+    fr = fl.LinearRegression(fit_intercept=False).fit(X, Y)
+
+    # Live-oracle ground truth (R-CHAR-3): sklearn intercept_ is scalar 0.0.
+    assert np.ndim(sk.intercept_) == 0
+    assert float(sk.intercept_) == 0.0
+
+    # ferrolearn must mirror sklearn's scalar-0.0 contract, not a zero vector.
+    assert np.ndim(fr.intercept_) == np.ndim(sk.intercept_)
+    assert float(fr.intercept_) == 0.0
+
+    # coef_ still (n_targets, n_features) and matches the oracle element-wise.
+    assert fr.coef_.shape == sk.coef_.shape == (2, 3)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+
+
+def test_linearregression_singleoutput_unchanged_by_multioutput_path():
+    """Single-output `ferrolearn.LinearRegression` (1-D `y`) is UNCHANGED: 1-D
+    `coef_`, scalar `intercept_`, 1-D `predict`, AND the `rank_`/`singular_`
+    lstsq diagnostics (#2101) are still set — matching sklearn (R-CHAR-3).
+
+    Guards that the multi-output routing in `LinearRegression.fit` did not
+    regress the 1-D path. Oracle is the live sklearn 1.5.2 call.
+    """
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    y = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+
+    sk = SkLinearRegression().fit(X, y)
+    fr = fl.LinearRegression().fit(X, y)
+
+    assert fr.coef_.ndim == 1
+    assert fr.coef_.shape == sk.coef_.shape == (2,)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+
+    # intercept_ is a scalar float (not an array), matching the 1-D contract.
+    assert np.isscalar(fr.intercept_) or np.ndim(fr.intercept_) == 0
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) < 1e-8
+
+    fr_pred = fr.predict(X[:2])
+    assert fr_pred.ndim == 1
+    np.testing.assert_allclose(fr_pred, sk.predict(X[:2]), atol=1e-8)
+
+    # rank_/singular_ (1-D lstsq diagnostics, #2101) are STILL present + match.
+    assert hasattr(fr, "rank_") and hasattr(fr, "singular_")
+    assert fr.rank_ == sk.rank_
+    np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# RED pins: multi-output LinearRegression divergences (unit #2123 re-audit).
+# The builder shipped the 2-D-`y` path but left two observable gaps vs sklearn
+# 1.5.2. Every expected value below is computed by the LIVE sklearn oracle in
+# the same test (R-CHAR-3); none is literal-copied from the ferrolearn side.
+# ---------------------------------------------------------------------------
+
+
+def test_red_linearregression_multioutput_rank_singular_missing():
+    """Multi-output `ferrolearn.LinearRegression` is MISSING `rank_`/`singular_`
+    where sklearn exposes them.
+
+    sklearn sets `self.coef_, _, self.rank_, self.singular_ = linalg.lstsq(X, y)`
+    for the dense path REGARDLESS of single vs multi-output
+    (`sklearn/linear_model/_base.py:687`); `rank_`/`singular_` are properties of
+    `X` and are documented unconditional fitted attributes
+    (`_base.py:505` `rank_`, `_base.py:508` `singular_`). So a 2-D-`y` fit has
+    BOTH attributes. ferrolearn's wrapper sets them only on the 1-D path
+    (`_regressors.py:96-97`) and skips them on the multi-output branch, so
+    `hasattr(fr, "rank_")` is False where sklearn's is True.
+
+    Oracle (R-CHAR-3): sklearn's live `rank_`/`singular_` are the ground truth.
+
+    Tracking: #2124 (release-blocker, left un-ignored per goal.md R-DEFER-3).
+    """
+    rng = np.random.RandomState(0)
+    X = rng.rand(8, 3)
+    Y = rng.rand(8, 2)
+
+    sk = SkLinearRegression().fit(X, Y)
+    fr = fl.LinearRegression().fit(X, Y)
+
+    # Live-oracle ground truth (R-CHAR-3): sklearn multi-output HAS both attrs.
+    assert hasattr(sk, "rank_")
+    assert hasattr(sk, "singular_")
+
+    # ferrolearn must mirror the sklearn attribute surface for multi-output.
+    assert hasattr(fr, "rank_"), "multi-output LinearRegression missing rank_"
+    assert hasattr(fr, "singular_"), (
+        "multi-output LinearRegression missing singular_"
+    )
+    assert fr.rank_ == sk.rank_
+    np.testing.assert_allclose(fr.singular_, sk.singular_, atol=1e-8)
+
+
+def test_red_linearregression_multioutput_pickle_predict_shape():
+    """A pickled-then-unpickled multi-output `ferrolearn.LinearRegression`
+    PRODUCES THE WRONG `predict`: the no-`_rs` fallback uses `X @ coef_` with
+    `coef_` shape `(n_targets, n_features)`, which is a matmul shape error
+    (should be `X @ coef_.T`).
+
+    sklearn's `__getstate__`/`__setstate__` round-trips a fitted estimator and
+    `predict` is unchanged (`coef_` is `(n_targets, n_features)`, the decision
+    function uses `X @ coef_.T`, `_base.py:364`). ferrolearn's `__getstate__`
+    pops `_rs` (`_regressors.py:110`), so the unpickled estimator's `predict`
+    takes the `_predict_linear(X, coef_, intercept_)` fallback
+    (`_regressors.py:106`) which computes `X @ coef_` (`_regressors.py:26`) —
+    a `(n,3) @ (2,3)` matmul that RAISES for multi-output (or, when
+    n_features == n_targets, silently returns the WRONG answer).
+
+    Oracle (R-CHAR-3): sklearn's live unpickled `predict` is the ground truth.
+
+    Tracking: #2125 (release-blocker, left un-ignored per goal.md R-DEFER-3).
+    """
+    import pickle
+
+    rng = np.random.RandomState(0)
+    X = rng.rand(8, 3)
+    Y = rng.rand(8, 2)
+
+    sk = SkLinearRegression().fit(X, Y)
+    fr = fl.LinearRegression().fit(X, Y)
+
+    # Live-oracle ground truth (R-CHAR-3): sklearn unpickled predict == fitted.
+    sk_un = pickle.loads(pickle.dumps(sk))
+    np.testing.assert_allclose(sk_un.predict(X), sk.predict(X), atol=1e-8)
+
+    # ferrolearn must round-trip predict identically (no shape error, right
+    # values). The fallback `X @ coef_` is wrong for `(n_targets, n_features)`.
+    fr_un = pickle.loads(pickle.dumps(fr))
+    fr_pred = fr_un.predict(X)
+    assert fr_pred.shape == sk.predict(X).shape
+    np.testing.assert_allclose(fr_pred, sk.predict(X), atol=1e-8)
