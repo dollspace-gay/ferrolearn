@@ -69,7 +69,7 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (`feature_log_prob_` smoothing + `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `fn recompute_feature_log_prob` computes `((N_cjk + alpha) / (N_c + alpha*K_j)).ln()` per (feature, class, category) — the algebraic identity of `_update_feature_log_prob` (`naive_bayes.py:1498-1506`: `smoothed_cat_count = category_count_[i] + alpha`; `feature_log_prob_[i] = log(smoothed_cat_count) - log(smoothed_cat_count.sum(axis=1).reshape(-1,1))`, since `category_count_[i].sum(axis=1) == N_c`); `impl BaseNB::joint_log_likelihood` for `FittedCategoricalNB` computes `scores[[i,ci]] = class_log_prior[ci] + sum_j log_prob_for(j, ci, x[i,j])`, mirroring `jll += feature_log_prob_[i][:, X[:,i]].T; jll += class_log_prior_` (`naive_bayes.py:1508-1515`); the four `predict_*` delegate to the `BaseNB` provided methods. Non-test consumer: `impl PipelineEstimator for CategoricalNB` / `FittedCategoricalNBPipeline` (`fn fit_pipeline` / `fn predict_pipeline`). Verified: green guard `green_categorical_predict_value` — on `X=[[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y=[0,0,0,1,1,1]`, `q=[[0,0],[2,1]]`, sklearn `predict_proba(q) = [[0.8181818181818182, 0.18181818181818182], [0.18181818181818182, 0.8181818181818182]]`, `predict_joint_log_proba(q) = [[-1.8971199848858809, -3.401197381662155], [-3.401197381662155, -1.8971199848858809]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. |
+//! | REQ-1 (`feature_log_prob_` smoothing + `_joint_log_likelihood` / `predict` / `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` VALUE) | SHIPPED | `fn recompute_feature_log_prob` computes `((N_cjk + alpha) / (N_c + alpha*K_j)).ln()` per (feature, class, category) — the algebraic identity of `_update_feature_log_prob` (`naive_bayes.py:1498-1506`: `smoothed_cat_count = category_count_[i] + alpha`; `feature_log_prob_[i] = log(smoothed_cat_count) - log(smoothed_cat_count.sum(axis=1).reshape(-1,1))`, since `category_count_[i].sum(axis=1) == N_c`); `impl BaseNB::joint_log_likelihood` for `FittedCategoricalNB` computes `scores[[i,ci]] = class_log_prior[ci] + sum_j log_prob_for(j, ci, x[i,j])`, mirroring `jll += feature_log_prob_[i][:, X[:,i]].T; jll += class_log_prior_` (`naive_bayes.py:1508-1515`); the four `predict_*` delegate to the `BaseNB` provided methods. Non-test consumer: `impl PipelineEstimator for CategoricalNB` / `FittedCategoricalNBPipeline` (`fn fit_pipeline` / `fn predict_pipeline`) — the adapter PRESERVES the ORIGINAL labels: `fit_pipeline` records `classes_orig = sorted-unique(y)` (sklearn `classes_ = np.unique(y)`, `naive_bayes.py:737`) and `predict_pipeline` returns `classes_orig[argmax]` (sklearn `classes_[np.argmax(jll, axis=1)]`, `naive_bayes.py:103`), NOT the internal usize class indices. Verified: green guard `green_categorical_predict_value` — on `X=[[0,1],[1,0],[0,0],[2,1],[2,0],[1,1]]`, `y=[0,0,0,1,1,1]`, `q=[[0,0],[2,1]]`, sklearn `predict_proba(q) = [[0.8181818181818182, 0.18181818181818182], [0.18181818181818182, 0.8181818181818182]]`, `predict_joint_log_proba(q) = [[-1.8971199848858809, -3.401197381662155], [-3.401197381662155, -1.8971199848858809]]`, `predict(q) = [0, 1]`; ferrolearn matches to ≤1e-12. |
 //! | REQ-2 (`alpha = 0` accepted + `alpha < 0` rejected) | SHIPPED | `fn fit` for `CategoricalNB` rejects ONLY `self.alpha < F::zero()` with `FerroError::InvalidParameter { name: "alpha", reason: "alpha must be >= 0 (sklearn Interval[0, inf))" }`, mirroring `CategoricalNB._parameter_constraints` which OVERRIDES `alpha` to `Interval(Real, 0, None, closed="left")` (`naive_bayes.py:1333`) — `alpha = 0` is INSIDE the closed-left interval so it is ACCEPTED (used as-is under the default `force_alpha=true`; only a divide-by-zero RuntimeWarning where a count is zero, NOT an error). Non-test consumer: `fit_pipeline` → `fit` propagates the `FerroError`. Verified: green pin `divergence_categorical_alpha_zero_allowed` (#921, now PASSING after the over-rejection fix): `with_alpha(0.0).fit(X,y)` returns `Ok` (sklearn `CategoricalNB(alpha=0.0).fit(X,y)` → "fit ok"); `test_categorical_nb_invalid_alpha_negative` confirms `with_alpha(-1.0).fit` still errors. |
 //! | REQ-3 (negative-feature reject AT FIT) | SHIPPED (fit path) | `fn fit` rejects `x.iter().any(\|&v\| v < F::zero())` with `FerroError::InvalidParameter { name: "X", reason: "Negative values in data passed to CategoricalNB (input X)" }`, mirroring `_check_X_y` → `check_non_negative(X, "CategoricalNB (input X)")` (`naive_bayes.py:1435-1440`) → `ValueError`. Non-test consumer: `fit_pipeline` → `fit`. Verified: green pin `divergence_categorical_negative_features_rejected` (#922, now PASSING): `CategoricalNB().fit(X_with_neg, y)` returns `Err` (sklearn raises `ValueError("Negative values in data passed to CategoricalNB (input X)")`). GAP (NOT-STARTED, folded into #920): the reject landed in `fn fit` ONLY — `partial_fit` and the predict path still silently map a negative value to category 0 via `x[[i,j]].to_usize().unwrap_or(0)`. sklearn's predict-path `_check_X` runs `check_non_negative` too (`naive_bayes.py:1432`); the predict-path non-negative validation is part of #920 (the partial_fit negative-validation sub-gap is folded into #924). |
 //! | REQ-4 (`min_categories` / `n_categories_` semantics) | SHIPPED | `fn fit` ensures `categories[j]` covers `0..min_cats[j]` (`MinCategories::Scalar` broadcast / `MinCategories::PerFeature` length-validated against `n_features`), mirroring `_validate_n_categories` (`naive_bayes.py:1446-1466`, `n_categories_ = max(X.max(0)+1, min_categories)`) + the `_count` `np.pad` padding (`naive_bayes.py:1491-1493`) so an allocated-but-unobserved category gets the smoothed `alpha/(N_c+alpha*K_j)` weight. Non-test consumer: `fit_pipeline` → `fit`. Verified: green guard `green_categorical_min_categories` — `CategoricalNB(min_categories=4).fit(X,y)` sklearn `n_categories_ = [4,4]`, `predict_joint_log_proba([[3,0]]) = [[-3.4863551900024623, -3.891820298110627]]`, `predict_proba([[3,0]]) = [[0.6000000000000001, 0.39999999999999997]]`, `predict([[3,0]]) = [0]`; ferrolearn `with_min_categories(4)` matches to ≤1e-12. (Scalar path only; a category `>= n_categories_` at predict is the REQ-? unseen-category divergence #920.) |
@@ -766,23 +766,46 @@ impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> PipelineEst
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
-        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
-        let fitted = self.fit(x, &y_usize)?;
-        Ok(Box::new(FittedCategoricalNBPipeline(fitted)))
+        // sklearn `CategoricalNB.fit` sets `classes_ = np.unique(y)` — the sorted
+        // unique ORIGINAL labels (`naive_bayes.py:737`, via `LabelBinarizer`);
+        // `predict` returns `self.classes_[np.argmax(jll, axis=1)]` — the
+        // original labels, NOT class indices (`naive_bayes.py:103`). Preserve the
+        // original float labels here instead of collapsing them to usize indices.
+        let mut classes_orig: Vec<F> = y.to_vec();
+        classes_orig.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        classes_orig.dedup();
+        // Map each label to its index into `classes_orig` (0..n_classes).
+        let y_idx: Array1<usize> =
+            y.mapv(|v| classes_orig.iter().position(|&c| c == v).unwrap_or(0));
+        let fitted = self.fit(x, &y_idx)?;
+        Ok(Box::new(FittedCategoricalNBPipeline {
+            fitted,
+            classes_orig,
+        }))
     }
 }
 
-struct FittedCategoricalNBPipeline<F: Float + Send + Sync + 'static>(FittedCategoricalNB<F>);
+struct FittedCategoricalNBPipeline<F: Float + Send + Sync + 'static> {
+    fitted: FittedCategoricalNB<F>,
+    classes_orig: Vec<F>,
+}
 
+// SAFETY: `FittedCategoricalNB<F>` and `Vec<F>` are both Send when `F: Send`;
+// this mirrors the existing inner-type bound and adds no interior mutability.
 unsafe impl<F: Float + Send + Sync + 'static> Send for FittedCategoricalNBPipeline<F> {}
+// SAFETY: `FittedCategoricalNB<F>` and `Vec<F>` are both Sync when `F: Sync`; no
+// shared interior mutability is introduced.
 unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedCategoricalNBPipeline<F> {}
 
 impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipelineEstimator<F>
     for FittedCategoricalNBPipeline<F>
 {
     fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
-        let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or_else(F::nan)))
+        // `self.fitted.predict` returns the class indices (`0..n_classes`) the
+        // model was trained on; map each back to the original label, mirroring
+        // sklearn `classes_[argmax(jll)]` (`naive_bayes.py:103`).
+        let preds = self.fitted.predict(x)?;
+        Ok(preds.mapv(|i| self.classes_orig.get(i).copied().unwrap_or_else(F::nan)))
     }
 }
 
@@ -1016,6 +1039,29 @@ mod tests {
         let fitted = model.fit_pipeline(&x, &y).unwrap();
         let preds = fitted.predict_pipeline(&x).unwrap();
         assert_eq!(preds.len(), 6);
+    }
+
+    #[test]
+    fn categorical_pipeline_preserves_original_float_labels() -> Result<(), FerroError> {
+        // sklearn 1.5.2 oracle: non-negative integer categorical features, with
+        // ORIGINAL float labels `y = [-1, -1, -1, 1, 1, 1]` →
+        // `classes_ = [-1, 1]`; `predict([[0,0],[2,1]]) = [-1.0, 1.0]` (the
+        // original labels, NOT the internal class indices `[0.0, 1.0]`).
+        // CategoricalNB(alpha=1.0).fit(X, y).predict([[0,0],[2,1]]) -> [-1, 1].
+        let f = CategoricalNB::<f64>::new().fit_pipeline(
+            &array![
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [0.0, 0.0],
+                [2.0, 1.0],
+                [2.0, 0.0],
+                [1.0, 1.0]
+            ],
+            &array![-1.0, -1.0, -1.0, 1.0, 1.0, 1.0],
+        )?;
+        let p = f.predict_pipeline(&array![[0.0, 0.0], [2.0, 1.0]])?;
+        assert_eq!(p, array![-1.0, 1.0]);
+        Ok(())
     }
 
     #[test]
