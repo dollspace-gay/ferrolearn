@@ -20,6 +20,7 @@
 //! single-file fix cannot close this iteration (R-DEFER-3); they are NOT pinned
 //! here as doomed tests.
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_numerical::sparse_graph::{
     connected_components, dijkstra, dijkstra_all_pairs, minimum_spanning_tree,
 };
@@ -128,6 +129,41 @@ fn mst_representation_upper_triangular() {
             );
         }
     }
+}
+
+// ===========================================================================
+// (1b) REQ-ERR-TYPE (#1953) — error TYPE is FerroError, not String
+// ===========================================================================
+
+/// Divergence: ferrolearn's `sparse_graph` routines returned `Result<_, String>`,
+/// violating the project error contract (CLAUDE.md / R-CODE-2:
+/// `Result<T, FerroError>`). scipy.sparse.csgraph raises `ValueError` for a
+/// non-square graph / out-of-bounds source and `NegativeCycleError`/`ValueError`
+/// for negative weights; the faithful ferrolearn analog is
+/// `FerroError::InvalidParameter` (the crate has no dedicated negative-cycle
+/// variant). This test pins the TYPE: every validation failure is an
+/// `Err(FerroError::InvalidParameter { .. })`, not a bare `String`.
+///
+/// (No numeric oracle — this is the error-TYPE contract, which is a project
+/// convention. The dijkstra/MST/cc VALUE oracles stay green in the guards below.)
+///
+/// Tracking: #1953.
+#[test]
+fn sparse_graph_invalid_returns_ferroerror() {
+    // Out-of-bounds source (valid 4-node graph, source == n) — scipy ValueError.
+    let oob = dijkstra(&graph4(), 4);
+    assert!(
+        matches!(&oob, Err(FerroError::InvalidParameter { .. })),
+        "out-of-bounds source must yield FerroError::InvalidParameter, got {oob:?}"
+    );
+
+    // Negative edge weight — Dijkstra forbids it (scipy NegativeCycleError/ValueError).
+    let neg_graph = csr(3, &[(0, 1, 1.0), (1, 2, -3.0)]);
+    let neg = dijkstra(&neg_graph, 0);
+    assert!(
+        matches!(&neg, Err(FerroError::InvalidParameter { .. })),
+        "negative edge weight must yield FerroError::InvalidParameter, got {neg:?}"
+    );
 }
 
 // ===========================================================================

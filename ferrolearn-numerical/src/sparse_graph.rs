@@ -18,7 +18,7 @@
 //! concrete blocker). Values are oracle-verified element-wise vs the live scipy
 //! (R-CHAR-3) — see `tests/divergence_sparse_graph.rs`.
 //!
-//! **4 SHIPPED / 7 NOT-STARTED.**
+//! **5 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -30,13 +30,14 @@
 //! | REQ-PRED-SENTINEL (predecessor sentinel) | NOT-STARTED | `usize::MAX` vs scipy `-9999`. Blocker #1950. |
 //! | REQ-CC-PARAMS (cc directed/connection) | NOT-STARTED | undirected (weak)-only; no `directed`/`connection='strong'`. Blocker #1951. |
 //! | REQ-MISSING-FNS (missing csgraph fns) | NOT-STARTED | no `shortest_path`/`floyd_warshall`/`bellman_ford`/`johnson`/`breadth_first_order`/`depth_first_order`/`laplacian`/`reconstruct_path`/etc. Blocker #1952. |
-//! | REQ-ERR-TYPE (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`/scipy exceptions. Blocker #1953. |
+//! | REQ-ERR-TYPE (error type) | SHIPPED | FIXED #1953: all four routines return `Result<_, FerroError>` (CLAUDE.md / R-CODE-2), with every validation failure raised as `FerroError::InvalidParameter { name, reason }` — the faithful analog of scipy's `ValueError` (non-square / out-of-bounds source) and `NegativeCycleError`/`ValueError` (negative weights rejected by Dijkstra/Kruskal). Was `Result<_, String>`. Guards `negative_weight_error` (in-crate) + `sparse_graph_invalid_returns_ferroerror` (`tests/divergence_sparse_graph.rs`). |
 //! | REQ-CONSUMER (production consumer) | NOT-STARTED | no non-test caller (standalone module; isomap.rs hand-rolls its own dijkstra). Blocker #1954. |
 //! | REQ-FERRAY (ferray substrate) | NOT-STARTED | `sprs::CsMat`+`ndarray` vs ferray's sparse/csgraph analog (R-SUBSTRATE-1). Blocker #1955. |
 
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
+use ferrolearn_core::error::FerroError;
 use ndarray::{Array1, Array2};
 use sprs::CsMat;
 
@@ -80,30 +81,36 @@ pub struct ConnectedComponentsResult {
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The matrix is not square.
-/// - `source` is out of bounds.
-/// - Any stored edge weight is negative.
-pub fn dijkstra(graph: &CsMat<f64>, source: usize) -> Result<DijkstraResult, String> {
+/// Returns [`FerroError::InvalidParameter`] (the analog of scipy's `ValueError`
+/// / `NegativeCycleError`) if:
+/// - The matrix is not square (`name: "graph"`) — scipy raises `ValueError`.
+/// - `source` is out of bounds (`name: "source"`) — scipy raises `ValueError`.
+/// - Any stored edge weight is negative (`name: "graph"`) — Dijkstra forbids
+///   negative weights; scipy steers them to `bellman_ford`/`johnson`, which
+///   raise `NegativeCycleError`/`ValueError`.
+pub fn dijkstra(graph: &CsMat<f64>, source: usize) -> Result<DijkstraResult, FerroError> {
     let (rows, cols) = graph.shape();
     if rows != cols {
-        return Err(format!(
-            "adjacency matrix must be square, got shape ({rows}, {cols})"
-        ));
+        return Err(FerroError::InvalidParameter {
+            name: "graph".to_string(),
+            reason: format!("adjacency matrix must be square, got shape ({rows}, {cols})"),
+        });
     }
     let n = rows;
     if source >= n {
-        return Err(format!(
-            "source vertex {source} is out of bounds for graph with {n} vertices"
-        ));
+        return Err(FerroError::InvalidParameter {
+            name: "source".to_string(),
+            reason: format!("source vertex {source} is out of bounds for graph with {n} vertices"),
+        });
     }
 
     // Validate non-negative weights.
     for (&w, _) in graph {
         if w < 0.0 {
-            return Err(format!(
-                "negative edge weight {w} is not allowed in Dijkstra's algorithm"
-            ));
+            return Err(FerroError::InvalidParameter {
+                name: "graph".to_string(),
+                reason: format!("negative edge weight {w} is not allowed in Dijkstra's algorithm"),
+            });
         }
     }
 
@@ -150,13 +157,16 @@ pub fn dijkstra(graph: &CsMat<f64>, source: usize) -> Result<DijkstraResult, Str
 ///
 /// # Errors
 ///
-/// Returns an error if the matrix is not square or contains negative weights.
-pub fn dijkstra_all_pairs(graph: &CsMat<f64>) -> Result<Array2<f64>, String> {
+/// Returns [`FerroError::InvalidParameter`] (scipy `ValueError` /
+/// `NegativeCycleError`) if the matrix is not square (`name: "graph"`) or
+/// contains negative weights (propagated from [`dijkstra`]).
+pub fn dijkstra_all_pairs(graph: &CsMat<f64>) -> Result<Array2<f64>, FerroError> {
     let (rows, cols) = graph.shape();
     if rows != cols {
-        return Err(format!(
-            "adjacency matrix must be square, got shape ({rows}, {cols})"
-        ));
+        return Err(FerroError::InvalidParameter {
+            name: "graph".to_string(),
+            reason: format!("adjacency matrix must be square, got shape ({rows}, {cols})"),
+        });
     }
     let n = rows;
     let mut result = Array2::from_elem((n, n), f64::INFINITY);
@@ -181,13 +191,15 @@ pub fn dijkstra_all_pairs(graph: &CsMat<f64>) -> Result<Array2<f64>, String> {
 ///
 /// # Errors
 ///
-/// Returns an error if the matrix is not square.
-pub fn connected_components(graph: &CsMat<f64>) -> Result<ConnectedComponentsResult, String> {
+/// Returns [`FerroError::InvalidParameter`] (scipy `ValueError`) if the matrix
+/// is not square (`name: "graph"`).
+pub fn connected_components(graph: &CsMat<f64>) -> Result<ConnectedComponentsResult, FerroError> {
     let (rows, cols) = graph.shape();
     if rows != cols {
-        return Err(format!(
-            "adjacency matrix must be square, got shape ({rows}, {cols})"
-        ));
+        return Err(FerroError::InvalidParameter {
+            name: "graph".to_string(),
+            reason: format!("adjacency matrix must be square, got shape ({rows}, {cols})"),
+        });
     }
     let n = rows;
 
@@ -248,13 +260,16 @@ pub fn connected_components(graph: &CsMat<f64>) -> Result<ConnectedComponentsRes
 ///
 /// # Errors
 ///
-/// Returns an error if the matrix is not square or contains negative weights.
-pub fn minimum_spanning_tree(graph: &CsMat<f64>) -> Result<CsMat<f64>, String> {
+/// Returns [`FerroError::InvalidParameter`] (scipy `ValueError` /
+/// `NegativeCycleError`) if the matrix is not square (`name: "graph"`) or
+/// contains a negative edge weight (`name: "graph"`).
+pub fn minimum_spanning_tree(graph: &CsMat<f64>) -> Result<CsMat<f64>, FerroError> {
     let (rows, cols) = graph.shape();
     if rows != cols {
-        return Err(format!(
-            "adjacency matrix must be square, got shape ({rows}, {cols})"
-        ));
+        return Err(FerroError::InvalidParameter {
+            name: "graph".to_string(),
+            reason: format!("adjacency matrix must be square, got shape ({rows}, {cols})"),
+        });
     }
     let n = rows;
 
@@ -262,9 +277,12 @@ pub fn minimum_spanning_tree(graph: &CsMat<f64>) -> Result<CsMat<f64>, String> {
     let mut edges: Vec<(f64, usize, usize)> = Vec::new();
     for (&val, (i, j)) in graph {
         if val < 0.0 {
-            return Err(format!(
-                "negative edge weight {val} is not allowed in minimum_spanning_tree"
-            ));
+            return Err(FerroError::InvalidParameter {
+                name: "graph".to_string(),
+                reason: format!(
+                    "negative edge weight {val} is not allowed in minimum_spanning_tree"
+                ),
+            });
         }
         if i < j && val != 0.0 {
             edges.push((val, i, j));
@@ -527,11 +545,13 @@ mod tests {
     fn negative_weight_error() {
         let graph = csr_from_triplets(3, &[(0, 1, 1.0), (1, 2, -3.0)]);
         let res = dijkstra(&graph, 0);
-        assert!(res.is_err());
-        assert!(res.unwrap_err().contains("negative"));
+        assert!(
+            matches!(&res, Err(FerroError::InvalidParameter { reason, .. }) if reason.contains("negative"))
+        );
 
         let res2 = minimum_spanning_tree(&graph);
-        assert!(res2.is_err());
-        assert!(res2.unwrap_err().contains("negative"));
+        assert!(
+            matches!(&res2, Err(FerroError::InvalidParameter { reason, .. }) if reason.contains("negative"))
+        );
     }
 }

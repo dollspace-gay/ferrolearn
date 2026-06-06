@@ -1084,6 +1084,7 @@ name = "ferrolearn-numerical"
 version = "0.4.0"
 dependencies = [
  "approx 0.5.1",
+ "ferrolearn-core",
  "ferrolearn-test-oracle",
  "libm",
  "ndarray",
