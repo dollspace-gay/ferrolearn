@@ -12,7 +12,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **9 SHIPPED / 5 NOT-STARTED.**
+//! **10 SHIPPED / 4 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -26,7 +26,7 @@
 //! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)`. Blocker #2008. |
 //! | REQ-MISSING-TRANSPOSE | SHIPPED (#2009) | `transpose()` returns a `(n_cols, n_rows)` CSC of `Aᵀ` via sprs `transpose_view().to_csc()`, mirroring scipy `A.T` (`_csc.py:20` — CSR view of the same buffers, here materialized as CSC). Live oracle: `A.T.toarray()`=`[[1,0,4],[0,3,0],[2,0,5]]`; non-square `B=[[1,2,3],[4,5,6]]` -> `B.T.toarray()`=`[[1,4],[2,5],[3,6]]` shape `(3,2)`; double-transpose round-trips. Guards `csc_transpose_matches_scipy`/`csc_transpose_non_square`/`csc_transpose_twice_roundtrip`. |
 //! | REQ-MISSING-REDUCE | SHIPPED (#2010) | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csc_sum_matches_scipy`/`csc_sum_axis0_matches_scipy`/`csc_sum_axis1_matches_scipy`/`csc_diagonal_matches_scipy`/`csc_diagonal_non_square`. |
-//! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2011. |
+//! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2011) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csc_multiply_matches_scipy`/`csc_sub_matches_scipy`/`csc_multiply_shape_mismatch_is_err`/`csc_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`astype`/`copy`/`max`/`min`. Blocker #2012. |
 //! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2013. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSC analog (R-SUBSTRATE-1). Blocker #2014. |
@@ -251,6 +251,67 @@ where
             });
         }
         let result = &self.inner + &rhs.inner;
+        Ok(Self { inner: result })
+    }
+
+    /// Element-wise subtraction of two CSC matrices with the same shape: `A - B`.
+    ///
+    /// Mirrors scipy `csc_matrix` subtraction `A - B` (`_sub_sparse`,
+    /// `scipy/sparse/_compressed.py:260`, which dispatches to the `_minus_`
+    /// binary op). The result has the UNION sparsity of `A` and `B`: a position
+    /// stored in either operand is stored in the output, so a stored−stored
+    /// difference that cancels to `0` may remain an explicit zero — scipy keeps
+    /// it too, and it materializes to `0` under [`to_dense`](Self::to_dense), so
+    /// `to_dense` parity holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the matrices have different shapes.
+    pub fn sub(&self, rhs: &CscMatrix<T>) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Zero + Default + Clone + 'static,
+        for<'r> &'r T: std::ops::Sub<&'r T, Output = T>,
+    {
+        if self.n_rows() != rhs.n_rows() || self.n_cols() != rhs.n_cols() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.n_rows(), self.n_cols()],
+                actual: vec![rhs.n_rows(), rhs.n_cols()],
+                context: "CscMatrix::sub".into(),
+            });
+        }
+        let result = &self.inner - &rhs.inner;
+        Ok(Self { inner: result })
+    }
+
+    /// Element-wise (Hadamard) product of two CSC matrices with the same shape.
+    ///
+    /// Mirrors scipy `csc_matrix.multiply(other)` (`scipy/sparse/_base.py:490`),
+    /// the element-wise product, which for two same-shape sparse operands runs
+    /// the `_elmul_` binary op. The result keeps only positions that are stored
+    /// (non-zero) in BOTH operands — the INTERSECTION sparsity — since the
+    /// product is zero wherever either factor is a structural zero. Oracle:
+    /// `A.multiply(B).toarray()` for `A=[[1,0,2],[0,3,0],[4,0,5]]`,
+    /// `B=[[1,1,0],[0,1,1],[0,0,1]]` is `[[1,0,0],[0,3,0],[0,0,5]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the matrices have different shapes.
+    pub fn multiply(&self, rhs: &CscMatrix<T>) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Zero + Clone + 'static,
+        for<'r> &'r T: Mul<&'r T, Output = T>,
+    {
+        if self.n_rows() != rhs.n_rows() || self.n_cols() != rhs.n_cols() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.n_rows(), self.n_cols()],
+                actual: vec![rhs.n_rows(), rhs.n_cols()],
+                context: "CscMatrix::multiply".into(),
+            });
+        }
+        // sprs `mul_mat_same_storage` runs `csmat_binop(|x, y| x * y)` over the
+        // two same-storage (both CSC) operands, emitting a non-zero only where
+        // both inputs are stored — the element-wise (Hadamard) intersection.
+        let result = sprs::binop::mul_mat_same_storage(&self.inner, &rhs.inner);
         Ok(Self { inner: result })
     }
 

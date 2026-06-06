@@ -265,3 +265,74 @@ fn csc_geometry_matches_scipy() {
     assert_eq!((a.n_rows(), a.n_cols()), (3, 3));
     assert_eq!(a.nnz(), 5);
 }
+
+/// Elementwise helper matrix `B = [[1,1,0],[0,1,1],[0,0,1]]` in CSC form.
+///
+/// Column-major: col 0: row 0 -> 1; col 1: rows 0,1 -> 1,1; col 2: rows 1,2 ->
+/// 1,1. So `indptr = [0,1,3,5]`, `indices = [0,0,1,1,2]`, `data = [1,1,1,1,1]`.
+/// This is the `B` used in the REQ-MISSING-ELEMENTWISE oracle (the CSR-twin B),
+/// distinct from the `sample_b` used by the add oracle above.
+fn sample_b_elmul() -> CscMatrix<f64> {
+    CscMatrix::new(
+        3,
+        3,
+        vec![0, 1, 3, 5],
+        vec![0, 0, 1, 1, 2],
+        vec![1.0, 1.0, 1.0, 1.0, 1.0],
+    )
+    .unwrap()
+}
+
+/// REQ-MISSING-ELEMENTWISE. `multiply(&B)` matches scipy `A.multiply(B)`
+/// (element-wise Hadamard product, INTERSECTION sparsity).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `A.multiply(B).toarray() == [[1,0,0],[0,3,0],[0,0,5]]`.
+#[test]
+fn csc_multiply_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b_elmul();
+    let prod = a.multiply(&b).unwrap();
+    let expected = [[1.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 5.0]];
+    assert_dense_eq(&prod.to_dense(), &expected);
+}
+
+/// REQ-MISSING-ELEMENTWISE. `sub(&B)` matches scipy `A - B` (element-wise,
+/// UNION sparsity).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `(A-B).toarray() == [[0,-1,2],[0,2,-1],[4,0,4]]`.
+#[test]
+fn csc_sub_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b_elmul();
+    let diff = a.sub(&b).unwrap();
+    let expected = [[0.0, -1.0, 2.0], [0.0, 2.0, -1.0], [4.0, 0.0, 4.0]];
+    assert_dense_eq(&diff.to_dense(), &expected);
+}
+
+/// REQ-MISSING-ELEMENTWISE / REQ-ERR. `multiply` with an incompatible shape
+/// returns `Err`, where scipy raises `ValueError: inconsistent shapes`.
+#[test]
+fn csc_multiply_shape_mismatch_is_err() {
+    let a = sample_a();
+    // empty 2x3 matrix (shape (2,3) vs A's (3,3))
+    let c = CscMatrix::<f64>::new(2, 3, vec![0, 0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.multiply(&c).is_err(),
+        "shape-mismatched multiply must return Err (scipy raises ValueError)"
+    );
+}
+
+/// REQ-MISSING-ELEMENTWISE / REQ-ERR. `sub` with an incompatible shape returns
+/// `Err`, where scipy raises `ValueError: inconsistent shapes`.
+#[test]
+fn csc_sub_shape_mismatch_is_err() {
+    let a = sample_a();
+    // empty 2x3 matrix (shape (2,3) vs A's (3,3))
+    let c = CscMatrix::<f64>::new(2, 3, vec![0, 0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.sub(&c).is_err(),
+        "shape-mismatched sub must return Err (scipy raises ValueError)"
+    );
+}
