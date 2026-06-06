@@ -634,3 +634,124 @@ def test_pca_get_covariance_and_precision_match_sklearn():
     sk_prec = sk.get_precision()
     assert fr_prec.shape == sk_prec.shape == (X.shape[1], X.shape[1])
     np.testing.assert_allclose(fr_prec, sk_prec, atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# RED pins: PCA whiten x {get_covariance, score, score_samples, get_precision}
+# cross-param divergences (critic re-audit of #2098/#2099/#2100).
+#
+# sklearn's get_covariance/get_precision/score/score_samples are computed from
+# the fitted model and, when whiten=True, rescale components_ by
+# sqrt(explained_variance_) (`sklearn/decomposition/_base.py:44-45` and
+# `:84-86`). They are therefore well-defined for whiten=True and DIFFER from the
+# whiten=False values (because sklearn stores `components_` identically for both
+# whiten settings, so the in-method rescale changes the result).
+#
+# ferrolearn's FittedPCA::get_covariance (`ferrolearn-decomp/src/pca.rs:328`)
+# ignores the whiten flag, and FittedPCA::precision_and_logdet
+# (`pca.rs:407-411`) short-circuits with an error whenever whiten==true, so the
+# whitened score/score_samples/get_precision raise ValueError.
+#
+# R-CHAR-3: every expected value is computed by the LIVE sklearn 1.5.2 oracle in
+# the same test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+# 6x3 fixture (rank 3, n_components=2 discards one eigenvalue -> noise_variance_>0).
+_XW = np.array(
+    [
+        [1.0, 2.0, 3.0],
+        [4.0, 5.0, 7.0],
+        [2.0, 0.0, 1.0],
+        [8.0, 6.0, 5.0],
+        [3.0, 3.0, 2.0],
+        [0.0, 1.0, 4.0],
+    ]
+)
+
+
+def test_red_pca_whiten_get_covariance_matches_sklearn():
+    """Divergence: PCA(whiten=True).get_covariance() ignores whiten in ferrolearn.
+
+    sklearn `get_covariance` rescales `components_` by `sqrt(explained_variance_)`
+    when `whiten=True` (`sklearn/decomposition/_base.py:44-45`), so the whitened
+    covariance DIFFERS from the whiten=False covariance. ferrolearn
+    `FittedPCA::get_covariance` (`ferrolearn-decomp/src/pca.rs:328`) ignores the
+    whiten flag and returns the whiten=False covariance.
+
+    Tracking: #2107.
+    """
+    sk_w = SkPCA(n_components=2, whiten=True).fit(_XW)
+    sk_nw = SkPCA(n_components=2, whiten=False).fit(_XW)
+
+    # Oracle invariant: the whitened covariance is genuinely different from the
+    # un-whitened one (otherwise ferrolearn returning the un-whitened value would
+    # not be a divergence). This pins the test to sklearn's actual behavior.
+    assert not np.allclose(sk_w.get_covariance(), sk_nw.get_covariance())
+
+    fr_w = fl.PCA(n_components=2, whiten=True).fit(_XW)
+    # ferrolearn's whitened covariance must equal sklearn's whitened covariance.
+    np.testing.assert_allclose(fr_w.get_covariance(), sk_w.get_covariance(), atol=1e-6)
+
+
+def test_red_pca_whiten_score_and_precision_match_sklearn():
+    """Divergence: PCA(whiten=True) score/score_samples/get_precision raise in ferrolearn.
+
+    sklearn computes these from the model regardless of `whiten`
+    (`sklearn/decomposition/_base.py:84-86`, `_pca.py:805-853`), returning finite
+    values for whiten=True. ferrolearn `FittedPCA::precision_and_logdet`
+    (`ferrolearn-decomp/src/pca.rs:407-411`) errors whenever `whiten==true`, so
+    the PyO3 binding raises ValueError for all three.
+
+    Tracking: #2108.
+    """
+    sk_w = SkPCA(n_components=2, whiten=True).fit(_XW)
+
+    fr_w = fl.PCA(n_components=2, whiten=True).fit(_XW)
+
+    # score(X): match the live oracle (whiten-specific value).
+    assert abs(fr_w.score(_XW) - sk_w.score(_XW)) < 1e-6
+
+    # score_samples(X): match element-wise.
+    np.testing.assert_allclose(
+        fr_w.score_samples(_XW), sk_w.score_samples(_XW), atol=1e-6
+    )
+
+    # get_precision(): match the live oracle.
+    np.testing.assert_allclose(
+        fr_w.get_precision(), sk_w.get_precision(), atol=1e-6
+    )
+
+
+# ---------------------------------------------------------------------------
+# RED pin: PCA(n_components=<float ratio>) (critic re-audit of #2097).
+#
+# sklearn PCA accepts a float n_components in (0, 1] and selects the smallest
+# number of components whose CUMULATIVE explained_variance_ratio_ is >= the
+# value (`sklearn/decomposition/_pca.py:409`, float branch `:659-681`). The
+# ferrolearn wrapper `_transformers.py::PCA.fit` passes n_components straight
+# into `_RsPCA(n_components=...)` whose PyO3 signature is `usize`, so a float
+# raises TypeError. The downstream Rust DOES support NComponents::Ratio
+# (REQ-13a) but the binding never threads the float.
+#
+# R-CHAR-3: the expected n_components_ comes from the live sklearn oracle.
+# ---------------------------------------------------------------------------
+
+
+def test_red_pca_n_components_float_ratio_matches_sklearn():
+    """Divergence: ferrolearn.PCA(n_components=0.95) raises; sklearn selects by ratio.
+
+    sklearn `PCA(n_components=0.95)` selects the smallest component count whose
+    cumulative `explained_variance_ratio_` is >= 0.95
+    (`sklearn/decomposition/_pca.py:659-681`); on the 6x3 fixture this is
+    `n_components_ == 2`. ferrolearn's wrapper passes the float into a usize-typed
+    binding and raises TypeError.
+
+    Tracking: #2109.
+    """
+    sk = SkPCA(n_components=0.95).fit(_XW)
+    # Oracle: a float ratio is accepted and resolves to a concrete count.
+    assert sk.n_components_ == 2
+
+    fr = fl.PCA(n_components=0.95).fit(_XW)
+    assert fr.n_components_ == sk.n_components_
+    assert fr.components_.shape == sk.components_.shape
