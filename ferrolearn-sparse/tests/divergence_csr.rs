@@ -510,3 +510,64 @@ fn csr_get_out_of_bounds_is_err() {
         Err(ferrolearn_core::FerroError::InvalidParameter { .. })
     ));
 }
+
+use ferrolearn_core::FerroError;
+
+/// REQ-MISSING-INDEX (max/min). `max()`/`min()` fold an implicit zero when the
+/// matrix is not fully dense (`nnz < n_rows*n_cols`), mirroring scipy
+/// `_minmax_mixin._min_or_max(axis=None)` (`scipy/sparse/_data.py:208`-`:224`).
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[-3.,0,0],[0,-1,0],[0,0,-5]]));
+///   print(A.max(), A.min())"`): `0.0 -5.0` — the all-negative diagonal makes the
+/// implicit zero the maximum.
+#[test]
+fn csr_max_folds_implicit_zero() -> Result<(), FerroError> {
+    // A = diag(-3, -1, -5), 3x3, nnz 3 < 9.
+    let a = CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![-3.0_f64, -1.0, -5.0],
+    )?;
+    assert_eq!(a.max(), 0.0);
+    assert_eq!(a.min(), -5.0);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (max/min). Symmetric to the negative-diagonal case: an
+/// all-positive diagonal makes the implicit zero the minimum.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   B=sp.csr_matrix(np.array([[3.,0,0],[0,1,0],[0,0,5]]));
+///   print(B.max(), B.min())"`): `5.0 0.0`.
+#[test]
+fn csr_min_folds_implicit_zero() -> Result<(), FerroError> {
+    // B = diag(3, 1, 5), 3x3, nnz 3 < 9.
+    let b = CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![3.0_f64, 1.0, 5.0],
+    )?;
+    assert_eq!(b.max(), 5.0);
+    assert_eq!(b.min(), 0.0);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (max/min). A fully dense matrix (`nnz == n_rows*n_cols`)
+/// has no implicit zero to fold, so `max()`/`min()` are pure stored-value
+/// reductions.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   C=sp.csr_matrix(np.array([[2.,7]])); print(C.max(), C.min())"`): `7.0 2.0`.
+#[test]
+fn csr_max_min_dense_no_implicit_zero() -> Result<(), FerroError> {
+    // C = [[2, 7]], 1x2, fully dense (nnz 2 == 2).
+    let c = CsrMatrix::new(1, 2, vec![0, 2], vec![0, 1], vec![2.0_f64, 7.0])?;
+    assert_eq!(c.max(), 7.0);
+    assert_eq!(c.min(), 2.0);
+    Ok(())
+}
