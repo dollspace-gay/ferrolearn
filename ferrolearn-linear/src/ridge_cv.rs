@@ -149,11 +149,24 @@ impl<F: Float> FittedRidgeCV<F> {
     }
 }
 
-/// Split sample indices into `k` roughly equal folds.
+/// Split sample indices into `k` CONTIGUOUS folds, mirroring sklearn
+/// `KFold(shuffle=False)` (`sklearn/model_selection/_split.py`, `_BaseKFold`):
+/// `fold_sizes = full(n_splits, n_samples // n_splits)`,
+/// `fold_sizes[: n_samples % n_splits] += 1`, then yield consecutive index
+/// blocks. The first `n_samples % k` folds get one extra element; folds are
+/// contiguous ranges, NOT round-robin. The `cv = Some(k)` k-fold path resolves
+/// to this splitter because sklearn's `GridSearchCV(estimator, cv=k)`
+/// (`_ridge.py:2429`) uses `KFold(n_splits=k, shuffle=False)` for a regressor.
+/// (Prior identical fix for LassoCV: #421, commit abf5a14.)
 fn kfold_indices(n_samples: usize, k: usize) -> Vec<Vec<usize>> {
-    let mut folds: Vec<Vec<usize>> = (0..k).map(|_| Vec::new()).collect();
-    for i in 0..n_samples {
-        folds[i % k].push(i);
+    let base = n_samples / k;
+    let rem = n_samples % k;
+    let mut folds = Vec::with_capacity(k);
+    let mut current = 0;
+    for f in 0..k {
+        let fold_size = base + if f < rem { 1 } else { 0 };
+        folds.push((current..current + fold_size).collect());
+        current += fold_size;
     }
     folds
 }
@@ -815,5 +828,80 @@ mod tests {
         let mut all: Vec<usize> = folds.into_iter().flatten().collect();
         all.sort();
         assert_eq!(all, (0..10).collect::<Vec<_>>());
+    }
+
+    /// `kfold_indices` must produce CONTIGUOUS folds matching sklearn
+    /// `KFold(shuffle=False)` (`_split.py`, `_BaseKFold`), NOT round-robin.
+    /// Oracle: `KFold(n_splits=k).split(arange(n))` test folds (live
+    /// sklearn 1.5.2). The first `n % k` folds get one extra element.
+    #[test]
+    fn kfold_indices_contiguous_matches_sklearn() {
+        // n=7, k=3 → first 1 fold gets the extra: [0,1,2],[3,4],[5,6].
+        assert_eq!(
+            kfold_indices(7, 3),
+            vec![vec![0, 1, 2], vec![3, 4], vec![5, 6]]
+        );
+        // n=8, k=4 → n % k == 0, all equal: [0,1],[2,3],[4,5],[6,7].
+        assert_eq!(
+            kfold_indices(8, 4),
+            vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
+        );
+        // n=10, k=3 → first 1 fold gets the extra: [0,1,2,3],[4,5,6],[7,8,9].
+        assert_eq!(
+            kfold_indices(10, 3),
+            vec![vec![0, 1, 2, 3], vec![4, 5, 6], vec![7, 8, 9]]
+        );
+    }
+
+    /// End-to-end `RidgeCV` with explicit `cv = Some(4)` on a fixed fixture
+    /// (no RNG), isolating the CONTIGUOUS-fold contract from the scoring
+    /// metric. ferrolearn's k-fold path averages per-fold MSE, so the matching
+    /// oracle is sklearn under `scoring='neg_mean_squared_error'` (live sklearn
+    /// 1.5.2): `RidgeCV(alphas=[0.1,1.0,10.0], cv=4,
+    /// scoring='neg_mean_squared_error').fit(X, y)` → `alpha_ = 0.1`,
+    /// `coef_ = [1.200451, 0.551174, 0.370867]`, `intercept_ = -0.048887`.
+    /// This pins that the contiguous folds (`_ridge.py:2429`
+    /// `GridSearchCV(cv=k)` → `KFold(shuffle=False)`) drive the train/test
+    /// partition correctly.
+    ///
+    /// NOTE: sklearn's DEFAULT `GridSearchCV` scoring for a regressor is R²,
+    /// under which the same call selects `alpha_ = 1.0`. ferrolearn's MSE
+    /// scoring is a SEPARATE divergence from this fold fix (issue #429) and is
+    /// out of scope here (R-FIX-1: one divergence per dispatch); it is reported
+    /// as a spillover finding.
+    #[test]
+    fn ridge_cv_explicit_cv4_selects_alpha_matches_sklearn() -> Result<(), FerroError> {
+        let x = Array2::from_shape_vec(
+            (8, 3),
+            vec![
+                1.0, 0.0, 2.0, //
+                0.0, 1.0, 1.0, //
+                2.0, 1.0, 0.0, //
+                1.0, 2.0, 1.0, //
+                0.0, 0.0, 3.0, //
+                3.0, 1.0, 2.0, //
+                1.0, 1.0, 1.0, //
+                2.0, 0.0, 1.0,
+            ],
+        )
+        .map_err(|e| FerroError::NumericalInstability {
+            message: format!("test fixture build failed: {e}"),
+        })?;
+        let y = array![2.0, 1.0, 3.0, 2.5, 1.0, 5.0, 2.0, 2.5];
+
+        let model = RidgeCV::<f64>::new()
+            .with_alphas(vec![0.1, 1.0, 10.0])
+            .with_cv(4);
+        let fitted = model.fit(&x, &y)?;
+
+        assert_relative_eq!(fitted.best_alpha(), 0.1, epsilon = 1e-9);
+
+        let coef = fitted.coefficients();
+        assert_relative_eq!(coef[0], 1.200_451, epsilon = 1e-5);
+        assert_relative_eq!(coef[1], 0.551_174, epsilon = 1e-5);
+        assert_relative_eq!(coef[2], 0.370_867, epsilon = 1e-5);
+        assert_relative_eq!(fitted.intercept(), -0.048_887, epsilon = 1e-5);
+
+        Ok(())
     }
 }
