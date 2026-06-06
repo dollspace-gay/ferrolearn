@@ -193,7 +193,7 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         self.__dict__.update(state)
 
 
-class Lasso(RegressorMixin, BaseEstimator):
+class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
     """Lasso regression backed by Rust.
 
     Parameters
@@ -215,6 +215,68 @@ class Lasso(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
+        # Detect multi-output BEFORE validation. sklearn `Lasso` (subclass of
+        # `ElasticNet(MultiOutputMixin, ...)`) fits each target column
+        # INDEPENDENTLY via a per-target coordinate-descent loop
+        # (`sklearn/linear_model/_coordinate_descent.py:1071-1101`), producing
+        # `coef_` `(n_targets, n_features)`, `intercept_` `(n_targets,)`,
+        # `n_iter_` a PER-TARGET LIST, and `dual_gap_` `(n_targets,)`
+        # (`:1108-1111`). A 2-D `y` — including a single-column `(n, 1)` — routes
+        # to this path (`:1054` keeps `y` 2-D); sklearn verified: multi `coef_`
+        # equals the stack of per-target single-output fits (NOT MultiTaskLasso).
+        # The `MultiOutputMixin` tag tells `check_supervised_y_2d` so there is no
+        # DataConversionWarning (#2126).
+        #
+        # n_targets == 1 COLLAPSE (differs from Ridge/LinearRegression): the CD
+        # path collapses a single-target fit — INCLUDING a `(n, 1)` `y` — back to
+        # 1-D `coef_`, scalar `n_iter_`, scalar `dual_gap_`, and `(n,)` `predict`
+        # (`_coordinate_descent.py:1106-1108` `if n_targets == 1`). Only
+        # `intercept_` stays a length-1 array `(1,)` from `_set_intercept`
+        # (`_base.py:319` `y_offset` is `(1,)`). Verified live on the sklearn
+        # 1.5.2 oracle (#2126).
+        y_arr = np.asarray(y)
+        if y_arr.ndim == 2:
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            coef_list = []
+            intercept_list = []
+            n_iter_list = []
+            dual_gap_list = []
+            self._rs_list = []
+            for j in range(y.shape[1]):
+                rs_j = _RsLasso(
+                    alpha=self.alpha,
+                    max_iter=self.max_iter,
+                    tol=self.tol,
+                    fit_intercept=self.fit_intercept,
+                )
+                _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
+                coef_list.append(np.array(rs_j.coef_))
+                intercept_list.append(float(rs_j.intercept_))
+                n_iter_list.append(int(rs_j.n_iter_))
+                dual_gap_list.append(float(rs_j.dual_gap_))
+                self._rs_list.append(rs_j)
+            n_targets = y.shape[1]
+            if n_targets == 1:
+                # Collapse coef_/n_iter_/dual_gap_ for the single target
+                # (`_coordinate_descent.py:1106-1108`), but `intercept_` keeps its
+                # `(1,)` shape (or scalar 0.0 when fit_intercept is False).
+                self.coef_ = coef_list[0]
+                self.n_iter_ = n_iter_list[0]
+                self.dual_gap_ = dual_gap_list[0]
+            else:
+                self.coef_ = np.vstack(coef_list)
+                # sklearn's `n_iter_` is the per-target Python list (`:1101`).
+                self.n_iter_ = n_iter_list
+                self.dual_gap_ = np.array(dual_gap_list)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(intercept_list) if self.fit_intercept else 0.0
+            )
+            return self
         X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsLasso(
@@ -234,6 +296,11 @@ class Lasso(RegressorMixin, BaseEstimator):
         check_is_fitted(self)
         X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
+        # Multi-output: no single `_rs`; use the stored coefficients so the
+        # result is `(n_samples, n_targets)` (`X @ coef_.T + intercept_`) and
+        # pickle round-trips work without rebuilding the Rust estimators.
+        if np.asarray(self.coef_).ndim == 2:
+            return _predict_linear(X, self.coef_, self.intercept_)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))
         return _predict_linear(X, self.coef_, self.intercept_)
@@ -241,13 +308,14 @@ class Lasso(RegressorMixin, BaseEstimator):
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_rs", None)
+        state.pop("_rs_list", None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
 
 
-class ElasticNet(RegressorMixin, BaseEstimator):
+class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
     """ElasticNet regression backed by Rust.
 
     Parameters
@@ -274,6 +342,68 @@ class ElasticNet(RegressorMixin, BaseEstimator):
         self.fit_intercept = fit_intercept
 
     def fit(self, X, y):
+        # Detect multi-output BEFORE validation. sklearn `ElasticNet`
+        # (`class ElasticNet(MultiOutputMixin, RegressorMixin, LinearModel)`)
+        # fits each target column INDEPENDENTLY via a per-target
+        # coordinate-descent loop
+        # (`sklearn/linear_model/_coordinate_descent.py:1071-1101`), producing
+        # `coef_` `(n_targets, n_features)`, `intercept_` `(n_targets,)`,
+        # `n_iter_` a PER-TARGET LIST, and `dual_gap_` `(n_targets,)`
+        # (`:1108-1111`). A 2-D `y` — including a single-column `(n, 1)` — routes
+        # here; sklearn verified: multi `coef_` equals the stack of per-target
+        # single-output fits (NOT MultiTaskElasticNet). The `MultiOutputMixin`
+        # tag means no DataConversionWarning (#2126).
+        #
+        # n_targets == 1 COLLAPSE (differs from Ridge/LinearRegression): the CD
+        # path collapses a single-target fit — INCLUDING a `(n, 1)` `y` — back to
+        # 1-D `coef_`, scalar `n_iter_`, scalar `dual_gap_`, and `(n,)` `predict`
+        # (`_coordinate_descent.py:1106-1108` `if n_targets == 1`). Only
+        # `intercept_` stays a length-1 array `(1,)` from `_set_intercept`
+        # (`_base.py:319`). Verified live on the sklearn 1.5.2 oracle (#2126).
+        y_arr = np.asarray(y)
+        if y_arr.ndim == 2:
+            X, y = self._validate_data(
+                X, y, dtype="float64", multi_output=True, y_numeric=True
+            )
+            X, y = _ensure_f64(X), _ensure_f64(y)
+            coef_list = []
+            intercept_list = []
+            n_iter_list = []
+            dual_gap_list = []
+            self._rs_list = []
+            for j in range(y.shape[1]):
+                rs_j = _RsElasticNet(
+                    alpha=self.alpha,
+                    l1_ratio=self.l1_ratio,
+                    max_iter=self.max_iter,
+                    tol=self.tol,
+                    fit_intercept=self.fit_intercept,
+                )
+                _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
+                coef_list.append(np.array(rs_j.coef_))
+                intercept_list.append(float(rs_j.intercept_))
+                n_iter_list.append(int(rs_j.n_iter_))
+                dual_gap_list.append(float(rs_j.dual_gap_))
+                self._rs_list.append(rs_j)
+            n_targets = y.shape[1]
+            if n_targets == 1:
+                # Collapse coef_/n_iter_/dual_gap_ for the single target
+                # (`_coordinate_descent.py:1106-1108`), but `intercept_` keeps its
+                # `(1,)` shape (or scalar 0.0 when fit_intercept is False).
+                self.coef_ = coef_list[0]
+                self.n_iter_ = n_iter_list[0]
+                self.dual_gap_ = dual_gap_list[0]
+            else:
+                self.coef_ = np.vstack(coef_list)
+                # sklearn's `n_iter_` is the per-target Python list (`:1101`).
+                self.n_iter_ = n_iter_list
+                self.dual_gap_ = np.array(dual_gap_list)
+            # sklearn `_set_intercept` sets a scalar `0.0` when fit_intercept is
+            # False, regardless of target count (`_base.py:327`).
+            self.intercept_ = (
+                np.array(intercept_list) if self.fit_intercept else 0.0
+            )
+            return self
         X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
         self._rs = _RsElasticNet(
@@ -294,6 +424,11 @@ class ElasticNet(RegressorMixin, BaseEstimator):
         check_is_fitted(self)
         X = self._validate_data(X, reset=False, dtype="float64")
         X = _ensure_f64(X)
+        # Multi-output: no single `_rs`; use the stored coefficients so the
+        # result is `(n_samples, n_targets)` (`X @ coef_.T + intercept_`) and
+        # pickle round-trips work without rebuilding the Rust estimators.
+        if np.asarray(self.coef_).ndim == 2:
+            return _predict_linear(X, self.coef_, self.intercept_)
         if hasattr(self, "_rs"):
             return np.array(self._rs.predict(X))
         return _predict_linear(X, self.coef_, self.intercept_)
@@ -301,6 +436,7 @@ class ElasticNet(RegressorMixin, BaseEstimator):
     def __getstate__(self):
         state = self.__dict__.copy()
         state.pop("_rs", None)
+        state.pop("_rs_list", None)
         return state
 
     def __setstate__(self, state):

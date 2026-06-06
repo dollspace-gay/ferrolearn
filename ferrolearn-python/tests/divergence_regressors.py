@@ -711,3 +711,242 @@ def test_red_linearregression_multioutput_pickle_predict_shape():
     fr_pred = fr_un.predict(X)
     assert fr_pred.shape == sk.predict(X).shape
     np.testing.assert_allclose(fr_pred, sk.predict(X), atol=1e-8)
+
+
+# ---------------------------------------------------------------------------
+# Multi-output Lasso / ElasticNet (unit #2126) — sklearn fits each target
+# INDEPENDENTLY (multi `coef_` == stack of per-target single-output fits, NOT
+# the coupled MultiTask variant). The wrapper loops the existing single-output
+# `_RsLasso`/`_RsElasticNet` per target column on the `y.ndim == 2` gate,
+# mirroring the just-committed multi-output Ridge/LinearRegression shape
+# contract. `n_iter_` is the per-target Python list; `dual_gap_` is `(n_targets,)`
+# (`sklearn/linear_model/_coordinate_descent.py:1071-1111`). Every expected value
+# is computed by the LIVE sklearn 1.5.2 oracle in the same test (R-CHAR-3).
+# ---------------------------------------------------------------------------
+
+# Director's verified oracle fixture (sklearn 1.5.2), alpha=0.5.
+_X_MO = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+_Y_MO = np.array(
+    [[3.0, 1.0], [2.5, 2.0], [7.1, 0.0], [6.0, 3.0], [11.2, 1.0]]
+)
+
+
+def test_lasso_multioutput_matches_sklearn():
+    """`ferrolearn.Lasso` fits 2-D `Y` (multi-output), matching sklearn EXACTLY.
+
+    sklearn `Lasso` (subclass of `ElasticNet(MultiOutputMixin, ...)`) fits each
+    target column independently in a per-target coordinate-descent loop
+    (`sklearn/linear_model/_coordinate_descent.py:1071-1101`), so `coef_` is
+    `(n_targets, n_features)`, `intercept_` is `(n_targets,)`, `n_iter_` is the
+    per-target Python list (`:1101`, no single-target collapse at `:1106`), and
+    `dual_gap_` is `(n_targets,)` (`:1111`). The wrapper loops the single-output
+    `_RsLasso` per target column on the `y.ndim == 2` gate.
+
+    Oracle (R-CHAR-3): every expected value comes from the LIVE sklearn 1.5.2
+    call here. (Verified oracle: coef_ (2,2), intercept_=[-0.10680734, 1.55],
+    n_iter_=[20, 2].)
+    """
+    sk = SkLasso(alpha=0.5).fit(_X_MO, _Y_MO)
+    fr = fl.Lasso(alpha=0.5).fit(_X_MO, _Y_MO)
+
+    # coef_ is (n_targets, n_features) == (2, 2), matching sklearn.
+    assert fr.coef_.shape == (2, 2)
+    assert fr.coef_.shape == sk.coef_.shape
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-7)
+
+    # intercept_ is (n_targets,) == (2,), matching sklearn.
+    assert fr.intercept_.shape == (2,)
+    assert fr.intercept_.shape == sk.intercept_.shape
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-7)
+
+    # n_iter_ is the per-target LIST, matching sklearn exactly.
+    assert isinstance(fr.n_iter_, list)
+    assert fr.n_iter_ == list(sk.n_iter_)
+
+    # dual_gap_ is (n_targets,), matching sklearn.
+    assert np.shape(fr.dual_gap_) == np.shape(sk.dual_gap_) == (2,)
+    np.testing.assert_allclose(fr.dual_gap_, sk.dual_gap_, atol=1e-9)
+
+    # predict returns (n_samples, n_targets), matching sklearn element-wise.
+    fr_pred = fr.predict(_X_MO[:2])
+    sk_pred = sk.predict(_X_MO[:2])
+    assert fr_pred.shape == sk_pred.shape == (2, 2)
+    np.testing.assert_allclose(fr_pred, sk_pred, atol=1e-7)
+
+    # Independence check: multi coef_ == stack of per-target single-output fits.
+    stacked = np.stack(
+        [fl.Lasso(alpha=0.5).fit(_X_MO, _Y_MO[:, j]).coef_ for j in range(2)]
+    )
+    np.testing.assert_allclose(fr.coef_, stacked, atol=1e-12)
+
+
+def test_elasticnet_multioutput_matches_sklearn():
+    """`ferrolearn.ElasticNet` fits 2-D `Y` (multi-output), matching sklearn.
+
+    sklearn `ElasticNet(MultiOutputMixin, RegressorMixin, LinearModel)` fits each
+    target column independently (per-target CD loop
+    `sklearn/linear_model/_coordinate_descent.py:1071-1101`): `coef_`
+    `(n_targets, n_features)`, `intercept_` `(n_targets,)`, `n_iter_` the
+    per-target list (`:1101`), `dual_gap_` `(n_targets,)` (`:1111`). The wrapper
+    loops the single-output `_RsElasticNet` per target column.
+
+    Oracle (R-CHAR-3): every expected value comes from the LIVE sklearn 1.5.2
+    call here. (Verified oracle, l1_ratio=0.5:
+    intercept_=[-0.10244714, 1.71171022], n_iter_=[14, 14].)
+    """
+    sk = SkElasticNet(alpha=0.5, l1_ratio=0.5).fit(_X_MO, _Y_MO)
+    fr = fl.ElasticNet(alpha=0.5, l1_ratio=0.5).fit(_X_MO, _Y_MO)
+
+    assert fr.coef_.shape == (2, 2)
+    assert fr.coef_.shape == sk.coef_.shape
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-7)
+
+    assert fr.intercept_.shape == (2,)
+    assert fr.intercept_.shape == sk.intercept_.shape
+    np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-7)
+
+    assert isinstance(fr.n_iter_, list)
+    assert fr.n_iter_ == list(sk.n_iter_)
+
+    assert np.shape(fr.dual_gap_) == np.shape(sk.dual_gap_) == (2,)
+    np.testing.assert_allclose(fr.dual_gap_, sk.dual_gap_, atol=1e-9)
+
+    fr_pred = fr.predict(_X_MO[:2])
+    sk_pred = sk.predict(_X_MO[:2])
+    assert fr_pred.shape == sk_pred.shape == (2, 2)
+    np.testing.assert_allclose(fr_pred, sk_pred, atol=1e-7)
+
+    stacked = np.stack(
+        [
+            fl.ElasticNet(alpha=0.5, l1_ratio=0.5).fit(_X_MO, _Y_MO[:, j]).coef_
+            for j in range(2)
+        ]
+    )
+    np.testing.assert_allclose(fr.coef_, stacked, atol=1e-12)
+
+
+def test_lasso_elasticnet_multioutput_column_vector_y():
+    """A column-vector `Y` of shape `(n, 1)` COLLAPSES the single target for both
+    Lasso and ElasticNet, matching sklearn EXACTLY: `coef_` 1-D `(n_features,)`,
+    `intercept_` `(1,)`, scalar `n_iter_`/`dual_gap_`, `predict` `(n,)`.
+
+    This DIFFERS from multi-output Ridge/LinearRegression, which preserve the
+    2-D `(1, n_features)` coef_ for a `(n, 1)` target. sklearn's coordinate-descent
+    path instead collapses `n_targets == 1`
+    (`_coordinate_descent.py:1106-1108` `if n_targets == 1: self.coef_ =
+    coef_[0]`), regardless of whether `y` arrived 1-D or `(n, 1)`. Only
+    `intercept_` stays length-1 (`_set_intercept` `y_offset` is `(1,)`,
+    `_base.py:319`). Oracle (R-CHAR-3): every expected value is the live sklearn
+    1.5.2 call, verified to give 1-D coef_ / `(1,)` intercept_ / `(n,)` predict.
+    """
+    Y1 = _Y_MO[:, [0]]  # shape (5, 1)
+
+    for fr_cls, sk_cls, kw in (
+        (fl.Lasso, SkLasso, {"alpha": 0.5}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.5, "l1_ratio": 0.5}),
+    ):
+        sk = sk_cls(**kw).fit(_X_MO, Y1)
+        fr = fr_cls(**kw).fit(_X_MO, Y1)
+
+        # Live-oracle shapes (R-CHAR-3): never literal-copied from ferrolearn.
+        # sklearn COLLAPSES the single target: coef_ is 1-D, intercept_ is (1,),
+        # n_iter_/dual_gap_ are scalars, predict is (n,).
+        assert sk.coef_.shape == (2,)
+        assert np.shape(sk.intercept_) == (1,)
+        assert np.isscalar(sk.n_iter_) and np.ndim(sk.dual_gap_) == 0
+        assert sk.predict(_X_MO).shape == (5,)
+
+        assert fr.coef_.shape == sk.coef_.shape
+        assert np.shape(fr.intercept_) == np.shape(sk.intercept_)
+        assert np.isscalar(fr.n_iter_) and np.ndim(fr.dual_gap_) == 0
+        assert fr.predict(_X_MO).shape == sk.predict(_X_MO).shape
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-7)
+        np.testing.assert_allclose(fr.intercept_, sk.intercept_, atol=1e-7)
+        np.testing.assert_allclose(fr.predict(_X_MO), sk.predict(_X_MO), atol=1e-7)
+        assert fr.n_iter_ == sk.n_iter_
+        assert abs(float(fr.dual_gap_) - float(sk.dual_gap_)) < 1e-9
+
+
+def test_lasso_elasticnet_multioutput_no_intercept_scalar_zero():
+    """`ferrolearn.Lasso`/`ElasticNet(fit_intercept=False)` on 2-D `y` exposes
+    `intercept_` as the scalar `0.0` (ndim 0), matching sklearn EXACTLY.
+
+    sklearn sets `intercept_` to the scalar `0.0` whenever `fit_intercept=False`,
+    regardless of target dimensionality (`sklearn/linear_model/_base.py:327`).
+    Oracle (R-CHAR-3): the live sklearn call is ground truth (scalar 0.0).
+    """
+    for fr_cls, sk_cls, kw in (
+        (fl.Lasso, SkLasso, {"alpha": 0.5}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.5, "l1_ratio": 0.5}),
+    ):
+        sk = sk_cls(fit_intercept=False, **kw).fit(_X_MO, _Y_MO)
+        fr = fr_cls(fit_intercept=False, **kw).fit(_X_MO, _Y_MO)
+
+        # Live-oracle ground truth (R-CHAR-3): sklearn intercept_ is scalar 0.0.
+        assert np.ndim(sk.intercept_) == 0
+        assert float(sk.intercept_) == 0.0
+
+        assert np.ndim(fr.intercept_) == np.ndim(sk.intercept_)
+        assert float(fr.intercept_) == 0.0
+
+        # coef_ still (n_targets, n_features) and matches the oracle.
+        assert fr.coef_.shape == sk.coef_.shape == (2, 2)
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-7)
+
+
+def test_lasso_elasticnet_singleoutput_unchanged_by_multioutput_path():
+    """Single-output `ferrolearn.Lasso`/`ElasticNet` (1-D `y`) is UNCHANGED: 1-D
+    `coef_`, scalar `intercept_`, SCALAR `n_iter_` (int, #2043) and SCALAR
+    `dual_gap_` (float, #2096), 1-D `predict` — matching sklearn (R-CHAR-3).
+
+    Guards that the multi-output routing did not regress the 1-D path.
+    """
+    y = _Y_MO[:, 0]  # shape (5,)
+
+    for fr_cls, sk_cls, kw in (
+        (fl.Lasso, SkLasso, {"alpha": 0.5}),
+        (fl.ElasticNet, SkElasticNet, {"alpha": 0.5, "l1_ratio": 0.5}),
+    ):
+        sk = sk_cls(**kw).fit(_X_MO, y)
+        fr = fr_cls(**kw).fit(_X_MO, y)
+
+        assert fr.coef_.ndim == 1
+        assert fr.coef_.shape == sk.coef_.shape == (2,)
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-7)
+
+        # intercept_ scalar float (not array), matching the 1-D contract.
+        assert np.isscalar(fr.intercept_) or np.ndim(fr.intercept_) == 0
+        assert abs(float(fr.intercept_) - float(sk.intercept_)) < 1e-7
+
+        # n_iter_ is a scalar int (#2043), dual_gap_ a scalar float (#2096) —
+        # NOT a list/array as on the multi-output path.
+        assert np.isscalar(fr.n_iter_) and not isinstance(fr.n_iter_, list)
+        assert fr.n_iter_ == sk.n_iter_
+        assert np.isscalar(fr.dual_gap_) and np.ndim(fr.dual_gap_) == 0
+        assert abs(float(fr.dual_gap_) - float(sk.dual_gap_)) < 1e-9
+
+        fr_pred = fr.predict(_X_MO[:2])
+        assert fr_pred.ndim == 1
+        np.testing.assert_allclose(fr_pred, sk.predict(_X_MO[:2]), atol=1e-7)
+
+
+def test_lasso_elasticnet_multioutput_pickle_predict_shape():
+    """A pickled-then-unpickled multi-output `ferrolearn.Lasso`/`ElasticNet`
+    round-trips `predict` identically (no shape error), since multi-output
+    `predict` uses `coef_`/`intercept_` (not the popped `_rs_list`).
+
+    sklearn's pickle round-trip leaves `predict` unchanged. Oracle (R-CHAR-3):
+    sklearn's live unpickled predict is the ground truth.
+    """
+    import pickle
+
+    for fr_cls, kw in (
+        (fl.Lasso, {"alpha": 0.5}),
+        (fl.ElasticNet, {"alpha": 0.5, "l1_ratio": 0.5}),
+    ):
+        fr = fr_cls(**kw).fit(_X_MO, _Y_MO)
+        fr_un = pickle.loads(pickle.dumps(fr))
+        np.testing.assert_allclose(
+            fr_un.predict(_X_MO), fr.predict(_X_MO), atol=1e-12
+        )
+        assert fr_un.predict(_X_MO).shape == (5, 2)
