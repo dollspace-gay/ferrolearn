@@ -18,7 +18,7 @@
 //! concrete blocker). Values are oracle-verified element-wise vs the live scipy
 //! (R-CHAR-3) — see `tests/divergence_interpolate.rs`.
 //!
-//! **8 SHIPPED / 6 NOT-STARTED.**
+//! **9 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -29,7 +29,7 @@
 //! | REQ-DEFAULT-BC (default bc_type) | NOT-STARTED | `new` requires an explicit `BoundaryCondition`; scipy defaults `bc_type='not-a-knot'`. Blocker #1958. |
 //! | REQ-MISSING-BC (clamped/periodic/custom) | NOT-STARTED | only Natural + NotAKnot; scipy also `'clamped'`/`'periodic'`/custom `((order,value),…)`. Blocker #1959. |
 //! | REQ-PPOLY-API (PPoly methods/attrs) | NOT-STARTED | no general-`nu` call, spline-returning `derivative()`/`antiderivative()`, `roots()`/`solve()`, `.c`/`.x`, `extrapolate=False`. Blocker #1960. |
-//! | REQ-ERR-TYPE (error type) | NOT-STARTED | `Result<_, String>` vs `FerroError`/scipy `ValueError`. Blocker #1961. |
+//! | REQ-ERR-TYPE (error type) | SHIPPED | FIXED #1961: `pub fn new in interpolate.rs` now returns `Result<Self, FerroError>` — all three input-validation sites return `FerroError::InvalidParameter { name: "x", reason }` (length mismatch / `< 2` points / non-increasing `x`), the ferrolearn analog of scipy's `prepare_input` `ValueError` (`scipy/interpolate/_cubic.py:50` `"`x` must contain at least 2 elements."`, line 51-53 length mismatch, line 65 `"`x` must be strictly increasing sequence."`). Pinned by `cubic_spline_new_invalid_returns_ferroerror` in `tests/divergence_interpolate.rs`. |
 //! | REQ-CONSUMER (production consumer) | NOT-STARTED | no non-test caller (standalone module). Blocker #1962. |
 //! | REQ-FERRAY (ferray substrate) | NOT-STARTED | `ndarray` + hand-rolled Thomas solve vs ferray interpolate/banded-solve (R-SUBSTRATE-1). Blocker #1963. |
 //!
@@ -46,6 +46,7 @@
 //! assert!((val - 2.25).abs() < 0.5); // close to 1.5^2
 //! ```
 
+use ferrolearn_core::error::FerroError;
 use ndarray::Array1;
 
 /// Boundary condition for the cubic spline.
@@ -97,34 +98,48 @@ impl CubicSpline {
     ///
     /// # Errors
     ///
-    /// Returns `Err` if:
+    /// Returns [`FerroError::InvalidParameter`] if:
     /// - `x` and `y` have different lengths.
     /// - Fewer than 2 data points are provided.
     /// - `x` is not strictly increasing.
-    pub fn new(x: &[f64], y: &[f64], bc: BoundaryCondition) -> Result<Self, String> {
+    ///
+    /// This mirrors scipy's `CubicSpline`, whose `prepare_input`
+    /// (`scipy/interpolate/_cubic.py:48-65`) raises `ValueError` on these same
+    /// invalid inputs — `"`x` must contain at least 2 elements."` (line 50), the
+    /// `x`/`y` length mismatch (line 51-53), and `"`x` must be strictly
+    /// increasing sequence."` (line 65). `FerroError::InvalidParameter` is the
+    /// ferrolearn analog of scipy's input-validation `ValueError`.
+    pub fn new(x: &[f64], y: &[f64], bc: BoundaryCondition) -> Result<Self, FerroError> {
         let n_points = x.len();
 
         if n_points != y.len() {
-            return Err(format!(
-                "x and y must have the same length, got {} and {}",
-                n_points,
-                y.len()
-            ));
+            return Err(FerroError::InvalidParameter {
+                name: "x".into(),
+                reason: format!(
+                    "x and y must have the same length, got {} and {}",
+                    n_points,
+                    y.len()
+                ),
+            });
         }
         if n_points < 2 {
-            return Err(format!(
-                "at least 2 data points are required, got {n_points}"
-            ));
+            return Err(FerroError::InvalidParameter {
+                name: "x".into(),
+                reason: format!("at least 2 data points are required, got {n_points}"),
+            });
         }
         for i in 1..n_points {
             if x[i] <= x[i - 1] {
-                return Err(format!(
-                    "x must be strictly increasing, but x[{}] = {} <= x[{}] = {}",
-                    i,
-                    x[i],
-                    i - 1,
-                    x[i - 1]
-                ));
+                return Err(FerroError::InvalidParameter {
+                    name: "x".into(),
+                    reason: format!(
+                        "x must be strictly increasing, but x[{}] = {} <= x[{}] = {}",
+                        i,
+                        x[i],
+                        i - 1,
+                        x[i - 1]
+                    ),
+                });
             }
         }
 
@@ -649,7 +664,10 @@ mod tests {
         let y = [1.0, 2.0, 3.0, 4.0];
 
         let result = CubicSpline::new(&x, &y, BoundaryCondition::Natural);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("strictly increasing"));
+        assert!(matches!(
+            result,
+            Err(FerroError::InvalidParameter { ref reason, .. })
+                if reason.contains("strictly increasing")
+        ));
     }
 }

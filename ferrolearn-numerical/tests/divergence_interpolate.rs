@@ -34,6 +34,7 @@
 //! conditions are identical."). ferrolearn's `solve_not_a_knot_general` has no
 //! analog of this special case.
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_numerical::interpolate::{BoundaryCondition, CubicSpline};
 
 // ===========================================================================
@@ -100,6 +101,69 @@ fn divergence_three_point_not_a_knot_parabola() {
     assert!(
         (got_1_5 - SCIPY_AT_1_5).abs() <= 1e-10,
         "3-point not-a-knot eval(1.5): ferrolearn {got_1_5} vs scipy {SCIPY_AT_1_5} (parabola)"
+    );
+}
+
+// ===========================================================================
+// (1b) GREEN PIN — REQ-ERR-TYPE: error-type parity (`FerroError` vs scipy
+// `ValueError`).
+//
+// scipy's `CubicSpline` validates its inputs in `prepare_input`
+// (`scipy/interpolate/_cubic.py:48-65`) and raises `ValueError` on each of the
+// three bad inputs below. Confirmed LIVE (R-CHAR-3, scipy 1.17.1, run from /tmp):
+//
+//   cd /tmp && python3 -c "
+//   import numpy as np
+//   from scipy.interpolate import CubicSpline
+//   for x, y in [([0.,1.],[0.,1.,2.]), ([0.],[0.]), ([0.,0.,1.],[0.,1.,2.])]:
+//       try:
+//           CubicSpline(np.array(x), np.array(y))
+//       except ValueError as e:
+//           print('ValueError:', str(e).strip())
+//   "
+//   -> length mismatch  -> ValueError: The length of `y` along `axis`=0 doesn't
+//                          match the length of `x`           (_cubic.py:51-53)
+//   -> too few points   -> ValueError: `x` must contain at least 2 elements.
+//                                                            (_cubic.py:50)
+//   -> non-increasing x -> ValueError: `x` must be strictly increasing sequence.
+//                                                            (_cubic.py:65)
+//
+// `FerroError::InvalidParameter` is the ferrolearn analog of scipy's
+// input-validation `ValueError` (cf. `ferrolearn-core/src/error.rs`
+// REQ-4: "Mirrors sklearn `ValueError` from `_parameter_constraints`"). This
+// pin asserts the error TYPE (not the human-readable message) is the
+// `FerroError` contract per CLAUDE.md / R-CODE-2.
+// ===========================================================================
+
+/// REQ-ERR-TYPE: `CubicSpline::new` returns `Err(FerroError::InvalidParameter)`
+/// — NOT `Err(String)` — on each input scipy rejects with `ValueError`
+/// (`scipy/interpolate/_cubic.py:48-65`, `prepare_input`).
+#[test]
+fn cubic_spline_new_invalid_returns_ferroerror() {
+    // (a) x/y length mismatch — scipy `ValueError` (_cubic.py:51-53).
+    let length_mismatch =
+        CubicSpline::new(&[0.0, 1.0], &[0.0, 1.0, 2.0], BoundaryCondition::Natural);
+    assert!(
+        matches!(length_mismatch, Err(FerroError::InvalidParameter { .. })),
+        "x/y length mismatch must return FerroError::InvalidParameter (scipy ValueError)"
+    );
+
+    // (b) fewer than 2 data points — scipy `ValueError` (_cubic.py:50).
+    let too_few = CubicSpline::new(&[0.0], &[0.0], BoundaryCondition::Natural);
+    assert!(
+        matches!(too_few, Err(FerroError::InvalidParameter { .. })),
+        "fewer than 2 points must return FerroError::InvalidParameter (scipy ValueError)"
+    );
+
+    // (c) non-increasing x — scipy `ValueError` (_cubic.py:65).
+    let non_increasing = CubicSpline::new(
+        &[0.0, 0.0, 1.0],
+        &[0.0, 1.0, 2.0],
+        BoundaryCondition::Natural,
+    );
+    assert!(
+        matches!(non_increasing, Err(FerroError::InvalidParameter { .. })),
+        "non-increasing x must return FerroError::InvalidParameter (scipy ValueError)"
     );
 }
 
