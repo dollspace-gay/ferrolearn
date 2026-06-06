@@ -758,3 +758,87 @@ fn csr_sum_duplicates_preserves_zero_sum() -> Result<(), FerroError> {
     assert_eq!(s.data(), &[0.0_f64, 7.0]);
     Ok(())
 }
+
+/// REQ-MISSING-INDEX (maintenance) — `power(n)` raises every stored value to the
+/// power `n`, preserving structure, matching scipy `csr_matrix.power(n)`
+/// (`scipy/sparse/_data.py:99`). Oracle: `csr_matrix(diag([2,-3,4])).power(2)` →
+/// `data=[4,9,16]`; `.power(3)` → `data=[8,-27,64]`.
+#[test]
+fn csr_power_squares_matches_scipy() -> Result<(), FerroError> {
+    // diag([2,-3,4]): CSR data=[2,-3,4], indptr=[0,1,2,3], indices=[0,1,2], (3,3).
+    let m = CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![2.0_f64, -3.0, 4.0],
+    )?;
+
+    let p2 = m.power(2.0)?;
+    // scipy: data [4,9,16], indptr [0,1,2,3], indices [0,1,2] (exact in f64).
+    assert_eq!(p2.data(), &[4.0_f64, 9.0, 16.0]);
+    assert_eq!(p2.indptr(), vec![0, 1, 2, 3]);
+    assert_eq!(p2.indices(), &[0, 1, 2]);
+    // scipy dense [[4,0,0],[0,9,0],[0,0,16]].
+    let expected = [[4.0, 0.0, 0.0], [0.0, 9.0, 0.0], [0.0, 0.0, 16.0]];
+    assert_dense_eq(&p2.to_dense(), &expected);
+
+    let p3 = m.power(3.0)?;
+    // scipy: data [8,-27,64].
+    assert_eq!(p3.data(), &[8.0_f64, -27.0, 64.0]);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `power(0.5)` is the element-wise square
+/// root, matching scipy `csr_matrix.power(0.5)` (`scipy/sparse/_data.py:99`).
+/// Oracle: `csr_matrix(diag([4,9,16])).power(0.5)` → `data=[2,3,4]`.
+#[test]
+fn csr_power_sqrt_matches_scipy() -> Result<(), FerroError> {
+    // diag([4,9,16]): CSR data=[4,9,16], indptr=[0,1,2,3], indices=[0,1,2], (3,3).
+    let m = CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![4.0_f64, 9.0, 16.0],
+    )?;
+
+    let r = m.power(0.5)?;
+    // scipy: data [2,3,4] (sqrt of perfect squares is exact in f64).
+    assert_eq!(r.data(), &[2.0_f64, 3.0, 4.0]);
+    // structure preserved.
+    assert_eq!(r.indptr(), vec![0, 1, 2, 3]);
+    assert_eq!(r.indices(), &[0, 1, 2]);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `sort_indices()` returns canonical (sorted
+/// within-row column-index) CSR, matching scipy `csr_matrix.sort_indices()`
+/// (`scipy/sparse/_compressed.py:1110`). Input is already canonical (sorted),
+/// so the method is the identity here — `CsrMatrix` is canonical-by-construction
+/// (`CsrMatrix::new` rejects unsorted indices), so `sort_indices` is idempotent.
+#[test]
+fn csr_sort_indices_canonical() -> Result<(), FerroError> {
+    // [[1,2,0],[0,3,4]]: CSR data=[1,2,3,4], indices=[0,1,1,2], indptr=[0,2,4].
+    let m = CsrMatrix::new(
+        2,
+        3,
+        vec![0, 2, 4],
+        vec![0, 1, 1, 2],
+        vec![1.0_f64, 2.0, 3.0, 4.0],
+    )?;
+    let s = m.sort_indices()?;
+    // scipy: indices [0,1,1,2], data [1,2,3,4] (already sorted -> identity).
+    assert_eq!(s.indices(), &[0, 1, 1, 2]);
+    assert_eq!(s.data(), &[1.0_f64, 2.0, 3.0, 4.0]);
+    assert_eq!(s.indptr(), vec![0, 2, 4]);
+    // scipy dense unchanged [[1,2,0],[0,3,4]].
+    let d = s.to_dense();
+    assert_eq!(d[[0, 0]], 1.0);
+    assert_eq!(d[[0, 1]], 2.0);
+    assert_eq!(d[[0, 2]], 0.0);
+    assert_eq!(d[[1, 0]], 0.0);
+    assert_eq!(d[[1, 1]], 3.0);
+    assert_eq!(d[[1, 2]], 4.0);
+    Ok(())
+}
