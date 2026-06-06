@@ -17,7 +17,7 @@
 //! `tests/divergence_regressors.py` + `tests/test_check_estimator.py` +
 //! `tests/test_cross_val_score.py` (616 pytest pass).
 //!
-//! **20 SHIPPED / 5 NOT-STARTED.**
+//! **23 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -37,21 +37,41 @@
 //! | REQ-LASSO-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/6 match the sklearn `Lasso` oracle ≤1e-6 for converged coef/intercept + exact-zero support (cyclic CD, `l1_reg=α·n`). (Dual-gap stopping #412, positive/selection='random' downstream.) |
 //! | REQ-LASSO-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsLasso::n_iter_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::Lasso.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedLasso::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-11/12 SHIPPED, #411 closed). Non-test consumer: `_regressors.py::Lasso` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.Lasso(alpha=0.5).fit(X,y).n_iter_ == SkLasso(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
 //! | REQ-LASSO-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsLasso::dual_gap_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::Lasso.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedLasso::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-11). Non-test consumer: `_regressors.py::Lasso` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.Lasso(0.3).dual_gap_ - SkLasso(0.3).dual_gap_) < 1e-9`, live oracle). |
-//! | REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsLasso::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::Lasso.__init__(self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes it to the single-output `_RsLasso` AND each per-target `_RsLasso` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Downstream non-negative soft-threshold `ferrolearn-linear` REQ (lasso `with_positive`/`lasso_positive_matches_sklearn`). Verification: `tests/divergence_regressors.py::test_lasso_positive_matches_sklearn` (+ multi-output) + `test_lasso_positive_false_unchanged`. Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. |
+//! | REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | SHIPPED (selection='random' bit-parity NOT-STARTED — numpy-MT RNG) | ALL of sklearn's `Lasso.__init__` params are now surfaced (`_coordinate_descent.py:1310-1322`): `RsLasso::new` carries `#[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false, precompute=false, copy_x=true, warm_start=false, random_state=None, selection="cyclic".to_string(), coef_init=None))]` + `fit` threads `.with_precompute(self.precompute).with_selection(coord_selection_from_str(&self.selection)?).with_warm_start(self.warm_start)`, calls `.with_random_state(seed)` only when `random_state` is `Some` (the Rust builder takes `u64`; `_coordinate_descent.py:803`), and `.with_coef_init(Array1::from(init))` when `warm_start && coef_init.is_some()` (R-DEV-4: ferrolearn estimators are immutable value types, so the prior fit's `coef_` is passed back explicitly rather than read off a mutated `self.coef_`, sklearn `_coordinate_descent.py:1062`). `selection` maps via `fn coord_selection_from_str` (`cyclic`→`Cyclic`, `random`→`Random`, any other → `ValueError`, mirroring sklearn `_parameter_constraints["selection"]=[StrOptions({"cyclic","random"})]` `_coordinate_descent.py:893`). `copy_X` is ABI-only (`#[allow(dead_code, reason=...)]` field — CD fit never mutates `X`, `_coordinate_descent.py:1314`); stored for `get_params`/`set_params` round-trip on the wrapper. Wrapper `_regressors.py::Lasso.__init__(self, alpha=1.0, *, fit_intercept=True, precompute=False, copy_X=True, max_iter=1000, tol=1e-4, warm_start=False, positive=False, random_state=None, selection='cyclic')` (sklearn order/defaults, `_coordinate_descent.py:1310-1322`) stores each and threads them into the single-output `_RsLasso` AND each per-target `_RsLasso` in the multi-output loop; warm_start is single-output-scoped (reuses the prior `self.coef_` as `coef_init` on a 1-D refit; multi-output warm_start is NOT-STARTED — stored for get_params but the per-target loop ignores it). Downstream `ferrolearn-linear` Lasso REQ-8 (warm_start) / REQ-9 (selection+random_state) / REQ-10 (precompute) all SHIPPED. `selection='random'` converges to the unique Lasso optimum but is NOT bit-identical to sklearn (Rust `StdRng` ≠ numpy MT19937 — bit-parity NOT-STARTED). Verification (live oracle, R-CHAR-3): `tests/divergence_regressors.py::{test_lasso_precompute_matches_sklearn, test_lasso_selection_cyclic_default_unchanged, test_lasso_selection_random_converges_to_optimum, test_lasso_warm_start_refit_fewer_iters, test_lasso_copy_x_accepted_default_unchanged, test_lasso_get_params_all_and_clone, test_lasso_invalid_selection_raises}`. |
 //! | REQ-ELASTICNET-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsElasticNet::fit`/`predict` + getters, wrapped by `_regressors.py::ElasticNet` (marshals `alpha`/`l1_ratio`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-ELASTICNET-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2042: `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, ...)` moves ONLY `alpha` before the `*` (l1_ratio stays keyword-only), so `ferrolearn.ElasticNet(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:898`. Guard `test_red_elasticnet_alpha_positional`. |
 //! | REQ-ELASTICNET-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/5 match the sklearn `ElasticNet` oracle <1e-5 over the (alpha,l1_ratio) grid (`l1_reg=α·l1_ratio·n`, `l2_reg=α·(1−l1_ratio)·n`), incl. l1_ratio=1↔Lasso / 0↔L2. (Dual-gap #412 downstream.) |
 //! | REQ-ELASTICNET-NITER (n_iter_ = real CD count) | SHIPPED | impl `RsElasticNet::n_iter_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.n_iter()`), surfaced by `_regressors.py::ElasticNet.fit` which now sets `self.n_iter_ = int(self._rs.n_iter_)` (was the faked `self.max_iter`/1000). Mirrors sklearn's ACTUAL CD count `self.n_iter_.append(this_iter[0])` (`_coordinate_descent.py:1103`, single-target collapse `:1106`). The downstream Rust `FittedElasticNet::n_iter()` is bit-faithful to sklearn via the dual-gap CD stopping criterion (`ferrolearn-linear` REQ-12/13 SHIPPED, #417 closed). Non-test consumer: `_regressors.py::ElasticNet` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn` asserts `fl.ElasticNet(alpha=0.5).fit(X,y).n_iter_ == SkElasticNet(alpha=0.5).fit(X,y).n_iter_` (live oracle, n_iter_==2 on the fixture, < max_iter — no longer faked). |
 //! | REQ-ELASTICNET-DUALGAP (dual_gap_ fitted attribute) | SHIPPED | impl `RsElasticNet::dual_gap_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::ElasticNet.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` (next to `n_iter_`). Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`). Downstream `FittedElasticNet::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-12). Non-test consumer: `_regressors.py::ElasticNet` + re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` (`abs(fl.ElasticNet(0.3).dual_gap_ - SkElasticNet(0.3).dual_gap_) < 1e-9`, live oracle, default l1_ratio=0.5). |
-//! | REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsElasticNet::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes it to the single-output `_RsElasticNet` AND each per-target `_RsElasticNet` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Downstream non-negative soft-threshold `ferrolearn-linear` REQ-8 SHIPPED (`elasticnet_positive_matches_sklearn`). Verification: `tests/divergence_regressors.py::test_elasticnet_positive_matches_sklearn` (+ multi-output) + `test_elasticnet_positive_false_unchanged`. Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. |
+//! | REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | SHIPPED (selection='random' bit-parity NOT-STARTED — numpy-MT RNG) | ALL of sklearn's `ElasticNet.__init__` params are now surfaced (`_coordinate_descent.py:898-912`): `RsElasticNet::new` carries `#[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false, precompute=false, copy_x=true, warm_start=false, random_state=None, selection="cyclic".to_string(), coef_init=None))]` + `fit` threads `.with_precompute(self.precompute).with_selection(coord_selection_from_str(&self.selection)?).with_warm_start(self.warm_start)`, calls `.with_random_state(seed)` only when `random_state` is `Some` (Rust builder takes `u64`; `_coordinate_descent.py:803`), and `.with_coef_init(Array1::from(init))` when `warm_start && coef_init.is_some()` (R-DEV-4 immutable-value-type adaptation of sklearn's reused `self.coef_`, `_coordinate_descent.py:1062`). `selection` maps via `fn coord_selection_from_str` (`cyclic`→`Cyclic`, `random`→`Random`, any other → `ValueError`, mirroring `_parameter_constraints["selection"]=[StrOptions({"cyclic","random"})]` `_coordinate_descent.py:893`). `copy_X` is ABI-only (`#[allow(dead_code, reason=...)]` field — CD fit never mutates `X`, `_coordinate_descent.py:906`); stored for `get_params`/`set_params` round-trip on the wrapper. Wrapper `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, fit_intercept=True, precompute=False, max_iter=1000, copy_X=True, tol=1e-4, warm_start=False, positive=False, random_state=None, selection='cyclic')` (sklearn order/defaults, `_coordinate_descent.py:898-912`) stores each and threads them into the single-output `_RsElasticNet` AND each per-target `_RsElasticNet` in the multi-output loop; warm_start is single-output-scoped (reuses the prior 1-D `self.coef_` as `coef_init`; multi-output warm_start NOT-STARTED — stored for get_params, ignored in the per-target loop). Downstream `ferrolearn-linear` ElasticNet REQ-9 (warm_start) / REQ-10 (selection+random_state) / REQ-11 (precompute) all SHIPPED. `selection='random'` converges to the unique ElasticNet optimum but is NOT bit-identical to sklearn (Rust `StdRng` ≠ numpy MT19937 — bit-parity NOT-STARTED). Verification (live oracle, R-CHAR-3): `tests/divergence_regressors.py::{test_elasticnet_precompute_matches_sklearn, test_elasticnet_selection_cyclic_default_unchanged, test_elasticnet_selection_random_converges_to_optimum, test_elasticnet_warm_start_refit_fewer_iters, test_elasticnet_copy_x_accepted_default_unchanged, test_elasticnet_get_params_all_and_clone, test_elasticnet_invalid_selection_raises}`. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_regressors.py::{LinearRegression,Ridge,Lasso,ElasticNet}` construct their `_Rs*` class and drive fit/predict + coef_/intercept_ reads; `ferrolearn/__init__.py` re-exports all four; `test_check_estimator.py` + `test_cross_val_score.py` exercise them (542 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
 use crate::conversions::*;
 use ferrolearn_core::{Fit, HasCoefficients, Predict};
+use ferrolearn_linear::lasso::CoordSelection;
 use ferrolearn_linear::ridge::RidgeSolver;
+use ndarray::Array1;
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
+
+/// Map the sklearn `selection` string to the Rust [`CoordSelection`] enum.
+///
+/// Mirrors sklearn's `_parameter_constraints["selection"] =
+/// [StrOptions({"cyclic", "random"})]` (`_coordinate_descent.py:893` for
+/// `ElasticNet`, inherited by `Lasso`): only `'cyclic'` / `'random'` are valid;
+/// any other value raises `ValueError` (the binding analog of sklearn's
+/// `InvalidParameterError`, a `ValueError` subclass).
+fn coord_selection_from_str(selection: &str) -> PyResult<CoordSelection> {
+    match selection {
+        "cyclic" => Ok(CoordSelection::Cyclic),
+        "random" => Ok(CoordSelection::Random),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "The 'selection' parameter must be a str among {{'cyclic', 'random'}}. \
+             Got {other:?} instead."
+        ))),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // LinearRegression
@@ -478,20 +498,68 @@ pub struct RsLasso {
     tol: f64,
     fit_intercept: bool,
     positive: bool,
+    precompute: bool,
+    // ABI-only (sklearn `Lasso(copy_X=...)`, `_coordinate_descent.py:1314`): the
+    // coordinate-descent fit never mutates `X` in place, so there is no Rust
+    // builder to thread it to. Stored on the wrapper for `get_params`/`set_params`
+    // round-trip; held here too so the binding mirrors the full sklearn ctor ABI.
+    #[allow(
+        dead_code,
+        reason = "copy_X is ABI-only — CD fit never mutates X, so there is no Rust builder; stored for sklearn constructor-ABI parity (_coordinate_descent.py:1314)"
+    )]
+    copy_x: bool,
+    warm_start: bool,
+    random_state: Option<u64>,
+    selection: String,
+    coef_init: Option<Vec<f64>>,
     fitted: Option<ferrolearn_linear::FittedLasso<f64>>,
 }
 
 #[pymethods]
 impl RsLasso {
     #[new]
-    #[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]
-    fn new(alpha: f64, max_iter: usize, tol: f64, fit_intercept: bool, positive: bool) -> Self {
+    #[pyo3(signature = (
+        alpha = 1.0,
+        max_iter = 1000,
+        tol = 1e-4,
+        fit_intercept = true,
+        positive = false,
+        precompute = false,
+        copy_x = true,
+        warm_start = false,
+        random_state = None,
+        selection = "cyclic".to_string(),
+        coef_init = None
+    ))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors sklearn Lasso.__init__ constructor ABI (alpha, fit_intercept, precompute, copy_X, max_iter, tol, warm_start, positive, random_state, selection) plus the R-DEV-4 coef_init warm-start seed; _coordinate_descent.py:1310-1322"
+    )]
+    fn new(
+        alpha: f64,
+        max_iter: usize,
+        tol: f64,
+        fit_intercept: bool,
+        positive: bool,
+        precompute: bool,
+        copy_x: bool,
+        warm_start: bool,
+        random_state: Option<u64>,
+        selection: String,
+        coef_init: Option<Vec<f64>>,
+    ) -> Self {
         Self {
             alpha,
             max_iter,
             tol,
             fit_intercept,
             positive,
+            precompute,
+            copy_x,
+            warm_start,
+            random_state,
+            selection,
+            coef_init,
             fitted: None,
         }
     }
@@ -499,12 +567,33 @@ impl RsLasso {
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray(y);
-        let model = ferrolearn_linear::Lasso::<f64>::new()
+        let selection_enum = coord_selection_from_str(&self.selection)?;
+        let mut model = ferrolearn_linear::Lasso::<f64>::new()
             .with_alpha(self.alpha)
             .with_max_iter(self.max_iter)
             .with_tol(self.tol)
             .with_fit_intercept(self.fit_intercept)
-            .with_positive(self.positive);
+            .with_positive(self.positive)
+            .with_precompute(self.precompute)
+            .with_selection(selection_enum)
+            .with_warm_start(self.warm_start);
+        // `random_state` is `Option<u64>` here (sklearn default `None`); the Rust
+        // builder takes a `u64`, so only call it when a seed was supplied,
+        // otherwise leave the estimator's own default (`_coordinate_descent.py:803`,
+        // only used when `selection == 'random'`).
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        // warm_start (R-DEV-4): ferrolearn estimators are immutable value types,
+        // so the prior fit's coefficients are passed back in explicitly as
+        // `coef_init` (sklearn reuses the mutable `self.coef_`,
+        // `_coordinate_descent.py:1062`). Only seed when both `warm_start` is set
+        // AND a prior coefficient vector was supplied by the wrapper.
+        if self.warm_start
+            && let Some(ref init) = self.coef_init
+        {
+            model = model.with_coef_init(Array1::from(init.clone()));
+        }
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -577,13 +666,44 @@ pub struct RsElasticNet {
     tol: f64,
     fit_intercept: bool,
     positive: bool,
+    precompute: bool,
+    // ABI-only (sklearn `ElasticNet(copy_X=...)`, `_coordinate_descent.py:906`):
+    // the coordinate-descent fit never mutates `X` in place, so there is no Rust
+    // builder to thread it to. Stored on the wrapper for `get_params`/`set_params`
+    // round-trip; held here too so the binding mirrors the full sklearn ctor ABI.
+    #[allow(
+        dead_code,
+        reason = "copy_X is ABI-only — CD fit never mutates X, so there is no Rust builder; stored for sklearn constructor-ABI parity (_coordinate_descent.py:906)"
+    )]
+    copy_x: bool,
+    warm_start: bool,
+    random_state: Option<u64>,
+    selection: String,
+    coef_init: Option<Vec<f64>>,
     fitted: Option<ferrolearn_linear::FittedElasticNet<f64>>,
 }
 
 #[pymethods]
 impl RsElasticNet {
     #[new]
-    #[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]
+    #[pyo3(signature = (
+        alpha = 1.0,
+        l1_ratio = 0.5,
+        max_iter = 1000,
+        tol = 1e-4,
+        fit_intercept = true,
+        positive = false,
+        precompute = false,
+        copy_x = true,
+        warm_start = false,
+        random_state = None,
+        selection = "cyclic".to_string(),
+        coef_init = None
+    ))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors sklearn ElasticNet.__init__ constructor ABI (alpha, l1_ratio, fit_intercept, precompute, max_iter, copy_X, tol, warm_start, positive, random_state, selection) plus the R-DEV-4 coef_init warm-start seed; _coordinate_descent.py:898-912"
+    )]
     fn new(
         alpha: f64,
         l1_ratio: f64,
@@ -591,6 +711,12 @@ impl RsElasticNet {
         tol: f64,
         fit_intercept: bool,
         positive: bool,
+        precompute: bool,
+        copy_x: bool,
+        warm_start: bool,
+        random_state: Option<u64>,
+        selection: String,
+        coef_init: Option<Vec<f64>>,
     ) -> Self {
         Self {
             alpha,
@@ -599,6 +725,12 @@ impl RsElasticNet {
             tol,
             fit_intercept,
             positive,
+            precompute,
+            copy_x,
+            warm_start,
+            random_state,
+            selection,
+            coef_init,
             fitted: None,
         }
     }
@@ -606,13 +738,31 @@ impl RsElasticNet {
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray(y);
-        let model = ferrolearn_linear::ElasticNet::<f64>::new()
+        let selection_enum = coord_selection_from_str(&self.selection)?;
+        let mut model = ferrolearn_linear::ElasticNet::<f64>::new()
             .with_alpha(self.alpha)
             .with_l1_ratio(self.l1_ratio)
             .with_max_iter(self.max_iter)
             .with_tol(self.tol)
             .with_fit_intercept(self.fit_intercept)
-            .with_positive(self.positive);
+            .with_positive(self.positive)
+            .with_precompute(self.precompute)
+            .with_selection(selection_enum)
+            .with_warm_start(self.warm_start);
+        // `random_state` is `Option<u64>` (sklearn default `None`); the Rust
+        // builder takes a `u64`, so only call it when a seed was supplied
+        // (`_coordinate_descent.py:803`, used only when `selection == 'random'`).
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        // warm_start (R-DEV-4): the prior fit's coefficients are passed back in
+        // explicitly as `coef_init` (sklearn reuses the mutable `self.coef_`,
+        // `_coordinate_descent.py:1062`).
+        if self.warm_start
+            && let Some(ref init) = self.coef_init
+        {
+            model = model.with_coef_init(Array1::from(init.clone()));
+        }
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

@@ -73,14 +73,16 @@ Divergence classes:
    58`). The Rust `_RsLasso`/`_RsElasticNet` expose NO `n_iter_` getter and
    `FittedLasso`/`FittedElasticNet` do not track the real count — owned
    downstream (Lasso #411, ElasticNet #417).
-4. **missing constructor params (NOT-STARTED, R-DEV-2; `positive` SHIPPED
-   #2129)** — `positive` is now surfaced on ALL FOUR (keyword-only, LAST,
-   matching sklearn; threaded into the Rust `with_positive` builder + the
-   single-output and multi-output Python paths). Still missing: LinearRegression
-   `copy_X`/`n_jobs`; Ridge `copy_X`/`max_iter`/`tol`/`solver`/`random_state`;
-   Lasso/ElasticNet `precompute`/`copy_X`/`warm_start`/`random_state`/`selection`.
-   The DEFAULTS all match; only the remaining param surface + non-default behavior
-   is missing, owned downstream.
+4. **constructor params (mostly SHIPPED; only LinearRegression `copy_X`/`n_jobs`
+   NOT-STARTED, R-DEV-2)** — `positive` is surfaced on ALL FOUR; Ridge
+   `copy_X`/`max_iter`/`tol`/`solver`/`random_state` SHIPPED (#2129/#2132);
+   Lasso/ElasticNet `precompute`/`copy_X`/`warm_start`/`random_state`/`selection`
+   SHIPPED (#2135) — threaded into the Rust `with_precompute`/`with_selection`/
+   `with_warm_start`/`with_random_state`/`with_coef_init` builders + the
+   single-output Python path (warm_start single-output-scoped; copy_X ABI-only;
+   `selection='random'` converges-to-optimum but is numpy-MT bit-parity
+   NOT-STARTED). Still missing: LinearRegression `copy_X`/`n_jobs`. The DEFAULTS
+   all match; the remaining non-default behavior is owned downstream.
 5. **value parity off the default path (NOT-STARTED, R-DEV-1; `positive` SHIPPED
    #2129)** — `positive=True` (NNLS / projected-CD / non-negative soft-threshold)
    now matches the live sklearn oracle through the binding for all four (single +
@@ -325,12 +327,39 @@ Grouped by estimator (`REQ-LINREG-*`, `REQ-RIDGE-*`, `REQ-LASSO-*`,
   == 89`). [Owned downstream: `ferrolearn-linear` REQ-11 (`n_iter_`/`dual_gap_`
   attrs) blocker #411 — `FittedLasso` does not track the count, so the wrapper
   fakes `n_iter_ = max_iter`.]
-- REQ-LASSO-PARAMS: `ferrolearn.Lasso` exposes the
-  `precompute`/`copy_X`/`warm_start`/`positive`/`random_state`/`selection`
-  constructor params (`_coordinate_descent.py:1310-1322`). [Param surface +
-  behavior owned downstream: `positive` `ferrolearn-linear` REQ-7 #407;
-  `warm_start` REQ-8 #408; `selection`/`random_state` REQ-9 #409; `precompute`
-  REQ-10 #410.]
+- REQ-LASSO-PARAMS: SHIPPED (selection='random' bit-parity NOT-STARTED — numpy-MT
+  RNG). `ferrolearn.Lasso` exposes ALL of sklearn's `Lasso.__init__` params in the
+  sklearn order/defaults
+  `(self, alpha=1.0, *, fit_intercept=True, precompute=False, copy_X=True,
+  max_iter=1000, tol=1e-4, warm_start=False, positive=False, random_state=None,
+  selection='cyclic')` (`_coordinate_descent.py:1310-1322`). The binding `RsLasso::new`
+  carries the matching `#[pyo3(signature = ...)]` (plus a `coef_init` warm-start
+  seed); `fit` threads `.with_precompute`/`.with_selection`/`.with_warm_start`,
+  calls `.with_random_state(seed)` only when `random_state` is `Some` (the Rust
+  builder takes `u64`; default otherwise), and `.with_coef_init` when
+  `warm_start && coef_init.is_some()`. `selection` maps via the binding helper
+  `coord_selection_from_str` (`cyclic`→`Cyclic`, `random`→`Random`, any other →
+  `ValueError`, mirroring sklearn's `StrOptions({'cyclic','random'})`
+  `_coordinate_descent.py:893` / `InvalidParameterError`). `copy_X` is ABI-only
+  (CD fit never mutates `X`); stored on the wrapper for `get_params`/`set_params`
+  round-trip. `warm_start` is single-output-scoped (R-DEV-4: ferrolearn estimators
+  are immutable Rust value types, so the prior fit's `self.coef_` is passed back as
+  `coef_init`, sklearn `_coordinate_descent.py:1062`); multi-output warm_start is
+  NOT-STARTED (stored for `get_params`, ignored by the per-target loop).
+  `selection='cyclic'` is bit-exact to sklearn; `selection='random'` converges to
+  the unique optimum but is NOT bit-identical (Rust `StdRng` ≠ numpy MT19937 —
+  bit-parity NOT-STARTED). [Downstream behavior: `ferrolearn-linear` Lasso REQ-8
+  (warm_start) / REQ-9 (selection+random_state) / REQ-10 (precompute) all SHIPPED.]
+  Surfaced by the `RsLasso` constructor + `fit`; consumed by
+  `_regressors.py::Lasso.__init__`/`fit` (single-output path + multi-output
+  per-target loop). Verified by
+  `tests/divergence_regressors.py::{test_lasso_precompute_matches_sklearn,
+  test_lasso_selection_cyclic_default_unchanged,
+  test_lasso_selection_random_converges_to_optimum,
+  test_lasso_warm_start_refit_fewer_iters, test_lasso_warm_start_false_independent_refits,
+  test_lasso_copy_x_accepted_default_unchanged, test_lasso_get_params_all_and_clone,
+  test_lasso_invalid_selection_raises, test_lasso_elasticnet_params_signature_matches_sklearn}`
+  (live oracle, R-CHAR-3).
 - REQ-LASSO-VALUE-PARITY: `coef_`/`intercept_` + the exact-zero support set match
   sklearn array-by-array (R-DEV-1) on the DEFAULT cyclic path. [Default-path
   converged parity is SHIPPED (downstream REQ-1/4/6 verify converged coef/
@@ -360,11 +389,39 @@ Grouped by estimator (`REQ-LINREG-*`, `REQ-RIDGE-*`, `REQ-LASSO-*`,
   `ferrolearn-linear` ElasticNet `n_iter_`/`dual_gap_` blocker #417 —
   `FittedElasticNet` does not track the count, so the wrapper fakes
   `n_iter_ = max_iter`.]
-- REQ-ELASTICNET-PARAMS: `ferrolearn.ElasticNet` exposes the
-  `precompute`/`copy_X`/`warm_start`/`positive`/`random_state`/`selection`
-  constructor params (`_coordinate_descent.py:898-912`). [Param surface +
-  behavior owned downstream: `positive` `ferrolearn-linear` REQ-8 #407;
-  `warm_start` #408; `selection`/`random_state` #409; `precompute` #410.]
+- REQ-ELASTICNET-PARAMS: SHIPPED (selection='random' bit-parity NOT-STARTED —
+  numpy-MT RNG). `ferrolearn.ElasticNet` exposes ALL of sklearn's
+  `ElasticNet.__init__` params in the sklearn order/defaults
+  `(self, alpha=1.0, *, l1_ratio=0.5, fit_intercept=True, precompute=False,
+  max_iter=1000, copy_X=True, tol=1e-4, warm_start=False, positive=False,
+  random_state=None, selection='cyclic')` (`_coordinate_descent.py:898-912`). The
+  binding `RsElasticNet::new` carries the matching `#[pyo3(signature = ...)]` (plus
+  a `coef_init` warm-start seed); `fit` threads
+  `.with_precompute`/`.with_selection`/`.with_warm_start`, calls
+  `.with_random_state(seed)` only when `random_state` is `Some` (Rust builder takes
+  `u64`), and `.with_coef_init` when `warm_start && coef_init.is_some()`.
+  `selection` maps via `coord_selection_from_str` (`cyclic`→`Cyclic`,
+  `random`→`Random`, any other → `ValueError`, mirroring sklearn's
+  `StrOptions({'cyclic','random'})` `_coordinate_descent.py:893`). `copy_X` is
+  ABI-only (CD fit never mutates `X`); stored on the wrapper for
+  `get_params`/`set_params` round-trip. `warm_start` is single-output-scoped
+  (R-DEV-4: the prior fit's `self.coef_` is passed back as `coef_init`, sklearn
+  `_coordinate_descent.py:1062`); multi-output warm_start is NOT-STARTED (stored for
+  `get_params`, ignored by the per-target loop). `selection='cyclic'` is bit-exact
+  to sklearn; `selection='random'` converges to the unique optimum but is NOT
+  bit-identical (Rust `StdRng` ≠ numpy MT19937 — bit-parity NOT-STARTED).
+  [Downstream behavior: `ferrolearn-linear` ElasticNet REQ-9 (warm_start) / REQ-10
+  (selection+random_state) / REQ-11 (precompute) all SHIPPED.] Surfaced by the
+  `RsElasticNet` constructor + `fit`; consumed by
+  `_regressors.py::ElasticNet.__init__`/`fit` (single-output path + multi-output
+  per-target loop). Verified by
+  `tests/divergence_regressors.py::{test_elasticnet_precompute_matches_sklearn,
+  test_elasticnet_selection_cyclic_default_unchanged,
+  test_elasticnet_selection_random_converges_to_optimum,
+  test_elasticnet_warm_start_refit_fewer_iters,
+  test_elasticnet_copy_x_accepted_default_unchanged,
+  test_elasticnet_get_params_all_and_clone, test_elasticnet_invalid_selection_raises,
+  test_lasso_elasticnet_params_signature_matches_sklearn}` (live oracle, R-CHAR-3).
 - REQ-ELASTICNET-VALUE-PARITY: `coef_`/`intercept_` + the exact-zero support set
   match sklearn array-by-array (R-DEV-1) on the DEFAULT cyclic path.
   [Default-path converged parity is SHIPPED (downstream REQ-1/4/5 verify converged
@@ -452,11 +509,16 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
   `Lasso(alpha=0.1).fit(X,y).n_iter_` equals the sklearn oracle count. FAILS until
   `FittedLasso` tracks and exposes the real count (downstream `ferrolearn-linear`
   REQ-11 #411).
-- AC-LASSO-PARAMS (REQ-LASSO-PARAMS): sklearn exposes the extra params
+- AC-LASSO-PARAMS (REQ-LASSO-PARAMS): SHIPPED (#2135). sklearn exposes the params
   (`cd /tmp && python3 -c "import inspect; from sklearn.linear_model import Lasso; ps=inspect.signature(Lasso.__init__).parameters; print([p for p in ('precompute','copy_X','warm_start','positive','random_state','selection') if p in ps])"`
-  → all 6). ferrolearn signature is `(self, *, alpha=1.0, max_iter=1000,
-  tol=1e-4, fit_intercept=True)` — none present. A critic pins FAILING pytests.
-  FAIL until added (behavior owned by `ferrolearn-linear` #407/#408/#409/#410).
+  → all 6); `ferrolearn.Lasso.get_params()` now returns the same 10-param set with
+  matching defaults and `clone()` round-trips. precompute=True coef_ matches the
+  live oracle ≤1e-6; selection='cyclic' is unchanged from default; selection='random'
+  converges to the unique optimum (~1e-2 from cyclic, NOT sklearn bit-match —
+  numpy-MT bit-parity NOT-STARTED); warm_start refit n_iter_ drops (170→1, matching
+  sklearn); copy_X accepted (ABI-only, default path unchanged); invalid selection →
+  ValueError. Verified by the `tests/divergence_regressors.py` Lasso-param suite
+  (live oracle, R-CHAR-3).
 - AC-ELASTICNET-API-CONFORM (REQ-ELASTICNET-API-CONFORM): `test_check_estimator.py`
   (`ElasticNet()`) + `test_cross_val_score.py` pass. Spot oracle:
   `cd /tmp && python3 -c "import numpy as np; from sklearn.linear_model import ElasticNet; X=np.array([[0.,0.],[1.,1.],[2.,4.],[3.,9.]]); y=np.array([1.,2.,3.,4.]); m=ElasticNet(alpha=0.1).fit(X,y); print([round(v,6) for v in m.coef_], round(m.intercept_,6))"`
@@ -477,12 +539,15 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
   `1000` (live; FAKE). A critic pins a FAILING pytest. FAILS until
   `FittedElasticNet` tracks the real count (downstream `ferrolearn-linear`
   #417).
-- AC-ELASTICNET-PARAMS (REQ-ELASTICNET-PARAMS): sklearn exposes the extra params
-  (`cd /tmp && python3 -c "import inspect; from sklearn.linear_model import ElasticNet; ps=inspect.signature(ElasticNet.__init__).parameters; print([p for p in ('precompute','copy_X','warm_start','positive','random_state','selection') if p in ps])"`
-  → all 6). ferrolearn signature is `(self, *, alpha=1.0, l1_ratio=0.5,
-  max_iter=1000, tol=1e-4, fit_intercept=True)` — none present. A critic pins
-  FAILING pytests. FAIL until added (behavior owned by `ferrolearn-linear`
-  #407/#408/#409/#410).
+- AC-ELASTICNET-PARAMS (REQ-ELASTICNET-PARAMS): SHIPPED (#2135). sklearn exposes the
+  params (`cd /tmp && python3 -c "import inspect; from sklearn.linear_model import ElasticNet; ps=inspect.signature(ElasticNet.__init__).parameters; print([p for p in ('precompute','copy_X','warm_start','positive','random_state','selection') if p in ps])"`
+  → all 6); `ferrolearn.ElasticNet.get_params()` now returns the same 11-param set
+  with matching defaults and `clone()` round-trips. precompute=True coef_ matches the
+  live oracle ≤1e-6; selection='cyclic' unchanged; selection='random' converges to
+  the unique optimum (NOT sklearn bit-match — numpy-MT bit-parity NOT-STARTED);
+  warm_start refit n_iter_ drops (112→1, matching sklearn); copy_X accepted
+  (ABI-only); invalid selection → ValueError. Verified by the
+  `tests/divergence_regressors.py` ElasticNet-param suite (live oracle, R-CHAR-3).
 - AC-CONSUMER (REQ-CONSUMER):
   `grep -n "_RsLinearRegression\|_RsRidge\|_RsLasso\|_RsElasticNet" /home/doll/ferrolearn/ferrolearn-python/python/ferrolearn/_regressors.py`
   shows each wrapper constructs its `_Rs*` class and drives fit/predict + reads
@@ -515,13 +580,13 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
 | REQ-LASSO-ALPHA-POSITIONAL (alpha positional ABI) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 constructor ABI; single-wrapper-fixable — HEADLINE 2/3). sklearn `__init__(self, alpha=1.0, *, ...)` (`_coordinate_descent.py:1310-1312`) makes `alpha` positional-or-keyword — `Lasso(0.1).alpha` → `0.1`. ferrolearn `_regressors.py::Lasso.__init__(self, *, alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=True)` makes it keyword-only — live: `ferrolearn.Lasso(0.1)` → `TypeError: __init__() takes 1 positional argument but 2 were given`. Single-line Python-wrapper fix: move `alpha` before the `*`. |
 | REQ-LASSO-NITER (n_iter_ = real CD count) | SHIPPED (#2043) | FIXED — `ferrolearn-linear` REQ-11 already SHIPPED (`FittedLasso::n_iter()` tracks the real count, matching sklearn EXACTLY via dual-gap CD stopping). `RsLasso::n_iter_` (`regressors.rs`) now binds it; `_regressors.py::Lasso.fit` sets `self.n_iter_ = int(self._rs.n_iter_)` (was the `max_iter` fake). Live oracle (R-CHAR-3): `ferrolearn.Lasso(0.5).n_iter_ == sklearn 2`, `Lasso(0.1) == 2` — exact, `< max_iter`. Guard `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn`. |
 | REQ-LASSO-DUALGAP (dual_gap_ fitted attribute) | SHIPPED (#2096) | impl `RsLasso::dual_gap_` getter in `regressors.rs` (over `FittedLasso<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::Lasso.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` next to `n_iter_`. Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`, single-target collapse; `:1111` multi-target). The downstream Rust `FittedLasso::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-11 SHIPPED, dual-gap CD stopping). Non-test consumer: `_regressors.py::Lasso` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` asserts `abs(fl.Lasso(alpha=0.3).fit(X,y).dual_gap_ - SkLasso(alpha=0.3).fit(X,y).dual_gap_) < 1e-9` (live oracle, R-CHAR-3). |
-| REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced (`ferrolearn-linear` Lasso `with_positive` + `lasso_positive_matches_sklearn` already SHIPPED): `RsLasso::new` takes `positive=false` LAST (`#[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::Lasso.__init__(self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes `positive=self.positive` to the single-output `_RsLasso` AND each per-target `_RsLasso` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Verification (model B): `tests/divergence_regressors.py::test_lasso_positive_matches_sklearn` (coef_ >= 0, live oracle match), `test_all_four_positive_false_unchanged`, `test_positive_param_keyword_only_last` (R-CHAR-3). Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. sklearn `_coordinate_descent.py:1310-1322`. |
+| REQ-LASSO-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | SHIPPED (selection='random' bit-parity NOT-STARTED — numpy-MT RNG) | ALL of sklearn's `Lasso.__init__` params surfaced (`_coordinate_descent.py:1310-1322`): `RsLasso::new` carries `#[pyo3(signature = (alpha=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false, precompute=false, copy_x=true, warm_start=false, random_state=None, selection="cyclic".to_string(), coef_init=None))]`; `fit` threads `.with_precompute(self.precompute).with_selection(coord_selection_from_str(&self.selection)?).with_warm_start(self.warm_start)`, calls `.with_random_state(seed)` only when `random_state` is `Some` (Rust builder takes `u64`; `_coordinate_descent.py:803`), and `.with_coef_init(Array1::from(init))` when `warm_start && coef_init.is_some()` (R-DEV-4). `selection` maps via `fn coord_selection_from_str` (`cyclic`→`Cyclic`, `random`→`Random`, any other → `ValueError`, mirroring `StrOptions({"cyclic","random"})` `_coordinate_descent.py:893`). `copy_X` is ABI-only (`#[allow(dead_code, reason=...)]` field — CD fit never mutates X, `_coordinate_descent.py:1314`); stored on the wrapper for get_params/set_params round-trip. `_regressors.py::Lasso.__init__(self, alpha=1.0, *, fit_intercept=True, precompute=False, copy_X=True, max_iter=1000, tol=1e-4, warm_start=False, positive=False, random_state=None, selection='cyclic')` (sklearn order/defaults) stores each and threads them into the single-output `_RsLasso` AND each per-target `_RsLasso` in the multi-output loop; warm_start single-output-scoped (prior `self.coef_`→`coef_init`; multi-output warm_start NOT-STARTED — stored for get_params, ignored). Downstream Lasso REQ-8/9/10 SHIPPED. `selection='random'` converges to the unique optimum but is NOT bit-identical (Rust StdRng ≠ numpy MT19937). Verification (model B): `tests/divergence_regressors.py::{test_lasso_precompute_matches_sklearn, test_lasso_selection_cyclic_default_unchanged, test_lasso_selection_random_converges_to_optimum, test_lasso_warm_start_refit_fewer_iters, test_lasso_warm_start_false_independent_refits, test_lasso_copy_x_accepted_default_unchanged, test_lasso_get_params_all_and_clone, test_lasso_invalid_selection_raises, test_lasso_elasticnet_params_signature_matches_sklearn}` (R-CHAR-3). |
 | REQ-LASSO-VALUE-PARITY (coef_/intercept_ + support set array parity, default cyclic) | SHIPPED | on the DEFAULT converged path. `_regressors.py::Lasso.fit` marshals `coef_`/`intercept_` from the `RsLasso` getters (over `FittedLasso`), and downstream `ferrolearn-linear` REQ-1/4/6 are critic-verified ("NO DIVERGENCE FOUND") to MATCH the live sklearn `Lasso` oracle to ≤1e-6 for converged coef/intercept + the exact-zero support set (cyclic CD with soft-thresholding, `l1_reg=α·n` convention), incl. alpha=0. Live (R-CHAR-3): ferrolearn `Lasso(alpha=0.1).fit(X,y)` coef agrees with the oracle to the converged tolerance. Non-test consumer: `_regressors.py::Lasso` + re-export. (The dual-gap stopping criterion #412 and `positive`/`selection='random'` paths are owned downstream.) |
 | REQ-ELASTICNET-API-CONFORM (fit/predict + coef_/intercept_, default cyclic path) | SHIPPED | impl `RsElasticNet::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` (over `ferrolearn_linear::FittedElasticNet<f64>`), wrapped by `ElasticNet` in `_regressors.py` which marshals `alpha`/`l1_ratio`/`max_iter`/`tol` via `RsElasticNet::new` → `with_alpha`/`with_l1_ratio`/`with_max_iter`/`with_tol`, sets `coef_`/`intercept_` + `n_features_in_`, inherits `score` from `RegressorMixin` — mirroring `sklearn/linear_model/_coordinate_descent.py:932` (CD fit, L1/L2 split) + `:1107` (coef). Non-test consumer: `_regressors.py::ElasticNet` + `ferrolearn/__init__.py:4` re-export. Verification (model B): pytest → 534 passed (`test_check_estimator.py:25` + `test_cross_val_score.py:47`). Live default-path coef matches the oracle to the downstream-verified converged tolerance (downstream `ferrolearn-linear` REQ-1/4/5: converged coef + support <1e-5, incl. l1_ratio=1↔Lasso / l1_ratio=0↔L2). |
 | REQ-ELASTICNET-ALPHA-POSITIONAL (alpha positional ABI) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 constructor ABI; single-wrapper-fixable — HEADLINE 3/3). sklearn `__init__(self, alpha=1.0, *, l1_ratio=0.5, ...)` (`_coordinate_descent.py:898-902`) makes `alpha` positional-or-keyword (`l1_ratio` correctly keyword-only) — `ElasticNet(0.1).alpha` → `0.1`. ferrolearn `_regressors.py::ElasticNet.__init__(self, *, alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True)` makes `alpha` keyword-only — live: `ferrolearn.ElasticNet(0.1)` → `TypeError: __init__() takes 1 positional argument but 2 were given`. Single-line Python-wrapper fix: move `alpha` before the `*`, keep `l1_ratio` after. |
 | REQ-ELASTICNET-NITER (n_iter_ = real CD count) | SHIPPED (#2043) | FIXED — `ferrolearn-linear` REQ-12 already SHIPPED (`FittedElasticNet::n_iter()` tracks the real count, matching sklearn EXACTLY via dual-gap CD stopping). `RsElasticNet::n_iter_` (`regressors.rs`) now binds it; `_regressors.py::ElasticNet.fit` sets `self.n_iter_ = int(self._rs.n_iter_)` (was the `max_iter` fake). Live oracle (R-CHAR-3): `ferrolearn.ElasticNet(0.5).n_iter_ == sklearn 2` — exact, `< max_iter`. Guard `tests/divergence_regressors.py::test_lasso_elasticnet_n_iter_matches_sklearn`. |
 | REQ-ELASTICNET-DUALGAP (dual_gap_ fitted attribute) | SHIPPED (#2096) | impl `RsElasticNet::dual_gap_` getter in `regressors.rs` (over `FittedElasticNet<f64>`, via `fitted.dual_gap()`), surfaced by `_regressors.py::ElasticNet.fit` which sets `self.dual_gap_ = float(self._rs.dual_gap_)` next to `n_iter_`. Mirrors sklearn `self.dual_gap_ = dual_gaps_[0]` (`_coordinate_descent.py:1108`, single-target collapse; `:1111` multi-target). The downstream Rust `FittedElasticNet::dual_gap()` matches sklearn EXACTLY (`ferrolearn-linear` REQ-12 SHIPPED, dual-gap CD stopping). Non-test consumer: `_regressors.py::ElasticNet` + `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_lasso_elasticnet_dual_gap_matches_sklearn` asserts `abs(fl.ElasticNet(alpha=0.3).fit(X,y).dual_gap_ - SkElasticNet(alpha=0.3).fit(X,y).dual_gap_) < 1e-9` (live oracle, R-CHAR-3, default l1_ratio=0.5). |
-| REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced (`ferrolearn-linear` REQ-8 `with_positive` + `elasticnet_positive_matches_sklearn` already SHIPPED): `RsElasticNet::new` takes `positive=false` LAST (`#[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_coordinate_descent.py:909`) passes `positive=self.positive` to the single-output `_RsElasticNet` AND each per-target `_RsElasticNet` in the multi-output loop (sklearn's CD `positive` clip is per-target-independent, `_cd_fast.pyx:191-195`). Verification (model B): `tests/divergence_regressors.py::test_elasticnet_positive_matches_sklearn` (coef_ >= 0, live oracle match), `test_all_four_positive_false_unchanged`, `test_positive_param_keyword_only_last` (R-CHAR-3). Still MISSING `precompute`/`copy_X`/`warm_start`/`random_state`/`selection` — downstream #408/#409/#410. sklearn `_coordinate_descent.py:898-912`. |
+| REQ-ELASTICNET-PARAMS (precompute/copy_X/warm_start/positive/random_state/selection) | SHIPPED (selection='random' bit-parity NOT-STARTED — numpy-MT RNG) | ALL of sklearn's `ElasticNet.__init__` params surfaced (`_coordinate_descent.py:898-912`): `RsElasticNet::new` carries `#[pyo3(signature = (alpha=1.0, l1_ratio=0.5, max_iter=1000, tol=1e-4, fit_intercept=true, positive=false, precompute=false, copy_x=true, warm_start=false, random_state=None, selection="cyclic".to_string(), coef_init=None))]`; `fit` threads `.with_precompute(self.precompute).with_selection(coord_selection_from_str(&self.selection)?).with_warm_start(self.warm_start)`, calls `.with_random_state(seed)` only when `Some`, and `.with_coef_init(Array1::from(init))` when `warm_start && coef_init.is_some()` (R-DEV-4). `selection` maps via `fn coord_selection_from_str` (any value outside {'cyclic','random'} → `ValueError`, `_coordinate_descent.py:893`). `copy_X` is ABI-only (`#[allow(dead_code, reason=...)]` field, `_coordinate_descent.py:906`); stored on the wrapper for get_params round-trip. `_regressors.py::ElasticNet.__init__(self, alpha=1.0, *, l1_ratio=0.5, fit_intercept=True, precompute=False, max_iter=1000, copy_X=True, tol=1e-4, warm_start=False, positive=False, random_state=None, selection='cyclic')` (sklearn order/defaults) stores each and threads them into the single-output `_RsElasticNet` AND each per-target `_RsElasticNet` in the multi-output loop; warm_start single-output-scoped (prior `self.coef_`→`coef_init`; multi-output NOT-STARTED). Downstream ElasticNet REQ-9/10/11 SHIPPED. `selection='random'` converges to the unique optimum, NOT bit-identical (Rust StdRng ≠ numpy MT19937). Verification (model B): `tests/divergence_regressors.py::{test_elasticnet_precompute_matches_sklearn, test_elasticnet_selection_cyclic_default_unchanged, test_elasticnet_selection_random_converges_to_optimum, test_elasticnet_warm_start_refit_fewer_iters, test_elasticnet_copy_x_accepted_default_unchanged, test_elasticnet_get_params_all_and_clone, test_elasticnet_invalid_selection_raises, test_lasso_elasticnet_params_signature_matches_sklearn}` (R-CHAR-3). |
 | REQ-ELASTICNET-VALUE-PARITY (coef_/intercept_ + support set array parity, default cyclic) | SHIPPED | on the DEFAULT converged path. `_regressors.py::ElasticNet.fit` marshals `coef_`/`intercept_` from the `RsElasticNet` getters (over `FittedElasticNet`), and downstream `ferrolearn-linear` REQ-1/4/5 are critic-verified ("NO DIVERGENCE FOUND") to MATCH the live sklearn `ElasticNet` oracle to <1e-5 for converged coef/intercept + the exact-zero support set over the (alpha, l1_ratio) grid, with `l1_reg=α·l1_ratio·n` / `l2_reg=α·(1−l1_ratio)·n`, incl. l1_ratio=1↔Lasso and l1_ratio=0↔L2. Live (R-CHAR-3): ferrolearn `ElasticNet(alpha=0.1).fit(X,y)` coef agrees with the oracle to the converged tolerance. Non-test consumer: `_regressors.py::ElasticNet` + re-export. (The dual-gap stopping criterion #412 and `positive`/`selection='random'` paths are owned downstream.) |
 | REQ-CONSUMER (binding IS the public API) | SHIPPED | the binding boundary types ARE the public API (R-DEFER-1/S5: boundary estimator types ARE the public surface; grandfathered existing pub API). Non-test production consumers: `_regressors.py::{LinearRegression,Ridge,Lasso,ElasticNet}` each construct their `_Rs*` class and call `fit`/`predict` + read the `coef_`/`intercept_` getters (`grep -n "_RsLinearRegression\|_RsRidge\|_RsLasso\|_RsElasticNet" python/ferrolearn/_regressors.py`); `ferrolearn/__init__.py:4` re-exports all four; `test_check_estimator.py:22-25` runs them through `parametrize_with_checks` and `test_cross_val_score.py:44-49` through `cross_val_score` + external users. Verification (model B): pytest → 534 passed (all four exercised in both consumer-suite files). |
 | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | open prereq blocker = `conversions.md` REQ-FERRAY #2027. `regressors.rs` marshals via `use crate::conversions::*` + `use numpy::{PyArray1, PyReadonlyArray1, PyReadonlyArray2}` (rust-numpy) and the conversions produce `ndarray::Array{1,2}` — the WRONG substrate per R-SUBSTRATE-1 (destination `ferray::numpy_interop` + `ferray-core`). ferray exposes no PyO3 numpy-interop bridge yet (R-SUBSTRATE-5). Owned by the conversions unit, surfaced here. |

@@ -379,26 +379,66 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
     ----------
     alpha : float, default=1.0
         Regularization strength.
+    fit_intercept : bool, default=True
+        Whether to calculate the intercept for this model.
+    precompute : bool, default=False
+        Whether to run coordinate descent on a precomputed Gram matrix, matching
+        sklearn `Lasso(precompute=...)` (`_coordinate_descent.py:1314`). Reaches
+        the same unique optimum as the direct path.
+    copy_X : bool, default=True
+        If True, X will be copied; else, it may be overwritten. ABI-only on the
+        Rust side (the coordinate-descent fit never mutates X), matching sklearn
+        `Lasso(copy_X=...)` (`_coordinate_descent.py:1314`).
     max_iter : int, default=1000
         Maximum number of iterations.
     tol : float, default=1e-4
         Tolerance for convergence.
-    fit_intercept : bool, default=True
-        Whether to calculate the intercept for this model.
+    warm_start : bool, default=False
+        When True, reuse the solution of the previous call to ``fit`` as the
+        coordinate-descent initialization, matching sklearn
+        `Lasso(warm_start=...)` (`_coordinate_descent.py:1318`). Single-output
+        only (multi-output warm_start is NOT-STARTED — the param is stored for
+        ``get_params`` but ignored by the per-target loop).
     positive : bool, default=False
         When True, force the coefficients to be non-negative (non-negative
         soft-threshold), matching sklearn `Lasso(positive=...)`
-        (`_coordinate_descent.py:909`; `_cd_fast.pyx:191-195`).
+        (`_coordinate_descent.py:1319`; `_cd_fast.pyx:191-195`).
+    random_state : int, default=None
+        Seed of the RNG that selects a random feature to update. Used only when
+        ``selection == 'random'``, matching sklearn `Lasso(random_state=...)`
+        (`_coordinate_descent.py:1320`).
+    selection : {'cyclic', 'random'}, default='cyclic'
+        Coordinate-selection order, matching sklearn `Lasso(selection=...)`
+        (`_coordinate_descent.py:1321`). ``'cyclic'`` is bit-exact to sklearn;
+        ``'random'`` converges to the same unique optimum but is NOT bit-identical
+        (Rust StdRng != numpy MT19937 — bit-parity NOT-STARTED). Any other value
+        raises ValueError.
     """
 
     def __init__(
-        self, alpha=1.0, *, max_iter=1000, tol=1e-4, fit_intercept=True, positive=False
+        self,
+        alpha=1.0,
+        *,
+        fit_intercept=True,
+        precompute=False,
+        copy_X=True,
+        max_iter=1000,
+        tol=1e-4,
+        warm_start=False,
+        positive=False,
+        random_state=None,
+        selection="cyclic",
     ):
         self.alpha = alpha
+        self.fit_intercept = fit_intercept
+        self.precompute = precompute
+        self.copy_X = copy_X
         self.max_iter = max_iter
         self.tol = tol
-        self.fit_intercept = fit_intercept
+        self.warm_start = warm_start
         self.positive = positive
+        self.random_state = random_state
+        self.selection = selection
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation. sklearn `Lasso` (subclass of
@@ -432,12 +472,21 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
             dual_gap_list = []
             self._rs_list = []
             for j in range(y.shape[1]):
+                # Multi-output warm_start is NOT-STARTED: the param is stored
+                # (for get_params) but the per-target loop always cold-starts
+                # (no coef_init), so warm_start has no effect on a 2-D `y` fit.
                 rs_j = _RsLasso(
                     alpha=self.alpha,
                     max_iter=self.max_iter,
                     tol=self.tol,
                     fit_intercept=self.fit_intercept,
                     positive=self.positive,
+                    precompute=self.precompute,
+                    copy_x=self.copy_X,
+                    warm_start=False,
+                    random_state=self.random_state,
+                    selection=self.selection,
+                    coef_init=None,
                 )
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
@@ -478,12 +527,36 @@ class Lasso(MultiOutputMixin, RegressorMixin, BaseEstimator):
             return self
         X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
+        # warm_start (single-output): ferrolearn estimators are immutable Rust
+        # value types (R-DEV-4), so the prior fit's `self.coef_` is passed back to
+        # the binding as `coef_init` to seed the coordinate descent, mirroring
+        # sklearn reusing its mutable `self.coef_` (`_coordinate_descent.py:1062`).
+        # Only when warm_start AND a prior 1-D (single-output) `coef_` exists.
+        coef_init = None
+        if self.warm_start and hasattr(self, "coef_"):
+            prev = np.asarray(self.coef_)
+            if prev.ndim == 1:
+                if prev.shape[0] != X.shape[1]:
+                    # sklearn feeds the stale `coef_` as `coef_init`; numpy
+                    # broadcast-fails when n_features changed under warm_start
+                    # (`_coordinate_descent.py:1062-1087`/`:706` -> ValueError).
+                    raise ValueError(
+                        f"could not broadcast input array from shape "
+                        f"({prev.shape[0]},) into shape ({X.shape[1]},)"
+                    )
+                coef_init = _ensure_f64(prev).tolist()
         self._rs = _RsLasso(
             alpha=self.alpha,
             max_iter=self.max_iter,
             tol=self.tol,
             fit_intercept=self.fit_intercept,
             positive=self.positive,
+            precompute=self.precompute,
+            copy_x=self.copy_X,
+            warm_start=self.warm_start,
+            random_state=self.random_state,
+            selection=self.selection,
+            coef_init=coef_init,
         )
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
@@ -536,16 +609,40 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
         Regularization strength.
     l1_ratio : float, default=0.5
         Mix of L1 vs L2 penalty (0=Ridge, 1=Lasso).
-    max_iter : int, default=1000
-        Maximum number of iterations.
-    tol : float, default=1e-4
-        Tolerance for convergence.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    precompute : bool, default=False
+        Whether to run coordinate descent on a precomputed Gram matrix, matching
+        sklearn `ElasticNet(precompute=...)` (`_coordinate_descent.py:904`).
+        Reaches the same unique optimum as the direct path.
+    max_iter : int, default=1000
+        Maximum number of iterations.
+    copy_X : bool, default=True
+        If True, X will be copied; else, it may be overwritten. ABI-only on the
+        Rust side (the coordinate-descent fit never mutates X), matching sklearn
+        `ElasticNet(copy_X=...)` (`_coordinate_descent.py:906`).
+    tol : float, default=1e-4
+        Tolerance for convergence.
+    warm_start : bool, default=False
+        When True, reuse the solution of the previous call to ``fit`` as the
+        coordinate-descent initialization, matching sklearn
+        `ElasticNet(warm_start=...)` (`_coordinate_descent.py:908`). Single-output
+        only (multi-output warm_start is NOT-STARTED — stored for ``get_params``
+        but ignored by the per-target loop).
     positive : bool, default=False
         When True, force the coefficients to be non-negative (non-negative
         soft-threshold), matching sklearn `ElasticNet(positive=...)`
         (`_coordinate_descent.py:909`; `_cd_fast.pyx:191-195`).
+    random_state : int, default=None
+        Seed of the RNG that selects a random feature to update. Used only when
+        ``selection == 'random'``, matching sklearn `ElasticNet(random_state=...)`
+        (`_coordinate_descent.py:910`).
+    selection : {'cyclic', 'random'}, default='cyclic'
+        Coordinate-selection order, matching sklearn `ElasticNet(selection=...)`
+        (`_coordinate_descent.py:911`). ``'cyclic'`` is bit-exact to sklearn;
+        ``'random'`` converges to the same unique optimum but is NOT bit-identical
+        (Rust StdRng != numpy MT19937 — bit-parity NOT-STARTED). Any other value
+        raises ValueError.
     """
 
     def __init__(
@@ -553,17 +650,27 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
         alpha=1.0,
         *,
         l1_ratio=0.5,
-        max_iter=1000,
-        tol=1e-4,
         fit_intercept=True,
+        precompute=False,
+        max_iter=1000,
+        copy_X=True,
+        tol=1e-4,
+        warm_start=False,
         positive=False,
+        random_state=None,
+        selection="cyclic",
     ):
         self.alpha = alpha
         self.l1_ratio = l1_ratio
-        self.max_iter = max_iter
-        self.tol = tol
         self.fit_intercept = fit_intercept
+        self.precompute = precompute
+        self.max_iter = max_iter
+        self.copy_X = copy_X
+        self.tol = tol
+        self.warm_start = warm_start
         self.positive = positive
+        self.random_state = random_state
+        self.selection = selection
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation. sklearn `ElasticNet`
@@ -596,6 +703,8 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
             dual_gap_list = []
             self._rs_list = []
             for j in range(y.shape[1]):
+                # Multi-output warm_start is NOT-STARTED: the param is stored
+                # (for get_params) but the per-target loop always cold-starts.
                 rs_j = _RsElasticNet(
                     alpha=self.alpha,
                     l1_ratio=self.l1_ratio,
@@ -603,6 +712,12 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
                     tol=self.tol,
                     fit_intercept=self.fit_intercept,
                     positive=self.positive,
+                    precompute=self.precompute,
+                    copy_x=self.copy_X,
+                    warm_start=False,
+                    random_state=self.random_state,
+                    selection=self.selection,
+                    coef_init=None,
                 )
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
@@ -643,6 +758,25 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
             return self
         X, y = self._validate_data(X, y, dtype="float64", y_numeric=True)
         X, y = _ensure_f64(X), _ensure_f64(y)
+        # warm_start (single-output): pass the prior fit's `self.coef_` back as
+        # `coef_init` to seed the coordinate descent (R-DEV-4; ferrolearn
+        # estimators are immutable Rust value types so the prior solution is
+        # supplied explicitly rather than read off a mutated estimator, mirroring
+        # sklearn `_coordinate_descent.py:1062`). Only when warm_start AND a prior
+        # 1-D (single-output) `coef_` of the right length exists.
+        coef_init = None
+        if self.warm_start and hasattr(self, "coef_"):
+            prev = np.asarray(self.coef_)
+            if prev.ndim == 1:
+                if prev.shape[0] != X.shape[1]:
+                    # sklearn feeds the stale `coef_` as `coef_init`; numpy
+                    # broadcast-fails when n_features changed under warm_start
+                    # (`_coordinate_descent.py:1062-1087`/`:706` -> ValueError).
+                    raise ValueError(
+                        f"could not broadcast input array from shape "
+                        f"({prev.shape[0]},) into shape ({X.shape[1]},)"
+                    )
+                coef_init = _ensure_f64(prev).tolist()
         self._rs = _RsElasticNet(
             alpha=self.alpha,
             l1_ratio=self.l1_ratio,
@@ -650,6 +784,12 @@ class ElasticNet(MultiOutputMixin, RegressorMixin, BaseEstimator):
             tol=self.tol,
             fit_intercept=self.fit_intercept,
             positive=self.positive,
+            precompute=self.precompute,
+            copy_x=self.copy_X,
+            warm_start=self.warm_start,
+            random_state=self.random_state,
+            selection=self.selection,
+            coef_init=coef_init,
         )
         _fit_rust(self._rs, X, y)
         self.coef_ = np.array(self._rs.coef_)
