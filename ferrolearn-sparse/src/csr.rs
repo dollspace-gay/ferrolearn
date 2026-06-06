@@ -105,6 +105,14 @@ where
             })
     }
 
+    /// Build a [`CsrMatrix`] from a pre-validated [`sprs::CsMat<T>`] in CSR storage.
+    ///
+    /// This is used internally for format conversions.
+    pub(crate) fn from_inner(inner: CsMat<T>) -> Self {
+        debug_assert!(inner.is_csr(), "inner matrix must be in CSR storage");
+        Self { inner }
+    }
+
     /// Returns the number of rows.
     pub fn n_rows(&self) -> usize {
         self.inner.rows()

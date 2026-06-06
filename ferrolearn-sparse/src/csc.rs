@@ -210,12 +210,17 @@ where
     }
 
     /// Convert to [`CsrMatrix`].
+    ///
+    /// This conversion is always successful: it re-expresses the same
+    /// `(data, indices, indptr)` buffers in CSR storage via the infallible
+    /// sprs `CsMat::to_csr`, mirroring scipy `csc_matrix.tocsr`
+    /// (`scipy/sparse/_csc.py:44`). The column-symmetric counterpart of the
+    /// infallible [`CsrMatrix::to_csc`].
     pub fn to_csr(&self) -> CsrMatrix<T>
     where
         T: Clone + Default + 'static,
     {
-        // from_csc is infallible for a valid CscMatrix
-        CsrMatrix::from_csc(self).unwrap()
+        CsrMatrix::from_inner(self.inner.to_csr())
     }
 
     /// Convert to [`CooMatrix`].
