@@ -40,7 +40,7 @@
 //! | REQ-2 | `shrink_threshold` shrunken centroids: `s = sqrt(var/(n-K))`, `s += median(s)` (`:183-184`), soft-threshold `sign·max(\|dev\|−thr,0)`, `centroid = dataset_centroid + m·s·signed_dev`; verified on 3-class/full/partial/partial-constant inputs | SHIPPED |
 //! | REQ-3 | `n_classes < 2` → `ValueError` (`:147-151`) | SHIPPED |
 //! | REQ-4 | All-features-zero-variance + shrink → `ValueError` (`:174-175`) | SHIPPED |
-//! | REQ-5 | `metric` param + `metric='manhattan'` median centroid | NOT-STARTED (#841) |
+//! | REQ-5 | `metric` param + `metric='manhattan'` median centroid (`NcMetric` + `with_metric`; feature-wise median `:167`, L1 predict `:218`) | SHIPPED (#841) |
 //! | REQ-6 | `shrink_threshold > 0` constraint (sklearn `InvalidParameterError` on 0/negative) | NOT-STARTED (#842) |
 //! | REQ-7 | PyO3 binding fidelity + ferray substrate | NOT-STARTED (#843) |
 
@@ -54,28 +54,73 @@ use num_traits::Float;
 // NearestCentroid
 // ---------------------------------------------------------------------------
 
+/// Distance metric used by [`NearestCentroid`].
+///
+/// Mirrors sklearn's `metric` parameter
+/// (`_nearest_centroid.py:104`: `StrOptions({"manhattan", "euclidean"})`).
+/// The metric governs BOTH how each class centroid is computed during `fit`
+/// and how `predict` measures distance to the centroids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NcMetric {
+    /// `metric="euclidean"` (sklearn default, `_nearest_centroid.py:104`).
+    ///
+    /// Centroid = per-class arithmetic MEAN (`:171`); `predict` assigns by
+    /// (squared) L2 distance.
+    #[default]
+    Euclidean,
+    /// `metric="manhattan"` (`_nearest_centroid.py:104`).
+    ///
+    /// Centroid = per-class feature-wise MEDIAN (`:167`,
+    /// `np.median(X[mask], axis=0)`); `predict` assigns by L1 distance.
+    Manhattan,
+}
+
 /// Nearest Centroid classifier.
 ///
 /// Classifies samples by assigning them to the class with the nearest
-/// centroid (mean) in Euclidean space.
+/// centroid in the configured [`NcMetric`]. For [`NcMetric::Euclidean`] the
+/// centroid is the per-class mean and distance is L2; for
+/// [`NcMetric::Manhattan`] the centroid is the per-class feature-wise median
+/// and distance is L1.
 ///
 /// # Type Parameters
 ///
 /// - `F`: The floating-point type (`f32` or `f64`).
 #[derive(Debug, Clone)]
 pub struct NearestCentroid<F> {
+    /// Distance metric. Default: [`NcMetric::Euclidean`] (sklearn default,
+    /// `_nearest_centroid.py:108`).
+    pub metric: NcMetric,
     /// Optional shrinkage threshold. If set, each class centroid is moved
     /// toward the overall centroid by this amount. Default: `None`.
+    ///
+    /// Shrinkage is defined for the euclidean/mean path only. When `metric ==
+    /// NcMetric::Manhattan`, `shrink_threshold` is currently IGNORED: sklearn's
+    /// shrinkage formula (`_nearest_centroid.py:173-196`) is derived for the
+    /// mean centroid, and the manhattan-with-shrink combination is not yet
+    /// translated.
     pub shrink_threshold: Option<F>,
 }
 
 impl<F: Float> NearestCentroid<F> {
-    /// Create a new `NearestCentroid` with no shrinkage.
+    /// Create a new `NearestCentroid` with the default ([`NcMetric::Euclidean`])
+    /// metric and no shrinkage.
     #[must_use]
     pub fn new() -> Self {
         Self {
+            metric: NcMetric::Euclidean,
             shrink_threshold: None,
         }
+    }
+
+    /// Set the distance [`NcMetric`].
+    ///
+    /// Mirrors sklearn's `metric` constructor parameter
+    /// (`_nearest_centroid.py:108`).
+    #[must_use]
+    pub fn with_metric(mut self, metric: NcMetric) -> Self {
+        self.metric = metric;
+        self
     }
 
     /// Set the shrinkage threshold.
@@ -105,6 +150,9 @@ pub struct FittedNearestCentroid<F> {
     centroids: Array2<F>,
     /// Sorted unique class labels.
     classes: Vec<usize>,
+    /// Distance metric used to assign samples in `predict`
+    /// (`_nearest_centroid.py:218`, `metric=self.metric`).
+    metric: NcMetric,
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for NearestCentroid<F> {
@@ -178,13 +226,36 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
                 .collect();
 
             let n_c = class_indices.len();
-            let n_c_f = F::from(n_c).unwrap();
 
-            for j in 0..n_features {
-                let sum = class_indices
-                    .iter()
-                    .fold(F::zero(), |acc, &i| acc + x[[i, j]]);
-                centroids[[ci, j]] = sum / n_c_f;
+            match self.metric {
+                // `_nearest_centroid.py:171`: euclidean → per-class feature-wise
+                // arithmetic mean `X[mask].mean(axis=0)`.
+                NcMetric::Euclidean => {
+                    let n_c_f = F::from(n_c).unwrap_or_else(F::one);
+                    for j in 0..n_features {
+                        let sum = class_indices
+                            .iter()
+                            .fold(F::zero(), |acc, &i| acc + x[[i, j]]);
+                        centroids[[ci, j]] = sum / n_c_f;
+                    }
+                }
+                // `_nearest_centroid.py:167`: manhattan → per-class feature-wise
+                // MEDIAN `np.median(X[mask], axis=0)`. numpy convention: sort the
+                // column values; odd count → middle element, even count →
+                // average of the two middle elements.
+                NcMetric::Manhattan => {
+                    let two = F::one() + F::one();
+                    for j in 0..n_features {
+                        let mut col: Vec<F> = class_indices.iter().map(|&i| x[[i, j]]).collect();
+                        col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        let mid = col.len() / 2;
+                        centroids[[ci, j]] = if col.len() % 2 == 1 {
+                            col[mid]
+                        } else {
+                            (col[mid - 1] + col[mid]) / two
+                        };
+                    }
+                }
             }
         }
 
@@ -295,7 +366,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
             }
         }
 
-        Ok(FittedNearestCentroid { centroids, classes })
+        Ok(FittedNearestCentroid {
+            centroids,
+            classes,
+            metric: self.metric,
+        })
     }
 }
 
@@ -330,12 +405,21 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedNearestCentr
             let mut best_dist = F::infinity();
 
             for ci in 0..n_classes {
-                let dist: F = (0..n_features)
-                    .map(|j| {
-                        let d = x[[i, j]] - self.centroids[[ci, j]];
-                        d * d
-                    })
-                    .fold(F::zero(), |a, b| a + b);
+                // `_nearest_centroid.py:218`: `pairwise_distances_argmin(X,
+                // centroids_, metric=self.metric)`. Euclidean uses (squared) L2;
+                // manhattan uses L1 `Σ|x_j − c_j|`. Squaring is monotone so the
+                // argmin is unchanged vs true L2 for the euclidean path.
+                let dist: F = match self.metric {
+                    NcMetric::Euclidean => (0..n_features)
+                        .map(|j| {
+                            let d = x[[i, j]] - self.centroids[[ci, j]];
+                            d * d
+                        })
+                        .fold(F::zero(), |a, b| a + b),
+                    NcMetric::Manhattan => (0..n_features)
+                        .map(|j| (x[[i, j]] - self.centroids[[ci, j]]).abs())
+                        .fold(F::zero(), |a, b| a + b),
+                };
 
                 if dist < best_dist {
                     best_dist = dist;
@@ -550,6 +634,72 @@ mod tests {
         let (x, y) = make_2class_data();
         let model = NearestCentroid::<f64>::new().with_shrink_threshold(-1.0);
         assert!(model.fit(&x, &y).is_err());
+    }
+
+    // R-CHAR-3 oracle: sklearn 1.5.2 `NearestCentroid`, run from /tmp on
+    // X=[[1,0],[2,0],[3,1],[10,5],[11,5],[12,6]], y=[0,0,0,1,1,1]:
+    //   metric='manhattan' centroids_ = [[2.0, 0.0], [11.0, 5.0]] (feature-wise median)
+    //   metric='manhattan' predict([[4,1],[9,5]]) = [0, 1]
+    //   default (euclidean) centroids_ = [[2.0, 0.3333333333333333],
+    //                                     [11.0, 5.333333333333333]] (mean)
+    fn manhattan_oracle_data() -> (Array2<f64>, Array1<usize>) {
+        let x = array![
+            [1.0, 0.0],
+            [2.0, 0.0],
+            [3.0, 1.0],
+            [10.0, 5.0],
+            [11.0, 5.0],
+            [12.0, 6.0]
+        ];
+        let y = array![0usize, 0, 0, 1, 1, 1];
+        (x, y)
+    }
+
+    #[test]
+    fn nearest_centroid_manhattan_median_centroids() -> Result<(), FerroError> {
+        let (x, y) = manhattan_oracle_data();
+        let fitted = NearestCentroid::<f64>::new()
+            .with_metric(NcMetric::Manhattan)
+            .fit(&x, &y)?;
+        let centroids = fitted.centroids();
+
+        // sklearn `_nearest_centroid.py:167` np.median(X[mask], axis=0).
+        assert_relative_eq!(centroids[[0, 0]], 2.0, epsilon = 1e-9);
+        assert_relative_eq!(centroids[[0, 1]], 0.0, epsilon = 1e-9);
+        assert_relative_eq!(centroids[[1, 0]], 11.0, epsilon = 1e-9);
+        assert_relative_eq!(centroids[[1, 1]], 5.0, epsilon = 1e-9);
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_centroid_manhattan_predict_matches_sklearn() -> Result<(), FerroError> {
+        let (x, y) = manhattan_oracle_data();
+        let fitted = NearestCentroid::<f64>::new()
+            .with_metric(NcMetric::Manhattan)
+            .fit(&x, &y)?;
+
+        let query = array![[4.0, 1.0], [9.0, 5.0]];
+        let preds = fitted.predict(&query)?;
+        // sklearn `_nearest_centroid.py:218` manhattan pairwise_distances_argmin.
+        assert_eq!(preds[0], 0);
+        assert_eq!(preds[1], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn nearest_centroid_euclidean_default_unchanged() -> Result<(), FerroError> {
+        let (x, y) = manhattan_oracle_data();
+        // Default metric is Euclidean (sklearn `_nearest_centroid.py:108`).
+        let fitted = NearestCentroid::<f64>::new().fit(&x, &y)?;
+        let centroids = fitted.centroids();
+
+        // sklearn `_nearest_centroid.py:171` X[mask].mean(axis=0) — the per-class
+        // mean path is unchanged by this commit (≤1e-12).
+        assert_relative_eq!(centroids[[0, 0]], 2.0, epsilon = 1e-12);
+        assert_relative_eq!(centroids[[0, 1]], 1.0 / 3.0, epsilon = 1e-12);
+        assert_relative_eq!(centroids[[1, 0]], 11.0, epsilon = 1e-12);
+        assert_relative_eq!(centroids[[1, 1]], 16.0 / 3.0, epsilon = 1e-12);
+        Ok(())
     }
 
     #[test]
