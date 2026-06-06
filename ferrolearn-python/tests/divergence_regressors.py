@@ -1289,3 +1289,138 @@ def test_ridge_positive_multioutput_matches_sklearn():
         [fl.Ridge(alpha=1.0, positive=True).fit(_X_POS, Y[:, j]).coef_ for j in range(2)]
     )
     np.testing.assert_allclose(fr.coef_, stacked, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# Ridge remaining constructor params: copy_X / max_iter / tol / solver /
+# random_state (issue #2132). The Rust `ferrolearn_linear::Ridge` SHIPS all of
+# them (REQ-8a solver auto/cholesky/svd, REQ-10 max_iter/tol, REQ-12
+# copy_x/random_state); these guards prove the BINDING now threads them.
+#
+# Live sklearn 1.5.2 oracle (R-CHAR-3): every expected value is computed by the
+# SkRidge call in the same test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+# Dedicated fixture from issue #2132 (full-rank, strictly-convex ridge solve).
+_X_RIDGE_PARAMS = np.array(
+    [[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]]
+)
+_y_RIDGE_PARAMS = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+
+
+def test_ridge_solver_svd_cholesky_auto_match_oracle():
+    """Ridge(solver='svd'|'cholesky'|'auto') all match the live sklearn oracle
+    (same solver) to 1e-6 AND are identical to each other.
+
+    sklearn's three dense solvers solve the SAME strictly-convex ridge problem,
+    so `coef_` is identical across them (`_ridge.py:830` resolve_solver; the
+    dense paths `_solve_cholesky`/`_solve_svd`). ferrolearn's `RidgeSolver`
+    {Auto, Cholesky, Svd} mirrors this. Oracle: live SkRidge per solver.
+    """
+    X, y = _X_RIDGE_PARAMS, _y_RIDGE_PARAMS
+    for solver in ("auto", "svd", "cholesky"):
+        sk = SkRidge(alpha=0.5, solver=solver).fit(X, y)
+        fr = fl.Ridge(alpha=0.5, solver=solver).fit(X, y)
+        np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+        np.testing.assert_allclose(
+            float(fr.intercept_), float(sk.intercept_), atol=1e-6
+        )
+
+    # All three ferrolearn solvers identical to each other (strictly convex).
+    coef_auto = fl.Ridge(alpha=0.5, solver="auto").fit(X, y).coef_
+    coef_svd = fl.Ridge(alpha=0.5, solver="svd").fit(X, y).coef_
+    coef_chol = fl.Ridge(alpha=0.5, solver="cholesky").fit(X, y).coef_
+    np.testing.assert_allclose(coef_auto, coef_svd, atol=1e-12)
+    np.testing.assert_allclose(coef_auto, coef_chol, atol=1e-12)
+
+
+def test_ridge_copy_x_max_iter_tol_random_state_accepted():
+    """copy_X / max_iter / tol / random_state are accepted and the default-path
+    coef_ is unchanged (no-ops for the dense direct solver).
+
+    sklearn's `cholesky`/`svd` paths ignore max_iter/tol/random_state and copy_X
+    is ABI-only (`_ridge.py:898-903`); the fitted `coef_` is therefore identical
+    to the bare default fit. Oracle: live SkRidge(alpha=0.5).
+    """
+    X, y = _X_RIDGE_PARAMS, _y_RIDGE_PARAMS
+    sk = SkRidge(alpha=0.5).fit(X, y)
+    baseline = fl.Ridge(alpha=0.5).fit(X, y)
+    np.testing.assert_allclose(baseline.coef_, sk.coef_, atol=1e-6)
+
+    fr = fl.Ridge(
+        alpha=0.5,
+        copy_X=False,
+        max_iter=500,
+        tol=1e-8,
+        random_state=42,
+    ).fit(X, y)
+    # No-op params => identical coefficients to the default fit and the oracle.
+    np.testing.assert_allclose(fr.coef_, baseline.coef_, atol=1e-12)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-6)
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), atol=1e-6)
+
+
+def test_ridge_get_params_all_eight_and_clone():
+    """get_params() contains all 8 sklearn Ridge params with the correct
+    defaults, and clone() round-trips them.
+
+    The expected param NAMES and DEFAULTS come from the live sklearn
+    `Ridge.__init__` signature (R-CHAR-3), NOT hard-coded from ferrolearn.
+    """
+    import inspect
+
+    from sklearn import clone
+
+    sk_params = inspect.signature(SkRidge.__init__).parameters
+    expected = {
+        name: p.default
+        for name, p in sk_params.items()
+        if name != "self" and p.default is not inspect.Parameter.empty
+    }
+    # sklearn 1.5.2 Ridge: alpha, fit_intercept, copy_X, max_iter, tol, solver,
+    # positive, random_state.
+    assert set(expected) == {
+        "alpha",
+        "fit_intercept",
+        "copy_X",
+        "max_iter",
+        "tol",
+        "solver",
+        "positive",
+        "random_state",
+    }
+
+    got = fl.Ridge().get_params()
+    assert set(got) == set(expected)
+    for name, default in expected.items():
+        assert got[name] == default, f"{name}: {got[name]!r} != sklearn {default!r}"
+
+    # clone() round-trips a non-default configuration.
+    src = fl.Ridge(
+        alpha=0.5,
+        fit_intercept=False,
+        copy_X=False,
+        max_iter=500,
+        tol=1e-8,
+        solver="svd",
+        positive=False,
+        random_state=7,
+    )
+    cloned = clone(src)
+    assert cloned.get_params() == src.get_params()
+
+
+def test_ridge_unsupported_solver_raises():
+    """Ridge(solver='lsqr').fit(...) raises (the iterative solvers are
+    NOT-STARTED downstream, #2133) with a clear message.
+
+    sklearn ACCEPTS 'lsqr' (`_ridge.py:885`), so this is a documented ferrolearn
+    NOT-STARTED gap surfaced as NotImplementedError at fit time, not a silent
+    wrong answer.
+    """
+    X, y = _X_RIDGE_PARAMS, _y_RIDGE_PARAMS
+    with pytest.raises((NotImplementedError, ValueError)) as excinfo:
+        fl.Ridge(solver="lsqr").fit(X, y)
+    msg = str(excinfo.value)
+    assert "lsqr" in msg
+    assert "not supported" in msg or "NOT-STARTED" in msg

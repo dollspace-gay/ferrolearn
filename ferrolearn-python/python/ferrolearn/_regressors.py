@@ -18,6 +18,29 @@ from ferrolearn._ferrolearn_rs import (
 )
 
 
+_RIDGE_DENSE_SOLVERS = frozenset({"auto", "svd", "cholesky"})
+_RIDGE_ITERATIVE_SOLVERS = frozenset({"lsqr", "sag", "saga", "sparse_cg", "lbfgs"})
+
+
+def _validate_ridge_solver(solver):
+    # sklearn `_ridge.py:883` accepts auto/svd/cholesky/lsqr/sparse_cg/sag/saga/lbfgs;
+    # ferrolearn implements only the dense direct solvers. A valid-but-unimplemented
+    # sklearn solver -> NotImplementedError (#2133, NOT-STARTED iterative solvers);
+    # an unknown string -> ValueError (mirrors sklearn InvalidParameterError).
+    if solver in _RIDGE_DENSE_SOLVERS:
+        return
+    if solver in _RIDGE_ITERATIVE_SOLVERS:
+        raise NotImplementedError(
+            f"Ridge solver '{solver}' is not supported (only 'auto'/'svd'/'cholesky'; "
+            f"iterative solvers lsqr/sag/saga/sparse_cg/lbfgs are NOT-STARTED, see #2133)"
+        )
+    raise ValueError(
+        f"The 'solver' parameter of Ridge must be a str among "
+        f"{{'auto', 'svd', 'cholesky', 'lsqr', 'sparse_cg', 'sag', 'saga', 'lbfgs'}}. "
+        f"Got {solver!r} instead."
+    )
+
+
 def _ensure_f64(arr):
     """Ensure array is C-contiguous float64 (required by Rust bindings)."""
     return np.ascontiguousarray(arr, dtype=np.float64)
@@ -199,16 +222,52 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         Regularization strength.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    copy_X : bool, default=True
+        If True, X will be copied; else, it may be overwritten. ABI-only on the
+        Rust side (fit never mutates X), matching sklearn `Ridge(copy_X=...)`
+        (`_ridge.py:898`).
+    max_iter : int, default=None
+        Maximum number of iterations. No-op for the dense direct solver
+        (closed-form normal equations), matching sklearn's `cholesky`/`svd`
+        paths (`_ridge.py:899`).
+    tol : float, default=1e-4
+        Precision of the solution. No-op for the dense direct solver
+        (`_ridge.py:900`).
+    solver : {'auto', 'svd', 'cholesky'}, default='auto'
+        Solver to use. `'auto'` resolves to `'cholesky'` for the dense path;
+        all three dense solvers produce the IDENTICAL coefficients (strictly
+        convex). The iterative solvers 'lsqr'/'sag'/'saga'/'sparse_cg'/'lbfgs'
+        are NOT-STARTED (raise NotImplementedError, see #2133). Matches sklearn
+        `Ridge(solver=...)` (`_ridge.py:901`).
     positive : bool, default=False
         When True, force the coefficients to be non-negative (projected
         coordinate descent), matching sklearn `Ridge(positive=...)`
         (`_ridge.py:902`/`:923-928`).
+    random_state : int, default=None
+        Used when `solver == 'sag'`/`'saga'`; a no-op for the dense direct
+        solver, matching sklearn `Ridge(random_state=...)` (`_ridge.py:903`).
     """
 
-    def __init__(self, alpha=1.0, *, fit_intercept=True, positive=False):
+    def __init__(
+        self,
+        alpha=1.0,
+        *,
+        fit_intercept=True,
+        copy_X=True,
+        max_iter=None,
+        tol=1e-4,
+        solver="auto",
+        positive=False,
+        random_state=None,
+    ):
         self.alpha = alpha
         self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.max_iter = max_iter
+        self.tol = tol
+        self.solver = solver
         self.positive = positive
+        self.random_state = random_state
 
     def fit(self, X, y):
         # Detect multi-output BEFORE validation: a 2-D `y` with >1 column routes
@@ -218,6 +277,14 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
         # a 2-D target shape (incl. a single-column `(n, 1)` `y` -> `coef_` `(1,
         # n_features)`, `intercept_` `(1,)`), so ANY 2-D `y` routes to the
         # multi-output path (`_base.py:319-324`).
+        #
+        # Validate `solver` UNIFORMLY before branching: sklearn validates
+        # `solver` against its StrOptions set (`_ridge.py:883`) regardless of
+        # `y` dimensionality, so both single- and multi-output paths must agree
+        # on accept/reject. The multi binding never receives `solver`, so without
+        # this the multi path silently accepts both unimplemented (lsqr/...) and
+        # bogus solver strings (#2134).
+        _validate_ridge_solver(self.solver)
         y_arr = np.asarray(y)
         multioutput = y_arr.ndim == 2
         if multioutput and self.positive:
@@ -237,7 +304,14 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
             intercept_list = []
             for j in range(y.shape[1]):
                 rs_j = _RsRidge(
-                    alpha=self.alpha, fit_intercept=self.fit_intercept, positive=True
+                    alpha=self.alpha,
+                    fit_intercept=self.fit_intercept,
+                    copy_x=self.copy_X,
+                    max_iter=self.max_iter,
+                    tol=self.tol,
+                    solver=self.solver,
+                    positive=True,
+                    random_state=self.random_state,
                 )
                 _fit_rust(rs_j, X, _ensure_f64(y[:, j]))
                 coef_list.append(np.array(rs_j.coef_))
@@ -269,7 +343,12 @@ class Ridge(MultiOutputMixin, RegressorMixin, BaseEstimator):
             self._rs = _RsRidge(
                 alpha=self.alpha,
                 fit_intercept=self.fit_intercept,
+                copy_x=self.copy_X,
+                max_iter=self.max_iter,
+                tol=self.tol,
+                solver=self.solver,
                 positive=self.positive,
+                random_state=self.random_state,
             )
             _fit_rust(self._rs, X, y)
             self.coef_ = np.array(self._rs.coef_)

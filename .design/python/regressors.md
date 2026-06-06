@@ -264,11 +264,30 @@ Grouped by estimator (`REQ-LINREG-*`, `REQ-RIDGE-*`, `REQ-LASSO-*`,
   `Ridge(0.5)` constructs an estimator with `alpha == 0.5`, matching sklearn
   `__init__(self, alpha=1.0, *, ...)` (`_ridge.py:893-895`, `alpha` before the
   `*`).
-- REQ-RIDGE-PARAMS: `ferrolearn.Ridge` exposes the
-  `copy_X`/`max_iter`/`tol`/`solver`/`positive`/`random_state` constructor params
-  (`_ridge.py:893-912`). [Param surface + behavior owned downstream: `solver`
-  `ferrolearn-linear` REQ-8 #386; `positive` REQ-9 #387; `max_iter`/`tol`/`n_iter_`
-  REQ-10 #388; `copy_X`/`random_state` REQ-12 #390.]
+- REQ-RIDGE-PARAMS: SHIPPED (iterative solvers NOT-STARTED #2133). `ferrolearn.Ridge`
+  exposes ALL of sklearn's `Ridge.__init__` params in the sklearn order/defaults
+  `(self, alpha=1.0, *, fit_intercept=True, copy_X=True, max_iter=None, tol=1e-4,
+  solver="auto", positive=False, random_state=None)` (`_ridge.py:893-904`). The
+  binding `RsRidge::new` carries the matching `#[pyo3(signature = ...)]`; `fit`
+  threads `.with_copy_x/.with_max_iter/.with_tol/.with_solver/.with_random_state/
+  .with_positive` into the Rust builder. The `solver` string maps to
+  `ferrolearn_linear::ridge::RidgeSolver` (`auto`→`Auto`, `cholesky`→`Cholesky`,
+  `svd`→`Svd`); all three dense solvers produce the IDENTICAL strictly-convex
+  `coef_`. Any other solver value (the iterative families `lsqr`/`sag`/`saga`/
+  `sparse_cg`/`lbfgs`, `_ridge.py:885`) raises `NotImplementedError` —
+  NOT-STARTED downstream, blocker #2133. `max_iter`/`tol`/`random_state` are
+  no-ops for the dense direct solver; `copy_X` is ABI-only. The wrapper stores
+  `self.copy_X` (capital-X, matching sklearn's attr) so `get_params()`/`set_params()`
+  round-trip all 8 params (check_estimator parity). [Downstream behavior:
+  `ferrolearn-linear` Ridge REQ-8a (solver auto/cholesky/svd) SHIPPED #386,
+  REQ-10 (max_iter/tol/n_iter_) SHIPPED #388, REQ-12 (copy_X/random_state)
+  SHIPPED #390; iterative-solver REQ-8b NOT-STARTED #386/#2133.] Surfaced by the
+  `RsRidge` constructor + `fit`; consumed by `_regressors.py::Ridge.__init__`/`fit`
+  (single-output path + per-target positive loop). Verified by
+  `tests/divergence_regressors.py::{test_ridge_solver_svd_cholesky_auto_match_oracle,
+  test_ridge_copy_x_max_iter_tol_random_state_accepted,
+  test_ridge_get_params_all_eight_and_clone, test_ridge_unsupported_solver_raises}`
+  (live oracle, R-CHAR-3).
 - REQ-RIDGE-VALUE-PARITY: `coef_`/`intercept_` match sklearn array-by-array
   (R-DEV-1) on the DEFAULT cholesky path. [Default path is SHIPPED (downstream
   REQ-1/REQ-5 verify cholesky coef/intercept to 1e-8 across

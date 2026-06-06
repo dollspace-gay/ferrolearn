@@ -31,7 +31,7 @@
 //! | REQ-RIDGE-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2040: `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True)` moves `alpha` before the `*`, so `ferrolearn.Ridge(0.5).alpha == 0.5` matching sklearn `_ridge.py:893`. Guard `test_red_ridge_alpha_positional`. |
 //! | REQ-RIDGE-VALUE-PARITY (coef_/intercept_ array parity, default cholesky) | SHIPPED | default path: downstream `ferrolearn-linear` REQ-1/5 match the sklearn `Ridge` oracle ≤1e-8 across alpha∈{0.1,1,10,100} (closed-form Cholesky, unpenalized intercept). (Per-target alpha #385, multi-output #384, alt solvers downstream.) |
 //! | REQ-RIDGE-MULTIOUTPUT (2-D Y → 2-D coef_) | SHIPPED | `ferrolearn.Ridge.fit` accepts a 2-D `y` of shape `(n_samples, n_targets)` and produces `coef_` `(n_targets, n_features)` + `intercept_` `(n_targets,)`, matching sklearn `Ridge` (`sklearn/linear_model/_ridge.py:543` coef shape, `:550` intercept shape, per-target solve `:207`/`:218`). impl `#[pyclass(name="_RsRidgeMultiOutput")] RsRidgeMultiOutput::fit`/`predict` + getters `coef_`/`intercept_` in `regressors.rs` over `ferrolearn_linear::FittedRidgeMulti<f64>` (the `Fit<Array2,Array2> for Ridge` path, `ferrolearn-linear/src/ridge.rs:725`, producing `FittedRidgeMulti` with `coefficients()` `(n_features,n_targets)` `:713` + `intercepts()` `:719`, shipped #29). The `coef_` getter TRANSPOSES the `(n_features,n_targets)` storage to sklearn's `(n_targets,n_features)` (R-DEV-3). Non-test consumer: `_regressors.py::Ridge.fit` routes the `y.ndim==2 and y.shape[1]>1` path to `_RsRidgeMultiOutput` (registered in `lib.rs`); `ferrolearn/__init__.py` re-export. Verification (model B): `tests/divergence_regressors.py::test_ridge_multioutput_matches_sklearn` asserts `coef_` `(2,2)`, `intercept_` `(2,)`, and `predict` match the live sklearn oracle ≤1e-8 (R-CHAR-3); `test_ridge_singleoutput_unchanged_by_multioutput_path` guards the 1-D path stays scalar-intercept. Downstream `ferrolearn-linear` REQ-6 #384. |
-//! | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | NOT-STARTED (positive SHIPPED #2129) | `positive` IS now surfaced: `RsRidge::new` takes `positive=false` (LAST, `#[pyo3(signature = (alpha=1.0, fit_intercept=true, positive=false))]`) + threads `.with_positive(self.positive)` into the `fit` builder; `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True, positive=False)` (keyword-only, matching sklearn `_ridge.py:902`) passes it to the single-output `_RsRidge` and (when `positive=True` AND `y` is 2-D) routes via a PER-TARGET LOOP over the single-output positive binding (sklearn's L-BFGS-B is per-target-independent, `_ridge.py:923-928`/`:207`). Downstream projected-CD `ferrolearn-linear` REQ-9 SHIPPED #387. Verification: `tests/divergence_regressors.py::test_ridge_positive_matches_sklearn` (+ `test_ridge_positive_multioutput_matches_sklearn`) + `test_ridge_positive_false_unchanged`. Still MISSING `copy_X`/`max_iter`/`tol`/`solver`/`random_state` — downstream #386/#388/#390. |
+//! | REQ-RIDGE-PARAMS (copy_X/max_iter/tol/solver/positive/random_state) | SHIPPED (iterative solvers NOT-STARTED #2133) | ALL of sklearn's `Ridge.__init__` params are now surfaced (`_ridge.py:893-904`): `RsRidge::new` takes `#[pyo3(signature = (alpha=1.0, fit_intercept=true, copy_x=true, max_iter=None, tol=1e-4, solver="auto".to_string(), positive=false, random_state=None))]` (sklearn order) + threads `.with_copy_x(self.copy_x).with_max_iter(self.max_iter).with_tol(self.tol).with_solver(solver_enum).with_random_state(self.random_state).with_positive(self.positive)` into the `fit` builder. The `solver` string maps to `ferrolearn_linear::RidgeSolver` (`auto`→`Auto`, `cholesky`→`Cholesky`, `svd`→`Svd`); any other value (the iterative families `lsqr`/`sag`/`saga`/`sparse_cg`/`lbfgs`, `_ridge.py:885`) raises `PyNotImplementedError` (NOT-STARTED downstream, #2133). Wrapper `_regressors.py::Ridge.__init__(self, alpha=1.0, *, fit_intercept=True, copy_X=True, max_iter=None, tol=1e-4, solver="auto", positive=False, random_state=None)` (sklearn order/defaults, `_ridge.py:893-904`) stores each (`self.copy_X` capital-X) and threads them into the single-output `_RsRidge`; the multi-output direct-solver path (`_RsRidgeMultiOutput`) leaves solver/tol/max_iter/random_state as no-ops (closed-form per-target Cholesky) but `get_params()` returns all 8 for sklearn parity. Downstream `ferrolearn-linear` REQ-8a (solver auto/cholesky/svd, all dense solvers give the identical strictly-convex coef) #386, REQ-10 (max_iter/tol no-ops for the direct solver) #388, REQ-12 (copy_x ABI-only, random_state stored-but-no-op) #390 all SHIPPED. Verification: `tests/divergence_regressors.py::{test_ridge_solver_svd_cholesky_auto_match_oracle, test_ridge_copy_x_max_iter_tol_random_state_accepted, test_ridge_get_params_all_eight_and_clone, test_ridge_unsupported_solver_raises}` (live oracle, R-CHAR-3). Iterative solvers `lsqr`/`sag`/`saga`/`sparse_cg`/`lbfgs` remain NOT-STARTED — #2133. |
 //! | REQ-LASSO-API-CONFORM (fit/predict + coef_/intercept_, default cyclic) | SHIPPED | `RsLasso::fit`/`predict` + getters, wrapped by `_regressors.py::Lasso` (marshals `alpha`/`max_iter`/`tol`) — mirroring `_coordinate_descent.py:932`. Live default-path coef matches the downstream-verified converged tolerance. |
 //! | REQ-LASSO-ALPHA-POSITIONAL (alpha positional ABI) | SHIPPED | FIXED #2041: `_regressors.py::Lasso.__init__(self, alpha=1.0, *, ...)` moves `alpha` before the `*`, so `ferrolearn.Lasso(0.1).alpha == 0.1` matching sklearn `_coordinate_descent.py:1310`. Guard `test_red_lasso_alpha_positional`. |
 //! | REQ-LASSO-VALUE-PARITY (coef_/intercept_ + support set, default cyclic) | SHIPPED | default converged path: downstream `ferrolearn-linear` REQ-1/4/6 match the sklearn `Lasso` oracle ≤1e-6 for converged coef/intercept + exact-zero support (cyclic CD, `l1_reg=α·n`). (Dual-gap stopping #412, positive/selection='random' downstream.) |
@@ -49,6 +49,7 @@
 
 use crate::conversions::*;
 use ferrolearn_core::{Fit, HasCoefficients, Predict};
+use ferrolearn_linear::ridge::RidgeSolver;
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
@@ -262,19 +263,51 @@ impl RsLinearRegressionMultiOutput {
 pub struct RsRidge {
     alpha: f64,
     fit_intercept: bool,
+    copy_x: bool,
+    max_iter: Option<usize>,
+    tol: f64,
+    solver: String,
     positive: bool,
+    random_state: Option<u64>,
     fitted: Option<ferrolearn_linear::FittedRidge<f64>>,
 }
 
 #[pymethods]
 impl RsRidge {
     #[new]
-    #[pyo3(signature = (alpha=1.0, fit_intercept=true, positive=false))]
-    fn new(alpha: f64, fit_intercept: bool, positive: bool) -> Self {
+    #[pyo3(signature = (
+        alpha = 1.0,
+        fit_intercept = true,
+        copy_x = true,
+        max_iter = None,
+        tol = 1e-4,
+        solver = "auto".to_string(),
+        positive = false,
+        random_state = None
+    ))]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "mirrors sklearn Ridge.__init__ constructor ABI (alpha, fit_intercept, copy_X, max_iter, tol, solver, positive, random_state); _ridge.py:893-904"
+    )]
+    fn new(
+        alpha: f64,
+        fit_intercept: bool,
+        copy_x: bool,
+        max_iter: Option<usize>,
+        tol: f64,
+        solver: String,
+        positive: bool,
+        random_state: Option<u64>,
+    ) -> Self {
         Self {
             alpha,
             fit_intercept,
+            copy_x,
+            max_iter,
+            tol,
+            solver,
             positive,
+            random_state,
             fitted: None,
         }
     }
@@ -282,9 +315,29 @@ impl RsRidge {
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray(y);
+        // Map the sklearn `solver` string to the Rust `RidgeSolver` enum. Only
+        // the dense direct solvers are implemented downstream; the iterative
+        // families ('lsqr'/'sag'/'saga'/'sparse_cg'/'lbfgs', sklearn
+        // `_ridge.py:885`) are NOT-STARTED (#2133) and raise NotImplementedError.
+        let solver_enum = match self.solver.as_str() {
+            "auto" => RidgeSolver::Auto,
+            "cholesky" => RidgeSolver::Cholesky,
+            "svd" => RidgeSolver::Svd,
+            other => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "Ridge solver '{other}' is not supported (only 'auto'/'svd'/'cholesky'; \
+                     iterative solvers lsqr/sag/saga/sparse_cg/lbfgs are NOT-STARTED, see #2133)"
+                )));
+            }
+        };
         let model = ferrolearn_linear::Ridge::<f64>::new()
             .with_alpha(self.alpha)
             .with_fit_intercept(self.fit_intercept)
+            .with_copy_x(self.copy_x)
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_solver(solver_enum)
+            .with_random_state(self.random_state)
             .with_positive(self.positive);
         let fitted = model
             .fit(&x_nd, &y_nd)
