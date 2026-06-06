@@ -755,3 +755,79 @@ def test_red_pca_n_components_float_ratio_matches_sklearn():
     fr = fl.PCA(n_components=0.95).fit(_XW)
     assert fr.n_components_ == sk.n_components_
     assert fr.components_.shape == sk.components_.shape
+
+
+# ---------------------------------------------------------------------------
+# RED pin: PCA(whiten=True) get_precision/score/score_samples on a
+# rank-deficient (n_samples < n_features) fit (critic re-audit of #2107/#2108).
+#
+# The #2107/#2108 fix removed the whiten bail-out in
+# FittedPCA::precision_and_logdet (ferrolearn-decomp/src/pca.rs) and folds the
+# `components_ * sqrt(exp_var)` whiten rescale (sklearn _base.py:46-47) into
+# get_covariance. That makes whiten=True work for the 6x3 fixture. But the
+# precision path still inverts get_covariance by eigendecomposing it and taking
+# 1/lambda, returning NumericalInstability whenever any eigenvalue is <= 0
+# (pca.rs precision_and_logdet, the `lambda <= 0` guard).
+#
+# When n_samples < n_features the data covariance is rank-deficient (it has
+# n_samples-1 nonzero eigenvalues at most), so get_covariance has ZERO
+# eigenvalues. sklearn computes get_precision via the matrix-inversion lemma
+# (sklearn/decomposition/_base.py:85-101, dividing by the tiny-but-nonzero
+# noise_variance_) and returns FINITE precision/score/score_samples; ferrolearn
+# raises ValueError instead. The whiten=True get_covariance itself DOES match
+# sklearn here (verified to ~1e-13), so this is purely the inverse/score path.
+#
+# R-CHAR-3: every expected value is computed by the LIVE sklearn 1.5.2 oracle in
+# the test, never literal-copied from ferrolearn. Magnitudes are ~1e15 (driven
+# by noise_variance_ ~= 1e-31), so the value comparison uses RELATIVE tolerance.
+# ---------------------------------------------------------------------------
+
+# 4x5 fixture: n_samples (4) < n_features (5) -> rank-deficient covariance with
+# zero eigenvalues. n_components=3 keeps a nonzero (dust) noise_variance_, so
+# sklearn takes the matrix-inversion-lemma branch and returns finite values.
+_XW_WIDE = np.array(
+    [
+        [1.0, 2.0, 3.0, 4.0, 5.0],
+        [2.0, 1.0, 0.0, 3.0, 2.0],
+        [5.0, 4.0, 2.0, 1.0, 0.0],
+        [0.0, 3.0, 1.0, 2.0, 4.0],
+    ]
+)
+
+
+def test_red_pca_whiten_precision_rank_deficient_matches_sklearn():
+    """Divergence: PCA(whiten=True).get_precision/score raise on a rank-deficient fit.
+
+    With n_samples < n_features the data covariance is singular (zero
+    eigenvalues). sklearn `get_precision` uses the matrix-inversion lemma
+    (`sklearn/decomposition/_base.py:85-101`) and returns FINITE
+    precision/score/score_samples for whiten=True; ferrolearn's
+    `FittedPCA::precision_and_logdet` (`ferrolearn-decomp/src/pca.rs`) inverts
+    `get_covariance` by eigendecomposing and taking `1/lambda`, hitting the
+    `lambda <= 0` guard on the zero eigenvalues and raising ValueError.
+
+    Tracking: #2110.
+    """
+    sk = SkPCA(n_components=3, whiten=True).fit(_XW_WIDE)
+    fr = fl.PCA(n_components=3, whiten=True).fit(_XW_WIDE)
+
+    # Oracle invariants: sklearn returns finite values for this rank-deficient
+    # whiten=True fit (pins the test to sklearn's actual behavior).
+    sk_prec = sk.get_precision()
+    sk_ss = sk.score_samples(_XW_WIDE)
+    sk_score = sk.score(_XW_WIDE)
+    assert np.all(np.isfinite(sk_prec))
+    assert np.all(np.isfinite(sk_ss))
+    assert np.isfinite(sk_score)
+
+    # ferrolearn's get_covariance under whiten=True already matches sklearn here,
+    # so the divergence is purely in the inverse/score path.
+    np.testing.assert_allclose(
+        fr.get_covariance(), sk.get_covariance(), atol=1e-6
+    )
+
+    # ferrolearn must NOT raise and must match the live oracle. Magnitudes are
+    # ~1e15 (noise_variance_ ~ 1e-31), so compare with relative tolerance.
+    np.testing.assert_allclose(fr.get_precision(), sk_prec, rtol=1e-6)
+    np.testing.assert_allclose(fr.score_samples(_XW_WIDE), sk_ss, rtol=1e-6)
+    assert abs(fr.score(_XW_WIDE) - sk_score) <= 1e-6 * abs(sk_score)
