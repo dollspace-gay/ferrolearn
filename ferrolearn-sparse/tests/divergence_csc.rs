@@ -412,6 +412,59 @@ fn csc_matmul_shape_mismatch_is_err() {
 // NOTE the CSC `data` order is COLUMN-major `[1,4,3,2,5]` (vs CSR's
 // `[1,2,3,4,5]`); `indices` are ROW indices and `indptr` is the COLUMN pointer.
 
+// REQ-MISSING-INDEX (element access) — live scipy oracle (R-CHAR-3). Expected
+// values from `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   print(A[1,1], A[0,1], A[0,0], A[0,2], A[2,0])"`
+//   -> 3.0 0.0 1.0 2.0 4.0  (A[0,1] is structurally absent -> 0).
+
+/// REQ-MISSING-INDEX (element access). `get(i,j)` returns the stored value at
+/// `(i,j)`, matching scipy `A[i,j]` (`IndexMixin.__getitem__` -> `_get_intXint`).
+///
+/// Oracle: `A[1,1]==3`, `A[0,0]==1`, `A[0,2]==2`, `A[2,0]==4`.
+#[test]
+fn csc_get_element_matches_scipy() {
+    let a = sample_a();
+    assert_eq!(a.get(1, 1).unwrap(), 3.0);
+    assert_eq!(a.get(0, 0).unwrap(), 1.0);
+    assert_eq!(a.get(0, 2).unwrap(), 2.0);
+    assert_eq!(a.get(2, 0).unwrap(), 4.0);
+}
+
+/// REQ-MISSING-INDEX (element access). A structurally absent position returns
+/// `0`, matching scipy `A[i,j]` for an unstored entry.
+///
+/// Oracle: `A[0,1] == 0.0` (no stored entry at row 0, col 1).
+#[test]
+fn csc_get_absent_is_zero() {
+    let a = sample_a();
+    assert_eq!(a.get(0, 1).unwrap(), 0.0);
+}
+
+/// REQ-MISSING-INDEX (element access) / REQ-ERR. An out-of-bounds index returns
+/// `Err(InvalidParameter)`, where scipy raises `IndexError`.
+///
+/// Oracle: `A[3,0]` and `A[0,3]` (A is 3×3) -> `IndexError: ... out of range`.
+#[test]
+fn csc_get_out_of_bounds_is_err() {
+    let a = sample_a();
+    assert!(
+        matches!(
+            a.get(3, 0),
+            Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+        ),
+        "row index out of bounds must return Err(InvalidParameter)"
+    );
+    assert!(
+        matches!(
+            a.get(0, 3),
+            Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+        ),
+        "col index out of bounds must return Err(InvalidParameter)"
+    );
+}
+
 /// REQ-API-ACCESSORS. `shape()`/`data()`/`indices()`/`indptr()` match scipy's
 /// `.shape`/`.data`/`.indices`/`.indptr` (`_compressed.py:38`, `:76-78`).
 ///
