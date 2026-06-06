@@ -31,7 +31,8 @@
 //! | REQ-MISSING-INDEX (element access) | SHIPPED (#2004) | `get(i, j)` returns the scalar `A[i,j]` — the stored value via sprs `inner.get(i,j) -> Option<&T>` (`.copied().unwrap_or_else(T::zero)`, so a structurally absent position yields `0`), bounds-checked (`i >= n_rows() \|\| j >= n_cols()` → `Err(FerroError::InvalidParameter)`), mirroring scipy `A[i,j]` (`IndexMixin.__getitem__` → `_get_intXint`, `_index.py:29`; out-of-range → `IndexError`, `_index.py:388`, mapped to `InvalidParameter` per R-DEV-2). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `A[1,1]=3`, `A[0,1]=0`, `A[0,0]=1`, `A[0,2]=2`, `A[2,0]=4`. Guards `csr_get_element_matches_scipy`/`csr_get_absent_is_zero`/`csr_get_out_of_bounds_is_err`. |
 //! | REQ-MISSING-INDEX (rows/cols) | SHIPPED (#2004) | `getrow(i)` returns row `i` as a `(1, n_cols)` CSR (single-row case of `row_slice`, delegates to `self.row_slice(i, i + 1)`), mirroring scipy `getrow(i)` (`_matrix.py:110` → `_getrow`, `_base.py:1116`, "(1 x n) row vector"); `getcol(j)` returns column `j` as a `(n_rows, 1)` CSR via `self.transpose().getrow(j)?.transpose()`, mirroring scipy `getcol(j)` (`_matrix.py:104` → `_getcol`, `_base.py:1097`, "(m x 1) column vector"). Both bounds-check (`i >= n_rows()`/`j >= n_cols()` → `Err(FerroError::InvalidParameter)`, scipy `IndexError`, R-DEV-2). Live oracle (R-CHAR-3): `A.getrow(0).toarray()`=`[[1,0,2]]`, `A.getrow(1).toarray()`=`[[0,3,0]]`, `A.getcol(0).toarray()`=`[[1],[0],[4]]`, `A.getcol(2).toarray()`=`[[2],[0],[5]]`. Guards `csr_getrow_matches_scipy`/`csr_getcol_matches_scipy`/`csr_getrow_getcol_out_of_bounds_is_err`. |
 //! | REQ-MISSING-INDEX (max/min) | SHIPPED (#2004) | `max()`/`min()` (`T: Copy + Zero + PartialOrd`) reduce over the stored `data()` and fold an implicit `T::zero()` when not fully dense (`nnz < n_rows*n_cols`); empty → `zero`. Mirrors scipy `_minmax_mixin._min_or_max(axis=None)` (`scipy/sparse/_data.py:208`-`:224`: stored-data reduce then `min_or_max(zero, m)` for the non-dense case). Live oracle (R-CHAR-3): `csr_matrix(diag(-3,-1,-5)).max()==0`, `.min()==-5`; `csr_matrix(diag(3,1,5)).max()==5`, `.min()==0`; dense `csr_matrix([[2,7]]).max()==7`, `.min()==2`. Guards `csr_max_folds_implicit_zero`/`csr_min_folds_implicit_zero`/`csr_max_min_dense_no_implicit_zero`. Direct analog of `CooMatrix::max()/min()`. |
-//! | REQ-MISSING-INDEX (maintenance) | NOT-STARTED | no `eliminate_zeros`/`sort_indices`/`sum_duplicates`/`astype`/`copy`. Blocker #2004. |
+//! | REQ-MISSING-INDEX (maintenance: astype/copy) | SHIPPED (#2004) | `astype<U,Fc>(cast)` (`scipy/sparse/_data.py:69`) casts every stored value to a new type `U` via a caller-supplied closure (Rust has no runtime dtype object — R-DEV-4 deviation; a plain `as`-cast closure reproduces numpy's C-cast float→int truncation toward zero), preserving the `indptr`/`indices` structure, `(n_rows,n_cols)` shape, and `nnz`; rebuilds via [`CsrMatrix::new`] from the original `indptr()`/`indices()` and the cast data (bound `T: Clone`, plus `U: Clone` as `new` requires). `copy()` (`scipy/sparse/_data.py:94`) clones preserving all structure including explicit stored zeros (delegates to `self.clone()`, `CsrMatrix` derives `Clone`; `#[must_use]`). Live oracle (R-CHAR-3): `csr_matrix([[3.7,0,0],[0,-2.9,0],[0,0,5.0]])` (`data=[3.7,-2.9,5.0]`, `indptr=[0,1,2,3]`, `indices=[0,1,2]`) → `astype(np.int64)` `data=[3,-2,5]` (truncated), dense `[[3,0,0],[0,-2,0],[0,0,5]]`; `astype(np.float32)` `data=[3.7f32,-2.9f32,5.0f32]`; `copy()` `nnz=3`, `data=[3.7,-2.9,5.0]`, dense unchanged. Guards `csr_astype_float_to_int_truncates`/`csr_astype_to_f32_preserves_structure`/`csr_copy_preserves_structure`. |
+//! | REQ-MISSING-INDEX (maintenance: remainder) | NOT-STARTED | no `eliminate_zeros`/`sort_indices`/`sum_duplicates`. Blocker #2004. |
 //! | REQ-API-ACCESSORS | SHIPPED (#2005) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSR `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSR column indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (row pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,2,3,4,5]`, `indices=[0,2,1,0,2]`, `indptr=[0,2,3,5]`. Guard `csr_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSR analog (R-SUBSTRATE-1). Blocker #2006. |
 
@@ -619,6 +620,77 @@ where
             });
         }
         Ok(self.transpose().getrow(j)?.transpose())
+    }
+
+    /// Return a copy of this matrix, preserving **all** stored structure.
+    ///
+    /// Mirrors scipy `csr_matrix.copy()` (`scipy/sparse/_data.py:94` —
+    /// `return self._with_data(self.data.copy(), copy=True)`), which returns an
+    /// identical matrix with the same sparsity pattern (`indptr`/`indices`) and
+    /// a copy of the `data` array. Every stored entry is preserved verbatim —
+    /// including **explicit stored zeros** — without coalescing or reordering.
+    /// Equivalent to [`Clone::clone`] (`CsrMatrix` derives `Clone`); provided as
+    /// a named method for scipy parity.
+    ///
+    /// Live oracle (R-CHAR-3): for
+    /// `sp.csr_matrix(np.array([[3.7,0,0],[0,-2.9,0],[0,0,5.0]]))`,
+    /// `A.copy().nnz == 3`, `A.copy().data == [3.7, -2.9, 5.0]`, and
+    /// `A.copy().toarray() == [[3.7,0,0],[0,-2.9,0],[0,0,5.0]]`.
+    #[must_use]
+    pub fn copy(&self) -> CsrMatrix<T> {
+        self.clone()
+    }
+}
+
+impl<T> CsrMatrix<T>
+where
+    T: Clone,
+{
+    /// Cast every stored value to a new scalar type `U` via a caller-supplied
+    /// closure, preserving the CSR sparsity structure (`indptr`/`indices`,
+    /// shape, nnz).
+    ///
+    /// Mirrors scipy `csr_matrix.astype(dtype)` (`scipy/sparse/_data.py:69` —
+    /// `self._with_data(self.data.astype(dtype, ...))`), which C-casts every
+    /// stored value in `self.data` to the requested numpy dtype while keeping the
+    /// `indptr`/`indices` structure and `shape` unchanged. scipy selects the cast
+    /// from a runtime numpy dtype object; Rust has no runtime dtype, so this is a
+    /// **deviation** (R-DEV-4): the caller supplies the element cast as a closure.
+    /// A plain `as`-cast closure (e.g. `|&v| v as i64`) reproduces numpy's C-cast
+    /// semantics, including float→int **truncation toward zero**.
+    ///
+    /// The `indptr` (row pointers) and `indices` (column indices) arrays, the
+    /// `(n_rows, n_cols)` shape, and the stored count are copied verbatim — only
+    /// the data array changes type — so explicit stored zeros are preserved (no
+    /// coalescing). Rebuilds a `CsrMatrix<U>` via [`new`](Self::new) from the
+    /// original `indptr`/`indices` and the cast data.
+    ///
+    /// Live oracle (R-CHAR-3): for
+    /// `sp.csr_matrix(np.array([[3.7,0,0],[0,-2.9,0],[0,0,5.0]]))` (CSR
+    /// `data=[3.7,-2.9,5.0]`, `indptr=[0,1,2,3]`, `indices=[0,1,2]`),
+    /// `astype(np.int64)` yields `data == [3, -2, 5]` (truncated toward zero) with
+    /// `indptr == [0,1,2,3]`, `indices == [0,1,2]`, dense
+    /// `[[3,0,0],[0,-2,0],[0,0,5]]`; `astype(np.float32)` yields
+    /// `data == [3.7f32, -2.9f32, 5.0f32]` with the same structure.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CsrMatrix` (the unchanged `indptr`/`indices` stay
+    /// valid for the unchanged shape).
+    pub fn astype<U, Fc>(&self, cast: Fc) -> Result<CsrMatrix<U>, FerroError>
+    where
+        U: Clone,
+        Fc: Fn(&T) -> U,
+    {
+        let data: Vec<U> = self.data().iter().map(&cast).collect();
+        CsrMatrix::<U>::new(
+            self.n_rows(),
+            self.n_cols(),
+            self.indptr(),
+            self.indices().to_vec(),
+            data,
+        )
     }
 }
 

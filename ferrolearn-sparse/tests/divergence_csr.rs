@@ -571,3 +571,88 @@ fn csr_max_min_dense_no_implicit_zero() -> Result<(), FerroError> {
     assert_eq!(c.min(), 2.0);
     Ok(())
 }
+
+/// Diagonal `f64` matrix `[[3.7,0,0],[0,-2.9,0],[0,0,5.0]]` in CSR form
+/// (`data=[3.7,-2.9,5.0]`, `indptr=[0,1,2,3]`, `indices=[0,1,2]`, shape (3,3)).
+fn sample_diag() -> Result<CsrMatrix<f64>, FerroError> {
+    CsrMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![3.7_f64, -2.9, 5.0],
+    )
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `astype`. Casting f64→i64 via `|&v| v as i64`
+/// truncates toward zero (numpy C-cast semantics) and preserves the CSR
+/// structure, matching scipy `A.astype(np.int64)`.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[3.7,0,0],[0,-2.9,0],[0,0,5.0]]));
+///   B=A.astype(np.int64);
+///   print(B.data.tolist(), B.indptr.tolist(), B.indices.tolist(),
+///         B.toarray().tolist())"`):
+/// `[3, -2, 5] [0, 1, 2, 3] [0, 1, 2] [[3,0,0],[0,-2,0],[0,0,5]]`.
+#[test]
+fn csr_astype_float_to_int_truncates() -> Result<(), FerroError> {
+    let a = sample_diag()?;
+    let b = a.astype(|&v| v as i64)?;
+    // scipy B.data == [3, -2, 5] (truncated toward zero)
+    assert_eq!(b.data(), &[3_i64, -2, 5]);
+    // structure preserved: scipy B.indptr == [0,1,2,3], B.indices == [0,1,2]
+    assert_eq!(b.indptr(), vec![0, 1, 2, 3]);
+    assert_eq!(b.indices(), &[0, 1, 2]);
+    // dense form scipy B.toarray() == [[3,0,0],[0,-2,0],[0,0,5]]
+    let d = b.to_dense();
+    let expected = [[3_i64, 0, 0], [0, -2, 0], [0, 0, 5]];
+    for (r, row) in expected.iter().enumerate() {
+        for (c, &v) in row.iter().enumerate() {
+            assert_eq!(d[[r, c]], v, "astype dense mismatch at ({r},{c})");
+        }
+    }
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `astype`. Casting f64→f32 via `|&v| v as f32`
+/// preserves the CSR structure, matching scipy `A.astype(np.float32)`.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[3.7,0,0],[0,-2.9,0],[0,0,5.0]]));
+///   B=A.astype(np.float32);
+///   print(B.data.tolist(), B.indptr.tolist(), B.indices.tolist())"`):
+/// `[3.700000047683716, -2.9000000953674316, 5.0] [0, 1, 2, 3] [0, 1, 2]`.
+#[test]
+fn csr_astype_to_f32_preserves_structure() -> Result<(), FerroError> {
+    let a = sample_diag()?;
+    let b = a.astype(|&v| v as f32)?;
+    // scipy B.data == [3.7f32, -2.9f32, 5.0f32]
+    assert_eq!(b.data(), &[3.7_f32, -2.9, 5.0]);
+    // structure preserved
+    assert_eq!(b.indptr(), vec![0, 1, 2, 3]);
+    assert_eq!(b.indices(), &[0, 1, 2]);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance) — `copy`. `copy()` clones preserving nnz,
+/// data, and dense form, leaving the original unchanged, matching scipy
+/// `A.copy()`.
+///
+/// Oracle (`cd /tmp && python3 -c "import numpy as np, scipy.sparse as sp;
+///   A=sp.csr_matrix(np.array([[3.7,0,0],[0,-2.9,0],[0,0,5.0]]));
+///   B=A.copy(); print(B.nnz, B.data.tolist(), B.toarray().tolist())"`):
+/// `3 [3.7, -2.9, 5.0] [[3.7,0,0],[0,-2.9,0],[0,0,5.0]]`.
+#[test]
+fn csr_copy_preserves_structure() -> Result<(), FerroError> {
+    let a = sample_diag()?;
+    let b = a.copy();
+    // scipy B.nnz == 3, B.data == [3.7, -2.9, 5.0]
+    assert_eq!(b.nnz(), 3);
+    assert_eq!(b.data(), &[3.7_f64, -2.9, 5.0]);
+    let expected = [[3.7, 0.0, 0.0], [0.0, -2.9, 0.0], [0.0, 0.0, 5.0]];
+    assert_dense_eq(&b.to_dense(), &expected);
+    // original is unchanged
+    assert_eq!(a.nnz(), 3);
+    assert_dense_eq(&a.to_dense(), &expected);
+    Ok(())
+}
