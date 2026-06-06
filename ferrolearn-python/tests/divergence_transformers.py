@@ -757,6 +757,55 @@ def test_red_pca_n_components_float_ratio_matches_sklearn():
     assert fr.components_.shape == sk.components_.shape
 
 
+def test_pca_n_components_float_ratio_variants_match_sklearn():
+    """PCA(n_components=<float ratio>) selects by cumulative variance like sklearn.
+
+    Covers the float branch across several ratios, the components_ value parity on
+    the selected subset, and the out-of-range float rejection. The wrapper threads
+    the float into the Rust `NComponents::Ratio` path
+    (`sklearn/decomposition/_pca.py:659-681` searchsorted-after-SVD); a float
+    `>= 1` is rejected at fit by sklearn's `_parameter_constraints`
+    (`_pca.py:386-391`).
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn.
+    """
+    # ratio -> count: smallest count whose cumulative explained_variance_ratio_
+    # is >= ratio. Oracle on _XW: 0.5 -> 1, 0.95 -> 2, 0.999 -> 3.
+    for ratio in (0.5, 0.95, 0.999):
+        sk = SkPCA(n_components=ratio).fit(_XW)
+        fr = fl.PCA(n_components=ratio).fit(_XW)
+
+        # n_components_ resolved by the ratio matches the live oracle.
+        assert fr.n_components_ == sk.n_components_
+        assert fr.components_.shape == sk.components_.shape
+
+        # The retained components match sklearn up to per-component sign
+        # (deterministic svd_flip, `_pca.py:647`).
+        np.testing.assert_allclose(
+            np.abs(fr.components_), np.abs(sk.components_), atol=1e-6
+        )
+        # explained_variance_ratio_ on the selected subset matches element-wise.
+        np.testing.assert_allclose(
+            fr.explained_variance_ratio_, sk.explained_variance_ratio_, atol=1e-6
+        )
+
+    # Cross-check the headline ratios resolve to the oracle's concrete counts.
+    assert SkPCA(n_components=0.5).fit(_XW).n_components_ == 1
+    assert SkPCA(n_components=0.999).fit(_XW).n_components_ == 3
+
+    # A float >= 1 is out of range: sklearn raises a ValueError at fit
+    # (`_parameter_constraints`, `_pca.py:386-391`). ferrolearn must too — and
+    # construction itself must NOT raise (validation is at fit, like sklearn's
+    # `_validate_params`-at-fit).
+    with pytest.raises(ValueError):
+        SkPCA(n_components=2.0).fit(_XW)
+
+    fr_bad = fl.PCA(n_components=2.0)  # constructs fine (validation deferred to fit)
+    with pytest.raises(ValueError):
+        fr_bad.fit(_XW)
+
+
 # ---------------------------------------------------------------------------
 # RED pin: PCA(whiten=True) get_precision/score/score_samples on a
 # rank-deficient (n_samples < n_features) fit (critic re-audit of #2107/#2108).
@@ -831,3 +880,97 @@ def test_red_pca_whiten_precision_rank_deficient_matches_sklearn():
     np.testing.assert_allclose(fr.get_precision(), sk_prec, rtol=1e-6)
     np.testing.assert_allclose(fr.score_samples(_XW_WIDE), sk_ss, rtol=1e-6)
     assert abs(fr.score(_XW_WIDE) - sk_score) <= 1e-6 * abs(sk_score)
+
+
+# ---------------------------------------------------------------------------
+# RED pin #2111: PCA(n_components=<float ratio>) off-by-one at the cumulative
+# explained_variance_ratio_ boundary (critic re-audit of #2109).
+#
+# sklearn resolves a float ratio AFTER the SVD with
+#   n_components = searchsorted(cumsum(explained_variance_ratio_), ratio,
+#                               side="right") + 1
+# (sklearn/decomposition/_pca.py:680-681). The `side="right"` tie-break means a
+# threshold that lands EXACTLY ON (or fractionally below, within ULPs of)
+# ferrolearn's reconstructed cumulative-sum boundary must keep the SAME count
+# sklearn keeps. ferrolearn's `PCA::with_variance_ratio`
+# (ferrolearn-decomp/src/pca.rs) computes its own cumulative sum and selects a
+# count that disagrees with sklearn by ONE for thresholds just below a boundary:
+# for the same X and the same nc, sklearn keeps N components but ferrolearn keeps
+# N+1.
+#
+# R-CHAR-3: the expected count is taken from the LIVE sklearn 1.5.2 oracle on the
+# SAME (X, nc) pair in this test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+# 8x5 fixture (np.random.RandomState(0) draw). Its explained_variance_ratio_
+# cumulative sums are ~[0.5246, 0.7668, 0.9047, 0.9798, 1.0]; the threshold
+# below sits one ULP-cluster under the 0.7668 boundary.
+_XRATIO = np.array(
+    [
+        [0.74159174, 1.55291372, -2.2683282, 1.33354538, -0.84272405],
+        [1.96992445, 1.26611853, -0.50587654, 2.54520078, 1.08081191],
+        [0.48431215, 0.57914048, -0.18158257, 1.41020463, -0.37447169],
+        [0.27519832, -0.96075461, 0.37692697, 0.03343893, 0.68056724],
+        [-1.56349669, -0.56669762, -0.24214951, 1.51439128, -0.3330574],
+        [0.04736482, 1.46274045, 1.53502913, 0.56644004, 0.14926509],
+        [-1.078278, 1.39547227, 1.78748405, -0.56951726, 0.17538653],
+        [-0.46250554, -1.0858006, 0.63973599, -0.38586334, -0.77576235],
+    ]
+)
+
+
+def test_red_pca_ncomp_float_ratio_cumsum_boundary_off_by_one():
+    """Divergence: float n_components off-by-one at the cumsum tie-break vs sklearn.
+
+    sklearn `_fit_full` selects the float-ratio count with
+    `searchsorted(cumsum(explained_variance_ratio_), ratio, side="right") + 1`
+    (`sklearn/decomposition/_pca.py:680-681`). For `nc` fractionally below the
+    second cumulative-variance boundary of `_XRATIO`, sklearn keeps 2 components;
+    ferrolearn's `PCA::with_variance_ratio`
+    (`ferrolearn-decomp/src/pca.rs`) keeps 3 — an off-by-one for the SAME (X, nc).
+
+    R-CHAR-3: the expected count is the live sklearn 1.5.2 oracle on this exact
+    (X, nc); nothing is copied from ferrolearn.
+
+    Tracking: #2111.
+    """
+    nc = 0.7667943106601404  # one ULP-cluster below the 0.7668 cumsum boundary
+
+    sk = SkPCA(n_components=nc).fit(_XRATIO)
+    fr = fl.PCA(n_components=nc).fit(_XRATIO)
+
+    # Live oracle: sklearn keeps exactly this many components for (X, nc).
+    assert sk.n_components_ == 2  # documents the oracle outcome
+    # ferrolearn must agree with the live oracle for the SAME (X, nc).
+    assert fr.n_components_ == sk.n_components_
+    # The retained component count drives components_ row count, so a mismatch
+    # propagates to the whole fitted model.
+    assert fr.components_.shape[0] == sk.components_.shape[0]
+
+
+def test_red_pca_ncomp_bool_accepted_by_sklearn():
+    """Divergence: ferrolearn rejects bool n_components; sklearn accepts True as 1.
+
+    sklearn's `n_components` constraint is `Interval(Integral, 0, None, ...)`
+    (`sklearn/decomposition/_pca.py:386-391`); Python `bool` is an `Integral`
+    subclass, so `PCA(n_components=True)` is ACCEPTED and fits with one component
+    (`n_components_` is the truthy int 1). ferrolearn's `_resolve_n_components`
+    (`ferrolearn-python/python/ferrolearn/_transformers.py`) explicitly guards
+    `not isinstance(nc, bool)` and raises ValueError, over-rejecting an input
+    sklearn accepts.
+
+    R-CHAR-3: the expected behavior (no raise, 1 component) is read from the live
+    sklearn 1.5.2 oracle in this test.
+
+    Tracking: #2112.
+    """
+    X = _XRATIO
+
+    # Live oracle: sklearn accepts bool True and keeps 1 component.
+    sk = SkPCA(n_components=True).fit(X)
+    assert int(sk.n_components_) == 1
+
+    # ferrolearn must match: accept True and keep 1 component (it currently
+    # raises ValueError in _resolve_n_components).
+    fr = fl.PCA(n_components=True).fit(X)
+    assert int(fr.n_components_) == int(sk.n_components_)
