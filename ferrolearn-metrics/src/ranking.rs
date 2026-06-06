@@ -11,8 +11,9 @@
 //! Mirrors scikit-learn ranking metrics (`sklearn/metrics/_ranking.py`). See
 //! `.design/metrics/ranking.md`. Non-test consumer: crate re-export. The
 //! dcg/ndcg/label_ranking value divergences (#754/#755/#756) are fixed; the
-//! remaining gaps are the 2D-multisample + `sample_weight` signature
-//! extensions and the ROC/PR surface (owned by `classification.rs`).
+//! `dcg_score`/`ndcg_score` 2D `(n_samples,n_labels)` sample-mean +
+//! `sample_weight` signature (#761, REQ-6b) is now shipped, completing REQ-6.
+//! The remaining gaps are the ROC/PR surface (owned by `classification.rs`).
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
@@ -22,14 +23,14 @@
 //! | REQ-4 | `label_ranking_average_precision_score` 1D value (`_ranking.py:1202`) | SHIPPED |
 //! | REQ-5 | `label_ranking_loss` 1D value: degenerate rows → 0, averaged over all `n_samples` (`_ranking.py:1461-1465`) | SHIPPED |
 //! | REQ-6a | `dcg_score` `log_base` parameter (`_ranking.py:1511`, discount `ln(base)/ln(i+2)`); validated to `(0,∞)\{1}`; `ndcg_score` is base-invariant so its signature is unchanged | SHIPPED |
-//! | REQ-6b | `dcg_score`/`ndcg_score` 2D `(n_samples,n_labels)` sample-mean + `sample_weight` | NOT-STARTED (#761) |
+//! | REQ-6b | `dcg_score`/`ndcg_score` 2D `(n_samples,n_labels)` sample-mean + `sample_weight` (`_ranking.py:1701-1706,:1864-1877`): per-row score via `fn dcg_single`, weighted mean `sum_i(w_i*s_i)/sum_i(w_i)` | SHIPPED |
 //! | REQ-7 | `coverage_error`/LRAP/`label_ranking_loss` `sample_weight`: weighted mean `sum_i(w_i * v_i)/sum_i(w_i)` (`_ranking.py:1365,:1281-1288,:1465`) | SHIPPED |
 //! | REQ-8 | ROC/PR surface (`auc`/`roc_auc_score`/`roc_curve`/`precision_recall_curve`/`average_precision_score`/`det_curve`/`top_k_accuracy_score`) currently in `classification.rs` | NOT-STARTED (#763) |
 //! | REQ-9 | PyO3 binding for ranking metrics | NOT-STARTED (#764) |
 //! | REQ-10 | ferray substrate migration | NOT-STARTED (#765) |
 
 use ferrolearn_core::FerroError;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, ArrayView1};
 use num_traits::Float;
 
 // ---------------------------------------------------------------------------
@@ -138,35 +139,62 @@ fn compute_dcg_plain<F: Float>(relevances: &[F], k: usize, base: F) -> F {
     dcg
 }
 
+/// Single-sample (per-row) tie-averaged DCG over a 1D ranking.
+///
+/// Mirrors sklearn `_tie_averaged_dcg` applied to one `(y_true_row, y_score_row)`
+/// pair inside the per-sample loop of `_dcg_sample_scores`
+/// (`sklearn/metrics/_ranking.py:1518-1524`). The 2D `dcg_score`/`ndcg_score`
+/// public APIs invoke this once per row, then average over samples.
+fn dcg_single<F: Float>(
+    y_true_row: ArrayView1<F>,
+    y_score_row: ArrayView1<F>,
+    k: usize,
+    base: F,
+) -> F {
+    // `compute_dcg_tie_averaged`/`argsort_desc`/`discount_cumsum` take `&Array1`,
+    // so materialise owned copies of the (borrowed) rows.
+    let y_true_owned: Array1<F> = y_true_row.to_owned();
+    let y_score_owned: Array1<F> = y_score_row.to_owned();
+    compute_dcg_tie_averaged(&y_true_owned, &y_score_owned, k, base)
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Compute the Discounted Cumulative Gain (DCG).
 ///
-/// Items are ranked by descending `y_score`. The DCG is defined as:
+/// Inputs are 2D `(n_samples, n_labels)`, mirroring sklearn's `dcg_score`
+/// (`sklearn/metrics/_ranking.py:1602`). For each sample (row) the items are
+/// ranked by descending `y_score` and the per-row DCG is:
 ///
 /// ```text
 /// DCG@k = sum_{i=0}^{k-1} y_true[ranked_i] / log_base(i + 2)
 /// ```
 ///
+/// (tie-averaged by default, matching sklearn `ignore_ties=False`). The returned
+/// scalar is the `sample_weight`-weighted mean of the per-row DCGs
+/// (`np.average(..., weights=sample_weight)`, `_ranking.py:1701-1706`).
+///
 /// # Arguments
 ///
-/// * `y_true` — relevance scores (ground-truth gains).
-/// * `y_score` — predicted scores used to rank items.
-/// * `k` — optional cutoff; if `None`, all items are used.
+/// * `y_true` — relevance scores (ground-truth gains), shape `(n_samples, n_labels)`.
+/// * `y_score` — predicted scores used to rank items, same shape as `y_true`.
+/// * `k` — optional cutoff; if `None`, all labels are used.
 /// * `log_base` — base of the discount logarithm (sklearn `log_base`,
-///   `_ranking.py:1492-1494`); `None` defaults to `2`. A low base means a
+///   `_ranking.py:1631-1633`); `None` defaults to `2`. A low base means a
 ///   sharper discount (top results matter more).
+/// * `sample_weight` — optional per-sample weights of length `n_samples`; if
+///   `None`, all samples are weighted equally (plain mean over rows).
 ///
 /// # Errors
 ///
 /// Returns [`FerroError::ShapeMismatch`] if `y_true` and `y_score` have
-/// different lengths.
-/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+/// different shapes, or if `sample_weight` length differs from `n_samples`.
+/// Returns [`FerroError::InsufficientSamples`] if there are no samples.
 /// Returns [`FerroError::InvalidParameter`] if `log_base` is `<= 0` or `== 1`
 /// (sklearn constrains `log_base` to the open interval `(0, ∞)`,
-/// `_ranking.py` `validate_params`; base `1` makes `ln(base) = 0` degenerate).
+/// `_ranking.py:1596`; base `1` makes `ln(base) = 0` degenerate).
 ///
 /// # Examples
 ///
@@ -174,34 +202,46 @@ fn compute_dcg_plain<F: Float>(relevances: &[F], k: usize, base: F) -> F {
 /// use ferrolearn_metrics::ranking::dcg_score;
 /// use ndarray::array;
 ///
-/// let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-/// let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-/// let dcg = dcg_score(&y_true, &y_score, None, None).unwrap();
+/// // Single-sample 2D input (one ranking).
+/// let y_true = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+/// let y_score = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+/// let dcg = dcg_score(&y_true, &y_score, None, None, None).unwrap();
 /// assert!(dcg > 0.0);
 ///
 /// // A different log base rescales the DCG by ln(base)/ln(2).
-/// let dcg10 = dcg_score(&y_true, &y_score, None, Some(10.0)).unwrap();
+/// let dcg10 = dcg_score(&y_true, &y_score, None, Some(10.0), None).unwrap();
 /// assert!((dcg10 - dcg * 10.0_f64.ln() / 2.0_f64.ln()).abs() < 1e-9);
 /// ```
 pub fn dcg_score<F: Float + Send + Sync + 'static>(
-    y_true: &Array1<F>,
-    y_score: &Array1<F>,
+    y_true: &Array2<F>,
+    y_score: &Array2<F>,
     k: Option<usize>,
     log_base: Option<F>,
+    sample_weight: Option<&Array1<F>>,
 ) -> Result<F, FerroError> {
-    let n = y_true.len();
-    if n != y_score.len() {
+    if y_true.dim() != y_score.dim() {
         return Err(FerroError::ShapeMismatch {
-            expected: vec![n],
-            actual: vec![y_score.len()],
+            expected: vec![y_true.nrows(), y_true.ncols()],
+            actual: vec![y_score.nrows(), y_score.ncols()],
             context: "dcg_score: y_true vs y_score".into(),
         });
     }
-    if n == 0 {
+    let n_samples = y_true.nrows();
+    let n_labels = y_true.ncols();
+    if n_samples == 0 {
         return Err(FerroError::InsufficientSamples {
             required: 1,
             actual: 0,
             context: "dcg_score".into(),
+        });
+    }
+    if let Some(w) = sample_weight
+        && w.len() != n_samples
+    {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![w.len()],
+            context: "dcg_score: sample_weight".into(),
         });
     }
 
@@ -214,34 +254,55 @@ pub fn dcg_score<F: Float + Send + Sync + 'static>(
         });
     }
 
-    let k = k.unwrap_or(n).min(n);
-    Ok(compute_dcg_tie_averaged(y_true, y_score, k, base))
+    let k = k.unwrap_or(n_labels).min(n_labels);
+
+    // sklearn returns `np.average(_dcg_sample_scores(...), weights=sample_weight)`
+    // (`_ranking.py:1701-1706`): the per-sample DCG is averaged with
+    // `sum_i(w_i * s_i) / sum_i(w_i)`; with `sample_weight=None` every `w_i = 1`,
+    // recovering the plain `sum/n_samples` mean.
+    let mut weighted_acc = F::zero();
+    let mut weight_sum = F::zero();
+    for i in 0..n_samples {
+        let w_i = sample_weight.map_or_else(F::one, |w| w[i]);
+        weight_sum = weight_sum + w_i;
+        let s_i = dcg_single(y_true.row(i), y_score.row(i), k, base);
+        weighted_acc = weighted_acc + w_i * s_i;
+    }
+    Ok(weighted_acc / weight_sum)
 }
 
 /// Compute the Normalized Discounted Cumulative Gain (NDCG).
 ///
-/// NDCG is the ratio of the DCG to the ideal DCG (computed by sorting
-/// `y_true` in descending order). NDCG is always in `[0, 1]` when
-/// relevances are non-negative.
+/// Inputs are 2D `(n_samples, n_labels)`, mirroring sklearn's `ndcg_score`
+/// (`sklearn/metrics/_ranking.py:1770`). For each sample the per-row NDCG is
+/// the ratio of the (tie-averaged) DCG to the ideal DCG (computed by sorting
+/// the row's `y_true` in descending order); both use base 2, which cancels in
+/// the ratio, so `ndcg_score` has NO `log_base` parameter. The returned scalar
+/// is the `sample_weight`-weighted mean of the per-row NDCGs
+/// (`np.average(gain, weights=sample_weight)`, `_ranking.py:1864-1877`).
 ///
 /// ```text
 /// NDCG@k = DCG@k / ideal_DCG@k
 /// ```
 ///
-/// When the ideal DCG is zero (all relevances are zero), the NDCG is
-/// defined as `0.0`.
+/// When the ideal DCG of a row is zero (all relevances are zero), that row's
+/// NDCG is defined as `0.0` (`_ranking.py:1754-1756`).
 ///
 /// # Arguments
 ///
-/// * `y_true` — relevance scores (ground-truth gains).
-/// * `y_score` — predicted scores used to rank items.
-/// * `k` — optional cutoff; if `None`, all items are used.
+/// * `y_true` — relevance scores (ground-truth gains), shape `(n_samples, n_labels)`.
+/// * `y_score` — predicted scores used to rank items, same shape as `y_true`.
+/// * `k` — optional cutoff; if `None`, all labels are used.
+/// * `sample_weight` — optional per-sample weights of length `n_samples`; if
+///   `None`, all samples are weighted equally (plain mean over rows).
 ///
 /// # Errors
 ///
 /// Returns [`FerroError::ShapeMismatch`] if `y_true` and `y_score` have
-/// different lengths.
-/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+/// different shapes, or if `sample_weight` length differs from `n_samples`.
+/// Returns [`FerroError::InsufficientSamples`] if there are no samples.
+/// Returns [`FerroError::InvalidParameter`] if any `y_true` value is negative
+/// (sklearn `_ranking.py:1868-1869`).
 ///
 /// # Examples
 ///
@@ -249,35 +310,47 @@ pub fn dcg_score<F: Float + Send + Sync + 'static>(
 /// use ferrolearn_metrics::ranking::ndcg_score;
 /// use ndarray::array;
 ///
-/// let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-/// let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-/// let ndcg = ndcg_score(&y_true, &y_score, None).unwrap();
+/// // Single-sample 2D input (one ranking).
+/// let y_true = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+/// let y_score = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+/// let ndcg = ndcg_score(&y_true, &y_score, None, None).unwrap();
 /// assert!(ndcg > 0.0 && ndcg <= 1.0);
 ///
 /// // Perfect ranking yields NDCG = 1.0
-/// let y_perfect = array![3.0_f64, 3.0, 2.0, 2.0, 1.0, 0.0];
-/// let y_score_perf = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-/// let ndcg_perf = ndcg_score(&y_perfect, &y_score_perf, None).unwrap();
+/// let y_perfect = array![[3.0_f64, 3.0, 2.0, 2.0, 1.0, 0.0]];
+/// let y_score_perf = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+/// let ndcg_perf = ndcg_score(&y_perfect, &y_score_perf, None, None).unwrap();
 /// assert!((ndcg_perf - 1.0).abs() < 1e-10);
 /// ```
 pub fn ndcg_score<F: Float + Send + Sync + 'static>(
-    y_true: &Array1<F>,
-    y_score: &Array1<F>,
+    y_true: &Array2<F>,
+    y_score: &Array2<F>,
     k: Option<usize>,
+    sample_weight: Option<&Array1<F>>,
 ) -> Result<F, FerroError> {
-    let n = y_true.len();
-    if n != y_score.len() {
+    if y_true.dim() != y_score.dim() {
         return Err(FerroError::ShapeMismatch {
-            expected: vec![n],
-            actual: vec![y_score.len()],
+            expected: vec![y_true.nrows(), y_true.ncols()],
+            actual: vec![y_score.nrows(), y_score.ncols()],
             context: "ndcg_score: y_true vs y_score".into(),
         });
     }
-    if n == 0 {
+    let n_samples = y_true.nrows();
+    let n_labels = y_true.ncols();
+    if n_samples == 0 {
         return Err(FerroError::InsufficientSamples {
             required: 1,
             actual: 0,
             context: "ndcg_score".into(),
+        });
+    }
+    if let Some(w) = sample_weight
+        && w.len() != n_samples
+    {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![w.len()],
+            context: "ndcg_score: sample_weight".into(),
         });
     }
 
@@ -289,29 +362,44 @@ pub fn ndcg_score<F: Float + Send + Sync + 'static>(
         });
     }
 
-    let k = k.unwrap_or(n).min(n);
+    let k = k.unwrap_or(n_labels).min(n_labels);
 
     // ndcg_score has NO log_base parameter (sklearn `ndcg_score`,
     // `_ranking.py:1770`): the base cancels in the DCG/ideal-DCG ratio, so
     // base 2 is used internally for both numerator and denominator.
     let base = F::from(2).unwrap_or_else(F::one);
 
-    // Actual DCG: tie-averaged over the order induced by y_score (sklearn
-    // default ignore_ties=False).
-    let dcg = compute_dcg_tie_averaged(y_true, y_score, k, base);
+    // Per-sample NDCG, then `np.average(gain, weights=sample_weight)`
+    // (`_ranking.py:1876-1877`).
+    let mut weighted_acc = F::zero();
+    let mut weight_sum = F::zero();
+    for i in 0..n_samples {
+        let w_i = sample_weight.map_or_else(F::one, |w| w[i]);
+        weight_sum = weight_sum + w_i;
+        let y_true_row = y_true.row(i);
+        let y_score_row = y_score.row(i);
 
-    // Ideal (normalizing) DCG: sort y_true descending. sklearn normalizes with
-    // ignore_ties=True (_ranking.py:1753) — permuting tied y_true entries does
-    // not change the re-ordered relevances, so the plain DCG is used here.
-    let mut ideal_relevances: Vec<F> = y_true.iter().copied().collect();
-    ideal_relevances.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
-    let ideal_dcg = compute_dcg_plain(&ideal_relevances, k, base);
+        // Actual DCG: tie-averaged over the order induced by y_score (sklearn
+        // default ignore_ties=False).
+        let dcg = dcg_single(y_true_row, y_score_row, k, base);
 
-    if ideal_dcg == F::zero() {
-        return Ok(F::zero());
+        // Ideal (normalizing) DCG: sort y_true descending. sklearn normalizes
+        // with ignore_ties=True (_ranking.py:1753) — permuting tied y_true
+        // entries does not change the re-ordered relevances, so the plain DCG
+        // is used here.
+        let mut ideal_relevances: Vec<F> = y_true_row.iter().copied().collect();
+        ideal_relevances.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let ideal_dcg = compute_dcg_plain(&ideal_relevances, k, base);
+
+        // all-irrelevant rows (ideal == 0) map to 0 (_ranking.py:1754-1756).
+        let ndcg_i = if ideal_dcg == F::zero() {
+            F::zero()
+        } else {
+            dcg / ideal_dcg
+        };
+        weighted_acc = weighted_acc + w_i * ndcg_i;
     }
-
-    Ok(dcg / ideal_dcg)
+    Ok(weighted_acc / weight_sum)
 }
 
 // ---------------------------------------------------------------------------
@@ -566,9 +654,9 @@ mod tests {
         // y_true = [3, 2, 3, 0, 1, 2], y_score = [6, 5, 4, 3, 2, 1]
         // Ranking by y_score descending gives relevances: [3, 2, 3, 0, 1, 2]
         // DCG = 3/log2(0+2) + 2/log2(1+2) + 3/log2(2+2) + 0/log2(3+2) + 1/log2(4+2) + 2/log2(5+2)
-        let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-        let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-        let dcg = dcg_score(&y_true, &y_score, None, None)?;
+        let y_true = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+        let y_score = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+        let dcg = dcg_score(&y_true, &y_score, None, None, None)?;
         let expected = 3.0 / 2.0_f64.log2()
             + 2.0 / 3.0_f64.log2()
             + 3.0 / 4.0_f64.log2()
@@ -581,9 +669,9 @@ mod tests {
 
     #[test]
     fn test_dcg_with_k() -> Result<(), FerroError> {
-        let y_true = array![3.0_f64, 2.0, 1.0];
-        let y_score = array![3.0_f64, 2.0, 1.0];
-        let dcg_k2 = dcg_score(&y_true, &y_score, Some(2), None)?;
+        let y_true = array![[3.0_f64, 2.0, 1.0]];
+        let y_score = array![[3.0_f64, 2.0, 1.0]];
+        let dcg_k2 = dcg_score(&y_true, &y_score, Some(2), None, None)?;
         // Only first 2: 3/log2(2) + 2/log2(3)
         let expected = 3.0 / 2.0_f64.log2() + 2.0 / 3.0_f64.log2();
         assert!((dcg_k2 - expected).abs() < 1e-10);
@@ -591,102 +679,107 @@ mod tests {
     }
 
     #[test]
-    fn test_ndcg_perfect_ranking() {
-        let y_true = array![3.0_f64, 2.0, 1.0, 0.0];
-        let y_score = array![4.0_f64, 3.0, 2.0, 1.0];
-        let ndcg = ndcg_score(&y_true, &y_score, None).unwrap();
+    fn test_ndcg_perfect_ranking() -> Result<(), FerroError> {
+        let y_true = array![[3.0_f64, 2.0, 1.0, 0.0]];
+        let y_score = array![[4.0_f64, 3.0, 2.0, 1.0]];
+        let ndcg = ndcg_score(&y_true, &y_score, None, None)?;
         assert!((ndcg - 1.0).abs() < 1e-10);
+        Ok(())
     }
 
     #[test]
-    fn test_ndcg_all_zero_relevance() {
-        let y_true = array![0.0_f64, 0.0, 0.0];
-        let y_score = array![3.0_f64, 2.0, 1.0];
-        let ndcg = ndcg_score(&y_true, &y_score, None).unwrap();
+    fn test_ndcg_all_zero_relevance() -> Result<(), FerroError> {
+        let y_true = array![[0.0_f64, 0.0, 0.0]];
+        let y_score = array![[3.0_f64, 2.0, 1.0]];
+        let ndcg = ndcg_score(&y_true, &y_score, None, None)?;
         assert!((ndcg - 0.0).abs() < 1e-10);
+        Ok(())
     }
 
     #[test]
-    fn test_ndcg_with_k() {
-        let y_true = array![0.0_f64, 1.0, 3.0, 2.0];
-        let y_score = array![1.0_f64, 4.0, 3.0, 2.0];
+    fn test_ndcg_with_k() -> Result<(), FerroError> {
+        let y_true = array![[0.0_f64, 1.0, 3.0, 2.0]];
+        let y_score = array![[1.0_f64, 4.0, 3.0, 2.0]];
         // Ranking by y_score desc: indices [1, 2, 3, 0] -> relevances [1, 3, 2, 0]
         // DCG@2 = 1/log2(0+2) + 3/log2(1+2) = 1/1 + 3/log2(3)
         // Ideal order of relevances: [3, 2, 1, 0]
         // ideal DCG@2 = 3/log2(2) + 2/log2(3) = 3/1 + 2/log2(3)
-        let ndcg = ndcg_score(&y_true, &y_score, Some(2)).unwrap();
+        let ndcg = ndcg_score(&y_true, &y_score, Some(2), None)?;
         let dcg = 1.0 / 2.0_f64.log2() + 3.0 / 3.0_f64.log2();
         let ideal = 3.0 / 2.0_f64.log2() + 2.0 / 3.0_f64.log2();
         assert!((ndcg - dcg / ideal).abs() < 1e-10);
+        Ok(())
     }
 
     #[test]
     fn test_dcg_empty() {
-        let y_true: Array1<f64> = Array1::zeros(0);
-        let y_score: Array1<f64> = Array1::zeros(0);
-        assert!(dcg_score(&y_true, &y_score, None, None).is_err());
+        let y_true: Array2<f64> = Array2::zeros((0, 0));
+        let y_score: Array2<f64> = Array2::zeros((0, 0));
+        assert!(dcg_score(&y_true, &y_score, None, None, None).is_err());
     }
 
     #[test]
     fn test_dcg_shape_mismatch() {
-        let y_true = array![1.0_f64, 2.0];
-        let y_score = array![1.0_f64, 2.0, 3.0];
-        assert!(dcg_score(&y_true, &y_score, None, None).is_err());
+        let y_true = array![[1.0_f64, 2.0]];
+        let y_score = array![[1.0_f64, 2.0, 3.0]];
+        assert!(dcg_score(&y_true, &y_score, None, None, None).is_err());
     }
 
     #[test]
     fn test_ndcg_empty() {
-        let y_true: Array1<f64> = Array1::zeros(0);
-        let y_score: Array1<f64> = Array1::zeros(0);
-        assert!(ndcg_score(&y_true, &y_score, None).is_err());
+        let y_true: Array2<f64> = Array2::zeros((0, 0));
+        let y_score: Array2<f64> = Array2::zeros((0, 0));
+        assert!(ndcg_score(&y_true, &y_score, None, None).is_err());
     }
 
     #[test]
     fn test_ndcg_shape_mismatch() {
-        let y_true = array![1.0_f64, 2.0];
-        let y_score = array![1.0_f64];
-        assert!(ndcg_score(&y_true, &y_score, None).is_err());
+        let y_true = array![[1.0_f64, 2.0]];
+        let y_score = array![[1.0_f64, 2.0, 3.0]];
+        assert!(ndcg_score(&y_true, &y_score, None, None).is_err());
     }
 
     #[test]
     fn test_dcg_single_element() -> Result<(), FerroError> {
-        let y_true = array![5.0_f64];
-        let y_score = array![1.0_f64];
-        let dcg = dcg_score(&y_true, &y_score, None, None)?;
+        let y_true = array![[5.0_f64]];
+        let y_score = array![[1.0_f64]];
+        let dcg = dcg_score(&y_true, &y_score, None, None, None)?;
         // 5 / log2(0+2) = 5 / log2(2) = 5 / 1 = 5
         assert!((dcg - 5.0).abs() < 1e-10);
         Ok(())
     }
 
     #[test]
-    fn test_ndcg_single_element() {
-        let y_true = array![5.0_f64];
-        let y_score = array![1.0_f64];
-        let ndcg = ndcg_score(&y_true, &y_score, None).unwrap();
+    fn test_ndcg_single_element() -> Result<(), FerroError> {
+        let y_true = array![[5.0_f64]];
+        let y_score = array![[1.0_f64]];
+        let ndcg = ndcg_score(&y_true, &y_score, None, None)?;
         assert!((ndcg - 1.0).abs() < 1e-10);
+        Ok(())
     }
 
     #[test]
     fn test_dcg_f32() -> Result<(), FerroError> {
-        let y_true = array![3.0_f32, 2.0, 1.0];
-        let y_score = array![3.0_f32, 2.0, 1.0];
-        let dcg = dcg_score(&y_true, &y_score, None, None)?;
+        let y_true = array![[3.0_f32, 2.0, 1.0]];
+        let y_score = array![[3.0_f32, 2.0, 1.0]];
+        let dcg = dcg_score(&y_true, &y_score, None, None, None)?;
         assert!(dcg > 0.0_f32);
         Ok(())
     }
 
     #[test]
-    fn test_ndcg_k_larger_than_n() {
-        let y_true = array![3.0_f64, 2.0, 1.0];
-        let y_score = array![3.0_f64, 2.0, 1.0];
-        let ndcg_all = ndcg_score(&y_true, &y_score, None).unwrap();
-        let ndcg_big_k = ndcg_score(&y_true, &y_score, Some(100)).unwrap();
+    fn test_ndcg_k_larger_than_n() -> Result<(), FerroError> {
+        let y_true = array![[3.0_f64, 2.0, 1.0]];
+        let y_score = array![[3.0_f64, 2.0, 1.0]];
+        let ndcg_all = ndcg_score(&y_true, &y_score, None, None)?;
+        let ndcg_big_k = ndcg_score(&y_true, &y_score, Some(100), None)?;
         assert!((ndcg_all - ndcg_big_k).abs() < 1e-10);
+        Ok(())
     }
 
     // -----------------------------------------------------------------
-    // log_base divergence pins (#761, REQ-6a). Expected values from the
-    // live sklearn 1.5.2 oracle:
+    // log_base divergence pins (REQ-6a). Expected values from the live
+    // sklearn 1.5.2 oracle (single-row 2D input):
     //   import numpy as np; from sklearn.metrics import dcg_score
     //   yt=np.array([[3,2,3,0,1,2]]); ys=np.array([[6,5,4,3,2,1]])
     //   dcg_score(yt,ys)            -> 6.8611266886  (log_base=2 default)
@@ -696,40 +789,40 @@ mod tests {
 
     #[test]
     fn dcg_score_default_log2_unchanged() -> Result<(), FerroError> {
-        let yt = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-        let ys = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-        let got = dcg_score(&yt, &ys, None, None)?;
+        let yt = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+        let ys = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+        let got = dcg_score(&yt, &ys, None, None, None)?;
         assert!((got - 6.861_126_688_6).abs() < 1e-9, "got {got}");
         Ok(())
     }
 
     #[test]
     fn dcg_score_log_base_10_matches_sklearn() -> Result<(), FerroError> {
-        let yt = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-        let ys = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-        let got = dcg_score(&yt, &ys, None, Some(10.0))?;
+        let yt = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+        let ys = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+        let got = dcg_score(&yt, &ys, None, Some(10.0), None)?;
         assert!((got - 22.792_169_509_4).abs() < 1e-9, "got {got}");
         Ok(())
     }
 
     #[test]
     fn dcg_score_log_base_e_matches_sklearn() -> Result<(), FerroError> {
-        let yt = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-        let ys = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-        let got = dcg_score(&yt, &ys, None, Some(std::f64::consts::E))?;
+        let yt = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+        let ys = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+        let got = dcg_score(&yt, &ys, None, Some(std::f64::consts::E), None)?;
         assert!((got - 9.898_513_448_5).abs() < 1e-9, "got {got}");
         Ok(())
     }
 
     #[test]
     fn dcg_score_invalid_log_base_errors() {
-        let yt = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-        let ys = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
+        let yt = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+        let ys = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
         // base == 1 (ln(1) = 0, degenerate discount), base == 0, and a
         // negative base are all rejected per sklearn's (0, ∞) constraint.
-        assert!(dcg_score(&yt, &ys, None, Some(1.0)).is_err());
-        assert!(dcg_score(&yt, &ys, None, Some(0.0)).is_err());
-        assert!(dcg_score(&yt, &ys, None, Some(-2.0)).is_err());
+        assert!(dcg_score(&yt, &ys, None, Some(1.0), None).is_err());
+        assert!(dcg_score(&yt, &ys, None, Some(0.0), None).is_err());
+        assert!(dcg_score(&yt, &ys, None, Some(-2.0), None).is_err());
     }
 
     // -----------------------------------------------------------------

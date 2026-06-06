@@ -4,9 +4,9 @@
 //! call is quoted in each test, R-CHAR-3) or a sklearn `file:line` symbolic
 //! constant — NEVER copied from the ferrolearn side.
 //!
-//! ferrolearn's `dcg_score`/`ndcg_score` are 1D (single ranking); sklearn's are
-//! 2D `(n_samples, n_labels)`. We call ferrolearn's 1D API with the single-row
-//! vectors and compare to sklearn's single-row 2D result (= the per-row score).
+//! ferrolearn's `dcg_score`/`ndcg_score` are 2D `(n_samples, n_labels)`, matching
+//! sklearn. Single-ranking pins use a single-row 2D array and compare to
+//! sklearn's single-row 2D result (= the per-row score).
 //!
 //! RED pins (deterministic correctness divergences — fixers must fix):
 //!   - divergence_dcg_tie_averaging          (#754)
@@ -19,7 +19,9 @@
 //!   - green_lrap_basic
 //!   - green_dcg_no_tie
 //!   - green_ndcg_no_tie
+//!   - dcg_ndcg_2d_sample_weight_matches_sklearn (REQ-6b, #761)
 
+use ferrolearn_core::FerroError;
 use ferrolearn_metrics::ranking::{
     coverage_error, dcg_score, label_ranking_average_precision_score, label_ranking_loss,
     ndcg_score,
@@ -42,16 +44,17 @@ use ndarray::{Array2, array};
 ///   # np.float64(7.5)   ← average true relevance of the tied top group (10+5)/2
 /// ferrolearn returns 10.0 (picks index-0 of the tie). Tracking: #754
 #[test]
-fn divergence_dcg_tie_averaging() {
-    let y_true = array![10.0_f64, 0.0, 0.0, 1.0, 5.0];
-    let y_score = array![1.0_f64, 0.0, 0.0, 0.0, 1.0];
-    let got = dcg_score(&y_true, &y_score, Some(1), None).unwrap();
+fn divergence_dcg_tie_averaging() -> Result<(), FerroError> {
+    let y_true = array![[10.0_f64, 0.0, 0.0, 1.0, 5.0]];
+    let y_score = array![[1.0_f64, 0.0, 0.0, 0.0, 1.0]];
+    let got = dcg_score(&y_true, &y_score, Some(1), None, None)?;
     // sklearn 1.5.2 live oracle:
     const SK_DCG_TIE_K1: f64 = 7.5;
     assert!(
         (got - SK_DCG_TIE_K1).abs() < 1e-9,
         "dcg_score tie-averaging: sklearn={SK_DCG_TIE_K1}, ferrolearn={got}"
     );
+    Ok(())
 }
 
 /// Divergence: `ndcg_score` does NOT tie-average (same root cause as dcg —
@@ -64,16 +67,17 @@ fn divergence_dcg_tie_averaging() {
 ///   # np.float64(0.75)
 /// ferrolearn returns 1.0. Tracking: #755
 #[test]
-fn divergence_ndcg_tie_averaging() {
-    let y_true = array![10.0_f64, 0.0, 0.0, 1.0, 5.0];
-    let y_score = array![1.0_f64, 0.0, 0.0, 0.0, 1.0];
-    let got = ndcg_score(&y_true, &y_score, Some(1)).unwrap();
+fn divergence_ndcg_tie_averaging() -> Result<(), FerroError> {
+    let y_true = array![[10.0_f64, 0.0, 0.0, 1.0, 5.0]];
+    let y_score = array![[1.0_f64, 0.0, 0.0, 0.0, 1.0]];
+    let got = ndcg_score(&y_true, &y_score, Some(1), None)?;
     // sklearn 1.5.2 live oracle:
     const SK_NDCG_TIE_K1: f64 = 0.75;
     assert!(
         (got - SK_NDCG_TIE_K1).abs() < 1e-9,
         "ndcg_score tie-averaging: sklearn={SK_NDCG_TIE_K1}, ferrolearn={got}"
     );
+    Ok(())
 }
 
 /// Divergence: `ndcg_score` lacks the negative-`y_true` guard. sklearn raises
@@ -87,9 +91,9 @@ fn divergence_ndcg_tie_averaging() {
 /// Tracking: #755
 #[test]
 fn divergence_ndcg_negative_y_true_guard() {
-    let y_true = array![-1.0_f64, 2.0, 3.0];
-    let y_score = array![1.0_f64, 2.0, 3.0];
-    let got = ndcg_score(&y_true, &y_score, None);
+    let y_true = array![[-1.0_f64, 2.0, 3.0]];
+    let y_score = array![[1.0_f64, 2.0, 3.0]];
+    let got = ndcg_score(&y_true, &y_score, None, None);
     // sklearn raises ValueError; ferrolearn must return Err (R-DEV-2).
     assert!(
         got.is_err(),
@@ -169,15 +173,16 @@ fn green_lrap_basic() {
 ///     print(dcg_score(np.array([[3,2,3,0,1,2]]), np.array([[6,5,4,3,2,1]])))"
 ///   # np.float64(6.861126688593501)
 #[test]
-fn green_dcg_no_tie() {
-    let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-    let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-    let got = dcg_score(&y_true, &y_score, None, None).unwrap();
+fn green_dcg_no_tie() -> Result<(), FerroError> {
+    let y_true = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+    let y_score = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+    let got = dcg_score(&y_true, &y_score, None, None, None)?;
     const SK_DCG_NOTIE: f64 = 6.861_126_688_593_501;
     assert!(
         (got - SK_DCG_NOTIE).abs() < 1e-9,
         "dcg_score no-tie: sklearn={SK_DCG_NOTIE}, ferrolearn={got}"
     );
+    Ok(())
 }
 
 /// Guard: `ndcg_score` no-tie (distinct y_score) matches sklearn.
@@ -186,13 +191,87 @@ fn green_dcg_no_tie() {
 ///     print(ndcg_score(np.array([[3,2,3,0,1,2]]), np.array([[6,5,4,3,2,1]])))"
 ///   # np.float64(0.9608081943360616)
 #[test]
-fn green_ndcg_no_tie() {
-    let y_true = array![3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0];
-    let y_score = array![6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0];
-    let got = ndcg_score(&y_true, &y_score, None).unwrap();
+fn green_ndcg_no_tie() -> Result<(), FerroError> {
+    let y_true = array![[3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0]];
+    let y_score = array![[6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0]];
+    let got = ndcg_score(&y_true, &y_score, None, None)?;
     const SK_NDCG_NOTIE: f64 = 0.960_808_194_336_061_6;
     assert!(
         (got - SK_NDCG_NOTIE).abs() < 1e-9,
         "ndcg_score no-tie: sklearn={SK_NDCG_NOTIE}, ferrolearn={got}"
     );
+    Ok(())
+}
+
+/// REQ-6b (#761): `dcg_score`/`ndcg_score` 2D `(n_samples, n_labels)` sample
+/// (weighted-)mean. sklearn computes the per-sample score then
+/// `np.average(scores, weights=sample_weight)` (`_ranking.py:1701-1706` for dcg,
+/// `:1864-1877` for ndcg). With two distinct samples the result is no longer a
+/// single-row value.
+///
+/// Oracle (live sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.metrics import dcg_score, ndcg_score; \
+///     yt=np.array([[3.,2.,3.,0.,1.,2.],[2.,0.,1.,3.,2.,1.]]); \
+///     ys=np.array([[6.,5.,4.,3.,2.,1.],[1.,2.,3.,4.,5.,6.]]); \
+///     print(dcg_score(yt,ys), \
+///           dcg_score(yt,ys,sample_weight=np.array([1.,3.])), \
+///           dcg_score(yt,ys,log_base=10), \
+///           ndcg_score(yt,ys), \
+///           ndcg_score(yt,ys,sample_weight=np.array([1.,3.])), \
+///           ndcg_score(yt,ys,k=2))"
+///   # 5.883038564012926 5.39399450172264 19.54303108910035
+///   # 0.883812280321066 0.8453143233135682 0.7008851691161981
+/// Per-row dcg = [6.861126688593501, 4.904950439432352]; mean = 5.883038564.
+#[test]
+fn dcg_ndcg_2d_sample_weight_matches_sklearn() -> Result<(), FerroError> {
+    let yt = array![
+        [3.0_f64, 2.0, 3.0, 0.0, 1.0, 2.0],
+        [2.0, 0.0, 1.0, 3.0, 2.0, 1.0]
+    ];
+    let ys = array![
+        [6.0_f64, 5.0, 4.0, 3.0, 2.0, 1.0],
+        [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    ];
+    let w = array![1.0_f64, 3.0];
+
+    // sklearn 1.5.2 live oracle:
+    const SK_DCG_NONE: f64 = 5.883_038_564_012_926;
+    const SK_DCG_SW: f64 = 5.393_994_501_722_64;
+    const SK_DCG_LB10: f64 = 19.543_031_089_100_35;
+    const SK_NDCG_NONE: f64 = 0.883_812_280_321_066;
+    const SK_NDCG_SW: f64 = 0.845_314_323_313_568_2;
+    const SK_NDCG_K2: f64 = 0.700_885_169_116_198_1;
+
+    let dcg_none = dcg_score(&yt, &ys, None, None, None)?;
+    assert!(
+        (dcg_none - SK_DCG_NONE).abs() < 1e-9,
+        "dcg none: sklearn={SK_DCG_NONE}, ferrolearn={dcg_none}"
+    );
+    let dcg_sw = dcg_score(&yt, &ys, None, None, Some(&w))?;
+    assert!(
+        (dcg_sw - SK_DCG_SW).abs() < 1e-9,
+        "dcg sample_weight: sklearn={SK_DCG_SW}, ferrolearn={dcg_sw}"
+    );
+    let dcg_lb10 = dcg_score(&yt, &ys, None, Some(10.0), None)?;
+    assert!(
+        (dcg_lb10 - SK_DCG_LB10).abs() < 1e-9,
+        "dcg log_base=10: sklearn={SK_DCG_LB10}, ferrolearn={dcg_lb10}"
+    );
+
+    let ndcg_none = ndcg_score(&yt, &ys, None, None)?;
+    assert!(
+        (ndcg_none - SK_NDCG_NONE).abs() < 1e-9,
+        "ndcg none: sklearn={SK_NDCG_NONE}, ferrolearn={ndcg_none}"
+    );
+    let ndcg_sw = ndcg_score(&yt, &ys, None, Some(&w))?;
+    assert!(
+        (ndcg_sw - SK_NDCG_SW).abs() < 1e-9,
+        "ndcg sample_weight: sklearn={SK_NDCG_SW}, ferrolearn={ndcg_sw}"
+    );
+    let ndcg_k2 = ndcg_score(&yt, &ys, Some(2), None)?;
+    assert!(
+        (ndcg_k2 - SK_NDCG_K2).abs() < 1e-9,
+        "ndcg k=2: sklearn={SK_NDCG_K2}, ferrolearn={ndcg_k2}"
+    );
+    Ok(())
 }
