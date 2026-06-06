@@ -12,9 +12,10 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **13 SHIPPED / 2 NOT-STARTED** (REQ-MISSING-INDEX is a SPLIT: element access
-//! `get(i,j)` and rows/cols `getrow`/`getcol` SHIPPED; maintenance ops
-//! NOT-STARTED).
+//! **14 SHIPPED / 1 NOT-STARTED** (REQ-MISSING-INDEX is a SPLIT: element access
+//! `get(i,j)`, rows/cols `getrow`/`getcol`, and the maintenance surface
+//! `max`/`min`/`astype`/`copy`/`eliminate_zeros`/`power` all SHIPPED;
+//! `sort_indices`/`sum_duplicates`/`argmax` remain NOT-STARTED).
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -31,7 +32,7 @@
 //! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2011) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csc_multiply_matches_scipy`/`csc_sub_matches_scipy`/`csc_multiply_shape_mismatch_is_err`/`csc_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
 //! | REQ-MISSING-INDEX (element access `A[i,j]`) | SHIPPED (#2012) | `get(i,j) -> Result<T, FerroError>` returns the stored value at `(i,j)` or `T::zero()` if structurally absent (sprs `CsMat::get(i,j).copied().unwrap_or_else(T::zero)`), with an out-of-bounds `i`/`j` → `Err(FerroError::InvalidParameter)` — the column-symmetric port of the CSR `get` (sprs `get(i,j)` indexes by `(row,col)` regardless of storage), mirroring scipy `A[i,j]` (`IndexMixin.__getitem__` -> `_get_intXint`, `_index.py:29`). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `A[1,1]=3`, `A[0,1]=0` (absent), `A[0,0]=1`, `A[0,2]=2`, `A[2,0]=4`; out-of-bounds → `Err`. Guards `csc_get_element_matches_scipy`/`csc_get_absent_is_zero`/`csc_get_out_of_bounds_is_err`. |
 //! | REQ-MISSING-INDEX (rows/cols) | SHIPPED (#2012) | `getcol(j)` returns column `j` as a `(n_rows, 1)` CSC (single-column case of `col_slice`, delegates to `self.col_slice(j, j + 1)`), mirroring scipy `getcol(j)` (`_matrix.py:104` → `_getcol`, "(m x 1) column vector"); `getrow(i)` returns row `i` as a `(1, n_cols)` CSC via `self.transpose().getcol(i)?.transpose()`, mirroring scipy `getrow(i)` (`_matrix.py:110` → `_getrow`, "(1 x n) row vector"). Both bounds-check (`j >= n_cols()`/`i >= n_rows()` → `Err(FerroError::InvalidParameter)`, scipy `IndexError`, R-DEV-2). CSC is column-natural, so `getcol` delegates to `col_slice` (the mirror of CSR's `getrow`→`row_slice`). Live oracle (R-CHAR-3): `A.getrow(0).toarray()`=`[[1,0,2]]`, `A.getrow(1).toarray()`=`[[0,3,0]]`, `A.getcol(0).toarray()`=`[[1],[0],[4]]`, `A.getcol(2).toarray()`=`[[2],[0],[5]]`. Guards `csc_getrow_matches_scipy`/`csc_getcol_matches_scipy`/`csc_getrow_getcol_out_of_bounds_is_err`. |
-//! | REQ-MISSING-INDEX (maintenance) | NOT-STARTED | no `eliminate_zeros`/`sort_indices`/`sum_duplicates`/`power`/`astype`/`copy`/`max`/`min`/`argmax`. Blocker #2012. |
+//! | REQ-MISSING-INDEX (maintenance) | SHIPPED (#2012) | `max()`/`min()` (`T: Copy + Zero + PartialOrd`) fold over [`data()`](CscMatrix::data) and, when not fully dense, fold an implicit zero, mirroring scipy `_minmax_mixin._min_or_max` `axis=None` (`_data.py:208`-`:224`); `astype(cast)` (closure-based dtype cast, `_data.py:69`, R-DEV-4) and `copy()` (= `clone`, `_data.py:94`) preserve `(indptr, indices, shape)`; `eliminate_zeros()` walks COLUMNS via the column-pointer `indptr`, dropping `val == 0` and rebuilding the triple (`_compressed.py:1025`, functional/new-matrix R-DEV-4); `power(n)` (`T: Float`) maps `data()` through `powf(n)` (`_data.py:99`). Storage-agnostic ports of the CSR maintenance surface; for CSC `indices` are ROW indices and `indptr` the COLUMN pointer. Live oracle (R-CHAR-3): `csc_matrix(diag(-3,-1,-5)).max()==0`, `.min()==-5`; `csc_matrix(diag(3,1,5)).max()==5`, `.min()==0`; `astype(int64)` of `[3.7,-2.9,5.0]` -> `[3,-2,5]` (truncation); `eliminate_zeros` of CSC `data=[3,0,5]`/`indices=[0,1,2]`/`indptr=[0,1,2,3]` -> `nnz=2`, `data=[3,5]`, `indices=[0,2]`, `indptr=[0,1,1,2]`; `power(2)` of `[2,-3]` -> `[4,9]`, `power(3)` -> `[8,-27]`. Guards `csc_max_min_folds_implicit_zero`/`csc_astype_truncates`/`csc_copy_preserves_structure`/`csc_eliminate_zeros_matches_scipy`/`csc_power_matches_scipy`. Still NOT-STARTED: `sort_indices`/`sum_duplicates`/`argmax`. |
 //! | REQ-API-ACCESSORS | SHIPPED (#2013) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSC `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSC ROW indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (COLUMN pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Column-symmetric port of the CSR accessors (#2005). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,4,3,2,5]` (column-major), `indices=[0,2,1,0,2]` (row indices), `indptr=[0,2,3,5]` (column pointer). Guard `csc_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSC analog (R-SUBSTRATE-1). Blocker #2014. |
 
@@ -620,6 +621,242 @@ where
             });
         }
         Ok(self.transpose().getcol(i)?.transpose())
+    }
+
+    /// Return a copy of this matrix, preserving **all** stored structure.
+    ///
+    /// Mirrors scipy `csc_matrix.copy()` (`scipy/sparse/_data.py:94` —
+    /// `return self._with_data(self.data.copy(), copy=True)`), which returns an
+    /// identical matrix with the same sparsity pattern (`indptr`/`indices`) and
+    /// a copy of the `data` array. Every stored entry is preserved verbatim —
+    /// including **explicit stored zeros** — without coalescing or reordering.
+    /// Equivalent to [`Clone::clone`] (`CscMatrix` derives `Clone`); provided as
+    /// a named method for scipy parity. Storage-agnostic port of the CSR
+    /// [`copy`](crate::CsrMatrix::copy); for CSC the preserved `indptr` is the
+    /// COLUMN pointer and `indices` are the ROW indices.
+    ///
+    /// Live oracle (R-CHAR-3): for
+    /// `sp.csc_matrix(np.diag([3.7,-2.9,5.0]))`, `A.copy().nnz == 3`,
+    /// `A.copy().data == [3.7, -2.9, 5.0]`, and `A.copy().toarray()` round-trips.
+    #[must_use]
+    pub fn copy(&self) -> CscMatrix<T> {
+        self.clone()
+    }
+
+    /// Return a new CSC matrix with all explicitly-stored zero entries removed.
+    ///
+    /// Mirrors scipy `csc_matrix.eliminate_zeros()`
+    /// (`scipy/sparse/_compressed.py:1025` — `csc_eliminate_zeros(...)` then
+    /// `self.prune()`), which drops every stored entry whose value equals `0`
+    /// and rebuilds the CSC `(data, indices, indptr)` triple. Walks each column
+    /// `c` over its stored slice `indptr[c]..indptr[c+1]` and keeps the
+    /// `(row, val)` pair only when `val != 0`, accumulating the kept count into a
+    /// fresh column-pointer `indptr2`. Within-column row order is preserved
+    /// (scipy keeps the existing sorted order), so the result stays canonical.
+    /// Storage-agnostic port of the CSR [`eliminate_zeros`](crate::CsrMatrix::eliminate_zeros):
+    /// for CSC the outer walk is over COLUMNS via the column pointer and the kept
+    /// `indices` are ROW indices.
+    ///
+    /// **Deviation (R-DEV-4):** scipy mutates in place; ferrolearn returns a NEW
+    /// matrix (functional style, consistent with the other `CscMatrix` methods).
+    ///
+    /// Live oracle (R-CHAR-3): for CSC `data=[3,0,5]`, `indices=[0,1,2]`,
+    /// `indptr=[0,1,2,3]`, shape `(3,3)`, `eliminate_zeros()` yields `nnz == 2`,
+    /// `data == [3, 5]`, `indices == [0, 2]`, `indptr == [0, 1, 1, 2]`, dense
+    /// `[[3,0,0],[0,0,0],[0,0,5]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CscMatrix` (filtering keeps every kept index in
+    /// bounds of the unchanged shape and preserves sorted within-column order).
+    pub fn eliminate_zeros(&self) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Clone + Zero + PartialEq,
+    {
+        let zero = T::zero();
+        let indptr = self.indptr();
+        let indices = self.indices();
+        let data = self.data();
+        let n_cols = self.n_cols();
+
+        let mut indptr2 = Vec::with_capacity(n_cols + 1);
+        let mut indices2 = Vec::new();
+        let mut data2 = Vec::new();
+        indptr2.push(0usize);
+        for c in 0..n_cols {
+            for k in indptr[c]..indptr[c + 1] {
+                if data[k] != zero {
+                    indices2.push(indices[k]);
+                    data2.push(data[k].clone());
+                }
+            }
+            indptr2.push(data2.len());
+        }
+        Self::new(self.n_rows(), n_cols, indptr2, indices2, data2)
+    }
+
+    /// Cast every stored value to a new scalar type `U` via a caller-supplied
+    /// closure, preserving the CSC sparsity structure (`indptr`/`indices`,
+    /// shape, nnz).
+    ///
+    /// Mirrors scipy `csc_matrix.astype(dtype)` (`scipy/sparse/_data.py:69` —
+    /// `self._with_data(self.data.astype(dtype, ...))`), which C-casts every
+    /// stored value in `self.data` to the requested numpy dtype while keeping the
+    /// `indptr`/`indices` structure and `shape` unchanged. scipy selects the cast
+    /// from a runtime numpy dtype object; Rust has no runtime dtype, so this is a
+    /// **deviation** (R-DEV-4): the caller supplies the element cast as a closure.
+    /// A plain `as`-cast closure (e.g. `|&v| v as i64`) reproduces numpy's C-cast
+    /// semantics, including float→int **truncation toward zero**.
+    ///
+    /// The `indptr` (column pointers) and `indices` (row indices) arrays, the
+    /// `(n_rows, n_cols)` shape, and the stored count are copied verbatim — only
+    /// the data array changes type — so explicit stored zeros are preserved (no
+    /// coalescing). Rebuilds a `CscMatrix<U>` via [`new`](Self::new) from the
+    /// original `indptr`/`indices` and the cast data. Storage-agnostic port of
+    /// the CSR [`astype`](crate::CsrMatrix::astype).
+    ///
+    /// Live oracle (R-CHAR-3): for `sp.csc_matrix(np.diag([3.7,-2.9,5.0]))`,
+    /// `astype(np.int64)` yields `data == [3, -2, 5]` (truncated toward zero)
+    /// with the `indptr`/`indices`/shape structure unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CscMatrix` (the unchanged `indptr`/`indices` stay
+    /// valid for the unchanged shape).
+    pub fn astype<U, Fc>(&self, cast: Fc) -> Result<CscMatrix<U>, FerroError>
+    where
+        U: Clone,
+        Fc: Fn(&T) -> U,
+    {
+        let data: Vec<U> = self.data().iter().map(&cast).collect();
+        CscMatrix::<U>::new(
+            self.n_rows(),
+            self.n_cols(),
+            self.indptr(),
+            self.indices().to_vec(),
+            data,
+        )
+    }
+}
+
+impl<T> CscMatrix<T>
+where
+    T: Copy + Zero + PartialOrd,
+{
+    /// Maximum over all elements (scipy `axis=None`), folding in implicit zeros.
+    ///
+    /// Mirrors scipy `csc_matrix.max()` via the `_minmax_mixin._min_or_max`
+    /// machinery with `axis=None` (`scipy/sparse/_data.py:208`-`:224`). scipy
+    /// reduces over the stored data (`m = min_or_max.reduce(self._deduped_data())`,
+    /// `:221`) and then, when the matrix is **not fully dense**, folds an implicit
+    /// zero into the result (`if self.nnz != math.prod(self.shape): m =
+    /// min_or_max(zero, m)`, `:222`-`:223`). An empty matrix (`nnz == 0`) returns
+    /// `zero` (`:219`-`:220`). The per-stored-entry value logic is identical to
+    /// the CSR [`max`](crate::CsrMatrix::max) — storage-agnostic (the fold is over
+    /// [`data()`](Self::data) regardless of CSR/CSC layout). The matrix is fully
+    /// dense iff `data().len() == n_rows * n_cols`, in which case no implicit zero
+    /// exists to fold.
+    ///
+    /// Live oracle (R-CHAR-3): `csc_matrix(diag(-3,-1,-5))` 3x3 `.max() == 0.0`
+    /// (implicit zero wins over the all-negative stored data);
+    /// `csc_matrix(diag(3,1,5))` `.max() == 5.0`.
+    #[must_use]
+    pub fn max(&self) -> T {
+        let zero = T::zero();
+        let data = self.data();
+        if data.is_empty() {
+            return zero;
+        }
+        let mut running = data[0];
+        for &val in &data[1..] {
+            if val > running {
+                running = val;
+            }
+        }
+        if data.len() < self.n_rows() * self.n_cols() && zero > running {
+            running = zero;
+        }
+        running
+    }
+
+    /// Minimum over all elements (scipy `axis=None`), folding in implicit zeros.
+    ///
+    /// Mirrors scipy `csc_matrix.min()` via the `_minmax_mixin._min_or_max`
+    /// machinery with `axis=None` (`scipy/sparse/_data.py:208`-`:224`). scipy
+    /// reduces over the stored data (`m = min_or_max.reduce(self._deduped_data())`,
+    /// `:221`) and then, when the matrix is **not fully dense**, folds an implicit
+    /// zero into the result (`if self.nnz != math.prod(self.shape): m =
+    /// min_or_max(zero, m)`, `:222`-`:223`). An empty matrix (`nnz == 0`) returns
+    /// `zero` (`:219`-`:220`). The per-stored-entry value logic is identical to
+    /// the CSR [`min`](crate::CsrMatrix::min) — storage-agnostic (the fold is over
+    /// [`data()`](Self::data) regardless of CSR/CSC layout). The matrix is fully
+    /// dense iff `data().len() == n_rows * n_cols`, in which case no implicit zero
+    /// exists to fold.
+    ///
+    /// Live oracle (R-CHAR-3): `csc_matrix(diag(3,1,5))` 3x3 `.min() == 0.0`
+    /// (implicit zero wins over the all-positive stored data);
+    /// `csc_matrix(diag(-3,-1,-5))` `.min() == -5.0`.
+    #[must_use]
+    pub fn min(&self) -> T {
+        let zero = T::zero();
+        let data = self.data();
+        if data.is_empty() {
+            return zero;
+        }
+        let mut running = data[0];
+        for &val in &data[1..] {
+            if val < running {
+                running = val;
+            }
+        }
+        if data.len() < self.n_rows() * self.n_cols() && zero < running {
+            running = zero;
+        }
+        running
+    }
+}
+
+impl<T> CscMatrix<T>
+where
+    T: num_traits::Float,
+{
+    /// Raise every stored value to the power `n`, returning a **new** matrix with
+    /// the sparsity structure preserved.
+    ///
+    /// Mirrors scipy `csc_matrix.power(n)` (`scipy/sparse/_data.py:99` —
+    /// `return self._with_data(data ** n)`), which performs an **element-wise
+    /// power over `self.data` only**, leaving the `indptr` (column pointers),
+    /// `indices` (row indices), the `(n_rows, n_cols)` shape, and the stored
+    /// count (`nnz`) unchanged. The implicit zeros stay zero because
+    /// `0 ** n == 0` for `n > 0` (scipy refuses `n == 0`, which would densify the
+    /// matrix; this method does not special-case it — `0.powf(0) == 1` per IEEE,
+    /// matching `T::powf`). Each stored value is mapped through
+    /// [`num_traits::Float::powf`]. Storage-agnostic port of the CSR
+    /// [`power`](crate::CsrMatrix::power).
+    ///
+    /// Explicit stored zeros are preserved (no coalescing) — only the data array
+    /// is transformed; the original `indptr`/`indices` are reused verbatim.
+    ///
+    /// Live oracle (R-CHAR-3): for `sp.csc_matrix(np.diag([2.,-3.]))` (CSC
+    /// `data=[2,-3]`), `power(2)` yields `data == [4, 9]`; `power(3)` yields
+    /// `data == [8, -27]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] propagated from [`new`](Self::new); infallible for
+    /// any structurally valid `CscMatrix` (the unchanged `indptr`/`indices` stay
+    /// in bounds of the unchanged shape and keep their sorted within-column order).
+    pub fn power(&self, n: T) -> Result<CscMatrix<T>, FerroError> {
+        let data: Vec<T> = self.data().iter().map(|v| v.powf(n)).collect();
+        CscMatrix::new(
+            self.n_rows(),
+            self.n_cols(),
+            self.indptr(),
+            self.indices().to_vec(),
+            data,
+        )
     }
 }
 

@@ -42,6 +42,7 @@
 //! blockers filed as `-l blocker` issues, not pinned here as doomed tests
 //! (R-DEFER-3).
 
+use ferrolearn_core::FerroError;
 use ferrolearn_sparse::{CooMatrix, CscMatrix};
 use ndarray::{Array1, array};
 
@@ -560,4 +561,120 @@ fn csc_shape_data_indices_indptr_match_scipy() {
     assert_eq!(a.indices(), &[0, 2, 1, 0, 2]);
     // scipy A.indptr == [0,2,3,5] (column pointer)
     assert_eq!(a.indptr(), vec![0, 2, 3, 5]);
+}
+
+// REQ-MISSING-INDEX (maintenance: max/min/astype/copy/eliminate_zeros/power) —
+// live scipy oracle (R-CHAR-3). Expected values from
+// `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   print(sp.csc_matrix(np.diag([-3.,-1.,-5.])).max(),
+//         sp.csc_matrix(np.diag([-3.,-1.,-5.])).min())
+//   print(sp.csc_matrix(np.diag([3.,1.,5.])).max(),
+//         sp.csc_matrix(np.diag([3.,1.,5.])).min())
+//   print(sp.csc_matrix(np.diag([3.7,-2.9,5.0])).astype(np.int64).data.tolist())
+//   D=sp.csc_matrix((np.array([3.,0.,5.]),np.array([0,1,2]),np.array([0,1,2,3])),shape=(3,3))
+//   D.eliminate_zeros()
+//   print(D.nnz, D.data.tolist(), D.indices.tolist(), D.indptr.tolist())
+//   print(sp.csc_matrix(np.diag([2.,-3.])).power(2).data.tolist(),
+//         sp.csc_matrix(np.diag([2.,-3.])).power(3).data.tolist())"`
+//   -> 0.0 -5.0 / 5.0 0.0 / [3,-2,5] / 2 [3.0,5.0] [0,2] [0,1,1,2] /
+//      [4.0,9.0] [8.0,-27.0].
+
+/// REQ-MISSING-INDEX (maintenance). `max()`/`min()` fold an implicit zero when
+/// the matrix is not fully dense, matching scipy `_minmax_mixin` `axis=None`.
+///
+/// Oracle: `diag(-3,-1,-5)` -> `max==0.0` (implicit zero), `min==-5.0`;
+/// `diag(3,1,5)` -> `max==5.0`, `min==0.0` (implicit zero).
+#[test]
+fn csc_max_min_folds_implicit_zero() -> Result<(), FerroError> {
+    let neg = array![[-3.0_f64, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -5.0]];
+    let m_neg = CscMatrix::from_dense(&neg.view(), 0.0);
+    assert_eq!(m_neg.max(), 0.0);
+    assert_eq!(m_neg.min(), -5.0);
+
+    let pos = array![[3.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 5.0]];
+    let m_pos = CscMatrix::from_dense(&pos.view(), 0.0);
+    assert_eq!(m_pos.max(), 5.0);
+    assert_eq!(m_pos.min(), 0.0);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `astype` casts each stored value through the
+/// supplied closure (truncation toward zero for `as i64`), preserving structure,
+/// matching scipy `astype(np.int64)`.
+///
+/// Oracle: `diag(3.7,-2.9,5.0)` -> `astype(int64).data == [3,-2,5]`.
+#[test]
+fn csc_astype_truncates() -> Result<(), FerroError> {
+    let dense = array![[3.7_f64, 0.0, 0.0], [0.0, -2.9, 0.0], [0.0, 0.0, 5.0]];
+    let m = CscMatrix::from_dense(&dense.view(), 0.0);
+    let cast: CscMatrix<i64> = m.astype(|&v| v as i64)?;
+    // scipy astype(int64).data == [3,-2,5] (truncation toward zero)
+    assert_eq!(cast.data(), &[3_i64, -2, 5]);
+    // structure preserved: same column pointers / row indices / shape / nnz
+    assert_eq!(cast.indptr(), m.indptr());
+    assert_eq!(cast.indices(), m.indices());
+    assert_eq!(cast.shape(), m.shape());
+    assert_eq!(cast.nnz(), 3);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `copy()` clones every stored entry; nnz,
+/// data, and dense match, and the original is unchanged, matching scipy `copy()`.
+#[test]
+fn csc_copy_preserves_structure() -> Result<(), FerroError> {
+    let a = sample_a();
+    let c = a.copy();
+    assert_eq!(c.nnz(), a.nnz());
+    assert_eq!(c.data(), a.data());
+    assert_eq!(c.to_dense(), a.to_dense());
+    // original unchanged
+    assert_eq!(a.nnz(), 5);
+    let expected = [[1.0, 0.0, 2.0], [0.0, 3.0, 0.0], [4.0, 0.0, 5.0]];
+    assert_dense_eq(&a.to_dense(), &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `eliminate_zeros()` drops an explicitly
+/// stored zero (walking COLUMNS via the column pointer), matching scipy
+/// `eliminate_zeros()`.
+///
+/// Oracle: CSC `data=[3,0,5]`, `indices=[0,1,2]`, `indptr=[0,1,2,3]`, shape
+/// `(3,3)` -> `nnz==2`, `data==[3,5]`, `indices==[0,2]`, `indptr==[0,1,1,2]`,
+/// dense `[[3,0,0],[0,0,0],[0,0,5]]`.
+#[test]
+fn csc_eliminate_zeros_matches_scipy() -> Result<(), FerroError> {
+    // A distinct row per column (single entry/column, sorted) — `new` accepts a
+    // stored zero at row 1, col 1.
+    let m = CscMatrix::new(
+        3,
+        3,
+        vec![0, 1, 2, 3],
+        vec![0, 1, 2],
+        vec![3.0_f64, 0.0, 5.0],
+    )?;
+    assert_eq!(m.nnz(), 3);
+    let pruned = m.eliminate_zeros()?;
+    assert_eq!(pruned.nnz(), 2);
+    assert_eq!(pruned.data(), &[3.0, 5.0]);
+    assert_eq!(pruned.indices(), &[0, 2]);
+    assert_eq!(pruned.indptr(), vec![0, 1, 1, 2]);
+    let expected = [[3.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 5.0]];
+    assert_dense_eq(&pruned.to_dense(), &expected);
+    Ok(())
+}
+
+/// REQ-MISSING-INDEX (maintenance). `power(n)` raises each stored value to `n`,
+/// preserving structure, matching scipy `power(n)`.
+///
+/// Oracle: `diag(2,-3)` -> `power(2).data == [4,9]`, `power(3).data == [8,-27]`.
+#[test]
+fn csc_power_matches_scipy() -> Result<(), FerroError> {
+    let dense = array![[2.0_f64, 0.0], [0.0, -3.0]];
+    let m = CscMatrix::from_dense(&dense.view(), 0.0);
+    let p2 = m.power(2.0)?;
+    assert_eq!(p2.data(), &[4.0, 9.0]);
+    let p3 = m.power(3.0)?;
+    assert_eq!(p3.data(), &[8.0, -27.0]);
+    Ok(())
 }
