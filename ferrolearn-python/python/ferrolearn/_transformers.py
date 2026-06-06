@@ -228,6 +228,25 @@ class PCA(TransformerMixin, BaseEstimator):
         self._ensure_rs()
         return float(self._rs.score(X))
 
+    def get_covariance(self):
+        # Data covariance with the generative model:
+        #   cov = components_.T * exp_var_diff * components_ + noise_variance_ * I
+        # (sklearn/decomposition/_base.py:30-56). No X argument — returns the
+        # model's own data covariance. Delegates to the Rust
+        # FittedPCA::get_covariance (ferrolearn-decomp/src/pca.rs:328, REQ-14).
+        check_is_fitted(self)
+        self._ensure_rs()
+        return np.array(self._rs.get_covariance())
+
+    def get_precision(self):
+        # Data precision matrix (inverse of get_covariance) with the generative
+        # model (sklearn/decomposition/_base.py:58-101). No X argument.
+        # Delegates to the Rust FittedPCA::get_precision
+        # (ferrolearn-decomp/src/pca.rs:390, REQ-14).
+        check_is_fitted(self)
+        self._ensure_rs()
+        return np.array(self._rs.get_precision())
+
     def get_feature_names_out(self, input_features=None):
         # ClassNamePrefixFeaturesOutMixin: PCA emits `pca0..pca{n_components_-1}`
         # (sklearn/decomposition/_base.py / _ClassNamePrefixFeaturesOutMixin).

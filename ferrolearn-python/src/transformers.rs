@@ -18,7 +18,7 @@
 //! `tests/divergence_transformers.py` + `tests/test_check_estimator.py`
 //! (534 pytest pass).
 //!
-//! **12 SHIPPED / 2 NOT-STARTED.**
+//! **13 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -34,6 +34,7 @@
 //! | REQ-PCA-PARAMS (copy/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | the wrapper exposes `n_components`+`whiten` only; sklearn `_pca.py:407-423`. The remaining params' default `svd_solver` MATCHES, so only the param surface + non-default paths are missing — owned downstream #1503/#1509. (`whiten` is now SHIPPED, see REQ-PCA-WHITEN.) |
 //! | REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | FIXED — the downstream prereqs (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`) already SHIPPED, so the binding now exposes both. `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs:283`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs:304`) — the full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept (`_pca.py:686-688`). Consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (non-zero); `PCA(3)` → `noise_variance_=0.0`. Verified `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
 //! | REQ-PCA-SCORE (score + score_samples Gaussian log-likelihood) | SHIPPED (#2099) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-15 #1507): `FittedPCA::score_samples` (`ferrolearn-decomp/src/pca.rs:484`) is the per-sample log-likelihood `-0.5*sum(Xr*(Xr@precision),1) - 0.5*(n_features*log(2pi) - logdet(precision))`, and `FittedPCA::score` (`pca.rs:533`) is its mean, both matching the live sklearn 1.5.2 oracle to 1e-6. The binding now surfaces them: `RsPCA::score_samples` (returns a `(n_samples,)` numpy array via `ndarray1_to_numpy`) + `RsPCA::score` (returns `f64`), each mapping `FerroError -> PyValueError`. Mirrors sklearn `PCA.score_samples`/`PCA.score` (`sklearn/decomposition/_pca.py:805-853`). Non-test consumer: `_transformers.py::PCA.score_samples` + `_transformers.py::PCA.score` (`check_is_fitted` + `_validate_data(reset=False)` + `_ensure_f64`, rebuilding `_rs` as `__setstate__` does if absent). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `score(X)=-5.358925927374854`, `score_samples(X)=[-4.6972115,-5.3570670,-5.8335549,-5.7184482,-5.4976041,-5.0496698]`. Guard `tests/divergence_transformers.py::test_pca_score_and_score_samples_match_sklearn`. |
+//! | REQ-PCA-COVARIANCE-PRECISION (get_covariance + get_precision) | SHIPPED (#2100) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-14 #1505): `FittedPCA::get_covariance` (`ferrolearn-decomp/src/pca.rs:328`) is the INFALLIBLE data covariance `components_ᵀ·diag(exp_var_diff)·components_ + noise_variance_·I`, and `FittedPCA::get_precision` (`pca.rs:390`) is its eigendecomposed inverse (returns a `Result`), both matching the live sklearn 1.5.2 oracle to 1e-6. The binding now surfaces them: `RsPCA::get_covariance` (returns a `(n_features, n_features)` numpy array via `ndarray2_to_numpy`, no error mapping — infallible) + `RsPCA::get_precision` (same shape, mapping `FerroError -> PyValueError`). Neither takes an `X` (the model's own data covariance / its inverse). Mirrors sklearn `PCA.get_covariance`/`PCA.get_precision` (`sklearn/decomposition/_base.py:30-101`). Non-test consumer: `_transformers.py::PCA.get_covariance` + `_transformers.py::PCA.get_precision` (`check_is_fitted` + `_ensure_rs`, no `_validate_data` since there is no `X` — matching sklearn's `get_covariance(self)`/`get_precision(self)` signatures). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `get_covariance()` diag `[8.0, 5.3666667, 4.6666667]`; `get_precision()` diag `[0.7432854, 2.0460427, 0.7745159]`. Guard `tests/divergence_transformers.py::test_pca_get_covariance_and_precision_match_sklearn`. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` and `::PCA` constructs `_RsPCA(...)`, driving fit/transform/inverse_transform + attr reads; `ferrolearn/__init__.py` re-exports both; `test_check_estimator.py` runs each through `parametrize_with_checks` (534 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
@@ -330,5 +331,38 @@ impl RsPCA {
             .score(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(result)
+    }
+
+    /// Data covariance `(n_features, n_features)` of the generative
+    /// (probabilistic-PCA) model, `get_covariance()`. Marshals
+    /// `FittedPCA::get_covariance()` (`ferrolearn-decomp/src/pca.rs:328`, REQ-14
+    /// #1505) — `components_ᵀ · diag(exp_var_diff) · components_ +
+    /// noise_variance_ · I`. Takes no `X` (the model's own data covariance);
+    /// infallible (returns `Array2` directly). Mirrors sklearn
+    /// `PCA.get_covariance` (`sklearn/decomposition/_base.py:30-56`).
+    fn get_covariance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cov = fitted.get_covariance();
+        Ok(ndarray2_to_numpy(py, &cov))
+    }
+
+    /// Data precision matrix `(n_features, n_features)` (inverse of the data
+    /// covariance) of the generative model, `get_precision()`. Marshals
+    /// `FittedPCA::get_precision()` (`ferrolearn-decomp/src/pca.rs:390`, REQ-14
+    /// #1505) — the eigendecomposed inverse of `get_covariance()`. Takes no `X`;
+    /// fallible (`FerroError -> PyValueError`, e.g. ill-conditioned covariance).
+    /// Mirrors sklearn `PCA.get_precision` (`sklearn/decomposition/_base.py:58-101`).
+    fn get_precision<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let prec = fitted
+            .get_precision()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &prec))
     }
 }

@@ -576,3 +576,61 @@ def test_pca_score_and_score_samples_match_sklearn():
 
     # score_samples(X) is the per-sample log-likelihood — match element-wise.
     np.testing.assert_allclose(fr.score_samples(X), sk.score_samples(X), atol=1e-9)
+
+
+# ---------------------------------------------------------------------------
+# PCA get_covariance + get_precision (unit #2100, R-DEV-3).
+#
+# The wrapper previously exposed no get_covariance/get_precision — the last two
+# unsurfaced FittedPCA methods. The Rust FittedPCA::get_covariance
+# (ferrolearn-decomp/src/pca.rs:328, INFALLIBLE) / FittedPCA::get_precision
+# (pca.rs:390, returns Result) already match sklearn (downstream
+# ferrolearn-decomp REQ-14 #1505); this surfaces them on the binding. They
+# compute the data covariance of the generative probabilistic-PCA model and its
+# inverse (`sklearn/decomposition/_base.py:30-101`): get_covariance is
+# `components_.T * exp_var_diff * components_ + noise_variance_ * I`,
+# get_precision is its inverse. Neither takes an X argument.
+#
+# R-CHAR-3: every expected value is computed by the LIVE sklearn 1.5.2 oracle in
+# the same test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+
+def test_pca_get_covariance_and_precision_match_sklearn():
+    """PCA.get_covariance / PCA.get_precision match the live sklearn oracle.
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn. The fixture has 6 samples ×
+    3 features with n_components=2 so the discarded tail eigenvalue makes
+    noise_variance_ (and hence the generative-model covariance/precision)
+    non-trivial.
+    """
+    X = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 7.0],
+            [2.0, 0.0, 1.0],
+            [8.0, 6.0, 5.0],
+            [3.0, 3.0, 2.0],
+            [0.0, 1.0, 4.0],
+        ]
+    )
+
+    fr = fl.PCA(n_components=2).fit(X)
+    sk = SkPCA(n_components=2).fit(X)
+
+    # The methods are present on the ferrolearn wrapper.
+    assert hasattr(fr, "get_covariance")
+    assert hasattr(fr, "get_precision")
+
+    # get_covariance() — (n_features, n_features), match the live oracle.
+    fr_cov = fr.get_covariance()
+    sk_cov = sk.get_covariance()
+    assert fr_cov.shape == sk_cov.shape == (X.shape[1], X.shape[1])
+    np.testing.assert_allclose(fr_cov, sk_cov, atol=1e-9)
+
+    # get_precision() — the inverse covariance, match the live oracle.
+    fr_prec = fr.get_precision()
+    sk_prec = sk.get_precision()
+    assert fr_prec.shape == sk_prec.shape == (X.shape[1], X.shape[1])
+    np.testing.assert_allclose(fr_prec, sk_prec, atol=1e-9)
