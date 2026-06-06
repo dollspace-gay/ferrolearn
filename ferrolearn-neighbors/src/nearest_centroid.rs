@@ -41,7 +41,7 @@
 //! | REQ-3 | `n_classes < 2` → `ValueError` (`:147-151`) | SHIPPED |
 //! | REQ-4 | All-features-zero-variance + shrink → `ValueError` (`:174-175`) | SHIPPED |
 //! | REQ-5 | `metric` param + `metric='manhattan'` median centroid (`NcMetric` + `with_metric`; feature-wise median `:167`, L1 predict `:218`) | SHIPPED (#841) |
-//! | REQ-6 | `shrink_threshold > 0` constraint (sklearn `InvalidParameterError` on 0/negative) | NOT-STARTED (#842) |
+//! | REQ-6 | `shrink_threshold > 0` constraint (sklearn `InvalidParameterError` on 0/negative) | SHIPPED | `fit` rejects `shrink_threshold <= 0` (`_nearest_centroid.py:105` `closed="neither"`); `nearest_centroid_shrink_threshold_zero_rejected` |
 //! | REQ-7 | PyO3 binding fidelity + ferray substrate | NOT-STARTED (#843) |
 
 use ferrolearn_core::error::FerroError;
@@ -165,7 +165,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
     ///
     /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers of rows.
     /// - [`FerroError::InsufficientSamples`] if there are no samples.
-    /// - [`FerroError::InvalidParameter`] if `shrink_threshold` is negative.
+    /// - [`FerroError::InvalidParameter`] if `shrink_threshold` is not strictly
+    ///   positive (`<= 0`), matching sklearn's `closed="neither"` constraint.
     fn fit(
         &self,
         x: &Array2<F>,
@@ -190,11 +191,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
         }
 
         if let Some(threshold) = self.shrink_threshold
-            && threshold < F::zero()
+            && threshold <= F::zero()
         {
+            // sklearn constraint `Interval(Real, 0, None, closed="neither")`
+            // (`_nearest_centroid.py:105`): shrink_threshold must be STRICTLY
+            // positive; `0` and negatives raise `InvalidParameterError`.
             return Err(FerroError::InvalidParameter {
                 name: "shrink_threshold".into(),
-                reason: "must be non-negative".into(),
+                reason: "must be strictly positive (> 0)".into(),
             });
         }
 
@@ -700,6 +704,34 @@ mod tests {
         assert_relative_eq!(centroids[[1, 0]], 11.0, epsilon = 1e-12);
         assert_relative_eq!(centroids[[1, 1]], 16.0 / 3.0, epsilon = 1e-12);
         Ok(())
+    }
+
+    #[test]
+    fn nearest_centroid_shrink_threshold_zero_rejected() {
+        // sklearn `_nearest_centroid.py:105` constraint
+        // `Interval(Real, 0, None, closed="neither")`: shrink_threshold must be
+        // strictly > 0. Live sklearn raises InvalidParameterError on 0.0 AND -1.0,
+        // accepts 0.5.
+        let (x, y) = manhattan_oracle_data();
+        assert!(matches!(
+            NearestCentroid::<f64>::new()
+                .with_shrink_threshold(0.0)
+                .fit(&x, &y),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            NearestCentroid::<f64>::new()
+                .with_shrink_threshold(-1.0)
+                .fit(&x, &y),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        // strictly-positive accepted.
+        assert!(
+            NearestCentroid::<f64>::new()
+                .with_shrink_threshold(0.5)
+                .fit(&x, &y)
+                .is_ok()
+        );
     }
 
     #[test]
