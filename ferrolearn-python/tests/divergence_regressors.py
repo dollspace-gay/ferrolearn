@@ -1872,3 +1872,44 @@ def test_red_elasticnet_warm_start_changed_n_features_more():
     fr.fit(X, y)
     with pytest.raises(ValueError):
         fr.fit(X3, y)
+
+
+def test_linearregression_copy_x_njobs_abi():
+    """LinearRegression exposes copy_X/n_jobs ctor params (ABI) matching sklearn.
+
+    sklearn `LinearRegression(*, fit_intercept=True, copy_X=True, n_jobs=None,
+    positive=False)` (`_base.py:572-574`). Both are no-ops for the result
+    (copy_X: fit doesn't mutate X; n_jobs: single-threaded), but must be present
+    in get_params and round-trip via clone (check_estimator contract). R-CHAR-3:
+    the sklearn signature/defaults are the oracle.
+    """
+    import inspect
+
+    from sklearn.base import clone
+    from sklearn.linear_model import LinearRegression as SkLinearRegression
+
+    sk_params = set(
+        inspect.signature(SkLinearRegression.__init__).parameters
+    ) - {"self"}
+    fl_params = set(inspect.signature(fl.LinearRegression.__init__).parameters) - {
+        "self"
+    }
+    assert fl_params == sk_params == {"fit_intercept", "copy_X", "n_jobs", "positive"}
+
+    m = fl.LinearRegression(copy_X=False, n_jobs=2)
+    gp = m.get_params()
+    assert gp["copy_X"] is False and gp["n_jobs"] == 2
+    # clone round-trips the params
+    assert clone(m).get_params() == gp
+
+    X = np.array([[1.0, 2.0], [2.0, 1.0], [3.0, 4.0], [4.0, 3.0], [5.0, 5.0]])
+    y = np.array([3.0, 2.5, 7.1, 6.0, 11.2])
+    # copy_X / n_jobs do not change the result vs the default-path oracle.
+    fr = fl.LinearRegression(copy_X=False, n_jobs=2).fit(X, y)
+    sk = SkLinearRegression(copy_X=False, n_jobs=2).fit(X, y)
+    np.testing.assert_allclose(fr.coef_, sk.coef_, atol=1e-8)
+    assert abs(float(fr.intercept_) - float(sk.intercept_)) < 1e-8
+    # copy_X=False must not mutate the input X.
+    X0 = X.copy()
+    fl.LinearRegression(copy_X=False).fit(X, y)
+    np.testing.assert_array_equal(X, X0)

@@ -103,13 +103,19 @@ class LinearRegression(MultiOutputMixin, RegressorMixin, BaseEstimator):
     ----------
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    copy_X : bool, default=True
+        ABI-only; the Rust lstsq fit never mutates X (sklearn `_base.py:572`).
+    n_jobs : int or None, default=None
+        Stored but ignored — the solve is single-threaded (sklearn `_base.py:573`).
     positive : bool, default=False
         When True, force the coefficients to be non-negative (NNLS), matching
         sklearn `LinearRegression(positive=...)` (`_base.py:574`/`:645-653`).
     """
 
-    def __init__(self, *, fit_intercept=True, positive=False):
+    def __init__(self, *, fit_intercept=True, copy_X=True, n_jobs=None, positive=False):
         self.fit_intercept = fit_intercept
+        self.copy_X = copy_X
+        self.n_jobs = n_jobs
         self.positive = positive
 
     def fit(self, X, y):
