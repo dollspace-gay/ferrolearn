@@ -35,7 +35,7 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). pdf/cdf/sf/ppf are oracle-verified
 //! element-wise (R-CHAR-3) — see `tests/divergence_distributions.rs`.
 //!
-//! **9 SHIPPED / 4 NOT-STARTED.**
+//! **10 SHIPPED / 3 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -49,10 +49,11 @@
 //! | REQ-8 (convenience p-value fns) | SHIPPED | `chi2_sf`/`f_sf`/`t_test_two_tailed`/`norm_sf` match scipy at valid params; `norm_sf` now machine-precision (via REQ-1); the three return `nan` on invalid params matching scipy (FIXED #1966, was panic). Guard `green_convenience_valid_params` + `red_*_invalid_df_returns_nan`. |
 //! | REQ-9 (Dirichlet ln_pdf) | SHIPPED | `ln_pdf` matches `scipy.stats.dirichlet.logpdf` ≤1e-14. Guard `green_dirichlet_logpdf`. (`sample` value parity is numpy-RNG-blocked, REQ-12.) |
 //! | REQ-10 (no-panic on invalid params) | NOT-STARTED | the convenience fns now return `nan` (#1966), but `unwrap_stat` (`mean`/`variance`) still `panic!` and `Dirichlet::ln_pdf`/`sample` still `assert!`/`expect` on user-reachable input (scipy returns nan). Blocker #1970. |
-//! | REQ-11 (FerroError error type) | NOT-STARTED | constructors return `Result<_, String>` not `FerroError`. Blocker #1967. |
+//! | REQ-11 (FerroError error type) | SHIPPED | FIXED #1967: all 7 constructors (`Normal`/`ChiSquared`/`FDist`/`StudentsT`/`Beta`/`Gamma`/`Dirichlet` `new`) return `Result<Self, FerroError>`, emitting `FerroError::InvalidParameter { name, reason }` on invalid shape/scale params — the workspace error contract (CLAUDE.md / R-DEV-2), mirroring scipy's `ValueError` on invalid distribution parameters. Guard `distribution_constructors_invalid_params_return_ferroerror`. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | `statrs`/`rand_distr` vs `ferray::stats`/`ferray::random` (R-SUBSTRATE-1). Blocker #1968. |
 //! | REQ-13 (production consumer) | NOT-STARTED | no non-test caller (model-sel uses a different `distributions` module). Blocker #1969. |
 
+use ferrolearn_core::error::FerroError;
 use ndarray::Array1;
 use statrs::distribution::{self as sd, Continuous, ContinuousCDF};
 use statrs::statistics::Distribution as StatrsDistribution;
@@ -133,16 +134,20 @@ impl Normal {
     ///
     /// # Errors
     ///
-    /// Returns an error if `std_dev` is not positive, or if either parameter
-    /// is NaN.
-    pub fn new(mean: f64, std_dev: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if `std_dev` is not positive,
+    /// or if either parameter is NaN (mirroring scipy's `ValueError` on an
+    /// invalid `scale`).
+    pub fn new(mean: f64, std_dev: f64) -> Result<Self, FerroError> {
         sd::Normal::new(mean, std_dev)
             .map(|inner| Self {
                 inner,
                 mean,
                 std_dev,
             })
-            .map_err(|e| format!("Normal::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "std_dev".into(),
+                reason: format!("Normal::new failed: {e}"),
+            })
     }
 }
 
@@ -204,11 +209,15 @@ impl ChiSquared {
     ///
     /// # Errors
     ///
-    /// Returns an error if `df` is not positive or is NaN.
-    pub fn new(df: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if `df` is not positive or is
+    /// NaN (mirroring scipy's `ValueError` on an invalid shape parameter).
+    pub fn new(df: f64) -> Result<Self, FerroError> {
         sd::ChiSquared::new(df)
             .map(|inner| Self { inner })
-            .map_err(|e| format!("ChiSquared::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "df".into(),
+                reason: format!("ChiSquared::new failed: {e}"),
+            })
     }
 }
 
@@ -260,12 +269,16 @@ impl FDist {
     ///
     /// # Errors
     ///
-    /// Returns an error if either `df1` or `df2` is not positive or is
-    /// non-finite.
-    pub fn new(df1: f64, df2: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if either `df1` or `df2` is not
+    /// positive or is non-finite (mirroring scipy's `ValueError` on an invalid
+    /// shape parameter).
+    pub fn new(df1: f64, df2: f64) -> Result<Self, FerroError> {
         sd::FisherSnedecor::new(df1, df2)
             .map(|inner| Self { inner })
-            .map_err(|e| format!("FDist::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "df1".into(),
+                reason: format!("FDist::new failed: {e}"),
+            })
     }
 }
 
@@ -321,12 +334,16 @@ impl StudentsT {
     ///
     /// # Errors
     ///
-    /// Returns an error if `df` is not positive or is NaN.
-    pub fn new(df: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if `df` is not positive or is
+    /// NaN (mirroring scipy's `ValueError` on an invalid shape parameter).
+    pub fn new(df: f64) -> Result<Self, FerroError> {
         // statrs::StudentsT takes (location, scale, freedom).
         sd::StudentsT::new(0.0, 1.0, df)
             .map(|inner| Self { inner })
-            .map_err(|e| format!("StudentsT::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "df".into(),
+                reason: format!("StudentsT::new failed: {e}"),
+            })
     }
 }
 
@@ -375,12 +392,16 @@ impl Beta {
     ///
     /// # Errors
     ///
-    /// Returns an error if either `alpha` or `beta` is not positive, is
-    /// infinite, or is NaN.
-    pub fn new(alpha: f64, beta: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if either `alpha` or `beta` is
+    /// not positive, is infinite, or is NaN (mirroring scipy's `ValueError` on
+    /// an invalid shape parameter).
+    pub fn new(alpha: f64, beta: f64) -> Result<Self, FerroError> {
         sd::Beta::new(alpha, beta)
             .map(|inner| Self { inner })
-            .map_err(|e| format!("Beta::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: format!("Beta::new failed: {e}"),
+            })
     }
 }
 
@@ -432,11 +453,16 @@ impl Gamma {
     ///
     /// # Errors
     ///
-    /// Returns an error if either parameter is not positive or is NaN.
-    pub fn new(shape: f64, rate: f64) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if either parameter is not
+    /// positive or is NaN (mirroring scipy's `ValueError` on an invalid shape
+    /// parameter).
+    pub fn new(shape: f64, rate: f64) -> Result<Self, FerroError> {
         sd::Gamma::new(shape, rate)
             .map(|inner| Self { inner })
-            .map_err(|e| format!("Gamma::new failed: {e}"))
+            .map_err(|e| FerroError::InvalidParameter {
+                name: "shape".into(),
+                reason: format!("Gamma::new failed: {e}"),
+            })
     }
 }
 
@@ -500,16 +526,22 @@ impl Dirichlet {
     ///
     /// # Errors
     ///
-    /// Returns an error if `alpha` has fewer than 2 elements, or if any
-    /// element is non-positive, infinite, or NaN.
-    pub fn new(alpha: &[f64]) -> Result<Self, String> {
+    /// Returns [`FerroError::InvalidParameter`] if `alpha` has fewer than 2
+    /// elements, or if any element is non-positive, infinite, or NaN (mirroring
+    /// scipy's `ValueError` on invalid concentration parameters).
+    pub fn new(alpha: &[f64]) -> Result<Self, FerroError> {
         if alpha.len() < 2 {
-            return Err("Dirichlet::new failed: alpha must have at least 2 elements".into());
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "Dirichlet::new failed: alpha must have at least 2 elements".into(),
+            });
         }
         if alpha.iter().any(|&a| !a.is_finite() || a <= 0.0) {
-            return Err(
-                "Dirichlet::new failed: all alpha elements must be finite and positive".into(),
-            );
+            return Err(FerroError::InvalidParameter {
+                name: "alpha".into(),
+                reason: "Dirichlet::new failed: all alpha elements must be finite and positive"
+                    .into(),
+            });
         }
         Ok(Self {
             alpha: alpha.to_vec(),
@@ -760,6 +792,45 @@ mod tests {
             let cdf_val = c.cdf(x);
             assert_abs_diff_eq!(sf_val, 1.0 - cdf_val, epsilon = 1e-6);
         }
+    }
+
+    #[test]
+    fn distribution_constructors_invalid_params_return_ferroerror() {
+        // R-CHAR-3: scipy.stats rejects these invalid distribution parameters
+        // (negative scale / non-positive df / non-positive shape / <2-element
+        // alpha) — e.g. `scipy.stats.norm(0, -1)` is invalid and
+        // `scipy.stats.chi2(df=0)` is invalid. The ferrolearn analog of scipy's
+        // `ValueError` on invalid params is `FerroError::InvalidParameter`
+        // (CLAUDE.md / R-DEV-2 error-type contract). Each construction below
+        // hits its constructor's real `Err` path.
+        assert!(matches!(
+            Normal::new(0.0, -1.0), // negative std_dev (scale)
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            ChiSquared::new(0.0), // non-positive df
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            FDist::new(-1.0, 1.0), // non-positive df1
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            StudentsT::new(0.0), // non-positive df
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            Beta::new(-1.0, 1.0), // non-positive alpha
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            Gamma::new(-1.0, 1.0), // non-positive shape
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            Dirichlet::new(&[1.0]), // fewer than 2 elements
+            Err(FerroError::InvalidParameter { .. })
+        ));
     }
 
     #[test]
