@@ -485,3 +485,44 @@ def test_red_bernoulli_binarize_none_feature_count_matches_sklearn():
             "naive_bayes.py:1179 (None skips binarization)"
         ),
     )
+
+
+# RED pin (#2104 follow-up): BernoulliNB(binarize=<negative>) parameter validation.
+#
+# sklearn's `BernoulliNB._parameter_constraints["binarize"]` is
+# `[None, Interval(Real, 0, None, closed="left")]` (sklearn/naive_bayes.py:1156),
+# enforced by `_validate_params()` at the top of `fit`. A negative threshold is
+# OUT of the half-open interval [0, inf), so sklearn raises
+# `InvalidParameterError` (a subclass of `ValueError`):
+#   "The 'binarize' parameter of BernoulliNB must be None or a float in the
+#    range [0.0, inf). Got -1.0 instead."
+# The #2104 fix retyped `binarize` to `Option<f64>` (admitting None) but added no
+# lower-bound check, so ferrolearn SILENTLY ACCEPTS a negative threshold and fits
+# (every value v > -1.0 binarizes to 1), diverging from sklearn's hard reject.
+#
+# Live oracle (R-CHAR-3): the expectation (sklearn raises ValueError) is observed
+# from the live sklearn 1.5.2 oracle in-test, never copied from ferrolearn.
+@pytest.mark.xfail(
+    reason="divergence: BernoulliNB accepts negative binarize threshold; sklearn rejects (Interval[0,inf) or None, naive_bayes.py:1156); tracking #2105",
+    strict=True,
+)
+def test_red_bernoulli_negative_binarize_rejected_like_sklearn():
+    """RED: `BernoulliNB(binarize=-1.0).fit(X, y)` raises a ValueError in
+    sklearn 1.5.2 (binarize constraint Interval[0, inf) or None,
+    naive_bayes.py:1156) but ferrolearn accepts it silently and fits."""
+    X = np.array(
+        [[2.0, 0.0], [0.0, 3.0], [1.0, 1.0], [0.0, 4.0]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 1, 1])
+
+    # --- Live sklearn oracle: a negative binarize threshold is rejected at fit.
+    with pytest.raises(ValueError):
+        SkBernoulliNB(binarize=-1.0).fit(X, y)
+
+    # --- ferrolearn must mirror the reject. Currently it does NOT raise:
+    # `_RsBernoulliNB` (extras.rs:614) and `BernoulliNB::with_binarize_option`
+    # (bernoulli.rs:165) / `fit` (bernoulli.rs:266) apply ANY threshold without a
+    # lower-bound check, so this fit succeeds -> divergence.
+    with pytest.raises(ValueError):
+        fl.BernoulliNB(binarize=-1.0).fit(X, y)
