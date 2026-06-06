@@ -465,6 +465,84 @@ fn csc_get_out_of_bounds_is_err() {
     );
 }
 
+// REQ-MISSING-INDEX (rows/cols) — live scipy oracle (R-CHAR-3). Expected values
+// from `cd /tmp && python3 -c "
+//   import numpy as np, scipy.sparse as sp
+//   A=sp.csc_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]))
+//   print(A.getrow(0).toarray().tolist(), A.getrow(1).toarray().tolist())
+//   print(A.getcol(0).toarray().tolist(), A.getcol(2).toarray().tolist())"`
+//   -> [[1,0,2]] [[0,3,0]] / [[1],[0],[4]] [[2],[0],[5]].
+
+/// REQ-MISSING-INDEX (rows/cols). `getrow(i)` returns row `i` as a `(1, n_cols)`
+/// CSC, matching scipy `A.getrow(i)` (`_matrix.py:110` -> `_getrow`).
+///
+/// Oracle: `A.getrow(0).toarray() == [[1,0,2]]` (shape `(1,3)`),
+/// `A.getrow(1).toarray() == [[0,3,0]]`.
+#[test]
+fn csc_getrow_matches_scipy() {
+    let a = sample_a();
+    let r0 = a.getrow(0).unwrap();
+    assert_eq!(r0.n_rows(), 1);
+    assert_eq!(r0.n_cols(), 3);
+    let d0 = r0.to_dense();
+    assert_eq!(d0[[0, 0]], 1.0);
+    assert_eq!(d0[[0, 1]], 0.0);
+    assert_eq!(d0[[0, 2]], 2.0);
+
+    let r1 = a.getrow(1).unwrap();
+    let d1 = r1.to_dense();
+    assert_eq!(d1[[0, 0]], 0.0);
+    assert_eq!(d1[[0, 1]], 3.0);
+    assert_eq!(d1[[0, 2]], 0.0);
+}
+
+/// REQ-MISSING-INDEX (rows/cols). `getcol(j)` returns column `j` as a
+/// `(n_rows, 1)` CSC, matching scipy `A.getcol(j)` (`_matrix.py:104` ->
+/// `_getcol`). CSC is column-natural, so `getcol` delegates to `col_slice`.
+///
+/// Oracle: `A.getcol(0).toarray() == [[1],[0],[4]]` (shape `(3,1)`),
+/// `A.getcol(2).toarray() == [[2],[0],[5]]`.
+#[test]
+fn csc_getcol_matches_scipy() {
+    let a = sample_a();
+    let c0 = a.getcol(0).unwrap();
+    assert_eq!(c0.n_rows(), 3);
+    assert_eq!(c0.n_cols(), 1);
+    let d0 = c0.to_dense();
+    assert_eq!(d0[[0, 0]], 1.0);
+    assert_eq!(d0[[1, 0]], 0.0);
+    assert_eq!(d0[[2, 0]], 4.0);
+
+    let c2 = a.getcol(2).unwrap();
+    let d2 = c2.to_dense();
+    assert_eq!(d2[[0, 0]], 2.0);
+    assert_eq!(d2[[1, 0]], 0.0);
+    assert_eq!(d2[[2, 0]], 5.0);
+}
+
+/// REQ-MISSING-INDEX (rows/cols) / REQ-ERR. An out-of-bounds index returns
+/// `Err(InvalidParameter)`, where scipy raises `IndexError`.
+///
+/// Oracle: `A.getrow(3)` and `A.getcol(3)` (A is 3×3) -> `IndexError`.
+#[test]
+fn csc_getrow_getcol_out_of_bounds_is_err() {
+    let a = sample_a();
+    assert!(
+        matches!(
+            a.getrow(3),
+            Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+        ),
+        "row index out of bounds must return Err(InvalidParameter)"
+    );
+    assert!(
+        matches!(
+            a.getcol(3),
+            Err(ferrolearn_core::FerroError::InvalidParameter { .. })
+        ),
+        "col index out of bounds must return Err(InvalidParameter)"
+    );
+}
+
 /// REQ-API-ACCESSORS. `shape()`/`data()`/`indices()`/`indptr()` match scipy's
 /// `.shape`/`.data`/`.indices`/`.indptr` (`_compressed.py:38`, `:76-78`).
 ///

@@ -12,7 +12,9 @@
 //! SHIPPED or NOT-STARTED (with a concrete blocker). Behavior is oracle-verified
 //! vs the live scipy (R-CHAR-3) — see `tests/divergence_csc.rs`.
 //!
-//! **13 SHIPPED / 2 NOT-STARTED.**
+//! **13 SHIPPED / 2 NOT-STARTED** (REQ-MISSING-INDEX is a SPLIT: element access
+//! `get(i,j)` and rows/cols `getrow`/`getcol` SHIPPED; maintenance ops
+//! NOT-STARTED).
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -28,7 +30,8 @@
 //! | REQ-MISSING-REDUCE | SHIPPED (#2010) | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csc_sum_matches_scipy`/`csc_sum_axis0_matches_scipy`/`csc_sum_axis1_matches_scipy`/`csc_diagonal_matches_scipy`/`csc_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | SHIPPED (#2011) | `multiply(&B)` (element-wise Hadamard, INTERSECTION sparsity via sprs `binop::mul_mat_same_storage`) mirrors scipy `multiply` (`_base.py:490`, `_elmul_`); `sub(&B)` (`A-B`, UNION sparsity via sprs `&CsMat - &CsMat`) mirrors scipy `_sub_sparse` (`_compressed.py:260`). Both shape-check first (`Err(FerroError::ShapeMismatch)`) like `add`. Live oracle: `A.multiply(B).toarray()`=`[[1,0,0],[0,3,0],[0,0,5]]`, `(A-B).toarray()`=`[[0,-1,2],[0,2,-1],[4,0,4]]`. Guards `csc_multiply_matches_scipy`/`csc_sub_matches_scipy`/`csc_multiply_shape_mismatch_is_err`/`csc_sub_shape_mismatch_is_err`. Sub-note: `.power` (`_data.py:99`) still NOT-STARTED. |
 //! | REQ-MISSING-INDEX (element access `A[i,j]`) | SHIPPED (#2012) | `get(i,j) -> Result<T, FerroError>` returns the stored value at `(i,j)` or `T::zero()` if structurally absent (sprs `CsMat::get(i,j).copied().unwrap_or_else(T::zero)`), with an out-of-bounds `i`/`j` → `Err(FerroError::InvalidParameter)` — the column-symmetric port of the CSR `get` (sprs `get(i,j)` indexes by `(row,col)` regardless of storage), mirroring scipy `A[i,j]` (`IndexMixin.__getitem__` -> `_get_intXint`, `_index.py:29`). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `A[1,1]=3`, `A[0,1]=0` (absent), `A[0,0]=1`, `A[0,2]=2`, `A[2,0]=4`; out-of-bounds → `Err`. Guards `csc_get_element_matches_scipy`/`csc_get_absent_is_zero`/`csc_get_out_of_bounds_is_err`. |
-//! | REQ-MISSING-INDEX (rows/cols/maintenance) | NOT-STARTED | no `getrow`/`getcol`/`A[i,:]`/`A[:,j]`/`eliminate_zeros`/`sort_indices`/`sum_duplicates`/`power`/`astype`/`copy`/`max`/`min`/`argmax`. Blocker #2012. |
+//! | REQ-MISSING-INDEX (rows/cols) | SHIPPED (#2012) | `getcol(j)` returns column `j` as a `(n_rows, 1)` CSC (single-column case of `col_slice`, delegates to `self.col_slice(j, j + 1)`), mirroring scipy `getcol(j)` (`_matrix.py:104` → `_getcol`, "(m x 1) column vector"); `getrow(i)` returns row `i` as a `(1, n_cols)` CSC via `self.transpose().getcol(i)?.transpose()`, mirroring scipy `getrow(i)` (`_matrix.py:110` → `_getrow`, "(1 x n) row vector"). Both bounds-check (`j >= n_cols()`/`i >= n_rows()` → `Err(FerroError::InvalidParameter)`, scipy `IndexError`, R-DEV-2). CSC is column-natural, so `getcol` delegates to `col_slice` (the mirror of CSR's `getrow`→`row_slice`). Live oracle (R-CHAR-3): `A.getrow(0).toarray()`=`[[1,0,2]]`, `A.getrow(1).toarray()`=`[[0,3,0]]`, `A.getcol(0).toarray()`=`[[1],[0],[4]]`, `A.getcol(2).toarray()`=`[[2],[0],[5]]`. Guards `csc_getrow_matches_scipy`/`csc_getcol_matches_scipy`/`csc_getrow_getcol_out_of_bounds_is_err`. |
+//! | REQ-MISSING-INDEX (maintenance) | NOT-STARTED | no `eliminate_zeros`/`sort_indices`/`sum_duplicates`/`power`/`astype`/`copy`/`max`/`min`/`argmax`. Blocker #2012. |
 //! | REQ-API-ACCESSORS | SHIPPED (#2013) | first-class `shape()`/`data()`/`indices()`/`indptr()` accessors mirror scipy `.shape` (`_compressed.py:38`) and `.data`/`.indices`/`.indptr` (`_compressed.py:76-78`), the same CSC `(data, indices, indptr)` triple. `shape()` → `(n_rows, n_cols)`; `data()` → `&[T]` (`inner.data()`); `indices()` → `&[usize]` (CSC ROW indices, `inner.indices()`); `indptr()` → owned `Vec<usize>` (COLUMN pointers, `inner.indptr().raw_storage().to_vec()` — owned because the sprs `IndPtrView` accessor borrows a temporary). Column-symmetric port of the CSR accessors (#2005). Live oracle (R-CHAR-3): `A=[[1,0,2],[0,3,0],[4,0,5]]` → `shape=(3,3)`, `data=[1,4,3,2,5]` (column-major), `indices=[0,2,1,0,2]` (row indices), `indptr=[0,2,3,5]` (column pointer). Guard `csc_shape_data_indices_indptr_match_scipy`. |
 //! | REQ-FERRAY | NOT-STARTED | `sprs::CsMat` + `ndarray` vs ferray's sparse CSC analog (R-SUBSTRATE-1). Blocker #2014. |
 
@@ -556,6 +559,67 @@ where
             });
         }
         Ok(self.inner.get(i, j).copied().unwrap_or_else(T::zero))
+    }
+
+    /// Single-column extraction: returns column `j` as a `(n_rows, 1)` CSC matrix.
+    ///
+    /// Mirrors scipy `csc_matrix.getcol(j)` (`scipy/sparse/_matrix.py:104` →
+    /// `_getcol`), which returns "a copy of column j of the matrix, as an (m x 1)
+    /// sparse matrix (column vector)". For CSC the column is the outer (natural)
+    /// dimension, so column `j` is the half-open range `j..j+1`: this delegates to
+    /// [`col_slice`](Self::col_slice)`(j, j + 1)`, which already produces the
+    /// `(n_rows, 1)` CSC — the column-symmetric analog of CSR's `getrow`
+    /// delegating to `row_slice`. Live oracle (R-CHAR-3): for
+    /// `A = [[1,0,2],[0,3,0],[4,0,5]]`, `A.getcol(0).toarray() == [[1],[0],[4]]`
+    /// (shape `(3,1)`), `A.getcol(2).toarray() == [[2],[0],[5]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if `j >= n_cols()`. scipy raises
+    /// `IndexError("index out of bounds")`; ferrolearn maps the out-of-range index
+    /// to `InvalidParameter` per the crate error contract (R-DEV-2).
+    pub fn getcol(&self, j: usize) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Clone + Default + 'static,
+    {
+        if j >= self.n_cols() {
+            return Err(FerroError::InvalidParameter {
+                name: "index".into(),
+                reason: format!("col index {j} out of bounds for {} cols", self.n_cols()),
+            });
+        }
+        self.col_slice(j, j + 1)
+    }
+
+    /// Single-row extraction: returns row `i` as a `(1, n_cols)` CSC matrix.
+    ///
+    /// Mirrors scipy `csc_matrix.getrow(i)` (`scipy/sparse/_matrix.py:110` →
+    /// `_getrow`), which returns "a copy of row i of the matrix, as a (1 x n)
+    /// sparse matrix (row vector)". For CSC the row is the inner dimension, so the
+    /// simplest correct path is via transpose: `Aᵀ` has shape `(n_cols, n_rows)`,
+    /// its column `i` is the `(n_cols, 1)` [`getcol`](Self::getcol)`(i)`, and
+    /// transposing that back is the `(1, n_cols)` row `i` of `A` — the
+    /// column-symmetric analog of CSR's `getcol` going via transpose. Live oracle
+    /// (R-CHAR-3): for `A = [[1,0,2],[0,3,0],[4,0,5]]`,
+    /// `A.getrow(0).toarray() == [[1,0,2]]` (shape `(1,3)`),
+    /// `A.getrow(1).toarray() == [[0,3,0]]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if `i >= n_rows()`. scipy raises
+    /// `IndexError("index out of bounds")`; ferrolearn maps the out-of-range index
+    /// to `InvalidParameter` per the crate error contract (R-DEV-2).
+    pub fn getrow(&self, i: usize) -> Result<CscMatrix<T>, FerroError>
+    where
+        T: Clone + Default + 'static,
+    {
+        if i >= self.n_rows() {
+            return Err(FerroError::InvalidParameter {
+                name: "index".into(),
+                reason: format!("row index {i} out of bounds for {} rows", self.n_rows()),
+            });
+        }
+        Ok(self.transpose().getcol(i)?.transpose())
     }
 }
 
