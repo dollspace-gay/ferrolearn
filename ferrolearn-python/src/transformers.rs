@@ -13,12 +13,12 @@
 //! `ferrolearn-decomp/src/pca.rs`. Verification model B: pytest comparing
 //! `import ferrolearn` against `import sklearn` 1.5.2 (live oracle;
 //! `sklearn/preprocessing/_data.py` + `sklearn/decomposition/_pca.py`). Design
-//! doc: `.design/python/transformers.md` (13 REQs). Every REQ is BINARY
+//! doc: `.design/python/transformers.md` (14 REQs). Every REQ is BINARY
 //! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). Verified via
 //! `tests/divergence_transformers.py` + `tests/test_check_estimator.py`
 //! (534 pytest pass).
 //!
-//! **11 SHIPPED / 2 NOT-STARTED.**
+//! **12 SHIPPED / 2 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -33,6 +33,7 @@
 //! | REQ-PCA-WHITEN (whiten ctor param) | SHIPPED (#2098) | FIXED — the downstream `PCA::with_whiten` builder (`ferrolearn-decomp/src/pca.rs:180`, REQ-11 #1502) already ships sklearn's whitening (`Transform::transform` divides each column by `sqrt(explained_variance_)`, `inverse_transform` re-multiplies; `_base.py:157-165`/`:192-196`), so the binding now threads the param. `RsPCA` carries `whiten: bool` (`#[pyo3(signature = (n_components=2, whiten=false))]`) and `fit` builds `PCA::<f64>::new(self.n_components).with_whiten(self.whiten)`. Non-test consumer: `_transformers.py::PCA.__init__(self, n_components=None, *, whiten=False)` stores `self.whiten` and `fit` passes `whiten=self.whiten` into `_RsPCA(...)` (and `__setstate__` rebuilds with `whiten=getattr(self, "whiten", False)`). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2, whiten=True).fit_transform(X)` matches sklearn element-wise to 1e-6; `whiten=False` is byte-identical to the default path. Guard `tests/divergence_transformers.py::test_pca_whiten_transform_matches_sklearn`. |
 //! | REQ-PCA-PARAMS (copy/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | the wrapper exposes `n_components`+`whiten` only; sklearn `_pca.py:407-423`. The remaining params' default `svd_solver` MATCHES, so only the param surface + non-default paths are missing — owned downstream #1503/#1509. (`whiten` is now SHIPPED, see REQ-PCA-WHITEN.) |
 //! | REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | FIXED — the downstream prereqs (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`) already SHIPPED, so the binding now exposes both. `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs:283`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs:304`) — the full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept (`_pca.py:686-688`). Consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (non-zero); `PCA(3)` → `noise_variance_=0.0`. Verified `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
+//! | REQ-PCA-SCORE (score + score_samples Gaussian log-likelihood) | SHIPPED (#2099) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-15 #1507): `FittedPCA::score_samples` (`ferrolearn-decomp/src/pca.rs:484`) is the per-sample log-likelihood `-0.5*sum(Xr*(Xr@precision),1) - 0.5*(n_features*log(2pi) - logdet(precision))`, and `FittedPCA::score` (`pca.rs:533`) is its mean, both matching the live sklearn 1.5.2 oracle to 1e-6. The binding now surfaces them: `RsPCA::score_samples` (returns a `(n_samples,)` numpy array via `ndarray1_to_numpy`) + `RsPCA::score` (returns `f64`), each mapping `FerroError -> PyValueError`. Mirrors sklearn `PCA.score_samples`/`PCA.score` (`sklearn/decomposition/_pca.py:805-853`). Non-test consumer: `_transformers.py::PCA.score_samples` + `_transformers.py::PCA.score` (`check_is_fitted` + `_validate_data(reset=False)` + `_ensure_f64`, rebuilding `_rs` as `__setstate__` does if absent). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `score(X)=-5.358925927374854`, `score_samples(X)=[-4.6972115,-5.3570670,-5.8335549,-5.7184482,-5.4976041,-5.0496698]`. Guard `tests/divergence_transformers.py::test_pca_score_and_score_samples_match_sklearn`. |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` and `::PCA` constructs `_RsPCA(...)`, driving fit/transform/inverse_transform + attr reads; `ferrolearn/__init__.py` re-exports both; `test_check_estimator.py` runs each through `parametrize_with_checks` (534 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
@@ -291,5 +292,43 @@ impl RsPCA {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.noise_variance())
+    }
+
+    /// Per-sample Gaussian log-likelihood under the fitted PCA model,
+    /// `score_samples(X)` (shape `(n_samples,)`). Marshals
+    /// `FittedPCA::score_samples()` (`ferrolearn-decomp/src/pca.rs:484`, REQ-15
+    /// #1507) — `-0.5 * sum(Xr * (Xr @ precision), axis=1) - 0.5 * (n_features *
+    /// log(2*pi) - logdet(precision))` with `precision = get_precision()`.
+    /// Mirrors sklearn `PCA.score_samples` (`sklearn/decomposition/_pca.py:805-830`).
+    fn score_samples<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let result = fitted
+            .score_samples(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &result))
+    }
+
+    /// Average Gaussian log-likelihood of all samples under the fitted PCA model,
+    /// `score(X)` (float) — the mean of `score_samples(X)`. Marshals
+    /// `FittedPCA::score()` (`ferrolearn-decomp/src/pca.rs:533`, REQ-15 #1507).
+    /// Mirrors sklearn `PCA.score` (`sklearn/decomposition/_pca.py:832-853`).
+    fn score(&self, x: PyReadonlyArray2<'_, f64>) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let result = fitted
+            .score(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(result)
     }
 }

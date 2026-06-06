@@ -527,3 +527,52 @@ def test_pca_whiten_transform_matches_sklearn():
     fr_nw = fl.PCA(n_components=2).fit_transform(X)
     sk_nw = SkPCA(n_components=2).fit_transform(X)
     np.testing.assert_allclose(fr_nw, sk_nw, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# PCA score + score_samples Gaussian log-likelihood (unit #2099, R-DEV-3).
+#
+# The wrapper previously exposed no score/score_samples. The Rust
+# FittedPCA::score_samples (ferrolearn-decomp/src/pca.rs:484) /
+# FittedPCA::score (pca.rs:533) already match sklearn (downstream
+# ferrolearn-decomp REQ-15 #1507); this surfaces them on the binding. They
+# compute the Gaussian log-likelihood under the probabilistic-PCA model
+# (`sklearn/decomposition/_pca.py:805-853`): score_samples is the per-sample
+# log-likelihood, score is its mean.
+#
+# R-CHAR-3: every expected value is computed by the LIVE sklearn 1.5.2 oracle in
+# the same test, never literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+
+def test_pca_score_and_score_samples_match_sklearn():
+    """PCA.score / PCA.score_samples match the live sklearn oracle element-wise.
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn. The fixture has 6 samples ×
+    3 features with n_components=2 so the discarded tail eigenvalue makes
+    noise_variance_ (and hence the get_precision-based log-likelihood) non-trivial.
+    """
+    X = np.array(
+        [
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 7.0],
+            [2.0, 0.0, 1.0],
+            [8.0, 6.0, 5.0],
+            [3.0, 3.0, 2.0],
+            [0.0, 1.0, 4.0],
+        ]
+    )
+
+    fr = fl.PCA(n_components=2).fit(X)
+    sk = SkPCA(n_components=2).fit(X)
+
+    # The methods are present on the ferrolearn wrapper.
+    assert hasattr(fr, "score")
+    assert hasattr(fr, "score_samples")
+
+    # score(X) is the mean log-likelihood — match the live oracle to 1e-9.
+    assert abs(fr.score(X) - sk.score(X)) < 1e-9
+
+    # score_samples(X) is the per-sample log-likelihood — match element-wise.
+    np.testing.assert_allclose(fr.score_samples(X), sk.score_samples(X), atol=1e-9)

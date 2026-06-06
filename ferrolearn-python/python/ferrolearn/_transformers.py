@@ -191,6 +191,43 @@ class PCA(TransformerMixin, BaseEstimator):
             return np.array(self._rs.inverse_transform(X))
         return X @ self.components_ + self.mean_
 
+    def _ensure_rs(self):
+        # Rebuild the Rust handle (dropped on pickle) the same way __setstate__
+        # does, threading the resolved n_components + whiten. score/score_samples
+        # have no closed-form Python fallback, so _rs must exist.
+        if not hasattr(self, "_rs") and hasattr(self, "_fit_X"):
+            n_components = (
+                self.n_components
+                if self.n_components is not None
+                else min(self._fit_X.shape)
+            )
+            self._rs = _RsPCA(
+                n_components=n_components,
+                whiten=getattr(self, "whiten", False),
+            )
+            self._rs.fit(_ensure_f64(self._fit_X))
+
+    def score_samples(self, X):
+        # Per-sample Gaussian log-likelihood under the fitted model
+        # (sklearn/decomposition/_pca.py:805-830). Delegates to the Rust
+        # FittedPCA::score_samples (ferrolearn-decomp/src/pca.rs:484, REQ-15).
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False, dtype="float64")
+        X = _ensure_f64(X)
+        self._ensure_rs()
+        return np.asarray(self._rs.score_samples(X))
+
+    def score(self, X, y=None):
+        # Average Gaussian log-likelihood of all samples — the mean of
+        # score_samples (sklearn/decomposition/_pca.py:832-853). `y` is ignored
+        # (sklearn signature `score(self, X, y=None)`). Delegates to the Rust
+        # FittedPCA::score (ferrolearn-decomp/src/pca.rs:533, REQ-15).
+        check_is_fitted(self)
+        X = self._validate_data(X, reset=False, dtype="float64")
+        X = _ensure_f64(X)
+        self._ensure_rs()
+        return float(self._rs.score(X))
+
     def get_feature_names_out(self, input_features=None):
         # ClassNamePrefixFeaturesOutMixin: PCA emits `pca0..pca{n_components_-1}`
         # (sklearn/decomposition/_base.py / _ClassNamePrefixFeaturesOutMixin).

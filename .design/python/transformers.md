@@ -224,6 +224,14 @@ Grouped by estimator (`REQ-SS-*`, `REQ-PCA-*`) plus shared `REQ-CONSUMER`/
   #2097 — the binding surfaces `FittedPCA::n_components_()`/`noise_variance()`
   (downstream prereqs `ferrolearn-decomp` REQ-16 #1505, REQ-15 #1507 SHIPPED),
   set by `_transformers.py::PCA.fit`.]
+- REQ-PCA-SCORE: `ferrolearn.PCA` exposes the `score(X, y=None)` (float) and
+  `score_samples(X)` `(n_samples,)` methods, returning the average / per-sample
+  Gaussian log-likelihood under the probabilistic-PCA model
+  (`_pca.py:805-853`). [SHIPPED #2099 — the binding surfaces
+  `FittedPCA::score_samples` (`ferrolearn-decomp/src/pca.rs:484`) / `FittedPCA::score`
+  (`pca.rs:533`) (downstream prereq `ferrolearn-decomp` REQ-15 #1507 SHIPPED,
+  matching the live oracle to 1e-6), wrapped by `_transformers.py::PCA.score`/
+  `score_samples`.]
 - REQ-PCA-VALUE-PARITY: `components_`/`explained_variance_`/
   `explained_variance_ratio_`/`singular_values_`/`mean_` match sklearn
   array-by-array (R-DEV-1), including the deterministic `svd_flip` sign on the
@@ -316,6 +324,17 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
   FAILING array-by-array pytest on a degenerate fixture; it FAILS until the
   downstream blockers land (`ferrolearn-decomp` REQ-2 #1501, REQ-11 #1502,
   REQ-12 #1503).
+- AC-PCA-SCORE (REQ-PCA-SCORE): SHIPPED #2099. sklearn oracle on the rank>2
+  fixture (so the discarded tail eigenvalue makes the `get_precision`-based
+  log-likelihood non-trivial)
+  `cd /tmp && python3 -c "import numpy as np; from sklearn.decomposition import PCA; X=np.array([[1.,2.,3.],[4.,5.,7.],[2.,0.,1.],[8.,6.,5.],[3.,3.,2.],[0.,1.,4.]]); m=PCA(2).fit(X); print(m.score(X)); print(m.score_samples(X).tolist())"`
+  → `-5.358925927374854` / `[-4.6972115227, -5.3570669702, -5.8335548795,
+  -5.7184482497, -5.4976041344, -5.0496698077]`. `ferrolearn.PCA(n_components=2).fit(X)`
+  now exposes `score(X)` matching the oracle to <1e-9 and `score_samples(X)`
+  element-wise to <1e-9 (via `RsPCA::score`/`score_samples` over
+  `FittedPCA::score()`/`score_samples()`, wrapped by `_transformers.py::PCA.score`/
+  `score_samples`). Guard
+  `tests/divergence_transformers.py::test_pca_score_and_score_samples_match_sklearn`.
 - AC-CONSUMER (REQ-CONSUMER):
   `grep -rn "_RsStandardScaler\|_RsPCA" /home/doll/ferrolearn/ferrolearn-python/python/ferrolearn/_transformers.py`
   shows `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` /
@@ -345,6 +364,7 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
 | REQ-PCA-PARAMS (copy/svd_solver/tol/iterated_power/n_oversamples/power_iteration_normalizer/random_state) | NOT-STARTED | open prereq blockers #1503 (`svd_solver`, `ferrolearn-decomp` REQ-12), #1509 (`tol`/`iterated_power`/`n_oversamples`/`power_iteration_normalizer`/`random_state`/`copy`, REQ-17). sklearn `_pca.py:407-423`/`:393-405`. ferrolearn `_transformers.py::PCA.__init__` now exposes `n_components`+`whiten`; the remaining ctor params are absent on `RsPCA::new`. The default `svd_solver` behavior MATCHES (covariance-eigh), so only the param surface + non-default paths are missing — owned downstream; the binding cannot expose what the library lacks. (`whiten` is now SHIPPED — see REQ-PCA-WHITEN.) |
 | REQ-PCA-ATTRS (n_components_ + noise_variance_) | SHIPPED (#2097) | the downstream prereqs already SHIPPED (`ferrolearn-decomp` REQ-16 #1505 `n_components_`, REQ-15 #1507 `noise_variance_`), so the binding now exposes both. impl: `RsPCA::n_components_` getter marshals `FittedPCA::n_components_()` (`ferrolearn-decomp/src/pca.rs::n_components_`, the row count of `components_`, `_pca.py:691`); `RsPCA::noise_variance_` getter marshals `FittedPCA::noise_variance()` (`pca.rs::noise_variance`, full-spectrum tail mean `mean(sorted_eigenvalues[n_comp..min_dim])` or `0.0` when all kept, `_pca.py:686-688`). Non-test consumer: `_transformers.py::PCA.fit` sets `n_components_ = int(self._rs.n_components_)` + `noise_variance_ = float(self._rs.noise_variance_)`. Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`: `PCA(2)` → `n_components_=2`, `noise_variance_=0.3132465241238894` (NON-ZERO — tail-mean path); `PCA(3)` → `noise_variance_=0.0`. Guard `tests/divergence_transformers.py::test_pca_n_components_and_noise_variance_match_sklearn`. |
 | REQ-PCA-VALUE-PARITY (components_/explained_variance_/ratio/singular_values_/mean_ array parity incl. svd_flip sign) | SHIPPED | on the DEFAULT solver path. `_transformers.py::PCA.fit` marshals all five arrays from the `RsPCA` getters (over `FittedPCA`), and the downstream `ferrolearn-decomp` REQ-1/4/5 are critic-verified to MATCH the live sklearn `PCA` oracle element-wise to 1e-6 INCLUDING the per-row `svd_flip(u_based_decision=False)` sign (`tests/divergence_pca.rs`, `_pca.py:647`). Live (R-CHAR-3): ferrolearn `PCA(n_components=2).fit(X)` equals the oracle element-wise (values above). Non-test consumer: `_transformers.py::PCA` + re-export. (The repeated-eigenvalue/rank-deficient sign-and-basis case is owned downstream REQ-2 #1501; `whiten`/alternate-`svd_solver` value parity is owned downstream #1502/#1503.) |
+| REQ-PCA-SCORE (score + score_samples Gaussian log-likelihood) | SHIPPED (#2099) | the downstream prereq already SHIPPED (`ferrolearn-decomp` REQ-15 #1507), so the binding now surfaces both. impl: `RsPCA::score_samples` getter-style method marshals `FittedPCA::score_samples()` (`ferrolearn-decomp/src/pca.rs:484` — `-0.5*sum(Xr*(Xr@precision),1) - 0.5*(n_features*log(2pi) - logdet(precision))`, `precision = get_precision()`) to a `(n_samples,)` numpy array; `RsPCA::score` marshals `FittedPCA::score()` (`pca.rs:533` — the mean of `score_samples`) to `f64`; both map `FerroError -> PyValueError`. Mirrors sklearn `PCA.score_samples`/`PCA.score` (`sklearn/decomposition/_pca.py:805-853`). Non-test consumer: `_transformers.py::PCA.score_samples`/`::PCA.score` (`check_is_fitted` + `_validate_data(reset=False, dtype="float64")` + `_ensure_f64`, rebuilding `_rs` via `_ensure_rs` the same way `__setstate__` does if absent). Live oracle (R-CHAR-3) `X=[[1,2,3],[4,5,7],[2,0,1],[8,6,5],[3,3,2],[0,1,4]]`, `PCA(n_components=2)`: `score(X)=-5.358925927374854`, `score_samples(X)=[-4.6972115,-5.3570670,-5.8335549,-5.7184482,-5.4976041,-5.0496698]` — match to <1e-9. Guard `tests/divergence_transformers.py::test_pca_score_and_score_samples_match_sklearn`. |
 | REQ-CONSUMER (binding IS the public API) | SHIPPED | the binding boundary types ARE the public API (R-DEFER-1/S5: boundary estimator types ARE the public surface; grandfathered existing pub API). Non-test production consumers: `_transformers.py::StandardScaler` constructs `_RsStandardScaler()` and `_transformers.py::PCA` constructs `_RsPCA(n_components=...)`, each calling `fit`/`transform`/`inverse_transform` + reading the fitted-attr getters (`grep -n "_RsStandardScaler\|_RsPCA" python/ferrolearn/_transformers.py`); `ferrolearn/__init__.py:12` re-exports both `StandardScaler` and `PCA`; `test_check_estimator.py:31-32` is the verification consumer + external users. Verification (model B): pytest → 524 passed (both estimators run through `parametrize_with_checks`). |
 | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | open prereq blocker = `conversions.md` REQ-FERRAY #2027. `transformers.rs` marshals via `use crate::conversions::*` + `use numpy::{PyArray1, PyArray2, PyReadonlyArray2}` (rust-numpy) and the conversions produce `ndarray::Array{1,2}` — the WRONG substrate per R-SUBSTRATE-1 (destination `ferray::numpy_interop` + `ferray-core`). ferray exposes no PyO3 numpy-interop bridge yet (R-SUBSTRATE-5). Owned by the conversions unit, surfaced here. |
 
