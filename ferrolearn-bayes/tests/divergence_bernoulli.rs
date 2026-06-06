@@ -486,3 +486,66 @@ fn green_bernoulli_score_accuracy() {
         "score = {acc}, want {SK_SCORE}"
     );
 }
+
+// ===========================================================================
+// RED (#2106) — `binarize = NaN / +inf` parameter validation. Follow-up to the
+// #2105 fix, which added a `b < F::zero()` reject in `BernoulliNB::fit`
+// (bernoulli.rs:257-264) mirroring ONLY the lower bound of sklearn's
+//   `binarize: [None, Interval(Real, 0, None, closed="left")]`
+//   (sklearn/naive_bayes.py:1156).
+// IEEE makes that guard INCOMPLETE: `NaN < 0.0 == false` and `+inf < 0.0 ==
+// false`, so ferrolearn ACCEPTS both and fits. sklearn's half-open interval
+// [0.0, +inf) excludes NaN (all comparisons false) and excludes +inf (the OPEN
+// right end, `closed="left"`), so `_validate_params()` raises
+// `InvalidParameterError` (a `ValueError`) for BOTH.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.naive_bayes import BernoulliNB
+//   X=np.array([[2.,0.],[0.,3.],[1.,1.],[0.,4.]]); y=np.array([0,0,1,1])
+//   for b in (float('nan'), float('inf')):
+//       try: BernoulliNB(binarize=b).fit(X,y); print(b,'OK')
+//       except Exception as e: print(b, type(e).__name__)"
+//   ->  nan InvalidParameterError
+//       inf InvalidParameterError
+// ===========================================================================
+
+/// Divergence: ferrolearn `BernoulliNB::fit` accepts `binarize = NaN` where
+/// sklearn rejects it. sklearn's `Interval(Real, 0, None, closed="left")`
+/// (`sklearn/naive_bayes.py:1156`) excludes NaN, so `_validate_params()` raises
+/// `InvalidParameterError`. ferrolearn's guard `b < F::zero()` (bernoulli.rs:257)
+/// evaluates `NaN < 0.0 == false`, so the fit succeeds. Tracking: #2106
+#[test]
+#[ignore = "divergence: BernoulliNB::fit accepts NaN binarize, sklearn rejects (naive_bayes.py:1156); tracking #2106"]
+fn divergence_bernoulli_nan_binarize_rejected() {
+    let (xc, yc) = nonbinary_fixture();
+
+    let model = BernoulliNB::<f64>::new().with_binarize(f64::NAN);
+    let result = model.fit(&xc, &yc);
+
+    assert!(
+        result.is_err(),
+        "fit with binarize=NaN should error (sklearn: InvalidParameterError, \
+         NaN outside Interval[0.0, inf)), got Ok (#2106)"
+    );
+}
+
+/// Divergence: ferrolearn `BernoulliNB::fit` accepts `binarize = +inf` where
+/// sklearn rejects it. sklearn's `Interval(Real, 0, None, closed="left")`
+/// (`sklearn/naive_bayes.py:1156`) has an OPEN upper bound, so +inf is excluded
+/// and `_validate_params()` raises `InvalidParameterError`. ferrolearn's guard
+/// `b < F::zero()` (bernoulli.rs:257) evaluates `+inf < 0.0 == false`, so the fit
+/// succeeds. (`-inf` is correctly rejected by both.) Tracking: #2106
+#[test]
+#[ignore = "divergence: BernoulliNB::fit accepts +inf binarize, sklearn rejects (naive_bayes.py:1156); tracking #2106"]
+fn divergence_bernoulli_inf_binarize_rejected() {
+    let (xc, yc) = nonbinary_fixture();
+
+    let model = BernoulliNB::<f64>::new().with_binarize(f64::INFINITY);
+    let result = model.fit(&xc, &yc);
+
+    assert!(
+        result.is_err(),
+        "fit with binarize=+inf should error (sklearn: InvalidParameterError, \
+         +inf is the open right end of Interval[0.0, inf)), got Ok (#2106)"
+    );
+}

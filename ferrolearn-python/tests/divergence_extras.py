@@ -502,10 +502,6 @@ def test_red_bernoulli_binarize_none_feature_count_matches_sklearn():
 #
 # Live oracle (R-CHAR-3): the expectation (sklearn raises ValueError) is observed
 # from the live sklearn 1.5.2 oracle in-test, never copied from ferrolearn.
-@pytest.mark.xfail(
-    reason="divergence: BernoulliNB accepts negative binarize threshold; sklearn rejects (Interval[0,inf) or None, naive_bayes.py:1156); tracking #2105",
-    strict=True,
-)
 def test_red_bernoulli_negative_binarize_rejected_like_sklearn():
     """RED: `BernoulliNB(binarize=-1.0).fit(X, y)` raises a ValueError in
     sklearn 1.5.2 (binarize constraint Interval[0, inf) or None,
@@ -526,3 +522,64 @@ def test_red_bernoulli_negative_binarize_rejected_like_sklearn():
     # lower-bound check, so this fit succeeds -> divergence.
     with pytest.raises(ValueError):
         fl.BernoulliNB(binarize=-1.0).fit(X, y)
+
+
+# RED pin (#2106): BernoulliNB(binarize=NaN / +inf) parameter validation.
+#
+# Follow-up to the #2105 fix, which added a `binarize < 0` reject in
+# `BernoulliNB::fit` (bernoulli.rs:257-264). That guard mirrors only the LOWER
+# bound of sklearn's constraint
+#   `binarize: [None, Interval(Real, 0, None, closed="left")]`
+#   (sklearn/naive_bayes.py:1156)
+# via `b < F::zero()`. But IEEE comparisons make that guard INCOMPLETE:
+#   * `NaN < 0.0` is `false`  -> ferrolearn ACCEPTS NaN and fits.
+#   * `+inf < 0.0` is `false` -> ferrolearn ACCEPTS +inf and fits.
+# sklearn's `Interval(Real, 0, None, closed="left")` is the half-open interval
+# [0.0, +inf): NaN is not a member (every comparison is false) and +inf is the
+# OPEN right end (`closed="left"` excludes the upper bound), so sklearn's
+# `_validate_params()` raises `InvalidParameterError` (a `ValueError`) for BOTH.
+# (-inf is correctly rejected by both, since `-inf < 0.0` is true.)
+#
+# Live oracle (R-CHAR-3): the expectation (sklearn raises ValueError) is observed
+# from the live sklearn 1.5.2 oracle in-test, never copied from ferrolearn.
+def test_red_bernoulli_nan_binarize_rejected_like_sklearn():
+    """RED: `BernoulliNB(binarize=NaN).fit(X, y)` raises a ValueError in sklearn
+    1.5.2 (binarize constraint Interval[0, inf) or None, naive_bayes.py:1156;
+    NaN is outside the interval) but ferrolearn's `b < 0` guard
+    (bernoulli.rs:257) lets `NaN < 0 == false` through and fits. Tracking #2106."""
+    X = np.array(
+        [[2.0, 0.0], [0.0, 3.0], [1.0, 1.0], [0.0, 4.0]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 1, 1])
+
+    nan = float("nan")
+    # --- Live sklearn oracle: NaN binarize is rejected at fit.
+    with pytest.raises(ValueError):
+        SkBernoulliNB(binarize=nan).fit(X, y)
+
+    # --- ferrolearn must mirror the reject. Currently it does NOT raise.
+    with pytest.raises(ValueError):
+        fl.BernoulliNB(binarize=nan).fit(X, y)
+
+
+def test_red_bernoulli_inf_binarize_rejected_like_sklearn():
+    """RED: `BernoulliNB(binarize=+inf).fit(X, y)` raises a ValueError in sklearn
+    1.5.2 (binarize constraint Interval[0, inf) with closed="left", so the +inf
+    upper bound is OPEN/excluded, naive_bayes.py:1156) but ferrolearn's `b < 0`
+    guard (bernoulli.rs:257) lets `+inf < 0 == false` through and fits.
+    Tracking #2106."""
+    X = np.array(
+        [[2.0, 0.0], [0.0, 3.0], [1.0, 1.0], [0.0, 4.0]],
+        dtype=np.float64,
+    )
+    y = np.array([0, 0, 1, 1])
+
+    inf = float("inf")
+    # --- Live sklearn oracle: +inf binarize is rejected at fit.
+    with pytest.raises(ValueError):
+        SkBernoulliNB(binarize=inf).fit(X, y)
+
+    # --- ferrolearn must mirror the reject. Currently it does NOT raise.
+    with pytest.raises(ValueError):
+        fl.BernoulliNB(binarize=inf).fit(X, y)
