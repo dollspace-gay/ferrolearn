@@ -515,7 +515,6 @@ fn green_bernoulli_score_accuracy() {
 /// `InvalidParameterError`. ferrolearn's guard `b < F::zero()` (bernoulli.rs:257)
 /// evaluates `NaN < 0.0 == false`, so the fit succeeds. Tracking: #2106
 #[test]
-#[ignore = "divergence: BernoulliNB::fit accepts NaN binarize, sklearn rejects (naive_bayes.py:1156); tracking #2106"]
 fn divergence_bernoulli_nan_binarize_rejected() {
     let (xc, yc) = nonbinary_fixture();
 
@@ -536,7 +535,6 @@ fn divergence_bernoulli_nan_binarize_rejected() {
 /// `b < F::zero()` (bernoulli.rs:257) evaluates `+inf < 0.0 == false`, so the fit
 /// succeeds. (`-inf` is correctly rejected by both.) Tracking: #2106
 #[test]
-#[ignore = "divergence: BernoulliNB::fit accepts +inf binarize, sklearn rejects (naive_bayes.py:1156); tracking #2106"]
 fn divergence_bernoulli_inf_binarize_rejected() {
     let (xc, yc) = nonbinary_fixture();
 

@@ -243,8 +243,29 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Bernoul
     ///
     /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers of rows.
     /// - [`FerroError::InsufficientSamples`] if there are no samples.
+    /// - [`FerroError::InvalidParameter`] if `binarize` is `Some(b)` where `b` is
+    ///   not a finite value `>= 0` (a negative threshold, `NaN`, or `+/-inf` — all
+    ///   outside sklearn's `binarize: [None, Interval(Real, 0, None,
+    ///   closed="left")]`, `naive_bayes.py:1156`) or if `alpha < 0`.
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedBernoulliNB<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
+
+        // sklearn `BernoulliNB._parameter_constraints["binarize"]` is
+        // `[None, Interval(Real, 0, None, closed="left")]` (`naive_bayes.py:1156`),
+        // enforced by `_validate_params()` at the top of `fit`. The half-open
+        // interval [0, inf) admits only None or a FINITE real >= 0; a negative
+        // threshold, NaN, and +/-inf are all outside it, so sklearn raises
+        // `InvalidParameterError` (a `ValueError` subclass). A bare `b < 0` reject
+        // is INCOMPLETE under IEEE-754 (`NaN < 0 == false`, `+inf < 0 == false`),
+        // so guard on "NOT a finite value >= 0" to reject NaN and +/-inf too.
+        if let Some(b) = self.binarize
+            && !(b.is_finite() && b >= F::zero())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "binarize".to_string(),
+                reason: "must be None or a float in the range [0.0, inf)".to_string(),
+            });
+        }
 
         if n_samples == 0 {
             return Err(FerroError::InsufficientSamples {
@@ -936,6 +957,46 @@ mod tests {
         let fitted = model.fit(&x, &y).unwrap();
         let preds = fitted.predict(&x).unwrap();
         assert_eq!(preds.len(), 6);
+    }
+
+    #[test]
+    fn test_bernoulli_nb_negative_binarize_rejected() {
+        // sklearn `BernoulliNB._parameter_constraints["binarize"]` is
+        // `[None, Interval(Real, 0, None, closed="left")]` (naive_bayes.py:1156),
+        // enforced at fit; the half-open interval [0, inf) admits only None or a
+        // FINITE real >= 0. `BernoulliNB(binarize=b).fit(X,y)` raises
+        // InvalidParameterError (a ValueError) for a negative threshold, `NaN`, and
+        // `+/-inf`. ferrolearn must reject all of those with
+        // `FerroError::InvalidParameter`, while `>= 0` / `None` still fit OK.
+        let x = array![[2.0, 0.0], [0.0, 3.0], [1.0, 1.0], [0.0, 4.0]];
+        let y = array![0usize, 0, 1, 1];
+
+        // Negative threshold, NaN, and +/-inf -> rejected with InvalidParameter
+        // on `binarize` (NaN and +inf slip past a bare `b < 0` guard under IEEE).
+        for bad in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let err = BernoulliNB::<f64>::new()
+                .with_binarize(bad)
+                .fit(&x, &y)
+                .unwrap_err();
+            assert!(
+                matches!(&err, FerroError::InvalidParameter { name, .. } if name == "binarize"),
+                "expected InvalidParameter for binarize={bad}, got {err:?}"
+            );
+        }
+
+        // Non-negative threshold and None still fit.
+        assert!(
+            BernoulliNB::<f64>::new()
+                .with_binarize(0.0)
+                .fit(&x, &y)
+                .is_ok()
+        );
+        assert!(
+            BernoulliNB::<f64>::new()
+                .with_binarize_option(None)
+                .fit(&x, &y)
+                .is_ok()
+        );
     }
 
     #[test]
