@@ -302,3 +302,52 @@ def test_red_standardscaler_copy_roundtrip():
     fl_m = fl.StandardScaler(copy=True).fit(_XSS)
     recovered = fl_m.inverse_transform(fl_m.transform(_XSS))
     np.testing.assert_allclose(recovered, _XSS, rtol=1e-9, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# StandardScaler.var_ on a CONSTANT (zero-variance) column (unit #2086).
+#
+# The wrapper previously derived `var_ = scale_**2`, which is WRONG on a
+# constant column: sklearn's `_handle_zeros_in_scale` clamps `scale_=1.0` there
+# (`sklearn/preprocessing/_data.py:1019-1020`), so `scale_**2=1.0`, while the
+# TRUE population variance is 0.0. sklearn's `var_` is the raw variance computed
+# BEFORE that clamp (`_data.py:1013-1023`). The fix reads the binding's true
+# variance (`FittedStandardScaler::var()`, downstream REQ-5 #1192).
+#
+# Oracle (sklearn 1.5.2), X=[[1,5],[2,5],[3,5]] (column 1 constant):
+#   var_   == [0.6666666666666666, 0.0]
+#   scale_ == [0.816496580927726, 1.0]
+#   buggy scale_**2 == [0.6666666666666666, 1.0]  (var_[1] wrong: 1.0 != 0.0)
+# ---------------------------------------------------------------------------
+
+# Column 1 is constant (all 5.0) -> a genuine zero-variance feature.
+_XCONST = np.array([[1.0, 5.0], [2.0, 5.0], [3.0, 5.0]])
+
+
+def test_red_standardscaler_var_constant_column_matches_oracle():
+    """var_ matches sklearn on a constant column (0.0), not the buggy scale_**2.
+
+    R-CHAR-3: every expected value comes from the live sklearn 1.5.2 oracle in
+    this test, never literal-copied from ferrolearn. The previous wrapper set
+    `var_ = scale_**2`; on the constant column `scale_=1.0` so `scale_**2=1.0`,
+    diverging from sklearn's true `var_=0.0`.
+    """
+    fl_m = fl.StandardScaler().fit(_XCONST)
+    sk_m = SkStandardScaler().fit(_XCONST)
+
+    # var_ matches the live oracle element-wise (tight: it is a deterministic
+    # two-pass population variance).
+    np.testing.assert_allclose(fl_m.var_, sk_m.var_, rtol=1e-12)
+
+    # The constant column's variance is exactly 0.0 — NOT the buggy scale_**2.
+    # The oracle confirms 0.0; ferrolearn now matches.
+    assert sk_m.var_[1] == 0.0
+    assert fl_m.var_[1] == 0.0
+
+    # Prove this is the TRUE-variance path, not the old `scale_**2` path: with
+    # sklearn's `_handle_zeros_in_scale` the constant-column scale is 1.0, so the
+    # OLD buggy ferrolearn `var_` was `sk.scale_**2 == 1.0` there — wrong. The
+    # oracle's own scale_ confirms the trap the fix avoids.
+    assert sk_m.scale_[1] == 1.0
+    assert sk_m.scale_[1] ** 2 == 1.0  # the value the old buggy var_[1] held
+    assert fl_m.var_[1] != sk_m.scale_[1] ** 2  # fixed: 0.0 != 1.0

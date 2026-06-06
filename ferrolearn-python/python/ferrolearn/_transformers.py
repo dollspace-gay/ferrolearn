@@ -57,7 +57,13 @@ class StandardScaler(TransformerMixin, BaseEstimator):
             np.array(self._rs.mean_) if (self.with_mean or self.with_std) else None
         )
         self.scale_ = np.array(self._rs.scale_) if self.with_std else None
-        self.var_ = self.scale_ ** 2 if self.with_std else None
+        # var_ is the TRUE population variance (ddof=0), which is 0.0 on a
+        # constant column. It is NOT scale_**2: sklearn's _handle_zeros_in_scale
+        # clamps scale_=1.0 on constant columns (so scale_**2=1.0 there), but
+        # var_ is the raw variance computed BEFORE that clamp
+        # (`sklearn/preprocessing/_data.py:1013-1023`). Read it from the binding,
+        # which surfaces `FittedStandardScaler::var()`.
+        self.var_ = np.array(self._rs.var_) if self.with_std else None
         self.n_samples_seen_ = X.shape[0]
         self._fit_X = X.copy()
         return self

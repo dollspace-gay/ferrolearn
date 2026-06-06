@@ -22,8 +22,8 @@
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
-//! | REQ-SS-API-CONFORM (fit/transform/inverse_transform + attrs, default path) | SHIPPED | `RsStandardScaler::fit`/`transform`/`inverse_transform` + getters `mean_`/`scale_`, wrapped by `_transformers.py::StandardScaler` which derives `var_ = scale_**2` + `n_samples_seen_` + `n_features_in_` (`self._validate_data`) and inherits `fit_transform` — mirroring `_data.py:756-790`/`:1027`/`:1070`. Live default-path oracle matches element-wise. |
-//! | REQ-SS-VALUE-PARITY (mean_/scale_/var_/n_samples_seen_ array parity) | SHIPPED | default path: marshals `mean_`/`scale_` from the Rust getters (over `FittedStandardScaler::mean()`/`std()`); downstream `ferrolearn-preprocess` REQ-1 is bit-identical to the sklearn oracle. (Non-default with_mean/with_std parity is REQ-SS-WITH-MEAN-STD.) |
+//! | REQ-SS-API-CONFORM (fit/transform/inverse_transform + attrs, default path) | SHIPPED | `RsStandardScaler::fit`/`transform`/`inverse_transform` + getters `mean_`/`scale_`, wrapped by `_transformers.py::StandardScaler` which reads `var_ = np.array(self._rs.var_)` (FIXED #2086; was the buggy `scale_**2`) + `n_samples_seen_` + `n_features_in_` (`self._validate_data`) and inherits `fit_transform` — mirroring `_data.py:756-790`/`:1027`/`:1070`. Live default-path oracle matches element-wise. |
+//! | REQ-SS-VALUE-PARITY (mean_/scale_/var_/n_samples_seen_ array parity) | SHIPPED | default path: marshals `mean_`/`scale_`/`var_` from the Rust getters (over `FittedStandardScaler::mean()`/`std()`/`var()`); downstream `ferrolearn-preprocess` REQ-1/5 is bit-identical to the sklearn oracle. FIXED #2086: `RsStandardScaler::var_` getter now exposes the TRUE population variance from `FittedStandardScaler::var()` (`0.0` on a constant column), so the wrapper reads `var_ = np.array(self._rs.var_)` instead of the buggy `scale_**2` — sklearn's `var_` is the raw variance computed BEFORE `_handle_zeros_in_scale` clamps `scale_=1.0` on a constant column (`_data.py:1013-1023`), so on `X=[[1,5],[2,5],[3,5]]` `var_=[0.6666666666666666,0.0]` while `scale_**2=[0.6666666666666666,1.0]`. Consumer: `_transformers.py::StandardScaler.fit`. Guard `tests/divergence_transformers.py::test_red_standardscaler_var_constant_column_matches_oracle`. (Non-default with_mean/with_std parity is REQ-SS-WITH-MEAN-STD.) |
 //! | REQ-PCA-API-CONFORM (fit/transform/inverse_transform + 5 attrs, default solver) | SHIPPED | `RsPCA::fit`/`transform`/`inverse_transform` + getters `components_`/`explained_variance_`/`explained_variance_ratio_`/`mean_`/`singular_values_`, wrapped by `_transformers.py::PCA` (+ `n_features_in_`), inheriting `fit_transform` — mirroring `_pca.py:691-707`/`:489` with the `svd_flip` sign (`_pca.py:647`). Live default-solver oracle matches element-wise incl. sign. |
 //! | REQ-PCA-VALUE-PARITY (components/variance/singular/mean parity incl. svd_flip sign) | SHIPPED | default solver: all five arrays marshalled from the `RsPCA` getters; downstream `ferrolearn-decomp` REQ-1/4/5 match the sklearn oracle ≤1e-6 incl. per-row `svd_flip(u_based_decision=False)` sign. (Repeated-eigenvalue/rank-deficient case downstream #1501; whiten/alt-solver #1502/#1503.) |
 //! | REQ-PCA-NCOMP-POSITIONAL (n_components positional ABI) | SHIPPED | FIXED #2035: `_transformers.py::PCA.__init__(self, n_components=2)` drops the keyword-only `*`, so `ferrolearn.PCA(2).n_components == 2` matching sklearn `__init__(self, n_components=None, *, ...)` (`_pca.py:407`). Guard `test_red_pca_n_components_positional`. |
@@ -126,6 +126,22 @@ impl RsStandardScaler {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(ndarray1_to_numpy(py, fitted.std()))
+    }
+
+    /// True population variance (ddof=0), `0.0` on a constant (zero-variance)
+    /// column — mirrors sklearn `StandardScaler.var_`, which is the raw variance
+    /// computed BEFORE `_handle_zeros_in_scale` clamps `scale_` to 1.0 there
+    /// (`sklearn/preprocessing/_data.py:1013-1023`). This is NOT `scale_**2`:
+    /// on a constant column `scale_=1.0` so `scale_**2=1.0`, whereas the true
+    /// `var_=0.0`. Marshals `FittedStandardScaler::var()` (downstream REQ-5,
+    /// #1192).
+    #[getter]
+    fn var_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.var()))
     }
 }
 
