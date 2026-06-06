@@ -12,7 +12,7 @@
 //! Behavior is oracle-verified vs the live scipy (R-CHAR-3) — see
 //! `tests/divergence_csr.rs`.
 //!
-//! **7 SHIPPED / 7 NOT-STARTED.**
+//! **8 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -25,7 +25,7 @@
 //! | REQ-CONSUMER | SHIPPED | real estimator consumers: `ferrolearn-neighbors/src/graph.rs` (`kneighbors_graph`/`radius_neighbors_graph` return CSR) + `ferrolearn-core/src/dataset.rs` (sparse `Dataset` arm); also `helpers.rs`/`csc.rs`. |
 //! | REQ-MISSING-MATMUL | NOT-STARTED | no sparse-sparse `A@B`/`.dot(B)` (`_compressed.py`). Blocker #2000. |
 //! | REQ-MISSING-TRANSPOSE | NOT-STARTED | no `.T`/`.transpose()`. Blocker #2001. |
-//! | REQ-MISSING-REDUCE | NOT-STARTED | no `.sum(axis=)`/`.diagonal()`. Blocker #2002. |
+//! | REQ-MISSING-REDUCE | SHIPPED | `sum`/`sum_axis0`/`sum_axis1`/`diagonal` mirror scipy `.sum(axis=)` (`_compressed.py:492`) + `.diagonal()` (`_compressed.py:476`). Live oracle: `A.sum()`=15, `A.sum(axis=0)`=[5,3,7], `A.sum(axis=1)`=[3,3,9], `A.diagonal()`=[1,3,5], non-square `B.diagonal()`=[1,5]. Guards `csr_sum_matches_scipy`/`csr_sum_axis0_matches_scipy`/`csr_sum_axis1_matches_scipy`/`csr_diagonal_matches_scipy`/`csr_diagonal_non_square`. |
 //! | REQ-MISSING-ELEMENTWISE | NOT-STARTED | no `.multiply(B)`/`.sub`/`.power`. Blocker #2003. |
 //! | REQ-MISSING-INDEX | NOT-STARTED | no `A[i,j]`/`getrow`/`getcol`/`eliminate_zeros`/`sort_indices`/`sum_duplicates`/`astype`/`copy`/`max`/`min`. Blocker #2004. |
 //! | REQ-API-ACCESSORS | NOT-STARTED | no `.shape`/`.data`/`.indices`/`.indptr` (behind `inner()`). Blocker #2005. |
@@ -279,6 +279,84 @@ where
         let result = &self.inner * rhs;
         Ok(result)
     }
+
+    /// Sum of all stored values.
+    ///
+    /// Mirrors scipy `csr_matrix.sum()` with `axis=None`
+    /// (`scipy/sparse/_compressed.py:492`), which reduces over both rows and
+    /// columns to a scalar. Structural zeros contribute nothing, so this is the
+    /// running total of the stored non-zero entries accumulated from
+    /// [`T::zero()`].
+    #[must_use]
+    pub fn sum(&self) -> T
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut acc = T::zero();
+        for (&val, _) in &self.inner {
+            acc = acc + val;
+        }
+        acc
+    }
+
+    /// Column sums, a length-`n_cols` vector.
+    ///
+    /// Mirrors scipy `csr_matrix.sum(axis=0)`
+    /// (`scipy/sparse/_compressed.py:492`), which returns a `(1, n_cols)`
+    /// row vector of per-column sums; here it is returned as a length-`n_cols`
+    /// [`Array1`]. For each stored entry `(row, col, val)`, `val` is added to
+    /// `out[col]`.
+    #[must_use]
+    pub fn sum_axis0(&self) -> Array1<T>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut out = Array1::<T>::zeros(self.n_cols());
+        for (&val, (_, c)) in &self.inner {
+            out[c] = out[c] + val;
+        }
+        out
+    }
+
+    /// Row sums, a length-`n_rows` vector.
+    ///
+    /// Mirrors scipy `csr_matrix.sum(axis=1)`
+    /// (`scipy/sparse/_compressed.py:492`), which returns an `(n_rows, 1)`
+    /// column vector of per-row sums; here it is returned as a length-`n_rows`
+    /// [`Array1`]. For each stored entry `(row, col, val)`, `val` is added to
+    /// `out[row]`.
+    #[must_use]
+    pub fn sum_axis1(&self) -> Array1<T>
+    where
+        T: Copy + Zero + Add<Output = T>,
+    {
+        let mut out = Array1::<T>::zeros(self.n_rows());
+        for (&val, (r, _)) in &self.inner {
+            out[r] = out[r] + val;
+        }
+        out
+    }
+
+    /// Main diagonal, a length-`min(n_rows, n_cols)` vector.
+    ///
+    /// Mirrors scipy `csr_matrix.diagonal()` with `k=0`
+    /// (`scipy/sparse/_compressed.py:476`): `out[i] == A[i, i]` for
+    /// `i in 0..min(n_rows, n_cols)`. Positions absent from the CSR structure
+    /// are structural zeros, so `out[i]` defaults to [`T::zero()`].
+    #[must_use]
+    pub fn diagonal(&self) -> Array1<T>
+    where
+        T: Copy + Zero,
+    {
+        let len = self.n_rows().min(self.n_cols());
+        let mut out = Array1::<T>::zeros(len);
+        for (i, row) in self.inner.outer_iterator().enumerate().take(len) {
+            if let Some(&val) = row.get(i) {
+                out[i] = val;
+            }
+        }
+        out
+    }
 }
 
 impl<T> CsrMatrix<T>
@@ -499,6 +577,51 @@ mod tests {
         let d: &dyn Dataset = &m;
         assert_eq!(d.n_samples(), 3);
         assert!(d.is_sparse());
+    }
+
+    // REQ-MISSING-REDUCE — live scipy 1.x oracle (R-CHAR-3). Expected values
+    // from `python3 -c "import numpy as np, scipy.sparse as sp;
+    //   A=sp.csr_matrix(np.array([[1.,0,2],[0,3,0],[4,0,5]]));
+    //   print(A.sum(), A.sum(axis=0).tolist(), A.sum(axis=1).tolist(),
+    //         A.diagonal().tolist())"`
+    //   -> 15.0 [[5.0,3.0,7.0]] [[3.0],[3.0],[9.0]] [1.0,3.0,5.0]
+    // and B=[[1,2,3],[4,5,6]] -> B.diagonal().tolist() == [1.0,5.0].
+
+    fn sample_csr_b() -> CsrMatrix<f64> {
+        // 2x3 dense matrix B = [[1,2,3],[4,5,6]] (no zeros). Built via
+        // from_dense (infallible, no unwrap) to match the test idiom.
+        let dense = array![[1.0_f64, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        CsrMatrix::from_dense(&dense.view(), 0.0)
+    }
+
+    #[test]
+    fn csr_sum_matches_scipy() {
+        let m = sample_csr();
+        assert_abs_diff_eq!(m.sum(), 15.0);
+    }
+
+    #[test]
+    fn csr_sum_axis0_matches_scipy() {
+        let m = sample_csr();
+        assert_eq!(m.sum_axis0(), array![5.0, 3.0, 7.0]);
+    }
+
+    #[test]
+    fn csr_sum_axis1_matches_scipy() {
+        let m = sample_csr();
+        assert_eq!(m.sum_axis1(), array![3.0, 3.0, 9.0]);
+    }
+
+    #[test]
+    fn csr_diagonal_matches_scipy() {
+        let m = sample_csr();
+        assert_eq!(m.diagonal(), array![1.0, 3.0, 5.0]);
+    }
+
+    #[test]
+    fn csr_diagonal_non_square() {
+        let m = sample_csr_b();
+        assert_eq!(m.diagonal(), array![1.0, 5.0]);
     }
 
     #[test]
