@@ -443,3 +443,306 @@ def test_gaussiannb_fitted_attrs_match_sklearn():
     assert abs(fr.epsilon_ - sk.epsilon_) < 1e-15
 
 
+# ===========================================================================
+# (3) KNeighborsClassifier constructor-param surface (#2138)
+#
+# sklearn signature (`neighbors/_classification.py:193`):
+#   KNeighborsClassifier(n_neighbors=5, *, weights='uniform', algorithm='auto',
+#       leaf_size=30, p=2, metric='minkowski', metric_params=None, n_jobs=None)
+# ferrolearn surfaces weights ('uniform'/'distance') + algorithm
+# ('auto'/'brute'/'kd_tree'/'ball_tree'); leaf_size/n_jobs are ABI no-ops; the
+# Euclidean-only restriction (p=2, metric in {minkowski, euclidean},
+# metric_params=None, no callable weights) is enforced (NOT-STARTED #876).
+#
+# Shared oracle dataset from the dispatch (live sklearn 1.5.2; R-CHAR-3).
+# ===========================================================================
+
+_KNN_X = np.array(
+    [
+        [0.0, 0.0],
+        [1.0, 0.0],
+        [0.0, 1.0],
+        [3.0, 3.0],
+        [4.0, 3.0],
+        [3.0, 4.0],
+        [1.0, 1.0],
+        [3.5, 3.5],
+    ]
+)
+_KNN_Y = np.array([0, 0, 0, 1, 1, 1, 0, 1])
+_KNN_XQ = np.array([[0.5, 0.5], [3.2, 3.3], [2.0, 2.0]])
+
+
+def test_knn_weights_distance_predict_proba_matches_sklearn():
+    """GREEN (#2138): weights='distance' predict_proba matches the live oracle.
+
+    sklearn `_classification.py:307` + `_get_weights`: 'distance' weights each
+    neighbor by 1/distance. On the dispatch dataset (k=3) the oracle gives
+    row 2 (query [3.2,3.3]) = [0.375, 0.625], which DIFFERS from the
+    'uniform' row 2 = [0.333..., 0.666...]. Expected values come from the live
+    sklearn fit in this test (R-CHAR-3), never copied from ferrolearn.
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    sk = SkKNN(n_neighbors=3, weights="distance").fit(_KNN_X, _KNN_Y)
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3, weights="distance").fit(
+        _KNN_X, _KNN_Y
+    )
+
+    sk_proba = sk.predict_proba(_KNN_XQ)
+    fl_proba = np.asarray(fl.predict_proba(_KNN_XQ))
+
+    np.testing.assert_allclose(fl_proba, sk_proba, atol=1e-9)
+    # Guard the documented oracle value for the third query row [2, 2], where
+    # inverse-distance weighting DIFFERS from uniform (live sklearn 1.5.2).
+    np.testing.assert_allclose(sk_proba[2], [0.375, 0.625], atol=1e-9)
+    np.testing.assert_allclose(fl_proba[2], [0.375, 0.625], atol=1e-9)
+
+
+def test_knn_weights_uniform_default_matches_sklearn():
+    """GREEN (#2138): default weights='uniform' predict_proba matches sklearn.
+
+    The 'uniform' row 2 differs from 'distance' (oracle: [0.333..., 0.666...]),
+    confirming the weighting branch actually changes the result.
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    sk = SkKNN(n_neighbors=3).fit(_KNN_X, _KNN_Y)
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3).fit(_KNN_X, _KNN_Y)
+
+    sk_proba = sk.predict_proba(_KNN_XQ)
+    fl_proba = np.asarray(fl.predict_proba(_KNN_XQ))
+
+    np.testing.assert_allclose(fl_proba, sk_proba, atol=1e-9)
+    np.testing.assert_allclose(sk_proba[2], [1 / 3, 2 / 3], atol=1e-9)
+    # uniform != distance on the third query row (proves weights is honored).
+    assert not np.allclose(sk_proba[2], [0.375, 0.625])
+
+
+def test_knn_algorithm_gives_same_result_as_sklearn():
+    """GREEN (#2138): 'brute'/'kd_tree'/'auto'/'ball_tree' all give the SAME
+    predict/predict_proba (algorithm is a search strategy only).
+
+    sklearn returns identical results across algorithms; ferrolearn must match
+    the oracle for each, and the four ferrolearn results must agree.
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    sk = SkKNN(n_neighbors=3).fit(_KNN_X, _KNN_Y)
+    sk_pred = sk.predict(_KNN_XQ)
+    sk_proba = sk.predict_proba(_KNN_XQ)
+
+    results_pred = []
+    for algo in ("auto", "brute", "kd_tree", "ball_tree"):
+        fl = ferrolearn.KNeighborsClassifier(
+            n_neighbors=3, algorithm=algo
+        ).fit(_KNN_X, _KNN_Y)
+        fl_pred = np.asarray(fl.predict(_KNN_XQ))
+        fl_proba = np.asarray(fl.predict_proba(_KNN_XQ))
+        # Each algorithm matches the sklearn oracle.
+        assert fl_pred.tolist() == sk_pred.tolist()
+        np.testing.assert_allclose(fl_proba, sk_proba, atol=1e-9)
+        results_pred.append(fl_pred.tolist())
+
+    # All four ferrolearn algorithms agree (search strategy only).
+    assert all(r == results_pred[0] for r in results_pred)
+
+
+def test_knn_get_params_clone_roundtrip():
+    """GREEN (#2138): get_params returns all 9 sklearn params with matching
+    defaults, and clone() round-trips (check_estimator prerequisite).
+    """
+    from sklearn.base import clone
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    fl = ferrolearn.KNeighborsClassifier()
+    sk = SkKNN()
+
+    fl_params = fl.get_params()
+    sk_params = sk.get_params()
+
+    # Same 9 param names as sklearn.
+    assert set(fl_params) == set(sk_params)
+    # Matching defaults for every param.
+    for name, value in sk_params.items():
+        assert fl_params[name] == value, name
+
+    # Signature: n_neighbors positional, rest keyword-only (sklearn parity).
+    fl_sig = inspect.signature(ferrolearn.KNeighborsClassifier.__init__)
+    sk_sig = inspect.signature(SkKNN.__init__)
+    for name in sk_params:
+        assert fl_sig.parameters[name].kind == sk_sig.parameters[name].kind, name
+
+    # clone() round-trips (deep copy of the unfitted estimator).
+    fl2 = ferrolearn.KNeighborsClassifier(
+        n_neighbors=3, weights="distance", algorithm="kd_tree"
+    )
+    cloned = clone(fl2)
+    assert cloned.get_params() == fl2.get_params()
+    # A cloned estimator still fits and predicts.
+    cloned.fit(_KNN_X, _KNN_Y)
+    assert np.asarray(cloned.predict(_KNN_XQ)).shape == (_KNN_XQ.shape[0],)
+
+
+def test_knn_unsupported_p_raises():
+    """GREEN (#2138): p != 2 raises NotImplementedError (Euclidean-only, #876)."""
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3, p=3)
+    with pytest.raises(NotImplementedError):
+        fl.fit(_KNN_X, _KNN_Y)
+
+
+def test_knn_unsupported_metric_raises():
+    """GREEN (#2138): a non-minkowski/euclidean metric raises (NOT-STARTED #876)."""
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3, metric="manhattan")
+    with pytest.raises(NotImplementedError):
+        fl.fit(_KNN_X, _KNN_Y)
+
+
+def test_knn_euclidean_metric_supported():
+    """GREEN (#2138): metric='euclidean' is accepted (== minkowski p=2)."""
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    sk = SkKNN(n_neighbors=3, metric="euclidean").fit(_KNN_X, _KNN_Y)
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3, metric="euclidean").fit(
+        _KNN_X, _KNN_Y
+    )
+    assert np.asarray(fl.predict(_KNN_XQ)).tolist() == sk.predict(_KNN_XQ).tolist()
+
+
+def test_knn_unsupported_callable_weights_raises():
+    """GREEN (#2138): callable weights raise NotImplementedError (#876)."""
+    fl = ferrolearn.KNeighborsClassifier(
+        n_neighbors=3, weights=lambda d: 1.0 / (d + 1e-9)
+    )
+    with pytest.raises(NotImplementedError):
+        fl.fit(_KNN_X, _KNN_Y)
+
+
+def test_knn_unsupported_metric_params_raises():
+    """GREEN (#2138): metric_params != None raises NotImplementedError (#876)."""
+    fl = ferrolearn.KNeighborsClassifier(
+        n_neighbors=3, metric_params={"w": 2.0}
+    )
+    with pytest.raises(NotImplementedError):
+        fl.fit(_KNN_X, _KNN_Y)
+
+
+def test_knn_check_estimator_green():
+    """GREEN (#2138): KNeighborsClassifier passes sklearn's check_estimator.
+
+    All 9 ctor params are plain stored attributes (get_params/set_params/clone
+    round-trip), the prerequisite for `parametrize_with_checks`.
+    """
+    from sklearn.utils.estimator_checks import check_estimator
+
+    # check_estimator raises on the first failed check; returning normally =
+    # green. The default-param estimator uses the SHIPPED uniform/minkowski(p=2)
+    # path, so no NotImplementedError is triggered.
+    check_estimator(ferrolearn.KNeighborsClassifier(n_neighbors=3))
+
+
+
+
+# ===========================================================================
+# (4) KNeighborsClassifier DIVERGENCES found by adversarial re-audit of #2138
+#     (live sklearn 1.5.2 oracle; R-CHAR-3 — no expected value copied from
+#     the ferrolearn side; every expected value is the sklearn oracle result).
+# ===========================================================================
+
+
+def test_red_knn_distance_tie_break_lowest_index_diverges():
+    """RED divergence (tracking #2139): ferrolearn's tree algorithms break a
+    k-th-boundary DISTANCE TIE by a different rule than sklearn.
+
+    sklearn selects the k nearest by `np.argpartition(dist, n_neighbors-1)`
+    then a stable `np.argsort(..., kind="mergesort")`
+    (`sklearn/neighbors/_base.py:738` and `:740-741`; cf. `:277`), so when
+    several training points sit at exactly the k-th distance, the LOWEST
+    training INDEX wins the tie.
+
+    Dataset: query [0,0] exactly coincides with idx0 (class 5). idx1 (class 1),
+    idx2 (class 0), idx3 (class 0) are all at distance 1 -> a 3-way tie for the
+    single remaining (k=2) slot. sklearn keeps idx1 (lowest index) ->
+    proba [0, 0.5, 0.5], predict 1.
+
+    ferrolearn 'auto'/'kd_tree'/'ball_tree' instead keep idx2 -> proba
+    [0.5, 0, 0.5], predict 0. (ferrolearn 'brute' happens to match sklearn,
+    which is itself a separate divergence: see test below.)
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    X = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    y = np.array([5, 1, 0, 0])
+    Xq = np.array([[0.0, 0.0]])
+
+    sk = SkKNN(n_neighbors=2, algorithm="auto").fit(X, y)
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=2, algorithm="auto").fit(X, y)
+
+    sk_pred = sk.predict(Xq)
+    sk_proba = sk.predict_proba(Xq)
+    fl_pred = np.asarray(fl.predict(Xq))
+    fl_proba = np.asarray(fl.predict_proba(Xq))
+
+    # Oracle: lowest-index tie-break keeps idx1 (class 1).
+    assert sk_pred.tolist() == [1]
+    np.testing.assert_allclose(sk_proba, [[0.0, 0.5, 0.5]], atol=1e-12)
+
+    # FAILS today: ferrolearn 'auto' keeps idx2 (class 0) -> predict 0.
+    assert fl_pred.tolist() == sk_pred.tolist()
+    np.testing.assert_allclose(fl_proba, sk_proba, atol=1e-9)
+
+
+def test_red_knn_algorithm_not_result_identical_on_ties():
+    """RED divergence (tracking #2139): the #2138 claim that all `algorithm`
+    values give the SAME predict/predict_proba is FALSE on tie-heavy data.
+
+    On the same k-th-boundary tie dataset, ferrolearn 'brute' returns a
+    DIFFERENT result than ferrolearn 'auto'/'kd_tree'/'ball_tree':
+      brute      -> predict 1, proba [0, 0.5, 0.5]   (matches sklearn here)
+      auto/trees -> predict 0, proba [0.5, 0, 0.5]
+    sklearn returns the SAME result for every algorithm string (search
+    strategy only); ferrolearn does not. This pins the internal inconsistency
+    independently of which one matches the oracle.
+    """
+    X = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [-1.0, 0.0]])
+    y = np.array([5, 1, 0, 0])
+    Xq = np.array([[0.0, 0.0]])
+
+    preds = {}
+    for algo in ("brute", "auto", "kd_tree", "ball_tree"):
+        fl = ferrolearn.KNeighborsClassifier(
+            n_neighbors=2, algorithm=algo
+        ).fit(X, y)
+        preds[algo] = np.asarray(fl.predict(Xq)).tolist()
+
+    # FAILS today: 'brute' -> [1] but 'auto'/'kd_tree'/'ball_tree' -> [0].
+    assert preds["brute"] == preds["auto"] == preds["kd_tree"] == preds["ball_tree"], (
+        f"algorithm not result-identical: {preds}"
+    )
+
+
+def test_red_knn_n_neighbors_gt_n_samples_must_raise():
+    """RED divergence (tracking #2140): n_neighbors > n_samples must raise.
+
+    sklearn raises ValueError at predict/kneighbors time
+    (`sklearn/neighbors/_base.py:828-838`):
+      "Expected n_neighbors <= n_samples_fit, but n_neighbors = 10,
+       n_samples_fit = 5, n_samples = 1".
+    ferrolearn silently returns a prediction (it clamps to the available
+    neighbors), so an over-large k goes unflagged.
+    """
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    X = np.array([[0.0, 0.0], [1.0, 0.0], [2.0, 0.0], [3.0, 0.0], [4.0, 0.0]])
+    y = np.array([0, 1, 0, 1, 0])
+    Xq = X[:1]
+
+    # Oracle: sklearn raises at predict time.
+    sk = SkKNN(n_neighbors=10).fit(X, y)
+    with pytest.raises(ValueError, match="n_neighbors"):
+        sk.predict(Xq)
+
+    # FAILS today: ferrolearn returns a prediction instead of raising.
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=10).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.predict(Xq)
