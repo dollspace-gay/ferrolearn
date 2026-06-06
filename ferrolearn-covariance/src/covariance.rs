@@ -60,7 +60,7 @@
 //! | REQ-11 | contamination interval `(0, 0.5]` | SHIPPED | `fn fit` rejects `≤0` / `>0.5` (`_elliptic_envelope.py:147` closed-right, fixed #1704); `divergence_contamination_right_endpoint` |
 //! | REQ-12 | EllipticEnvelope exact inlier/outlier labels | NOT-STARTED | RNG carve-out via MCD, R-DEFER-3 — blocker #1706 |
 //! | REQ-13 | `mahalanobis` returns SQUARED distance | SHIPPED | `FittedCovariance::mahalanobis` squares the helper output (`.mapv(\|d\| d * d)`); sklearn squared (`_empirical_covariance.py:340,353`); oracle `X=[[0,0],[2,0],[0,2],[2,2]]` → `[2,2,2,2]`; `mahalanobis_returns_squared_matches_sklearn` |
-//! | REQ-14 | `score`/log-likelihood method | NOT-STARTED | absent — blocker #1707 |
+//! | REQ-14 | `score`/log-likelihood method | SHIPPED | `FittedCovariance::score` centers by training `location_`, forms assume_centered empirical cov `(Xc^T Xc)/n`, then `helpers::log_likelihood(test_cov, precision_)` (`_empirical_covariance.py:258`); delegated by all wrappers; oracle `score_on_training_data_matches_sklearn`/`score_on_test_data_matches_sklearn` |
 //! | REQ-15 | `error_norm` method | NOT-STARTED | absent — blocker #1707 |
 //! | REQ-16 | `get_precision`/`store_precision` | NOT-STARTED | absent — blocker #1707 |
 //! | REQ-17 | clippy-clean (no `collapsible_if`) | SHIPPED | let-chains at the MCD `log_det`/`spd_inverse` sites; crate clippy `-D warnings` green |
@@ -69,6 +69,7 @@
 //!
 //! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
+use crate::helpers::log_likelihood;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
@@ -394,6 +395,49 @@ impl<F: Float + Send + Sync + 'static> FittedCovariance<F> {
         // semantics. (`_empirical_covariance.py:340,353`)
         Ok(mahalanobis_distances(x, &self.location_, &self.precision_).mapv(|d| d * d))
     }
+
+    /// Compute the Gaussian log-likelihood of `x` under the fitted model.
+    ///
+    /// Centers `x` by the *training* location, forms the empirical
+    /// covariance of the centered data treating it as already-centered
+    /// (`(x − location)ᵀ(x − location) / n`, dividing by `n`), then returns
+    /// `log_likelihood(test_cov, precision_)`. Mirrors sklearn's
+    /// `EmpiricalCovariance.score` (`_empirical_covariance.py:258`):
+    /// `test_cov = empirical_covariance(X_test - self.location_,
+    /// assume_centered=True)` then `log_likelihood(test_cov,
+    /// self.get_precision())`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of columns in `x`
+    /// does not match the dimensionality of the fitted model, or
+    /// [`FerroError::NumericalInstability`] if `n` cannot be represented in
+    /// the float type.
+    pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
+        let p = self.location_.len();
+        if x.ncols() != p {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), p],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedCovariance::score".into(),
+            });
+        }
+        let n = x.nrows();
+        let n_f = F::from(n).ok_or_else(|| FerroError::NumericalInstability {
+            message: "FittedCovariance::score: cannot convert n_samples to float".into(),
+        })?;
+        // Center by the training location, then form the (assume_centered)
+        // empirical covariance: (Xc^T Xc) / n.
+        let mut xc = x.to_owned();
+        for mut row in xc.rows_mut() {
+            for (v, &m) in row.iter_mut().zip(self.location_.iter()) {
+                *v = *v - m;
+            }
+        }
+        let mut test_cov = xc.t().dot(&xc);
+        test_cov.mapv_inplace(|v| v / n_f);
+        log_likelihood(&test_cov, &self.precision_)
+    }
 }
 
 // ============================================================================
@@ -686,6 +730,19 @@ impl<F: Float + Send + Sync + 'static> FittedLedoitWolf<F> {
     pub fn mahalanobis(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.inner.mahalanobis(x)
     }
+
+    /// Compute the Gaussian log-likelihood of `x` under the fitted model.
+    ///
+    /// Delegates to [`FittedCovariance::score`]; inherited from sklearn's
+    /// `EmpiricalCovariance.score` (`_empirical_covariance.py:258`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x` has the wrong number of
+    /// columns.
+    pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
+        self.inner.score(x)
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LedoitWolf<F> {
@@ -892,6 +949,19 @@ impl<F: Float + Send + Sync + 'static> FittedOAS<F> {
     pub fn mahalanobis(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.inner.mahalanobis(x)
     }
+
+    /// Compute the Gaussian log-likelihood of `x` under the fitted model.
+    ///
+    /// Delegates to [`FittedCovariance::score`]; inherited from sklearn's
+    /// `EmpiricalCovariance.score` (`_empirical_covariance.py:258`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x` has the wrong number of
+    /// columns.
+    pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
+        self.inner.score(x)
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OAS<F> {
@@ -1075,6 +1145,19 @@ impl<F: Float + Send + Sync + 'static> FittedMinCovDet<F> {
     /// `x` does not match the dimensionality of the fitted model.
     pub fn mahalanobis(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
         self.inner.mahalanobis(x)
+    }
+
+    /// Compute the Gaussian log-likelihood of `x` under the fitted model.
+    ///
+    /// Delegates to [`FittedCovariance::score`]; inherited from sklearn's
+    /// `EmpiricalCovariance.score` (`_empirical_covariance.py:258`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x` has the wrong number of
+    /// columns.
+    pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
+        self.inner.score(x)
     }
 }
 
@@ -1557,6 +1640,19 @@ impl<F: Float + Send + Sync + 'static> FittedEllipticEnvelope<F> {
         self.mcd.mahalanobis(x)
     }
 
+    /// Compute the Gaussian log-likelihood of `x` under the fitted model.
+    ///
+    /// Delegates to [`FittedMinCovDet::score`]; inherited from sklearn's
+    /// `EmpiricalCovariance.score` (`_empirical_covariance.py:258`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `x` has the wrong number of
+    /// columns.
+    pub fn score(&self, x: &Array2<F>) -> Result<F, FerroError> {
+        self.mcd.score(x)
+    }
+
     /// Compute the decision function: negative Mahalanobis distance
     /// shifted by the threshold.
     ///
@@ -1726,6 +1822,65 @@ mod tests {
             // off from 2.0 by ~0.586.
             assert_abs_diff_eq!(d, 2.0, epsilon = 1e-7);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn score_on_training_data_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   from sklearn.covariance import EmpiricalCovariance
+        //   import numpy as np
+        //   X = np.array([[1,2],[2,1],[3,4],[4,3],[5,5],[2,3]], float)
+        //   EmpiricalCovariance().fit(X).score(X) -> -2.9419860169581122
+        // (`EmpiricalCovariance.score`, _empirical_covariance.py:258).
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 5.0],
+            [2.0, 3.0],
+        ];
+        let fitted = est.fit(&x, &())?;
+        let s = fitted.score(&x)?;
+        assert_abs_diff_eq!(s, -2.9419860169581122, epsilon = 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn score_on_test_data_matches_sklearn() -> Result<(), FerroError> {
+        // Live sklearn 1.5.2 oracle (R-CHAR-3):
+        //   X  = [[1,2],[2,1],[3,4],[4,3],[5,5],[2,3]]
+        //   Xt = [[1,1],[2,2],[3,1]]
+        //   EmpiricalCovariance().fit(X).score(Xt) -> -3.5585273703415714
+        // score centers Xt by the TRAINING location_ (not Xt's own mean).
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![
+            [1.0, 2.0],
+            [2.0, 1.0],
+            [3.0, 4.0],
+            [4.0, 3.0],
+            [5.0, 5.0],
+            [2.0, 3.0],
+        ];
+        let xt = array![[1.0, 1.0], [2.0, 2.0], [3.0, 1.0]];
+        let fitted = est.fit(&x, &())?;
+        let s = fitted.score(&xt)?;
+        assert_abs_diff_eq!(s, -3.5585273703415714, epsilon = 1e-7);
+        Ok(())
+    }
+
+    #[test]
+    fn score_shape_mismatch_errors() -> Result<(), FerroError> {
+        let est = EmpiricalCovariance::<f64>::new();
+        let x = array![[1.0, 2.0], [3.0, 4.0]];
+        let fitted = est.fit(&x, &())?;
+        let bad = array![[1.0, 2.0, 3.0]];
+        assert!(matches!(
+            fitted.score(&bad),
+            Err(FerroError::ShapeMismatch { .. })
+        ));
         Ok(())
     }
 
