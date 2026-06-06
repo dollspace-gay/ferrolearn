@@ -49,7 +49,11 @@
 //! `predict` against the library `FittedMultinomialNB` and is surfaced as
 //! `ferrolearn.MultinomialNB` (`_extras.py`, `class MultinomialNB`); plus the
 //! in-crate `impl PipelineEstimator for MultinomialNB` (`fit_pipeline` /
-//! `predict_pipeline`). Green verification = the in-tree `multinomial` lib tests
+//! `predict_pipeline`). The pipeline adapter preserves the ORIGINAL labels:
+//! `fit_pipeline` sets `classes_ = np.unique(y)` (sorted unique original float
+//! labels, via `label_binarize`) and `predict_pipeline` returns those original
+//! labels (`classes_[argmax(jll)]`, `naive_bayes.py:103`), not `0..n_classes`
+//! indices. Green verification = the in-tree `multinomial` lib tests
 //! plus the live-sklearn pins (`ferrolearn-bayes/tests/divergence_multinomial.rs`):
 //! `divergence_multinomial_negative_alpha_rejected` (#904, now PASSING after the
 //! `alpha < 0` reject landed), then the green guards
@@ -597,23 +601,46 @@ impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> PipelineEst
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
-        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
-        let fitted = self.fit(x, &y_usize)?;
-        Ok(Box::new(FittedMultinomialNBPipeline(fitted)))
+        // sklearn `MultinomialNB.fit` sets `classes_ = np.unique(y)` — the sorted
+        // unique ORIGINAL labels (via `label_binarize`); `predict` returns
+        // `self.classes_[np.argmax(jll, axis=1)]` — the original labels, NOT
+        // class indices (`naive_bayes.py:103`). Preserve the original float
+        // labels here instead of collapsing them to usize indices.
+        let mut classes_orig: Vec<F> = y.to_vec();
+        classes_orig.sort_by(|a, b| a.partial_cmp(b).unwrap_or(core::cmp::Ordering::Equal));
+        classes_orig.dedup();
+        // Map each label to its index into `classes_orig` (0..n_classes).
+        let y_idx: Array1<usize> =
+            y.mapv(|v| classes_orig.iter().position(|&c| c == v).unwrap_or(0));
+        let fitted = self.fit(x, &y_idx)?;
+        Ok(Box::new(FittedMultinomialNBPipeline {
+            fitted,
+            classes_orig,
+        }))
     }
 }
 
-struct FittedMultinomialNBPipeline<F: Float + Send + Sync + 'static>(FittedMultinomialNB<F>);
+struct FittedMultinomialNBPipeline<F: Float + Send + Sync + 'static> {
+    fitted: FittedMultinomialNB<F>,
+    classes_orig: Vec<F>,
+}
 
+// SAFETY: `FittedMultinomialNB<F>` and `Vec<F>` are both Send when `F: Send`;
+// this mirrors the existing inner-type bound and adds no interior mutability.
 unsafe impl<F: Float + Send + Sync + 'static> Send for FittedMultinomialNBPipeline<F> {}
+// SAFETY: `FittedMultinomialNB<F>` and `Vec<F>` are both Sync when `F: Sync`; no
+// shared interior mutability is introduced.
 unsafe impl<F: Float + Send + Sync + 'static> Sync for FittedMultinomialNBPipeline<F> {}
 
 impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipelineEstimator<F>
     for FittedMultinomialNBPipeline<F>
 {
     fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
-        let preds = self.0.predict(x)?;
-        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or_else(F::nan)))
+        // `self.fitted.predict` returns the class indices (`0..n_classes`) the
+        // model was trained on; map each back to the original label, mirroring
+        // sklearn `classes_[argmax(jll)]` (`naive_bayes.py:103`).
+        let preds = self.fitted.predict(x)?;
+        Ok(preds.mapv(|i| self.classes_orig.get(i).copied().unwrap_or_else(F::nan)))
     }
 }
 
@@ -863,6 +890,24 @@ mod tests {
         for (i, &e) in expected_cc.iter().enumerate() {
             assert_relative_eq!(cc[i], e, epsilon = 1e-9);
         }
+        Ok(())
+    }
+
+    // The `PipelineEstimator` adapter must preserve the ORIGINAL float labels:
+    // sklearn `MultinomialNB.fit` sets `classes_ = np.unique(y)` and `predict`
+    // returns `classes_[argmax(jll)]` — the original labels, NOT class indices
+    // (`naive_bayes.py:103`). Live sklearn 1.5.2 oracle (run from /tmp):
+    //   X=[[3,0],[4,0],[0,3],[0,4]], y=[-1,-1,1,1], q=[[5,0],[0,5]]
+    //   MultinomialNB().fit(X,y).classes_  -> [-1, 1]
+    //   MultinomialNB().fit(X,y).predict(q) -> [-1, 1]   (NOT [0, 1])
+    #[test]
+    fn multinomial_pipeline_preserves_original_float_labels() -> Result<(), FerroError> {
+        let x = array![[3.0, 0.0], [4.0, 0.0], [0.0, 3.0], [0.0, 4.0]];
+        let y = array![-1.0, -1.0, 1.0, 1.0];
+        let f = MultinomialNB::<f64>::new().fit_pipeline(&x, &y)?;
+        let p = f.predict_pipeline(&array![[5.0, 0.0], [0.0, 5.0]])?;
+        // Original labels [-1.0, 1.0], not the collapsed indices [0.0, 1.0].
+        assert_eq!(p, array![-1.0, 1.0]);
         Ok(())
     }
 }
