@@ -180,6 +180,60 @@ fn csr_add_other_matches_scipy() {
     assert_dense_eq(&sum.to_dense(), &expected);
 }
 
+/// REQ-MISSING-ELEMENTWISE. `multiply(&B)` matches scipy `A.multiply(B)`
+/// (element-wise Hadamard product, INTERSECTION sparsity).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `A.multiply(B).toarray() == [[1,0,0],[0,3,0],[0,0,5]]`.
+#[test]
+fn csr_multiply_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b();
+    let prod = a.multiply(&b).unwrap();
+    let expected = [[1.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 5.0]];
+    assert_dense_eq(&prod.to_dense(), &expected);
+}
+
+/// REQ-MISSING-ELEMENTWISE. `sub(&B)` matches scipy `A - B` (element-wise,
+/// UNION sparsity).
+///
+/// Oracle: B = [[1,1,0],[0,1,1],[0,0,1]];
+/// `(A-B).toarray() == [[0,-1,2],[0,2,-1],[4,0,4]]`.
+#[test]
+fn csr_sub_matches_scipy() {
+    let a = sample_a();
+    let b = sample_b();
+    let diff = a.sub(&b).unwrap();
+    let expected = [[0.0, -1.0, 2.0], [0.0, 2.0, -1.0], [4.0, 0.0, 4.0]];
+    assert_dense_eq(&diff.to_dense(), &expected);
+}
+
+/// REQ-MISSING-ELEMENTWISE / REQ-ERR. `multiply` with an incompatible shape
+/// returns `Err`, where scipy raises `ValueError: inconsistent shapes`.
+#[test]
+fn csr_multiply_shape_mismatch_is_err() {
+    let a = sample_a();
+    // empty 2x3 matrix (shape (2,3) vs A's (3,3))
+    let c = CsrMatrix::<f64>::new(2, 3, vec![0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.multiply(&c).is_err(),
+        "shape-mismatched multiply must return Err (scipy raises ValueError)"
+    );
+}
+
+/// REQ-MISSING-ELEMENTWISE / REQ-ERR. `sub` with an incompatible shape returns
+/// `Err`, where scipy raises `ValueError: inconsistent shapes`.
+#[test]
+fn csr_sub_shape_mismatch_is_err() {
+    let a = sample_a();
+    // empty 2x3 matrix (shape (2,3) vs A's (3,3))
+    let c = CsrMatrix::<f64>::new(2, 3, vec![0, 0, 0], vec![], vec![]).unwrap();
+    assert!(
+        a.sub(&c).is_err(),
+        "shape-mismatched sub must return Err (scipy raises ValueError)"
+    );
+}
+
 /// REQ-SCALAR-MUL. `mul_scalar(2.0)` (new) and `scale(2.0)` (in place) match
 /// scipy `A * 2`.
 ///
