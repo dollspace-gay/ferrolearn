@@ -330,3 +330,37 @@ fn green_extrapolation() {
         "not-a-knot extrap: {got_nak:?} vs {SCIPY_NAK:?}"
     );
 }
+
+/// REQ-DEFAULT-BC: scipy's `CubicSpline.__init__` defaults `bc_type='not-a-knot'`
+/// (`scipy/interpolate/_cubic.py:790`,
+/// `def __init__(self, x, y, axis=0, bc_type='not-a-knot', extrapolate=None)`),
+/// so `CubicSpline(x, y)` builds a not-a-knot spline. ferrolearn mirrors this with
+/// `BoundaryCondition::default() == NotAKnot`, so
+/// `CubicSpline::new(&x, &y, BoundaryCondition::default())` reproduces scipy's
+/// `CubicSpline(x, y)`.
+///
+/// Live oracle (`cd /tmp && python3 -c "import numpy as np; from
+/// scipy.interpolate import CubicSpline; x=np.array([0.,1,2,3,4]);
+/// y=np.array([0.,1,8,27,64]); print(CubicSpline(x,y)([0.5,1.5,2.5,3.5]).tolist())"`):
+/// default (== not-a-knot) → `[0.125, 3.375, 15.625, 42.875]`; the `'natural'` bc
+/// gives the distinct `[0.0982142857, 3.4553571429, 15.3303571429, 43.9732142857]`,
+/// confirming the default selects not-a-knot (not natural).
+#[test]
+fn cubic_spline_default_bc_is_not_a_knot_matches_scipy() -> Result<(), FerroError> {
+    // The default boundary condition is not-a-knot, matching scipy's `bc_type`.
+    assert_eq!(BoundaryCondition::default(), BoundaryCondition::NotAKnot);
+
+    const SCIPY_DEFAULT: [f64; 4] = [0.125, 3.375, 15.625, 42.875];
+
+    let x = [0.0, 1.0, 2.0, 3.0, 4.0];
+    let y = [0.0, 1.0, 8.0, 27.0, 64.0];
+
+    let cs = CubicSpline::new(&x, &y, BoundaryCondition::default())?;
+    let got = [cs.eval(0.5), cs.eval(1.5), cs.eval(2.5), cs.eval(3.5)];
+    assert!(
+        all_close(&got, &SCIPY_DEFAULT, 1e-9),
+        "default-bc eval: {got:?} vs scipy {SCIPY_DEFAULT:?}"
+    );
+
+    Ok(())
+}

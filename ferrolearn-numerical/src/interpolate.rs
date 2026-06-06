@@ -18,7 +18,7 @@
 //! concrete blocker). Values are oracle-verified element-wise vs the live scipy
 //! (R-CHAR-3) — see `tests/divergence_interpolate.rs`.
 //!
-//! **9 SHIPPED / 5 NOT-STARTED.**
+//! **10 SHIPPED / 4 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -26,7 +26,7 @@
 //! | REQ-NAK-EVAL / REQ-NAK-DERIV / REQ-NAK-INTEG (not-a-knot, n≥4) | SHIPPED | match scipy default `bc_type='not-a-knot'` (oracle reproduces x³ exactly; eval `[0.25,2.25,6.25,12.25]`, d1@1.5=3.0, integ=21.3333). Guards `green_not_a_knot_*`. |
 //! | REQ-EXTRAP (extrapolation) | SHIPPED | `find_interval` clamps to the first/last cubic, matching scipy `extrapolate=True` default (oracle natural `[-0.339, 19.661]`, ≤1e-13). Guard `green_extrapolation`. |
 //! | REQ-FEWPOINT (3-point not-a-knot) | SHIPPED | FIXED #1957: `solve_not_a_knot` special-cases `n==2` (1 interior knot) — the two not-a-knot conditions are degenerate, so the spline is the unique PARABOLA through the 3 points (`c` = constant second divided difference), matching scipy `_cubic.py:824` (`CubicSpline([0,1,2],[0,1,4],not-a-knot)([0.5,1.5])=[0.25,2.25]`; was `[0.125,2.375]`). Pinned by `divergence_three_point_not_a_knot_parabola`. |
-//! | REQ-DEFAULT-BC (default bc_type) | NOT-STARTED | `new` requires an explicit `BoundaryCondition`; scipy defaults `bc_type='not-a-knot'`. Blocker #1958. |
+//! | REQ-DEFAULT-BC (default bc_type) | SHIPPED | FIXED #1958: `impl Default for BoundaryCondition` returns `Self::NotAKnot`, mirroring scipy `CubicSpline(bc_type='not-a-knot')` (`scipy/interpolate/_cubic.py:790` `def __init__(self, x, y, axis=0, bc_type='not-a-knot', extrapolate=None)`). So `CubicSpline::new(&x, &y, BoundaryCondition::default())` reproduces scipy's `CubicSpline(x, y)`. Live oracle `CubicSpline([0,1,2,3,4],[0,1,8,27,64])([0.5,1.5,2.5,3.5]) = [0.125, 3.375, 15.625, 42.875]` (default not-a-knot; `'natural'` differs). Pinned by `cubic_spline_default_bc_is_not_a_knot_matches_scipy`. |
 //! | REQ-MISSING-BC (clamped/periodic/custom) | NOT-STARTED | only Natural + NotAKnot; scipy also `'clamped'`/`'periodic'`/custom `((order,value),…)`. Blocker #1959. |
 //! | REQ-PPOLY-API (PPoly methods/attrs) | NOT-STARTED | no general-`nu` call, spline-returning `derivative()`/`antiderivative()`, `roots()`/`solve()`, `.c`/`.x`, `extrapolate=False`. Blocker #1960. |
 //! | REQ-ERR-TYPE (error type) | SHIPPED | FIXED #1961: `pub fn new in interpolate.rs` now returns `Result<Self, FerroError>` — all three input-validation sites return `FerroError::InvalidParameter { name: "x", reason }` (length mismatch / `< 2` points / non-increasing `x`), the ferrolearn analog of scipy's `prepare_input` `ValueError` (`scipy/interpolate/_cubic.py:50` `"`x` must contain at least 2 elements."`, line 51-53 length mismatch, line 65 `"`x` must be strictly increasing sequence."`). Pinned by `cubic_spline_new_invalid_returns_ferroerror` in `tests/divergence_interpolate.rs`. |
@@ -56,6 +56,18 @@ pub enum BoundaryCondition {
     Natural,
     /// Not-a-knot: third derivative continuous at x_1 and x_{n-1}.
     NotAKnot,
+}
+
+impl Default for BoundaryCondition {
+    /// Mirrors scipy `CubicSpline(bc_type='not-a-knot')` — the default boundary
+    /// condition (`scipy/interpolate/_cubic.py:790`,
+    /// `def __init__(self, x, y, axis=0, bc_type='not-a-knot', extrapolate=None)`).
+    ///
+    /// So `CubicSpline::new(&x, &y, BoundaryCondition::default())` reproduces
+    /// scipy's `CubicSpline(x, y)`.
+    fn default() -> Self {
+        Self::NotAKnot
+    }
 }
 
 /// A cubic spline interpolant.
