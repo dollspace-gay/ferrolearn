@@ -45,7 +45,7 @@
 //! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
 //! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
 //! | REQ-13 (missing kernels) | NOT-STARTED | no `RationalQuadratic` (`:1798`), `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). Blocker #1917. |
-//! | REQ-14 (constructor defaults / `Default`) | NOT-STARTED | `new()` requires explicit args; no `Default` matching sklearn's keyword defaults (constant_value=1, sigma_0=1, length_scale=1, nu=1.5, noise_level=1). Blocker #1918. |
+//! | REQ-14 (constructor defaults / `Default`) | SHIPPED | `Default` impls call `new()` with sklearn's keyword defaults: RBF `length_scale=1.0` (`kernels.py:1508`), Matern `length_scale=1.0, nu=1.5` (`:1678`), Constant `constant_value=1.0` (`:1233`), White `noise_level=1.0` (`:1363`), DotProduct `sigma_0=1.0` (`:2156`); guarded by `gp_kernel_defaults_match_sklearn`. Blocker #1918. |
 //! | REQ-15 (ferray substrate) | NOT-STARTED | `ndarray` arrays vs `ferray-core` (R-SUBSTRATE-1). Blocker #1919. |
 
 use ndarray::{Array1, Array2};
@@ -149,6 +149,13 @@ impl<F: Float> RBFKernel<F> {
     }
 }
 
+impl<F: Float> Default for RBFKernel<F> {
+    /// Mirrors sklearn `RBF(length_scale=1.0)` (`kernels.py:1508`).
+    fn default() -> Self {
+        Self::new(F::one())
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> GPKernel<F> for RBFKernel<F> {
     fn compute(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array2<F> {
         let two = F::from(2.0).unwrap();
@@ -211,6 +218,13 @@ impl<F: Float> MaternKernel<F> {
     #[must_use]
     pub fn new(length_scale: F, nu: F) -> Self {
         Self { length_scale, nu }
+    }
+}
+
+impl<F: Float> Default for MaternKernel<F> {
+    /// Mirrors sklearn `Matern(length_scale=1.0, nu=1.5)` (`kernels.py:1678`).
+    fn default() -> Self {
+        Self::new(F::one(), F::from(1.5).unwrap_or_else(F::one))
     }
 }
 
@@ -294,6 +308,13 @@ impl<F: Float> ConstantKernel<F> {
     }
 }
 
+impl<F: Float> Default for ConstantKernel<F> {
+    /// Mirrors sklearn `ConstantKernel(constant_value=1.0)` (`kernels.py:1233`).
+    fn default() -> Self {
+        Self::new(F::one())
+    }
+}
+
 impl<F: Float + Send + Sync + 'static> GPKernel<F> for ConstantKernel<F> {
     fn compute(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array2<F> {
         Array2::from_elem((x1.nrows(), x2.nrows()), self.constant_value)
@@ -343,6 +364,13 @@ impl<F: Float> WhiteKernel<F> {
     #[must_use]
     pub fn new(noise_level: F) -> Self {
         Self { noise_level }
+    }
+}
+
+impl<F: Float> Default for WhiteKernel<F> {
+    /// Mirrors sklearn `WhiteKernel(noise_level=1.0)` (`kernels.py:1363`).
+    fn default() -> Self {
+        Self::new(F::one())
     }
 }
 
@@ -412,6 +440,13 @@ impl<F: Float> DotProductKernel<F> {
     #[must_use]
     pub fn new(sigma_0: F) -> Self {
         Self { sigma_0 }
+    }
+}
+
+impl<F: Float> Default for DotProductKernel<F> {
+    /// Mirrors sklearn `DotProduct(sigma_0=1.0)` (`kernels.py:2156`).
+    fn default() -> Self {
+        Self::new(F::one())
     }
 }
 
@@ -930,6 +965,24 @@ mod tests {
                 assert_abs_diff_eq!(km1[[i, j]], km2[[i, j]], epsilon = 1e-12);
             }
         }
+    }
+
+    // --- Constructor defaults (REQ-14) ---
+
+    #[test]
+    fn gp_kernel_defaults_match_sklearn() {
+        // Symbolic sklearn 1.5.2 keyword defaults (R-CHAR-3):
+        // RBF(length_scale=1.0) kernels.py:1508
+        assert_eq!(RBFKernel::<f64>::default().length_scale, 1.0);
+        // Matern(length_scale=1.0, nu=1.5) kernels.py:1678
+        assert_eq!(MaternKernel::<f64>::default().length_scale, 1.0);
+        assert_eq!(MaternKernel::<f64>::default().nu, 1.5);
+        // ConstantKernel(constant_value=1.0) kernels.py:1233
+        assert_eq!(ConstantKernel::<f64>::default().constant_value, 1.0);
+        // DotProduct(sigma_0=1.0) kernels.py:2156
+        assert_eq!(DotProductKernel::<f64>::default().sigma_0, 1.0);
+        // WhiteKernel(noise_level=1.0) kernels.py:1363
+        assert_eq!(WhiteKernel::<f64>::default().noise_level, 1.0);
     }
 
     // --- f32 support ---
