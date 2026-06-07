@@ -645,3 +645,272 @@ fn green_xi_default_unchanged_three_blobs() {
         "default Xi labels_ must be unchanged by the dbscan dispatch; #1084"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REQ-11 — parameter-validation accept/reject BOUNDARIES match sklearn's
+// `OPTICS._parameter_constraints` (`sklearn/cluster/_optics.py:242-264`).
+//
+// Only the accept/reject BOUNDARY is matched; the error TYPE stays the
+// grandfathered crate `FerroError` ABI (NOT sklearn's `InvalidParameterError`).
+// Each oracle is cited via a `python3 -c` command (run from /tmp), recorded from
+// the LIVE installed sklearn 1.5.2 oracle, NEVER copied from ferrolearn (R-CHAR-3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// REQ-11. `min_samples` int must be `>= 2`
+/// (`"min_samples": [Interval(Integral, 2, None, closed="left"), ...]`,
+/// `sklearn/cluster/_optics.py:243-246`). `min_samples ∈ {0, 1}` is REJECTED.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp): both raise InvalidParameterError
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=1).fit(X)"
+///   -> InvalidParameterError: The 'min_samples' parameter of OPTICS must be an
+///      int in the range [2, inf) or a float ...
+///   python3 -c "... OPTICS(min_samples=0).fit(X)"
+///   -> InvalidParameterError (same: range [2, inf))
+#[test]
+fn green_min_samples_below_2_rejected() {
+    // ferrolearn rejects both 0 and 1 (sklearn raises InvalidParameterError);
+    // the BOUNDARY matches, the error TYPE is the grandfathered FerroError.
+    let r0 = OPTICS::<f64>::new(0).fit(&three_blobs(), &());
+    let r1 = OPTICS::<f64>::new(1).fit(&three_blobs(), &());
+    assert!(r0.is_err(), "min_samples=0 must be rejected like sklearn");
+    assert!(r1.is_err(), "min_samples=1 must be rejected like sklearn");
+}
+
+/// REQ-11. `min_samples == 2` is ACCEPTED (the left-closed interval lower bound).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp): fits without error
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2).fit(X).ordering_.tolist())"
+///   -> [0, 1, 2, 3, 4, 5, 8, 6, 7]   (no error)
+#[test]
+fn green_min_samples_2_accepted() {
+    let r = OPTICS::<f64>::new(2).fit(&three_blobs(), &());
+    assert!(r.is_ok(), "min_samples=2 must be accepted like sklearn");
+}
+
+/// REQ-11. `max_eps == 0` is ACCEPTED (`"max_eps": [Interval(Real, 0, None,
+/// closed="both")]`, `sklearn/cluster/_optics.py:247` — closed at 0). The fit
+/// RUNS and produces the degenerate result: every `core_distances_` and
+/// `reachability_` is `inf`, `ordering_` is by index, `labels_` are all `-1`.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np, warnings; from sklearn.cluster import OPTICS; \
+///     warnings.simplefilter('ignore'); \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     m=OPTICS(min_samples=2, max_eps=0).fit(X); \
+///     print(m.core_distances_.tolist()); print(m.reachability_.tolist()); \
+///     print(m.ordering_.tolist()); print(m.labels_.tolist())"
+///   -> core_distances_: [inf, inf, inf, inf, inf, inf, inf, inf, inf]
+///      reachability_:   [inf, inf, inf, inf, inf, inf, inf, inf, inf]
+///      ordering_:       [0, 1, 2, 3, 4, 5, 6, 7, 8]
+///      labels_:         [-1, -1, -1, -1, -1, -1, -1, -1, -1]
+#[test]
+fn green_max_eps_zero_degenerate_matches_oracle() {
+    // LIVE sklearn 1.5.2 oracle (above), never copied from ferrolearn.
+    let sk_ordering: [usize; 9] = [0, 1, 2, 3, 4, 5, 6, 7, 8];
+    let sk_labels: [isize; 9] = [-1; 9];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_max_eps(0.0)
+        .fit(&three_blobs(), &())
+        .expect("max_eps=0 must be accepted (sklearn closed at 0)");
+    let core = fitted.core_distances();
+    let reach = fitted.reachability();
+    for i in 0..9 {
+        assert!(
+            core[i].is_infinite(),
+            "core_distances_[{i}]: ferro={} sklearn=inf",
+            core[i]
+        );
+        assert!(
+            reach[i].is_infinite(),
+            "reachability_[{i}]: ferro={} sklearn=inf",
+            reach[i]
+        );
+    }
+    assert_eq!(
+        fitted.ordering(),
+        &sk_ordering[..],
+        "max_eps=0 ordering_ must be by index, matching sklearn"
+    );
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "max_eps=0 labels_ must be all -1, matching sklearn"
+    );
+}
+
+/// REQ-11. A normal finite `max_eps == 0.5` still works as before (the boundary
+/// change only opened up `max_eps == 0`; positive values are unaffected).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2, max_eps=0.5).fit(X).core_distances_.tolist())"
+///   -> [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+#[test]
+fn green_max_eps_half_unchanged() {
+    let fitted = OPTICS::<f64>::new(2)
+        .with_max_eps(0.5)
+        .fit(&three_blobs(), &())
+        .expect("max_eps=0.5 must be accepted");
+    let core = fitted.core_distances();
+    for i in 0..9 {
+        assert!(
+            (core[i] - 0.1).abs() <= TOL,
+            "core_distances_[{i}]: ferro={} sklearn=0.1",
+            core[i]
+        );
+    }
+}
+
+/// REQ-11. `max_eps < 0` is REJECTED. sklearn's `Interval(Real, 0, None,
+/// closed="both")` (`sklearn/cluster/_optics.py:247`) excludes negatives.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=2, max_eps=-1.0).fit(X)"
+///   -> InvalidParameterError: The 'max_eps' parameter of OPTICS must be a float
+///      in the range [0, inf). Got -1.0 instead.
+#[test]
+fn green_max_eps_negative_rejected() {
+    let r = OPTICS::<f64>::new(2)
+        .with_max_eps(-1.0)
+        .fit(&three_blobs(), &());
+    assert!(r.is_err(), "max_eps<0 must be rejected like sklearn");
+}
+
+/// REQ-11. `xi == 0` is ACCEPTED (`"xi": [Interval(Real, 0, 1, closed="both")]`,
+/// `sklearn/cluster/_optics.py:253` — closed at 0). (Matching the Xi `labels_`
+/// VALUE for `xi=0` is REQ-5, NOT-STARTED; only the param is ACCEPTED here.)
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp): fits without error
+///   python3 -c "import numpy as np, warnings; from sklearn.cluster import OPTICS; \
+///     warnings.simplefilter('ignore'); \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2, xi=0.0).fit(X).labels_.tolist())"
+///   -> [0, 0, 0, 1, 1, 1, 2, 2, 2]   (no error — accepted)
+#[test]
+fn green_xi_zero_accepted() {
+    let r = OPTICS::<f64>::new(2).with_xi(0.0).fit(&three_blobs(), &());
+    assert!(r.is_ok(), "xi=0 must be accepted like sklearn");
+}
+
+/// REQ-11. `xi == 1` is ACCEPTED by sklearn's PARAMETER VALIDATION
+/// (`Interval(Real, 0, 1, closed="both")`, `sklearn/cluster/_optics.py:253` —
+/// closed at 1). sklearn's `_xi_cluster` then raises a runtime
+/// `ZeroDivisionError` (because `1 - xi == 0`), but that is downstream of the
+/// accept/reject BOUNDARY this REQ governs. ferrolearn's Xi extraction computes
+/// the same ratios in Rust float arithmetic (`1.0/0.0 == inf`, `inf/inf == NaN`,
+/// all-false comparisons), so it does NOT panic (R-CODE-2) and returns labels.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp): parameter validation ACCEPTS
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=2, xi=1.0).fit(X)"
+///   -> ZeroDivisionError: float division by zero  (NOT InvalidParameterError —
+///      the parameter passed _parameter_constraints; the error is a runtime
+///      1-xi==0 divide inside _xi_cluster, not a validation rejection)
+#[test]
+fn green_xi_one_accepted_no_panic() {
+    // The BOUNDARY (parameter validation) ACCEPTS xi=1.0; ferrolearn must not
+    // reject it at validation and must not panic.
+    let r = OPTICS::<f64>::new(2).with_xi(1.0).fit(&three_blobs(), &());
+    assert!(
+        r.is_ok(),
+        "xi=1 must pass parameter validation (sklearn closed at 1) and not panic"
+    );
+}
+
+/// REQ-11. `xi < 0` is REJECTED.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=2, xi=-0.1).fit(X)"
+///   -> InvalidParameterError: The 'xi' parameter of OPTICS must be a float in
+///      the range [0.0, 1.0]. Got -0.1 instead.
+#[test]
+fn green_xi_negative_rejected() {
+    let r = OPTICS::<f64>::new(2).with_xi(-0.1).fit(&three_blobs(), &());
+    assert!(r.is_err(), "xi<0 must be rejected like sklearn");
+}
+
+/// REQ-11. `xi > 1` is REJECTED.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=2, xi=1.1).fit(X)"
+///   -> InvalidParameterError: The 'xi' parameter of OPTICS must be a float in
+///      the range [0.0, 1.0]. Got 1.1 instead.
+#[test]
+fn green_xi_above_one_rejected() {
+    let r = OPTICS::<f64>::new(2).with_xi(1.1).fit(&three_blobs(), &());
+    assert!(r.is_err(), "xi>1 must be rejected like sklearn");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REQ-11 UPPER-BOUND GAP (critic pin) — min_samples > n_samples.
+//
+// The shipped REQ-11 validation matched sklearn's LOWER bound for `min_samples`
+// (`< 2` rejected, `== 2` accepted) but MISSED the UPPER bound. sklearn's
+// `compute_optics_graph` calls `_validate_size(min_samples, n_samples,
+// "min_samples")` (`sklearn/cluster/_optics.py:597`), which raises
+//     ValueError("%s must be no greater than the number of samples (%d). Got %d")
+// (`sklearn/cluster/_optics.py:393-400`) whenever `min_samples > n_samples`.
+//
+// ferrolearn's `Fit::fit` has NO upper-bound check: `core_distance` (optics.rs
+// :396-411) merely returns `F::infinity()` when fewer than `min_samples-1`
+// other points exist, so `fit` SUCCEEDS (Ok) returning an all-`inf`
+// core_distances_/reachability_ and all-`-1` labels_ — exactly where sklearn
+// ERRORS. This is an observable contract divergence (sklearn raises, ferrolearn
+// returns Ok).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Divergence: `ferrolearn_cluster::OPTICS::<f64>::fit` accepts `min_samples`
+/// strictly greater than `n_samples` and returns `Ok`, whereas sklearn 1.5.2
+/// RAISES `ValueError` via `_validate_size` (`sklearn/cluster/_optics.py:597`
+/// calls `_validate_size` defined at `:393-400`:
+/// `if size > n_samples: raise ValueError(...)`).
+///
+/// Input: `n_samples = 5`, `min_samples = 6` (6 > 5).
+///
+/// LIVE ORACLE (sklearn 1.5.2):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.]]); \
+///     OPTICS(min_samples=6).fit(X)"
+///   -> ValueError: min_samples must be no greater than the number of samples
+///      (5). Got 6
+///
+/// sklearn: fit RAISES (ValueError).
+/// ferrolearn: fit returns Ok (core_distances_/reachability_ all inf, labels_
+///   all -1) — no error.
+///
+/// Tracking: #2197
+#[test]
+#[ignore = "divergence: OPTICS::fit accepts min_samples > n_samples (sklearn _validate_size raises); tracking #2197"]
+fn divergence_min_samples_above_n_samples_rejected() {
+    // n_samples = 5 fixture (subset of three_blobs).
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![0.0, 0.0, 0.1, 0.0, 0.0, 0.1, 5.0, 5.0, 5.1, 5.0],
+    )
+    .unwrap();
+
+    // sklearn (oracle above) RAISES ValueError for min_samples=6 > n_samples=5.
+    // The OBSERVABLE contract is "fit errors"; the error TYPE is the
+    // grandfathered FerroError (not sklearn's exception class). Assert ferrolearn
+    // ALSO errors. It currently returns Ok, so this assertion FAILS — pinning the
+    // missing upper-bound (`_validate_size`) check.
+    let r = OPTICS::<f64>::new(6).fit(&x, &());
+    assert!(
+        r.is_err(),
+        "min_samples=6 with n_samples=5 must be rejected like sklearn \
+         (_validate_size, sklearn/cluster/_optics.py:597 -> :393-400 raises \
+         ValueError); ferrolearn returned Ok"
+    );
+}
