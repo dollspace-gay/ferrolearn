@@ -36,6 +36,7 @@ from ferrolearn._extras import (
     HistGradientBoostingRegressor,
     HuberRegressor,
     IncrementalPCA,
+    IsolationForest,
     KernelPCA,
     KernelRidge,
     KNeighborsRegressor,
@@ -104,6 +105,7 @@ __all__ = [
     "HistGradientBoostingClassifier",
     "HistGradientBoostingRegressor",
     "BaggingClassifier",
+    "IsolationForest",
     # Neighbors extras
     "KNeighborsRegressor",
     "NearestCentroid",

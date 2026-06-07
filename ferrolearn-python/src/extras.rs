@@ -37,6 +37,7 @@
 //! | REQ-DECOMP-NCOMPONENTS-DEFAULT (n_components default) | NOT-STARTED | the 5-6 decomp transformers hardcode `n_components=2` vs sklearn `None` (`IncrementalPCA`/`FastICA`/`KernelPCA`/`SparsePCA`/`FactorAnalysis`) / `'warn'`→None (`NMF`); the `None`-auto-rank behavior is owned downstream by `ferrolearn_decomp`. (`TruncatedSVD` default 2 MATCHES.) |
 //! | REQ-DISCRETE-NB-FITTED-ATTRS (feature_log_prob_/class_log_prior_/feature_count_/class_count_) | SHIPPED | FIXED #2103: `MultinomialNB`/`BernoulliNB`/`ComplementNB` expose the four `_BaseDiscreteNB` fitted attrs (sklearn/naive_bayes.py:880-892/580-602/1032-1042). A SECOND `#[pymethods] impl Rs{Multinomial,Bernoulli,Complement}NB` block (pyo3 `multiple-pymethods`) adds four `#[getter]`s each over the Rust fitted types (`FittedMultinomialNB` multinomial.rs:489/499/509/520, `FittedBernoulliNB` bernoulli.rs:520/530/540/551, `FittedComplementNB` complement.rs:535/586/545/556); `py_classifier!` macro + its 18 invocations UNCHANGED. ComplementNB `feature_log_prob_` is the `-logged` complement weight (positive) per sklearn. Non-test consumer: `_extras.py::_DiscreteNBWrapper.fit` sets `self.{feature_log_prob_,class_log_prior_,feature_count_,class_count_}` from `self._rs.*` (the three NB wrappers subclass it). Verification (model B): `tests/divergence_extras.py::test_{multinomial,bernoulli,complement}_discrete_nb_fitted_attrs_match_sklearn` (live sklearn 1.5.2 oracle, atol 1e-7). |
 //! | REQ-BERNOULLI-BINARIZE-NONE (`binarize=None` skips binarization) | SHIPPED | FIXED #2104: `_RsBernoulliNB` now types `binarize: Option<f64> = Some(0.0)` (was `f64 = 0.0`) and builds via `BernoulliNB::with_binarize_option(binarize)` (bernoulli.rs), so pyo3 maps Python `None`→`Option::None` (skips binarization, sklearn/naive_bayes.py:1076,1156,1179,1185) and a float→`Some(f64)`. `feature_count_` then accumulates raw X. Non-test consumer: `_extras.py::BernoulliNB.__init__(binarize=0.0)` passes `self.binarize` straight through (default 0.0 unchanged). Verification (model B): `tests/divergence_extras.py::test_red_bernoulli_binarize_none_feature_count_matches_sklearn` (live sklearn 1.5.2 oracle, atol 1e-9). |
+//! | REQ-IFOREST-BINDING (#2180) | SHIPPED | `RsIsolationForest` (hand `#[pyclass]`) over `ferrolearn_tree::IsolationForest<f64>`/`FittedIsolationForest<f64>` exposes the `OutlierMixin` surface — `predict` (±1, `_iforest.py:357-378`), `score_samples` (∈[-1,0], `_iforest.py:412-451`), `decision_function` (`=score-offset_`, `_iforest.py:380-410`) — plus `offset_` (`_iforest.py:344/353`) and `n_features_in_`. The `_extras.py::IsolationForest(_RegressorPickleMixin, OutlierMixin, BaseEstimator)` wrapper mirrors sklearn's full ctor (`_iforest.py:221-233`), resolves `max_samples` ('auto'→`min(256,n)`, int→as-is, float→`int(f*n)`, `_iforest.py:303-318`) and `contamination` ('auto'→`with_contamination_auto()`, float→`with_contamination(c)`, `_iforest.py:341-353`) BEFORE the ABI, and rejects the unsupported surface (`max_features!=1.0`/`bootstrap=True`/`warm_start=True` → NotImplementedError, isolation_forest.rs REQ-7a/7b #728/#729; bad `n_estimators`/`contamination`/`max_samples` → ValueError); `n_jobs`/`verbose` accept-and-ignore. RNG-substrate caveat #2118 (isolation_forest.rs StdRng vs numpy MT19937 #730): exact `score_samples` DIVERGE from sklearn for a given seed; the STRUCTURAL contract matches (asserted vs the live oracle). Non-test consumer: `_extras.py::IsolationForest` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/divergence_extras.py::test_iforest_*` (16, live sklearn 1.5.2 oracle). |
 //! | REQ-RANSAC-BINDING (#2178) | SHIPPED | `RsRANSACRegressor` (hand `#[pyclass]`) over `ferrolearn_linear::RANSACRegressor<f64, LinearRegression<f64>>` (default `LinearRegression()` base, `_ransac.py:380`) exposes `fit`/`predict`/`coef_`/`intercept_`/`inlier_mask_`. The `_extras.py::RANSACRegressor` wrapper mirrors sklearn's full ctor (`_ransac.py:288-315`), resolves `min_samples` (None→`n_features+1`, float→`ceil`) before the ABI, and rejects the unsupported surface (`estimator`/`loss='squared_error'`/`stop_*`/`is_*_valid` → NotImplementedError; bad `min_samples`/`max_trials`/`residual_threshold` → ValueError). `coef_`/`intercept_` recovered EXACTLY via affine probe predictions (core keeps the refit base private, ransac.rs REQ-10 #518; no `n_trials_`/`estimator_` faked). Non-test consumer: `_extras.py::RANSACRegressor` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/divergence_extras.py::test_ransac_*` (14, live sklearn 1.5.2 oracle on well-separated data; coef_/inlier_mask_ MATCH `atol 1e-2`, RNG caveat #2118). |
 //! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
 //! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. (`KNeighborsRegressor` is the exception: full surface SHIPPED, REQ-KNR-CTOR-SURFACE.) |
@@ -1289,6 +1290,169 @@ impl RsRANSACRegressor {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(PyArray1::from_slice(py, fitted.inlier_mask()))
+    }
+}
+
+// IsolationForest (#2180): hand-written pyclass (rather than a thin
+// `py_transformer!`/`py_regressor!` invocation) so the binding surfaces the
+// sklearn `OutlierMixin` method surface — `predict` (±1, `_iforest.py:357-378`),
+// `score_samples` (`_iforest.py:412-451`), `decision_function`
+// (`_iforest.py:380-410`) — over the SAME fitted handle, plus the fitted
+// `offset_` (`_iforest.py:344/353`) and `n_features_in_` attributes. The anomaly
+// MATH (isolation-tree build, `c(n)` average path length, the `-2^(-mean/c)`
+// score, the `offset_` percentile) lives in
+// `ferrolearn_tree::IsolationForest`/`FittedIsolationForest` (isolation_forest.rs,
+// REQ-1..9 SHIPPED); this is the thin marshalling shim and the non-test
+// production consumer of that core API (R-DEFER-1).
+//
+// Constructor surface: the wrapper resolves sklearn's `max_samples`
+// (`'auto'`→`min(256,n)`, int→as-is, float→`int(f*n)`, `_iforest.py:303-318`)
+// and `contamination` (`'auto'`→`with_contamination_auto()`, float→
+// `with_contamination(f)`, `_iforest.py:341-353`) BEFORE this ABI (the core takes
+// a `usize` `max_samples` and the `Contamination` enum). `n_estimators`/
+// `max_samples`/`random_state` thread through directly.
+//
+// RNG-substrate caveat (#2118/isolation_forest.rs RNG-boundary #730): the Rust
+// core's subsample + split draws use `StdRng`, NOT numpy's MT19937, so for a
+// GIVEN `random_state` the trees (and thus the exact `score_samples` values)
+// DIFFER from sklearn. The STRUCTURAL contract still holds and matches sklearn:
+// `predict ∈ {-1,+1}`, `score_samples ∈ [-1,0]`,
+// `decision_function == score_samples − offset_`, `predict == −1 where df<0 else
+// +1`, `offset_ == −0.5` for `contamination='auto'`, and the anomaly RANKING
+// (injected far outliers score lower than inliers). Exact score parity is the
+// RNG-substrate limitation, NOT a binding bug.
+#[pyclass(name = "_RsIsolationForest")]
+pub struct RsIsolationForest {
+    n_estimators: usize,
+    // Resolved integer count (the wrapper resolves 'auto'/float→int before the
+    // ABI). The core re-clamps to `min(max_samples, n_samples)` internally
+    // (isolation_forest.rs `fit`), matching sklearn's int-max_samples warn-clamp
+    // (`_iforest.py:307-314`).
+    max_samples: usize,
+    // None == sklearn `contamination='auto'`; Some(f) == the float path.
+    contamination: Option<f64>,
+    random_state: Option<u64>,
+    fitted: Option<ferrolearn_tree::FittedIsolationForest<f64>>,
+}
+
+#[pymethods]
+impl RsIsolationForest {
+    #[new]
+    #[pyo3(signature = (n_estimators=100, max_samples=256, contamination=None,
+                        random_state=None))]
+    fn new(
+        n_estimators: usize,
+        max_samples: usize,
+        contamination: Option<f64>,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            n_estimators,
+            max_samples,
+            contamination,
+            random_state,
+            fitted: None,
+        }
+    }
+
+    // sklearn `fit(X, y=None)` (`_iforest.py:269`): `y` is ignored. The wrapper
+    // passes only `X`; the core's `Fit<Array2<f64>, ()>` takes unit `y`.
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let mut model = ferrolearn_tree::IsolationForest::<f64>::new()
+            .with_n_estimators(self.n_estimators)
+            .with_max_samples(self.max_samples);
+        model = match self.contamination {
+            // sklearn `contamination='auto'` (`_iforest.py:341-345`, offset_=-0.5).
+            None => model.with_contamination_auto(),
+            // sklearn `contamination=<float>` (`_iforest.py:353`, offset_=percentile).
+            Some(c) => model.with_contamination(c),
+        };
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `predict` (`_iforest.py:357-378`): +1 inlier / -1 outlier. The core
+    // `Predict::Output` is `Array1<isize>`; marshalled to a numpy int64 array.
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let preds_i64 = preds.mapv(|p| p as i64);
+        Ok(PyArray1::from_array(py, &preds_i64))
+    }
+
+    // sklearn `score_samples` (`_iforest.py:412-451`): the opposite of the paper
+    // anomaly score, in `[-1, 0]` (higher == more normal).
+    fn score_samples<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let scores = fitted
+            .score_samples(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &scores))
+    }
+
+    // sklearn `decision_function` (`_iforest.py:380-410`):
+    // `score_samples(X) - offset_`; `< 0` == outlier.
+    fn decision_function<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let df = fitted
+            .decision_function(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &df))
+    }
+
+    // sklearn `offset_` (`_iforest.py:344/353`): the decision-threshold offset
+    // (-0.5 for `contamination='auto'`, else the percentile of train scores).
+    #[getter]
+    fn offset_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.offset())
+    }
+
+    // sklearn `n_features_in_` (set by `_validate_data` at fit): the number of
+    // features seen during fit. The core fitted type exposes it as `n_features()`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features())
     }
 }
 

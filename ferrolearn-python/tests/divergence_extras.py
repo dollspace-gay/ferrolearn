@@ -64,6 +64,7 @@ from sklearn.discriminant_analysis import (
 )
 from sklearn.ensemble import (
     ExtraTreesRegressor as SkExtraTreesRegressor,
+    IsolationForest as SkIsolationForest,
     RandomForestRegressor as SkRandomForestRegressor,
 )
 from sklearn.kernel_ridge import KernelRidge as SkKernelRidge
@@ -1861,3 +1862,233 @@ def test_ransac_pickle_roundtrip_preserves_predictions():
     pred_before = fr.predict(X)
     fr2 = pickle.loads(pickle.dumps(fr))
     np.testing.assert_allclose(fr2.predict(X), pred_before, rtol=0, atol=1e-9)
+
+
+# ===========================================================================
+# IsolationForest (#2180) — sklearn.ensemble.IsolationForest binding.
+#
+# The Rust core's subsample + split draws use `StdRng`, NOT numpy's MT19937
+# (isolation_forest.rs RNG-boundary #730), so for a GIVEN random_state the
+# trees — and thus the exact `score_samples` values — DIVERGE from sklearn
+# (the RNG-substrate limitation #2118, R-SUBSTRATE-5). These tests therefore
+# pin the STRUCTURAL contract (which DOES match sklearn) against the live
+# sklearn 1.5.2 oracle, NOT exact score parity. Every expected value comes
+# from the oracle or a sklearn `file:line` constant (R-CHAR-3).
+# ===========================================================================
+
+
+def _iforest_data(seed=0):
+    """40 tight inliers around the origin + 5 far uniform outliers (last 5 rows).
+    The anomaly RANKING is unambiguous regardless of the tree RNG."""
+    rng = np.random.RandomState(seed)
+    inliers = rng.randn(40, 2) * 0.3
+    outliers = rng.uniform(low=-6.0, high=6.0, size=(5, 2))
+    return np.r_[inliers, outliers]
+
+
+def test_iforest_get_params_keys_match_sklearn():
+    """REQ-IFOREST-BINDING: the wrapper ctor surface == sklearn's
+    `IsolationForest.__init__` param set (`_iforest.py:221-233`), so
+    get_params()/clone() round-trip exactly."""
+    from sklearn.base import clone
+
+    fl_keys = set(fl.IsolationForest().get_params().keys())
+    sk_keys = set(SkIsolationForest().get_params().keys())
+    assert fl_keys == sk_keys
+    # clone() (deep get_params + re-construct) must succeed.
+    clone(fl.IsolationForest(n_estimators=50, contamination=0.2, max_samples=64))
+
+
+def test_iforest_predict_in_pm_one_and_shape():
+    """REQ-IFOREST-BINDING: predict returns ±1 of shape (n_samples,)
+    (`_iforest.py:357-378`); the live sklearn oracle does the same."""
+    X = _iforest_data()
+    fp = fl.IsolationForest(random_state=42).fit(X).predict(X)
+    sp = SkIsolationForest(random_state=42).fit(X).predict(X)
+    assert fp.shape == (X.shape[0],) == sp.shape
+    assert set(np.unique(fp).tolist()) <= {-1, 1}
+    # sklearn likewise yields only ±1.
+    assert set(np.unique(sp).tolist()) <= {-1, 1}
+
+
+def test_iforest_score_samples_in_minus_one_zero():
+    """REQ-IFOREST-BINDING: score_samples ∈ [-1, 0]
+    (`_iforest.py:412-451`, the negated paper score); sklearn's are too."""
+    X = _iforest_data()
+    fs = fl.IsolationForest(random_state=42).fit(X).score_samples(X)
+    ss = SkIsolationForest(random_state=42).fit(X).score_samples(X)
+    assert np.all(fs >= -1.0 - 1e-12) and np.all(fs <= 0.0 + 1e-12)
+    # The live oracle obeys the same [-1, 0] contract.
+    assert np.all(ss >= -1.0 - 1e-12) and np.all(ss <= 0.0 + 1e-12)
+
+
+def test_iforest_decision_function_equals_score_minus_offset():
+    """REQ-IFOREST-BINDING: decision_function == score_samples - offset_
+    (`_iforest.py:410`)."""
+    X = _iforest_data()
+    f = fl.IsolationForest(contamination=0.1, random_state=42).fit(X)
+    df = f.decision_function(X)
+    sc = f.score_samples(X)
+    np.testing.assert_allclose(df, sc - f.offset_, rtol=0, atol=1e-12)
+
+
+def test_iforest_predict_matches_decision_function_sign():
+    """REQ-IFOREST-BINDING: predict == where(decision_function < 0, -1, 1)
+    (`_iforest.py:374-378`: `is_inlier = ones; is_inlier[df < 0] = -1`)."""
+    X = _iforest_data()
+    f = fl.IsolationForest(contamination=0.15, random_state=42).fit(X)
+    df = f.decision_function(X)
+    pred = f.predict(X)
+    np.testing.assert_array_equal(pred, np.where(df < 0, -1, 1))
+
+
+def test_iforest_offset_auto_is_minus_half_like_sklearn():
+    """REQ-IFOREST-BINDING: contamination='auto' => offset_ == -0.5
+    (`_iforest.py:341-344`); the live sklearn oracle sets the same value."""
+    X = _iforest_data()
+    f = fl.IsolationForest(contamination="auto", random_state=0).fit(X)
+    s = SkIsolationForest(contamination="auto", random_state=0).fit(X)
+    assert f.offset_ == -0.5
+    assert s.offset_ == -0.5
+
+
+def test_iforest_offset_float_is_percentile_of_scores():
+    """REQ-IFOREST-BINDING: contamination=<float> => offset_ ==
+    np.percentile(score_samples(X), 100*contamination) (`_iforest.py:353`),
+    NOT -0.5. (Computed over ferrolearn's OWN scores — the core, like sklearn,
+    derives offset_ from the model's own training scores.)"""
+    X = _iforest_data()
+    f = fl.IsolationForest(contamination=0.1, random_state=7).fit(X)
+    assert f.offset_ != -0.5
+    expected = np.percentile(f.score_samples(X), 10.0)
+    assert abs(f.offset_ - expected) < 1e-9
+
+
+def test_iforest_anomaly_ranking_matches_sklearn():
+    """REQ-IFOREST-BINDING: the injected far outliers (last 5 rows) get LOWER
+    score_samples than the inliers — the anomaly RANKING is correct and agrees
+    with the live sklearn oracle's ranking direction (R-SUBSTRATE-5: exact
+    score values diverge under the StdRng substrate, but the ranking does not)."""
+    X = _iforest_data()
+    fs = fl.IsolationForest(n_estimators=200, random_state=42).fit(X).score_samples(X)
+    ss = SkIsolationForest(n_estimators=200, random_state=42).fit(X).score_samples(X)
+    # ferrolearn: outliers strictly more anomalous (lower) than inliers.
+    assert fs[40:].max() < fs[:40].min()
+    # the live sklearn oracle ranks them the same way.
+    assert ss[40:].max() < ss[:40].min()
+
+
+def test_iforest_n_features_in_matches_sklearn():
+    """REQ-IFOREST-BINDING: n_features_in_ is set at fit and equals X.shape[1],
+    matching the live sklearn oracle."""
+    X = _iforest_data()
+    f = fl.IsolationForest(random_state=0).fit(X)
+    s = SkIsolationForest(random_state=0).fit(X)
+    assert f.n_features_in_ == X.shape[1] == s.n_features_in_
+
+
+def test_iforest_fit_predict_equals_fit_then_predict():
+    """REQ-IFOREST-BINDING: OutlierMixin.fit_predict(X) == fit(X).predict(X)
+    on the SAME seeded model (`_iforest.py` inherits OutlierMixin)."""
+    X = _iforest_data()
+    fp1 = fl.IsolationForest(random_state=11).fit_predict(X)
+    fp2 = fl.IsolationForest(random_state=11).fit(X).predict(X)
+    np.testing.assert_array_equal(fp1, fp2)
+
+
+def test_iforest_max_samples_resolution():
+    """REQ-IFOREST-BINDING: max_samples 'auto'/int/float all fit successfully
+    (sklearn `_iforest.py:303-318`: 'auto'->min(256,n), int->as-is,
+    float->int(f*n)). sklearn accepts the same three forms."""
+    X = _iforest_data()
+    for ms in ("auto", 32, 0.5):
+        f = fl.IsolationForest(max_samples=ms, random_state=0).fit(X)
+        s = SkIsolationForest(max_samples=ms, random_state=0).fit(X)
+        assert f.predict(X).shape == (X.shape[0],)
+        assert s.predict(X).shape == (X.shape[0],)
+
+
+def test_iforest_invalid_params_raise_valueerror():
+    """REQ-IFOREST-BINDING: out-of-range params raise ValueError (mirroring
+    sklearn's InvalidParameterError ⊂ ValueError, `_iforest.py:199-219`)."""
+    X = _iforest_data()
+    # contamination float must be in (0, 0.5].
+    with pytest.raises(ValueError):
+        fl.IsolationForest(contamination=0.6).fit(X)
+    with pytest.raises(ValueError):
+        fl.IsolationForest(contamination=0.0).fit(X)
+    # n_estimators >= 1.
+    with pytest.raises(ValueError):
+        fl.IsolationForest(n_estimators=0).fit(X)
+    # max_samples int >= 1 / float in (0, 1].
+    with pytest.raises(ValueError):
+        fl.IsolationForest(max_samples=0).fit(X)
+    with pytest.raises(ValueError):
+        fl.IsolationForest(max_samples=1.5).fit(X)
+    # The live sklearn oracle rejects the same values (InvalidParameterError).
+    from sklearn.exceptions import NotFittedError  # noqa: F401
+    for bad in (dict(contamination=0.6), dict(n_estimators=0),
+                dict(max_samples=0), dict(max_samples=1.5)):
+        with pytest.raises(ValueError):
+            SkIsolationForest(**bad).fit(X)
+
+
+def test_iforest_unsupported_params_raise_notimplemented():
+    """REQ-IFOREST-BINDING: the Rust core implements only the full-feature,
+    with-replacement subsample path (isolation_forest.rs REQ-7a/7b
+    NOT-STARTED #728/#729), so non-default max_features / bootstrap / warm_start
+    raise NotImplementedError (sklearn accepts them — these are honest gaps)."""
+    X = _iforest_data()
+    with pytest.raises(NotImplementedError):
+        fl.IsolationForest(max_features=0.5).fit(X)
+    with pytest.raises(NotImplementedError):
+        fl.IsolationForest(bootstrap=True).fit(X)
+    with pytest.raises(NotImplementedError):
+        fl.IsolationForest(warm_start=True).fit(X)
+
+
+def test_iforest_n_jobs_verbose_accept_and_ignore():
+    """REQ-IFOREST-BINDING: n_jobs (threading) and verbose (diagnostics) are
+    accept-and-ignore — they do not change the result and never raise."""
+    X = _iforest_data()
+    f0 = fl.IsolationForest(random_state=5).fit(X)
+    f1 = fl.IsolationForest(n_jobs=4, verbose=2, random_state=5).fit(X)
+    # Same seed + same supported params => identical reproducible result.
+    np.testing.assert_array_equal(f0.predict(X), f1.predict(X))
+
+
+def test_iforest_not_fitted_raises():
+    """REQ-IFOREST-BINDING: predict/score_samples/decision_function before fit
+    raise (NotFittedError via check_is_fitted)."""
+    from sklearn.exceptions import NotFittedError
+
+    X = _iforest_data()
+    for meth in ("predict", "score_samples", "decision_function"):
+        with pytest.raises(NotFittedError):
+            getattr(fl.IsolationForest(), meth)(X)
+
+
+def test_iforest_pickle_roundtrip_preserves_predictions():
+    """REQ-IFOREST-BINDING: pickle round-trips (Rust fitted object not
+    picklable -> refit-on-unpickle via `_RegressorPickleMixin`); the seeded
+    predictions are preserved."""
+    import pickle
+
+    X = _iforest_data()
+    f = fl.IsolationForest(random_state=3).fit(X)
+    pred_before = f.predict(X)
+    f2 = pickle.loads(pickle.dumps(f))
+    np.testing.assert_array_equal(f2.predict(X), pred_before)
+
+
+def test_iforest_score_samples_diverges_from_sklearn_rng_substrate():
+    """RNG-substrate divergence (#2118, R-SUBSTRATE-5): the Rust core's StdRng
+    subsample/split draws are NOT numpy's MT19937, so for the SAME random_state
+    the exact score_samples values DIFFER from sklearn. This pins the documented
+    limitation (so a future numpy-RNG migration would flip it). The STRUCTURAL
+    contract above still matches sklearn — only the exact values diverge."""
+    X = _iforest_data()
+    fs = fl.IsolationForest(random_state=42, n_estimators=100).fit(X).score_samples(X)
+    ss = SkIsolationForest(random_state=42, n_estimators=100).fit(X).score_samples(X)
+    # Honest pin: the exact per-sample scores are NOT close (different trees).
+    assert not np.allclose(fs, ss, atol=1e-6)

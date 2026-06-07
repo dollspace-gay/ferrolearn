@@ -64,6 +64,9 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extras::RsHistGradientBoostingClassifier>()?;
     m.add_class::<extras::RsBaggingClassifier>()?;
 
+    // Extras — ensemble outlier detection (#2180)
+    m.add_class::<extras::RsIsolationForest>()?;
+
     // Extras — neighbors
     m.add_class::<extras::RsNearestCentroid>()?;
 

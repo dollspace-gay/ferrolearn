@@ -8,6 +8,7 @@ from sklearn.base import (
     BaseEstimator,
     ClassifierMixin,
     ClusterMixin,
+    OutlierMixin,
     RegressorMixin,
     TransformerMixin,
 )
@@ -36,6 +37,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsHistGradientBoostingRegressor,
     _RsHuberRegressor,
     _RsIncrementalPCA,
+    _RsIsolationForest,
     _RsKNeighborsRegressor,
     _RsKernelPCA,
     _RsKernelRidge,
@@ -1511,6 +1513,236 @@ class GaussianMixture(BaseEstimator):
 
     def predict(self, X):
         return np.asarray(self._rs.predict(_f64(X)))
+
+    def fit_predict(self, X, y=None):
+        return self.fit(X).predict(X)
+
+
+# ---------------------------------------------------------------------------
+# Ensemble outlier-detection wrappers
+# ---------------------------------------------------------------------------
+
+class IsolationForest(_RegressorPickleMixin, OutlierMixin, BaseEstimator):
+    """Isolation Forest anomaly detector backed by Rust (#2180).
+
+    Mirrors ``sklearn.ensemble.IsolationForest``
+    (``sklearn/ensemble/_iforest.py:221-248``), surfacing the keyword-only
+    constructor ``(n_estimators=100, max_samples='auto', contamination='auto',
+    max_features=1.0, bootstrap=False, n_jobs=None, random_state=None, verbose=0,
+    warm_start=False)`` (sklearn defaults/order), the ``fit(X, y=None)`` contract,
+    and the ``predict``/``score_samples``/``decision_function``/``fit_predict``
+    ``OutlierMixin`` method surface plus the fitted ``offset_``/``n_features_in_``
+    attributes from the Rust fitted type.
+
+    Of the constructor surface, ``n_estimators``/``max_samples``/``contamination``/
+    ``random_state`` are threaded into the Rust core. ``max_samples`` and
+    ``contamination`` are resolved to sklearn's effective values BEFORE the Rust
+    ABI (which takes an integer ``max_samples`` and an ``'auto'``-or-float
+    contamination):
+
+    - ``max_samples`` (sklearn ``_iforest.py:303-318``): ``'auto'`` →
+      ``min(256, n_samples)``; an int → as-is (the core re-clamps to
+      ``n_samples``, matching sklearn's warn-and-clamp ``:307-314``); a float in
+      ``(0, 1]`` → ``int(max_samples * n_samples)`` (sklearn truncates, ``:318``).
+    - ``contamination`` (sklearn ``_iforest.py:341-353``): ``'auto'`` → the
+      ``offset_ = -0.5`` paper path; a float in ``(0, 0.5]`` → the
+      ``offset_ = percentile`` path.
+
+    Validation mirrors sklearn's ``_parameter_constraints``
+    (``_iforest.py:199-219``), raising ``ValueError`` (sklearn's
+    ``InvalidParameterError`` ⊂ ``ValueError``) for ``n_estimators < 1``, a
+    ``max_samples`` int ``< 1`` / float outside ``(0, 1]`` / invalid string, or a
+    ``contamination`` float outside ``(0, 0.5]``.
+
+    The Rust core implements only the full-feature, with-replacement subsample
+    path (isolation_forest.rs REQ-7a/7b NOT-STARTED #728/#729), so the
+    non-default ``max_features != 1.0`` / ``bootstrap=True`` / ``warm_start=True``
+    raise ``NotImplementedError``; ``n_jobs`` (a threading knob) and ``verbose`` (a
+    diagnostics knob) are accepted-and-ignored (held only for ``get_params``/
+    ``clone`` round-trip).
+
+    RNG-substrate caveat (#2118 / isolation_forest.rs RNG-boundary #730): the Rust
+    core's subsample + split draws use ``StdRng``, NOT numpy's MT19937, so for a
+    GIVEN ``random_state`` the trees — and thus the exact ``score_samples`` values
+    — DIFFER from sklearn. The STRUCTURAL contract holds and matches sklearn:
+    ``predict ∈ {-1, +1}``, ``score_samples ∈ [-1, 0]``,
+    ``decision_function == score_samples - offset_``,
+    ``predict == where(decision_function < 0, -1, 1)``, ``offset_ == -0.5`` for
+    ``contamination='auto'``, and the anomaly ranking (injected far outliers score
+    lower than inliers). Exact score parity is the RNG-substrate limitation, not a
+    binding bug.
+
+    Pickle: the Rust fitted object is not directly picklable, so the training data
+    is stored on fit and ``_rs`` is rebuilt by re-fitting on unpickle
+    (``_RegressorPickleMixin``).
+    """
+
+    def __init__(self, *, n_estimators=100, max_samples="auto",
+                 contamination="auto", max_features=1.0, bootstrap=False,
+                 n_jobs=None, random_state=None, verbose=0, warm_start=False):
+        self.n_estimators = n_estimators
+        self.max_samples = max_samples
+        self.contamination = contamination
+        self.max_features = max_features
+        self.bootstrap = bootstrap
+        self.n_jobs = n_jobs
+        self.random_state = random_state
+        self.verbose = verbose
+        self.warm_start = warm_start
+
+    def _validate_static(self):
+        # The n_samples-independent half of sklearn's `_parameter_constraints`
+        # (`_iforest.py:199-219`), runnable before we have X. n_estimators and
+        # contamination, plus the unsupported-knob NotImplementedError gates.
+        # n_estimators: Interval(Integral, 1, None, closed='left') (`:200`).
+        # Python `bool` is `numbers.Integral`, so sklearn accepts True (== 1 >= 1,
+        # fits 1 estimator) and rejects False (== 0 < 1) via the >= 1 bound; mirror
+        # that by NOT special-casing bool.
+        if (not isinstance(self.n_estimators, (int, np.integer))
+                or self.n_estimators < 1):
+            raise ValueError(
+                f"n_estimators == {self.n_estimators}, must be >= 1 "
+                "(an int in [1, inf))."
+            )
+        # contamination: StrOptions({'auto'}) or Interval(Real, 0, 0.5,
+        # closed='right') (`:206-209`).
+        if isinstance(self.contamination, str):
+            if self.contamination != "auto":
+                raise ValueError(
+                    f"contamination == {self.contamination!r}, must be 'auto' or "
+                    "a float in (0, 0.5]."
+                )
+        elif (not isinstance(self.contamination,
+                             (int, float, np.floating, np.integer))
+              or isinstance(self.contamination, bool)
+              or not (0 < self.contamination <= 0.5)):
+            raise ValueError(
+                f"contamination == {self.contamination}, must be 'auto' or a "
+                "float in (0, 0.5]."
+            )
+        # max_features: only the default 1.0 (full feature set) is supported; the
+        # Rust core always considers every feature (isolation_forest.rs REQ-7a
+        # NOT-STARTED #728).
+        if self.max_features != 1.0:
+            raise NotImplementedError(
+                "max_features != 1.0 not supported (the Rust IsolationForest core "
+                "always considers the full feature set; NOT-STARTED #728)."
+            )
+        # bootstrap: only the default False (subsample WITHOUT replacement is the
+        # core's only path; bootstrap=True would draw WITH replacement,
+        # isolation_forest.rs REQ-7b NOT-STARTED #729).
+        if self.bootstrap:
+            raise NotImplementedError(
+                "bootstrap=True not supported (the Rust IsolationForest core does "
+                "not implement bootstrap resampling; NOT-STARTED #729)."
+            )
+        # warm_start: only the default False (no incremental tree-adding path in
+        # the Rust core).
+        if self.warm_start:
+            raise NotImplementedError(
+                "warm_start=True not supported (the Rust IsolationForest core does "
+                "not implement incremental tree-adding; NOT-STARTED #728)."
+            )
+
+    def _resolve_max_samples(self, n_samples):
+        # sklearn `_iforest.py:303-318`: resolve `max_samples` to an int given
+        # n_samples. 'auto' -> min(256, n); int -> as-is (the core re-clamps to
+        # n_samples, matching sklearn's warn-and-clamp :307-314); float in (0, 1]
+        # -> int(f * n) (sklearn truncates, :318).
+        ms = self.max_samples
+        if isinstance(ms, str):
+            if ms != "auto":
+                raise ValueError(
+                    f"max_samples == {ms!r}, must be 'auto', an int >= 1, or a "
+                    "float in (0, 1]."
+                )
+            return min(256, n_samples)
+        # bool is `numbers.Integral` in sklearn, so True falls through the Integral
+        # branch (True == 1 >= 1 -> max_samples_ == 1) and False (== 0 < 1) is
+        # rejected by that branch's >= 1 bound. Do NOT special-case bool.
+        if isinstance(ms, (int, np.integer)):
+            # Interval(Integral, 1, None, closed='left') (`_iforest.py:203`).
+            if ms < 1:
+                raise ValueError(
+                    f"max_samples == {ms}, must be >= 1 (an int in [1, inf)) when "
+                    "an integer."
+                )
+            return int(ms)
+        if isinstance(ms, (float, np.floating)):
+            # Interval(RealNotInt, 0, 1, closed='right') (`_iforest.py:204`):
+            # a float must be in (0, 1].
+            if not (0 < ms <= 1):
+                raise ValueError(
+                    f"max_samples == {ms}, must be in (0, 1] when a float."
+                )
+            # sklearn truncates: int(max_samples * n_samples) (`:318`), with NO
+            # guard. A tiny float that truncates to 0 (e.g. 0.01 * 45 -> 0) makes
+            # sklearn's fit raise ValueError (zero-size subsample); mirror that
+            # observable raise instead of clamping up to 1.
+            resolved = int(ms * n_samples)
+            if resolved < 1:
+                raise ValueError(
+                    f"max_samples == {ms} resolves to int({ms} * {n_samples}) == "
+                    f"{resolved}, which is an invalid (zero-size) subsample."
+                )
+            return resolved
+        raise ValueError(
+            f"max_samples == {ms!r}, must be 'auto', an int >= 1, or a float in "
+            "(0, 1]."
+        )
+
+    def _make_rs(self, n_samples):
+        self._validate_static()
+        max_samples = self._resolve_max_samples(n_samples)
+        # contamination: None == sklearn 'auto' across the ABI; a float takes the
+        # percentile path.
+        contamination = (None if isinstance(self.contamination, str)
+                         else float(self.contamination))
+        rs = (None if self.random_state is None else int(self.random_state))
+        return _RsIsolationForest(
+            n_estimators=self.n_estimators, max_samples=max_samples,
+            contamination=contamination, random_state=rs)
+
+    def fit(self, X, y=None, sample_weight=None):
+        X = _f64(X)
+        self._rs = self._make_rs(X.shape[0])
+        self._rs.fit(X)
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/ensemble/_iforest.py:344/353).
+        self.offset_ = self._rs.offset_
+        # _store_training_data expects (X, y); y is ignored by IsolationForest, so
+        # store a placeholder for the pickle-refit path.
+        self._fit_X = X.copy()
+        self._fit_y = None
+        return self
+
+    def _rebuild_rs(self):
+        self._rs = self._make_rs(self._fit_X.shape[0])
+        self._rs.fit(self._fit_X)
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if hasattr(self, "_fit_X"):
+            self._rebuild_rs()
+
+    def predict(self, X):
+        check_is_fitted(self)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.predict(_f64(X)))
+
+    def score_samples(self, X):
+        check_is_fitted(self)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.score_samples(_f64(X)))
+
+    def decision_function(self, X):
+        check_is_fitted(self)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.decision_function(_f64(X)))
 
     def fit_predict(self, X, y=None):
         return self.fit(X).predict(X)
