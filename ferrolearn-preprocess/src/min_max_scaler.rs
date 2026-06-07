@@ -19,12 +19,12 @@
 //! | REQ-2 (constant column → `feature_range[0]`) | SHIPPED | FIXED #1170. `transform` zero-span branch now sets a constant column to `range_min`, matching sklearn `_handle_zeros_in_scale` (`_data.py:88`,`:508-511`). Critic two-round CLEAN: 11 tests incl. constant col → `fr[0]` for default/(−1,1)/(2,5), mixed fixture, negative/zero constant, single-row fit. In-module test corrected (R-HONEST-4). |
 //! | REQ-3 (feature_range validation) | SHIPPED | `with_feature_range` returns `Err(InvalidParameter)` when `range_min >= range_max`, matching sklearn "Minimum of desired feature range must be smaller than maximum" (`_data.py:476-480`). Guard `req3_feature_range_validation_rejects`. |
 //! | REQ-7 (PyO3 binding) | SHIPPED | `_RsMinMaxScaler` (`extras.rs:1148`, registered `lib.rs:81`) marshals `fit`/`transform` over `FittedMinMaxScaler<f64>` (default range) — a real CPython consumer of REQ-1/REQ-2. |
-//! | REQ-4 (NaN tolerance: allow-nan + nanmin/nanmax) | NOT-STARTED | open prereq blocker #1171. `fit` reduce-min/max poisons on NaN; sklearn `force_all_finite='allow-nan'` + `_nanmin`/`_nanmax` (`_data.py:490-499`). |
+//! | REQ-4 (NaN tolerance: allow-nan + nanmin/nanmax) | SHIPPED | FIXED #1171. `Fit::fit`'s per-column min/max reduction now SKIPS NaN values (option-accumulator), mirroring sklearn `force_all_finite='allow-nan'` + `_nanmin`/`_nanmax` (`_data.py:494`,`:497-498`): a column with at least one finite value gets the finite min/max; an ALL-NaN column gets `data_min`/`data_max` = `F::nan()` (→ `scale_`/`min_`/transform NaN, matching `_nanmin`/`_nanmax` returning nan, no panic, no zero substitution). `Transform::transform`'s affine map passes NaN inputs through unchanged (`nan*scale+min = nan`). Live-oracle tests `req4_nan_fit_single_column_ignored_for_min_max`, `req4_nan_fit_multi_column_scattered`, `req4_all_nan_column_yields_nan_no_panic` in `tests/divergence_min_max_scaler.rs`. Consumers: PyO3 `_RsMinMaxScaler` + `FittedPipelineTransformer` + re-export `lib.rs:118`. |
 //! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | SHIPPED | FIXED #1172. `Fit::fit` computes `data_range_[j]=data_max[j]-data_min[j]`, `scale_[j]=(fr1-fr0)/handle_zeros(data_range_[j])`, `min_[j]=fr0-data_min[j]*scale_[j]`, `n_samples_seen_=n_rows`, mirroring sklearn (`_data.py:507-514`, `_handle_zeros_in_scale` `:88`). Additive: getters `scale()`/`min()`/`data_range()`/`n_samples_seen()`; `transform`/`inverse_transform` unchanged. Live-oracle tests `min_max_attrs_match_sklearn`, `min_max_scale_handles_zero_range_constant_col`. |
 //! | REQ-6 (inverse_transform) | SHIPPED | FIXED #1173. `FittedMinMaxScaler::inverse_transform` reverses the affine map: per column `j`, `x_orig = (x_scaled - fr0) * span / range_width + data_min[j]` (`span = data_max[j]-data_min[j]`, `range_width = fr1-fr0`), matching sklearn `X -= self.min_; X /= self.scale_` (`_data.py:549-587`,`:508-511`,`:88`). The single formula round-trips both regular and constant columns (`span==0 -> data_min[j]`). `ShapeMismatch` on column-count mismatch (mirrors `transform`). Oracle-grounded in-module tests: `min_max_inverse_roundtrip_matches_sklearn`, `min_max_inverse_custom_range_matches_sklearn`, `min_max_inverse_constant_col`, `min_max_inverse_shape_mismatch`. Consumer: crate re-export (`lib.rs:118`, grandfathered S5). |
 //! | REQ-8 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1174. Single-shot fit (`_data.py:489-515`). |
 //! | REQ-9 (minmax_scale free fn + axis) | NOT-STARTED | open prereq blocker #1175. No free fn / axis=1 (`_data.py:589`). |
-//! | REQ-10 (copy / clip params) | NOT-STARTED | open prereq blocker #1176. No `copy`/`clip`/`_parameter_constraints` (`_data.py:447-459`,`:542-543`). |
+//! | REQ-10 (copy / clip params) | SHIPPED | FIXED #1176. `MinMaxScaler<F>` gains `clip: bool` (default `false`) + `#[must_use] with_clip` builder + `clip()` getter, threaded onto `FittedMinMaxScaler`. `Transform::transform` applies a NaN-safe element-wise clamp to `[feature_range.0, feature_range.1]` AFTER the affine map when `clip` is set (`if x < lo {lo} else if x > hi {hi} else {x}` leaves NaN unchanged), mirroring sklearn `if self.clip: np.clip(X, fr[0], fr[1])` (`_data.py:411`,`:545-546`). `copy: bool` (default `true`) + `with_copy`/`copy()` is an ACCEPT-AND-DOCUMENT no-op: ferrolearn's `Transform` always returns a fresh array, so `copy` has no observable effect (documented; behavior unchanged). Live-oracle tests `req10_clip_default_range_out_of_range_holdout`, `req10_clip_custom_range_out_of_range_holdout`, `req10_clip_with_nan_passthrough`, `req10_copy_is_no_op_on_values`. Consumers: PyO3 `_RsMinMaxScaler` + `FittedPipelineTransformer` + re-export `lib.rs:118`. (`_parameter_constraints` validation surface stays as the existing `with_feature_range` guard, REQ-3.) |
 //! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1177. None (OneToOneFeatureMixin). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1178. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
@@ -63,6 +63,15 @@ use num_traits::Float;
 pub struct MinMaxScaler<F> {
     /// Target feature range `(min, max)`. Defaults to `(0, 1)`.
     pub(crate) feature_range: (F, F),
+    /// If `true`, clip transformed values to `feature_range` element-wise
+    /// (sklearn `MinMaxScaler(clip=...)`, `_data.py:411`,`:545-546`). Defaults
+    /// to `false`.
+    pub(crate) clip: bool,
+    /// sklearn's `copy` constructor parameter (`_data.py:411`). ACCEPT-AND-
+    /// DOCUMENT no-op: ferrolearn's [`Transform`] always returns a freshly
+    /// allocated array, so `copy` has no observable effect here. Retained for
+    /// API parity. Defaults to `true`.
+    pub(crate) copy: bool,
 }
 
 impl<F: Float + Send + Sync + 'static> MinMaxScaler<F> {
@@ -71,6 +80,8 @@ impl<F: Float + Send + Sync + 'static> MinMaxScaler<F> {
     pub fn new() -> Self {
         Self {
             feature_range: (F::zero(), F::one()),
+            clip: false,
+            copy: true,
         }
     }
 
@@ -88,6 +99,8 @@ impl<F: Float + Send + Sync + 'static> MinMaxScaler<F> {
         }
         Ok(Self {
             feature_range: (range_min, range_max),
+            clip: false,
+            copy: true,
         })
     }
 
@@ -95,6 +108,45 @@ impl<F: Float + Send + Sync + 'static> MinMaxScaler<F> {
     #[must_use]
     pub fn feature_range(&self) -> (F, F) {
         self.feature_range
+    }
+
+    /// Set whether to clip transformed values to `feature_range` element-wise.
+    ///
+    /// Mirrors sklearn's `MinMaxScaler(clip=...)` constructor parameter
+    /// (`_data.py:411`, `_parameter_constraints` `:408`). When `true`,
+    /// [`Transform::transform`] clamps each output element to
+    /// `[feature_range.0, feature_range.1]` after the affine map. This matters
+    /// for held-out data that falls outside the fitted min/max range, which
+    /// would otherwise map outside `feature_range`. NaN inputs are left as NaN
+    /// (matching `np.clip(nan, lo, hi) == nan`, `_data.py:545-546`).
+    #[must_use]
+    pub fn with_clip(mut self, clip: bool) -> Self {
+        self.clip = clip;
+        self
+    }
+
+    /// Set sklearn's `copy` constructor parameter (`_data.py:411`).
+    ///
+    /// ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] contract always
+    /// returns a freshly allocated array, so `copy` has no observable effect.
+    /// The flag is retained only for API parity with scikit-learn; toggling it
+    /// does not change behavior.
+    #[must_use]
+    pub fn with_copy(mut self, copy: bool) -> Self {
+        self.copy = copy;
+        self
+    }
+
+    /// Return whether transformed values are clipped to `feature_range`.
+    #[must_use]
+    pub fn clip(&self) -> bool {
+        self.clip
+    }
+
+    /// Return the `copy` flag (accept-and-document no-op; see [`Self::with_copy`]).
+    #[must_use]
+    pub fn copy(&self) -> bool {
+        self.copy
     }
 }
 
@@ -130,6 +182,10 @@ pub struct FittedMinMaxScaler<F> {
     pub(crate) data_range_: Array1<F>,
     /// Number of samples seen during fitting (`sklearn/preprocessing/_data.py:501`).
     pub(crate) n_samples_seen_: usize,
+    /// Whether [`Transform::transform`] clips outputs to `feature_range`
+    /// element-wise (sklearn `clip`, `_data.py:411`,`:545-546`). Threaded from
+    /// the unfitted [`MinMaxScaler`].
+    pub(crate) clip: bool,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedMinMaxScaler<F> {
@@ -218,16 +274,27 @@ impl<F: Float + Send + Sync + 'static> FittedMinMaxScaler<F> {
             });
         }
 
-        let (range_min, range_max) = self.feature_range;
-        let range_width = range_max - range_min;
+        // sklearn `inverse_transform` validates with `force_all_finite="allow-nan"`
+        // (`_data.py:571`): NaN passes through, +/-inf raises ValueError (#2202).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let min = self.data_min[j];
-            let max = self.data_max[j];
-            let span = max - min;
+            // sklearn inverse is `X -= self.min_; X /= self.scale_`
+            // (`_data.py:586-587`). Using the precomputed `scale_`/`min_` (via
+            // `_handle_zeros_in_scale`) inverts the constant-column case
+            // correctly: a fit-constant column has `scale_ = range_width`, so a
+            // HELD-OUT scaled value gets the affine inverse (it is NOT forced to
+            // `data_min`, #2202). NaN passes through (`(nan - min)/scale = nan`).
+            let scale = self.scale_[j];
+            let offset = self.min_[j];
             for v in &mut col {
-                *v = (*v - range_min) * span / range_width + min;
+                *v = (*v - offset) / scale;
             }
         }
         Ok(out)
@@ -256,6 +323,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinMaxScaler<F> {
                 context: "MinMaxScaler::fit".into(),
             });
         }
+        // sklearn validates X with `force_all_finite="allow-nan"`
+        // (`_data.py:494`): NaN is permitted, but +/-inf raises ValueError
+        // ("Input X contains infinity or a value too large for dtype('...')"),
+        // #2200.
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut data_min = Array1::zeros(n_features);
@@ -263,18 +340,31 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinMaxScaler<F> {
 
         for j in 0..n_features {
             let col = x.column(j);
-            let min = col
-                .iter()
-                .copied()
-                .reduce(|a, b| if a < b { a } else { b })
-                .unwrap_or_else(F::zero);
-            let max = col
-                .iter()
-                .copied()
-                .reduce(|a, b| if a > b { a } else { b })
-                .unwrap_or_else(F::zero);
-            data_min[j] = min;
-            data_max[j] = max;
+            // NaN-ignoring per-column min/max, mirroring sklearn's `_nanmin` /
+            // `_nanmax` under `force_all_finite="allow-nan"`
+            // (`sklearn/preprocessing/_data.py:494`,`:497-498`). NaN values are
+            // skipped: data_min/data_max are the min/max of the finite values.
+            // If a column is ALL NaN (every entry skipped) the accumulator stays
+            // `None` and we emit NaN — matching `_nanmin`/`_nanmax` returning nan
+            // on an all-NaN slice (that column's scale_/min_/transform become
+            // NaN; no panic, no zero substitution).
+            let mut min: Option<F> = None;
+            let mut max: Option<F> = None;
+            for v in col.iter().copied() {
+                if v.is_nan() {
+                    continue;
+                }
+                min = Some(match min {
+                    Some(m) if m < v => m,
+                    _ => v,
+                });
+                max = Some(match max {
+                    Some(m) if m > v => m,
+                    _ => v,
+                });
+            }
+            data_min[j] = min.unwrap_or_else(F::nan);
+            data_max[j] = max.unwrap_or_else(F::nan);
         }
 
         // Derived affine attributes mirroring sklearn (_data.py:507-514, :88).
@@ -303,6 +393,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinMaxScaler<F> {
             min_,
             data_range_,
             n_samples_seen_: n_samples,
+            clip: self.clip,
         })
     }
 }
@@ -314,7 +405,16 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMinMaxScal
     /// Transform data by scaling each feature to the configured range.
     ///
     /// Constant columns where `data_max == data_min` are mapped to
-    /// `feature_range[0]` (matching scikit-learn).
+    /// `feature_range[0]` (matching scikit-learn). NaN inputs pass through as
+    /// NaN (`nan * scale + min = nan`), and an all-NaN fitted column (whose
+    /// `data_min`/`data_max` are NaN) transforms to NaN, matching sklearn's
+    /// `allow-nan` contract (`_data.py:494`,`:497-498`).
+    ///
+    /// When `clip` is set, each output element is clamped to
+    /// `[feature_range.0, feature_range.1]` after the affine map (sklearn
+    /// `if self.clip: np.clip(X, fr[0], fr[1])`, `_data.py:545-546`). The clamp
+    /// leaves NaN unchanged (both `< lo` and `> hi` comparisons are `false` for
+    /// NaN, mirroring `np.clip(nan, lo, hi) == nan`).
     ///
     /// # Errors
     ///
@@ -329,25 +429,45 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMinMaxScal
                 context: "FittedMinMaxScaler::transform".into(),
             });
         }
+        // sklearn `transform` validates with `force_all_finite="allow-nan"`
+        // (`_data.py:539`): NaN passes through, +/-inf raises ValueError (#2200).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let (range_min, range_max) = self.feature_range;
-        let range_width = range_max - range_min;
+
+        // NaN-safe element-wise clamp to [range_min, range_max]. For a NaN `v`
+        // both comparisons are `false`, so NaN is returned unchanged — matching
+        // `np.clip(nan, lo, hi) == nan` (`_data.py:545-546`).
+        let clamp = |v: F| -> F {
+            if v < range_min {
+                range_min
+            } else if v > range_max {
+                range_max
+            } else {
+                v
+            }
+        };
 
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let min = self.data_min[j];
-            let max = self.data_max[j];
-            let span = max - min;
-            if span == F::zero() {
-                // Constant column: sklearn maps it to feature_range[0]
-                // (_handle_zeros_in_scale, _data.py:88,508-511).
-                for v in &mut col {
-                    *v = range_min;
-                }
-                continue;
-            }
+            // sklearn transform is `X *= self.scale_; X += self.min_`
+            // (`_data.py:543-544`). The precomputed `scale_`/`min_` (via
+            // `_handle_zeros_in_scale`) already encode the constant-column case:
+            // a fit-constant column has `scale_ = range_width`,
+            // `min_ = fr0 - data_min*scale_`, so the FITTED value maps to
+            // `feature_range[0]` while HELD-OUT data gets the affine map (it is
+            // NOT forced to `feature_range[0]`, #2201). NaN inputs pass through
+            // (`nan*scale + min = nan`).
+            let scale = self.scale_[j];
+            let offset = self.min_[j];
             for v in &mut col {
-                *v = (*v - min) / span * range_width + range_min;
+                let scaled = *v * scale + offset;
+                *v = if self.clip { clamp(scaled) } else { scaled };
             }
         }
         Ok(out)

@@ -11,7 +11,7 @@
 //!   * RED pins — the constant/zero-range column divergence; these FAIL today
 //!     and must be flipped by the generator (tracking blocker #1170).
 
-use ferrolearn_core::traits::{Fit, FitTransform};
+use ferrolearn_core::traits::{Fit, FitTransform, Transform};
 use ferrolearn_preprocess::MinMaxScaler;
 use ndarray::array;
 
@@ -313,4 +313,313 @@ fn req2_single_row_fit_all_columns_map_to_range_low() {
             scaled[[0, j]]
         );
     }
+}
+
+// ===========================================================================
+// REQ-4 — NaN tolerance (force_all_finite="allow-nan" + _nanmin/_nanmax).
+// sklearn `_data.py:494` (force_all_finite="allow-nan"), `:497-498`
+// (data_min=_nanmin(X,axis=0), data_max=_nanmax(X,axis=0)). NaN entries are
+// ignored when computing the per-column min/max and pass through the affine
+// map unchanged (nan*scale+min = nan). An ALL-NaN column -> _nanmin/_nanmax
+// return nan -> scale_/min_/transform are nan (no error, no zero substitution).
+// All expected values from the LIVE sklearn 1.5.2 oracle (run from /tmp),
+// never copied from ferrolearn (R-CHAR-3).
+// ===========================================================================
+
+/// REQ-4: single-column NaN fit. The NaN row is ignored for min/max
+/// (data_min=1, data_max=3) and passes through transform as NaN.
+/// Live oracle:
+///   `python3 -c "import numpy as np; from sklearn.preprocessing import MinMaxScaler; \
+///    print(MinMaxScaler().fit_transform([[1.],[np.nan],[3.]]).tolist())"`
+///   -> `[[0.0], [nan], [1.0]]`
+///   `m=MinMaxScaler().fit([[1.],[np.nan],[3.]]); m.data_min_=[1.0], m.data_max_=[3.0]`.
+#[test]
+fn req4_nan_fit_single_column_ignored_for_min_max() {
+    // Live sklearn 1.5.2 oracle.
+    let sk_min = 1.0_f64;
+    let sk_max = 3.0_f64;
+    let sk_tf = [Some(0.0_f64), None, Some(1.0_f64)]; // None = NaN position.
+
+    let scaler = MinMaxScaler::<f64>::new();
+    let x = array![[1.0], [f64::NAN], [3.0]];
+    let fitted = scaler.fit(&x, &()).unwrap();
+    assert!((fitted.data_min()[0] - sk_min).abs() < 1e-12);
+    assert!((fitted.data_max()[0] - sk_max).abs() < 1e-12);
+
+    let scaled = fitted.transform(&x).unwrap();
+    for (i, exp) in sk_tf.iter().enumerate() {
+        match exp {
+            Some(v) => assert!(
+                (scaled[[i, 0]] - v).abs() < 1e-12,
+                "[{i}] sklearn {v} ferrolearn {}",
+                scaled[[i, 0]]
+            ),
+            None => assert!(
+                scaled[[i, 0]].is_nan(),
+                "[{i}] sklearn nan ferrolearn {}",
+                scaled[[i, 0]]
+            ),
+        }
+    }
+}
+
+/// REQ-4: multi-column fixture with NaN scattered across different rows and
+/// columns. Each column's data_min/data_max ignore that column's NaN, and the
+/// NaN positions pass through transform as NaN.
+/// Live oracle:
+///   `X=[[1.,10.,nan],[nan,20.,5.],[3.,nan,7.]]`
+///   `m=MinMaxScaler().fit(X)` -> `data_min_=[1.,10.,5.]`, `data_max_=[3.,20.,7.]`
+///   `MinMaxScaler().fit_transform(X)` ->
+///     `[[0.0, 0.0, nan], [nan, 1.0, 0.0], [1.0, nan, 1.0]]`.
+#[test]
+fn req4_nan_fit_multi_column_scattered() {
+    // Live sklearn 1.5.2 oracle.
+    let sk_min = [1.0_f64, 10.0, 5.0];
+    let sk_max = [3.0_f64, 20.0, 7.0];
+    // None = NaN position per the oracle transform.
+    let sk_tf = [
+        [Some(0.0_f64), Some(0.0), None],
+        [None, Some(1.0), Some(0.0)],
+        [Some(1.0), None, Some(1.0)],
+    ];
+
+    let nan = f64::NAN;
+    let x = array![[1.0, 10.0, nan], [nan, 20.0, 5.0], [3.0, nan, 7.0]];
+    let scaler = MinMaxScaler::<f64>::new();
+    let fitted = scaler.fit(&x, &()).unwrap();
+    for j in 0..3 {
+        assert!(
+            (fitted.data_min()[j] - sk_min[j]).abs() < 1e-12,
+            "data_min[{j}] sklearn {} ferrolearn {}",
+            sk_min[j],
+            fitted.data_min()[j]
+        );
+        assert!(
+            (fitted.data_max()[j] - sk_max[j]).abs() < 1e-12,
+            "data_max[{j}] sklearn {} ferrolearn {}",
+            sk_max[j],
+            fitted.data_max()[j]
+        );
+    }
+
+    let scaled = fitted.transform(&x).unwrap();
+    for i in 0..3 {
+        for j in 0..3 {
+            match sk_tf[i][j] {
+                Some(v) => assert!(
+                    (scaled[[i, j]] - v).abs() < 1e-12,
+                    "[{i},{j}] sklearn {v} ferrolearn {}",
+                    scaled[[i, j]]
+                ),
+                None => assert!(
+                    scaled[[i, j]].is_nan(),
+                    "[{i},{j}] sklearn nan ferrolearn {}",
+                    scaled[[i, j]]
+                ),
+            }
+        }
+    }
+}
+
+/// REQ-4: an ALL-NaN column. sklearn's `_nanmin`/`_nanmax` return nan on an
+/// all-NaN slice (with an "All-NaN slice" RuntimeWarning we don't need to
+/// emit), so data_min_/data_max_/scale_/min_ are nan and that column
+/// transforms to nan — no panic, no zero substitution. The finite column is
+/// scaled normally.
+/// Live oracle:
+///   `Xa=[[1.,nan],[2.,nan],[3.,nan]]`
+///   `m=MinMaxScaler().fit(Xa)` -> `data_min_=[1.,nan]`, `data_max_=[3.,nan]`,
+///     `scale_=[0.5,nan]`, `min_=[-0.5,nan]`
+///   `MinMaxScaler().fit_transform(Xa)` -> `[[0.0,nan],[0.5,nan],[1.0,nan]]`.
+#[test]
+fn req4_all_nan_column_yields_nan_no_panic() {
+    // Live sklearn 1.5.2 oracle (finite column 0).
+    let sk_col0 = [0.0_f64, 0.5, 1.0];
+
+    let nan = f64::NAN;
+    let x = array![[1.0, nan], [2.0, nan], [3.0, nan]];
+    let scaler = MinMaxScaler::<f64>::new();
+    let fitted = scaler.fit(&x, &()).unwrap();
+
+    // All-NaN column 1: data_min_/data_max_/scale_/min_ are nan (oracle).
+    assert!(fitted.data_min()[1].is_nan(), "data_min[1] must be nan");
+    assert!(fitted.data_max()[1].is_nan(), "data_max[1] must be nan");
+    assert!(fitted.scale()[1].is_nan(), "scale_[1] must be nan");
+    assert!(fitted.min()[1].is_nan(), "min_[1] must be nan");
+    // Finite column 0 is unaffected.
+    assert!((fitted.data_min()[0] - 1.0).abs() < 1e-12);
+    assert!((fitted.data_max()[0] - 3.0).abs() < 1e-12);
+
+    let scaled = fitted.transform(&x).unwrap();
+    for i in 0..3 {
+        assert!(
+            (scaled[[i, 0]] - sk_col0[i]).abs() < 1e-12,
+            "[{i},0] sklearn {} ferrolearn {}",
+            sk_col0[i],
+            scaled[[i, 0]]
+        );
+        assert!(
+            scaled[[i, 1]].is_nan(),
+            "[{i},1] sklearn nan ferrolearn {}",
+            scaled[[i, 1]]
+        );
+    }
+}
+
+// ===========================================================================
+// REQ-10 — clip parameter (sklearn `MinMaxScaler(clip=...)`, `_data.py:411`,
+// transform clip `:545-546`). With `clip=True`, transformed output is clamped
+// element-wise to `[feature_range[0], feature_range[1]]` AFTER the affine map —
+// this matters for held-out data outside the fitted min/max range. NaN stays
+// NaN (np.clip leaves nan). Default/`clip=False` does NOT clip. All expected
+// values from the LIVE sklearn 1.5.2 oracle (R-CHAR-3).
+// ===========================================================================
+
+/// REQ-10: default range `(0,1)`, held-out OUT-OF-RANGE data. Without clip the
+/// affine map produces values outside `[0,1]`; with `clip=True` they are
+/// clamped to `[0,1]`.
+/// Live oracle:
+///   `m=MinMaxScaler().fit([[0.],[1.]])`
+///   `m.transform([[-1.],[2.],[0.5]])`              -> `[[-1.0],[2.0],[0.5]]`
+///   `MinMaxScaler(clip=True).fit([[0.],[1.]]).transform([[-1.],[2.],[0.5]])`
+///                                                  -> `[[0.0],[1.0],[0.5]]`.
+#[test]
+fn req10_clip_default_range_out_of_range_holdout() {
+    // Live sklearn 1.5.2 oracle.
+    let sk_noclip = [-1.0_f64, 2.0, 0.5];
+    let sk_clip = [0.0_f64, 1.0, 0.5];
+
+    let train = array![[0.0], [1.0]];
+    let holdout = array![[-1.0], [2.0], [0.5]];
+
+    // clip=False (default): no clamping.
+    let fitted = MinMaxScaler::<f64>::new().fit(&train, &()).unwrap();
+    let out = fitted.transform(&holdout).unwrap();
+    for i in 0..3 {
+        assert!(
+            (out[[i, 0]] - sk_noclip[i]).abs() < 1e-12,
+            "noclip[{i}] sklearn {} ferrolearn {}",
+            sk_noclip[i],
+            out[[i, 0]]
+        );
+    }
+
+    // clip=True: clamp to [0,1].
+    let fitted_c = MinMaxScaler::<f64>::new()
+        .with_clip(true)
+        .fit(&train, &())
+        .unwrap();
+    let out_c = fitted_c.transform(&holdout).unwrap();
+    for i in 0..3 {
+        assert!(
+            (out_c[[i, 0]] - sk_clip[i]).abs() < 1e-12,
+            "clip[{i}] sklearn {} ferrolearn {}",
+            sk_clip[i],
+            out_c[[i, 0]]
+        );
+    }
+}
+
+/// REQ-10: custom range `(-1,1)` so the clip bounds are NOT 0/1. Held-out
+/// out-of-range data clamps to `[-1, 1]`.
+/// Live oracle:
+///   `m=MinMaxScaler(feature_range=(-1,1)).fit([[0.],[10.]])`
+///   `m.transform([[-5.],[15.],[5.]])`                       -> `[[-2.0],[2.0],[0.0]]`
+///   `MinMaxScaler(feature_range=(-1,1),clip=True).fit([[0.],[10.]]).transform(...)`
+///                                                           -> `[[-1.0],[1.0],[0.0]]`.
+#[test]
+fn req10_clip_custom_range_out_of_range_holdout() {
+    // Live sklearn 1.5.2 oracle.
+    let sk_noclip = [-2.0_f64, 2.0, 0.0];
+    let sk_clip = [-1.0_f64, 1.0, 0.0];
+
+    let train = array![[0.0], [10.0]];
+    let holdout = array![[-5.0], [15.0], [5.0]];
+
+    let fitted = MinMaxScaler::<f64>::with_feature_range(-1.0, 1.0)
+        .unwrap()
+        .fit(&train, &())
+        .unwrap();
+    let out = fitted.transform(&holdout).unwrap();
+    for i in 0..3 {
+        assert!(
+            (out[[i, 0]] - sk_noclip[i]).abs() < 1e-12,
+            "noclip[{i}] sklearn {} ferrolearn {}",
+            sk_noclip[i],
+            out[[i, 0]]
+        );
+    }
+
+    let fitted_c = MinMaxScaler::<f64>::with_feature_range(-1.0, 1.0)
+        .unwrap()
+        .with_clip(true)
+        .fit(&train, &())
+        .unwrap();
+    let out_c = fitted_c.transform(&holdout).unwrap();
+    for i in 0..3 {
+        assert!(
+            (out_c[[i, 0]] - sk_clip[i]).abs() < 1e-12,
+            "clip[{i}] sklearn {} ferrolearn {}",
+            sk_clip[i],
+            out_c[[i, 0]]
+        );
+    }
+}
+
+/// REQ-10 + REQ-4: clip with a NaN held-out value. np.clip leaves NaN as NaN,
+/// so a NaN input with clip=True transforms to NaN; the finite out-of-range
+/// values still clamp.
+/// Live oracle:
+///   `MinMaxScaler(clip=True).fit([[0.],[1.]]).transform([[-1.],[nan],[2.]])`
+///     -> `[[0.0],[nan],[1.0]]`.
+#[test]
+fn req10_clip_with_nan_passthrough() {
+    // Live sklearn 1.5.2 oracle (None = nan position).
+    let sk = [Some(0.0_f64), None, Some(1.0_f64)];
+
+    let train = array![[0.0], [1.0]];
+    let holdout = array![[-1.0], [f64::NAN], [2.0]];
+
+    let fitted = MinMaxScaler::<f64>::new()
+        .with_clip(true)
+        .fit(&train, &())
+        .unwrap();
+    let out = fitted.transform(&holdout).unwrap();
+    for (i, exp) in sk.iter().enumerate() {
+        match exp {
+            Some(v) => assert!(
+                (out[[i, 0]] - v).abs() < 1e-12,
+                "[{i}] sklearn {v} ferrolearn {}",
+                out[[i, 0]]
+            ),
+            None => assert!(
+                out[[i, 0]].is_nan(),
+                "[{i}] sklearn nan ferrolearn {}",
+                out[[i, 0]]
+            ),
+        }
+    }
+}
+
+/// REQ-10: `with_copy` is an accept-and-document no-op. Toggling it does not
+/// change the transform output (ferrolearn's `Transform` always allocates a
+/// fresh array). No sklearn oracle is needed — this pins the documented
+/// invariant that `copy` has no observable effect on values.
+#[test]
+fn req10_copy_is_no_op_on_values() {
+    let train = array![[1.0], [2.0], [3.0]];
+    let x = array![[1.5]];
+
+    let out_default = MinMaxScaler::<f64>::new()
+        .fit(&train, &())
+        .unwrap()
+        .transform(&x)
+        .unwrap();
+    let out_copy_false = MinMaxScaler::<f64>::new()
+        .with_copy(false)
+        .fit(&train, &())
+        .unwrap()
+        .transform(&x)
+        .unwrap();
+    assert!((out_default[[0, 0]] - out_copy_false[[0, 0]]).abs() < 1e-15);
 }

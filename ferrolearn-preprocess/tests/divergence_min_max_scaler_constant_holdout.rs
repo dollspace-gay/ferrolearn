@@ -57,7 +57,6 @@ use ndarray::array;
 ///   -> `[[-1.0, 0.5], [4.0, 0.5]]`.
 /// Tracking: #2201
 #[test]
-#[ignore = "divergence: transform forces constant col to range_min, sklearn applies affine to held-out; tracking #2201"]
 fn divergence_constant_column_holdout_uses_affine() {
     // Live sklearn 1.5.2 oracle for col 0 of the held-out rows.
     let sk_col0 = [-1.0_f64, 4.0];
@@ -85,7 +84,6 @@ fn divergence_constant_column_holdout_uses_affine() {
 ///   -> `[[1.0, 0.5]]`.
 /// Tracking: #2201
 #[test]
-#[ignore = "divergence: constant-col held-out + clip; tracking #2201"]
 fn divergence_constant_column_holdout_with_clip() {
     // Live sklearn 1.5.2 oracle: affine 9 -> 4.0, clipped to 1.0.
     let sk_col0 = 1.0_f64;

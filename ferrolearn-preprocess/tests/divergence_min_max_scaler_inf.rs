@@ -49,7 +49,6 @@ use ndarray::array;
 /// ferrolearn: returns `Ok` (only NaN is skipped; inf is kept as data_max).
 /// Tracking: #2200
 #[test]
-#[ignore = "divergence: MinMaxScaler::fit accepts inf, sklearn raises ValueError; tracking #2200"]
 fn divergence_fit_rejects_positive_inf() {
     // Live sklearn 1.5.2 oracle: this input raises ValueError, so a faithful
     // translation must return Err (no fitted model). Asserting `is_err()` is
@@ -69,7 +68,6 @@ fn divergence_fit_rejects_positive_inf() {
 /// Live oracle: `MinMaxScaler().fit([[1.],[-inf],[3.]])` -> `ValueError`.
 /// Tracking: #2200
 #[test]
-#[ignore = "divergence: MinMaxScaler::fit accepts -inf, sklearn raises ValueError; tracking #2200"]
 fn divergence_fit_rejects_negative_inf() {
     let scaler = MinMaxScaler::<f64>::new();
     let x = array![[1.0], [f64::NEG_INFINITY], [3.0]];

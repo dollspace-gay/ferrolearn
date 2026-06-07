@@ -67,7 +67,6 @@ use ndarray::array;
 ///   -> `[5.0, 5.5, 7.0]`.
 /// Tracking: #2202
 #[test]
-#[ignore = "divergence: inverse_transform forces fit-constant col to data_min for held-out data (sklearn uses affine scale_=1,min_=-5); tracking #2202"]
 fn divergence_inverse_constant_column_holdout_uses_affine() {
     // Live sklearn 1.5.2 oracle, never copied from ferrolearn.
     let sk = [5.0_f64, 5.5, 7.0];
@@ -96,7 +95,6 @@ fn divergence_inverse_constant_column_holdout_uses_affine() {
 ///    .inverse_transform([[2.],[3.5],[8.]])` -> `[5.0, 5.5, 7.0]`.
 /// Tracking: #2202
 #[test]
-#[ignore = "divergence: inverse_transform constant col custom-range held-out collapses to data_min; tracking #2202"]
 fn divergence_inverse_constant_column_custom_range_holdout() {
     // Live sklearn 1.5.2 oracle.
     let sk = [5.0_f64, 5.5, 7.0];
@@ -126,7 +124,6 @@ fn divergence_inverse_constant_column_custom_range_holdout() {
 /// own `fit`/`transform`). A faithful translation must return `Err`.
 /// Tracking: #2202
 #[test]
-#[ignore = "divergence: inverse_transform accepts +/-inf where sklearn rejects (force_all_finite=allow-nan); tracking #2202"]
 fn divergence_inverse_rejects_inf() {
     let train = array![[1.0_f64], [2.0], [3.0]];
     let fitted = MinMaxScaler::<f64>::new().fit(&train, &()).unwrap();
