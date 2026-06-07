@@ -134,7 +134,11 @@ print(C)
 print(Y_n_chunks)
 "#
     );
-    let out = Command::new("python3").arg("-c").arg(script).output().ok()?;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
     if !out.status.success() {
         eprintln!(
             "sklearn oracle unavailable; skipping. stderr:\n{}",

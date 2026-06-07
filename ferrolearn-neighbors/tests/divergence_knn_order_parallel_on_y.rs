@@ -83,7 +83,6 @@ fn caveat_fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
 ///
 /// Tracking: #2143
 #[test]
-#[ignore = "divergence: KNN kneighbors tie ORDER is parallel_on_X single-heap, sklearn default is parallel_on_Y (auto->brute); tracking #2143"]
 fn divergence_kneighbors_order_differs_from_sklearn_default() {
     let (x, y, xq) = caveat_fixture();
 

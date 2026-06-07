@@ -1,22 +1,23 @@
-//! Divergence pins for the #2139 KNN tie-break claim.
+//! Divergence pins for the #2139 / #2141 KNN exact-tie selection.
 //!
-//! #2139 routes every `algorithm` variant of
-//! `FittedKNeighborsClassifier`/`Regressor` through
-//! `kdtree::brute_force_knn`, which selects the k nearest with a STABLE
-//! `sort_by (distance asc, then index asc)` and claims this reproduces
-//! sklearn's `np.argpartition` + `np.argsort` selection
-//! (`sklearn/neighbors/_base.py:738`, `:740-741`) with a "LOWEST-INDEX"
-//! tie-break that is "identical for every `algorithm`".
+//! The prior interim fix routed every `algorithm` variant through a STABLE
+//! `(distance asc, then index asc)` brute top-k and CLAIMED this reproduced
+//! sklearn's selection with a "LOWEST-INDEX" tie-break. That claim was FALSE:
+//! sklearn does NOT select the lowest tied index when a strictly closer
+//! (fp-distinct) point pushes the k-th boundary into an exact-distance tie set.
+//! On the fixture below sklearn keeps idx2 (not the lowest-index idx1),
+//! flipping the observable `predict`/`predict_proba`.
 //!
-//! The algorithm-invariance half of the claim holds on the ferrolearn side
-//! (the in-module `test_knn_tie_break_lowest_index_all_algorithms` is green).
-//! The "matches sklearn (lowest index)" half is FALSE: sklearn's
-//! `np.argpartition` does NOT select the lowest tied index when a strictly
-//! closer (fp-distinct) point pushes the k-th boundary into an exact-distance
-//! tie set. ferrolearn's lowest-index rule then selects a DIFFERENT set than
-//! sklearn, flipping the observable `predict` and `predict_proba`.
+//! Root cause: sklearn's dense-f64-euclidean KNN (every `algorithm` string)
+//! selects with its own fixed-size max-heap `NeighborsHeap` — `heap_push`
+//! (`sklearn/utils/_heap.pyx`) over squared euclidean distances pushed in index
+//! order, then `simultaneous_sort` (`sklearn/utils/_sorting.pyx`) — NOT
+//! `np.argpartition` + `np.argsort` (`_base.py:738` is the non-reduction
+//! fallback). ferrolearn now ports that heap (`knn.rs::heap_push` /
+//! `simultaneous_sort` / `neighbors_heap_select`, f64 path of `find_neighbors`),
+//! so the exact-tie SET and ORDER match sklearn and these pins are green.
 //!
-//! Tracking: #2141.
+//! Tracking: #2139, #2141. Expected values are the live sklearn 1.5.2 oracle.
 
 use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_neighbors::{Algorithm, KNeighborsClassifier};
@@ -26,15 +27,20 @@ use ndarray::{Array1, Array2, array};
 /// at distance sqrt(2 * 0.7071^2) = 0.99999041 — STRICTLY closer than the four
 /// unit-axis points idx1..idx4, which are at EXACTLY distance 1.0. So the k=4
 /// neighbor set is { idx0, idx5, idx6, ONE of the {1,2,3,4} tie }.
+#[allow(
+    clippy::approx_constant,
+    reason = "0.7071 is the exact #2141 sklearn-oracle fixture coordinate, not an \
+              approximation of FRAC_1_SQRT_2; changing it would change the oracle result"
+)]
 fn fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
     let x = array![
-        [0.0, 0.0],     // idx0  dist 0
-        [1.0, 0.0],     // idx1  dist 1.0  (exact tie)
-        [-1.0, 0.0],    // idx2  dist 1.0  (exact tie)
-        [0.0, 1.0],     // idx3  dist 1.0  (exact tie)
-        [0.0, -1.0],    // idx4  dist 1.0  (exact tie)
-        [0.7071, 0.7071],   // idx5  dist 0.99999041  (strictly closer)
-        [-0.7071, 0.7071],  // idx6  dist 0.99999041  (strictly closer)
+        [0.0, 0.0],        // idx0  dist 0
+        [1.0, 0.0],        // idx1  dist 1.0  (exact tie)
+        [-1.0, 0.0],       // idx2  dist 1.0  (exact tie)
+        [0.0, 1.0],        // idx3  dist 1.0  (exact tie)
+        [0.0, -1.0],       // idx4  dist 1.0  (exact tie)
+        [0.7071, 0.7071],  // idx5  dist 0.99999041  (strictly closer)
+        [-0.7071, 0.7071], // idx6  dist 0.99999041  (strictly closer)
     ];
     // Labels chosen so the tie-resolved 4th member decides the vote:
     // idx0=0, idx1=0, idx2=1, idx5=1, idx6=1 (idx3/idx4 unused at k=4).
@@ -43,10 +49,10 @@ fn fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
     (x, y, xq)
 }
 
-/// Divergence: `FittedKNeighborsClassifier::kneighbors` selects the LOWEST
-/// tied index (idx1) at the k=4 boundary, but sklearn's `np.argpartition`
-/// (`sklearn/neighbors/_base.py:738`) selects idx2 — for brute AND kd_tree AND
-/// ball_tree AND auto.
+/// Divergence (now fixed): the prior interim selection kept the LOWEST tied
+/// index (idx1) at the k=4 boundary, but sklearn's `NeighborsHeap`
+/// (`_heap.pyx` + `_sorting.pyx`) selects idx2 — for brute AND kd_tree AND
+/// ball_tree AND auto. The ported heap reproduces sklearn exactly.
 ///
 /// Live sklearn 1.5.2 oracle (system python3):
 /// ```text
@@ -59,7 +65,6 @@ fn fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
 ///
 /// Tracking: #2141
 #[test]
-#[ignore = "divergence: KNN tie-break is not sklearn's argpartition (picks lowest-index idx1, sklearn picks idx2); tracking #2141"]
 fn divergence_knn_tiebreak_set_differs_from_sklearn() {
     let (x, y, xq) = fixture();
     // sklearn's selected SET at k=4 (oracle, all algorithms): {0, 2, 5, 6}.
@@ -81,9 +86,9 @@ fn divergence_knn_tiebreak_set_differs_from_sklearn() {
         got.sort_unstable();
         assert_eq!(
             got, sklearn_set,
-            "{algo:?}: kneighbors must select sklearn's argpartition set \
+            "{algo:?}: kneighbors must select sklearn's NeighborsHeap set \
              {sklearn_set:?} (idx2 at the tie boundary), not the lowest-index \
-             set; sklearn/neighbors/_base.py:738"
+             set; sklearn/utils/_heap.pyx + _sorting.pyx"
         );
     }
 }
@@ -102,7 +107,6 @@ fn divergence_knn_tiebreak_set_differs_from_sklearn() {
 ///
 /// Tracking: #2141
 #[test]
-#[ignore = "divergence: KNN tie-break flips predict/predict_proba vs sklearn; tracking #2141"]
 fn divergence_knn_tiebreak_flips_predict() {
     let (x, y, xq) = fixture();
     // sklearn oracle.

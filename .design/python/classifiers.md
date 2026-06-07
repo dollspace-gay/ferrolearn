@@ -351,11 +351,33 @@ Grouped by estimator (`REQ-LOGREG-*`, `REQ-DT-*`, `REQ-RF-*`, `REQ-KNN-*`,
   value-correct but has NO non-test consumer. [Owned downstream:
   `ferrolearn-neighbors` REQ-2/REQ-11 blocker #877 — the binding under-exposes the
   surface.]
-- REQ-KNN-PARAMS: `ferrolearn.KNeighborsClassifier` exposes
-  `weights`/`algorithm`/`leaf_size`/`p`/`metric`/`metric_params`/`n_jobs`
-  (`_classification.py:193`). The wrapper takes `n_neighbors` only. [Owned
-  downstream: `ferrolearn-neighbors` REQ-10/REQ-11 blockers #876 (weights/metric/p)
-  + #877 (PyO3 surface).]
+- REQ-KNN-PARAMS (**SHIPPED, surfaced subset**, #2138): `ferrolearn.KNeighborsClassifier`
+  exposes all nine sklearn constructor params —
+  `n_neighbors`/`weights`/`algorithm`/`leaf_size`/`p`/`metric`/`metric_params`/`n_jobs`
+  (`_classification.py:193`), with `n_neighbors` positional and the rest
+  keyword-only, matching sklearn defaults (`weights='uniform'`,
+  `algorithm='auto'`, `leaf_size=30`, `p=2`, `metric='minkowski'`,
+  `metric_params=None`, `n_jobs=None`). The `RsKNeighborsClassifier::new`
+  binding gains the matching fields and `fit` maps `weights` →
+  `Weights::{Uniform,Distance}` and `algorithm` →
+  `Algorithm::{Auto,BruteForce,KdTree}` (`'ball_tree'` → `Auto`, identical
+  result — the search strategy does not change predict/predict_proba);
+  `leaf_size`/`n_jobs` are ABI no-ops (tree-build perf / threading only).
+  Consumer: `_classifiers.py::KNeighborsClassifier.__init__`/`_build_rs`. The
+  Euclidean-only restriction is validated and the unsupported subset stays
+  NOT-STARTED: `p != 2` and `metric ∉ {'minkowski','euclidean'}` raise
+  `NotImplementedError` (`fit`); a callable `weights` and a non-`None`
+  `metric_params` raise `NotImplementedError` (wrapper) — all #876. Verified by
+  `tests/divergence_classifiers.py::{test_knn_weights_distance_predict_proba_matches_sklearn,
+  test_knn_weights_uniform_default_matches_sklearn,
+  test_knn_algorithm_gives_same_result_as_sklearn,
+  test_knn_get_params_clone_roundtrip, test_knn_unsupported_p_raises,
+  test_knn_unsupported_metric_raises, test_knn_euclidean_metric_supported,
+  test_knn_unsupported_callable_weights_raises,
+  test_knn_unsupported_metric_params_raises, test_knn_check_estimator_green}`
+  (live sklearn 1.5.2 oracle, R-CHAR-3). [Remaining NOT-STARTED: callable
+  weights / Minkowski-p≠2 / custom metric, owned downstream
+  `ferrolearn-neighbors` REQ-10 #876.]
 - REQ-KNN-VALUE-PARITY: `pred` matches sklearn including tie-breaking (R-DEV-1).
   [Uniform-vote predict + smallest-label tie-break is SHIPPED downstream
   (`ferrolearn-neighbors` REQ-1); Euclidean-only/no-distance-weighting and 2-D
@@ -517,9 +539,21 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
   → `(6, 2)`. ferrolearn FAILS:
   `cd ferrolearn-python && PYTHONPATH=python python3 -c "from ferrolearn import KNeighborsClassifier; print(hasattr(KNeighborsClassifier, 'predict_proba'))"`
   → `False` (live-confirmed). Owned downstream `ferrolearn-neighbors` #877.
-- AC-KNN-PARAMS (REQ-KNN-PARAMS): sklearn exposes
-  `weights`/`algorithm`/`leaf_size`/`p`/`metric` (all present). ferrolearn has
-  none. FAIL until added (owned downstream #876/#877).
+- AC-KNN-PARAMS (REQ-KNN-PARAMS): sklearn exposes all nine ctor params
+  (`cd /tmp && python3 -c "import inspect; from sklearn.neighbors import KNeighborsClassifier; print(list(inspect.signature(KNeighborsClassifier.__init__).parameters)[1:])"`
+  → `['n_neighbors','weights','algorithm','leaf_size','p','metric','metric_params','n_jobs']`).
+  ferrolearn now exposes the same nine with matching kinds/defaults
+  (`KNeighborsClassifier().get_params()` == sklearn's;
+  `n_neighbors` positional, rest keyword-only). PASS:
+  `test_knn_get_params_clone_roundtrip`. weights='distance' predict_proba matches
+  the live oracle (`test_knn_weights_distance_predict_proba_matches_sklearn`),
+  the four `algorithm` values give identical results
+  (`test_knn_algorithm_gives_same_result_as_sklearn`), and the unsupported
+  Euclidean-only subset (p≠2 / non-minkowski metric / callable weights /
+  metric_params) raises `NotImplementedError` (the `test_knn_unsupported_*`
+  guards). `check_estimator(KNeighborsClassifier(n_neighbors=3))` is green
+  (`test_knn_check_estimator_green`). [Callable weights / Minkowski-p≠2 / custom
+  metric remain NOT-STARTED — owned downstream #876.]
 - AC-GNB-API-CONFORM (REQ-GNB-API-CONFORM): `test_check_estimator.py`
   (`GaussianNB()`) + `test_cross_val_score.py` pass. Spot oracle:
   `cd /tmp && python3 -c "import numpy as np; from sklearn.naive_bayes import GaussianNB; X=np.array([[0.,0.],[1.,1.],[2.,4.],[3.,9.],[4.,1.],[5.,2.]]); y=np.array([0,0,1,1,0,1]); m=GaussianNB().fit(X,y); print(m.classes_.tolist(), m.predict(X).tolist(), [round(v,6) for v in m.predict_proba(X)[0]])"`
@@ -568,7 +602,7 @@ end-to-end check (verification model B); rebuild first if the Rust side changed
 | REQ-KNN-API-CONFORM (fit/predict + classes_, default uniform path) | SHIPPED | impl `RsKNeighborsClassifier::fit`/`predict` + getter `classes_` in `classifiers.rs` (over `ferrolearn_neighbors::FittedKNeighborsClassifier<f64>`), wrapped by `KNeighborsClassifier` in `_classifiers.py` which marshals `n_neighbors`, sets `classes_` + `n_features_in_`, inherits `score` — mirroring `sklearn/neighbors/_classification.py:39` (class) + `:240` (predict). Non-test consumer: `_classifiers.py::KNeighborsClassifier` + `ferrolearn/__init__.py:5-11` re-export. Verification (model B): pytest → 542 passed (`test_check_estimator.py:29` runs `KNeighborsClassifier(n_neighbors=3)`). Live: `classes_=[0,1]`; default-path uniform-vote predict + smallest-label tie-break is SHIPPED downstream (`ferrolearn-neighbors` REQ-1). |
 | REQ-KNN-NNEIGHBORS-POSITIONAL (n_neighbors positional ABI) — **HEADLINE 2/3** | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 constructor ABI; single-wrapper-fixable). sklearn `__init__(self, n_neighbors=5, *, ...)` (`_classification.py:193`) makes `n_neighbors` positional-or-keyword — `KNeighborsClassifier(3).n_neighbors` → `3`. ferrolearn `_classifiers.py::KNeighborsClassifier.__init__(self, *, n_neighbors=5)` makes it keyword-only — live: `ferrolearn.KNeighborsClassifier(3)` → `TypeError: __init__() takes 1 positional argument but 2 were given`. Single-line Python-wrapper fix: move `n_neighbors` before the `*`. |
 | REQ-KNN-PREDICT-PROBA (predict_proba surfaced) | SHIPPED (#2051) | FIXED — `RsKNeighborsClassifier::predict_proba` (`classifiers.rs`) binds `FittedKNeighborsClassifier::predict_proba` (`knn.rs:487`, normalized weighted class-vote shares, `_classification.py:307`), and `_classifiers.py::KNeighborsClassifier.predict_proba` surfaces it. KNN is multiclass-capable, so unlike the binary-only LR `decision_function` (#2094, reverted) this is sklearn-`check_estimator`-safe — verified by the FULL `pytest tests/` suite (614 passed, `test_check_estimator.py` 504 green). Contract: `proba.shape == (n, n_classes)`, rows sum to 1.0, `predict == classes_[argmax(predict_proba)]`. Guard `tests/divergence_classifiers.py::test_red_knn_predict_proba_surfaced`. |
-| REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | NOT-STARTED | open prereq blockers #876 (`weights`/`metric`/`p` callable variants) + #877 (PyO3 surface — `weights`/`algorithm` not bound). sklearn `_classification.py:193`. ferrolearn `_classifiers.py::KNeighborsClassifier.__init__` exposes `n_neighbors` only; `RsKNeighborsClassifier::new` likewise. The default `weights='uniform'`/`metric='minkowski'`/`p=2` (Euclidean) behavior MATCHES — only the param surface + non-default paths are missing — owned downstream. |
+| REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | SHIPPED (surfaced subset) | FIXED #2138: `RsKNeighborsClassifier::new` gains `weights`/`algorithm`/`leaf_size`/`p`/`metric`/`n_jobs` fields (`#[pyo3(signature = (n_neighbors=5, weights="uniform", algorithm="auto", leaf_size=30, p=2.0, metric="minkowski", n_jobs=None))]`); `_classifiers.py::KNeighborsClassifier.__init__(self, n_neighbors=5, *, weights='uniform', algorithm='auto', leaf_size=30, p=2, metric='minkowski', metric_params=None, n_jobs=None)` surfaces all nine matching sklearn `_classification.py:193`. Consumer `_build_rs`/`fit` maps `weights`→`Weights::{Uniform,Distance}`, `algorithm`→`Algorithm::{Auto,BruteForce,KdTree}` (`ball_tree`→`Auto`, identical result); `leaf_size`/`n_jobs` are ABI no-ops. Euclidean-only restriction validated: p≠2 / metric∉{minkowski,euclidean} / callable weights / metric_params≠None → `NotImplementedError`. weights='distance' predict_proba matches the live oracle. Guards `test_knn_weights_*`/`test_knn_algorithm_gives_same_result_as_sklearn`/`test_knn_get_params_clone_roundtrip`/`test_knn_unsupported_*`/`test_knn_check_estimator_green`. NOT-STARTED (callable-weights/Minkowski-p≠2/custom-metric): downstream #876. |
 | REQ-KNN-VALUE-PARITY (pred array parity incl. tie-break) | SHIPPED | on the DEFAULT uniform path. `_classifiers.py::KNeighborsClassifier.predict` marshals from `RsKNeighborsClassifier::predict` (over `FittedKNeighborsClassifier`), and downstream `ferrolearn-neighbors` REQ-1 is critic-verified for the uniform weighted-vote `np.argmax` smallest-label tie-break (`_classification.py:240-305`). Non-test consumer: `_classifiers.py::KNeighborsClassifier` + re-export. (Live: ferrolearn `KNeighborsClassifier(n_neighbors=3).predict(X)=[0,0,1,1,0,1]` vs oracle `[0,0,0,1,0,1]` on this dataset — a value/tie boundary; distance-weighting/2-D-query/non-Euclidean divergences owned downstream #876.) |
 | REQ-GNB-API-CONFORM (fit/predict/predict_proba + classes_, default path) | SHIPPED | impl `RsGaussianNB::fit`/`predict`/`predict_proba` + getter `classes_` in `classifiers.rs` (over `ferrolearn_bayes::FittedGaussianNB<f64>`), wrapped by `GaussianNB` in `_classifiers.py` which marshals `var_smoothing`, sets `classes_` + `n_features_in_`, inherits `score` — mirroring `sklearn/naive_bayes.py:147` (class) + `:128` (predict_proba). Non-test consumer: `_classifiers.py::GaussianNB` + `ferrolearn/__init__.py:5-11` re-export. Verification (model B): pytest → 542 passed (`test_check_estimator.py:30`). Live default-path oracle MATCHES element-wise: `classes_=[0,1]`, `pred=[0,0,1,1,0,1]`, `proba[0]=[0.993664,0.006336]`. |
 | REQ-GNB-CTOR-ABI (all params keyword-only) | SHIPPED | `_classifiers.py::GaussianNB.__init__(self, *, var_smoothing=1e-9)` makes ALL params keyword-only, MATCHING sklearn `naive_bayes.py:234` (`__init__(self, *, priors=None, var_smoothing=1e-9)` — the `*` is FIRST). Marshalled to `RsGaussianNB::new` via `#[pyo3(signature = (var_smoothing=1e-9))]` + `with_var_smoothing`. Live: both fully `KEYWORD_ONLY`. Non-test consumer: `_classifiers.py::GaussianNB`. |

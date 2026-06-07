@@ -51,12 +51,14 @@
 
 pub mod balltree;
 pub mod graph;
+pub mod introselect;
 pub mod kdtree;
 pub mod knn;
 pub mod local_outlier_factor;
 pub mod nearest_centroid;
 pub mod nearest_neighbors;
 pub mod radius_neighbors;
+pub mod sk_kdtree;
 
 pub use graph::{GraphMode, kneighbors_graph, radius_neighbors_graph, sort_graph_by_row_values};
 

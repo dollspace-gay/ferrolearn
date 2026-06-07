@@ -86,6 +86,17 @@ fn fixture() -> (Array2<f64>, Array1<usize>, Array2<f64>) {
 /// Tracking: #2144
 #[test]
 fn divergence_knn_multichunk_parallel_on_y_tie_set() {
+    // This fixture (n=400 → 2 Y-chunks) pins the DEFAULT multi-core tie
+    // resolution (effective_n_threads >= 2, each chunk its own thread). Under
+    // `OMP_NUM_THREADS=1` sklearn itself collapses to the single-heap order
+    // `[5, 250, 260, 390, 2, 4, 0, 6]` (which ferrolearn also returns and is
+    // equally correct for that env), so skip rather than assert the multi-core
+    // expectation in a single-thread environment.
+    if std::env::var("OMP_NUM_THREADS").as_deref() == Ok("1") {
+        eprintln!("skipped: OMP_NUM_THREADS=1 -> single-heap order (sklearn agrees)");
+        return;
+    }
+
     let (x, y, q) = fixture();
     let k = 8usize;
 

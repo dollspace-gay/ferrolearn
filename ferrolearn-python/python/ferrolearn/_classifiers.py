@@ -300,27 +300,99 @@ class RandomForestClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstima
 class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator):
     """K-Nearest Neighbors Classifier backed by Rust.
 
+    Mirrors ``sklearn.neighbors.KNeighborsClassifier``
+    (``sklearn/neighbors/_classification.py:193``). ``n_neighbors`` is
+    positional-or-keyword; the rest are keyword-only.
+
     Parameters
     ----------
     n_neighbors : int, default=5
         Number of neighbors to use.
+    weights : {'uniform', 'distance'}, default='uniform'
+        Weight function used in prediction. 'uniform' weights all neighbors
+        equally; 'distance' weights by the inverse of distance. Callable
+        weights are NOT supported (NotImplementedError, #876).
+    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, default='auto'
+        Algorithm used to compute the nearest neighbors. This is a search
+        strategy only — all values give identical predict/predict_proba.
+        'ball_tree' maps to 'auto' (no distinct classifier variant).
+    leaf_size : int, default=30
+        Leaf size passed to the tree index. ABI-only: affects tree-build
+        performance, not the result.
+    p : float, default=2
+        Power parameter for the Minkowski metric. Only ``p=2`` (Euclidean) is
+        supported; any other value raises NotImplementedError (#876).
+    metric : str, default='minkowski'
+        Distance metric. Only 'minkowski' (with p=2) and 'euclidean' are
+        supported; any other value raises NotImplementedError (#876).
+    metric_params : dict or None, default=None
+        Additional metric kwargs. Only ``None`` is supported (the Rust core has
+        no custom metric); a non-None value raises NotImplementedError (#876).
+    n_jobs : int or None, default=None
+        Number of parallel jobs. ABI-only: a threading knob, does not affect
+        the result.
     """
 
-    def __init__(self, n_neighbors=5):
+    def __init__(
+        self,
+        n_neighbors=5,
+        *,
+        weights="uniform",
+        algorithm="auto",
+        leaf_size=30,
+        p=2,
+        metric="minkowski",
+        metric_params=None,
+        n_jobs=None,
+    ):
         self.n_neighbors = n_neighbors
+        self.weights = weights
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.p = p
+        self.metric = metric
+        self.metric_params = metric_params
+        self.n_jobs = n_jobs
 
     def fit(self, X, y):
         X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
-        self._rs = _RsKNeighborsClassifier(n_neighbors=self.n_neighbors)
+        self._rs = self._build_rs()
         _fit_rust(self._rs, X, y_encoded)
         self._store_training_data(X, y_encoded)
         return self
 
+    def _build_rs(self):
+        # Callable weights are NOT supported (the Rust core has only
+        # Weights::{Uniform, Distance}); reject before the str-typed boundary
+        # so the user sees a clear NotImplementedError, not a PyO3 TypeError
+        # (NOT-STARTED #876).
+        if callable(self.weights):
+            raise NotImplementedError(
+                "callable weights not supported (only 'uniform'/'distance'; "
+                "NOT-STARTED #876)"
+            )
+        # metric_params is wrapper-validated: the Rust core has no custom
+        # metric, so only None is supported (NOT-STARTED #876).
+        if self.metric_params is not None:
+            raise NotImplementedError(
+                f"metric_params={self.metric_params!r} not supported "
+                "(no custom metric; NOT-STARTED #876)"
+            )
+        return _RsKNeighborsClassifier(
+            n_neighbors=self.n_neighbors,
+            weights=self.weights,
+            algorithm=self.algorithm,
+            leaf_size=self.leaf_size,
+            p=float(self.p),
+            metric=self.metric,
+            n_jobs=self.n_jobs,
+        )
+
     def _rebuild_rs(self):
-        self._rs = _RsKNeighborsClassifier(n_neighbors=self.n_neighbors)
+        self._rs = self._build_rs()
         self._rs.fit(self._fit_X, self._fit_y_encoded)
 
     def predict(self, X):

@@ -19,7 +19,7 @@
 //! blocker). Verified via `tests/divergence_classifiers.py` +
 //! `tests/test_check_estimator.py` (553 pytest pass).
 //!
-//! **22 SHIPPED / 7 NOT-STARTED.**
+//! **23 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -44,7 +44,7 @@
 //! | REQ-KNN-NNEIGHBORS-POSITIONAL (n_neighbors positional ABI) | SHIPPED | FIXED #2046: `_classifiers.py::KNeighborsClassifier.__init__(self, n_neighbors=5)` drops the keyword-only `*`, so `ferrolearn.KNeighborsClassifier(3).n_neighbors == 3` matching sklearn `_classification.py:193`. Guard `test_red_knn_n_neighbors_positional`. |
 //! | REQ-KNN-VALUE-PARITY (pred parity incl. tie-break) | SHIPPED | default uniform path: downstream `ferrolearn-neighbors` REQ-1 verifies the uniform weighted-vote smallest-label tie-break. (Distance-weighting/2-D-query/non-Euclidean divergences downstream #876.) |
 //! | REQ-KNN-PREDICT-PROBA (predict_proba surfaced) | SHIPPED | FIXED #2051: `RsKNeighborsClassifier::predict_proba` binds the existing `FittedKNeighborsClassifier::predict_proba` (normalized weighted class-vote shares, `knn.rs:487`), surfaced by `_classifiers.py::KNeighborsClassifier.predict_proba` — `(n_samples, n_classes)` rows summing to 1.0, with `predict == classes_[argmax(predict_proba)]` matching sklearn `_classification.py:307`. Guard `test_red_knn_predict_proba_surfaced`. |
-//! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | NOT-STARTED | the wrapper exposes `n_neighbors` only; sklearn `_classification.py:193`. Default uniform/minkowski/p=2 MATCHES — downstream #876/#877. |
+//! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | SHIPPED (surfaced subset) | FIXED #2138: `RsKNeighborsClassifier` gains `weights`/`algorithm`/`leaf_size`/`p`/`metric`/`n_jobs` (`#[pyo3(signature = (n_neighbors=5, weights="uniform", algorithm="auto", leaf_size=30, p=2.0, metric="minkowski", n_jobs=None))]`), surfaced by `_classifiers.py::KNeighborsClassifier.__init__` matching sklearn `_classification.py:193` (n_neighbors positional, rest keyword-only). `fit` maps `weights`→`Weights::{Uniform,Distance}`, `algorithm`→`Algorithm::{Auto,BruteForce,KdTree}` (`ball_tree`→`Auto`, identical result); `leaf_size`/`n_jobs` are ABI no-ops (perf/threading only). The Euclidean-only restriction is validated: `p != 2.0` and `metric ∉ {minkowski,euclidean}` raise `NotImplementedError #876`; callable weights raise `NotImplementedError #876`; `metric_params` is wrapper-validated `is None`. Guards `test_knn_weights_distance_*`/`test_knn_algorithm_same_result`/`test_knn_get_params_clone`/`test_knn_unsupported_*`. NOT-STARTED: callable-weights / Minkowski-p≠2 / custom-metric (#876). |
 //! | REQ-GNB-API-CONFORM (fit/predict/predict_proba + classes_, default path) | SHIPPED | `RsGaussianNB::*` + getter, wrapped by `_classifiers.py::GaussianNB` — mirroring `naive_bayes.py:147`/`:128`. Live default-path oracle matches element-wise. |
 //! | REQ-GNB-CTOR-ABI (all params keyword-only) | SHIPPED | `GaussianNB.__init__(self, *, var_smoothing=1e-9)` matches sklearn `naive_bayes.py:234` (the `*` is first). |
 //! | REQ-GNB-FITTED-ATTRS (theta_/var_/class_prior_/class_count_/epsilon_ surfaced) | SHIPPED | FIXED #2102: `RsGaussianNB::{theta_,var_,class_prior_,class_count_,epsilon_}` getters bind the pre-existing `FittedGaussianNB` accessors (`gaussian.rs:549`/:557`/:565`/:572`/:584`); consumer `_classifiers.py::GaussianNB.fit` assigns all five after `classes_`, mirroring sklearn `naive_bayes.py` `theta_`/`var_`/`class_prior_`/`class_count_`/`epsilon_`. Guard `test_gaussiannb_fitted_attrs_match_sklearn` (live oracle, R-CHAR-3). |
@@ -367,25 +367,114 @@ impl RsRandomForestClassifier {
 #[pyclass(name = "_RsKNeighborsClassifier")]
 pub struct RsKNeighborsClassifier {
     n_neighbors: usize,
+    weights: String,
+    algorithm: String,
+    // `leaf_size`/`n_jobs` are stored for ABI parity with sklearn
+    // (`neighbors/_classification.py:193`) but are search-perf / threading
+    // knobs only — they do NOT change the predicted result, so they are
+    // accepted and held without affecting the fitted model.
+    #[allow(
+        dead_code,
+        reason = "ABI-parity no-op: leaf_size affects only tree-build perf, not the result (sklearn neighbors/_classification.py:193)"
+    )]
+    leaf_size: usize,
+    p: f64,
+    metric: String,
+    #[allow(
+        dead_code,
+        reason = "ABI-parity no-op: n_jobs is a threading knob, not a result-affecting param (sklearn neighbors/_classification.py:193)"
+    )]
+    n_jobs: Option<i64>,
     fitted: Option<ferrolearn_neighbors::FittedKNeighborsClassifier<f64>>,
 }
 
 #[pymethods]
 impl RsKNeighborsClassifier {
     #[new]
-    #[pyo3(signature = (n_neighbors=5))]
-    fn new(n_neighbors: usize) -> Self {
+    #[pyo3(signature = (
+        n_neighbors=5,
+        weights="uniform".to_string(),
+        algorithm="auto".to_string(),
+        leaf_size=30,
+        p=2.0,
+        metric="minkowski".to_string(),
+        n_jobs=None,
+    ))]
+    fn new(
+        n_neighbors: usize,
+        weights: String,
+        algorithm: String,
+        leaf_size: usize,
+        p: f64,
+        metric: String,
+        n_jobs: Option<i64>,
+    ) -> Self {
         Self {
             n_neighbors,
+            weights,
+            algorithm,
+            leaf_size,
+            p,
+            metric,
+            n_jobs,
             fitted: None,
         }
     }
 
     fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
+        use ferrolearn_neighbors::{Algorithm, Weights};
+
+        // weights: only 'uniform'/'distance' are supported in the Rust core
+        // (`knn.rs::Weights`); callable weights are NOT-STARTED (#876).
+        let weights = match self.weights.as_str() {
+            "uniform" => Weights::Uniform,
+            "distance" => Weights::Distance,
+            other => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "weights={other:?} not supported (only 'uniform'/'distance'; \
+                     callable weights NOT-STARTED #876)"
+                )));
+            }
+        };
+
+        // algorithm: 'auto'/'brute'/'kd_tree'/'ball_tree' all produce the SAME
+        // predict/predict_proba (search strategy only). The Rust core has no
+        // exact 'ball_tree'-distinct classifier variant, so it maps to Auto
+        // (identical result).
+        let algorithm = match self.algorithm.as_str() {
+            "auto" => Algorithm::Auto,
+            "brute" => Algorithm::BruteForce,
+            "kd_tree" => Algorithm::KdTree,
+            "ball_tree" => Algorithm::Auto,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid algorithm: {other:?} (expected one of \
+                     'auto', 'brute', 'kd_tree', 'ball_tree')"
+                )));
+            }
+        };
+
+        // The Rust core is Euclidean-only (Minkowski with p=2). Reject any
+        // metric/p that would change the distance (NOT-STARTED #876).
+        if self.p != 2.0 {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "p={} not supported (Euclidean-only, p=2; Minkowski-p NOT-STARTED #876)",
+                self.p
+            )));
+        }
+        if self.metric != "minkowski" && self.metric != "euclidean" {
+            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                "metric={:?} not supported (only minkowski(p=2)/euclidean; NOT-STARTED #876)",
+                self.metric
+            )));
+        }
+
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray_usize(y);
         let model = ferrolearn_neighbors::KNeighborsClassifier::<f64>::new()
-            .with_n_neighbors(self.n_neighbors);
+            .with_n_neighbors(self.n_neighbors)
+            .with_weights(weights)
+            .with_algorithm(algorithm);
         let fitted = model
             .fit(&x_nd, &y_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;

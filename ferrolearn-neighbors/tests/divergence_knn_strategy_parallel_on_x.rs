@@ -108,7 +108,11 @@ print(strat)
 print(E)
 "#
     );
-    let out = Command::new("python3").arg("-c").arg(script).output().ok()?;
+    let out = Command::new("python3")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .ok()?;
     if !out.status.success() {
         eprintln!(
             "sklearn oracle unavailable; skipping. stderr:\n{}",
@@ -145,7 +149,6 @@ fn ferro_order(n_q: usize) -> Vec<usize> {
 /// `parallel_on_X` and returns a tie ORDER that ferrolearn's always-on
 /// `parallel_on_Y` reduction does not reproduce.
 #[test]
-#[ignore = "divergence: brute auto never switches to parallel_on_X for n_queries>n_train; tracking #2146"]
 fn divergence_kneighbors_strategy_parallel_on_x_order() {
     let Some((sk_big, strat_big, eff)) = sklearn_oracle(N_Q) else {
         eprintln!("oracle unavailable; skipping");

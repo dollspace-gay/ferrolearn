@@ -369,6 +369,15 @@ parity_ops = ["IsolationForest"]
 # Layer 1 — ferrolearn-neighbors
 # =====================================================================
 
+# Crate root: the module map mirroring sklearn/neighbors/__init__.py. Edited
+# when a new internal translation submodule (e.g. introselect / sk_kdtree, the
+# #2143 default-backend port) is declared.
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/lib.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/neighbors/__init__.py"]
+design = ".design/neighbors/knn.md"
+parity_ops = []
+
 [[route]]
 crate_pattern = "ferrolearn-neighbors/src/knn.rs"
 upstream = [
@@ -422,6 +431,32 @@ upstream = [
 ]
 design = ".design/neighbors/kdtree.md"
 parity_ops = ["KDTree"]
+
+# Default-backend exact-tie port (#2143): the f64 KNeighbors default user gets
+# either brute (ArgKmin parallel_on_Y) or kd_tree (KDTree single-tree query),
+# never the internal parallel_on_X single-heap. sk_kdtree.rs ports sklearn's
+# KDTree build + depth-first query bit-for-bit; introselect.rs ports the
+# libstdc++ std::nth_element that partition_node_indices relies on for its leaf
+# layout (hence the exact tie SET). Both are facets of the knn.rs translation,
+# so they share the knn.md design doc.
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/sk_kdtree.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_kd_tree.pyx.tp",
+  "/home/doll/scikit-learn/sklearn/neighbors/_binary_tree.pxi.tp",
+  "/home/doll/scikit-learn/sklearn/neighbors/_partition_nodes.pyx",
+]
+design = ".design/neighbors/knn.md"
+parity_ops = ["KNeighborsClassifier", "KNeighborsRegressor"]
+
+[[route]]
+crate_pattern = "ferrolearn-neighbors/src/introselect.rs"
+upstream = [
+  "/home/doll/scikit-learn/sklearn/neighbors/_partition_nodes.pyx",
+  "/home/doll/scikit-learn/sklearn/neighbors/_binary_tree.pxi.tp",
+]
+design = ".design/neighbors/knn.md"
+parity_ops = ["KNeighborsClassifier", "KNeighborsRegressor"]
 
 [[route]]
 crate_pattern = "ferrolearn-neighbors/src/balltree.rs"

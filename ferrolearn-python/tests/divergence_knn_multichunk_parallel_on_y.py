@@ -32,7 +32,7 @@ Verification model B (goal.md): the expected value is the LIVE sklearn 1.5.2
 oracle computed in-test (default thread pool — the multi-core contract); nothing
 is literal-copied from the ferrolearn side (R-CHAR-3).
 
-Tracking: #2.
+Tracking: #2144.
 """
 
 import numpy as np

@@ -39,7 +39,7 @@
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
-//! | REQ-1 | Single-row k-NN `query`: true euclidean distances + indices, nearest-first; distinct-distance order matches the live oracle, tie set + sorted distances match (order is leaf_size/traversal-dependent in sklearn) | SHIPPED |
+//! | REQ-1 | Single-row k-NN `query`: true euclidean distances + indices, nearest-first; distinct-distance order matches the live oracle, tie set + sorted distances match (order is leaf_size/traversal-dependent in sklearn). The free `brute_force_knn` (the selection kernel `knn.rs::find_neighbors` routes ALL `algorithm` variants through) orders by `(distance, index)` ascending — exact-distance ties broken by LOWEST index — reproducing sklearn's `argpartition`+`argsort` selection in `KNeighborsMixin.kneighbors` (`_base.py:738`/`:740-741`; mergesort `:277`) so the estimator result is algorithm-invariant (#2139). | SHIPPED |
 //! | REQ-2 | `query` k>n_samples error contract (sklearn `ValueError`, `_binary_tree.pxi.tp:1140-1142`) | NOT-STARTED (#831, blocked on `query`→`Result` threading through knn/nearest_neighbors consumers) |
 //! | REQ-3 | `query_radius` method (radius search on the tree) | NOT-STARTED (#832) |
 //! | REQ-4 | `leaf_size` param + node bounds; non-euclidean metric set (minkowski/p/manhattan/chebyshev) | NOT-STARTED (#833) |
@@ -376,7 +376,19 @@ pub fn euclidean_distance<F: Float>(a: &[F], b: &[F]) -> F {
 ///
 /// # Returns
 ///
-/// A vector of `(index, distance)` pairs sorted by distance ascending.
+/// A vector of `(index, distance)` pairs ordered by `(distance, index)`
+/// ascending: nearest-first, with exact distance ties broken by the LOWEST
+/// training index.
+///
+/// This `(distance, index)` ordering reproduces sklearn's `np.argpartition` +
+/// `np.argsort` selection in `KNeighborsMixin.kneighbors`
+/// (`sklearn/neighbors/_base.py:738` and `:740-741`; cf. the mergesort re-sort
+/// at `:277`), where a k-th-boundary distance tie is won by the lowest index
+/// and ties are ordered by ascending index. Selection uses a single STABLE
+/// `sort_by` on the `(distance, index)` comparator (not `select_nth_unstable_*`),
+/// so the result is deterministic and — since `find_neighbors` routes every
+/// `algorithm` variant through this function — identical for `brute`/`auto`/
+/// `kd_tree`/`ball_tree` (#2139).
 pub fn brute_force_knn<F: Float + Send + Sync + 'static>(
     data: &Array2<F>,
     query: &[F],
@@ -394,14 +406,18 @@ pub fn brute_force_knn<F: Float + Send + Sync + 'static>(
         })
         .collect();
 
-    // Partial sort to get k smallest.
     let k_clamped = k.min(n_samples);
     if k_clamped == 0 {
         return Vec::new();
     }
-    distances.select_nth_unstable_by(k_clamped - 1, |a, b| a.1.partial_cmp(&b.1).unwrap());
+    // Stable selection by (distance, index): distance ascending, then lowest
+    // index first on exact ties — matching sklearn's argpartition + argsort.
+    distances.sort_by(|a, b| {
+        a.1.partial_cmp(&b.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     distances.truncate(k_clamped);
-    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     distances
 }

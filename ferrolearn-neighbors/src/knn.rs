@@ -306,56 +306,213 @@ pub(crate) fn simultaneous_sort(values: &mut [f64], indices: &mut [usize], size:
 /// `sklearn/metrics/_pairwise_distances_reduction/_base.pyx.tp` (Y-chunking) +
 /// `_argkmin.pyx.tp:237-261` (`_parallel_on_Y_synchronize`):
 ///
-/// 1. Y-chunking (`_base.pyx.tp`): Y is split into `n_chunks = ceil(n / 256)`
+/// 1. Y-chunking (`_base.pyx.tp`): Y is split into `Y_n_chunks = ceil(n / 256)`
 ///    contiguous chunks of `pairwise_dist_chunk_size = 256` points
-///    (`Y_n_samples_chunk = min(n, 256)`). For each chunk a per-chunk heap `hc`
-///    of size `k` (init `+inf`/`-1`) is filled by pushing that chunk's points in
-///    INDEX order via `heap_push`; each `hc` then holds its chunk's k smallest
-///    in HEAP-ARRAY layout. For `n <= 256` there is exactly ONE chunk spanning
-///    `0..n`, so this collapses to a single global heap (the single-thread /
-///    `OMP_NUM_THREADS=1` result) — byte-identical to the prior single-heap impl.
+///    (`Y_n_samples_chunk = min(n, 256)`). The chunks are driven by
+///    `prange(Y_n_chunks, schedule='static')` over
+///    `chunks_n_threads = min(Y_n_chunks, effective_n_threads)` OpenMP threads
+///    (`_base.pyx.tp:201-203`, `:312`). With libgomp `schedule='static'` (no
+///    explicit chunk size) each thread is assigned ONE CONTIGUOUS BLOCK of
+///    Y-chunks; the `Y_n_chunks` chunks split across `chunks_n_threads` threads
+///    as near-equal contiguous blocks, the first
+///    `Y_n_chunks % chunks_n_threads` threads getting one extra chunk. Each
+///    thread accumulates ALL points in its block of chunks into ONE per-THREAD
+///    heap `h1` of size `k` (init `+inf`/`-1`), pushing in INDEX order via
+///    `heap_push`. For `n <= 256` there is exactly ONE chunk and one thread
+///    spanning `0..n`, so this collapses to a single global heap (the
+///    single-thread / `OMP_NUM_THREADS=1` result) — byte-identical to the prior
+///    single-heap impl.
 /// 2. `_parallel_on_Y_synchronize` (`_argkmin.pyx.tp:237-261`): the main heap
-///    `h2` of size `k` (init `+inf`/`-1`); for each chunk `c` in `0..n_chunks`
-///    (chunk-major), for `jdx in 0..k` push `(hc.values[jdx], hc.indices[jdx])`
-///    — i.e. re-push each chunk's heap-array slots in heap order, NOT index
-///    order. Re-pushing under-filled sentinel slots is a harmless no-op (the
-///    `val >= values[0]` reject keeps `+inf`/`usize::MAX` out of `h2`). This
-///    per-chunk-then-merge is exactly why the tie SET/ORDER differs from a
-///    single global-index-order heap once `n > 256`.
+///    `h2` of size `k` (init `+inf`/`-1`); for each `thread_num` in
+///    `0..chunks_n_threads` (THREAD-major, NOT chunk-major over `Y_n_chunks`),
+///    for `jdx in 0..k` push `(h1.values[jdx], h1.indices[jdx])` — i.e. re-push
+///    each thread's heap-array slots in heap order, NOT index order. Re-pushing
+///    under-filled sentinel slots is a harmless no-op (the `val >= values[0]`
+///    reject keeps `+inf`/`usize::MAX` out of `h2`). This per-thread-then-merge
+///    is exactly why the tie SET/ORDER differs from a single global-index-order
+///    heap once `n > 256`, AND why the SET depends on `effective_n_threads`
+///    once `Y_n_chunks > effective_n_threads` (multiple chunks then share a
+///    thread, so the boundary tie tracks the machine's thread count).
 /// 3. `simultaneous_sort(h2)` ascending.
+///
+/// The result is intentionally `effective_n_threads`-dependent, mirroring
+/// sklearn's own OpenMP-scheduling-dependent tie resolution on the same machine
+/// (the same precedent as ferrolearn replicating numpy's CPU-dependent AVX2 sort
+/// path): when `Y_n_chunks <= effective_n_threads` (`chunks_n_threads ==
+/// Y_n_chunks`) each thread owns exactly one chunk and this reduces to the
+/// chunk-major merge; when `Y_n_chunks > effective_n_threads` chunks are grouped
+/// per thread and the boundary tie SET tracks the machine's thread count.
 ///
 /// Returns `(indices, sorted_squared_distances)` in sklearn's exact default
 /// brute k-NN order.
 fn brute_parallel_on_y(sq_dist: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
     const CHUNK_SIZE: usize = 256;
     let n = sq_dist.len();
-    let n_chunks = n.div_ceil(CHUNK_SIZE);
+    let eff = effective_n_threads(); // sklearn `_openmp_effective_n_threads(None)`
+    let m = n.div_ceil(CHUNK_SIZE); // Y_n_chunks
+    let t = m.min(eff); // chunks_n_threads = min(Y_n_chunks, effective_n_threads)
 
-    // Main heap (init `+inf`/`-1`), filled by merging the per-chunk heaps.
+    // libgomp `schedule='static'` (no chunk size): distribute the `m` chunks
+    // across `t` threads as contiguous blocks; the first `r` threads get one
+    // extra chunk.
+    let q = m / t;
+    let r = m % t;
+
+    // Main heap (init `+inf`/`-1`), filled by merging the per-thread heaps.
     let mut h2v = vec![f64::INFINITY; k];
     let mut h2i = vec![usize::MAX; k];
 
-    for c in 0..n_chunks {
-        let start = c * CHUNK_SIZE;
-        let end = ((c + 1) * CHUNK_SIZE).min(n);
+    let mut chunk_cursor = 0usize;
+    for thread in 0..t {
+        let n_chunks_this = q + usize::from(thread < r);
+        let c_lo = chunk_cursor;
+        let c_hi = chunk_cursor + n_chunks_this;
+        chunk_cursor = c_hi;
 
-        // Per-chunk heap: push this chunk's points in index order. `j` is the
-        // GLOBAL training index (pushed as the heap index), `start + off`.
-        let mut hcv = vec![f64::INFINITY; k];
-        let mut hci = vec![usize::MAX; k];
-        for (off, &d) in sq_dist[start..end].iter().enumerate() {
-            heap_push(&mut hcv, &mut hci, k, d, start + off);
+        let idx_lo = c_lo * CHUNK_SIZE;
+        let idx_hi = (c_hi * CHUNK_SIZE).min(n);
+
+        // Per-THREAD heap: push this thread's contiguous index range in index
+        // order. `idx_lo + off` is the GLOBAL training index (the heap index).
+        let mut hv = vec![f64::INFINITY; k];
+        let mut hi = vec![usize::MAX; k];
+        for (off, &d) in sq_dist[idx_lo..idx_hi].iter().enumerate() {
+            heap_push(&mut hv, &mut hi, k, d, idx_lo + off);
         }
 
-        // Merge into the main heap (chunk-major): re-push this chunk's
+        // Merge into the main heap (thread-major): re-push this thread's
         // heap-array slots jdx=0..k-1 in heap order.
         for jdx in 0..k {
-            heap_push(&mut h2v, &mut h2i, k, hcv[jdx], hci[jdx]);
+            heap_push(&mut h2v, &mut h2i, k, hv[jdx], hi[jdx]);
         }
     }
 
     simultaneous_sort(&mut h2v, &mut h2i, k);
     (h2i, h2v)
+}
+
+/// sklearn brute `ArgKmin` `parallel_on_X` strategy over already-computed
+/// SQUARED euclidean distances.
+///
+/// sklearn's `auto` strategy resolver (`_base.pyx.tp:183-196`) switches the
+/// brute `ArgKmin.compute(X=queries, Y=training)` reduction from the default
+/// `parallel_on_Y` to `parallel_on_X` whenever `n_samples_Y < n_samples_X`
+/// (i.e. `n_train < n_queries`) OR `4 * chunk_size * effective_n_threads <
+/// n_samples_X`. Under `parallel_on_X` each query owns its OWN heap and the
+/// Y-chunks are pushed SEQUENTIALLY in global training-index order `0..n` into
+/// that single heap, finalized by `simultaneous_sort`
+/// (`_parallel_on_X_prange_iter_finalize`). So for one query this is exactly
+/// the SINGLE global-heap select over all of Y in index order — NOT the
+/// per-chunk-then-merge double-heap of [`brute_parallel_on_y`]. The SET is the
+/// same as `parallel_on_Y`; only the exact-distance tie ORDER at the k-th
+/// boundary differs.
+///
+/// Returns `(indices, sorted_squared_distances)`.
+fn brute_parallel_on_x(sq_dist: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
+    let mut hv = vec![f64::INFINITY; k];
+    let mut hi = vec![usize::MAX; k];
+    for (i, &d) in sq_dist.iter().enumerate() {
+        heap_push(&mut hv, &mut hi, k, d, i);
+    }
+    simultaneous_sort(&mut hv, &mut hi, k);
+    (hi, hv)
+}
+
+/// Resolve sklearn's brute `ArgKmin` `auto` reduction strategy for a whole
+/// `kneighbors` call (`_base.pyx.tp:183-196`).
+///
+/// For `kneighbors`, sklearn calls `ArgKmin.compute(X=queries, Y=training,
+/// strategy="auto")` (`sklearn/neighbors/_base.py:849-851`), so
+/// `n_samples_X = n_queries` and `n_samples_Y = n_train`. With
+/// `chunk_size = 256` the `auto` resolver picks `parallel_on_X` when
+/// `n_samples_Y < n_samples_X` OR `4 * chunk_size * effective_n_threads <
+/// n_samples_X`, else `parallel_on_Y`. The decision depends on the TOTAL query
+/// count, which only the per-call caller knows — hence it is computed once and
+/// threaded into [`find_neighbors`] via a flag.
+fn brute_use_parallel_on_x(n_train: usize, n_queries: usize) -> bool {
+    const CHUNK_SIZE: usize = 256;
+    n_train < n_queries || 4 * CHUNK_SIZE * effective_n_threads() < n_queries
+}
+
+/// sklearn `_openmp_effective_n_threads(None)`
+/// (`sklearn/utils/_openmp_helpers.pyx`), which determines `chunks_n_threads`
+/// for the brute `parallel_on_Y` reduction and therefore the OpenMP-scheduling
+/// tie SET at the k-boundary (see [`brute_parallel_on_y`]).
+///
+/// Replicates sklearn exactly: if `OMP_NUM_THREADS` is set, `omp_get_max_threads`
+/// honours it (first comma token); otherwise the value is
+/// `min(omp_get_max_threads(), cpu_count(only_physical_cores=True))`, which on a
+/// machine whose OMP default is the logical core count (>= physical) equals the
+/// physical core count. The output is therefore intentionally machine-dependent,
+/// mirroring sklearn's own behaviour on the same box. Never panics — every parse
+/// failure degrades to the logical-parallelism fallback.
+fn effective_n_threads() -> usize {
+    // `OMP_NUM_THREADS` override (omp_get_max_threads honours it; first token).
+    if let Ok(s) = std::env::var("OMP_NUM_THREADS")
+        && let Some(tok) = s.split(',').next()
+        && let Ok(v) = tok.trim().parse::<usize>()
+        && v > 0
+    {
+        return v;
+    }
+    // Else physical core count (joblib `cpu_count(only_physical_cores=True)`).
+    if let Some(p) = physical_cores_from_cpuinfo()
+        && p > 0
+    {
+        return p;
+    }
+    // Fallback: logical parallelism.
+    std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1)
+}
+
+/// Count physical cores on Linux as the number of unique `(physical id, core id)`
+/// pairs in `/proc/cpuinfo` (joblib's `only_physical_cores=True` heuristic).
+///
+/// Returns `None` (so the caller falls back to logical parallelism) when
+/// `/proc/cpuinfo` is unreadable or lacks the `physical id` / `core id` fields
+/// (some CPUs / VMs). Never panics.
+fn physical_cores_from_cpuinfo() -> Option<usize> {
+    use std::collections::HashSet;
+
+    let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut pairs: HashSet<(String, String)> = HashSet::new();
+    let mut cur_phys: Option<String> = None;
+    let mut cur_core: Option<String> = None;
+    let mut saw_field = false;
+
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            // End of a processor block — record its (physical id, core id) pair.
+            if let (Some(p), Some(c)) = (cur_phys.take(), cur_core.take()) {
+                pairs.insert((p, c));
+            }
+            cur_phys = None;
+            cur_core = None;
+            continue;
+        }
+        if let Some((key, val)) = line.split_once(':') {
+            let key = key.trim();
+            let val = val.trim().to_string();
+            if key == "physical id" {
+                cur_phys = Some(val);
+                saw_field = true;
+            } else if key == "core id" {
+                cur_core = Some(val);
+                saw_field = true;
+            }
+        }
+    }
+    // Trailing block without a terminating blank line.
+    if let (Some(p), Some(c)) = (cur_phys, cur_core) {
+        pairs.insert((p, c));
+    }
+
+    if !saw_field || pairs.is_empty() {
+        return None;
+    }
+    Some(pairs.len())
 }
 
 /// Find the k nearest neighbors of a query point.
@@ -374,9 +531,12 @@ fn brute_parallel_on_y(sq_dist: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
 /// distance ties (#2143). The auto rule (`sklearn/neighbors/_base.py:607-640`)
 /// selects, for `p=2` low-dim:
 ///
-/// - `n_features > 15` OR `k >= n_samples // 2` -> **brute**, whose default
-///   strategy is `parallel_on_Y` (`brute_parallel_on_y` — the double-heap
-///   transform of `_argkmin.pyx.tp`).
+/// - `n_features > 15` OR `k >= n_samples // 2` -> **brute**, whose `auto`
+///   strategy (`_base.pyx.tp:183-196`) is `parallel_on_Y` (`brute_parallel_on_y`
+///   — the double-heap transform of `_argkmin.pyx.tp`) UNLESS the caller's
+///   `use_parallel_on_x` flag is set (`n_train < n_queries` OR
+///   `4*256*effective_n_threads < n_queries`), in which case the single global
+///   index-order heap `brute_parallel_on_x` is used.
 /// - else -> **kd_tree**, a single-tree depth-first `KDTree.query`
 ///   ([`crate::sk_kdtree::SkKdTree`]), whose leaf push order (hence tie SET)
 ///   follows the bit-exact `std::nth_element` build partition.
@@ -404,6 +564,7 @@ fn find_neighbors<F: Float + Send + Sync + 'static>(
     query_row: &[F],
     k: usize,
     _index: &SpatialIndex,
+    use_parallel_on_x: bool,
 ) -> Vec<(usize, F)> {
     let n_samples = data.nrows();
     let k_clamped = k.min(n_samples);
@@ -440,7 +601,15 @@ fn find_neighbors<F: Float + Send + Sync + 'static>(
                     acc
                 })
                 .collect();
-            let (hi, sq) = brute_parallel_on_y(&sq_dist, k_clamped);
+            // sklearn `ArgKmin` auto strategy (`_base.pyx.tp:183-196`):
+            // `parallel_on_X` when `n_train < n_queries` OR
+            // `4*256*effective_n_threads < n_queries` (computed by the caller,
+            // which knows the total query count), else `parallel_on_Y`.
+            let (hi, sq) = if use_parallel_on_x {
+                brute_parallel_on_x(&sq_dist, k_clamped)
+            } else {
+                brute_parallel_on_y(&sq_dist, k_clamped)
+            };
             // brute returns squared distances; convert to euclidean.
             let dists: Vec<f64> = sq.into_iter().map(|s| s.max(0.0).sqrt()).collect();
             (hi, dists)
@@ -698,6 +867,9 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
 
         let n_samples = x.nrows();
 
+        // Brute `ArgKmin` auto strategy resolved once for the whole call.
+        let use_parallel_on_x = brute_use_parallel_on_x(n_samples_fit, n_samples);
+
         // Use a threshold to avoid Rayon overhead on small inputs.
         const PAR_THRESHOLD: usize = 256;
 
@@ -711,6 +883,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
                         &query,
                         self.n_neighbors,
                         &self.spatial_index,
+                        use_parallel_on_x,
                     );
                     self.weighted_vote(&neighbors)
                 })
@@ -724,6 +897,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
                         &query,
                         self.n_neighbors,
                         &self.spatial_index,
+                        use_parallel_on_x,
                     );
                     self.weighted_vote(&neighbors)
                 })
@@ -826,12 +1000,18 @@ impl<F: Float + Send + Sync + 'static> FittedKNeighborsClassifier<F> {
 
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
+        let use_parallel_on_x = brute_use_parallel_on_x(n_samples_fit, n_samples);
         let mut proba = Array2::<F>::zeros((n_samples, n_classes));
 
         for i in 0..n_samples {
             let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let neighbors =
-                find_neighbors(&self.x_train, &query, self.n_neighbors, &self.spatial_index);
+            let neighbors = find_neighbors(
+                &self.x_train,
+                &query,
+                self.n_neighbors,
+                &self.spatial_index,
+                use_parallel_on_x,
+            );
             let scores = self.class_score_vec(&neighbors);
             let total: F = scores.iter().copied().fold(F::zero(), |a, b| a + b);
             if total > F::zero() {
@@ -1120,6 +1300,9 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
 
         let n_samples = x.nrows();
 
+        // Brute `ArgKmin` auto strategy resolved once for the whole call.
+        let use_parallel_on_x = brute_use_parallel_on_x(n_samples_fit, n_samples);
+
         // Use a threshold to avoid Rayon overhead on small inputs.
         const PAR_THRESHOLD: usize = 256;
 
@@ -1133,6 +1316,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
                         &query,
                         self.n_neighbors,
                         &self.spatial_index,
+                        use_parallel_on_x,
                     );
                     self.weighted_mean(&neighbors)
                 })
@@ -1146,6 +1330,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
                         &query,
                         self.n_neighbors,
                         &self.spatial_index,
+                        use_parallel_on_x,
                     );
                     self.weighted_mean(&neighbors)
                 })
@@ -1278,12 +1463,21 @@ pub(crate) fn kneighbors_impl<F: Float + Send + Sync + 'static>(
     }
 
     let n_queries = x.nrows();
+    // Brute `ArgKmin` auto strategy resolved once for the whole call
+    // (`_base.pyx.tp:183-196`): depends on the TOTAL query count.
+    let use_parallel_on_x = brute_use_parallel_on_x(x_train.nrows(), n_queries);
     let mut distances = Array2::<F>::zeros((n_queries, n_neighbors));
     let mut indices = Array2::<usize>::zeros((n_queries, n_neighbors));
 
     for i in 0..n_queries {
         let query: Vec<F> = (0..n_features).map(|j| x[[i, j]]).collect();
-        let neighbors = find_neighbors(x_train, &query, n_neighbors, spatial_index);
+        let neighbors = find_neighbors(
+            x_train,
+            &query,
+            n_neighbors,
+            spatial_index,
+            use_parallel_on_x,
+        );
         for (k, &(idx, dist)) in neighbors.iter().enumerate() {
             indices[[i, k]] = idx;
             distances[[i, k]] = dist;
