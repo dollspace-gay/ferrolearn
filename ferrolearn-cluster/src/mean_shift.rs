@@ -16,13 +16,16 @@
 //!    points.
 //! 2. **Mean shift iteration**: for each data point (candidate mode), compute
 //!    the mean of all points within `bandwidth` distance and shift the
-//!    candidate to that mean.  Repeat until the shift is smaller than `tol`
-//!    or `max_iter` is reached.
-//! 3. **Mode merging**: candidates whose final positions are within
-//!    `bandwidth` of each other are merged (the one with more nearby points
-//!    becomes the representative center).
+//!    candidate to that mean.  Repeat until the shift is `<= 1e-3 * bandwidth`
+//!    (sklearn's `stop_thresh`) or `max_iter` is reached.
+//! 3. **De-duplication** (sklearn post-processing): converged modes are sorted
+//!    by `(intensity, coordinate)` descending — `intensity` being the number of
+//!    original points within `bandwidth` of the final mode — then greedily
+//!    thinned so that at most one mode survives per `bandwidth`-ball (the
+//!    highest-intensity one). The retained `cluster_centers_` are the ACTUAL
+//!    converged modes, in intensity-sorted order.
 //! 4. **Label assignment**: each training point is assigned to the nearest
-//!    cluster center.
+//!    cluster center (which indexes into the intensity-sorted order).
 //!
 //! Mean Shift does **not** require specifying the number of clusters ahead of
 //! time; that number emerges from the data density and the bandwidth.
@@ -50,26 +53,24 @@
 //! (`class MeanShift(ClusterMixin, BaseEstimator)` `:302-578`; `estimate_bandwidth`
 //! `:43-106`). Design doc: `.design/cluster/mean_shift.md`. Cites use ferrolearn
 //! symbol anchors / sklearn `file:line` (commit 156ef14); expected values from the
-//! live sklearn 1.5.2 oracle (R-CHAR-3). Verify-and-document unit: the
-//! explicit-bandwidth `labels_` PARTITION (up to a label permutation, well-separated
-//! regime) and the `estimate_bandwidth` kNN VALUE (default no-subsampling path) match
-//! sklearn and SHIP through the crate re-export. The `cluster_centers_` VALUES, the
-//! `labels_` INTEGERS, and `n_iter_` DIVERGE — ferrolearn averages each merged mode
-//! group in seed order, while sklearn retains the actual highest-intensity converged
-//! mode sorted by intensity (#984/#986). There is no CPython binding (no
-//! `RsMeanShift`; #993).
+//! live sklearn 1.5.2 oracle (R-CHAR-3). The `cluster_centers_` VALUES (~1e-6), the
+//! `labels_` INTEGERS (exact), and `n_iter_` now MATCH sklearn — `fn fit` sorts
+//! converged modes by `(intensity, coord)` descending and retains the actual
+//! highest-intensity mode per `bandwidth`-ball, and `mean_shift_single` uses
+//! `stop_thresh = 1e-3 * bandwidth` (#984/#986/#990, n_iter side-effect closes #991).
+//! There is no CPython binding (no `RsMeanShift`; #993).
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (explicit-bandwidth `labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `fn fit` (seed-per-point `mean_shift_single` + the mode-merge loop) recovers sklearn's grouping for an explicit `bandwidth` on well-separated data. Consumer: crate re-export `pub use mean_shift::{FittedMeanShift, MeanShift}` (`lib.rs`). Guards: `green_two_blobs_partition_matches_sklearn_bw2`, `green_three_blobs_partition_matches_sklearn_bw15`, `green_fresh_three_blobs_partition_matches_sklearn_bw3` in `tests/divergence_mean_shift.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — absolute `labels_` integers (REQ-4) + `cluster_centers_` values (REQ-2) diverge. |
+//! | REQ-1 (explicit-bandwidth `labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `fn fit` (seed-per-point `mean_shift_single` + the de-dup loop) recovers sklearn's grouping for an explicit `bandwidth` on well-separated data. Consumer: crate re-export `pub use mean_shift::{FittedMeanShift, MeanShift}` (`lib.rs`). Guards: `green_two_blobs_partition_matches_sklearn_bw2`, `green_three_blobs_partition_matches_sklearn_bw15`, `green_fresh_three_blobs_partition_matches_sklearn_bw3` in `tests/divergence_mean_shift.rs` (canonicalized, live-oracle). Now SUPERSEDED by the exact-value guards (REQ-2/REQ-4) below. |
 //! | REQ-3 (`estimate_bandwidth` kNN heuristic, default path) | SHIPPED | impl `pub fn estimate_bandwidth(x, quantile)` mirrors sklearn `estimate_bandwidth(X, quantile=0.3)` (`_mean_shift.py:95-106`): `k=int(n*quantile)` (clip `>=1`), per-point max distance among the `k` nearest (self included at 0), averaged over points. Consumer: `fn fit` None-bandwidth path calls `estimate_bandwidth(x, 0.3)`. Guard: `divergence_auto_bandwidth_n_clusters` (`MeanShift::new().fit(fresh 3-blob)` → 3 clusters, matching sklearn; was 1 under the old median-pairwise). Fixed in #985. Caveat: the `n_samples`/`random_state` subsampling + `n_jobs` params are NOT implemented — they only affect the large-data approximation, not the default (full-sample) VALUE, which matches. |
-//! | REQ-2 (`cluster_centers_` VALUE + intensity ordering) | NOT-STARTED | open prereq blocker #984. sklearn sorts converged modes by `(intensity, coord)` desc and retains the actual highest-intensity mode per `bandwidth`-ball (`_mean_shift.py:529-546`); `cluster_centers_` on docs = `[[3.333,6.0],[1.333,0.666]]`. ferrolearn `fn fit` averages each merged group in seed order — different values + ordering. |
-//! | REQ-4 (`labels_` VALUE parity) | NOT-STARTED | open prereq blocker #986. sklearn `labels_` index into intensity-sorted `cluster_centers_` (`_mean_shift.py:548-557`), docs = `[1,1,1,0,0,0]`; ferrolearn assigns nearest of seed-ordered group-mean centers (same partition, permuted integers). Gated on REQ-2. |
+//! | REQ-2 (`cluster_centers_` VALUE + intensity ordering) | SHIPPED | impl `fn fit` collects `(converged_mode, intensity)` from `mean_shift_single` over every seed, de-dups exact-equal modes (`modes_equal`), sorts by `(intensity, coord)` DESC (`coord_cmp` + intensity), then greedily retains the highest-intensity mode per `bandwidth`-ball (`_mean_shift.py:529-546`), keeping the ACTUAL converged mode in intensity-sorted order. Consumer: crate re-export `pub use mean_shift::{FittedMeanShift, MeanShift}` (`lib.rs`). Guards (live-oracle, ~1e-6): `green_docstring_centers_and_labels_match_sklearn_bw2` (docs → `[[3.333…,6.0],[1.333…,0.666…]]`), `green_two_blobs_centers_and_labels_match_sklearn_bw2`, `green_three_blobs_centers_and_labels_match_sklearn_bw15`, `green_two_clusters_centers_and_labels_match_sklearn_bw5`. |
+//! | REQ-4 (`labels_` VALUE parity) | SHIPPED | impl `fn fit` label loop assigns each point to the nearest retained center (`cluster_all=True`, n_neighbors=1, `_mean_shift.py:548-553`); since the centers are now in sklearn's intensity-sorted order (REQ-2) the integers match exactly. Consumer: crate re-export (`lib.rs`). Guards (live-oracle, exact integers): same four `green_*_centers_and_labels_*` tests (docs → `[1,1,1,0,0,0]`; three_blobs bw1.5 → `[2,2,2,0,0,0,1,1,1]`). The signed `-1`/`cluster_all=False` path stays REQ-6 (#988). |
 //! | REQ-5 (ctor surface `seeds`/`bin_seeding`/`min_bin_freq`/`cluster_all`/`n_jobs`; drop non-sklearn `tol`) | NOT-STARTED | open prereq blocker #987. sklearn `__init__` (`_mean_shift.py:449-466`) = `bandwidth,seeds,bin_seeding,min_bin_freq,cluster_all,n_jobs,max_iter`; ferrolearn `MeanShift<F>` = `bandwidth/max_iter/tol` (missing 5; `tol` is non-sklearn — sklearn hardcodes `1e-3*bandwidth`). |
 //! | REQ-6 (`cluster_all=False` orphan `-1`) | NOT-STARTED | open prereq blocker #988. sklearn fills `labels=-1` then assigns only within-`bandwidth` points (`_mean_shift.py:552-557`); ferrolearn `labels_: Array1<usize>` cannot hold `-1` and always assigns nearest. Needs a signed label type + `cluster_all`. |
 //! | REQ-7 (`bin_seeding`/`get_bin_seeds`/`min_bin_freq` seeding) | NOT-STARTED | open prereq blocker #989. sklearn `get_bin_seeds(X, bandwidth, min_bin_freq)` bins to a `bandwidth`-grid (`_mean_shift.py:249-299`, `:491-495`); ferrolearn always seeds from every data point. |
-//! | REQ-8 (convergence stop-threshold `1e-3*bandwidth`) | NOT-STARTED | open prereq blocker #990. sklearn `stop_thresh = 1e-3 * bandwidth` (`_mean_shift.py:113`, `:124-127`); ferrolearn stops at `shift < tol` with absolute default `tol=1e-3` (diverges for `bandwidth != 1`); `tol` is a non-sklearn knob. |
-//! | REQ-9 (`n_iter_` semantics) | NOT-STARTED | open prereq blocker #991. sklearn `n_iter_ = max(completed_iterations)` incremented after the convergence/`max_iter` check (`_mean_shift.py:124-129`, `:514`), docs = `2`; ferrolearn `fn fit` takes `max(iter+1)` (loop counter, off-by-one/different convention). |
+//! | REQ-8 (convergence stop-threshold `1e-3*bandwidth`) | SHIPPED | impl `fn mean_shift_single` sets `stop_thresh = 1e-3 * bandwidth` and breaks on `shift <= stop_thresh` (`_mean_shift.py:113`, `:124-127`), so the converged modes match sklearn's float VALUES for any bandwidth (this is what makes REQ-2 bit-exact). The non-sklearn `tol` field is now unused by `fit` (its removal is the ctor-surface REQ-5 / #987). Consumer: `fn fit` seed loop. Guards: the `bw != 1` value tests `green_three_blobs_centers_and_labels_match_sklearn_bw15` (bw=1.5) and `green_two_clusters_centers_and_labels_match_sklearn_bw5` (bw=5.0) — their centers match to ~1e-6 only with the scaled threshold. |
+//! | REQ-9 (`n_iter_` semantics) | SHIPPED | side-effect of the REQ-8 fix: `fn mean_shift_single` now mirrors `_mean_shift_single_seed` exactly — increments `completed_iterations` AFTER the convergence/`max_iter` check and returns it (`_mean_shift.py:124-129`); `fn fit` takes `n_iter_max = max(completed)` (`:514`). Consumer: `fn fit`. Guard: `green_n_iter_matches_sklearn_docs_bw2` (docs bw=2 → sklearn `n_iter_ == 2`). |
 //! | REQ-10 (error ABI `InvalidParameterError` + no-neighbour `ValueError`) | NOT-STARTED | open prereq blocker #992. sklearn rejects `bandwidth<=0` with `InvalidParameterError` (`(0,inf)`, `_mean_shift.py:440`) and raises `ValueError` when no seed has neighbours (`:516-522`); ferrolearn raises `FerroError::InvalidParameter` (matching bound, different type/ABI) and cannot hit the no-neighbour case. |
 //! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #993. `grep MeanShift ferrolearn-python/` empty — `RsKMeans` is registered but no `RsMeanShift`, so `import ferrolearn` cannot reach `MeanShift`. Only consumer is the crate re-export. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #994. `mean_shift.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1/2). |
@@ -163,7 +164,8 @@ pub struct FittedMeanShift<F> {
     cluster_centers_: Array2<F>,
     /// Cluster label for each training sample (0-indexed).
     labels_: Array1<usize>,
-    /// Number of mean-shift iterations performed on the last seed point.
+    /// Maximum number of mean-shift iterations performed across all seeds
+    /// (sklearn `n_iter_ = max([completed_iterations])`).
     n_iter_: usize,
 }
 
@@ -180,7 +182,8 @@ impl<F: Float> FittedMeanShift<F> {
         &self.labels_
     }
 
-    /// Return the number of mean-shift iterations in the last seed.
+    /// Return the maximum number of mean-shift iterations across all seeds
+    /// (sklearn `n_iter_`).
     #[must_use]
     pub fn n_iter(&self) -> usize {
         self.n_iter_
@@ -203,6 +206,36 @@ fn sq_dist<F: Float>(a: &[F], b: &[F]) -> F {
     a.iter()
         .zip(b)
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
+}
+
+/// Exact equality of two converged-mode coordinate vectors.
+///
+/// Mirrors Python keying `center_intensity_dict[tuple(my_mean)]`
+/// (`_mean_shift.py:512`): the dict key is the exact float tuple, so two seeds
+/// collapse to one entry only when their converged modes are bit-equal. We use
+/// exact `==` (not a tolerance) to match the `dict` semantics precisely.
+#[inline]
+fn modes_equal<F: Float>(a: &[F], b: &[F]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(&ai, &bi)| ai == bi)
+}
+
+/// Lexicographic comparison of two coordinate vectors, ASCENDING.
+///
+/// Mirrors Python's tuple ordering used in
+/// `sorted(..., key=lambda t: (t[1], t[0]))` (`_mean_shift.py:531`): the
+/// coordinate tuple `t[0]` is compared element-by-element, the first differing
+/// element deciding the order. The caller applies the `reverse=True` direction.
+/// NaN coordinates are impossible for a converged finite-data mean, so a
+/// `partial_cmp` fallback to `Equal` is never hit on the real path.
+#[inline]
+fn coord_cmp<F: Float>(a: &[F], b: &[F]) -> std::cmp::Ordering {
+    for (&ai, &bi) in a.iter().zip(b) {
+        match ai.partial_cmp(&bi) {
+            Some(std::cmp::Ordering::Equal) | None => {}
+            Some(ord) => return ord,
+        }
+    }
+    std::cmp::Ordering::Equal
 }
 
 /// Estimate the mean-shift bandwidth with scikit-learn's kNN heuristic.
@@ -258,24 +291,40 @@ pub fn estimate_bandwidth<F: Float>(x: &Array2<F>, quantile: F) -> Result<F, Fer
 
 /// Perform mean-shift iteration starting from `seed`.
 ///
-/// Returns the converged mode position and the number of iterations taken.
+/// Mirrors `_mean_shift_single_seed` (`sklearn/cluster/_mean_shift.py:110-130`):
+/// at each step the candidate is moved to the (flat-kernel) mean of all points
+/// within `bandwidth`, and the loop stops when either the L2 shift drops to
+/// `stop_thresh = 1e-3 * bandwidth` (`:113`, `:124-127`) or `completed_iterations
+/// == max_iter` (`:126`). sklearn checks convergence/`max_iter` immediately
+/// *after* the mean update (`:124-128`) and increments `completed_iterations`
+/// only when it has NOT converged (`:129`), so the returned count is the number
+/// of *additional* steps taken after the very first mean.
+///
+/// Returns `(converged_mode, n_points_within_at_final_mode, completed_iterations)`.
+/// `n_points_within` is the membership count at the FINAL mode (sklearn returns
+/// `len(points_within)` from the last loop body that ran, `:130`).
 fn mean_shift_single<F: Float>(
     seed: &[F],
     x: &Array2<F>,
+    bandwidth: F,
     bw_sq: F,
     max_iter: usize,
-    tol: F,
-) -> (Vec<F>, usize) {
+) -> (Vec<F>, usize, usize) {
     let n_features = seed.len();
     let mut current = seed.to_vec();
-    let mut n_iter = 0;
+    // sklearn: `stop_thresh = 1e-3 * bandwidth` (`_mean_shift.py:113`). NOT an
+    // absolute `tol` — scales with the bandwidth so the converged modes match
+    // sklearn's float values for any bandwidth (REQ-8).
+    let stop_thresh = F::from(1e-3).unwrap_or_else(F::epsilon) * bandwidth;
+    let mut completed_iterations = 0usize;
+    let mut count_within = 0usize;
 
-    for iter in 0..max_iter {
-        n_iter = iter + 1;
-
-        // Collect all points within bandwidth.
+    loop {
+        // Find mean of points within bandwidth of the current mean
+        // (sklearn `_mean_shift.py:117-122`).
         let mut mean = vec![F::zero(); n_features];
         let mut count = F::zero();
+        let mut n_within = 0usize;
 
         for i in 0..x.nrows() {
             let row = x.row(i);
@@ -285,28 +334,34 @@ fn mean_shift_single<F: Float>(
                     mean[j] = mean[j] + rs[j];
                 }
                 count = count + F::one();
+                n_within += 1;
             }
         }
 
-        if count == F::zero() {
-            // No neighbors — the point is isolated; keep it as-is.
+        if n_within == 0 {
+            // No neighbours — sklearn `break`s without updating the mean or the
+            // membership count (`_mean_shift.py:119-120`).
             break;
         }
+        count_within = n_within;
 
         for v in &mut mean {
             *v = *v / count;
         }
 
-        // Compute shift magnitude.
+        // L2 shift magnitude `||my_mean - my_old_mean||` (sklearn `:125`).
         let shift = sq_dist(&current, &mean).sqrt();
         current = mean;
 
-        if shift < tol {
+        // Converged or at max_iter → break BEFORE incrementing
+        // (sklearn `_mean_shift.py:124-129`).
+        if shift <= stop_thresh || completed_iterations == max_iter {
             break;
         }
+        completed_iterations += 1;
     }
 
-    (current, n_iter)
+    (current, count_within, completed_iterations)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -358,57 +413,106 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MeanShift<F> {
 
         let bw_sq = bandwidth * bandwidth;
 
-        // Run mean-shift from every data point as a seed.
-        let mut modes: Vec<Vec<F>> = Vec::with_capacity(n_samples);
-        let mut last_n_iter = 0usize;
+        // Run mean-shift from EVERY data point as a seed (the sklearn default
+        // `seeds=None` / `bin_seeding=False` path: `seeds = X`,
+        // `_mean_shift.py:491-495`). Each seed climbs to a converged mode;
+        // collect `(mode, intensity)` where `intensity` is the number of
+        // original points within `bandwidth` of the FINAL mode
+        // (`_mean_shift.py:130`).
+        //
+        // `center_intensity_dict[tuple(mean)] = n_points_within` only when
+        // `n_points_within > 0` (`_mean_shift.py:510-512`). Because the dict is
+        // keyed by the exact converged-mode value, duplicate modes collapse to
+        // a single entry; the intensity is deterministic per mode so the kept
+        // value matches. We replicate the dict semantics with an order-stable
+        // de-dup keyed by the exact mode coordinates.
+        //
+        // `n_iter_ = max([completed_iterations])` over all seeds
+        // (`_mean_shift.py:514`).
+        let mut mode_keys: Vec<Vec<F>> = Vec::new();
+        let mut intensities: Vec<usize> = Vec::new();
+        let mut n_iter_max = 0usize;
 
         for i in 0..n_samples {
             let row = x.row(i);
             let seed = row.as_slice().unwrap_or(&[]);
-            let (mode, n_iter) = mean_shift_single(seed, x, bw_sq, self.max_iter, self.tol);
-            modes.push(mode);
-            last_n_iter = last_n_iter.max(n_iter);
-        }
-
-        // Merge nearby modes into cluster centers.
-        // We keep one representative per group of modes that lie within
-        // `bandwidth` of each other.  We pick the first unclaimed mode as a
-        // new center, then merge all other modes within `bandwidth` into it.
-        let mut used = vec![false; modes.len()];
-        let mut centers: Vec<Vec<F>> = Vec::new();
-
-        for i in 0..modes.len() {
-            if used[i] {
+            let (mode, intensity, completed) =
+                mean_shift_single(seed, x, bandwidth, bw_sq, self.max_iter);
+            n_iter_max = n_iter_max.max(completed);
+            if intensity == 0 {
+                // sklearn skips seeds whose final mode has no members
+                // (`_mean_shift.py:511`); these never enter the dict.
                 continue;
             }
-            used[i] = true;
-            let mut group: Vec<&Vec<F>> = vec![&modes[i]];
-
-            for j in (i + 1)..modes.len() {
-                if !used[j] && sq_dist(&modes[i], &modes[j]).sqrt() < bandwidth {
-                    used[j] = true;
-                    group.push(&modes[j]);
-                }
+            // Dict semantics: keep one entry per exact-equal mode value.
+            if let Some(pos) = mode_keys.iter().position(|m| modes_equal(m, &mode)) {
+                // Python's dict OVERWRITES with the same (deterministic)
+                // intensity — a no-op for the value; the position is retained.
+                intensities[pos] = intensity;
+            } else {
+                mode_keys.push(mode);
+                intensities.push(intensity);
             }
-
-            // Compute the mean of the group as the representative center.
-            let mut center = vec![F::zero(); n_features];
-            let g_len = F::from(group.len()).unwrap_or_else(F::one);
-            for m in &group {
-                for (k, &v) in m.iter().enumerate() {
-                    center[k] = center[k] + v;
-                }
-            }
-            for v in &mut center {
-                *v = *v / g_len;
-            }
-            centers.push(center);
         }
 
-        let n_centers = centers.len();
+        if mode_keys.is_empty() {
+            // Mirrors sklearn's "No point was within bandwidth of any seed"
+            // `ValueError` (`_mean_shift.py:516-522`). Unreachable on the
+            // seeds=X path (each seed is a data point, self-inclusive), but
+            // kept for contract fidelity.
+            return Err(FerroError::NumericalInstability {
+                message: "no point was within bandwidth of any seed".into(),
+            });
+        }
 
-        // Build the center matrix.
-        let flat: Vec<F> = centers.into_iter().flatten().collect();
+        // POST-PROCESSING — remove near-duplicate modes
+        // (`_mean_shift.py:524-546`).
+        //
+        // Sort by `(intensity, coordinate-tuple)` DESCENDING — sklearn:
+        // `sorted(center_intensity_dict.items(), key=lambda t: (t[1], t[0]),
+        // reverse=True)` (`:529-533`). Python's tuple comparison is
+        // lexicographic and total; `reverse=True` orders intensity desc then,
+        // on ties, coordinate-tuple desc. Python's `sorted` is stable, but the
+        // key is a total order over distinct (mode) keys so stability is not
+        // observable here.
+        let mut order: Vec<usize> = (0..mode_keys.len()).collect();
+        order.sort_by(|&a, &b| {
+            // Descending: compare b vs a.
+            intensities[b]
+                .cmp(&intensities[a])
+                .then_with(|| coord_cmp(&mode_keys[b], &mode_keys[a]))
+        });
+        let sorted_centers: Vec<&Vec<F>> = order.iter().map(|&i| &mode_keys[i]).collect();
+
+        // Greedy radius-`bandwidth` unique selection over the sorted modes
+        // (`_mean_shift.py:535-546`): walk the intensity-sorted modes; for each
+        // still-unique mode, mark every mode within `bandwidth` (inclusive,
+        // `radius_neighbors`) as non-unique, then re-mark the current one
+        // unique. The kept modes are emitted IN THE SORTED-BY-INTENSITY ORDER
+        // — that order is what `labels_` indexes into.
+        let m = sorted_centers.len();
+        let mut unique = vec![true; m];
+        for i in 0..m {
+            if unique[i] {
+                for (j, item) in unique.iter_mut().enumerate() {
+                    // `radius_neighbors([center])` returns points within
+                    // `bandwidth` inclusive (`<= bandwidth`).
+                    if sq_dist(sorted_centers[i], sorted_centers[j]) <= bw_sq {
+                        *item = false;
+                    }
+                }
+                unique[i] = true; // leave the current point as unique.
+            }
+        }
+
+        let kept: Vec<&Vec<F>> = (0..m)
+            .filter(|&i| unique[i])
+            .map(|i| sorted_centers[i])
+            .collect();
+        let n_centers = kept.len();
+
+        // Build the center matrix in the sorted-by-intensity order.
+        let flat: Vec<F> = kept.iter().flat_map(|c| c.iter().copied()).collect();
         let cluster_centers =
             Array2::from_shape_vec((n_centers, n_features), flat).map_err(|_| {
                 FerroError::NumericalInstability {
@@ -416,17 +520,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MeanShift<F> {
                 }
             })?;
 
-        // Assign each training point to the nearest center.
+        // ASSIGN LABELS — nearest cluster center, `n_neighbors=1`
+        // (`_mean_shift.py:548-553`, `cluster_all=True`).
         let mut labels = Array1::zeros(n_samples);
         for i in 0..n_samples {
             let row = x.row(i);
             let rs = row.as_slice().unwrap_or(&[]);
             let mut best = 0usize;
             let mut best_dist = F::max_value();
-            for c in 0..n_centers {
-                let center_row = cluster_centers.row(c);
-                let cs = center_row.as_slice().unwrap_or(&[]);
-                let d = sq_dist(rs, cs);
+            for (c, center) in kept.iter().enumerate() {
+                let d = sq_dist(rs, center);
                 if d < best_dist {
                     best_dist = d;
                     best = c;
@@ -438,7 +541,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MeanShift<F> {
         Ok(FittedMeanShift {
             cluster_centers_: cluster_centers,
             labels_: labels,
-            n_iter_: last_n_iter,
+            n_iter_: n_iter_max,
         })
     }
 }
