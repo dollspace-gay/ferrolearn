@@ -163,3 +163,26 @@ fn green_req3_errors() {
     let x_bad = array![[1.0, 2.0, 3.0]];
     assert!(fitted.transform(&x_bad).is_err());
 }
+
+/// #2204: sklearn `_handle_zeros_in_scale` (`_data.py:114-119`) replaces an
+/// `IQR < 10 * eps` (near-constant) column's scale with 1.0 — NOT just an
+/// exactly-zero IQR. A tiny-but-nonzero IQR column must divide by 1.0 (the
+/// column is still centered), not by the tiny IQR.
+///
+/// Live sklearn 1.5.2 oracle (run from /tmp):
+///   r = RobustScaler().fit([[1e-16],[2e-16],[1.5e-16],[1e-16]])
+///   r.center_ -> [1.25e-16]; r.scale_ -> [1.0]
+///   r.transform([[3e-16]]) -> [[1.7499999999999998e-16]]  (= 3e-16 - 1.25e-16)
+#[test]
+fn req2204_near_constant_iqr_handled_like_sklearn() {
+    let x = array![[1e-16_f64], [2e-16], [1.5e-16], [1e-16]];
+    let fitted = RobustScaler::<f64>::new().fit(&x, &()).unwrap();
+    // IQR ~1e-16 < 10*eps -> effective scale 1.0; centered by median 1.25e-16.
+    let out = fitted.transform(&array![[3e-16_f64]]).unwrap();
+    let expected = 3e-16 - 1.25e-16; // = 1.75e-16
+    assert!(
+        (out[[0, 0]] - expected).abs() < 1e-30,
+        "near-constant IQR: transform {} != sklearn {expected}",
+        out[[0, 0]]
+    );
+}

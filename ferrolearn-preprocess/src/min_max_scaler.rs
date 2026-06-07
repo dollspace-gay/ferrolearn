@@ -373,10 +373,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MinMaxScaler<F> {
         let data_range_ = &data_max - &data_min;
         let mut scale_ = Array1::zeros(n_features);
         let mut min_ = Array1::zeros(n_features);
+        let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
         for j in 0..n_features {
-            // _handle_zeros_in_scale (_data.py:88): a zero (constant-column)
-            // range is replaced by 1 to avoid division by zero.
-            let denom = if data_range_[j] == F::zero() {
+            // _handle_zeros_in_scale (`_data.py:114-119`): `constant_mask =
+            // scale < 10 * finfo(dtype).eps; scale[mask] = 1.0`. A data_range
+            // BELOW the near-constant threshold (NOT just exactly 0) is replaced
+            // by 1 (#2204), so a tiny-but-nonzero range column maps to
+            // feature_range[0] like sklearn rather than dividing by the tiny
+            // value. (NaN data_range is not `< threshold` -> passes through.)
+            let denom = if data_range_[j] < ten_eps {
                 F::one()
             } else {
                 data_range_[j]

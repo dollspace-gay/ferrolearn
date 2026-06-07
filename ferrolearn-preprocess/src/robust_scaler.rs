@@ -309,9 +309,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         }
 
         // scale_ = _handle_zeros_in_scale(iqr): the raw IQR on non-constant
-        // columns, 1.0 on zero-IQR/constant columns (sklearn `_data.py:1635`,
-        // `:88`). This is the effective scale `transform` already divides by.
-        let scale_arr = iqr_arr.mapv(|v| if v == F::zero() { F::one() } else { v });
+        // columns, 1.0 on near-constant columns. sklearn `_handle_zeros_in_scale`
+        // (`_data.py:114-119`, called `:1635`) uses `constant_mask = scale <
+        // 10 * finfo(dtype).eps` — a tiny-but-nonzero IQR (NOT just exactly 0) is
+        // replaced by 1.0 (#2204). This is the effective scale `transform`
+        // already divides by.
+        let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
+        let scale_arr = iqr_arr.mapv(|v| if v < ten_eps { F::one() } else { v });
 
         Ok(FittedRobustScaler {
             median: median_arr,
@@ -352,12 +356,14 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
             let med = self.median[j];
             let iqr = self.iqr[j];
-            // A zero IQR is replaced by an effective scale of 1, matching sklearn
-            // `_handle_zeros_in_scale` (`_data.py:88`, called at `:1635`). The column
-            // is still centered (`X -= center_`, `:1673`) then divided by the
-            // effective scale (`X /= scale_`, `:1675`), so a constant column maps to 0
-            // and a non-constant zero-IQR column maps to `x - median`.
-            let scale_eff = if iqr == F::zero() { F::one() } else { iqr };
+            // A near-constant IQR is replaced by an effective scale of 1,
+            // matching sklearn `_handle_zeros_in_scale` (`_data.py:114-119`,
+            // called `:1635`): `constant_mask = scale < 10 * finfo(dtype).eps`
+            // (NOT just exactly 0, #2204). The column is still centered
+            // (`X -= center_`, `:1673`) then divided by the effective scale
+            // (`X /= scale_`, `:1675`).
+            let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
+            let scale_eff = if iqr < ten_eps { F::one() } else { iqr };
             // Conditional center/scale mirroring sklearn `transform`
             // (`_data.py:1672-1675`): `if with_centering: X -= center_` then
             // `if with_scaling: X /= scale_`. When `with_centering && with_scaling`

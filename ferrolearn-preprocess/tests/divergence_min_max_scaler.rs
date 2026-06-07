@@ -623,3 +623,28 @@ fn req10_copy_is_no_op_on_values() {
         .unwrap();
     assert!((out_default[[0, 0]] - out_copy_false[[0, 0]]).abs() < 1e-15);
 }
+
+/// #2204: sklearn `_handle_zeros_in_scale` (`_data.py:114-119`) replaces a
+/// `data_range < 10 * eps` (near-constant) column's scale with 1.0 — NOT just an
+/// exactly-zero range. A tiny-but-nonzero range column must therefore behave
+/// like a constant column (scale_ == 1, the fitted value -> feature_range[0]),
+/// not divide by the tiny range.
+///
+/// Live sklearn 1.5.2 oracle (run from /tmp):
+///   m = MinMaxScaler().fit([[1e-16],[0.0],[5e-17]])
+///   m.scale_ -> [1.0]; m.min_ -> [0.0]
+///   m.transform([[2e-16],[1e-16]]) -> [[2e-16],[1e-16]]  (scale_=1, min_=0)
+#[test]
+fn req2204_near_constant_range_handled_like_sklearn() {
+    let x = array![[1e-16_f64], [0.0], [5e-17]];
+    let fitted = MinMaxScaler::<f64>::new().fit(&x, &()).unwrap();
+    // data_range = 1e-16 < 10*eps -> scale_ forced to 1.0 (#2204).
+    assert!(
+        (fitted.scale()[0] - 1.0).abs() < 1e-12,
+        "near-constant range: scale_ {} != sklearn 1.0",
+        fitted.scale()[0]
+    );
+    let out = fitted.transform(&array![[2e-16_f64], [1e-16]]).unwrap();
+    // scale_=1, min_=0 -> identity.
+    assert!((out[[0, 0]] - 2e-16).abs() < 1e-30 && (out[[1, 0]] - 1e-16).abs() < 1e-30);
+}
