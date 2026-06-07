@@ -38,6 +38,7 @@
 //! | REQ-DISCRETE-NB-FITTED-ATTRS (feature_log_prob_/class_log_prior_/feature_count_/class_count_) | SHIPPED | FIXED #2103: `MultinomialNB`/`BernoulliNB`/`ComplementNB` expose the four `_BaseDiscreteNB` fitted attrs (sklearn/naive_bayes.py:880-892/580-602/1032-1042). A SECOND `#[pymethods] impl Rs{Multinomial,Bernoulli,Complement}NB` block (pyo3 `multiple-pymethods`) adds four `#[getter]`s each over the Rust fitted types (`FittedMultinomialNB` multinomial.rs:489/499/509/520, `FittedBernoulliNB` bernoulli.rs:520/530/540/551, `FittedComplementNB` complement.rs:535/586/545/556); `py_classifier!` macro + its 18 invocations UNCHANGED. ComplementNB `feature_log_prob_` is the `-logged` complement weight (positive) per sklearn. Non-test consumer: `_extras.py::_DiscreteNBWrapper.fit` sets `self.{feature_log_prob_,class_log_prior_,feature_count_,class_count_}` from `self._rs.*` (the three NB wrappers subclass it). Verification (model B): `tests/divergence_extras.py::test_{multinomial,bernoulli,complement}_discrete_nb_fitted_attrs_match_sklearn` (live sklearn 1.5.2 oracle, atol 1e-7). |
 //! | REQ-BERNOULLI-BINARIZE-NONE (`binarize=None` skips binarization) | SHIPPED | FIXED #2104: `_RsBernoulliNB` now types `binarize: Option<f64> = Some(0.0)` (was `f64 = 0.0`) and builds via `BernoulliNB::with_binarize_option(binarize)` (bernoulli.rs), so pyo3 maps Python `None`→`Option::None` (skips binarization, sklearn/naive_bayes.py:1076,1156,1179,1185) and a float→`Some(f64)`. `feature_count_` then accumulates raw X. Non-test consumer: `_extras.py::BernoulliNB.__init__(binarize=0.0)` passes `self.binarize` straight through (default 0.0 unchanged). Verification (model B): `tests/divergence_extras.py::test_red_bernoulli_binarize_none_feature_count_matches_sklearn` (live sklearn 1.5.2 oracle, atol 1e-9). |
 //! | REQ-IFOREST-BINDING (#2180) | SHIPPED | `RsIsolationForest` (hand `#[pyclass]`) over `ferrolearn_tree::IsolationForest<f64>`/`FittedIsolationForest<f64>` exposes the `OutlierMixin` surface — `predict` (±1, `_iforest.py:357-378`), `score_samples` (∈[-1,0], `_iforest.py:412-451`), `decision_function` (`=score-offset_`, `_iforest.py:380-410`) — plus `offset_` (`_iforest.py:344/353`) and `n_features_in_`. The `_extras.py::IsolationForest(_RegressorPickleMixin, OutlierMixin, BaseEstimator)` wrapper mirrors sklearn's full ctor (`_iforest.py:221-233`), resolves `max_samples` ('auto'→`min(256,n)`, int→as-is, float→`int(f*n)`, `_iforest.py:303-318`) and `contamination` ('auto'→`with_contamination_auto()`, float→`with_contamination(c)`, `_iforest.py:341-353`) BEFORE the ABI, and rejects the unsupported surface (`max_features!=1.0`/`bootstrap=True`/`warm_start=True` → NotImplementedError, isolation_forest.rs REQ-7a/7b #728/#729; bad `n_estimators`/`contamination`/`max_samples` → ValueError); `n_jobs`/`verbose` accept-and-ignore. RNG-substrate caveat #2118 (isolation_forest.rs StdRng vs numpy MT19937 #730): exact `score_samples` DIVERGE from sklearn for a given seed; the STRUCTURAL contract matches (asserted vs the live oracle). Non-test consumer: `_extras.py::IsolationForest` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/divergence_extras.py::test_iforest_*` (16, live sklearn 1.5.2 oracle). |
+//! | REQ-FEATAGGLOM-BINDING (#943) | SHIPPED | `RsFeatureAgglomeration` (hand `#[pyclass]`) over `ferrolearn_cluster::FeatureAgglomeration<f64>`/`FittedFeatureAgglomeration<f64>` exposes `fit`/`transform`/`inverse_transform` (`_feature_agglomeration.py:32-92`) + the dendrogram getters `labels_` (1-D int), `n_clusters_`, `children_` ((n-1,2) int), `distances_` (1-D f64 or None), `n_leaves_`, `n_connected_components_`, `n_features_in_` — delegated from the inner clustering over `X.T` (`_agglomerative.py:1083-1095/1339`). `fit` maps `linkage`/`pooling` strings → `AgglomerativeLinkage`/`PoolingFunc`; an unknown string → `PyValueError`; FerroError → `PyValueError`; not-fitted → `PyRuntimeError` (no panic). The `_extras.py::FeatureAgglomeration(_TransformerWrapper)` wrapper mirrors sklearn's ctor (`_agglomerative.py:1296`, `n_clusters=2` positional), resolves `pooling_func` ('mean'/'max' OR np.mean/np.max → enum; other callable → NotImplementedError REQ-7 #941) BEFORE the ABI, rejects core-unsupported `metric`/`connectivity`/`distance_threshold` (non-default) → NotImplementedError REQ-6 #941, and sets the dendrogram attrs post-fit. VALUE-EXACT vs sklearn: `labels_` int-exact, `transform`/`inverse_transform`/`children_`/`distances_` ≈1e-9 across {ward,complete,average,single}×{mean,max}. Non-test consumer: `_extras.py::FeatureAgglomeration` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/test_feature_agglomeration.py` (21, live sklearn 1.5.2 oracle). |
 //! | REQ-RANSAC-BINDING (#2178) | SHIPPED | `RsRANSACRegressor` (hand `#[pyclass]`) over `ferrolearn_linear::RANSACRegressor<f64, LinearRegression<f64>>` (default `LinearRegression()` base, `_ransac.py:380`) exposes `fit`/`predict`/`coef_`/`intercept_`/`inlier_mask_`. The `_extras.py::RANSACRegressor` wrapper mirrors sklearn's full ctor (`_ransac.py:288-315`), resolves `min_samples` (None→`n_features+1`, float→`ceil`) before the ABI, and rejects the unsupported surface (`estimator`/`loss='squared_error'`/`stop_*`/`is_*_valid` → NotImplementedError; bad `min_samples`/`max_trials`/`residual_threshold` → ValueError). `coef_`/`intercept_` recovered EXACTLY via affine probe predictions (core keeps the refit base private, ransac.rs REQ-10 #518; no `n_trials_`/`estimator_` faked). Non-test consumer: `_extras.py::RANSACRegressor` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/divergence_extras.py::test_ransac_*` (14, live sklearn 1.5.2 oracle on well-separated data; coef_/inlier_mask_ MATCH `atol 1e-2`, RNG caveat #2118). |
 //! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
 //! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. (`KNeighborsRegressor` is the exception: full surface SHIPPED, REQ-KNR-CTOR-SURFACE.) |
@@ -48,7 +49,7 @@
 
 use crate::conversions::*;
 use ferrolearn_core::{Fit, Predict, Transform};
-use ndarray::Array1;
+use ndarray::{Array1, Array2};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
@@ -2645,6 +2646,210 @@ impl RsGaussianMixture {
             .predict(&x_nd)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         Ok(ndarray1_usize_to_numpy(py, &preds))
+    }
+}
+
+// FeatureAgglomeration (#943): hand-written `#[pyclass]` over
+// `ferrolearn_cluster::FeatureAgglomeration<f64>`/`FittedFeatureAgglomeration<f64>`.
+// FeatureAgglomeration is BOTH a transformer (transform/inverse_transform via
+// sklearn's `AgglomerationTransform`/`TransformerMixin`,
+// `sklearn/cluster/_feature_agglomeration.py:22-92`) AND exposes the hierarchical
+// `labels_`/`children_`/`distances_`/`n_leaves_`/`n_connected_components_` fitted
+// attributes delegated from the inner clustering over `X.T`
+// (`sklearn/cluster/_agglomerative.py:1338-1340`). The Rust core is
+// pre-existing/audited (`ferrolearn_cluster` feature_agglomeration.rs REQ-1..9
+// SHIPPED); this is the thin marshalling shim and the non-test production
+// consumer of `fit`/`transform`/`inverse_transform`/`labels()`/`children()`/etc.
+//
+// The wrapper resolves `linkage` ('ward'/'complete'/'average'/'single') and
+// `pooling` ('mean'/'max') to the closed `AgglomerativeLinkage`/`PoolingFunc`
+// enums BEFORE the ABI; an unrecognized string is a `ValueError` (sklearn's
+// `InvalidParameterError ⊂ ValueError`, `_agglomerative.py:1290-1291`). The
+// arbitrary-callable `pooling_func` (sklearn `[callable]`, `:1291`) and the
+// `metric`/`memory`/`connectivity`/`compute_full_tree`/`distance_threshold`
+// params the core lacks are handled in the `_extras.py` wrapper (REQ-7/#941).
+#[pyclass(name = "_RsFeatureAgglomeration")]
+pub struct RsFeatureAgglomeration {
+    n_clusters: usize,
+    linkage: String,
+    pooling: String,
+    compute_distances: bool,
+    fitted: Option<ferrolearn_cluster::FittedFeatureAgglomeration<f64>>,
+}
+
+#[pymethods]
+impl RsFeatureAgglomeration {
+    #[new]
+    #[pyo3(signature = (n_clusters=2, linkage="ward".to_string(),
+                        pooling="mean".to_string(), compute_distances=false))]
+    fn new(n_clusters: usize, linkage: String, pooling: String, compute_distances: bool) -> Self {
+        Self {
+            n_clusters,
+            linkage,
+            pooling,
+            compute_distances,
+            fitted: None,
+        }
+    }
+
+    // sklearn `fit(X, y=None)` (`_agglomerative.py:1322`): `y` ignored. Maps the
+    // `linkage`/`pooling` strings to the core enums; an unknown string is a
+    // `ValueError` (sklearn `InvalidParameterError ⊂ ValueError`).
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        use ferrolearn_cluster::{AgglomerativeLinkage, PoolingFunc};
+        let linkage = match self.linkage.as_str() {
+            "ward" => AgglomerativeLinkage::Ward,
+            "complete" => AgglomerativeLinkage::Complete,
+            "average" => AgglomerativeLinkage::Average,
+            "single" => AgglomerativeLinkage::Single,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "linkage == {other:?}, must be one of 'ward', 'complete', 'average', 'single'."
+                )));
+            }
+        };
+        let pooling = match self.pooling.as_str() {
+            "mean" => PoolingFunc::Mean,
+            "max" => PoolingFunc::Max,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "pooling_func == {other:?}, only 'mean'/np.mean and 'max'/np.max are \
+                     supported (arbitrary-callable pooling is NOT-STARTED #941)."
+                )));
+            }
+        };
+        let x_nd = numpy2_to_ndarray(x);
+        let model = ferrolearn_cluster::FeatureAgglomeration::<f64>::new(self.n_clusters)
+            .with_linkage(linkage)
+            .with_pooling_func(pooling)
+            .with_compute_distances(self.compute_distances);
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `AgglomerationTransform.transform`
+    // (`_feature_agglomeration.py:32-64`): pool features per cluster, output
+    // shape `(n_samples, n_clusters)`, columns ordered by ascending label index.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `AgglomerationTransform.inverse_transform`
+    // (`_feature_agglomeration.py:66-92`): broadcast each cluster's pooled value
+    // back to every member feature, output shape `(n_samples, n_features)`.
+    fn inverse_transform<'py>(
+        &self,
+        py: Python<'py>,
+        xred: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let xred_nd = numpy2_to_ndarray(xred);
+        let xi = fitted
+            .inverse_transform(&xred_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xi))
+    }
+
+    // sklearn `labels_` (`_agglomerative.py:1339`, delegated from the inner
+    // AgglomerativeClustering over `X.T`): per-feature cluster assignment, 1-D
+    // int array of length `n_features`.
+    #[getter]
+    fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_usize_to_numpy(py, fitted.labels()))
+    }
+
+    // sklearn `n_clusters_` (`_agglomerative.py:1083`): number of feature clusters.
+    #[getter]
+    fn n_clusters_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_clusters())
+    }
+
+    // sklearn `children_` (`_agglomerative.py:1086`): the merge history, an
+    // `(n_features - 1, 2)` int array.
+    #[getter]
+    fn children_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let children = fitted.children();
+        let n = children.len();
+        let mut arr = Array2::<i64>::zeros((n, 2));
+        for (i, &(a, b)) in children.iter().enumerate() {
+            arr[[i, 0]] = a as i64;
+            arr[[i, 1]] = b as i64;
+        }
+        Ok(PyArray2::from_array(py, &arr))
+    }
+
+    // sklearn `distances_` (`_agglomerative.py:1093-1095`): per-merge linkage
+    // distances, a 1-D f64 array, or `None` if `compute_distances` was not set.
+    #[getter]
+    fn distances_<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.distances().map(|d| ndarray1_to_numpy(py, d)))
+    }
+
+    // sklearn `n_leaves_` (`_agglomerative.py:1090`): number of leaves in the
+    // inner hierarchical tree (== n_features for the unstructured path).
+    #[getter]
+    fn n_leaves_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_leaves())
+    }
+
+    // sklearn `n_connected_components_` (`_agglomerative.py:1089`): always 1 for
+    // the unstructured `connectivity=None` path.
+    #[getter]
+    fn n_connected_components_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_connected_components())
+    }
+
+    // sklearn `n_features_in_` (set by `_validate_data` at fit): number of
+    // features seen during fit. The core fitted type exposes it as `n_features()`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features())
     }
 }
 

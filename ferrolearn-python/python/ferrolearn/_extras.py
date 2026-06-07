@@ -12,6 +12,7 @@ from sklearn.base import (
     RegressorMixin,
     TransformerMixin,
 )
+from sklearn.utils.deprecation import _deprecate_Xt_in_inverse_transform
 from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
@@ -30,6 +31,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsExtraTreesRegressor,
     _RsFactorAnalysis,
     _RsFastICA,
+    _RsFeatureAgglomeration,
     _RsGaussianMixture,
     _RsGradientBoostingClassifier,
     _RsGradientBoostingRegressor,
@@ -1817,6 +1819,148 @@ class FactorAnalysis(_TransformerWrapper):
 
     def _make_rs(self):
         return _RsFactorAnalysis(n_components=self.n_components)
+
+
+class FeatureAgglomeration(_TransformerWrapper):
+    """Feature Agglomeration backed by Rust (#943).
+
+    Mirrors ``sklearn.cluster.FeatureAgglomeration``
+    (``sklearn/cluster/_agglomerative.py:1296-1346`` +
+    ``sklearn/cluster/_feature_agglomeration.py:22-92``): hierarchical clustering
+    of the FEATURES (columns) followed by per-cluster pooling, exposing the
+    ``TransformerMixin`` ``fit``/``transform``/``fit_transform`` surface plus
+    ``inverse_transform`` and the dendrogram fitted attributes
+    ``labels_``/``n_clusters_``/``children_``/``distances_``/``n_leaves_``/
+    ``n_connected_components_`` delegated from the inner ``AgglomerativeClustering``
+    over ``X.T`` (``_agglomerative.py:1338-1340``).
+
+    The keyword-only constructor mirrors sklearn's signature
+    ``(n_clusters=2, *, metric=None, memory=None, connectivity=None,
+    compute_full_tree='auto', linkage='ward', pooling_func=np.mean,
+    distance_threshold=None, compute_distances=False)`` (``_agglomerative.py:1296``).
+    Of these, ``n_clusters``/``linkage``/``pooling_func``/``compute_distances`` are
+    threaded into the Rust core:
+
+    - ``linkage`` (``_agglomerative.py:1290``, ``StrOptions(_TREE_BUILDERS)``):
+      one of ``'ward'``/``'complete'``/``'average'``/``'single'`` (default
+      ``'ward'``). The Rust core supports all four (feature_agglomeration.rs
+      ``map_linkage``).
+    - ``pooling_func`` (``_agglomerative.py:1291``, ``[callable]``, default
+      ``np.mean``): the Rust core offers only the closed
+      ``PoolingFunc::{Mean, Max}`` enum, so this wrapper accepts the strings
+      ``'mean'``/``'max'`` OR the numpy callables ``np.mean``/``np.max`` and maps
+      them to the enum. ANY OTHER callable (an arbitrary pooling function, which
+      sklearn permits) raises ``NotImplementedError`` (feature_agglomeration.rs
+      REQ-7 NOT-STARTED #941); a non-callable / unknown string raises
+      ``ValueError`` (sklearn ``InvalidParameterError ⊂ ValueError``).
+    - ``compute_distances`` (``_agglomerative.py:1307/1319``, default ``False``):
+      when ``True``, ``distances_`` is computed; else it is ``None``.
+
+    The params the Rust core does NOT support — ``metric``/``memory``/
+    ``connectivity``/``compute_full_tree``/``distance_threshold`` — are accepted
+    (held for ``get_params``/``clone`` round-trip) but raise ``NotImplementedError``
+    if set to a NON-default value, honestly surfacing the gap rather than silently
+    ignoring it (esp. ``distance_threshold``, which would change the cut, REQ-6
+    NOT-STARTED #941).
+    """
+
+    def __init__(self, n_clusters=2, *, metric=None, memory=None,
+                 connectivity=None, compute_full_tree="auto", linkage="ward",
+                 pooling_func=np.mean, distance_threshold=None,
+                 compute_distances=False):
+        self.n_clusters = n_clusters
+        self.metric = metric
+        self.memory = memory
+        self.connectivity = connectivity
+        self.compute_full_tree = compute_full_tree
+        self.linkage = linkage
+        self.pooling_func = pooling_func
+        self.distance_threshold = distance_threshold
+        self.compute_distances = compute_distances
+
+    def _resolve_pooling(self):
+        # Map the sklearn `pooling_func` (string or numpy callable) onto the Rust
+        # core's closed PoolingFunc enum (passed as a string across the ABI).
+        pf = self.pooling_func
+        if isinstance(pf, str):
+            if pf not in ("mean", "max"):
+                raise ValueError(
+                    f"pooling_func == {pf!r}, must be 'mean'/np.mean or "
+                    "'max'/np.max (the Rust FeatureAgglomeration core supports "
+                    "only mean/max pooling; arbitrary callables NOT-STARTED #941)."
+                )
+            return pf
+        if pf is np.mean:
+            return "mean"
+        if pf is np.max:
+            return "max"
+        if callable(pf):
+            raise NotImplementedError(
+                "pooling_func as an arbitrary callable is not supported (the Rust "
+                "FeatureAgglomeration core offers only PoolingFunc::{Mean, Max}; "
+                "pass 'mean'/np.mean or 'max'/np.max; REQ-7 NOT-STARTED #941)."
+            )
+        raise ValueError(
+            f"pooling_func == {pf!r}, must be 'mean'/np.mean or 'max'/np.max."
+        )
+
+    def _validate_unsupported(self):
+        # The Rust core implements only the unstructured, euclidean, n_clusters
+        # cut. Params that would CHANGE that result raise NotImplementedError when
+        # non-default; the no-op knobs (metric default, memory, compute_full_tree
+        # 'auto') are accepted silently.
+        if self.metric is not None:
+            raise NotImplementedError(
+                "metric != None not supported (the Rust FeatureAgglomeration core "
+                "uses the euclidean/ward default only; REQ-6 NOT-STARTED #941)."
+            )
+        if self.connectivity is not None:
+            raise NotImplementedError(
+                "connectivity != None not supported (the Rust FeatureAgglomeration "
+                "core implements only the unstructured path; REQ-6 NOT-STARTED "
+                "#941)."
+            )
+        if self.distance_threshold is not None:
+            raise NotImplementedError(
+                "distance_threshold != None not supported (the Rust "
+                "FeatureAgglomeration core cuts by n_clusters only; "
+                "REQ-6 NOT-STARTED #941)."
+            )
+
+    def _make_rs(self):
+        self._validate_unsupported()
+        return _RsFeatureAgglomeration(
+            n_clusters=self.n_clusters,
+            linkage=self.linkage,
+            pooling=self._resolve_pooling(),
+            compute_distances=self.compute_distances,
+        )
+
+    def fit(self, X, y=None):
+        self._rs = self._make_rs()
+        self._rs.fit(_f64(X))
+        self.n_features_in_ = X.shape[1]
+        # Dendrogram fitted attributes delegated from the inner clustering over
+        # X.T (sklearn/cluster/_agglomerative.py:1083-1095/1339).
+        self.labels_ = np.asarray(self._rs.labels_)
+        self.n_clusters_ = self._rs.n_clusters_
+        self.children_ = np.asarray(self._rs.children_)
+        self.distances_ = (
+            None if self._rs.distances_ is None
+            else np.asarray(self._rs.distances_)
+        )
+        self.n_leaves_ = self._rs.n_leaves_
+        self.n_connected_components_ = self._rs.n_connected_components_
+        return self
+
+    def inverse_transform(self, X=None, *, Xt=None):
+        # sklearn FeatureAgglomeration.inverse_transform(self, X=None, *, Xt=None)
+        # routes the deprecated `Xt=` kwarg through `_deprecate_Xt_in_inverse_transform`
+        # (FutureWarning), and the canonical positional param is named `X`
+        # (_feature_agglomeration.py:66-87, #2188).
+        X = _deprecate_Xt_in_inverse_transform(X, Xt)
+        check_is_fitted(self)
+        return np.asarray(self._rs.inverse_transform(_f64(X)))
 
 
 class MinMaxScaler(_TransformerWrapper):

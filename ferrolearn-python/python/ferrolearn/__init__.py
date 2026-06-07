@@ -29,6 +29,7 @@ from ferrolearn._extras import (
     ExtraTreesRegressor,
     FactorAnalysis,
     FastICA,
+    FeatureAgglomeration,
     GaussianMixture,
     GradientBoostingClassifier,
     GradientBoostingRegressor,
@@ -114,6 +115,7 @@ __all__ = [
     "DBSCAN",
     "AgglomerativeClustering",
     "Birch",
+    "FeatureAgglomeration",
     "GaussianMixture",
     # Decomp extras
     "IncrementalPCA",

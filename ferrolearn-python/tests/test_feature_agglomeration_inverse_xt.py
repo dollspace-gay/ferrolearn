@@ -28,7 +28,6 @@ Tracking: #2188
 import warnings
 
 import numpy as np
-import pytest
 
 import ferrolearn as fl
 from sklearn.cluster import FeatureAgglomeration as Sk
@@ -47,15 +46,11 @@ def _fixture():
     return X
 
 
-@pytest.mark.xfail(
-    reason="ferrolearn FeatureAgglomeration.inverse_transform signature is "
-    "(self, Xred); it rejects the deprecated Xt= keyword that sklearn 1.5.2 "
-    "accepts (_feature_agglomeration.py:66/87) -> TypeError vs inverse; "
-    "tracking #2188",
-    strict=True,
-    raises=TypeError,
-)
 def test_inverse_transform_accepts_deprecated_Xt_kwarg():
+    """Fixed (#2188): the wrapper now mirrors sklearn's
+    ``inverse_transform(self, X=None, *, Xt=None)`` — it accepts the deprecated
+    ``Xt=`` keyword (routed via ``_deprecate_Xt_in_inverse_transform``, emitting a
+    FutureWarning) and the canonical ``X=`` keyword."""
     X = _fixture()
 
     # Live sklearn oracle: inverse_transform(Xt=...) returns the inverse and
@@ -68,9 +63,15 @@ def test_inverse_transform_accepts_deprecated_Xt_kwarg():
     assert any(issubclass(rec.category, FutureWarning) for rec in w)
     assert sk_inv.shape == (8, 6)
 
-    # ferrolearn must mirror: accept Xt= and return the same inverse.
+    # ferrolearn mirrors: accept Xt= (with FutureWarning) and return the same inverse.
     fa = fl.FeatureAgglomeration(3).fit(X)
     Xt_fa = fa.transform(X)
-    fa_inv = fa.inverse_transform(Xt=Xt_fa)  # raises TypeError today (the xfail)
-
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+        fa_inv = fa.inverse_transform(Xt=Xt_fa)
+    assert any(issubclass(rec.category, FutureWarning) for rec in w)
     np.testing.assert_allclose(fa_inv, sk_inv, rtol=0, atol=1e-9)
+
+    # The canonical X= keyword and positional both work and agree.
+    np.testing.assert_allclose(fa.inverse_transform(X=Xt_fa), sk_inv, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(fa.inverse_transform(Xt_fa), sk_inv, rtol=0, atol=1e-9)
