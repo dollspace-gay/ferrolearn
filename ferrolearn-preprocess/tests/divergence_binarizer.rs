@@ -665,12 +665,11 @@ fn divergence_binarize_nan_threshold_should_error_like_sklearn() {
         binarize(&x, f64::NAN).is_err(),
         "free binarize(X, nan) must Err (sklearn @validate_params, _data.py:2114)"
     );
-    // sklearn's `_fit_context` validates `_parameter_constraints` BEFORE the
-    // data, so `Binarizer(threshold=nan).fit(X)` raises InvalidParameterError.
-    assert!(
-        Binarizer::<f64>::new(f64::NAN).fit(&x, &()).is_err(),
-        "Binarizer(threshold=nan).fit must Err (sklearn _fit_context param-check, _data.py:2249)"
-    );
+    // NOTE: `Binarizer.fit` does NOT reject a non-finite threshold — its
+    // `_parameter_constraints {threshold: [Real]}` (`_data.py:2249`) is a bare
+    // type check that accepts NaN/+-inf; only `transform`/`binarize` reject it
+    // (#2209). That accept-at-fit behavior is pinned by
+    // `divergence_binarizer_fit_accepts_nonfinite_threshold_like_sklearn`.
 }
 
 /// Divergence: `ferrolearn::binarize` diverges from
@@ -744,7 +743,6 @@ fn divergence_binarize_inf_threshold_should_error_like_sklearn() {
 /// from the #2208 fix.
 /// Tracking: #2209
 #[test]
-#[ignore = "divergence: Binarizer::fit over-rejects non-finite threshold (sklearn _data.py:2249 [Real] accepts it); tracking #2209"]
 fn divergence_binarizer_fit_accepts_nonfinite_threshold_like_sklearn() {
     // Live oracle (sklearn 1.5.2, /tmp):
     //   Binarizer(threshold=nan).fit([[1,-1,2],[2,0,0],[0,1,-1]]) -> OK, n_features_in_=3
