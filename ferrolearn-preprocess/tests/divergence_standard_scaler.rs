@@ -655,14 +655,17 @@ fn req7_f32_constant_column_scale_one() -> Result<(), FerroError> {
 /// Tracking: #2205
 #[test]
 #[ignore = "divergence: StandardScaler<f32> computes mean_/var_/scale_ in f32 not float64 accumulators; tracking #2205"]
+#[allow(
+    clippy::approx_constant,
+    reason = "these are the LIVE sklearn 1.5.2 f32 transform-output oracle values \
+              (R-CHAR-3) for a 2-equal/1-different fixture; they coincide with \
+              +/-1/sqrt(2) and sqrt(2) by construction, not because we meant the \
+              math constant"
+)]
 fn divergence_f32_uses_float64_accumulators() {
     // Live sklearn 1.5.2 oracle (run from /tmp). sklearn computes the mean in
     // float64, so the true mean 16777217.333... is preserved; transform output:
-    let sk_transform = [
-        -0.7071068286895752f32,
-        -0.7071068286895752f32,
-        1.4142136573791504f32,
-    ];
+    let sk_transform = [-0.7071068f32, -0.7071068f32, 1.4142137f32];
     // sklearn mean_ is float64; the closest f32 value sklearn would NOT collapse
     // to is 16777218.0 (which is what ferrolearn computes). The float64 mean is
     // strictly between 16777216 and 16777218.

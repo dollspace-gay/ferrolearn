@@ -7,6 +7,10 @@
 //! scale of 1, matching scikit-learn `_handle_zeros_in_scale`
 //! (`_data.py:88`, `:1635`, `:1673-1675`); a constant column therefore maps to 0.
 //!
+//! NaN is tolerated (ignored in `fit` via `np.nanmedian`/`np.nanpercentile`
+//! semantics, passed through `transform`); +/-inf is rejected (sklearn
+//! `force_all_finite="allow-nan"`, `_data.py:1601`,`:1665`).
+//!
 //! Translation target: scikit-learn 1.5.2 `class RobustScaler`
 //! (`sklearn/preprocessing/_data.py:1445`) + `robust_scale` (`:1719`). Design:
 //! `.design/preprocess/robust_scaler.md`. Tracking: #1247.
@@ -24,7 +28,7 @@
 //! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
 //! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
 //! | REQ-8 `robust_scale` free function + axis | SHIPPED (#1253) | `robust_scale` free fn delegating to `RobustScaler` (`axis=0` native, `axis=1` transpose→fit_transform→transpose); sklearn `_data.py:1719`,`:1845-1848` |
-//! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | NOT-STARTED (#1254) | sklearn `_data.py:1601`,`:1614`,`:1630` |
+//! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | SHIPPED (#1254) | `RobustScaler::fit` filters `is_nan()` out of each column BEFORE the sort + `quantile_sorted` (median = `Q50`, IQR = `Q(q_max)−Q(q_min)`), so center_/iqr/scale_ are computed over the FINITE values only — mirroring sklearn `np.nanmedian(X, axis=0)` (`_data.py:1614`) + per-column `np.nanpercentile(column_data, quantile_range)` (`:1630`) under `force_all_finite="allow-nan"` (`:1601`). An ALL-NaN column collects no finite values -> the sorted slice is EMPTY -> `quantile_sorted` returns `F::nan()` (made total / non-panicking, R-CODE-2) -> center_/iqr/scale_ = NaN (`_handle_zeros_in_scale` leaves NaN since `NaN < 10*eps` is false). NaN inputs pass through `transform` (`(nan-center)/scale = nan`). inf-rejection (allow-nan REJECTS +/-inf, MinMaxScaler #2200 precedent): `fit` AND `transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Finite-data behavior is byte-identical (same sort + linear-interp quantile; REQ-1/#2204 green guards unchanged). Live-oracle tests (`tests/divergence_robust_scaler.rs`): `req9_nan_fit_single_column_ignored` (center_=4.0/scale_=3.0/transform `[[-1],[nan],[-1/3],[1/3],[1]]`), `req9_nan_fit_multi_column_scattered`, `req9_all_nan_column_yields_nan_no_panic`, `req9_with_centering_false_nan`, `req9_with_scaling_false_nan`, `inf_rejected_fit`, `inf_rejected_transform`, `nan_only_still_fits`. Non-test consumer: PyO3 `_RsRobustScaler` (`ferrolearn-python/src/extras.rs:3228`, registered `lib.rs:94`) marshals `fit`/`transform` over `FittedRobustScaler<f64>` + `FittedPipelineTransformer` impl + crate re-export. **f32 caveat (#2206):** numpy `np.nanpercentile` UPCASTS float32 input to float64 for the linear interpolation (returning float64), so sklearn's `scale_`/`center_` are float64 even for f32 input; ferrolearn's `quantile_sorted::<F>` interpolates in `F`, so on f32 a non-trivial interpolation fraction at larger magnitudes diverges (~3e-4 abs). Same class as StandardScaler #2205 / OPTICS #2195 (generic-F vs sklearn-float64-upcast); the f64 path is bit-exact (2000-fixture fuzz, worst diff 7e-15). Tracked #2206, pinned `#[ignore]` in `tests/divergence_robust_scaler.rs::divergence_f32_nanpercentile_upcasts_to_float64`. Future fix: interpolate the quantile in f64 regardless of `F`. sklearn `_data.py:1601`,`:1614`,`:1630`,`:1665` |
 //! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | SHIPPED (#1255) | `FittedRobustScaler::center` (= `median`) / `scale` (= `scale_` field = `_handle_zeros_in_scale(iqr)`, `1.0` on zero-IQR columns); `fit` sets `scale_ = iqr.mapv(\|v\| if v==0 {1} else {v})`; sklearn `_data.py:1505-1514`,`:1634-1635` |
 //! | REQ-12 copy ctor param + in-place semantics | NOT-STARTED (#1256) | sklearn `_data.py:1568`,`:1661` |
 //! | REQ-13 sparse CSC/CSR support | NOT-STARTED (#1257) | sklearn `_data.py:1609-1612`,`:1668-1670` |
@@ -41,11 +45,20 @@ use num_traits::Float;
 // Helper: compute quantile of a sorted slice
 // ---------------------------------------------------------------------------
 
-/// Compute the `q`-th quantile (0.0–1.0) of a sorted slice using linear interpolation.
+/// Compute the `q`-th quantile (0.0–1.0) of a sorted slice using numpy's default
+/// `'linear'` interpolation at the virtual index `(n-1)*q`.
 ///
-/// Panics if `sorted` is empty.
+/// Total / non-panicking (R-CODE-2): an EMPTY slice returns `F::nan()` rather
+/// than indexing out of bounds. This is the all-NaN-column path — sklearn's
+/// `np.nanpercentile` / `np.nanmedian` over a column with no finite values also
+/// yields `nan` (`_data.py:1614`,`:1630`). Finite, non-empty input is unchanged.
 fn quantile_sorted<F: Float>(sorted: &[F], q: f64) -> F {
     let n = sorted.len();
+    if n == 0 {
+        // Empty slice (an all-NaN column once NaNs are filtered out): no finite
+        // value to interpolate -> NaN, matching np.nanpercentile([], q) -> nan.
+        return F::nan();
+    }
     if n == 1 {
         return sorted[0];
     }
@@ -272,9 +285,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
 
     /// Fit the scaler by computing per-column medians and IQRs.
     ///
+    /// NaN inputs are tolerated and IGNORED: the per-column median and the
+    /// percentile pair are computed over the FINITE values only, mirroring
+    /// sklearn's `np.nanmedian` / `np.nanpercentile` under
+    /// `force_all_finite="allow-nan"` (`_data.py:1601`,`:1614`,`:1630`). An
+    /// all-NaN column yields `center_`/`iqr`/`scale_` = NaN (no panic).
+    ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows.
+    /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows, or
+    /// [`FerroError::InvalidParameter`] if any input element is +/-inf (sklearn
+    /// `force_all_finite="allow-nan"` rejects infinity, `_data.py:1601`).
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedRobustScaler<F>, FerroError> {
         let n_samples = x.nrows();
         if n_samples == 0 {
@@ -282,6 +303,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
                 required: 1,
                 actual: 0,
                 context: "RobustScaler::fit".into(),
+            });
+        }
+        // sklearn validates X with `force_all_finite="allow-nan"`
+        // (`_data.py:1601`): NaN is permitted (ignored by `np.nanmedian` /
+        // `np.nanpercentile`), but +/-inf raises ValueError ("Input X contains
+        // infinity or a value too large for dtype('...')"). Mirrors the
+        // MinMaxScaler #2200 / StandardScaler #2205 precedent (allow-nan rejects
+        // inf).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
             });
         }
 
@@ -296,7 +329,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         let q_max_frac = self.quantile_range.1.to_f64().unwrap_or(75.0) / 100.0;
 
         for j in 0..n_features {
-            let mut col: Vec<F> = x.column(j).iter().copied().collect();
+            // NaN-ignoring median + percentiles over the FINITE values only,
+            // mirroring sklearn's `np.nanmedian(X, axis=0)` (`_data.py:1614`) and
+            // per-column `np.nanpercentile(column_data, quantile_range)`
+            // (`_data.py:1630`) under `force_all_finite="allow-nan"` (`:1601`):
+            // NaN entries are removed BEFORE sorting + interpolating. An ALL-NaN
+            // column collects no finite values -> the sorted slice is empty ->
+            // `quantile_sorted` returns NaN (no panic, no OOB index), matching
+            // `np.nanmedian`/`np.nanpercentile` -> nan on an all-NaN column.
+            let mut col: Vec<F> = x
+                .column(j)
+                .iter()
+                .copied()
+                .filter(|v| !v.is_nan())
+                .collect();
             col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
             let med = quantile_sorted(&col, 0.5);
@@ -304,7 +350,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
             let q_hi = quantile_sorted(&col, q_max_frac);
 
             median_arr[j] = med;
-            // scale_ = Q(q_max) − Q(q_min) (sklearn `_data.py:1634`).
+            // scale_ = Q(q_max) − Q(q_min) (sklearn `_data.py:1634`). An all-NaN
+            // column has med/q_lo/q_hi = NaN -> iqr = NaN -> scale_ = NaN below.
             iqr_arr[j] = q_hi - q_lo;
         }
 
@@ -338,10 +385,16 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
     /// still centered: a constant column maps to 0 and a non-constant zero-IQR
     /// column maps to `x - median`.
     ///
+    /// NaN inputs pass through (`(nan - median)/scale = nan`), and an all-NaN
+    /// fitted column (whose `median`/`scale_` are NaN) transforms to NaN,
+    /// matching sklearn's `allow-nan` contract (`_data.py:1665`,`:1672-1675`).
+    ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
-    /// match the number of features seen during fitting.
+    /// match the number of features seen during fitting, or
+    /// [`FerroError::InvalidParameter`] if any input element is +/-inf (sklearn
+    /// `force_all_finite="allow-nan"` rejects infinity, `_data.py:1665`).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.median.len();
         if x.ncols() != n_features {
@@ -349,6 +402,16 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
                 expected: vec![x.nrows(), n_features],
                 actual: vec![x.nrows(), x.ncols()],
                 context: "FittedRobustScaler::transform".into(),
+            });
+        }
+        // sklearn `transform` validates with `force_all_finite="allow-nan"`
+        // (`_data.py:1665`): NaN passes through the conditional center/scale
+        // (`(nan - center)/scale = nan`), but +/-inf raises ValueError
+        // (MinMaxScaler #2200 precedent; allow-nan rejects inf).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
             });
         }
 

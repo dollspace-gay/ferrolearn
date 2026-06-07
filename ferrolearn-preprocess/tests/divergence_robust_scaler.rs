@@ -433,6 +433,13 @@ fn req9_f32_nan_fit_ignored() {
 /// Tracking: #2206
 #[test]
 #[ignore = "divergence: RobustScaler f32 percentile interp in f32 vs sklearn nanpercentile float64 upcast; tracking #2206"]
+#[allow(
+    clippy::excessive_precision,
+    reason = "the fixture values are written at full precision precisely BECAUSE \
+              they are exact f32 magnitudes chosen so the percentile interpolation \
+              fraction f32-rounds differently from numpy's float64 nanpercentile \
+              (the #2206 divergence); truncating them would change the f32 value"
+)]
 fn divergence_f32_nanpercentile_upcasts_to_float64() {
     let nan = f32::NAN;
     let x = array![
