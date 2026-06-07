@@ -243,9 +243,14 @@ non-test consumer is the crate re-export (`pub use optics::{FittedOPTICS, OPTICS
   Xi `min_cluster_size` criterion is dropped (REQ-7), and the hierarchy/leaf-label
   selection differs (REQ-8).
 - REQ-6: **`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`
-  (R-DEV-2).** sklearn `fit` branch `:374-390` and the free function `:726-788`.
-  ferrolearn supports Xi only; no `cluster_method`/`eps` params and no
-  `cluster_optics_dbscan` (Probe 4).
+  (R-DEV-2). SHIPPED** (#1084, see the `optics.rs` `//!` REQ-6 row). `OPTICS`
+  gains `cluster_method: OpticsClusterMethod {Xi (default), Dbscan}` +
+  `eps: Option<F>` builders; `fn cluster_optics_dbscan` translates sklearn's
+  two-step cumsum cut (`:781-787`) exactly; the `Dbscan` fit arm resolves
+  `eps = self.eps.unwrap_or(self.max_eps)`, errors on `eps > max_eps`. `labels_`
+  value-matches the live oracle. Caveat #2196: at `eps` EXACTLY equal to a
+  differing `core_distances_` value the `<=` cut can flip (sub-ULP distance-form
+  diff, same class as DBSCAN #952); value-exact otherwise.
 - REQ-7: **Xi `min_cluster_size` criterion 3.a (R-DEV-1).** sklearn enforces
   `c_end-c_start+1 < min_cluster_size → continue` *inside* `_xi_cluster`
   (`_optics.py:1155-1156`). ferrolearn applies size filtering *post-hoc* in

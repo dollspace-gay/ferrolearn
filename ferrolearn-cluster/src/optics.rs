@@ -42,15 +42,17 @@
 //! # `## REQ status`
 //!
 //! Binary (R-DEFER-2), translating `sklearn/cluster/_optics.py` (`class OPTICS`,
-//! `compute_optics_graph`, `cluster_optics_xi`). Design doc:
-//! `.design/cluster/optics.md`. Cites use ferrolearn symbol anchors / sklearn
+//! `compute_optics_graph`, `cluster_optics_xi`, `cluster_optics_dbscan`). Design
+//! doc: `.design/cluster/optics.md`. Cites use ferrolearn symbol anchors / sklearn
 //! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
 //! (R-CHAR-3). OPTICS is deterministic (no RNG) → value-parity is genuine. No PyO3
 //! binding — only consumer is the crate re-export. After fixing the traversal
 //! (#1080), `core_distances_`/`ordering_`/`reachability_` VALUE-match sklearn, and
-//! `predecessor_` (the `-1`-sentinel int array, REQ-4) now value-matches too; the Xi
-//! `labels_`, `cluster_hierarchy_`, the dbscan method, and the parameter/attribute
-//! surface remain divergent.
+//! `predecessor_` (the `-1`-sentinel int array, REQ-4) now value-matches too. The
+//! `cluster_method='dbscan'` + `eps` extraction (REQ-6) is now SHIPPED — `fn
+//! cluster_optics_dbscan` value-matches the live oracle. The Xi `labels_`,
+//! `cluster_hierarchy_`, and the remaining parameter/attribute surface stay
+//! divergent.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -59,7 +61,7 @@
 //! | REQ-3 (`reachability_` VALUE) | SHIPPED | impl `fn update_seeds` computes `max(core_dist_p, dist)` then rounds via `fn round_to_precision` (`np.around(decimals=np.finfo(dtype).precision)`, round-ties-even = numpy rint, `_optics.py:711`); combined with the REQ-2 traversal the reported plot value-matches sklearn (the #1080 ordering parity on tie fixtures REQUIRES the matching rounded reachability at each argmin step). Guards: `green_reachability_docstring` + (noisy) the ordering parity which is driven by reachability. Fixed #1080 (bundled). |
 //! | REQ-4 (`predecessor_` `-1`-sentinel int array) | SHIPPED | impl: `FittedOPTICS` stores `predecessor_: Array1<i64>` built in `Fit::fit` (`predecessors.iter().map(\|p\| p.map_or(-1, \|j\| j as i64))`), surfaced via accessor `fn predecessor() -> &Array1<i64>`. This is the `-1`-sentinel int array (shape `(n_samples,)`, indexed by original sample index) matching sklearn `predecessor_` "Seed points have a predecessor of -1" (`_optics.py:187-189`, `np.full(n_samples,-1,dtype=int)` `:604-605`, set on STRICT improvement `:712-714`). ferrolearn's `fn update_seeds` records the predecessor under the SAME strict `new_reach < reachability[q]` condition as sklearn's `improved = np.where(rdists < ...)` (`:712`), so the VALUES match too — verified element-wise (incl. the `-1` seed) vs the live oracle on `three_blobs` (`[-1,0,0,1,3,3,8,6,4]`), `small10` (tie-prone, `[-1,0,3,1,8,9,5,6,7,3]`), and the docstring fixture (`[-1,0,1,5,3,2]`). Internal `fn predecessors() -> &[Option<usize>]` kept (seed `None`) for the Xi extractor + back-compat. Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards (live-oracle, R-CHAR-3): `green_predecessor_three_blobs`, `green_predecessor_small10`, `green_predecessor_docstring` in `tests/divergence_optics.rs`. **f32 caveat (#2195):** sklearn OPTICS ALWAYS computes the graph in float64 — `reachability_.dtype == float64` even for float32 input (it upcasts) — whereas ferrolearn computes generically in `F`, so on f32 a near-tie in the reachability plot can round to the opposite side, swapping `ordering_`/`reachability_` and hence `predecessor_` (e.g. `small10` f32 at indices 6/7/8). This is an OPTICS-WIDE f32 divergence (it equally affects the SHIPPED f64-only REQ-1/2/3), tracked as #2195 and pinned `#[ignore]` in `tests/divergence_optics_predecessor_f32.rs`; the f64 path is bit-exact. The future fix is to compute the OPTICS graph in f64 regardless of `F` (matching sklearn's upcast) — out of this single-file predecessor scope. |
 //! | REQ-5 (`labels_` Xi VALUE parity) | NOT-STARTED | open prereq blocker #1083. sklearn `labels_` via `cluster_optics_xi` (`:810-918`); ferrolearn diverges (gated on the in-Xi `min_cluster_size` REQ-7 + `cluster_hierarchy_` leaf-selection REQ-8). With REQ-2 fixed the plot now matches, but the Xi label derivation still differs. |
-//! | REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | NOT-STARTED | open prereq blocker #1084. sklearn `fit` branch (`:374-390`) + free fn (`:726-788`); ferrolearn Xi-only, no `cluster_method`/`eps`. |
+//! | REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | SHIPPED | impl: free fn `cluster_optics_dbscan(reachability, core_distances, ordering, eps) -> Array1<isize>` translates sklearn's two-step labelling EXACTLY (`sklearn/cluster/_optics.py:781-787`): step 1 walks `ordering` accumulating `cumsum(far_reach & near_core) - 1` with `far_reach = reachability > eps` (STRICT) and `near_core = core_distances <= eps` (INCLUSIVE); step 2 overwrites `labels[far_reach & !near_core] = -1`. Wired into `Fit::fit` via the new `cluster_method: OpticsClusterMethod` field (`enum {Xi (default), Dbscan}`, builder `fn with_cluster_method`) + `eps: Option<F>` field (builder `fn with_eps`): the `Dbscan` arm resolves `eps = self.eps.unwrap_or(self.max_eps)` and errors (`FerroError::InvalidParameter`) when `eps > self.max_eps`, mirroring sklearn's `eps` resolution + ValueError (`:375-383`). Consumer (R-DEFER-1, non-test): `Fit::fit`'s `OpticsClusterMethod::Dbscan` arm CALLS `cluster_optics_dbscan` to populate `labels_`; reachable publicly via `pub mod optics` (`ferrolearn_cluster::optics::{cluster_optics_dbscan, OpticsClusterMethod}`). Guards (live-oracle, R-CHAR-3): `green_dbscan_three_blobs_eps05/eps_none_all_noise/eps_large_merge`, `green_dbscan_small10_eps07_mixed/eps2_merge/eps05_noise`, `green_dbscan_eps_gt_max_eps_errs`, `green_xi_default_unchanged_three_blobs` in `tests/divergence_optics.rs`. (The Xi `labels_` REQ-5/7/8 + the PyO3 surface REQ-12 stay separate NOT-STARTED.) **eps-at-core-distance-boundary caveat (#2196):** when `eps` is set EXACTLY equal to one of ferrolearn's `core_distances_` values, the `<=` near-core cut can flip vs sklearn because ferrolearn's `core_distance` (`sqrt(sum-of-squares)`) differs from sklearn's `kneighbors`/`euclidean_distances` distance form by a sub-ULP (~4e-17), so `core <= eps` rounds to opposite sides at the exact boundary (`small10` at `eps == core_distances_[5]`). This is the SAME distance-form boundary class as DBSCAN #952 (REQ-1 `core_distances_` value-matches to ~1e-9, not bit-exact); for any `eps` not landing precisely on a differing core-distance the cut is value-exact. Tracked #2196, pinned `#[ignore]` in `tests/divergence_optics_dbscan_boundary.rs`. |
 //! | REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker #1085. sklearn enforces size INSIDE `_xi_cluster` (`:1155-1156`); ferrolearn post-filters in `fn filter_small_clusters` — different fixed point. |
 //! | REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker #1086. sklearn `(n_clusters,2)` `[start,end]` ordered `(end,-start)` (`:1166-1172`); ferrolearn `fn xi_cluster_extraction` discards the intervals, no accessor. |
 //! | REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker #1087. sklearn `bool` default True (`:277`); ferrolearn always applies `fn correct_predecessor`, no param. |
@@ -78,6 +80,23 @@ use std::collections::HashMap;
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration struct
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Cluster-extraction method used by [`OPTICS`] to derive `labels_` from the
+/// reachability plot.
+///
+/// Mirrors scikit-learn's `cluster_method` parameter, whose
+/// `_parameter_constraints` is `StrOptions({"dbscan", "xi"})` with default
+/// `"xi"` (`sklearn/cluster/_optics.py:251`, `:274`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpticsClusterMethod {
+    /// The automatic Xi-steep extraction technique (the default), proposed in
+    /// the OPTICS paper. Uses the `xi`/`min_cluster_size` parameters.
+    #[default]
+    Xi,
+    /// A DBSCAN-like extraction at a fixed `eps`, via
+    /// [`cluster_optics_dbscan`]. Uses the `eps` parameter.
+    Dbscan,
+}
 
 /// OPTICS clustering configuration (unfitted).
 ///
@@ -102,6 +121,15 @@ pub struct OPTICS<F> {
     /// Clusters smaller than this are relabelled as noise (`-1`).
     /// Defaults to `None`, meaning use `min_samples`.
     pub min_cluster_size: Option<usize>,
+    /// The cluster-extraction method used to derive `labels_` from the
+    /// reachability plot.  Defaults to [`OpticsClusterMethod::Xi`], matching
+    /// scikit-learn's `cluster_method="xi"` (`sklearn/cluster/_optics.py:274`).
+    pub cluster_method: OpticsClusterMethod,
+    /// DBSCAN `eps` parameter, used only when
+    /// `cluster_method == OpticsClusterMethod::Dbscan`.  When `None` (the
+    /// default) it assumes the same value as `max_eps`, matching scikit-learn's
+    /// `eps=None` (`sklearn/cluster/_optics.py:275`, resolved `:375-378`).
+    pub eps: Option<F>,
 }
 
 impl<F: Float> OPTICS<F> {
@@ -115,6 +143,8 @@ impl<F: Float> OPTICS<F> {
             max_eps: F::infinity(),
             xi: F::from(0.05).unwrap_or_else(|| F::from(5e-2).unwrap()),
             min_cluster_size: None,
+            cluster_method: OpticsClusterMethod::Xi,
+            eps: None,
         }
     }
 
@@ -142,6 +172,32 @@ impl<F: Float> OPTICS<F> {
     #[must_use]
     pub fn with_min_cluster_size(mut self, size: usize) -> Self {
         self.min_cluster_size = Some(size);
+        self
+    }
+
+    /// Set the cluster-extraction method (`Xi` or `Dbscan`).
+    ///
+    /// Mirrors scikit-learn's `cluster_method` parameter
+    /// (`sklearn/cluster/_optics.py:274`). With [`OpticsClusterMethod::Dbscan`]
+    /// the labels are derived from the reachability plot at a fixed `eps` via
+    /// [`cluster_optics_dbscan`]; with [`OpticsClusterMethod::Xi`] (the default)
+    /// the automatic Xi-steep extraction is used.
+    #[must_use]
+    pub fn with_cluster_method(mut self, method: OpticsClusterMethod) -> Self {
+        self.cluster_method = method;
+        self
+    }
+
+    /// Set the DBSCAN `eps` parameter (used only when
+    /// `cluster_method == OpticsClusterMethod::Dbscan`).
+    ///
+    /// When unset (`None`, the default), `eps` assumes the value of `max_eps`,
+    /// matching scikit-learn's `eps=None` resolution
+    /// (`sklearn/cluster/_optics.py:375-378`). `eps` must not exceed `max_eps`,
+    /// otherwise [`Fit::fit`] returns an error.
+    #[must_use]
+    pub fn with_eps(mut self, eps: F) -> Self {
+        self.eps = Some(eps);
         self
     }
 }
@@ -413,6 +469,73 @@ fn update_seeds<F: Float>(
             predecessors[q] = Some(current_point);
         }
     }
+}
+
+/// Perform DBSCAN extraction from an OPTICS reachability graph at a fixed `eps`.
+///
+/// This is the ferrolearn translation of scikit-learn's
+/// `cluster_optics_dbscan(*, reachability, core_distances, ordering, eps)`
+/// (`sklearn/cluster/_optics.py:726-788`). Given the OPTICS-computed
+/// `reachability_`, `core_distances_`, and `ordering_`, it labels each sample as
+/// a member of a DBSCAN-like cluster (`0, 1, 2, …`) or as noise (`-1`), running
+/// in linear time over `ordering`.
+///
+/// The exact two-step labelling (`_optics.py:781-787`):
+/// 1. `far_reach = reachability > eps` (STRICT `>`), `near_core =
+///    core_distances <= eps` (INCLUSIVE `<=`). Walking the points in `ordering`
+///    order, maintain a running cumulative sum of `far_reach[o] & near_core[o]`
+///    and assign `labels[o] = cumsum_so_far - 1`. This assigns ALL points.
+/// 2. For every point `i` with `far_reach[i] & !near_core[i]`, OVERWRITE
+///    `labels[i] = -1` (the noise mask).
+///
+/// `reachability`, `core_distances` are indexed by ORIGINAL sample index;
+/// `ordering` lists the original indices in OPTICS reachability order. The
+/// returned labels are indexed by original sample index, shape `(n_samples,)`.
+///
+/// # Panics
+///
+/// Does not panic. Out-of-range entries in `ordering` (which OPTICS never
+/// produces) are skipped rather than indexing out of bounds.
+#[must_use]
+pub fn cluster_optics_dbscan<F: Float>(
+    reachability: &[F],
+    core_distances: &[F],
+    ordering: &[usize],
+    eps: F,
+) -> Array1<isize> {
+    let n_samples = core_distances.len();
+    // labels = np.zeros(n_samples, dtype=int)  (`_optics.py:782`).
+    let mut labels = Array1::<isize>::zeros(n_samples);
+
+    // Step 1: labels[ordering] = np.cumsum(far_reach[ordering] & near_core[ordering]) - 1
+    // (`_optics.py:784-786`). `far_reach` uses STRICT `>`, `near_core` uses
+    // INCLUSIVE `<=`. We walk `ordering` accumulating the boolean cumsum.
+    let mut cumsum: isize = 0;
+    for &o in ordering {
+        if o >= n_samples {
+            // OPTICS never emits an out-of-range index; guard defensively.
+            continue;
+        }
+        let far_reach = reachability[o] > eps;
+        let near_core = core_distances[o] <= eps;
+        if far_reach && near_core {
+            cumsum += 1;
+        }
+        labels[o] = cumsum - 1;
+    }
+
+    // Step 2: labels[far_reach & ~near_core] = -1  (`_optics.py:787`). This
+    // OVERWRITES the cumsum value for the noise points, indexed by original
+    // sample index over ALL samples (not just those in `ordering`).
+    for i in 0..n_samples {
+        let far_reach = reachability[i] > eps;
+        let near_core = core_distances[i] <= eps;
+        if far_reach && !near_core {
+            labels[i] = -1;
+        }
+    }
+
+    labels
 }
 
 /// A steep-down area (SDA) tracked during Xi extraction.
@@ -900,18 +1023,52 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
             }
         }
 
-        // Extract cluster labels via the Xi method.
-        let mut labels = xi_cluster_extraction(
-            &ordering,
-            &reachability,
-            &predecessors,
-            self.xi,
-            self.min_samples,
-        );
+        // Extract cluster labels.  sklearn dispatches on `cluster_method`
+        // (`sklearn/cluster/_optics.py:363-390`): `"xi"` runs `cluster_optics_xi`
+        // (the default), `"dbscan"` resolves `eps` then runs
+        // `cluster_optics_dbscan`.
+        let labels = match self.cluster_method {
+            OpticsClusterMethod::Xi => {
+                // Extract cluster labels via the Xi method.
+                let mut labels = xi_cluster_extraction(
+                    &ordering,
+                    &reachability,
+                    &predecessors,
+                    self.xi,
+                    self.min_samples,
+                );
 
-        // Apply min_cluster_size filtering.
-        let min_size = self.min_cluster_size.unwrap_or(self.min_samples);
-        filter_small_clusters(&mut labels, min_size);
+                // Apply min_cluster_size filtering.
+                let min_size = self.min_cluster_size.unwrap_or(self.min_samples);
+                filter_small_clusters(&mut labels, min_size);
+                labels
+            }
+            OpticsClusterMethod::Dbscan => {
+                // Resolve `eps`: `eps = self.eps if self.eps is not None else
+                // self.max_eps` (`sklearn/cluster/_optics.py:375-378`).
+                let eps = self.eps.unwrap_or(self.max_eps);
+                // `if eps > self.max_eps: raise ValueError("Specify an epsilon
+                // smaller than %s. Got %s.")` (`:380-383`).
+                if eps > self.max_eps {
+                    return Err(FerroError::InvalidParameter {
+                        name: "eps".into(),
+                        reason: format!(
+                            "Specify an epsilon smaller than {:?}. Got {:?}.",
+                            self.max_eps.to_f64().unwrap_or(f64::INFINITY),
+                            eps.to_f64().unwrap_or(f64::INFINITY)
+                        ),
+                    });
+                }
+                // labels_ = cluster_optics_dbscan(reachability_, core_distances_,
+                // ordering_, eps)  (`:385-390`).
+                cluster_optics_dbscan(
+                    reachability.as_slice().unwrap_or(&[]),
+                    core_distances.as_slice().unwrap_or(&[]),
+                    &ordering,
+                    eps,
+                )
+            }
+        };
 
         // Build the sklearn-faithful `-1`-sentinel `predecessor_` from the
         // `Option<usize>` predecessors: `Some(j) -> j as i64`, `None -> -1`

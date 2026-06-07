@@ -19,6 +19,7 @@
 //!         (formerly `divergence_ordering_small10`; the fix landed so the pin is green)
 
 use ferrolearn_cluster::OPTICS;
+use ferrolearn_cluster::optics::OpticsClusterMethod;
 use ferrolearn_core::Fit;
 use ndarray::Array2;
 
@@ -436,4 +437,211 @@ fn green_predecessor_docstring() {
     }
     let n_neg1 = pred.iter().filter(|&&v| v == -1).count();
     assert_eq!(n_neg1, 1, "docstring fixture has a single -1 seed");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GREEN-GUARD: REQ-6 `cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`
+// VALUE parity (#1084, NOW SHIPPED).
+//
+// sklearn's `OPTICS(cluster_method='dbscan', eps=...).fit(X).labels_` derives the
+// labels from the reachability graph by the linear-time two-step extraction
+// `cluster_optics_dbscan` (`sklearn/cluster/_optics.py:781-787`):
+//   far_reach = reachability > eps              (STRICT >)
+//   near_core = core_distances <= eps           (INCLUSIVE <=)
+//   labels[ordering] = cumsum(far_reach[ordering] & near_core[ordering]) - 1
+//   labels[far_reach & ~near_core] = -1
+// `eps` resolves to `max_eps` when unset (`:375-378`); `eps > max_eps` raises
+// ValueError (`:380-383`). All expected values below are from the LIVE sklearn
+// 1.5.2 oracle (run from /tmp), never copied from ferrolearn (R-CHAR-3). f64
+// fixtures only (the OPTICS graph diverges on f32, #2195 — out of scope here).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Green-guard: REQ-6. `OPTICS(min_samples=2, cluster_method='dbscan', eps=0.5)
+/// .fit(three_blobs).labels_` value-matches sklearn — three tight clusters, no
+/// noise (`sklearn/cluster/_optics.py:781-787`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan', eps=0.5).fit(X).labels_.tolist())"
+///   -> [0, 0, 0, 1, 1, 1, 2, 2, 2]
+#[test]
+fn green_dbscan_three_blobs_eps05() {
+    let sk_labels: [isize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(0.5)
+        .fit(&three_blobs(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "dbscan labels_ must match sklearn (sklearn/cluster/_optics.py:781-787); #1084"
+    );
+}
+
+/// Green-guard: REQ-6. With `eps=None` and the default `max_eps=inf`, `eps`
+/// resolves to `inf`; `far_reach = reachability > inf` is FALSE everywhere, so the
+/// cumsum is all-zero → `labels = cumsum - 1 = -1` everywhere (all noise). The
+/// noise mask is empty (no point has `far_reach`), so the result is all `-1`.
+/// (`sklearn/cluster/_optics.py:375-378,781-787`.)
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan').fit(X).labels_.tolist())"
+///   -> [-1, -1, -1, -1, -1, -1, -1, -1, -1]
+#[test]
+fn green_dbscan_eps_none_all_noise() {
+    let sk_labels: [isize; 9] = [-1, -1, -1, -1, -1, -1, -1, -1, -1];
+    // eps unset → resolves to max_eps (= inf here).
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .fit(&three_blobs(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "eps=None,max_eps=inf must be all-noise like sklearn; #1084"
+    );
+}
+
+/// Green-guard: REQ-6. A LARGE `eps` merges everything into a single cluster
+/// (`sklearn/cluster/_optics.py:781-787`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan', eps=100.0).fit(X).labels_.tolist())"
+///   -> [0, 0, 0, 0, 0, 0, 0, 0, 0]
+#[test]
+fn green_dbscan_three_blobs_eps_large_merge() {
+    let sk_labels: [isize; 9] = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(100.0)
+        .fit(&three_blobs(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "large eps must merge all into one cluster like sklearn; #1084"
+    );
+}
+
+/// Green-guard: REQ-6. `small10`, `eps=0.7` — a mixed labelling with NOISE points
+/// (`-1`), exercising both the STRICT-`>` reachability boundary and the
+/// `<=`-INCLUSIVE core boundary (`sklearn/cluster/_optics.py:781-787`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan', eps=0.7).fit(X).labels_.tolist())"
+///   -> [0, 0, -1, 1, -1, 2, 2, 2, 2, 1]
+#[test]
+fn green_dbscan_small10_eps07_mixed() {
+    let sk_labels: [isize; 10] = [0, 0, -1, 1, -1, 2, 2, 2, 2, 1];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(0.7)
+        .fit(&small10(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "small10 eps=0.7 mixed labelling must match sklearn; #1084"
+    );
+}
+
+/// Green-guard: REQ-6. `small10`, `eps=0.5` — produces several `-1` noise points
+/// (small eps) with a single 3-point cluster
+/// (`sklearn/cluster/_optics.py:781-787`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan', eps=0.5).fit(X).labels_.tolist())"
+///   -> [-1, -1, -1, -1, -1, -1, 0, 0, 0, -1]
+#[test]
+fn green_dbscan_small10_eps05_noise() {
+    let sk_labels: [isize; 10] = [-1, -1, -1, -1, -1, -1, 0, 0, 0, -1];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(0.5)
+        .fit(&small10(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "small10 eps=0.5 small-eps noise must match sklearn; #1084"
+    );
+}
+
+/// Green-guard: REQ-6. `small10`, `eps=2.0` — a large eps merges everything
+/// (`sklearn/cluster/_optics.py:781-787`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     print(OPTICS(min_samples=2, cluster_method='dbscan', eps=2.0).fit(X).labels_.tolist())"
+///   -> [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+#[test]
+fn green_dbscan_small10_eps2_merge() {
+    let sk_labels: [isize; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(2.0)
+        .fit(&small10(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "small10 eps=2.0 must merge all like sklearn; #1084"
+    );
+}
+
+/// Green-guard: REQ-6. `eps > max_eps` must error (no panic), mirroring sklearn's
+/// `ValueError("Specify an epsilon smaller than %s. Got %s.")`
+/// (`sklearn/cluster/_optics.py:380-383`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     OPTICS(min_samples=2, cluster_method='dbscan', eps=5.0, max_eps=1.0).fit(X)"
+///   -> ValueError: Specify an epsilon smaller than 1.0. Got 5.0.
+#[test]
+fn green_dbscan_eps_gt_max_eps_errs() {
+    let result = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(5.0)
+        .with_max_eps(1.0)
+        .fit(&three_blobs(), &());
+    assert!(
+        result.is_err(),
+        "eps > max_eps must error like sklearn's ValueError (sklearn/cluster/_optics.py:380-383); #1084"
+    );
+}
+
+/// Green-guard: REQ-6. The DEFAULT `cluster_method` (Xi) path is UNCHANGED — the
+/// existing three_blobs Xi labels_ still produce three clusters. Confirms the new
+/// `cluster_method` dispatch did not perturb the Xi default
+/// (`sklearn/cluster/_optics.py:363-372` Xi branch).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2).fit(X).labels_.tolist())"
+///   -> [0, 0, 0, 1, 1, 1, 2, 2, 2]
+#[test]
+fn green_xi_default_unchanged_three_blobs() {
+    let sk_labels: [isize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+    // No with_cluster_method → default Xi path.
+    let est = OPTICS::<f64>::new(2);
+    assert_eq!(est.cluster_method, OpticsClusterMethod::Xi);
+    let fitted = est.fit(&three_blobs(), &()).unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "default Xi labels_ must be unchanged by the dbscan dispatch; #1084"
+    );
 }
