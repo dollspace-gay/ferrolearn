@@ -46,7 +46,6 @@ use ndarray::{Array1, Array2};
 /// The tiny `tol=1e-12` guarantees the slow-converging gamma=1 graph never hits
 /// the L1-at-start break before `max_iter`, forcing the non-convergence branch.
 #[test]
-#[ignore = "divergence: LabelPropagation::n_iter_ returns max_iter+1 on non-convergence, sklearn returns max_iter; tracking #2183"]
 fn divergence_n_iter_max_iter_hit_equals_max_iter() {
     // sklearn oracle: n_iter_ == max_iter on the non-convergence exit.
     let x = Array2::from_shape_vec((4, 2), vec![0., 0., 0.3, 0., 0.6, 0., 1.0, 0.]).unwrap();
