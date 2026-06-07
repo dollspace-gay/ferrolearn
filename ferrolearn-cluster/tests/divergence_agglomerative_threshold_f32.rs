@@ -46,9 +46,7 @@ use ndarray::Array2;
 fn fixture6_f32() -> Array2<f32> {
     Array2::from_shape_vec(
         (6, 2),
-        vec![
-            0.0, 0.0, 0.2, 0.1, 0.9, 1.1, 3.0, 3.2, 3.3, 3.0, 6.0, 0.2,
-        ],
+        vec![0.0, 0.0, 0.2, 0.1, 0.9, 1.1, 3.0, 3.2, 3.3, 3.0, 6.0, 0.2],
     )
     .unwrap()
 }
@@ -58,7 +56,6 @@ fn fixture6_f32() -> Array2<f32> {
 /// sklearn returns `n_clusters_ == 1` / `labels_ == [0;6]`; ferrolearn returns
 /// `n_clusters_ == 2` / `labels_ == [1,1,1,0,0,0]`.
 #[test]
-#[ignore = "divergence: f32 distances_ truncated (sklearn keeps float64) flips distance_threshold count; tracking #2185"]
 fn divergence_f32_distances_threshold_count_flip_6pt_ward() {
     // Oracle values from the live sklearn 1.5.2 command in the module doc.
     const SK_N_CLUSTERS: usize = 1;

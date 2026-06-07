@@ -88,8 +88,8 @@
 //! | REQ-6 (`children_` full-dendrogram format) | SHIPPED | impl `fn full_dendrogram in agglomerative.rs` (nn-chain `fn nn_chain` + stable distance sort + union-find `fn union_find_relabel` for ward/complete/average; Prim MST `fn mst_single` + `fn single_linkage_relabel` for single) produces `children_` of shape `(n_samples-1, 2)` with leaves `0..n-1` and internal-node IDs `n+i`, BIT-EXACT-equal to `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]` for ward/complete/average (`_agglomerative.py:314`/`:586`); for `single`, sklearn uses `mst_linkage_core` + `_single_linkage_label` (`:567-584`, R-DEV-7) whose pair order differs from `scipy.linkage('single')`, so `children_` matches sklearn's OWN `AgglomerativeClustering.children_` bit-exact. Live-oracle tests in `tests/divergence_agglomerative_dendrogram.rs`: `children_exact_scipy_6pt_nn_chain_linkages`, `children_exact_scipy_10pt_nn_chain_linkages`, `children_exact_sklearn_single_6pt`, `children_exact_sklearn_single_10pt`, and the pinned `divergence_children_full_dendrogram_format`. Consumers: `Fit::fit` → `children_`, `RsAgglomerativeClustering`, `birch.rs`/`feature_agglomeration.rs`. |
 //! | REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | SHIPPED | impl `fn hc_cut in agglomerative.rs` (negated-id max-heap over the top-`n_clusters` dendrogram nodes + `fn hc_get_descendent`, mirroring `_hc_cut`, `_agglomerative.py:731-775`) builds `labels_` from the REQ-6 full `children_`, BIT-EXACT-equal to `sklearn.cluster.AgglomerativeClustering(n_clusters=k, linkage=…).fit(X).labels_`. Live-oracle tests: `labels_exact_sklearn_6pt_all_linkages`/`labels_exact_sklearn_10pt_all_linkages` (k∈{2,3}, all four linkages) + the pinned `divergence_labels_absolute_hc_cut_numbering`. Consumer: `Fit::fit` → `labels_` surfaced through `RsAgglomerativeClustering::labels_` + `birch.rs`/`feature_agglomeration.rs` (partition use). |
 //! | REQ-8 (`metric` / `connectivity`) | NOT-STARTED | open prereq blocker #965. sklearn `metric` ∈ {euclidean,l1,l2,manhattan,cosine,precomputed} default `'euclidean'` with the ward-requires-euclidean rule (`_agglomerative.py:795-799`, `:1034-1038`) and `connectivity` for structured clustering (`:812-822`). ferrolearn `fn sq_euclidean`/`fn pairwise_sq_dists` are Euclidean-only, unstructured. |
-//! | REQ-9 (`distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_`) | NOT-STARTED | open prereq blocker #966. sklearn `distance_threshold` (XOR with `n_clusters`, `_agglomerative.py:1022-1027`; `n_clusters_` derived `:1090-1093`), `compute_full_tree='auto'` (`:1051-1064`), `compute_distances` → `distances_` (`:1087-1088`). ferrolearn has only `n_clusters` + `linkage`, no `distances_`, and the merge-distance VALUES differ. |
-//! | REQ-10 (`n_leaves_`/`n_connected_components_` + `memory`) | NOT-STARTED | open prereq blocker #967. sklearn sets `n_leaves_`/`n_connected_components_` from the tree builder (`_agglomerative.py:1083-1085`) and caches via `memory` (`:1006`/`:1076`). `FittedAgglomerativeClustering` exposes `labels()`/`n_clusters()`/`children()` only. |
+//! | REQ-9 (`distance_threshold`/`compute_distances`/`distances_`) | SHIPPED | ctor `n_clusters: Option<usize>` (default `Some(2)`) + `distance_threshold: Option<F>` + `with_distance_threshold` (clears `n_clusters`, mirroring `n_clusters=None,distance_threshold=t`) + `with_compute_distances`; `Fit::fit` enforces the XOR `not ((n_clusters is None) ^ (distance_threshold is None))` (`_agglomerative.py:1022-1027`) as `FerroError::InvalidParameter`. `fn full_dendrogram`/`fn union_find_relabel`/`fn single_linkage_relabel` now also return the per-merge distances in `children_` row order; `fn agglomerate` surfaces them as `distances_` when `return_distance = distance_threshold.is_some() || compute_distances` (`:1074`, `:1087-1088`) and derives `n_clusters_ = count(distances_ >= t) + 1` (`:1090-1093`) then `labels_ = hc_cut(n_clusters_, …)` (`:1099`). `distances_` EXACT-equals `scipy.linkage(X, L, 'euclidean')[:, 2]` / sklearn `distances_` (~1e-12, all 4 linkages). Live-oracle tests `tests/divergence_agglomerative_threshold.rs`: `distances_exact_6pt_all_linkages`, `distances_exact_10pt_all_linkages`, `threshold_cut_exact_6pt_all_linkages`, `threshold_cut_exact_10pt_all_linkages`, `threshold_inclusive_boundary_6pt_ward`, `xor_*`. Consumers: `Fit::fit` → `distances_`/`n_clusters_`/`labels_`, `RsAgglomerativeClustering`, `birch.rs`/`feature_agglomeration.rs` (via `new()` default `Some(2)`). NOTE `compute_full_tree` is a no-op here: the unstructured path always builds the FULL dendrogram, so the `'auto'`/partial-tree PERF optimisation is unimplemented and not observable — every observable attribute matches the full-tree path. `memory` caching stays NOT-STARTED. |
+//! | REQ-10 (`n_leaves_`/`n_connected_components_`) | SHIPPED | `FittedAgglomerativeClustering` now stores `pub n_leaves_: usize` / `pub n_connected_components_: usize` with accessors `n_leaves()`/`n_connected_components()`; `Fit::fit` sets `n_leaves_ = n_samples`, `n_connected_components_ = 1` for the unstructured (`connectivity=None`) path (`_agglomerative.py:1083-1085`: `ward_tree`/`linkage_tree` return `(children_, 1, n_samples, None[, distances])`). Live-oracle test `n_leaves_and_connected_components_unstructured` (`tests/divergence_agglomerative_threshold.rs`, both fixtures, all 4 linkages). Consumer: `Fit::fit` (production path) + the accessors. `memory` caching (`:1006`/`:1076`) stays NOT-STARTED (open blocker #967): it is an opt-in perf/persistence wrapper with no observable attribute divergence in the default `memory=None` path. |
 //! | REQ-11 (PyO3 binding parity) | SHIPPED | `#[pyclass(name="_RsAgglomerativeClustering")]` (`ferrolearn-python/src/extras.rs`): `fn new(n_clusters=2)`, `fn fit` → `ferrolearn_cluster::AgglomerativeClustering::<f64>::new(self.n_clusters)`, `#[getter] labels_`; registered in `ferrolearn-python/src/lib.rs`, wrapped `class AgglomerativeClustering(_ClusterWrapper)` in `python/ferrolearn/_extras.py`, exported in `__init__.py`. `ferrolearn.AgglomerativeClustering(n_clusters=2).fit(X).labels_` matches sklearn up to label permutation (REQ-1). Hard-wires Ward (no `linkage`/`metric`/`distance_threshold` arg). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #968. `agglomerative.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`; the PyO3 boundary uses `numpy2_to_ndarray`, not `ferray::numpy_interop` (R-SUBSTRATE). |
 
@@ -124,15 +124,43 @@ pub enum Linkage {
 /// Call [`Fit::fit`] to run the algorithm and obtain a
 /// [`FittedAgglomerativeClustering`].
 ///
+/// # Cluster target: `n_clusters` XOR `distance_threshold`
+///
+/// Mirroring sklearn's `__init__` (`_agglomerative.py:949-960`), the number of
+/// clusters is expressed as EITHER a fixed `n_clusters` OR a
+/// `distance_threshold` (the linkage distance above which clusters are not
+/// merged). Exactly one must be set — sklearn enforces this as the XOR
+/// `not ((n_clusters is None) ^ (distance_threshold is None))`
+/// (`_agglomerative.py:1022-1027`). Rust has no `None`-vs-`int` overload, so we
+/// store `n_clusters: Option<usize>` (default `Some(2)`, mirroring sklearn's
+/// `n_clusters=2` default) and `distance_threshold: Option<F>` (default
+/// `None`). [`with_distance_threshold`](Self::with_distance_threshold) sets the
+/// threshold and clears `n_clusters` to mirror the sklearn idiom
+/// `AgglomerativeClustering(n_clusters=None, distance_threshold=t)`.
+///
 /// # Type Parameters
 ///
 /// - `F`: floating-point scalar type (`f32` or `f64`).
 #[derive(Debug, Clone)]
 pub struct AgglomerativeClustering<F> {
-    /// Target number of clusters.
-    pub n_clusters: usize,
+    /// Target number of clusters. `None` when [`distance_threshold`] drives the
+    /// cut instead (mirrors sklearn `n_clusters=None`).
+    ///
+    /// [`distance_threshold`]: Self::distance_threshold
+    pub n_clusters: Option<usize>,
     /// Linkage strategy for computing inter-cluster distances.
     pub linkage: Linkage,
+    /// The linkage distance threshold at or above which clusters will not be
+    /// merged. `None` when [`n_clusters`] drives the cut (mirrors sklearn
+    /// `distance_threshold=None`).
+    ///
+    /// [`n_clusters`]: Self::n_clusters
+    pub distance_threshold: Option<F>,
+    /// Whether to compute and store the per-merge `distances_` even when
+    /// `distance_threshold` is not set (mirrors sklearn `compute_distances`,
+    /// default `false`). `distances_` is always computed when
+    /// `distance_threshold` is set (`return_distance`, `_agglomerative.py:1074`).
+    pub compute_distances: bool,
     /// Phantom to retain the float type parameter.
     _marker: std::marker::PhantomData<F>,
 }
@@ -140,12 +168,15 @@ pub struct AgglomerativeClustering<F> {
 impl<F: Float> AgglomerativeClustering<F> {
     /// Create a new `AgglomerativeClustering` with the given number of clusters.
     ///
-    /// Uses default `linkage = Ward`.
+    /// Uses default `linkage = Ward`, `distance_threshold = None`,
+    /// `compute_distances = false`.
     #[must_use]
     pub fn new(n_clusters: usize) -> Self {
         Self {
-            n_clusters,
+            n_clusters: Some(n_clusters),
             linkage: Linkage::Ward,
+            distance_threshold: None,
+            compute_distances: false,
             _marker: std::marker::PhantomData,
         }
     }
@@ -154,6 +185,31 @@ impl<F: Float> AgglomerativeClustering<F> {
     #[must_use]
     pub fn with_linkage(mut self, linkage: Linkage) -> Self {
         self.linkage = linkage;
+        self
+    }
+
+    /// Drive the cut by a linkage-distance threshold instead of a fixed cluster
+    /// count, mirroring sklearn
+    /// `AgglomerativeClustering(n_clusters=None, distance_threshold=t)`.
+    ///
+    /// Sets `distance_threshold = Some(threshold)` and clears `n_clusters` to
+    /// `None` (the XOR contract, `_agglomerative.py:1022-1027`). After fitting,
+    /// `n_clusters_ = count(distances_ >= threshold) + 1`
+    /// (`_agglomerative.py:1090-1093`). Setting the threshold also forces
+    /// `distances_` to be computed (`return_distance`, `:1074`).
+    #[must_use]
+    pub fn with_distance_threshold(mut self, threshold: F) -> Self {
+        self.distance_threshold = Some(threshold);
+        self.n_clusters = None;
+        self
+    }
+
+    /// Compute and store the per-merge `distances_` array even when no
+    /// `distance_threshold` is set, mirroring sklearn `compute_distances=True`
+    /// (`_agglomerative.py:959`, `:1074`, `:1087-1088`).
+    #[must_use]
+    pub fn with_compute_distances(mut self, compute_distances: bool) -> Self {
+        self.compute_distances = compute_distances;
         self
     }
 }
@@ -184,6 +240,22 @@ pub struct FittedAgglomerativeClustering<F> {
     /// This matches scikit-learn's `children_` attribute and
     /// `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]`.
     pub children_: Vec<(usize, usize)>,
+    /// The per-merge linkage distances, in `children_` row order, length
+    /// `n_samples - 1`. `Some` when `distance_threshold` was set OR
+    /// `compute_distances` was `true` (mirroring sklearn's `return_distance`
+    /// path, `_agglomerative.py:1074`, `:1087-1088`), `None` otherwise.
+    ///
+    /// Equal to `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, 2]`
+    /// for ward/complete/average and to sklearn's own `distances_` for single.
+    pub distances_: Option<Array1<F>>,
+    /// The number of leaves in the hierarchical tree, equal to `n_samples` for
+    /// the unstructured (`connectivity=None`) path
+    /// (`_agglomerative.py:1083-1085`).
+    pub n_leaves_: usize,
+    /// The estimated number of connected components in the graph. Always `1` for
+    /// the unstructured (`connectivity=None`) path
+    /// (`_agglomerative.py:1083-1085`).
+    pub n_connected_components_: usize,
     /// Phantom to retain the float type parameter.
     _marker: std::marker::PhantomData<F>,
 }
@@ -210,6 +282,31 @@ impl<F: Float> FittedAgglomerativeClustering<F> {
     #[must_use]
     pub fn children(&self) -> &[(usize, usize)] {
         &self.children_
+    }
+
+    /// Return the per-merge linkage distances (in `children_` row order), or
+    /// `None` if they were not computed (neither `distance_threshold` nor
+    /// `compute_distances` was set). Mirrors sklearn's `distances_` attribute
+    /// (`_agglomerative.py:1087-1088`).
+    #[must_use]
+    pub fn distances(&self) -> Option<&Array1<F>> {
+        self.distances_.as_ref()
+    }
+
+    /// Return the number of leaves in the hierarchical tree (`= n_samples` for
+    /// the unstructured path). Mirrors sklearn's `n_leaves_`
+    /// (`_agglomerative.py:1083-1085`).
+    #[must_use]
+    pub fn n_leaves(&self) -> usize {
+        self.n_leaves_
+    }
+
+    /// Return the number of connected components (`= 1` for the unstructured
+    /// path). Mirrors sklearn's `n_connected_components_`
+    /// (`_agglomerative.py:1083-1085`).
+    #[must_use]
+    pub fn n_connected_components(&self) -> usize {
+        self.n_connected_components_
     }
 }
 
@@ -390,49 +487,62 @@ fn mst_single<F: Float>(x: &Array2<F>, n: usize) -> Vec<RawMerge> {
     merges
 }
 
+/// The full dendrogram plus the per-merge distances in `children_` row order.
+/// `distances[i]` is the linkage distance at which `children[i]` merged — the
+/// 3rd column of the scipy linkage matrix / sklearn's `distances_`
+/// (`_agglomerative.py:1087-1088`).
+type Dendrogram = (Vec<(usize, usize)>, Vec<f64>);
+
 /// Union-find relabel for the nn-chain linkages, mirroring scipy's `label`
 /// (`scipy/cluster/_hierarchy.pyx`). Merges must already be **stably sorted by
-/// distance**. Emits the full dendrogram with the smaller root first.
-fn union_find_relabel(mut merges: Vec<RawMerge>, n: usize) -> Vec<(usize, usize)> {
+/// distance**. Emits the full dendrogram with the smaller root first, plus the
+/// per-merge distances in that same (sorted) row order — `scipy.linkage(...)[:, 2]`.
+fn union_find_relabel(mut merges: Vec<RawMerge>, n: usize) -> Dendrogram {
     // Stable sort by merge distance (scipy uses `argsort(kind='stable')`).
     merges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut parent: Vec<usize> = (0..(2 * n).saturating_sub(1)).collect();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(n.saturating_sub(1));
+    let mut dists: Vec<f64> = Vec::with_capacity(n.saturating_sub(1));
 
-    for (i, (a, b, _)) in merges.into_iter().enumerate() {
+    for (i, (a, b, dist)) in merges.into_iter().enumerate() {
         let next_label = n + i;
         let ra = uf_find(&mut parent, a);
         let rb = uf_find(&mut parent, b);
         let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
         out.push((lo, hi));
+        dists.push(dist);
         parent[ra] = next_label;
         parent[rb] = next_label;
     }
 
-    out
+    (out, dists)
 }
 
 /// Union-find relabel for single linkage, mirroring sklearn's
 /// `_single_linkage_label` + `UnionFind` (`_hierarchical_fast.pyx`). The MST must
 /// already be **stably sorted by weight**. Unlike [`union_find_relabel`], the
-/// pair is emitted in `(left_root, right_root)` order WITHOUT reordering.
-fn single_linkage_relabel(mut merges: Vec<RawMerge>, n: usize) -> Vec<(usize, usize)> {
+/// pair is emitted in `(left_root, right_root)` order WITHOUT reordering. The
+/// per-merge distances are returned in that same (sorted) row order, equal to
+/// sklearn's `distances_`.
+fn single_linkage_relabel(mut merges: Vec<RawMerge>, n: usize) -> Dendrogram {
     merges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut parent: Vec<usize> = (0..(2 * n).saturating_sub(1)).collect();
     let mut out: Vec<(usize, usize)> = Vec::with_capacity(n.saturating_sub(1));
+    let mut dists: Vec<f64> = Vec::with_capacity(n.saturating_sub(1));
 
-    for (i, (left, right, _)) in merges.into_iter().enumerate() {
+    for (i, (left, right, dist)) in merges.into_iter().enumerate() {
         let next_label = n + i;
         let lc = uf_find(&mut parent, left);
         let rc = uf_find(&mut parent, right);
         out.push((lc, rc));
+        dists.push(dist);
         parent[lc] = next_label;
         parent[rc] = next_label;
     }
 
-    out
+    (out, dists)
 }
 
 /// Find with path compression over a parent array where a self-parent denotes a
@@ -461,11 +571,12 @@ fn row_slice<F: Float>(x: &Array2<F>, i: usize) -> &[F] {
 /// Build the FULL dendrogram (shape `(n_samples - 1, 2)`) for the given linkage,
 /// bit-exact with `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]`
 /// (ward == `method='ward'`). Leaves are `0..n`, the `i`-th sorted merge forms
-/// node `n + i`.
-fn full_dendrogram<F: Float>(x: &Array2<F>, linkage: Linkage) -> Vec<(usize, usize)> {
+/// node `n + i`. Also returns the per-merge distances in `children_` row order
+/// (the 3rd column of the scipy linkage matrix / sklearn's `distances_`).
+fn full_dendrogram<F: Float>(x: &Array2<F>, linkage: Linkage) -> Dendrogram {
     let n = x.nrows();
     if n < 2 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
 
     match linkage {
@@ -615,21 +726,65 @@ fn sift_up(heap: &mut [i64], pos: usize) {
     sift_down(heap, startpos, pos);
 }
 
-/// Run the full unstructured agglomerative pipeline for `x` returning
-/// `(labels_, children_)`, mirroring sklearn's `_fit` (`_agglomerative.py:1083-1105`)
-/// when `distance_threshold is None`: build the full dendrogram, then
-/// `_hc_cut(n_clusters, children_, n_leaves)`.
-type AgglomerateResult = Result<(Array1<usize>, Vec<(usize, usize)>), FerroError>;
+/// The realised cut: `(labels_, children_, n_clusters_, distances_)`.
+/// `distances_` is `Some` iff the distances were requested (`return_distance`).
+type AgglomerateResult<F> =
+    Result<(Array1<usize>, Vec<(usize, usize)>, usize, Option<Array1<F>>), FerroError>;
 
+/// Run the full unstructured agglomerative pipeline for `x`, mirroring sklearn's
+/// `_fit` (`_agglomerative.py:1066-1106`) for the `connectivity=None` case:
+///
+/// 1. build the full dendrogram (`children_` + per-merge `distances_`);
+/// 2. `return_distance = (distance_threshold is not None) or compute_distances`
+///    (`:1074`) decides whether `distances_` is surfaced;
+/// 3. `n_clusters_` is either `count(distances_ >= threshold) + 1`
+///    (`:1090-1093`) or the requested `n_clusters` (`:1095`);
+/// 4. `labels_ = _hc_cut(n_clusters_, children_, n_leaves)` (`:1099`).
 fn agglomerate<F: Float>(
     x: &Array2<F>,
-    n_clusters_target: usize,
+    n_clusters: Option<usize>,
+    distance_threshold: Option<F>,
+    compute_distances: bool,
     linkage: Linkage,
-) -> AgglomerateResult {
+) -> AgglomerateResult<F> {
     let n_samples = x.nrows();
-    let children = full_dendrogram(x, linkage);
-    let labels = hc_cut(n_clusters_target, &children, n_samples);
-    Ok((labels, children))
+    let (children, raw_dists) = full_dendrogram(x, linkage);
+
+    // return_distance (`_agglomerative.py:1074`).
+    let return_distance = distance_threshold.is_some() || compute_distances;
+
+    // Convert the per-merge distances to F (computed in f64 internally).
+    let distances_f: Vec<F> = raw_dists
+        .iter()
+        .map(|&d| F::from(d).unwrap_or_else(F::zero))
+        .collect();
+
+    // n_clusters_ (`_agglomerative.py:1090-1095`).
+    let n_clusters_ = match distance_threshold {
+        Some(t) => {
+            // np.count_nonzero(distances_ >= distance_threshold) + 1.
+            // sklearn's `distances_` and the threshold are float64 (scipy's
+            // `linkage`/`ward_tree` return float64 heights regardless of
+            // `X.dtype`), so count against the RAW f64 heights and an
+            // f64-promoted threshold — NOT the F-downcast copy, whose f32
+            // rounding of a merge height would flip the count near the
+            // threshold (#2185).
+            let t_f64 = t.to_f64().unwrap_or(f64::NAN);
+            let count = raw_dists.iter().filter(|&&d| d >= t_f64).count();
+            count + 1
+        }
+        None => n_clusters.unwrap_or(0),
+    };
+
+    let labels = hc_cut(n_clusters_, &children, n_samples);
+
+    let distances_out = if return_distance {
+        Some(Array1::from(distances_f))
+    } else {
+        None
+    };
+
+    Ok((labels, children, n_clusters_, distances_out))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -644,10 +799,30 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for AgglomerativeClust
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `n_clusters == 0`.
-    /// - [`FerroError::InsufficientSamples`] if `n_samples < n_clusters`.
+    /// - [`FerroError::InvalidParameter`] (`"n_clusters"` / `"distance_threshold"`)
+    ///   when neither or both of `n_clusters`/`distance_threshold` is set
+    ///   (sklearn's XOR, `_agglomerative.py:1022-1027`), or when `n_clusters == 0`.
+    /// - [`FerroError::InsufficientSamples`] if `n_samples == 0`, or (in the
+    ///   fixed-`n_clusters` path) `n_samples < n_clusters`.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedAgglomerativeClustering<F>, FerroError> {
-        if self.n_clusters == 0 {
+        // XOR: exactly one of n_clusters / distance_threshold must be set.
+        // Mirrors `not ((n_clusters is None) ^ (distance_threshold is None))`
+        // (`_agglomerative.py:1022-1027`).
+        match (self.n_clusters, self.distance_threshold) {
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(FerroError::InvalidParameter {
+                    name: "distance_threshold".into(),
+                    reason: "Exactly one of n_clusters and distance_threshold has to be set, \
+                             and the other needs to be None"
+                        .into(),
+                });
+            }
+            _ => {}
+        }
+
+        if let Some(k) = self.n_clusters
+            && k == 0
+        {
             return Err(FerroError::InvalidParameter {
                 name: "n_clusters".into(),
                 reason: "must be at least 1".into(),
@@ -658,26 +833,39 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for AgglomerativeClust
 
         if n_samples == 0 {
             return Err(FerroError::InsufficientSamples {
-                required: self.n_clusters,
+                required: self.n_clusters.unwrap_or(1),
                 actual: 0,
                 context: "AgglomerativeClustering requires at least n_clusters samples".into(),
             });
         }
 
-        if n_samples < self.n_clusters {
+        if let Some(k) = self.n_clusters
+            && n_samples < k
+        {
             return Err(FerroError::InsufficientSamples {
-                required: self.n_clusters,
+                required: k,
                 actual: n_samples,
                 context: "AgglomerativeClustering requires at least n_clusters samples".into(),
             });
         }
 
-        let (labels, children) = agglomerate(x, self.n_clusters, self.linkage)?;
+        let (labels, children, n_clusters_, distances) = agglomerate(
+            x,
+            self.n_clusters,
+            self.distance_threshold,
+            self.compute_distances,
+            self.linkage,
+        )?;
 
         Ok(FittedAgglomerativeClustering {
             labels_: labels,
-            n_clusters_: self.n_clusters,
+            n_clusters_,
             children_: children,
+            distances_: distances,
+            // Unstructured (connectivity=None): n_leaves_ == n_samples,
+            // n_connected_components_ == 1 (`_agglomerative.py:1083-1085`).
+            n_leaves_: n_samples,
+            n_connected_components_: 1,
             _marker: std::marker::PhantomData,
         })
     }
@@ -738,7 +926,7 @@ mod tests {
     #[test]
     fn test_new_defaults() {
         let model = AgglomerativeClustering::<f64>::new(3);
-        assert_eq!(model.n_clusters, 3);
+        assert_eq!(model.n_clusters, Some(3));
         assert_eq!(model.linkage, Linkage::Ward);
     }
 
