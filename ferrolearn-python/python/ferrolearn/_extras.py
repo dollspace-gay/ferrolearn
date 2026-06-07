@@ -53,6 +53,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsNMF,
     _RsNearestCentroid,
     _RsNystroem,
+    _RsOPTICS,
     _RsOrthogonalMatchingPursuit,
     _RsPowerTransformer,
     _RsQDA,
@@ -1573,6 +1574,171 @@ class Birch(_ClusterWrapper):
 
     def _make_rs(self):
         return _RsBirch(n_clusters=self.n_clusters, threshold=self.threshold)
+
+
+class OPTICS(_ClusterWrapper):
+    """OPTICS density-based clustering backed by Rust (#1090, REQ-12).
+
+    Mirrors ``sklearn.cluster.OPTICS`` (``sklearn/cluster/_optics.py:266-297``):
+    Ordering Points To Identify the Clustering Structure. Computes a reachability
+    ordering of the data and extracts ``labels_`` via the Xi-steep method (the
+    default) or a DBSCAN-like cut at a fixed ``eps``. Exposes the keyword-only
+    constructor ``(*, min_samples=5, max_eps=np.inf, metric='minkowski', p=2,
+    metric_params=None, cluster_method='xi', eps=None, xi=0.05,
+    predecessor_correction=True, min_cluster_size=None, algorithm='auto',
+    leaf_size=30, memory=None, n_jobs=None)`` (sklearn defaults/order), the
+    ``fit(X, y=None)`` contract, the inherited ``fit_predict``, and the fitted
+    attributes ``labels_``/``reachability_``/``ordering_``/``core_distances_``/
+    ``predecessor_``/``cluster_hierarchy_``/``n_features_in_``
+    (``_optics.py:175-209``).
+
+    Of the constructor surface, ``min_samples``/``max_eps``/``xi``/
+    ``min_cluster_size``/``cluster_method``/``eps``/``predecessor_correction`` are
+    threaded into the Rust core (``ferrolearn_cluster::OPTICS<f64>``, optics.rs
+    REQ-1..11 SHIPPED, bit-exact vs the live sklearn 1.5.2 oracle):
+
+    - ``cluster_method`` (``_optics.py:274``, ``StrOptions({"xi","dbscan"})``):
+      ``'xi'`` (default) runs the automatic Xi-steep extraction; ``'dbscan'`` runs
+      a DBSCAN-like cut at ``eps`` (assuming ``max_eps`` when ``eps is None``,
+      ``_optics.py:375-378``). An unknown string raises ``ValueError`` (sklearn's
+      ``InvalidParameterError`` is a ``ValueError`` subclass).
+    - ``min_cluster_size`` (``_optics.py:278``): ``None`` (default) means use
+      ``min_samples``; an int is the minimum number of samples in a Xi cluster
+      (``_optics.py:902-903``).
+    - ``eps`` (``_optics.py:275``): the DBSCAN cut radius, used ONLY by
+      ``cluster_method='dbscan'``; ``eps > max_eps`` raises ``ValueError``
+      (``_optics.py:380-383``).
+
+    The Rust OPTICS core supports only the Euclidean (``metric='minkowski', p=2``)
+    brute-force path (optics.rs ``core_distance``/``get_neighbors`` compute
+    Euclidean distances), so the params that would CHANGE the result — a
+    non-Euclidean ``metric``/``p``, ``metric_params``, a precomputed/callable
+    ``metric``, an ``algorithm`` other than ``'auto'``/``'brute'`` — raise
+    ``NotImplementedError`` when set NON-default, honestly surfacing the gap rather
+    than silently mis-resolving (optics.rs REQ-10 NOT-STARTED, #1088). A FLOAT
+    ``min_samples`` (sklearn accepts a ``(0, 1]`` fraction, ``_optics.py:245``) is
+    likewise REQ-10 NOT-STARTED: it raises ``NotImplementedError`` rather than
+    truncating. The no-op knobs ``leaf_size``/``memory``/``n_jobs`` (neighbor-search
+    / caching / threading; identical result) are accepted-and-ignored (held only
+    for ``get_params``/``clone`` round-trip).
+    """
+
+    def __init__(self, *, min_samples=5, max_eps=np.inf, metric="minkowski",
+                 p=2, metric_params=None, cluster_method="xi", eps=None,
+                 xi=0.05, predecessor_correction=True, min_cluster_size=None,
+                 algorithm="auto", leaf_size=30, memory=None, n_jobs=None):
+        self.min_samples = min_samples
+        self.max_eps = max_eps
+        self.metric = metric
+        self.p = p
+        self.metric_params = metric_params
+        self.cluster_method = cluster_method
+        self.eps = eps
+        self.xi = xi
+        self.predecessor_correction = predecessor_correction
+        self.min_cluster_size = min_cluster_size
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.memory = memory
+        self.n_jobs = n_jobs
+
+    def _validate_unsupported(self):
+        # The Rust OPTICS core computes Euclidean (minkowski p=2) distances by
+        # brute force over the full sample set. Params that would CHANGE the
+        # reachability graph raise NotImplementedError when non-default; the no-op
+        # knobs (leaf_size, memory, n_jobs) are accepted silently. REQ-10 #1088.
+        if self.metric != "minkowski":
+            raise NotImplementedError(
+                f"metric == {self.metric!r} not supported (the Rust OPTICS core "
+                "computes only Euclidean = minkowski(p=2) distances; "
+                "REQ-10 NOT-STARTED #1088)."
+            )
+        if self.p != 2:
+            raise NotImplementedError(
+                f"p == {self.p!r} not supported (the Rust OPTICS core computes "
+                "only minkowski(p=2) = Euclidean distances; REQ-10 NOT-STARTED "
+                "#1088)."
+            )
+        if self.metric_params is not None:
+            raise NotImplementedError(
+                "metric_params != None not supported (the Rust OPTICS core "
+                "computes only Euclidean distances; REQ-10 NOT-STARTED #1088)."
+            )
+        if self.algorithm not in ("auto", "brute"):
+            raise NotImplementedError(
+                f"algorithm == {self.algorithm!r} not supported (the Rust OPTICS "
+                "core uses a brute-force neighbor search; pass 'auto'/'brute'; "
+                "REQ-10 NOT-STARTED #1088)."
+            )
+        # A float min_samples is sklearn's (0, 1] fraction (_optics.py:245); the
+        # Rust core takes a usize, so reject the float branch (REQ-10 #1088)
+        # rather than silently truncating. A bool is an int subclass in Python; we
+        # accept genuine ints (and bool, though min_samples<2 then errors).
+        if isinstance(self.min_samples, float):
+            raise NotImplementedError(
+                "a float min_samples (the (0, 1] fraction of n_samples, "
+                "sklearn/cluster/_optics.py:245) is not supported (the Rust "
+                "OPTICS core takes an integer min_samples; REQ-10 NOT-STARTED "
+                "#1088)."
+            )
+        if self.min_cluster_size is not None and isinstance(
+            self.min_cluster_size, float
+        ):
+            raise NotImplementedError(
+                "a float min_cluster_size (the (0, 1] fraction of n_samples, "
+                "sklearn/cluster/_optics.py:906) is not supported (the Rust "
+                "OPTICS core takes an integer min_cluster_size; REQ-10 "
+                "NOT-STARTED #1088)."
+            )
+        # An INTEGER min_cluster_size must be >= 2 (sklearn
+        # `Interval(Integral, 2, None, closed="left")`, `_optics.py:255-256` ->
+        # InvalidParameterError). ferrolearn previously threaded an int < 2
+        # straight to the core and fit silently (#2199). (bool is an int
+        # subclass; True==1/False==0 are likewise rejected, matching sklearn.)
+        if (
+            self.min_cluster_size is not None
+            and not isinstance(self.min_cluster_size, float)
+            and self.min_cluster_size < 2
+        ):
+            raise ValueError(
+                "The 'min_cluster_size' parameter of OPTICS must be an int in "
+                "the range [2, inf) or a float in the range (0, 1). Got "
+                f"{self.min_cluster_size!r} instead."
+            )
+
+    def _make_rs(self):
+        self._validate_unsupported()
+        return _RsOPTICS(
+            min_samples=self.min_samples,
+            max_eps=self.max_eps,
+            xi=self.xi,
+            min_cluster_size=self.min_cluster_size,
+            cluster_method=self.cluster_method,
+            eps=self.eps,
+            predecessor_correction=self.predecessor_correction,
+        )
+
+    def fit(self, X, y=None):
+        # sklearn `OPTICS.fit(X, y=None)` (`_optics.py:303`): `y` ignored. The
+        # supported-param gate runs in `_make_rs` BEFORE the ABI; the Rust core
+        # validates min_samples/max_eps/xi/eps bounds (FerroError -> ValueError).
+        self._rs = self._make_rs()
+        self._rs.fit(_f64(X))
+        # Fitted attrs (`_optics.py:175-209`), indexed by original sample order
+        # (`ordering_` lists the reachability-plot order).
+        self.labels_ = np.asarray(self._rs.labels_)
+        self.reachability_ = np.asarray(self._rs.reachability_)
+        self.ordering_ = np.asarray(self._rs.ordering_)
+        self.core_distances_ = np.asarray(self._rs.core_distances_)
+        self.predecessor_ = np.asarray(self._rs.predecessor_)
+        # sklearn only sets `cluster_hierarchy_` on the Xi branch (`_optics.py:373`);
+        # the dbscan branch leaves the attribute UNSET (the Rust core returns an
+        # empty (0, 2) array there). Mirror sklearn's `hasattr` contract: expose
+        # the attr ONLY for the Xi method.
+        if self.cluster_method == "xi":
+            self.cluster_hierarchy_ = np.asarray(self._rs.cluster_hierarchy_)
+        self.n_features_in_ = X.shape[1]
+        return self
 
 
 class GaussianMixture(BaseEstimator):

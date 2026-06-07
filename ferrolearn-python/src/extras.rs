@@ -2765,6 +2765,189 @@ impl RsGaussianMixture {
     }
 }
 
+// OPTICS (#1090, REQ-12): hand-written `#[pyclass]` over
+// `ferrolearn_cluster::OPTICS<f64>`/`FittedOPTICS<f64>`. OPTICS is a density-based
+// clusterer (a `ClusterMixin`) that computes a reachability ordering and extracts
+// `labels_` via the Xi method (default) or a DBSCAN-like cut. The Rust core is
+// pre-existing/audited (`ferrolearn_cluster` optics.rs REQ-1..11 SHIPPED, bit-exact
+// vs the live sklearn 1.5.2 oracle); this is the thin marshalling shim and the
+// non-test production consumer of `OPTICS::new`/the builders/`Fit::fit` and the
+// `FittedOPTICS` accessors (R-DEFER-1).
+//
+// The ctor mirrors sklearn's `OPTICS.__init__` (`sklearn/cluster/_optics.py:266-297`)
+// for the SUPPORTED surface (`min_samples`/`max_eps`/`xi`/`min_cluster_size`/
+// `cluster_method`/`eps`/`predecessor_correction`). `cluster_method` is resolved
+// case-sensitively (`"xi"`->`Xi`, `"dbscan"`->`Dbscan`; unknown -> `PyValueError`,
+// mirroring sklearn's `StrOptions({"xi","dbscan"})` `InvalidParameterError ⊂
+// ValueError`, `:251`). `min_cluster_size=None` does NOT call the builder (the core
+// defaults `min_cluster_size` to `min_samples`, matching `:902-903`); an int chains
+// `.with_min_cluster_size`. `eps` chains `.with_eps` only when `Some`. The
+// remaining sklearn params (`metric`/`p`/`algorithm`/`leaf_size`/`n_jobs`/
+// `metric_params`/`memory` + the float-fraction `min_samples`) are REQ-10 in
+// optics.rs (NOT-STARTED, #1088); the Python wrapper rejects their non-default
+// values with `NotImplementedError` rather than silently mis-resolving. A `usize`
+// `min_samples` ctor type means a FLOAT `min_samples` is caught in the wrapper
+// (NotImplementedError) before reaching this ABI. FerroError -> `PyValueError`
+// covers `min_samples<2`/`min_samples>n_samples`/`xi`+`eps` bounds and the
+// `xi==1` Xi-path error (`:242-264`, `:393-400`).
+#[pyclass(name = "_RsOPTICS")]
+pub struct RsOPTICS {
+    min_samples: usize,
+    max_eps: f64,
+    xi: f64,
+    min_cluster_size: Option<usize>,
+    // sklearn `cluster_method` (`_optics.py:274`, default `"xi"`): the
+    // cluster-extraction method STRING, resolved to `OpticsClusterMethod` at fit.
+    cluster_method: String,
+    // sklearn `eps` (`_optics.py:275`, default `None`): the DBSCAN cut radius,
+    // used ONLY by `cluster_method='dbscan'`; `None` -> assume `max_eps`.
+    eps: Option<f64>,
+    predecessor_correction: bool,
+    fitted: Option<ferrolearn_cluster::FittedOPTICS<f64>>,
+}
+
+#[pymethods]
+impl RsOPTICS {
+    #[new]
+    #[pyo3(signature = (min_samples=5, max_eps=f64::INFINITY, xi=0.05,
+                        min_cluster_size=None, cluster_method="xi".to_string(),
+                        eps=None, predecessor_correction=true))]
+    fn new(
+        min_samples: usize,
+        max_eps: f64,
+        xi: f64,
+        min_cluster_size: Option<usize>,
+        cluster_method: String,
+        eps: Option<f64>,
+        predecessor_correction: bool,
+    ) -> Self {
+        Self {
+            min_samples,
+            max_eps,
+            xi,
+            min_cluster_size,
+            cluster_method,
+            eps,
+            predecessor_correction,
+            fitted: None,
+        }
+    }
+
+    // sklearn `OPTICS.fit(X, y=None)` (`_optics.py:299`): `y` ignored. Resolves the
+    // `cluster_method` string to `OpticsClusterMethod` (case-sensitive; unknown ->
+    // `PyValueError`, matching sklearn's `StrOptions` `InvalidParameterError`),
+    // builds the Rust estimator chaining only the SUPPORTED builders, and maps any
+    // `FerroError` to `PyValueError` (the parameter/size validation,
+    // `_optics.py:242-264`/`:393-400`).
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        use ferrolearn_cluster::optics::OpticsClusterMethod;
+        // `cluster_method` is `StrOptions({"dbscan", "xi"})` (`_optics.py:251`) —
+        // EXACT (case-sensitive) membership; `'Xi'`/`'DBSCAN'` are rejected.
+        let method = match self.cluster_method.as_str() {
+            "xi" => OpticsClusterMethod::Xi,
+            "dbscan" => OpticsClusterMethod::Dbscan,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "cluster_method == {other:?}, must be 'xi' or 'dbscan'."
+                )));
+            }
+        };
+        let x_nd = numpy2_to_ndarray(x);
+        let mut m = ferrolearn_cluster::OPTICS::<f64>::new(self.min_samples)
+            .with_max_eps(self.max_eps)
+            .with_xi(self.xi)
+            .with_cluster_method(method)
+            .with_predecessor_correction(self.predecessor_correction);
+        // `min_cluster_size=None` -> leave the core default (`min_samples`,
+        // `_optics.py:902-903`); an int -> chain the builder.
+        if let Some(mcs) = self.min_cluster_size {
+            m = m.with_min_cluster_size(mcs);
+        }
+        // `eps` chains only when set (the `'xi'` path never reads it; the
+        // `'dbscan'` path resolves `eps.unwrap_or(max_eps)`).
+        if let Some(eps) = self.eps {
+            m = m.with_eps(eps);
+        }
+        let fitted = m
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `labels_` (`_optics.py:175-179`): cluster label per sample (`-1`
+    // noise), indexed by original sample order. Cast `isize` -> `i64`.
+    #[getter]
+    fn labels_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let arr: Array1<i64> = f.labels().mapv(|v| v as i64);
+        Ok(PyArray1::from_array(py, &arr))
+    }
+
+    // sklearn `reachability_` (`_optics.py:181-185`): reachability distance per
+    // sample (indexed by object order), `inf` for the first / unreachable points.
+    #[getter]
+    fn reachability_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, f.reachability()))
+    }
+
+    // sklearn `ordering_` (`_optics.py:201-202`): the cluster-ordered list of
+    // sample indices. Cast `usize` -> `i64`.
+    #[getter]
+    fn ordering_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let arr: Array1<i64> = f.ordering().iter().map(|&i| i as i64).collect();
+        Ok(PyArray1::from_array(py, &arr))
+    }
+
+    // sklearn `core_distances_` (`_optics.py:203-209`): distance to the
+    // `min_samples`-th neighbour per sample (`inf` for non-core / unreachable),
+    // indexed by object order.
+    #[getter]
+    fn core_distances_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, f.core_distances()))
+    }
+
+    // sklearn `predecessor_` (`_optics.py:187-189`): the point a sample was
+    // reached from (object order); seed points have `-1`. Already an `i64` array.
+    #[getter]
+    fn predecessor_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(PyArray1::from_array(py, f.predecessor()))
+    }
+
+    // sklearn `cluster_hierarchy_` (`_optics.py:191-200`): the `(n_clusters, 2)`
+    // `[start, end]` plot-order intervals (Xi method only). When
+    // `cluster_method='dbscan'` sklearn does NOT set the attribute; the Rust core
+    // returns an empty `(0, 2)` array, and the Python wrapper omits the attr to
+    // match sklearn's `hasattr` contract.
+    #[getter]
+    fn cluster_hierarchy_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(PyArray2::from_array(py, f.cluster_hierarchy()))
+    }
+}
+
 // FeatureAgglomeration (#943): hand-written `#[pyclass]` over
 // `ferrolearn_cluster::FeatureAgglomeration<f64>`/`FittedFeatureAgglomeration<f64>`.
 // FeatureAgglomeration is BOTH a transformer (transform/inverse_transform via

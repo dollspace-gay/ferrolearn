@@ -51,6 +51,7 @@ from ferrolearn._extras import (
     NMF,
     NearestCentroid,
     Nystroem,
+    OPTICS,
     OrthogonalMatchingPursuit,
     PowerTransformer,
     QuadraticDiscriminantAnalysis,
@@ -116,6 +117,7 @@ __all__ = [
     "AgglomerativeClustering",
     "Birch",
     "FeatureAgglomeration",
+    "OPTICS",
     "GaussianMixture",
     # Decomp extras
     "IncrementalPCA",

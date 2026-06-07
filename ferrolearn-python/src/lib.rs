@@ -77,6 +77,7 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extras::RsBirch>()?;
     m.add_class::<extras::RsGaussianMixture>()?;
     m.add_class::<extras::RsFeatureAgglomeration>()?;
+    m.add_class::<extras::RsOPTICS>()?;
 
     // Extras — decomp
     m.add_class::<extras::RsIncrementalPCA>()?;

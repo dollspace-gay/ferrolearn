@@ -49,20 +49,15 @@ DOCTEST_X = np.array(
 )
 
 
-@pytest.mark.xfail(
-    reason="ferrolearn.OPTICS accepts int min_cluster_size<2 where sklearn "
-    "(_optics.py:256, Interval(Integral, 2, None)) raises ValueError; "
-    "tracking #2199",
-    strict=True,
-)
 @pytest.mark.parametrize("mcs", [0, 1])
 def test_int_min_cluster_size_below_two_raises_like_sklearn(mcs):
+    """Fixed (#2199): `_validate_unsupported` now rejects an integer
+    min_cluster_size < 2 with ValueError, matching sklearn's
+    `Interval(Integral, 2, None)` constraint."""
     # LIVE ORACLE (R-CHAR-3): sklearn rejects an integer min_cluster_size < 2.
     with pytest.raises(ValueError):
         SkOPTICS(min_samples=2, min_cluster_size=mcs).fit(DOCTEST_X)
 
-    # ferrolearn must mirror that rejection. It currently does NOT — it fits
-    # silently (no exception), so this `pytest.raises` block FAILS, which the
-    # strict xfail captures as the pinned divergence.
+    # ferrolearn mirrors that rejection.
     with pytest.raises(ValueError):
         fl.OPTICS(min_samples=2, min_cluster_size=mcs).fit(DOCTEST_X)
