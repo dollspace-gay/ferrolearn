@@ -32,43 +32,34 @@ and bound into CPython as `ferrolearn.AgglomerativeClustering` via
 `_RsAgglomerativeClustering` (`ferrolearn-python/src/extras.rs`,
 `ferrolearn-python/python/ferrolearn/_extras.py`).
 
-**The structural carve-out (the root of #938).** ferrolearn builds the dendrogram
-fundamentally differently from sklearn in two coupled ways:
+**The structural carve-out (#938) — RESOLVED for the unstructured case.** ferrolearn
+now builds the dendrogram exactly as sklearn does for the default unstructured
+(`connectivity=None`) path, producing bit-exact `children_` (REQ-6) and absolute
+`labels_` (REQ-7) for all four linkages:
 
-1. **Truncated `children_` with reused-slot IDs vs. the full dendrogram with
-   internal-node IDs.** sklearn's `children_` is shape `(n_samples-1, 2)` (the
-   FULL dendrogram, regardless of `n_clusters`), where a value `>= n_samples` is an
-   internal node and merge `i` forms node `n_samples + i`
-   (`_agglomerative.py:902-908`). ferrolearn's `children_` (`FittedAgglomerativeClustering::children_`,
-   type `Vec<(usize, usize)>`) is the TRUNCATED merge list of length
-   `n_samples - n_clusters` using the **merged-into slot ID** `ci` for the new
-   cluster (`fn agglomerate`: `children.push((ci, cj))`, then samples assigned to
-   `cj` are redirected to `ci`). Different length AND different ID semantics.
+1. **Full `children_` with internal-node IDs.** `fn full_dendrogram` returns the
+   FULL dendrogram, shape `(n_samples-1, 2)`, leaves `0..n-1` and internal-node IDs
+   `n+i` for the `i`-th sorted merge (`_agglomerative.py:902-908`,
+   `:314`/`:586`). For ward/complete/average it runs the **nearest-neighbour chain**
+   (`fn nn_chain`, the Lance–Williams update `fn lance_williams` on **Euclidean**
+   distances — NOTE scipy's linkage distances are actual Euclidean, the Ward update
+   is the Wishart/Ward form, NOT squared), then a **stable distance sort** and a
+   **union-find relabel** (`fn union_find_relabel`) — reproducing
+   `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]` bit-for-bit. For
+   single it runs **Prim's MST** (`fn mst_single`, mirroring `mst_linkage_core`) +
+   `fn single_linkage_relabel` (mirroring `_single_linkage_label`); for single,
+   sklearn's pair-column order differs from `scipy.linkage('single')` (R-DEV-7), and
+   ferrolearn matches sklearn's OWN `children_`.
 
-2. **HashMap relabel-by-surviving-root vs. `_hc_cut` heap-pop enumeration.** sklearn
-   numbers `labels_` by cutting the full tree: a negated-id min-heap pops the
-   top-`n_clusters` dendrogram nodes, and `for i, node in enumerate(nodes):
-   label[descendents] = i` (`_hc_cut`, `_agglomerative.py:760-775`) — so the
-   absolute label of a sample depends on heap-pop order over internal node IDs.
-   ferrolearn relabels by ascending surviving-slot order via a `HashMap` built from
-   `active.iter().enumerate()` (`fn agglomerate`, the re-label loop). The
-   **PARTITION** (which samples share a cluster) agrees with sklearn on
-   well-separated data, but the **ABSOLUTE LABEL NUMBERING differs** — e.g. on the
-   3-blob fixture (Probe B) sklearn ward yields `[2,2,2,1,1,1,0,0,0]` while
-   ferrolearn's slot-order relabel yields the same partition with permuted integers.
-   Reproducing sklearn's exact `labels_` requires first building the full
-   `children_` dendrogram and then running `_hc_cut`'s heap enumeration — **not a
-   minimal fix**, it is a structural rewrite of both the tree representation and the
-   cut. This is the shared root cause that `birch.rs` (REQ-3) and
-   `feature_agglomeration.rs` (REQ-3/REQ-5) already gate on as blocker **#938**.
-
-A secondary structural fact: ferrolearn computes linkage VALUES via the
-Lance–Williams recurrence on the **squared-Euclidean** distance matrix (`fn agglomerate`,
-`Linkage::Ward` arm uses the size-weighted Lance–Williams update on `sq_dists`),
-whereas sklearn's `ward_tree`/`linkage_tree` operate on Euclidean distances with a
-heap / nearest-neighbor chain (`_TREE_BUILDERS`, `_agglomerative.py:720-725`). For
-well-separated data the PARTITION agrees; tie-breaking and the merge-distance VALUES
-(which sklearn can surface via `distances_`) differ.
+2. **`_hc_cut` heap-pop enumeration.** `fn hc_cut` cuts the full tree exactly as
+   `_hc_cut` (`_agglomerative.py:731-775`): a negated-id min-heap (`fn heappush_min`/
+   `fn heappushpop_min`, a CPython-`heapq`-faithful translation incl. `_siftup`/
+   `_siftdown` layout) pops the top-`n_clusters` nodes, then
+   `for i, node in enumerate(nodes): label[descendents] = i` numbers each leaf by
+   its ancestor's heap position. So on the 3-blob fixture (Probe B) ferrolearn now
+   yields sklearn's exact `[2,2,2,1,1,1,0,0,0]`. The consumers `birch.rs` (REQ-3)
+   and `feature_agglomeration.rs` (REQ-3/REQ-5) use `labels()` purely as a partition
+   and are unaffected by the renumbering (their suites stay green).
 
 The NOT-STARTED surface is the parameters/attributes ferrolearn does not expose:
 `metric`, `connectivity`, `compute_full_tree`, `distance_threshold`,
@@ -268,11 +259,14 @@ in-tree `#[test]` co-membership assertions in `agglomerative.rs`.
 - AC-5 (REQ-5, diverges): `AgglomerativeClustering(n_clusters=1).fit([[3.,4.]])` →
   sklearn `ValueError` (min 2 samples); ferrolearn accepts it
   (`test_single_sample_single_cluster` → `labels()[0]==0`).
-- AC-6 (REQ-6, diverges): on Probe A sklearn `children_.shape == (7,2)` with IDs up to
-  13; ferrolearn `children().len() == 6` (`n_samples - n_clusters`,
-  `test_children_length`) of reused-slot pairs.
-- AC-7 (REQ-7, diverges): on Probe B sklearn ward `labels_` = `[2,2,2,1,1,1,0,0,0]`;
-  ferrolearn yields the same PARTITION with permuted integers (blob `{0,1,2}` → label 0).
+- AC-6 (REQ-6, SHIPPED): `children_` is the FULL dendrogram, shape `(n_samples-1, 2)`
+  with internal-node IDs `>= n_samples` (`test_children_length` asserts `len ==
+  n_samples - 1`), BIT-EXACT-equal to `scipy.cluster.hierarchy.linkage(...)[:, :2]`
+  for ward/complete/average and to sklearn's own `children_` for single (parity tests
+  in `tests/divergence_agglomerative_dendrogram.rs`).
+- AC-7 (REQ-7, SHIPPED): on Probe B sklearn ward `labels_` = `[2,2,2,1,1,1,0,0,0]`;
+  ferrolearn now reproduces this EXACTLY via `_hc_cut`
+  (`labels_exact_sklearn_*` parity tests, k∈{2,3}, all four linkages).
 - AC-8 (REQ-8, missing): `AgglomerativeClustering(linkage='ward',metric='manhattan').fit(X)`
   → sklearn `ValueError`; ferrolearn has no `metric` (Euclidean-only, validation
   unreachable).
@@ -293,10 +287,11 @@ Binary (R-DEFER-2). `AgglomerativeClustering` / `FittedAgglomerativeClustering` 
 `ferrolearn.AgglomerativeClustering` (real non-test consumers; grandfathered
 S5/R-DEFER-1). Cites use symbol anchors (ferrolearn) / `file:line` (sklearn 1.5.2,
 commit 156ef14). Live oracle = installed sklearn 1.5.2, run from `/tmp`. Honest
-assessment (R-HONEST-3): the PARTITION contract genuinely SHIPS on separable data
-(REQ-1/2/3/11) through real consumers, but the absolute `labels_` numbering (REQ-7)
-and the full `children_` dendrogram (REQ-6) DIVERGE — both rooted in the truncated-tree
-+ slot-relabel design, the shared #938 root cause. The remaining NOT-STARTED REQs are
+assessment (R-HONEST-3): the PARTITION contract SHIPS on separable data
+(REQ-1/2/3/11), AND the full `children_` dendrogram (REQ-6) and the absolute
+`_hc_cut` `labels_` numbering (REQ-7) now SHIP bit-exact for the unstructured
+(`connectivity=None`) case across all four linkages — the #938 structural carve-out
+is RESOLVED here (the nn-chain/MST builder + `_hc_cut`). The remaining NOT-STARTED REQs are
 the unimplemented parameters (`metric`/`connectivity`/`distance_threshold`/
 `compute_full_tree`/`compute_distances`/`memory`), the `n_clusters=2` default + error
 ABI, the `ensure_min_samples=2` validation, the `distances_`/`n_leaves_`/
@@ -311,8 +306,8 @@ by `birch.rs` REQ-3 and `feature_agglomeration.rs` REQ-3/REQ-5).
 | REQ-3 (four linkage criteria, partition) | SHIPPED | impl `enum Linkage` + the `match linkage` arms in `fn agglomerate in agglomerative.rs` (Single=min, Complete=max, Average=size-weighted mean, Ward=size-weighted Lance–Williams) mirror `_TREE_BUILDERS` (`_agglomerative.py:720-725`). PARTITION matches sklearn for all four on Probe B. Consumer: `with_linkage` used by `birch.rs` (`Linkage::Ward`) + `feature_agglomeration.rs` (`map_linkage` all four). Verification: `test_ward/complete/average/single_three_blobs` (24 passed). **Caveat (REQ-9)**: this is the PARTITION only — merge-distance VALUES and tie-breaking differ (squared-Euclidean LW vs sklearn heap/nn-chain). |
 | REQ-4 (`n_clusters=2` default + error ABI) | NOT-STARTED | open prereq blocker **#963**. sklearn `__init__` defaults `n_clusters=2` (`_agglomerative.py:951`); ferrolearn `fn new(n_clusters)` REQUIRES it (Probe C, AC-4). The PyO3 layer DOES default `n_clusters=2` (`extras.rs:968`) so `ferrolearn.AgglomerativeClustering()` matches, but the Rust constructor does not. Also validation errors are `FerroError::InvalidParameter`/`InsufficientSamples`, not the sklearn `InvalidParameterError`/`ValueError` ABI (R-DEV-2). |
 | REQ-5 (`ensure_min_samples=2` validation) | NOT-STARTED | open prereq blocker **#964**. sklearn `fit` → `_validate_data(X, ensure_min_samples=2)` (`_agglomerative.py:989`) rejects `n_samples < 2` with `ValueError` (Probe D). ferrolearn `fn fit` rejects only `n_samples == 0` and `n_samples < n_clusters`; it ACCEPTS a single sample when `n_clusters <= 1` (`test_single_sample_single_cluster`, AC-5). Divergent edge-case handling. |
-| REQ-6 (`children_` full-dendrogram format) | NOT-STARTED | open prereq blocker **#938** (the shared root cause). sklearn `children_` is shape `(n_samples-1, 2)`, internal-node IDs `>= n_samples`, merge `i` forms node `n_samples + i` (`_agglomerative.py:902-908`; Probe A: 7 rows, IDs to 13). ferrolearn `children_` (`FittedAgglomerativeClustering::children_`, built in `fn agglomerate` as `children.push((ci, cj))`) is length `n_samples - n_clusters` of reused merged-into-slot pairs (`test_children_length` asserts `len == n_samples - n_clusters`, a ferrolearn-INTERNAL contract, NOT sklearn's). Different length AND ID semantics — a full-dendrogram rewrite, not a minimal fix. |
-| REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | NOT-STARTED | open prereq blocker **#938** (the shared root cause). sklearn numbers `labels_` by negated-id min-heap pop over the top-`n_clusters` dendrogram nodes + `for i,node in enumerate(nodes): label[descendents]=i` (`_hc_cut`, `_agglomerative.py:760-775`). ferrolearn relabels by ascending surviving-slot order via a `HashMap` from `active.iter().enumerate()` (`fn agglomerate` re-label loop). Probe B: sklearn ward `[2,2,2,1,1,1,0,0,0]` vs ferrolearn same partition with permuted integers (AC-7). Exact numbering requires the full `children_` (REQ-6) then `_hc_cut`. |
+| REQ-6 (`children_` full-dendrogram format) | SHIPPED | impl `fn full_dendrogram in agglomerative.rs`: nn-chain (`fn nn_chain`, Lance–Williams `fn lance_williams`) + stable distance sort + union-find (`fn union_find_relabel`) for ward/complete/average; Prim's MST (`fn mst_single`) + `fn single_linkage_relabel` for single. Produces `children_` of shape `(n_samples-1, 2)`, leaves `0..n-1`, internal-node IDs `n+i` (`_agglomerative.py:314`/`:586`/`:902-908`). BIT-EXACT-equal to `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]` for ward/complete/average; for `single`, sklearn uses `mst_linkage_core`+`_single_linkage_label` (`:567-584`, R-DEV-7) whose pair-column order differs from `scipy.linkage('single')`, so `children_` matches sklearn's OWN `AgglomerativeClustering.children_` bit-exact. Live-oracle tests: `children_exact_scipy_6pt_nn_chain_linkages`, `children_exact_scipy_10pt_nn_chain_linkages`, `children_exact_sklearn_single_6pt`, `children_exact_sklearn_single_10pt`, `divergence_children_full_dendrogram_format` (`tests/divergence_agglomerative_dendrogram.rs`). Consumers: `Fit::fit` → `children_`, `RsAgglomerativeClustering`, `birch.rs`/`feature_agglomeration.rs`. |
+| REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | SHIPPED | impl `fn hc_cut in agglomerative.rs`: negated-id MIN-heap (`fn heappush_min`/`fn heappushpop_min`/`fn sift_down`/`fn sift_up`, a CPython-`heapq`-exact translation) over the top-`n_clusters` dendrogram nodes + `fn hc_get_descendent`, mirroring `_hc_cut` (`_agglomerative.py:731-775`). Builds `labels_` from the REQ-6 full `children_`, BIT-EXACT-equal to `sklearn.cluster.AgglomerativeClustering(n_clusters=k, linkage=…).fit(X).labels_` (Probe B: ward `[2,2,2,1,1,1,0,0,0]` now reproduced exactly). Live-oracle tests: `labels_exact_sklearn_6pt_all_linkages`, `labels_exact_sklearn_10pt_all_linkages` (k∈{2,3}, all four linkages), `divergence_labels_absolute_hc_cut_numbering`. Consumer: `Fit::fit` → `labels_` via `RsAgglomerativeClustering::labels_` + `birch.rs`/`feature_agglomeration.rs` (partition use, unaffected by the renumbering). |
 | REQ-8 (`metric` / `connectivity`) | NOT-STARTED | open prereq blocker **#965**. sklearn `metric` ∈ {euclidean,l1,l2,manhattan,cosine,precomputed} default `'euclidean'` (`_agglomerative.py:795-799`), with the ward-requires-euclidean rule (`:1034-1038`; Probe E → `ValueError`), and `connectivity` for structured clustering (`:812-822`, `:1042-1048`). ferrolearn `fn sq_euclidean`/`fn pairwise_sq_dists` are Euclidean-only and unstructured; neither parameter exists. |
 | REQ-9 (`distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_`) | NOT-STARTED | open prereq blocker **#966**. sklearn `distance_threshold` (XOR with `n_clusters`, `_agglomerative.py:1022-1027`; `n_clusters_` derived `:1090-1093`), `compute_full_tree='auto'` early-stop (`:1051-1064`), `compute_distances` → `distances_` shape `(n_nodes-1,)` (`:1074`, `:1087-1088`; Probe F: dt=5 → `[0,0,1,1]`, `distances_ [~0.1,0.1,20.0]`). ferrolearn `AgglomerativeClustering<F>` has only `n_clusters` + `linkage` — none of these parameters and no `distances_` attribute. The merge-distance VALUES also differ (squared-Euclidean LW vs Euclidean heap/nn-chain), so even a `distances_` accessor would not value-match without REQ-3's value layer. |
 | REQ-10 (`n_leaves_`/`n_connected_components_` + `memory`) | NOT-STARTED | open prereq blocker **#967**. sklearn sets `self.n_leaves_`/`self.n_connected_components_` from the tree builder (`_agglomerative.py:1083-1085`; Probe A: 8 and 1) and caches via `memory` (`:1006`, `:1076`). `FittedAgglomerativeClustering` exposes `labels()`/`n_clusters()`/`children()` only — neither attribute, no caching. Missing attributes. |
@@ -334,49 +329,51 @@ Accessors: `labels()`, `n_clusters()`, `children()`. The unfitted-method
 
 **Fit path (`fn fit` → `fn agglomerate`).** Validates `n_clusters != 0` (REQ-4 ABit) and
 `n_samples >= n_clusters` (NOT `ensure_min_samples=2` — REQ-5 divergence), then:
-1. **Distance matrix** — `fn pairwise_sq_dists` builds the flat `n × n` row-major
-   matrix of **squared** Euclidean distances (`fn sq_euclidean`). Data is converted to
-   `f64` upfront for the internal computation.
-2. **Merge loop** — while `active.len() > n_clusters`: `fn find_min_pair` scans the
-   active clusters for the closest pair `(ci, cj)`; `cj` is removed from `active`,
-   `(ci, cj)` is pushed to `children`, and the **Lance–Williams recurrence** updates
-   `sq_dists[ci][ck]` for every remaining `ck` per the `Linkage` arm (Single=min,
-   Complete=max, Average=size-weighted mean, Ward=`((ni+nk)d_ik + (nj+nk)d_jk -
-   nk·d_ij)/(ni+nj+nk)`). `sizes[ci]` accumulates, and every sample assigned to `cj`
-   is redirected to `ci`. This is `_TREE_BUILDERS`'s merge clustering (`:720-725`)
-   expressed as a dense O(n³)/O(n²) Lance–Williams update rather than sklearn's
-   heap (`ward_tree`) / nearest-neighbor chain (`linkage_tree`) on Euclidean distances.
-3. **Relabel** — a `HashMap` maps each surviving slot ID in `active.iter().enumerate()`
-   order to `0..n_clusters`; `assignment` is mapped through it to `labels_`. This is
-   the ascending-slot numbering that DIVERGES from sklearn's `_hc_cut` heap enumeration
-   (REQ-7).
+1. **Full dendrogram** — `fn full_dendrogram`. For ward/complete/average it builds the
+   condensed Euclidean distance vector and runs the **nearest-neighbour chain**
+   (`fn nn_chain`, the Lance–Williams update `fn lance_williams` on Euclidean
+   distances), then a **stable sort by merge distance** + a **union-find relabel**
+   (`fn union_find_relabel`) → `children_` bit-exact with
+   `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]`. For single it
+   runs **Prim's MST** (`fn mst_single`, mirroring `mst_linkage_core`) + a union-find
+   relabel that does NOT reorder the pair (`fn single_linkage_relabel`, mirroring
+   `_single_linkage_label`). Leaves are `0..n`, the `i`-th sorted merge forms node
+   `n + i`; `children_` is the FULL tree, shape `(n_samples-1, 2)`, regardless of
+   `n_clusters` (REQ-6).
+2. **Cut** — `fn hc_cut` cuts the full tree into `n_clusters` clusters exactly as
+   sklearn's `_hc_cut` (`_agglomerative.py:731-775`): a CPython-`heapq`-faithful
+   negated-id min-heap (`fn heappush_min`/`fn heappushpop_min`/`fn sift_up`/
+   `fn sift_down`) pops the top-`n_clusters` nodes, and
+   `for i, node in enumerate(nodes): label[descendents(node)] = i`
+   (`fn hc_get_descendent`) numbers each leaf by its ancestor's heap position →
+   `labels_` bit-exact with sklearn (REQ-7).
 
-**Invariants held vs sklearn (the SHIPPED core):** the `labels_` PARTITION on
-separable data (REQ-1 — co-membership matches across all four linkages); `n_clusters_`
-= requested `n_clusters` (REQ-2); the four linkage partitions (REQ-3); the PyO3
-`labels_` marshalling (REQ-11). The ferrolearn-INTERNAL `children_` length
-(`n_samples - n_clusters`, `test_children_length`) is an internal contract, NOT a
-sklearn match (sklearn's is `n_samples - 1`).
+**Invariants held vs sklearn (the SHIPPED core):** the `labels_` PARTITION AND absolute
+numbering on separable data (REQ-1/REQ-7); `n_clusters_` = requested `n_clusters`
+(REQ-2); the four linkages, children AND labels bit-exact (REQ-3/REQ-6/REQ-7); the
+full-dendrogram `children_` format, shape `(n_samples-1, 2)` (REQ-6); the PyO3
+`labels_` marshalling (REQ-11).
 
 **Invariants NOT held vs sklearn:** the `n_clusters=2` Rust-constructor default + the
 `InvalidParameterError`/`ValueError` error ABI (REQ-4); the `ensure_min_samples=2`
-single-sample rejection (REQ-5); the full-dendrogram `children_` format (REQ-6, #938);
-the absolute `labels_` numbering via `_hc_cut` (REQ-7, #938); `metric`/`connectivity`
-(REQ-8); `distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_`
-(REQ-9 — including the merge-distance VALUE divergence); `n_leaves_`/
-`n_connected_components_`/`memory` (REQ-10); the ferray substrate (REQ-12).
+single-sample rejection (REQ-5); `metric`/`connectivity` (REQ-8);
+`distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_` (REQ-9);
+`n_leaves_`/`n_connected_components_`/`memory` (REQ-10); the ferray substrate (REQ-12).
+NOTE: REQ-6/REQ-7 cover ONLY the unstructured (`connectivity=None`) case — structured
+clustering (the `connectivity` matrix path, REQ-8) uses a different sklearn tree builder
+and is still unimplemented.
 
 **Consumer wiring.** `pub use agglomerative::{AgglomerativeClustering,
-FittedAgglomerativeClustering, Linkage}` (`ferrolearn-cluster/src/lib.rs:97`)
+FittedAgglomerativeClustering, Linkage}` (`ferrolearn-cluster/src/lib.rs`)
 re-exports the types. The real non-test production consumers are (a) `birch.rs`
-(`fn fit` → global Ward clustering on `subcluster_centers_`, `birch.rs:459`), (b)
-`feature_agglomeration.rs` (`fn fit` → clustering on `X.T`, `:307`), and (c)
-`ferrolearn.AgglomerativeClustering` (`_RsAgglomerativeClustering` in `extras.rs:959`,
-registered in `src/lib.rs:67`, wrapped in `python/ferrolearn/_extras.py:432`,
-exported in `__init__.py`). Both in-crate consumers inherit the #938 label-numbering
-divergence — that is exactly why `birch.rs` REQ-3 and `feature_agglomeration.rs`
-REQ-3/REQ-5 cite the partition contract as SHIPPED but the absolute `labels_` VALUE
-as NOT-STARTED/#938.
+(`fn fit` → global Ward clustering on `subcluster_centers_`), (b)
+`feature_agglomeration.rs` (`fn fit` → clustering on `X.T`), and (c)
+`ferrolearn.AgglomerativeClustering` (`_RsAgglomerativeClustering` in `extras.rs`,
+registered in `src/lib.rs`, wrapped in `python/ferrolearn/_extras.py`,
+exported in `__init__.py`). Both in-crate consumers use `labels()` purely as a
+PARTITION (mapping points/features to whatever integer label they receive), so the
+now-sklearn-exact renumbering does not change their output structure — their test
+suites (`divergence_birch.rs`, `divergence_feature_agglomeration.rs`) stay green.
 
 ## Verification
 

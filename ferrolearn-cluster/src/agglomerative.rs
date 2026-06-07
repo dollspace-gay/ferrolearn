@@ -6,13 +6,29 @@
 //!
 //! # Algorithm
 //!
-//! 1. Initialise each data point as its own singleton cluster.
-//! 2. Build an `n × n` pairwise distance matrix.
-//! 3. Repeat until `n_clusters` clusters remain:
-//!    a. Find the pair of clusters `(i, j)` with the smallest inter-cluster
-//!    distance according to the chosen linkage.
-//!    b. Merge them into a new cluster; record the merge in `children_`.
-//!    c. Update distances using the Lance–Williams recurrence.
+//! This is a bit-exact translation of scikit-learn's *unstructured*
+//! (`connectivity=None`) path, which delegates the dendrogram construction to
+//! SciPy (`sklearn/cluster/_agglomerative.py:298-321, 532-592`):
+//!
+//! * **Ward / Complete / Average** use the **nearest-neighbour chain**
+//!   (`nn-chain`) algorithm (`scipy.cluster.hierarchy.linkage`), producing a set
+//!   of `n-1` merges. The merges are then **stably sorted by merge distance** and
+//!   relabelled through a **union-find** so the resulting `children_` matches
+//!   `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]` bit-for-bit.
+//! * **Single** uses **Prim's MST** (`mst_linkage_core`,
+//!   `_hierarchical_fast.pyx`) sorted by weight, then a union-find relabel
+//!   (`_single_linkage_label`) that — unlike the other linkages — does **not**
+//!   reorder the merged pair.
+//!
+//! The full dendrogram has node IDs `0..n-1` for the leaves and `n+i` for the
+//! cluster formed by the `i`-th sorted merge. `children_` therefore has shape
+//! `(n_samples - 1, 2)` regardless of `n_clusters` (the FULL tree), exactly like
+//! sklearn's fitted `children_` attribute.
+//!
+//! `labels_` are then produced by cutting the full tree with
+//! [`_hc_cut`](https://github.com/scikit-learn/scikit-learn/blob/1.5.2/sklearn/cluster/_agglomerative.py#L731):
+//! a negated-id max-heap pops the top `n_clusters` dendrogram nodes and numbers
+//! each leaf by the heap position of its ancestor.
 //!
 //! The overall complexity is **O(n³)** in time and **O(n²)** in space, which
 //! is practical for datasets up to a few thousand samples.
@@ -54,22 +70,23 @@
 //! (`class AgglomerativeClustering(ClusterMixin, BaseEstimator)` `:781`).
 //! Design doc: `.design/cluster/agglomerative.md`. Cites use ferrolearn symbol
 //! anchors / sklearn `file:line` (commit 156ef14); expected values from the live
-//! sklearn 1.5.2 oracle (R-CHAR-3). This is a verify-and-document unit: the
-//! `labels_` PARTITION (up to a label permutation) genuinely ships on separable
-//! data through real consumers, but the absolute `labels_` numbering and the full
-//! `children_` dendrogram DIVERGE — both rooted in ferrolearn's truncated-tree +
-//! ascending-slot relabel vs sklearn's full dendrogram + `_hc_cut` heap cut
-//! (the shared #938 root cause, also gating `birch.rs` / `feature_agglomeration.rs`).
+//! sklearn 1.5.2 oracle (R-CHAR-3). The `labels_` PARTITION (REQ-1), the full
+//! `children_` dendrogram (REQ-6) and the absolute `_hc_cut` `labels_` numbering
+//! (REQ-7) all SHIP bit-exact against scipy/sklearn 1.5.2 for the unstructured
+//! (`connectivity=None`) case across all four linkages (the #938 structural
+//! carve-out), via the nn-chain / MST dendrogram builder + `_hc_cut`. The
+//! consumers `birch.rs` / `feature_agglomeration.rs` use `labels()` purely as a
+//! partition and are unaffected by the (now sklearn-exact) renumbering.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | `fn agglomerate` (Lance–Williams merge-until-`n_clusters` via `find_min_pair`/`pairwise_sq_dists`) → `Fit::fit` builds `labels_`, mirroring the merge clustering of sklearn `_fit` (`_agglomerative.py:992-1106`). Partition value-matches the oracle for all 4 linkages. Consumers: `_RsAgglomerativeClustering` (`ferrolearn-python/src/extras.rs`), `birch.rs fn fit`, `feature_agglomeration.rs fn fit`. Guards: `green_two_blobs_partition_all_linkages`, `green_three_blobs_partition_all_linkages` in `tests/divergence_agglomerative.rs`. |
+//! | REQ-1 (`labels_` PARTITION, separable data) | SHIPPED | impl `fn agglomerate` (`fn full_dendrogram` → `fn hc_cut`) → `Fit::fit` builds `labels_`, mirroring sklearn `_fit` (`_agglomerative.py:1083-1105`). Now ABSOLUTE-value-matches the oracle for all 4 linkages (was up-to-permutation; see REQ-7). Consumers: `_RsAgglomerativeClustering` (`ferrolearn-python/src/extras.rs`), `birch.rs fn fit`, `feature_agglomeration.rs fn fit`. Guards: `green_two_blobs_partition_all_linkages`, `green_three_blobs_partition_all_linkages` in `tests/divergence_agglomerative.rs`. |
 //! | REQ-2 (`n_clusters_` == requested) | SHIPPED | `Fit::fit` sets `n_clusters_: self.n_clusters`, mirroring `self.n_clusters_ = self.n_clusters` when `distance_threshold is None` (`_agglomerative.py:1095`). Guards above assert `n_clusters_` 2 and 3; `n_clusters()` accessor consumed by `birch.rs`/`feature_agglomeration.rs`. |
-//! | REQ-3 (four linkage criteria — partition) | SHIPPED | `enum Linkage` + `match linkage` arms in `fn agglomerate` (Single=min, Complete=max, Average=size-weighted mean, Ward=size-weighted Lance–Williams) mirror `_TREE_BUILDERS` (`_agglomerative.py:720-725`). Partition matches the oracle for all four (guards above). Caveat: PARTITION only — merge-distance VALUES/ties differ (squared-Euclidean LW vs sklearn heap/nn-chain), see REQ-9. |
+//! | REQ-3 (four linkage criteria) | SHIPPED | `enum Linkage` + `fn lance_williams` (Single=min, Complete=max, Average=size-weighted mean, Ward=Ward update on Euclidean distances) in the `fn nn_chain` builder, with `fn mst_single`+`fn single_linkage_relabel` for single, mirror `_TREE_BUILDERS` (`_agglomerative.py:720-725`). Now the `children_`/`labels_` BIT-EXACT-match the oracle for all four (REQ-6/REQ-7), not just the partition. Guards above + the parity tests in REQ-6/REQ-7. |
 //! | REQ-4 (`n_clusters=2` ctor default + sklearn error ABI) | NOT-STARTED | open prereq blocker #963. sklearn `__init__` defaults `n_clusters=2` (`_agglomerative.py:951`); ferrolearn `fn new(n_clusters)` requires it. Validation errors are `FerroError::InvalidParameter`/`InsufficientSamples` (crate-wide port convention), not sklearn's `ValueError`/`InvalidParameterError`. |
 //! | REQ-5 (`ensure_min_samples=2` validation) | NOT-STARTED | open prereq blocker #964. sklearn `fit` → `_validate_data(X, ensure_min_samples=2)` (`_agglomerative.py:989`) rejects `n_samples < 2`; ferrolearn `fn fit` accepts a single sample when `n_clusters <= 1` (`test_single_sample_single_cluster`). Coupled fix: `birch.rs fn fit` calls `AgglomerativeClustering::new(1)` on a 1-row matrix in the single-subcluster path, so this is a multi-file change, not minimal in `agglomerative.rs` alone. |
-//! | REQ-6 (`children_` full-dendrogram format) | NOT-STARTED | open prereq blocker #938. sklearn `children_` is shape `(n_samples-1, 2)` with internal-node IDs `>= n_samples` (`_agglomerative.py:902-908`); ferrolearn `FittedAgglomerativeClustering::children_` is length `n_samples - n_clusters` of reused merged-into-slot pairs (`fn agglomerate`: `children.push((ci, cj))`). Different length AND ID semantics — full-dendrogram rewrite, not minimal. |
-//! | REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | NOT-STARTED | open prereq blocker #938. sklearn numbers labels by a negated-id min-heap pop over the top-`n_clusters` dendrogram nodes (`_hc_cut`, `_agglomerative.py:760-775`); ferrolearn relabels by ascending surviving-slot order via a `HashMap` (`fn agglomerate` relabel loop). Same partition (REQ-1), permuted integers. Requires the full `children_` (REQ-6) then `_hc_cut`. |
+//! | REQ-6 (`children_` full-dendrogram format) | SHIPPED | impl `fn full_dendrogram in agglomerative.rs` (nn-chain `fn nn_chain` + stable distance sort + union-find `fn union_find_relabel` for ward/complete/average; Prim MST `fn mst_single` + `fn single_linkage_relabel` for single) produces `children_` of shape `(n_samples-1, 2)` with leaves `0..n-1` and internal-node IDs `n+i`, BIT-EXACT-equal to `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]` for ward/complete/average (`_agglomerative.py:314`/`:586`); for `single`, sklearn uses `mst_linkage_core` + `_single_linkage_label` (`:567-584`, R-DEV-7) whose pair order differs from `scipy.linkage('single')`, so `children_` matches sklearn's OWN `AgglomerativeClustering.children_` bit-exact. Live-oracle tests in `tests/divergence_agglomerative_dendrogram.rs`: `children_exact_scipy_6pt_nn_chain_linkages`, `children_exact_scipy_10pt_nn_chain_linkages`, `children_exact_sklearn_single_6pt`, `children_exact_sklearn_single_10pt`, and the pinned `divergence_children_full_dendrogram_format`. Consumers: `Fit::fit` → `children_`, `RsAgglomerativeClustering`, `birch.rs`/`feature_agglomeration.rs`. |
+//! | REQ-7 (`labels_` ABSOLUTE numbering via `_hc_cut`) | SHIPPED | impl `fn hc_cut in agglomerative.rs` (negated-id max-heap over the top-`n_clusters` dendrogram nodes + `fn hc_get_descendent`, mirroring `_hc_cut`, `_agglomerative.py:731-775`) builds `labels_` from the REQ-6 full `children_`, BIT-EXACT-equal to `sklearn.cluster.AgglomerativeClustering(n_clusters=k, linkage=…).fit(X).labels_`. Live-oracle tests: `labels_exact_sklearn_6pt_all_linkages`/`labels_exact_sklearn_10pt_all_linkages` (k∈{2,3}, all four linkages) + the pinned `divergence_labels_absolute_hc_cut_numbering`. Consumer: `Fit::fit` → `labels_` surfaced through `RsAgglomerativeClustering::labels_` + `birch.rs`/`feature_agglomeration.rs` (partition use). |
 //! | REQ-8 (`metric` / `connectivity`) | NOT-STARTED | open prereq blocker #965. sklearn `metric` ∈ {euclidean,l1,l2,manhattan,cosine,precomputed} default `'euclidean'` with the ward-requires-euclidean rule (`_agglomerative.py:795-799`, `:1034-1038`) and `connectivity` for structured clustering (`:812-822`). ferrolearn `fn sq_euclidean`/`fn pairwise_sq_dists` are Euclidean-only, unstructured. |
 //! | REQ-9 (`distance_threshold`/`compute_full_tree`/`compute_distances`/`distances_`) | NOT-STARTED | open prereq blocker #966. sklearn `distance_threshold` (XOR with `n_clusters`, `_agglomerative.py:1022-1027`; `n_clusters_` derived `:1090-1093`), `compute_full_tree='auto'` (`:1051-1064`), `compute_distances` → `distances_` (`:1087-1088`). ferrolearn has only `n_clusters` + `linkage`, no `distances_`, and the merge-distance VALUES differ. |
 //! | REQ-10 (`n_leaves_`/`n_connected_components_` + `memory`) | NOT-STARTED | open prereq blocker #967. sklearn sets `n_leaves_`/`n_connected_components_` from the tree builder (`_agglomerative.py:1083-1085`) and caches via `memory` (`:1006`/`:1076`). `FittedAgglomerativeClustering` exposes `labels()`/`n_clusters()`/`children()` only. |
@@ -159,9 +176,13 @@ pub struct FittedAgglomerativeClustering<F> {
     pub labels_: Array1<usize>,
     /// The actual number of clusters formed.
     pub n_clusters_: usize,
-    /// Merge history: each element `(i, j)` records that the clusters
-    /// with internal IDs `i` and `j` were merged.  Length =
-    /// `n_samples - n_clusters`.
+    /// The full dendrogram, shape `(n_samples - 1, 2)`.
+    ///
+    /// Each element `(a, b)` records that nodes `a` and `b` were merged to form
+    /// node `n_samples + i` (where `i` is the row index). Values `< n_samples`
+    /// are leaves (original samples); values `>= n_samples` are internal nodes.
+    /// This matches scikit-learn's `children_` attribute and
+    /// `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]`.
     pub children_: Vec<(usize, usize)>,
     /// Phantom to retain the float type parameter.
     _marker: std::marker::PhantomData<F>,
@@ -180,9 +201,12 @@ impl<F: Float> FittedAgglomerativeClustering<F> {
         self.n_clusters_
     }
 
-    /// Return the merge tree: pairs of cluster IDs that were merged.
+    /// Return the full dendrogram, shape `(n_samples - 1, 2)`.
     ///
-    /// The entries are in merge order (earliest merge first).
+    /// Row `i` is the pair of node IDs merged to form node `n_samples + i`
+    /// (leaves are `0..n_samples`, internal nodes are `>= n_samples`). This
+    /// matches scikit-learn's `children_` /
+    /// `scipy.cluster.hierarchy.linkage(...)[:, :2]`.
     #[must_use]
     pub fn children(&self) -> &[(usize, usize)] {
         &self.children_
@@ -193,166 +217,418 @@ impl<F: Float> FittedAgglomerativeClustering<F> {
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Compute the squared Euclidean distance between two row slices.
+/// Compute the *Euclidean* distance between two row slices.
+///
+/// scipy's `linkage`/`ward` operate on actual (non-squared) Euclidean distances;
+/// the Ward Lance–Williams update below works on these directly.
 #[inline]
-fn sq_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
+fn euclidean<F: Float>(a: &[F], b: &[F]) -> f64 {
     a.iter()
         .zip(b.iter())
-        .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
+        .fold(0.0_f64, |acc, (&ai, &bi)| {
+            let d = ai.to_f64().unwrap_or(0.0) - bi.to_f64().unwrap_or(0.0);
+            acc + d * d
+        })
+        .sqrt()
 }
 
-/// Compute the full `n × n` pairwise squared-distance matrix.
-fn pairwise_sq_dists<F: Float>(x: &Array2<F>) -> Vec<F> {
-    let n = x.nrows();
-    let mut d = vec![F::zero(); n * n];
-    for i in 0..n {
-        let ri = x.row(i);
-        let si = ri.as_slice().unwrap_or(&[]);
-        for j in (i + 1)..n {
-            let rj = x.row(j);
-            let sj = rj.as_slice().unwrap_or(&[]);
-            let dist = sq_euclidean(si, sj);
-            d[i * n + j] = dist;
-            d[j * n + i] = dist;
+/// Index into the condensed (upper-triangular) distance vector for the pair
+/// `(i, j)` over `n` observations, mirroring scipy's `condensed_index`.
+#[inline]
+fn condensed_index(n: usize, i: usize, j: usize) -> usize {
+    if i < j {
+        n * i - (i * (i + 1)) / 2 + (j - i - 1)
+    } else {
+        n * j - (j * (j + 1)) / 2 + (i - j - 1)
+    }
+}
+
+/// Lance–Williams distance update for the nn-chain linkages, matching scipy's
+/// `linkage_distance_update` family (operating on Euclidean distances).
+#[inline]
+fn lance_williams(
+    linkage: Linkage,
+    d_xi: f64,
+    d_yi: f64,
+    size_x: f64,
+    size_y: f64,
+    size_i: f64,
+    d_xy: f64,
+) -> f64 {
+    match linkage {
+        Linkage::Single => d_xi.min(d_yi),
+        Linkage::Complete => d_xi.max(d_yi),
+        Linkage::Average => (size_x * d_xi + size_y * d_yi) / (size_x + size_y),
+        Linkage::Ward => {
+            let t = 1.0 / (size_x + size_y + size_i);
+            ((size_i + size_x) * t * d_xi * d_xi + (size_i + size_y) * t * d_yi * d_yi
+                - size_i * t * d_xy * d_xy)
+                .sqrt()
         }
     }
-    d
 }
 
-/// Find the (i, j) pair with the smallest value in `dist_mat` among the
-/// currently active clusters.
-fn find_min_pair(dist_mat: &[f64], active: &[usize]) -> (usize, usize) {
-    let mut best_i = active[0];
-    let mut best_j = active[1];
-    let n = (dist_mat.len() as f64).sqrt() as usize;
-    let mut best_val = f64::INFINITY;
+/// A single merge produced by the chain/MST builders, before relabelling.
+/// `(node_a, node_b, distance)` with the original observation indices.
+type RawMerge = (usize, usize, f64);
 
-    for (ai, &i) in active.iter().enumerate() {
-        for &j in active.iter().skip(ai + 1) {
-            let v = dist_mat[i * n + j];
-            if v < best_val {
-                best_val = v;
-                best_i = i;
-                best_j = j;
+/// Nearest-neighbour-chain dendrogram builder for ward / complete / average,
+/// mirroring scipy's `nn_chain` (`scipy/cluster/_hierarchy.pyx`). Returns the
+/// `n-1` merges (unordered) as `(x, y, dist)` with `x < y` original-index roots
+/// at merge time — exactly scipy's `Z[:, :3]` before the final sort/relabel.
+fn nn_chain(condensed: &[f64], n: usize, linkage: Linkage) -> Vec<RawMerge> {
+    let mut d = condensed.to_vec();
+    let mut size = vec![1.0_f64; n];
+    let mut chain: Vec<usize> = vec![0; n];
+    let mut chain_len = 0usize;
+    let mut merges: Vec<RawMerge> = Vec::with_capacity(n.saturating_sub(1));
+
+    for _ in 0..n.saturating_sub(1) {
+        if chain_len == 0 {
+            chain_len = 1;
+            // First active cluster (size > 0).
+            for (i, &s) in size.iter().enumerate() {
+                if s > 0.0 {
+                    chain[0] = i;
+                    break;
+                }
             }
         }
+
+        let mut x;
+        let mut y;
+        let mut current_min;
+        loop {
+            x = chain[chain_len - 1];
+            if chain_len > 1 {
+                y = chain[chain_len - 2];
+                current_min = d[condensed_index(n, x, y)];
+            } else {
+                y = usize::MAX;
+                current_min = f64::INFINITY;
+            }
+            for (i, &si) in size.iter().enumerate() {
+                if si == 0.0 || x == i {
+                    continue;
+                }
+                let dist = d[condensed_index(n, x, i)];
+                if dist < current_min {
+                    current_min = dist;
+                    y = i;
+                }
+            }
+            if chain_len > 1 && y == chain[chain_len - 2] {
+                break;
+            }
+            chain[chain_len] = y;
+            chain_len += 1;
+        }
+
+        chain_len -= 2;
+
+        // Merge x and y; ensure x < y (scipy's convention).
+        if x > y {
+            std::mem::swap(&mut x, &mut y);
+        }
+        let nx = size[x];
+        let ny = size[y];
+        merges.push((x, y, current_min));
+
+        size[x] = 0.0;
+        size[y] = nx + ny;
+
+        // Lance–Williams update of distances to the merged cluster (stored in y).
+        for i in 0..n {
+            let ni = size[i];
+            if ni == 0.0 || i == y {
+                continue;
+            }
+            let d_ix = d[condensed_index(n, i, x)];
+            let d_iy = d[condensed_index(n, i, y)];
+            d[condensed_index(n, i, y)] =
+                lance_williams(linkage, d_ix, d_iy, nx, ny, ni, current_min);
+        }
     }
-    (best_i, best_j)
+
+    merges
 }
 
-/// Return type of the internal `agglomerate` helper.
+/// Prim's MST builder for single linkage, mirroring sklearn's
+/// `mst_linkage_core` (`_hierarchical_fast.pyx`). Distances are generated on the
+/// fly (Euclidean). Returns `n-1` merges as `(current_node, new_node, dist)` in
+/// MST-construction order (NOT sorted).
+fn mst_single<F: Float>(x: &Array2<F>, n: usize) -> Vec<RawMerge> {
+    let rows: Vec<&[F]> = (0..n).map(|i| row_slice(x, i)).collect();
+    let mut in_tree = vec![false; n];
+    let mut current_distances = vec![f64::INFINITY; n];
+    let mut current_node = 0usize;
+    let mut merges: Vec<RawMerge> = Vec::with_capacity(n.saturating_sub(1));
+
+    for _ in 0..n.saturating_sub(1) {
+        in_tree[current_node] = true;
+        let mut new_distance = f64::INFINITY;
+        let mut new_node = 0usize;
+
+        for j in 0..n {
+            if in_tree[j] {
+                continue;
+            }
+            let left_value = euclidean(rows[current_node], rows[j]);
+            if left_value < current_distances[j] {
+                current_distances[j] = left_value;
+            }
+            if current_distances[j] < new_distance {
+                new_distance = current_distances[j];
+                new_node = j;
+            }
+        }
+
+        merges.push((current_node, new_node, new_distance));
+        current_node = new_node;
+    }
+
+    merges
+}
+
+/// Union-find relabel for the nn-chain linkages, mirroring scipy's `label`
+/// (`scipy/cluster/_hierarchy.pyx`). Merges must already be **stably sorted by
+/// distance**. Emits the full dendrogram with the smaller root first.
+fn union_find_relabel(mut merges: Vec<RawMerge>, n: usize) -> Vec<(usize, usize)> {
+    // Stable sort by merge distance (scipy uses `argsort(kind='stable')`).
+    merges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut parent: Vec<usize> = (0..(2 * n).saturating_sub(1)).collect();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(n.saturating_sub(1));
+
+    for (i, (a, b, _)) in merges.into_iter().enumerate() {
+        let next_label = n + i;
+        let ra = uf_find(&mut parent, a);
+        let rb = uf_find(&mut parent, b);
+        let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+        out.push((lo, hi));
+        parent[ra] = next_label;
+        parent[rb] = next_label;
+    }
+
+    out
+}
+
+/// Union-find relabel for single linkage, mirroring sklearn's
+/// `_single_linkage_label` + `UnionFind` (`_hierarchical_fast.pyx`). The MST must
+/// already be **stably sorted by weight**. Unlike [`union_find_relabel`], the
+/// pair is emitted in `(left_root, right_root)` order WITHOUT reordering.
+fn single_linkage_relabel(mut merges: Vec<RawMerge>, n: usize) -> Vec<(usize, usize)> {
+    merges.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut parent: Vec<usize> = (0..(2 * n).saturating_sub(1)).collect();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(n.saturating_sub(1));
+
+    for (i, (left, right, _)) in merges.into_iter().enumerate() {
+        let next_label = n + i;
+        let lc = uf_find(&mut parent, left);
+        let rc = uf_find(&mut parent, right);
+        out.push((lc, rc));
+        parent[lc] = next_label;
+        parent[rc] = next_label;
+    }
+
+    out
+}
+
+/// Find with path compression over a parent array where a self-parent denotes a
+/// root. (Matches the union-find semantics of scipy `label` / sklearn
+/// `UnionFind.fast_find`.)
+fn uf_find(parent: &mut [usize], mut node: usize) -> usize {
+    let mut root = node;
+    while parent[root] != root {
+        root = parent[root];
+    }
+    // Path compression.
+    while parent[node] != root {
+        let next = parent[node];
+        parent[node] = root;
+        node = next;
+    }
+    root
+}
+
+/// Collect a contiguous row slice for sample `i`, falling back to a copy when
+/// the row is not contiguous.
+fn row_slice<F: Float>(x: &Array2<F>, i: usize) -> &[F] {
+    x.row(i).to_slice().unwrap_or(&[])
+}
+
+/// Build the FULL dendrogram (shape `(n_samples - 1, 2)`) for the given linkage,
+/// bit-exact with `scipy.cluster.hierarchy.linkage(X, method, 'euclidean')[:, :2]`
+/// (ward == `method='ward'`). Leaves are `0..n`, the `i`-th sorted merge forms
+/// node `n + i`.
+fn full_dendrogram<F: Float>(x: &Array2<F>, linkage: Linkage) -> Vec<(usize, usize)> {
+    let n = x.nrows();
+    if n < 2 {
+        return Vec::new();
+    }
+
+    match linkage {
+        Linkage::Single => {
+            let merges = mst_single(x, n);
+            single_linkage_relabel(merges, n)
+        }
+        _ => {
+            // Build the condensed Euclidean distance vector.
+            let rows: Vec<&[F]> = (0..n).map(|i| row_slice(x, i)).collect();
+            let mut condensed = vec![0.0_f64; n * (n - 1) / 2];
+            let mut k = 0;
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    condensed[k] = euclidean(rows[i], rows[j]);
+                    k += 1;
+                }
+            }
+            let merges = nn_chain(&condensed, n, linkage);
+            union_find_relabel(merges, n)
+        }
+    }
+}
+
+/// Collect all descendant leaves of `node` in the dendrogram, mirroring
+/// sklearn's `_hc_get_descendent` (`_hierarchical_fast.pyx`). Leaves are
+/// `< n_leaves`; an internal node `i` has children `children[i - n_leaves]`.
+fn hc_get_descendent(node: usize, children: &[(usize, usize)], n_leaves: usize) -> Vec<usize> {
+    if node < n_leaves {
+        return vec![node];
+    }
+    let mut stack = vec![node];
+    let mut descendents = Vec::new();
+    while let Some(i) = stack.pop() {
+        if i < n_leaves {
+            descendents.push(i);
+        } else {
+            let (a, b) = children[i - n_leaves];
+            stack.push(a);
+            stack.push(b);
+        }
+    }
+    descendents
+}
+
+/// Cut the full dendrogram into `n_clusters` clusters, numbering each leaf by
+/// the heap position of its top-level ancestor — a faithful, operation-for-
+/// operation translation of sklearn's `_hc_cut` (`_agglomerative.py:731-775`).
+///
+/// `nodes` stores NEGATED node ids in a Python-`heapq` MIN-heap (so the smallest
+/// element is the largest node id). We replicate `heappush` and `heappushpop`
+/// exactly, then `enumerate` the heap array in its final layout order — both the
+/// heap-array layout and the enumeration order are reproduced verbatim, so the
+/// absolute `labels_` match sklearn bit-for-bit.
+fn hc_cut(n_clusters: usize, children: &[(usize, usize)], n_leaves: usize) -> Array1<usize> {
+    let mut labels = Array1::<usize>::zeros(n_leaves);
+    if n_leaves == 0 || children.is_empty() {
+        // Single leaf (or no merges) → one cluster (label 0 everywhere).
+        return labels;
+    }
+
+    // nodes = [-(max(children[-1]) + 1)]  (negated root id).
+    let last = children[children.len() - 1];
+    let root = (last.0.max(last.1) + 1) as i64;
+    let mut nodes: Vec<i64> = vec![-root];
+
+    for _ in 0..n_clusters.saturating_sub(1) {
+        // these_children = children[-nodes[0] - n_leaves]; nodes[0] is the
+        // min (= most-negative) element of the Python heap.
+        let smallest = nodes[0]; // negated => smallest negated == largest id
+        let node_id = (-smallest) as usize;
+        let these = children[node_id - n_leaves];
+        // heappush(nodes, -these[0]); heappushpop(nodes, -these[1]);
+        heappush_min(&mut nodes, -(these.0 as i64));
+        heappushpop_min(&mut nodes, -(these.1 as i64));
+    }
+
+    // for i, node in enumerate(nodes): label[descendents(-node)] = i
+    for (i, &neg_node) in nodes.iter().enumerate() {
+        let node = (-neg_node) as usize;
+        for leaf in hc_get_descendent(node, children, n_leaves) {
+            labels[leaf] = i;
+        }
+    }
+    labels
+}
+
+/// CPython `heapq.heappush` (sift-down of the new last element toward the root),
+/// reproducing the exact array layout so `_hc_cut`'s `enumerate(nodes)` order
+/// matches.
+fn heappush_min(heap: &mut Vec<i64>, item: i64) {
+    heap.push(item);
+    let last = heap.len() - 1;
+    sift_down(heap, 0, last);
+}
+
+/// CPython `heapq.heappushpop`: push `item`, then pop-and-return the smallest.
+/// If `item` is no larger than the current min, it is returned unchanged
+/// (matching CPython's fast path) and the heap is untouched.
+fn heappushpop_min(heap: &mut [i64], item: i64) -> i64 {
+    if !heap.is_empty() && heap[0] < item {
+        let returned = heap[0];
+        heap[0] = item;
+        sift_up(heap, 0);
+        return returned;
+    }
+    item
+}
+
+/// CPython `heapq._siftdown(heap, startpos, pos)`: bubble `heap[pos]` up toward
+/// `startpos` while it is smaller than its parent.
+fn sift_down(heap: &mut [i64], startpos: usize, pos: usize) {
+    let mut pos = pos;
+    let new_item = heap[pos];
+    while pos > startpos {
+        let parentpos = (pos - 1) >> 1;
+        let parent = heap[parentpos];
+        if new_item < parent {
+            heap[pos] = parent;
+            pos = parentpos;
+        } else {
+            break;
+        }
+    }
+    heap[pos] = new_item;
+}
+
+/// CPython `heapq._siftup(heap, pos)`: move `heap[pos]` down to a leaf along the
+/// path of smaller children, then sift it back up to its correct spot. This is
+/// CPython's exact (non-obvious) layout-preserving variant.
+fn sift_up(heap: &mut [i64], pos: usize) {
+    let endpos = heap.len();
+    let startpos = pos;
+    let mut pos = pos;
+    let new_item = heap[pos];
+    let mut childpos = 2 * pos + 1;
+    while childpos < endpos {
+        let rightpos = childpos + 1;
+        if rightpos < endpos && heap[childpos] >= heap[rightpos] {
+            childpos = rightpos;
+        }
+        heap[pos] = heap[childpos];
+        pos = childpos;
+        childpos = 2 * pos + 1;
+    }
+    heap[pos] = new_item;
+    sift_down(heap, startpos, pos);
+}
+
+/// Run the full unstructured agglomerative pipeline for `x` returning
+/// `(labels_, children_)`, mirroring sklearn's `_fit` (`_agglomerative.py:1083-1105`)
+/// when `distance_threshold is None`: build the full dendrogram, then
+/// `_hc_cut(n_clusters, children_, n_leaves)`.
 type AgglomerateResult = Result<(Array1<usize>, Vec<(usize, usize)>), FerroError>;
 
-/// Generic helper: run agglomerative clustering returning `(labels, children)`.
-///
-/// We work entirely with `f64` internally and accept the input as a trait
-/// object of `Float` by converting upfront.
 fn agglomerate<F: Float>(
     x: &Array2<F>,
     n_clusters_target: usize,
     linkage: Linkage,
 ) -> AgglomerateResult {
     let n_samples = x.nrows();
-
-    // Convert data to f64 for internal computation.
-    let x_f64: Array2<f64> = x.mapv(|v| v.to_f64().unwrap_or(0.0));
-
-    // Build pairwise squared-distance matrix (n × n, flat, row-major).
-    let mut sq_dists = pairwise_sq_dists(&x_f64);
-    let n = n_samples;
-
-    // For Ward linkage we also need cluster sizes and sum-of-squares.
-    // For others we just track sizes to apply Lance–Williams updates.
-    let mut sizes: Vec<f64> = vec![1.0; n];
-
-    // active[i] = current internal cluster ID of the i-th active position.
-    let mut active: Vec<usize> = (0..n).collect();
-
-    let mut children: Vec<(usize, usize)> = Vec::with_capacity(n - n_clusters_target);
-
-    // cluster_id[i] = which leaf cluster i belongs to at the current merge step.
-    // Initially each sample is its own cluster.
-    let mut assignment: Vec<usize> = (0..n).collect();
-
-    // Counter for new cluster IDs after merges (reuse the merged-into slot).
-    // We track the merge history as pairs of original-or-merged IDs.
-
-    while active.len() > n_clusters_target {
-        // ── Find the two closest active clusters ────────────────────────────
-        let (ci, cj) = find_min_pair(&sq_dists, &active);
-
-        // Remove cj from active; ci absorbs cj.
-        active.retain(|&id| id != cj);
-        children.push((ci, cj));
-
-        let ni = sizes[ci];
-        let nj = sizes[cj];
-        let new_size = ni + nj;
-
-        // ── Update the distance matrix using Lance–Williams recurrence ───────
-        // For the merged cluster (stored in slot ci), update dist to all
-        // remaining active clusters.
-        for &ck in &active {
-            if ck == ci {
-                continue;
-            }
-            let nk = sizes[ck];
-            let d_ik = sq_dists[ci * n + ck];
-            let d_jk = sq_dists[cj * n + ck];
-
-            let new_dist = match linkage {
-                Linkage::Single => {
-                    if d_ik < d_jk {
-                        d_ik
-                    } else {
-                        d_jk
-                    }
-                }
-                Linkage::Complete => {
-                    if d_ik > d_jk {
-                        d_ik
-                    } else {
-                        d_jk
-                    }
-                }
-                Linkage::Average => (ni * d_ik + nj * d_jk) / (ni + nj),
-                Linkage::Ward => {
-                    // Ward: squared Euclidean distance between new centroid
-                    // and existing centroid, weighted by sizes.
-                    // Lance–Williams for Ward:
-                    // d(ij, k) = ((n_i + n_k)/(n_i+n_j+n_k)) * d(i,k)
-                    //          + ((n_j + n_k)/(n_i+n_j+n_k)) * d(j,k)
-                    //          - (n_k      /(n_i+n_j+n_k)) * d(i,j)
-                    let d_ij = sq_dists[ci * n + cj];
-                    let denom = ni + nj + nk;
-                    ((ni + nk) / denom) * d_ik + ((nj + nk) / denom) * d_jk - (nk / denom) * d_ij
-                }
-            };
-
-            sq_dists[ci * n + ck] = new_dist;
-            sq_dists[ck * n + ci] = new_dist;
-        }
-
-        sizes[ci] = new_size;
-
-        // Redirect all samples assigned to cj → ci.
-        for s in &mut assignment {
-            if *s == cj {
-                *s = ci;
-            }
-        }
-    }
-
-    // ── Re-label active cluster IDs as 0 .. n_clusters_target ───────────────
-    let mut id_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
-    for (new_id, &cluster_id) in active.iter().enumerate() {
-        id_map.insert(cluster_id, new_id);
-    }
-    let labels: Array1<usize> = assignment
-        .iter()
-        .map(|id| *id_map.get(id).unwrap_or(&0))
-        .collect();
-
+    let children = full_dendrogram(x, linkage);
+    let labels = hc_cut(n_clusters_target, &children, n_samples);
     Ok((labels, children))
 }
 
@@ -450,6 +726,11 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    /// Three collinear points, well separated (infallible `arr2` fixture).
+    fn three_points() -> Array2<f64> {
+        ndarray::arr2(&[[0.0, 0.0], [5.0, 5.0], [10.0, 10.0]])
     }
 
     // ── Construction ────────────────────────────────────────────────────────
@@ -636,16 +917,28 @@ mod tests {
 
     #[test]
     fn test_children_length() {
-        let x = make_two_blobs(); // 8 samples, 2 clusters → 6 merges
-        let fitted = AgglomerativeClustering::<f64>::new(2).fit(&x, &()).unwrap();
-        assert_eq!(fitted.children().len(), x.nrows() - 2);
+        // Full dendrogram: children_ has n_samples - 1 rows regardless of
+        // n_clusters (matches sklearn / scipy linkage output).
+        let x = make_two_blobs(); // 8 samples → 7 dendrogram rows.
+        let fitted = AgglomerativeClustering::<f64>::new(2).fit(&x, &());
+        let fitted = fitted.as_ref().ok();
+        assert!(fitted.is_some());
+        if let Some(f) = fitted {
+            assert_eq!(f.children().len(), x.nrows() - 1);
+        }
     }
 
     #[test]
-    fn test_children_empty_when_n_clusters_equals_n_samples() {
-        let x = Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 5.0, 5.0, 10.0, 10.0]).unwrap();
-        let fitted = AgglomerativeClustering::<f64>::new(3).fit(&x, &()).unwrap();
-        assert!(fitted.children().is_empty());
+    fn test_children_full_tree_when_n_clusters_equals_n_samples() {
+        // children_ is the FULL dendrogram (n_samples - 1 rows) even when
+        // n_clusters == n_samples — sklearn always builds the full tree.
+        let x = three_points();
+        let fitted = AgglomerativeClustering::<f64>::new(3).fit(&x, &());
+        let fitted = fitted.as_ref().ok();
+        assert!(fitted.is_some());
+        if let Some(f) = fitted {
+            assert_eq!(f.children().len(), 2);
+        }
     }
 
     // ── Special cases ─────────────────────────────────────────────────────────
