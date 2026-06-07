@@ -22,6 +22,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsBaggingClassifier,
     _RsBayesianRidge,
     _RsBernoulliNB,
+    _RsBinarizer,
     _RsBirch,
     _RsComplementNB,
     _RsDBSCAN,
@@ -2206,6 +2207,55 @@ class FeatureAgglomeration(_TransformerWrapper):
         X = _deprecate_Xt_in_inverse_transform(X, Xt)
         check_is_fitted(self)
         return np.asarray(self._rs.inverse_transform(_f64(X)))
+
+
+class Binarizer(_TransformerWrapper):
+    """Binarize features to 0/1 by a threshold, backed by Rust (#1131).
+
+    Mirrors ``sklearn.preprocessing.Binarizer``
+    (``sklearn/preprocessing/_data.py:2177-2306``): values strictly greater than
+    ``threshold`` map to 1, all others to 0 (default ``threshold=0.0`` -> only
+    positive values map to 1). The keyword-only constructor mirrors sklearn's
+    ``__init__(self, *, threshold=0.0, copy=True)`` (``_data.py:2253``); both
+    ``threshold`` and ``copy`` are threaded into the Rust core via ``_make_rs`` so
+    ``get_params``/``set_params``/``clone`` round-trip them.
+
+    ``copy`` is an accept-and-document no-op (ferrolearn's ``Transform`` always
+    returns a freshly allocated array, so ``copy=False`` produces identical
+    output; binarizer.rs REQ-2). A non-finite ``threshold`` is ACCEPTED at ``fit``
+    (sklearn ``_parameter_constraints {threshold: [Real]}`` is a bare type check,
+    binarizer.rs #2209) but REJECTED at ``transform`` (sklearn's free ``binarize``
+    ``@validate_params`` open interval ``(-inf, inf)``, ``_data.py:2114``, #2208),
+    surfacing as ``ValueError`` from the Rust core — matching sklearn. NaN/+-inf
+    INPUT also raises ``ValueError`` (``check_array(force_all_finite=True)``,
+    binarizer.rs REQ-9). Inherits ``fit``/``transform``/``fit_transform`` from
+    ``_TransformerWrapper``.
+    """
+
+    def __init__(self, *, threshold=0.0, copy=True):
+        self.threshold = threshold
+        self.copy = copy
+
+    def _make_rs(self):
+        return _RsBinarizer(threshold=self.threshold, copy=self.copy)
+
+    def transform(self, X):
+        # sklearn Binarizer is STATELESS (`_more_tags() -> {"stateless": True}`,
+        # `_data.py:2308`; "does not need to be fitted"): `transform` works
+        # WITHOUT a prior `fit` (#2213). Build the Rust core on demand if `fit`
+        # was never called — `binarize` reads only `threshold`, no fitted state.
+        if not hasattr(self, "_rs"):
+            self._rs = self._make_rs()
+            self._rs.fit(_f64(X))
+        out = np.asarray(self._rs.transform(_f64(X)))
+        # sklearn `binarize` -> `check_array(dtype="numeric")` PRESERVES the input
+        # dtype (int64->int64, float32->float32; `_data.py:2160`), but the f64
+        # Rust ABI always returns float64. Cast back (#2214) — 0.0/1.0 are exact
+        # in every numeric dtype, so the values are unchanged.
+        in_dtype = np.asarray(X).dtype
+        if np.issubdtype(in_dtype, np.number) and out.dtype != in_dtype:
+            out = out.astype(in_dtype, copy=False)
+        return out
 
 
 class MinMaxScaler(_TransformerWrapper):

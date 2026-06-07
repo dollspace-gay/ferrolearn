@@ -42,10 +42,6 @@ _X = np.array(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(
-    reason="divergence: stateless transform-without-fit raises AttributeError "
-    "vs sklearn transforming; tracking #2213"
-)
 def test_transform_without_fit_is_stateless_like_sklearn():
     """fl.Binarizer().transform(X) (NO fit) must binarize, like sklearn.
 

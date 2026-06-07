@@ -20,6 +20,7 @@ from ferrolearn._extras import (
     BaggingClassifier,
     BayesianRidge,
     BernoulliNB,
+    Binarizer,
     Birch,
     ComplementNB,
     DBSCAN,
@@ -128,6 +129,7 @@ __all__ = [
     "SparsePCA",
     "FactorAnalysis",
     # Preprocess extras
+    "Binarizer",
     "MinMaxScaler",
     "MaxAbsScaler",
     "RobustScaler",

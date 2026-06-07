@@ -89,6 +89,7 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extras::RsFactorAnalysis>()?;
 
     // Extras — preprocess
+    m.add_class::<extras::RsBinarizer>()?;
     m.add_class::<extras::RsMinMaxScaler>()?;
     m.add_class::<extras::RsMaxAbsScaler>()?;
     m.add_class::<extras::RsRobustScaler>()?;

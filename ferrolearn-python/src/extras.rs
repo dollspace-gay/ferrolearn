@@ -3209,6 +3209,29 @@ py_transformer!(
 // Preprocess (extras)
 // ===========================================================================
 
+// Binarizer (#1131): the `py_transformer!` macro generates the `#[new]` taking
+// `threshold: f64 = 0.0` + `copy: bool = true` (sklearn `Binarizer.__init__(*,
+// threshold=0.0, copy=True)`, `sklearn/preprocessing/_data.py:2253`), `fit(x)`
+// (constructs `Binarizer::<f64>::new(threshold).with_copy(copy)` then
+// `.fit(&x, &())`), and `transform(x)` (delegates to the fitted type). The build
+// block references the macro-cloned `threshold`/`copy` locals. The non-finite
+// threshold is ACCEPTED at fit (sklearn `_parameter_constraints {threshold:
+// [Real]}` is a bare type check, #2209) and REJECTED by transform (sklearn's free
+// `binarize` `@validate_params` open `Interval(Real, None, None,
+// closed="neither")`, `_data.py:2114`, #2208) — `FittedBinarizer::transform` maps
+// that `FerroError::InvalidParameter` to `PyValueError`, matching sklearn.
+py_transformer!(
+    RsBinarizer,
+    "_RsBinarizer",
+    // `FittedBinarizer` is not re-exported at the crate root (only `Binarizer`
+    // is, `ferrolearn-preprocess/src/lib.rs:127`); reach it via the public
+    // `binarizer` module so this binding does not widen the preprocess crate's
+    // re-export surface.
+    ferrolearn_preprocess::binarizer::FittedBinarizer<f64>,
+    (threshold: f64 = 0.0, copy: bool = true),
+    { ferrolearn_preprocess::Binarizer::<f64>::new(threshold).with_copy(copy) }
+);
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",
