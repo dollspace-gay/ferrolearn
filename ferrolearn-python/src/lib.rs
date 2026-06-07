@@ -31,6 +31,8 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extras::RsHuberRegressor>()?;
     m.add_class::<extras::RsQuantileRegressor>()?;
     m.add_class::<extras::RsOrthogonalMatchingPursuit>()?;
+    m.add_class::<extras::RsLars>()?;
+    m.add_class::<extras::RsLassoLars>()?;
 
     // Extras — tree regressors
     m.add_class::<extras::RsDecisionTreeRegressor>()?;

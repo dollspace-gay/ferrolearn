@@ -115,8 +115,6 @@ def test_lassolars_duplicate_column_matches_sklearn():
 # Tracking: #2177
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(reason="divergence #2177: Lars accepts non-bool copy_X "
-                          "where sklearn raises", strict=True)
 def test_lars_copy_x_invalid_rejected_like_sklearn():
     rng = np.random.RandomState(0)
     X = rng.randn(20, 5)
@@ -129,8 +127,6 @@ def test_lars_copy_x_invalid_rejected_like_sklearn():
         fl.Lars(copy_X="not-a-bool").fit(X, y)
 
 
-@pytest.mark.xfail(reason="divergence #2177: LassoLars accepts non-bool copy_X "
-                          "where sklearn raises", strict=True)
 def test_lassolars_copy_x_invalid_rejected_like_sklearn():
     rng = np.random.RandomState(0)
     X = rng.randn(20, 5)

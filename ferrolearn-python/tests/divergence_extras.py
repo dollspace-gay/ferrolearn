@@ -1367,3 +1367,306 @@ def test_omp_pickle_roundtrip_preserves_predictions():
     pred_before = fr.predict(X)
     fr2 = pickle.loads(pickle.dumps(fr))
     np.testing.assert_allclose(fr2.predict(X), pred_before, rtol=0, atol=1e-12)
+
+
+# ===========================================================================
+# Lars / LassoLars (#2174): the binding-surface unit. Oracle = live sklearn
+# 1.5.2 `sklearn.linear_model.Lars`/`LassoLars` (imported here), compared
+# head-to-head. coef_/intercept_/predict per several `n_nonzero_coefs` and the
+# default (n_nonzero_coefs=500 -> capped at n_features), fit_intercept True/False,
+# `LassoLars(alpha=a)` per several alpha, the ctor ABI / get_params / clone, and
+# the validated/NotImplemented param surface (jitter / positive / bad precompute /
+# n_nonzero_coefs<1 / negative alpha). All expected values are computed by the
+# live sklearn oracle in the SAME test (R-CHAR-3) — never copied from ferrolearn.
+# ===========================================================================
+
+from sklearn.linear_model import Lars as SkLars
+from sklearn.linear_model import LassoLars as SkLassoLars
+
+
+def _lars_dataset(seed=0, n=60, p=8, informative=5, noise=4.0):
+    from sklearn.datasets import make_regression
+
+    X, y = make_regression(
+        n_samples=n, n_features=p, n_informative=informative, noise=noise,
+        random_state=seed,
+    )
+    return X, y
+
+
+def test_lars_coef_intercept_predict_match_sklearn_per_n_nonzero():
+    """REQ-LARS: for several `n_nonzero_coefs`, `coef_`/`intercept_`/`predict`
+    reproduce the live sklearn oracle to ~1e-6 (lars.rs REQ-1/3/4 SHIPPED)."""
+    X, y = _lars_dataset()
+    for k in (1, 2, 3, 5):
+        sk = SkLars(n_nonzero_coefs=k).fit(X, y)
+        fr = fl.Lars(n_nonzero_coefs=k).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6,
+            err_msg=f"coef_ diverges at n_nonzero_coefs={k}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6, (
+            f"intercept_ diverges at n_nonzero_coefs={k}"
+        )
+        np.testing.assert_allclose(
+            fr.predict(X), sk.predict(X), rtol=0, atol=1e-6,
+            err_msg=f"predict diverges at n_nonzero_coefs={k}",
+        )
+        # k features in the active set -> exactly k non-zero coefficients.
+        assert int(np.count_nonzero(np.abs(np.asarray(fr.coef_)) > 1e-9)) == k
+
+
+def test_lars_default_n_nonzero_capped_at_n_features_matches_sklearn():
+    """REQ-LARS: sklearn's default `n_nonzero_coefs=500` is an UPPER bound on the
+    active set, capped at `n_features` (`_least_angle.py` lars_path
+    `max_features`). With p=8 features the cap is 8, so the default uses all
+    features; ferrolearn reproduces the SAME `coef_`/`intercept_`/`predict`."""
+    X, y = _lars_dataset(p=8)
+    sk = SkLars().fit(X, y)
+    fr = fl.Lars().fit(X, y)
+    # The wrapper exposes sklearn's default 500 (capped internally to n_features).
+    assert fr.n_nonzero_coefs == 500
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-6
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), rtol=0, atol=1e-6)
+
+
+def test_lars_fit_intercept_true_false_match_sklearn():
+    """REQ-LARS: both `fit_intercept=True`/`False` reproduce the sklearn oracle;
+    with `fit_intercept=False` the intercept is exactly 0.0."""
+    X, y = _lars_dataset()
+    for fit_intercept in (True, False):
+        sk = SkLars(n_nonzero_coefs=4, fit_intercept=fit_intercept).fit(X, y)
+        fr = fl.Lars(n_nonzero_coefs=4, fit_intercept=fit_intercept).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6,
+            err_msg=f"coef_ diverges at fit_intercept={fit_intercept}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6
+        if not fit_intercept:
+            assert fr.intercept_ == 0.0
+
+
+def test_lars_precompute_accepted_no_result_change():
+    """REQ-LARS: `precompute='auto'`/`True`/`False`/`None` (`_least_angle.py:1035`)
+    is a Gram-matrix speed knob that does NOT change the LARS solution. ferrolearn
+    accepts every value, yielding the IDENTICAL fit as the `'auto'` default (and
+    matching the precompute-invariant sklearn oracle)."""
+    X, y = _lars_dataset()
+    sk = SkLars(n_nonzero_coefs=4).fit(X, y)
+    base = fl.Lars(n_nonzero_coefs=4, precompute='auto').fit(X, y)
+    for pc in ('auto', False, True, None):
+        fr = fl.Lars(n_nonzero_coefs=4, precompute=pc).fit(X, y)
+        np.testing.assert_array_equal(
+            np.asarray(fr.coef_), np.asarray(base.coef_),
+        )
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6,
+            err_msg=f"coef_ diverges at precompute={pc!r}",
+        )
+
+
+def test_lars_ctor_abi_keyword_only_like_sklearn():
+    """REQ-LARS (R-DEV-2): the constructor exposes exactly sklearn's nine
+    keyword-only params with sklearn's defaults/order
+    (`_least_angle.py:1047-1058`)."""
+    sig = inspect.signature(fl.Lars.__init__)
+    params = [p for p in sig.parameters if p != "self"]
+    sk_sig = inspect.signature(SkLars.__init__)
+    sk_params = [p for p in sk_sig.parameters if p != "self"]
+    assert params == sk_params
+    for name in params:
+        assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"{name} must be keyword-only (sklearn leading `*`)"
+        )
+        assert (
+            sig.parameters[name].kind == sk_sig.parameters[name].kind
+        ), f"{name} kind diverges from sklearn"
+    assert sig.parameters["n_nonzero_coefs"].default == 500
+    assert sig.parameters["fit_intercept"].default is True
+    assert sig.parameters["precompute"].default == "auto"
+    assert sig.parameters["jitter"].default is None
+
+
+def test_lars_get_params_clone_roundtrip_matches_sklearn_keys():
+    """REQ-LARS (R-DEV-2): `get_params`/`clone` round-trip the params, matching
+    the live sklearn oracle's `get_params` key set."""
+    from sklearn.base import clone
+
+    est = fl.Lars(n_nonzero_coefs=3, fit_intercept=False, precompute=False)
+    params = est.get_params()
+    assert params["n_nonzero_coefs"] == 3
+    assert params["fit_intercept"] is False
+    assert params["precompute"] is False
+    c = clone(est)
+    assert c.get_params() == params
+    sk_keys = set(SkLars().get_params().keys())
+    assert set(params.keys()) == sk_keys
+
+
+def test_lars_invalid_n_nonzero_coefs_rejected_like_sklearn():
+    """REQ-LARS (R-DEV-2): `n_nonzero_coefs < 1` is an invalid parameter; sklearn
+    raises a ValueError-subclass (`InvalidParameterError`) at fit, ferrolearn
+    raises `ValueError`."""
+    X, y = _lars_dataset()
+    # sklearn oracle: fitting with n_nonzero_coefs=0 raises a ValueError subclass.
+    with pytest.raises(ValueError):
+        SkLars(n_nonzero_coefs=0).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.Lars(n_nonzero_coefs=0).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.Lars(n_nonzero_coefs=-1).fit(X, y)
+
+
+def test_lars_bad_precompute_rejected_like_sklearn():
+    """REQ-LARS (R-DEV-2): an invalid `precompute` string is an invalid parameter
+    (ValueError-subclass in sklearn; ValueError in ferrolearn)."""
+    X, y = _lars_dataset()
+    with pytest.raises(ValueError):
+        SkLars(precompute="nonsense").fit(X, y)
+    with pytest.raises(ValueError):
+        fl.Lars(precompute="nonsense").fit(X, y)
+
+
+def test_lars_jitter_non_none_raises_notimplemented():
+    """REQ-LARS: a non-None `jitter` adds SEEDED gaussian noise to y
+    (`_least_angle.py:1170-1175`) which changes coef_; the Rust core cannot
+    reproduce numpy's RNG stream (R-SUBSTRATE-5), so ferrolearn raises an honest
+    `NotImplementedError` while sklearn fits successfully (#2174)."""
+    X, y = _lars_dataset()
+    # sklearn oracle: jitter fits fine (no exception).
+    SkLars(n_nonzero_coefs=3, jitter=0.1, random_state=0).fit(X, y)
+    with pytest.raises(NotImplementedError):
+        fl.Lars(n_nonzero_coefs=3, jitter=0.1, random_state=0).fit(X, y)
+
+
+def test_lasso_lars_coef_intercept_predict_match_sklearn_per_alpha():
+    """REQ-LASSOLARS: for several `alpha`, `coef_`/`intercept_`/`predict`
+    reproduce the live sklearn oracle to ~1e-6 (lars.rs REQ-2/3/4 SHIPPED)."""
+    X, y = _lars_dataset()
+    for a in (0.1, 0.5, 1.0, 2.0):
+        sk = SkLassoLars(alpha=a).fit(X, y)
+        fr = fl.LassoLars(alpha=a).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6,
+            err_msg=f"coef_ diverges at alpha={a}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6, (
+            f"intercept_ diverges at alpha={a}"
+        )
+        np.testing.assert_allclose(
+            fr.predict(X), sk.predict(X), rtol=0, atol=1e-6,
+            err_msg=f"predict diverges at alpha={a}",
+        )
+
+
+def test_lasso_lars_alpha_positional_first_like_sklearn():
+    """REQ-LASSOLARS (R-DEV-2): `alpha` is positional-or-keyword FIRST, the rest
+    keyword-only (`_least_angle.py:1363-1376`) — matching the live oracle."""
+    sig = inspect.signature(fl.LassoLars.__init__)
+    params = [p for p in sig.parameters if p != "self"]
+    sk_sig = inspect.signature(SkLassoLars.__init__)
+    sk_params = [p for p in sk_sig.parameters if p != "self"]
+    assert params == sk_params
+    for name in params:
+        assert (
+            sig.parameters[name].kind == sk_sig.parameters[name].kind
+        ), f"{name} kind diverges from sklearn"
+    assert (
+        sig.parameters["alpha"].kind == inspect.Parameter.POSITIONAL_OR_KEYWORD
+    )
+    assert sig.parameters["alpha"].default == 1.0
+    # alpha accepted positionally, like sklearn.
+    assert fl.LassoLars(0.3).alpha == 0.3
+    assert SkLassoLars(0.3).alpha == 0.3
+
+
+def test_lasso_lars_fit_intercept_true_false_match_sklearn():
+    """REQ-LASSOLARS: both `fit_intercept=True`/`False` reproduce the oracle."""
+    X, y = _lars_dataset()
+    for fit_intercept in (True, False):
+        sk = SkLassoLars(alpha=0.5, fit_intercept=fit_intercept).fit(X, y)
+        fr = fl.LassoLars(alpha=0.5, fit_intercept=fit_intercept).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-6,
+            err_msg=f"coef_ diverges at fit_intercept={fit_intercept}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-6
+        if not fit_intercept:
+            assert fr.intercept_ == 0.0
+
+
+def test_lasso_lars_get_params_clone_roundtrip_matches_sklearn_keys():
+    """REQ-LASSOLARS (R-DEV-2): `get_params`/`clone` round-trip, matching the
+    sklearn oracle's `get_params` key set."""
+    from sklearn.base import clone
+
+    est = fl.LassoLars(alpha=0.7, fit_intercept=False, max_iter=200)
+    params = est.get_params()
+    assert params["alpha"] == 0.7
+    assert params["fit_intercept"] is False
+    assert params["max_iter"] == 200
+    c = clone(est)
+    assert c.get_params() == params
+    sk_keys = set(SkLassoLars().get_params().keys())
+    assert set(params.keys()) == sk_keys
+
+
+def test_lasso_lars_negative_alpha_rejected_like_sklearn():
+    """REQ-LASSOLARS (R-DEV-2): negative `alpha` is an invalid parameter
+    (ValueError-subclass in sklearn; ValueError in ferrolearn)."""
+    X, y = _lars_dataset()
+    with pytest.raises(ValueError):
+        SkLassoLars(alpha=-1.0).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.LassoLars(alpha=-1.0).fit(X, y)
+
+
+def test_lasso_lars_positive_true_raises_notimplemented():
+    """REQ-LASSOLARS: `positive=True` (`_least_angle.py:1357`) constrains
+    coefficients to be non-negative — a different optimization the Rust core does
+    NOT implement, so ferrolearn raises an honest `NotImplementedError` while
+    sklearn fits successfully (NOT-STARTED #2174)."""
+    X, y = _lars_dataset()
+    # sklearn oracle: positive=True fits fine.
+    SkLassoLars(alpha=0.5, positive=True).fit(X, y)
+    with pytest.raises(NotImplementedError):
+        fl.LassoLars(alpha=0.5, positive=True).fit(X, y)
+
+
+def test_lasso_lars_jitter_non_none_raises_notimplemented():
+    """REQ-LASSOLARS: a non-None `jitter` raises `NotImplementedError`
+    (seeded gaussian noise, R-SUBSTRATE-5; #2174) while sklearn fits."""
+    X, y = _lars_dataset()
+    SkLassoLars(alpha=0.5, jitter=0.1, random_state=0).fit(X, y)
+    with pytest.raises(NotImplementedError):
+        fl.LassoLars(alpha=0.5, jitter=0.1, random_state=0).fit(X, y)
+
+
+def test_lars_score_and_n_features_in_match_sklearn():
+    """REQ-LARS/LASSOLARS: inherit `RegressorMixin.score` (R^2) and set
+    `n_features_in_`; the score equals the live sklearn oracle's score."""
+    X, y = _lars_dataset()
+    sk = SkLars(n_nonzero_coefs=5).fit(X, y)
+    fr = fl.Lars(n_nonzero_coefs=5).fit(X, y)
+    assert fr.n_features_in_ == X.shape[1] == sk.n_features_in_
+    assert abs(fr.score(X, y) - sk.score(X, y)) < 1e-6
+
+    skl = SkLassoLars(alpha=0.3).fit(X, y)
+    frl = fl.LassoLars(alpha=0.3).fit(X, y)
+    assert frl.n_features_in_ == X.shape[1] == skl.n_features_in_
+    assert abs(frl.score(X, y) - skl.score(X, y)) < 1e-6
+
+
+def test_lars_pickle_roundtrip_preserves_predictions():
+    """REQ-LARS/LASSOLARS: pickle round-trips (Rust fitted object not picklable ->
+    refit-on-unpickle via `_RegressorPickleMixin`); predictions are preserved."""
+    import pickle
+
+    X, y = _lars_dataset()
+    for fr in (fl.Lars(n_nonzero_coefs=4).fit(X, y),
+               fl.LassoLars(alpha=0.5).fit(X, y)):
+        pred_before = fr.predict(X)
+        fr2 = pickle.loads(pickle.dumps(fr))
+        np.testing.assert_allclose(
+            fr2.predict(X), pred_before, rtol=0, atol=1e-12)

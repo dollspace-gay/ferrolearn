@@ -888,6 +888,219 @@ impl RsOrthogonalMatchingPursuit {
     }
 }
 
+// Lars (#2174): hand-written pyclass (rather than a thin `py_regressor!`
+// invocation) so the binding surfaces sklearn's full keyword-only constructor
+// `(fit_intercept=True, verbose=False, precompute='auto', n_nonzero_coefs=500,
+// eps=np.finfo(float).eps, copy_X=True, fit_path=True, jitter=None,
+// random_state=None)` (`sklearn/linear_model/_least_angle.py:1047-1058`,
+// `_parameter_constraints` `:1032-1042`) AND the fitted `coef_` (shape
+// `(n_features,)`) / `intercept_` (scalar) getters (sklearn `coef_path[:, -1]`
+// reduced to `coef_`, `_least_angle.py:1125-1131`; `intercept_` via
+// `_set_intercept`). The equiangular-homotopy LARS MATH lives in
+// `ferrolearn_linear::Lars` (`with_n_nonzero_coefs`/`with_fit_intercept`,
+// `lars.rs`); this is the thin marshalling shim and the non-test production
+// consumer of that core API (R-DEFER-1). coef_/intercept_ match the live sklearn
+// oracle to ~1e-6 (`ferrolearn_linear` lars.rs REQ-1/3/4 SHIPPED).
+//
+// Of sklearn's 9 ctor params only `fit_intercept`/`n_nonzero_coefs` change the
+// supported result, so only those two are threaded into the Rust core. The other
+// seven are accepted (validated to sklearn's `_parameter_constraints` set in the
+// `_extras.py` wrapper) and ignored on the supported path:
+//   - `verbose`/`copy_X` — diagnostics / input-copy knobs: never affect coef_.
+//   - `precompute` ('auto'/True/False/ndarray/None) — a Gram-matrix speed knob;
+//     `_get_gram` (`_least_angle.py:1070-1079`) precomputes `X.T@X` but the LARS
+//     path is identical with or without it. The core never uses a Gram path, so
+//     every `precompute` yields the same fit.
+//   - `eps` — the Cholesky regularization floor (`_least_angle.py:1037`); only a
+//     numerical-stability guard, does not change the supported result.
+//   - `fit_path` — when False sklearn skips storing the full `coef_path_` but the
+//     final `coef_` is IDENTICAL (`_least_angle.py:1133-1151`); accepted.
+//   - `random_state` — only consumed BY `jitter` (seeds the gaussian noise,
+//     `_least_angle.py:1170-1175`); a no-op when `jitter is None`.
+// `jitter` (a non-None Real >= 0) ADDS scaled gaussian noise to `y` before the
+// fit (`_least_angle.py:1170-1175`), which DOES change coef_. The Rust core cannot
+// replicate numpy's seeded normal draws (R-SUBSTRATE-5), so a non-None `jitter`
+// raises `NotImplementedError` in the `_extras.py` wrapper (#2174-tracked); the
+// `None` default is the normal supported path. The wrapper holds all 9 params for
+// `get_params`/`clone` round-trip, so this Rust class need only store the two that
+// reach the core.
+#[pyclass(name = "_RsLars")]
+pub struct RsLars {
+    n_nonzero_coefs: usize,
+    fit_intercept: bool,
+    fitted: Option<ferrolearn_linear::FittedLars<f64>>,
+}
+
+#[pymethods]
+impl RsLars {
+    // sklearn's `n_nonzero_coefs=500` (`_least_angle.py:1053`) is an UPPER bound on
+    // the active set; the path stops at `min(n_nonzero_coefs, n_features)`
+    // (`_least_angle.py` lars_path `max_features`). The `_extras.py` wrapper clamps
+    // it to `min(n_nonzero_coefs, n_features)` before the ABI so the core (which
+    // errors when `n_nonzero_coefs > n_features`) sees a valid bound that yields
+    // the same support as sklearn's cap.
+    #[new]
+    #[pyo3(signature = (n_nonzero_coefs, fit_intercept=true))]
+    fn new(n_nonzero_coefs: usize, fit_intercept: bool) -> Self {
+        Self {
+            n_nonzero_coefs,
+            fit_intercept,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let model = ferrolearn_linear::Lars::<f64>::new()
+            .with_n_nonzero_coefs(self.n_nonzero_coefs)
+            .with_fit_intercept(self.fit_intercept);
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    // sklearn `coef_` (`_least_angle.py:1125` `self.coef_[k] = coef_path[:, -1]`):
+    // the `(n_features,)` parameter vector at the final LARS knot.
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+    }
+
+    // sklearn `intercept_` (`LinearModel._set_intercept`): the scalar independent
+    // term (0.0 when `fit_intercept=False`).
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.intercept())
+    }
+}
+
+// LassoLars (#2174): hand-written pyclass so the binding surfaces sklearn's full
+// constructor `(alpha=1.0, *, fit_intercept=True, verbose=False,
+// precompute='auto', max_iter=500, eps=np.finfo(float).eps, copy_X=True,
+// fit_path=True, positive=False, jitter=None, random_state=None)`
+// (`sklearn/linear_model/_least_angle.py:1363-1376`, `_parameter_constraints`
+// `:1353-1359`) — note `alpha` is positional-or-keyword FIRST, the rest
+// keyword-only — AND the fitted `coef_`/`intercept_` getters. The LARS-Lasso
+// homotopy MATH lives in `ferrolearn_linear::LassoLars`
+// (`with_alpha`/`with_max_iter`/`with_fit_intercept`, `lars.rs`); this is the
+// thin marshalling shim and the non-test production consumer of that core API
+// (R-DEFER-1). coef_/intercept_ match the live sklearn oracle to ~1e-6
+// (`ferrolearn_linear` lars.rs REQ-2/3/4 SHIPPED).
+//
+// `alpha`/`max_iter`/`fit_intercept` are threaded into the core. The accept-and-
+// ignore params are the same as `Lars` (`verbose`/`precompute`/`eps`/`copy_X`/
+// `fit_path`/`random_state`), validated in the `_extras.py` wrapper. `jitter` is
+// `NotImplementedError` for non-None (seeded gaussian noise, R-SUBSTRATE-5).
+// `positive` (`_least_angle.py:1357`/`:1374`) constrains all coefficients to be
+// non-negative — a DIFFERENT optimization the Rust core does NOT implement
+// (`lars.rs` has no `positive` builder), so `positive=True` raises
+// `NotImplementedError` in the wrapper (NOT-STARTED #2174); `positive=False`
+// (default) is the normal supported path.
+#[pyclass(name = "_RsLassoLars")]
+pub struct RsLassoLars {
+    alpha: f64,
+    max_iter: usize,
+    fit_intercept: bool,
+    fitted: Option<ferrolearn_linear::FittedLassoLars<f64>>,
+}
+
+#[pymethods]
+impl RsLassoLars {
+    #[new]
+    #[pyo3(signature = (alpha=1.0, max_iter=500, fit_intercept=true))]
+    fn new(alpha: f64, max_iter: usize, fit_intercept: bool) -> Self {
+        Self {
+            alpha,
+            max_iter,
+            fit_intercept,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let model = ferrolearn_linear::LassoLars::<f64>::new()
+            .with_alpha(self.alpha)
+            .with_max_iter(self.max_iter)
+            .with_fit_intercept(self.fit_intercept);
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    // sklearn `coef_` (`_least_angle.py:1125`): the `(n_features,)` Lasso-LARS
+    // parameter vector interpolated at `alpha`.
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+    }
+
+    // sklearn `intercept_` (`LinearModel._set_intercept`): the scalar independent
+    // term (0.0 when `fit_intercept=False`).
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.intercept())
+    }
+}
+
 // ===========================================================================
 // Tree regressors
 // ===========================================================================

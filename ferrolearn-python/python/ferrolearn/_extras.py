@@ -39,6 +39,8 @@ from ferrolearn._ferrolearn_rs import (
     _RsKNeighborsRegressor,
     _RsKernelPCA,
     _RsKernelRidge,
+    _RsLars,
+    _RsLassoLars,
     _RsLinearSVC,
     _RsMaxAbsScaler,
     _RsMinMaxScaler,
@@ -332,6 +334,294 @@ class OrthogonalMatchingPursuit(_RegressorPickleMixin, RegressorMixin,
 
     def predict(self, X):
         return np.asarray(self._rs.predict(_f64(X)))
+
+
+class Lars(_RegressorPickleMixin, RegressorMixin, BaseEstimator):
+    """Least Angle Regression backed by Rust (#2174).
+
+    Mirrors ``sklearn.linear_model.Lars``
+    (``sklearn/linear_model/_least_angle.py:922-1068``), surfacing the full
+    keyword-only constructor ``(fit_intercept=True, verbose=False,
+    precompute='auto', n_nonzero_coefs=500, eps=np.finfo(float).eps,
+    copy_X=True, fit_path=True, jitter=None, random_state=None)`` (sklearn
+    defaults/order, ``_least_angle.py:1047-1058``), the ``fit(X, y)``/
+    ``predict(X)`` contract, and the fitted ``coef_`` (shape ``(n_features,)``)/
+    ``intercept_``/``n_features_in_`` attributes from the Rust fitted type
+    (``_least_angle.py:1125``).
+
+    Of the 9 parameters only ``fit_intercept`` and ``n_nonzero_coefs`` change the
+    supported result; they are threaded into the Rust core. The other seven are
+    validated to sklearn's ``_parameter_constraints``
+    (``_least_angle.py:1032-1042``) and accepted-and-ignored on the supported
+    path:
+
+    - ``verbose`` (bool / int), ``copy_X`` (bool) — diagnostics / input-copy
+      knobs; never change ``coef_``.
+    - ``precompute`` (``'auto'``/``True``/``False``/ndarray/``None``,
+      ``_least_angle.py:1035``) — a Gram-matrix speed knob (``_get_gram``,
+      ``_least_angle.py:1070-1079``); the LARS path is identical with or without
+      it, so every value yields the same fit.
+    - ``eps`` (Real >= 0, ``_least_angle.py:1037``) — Cholesky regularization
+      floor; numerical-stability only.
+    - ``fit_path`` (bool) — when ``False`` sklearn skips storing the full
+      ``coef_path_`` but the final ``coef_`` is IDENTICAL
+      (``_least_angle.py:1133-1151``).
+    - ``random_state`` — consumed only by ``jitter`` (seeds the gaussian noise);
+      a no-op when ``jitter is None``.
+
+    ``jitter`` (a non-None Real >= 0) adds scaled SEEDED gaussian noise to ``y``
+    before the fit (``_least_angle.py:1170-1175``), which DOES change ``coef_``.
+    The Rust core cannot reproduce numpy's seeded normal draws (R-SUBSTRATE-5), so
+    a non-None ``jitter`` raises ``NotImplementedError`` (#2174-tracked); the
+    ``None`` default is the supported path. ``n_nonzero_coefs`` is an upper bound
+    on the active set; sklearn caps it at ``n_features`` (``_least_angle.py``
+    lars_path ``max_features``), so the wrapper passes
+    ``min(n_nonzero_coefs, n_features)`` to the core (which errors when the bound
+    exceeds ``n_features``) — yielding the same support as sklearn's cap.
+
+    Pickle: the Rust fitted object is not directly picklable, so the training
+    data is stored on fit and ``_rs`` is rebuilt by re-fitting on unpickle
+    (``_RegressorPickleMixin``).
+    """
+
+    def __init__(self, *, fit_intercept=True, verbose=False, precompute='auto',
+                 n_nonzero_coefs=500, eps=np.finfo(float).eps, copy_X=True,
+                 fit_path=True, jitter=None, random_state=None):
+        self.fit_intercept = fit_intercept
+        self.verbose = verbose
+        self.precompute = precompute
+        self.n_nonzero_coefs = n_nonzero_coefs
+        self.eps = eps
+        self.copy_X = copy_X
+        self.fit_path = fit_path
+        self.jitter = jitter
+        self.random_state = random_state
+
+    def _validate(self, n_features):
+        # sklearn's `_validate_params` runs at fit and raises
+        # `InvalidParameterError` (a `ValueError` subclass) for out-of-range
+        # inputs. Mirror sklearn's `Lars._parameter_constraints`
+        # (`_least_angle.py:1032-1042`), Python-side, before the usize/bool ABI
+        # boundary (where 0/negatives would mis-fit or overflow). bool is
+        # Integral; n_nonzero_coefs forbids bool (matching sklearn's
+        # `Interval(Integral, 1, None)` which rejects bools via its own check).
+        if (not isinstance(self.n_nonzero_coefs, (int, np.integer))
+                or isinstance(self.n_nonzero_coefs, bool)
+                or self.n_nonzero_coefs < 1):
+            raise ValueError(
+                f"n_nonzero_coefs == {self.n_nonzero_coefs}, must be >= 1 "
+                "(an int in [1, inf))."
+            )
+        # eps: Interval(Real, 0, None, closed='left') (`_least_angle.py:1037`).
+        if (not isinstance(self.eps, (int, float, np.floating, np.integer))
+                or isinstance(self.eps, bool)
+                or self.eps < 0):
+            raise ValueError(
+                f"eps == {self.eps}, must be >= 0 (a real in [0, inf))."
+            )
+        # copy_X: ['boolean'] (`_least_angle.py:1039`). An input-copy speed knob
+        # that never changes coef_ (accept-and-ignore for valid bools); sklearn's
+        # boolean validator accepts bool/np.bool_ and rejects ints/strings, so a
+        # non-bool copy_X is an InvalidParameterError (a ValueError subclass) (#2177).
+        if not isinstance(self.copy_X, (bool, np.bool_)):
+            raise ValueError(
+                f"copy_X == {self.copy_X!r}, must be a boolean."
+            )
+        # precompute: [boolean, StrOptions({'auto'}), np.ndarray, None]
+        # (`_least_angle.py:1035`). A Gram-matrix speed knob (no result change);
+        # the VALID values are accepted-and-ignored, only INVALID ones rejected.
+        if not (self.precompute == "auto"
+                or isinstance(self.precompute, (bool, np.bool_, np.ndarray))
+                or self.precompute is None):
+            raise ValueError(
+                f"precompute == {self.precompute!r}, must be 'auto', a boolean, "
+                "an array, or None."
+            )
+        # jitter: [Interval(Real, 0, None, closed='left'), None]
+        # (`_least_angle.py:1040`). A non-None jitter adds SEEDED gaussian noise
+        # to y (changes coef_) the Rust core cannot reproduce (R-SUBSTRATE-5).
+        if self.jitter is not None:
+            if (not isinstance(self.jitter, (int, float, np.floating, np.integer))
+                    or isinstance(self.jitter, bool)
+                    or self.jitter < 0):
+                raise ValueError(
+                    f"jitter == {self.jitter}, must be >= 0 (a real in [0, inf)) "
+                    "or None."
+                )
+            raise NotImplementedError(
+                "jitter != None not supported (adds seeded gaussian noise to y; "
+                "needs numpy's RNG stream — NOT-STARTED #2174)."
+            )
+
+    def _make_rs(self, n_features):
+        self._validate(n_features)
+        # n_nonzero_coefs is an upper bound; sklearn caps it at n_features. The
+        # Rust core errors when the bound exceeds n_features, so clamp here.
+        n_nonzero = min(self.n_nonzero_coefs, n_features)
+        return _RsLars(n_nonzero_coefs=n_nonzero,
+                       fit_intercept=self.fit_intercept)
+
+    def fit(self, X, y):
+        X = _f64(X)
+        y = _f64(y)
+        self._rs = self._make_rs(X.shape[1])
+        self._rs.fit(X, y)
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/linear_model/_least_angle.py:1125).
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self._store_training_data(X, y)
+        return self
+
+    def _rebuild_rs(self):
+        self._rs = self._make_rs(self._fit_X.shape[1])
+        self._rs.fit(self._fit_X, self._fit_y)
+
+    def predict(self, X):
+        check_is_fitted(self)
+        X = _f64(X)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.predict(X))
+
+
+class LassoLars(_RegressorPickleMixin, RegressorMixin, BaseEstimator):
+    """Lasso model fit with Least Angle Regression backed by Rust (#2174).
+
+    Mirrors ``sklearn.linear_model.LassoLars``
+    (``sklearn/linear_model/_least_angle.py:1212-1388``), surfacing the full
+    constructor ``(alpha=1.0, *, fit_intercept=True, verbose=False,
+    precompute='auto', max_iter=500, eps=np.finfo(float).eps, copy_X=True,
+    fit_path=True, positive=False, jitter=None, random_state=None)`` — note
+    ``alpha`` is positional-or-keyword FIRST, the rest keyword-only
+    (``_least_angle.py:1363-1376``) — the ``fit(X, y)``/``predict(X)`` contract,
+    and the fitted ``coef_``/``intercept_``/``n_features_in_`` attributes from the
+    Rust fitted type.
+
+    ``alpha``, ``max_iter`` and ``fit_intercept`` are threaded into the Rust core.
+    The accept-and-ignore params are the same as ``Lars``
+    (``verbose``/``precompute``/``eps``/``copy_X``/``fit_path``/``random_state``),
+    validated to sklearn's ``_parameter_constraints``
+    (``_least_angle.py:1353-1359``). ``jitter != None`` raises
+    ``NotImplementedError`` (seeded gaussian noise, R-SUBSTRATE-5; #2174).
+
+    ``positive=True`` (``_least_angle.py:1357``) constrains all coefficients to be
+    non-negative — a different optimization the Rust core does NOT implement
+    (``lars.rs`` has no ``positive`` builder), so it raises ``NotImplementedError``
+    (NOT-STARTED #2174); ``positive=False`` (default) is the supported path.
+
+    Pickle: the Rust fitted object is not directly picklable, so the training
+    data is stored on fit and ``_rs`` is rebuilt by re-fitting on unpickle
+    (``_RegressorPickleMixin``).
+    """
+
+    def __init__(self, alpha=1.0, *, fit_intercept=True, verbose=False,
+                 precompute='auto', max_iter=500, eps=np.finfo(float).eps,
+                 copy_X=True, fit_path=True, positive=False, jitter=None,
+                 random_state=None):
+        self.alpha = alpha
+        self.fit_intercept = fit_intercept
+        self.verbose = verbose
+        self.precompute = precompute
+        self.max_iter = max_iter
+        self.eps = eps
+        self.copy_X = copy_X
+        self.fit_path = fit_path
+        self.positive = positive
+        self.jitter = jitter
+        self.random_state = random_state
+
+    def _validate(self):
+        # Mirror sklearn's `LassoLars._parameter_constraints`
+        # (`_least_angle.py:1353-1359`: alpha Interval(Real, 0, None),
+        # max_iter Interval(Integral, 0, None), positive boolean; inherits
+        # Lars's eps/precompute/jitter), Python-side, before the f64/usize/bool
+        # ABI boundary.
+        if (not isinstance(self.alpha, (int, float, np.floating, np.integer))
+                or isinstance(self.alpha, bool)
+                or self.alpha < 0):
+            raise ValueError(
+                f"alpha == {self.alpha}, must be >= 0 (a real in [0, inf))."
+            )
+        # max_iter: Interval(Integral, 0, None, closed='left')
+        # (`_least_angle.py:1356`) -> a non-negative int (bool forbidden).
+        if (not isinstance(self.max_iter, (int, np.integer))
+                or isinstance(self.max_iter, bool)
+                or self.max_iter < 0):
+            raise ValueError(
+                f"max_iter == {self.max_iter}, must be >= 0 (an int in [0, inf))."
+            )
+        if (not isinstance(self.eps, (int, float, np.floating, np.integer))
+                or isinstance(self.eps, bool)
+                or self.eps < 0):
+            raise ValueError(
+                f"eps == {self.eps}, must be >= 0 (a real in [0, inf))."
+            )
+        # copy_X: ['boolean'] (`_least_angle.py:1039`, inherited by LassoLars).
+        # An input-copy speed knob that never changes coef_; a non-bool copy_X is
+        # an InvalidParameterError (a ValueError subclass) in sklearn (#2177).
+        if not isinstance(self.copy_X, (bool, np.bool_)):
+            raise ValueError(
+                f"copy_X == {self.copy_X!r}, must be a boolean."
+            )
+        if not (self.precompute == "auto"
+                or isinstance(self.precompute, (bool, np.bool_, np.ndarray))
+                or self.precompute is None):
+            raise ValueError(
+                f"precompute == {self.precompute!r}, must be 'auto', a boolean, "
+                "an array, or None."
+            )
+        # positive: boolean (`_least_angle.py:1357`). True is a DIFFERENT
+        # optimization (non-negative coefficients) the Rust core does not
+        # implement (NOT-STARTED #2174).
+        if not isinstance(self.positive, (bool, np.bool_)):
+            raise ValueError(
+                f"positive == {self.positive!r}, must be a boolean."
+            )
+        if self.positive:
+            raise NotImplementedError(
+                "positive=True not supported (non-negative coefficient "
+                "constraint; the Rust LassoLars core has no `positive` path — "
+                "NOT-STARTED #2174)."
+            )
+        if self.jitter is not None:
+            if (not isinstance(self.jitter, (int, float, np.floating, np.integer))
+                    or isinstance(self.jitter, bool)
+                    or self.jitter < 0):
+                raise ValueError(
+                    f"jitter == {self.jitter}, must be >= 0 (a real in [0, inf)) "
+                    "or None."
+                )
+            raise NotImplementedError(
+                "jitter != None not supported (adds seeded gaussian noise to y; "
+                "needs numpy's RNG stream — NOT-STARTED #2174)."
+            )
+
+    def _make_rs(self):
+        self._validate()
+        return _RsLassoLars(alpha=float(self.alpha), max_iter=self.max_iter,
+                            fit_intercept=self.fit_intercept)
+
+    def fit(self, X, y):
+        X = _f64(X)
+        y = _f64(y)
+        self._rs = self._make_rs()
+        self._rs.fit(X, y)
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/linear_model/_least_angle.py:1125).
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self._store_training_data(X, y)
+        return self
+
+    def predict(self, X):
+        check_is_fitted(self)
+        X = _f64(X)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.predict(X))
 
 
 class HuberRegressor(_RegressorWrapper):
