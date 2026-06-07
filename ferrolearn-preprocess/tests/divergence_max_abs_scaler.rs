@@ -436,7 +436,6 @@ fn req9_copy_is_no_op_on_values() {
 ///
 /// Tracking: #2203
 #[test]
-#[ignore = "divergence: MaxAbsScaler scale_ only replaces exact-zero, not <10*eps near-constant per sklearn _handle_zeros_in_scale; tracking #2203"]
 fn divergence_handle_zeros_near_constant_threshold() {
     // sklearn oracle constants (_data.py:114,119 — constant_mask = scale < 10*eps).
     let sk_scale0 = 1.0_f64;

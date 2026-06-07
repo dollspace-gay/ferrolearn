@@ -22,11 +22,11 @@
 //! | REQ-2 (zero-max_abs column → identity, MATCHES sklearn) | SHIPPED | A zero-max_abs column is all-zero; sklearn `scale_=_handle_zeros_in_scale(0)=1` → `x/1=x` = ferrolearn's leave-unchanged for ANY input. Critic-verified MATCH (discriminating: `fit([[0],[0]]).transform([[5]])==[[5.0]]` in both). NOT a divergence (contrast Min/StandardScaler). |
 //! | REQ-3 (inverse_transform round-trip) | SHIPPED | `inverse_transform` = `x*max_abs` (zero-max_abs left unchanged), mirroring sklearn `X *= scale_` (`_data.py:1337`); `inverse_transform(transform(X))==X` (green guard). Consumer: re-export boundary (S5). |
 //! | REQ-4 (PyO3 binding) | SHIPPED | `_RsMaxAbsScaler` (`extras.rs:1156`, registered `lib.rs:82`) marshals `fit`/`transform` over `FittedMaxAbsScaler<f64>` — a real CPython consumer; maturin smoke. |
-//! | REQ-5 (NaN tolerance: allow-nan) | NOT-STARTED | open prereq blocker #1202. Fold NaN-ignoring incidental; no `force_all_finite=allow-nan` contract (`_data.py:1256`,`:1263`). Must ALLOW NaN. |
+//! | REQ-5 (NaN tolerance: allow-nan) | SHIPPED | FIXED #1202. `Fit::fit`'s per-column `max(\|x\|)` reduction now SKIPS NaN via an `Option<F>` accumulator (`continue` on `is_nan()`), mirroring sklearn `max_abs = _nanmax(abs(X), axis=0)` under `force_all_finite='allow-nan'` (`_data.py:1263`,`:1256`): a column with at least one finite value gets the finite max-abs; an ALL-NaN column gets `max_abs = F::nan()` (NaN passes `_handle_zeros_in_scale` since NaN != 0 → `scale_` NaN → transform/inverse NaN; no panic, no zero-substitution). `transform`/`inverse_transform` now divide/multiply by `scale_` (so a NaN-column maps to NaN, a zero-column to identity); NaN inputs pass through (`nan/scale = nan`, `nan*scale = nan`). inf-rejection (allow-nan REJECTS ±inf, MinMaxScaler #2200 precedent): `fit`/`transform`/`inverse_transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Live-oracle tests `req5_nan_fit_single_column_ignored`, `req5_nan_fit_multi_column_scattered`, `req5_all_nan_column_yields_nan_no_panic`, `req5_nan_passthrough_inverse_transform`, `inf_rejected_fit`/`inf_rejected_transform`/`inf_rejected_inverse_transform`, `nan_only_still_fits` in `tests/divergence_max_abs_scaler.rs`. Consumers: PyO3 `_RsMaxAbsScaler` + `FittedPipelineTransformer` + re-export. |
 //! | REQ-6 (scale_/n_samples_seen_ attrs) | SHIPPED | `FittedMaxAbsScaler<F>` stores `scale_ = max_abs.mapv(\|m\| if m==0 {1} else {m})` (mirroring sklearn `scale_ = _handle_zeros_in_scale(max_abs_)` `_data.py:1272`,`:88` — `1.0` on all-zero columns) and `n_samples_seen_ = n_samples` (`:1266`), set in `Fit::fit`. Getters `scale()`/`n_samples_seen()` (`#[must_use]`). Oracle (`MaxAbsScaler().fit([[1,0],[-3,0],[2,0]])` → `max_abs_=[3,0]`, `scale_=[3,1]`, `n_samples_seen_=3`): tests `max_abs_scale_nsamples_match_sklearn`, `max_abs_scale_differs_from_max_abs_on_zero_col`. `transform`/`inverse_transform` unchanged (still divide/multiply by `max_abs`; identical to dividing by `scale_` since they coincide off the all-zero columns). |
 //! | REQ-7 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1204. Single-shot (`_data.py:1232-1273`). |
 //! | REQ-8 (maxabs_scale free fn + axis) | NOT-STARTED | open prereq blocker #1205. No `maxabs_scale` / axis=1 (`_data.py:1351`). |
-//! | REQ-9 (copy param + _parameter_constraints) | NOT-STARTED | open prereq blocker #1206. No `copy` (`_data.py:1188`,`:1190`). |
+//! | REQ-9 (copy param + _parameter_constraints) | SHIPPED | FIXED #1206. `MaxAbsScaler<F>` gains a `copy: bool` field (default `true`) + `#[must_use] with_copy(self, bool) -> Self` builder + `copy()` getter, mirroring sklearn `__init__(*, copy=True)` (`_data.py:1190`) under `_parameter_constraints {copy:["boolean"]}` (`:1188`). ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] always returns a freshly allocated array (`to_owned()`), so `copy` has no observable effect (documented; behavior unchanged) — the direct analog of MinMaxScaler REQ-10's `copy` no-op. Live-oracle test `req9_copy_is_no_op_on_values`. Consumers: PyO3 `_RsMaxAbsScaler` + re-export. |
 //! | REQ-10 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1207. Dense-only; MaxAbsScaler is sklearn's flagship sparse-safe scaler (`_data.py:1260-1261`,`:1303`). |
 //! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1208. None (OneToOneFeatureMixin). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1209. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
@@ -64,6 +64,12 @@ use num_traits::Float;
 /// ```
 #[derive(Debug, Clone)]
 pub struct MaxAbsScaler<F> {
+    /// sklearn's `copy` constructor parameter (`_data.py:1190`,
+    /// `_parameter_constraints {copy:["boolean"]}` `:1188`). ACCEPT-AND-DOCUMENT
+    /// no-op: ferrolearn's [`Transform`] always returns a freshly allocated
+    /// array, so `copy` has no observable effect here. Retained for API parity.
+    /// Defaults to `true`.
+    pub(crate) copy: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -72,8 +78,28 @@ impl<F: Float + Send + Sync + 'static> MaxAbsScaler<F> {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            copy: true,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set sklearn's `copy` constructor parameter (`_data.py:1190`).
+    ///
+    /// ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] contract always
+    /// returns a freshly allocated array, so `copy` has no observable effect.
+    /// The flag is retained only for API parity with scikit-learn
+    /// (`_parameter_constraints {copy:["boolean"]}`, `_data.py:1188`); toggling
+    /// it does not change behavior.
+    #[must_use]
+    pub fn with_copy(mut self, copy: bool) -> Self {
+        self.copy = copy;
+        self
+    }
+
+    /// Return the `copy` flag (accept-and-document no-op; see [`Self::with_copy`]).
+    #[must_use]
+    pub fn copy(&self) -> bool {
+        self.copy
     }
 }
 
@@ -129,12 +155,20 @@ impl<F: Float + Send + Sync + 'static> FittedMaxAbsScaler<F> {
 
     /// Inverse-transform scaled data back to the original space.
     ///
-    /// Applies `x_orig = x_scaled * max_abs` per column.
+    /// Applies `x_orig = x_scaled * scale_` per column, mirroring sklearn
+    /// `X *= self.scale_` (`_data.py:1337`) with
+    /// `scale_ = _handle_zeros_in_scale(max_abs_)` (`:1272`,`:88`): a
+    /// zero-`max_abs` (all-zero) column has `scale_ = 1` (`x * 1 = x`), an
+    /// all-NaN fitted column has `scale_ = NaN` (`x * NaN = NaN`). NaN inputs
+    /// pass through (`nan * scale = nan`), matching sklearn's `allow-nan`
+    /// contract (`_data.py:1331`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
-    /// match the number of features seen during fitting.
+    /// match the number of features seen during fitting, or
+    /// [`FerroError::InvalidParameter`] if any input element is +/-inf
+    /// (sklearn `force_all_finite="allow-nan"` rejects infinity).
     pub fn inverse_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.max_abs.len();
         if x.ncols() != n_features {
@@ -144,14 +178,23 @@ impl<F: Float + Send + Sync + 'static> FittedMaxAbsScaler<F> {
                 context: "FittedMaxAbsScaler::inverse_transform".into(),
             });
         }
+        // sklearn `inverse_transform` validates with
+        // `force_all_finite="allow-nan"` (`_data.py:1331`): NaN passes through,
+        // +/-inf raises ValueError.
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let ma = self.max_abs[j];
-            if ma == F::zero() {
-                continue;
-            }
+            // Multiply by `scale_` (= `_handle_zeros_in_scale`): zero-`max_abs`
+            // column has `scale_ = 1` (`x * 1 = x`), all-NaN column has
+            // `scale_ = NaN` (`x * NaN = NaN`), otherwise `scale_ = max_abs`.
+            let scale = self.scale_[j];
             for v in &mut col {
-                *v = *v * ma;
+                *v = *v * scale;
             }
         }
         Ok(out)
@@ -180,23 +223,52 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MaxAbsScaler<F> {
                 context: "MaxAbsScaler::fit".into(),
             });
         }
+        // sklearn validates X with `force_all_finite="allow-nan"`
+        // (`_data.py:1256`): NaN is permitted, but +/-inf raises ValueError
+        // ("Input X contains infinity or a value too large for dtype('...')").
+        // Mirrors the MinMaxScaler #2200 precedent (allow-nan rejects inf).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut max_abs = Array1::zeros(n_features);
 
         for j in 0..n_features {
-            let col_max_abs = x
-                .column(j)
-                .iter()
-                .copied()
-                .map(num_traits::Float::abs)
-                .fold(F::zero(), |acc, v| if v > acc { v } else { acc });
-            max_abs[j] = col_max_abs;
+            // NaN-ignoring per-column max(|x|), mirroring sklearn's
+            // `max_abs = _nanmax(abs(X), axis=0)` under
+            // `force_all_finite="allow-nan"` (`_data.py:1263`,`:1256`). NaN values
+            // are skipped (Option accumulator). If a column is ALL NaN (every
+            // entry skipped) the accumulator stays `None` and we emit NaN —
+            // matching `_nanmax` returning nan on an all-NaN slice (that column's
+            // scale_/transform become NaN via `_handle_zeros_in_scale`, which
+            // leaves NaN unchanged since NaN != 0; no panic, no zero substitution).
+            let mut acc: Option<F> = None;
+            for v in x.column(j).iter().copied() {
+                if v.is_nan() {
+                    continue;
+                }
+                let a = v.abs();
+                acc = Some(match acc {
+                    Some(m) if m >= a => m,
+                    _ => a,
+                });
+            }
+            max_abs[j] = acc.unwrap_or_else(F::nan);
         }
 
-        // sklearn: scale_ = _handle_zeros_in_scale(max_abs_) (`_data.py:1272`,`:88`):
-        // a max_abs of 0 (all-zero column) becomes 1.0 so dividing leaves it unchanged.
-        let scale_ = max_abs.mapv(|m| if m == F::zero() { F::one() } else { m });
+        // sklearn: scale_ = _handle_zeros_in_scale(max_abs_) (`_data.py:1272`,
+        // `:114-119`): `constant_mask = scale < 10 * finfo(dtype).eps;
+        // scale[constant_mask] = 1.0`. A max_abs BELOW the near-constant
+        // threshold (NOT just exactly 0) becomes 1.0 so dividing leaves the
+        // column unchanged (#2203). A NaN max_abs (all-NaN column) is NOT
+        // `< threshold` (NaN compares false), so it passes through -> scale_ =
+        // NaN -> transform/inverse yield NaN (matching sklearn).
+        let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
+        let scale_ = max_abs.mapv(|m| if m < ten_eps { F::one() } else { m });
         // sklearn: n_samples_seen_ = X.shape[0] (`_data.py:1266`).
         let n_samples_seen_ = n_samples;
 
@@ -214,12 +286,19 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMaxAbsScal
 
     /// Transform data by dividing each feature by its maximum absolute value.
     ///
-    /// Columns where `max_abs = 0` are left unchanged.
+    /// Mirrors sklearn `X /= self.scale_` (`_data.py:1305`) with
+    /// `scale_ = _handle_zeros_in_scale(max_abs_)` (`:1272`,`:88`): a
+    /// zero-`max_abs` (all-zero) column has `scale_ = 1`, so `x / 1 = x` leaves
+    /// it unchanged; an all-NaN fitted column has `scale_ = NaN`, so `x / NaN =
+    /// NaN`. NaN inputs pass through (`nan / scale = nan`), matching sklearn's
+    /// `allow-nan` contract (`_data.py:1256`,`:1299`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
-    /// match the number of features seen during fitting.
+    /// match the number of features seen during fitting, or
+    /// [`FerroError::InvalidParameter`] if any input element is +/-inf
+    /// (sklearn `force_all_finite="allow-nan"` rejects infinity).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.max_abs.len();
         if x.ncols() != n_features {
@@ -229,16 +308,24 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMaxAbsScal
                 context: "FittedMaxAbsScaler::transform".into(),
             });
         }
+        // sklearn `transform` validates with `force_all_finite="allow-nan"`
+        // (`_data.py:1299`): NaN passes through, +/-inf raises ValueError.
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let ma = self.max_abs[j];
-            if ma == F::zero() {
-                // All-zero column: leave unchanged.
-                continue;
-            }
+            // Divide by the precomputed `scale_` (= `_handle_zeros_in_scale`):
+            // a zero-`max_abs` column has `scale_ = 1` (`x / 1 = x`), an all-NaN
+            // column has `scale_ = NaN` (`x / NaN = NaN`), otherwise `scale_ =
+            // max_abs`. NaN inputs pass through (`nan / scale = nan`).
+            let scale = self.scale_[j];
             for v in &mut col {
-                *v = *v / ma;
+                *v = *v / scale;
             }
         }
         Ok(out)
