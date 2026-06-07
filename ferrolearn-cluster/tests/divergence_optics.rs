@@ -58,6 +58,28 @@ fn small10() -> Array2<f64> {
     .unwrap()
 }
 
+/// A 44-point 3-blobs fixture (`np.random.seed(0)`): 20 points around `(0,0)`,
+/// 20 around `(8,8)`, and a SMALL 4-point blob around `(4,0)`, each
+/// `randn*scale + center`, rounded to 3 decimals. The 4-point blob is the
+/// REQ-7 lever: it survives at the default `min_cluster_size` but is filtered at
+/// `min_cluster_size=10`.
+fn blobs44() -> Array2<f64> {
+    Array2::from_shape_vec(
+        (44, 2),
+        vec![
+            0.529, 0.120, 0.294, 0.672, 0.560, -0.293, 0.285, -0.045, -0.031, 0.123, 0.043, 0.436,
+            0.228, 0.037, 0.133, 0.100, 0.448, -0.062, 0.094, -0.256, -0.766, 0.196, 0.259, -0.223,
+            0.681, -0.436, 0.014, -0.056, 0.460, 0.441, 0.046, 0.113, -0.266, -0.594, -0.104,
+            0.047, 0.369, 0.361, -0.116, -0.091, 7.685, 7.574, 7.488, 8.585, 7.847, 7.869, 7.624,
+            8.233, 7.516, 7.936, 7.731, 8.116, 7.847, 7.646, 7.992, 8.128, 8.020, 8.091, 7.810,
+            7.891, 7.798, 7.892, 7.756, 7.482, 8.053, 7.879, 7.511, 8.139, 7.728, 8.016, 8.219,
+            8.039, 8.342, 7.630, 8.121, 7.795, 7.739, 7.826, 7.907, 8.017, 3.767, 0.180, 4.093,
+            -0.307, 4.298, 0.379, 4.236, -0.036,
+        ],
+    )
+    .unwrap()
+}
+
 const TOL: f64 = 1e-6;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -949,5 +971,290 @@ fn green_nan_params_rejected() {
             .fit(&x, &())
             .is_err(),
         "xi=NaN must be rejected (sklearn InvalidParameterError)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REQ-5 / REQ-7 / REQ-8 — Xi-method `labels_` + `cluster_hierarchy_` VALUE parity
+// vs the live sklearn 1.5.2 oracle (`OPTICS(cluster_method='xi').fit(X)`).
+//
+// `labels_` derives from `cluster_optics_xi` → `_xi_cluster` → `_extract_xi_labels`
+// (`sklearn/cluster/_optics.py:810-1201`); `cluster_hierarchy_` is the
+// `(n_clusters, 2)` `[start, end]` interval array `_xi_cluster` returns
+// (`:859-865`, `:1166-1172`), set on the Xi branch of `fit` (`:373`). REQ-7 is the
+// criterion-3.a `min_cluster_size` check INSIDE the steep-up loop (`:1154-1156`),
+// NOT a post-filter. All expected values are from the LIVE sklearn 1.5.2 oracle
+// (run from /tmp), NEVER copied from ferrolearn (R-CHAR-3). f64 fixtures only
+// (the OPTICS graph diverges on f32, #2195 — out of scope here).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Helper: assert a `FittedOPTICS::cluster_hierarchy` equals a slice of
+/// `[start, end]` rows, exactly (integer comparison).
+fn assert_hierarchy(h: &ndarray::Array2<i64>, expected: &[[i64; 2]]) {
+    assert_eq!(
+        h.nrows(),
+        expected.len(),
+        "cluster_hierarchy_ row count: ferro={} sklearn={}; ferro rows={:?}",
+        h.nrows(),
+        expected.len(),
+        h.outer_iter().map(|r| [r[0], r[1]]).collect::<Vec<_>>()
+    );
+    assert_eq!(h.ncols(), 2, "cluster_hierarchy_ must be (n_clusters, 2)");
+    for (i, exp) in expected.iter().enumerate() {
+        assert_eq!(
+            [h[[i, 0]], h[[i, 1]]],
+            *exp,
+            "cluster_hierarchy_[{i}]: ferro=[{},{}] sklearn={exp:?}",
+            h[[i, 0]],
+            h[[i, 1]]
+        );
+    }
+}
+
+/// REQ-5/REQ-8. The `cluster_optics_xi` doctest fixture
+/// (`sklearn/cluster/_optics.py:869-896`): `labels == [0,0,0,1,1,1]` and
+/// `clusters == [[0,2],[3,5],[0,5]]` (the docstring's own asserted output).
+///
+/// Note `len(cluster_hierarchy_) == 3 > 2 == n_unique_labels` — the hierarchy
+/// keeps the encompassing `[0,5]` cluster while `labels_` only labels the two
+/// leaves.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp) == the `_optics.py:891-896` doctest:
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[1,2],[2,5],[3,6],[8,7],[8,8],[7,3]]); \
+///     m=OPTICS(min_samples=2,cluster_method='xi').fit(X); \
+///     print(m.labels_.tolist()); print(m.cluster_hierarchy_.tolist())"
+///   -> labels_:           [0, 0, 0, 1, 1, 1]
+///      cluster_hierarchy_: [[0, 2], [3, 5], [0, 5]]
+#[test]
+fn green_xi_labels_hierarchy_doctest() {
+    let sk_labels: [isize; 6] = [0, 0, 0, 1, 1, 1];
+    let fitted = OPTICS::<f64>::new(2).fit(&docstring(), &()).unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "Xi labels_ must match the _optics.py doctest [0,0,0,1,1,1]; #1083"
+    );
+    assert_hierarchy(fitted.cluster_hierarchy(), &[[0, 2], [3, 5], [0, 5]]);
+    // hierarchy strictly larger than n unique labels (nested clusters kept).
+    let n_unique = {
+        let mut v: Vec<isize> = fitted
+            .labels()
+            .iter()
+            .filter(|&&l| l >= 0)
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v.len()
+    };
+    assert_eq!(n_unique, 2);
+    assert!(
+        fitted.cluster_hierarchy().nrows() > n_unique,
+        "cluster_hierarchy_ keeps nested clusters: {} > {n_unique}",
+        fitted.cluster_hierarchy().nrows()
+    );
+}
+
+/// REQ-5/REQ-8. `three_blobs` (min_samples=2, default xi=0.05): three leaf
+/// clusters plus the encompassing root in the hierarchy.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     m=OPTICS(min_samples=2,cluster_method='xi').fit(X); \
+///     print(m.labels_.tolist()); print(m.cluster_hierarchy_.tolist())"
+///   -> labels_:           [0, 0, 0, 1, 1, 1, 2, 2, 2]
+///      cluster_hierarchy_: [[0, 2], [3, 5], [6, 8], [0, 8]]
+#[test]
+fn green_xi_labels_hierarchy_three_blobs() {
+    let sk_labels: [isize; 9] = [0, 0, 0, 1, 1, 1, 2, 2, 2];
+    let fitted = OPTICS::<f64>::new(2).fit(&three_blobs(), &()).unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "three_blobs Xi labels_ must match sklearn; #1083"
+    );
+    assert_hierarchy(
+        fitted.cluster_hierarchy(),
+        &[[0, 2], [3, 5], [6, 8], [0, 8]],
+    );
+}
+
+/// REQ-5/REQ-8. `small10` (min_samples=2, default xi): a mixed labelling with
+/// noise (`-1`) and a 5-row nested hierarchy.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     m=OPTICS(min_samples=2,cluster_method='xi').fit(X); \
+///     print(m.labels_.tolist()); print(m.cluster_hierarchy_.tolist())"
+///   -> labels_:           [0, 0, -1, 1, -1, 2, 2, 2, 2, 1]
+///      cluster_hierarchy_: [[0, 1], [2, 3], [0, 3], [4, 7], [0, 9]]
+#[test]
+fn green_xi_labels_hierarchy_small10() {
+    let sk_labels: [isize; 10] = [0, 0, -1, 1, -1, 2, 2, 2, 2, 1];
+    let fitted = OPTICS::<f64>::new(2).fit(&small10(), &()).unwrap();
+    assert_eq!(
+        fitted.labels().as_slice().unwrap(),
+        &sk_labels[..],
+        "small10 Xi labels_ must match sklearn; #1083"
+    );
+    assert_hierarchy(
+        fitted.cluster_hierarchy(),
+        &[[0, 1], [2, 3], [0, 3], [4, 7], [0, 9]],
+    );
+}
+
+/// REQ-5/REQ-7. `min_cluster_size` exercised INSIDE the Xi loop. `blobs44`
+/// (`np.random.seed(0)`-generated: 20 pts @ (0,0), 20 @ (8,8), 4 @ (4,0),
+/// rounded to 3 dp), `min_samples=3`. With the DEFAULT `min_cluster_size`
+/// (= min_samples = 3) the 4-point small blob survives; with
+/// `min_cluster_size=10` it is filtered (criterion 3.a, `_optics.py:1155-1156`),
+/// changing BOTH `labels_` AND `cluster_hierarchy_` (proving the size cut is
+/// applied INSIDE `_xi_cluster`, not as a post-filter, REQ-7).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   X = the 44x2 array below (np.random.seed(0); blobs at (0,0),(8,8),(4,0); .round(3))
+///   default: OPTICS(min_samples=3, cluster_method='xi').fit(X)
+///     labels_ = [0,-1,0,0,0,-1,0,0,0,0,-1,0,0,0,-1,0,-1,0,-1,0,2,-1,3,-1,-1,3,2,4,4,3,3,2,4,-1,3,-1,-1,-1,3,4,1,1,1,1]
+///     cluster_hierarchy_ = [[0,13],[0,19],[20,23],[0,23],[24,26],[27,32],[35,38],[27,42],[24,43],[0,43]]
+///   mcs=10: OPTICS(min_samples=3, min_cluster_size=10, cluster_method='xi').fit(X)
+///     labels_ = [0,-1,0,0,0,-1,0,0,0,0,-1,0,0,0,-1,0,-1,0,-1,0,-1,-1,1,1,1,1,-1,1,1,1,1,-1,1,1,1,1,1,1,1,1,-1,-1,-1,-1]
+///     cluster_hierarchy_ = [[0,13],[0,19],[0,23],[27,42],[24,43],[0,43]]
+#[test]
+fn green_xi_min_cluster_size_inside_loop() {
+    let x = blobs44();
+    // Default min_cluster_size (= min_samples = 3): the 4-point small blob keeps
+    // a label and the hierarchy has 10 rows.
+    let default_labels: [isize; 44] = [
+        0, -1, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0, -1, 0, -1, 0, 2, -1, 3, -1, -1, 3, 2,
+        4, 4, 3, 3, 2, 4, -1, 3, -1, -1, -1, 3, 4, 1, 1, 1, 1,
+    ];
+    let f_default = OPTICS::<f64>::new(3).fit(&x, &()).unwrap();
+    assert_eq!(
+        f_default.labels().as_slice().unwrap(),
+        &default_labels[..],
+        "blobs44 ms3 default mcs labels_ must match sklearn; #1083"
+    );
+    assert_hierarchy(
+        f_default.cluster_hierarchy(),
+        &[
+            [0, 13],
+            [0, 19],
+            [20, 23],
+            [0, 23],
+            [24, 26],
+            [27, 32],
+            [35, 38],
+            [27, 42],
+            [24, 43],
+            [0, 43],
+        ],
+    );
+
+    // min_cluster_size=10: small clusters dropped INSIDE the Xi loop (REQ-7).
+    let mcs10_labels: [isize; 44] = [
+        0, -1, 0, 0, 0, -1, 0, 0, 0, 0, -1, 0, 0, 0, -1, 0, -1, 0, -1, 0, -1, -1, 1, 1, 1, 1, -1,
+        1, 1, 1, 1, -1, 1, 1, 1, 1, 1, 1, 1, 1, -1, -1, -1, -1,
+    ];
+    let f_mcs10 = OPTICS::<f64>::new(3)
+        .with_min_cluster_size(10)
+        .fit(&x, &())
+        .unwrap();
+    assert_eq!(
+        f_mcs10.labels().as_slice().unwrap(),
+        &mcs10_labels[..],
+        "blobs44 ms3 mcs=10 labels_ must match sklearn (in-loop size cut, REQ-7); #1085"
+    );
+    assert_hierarchy(
+        f_mcs10.cluster_hierarchy(),
+        &[[0, 13], [0, 19], [0, 23], [27, 42], [24, 43], [0, 43]],
+    );
+}
+
+/// REQ-5. Varied `xi` on `small10`: `xi=0.1` and `xi=0.3` change the steep-area
+/// thresholds, producing different `labels_`/`cluster_hierarchy_` — each matched
+/// to the live oracle.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     [print(xi, OPTICS(min_samples=2,xi=xi,cluster_method='xi').fit(X).labels_.tolist(), \
+///        OPTICS(min_samples=2,xi=xi,cluster_method='xi').fit(X).cluster_hierarchy_.tolist()) for xi in (0.1,0.3)]"
+///   -> 0.1 labels=[-1,-1,-1,0,-1,1,1,1,1,0] hier=[[2,3],[4,7],[0,9]]
+///      0.3 labels=[-1,-1,-1,-1,-1,0,0,0,0,-1] hier=[[4,7],[0,9]]
+#[test]
+fn green_xi_varied_threshold_small10() {
+    let f01 = OPTICS::<f64>::new(2)
+        .with_xi(0.1)
+        .fit(&small10(), &())
+        .unwrap();
+    let sk_01: [isize; 10] = [-1, -1, -1, 0, -1, 1, 1, 1, 1, 0];
+    assert_eq!(
+        f01.labels().as_slice().unwrap(),
+        &sk_01[..],
+        "small10 xi=0.1 labels_ must match sklearn; #1083"
+    );
+    assert_hierarchy(f01.cluster_hierarchy(), &[[2, 3], [4, 7], [0, 9]]);
+
+    let f03 = OPTICS::<f64>::new(2)
+        .with_xi(0.3)
+        .fit(&small10(), &())
+        .unwrap();
+    let sk_03: [isize; 10] = [-1, -1, -1, -1, -1, 0, 0, 0, 0, -1];
+    assert_eq!(
+        f03.labels().as_slice().unwrap(),
+        &sk_03[..],
+        "small10 xi=0.3 labels_ must match sklearn; #1083"
+    );
+    assert_hierarchy(f03.cluster_hierarchy(), &[[4, 7], [0, 9]]);
+}
+
+/// REQ-8. The `Dbscan` cluster method leaves `cluster_hierarchy_` EMPTY (sklearn
+/// only sets it on the Xi branch, `sklearn/cluster/_optics.py:373`).
+#[test]
+fn green_dbscan_cluster_hierarchy_empty() {
+    let fitted = OPTICS::<f64>::new(2)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(0.5)
+        .fit(&three_blobs(), &())
+        .unwrap();
+    assert_eq!(
+        fitted.cluster_hierarchy().nrows(),
+        0,
+        "dbscan method must leave cluster_hierarchy_ empty (sklearn :373)"
+    );
+    assert_eq!(fitted.cluster_hierarchy().ncols(), 2);
+}
+
+/// REQ-5/REQ-8. `predecessor_correction` toggle (default `true`). On `small10`,
+/// turning it OFF changes the corrected cluster end (`[4,7] → [4,8]`) and labels
+/// point 2 (which the predecessor-corrected pass drops), matching sklearn's
+/// `predecessor_correction=False` (`sklearn/cluster/_optics.py:1146-1152`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     m=OPTICS(min_samples=2,cluster_method='xi',predecessor_correction=False).fit(X); \
+///     print(m.labels_.tolist()); print(m.cluster_hierarchy_.tolist())"
+///   -> labels_:           [0, 0, 2, 1, -1, 2, 2, 2, 2, 1]
+///      cluster_hierarchy_: [[0, 1], [2, 3], [0, 3], [4, 8], [0, 9]]
+#[test]
+fn green_xi_predecessor_correction_toggle_small10() {
+    // Default (true) gives [4,7] / point-2 noise (see green_xi_labels_hierarchy_small10).
+    let off = OPTICS::<f64>::new(2)
+        .with_predecessor_correction(false)
+        .fit(&small10(), &())
+        .unwrap();
+    let sk_labels_off: [isize; 10] = [0, 0, 2, 1, -1, 2, 2, 2, 2, 1];
+    assert_eq!(
+        off.labels().as_slice().unwrap(),
+        &sk_labels_off[..],
+        "predecessor_correction=False labels_ must match sklearn; #1087"
+    );
+    assert_hierarchy(
+        off.cluster_hierarchy(),
+        &[[0, 1], [2, 3], [0, 3], [4, 8], [0, 9]],
     );
 }

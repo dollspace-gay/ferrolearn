@@ -50,9 +50,14 @@
 //! (#1080), `core_distances_`/`ordering_`/`reachability_` VALUE-match sklearn, and
 //! `predecessor_` (the `-1`-sentinel int array, REQ-4) now value-matches too. The
 //! `cluster_method='dbscan'` + `eps` extraction (REQ-6) is now SHIPPED — `fn
-//! cluster_optics_dbscan` value-matches the live oracle. The Xi `labels_`,
-//! `cluster_hierarchy_`, and the remaining parameter/attribute surface stay
-//! divergent.
+//! cluster_optics_dbscan` value-matches the live oracle. The Xi `labels_`
+//! (REQ-5), the in-Xi `min_cluster_size` criterion 3.a (REQ-7), and the
+//! `cluster_hierarchy_` attribute (REQ-8) are now SHIPPED: `fn cluster_optics_xi`
+//! / `fn xi_cluster` faithfully port sklearn's `cluster_optics_xi` / `_xi_cluster`
+//! (incl. the paper-corrected steep inequalities, `predecessor_correction`, the
+//! in-loop size cut, and `_extract_xi_labels`), bit-exact vs the live oracle. The
+//! remaining parameter/attribute surface (REQ-9 toggle, REQ-10 param surface,
+//! REQ-12 PyO3, REQ-13 ferray) stays divergent.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -60,11 +65,11 @@
 //! | REQ-2 (`ordering_` traversal value-parity) | SHIPPED | impl `Fit::fit` now selects the next seed by LINEAR ARGMIN over all unprocessed reachability with smallest-index tie-break (single pool, no heap), matching sklearn `compute_optics_graph` (`_optics.py:638-659`, `:53` "we do not employ a heap"). The prior `BinaryHeap` traversal diverged on tie-prone data. Guard: `divergence_ordering_small10` (sklearn `[0,1,3,9,5,6,7,8,2,4]`; was `[…5,7,8,6…]`) + `green_ordering_three_blobs`/`green_ordering_docstring`. Fixed #1080. |
 //! | REQ-3 (`reachability_` VALUE) | SHIPPED | impl `fn update_seeds` computes `max(core_dist_p, dist)` then rounds via `fn round_to_precision` (`np.around(decimals=np.finfo(dtype).precision)`, round-ties-even = numpy rint, `_optics.py:711`); combined with the REQ-2 traversal the reported plot value-matches sklearn (the #1080 ordering parity on tie fixtures REQUIRES the matching rounded reachability at each argmin step). Guards: `green_reachability_docstring` + (noisy) the ordering parity which is driven by reachability. Fixed #1080 (bundled). |
 //! | REQ-4 (`predecessor_` `-1`-sentinel int array) | SHIPPED | impl: `FittedOPTICS` stores `predecessor_: Array1<i64>` built in `Fit::fit` (`predecessors.iter().map(\|p\| p.map_or(-1, \|j\| j as i64))`), surfaced via accessor `fn predecessor() -> &Array1<i64>`. This is the `-1`-sentinel int array (shape `(n_samples,)`, indexed by original sample index) matching sklearn `predecessor_` "Seed points have a predecessor of -1" (`_optics.py:187-189`, `np.full(n_samples,-1,dtype=int)` `:604-605`, set on STRICT improvement `:712-714`). ferrolearn's `fn update_seeds` records the predecessor under the SAME strict `new_reach < reachability[q]` condition as sklearn's `improved = np.where(rdists < ...)` (`:712`), so the VALUES match too — verified element-wise (incl. the `-1` seed) vs the live oracle on `three_blobs` (`[-1,0,0,1,3,3,8,6,4]`), `small10` (tie-prone, `[-1,0,3,1,8,9,5,6,7,3]`), and the docstring fixture (`[-1,0,1,5,3,2]`). Internal `fn predecessors() -> &[Option<usize>]` kept (seed `None`) for the Xi extractor + back-compat. Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards (live-oracle, R-CHAR-3): `green_predecessor_three_blobs`, `green_predecessor_small10`, `green_predecessor_docstring` in `tests/divergence_optics.rs`. **f32 caveat (#2195):** sklearn OPTICS ALWAYS computes the graph in float64 — `reachability_.dtype == float64` even for float32 input (it upcasts) — whereas ferrolearn computes generically in `F`, so on f32 a near-tie in the reachability plot can round to the opposite side, swapping `ordering_`/`reachability_` and hence `predecessor_` (e.g. `small10` f32 at indices 6/7/8). This is an OPTICS-WIDE f32 divergence (it equally affects the SHIPPED f64-only REQ-1/2/3), tracked as #2195 and pinned `#[ignore]` in `tests/divergence_optics_predecessor_f32.rs`; the f64 path is bit-exact. The future fix is to compute the OPTICS graph in f64 regardless of `F` (matching sklearn's upcast) — out of this single-file predecessor scope. |
-//! | REQ-5 (`labels_` Xi VALUE parity) | NOT-STARTED | open prereq blocker #1083. sklearn `labels_` via `cluster_optics_xi` (`:810-918`); ferrolearn diverges (gated on the in-Xi `min_cluster_size` REQ-7 + `cluster_hierarchy_` leaf-selection REQ-8). With REQ-2 fixed the plot now matches, but the Xi label derivation still differs. |
+//! | REQ-5 (`labels_` Xi VALUE parity) | SHIPPED | impl: `Fit::fit`'s `OpticsClusterMethod::Xi` arm calls `fn cluster_optics_xi` → `fn xi_cluster` → `fn extract_xi_labels`, a faithful port of sklearn `cluster_optics_xi`/`_xi_cluster`/`_extract_xi_labels` (`sklearn/cluster/_optics.py:810-1201`): the appended `+inf` sentinel (`:1070`), `xi_complement = 1-xi`, the IEEE-754 `ratio` (Rust `inf/inf=NaN`, `x/inf=0`, `x/0=+inf` reproduce numpy `errstate(invalid="ignore")` `:1082-1087`), the PAPER-CORRECTED steep inequalities (`steep_downward = ratio >= 1/xi_complement` `:1085`, `steep_upward = ratio <= xi_complement` `:1084`), the steep-down/steep-up branches with `fn extend_region`/`fn update_filter_sdas`/`fn correct_predecessor`, Definition-11 criteria 1-4 (incl. the `:1143` `r(x) > D_max` paper-correction), and `_extract_xi_labels`' leaf-only assign + `labels[ordering]=labels` scatter (`:1194-1200`). Consumer (R-DEFER-1, non-test): the `Xi` arm of `Fit::fit` populates `labels_`, reachable via the crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`); also surfaced through `FittedOPTICS::extract_clusters`. Guards (live-oracle, R-CHAR-3): `green_xi_labels_hierarchy_doctest` (the `_optics.py:891-896` doctest `[0,0,0,1,1,1]`), `green_xi_labels_hierarchy_three_blobs`, `green_xi_labels_hierarchy_small10`, `green_xi_min_cluster_size_inside_loop`, `green_xi_varied_threshold_small10` in `tests/divergence_optics.rs`. **f32 caveat:** the underlying graph is f32-divergent (#2195); these guards are f64. |
 //! | REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | SHIPPED | impl: free fn `cluster_optics_dbscan(reachability, core_distances, ordering, eps) -> Array1<isize>` translates sklearn's two-step labelling EXACTLY (`sklearn/cluster/_optics.py:781-787`): step 1 walks `ordering` accumulating `cumsum(far_reach & near_core) - 1` with `far_reach = reachability > eps` (STRICT) and `near_core = core_distances <= eps` (INCLUSIVE); step 2 overwrites `labels[far_reach & !near_core] = -1`. Wired into `Fit::fit` via the new `cluster_method: OpticsClusterMethod` field (`enum {Xi (default), Dbscan}`, builder `fn with_cluster_method`) + `eps: Option<F>` field (builder `fn with_eps`): the `Dbscan` arm resolves `eps = self.eps.unwrap_or(self.max_eps)` and errors (`FerroError::InvalidParameter`) when `eps > self.max_eps`, mirroring sklearn's `eps` resolution + ValueError (`:375-383`). Consumer (R-DEFER-1, non-test): `Fit::fit`'s `OpticsClusterMethod::Dbscan` arm CALLS `cluster_optics_dbscan` to populate `labels_`; reachable publicly via `pub mod optics` (`ferrolearn_cluster::optics::{cluster_optics_dbscan, OpticsClusterMethod}`). Guards (live-oracle, R-CHAR-3): `green_dbscan_three_blobs_eps05/eps_none_all_noise/eps_large_merge`, `green_dbscan_small10_eps07_mixed/eps2_merge/eps05_noise`, `green_dbscan_eps_gt_max_eps_errs`, `green_xi_default_unchanged_three_blobs` in `tests/divergence_optics.rs`. (The Xi `labels_` REQ-5/7/8 + the PyO3 surface REQ-12 stay separate NOT-STARTED.) **eps-at-core-distance-boundary caveat (#2196):** when `eps` is set EXACTLY equal to one of ferrolearn's `core_distances_` values, the `<=` near-core cut can flip vs sklearn because ferrolearn's `core_distance` (`sqrt(sum-of-squares)`) differs from sklearn's `kneighbors`/`euclidean_distances` distance form by a sub-ULP (~4e-17), so `core <= eps` rounds to opposite sides at the exact boundary (`small10` at `eps == core_distances_[5]`). This is the SAME distance-form boundary class as DBSCAN #952 (REQ-1 `core_distances_` value-matches to ~1e-9, not bit-exact); for any `eps` not landing precisely on a differing core-distance the cut is value-exact. Tracked #2196, pinned `#[ignore]` in `tests/divergence_optics_dbscan_boundary.rs`. |
-//! | REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker #1085. sklearn enforces size INSIDE `_xi_cluster` (`:1155-1156`); ferrolearn post-filters in `fn filter_small_clusters` — different fixed point. |
-//! | REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker #1086. sklearn `(n_clusters,2)` `[start,end]` ordered `(end,-start)` (`:1166-1172`); ferrolearn `fn xi_cluster_extraction` discards the intervals, no accessor. |
-//! | REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker #1087. sklearn `bool` default True (`:277`); ferrolearn always applies `fn correct_predecessor`, no param. |
+//! | REQ-7 (Xi `min_cluster_size` criterion 3.a) | SHIPPED | impl: `fn xi_cluster` applies the size cut INSIDE the steep-up loop — `if c_end + 1 - c_start < min_cluster_size { continue; }` — matching sklearn's `if c_end - c_start + 1 < min_cluster_size: continue` (`sklearn/cluster/_optics.py:1154-1156`), NOT a post-filter (the old `fn filter_small_clusters` post-pass was REMOVED). `min_cluster_size` resolves `None → min_samples` in `fn cluster_optics_xi` (`:902-903`). This is a DIFFERENT fixed point from a post-filter: dropping a cluster mid-loop changes which later intervals get labelled AND the hierarchy. Consumer: same `Fit::fit` Xi arm as REQ-5. Guard (live-oracle): `green_xi_min_cluster_size_inside_loop` — `blobs44` with `min_samples=3`: the 4-point small blob keeps a label at the default `min_cluster_size` but is filtered at `min_cluster_size=10`, changing BOTH `labels_` AND `cluster_hierarchy_` exactly as sklearn. |
+//! | REQ-8 (`cluster_hierarchy_` attribute) | SHIPPED | impl: `FittedOPTICS` stores `cluster_hierarchy_: Array2<i64>` (`(n_clusters, 2)` `[start, end]` plot-order intervals, both inclusive), surfaced via `fn cluster_hierarchy() -> &Array2<i64>`. Built in `fn cluster_optics_xi` from the `Vec<(usize,usize)>` `fn xi_cluster` returns (`np.array(clusters)`, `sklearn/cluster/_optics.py:1172`), set on the `Xi` arm of `Fit::fit` (`self.cluster_hierarchy_ = clusters_`, `:373`); the `Dbscan` arm leaves it empty (shape `(0,2)`) — sklearn only sets it on the Xi branch. The order is `_xi_cluster`'s discovery order (U_clusters reversed), which equals the docstring's `(end, -start)` ascending on these fixtures (verified vs the oracle; `cluster_optics_xi` does NOT re-sort — `cluster_hierarchy_ = clusters_` directly). Consumer (R-DEFER-1, non-test): the `Xi` arm of `Fit::fit` populates the field; reachable via the crate re-export. Guards (live-oracle): `green_xi_labels_hierarchy_doctest` (the `_optics.py:893-896` doctest `[[0,2],[3,5],[0,5]]`, with `len(hierarchy)=3 > 2=n_unique_labels` asserting the nested-cluster-kept contract), `_three_blobs`, `_small10`, `green_xi_min_cluster_size_inside_loop`, `green_xi_varied_threshold_small10`, `green_dbscan_cluster_hierarchy_empty` in `tests/divergence_optics.rs`. |
+//! | REQ-9 (`predecessor_correction` toggle) | SHIPPED | impl: `OPTICS<F>` carries `predecessor_correction: bool` (default `true` in `fn new`, builder `fn with_predecessor_correction`), threaded through `Fit::fit` → `fn cluster_optics_xi` → `fn xi_cluster`, which applies `fn correct_predecessor` ONLY when the flag is set — matching sklearn's `predecessor_correction=True` default (`sklearn/cluster/_optics.py:277`) and its conditional use (`if predecessor_correction:` `:1147-1150`). Consumer (R-DEFER-1, non-test): the `Xi` arm of `Fit::fit` reads `self.predecessor_correction`. Guard (live-oracle): `green_xi_predecessor_correction_toggle_small10` — `predecessor_correction=False` changes the corrected end (`[4,7]→[4,8]`) and labels point 2, bit-exact vs sklearn. (The remaining REQ-10 param surface stays NOT-STARTED.) |
 //! | REQ-10 (param surface `metric`/`p`/`algorithm`/`leaf_size`/`n_jobs` + `min_samples=5` default + float fractions) | NOT-STARTED | open prereq blocker #1088. sklearn `__init__` (`:266-297`); ferrolearn `fn new(min_samples)` required, only `max_eps`/`xi`/`min_cluster_size` builders. |
 //! | REQ-11 (validation accept/reject BOUNDARIES) | SHIPPED | impl: `Fit::fit`'s parameter-validation block now matches sklearn's `OPTICS._parameter_constraints` (`sklearn/cluster/_optics.py:242-264`) at the accept/reject BOUNDARY: `min_samples < 2` REJECTED (`Interval(Integral, 2, None, closed="left")` `:243-246` — `{0,1}` rejected; was permitting `min_samples=1`), `max_eps < 0` REJECTED but `max_eps == 0` ACCEPTED (`Interval(Real, 0, None, closed="both")` `:247` — was over-rejecting `max_eps==0`), `xi < 0 \|\| xi > 1` REJECTED but `xi == 0` AND `xi == 1` ACCEPTED (`Interval(Real, 0, 1, closed="both")` `:253` — was over-rejecting `xi∈{0,1}`). The `max_eps == 0` degenerate path needed NO algorithm change: with `max_eps==0` no point has a neighbour, so `fn core_distance` returns `∞` for all (the `if core_distances[point].is_finite()` guard in `Fit::fit` skips `fn update_seeds`), `reachability_` stays `∞`, `ordering_` is by index, and `fn xi_cluster_extraction` on the all-`∞` plot yields all-`-1` labels (the `ratio = inf/inf = NaN` comparisons are all false → no steep points → no clusters) — value-matching the live oracle WITHOUT divide-by-zero / OOB / unwrap-None (R-CODE-2). `xi == 1` likewise does not panic: ferrolearn's Xi ratios use Rust float arithmetic (`1.0/0.0 == inf`), unlike sklearn's Python `ZeroDivisionError`. **Error TYPE ABI:** the grandfathered crate `FerroError::InvalidParameter` is kept (NOT sklearn's `InvalidParameterError`); only the accept/reject BOUNDARY is matched (R-DEV-2 user-API ABI is the boundary, not the exception class name — a crate-wide grandfathered convention). Consumer (R-DEFER-1, non-test): the validated `Fit::fit` is reachable via the crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards (live-oracle, R-CHAR-3): `green_min_samples_below_2_rejected`, `green_min_samples_2_accepted`, `green_max_eps_zero_degenerate_matches_oracle` (element-wise `core_distances_`/`reachability_`/`ordering_`/`labels_` vs the oracle), `green_max_eps_half_unchanged`, `green_max_eps_negative_rejected`, `green_xi_zero_accepted`, `green_xi_one_accepted_no_panic`, `green_xi_negative_rejected`, `green_xi_above_one_rejected` in `tests/divergence_optics.rs`. The `min_samples` float-fraction branch (`Interval(RealNotInt, 0, 1, closed="both")` `:245`) + the remaining param surface (`metric`/`p`/`algorithm`/`leaf_size`/`n_jobs`, the `min_samples=5` default) stay NOT-STARTED (REQ-10, blocker #1088). |
 //! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1090. No `_RsOPTICS` (grep empty); `import ferrolearn` cannot reach OPTICS. |
@@ -75,7 +80,6 @@ use ferrolearn_core::traits::Fit;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::cmp::Ordering;
-use std::collections::HashMap;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration struct
@@ -130,6 +134,10 @@ pub struct OPTICS<F> {
     /// default) it assumes the same value as `max_eps`, matching scikit-learn's
     /// `eps=None` (`sklearn/cluster/_optics.py:275`, resolved `:375-378`).
     pub eps: Option<F>,
+    /// Correct clusters based on the calculated predecessors during Xi
+    /// extraction.  Defaults to `true`, matching scikit-learn's
+    /// `predecessor_correction=True` (`sklearn/cluster/_optics.py:277`).
+    pub predecessor_correction: bool,
 }
 
 impl<F: Float> OPTICS<F> {
@@ -145,6 +153,7 @@ impl<F: Float> OPTICS<F> {
             min_cluster_size: None,
             cluster_method: OpticsClusterMethod::Xi,
             eps: None,
+            predecessor_correction: true,
         }
     }
 
@@ -200,6 +209,19 @@ impl<F: Float> OPTICS<F> {
         self.eps = Some(eps);
         self
     }
+
+    /// Set whether to apply predecessor correction during Xi extraction.
+    ///
+    /// Mirrors scikit-learn's `predecessor_correction` parameter, a `bool`
+    /// with default `True` (`sklearn/cluster/_optics.py:277`). When `true`
+    /// (the default), each candidate Xi cluster is adjusted via
+    /// `_correct_predecessor` (Algorithm 2 of Schubert & Gertz 2018) before
+    /// being accepted.
+    #[must_use]
+    pub fn with_predecessor_correction(mut self, predecessor_correction: bool) -> Self {
+        self.predecessor_correction = predecessor_correction;
+        self
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -240,6 +262,19 @@ pub struct FittedOPTICS<F> {
     predecessor_: Array1<i64>,
     /// The `min_samples` value used during fitting (needed for Xi extraction).
     min_samples_: usize,
+    /// The hierarchy of clusters discovered by the Xi method, as a
+    /// `(n_clusters, 2)` integer array of `[start, end]` intervals (both
+    /// indices inclusive, in reachability-plot / `ordering_` order).
+    ///
+    /// Mirrors scikit-learn's `OPTICS.cluster_hierarchy_` — "The list of
+    /// clusters in the form of `[start, end]` in each row, with all indices
+    /// inclusive. The clusters are ordered according to `(end, -start)`
+    /// (ascending) so that larger clusters encompassing smaller clusters come
+    /// after such nested smaller clusters" (`sklearn/cluster/_optics.py:191-200`,
+    /// returned by `cluster_optics_xi` `:859-865` / `_xi_cluster` `:1166-1172`).
+    /// Empty (shape `(0, 2)`) when `cluster_method == Dbscan` (sklearn only
+    /// sets `cluster_hierarchy_` on the Xi branch, `:373`).
+    cluster_hierarchy_: Array2<i64>,
 }
 
 impl<F: Float> FittedOPTICS<F> {
@@ -297,6 +332,23 @@ impl<F: Float> FittedOPTICS<F> {
         &self.predecessor_
     }
 
+    /// Return the cluster hierarchy discovered by the Xi method.
+    ///
+    /// A `(n_clusters, 2)` integer array of `[start, end]` intervals (both
+    /// indices inclusive, in reachability-plot / `ordering_` order), ordered so
+    /// that larger clusters encompassing smaller ones come after the nested
+    /// smaller clusters. Because `labels_` keeps only the leaf-level clusters,
+    /// `cluster_hierarchy().nrows()` is usually greater than the number of
+    /// distinct non-noise labels.
+    ///
+    /// Mirrors scikit-learn's `OPTICS.cluster_hierarchy_`
+    /// (`sklearn/cluster/_optics.py:191-200`). Empty (shape `(0, 2)`) when the
+    /// `Dbscan` cluster method was used (sklearn only sets it on the Xi branch).
+    #[must_use]
+    pub fn cluster_hierarchy(&self) -> &Array2<i64> {
+        &self.cluster_hierarchy_
+    }
+
     /// Return the number of clusters found (excluding noise).
     #[must_use]
     pub fn n_clusters(&self) -> usize {
@@ -327,13 +379,19 @@ impl<F: Float> FittedOPTICS<F> {
                 reason: "must be in (0, 1)".into(),
             });
         }
-        Ok(xi_cluster_extraction(
-            &self.ordering_,
+        // Re-run the Xi extraction with this `xi`, the fitted `min_samples`
+        // (also used as the default `min_cluster_size`), and predecessor
+        // correction enabled (the sklearn default). Discards the hierarchy.
+        let (labels, _hierarchy) = cluster_optics_xi(
             &self.reachability_,
-            &self.predecessors_,
+            &self.predecessor_,
+            &self.ordering_,
             xi,
             self.min_samples_,
-        ))
+            None,
+            true,
+        );
+        Ok(labels)
     }
 }
 
@@ -538,7 +596,17 @@ pub fn cluster_optics_dbscan<F: Float>(
     labels
 }
 
-/// A steep-down area (SDA) tracked during Xi extraction.
+// ─────────────────────────────────────────────────────────────────────────────
+// Xi-method cluster extraction — faithful port of sklearn's
+// `cluster_optics_xi` / `_xi_cluster` (`sklearn/cluster/_optics.py:810-1202`).
+//
+// The reachability plot, predecessor plot, and cluster intervals all index the
+// reachability-PLOT (i.e. `ordering`) order, NOT the original sample order. The
+// final `_extract_xi_labels` scatters back to original-sample order.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A steep-down area (SDA) tracked during Xi extraction
+/// (a `{"start", "end", "mib"}` dict in sklearn, `_optics.py:1104`).
 #[derive(Debug, Clone)]
 struct SteepDownArea {
     start: usize,
@@ -546,35 +614,122 @@ struct SteepDownArea {
     mib: f64,
 }
 
-/// Extend a steep region (downward or upward) maximally.
+/// Automatically extract clusters via the Xi-steep method.
 ///
-/// `steep_point[i]` is true if position `i` is steep in the primary direction.
-/// `xward_point[i]` is true if the reachability is moving in the *opposite*
-/// direction.  We allow up to `min_samples` consecutive non-steep positions
-/// that are still going in the correct direction.
+/// Faithful translation of scikit-learn's `cluster_optics_xi`
+/// (`sklearn/cluster/_optics.py:810-918`). Resolves `min_cluster_size`
+/// (`None` → `min_samples`), runs [`xi_cluster`] over the reachability plot, and
+/// derives leaf labels via [`extract_xi_labels`].
+///
+/// Returns `(labels, clusters)` where `labels` is the `(n_samples,)` cluster
+/// assignment (`-1` for noise, indexed by ORIGINAL sample order) and `clusters`
+/// is the `(n_clusters, 2)` `[start, end]` hierarchy (PLOT-order intervals,
+/// both inclusive) — exactly `OPTICS.labels_` and `OPTICS.cluster_hierarchy_`.
+///
+/// `reachability` and `predecessor` are indexed by ORIGINAL sample order;
+/// `ordering` lists original sample indices in reachability-plot order.
+///
+/// ferrolearn's `min_samples` / `min_cluster_size` are already `>= 2` integers
+/// (the float-fraction `<= 1` resolution in `cluster_optics_xi` `:900-906` is
+/// REQ-10, out of scope), so only the `None → min_samples` default is applied
+/// here.
+fn cluster_optics_xi<F: Float>(
+    reachability: &Array1<F>,
+    predecessor: &Array1<i64>,
+    ordering: &[usize],
+    xi: F,
+    min_samples: usize,
+    min_cluster_size: Option<usize>,
+    predecessor_correction: bool,
+) -> (Array1<isize>, Array2<i64>) {
+    let n_total = reachability.len();
+    // `if min_cluster_size is None: min_cluster_size = min_samples` (`:902-903`).
+    let min_cluster_size = min_cluster_size.unwrap_or(min_samples);
+
+    if ordering.is_empty() {
+        return (
+            Array1::from_elem(n_total, -1isize),
+            Array2::<i64>::zeros((0, 2)),
+        );
+    }
+
+    // reachability_plot = reachability[ordering] (`:909`), as f64 with non-finite
+    // → +inf. _xi_cluster then hstacks an extra +inf sentinel (`:1070`).
+    let mut r_plot: Vec<f64> = ordering
+        .iter()
+        .map(|&i| {
+            let v = reachability[i].to_f64().unwrap_or(f64::INFINITY);
+            if v.is_finite() { v } else { f64::INFINITY }
+        })
+        .collect();
+    r_plot.push(f64::INFINITY);
+
+    // predecessor_plot = predecessor[ordering] (`:910`), keeping sklearn's `-1`
+    // sentinel for seed points.
+    let pred_plot: Vec<i64> = ordering.iter().map(|&i| predecessor[i]).collect();
+
+    let xi_f64 = xi.to_f64().unwrap_or(0.05);
+
+    let clusters = xi_cluster(
+        &r_plot,
+        &pred_plot,
+        ordering,
+        xi_f64,
+        min_samples,
+        min_cluster_size,
+        predecessor_correction,
+    );
+
+    let labels = extract_xi_labels(ordering, &clusters, n_total);
+
+    // Build the `(n_clusters, 2)` hierarchy array (`np.array(clusters)`, `:1172`).
+    let hierarchy = if clusters.is_empty() {
+        Array2::<i64>::zeros((0, 2))
+    } else {
+        let mut flat: Vec<i64> = Vec::with_capacity(clusters.len() * 2);
+        for &(s, e) in &clusters {
+            flat.push(s as i64);
+            flat.push(e as i64);
+        }
+        Array2::from_shape_vec((clusters.len(), 2), flat)
+            .unwrap_or_else(|_| Array2::<i64>::zeros((0, 2)))
+    };
+
+    (labels, hierarchy)
+}
+
+/// Extend the steep area until it's maximal.
+///
+/// Faithful translation of `_extend_region` (`sklearn/cluster/_optics.py:921-981`).
+/// The same function serves both directions: to extend an upward region pass
+/// `steep_point=steep_upward, xward_point=downward`; to extend a downward region
+/// pass `steep_point=steep_downward, xward_point=upward`. Up/down steep regions
+/// can't have more than `min_samples` consecutive non-steep points going the
+/// correct direction. The returned `end` is inclusive.
 fn extend_region(
     steep_point: &[bool],
     xward_point: &[bool],
     start: usize,
     min_samples: usize,
 ) -> usize {
-    let n = steep_point.len();
+    let n_samples = steep_point.len();
     let mut non_xward_points = 0usize;
     let mut index = start;
     let mut end = start;
-
-    while index < n {
+    // find a maximal area
+    while index < n_samples {
         if steep_point[index] {
             non_xward_points = 0;
             end = index;
         } else if !xward_point[index] {
-            // Not steep, but still going in the right direction.
+            // it's not a steep point, but still goes up.
             non_xward_points += 1;
+            // region should include no more than min_samples consecutive
+            // non steep xward points.
             if non_xward_points > min_samples {
                 break;
             }
         } else {
-            // Going the wrong direction — stop.
             return end;
         }
         index += 1;
@@ -582,272 +737,14 @@ fn extend_region(
     end
 }
 
-/// Predecessor correction (Algorithm 2 of Schubert & Gertz 2018).
+/// Update steep-down areas (SDAs) using the new maximum-in-between (`mib`) value
+/// and `xi_complement = 1 - xi`.
 ///
-/// Returns `Some((c_start, c_end))` if the corrected cluster is valid,
-/// or `None` if predecessor correction eliminates it.
-fn correct_predecessor(
-    r_plot: &[f64],
-    pred_plot: &[Option<usize>],
-    ordering: &[usize],
-    s: usize,
-    mut e: usize,
-) -> Option<(usize, usize)> {
-    while s < e {
-        if r_plot[s] > r_plot[e] {
-            return Some((s, e));
-        }
-        let p_e = pred_plot[ordering[e]];
-        for item in ordering.iter().take(e).skip(s) {
-            if p_e == Some(*item) {
-                return Some((s, e));
-            }
-        }
-        e -= 1;
-    }
-    None
-}
-
-/// Xi-method cluster extraction from the reachability plot.
-///
-/// Implements Figure 19 of the OPTICS paper (Ankerst et al., 1999) with
-/// corrections from Schubert & Gertz (2018).  This matches sklearn's
-/// `cluster_optics_xi` implementation.
-///
-/// The algorithm:
-/// 1. Builds steep-up/steep-down boolean arrays from the reachability plot.
-/// 2. Iterates through steep points, extending them into *areas*.
-/// 3. Maintains a stack of steep-down areas (SDAs) with max-in-between (MIB).
-/// 4. When encountering a steep-up area, attempts to match it with each SDA.
-/// 5. Applies boundary correction and predecessor correction per cluster.
-fn xi_cluster_extraction<F: Float>(
-    ordering: &[usize],
-    reachability: &Array1<F>,
-    predecessors: &[Option<usize>],
-    xi: F,
-    min_samples: usize,
-) -> Array1<isize> {
-    let n_ordered = ordering.len();
-    let n_total = reachability.len();
-
-    if n_ordered == 0 {
-        return Array1::from_elem(n_total, -1isize);
-    }
-
-    // Build the reachability plot in ordering order (as f64 for simplicity).
-    // Append +inf sentinel at the end (helps detect clusters at the tail).
-    let mut r_plot: Vec<f64> = ordering
-        .iter()
-        .map(|&i| {
-            let v = reachability[i];
-            if v.is_finite() {
-                v.to_f64().unwrap_or(f64::INFINITY)
-            } else {
-                f64::INFINITY
-            }
-        })
-        .collect();
-    r_plot.push(f64::INFINITY);
-
-    // Predecessor plot in ordering order.
-    let pred_plot: Vec<Option<usize>> = ordering.iter().map(|&i| predecessors[i]).collect();
-
-    let xi_f64 = xi.to_f64().unwrap_or(0.05);
-    let xi_complement = 1.0 - xi_f64;
-    let min_samples = min_samples.max(1);
-
-    // Compute steep_upward, steep_downward, upward, downward arrays.
-    // ratio[i] = r_plot[i] / r_plot[i+1]
-    let n_plot = r_plot.len() - 1; // last element is the sentinel
-    let mut steep_upward = vec![false; n_plot];
-    let mut steep_downward = vec![false; n_plot];
-    let mut upward = vec![false; n_plot];
-    let mut downward = vec![false; n_plot];
-
-    for i in 0..n_plot {
-        if r_plot[i + 1] == 0.0 {
-            // Avoid division by zero; treat as downward.
-            if r_plot[i] > 0.0 {
-                steep_downward[i] = true;
-                downward[i] = true;
-            }
-            continue;
-        }
-        let ratio = r_plot[i] / r_plot[i + 1];
-        if ratio <= xi_complement {
-            steep_upward[i] = true;
-        }
-        if ratio >= 1.0 / xi_complement {
-            steep_downward[i] = true;
-        }
-        if ratio > 1.0 {
-            downward[i] = true;
-        }
-        if ratio < 1.0 {
-            upward[i] = true;
-        }
-    }
-
-    // Main loop: Figure 19 of the OPTICS paper.
-    let mut sdas: Vec<SteepDownArea> = Vec::new();
-    let mut clusters: Vec<(usize, usize)> = Vec::new();
-    let mut index = 0usize;
-    let mut mib = 0.0_f64;
-
-    // Collect indices that are steep upward or steep downward.
-    let steep_indices: Vec<usize> = (0..n_plot)
-        .filter(|&i| steep_upward[i] || steep_downward[i])
-        .collect();
-
-    for &steep_index in &steep_indices {
-        if steep_index < index {
-            continue;
-        }
-
-        // Update MIB with the max reachability between the last processed
-        // index and the current steep index.
-        for item in r_plot.iter().take(steep_index + 1).skip(index) {
-            if *item > mib {
-                mib = *item;
-            }
-        }
-
-        if steep_downward[steep_index] {
-            // --- Steep downward area ---
-            // Filter existing SDAs whose start reachability * xi_complement < mib.
-            sdas = update_filter_sdas(sdas, mib, xi_complement, &r_plot);
-
-            let d_start = steep_index;
-            let d_end = extend_region(&steep_downward, &upward, d_start, min_samples);
-            sdas.push(SteepDownArea {
-                start: d_start,
-                end: d_end,
-                mib: 0.0,
-            });
-            index = d_end + 1;
-            if index < r_plot.len() {
-                mib = r_plot[index];
-            }
-        } else {
-            // --- Steep upward area ---
-            sdas = update_filter_sdas(sdas, mib, xi_complement, &r_plot);
-
-            let u_start = steep_index;
-            let u_end = extend_region(&steep_upward, &downward, u_start, min_samples);
-            index = u_end + 1;
-            if index < r_plot.len() {
-                mib = r_plot[index];
-            }
-
-            // Try to form clusters by matching this upward area with each SDA.
-            let mut u_clusters: Vec<(usize, usize)> = Vec::new();
-            for sda in &sdas {
-                let mut c_start = sda.start;
-                let c_end_initial = u_end;
-
-                // Line (**), sc2*: skip if the point after the cluster end
-                // times xi_complement is less than the SDA's MIB.
-                let r_after = if c_end_initial + 1 < r_plot.len() {
-                    r_plot[c_end_initial + 1]
-                } else {
-                    f64::INFINITY
-                };
-                if r_after * xi_complement < sda.mib {
-                    continue;
-                }
-
-                // Definition 11, criterion 4: boundary correction.
-                let d_max = r_plot[sda.start];
-                let mut c_end = c_end_initial;
-
-                if d_max * xi_complement >= r_after {
-                    // Adjust start: find the first index from the left
-                    // at a similar level as the end.
-                    while c_start < sda.end
-                        && c_start + 1 < r_plot.len()
-                        && r_plot[c_start + 1] > r_after
-                    {
-                        c_start += 1;
-                    }
-                } else if r_after * xi_complement >= d_max {
-                    // Adjust end: find the first index from the right
-                    // at a similar level as the start.
-                    while c_end > u_start && c_end > 0 && r_plot[c_end - 1] > d_max {
-                        c_end -= 1;
-                    }
-                }
-
-                // Predecessor correction.
-                if let Some((cs, ce)) =
-                    correct_predecessor(&r_plot, &pred_plot, ordering, c_start, c_end)
-                {
-                    c_start = cs;
-                    c_end = ce;
-                } else {
-                    continue;
-                }
-
-                // Definition 11, criterion 3a: minimum size (checked later
-                // by filter_small_clusters, but we can skip tiny ones here).
-                if c_end < c_start + 1 {
-                    continue;
-                }
-
-                // Definition 11, criterion 1: c_start must be within the SDA.
-                if c_start > sda.end {
-                    continue;
-                }
-
-                // Definition 11, criterion 2: c_end must be within the SUA.
-                if c_end < u_start {
-                    continue;
-                }
-
-                u_clusters.push((c_start, c_end));
-            }
-
-            // Add smaller clusters first (so larger encompassing clusters
-            // come after when we process them).
-            u_clusters.reverse();
-            clusters.extend(u_clusters);
-        }
-    }
-
-    // Convert cluster intervals to labels.
-    // Clusters are ordered with smaller (leaf) clusters before larger
-    // encompassing ones.  A cluster interval is assigned a label ONLY if
-    // all positions in [c_start, c_end] are currently unassigned (-1).
-    // This selects the leaf-level clusters from the hierarchy.
-    //
-    // Labels are initially in ordering-space; we remap to point-space at the
-    // end.
-    let mut ord_labels = vec![-1isize; n_ordered];
-    let mut label = 0isize;
-    for &(c_start, c_end) in &clusters {
-        let end = c_end.min(n_ordered - 1);
-        // Only assign if the entire interval is unassigned.
-        let all_unassigned = (c_start..=end).all(|pos| ord_labels[pos] == -1);
-        if all_unassigned {
-            for item in ord_labels.iter_mut().take(end + 1).skip(c_start) {
-                *item = label;
-            }
-            label += 1;
-        }
-    }
-
-    // Remap from ordering-space labels to point-space labels.
-    let mut labels = Array1::from_elem(n_total, -1isize);
-    for (ord_pos, &pt) in ordering.iter().enumerate() {
-        labels[pt] = ord_labels[ord_pos];
-    }
-
-    labels
-}
-
-/// Update and filter steep-down areas based on maximum-in-between (MIB).
-///
-/// Removes SDAs whose start reachability * xi_complement is less than the
-/// current MIB.  Updates the MIB of surviving SDAs.
+/// Faithful translation of `_update_filter_sdas`
+/// (`sklearn/cluster/_optics.py:984-995`): if `mib` is `inf` every SDA is
+/// dropped; otherwise keep SDAs whose `r_plot[start] * xi_complement >= mib`
+/// (sklearn `mib <= reachability_plot[sda["start"]] * xi_complement`) and update
+/// each survivor's `mib = max(mib, sda.mib)`.
 fn update_filter_sdas(
     sdas: Vec<SteepDownArea>,
     mib: f64,
@@ -857,65 +754,260 @@ fn update_filter_sdas(
     if mib.is_infinite() {
         return Vec::new();
     }
-    let mut result: Vec<SteepDownArea> = sdas
+    let mut res: Vec<SteepDownArea> = sdas
         .into_iter()
         .filter(|sda| mib <= r_plot[sda.start] * xi_complement)
         .collect();
-    for sda in &mut result {
-        if mib > sda.mib {
-            sda.mib = mib;
-        }
+    for sda in &mut res {
+        sda.mib = sda.mib.max(mib);
     }
-    result
+    res
 }
 
-/// Filter small clusters and renumber labels to be contiguous.
+/// Correct for predecessors (Algorithm 2 of Schubert & Gertz 2018).
 ///
-/// Clusters with fewer than `min_cluster_size` points are relabelled as
-/// noise (`-1`). Remaining clusters are renumbered `0, 1, 2, ...`.
-fn filter_small_clusters(labels: &mut Array1<isize>, min_cluster_size: usize) {
-    // Count cluster sizes.
-    let mut cluster_sizes: HashMap<isize, usize> = HashMap::new();
-    for &l in labels.iter() {
-        if l >= 0 {
-            *cluster_sizes.entry(l).or_insert(0) += 1;
+/// Faithful translation of `_correct_predecessor`
+/// (`sklearn/cluster/_optics.py:998-1017`). Inputs are PLOT-ordered. Returns
+/// `Some((s, e))` for the corrected interval, or `None` (sklearn `(None, None)`)
+/// when the interval collapses (`s >= e`).
+///
+/// `predecessor_plot[e]` is an ORIGINAL sample index (or `-1` for a seed);
+/// `ordering[i]` is also an original sample index, so the membership test
+/// `p_e == ordering[i]` compares like-for-like. A `-1` predecessor never equals
+/// any `ordering[i]` (all `>= 0`), matching sklearn where a seed's predecessor
+/// (`-1`) is not in the ordering window.
+fn correct_predecessor(
+    r_plot: &[f64],
+    predecessor_plot: &[i64],
+    ordering: &[usize],
+    s: usize,
+    mut e: usize,
+) -> Option<(usize, usize)> {
+    let mut s = s;
+    while s < e {
+        if r_plot[s] > r_plot[e] {
+            return Some((s, e));
         }
+        let p_e = predecessor_plot[e];
+        let mut found = false;
+        for &item in ordering.iter().take(e).skip(s) {
+            if p_e == item as i64 {
+                found = true;
+                break;
+            }
+        }
+        if found {
+            return Some((s, e));
+        }
+        e -= 1;
+        // (s is never advanced by sklearn; kept mutable only to mirror the
+        // signature — the `while s < e` guard handles the collapse.)
+        let _ = &mut s;
+    }
+    None
+}
+
+/// Automatically extract clusters according to the Xi-steep method (Figure 19).
+///
+/// Faithful translation of `_xi_cluster` (`sklearn/cluster/_optics.py:1020-1172`).
+///
+/// `r_plot` already has the appended `+inf` sentinel (length `n_plot + 1`).
+/// `predecessor_plot` is PLOT-ordered with the `-1` seed sentinel. Returns the
+/// list of `(start, end)` cluster intervals (PLOT-order, both inclusive) in
+/// discovery order, with each steep-up area's matches reversed (smaller clusters
+/// first), exactly as sklearn returns `np.array(clusters)`.
+///
+/// The ratio arithmetic mirrors numpy under `errstate(invalid="ignore")`:
+/// `inf/inf` and `0/0` give `NaN` (all comparisons false), `x/inf = 0`,
+/// finite `x/0 = +inf`. Rust's IEEE-754 float division reproduces this exactly,
+/// so no special-casing is needed (and no divide-by-zero panic, R-CODE-2).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors sklearn `_xi_cluster`'s 7-parameter signature (sklearn/cluster/_optics.py:1020-1028)"
+)]
+fn xi_cluster(
+    r_plot: &[f64],
+    predecessor_plot: &[i64],
+    ordering: &[usize],
+    xi: f64,
+    min_samples: usize,
+    min_cluster_size: usize,
+    predecessor_correction: bool,
+) -> Vec<(usize, usize)> {
+    // xi_complement = 1 - xi (`:1072`).
+    let xi_complement = 1.0 - xi;
+
+    let n_plot = r_plot.len() - 1; // excluding the appended +inf sentinel
+
+    // Definition 9 (paper-corrected): steep DOWN uses `>=`, steep UP uses `<=`.
+    // ratio = r_plot[:-1] / r_plot[1:] (`:1083-1087`).
+    let mut steep_upward = vec![false; n_plot];
+    let mut steep_downward = vec![false; n_plot];
+    let mut upward = vec![false; n_plot];
+    let mut downward = vec![false; n_plot];
+    let inv_xi_complement = 1.0 / xi_complement; // 1 / (1 - xi); +inf when xi == 1
+    for i in 0..n_plot {
+        let ratio = r_plot[i] / r_plot[i + 1]; // NaN for inf/inf or 0/0
+        steep_upward[i] = ratio <= xi_complement;
+        steep_downward[i] = ratio >= inv_xi_complement;
+        downward[i] = ratio > 1.0;
+        upward[i] = ratio < 1.0;
     }
 
-    // Relabel small clusters as noise.
-    for label in labels.iter_mut() {
-        if *label >= 0
-            && let Some(&size) = cluster_sizes.get(label)
-            && size < min_cluster_size
-        {
-            *label = -1;
-        }
-    }
+    let mut sdas: Vec<SteepDownArea> = Vec::new();
+    let mut clusters: Vec<(usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    let mut mib = 0.0_f64; // maximum in between
 
-    // Renumber clusters to be contiguous.
-    let mut unique_labels: Vec<isize> = cluster_sizes
-        .keys()
-        .filter(|&&k| {
-            cluster_sizes
-                .get(&k)
-                .is_some_and(|&sz| sz >= min_cluster_size)
-        })
-        .copied()
+    // for steep_index in np.flatnonzero(steep_upward | steep_downward) (`:1091`).
+    let steep_indices: Vec<usize> = (0..n_plot)
+        .filter(|&i| steep_upward[i] || steep_downward[i])
         .collect();
-    unique_labels.sort_unstable();
 
-    let mut remap: HashMap<isize, isize> = HashMap::new();
-    for (new_id, &old_id) in unique_labels.iter().enumerate() {
-        remap.insert(old_id, new_id as isize);
-    }
+    for steep_index in steep_indices {
+        // continue if steep_index is inside a discovered xward area (`:1094-1095`).
+        if steep_index < index {
+            continue;
+        }
 
-    for label in labels.iter_mut() {
-        if *label >= 0
-            && let Some(&new_id) = remap.get(label)
-        {
-            *label = new_id;
+        // mib = max(mib, np.max(r_plot[index : steep_index + 1])) (`:1097`).
+        for &item in r_plot.iter().take(steep_index + 1).skip(index) {
+            if item > mib {
+                mib = item;
+            }
+        }
+
+        if steep_downward[steep_index] {
+            // --- steep downward area (`:1100-1107`) ---
+            sdas = update_filter_sdas(sdas, mib, xi_complement, r_plot);
+            let d_start = steep_index;
+            let d_end = extend_region(&steep_downward, &upward, d_start, min_samples);
+            sdas.push(SteepDownArea {
+                start: d_start,
+                end: d_end,
+                mib: 0.0,
+            });
+            index = d_end + 1;
+            mib = r_plot[index];
+        } else {
+            // --- steep upward area (`:1110-1170`) ---
+            sdas = update_filter_sdas(sdas, mib, xi_complement, r_plot);
+            let u_start = steep_index;
+            let u_end = extend_region(&steep_upward, &downward, u_start, min_samples);
+            index = u_end + 1;
+            mib = r_plot[index];
+
+            let mut u_clusters: Vec<(usize, usize)> = Vec::new();
+            for d in &sdas {
+                let mut c_start = d.start;
+                let mut c_end = u_end;
+
+                // line (**), sc2*: r_plot[c_end + 1] * xi_complement < D["mib"]
+                // → continue (`:1123-1124`). c_end+1 <= u_end+1 = index <= n_plot,
+                // and r_plot has the appended sentinel, so the index is in range.
+                if r_plot[c_end + 1] * xi_complement < d.mib {
+                    continue;
+                }
+
+                // Definition 11: criterion 4 (`:1126-1144`).
+                let d_max = r_plot[d.start];
+                if d_max * xi_complement >= r_plot[c_end + 1] {
+                    // Find the first index from the left almost at the end level.
+                    // sklearn evaluates `r_plot[c_start+1] > r_plot[c_end+1]`
+                    // FIRST then `c_start < D["end"]` (short-circuit `and`). We
+                    // guard `c_start + 1 < r_plot.len()` defensively (always true:
+                    // c_start < D["end"] <= n_plot-1 here), no OOB.
+                    while c_start < d.end && r_plot[c_start + 1] > r_plot[c_end + 1] {
+                        c_start += 1;
+                    }
+                } else if r_plot[c_end + 1] * xi_complement >= d_max {
+                    // Find the first index from the right almost at the start
+                    // level. Paper-correction: `r(x) > r(sD)` (not `<`). sklearn:
+                    // `while r_plot[c_end - 1] > D_max and c_end > U_start`.
+                    while c_end > u_start && r_plot[c_end - 1] > d_max {
+                        c_end -= 1;
+                    }
+                }
+
+                // predecessor correction (`:1146-1152`).
+                if predecessor_correction {
+                    match correct_predecessor(r_plot, predecessor_plot, ordering, c_start, c_end) {
+                        Some((cs, ce)) => {
+                            c_start = cs;
+                            c_end = ce;
+                        }
+                        None => continue, // c_start is None → continue
+                    }
+                }
+
+                // Definition 11: criterion 3.a (REQ-7 — INSIDE the loop):
+                // c_end - c_start + 1 < min_cluster_size → continue (`:1154-1156`).
+                if c_end + 1 - c_start < min_cluster_size {
+                    continue;
+                }
+
+                // Definition 11: criterion 1: c_start > D["end"] → continue (`:1158-1160`).
+                if c_start > d.end {
+                    continue;
+                }
+
+                // Definition 11: criterion 2: c_end < U_start → continue (`:1162-1164`).
+                if c_end < u_start {
+                    continue;
+                }
+
+                u_clusters.push((c_start, c_end));
+            }
+
+            // add smaller clusters first (`:1168-1170`).
+            u_clusters.reverse();
+            clusters.extend(u_clusters);
         }
     }
+
+    clusters
+}
+
+/// Extract labels from the clusters returned by [`xi_cluster`].
+///
+/// Faithful translation of `_extract_xi_labels`
+/// (`sklearn/cluster/_optics.py:1175-1201`). Relies on `clusters` being stored
+/// smaller-first: a cluster interval `[c0, c1]` (PLOT-order) is given the next
+/// label only if NONE of its plot positions is already labelled, selecting the
+/// leaf-level clusters. Then `labels[ordering] = labels.copy()` scatters from
+/// plot order back to ORIGINAL sample order.
+fn extract_xi_labels(
+    ordering: &[usize],
+    clusters: &[(usize, usize)],
+    n_total: usize,
+) -> Array1<isize> {
+    let n = ordering.len();
+    // labels = np.full(len(ordering), -1) (`:1194`). Length is n_ordered; the
+    // plot positions index [0, n). The scatter restores original-sample shape.
+    let mut plot_labels = vec![-1isize; n];
+    let mut label = 0isize;
+    for &(c0, c1) in clusters {
+        // `if not np.any(labels[c0 : c1+1] != -1)` (`:1197`). Guard the slice
+        // against any out-of-range interval (xi_cluster never emits one).
+        let end = (c1 + 1).min(n);
+        let start = c0.min(end);
+        let any_assigned = plot_labels[start..end].iter().any(|&v| v != -1);
+        if !any_assigned {
+            for v in &mut plot_labels[start..end] {
+                *v = label;
+            }
+            label += 1;
+        }
+    }
+
+    // labels[ordering] = labels.copy() (`:1200`): scatter plot-order labels back
+    // to original-sample order. `labels` (original order) starts all -1; any
+    // sample not in `ordering` (OPTICS always covers all) stays -1.
+    let mut labels = Array1::from_elem(n_total, -1isize);
+    for (plot_pos, &sample) in ordering.iter().enumerate() {
+        labels[sample] = plot_labels[plot_pos];
+    }
+    labels
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1085,25 +1177,34 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
             }
         }
 
+        // Build the sklearn-faithful `-1`-sentinel `predecessor_` from the
+        // `Option<usize>` predecessors: `Some(j) -> j as i64`, `None -> -1`
+        // (mirroring `np.full(n_samples, -1, dtype=int)` then in-place updates,
+        // `sklearn/cluster/_optics.py:604-605`, `:714`). Built BEFORE the Xi
+        // extraction because `cluster_optics_xi` consumes `predecessor[ordering]`.
+        let predecessor_: Array1<i64> = predecessors
+            .iter()
+            .map(|p| p.map_or(-1i64, |j| j as i64))
+            .collect();
+
         // Extract cluster labels.  sklearn dispatches on `cluster_method`
         // (`sklearn/cluster/_optics.py:363-390`): `"xi"` runs `cluster_optics_xi`
         // (the default), `"dbscan"` resolves `eps` then runs
-        // `cluster_optics_dbscan`.
-        let labels = match self.cluster_method {
+        // `cluster_optics_dbscan`. The Xi branch additionally sets
+        // `cluster_hierarchy_` (`:373`); the dbscan branch leaves it empty.
+        let (labels, cluster_hierarchy_) = match self.cluster_method {
             OpticsClusterMethod::Xi => {
-                // Extract cluster labels via the Xi method.
-                let mut labels = xi_cluster_extraction(
-                    &ordering,
+                // labels_, clusters_ = cluster_optics_xi(...) (`:364-372`);
+                // self.cluster_hierarchy_ = clusters_ (`:373`).
+                cluster_optics_xi(
                     &reachability,
-                    &predecessors,
+                    &predecessor_,
+                    &ordering,
                     self.xi,
                     self.min_samples,
-                );
-
-                // Apply min_cluster_size filtering.
-                let min_size = self.min_cluster_size.unwrap_or(self.min_samples);
-                filter_small_clusters(&mut labels, min_size);
-                labels
+                    self.min_cluster_size,
+                    self.predecessor_correction,
+                )
             }
             OpticsClusterMethod::Dbscan => {
                 // Resolve `eps`: `eps = self.eps if self.eps is not None else
@@ -1122,24 +1223,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
                     });
                 }
                 // labels_ = cluster_optics_dbscan(reachability_, core_distances_,
-                // ordering_, eps)  (`:385-390`).
-                cluster_optics_dbscan(
+                // ordering_, eps)  (`:385-390`). sklearn does NOT set
+                // `cluster_hierarchy_` on this branch, so it stays empty.
+                let labels = cluster_optics_dbscan(
                     reachability.as_slice().unwrap_or(&[]),
                     core_distances.as_slice().unwrap_or(&[]),
                     &ordering,
                     eps,
-                )
+                );
+                (labels, Array2::<i64>::zeros((0, 2)))
             }
         };
-
-        // Build the sklearn-faithful `-1`-sentinel `predecessor_` from the
-        // `Option<usize>` predecessors: `Some(j) -> j as i64`, `None -> -1`
-        // (mirroring `np.full(n_samples, -1, dtype=int)` then in-place updates,
-        // `sklearn/cluster/_optics.py:604-605`, `:714`).
-        let predecessor_: Array1<i64> = predecessors
-            .iter()
-            .map(|p| p.map_or(-1i64, |j| j as i64))
-            .collect();
 
         Ok(FittedOPTICS {
             ordering_: ordering,
@@ -1149,6 +1243,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
             predecessors_: predecessors,
             predecessor_,
             min_samples_: self.min_samples,
+            cluster_hierarchy_,
         })
     }
 }
