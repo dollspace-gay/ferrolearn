@@ -946,7 +946,7 @@ fn green_dbscan_minkowski_p1_p2_collapse() {
 
     let p1 = DBSCAN::<f64>::new(1.2)
         .with_min_samples(2)
-        .with_p(1.0)
+        .with_metric(DbscanMetric::Minkowski(1.0))
         .fit(&x, &())
         .unwrap();
     for (i, &exp) in sk_p1_labels.iter().enumerate() {
@@ -975,7 +975,7 @@ fn green_dbscan_minkowski_p1_p2_collapse() {
 
     let p2 = DBSCAN::<f64>::new(1.2)
         .with_min_samples(2)
-        .with_p(2.0)
+        .with_metric(DbscanMetric::Minkowski(2.0))
         .fit(&x, &())
         .unwrap();
     for (i, &exp) in sk_p2_labels.iter().enumerate() {
@@ -1081,7 +1081,7 @@ fn green_dbscan_chebyshev_and_minkowski_p3() {
     // Minkowski p=3 — all chained (matches sklearn).
     let p3 = DBSCAN::<f64>::new(1.3)
         .with_min_samples(2)
-        .with_p(3.0)
+        .with_metric(DbscanMetric::Minkowski(3.0))
         .fit(&x, &())
         .unwrap();
     for (i, &exp) in sk_other_labels.iter().enumerate() {
@@ -1119,7 +1119,7 @@ fn green_dbscan_minkowski_nonpositive_p_rejected() {
     for &p in &[-1.0f64, 0.0] {
         let result = DBSCAN::<f64>::new(1.5)
             .with_min_samples(2)
-            .with_p(p)
+            .with_metric(DbscanMetric::Minkowski(p))
             .fit(&x, &());
         assert!(
             result.is_err(),
@@ -1130,14 +1130,13 @@ fn green_dbscan_minkowski_nonpositive_p_rejected() {
 }
 
 // ===========================================================================
-// RED PIN — metric/p precedence (REQ-6, #948): sklearn's `p` is an INDEPENDENT
-// parameter that is IGNORED for non-Minkowski metrics. ferrolearn conflates
-// `metric` and `p` into the single `metric: DbscanMetric<F>` field, so `with_p`
-// unconditionally OVERWRITES the metric to `Minkowski(p)` (`dbscan.rs`
-// `fn with_p`: `self.metric = DbscanMetric::Minkowski(p)`). There is no way to
-// express sklearn's `DBSCAN(metric='euclidean', p=3)` — setting both (in the
-// only available order, `.with_metric(Euclidean).with_p(3.0)`) silently becomes
-// Minkowski(3), diverging from sklearn which IGNORES p under euclidean.
+// GREEN guard (was a RED pin, fixed #2192) — metric/p precedence (REQ-6,
+// #948): sklearn's `p` is an INDEPENDENT parameter that is IGNORED for
+// non-Minkowski metrics. `DBSCAN::with_p` now updates the order ONLY when the
+// metric is already `Minkowski` (a no-op otherwise), so
+// `.with_metric(Euclidean).with_p(3.0)` stays Euclidean — matching sklearn's
+// `DBSCAN(metric='euclidean', p=3)`, which ignores `p`. To select Minkowski use
+// `.with_metric(DbscanMetric::Minkowski(p))`.
 //
 // sklearn `NearestNeighbors(metric=self.metric, ..., p=self.p)` passes `p`
 // ALONGSIDE `metric` (`_dbscan.py:411-418`), but `p` only feeds the Minkowski
@@ -1160,14 +1159,13 @@ fn green_dbscan_minkowski_nonpositive_p_rejected() {
 // labels [0,0,0,0] / core [0,1,2,3] (the Minkowski-p3 result), diverging.
 // ===========================================================================
 
-/// Divergence: ferrolearn's `DBSCAN::with_p` overwrites `metric` to
-/// `Minkowski(p)`, so `metric='euclidean'` + `p=3` (sklearn IGNORES p, returns
-/// the euclidean result `[-1,0,0,-1]` / core `[1,2]`,
-/// `sklearn/cluster/_dbscan.py:341,411-418`) cannot be expressed — the only
-/// available ferrolearn spelling `.with_metric(Euclidean).with_p(3.0)` yields
-/// the Minkowski-p3 result `[0,0,0,0]` / core `[0,1,2,3]`. Tracking: #2192.
+/// Fixed (#2192): `DBSCAN::with_p` now updates the order ONLY when the metric
+/// is already `Minkowski` (a no-op otherwise), mirroring sklearn where `p` is
+/// IGNORED for non-Minkowski metrics (`sklearn/cluster/_dbscan.py:341,411-418`).
+/// So `.with_metric(Euclidean).with_p(3.0)` stays Euclidean and yields the
+/// euclidean result `[-1,0,0,-1]` / core `[1,2]`, matching `DBSCAN(metric=
+/// 'euclidean', p=3)`. Tracking: #2192.
 #[test]
-#[ignore = "divergence: DBSCAN conflates metric/p, with_p overwrites metric so p is not ignored for euclidean; tracking #2192"]
 fn divergence_dbscan_p_ignored_for_euclidean() {
     // sklearn oracle: metric='euclidean', p=3 == euclidean (p IGNORED).
     let sklearn_labels: [isize; 4] = [-1, 0, 0, -1];

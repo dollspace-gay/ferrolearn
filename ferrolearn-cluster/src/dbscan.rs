@@ -81,7 +81,7 @@
 //! | REQ-3 (`eps>0` / `min_samples>=1` validation boundary) | SHIPPED | impl `Fit::fit` guards `self.eps <= F::zero()` → `Err(FerroError::InvalidParameter { name: "eps" })` and `self.min_samples == 0` → `Err(FerroError::InvalidParameter { name: "min_samples" })`, matching the accept/reject boundary of `_parameter_constraints` `"eps": [Interval(Real, 0.0, None, closed="neither")]` / `"min_samples": [Interval(Integral, 1, None, closed="left")]` (`_dbscan.py:332-333`). Non-test consumer: `RsDBSCAN::fit` maps the error to `PyValueError` (`ferrolearn-python/src/extras.rs`). Green guards: `green_dbscan_eps_zero_rejected` (`eps=0` → `Err`), `green_dbscan_min_samples_one_self_core` (`min_samples=1` accepted, self-core). GAP: the error TYPE is `FerroError::InvalidParameter`, not sklearn's `InvalidParameterError`/`ValueError` ABI — the boundary itself matches; the ABI nuance is tracked under REQ-4. |
 //! | REQ-4 (`eps=0.5` Rust-constructor default + sklearn error ABI) | NOT-STARTED | open prereq blocker **#946**. sklearn `__init__` `eps=0.5` default (`_dbscan.py:347`); ferrolearn `fn new(eps: F)` REQUIRES `eps` — no default. (The PyO3 layer DOES default `eps=0.5` in `RsDBSCAN::new`, but the Rust constructor `DBSCAN::new` does not.) Also validation errors are `FerroError::InvalidParameter`, not the sklearn `InvalidParameterError`/`ValueError` ABI (R-DEV-2). |
 //! | REQ-5 (`sample_weight` — alters core determination) | SHIPPED | impl: `DBSCAN<F>` gains `pub sample_weight: Option<Array1<F>>` + builder `fn with_sample_weight` (`dbscan.rs`); `Fit::fit` validates `w.len() == n_samples` (else `FerroError::ShapeMismatch { context: "sample_weight" }`, mirroring `_check_sample_weight`'s shape `ValueError`, `sklearn/utils/validation.py:2055-2060`) then, when `Some(w)`, sets the core mask `is_core[i] = (sum_{j in neighborhoods[i]} w[j]) >= F::from(min_samples)` — a FLOAT compare over the SAME self-including neighborhoods — mirroring `n_neighbors = [sum(sample_weight[neighbors])...]` + `core_samples = n_neighbors >= self.min_samples` (`_dbscan.py:427-435`). `None` keeps the byte-for-byte unchanged `len >= min_samples` path. Downstream BFS / `core_sample_indices_` / `components_` / `labels_` consume the new mask UNCHANGED. Negative/zero weights accepted (DBSCAN does not pass `only_non_negative`). Non-test consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate builder/accessors (the PyO3 `sample_weight` Python surface stays a REQ-9 follow-on, matching how `core_sample_indices_`/`components_` already ship through the re-export, not the binding). Live-oracle guards (`tests/divergence_dbscan.rs`, R-CHAR-3): `green_dbscan_weighted_flips_isolated_to_core` (`w=[5,1,1]` → `[0,-1,-1]` core `[0]` vs unweighted `[-1,-1,-1]` core `[]`), `green_dbscan_weighted_demotes_core_to_noise` (`w=[0.5;4]`, `min_samples=4` → all noise vs unweighted one cluster), `green_dbscan_all_ones_equals_unweighted` (`w=[1;8]` reproduces Fixture-A `[0,0,0,0,1,1,1,1]`/core `[0..8]` EXACTLY), `green_dbscan_fractional_weight_boundary` (`w=[0.5;8]`: `8*0.5=4.0 >= 4` core / `< 5` noise — the float `>=` boundary), `green_dbscan_sample_weight_wrong_length_errs` (`Err`, no panic). |
-//! | REQ-6 (`metric` / `p` / `metric_params`) | NOT-STARTED | open prereq blocker **#948**. sklearn accepts any `pairwise_distances` metric (`_dbscan.py:334-337`), `p` for Minkowski (`:341`), default `'euclidean'` (`:350`). ferrolearn `fn region_query` / `fn squared_euclidean` (`dbscan.rs`) is Euclidean-ONLY; no `metric`/`p`/`metric_params` param (oracle: `metric='manhattan'` → `[-1,0,0]` vs euclidean `[0,0,0]`). Missing surface. |
+//! | REQ-6 (`metric` / `p`) | SHIPPED | impl: `pub enum DbscanMetric<F> { Euclidean, Manhattan, Minkowski(F), Chebyshev }` + field `pub metric: DbscanMetric<F>` (default `Euclidean`) + builders `fn with_metric` / `fn with_p` on `DBSCAN<F>` (`dbscan.rs`); `Fit::fit` resolves the metric into `enum MetricThreshold` and `fn region_query` branches on it — Euclidean keeps the UNCHANGED `sum_sq <= eps*eps` (byte-for-byte default), Manhattan `sum\|dx\| <= eps`, Chebyshev `max\|dx\| <= eps`, Minkowski(p) the POWERED form `sum\|dx\|^p <= eps.powf(p)` (no outer `^(1/p)` root; `p==1` collapses to Manhattan, `p==2` to the exact Euclidean sum-sq form). Mirrors sklearn's `NearestNeighbors(metric=..., p=...).radius_neighbors` neighbor test `dist <= eps` (`_dbscan.py:411-422`), metric formulas `sklearn/metrics/_dist_metrics.pyx.tp:102-105`, default `'euclidean'` (`_dbscan.py:350`), `p=None`→`p=2` (`_dbscan.py:354`). `p <= 0` / NaN → `Err(FerroError::InvalidParameter { name: "p" })` (no panic), mirroring sklearn's `NearestNeighbors` `p in (0, inf]` `InvalidParameterError`. Non-test consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) surfaces the `with_metric`/`with_p` builders + public `metric` field (the enum is reachable via the `pub mod dbscan`; the PyO3 `metric`/`p` Python surface stays a follow-on, like `sample_weight`/REQ-5). Live-oracle guards (`tests/divergence_dbscan.rs`, R-CHAR-3): `green_dbscan_manhattan_vs_euclidean_labels` (Fixture M: manhattan `[-1,0,0]`/core `[1,2]` vs euclidean `[0,0,0]`/`[0,1,2]`), `green_dbscan_default_euclidean_equals_no_metric` (explicit Euclidean == no-metric, default unchanged), `green_dbscan_minkowski_p1_p2_collapse` (p=1==manhattan, p=2==euclidean, both == sklearn), `green_dbscan_chebyshev_and_minkowski_p3` (Fixture N: chebyshev & p=3 `[0,0,0,0]`/`[0,1,2,3]` vs euclidean `[-1,0,0,-1]`/`[1,2]`), `green_dbscan_minkowski_nonpositive_p_rejected` (p=-1/0 → `Err`, no panic). GAP: `metric_params`, `metric='precomputed'`, callable metric stay NOT-STARTED — `metric_params` (per-metric kwargs like Minkowski `w`/seuclidean `V`) has no ferrolearn surface (only scalar `p` is plumbed); `precomputed`/callable need a distance-matrix / closure input path (#948 scope). The #952 exact-eps-boundary distance-form caveat (REQ-11) PERSISTS per metric: each metric's `<=` compares ferrolearn's powered form against the powered `eps`, which can round to the opposite side of sklearn's tree/`pairwise_distances` computation for an edge whose true distance is within a ULP of `eps`. |
 //! | REQ-7 (`algorithm` / `leaf_size` / `n_jobs`) | NOT-STARTED | open prereq blocker **#949**. sklearn routes neighbor search through `NearestNeighbors(radius, algorithm, leaf_size, ..., n_jobs)` (`_dbscan.py:411-422`; constraints `:339-342`). ferrolearn uses a fixed brute-force `O(n^2)` `fn region_query` with no parameter. (Brute force value-matches the default `'auto'`; the divergence is the absent parameter surface.) Missing surface. |
 //! | REQ-8 (`components_` fitted attribute) | SHIPPED | impl: `Fit::fit` builds `components_: Array2<F>` of shape `(core_sample_indices.len(), n_features)` whose row `k` is `x.row(core_sample_indices[k])`, stored in `FittedDBSCAN`, surfaced via accessor `fn components` in `dbscan.rs` — mirroring `self.components_ = X[self.core_sample_indices_].copy()` (`_dbscan.py:441-446`). VALUE-matches the live sklearn 1.5.2 oracle (`DBSCAN(eps=0.5, min_samples=3)` on the 7-point fixture → `components_` shape `(6,2)` = `[[1,1],[1.2,1.1],[0.9,1.0],[8,8],[8.1,8.2],[8.0,7.9]]`, the rows of `X` at `core_sample_indices_ = [0,1,2,3,4,5]`). Consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate accessor (the PyO3 layer does not yet re-expose `components_`, see REQ-9). Green guard: `dbscan_components_match_sklearn` (`dbscan.rs` tests). |
 //! | REQ-9 (PyO3 binding VALUE parity) | SHIPPED | impl `#[pyclass(name = "_RsDBSCAN")] RsDBSCAN` (`ferrolearn-python/src/extras.rs`): `fn new(eps=0.5, min_samples=5)`, `fn fit` calling `ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples)`, `#[getter] labels_`; registered via `m.add_class::<extras::RsDBSCAN>()` (`ferrolearn-python/src/lib.rs`), surfaced as `ferrolearn.DBSCAN` (`fit_predict` / `labels_`). Non-test consumer: `import ferrolearn; ferrolearn.DBSCAN(...).fit(X).labels_`. Since the Rust core value-matches (REQ-1/2), `import ferrolearn` matches `import sklearn` on the Euclidean / no-`sample_weight` path. The binding does NOT yet re-expose `core_sample_indices_` / `components_` / `sample_weight` / `metric` (only `labels_` via `#[getter]`) — those ride their own REQs. |
@@ -144,6 +144,59 @@ fn numpy_pairwise_sum<F: Float>(a: &[F]) -> F {
     }
 }
 
+/// The neighbor distance metric used by [`DBSCAN`] to decide whether two
+/// samples are within `eps` of each other.
+///
+/// A point `j` is a neighbor of point `i` iff `dist(i, j) <= eps` under the
+/// chosen metric, mirroring scikit-learn's
+/// `NearestNeighbors(radius=eps, metric=..., p=...).radius_neighbors`
+/// (`sklearn/cluster/_dbscan.py:411-422`). The metric names and formulas
+/// mirror `sklearn.metrics.DistanceMetric`
+/// (`sklearn/metrics/_dist_metrics.pyx.tp:102-105`):
+///
+/// - [`Euclidean`](DbscanMetric::Euclidean) (`'euclidean'`/`'l2'`):
+///   `sqrt(sum((xi - yi)^2))`.
+/// - [`Manhattan`](DbscanMetric::Manhattan) (`'manhattan'`/`'l1'`/`'cityblock'`):
+///   `sum(|xi - yi|)`.
+/// - [`Minkowski(p)`](DbscanMetric::Minkowski) (`'minkowski'` with `p`):
+///   `(sum(|xi - yi|^p))^(1/p)`; `p = 1` is Manhattan, `p = 2` is Euclidean.
+///   In scikit-learn, `metric='minkowski'` with `p=None` means `p = 2`
+///   (Euclidean) (`sklearn/cluster/_dbscan.py:354`); construct
+///   [`Minkowski`](DbscanMetric::Minkowski) with the resolved `p` value.
+/// - [`Chebyshev`](DbscanMetric::Chebyshev) (`'chebyshev'`/`'l_inf'`):
+///   `max(|xi - yi|)`.
+///
+/// The default is [`Euclidean`](DbscanMetric::Euclidean), so
+/// [`DBSCAN::new`] (and any model that never calls [`DBSCAN::with_metric`])
+/// behaves identically to the metric-free implementation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DbscanMetric<F> {
+    /// Euclidean (L2) distance: `sqrt(sum((xi - yi)^2))`.
+    Euclidean,
+    /// Manhattan (L1 / cityblock) distance: `sum(|xi - yi|)`.
+    Manhattan,
+    /// Minkowski distance of order `p`: `(sum(|xi - yi|^p))^(1/p)`.
+    ///
+    /// `p = 1` is equivalent to [`Manhattan`](DbscanMetric::Manhattan) and
+    /// `p = 2` to [`Euclidean`](DbscanMetric::Euclidean). The neighbor test
+    /// compares the powered sum `sum(|xi - yi|^p)` against `eps^p` to avoid
+    /// the outer `^(1/p)` root (matching sklearn's `dist <= eps`). `p` must be
+    /// strictly positive; a non-positive `p` is rejected at [`Fit::fit`] time
+    /// (sklearn's `NearestNeighbors` requires `p` in `(0, inf]`).
+    Minkowski(F),
+    /// Chebyshev (L-infinity) distance: `max(|xi - yi|)`.
+    Chebyshev,
+}
+
+impl<F> Default for DbscanMetric<F> {
+    /// The default metric is [`Euclidean`](DbscanMetric::Euclidean), matching
+    /// scikit-learn's `metric='euclidean'` default
+    /// (`sklearn/cluster/_dbscan.py:350`).
+    fn default() -> Self {
+        DbscanMetric::Euclidean
+    }
+}
+
 /// DBSCAN clustering configuration (unfitted).
 ///
 /// Holds hyperparameters for the DBSCAN algorithm. Call [`Fit::fit`]
@@ -167,6 +220,13 @@ pub struct DBSCAN<F> {
     /// (`sklearn/cluster/_dbscan.py:427-429`). `None` is equivalent to all
     /// ones (the unweighted `len >= min_samples` path).
     pub sample_weight: Option<Array1<F>>,
+    /// The neighbor distance metric. A sample `j` is a neighbor of `i` iff
+    /// `dist(i, j) <= eps` under this metric, mirroring
+    /// `NearestNeighbors(metric=..., p=...)` (`sklearn/cluster/_dbscan.py:411-422`).
+    /// Defaults to [`DbscanMetric::Euclidean`] (sklearn `metric='euclidean'`,
+    /// `_dbscan.py:350`); the Euclidean path is byte-for-byte identical to the
+    /// metric-free implementation.
+    pub metric: DbscanMetric<F>,
 }
 
 impl<F: Float> DBSCAN<F> {
@@ -179,6 +239,7 @@ impl<F: Float> DBSCAN<F> {
             eps,
             min_samples: 5,
             sample_weight: None,
+            metric: DbscanMetric::Euclidean,
         }
     }
 
@@ -186,6 +247,42 @@ impl<F: Float> DBSCAN<F> {
     #[must_use]
     pub fn with_min_samples(mut self, min_samples: usize) -> Self {
         self.min_samples = min_samples;
+        self
+    }
+
+    /// Set the neighbor distance metric.
+    ///
+    /// Mirrors scikit-learn's `DBSCAN(metric=..., p=...)`: a sample `j` is a
+    /// neighbor of `i` iff `dist(i, j) <= eps` under the chosen metric
+    /// (`sklearn/cluster/_dbscan.py:411-422`). The default
+    /// [`DbscanMetric::Euclidean`] reproduces the metric-free path exactly. For
+    /// `metric='minkowski'` with `p`, pass [`DbscanMetric::Minkowski`] with the
+    /// resolved `p` (sklearn's `p=None` means `p = 2`, i.e. Euclidean,
+    /// `_dbscan.py:354`); the `p` value is validated to be strictly positive at
+    /// [`Fit::fit`] time.
+    #[must_use]
+    pub fn with_metric(mut self, metric: DbscanMetric<F>) -> Self {
+        self.metric = metric;
+        self
+    }
+
+    /// Set the Minkowski order `p`.
+    ///
+    /// In scikit-learn `p` is a parameter ORTHOGONAL to `metric` that is used
+    /// ONLY by the Minkowski metric and is IGNORED for every other metric
+    /// (`sklearn/cluster/_dbscan.py:411-418`; e.g. `DBSCAN(metric='euclidean',
+    /// p=3)` is plain Euclidean, not Minkowski, #2192). This mirrors that: it
+    /// updates the order only when the current metric is
+    /// [`DbscanMetric::Minkowski`], and is a no-op otherwise. To SELECT the
+    /// Minkowski metric, use [`with_metric`](Self::with_metric) with
+    /// [`DbscanMetric::Minkowski`] (`p = 1` is Manhattan, `p = 2` is Euclidean;
+    /// `p` is validated strictly positive at [`Fit::fit`] time, matching
+    /// `NearestNeighbors`' `p` in `(0, inf]`).
+    #[must_use]
+    pub fn with_p(mut self, p: F) -> Self {
+        if matches!(self.metric, DbscanMetric::Minkowski(_)) {
+            self.metric = DbscanMetric::Minkowski(p);
+        }
         self
     }
 
@@ -269,8 +366,67 @@ fn squared_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
 }
 
-/// Find all neighbors within `eps` distance of point `idx`.
-fn region_query<F: Float>(x: &Array2<F>, idx: usize, eps_sq: F) -> Vec<usize> {
+/// Compute the Manhattan (L1) distance `sum(|ai - bi|)` between two slices.
+fn manhattan<F: Float>(a: &[F], b: &[F]) -> F {
+    a.iter()
+        .zip(b.iter())
+        .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi).abs())
+}
+
+/// Compute the powered Minkowski sum `sum(|ai - bi|^p)` between two slices
+/// (the inner term of `(sum(|xi - yi|^p))^(1/p)`, BEFORE the outer root).
+fn minkowski_powered_sum<F: Float>(a: &[F], b: &[F], p: F) -> F {
+    a.iter()
+        .zip(b.iter())
+        .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi).abs().powf(p))
+}
+
+/// Compute the Chebyshev (L-infinity) distance `max(|ai - bi|)` between two
+/// slices.
+fn chebyshev<F: Float>(a: &[F], b: &[F]) -> F {
+    a.iter()
+        .zip(b.iter())
+        .fold(F::zero(), |acc, (&ai, &bi)| acc.max((ai - bi).abs()))
+}
+
+/// The per-metric threshold form used by [`region_query`].
+///
+/// To match scikit-learn's `dist(i, j) <= eps` while avoiding extra rounding
+/// from an outer root, each variant carries a comparison that is exact in the
+/// same algebra sklearn uses:
+///
+/// - [`SquaredEuclidean(eps^2)`](MetricThreshold::SquaredEuclidean): compare
+///   `sum((xi - yi)^2) <= eps^2` (the unchanged default path — no `sqrt`).
+/// - [`Manhattan(eps)`](MetricThreshold::Manhattan): compare `sum(|dx|) <= eps`.
+/// - [`Minkowski { p, eps_pow_p }`](MetricThreshold::Minkowski): compare the
+///   powered sum `sum(|dx|^p) <= eps^p` (no outer `^(1/p)`).
+/// - [`Chebyshev(eps)`](MetricThreshold::Chebyshev): compare `max(|dx|) <= eps`.
+#[derive(Debug, Clone, Copy)]
+enum MetricThreshold<F> {
+    /// Compare the sum-of-squares against `eps^2` (Euclidean / L2).
+    SquaredEuclidean(F),
+    /// Compare the sum of absolute differences against `eps` (Manhattan / L1).
+    Manhattan(F),
+    /// Compare the powered Minkowski sum `sum(|dx|^p)` against `eps^p`.
+    Minkowski {
+        /// The Minkowski order `p` (strictly positive).
+        p: F,
+        /// `eps^p`, precomputed so `region_query` does not take the outer root.
+        eps_pow_p: F,
+    },
+    /// Compare the max absolute difference against `eps` (Chebyshev / L_inf).
+    Chebyshev(F),
+}
+
+/// Find all neighbors within `eps` distance of point `idx` under the given
+/// metric threshold.
+///
+/// A point `j` is a neighbor iff `dist(idx, j) <= eps`, mirroring
+/// `radius_neighbors` (`sklearn/cluster/_dbscan.py:411-422`). Each branch
+/// compares the metric's powered form against the matching powered `eps`
+/// (e.g. `sum_sq <= eps^2`, `sum(|dx|^p) <= eps^p`) so the default Euclidean
+/// path is byte-for-byte unchanged and no extra root rounding is introduced.
+fn region_query<F: Float>(x: &Array2<F>, idx: usize, threshold: MetricThreshold<F>) -> Vec<usize> {
     let n_samples = x.nrows();
     let row = x.row(idx);
     let row_slice = row.as_slice().unwrap_or(&[]);
@@ -279,7 +435,17 @@ fn region_query<F: Float>(x: &Array2<F>, idx: usize, eps_sq: F) -> Vec<usize> {
     for j in 0..n_samples {
         let other = x.row(j);
         let other_slice = other.as_slice().unwrap_or(&[]);
-        if squared_euclidean(row_slice, other_slice) <= eps_sq {
+        let included = match threshold {
+            MetricThreshold::SquaredEuclidean(eps_sq) => {
+                squared_euclidean(row_slice, other_slice) <= eps_sq
+            }
+            MetricThreshold::Manhattan(eps) => manhattan(row_slice, other_slice) <= eps,
+            MetricThreshold::Minkowski { p, eps_pow_p } => {
+                minkowski_powered_sum(row_slice, other_slice, p) <= eps_pow_p
+            }
+            MetricThreshold::Chebyshev(eps) => chebyshev(row_slice, other_slice) <= eps,
+        };
+        if included {
             neighbors.push(j);
         }
     }
@@ -338,11 +504,46 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
             });
         }
 
-        let eps_sq = self.eps * self.eps;
+        // Resolve the metric into a powered threshold (mirroring sklearn's
+        // `NearestNeighbors(metric=..., p=...).radius_neighbors` neighbor test
+        // `dist <= eps`, `_dbscan.py:411-422`). Each branch compares a powered
+        // distance form against the matching powered `eps` so the default
+        // Euclidean path is byte-for-byte the prior `sum_sq <= eps*eps` and no
+        // outer root rounding is introduced. `Minkowski(p)` validates `p > 0`
+        // (sklearn's `NearestNeighbors` requires `p` in `(0, inf]`; `p=1`
+        // collapses to Manhattan, `p=2` to the exact Euclidean sum-of-squares
+        // form for byte-for-byte parity with the default).
+        let threshold = match self.metric {
+            DbscanMetric::Euclidean => MetricThreshold::SquaredEuclidean(self.eps * self.eps),
+            DbscanMetric::Manhattan => MetricThreshold::Manhattan(self.eps),
+            DbscanMetric::Chebyshev => MetricThreshold::Chebyshev(self.eps),
+            DbscanMetric::Minkowski(p) => {
+                // Reject any `p` that is not strictly positive (including NaN,
+                // which fails every ordered comparison). sklearn's
+                // `NearestNeighbors` requires `p` in `(0, inf]`.
+                if p <= F::zero() || p.is_nan() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "p".into(),
+                        reason: "must be a positive float (Minkowski order)".into(),
+                    });
+                }
+                if p == F::one() {
+                    MetricThreshold::Manhattan(self.eps)
+                } else if p == F::from(2).unwrap_or_else(F::nan) {
+                    MetricThreshold::SquaredEuclidean(self.eps * self.eps)
+                } else {
+                    MetricThreshold::Minkowski {
+                        p,
+                        eps_pow_p: self.eps.powf(p),
+                    }
+                }
+            }
+        };
 
         // Step 1: Find neighborhoods for all points.
-        let neighborhoods: Vec<Vec<usize>> =
-            (0..n_samples).map(|i| region_query(x, i, eps_sq)).collect();
+        let neighborhoods: Vec<Vec<usize>> = (0..n_samples)
+            .map(|i| region_query(x, i, threshold))
+            .collect();
 
         // Step 2: Identify core points.
         //
