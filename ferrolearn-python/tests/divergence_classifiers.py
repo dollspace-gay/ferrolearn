@@ -609,6 +609,29 @@ def test_knn_euclidean_metric_supported():
     assert np.asarray(fl.predict(_KNN_XQ)).tolist() == sk.predict(_KNN_XQ).tolist()
 
 
+def test_knn_euclidean_metric_ignores_p():
+    """GREEN (#2148): metric='euclidean' ignores p (sklearn _base.py:526-538) —
+    KNeighborsClassifier(metric='euclidean', p=3) is VALID and matches sklearn,
+    NOT a NotImplementedError. p is only consumed for metric='minkowski'."""
+    from sklearn.neighbors import KNeighborsClassifier as SkKNN
+
+    sk = SkKNN(n_neighbors=3, metric="euclidean", p=3).fit(_KNN_X, _KNN_Y)
+    fl = ferrolearn.KNeighborsClassifier(
+        n_neighbors=3, metric="euclidean", p=3
+    ).fit(_KNN_X, _KNN_Y)
+    assert np.asarray(fl.predict(_KNN_XQ)).tolist() == sk.predict(_KNN_XQ).tolist()
+
+
+def test_knn_invalid_weights_string_is_valueerror():
+    """GREEN (#2149): an invalid weights STRING raises a ValueError (sklearn's
+    InvalidParameterError is a ValueError subclass), NOT NotImplementedError —
+    so the sklearn-idiomatic `except ValueError` catches it. (Callable weights
+    remain NotImplementedError #876, tested separately.)"""
+    fl = ferrolearn.KNeighborsClassifier(n_neighbors=3, weights="foo")
+    with pytest.raises(ValueError):
+        fl.fit(_KNN_X, _KNN_Y)
+
+
 def test_knn_unsupported_callable_weights_raises():
     """GREEN (#2138): callable weights raise NotImplementedError (#876)."""
     fl = ferrolearn.KNeighborsClassifier(

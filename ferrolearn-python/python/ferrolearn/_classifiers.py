@@ -15,6 +15,24 @@ from ferrolearn._ferrolearn_rs import (
     _RsRandomForestClassifier,
 )
 
+# sklearn 1.5.2's full set of recognized neighbors metric names
+# (`set(itertools.chain(*sklearn.neighbors.VALID_METRICS.values()))`,
+# neighbors/_base.py:401). A metric STRING outside this set is an
+# InvalidParameterError (a ValueError subclass) in sklearn; a metric INSIDE it
+# that ferrolearn's Euclidean-only core cannot compute (e.g. 'cityblock',
+# 'cosine', 'manhattan', 'l1') is an honest NotImplementedError (#876). Keeping
+# this distinction is why an invalid metric must raise ValueError, not #876.
+_SKLEARN_VALID_KNN_METRICS = frozenset(
+    {
+        "braycurtis", "canberra", "chebyshev", "cityblock", "correlation",
+        "cosine", "dice", "euclidean", "hamming", "haversine", "infinity",
+        "jaccard", "l1", "l2", "mahalanobis", "manhattan", "minkowski",
+        "nan_euclidean", "p", "precomputed", "pyfunc", "rogerstanimoto",
+        "russellrao", "seuclidean", "sokalmichener", "sokalsneath",
+        "sqeuclidean", "yule",
+    }
+)
+
 
 def _ensure_f64(arr):
     """Ensure array is C-contiguous float64 (required by Rust bindings)."""
@@ -365,25 +383,84 @@ class KNeighborsClassifier(_ClassifierPickleMixin, ClassifierMixin, BaseEstimato
         return self
 
     def _build_rs(self):
-        # Callable weights are NOT supported (the Rust core has only
-        # Weights::{Uniform, Distance}); reject before the str-typed boundary
-        # so the user sees a clear NotImplementedError, not a PyO3 TypeError
-        # (NOT-STARTED #876).
-        if callable(self.weights):
+        # sklearn validates n_neighbors in [1, inf) and leaf_size in [1, inf)
+        # (Integral) at fit, raising InvalidParameterError (a ValueError
+        # subclass). Mirror that here — Python-side, before the usize ABI
+        # boundary that would otherwise raise OverflowError for negatives (#2152).
+        if not isinstance(self.n_neighbors, (int, np.integer)) or self.n_neighbors < 1:
+            raise ValueError(
+                f"n_neighbors == {self.n_neighbors}, must be >= 1 (an int in [1, inf))."
+            )
+        if not isinstance(self.leaf_size, (int, np.integer)) or self.leaf_size < 1:
+            raise ValueError(
+                f"leaf_size == {self.leaf_size}, must be >= 1 (an int in [1, inf))."
+            )
+        # n_jobs: sklearn constraint [Integral, None] (neighbors/_base.py:404).
+        # A non-int (e.g. 1.5/'x') is an InvalidParameterError (ValueError);
+        # mirror that before the Option<i64> ABI boundary that would TypeError
+        # (#2152). bool is Integral, so it is accepted (sklearn does too).
+        if self.n_jobs is not None and not isinstance(self.n_jobs, (int, np.integer)):
+            raise ValueError(f"n_jobs must be an int or None, got {self.n_jobs!r}.")
+        # weights: sklearn accepts {'uniform','distance'}, a callable, or None;
+        # None behaves identically to 'uniform' (neighbors/_classification.py:190).
+        # callable is NOT supported (#876). An invalid string is rejected
+        # (ValueError) at the Rust boundary.
+        weights = self.weights
+        if weights is None:
+            weights = "uniform"
+        elif callable(weights):
             raise NotImplementedError(
                 "callable weights not supported (only 'uniform'/'distance'; "
                 "NOT-STARTED #876)"
             )
-        # metric_params is wrapper-validated: the Rust core has no custom
-        # metric, so only None is supported (NOT-STARTED #876).
-        if self.metric_params is not None:
-            raise NotImplementedError(
-                f"metric_params={self.metric_params!r} not supported "
-                "(no custom metric; NOT-STARTED #876)"
+        elif not isinstance(weights, str):
+            raise ValueError(
+                "weights must be 'uniform', 'distance', a callable, or None, got "
+                f"{weights!r}."
             )
+        # algorithm/metric: sklearn requires a str (metric also accepts a
+        # callable). A non-str (e.g. None/int) is an InvalidParameterError
+        # (ValueError); mirror that before the Rust String boundary that would
+        # otherwise TypeError (#2156). An invalid str value is rejected
+        # (ValueError / NotImplementedError) inside the Rust binding.
+        if not isinstance(self.algorithm, str):
+            raise ValueError(
+                "algorithm must be one of 'auto', 'ball_tree', 'kd_tree', "
+                f"'brute', got {self.algorithm!r}."
+            )
+        if callable(self.metric):
+            raise NotImplementedError(
+                "callable metric not supported (no custom metric; NOT-STARTED #876)"
+            )
+        if not isinstance(self.metric, str):
+            raise ValueError(f"metric must be a str or callable, got {self.metric!r}.")
+        # A metric string OUTSIDE sklearn's recognized set is an invalid
+        # parameter (ValueError); reject it here so it is NOT conflated with a
+        # valid-but-unimplemented metric (which the Rust core reports as
+        # NotImplementedError #876).
+        if self.metric not in _SKLEARN_VALID_KNN_METRICS:
+            raise ValueError(
+                f"metric={self.metric!r} is not a valid metric "
+                "(not among sklearn's recognized metric names)."
+            )
+        # metric_params: sklearn constraint [dict, None] (neighbors/_base.py:402).
+        # An EMPTY dict is valid (no custom params == None) and is accepted; a
+        # non-dict (e.g. a list) is a ValueError; a NON-EMPTY dict needs a custom
+        # metric the Rust core lacks (NOT-STARTED #876).
+        if self.metric_params is not None:
+            if not isinstance(self.metric_params, dict):
+                raise ValueError(
+                    "metric_params must be a dict or None, got "
+                    f"{type(self.metric_params).__name__}."
+                )
+            if len(self.metric_params) > 0:
+                raise NotImplementedError(
+                    f"metric_params={self.metric_params!r} not supported "
+                    "(no custom metric; NOT-STARTED #876)"
+                )
         return _RsKNeighborsClassifier(
             n_neighbors=self.n_neighbors,
-            weights=self.weights,
+            weights=weights,
             algorithm=self.algorithm,
             leaf_size=self.leaf_size,
             p=float(self.p),

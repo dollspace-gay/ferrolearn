@@ -19,7 +19,7 @@
 //! or NOT-STARTED (with a concrete blocker). Verified via
 //! `tests/divergence_extras.py` + the per-category divergence suites (595 pytest pass).
 //!
-//! **13 SHIPPED / 5 NOT-STARTED.**
+//! **14 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -38,7 +38,8 @@
 //! | REQ-DISCRETE-NB-FITTED-ATTRS (feature_log_prob_/class_log_prior_/feature_count_/class_count_) | SHIPPED | FIXED #2103: `MultinomialNB`/`BernoulliNB`/`ComplementNB` expose the four `_BaseDiscreteNB` fitted attrs (sklearn/naive_bayes.py:880-892/580-602/1032-1042). A SECOND `#[pymethods] impl Rs{Multinomial,Bernoulli,Complement}NB` block (pyo3 `multiple-pymethods`) adds four `#[getter]`s each over the Rust fitted types (`FittedMultinomialNB` multinomial.rs:489/499/509/520, `FittedBernoulliNB` bernoulli.rs:520/530/540/551, `FittedComplementNB` complement.rs:535/586/545/556); `py_classifier!` macro + its 18 invocations UNCHANGED. ComplementNB `feature_log_prob_` is the `-logged` complement weight (positive) per sklearn. Non-test consumer: `_extras.py::_DiscreteNBWrapper.fit` sets `self.{feature_log_prob_,class_log_prior_,feature_count_,class_count_}` from `self._rs.*` (the three NB wrappers subclass it). Verification (model B): `tests/divergence_extras.py::test_{multinomial,bernoulli,complement}_discrete_nb_fitted_attrs_match_sklearn` (live sklearn 1.5.2 oracle, atol 1e-7). |
 //! | REQ-BERNOULLI-BINARIZE-NONE (`binarize=None` skips binarization) | SHIPPED | FIXED #2104: `_RsBernoulliNB` now types `binarize: Option<f64> = Some(0.0)` (was `f64 = 0.0`) and builds via `BernoulliNB::with_binarize_option(binarize)` (bernoulli.rs), so pyo3 maps Python `None`→`Option::None` (skips binarization, sklearn/naive_bayes.py:1076,1156,1179,1185) and a float→`Some(f64)`. `feature_count_` then accumulates raw X. Non-test consumer: `_extras.py::BernoulliNB.__init__(binarize=0.0)` passes `self.binarize` straight through (default 0.0 unchanged). Verification (model B): `tests/divergence_extras.py::test_red_bernoulli_binarize_none_feature_count_matches_sklearn` (live sklearn 1.5.2 oracle, atol 1e-9). |
 //! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
-//! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. |
+//! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. (`KNeighborsRegressor` is the exception: full surface SHIPPED, REQ-KNR-CTOR-SURFACE.) |
+//! | REQ-KNR-CTOR-SURFACE (KNeighborsRegressor full constructor) | SHIPPED | FIXED #2147: hand-written `RsKNeighborsRegressor` (replacing the `n_neighbors`-only `py_regressor!` invocation) mirrors `RsKNeighborsClassifier` and exposes sklearn's full `(n_neighbors, weights, algorithm, leaf_size, p, metric, metric_params, n_jobs)` surface (`neighbors/_regression.py:178-189`); `weights='distance'` changes predictions and matches the live sklearn 1.5.2 oracle. `fit(x, y: f64)`/`predict→PyArray1<f64>` keep the macro ABI. Validation is metric-aware (FIXED #2148): `metric='minkowski'` requires `p==2` (else `PyNotImplementedError #876`); `metric='euclidean'` accepts ANY `p` (sklearn ignores p for euclidean, `_base.py:526-538`); other metrics `PyNotImplementedError #876`; an invalid `weights` STRING raises `ValueError` (sklearn `InvalidParameterError ⊂ ValueError`, FIXED #2149); callable-weights/`metric_params` reject with `NotImplementedError #876`. Non-test consumer: `_extras.py::KNeighborsRegressor` full shim (`_make_rs`/`fit`/`predict` + `_RegressorPickleMixin`). Verification: `tests/divergence_extras.py::test_knr_*` (14 cases) + `tests/divergence_knr_ctor_surface.py` (#2148/#2149 pins). |
 //! | REQ-VALUE-PARITY-RNG (seeded stochastic parity) | NOT-STARTED | the stochastic estimators (RF/ET/GB/HistGB/Bagging/AdaBoost/MiniBatchKMeans/GMM/FastICA/NMF) pass `random_state: Option<u64>` to a non-numpy RNG, so a shared `random_state` will not reproduce sklearn's numpy-MT/PCG64 draws (R-SUBSTRATE-5; needs `ferray::random`). |
 //! | REQ-CONSUMER (binding IS the public API) | SHIPPED | non-test consumers: the `_extras.py` wrappers + `GaussianMixture` construct their `_Rs*` class via `_make_rs` and drive fit/predict/transform; `ferrolearn/__init__.py` re-exports all ~40; `lib.rs` registers every `_Rs*`; the head-to-head bench drives them vs sklearn (595 pytest pass). |
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
@@ -496,15 +497,177 @@ impl RsHistGradientBoostingRegressor {
     }
 }
 
-py_regressor!(
-    RsKNeighborsRegressor, "_RsKNeighborsRegressor",
-    ferrolearn_neighbors::FittedKNeighborsRegressor<f64>,
-    (n_neighbors: usize = 5),
-    {
-        ferrolearn_neighbors::KNeighborsRegressor::<f64>::new()
-            .with_n_neighbors(n_neighbors)
+// ---------------------------------------------------------------------------
+// KNeighborsRegressor (#2147): hand-written pyclass exposing the FULL sklearn
+// constructor surface (`neighbors/_regression.py:178-189`:
+// `(n_neighbors=5, *, weights='uniform', algorithm='auto', leaf_size=30, p=2,
+//  metric='minkowski', metric_params=None, n_jobs=None)`). Replaces the thin
+// `py_regressor!(... (n_neighbors: usize = 5) ...)` invocation. `weights`
+// CHANGES PREDICTIONS (inverse-distance-weighted average of neighbor targets);
+// the Rust core already supports it (`knn.rs:1160-1175` `with_n_neighbors`/
+// `with_weights`/`with_algorithm`). Mirrors `RsKNeighborsClassifier`
+// (classifiers.rs) but `fit(X, y: f64)` over continuous targets and `predict`
+// returns `PyArray1<f64>` — same fit/predict ABI the `py_regressor!` macro
+// emitted, so `_extras.py`'s plumbing is unchanged.
+#[pyclass(name = "_RsKNeighborsRegressor")]
+pub struct RsKNeighborsRegressor {
+    n_neighbors: usize,
+    weights: String,
+    algorithm: String,
+    // `leaf_size`/`n_jobs` are stored for ABI parity with sklearn
+    // (`neighbors/_regression.py:184,188`) but are search-perf / threading
+    // knobs only — they do NOT change the predicted result, so they are
+    // accepted and held without affecting the fitted model.
+    #[allow(
+        dead_code,
+        reason = "ABI-parity no-op: leaf_size affects only tree-build perf, not the result (sklearn neighbors/_regression.py:184)"
+    )]
+    leaf_size: usize,
+    p: f64,
+    metric: String,
+    #[allow(
+        dead_code,
+        reason = "ABI-parity no-op: n_jobs is a threading knob, not a result-affecting param (sklearn neighbors/_regression.py:188)"
+    )]
+    n_jobs: Option<i64>,
+    fitted: Option<ferrolearn_neighbors::FittedKNeighborsRegressor<f64>>,
+}
+
+#[pymethods]
+impl RsKNeighborsRegressor {
+    #[new]
+    #[pyo3(signature = (
+        n_neighbors=5,
+        weights="uniform".to_string(),
+        algorithm="auto".to_string(),
+        leaf_size=30,
+        p=2.0,
+        metric="minkowski".to_string(),
+        n_jobs=None,
+    ))]
+    fn new(
+        n_neighbors: usize,
+        weights: String,
+        algorithm: String,
+        leaf_size: usize,
+        p: f64,
+        metric: String,
+        n_jobs: Option<i64>,
+    ) -> Self {
+        Self {
+            n_neighbors,
+            weights,
+            algorithm,
+            leaf_size,
+            p,
+            metric,
+            n_jobs,
+            fitted: None,
+        }
     }
-);
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        use ferrolearn_neighbors::{Algorithm, Weights};
+
+        // weights: only 'uniform'/'distance' are supported in the Rust core
+        // (`knn.rs::Weights`); callable weights are NOT-STARTED (#876).
+        // 'distance' weights neighbor targets by inverse distance — it CHANGES
+        // the prediction (sklearn/neighbors/_regression.py:43-45).
+        let weights = match self.weights.as_str() {
+            "uniform" => Weights::Uniform,
+            "distance" => Weights::Distance,
+            other => {
+                // An invalid weights STRING is a parameter-value error, not an
+                // unsupported-feature error: sklearn raises InvalidParameterError
+                // (a ValueError subclass). Callable weights are intercepted in
+                // the Python shim (NotImplementedError #876) and never reach here.
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "weights={other:?} is invalid (expected 'uniform' or 'distance')"
+                )));
+            }
+        };
+
+        // algorithm: 'auto'/'brute'/'kd_tree'/'ball_tree' all produce the SAME
+        // predict (search strategy only). The Rust core has no exact
+        // 'ball_tree'-distinct regressor variant, so it maps to Auto (identical
+        // result), mirroring `RsKNeighborsClassifier`.
+        let algorithm = match self.algorithm.as_str() {
+            "auto" => Algorithm::Auto,
+            "brute" => Algorithm::BruteForce,
+            "kd_tree" => Algorithm::KdTree,
+            "ball_tree" => Algorithm::Auto,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "invalid algorithm: {other:?} (expected one of \
+                     'auto', 'brute', 'kd_tree', 'ball_tree')"
+                )));
+            }
+        };
+
+        // sklearn validates `p` against Interval(Real, 0, None, closed="right")
+        // == (0, inf] UNCONDITIONALLY at fit, BEFORE the metric is consulted
+        // (sklearn/neighbors/_base.py:400), so p <= 0 (and NaN) is an
+        // InvalidParameterError (a ValueError subclass) for ANY metric (#2151).
+        if self.p <= 0.0 || self.p.is_nan() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "p={} is invalid (must be in the range (0, inf])",
+                self.p
+            )));
+        }
+
+        // The Rust core is Euclidean-only. sklearn consumes `p` ONLY when
+        // metric == "minkowski" (sklearn/neighbors/_base.py:526-538); 'euclidean'
+        // and its alias 'l2' ARE the Euclidean (p=2) distance and accept any
+        // valid p (p is ignored). metric == "minkowski" requires p == 2; other p
+        // (true Minkowski) and all non-Euclidean metrics are NOT-STARTED (#876).
+        match self.metric.as_str() {
+            "euclidean" | "l2" => {}
+            "minkowski" => {
+                if self.p != 2.0 {
+                    return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                        "p={} not supported for metric='minkowski' (Euclidean-only, \
+                         p=2; Minkowski-p NOT-STARTED #876)",
+                        self.p
+                    )));
+                }
+            }
+            other => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "metric={other:?} not supported (only minkowski(p=2)/euclidean/l2; \
+                     NOT-STARTED #876)"
+                )));
+            }
+        }
+
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let model = ferrolearn_neighbors::KNeighborsRegressor::<f64>::new()
+            .with_n_neighbors(self.n_neighbors)
+            .with_weights(weights)
+            .with_algorithm(algorithm);
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+}
 
 py_regressor!(
     RsKernelRidge, "_RsKernelRidge",

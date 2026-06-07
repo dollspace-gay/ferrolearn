@@ -175,3 +175,34 @@ def test_knn_reg_weights_none_is_accepted_as_uniform():
     np.testing.assert_allclose(expected, sk_unif.predict(Xq), rtol=0, atol=0)
     got = fl.KNeighborsRegressor(n_neighbors=3, weights=None).fit(X, y).predict(Xq)
     np.testing.assert_allclose(got, expected, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# #2156 — non-str weights/algorithm/metric (e.g. None, int): sklearn raises a
+#         ValueError (InvalidParameterError); ferrolearn previously hit the Rust
+#         String ABI boundary and raised TypeError, uncatchable as ValueError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{"weights": 123}, {"algorithm": None}, {"algorithm": 7}, {"metric": None}, {"metric": 123}],
+)
+def test_knn_clf_nonstr_choice_param_is_valueerror(kw):
+    X, y = _data_clf()
+    with pytest.raises(ValueError):
+        skn.KNeighborsClassifier(**kw).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.KNeighborsClassifier(**kw).fit(X, y)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{"weights": 123}, {"algorithm": None}, {"algorithm": 7}, {"metric": None}, {"metric": 123}],
+)
+def test_knn_reg_nonstr_choice_param_is_valueerror(kw):
+    X, y = _data_reg()
+    with pytest.raises(ValueError):
+        skn.KNeighborsRegressor(**kw).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.KNeighborsRegressor(**kw).fit(X, y)

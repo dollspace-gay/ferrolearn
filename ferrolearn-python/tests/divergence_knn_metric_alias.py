@@ -122,3 +122,33 @@ def test_knn_reg_euclidean_nonpositive_p_is_valueerror(p):
         skn.KNeighborsRegressor(2, metric="euclidean", p=p).fit(X, y)
     with pytest.raises(ValueError):
         fl.KNeighborsRegressor(2, metric="euclidean", p=p).fit(X, y)
+
+
+# ---------------------------------------------------------------------------
+# #2152 — n_neighbors / leaf_size out of [1, inf): sklearn validates (ValueError);
+#         ferrolearn previously accepted leaf_size<1 and Overflow'd on negatives
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("kw", [{"leaf_size": 0}, {"leaf_size": -1}, {"n_neighbors": 0}, {"n_neighbors": -3}])
+def test_knn_clf_out_of_range_int_params_are_valueerror(kw):
+    """sklearn validates n_neighbors/leaf_size in [1, inf) (Integral) at fit,
+    raising InvalidParameterError (a ValueError subclass). ferrolearn must too —
+    catchable as ValueError, not OverflowError or silently accepted (#2152)."""
+    X, y, _ = _train_clf()
+    with pytest.raises(ValueError):
+        skn.KNeighborsClassifier(**kw).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.KNeighborsClassifier(**kw).fit(X, y)
+
+
+@pytest.mark.parametrize("kw", [{"leaf_size": 0}, {"leaf_size": -1}, {"n_neighbors": 0}, {"n_neighbors": -3}])
+def test_knn_reg_out_of_range_int_params_are_valueerror(kw):
+    """sklearn validates n_neighbors/leaf_size in [1, inf) (Integral) at fit,
+    raising InvalidParameterError (a ValueError subclass). ferrolearn must too —
+    catchable as ValueError, not OverflowError or silently accepted (#2152)."""
+    X, y, _ = _train_reg()
+    with pytest.raises(ValueError):
+        skn.KNeighborsRegressor(**kw).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.KNeighborsRegressor(**kw).fit(X, y)

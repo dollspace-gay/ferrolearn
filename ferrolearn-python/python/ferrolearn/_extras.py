@@ -11,6 +11,7 @@ from sklearn.base import (
     RegressorMixin,
     TransformerMixin,
 )
+from sklearn.utils.validation import check_is_fitted
 
 from ferrolearn._ferrolearn_rs import (
     _RsARDRegression,
@@ -57,6 +58,23 @@ from ferrolearn._ferrolearn_rs import (
     _RsTruncatedSVD,
 )
 
+# sklearn 1.5.2's full set of recognized neighbors metric names
+# (`set(itertools.chain(*sklearn.neighbors.VALID_METRICS.values()))`,
+# neighbors/_base.py:401). A metric STRING outside this set is an
+# InvalidParameterError (a ValueError subclass) in sklearn; a metric INSIDE it
+# that ferrolearn's Euclidean-only core cannot compute (e.g. 'cityblock',
+# 'cosine', 'manhattan', 'l1') is an honest NotImplementedError (#876).
+_SKLEARN_VALID_KNN_METRICS = frozenset(
+    {
+        "braycurtis", "canberra", "chebyshev", "cityblock", "correlation",
+        "cosine", "dice", "euclidean", "hamming", "haversine", "infinity",
+        "jaccard", "l1", "l2", "mahalanobis", "manhattan", "minkowski",
+        "nan_euclidean", "p", "precomputed", "pyfunc", "rogerstanimoto",
+        "russellrao", "seuclidean", "sokalmichener", "sokalsneath",
+        "sqeuclidean", "yule",
+    }
+)
+
 
 def _f64(a):
     return np.ascontiguousarray(a, dtype=np.float64)
@@ -87,6 +105,31 @@ class _RegressorWrapper(RegressorMixin, BaseEstimator):
 
     def predict(self, X):
         return np.asarray(self._rs.predict(_f64(X)))
+
+
+class _RegressorPickleMixin:
+    """Mixin for pickling regressors whose Rust fitted object is not directly
+    picklable (mirrors `_classifiers.py::_ClassifierPickleMixin`). The training
+    data is stored on fit and the `_rs` handle is dropped from the pickled
+    state and rebuilt by re-fitting on unpickle."""
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_rs", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if hasattr(self, "_fit_X") and hasattr(self, "_fit_y"):
+            self._rebuild_rs()
+
+    def _store_training_data(self, X, y):
+        self._fit_X = X.copy()
+        self._fit_y = y.copy()
+
+    def _rebuild_rs(self):
+        self._rs = self._make_rs()
+        self._rs.fit(self._fit_X, self._fit_y)
 
 
 class BayesianRidge(_RegressorWrapper):
@@ -215,12 +258,163 @@ class HistGradientBoostingRegressor(_RegressorWrapper):
             max_depth=self.max_depth, random_state=self.random_state)
 
 
-class KNeighborsRegressor(_RegressorWrapper):
-    def __init__(self, n_neighbors=5):
+class KNeighborsRegressor(_RegressorPickleMixin, RegressorMixin, BaseEstimator):
+    """K-Nearest Neighbors Regressor backed by Rust (#2147).
+
+    Mirrors ``sklearn.neighbors.KNeighborsRegressor``
+    (``sklearn/neighbors/_regression.py:178-189``). ``n_neighbors`` is
+    positional-or-keyword; the rest are keyword-only.
+
+    Parameters
+    ----------
+    n_neighbors : int, default=5
+        Number of neighbors to use.
+    weights : {'uniform', 'distance'}, default='uniform'
+        Weight function used in prediction. 'uniform' averages the neighbor
+        targets equally; 'distance' weights each neighbor target by the inverse
+        of its distance (``sklearn/neighbors/_regression.py:43-45``) — this
+        CHANGES the prediction. Callable weights are NOT supported
+        (NotImplementedError, #876).
+    algorithm : {'auto', 'ball_tree', 'kd_tree', 'brute'}, default='auto'
+        Nearest-neighbor search strategy only — all values give identical
+        predict. 'ball_tree' maps to 'auto' (no distinct regressor variant).
+    leaf_size : int, default=30
+        ABI-only: affects tree-build performance, not the result.
+    p : float, default=2
+        Minkowski power. Only ``p=2`` (Euclidean) is supported; any other value
+        raises NotImplementedError (#876).
+    metric : str, default='minkowski'
+        Only 'minkowski' (with p=2) and 'euclidean' are supported; any other
+        value raises NotImplementedError (#876).
+    metric_params : dict or None, default=None
+        Only ``None`` is supported (no custom metric); a non-None value raises
+        NotImplementedError (#876).
+    n_jobs : int or None, default=None
+        ABI-only: a threading knob, does not affect the result.
+    """
+
+    def __init__(
+        self,
+        n_neighbors=5,
+        *,
+        weights="uniform",
+        algorithm="auto",
+        leaf_size=30,
+        p=2,
+        metric="minkowski",
+        metric_params=None,
+        n_jobs=None,
+    ):
         self.n_neighbors = n_neighbors
+        self.weights = weights
+        self.algorithm = algorithm
+        self.leaf_size = leaf_size
+        self.p = p
+        self.metric = metric
+        self.metric_params = metric_params
+        self.n_jobs = n_jobs
 
     def _make_rs(self):
-        return _RsKNeighborsRegressor(n_neighbors=self.n_neighbors)
+        # sklearn validates n_neighbors in [1, inf) and leaf_size in [1, inf)
+        # (Integral) at fit, raising InvalidParameterError (a ValueError
+        # subclass). Mirror that here — Python-side, before the usize ABI
+        # boundary that would otherwise raise OverflowError for negatives (#2152).
+        if not isinstance(self.n_neighbors, (int, np.integer)) or self.n_neighbors < 1:
+            raise ValueError(
+                f"n_neighbors == {self.n_neighbors}, must be >= 1 (an int in [1, inf))."
+            )
+        if not isinstance(self.leaf_size, (int, np.integer)) or self.leaf_size < 1:
+            raise ValueError(
+                f"leaf_size == {self.leaf_size}, must be >= 1 (an int in [1, inf))."
+            )
+        # n_jobs: sklearn constraint [Integral, None] (neighbors/_base.py:404).
+        # A non-int (e.g. 1.5/'x') is an InvalidParameterError (ValueError);
+        # mirror that before the Option<i64> ABI boundary that would TypeError
+        # (#2152). bool is Integral, so it is accepted (sklearn does too).
+        if self.n_jobs is not None and not isinstance(self.n_jobs, (int, np.integer)):
+            raise ValueError(f"n_jobs must be an int or None, got {self.n_jobs!r}.")
+        # weights: sklearn accepts {'uniform','distance'}, a callable, or None;
+        # None behaves identically to 'uniform' (neighbors/_regression.py:173).
+        # callable is NOT supported (#876). An invalid string is rejected
+        # (ValueError) at the Rust boundary.
+        weights = self.weights
+        if weights is None:
+            weights = "uniform"
+        elif callable(weights):
+            raise NotImplementedError(
+                "callable weights not supported (only 'uniform'/'distance'; "
+                "NOT-STARTED #876)"
+            )
+        elif not isinstance(weights, str):
+            raise ValueError(
+                "weights must be 'uniform', 'distance', a callable, or None, got "
+                f"{weights!r}."
+            )
+        # algorithm/metric: sklearn requires a str (metric also accepts a
+        # callable). A non-str (e.g. None/int) is an InvalidParameterError
+        # (ValueError); mirror that before the Rust String boundary that would
+        # otherwise TypeError (#2156). An invalid str value is rejected
+        # (ValueError / NotImplementedError) inside the Rust binding.
+        if not isinstance(self.algorithm, str):
+            raise ValueError(
+                "algorithm must be one of 'auto', 'ball_tree', 'kd_tree', "
+                f"'brute', got {self.algorithm!r}."
+            )
+        if callable(self.metric):
+            raise NotImplementedError(
+                "callable metric not supported (no custom metric; NOT-STARTED #876)"
+            )
+        if not isinstance(self.metric, str):
+            raise ValueError(f"metric must be a str or callable, got {self.metric!r}.")
+        # A metric string OUTSIDE sklearn's recognized set is an invalid
+        # parameter (ValueError); reject it here so it is NOT conflated with a
+        # valid-but-unimplemented metric (which the Rust core reports as
+        # NotImplementedError #876).
+        if self.metric not in _SKLEARN_VALID_KNN_METRICS:
+            raise ValueError(
+                f"metric={self.metric!r} is not a valid metric "
+                "(not among sklearn's recognized metric names)."
+            )
+        # metric_params: sklearn constraint [dict, None] (neighbors/_base.py:402).
+        # An EMPTY dict is valid (no custom params == None) and is accepted; a
+        # non-dict (e.g. a list) is a ValueError; a NON-EMPTY dict needs a custom
+        # metric the Rust core lacks (NOT-STARTED #876).
+        if self.metric_params is not None:
+            if not isinstance(self.metric_params, dict):
+                raise ValueError(
+                    "metric_params must be a dict or None, got "
+                    f"{type(self.metric_params).__name__}."
+                )
+            if len(self.metric_params) > 0:
+                raise NotImplementedError(
+                    f"metric_params={self.metric_params!r} not supported "
+                    "(no custom metric; NOT-STARTED #876)"
+                )
+        return _RsKNeighborsRegressor(
+            n_neighbors=self.n_neighbors,
+            weights=weights,
+            algorithm=self.algorithm,
+            leaf_size=self.leaf_size,
+            p=float(self.p),
+            metric=self.metric,
+            n_jobs=self.n_jobs,
+        )
+
+    def fit(self, X, y):
+        X = _f64(X)
+        y = _f64(y)
+        self._rs = self._make_rs()
+        self._rs.fit(X, y)
+        self.n_features_in_ = X.shape[1]
+        self._store_training_data(X, y)
+        return self
+
+    def predict(self, X):
+        check_is_fitted(self)
+        X = _f64(X)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.predict(X))
 
 
 class KernelRidge(_RegressorWrapper):

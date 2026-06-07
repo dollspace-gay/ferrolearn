@@ -583,3 +583,151 @@ def test_red_bernoulli_inf_binarize_rejected_like_sklearn():
     # --- ferrolearn must mirror the reject. Currently it does NOT raise.
     with pytest.raises(ValueError):
         fl.BernoulliNB(binarize=inf).fit(X, y)
+
+
+# ---------------------------------------------------------------------------
+# KNeighborsRegressor full constructor surface (#2147, REQ-KNR-CTOR-SURFACE)
+#
+# `ferrolearn.KNeighborsRegressor` now mirrors sklearn's full
+# `(n_neighbors=5, *, weights='uniform', algorithm='auto', leaf_size=30, p=2,
+#  metric='minkowski', metric_params=None, n_jobs=None)` surface
+# (sklearn/neighbors/_regression.py:178-189). The headline: `weights='distance'`
+# CHANGES the prediction (inverse-distance-weighted average) and must match the
+# live sklearn 1.5.2 oracle. Every expected value comes from the SAME-test
+# sklearn oracle (R-CHAR-3) — none is literal-copied from ferrolearn.
+# ---------------------------------------------------------------------------
+
+# Deterministic continuous-target regression fixture (well-conditioned, no ties).
+_XKNR = np.random.RandomState(7).randn(50, 4)
+_YKNR = np.random.RandomState(8).randn(50)
+_XKNR_TEST = np.random.RandomState(9).randn(15, 4)
+
+
+@pytest.mark.parametrize("weights", ["uniform", "distance"])
+def test_knr_weights_predict_parity_vs_sklearn(weights):
+    """GREEN (#2147): `KNeighborsRegressor(weights=...)` predict matches the live
+    sklearn 1.5.2 oracle for BOTH 'uniform' and 'distance'. The 'distance' case
+    is the headline — inverse-distance-weighted neighbor-target average
+    (sklearn/neighbors/_regression.py:43-45)."""
+    fl_reg = fl.KNeighborsRegressor(n_neighbors=4, weights=weights).fit(_XKNR, _YKNR)
+    sk_reg = SkKNeighborsRegressor(n_neighbors=4, weights=weights).fit(_XKNR, _YKNR)
+
+    fl_pred = np.asarray(fl_reg.predict(_XKNR_TEST))
+    sk_pred = sk_reg.predict(_XKNR_TEST)  # live oracle (R-CHAR-3)
+
+    np.testing.assert_allclose(fl_pred, sk_pred, rtol=1e-9, atol=1e-9)
+
+
+def test_knr_distance_weighting_changes_prediction():
+    """GREEN (#2147): `weights='distance'` produces a DIFFERENT prediction than
+    `weights='uniform'` (the whole point of the param). Oracle-anchored: sklearn
+    itself diverges between the two on this fixture, and ferrolearn mirrors that
+    divergence."""
+    fl_uni = np.asarray(
+        fl.KNeighborsRegressor(n_neighbors=4, weights="uniform")
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    fl_dist = np.asarray(
+        fl.KNeighborsRegressor(n_neighbors=4, weights="distance")
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    sk_uni = (
+        SkKNeighborsRegressor(n_neighbors=4, weights="uniform")
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    sk_dist = (
+        SkKNeighborsRegressor(n_neighbors=4, weights="distance")
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    # Live oracle: the two weighting schemes diverge.
+    assert not np.allclose(sk_uni, sk_dist)
+    # ferrolearn mirrors the same divergence.
+    assert not np.allclose(fl_uni, fl_dist)
+
+
+@pytest.mark.parametrize("algorithm", ["auto", "brute", "kd_tree", "ball_tree"])
+def test_knr_algorithm_is_search_strategy_only(algorithm):
+    """GREEN (#2147): `algorithm` is a search-strategy knob only — every value
+    gives the SAME predict, identical to the live sklearn oracle
+    (sklearn/neighbors/_regression.py:56-66)."""
+    fl_pred = np.asarray(
+        fl.KNeighborsRegressor(n_neighbors=5, algorithm=algorithm)
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    sk_pred = (
+        SkKNeighborsRegressor(n_neighbors=5, algorithm=algorithm)
+        .fit(_XKNR, _YKNR)
+        .predict(_XKNR_TEST)
+    )
+    np.testing.assert_allclose(fl_pred, sk_pred, rtol=1e-9, atol=1e-9)
+
+
+def test_knr_get_params_exposes_full_surface_like_sklearn():
+    """GREEN (#2147): `get_params()` exposes all 8 sklearn constructor params
+    (sklearn `clone()` compatibility). Oracle: the param NAME SET equals
+    sklearn's."""
+    sk_params = set(SkKNeighborsRegressor().get_params())  # live oracle
+    fl_params = set(fl.KNeighborsRegressor().get_params())
+    assert fl_params == sk_params
+    assert len(fl_params) == 8
+
+
+def test_knr_set_params_clone_roundtrip():
+    """GREEN (#2147): `clone()`/`set_params()` round-trip preserves all params,
+    including the result-affecting `weights='distance'` (sklearn clone protocol
+    re-reads `get_params()`)."""
+    from sklearn.base import clone
+
+    est = fl.KNeighborsRegressor(
+        3, weights="distance", algorithm="kd_tree", leaf_size=10, p=2, n_jobs=2
+    )
+    cloned = clone(est)
+    assert cloned.weights == "distance"
+    assert cloned.n_neighbors == 3
+    assert cloned.algorithm == "kd_tree"
+    assert cloned.leaf_size == 10
+    assert cloned.n_jobs == 2
+
+    est.set_params(weights="uniform", n_neighbors=7)
+    assert est.weights == "uniform"
+    assert est.n_neighbors == 7
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"p": 3},
+        {"metric": "manhattan"},
+        {"weights": (lambda d: np.ones_like(d))},
+        {"metric_params": {"w": [1.0, 1.0, 1.0, 1.0]}},
+    ],
+    ids=["p3", "metric_manhattan", "weights_callable", "metric_params"],
+)
+def test_knr_unsupported_params_raise_notimplemented(kwargs):
+    """GREEN (#2147): params the Euclidean-only Rust core cannot honor raise
+    NotImplementedError at fit (mirrors `KNeighborsClassifier`; NOT-STARTED
+    #876). The live sklearn oracle ACCEPTS these (asserted) — ferrolearn's
+    reject is the explicit, honest divergence, not a silent wrong answer."""
+    # --- Live oracle: sklearn fits with these params (no error).
+    SkKNeighborsRegressor(n_neighbors=4, **kwargs).fit(_XKNR, _YKNR)
+    # --- ferrolearn raises NotImplementedError (clear, not a wrong result).
+    with pytest.raises(NotImplementedError):
+        fl.KNeighborsRegressor(n_neighbors=4, **kwargs).fit(_XKNR, _YKNR)
+
+
+def test_knr_pickle_roundtrip_preserves_distance_predictions():
+    """GREEN (#2147): a fitted `weights='distance'` regressor survives pickling
+    (the Rust `_rs` is dropped and rebuilt by re-fit on unpickle, mirroring the
+    classifier pickle mixin) and reproduces identical predictions."""
+    import pickle
+
+    reg = fl.KNeighborsRegressor(n_neighbors=4, weights="distance").fit(_XKNR, _YKNR)
+    before = np.asarray(reg.predict(_XKNR_TEST))
+    restored = pickle.loads(pickle.dumps(reg))
+    after = np.asarray(restored.predict(_XKNR_TEST))
+    np.testing.assert_allclose(after, before, rtol=1e-12, atol=1e-12)

@@ -44,7 +44,7 @@
 //! | REQ-KNN-NNEIGHBORS-POSITIONAL (n_neighbors positional ABI) | SHIPPED | FIXED #2046: `_classifiers.py::KNeighborsClassifier.__init__(self, n_neighbors=5)` drops the keyword-only `*`, so `ferrolearn.KNeighborsClassifier(3).n_neighbors == 3` matching sklearn `_classification.py:193`. Guard `test_red_knn_n_neighbors_positional`. |
 //! | REQ-KNN-VALUE-PARITY (pred parity incl. tie-break) | SHIPPED | default uniform path: downstream `ferrolearn-neighbors` REQ-1 verifies the uniform weighted-vote smallest-label tie-break. (Distance-weighting/2-D-query/non-Euclidean divergences downstream #876.) |
 //! | REQ-KNN-PREDICT-PROBA (predict_proba surfaced) | SHIPPED | FIXED #2051: `RsKNeighborsClassifier::predict_proba` binds the existing `FittedKNeighborsClassifier::predict_proba` (normalized weighted class-vote shares, `knn.rs:487`), surfaced by `_classifiers.py::KNeighborsClassifier.predict_proba` — `(n_samples, n_classes)` rows summing to 1.0, with `predict == classes_[argmax(predict_proba)]` matching sklearn `_classification.py:307`. Guard `test_red_knn_predict_proba_surfaced`. |
-//! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | SHIPPED (surfaced subset) | FIXED #2138: `RsKNeighborsClassifier` gains `weights`/`algorithm`/`leaf_size`/`p`/`metric`/`n_jobs` (`#[pyo3(signature = (n_neighbors=5, weights="uniform", algorithm="auto", leaf_size=30, p=2.0, metric="minkowski", n_jobs=None))]`), surfaced by `_classifiers.py::KNeighborsClassifier.__init__` matching sklearn `_classification.py:193` (n_neighbors positional, rest keyword-only). `fit` maps `weights`→`Weights::{Uniform,Distance}`, `algorithm`→`Algorithm::{Auto,BruteForce,KdTree}` (`ball_tree`→`Auto`, identical result); `leaf_size`/`n_jobs` are ABI no-ops (perf/threading only). The Euclidean-only restriction is validated: `p != 2.0` and `metric ∉ {minkowski,euclidean}` raise `NotImplementedError #876`; callable weights raise `NotImplementedError #876`; `metric_params` is wrapper-validated `is None`. Guards `test_knn_weights_distance_*`/`test_knn_algorithm_same_result`/`test_knn_get_params_clone`/`test_knn_unsupported_*`. NOT-STARTED: callable-weights / Minkowski-p≠2 / custom-metric (#876). |
+//! | REQ-KNN-PARAMS (weights/algorithm/leaf_size/p/metric/metric_params/n_jobs) | SHIPPED (surfaced subset) | FIXED #2138: `RsKNeighborsClassifier` gains `weights`/`algorithm`/`leaf_size`/`p`/`metric`/`n_jobs` (`#[pyo3(signature = (n_neighbors=5, weights="uniform", algorithm="auto", leaf_size=30, p=2.0, metric="minkowski", n_jobs=None))]`), surfaced by `_classifiers.py::KNeighborsClassifier.__init__` matching sklearn `_classification.py:193` (n_neighbors positional, rest keyword-only). `fit` maps `weights`→`Weights::{Uniform,Distance}`, `algorithm`→`Algorithm::{Auto,BruteForce,KdTree}` (`ball_tree`→`Auto`, identical result); `leaf_size`/`n_jobs` are ABI no-ops (perf/threading only). The Euclidean-only restriction is validated metric-aware (FIXED #2148): `metric='minkowski'` requires `p==2` (else `NotImplementedError #876`); `metric='euclidean'` accepts ANY `p` (sklearn consumes `p` only for minkowski, `_base.py:526-538`); other metrics raise `NotImplementedError #876`. An invalid `weights` STRING raises `ValueError` (matching sklearn `InvalidParameterError ⊂ ValueError`, FIXED #2149); callable weights raise `NotImplementedError #876`; `metric_params` is wrapper-validated `is None`. Guards `test_knn_weights_distance_*`/`test_knn_algorithm_same_result`/`test_knn_get_params_clone`/`test_knn_unsupported_*`/`test_knn_euclidean_metric_ignores_p`/`test_knn_invalid_weights_string_is_valueerror`. NOT-STARTED: callable-weights / Minkowski-p≠2 / custom-metric (#876). |
 //! | REQ-GNB-API-CONFORM (fit/predict/predict_proba + classes_, default path) | SHIPPED | `RsGaussianNB::*` + getter, wrapped by `_classifiers.py::GaussianNB` — mirroring `naive_bayes.py:147`/`:128`. Live default-path oracle matches element-wise. |
 //! | REQ-GNB-CTOR-ABI (all params keyword-only) | SHIPPED | `GaussianNB.__init__(self, *, var_smoothing=1e-9)` matches sklearn `naive_bayes.py:234` (the `*` is first). |
 //! | REQ-GNB-FITTED-ATTRS (theta_/var_/class_prior_/class_count_/epsilon_ surfaced) | SHIPPED | FIXED #2102: `RsGaussianNB::{theta_,var_,class_prior_,class_count_,epsilon_}` getters bind the pre-existing `FittedGaussianNB` accessors (`gaussian.rs:549`/:557`/:565`/:572`/:584`); consumer `_classifiers.py::GaussianNB.fit` assigns all five after `classes_`, mirroring sklearn `naive_bayes.py` `theta_`/`var_`/`class_prior_`/`class_count_`/`epsilon_`. Guard `test_gaussiannb_fitted_attrs_match_sklearn` (live oracle, R-CHAR-3). |
@@ -430,9 +430,12 @@ impl RsKNeighborsClassifier {
             "uniform" => Weights::Uniform,
             "distance" => Weights::Distance,
             other => {
-                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-                    "weights={other:?} not supported (only 'uniform'/'distance'; \
-                     callable weights NOT-STARTED #876)"
+                // An invalid weights STRING is a parameter-value error, not an
+                // unsupported-feature error: sklearn raises InvalidParameterError
+                // (a ValueError subclass). Callable weights are intercepted in
+                // the Python shim (NotImplementedError #876) and never reach here.
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "weights={other:?} is invalid (expected 'uniform' or 'distance')"
                 )));
             }
         };
@@ -454,19 +457,39 @@ impl RsKNeighborsClassifier {
             }
         };
 
-        // The Rust core is Euclidean-only (Minkowski with p=2). Reject any
-        // metric/p that would change the distance (NOT-STARTED #876).
-        if self.p != 2.0 {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-                "p={} not supported (Euclidean-only, p=2; Minkowski-p NOT-STARTED #876)",
+        // sklearn validates `p` against Interval(Real, 0, None, closed="right")
+        // == (0, inf] UNCONDITIONALLY at fit, BEFORE the metric is consulted
+        // (sklearn/neighbors/_base.py:400), so p <= 0 (and NaN) is an
+        // InvalidParameterError (a ValueError subclass) for ANY metric (#2151).
+        if self.p <= 0.0 || self.p.is_nan() {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "p={} is invalid (must be in the range (0, inf])",
                 self.p
             )));
         }
-        if self.metric != "minkowski" && self.metric != "euclidean" {
-            return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
-                "metric={:?} not supported (only minkowski(p=2)/euclidean; NOT-STARTED #876)",
-                self.metric
-            )));
+
+        // The Rust core is Euclidean-only. sklearn consumes `p` ONLY when
+        // metric == "minkowski" (sklearn/neighbors/_base.py:526-538); 'euclidean'
+        // and its alias 'l2' ARE the Euclidean (p=2) distance and accept any
+        // valid p (p is ignored). metric == "minkowski" requires p == 2; other p
+        // (true Minkowski) and all non-Euclidean metrics are NOT-STARTED (#876).
+        match self.metric.as_str() {
+            "euclidean" | "l2" => {}
+            "minkowski" => {
+                if self.p != 2.0 {
+                    return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                        "p={} not supported for metric='minkowski' (Euclidean-only, \
+                         p=2; Minkowski-p NOT-STARTED #876)",
+                        self.p
+                    )));
+                }
+            }
+            other => {
+                return Err(pyo3::exceptions::PyNotImplementedError::new_err(format!(
+                    "metric={other:?} not supported (only minkowski(p=2)/euclidean/l2; \
+                     NOT-STARTED #876)"
+                )));
+            }
         }
 
         let x_nd = numpy2_to_ndarray(x);
