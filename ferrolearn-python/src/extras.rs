@@ -26,7 +26,7 @@
 //! | REQ-REGRESSOR-API-CONFORM (fit/predict, 11 regressors) | SHIPPED | `py_regressor!` macro + hand-written `Rs*Regressor` expose fit/predict, wrapped by `_extras.py::_RegressorWrapper` (+ `n_features_in_`/`score`). Mirrors the sklearn regressor fit/predict contract across `ensemble`/`linear_model`/`neighbors`/`kernel_ridge`/`tree`. |
 //! | REQ-CLASSIFIER-API-CONFORM (fit/predict + LabelEncoder, 13 classifiers) | SHIPPED | `py_classifier!` macro + hand-written classifiers expose fit/predict, wrapped by `_extras.py::_ClassifierWrapper` whose `_encode` (np.unique+searchsorted) sets `classes_` and round-trips arbitrary label dtypes through the Rust `usize`-label core. |
 //! | REQ-CLUSTERER-API-CONFORM (fit + labels_, 5 clusterers incl. GMM) | SHIPPED | `RsMiniBatchKMeans`/`RsDBSCAN`/`RsAgglomerativeClustering`/`RsBirch` expose fit + `labels_` (+ predict for MiniBatchKMeans), `RsGaussianMixture` fit/predict; wrapped by `_extras.py::_ClusterWrapper` (+ `fit_predict`). |
-//! | REQ-DBSCAN-BINDING-SURFACE (`sample_weight` + `core_sample_indices_` + `components_`) | SHIPPED | FIXED #2190: `RsDBSCAN.fit` takes `#[pyo3(signature = (x, sample_weight=None))]` and chains `.with_sample_weight(numpy1_to_ndarray(w))` (weighted core determination, `cluster/_dbscan.py:370,427-435`; wrong-length → `ShapeMismatch`→`PyValueError`); new `#[getter] core_sample_indices_ → PyArray1<i64>` (`_dbscan.py:438`) + `#[getter] components_ → PyArray2<f64>` (`_dbscan.py:441-446`). `_extras.py::DBSCAN` overrides `fit(X, y=None, sample_weight=None)` + `fit_predict(... sample_weight=None)`, exposing `labels_`/`core_sample_indices_`/`components_`. Non-test consumer: `ferrolearn.DBSCAN(...).fit(X, sample_weight=w)`. Live oracle: `tests/divergence_dbscan_sample_weight.py` (9 pass) — unweighted/promote/demote/#2189-pairwise-boundary/negative-weight/wrong-length-`ValueError`/`fit_predict`/clone parity. See `.design/python/extras.md`. |
+//! | REQ-DBSCAN-BINDING-SURFACE (`sample_weight` + `core_sample_indices_` + `components_` + `metric`/`p`) | SHIPPED | FIXED #2190: `RsDBSCAN.fit` takes `#[pyo3(signature = (x, sample_weight=None))]` and chains `.with_sample_weight(numpy1_to_ndarray(w))` (weighted core determination, `cluster/_dbscan.py:370,427-435`; wrong-length → `ShapeMismatch`→`PyValueError`); new `#[getter] core_sample_indices_ → PyArray1<i64>` (`_dbscan.py:438`) + `#[getter] components_ → PyArray2<f64>` (`_dbscan.py:441-446`). EXTENDED #2193: `RsDBSCAN::new` ctor gains `metric="euclidean".to_string()` + `p=None` (`_dbscan.py:345-363`); `fn fit` resolves the lowercased metric string via `resolve_dbscan_metric` (`euclidean`/`l2`→Euclidean, `manhattan`/`l1`/`cityblock`→Manhattan, `chebyshev`→Chebyshev, `minkowski`→`Minkowski(p.unwrap_or(2.0))`; unknown→`PyValueError`, matching sklearn's `InvalidParameterError ⊂ ValueError`) and chains `.with_metric(resolved)` onto the builder (consuming `ferrolearn_cluster::dbscan::DbscanMetric`/`with_metric`, core commit 485c06fcd). `p` IGNORED for non-Minkowski metrics (#2192); non-positive/NaN Minkowski `p`→`InvalidParameter`→`PyValueError`. `_extras.py::DBSCAN` overrides `fit(X, y=None, sample_weight=None)` + `fit_predict(... sample_weight=None)`, exposing `labels_`/`core_sample_indices_`/`components_`; ctor `(eps=0.5, *, min_samples=5, metric='euclidean', p=None)` threads metric/p through `_make_rs` (so `get_params`/`clone`/`set_params` round-trip them). Non-test consumer: `ferrolearn.DBSCAN(..., metric='manhattan', p=...).fit(X, sample_weight=w)`. Live oracle: `tests/divergence_dbscan_sample_weight.py` (9 pass) + `tests/test_dbscan_metric.py` (20 pass) — euclidean/l2/manhattan(+aliases)/chebyshev/minkowski-p∈{1,2,3} `labels_`+`core_sample_indices_` parity, p1==manhattan, p2==euclidean, euclidean-ignores-p (#2192), unknown-metric-`ValueError`, non-positive-p-`ValueError`, metric+sample_weight, clone/get_params/set_params. DOCUMENTED DIVERGENCE: ferrolearn `metric='minkowski', p=None`→p=2 (documented intent, fits) vs sklearn `TypeError`. `metric_params`/`precomputed`/callable/`algorithm`/`leaf_size`/`n_jobs` stay NOT-STARTED. See `.design/python/extras.md`. |
 //! | REQ-TRANSFORMER-API-CONFORM (fit/transform, 13 transformers) | SHIPPED | `py_transformer!` macro exposes fit/transform for the decomp/preprocess/kernel transformers, wrapped by `_extras.py::_TransformerWrapper` (+ `fit_transform`). |
 //! | REQ-REGRESSOR-VALUE-PARITY (default-path predict parity) | SHIPPED | deterministic default path: the deterministic regressors' predict parity is verified downstream in `ferrolearn_linear`/`_tree`/`_neighbors`/`_kernel` REQ tables. (Seeded-RNG ensembles → REQ-VALUE-PARITY-RNG.) |
 //! | REQ-CLASSIFIER-VALUE-PARITY (default-path label parity) | SHIPPED | deterministic default path: decoded label predictions of the deterministic classifiers match sklearn after the `_encode`/decode round-trip; verified downstream in `ferrolearn_linear`/`_bayes`/`_tree`. |
@@ -2478,21 +2478,85 @@ impl RsMiniBatchKMeans {
     }
 }
 
+// DBSCAN metric/p surface (#2193): map the lowercased sklearn metric STRING to
+// `ferrolearn_cluster::dbscan::DbscanMetric<f64>`, threading the Minkowski order
+// `p` (`p=None` -> `p=2`, `sklearn/cluster/_dbscan.py:243-246/354`). sklearn's
+// `_parameter_constraints["metric"]` is `StrOptions(set(_VALID_METRICS) |
+// {"precomputed"})` (`_dbscan.py:334-337`): only the aliases sklearn itself
+// recognizes are accepted; an unknown string is an `InvalidParameterError` (a
+// `ValueError` subclass), surfaced here as `PyValueError`. The aliases mirror
+// `sklearn.metrics.pairwise._VALID_METRICS`: `euclidean`/`l2` -> Euclidean,
+// `manhattan`/`l1`/`cityblock` -> Manhattan, `chebyshev` -> Chebyshev,
+// `minkowski` -> Minkowski(p). `p` is IGNORED for every non-Minkowski metric
+// (`_dbscan.py:411-418`, #2192) so `with_p` is NOT called on those branches;
+// only `Minkowski` carries `p`. The metrics ferrolearn cannot compute
+// (`metric_params` kwargs, `precomputed`, callable, the spatial metrics like
+// `cosine`/`haversine`) are out of scope (NOT-STARTED, see `.design/python/extras.md`).
+fn resolve_dbscan_metric(
+    metric: &str,
+    p: Option<f64>,
+) -> PyResult<ferrolearn_cluster::dbscan::DbscanMetric<f64>> {
+    use ferrolearn_cluster::dbscan::DbscanMetric;
+    // sklearn's `metric` constraint is `StrOptions(set(_VALID_METRICS) |
+    // {"precomputed"})` (`_dbscan.py:334-337`) — EXACT (case-sensitive) string
+    // membership over lowercase names. So we match the raw string WITHOUT
+    // `to_lowercase()`: `'Euclidean'`/`'L2'` are rejected by sklearn
+    // (InvalidParameterError) and must be rejected here too (#2194).
+    match metric {
+        "euclidean" | "l2" => Ok(DbscanMetric::Euclidean),
+        "manhattan" | "l1" | "cityblock" => Ok(DbscanMetric::Manhattan),
+        "chebyshev" => Ok(DbscanMetric::Chebyshev),
+        // To SELECT Minkowski-with-`p` the core requires
+        // `with_metric(Minkowski(p))`, NOT `with_p` alone (#2192); construct the
+        // variant directly with the order. The strict-positivity / NaN check on
+        // `p` is enforced downstream by `Fit::fit` (-> `InvalidParameter` ->
+        // `PyValueError`).
+        //
+        // `p=None` with `metric='minkowski'` is REJECTED, matching the LIVE
+        // sklearn 1.5.2 oracle (R-CHAR-3, #2193): `DBSCAN(metric='minkowski',
+        // p=None).fit` forwards `p=None` to `NearestNeighbors`, which raises
+        // (`TypeError: None < 1`). We do NOT silently resolve to `p=2` (the
+        // docstring's stated default) — the live behavior is to FAIL, and the
+        // oracle, not the docstring, is the contract. ferrolearn raises a
+        // `ValueError` (its param-error convention) requiring an explicit `p`.
+        "minkowski" => match p {
+            Some(pval) => Ok(DbscanMetric::Minkowski(pval)),
+            None => Err(pyo3::exceptions::PyValueError::new_err(
+                "metric='minkowski' requires an explicit p (p=None is rejected; \
+                 sklearn raises TypeError for this combination)",
+            )),
+        },
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "metric == {other:?}, must be one of 'euclidean'/'l2', \
+             'manhattan'/'l1'/'cityblock', 'chebyshev', or 'minkowski'."
+        ))),
+    }
+}
+
 #[pyclass(name = "_RsDBSCAN")]
 pub struct RsDBSCAN {
     eps: f64,
     min_samples: usize,
+    // sklearn `metric` (`_dbscan.py:350`, default `"euclidean"`): the neighbor
+    // distance metric STRING, resolved to a `DbscanMetric<f64>` at fit time.
+    metric: String,
+    // sklearn `p` (`_dbscan.py:354`, default `None`): the Minkowski order, used
+    // ONLY by `metric='minkowski'` and IGNORED otherwise (#2192). `None` -> 2.0
+    // for Minkowski.
+    p: Option<f64>,
     fitted: Option<ferrolearn_cluster::FittedDBSCAN<f64>>,
 }
 
 #[pymethods]
 impl RsDBSCAN {
     #[new]
-    #[pyo3(signature = (eps=0.5, min_samples=5))]
-    fn new(eps: f64, min_samples: usize) -> Self {
+    #[pyo3(signature = (eps=0.5, min_samples=5, metric="euclidean".to_string(), p=None))]
+    fn new(eps: f64, min_samples: usize, metric: String, p: Option<f64>) -> Self {
         Self {
             eps,
             min_samples,
+            metric,
+            p,
             fitted: None,
         }
     }
@@ -2504,6 +2568,13 @@ impl RsDBSCAN {
     // min_samples` path, `_dbscan.py:427-435`). A wrong-length `sample_weight`
     // surfaces from the core as a `FerroError::ShapeMismatch` -> `PyValueError`
     // (mirroring `_check_sample_weight`'s `ValueError`, `_dbscan.py:397`).
+    //
+    // The `metric`/`p` ctor params resolve to a `DbscanMetric<f64>` chained via
+    // `.with_metric(...)` (`_dbscan.py:411-422`, neighbor test `dist <= eps`):
+    // an unknown metric string is rejected as `PyValueError` (sklearn's
+    // `InvalidParameterError`), a non-positive/NaN Minkowski `p` surfaces from
+    // `Fit::fit` as `InvalidParameter` -> `PyValueError`. `p` is IGNORED for the
+    // non-Minkowski metrics (#2192), matching sklearn.
     #[pyo3(signature = (x, sample_weight=None))]
     fn fit(
         &mut self,
@@ -2511,8 +2582,10 @@ impl RsDBSCAN {
         sample_weight: Option<PyReadonlyArray1<'_, f64>>,
     ) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
-        let mut m =
-            ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples);
+        let resolved = resolve_dbscan_metric(&self.metric, self.p)?;
+        let mut m = ferrolearn_cluster::DBSCAN::<f64>::new(self.eps)
+            .with_min_samples(self.min_samples)
+            .with_metric(resolved);
         if let Some(w) = sample_weight {
             m = m.with_sample_weight(numpy1_to_ndarray(w));
         }

@@ -27,13 +27,11 @@ import ferrolearn as fl
 _X = np.array([[0.0, 0.0], [1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
 
 
-@pytest.mark.xfail(
-    reason="ferrolearn DBSCAN metric is case-insensitive (to_lowercase) but "
-    "sklearn StrOptions rejects 'Euclidean'; tracking #2194",
-    strict=True,
-)
 @pytest.mark.parametrize("metric", ["Euclidean", "EUCLIDEAN", "Manhattan", "L2"])
 def test_capitalized_metric_rejected_like_sklearn(metric):
+    """Fixed (#2194): `resolve_dbscan_metric` matches the raw string (no
+    `to_lowercase`), so a capitalized metric falls through to the ValueError
+    arm, matching sklearn's exact (case-sensitive) `StrOptions` membership."""
     # Live oracle (the contract): sklearn 1.5.2 rejects a capitalized metric
     # string as InvalidParameterError (a ValueError subclass), because its
     # StrOptions set only contains the lowercase _VALID_METRICS names.

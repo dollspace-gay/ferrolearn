@@ -1471,11 +1471,12 @@ class MiniBatchKMeans(_ClusterWrapper):
 
 
 class DBSCAN(_ClusterWrapper):
-    """DBSCAN density-based clustering backed by Rust (#2190).
+    """DBSCAN density-based clustering backed by Rust (#2190, #2193).
 
-    Mirrors ``sklearn.cluster.DBSCAN`` (``sklearn/cluster/_dbscan.py:243``),
-    surfacing the ``fit(X, y=None, sample_weight=None)`` signature
-    (``_dbscan.py:370``) and the fitted ``labels_`` (``_dbscan.py:439``),
+    Mirrors ``sklearn.cluster.DBSCAN`` (``sklearn/cluster/_dbscan.py:345-363``),
+    surfacing the constructor ``(eps=0.5, *, min_samples=5, metric='euclidean',
+    p=None)`` (sklearn defaults/order), the ``fit(X, y=None, sample_weight=None)``
+    signature (``_dbscan.py:370``) and the fitted ``labels_`` (``_dbscan.py:439``),
     ``core_sample_indices_`` (``np.where(core_samples)[0]``, ``_dbscan.py:438``),
     and ``components_`` (``X[core_sample_indices_].copy()``,
     ``_dbscan.py:441-446``) attributes from the Rust fitted type.
@@ -1487,14 +1488,33 @@ class DBSCAN(_ClusterWrapper):
     reproduces the unweighted ``len >= min_samples`` core path EXACTLY). A
     wrong-length ``sample_weight`` raises ``ValueError`` (the Rust core's
     ``ShapeMismatch`` -> ``PyValueError``, mirroring ``_check_sample_weight``).
+
+    ``metric`` (``_dbscan.py:350``, default ``'euclidean'``) selects the neighbor
+    distance metric. The supported strings mirror
+    ``sklearn.metrics.pairwise._VALID_METRICS``:
+    ``'euclidean'``/``'l2'``, ``'manhattan'``/``'l1'``/``'cityblock'``,
+    ``'chebyshev'``, and ``'minkowski'``. An unknown metric raises ``ValueError``
+    (matching sklearn's ``InvalidParameterError``). ``p`` (``_dbscan.py:354``,
+    default ``None``) is the Minkowski order; it is used ONLY by
+    ``metric='minkowski'`` (``p=None`` -> ``p=2``, i.e. Euclidean) and is IGNORED
+    by every other metric (``_dbscan.py:411-418``, #2192) — so
+    ``DBSCAN(metric='euclidean', p=3)`` is plain Euclidean. A non-positive /
+    ``NaN`` Minkowski ``p`` raises ``ValueError`` (the Rust core's
+    ``InvalidParameter`` -> ``PyValueError``, matching ``NearestNeighbors``'
+    ``p in (0, inf]``). ``metric_params``, ``metric='precomputed'``, and callable
+    metrics stay NOT-STARTED (no ferrolearn surface). ``algorithm``/``leaf_size``/
+    ``n_jobs`` (neighbor-search knobs, identical result) are not exposed.
     """
 
-    def __init__(self, eps=0.5, *, min_samples=5):
+    def __init__(self, eps=0.5, *, min_samples=5, metric="euclidean", p=None):
         self.eps = eps
         self.min_samples = min_samples
+        self.metric = metric
+        self.p = p
 
     def _make_rs(self):
-        return _RsDBSCAN(eps=self.eps, min_samples=self.min_samples)
+        return _RsDBSCAN(eps=self.eps, min_samples=self.min_samples,
+                         metric=self.metric, p=self.p)
 
     def fit(self, X, y=None, sample_weight=None):
         self._rs = self._make_rs()

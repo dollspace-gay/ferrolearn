@@ -151,7 +151,14 @@ def test_sklearn_compat_clone_get_set_params():
     assert est.eps == 0.5
     assert est.min_samples == 5
     params = est.get_params()
-    assert params == {"eps": 0.5, "min_samples": 5}
+    # metric='euclidean'/p=None added in #2193 (the supported DBSCAN ctor
+    # surface); these defaults match sklearn's `DBSCAN().get_params()`.
+    assert params == {
+        "eps": 0.5,
+        "min_samples": 5,
+        "metric": "euclidean",
+        "p": None,
+    }
 
     cloned = clone(est)
     assert cloned.get_params() == params
