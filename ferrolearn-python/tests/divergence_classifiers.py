@@ -769,3 +769,207 @@ def test_red_knn_n_neighbors_gt_n_samples_must_raise():
     fl = ferrolearn.KNeighborsClassifier(n_neighbors=10).fit(X, y)
     with pytest.raises(ValueError):
         fl.predict(Xq)
+
+
+# ---------------------------------------------------------------------------
+# LogisticRegression: sample_weight / class_weight / n_iter_ / random_state /
+# n_jobs (downstream #450/#451/#445/#452).
+# Every expected value is the LIVE sklearn 1.5.2 oracle (R-CHAR-3).
+# ---------------------------------------------------------------------------
+
+
+def _lr_binary_imbalanced():
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [2.5, 3.5], [5.0, 6.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 0, 1, 1])
+    return X, y
+
+
+def test_logreg_sample_weight_matches_sklearn_binary():
+    """Weighted coef_/intercept_/predict_proba vs sklearn (binary)."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    w = np.array([1.0, 2.0, 1.0, 3.0, 1.0, 2.0])
+
+    sk = SkLR(C=1.0, solver="lbfgs", max_iter=3000, tol=1e-9).fit(X, y, sample_weight=w)
+    fl = ferrolearn.LogisticRegression(C=1.0, max_iter=3000, tol=1e-9).fit(
+        X, y, sample_weight=w
+    )
+    assert np.abs(fl.coef_ - sk.coef_).max() < 1e-6, (fl.coef_, sk.coef_)
+    assert np.abs(fl.intercept_ - sk.intercept_).max() < 1e-5
+    assert np.abs(fl.predict_proba(X) - sk.predict_proba(X)).max() < 1e-5
+
+
+def test_logreg_sample_weight_matches_sklearn_3class():
+    """Weighted 3-class multinomial coef_ vs sklearn."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X = np.array(
+        [
+            [0.0, 0.0], [0.5, 0.0], [0.0, 0.5],
+            [5.0, 0.0], [5.5, 0.0], [5.0, 0.5],
+            [0.0, 5.0], [0.5, 5.0], [0.0, 5.5],
+        ]
+    )
+    y = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    w = np.array([1.0, 2.0, 1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 1.0])
+
+    sk = SkLR(C=10.0, solver="lbfgs", max_iter=5000, tol=1e-8).fit(X, y, sample_weight=w)
+    fl = ferrolearn.LogisticRegression(C=10.0, max_iter=5000, tol=1e-8).fit(
+        X, y, sample_weight=w
+    )
+    # The multinomial coef_ matrix is non-identifiable up to a per-row constant,
+    # but predict_proba IS identifiable: assert weighted-fit parity there (the
+    # binding's multiclass coef_ exposure collapse is the separate #2170 item).
+    assert np.abs(fl.predict_proba(X) - sk.predict_proba(X)).max() < 5e-3, (
+        fl.predict_proba(X),
+        sk.predict_proba(X),
+    )
+
+
+def test_logreg_sample_weight_none_is_unweighted():
+    """sample_weight=None == not passing sample_weight (unweighted fit)."""
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    a = ferrolearn.LogisticRegression(C=1.0, max_iter=2000, tol=1e-9).fit(X, y)
+    b = ferrolearn.LogisticRegression(C=1.0, max_iter=2000, tol=1e-9).fit(
+        X, y, sample_weight=None
+    )
+    assert np.array_equal(a.coef_, b.coef_)
+    assert np.array_equal(a.intercept_, b.intercept_)
+
+
+def test_logreg_integer_sample_weight_equals_row_dup():
+    """Integer sample_weight == duplicating those rows (sklearn invariant)."""
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    w = np.array([2.0, 1.0, 1.0, 1.0, 1.0, 2.0])
+    weighted = ferrolearn.LogisticRegression(C=1.0, max_iter=5000, tol=1e-10).fit(
+        X, y, sample_weight=w
+    )
+    Xd = np.vstack([X[0:1], X, X[5:6]])
+    yd = np.concatenate([y[0:1], y, y[5:6]])
+    dup = ferrolearn.LogisticRegression(C=1.0, max_iter=5000, tol=1e-10).fit(Xd, yd)
+    assert np.abs(weighted.coef_ - dup.coef_).max() < 1e-2, (weighted.coef_, dup.coef_)
+
+
+def test_logreg_class_weight_balanced_matches_sklearn():
+    """class_weight='balanced' vs sklearn (imbalanced 2-class)."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X, y = _lr_binary_imbalanced()
+    sk = SkLR(C=1.0, solver="lbfgs", max_iter=5000, tol=1e-10, class_weight="balanced").fit(X, y)
+    fl = ferrolearn.LogisticRegression(
+        C=1.0, max_iter=5000, tol=1e-10, class_weight="balanced"
+    ).fit(X, y)
+    assert np.abs(fl.coef_ - sk.coef_).max() < 1e-5, (fl.coef_, sk.coef_)
+    assert np.abs(fl.intercept_ - sk.intercept_).max() < 1e-4
+
+
+def test_logreg_class_weight_dict_matches_sklearn():
+    """class_weight={0:1,1:3} vs sklearn."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X, y = _lr_binary_imbalanced()
+    cw = {0: 1.0, 1: 3.0}
+    sk = SkLR(C=1.0, solver="lbfgs", max_iter=5000, tol=1e-10, class_weight=cw).fit(X, y)
+    fl = ferrolearn.LogisticRegression(
+        C=1.0, max_iter=5000, tol=1e-10, class_weight=cw
+    ).fit(X, y)
+    assert np.abs(fl.coef_ - sk.coef_).max() < 1e-5, (fl.coef_, sk.coef_)
+
+
+def test_logreg_class_weight_balanced_3class_matches_sklearn():
+    """class_weight='balanced' on an imbalanced 3-class problem vs sklearn."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X = np.array(
+        [
+            [0.0, 0.0], [0.5, 0.0], [0.0, 0.5],
+            [5.0, 0.0], [5.5, 0.0],
+            [0.0, 5.0], [0.5, 5.0], [0.0, 5.5], [6.0, 6.0],
+        ]
+    )
+    y = np.array([0, 0, 0, 1, 1, 2, 2, 2, 2])
+    sk = SkLR(C=10.0, solver="lbfgs", max_iter=5000, tol=1e-8, class_weight="balanced").fit(X, y)
+    fl = ferrolearn.LogisticRegression(
+        C=10.0, max_iter=5000, tol=1e-8, class_weight="balanced"
+    ).fit(X, y)
+    # Identifiable comparison via predict_proba (see #2170 for the multiclass
+    # coef_ exposure collapse, which is orthogonal to the class_weight fit).
+    assert np.abs(fl.predict_proba(X) - sk.predict_proba(X)).max() < 5e-3, (
+        fl.predict_proba(X),
+        sk.predict_proba(X),
+    )
+
+
+def test_logreg_class_weight_none_unchanged():
+    """class_weight=None == the plain unweighted fit."""
+    X, y = _lr_binary_imbalanced()
+    plain = ferrolearn.LogisticRegression(C=1.0, max_iter=3000, tol=1e-9).fit(X, y)
+    none_cw = ferrolearn.LogisticRegression(
+        C=1.0, max_iter=3000, tol=1e-9, class_weight=None
+    ).fit(X, y)
+    assert np.array_equal(plain.coef_, none_cw.coef_)
+
+
+def test_logreg_class_weight_composes_with_sample_weight():
+    """class_weight + sample_weight together == sklearn (the product folds in)."""
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X, y = _lr_binary_imbalanced()
+    cw = {0: 1.0, 1: 3.0}
+    usw = np.array([1.0, 2.0, 1.0, 1.0, 1.0, 2.0])
+    sk = SkLR(C=1.0, solver="lbfgs", max_iter=5000, tol=1e-10, class_weight=cw).fit(
+        X, y, sample_weight=usw
+    )
+    fl = ferrolearn.LogisticRegression(
+        C=1.0, max_iter=5000, tol=1e-10, class_weight=cw
+    ).fit(X, y, sample_weight=usw)
+    assert np.abs(fl.coef_ - sk.coef_).max() < 1e-5, (fl.coef_, sk.coef_)
+
+
+def test_logreg_n_iter_contract():
+    """n_iter_ is a positive int <= max_iter, shape (1,), deterministic.
+
+    R-DEV-7: ferrolearn's L-BFGS != scipy's, so we assert the CONTRACT, not
+    equality with sklearn's count (which is also shape (1,) here).
+    """
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    sk = SkLR(C=1.0, solver="lbfgs", max_iter=200, tol=1e-4).fit(X, y)
+    fl = ferrolearn.LogisticRegression(C=1.0, max_iter=200, tol=1e-4).fit(X, y)
+    # Shape parity with sklearn's n_iter_.
+    assert fl.n_iter_.shape == sk.n_iter_.shape == (1,)
+    assert fl.n_iter_.dtype == np.int32
+    assert 1 <= int(fl.n_iter_[0]) <= 200
+    # Determinism.
+    fl2 = ferrolearn.LogisticRegression(C=1.0, max_iter=200, tol=1e-4).fit(X, y)
+    assert int(fl.n_iter_[0]) == int(fl2.n_iter_[0])
+
+
+def test_logreg_random_state_n_jobs_noop_and_get_params():
+    """random_state/n_jobs are accepted, no-op on the result, and exposed via
+    get_params + survive clone (sklearn API parity)."""
+    from sklearn.base import clone
+
+    X = np.array([[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]])
+    y = np.array([0, 0, 0, 1, 1, 1])
+    base = ferrolearn.LogisticRegression(C=1.0, max_iter=2000, tol=1e-9).fit(X, y)
+    rs = ferrolearn.LogisticRegression(
+        C=1.0, max_iter=2000, tol=1e-9, random_state=42, n_jobs=4
+    ).fit(X, y)
+    assert np.array_equal(base.coef_, rs.coef_)
+    assert np.array_equal(base.intercept_, rs.intercept_)
+
+    m = ferrolearn.LogisticRegression(
+        C=2.0, class_weight="balanced", random_state=7, n_jobs=3
+    )
+    params = m.get_params()
+    assert params["random_state"] == 7
+    assert params["n_jobs"] == 3
+    assert params["class_weight"] == "balanced"
+    assert clone(m).get_params() == params

@@ -19,7 +19,7 @@
 //! blocker). Verified via `tests/divergence_classifiers.py` +
 //! `tests/test_check_estimator.py` (553 pytest pass).
 //!
-//! **23 SHIPPED / 6 NOT-STARTED.**
+//! **24 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -27,8 +27,9 @@
 //! | REQ-LOGREG-C-ABI (C keyword-only) | SHIPPED | `LogisticRegression.__init__(self, *, C=1.0, ...)` matches sklearn `_logistic.py:1129` (`C` after the `*`). |
 //! | REQ-LOGREG-MAXITER-DEFAULT (max_iter default 100) | SHIPPED | FIXED #2049: wrapper default `max_iter=100` matching sklearn `_logistic.py:1129` (was 1000); critic verified the LBFGS solver still converges + predicts accuracy 1.0 at 100 iters. Guard `test_red_logreg_max_iter_default`. |
 //! | REQ-LOGREG-VALUE-PARITY (coef_/intercept_/predict_proba parity, default path) | SHIPPED | default path: downstream `ferrolearn-linear` REQ-1/2/4 match the sklearn `LogisticRegression` oracle ~1e-8 at convergence (binary LBFGS + multinomial softmax). (decision_function shape #454.) |
-//! | REQ-LOGREG-NITER (n_iter_ = real LBFGS count) | NOT-STARTED | `fit` sets `n_iter_ = self.max_iter` (faked) vs sklearn actual (`_logistic.py:1276`, e.g. `[11]`); `_RsLogisticRegression` exposes no `n_iter_` getter — downstream #450. |
-//! | REQ-LOGREG-PARAMS (penalty/dual/solver/class_weight/random_state/intercept_scaling/warm_start/l1_ratio/n_jobs) | NOT-STARTED | the wrapper exposes `C`/`max_iter`/`tol`/`fit_intercept` only; sklearn `_logistic.py:1129`. Default l2/lbfgs MATCHES — downstream #442-#452. |
+//! | REQ-LOGREG-NITER (n_iter_ = real LBFGS count) | SHIPPED | FIXED #450/#2169: `RsLogisticRegression::n_iter_` getter binds the real `FittedLogisticRegression::n_iter` (from `LbfgsOptimizer::minimize_reporting`); `_classifiers.py::LogisticRegression.fit` sets `n_iter_ = np.array([n], dtype=int32)` (shape `(1,)`, matching sklearn `_logistic.py:1376`). R-DEV-7: honest count (positive, `<= max_iter`, deterministic), not the literal scipy value. Guard `test_logreg_n_iter_contract`. |
+//! | REQ-LOGREG-PARAMS-WEIGHTING (class_weight/random_state/n_jobs + sample_weight) | SHIPPED | FIXED #445/#451/#452/#2169: ctor gains `class_weight` (`None`/`'balanced'`/dict, re-keyed onto encoded labels), `random_state`, `n_jobs`; `fit(X,y,sample_weight=None)` threads per-sample weights. `class_weight`/`sample_weight` reach the Rust core's `with_class_weight`/`fit_with_sample_weight`; `random_state`/`n_jobs` are stored no-ops (deterministic lbfgs). sklearn `_logistic.py:1129`. Guards `test_logreg_sample_weight_*`/`test_logreg_class_weight_*`/`test_logreg_random_state_n_jobs_noop_and_get_params` (live oracle). NOTE: multiclass `coef_` exposure still collapses to `(1,n_features)` (separate #2170). |
+//! | REQ-LOGREG-PARAMS-REMAINING (penalty/dual/solver/intercept_scaling/warm_start/l1_ratio) | NOT-STARTED | the wrapper still exposes no `penalty`/`dual`/`solver`/`intercept_scaling`/`warm_start`/`l1_ratio`; sklearn `_logistic.py:1129`. Default l2/lbfgs MATCHES — downstream #442-#444/#446-#449. |
 //! | REQ-DT-API-CONFORM (fit/predict/predict_proba + classes_, default gini) | SHIPPED | `RsDecisionTreeClassifier::*` + getter, wrapped by `_classifiers.py::DecisionTreeClassifier` — mirroring `tree/_classes.py:698`/`:1017`. Live default-path oracle matches. |
 //! | REQ-DT-CTOR-ABI (all params keyword-only) | SHIPPED | `DecisionTreeClassifier.__init__(self, *, max_depth=None, ...)` matches sklearn `_classes.py:945` (the `*` is first). |
 //! | REQ-DT-FEATURE-IMPORTANCES (feature_importances_ surfaced) | SHIPPED | FIXED #2047: the wrapper `fit` now reads the pre-existing Rust getter `self.feature_importances_ = np.array(self._rs.feature_importances_)` — `(n_features,)` summing to 1.0 matching sklearn. Guard `test_red_dt_feature_importances_exposed`. |
@@ -68,33 +69,103 @@ pub struct RsLogisticRegression {
     max_iter: usize,
     tol: f64,
     fit_intercept: bool,
+    // `class_weight` is normalized by the Python wrapper into either the string
+    // "balanced" or a list of (class_label_as_i64, weight) pairs; `None` ==
+    // uniform. Stored so it threads into the Rust core's `with_class_weight`.
+    class_weight_mode: Option<ClassWeightArg>,
+    // `random_state`/`n_jobs` are stored for sklearn `get_params`/`clone` parity
+    // only — they are documented no-ops on the deterministic lbfgs path
+    // (sklearn `_logistic.py:1112`/`:1121`; mirrored downstream by
+    // `LogisticRegression::with_random_state`/`with_n_jobs`).
+    #[allow(
+        dead_code,
+        reason = "ABI/get_params-parity no-op: random_state does not affect the deterministic lbfgs solver (sklearn _logistic.py:1112)"
+    )]
+    random_state: Option<u64>,
+    #[allow(
+        dead_code,
+        reason = "ABI/get_params-parity no-op: n_jobs is a threading knob, not a result-affecting param (sklearn _logistic.py:1121)"
+    )]
+    n_jobs: Option<i64>,
     fitted: Option<ferrolearn_linear::FittedLogisticRegression<f64>>,
+}
+
+/// Normalized `class_weight` argument crossing the PyO3 boundary.
+#[derive(Clone)]
+enum ClassWeightArg {
+    /// sklearn `class_weight='balanced'`.
+    Balanced,
+    /// sklearn `class_weight={label: weight}`, as `(label_i64, weight)` pairs.
+    Dict(Vec<(i64, f64)>),
 }
 
 #[pymethods]
 impl RsLogisticRegression {
     #[new]
-    #[pyo3(signature = (c=1.0, max_iter=1000, tol=1e-4, fit_intercept=true))]
-    fn new(c: f64, max_iter: usize, tol: f64, fit_intercept: bool) -> Self {
-        Self {
+    #[pyo3(signature = (c=1.0, max_iter=1000, tol=1e-4, fit_intercept=true, class_weight=None, random_state=None, n_jobs=None))]
+    fn new(
+        c: f64,
+        max_iter: usize,
+        tol: f64,
+        fit_intercept: bool,
+        class_weight: Option<Bound<'_, PyAny>>,
+        random_state: Option<u64>,
+        n_jobs: Option<i64>,
+    ) -> PyResult<Self> {
+        let class_weight_mode = parse_class_weight(class_weight.as_ref())?;
+        Ok(Self {
             c,
             max_iter,
             tol,
             fit_intercept,
+            class_weight_mode,
+            random_state,
+            n_jobs,
             fitted: None,
-        }
+        })
     }
 
-    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, i64>) -> PyResult<()> {
+    #[pyo3(signature = (x, y, sample_weight=None))]
+    fn fit(
+        &mut self,
+        x: PyReadonlyArray2<'_, f64>,
+        y: PyReadonlyArray1<'_, i64>,
+        sample_weight: Option<PyReadonlyArray1<'_, f64>>,
+    ) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
         let y_nd = numpy1_to_ndarray_usize(y);
-        let model = ferrolearn_linear::LogisticRegression::<f64>::new()
+        let sw_nd = sample_weight.map(numpy1_to_ndarray);
+        let mut model = ferrolearn_linear::LogisticRegression::<f64>::new()
             .with_c(self.c)
             .with_max_iter(self.max_iter)
             .with_tol(self.tol)
             .with_fit_intercept(self.fit_intercept);
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        if let Some(jobs) = self.n_jobs {
+            model = model.with_n_jobs(jobs);
+        }
+        if let Some(cw) = &self.class_weight_mode {
+            // The Rust core keys `class_weight` by the encoded usize label
+            // (the Python wrapper passes already-encoded contiguous labels
+            // 0..n_classes via `_encode_labels`, so the i64 labels are >= 0).
+            let core_cw = match cw {
+                ClassWeightArg::Balanced => {
+                    ferrolearn_linear::logistic_regression::ClassWeight::Balanced
+                }
+                ClassWeightArg::Dict(pairs) => {
+                    let mapped: Vec<(usize, f64)> = pairs
+                        .iter()
+                        .map(|&(lbl, w)| (lbl.max(0) as usize, w))
+                        .collect();
+                    ferrolearn_linear::logistic_regression::ClassWeight::Dict(mapped)
+                }
+            };
+            model = model.with_class_weight(core_cw);
+        }
         let fitted = model
-            .fit(&x_nd, &y_nd)
+            .fit_with_sample_weight(&x_nd, &y_nd, sw_nd.as_ref())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         self.fitted = Some(fitted);
         Ok(())
@@ -160,6 +231,63 @@ impl RsLogisticRegression {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.intercept())
     }
+
+    /// Number of L-BFGS iterations performed during `fit` (sklearn `n_iter_`,
+    /// `_logistic.py:1376`). Exposed as a scalar; the Python wrapper presents it
+    /// as `np.array([n_iter])` to match sklearn's `(1,)` shape on the
+    /// binary/multinomial lbfgs path. R-DEV-7: the count is honest (positive,
+    /// `<= max_iter`, deterministic), not asserted equal to scipy's.
+    #[getter]
+    fn n_iter_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_iter())
+    }
+}
+
+/// Parse a Python `class_weight` argument (`None` / `'balanced'` / `dict`) into
+/// the normalized [`ClassWeightArg`]. Mirrors sklearn's accepted values
+/// (`_logistic.py:1111` `[dict, StrOptions({"balanced"}), None]`).
+fn parse_class_weight(obj: Option<&Bound<'_, PyAny>>) -> PyResult<Option<ClassWeightArg>> {
+    let Some(obj) = obj else {
+        return Ok(None);
+    };
+    if obj.is_none() {
+        return Ok(None);
+    }
+    // String form: only 'balanced' is valid.
+    if let Ok(s) = obj.extract::<String>() {
+        if s == "balanced" {
+            return Ok(Some(ClassWeightArg::Balanced));
+        }
+        return Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "class_weight={s:?} is invalid (expected 'balanced', a dict, or None)"
+        )));
+    }
+    // Dict form: {label: weight}. Labels are the already-encoded i64 class
+    // indices passed by the Python wrapper.
+    if let Ok(dict) = obj.cast::<pyo3::types::PyDict>() {
+        let mut pairs: Vec<(i64, f64)> = Vec::with_capacity(dict.len());
+        for (k, v) in dict.iter() {
+            let label: i64 = k.extract().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "class_weight dict keys must be integer class labels",
+                )
+            })?;
+            let weight: f64 = v.extract().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "class_weight dict values must be numeric weights",
+                )
+            })?;
+            pairs.push((label, weight));
+        }
+        return Ok(Some(ClassWeightArg::Dict(pairs)));
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "class_weight must be None, 'balanced', or a {class: weight} dict",
+    ))
 }
 
 // ---------------------------------------------------------------------------

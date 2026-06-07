@@ -26,7 +26,11 @@
 //! | REQ-6 (fit_intercept incl. false) | SHIPPED | intercept fixed at 0, unpenalized. |
 //! | REQ-7 (C regularization convention) | SHIPPED | C multiplies the loss (not the penalty); matches sklearn. |
 //! | REQ-8 (HasCoefficients/HasClasses) | SHIPPED | coef_ `(n_classes,n_features)`/`(1,n_features)` (no transpose). |
-//! | REQ-9..20 NOT-STARTED | penalty l1/elasticnet/none (#442), solver variants (#443), multi_class=ovr (#444), class_weight (#445), dual (#446), intercept_scaling (#447), l1_ratio (#448), warm_start (#449), n_iter_ (#450), sample_weight (#451), random_state/n_jobs (#452), ferray substrate (#453). |
+//! | REQ-12 (class_weight) | SHIPPED | `ClassWeight` enum (`Balanced`/`Dict`) + `with_class_weight`; `effective_sample_weights` folds the per-class multiplier into the per-sample weight (`utils/class_weight.py:73` balanced formula, `:77-83` dict). Consumer: `RsLogisticRegression` (binding). Verified vs live oracle (balanced/dict, 2- and 3-class). |
+//! | REQ-17 (n_iter_) | SHIPPED | `FittedLogisticRegression::n_iter` (via `LbfgsOptimizer::minimize_reporting`) + getter `n_iter()`; positive int `<= max_iter`, deterministic (R-DEV-7: contract not literal sklearn count). Consumer: `RsLogisticRegression::n_iter_`. |
+//! | REQ-18 (sample_weight) | SHIPPED | `fit_with_sample_weight(x,y,Option<&Array1<F>>)` threads per-sample weights into logloss+grad in both branches; `Fit::fit` delegates `None` (byte-identical). Consumer: `RsLogisticRegression::fit`. Verified vs oracle (weighted coef/intercept, integer-weight≡row-dup). |
+//! | REQ-19 (random_state/n_jobs) | SHIPPED | `random_state`/`n_jobs` ctor fields + `with_random_state`/`with_n_jobs`; documented no-ops on the deterministic lbfgs path (R-DEV-7). Consumer: `RsLogisticRegression` get_params/clone parity. |
+//! | REQ-9..11,13..16,20 NOT-STARTED | penalty l1/elasticnet/none (#442), solver variants (#443), multi_class=ovr (#444), dual (#446), intercept_scaling (#447), l1_ratio (#448), warm_start (#449), ferray substrate (#453). |
 //!
 //! acto-critic: binary + multinomial coef/intercept/predict_proba match the live oracle to ~1e-8 at
 //! convergence; classes_ returns original labels; intercept unpenalized; C convention correct. The
@@ -60,6 +64,26 @@ use num_traits::{Float, FromPrimitive, ToPrimitive};
 
 use crate::optim::lbfgs::LbfgsOptimizer;
 
+/// Per-class weighting strategy, mirroring scikit-learn's `class_weight`
+/// parameter (`sklearn/linear_model/_logistic.py:1111`,
+/// `"class_weight": [dict, StrOptions({"balanced"}), None]`).
+///
+/// `None` (the absence of this enum) means uniform weights. The two non-uniform
+/// modes both produce a per-class multiplier that is folded into the effective
+/// per-sample weight `sample_weight[i] * class_weight[y[i]]`
+/// (`sklearn/linear_model/_logistic.py:312-313`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClassWeight<F> {
+    /// `'balanced'`: per-class weight `n_samples / (n_classes * bincount[class])`
+    /// (`sklearn/utils/class_weight.py:73`,
+    /// `recip_freq = len(y) / (len(le.classes_) * np.bincount(y_ind))`).
+    Balanced,
+    /// A user-supplied `{class_label: weight}` map. Classes absent from the map
+    /// default to weight `1.0` (`sklearn/utils/class_weight.py:77-83`). Stored as
+    /// `(class_label, weight)` pairs to preserve the `F` generic.
+    Dict(Vec<(usize, F)>),
+}
+
 /// Logistic regression classifier.
 ///
 /// Uses L-BFGS optimization to minimize the regularized logistic loss.
@@ -79,6 +103,19 @@ pub struct LogisticRegression<F> {
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// Per-class weighting strategy. `None` => uniform weights (sklearn default,
+    /// `_logistic.py:1138` `class_weight=None`).
+    pub class_weight: Option<ClassWeight<F>>,
+    /// Random seed. On the lbfgs solver (the only path implemented) this is a
+    /// no-op: lbfgs is deterministic and consumes no RNG — `random_state` only
+    /// affects sag/saga/liblinear shuffling (sklearn `_logistic.py:1112`
+    /// `"random_state": ["random_state"]`). Stored for `get_params`/`clone`
+    /// parity.
+    pub random_state: Option<u64>,
+    /// Number of parallel jobs. A threading knob only; it never changes the
+    /// fitted result (sklearn `_logistic.py:1121` `"n_jobs": [None, Integral]`).
+    /// Stored for `get_params`/`clone` parity.
+    pub n_jobs: Option<i64>,
 }
 
 impl<F: Float> LogisticRegression<F> {
@@ -93,6 +130,9 @@ impl<F: Float> LogisticRegression<F> {
             max_iter: 1000,
             tol: F::from(1e-4).unwrap(),
             fit_intercept: true,
+            class_weight: None,
+            random_state: None,
+            n_jobs: None,
         }
     }
 
@@ -121,6 +161,33 @@ impl<F: Float> LogisticRegression<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the per-class weighting strategy (`'balanced'` or a `{class: weight}`
+    /// dict). Mirrors sklearn's `class_weight` constructor argument
+    /// (`_logistic.py:1138`).
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = Some(class_weight);
+        self
+    }
+
+    /// Set the random seed. On the lbfgs solver this is a no-op (lbfgs is
+    /// deterministic); stored for API/`clone` parity with sklearn
+    /// (`_logistic.py:1139`).
+    #[must_use]
+    pub fn with_random_state(mut self, random_state: u64) -> Self {
+        self.random_state = Some(random_state);
+        self
+    }
+
+    /// Set the number of parallel jobs. A threading knob that never changes the
+    /// fitted result; stored for API/`clone` parity with sklearn
+    /// (`_logistic.py:1145`).
+    #[must_use]
+    pub fn with_n_jobs(mut self, n_jobs: i64) -> Self {
+        self.n_jobs = Some(n_jobs);
         self
     }
 }
@@ -153,6 +220,10 @@ pub struct FittedLogisticRegression<F> {
     classes: Vec<usize>,
     /// Whether this is a binary problem.
     is_binary: bool,
+    /// Number of L-BFGS outer iterations actually performed during `fit`
+    /// (the analog of scipy's `OptimizeResult.nit` that sklearn stores in
+    /// `n_iter_`, `_logistic.py:1375-1376`). A positive integer `<= max_iter`.
+    n_iter: usize,
 }
 
 /// Sigmoid function: 1 / (1 + exp(-z)).
@@ -185,6 +256,39 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedLogisticRegression<F>, FerroError> {
+        // `Fit::fit` is the unweighted entry point: delegate with no
+        // `sample_weight`, which is byte-identical to the pre-weighting
+        // implementation (the per-sample weight loop collapses to `w_i = 1`).
+        self.fit_with_sample_weight(x, y, None)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
+    /// Fit the model with optional per-sample weights.
+    ///
+    /// `sample_weight`, when supplied, weights each sample's contribution to the
+    /// log-loss and its gradient (mirroring sklearn's
+    /// `LogisticRegression.fit(X, y, sample_weight=...)`,
+    /// `_logistic.py:1165`). When `self.class_weight` is set, the per-class
+    /// multiplier is folded in so the effective per-sample weight is
+    /// `sample_weight[i] * class_weight[y[i]]`
+    /// (`_logistic.py:302-313`). `None` for `sample_weight` with `class_weight =
+    /// None` reproduces the unweighted fit exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of samples in `x`,
+    /// `y`, or `sample_weight` differ.
+    /// Returns [`FerroError::InvalidParameter`] if `C` is not positive.
+    /// (Negative `sample_weight` entries are accepted, matching sklearn 1.5.2.)
+    /// Returns [`FerroError::InsufficientSamples`] if there are fewer than 2
+    /// distinct classes.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<FittedLogisticRegression<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -192,6 +296,21 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn 1.5.2 `LogisticRegression.fit` validates sample_weight via
+        // `_check_sample_weight` WITHOUT `only_non_negative=True`
+        // (`_logistic.py:303`), so negative weights are accepted and flow into
+        // the weighted logloss/gradient with a negative contribution. We match
+        // that: only the length is enforced, no non-negativity check (#2171).
+        if let Some(sw) = sample_weight
+            && sw.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sw.len()],
+                context: "sample_weight length must match number of samples in X".into(),
             });
         }
 
@@ -223,17 +342,104 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
+        // Build the effective per-sample weights `sw_i * class_weight[y_i]`
+        // (sklearn folds class_weight INTO sample_weight before the loss,
+        // `_logistic.py:312-313`). `None` is returned when both are absent, so
+        // the unweighted path stays byte-identical.
+        let effective = self.effective_sample_weights(y, &classes, sample_weight)?;
+
         let n_classes = classes.len();
 
         if n_classes == 2 {
-            self.fit_binary(x, y, n_samples, n_features, &classes)
+            self.fit_binary(x, y, n_samples, n_features, &classes, effective.as_ref())
         } else {
-            self.fit_multinomial(x, y, n_samples, n_features, &classes)
+            self.fit_multinomial(x, y, n_samples, n_features, &classes, effective.as_ref())
         }
     }
-}
 
-impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
+    /// Compose `sample_weight` with `class_weight` into the effective per-sample
+    /// weight vector `w_i = sample_weight[i] * class_weight[y[i]]`.
+    ///
+    /// Returns `None` when neither `sample_weight` nor `class_weight` is set
+    /// (the unweighted fast path). Mirrors sklearn's
+    /// `sample_weight *= class_weight_[le.fit_transform(y)]`
+    /// (`_logistic.py:313`) with `class_weight_` from
+    /// `compute_class_weight` (`utils/class_weight.py`).
+    fn effective_sample_weights(
+        &self,
+        y: &Array1<usize>,
+        classes: &[usize],
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<Option<Array1<F>>, FerroError> {
+        // Per-class multiplier indexed by position in `classes`.
+        let class_mult: Option<Vec<F>> = match &self.class_weight {
+            None => None,
+            Some(ClassWeight::Balanced) => {
+                // n_samples / (n_classes * bincount[class])
+                // (utils/class_weight.py:73).
+                let n_samples = y.len();
+                let n_classes = classes.len();
+                let mut counts = vec![0usize; n_classes];
+                for &label in y {
+                    if let Some(pos) = classes.iter().position(|&c| c == label) {
+                        counts[pos] += 1;
+                    }
+                }
+                let n_f = F::from(n_samples).ok_or_else(|| FerroError::NumericalInstability {
+                    message: "n_samples not representable in F".into(),
+                })?;
+                let nc_f = F::from(n_classes).ok_or_else(|| FerroError::NumericalInstability {
+                    message: "n_classes not representable in F".into(),
+                })?;
+                let mut mult = vec![F::one(); n_classes];
+                for (k, &cnt) in counts.iter().enumerate() {
+                    let cnt_f = F::from(cnt).ok_or_else(|| FerroError::NumericalInstability {
+                        message: "class count not representable in F".into(),
+                    })?;
+                    if cnt_f > F::zero() {
+                        mult[k] = n_f / (nc_f * cnt_f);
+                    }
+                }
+                Some(mult)
+            }
+            Some(ClassWeight::Dict(map)) => {
+                // Classes absent from the map default to 1.0
+                // (utils/class_weight.py:77-83).
+                let mut mult = vec![F::one(); classes.len()];
+                for (k, &cls) in classes.iter().enumerate() {
+                    if let Some(&(_, w)) = map.iter().find(|&&(c, _)| c == cls) {
+                        mult[k] = w;
+                    }
+                }
+                Some(mult)
+            }
+        };
+
+        match (sample_weight, class_mult) {
+            (None, None) => Ok(None),
+            (Some(sw), None) => Ok(Some(sw.clone())),
+            (None, Some(mult)) => {
+                let eff = y.mapv(|label| {
+                    classes
+                        .iter()
+                        .position(|&c| c == label)
+                        .map_or(F::one(), |pos| mult[pos])
+                });
+                Ok(Some(eff))
+            }
+            (Some(sw), Some(mult)) => {
+                let eff = Array1::from_shape_fn(sw.len(), |i| {
+                    let m = classes
+                        .iter()
+                        .position(|&c| c == y[i])
+                        .map_or(F::one(), |pos| mult[pos]);
+                    sw[i] * m
+                });
+                Ok(Some(eff))
+            }
+        }
+    }
+
     /// Fit binary logistic regression.
     fn fit_binary(
         &self,
@@ -242,6 +448,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
         n_samples: usize,
         n_features: usize,
         classes: &[usize],
+        sample_weight: Option<&Array1<F>>,
     ) -> Result<FittedLogisticRegression<F>, FerroError> {
         let n_f = F::from(n_samples).unwrap();
         let reg = F::one() / self.c;
@@ -254,6 +461,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
                 F::zero()
             }
         });
+
+        // Materialize the per-sample weights (effective sample_weight*class_weight
+        // already composed upstream); `None` => unit weights, the unweighted path.
+        let sw: Array1<F> =
+            sample_weight.map_or_else(|| Array1::from_elem(n_samples, F::one()), Clone::clone);
 
         // Parameter vector: [w_0, w_1, ..., w_{n_features-1}, (intercept)]
         let n_params = if self.fit_intercept {
@@ -281,14 +493,19 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             for i in 0..n_samples {
                 let p = sigmoid(logits[i]);
                 let yi = y_binary[i];
+                let wi = sw[i];
 
                 // Binary cross-entropy loss (negative log-likelihood).
                 let eps = F::from(1e-15).unwrap();
                 let p_clipped = p.max(eps).min(F::one() - eps);
-                loss = loss - (yi * p_clipped.ln() + (F::one() - yi) * (F::one() - p_clipped).ln());
+                // Per-sample weighting: each pointwise loss term scaled by w_i
+                // (sklearn folds sample_weight*class_weight into the loss,
+                // `_logistic.py:302-313`, `:451`).
+                loss = loss
+                    - wi * (yi * p_clipped.ln() + (F::one() - yi) * (F::one() - p_clipped).ln());
 
-                // Gradient.
-                let diff = p - yi;
+                // Gradient (each sample's contribution scaled by w_i).
+                let diff = wi * (p - yi);
                 let xi = x.row(i);
                 for j in 0..n_features {
                     grad_w[j] = grad_w[j] + diff * xi[j];
@@ -327,7 +544,10 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
 
         let optimizer = LbfgsOptimizer::new(self.max_iter, self.tol);
         let x0 = Array1::<F>::zeros(n_params);
-        let params = optimizer.minimize(objective, x0)?;
+        // `minimize_reporting` returns the L-BFGS outer-iteration count (scipy
+        // `OptimizeResult.nit` analog) that sklearn stores in `n_iter_`
+        // (`_logistic.py:1375-1376`), without changing `minimize`'s behavior.
+        let (params, n_iter) = optimizer.minimize_reporting(objective, x0)?;
 
         let coefficients = params.slice(ndarray::s![..n_features]).to_owned();
         let intercept = if self.fit_intercept {
@@ -350,6 +570,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             intercept_vec: Array1::from_vec(vec![intercept]),
             classes: classes.to_vec(),
             is_binary: true,
+            n_iter,
         })
     }
 
@@ -361,6 +582,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
         n_samples: usize,
         n_features: usize,
         classes: &[usize],
+        sample_weight: Option<&Array1<F>>,
     ) -> Result<FittedLogisticRegression<F>, FerroError> {
         let n_classes = classes.len();
         let n_f = F::from(n_samples).unwrap();
@@ -377,6 +599,11 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
         for (i, &ci) in class_indices.iter().enumerate() {
             y_onehot[[i, ci]] = F::one();
         }
+
+        // Effective per-sample weights (sample_weight*class_weight already
+        // composed upstream); `None` => unit weights.
+        let sw: Array1<F> =
+            sample_weight.map_or_else(|| Array1::from_elem(n_samples, F::one()), Clone::clone);
 
         // Parameter vector: flattened [W (n_classes x n_features), b (n_classes)]
         let n_weight_params = n_classes * n_features;
@@ -415,9 +642,12 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             let mut loss = F::zero();
             let eps = F::from(1e-15).unwrap();
             for i in 0..n_samples {
+                let wi = sw[i];
                 for c in 0..n_classes {
                     let p = probs[[i, c]].max(eps);
-                    loss = loss - y_onehot[[i, c]] * p.ln();
+                    // Per-sample weighting of each cross-entropy term
+                    // (`_logistic.py:302-313`, `:451`).
+                    loss = loss - wi * y_onehot[[i, c]] * p.ln();
                 }
             }
             let _ = n_f; // n_f intentionally unused since we don't divide
@@ -426,8 +656,16 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             let reg_loss: F = w_mat.iter().fold(F::zero(), |acc, &wi| acc + wi * wi);
             loss = loss + reg / F::from(2.0).unwrap() * reg_loss;
 
-            // Gradient (sum form to match sklearn's loss scaling).
-            let diff = &probs - &y_onehot;
+            // Gradient (sum form to match sklearn's loss scaling). Each sample
+            // row of `diff` is scaled by its weight w_i, so the weighted loss's
+            // gradient is `sum_i w_i (p_i - y_i) x_i` (`_logistic.py:302-313`).
+            let mut diff = &probs - &y_onehot;
+            for i in 0..n_samples {
+                let wi = sw[i];
+                for c in 0..n_classes {
+                    diff[[i, c]] = diff[[i, c]] * wi;
+                }
+            }
             let grad_w = diff.t().dot(x);
 
             let mut grad = Array1::<F>::zeros(n_params);
@@ -450,7 +688,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
 
         let optimizer = LbfgsOptimizer::new(self.max_iter, self.tol);
         let x0 = Array1::<F>::zeros(n_params);
-        let params = optimizer.minimize(objective, x0)?;
+        // Capture the L-BFGS iteration count (scipy `nit` analog) for `n_iter_`
+        // (`_logistic.py:1375-1376`).
+        let (params, n_iter) = optimizer.minimize_reporting(objective, x0)?;
 
         // Extract results.
         let mut weight_matrix = Array2::<F>::zeros((n_classes, n_features));
@@ -477,6 +717,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
             intercept_vec,
             classes: classes.to_vec(),
             is_binary: false,
+            n_iter,
         })
     }
 }
@@ -531,6 +772,19 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedLogisticRegression<
     #[must_use]
     pub fn is_binary(&self) -> bool {
         self.is_binary
+    }
+
+    /// Number of L-BFGS iterations performed during `fit` (sklearn `n_iter_`,
+    /// `_logistic.py:1376`). For the binary and multinomial lbfgs paths sklearn
+    /// reports a single count (its `n_iter_` is shape `(1,)`); this scalar IS
+    /// that single count. A positive integer `<= max_iter`.
+    ///
+    /// NOTE (R-DEV-7): ferrolearn's L-BFGS is not scipy's, so the exact count
+    /// differs from sklearn's — the CONTRACT (positive, deterministic,
+    /// `<= max_iter`) is matched, not the literal value.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
     }
 
     /// Predict class probabilities for the given feature matrix.

@@ -114,29 +114,121 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
         Tolerance for convergence.
     fit_intercept : bool, default=True
         Whether to calculate the intercept for this model.
+    class_weight : dict, 'balanced' or None, default=None
+        Weights associated with classes. 'balanced' uses
+        ``n_samples / (n_classes * np.bincount(y))``; a dict maps
+        ``{class_label: weight}``. Mirrors
+        ``sklearn/linear_model/_logistic.py:1138``.
+    random_state : int or None, default=None
+        Random seed. A no-op on the lbfgs solver (deterministic); stored for
+        ``get_params``/``clone`` parity (``_logistic.py:1139``).
+    n_jobs : int or None, default=None
+        Number of parallel jobs. A threading knob only; does not affect the
+        result (``_logistic.py:1145``).
     """
 
-    def __init__(self, *, C=1.0, max_iter=100, tol=1e-4, fit_intercept=True):
+    def __init__(
+        self,
+        *,
+        C=1.0,
+        max_iter=100,
+        tol=1e-4,
+        fit_intercept=True,
+        class_weight=None,
+        random_state=None,
+        n_jobs=None,
+    ):
         self.C = C
         self.max_iter = max_iter
         self.tol = tol
         self.fit_intercept = fit_intercept
+        self.class_weight = class_weight
+        self.random_state = random_state
+        self.n_jobs = n_jobs
 
-    def fit(self, X, y):
+    def _encode_class_weight(self, class_weight, classes):
+        """Re-key a {original_label: weight} class_weight onto the encoded
+        contiguous labels (0..n_classes) the Rust core consumes. 'balanced' and
+        None pass through unchanged. Mirrors sklearn keying class_weight by the
+        original labels (utils/class_weight.py)."""
+        if class_weight is None or class_weight == "balanced":
+            return class_weight
+        if isinstance(class_weight, dict):
+            label_to_idx = {c: i for i, c in enumerate(classes)}
+            encoded = {}
+            for label, weight in class_weight.items():
+                if label not in label_to_idx:
+                    raise ValueError(
+                        f"class_weight refers to class {label!r} not present in y."
+                    )
+                encoded[int(label_to_idx[label])] = float(weight)
+            return encoded
+        raise ValueError(
+            "class_weight must be None, 'balanced', or a {class: weight} dict, "
+            f"got {class_weight!r}."
+        )
+
+    def _make_random_state(self):
+        """Coerce sklearn's random_state (int/None) to the u64 the Rust core
+        accepts. RandomState instances are not supported on this deterministic
+        path; only an int seed or None is threaded through (it is a no-op)."""
+        rs = self.random_state
+        if rs is None or isinstance(rs, (int, np.integer)):
+            return None if rs is None else int(rs)
+        # On lbfgs random_state never changes the result; a non-int seed is
+        # accepted but ignored (no RNG is consumed).
+        return None
+
+    def fit(self, X, y, sample_weight=None):
         X, y = self._validate_data(X, y, dtype="float64")
         _check_classification_target(y)
         X = _ensure_f64(X)
         y_encoded, self.classes_ = _encode_labels(y)
+        if sample_weight is not None:
+            sample_weight = np.asarray(sample_weight, dtype=np.float64)
+            # sklearn validates sample_weight is 1-D with one entry per sample
+            # (utils/validation._check_sample_weight) and raises ValueError on a
+            # shape mismatch — enforce that here, before the Rust 1-D ABI
+            # boundary that would otherwise raise TypeError for a 2-D array.
+            if sample_weight.ndim != 1:
+                raise ValueError(
+                    f"sample_weight must be 1D array or scalar, got {sample_weight.ndim}D."
+                )
+            if sample_weight.shape[0] != X.shape[0]:
+                raise ValueError(
+                    "sample_weight.shape == "
+                    f"{sample_weight.shape}, expected ({X.shape[0]},)!"
+                )
+            sample_weight = np.ascontiguousarray(sample_weight, dtype=np.float64)
         self._rs = _RsLogisticRegression(
             c=float(self.C),
             max_iter=self.max_iter,
             tol=self.tol,
             fit_intercept=self.fit_intercept,
+            class_weight=self._encode_class_weight(self.class_weight, self.classes_),
+            random_state=self._make_random_state(),
+            n_jobs=self.n_jobs,
         )
-        _fit_rust(self._rs, X, y_encoded)
+        try:
+            self._rs.fit(X, y_encoded, sample_weight)
+        except ValueError as e:
+            # Mirror _fit_rust's sklearn-message translation (the Rust core's
+            # "Insufficient samples" -> sklearn n_samples phrasing), but on the
+            # 3-arg sample_weight signature.
+            msg = str(e)
+            m = re.search(r"got (\d+)", msg)
+            if m and "Insufficient" in msg:
+                n = m.group(1)
+                raise ValueError(
+                    f"n_samples={n} is not enough; this estimator needs at least "
+                    f"as many samples as features. {msg}"
+                ) from e
+            raise
         self.coef_ = np.array(self._rs.coef_).reshape(1, -1)
         self.intercept_ = np.array([float(self._rs.intercept_)])
-        self.n_iter_ = self.max_iter
+        # n_iter_ shape (1,) for the binary/multinomial lbfgs path
+        # (sklearn _logistic.py:1376).
+        self.n_iter_ = np.array([int(self._rs.n_iter_)], dtype=np.int32)
         self._store_training_data(X, y_encoded)
         return self
 
@@ -146,6 +238,9 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
             max_iter=self.max_iter,
             tol=self.tol,
             fit_intercept=self.fit_intercept,
+            class_weight=self._encode_class_weight(self.class_weight, self.classes_),
+            random_state=self._make_random_state(),
+            n_jobs=self.n_jobs,
         )
         self._rs.fit(self._fit_X, self._fit_y_encoded)
 

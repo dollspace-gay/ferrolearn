@@ -53,6 +53,14 @@ impl<F: Float + Send + Sync + 'static> LbfgsOptimizer<F> {
     /// Returns [`FerroError::ConvergenceFailure`] if the optimizer does not
     /// converge within `max_iter` iterations.
     /// Returns [`FerroError::NumericalInstability`] if NaN values are encountered.
+    #[allow(
+        dead_code,
+        reason = "byte-identical non-reporting delegate to minimize_inner; both \
+                  logistic_regression.rs and huber_regressor.rs now use \
+                  minimize_reporting to capture n_iter_ (#450), so minimize has \
+                  no production caller but remains the documented/test-covered \
+                  reporting-vs-non-reporting split point"
+    )]
     pub(crate) fn minimize<Func>(
         &self,
         objective: Func,
