@@ -164,7 +164,11 @@ class HuberRegressor(_RegressorWrapper):
     ``(coef_, intercept_, scale_)`` as the optimizer seed (``_huber.py:308-309``);
     because the Huber objective is convex the converged fit is unchanged and the
     refit converges in fewer iterations. The fitted ``coef_``/``intercept_``/
-    ``scale_`` attributes are surfaced from the Rust fitted type.
+    ``scale_``/``n_iter_`` attributes are surfaced from the Rust fitted type.
+    ``n_iter_`` is the honest ferrolearn L-BFGS iteration count (``_huber.py:342``
+    ``self.n_iter_ = opt_res.nit``); R-DEV-7: the Rust core is not scipy's
+    L-BFGS-B, so it need not equal sklearn's exactly, but it is a positive int
+    ``<= max_iter`` and a warm refit reports fewer iterations than the cold fit.
     """
 
     def __init__(self, *, epsilon=1.35, alpha=1e-4, max_iter=100, tol=1e-5,
@@ -196,6 +200,11 @@ class HuberRegressor(_RegressorWrapper):
         self.coef_ = np.asarray(self._rs.coef_)
         self.intercept_ = self._rs.intercept_
         self.scale_ = self._rs.scale_
+        # sklearn `n_iter_` (`_huber.py:342` `self.n_iter_ = opt_res.nit`): the
+        # number of optimizer iterations the fit ran for. R-DEV-7: the Rust core
+        # is not scipy's L-BFGS-B, so this is the honest ferrolearn iteration
+        # count (positive int <= max_iter; a warm refit takes fewer than cold).
+        self.n_iter_ = int(self._rs.n_iter_)
         return self
 
 

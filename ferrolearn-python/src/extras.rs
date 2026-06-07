@@ -341,6 +341,19 @@ impl RsHuberRegressor {
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.scale())
     }
+
+    // sklearn `n_iter_` (`sklearn/linear_model/_huber.py:342` `self.n_iter_ =
+    // opt_res.nit`): the number of optimizer iterations the fit ran for. The
+    // MATH (and the R-DEV-7 honest-count caveat) lives in
+    // `FittedHuberRegressor::n_iter`; this getter marshals it as a Python int.
+    #[getter]
+    fn n_iter_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_iter())
+    }
 }
 
 py_regressor!(

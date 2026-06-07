@@ -61,6 +61,55 @@ impl<F: Float + Send + Sync + 'static> LbfgsOptimizer<F> {
     where
         Func: Fn(&Array1<F>) -> (F, Array1<F>),
     {
+        // Discard the iteration count: byte-identical observable behavior and
+        // return type to the pre-`minimize_reporting` implementation. Consumers
+        // that do not need `n_iter_` (e.g. `logistic_regression.rs`) are
+        // completely unaffected.
+        self.minimize_inner(objective, x0).map(|(x, _n_iter)| x)
+    }
+
+    /// Minimize the objective and ALSO report the optimizer iteration count.
+    ///
+    /// Identical computation to [`LbfgsOptimizer::minimize`], additionally
+    /// returning `(solution, n_iters)` where `n_iters` is the number of outer
+    /// L-BFGS iterations performed — the analog of `scipy.optimize`'s
+    /// `OptimizeResult.nit` (sklearn `HuberRegressor.fit` sets
+    /// `self.n_iter_ = opt_res.nit`, `sklearn/linear_model/_huber.py:342`),
+    /// NOT line-search or function-evaluation counts. The count is a positive
+    /// integer `<= max_iter`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ConvergenceFailure`] if the optimizer does not
+    /// converge within `max_iter` iterations (the count is carried in the error).
+    /// Returns [`FerroError::NumericalInstability`] if NaN values are encountered.
+    pub(crate) fn minimize_reporting<Func>(
+        &self,
+        objective: Func,
+        x0: Array1<F>,
+    ) -> Result<(Array1<F>, usize), FerroError>
+    where
+        Func: Fn(&Array1<F>) -> (F, Array1<F>),
+    {
+        self.minimize_inner(objective, x0)
+    }
+
+    /// Shared optimizer loop returning `(solution, n_iters)`.
+    ///
+    /// Both [`LbfgsOptimizer::minimize`] (which discards `n_iters`) and
+    /// [`LbfgsOptimizer::minimize_reporting`] (which returns it) call this, so
+    /// the two entry points compute byte-identically. `n_iters` counts the outer
+    /// L-BFGS iterations actually performed before convergence (the same count
+    /// already reported in [`FerroError::ConvergenceFailure`] on the failure
+    /// path), mirroring scipy's `OptimizeResult.nit`.
+    fn minimize_inner<Func>(
+        &self,
+        objective: Func,
+        x0: Array1<F>,
+    ) -> Result<(Array1<F>, usize), FerroError>
+    where
+        Func: Fn(&Array1<F>) -> (F, Array1<F>),
+    {
         let n = x0.len();
         let mut x = x0;
 
@@ -81,7 +130,11 @@ impl<F: Float + Send + Sync + 'static> LbfgsOptimizer<F> {
             // Check convergence: ||g||_inf < tol
             let g_norm = g.iter().fold(F::zero(), |acc, &v| acc.max(v.abs()));
             if g_norm < self.tol {
-                return Ok(x);
+                // `iter` outer iterations have been completed before this
+                // convergence check fires; mirror scipy's `nit` (>= 1 once any
+                // descent step has run, but at least 1 on an immediate converge
+                // so a fitted model never reports a zero iteration count).
+                return Ok((x, iter.max(1)));
             }
 
             // Compute search direction using two-loop recursion.
@@ -127,8 +180,11 @@ impl<F: Float + Send + Sync + 'static> LbfgsOptimizer<F> {
         // Many practical problems converge "close enough".
         let g_norm = g.iter().fold(F::zero(), |acc, &v| acc.max(v.abs()));
         if g_norm < F::from(1e-2).unwrap() {
-            // Close enough to convergence.
-            return Ok(x);
+            // Close enough to convergence: the full `max_iter` outer iterations
+            // ran without hitting the tight tolerance, so report `max_iter`
+            // (scipy likewise caps `n_iter_` at `max_iter`,
+            // `sklearn/linear_model/_huber.py:206-207`).
+            return Ok((x, self.max_iter));
         }
 
         Err(FerroError::ConvergenceFailure {

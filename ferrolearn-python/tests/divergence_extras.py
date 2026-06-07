@@ -803,3 +803,54 @@ def test_huber_warm_start_keyword_only_like_sklearn():
     sig = inspect.signature(fl.HuberRegressor.__init__)
     assert sig.parameters["warm_start"].kind == inspect.Parameter.KEYWORD_ONLY
     assert sig.parameters["warm_start"].default is False
+
+
+def test_huber_n_iter_attribute_positive_bounded():
+    """REQ-9 (#499): `fl.HuberRegressor().fit(...).n_iter_` is exposed (sklearn
+    `n_iter_`, `_huber.py:342` `self.n_iter_ = opt_res.nit`) as a positive int
+    `<= max_iter`. R-DEV-7: the Rust core is not scipy's L-BFGS-B, so the raw
+    count need not equal sklearn's exactly — we assert the same positivity/bound
+    contract sklearn satisfies, not equality."""
+    X, y = _huber_outlier_data()
+    max_iter = 200
+    fr = fl.HuberRegressor(max_iter=max_iter).fit(X, y)
+    sk = SkHuberRegressor(max_iter=max_iter).fit(X, y)
+
+    assert isinstance(fr.n_iter_, int)
+    assert fr.n_iter_ >= 1
+    assert fr.n_iter_ <= max_iter
+    # sklearn's own n_iter_ is likewise a positive int <= max_iter (the contract
+    # both share; the exact counts differ across the two L-BFGS implementations).
+    assert int(sk.n_iter_) >= 1
+
+
+def test_huber_n_iter_warm_start_fewer_than_cold_like_sklearn():
+    """REQ-9 (#499): a warm-start refit reports FEWER `n_iter_` than the cold fit
+    — the oracle-comparable property sklearn also exhibits (live sklearn 1.5.2:
+    cold `n_iter_`=15, warm=1; `_huber.py:308-309`/`:342`). R-CHAR-3: the sklearn
+    inequality is computed live in this test, not copied."""
+    X, y = _huber_outlier_data()
+
+    # sklearn oracle: warm refit n_iter_ < cold n_iter_.
+    sk = SkHuberRegressor(warm_start=True)
+    sk.fit(X, y)
+    sk_cold_iters = int(sk.n_iter_)
+    sk.fit(X, y)
+    sk_warm_iters = int(sk.n_iter_)
+    assert sk_warm_iters < sk_cold_iters, (
+        f"sklearn oracle expected warm < cold, got warm={sk_warm_iters} "
+        f"cold={sk_cold_iters}"
+    )
+
+    # ferrolearn must exhibit the same warm < cold property.
+    fr = fl.HuberRegressor(warm_start=True)
+    fr.fit(X, y)
+    fr_cold_iters = fr.n_iter_
+    fr.fit(X, y)  # warm refit reuses the prior fit's coef_/intercept_/scale_
+    fr_warm_iters = fr.n_iter_
+
+    assert fr_warm_iters < fr_cold_iters, (
+        f"ferrolearn warm n_iter_ ({fr_warm_iters}) must be < cold "
+        f"({fr_cold_iters}) (sklearn: cold={sk_cold_iters}, warm={sk_warm_iters})"
+    )
+    assert fr_warm_iters >= 1

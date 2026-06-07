@@ -56,11 +56,18 @@
 //! - REQ-6 (predict): SHIPPED — `Predict` returns `X·coef + intercept`.
 //! - REQ-7 (fit_intercept / HasCoefficients): SHIPPED.
 //! - REQ-8 (scale_ attribute): SHIPPED — `scale()` accessor.
-//! - REQ-9 (n_iter_): NOT-STARTED (blocker #499) — the actual solver iteration
-//!   count lives in `crate::optim::lbfgs::LbfgsOptimizer` (its `minimize`
-//!   returns only the final parameter vector, not `opt_res.nit`); surfacing it
-//!   requires a non-breaking reporting overload in `optim/lbfgs.rs`, which is
-//!   OUTSIDE this unit's file manifest (escalated for manifest expansion).
+//! - REQ-9 (n_iter_): SHIPPED (closes #499) — `FittedHuberRegressor` carries an
+//!   `n_iter` field (the REAL L-BFGS iteration count), surfaced via
+//!   `pub fn n_iter`. `fit_with_sample_weight` now calls the additive
+//!   `crate::optim::lbfgs::LbfgsOptimizer::minimize_reporting` overload (which
+//!   returns `(params, n_iters)`; `minimize` is unchanged and still used by
+//!   `logistic_regression.rs`). Mirrors sklearn `self.n_iter_ = opt_res.nit`
+//!   (`sklearn/linear_model/_huber.py:342`). R-DEV-7: ferrolearn's in-repo
+//!   L-BFGS is not scipy's L-BFGS-B, so the raw count need not equal sklearn's
+//!   exactly; the oracle-comparable contract shipped is positivity, `<= max_iter`,
+//!   determinism, and warm < cold (sklearn cold `n_iter_=15`, warm `=1`).
+//!   Consumer: `ferrolearn-python` `RsHuberRegressor::n_iter_` →
+//!   `_extras.py::HuberRegressor.fit` (`self.n_iter_ = int(self._rs.n_iter_)`).
 //! - REQ-10 (warm_start): SHIPPED — `pub warm_start: bool` +
 //!   `pub warm_start_state: Option<(coef, intercept, scale)>` with
 //!   `with_warm_start`/`with_warm_start_state`; when set, `fit_with_sample_weight`
@@ -436,6 +443,13 @@ pub struct FittedHuberRegressor<F> {
     /// Boolean outlier mask: `|y − X·coef − intercept| > scale · epsilon`
     /// (sklearn `outliers_`).
     outliers: Array1<bool>,
+    /// Number of L-BFGS optimizer iterations performed during the fit (sklearn
+    /// `n_iter_`). A positive integer `<= max_iter`. NOTE (R-DEV-7): ferrolearn's
+    /// in-repo L-BFGS is NOT scipy's bounded L-BFGS-B, so this is the REAL count
+    /// of ferrolearn iterations and need not equal sklearn's `opt_res.nit`
+    /// exactly; the meaningful, oracle-comparable property — a warm-start refit
+    /// taking FEWER iterations than the cold fit — is preserved.
+    n_iter: usize,
 }
 
 /// Huber loss and gradient over the joint parameter vector
@@ -760,7 +774,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> HuberRegr
         let fit_intercept = self.fit_intercept;
 
         let optimizer = LbfgsOptimizer::<F>::new(self.max_iter, self.tol);
-        let params = optimizer.minimize(
+        // `minimize_reporting` also returns the optimizer iteration count
+        // (sklearn `self.n_iter_ = opt_res.nit`, `sklearn/linear_model/_huber.py:342`).
+        // `minimize` itself is unchanged (and still used by `logistic_regression.rs`).
+        let (params, n_iter) = optimizer.minimize_reporting(
             |p| huber_loss_and_gradient(p, x, y, &weights, epsilon, alpha, fit_intercept),
             x0,
         )?;
@@ -789,6 +806,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> HuberRegr
             intercept,
             scale,
             outliers,
+            n_iter,
         })
     }
 }
@@ -809,6 +827,20 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> FittedHuberRegressor<F> {
     #[must_use]
     pub fn outliers(&self) -> &Array1<bool> {
         &self.outliers
+    }
+
+    /// Number of L-BFGS optimizer iterations performed during the fit (sklearn
+    /// `n_iter_`, `sklearn/linear_model/_huber.py:342` `self.n_iter_ =
+    /// opt_res.nit`). A positive integer `<= max_iter`.
+    ///
+    /// R-DEV-7: ferrolearn's in-repo L-BFGS is not scipy's bounded L-BFGS-B, so
+    /// this is the genuine count of ferrolearn iterations and is not guaranteed
+    /// equal to sklearn's `n_iter_`. The oracle-comparable contract that DOES
+    /// hold — and that sklearn also exhibits — is that a warm-start refit
+    /// converges in FEWER iterations than the cold fit.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
     }
 }
 

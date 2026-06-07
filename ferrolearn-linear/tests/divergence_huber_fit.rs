@@ -518,3 +518,83 @@ fn warm_start_wrong_len_errors() {
         .fit(&o.x, &o.y_outlier);
     assert!(r.is_err(), "wrong-length warm coef must error");
 }
+
+/// REQ-9 (#499): `FittedHuberRegressor::n_iter()` reports the REAL number of
+/// ferrolearn L-BFGS iterations (sklearn `self.n_iter_ = opt_res.nit`,
+/// `sklearn/linear_model/_huber.py:342`).
+///
+/// R-DEV-7 / R-CHAR-3: ferrolearn's in-repo L-BFGS is NOT scipy's bounded
+/// L-BFGS-B, so the raw count is not asserted equal to sklearn's `n_iter_`.
+/// The oracle-comparable contract asserted is the one sklearn ALSO satisfies:
+/// `n_iter_` is a positive integer `<= max_iter` and is deterministic for a
+/// fixed fit. (The warm-start < cold-start inequality is pinned separately in
+/// `huber_warm_start_fewer_iters_than_cold`, mirroring sklearn cold `n_iter_=15`
+/// vs warm `n_iter_=1`.)
+#[test]
+fn huber_n_iter_positive_bounded_and_deterministic() {
+    let o = load_oracle();
+
+    let max_iter = 200;
+    let fit1 = HuberRegressor::<f64>::new()
+        .with_max_iter(max_iter)
+        .fit(&o.x, &o.y_outlier)
+        .unwrap();
+    let n1 = fit1.n_iter();
+
+    // Positive and bounded by max_iter (sklearn caps n_iter_ at max_iter,
+    // _huber.py:206-207).
+    assert!(n1 >= 1, "n_iter must be a positive integer, got {n1}");
+    assert!(
+        n1 <= max_iter,
+        "n_iter ({n1}) must be <= max_iter ({max_iter})"
+    );
+
+    // Deterministic: the same fit yields the same count.
+    let fit2 = HuberRegressor::<f64>::new()
+        .with_max_iter(max_iter)
+        .fit(&o.x, &o.y_outlier)
+        .unwrap();
+    assert_eq!(
+        n1,
+        fit2.n_iter(),
+        "n_iter must be deterministic for a fixed fit"
+    );
+}
+
+/// REQ-9 (#499): a warm-start refit converges in FEWER L-BFGS iterations than
+/// the cold fit — the meaningful, oracle-comparable `n_iter_` property sklearn
+/// also exhibits (live sklearn 1.5.2: cold `n_iter_=15`, warm `n_iter_=1`,
+/// `sklearn/linear_model/_huber.py:308-309`/`:342`). Because the Huber objective
+/// is convex with a unique minimum, seeding from the converged solution lands
+/// the optimizer at (or adjacent to) the optimum, so it terminates sooner.
+#[test]
+fn huber_warm_start_fewer_iters_than_cold() {
+    let o = load_oracle();
+
+    // Cold fit.
+    let cold = HuberRegressor::<f64>::new()
+        .fit(&o.x, &o.y_outlier)
+        .unwrap();
+    let cold_iters = cold.n_iter();
+    let cold_coef = HasCoefficients::coefficients(&cold).to_owned();
+    let cold_int = HasCoefficients::intercept(&cold);
+    let cold_scale = cold.scale();
+
+    // Warm refit seeded from the converged cold solution.
+    let warm = HuberRegressor::<f64>::new()
+        .with_warm_start(true)
+        .with_warm_start_state(cold_coef, cold_int, cold_scale)
+        .fit(&o.x, &o.y_outlier)
+        .unwrap();
+    let warm_iters = warm.n_iter();
+
+    assert!(
+        warm_iters < cold_iters,
+        "warm-start n_iter ({warm_iters}) must be < cold-start n_iter ({cold_iters}) \
+         (sklearn: cold=15, warm=1)"
+    );
+    assert!(
+        warm_iters >= 1,
+        "warm n_iter must still be a positive integer"
+    );
+}

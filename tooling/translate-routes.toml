@@ -191,6 +191,18 @@ upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_huber.py"]
 design = ".design/linear/huber_regressor.md"
 parity_ops = ["HuberRegressor"]
 
+# Internal L-BFGS optimizer shared by huber_regressor.rs + logistic_regression.rs.
+# Not a sklearn estimator of its own; its observable contract is the optimizer
+# iteration count (`n_iter_`) sklearn's HuberRegressor surfaces via
+# `opt_res.nit` (sklearn/linear_model/_huber.py:342). Routed to the same upstream
+# + design doc as huber_regressor.rs, which governs the `minimize_reporting`
+# reporting overload (REQ-9).
+[[route]]
+crate_pattern = "ferrolearn-linear/src/optim/lbfgs.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_huber.py"]
+design = ".design/linear/huber_regressor.md"
+parity_ops = ["HuberRegressor"]
+
 [[route]]
 crate_pattern = "ferrolearn-linear/src/quantile_regressor.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_quantile.py"]
