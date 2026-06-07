@@ -53,6 +53,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsPowerTransformer,
     _RsQDA,
     _RsQuantileRegressor,
+    _RsRANSACRegressor,
     _RsRBFSampler,
     _RsRandomForestRegressor,
     _RsRidgeClassifier,
@@ -615,6 +616,287 @@ class LassoLars(_RegressorPickleMixin, RegressorMixin, BaseEstimator):
         self.intercept_ = self._rs.intercept_
         self._store_training_data(X, y)
         return self
+
+    def predict(self, X):
+        check_is_fitted(self)
+        X = _f64(X)
+        if not hasattr(self, "_rs"):
+            self._rebuild_rs()
+        return np.asarray(self._rs.predict(X))
+
+
+class RANSACRegressor(_RegressorPickleMixin, RegressorMixin, BaseEstimator):
+    """RANSAC robust regression backed by Rust (#2178).
+
+    Mirrors ``sklearn.linear_model.RANSACRegressor``
+    (``sklearn/linear_model/_ransac.py:288-315``) over the DEFAULT
+    ``LinearRegression`` base (``estimator=None`` -> ``LinearRegression()``,
+    ``_ransac.py:380``), surfacing the full constructor
+    ``(estimator=None, *, min_samples=None, residual_threshold=None,
+    max_trials=100, max_skips=np.inf, stop_n_inliers=np.inf, stop_score=np.inf,
+    stop_probability=0.99, loss='absolute_error', random_state=None)`` (sklearn
+    defaults/order), the ``fit(X, y)``/``predict(X)`` contract, and the fitted
+    ``coef_``/``intercept_`` (from the refit base estimator, ``_ransac.py:602-605``)/
+    ``inlier_mask_`` (``_ransac.py:201``)/``n_features_in_`` attributes.
+
+    Of the constructor surface, ``min_samples``/``residual_threshold``/
+    ``max_trials``/``random_state`` are threaded into the Rust core. The rest are
+    validated to sklearn's ``_parameter_constraints`` (``_ransac.py:260-286``):
+
+    - ``estimator``: ``None`` -> the default ``LinearRegression`` base. A non-None
+      ``estimator`` that is NOT a ``LinearRegression`` instance raises
+      ``NotImplementedError`` (the Rust binding has no estimator pluggability; only
+      the default ``fit_intercept=True`` LinearRegression base is supported). A
+      ``LinearRegression`` instance with non-default params (``fit_intercept=False``
+      etc.) is also rejected (only sklearn's default-equivalent base is bound).
+    - ``min_samples``: sklearn ``Interval(Integral, 1, None)`` or
+      ``Interval(RealNotInt, 0, 1)`` or ``None`` (``_ransac.py:262-266``). Resolved
+      at FIT time (we have ``X`` then): ``None`` -> ``n_features + 1``
+      (``_ransac.py:388``); an int ``>= 1`` -> as-is; a float in ``[0, 1]`` ->
+      ``ceil(min_samples * n_samples)`` (``_ransac.py:389-392``); out of range ->
+      ``ValueError``; ``> n_samples`` -> ``ValueError`` (``_ransac.py:393-397``).
+    - ``residual_threshold``: ``None`` (the core's MAD-of-y default, ransac.rs
+      REQ-2) or a real ``>= 0``; negative -> ``ValueError``.
+    - ``max_trials``: an int ``>= 0`` (or ``np.inf``); other values -> ``ValueError``.
+    - ``loss``: only the default ``'absolute_error'`` is supported; the Rust core
+      hardcodes absolute-error residuals (ransac.rs REQ-8 NOT-STARTED #516), so
+      ``'squared_error'`` (which DOES change the inlier set) and any callable raise
+      ``NotImplementedError``.
+    - ``max_skips``/``stop_n_inliers``/``stop_score``/``stop_probability``: only the
+      sklearn DEFAULTS (``inf``/``inf``/``inf``/``0.99``) are supported — the Rust
+      core runs a FIXED ``max_trials`` loop with no dynamic-stop / skip tracking
+      (ransac.rs REQ-7 NOT-STARTED #515); a non-default value (which would change
+      the trial count / result) raises ``NotImplementedError``.
+
+    RNG-substrate caveat (#2118): the Rust core's subset RNG is a Fisher-Yates
+    ``StdRng``, NOT numpy's MT19937, so for a GIVEN ``random_state`` the drawn
+    subsets differ from sklearn. On WELL-SEPARATED data (clear inliers + a few far
+    outliers) the best inlier set is UNIQUE, so the final refit ``coef_``/
+    ``intercept_`` converge to sklearn's regardless of RNG given sufficient
+    ``max_trials``; on overlapping data the chosen consensus set (and thus
+    ``coef_``) may differ from sklearn's for the same seed.
+
+    ``n_trials_``/``n_skips_*``/``estimator_`` are NOT exposed: the Rust core does
+    not track the trial count (ransac.rs REQ-7 #515) nor surface the refit base as
+    a wrapped fitted type (REQ-10 #518), so none is faked.
+
+    Pickle: the Rust fitted object is not directly picklable, so the training data
+    is stored on fit and ``_rs`` is rebuilt by re-fitting on unpickle
+    (``_RegressorPickleMixin``).
+    """
+
+    def __init__(self, estimator=None, *, min_samples=None,
+                 residual_threshold=None, is_data_valid=None,
+                 is_model_valid=None, max_trials=100, max_skips=np.inf,
+                 stop_n_inliers=np.inf, stop_score=np.inf, stop_probability=0.99,
+                 loss='absolute_error', random_state=None):
+        self.estimator = estimator
+        self.min_samples = min_samples
+        self.residual_threshold = residual_threshold
+        # is_data_valid/is_model_valid (`_ransac.py:294-295`): per-trial callable
+        # rejection hooks. The Rust core has no such hooks (REQ-11 NOT-STARTED
+        # #519); held for get_params/clone parity, a non-None value is rejected in
+        # `_validate`.
+        self.is_data_valid = is_data_valid
+        self.is_model_valid = is_model_valid
+        self.max_trials = max_trials
+        self.max_skips = max_skips
+        self.stop_n_inliers = stop_n_inliers
+        self.stop_score = stop_score
+        self.stop_probability = stop_probability
+        self.loss = loss
+        self.random_state = random_state
+
+    def _validate(self, n_samples, n_features):
+        # Mirror sklearn's `RANSACRegressor._parameter_constraints`
+        # (`_ransac.py:260-286`) + the `fit`-time resolution (`_ransac.py:377-403`),
+        # Python-side, before the usize/f64 ABI boundary. Returns the resolved
+        # integer `min_samples` (or None to let the core default to n_features+1).
+
+        # estimator: None -> default LinearRegression base. A non-None estimator
+        # must be a *default-equivalent* LinearRegression instance; anything else
+        # has no Rust binding (no estimator pluggability) -> NotImplementedError.
+        from sklearn.linear_model import LinearRegression as _SkLR
+        if self.estimator is not None:
+            if not isinstance(self.estimator, _SkLR):
+                raise NotImplementedError(
+                    "RANSACRegressor only supports the default LinearRegression "
+                    "base estimator (no estimator pluggability across the Rust "
+                    "ABI; NOT-STARTED)."
+                )
+            # Only sklearn's default-equivalent LinearRegression is bound; a
+            # non-default base (fit_intercept=False / positive=True / ...) is a
+            # different fit the binding cannot reproduce.
+            defaults = _SkLR()
+            for p in ("fit_intercept", "copy_X", "n_jobs", "positive"):
+                if getattr(self.estimator, p) != getattr(defaults, p):
+                    raise NotImplementedError(
+                        "RANSACRegressor only supports a default-parameter "
+                        f"LinearRegression base; {p}="
+                        f"{getattr(self.estimator, p)!r} differs from the "
+                        "default (NOT-STARTED)."
+                    )
+
+        # is_data_valid / is_model_valid: per-trial callable rejection hooks
+        # (`_ransac.py:294-295`); the Rust core has no such hooks (REQ-11 #519).
+        if self.is_data_valid is not None:
+            raise NotImplementedError(
+                "is_data_valid not supported (no per-trial data-validation hook "
+                "in the Rust core; NOT-STARTED #519)."
+            )
+        if self.is_model_valid is not None:
+            raise NotImplementedError(
+                "is_model_valid not supported (no per-trial model-validation hook "
+                "in the Rust core; NOT-STARTED #519)."
+            )
+
+        # loss: only the default 'absolute_error' (ransac.rs hardcodes absolute
+        # residuals, REQ-8 #516). 'squared_error' / a callable change the inlier
+        # set, so they are NotImplementedError.
+        if self.loss != "absolute_error":
+            if callable(self.loss):
+                raise NotImplementedError(
+                    "loss=<callable> not supported (the Rust core hardcodes "
+                    "absolute-error residuals; NOT-STARTED #516)."
+                )
+            if self.loss == "squared_error":
+                raise NotImplementedError(
+                    "loss='squared_error' not supported (the Rust core hardcodes "
+                    "absolute-error residuals, which select a different inlier "
+                    "set; NOT-STARTED #516)."
+                )
+            raise ValueError(
+                f"loss == {self.loss!r}, must be 'absolute_error', "
+                "'squared_error', or a callable."
+            )
+
+        # max_skips / stop_*: only the sklearn DEFAULTS are supported (the Rust
+        # core runs a fixed max_trials loop with no dynamic-stop / skip tracking,
+        # REQ-7 #515). A non-default value changes the trial count / result.
+        if not (self.max_skips == np.inf):
+            raise NotImplementedError(
+                "max_skips != np.inf not supported (the Rust core does not track "
+                "skips; NOT-STARTED #515)."
+            )
+        if not (self.stop_n_inliers == np.inf):
+            raise NotImplementedError(
+                "stop_n_inliers != np.inf not supported (no early-stop in the "
+                "Rust core; NOT-STARTED #515)."
+            )
+        if not (self.stop_score == np.inf):
+            raise NotImplementedError(
+                "stop_score != np.inf not supported (no early-stop in the Rust "
+                "core; NOT-STARTED #515)."
+            )
+        if not (self.stop_probability == 0.99):
+            raise NotImplementedError(
+                "stop_probability != 0.99 not supported (no dynamic max_trials in "
+                "the Rust core; NOT-STARTED #515)."
+            )
+
+        # max_trials: Interval(Integral, 0, None) or {np.inf} (`_ransac.py:270`).
+        # The Rust core takes a usize; np.inf has no usize image, so reject it
+        # (a fixed loop cannot run inf trials — NOT-STARTED #515).
+        if self.max_trials == np.inf:
+            raise NotImplementedError(
+                "max_trials=np.inf not supported (the Rust core runs a fixed "
+                "max_trials loop; NOT-STARTED #515)."
+            )
+        if (not isinstance(self.max_trials, (int, np.integer))
+                or isinstance(self.max_trials, bool)
+                or self.max_trials < 0):
+            raise ValueError(
+                f"max_trials == {self.max_trials}, must be >= 0 (an int in "
+                "[0, inf)) or np.inf."
+            )
+
+        # residual_threshold: Interval(Real, 0, None) or None (`_ransac.py:267`).
+        if self.residual_threshold is not None and (
+            not isinstance(self.residual_threshold,
+                           (int, float, np.floating, np.integer))
+            or isinstance(self.residual_threshold, bool)
+            or self.residual_threshold < 0
+        ):
+            raise ValueError(
+                f"residual_threshold == {self.residual_threshold}, must be >= 0 "
+                "(a real in [0, inf)) or None."
+            )
+
+        # min_samples resolution (`_ransac.py:389-397`), mirroring sklearn's
+        # fit-time branches EXACTLY (verified against the live 1.5.2 oracle, #2179):
+        #   None        -> n_features + 1                            (:388)
+        #   0 < ms < 1  -> ceil(ms * n_samples)   (STRICT both ends) (:389-390)
+        #   ms >= 1     -> int(ms) if integer-valued, else ValueError (:391-394)
+        # sklearn's branches are STRICT, so the float endpoints 0.0 and 1.0 do
+        # NOT take the ceil branch: 1.0 falls into the `>= 1` branch and resolves
+        # to a size-1 subset, while 0.0 satisfies NEITHER branch and leaves
+        # `min_samples` unbound -> the live oracle raises (mirrored here as a
+        # ValueError). bool is Integral and is handled by these numeric branches
+        # with NO special-casing: True (== 1) is `>= 1` and integer-valued ->
+        # int(True) == 1 (ACCEPTED); False (== 0) satisfies neither branch ->
+        # rejected, matching sklearn.
+        if self.min_samples is None:
+            min_samples = n_features + 1
+        elif not isinstance(self.min_samples,
+                            (int, float, np.integer, np.floating)):
+            # sklearn's `_parameter_constraints` rejects non-real types (e.g. a
+            # string) as InvalidParameterError (a ValueError) before fit.
+            raise ValueError(
+                f"min_samples == {self.min_samples!r}, must be an int >= 1, a "
+                "float in (0, 1), or None."
+            )
+        elif 0 < self.min_samples < 1:
+            min_samples = int(np.ceil(self.min_samples * n_samples))
+        elif self.min_samples >= 1:
+            # A non-integer real >= 1 (e.g. 2.5) is rejected by sklearn's fit-time
+            # `min_samples % 1 != 0` check (`_ransac.py:393-394`).
+            if self.min_samples % 1 != 0:
+                raise ValueError(
+                    f"min_samples == {self.min_samples}, must be an integer "
+                    "value when >= 1, a float in (0, 1), or None."
+                )
+            min_samples = int(self.min_samples)
+        else:
+            # Falls through every valid branch (e.g. 0.0, 0, False, negatives):
+            # below 1 with no valid branch -> error (matches the live oracle).
+            raise ValueError(
+                f"min_samples == {self.min_samples}, must be an int >= 1, a "
+                "float in (0, 1), or None."
+            )
+
+        if min_samples > n_samples:
+            raise ValueError(
+                "`min_samples` may not be larger than number of samples: "
+                f"n_samples = {n_samples}."
+            )
+        return min_samples
+
+    def _make_rs(self, n_samples, n_features):
+        min_samples = self._validate(n_samples, n_features)
+        rt = (None if self.residual_threshold is None
+              else float(self.residual_threshold))
+        rs = (None if self.random_state is None else int(self.random_state))
+        return _RsRANSACRegressor(
+            min_samples=min_samples, residual_threshold=rt,
+            max_trials=int(self.max_trials), random_state=rs)
+
+    def fit(self, X, y):
+        X = _f64(X)
+        y = _f64(y)
+        self._rs = self._make_rs(X.shape[0], X.shape[1])
+        self._rs.fit(X, y)
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/linear_model/_ransac.py:201/602-605).
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self.inlier_mask_ = np.asarray(self._rs.inlier_mask_)
+        self._store_training_data(X, y)
+        return self
+
+    def _rebuild_rs(self):
+        self._rs = self._make_rs(self._fit_X.shape[0], self._fit_X.shape[1])
+        self._rs.fit(self._fit_X, self._fit_y)
 
     def predict(self, X):
         check_is_fitted(self)

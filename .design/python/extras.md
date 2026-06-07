@@ -203,6 +203,7 @@ appears once, `BaggingClassifier`/`NearestCentroid` once — the Rust file defin
 | 11b | `OrthogonalMatchingPursuit` | `RsOrthogonalMatchingPursuit` (hand, #2172) | `ferrolearn_linear::FittedOMP` | fit/predict/`coef_`/`intercept_` | regressor (full ctor surface SHIPPED; `precompute` accepted+ignored; coef_/intercept_ ~1e-12) |
 | 11c | `Lars` | `RsLars` (hand, #2174) | `ferrolearn_linear::FittedLars` | fit/predict/`coef_`/`intercept_` | regressor (full ctor surface SHIPPED; `precompute`/`fit_path`/`eps`/`verbose`/`copy_X`/`random_state` accepted+ignored; `jitter` NotImpl; coef_/intercept_ ~1e-6) |
 | 11d | `LassoLars` | `RsLassoLars` (hand, #2174) | `ferrolearn_linear::FittedLassoLars` | fit/predict/`coef_`/`intercept_` | regressor (full ctor surface SHIPPED; `alpha` positional-first; `positive`/`jitter` NotImpl; coef_/intercept_ ~1e-6) |
+| 11e | `RANSACRegressor` | `RsRANSACRegressor` (hand, #2178) | `ferrolearn_linear::FittedRANSACRegressor<FittedLinearRegression>` | fit/predict/`coef_`/`intercept_`/`inlier_mask_` | regressor over default LinearRegression base (full ctor surface SHIPPED; `estimator`/`loss='squared_error'`/`stop_*`/`is_*_valid` NotImpl; coef_/inlier_mask_ match on well-separated data, RNG caveat #2118) |
 | 12 | `RidgeClassifier` | `RsRidgeClassifier` (macro) | `ferrolearn_linear::FittedRidgeClassifier` | fit/predict | classifier + **Pos-fix** |
 | 13 | `LinearSVC` | `RsLinearSVC` (macro) | `ferrolearn_linear::FittedLinearSVC` | fit/predict | classifier (ABI matches) |
 | 14 | `QuadraticDiscriminantAnalysis` | `RsQDA` (macro) | `ferrolearn_linear::FittedQDA` | fit/predict | classifier (ABI matches) |
@@ -342,6 +343,37 @@ cross-cutting binding REQs and the three HEADLINE fixable divergences.
   unchanged. Consumer: `_extras.py::_DiscreteNBWrapper.fit`. For `ComplementNB`,
   `feature_log_prob_` is the `-logged` complement weight (positive values) — this
   is exactly what sklearn exposes (`naive_bayes.py:1041`), not a bug.
+
+- REQ-RANSAC-BINDING (#2178): `RANSACRegressor` is bound over the default
+  `LinearRegression` base — `RsRANSACRegressor` (hand-written `#[pyclass]`,
+  `extras.rs`) over `ferrolearn_linear::RANSACRegressor<f64,
+  LinearRegression<f64>>` (the base is FIXED to `LinearRegression::<f64>::new()`,
+  sklearn's `estimator=None`→`LinearRegression()` default `fit_intercept=True`,
+  `_ransac.py:380`). The constructor mirrors sklearn's full surface
+  `(estimator=None, *, min_samples=None, residual_threshold=None,
+  is_data_valid=None, is_model_valid=None, max_trials=100, max_skips=np.inf,
+  stop_n_inliers=np.inf, stop_score=np.inf, stop_probability=0.99,
+  loss='absolute_error', random_state=None)` (`_ransac.py:288-315`). The
+  `_extras.py::RANSACRegressor` wrapper resolves `min_samples` BEFORE the ABI
+  (`None`→`n_features+1`, int≥1→as-is, float∈[0,1]→`ceil(min_samples*n_samples)`,
+  `_ransac.py:382-397`), threads `residual_threshold`/`max_trials`/`random_state`,
+  and rejects the unsupported surface: a non-default `estimator` /
+  `loss='squared_error'` (or callable, ransac.rs REQ-8 #516) / non-default
+  `max_skips`/`stop_*` (ransac.rs REQ-7 #515) / `is_data_valid`/`is_model_valid`
+  (ransac.rs REQ-11 #519) → `NotImplementedError`; out-of-range
+  `min_samples`/`max_trials`/`residual_threshold` → `ValueError` (sklearn
+  `InvalidParameterError`). Fitted attrs `coef_`/`intercept_`/`inlier_mask_`/
+  `n_features_in_` are surfaced; `coef_`/`intercept_` are recovered EXACTLY from
+  the refit base via affine probe predictions (`intercept_=predict(0)`,
+  `coef_[j]=predict(e_j)−intercept_`) because the core keeps the refit base
+  private (ransac.rs REQ-10 NOT-STARTED #518; no `n_trials_`/`estimator_` faked).
+  Verification (model B): `tests/divergence_extras.py::test_ransac_*` (14 cases,
+  live sklearn 1.5.2 oracle on WELL-SEPARATED outlier data so the best inlier set
+  is unique → `coef_`/`intercept_`/`inlier_mask_` MATCH sklearn `atol 1e-2`
+  despite the RNG-substrate caveat #2118). Impl: `extras.rs` `RsRANSACRegressor`
+  (`fit`/`predict`/`coef_`/`intercept_`/`inlier_mask_`). Non-test consumer
+  (R-DEFER-1): `_extras.py::RANSACRegressor` (`_make_rs`/`fit`/`predict`),
+  `__init__.py` re-export, `lib.rs` `m.add_class::<extras::RsRANSACRegressor>()`.
 
 ### Downstream-owned divergence REQs (NOT-STARTED)
 

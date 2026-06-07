@@ -19,7 +19,7 @@
 //! or NOT-STARTED (with a concrete blocker). Verified via
 //! `tests/divergence_extras.py` + the per-category divergence suites (595 pytest pass).
 //!
-//! **14 SHIPPED / 5 NOT-STARTED.**
+//! **15 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -37,6 +37,7 @@
 //! | REQ-DECOMP-NCOMPONENTS-DEFAULT (n_components default) | NOT-STARTED | the 5-6 decomp transformers hardcode `n_components=2` vs sklearn `None` (`IncrementalPCA`/`FastICA`/`KernelPCA`/`SparsePCA`/`FactorAnalysis`) / `'warn'`→None (`NMF`); the `None`-auto-rank behavior is owned downstream by `ferrolearn_decomp`. (`TruncatedSVD` default 2 MATCHES.) |
 //! | REQ-DISCRETE-NB-FITTED-ATTRS (feature_log_prob_/class_log_prior_/feature_count_/class_count_) | SHIPPED | FIXED #2103: `MultinomialNB`/`BernoulliNB`/`ComplementNB` expose the four `_BaseDiscreteNB` fitted attrs (sklearn/naive_bayes.py:880-892/580-602/1032-1042). A SECOND `#[pymethods] impl Rs{Multinomial,Bernoulli,Complement}NB` block (pyo3 `multiple-pymethods`) adds four `#[getter]`s each over the Rust fitted types (`FittedMultinomialNB` multinomial.rs:489/499/509/520, `FittedBernoulliNB` bernoulli.rs:520/530/540/551, `FittedComplementNB` complement.rs:535/586/545/556); `py_classifier!` macro + its 18 invocations UNCHANGED. ComplementNB `feature_log_prob_` is the `-logged` complement weight (positive) per sklearn. Non-test consumer: `_extras.py::_DiscreteNBWrapper.fit` sets `self.{feature_log_prob_,class_log_prior_,feature_count_,class_count_}` from `self._rs.*` (the three NB wrappers subclass it). Verification (model B): `tests/divergence_extras.py::test_{multinomial,bernoulli,complement}_discrete_nb_fitted_attrs_match_sklearn` (live sklearn 1.5.2 oracle, atol 1e-7). |
 //! | REQ-BERNOULLI-BINARIZE-NONE (`binarize=None` skips binarization) | SHIPPED | FIXED #2104: `_RsBernoulliNB` now types `binarize: Option<f64> = Some(0.0)` (was `f64 = 0.0`) and builds via `BernoulliNB::with_binarize_option(binarize)` (bernoulli.rs), so pyo3 maps Python `None`→`Option::None` (skips binarization, sklearn/naive_bayes.py:1076,1156,1179,1185) and a float→`Some(f64)`. `feature_count_` then accumulates raw X. Non-test consumer: `_extras.py::BernoulliNB.__init__(binarize=0.0)` passes `self.binarize` straight through (default 0.0 unchanged). Verification (model B): `tests/divergence_extras.py::test_red_bernoulli_binarize_none_feature_count_matches_sklearn` (live sklearn 1.5.2 oracle, atol 1e-9). |
+//! | REQ-RANSAC-BINDING (#2178) | SHIPPED | `RsRANSACRegressor` (hand `#[pyclass]`) over `ferrolearn_linear::RANSACRegressor<f64, LinearRegression<f64>>` (default `LinearRegression()` base, `_ransac.py:380`) exposes `fit`/`predict`/`coef_`/`intercept_`/`inlier_mask_`. The `_extras.py::RANSACRegressor` wrapper mirrors sklearn's full ctor (`_ransac.py:288-315`), resolves `min_samples` (None→`n_features+1`, float→`ceil`) before the ABI, and rejects the unsupported surface (`estimator`/`loss='squared_error'`/`stop_*`/`is_*_valid` → NotImplementedError; bad `min_samples`/`max_trials`/`residual_threshold` → ValueError). `coef_`/`intercept_` recovered EXACTLY via affine probe predictions (core keeps the refit base private, ransac.rs REQ-10 #518; no `n_trials_`/`estimator_` faked). Non-test consumer: `_extras.py::RANSACRegressor` + `lib.rs` `add_class` + `__init__.py` re-export. Verification: `tests/divergence_extras.py::test_ransac_*` (14, live sklearn 1.5.2 oracle on well-separated data; coef_/inlier_mask_ MATCH `atol 1e-2`, RNG caveat #2118). |
 //! | REQ-MISSING-METHODS (coef_/predict_proba/inverse_transform/cluster_centers_) | NOT-STARTED | the `Rs*` classes expose only fit/predict(/transform/labels_) — no `coef_`/`feature_importances_`, `predict_proba`/`decision_function`, `inverse_transform`/`components_`, `cluster_centers_`/`children_`. The binding cannot expose attrs the fitted library types do not compute — owned downstream by the eight crates. |
 //! | REQ-MISSING-PARAMS (full constructor surface) | NOT-STARTED | each `Rs*` constructor binds a thin subset of sklearn's params (e.g. `RsRandomForestRegressor` lacks `criterion`/`max_features`/`bootstrap`/`oob_score`; `RsBaggingClassifier` lacks the `estimator` knob). Owned downstream by the eight crates. (`KNeighborsRegressor` is the exception: full surface SHIPPED, REQ-KNR-CTOR-SURFACE.) |
 //! | REQ-KNR-CTOR-SURFACE (KNeighborsRegressor full constructor) | SHIPPED | FIXED #2147: hand-written `RsKNeighborsRegressor` (replacing the `n_neighbors`-only `py_regressor!` invocation) mirrors `RsKNeighborsClassifier` and exposes sklearn's full `(n_neighbors, weights, algorithm, leaf_size, p, metric, metric_params, n_jobs)` surface (`neighbors/_regression.py:178-189`); `weights='distance'` changes predictions and matches the live sklearn 1.5.2 oracle. `fit(x, y: f64)`/`predict→PyArray1<f64>` keep the macro ABI. Validation is metric-aware (FIXED #2148): `metric='minkowski'` requires `p==2` (else `PyNotImplementedError #876`); `metric='euclidean'` accepts ANY `p` (sklearn ignores p for euclidean, `_base.py:526-538`); other metrics `PyNotImplementedError #876`; an invalid `weights` STRING raises `ValueError` (sklearn `InvalidParameterError ⊂ ValueError`, FIXED #2149); callable-weights/`metric_params` reject with `NotImplementedError #876`. Non-test consumer: `_extras.py::KNeighborsRegressor` full shim (`_make_rs`/`fit`/`predict` + `_RegressorPickleMixin`). Verification: `tests/divergence_extras.py::test_knr_*` (14 cases) + `tests/divergence_knr_ctor_surface.py` (#2148/#2149 pins). |
@@ -1098,6 +1099,196 @@ impl RsLassoLars {
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
         Ok(fitted.intercept())
+    }
+}
+
+// RANSACRegressor (#2178): hand-written pyclass (rather than a thin
+// `py_regressor!` invocation) so the binding surfaces sklearn's RANSAC
+// constructor surface (`sklearn/linear_model/_ransac.py:288-315`,
+// `_parameter_constraints` `:260-286`) over the DEFAULT `LinearRegression` base
+// (`_ransac.py:380`, `estimator=None` → `LinearRegression()`) AND the fitted
+// `coef_`/`intercept_` (from the refit base estimator, `_ransac.py:597-605`) and
+// `inlier_mask_` (`_ransac.py:201`) getters. The RANSAC MATH (sampling loop, MAD
+// threshold, inlier classification, n_inliers→R² selection, single final refit)
+// lives in `ferrolearn_linear::RANSACRegressor<f64, LinearRegression<f64>>`
+// (`ransac.rs`, REQ-1..6/9 SHIPPED); this is the thin marshalling shim and the
+// non-test production consumer of that core API (R-DEFER-1).
+//
+// The base estimator is FIXED to `ferrolearn_linear::LinearRegression::<f64>::new()`
+// — sklearn's default `fit_intercept=True` LinearRegression (`_ransac.py:380`).
+// The core `RANSACRegressor<F, E>` is generic over `E`, but the Rust core has no
+// estimator-pluggability across the Python ABI, so only the default base is bound
+// (the `_extras.py` wrapper rejects a non-LinearRegression `estimator` with
+// `NotImplementedError`). `min_samples` is typed `Option<usize>`: the wrapper
+// resolves sklearn's `None`→`n_features+1` and `float`→`ceil(min_samples*n_samples)`
+// BEFORE the ABI (it has X at fit time), so the core sees only an integer count or
+// `None` (which the core itself defaults to `n_features+1`, `ransac.rs` `fit`).
+// `residual_threshold` is `Option<f64>` (None → the core's MAD-of-y default,
+// `ransac.rs` REQ-2). `random_state` is `Option<u64>` threaded to the core's
+// `StdRng` seed (RNG-substrate caveat #2118: the Rust Fisher-Yates RNG ≠ numpy
+// MT19937, so for a GIVEN seed the drawn subsets differ from sklearn — but on
+// well-separated data the best inlier set is UNIQUE, so the refit coef_ converges
+// to sklearn's regardless of RNG, given sufficient `max_trials`).
+//
+// `n_trials_`/`n_skips_*`/`estimator_` are NOT exposed: the Rust core does not
+// track the trial count (ransac.rs REQ-7 NOT-STARTED #515) nor surface the refit
+// base as a wrapped fitted type (REQ-10 NOT-STARTED #518), so no getter is faked
+// for them. `loss='squared_error'` and the non-default stop_*/max_skips knobs are
+// rejected by the `_extras.py` wrapper (`NotImplementedError`, ransac.rs REQ-7/8).
+#[pyclass(name = "_RsRANSACRegressor")]
+pub struct RsRANSACRegressor {
+    // Resolved integer count or None (the wrapper resolves float/None before the
+    // ABI; None lets the core default to n_features+1).
+    min_samples: Option<usize>,
+    residual_threshold: Option<f64>,
+    max_trials: usize,
+    random_state: Option<u64>,
+    // Number of features seen at fit (needed to size the coef_ probe; the core
+    // fitted type exposes no n_features accessor — ransac.rs REQ-10 NOT-STARTED).
+    n_features: usize,
+    fitted: Option<
+        ferrolearn_linear::FittedRANSACRegressor<ferrolearn_linear::FittedLinearRegression<f64>>,
+    >,
+}
+
+impl RsRANSACRegressor {
+    /// Recover the refit base estimator's intercept as `predict(0_vector)`.
+    /// The base is a `FittedLinearRegression` whose `predict` is the exact affine
+    /// map `X·coef + intercept` (linear_regression.rs REQ-2), so a zero row yields
+    /// the intercept exactly. The core keeps the base private (ransac.rs REQ-10
+    /// NOT-STARTED #518); this reads it through the only public surface (`predict`).
+    fn recover_intercept(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let zero = ndarray::Array2::<f64>::zeros((1, self.n_features));
+        let pred = fitted
+            .predict(&zero)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(pred[0])
+    }
+
+    /// Recover the refit base estimator's coefficient vector as
+    /// `coef_[j] = predict(e_j) − intercept_`, probing one unit row per feature.
+    /// Exact (to float round-off) because the base `predict` is affine.
+    fn recover_coef(&self) -> PyResult<Array1<f64>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let intercept = self.recover_intercept()?;
+        // One probe row per feature: row j is the unit vector e_j.
+        let mut probe = ndarray::Array2::<f64>::zeros((self.n_features, self.n_features));
+        for j in 0..self.n_features {
+            probe[[j, j]] = 1.0;
+        }
+        let preds = fitted
+            .predict(&probe)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let coef = preds.mapv(|p| p - intercept);
+        Ok(coef)
+    }
+}
+
+#[pymethods]
+impl RsRANSACRegressor {
+    #[new]
+    #[pyo3(signature = (min_samples=None, residual_threshold=None, max_trials=100,
+                        random_state=None))]
+    fn new(
+        min_samples: Option<usize>,
+        residual_threshold: Option<f64>,
+        max_trials: usize,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            min_samples,
+            residual_threshold,
+            max_trials,
+            random_state,
+            n_features: 0,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        self.n_features = x_nd.ncols();
+        // The default base estimator: sklearn's `LinearRegression()` with
+        // `fit_intercept=True` (`_ransac.py:380`).
+        let base = ferrolearn_linear::LinearRegression::<f64>::new();
+        let mut model =
+            ferrolearn_linear::RANSACRegressor::new(base).with_max_trials(self.max_trials);
+        if let Some(ms) = self.min_samples {
+            model = model.with_min_samples(ms);
+        }
+        if let Some(t) = self.residual_threshold {
+            model = model.with_residual_threshold(t);
+        }
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    // sklearn `estimator_.coef_` (`_ransac.py:602-605`, the refit base estimator's
+    // coefficients): the `(n_features,)` vector of the LinearRegression fitted on
+    // the best inlier set.
+    //
+    // The Rust core's `FittedRANSACRegressor` keeps the refit base estimator
+    // PRIVATE and exposes no `estimator_`/`coefficients()` accessor (ransac.rs
+    // REQ-10 NOT-STARTED #518; the manifest forbids touching ransac.rs). The base
+    // IS a `FittedLinearRegression`, whose `predict` is the EXACT affine map
+    // `X·coef + intercept` (linear_regression.rs `Predict`, REQ-2). So we recover
+    // the coefficients EXACTLY (to float round-off) from probe predictions:
+    // `intercept_ = predict(0)`, `coef_[j] = predict(e_j) − intercept_`. This is
+    // not a refit — it reads the already-fitted base through its only public
+    // surface. (When ransac.rs ships REQ-10, swap this for a direct getter.)
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let coef = self.recover_coef()?;
+        Ok(ndarray1_to_numpy(py, &coef))
+    }
+
+    // sklearn `estimator_.intercept_` (`_ransac.py:602-605`): the scalar
+    // independent term of the refit base LinearRegression. Recovered as
+    // `predict(0_vector)` (see `coef_`).
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        self.recover_intercept()
+    }
+
+    // sklearn `inlier_mask_` (`_ransac.py:201` / `:589`): the boolean mask of the
+    // winning subset model (True == inlier, `ransac.rs` REQ-5).
+    #[getter]
+    fn inlier_mask_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<bool>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(PyArray1::from_slice(py, fitted.inlier_mask()))
     }
 }
 

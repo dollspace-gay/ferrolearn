@@ -1670,3 +1670,194 @@ def test_lars_pickle_roundtrip_preserves_predictions():
         fr2 = pickle.loads(pickle.dumps(fr))
         np.testing.assert_allclose(
             fr2.predict(X), pred_before, rtol=0, atol=1e-12)
+
+
+# ===========================================================================
+# RANSACRegressor (#2178) — the binding over the default LinearRegression base.
+# Every expected value is computed by the LIVE sklearn 1.5.2 oracle in the SAME
+# test (R-CHAR-3) — never copied from ferrolearn. Well-separated outlier data is
+# used so the best inlier set is UNIQUE -> the refit coef_/intercept_/predict
+# converge to sklearn's REGARDLESS of the RNG substrate (#2118).
+# ===========================================================================
+
+from sklearn.linear_model import LinearRegression as SkLinearRegression
+from sklearn.linear_model import RANSACRegressor as SkRANSACRegressor
+
+
+def _ransac_well_separated(seed=0, n_inliers=80, n_outliers=12):
+    """1-feature data y = 3x + 2 with a handful of FAR outliers. The inlier set
+    is cleanly separable, so RANSAC's best consensus set is unique."""
+    rng = np.random.RandomState(seed)
+    x = np.linspace(-5, 5, n_inliers)
+    y = 3.0 * x + 2.0 + rng.normal(scale=0.05, size=n_inliers)
+    # Outliers: far off the line.
+    xo = rng.uniform(-5, 5, n_outliers)
+    yo = 3.0 * xo + 2.0 + rng.choice([-1, 1], n_outliers) * rng.uniform(40, 60, n_outliers)
+    X = np.concatenate([x, xo]).reshape(-1, 1)
+    Y = np.concatenate([y, yo])
+    return X, Y
+
+
+def test_ransac_default_coef_intercept_predict_match_sklearn():
+    """REQ-RANSAC: default (min_samples=None -> n_features+1, residual_threshold
+    None -> MAD) on well-separated data reproduces sklearn coef_/intercept_/predict
+    to a reasonable tolerance (the unique best inlier set's refit is deterministic).
+    """
+    X, y = _ransac_well_separated()
+    sk = SkRANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    fr = fl.RANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.estimator_.coef_,
+                               rtol=0, atol=1e-2)
+    assert abs(fr.intercept_ - sk.estimator_.intercept_) < 1e-2
+    Xt = np.linspace(-5, 5, 11).reshape(-1, 1)
+    np.testing.assert_allclose(fr.predict(Xt), sk.predict(Xt), rtol=0, atol=5e-2)
+
+
+def test_ransac_inlier_mask_matches_sklearn():
+    """REQ-RANSAC: the inlier_mask_ excludes the (well-separated) outliers exactly
+    as sklearn does — the last 12 points are outliers in both."""
+    X, y = _ransac_well_separated()
+    sk = SkRANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    fr = fl.RANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    assert fr.inlier_mask_.dtype == bool
+    # The 12 trailing outliers are NOT inliers (structural contract).
+    assert not fr.inlier_mask_[-12:].any()
+    # Same set of excluded outliers as sklearn.
+    np.testing.assert_array_equal(fr.inlier_mask_, sk.inlier_mask_)
+
+
+def test_ransac_explicit_int_min_samples_matches_sklearn():
+    """REQ-RANSAC: an explicit int min_samples threads through; coef_ matches."""
+    X, y = _ransac_well_separated()
+    sk = SkRANSACRegressor(min_samples=10, random_state=0, max_trials=1000).fit(X, y)
+    fr = fl.RANSACRegressor(min_samples=10, random_state=0, max_trials=1000).fit(X, y)
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.estimator_.coef_,
+                               rtol=0, atol=1e-2)
+    np.testing.assert_array_equal(fr.inlier_mask_, sk.inlier_mask_)
+
+
+def test_ransac_float_min_samples_resolves_to_ceil_like_sklearn():
+    """REQ-RANSAC: a float min_samples in [0,1] resolves to
+    ceil(min_samples * n_samples), matching sklearn (`_ransac.py:389-392`)."""
+    X, y = _ransac_well_separated()
+    sk = SkRANSACRegressor(min_samples=0.2, random_state=0, max_trials=1000).fit(X, y)
+    fr = fl.RANSACRegressor(min_samples=0.2, random_state=0, max_trials=1000).fit(X, y)
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.estimator_.coef_,
+                               rtol=0, atol=1e-2)
+    np.testing.assert_array_equal(fr.inlier_mask_, sk.inlier_mask_)
+
+
+def test_ransac_residual_threshold_set_vs_none_match_sklearn():
+    """REQ-RANSAC: an explicit residual_threshold and the None(MAD) default both
+    reproduce sklearn's coef_ on well-separated data."""
+    X, y = _ransac_well_separated()
+    for rt in (None, 5.0):
+        sk = SkRANSACRegressor(residual_threshold=rt, random_state=0,
+                               max_trials=1000).fit(X, y)
+        fr = fl.RANSACRegressor(residual_threshold=rt, random_state=0,
+                                max_trials=1000).fit(X, y)
+        np.testing.assert_allclose(np.asarray(fr.coef_), sk.estimator_.coef_,
+                                   rtol=0, atol=1e-2,
+                                   err_msg=f"coef_ diverges at residual_threshold={rt}")
+        np.testing.assert_array_equal(fr.inlier_mask_, sk.inlier_mask_)
+
+
+def test_ransac_get_params_clone_exposes_sklearn_key_set():
+    """REQ-RANSAC: get_params/clone expose sklearn's full key set (so RANSAC plugs
+    into Pipeline/GridSearch). The keys are exactly sklearn's."""
+    from sklearn.base import clone
+    sk_keys = set(SkRANSACRegressor().get_params(deep=False).keys())
+    fr = fl.RANSACRegressor()
+    assert set(fr.get_params(deep=False).keys()) == sk_keys
+    fr2 = clone(fr)
+    assert set(fr2.get_params(deep=False).keys()) == sk_keys
+
+
+def test_ransac_custom_estimator_raises_notimplemented():
+    """REQ-RANSAC: a non-default base estimator has no Rust binding ->
+    NotImplementedError (only the default LinearRegression base is supported)."""
+    X, y = _ransac_well_separated()
+    from sklearn.tree import DecisionTreeRegressor as SkDTR
+    with pytest.raises(NotImplementedError):
+        fl.RANSACRegressor(estimator=SkDTR()).fit(X, y)
+    # A LinearRegression with NON-default params is also rejected.
+    with pytest.raises(NotImplementedError):
+        fl.RANSACRegressor(estimator=SkLinearRegression(fit_intercept=False)).fit(X, y)
+
+
+def test_ransac_default_estimator_none_accepted():
+    """REQ-RANSAC: estimator=None (default) and an explicit DEFAULT-param
+    LinearRegression instance are both accepted (the default base)."""
+    X, y = _ransac_well_separated()
+    fl.RANSACRegressor(estimator=None, random_state=0).fit(X, y)
+    fl.RANSACRegressor(estimator=SkLinearRegression(), random_state=0).fit(X, y)
+
+
+def test_ransac_squared_error_loss_raises_notimplemented():
+    """REQ-RANSAC: loss='squared_error' selects a different inlier set; the Rust
+    core hardcodes absolute-error residuals -> NotImplementedError (#516)."""
+    X, y = _ransac_well_separated()
+    with pytest.raises(NotImplementedError):
+        fl.RANSACRegressor(loss='squared_error').fit(X, y)
+    with pytest.raises(NotImplementedError):
+        fl.RANSACRegressor(loss=lambda a, b: np.abs(a - b)).fit(X, y)
+
+
+def test_ransac_nondefault_stop_params_raise_notimplemented():
+    """REQ-RANSAC: non-default max_skips/stop_*/inf max_trials change the trial
+    count / early-stop; the Rust core has no such tracking -> NotImplementedError
+    (#515)."""
+    X, y = _ransac_well_separated()
+    for kw in (dict(max_skips=5), dict(stop_n_inliers=50),
+               dict(stop_score=0.9), dict(stop_probability=0.5),
+               dict(max_trials=np.inf)):
+        with pytest.raises(NotImplementedError):
+            fl.RANSACRegressor(**kw).fit(X, y)
+
+
+def test_ransac_invalid_params_raise_valueerror():
+    """REQ-RANSAC: invalid min_samples / max_trials / residual_threshold mirror
+    sklearn's InvalidParameterError (a ValueError subclass)."""
+    X, y = _ransac_well_separated()
+    # min_samples out of [0,1] float range and < 1 int.
+    with pytest.raises(ValueError):
+        fl.RANSACRegressor(min_samples=1.5).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.RANSACRegressor(min_samples=0).fit(X, y)
+    # min_samples > n_samples.
+    with pytest.raises(ValueError):
+        fl.RANSACRegressor(min_samples=10_000).fit(X, y)
+    # negative max_trials / residual_threshold.
+    with pytest.raises(ValueError):
+        fl.RANSACRegressor(max_trials=-1).fit(X, y)
+    with pytest.raises(ValueError):
+        fl.RANSACRegressor(residual_threshold=-1.0).fit(X, y)
+
+
+def test_ransac_not_fitted_predict_raises():
+    """REQ-RANSAC: predict before fit raises (NotFittedError via check_is_fitted)."""
+    from sklearn.exceptions import NotFittedError
+    with pytest.raises(NotFittedError):
+        fl.RANSACRegressor().predict(np.zeros((3, 1)))
+
+
+def test_ransac_score_and_n_features_in_match_sklearn():
+    """REQ-RANSAC: inherit RegressorMixin.score (R^2) + set n_features_in_; the
+    score equals the live sklearn oracle's on well-separated data."""
+    X, y = _ransac_well_separated()
+    sk = SkRANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    fr = fl.RANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    assert fr.n_features_in_ == X.shape[1] == sk.n_features_in_
+    assert abs(fr.score(X, y) - sk.score(X, y)) < 1e-2
+
+
+def test_ransac_pickle_roundtrip_preserves_predictions():
+    """REQ-RANSAC: pickle round-trips (Rust fitted object not picklable ->
+    refit-on-unpickle via `_RegressorPickleMixin`); predictions are preserved."""
+    import pickle
+
+    X, y = _ransac_well_separated()
+    fr = fl.RANSACRegressor(random_state=0, max_trials=1000).fit(X, y)
+    pred_before = fr.predict(X)
+    fr2 = pickle.loads(pickle.dumps(fr))
+    np.testing.assert_allclose(fr2.predict(X), pred_before, rtol=0, atol=1e-9)
