@@ -66,7 +66,6 @@ use ndarray::array;
 ///
 /// Tracking: #2211
 #[test]
-#[ignore = "divergence: PolynomialFeatures interaction_only+degree>=4 panics (index OOB) vs sklearn valid matrix; tracking #2211"]
 fn divergence_interaction_only_degree_exceeds_features_panics() {
     // Expected = LIVE sklearn 1.5.2 oracle bit patterns (NOT copied from ferrolearn):
     //   PolynomialFeatures(4, interaction_only=True, include_bias=False)

@@ -40,7 +40,6 @@ use ndarray::array;
 ///
 /// Tracking: #2210
 #[test]
-#[ignore = "divergence: PolynomialFeatures left-fold product vs sklearn incremental multiply differs by 1 ULP for degree>=3 terms; tracking #2210"]
 fn divergence_polynomial_higher_degree_term_ulp_vs_sklearn() {
     // Expected = LIVE sklearn 1.5.2 oracle bit pattern (NOT copied from ferrolearn):
     //   PolynomialFeatures(3, interaction_only=True, include_bias=False)

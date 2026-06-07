@@ -140,7 +140,7 @@ pub use min_max_scaler::{FittedMinMaxScaler, MinMaxScaler};
 pub use normalizer::Normalizer;
 pub use one_hot_encoder::{FittedOneHotEncoder, OneHotEncoder};
 pub use ordinal_encoder::{FittedOrdinalEncoder, OrdinalEncoder};
-pub use polynomial_features::PolynomialFeatures;
+pub use polynomial_features::{FittedPolynomialFeatures, PolynomialFeatures};
 pub use power_transformer::{FittedPowerTransformer, PowerTransformer};
 pub use robust_scaler::{FittedRobustScaler, RobustScaler};
 pub use standard_scaler::{FittedStandardScaler, StandardScaler};

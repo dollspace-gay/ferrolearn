@@ -53,7 +53,7 @@
 //!   `InvalidParameter` (already present), non-finite -> `InvalidParameter`.
 
 use ferrolearn_core::error::FerroError;
-use ferrolearn_core::traits::Transform;
+use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::PolynomialFeatures;
 use ndarray::{Array2, array};
 
@@ -335,4 +335,347 @@ fn guard_finite_input_overflowing_product_not_over_rejected_matches_sklearn_orac
          accepted); ferrolearn returned {}",
         out[[0, 1]]
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-4 / REQ-5 — stateful fit -> FittedPolynomialFeatures: n_features_in_,
+// n_output_features_, powers_, and the transform-time feature-count check.
+// All expected values are from the LIVE sklearn 1.5.2 oracle (R-CHAR-3), run
+// from /tmp; NEVER literal-copied from ferrolearn.
+//
+// Oracle commands:
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; \
+//     print(P(2).fit(np.array([[2.,3.]])).powers_.tolist())"
+//     -> [[0,0],[1,0],[0,1],[2,0],[1,1],[0,2]]
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; print(P(2).fit(np.array([[2.,3.,5.]])).powers_.tolist())"
+//     -> [[0,0,0],[1,0,0],[0,1,0],[0,0,1],[2,0,0],[1,1,0],[1,0,1],[0,2,0],[0,1,1],[0,0,2]]
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; \
+//     print(P(2,interaction_only=True).fit(np.array([[2.,3.]])).powers_.tolist())"
+//     -> [[0,0],[1,0],[0,1],[1,1]]
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; \
+//     print(P(2,include_bias=False).fit(np.array([[2.,3.]])).powers_.tolist())"
+//     -> [[1,0],[0,1],[2,0],[1,1],[0,2]]
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; \
+//     print(P(2,interaction_only=True,include_bias=False).fit(np.array([[2.,3.,5.]])).powers_.tolist())"
+//     -> [[1,0,0],[0,1,0],[0,0,1],[1,1,0],[1,0,1],[0,1,1]]
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; m=P(2).fit(np.array([[2.,3.]])); \
+//     print(m.n_output_features_, m.n_features_in_)"   -> 6 2
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; print(P(3,interaction_only=True,include_bias=False) \
+//     .fit(np.array([[2.,3.,5.]])).n_output_features_)"   -> 7
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; m=P(2).fit(np.array([[2.,3.]])); m.transform([[1.,2.,3.]])"
+//     -> ValueError: X has 3 features, but PolynomialFeatures is expecting 2 features as input.
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; m=P(2).fit(np.array([[2.,3.]])); m.transform([[1.]])"
+//     -> ValueError: X has 1 features, but PolynomialFeatures is expecting 2 features as input.
+//   python3 -c "from sklearn.preprocessing import PolynomialFeatures as P; \
+//     import numpy as np; m=P(2).fit(np.array([[2.,3.]])); \
+//     m.transform(np.array([[float('nan'),1.,2.]]))"
+//     -> ValueError: Input X contains NaN.   (check_array fires BEFORE the n_features mismatch)
+// ---------------------------------------------------------------------------
+
+/// REQ-5 powers_: 2-feat, degree=2, default (full + bias). Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.]]).powers_`
+/// == `[[0,0],[1,0],[0,1],[2,0],[1,1],[0,2]]`, shape (6, 2). ferrolearn
+/// `new(2,false,true).fit` must match every entry and the shape.
+#[test]
+fn fit_powers_2feat_degree2_default_matches_sklearn_oracle() {
+    // Live oracle: PolynomialFeatures(2).fit([[2.,3.]]).powers_
+    let sklearn_powers: Array2<usize> = array![[0, 0], [1, 0], [0, 1], [2, 0], [1, 1], [0, 2]];
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    assert_eq!(fitted.powers().shape(), &[6, 2]);
+    assert_eq!(fitted.powers(), &sklearn_powers);
+    // Shape consistency: (n_output_features_, n_features_in_).
+    assert_eq!(
+        fitted.powers().shape(),
+        &[fitted.n_output_features(), fitted.n_features_in()]
+    );
+}
+
+/// REQ-5 powers_: 3-feat, degree=2, default. Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.,5.]]).powers_` ==
+/// `[[0,0,0],[1,0,0],[0,1,0],[0,0,1],[2,0,0],[1,1,0],[1,0,1],[0,2,0],[0,1,1],[0,0,2]]`,
+/// shape (10, 3).
+#[test]
+fn fit_powers_3feat_degree2_default_matches_sklearn_oracle() {
+    // Live oracle: PolynomialFeatures(2).fit([[2.,3.,5.]]).powers_
+    let sklearn_powers: Array2<usize> = array![
+        [0, 0, 0],
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+        [2, 0, 0],
+        [1, 1, 0],
+        [1, 0, 1],
+        [0, 2, 0],
+        [0, 1, 1],
+        [0, 0, 2]
+    ];
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0, 5.0]], &())
+        .unwrap();
+    assert_eq!(fitted.powers().shape(), &[10, 3]);
+    assert_eq!(fitted.powers(), &sklearn_powers);
+}
+
+/// REQ-5 powers_: 2-feat, degree=2, interaction_only (bias present). Live oracle
+/// `PolynomialFeatures(2, interaction_only=True).fit([[2.,3.]]).powers_` ==
+/// `[[0,0],[1,0],[0,1],[1,1]]` (no pure-power `[2,0]`/`[0,2]` rows).
+#[test]
+fn fit_powers_2feat_interaction_only_matches_sklearn_oracle() {
+    // Live oracle: PolynomialFeatures(2, interaction_only=True).fit([[2.,3.]]).powers_
+    let sklearn_powers: Array2<usize> = array![[0, 0], [1, 0], [0, 1], [1, 1]];
+    let fitted = PolynomialFeatures::<f64>::new(2, true, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    assert_eq!(fitted.powers(), &sklearn_powers);
+}
+
+/// REQ-5 powers_: 2-feat, degree=2, include_bias=False — the all-zeros bias row
+/// is ABSENT. Live oracle
+/// `PolynomialFeatures(2, include_bias=False).fit([[2.,3.]]).powers_` ==
+/// `[[1,0],[0,1],[2,0],[1,1],[0,2]]` (no leading `[0,0]`).
+#[test]
+fn fit_powers_2feat_no_bias_omits_zero_row_matches_sklearn_oracle() {
+    // Live oracle: PolynomialFeatures(2, include_bias=False).fit([[2.,3.]]).powers_
+    let sklearn_powers: Array2<usize> = array![[1, 0], [0, 1], [2, 0], [1, 1], [0, 2]];
+    let fitted = PolynomialFeatures::<f64>::new(2, false, false)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    assert_eq!(fitted.powers(), &sklearn_powers);
+}
+
+/// REQ-5 powers_: 3-feat, degree=2, interaction_only + no bias. Live oracle
+/// `PolynomialFeatures(2, interaction_only=True, include_bias=False).fit([[2.,3.,5.]]).powers_`
+/// == `[[1,0,0],[0,1,0],[0,0,1],[1,1,0],[1,0,1],[0,1,1]]`.
+#[test]
+fn fit_powers_3feat_interaction_only_no_bias_matches_sklearn_oracle() {
+    // Live oracle:
+    // PolynomialFeatures(2,interaction_only=True,include_bias=False).fit([[2.,3.,5.]]).powers_
+    let sklearn_powers: Array2<usize> = array![
+        [1, 0, 0],
+        [0, 1, 0],
+        [0, 0, 1],
+        [1, 1, 0],
+        [1, 0, 1],
+        [0, 1, 1]
+    ];
+    let fitted = PolynomialFeatures::<f64>::new(2, true, false)
+        .unwrap()
+        .fit(&array![[2.0, 3.0, 5.0]], &())
+        .unwrap();
+    assert_eq!(fitted.powers(), &sklearn_powers);
+}
+
+/// REQ-4 n_features_in_ == ncols seen during fit (here 3). Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.,5.]]).n_features_in_` == `3`.
+#[test]
+fn fit_n_features_in_matches_ncols() {
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0, 5.0]], &())
+        .unwrap();
+    assert_eq!(fitted.n_features_in(), 3);
+}
+
+/// REQ-4 n_output_features_ == sklearn `.n_output_features_` AND == the transform
+/// output column count, across several (degree, interaction_only, include_bias)
+/// combos. Live oracle counts:
+///   P(2).fit([[2,3]]).n_output_features_                              -> 6
+///   P(2).fit([[2,3,5]]).n_output_features_                            -> 10
+///   P(2,interaction_only=True).fit([[2,3,5]]).n_output_features_      -> 7
+///   P(3,interaction_only=True,include_bias=False).fit([[2,3,5]])...   -> 7
+///   P(2,include_bias=False).fit([[2,3]]).n_output_features_           -> 5
+#[test]
+fn fit_n_output_features_matches_sklearn_oracle_and_transform_ncols() {
+    // (degree, interaction_only, include_bias, n_features, sklearn n_output_features_)
+    let cases: &[(usize, bool, bool, usize, usize)] = &[
+        (2, false, true, 2, 6),
+        (2, false, true, 3, 10),
+        (2, true, true, 3, 7),
+        (3, true, false, 3, 7),
+        (2, false, false, 2, 5),
+    ];
+    for &(deg, inter, bias, nfeat, expected_n_out) in cases {
+        let poly = PolynomialFeatures::<f64>::new(deg, inter, bias).unwrap();
+        let x: Array2<f64> = Array2::from_elem((1, nfeat), 2.0);
+        let fitted = poly.fit(&x, &()).unwrap();
+        assert_eq!(
+            fitted.n_output_features(),
+            expected_n_out,
+            "n_output_features_ mismatch for deg={deg} inter={inter} bias={bias} nfeat={nfeat}"
+        );
+        // n_output_features_ must equal the transform output column count.
+        let out = fitted.transform(&x).unwrap();
+        assert_eq!(out.shape()[1], expected_n_out);
+        // And the stateless path agrees on the column count.
+        assert_eq!(poly.transform(&x).unwrap().shape()[1], expected_n_out);
+    }
+}
+
+/// REQ-4: `fit(X).transform(X)` == the stateless `PolynomialFeatures::transform(X)`
+/// == sklearn `.fit_transform(X)` (full matrix, bit-exact, REQ-1 column order).
+/// Live oracle (REQ-1 reuse): `PolynomialFeatures(2).fit_transform([[2.,3.,5.]])`
+/// == `[[1,2,3,5,4,6,10,9,15,25]]`.
+#[test]
+fn fitted_transform_matches_stateless_and_sklearn_oracle() {
+    // Live oracle: PolynomialFeatures(2).fit_transform([[2.,3.,5.]])
+    let sklearn_expected: Array2<f64> =
+        array![[1.0, 2.0, 3.0, 5.0, 4.0, 6.0, 10.0, 9.0, 15.0, 25.0]];
+    let poly = PolynomialFeatures::<f64>::new(2, false, true).unwrap();
+    let x = array![[2.0, 3.0, 5.0]];
+    let stateless = poly.transform(&x).unwrap();
+    let fitted = poly.fit(&x, &()).unwrap();
+    let stateful = fitted.transform(&x).unwrap();
+    // fitted == stateless == sklearn, byte-for-byte.
+    assert_eq!(stateful, stateless);
+    assert_eq!(stateful, sklearn_expected);
+}
+
+/// REQ-4 transform-time feature-count check: MORE features than fitted →
+/// ShapeMismatch (Err, no panic). Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.]]).transform([[1.,2.,3.]])` raises
+/// `ValueError: X has 3 features, but PolynomialFeatures is expecting 2 features
+/// as input.`
+#[test]
+fn fitted_transform_more_features_shape_mismatch_like_sklearn() {
+    // Live oracle: fit([[2.,3.]]) then transform([[1.,2.,3.]]) -> ValueError (3 vs 2)
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    let result = fitted.transform(&array![[1.0, 2.0, 3.0]]);
+    assert!(
+        matches!(result, Err(FerroError::ShapeMismatch { .. })),
+        "sklearn raises ValueError (X has 3 features, expecting 2); ferrolearn must \
+         return ShapeMismatch, got {result:?}"
+    );
+}
+
+/// REQ-4 transform-time feature-count check: FEWER features than fitted →
+/// ShapeMismatch (Err, no panic). Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.]]).transform([[1.]])` raises
+/// `ValueError: X has 1 features, but PolynomialFeatures is expecting 2 features
+/// as input.`
+#[test]
+fn fitted_transform_fewer_features_shape_mismatch_like_sklearn() {
+    // Live oracle: fit([[2.,3.]]) then transform([[1.]]) -> ValueError (1 vs 2)
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    let result = fitted.transform(&array![[1.0]]);
+    assert!(
+        matches!(result, Err(FerroError::ShapeMismatch { .. })),
+        "sklearn raises ValueError (X has 1 features, expecting 2); ferrolearn must \
+         return ShapeMismatch, got {result:?}"
+    );
+}
+
+/// REQ-4 #2207 order: a NaN-containing input that ALSO has the wrong feature
+/// count must raise the check_array (finite) error, NOT ShapeMismatch — sklearn
+/// runs `check_array` (force_all_finite) BEFORE the n_features consistency check
+/// (`_polynomial.py:433-435`). Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.]]).transform([[nan,1.,2.]])` raises
+/// `ValueError: Input X contains NaN.` (the finite error), not the 3-vs-2
+/// feature-count error.
+#[test]
+fn fitted_transform_nan_validation_before_n_features_like_sklearn() {
+    // Live oracle: fit([[2.,3.]]) then transform([[nan,1.,2.]]) -> "Input X contains NaN."
+    // (check_array finite check fires BEFORE the 3-vs-2 n_features mismatch.)
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    let result = fitted.transform(&array![[f64::NAN, 1.0, 2.0]]);
+    // The NaN/finite check (REQ-8 InvalidParameter) must win over the
+    // feature-count check (ShapeMismatch), matching sklearn's validation order.
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "sklearn validates finiteness (Input X contains NaN) BEFORE the n_features \
+         check (#2207); ferrolearn must return InvalidParameter, not ShapeMismatch, \
+         got {result:?}"
+    );
+}
+
+/// REQ-4: the fitted path enforces REQ-8 input validation too (shared guard) —
+/// a NaN input with the CORRECT feature count still errors (InvalidParameter),
+/// matching the stateless path. Live oracle
+/// `PolynomialFeatures(2).fit([[2.,3.]]).transform([[nan,1.]])` raises
+/// `ValueError: Input X contains NaN.`
+#[test]
+fn fitted_transform_rejects_nan_like_sklearn() {
+    let fitted = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[2.0, 3.0]], &())
+        .unwrap();
+    let result = fitted.transform(&array![[f64::NAN, 1.0]]);
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "sklearn raises ValueError on NaN (force_all_finite); ferrolearn must reject \
+         with InvalidParameter, got {result:?}"
+    );
+}
+
+/// REQ-4: `fit` itself runs the REQ-8 guard — a NaN in the fit data is rejected
+/// (sklearn `fit` -> `_validate_data` default force_all_finite=True). Live oracle
+/// `PolynomialFeatures(2).fit(np.array([[float('nan'),1.]]))` raises
+/// `ValueError: Input X contains NaN.`
+#[test]
+fn fit_rejects_nan_like_sklearn() {
+    let result = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&array![[f64::NAN, 1.0]], &());
+    assert!(
+        matches!(result, Err(FerroError::InvalidParameter { .. })),
+        "sklearn fit rejects NaN (force_all_finite); ferrolearn must return \
+         InvalidParameter, got {result:?}"
+    );
+}
+
+/// REQ-4: `fit` rejects a zero-row input (sklearn `_validate_data`
+/// ensure_min_samples=1). Live oracle
+/// `PolynomialFeatures(2).fit(np.empty((0,2)))` raises
+/// `ValueError: Found array with 0 sample(s) ... a minimum of 1 is required`.
+#[test]
+fn fit_rejects_zero_rows_like_sklearn() {
+    let x: Array2<f64> = Array2::zeros((0, 2));
+    let result = PolynomialFeatures::<f64>::new(2, false, true)
+        .unwrap()
+        .fit(&x, &());
+    assert!(
+        matches!(result, Err(FerroError::InsufficientSamples { .. })),
+        "sklearn fit rejects 0-sample input (ensure_min_samples=1); ferrolearn must \
+         return InsufficientSamples, got {result:?}"
+    );
+}
+
+/// REQ-5 f32 generic: powers_ is dtype-independent (always usize exponents) and
+/// matches the oracle for an f32 estimator. Live oracle (same as the f64 2-feat
+/// default) `PolynomialFeatures(2).fit([[2.,3.]]).powers_` ==
+/// `[[0,0],[1,0],[0,1],[2,0],[1,1],[0,2]]`.
+#[test]
+fn fit_powers_f32_matches_sklearn_oracle() {
+    let sklearn_powers: Array2<usize> = array![[0, 0], [1, 0], [0, 1], [2, 0], [1, 1], [0, 2]];
+    let x: Array2<f32> = array![[2.0f32, 3.0]];
+    let fitted = PolynomialFeatures::<f32>::new(2, false, true)
+        .unwrap()
+        .fit(&x, &())
+        .unwrap();
+    assert_eq!(fitted.powers(), &sklearn_powers);
+    assert_eq!(fitted.n_output_features(), 6);
+    assert_eq!(fitted.n_features_in(), 2);
 }
