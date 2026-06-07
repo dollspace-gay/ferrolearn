@@ -67,7 +67,7 @@
 //! `1.0²` is exact and both include). This exact-boundary distance-form parity is
 //! carved out as REQ-11 (NOT-STARTED, #952), tied to the neighbor-search
 //! algorithm surface (#949). The NOT-STARTED surface is the
-//! unimplemented parameter/attribute surface (`sample_weight`, `metric`/`p`,
+//! unimplemented parameter/attribute surface (`metric`/`p`,
 //! `algorithm`/`leaf_size`/`n_jobs`, the `eps=0.5` Rust-constructor default + error
 //! ABI, the ferray substrate), each carrying an open
 //! prereq blocker. Cites use symbol anchors (ferrolearn) / `file:line`
@@ -80,7 +80,7 @@
 //! | REQ-2 (`core_sample_indices_` VALUE parity) | SHIPPED | impl `core_sample_indices = (0..n).filter(\|&i\| is_core[i]).collect()` in `Fit::fit` + accessor `fn core_sample_indices` in `dbscan.rs`, mirroring `core_sample_indices_ = np.where(core_samples)[0]` (`_dbscan.py:438`), core `= neighborhoods[i].len() >= min_samples` (`:435`). VALUE-matches ascending EXACTLY on non-eps-boundary inputs (the eps-boundary case flips a point's core status — REQ-11/#952). Non-test consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate accessor (the PyO3 layer surfaces only `labels_`, not `core_sample_indices_`). Green guards: `green_dbscan_shared_border_tie` (Fixture C core `[0,1,2,3,5,6,7,8]`, border idx4 excluded), `green_dbscan_noise_and_core_indices` (Fixture D core `[0,1,2,4,6,7,8,9,13]`). |
 //! | REQ-3 (`eps>0` / `min_samples>=1` validation boundary) | SHIPPED | impl `Fit::fit` guards `self.eps <= F::zero()` → `Err(FerroError::InvalidParameter { name: "eps" })` and `self.min_samples == 0` → `Err(FerroError::InvalidParameter { name: "min_samples" })`, matching the accept/reject boundary of `_parameter_constraints` `"eps": [Interval(Real, 0.0, None, closed="neither")]` / `"min_samples": [Interval(Integral, 1, None, closed="left")]` (`_dbscan.py:332-333`). Non-test consumer: `RsDBSCAN::fit` maps the error to `PyValueError` (`ferrolearn-python/src/extras.rs`). Green guards: `green_dbscan_eps_zero_rejected` (`eps=0` → `Err`), `green_dbscan_min_samples_one_self_core` (`min_samples=1` accepted, self-core). GAP: the error TYPE is `FerroError::InvalidParameter`, not sklearn's `InvalidParameterError`/`ValueError` ABI — the boundary itself matches; the ABI nuance is tracked under REQ-4. |
 //! | REQ-4 (`eps=0.5` Rust-constructor default + sklearn error ABI) | NOT-STARTED | open prereq blocker **#946**. sklearn `__init__` `eps=0.5` default (`_dbscan.py:347`); ferrolearn `fn new(eps: F)` REQUIRES `eps` — no default. (The PyO3 layer DOES default `eps=0.5` in `RsDBSCAN::new`, but the Rust constructor `DBSCAN::new` does not.) Also validation errors are `FerroError::InvalidParameter`, not the sklearn `InvalidParameterError`/`ValueError` ABI (R-DEV-2). |
-//! | REQ-5 (`sample_weight` — alters core determination) | NOT-STARTED | open prereq blocker **#947**. sklearn `fit(X, sample_weight=w)` sets `n_neighbors = sum(sample_weight[neighbors])` (`_dbscan.py:427-429`), so a high-weight point becomes core with fewer neighbors (oracle: `w0=5` → `[0,-1,-1]` vs unweighted `[-1,-1,-1]`). ferrolearn `Fit<Array2<F>, ()>` has the unit `()` target — no weight; core is purely `neighborhoods[i].len() >= min_samples` (`Fit::fit`). Missing surface. |
+//! | REQ-5 (`sample_weight` — alters core determination) | SHIPPED | impl: `DBSCAN<F>` gains `pub sample_weight: Option<Array1<F>>` + builder `fn with_sample_weight` (`dbscan.rs`); `Fit::fit` validates `w.len() == n_samples` (else `FerroError::ShapeMismatch { context: "sample_weight" }`, mirroring `_check_sample_weight`'s shape `ValueError`, `sklearn/utils/validation.py:2055-2060`) then, when `Some(w)`, sets the core mask `is_core[i] = (sum_{j in neighborhoods[i]} w[j]) >= F::from(min_samples)` — a FLOAT compare over the SAME self-including neighborhoods — mirroring `n_neighbors = [sum(sample_weight[neighbors])...]` + `core_samples = n_neighbors >= self.min_samples` (`_dbscan.py:427-435`). `None` keeps the byte-for-byte unchanged `len >= min_samples` path. Downstream BFS / `core_sample_indices_` / `components_` / `labels_` consume the new mask UNCHANGED. Negative/zero weights accepted (DBSCAN does not pass `only_non_negative`). Non-test consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate builder/accessors (the PyO3 `sample_weight` Python surface stays a REQ-9 follow-on, matching how `core_sample_indices_`/`components_` already ship through the re-export, not the binding). Live-oracle guards (`tests/divergence_dbscan.rs`, R-CHAR-3): `green_dbscan_weighted_flips_isolated_to_core` (`w=[5,1,1]` → `[0,-1,-1]` core `[0]` vs unweighted `[-1,-1,-1]` core `[]`), `green_dbscan_weighted_demotes_core_to_noise` (`w=[0.5;4]`, `min_samples=4` → all noise vs unweighted one cluster), `green_dbscan_all_ones_equals_unweighted` (`w=[1;8]` reproduces Fixture-A `[0,0,0,0,1,1,1,1]`/core `[0..8]` EXACTLY), `green_dbscan_fractional_weight_boundary` (`w=[0.5;8]`: `8*0.5=4.0 >= 4` core / `< 5` noise — the float `>=` boundary), `green_dbscan_sample_weight_wrong_length_errs` (`Err`, no panic). |
 //! | REQ-6 (`metric` / `p` / `metric_params`) | NOT-STARTED | open prereq blocker **#948**. sklearn accepts any `pairwise_distances` metric (`_dbscan.py:334-337`), `p` for Minkowski (`:341`), default `'euclidean'` (`:350`). ferrolearn `fn region_query` / `fn squared_euclidean` (`dbscan.rs`) is Euclidean-ONLY; no `metric`/`p`/`metric_params` param (oracle: `metric='manhattan'` → `[-1,0,0]` vs euclidean `[0,0,0]`). Missing surface. |
 //! | REQ-7 (`algorithm` / `leaf_size` / `n_jobs`) | NOT-STARTED | open prereq blocker **#949**. sklearn routes neighbor search through `NearestNeighbors(radius, algorithm, leaf_size, ..., n_jobs)` (`_dbscan.py:411-422`; constraints `:339-342`). ferrolearn uses a fixed brute-force `O(n^2)` `fn region_query` with no parameter. (Brute force value-matches the default `'auto'`; the divergence is the absent parameter surface.) Missing surface. |
 //! | REQ-8 (`components_` fitted attribute) | SHIPPED | impl: `Fit::fit` builds `components_: Array2<F>` of shape `(core_sample_indices.len(), n_features)` whose row `k` is `x.row(core_sample_indices[k])`, stored in `FittedDBSCAN`, surfaced via accessor `fn components` in `dbscan.rs` — mirroring `self.components_ = X[self.core_sample_indices_].copy()` (`_dbscan.py:441-446`). VALUE-matches the live sklearn 1.5.2 oracle (`DBSCAN(eps=0.5, min_samples=3)` on the 7-point fixture → `components_` shape `(6,2)` = `[[1,1],[1.2,1.1],[0.9,1.0],[8,8],[8.1,8.2],[8.0,7.9]]`, the rows of `X` at `core_sample_indices_ = [0,1,2,3,4,5]`). Consumer: crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`ferrolearn-cluster/src/lib.rs`) — the in-crate accessor (the PyO3 layer does not yet re-expose `components_`, see REQ-9). Green guard: `dbscan_components_match_sklearn` (`dbscan.rs` tests). |
@@ -93,6 +93,56 @@ use ferrolearn_core::traits::Fit;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::collections::VecDeque;
+
+/// NumPy-compatible pairwise summation, byte-for-byte mirroring `np.sum` over a
+/// 1-D contiguous array (NumPy `pairwise_sum`,
+/// `numpy/_core/src/umath/loops_utils.h.src:81-145`).
+///
+/// DBSCAN's weighted core determination compares `np.sum(sample_weight[neighbors])`
+/// against `min_samples` (`sklearn/cluster/_dbscan.py:428-435`). A sequential
+/// left-fold rounds differently from NumPy's pairwise reduction (e.g. ten `0.1`
+/// weights sum to exactly `1.0` under pairwise but `0.999…` sequentially),
+/// flipping the float `>=` boundary, so the weight sum must use this exact
+/// reduction order (#2189).
+fn numpy_pairwise_sum<F: Float>(a: &[F]) -> F {
+    let n = a.len();
+    if n < 8 {
+        // Start from -0.0 to preserve `-0` semantics (numpy `:86-89`).
+        let mut res = F::neg_zero();
+        for &v in a {
+            res = res + v;
+        }
+        res
+    } else if n <= 128 {
+        // Eight-accumulator unrolled block (numpy `:96-135`).
+        let mut r = [a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]];
+        let limit = n - (n % 8);
+        let mut i = 8;
+        while i < limit {
+            r[0] = r[0] + a[i];
+            r[1] = r[1] + a[i + 1];
+            r[2] = r[2] + a[i + 2];
+            r[3] = r[3] + a[i + 3];
+            r[4] = r[4] + a[i + 4];
+            r[5] = r[5] + a[i + 5];
+            r[6] = r[6] + a[i + 6];
+            r[7] = r[7] + a[i + 7];
+            i += 8;
+        }
+        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        // Non-multiple-of-8 remainder (numpy `:131-134`).
+        while i < n {
+            res = res + a[i];
+            i += 1;
+        }
+        res
+    } else {
+        // Divide and conquer, n2 rounded down to a multiple of 8 (numpy `:137-143`).
+        let mut n2 = n / 2;
+        n2 -= n2 % 8;
+        numpy_pairwise_sum(&a[..n2]) + numpy_pairwise_sum(&a[n2..])
+    }
+}
 
 /// DBSCAN clustering configuration (unfitted).
 ///
@@ -110,17 +160,25 @@ pub struct DBSCAN<F> {
     /// The minimum number of samples in a neighborhood for a point to be
     /// considered a core point (including the point itself).
     pub min_samples: usize,
+    /// Optional per-sample weights. When `Some(w)`, a point `i` is a core
+    /// point iff the SUM of weights over its neighbors (including itself)
+    /// is `>= min_samples`, mirroring sklearn's
+    /// `n_neighbors[i] = sum(sample_weight[neighbors])`
+    /// (`sklearn/cluster/_dbscan.py:427-429`). `None` is equivalent to all
+    /// ones (the unweighted `len >= min_samples` path).
+    pub sample_weight: Option<Array1<F>>,
 }
 
 impl<F: Float> DBSCAN<F> {
     /// Create a new `DBSCAN` with the given `eps` radius.
     ///
-    /// Uses default `min_samples = 5`.
+    /// Uses default `min_samples = 5` and no sample weights.
     #[must_use]
     pub fn new(eps: F) -> Self {
         Self {
             eps,
             min_samples: 5,
+            sample_weight: None,
         }
     }
 
@@ -128,6 +186,22 @@ impl<F: Float> DBSCAN<F> {
     #[must_use]
     pub fn with_min_samples(mut self, min_samples: usize) -> Self {
         self.min_samples = min_samples;
+        self
+    }
+
+    /// Set per-sample weights.
+    ///
+    /// Mirrors scikit-learn's `DBSCAN.fit(X, sample_weight=w)`: a sample with
+    /// a weight of at least `min_samples` is by itself a core sample, and a
+    /// sample with a negative weight may inhibit its eps-neighbors from being
+    /// core (`sklearn/cluster/_dbscan.py:384-388`). Weights are absolute and
+    /// default to 1 (passing all-ones reproduces the unweighted path exactly).
+    /// Negative and zero weights are accepted (sklearn's `_check_sample_weight`
+    /// does NOT require non-negativity for DBSCAN). The weight vector length is
+    /// validated against the number of samples at [`Fit::fit`] time.
+    #[must_use]
+    pub fn with_sample_weight(mut self, w: Array1<F>) -> Self {
+        self.sample_weight = Some(w);
         self
     }
 }
@@ -241,6 +315,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
         let n_samples = x.nrows();
         let n_features = x.ncols();
 
+        // Validate `sample_weight` length against `n_samples`, mirroring
+        // `_check_sample_weight` (`sklearn/utils/validation.py:2055-2060`):
+        // a wrong-length weight vector raises `ValueError`. Negative/zero
+        // weights are ALLOWED (DBSCAN does not pass `only_non_negative`).
+        if let Some(w) = &self.sample_weight
+            && w.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![w.len()],
+                context: "sample_weight".into(),
+            });
+        }
+
         if n_samples == 0 {
             return Ok(FittedDBSCAN {
                 labels_: Array1::zeros(0),
@@ -257,10 +345,40 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
             (0..n_samples).map(|i| region_query(x, i, eps_sq)).collect();
 
         // Step 2: Identify core points.
-        let is_core: Vec<bool> = neighborhoods
-            .iter()
-            .map(|n| n.len() >= self.min_samples)
-            .collect();
+        //
+        // Unweighted (`sample_weight` is `None`): `is_core[i]` iff the
+        // neighborhood size (self included) is `>= min_samples`, mirroring
+        // `n_neighbors = [len(neighbors) ...]` (`_dbscan.py:425`).
+        //
+        // Weighted: `is_core[i]` iff the SUM of weights over the SAME
+        // neighborhood (self included) is `>= min_samples` (a float compare),
+        // mirroring `n_neighbors = [sum(sample_weight[neighbors]) ...]` and
+        // `core_samples = n_neighbors >= self.min_samples`
+        // (`_dbscan.py:427-435`). `min_samples` is cast to `F` for the compare.
+        let is_core: Vec<bool> = match &self.sample_weight {
+            None => neighborhoods
+                .iter()
+                .map(|n| n.len() >= self.min_samples)
+                .collect(),
+            Some(w) => {
+                let min_samples_f = F::from(self.min_samples).unwrap_or_else(F::infinity);
+                neighborhoods
+                    .iter()
+                    .map(|n| {
+                        // sklearn computes `np.sum(sample_weight[neighbors])`
+                        // (`_dbscan.py:428`); NumPy `np.sum` uses PAIRWISE
+                        // summation, not a sequential fold, so a running sum that
+                        // straddles `min_samples` (e.g. ten `0.1` weights ->
+                        // numpy 1.0 vs sequential 0.999…) must use the SAME
+                        // reduction order to match the float `>=` core boundary
+                        // (#2189).
+                        let neighbor_weights: Vec<F> = n.iter().map(|&j| w[j]).collect();
+                        let weight_sum = numpy_pairwise_sum(&neighbor_weights);
+                        weight_sum >= min_samples_f
+                    })
+                    .collect()
+            }
+        };
 
         let core_sample_indices: Vec<usize> = (0..n_samples).filter(|&i| is_core[i]).collect();
 

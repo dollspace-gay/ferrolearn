@@ -768,7 +768,6 @@ fn green_dbscan_sample_weight_wrong_length_errs() {
 /// (< 1.0 -> all noise). Neighbor SETS are identical (eps=1.0); only the
 /// summation order differs. Tracking: #2189.
 #[test]
-#[ignore = "divergence: weighted core-mask sum uses sequential fold not pairwise np.sum -> flips at integer >= boundary; tracking #2189"]
 fn divergence_dbscan_weight_sum_summation_order_boundary() {
     // sklearn 1.5.2 oracle (np.sum is pairwise -> EXACTLY 1.0 -> all core).
     let sklearn_labels: [isize; 10] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
