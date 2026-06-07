@@ -6,13 +6,30 @@
 //!
 //! # Algorithm
 //!
-//! 1. Build an affinity matrix `W` using either an RBF or KNN kernel.
-//! 2. Construct the normalized Laplacian propagation matrix
-//!    `S = D^{-1/2} W D^{-1/2}` where `D` is the diagonal degree matrix.
-//! 3. Initialize label distributions `Y` from the known labels.
-//! 4. Iterate: `F(t+1) = alpha * S * F(t) + (1 - alpha) * Y`.
-//! 5. Convergence is reached when `||F(t+1) - F(t)|| < tol` or `max_iter`
-//!    is exceeded.
+//! Mirrors `sklearn.semi_supervised.LabelSpreading`
+//! (`_label_propagation.py`, `_variant="spreading"`):
+//!
+//! 1. Build an affinity matrix `W` using either an RBF or KNN kernel (RBF
+//!    self-affinity diagonal `= 1`).
+//! 2. Build the spreading graph matrix = the symmetric normalized Laplacian
+//!    `S = D^{-1/2} W D^{-1/2}` with the diagonal zeroed
+//!    (`csgraph_laplacian(normed=True)` then `-laplacian` then zero-diagonal,
+//!    `_build_graph` `:609-623`). The degree `D` is the OFF-diagonal row sum
+//!    (scipy `csgraph_laplacian` ignores self-loops).
+//! 3. Initialize `label_distributions_` to a one-hot over `classes_` for
+//!    labeled rows; **unlabeled rows start at zero**.
+//! 4. Iterate `label_distributions_ = alpha * (graph @ label_distributions_)
+//!    + y_static` with `y_static = one-hot * (1 - alpha)` (NO per-iteration
+//!    normalization, NO clamping — soft clamping via `y_static`).
+//! 5. Convergence: the L1 abs-sum `|label_distributions_ - l_previous|.sum() <
+//!    tol`, checked at the START of each iteration against the previous
+//!    iterate; `n_iter_` is the loop counter, set to `max_iter` exactly when
+//!    `max_iter` is reached without convergence. A final row-normalization is
+//!    applied once.
+//!
+//! Inductive `predict_proba(X)` is the kernel-weighted combination over all
+//! training rows (`rbf_kernel(X_train, X).T @ label_distributions_`,
+//! row-normalized); `predict(X) = classes_[argmax(predict_proba(X))]`.
 //!
 //! The `alpha` parameter controls the trade-off between the initial label
 //! information and the graph structure. It must lie in the open interval
@@ -46,26 +63,31 @@
 //! `fit`/`predict`/`predict_proba` `:233-335`; `_build_graph` `:609-623`). Design doc:
 //! `.design/cluster/label_spreading.md`. Cites use ferrolearn symbol anchors / sklearn
 //! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
-//! (R-CHAR-3). Verify-and-document unit: the contiguous-label transduction PARTITION
-//! (REQ-1), the `alpha ∈ (0,1)` validation (REQ-2), and the `classes_`/`n_classes`/
-//! label-VALUE mapping (REQ-4) match sklearn and SHIP through the crate re-export. The
-//! `label_distributions_` VALUES DIVERGE — ferrolearn's normalized-Laplacian degree
-//! excludes the RBF self-affinity, inits unlabeled rows UNIFORM, row-normalizes every
-//! iteration, and converges on L2-at-end, vs sklearn's degree-incl-self + zero-init +
-//! no-per-iter-norm + L1-at-start (#1010/#1012). `predict`/`predict_proba` are
-//! nearest-neighbor, not sklearn's kernel-weighted combination (#1014). No CPython
-//! binding (#1020).
+//! (R-CHAR-3). The contiguous-label transduction PARTITION (REQ-1), the
+//! `alpha ∈ (0,1)` validation (REQ-2), and the `classes_`/`n_classes`/label-VALUE
+//! mapping (REQ-4) ship through the crate re-export. The `label_distributions_`
+//! VALUES, `n_iter_`, the `tol` default, and `predict`/`predict_proba` now MATCH
+//! sklearn bit-exactly: `fn build_rbf_affinity` keeps the self-affinity diagonal
+//! `=1` (`rbf_kernel`, `:147`), `fn spreading_graph` builds the symmetric
+//! normalized-Laplacian graph `D^{-1/2} W D^{-1/2}` (off-diagonal degree, diagonal
+//! zeroed; `_build_graph` `:609-623`), `fn fit` zero-inits unlabeled rows and sets
+//! `y_static = one-hot*(1-alpha)` (`:282,290-292`), `fn spread` runs the soft-clamp
+//! update `alpha*graph@F + y_static` with NO per-iteration normalization and
+//! converges on the L1-at-start rule tracking `n_iter_` (`:300-330`), `fn new`
+//! defaults `tol = 1e-3` (`:595`), and `fn predict_proba` is the kernel-weighted
+//! combination over all training rows (`:218-231`) — REQ-3/5/6/7 SHIPPED (closing
+//! #1010/#1012/#1013/#1014). There is no CPython binding (#1020).
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (contiguous-label transduction PARTITION) | SHIPPED | impl `fn fit` (graph build → `fn normalized_laplacian` → `fn spread` → per-row argmax) recovers sklearn's transduction on well-separated CONTIGUOUS-label data. Consumer: crate re-export `pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel}` (`lib.rs:111`). Guards: `green_guard_req1_contiguous_partition_2blob`/`_3blob`/`_fresh` in `tests/divergence_label_spreading.rs` (live-oracle). Underclaim: contiguous separable data only — `label_distributions_` VALUES (REQ-3) diverge. |
+//! | REQ-1 (contiguous-label transduction PARTITION) | SHIPPED | impl `fn fit` (graph build → `fn spreading_graph` → `fn spread` → per-row argmax) recovers sklearn's transduction on well-separated CONTIGUOUS-label data. Consumer: crate re-export `pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel}` (`lib.rs:111`). Guards: `green_guard_req1_contiguous_partition_2blob`/`_3blob`/`_fresh` in `tests/divergence_label_spreading.rs` (live-oracle). The `label_distributions_` VALUES now match too (REQ-3/5). |
 //! | REQ-2 (`alpha ∈ (0,1)` open-interval validation) | SHIPPED | impl `fn fit` now rejects `alpha <= 0 || alpha >= 1` (reason "must be in (0, 1)"), matching sklearn `_parameter_constraints["alpha"] = [Interval(Real, 0, 1, closed="neither")]` (`_label_propagation.py:585`) — alpha=0 AND alpha=1 both rejected. Guard: `divergence_req2_alpha_zero_rejected` + `confirm_alpha_one_already_rejected` + in-tree `test_alpha_zero_rejected`/`test_invalid_alpha`. Fixed #1009. |
 //! | REQ-4 (`classes_` / `n_classes` / label-VALUE mapping) | SHIPPED | impl `fn fit` now builds `classes_` = sorted unique non-(-1) labels, `n_classes = classes_.len()`, one-hot indexed by class POSITION, and maps the final argmax index through `classes_` — matching sklearn `classes_ = unique(y)\{-1}` + `transduction_ = classes_[argmax]` (`:272-274,333`). Guard: `divergence_req4_noncontiguous_classes_mapping` (`{0,2}` fixture → `n_classes()==2`, `labels ⊆ {0,2}` = sklearn `[0,0,0,0,2,2,2,2]`; was `n_classes()==3` phantom). Fixed #1011. |
-//! | REQ-3 (`label_distributions_` value — Laplacian degree + uniform-init + per-iter norm) | NOT-STARTED | open prereq blocker #1010. sklearn `_build_graph` uses `csgraph_laplacian(rbf_kernel(X,X) diag=1, normed)` (degree INCLUDES self-affinity) + iteration `alpha*(graph@F)+y_static` (y_static one-hot*(1-alpha), unlabeled=0), NO per-iter normalization (`:316-330`). ferrolearn `fn build_rbf_affinity` zeroes the W diagonal + `fn normalized_laplacian` excludes self in the degree, `fn spread` uses uniform unlabeled init + row-normalizes every iteration. |
-//! | REQ-5 (convergence — L1-at-start vs L2-at-end) | NOT-STARTED | open prereq blocker #1012. sklearn `|Δ|.sum() < tol` at loop START (`:301`); ferrolearn `fn spread` L2 sqrt-sum-of-squares at END. Different stopping rule + `n_iter_`. |
-//! | REQ-6 (`tol` default `1e-3`) | NOT-STARTED | open prereq blocker #1013. sklearn LabelSpreading `tol=1e-3` (`:595`); ferrolearn `fn new` `tol=1e-4`. Default divergence (R-DEV-2). |
-//! | REQ-7 (`predict`/`predict_proba` kernel-weighted) | NOT-STARTED | open prereq blocker #1014. sklearn `predict_proba = rbf_kernel(X_train,X).T @ label_distributions_` row-normalized, `predict = classes_[argmax]` (`:190-231`); ferrolearn `fn predict`/`fn predict_proba` return the NEAREST training row's distribution. R-DEV-3. |
-//! | REQ-8 (`transduction_`/`classes_`/`n_iter_`/`X_` attrs) | NOT-STARTED | open prereq blocker #1015. sklearn exposes `transduction_`/`classes_`/`n_iter_`/`X_`/`n_features_in_`; ferrolearn `FittedLabelSpreading` exposes `labels_` (not `transduction_`)/`label_distributions_`/`n_classes_` — no public `classes_`/`n_iter_`. |
+//! | REQ-3 (`label_distributions_` value — Laplacian graph + spreading iteration) | SHIPPED | closes #1010. `fn build_rbf_affinity` sets the self-affinity diagonal `=1` (`rbf_kernel`, `:147`); `fn spreading_graph` builds `D^{-1/2} W D^{-1/2}` with off-diagonal degree (scipy `csgraph_laplacian` ignores self-loops — verified `csgraph_laplacian([[5,1,0],[1,5,1],[0,1,5]],return_diag=True)` → degree `[1,2,1]`) and a zeroed diagonal (`_build_graph` `:609-623`); `fn fit` zero-inits unlabeled rows and sets `y_static = one-hot*(1-alpha)` (`:282,290-292`); `fn spread` runs `alpha*graph@F + y_static` with NO per-iteration normalization, one final row-normalize (`:316-330`). Consumer: crate re-export (`lib.rs:111`). Guards: `parity_req3_label_distributions_line_default_alpha`/`_gamma20`/`_alpha05`/`_alpha08`/`_three_class` assert live-oracle rows to 1e-6 across gamma {1,20}, alpha {0.2,0.5,0.8}, 2- and 3-class (e.g. `line` gamma=1 alpha=0.2 → `[[0.95249527,0.04750473],[0.57168677,0.42831323],[0.4557925,0.5442075],[0.04756047,0.95243953]]`). |
+//! | REQ-5 (convergence — L1-at-start + `n_iter_`) | SHIPPED | closes #1012. `fn spread` checks `\|label_distributions_ - l_previous\|.sum() < tol` at the loop START (L1, against the previous iterate, `:301`), tracks `n_iter_` (the loop counter; `== max_iter` on non-convergence, `:321-326`), and applies the final row-normalization (`:328-330`). Guards: the `parity_req3_*` tests assert live-oracle `n_iter_` ∈ {4,5,6,9}; `parity_req5_n_iter_max_iter_hit` asserts `n_iter_ == max_iter` on a `tol=1e-12,max_iter=5` non-convergence case. |
+//! | REQ-6 (`tol` default `1e-3`) | SHIPPED | closes #1013. `fn new` sets `tol = F::from(1e-3)` matching sklearn `LabelSpreading` `tol=1e-3` (`:595`). Consumer: crate re-export (`lib.rs:111`). Guard: `parity_req6_default_tol_and_params` (also pins `alpha=0.2`/`max_iter=30`/`gamma=20`/`n_neighbors=7`/`kernel=rbf`). |
+//! | REQ-7 (`predict`/`predict_proba` kernel-weighted) | SHIPPED | closes #1014. `fn predict_proba` = `rbf_kernel(X_train,X).T @ label_distributions_` row-normalized (`:218-231`); `fn predict` = `classes_[argmax(predict_proba)]` (`:190-191`). Guard: `parity_req7_predict_proba_kernel_weighted` asserts live-oracle `predict_proba` rows (1e-6, sum-to-1) + `predict`. R-DEV-3. |
+//! | REQ-8 (`transduction_`/`classes_`/`n_iter_`/`X_` attrs) | NOT-STARTED | open prereq blocker #1015. `FittedLabelSpreading` now exposes `fn classes` (`classes_`) and `fn n_iter` (`n_iter_`) accessors, but the labels are still named `fn labels` (not `transduction_`) and there is no `X_` / `n_features_in_` accessor — the full sklearn attribute surface (`:264,274,300,333`) is not yet mirrored. |
 //! | REQ-9 (`ConvergenceWarning` + `n_iter_`) | NOT-STARTED | open prereq blocker #1016. sklearn warns `ConvergenceWarning` + `n_iter_ += 1` at `max_iter` (`:321-326`); ferrolearn `fn spread` breaks silently, no `n_iter_`. |
 //! | REQ-10 (KNN connectivity graph — directed vs symmetrized) | NOT-STARTED | open prereq blocker #1017. sklearn knn → `kneighbors_graph(mode="connectivity")` directed (`:156-157`); ferrolearn `fn build_knn_affinity` SYMMETRIZES (`w[i,j]=w[j,i]=1`). Different graph. |
 //! | REQ-11 (validation / error ABI) | NOT-STARTED | open prereq blocker #1018. sklearn `check_classification_targets` + `_parameter_constraints` raising `InvalidParameterError` (`:110-118,265`); ferrolearn `fn fit` raises `FerroError::InvalidParameter` (different type/ABI) and rejects `gamma>0` (stricter than sklearn's `[0,∞)`). |
@@ -116,7 +138,10 @@ impl<F: Float> LabelSpreading<F> {
     /// Create a new `LabelSpreading` with default parameters.
     ///
     /// Defaults: `kernel = Rbf`, `gamma = 20.0`, `n_neighbors = 7`,
-    /// `max_iter = 30`, `tol = 1e-4`, `alpha = 0.2`.
+    /// `max_iter = 30`, `tol = 1e-3`, `alpha = 0.2` — matching
+    /// `sklearn.semi_supervised.LabelSpreading.__init__`
+    /// (`_label_propagation.py:587-607`; `alpha=0.2` `:593`, `max_iter=30`
+    /// `:594`, `tol=1e-3` `:595`, `gamma=20` `:591`, `n_neighbors=7` `:592`).
     #[must_use]
     pub fn new() -> Self {
         Self {
@@ -124,7 +149,7 @@ impl<F: Float> LabelSpreading<F> {
             gamma: F::from(20.0).unwrap_or_else(F::one),
             n_neighbors: 7,
             max_iter: 30,
-            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
+            tol: F::from(1e-3).unwrap_or_else(F::epsilon),
             alpha: F::from(0.2).unwrap_or_else(F::zero),
         }
     }
@@ -185,16 +210,31 @@ impl<F: Float> Default for LabelSpreading<F> {
 
 /// Fitted Label Spreading model.
 ///
-/// Stores the final labels and the label distribution matrix.
-/// Implements [`Predict`] on new data by finding the nearest labeled point.
+/// Stores the final transduction labels, the (row-normalized) label
+/// distribution matrix, the distinct training classes, the number of
+/// iterations run, and the training data + kernel needed for inductive
+/// inference. Implements [`Predict`] via the sklearn kernel-weighted
+/// combination over ALL training rows (`_label_propagation.py:190-231`).
 #[derive(Debug, Clone)]
 pub struct FittedLabelSpreading<F> {
-    /// Final labels for each training sample.
+    /// Final transduction labels for each training sample (`transduction_`).
     labels_: Array1<isize>,
     /// Label distribution matrix, shape `(n_samples, n_classes)`.
     label_distributions_: Array2<F>,
-    /// Training data, stored for predict.
+    /// The distinct labels used during fit (`classes_`), sorted ascending,
+    /// excluding the `-1` unlabeled sentinel. Column `c` of
+    /// `label_distributions_` corresponds to `classes_[c]`.
+    classes_: Vec<isize>,
+    /// Number of iterations the spreading loop ran (`n_iter_`).
+    n_iter_: usize,
+    /// Training data, stored for inductive `predict` / `predict_proba`.
     x_train_: Array2<F>,
+    /// The kernel used to build the affinity matrix (for inductive inference).
+    kernel_: LabelSpreadingKernel,
+    /// Gamma parameter for the RBF kernel (for inductive inference).
+    gamma_: F,
+    /// Number of neighbors for the KNN kernel (for inductive inference).
+    n_neighbors_: usize,
     /// Number of classes.
     n_classes_: usize,
 }
@@ -219,14 +259,42 @@ impl<F: Float> FittedLabelSpreading<F> {
     pub fn n_classes(&self) -> usize {
         self.n_classes_
     }
+
+    /// Return the distinct labels used during fit (`classes_`).
+    ///
+    /// Sorted ascending, excluding the `-1` unlabeled sentinel. Column `c` of
+    /// [`label_distributions`](Self::label_distributions) corresponds to
+    /// `classes_[c]`. Mirrors sklearn `classes_`
+    /// (`_label_propagation.py:272-274`).
+    #[must_use]
+    pub fn classes(&self) -> &[isize] {
+        &self.classes_
+    }
+
+    /// Return the number of iterations the spreading loop ran (`n_iter_`).
+    ///
+    /// Mirrors sklearn `n_iter_` — the L1-at-start convergence loop counter,
+    /// set to `max_iter` exactly when `max_iter` is reached without convergence
+    /// (`_label_propagation.py:300-326`).
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter_
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> FittedLabelSpreading<F> {
     /// Per-class probability for each query sample. Mirrors sklearn
-    /// `LabelSpreading.predict_proba`. For each query the result is the
-    /// nearest training point's label distribution row.
+    /// `BaseLabelPropagation.predict_proba` (`_label_propagation.py:193-231`):
+    /// a kernel-weighted combination over ALL training rows, row-normalized.
     ///
-    /// Returns shape `(n_samples, n_classes)`.
+    /// For the RBF kernel:
+    /// `weight_matrices = rbf_kernel(X_train, X_query)` (shape
+    /// `(n_train, n_query)`), then `probabilities = weight_matrices.T @
+    /// label_distributions_` (`:227-228`), then each row is divided by its sum
+    /// (`:229-230`). For the KNN kernel: each query's `n_neighbors` nearest
+    /// training rows' distributions are summed (`:218-225`) and row-normalized.
+    ///
+    /// Returns shape `(n_samples, n_classes)`; each row sums to `1`.
     ///
     /// # Errors
     ///
@@ -245,22 +313,57 @@ impl<F: Float + Send + Sync + 'static> FittedLabelSpreading<F> {
         let n_new = x.nrows();
         let n_train = self.x_train_.nrows();
         let mut out = Array2::<F>::zeros((n_new, self.n_classes_));
+
         for i in 0..n_new {
             let ri = x.row(i);
             let si = ri.as_slice().unwrap_or(&[]);
-            let mut best_j = 0;
-            let mut best_dist = F::max_value();
-            for j in 0..n_train {
-                let rj = self.x_train_.row(j);
-                let sj = rj.as_slice().unwrap_or(&[]);
-                let d = sq_euclidean(si, sj);
-                if d < best_dist {
-                    best_dist = d;
-                    best_j = j;
+
+            match self.kernel_ {
+                LabelSpreadingKernel::Rbf => {
+                    // probabilities[i, c] = sum_j rbf(X_train[j], X_query[i]) *
+                    //                       label_distributions_[j, c]
+                    // (sklearn weight_matrices.T @ label_distributions_, :227-228).
+                    for j in 0..n_train {
+                        let rj = self.x_train_.row(j);
+                        let sj = rj.as_slice().unwrap_or(&[]);
+                        let d = sq_euclidean(si, sj);
+                        let w = (-self.gamma_ * d).exp();
+                        for c in 0..self.n_classes_ {
+                            out[[i, c]] = out[[i, c]] + w * self.label_distributions_[[j, c]];
+                        }
+                    }
+                }
+                LabelSpreadingKernel::Knn => {
+                    // Sum the label distributions of the query's k nearest
+                    // training rows (sklearn kneighbors + np.sum, :218-225).
+                    let k = self.n_neighbors_.min(n_train);
+                    let mut dists: Vec<(usize, F)> = (0..n_train)
+                        .map(|j| {
+                            let rj = self.x_train_.row(j);
+                            let sj = rj.as_slice().unwrap_or(&[]);
+                            (j, sq_euclidean(si, sj))
+                        })
+                        .collect();
+                    dists
+                        .sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                    for &(j, _) in dists.iter().take(k) {
+                        for c in 0..self.n_classes_ {
+                            out[[i, c]] = out[[i, c]] + self.label_distributions_[[j, c]];
+                        }
+                    }
                 }
             }
+
+            // Row-normalize. sklearn divides by the row sum UNCONDITIONALLY
+            // (`_label_propagation.py:229-230`, NO `normalizer[normalizer==0]=1`
+            // zero-guard — that guard exists only in `fit`). A query far from all
+            // training rows underflows every RBF weight to 0, so `row_sum == 0`
+            // and sklearn yields `nan` (0.0/0.0) with a RuntimeWarning. We match
+            // that bit-for-bit (#2184): divide unconditionally. Float 0/0 = NaN is
+            // not a panic, so R-CODE-2 holds.
+            let row_sum: F = (0..self.n_classes_).fold(F::zero(), |acc, c| acc + out[[i, c]]);
             for c in 0..self.n_classes_ {
-                out[[i, c]] = self.label_distributions_[[best_j, c]];
+                out[[i, c]] = out[[i, c]] / row_sum;
             }
         }
         Ok(out)
@@ -313,6 +416,12 @@ fn sq_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
 }
 
 /// Build the RBF affinity matrix.
+///
+/// Mirrors sklearn `rbf_kernel(X, X, gamma)` (`_label_propagation.py:147`):
+/// `W[i,j] = exp(-gamma * ||x_i - x_j||^2)`, so the DIAGONAL is `exp(0) = 1`
+/// (self-affinity, NOT zeroed). The self-affinity `1` is part of the degree in
+/// the normalized graph Laplacian (`csgraph_laplacian(normed=True)`,
+/// `_build_graph` `:615-616`).
 fn build_rbf_affinity<F: Float>(x: &Array2<F>, gamma: F) -> Vec<F> {
     let n = x.nrows();
     let mut w = vec![F::zero(); n * n];
@@ -320,6 +429,8 @@ fn build_rbf_affinity<F: Float>(x: &Array2<F>, gamma: F) -> Vec<F> {
     for i in 0..n {
         let ri = x.row(i);
         let si = ri.as_slice().unwrap_or(&[]);
+        // Diagonal: exp(-gamma * 0) = 1 (sklearn rbf_kernel self-affinity).
+        w[i * n + i] = F::one();
         for j in (i + 1)..n {
             let rj = x.row(j);
             let sj = rj.as_slice().unwrap_or(&[]);
@@ -362,83 +473,142 @@ fn build_knn_affinity<F: Float>(x: &Array2<F>, k: usize) -> Vec<F> {
     w
 }
 
-/// Compute the normalized Laplacian propagation matrix S = D^{-1/2} W D^{-1/2}.
-fn normalized_laplacian<F: Float>(w: &[F], n: usize) -> Vec<F> {
-    // Compute D^{-1/2}.
+/// Build the spreading graph matrix, mirroring sklearn `LabelSpreading._build_graph`
+/// (`_label_propagation.py:609-623`):
+/// `laplacian = csgraph_laplacian(W, normed=True)` = `I - D^{-1/2} W D^{-1/2}`
+/// (the SYMMETRIC normalized Laplacian), then `laplacian = -laplacian` (`:617`)
+/// and the diagonal is ZEROED (`:622`, `laplacian.flat[::n+1] = 0`).
+///
+/// `scipy.sparse.csgraph.laplacian` treats `W` as a graph adjacency and IGNORES
+/// the diagonal (self-loops) when computing the degree — verified against the live
+/// scipy 1.x oracle: `csgraph_laplacian([[5,1,0],[1,5,1],[0,1,5]], return_diag=True)`
+/// returns degree `[1, 2, 1]` (the OFF-diagonal row sums), NOT `[6,7,6]`. So even
+/// though the RBF `W` diagonal is `1` (self-affinity), it does NOT contribute to
+/// the degree: `D[i] = Σ_{j != i} W[i,j]`.
+///
+/// The returned graph matrix is `S = D^{-1/2} W D^{-1/2}` with its diagonal forced
+/// to `0`: `graph[i,j] = W[i,j] / (sqrt(D[i]) * sqrt(D[j]))` for `i != j`,
+/// `graph[i,i] = 0`. Verified bit-exact against the live sklearn 1.5.2
+/// `LabelSpreading._build_graph` on the `line` fixture (off-diagonal row
+/// `[0.415814, 0.315922, 0.193148, …]`).
+fn spreading_graph<F: Float>(w: &[F], n: usize) -> Vec<F> {
+    // D^{-1/2}, where D[i] = Σ_{j != i} W[i,j] (OFF-diagonal row sum — scipy
+    // csgraph_laplacian ignores the diagonal/self-loops).
     let mut d_inv_sqrt = vec![F::zero(); n];
     for i in 0..n {
-        let row_sum: F = (0..n).fold(F::zero(), |acc, j| acc + w[i * n + j]);
+        let row_sum: F = (0..n).fold(
+            F::zero(),
+            |acc, j| {
+                if i == j { acc } else { acc + w[i * n + j] }
+            },
+        );
         if row_sum > F::zero() {
             d_inv_sqrt[i] = F::one() / row_sum.sqrt();
         }
     }
 
-    // S[i,j] = D_inv_sqrt[i] * W[i,j] * D_inv_sqrt[j].
-    let mut s = vec![F::zero(); n * n];
+    // graph[i,j] = D^{-1/2}[i] * W[i,j] * D^{-1/2}[j] for i != j; diagonal = 0.
+    let mut graph = vec![F::zero(); n * n];
     for i in 0..n {
         for j in 0..n {
-            s[i * n + j] = d_inv_sqrt[i] * w[i * n + j] * d_inv_sqrt[j];
+            if i == j {
+                continue;
+            }
+            graph[i * n + j] = d_inv_sqrt[i] * w[i * n + j] * d_inv_sqrt[j];
         }
     }
 
-    s
+    graph
 }
 
-/// Run the label spreading iterations.
-/// Update rule: F(t+1) = alpha * S * F(t) + (1 - alpha) * Y
+/// Run the label spreading iterations, mirroring `BaseLabelPropagation.fit`'s loop
+/// (`_label_propagation.py:294-330`) for `_variant == "spreading"`.
+///
+/// Iterates `label_distributions_ = alpha * (graph_matrix @ label_distributions_)
+/// + y_static` (`:316-320`) with NO per-iteration row-normalization and NO
+/// clamping (spreading lets labeled rows evolve, soft-clamped through
+/// `y_static = one-hot * (1 - alpha)`). Convergence is the L1 abs-sum against the
+/// PREVIOUS iterate, checked at the START of the loop
+/// (`np.abs(label_distributions_ - l_previous).sum() < tol`, `:301`). `n_iter_`
+/// is the loop counter at the break — or `max_iter` (the loop `else: n_iter_ += 1`,
+/// `:321-326`) if convergence was never reached. A single final row-normalization
+/// is applied after the loop (`:328-330`).
+///
+/// Returns `(label_distributions_, n_iter_)`. `graph_matrix` is the spreading graph
+/// (`fn spreading_graph`, row-major `n × n`); `initial_y` is the initial
+/// `label_distributions_` (labeled rows one-hot, unlabeled rows zero); `y_static`
+/// is the soft-clamp target (`one-hot * (1 - alpha)`, unlabeled zero).
 fn spread<F: Float>(
-    s_matrix: &[F],
+    graph_matrix: &[F],
     initial_y: &Array2<F>,
+    y_static: &Array2<F>,
     alpha: F,
     max_iter: usize,
     tol: F,
-) -> Array2<F> {
+) -> (Array2<F>, usize) {
     let n = initial_y.nrows();
     let n_classes = initial_y.ncols();
-    let one_minus_alpha = F::one() - alpha;
 
-    let mut f_current = initial_y.clone();
-    let mut f_next = Array2::zeros((n, n_classes));
+    // self.label_distributions_ (starts at the one-hot/zero init).
+    let mut ld = initial_y.clone();
+    // l_previous starts at zeros (sklearn `:294`).
+    let mut l_previous = Array2::<F>::zeros((n, n_classes));
+    let mut buf = Array2::<F>::zeros((n, n_classes));
 
-    for _ in 0..max_iter {
-        // f_next = alpha * S * f_current + (1 - alpha) * Y
+    let mut n_iter = max_iter;
+    let mut converged = false;
+
+    for it in 0..max_iter {
+        // Convergence check at loop START: |ld - l_previous|.sum() < tol (L1).
+        let mut diff = F::zero();
+        for i in 0..n {
+            for c in 0..n_classes {
+                diff = diff + (ld[[i, c]] - l_previous[[i, c]]).abs();
+            }
+        }
+        if diff < tol {
+            n_iter = it;
+            converged = true;
+            break;
+        }
+
+        // l_previous = ld; ld = alpha * (graph_matrix @ ld) + y_static.
+        l_previous.assign(&ld);
         for i in 0..n {
             for c in 0..n_classes {
                 let mut sum = F::zero();
                 for j in 0..n {
-                    sum = sum + s_matrix[i * n + j] * f_current[[j, c]];
+                    sum = sum + graph_matrix[i * n + j] * l_previous[[j, c]];
                 }
-                f_next[[i, c]] = alpha * sum + one_minus_alpha * initial_y[[i, c]];
+                buf[[i, c]] = alpha * sum + y_static[[i, c]];
             }
         }
+        std::mem::swap(&mut ld, &mut buf);
+        // NO per-iteration row-normalization, NO clamping (spreading variant).
+    }
 
-        // Normalize rows.
-        for i in 0..n {
-            let row_sum: F = (0..n_classes).fold(F::zero(), |acc, c| acc + f_next[[i, c]]);
-            if row_sum > F::zero() {
-                for c in 0..n_classes {
-                    f_next[[i, c]] = f_next[[i, c]] / row_sum;
-                }
-            }
-        }
+    // sklearn: `for self.n_iter_ in range(max_iter)` leaves `n_iter_ == max_iter - 1`
+    // on a no-break exit, then the loop `else:` does `self.n_iter_ += 1`
+    // (`_label_propagation.py:321-326`) → `n_iter_ == max_iter` exactly on
+    // non-convergence (#2183, same as LabelPropagation).
+    if !converged {
+        n_iter = max_iter;
+    }
 
-        // Check convergence.
-        let mut diff = F::zero();
-        for i in 0..n {
-            for c in 0..n_classes {
-                let d = f_next[[i, c]] - f_current[[i, c]];
-                diff = diff + d * d;
-            }
-        }
-
-        std::mem::swap(&mut f_current, &mut f_next);
-
-        if diff.sqrt() < tol {
-            break;
+    // Final single row-normalization (sklearn `:328-330`).
+    for i in 0..n {
+        let row_sum: F = (0..n_classes).fold(F::zero(), |acc, c| acc + ld[[i, c]]);
+        let denom = if row_sum == F::zero() {
+            F::one()
+        } else {
+            row_sum
+        };
+        for c in 0..n_classes {
+            ld[[i, c]] = ld[[i, c]] / denom;
         }
     }
 
-    f_current
+    (ld, n_iter)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -464,7 +634,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
             return Ok(FittedLabelSpreading {
                 labels_: Array1::zeros(0),
                 label_distributions_: Array2::zeros((0, 0)),
+                classes_: Vec::new(),
+                n_iter_: 0,
                 x_train_: x.clone(),
+                kernel_: self.kernel,
+                gamma_: self.gamma,
+                n_neighbors_: self.n_neighbors,
                 n_classes_: 0,
             });
         }
@@ -518,16 +693,23 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
         };
         let n_classes = classes_.len();
 
-        // Build the affinity matrix.
+        // Build the affinity matrix. The RBF self-affinity diagonal is `1`
+        // (`rbf_kernel(X,X)`, `:147`); the KNN graph is built per
+        // `build_knn_affinity`.
         let w = match self.kernel {
             LabelSpreadingKernel::Rbf => build_rbf_affinity(x, self.gamma),
             LabelSpreadingKernel::Knn => build_knn_affinity(x, self.n_neighbors),
         };
 
-        // Build the normalized Laplacian propagation matrix S.
-        let s = normalized_laplacian(&w, n_samples);
+        // Build the spreading graph matrix = `D^{-1/2} W D^{-1/2}` (degree `D`
+        // INCLUDES the diagonal self-affinity) with the diagonal forced to `0`
+        // (sklearn `_build_graph`, `csgraph_laplacian(normed=True)` then
+        // `-laplacian` then zero diagonal, `:609-623`).
+        let graph = spreading_graph(&w, n_samples);
 
-        // Build initial label distribution Y.
+        // Build the initial `label_distributions_`: zeros, then one-hot for
+        // labeled rows (sklearn `:282-284`). Unlabeled rows START AT ZERO (NOT
+        // uniform — the spreading iteration injects mass through `y_static`).
         let mut initial_y = Array2::from_elem((n_samples, n_classes), F::zero());
         for (i, &label) in y.iter().enumerate() {
             if label >= 0 {
@@ -537,17 +719,29 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
                 if c < n_classes {
                     initial_y[[i, c]] = F::one();
                 }
-            } else {
-                // Unlabeled: uniform distribution.
-                let uniform = F::one() / F::from(n_classes).unwrap_or_else(F::one);
-                for c in 0..n_classes {
-                    initial_y[[i, c]] = uniform;
-                }
             }
+            // Unlabeled rows remain zero (sklearn `:282`).
         }
 
-        // Run spreading.
-        let label_distributions = spread(&s, &initial_y, self.alpha, self.max_iter, self.tol);
+        // `y_static` for the SPREADING variant = the one-hot init scaled by
+        // `(1 - alpha)` (sklearn `y_static *= 1 - self.alpha`, `:290-292`).
+        // Unlabeled rows are zero (they were zero in `initial_y`), so they stay
+        // zero after scaling.
+        let one_minus_alpha = F::one() - self.alpha;
+        let mut y_static = initial_y.clone();
+        y_static.mapv_inplace(|v| v * one_minus_alpha);
+
+        // Run spreading (soft-clamp update `alpha*graph@F + y_static`, NO
+        // per-iteration normalization, L1-at-start convergence, final
+        // row-normalize). Returns (label_distributions_, n_iter_).
+        let (label_distributions, n_iter) = spread(
+            &graph,
+            &initial_y,
+            &y_static,
+            self.alpha,
+            self.max_iter,
+            self.tol,
+        );
 
         // Extract final labels (argmax of each row).
         let labels: Array1<isize> = Array1::from_vec(
@@ -571,7 +765,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelSp
         Ok(FittedLabelSpreading {
             labels_: labels,
             label_distributions_: label_distributions,
+            classes_,
+            n_iter_: n_iter,
             x_train_: x.clone(),
+            kernel_: self.kernel,
+            gamma_: self.gamma,
+            n_neighbors_: self.n_neighbors,
             n_classes_: n_classes,
         })
     }
@@ -581,45 +780,37 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedLabelSpreadi
     type Output = Array1<isize>;
     type Error = FerroError;
 
-    /// Predict labels for new data by finding the nearest training point
-    /// and returning its label.
+    /// Predict labels for new data by inductive inference, mirroring sklearn
+    /// `BaseLabelPropagation.predict` (`_label_propagation.py:173-191`):
+    /// `classes_[argmax(predict_proba(X), axis=1)]` — the per-row argmax of the
+    /// kernel-weighted probabilities, mapped THROUGH `classes_`.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the feature count does not match.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<isize>, FerroError> {
-        let n_features = x.ncols();
-        let expected_features = self.x_train_.ncols();
-
-        if n_features != expected_features {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![expected_features],
-                actual: vec![n_features],
-                context: "number of features must match the training data".into(),
-            });
-        }
-
-        let n_new = x.nrows();
-        let n_train = self.x_train_.nrows();
+        let probas = self.predict_proba(x)?;
+        let n_new = probas.nrows();
         let mut labels = Array1::zeros(n_new);
 
         for i in 0..n_new {
-            let ri = x.row(i);
-            let si = ri.as_slice().unwrap_or(&[]);
-            let mut best_j = 0;
-            let mut best_dist = F::max_value();
-
-            for j in 0..n_train {
-                let rj = self.x_train_.row(j);
-                let sj = rj.as_slice().unwrap_or(&[]);
-                let d = sq_euclidean(si, sj);
-                if d < best_dist {
-                    best_dist = d;
-                    best_j = j;
+            // argmax over classes; ties resolve to the first (lowest) index,
+            // matching numpy `np.argmax`.
+            let mut best_c = 0;
+            let mut best_v = if self.n_classes_ > 0 {
+                probas[[i, 0]]
+            } else {
+                F::zero()
+            };
+            for c in 1..self.n_classes_ {
+                if probas[[i, c]] > best_v {
+                    best_v = probas[[i, c]];
+                    best_c = c;
                 }
             }
-
-            labels[i] = self.labels_[best_j];
+            // Map the argmax column index through `classes_`
+            // (sklearn `classes_[argmax(...)]`, `:191`).
+            labels[i] = self.classes_.get(best_c).copied().unwrap_or(0);
         }
 
         Ok(labels)

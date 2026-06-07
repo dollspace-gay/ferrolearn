@@ -42,7 +42,6 @@ use ndarray::{Array1, Array2};
 ///
 /// Tracking: #2184.
 #[test]
-#[ignore = "divergence: predict_proba zero-row -> sklearn nan vs ferrolearn finite [0,0] (_label_propagation.py:229-230); tracking #2184"]
 fn divergence_predict_proba_zero_row_is_nan_not_finite() {
     // Same fixture the live oracle was run on (`line`, gamma=1, alpha=0.2).
     let x = Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 0.3, 0.0, 0.6, 0.0, 1.0, 0.0]).unwrap();
