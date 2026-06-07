@@ -47,7 +47,8 @@
 //! `file:line` (commit 156ef14); expected values from the live sklearn 1.5.2 oracle
 //! (R-CHAR-3). OPTICS is deterministic (no RNG) → value-parity is genuine. No PyO3
 //! binding — only consumer is the crate re-export. After fixing the traversal
-//! (#1080), `core_distances_`/`ordering_`/`reachability_` VALUE-match sklearn; the Xi
+//! (#1080), `core_distances_`/`ordering_`/`reachability_` VALUE-match sklearn, and
+//! `predecessor_` (the `-1`-sentinel int array, REQ-4) now value-matches too; the Xi
 //! `labels_`, `cluster_hierarchy_`, the dbscan method, and the parameter/attribute
 //! surface remain divergent.
 //!
@@ -56,7 +57,7 @@
 //! | REQ-1 (`core_distances_` VALUE) | SHIPPED | impl `fn core_distance` (distance to the `(min_samples-1)`-th other point within `max_eps`) value-matches sklearn `_compute_core_distances_` = `kneighbors(X,min_samples)[0][:,-1]` (`_optics.py:405-438`) even on hard fixtures. Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards: `green_core_distances_three_blobs`, `green_core_distances_small10_ms2/ms3` in `tests/divergence_optics.rs` (live-oracle). |
 //! | REQ-2 (`ordering_` traversal value-parity) | SHIPPED | impl `Fit::fit` now selects the next seed by LINEAR ARGMIN over all unprocessed reachability with smallest-index tie-break (single pool, no heap), matching sklearn `compute_optics_graph` (`_optics.py:638-659`, `:53` "we do not employ a heap"). The prior `BinaryHeap` traversal diverged on tie-prone data. Guard: `divergence_ordering_small10` (sklearn `[0,1,3,9,5,6,7,8,2,4]`; was `[…5,7,8,6…]`) + `green_ordering_three_blobs`/`green_ordering_docstring`. Fixed #1080. |
 //! | REQ-3 (`reachability_` VALUE) | SHIPPED | impl `fn update_seeds` computes `max(core_dist_p, dist)` then rounds via `fn round_to_precision` (`np.around(decimals=np.finfo(dtype).precision)`, round-ties-even = numpy rint, `_optics.py:711`); combined with the REQ-2 traversal the reported plot value-matches sklearn (the #1080 ordering parity on tie fixtures REQUIRES the matching rounded reachability at each argmin step). Guards: `green_reachability_docstring` + (noisy) the ordering parity which is driven by reachability. Fixed #1080 (bundled). |
-//! | REQ-4 (`predecessor_` `-1`-sentinel int array) | NOT-STARTED | open prereq blocker #1082. sklearn `predecessor_` is `ndarray[int]`, seeds `-1` (`_optics.py:558-560`); ferrolearn `predecessors()` returns `&[Option<usize>]` (seed `None`) — different output object (R-DEV-3). |
+//! | REQ-4 (`predecessor_` `-1`-sentinel int array) | SHIPPED | impl: `FittedOPTICS` stores `predecessor_: Array1<i64>` built in `Fit::fit` (`predecessors.iter().map(\|p\| p.map_or(-1, \|j\| j as i64))`), surfaced via accessor `fn predecessor() -> &Array1<i64>`. This is the `-1`-sentinel int array (shape `(n_samples,)`, indexed by original sample index) matching sklearn `predecessor_` "Seed points have a predecessor of -1" (`_optics.py:187-189`, `np.full(n_samples,-1,dtype=int)` `:604-605`, set on STRICT improvement `:712-714`). ferrolearn's `fn update_seeds` records the predecessor under the SAME strict `new_reach < reachability[q]` condition as sklearn's `improved = np.where(rdists < ...)` (`:712`), so the VALUES match too — verified element-wise (incl. the `-1` seed) vs the live oracle on `three_blobs` (`[-1,0,0,1,3,3,8,6,4]`), `small10` (tie-prone, `[-1,0,3,1,8,9,5,6,7,3]`), and the docstring fixture (`[-1,0,1,5,3,2]`). Internal `fn predecessors() -> &[Option<usize>]` kept (seed `None`) for the Xi extractor + back-compat. Consumer: crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards (live-oracle, R-CHAR-3): `green_predecessor_three_blobs`, `green_predecessor_small10`, `green_predecessor_docstring` in `tests/divergence_optics.rs`. **f32 caveat (#2195):** sklearn OPTICS ALWAYS computes the graph in float64 — `reachability_.dtype == float64` even for float32 input (it upcasts) — whereas ferrolearn computes generically in `F`, so on f32 a near-tie in the reachability plot can round to the opposite side, swapping `ordering_`/`reachability_` and hence `predecessor_` (e.g. `small10` f32 at indices 6/7/8). This is an OPTICS-WIDE f32 divergence (it equally affects the SHIPPED f64-only REQ-1/2/3), tracked as #2195 and pinned `#[ignore]` in `tests/divergence_optics_predecessor_f32.rs`; the f64 path is bit-exact. The future fix is to compute the OPTICS graph in f64 regardless of `F` (matching sklearn's upcast) — out of this single-file predecessor scope. |
 //! | REQ-5 (`labels_` Xi VALUE parity) | NOT-STARTED | open prereq blocker #1083. sklearn `labels_` via `cluster_optics_xi` (`:810-918`); ferrolearn diverges (gated on the in-Xi `min_cluster_size` REQ-7 + `cluster_hierarchy_` leaf-selection REQ-8). With REQ-2 fixed the plot now matches, but the Xi label derivation still differs. |
 //! | REQ-6 (`cluster_method='dbscan'` + `eps` + `cluster_optics_dbscan`) | NOT-STARTED | open prereq blocker #1084. sklearn `fit` branch (`:374-390`) + free fn (`:726-788`); ferrolearn Xi-only, no `cluster_method`/`eps`. |
 //! | REQ-7 (Xi `min_cluster_size` criterion 3.a) | NOT-STARTED | open prereq blocker #1085. sklearn enforces size INSIDE `_xi_cluster` (`:1155-1156`); ferrolearn post-filters in `fn filter_small_clusters` — different fixed point. |
@@ -173,6 +174,14 @@ pub struct FittedOPTICS<F> {
     /// `predecessors_[i] = Some(j)` means point `i` was reached from point `j`.
     /// The first point in each connected component has `None`.
     predecessors_: Vec<Option<usize>>,
+    /// sklearn-faithful `predecessor_`: a `-1`-sentinel integer array, indexed by
+    /// original sample index. `predecessor_[i] = j` (`>= 0`) means point `i` was
+    /// reached from point `j`; seed points have `-1`. Built from `predecessors_`
+    /// at fit time (`Some(j) -> j as i64`, `None -> -1`), mirroring
+    /// `predecessor_ = np.full(n_samples, -1, dtype=int)` then
+    /// `predecessor_[unproc[improved]] = point_index` in `compute_optics_graph`
+    /// (`sklearn/cluster/_optics.py:604-605`, `:714`).
+    predecessor_: Array1<i64>,
     /// The `min_samples` value used during fitting (needed for Xi extraction).
     min_samples_: usize,
 }
@@ -212,6 +221,24 @@ impl<F: Float> FittedOPTICS<F> {
     #[must_use]
     pub fn predecessors(&self) -> &[Option<usize>] {
         &self.predecessors_
+    }
+
+    /// Return the sklearn-faithful `predecessor_`: a `-1`-sentinel integer array
+    /// of shape `(n_samples,)`, indexed by original sample index.
+    ///
+    /// `predecessor()[i] = j` (`>= 0`) means point `i` was reached from point
+    /// `j` during the OPTICS ordering phase; seed points (the first point in
+    /// each connected component) have `predecessor()[i] = -1`.
+    ///
+    /// This mirrors scikit-learn's `OPTICS.predecessor_` — "Point that a sample
+    /// was reached from, indexed by object order. Seed points have a predecessor
+    /// of -1." (`sklearn/cluster/_optics.py:187-189`, built as
+    /// `np.full(n_samples, -1, dtype=int)` in `compute_optics_graph` `:604-605`,
+    /// `:714`). It is the `-1`-sentinel `Array1<i64>` counterpart of the internal
+    /// [`predecessors`](Self::predecessors) (`&[Option<usize>]`, seed `None`).
+    #[must_use]
+    pub fn predecessor(&self) -> &Array1<i64> {
+        &self.predecessor_
     }
 
     /// Return the number of clusters found (excluding noise).
@@ -886,12 +913,22 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
         let min_size = self.min_cluster_size.unwrap_or(self.min_samples);
         filter_small_clusters(&mut labels, min_size);
 
+        // Build the sklearn-faithful `-1`-sentinel `predecessor_` from the
+        // `Option<usize>` predecessors: `Some(j) -> j as i64`, `None -> -1`
+        // (mirroring `np.full(n_samples, -1, dtype=int)` then in-place updates,
+        // `sklearn/cluster/_optics.py:604-605`, `:714`).
+        let predecessor_: Array1<i64> = predecessors
+            .iter()
+            .map(|p| p.map_or(-1i64, |j| j as i64))
+            .collect();
+
         Ok(FittedOPTICS {
             ordering_: ordering,
             reachability_: reachability,
             core_distances_: core_distances,
             labels_: labels,
             predecessors_: predecessors,
+            predecessor_,
             min_samples_: self.min_samples,
         })
     }

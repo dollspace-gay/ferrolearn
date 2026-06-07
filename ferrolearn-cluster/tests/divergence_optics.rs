@@ -329,3 +329,111 @@ fn green_ordering_small10() {
          (sklearn/cluster/_optics.py:638-659,711); #1080"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GREEN-GUARD: REQ-4 `predecessor_` `-1`-sentinel int array VALUE parity (#1082).
+//
+// sklearn's `predecessor_` is `np.full(n_samples, -1, dtype=int)` then set on a
+// STRICT reachability improvement only — `improved = np.where(rdists < ...)` and
+// `predecessor_[unproc[improved]] = point_index` (`sklearn/cluster/_optics.py:712-714`),
+// indexed by ORIGINAL object order, seeds = -1 (`:187-189`, `:558-560`). ferrolearn's
+// `fn update_seeds` records the predecessor under the SAME strict
+// `new_reach < reachability[q]` condition, then `Fit::fit` maps `Some(j)->j`,
+// `None->-1` into the `Array1<i64>` surfaced by `FittedOPTICS::predecessor()`.
+// These guards assert element-wise integer parity (incl. the -1 seed sentinel)
+// against the live sklearn 1.5.2 oracle (R-CHAR-3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Green-guard: REQ-4. `OPTICS(min_samples=2).fit(three_blobs).predecessor_`
+/// value-matches sklearn's `-1`-sentinel int array
+/// (`sklearn/cluster/_optics.py:604-605,712-714`; seeds -1 `:187-189`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[0.,0.],[0.1,0.],[0.,0.1],[5.,5.],[5.1,5.],[5.,5.1],[10.,0.],[10.1,0.],[10.,0.1]]); \
+///     print(OPTICS(min_samples=2).fit(X).predecessor_.tolist())"
+///   -> [-1, 0, 0, 1, 3, 3, 8, 6, 4]   (exactly one -1: the single seed)
+#[test]
+fn green_predecessor_three_blobs() {
+    // LIVE sklearn 1.5.2 oracle (above), never copied from ferrolearn.
+    let sk_pred: [i64; 9] = [-1, 0, 0, 1, 3, 3, 8, 6, 4];
+    let fitted = OPTICS::<f64>::new(2).fit(&three_blobs(), &()).unwrap();
+    let pred = fitted.predecessor();
+    assert_eq!(pred.len(), 9, "predecessor_ must be shape (n_samples,)");
+    for (i, &sk) in sk_pred.iter().enumerate() {
+        assert_eq!(
+            pred[i], sk,
+            "predecessor_[{i}]: ferro={} sklearn={sk}",
+            pred[i]
+        );
+    }
+    // Seed-sentinel count matches sklearn (exactly one -1).
+    let n_neg1 = pred.iter().filter(|&&v| v == -1).count();
+    let sk_n_neg1 = sk_pred.iter().filter(|&&v| v == -1).count();
+    assert_eq!(n_neg1, sk_n_neg1, "count of -1 seeds must match sklearn");
+    assert_eq!(
+        n_neg1, 1,
+        "three_blobs has a single seed (one connected order)"
+    );
+    // The seed sentinel sits on the first point in the ordering.
+    let first = fitted.ordering()[0];
+    assert_eq!(pred[first], -1, "the first ordered point is the -1 seed");
+}
+
+/// Green-guard: REQ-4. `OPTICS(min_samples=2).fit(small10).predecessor_`
+/// value-matches sklearn on the TIE-PRONE fixture — the case where a `<=`
+/// (rather than strict `<`) improvement condition, or unconditional assignment,
+/// would diverge. The match confirms `fn update_seeds` uses the same strict
+/// `rdist < reachability_[i]` rule (`sklearn/cluster/_optics.py:712-714`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[2.1,0.3],[1.5,0.6],[0.5,-0.8],[0.9,0.2],[-1.9,-0.6],[-0.1,0.8],[-0.6,0.6],[-0.3,0.3],[-0.4,0.2],[0.7,0.8]]); \
+///     print(OPTICS(min_samples=2).fit(X).predecessor_.tolist())"
+///   -> [-1, 0, 3, 1, 8, 9, 5, 6, 7, 3]   (exactly one -1)
+#[test]
+fn green_predecessor_small10() {
+    // LIVE sklearn 1.5.2 oracle (above), never copied from ferrolearn.
+    let sk_pred: [i64; 10] = [-1, 0, 3, 1, 8, 9, 5, 6, 7, 3];
+    let fitted = OPTICS::<f64>::new(2).fit(&small10(), &()).unwrap();
+    let pred = fitted.predecessor();
+    assert_eq!(pred.len(), 10, "predecessor_ must be shape (n_samples,)");
+    for (i, &sk) in sk_pred.iter().enumerate() {
+        assert_eq!(
+            pred[i], sk,
+            "predecessor_[{i}]: ferro={} sklearn={sk} (tie-prone strict-improvement)",
+            pred[i]
+        );
+    }
+    let n_neg1 = pred.iter().filter(|&&v| v == -1).count();
+    assert_eq!(n_neg1, 1, "small10 has a single -1 seed (matches sklearn)");
+    let first = fitted.ordering()[0];
+    assert_eq!(pred[first], -1, "the first ordered point is the -1 seed");
+}
+
+/// Green-guard: REQ-4. `OPTICS(min_samples=2).fit(docstring).predecessor_`
+/// value-matches sklearn's docstring worked example
+/// (`sklearn/cluster/_optics.py:593-594` shows `predecessor array([-1,0,1,5,3,2])`).
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS; \
+///     X=np.array([[1.,2.],[2.,5.],[3.,6.],[8.,7.],[8.,8.],[7.,3.]]); \
+///     print(OPTICS(min_samples=2).fit(X).predecessor_.tolist())"
+///   -> [-1, 0, 1, 5, 3, 2]   (matches the `_optics.py:594` docstring exactly)
+#[test]
+fn green_predecessor_docstring() {
+    // LIVE sklearn 1.5.2 oracle (above) == the `_optics.py:594` docstring constant.
+    let sk_pred: [i64; 6] = [-1, 0, 1, 5, 3, 2];
+    let fitted = OPTICS::<f64>::new(2).fit(&docstring(), &()).unwrap();
+    let pred = fitted.predecessor();
+    assert_eq!(pred.len(), 6, "predecessor_ must be shape (n_samples,)");
+    for (i, &sk) in sk_pred.iter().enumerate() {
+        assert_eq!(
+            pred[i], sk,
+            "predecessor_[{i}]: ferro={} sklearn={sk}",
+            pred[i]
+        );
+    }
+    let n_neg1 = pred.iter().filter(|&&v| v == -1).count();
+    assert_eq!(n_neg1, 1, "docstring fixture has a single -1 seed");
+}
