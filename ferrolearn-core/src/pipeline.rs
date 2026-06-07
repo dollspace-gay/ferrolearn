@@ -101,6 +101,7 @@
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 
+use crate::dataset::check_consistent_length;
 use crate::error::FerroError;
 use crate::traits::{Fit, Predict};
 
@@ -366,10 +367,21 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for Pipeline<F>
     /// Each transformer is fit on the current data, then the data is
     /// transformed before being passed to the next step.
     ///
+    /// Before fitting any step, the pipeline validates that `x` and `y` have a
+    /// consistent number of samples via
+    /// [`check_consistent_length`](crate::dataset::check_consistent_length),
+    /// mirroring scikit-learn's `Pipeline.fit`, which runs every step through
+    /// input validation (`check_X_y` → `check_consistent_length`,
+    /// `sklearn/utils/validation.py:1320`) and rejects `X`/`y` with mismatched
+    /// `n_samples` before fitting (`sklearn/pipeline.py:406` `_fit`). A pipeline
+    /// therefore rejects inconsistent `X`/`y` up front rather than failing
+    /// inside a step's `fit_pipeline`.
+    ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if no estimator step was set.
-    /// Propagates any errors from individual step fitting or transforming.
+    /// Returns [`FerroError::InvalidParameter`] if no estimator step was set, or
+    /// [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`. Propagates any
+    /// errors from individual step fitting or transforming.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedPipeline<F>, FerroError> {
         if self.estimator.is_none() {
             return Err(FerroError::InvalidParameter {
@@ -377,6 +389,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for Pipeline<F>
                 reason: "pipeline must have a final estimator step".into(),
             });
         }
+
+        // sklearn validates X/y sample-count consistency before fitting any
+        // step (`check_consistent_length`, `sklearn/utils/validation.py:1320`).
+        check_consistent_length(x.nrows(), y.len())?;
 
         let mut current_x = x.clone();
         let mut fitted_transforms = Vec::with_capacity(self.transforms.len());
@@ -781,6 +797,46 @@ mod tests {
 
         assert!((preds[0] - 12.0).abs() < 1e-10);
         assert!((preds[1] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_pipeline_rejects_inconsistent_x_y() {
+        // sklearn's Pipeline.fit validates X/y consistency before fitting any
+        // step (check_consistent_length, validation.py:1320): a mismatched
+        // n_samples raises ValueError. Live oracle:
+        //   from sklearn.pipeline import Pipeline
+        //   from sklearn.preprocessing import StandardScaler
+        //   from sklearn.naive_bayes import GaussianNB; import numpy as np
+        //   p = Pipeline([("s", StandardScaler()), ("c", GaussianNB())])
+        //   try: p.fit(np.zeros((3,2)), np.zeros(4)); print("OK")
+        //   except ValueError: print("RAISE")          # -> RAISE
+        let pipeline = Pipeline::new()
+            .transform_step("doubler", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = Array2::<f64>::zeros((3, 2));
+        let y = Array1::from_vec(vec![0.0, 1.0]); // len 2 != 3 rows
+        let result = pipeline.fit(&x, &y);
+        assert!(matches!(result, Err(FerroError::ShapeMismatch { .. })));
+    }
+
+    #[test]
+    fn test_pipeline_accepts_consistent_x_y() -> Result<(), FerroError> {
+        // The guard must not reject well-formed X/y (live oracle: same Pipeline
+        // with matching shapes -> OK).
+        let pipeline = Pipeline::new()
+            .transform_step("doubler", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x =
+            Array2::from_shape_vec((2, 3), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).map_err(|e| {
+                FerroError::InvalidParameter {
+                    name: "x".into(),
+                    reason: e.to_string(),
+                }
+            })?;
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        assert_eq!(fitted.predict(&x)?.len(), 2);
+        Ok(())
     }
 
     #[test]

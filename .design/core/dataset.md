@@ -17,10 +17,12 @@ tabular data. It mirrors **only the shape slice** of scikit-learn's input
 validation: the helpers `_num_samples` (`sklearn/utils/validation.py:364`) and
 `_num_features` (`sklearn/utils/validation.py:311`), and the
 `n_features_in_` / sample-count concept that sklearn estimators expose via
-`sklearn/base.py`. It deliberately does **not** implement the rest of
-`validation.py` — `check_array`, `check_X_y`, `check_consistent_length`,
-`assert_all_finite`, or `column_or_1d`; those are NOT-STARTED at this unit and
-tracked by blocker #356.
+`sklearn/base.py`. It **also** carries the shape/finite/consistency/min-samples
+slice of `validation.py` as free functions — `assert_all_finite`,
+`check_consistent_length`, `column_or_1d`, `check_array`, and `check_x_y`
+(REQ-4) — whose dtype-coercion, sparse, `copy`/`force_writeable`, and
+`multi_output` sub-behaviors remain NOT-STARTED (single-dtype, dense,
+borrow-based Rust functions need no runtime dtype/writeability dance).
 
 ## Requirements
 
@@ -63,7 +65,7 @@ tracked by blocker #356.
 | REQ-1 (shape introspection) | SHIPPED | The `Dataset` trait (`pub trait Dataset in dataset.rs`) and its blanket `impl<F> Dataset for Array2<F> in dataset.rs` are oracle-correct (`n_samples` → `self.nrows()`, `n_features` → `self.ncols()`; live oracle `_num_samples(zeros(100,10)) == 100`, `_num_features == 10`), mirroring `_num_samples` (`validation.py:364`, dense path `return x.shape[0]` at `:388`) and `_num_features` (`validation.py:311`, dense path `return X.shape[1]` at `:346`). Cross-crate non-test production consumer: `impl Dataset for CsrMatrix in ferrolearn-sparse/src/csr.rs`. Per goal.md S5/R-DOC-5 the `Dataset` trait + its dense impl are grandfathered existing public boundary API with a real cross-crate consumer → SHIPPED (the prior NOT-STARTED was over-strict). |
 | REQ-2 (is_sparse) | SHIPPED | `is_sparse` returns `false` in `impl Dataset for Array2<F> in dataset.rs` and `true` in `impl<F> Dataset for CsrMatrix<F> in csr.rs` (`ferrolearn-sparse`). The dense/sparse split across the two grandfathered cross-crate impls is the production discrimination on storage format (R-SUBSTRATE-4 transitional substrate). Same S5/R-DOC-5 grandfathering as REQ-1. |
 | REQ-3 (ferray substrate) | SHIPPED | `impl<F> Dataset for ferray::aliases::Array2<F> in dataset.rs` (bound `F: ferray::Element`; `n_samples`/`n_features` via `self.shape()[0]`/`self.shape()[1]`, `is_sparse` → `false`), on ferray's array type whose `.shape() -> &[usize]`, per R-SUBSTRATE-1. `ferrolearn-core/Cargo.toml` declares `ferray = { workspace = true }` (umbrella crate, the `import numpy as np` parallel). `cargo build -p ferrolearn-core` compiles with ferray in the graph — the first real ferray integration in ferrolearn. The non-test production consumer of the new impl is the same cross-crate `impl Dataset for CsrMatrix in csr.rs` that satisfies REQ-1/REQ-2 (the trait it implements is now also implemented on the ferray substrate). |
-| REQ-4 (validation surface) | NOT-STARTED | open prereq blocker #356. `dataset.rs` implements only the shape slice. `check_array` (`validation.py:718`), `check_X_y` (`validation.py:1154`), `check_consistent_length` (`validation.py:436`), `assert_all_finite` (`validation.py:175`), and `column_or_1d` (`validation.py:1348`) have no counterpart in `ferrolearn-core`. |
+| REQ-4 (validation surface) | SHIPPED | `dataset.rs` adds the free fns `assert_all_finite` / `assert_all_finite_2d` (mirror `assert_all_finite`, `validation.py:175`), `check_consistent_length` (mirrors `validation.py:436`), `column_or_1d` / `column_or_1d_view` (mirror `validation.py:1348`), `check_array` / `check_array_default` (mirror the shape/finite/min-samples/min-features contract of `validation.py:718`), and `check_x_y` (mirrors `validation.py:1154`). Non-test production consumer: `check_consistent_length` is called by `Fit::fit for Pipeline in pipeline.rs`, which rejects mismatched `X`/`y` `n_samples` before fitting any step (mirroring `check_consistent_length`, `validation.py:1320`). Accept/reject parity is verified against the live sklearn 1.5.2 oracle by the `test_*_oracle_parity` tests in `dataset.rs` and the pipeline guard tests `test_pipeline_rejects_inconsistent_x_y` / `test_pipeline_accepts_consistent_x_y` in `pipeline.rs`. Sub-behaviors scoped out as NOT-STARTED (R-DEFER-2): dtype coercion / `dtype="numeric"` (`validation.py:986`), sparse `accept_sparse` (`validation.py:870`), `copy` / `force_writeable` (`validation.py:1071`), and `multi_output=True` y handling (`validation.py:1327`) — the Rust functions are single-dtype, dense, and borrow-based, so these numpy/CPython-era affordances have no Rust analog here. |
 
 ## Architecture
 
@@ -132,8 +134,19 @@ on fitted estimators; in ferrolearn that lives as inherent methods on the
   substrate (R-SUBSTRATE-4) until the broader migration; both substrates now
   satisfy the same `Dataset` contract.
 
-- **REQ-4 NOT-STARTED (validation surface absent).** The bulk of `validation.py`
-  is not translated. Tracked by blocker #356.
+- **REQ-4 SHIPPED (shape/finite/consistency/min-samples slice).** `dataset.rs`
+  adds `assert_all_finite` / `assert_all_finite_2d`, `check_consistent_length`,
+  `column_or_1d` / `column_or_1d_view`, `check_array` / `check_array_default`,
+  and `check_x_y` as total, `Result`-returning free functions (no panics,
+  R-CODE-2). The non-test production consumer is `Fit::fit for Pipeline in
+  pipeline.rs`, which calls `check_consistent_length(x.nrows(), y.len())` before
+  fitting any step — a `Pipeline` now rejects mismatched `X`/`y` up front,
+  mirroring sklearn's `check_consistent_length` (`validation.py:1320`). Each
+  function's accept/reject decision is pinned against the live sklearn 1.5.2
+  oracle. The dtype-coercion, sparse, `copy`/`force_writeable`, and
+  `multi_output` sub-behaviors are scoped out as NOT-STARTED sub-points
+  (R-DEFER-2): the Rust functions are single-dtype, dense, and borrow-based and
+  so do not need those numpy/CPython-era affordances.
 
 ## Verification
 
@@ -172,7 +185,11 @@ REQ state vs blockers:
   grandfathering correction.
 - REQ-3 → SHIPPED (blocker #355 closed): `ferrolearn-core` depends on `ferray`
   and `impl Dataset for ferray::aliases::Array2` exists in `dataset.rs`.
-- REQ-4 → NOT-STARTED, blocker #356: a validation module mirrors `check_array` /
-  `check_X_y` / `check_consistent_length` with sklearn-grounded divergence
-  tests (length-mismatch `ValueError`, non-finite rejection per
-  `assert_all_finite`).
+- REQ-4 → SHIPPED (blocker #356 closed): `dataset.rs` mirrors `check_array` /
+  `check_x_y` / `check_consistent_length` / `assert_all_finite` / `column_or_1d`
+  with sklearn-grounded accept/reject tests (length-mismatch `ShapeMismatch`,
+  non-finite rejection per `assert_all_finite`, 0-sample/0-feature rejection per
+  `ensure_min_samples`/`ensure_min_features`). The non-test consumer is the
+  pipeline `check_consistent_length` guard in `pipeline.rs`. Sub-behaviors
+  (dtype coercion, sparse, `copy`/`force_writeable`, `multi_output`) remain
+  NOT-STARTED per the REQ-status row.
