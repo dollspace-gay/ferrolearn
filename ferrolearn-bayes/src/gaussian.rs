@@ -714,12 +714,47 @@ impl<F: Float + ToPrimitive + FromPrimitive + Send + Sync + 'static> FittedPipel
         let preds = self.fitted.predict(x)?;
         Ok(preds.mapv(|i| self.classes_orig.get(i).copied().unwrap_or_else(F::nan)))
     }
+
+    /// Pipeline-level `predict_proba` delegation (sklearn
+    /// `Pipeline.predict_proba` → `self.steps[-1][1].predict_proba(Xt)`,
+    /// `naive_bayes.py` `_BaseNB.predict_proba`). The returned columns are
+    /// ordered by sorted class index, which equals sklearn's `classes_`
+    /// ordering (`np.unique(y)`, `naive_bayes.py:264`) — the same ordering
+    /// `predict_proba` uses. No label remap is needed: probabilities are keyed
+    /// by column position, not by the original label value.
+    fn predict_proba_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        self.fitted.predict_proba(x)
+    }
+
+    /// Pipeline-level `score` delegation (sklearn `Pipeline.score` →
+    /// `self.steps[-1][1].score(Xt, y)`, `pipeline.py:1004`). `GaussianNB.score`
+    /// is `ClassifierMixin.score` = mean accuracy `(predict(X) == y).mean()`.
+    /// The pipeline supplies the ORIGINAL float labels `y`; map each to its
+    /// class index (the same mapping `fit_pipeline` applied to the training
+    /// labels) before delegating to the index-typed
+    /// [`FittedGaussianNB::score`], so accuracy is computed against the right
+    /// classes.
+    fn score_pipeline(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError> {
+        // Labels unseen at fit time map to no index; sklearn would simply count
+        // them as mispredictions. Use an out-of-range sentinel index so the
+        // comparison in `score` treats them as incorrect (predictions are
+        // always in `0..n_classes`).
+        let n_classes = self.classes_orig.len();
+        let y_idx: Array1<usize> = y.mapv(|v| {
+            self.classes_orig
+                .iter()
+                .position(|&c| c == v)
+                .unwrap_or(n_classes)
+        });
+        self.fitted.score(x, &y_idx)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use approx::assert_relative_eq;
+    use ferrolearn_core::pipeline::{FittedPipelineTransformer, Pipeline, PipelineTransformer};
     use ndarray::array;
 
     fn make_2class_data() -> (Array2<f64>, Array1<usize>) {
@@ -1061,6 +1096,135 @@ mod tests {
     // sklearn `classes_ = np.unique(y)` (naive_bayes.py:264) and `predict`
     // returns `classes_[argmax(jll)]` — the ORIGINAL labels (naive_bayes.py:103),
     // NOT the `0..n_classes` indices. The pipeline adapter must do the same.
+    // ------------------------------------------------------------------
+    // REQ-3 of .design/core/pipeline.md (blocker #361): GaussianNB as the
+    // pipeline consumer of the new predict_proba_pipeline / score_pipeline
+    // delegations. A self-contained StandardScaler-equivalent transformer
+    // (population mean/std, ddof=0 — exactly sklearn StandardScaler) is fit in
+    // the pipeline, then the full pipeline's predict_proba / score / transform
+    // are compared against the LIVE sklearn 1.5.2 oracle (R-CHAR-3).
+    //
+    // Live oracle (run from /tmp, sklearn 1.5.2):
+    //   from sklearn.pipeline import Pipeline
+    //   from sklearn.preprocessing import StandardScaler
+    //   from sklearn.naive_bayes import GaussianNB
+    //   import numpy as np
+    //   X=[[1,2],[1.6,1.5],[2,2.6],[3,3.1],[3.4,2.8],[4,3.6]]; y=[0,0,0,1,1,1]
+    //   p=Pipeline([('s',StandardScaler()),('g',GaussianNB())]).fit(X,y)
+    //   Xt=[[1.5,2.0],[3.5,3.0],[2.5,2.7]]; yt=[0.,1.,0.]
+    //   p.predict_proba(Xt) ->
+    //     [[0.9999999718326265, 2.8167373661949353e-08],
+    //      [8.831441779372302e-07, 0.9999991168558221],
+    //      [0.3992908671216849, 0.6007091328783151]]
+    //   p.score(Xt, yt)   -> 0.6666666666666666   (predict -> [0,1,1])
+    //   StandardScaler().fit(X).transform(Xt) ->
+    //     [[-0.9520212239630653, -0.8690481892534817],
+    //      [ 0.9520212239630653,  0.579365459502321 ],
+    //      [ 0.0,                 0.14484136487558041]]
+
+    /// A StandardScaler-equivalent transformer for pipeline tests. `fit`
+    /// computes the per-feature population mean and std (ddof=0, exactly
+    /// `sklearn.preprocessing.StandardScaler`); `transform` maps
+    /// `(x - mean) / scale` with `scale = 1` where std is 0 (sklearn's
+    /// `_handle_zeros_in_scale`).
+    struct StdScaler;
+
+    struct FittedStdScaler {
+        mean: Vec<f64>,
+        scale: Vec<f64>,
+    }
+
+    impl PipelineTransformer<f64> for StdScaler {
+        fn fit_pipeline(
+            &self,
+            x: &Array2<f64>,
+            _y: &Array1<f64>,
+        ) -> Result<Box<dyn FittedPipelineTransformer<f64>>, FerroError> {
+            let n = x.nrows() as f64;
+            let ncols = x.ncols();
+            let mut mean = vec![0.0; ncols];
+            let mut scale = vec![1.0; ncols];
+            for j in 0..ncols {
+                let m = x.column(j).sum() / n;
+                mean[j] = m;
+                let var = x.column(j).iter().map(|&v| (v - m) * (v - m)).sum::<f64>() / n;
+                let s = var.sqrt();
+                // sklearn _handle_zeros_in_scale: scale 0 -> 1.
+                scale[j] = if s == 0.0 { 1.0 } else { s };
+            }
+            Ok(Box::new(FittedStdScaler { mean, scale }))
+        }
+    }
+
+    impl FittedPipelineTransformer<f64> for FittedStdScaler {
+        fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+            let mut out = x.clone();
+            for j in 0..x.ncols() {
+                let m = self.mean[j];
+                let s = self.scale[j];
+                for i in 0..x.nrows() {
+                    out[[i, j]] = (x[[i, j]] - m) / s;
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    #[test]
+    fn gaussian_pipeline_predict_proba_score_match_sklearn() -> Result<(), FerroError> {
+        let x = array![
+            [1.0, 2.0],
+            [1.6, 1.5],
+            [2.0, 2.6],
+            [3.0, 3.1],
+            [3.4, 2.8],
+            [4.0, 3.6]
+        ];
+        let y = array![0.0_f64, 0.0, 0.0, 1.0, 1.0, 1.0];
+
+        let pipeline = Pipeline::new()
+            .transform_step("scaler", Box::new(StdScaler))
+            .estimator_step("gnb", Box::new(GaussianNB::<f64>::new()));
+        let (fitted, _xt_train) = pipeline.fit_transform(&x, &y)?;
+
+        let x_test = array![[1.5, 2.0], [3.5, 3.0], [2.5, 2.7]];
+        let y_test = array![0.0_f64, 1.0, 0.0];
+
+        // --- transform: must equal StandardScaler().fit(X).transform(Xt). ---
+        let xt = fitted.transform(&x_test)?;
+        let expected_xt = [
+            [-0.9520212239630653, -0.8690481892534817],
+            [0.9520212239630653, 0.579365459502321],
+            [0.0, 0.14484136487558041],
+        ];
+        for i in 0..3 {
+            for j in 0..2 {
+                assert_relative_eq!(xt[[i, j]], expected_xt[i][j], epsilon = 1e-12);
+            }
+        }
+
+        // --- predict_proba: must match sklearn pipeline.predict_proba. ---
+        let proba = fitted.predict_proba(&x_test)?;
+        assert_eq!(proba.dim(), (3, 2));
+        let expected_proba = [
+            [0.9999999718326265, 2.8167373661949353e-08],
+            [8.831441779372302e-07, 0.9999991168558221],
+            [0.3992908671216849, 0.6007091328783151],
+        ];
+        for i in 0..3 {
+            for k in 0..2 {
+                assert_relative_eq!(proba[[i, k]], expected_proba[i][k], max_relative = 1e-9);
+            }
+            assert_relative_eq!(proba.row(i).sum(), 1.0, epsilon = 1e-12);
+        }
+
+        // --- score: must match sklearn pipeline.score (mean accuracy). ---
+        let s = fitted.score(&x_test, &y_test)?;
+        assert_relative_eq!(s, 0.6666666666666666, epsilon = 1e-12);
+
+        Ok(())
+    }
+
     #[test]
     fn gaussian_pipeline_preserves_original_float_labels() -> Result<(), FerroError> {
         // --- 2-class case with a negative label (-1, not collapsible to usize). ---

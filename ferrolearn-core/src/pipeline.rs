@@ -17,7 +17,7 @@
 //! |---|---|---|
 //! | REQ-1 (fit→transform chaining + final predict) | SHIPPED | `Fit for Pipeline` (fit each transformer, transform, fit final estimator) mirrors `Pipeline._fit` (`pipeline.py:406`); `Predict for FittedPipeline` mirrors `Pipeline.predict` (`pipeline.py:599`). Non-test consumers: `impl PipelineEstimator for GaussianNB in gaussian.rs`, `impl PipelineEstimator for BernoulliNB in bernoulli.rs`, `impl PipelineTransformer for KernelPCA in kernel_pca.rs`. (critic: fit-then-transform ≡ sklearn fused fit_transform to ≤1.1e-14 on KernelPCA.) |
 //! | REQ-2 (no-final-estimator rejected at fit) | SHIPPED | `Fit for Pipeline` returns `FerroError::InvalidParameter` when the estimator slot is unset; matches sklearn requiring a final predictor for `.predict` (`available_if` at `pipeline.py:549`). |
-//! | REQ-3 (fit_transform/transform/predict_proba/decision_function/score) | NOT-STARTED | blocker #361. `FittedPipeline` exposes only `predict`. |
+//! | REQ-3 (fit_transform/transform/predict_proba/decision_function/score) | SHIPPED | `Pipeline::fit_transform` (`Fit::fit` then `transform_through`) mirrors `Pipeline.fit_transform` (`pipeline.py:489`); `FittedPipeline::{transform, predict_proba, decision_function, score}` run the private `transform_through` loop (`pipeline.py:599-600`/`:719-720`/`:768-769`/`:999-1000`) then delegate to the final estimator. `predict_proba`/`decision_function`/`score` forward to the new default-`Err` trait methods `predict_proba_pipeline`/`decision_function_pipeline`/`score_pipeline` on `FittedPipelineEstimator` (the `available_if(_final_estimator_has(...))` analog, `pipeline.py:674`/`:731`/`:960`); `transform` returns the transformer-prefix output (sklearn raises `AttributeError` for a non-transformer-final `transform`, `:858`). Non-test consumer: `impl FittedPipelineEstimator for FittedGaussianNBPipeline in gaussian.rs` overrides `predict_proba_pipeline` (→ `predict_proba`) + `score_pipeline` (→ `score`). Live-oracle verification: `gaussian_pipeline_predict_proba_score_match_sklearn` (StandardScaler+GaussianNB pipeline matches sklearn `predict_proba`/`score`/`transform`) + core `test_pipeline_fit_transform_equals_transform`/`test_pipeline_predict_proba_and_score_override`/`test_pipeline_predict_proba_default_is_err`. |
 //! | REQ-4 (named_steps/get_params/set_params/__getitem__) | NOT-STARTED | blocker #362. Only `step_names()` exists. |
 //! | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | blocker #363. |
 //! | REQ-6 (fit_params / metadata routing) | NOT-STARTED | blocker #364. |
@@ -26,9 +26,12 @@
 //! | REQ-9 (ferray substrate) | NOT-STARTED | blocker #367 — data flow typed on `ndarray::{Array1,Array2}`; cascades (R-SUBSTRATE-4). |
 //!
 //! acto-critic verdict: NO DIVERGENCE FOUND in the implemented surface (chaining,
-//! y-threading, estimator-only predict all match the live sklearn oracle; the
-//! transformer-terminal-pipeline rejection is owned by the missing transform surface,
-//! #361). Two states only per goal.md R-DEFER-2.
+//! y-threading, estimator-only predict, and the REQ-3 apply methods
+//! — `fit_transform`/`transform`/`predict_proba`/`decision_function`/`score` —
+//! all match the live sklearn oracle; `transform` over a non-transformer-final
+//! pipeline returns the transformer-prefix output, the structural analog of
+//! sklearn's `available_if(_can_transform)` `AttributeError`). Two states only
+//! per goal.md R-DEFER-2.
 //!
 //! # Examples
 //!
@@ -156,6 +159,19 @@ pub trait PipelineEstimator<F: Float + Send + Sync + 'static>: Send + Sync {
 /// A fitted estimator step in a [`FittedPipeline`].
 ///
 /// Produces `Array1<F>` predictions from `Array2<F>` input.
+///
+/// The three delegating methods below — `predict_proba_pipeline`,
+/// `decision_function_pipeline`, `score_pipeline` — mirror the way sklearn's
+/// `Pipeline` forwards to the final estimator's `predict_proba` /
+/// `decision_function` / `score` (`sklearn/pipeline.py:675`, `:731`, `:961`).
+/// scikit-learn gates each pipeline method on the final estimator actually
+/// having the attribute via `available_if(_final_estimator_has(...))`
+/// (`sklearn/pipeline.py:674`, `:731`, `:960`); a final estimator that lacks
+/// the method raises `AttributeError`. ferrolearn cannot express
+/// `available_if` over a trait object, so each method ships a DEFAULT impl that
+/// returns [`FerroError::InvalidParameter`] (the closest analog of sklearn's
+/// `AttributeError`). A concrete estimator that DOES support the operation
+/// overrides the corresponding method.
 pub trait FittedPipelineEstimator<F: Float + Send + Sync + 'static>: Send + Sync {
     /// Generate predictions for the input data.
     ///
@@ -163,6 +179,67 @@ pub trait FittedPipelineEstimator<F: Float + Send + Sync + 'static>: Send + Sync
     ///
     /// Returns a [`FerroError`] if the input shape is incompatible.
     fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError>;
+
+    /// Class-probability estimates for the input data, shape
+    /// `(n_samples, n_classes)`.
+    ///
+    /// Mirrors the final-estimator delegation of `Pipeline.predict_proba`
+    /// (`sklearn/pipeline.py:721`: `self.steps[-1][1].predict_proba(Xt)`).
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`FerroError::InvalidParameter`] —
+    /// the analog of sklearn raising `AttributeError` when the final estimator
+    /// has no `predict_proba`. Estimators that support probability estimates
+    /// override this method.
+    fn predict_proba_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let _ = x;
+        Err(FerroError::InvalidParameter {
+            name: "predict_proba".into(),
+            reason: "the final estimator of this pipeline does not support predict_proba".into(),
+        })
+    }
+
+    /// Confidence scores (decision function) for the input data, shape
+    /// `(n_samples, n_classes)` (or `(n_samples,)` for binary, per the
+    /// estimator's contract).
+    ///
+    /// Mirrors the final-estimator delegation of `Pipeline.decision_function`
+    /// (`sklearn/pipeline.py:772`: `self.steps[-1][1].decision_function(Xt)`).
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`FerroError::InvalidParameter`] —
+    /// the analog of sklearn raising `AttributeError` when the final estimator
+    /// has no `decision_function`. Estimators that expose a decision function
+    /// override this method.
+    fn decision_function_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let _ = x;
+        Err(FerroError::InvalidParameter {
+            name: "decision_function".into(),
+            reason: "the final estimator of this pipeline does not support decision_function"
+                .into(),
+        })
+    }
+
+    /// Score the final estimator on `(x, y)`, returning a single scalar
+    /// (e.g. mean accuracy for a classifier, R² for a regressor).
+    ///
+    /// Mirrors the final-estimator delegation of `Pipeline.score`
+    /// (`sklearn/pipeline.py:1004`: `self.steps[-1][1].score(Xt, y)`).
+    ///
+    /// # Errors
+    ///
+    /// The default implementation returns [`FerroError::InvalidParameter`] —
+    /// the analog of sklearn raising `AttributeError` when the final estimator
+    /// has no `score`. Estimators that support scoring override this method.
+    fn score_pipeline(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError> {
+        let _ = (x, y);
+        Err(FerroError::InvalidParameter {
+            name: "score".into(),
+            reason: "the final estimator of this pipeline does not support score".into(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -241,6 +318,35 @@ impl<F: Float + Send + Sync + 'static> Pipeline<F> {
     #[must_use]
     pub fn step(self, name: &str, step: Box<dyn PipelineStep<F>>) -> Self {
         step.add_to_pipeline(self, name)
+    }
+
+    /// Fit the pipeline and return both the [`FittedPipeline`] and the data
+    /// after every transformer step has been applied.
+    ///
+    /// This mirrors `Pipeline.fit_transform` (`sklearn/pipeline.py:489-547`):
+    /// `Xt = self._fit(X, y)` fits each transformer on the running `Xt` and
+    /// applies it, then the result is the transformed data. sklearn ALSO calls
+    /// the final estimator's `fit_transform`/`fit().transform()` when the final
+    /// step is itself a transformer (`:540-547`); ferrolearn's final slot is a
+    /// non-transformer estimator, so — like its [`FittedPipeline::transform`] —
+    /// `fit_transform` returns the data after the transformer prefix, with the
+    /// estimator still fit (as in `fit`). The returned `Array2<F>` equals
+    /// [`FittedPipeline::transform`] applied to the same `x` (fit-then-transform
+    /// ≡ sklearn's fused `fit_transform`, established for REQ-1).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if no estimator step was set
+    /// (delegates to [`Fit::fit`]). Propagates any errors from individual step
+    /// fitting or transforming.
+    pub fn fit_transform(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<(FittedPipeline<F>, Array2<F>), FerroError> {
+        let fitted = self.fit(x, y)?;
+        let transformed = fitted.transform_through(x)?;
+        Ok((fitted, transformed))
     }
 }
 
@@ -326,6 +432,111 @@ impl<F: Float + Send + Sync + 'static> FittedPipeline<F> {
         names.push(&self.estimator.0);
         names
     }
+
+    /// Run `x` through every fitted transformer step in order, returning the
+    /// fully transformed data (the data the final estimator sees).
+    ///
+    /// This is the shared `for ...: Xt = transform.transform(Xt)` loop of
+    /// sklearn's `Pipeline.predict` / `predict_proba` / `decision_function` /
+    /// `score` (`sklearn/pipeline.py:599-600`, `:719-720`, `:768-769`,
+    /// `:999-1000`), which run the data through every non-final transformer
+    /// before delegating to the final estimator.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FerroError`] from an individual transformer step.
+    fn transform_through(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let mut current_x = x.clone();
+        for ts in &self.transforms {
+            current_x = ts.step.transform_pipeline(&current_x)?;
+        }
+        Ok(current_x)
+    }
+
+    /// Apply every fitted transformer step to `x`, returning the transformed
+    /// data without invoking the final estimator.
+    ///
+    /// This mirrors `Pipeline.transform` (`sklearn/pipeline.py:863-904`) for the
+    /// *transformer-final* case. sklearn gates `transform` on
+    /// `_can_transform` (`:858`): it is only available when the final step is
+    /// itself a transformer, in which case it runs the data through ALL steps
+    /// including the last (`for _, name, transform in self._iter(): Xt =
+    /// transform.transform(Xt)`). When the final step is a non-transformer
+    /// estimator (e.g. `GaussianNB`), sklearn raises `AttributeError`
+    /// (`'Pipeline' has no attribute 'transform'`, verified against the live
+    /// 1.5.2 oracle).
+    ///
+    /// ferrolearn's [`FittedPipeline`] structurally separates the transformer
+    /// steps from a single non-transformer estimator slot (the estimator is
+    /// reached via [`predict_pipeline`](FittedPipelineEstimator::predict_pipeline),
+    /// not `transform_pipeline`). Therefore `transform` applies exactly the
+    /// transformer steps and returns the data the final estimator would see —
+    /// equivalent to sklearn's transformer-final `transform` over the
+    /// transformer prefix. The estimator slot is never a transformer, so there
+    /// is no "transform the final step too" branch to mirror.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FerroError`] from a transformer step (e.g. a feature
+    /// count mismatch).
+    pub fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        self.transform_through(x)
+    }
+
+    /// Transform `x` through every fitted transformer step, then return the
+    /// final estimator's class-probability estimates, shape
+    /// `(n_samples, n_classes)`.
+    ///
+    /// Mirrors `Pipeline.predict_proba` (`sklearn/pipeline.py:716-721`): run the
+    /// data through every non-final transformer, then
+    /// `self.steps[-1][1].predict_proba(Xt)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transformer-step errors; returns [`FerroError::InvalidParameter`]
+    /// if the final estimator does not support `predict_proba` (sklearn's
+    /// `AttributeError` analog).
+    pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let xt = self.transform_through(x)?;
+        self.estimator.1.predict_proba_pipeline(&xt)
+    }
+
+    /// Transform `x` through every fitted transformer step, then return the
+    /// final estimator's decision-function scores.
+    ///
+    /// Mirrors `Pipeline.decision_function` (`sklearn/pipeline.py:767-774`): run
+    /// the data through every non-final transformer, then
+    /// `self.steps[-1][1].decision_function(Xt)`.
+    ///
+    /// # Errors
+    ///
+    /// Propagates transformer-step errors; returns [`FerroError::InvalidParameter`]
+    /// if the final estimator does not support `decision_function` (sklearn's
+    /// `AttributeError` analog).
+    pub fn decision_function(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let xt = self.transform_through(x)?;
+        self.estimator.1.decision_function_pipeline(&xt)
+    }
+
+    /// Transform `x` through every fitted transformer step, then return the
+    /// final estimator's score on `(Xt, y)` (e.g. mean accuracy for a
+    /// classifier).
+    ///
+    /// Mirrors `Pipeline.score` (`sklearn/pipeline.py:997-1004`): run the data
+    /// through every non-final transformer, then
+    /// `self.steps[-1][1].score(Xt, y)`. ferrolearn does not yet thread
+    /// `sample_weight` (sklearn's optional third argument, `:961`); that is part
+    /// of the metadata-routing surface (REQ-6, blocker #364).
+    ///
+    /// # Errors
+    ///
+    /// Propagates transformer-step errors; returns [`FerroError::InvalidParameter`]
+    /// if the final estimator does not support `score` (sklearn's
+    /// `AttributeError` analog).
+    pub fn score(&self, x: &Array2<F>, y: &Array1<F>) -> Result<F, FerroError> {
+        let xt = self.transform_through(x)?;
+        self.estimator.1.score_pipeline(&xt, y)
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedPipeline<F> {
@@ -339,12 +550,7 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedPipeline<F> 
     ///
     /// Propagates any errors from transformer or estimator steps.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
-        let mut current_x = x.clone();
-
-        for ts in &self.transforms {
-            current_x = ts.step.transform_pipeline(&current_x)?;
-        }
-
+        let current_x = self.transform_through(x)?;
         self.estimator.1.predict_pipeline(&current_x)
     }
 }
@@ -654,5 +860,149 @@ mod tests {
         assert_send_sync::<Pipeline<f32>>();
         assert_send_sync::<FittedPipeline<f64>>();
         assert_send_sync::<FittedPipeline<f32>>();
+    }
+
+    // -- REQ-3: fit_transform / transform / predict_proba / decision_function /
+    //    score ---------------------------------------------------------------
+
+    /// An estimator that overrides the probability/decision/score delegations,
+    /// proving the new default-Err trait methods can be overridden by a real
+    /// final estimator (mirrors how `GaussianNB` does so in `gaussian.rs`).
+    struct ProbaEstimator;
+
+    impl PipelineEstimator<f64> for ProbaEstimator {
+        fn fit_pipeline(
+            &self,
+            _x: &Array2<f64>,
+            _y: &Array1<f64>,
+        ) -> Result<Box<dyn FittedPipelineEstimator<f64>>, FerroError> {
+            Ok(Box::new(FittedProbaEstimator))
+        }
+    }
+
+    struct FittedProbaEstimator;
+
+    impl FittedPipelineEstimator<f64> for FittedProbaEstimator {
+        fn predict_pipeline(&self, x: &Array2<f64>) -> Result<Array1<f64>, FerroError> {
+            // Predict 1.0 when the row sum is positive, else 0.0.
+            Ok(Array1::from_iter(
+                x.rows()
+                    .into_iter()
+                    .map(|r| if r.sum() > 0.0 { 1.0 } else { 0.0 }),
+            ))
+        }
+
+        fn predict_proba_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+            // A deterministic two-column "probability" (sigmoid of row sum).
+            let mut out = Array2::<f64>::zeros((x.nrows(), 2));
+            for (i, r) in x.rows().into_iter().enumerate() {
+                let p1 = 1.0 / (1.0 + (-r.sum()).exp());
+                out[[i, 0]] = 1.0 - p1;
+                out[[i, 1]] = p1;
+            }
+            Ok(out)
+        }
+
+        fn score_pipeline(&self, x: &Array2<f64>, y: &Array1<f64>) -> Result<f64, FerroError> {
+            let preds = self.predict_pipeline(x)?;
+            let n = y.len();
+            if n == 0 {
+                return Ok(0.0);
+            }
+            let correct = preds
+                .iter()
+                .zip(y.iter())
+                .filter(|(p, t)| (**p - **t).abs() < 1e-12)
+                .count();
+            Ok(correct as f64 / n as f64)
+        }
+    }
+
+    #[test]
+    fn test_pipeline_fit_transform_equals_transform() -> Result<(), FerroError> {
+        // fit_transform must return exactly what FittedPipeline::transform
+        // returns on the same input (fit-then-transform ≡ fused fit_transform).
+        let pipeline = Pipeline::new()
+            .transform_step("double1", Box::new(DoublingTransformer))
+            .transform_step("double2", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+
+        let (fitted, xt) = pipeline.fit_transform(&x, &y)?;
+        // Two doublers quadruple the data.
+        let expected = x.mapv(|v| v * 4.0);
+        assert_eq!(xt, expected);
+        // transform() on the fitted pipeline matches fit_transform's output.
+        let xt2 = fitted.transform(&x)?;
+        assert_eq!(xt2, expected);
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_transform_applies_only_transformer_steps() -> Result<(), FerroError> {
+        // FittedPipeline::transform returns the data the estimator would see —
+        // i.e. only the transformer prefix is applied, not the estimator.
+        let pipeline = Pipeline::new()
+            .transform_step("doubler", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = ndarray::array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        let xt = fitted.transform(&x)?;
+        assert_eq!(xt, x.mapv(|v| v * 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_predict_proba_default_is_err() -> Result<(), FerroError> {
+        // SumEstimator does not override predict_proba_pipeline → the default
+        // Err (sklearn AttributeError analog) fires.
+        let pipeline = Pipeline::new()
+            .transform_step("doubler", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = ndarray::array![[1.0, 1.0]];
+        let y = Array1::from_vec(vec![0.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        assert!(matches!(
+            fitted.predict_proba(&x),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            fitted.decision_function(&x),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        assert!(matches!(
+            fitted.score(&x, &y),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_predict_proba_and_score_override() -> Result<(), FerroError> {
+        // ProbaEstimator overrides the delegations. The transformer doubles the
+        // data; the proba estimator sees the doubled rows.
+        let pipeline = Pipeline::new()
+            .transform_step("doubler", Box::new(DoublingTransformer))
+            .estimator_step("clf", Box::new(ProbaEstimator));
+        let x = ndarray::array![[1.0], [-2.0]];
+        let y = Array1::from_vec(vec![1.0, 0.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+
+        // Doubled rows: [2.0], [-4.0]. p1 = sigmoid(row sum).
+        let proba = fitted.predict_proba(&x)?;
+        assert_eq!(proba.dim(), (2, 2));
+        for i in 0..2 {
+            assert!((proba.row(i).sum() - 1.0).abs() < 1e-12);
+        }
+        let p1_row0 = 1.0 / (1.0 + (-2.0f64).exp());
+        assert!((proba[[0, 1]] - p1_row0).abs() < 1e-12);
+
+        // Both rows predicted correctly → score 1.0.
+        let s = fitted.score(&x, &y)?;
+        assert!((s - 1.0).abs() < 1e-12);
+        Ok(())
     }
 }
