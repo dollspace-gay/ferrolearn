@@ -155,18 +155,48 @@ class ARDRegression(_RegressorWrapper):
 
 
 class HuberRegressor(_RegressorWrapper):
+    """Huber regressor backed by Rust (#500/#501).
+
+    Mirrors ``sklearn.linear_model.HuberRegressor``
+    (``sklearn/linear_model/_huber.py:259-274``), including the keyword-only
+    ``warm_start`` parameter and the ``fit(X, y, sample_weight=None)`` signature.
+    On a warm-start refit the Rust binding reuses the previously fitted
+    ``(coef_, intercept_, scale_)`` as the optimizer seed (``_huber.py:308-309``);
+    because the Huber objective is convex the converged fit is unchanged and the
+    refit converges in fewer iterations. The fitted ``coef_``/``intercept_``/
+    ``scale_`` attributes are surfaced from the Rust fitted type.
+    """
+
     def __init__(self, *, epsilon=1.35, alpha=1e-4, max_iter=100, tol=1e-5,
-                 fit_intercept=True):
+                 warm_start=False, fit_intercept=True):
         self.epsilon = epsilon
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
+        self.warm_start = warm_start
         self.fit_intercept = fit_intercept
 
     def _make_rs(self):
         return _RsHuberRegressor(epsilon=self.epsilon, alpha=self.alpha,
                                  max_iter=self.max_iter, tol=self.tol,
-                                 fit_intercept=self.fit_intercept)
+                                 fit_intercept=self.fit_intercept,
+                                 warm_start=self.warm_start)
+
+    def fit(self, X, y, sample_weight=None):
+        # warm_start (sklearn `_huber.py:308`): reuse the prior `_rs` (which
+        # holds the previously fitted attributes) so the Rust core seeds the
+        # optimizer from them. Otherwise build a fresh handle (cold start).
+        if not (self.warm_start and hasattr(self, "_rs")):
+            self._rs = self._make_rs()
+        if sample_weight is None:
+            self._rs.fit(_f64(X), _f64(y))
+        else:
+            self._rs.fit(_f64(X), _f64(y), _f64(sample_weight))
+        self.n_features_in_ = X.shape[1]
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self.scale_ = self._rs.scale_
+        return self
 
 
 class QuantileRegressor(_RegressorWrapper):

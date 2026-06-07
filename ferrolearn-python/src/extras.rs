@@ -212,17 +212,136 @@ py_regressor!(
     }
 );
 
-py_regressor!(
-    RsHuberRegressor, "_RsHuberRegressor",
-    ferrolearn_linear::FittedHuberRegressor<f64>,
-    (epsilon: f64 = 1.35, alpha: f64 = 0.0001, max_iter: usize = 100,
-     tol: f64 = 1e-5, fit_intercept: bool = true),
-    {
-        ferrolearn_linear::HuberRegressor::<f64>::new()
-            .with_epsilon(epsilon).with_alpha(alpha).with_max_iter(max_iter)
-            .with_tol(tol).with_fit_intercept(fit_intercept)
+// HuberRegressor (#500/#501): hand-written pyclass (replacing the thin
+// `py_regressor!` invocation) so the binding can surface sklearn's `warm_start`
+// constructor param (`sklearn/linear_model/_huber.py:265`), the `sample_weight`
+// fit argument (`_huber.py:277`), and the fitted `coef_`/`intercept_`/`scale_`
+// attributes the warm-start refit reuses. The MATH lives in
+// `ferrolearn_linear::HuberRegressor` (`fit_with_sample_weight` +
+// `with_warm_start_state`); this is the thin marshalling shim and the
+// non-test production consumer of the new core API (R-DEFER-1).
+#[pyclass(name = "_RsHuberRegressor")]
+pub struct RsHuberRegressor {
+    epsilon: f64,
+    alpha: f64,
+    max_iter: usize,
+    tol: f64,
+    fit_intercept: bool,
+    warm_start: bool,
+    fitted: Option<ferrolearn_linear::FittedHuberRegressor<f64>>,
+}
+
+#[pymethods]
+impl RsHuberRegressor {
+    #[new]
+    #[pyo3(signature = (epsilon=1.35, alpha=0.0001, max_iter=100, tol=1e-5,
+                        fit_intercept=true, warm_start=false))]
+    fn new(
+        epsilon: f64,
+        alpha: f64,
+        max_iter: usize,
+        tol: f64,
+        fit_intercept: bool,
+        warm_start: bool,
+    ) -> Self {
+        Self {
+            epsilon,
+            alpha,
+            max_iter,
+            tol,
+            fit_intercept,
+            warm_start,
+            fitted: None,
+        }
     }
-);
+
+    // sklearn's `fit(X, y, sample_weight=None)` (`_huber.py:277`). When
+    // `warm_start` is set AND a prior fit exists, the previously fitted
+    // `(coef_, intercept_, scale_)` seed the optimizer (sklearn `_huber.py:308`
+    // `if self.warm_start and hasattr(self, "coef_")`) — the R-DEV-4 stand-in
+    // is `with_warm_start_state`, fed from `self.fitted`.
+    #[pyo3(signature = (x, y, sample_weight=None))]
+    fn fit(
+        &mut self,
+        x: PyReadonlyArray2<'_, f64>,
+        y: PyReadonlyArray1<'_, f64>,
+        sample_weight: Option<PyReadonlyArray1<'_, f64>>,
+    ) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+
+        let mut model = ferrolearn_linear::HuberRegressor::<f64>::new()
+            .with_epsilon(self.epsilon)
+            .with_alpha(self.alpha)
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_fit_intercept(self.fit_intercept)
+            .with_warm_start(self.warm_start);
+
+        if self.warm_start
+            && let Some(prev) = &self.fitted
+        {
+            use ferrolearn_core::introspection::HasCoefficients;
+            model = model.with_warm_start_state(
+                prev.coefficients().to_owned(),
+                prev.intercept(),
+                prev.scale(),
+            );
+        }
+
+        let sw = sample_weight.as_ref().map(|w| numpy1_to_ndarray(w.clone()));
+        let fitted = model
+            .fit_with_sample_weight(&x_nd, &y_nd, sw.as_ref())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+    }
+
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.intercept())
+    }
+
+    #[getter]
+    fn scale_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.scale())
+    }
+}
 
 py_regressor!(
     RsQuantileRegressor, "_RsQuantileRegressor",

@@ -35,7 +35,6 @@ use ndarray::{Array1, Array2};
 ///
 /// Tracking: #2159
 #[test]
-#[ignore = "divergence: HuberRegressor rejects negative sample_weight sklearn accepts; tracking #2159"]
 fn divergence_huber_negative_sample_weight_accepted_by_sklearn() {
     // Live sklearn 1.5.2 oracle (generated via
     //   HuberRegressor(alpha=1e-4, epsilon=1.35, max_iter=200, tol=1e-5)

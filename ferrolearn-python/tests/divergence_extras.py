@@ -731,3 +731,75 @@ def test_knr_pickle_roundtrip_preserves_distance_predictions():
     restored = pickle.loads(pickle.dumps(reg))
     after = np.asarray(restored.predict(_XKNR_TEST))
     np.testing.assert_allclose(after, before, rtol=1e-12, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# HuberRegressor: sample_weight (#501) + warm_start (#500)
+# ---------------------------------------------------------------------------
+
+from sklearn.linear_model import HuberRegressor as SkHuberRegressor
+
+
+def _huber_outlier_data():
+    rng = np.random.RandomState(0)
+    X = rng.randn(50, 3)
+    y = X @ np.array([1.0, 2.0, -1.0]) + 0.1 * rng.randn(50)
+    y[:5] += 20
+    return X, y
+
+
+def test_huber_sample_weight_matches_sklearn():
+    """REQ-11 (#501): `fl.HuberRegressor().fit(X, y, sample_weight=w)` reproduces
+    sklearn's weighted `coef_`/`intercept_`/`scale_`. Oracle computed live in the
+    SAME test (R-CHAR-3)."""
+    X, y = _huber_outlier_data()
+    rng = np.random.RandomState(42)
+    w = np.abs(rng.randn(len(y))) + 0.5
+
+    sk = SkHuberRegressor().fit(X, y, sample_weight=w)
+    fr = fl.HuberRegressor().fit(X, y, sample_weight=w)
+
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.coef_, atol=1e-3)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-3
+    assert abs(fr.scale_ - sk.scale_) < 1e-3
+
+
+def test_huber_sample_weight_none_equals_default():
+    """REQ-11: `sample_weight=None` is byte-identical to the unweighted fit."""
+    X, y = _huber_outlier_data()
+    a = fl.HuberRegressor().fit(X, y)
+    b = fl.HuberRegressor().fit(X, y, sample_weight=None)
+    np.testing.assert_array_equal(np.asarray(a.coef_), np.asarray(b.coef_))
+    assert a.intercept_ == b.intercept_
+    assert a.scale_ == b.scale_
+
+
+def test_huber_warm_start_same_optimum_matches_sklearn():
+    """REQ-10 (#500): a `warm_start=True` refit reaches the SAME optimum as the
+    cold fit (Huber is convex), matching the live sklearn oracle. sklearn's
+    warm refit drops `n_iter_` from 15 to 1; we assert the fitted attributes are
+    unchanged and still match sklearn (the value contract, R-DEV-7)."""
+    X, y = _huber_outlier_data()
+
+    sk = SkHuberRegressor(warm_start=True)
+    sk.fit(X, y)
+    sk.fit(X, y)  # warm refit
+
+    fr = fl.HuberRegressor(warm_start=True)
+    fr.fit(X, y)
+    cold_coef = np.asarray(fr.coef_).copy()
+    fr.fit(X, y)  # warm refit reuses the prior fit's coef_/intercept_/scale_
+
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.coef_, atol=1e-3)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-3
+    assert abs(fr.scale_ - sk.scale_) < 1e-3
+    # Convex unique minimum: warm refit unchanged from cold.
+    np.testing.assert_allclose(np.asarray(fr.coef_), cold_coef, atol=1e-3)
+
+
+def test_huber_warm_start_keyword_only_like_sklearn():
+    """REQ-10 (R-DEV-2): `warm_start` is keyword-only, matching sklearn's
+    `def __init__(self, *, ..., warm_start=False, ...)` (`_huber.py:259-268`)."""
+    sig = inspect.signature(fl.HuberRegressor.__init__)
+    assert sig.parameters["warm_start"].kind == inspect.Parameter.KEYWORD_ONLY
+    assert sig.parameters["warm_start"].default is False

@@ -56,8 +56,28 @@
 //! - REQ-6 (predict): SHIPPED — `Predict` returns `X·coef + intercept`.
 //! - REQ-7 (fit_intercept / HasCoefficients): SHIPPED.
 //! - REQ-8 (scale_ attribute): SHIPPED — `scale()` accessor.
-//! - REQ-9 (n_iter_), REQ-10 (warm_start), REQ-11 (sample_weight),
-//!   REQ-12 (ferray substrate): NOT-STARTED (blockers #499, #500, #501, #502).
+//! - REQ-9 (n_iter_): NOT-STARTED (blocker #499) — the actual solver iteration
+//!   count lives in `crate::optim::lbfgs::LbfgsOptimizer` (its `minimize`
+//!   returns only the final parameter vector, not `opt_res.nit`); surfacing it
+//!   requires a non-breaking reporting overload in `optim/lbfgs.rs`, which is
+//!   OUTSIDE this unit's file manifest (escalated for manifest expansion).
+//! - REQ-10 (warm_start): SHIPPED — `pub warm_start: bool` +
+//!   `pub warm_start_state: Option<(coef, intercept, scale)>` with
+//!   `with_warm_start`/`with_warm_start_state`; when set, `fit_with_sample_weight`
+//!   seeds the L-BFGS from the prior `(coef, intercept, scale)` instead of the
+//!   IRLS cold start (sklearn `_huber.py:308-309`), the R-DEV-4 stand-in for
+//!   sklearn's reused mutable `self.coef_`. The convex objective's unique minimum
+//!   is unchanged; a warm refit converges in FEWER iterations. Consumer:
+//!   `ferrolearn-python` `RsHuberRegressor` (`warm_start` ctor param +
+//!   `coef_`/`intercept_`/`scale_` getters reused by `_extras.py::HuberRegressor`).
+//! - REQ-11 (sample_weight): SHIPPED — `fit_with_sample_weight(x, y,
+//!   sample_weight: Option<&Array1<F>>)` threads per-sample weights into
+//!   `huber_loss_and_gradient` (each contribution × `w[i]`, `n_samples = Σ w`,
+//!   sklearn `_huber.py:18`/`:59`/`:77-80`); `Fit::fit` delegates with `None`
+//!   (byte-identical to the old path). Consumer: `RsHuberRegressor::fit(x, y,
+//!   sample_weight=None)` → `_extras.py::HuberRegressor.fit(X, y,
+//!   sample_weight=None)`.
+//! - REQ-12 (ferray substrate): NOT-STARTED (blocker #502).
 //!
 //! # Examples
 //!
@@ -281,6 +301,32 @@ pub struct HuberRegressor<F> {
     pub tol: F,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
+    /// When `true`, initialize the joint optimization from a prior solution
+    /// (`coef_init`/`intercept_init`/`scale_init`) instead of the cold IRLS
+    /// warm start.
+    ///
+    /// Mirrors sklearn `HuberRegressor(warm_start=False)`
+    /// (`sklearn/linear_model/_huber.py:265`), which "reuse[s] the stored
+    /// attributes of a previously used model" — `self.coef_`, `self.intercept_`
+    /// and `self.scale_` become the optimizer's start vector
+    /// (`_huber.py:308-309`: `parameters = np.concatenate((self.coef_,
+    /// [self.intercept_, self.scale_]))`).
+    ///
+    /// R-DEV-4 adaptation: ferrolearn estimators are immutable value types —
+    /// there is no mutable `self.coef_`/`scale_` carried across repeated
+    /// `.fit()` calls — so the prior solution is supplied EXPLICITLY through
+    /// [`HuberRegressor::warm_start_state`] (mirroring `lasso.rs`/`elastic_net.rs`
+    /// `coef_init`). The Huber objective is convex with a unique minimum, so the
+    /// converged fit is unchanged; only the path (and iteration count) changes.
+    pub warm_start: bool,
+    /// Explicit warm-start seed `(coef, intercept, scale)` used when
+    /// [`HuberRegressor::warm_start`] is `true` (the R-DEV-4 stand-in for
+    /// sklearn's reused `self.coef_`/`self.intercept_`/`self.scale_`).
+    ///
+    /// `None` (the default) — or `warm_start == false` — uses the IRLS cold
+    /// start, the byte-identical pre-`warm_start` path. When `Some`, the coef
+    /// length must equal `n_features` and the scale must be strictly positive.
+    pub warm_start_state: Option<(Array1<F>, F, F)>,
 }
 
 impl<F: Float + FromPrimitive> HuberRegressor<F> {
@@ -297,6 +343,8 @@ impl<F: Float + FromPrimitive> HuberRegressor<F> {
             max_iter: 100,
             tol: cast(1e-5),
             fit_intercept: true,
+            warm_start: false,
+            warm_start_state: None,
         }
     }
 
@@ -336,6 +384,35 @@ impl<F: Float + FromPrimitive> HuberRegressor<F> {
         self.fit_intercept = fit_intercept;
         self
     }
+
+    /// Enable or disable `warm_start`.
+    ///
+    /// Mirrors `sklearn.linear_model.HuberRegressor(warm_start=...)`
+    /// (`sklearn/linear_model/_huber.py:265`). When `true` AND a
+    /// [`HuberRegressor::warm_start_state`] is supplied, the joint optimization
+    /// is seeded from that prior `(coef, intercept, scale)` instead of the IRLS
+    /// cold start; `warm_start` alone (no state) is a no-op falling back to the
+    /// cold path.
+    #[must_use]
+    pub fn with_warm_start(mut self, warm_start: bool) -> Self {
+        self.warm_start = warm_start;
+        self
+    }
+
+    /// Supply the explicit warm-start seed `(coef, intercept, scale)` reused
+    /// when [`HuberRegressor::warm_start`] is `true`.
+    ///
+    /// This is the R-DEV-4 stand-in for sklearn's reused mutable
+    /// `self.coef_`/`self.intercept_`/`self.scale_` (`_huber.py:308-309`):
+    /// because ferrolearn estimators are immutable value types, the prior fit's
+    /// attributes are threaded in explicitly (mirroring `lasso.rs`/
+    /// `elastic_net.rs` `with_coef_init`). The coef length must equal
+    /// `n_features` and the scale must be `> 0`.
+    #[must_use]
+    pub fn with_warm_start_state(mut self, coef: Array1<F>, intercept: F, scale: F) -> Self {
+        self.warm_start_state = Some((coef, intercept, scale));
+        self
+    }
 }
 
 impl<F: Float + FromPrimitive> Default for HuberRegressor<F> {
@@ -369,12 +446,17 @@ pub struct FittedHuberRegressor<F> {
 /// gradient is multiplied by `sigma` (chain rule) so the caller optimizes the
 /// unconstrained `log_sigma`, keeping `sigma > 0` without bounds.
 ///
-/// `n_samples` is the unweighted sample count (sklearn's
-/// `n_samples = np.sum(sample_weight)` with unit weights).
+/// `sample_weight` is the per-sample weight vector (sklearn's `sample_weight`,
+/// `sklearn/linear_model/_huber.py:18`). `n_samples = Σ sample_weight` (sklearn
+/// `_huber.py:59` `n_samples = np.sum(sample_weight)`), and every per-sample
+/// loss/gradient contribution is multiplied by that sample's weight
+/// (`_huber.py:77-80`, `:87-88`, `:107`, `:120-121`). With unit weights this is
+/// byte-identical to the unweighted objective.
 fn huber_loss_and_gradient<F: Float + FromPrimitive + ScalarOperand + 'static>(
     params: &Array1<F>,
     x: &Array2<F>,
     y: &Array1<F>,
+    sample_weight: &Array1<F>,
     epsilon: F,
     alpha: F,
     fit_intercept: bool,
@@ -419,29 +501,34 @@ fn huber_loss_and_gradient<F: Float + FromPrimitive + ScalarOperand + 'static>(
     let mut sum_inlier_r = F::zero(); // Σ_inlier r  (for intercept grad)
     let mut sum_signed_outliers = F::zero(); // Σ_outlier sign(r)
 
+    let mut n_sw = F::zero(); // Σ sample_weight  (sklearn `n_samples`, :59)
     for i in 0..n_samples {
+        let sw = sample_weight[i];
+        n_sw = n_sw + sw;
         let r = linear_loss[i];
         let abs_r = r.abs();
         let xi = x.row(i);
         if abs_r > threshold {
             // Outlier: linear loss.   (sklearn `_huber.py:69-82`, :102-108)
+            // Every contribution is weighted by `sw` (`:77-80`, `:107`).
             let sign = if r < F::zero() { -F::one() } else { F::one() };
-            // grad[:n_features] -= 2·epsilon·sign · X[i]
+            // grad[:n_features] -= 2·epsilon·(sw·sign) · X[i]
             for k in 0..n_features {
-                grad[k] = grad[k] - two * epsilon * sign * xi[k];
+                grad[k] = grad[k] - two * epsilon * sw * sign * xi[k];
             }
-            outlier_abs_sum = outlier_abs_sum + abs_r;
-            num_outliers = num_outliers + F::one();
-            sum_signed_outliers = sum_signed_outliers + sign;
+            outlier_abs_sum = outlier_abs_sum + sw * abs_r;
+            num_outliers = num_outliers + sw;
+            sum_signed_outliers = sum_signed_outliers + sw * sign;
         } else {
             // Inlier: quadratic loss.  (sklearn `_huber.py:84-100`)
-            // grad[:n_features] += (2/sigma)·(-r)·X[i] = -(2/sigma)·r·X[i]
-            let g = -(two / sigma) * r;
+            // weighted_non_outliers = sw·r; grad += (2/sigma)·(-sw·r)·X[i].
+            let wr = sw * r;
+            let g = -(two / sigma) * wr;
             for k in 0..n_features {
                 grad[k] = grad[k] + g * xi[k];
             }
-            squared_loss = squared_loss + r * r;
-            sum_inlier_r = sum_inlier_r + r;
+            squared_loss = squared_loss + wr * r;
+            sum_inlier_r = sum_inlier_r + wr;
         }
     }
 
@@ -451,7 +538,9 @@ fn huber_loss_and_gradient<F: Float + FromPrimitive + ScalarOperand + 'static>(
         grad[k] = grad[k] + two * alpha * coef[k];
     }
 
-    let n = cast::<F>(n_samples as f64);
+    // sklearn's `n_samples` is `np.sum(sample_weight)` (`_huber.py:59`), NOT the
+    // raw sample count — under unit weights the two coincide.
+    let n = n_sw;
 
     // Gradient due to sigma (sklearn `_huber.py:114-116`):
     //   grad_sigma = n - num_outliers·epsilon² - (squared_loss / sigma) / sigma
@@ -508,6 +597,43 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::NumericalInstability`] / [`FerroError::ConvergenceFailure`]
     ///   — optimizer failure.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedHuberRegressor<F>, FerroError> {
+        // Unit weights: byte-identical to the pre-`sample_weight` cold path.
+        self.fit_with_sample_weight(x, y, None)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> HuberRegressor<F> {
+    /// Fit the Huber Regressor with optional per-sample weights, mirroring
+    /// `sklearn.linear_model.HuberRegressor.fit(X, y, sample_weight=None)`
+    /// (`sklearn/linear_model/_huber.py:277`, `:306`).
+    ///
+    /// `sample_weight = None` is byte-identical to [`Fit::fit`] (unit weights,
+    /// sklearn `_check_sample_weight` returns `np.ones(n_samples)`,
+    /// `_huber.py:306`). When `Some(w)`, each sample's loss/gradient contribution
+    /// is multiplied by `w[i]` and `n_samples = Σ w` inside
+    /// [`huber_loss_and_gradient`] (sklearn `_huber.py:18`, `:59`, `:77-80`).
+    ///
+    /// When [`HuberRegressor::warm_start`] is `true` and a
+    /// [`HuberRegressor::warm_start_state`] is present, the joint optimization is
+    /// seeded from that prior `(coef, intercept, scale)` rather than the IRLS
+    /// cold start (sklearn `_huber.py:308-309`); the convex objective's unique
+    /// minimum is unchanged, only the path (and iteration count) shortens.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::ShapeMismatch`] — `y` / `sample_weight` / warm-start coef
+    ///   length mismatch.
+    /// - [`FerroError::InvalidParameter`] — `epsilon <= 1.0`, negative `alpha`,
+    ///   a negative weight, or a non-positive warm-start scale.
+    /// - [`FerroError::InsufficientSamples`] — zero samples.
+    /// - [`FerroError::NumericalInstability`] / [`FerroError::ConvergenceFailure`]
+    ///   — optimizer failure.
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<FittedHuberRegressor<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -540,6 +666,28 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
+        // Materialize sample weights: `None` -> unit weights, mirroring sklearn
+        // `_check_sample_weight(None, X) == np.ones(n_samples)`
+        // (`sklearn/linear_model/_huber.py:306`).
+        let weights: Array1<F> = match sample_weight {
+            None => Array1::<F>::ones(n_samples),
+            Some(w) => {
+                if w.len() != n_samples {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n_samples],
+                        actual: vec![w.len()],
+                        context: "sample_weight length must match number of samples in X".into(),
+                    });
+                }
+                // No non-negativity constraint: sklearn 1.5.2's `HuberRegressor.fit`
+                // runs `sample_weight` through `_check_sample_weight`
+                // (`sklearn/linear_model/_huber.py:306`), which validates length/dtype
+                // but NOT sign — negative weights flow straight into
+                // `_huber_loss_and_gradient` and the fit converges (#2159).
+                w.clone()
+            }
+        };
+
         // Parameter layout: [coef (n_features), intercept (if fit_intercept),
         // log_sigma]. sklearn inits coef/intercept to 0 and `sigma` to 1
         // (`sklearn/linear_model/_huber.py:311-317`) and relies on the bounded
@@ -554,7 +702,39 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // (R-DEV-7); on a singular solve we fall back to sklearn's origin.
         let n_params = n_features + usize::from(self.fit_intercept) + 1;
         let mut x0 = Array1::<F>::zeros(n_params);
-        if let Some((coef0, intercept0, sigma0)) =
+
+        // warm_start (REQ-10): if enabled with an explicit prior solution, seed
+        // the optimizer from it directly (sklearn `_huber.py:308-309`
+        // `parameters = np.concatenate((self.coef_, [self.intercept_,
+        // self.scale_]))`). The R-DEV-4 stand-in for sklearn's reused mutable
+        // `self.coef_`. Otherwise fall back to the IRLS cold start.
+        let warm = if self.warm_start {
+            self.warm_start_state.as_ref()
+        } else {
+            None
+        };
+        if let Some((coef0, intercept0, scale0)) = warm {
+            if coef0.len() != n_features {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![n_features],
+                    actual: vec![coef0.len()],
+                    context: "warm_start coef length must equal number of features".into(),
+                });
+            }
+            if *scale0 <= F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "warm_start_state.scale".into(),
+                    reason: "scale must be strictly positive".into(),
+                });
+            }
+            for k in 0..n_features {
+                x0[k] = coef0[k];
+            }
+            if self.fit_intercept {
+                x0[n_features] = *intercept0;
+            }
+            x0[n_params - 1] = scale0.ln();
+        } else if let Some((coef0, intercept0, sigma0)) =
             irls_warm_start(x, y, self.epsilon, self.fit_intercept)
         {
             for k in 0..n_features {
@@ -581,7 +761,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let optimizer = LbfgsOptimizer::<F>::new(self.max_iter, self.tol);
         let params = optimizer.minimize(
-            |p| huber_loss_and_gradient(p, x, y, epsilon, alpha, fit_intercept),
+            |p| huber_loss_and_gradient(p, x, y, &weights, epsilon, alpha, fit_intercept),
             x0,
         )?;
 
