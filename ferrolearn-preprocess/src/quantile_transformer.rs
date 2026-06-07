@@ -22,7 +22,7 @@
 //! | REQ-5 error/parameter contracts (scoped) | SHIPPED | `fit`/`transform` guards; sklearn `_data.py:2654` |
 //! | REQ-4 `np.maximum.accumulate` monotonic repair (unobservable) | NOT-STARTED (#1323) | sklearn `_data.py:2707` |
 //! | REQ-6 random subsample + random_state + n_quantiles>subsample error | NOT-STARTED (#1324) | sklearn `_data.py:2696-2700`,`:2774-2779` |
-//! | REQ-7 `inverse_transform` | NOT-STARTED (#1325) | sklearn `_data.py:2947`,`:2848` |
+//! | REQ-7 `inverse_transform` (reverse interp + `norm.cdf` + bounds + NaN) | SHIPPED (#1325) | `FittedQuantileTransformer::inverse_transform` + `norm_cdf` (ndtr via `erf`/`erfc`); sklearn `_data.py:2947`,`:2813-2851`,`:2821`. Uniform ~exact, Normal ~1e-7 (follows the forward REQ-3 ~1e-9 ndtr/probit contract). Consumer: crate re-export `pub use quantile_transformer::FittedQuantileTransformer` (`lib.rs`, boundary public API). Live-oracle: `tests/divergence_quantile_transformer.rs` (uniform/normal round-trip + held-out + bounds + NaN + `norm_cdf` sanity) |
 //! | REQ-8 `ignore_implicit_zeros` + sparse CSC | NOT-STARTED (#1326) | sklearn `_data.py:2709-2752` |
 //! | REQ-9 `quantile_transform` free function | NOT-STARTED (#1327) | sklearn `_data.py:2978` |
 //! | REQ-10 `copy` + OneToOneFeatureMixin fitted-attr surface | NOT-STARTED (#1328) | sklearn `_data.py:2540`,`:2790-2795` |
@@ -31,6 +31,7 @@
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
+use ferrolearn_numerical::special::{erf, erfc};
 use ndarray::Array2;
 use num_traits::Float;
 
@@ -161,6 +162,113 @@ impl<F: Float + Send + Sync + 'static> FittedQuantileTransformer<F> {
     pub fn n_features(&self) -> usize {
         self.quantiles.len()
     }
+
+    /// Back-project transformed data to the original feature space.
+    ///
+    /// The inverse of [`Transform::transform`]: each transformed column value is
+    /// mapped back to an original feature value. Mirrors scikit-learn
+    /// `QuantileTransformer.inverse_transform` (`_data.py:2947`) which runs
+    /// `_transform_col(..., inverse=True)` (`_data.py:2813-2866`):
+    ///
+    /// - **Normal** output: the value is first mapped to its uniform rank in
+    ///   `[0, 1]` via the standard normal CDF `stats.norm.cdf` (`:2821`,
+    ///   [`norm_cdf`]); the bound masks use `BOUNDS_THRESHOLD = 1e-7` (`:47`)
+    ///   against `0` / `1` (`:2827-2828`).
+    /// - **Uniform** output: the value IS the rank; the bound masks use exact
+    ///   equality `== 0` / `== 1` (`:2830-2831`).
+    ///
+    /// The finite ranks are interpolated with a **plain** `np.interp(rank,
+    /// references_, quantiles)` — the REVERSE of the forward interp, and NOT the
+    /// forward/reversed-averaged variant (the averaging is forward-only,
+    /// `:2848`). Ranks at/below the lower bound map to the column minimum
+    /// `quantiles[0]` and at/above the upper bound to the column maximum
+    /// `quantiles[-1]` (`:2850-2851`). `NaN` passes through unchanged
+    /// (`isfinite_mask`, `:2833`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of columns differs
+    /// from the number of features seen during fitting.
+    pub fn inverse_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_features = self.quantiles.len();
+        if x.ncols() != n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), n_features],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedQuantileTransformer::inverse_transform".into(),
+            });
+        }
+        // sklearn `inverse_transform` -> `_check_inputs(force_all_finite=
+        // "allow-nan")` (`_data.py:2876`, called `:2965`): NaN passes through,
+        // but +/-inf raises ValueError (#2212, MinMaxScaler #2200 precedent).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
+
+        // sklearn _transform_col inverse: lower_bound_x = 0, upper_bound_x = 1,
+        // lower_bound_y = quantiles[0], upper_bound_y = quantiles[-1]
+        // (`_data.py:2814-2817`). BOUNDS_THRESHOLD = 1e-7 (`:47`).
+        let bounds_threshold = F::from(1e-7).unwrap_or_else(F::zero);
+        let zero = F::zero();
+        let one = F::one();
+
+        let mut out = x.to_owned();
+
+        for j in 0..n_features {
+            let quantiles_col = &self.quantiles[j];
+            let (lower_y, upper_y) = match (quantiles_col.first(), quantiles_col.last()) {
+                (Some(&first), Some(&last)) => (first, last),
+                // Empty landmark column: nothing to map to; leave values as-is.
+                _ => continue,
+            };
+
+            for i in 0..out.nrows() {
+                let val = out[[i, j]];
+                if val.is_nan() {
+                    // isfinite_mask excludes NaN; it stays NaN (`_data.py:2833`).
+                    continue;
+                }
+
+                // For Normal output, map the normal-space value back to the
+                // uniform rank in [0, 1] (`_data.py:2821`). For Uniform the
+                // value already IS the rank.
+                let rank = match self.output_distribution {
+                    OutputDistribution::Uniform => val,
+                    OutputDistribution::Normal => norm_cdf(val),
+                };
+
+                // Bound masks (`_data.py:2826-2831`). Under errstate(invalid=
+                // "ignore") NaN comparisons are false — but `rank` is finite
+                // here (norm_cdf of a finite value is finite, val is finite).
+                let (lower_idx, upper_idx) = match self.output_distribution {
+                    OutputDistribution::Normal => (
+                        rank - bounds_threshold < zero,
+                        rank + bounds_threshold > one,
+                    ),
+                    OutputDistribution::Uniform => (rank == zero, rank == one),
+                };
+
+                // Plain reverse interp references_ -> quantiles (`_data.py:2848`).
+                let mut mapped = np_interp(rank, &self.references, quantiles_col);
+
+                // Bound overrides (`_data.py:2850-2851`): upper applied first,
+                // then lower (matching sklearn's order).
+                if upper_idx {
+                    mapped = upper_y;
+                }
+                if lower_idx {
+                    mapped = lower_y;
+                }
+
+                out[[i, j]] = mapped;
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -273,6 +381,38 @@ fn np_interp<F: Float>(x: F, xp: &[F], fp: &[F]) -> F {
     } else {
         fp[i] + (x - xp[i]) / denom * (fp[i + 1] - fp[i])
     }
+}
+
+/// Standard normal CDF Φ(x) (scipy `ndtr` / `stats.norm.cdf`), computed in f64
+/// for accuracy then cast back to `F`. Used by [`FittedQuantileTransformer::inverse_transform`]
+/// to map a Normal-space value back to its uniform rank in `[0, 1]`, mirroring
+/// sklearn `_transform_col` inverse branch (`_data.py:2821`: `stats.norm.cdf(X_col)`).
+///
+/// Built from [`ferrolearn_numerical::special::erf`]/[`erfc`] (libm Cephes,
+/// machine precision) via the standard three-branch `ndtr` split on
+/// `t = x / sqrt(2)`, which preserves tail accuracy by using `erfc` (not
+/// `1 - erf`) in the tails:
+/// - `t < -1`  → `0.5 * erfc(-t)`   (left tail; no catastrophic cancellation)
+/// - `-1 ≤ t ≤ 1` → `0.5 * (1 + erf(t))` (central region)
+/// - `t > 1`   → `1 - 0.5 * erfc(t)` (right tail)
+///
+/// This is the analytic inverse of the forward [`probit`] (Acklam ppf, ~1e-9),
+/// so a Normal round-trip agrees with `scipy.stats.norm.cdf` to ~1e-9. A `NaN`
+/// input is passed through (returns `NaN`); ±∞ map to 1/0 since `erf(±∞)=±1`.
+fn norm_cdf<F: Float>(x: F) -> F {
+    let xf = x.to_f64().unwrap_or(f64::NAN);
+    if xf.is_nan() {
+        return F::nan();
+    }
+    let t = xf / std::f64::consts::SQRT_2;
+    let cdf = if t < -1.0 {
+        0.5 * erfc(-t)
+    } else if t <= 1.0 {
+        0.5 * (1.0 + erf(t))
+    } else {
+        1.0 - 0.5 * erfc(t)
+    };
+    F::from(cdf).unwrap_or_else(F::zero)
 }
 
 /// Map `value` to its quantile level by averaging the ascending and reversed

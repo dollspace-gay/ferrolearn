@@ -1026,7 +1026,6 @@ fn green_inverse_normal_plateau_heldout() {
 /// error). So the contract divergence is: sklearn `Err`, ferrolearn `Ok`.
 /// Tracking: #2212
 #[test]
-#[ignore = "divergence: inverse_transform accepts +/-inf, sklearn rejects (force_all_finite=allow-nan); tracking #2212"]
 fn divergence_inverse_rejects_inf() {
     // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
     //   X=np.arange(1.,11.).reshape(-1,1); \
