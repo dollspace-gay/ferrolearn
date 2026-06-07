@@ -1188,3 +1188,182 @@ def test_quantile_n_iter_contract():
     # sklearn also reports a positive int (different solver, different value).
     sk = SkQuantileRegressor(quantile=0.5, alpha=0.0).fit(X, y)
     assert int(sk.n_iter_) > 0
+
+
+# ===========================================================================
+# OrthogonalMatchingPursuit (#2172): the binding-surface unit. Oracle = live
+# sklearn 1.5.2 `sklearn.linear_model.OrthogonalMatchingPursuit` (imported here),
+# compared head-to-head. coef_/intercept_/predict per several `n_nonzero_coefs`,
+# the `tol` path, the default (None/None -> max(int(0.1*n_features),1)),
+# fit_intercept True/False, the 4-param keyword-only ctor ABI / clone, and
+# precompute='auto'/False/True acceptance (Gram knob, no result change). All
+# expected values are computed by the live sklearn oracle in the SAME test
+# (R-CHAR-3) — never copied from ferrolearn.
+# ===========================================================================
+
+from sklearn.linear_model import (
+    OrthogonalMatchingPursuit as SkOrthogonalMatchingPursuit,
+)
+
+
+def _omp_dataset(seed=0, n=80, p=12, informative=5, noise=4.0):
+    from sklearn.datasets import make_regression
+
+    X, y = make_regression(
+        n_samples=n, n_features=p, n_informative=informative, noise=noise,
+        random_state=seed,
+    )
+    return X, y
+
+
+def test_omp_coef_intercept_predict_match_sklearn_per_n_nonzero():
+    """REQ-OMP: for several `n_nonzero_coefs`, `coef_`/`intercept_`/`predict`
+    reproduce the live sklearn oracle to ~1e-12 (omp.rs REQ-1/2/5 SHIPPED)."""
+    X, y = _omp_dataset()
+    for k in (1, 2, 3, 5, 8):
+        sk = SkOrthogonalMatchingPursuit(n_nonzero_coefs=k).fit(X, y)
+        fr = fl.OrthogonalMatchingPursuit(n_nonzero_coefs=k).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-10,
+            err_msg=f"coef_ diverges at n_nonzero_coefs={k}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-10, (
+            f"intercept_ diverges at n_nonzero_coefs={k}"
+        )
+        np.testing.assert_allclose(
+            fr.predict(X), sk.predict(X), rtol=0, atol=1e-9,
+            err_msg=f"predict diverges at n_nonzero_coefs={k}",
+        )
+
+
+def test_omp_default_n_nonzero_matches_sklearn():
+    """REQ-OMP: with `n_nonzero_coefs=None` AND `tol=None`, sklearn sets
+    `n_nonzero_coefs_ = max(int(0.1 * n_features), 1)` (`_omp.py:785`) and fits;
+    ferrolearn reproduces the SAME `coef_`/`intercept_`/`predict` (omp.rs REQ-2)."""
+    X, y = _omp_dataset(p=12)
+    sk = SkOrthogonalMatchingPursuit().fit(X, y)
+    fr = fl.OrthogonalMatchingPursuit().fit(X, y)
+    # sklearn's effective support size is the documented default (oracle, R-CHAR-3).
+    assert sk.n_nonzero_coefs_ == max(int(0.1 * X.shape[1]), 1)
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-10)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-10
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), rtol=0, atol=1e-9)
+    # Exactly one non-zero coefficient (12 features -> int(1.2) -> 1).
+    assert int(np.count_nonzero(np.abs(np.asarray(fr.coef_)) > 1e-10)) == 1
+
+
+def test_omp_tol_path_matches_sklearn():
+    """REQ-OMP: the `tol` stopping path (sklearn `tol` overrides
+    `n_nonzero_coefs`, `_omp.py:786-789`) reproduces the sklearn oracle's
+    `coef_`/`predict`."""
+    X, y = _omp_dataset()
+    tol = float(np.sum((y - y.mean()) ** 2) * 0.05)
+    sk = SkOrthogonalMatchingPursuit(tol=tol).fit(X, y)
+    fr = fl.OrthogonalMatchingPursuit(tol=tol).fit(X, y)
+    np.testing.assert_allclose(np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-9)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-9
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), rtol=0, atol=1e-8)
+
+
+def test_omp_fit_intercept_true_false_match_sklearn():
+    """REQ-OMP: both `fit_intercept=True` and `fit_intercept=False` reproduce the
+    sklearn oracle (`_omp.py:660-663`/`:815`)."""
+    X, y = _omp_dataset()
+    for fit_intercept in (True, False):
+        sk = SkOrthogonalMatchingPursuit(
+            n_nonzero_coefs=4, fit_intercept=fit_intercept).fit(X, y)
+        fr = fl.OrthogonalMatchingPursuit(
+            n_nonzero_coefs=4, fit_intercept=fit_intercept).fit(X, y)
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-10,
+            err_msg=f"coef_ diverges at fit_intercept={fit_intercept}",
+        )
+        assert abs(fr.intercept_ - sk.intercept_) < 1e-10
+        if not fit_intercept:
+            assert fr.intercept_ == 0.0
+
+
+def test_omp_precompute_accepted_no_result_change():
+    """REQ-OMP: sklearn's `precompute='auto'`/`True`/`False` (`_omp.py:665-669`,
+    `_parameter_constraints` `:739`) is a Gram-matrix speed knob that does NOT
+    change the OMP solution (`_omp.py:791-813`). ferrolearn accepts every value
+    and yields the IDENTICAL fit as the `precompute='auto'` default (and matches
+    the sklearn oracle, which is itself precompute-invariant)."""
+    X, y = _omp_dataset()
+    sk = SkOrthogonalMatchingPursuit(n_nonzero_coefs=4).fit(X, y)
+    base = fl.OrthogonalMatchingPursuit(n_nonzero_coefs=4, precompute='auto').fit(X, y)
+    for pc in ('auto', False, True):
+        fr = fl.OrthogonalMatchingPursuit(n_nonzero_coefs=4, precompute=pc).fit(X, y)
+        # Identical to the 'auto' fit (precompute is ignored / result-invariant).
+        np.testing.assert_array_equal(
+            np.asarray(fr.coef_), np.asarray(base.coef_),
+        )
+        assert fr.intercept_ == base.intercept_
+        # ... and still matches the sklearn oracle.
+        np.testing.assert_allclose(
+            np.asarray(fr.coef_), sk.coef_, rtol=0, atol=1e-10,
+            err_msg=f"coef_ diverges at precompute={pc!r}",
+        )
+
+
+def test_omp_ctor_abi_keyword_only_four_params_like_sklearn():
+    """REQ-OMP (R-DEV-2): the constructor exposes exactly sklearn's four
+    keyword-only params with sklearn's defaults/order
+    (`_omp.py:742-753`: `(*, n_nonzero_coefs=None, tol=None, fit_intercept=True,
+    precompute='auto')`)."""
+    sig = inspect.signature(fl.OrthogonalMatchingPursuit.__init__)
+    params = [p for p in sig.parameters if p != "self"]
+    assert params == ["n_nonzero_coefs", "tol", "fit_intercept", "precompute"]
+    for name in params:
+        assert sig.parameters[name].kind == inspect.Parameter.KEYWORD_ONLY, (
+            f"{name} must be keyword-only (sklearn leading `*`)"
+        )
+    assert sig.parameters["n_nonzero_coefs"].default is None
+    assert sig.parameters["tol"].default is None
+    assert sig.parameters["fit_intercept"].default is True
+    assert sig.parameters["precompute"].default == "auto"
+    # Live sklearn oracle exposes the same four keyword-only params.
+    sk_sig = inspect.signature(SkOrthogonalMatchingPursuit.__init__)
+    sk_params = [p for p in sk_sig.parameters if p != "self"]
+    assert sk_params == params
+
+
+def test_omp_get_params_clone_roundtrip():
+    """REQ-OMP (R-DEV-2): `get_params`/`clone` round-trip the four params, matching
+    the live sklearn oracle's `get_params` key set."""
+    from sklearn.base import clone
+
+    est = fl.OrthogonalMatchingPursuit(
+        n_nonzero_coefs=4, tol=None, fit_intercept=False, precompute=False)
+    params = est.get_params()
+    assert params == {
+        "n_nonzero_coefs": 4, "tol": None,
+        "fit_intercept": False, "precompute": False,
+    }
+    c = clone(est)
+    assert c.get_params() == params
+    # Same param key set as the sklearn oracle.
+    sk_keys = set(SkOrthogonalMatchingPursuit().get_params().keys())
+    assert set(params.keys()) == sk_keys
+
+
+def test_omp_score_and_n_features_in_match_sklearn():
+    """REQ-OMP: inherits `RegressorMixin.score` (R^2) and sets `n_features_in_`;
+    the score equals the live sklearn oracle's score on the same data."""
+    X, y = _omp_dataset()
+    sk = SkOrthogonalMatchingPursuit(n_nonzero_coefs=5).fit(X, y)
+    fr = fl.OrthogonalMatchingPursuit(n_nonzero_coefs=5).fit(X, y)
+    assert fr.n_features_in_ == X.shape[1] == sk.n_features_in_
+    assert abs(fr.score(X, y) - sk.score(X, y)) < 1e-9
+
+
+def test_omp_pickle_roundtrip_preserves_predictions():
+    """REQ-OMP: pickle round-trips (Rust fitted object not picklable ->
+    refit-on-unpickle via `_RegressorPickleMixin`); predictions are preserved."""
+    import pickle
+
+    X, y = _omp_dataset()
+    fr = fl.OrthogonalMatchingPursuit(n_nonzero_coefs=4).fit(X, y)
+    pred_before = fr.predict(X)
+    fr2 = pickle.loads(pickle.dumps(fr))
+    np.testing.assert_allclose(fr2.predict(X), pred_before, rtol=0, atol=1e-12)

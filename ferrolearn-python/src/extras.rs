@@ -769,6 +769,125 @@ fn quantile_fit_err(e: ferrolearn_core::error::FerroError) -> PyErr {
     pyo3::exceptions::PyValueError::new_err(e.to_string())
 }
 
+// OrthogonalMatchingPursuit (#2172): hand-written pyclass (rather than a thin
+// `py_regressor!` invocation) so the binding surfaces sklearn's full keyword-only
+// constructor `(n_nonzero_coefs=None, tol=None, fit_intercept=True,
+// precompute='auto')` (`sklearn/linear_model/_omp.py:742-753`,
+// `_parameter_constraints` `:735-740`) — including the two `Option`-typed stopping
+// criteria — AND the fitted `coef_`/`intercept_` getters (sklearn `coef_` shape
+// `(n_features,)` for the single-target fit, `intercept_` scalar, `_omp.py:814-815`).
+// The greedy-Cholesky OMP MATH lives in
+// `ferrolearn_linear::OrthogonalMatchingPursuit` (`with_n_nonzero_coefs`/
+// `with_tol`/`with_fit_intercept`, `omp.rs`); this is the thin marshalling shim and
+// the non-test production consumer of that core API (R-DEFER-1). coef_/intercept_
+// match the live sklearn oracle to ~1e-12 (`ferrolearn_linear` omp.rs REQ-1/2/5
+// SHIPPED).
+//
+// `precompute` (sklearn `'auto'`/`True`/`False`, `_omp.py:739`) is purely a
+// Gram-matrix speed optimization: `_pre_fit` either passes a precomputed
+// `X.T@X`/`X.T@y` to `orthogonal_mp_gram` or runs `orthogonal_mp` directly, but
+// BOTH compute the IDENTICAL OMP solution (`_omp.py:791-813`). ferrolearn's core
+// never uses a Gram path, so its result is identical under every `precompute`
+// setting; the binding therefore ACCEPTS any `precompute` value (string or bool)
+// and ignores it. It is a `BaseEstimator` param held on the `_extras.py` wrapper
+// for `get_params`/`clone()` round-trip, so the Rust class need not store it. The
+// Rust core exposes no `n_iter_`/`n_nonzero_coefs_` (sklearn `_omp.py:785-789`/
+// `:792`) — those stay NOT-STARTED (`ferrolearn_linear` omp.rs REQ-7 #491), so no
+// getter is faked for them.
+#[pyclass(name = "_RsOrthogonalMatchingPursuit")]
+pub struct RsOrthogonalMatchingPursuit {
+    n_nonzero_coefs: Option<usize>,
+    tol: Option<f64>,
+    fit_intercept: bool,
+    fitted: Option<ferrolearn_linear::FittedOMP<f64>>,
+}
+
+#[pymethods]
+impl RsOrthogonalMatchingPursuit {
+    // `precompute` is accepted (any string/bool, `_omp.py:739`) and ignored — it
+    // is a Gram-matrix speed knob that does NOT change the OMP solution
+    // (`_omp.py:791-813`); the `get_params`/`clone` round-trip lives on the Python
+    // wrapper. `_extras.py` always passes the sklearn default `'auto'`.
+    #[new]
+    #[pyo3(signature = (n_nonzero_coefs=None, tol=None, fit_intercept=true, precompute=None))]
+    fn new(
+        n_nonzero_coefs: Option<usize>,
+        tol: Option<f64>,
+        fit_intercept: bool,
+        precompute: Option<pyo3::Py<pyo3::PyAny>>,
+    ) -> Self {
+        let _ = precompute;
+        Self {
+            n_nonzero_coefs,
+            tol,
+            fit_intercept,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let mut model = ferrolearn_linear::OrthogonalMatchingPursuit::<f64>::new()
+            .with_fit_intercept(self.fit_intercept);
+        // sklearn applies `n_nonzero_coefs`/`tol` only when set; the `None`/`None`
+        // default (`max(int(0.1 * n_features), 1)`) is handled INSIDE the core
+        // (`omp.rs` Fit, mirroring `_omp.py:785`), so only thread the Some values
+        // — leaving both unset preserves the core default path.
+        if let Some(n) = self.n_nonzero_coefs {
+            model = model.with_n_nonzero_coefs(n);
+        }
+        if let Some(t) = self.tol {
+            model = model.with_tol(t);
+        }
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    // sklearn `coef_` (`_omp.py:814` `self.coef_ = coef_.T`): the (n_features,)
+    // parameter vector for the single-target fit.
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+    }
+
+    // sklearn `intercept_` (`_omp.py:815` `self._set_intercept(...)`): the scalar
+    // independent term for the single-target fit.
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.intercept())
+    }
+}
+
 // ===========================================================================
 // Tree regressors
 // ===========================================================================

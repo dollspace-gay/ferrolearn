@@ -47,6 +47,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsNMF,
     _RsNearestCentroid,
     _RsNystroem,
+    _RsOrthogonalMatchingPursuit,
     _RsPowerTransformer,
     _RsQDA,
     _RsQuantileRegressor,
@@ -237,6 +238,100 @@ class ARDRegression(RegressorMixin, BaseEstimator):
             return np.asarray(self._rs.predict(_f64(X)))
         mean, std = self._rs.predict(_f64(X), return_std=True)
         return np.asarray(mean), np.asarray(std)
+
+
+class OrthogonalMatchingPursuit(_RegressorPickleMixin, RegressorMixin,
+                                BaseEstimator):
+    """Orthogonal Matching Pursuit backed by Rust (#2172).
+
+    Mirrors ``sklearn.linear_model.OrthogonalMatchingPursuit``
+    (``sklearn/linear_model/_omp.py:645-753``), surfacing the keyword-only
+    constructor ``(n_nonzero_coefs=None, tol=None, fit_intercept=True,
+    precompute='auto')`` (sklearn defaults/order, ``_omp.py:742-753``), the
+    ``fit(X, y)``/``predict(X)`` contract, and the fitted
+    ``coef_``/``intercept_``/``n_features_in_`` attributes from the Rust fitted
+    type (``_omp.py:814-815``, ``coef_`` shape ``(n_features,)``).
+
+    ``precompute`` is a Gram-matrix speed knob that does NOT change the OMP
+    solution (``_omp.py:791-813``): ``'auto'``/``True``/``False`` all yield the
+    identical fit. ferrolearn's core never uses a Gram path, so it accepts any
+    ``precompute`` value and ignores it (held only for ``get_params``/``clone``
+    round-trip). ``n_iter_``/``n_nonzero_coefs_`` are NOT exposed — the Rust core
+    does not compute them (NOT-STARTED, omp.rs REQ-7 #491).
+
+    Pickle: the Rust fitted object is not directly picklable, so the training
+    data is stored on fit and ``_rs`` is rebuilt by re-fitting on unpickle
+    (``_RegressorPickleMixin``).
+    """
+
+    def __init__(self, *, n_nonzero_coefs=None, tol=None, fit_intercept=True,
+                 precompute='auto'):
+        self.n_nonzero_coefs = n_nonzero_coefs
+        self.tol = tol
+        self.fit_intercept = fit_intercept
+        self.precompute = precompute
+
+    def _make_rs(self):
+        # sklearn's `_validate_params` (`_omp.py:735-740` `_parameter_constraints`)
+        # runs at fit and raises `InvalidParameterError` (a `ValueError` subclass)
+        # for out-of-range inputs. Mirror it here, Python-side, before the Rust ABI
+        # boundary (where 0/negatives would mis-fit or TypeError). bool is Integral,
+        # so np.bool_/True/False would pass the int check — but precompute (the only
+        # bool-valued param) is handled by its own StrOptions/boolean check below.
+        if self.n_nonzero_coefs is not None and (
+            not isinstance(self.n_nonzero_coefs, (int, np.integer))
+            or isinstance(self.n_nonzero_coefs, bool)
+            or self.n_nonzero_coefs < 1
+        ):
+            raise ValueError(
+                f"n_nonzero_coefs == {self.n_nonzero_coefs}, must be >= 1 "
+                "(an int in [1, inf)) or None."
+            )
+        # tol: sklearn constraint `Interval(Real, 0, None, closed='left')`
+        # (`_omp.py:737`) -> None or a real >= 0; a negative tol is rejected.
+        if self.tol is not None and (
+            not isinstance(self.tol, (int, float, np.floating, np.integer))
+            or isinstance(self.tol, bool)
+            or self.tol < 0
+        ):
+            raise ValueError(
+                f"tol == {self.tol}, must be >= 0 (a real in [0, inf)) or None."
+            )
+        # precompute: sklearn constraint `[StrOptions({'auto'}), 'boolean']`
+        # (`_omp.py:739`) -> 'auto', True, or False; anything else is rejected.
+        # It is a Gram-matrix speed knob that does NOT change the OMP solution
+        # (`_omp.py:791-813`), so the VALID values are accepted-and-ignored by the
+        # Rust core; only the INVALID ones are rejected here.
+        if not (self.precompute == "auto"
+                or isinstance(self.precompute, (bool, np.bool_))):
+            raise ValueError(
+                f"precompute == {self.precompute!r}, must be 'auto', True, or False."
+            )
+        # tol OVERRIDES n_nonzero_coefs (sklearn `_omp.py:786-787`: when `tol is not
+        # None`, `n_nonzero_coefs_` is forced to None, so tol is the sole stopping
+        # criterion and the support is capped only at n_features, `_omp.py:94`).
+        # Pass `n_nonzero_coefs=None` to the core in that case so it does not also
+        # cap the support — matching sklearn's tol-only fit.
+        n_nonzero_coefs = None if self.tol is not None else self.n_nonzero_coefs
+        return _RsOrthogonalMatchingPursuit(
+            n_nonzero_coefs=n_nonzero_coefs, tol=self.tol,
+            fit_intercept=self.fit_intercept, precompute=self.precompute)
+
+    def fit(self, X, y):
+        X = _f64(X)
+        y = _f64(y)
+        self._rs = self._make_rs()
+        self._rs.fit(X, y)
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/linear_model/_omp.py:814-815).
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self._store_training_data(X, y)
+        return self
+
+    def predict(self, X):
+        return np.asarray(self._rs.predict(_f64(X)))
 
 
 class HuberRegressor(_RegressorWrapper):
