@@ -80,7 +80,7 @@
 //! | REQ-5 (linkage variants ward/complete/average/single) | SHIPPED | `fn map_linkage` maps all four `AgglomerativeLinkage` variants to `Linkage`, delegated to `AgglomerativeClustering`, mirroring `_TREE_BUILDERS` (`_agglomerative.py:720-725`/`:1290`). VALUE parity (labels_ + transform) holds across all four post-#938. Non-test consumer: crate re-export (`lib.rs`). Verified: `value_labels_exact_all_linkages_k2_k3` (all four linkages) + `value_transform_mean_column_ordered` (ward+single) + `value_transform_max_column_ordered` (ward+complete). |
 //! | REQ-6 (`n_clusters=2` default + missing params metric/memory/connectivity/compute_full_tree/distance_threshold/compute_distances) | NOT-STARTED | open prereq blocker **#941**. sklearn `__init__` (`_agglomerative.py:1296-1319`) takes 9 params with `n_clusters=2` default. `FeatureAgglomeration<F>` REQUIRES `n_clusters` (`fn new`, no default) and has only `linkage`/`pooling_func`. `distance_threshold` (cut by distance with `n_clusters=None`, `:1281`/`:1091-1092`) is materially absent. |
 //! | REQ-7 (`pooling_func` as arbitrary callable) | NOT-STARTED | open prereq blocker **#941**. sklearn `_parameter_constraints["pooling_func"] = [callable]` (`_agglomerative.py:1291`) accepts any callable (default `np.mean`, `:1305`). ferrolearn offers only the closed `PoolingFunc::{Mean, Max}` enum (`fn with_pooling_func`). |
-//! | REQ-8 (`inverse_transform`) | NOT-STARTED | open prereq blocker **#940**. sklearn `AgglomerationTransform.inverse_transform` broadcasts pooled values back via `X[..., np.unique(labels_, return_inverse=True)[1]]` (`_feature_agglomeration.py:66-92`). `FittedFeatureAgglomeration` impls only `Transform` — no `inverse_transform`. |
+//! | REQ-8 (`inverse_transform`) | SHIPPED | `FittedFeatureAgglomeration::inverse_transform` broadcasts each cluster's pooled value back to its member features: `result[i, f] = xred[i, labels_[f]]`, mirroring sklearn `AgglomerationTransform.inverse_transform` (`_feature_agglomeration.py:66-92`: `unil, inverse = np.unique(labels_, return_inverse=True); return X[..., inverse]` — `inverse == labels_` for the contiguous `_hc_cut` numbering). Output shape `(n_samples, n_features)`; accepts `xred.ncols() >= n_clusters` (ignoring trailing extra columns, matching sklearn's numpy fancy-index `X[..., inverse]`, #2187) and rejects `xred.ncols() < n_clusters` with `FerroError::ShapeMismatch` (sklearn raises `IndexError`). Non-test consumer: crate re-export (`lib.rs`). Verified: `value_inverse_transform_roundtrip_and_broadcast` (full-matrix ~1e-12, all four linkages) + `divergence_inverse_transform_extra_cols_ignored` (#2187: `(2,4)` xred with n_clusters=3 ignores the 4th column, matching sklearn). |
 //! | REQ-9 (fitted attrs labels_/n_leaves_/n_connected_components_/children_/distances_) | SHIPPED | `fn fit` stores the inner `AgglomerativeClustering::fit(X.T)` attributes into `FittedFeatureAgglomeration` (`children_`, `distances_`, `n_leaves_`, `n_connected_components_`), delegating exactly as sklearn `FeatureAgglomeration._fit` → `AgglomerativeClustering._fit(X.T)` (`_agglomerative.py:1339`, sets `labels_`/`n_clusters_`/`n_leaves_`/`n_connected_components_`/`children_`/`distances_` at `:1083-1095`). Accessors: `fn labels` (sklearn name, alias of `feature_labels`), `fn children`, `fn distances` (`Option`, `Some` iff `with_compute_distances(true)` — mirrors sklearn `compute_distances`, `:1319`), `fn n_leaves` (= `n_features`), `fn n_connected_components` (= 1 for the unstructured path). `with_compute_distances` passthrough sets the inner `compute_distances`. Non-test consumer: crate re-export (`lib.rs`). Verified: `value_fitted_attrs_delegated` — `children_` == sklearn `FeatureAgglomeration(compute_distances=True).fit(X).children_`; `distances_` == sklearn `distances_` (~1e-9); `n_leaves_ == 6 == n_features`; `n_connected_components_ == 1`. |
 //! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker **#943**. `grep -rln FeatureAgglomeration ferrolearn-python/` is EMPTY — no `_RsFeatureAgglomeration`, so `import ferrolearn` cannot reach `FeatureAgglomeration`. The only non-test consumer of `fit` / `transform` / `feature_labels()` is the crate re-export (`lib.rs`). |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#943**. `feature_agglomeration.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`; the delegated `agglomerative.rs` is likewise on `ndarray`. Not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
@@ -470,6 +470,47 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFeatureAgg
             }
         }
 
+        Ok(result)
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FittedFeatureAgglomeration<F> {
+    /// Inverse the pooling transformation: broadcast each cluster's pooled
+    /// value back to every feature in that cluster.
+    ///
+    /// Mirrors sklearn `AgglomerationTransform.inverse_transform`
+    /// (`_feature_agglomeration.py:66-92`): `unil, inverse =
+    /// np.unique(labels_, return_inverse=True); return X[..., inverse]`. Since
+    /// `labels_` is the contiguous `_hc_cut` numbering `0..n_clusters`,
+    /// `inverse == labels_`, so output column `f` is reduced column
+    /// `labels_[f]`: `result[i, f] = xred[i, labels_[f]]`.
+    ///
+    /// `xred` has shape `(n_samples, n_clusters)`; the result has shape
+    /// `(n_samples, n_features)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `xred.ncols() < n_clusters`.
+    /// Mirroring sklearn's numpy fancy-index `X[..., inverse]` (which reads only
+    /// columns `0..n_clusters` and ignores any trailing columns, #2187), a wider
+    /// `xred` is accepted and the extra columns are ignored; too few columns is
+    /// the only error (sklearn raises `IndexError`).
+    pub fn inverse_transform(&self, xred: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        if xred.ncols() < self.n_clusters_ {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![xred.nrows(), self.n_clusters_],
+                actual: vec![xred.nrows(), xred.ncols()],
+                context: "FittedFeatureAgglomeration::inverse_transform".into(),
+            });
+        }
+
+        let n_samples = xred.nrows();
+        let mut result = Array2::<F>::zeros((n_samples, self.n_features_));
+        for i in 0..n_samples {
+            for (f, &label) in self.feature_labels_.iter().enumerate() {
+                result[[i, f]] = xred[[i, label]];
+            }
+        }
         Ok(result)
     }
 }

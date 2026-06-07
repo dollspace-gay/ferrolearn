@@ -302,3 +302,76 @@ fn value_fitted_attrs_delegated() {
     assert_eq!(no_dist.n_leaves(), 6);
     assert_eq!(no_dist.n_connected_components(), 1);
 }
+
+// ===========================================================================
+// REQ-8 — inverse_transform broadcasts each cluster's pooled value back to its
+// member features (`_feature_agglomeration.py:66-92`: `X[..., inverse]`).
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   for L in ['ward','complete','average','single']:
+//     m=FeatureAgglomeration(n_clusters=3, linkage=L).fit(X)
+//     print(L, m.inverse_transform(m.transform(X)).flatten().tolist())
+//   # all four linkages (identical partition): row-major (5x6)
+//   # [1.05,1.05, 5.05,5.05, 9.05,9.05,  2.05,2.05, 6.05,6.05, 8.05,8.05,
+//   #  3.05,3.05, 7.05,7.05, 7.05,7.05,  4.05,4.05, 8.05,8.05, 6.05,6.05,
+//   #  5.05,5.05, 9.05,9.05, 5.05,5.05]
+// ===========================================================================
+
+/// REQ-8: `inverse_transform(transform(X))` broadcasts the per-cluster mean
+/// back to every feature in the cluster, matching sklearn bit-for-bit for all
+/// four linkages. Also checks the shape `(n_samples, n_features)` and the
+/// `xred.ncols() != n_clusters` shape-mismatch rejection.
+#[test]
+fn value_inverse_transform_roundtrip_and_broadcast() {
+    // Live sklearn oracle: row-major (5, 6), identical across all four linkages.
+    const SK_INV: [f64; 30] = [
+        1.05, 1.05, 5.05, 5.05, 9.05, 9.05, 2.05, 2.05, 6.05, 6.05, 8.05, 8.05, 3.05, 3.05, 7.05,
+        7.05, 7.05, 7.05, 4.05, 4.05, 8.05, 8.05, 6.05, 6.05, 5.05, 5.05, 9.05, 9.05, 5.05, 5.05,
+    ];
+
+    let x = make_correlated_features();
+
+    for linkage in [
+        AgglomerativeLinkage::Ward,
+        AgglomerativeLinkage::Complete,
+        AgglomerativeLinkage::Average,
+        AgglomerativeLinkage::Single,
+    ] {
+        let fitted = FeatureAgglomeration::<f64>::new(3)
+            .with_linkage(linkage)
+            .with_pooling_func(PoolingFunc::Mean)
+            .fit(&x, &())
+            .unwrap();
+
+        let xt = fitted.transform(&x).unwrap();
+        let xinv = fitted.inverse_transform(&xt).unwrap();
+
+        assert_eq!(
+            xinv.dim(),
+            (5, 6),
+            "inverse_transform output must be (n_samples, n_features) = (5, 6), got {:?}",
+            xinv.dim()
+        );
+        for (idx, &sk) in SK_INV.iter().enumerate() {
+            let (i, f) = (idx / 6, idx % 6);
+            assert!(
+                (xinv[[i, f]] - sk).abs() < 1e-12,
+                "{linkage:?}: inverse_transform[{i},{f}] = {} != sklearn {sk}",
+                xinv[[i, f]]
+            );
+        }
+    }
+
+    // Shape-mismatch: too FEW columns is rejected (sklearn raises IndexError).
+    // A WIDER xred is accepted with trailing columns ignored — see the #2187
+    // pin in divergence_feature_agglom_inverse_transform.rs.
+    let fitted = FeatureAgglomeration::<f64>::new(3)
+        .with_linkage(AgglomerativeLinkage::Ward)
+        .fit(&x, &())
+        .unwrap();
+    let bad = Array2::<f64>::zeros((5, 2)); // 2 < n_clusters (3): too few columns
+    assert!(
+        fitted.inverse_transform(&bad).is_err(),
+        "inverse_transform must reject xred.ncols() < n_clusters (sklearn IndexError)"
+    );
+}

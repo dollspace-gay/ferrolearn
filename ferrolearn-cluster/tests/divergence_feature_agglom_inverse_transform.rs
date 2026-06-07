@@ -63,7 +63,6 @@ fn make_correlated_features() -> Array2<f64> {
 ///
 /// Tracking: #2187
 #[test]
-#[ignore = "divergence: inverse_transform rejects xred.ncols()>n_clusters but sklearn ignores extra cols (X[..., inverse]); tracking #2187"]
 fn divergence_inverse_transform_extra_cols_ignored() {
     let x = make_correlated_features();
     let fitted = FeatureAgglomeration::<f64>::new(3)
@@ -73,11 +72,8 @@ fn divergence_inverse_transform_extra_cols_ignored() {
 
     // labels_ == [0,0,2,2,1,1] (matches sklearn oracle); the extra 4th column
     // (99/88) is never referenced by `inverse == labels_` and is dropped.
-    let xred = Array2::from_shape_vec(
-        (2, 4),
-        vec![10.0, 20.0, 30.0, 99.0, 40.0, 50.0, 60.0, 88.0],
-    )
-    .unwrap();
+    let xred = Array2::from_shape_vec((2, 4), vec![10.0, 20.0, 30.0, 99.0, 40.0, 50.0, 60.0, 88.0])
+        .unwrap();
 
     // sklearn live-oracle expected: (2,6), trailing column ignored.
     let sk_expected: [[f64; 6]; 2] = [
@@ -85,9 +81,9 @@ fn divergence_inverse_transform_extra_cols_ignored() {
         [40.0, 40.0, 60.0, 60.0, 50.0, 50.0],
     ];
 
-    let out = fitted
-        .inverse_transform(&xred)
-        .expect("sklearn returns a (2,6) matrix here; ferrolearn must not reject xred.ncols()>n_clusters");
+    let out = fitted.inverse_transform(&xred).expect(
+        "sklearn returns a (2,6) matrix here; ferrolearn must not reject xred.ncols()>n_clusters",
+    );
 
     assert_eq!(
         out.dim(),
