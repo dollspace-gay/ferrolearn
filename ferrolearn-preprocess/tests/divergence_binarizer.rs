@@ -395,7 +395,7 @@ fn fit_transform_matches_sklearn_and_stateless() {
         let stateless = Binarizer::<f64>::new(t).transform(&x).unwrap();
         assert_eq!(fit_out, stateless, "fit-path != stateless at threshold {t}");
         // Fit path == `binarize` free fn, bit-for-bit.
-        let free = binarize(&x, t);
+        let free = binarize(&x, t).unwrap();
         assert_eq!(fit_out, free, "fit-path != binarize() at threshold {t}");
     }
 }
@@ -647,7 +647,6 @@ fn fit_f32_matches_oracle_and_stateless() {
 /// EXCLUDES NaN/+-inf.
 /// Tracking: #2208
 #[test]
-#[ignore = "divergence: binarize/transform accept NaN+-inf threshold sklearn rejects (InvalidParameterError); tracking #2208"]
 fn divergence_binarize_nan_threshold_should_error_like_sklearn() {
     // Live oracle: binarize([[5,-1,0]], threshold=nan) -> InvalidParameterError
     let x = array![[5.0_f64, -1.0, 0.0]];
@@ -661,6 +660,17 @@ fn divergence_binarize_nan_threshold_should_error_like_sklearn() {
          (_data.py:2114 Interval(Real, closed=neither)); ferrolearn returned Ok({:?})",
         result.ok()
     );
+    // The free `binarize` fn (the @validate_params boundary) rejects directly.
+    assert!(
+        binarize(&x, f64::NAN).is_err(),
+        "free binarize(X, nan) must Err (sklearn @validate_params, _data.py:2114)"
+    );
+    // sklearn's `_fit_context` validates `_parameter_constraints` BEFORE the
+    // data, so `Binarizer(threshold=nan).fit(X)` raises InvalidParameterError.
+    assert!(
+        Binarizer::<f64>::new(f64::NAN).fit(&x, &()).is_err(),
+        "Binarizer(threshold=nan).fit must Err (sklearn _fit_context param-check, _data.py:2249)"
+    );
 }
 
 /// Divergence: `ferrolearn::binarize` diverges from
@@ -671,7 +681,6 @@ fn divergence_binarize_nan_threshold_should_error_like_sklearn() {
 /// free-function entry point used by every Binarizer path.
 /// Tracking: #2208
 #[test]
-#[ignore = "divergence: binarize accepts +inf threshold sklearn rejects (InvalidParameterError); tracking #2208"]
 fn divergence_binarize_inf_threshold_should_error_like_sklearn() {
     // Live oracle: binarize([[5,-1,1e308]], threshold=inf) -> InvalidParameterError
     let x = array![[5.0_f64, -1.0, 1e308]];
@@ -685,4 +694,78 @@ fn divergence_binarize_inf_threshold_should_error_like_sklearn() {
          (_data.py:2114 Interval(Real, closed=neither)); ferrolearn returned Ok({:?})",
         result.ok()
     );
+}
+
+// ===========================================================================
+// DIVERGENCE (#2209) — Binarizer::fit OVER-REJECTS a non-finite threshold.
+//
+// REGRESSION introduced by the #2208 fix. The #2208 fix correctly added a
+// non-finite-threshold rejection to the FREE function `binarize` and to
+// `Binarizer::transform` (which both mirror sklearn's `binarize`
+// `@validate_params({"threshold": [Interval(Real, None, None,
+// closed="neither")]})`, `_data.py:2112-2118` — the OPEN interval excludes
+// NaN/+-inf). BUT it ALSO added the same rejection to `Binarizer::fit`
+// (`binarizer.rs:304-309`), where sklearn does NOT reject.
+//
+// sklearn's *estimator* `Binarizer` uses a DIFFERENT, looser constraint than
+// the `binarize` free function: its `_parameter_constraints` is
+// `{"threshold": [Real], "copy": ["boolean"]}` (`_data.py:2248-2251`). `[Real]`
+// is the bare Real type-check, which ACCEPTS NaN and +-inf (only the OPEN
+// `Interval` on `binarize` excludes them). `Binarizer.fit` is decorated
+// `@_fit_context` (`_data.py:2257`) and its body only calls
+// `self._validate_data(X, accept_sparse="csr")` (`:2277`) — it validates X but
+// NOT the threshold against an interval. So a non-finite threshold passes fit.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import Binarizer
+//   m=Binarizer(threshold=float('nan')).fit(np.array([[1.,-1.,2.],[2.,0.,0.],[0.,1.,-1.]]))
+//   print('OK', m.n_features_in_)"
+//   -> OK 3            # fit RETURNS a fitted estimator; does NOT raise
+//   ... threshold=float('inf')  -> OK 3
+//   ... threshold=float('-inf') -> OK 3
+//
+// ferrolearn `Binarizer::fit` checks `self.threshold.is_nan() ||
+// self.threshold.is_infinite()` FIRST (`binarizer.rs:304-309`) and returns
+// `Err(FerroError::InvalidParameter)` — rejecting an input sklearn accepts.
+// This is an over-rejection divergence (R-DEV-2: ferrolearn must not reject
+// inputs sklearn accepts). The in-tree #2208 tests `fit_rejects_nan` /
+// `fit_rejects_pos_inf` / `fit_rejects_neg_inf` assert the WRONG (rejecting)
+// behavior and are themselves divergent (tracked under #2209).
+// ===========================================================================
+
+/// Divergence: `ferrolearn::Binarizer::fit` over-rejects a non-finite
+/// `threshold`, diverging from `sklearn/preprocessing/_data.py:2248-2251`
+/// (`Binarizer._parameter_constraints = {"threshold": [Real], ...}` — the bare
+/// `[Real]` type-check ACCEPTS NaN/+-inf; only the `binarize` free function uses
+/// the OPEN `Interval(Real, None, None, closed="neither")` at `:2115`). sklearn
+/// `Binarizer(threshold=nan).fit(goodX)` RETURNS a fitted estimator with
+/// `n_features_in_ == 3` (live oracle); ferrolearn `fit` returns
+/// `Err(InvalidParameter)` (`binarizer.rs:304-309`). Over-rejection regression
+/// from the #2208 fix.
+/// Tracking: #2209
+#[test]
+#[ignore = "divergence: Binarizer::fit over-rejects non-finite threshold (sklearn _data.py:2249 [Real] accepts it); tracking #2209"]
+fn divergence_binarizer_fit_accepts_nonfinite_threshold_like_sklearn() {
+    // Live oracle (sklearn 1.5.2, /tmp):
+    //   Binarizer(threshold=nan).fit([[1,-1,2],[2,0,0],[0,1,-1]]) -> OK, n_features_in_=3
+    //   ... threshold=inf  -> OK, n_features_in_=3
+    //   ... threshold=-inf -> OK, n_features_in_=3
+    let x = array![[1.0, -1.0, 2.0], [2.0, 0.0, 0.0], [0.0, 1.0, -1.0]];
+
+    for thr in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let fitted = Binarizer::<f64>::new(thr).fit(&x, &());
+        assert!(
+            fitted.is_ok(),
+            "sklearn Binarizer(threshold={thr:?}).fit(goodX) returns a fitted \
+             estimator (_data.py:2248-2251 [Real] accepts NaN/+-inf); \
+             ferrolearn fit returned {:?}",
+            fitted.as_ref().err()
+        );
+        // sklearn records n_features_in_ == ncols == 3 even with a non-finite threshold.
+        let n = fitted.unwrap().n_features_in();
+        assert_eq!(
+            n, 3,
+            "sklearn fit records n_features_in_=3 (live oracle) for threshold {thr:?}; got {n}"
+        );
+    }
 }
