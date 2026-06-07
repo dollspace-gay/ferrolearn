@@ -132,15 +132,59 @@ class _RegressorPickleMixin:
         self._rs.fit(self._fit_X, self._fit_y)
 
 
-class BayesianRidge(_RegressorWrapper):
-    def __init__(self, *, max_iter=300, tol=1e-3, fit_intercept=True):
+class BayesianRidge(RegressorMixin, BaseEstimator):
+    """Bayesian ridge regression backed by Rust (#2161).
+
+    Mirrors ``sklearn.linear_model.BayesianRidge``
+    (``sklearn/linear_model/_bayes.py:187-202``), surfacing the
+    ``compute_score`` keyword-only parameter, the
+    ``fit(X, y, sample_weight=None)`` signature, the
+    ``predict(X, return_std=False)`` path, and the fitted
+    ``coef_``/``intercept_``/``alpha_``/``lambda_``/``sigma_``/``n_iter_``/
+    ``scores_`` attributes from the Rust fitted type.
+
+    ``scores_`` (the per-iteration log marginal likelihood, length
+    ``n_iter_ + 1``) is populated only when ``compute_score=True``
+    (``_bayes.py:198``); otherwise it is an empty array.
+    """
+
+    def __init__(self, *, max_iter=300, tol=1e-3, compute_score=False,
+                 fit_intercept=True):
         self.max_iter = max_iter
         self.tol = tol
+        self.compute_score = compute_score
         self.fit_intercept = fit_intercept
 
     def _make_rs(self):
         return _RsBayesianRidge(max_iter=self.max_iter, tol=self.tol,
+                                compute_score=self.compute_score,
                                 fit_intercept=self.fit_intercept)
+
+    def fit(self, X, y, sample_weight=None):
+        self._rs = self._make_rs()
+        if sample_weight is None:
+            self._rs.fit(_f64(X), _f64(y))
+        else:
+            self._rs.fit(_f64(X), _f64(y), _f64(sample_weight))
+        self.n_features_in_ = X.shape[1]
+        # Fitted attributes surfaced from the Rust fitted type
+        # (sklearn/linear_model/_bayes.py:94-120).
+        self.coef_ = np.asarray(self._rs.coef_)
+        self.intercept_ = self._rs.intercept_
+        self.alpha_ = self._rs.alpha_
+        self.lambda_ = self._rs.lambda_
+        self.sigma_ = np.asarray(self._rs.sigma_)
+        self.n_iter_ = int(self._rs.n_iter_)
+        # scores_ is empty unless compute_score=True (matches sklearn, which
+        # only sets it under that flag).
+        self.scores_ = np.asarray(self._rs.scores_)
+        return self
+
+    def predict(self, X, return_std=False):
+        if not return_std:
+            return np.asarray(self._rs.predict(_f64(X)))
+        mean, std = self._rs.predict(_f64(X), return_std=True)
+        return np.asarray(mean), np.asarray(std)
 
 
 class ARDRegression(_RegressorWrapper):

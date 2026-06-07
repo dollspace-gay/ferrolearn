@@ -854,3 +854,110 @@ def test_huber_n_iter_warm_start_fewer_than_cold_like_sklearn():
         f"({fr_cold_iters}) (sklearn: cold={sk_cold_iters}, warm={sk_warm_iters})"
     )
     assert fr_warm_iters >= 1
+
+
+# ===========================================================================
+# BayesianRidge REQ-6/7/8/9 (#2161): compute_score/scores_, n_iter_,
+# predict(return_std=True)/sigma_, sample_weight. Oracle = live sklearn 1.5.2
+# `sklearn.linear_model.BayesianRidge` (imported here), compared head-to-head.
+# ===========================================================================
+
+from sklearn.linear_model import BayesianRidge as SkBayesianRidge
+
+
+def _bayes_dataset(seed=0, n=30, p=5):
+    rng = np.random.RandomState(seed)
+    X = rng.randn(n, p)
+    y = X @ np.array([3.0, -1.8, 0.0, 0.5, 1.2][:p]) + 0.5 * rng.randn(n)
+    return X, y
+
+
+def test_bayesian_ridge_n_iter_matches_sklearn():
+    """REQ-7: `n_iter_` matches the live sklearn oracle (positive int <= max_iter,
+    sklearn `_bayes.py:316`)."""
+    X, y = _bayes_dataset()
+    sk = SkBayesianRidge().fit(X, y)
+    fr = fl.BayesianRidge().fit(X, y)
+    assert fr.n_iter_ == sk.n_iter_, (
+        f"n_iter_: ferrolearn={fr.n_iter_}, sklearn={sk.n_iter_}"
+    )
+    assert 1 <= fr.n_iter_ <= 300
+
+
+def test_bayesian_ridge_scores_matches_sklearn():
+    """REQ-6: `compute_score=True` populates `scores_` (length n_iter_+1) with the
+    log marginal likelihood; the converged (final) value matches the sklearn
+    oracle tightly and the full sequence to a documented tolerance
+    (sklearn `_bayes.py:302/330`)."""
+    X, y = _bayes_dataset()
+    sk = SkBayesianRidge(compute_score=True).fit(X, y)
+    fr = fl.BayesianRidge(compute_score=True).fit(X, y)
+
+    assert len(fr.scores_) == len(sk.scores_)
+    assert len(fr.scores_) == fr.n_iter_ + 1
+    # Final converged LML: tight.
+    assert abs(fr.scores_[-1] - sk.scores_[-1]) < 1e-6 * abs(sk.scores_[-1]), (
+        f"final scores_: ferrolearn={fr.scores_[-1]}, sklearn={sk.scores_[-1]}"
+    )
+    # Per-iteration LML: looser (EM trajectory is path-sensitive).
+    np.testing.assert_allclose(fr.scores_, sk.scores_, rtol=1e-4, atol=1e-4)
+
+
+def test_bayesian_ridge_scores_empty_without_compute_score():
+    """REQ-6: with compute_score=False (default), `scores_` is empty — matching
+    sklearn which only populates it under the flag (`_bayes.py:198`)."""
+    X, y = _bayes_dataset()
+    fr = fl.BayesianRidge().fit(X, y)
+    assert fr.scores_.size == 0
+
+
+def test_bayesian_ridge_return_std_matches_sklearn():
+    """REQ-8: `predict(X, return_std=True)` returns `(mean, std)` matching the
+    sklearn oracle; the mean equals the plain predict (`_bayes.py:367-371`)."""
+    X, y = _bayes_dataset()
+    sk = SkBayesianRidge().fit(X, y)
+    fr = fl.BayesianRidge().fit(X, y)
+
+    sk_mean, sk_std = sk.predict(X, return_std=True)
+    fr_mean, fr_std = fr.predict(X, return_std=True)
+
+    np.testing.assert_allclose(fr_mean, sk_mean, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(fr_std, sk_std, rtol=1e-5, atol=1e-8)
+
+    # return_std=False returns a bare mean array equal to the (mean, std) mean.
+    fr_mean_only = fr.predict(X)
+    np.testing.assert_allclose(fr_mean_only, fr_mean, rtol=0, atol=1e-12)
+
+
+def test_bayesian_ridge_sigma_full_matches_sklearn():
+    """REQ-8: the fitted `sigma_` is the full (n_features, n_features) posterior
+    covariance matrix matching the sklearn oracle (`_bayes.py:333-337`)."""
+    X, y = _bayes_dataset()
+    sk = SkBayesianRidge().fit(X, y)
+    fr = fl.BayesianRidge().fit(X, y)
+    assert fr.sigma_.shape == sk.sigma_.shape == (5, 5)
+    np.testing.assert_allclose(fr.sigma_, sk.sigma_, rtol=1e-5, atol=1e-9)
+
+
+def test_bayesian_ridge_sample_weight_matches_sklearn():
+    """REQ-9: a weighted fit (`fit(X, y, sample_weight=...)`) matches the sklearn
+    oracle's coef_/intercept_/alpha_/lambda_ (`_bayes.py:254-256`)."""
+    X, y = _bayes_dataset()
+    sw = np.abs(np.sin(np.arange(X.shape[0]) * 0.7)) + 0.1
+
+    sk = SkBayesianRidge().fit(X, y, sample_weight=sw)
+    fr = fl.BayesianRidge().fit(X, y, sample_weight=sw)
+
+    np.testing.assert_allclose(fr.coef_, sk.coef_, rtol=1e-3, atol=1e-6)
+    assert abs(fr.intercept_ - sk.intercept_) < 1e-3
+    assert abs(fr.alpha_ - sk.alpha_) / abs(sk.alpha_) < 1e-2
+    assert abs(fr.lambda_ - sk.lambda_) / abs(sk.lambda_) < 1e-2
+
+
+def test_bayesian_ridge_sample_weight_none_matches_unweighted():
+    """REQ-9: `sample_weight=None` is byte-identical to the unweighted fit."""
+    X, y = _bayes_dataset()
+    a = fl.BayesianRidge().fit(X, y, sample_weight=None)
+    b = fl.BayesianRidge().fit(X, y)
+    np.testing.assert_array_equal(a.coef_, b.coef_)
+    assert a.intercept_ == b.intercept_

@@ -24,7 +24,7 @@
 //! Tracking: #464 (hyperprior + exact-gamma fit), contributing #466 (alpha_init default).
 
 use ferrolearn_core::introspection::HasCoefficients;
-use ferrolearn_core::traits::Fit;
+use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::BayesianRidge;
 use ndarray::{Array1, Array2};
 
@@ -521,5 +521,194 @@ fn oracle_bayesian_ridge_random_state_7() {
         -0.02409327335431064,
         6.806508125342455,
         0.765790418713969,
+    );
+}
+
+// ===========================================================================
+// REQ-6/7/8/9: compute_score/scores_, n_iter_, return_std/sigma_, sample_weight
+// vs the live sklearn 1.5.2 oracle. Expected constants are produced by the
+// oracle scripts quoted above each test (R-CHAR-3 — NOT copied from ferrolearn).
+// ===========================================================================
+
+/// AC-1 5x1 design (`X=[[1],[2],[3],[4],[5]]`, `y=[3,5,7,9,11]`).
+fn ac1_dataset() -> (Array2<f64>, Array1<f64>) {
+    (
+        Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap(),
+        Array1::from_vec(vec![3.0, 5.0, 7.0, 9.0, 11.0]),
+    )
+}
+
+/// REQ-7 `n_iter_` (sklearn `_bayes.py:316` `self.n_iter_ = iter_ + 1`). On the
+/// AC-1 data and on the 30x5 design the live oracle converges in 5 iterations:
+///   python3 -c "from sklearn.linear_model import BayesianRidge; import numpy as np; \
+///     X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([3.,5.,7.,9.,11.]); \
+///     print(BayesianRidge().fit(X,y).n_iter_)"   # -> 5
+#[test]
+fn divergence_bayesian_ridge_n_iter() {
+    let (x, y) = ac1_dataset();
+    let fitted = BayesianRidge::<f64>::new().fit(&x, &y).unwrap();
+    // sklearn oracle: n_iter_ == 5 (positive int <= max_iter).
+    assert_eq!(
+        fitted.n_iter(),
+        5,
+        "n_iter_ should match the sklearn oracle (5)"
+    );
+
+    let (x2, y2) = dataset();
+    let fitted2 = BayesianRidge::<f64>::new().fit(&x2, &y2).unwrap();
+    assert_eq!(
+        fitted2.n_iter(),
+        5,
+        "30x5 n_iter_ should match the sklearn oracle (5)"
+    );
+}
+
+/// REQ-6 `compute_score`/`scores_` on the AC-1 data. The live oracle:
+///   python3 -c "from sklearn.linear_model import BayesianRidge; import numpy as np; \
+///     X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([3.,5.,7.,9.,11.]); \
+///     print(BayesianRidge(compute_score=True).fit(X,y).scores_.tolist())"
+/// -> [-11.309875943883771, -8.16778381293061, -1.0983485438441192,
+///      14.50126980034388, 20.07819595629966, 20.078195956332387]
+/// scores_ has length n_iter_+1 (one per iteration + the post-loop value).
+#[test]
+fn divergence_bayesian_ridge_scores_ac1() {
+    const SK_SCORES: [f64; 6] = [
+        -11.309875943883771,
+        -8.16778381293061,
+        -1.0983485438441192,
+        14.50126980034388,
+        20.07819595629966,
+        20.078195956332387,
+    ];
+    let (x, y) = ac1_dataset();
+    // Default (compute_score=false): scores_ is empty (sklearn `_bayes.py:198`).
+    let no_score = BayesianRidge::<f64>::new().fit(&x, &y).unwrap();
+    assert!(no_score.scores().is_empty());
+
+    let fitted = BayesianRidge::<f64>::new()
+        .with_compute_score(true)
+        .fit(&x, &y)
+        .unwrap();
+    let scores = fitted.scores();
+    assert_eq!(scores.len(), fitted.n_iter() + 1, "len == n_iter_+1");
+    assert_eq!(scores.len(), SK_SCORES.len());
+    for (i, (&got, &want)) in scores.iter().zip(SK_SCORES.iter()).enumerate() {
+        // The converged (last) LML must match tightly; per-iteration values to a
+        // looser tolerance since the EM trajectory is path-sensitive.
+        let tol = if i + 1 == scores.len() { 1e-6 } else { 1e-4 };
+        assert!(
+            (got - want).abs() < tol * want.abs().max(1.0),
+            "scores_[{i}]: ferrolearn={got}, sklearn={want} (diff {})",
+            (got - want).abs()
+        );
+    }
+}
+
+/// REQ-6 `scores_` on the 30x5 design (final LML tight). Live oracle:
+///   ...BayesianRidge(compute_score=True).fit(X,y).scores_ ->
+///   [..., -31.363808685342036]  (length 6 == n_iter_+1)
+#[test]
+fn divergence_bayesian_ridge_scores_30x5_final() {
+    const SK_FINAL_SCORE: f64 = -31.363808685342036;
+    let (x, y) = dataset();
+    let fitted = BayesianRidge::<f64>::new()
+        .with_compute_score(true)
+        .fit(&x, &y)
+        .unwrap();
+    let scores = fitted.scores();
+    assert_eq!(scores.len(), fitted.n_iter() + 1);
+    let last = *scores.last().unwrap();
+    assert!(
+        (last - SK_FINAL_SCORE).abs() < 1e-5 * SK_FINAL_SCORE.abs(),
+        "final scores_: ferrolearn={last}, sklearn={SK_FINAL_SCORE}"
+    );
+}
+
+/// REQ-8 `predict(return_std=True)` on the AC-1 data. Live oracle:
+///   python3 -c "from sklearn.linear_model import BayesianRidge; import numpy as np; \
+///     X=np.array([[1.],[2.],[3.],[4.],[5.]]); y=np.array([3.,5.,7.,9.,11.]); \
+///     m=BayesianRidge().fit(X,y); mean,std=m.predict(X,return_std=True); \
+///     print(std.tolist())"
+/// -> [0.0007416196628833074, 0.0008366598158751205, 0.0009746791879255745,
+///      0.0011401751356701088, 0.001322875318907822]
+#[test]
+fn divergence_bayesian_ridge_return_std_ac1() {
+    const SK_STD: [f64; 5] = [
+        0.0007416196628833074,
+        0.0008366598158751205,
+        0.0009746791879255745,
+        0.0011401751356701088,
+        0.001322875318907822,
+    ];
+    let (x, y) = ac1_dataset();
+    let fitted = BayesianRidge::<f64>::new().fit(&x, &y).unwrap();
+    let (mean, std) = fitted.predict_with_std(&x).unwrap();
+    // mean equals the plain predict (`_bayes.py:365`).
+    let mean_only = fitted.predict(&x).unwrap();
+    for (a, b) in mean.iter().zip(mean_only.iter()) {
+        assert!((a - b).abs() < 1e-12);
+    }
+    for (i, (&got, &want)) in std.iter().zip(SK_STD.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-6 * want.abs().max(1.0),
+            "y_std[{i}]: ferrolearn={got}, sklearn={want} (diff {})",
+            (got - want).abs()
+        );
+    }
+}
+
+/// REQ-9 `sample_weight` on the 30x5 design. Live oracle:
+///   python3 -c "import numpy as np; from sklearn.linear_model import BayesianRidge; \
+///     X=<30x5 dataset()>; y=<dataset()>; \
+///     sw=np.abs(np.sin(np.arange(30)*0.7))+0.1; \
+///     m=BayesianRidge().fit(X,y,sample_weight=sw); \
+///     print(m.coef_.tolist(), m.intercept_, m.alpha_, m.lambda_)"
+/// -> coef_=[3.2341913556739508,-1.7188462295655007,0.04439303444969286,
+///           -0.34499946108592144,1.1215298680262287], intercept_=-0.020045205577820566,
+///    alpha_=7.630554837090482, lambda_=0.3119745275723933
+#[test]
+fn divergence_bayesian_ridge_sample_weight() {
+    const SK_COEF_W: [f64; 5] = [
+        3.2341913556739508,
+        -1.7188462295655007,
+        0.04439303444969286,
+        -0.34499946108592144,
+        1.1215298680262287,
+    ];
+    const SK_INTERCEPT_W: f64 = -0.020045205577820566;
+    const SK_ALPHA_W: f64 = 7.630554837090482;
+    const SK_LAMBDA_W: f64 = 0.3119745275723933;
+
+    let (x, y) = dataset();
+    // sw[i] = |sin(i*0.7)| + 0.1 — matches the oracle script exactly.
+    let sw: Array1<f64> = (0..30)
+        .map(|i| (f64::from(i) * 0.7).sin().abs() + 0.1)
+        .collect();
+
+    let fitted = BayesianRidge::<f64>::new()
+        .fit_with_sample_weight(&x, &y, Some(&sw))
+        .unwrap();
+    let coef = fitted.coefficients();
+    for (i, (&got, &want)) in coef.iter().zip(SK_COEF_W.iter()).enumerate() {
+        assert!(
+            (got - want).abs() < 1e-3 * want.abs().max(1.0),
+            "weighted coef_[{i}]: ferrolearn={got}, sklearn={want} (diff {})",
+            (got - want).abs()
+        );
+    }
+    assert!(
+        (fitted.intercept() - SK_INTERCEPT_W).abs() < 1e-3,
+        "weighted intercept_: ferrolearn={}, sklearn={SK_INTERCEPT_W}",
+        fitted.intercept()
+    );
+    assert!(
+        (fitted.alpha() - SK_ALPHA_W).abs() / SK_ALPHA_W < 1e-2,
+        "weighted alpha_: ferrolearn={}, sklearn={SK_ALPHA_W}",
+        fitted.alpha()
+    );
+    assert!(
+        (fitted.lambda() - SK_LAMBDA_W).abs() / SK_LAMBDA_W < 1e-2,
+        "weighted lambda_: ferrolearn={}, sklearn={SK_LAMBDA_W}",
+        fitted.lambda()
     );
 }

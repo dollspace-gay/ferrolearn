@@ -17,9 +17,13 @@
 //! p(y | X, alpha, lambda) ∝ N(y; 0, (1/alpha)*I + (1/lambda)*X X^T)
 //! ```
 //!
-//! After fitting, the model exposes the posterior mean (`coefficients`),
-//! the posterior covariance diagonal (`sigma`), the noise precision (`alpha`),
-//! and the weight precision (`lambda`).
+//! After fitting, the model exposes the posterior mean (`coefficients`), the
+//! posterior covariance diagonal (`sigma`) and full matrix (`sigma_full`,
+//! sklearn `sigma_`), the noise precision (`alpha`), the weight precision
+//! (`lambda`), the EM iteration count (`n_iter`), and — when built with
+//! `with_compute_score(true)` — the per-iteration log-marginal-likelihood
+//! sequence (`scores`). `predict_with_std` returns the predictive mean and
+//! standard deviation (sklearn `predict(return_std=True)`).
 //!
 //! # Examples
 //!
@@ -45,10 +49,10 @@
 //! | REQ-3 (alpha_init default = 1/Var(y)) | SHIPPED | `alpha_init: Option<F>` (default `None`), and `fn fit` sets `alpha = 1/(var(y)+eps)` when `None` (`_bayes.py:266-269`); `lambda_init: Option<F>` defaults to `1.0` (`_bayes.py:270-271`). |
 //! | REQ-4 (predict posterior mean) | SHIPPED | `fn predict` for `FittedBayesianRidge` computes `X·coef_ + intercept_` (`_bayes.py:365`). Consumer: `RsBayesianRidge` in `ferrolearn-python/src/extras.rs`. |
 //! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | `fn fit` centers and recovers `intercept = y_offset - X_offset·coef_` (`_bayes.py:339`); `impl HasCoefficients` exposes `coef_`/`intercept_`. |
-//! | REQ-6 (compute_score / scores_) | NOT-STARTED | open prereq blocker #467 — no `_log_marginal_likelihood` analog (`_bayes.py:396-426`). |
-//! | REQ-7 (n_iter_) | NOT-STARTED | open prereq blocker #468 — `FittedBayesianRidge` stores no iteration count (`_bayes.py:316`). |
-//! | REQ-8 (predict return_std / full sigma_) | NOT-STARTED | open prereq blocker #469 — `sigma` is the covariance diagonal, not the full `(n_features, n_features)` `sigma_` (`_bayes.py:333-337`); `predict` has no `return_std` path. |
-//! | REQ-9 (sample_weight) | NOT-STARTED | open prereq blocker #470 — `fn fit` takes only `(x, y)` (`_bayes.py:254-256`). |
+//! | REQ-6 (compute_score / scores_) | SHIPPED | `with_compute_score` on `struct BayesianRidge` (default `false`, `_bayes.py:198`); when set, `fn fit_with_sample_weight` accumulates `fn log_marginal_likelihood` (the exact `_bayes.py:396-426` LML: Gamma-hyperprior terms + `0.5*(p·log λ + n·log α − α·rmse − λ·‖coef‖² + logdet_sigma − n·log 2π)`) per iteration plus once post-loop, stored as `scores` with getter `fn scores` (length `n_iter()+1`). Consumer: `RsBayesianRidge::scores_` getter in `ferrolearn-python/src/extras.rs` → `_extras.py::BayesianRidge.scores_`. Verified by `divergence_bayesian_ridge_scores_ac1`/`_30x5_final` (Rust) + `test_bayesian_ridge_scores_matches_sklearn` (pytest) vs live sklearn. |
+//! | REQ-7 (n_iter_) | SHIPPED | `FittedBayesianRidge.n_iter` set to `last_iter + 1` in `fn fit_with_sample_weight` (`_bayes.py:316` `self.n_iter_ = iter_ + 1`); getter `fn n_iter`. Consumer: `RsBayesianRidge::n_iter_` getter (`extras.rs`) → `_extras.py::BayesianRidge.n_iter_`. Verified by `divergence_bayesian_ridge_n_iter` (== 5, sklearn oracle) + `test_bayesian_ridge_n_iter_matches_sklearn` (pytest). |
+//! | REQ-8 (predict return_std / full sigma_) | SHIPPED | `FittedBayesianRidge.sigma_full` is the full `(n_features, n_features)` covariance `(1/α)·Vhᵀ·diag(1/(eig+λ/α))·Vh` (`_bayes.py:333-337`), getter `fn sigma_full`; `fn predict_with_std` returns `(mean, sqrt(diag(X·sigma_·Xᵀ)+1/α))` (`_bayes.py:367-371`). Consumer: `RsBayesianRidge::predict(return_std=True)` + `sigma_` getter (`extras.rs`) → `_extras.py::BayesianRidge.predict`/`sigma_`. Verified by `divergence_bayesian_ridge_return_std_ac1` (Rust) + `test_bayesian_ridge_return_std_matches_sklearn`/`_sigma_full_matches_sklearn` (pytest). |
+//! | REQ-9 (sample_weight) | SHIPPED | `fn fit_with_sample_weight(x, y, Option<&Array1<F>>)` rescales centered `(X, y)` by `sqrt(sample_weight)` via `fn rescale_data` (sklearn `_rescale_data`, `_bayes.py:254-256`) with weighted offsets via `fn weighted_means`; `Fit::fit` delegates `None` (byte-identical). Consumer: `RsBayesianRidge::fit(x, y, sample_weight=None)` (`extras.rs`) → `_extras.py::BayesianRidge.fit`. Verified by `divergence_bayesian_ridge_sample_weight` (Rust) + `test_bayesian_ridge_sample_weight_matches_sklearn` (pytest) vs live sklearn. |
 //! | REQ-10 (ferray substrate) | SHIPPED (SVD) | the SVD runs on `ferray::linalg::svd` (`ferray-linalg/src/decomp/svd.rs:40`), bridged ndarray↔ferray at the `fn fit` boundary (R-SUBSTRATE-4), mirroring sklearn `scipy.linalg.svd` (`_bayes.py:287`). Remaining `ndarray` array-type migration tracked by #471. |
 
 use ferray::linalg::{LinalgFloat, svd};
@@ -94,6 +98,10 @@ pub struct BayesianRidge<F> {
     /// Initial weight precision (lambda). `None` (the default) means `1.0`,
     /// matching sklearn's `lambda_init=None`. Must be positive when set.
     pub lambda_init: Option<F>,
+    /// If `true`, accumulate the log marginal likelihood at each EM iteration
+    /// into `scores_` (sklearn `compute_score`, default `false`,
+    /// `_bayes.py:198`).
+    pub compute_score: bool,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
 }
@@ -118,6 +126,7 @@ impl<F: Float + FromPrimitive> BayesianRidge<F> {
             lambda_2: eps6,
             alpha_init: None,
             lambda_init: None,
+            compute_score: false,
             fit_intercept: true,
         }
     }
@@ -179,6 +188,16 @@ impl<F: Float + FromPrimitive> BayesianRidge<F> {
         self
     }
 
+    /// Set whether to compute the log marginal likelihood at each iteration
+    /// (sklearn `compute_score`, `_bayes.py:198`). When `true`, the converged
+    /// model's [`FittedBayesianRidge::scores`] holds the per-iteration LML
+    /// sequence (length `n_iter_ + 1`); when `false` it is empty.
+    #[must_use]
+    pub fn with_compute_score(mut self, compute_score: bool) -> Self {
+        self.compute_score = compute_score;
+        self
+    }
+
     /// Set whether to fit an intercept term.
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
@@ -196,8 +215,11 @@ impl<F: Float + FromPrimitive> Default for BayesianRidge<F> {
 /// Fitted Bayesian Ridge Regression model.
 ///
 /// Stores the posterior mean coefficients, intercept, estimated noise
-/// precision (`alpha`), weight precision (`lambda`), and the diagonal
-/// of the posterior covariance matrix (`sigma`).
+/// precision (`alpha`), weight precision (`lambda`), the diagonal of the
+/// posterior covariance matrix (`sigma`), the full posterior covariance
+/// matrix (`sigma_full`, sklearn `sigma_`), the EM iteration count
+/// (`n_iter`), and the optional per-iteration log-marginal-likelihood
+/// sequence (`scores`).
 #[derive(Debug, Clone)]
 pub struct FittedBayesianRidge<F> {
     /// Posterior mean coefficient vector.
@@ -210,6 +232,16 @@ pub struct FittedBayesianRidge<F> {
     lambda: F,
     /// Diagonal of the posterior covariance matrix `Sigma`.
     sigma: Array1<F>,
+    /// Full `(n_features, n_features)` posterior covariance matrix, mirroring
+    /// sklearn's `sigma_` (`_bayes.py:333-337`).
+    sigma_full: Array2<F>,
+    /// Actual number of EM iterations run, mirroring sklearn's `n_iter_`
+    /// (`_bayes.py:316`, `iter_ + 1`).
+    n_iter: usize,
+    /// Per-iteration log marginal likelihood (sklearn `scores_`,
+    /// `_bayes.py:283/302/330`). Empty unless `compute_score` was set;
+    /// otherwise length `n_iter + 1`.
+    scores: Vec<F>,
 }
 
 impl<F: Float> FittedBayesianRidge<F> {
@@ -226,6 +258,25 @@ impl<F: Float> FittedBayesianRidge<F> {
     /// Returns the diagonal of the posterior covariance matrix.
     pub fn sigma(&self) -> &Array1<F> {
         &self.sigma
+    }
+
+    /// Returns the full `(n_features, n_features)` posterior covariance matrix
+    /// (sklearn `sigma_`, `_bayes.py:333-337`).
+    pub fn sigma_full(&self) -> &Array2<F> {
+        &self.sigma_full
+    }
+
+    /// Returns the actual number of EM iterations run to reach the stopping
+    /// criterion (sklearn `n_iter_`, `_bayes.py:316`).
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+
+    /// Returns the per-iteration log-marginal-likelihood sequence (sklearn
+    /// `scores_`, `_bayes.py:283/302/330`). Empty unless the model was built
+    /// with `with_compute_score(true)`; otherwise of length `n_iter() + 1`.
+    pub fn scores(&self) -> &[F] {
+        &self.scores
     }
 }
 
@@ -325,15 +376,100 @@ fn update_coef<F: Float + ScalarOperand + 'static>(
     (coef, rmse)
 }
 
-impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
-    for BayesianRidge<F>
-{
-    type Fitted = FittedBayesianRidge<F>;
-    type Error = FerroError;
+/// Hyperprior shape/rate pairs `(alpha_1, alpha_2, lambda_1, lambda_2)` passed
+/// through to [`log_marginal_likelihood`].
+type Hyperpriors<F> = (F, F, F, F);
 
-    /// Fit the Bayesian Ridge model by MacKay (1992) evidence maximization,
-    /// mirroring `sklearn.linear_model.BayesianRidge.fit`
-    /// (`sklearn/linear_model/_bayes.py:217-339`).
+/// Log marginal likelihood of the Bayesian-ridge evidence, mirroring
+/// scikit-learn's `BayesianRidge._log_marginal_likelihood`
+/// (`sklearn/linear_model/_bayes.py:396-426`).
+///
+/// For the `n_samples > n_features` regime (the only regime the ferrolearn fit
+/// exercises) the log-determinant of the posterior covariance is
+/// `logdet_sigma = -sum(log(lambda_ + alpha_ * eigen_vals_))` (`_bayes.py:409`),
+/// and the score is the sum of the Gamma-hyperprior terms and the evidence
+/// terms (`_bayes.py:415-424`):
+///
+/// ```text
+/// score = lambda_1*log(lambda_) - lambda_2*lambda_
+///       + alpha_1*log(alpha_)  - alpha_2*alpha_
+///       + 0.5*( n_features*log(lambda_) + n_samples*log(alpha_)
+///               - alpha_*rmse - lambda_*sum(coef²) + logdet_sigma
+///               - n_samples*log(2π) )
+/// ```
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors sklearn's BayesianRidge._log_marginal_likelihood(self, n_samples, \
+              n_features, eigen_vals, alpha_, lambda_, coef, rmse) — these are the \
+              intrinsic LML inputs (_bayes.py:396), with the four Gamma hyperpriors \
+              passed as one tuple"
+)]
+fn log_marginal_likelihood<F: Float + FromPrimitive>(
+    n_samples: usize,
+    n_features: usize,
+    eigen_vals: &Array1<F>,
+    alpha: F,
+    lambda: F,
+    coef: &Array1<F>,
+    rmse: F,
+    hyperpriors: Hyperpriors<F>,
+) -> F {
+    let (alpha_1, alpha_2, lambda_1, lambda_2) = hyperpriors;
+    let zero = F::zero();
+    let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+    let two_pi = F::from(std::f64::consts::TAU).unwrap_or_else(F::one);
+
+    let n_s = F::from(n_samples).unwrap_or_else(F::one);
+    let n_f = F::from(n_features).unwrap_or_else(F::one);
+
+    // n_samples > n_features branch (`_bayes.py:408-409`).
+    // logdet_sigma = -sum(log(lambda_ + alpha_ * eigen_vals_)).
+    let logdet_sigma: F = eigen_vals
+        .iter()
+        .map(|&ev| (lambda + alpha * ev).ln())
+        .fold(zero, |acc, t| acc + t);
+    let logdet_sigma = -logdet_sigma;
+
+    let coef_sq: F = coef.iter().map(|&c| c * c).fold(zero, |a, b| a + b);
+
+    let mut score = lambda_1 * lambda.ln() - lambda_2 * lambda;
+    score = score + alpha_1 * alpha.ln() - alpha_2 * alpha;
+    score = score
+        + half
+            * (n_f * lambda.ln() + n_s * alpha.ln() - alpha * rmse - lambda * coef_sq
+                + logdet_sigma
+                - n_s * two_pi.ln());
+    score
+}
+
+/// Rescale `(X, y)` by `sqrt(sample_weight)` per sample, mirroring
+/// scikit-learn's `_rescale_data` (`sklearn/linear_model/_base.py`, applied at
+/// `_bayes.py:254-256`). This is the sample-weight implementation: a weighted
+/// least-squares fit is an ordinary fit on the rescaled data.
+fn rescale_data<F: Float>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    sample_weight: &Array1<F>,
+) -> (Array2<F>, Array1<F>) {
+    let sqrt_sw: Array1<F> = sample_weight.mapv(|w| w.sqrt());
+    let mut x_scaled = x.clone();
+    for (mut row, &s) in x_scaled.outer_iter_mut().zip(sqrt_sw.iter()) {
+        row.mapv_inplace(|v| v * s);
+    }
+    let y_scaled = y * &sqrt_sw;
+    (x_scaled, y_scaled)
+}
+
+impl<F: LinalgFloat + ScalarOperand + FromPrimitive> BayesianRidge<F> {
+    /// Fit the Bayesian Ridge model with optional per-sample weights, mirroring
+    /// `sklearn.linear_model.BayesianRidge.fit(X, y, sample_weight=None)`
+    /// (`sklearn/linear_model/_bayes.py:217-341`).
+    ///
+    /// When `sample_weight` is `Some`, `X` and `y` are rescaled by
+    /// `sqrt(sample_weight)` AFTER centering, exactly as sklearn applies
+    /// `_rescale_data` after `_preprocess_data` (`_bayes.py:246-256`); a
+    /// weighted least-squares fit is then an ordinary fit on the rescaled data.
+    /// Passing `None` is byte-identical to [`Fit::fit`].
     ///
     /// After centering (when `fit_intercept`), the (thin) SVD `X = U S Vᵀ`
     /// gives `eigen_vals_ = S²` (`_bayes.py:287-288`). Each iteration updates
@@ -348,14 +484,23 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
     /// ```
     ///
     /// converging when `sum(|coef_old - coef_|) < tol` (`_bayes.py:310`).
+    /// `n_iter_` is set to `iter_ + 1` (`_bayes.py:316`); when `compute_score`
+    /// is set, the log marginal likelihood is accumulated per iteration plus
+    /// once after the loop (`_bayes.py:283/302/330`).
     ///
     /// # Errors
     ///
-    /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
+    /// - [`FerroError::ShapeMismatch`] — sample count mismatch (`y` or
+    ///   `sample_weight`).
     /// - [`FerroError::InvalidParameter`] — non-positive `alpha_init`/`lambda_init`.
     /// - [`FerroError::InsufficientSamples`] — fewer than 2 samples.
     /// - [`FerroError::NumericalInstability`] — SVD or numerical failure.
-    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedBayesianRidge<F>, FerroError> {
+    pub fn fit_with_sample_weight(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+        sample_weight: Option<&Array1<F>>,
+    ) -> Result<FittedBayesianRidge<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
         if n_samples != y.len() {
@@ -363,6 +508,16 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        if let Some(sw) = sample_weight
+            && sw.len() != n_samples
+        {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sw.len()],
+                context: "sample_weight length must match number of samples in X".into(),
             });
         }
 
@@ -398,16 +553,24 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
         let n_f = <F as num_traits::NumCast>::from(n_samples).unwrap_or(one);
 
         // Center data for intercept (sklearn `_preprocess_data`, `_bayes.py:246`).
-        let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
-            let x_mean = x
-                .mean_axis(Axis(0))
-                .ok_or_else(|| FerroError::NumericalInstability {
-                    message: "failed to compute column means".into(),
-                })?;
-            let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
-                message: "failed to compute target mean".into(),
-            })?;
-
+        // sklearn's `_preprocess_data` computes the WEIGHTED column/target means
+        // when `sample_weight` is given; the rescaling itself (`_rescale_data`,
+        // `_bayes.py:254-256`) then multiplies the centered data by sqrt(w).
+        let (x_centered, y_centered, x_mean, y_mean) = if self.fit_intercept {
+            let (x_mean, y_mean) = match sample_weight {
+                Some(sw) => weighted_means(x, y, sw)?,
+                None => {
+                    let x_mean =
+                        x.mean_axis(Axis(0))
+                            .ok_or_else(|| FerroError::NumericalInstability {
+                                message: "failed to compute column means".into(),
+                            })?;
+                    let y_mean = y.mean().ok_or_else(|| FerroError::NumericalInstability {
+                        message: "failed to compute target mean".into(),
+                    })?;
+                    (x_mean, y_mean)
+                }
+            };
             let x_c = x - &x_mean;
             let y_c = y - y_mean;
             (x_c, y_c, Some(x_mean), Some(y_mean))
@@ -415,9 +578,15 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
             (x.clone(), y.clone(), None, None)
         };
 
+        // sample_weight: rescale centered (X, y) by sqrt(w) (`_bayes.py:254-256`).
+        let (x_work, y_work) = match sample_weight {
+            Some(sw) => rescale_data(&x_centered, &y_centered, sw),
+            None => (x_centered, y_centered),
+        };
+
         // Initialization (`_bayes.py:262-271`): eps = finfo(dtype).eps;
         // alpha_ = 1/(Var(y)+eps) when alpha_init is None; lambda_ = 1 when
-        // lambda_init is None.
+        // lambda_init is None. sklearn computes Var on the (rescaled) y.
         let eps = <F as Float>::epsilon();
         let mut alpha = match self.alpha_init {
             Some(a0) => a0,
@@ -438,16 +607,47 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
         let alpha_2 = self.alpha_2;
         let lambda_1 = self.lambda_1;
         let lambda_2 = self.lambda_2;
+        let hyperpriors = (alpha_1, alpha_2, lambda_1, lambda_2);
 
         // `coef_old_` tracks the previous iterate for the convergence check;
         // sklearn recomputes `coef_` once more after the loop (`_bayes.py:322`),
         // so the in-loop posterior mean is not itself the returned coefficient.
         let mut coef_old: Option<Array1<F>> = None;
+        let mut scores: Vec<F> = Vec::new();
+
+        // The LOCAL `coef_` from the last in-loop iteration. sklearn's post-loop
+        // `_log_marginal_likelihood` (`_bayes.py:327`) is passed this loop-local
+        // `coef_` (the posterior mean from the final iteration, computed with the
+        // pre-final alpha_/lambda_) — NOT the recomputed `self.coef_` of
+        // `_bayes.py:322` — paired with the freshly recomputed post-loop `rmse_`.
+        // We retain it to replicate sklearn's exact `scores_[-1]` (#2162).
+        let mut last_in_loop_coef: Option<Array1<F>> = None;
+
+        // `n_iter_` = iter_ + 1 after the loop (`_bayes.py:316`). The loop always
+        // runs at least once (max_iter >= 1 in sklearn's constraint), so track
+        // the last `iter_`.
+        let mut last_iter: usize = 0;
 
         // Convergence loop (`_bayes.py:291-314`).
         for iter_ in 0..self.max_iter {
+            last_iter = iter_;
             let (coef_new, rmse) =
                 update_coef(&x_work, &y_work, &u, &vt, &s, &eigen_vals, alpha, lambda);
+
+            // compute_score: log marginal likelihood with the CURRENT
+            // alpha_/lambda_ and the just-computed coef_/rmse_ (`_bayes.py:297-302`).
+            if self.compute_score {
+                scores.push(log_marginal_likelihood(
+                    n_samples,
+                    n_features,
+                    &eigen_vals,
+                    alpha,
+                    lambda,
+                    &coef_new,
+                    rmse,
+                    hyperpriors,
+                ));
+            }
 
             // gamma_ = sum((alpha_ * eigen_vals_) / (lambda_ + alpha_ * eigen_vals_))
             let gamma: F = eigen_vals
@@ -472,30 +672,60 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
                     .map(|(&o, &c)| (o - c).abs())
                     .fold(zero, |a, b| a + b);
                 if delta < self.tol {
+                    last_in_loop_coef = Some(coef_new);
                     break;
                 }
             }
+            last_in_loop_coef = Some(coef_new.clone());
             coef_old = Some(coef_new);
         }
 
-        // Final coef_ update with the converged alpha_/lambda_ (`_bayes.py:322`).
-        let (coef, _rmse) = update_coef(&x_work, &y_work, &u, &vt, &s, &eigen_vals, alpha, lambda);
+        let n_iter = last_iter + 1;
 
-        // Posterior covariance diagonal: sigma_ = (1/alpha_) * Vhᵀ ·
-        // diag(1/(eigen_vals_ + lambda_/alpha_)) · Vh (`_bayes.py:333-337`);
-        // we expose its diagonal.
+        // Final coef_ update with the converged alpha_/lambda_ (`_bayes.py:322`).
+        let (coef, final_rmse) =
+            update_coef(&x_work, &y_work, &u, &vt, &s, &eigen_vals, alpha, lambda);
+
+        // Final score with the converged alpha_/lambda_ (`_bayes.py:325-330`).
+        // R-DEV-1: sklearn's line 327 passes the LOOP-LOCAL `coef_` (the last
+        // in-loop posterior mean) together with the freshly RECOMPUTED `rmse_`
+        // — a mismatched pair, since line 322 only rebinds `self.coef_`, not the
+        // local `coef_`. We replicate that exactly: `last_in_loop_coef` (NOT the
+        // recomputed `coef`) paired with `final_rmse` (#2162). The fitted
+        // `coef`/predict path keeps the recomputed `coef` (line 322's
+        // `self.coef_`) and is unaffected.
+        if self.compute_score {
+            let score_coef = last_in_loop_coef.as_ref().unwrap_or(&coef);
+            scores.push(log_marginal_likelihood(
+                n_samples,
+                n_features,
+                &eigen_vals,
+                alpha,
+                lambda,
+                score_coef,
+                final_rmse,
+                hyperpriors,
+            ));
+        }
+
+        // Full posterior covariance sigma_ = (1/alpha_) * Vhᵀ ·
+        // diag(1/(eigen_vals_ + lambda_/alpha_)) · Vh (`_bayes.py:333-337`).
         let ratio = lambda / alpha;
         let inv_alpha = one / alpha;
-        let mut sigma_diag = Array1::<F>::zeros(n_features);
         let k = s.len();
-        for j in 0..n_features {
-            let mut acc = zero;
-            for i in 0..k {
-                let vij = vt[[i, j]];
-                acc += (vij * vij) / (eigen_vals[i] + ratio);
+        // scaled_rows_i = Vh_i / (eigen_vals_i + lambda_/alpha_); sigma_full =
+        // (1/alpha_) * Vhᵀ @ scaled_rows.
+        let mut sigma_full = Array2::<F>::zeros((n_features, n_features));
+        for a in 0..n_features {
+            for b in 0..n_features {
+                let mut acc = zero;
+                for i in 0..k {
+                    acc += (vt[[i, a]] * vt[[i, b]]) / (eigen_vals[i] + ratio);
+                }
+                sigma_full[[a, b]] = inv_alpha * acc;
             }
-            sigma_diag[j] = inv_alpha * acc;
         }
+        let sigma_diag: Array1<F> = (0..n_features).map(|j| sigma_full[[j, j]]).collect();
 
         // intercept_ = y_offset - X_offset · coef_ (`_bayes.py:339`,
         // `_set_intercept`).
@@ -511,8 +741,63 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
             alpha,
             lambda,
             sigma: sigma_diag,
+            sigma_full,
+            n_iter,
+            scores,
         })
     }
+}
+
+impl<F: LinalgFloat + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
+    for BayesianRidge<F>
+{
+    type Fitted = FittedBayesianRidge<F>;
+    type Error = FerroError;
+
+    /// Fit the Bayesian Ridge model by MacKay (1992) evidence maximization,
+    /// mirroring `sklearn.linear_model.BayesianRidge.fit`
+    /// (`sklearn/linear_model/_bayes.py:217-341`). This delegates to
+    /// [`BayesianRidge::fit_with_sample_weight`] with `sample_weight = None`.
+    ///
+    /// # Errors
+    ///
+    /// See [`BayesianRidge::fit_with_sample_weight`].
+    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedBayesianRidge<F>, FerroError> {
+        self.fit_with_sample_weight(x, y, None)
+    }
+}
+
+/// Weighted column means of `X` and weighted mean of `y` using `sample_weight`,
+/// mirroring the weighted averages sklearn's `_preprocess_data` computes when
+/// `sample_weight` is supplied (`sklearn/linear_model/_base.py`, used at
+/// `_bayes.py:246-252`): `X_offset_ = average(X, axis=0, weights=sw)`,
+/// `y_offset_ = average(y, weights=sw)`.
+fn weighted_means<F: Float>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    sample_weight: &Array1<F>,
+) -> Result<(Array1<F>, F), FerroError> {
+    let n_features = x.ncols();
+    let sw_sum = sample_weight.iter().fold(F::zero(), |a, &b| a + b);
+    if sw_sum <= F::zero() {
+        return Err(FerroError::InvalidParameter {
+            name: "sample_weight".into(),
+            reason: "sum of sample_weight must be positive".into(),
+        });
+    }
+    let mut x_mean = Array1::<F>::zeros(n_features);
+    for (row, &w) in x.outer_iter().zip(sample_weight.iter()) {
+        for (j, &v) in row.iter().enumerate() {
+            x_mean[j] = x_mean[j] + w * v;
+        }
+    }
+    x_mean.mapv_inplace(|s| s / sw_sum);
+    let y_mean = y
+        .iter()
+        .zip(sample_weight.iter())
+        .fold(F::zero(), |acc, (&yi, &w)| acc + w * yi)
+        / sw_sum;
+    Ok((x_mean, y_mean))
 }
 
 /// Population variance `mean((v - mean(v))²)`, matching numpy's `np.var`
@@ -557,6 +842,53 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
 
         let preds = x.dot(&self.coefficients) + self.intercept;
         Ok(preds)
+    }
+}
+
+impl<F: Float + ScalarOperand + 'static> FittedBayesianRidge<F> {
+    /// Predict the posterior mean AND the predictive standard deviation,
+    /// mirroring `sklearn.linear_model.BayesianRidge.predict(X, return_std=True)`
+    /// (`sklearn/linear_model/_bayes.py:367-371`):
+    ///
+    /// ```text
+    /// y_mean = X @ coef_ + intercept_
+    /// y_std  = sqrt( (X @ sigma_ * X).sum(axis=1) + 1/alpha_ )
+    /// ```
+    ///
+    /// Returns `(y_mean, y_std)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
+    /// match the fitted model.
+    pub fn predict_with_std(&self, x: &Array2<F>) -> Result<(Array1<F>, Array1<F>), FerroError> {
+        let n_features = x.ncols();
+        if n_features != self.coefficients.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.coefficients.len()],
+                actual: vec![n_features],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+
+        let y_mean = x.dot(&self.coefficients) + self.intercept;
+
+        // sigmas_squared_data = (X @ sigma_ * X).sum(axis=1) (`_bayes.py:369`).
+        let xs = x.dot(&self.sigma_full); // (n_samples, n_features)
+        let inv_alpha = F::one() / self.alpha;
+        let y_std: Array1<F> = xs
+            .outer_iter()
+            .zip(x.outer_iter())
+            .map(|(xs_row, x_row)| {
+                let q = xs_row
+                    .iter()
+                    .zip(x_row.iter())
+                    .fold(F::zero(), |acc, (&a, &b)| acc + a * b);
+                (q + inv_alpha).sqrt()
+            })
+            .collect();
+
+        Ok((y_mean, y_std))
     }
 }
 

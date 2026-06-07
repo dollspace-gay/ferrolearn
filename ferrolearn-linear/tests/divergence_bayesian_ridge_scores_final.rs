@@ -56,8 +56,6 @@ fn dataset() -> (Array2<f64>, Array1<f64>) {
 /// and with non-default hyperpriors (alpha_1=1e-3, alpha_2=2e-3,
 ///    lambda_1=3e-3, lambda_2=4e-3): -> -31.375951060428644
 #[test]
-#[ignore = "divergence: BayesianRidge scores_[-1] uses last-in-loop coef \
-           per sklearn _bayes.py:327; ferrolearn uses final recomputed coef; tracking #2162"]
 fn divergence_bayesian_ridge_scores_final_postloop_coef() {
     const SK_FINAL_DEFAULT: f64 = -31.363808685342036;
     const SK_FINAL_NONDEFAULT: f64 = -31.375951060428644;
