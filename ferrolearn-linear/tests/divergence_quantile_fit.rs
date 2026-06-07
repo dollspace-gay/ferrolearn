@@ -409,3 +409,138 @@ fn near_match_median_no_penalty() {
          ferrolearn {intercept}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-6 (n_iter_): the ferrolearn analog of sklearn's `n_iter_`
+// (`_quantile.py:300` `self.n_iter_ = result.nit`).
+//
+// R-DEV-7: ferrolearn solves the SAME LP, but with a from-scratch two-phase
+// PRIMAL SIMPLEX, NOT scipy's HiGHS. The pivot count is therefore a DIFFERENT
+// integer from scipy's `result.nit` (HiGHS on this dataset reports n_iter=31
+// for "highs"/"highs-ds", 8 for "highs-ipm"). The contract we pin is the one
+// that holds across solvers, per R-DEV-7: `n_iter_` is a POSITIVE integer,
+// `<= max_iter`, and DETERMINISTIC for a given dataset — NOT `== sklearn`.
+// ---------------------------------------------------------------------------
+
+/// `n_iter_` is a positive pivot count bounded by `max_iter` on the oracle
+/// dataset (the honest ferrolearn two-phase-simplex count, NOT scipy's
+/// `result.nit`; R-DEV-7).
+#[test]
+fn n_iter_positive_and_bounded_on_oracle() {
+    let (x, y) = oracle_dataset();
+    let max_iter = 20000;
+    let fitted = QuantileRegressor::<f64>::new()
+        .with_quantile(0.5)
+        .with_alpha(0.0)
+        .with_max_iter(max_iter)
+        .fit(&x, &y)
+        .unwrap();
+    let n = fitted.n_iter();
+    assert!(n > 0, "n_iter must be positive, got {n}");
+    assert!(
+        n <= max_iter,
+        "n_iter {n} must not exceed max_iter {max_iter}"
+    );
+}
+
+/// `n_iter_` is deterministic across repeated fits of the same dataset.
+#[test]
+fn n_iter_deterministic_on_oracle() {
+    let (x, y) = oracle_dataset();
+    let fit = |q: f64| {
+        QuantileRegressor::<f64>::new()
+            .with_quantile(q)
+            .with_alpha(0.0)
+            .with_max_iter(20000)
+            .fit(&x, &y)
+            .unwrap()
+            .n_iter()
+    };
+    assert_eq!(fit(0.5), fit(0.5), "n_iter must be deterministic (q=0.5)");
+    assert_eq!(fit(0.8), fit(0.8), "n_iter must be deterministic (q=0.8)");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-7 (solver / solver_options): sklearn's `_parameter_constraints["solver"]`
+// (`_quantile.py:114-124`) is `StrOptions({"highs-ds","highs-ipm","highs",
+// "interior-point","revised simplex"})` and `solver_options` is `[dict, None]`.
+// The HiGHS family + "revised simplex" all reach the SAME unique LP vertex
+// (verified live: identical coef_/intercept_ across them). ferrolearn maps each
+// to its two-phase simplex, so `coef_` is byte-identical across them and equals
+// the default-"highs" fit. `interior-point` is rejected (sklearn raises
+// ValueError on scipy>=1.11). An invalid string is rejected (sklearn raises
+// InvalidParameterError, a ValueError subclass).
+// ---------------------------------------------------------------------------
+
+/// Solver "highs"/"highs-ds"/"highs-ipm"/"revised simplex" all give the SAME
+/// coef_/intercept_ as the default fit (they reach the same LP vertex,
+/// `_quantile.py:250`, verified against the live oracle which returns
+/// identical coef_ for all four). The default-"highs" coef_ also still matches
+/// the live sklearn HiGHS optimum to 1e-6 (the REQ-1 regression guard).
+#[test]
+fn solver_family_gives_identical_coef_and_matches_sklearn() {
+    let (x, y) = oracle_dataset();
+    // SK_Q08_A0_COEF/SK_Q08_A0_INTERCEPT are the live HiGHS oracle values at
+    // q=0.8, alpha=0.0 (defined above; NOT copied from ferrolearn).
+    let default = QuantileRegressor::<f64>::new()
+        .with_quantile(0.8)
+        .with_alpha(0.0)
+        .with_max_iter(20000)
+        .fit(&x, &y)
+        .unwrap();
+    // REQ-1 regression guard: default "highs" still matches the live oracle.
+    for (j, &sk) in SK_Q08_A0_COEF.iter().enumerate() {
+        assert!(
+            (default.coefficients()[j] - sk).abs() < 1e-6,
+            "default-solver coef[{j}] regression: sklearn {sk}, ferrolearn {}",
+            default.coefficients()[j]
+        );
+    }
+    assert!((default.intercept() - SK_Q08_A0_INTERCEPT).abs() < 1e-6);
+
+    for solver in ["highs", "highs-ds", "highs-ipm", "revised simplex"] {
+        let f = QuantileRegressor::<f64>::new()
+            .with_quantile(0.8)
+            .with_alpha(0.0)
+            .with_max_iter(20000)
+            .with_solver(solver)
+            .fit(&x, &y)
+            .unwrap();
+        for j in 0..3 {
+            assert!(
+                (f.coefficients()[j] - default.coefficients()[j]).abs() < 1e-9,
+                "solver {solver:?} coef[{j}] must equal the default-highs vertex: \
+                 {} vs {}",
+                f.coefficients()[j],
+                default.coefficients()[j]
+            );
+        }
+        assert!((f.intercept() - default.intercept()).abs() < 1e-9);
+    }
+}
+
+/// An invalid solver string is rejected — mirroring sklearn's
+/// `InvalidParameterError` (a `ValueError` subclass) from the `StrOptions`
+/// constraint (`_quantile.py:114-124`).
+#[test]
+fn invalid_solver_string_is_rejected() {
+    let (x, y) = oracle_dataset();
+    let res = QuantileRegressor::<f64>::new()
+        .with_solver("not-a-solver")
+        .fit(&x, &y);
+    assert!(res.is_err(), "invalid solver string must be rejected");
+}
+
+/// `interior-point` is rejected — mirroring sklearn raising `ValueError`
+/// ("not anymore available in SciPy >= 1.11.0", `_quantile.py:196-199`).
+#[test]
+fn interior_point_solver_is_rejected() {
+    let (x, y) = oracle_dataset();
+    let res = QuantileRegressor::<f64>::new()
+        .with_solver("interior-point")
+        .fit(&x, &y);
+    assert!(
+        res.is_err(),
+        "interior-point must be rejected (removed in scipy 1.11)"
+    );
+}

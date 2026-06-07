@@ -1056,3 +1056,135 @@ def test_ard_sigma_matches_sklearn():
     fr = fl.ARDRegression(max_iter=1000).fit(X, y)
     assert fr.sigma_.shape == sk.sigma_.shape == (2, 2)
     np.testing.assert_allclose(fr.sigma_, sk.sigma_, rtol=1e-5, atol=1e-9)
+
+
+# ===========================================================================
+# QuantileRegressor REQ-6 (n_iter_) + REQ-7 (solver / solver_options) (#507/#508)
+# ---------------------------------------------------------------------------
+# Live sklearn 1.5.2 oracle: `sklearn.linear_model.QuantileRegressor`
+# (`_quantile.py:128-141`/`:300`). The HiGHS family + "revised simplex" all
+# reach the SAME unique LP vertex; "interior-point" raises ValueError
+# (removed in scipy>=1.11); an invalid solver string raises a ValueError
+# (InvalidParameterError ⊂ ValueError). `solver_options` is `[dict, None]`.
+# R-DEV-7: ferrolearn's `n_iter_` is the honest two-phase-simplex pivot count,
+# NOT scipy's `result.nit`, so it is a positive int <= max_iter and
+# deterministic — NOT asserted == sklearn.
+# ===========================================================================
+
+from sklearn.linear_model import QuantileRegressor as SkQuantileRegressor
+
+
+def _quantile_dataset():
+    rng = np.random.RandomState(0)
+    X = rng.randn(30, 3)
+    y = X @ np.array([1.0, 2.0, -1.0]) + 0.5 * rng.randn(30)
+    return X, y
+
+
+def test_quantile_default_solver_predict_matches_sklearn():
+    """REQ-1 regression guard + REQ-7 default: with the default solver="highs"
+    ferrolearn's predictions match the live sklearn HiGHS LP optimum
+    (`_quantile.py:300-304`) to 1e-6 — the new ctor params did not perturb the
+    fit. (The `_extras.py` wrapper exposes the fit via `predict`; `coef_` is the
+    separately-tracked REQ-MISSING-METHODS surface.) `predict = X@coef_ +
+    intercept_`, so prediction parity pins coef_/intercept_ parity."""
+    X, y = _quantile_dataset()
+    sk = SkQuantileRegressor(quantile=0.8, alpha=0.0).fit(X, y)
+    fr = fl.QuantileRegressor(quantile=0.8, alpha=0.0).fit(X, y)
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), rtol=0, atol=1e-6)
+
+
+def test_quantile_highs_family_solvers_give_identical_predict():
+    """REQ-7: solver in {"highs","highs-ds","highs-ipm","revised simplex"} all
+    reach the SAME LP vertex (verified live: sklearn returns identical
+    predictions for all of them), so ferrolearn's predictions are unchanged
+    across them and equal the default fit (`_quantile.py:114-124`/`:250`)."""
+    X, y = _quantile_dataset()
+    # Live oracle: all four solvers give the same sklearn prediction.
+    sk_default = SkQuantileRegressor(quantile=0.5, alpha=0.0).fit(X, y)
+    fr_default = fl.QuantileRegressor(quantile=0.5, alpha=0.0).fit(X, y)
+    np.testing.assert_allclose(fr_default.predict(X), sk_default.predict(X),
+                               rtol=0, atol=1e-6)
+
+    for solver in ("highs", "highs-ds", "highs-ipm", "revised simplex"):
+        sk = SkQuantileRegressor(quantile=0.5, alpha=0.0, solver=solver).fit(X, y)
+        # sklearn itself returns the same vertex across these solvers.
+        np.testing.assert_allclose(sk.predict(X), sk_default.predict(X),
+                                   rtol=0, atol=1e-6)
+        fr = fl.QuantileRegressor(quantile=0.5, alpha=0.0, solver=solver).fit(X, y)
+        np.testing.assert_allclose(fr.predict(X), fr_default.predict(X),
+                                   rtol=0, atol=1e-9)
+
+
+def test_quantile_invalid_solver_raises_valueerror():
+    """REQ-7: an invalid solver string raises ValueError in BOTH sklearn
+    (InvalidParameterError ⊂ ValueError, `_quantile.py:114-124`) and
+    ferrolearn."""
+    X, y = _quantile_dataset()
+    with pytest.raises(ValueError):
+        SkQuantileRegressor(solver="not-a-solver").fit(X, y)
+    with pytest.raises(ValueError):
+        fl.QuantileRegressor(solver="not-a-solver").fit(X, y)
+
+
+def test_quantile_interior_point_raises_valueerror():
+    """REQ-7: "interior-point" was removed in scipy>=1.11; both sklearn
+    (`_quantile.py:196-199`) and ferrolearn raise ValueError."""
+    X, y = _quantile_dataset()
+    with pytest.raises(ValueError):
+        SkQuantileRegressor(solver="interior-point").fit(X, y)
+    with pytest.raises(ValueError):
+        fl.QuantileRegressor(solver="interior-point").fit(X, y)
+
+
+def test_quantile_solver_options_none_and_empty_accepted():
+    """REQ-7: `solver_options=None` and an empty dict are accepted (HiGHS tuning
+    knobs that do not change the optimum, `_quantile.py:206`); the fit (probed
+    via `predict`) is unchanged and still matches the sklearn oracle."""
+    X, y = _quantile_dataset()
+    sk = SkQuantileRegressor(quantile=0.5, alpha=0.0, solver_options=None).fit(X, y)
+    fr_none = fl.QuantileRegressor(quantile=0.5, alpha=0.0,
+                                   solver_options=None).fit(X, y)
+    fr_empty = fl.QuantileRegressor(quantile=0.5, alpha=0.0,
+                                    solver_options={}).fit(X, y)
+    np.testing.assert_allclose(fr_none.predict(X), sk.predict(X), rtol=0, atol=1e-6)
+    np.testing.assert_allclose(fr_empty.predict(X), fr_none.predict(X),
+                               rtol=0, atol=1e-12)
+
+
+def test_quantile_nonempty_solver_options_accepted_matches_sklearn():
+    """REQ-7 (#2168): sklearn's `solver_options` is `[dict, None]`
+    (`_quantile.py:125`), so a non-empty dict is a valid construction and sklearn
+    fits successfully — the options (`presolve`, `disp`, ...) are HiGHS tuning
+    knobs that do NOT change the LP optimum. ferrolearn must mirror that: it
+    ACCEPTS the dict, ignores it, and returns the SAME fit it does with
+    `solver_options=None`, matching the live sklearn oracle (R-CHAR-3)."""
+    X, y = _quantile_dataset()
+    sk = SkQuantileRegressor(
+        quantile=0.5, alpha=0.0, solver_options={"presolve": True}
+    ).fit(X, y)
+    fr = fl.QuantileRegressor(
+        quantile=0.5, alpha=0.0, solver_options={"presolve": True}
+    ).fit(X, y)
+    np.testing.assert_allclose(fr.predict(X), sk.predict(X), rtol=0, atol=1e-6)
+    # ... and identical to the solver_options=None fit (options are ignored).
+    fr_none = fl.QuantileRegressor(quantile=0.5, alpha=0.0).fit(X, y)
+    np.testing.assert_allclose(fr.predict(X), fr_none.predict(X), rtol=0, atol=1e-12)
+
+
+def test_quantile_n_iter_contract():
+    """REQ-6: `n_iter_` is a positive int <= max_iter and deterministic. R-DEV-7:
+    ferrolearn's two-phase-simplex pivot count is NOT scipy's HiGHS `result.nit`
+    (`_quantile.py:300`), so we assert the CONTRACT, not equality with sklearn.
+    sklearn's own n_iter_ is read only to confirm both are positive ints."""
+    X, y = _quantile_dataset()
+    max_iter = 20000
+    fr = fl.QuantileRegressor(quantile=0.5, alpha=0.0, max_iter=max_iter).fit(X, y)
+    assert isinstance(fr.n_iter_, int)
+    assert 0 < fr.n_iter_ <= max_iter
+    # Deterministic across refits.
+    fr2 = fl.QuantileRegressor(quantile=0.5, alpha=0.0, max_iter=max_iter).fit(X, y)
+    assert fr.n_iter_ == fr2.n_iter_
+    # sklearn also reports a positive int (different solver, different value).
+    sk = SkQuantileRegressor(quantile=0.5, alpha=0.0).fit(X, y)
+    assert int(sk.n_iter_) > 0

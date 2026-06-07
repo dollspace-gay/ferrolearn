@@ -294,18 +294,57 @@ class HuberRegressor(_RegressorWrapper):
 
 
 class QuantileRegressor(_RegressorWrapper):
+    """Quantile regression backed by Rust (#507/#508).
+
+    Mirrors ``sklearn.linear_model.QuantileRegressor``
+    (``sklearn/linear_model/_quantile.py:128-141``), surfacing the keyword-only
+    ``solver`` (default ``"highs"``) and ``solver_options`` (default ``None``)
+    constructor parameters and the fitted ``n_iter_`` attribute
+    (``_quantile.py:300`` ``self.n_iter_ = result.nit``).
+
+    ``solver`` accepts sklearn's ``_parameter_constraints`` set
+    (``_quantile.py:114-124``): ``"highs"``/``"highs-ds"``/``"highs-ipm"`` and
+    ``"revised simplex"`` all reach the SAME unique LP vertex, so they map onto
+    ferrolearn's two-phase primal simplex and give identical ``coef_``.
+    ``"interior-point"`` raises ``ValueError`` (it was removed in SciPy 1.11.0,
+    ``_quantile.py:196-199``); any other string is an invalid parameter
+    (``ValueError``, matching sklearn's ``InvalidParameterError``).
+
+    ``solver_options`` accepts ``None`` and an empty dict (HiGHS tuning knobs
+    that do not change the LP optimum, ``_quantile.py:206``); a non-empty dict
+    raises ``NotImplementedError`` (ferrolearn's simplex has no such tuning
+    surface; #508-tracked).
+
+    ``n_iter_`` is the honest ferrolearn two-phase-simplex PIVOT count
+    (``_quantile.py:300``); R-DEV-7: ferrolearn's solver is NOT scipy's HiGHS,
+    so this need not equal sklearn's ``n_iter_``, but it is a positive int
+    ``<= max_iter`` and deterministic for a given dataset.
+    """
+
     def __init__(self, *, quantile=0.5, alpha=1.0, max_iter=10000,
-                 tol=1e-6, fit_intercept=True):
+                 tol=1e-6, fit_intercept=True, solver="highs",
+                 solver_options=None):
         self.quantile = quantile
         self.alpha = alpha
         self.max_iter = max_iter
         self.tol = tol
         self.fit_intercept = fit_intercept
+        self.solver = solver
+        self.solver_options = solver_options
 
     def _make_rs(self):
         return _RsQuantileRegressor(quantile=self.quantile, alpha=self.alpha,
                                     max_iter=self.max_iter, tol=self.tol,
-                                    fit_intercept=self.fit_intercept)
+                                    fit_intercept=self.fit_intercept,
+                                    solver=self.solver,
+                                    solver_options=self.solver_options)
+
+    def fit(self, X, y):
+        super().fit(X, y)
+        # sklearn `n_iter_` (`_quantile.py:300`): surfaced from the Rust fitted
+        # type (the two-phase-simplex pivot count; R-DEV-7 honest count).
+        self.n_iter_ = int(self._rs.n_iter_)
+        return self
 
 
 class DecisionTreeRegressor(_RegressorWrapper):

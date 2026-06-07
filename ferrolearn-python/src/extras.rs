@@ -651,17 +651,123 @@ impl RsHuberRegressor {
     }
 }
 
-py_regressor!(
-    RsQuantileRegressor, "_RsQuantileRegressor",
-    ferrolearn_linear::FittedQuantileRegressor<f64>,
-    (quantile: f64 = 0.5, alpha: f64 = 1.0, max_iter: usize = 10000,
-     tol: f64 = 1e-6, fit_intercept: bool = true),
-    {
-        ferrolearn_linear::QuantileRegressor::<f64>::new()
-            .with_quantile(quantile).with_alpha(alpha).with_max_iter(max_iter)
-            .with_tol(tol).with_fit_intercept(fit_intercept)
+// QuantileRegressor (#507/#508): hand-written pyclass (replacing the thin
+// `py_regressor!` invocation) so the binding can surface sklearn's `solver`
+// (`sklearn/linear_model/_quantile.py:134`, default `"highs"`) and
+// `solver_options` (`_quantile.py:135`, default `None`) constructor params and
+// the fitted `n_iter_` attribute (`_quantile.py:300` `self.n_iter_ =
+// result.nit`). The MATH (LP build, two-phase simplex, the pivot count, and the
+// solver/solver_options validation) lives in
+// `ferrolearn_linear::QuantileRegressor` (`with_solver`/`with_solver_options`,
+// `FittedQuantileRegressor::n_iter`); this is the thin marshalling shim and the
+// non-test production consumer of the new core API (R-DEFER-1).
+//
+// Solver validity mirrors sklearn's `_parameter_constraints["solver"]`
+// (`_quantile.py:114-124`): the HiGHS family + "revised simplex" reach the same
+// LP vertex; an invalid string OR "interior-point" (removed in scipy>=1.11) is
+// rejected by the core as `InvalidParameter`, marshalled here to `ValueError`
+// (matching sklearn's `InvalidParameterError`/`ValueError`). `solver_options`
+// is `[dict, None]` in sklearn (`_quantile.py:125`) — ANY dict is valid and
+// sklearn fits successfully. The core ACCEPTS (and ignores) any `solver_options`
+// (they are HiGHS tuning knobs that do not change the LP optimum, #2168), so the
+// binding stores them for `get_params`/`clone()` round-trip and passes them
+// straight through to the solve.
+#[pyclass(name = "_RsQuantileRegressor")]
+pub struct RsQuantileRegressor {
+    quantile: f64,
+    alpha: f64,
+    max_iter: usize,
+    tol: f64,
+    fit_intercept: bool,
+    solver: String,
+    // sklearn's `solver_options` is `[dict, None]` (`_quantile.py:125`). Any
+    // dict is accepted; the options are HiGHS tuning knobs that do not change the
+    // LP optimum (#2168). Stored for `get_params`/`clone()` round-trip.
+    solver_options: Option<std::collections::HashMap<String, f64>>,
+    fitted: Option<ferrolearn_linear::FittedQuantileRegressor<f64>>,
+}
+
+#[pymethods]
+impl RsQuantileRegressor {
+    #[new]
+    #[pyo3(signature = (quantile=0.5, alpha=1.0, max_iter=10000, tol=1e-6,
+                        fit_intercept=true, solver="highs".to_string(),
+                        solver_options=None))]
+    fn new(
+        quantile: f64,
+        alpha: f64,
+        max_iter: usize,
+        tol: f64,
+        fit_intercept: bool,
+        solver: String,
+        solver_options: Option<std::collections::HashMap<String, f64>>,
+    ) -> Self {
+        Self {
+            quantile,
+            alpha,
+            max_iter,
+            tol,
+            fit_intercept,
+            solver,
+            solver_options,
+            fitted: None,
+        }
     }
-);
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let model = ferrolearn_linear::QuantileRegressor::<f64>::new()
+            .with_quantile(self.quantile)
+            .with_alpha(self.alpha)
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_fit_intercept(self.fit_intercept)
+            .with_solver(self.solver.clone())
+            .with_solver_options(self.solver_options.clone());
+        let fitted = model.fit(&x_nd, &y_nd).map_err(quantile_fit_err)?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let preds = fitted
+            .predict(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray1_to_numpy(py, &preds))
+    }
+
+    // sklearn `n_iter_` (`_quantile.py:300` `self.n_iter_ = result.nit`): the
+    // number of solver iterations. R-DEV-7: ferrolearn's value is the honest
+    // two-phase primal-simplex pivot count, NOT scipy's HiGHS iteration count,
+    // so it is a positive int <= max_iter and deterministic, but not == sklearn.
+    #[getter]
+    fn n_iter_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_iter())
+    }
+}
+
+// Map `QuantileRegressor::fit` errors to the sklearn-equivalent Python
+// exception. An invalid `solver` (incl. "interior-point") mirrors sklearn's
+// `InvalidParameterError`/`ValueError` (`_quantile.py:114`/`:196`); everything
+// else is a `ValueError`. (`solver_options` is now accepted by the core for any
+// dict, #2168, so it never produces an error here.)
+fn quantile_fit_err(e: ferrolearn_core::error::FerroError) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(e.to_string())
+}
 
 // ===========================================================================
 // Tree regressors
