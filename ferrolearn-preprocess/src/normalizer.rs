@@ -11,7 +11,12 @@
 //! Samples that already have a zero norm are left unchanged.
 //!
 //! This transformer is **stateless** — no fitting is required. Call
-//! [`Transform::transform`] directly.
+//! [`Transform::transform`] directly. For scikit-learn API parity it ALSO
+//! supports the stateful [`Fit`](ferrolearn_core::traits::Fit) →
+//! [`FittedNormalizer`] path, which records `n_features_in_` and (like
+//! sklearn) validates the input in `fit`; the fitted type's `transform`
+//! reuses the very same row-norm logic as the stateless path, so both paths
+//! are bit-identical.
 //!
 //! # `## REQ status`
 //!
@@ -25,17 +30,17 @@
 //! |---|---|---|
 //! | REQ-1 (row-wise L1/L2/Max transform) | SHIPPED | `Transform::transform` divides each row by its norm (L1=Σ\|v\|, L2=√Σv², Max=max\|v\|; zero-norm row unchanged), default L2; mirrors sklearn dense `normalize` (`_data.py:1962-1969`, `_handle_zeros_in_scale` `:1968`). Critic-verified bit-identical to live oracle: `guard_l1/l2/max/zero_row/f32_matches_oracle` in `tests/divergence_normalizer.rs`. Consumers: `FittedPipelineTransformer::transform_pipeline` + crate re-export `lib.rs:119`. |
 //! | REQ-2 (transform input validation per check_array) | SHIPPED | FIXED #1140. `transform` guards (sklearn order) zero-samples → `InsufficientSamples` (`validation.py:1084`), zero-features → `InvalidParameter` (`:1093`), non-finite NaN/±inf → `InvalidParameter` (`:1063`) — matching `Normalizer.transform` → `normalize` → `check_array` (`_data.py:1933-1940`). Mirrors converged `binarizer.rs`. Critic two-round CLEAN: 6 rejection pins + finite-not-over-rejected guards (zero-NORM-row/1e308/subnormal/-0.0); pipeline consumer inherits validation. |
-//! | REQ-3 (validating fit + parameter constraints) | NOT-STARTED | open prereq blocker #1141. No `Fit`/fitted type/`_parameter_constraints` (norm StrOptions → InvalidParameterError; sklearn `:2053-2083`). |
+//! | REQ-3 (validating fit + parameter constraints) | SHIPPED | FIXED #1141. `impl Fit<Array2<F>, ()> for Normalizer` (`fit`): runs the SAME `validate_normalize_input` guard as `Transform::transform`/`normalize` (REQ-2: zero-samples → `InsufficientSamples`, zero-features/non-finite NaN±inf → `InvalidParameter`, sklearn `_validate_data` default `force_all_finite=True` REJECTS NaN/inf — confirmed `Normalizer().fit([[nan]])`/`[[inf]]` raise ValueError, `:2082`,`utils/validation.py:1063/1084/1093`), records `n_features_in_ = x.ncols()`, returns `FittedNormalizer { norm, copy, n_features_in_ }` (no fitted statistics — Normalizer is stateless, sklearn fit "Only validates", `:2062-2083`). sklearn's `_parameter_constraints {norm:[StrOptions{l1,l2,max}]}` (`:2053-2055`) has NO ferrolearn analog: `NormType` is a closed Rust enum, so an out-of-domain norm is UNREPRESENTABLE rather than runtime-rejected — the type system satisfies the param-domain check. Live-oracle tests: `fit_l1/l2/max_matches_oracle_and_stateless`, `fit_rejects_nan/pos_inf/neg_inf`, `fit_zero_row_unchanged`, `fitted_transform_shape_mismatch`, `fit_path_equals_stateless_path` in `tests/divergence_normalizer.rs`. Consumers: `FittedNormalizer::transform` (the fitted path) + crate re-export `lib.rs:140`. |
 //! | REQ-4 (normalize free fn: axis / return_norm) | SHIPPED | FIXED #1142. `pub fn normalize` + `pub fn normalize_with_norms` (free fns) mirror sklearn `normalize(X, norm, *, axis=1, copy=True, return_norm=False)` (`_data.py:1866`). Shared `row_norm` helper computes L1=Σ\|v\|, L2=√Σv², Max=max\|v\| (`:1962-1967`); `_handle_zeros_in_scale` zero→1 (`:1968`); `X /= norms` (`:1969`). `axis=1` row-normalizes; `axis=0` column-normalizes (sklearn transpose `:1926-1942`,`:1971-1972`); `axis ∉ {0,1}` → `InvalidParameter`. `normalize_with_norms` returns `(normalized, raw_norms)` (return_norm `:1974-1975`; raw, NOT zero-handled). Same validation as `Transform::transform` (REQ-2). Oracle-grounded tests in `#[cfg(test)]`: `normalize_l2/l1/max_axis1_matches_sklearn`, `normalize_l2_axis0_matches_sklearn`, `normalize_return_norm_l2_and_l1`, `normalize_invalid_axis_errors`. |
-//! | REQ-5 (copy parameter) | NOT-STARTED | open prereq blocker #1143. No `copy` param; `transform` always `to_owned()`s (`:2058`,`:2085-2106`). |
-//! | REQ-6 (n_features_in_ / feature names) | NOT-STARTED | open prereq blocker #1144. No `n_features_in_`/`get_feature_names_out` (OneToOneFeatureMixin, `:2082`). Depends on REQ-3. |
+//! | REQ-5 (copy parameter) | SHIPPED | FIXED #1143. `Normalizer<F>` gains a `copy: bool` field (default `true`) + `#[must_use] with_copy` builder + `copy()` getter, threaded onto `FittedNormalizer`, mirroring sklearn `__init__(norm='l2', *, copy=True)` (`_data.py:2058-2060`, `_parameter_constraints {copy:["boolean"]}` `:2055`). ACCEPT-AND-DOCUMENT no-op: ferrolearn's `Transform` always returns a freshly allocated array (`to_owned()`), so `copy` has no observable effect — `copy=True`/`copy=False` produce identical output (sklearn's `copy=False` does in-place row normalization, an optimization Rust's ownership makes moot here). Live-oracle test `fit_copy_true_false_identical`. Consumers: `FittedNormalizer` carries the flag + crate re-export `lib.rs:140`. |
+//! | REQ-6 (n_features_in_ / feature names) | PARTIAL | `n_features_in_` SHIPPED, `get_feature_names_out` NOT-STARTED. `FittedNormalizer<F>` records `n_features_in_ = x.ncols()` in `fit` and exposes `pub fn n_features_in(&self) -> usize`, mirroring sklearn's `_validate_data` setting `n_features_in_` (`:2082`); `FittedNormalizer::transform` validates the input column count against it (`ShapeMismatch`, sklearn `_validate_data(reset=False)` `:2104`). The `OneToOneFeatureMixin.get_feature_names_out` / `feature_names_in_` string-name plumbing is OUT OF SCOPE for this build (no string feature-name infrastructure in ferrolearn yet) — open prereq blocker #1144 for the feature-name half. Live-oracle test `fit_n_features_in_matches_ncols`. |
 //! | REQ-7 (sparse support) | NOT-STARTED | open prereq blocker #1145. Dense-only; no CSR `inplace_csr_row_normalize_l1/l2` / `min_max_axis` Max (`:1944-1960`). |
 //! | REQ-8 (PyO3 binding) | NOT-STARTED | open prereq blocker #1146. No `ferrolearn-python` registration (R-DEFER-1). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #1147. `ndarray::Array2` + `num_traits::Float`, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
-use ferrolearn_core::traits::Transform;
+use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2, ArrayView1};
 use num_traits::Float;
 
@@ -83,6 +88,12 @@ pub enum NormType {
 pub struct Normalizer<F> {
     /// The norm to use for normalisation.
     pub(crate) norm: NormType,
+    /// sklearn's `copy` constructor parameter (`__init__(norm='l2', *, copy=True)`,
+    /// `_data.py:2058-2060`; `_parameter_constraints {copy:["boolean"]}` `:2055`).
+    /// ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] always returns a
+    /// freshly allocated array, so `copy` has no observable effect. Retained for
+    /// API parity. Defaults to `true`.
+    pub(crate) copy: bool,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -92,6 +103,7 @@ impl<F: Float + Send + Sync + 'static> Normalizer<F> {
     pub fn new(norm: NormType) -> Self {
         Self {
             norm,
+            copy: true,
             _marker: std::marker::PhantomData,
         }
     }
@@ -119,11 +131,152 @@ impl<F: Float + Send + Sync + 'static> Normalizer<F> {
     pub fn norm(&self) -> NormType {
         self.norm
     }
+
+    /// Set the `copy` parameter (sklearn `Normalizer(copy=...)`,
+    /// `_data.py:2058`, `_parameter_constraints {copy:["boolean"]}` `:2055`).
+    ///
+    /// This is an ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] always
+    /// returns a freshly allocated array, so `copy` has no observable effect on
+    /// the output. It is retained for API parity with scikit-learn.
+    #[must_use]
+    pub fn with_copy(mut self, copy: bool) -> Self {
+        self.copy = copy;
+        self
+    }
+
+    /// Return the configured `copy` flag (sklearn `Normalizer.copy`).
+    #[must_use]
+    pub fn copy(&self) -> bool {
+        self.copy
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Default for Normalizer<F> {
     fn default() -> Self {
         Self::new(NormType::L2)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FittedNormalizer (sklearn stateful `fit` -> fitted estimator path)
+// ---------------------------------------------------------------------------
+
+/// A fitted [`Normalizer`].
+///
+/// `Normalizer` is stateless — its `fit` (sklearn `Normalizer.fit`,
+/// `_data.py:2062-2083`, "Only validates estimator's parameters") learns NO
+/// statistics; it merely validates the input and records `n_features_in_`. The
+/// fitted type therefore carries only the configured `norm`, the `copy` flag,
+/// and the recorded feature count. Its [`Transform::transform`] reuses the very
+/// same row-norm logic as the stateless [`Normalizer`]/[`normalize`] path, so
+/// the two paths are bit-identical.
+#[derive(Debug, Clone)]
+pub struct FittedNormalizer<F> {
+    /// The norm to use for normalisation.
+    pub(crate) norm: NormType,
+    /// The `copy` flag carried from the unfitted [`Normalizer`] (no-op; see
+    /// [`Normalizer::with_copy`]).
+    pub(crate) copy: bool,
+    /// Number of features (columns) seen during [`Fit::fit`] — sklearn's
+    /// `n_features_in_` (`_data.py:2082`, set by `_validate_data`).
+    pub(crate) n_features_in_: usize,
+    _marker: std::marker::PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedNormalizer<F> {
+    /// Return the number of features (columns) seen during [`Fit::fit`].
+    ///
+    /// Mirrors scikit-learn's `Normalizer.n_features_in_` (`_data.py:2082`).
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.n_features_in_
+    }
+
+    /// Return the configured norm type.
+    #[must_use]
+    pub fn norm(&self) -> NormType {
+        self.norm
+    }
+
+    /// Return the configured `copy` flag (no-op; see [`Normalizer::with_copy`]).
+    #[must_use]
+    pub fn copy(&self) -> bool {
+        self.copy
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for Normalizer<F> {
+    type Fitted = FittedNormalizer<F>;
+    type Error = FerroError;
+
+    /// Validate the input and record `n_features_in_`, returning a
+    /// [`FittedNormalizer`].
+    ///
+    /// `Normalizer` is stateless: like scikit-learn's `Normalizer.fit`
+    /// (`sklearn/preprocessing/_data.py:2062-2083`, "Only validates estimator's
+    /// parameters"), this learns NO statistics. It runs the SAME `check_array`
+    /// validation as [`Transform::transform`] / [`normalize`] (REQ-2, via the
+    /// shared `validate_normalize_input` helper) and records
+    /// `n_features_in_ = x.ncols()`. sklearn's `_validate_data` uses the default
+    /// `force_all_finite=True`, so NaN/±inf are REJECTED in `fit`
+    /// (`Normalizer().fit([[nan]])` / `[[inf]]` raise `ValueError`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InsufficientSamples`] for zero rows and
+    /// [`FerroError::InvalidParameter`] for zero features or any non-finite
+    /// value (NaN, +inf, -inf) — matching `check_array`
+    /// (`sklearn/utils/validation.py:1084`, `:1093`, `:1063`) as routed through
+    /// `Normalizer.fit` -> `_validate_data` (`_data.py:2082`).
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedNormalizer<F>, FerroError> {
+        validate_normalize_input(x)?;
+        Ok(FittedNormalizer {
+            norm: self.norm,
+            copy: self.copy,
+            n_features_in_: x.ncols(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedNormalizer<F> {
+    type Output = Array2<F>;
+    type Error = FerroError;
+
+    /// Normalize each row of `x` to unit norm, delegating to the SAME row-norm
+    /// logic as the stateless [`Normalizer`] / [`normalize`] path.
+    ///
+    /// First validates that `x` has the same number of columns recorded during
+    /// [`Fit::fit`] (sklearn `_validate_data(reset=False)`,
+    /// `sklearn/preprocessing/_data.py:2104`) and applies the REQ-2
+    /// `check_array` guards, then calls the shared [`normalize`] free function
+    /// with `axis=1` (sklearn `Normalizer.transform` ->
+    /// `normalize(X, norm=self.norm, axis=1)`, `:2106`). The output is therefore
+    /// byte-identical to `Normalizer::transform`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the column count differs from
+    /// `n_features_in_`. Returns [`FerroError::InsufficientSamples`] for zero
+    /// rows and [`FerroError::InvalidParameter`] for zero features or any
+    /// non-finite value (REQ-2, via [`normalize`]).
+    fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        // sklearn `_validate_data(reset=False)` runs `check_array` (finite /
+        // min-samples / min-features) BEFORE `_check_n_features` (`base.py:633`
+        // then `:654`, #2207). So validate + normalize FIRST (this is
+        // `check_array`'s job via the shared REQ-2 guard in `normalize`); a NaN /
+        // +-inf / zero-sample / zero-feature input must raise its check_array
+        // error EVEN when the column count is also wrong. Only after that does
+        // the n_features comparison fire.
+        let normalized = normalize(x, self.norm, 1)?;
+        if x.ncols() != self.n_features_in_ {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), self.n_features_in_],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedNormalizer::transform".into(),
+            });
+        }
+        Ok(normalized)
     }
 }
 

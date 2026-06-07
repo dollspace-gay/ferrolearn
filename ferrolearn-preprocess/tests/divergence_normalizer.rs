@@ -17,9 +17,9 @@
 //!     today (the orchestrator fixes this iteration).
 
 use ferrolearn_core::error::FerroError;
-use ferrolearn_core::traits::Transform;
+use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::Normalizer;
-use ferrolearn_preprocess::normalizer::NormType;
+use ferrolearn_preprocess::normalizer::{FittedNormalizer, NormType};
 use ndarray::{Array2, array};
 
 // ===========================================================================
@@ -388,4 +388,304 @@ fn guard_neg_zero_not_rejected_matches_oracle() {
     // sklearn returns the row unchanged (zero-norm); values are zero-valued.
     assert_eq!(out[[0, 0]], 0.0);
     assert_eq!(out[[0, 1]], 0.0);
+}
+
+// ===========================================================================
+// REQ-3 / REQ-5 / REQ-6 — stateful `Fit` -> `FittedNormalizer` path.
+//
+// sklearn `Normalizer(norm, copy).fit(X).transform(X)`:
+//   - fit "Only validates estimator's parameters" + records n_features_in_
+//     (`_data.py:2062-2083`); _validate_data default force_all_finite=True
+//     REJECTS NaN/±inf.
+//   - transform delegates to `normalize(X, norm=self.norm, axis=1)` (`:2106`),
+//     so the fitted path is bit-identical to the stateless `Normalizer.transform`.
+//
+// Shared fixture X = [[1,2,2],[0,3,4],[-5,3,1]]. ALL expected values come from a
+// LIVE sklearn 1.5.2 call run from /tmp (recorded in each test's doc comment),
+// never copied from the ferrolearn side (R-CHAR-3).
+// ===========================================================================
+
+/// REQ-3 / REQ-6 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// X=np.array([[1.,2.,2.],[0.,3.,4.],[-5.,3.,1.]])
+/// print(Normalizer(norm='l1').fit(X).transform(X).tolist())
+/// print(Normalizer(norm='l2').fit(X).transform(X).tolist())
+/// print(Normalizer(norm='max').fit(X).transform(X).tolist())"
+/// ```
+/// l1  -> [[0.2,0.4,0.4],[0.0,0.42857142857142855,0.5714285714285714],
+///         [-0.5555555555555556,0.3333333333333333,0.1111111111111111]]
+/// l2  -> [[0.3333333333333333,0.6666666666666666,0.6666666666666666],
+///         [0.0,0.6,0.8],
+///         [-0.8451542547285166,0.50709255283711,0.1690308509457033]]
+/// max -> [[0.5,1.0,1.0],[0.0,0.75,1.0],[-1.0,0.6,0.2]]
+///
+/// The fitted-path output must equal the live oracle AND the stateless
+/// `Normalizer::transform` output (the Fit path must not diverge).
+#[test]
+fn fit_l1_l2_max_matches_oracle_and_stateless() {
+    let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0], [-5.0, 3.0, 1.0]];
+
+    let l1: [[f64; 3]; 3] = [
+        [0.2, 0.4, 0.4],
+        [0.0, 0.428_571_428_571_428_55, 0.571_428_571_428_571_4],
+        [
+            -0.555_555_555_555_555_6,
+            0.333_333_333_333_333_3,
+            0.111_111_111_111_111_1,
+        ],
+    ];
+    let l2: [[f64; 3]; 3] = [
+        [
+            0.333_333_333_333_333_3,
+            0.666_666_666_666_666_6,
+            0.666_666_666_666_666_6,
+        ],
+        [0.0, 0.6, 0.8],
+        [
+            -0.845_154_254_728_516_6,
+            0.507_092_552_837_11,
+            0.169_030_850_945_703_3,
+        ],
+    ];
+    let max: [[f64; 3]; 3] = [[0.5, 1.0, 1.0], [0.0, 0.75, 1.0], [-1.0, 0.6, 0.2]];
+
+    for (norm, sk) in [(NormType::L1, l1), (NormType::L2, l2), (NormType::Max, max)] {
+        let fitted: FittedNormalizer<f64> = Normalizer::<f64>::new(norm).fit(&x, &()).unwrap();
+        let fit_out = fitted.transform(&x).unwrap();
+        let stateless_out = Normalizer::<f64>::new(norm).transform(&x).unwrap();
+        assert_eq!(fit_out.dim(), (3, 3));
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (fit_out[[i, j]] - sk[i][j]).abs() < 1e-12,
+                    "fit {norm:?}[{i},{j}]: ferro={} sklearn={}",
+                    fit_out[[i, j]],
+                    sk[i][j]
+                );
+                // Fit path must be bit-identical to the stateless path.
+                assert_eq!(
+                    fit_out[[i, j]].to_bits(),
+                    stateless_out[[i, j]].to_bits(),
+                    "fit-path != stateless-path at {norm:?}[{i},{j}]"
+                );
+            }
+        }
+    }
+}
+
+/// REQ-3 / REQ-6 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// print(Normalizer().fit(np.array([[1.,2.,2.],[0.,3.,4.],[-5.,3.,1.]])).n_features_in_)"
+/// ```
+/// -> `3`
+#[test]
+fn fit_n_features_in_matches_ncols() {
+    let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0], [-5.0, 3.0, 1.0]];
+    let fitted = Normalizer::<f64>::l2().fit(&x, &()).unwrap();
+    assert_eq!(fitted.n_features_in(), 3);
+    // 2-column fit records 2.
+    let x2 = array![[1.0, 2.0], [3.0, 4.0]];
+    assert_eq!(
+        Normalizer::<f64>::l2()
+            .fit(&x2, &())
+            .unwrap()
+            .n_features_in(),
+        2
+    );
+}
+
+/// REQ-3 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// Normalizer().fit(np.array([[float('nan'),1.0]]))"
+/// ```
+/// -> `ValueError: Input X contains NaN. Normalizer does not accept missing
+///     values encoded as NaN natively...`
+///
+/// sklearn `fit` -> `_validate_data` default `force_all_finite=True` REJECTS
+/// NaN; ferrolearn `fit` must return Err.
+#[test]
+fn fit_rejects_nan() {
+    let x = array![[f64::NAN, 1.0]];
+    assert!(
+        Normalizer::<f64>::l2().fit(&x, &()).is_err(),
+        "sklearn Normalizer().fit raises ValueError on NaN; ferrolearn fit must Err"
+    );
+}
+
+/// REQ-3 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// Normalizer().fit(np.array([[float('inf'),1.0]]))"
+/// ```
+/// -> `ValueError: Input X contains infinity or a value too large for
+///     dtype('float64').`
+#[test]
+fn fit_rejects_pos_inf() {
+    let x = array![[f64::INFINITY, 1.0]];
+    assert!(
+        Normalizer::<f64>::l2().fit(&x, &()).is_err(),
+        "sklearn Normalizer().fit raises ValueError on +inf; ferrolearn fit must Err"
+    );
+}
+
+/// REQ-3 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// Normalizer().fit(np.array([[float('-inf'),1.0]]))"
+/// ```
+/// -> `ValueError: Input X contains infinity or a value too large for
+///     dtype('float64').`
+#[test]
+fn fit_rejects_neg_inf() {
+    let x = array![[f64::NEG_INFINITY, 1.0]];
+    assert!(
+        Normalizer::<f64>::l2().fit(&x, &()).is_err(),
+        "sklearn Normalizer().fit raises ValueError on -inf; ferrolearn fit must Err"
+    );
+}
+
+/// REQ-5 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// X=np.array([[1.,2.,2.],[0.,3.,4.],[-5.,3.,1.]])
+/// a=Normalizer(norm='l2',copy=True).fit(X).transform(X)
+/// b=Normalizer(norm='l2',copy=False).fit(X).transform(X.copy())
+/// print(np.array_equal(a,b))"
+/// ```
+/// -> `True`
+///
+/// `copy` is an ACCEPT-AND-DOCUMENT no-op in ferrolearn: `copy=True` and
+/// `copy=False` produce bit-identical output.
+#[test]
+fn fit_copy_true_false_identical() {
+    let x = array![[1.0, 2.0, 2.0], [0.0, 3.0, 4.0], [-5.0, 3.0, 1.0]];
+    let a = Normalizer::<f64>::l2()
+        .with_copy(true)
+        .fit(&x, &())
+        .unwrap();
+    let b = Normalizer::<f64>::l2()
+        .with_copy(false)
+        .fit(&x, &())
+        .unwrap();
+    assert!(a.copy());
+    assert!(!b.copy());
+    let out_a = a.transform(&x).unwrap();
+    let out_b = b.transform(&x).unwrap();
+    for (va, vb) in out_a.iter().zip(out_b.iter()) {
+        assert_eq!(va.to_bits(), vb.to_bits(), "copy flag changed the output");
+    }
+}
+
+/// REQ-1-through-Fit oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// Z=np.array([[0.,0.,0.],[3.,4.,0.]])
+/// print(Normalizer(norm='l2').fit(Z).transform(Z).tolist())"
+/// ```
+/// -> `[[0.0, 0.0, 0.0], [0.6, 0.8, 0.0]]`
+///
+/// A zero-NORM row is left unchanged through the Fit path (REQ-1 preserved via
+/// `_handle_zeros_in_scale`, `_data.py:1968`).
+#[test]
+fn fit_zero_row_unchanged() {
+    const SK: [[f64; 3]; 2] = [[0.0, 0.0, 0.0], [0.6, 0.8, 0.0]];
+    let z = array![[0.0, 0.0, 0.0], [3.0, 4.0, 0.0]];
+    let out = Normalizer::<f64>::l2()
+        .fit(&z, &())
+        .unwrap()
+        .transform(&z)
+        .unwrap();
+    for i in 0..2 {
+        for j in 0..3 {
+            assert!(
+                (out[[i, j]] - SK[i][j]).abs() < 1e-12,
+                "fit zero[{i},{j}]: ferro={} sklearn={}",
+                out[[i, j]],
+                SK[i][j]
+            );
+        }
+    }
+}
+
+/// REQ-6 oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// m=Normalizer().fit(np.ones((2,3)))
+/// m.transform(np.ones((2,5)))"
+/// ```
+/// -> `ValueError: X has 5 features, but Normalizer is expecting 3 features as
+///     input.`
+///
+/// sklearn `transform` -> `_validate_data(reset=False)` (`_data.py:2104`) checks
+/// the column count against the fitted `n_features_in_`. ferrolearn maps the
+/// mismatch to `FerroError::ShapeMismatch`.
+#[test]
+fn fitted_transform_shape_mismatch() {
+    let x_fit = array![[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]];
+    let fitted = Normalizer::<f64>::l2().fit(&x_fit, &()).unwrap();
+    let x_wrong = array![[1.0, 1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 1.0, 1.0, 1.0]];
+    let result = fitted.transform(&x_wrong);
+    assert!(
+        matches!(result, Err(FerroError::ShapeMismatch { .. })),
+        "wrong column count after fit should map to FerroError::ShapeMismatch"
+    );
+}
+
+/// REQ-3 — the Fit path equals the stateless path equals the `normalize` free
+/// fn on a richer fixture, bit-for-bit (no divergence between the three public
+/// entry points). Oracle (live sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer, normalize
+/// X=np.array([[-2.,1.,2.],[-1.,0.,1.],[10.,-3.,0.5]])
+/// print(np.array_equal(Normalizer(norm='l2').fit(X).transform(X), normalize(X, norm='l2')))"
+/// ```
+/// -> `True`
+#[test]
+fn fit_path_equals_stateless_path() {
+    let x = array![[-2.0, 1.0, 2.0], [-1.0, 0.0, 1.0], [10.0, -3.0, 0.5]];
+    for norm in [NormType::L1, NormType::L2, NormType::Max] {
+        let fit_out = Normalizer::<f64>::new(norm)
+            .fit(&x, &())
+            .unwrap()
+            .transform(&x)
+            .unwrap();
+        let stateless_out = Normalizer::<f64>::new(norm).transform(&x).unwrap();
+        for (a, b) in fit_out.iter().zip(stateless_out.iter()) {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "fit-path diverged from stateless-path for {norm:?}"
+            );
+        }
+    }
+}
+
+/// REQ-3 — f32 Fit path matches the stateless f32 path. Oracle (live sklearn
+/// 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import Normalizer
+/// X=np.array([[3.,4.]],dtype=np.float32)
+/// print(Normalizer(norm='l2').fit(X).transform(X).tolist())"
+/// ```
+/// -> `[[0.6000000238418579, 0.800000011920929]]`
+#[test]
+fn fit_f32_matches_oracle() {
+    const SK: [f32; 2] = [0.6, 0.8];
+    let x: Array2<f32> = array![[3.0f32, 4.0]];
+    let out = Normalizer::<f32>::l2()
+        .fit(&x, &())
+        .unwrap()
+        .transform(&x)
+        .unwrap();
+    for j in 0..2 {
+        assert!(
+            (out[[0, j]] - SK[j]).abs() < 1e-6,
+            "fit f32[0,{j}]: ferro={} sklearn={}",
+            out[[0, j]],
+            SK[j]
+        );
+    }
 }

@@ -50,7 +50,6 @@ use ndarray::array;
 ///
 /// Tracking: #2207
 #[test]
-#[ignore = "divergence: FittedNormalizer::transform checks n_features before finite/samples, inverting sklearn check_array-then-_check_n_features order; tracking #2207"]
 fn divergence_fitted_transform_finite_checked_before_n_features() {
     let x_fit = array![[1.0, 1.0, 1.0], [1.0, 1.0, 1.0]];
     let fitted = Normalizer::<f64>::l2().fit(&x_fit, &()).unwrap();
