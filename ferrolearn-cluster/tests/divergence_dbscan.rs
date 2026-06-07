@@ -74,6 +74,7 @@
 //! `num_traits::Float`, not `ferray-core`. Not migrated. Documented only.
 
 use ferrolearn_cluster::DBSCAN;
+use ferrolearn_cluster::dbscan::DbscanMetric;
 use ferrolearn_core::traits::Fit;
 use ndarray::{Array1, Array2};
 
@@ -805,5 +806,399 @@ fn divergence_dbscan_weight_sum_summation_order_boundary() {
          flip at the float `>=` boundary)",
         fitted.core_sample_indices(),
         sklearn_core
+    );
+}
+
+// ===========================================================================
+// GREEN — metric (REQ-6): MANHATTAN vs EUCLIDEAN give DIFFERENT labels_.
+//
+// sklearn routes the neighbor test through `NearestNeighbors(metric=...,
+// p=...)` (`_dbscan.py:411-422`): a point `j` is a neighbor of `i` iff
+// `dist(i,j) <= eps`. Fixture M: three points on the diagonal
+// {(0,0),(0.8,0.8),(0.85,0.85)} with eps=1.2, min_samples=2. The (0,0)->
+// (0.8,0.8) distance is `sqrt(2)*0.8 ≈ 1.131 <= 1.2` (euclidean neighbor) but
+// `1.6 > 1.2` (manhattan NON-neighbor). So under manhattan idx0 is isolated
+// (noise), under euclidean all three are one cluster. None of the relevant
+// distances are within a ULP of eps=1.2.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.cluster import DBSCAN
+//     X=np.array([[0.,0.],[0.8,0.8],[0.85,0.85]])
+//     for met in ('euclidean','manhattan'):
+//       m=DBSCAN(eps=1.2,min_samples=2,metric=met).fit(X)
+//       print(met, m.labels_.tolist(), m.core_sample_indices_.tolist())"
+//   ->  euclidean [0, 0, 0]   [0, 1, 2]
+//       manhattan [-1, 0, 0]  [1, 2]
+// ===========================================================================
+
+fn fixture_m() -> Array2<f64> {
+    Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 0.8, 0.8, 0.85, 0.85]).unwrap()
+}
+
+/// Guard: on Fixture M, ferrolearn `with_metric(Manhattan)` ==
+/// sklearn `metric='manhattan'` labels `[-1,0,0]` / core `[1,2]` EXACTLY, and
+/// `with_metric(Euclidean)` == sklearn `metric='euclidean'` `[0,0,0]` /
+/// `[0,1,2]` EXACTLY (oracle above) — the metric changes the neighbor graph.
+#[test]
+fn green_dbscan_manhattan_vs_euclidean_labels() {
+    // sklearn oracle (Fixture M).
+    let sk_manhattan_labels: [isize; 3] = [-1, 0, 0];
+    let sk_manhattan_core: [usize; 2] = [1, 2];
+    let sk_euclidean_labels: [isize; 3] = [0, 0, 0];
+    let sk_euclidean_core: [usize; 3] = [0, 1, 2];
+
+    let x = fixture_m();
+
+    let manhattan = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Manhattan)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_manhattan_labels.iter().enumerate() {
+        assert_eq!(
+            manhattan.labels()[i],
+            exp,
+            "manhattan label[{i}]: ferrolearn {} vs sklearn {exp} (idx0 isolated: \
+             L1 dist 1.6 > eps 1.2)",
+            manhattan.labels()[i]
+        );
+    }
+    assert_eq!(
+        manhattan.core_sample_indices(),
+        &sk_manhattan_core,
+        "manhattan core: ferrolearn {:?} vs sklearn [1,2]",
+        manhattan.core_sample_indices()
+    );
+
+    let euclidean = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Euclidean)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_euclidean_labels.iter().enumerate() {
+        assert_eq!(
+            euclidean.labels()[i],
+            exp,
+            "euclidean label[{i}]: ferrolearn {} vs sklearn {exp} (L2 dist 1.131 \
+             <= eps 1.2)",
+            euclidean.labels()[i]
+        );
+    }
+    assert_eq!(euclidean.core_sample_indices(), &sk_euclidean_core);
+}
+
+/// Guard: the default (`metric='euclidean'`) path is UNCHANGED — an explicit
+/// `with_metric(Euclidean)` equals the no-metric run element-wise on Fixture M.
+#[test]
+fn green_dbscan_default_euclidean_equals_no_metric() {
+    let x = fixture_m();
+
+    let explicit = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Euclidean)
+        .fit(&x, &())
+        .unwrap();
+    let default = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .fit(&x, &())
+        .unwrap();
+
+    for i in 0..3 {
+        assert_eq!(
+            explicit.labels()[i],
+            default.labels()[i],
+            "explicit-Euclidean must equal no-metric at [{i}]"
+        );
+    }
+    assert_eq!(
+        explicit.core_sample_indices(),
+        default.core_sample_indices(),
+        "explicit-Euclidean core must equal no-metric core"
+    );
+}
+
+// ===========================================================================
+// GREEN — minkowski p (REQ-6): p=1 reproduces manhattan, p=2 reproduces
+// euclidean, on Fixture M, all matching sklearn `metric='minkowski', p=...`.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.cluster import DBSCAN
+//     X=np.array([[0.,0.],[0.8,0.8],[0.85,0.85]])
+//     for p in (1,2):
+//       m=DBSCAN(eps=1.2,min_samples=2,metric='minkowski',p=p).fit(X)
+//       print('p',p, m.labels_.tolist(), m.core_sample_indices_.tolist())"
+//   ->  p 1 [-1, 0, 0]   [1, 2]
+//       p 2 [0, 0, 0]    [0, 1, 2]
+// ===========================================================================
+
+/// Guard: `with_p(1.0)` (Minkowski p=1) reproduces sklearn `p=1` =
+/// `[-1,0,0]`/`[1,2]` AND equals the explicit Manhattan run; `with_p(2.0)`
+/// reproduces sklearn `p=2` = `[0,0,0]`/`[0,1,2]` AND equals the explicit
+/// Euclidean run (oracle above).
+#[test]
+fn green_dbscan_minkowski_p1_p2_collapse() {
+    let sk_p1_labels: [isize; 3] = [-1, 0, 0];
+    let sk_p1_core: [usize; 2] = [1, 2];
+    let sk_p2_labels: [isize; 3] = [0, 0, 0];
+    let sk_p2_core: [usize; 3] = [0, 1, 2];
+
+    let x = fixture_m();
+
+    let p1 = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_p(1.0)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_p1_labels.iter().enumerate() {
+        assert_eq!(
+            p1.labels()[i],
+            exp,
+            "minkowski p=1 label[{i}]: ferrolearn {} vs sklearn {exp}",
+            p1.labels()[i]
+        );
+    }
+    assert_eq!(p1.core_sample_indices(), &sk_p1_core);
+
+    // p=1 must equal the explicit Manhattan run (the collapse).
+    let manhattan = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Manhattan)
+        .fit(&x, &())
+        .unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            p1.labels()[i],
+            manhattan.labels()[i],
+            "minkowski p=1 must equal Manhattan at [{i}]"
+        );
+    }
+
+    let p2 = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .with_p(2.0)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_p2_labels.iter().enumerate() {
+        assert_eq!(
+            p2.labels()[i],
+            exp,
+            "minkowski p=2 label[{i}]: ferrolearn {} vs sklearn {exp}",
+            p2.labels()[i]
+        );
+    }
+    assert_eq!(p2.core_sample_indices(), &sk_p2_core);
+
+    // p=2 must equal the explicit Euclidean run (and hence the default path).
+    let euclidean = DBSCAN::<f64>::new(1.2)
+        .with_min_samples(2)
+        .fit(&x, &())
+        .unwrap();
+    for i in 0..3 {
+        assert_eq!(
+            p2.labels()[i],
+            euclidean.labels()[i],
+            "minkowski p=2 must equal Euclidean at [{i}]"
+        );
+    }
+    assert_eq!(p2.core_sample_indices(), euclidean.core_sample_indices());
+}
+
+// ===========================================================================
+// GREEN — chebyshev / minkowski p=3 (REQ-6): a fixture where these DIFFER from
+// euclidean/manhattan. Fixture N: four points on the diagonal
+// {(0,0),(1,1),(1.5,1.5),(2.5,2.5)} with eps=1.3, min_samples=2.
+//
+// Pairwise (0,0)->(1,1): L2 1.414, L1 2.0, Linf 1.0, Mink-p3 1.260; (1,1)->
+// (1.5,1.5): L2 0.707, L1 1.0, Linf 0.5; (1.5,1.5)->(2.5,2.5): L2 1.414, L1
+// 2.0, Linf 1.0, Mink-p3 1.260. With eps=1.3:
+//   - euclidean/manhattan/mink-p1: idx0 and idx3 are isolated (their nearest L2
+//     neighbor 1.414 > 1.3) -> labels [-1,0,0,-1], core [1,2].
+//   - chebyshev/mink-p3: all chained (Linf 1.0 <= 1.3, Mink-p3 1.260 <= 1.3) ->
+//     labels [0,0,0,0], core [0,1,2,3].
+// No distance is within a ULP of eps=1.3.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.cluster import DBSCAN
+//     X=np.array([[0.,0.],[1.,1.],[1.5,1.5],[2.5,2.5]])
+//     for met,p in (('euclidean',None),('chebyshev',None),('minkowski',3)):
+//       kw=dict(eps=1.3,min_samples=2,metric=met)
+//       if p is not None: kw['p']=p
+//       m=DBSCAN(**kw).fit(X)
+//       print(met,p, m.labels_.tolist(), m.core_sample_indices_.tolist())"
+//   ->  euclidean None [-1, 0, 0, -1]   [1, 2]
+//       chebyshev None [0, 0, 0, 0]     [0, 1, 2, 3]
+//       minkowski 3    [0, 0, 0, 0]     [0, 1, 2, 3]
+// ===========================================================================
+
+fn fixture_n() -> Array2<f64> {
+    Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 1.0, 1.5, 1.5, 2.5, 2.5]).unwrap()
+}
+
+/// Guard: on Fixture N, `with_metric(Chebyshev)` == sklearn `chebyshev`
+/// `[0,0,0,0]`/`[0,1,2,3]`, `with_p(3.0)` (Minkowski p=3) == sklearn
+/// `minkowski p=3` `[0,0,0,0]`/`[0,1,2,3]`, and the default Euclidean ==
+/// sklearn `euclidean` `[-1,0,0,-1]`/`[1,2]` — all EXACT (oracle above).
+#[test]
+fn green_dbscan_chebyshev_and_minkowski_p3() {
+    let sk_euclidean_labels: [isize; 4] = [-1, 0, 0, -1];
+    let sk_euclidean_core: [usize; 2] = [1, 2];
+    let sk_other_labels: [isize; 4] = [0, 0, 0, 0];
+    let sk_other_core: [usize; 4] = [0, 1, 2, 3];
+
+    let x = fixture_n();
+
+    // Euclidean baseline (default path) — idx0/idx3 isolated.
+    let euclidean = DBSCAN::<f64>::new(1.3)
+        .with_min_samples(2)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_euclidean_labels.iter().enumerate() {
+        assert_eq!(
+            euclidean.labels()[i],
+            exp,
+            "euclidean label[{i}]: ferrolearn {} vs sklearn {exp}",
+            euclidean.labels()[i]
+        );
+    }
+    assert_eq!(euclidean.core_sample_indices(), &sk_euclidean_core);
+
+    // Chebyshev — all chained.
+    let chebyshev = DBSCAN::<f64>::new(1.3)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Chebyshev)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_other_labels.iter().enumerate() {
+        assert_eq!(
+            chebyshev.labels()[i],
+            exp,
+            "chebyshev label[{i}]: ferrolearn {} vs sklearn {exp}",
+            chebyshev.labels()[i]
+        );
+    }
+    assert_eq!(chebyshev.core_sample_indices(), &sk_other_core);
+
+    // Minkowski p=3 — all chained (matches sklearn).
+    let p3 = DBSCAN::<f64>::new(1.3)
+        .with_min_samples(2)
+        .with_p(3.0)
+        .fit(&x, &())
+        .unwrap();
+    for (i, &exp) in sk_other_labels.iter().enumerate() {
+        assert_eq!(
+            p3.labels()[i],
+            exp,
+            "minkowski p=3 label[{i}]: ferrolearn {} vs sklearn {exp}",
+            p3.labels()[i]
+        );
+    }
+    assert_eq!(p3.core_sample_indices(), &sk_other_core);
+}
+
+// ===========================================================================
+// GREEN — p validation (REQ-6): a non-positive Minkowski `p` is REJECTED (no
+// panic), mirroring sklearn which raises `InvalidParameterError` because
+// `NearestNeighbors` requires `p` in `(0, inf]`.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.cluster import DBSCAN
+//     X=np.array([[0.,0.],[1.,1.],[2.,2.]])
+//     for p in (-1.0, 0.0):
+//       try: DBSCAN(eps=1.5,min_samples=2,metric='minkowski',p=p).fit(X)
+//       except Exception as e: print(p, type(e).__name__)"
+//   ->  -1.0 InvalidParameterError
+//        0.0 InvalidParameterError
+// ===========================================================================
+
+/// Guard: `with_p(p)` for `p <= 0` returns `Err` (no panic), matching sklearn
+/// which raises `InvalidParameterError` (p must be in `(0, inf]`, oracle above).
+#[test]
+fn green_dbscan_minkowski_nonpositive_p_rejected() {
+    let x = Array2::from_shape_vec((3, 2), vec![0.0, 0.0, 1.0, 1.0, 2.0, 2.0]).unwrap();
+
+    for &p in &[-1.0f64, 0.0] {
+        let result = DBSCAN::<f64>::new(1.5)
+            .with_min_samples(2)
+            .with_p(p)
+            .fit(&x, &());
+        assert!(
+            result.is_err(),
+            "minkowski p={p} should error (sklearn: InvalidParameterError, p in \
+             (0, inf]), got Ok"
+        );
+    }
+}
+
+// ===========================================================================
+// RED PIN — metric/p precedence (REQ-6, #948): sklearn's `p` is an INDEPENDENT
+// parameter that is IGNORED for non-Minkowski metrics. ferrolearn conflates
+// `metric` and `p` into the single `metric: DbscanMetric<F>` field, so `with_p`
+// unconditionally OVERWRITES the metric to `Minkowski(p)` (`dbscan.rs`
+// `fn with_p`: `self.metric = DbscanMetric::Minkowski(p)`). There is no way to
+// express sklearn's `DBSCAN(metric='euclidean', p=3)` — setting both (in the
+// only available order, `.with_metric(Euclidean).with_p(3.0)`) silently becomes
+// Minkowski(3), diverging from sklearn which IGNORES p under euclidean.
+//
+// sklearn `NearestNeighbors(metric=self.metric, ..., p=self.p)` passes `p`
+// ALONGSIDE `metric` (`_dbscan.py:411-418`), but `p` only feeds the Minkowski
+// metric; for `metric='euclidean'` the L2 metric ignores `p`
+// (`_parameter_constraints` accepts `p` for any metric, `_dbscan.py:341`).
+//
+// Fixture N reused (diagonal {(0,0),(1,1),(1.5,1.5),(2.5,2.5)}, eps=1.3,
+// min_samples=2). Euclidean isolates idx0/idx3 (L2 1.414 > 1.3); Minkowski p=3
+// chains all four (mink-p3 1.260 <= 1.3). No distance within a ULP of eps=1.3.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.cluster import DBSCAN
+//     X=np.array([[0.,0.],[1.,1.],[1.5,1.5],[2.5,2.5]])
+//     m=DBSCAN(eps=1.3,min_samples=2,metric='euclidean',p=3).fit(X)
+//     print(m.labels_.tolist(), m.core_sample_indices_.tolist())"
+//   ->  [-1, 0, 0, -1]   [1, 2]
+// (i.e. IDENTICAL to metric='euclidean' with p=None — p is ignored.)
+//
+// ferrolearn `with_metric(Euclidean).with_p(3.0)` -> Minkowski(3) ->
+// labels [0,0,0,0] / core [0,1,2,3] (the Minkowski-p3 result), diverging.
+// ===========================================================================
+
+/// Divergence: ferrolearn's `DBSCAN::with_p` overwrites `metric` to
+/// `Minkowski(p)`, so `metric='euclidean'` + `p=3` (sklearn IGNORES p, returns
+/// the euclidean result `[-1,0,0,-1]` / core `[1,2]`,
+/// `sklearn/cluster/_dbscan.py:341,411-418`) cannot be expressed — the only
+/// available ferrolearn spelling `.with_metric(Euclidean).with_p(3.0)` yields
+/// the Minkowski-p3 result `[0,0,0,0]` / core `[0,1,2,3]`. Tracking: #2192.
+#[test]
+#[ignore = "divergence: DBSCAN conflates metric/p, with_p overwrites metric so p is not ignored for euclidean; tracking #2192"]
+fn divergence_dbscan_p_ignored_for_euclidean() {
+    // sklearn oracle: metric='euclidean', p=3 == euclidean (p IGNORED).
+    let sklearn_labels: [isize; 4] = [-1, 0, 0, -1];
+    let sklearn_core: [usize; 2] = [1, 2];
+
+    let x = fixture_n();
+
+    // The ferrolearn analogue of sklearn `DBSCAN(metric='euclidean', p=3)`:
+    // request the Euclidean metric AND set p=3. sklearn ignores p here.
+    let fitted = DBSCAN::<f64>::new(1.3)
+        .with_min_samples(2)
+        .with_metric(DbscanMetric::Euclidean)
+        .with_p(3.0)
+        .fit(&x, &())
+        .unwrap();
+
+    for (i, &exp) in sklearn_labels.iter().enumerate() {
+        assert_eq!(
+            fitted.labels()[i],
+            exp,
+            "metric=euclidean,p=3 label[{i}]: ferrolearn {} vs sklearn {exp} \
+             (sklearn IGNORES p for euclidean; ferrolearn with_p overwrites \
+             metric to Minkowski(3))",
+            fitted.labels()[i]
+        );
+    }
+    assert_eq!(
+        fitted.core_sample_indices(),
+        &sklearn_core,
+        "metric=euclidean,p=3 core: ferrolearn {:?} vs sklearn [1,2] \
+         (p must be ignored for euclidean)",
+        fitted.core_sample_indices()
     );
 }
