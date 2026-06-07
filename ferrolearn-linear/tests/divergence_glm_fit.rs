@@ -1093,3 +1093,201 @@ fn glm_warm_start_init_used() {
          to the solution than cold (seeded at 0); warm_err {warm_err}, cold_err {cold_err}"
     );
 }
+
+// ===========================================================================
+// #552 (REQ-5) — intercept initialization = link(weighted_mean(y)).
+//
+// sklearn cold-starts the optimizer with `coef = init_zero_coef(X)` and, when
+// `fit_intercept`, seeds the intercept entry at
+//   `coef[-1] = link.link(np.average(y, weights=sample_weight))`
+// (`sklearn/linear_model/_glm/glm.py:251-256`) — for the log link this is
+// `intercept_init = log(weighted_mean(y))`, feature coefficients stay 0. The
+// penalized GLM objective is CONVEX, so this init changes only the starting
+// point (and the iteration count), never the converged optimum: the cold fit
+// stays byte-identical to the sklearn oracle. The observable parity is sklearn's
+// FIRST iterate, isolated below on a constant-`y` input where the seed already
+// IS the optimum.
+//
+// warm_start with an explicit `coef_init` (REQ-11) MUST take precedence over the
+// REQ-5 intercept seed — verified green by `glm_warm_start_*` above (those fits
+// reach the converged optimum from the supplied seed, not from log(mean y)).
+// ===========================================================================
+
+/// REQ-5 init consumed + matches sklearn's first iterate. On a CONSTANT-`y`
+/// Poisson input the alpha=0 optimum is `intercept_ = log(c)`, `coef_ = 0`, which
+/// is EXACTLY what sklearn's intercept init seeds (`coef[-1] = log(mean y) =
+/// log(c)`). So a single optimizer step (`max_iter=1`) already lands at the
+/// optimum — directly observing that ferrolearn seeds the intercept at
+/// `log(mean y)` (a true coef=0 / intercept=0 start would NOT be at `log(c)`
+/// after one step).
+///
+/// sklearn site: `sklearn/linear_model/_glm/glm.py:251-256`
+///   `coef = linear_loss.init_zero_coef(X, ...)`
+///   `if self.fit_intercept: coef[-1] = base_loss.link.link(np.average(y, ...))`
+///
+/// Oracle (live sklearn 1.5.2 — first iterate equals `log(7)`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[1.],[2.],[3.],[4.]]); y=np.array([7.,7.,7.,7.]); \
+///   m=PoissonRegressor(alpha=0.0,max_iter=1).fit(X,y); \
+///   print(repr(m.intercept_), repr(m.coef_.tolist()), repr(np.log(7.0)))"
+/// # -> 1.9459101490553132 [0.0] 1.9459101490553132
+/// ```
+#[test]
+fn glm_intercept_init_matches_sklearn_first_iterate() {
+    // sklearn intercept init seed (and the constant-y optimum): log(mean y).
+    let c = 7.0_f64;
+    const SK_INTERCEPT_1ITER: f64 = 1.945_910_149_055_313_2; // = ln(7), live sklearn
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = Array1::from(vec![c, c, c, c]);
+
+    // A SINGLE IRLS step (max_iter=1). With the REQ-5 intercept seed at
+    // log(mean y) = log(7) (the constant-y optimum), the result is already there.
+    let one_step = PoissonRegressor::<f64>::new()
+        .with_alpha(0.0)
+        .with_max_iter(1)
+        .fit(&x, &y)
+        .expect("1-step fit");
+
+    assert!(
+        (one_step.intercept() - SK_INTERCEPT_1ITER).abs() < 1e-9,
+        "REQ-5 intercept init: sklearn seeds coef[-1] = log(mean y) = log(7) = \
+         {SK_INTERCEPT_1ITER} (glm.py:251-256), so a max_iter=1 fit on constant y \
+         lands there; ferrolearn returned intercept {} — if the intercept were \
+         seeded at 0 it would NOT equal log(7) after one step",
+        one_step.intercept()
+    );
+    assert!(
+        one_step.coefficients()[0].abs() < 1e-9,
+        "REQ-5: feature coefficients init to 0 (constant-y optimum coef_=0); \
+         ferrolearn returned {}",
+        one_step.coefficients()[0]
+    );
+}
+
+/// REQ-5 is path-only on a CONVEX objective: the converged `coef_`/`intercept_`
+/// are unchanged by the init and still match the live sklearn oracle for
+/// `alpha > 0`. (Re-pins the alpha=0.5 Poisson optimum the existing parity tests
+/// also cover, but here specifically as the post-init invariance guarantee.)
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[0.,0.],[1.,0.],[2.,1.],[3.,2.],[4.,2.]]); y=np.array([0.,1.,2.,3.,4.]); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=1000,tol=1e-10).fit(X,y); \
+///   print(repr(m.coef_.tolist()), repr(m.intercept_))"
+/// # -> [0.3838852306065439, 0.20239975413374428] -0.5193574932086451
+/// ```
+#[test]
+fn glm_intercept_init_converged_optimum_unchanged() {
+    const SK_COEF: [f64; 2] = [0.383_885_230_606_543_9, 0.202_399_754_133_744_28];
+    const SK_INTERCEPT: f64 = -0.519_357_493_208_645_1;
+    let x = Array2::from_shape_vec((5, 2), vec![0., 0., 1., 0., 2., 1., 3., 2., 4., 2.]).unwrap();
+    let y = Array1::from(vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(1000)
+        .with_tol(1e-10)
+        .fit(&x, &y)
+        .expect("fit");
+    let coef = fitted.coefficients();
+    assert!(
+        (coef[0] - SK_COEF[0]).abs() < 1e-4
+            && (coef[1] - SK_COEF[1]).abs() < 1e-4
+            && (fitted.intercept() - SK_INTERCEPT).abs() < 1e-4,
+        "REQ-5 post-init convergence: the intercept init is path-only (convex \
+         objective), so the converged optimum must still match the sklearn oracle \
+         coef {SK_COEF:?} int {SK_INTERCEPT}; ferrolearn coef {coef:?} int {}",
+        fitted.intercept()
+    );
+}
+
+/// REQ-5 no-panic edge case (R-CODE-2): an all-zero Poisson `y` has
+/// `weighted_mean(y) = 0`, so `link.link(0) = log(0) = -inf`. ferrolearn must NOT
+/// produce a NaN/panic — the non-finite seed falls back to the previous cold
+/// start (intercept entry 0), and the fit still returns a finite result. sklearn
+/// likewise computes `link.link(0) = -inf` and recovers (the optimizer steps away
+/// from it); the observable parity is that the all-zero fit succeeds with finite
+/// attributes (the degenerate intercept tends toward `-inf`/very negative as the
+/// mean prediction → 0).
+#[test]
+fn glm_intercept_init_all_zero_y_no_nan() {
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = Array1::from(vec![0.0, 0.0, 0.0, 0.0]); // mean = 0 => log(0) = -inf seed
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(100)
+        .fit(&x, &y)
+        .expect("all-zero-y Poisson fit must not error (y==0 is in the Poisson domain)");
+    assert!(
+        fitted.intercept().is_finite() && fitted.coefficients().iter().all(|c| c.is_finite()),
+        "REQ-5 no-panic: a non-finite intercept seed (log(mean y)=log(0)=-inf) must \
+         fall back gracefully — ferrolearn returned a non-finite fitted attribute \
+         (intercept {}, coef {:?})",
+        fitted.intercept(),
+        fitted.coefficients()
+    );
+}
+
+// ===========================================================================
+// #2160 (REQ-5, attack #3) — all-zero-y Poisson degenerate boundary.
+//
+// For an all-zero Poisson `y` (mean 0, which is IN the Poisson domain `y >= 0`),
+// sklearn seeds `coef[-1] = link.link(average(y)) = log(0) = -inf`
+// (`glm.py:254-256`) and the lbfgs optimum stays there: `intercept_ = -inf`,
+// `coef_ = [0.0]`, and the inverse-link prediction is `exp(-inf) = 0.0` EXACTLY
+// for every sample. ferrolearn's REQ-5 non-finite-seed FALLBACK substitutes the
+// prior cold start (intercept 0) and then converges to a *finite* very-negative
+// intercept (~ -20.95) with eta clamped at -20, so `predict` returns
+// `exp(-20.95) = 7.96e-10` per sample, NOT sklearn's exact `0.0`. This is an
+// OBSERVABLE divergence at the degenerate boundary: the builder's
+// `glm_intercept_init_all_zero_y_no_nan` only asserts FINITENESS (ferrolearn's
+// own behavior), which is the opposite of sklearn's `-inf`/`0.0` result.
+// ===========================================================================
+
+/// Divergence: ferrolearn's `fit_glm_irls` (`ferrolearn-linear/src/glm.rs:1752`,
+/// the `if intercept_init.is_finite()` non-finite-seed fallback) diverges from
+/// `sklearn/linear_model/_glm/glm.py:254`
+///   `coef[-1] = base_loss.link.link(np.average(y, weights=sample_weight))`
+/// for an all-zero Poisson `y`.
+///
+/// sklearn returns `intercept_ = -inf`, `predict(X) = [0.0, 0.0, 0.0, 0.0]`
+/// (every sample EXACTLY 0). ferrolearn returns a finite `intercept_ ≈ -20.95`
+/// and `predict(X) ≈ [7.96e-10; 4]`.
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -W ignore -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[1.],[2.],[3.],[4.]]); y=np.zeros(4); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=100,tol=1e-6).fit(X,y); \
+///   print(m.intercept_, m.predict(X).tolist())"
+/// # -> -inf [0.0, 0.0, 0.0, 0.0]
+/// ```
+///
+/// Tracking: #2160
+#[test]
+#[ignore = "divergence: all-zero-y Poisson predict 7.96e-10/intercept -20.95 vs sklearn 0.0/-inf; tracking #2160"]
+fn divergence_glm_all_zero_y_predict_matches_sklearn() {
+    // sklearn's exact all-zero-y Poisson predictions: every sample is 0.0.
+    const SK_PRED: [f64; 4] = [0.0, 0.0, 0.0, 0.0];
+    let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+    let y = Array1::from(vec![0.0, 0.0, 0.0, 0.0]);
+
+    let fitted = PoissonRegressor::<f64>::new()
+        .with_alpha(0.5)
+        .with_max_iter(100)
+        .with_tol(1e-6)
+        .fit(&x, &y)
+        .expect("all-zero-y Poisson fit (y==0 is in the Poisson domain)");
+
+    let pred = fitted.predict(&x).unwrap();
+    for (i, (&p, &skp)) in pred.iter().zip(SK_PRED.iter()).enumerate() {
+        assert!(
+            (p - skp).abs() < 1e-12,
+            "REQ-5 all-zero-y: sklearn's PoissonRegressor predicts EXACTLY {skp} \
+             at sample {i} (intercept_ = log(0) = -inf => exp = 0; glm.py:254), \
+             but ferrolearn returned {p} (the non-finite-seed fallback converges \
+             to a finite ~-20.95 intercept and clamps eta, so exp(eta) != 0)",
+        );
+    }
+}
