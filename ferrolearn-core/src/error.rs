@@ -19,7 +19,7 @@
 //! | REQ-6 (IoError + SerdeError) | SHIPPED | `FerroError::IoError(#[from])` / `SerdeError`; consumers `save_pmml` in `pmml.rs`, `fetch_openml` in `openml.rs`. |
 //! | REQ-7 (FerroResult alias) | SHIPPED | `pub type FerroResult<T>`; pervasive return type; `FerroError: Send + Sync`. |
 //! | REQ-8 (NotFittedError eliminated, R-DEV-4) | SHIPPED | Sanctioned deviation: no `NotFitted` variant — replaced by the `traits.rs` typestate (predict-before-fit is a compile error). Mirrors `NotFittedError` (`exceptions.py:42`). Runtime `PyErr` MRO parity pinned later in `ferrolearn-python`. |
-//! | REQ-9 (ShapeMismatchContext builder) | NOT-STARTED | open blocker #351 — builder has no non-test production consumer (sites construct `ShapeMismatch{..}` directly). |
+//! | REQ-9 (ShapeMismatchContext builder) | SHIPPED | `struct ShapeMismatchContext` + `new`/`expected`/`actual`/`build in error.rs`. Non-test production consumer: `fn check_consistent_length in dataset.rs` constructs its `FerroError::ShapeMismatch` via `ShapeMismatchContext::new(..).expected(..).actual(..).build()` — and `check_consistent_length` is itself consumed by `Fit::fit for Pipeline in pipeline.rs`. Verification: `cargo test -p ferrolearn-core --lib`. |
 //! | REQ-10 (advisory-warning mapping) | SHIPPED | Documented non-applicable: sklearn's `*Warning` advisories (`exceptions.py:64-188`) have no `Result`-contract analog; `#[non_exhaustive]` leaves room for a future warnings channel. |
 //!
 //! acto-critic audit: NO DIVERGENCE FOUND (error.rs is vocabulary-only; exception-type

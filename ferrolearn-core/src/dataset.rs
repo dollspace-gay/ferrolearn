@@ -22,7 +22,7 @@ use ferray::aliases::Array2 as FerrayArray2;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use num_traits::Float;
 
-use crate::error::FerroError;
+use crate::error::{FerroError, ShapeMismatchContext};
 
 /// A trait for types that represent tabular datasets.
 ///
@@ -203,14 +203,13 @@ where
 /// sklearn's "inconsistent numbers of samples" wording in the context field.
 pub fn check_consistent_length(len_a: usize, len_b: usize) -> Result<(), FerroError> {
     if len_a != len_b {
-        return Err(FerroError::ShapeMismatch {
-            expected: vec![len_a],
-            actual: vec![len_b],
-            context: format!(
-                "Found input variables with inconsistent numbers of samples: {:?}",
-                [len_a, len_b]
-            ),
-        });
+        return Err(ShapeMismatchContext::new(format!(
+            "Found input variables with inconsistent numbers of samples: {:?}",
+            [len_a, len_b]
+        ))
+        .expected(&[len_a])
+        .actual(&[len_b])
+        .build());
     }
     Ok(())
 }
