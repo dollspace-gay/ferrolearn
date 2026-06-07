@@ -819,9 +819,10 @@ def test_logreg_sample_weight_matches_sklearn_3class():
     fl = ferrolearn.LogisticRegression(C=10.0, max_iter=5000, tol=1e-8).fit(
         X, y, sample_weight=w
     )
-    # The multinomial coef_ matrix is non-identifiable up to a per-row constant,
-    # but predict_proba IS identifiable: assert weighted-fit parity there (the
-    # binding's multiclass coef_ exposure collapse is the separate #2170 item).
+    # At this (loose) tol the multinomial coef_ matrix is non-identifiable up to
+    # a per-row constant, but predict_proba IS identifiable: assert weighted-fit
+    # parity there. (The multiclass coef_ EXPOSURE shape/values are pinned
+    # separately in test_logreg_coef_intercept_shapes_match_sklearn_*, #2170.)
     assert np.abs(fl.predict_proba(X) - sk.predict_proba(X)).max() < 5e-3, (
         fl.predict_proba(X),
         sk.predict_proba(X),
@@ -896,8 +897,8 @@ def test_logreg_class_weight_balanced_3class_matches_sklearn():
     fl = ferrolearn.LogisticRegression(
         C=10.0, max_iter=5000, tol=1e-8, class_weight="balanced"
     ).fit(X, y)
-    # Identifiable comparison via predict_proba (see #2170 for the multiclass
-    # coef_ exposure collapse, which is orthogonal to the class_weight fit).
+    # Identifiable comparison via predict_proba (the multiclass coef_ exposure
+    # shape/values are pinned separately, #2170; orthogonal to class_weight).
     assert np.abs(fl.predict_proba(X) - sk.predict_proba(X)).max() < 5e-3, (
         fl.predict_proba(X),
         sk.predict_proba(X),
@@ -973,3 +974,60 @@ def test_logreg_random_state_n_jobs_noop_and_get_params():
     assert params["n_jobs"] == 3
     assert params["class_weight"] == "balanced"
     assert clone(m).get_params() == params
+
+
+def test_logreg_coef_intercept_shapes_match_sklearn_multiclass_and_binary():
+    """coef_/intercept_ EXPOSURE matches sklearn shapes AND values (#2170).
+
+    Before the fix the binding marshalled only the row-0 / first-class vector and
+    the wrapper reshaped it to (1, n_features)/(1,), so multiclass coef_ collapsed
+    to (1, n_features) instead of (n_classes, n_features). sklearn
+    `LogisticRegression` (`_logistic.py` self.coef_/self.intercept_) gives
+    `(1, n_features)`/`(1,)` for binary and `(n_classes, n_features)`/`(n_classes,)`
+    for multiclass. The expected values are computed by the live sklearn 1.5.2
+    oracle in-test (R-CHAR-3). The fix is exposure-only, so predict/predict_proba
+    must be UNCHANGED — asserted against the same oracle.
+    """
+    from sklearn.linear_model import LogisticRegression as SkLR
+
+    # --- 3-class (multinomial): coef_ MUST be (n_classes, n_features) ---
+    X3 = np.array(
+        [
+            [0.0, 0.0], [0.5, 0.0], [0.0, 0.5],
+            [5.0, 0.0], [5.5, 0.0], [5.0, 0.5],
+            [0.0, 5.0], [0.5, 5.0], [0.0, 5.5],
+        ]
+    )
+    y3 = np.array([0, 0, 0, 1, 1, 1, 2, 2, 2])
+    n_features = X3.shape[1]
+    n_classes = 3
+
+    # Tight convergence so the (otherwise non-identifiable) multinomial coef_
+    # matrix is pinned to sklearn's symmetric-softmax solution to ~1e-6.
+    sk3 = SkLR(solver="lbfgs", max_iter=5000, tol=1e-10).fit(X3, y3)
+    fl3 = ferrolearn.LogisticRegression(max_iter=5000, tol=1e-10).fit(X3, y3)
+
+    assert np.asarray(fl3.coef_).shape == (n_classes, n_features) == sk3.coef_.shape
+    assert np.asarray(fl3.intercept_).shape == (n_classes,) == sk3.intercept_.shape
+    np.testing.assert_allclose(np.asarray(fl3.coef_), sk3.coef_, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(fl3.intercept_), sk3.intercept_, atol=1e-6)
+
+    # Exposure-only fix: predict/predict_proba unchanged (match the oracle).
+    assert np.array_equal(np.asarray(fl3.predict(X3)), sk3.predict(X3))
+    np.testing.assert_allclose(fl3.predict_proba(X3), sk3.predict_proba(X3), atol=1e-6)
+
+    # --- binary: coef_ MUST stay (1, n_features), NOT collapse to 1-D ---
+    Xb = np.array(
+        [[1.0, 2.0], [2.0, 3.0], [3.0, 4.0], [5.0, 6.0], [6.0, 7.0], [7.0, 8.0]]
+    )
+    yb = np.array([0, 0, 0, 1, 1, 1])
+    skb = SkLR(solver="lbfgs", max_iter=5000, tol=1e-10).fit(Xb, yb)
+    flb = ferrolearn.LogisticRegression(max_iter=5000, tol=1e-10).fit(Xb, yb)
+
+    assert np.asarray(flb.coef_).shape == (1, Xb.shape[1]) == skb.coef_.shape
+    assert np.asarray(flb.intercept_).shape == (1,) == skb.intercept_.shape
+    np.testing.assert_allclose(np.asarray(flb.coef_), skb.coef_, atol=1e-6)
+    np.testing.assert_allclose(np.asarray(flb.intercept_), skb.intercept_, atol=1e-6)
+
+    assert np.array_equal(np.asarray(flb.predict(Xb)), skb.predict(Xb))
+    np.testing.assert_allclose(flb.predict_proba(Xb), skb.predict_proba(Xb), atol=1e-6)

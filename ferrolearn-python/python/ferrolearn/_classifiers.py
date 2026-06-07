@@ -224,8 +224,14 @@ class LogisticRegression(_ClassifierPickleMixin, ClassifierMixin, BaseEstimator)
                     f"as many samples as features. {msg}"
                 ) from e
             raise
-        self.coef_ = np.array(self._rs.coef_).reshape(1, -1)
-        self.intercept_ = np.array([float(self._rs.intercept_)])
+        # The binding now returns the full coefficient matrix / intercept
+        # vector: coef_ is (1, n_features) for binary and (n_classes, n_features)
+        # for multiclass; intercept_ is (1,) for binary and (n_classes,) for
+        # multiclass — matching sklearn's shapes exactly (sklearn
+        # _logistic.py self.coef_/self.intercept_). Pass them through unchanged
+        # (no (1, -1)/(1,) collapse, which dropped the per-class rows, #2170).
+        self.coef_ = np.array(self._rs.coef_, dtype=np.float64)
+        self.intercept_ = np.array(self._rs.intercept_, dtype=np.float64)
         # n_iter_ shape (1,) for the binary/multinomial lbfgs path
         # (sklearn _logistic.py:1376).
         self.n_iter_ = np.array([int(self._rs.n_iter_)], dtype=np.int32)

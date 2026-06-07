@@ -55,7 +55,7 @@
 //! | REQ-SUBSTRATE (ferray::numpy_interop) | NOT-STARTED | marshals via `crate::conversions::*` (rust-numpy + `ndarray`), not `ferray::numpy_interop`/`ferray-core` (R-SUBSTRATE-1); ferray exposes no numpy bridge (R-SUBSTRATE-5). Owned by `conversions.md` #2027. |
 
 use crate::conversions::*;
-use ferrolearn_core::{Fit, HasClasses, HasCoefficients, HasFeatureImportances, Predict};
+use ferrolearn_core::{Fit, HasClasses, HasFeatureImportances, Predict};
 use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 
@@ -214,22 +214,30 @@ impl RsLogisticRegression {
         Ok(PyArray1::from_array(py, &arr))
     }
 
+    /// Coefficient matrix (sklearn `coef_`, `_logistic.py`): shape
+    /// `(1, n_features)` for binary and `(n_classes, n_features)` for multiclass.
+    /// Binds the core's full `weight_matrix()` (which already shapes the binary
+    /// weight vector to `(1, n_features)`), NOT the flat first-class
+    /// `coefficients()` — fixing the multiclass `(1, n_features)` collapse (#2170).
     #[getter]
-    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let fitted = self
             .fitted
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
-        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+        Ok(ndarray2_to_numpy(py, fitted.weight_matrix()))
     }
 
+    /// Intercept vector (sklearn `intercept_`, `_logistic.py`): shape `(1,)` for
+    /// binary and `(n_classes,)` for multiclass. Binds the core's per-class
+    /// `intercept_vec()`, NOT the scalar first-class `intercept()` (#2170).
     #[getter]
-    fn intercept_(&self) -> PyResult<f64> {
+    fn intercept_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let fitted = self
             .fitted
             .as_ref()
             .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
-        Ok(fitted.intercept())
+        Ok(ndarray1_to_numpy(py, fitted.intercept_vec()))
     }
 
     /// Number of L-BFGS iterations performed during `fit` (sklearn `n_iter_`,
