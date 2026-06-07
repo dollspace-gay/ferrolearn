@@ -26,7 +26,7 @@
 //! | REQ-4 quantile_range ctor param + validation | SHIPPED (#1249) | `RobustScaler::quantile_range` field (default `(25,75)`) + `with_quantile_range` validating builder (non-strict `0 <= q_min <= q_max <= 100`, matching sklearn's `if not 0 <= q_min <= q_max <= 100`); `fit` uses `Q(q_max_frac) − Q(q_min_frac)`; sklearn `_data.py:1567`,`:1604-1606`,`:1630` |
 //! | REQ-5 with_centering / with_scaling ctor params | SHIPPED (#1250) | `RobustScaler::with_centering`/`with_scaling` fields (default `true`) + `with_with_centering`/`with_with_scaling` builders, threaded into `FittedRobustScaler`; `transform` is conditional `if with_centering: X -= center_` then `if with_scaling: X /= scale_`, mirroring sklearn `_data.py:1672-1675`,`:1616`,`:1640`. R-DEV-4: ferrolearn always materializes `median`/`iqr`; sklearn nulls `center_`/`scale_` when the flag is `False` (flags govern transform APPLICATION so OUTPUT matches sklearn exactly). |
 //! | REQ-6 unit_variance ctor param | NOT-STARTED (#1251) | sklearn `_data.py:1636-1638` |
-//! | REQ-7 inverse_transform | NOT-STARTED (#1252) | sklearn `_data.py:1678`,`:1706-1708` |
+//! | REQ-7 inverse_transform | SHIPPED (#1252) | `FittedRobustScaler::inverse_transform` reconstructs per column `x_orig = x_scaled * scale_ + center_` in sklearn's order (scaling FIRST then centering: `if with_scaling: X *= scale_` then `if with_centering: X += center_`, `_data.py:1706-1708`), using the stored `scale_` (`_handle_zeros_in_scale(iqr)`, so a near-constant column inverts the centered value). `force_all_finite="allow-nan"`: NaN passes through (`nan*scale+center=nan`); +/-inf rejected (`InvalidParameter`, #2200 precedent); `ShapeMismatch` on column-count mismatch. Live-oracle tests (`tests/divergence_robust_scaler.rs`): `req7_inverse_roundtrip`, `req7_inverse_holdout`, `req7_inverse_nan_passthrough`, `req7_inverse_with_centering_false`/`with_scaling_false`, `req7_inverse_inf_rejected`. Consumer: crate re-export + PyO3 `_RsRobustScaler` (`extras.rs:3228`). sklearn `_data.py:1678`,`:1706-1708` |
 //! | REQ-8 `robust_scale` free function + axis | SHIPPED (#1253) | `robust_scale` free fn delegating to `RobustScaler` (`axis=0` native, `axis=1` transpose→fit_transform→transpose); sklearn `_data.py:1719`,`:1845-1848` |
 //! | REQ-9 NaN tolerance (allow-nan / nanmedian / nanpercentile) | SHIPPED (#1254) | `RobustScaler::fit` filters `is_nan()` out of each column BEFORE the sort + `quantile_sorted` (median = `Q50`, IQR = `Q(q_max)−Q(q_min)`), so center_/iqr/scale_ are computed over the FINITE values only — mirroring sklearn `np.nanmedian(X, axis=0)` (`_data.py:1614`) + per-column `np.nanpercentile(column_data, quantile_range)` (`:1630`) under `force_all_finite="allow-nan"` (`:1601`). An ALL-NaN column collects no finite values -> the sorted slice is EMPTY -> `quantile_sorted` returns `F::nan()` (made total / non-panicking, R-CODE-2) -> center_/iqr/scale_ = NaN (`_handle_zeros_in_scale` leaves NaN since `NaN < 10*eps` is false). NaN inputs pass through `transform` (`(nan-center)/scale = nan`). inf-rejection (allow-nan REJECTS +/-inf, MinMaxScaler #2200 precedent): `fit` AND `transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Finite-data behavior is byte-identical (same sort + linear-interp quantile; REQ-1/#2204 green guards unchanged). Live-oracle tests (`tests/divergence_robust_scaler.rs`): `req9_nan_fit_single_column_ignored` (center_=4.0/scale_=3.0/transform `[[-1],[nan],[-1/3],[1/3],[1]]`), `req9_nan_fit_multi_column_scattered`, `req9_all_nan_column_yields_nan_no_panic`, `req9_with_centering_false_nan`, `req9_with_scaling_false_nan`, `inf_rejected_fit`, `inf_rejected_transform`, `nan_only_still_fits`. Non-test consumer: PyO3 `_RsRobustScaler` (`ferrolearn-python/src/extras.rs:3228`, registered `lib.rs:94`) marshals `fit`/`transform` over `FittedRobustScaler<f64>` + `FittedPipelineTransformer` impl + crate re-export. **f32 caveat (#2206):** numpy `np.nanpercentile` UPCASTS float32 input to float64 for the linear interpolation (returning float64), so sklearn's `scale_`/`center_` are float64 even for f32 input; ferrolearn's `quantile_sorted::<F>` interpolates in `F`, so on f32 a non-trivial interpolation fraction at larger magnitudes diverges (~3e-4 abs). Same class as StandardScaler #2205 / OPTICS #2195 (generic-F vs sklearn-float64-upcast); the f64 path is bit-exact (2000-fixture fuzz, worst diff 7e-15). Tracked #2206, pinned `#[ignore]` in `tests/divergence_robust_scaler.rs::divergence_f32_nanpercentile_upcasts_to_float64`. Future fix: interpolate the quantile in f64 regardless of `F`. sklearn `_data.py:1601`,`:1614`,`:1630`,`:1665` |
 //! | REQ-10 center_ / scale_ attribute names + _handle_zeros scale_ | SHIPPED (#1255) | `FittedRobustScaler::center` (= `median`) / `scale` (= `scale_` field = `_handle_zeros_in_scale(iqr)`, `1.0` on zero-IQR columns); `fit` sets `scale_ = iqr.mapv(\|v\| if v==0 {1} else {v})`; sklearn `_data.py:1505-1514`,`:1634-1635` |
@@ -241,6 +241,56 @@ pub struct FittedRobustScaler<F> {
 }
 
 impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
+    /// Inverse the robust scaling, reconstructing the original feature values.
+    ///
+    /// Per column `x_orig = x_scaled * scale_ + center_`, applied in sklearn's
+    /// order — scaling FIRST, then centering: `if with_scaling: X *= scale_`
+    /// then `if with_centering: X += center_` (`_data.py:1706-1708`), the
+    /// reverse of [`transform`](Transform::transform)'s center-then-scale. Uses
+    /// the stored `scale_` (= `_handle_zeros_in_scale(iqr)`, so a near-constant
+    /// column's scale is 1 and its inverse leaves the centered value), matching
+    /// sklearn's `X *= self.scale_`.
+    ///
+    /// `force_all_finite="allow-nan"` (`_data.py`): NaN passes through
+    /// (`nan*scale + center = nan`); +/-inf is rejected (#2200 precedent).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the column count differs from
+    /// the fitted feature count, or [`FerroError::InvalidParameter`] if the
+    /// input contains +/-inf.
+    pub fn inverse_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_features = self.median.len();
+        if x.ncols() != n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), n_features],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedRobustScaler::inverse_transform".into(),
+            });
+        }
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
+
+        let mut out = x.to_owned();
+        for (j, mut col) in out.columns_mut().into_iter().enumerate() {
+            let med = self.median[j];
+            let scale = self.scale_[j];
+            for v in &mut col {
+                if self.with_scaling {
+                    *v = *v * scale;
+                }
+                if self.with_centering {
+                    *v = *v + med;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Return the per-column medians learned during fitting.
     #[must_use]
     pub fn median(&self) -> &Array1<F> {

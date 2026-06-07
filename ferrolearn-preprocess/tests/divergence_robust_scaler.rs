@@ -470,3 +470,114 @@ fn divergence_f32_nanpercentile_upcasts_to_float64() {
         (f_scale_f64 - sk_scale_f64).abs()
     );
 }
+
+// ===========================================================================
+// REQ-7 (#1252): inverse_transform = x*scale_ + center_ (scaling first, then
+// centering), force_all_finite="allow-nan" (NaN passes, +/-inf rejected).
+//
+// Live sklearn 1.5.2 oracle (run from /tmp):
+//   X=[[1,10],[2,20],[3,30],[100,40]]; r=RobustScaler().fit(X)
+//   center_=[2.5,25.0]; scale_=[25.5,15.0]
+//   r.inverse_transform(r.transform(X)) == X
+//   r.inverse_transform([[0,0],[1,1]]) -> [[2.5,25.0],[28.0,40.0]]
+//   RobustScaler().fit([[1],[2],[3],[4]]).inverse_transform([[nan],[0]]) -> [[nan],[2.5]]
+// ===========================================================================
+
+fn fixture_4x2() -> ndarray::Array2<f64> {
+    array![[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [100.0, 40.0]]
+}
+
+#[test]
+fn req7_inverse_roundtrip() {
+    let x = fixture_4x2();
+    let fitted = RobustScaler::<f64>::new().fit(&x, &()).unwrap();
+    let xt = fitted.transform(&x).unwrap();
+    let xinv = fitted.inverse_transform(&xt).unwrap();
+    for ((i, j), &orig) in x.indexed_iter() {
+        assert!(
+            (xinv[[i, j]] - orig).abs() < 1e-9,
+            "roundtrip[{i},{j}] = {} != {orig}",
+            xinv[[i, j]]
+        );
+    }
+}
+
+#[test]
+fn req7_inverse_holdout() {
+    // Live oracle: inverse([[0,0],[1,1]]) = [[2.5,25.0],[28.0,40.0]]
+    // (0*scale+center=center; 1*scale+center).
+    let fitted = RobustScaler::<f64>::new().fit(&fixture_4x2(), &()).unwrap();
+    let out = fitted
+        .inverse_transform(&array![[0.0, 0.0], [1.0, 1.0]])
+        .unwrap();
+    let exp = [[2.5, 25.0], [28.0, 40.0]];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (out[[i, j]] - exp[i][j]).abs() < 1e-9,
+                "holdout[{i},{j}] = {} != sklearn {}",
+                out[[i, j]],
+                exp[i][j]
+            );
+        }
+    }
+}
+
+#[test]
+fn req7_inverse_nan_passthrough() {
+    // Live oracle: fit([[1],[2],[3],[4]]) center_=2.5; inverse([[nan],[0]])=[[nan],[2.5]].
+    let fitted = RobustScaler::<f64>::new()
+        .fit(&array![[1.0], [2.0], [3.0], [4.0]], &())
+        .unwrap();
+    let out = fitted
+        .inverse_transform(&array![[f64::NAN], [0.0]])
+        .unwrap();
+    assert!(out[[0, 0]].is_nan(), "nan must pass through inverse");
+    assert!(
+        (out[[1, 0]] - 2.5).abs() < 1e-9,
+        "0 -> center 2.5, got {}",
+        out[[1, 0]]
+    );
+}
+
+#[test]
+fn req7_inverse_with_flags_false() {
+    let x = fixture_4x2();
+    // with_centering=false: inverse = x*scale_ (no +center).
+    let f_nocenter = RobustScaler::<f64>::new()
+        .with_with_centering(false)
+        .fit(&x, &())
+        .unwrap();
+    let xt = f_nocenter.transform(&x).unwrap();
+    let xinv = f_nocenter.inverse_transform(&xt).unwrap();
+    for ((i, j), &orig) in x.indexed_iter() {
+        assert!(
+            (xinv[[i, j]] - orig).abs() < 1e-9,
+            "nocenter roundtrip[{i},{j}]"
+        );
+    }
+    // with_scaling=false: inverse = x + center (no *scale).
+    let f_noscale = RobustScaler::<f64>::new()
+        .with_with_scaling(false)
+        .fit(&x, &())
+        .unwrap();
+    let xt2 = f_noscale.transform(&x).unwrap();
+    let xinv2 = f_noscale.inverse_transform(&xt2).unwrap();
+    for ((i, j), &orig) in x.indexed_iter() {
+        assert!(
+            (xinv2[[i, j]] - orig).abs() < 1e-9,
+            "noscale roundtrip[{i},{j}]"
+        );
+    }
+}
+
+#[test]
+fn req7_inverse_inf_rejected() {
+    let fitted = RobustScaler::<f64>::new().fit(&fixture_4x2(), &()).unwrap();
+    assert!(
+        fitted
+            .inverse_transform(&array![[f64::INFINITY, 0.0]])
+            .is_err(),
+        "inverse_transform must reject +inf (allow-nan)"
+    );
+}
