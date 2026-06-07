@@ -1471,12 +1471,71 @@ class MiniBatchKMeans(_ClusterWrapper):
 
 
 class DBSCAN(_ClusterWrapper):
+    """DBSCAN density-based clustering backed by Rust (#2190).
+
+    Mirrors ``sklearn.cluster.DBSCAN`` (``sklearn/cluster/_dbscan.py:243``),
+    surfacing the ``fit(X, y=None, sample_weight=None)`` signature
+    (``_dbscan.py:370``) and the fitted ``labels_`` (``_dbscan.py:439``),
+    ``core_sample_indices_`` (``np.where(core_samples)[0]``, ``_dbscan.py:438``),
+    and ``components_`` (``X[core_sample_indices_].copy()``,
+    ``_dbscan.py:441-446``) attributes from the Rust fitted type.
+
+    ``sample_weight`` (``_dbscan.py:384-388``): weight of each sample, such that
+    a sample with a weight of at least ``min_samples`` is by itself a core
+    sample; a sample with a negative weight may inhibit its eps-neighbor from
+    being core. Weights are absolute and default to 1 (the ``None`` default
+    reproduces the unweighted ``len >= min_samples`` core path EXACTLY). A
+    wrong-length ``sample_weight`` raises ``ValueError`` (the Rust core's
+    ``ShapeMismatch`` -> ``PyValueError``, mirroring ``_check_sample_weight``).
+    """
+
     def __init__(self, eps=0.5, *, min_samples=5):
         self.eps = eps
         self.min_samples = min_samples
 
     def _make_rs(self):
         return _RsDBSCAN(eps=self.eps, min_samples=self.min_samples)
+
+    def fit(self, X, y=None, sample_weight=None):
+        self._rs = self._make_rs()
+        # sklearn validates X via check_array(dtype="numeric")
+        # (`_dbscan.py:395`): a 2-D array is REQUIRED (1-D -> ValueError, not
+        # TypeError, #2191), and float32/float64 are PRESERVED (other dtypes
+        # cast to float64) — DBSCAN does NOT upcast float32.
+        Xa = np.asarray(X)
+        if Xa.ndim != 2:
+            raise ValueError(f"Expected 2D array, got {Xa.ndim}D array instead.")
+        if Xa.dtype not in (np.float32, np.float64):
+            Xa = Xa.astype(np.float64)
+        # sklearn `DBSCAN.fit(X, y=None, sample_weight=None)`
+        # (`_dbscan.py:370`): thread `sample_weight` into the Rust core (the
+        # weighted core-determination path). `None` is the unweighted path,
+        # byte-identical to today.
+        if sample_weight is None:
+            self._rs.fit(_f64(Xa))
+        else:
+            sw = np.asarray(sample_weight, dtype=np.float64)
+            if sw.ndim == 0:
+                # _check_sample_weight broadcasts a scalar to all n samples.
+                sw = np.full(Xa.shape[0], float(sw))
+            elif sw.ndim > 1:
+                # _check_sample_weight: "Sample weights must be 1D array or
+                # scalar" (ValueError, not TypeError, #2191).
+                raise ValueError("Sample weights must be 1D array or scalar")
+            self._rs.fit(_f64(Xa), sample_weight=sw)
+        self.labels_ = np.asarray(self._rs.labels_)
+        self.core_sample_indices_ = np.asarray(self._rs.core_sample_indices_)
+        # sklearn `self.components_ = X[self.core_sample_indices_].copy()`
+        # (`_dbscan.py:442`) — taken from the VALIDATED input, preserving its
+        # dtype (float32 stays float32), NOT the f64 Rust core copy (#2191).
+        self.components_ = Xa[self.core_sample_indices_].copy()
+        self.n_features_in_ = Xa.shape[1]
+        return self
+
+    def fit_predict(self, X, y=None, sample_weight=None):
+        # sklearn `DBSCAN.fit_predict(X, y=None, sample_weight=None)`
+        # (`_dbscan.py:450`) threads sample_weight through fit.
+        return self.fit(X, sample_weight=sample_weight).labels_
 
 
 class AgglomerativeClustering(_ClusterWrapper):

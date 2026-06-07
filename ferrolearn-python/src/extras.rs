@@ -26,6 +26,7 @@
 //! | REQ-REGRESSOR-API-CONFORM (fit/predict, 11 regressors) | SHIPPED | `py_regressor!` macro + hand-written `Rs*Regressor` expose fit/predict, wrapped by `_extras.py::_RegressorWrapper` (+ `n_features_in_`/`score`). Mirrors the sklearn regressor fit/predict contract across `ensemble`/`linear_model`/`neighbors`/`kernel_ridge`/`tree`. |
 //! | REQ-CLASSIFIER-API-CONFORM (fit/predict + LabelEncoder, 13 classifiers) | SHIPPED | `py_classifier!` macro + hand-written classifiers expose fit/predict, wrapped by `_extras.py::_ClassifierWrapper` whose `_encode` (np.unique+searchsorted) sets `classes_` and round-trips arbitrary label dtypes through the Rust `usize`-label core. |
 //! | REQ-CLUSTERER-API-CONFORM (fit + labels_, 5 clusterers incl. GMM) | SHIPPED | `RsMiniBatchKMeans`/`RsDBSCAN`/`RsAgglomerativeClustering`/`RsBirch` expose fit + `labels_` (+ predict for MiniBatchKMeans), `RsGaussianMixture` fit/predict; wrapped by `_extras.py::_ClusterWrapper` (+ `fit_predict`). |
+//! | REQ-DBSCAN-BINDING-SURFACE (`sample_weight` + `core_sample_indices_` + `components_`) | SHIPPED | FIXED #2190: `RsDBSCAN.fit` takes `#[pyo3(signature = (x, sample_weight=None))]` and chains `.with_sample_weight(numpy1_to_ndarray(w))` (weighted core determination, `cluster/_dbscan.py:370,427-435`; wrong-length → `ShapeMismatch`→`PyValueError`); new `#[getter] core_sample_indices_ → PyArray1<i64>` (`_dbscan.py:438`) + `#[getter] components_ → PyArray2<f64>` (`_dbscan.py:441-446`). `_extras.py::DBSCAN` overrides `fit(X, y=None, sample_weight=None)` + `fit_predict(... sample_weight=None)`, exposing `labels_`/`core_sample_indices_`/`components_`. Non-test consumer: `ferrolearn.DBSCAN(...).fit(X, sample_weight=w)`. Live oracle: `tests/divergence_dbscan_sample_weight.py` (9 pass) — unweighted/promote/demote/#2189-pairwise-boundary/negative-weight/wrong-length-`ValueError`/`fit_predict`/clone parity. See `.design/python/extras.md`. |
 //! | REQ-TRANSFORMER-API-CONFORM (fit/transform, 13 transformers) | SHIPPED | `py_transformer!` macro exposes fit/transform for the decomp/preprocess/kernel transformers, wrapped by `_extras.py::_TransformerWrapper` (+ `fit_transform`). |
 //! | REQ-REGRESSOR-VALUE-PARITY (default-path predict parity) | SHIPPED | deterministic default path: the deterministic regressors' predict parity is verified downstream in `ferrolearn_linear`/`_tree`/`_neighbors`/`_kernel` REQ tables. (Seeded-RNG ensembles → REQ-VALUE-PARITY-RNG.) |
 //! | REQ-CLASSIFIER-VALUE-PARITY (default-path label parity) | SHIPPED | deterministic default path: decoded label predictions of the deterministic classifiers match sklearn after the `_encode`/decode round-trip; verified downstream in `ferrolearn_linear`/`_bayes`/`_tree`. |
@@ -2496,9 +2497,25 @@ impl RsDBSCAN {
         }
     }
 
-    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+    // sklearn's `DBSCAN.fit(X, y=None, sample_weight=None)`
+    // (`sklearn/cluster/_dbscan.py:370`). A `None` sample_weight is the
+    // unweighted `len >= min_samples` core path; a `Some(w)` weight chains the
+    // core builder `.with_sample_weight(w)` (the weighted `sum(w[neighbors]) >=
+    // min_samples` path, `_dbscan.py:427-435`). A wrong-length `sample_weight`
+    // surfaces from the core as a `FerroError::ShapeMismatch` -> `PyValueError`
+    // (mirroring `_check_sample_weight`'s `ValueError`, `_dbscan.py:397`).
+    #[pyo3(signature = (x, sample_weight=None))]
+    fn fit(
+        &mut self,
+        x: PyReadonlyArray2<'_, f64>,
+        sample_weight: Option<PyReadonlyArray1<'_, f64>>,
+    ) -> PyResult<()> {
         let x_nd = numpy2_to_ndarray(x);
-        let m = ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples);
+        let mut m =
+            ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples);
+        if let Some(w) = sample_weight {
+            m = m.with_sample_weight(numpy1_to_ndarray(w));
+        }
         let fitted = m
             .fit(&x_nd, &())
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -2515,6 +2532,32 @@ impl RsDBSCAN {
         let lbls = f.labels();
         let arr: Array1<i64> = lbls.mapv(|v| v as i64);
         Ok(PyArray1::from_array(py, &arr))
+    }
+
+    /// Indices of the core samples, mirroring sklearn's
+    /// `core_sample_indices_ = np.where(core_samples)[0]`
+    /// (`sklearn/cluster/_dbscan.py:438`); a 1-D ascending int array.
+    #[getter]
+    fn core_sample_indices_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let arr: Array1<i64> = f.core_sample_indices().iter().map(|&i| i as i64).collect();
+        Ok(PyArray1::from_array(py, &arr))
+    }
+
+    /// Coordinates of the core samples (rows of `X` at `core_sample_indices_`),
+    /// shape `(n_core, n_features)`, mirroring sklearn's
+    /// `components_ = X[core_sample_indices_].copy()`
+    /// (`sklearn/cluster/_dbscan.py:441-446`).
+    #[getter]
+    fn components_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let f = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(PyArray2::from_array(py, f.components()))
     }
 }
 
