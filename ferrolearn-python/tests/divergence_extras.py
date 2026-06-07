@@ -961,3 +961,98 @@ def test_bayesian_ridge_sample_weight_none_matches_unweighted():
     b = fl.BayesianRidge().fit(X, y)
     np.testing.assert_array_equal(a.coef_, b.coef_)
     assert a.intercept_ == b.intercept_
+
+
+# ===========================================================================
+# ARDRegression REQ-6/7/8 (#2163): compute_score/scores_, n_iter_,
+# predict(return_std=True)/sigma_ (kept-feature covariance). Oracle = live
+# sklearn 1.5.2 `sklearn.linear_model.ARDRegression`, compared head-to-head.
+# ===========================================================================
+
+from sklearn.linear_model import ARDRegression as SkARDRegression
+
+
+def _ard_dataset():
+    # 4-feature mixed-relevance design (y = 2*x0 + 0.5*x2; features 1, 3 are
+    # irrelevant and get pruned), so sigma_ is the kept (2,2) block.
+    X = np.array(
+        [
+            [1.0, 50.0, 2.0, -3.0],
+            [2.0, 10.0, 4.0, 1.0],
+            [3.0, 90.0, 6.0, -7.0],
+            [4.0, 20.0, 8.0, 5.0],
+            [5.0, 70.0, 10.0, -2.0],
+            [6.0, 40.0, 12.0, 9.0],
+            [7.0, 60.0, 14.0, -1.0],
+            [8.0, 30.0, 16.0, 4.0],
+        ]
+    )
+    y = 2.0 * X[:, 0] + 0.5 * X[:, 2]
+    return X, y
+
+
+def test_ard_n_iter_matches_sklearn():
+    """REQ-7: `n_iter_` matches the live sklearn oracle (`_bayes.py:716`,
+    `self.n_iter_ = iter_ + 1`)."""
+    X, y = _ard_dataset()
+    sk = SkARDRegression(max_iter=1000).fit(X, y)
+    fr = fl.ARDRegression(max_iter=1000).fit(X, y)
+    assert fr.n_iter_ == sk.n_iter_, (
+        f"n_iter_: ferrolearn={fr.n_iter_}, sklearn={sk.n_iter_}"
+    )
+    assert 1 <= fr.n_iter_ <= 1000
+
+
+def test_ard_scores_matches_sklearn():
+    """REQ-6: `compute_score=True` populates `scores_` (length n_iter_, NO
+    post-loop append — ARD appends inside the loop before the convergence break)
+    with the ARD objective per iteration, matching the sklearn oracle tightly
+    when the EM iterates align (`_bayes.py:695-704`)."""
+    X, y = _ard_dataset()
+    sk = SkARDRegression(max_iter=1000, compute_score=True).fit(X, y)
+    fr = fl.ARDRegression(max_iter=1000, compute_score=True).fit(X, y)
+
+    assert len(fr.scores_) == len(sk.scores_)
+    # ARD: len(scores_) == n_iter_ (unlike BayesianRidge's n_iter_+1).
+    assert len(fr.scores_) == fr.n_iter_
+    np.testing.assert_allclose(fr.scores_, sk.scores_, rtol=1e-7, atol=1e-7)
+
+
+def test_ard_scores_empty_without_compute_score():
+    """REQ-6: with compute_score=False (default), `scores_` is empty — matching
+    sklearn which only populates it under the flag (`_bayes.py:587`)."""
+    X, y = _ard_dataset()
+    fr = fl.ARDRegression(max_iter=1000).fit(X, y)
+    assert fr.scores_.size == 0
+
+
+def test_ard_return_std_matches_sklearn():
+    """REQ-8: `predict(X, return_std=True)` returns `(mean, std)` matching the
+    sklearn oracle (variance over the KEPT columns only, `_bayes.py:787-790`),
+    including an out-of-range query point. The mean equals the plain predict."""
+    X, y = _ard_dataset()
+    sk = SkARDRegression(max_iter=1000).fit(X, y)
+    fr = fl.ARDRegression(max_iter=1000).fit(X, y)
+
+    # Training rows + an out-of-range query (3x the last row).
+    Xq = np.vstack([X[:3], X[-1] * 3.0])
+    sk_mean, sk_std = sk.predict(Xq, return_std=True)
+    fr_mean, fr_std = fr.predict(Xq, return_std=True)
+
+    np.testing.assert_allclose(fr_mean, sk_mean, rtol=1e-6, atol=1e-9)
+    np.testing.assert_allclose(fr_std, sk_std, rtol=1e-5, atol=1e-8)
+
+    # return_std=False returns a bare mean array equal to the (mean, std) mean.
+    fr_mean_only = fr.predict(Xq)
+    np.testing.assert_allclose(fr_mean_only, fr_mean, rtol=0, atol=1e-12)
+
+
+def test_ard_sigma_matches_sklearn():
+    """REQ-8: the fitted `sigma_` is the KEPT-feature (n_kept, n_kept) posterior
+    covariance matching the sklearn oracle (`_bayes.py:727`). On this design
+    features 1, 3 are pruned, so sigma_ is (2, 2), not (4, 4)."""
+    X, y = _ard_dataset()
+    sk = SkARDRegression(max_iter=1000).fit(X, y)
+    fr = fl.ARDRegression(max_iter=1000).fit(X, y)
+    assert fr.sigma_.shape == sk.sigma_.shape == (2, 2)
+    np.testing.assert_allclose(fr.sigma_, sk.sigma_, rtol=1e-5, atol=1e-9)

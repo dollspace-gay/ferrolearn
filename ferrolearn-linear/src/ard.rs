@@ -39,7 +39,12 @@
 //! | REQ-3 (per-iteration keep_lambda masking + threshold pruning) | SHIPPED | `keep_lambda = lambda_ < threshold_lambda(1e4)` recomputed each iter; pruned coef zeroed (`_bayes.py:691`). |
 //! | REQ-4 (predict) | SHIPPED | `Predict for FittedARDRegression`. |
 //! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
-//! | REQ-6..9 NOT-STARTED | compute_score/scores_ (#477), n_iter_ (#478), predict(return_std)/sigma_ (#479), array-type ferray substrate (#480; the kept-Gram inverse already on `ferray::linalg::inv`). |
+//! | REQ-6 (compute_score / scores_) | SHIPPED | `with_compute_score` on `ARDRegression` (default `false`, `_bayes.py:587`); when set, `fn fit` appends the exact ARD objective (`_bayes.py:695-704`: `sum(λ1·log λ − λ2·λ) + α1·log α − α2·α + 0.5·(fast_logdet(σ) + n·log α + sum log λ) − 0.5·(α·rmse + sum(λ·coef²))`, `fast_logdet` via `fn logdet_spd`) per iteration — appended BEFORE the convergence break, so `scores.len() == n_iter` (NO post-loop append, unlike `BayesianRidge`: no `scores_[-1]` aliasing quirk). Getter `fn scores`. Consumer: `RsARDRegression::scores_` (`extras.rs`) → `_extras.py::ARDRegression.scores_`. Verified by `divergence_ard_scores.rs` (Rust) + `test_ard_scores_matches_sklearn` (pytest) vs live sklearn. |
+//! | REQ-7 (n_iter_) | SHIPPED | `FittedARDRegression.n_iter` set to `last_iter + 1` in `fn fit` (`_bayes.py:716` `self.n_iter_ = iter_ + 1`); getter `fn n_iter`. Consumer: `RsARDRegression::n_iter_` (`extras.rs`) → `_extras.py::ARDRegression.n_iter_`. Verified by `divergence_ard_scores.rs` (each case asserts `n_iter()` == the live oracle: 3/6/4) + `test_ard_n_iter_matches_sklearn` (pytest). |
+//! | REQ-8 (predict return_std / full sigma_) | SHIPPED | `FittedARDRegression.sigma_full` is the kept-feature `(n_kept, n_kept)` posterior covariance (sklearn `sigma_`, `_bayes.py:727`; empty `(0,0)` if all pruned) with `keep_lambda` mask back to full feature space; getters `fn sigma_full`/`fn keep_lambda`. `fn predict_with_std` returns `(mean, sqrt((Xk·σ·Xk).sum(axis=1) + 1/α))` over KEPT cols only (`_bayes.py:787-790`). Consumer: `RsARDRegression::predict(return_std=True)` + `sigma_` getter (`extras.rs`) → `_extras.py::ARDRegression.predict`/`sigma_`. Verified by `divergence_ard_return_std.rs` (Rust) + `test_ard_return_std_matches_sklearn`/`_sigma_matches_sklearn` (pytest). |
+//! | REQ-8b (n<p Woodbury branch: structural + observable contract) | SHIPPED | `n_samples < n_features` selects `fn update_sigma_woodbury` (sklearn `_update_sigma_woodbury`, `_bayes.py:670-674`, `:732-748`): inverts the well-conditioned `(n,n)` `eye/alpha + (Xk·invλ)·Xkᵀ` via `fn invert_dense` (`ferray::linalg::inv`) instead of the rank-deficient `(p,p)` Gram block. Constant-y all-pruned (`intercept_=mean(y)`, coef 0, no panic) and recoverable-sparse cases match the live oracle (same kept set, coef within eigensolver-backend tolerance). Verified by `divergence_ard_woodbury.rs` (Rust) + `divergence_ard_woodbury.py` (pytest) vs live sklearn 1.5.2. |
+//! | REQ-8c (n<p EXACT bit-parity on chaotic ill-conditioned trajectories) | NOT-STARTED | Blocked on ferray `scipy.linalg.pinvh` primitive (#2165, R-SUBSTRATE-5): sklearn's `_update_sigma_woodbury` inverts `A` with `pinvh` (LAPACK `syev` + eigenvalue cutoff `max|λ|·N·eps`); ferray exposes only an LU `inv`. On cond~2e8 EM trajectories even numpy's `eigh` differs from scipy's `pinvh` (~1.67), so exact `n_iter_`/coef parity in n<p is genuinely substrate-blocked. `fn update_sigma_woodbury` carries a minimal `pinvh`-cutoff floor on the singular-inverse retry (constant-y path) but does NOT reproduce the full eigenvalue-cutoff trajectory. The OBSERVABLE contract is SHIPPED (REQ-8b); only the exact-bit-chaotic tail is deferred. |
+//! | REQ-9 (array-type ferray substrate) | NOT-STARTED | #480; the kept-Gram inverse already on `ferray::linalg::inv`, the array type is still `ndarray`. |
 //!
 //! acto-critic + builder: the fit was rewritten to sklearn's per-iteration ARD (was wrongly
 //! pruning relevant features); coef_/alpha_/lambda_/pruned-set now match the live oracle. The
@@ -96,6 +101,10 @@ pub struct ARDRegression<F> {
     pub lambda_2: F,
     /// Features with `lambda_i > threshold_lambda` are pruned.
     pub threshold_lambda: F,
+    /// If `true`, compute the ARD objective (log marginal likelihood) at each
+    /// EM iteration into `scores_` (sklearn `compute_score`, default `false`,
+    /// `_bayes.py:587`).
+    pub compute_score: bool,
     /// Whether to fit an intercept (bias) term.
     pub fit_intercept: bool,
 }
@@ -116,6 +125,7 @@ impl<F: Float + FromPrimitive> ARDRegression<F> {
             lambda_1: F::from(1e-6).unwrap(),
             lambda_2: F::from(1e-6).unwrap(),
             threshold_lambda: F::from(1e4).unwrap(),
+            compute_score: false,
             fit_intercept: true,
         }
     }
@@ -169,6 +179,17 @@ impl<F: Float + FromPrimitive> ARDRegression<F> {
         self
     }
 
+    /// Set whether to compute the ARD objective (log marginal likelihood) at
+    /// each EM iteration (sklearn `compute_score`, `_bayes.py:587`). When
+    /// `true`, the converged model's [`FittedARDRegression::scores`] holds the
+    /// per-iteration objective sequence (length `n_iter_`); when `false` it is
+    /// empty.
+    #[must_use]
+    pub fn with_compute_score(mut self, compute_score: bool) -> Self {
+        self.compute_score = compute_score;
+        self
+    }
+
     /// Set whether to fit an intercept term.
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
@@ -198,8 +219,24 @@ pub struct FittedARDRegression<F> {
     alpha: F,
     /// Per-feature weight precisions.
     lambda: Array1<F>,
-    /// Diagonal of the posterior covariance matrix.
+    /// Diagonal of the posterior covariance matrix (over the full feature
+    /// index; pruned features carry 0).
     sigma: Array1<F>,
+    /// Full kept-feature posterior covariance matrix `(n_kept, n_kept)`,
+    /// mirroring sklearn's `sigma_` (`_bayes.py:727`). Empty `(0, 0)` if all
+    /// features are pruned.
+    sigma_full: Array2<F>,
+    /// Mask of surviving (kept) features, `keep_lambda = lambda_ <
+    /// threshold_lambda` at convergence (`_bayes.py:691`). Maps the rows/cols of
+    /// [`Self::sigma_full`] back to the full feature space.
+    keep_lambda: Vec<bool>,
+    /// Actual number of EM iterations run, mirroring sklearn's `n_iter_`
+    /// (`_bayes.py:716`, `iter_ + 1`).
+    n_iter: usize,
+    /// Per-iteration ARD objective (log marginal likelihood), mirroring
+    /// sklearn's `scores_` (`_bayes.py:695-704`). Empty unless `compute_score`
+    /// was set; otherwise length `n_iter`.
+    scores: Vec<F>,
 }
 
 impl<F: Float> FittedARDRegression<F> {
@@ -220,6 +257,61 @@ impl<F: Float> FittedARDRegression<F> {
     pub fn sigma(&self) -> &Array1<F> {
         &self.sigma
     }
+
+    /// Returns the full kept-feature posterior covariance matrix
+    /// `(n_kept, n_kept)` (sklearn `sigma_`, `_bayes.py:727`). Empty `(0, 0)`
+    /// if every feature was pruned.
+    #[must_use]
+    pub fn sigma_full(&self) -> &Array2<F> {
+        &self.sigma_full
+    }
+
+    /// Returns the kept-feature mask (`keep_lambda = lambda_ <
+    /// threshold_lambda` at convergence, `_bayes.py:691`): index `i` is `true`
+    /// iff feature `i` survived pruning. The `true` positions index the
+    /// rows/cols of [`Self::sigma_full`].
+    #[must_use]
+    pub fn keep_lambda(&self) -> &[bool] {
+        &self.keep_lambda
+    }
+
+    /// Returns the actual number of EM iterations run to reach the stopping
+    /// criterion (sklearn `n_iter_`, `_bayes.py:716`).
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+
+    /// Returns the per-iteration ARD objective (log marginal likelihood)
+    /// sequence (sklearn `scores_`, `_bayes.py:695-704`). Empty unless the
+    /// model was built with `with_compute_score(true)`; otherwise of length
+    /// [`Self::n_iter`].
+    #[must_use]
+    pub fn scores(&self) -> &[F] {
+        &self.scores
+    }
+}
+
+/// Dense inverse of a square matrix on the ferray substrate
+/// (`ferray::linalg::inv`), bridging `ndarray -> ferray -> ndarray` at this
+/// boundary (R-SUBSTRATE-4). Returns the ferray error (including the singular-
+/// matrix signal) so callers can decide whether to retry.
+fn invert_dense<F: LinalgFloat>(m: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let n = m.nrows();
+    let flat: Vec<F> = m.iter().copied().collect();
+    let a = FerrayArray::<F, FerrayIx2>::from_vec(FerrayIx2::new([n, n]), flat).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray inv: failed to build matrix: {e}"),
+        }
+    })?;
+    let inv_f = inv(&a).map_err(|e| FerroError::NumericalInstability {
+        message: format!("ferray inv failed: {e}"),
+    })?;
+    Array2::from_shape_vec((n, n), inv_f.iter().copied().collect()).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray inv: shape conversion failed: {e}"),
+        }
+    })
 }
 
 /// Posterior covariance of the kept feature block, mirroring scikit-learn's
@@ -272,6 +364,163 @@ fn update_sigma<F: LinalgFloat>(
         }
     })?;
     Ok(sigma)
+}
+
+/// Posterior covariance of the kept feature block in the `n_samples <
+/// n_features` regime, mirroring scikit-learn's
+/// `ARDRegression._update_sigma_woodbury` (`sklearn/linear_model/_bayes.py:732-748`):
+///
+/// ```text
+/// X_keep     = X[:, keep]                                     # (n, k_keep)
+/// inv_lambda = 1 / lambda_[keep]                              # len k_keep
+/// A          = eye(n)/alpha + (X_keep .* inv_lambda) @ X_keep^T   # (n, n)
+/// inv_A      = pinvh(A)
+/// S          = inv_A @ (X_keep .* inv_lambda)                 # (n, k_keep)
+/// sigma      = -((X_keep^T .* inv_lambda_rows) @ S)           # (k_keep, k_keep)
+/// sigma[j,j] += inv_lambda[j]
+/// ```
+///
+/// When `n_samples < n_features` the direct Gram block `diag(lambda) + alpha *
+/// Xk^T Xk` is `(k_keep, k_keep)` with `rank(Xk^T Xk) <= n_samples < k_keep`, so
+/// it is rank-deficient and the direct inverse diverges. The Woodbury identity
+/// inverts the WELL-CONDITIONED `(n, n)` matrix `A = eye(n)/alpha + ...` (SPD,
+/// never singular) instead. The `(n, n)` inverse runs on the SAME ferray
+/// substrate as the direct path (`ferray::linalg::inv`). The empty-kept edge
+/// (`k_keep == 0`) returns the empty `(0, 0)` covariance.
+///
+/// NOTE (R-SUBSTRATE-5, #2165): sklearn's `_update_sigma_woodbury` inverts `A`
+/// with scipy's `pinvh` (LAPACK `syev` symmetric eigendecomposition + an
+/// eigenvalue cutoff `max|λ|·N·eps`); ferray exposes only an LU `inv`. The two
+/// agree to machine precision on the WELL-CONDITIONED `A` (the structural
+/// contract this function delivers), but on chaotic ill-conditioned EM
+/// trajectories the eigensolver-backend difference can amplify — exact bit
+/// parity there is blocked on the ferray `pinvh` primitive (#2165).
+///
+/// Returns the full `(k_keep, k_keep)` posterior covariance `Sigma`.
+fn update_sigma_woodbury<F: LinalgFloat>(
+    xk: &Array2<F>,
+    alpha: F,
+    lambda_keep: &[F],
+) -> Result<Array2<F>, FerroError> {
+    let n_samples = xk.nrows();
+    let k = xk.ncols();
+    let one = <F as num_traits::One>::one();
+
+    // Empty-kept edge: all features pruned -> empty (0, 0) covariance.
+    if k == 0 {
+        return Ok(Array2::<F>::zeros((0, 0)));
+    }
+
+    let inv_lambda: Vec<F> = lambda_keep.iter().map(|&l| one / l).collect();
+
+    // X_keep .* inv_lambda (broadcast over columns): (n, k).
+    let mut xk_scaled = xk.clone();
+    for col in 0..k {
+        let s = inv_lambda[col];
+        for row in 0..n_samples {
+            xk_scaled[[row, col]] *= s;
+        }
+    }
+
+    // A = eye(n)/alpha + (X_keep .* inv_lambda) @ X_keep^T  (n, n), SPD.
+    let mut a_mat = xk_scaled.dot(&xk.t());
+    let inv_alpha = one / alpha;
+    for i in 0..n_samples {
+        a_mat[[i, i]] += inv_alpha;
+    }
+
+    // inv_A = inverse(A) on the ferray substrate (R-SUBSTRATE-4). A is SPD and
+    // well-conditioned for the generic n<p design, where the LU `inv` matches
+    // scipy's `pinvh` to machine precision and the fallback below is NEVER
+    // taken (keeping those trajectories byte-identical).
+    //
+    // pinvh shim (#2165, R-SUBSTRATE-5): when alpha is astronomically large
+    // (the constant-y / zero-variance signature) the `eye(n)/alpha` term
+    // vanishes below rounding and A collapses to the rank-`<= n_samples`
+    // outer-product `(X_keep .* inv_lambda) @ X_keep^T`, so the LU `inv`
+    // reports a singular matrix. scipy's `pinvh` tolerates this by zeroing
+    // eigenvalues below `max|λ|·N·eps`; ferray has no eigensolver yet (#2165).
+    // We mirror that cutoff with the minimal equivalent — a diagonal floor of
+    // `max|A_ij|·N·eps` added ONLY on the singular-inverse retry — which
+    // reproduces sklearn's all-pruned trajectory (kept 10->2->0) on the
+    // constant-y case without perturbing any well-conditioned design.
+    let inv_a = match invert_dense(&a_mat) {
+        Ok(m) => m,
+        Err(_) => {
+            let eps = <F as Float>::epsilon();
+            let n_f = <F as num_traits::NumCast>::from(n_samples)
+                .unwrap_or_else(<F as num_traits::One>::one);
+            let max_abs = a_mat.iter().fold(<F as num_traits::Zero>::zero(), |m, &v| {
+                let a = v.abs();
+                if a > m { a } else { m }
+            });
+            let floor = max_abs * n_f * eps;
+            let mut a_reg = a_mat.clone();
+            for i in 0..n_samples {
+                a_reg[[i, i]] += floor;
+            }
+            invert_dense(&a_reg).map_err(|e| FerroError::NumericalInstability {
+                message: format!("ferray inv failed (ARD Woodbury A, post pinvh-floor): {e}"),
+            })?
+        }
+    };
+
+    // S = inv_A @ (X_keep .* inv_lambda)  (n, k).
+    let s_mat = inv_a.dot(&xk_scaled);
+
+    // sigma = -((X_keep^T .* inv_lambda_rows) @ S)  (k, k);
+    // (X_keep^T .* inv_lambda_rows) scales row j of X_keep^T by inv_lambda[j],
+    // i.e. column j of X_keep by inv_lambda[j] -> that is exactly xk_scaled^T.
+    let mut sigma = xk_scaled.t().dot(&s_mat).mapv(|v| -v);
+
+    // sigma[j, j] += inv_lambda[j]  (_bayes.py:747).
+    for j in 0..k {
+        sigma[[j, j]] += inv_lambda[j];
+    }
+
+    Ok(sigma)
+}
+
+/// Natural log of the determinant of the symmetric positive-definite kept-block
+/// covariance `sigma`, mirroring scikit-learn's `fast_logdet(sigma_)`
+/// (`sklearn/utils/extmath.py:93-130`, `sign, ld = slogdet(A); return ld if
+/// sign > 0 else -inf`) as used in the ARD objective (`_bayes.py:699`).
+///
+/// `sigma` is the posterior covariance over the kept features — it is symmetric
+/// positive-definite in the `_update_sigma` (`n_samples >= n_features`) regime,
+/// so `det(sigma) > 0` and `slogdet` returns `+1` sign. We compute the
+/// log-determinant via an unpivoted LU factorization (Doolittle): for an SPD
+/// matrix the diagonal pivots are strictly positive and `log det = sum(log
+/// u_ii)`. Returns `-inf` if a non-positive pivot is encountered (the `sign <=
+/// 0` branch of `fast_logdet`).
+fn logdet_spd<F: Float>(sigma: &Array2<F>) -> F {
+    let n = sigma.nrows();
+    if n == 0 {
+        // slogdet of a 0x0 matrix is (1.0, 0.0): det == 1, log det == 0.
+        return F::zero();
+    }
+    // Copy into a working LU buffer (unpivoted Doolittle elimination).
+    let mut a = sigma.clone();
+    let mut logdet = F::zero();
+    for k in 0..n {
+        let pivot = a[[k, k]];
+        // A non-positive OR NaN pivot is the `sign <= 0` branch of
+        // `fast_logdet` (`extmath.py:128`): `partial_cmp(..) != Some(Greater)`
+        // is `true` for `pivot <= 0` AND for `NaN` (incomparable), matching
+        // `not (sign > 0)`.
+        if pivot.partial_cmp(&F::zero()) != Some(core::cmp::Ordering::Greater) {
+            return F::neg_infinity();
+        }
+        logdet = logdet + pivot.ln();
+        for i in (k + 1)..n {
+            let factor = a[[i, k]] / pivot;
+            for j in (k + 1)..n {
+                let v = a[[i, j]] - factor * a[[k, j]];
+                a[[i, j]] = v;
+            }
+        }
+    }
+    logdet
 }
 
 impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>, Array1<F>>
@@ -357,13 +606,40 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
         let mut lambda = Array1::<F>::from_elem(n_features, one);
         let mut keep_lambda: Vec<bool> = vec![true; n_features];
 
+        // Branch selection (`_bayes.py:670-674`): when `n_samples < n_features`
+        // (ORIGINAL full feature count, before any pruning) the direct Gram
+        // block is rank-deficient, so sklearn switches to the Woodbury update
+        // (`_update_sigma_woodbury`), inverting the well-conditioned `(n, n)`
+        // matrix. Otherwise it uses the direct `_update_sigma`. Selected once,
+        // matching sklearn (which selects it before the loop and never revisits
+        // it, even as `keep_lambda` shrinks `n_kept` below `n_samples`).
+        let use_woodbury = n_samples < n_features;
+        let solve_sigma = |xk: &Array2<F>, alpha: F, lambda_keep: &[F]| {
+            if use_woodbury {
+                update_sigma_woodbury(xk, alpha, lambda_keep)
+            } else {
+                update_sigma(xk, alpha, lambda_keep)
+            }
+        };
+
         let mut coef = Array1::<F>::zeros(n_features);
         let mut coef_old: Option<Array1<F>> = None;
         // Diagonal of the posterior covariance over the full feature index
         // (pruned features carry 0); kept entries filled from `Sigma` each iter.
         let mut sigma_diag = Array1::<F>::zeros(n_features);
 
-        for _iter_ in 0..self.max_iter {
+        let half = <F as num_traits::NumCast>::from(0.5).unwrap_or(one / two);
+        // Per-iteration ARD objective (`_bayes.py:695-704`); empty unless
+        // `compute_score`. sklearn appends ONE score per iteration (inside the
+        // loop, BEFORE the convergence break) and does NOT recompute it after
+        // the loop, so `len(scores_) == n_iter_` — unlike `BayesianRidge`,
+        // there is no post-loop `scores_[-1]` coef-aliasing quirk.
+        let mut scores: Vec<F> = Vec::new();
+        // `n_iter_ = iter_ + 1` (`_bayes.py:716`). The loop runs at least once.
+        let mut last_iter: usize = 0;
+
+        for iter_ in 0..self.max_iter {
+            last_iter = iter_;
             // Indices of kept columns.
             let kept: Vec<usize> = (0..n_features).filter(|&i| keep_lambda[i]).collect();
             let k = kept.len();
@@ -377,8 +653,9 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
             }
             let lambda_keep: Vec<F> = kept.iter().map(|&i| lambda[i]).collect();
 
-            // sigma_ = (diag(lambda[keep]) + alpha * Xk^T Xk)^{-1}  (_bayes.py:677).
-            let sigma = update_sigma(&xk, alpha, &lambda_keep)?;
+            // sigma_ = update_sigma(...) — Woodbury or direct per the n<p branch
+            // selected before the loop (_bayes.py:677, :670-674).
+            let sigma = solve_sigma(&xk, alpha, &lambda_keep)?;
 
             // coef_[keep] = alpha * sigma_ @ Xk^T @ y; coef_[~keep] = 0
             // (_bayes.py:665-667, the running zeros from the prior mask).
@@ -424,6 +701,33 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
                 }
             }
 
+            // compute_score: the ARD objective (`_bayes.py:695-704`), evaluated
+            // with the UPDATED `alpha`/`lambda` and the just-PRUNED `coef`, the
+            // PRE-prune `rmse`, and the kept-block `sigma` from the TOP of THIS
+            // iteration (`fast_logdet(sigma_)` = log det of the SPD kept
+            // covariance, `extmath.py:93-130`):
+            //
+            //   s  = sum(lambda_1*log(lambda_) - lambda_2*lambda_)        (all features)
+            //      + alpha_1*log(alpha_) - alpha_2*alpha_
+            //      + 0.5*(logdet(sigma_) + n*log(alpha_) + sum(log(lambda_)))
+            //      - 0.5*(alpha_*rmse_ + sum(lambda_*coef_^2))
+            if self.compute_score {
+                let mut s = zero;
+                for i in 0..n_features {
+                    s = s + self.lambda_1 * lambda[i].ln() - self.lambda_2 * lambda[i];
+                }
+                s = s + self.alpha_1 * alpha.ln() - self.alpha_2 * alpha;
+                let sum_log_lambda: F = (0..n_features)
+                    .map(|i| lambda[i].ln())
+                    .fold(zero, |a, b| a + b);
+                s += half * (logdet_spd(&sigma) + n_f * alpha.ln() + sum_log_lambda);
+                let lambda_coef_sq: F = (0..n_features)
+                    .map(|i| lambda[i] * coef[i] * coef[i])
+                    .fold(zero, |a, b| a + b);
+                s -= half * (alpha * rmse + lambda_coef_sq);
+                scores.push(s);
+            }
+
             // Convergence: iter>0 and sum(|coef_old - coef_|) < tol (_bayes.py:707).
             if let Some(prev) = &coef_old {
                 let delta: F = (0..n_features)
@@ -441,11 +745,16 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
             }
         }
 
+        let n_iter = last_iter + 1;
+
         // Final coef_/sigma_ refresh with the converged params, over the
-        // surviving kept set (_bayes.py:718-721).
+        // surviving kept set (_bayes.py:718-721). `sigma_` is the full kept
+        // `(k, k)` covariance (sklearn `self.sigma_`, `_bayes.py:727`), or the
+        // empty `(0, 0)` matrix when every feature is pruned (`_bayes.py:723`:
+        // `sigma_ = np.array([]).reshape(0, 0)`).
         let kept: Vec<usize> = (0..n_features).filter(|&i| keep_lambda[i]).collect();
         let k = kept.len();
-        if k > 0 {
+        let sigma_full: Array2<F> = if k > 0 {
             let mut xk = Array2::<F>::zeros((n_samples, k));
             for (col, &i) in kept.iter().enumerate() {
                 for row in 0..n_samples {
@@ -453,7 +762,7 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
                 }
             }
             let lambda_keep: Vec<F> = kept.iter().map(|&i| lambda[i]).collect();
-            let sigma = update_sigma(&xk, alpha, &lambda_keep)?;
+            let sigma = solve_sigma(&xk, alpha, &lambda_keep)?;
             let xkt_y = xk.t().dot(&y_work);
             let coef_keep = sigma.dot(&xkt_y).mapv(|v| v * alpha);
             coef.fill(zero);
@@ -462,10 +771,12 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
                 coef[i] = coef_keep[col];
                 sigma_diag[i] = sigma[[col, col]];
             }
+            sigma
         } else {
             coef.fill(zero);
             sigma_diag.fill(zero);
-        }
+            Array2::<F>::zeros((0, 0))
+        };
 
         // intercept_ = y_offset - X_offset @ coef_ (_bayes.py:729 `_set_intercept`).
         let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
@@ -480,6 +791,10 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
             alpha,
             lambda,
             sigma: sigma_diag,
+            sigma_full,
+            keep_lambda,
+            n_iter,
+            scores,
         })
     }
 }
@@ -510,6 +825,71 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
 
         let preds = x.dot(&self.coefficients) + self.intercept;
         Ok(preds)
+    }
+}
+
+impl<F: Float + ScalarOperand + 'static> FittedARDRegression<F> {
+    /// Predict the posterior mean AND the predictive standard deviation,
+    /// mirroring `sklearn.linear_model.ARDRegression.predict(X,
+    /// return_std=True)` (`sklearn/linear_model/_bayes.py:761-791`):
+    ///
+    /// ```text
+    /// y_mean = X @ coef_ + intercept_
+    /// col_index = lambda_ < threshold_lambda            # the kept-feature mask
+    /// Xk = X[:, col_index]                              # kept columns only
+    /// y_std = sqrt( (Xk @ sigma_ * Xk).sum(axis=1) + 1/alpha_ )
+    /// ```
+    ///
+    /// The predictive variance uses ONLY the kept columns and the kept-feature
+    /// covariance `sigma_` (`_bayes.py:787-790`); pruned features (whose `coef_`
+    /// is `0`) contribute nothing. Returns `(y_mean, y_std)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of features does not
+    /// match the fitted model.
+    pub fn predict_with_std(&self, x: &Array2<F>) -> Result<(Array1<F>, Array1<F>), FerroError> {
+        let n_features = x.ncols();
+        if n_features != self.coefficients.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.coefficients.len()],
+                actual: vec![n_features],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+
+        let y_mean = x.dot(&self.coefficients) + self.intercept;
+
+        // Kept columns (`col_index = lambda_ < threshold_lambda`, `_bayes.py:787`).
+        let kept: Vec<usize> = (0..n_features).filter(|&i| self.keep_lambda[i]).collect();
+        let k = kept.len();
+        let n_samples = x.nrows();
+        let inv_alpha = F::one() / self.alpha;
+
+        // Xk = X[:, col_index] (`_bayes.py:788`).
+        let mut xk = Array2::<F>::zeros((n_samples, k));
+        for (col, &i) in kept.iter().enumerate() {
+            for row in 0..n_samples {
+                xk[[row, col]] = x[[row, i]];
+            }
+        }
+
+        // sigmas_squared_data = (Xk @ sigma_ * Xk).sum(axis=1) (`_bayes.py:789`);
+        // y_std = sqrt(sigmas_squared_data + 1/alpha_) (`_bayes.py:790`).
+        let xs = xk.dot(&self.sigma_full); // (n_samples, k)
+        let y_std: Array1<F> = xs
+            .outer_iter()
+            .zip(xk.outer_iter())
+            .map(|(xs_row, xk_row)| {
+                let q = xs_row
+                    .iter()
+                    .zip(xk_row.iter())
+                    .fold(F::zero(), |acc, (&a, &b)| acc + a * b);
+                (q + inv_alpha).sqrt()
+            })
+            .collect();
+
+        Ok((y_mean, y_std))
     }
 }
 

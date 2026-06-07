@@ -354,15 +354,158 @@ impl RsBayesianRidge {
     }
 }
 
-py_regressor!(
-    RsARDRegression, "_RsARDRegression",
-    ferrolearn_linear::FittedARDRegression<f64>,
-    (max_iter: usize = 300, tol: f64 = 1e-3, fit_intercept: bool = true),
-    {
-        ferrolearn_linear::ARDRegression::<f64>::new()
-            .with_max_iter(max_iter).with_tol(tol).with_fit_intercept(fit_intercept)
+// ARDRegression (#2163): hand-written pyclass (replacing the thin
+// `py_regressor!` invocation) so the binding can surface sklearn's
+// `compute_score` constructor param (`sklearn/linear_model/_bayes.py:587`), the
+// `predict(X, return_std=True)` path (`_bayes.py:761-791`), and the fitted
+// `n_iter_`/`scores_`/`sigma_` attributes. The MATH lives in
+// `ferrolearn_linear::ARDRegression` (`with_compute_score`, `predict_with_std`,
+// `n_iter`/`scores`/`sigma_full`); this is the thin marshalling shim and the
+// non-test production consumer of the new core API (R-DEFER-1). `sigma_` is the
+// kept-feature `(n_kept, n_kept)` covariance, exactly as sklearn exposes it
+// (`_bayes.py:727`).
+#[pyclass(name = "_RsARDRegression")]
+pub struct RsARDRegression {
+    max_iter: usize,
+    tol: f64,
+    compute_score: bool,
+    fit_intercept: bool,
+    fitted: Option<ferrolearn_linear::FittedARDRegression<f64>>,
+}
+
+#[pymethods]
+impl RsARDRegression {
+    #[new]
+    #[pyo3(signature = (max_iter=300, tol=1e-3, compute_score=false, fit_intercept=true))]
+    fn new(max_iter: usize, tol: f64, compute_score: bool, fit_intercept: bool) -> Self {
+        Self {
+            max_iter,
+            tol,
+            compute_score,
+            fit_intercept,
+            fitted: None,
+        }
     }
-);
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>, y: PyReadonlyArray1<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let y_nd = numpy1_to_ndarray(y);
+        let model = ferrolearn_linear::ARDRegression::<f64>::new()
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_compute_score(self.compute_score)
+            .with_fit_intercept(self.fit_intercept);
+        let fitted = model
+            .fit(&x_nd, &y_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn's `predict(X, return_std=False)` (`_bayes.py:761`). With
+    // `return_std=False` returns the mean array; with `return_std=True` returns
+    // a `(mean, std)` tuple computed over the KEPT columns (`_bayes.py:787-790`).
+    #[pyo3(signature = (x, return_std=false))]
+    fn predict<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+        return_std: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        if return_std {
+            let (mean, std) = fitted
+                .predict_with_std(&x_nd)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            let mean_py = ndarray1_to_numpy(py, &mean);
+            let std_py = ndarray1_to_numpy(py, &std);
+            Ok((mean_py, std_py).into_pyobject(py)?.into_any())
+        } else {
+            let preds = fitted
+                .predict(&x_nd)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+            Ok(ndarray1_to_numpy(py, &preds).into_any())
+        }
+    }
+
+    // sklearn `n_iter_` (`_bayes.py:716` `self.n_iter_ = iter_ + 1`).
+    #[getter]
+    fn n_iter_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_iter())
+    }
+
+    // sklearn `scores_` (`_bayes.py:695-704`): the per-iteration ARD objective
+    // (length n_iter_), populated only when compute_score=True; otherwise empty.
+    #[getter]
+    fn scores_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let scores = Array1::from_vec(fitted.scores().to_vec());
+        Ok(ndarray1_to_numpy(py, &scores))
+    }
+
+    // sklearn `sigma_` (`_bayes.py:727`): the kept-feature (n_kept, n_kept)
+    // posterior covariance matrix of the weights.
+    #[getter]
+    fn sigma_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray2_to_numpy(py, fitted.sigma_full()))
+    }
+
+    // sklearn `coef_` / `intercept_` (`_bayes.py:490`, `:510`).
+    #[getter]
+    fn coef_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.coefficients()))
+    }
+
+    #[getter]
+    fn intercept_(&self) -> PyResult<f64> {
+        use ferrolearn_core::introspection::HasCoefficients;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.intercept())
+    }
+
+    // sklearn `alpha_` (`_bayes.py:493`): estimated noise precision.
+    #[getter]
+    fn alpha_(&self) -> PyResult<f64> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.alpha())
+    }
+
+    // sklearn `lambda_` (`_bayes.py:496`): per-feature weight precisions.
+    #[getter]
+    fn lambda_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(ndarray1_to_numpy(py, fitted.lambda()))
+    }
+}
 
 // HuberRegressor (#500/#501): hand-written pyclass (replacing the thin
 // `py_regressor!` invocation) so the binding can surface sklearn's `warm_start`
