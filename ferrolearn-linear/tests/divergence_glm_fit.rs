@@ -1202,14 +1202,22 @@ fn glm_intercept_init_converged_optimum_unchanged() {
     );
 }
 
-/// REQ-5 no-panic edge case (R-CODE-2): an all-zero Poisson `y` has
-/// `weighted_mean(y) = 0`, so `link.link(0) = log(0) = -inf`. ferrolearn must NOT
-/// produce a NaN/panic — the non-finite seed falls back to the previous cold
-/// start (intercept entry 0), and the fit still returns a finite result. sklearn
-/// likewise computes `link.link(0) = -inf` and recovers (the optimizer steps away
-/// from it); the observable parity is that the all-zero fit succeeds with finite
-/// attributes (the degenerate intercept tends toward `-inf`/very negative as the
-/// mean prediction → 0).
+/// REQ-5 degenerate boundary (R-CODE-2, R-DEV-1): an all-zero Poisson `y` has
+/// `weighted_mean(y) = 0`, so `link.link(0) = log(0) = -inf`. sklearn seeds
+/// `coef[-1] = -inf` (`glm.py:254`) and its lbfgs optimum STAYS there:
+/// `intercept_ = -inf`, `coef_ = 0`, `predict = exp(-inf) = 0.0` exactly.
+/// ferrolearn must NOT panic / produce NaN: it short-circuits to that same
+/// degenerate optimum (`coef_ = 0`, `intercept_ = -inf`), so `predict` is `0.0`
+/// for every sample, matching the live sklearn oracle (NOT a finite fallback).
+///
+/// Oracle (live sklearn 1.5.2):
+/// ```text
+/// python3 -W ignore -c "import numpy as np; from sklearn.linear_model import PoissonRegressor; \
+///   X=np.array([[1.],[2.],[3.],[4.]]); y=np.zeros(4); \
+///   m=PoissonRegressor(alpha=0.5,max_iter=100).fit(X,y); \
+///   print(m.intercept_, m.coef_.tolist(), m.predict(X).tolist())"
+/// # -> -inf [0.0] [0.0, 0.0, 0.0, 0.0]
+/// ```
 #[test]
 fn glm_intercept_init_all_zero_y_no_nan() {
     let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
@@ -1219,13 +1227,30 @@ fn glm_intercept_init_all_zero_y_no_nan() {
         .with_max_iter(100)
         .fit(&x, &y)
         .expect("all-zero-y Poisson fit must not error (y==0 is in the Poisson domain)");
+
+    // sklearn: intercept_ = -inf (NOT a finite fallback), coef_ = 0, no NaN.
     assert!(
-        fitted.intercept().is_finite() && fitted.coefficients().iter().all(|c| c.is_finite()),
-        "REQ-5 no-panic: a non-finite intercept seed (log(mean y)=log(0)=-inf) must \
-         fall back gracefully — ferrolearn returned a non-finite fitted attribute \
-         (intercept {}, coef {:?})",
-        fitted.intercept(),
+        fitted.intercept().is_infinite() && fitted.intercept() < 0.0,
+        "REQ-5 degenerate: sklearn seeds and keeps intercept_ = log(0) = -inf \
+         (glm.py:254); ferrolearn returned intercept {}",
+        fitted.intercept()
+    );
+    assert!(
+        fitted.coefficients().iter().all(|c| c.abs() < 1e-12),
+        "REQ-5 degenerate: sklearn coef_ = 0 (penalty drives features to 0); \
+         ferrolearn returned coef {:?}",
         fitted.coefficients()
+    );
+    assert!(
+        !fitted.intercept().is_nan() && fitted.coefficients().iter().all(|c| !c.is_nan()),
+        "REQ-5 no-NaN: -inf is intentional and finite-representable; no NaN allowed"
+    );
+
+    // predict = inverse_link(X @ 0 + (-inf)) = exp(-inf) = 0.0 for every sample.
+    let pred = fitted.predict(&x).unwrap();
+    assert!(
+        pred.iter().all(|&p| p == 0.0),
+        "REQ-5 degenerate: sklearn predict = [0,0,0,0]; ferrolearn returned {pred:?}"
     );
 }
 
@@ -1266,7 +1291,6 @@ fn glm_intercept_init_all_zero_y_no_nan() {
 ///
 /// Tracking: #2160
 #[test]
-#[ignore = "divergence: all-zero-y Poisson predict 7.96e-10/intercept -20.95 vs sklearn 0.0/-inf; tracking #2160"]
 fn divergence_glm_all_zero_y_predict_matches_sklearn() {
     // sklearn's exact all-zero-y Poisson predictions: every sample is 0.0.
     const SK_PRED: [f64; 4] = [0.0, 0.0, 0.0, 0.0];

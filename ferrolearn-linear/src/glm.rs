@@ -40,8 +40,10 @@
 //! | REQ | Status | Evidence |
 //! |---|---|---|
 //! | REQ-4 (penalized objective: mean half-deviance + ½·alpha, intercept-free) | SHIPPED | `fn weighted_ridge_solve` adds the L2 penalty `weight_sum * alpha` to feature columns only, skipping the intercept column (`intercept_col`), matching sklearn's mean-deviance objective + unpenalized intercept (`glm.py:229-258`: `obj = average(½·deviance) + ½·alpha·‖coef‖²`, `l2_reg_strength = self.alpha`). Oracle parity tests `glm_poisson_intercept_unpenalized` (alpha=1e6 → `intercept_ = log(mean y)`, coef → 0) and `glm_poisson_penalty_scaling` (alpha=1.0 → `coef_=[0.34151720,0.18859745]`, `intercept_=-0.37680132`) green in `tests/divergence_glm_fit.rs`. |
-//! | REQ-1/REQ-2/REQ-3 (Poisson/Gamma/Tweedie families) | NOT-STARTED | #548/#549/#550 — alpha=0 paths match the oracle; per-family alpha>0 parity now uses the correct objective but the director reconciles the SHIPPED claim. |
-//! | REQ-5 (intercept init = link(mean y)) | NOT-STARTED | #552 — `coef` still cold-starts at zero; the alpha=1e6 test reaches `log(mean y)` via convergence of the unpenalized intercept, not via init. |
+//! | REQ-1 (Poisson family + log link) | SHIPPED | #548. `fn fit_glm_irls` with `GLMFamily::Poisson` (`variance => mu`, log-link Fisher scoring) under the REQ-4 mean-deviance/unpenalized-intercept objective fits `PoissonRegressor` to sklearn's `PoissonRegressor` (`HalfPoissonLoss`, log link, `glm.py:589-590`) at BOTH alpha=0 and alpha>0. Consumer: `PoissonRegressor::fit` (crate-root export). Oracle parity tests `glm_poisson_alpha_half_parity` (alpha=0.5 → live coef `[0.38388476754733647,0.2024000617918683]`, int `-0.519356533563308`), `glm_solver_param_invariant`, `glm_poisson_sample_weight`, `glm_poisson_penalty_scaling` green in `tests/divergence_glm_fit.rs` (the alpha=0 MLE matches to <1e-9, the module-header note). |
+//! | REQ-2 (Gamma family + log link) | SHIPPED | #549. `GLMFamily::Gamma` (`variance => mu²`) drives `w = mu²/V(mu)` log-link IRLS; `GammaRegressor` matches sklearn's `GammaRegressor` (`HalfGammaLoss`, log link, y-domain `0 < y`, `glm.py:721-722`) at alpha=0 and alpha>0. The `y == 0` rejection (`HalfGammaLoss` open at 0) is enforced under REQ-14 (`YDomain::Positive`). Consumer: `GammaRegressor::fit` (crate-root export). Oracle tests `glm_gamma_alpha_half_parity` (alpha=0.5 → live coef `[0.24773782526507374,0.11636425618936652]`, int `0.3599464049766692`), `glm_gamma_sample_weight`, `glm_gamma_rejects_zero_y` green. |
+//! | REQ-3 (Tweedie family + power) | SHIPPED | #550. `GLMFamily::Tweedie(p)` (`variance => mu^p`) with the link resolved from `power`/`link` (REQ-8); `TweedieRegressor(power=p)` matches sklearn's `TweedieRegressor` for the log-link powers `p>0` AND the identity-link `p<=0` (`HalfTweedieLoss`/`HalfTweedieLossIdentity`, `glm.py:889-903`) at alpha=0 and alpha>0. Verified live against the oracle for `p ∈ {0,1,1.5,2,3}` to <1e-8. Consumer: `TweedieRegressor::fit` (crate-root export). Oracle tests `glm_tweedie_alpha_half_parity` (`power=1.5, alpha=0.5` → live coef `[0.25606046404981164,0.11657692670900446]`, int `0.3563978246931595`), `glm_tweedie_power0_identity_link`, `glm_tweedie_power0_predict_identity_inverse`, `glm_tweedie_power2_rejects_zero_y` green. |
+//! | REQ-5 (intercept init = link(weighted_mean(y))) | SHIPPED | #552. In `fn fit_glm_irls`, when `fit_intercept` AND NOT (warm_start with `coef_init`), the intercept entry is seeded at `coef[0] = link.link(weighted_mean(y))` (feature coefs stay 0) and `eta`/`mu` are recomputed from that seed, mirroring sklearn's `coef[-1] = link.link(np.average(y, weights=sample_weight))` (`glm.py:251-256`); `weighted_mean(y) = Σ(sᵢ·yᵢ)/Σ(sᵢ)`. warm_start with an explicit `coef_init` (REQ-11) takes precedence (the warm seed overrides the init), and a non-finite seed (e.g. `log(0)` for all-zero Poisson `y`) falls back to the previous cold start (intercept 0) with NO panic/NaN (R-CODE-2). The penalized GLM objective is convex, so the converged `coef_`/`intercept_` are init-invariant — all 22 pre-existing oracle tests stay byte-identical at convergence. Consumer: each estimator's `Fit::fit` (crate-root export). Oracle tests `glm_intercept_init_matches_sklearn_first_iterate` (constant `y=7` → `max_iter=1` intercept = `log(7) = 1.9459101490553132`, == live sklearn's first iterate; feature coef 0), `glm_intercept_init_converged_optimum_unchanged` (alpha=0.5 optimum unchanged vs oracle), `glm_intercept_init_all_zero_y_no_nan` (non-finite-seed fallback, finite result) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-13 (score = D², deviance-explained) | SHIPPED | #559. `#[must_use] pub fn score(&self, x, y) -> Result<F, FerroError>` on `FittedGLMRegressor` computes `D² = 1 − (deviance + constant)/(deviance_null + constant)` (`glm.py:365-438`): `μ = predict(x)`, the null model predicts the (unweighted) mean `ȳ` for every sample, and the per-family unit deviance comes from `GLMFamily::unit_deviance` (Poisson `2·(y·ln(y/μ) − y + μ)`, y=0→`2μ`; Gamma `2·(−ln(y/μ) + (y−μ)/μ)`; Tweedie p=0 `(y−μ)²`; general-p `2·(y^(2−p)/((1−p)(2−p)) − y·μ^(1−p)/(1−p) + μ^(2−p)/(2−p))`), verified term-for-term against `sklearn/_loss/loss.py` (`HalfPoissonLoss:728-742`, `HalfGammaLoss:754-773`, `HalfTweedieLoss:789-837`). `GLMFamily::constant_to_optimal_zero` restores sklearn's `+ constant` so the degenerate constant-`y` boundary matches the oracle. `score` re-validates the y-domain (`YDomain::for_power`), mirroring `glm.py:413-417`. Consumer: the crate-root-exported `FittedGLMRegressor::score` (a public method on the boundary fitted type). Oracle tests `glm_poisson_d2_score` (D²=0.7979479374534378), `glm_gamma_d2_score` (0.8987486959882107), `glm_tweedie_power0_d2_score` (0.9319946452476573, == R²), `glm_tweedie_d2_score` (0.9277805586816806), `glm_score_rejects_out_of_domain_y` green in `tests/divergence_glm_fit.rs`; all 14 pre-existing glm divergence tests stay green. |
 //! | REQ-7 (predict = link.inverse) | SHIPPED | `fn predict` applies `self.link.inverse(eta)` (`Link::Log => exp`, `Link::Identity => eta`), mirroring `glm.py:362` (`y_pred = link.inverse(raw_prediction)`). Consumer: the crate-root-exported `FittedGLMRegressor::predict` used by every wrapper; oracle test `glm_tweedie_power0_predict_identity_inverse` (identity link → raw linear predictor `[0.4,6.3,12.2,18.1]`) green in `tests/divergence_glm_fit.rs`. |
 //! | REQ-8 (Tweedie link='auto'/identity/log) | SHIPPED | `pub enum Link { Log, Identity }` + `pub enum LinkConfig { Auto, Log, Identity }` with `LinkConfig::resolve(power)`: Auto → identity for `power <= 0`, log otherwise (`glm.py:889-893`). `TweedieRegressor.link: LinkConfig` (default `Auto`) is resolved at fit time and threaded into `fit_glm_irls`'s link-parameterized IRLS (`w = dmu_deta^2/V(mu)`, `z = eta + (y-mu)/dmu_deta`) and the fitted struct. Consumer: `TweedieRegressor::fit` (crate-root export); oracle test `glm_tweedie_power0_identity_link` (`coef_=[5.9]`, `intercept_=-5.5`, OLS) green. Poisson/Gamma wire `Link::Log` explicitly. |
@@ -96,6 +98,21 @@ impl Link {
         match self {
             Link::Log => eta.exp(),
             Link::Identity => eta,
+        }
+    }
+
+    /// Forward link `g(mu) = eta`: maps the mean to the linear predictor.
+    ///
+    /// - [`Link::Log`] → `ln(mu)`
+    /// - [`Link::Identity`] → `mu`
+    ///
+    /// Mirrors `link.link(...)` used by sklearn to seed the intercept at
+    /// `link.link(average(y))` (`glm.py:254-256`).
+    #[must_use]
+    fn link<F: Float>(self, mu: F) -> F {
+        match self {
+            Link::Log => mu.ln(),
+            Link::Identity => mu,
         }
     }
 
@@ -1632,18 +1649,22 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
 
     // Coefficient initialization.
     //
-    // COLD START (default, `warm_start == false` or no `coef_init`): `coef = 0`,
-    // with `eta`/`mu` seeded from `y` above — byte-for-byte the previous,
-    // oracle-matching path.
+    // COLD START (default, `warm_start == false` or no `coef_init`): feature
+    // coefficients are 0; when `fit_intercept` the intercept entry is seeded at
+    // `link.link(weighted_mean(y))` (REQ-5, `glm.py:251-256`), and `eta`/`mu`
+    // are recomputed from that seed (so `eta == link(mean_w(y))` constant). When
+    // `fit_intercept` is false the intercept seed is skipped and `eta`/`mu` keep
+    // the per-sample `link(y)` seed above. The objective is convex, so this
+    // changes only the starting point (and the iteration count), never the
+    // converged optimum — the cold fit still matches the sklearn oracle.
     //
     // WARM START (R-DEV-7 analog of sklearn's `warm_start=True`,
     // `glm.py:243-254`): seed the IRLS coefficient vector from the explicit
-    // `coef_init = (feature_coef, intercept)` instead of zero, then recompute
+    // `coef_init = (feature_coef, intercept)` instead, then recompute
     // `eta = X_design @ coef` and `mu = link.inverse(eta)` so the first IRLS
     // weights/working-response are formed at the supplied point (sklearn likewise
-    // hands `coef` straight to the optimizer). The objective is convex, so this
-    // changes only the starting point (and the iteration count), never the
-    // converged optimum.
+    // hands `coef` straight to the optimizer). When `warm_start && coef_init`,
+    // the explicit init takes precedence over the REQ-5 intercept seed.
     let mut coef = Array1::<F>::zeros(n_cols);
     if warm_start && let Some((feature_coef, intercept_init)) = coef_init {
         if feature_coef.len() != n_features_orig {
@@ -1692,6 +1713,96 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
                 }
             }
         }
+    } else if fit_intercept {
+        // COLD-START INTERCEPT INITIALIZATION (REQ-5, `glm.py:251-256`).
+        //
+        // sklearn cold-starts with `coef = init_zero_coef(X)` and, when
+        // `fit_intercept`, seeds the intercept entry at
+        //   `coef[-1] = link.link(np.average(y, weights=sample_weight))`
+        // (the feature coefficients stay 0). For the log link this is
+        // `intercept_init = log(weighted_mean(y))`; for the identity link it is
+        // `weighted_mean(y)`. We mirror this exactly: the intercept is design
+        // column 0, so `coef[0] = link.link(weighted_mean(y))`.
+        //
+        // `weighted_mean(y) = Σ(s_i·y_i) / Σ(s_i)` (= plain mean for an all-ones
+        // sample_weight). `weight_sum = Σ s_i` was computed above.
+        //
+        // Edge case (R-CODE-2, R-DEV-1): the seed must lie in the link's domain.
+        // For the log link `weighted_mean(y)` can be 0 (e.g. all-zero Poisson
+        // `y`, which is IN the Poisson domain `y >= 0`), where `log(0) = -inf` —
+        // sklearn likewise computes `link.link(0) = -inf` there (`glm.py:254`)
+        // and its lbfgs optimum STAYS at `-inf`: the penalized data deviance is
+        // minimized as `mu -> 0` (`eta -> -inf`), and the L2 penalty is on the
+        // feature coefficients only (`l2_reg_strength = self.alpha`,
+        // `glm.py:258`), which are 0. So sklearn returns `intercept_ = -inf`,
+        // `coef_ = 0`, and `predict = inverse_link(X @ 0 - inf) = exp(-inf) =
+        // 0.0` EXACTLY for every sample. We short-circuit to that same degenerate
+        // optimum: IRLS cannot iterate from `mu = 0` (the Fisher weights blow up),
+        // so we skip the loop entirely and return `coef_ = 0`, `intercept_ =
+        // link(weighted_mean(y))` (the non-finite seed). This is alpha-INVARIANT
+        // (the penalty on coef is 0 since coef = 0; the deviance drives
+        // `eta -> -inf` regardless of alpha) and fires ONLY for a non-finite seed
+        // (log link + `mean(y) == 0`) — the exact all-zero case. Gamma requires
+        // `y > 0` so `mean(y) > 0` always (domain guard rejects `y == 0`); the
+        // identity link gives `link(0) = 0` (finite), so neither hits this path.
+        let weighted_y_sum = y
+            .iter()
+            .zip(sample_weight.iter())
+            .fold(F::zero(), |acc, (&yi, &si)| acc + si * yi);
+        let denom = if weight_sum > F::zero() {
+            weight_sum
+        } else {
+            F::from(n_samples).unwrap_or_else(F::one)
+        };
+        let weighted_mean_y = weighted_y_sum / denom;
+        let intercept_init = link.link(weighted_mean_y);
+
+        if !intercept_init.is_finite() {
+            // Degenerate optimum (all-zero-y log-link case): short-circuit to
+            // sklearn's lbfgs landing point `coef_ = 0`, `intercept_ = -inf`
+            // (`glm.py:254`), skipping IRLS (which cannot iterate from `mu = 0`).
+            // `predict = exp(-inf) = 0.0` then matches sklearn exactly. The
+            // feature coefficients are already 0 (cold start); set the intercept
+            // column to the non-finite seed and return immediately. `n_iter_ = 0`
+            // records that the optimum was reached without any IRLS iteration.
+            coef[0] = intercept_init;
+            let intercept = coef[0];
+            let coefficients = Array1::from_iter(coef.iter().skip(1).copied());
+            return Ok(FittedGLMRegressor {
+                coefficients,
+                intercept,
+                link,
+                family: *family,
+                n_iter: 0,
+            });
+        }
+
+        {
+            coef[0] = intercept_init;
+            // Recompute eta/mu from the seeded coef (feature coefs are 0, so
+            // `eta = intercept_init` for every sample, i.e. `eta = link(mean y)`).
+            eta = x_design.dot(&coef);
+            match link {
+                Link::Log => {
+                    let hi = F::from(20.0).unwrap_or_else(F::max_value);
+                    let lo = F::zero() - hi;
+                    let mmu = F::from(1e-10).unwrap_or_else(F::epsilon);
+                    let xmu = F::from(1e10).unwrap_or_else(F::max_value);
+                    for i in 0..n_samples {
+                        let eta_i = eta[i].max(lo).min(hi);
+                        eta[i] = eta_i;
+                        mu[i] = link.inverse(eta_i).max(mmu).min(xmu);
+                    }
+                }
+                Link::Identity => {
+                    for i in 0..n_samples {
+                        mu[i] = link.inverse(eta[i]);
+                    }
+                }
+            }
+        }
+        // (The non-finite-seed branch above returns early, so there is no
+        // finite-init fall-through here.)
     }
 
     let min_mu = F::from(1e-10).unwrap_or_else(F::epsilon);
