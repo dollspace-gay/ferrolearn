@@ -624,3 +624,443 @@ fn green_uniform_multifeature_plateau() {
         }
     }
 }
+
+// ===========================================================================
+// REQ-7 — inverse_transform (reverse interp + norm.cdf + bounds + NaN).
+// sklearn `_data.py:2947` -> `_transform_col(inverse=True)` (`:2813-2851`):
+// normal -> `stats.norm.cdf` (`:2821`) then plain `np.interp(rank, references_,
+// quantiles)` (`:2848`); bounds override to quantiles[0]/quantiles[-1]
+// (`:2850-2851`); NaN passes through (`:2833`).
+// Every expected value below is a LIVE sklearn 1.5.2 / scipy call (R-CHAR-3).
+// ===========================================================================
+
+/// REQ-7: UNIFORM round-trip recovers the original data. `inverse_transform(
+/// transform(X))` ≈ X. The forward transform is monotone; on the EXACT-landmark
+/// integer fixture the round-trip is bit-exact. Oracle = live sklearn
+/// `inverse_transform(transform(X))`.
+#[test]
+fn green_inverse_uniform_roundtrip() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='uniform', subsample=10**9).fit(X); \
+    //   print(qt.inverse_transform(qt.transform(X)).ravel().tolist())"
+    //   -> [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    let sk: [f64; 10] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Uniform, 0);
+    let fitted = qt.fit(&x, &()).unwrap();
+    let fwd = fitted.transform(&x).unwrap();
+    let inv = fitted.inverse_transform(&fwd).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        let got = inv[[i, 0]];
+        assert!(
+            (got - expected).abs() <= 1e-9,
+            "row {i}: ferrolearn inverse roundtrip = {got}, sklearn/original = {expected}"
+        );
+    }
+}
+
+/// REQ-7: UNIFORM held-out arbitrary ranks Y in [0,1] match sklearn
+/// `inverse_transform(Y)`. The fixture is strictly-distinct integer data so
+/// ferrolearn's landmarks and sklearn's `np.nanpercentile` landmarks agree to
+/// f64 ULP (#1322 dormant), making the comparison valid to 1e-9.
+/// sklearn `_data.py:2848` (plain reverse `np.interp`).
+#[test]
+fn green_inverse_uniform_heldout() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='uniform', subsample=10**9).fit(X); \
+    //   Y=np.array([[0.0],[0.05],[0.15],[0.33],[0.5],[0.66],[0.8],[0.95],[1.0]]); \
+    //   print(qt.inverse_transform(Y).ravel().tolist())"
+    //   -> [1.0, 1.45, 2.35, 3.9699999999999998, 5.5, 6.939999999999999,
+    //       8.200000000000001, 9.55, 10.0]
+    let sk: [f64; 9] = [
+        1.0,
+        1.45,
+        2.35,
+        3.969_999_999_999_999_8,
+        5.5,
+        6.939_999_999_999_999,
+        8.200_000_000_000_001,
+        9.55,
+        10.0,
+    ];
+    let y = array![
+        [0.0],
+        [0.05],
+        [0.15],
+        [0.33],
+        [0.5],
+        [0.66],
+        [0.8],
+        [0.95],
+        [1.0]
+    ];
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Uniform, 0);
+    let fitted = qt.fit(&x, &()).unwrap();
+    let inv = fitted.inverse_transform(&y).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        let got = inv[[i, 0]];
+        assert!(
+            (got - expected).abs() <= 1e-9,
+            "row {i}: ferrolearn inverse = {got}, sklearn inverse = {expected} (diff {})",
+            (got - expected).abs()
+        );
+    }
+}
+
+/// REQ-7: NORMAL round-trip recovers the original data. `inverse_transform(
+/// transform(X))` ≈ X within ~1e-7 (the forward Acklam probit + inverse ndtr
+/// each ~1e-9, compounded through the interp). Oracle = live sklearn.
+/// sklearn `_data.py:2821`,`:2848`.
+#[test]
+fn green_inverse_normal_roundtrip() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='normal', subsample=10**9).fit(X); \
+    //   print(qt.inverse_transform(qt.transform(X)).ravel().tolist())"
+    //   -> [1.0, 2.0, 3.0, 3.9999999999999996, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+    let sk: [f64; 10] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Normal, 0);
+    let fitted = qt.fit(&x, &()).unwrap();
+    let fwd = fitted.transform(&x).unwrap();
+    let inv = fitted.inverse_transform(&fwd).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        let got = inv[[i, 0]];
+        assert!(
+            (got - expected).abs() <= 1e-7,
+            "row {i}: ferrolearn inverse normal roundtrip = {got}, original = {expected} (diff {})",
+            (got - expected).abs()
+        );
+    }
+}
+
+/// REQ-7: NORMAL held-out values in normal space match sklearn
+/// `inverse_transform(Y)` to ~1e-7 (the inverse ndtr `norm.cdf` ~1e-9 + interp).
+/// sklearn `_data.py:2821` (`stats.norm.cdf`) + `:2848` (reverse interp).
+#[test]
+fn green_inverse_normal_heldout() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='normal', subsample=10**9).fit(X); \
+    //   Y=np.array([[-2.0],[-1.0],[-0.5],[0.0],[0.5],[1.0],[2.0]]); \
+    //   print(qt.inverse_transform(Y).ravel().tolist())"
+    //   -> [1.2047511875336128, 2.427897285383114, 3.7768378485338814, 5.5,
+    //       7.223162151466117, 8.572102714616886, 9.795248812466387]
+    let sk: [f64; 7] = [
+        1.204_751_187_533_612_8,
+        2.427_897_285_383_114,
+        3.776_837_848_533_881_4,
+        5.5,
+        7.223_162_151_466_117,
+        8.572_102_714_616_886,
+        9.795_248_812_466_387,
+    ];
+    let y = array![[-2.0], [-1.0], [-0.5], [0.0], [0.5], [1.0], [2.0]];
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Normal, 0);
+    let fitted = qt.fit(&x, &()).unwrap();
+    let inv = fitted.inverse_transform(&y).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        let got = inv[[i, 0]];
+        assert!(
+            (got - expected).abs() <= 1e-7,
+            "row {i}: ferrolearn inverse normal = {got}, sklearn inverse = {expected} (diff {})",
+            (got - expected).abs()
+        );
+    }
+}
+
+/// REQ-7: bounds clipping. UNIFORM rank exactly 0 -> column min (quantiles[0]),
+/// rank exactly 1 -> column max (quantiles[-1]). NORMAL very-negative ->
+/// column min, very-positive -> column max. sklearn `_data.py:2850-2851` +
+/// the bound masks `:2827-2831`.
+#[test]
+fn green_inverse_bounds_clipping() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qu=QuantileTransformer(n_quantiles=10, output_distribution='uniform', subsample=10**9).fit(X); \
+    //   qn=QuantileTransformer(n_quantiles=10, output_distribution='normal', subsample=10**9).fit(X); \
+    //   print(float(qu.inverse_transform([[0.0]])[0,0]), float(qu.inverse_transform([[1.0]])[0,0]), \
+    //         float(qn.inverse_transform([[-10.0]])[0,0]), float(qn.inverse_transform([[10.0]])[0,0]))"
+    //   -> 1.0 10.0 1.0 10.0   (column min=1.0, column max=10.0)
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qu = QuantileTransformer::<f64>::new(10, OutputDistribution::Uniform, 0)
+        .fit(&x, &())
+        .unwrap();
+    let lo = qu.inverse_transform(&array![[0.0]]).unwrap();
+    let hi = qu.inverse_transform(&array![[1.0]]).unwrap();
+    assert!(
+        (lo[[0, 0]] - 1.0).abs() <= 1e-12,
+        "uniform rank 0 -> column min 1.0, got {}",
+        lo[[0, 0]]
+    );
+    assert!(
+        (hi[[0, 0]] - 10.0).abs() <= 1e-12,
+        "uniform rank 1 -> column max 10.0, got {}",
+        hi[[0, 0]]
+    );
+
+    let qn = QuantileTransformer::<f64>::new(10, OutputDistribution::Normal, 0)
+        .fit(&x, &())
+        .unwrap();
+    let nlo = qn.inverse_transform(&array![[-10.0]]).unwrap();
+    let nhi = qn.inverse_transform(&array![[10.0]]).unwrap();
+    assert!(
+        (nlo[[0, 0]] - 1.0).abs() <= 1e-12,
+        "normal -10 -> column min 1.0, got {}",
+        nlo[[0, 0]]
+    );
+    assert!(
+        (nhi[[0, 0]] - 10.0).abs() <= 1e-12,
+        "normal +10 -> column max 10.0, got {}",
+        nhi[[0, 0]]
+    );
+}
+
+/// REQ-7: NaN passes through inverse_transform unchanged (sklearn
+/// `isfinite_mask`, `_data.py:2833`; `_more_tags` `allow_nan=True`, `:2970`).
+#[test]
+fn green_inverse_nan_passthrough() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='uniform', subsample=10**9).fit(X); \
+    //   print(qt.inverse_transform(np.array([[0.3],[np.nan],[0.7]])).ravel().tolist())"
+    //   -> [3.6999999999999993, nan, 7.299999999999999]
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Uniform, 0)
+        .fit(&x, &())
+        .unwrap();
+    let y = array![[0.3], [f64::NAN], [0.7]];
+    let inv = qt.inverse_transform(&y).unwrap();
+    assert!(inv[[1, 0]].is_nan(), "NaN row should stay NaN");
+    // finite rows match sklearn (ferrolearn exact landmarks vs sklearn ~ULP).
+    assert!(
+        (inv[[0, 0]] - 3.699_999_999_999_999_3).abs() <= 1e-9,
+        "row 0 = {}, sklearn = 3.6999999999999993",
+        inv[[0, 0]]
+    );
+    assert!(
+        (inv[[2, 0]] - 7.299_999_999_999_999).abs() <= 1e-9,
+        "row 2 = {}, sklearn = 7.299999999999999",
+        inv[[2, 0]]
+    );
+}
+
+/// REQ-7: shape mismatch (wrong n_features) -> Err.
+#[test]
+fn green_inverse_shape_mismatch() {
+    let qt = QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0);
+    let fitted = qt.fit(&array![[1.0, 2.0], [3.0, 4.0]], &()).unwrap();
+    assert!(
+        fitted.inverse_transform(&array![[0.5, 0.5, 0.5]]).is_err(),
+        "inverse_transform ncols mismatch should Err"
+    );
+}
+
+/// REQ-7: `norm_cdf` (scipy `ndtr` / `stats.norm.cdf`) sanity vs the live scipy
+/// oracle, exposed through the public `inverse_transform` Normal path. A
+/// transformer fitted on `[0,1]` (n_quantiles=2) has `quantiles_=[0,1]`,
+/// `references_=[0,1]`, so the Normal inverse maps `norm_cdf(x)` straight
+/// through `np.interp(rank,[0,1],[0,1]) = rank` (identity), exposing
+/// `norm_cdf(x)` as the output. The chosen `x` give ranks strictly inside
+/// `(1e-7, 1-1e-7)` so the bound masks do not fire.
+#[test]
+fn green_norm_cdf_sanity_via_inverse() {
+    // oracle: python3 -c "import scipy.stats as st; \
+    //   print(st.norm.cdf(0.0), st.norm.cdf(1.96), st.norm.cdf(-1.96), st.norm.cdf(3.0), st.norm.cdf(-3.0))"
+    //   -> 0.5 0.9750021048517795 0.024997895148220435 0.9986501019683699 0.0013498980316300933
+    let cases: [(f64, f64); 5] = [
+        (0.0, 0.5),
+        (1.96, 0.975_002_104_851_779_5),
+        (-1.96, 0.024_997_895_148_220_435),
+        (3.0, 0.998_650_101_968_369_9),
+        (-3.0, 0.001_349_898_031_630_093_3),
+    ];
+    let qt = QuantileTransformer::<f64>::new(2, OutputDistribution::Normal, 0)
+        .fit(&array![[0.0], [1.0]], &())
+        .unwrap();
+    for (x, expected_cdf) in cases {
+        let out = qt.inverse_transform(&array![[x]]).unwrap();
+        let got = out[[0, 0]];
+        assert!(
+            (got - expected_cdf).abs() <= 1e-9,
+            "norm_cdf({x}) = {got}, scipy = {expected_cdf} (diff {})",
+            (got - expected_cdf).abs()
+        );
+    }
+}
+
+/// REQ-7: NORMAL inverse on TIED/PLATEAU training data. The plateau landmarks
+/// repeat; the reverse plain interp must hit the right landmark span. The
+/// expected values come from the live sklearn `_transform_col` inverse computed
+/// on the EXACT landmark grid ferrolearn produced (R-CHAR-3), neutralising the
+/// #1322 landmark FP divergence the same way `green_np_interp_faithfulness`
+/// does. sklearn `_data.py:2821`,`:2848`.
+#[test]
+fn green_inverse_normal_plateau_heldout() {
+    use ferrolearn_preprocess::quantile_transformer::FittedQuantileTransformer;
+    let x = array![[1.0], [2.0], [2.0], [2.0], [5.0], [7.0], [9.0], [12.0]];
+    let qt = QuantileTransformer::<f64>::new(8, OutputDistribution::Normal, 0);
+    let fitted: FittedQuantileTransformer<f64> = qt.fit(&x, &()).unwrap();
+    let landmarks = fitted.quantiles()[0].clone();
+    let refs: Vec<f64> = (0..landmarks.len())
+        .map(|i| i as f64 / (landmarks.len() - 1) as f64)
+        .collect();
+    let ys = [-1.0_f64, 0.0, 1.0];
+    let py = format!(
+        "import numpy as np\nimport scipy.stats as st\nq=np.array({:?})\nr=np.array({:?})\nx=np.array({:?})\nrank=st.norm.cdf(x)\nv=np.interp(rank,r,q)\nv[rank<=0]=q[0]\nv[rank>=1]=q[-1]\nprint(' '.join(repr(float(t)) for t in v))",
+        landmarks, refs, ys
+    );
+    let output = std::process::Command::new("python3")
+        .arg("-c")
+        .arg(&py)
+        .output()
+        .expect("python3 oracle call failed");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let expected: Vec<f64> = stdout
+        .split_whitespace()
+        .map(|s| s.parse().unwrap())
+        .collect();
+    assert_eq!(expected.len(), ys.len(), "oracle parse failed: {stdout}");
+
+    let yarr = array![[-1.0], [0.0], [1.0]];
+    let inv = fitted.inverse_transform(&yarr).unwrap();
+    for (i, &exp) in expected.iter().enumerate() {
+        let got = inv[[i, 0]];
+        assert!(
+            (got - exp).abs() <= 1e-7,
+            "normal plateau inverse row {i}: ferrolearn = {got}, sklearn = {exp} (diff {})",
+            (got - exp).abs()
+        );
+    }
+}
+
+// ===========================================================================
+// DIV-D — inverse_transform must REJECT +/-inf (force_all_finite="allow-nan").
+// ===========================================================================
+
+/// Divergence: ferrolearn's `inverse_transform`
+/// (`quantile_transformer.rs:192-262`) ACCEPTS `+/-inf` and silently maps it
+/// through `norm_cdf`/`np_interp` (it only special-cases `NaN`,
+/// `:221-224`), whereas sklearn `QuantileTransformer.inverse_transform`
+/// (`sklearn/preprocessing/_data.py:2947`) runs
+/// `_check_inputs(X, in_fit=False, ...)` (`:2965`) which validates with
+/// `force_all_finite="allow-nan"` (`:2876`) — NaN is allowed but `+/-inf` is
+/// REJECTED with `ValueError: Input X contains infinity ...`.
+///
+/// Input: a model fitted on `arange(1,11)`, then `inverse_transform([[inf]])`
+/// (and `[[-inf]]`), Uniform output.
+/// sklearn raises `ValueError` (Input X contains infinity) for BOTH inf signs
+/// and BOTH output distributions (verified live, see oracle below).
+/// ferrolearn returns `Ok` (no error): for Uniform, `np_interp(inf, refs, q)`
+/// clamps to `q[-1]` for `+inf` and `q[0]` for `-inf` (a finite value, not an
+/// error). So the contract divergence is: sklearn `Err`, ferrolearn `Ok`.
+/// Tracking: #2212
+#[test]
+#[ignore = "divergence: inverse_transform accepts +/-inf, sklearn rejects (force_all_finite=allow-nan); tracking #2212"]
+fn divergence_inverse_rejects_inf() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import QuantileTransformer; \
+    //   X=np.arange(1.,11.).reshape(-1,1); \
+    //   qt=QuantileTransformer(n_quantiles=10, output_distribution='uniform', subsample=10**9).fit(X); \
+    //   [print('ERROR') if (lambda f: ([f(np.array([[v]])) for v in (np.inf,-np.inf)]))(qt.inverse_transform) else None]"
+    //   -> raises ValueError('Input X contains infinity or a value too large for dtype('float64').')
+    //      for +inf AND -inf (uniform AND normal). NaN, by contrast, is allowed
+    //      (allow-nan) and passes through.
+    let x = array![
+        [1.0],
+        [2.0],
+        [3.0],
+        [4.0],
+        [5.0],
+        [6.0],
+        [7.0],
+        [8.0],
+        [9.0],
+        [10.0]
+    ];
+    let qt = QuantileTransformer::<f64>::new(10, OutputDistribution::Uniform, 0)
+        .fit(&x, &())
+        .unwrap();
+
+    // sklearn rejects +inf with ValueError; ferrolearn must also Err.
+    assert!(
+        qt.inverse_transform(&array![[f64::INFINITY]]).is_err(),
+        "inverse_transform(+inf) must Err (sklearn raises ValueError via \
+         force_all_finite=allow-nan), but ferrolearn returned Ok"
+    );
+    // sklearn rejects -inf with ValueError; ferrolearn must also Err.
+    assert!(
+        qt.inverse_transform(&array![[f64::NEG_INFINITY]]).is_err(),
+        "inverse_transform(-inf) must Err (sklearn raises ValueError via \
+         force_all_finite=allow-nan), but ferrolearn returned Ok"
+    );
+}
