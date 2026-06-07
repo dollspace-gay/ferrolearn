@@ -815,13 +815,25 @@ fn green_xi_zero_accepted() {
 ///      the parameter passed _parameter_constraints; the error is a runtime
 ///      1-xi==0 divide inside _xi_cluster, not a validation rejection)
 #[test]
-fn green_xi_one_accepted_no_panic() {
-    // The BOUNDARY (parameter validation) ACCEPTS xi=1.0; ferrolearn must not
-    // reject it at validation and must not panic.
-    let r = OPTICS::<f64>::new(2).with_xi(1.0).fit(&three_blobs(), &());
+fn green_xi_one_xi_method_errors_dbscan_accepts() {
+    // OBSERVABLE contract: `OPTICS(xi=1.0).fit` (default cluster_method='xi')
+    // RAISES (sklearn _xi_cluster ZeroDivisionError, 1-xi==0) — see the oracle
+    // above. ferrolearn mirrors that with an Err on the Xi path (#2197), no
+    // panic. The 'dbscan' method ignores xi, so it is accepted (sklearn does not
+    // raise there).
+    let r_xi = OPTICS::<f64>::new(2).with_xi(1.0).fit(&three_blobs(), &());
     assert!(
-        r.is_ok(),
-        "xi=1 must pass parameter validation (sklearn closed at 1) and not panic"
+        r_xi.is_err(),
+        "xi=1 with the Xi method must error (sklearn _xi_cluster ZeroDivisionError)"
+    );
+    let r_dbscan = OPTICS::<f64>::new(2)
+        .with_xi(1.0)
+        .with_cluster_method(OpticsClusterMethod::Dbscan)
+        .with_eps(0.5)
+        .fit(&three_blobs(), &());
+    assert!(
+        r_dbscan.is_ok(),
+        "xi=1 with cluster_method='dbscan' is accepted (xi unused; sklearn does not raise)"
     );
 }
 
@@ -892,7 +904,6 @@ fn green_xi_above_one_rejected() {
 ///
 /// Tracking: #2197
 #[test]
-#[ignore = "divergence: OPTICS::fit accepts min_samples > n_samples (sklearn _validate_size raises); tracking #2197"]
 fn divergence_min_samples_above_n_samples_rejected() {
     // n_samples = 5 fixture (subset of three_blobs).
     let x = Array2::from_shape_vec(
@@ -912,5 +923,31 @@ fn divergence_min_samples_above_n_samples_rejected() {
         "min_samples=6 with n_samples=5 must be rejected like sklearn \
          (_validate_size, sklearn/cluster/_optics.py:597 -> :393-400 raises \
          ValueError); ferrolearn returned Ok"
+    );
+}
+
+/// REQ-11: `max_eps = NaN` and `xi = NaN` are REJECTED (NaN ∉ the closed
+/// intervals; sklearn's `Interval` constraints raise `InvalidParameterError`).
+/// Rust comparisons against NaN are all `false`, so the validation needs an
+/// explicit `is_nan()` guard (#2197).
+///
+/// LIVE ORACLE (sklearn 1.5.2): `OPTICS(min_samples=2, max_eps=float('nan'))`
+/// and `OPTICS(min_samples=2, xi=float('nan'))` both raise InvalidParameterError.
+#[test]
+fn green_nan_params_rejected() {
+    let x = three_blobs();
+    assert!(
+        OPTICS::<f64>::new(2)
+            .with_max_eps(f64::NAN)
+            .fit(&x, &())
+            .is_err(),
+        "max_eps=NaN must be rejected (sklearn InvalidParameterError)"
+    );
+    assert!(
+        OPTICS::<f64>::new(2)
+            .with_xi(f64::NAN)
+            .fit(&x, &())
+            .is_err(),
+        "xi=NaN must be rejected (sklearn InvalidParameterError)"
     );
 }

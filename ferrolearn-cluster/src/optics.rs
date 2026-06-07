@@ -66,7 +66,7 @@
 //! | REQ-8 (`cluster_hierarchy_` attribute) | NOT-STARTED | open prereq blocker #1086. sklearn `(n_clusters,2)` `[start,end]` ordered `(end,-start)` (`:1166-1172`); ferrolearn `fn xi_cluster_extraction` discards the intervals, no accessor. |
 //! | REQ-9 (`predecessor_correction` toggle) | NOT-STARTED | open prereq blocker #1087. sklearn `bool` default True (`:277`); ferrolearn always applies `fn correct_predecessor`, no param. |
 //! | REQ-10 (param surface `metric`/`p`/`algorithm`/`leaf_size`/`n_jobs` + `min_samples=5` default + float fractions) | NOT-STARTED | open prereq blocker #1088. sklearn `__init__` (`:266-297`); ferrolearn `fn new(min_samples)` required, only `max_eps`/`xi`/`min_cluster_size` builders. |
-//! | REQ-11 (validation bounds + error ABI) | NOT-STARTED | open prereq blocker #1089. sklearn `max_eps∈[0,inf]`, `xi∈[0,1]` closed-both, `min_samples∈[2,inf)`, `InvalidParameterError` (`:242-264`); ferrolearn over-rejects `max_eps=0`/`xi∈{0,1}`, permits `min_samples=1`, `FerroError` ABI. |
+//! | REQ-11 (validation accept/reject BOUNDARIES) | SHIPPED | impl: `Fit::fit`'s parameter-validation block now matches sklearn's `OPTICS._parameter_constraints` (`sklearn/cluster/_optics.py:242-264`) at the accept/reject BOUNDARY: `min_samples < 2` REJECTED (`Interval(Integral, 2, None, closed="left")` `:243-246` — `{0,1}` rejected; was permitting `min_samples=1`), `max_eps < 0` REJECTED but `max_eps == 0` ACCEPTED (`Interval(Real, 0, None, closed="both")` `:247` — was over-rejecting `max_eps==0`), `xi < 0 \|\| xi > 1` REJECTED but `xi == 0` AND `xi == 1` ACCEPTED (`Interval(Real, 0, 1, closed="both")` `:253` — was over-rejecting `xi∈{0,1}`). The `max_eps == 0` degenerate path needed NO algorithm change: with `max_eps==0` no point has a neighbour, so `fn core_distance` returns `∞` for all (the `if core_distances[point].is_finite()` guard in `Fit::fit` skips `fn update_seeds`), `reachability_` stays `∞`, `ordering_` is by index, and `fn xi_cluster_extraction` on the all-`∞` plot yields all-`-1` labels (the `ratio = inf/inf = NaN` comparisons are all false → no steep points → no clusters) — value-matching the live oracle WITHOUT divide-by-zero / OOB / unwrap-None (R-CODE-2). `xi == 1` likewise does not panic: ferrolearn's Xi ratios use Rust float arithmetic (`1.0/0.0 == inf`), unlike sklearn's Python `ZeroDivisionError`. **Error TYPE ABI:** the grandfathered crate `FerroError::InvalidParameter` is kept (NOT sklearn's `InvalidParameterError`); only the accept/reject BOUNDARY is matched (R-DEV-2 user-API ABI is the boundary, not the exception class name — a crate-wide grandfathered convention). Consumer (R-DEFER-1, non-test): the validated `Fit::fit` is reachable via the crate re-export `pub use optics::{FittedOPTICS, OPTICS}` (`lib.rs`). Guards (live-oracle, R-CHAR-3): `green_min_samples_below_2_rejected`, `green_min_samples_2_accepted`, `green_max_eps_zero_degenerate_matches_oracle` (element-wise `core_distances_`/`reachability_`/`ordering_`/`labels_` vs the oracle), `green_max_eps_half_unchanged`, `green_max_eps_negative_rejected`, `green_xi_zero_accepted`, `green_xi_one_accepted_no_panic`, `green_xi_negative_rejected`, `green_xi_above_one_rejected` in `tests/divergence_optics.rs`. The `min_samples` float-fraction branch (`Interval(RealNotInt, 0, 1, closed="both")` `:245`) + the remaining param surface (`metric`/`p`/`algorithm`/`leaf_size`/`n_jobs`, the `min_samples=5` default) stay NOT-STARTED (REQ-10, blocker #1088). |
 //! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1090. No `_RsOPTICS` (grep empty); `import ferrolearn` cannot reach OPTICS. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1091. `optics.rs` imports `ndarray`/`num-traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
@@ -934,29 +934,78 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `min_samples == 0`, `max_eps <= 0`,
-    ///   or `xi` is outside `(0, 1)`.
+    /// - [`FerroError::InvalidParameter`] if `min_samples < 2`, `max_eps < 0`,
+    ///   or `xi` is outside `[0, 1]`.
     /// - [`FerroError::InsufficientSamples`] if the dataset is empty.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedOPTICS<F>, FerroError> {
         let n_samples = x.nrows();
 
-        // Validate parameters.
-        if self.min_samples == 0 {
+        // Validate parameters — boundaries match sklearn's
+        // `OPTICS._parameter_constraints` (`sklearn/cluster/_optics.py:242-264`).
+        // The error TYPE stays the grandfathered crate `FerroError` ABI (not
+        // sklearn's `InvalidParameterError`); only the accept/reject BOUNDARY is
+        // matched.
+        //
+        // `"min_samples": [Interval(Integral, 2, None, closed="left"), ...]`
+        // (`:243-246`) — an int `min_samples` must be `>= 2`, so `{0, 1}` are
+        // rejected. (ferrolearn's `min_samples` is `usize`; the float-fraction
+        // branch is REQ-10, out of scope.)
+        if self.min_samples < 2 {
             return Err(FerroError::InvalidParameter {
                 name: "min_samples".into(),
-                reason: "must be at least 1".into(),
+                reason: "must be at least 2".into(),
             });
         }
-        if self.max_eps <= F::zero() {
+        // `"max_eps": [Interval(Real, 0, None, closed="both")]` (`:247`) —
+        // `max_eps >= 0`, with `max_eps == 0` ALLOWED (closed at 0). Reject only
+        // `max_eps < 0` (for an `F` that can be negative). With `max_eps == 0`
+        // the fit RUNS: no point has a neighbour within `max_eps`, so every core
+        // distance and reachability is `∞`, ordering is by index, and the labels
+        // are all `-1` (matching the live sklearn 1.5.2 oracle).
+        // `NaN` is rejected (NaN ∉ [0, ∞]; sklearn's `Interval` rejects it as
+        // `InvalidParameterError`). Note `NaN < 0` is `false`, so the NaN guard
+        // is explicit (#2197).
+        if self.max_eps < F::zero() || self.max_eps.is_nan() {
             return Err(FerroError::InvalidParameter {
                 name: "max_eps".into(),
-                reason: "must be positive".into(),
+                reason: "must be non-negative".into(),
             });
         }
-        if self.xi <= F::zero() || self.xi >= F::one() {
+        // `"xi": [Interval(Real, 0, 1, closed="both")]` (`:253`) — `xi ∈ [0, 1]`,
+        // BOTH endpoints allowed (`xi == 0` and `xi == 1` accepted by parameter
+        // validation). Reject only `xi < 0 || xi > 1`. (sklearn's `_xi_cluster`
+        // raises a runtime `ZeroDivisionError` for `xi == 1.0` because
+        // `1 - xi == 0`; ferrolearn's Xi extraction computes the same ratios in
+        // Rust float arithmetic — `1.0/0.0 == inf`, `inf/inf == NaN` — so it does
+        // NOT panic (R-CODE-2), producing all-`-1` labels. Matching the Xi
+        // `labels_` VALUE for these endpoints is REQ-5, NOT-STARTED; only the
+        // accept/reject BOUNDARY is matched here.)
+        if self.xi < F::zero() || self.xi > F::one() || self.xi.is_nan() {
             return Err(FerroError::InvalidParameter {
                 name: "xi".into(),
-                reason: "must be in (0, 1)".into(),
+                reason: "must be in [0, 1]".into(),
+            });
+        }
+        // `xi == 1.0` passes sklearn's `_parameter_constraints` (closed at 1) but
+        // makes `_xi_cluster` divide by `1 - xi == 0`, raising a runtime
+        // `ZeroDivisionError` IN THE XI METHOD (`_optics.py` steep-area ratio);
+        // the OBSERVABLE contract is therefore "fit raises". We mirror that by
+        // erroring for `xi == 1` ONLY on the Xi path (the `'dbscan'` method
+        // ignores `xi`, so sklearn does NOT raise there). #2197.
+        if matches!(self.cluster_method, OpticsClusterMethod::Xi) && self.xi == F::one() {
+            return Err(FerroError::InvalidParameter {
+                name: "xi".into(),
+                reason: "xi == 1 is not supported by the Xi method (1 - xi == 0)".into(),
+            });
+        }
+        // `"eps": [Interval(Real, 0, None, closed="both"), None]` (`:252`) — when
+        // set, `eps >= 0` (NaN rejected). sklearn validates this BEFORE the fit
+        // body, so it applies regardless of `cluster_method` (the Xi path never
+        // reads `eps`, but an invalid `eps` is still rejected). #2198.
+        if self.eps.is_some_and(|eps| eps < F::zero() || eps.is_nan()) {
+            return Err(FerroError::InvalidParameter {
+                name: "eps".into(),
+                reason: "must be non-negative".into(),
             });
         }
 
@@ -965,6 +1014,19 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OPTICS<F> {
                 required: 1,
                 actual: 0,
                 context: "OPTICS requires at least 1 sample".into(),
+            });
+        }
+        // sklearn `_validate_size(min_samples, n_samples, "min_samples")`
+        // (`_optics.py:393-400`, called `:597`): `min_samples` must be NO GREATER
+        // than `n_samples` (else `ValueError`). ferrolearn previously fit silently
+        // with all-`∞` core distances (#2197).
+        if self.min_samples > n_samples {
+            return Err(FerroError::InvalidParameter {
+                name: "min_samples".into(),
+                reason: format!(
+                    "must be no greater than the number of samples ({n_samples}). Got {}",
+                    self.min_samples
+                ),
             });
         }
 
@@ -1231,10 +1293,24 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_max_eps_zero() {
+    fn test_invalid_min_samples_one() {
+        // min_samples=1 is now rejected (sklearn requires >= 2).
+        let x = three_blobs();
+        let result = OPTICS::<f64>::new(1).fit(&x, &());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_max_eps_zero_accepted() {
+        // sklearn accepts max_eps=0 (closed at 0); the fit runs and produces an
+        // all-inf / all-noise degenerate result.
         let x = three_blobs();
         let result = OPTICS::<f64>::new(2).with_max_eps(0.0).fit(&x, &());
-        assert!(result.is_err());
+        assert!(result.is_ok(), "max_eps=0 should be accepted");
+        if let Ok(fitted) = result {
+            assert!(fitted.core_distances().iter().all(|c| c.is_infinite()));
+            assert!(fitted.reachability().iter().all(|r| r.is_infinite()));
+        }
     }
 
     #[test]
@@ -1245,16 +1321,34 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_xi_zero() {
+    fn test_xi_zero_accepted() {
+        // sklearn accepts xi=0 (closed at 0).
         let x = three_blobs();
         let result = OPTICS::<f64>::new(2).with_xi(0.0).fit(&x, &());
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_xi_one_xi_method_errors() {
+        // sklearn accepts xi=1 at validation but the Xi method raises a runtime
+        // ZeroDivisionError (1-xi==0); the observable contract is "fit raises",
+        // so ferrolearn errors on the Xi path (#2197), no panic.
+        let x = three_blobs();
+        let result = OPTICS::<f64>::new(2).with_xi(1.0).fit(&x, &());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_invalid_xi_one() {
+    fn test_invalid_xi_negative() {
         let x = three_blobs();
-        let result = OPTICS::<f64>::new(2).with_xi(1.0).fit(&x, &());
+        let result = OPTICS::<f64>::new(2).with_xi(-0.1).fit(&x, &());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_invalid_xi_above_one() {
+        let x = three_blobs();
+        let result = OPTICS::<f64>::new(2).with_xi(1.1).fit(&x, &());
         assert!(result.is_err());
     }
 
@@ -1266,11 +1360,17 @@ mod tests {
     }
 
     #[test]
-    fn test_single_sample() {
-        let x = Array2::from_shape_vec((1, 2), vec![5.0, 5.0]).unwrap();
-        let fitted = OPTICS::<f64>::new(1).fit(&x, &()).unwrap();
-        assert_eq!(fitted.ordering().len(), 1);
-        assert_eq!(fitted.ordering()[0], 0);
+    fn test_single_sample_rejected() {
+        // A single sample cannot be fit by OPTICS: sklearn requires
+        // `2 <= min_samples <= n_samples`, but n_samples=1 leaves no valid
+        // min_samples, so `_validate_size` raises (min_samples=2 > 1). ferrolearn
+        // mirrors that with an Err (#2197).
+        let x: Array2<f64> = ndarray::array![[5.0, 5.0]];
+        let result = OPTICS::<f64>::new(2).fit(&x, &());
+        assert!(
+            result.is_err(),
+            "single-sample fit must error (min_samples=2 > n_samples=1)"
+        );
     }
 
     #[test]

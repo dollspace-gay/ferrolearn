@@ -35,8 +35,8 @@ fn three_blobs() -> Array2<f64> {
     Array2::from_shape_vec(
         (9, 2),
         vec![
-            0.0, 0.0, 0.1, 0.1, 0.0, 0.1, 5.0, 5.0, 5.1, 5.0, 5.0, 5.1, 10.0, 0.0, 10.1, 0.0,
-            10.0, 0.1,
+            0.0, 0.0, 0.1, 0.1, 0.0, 0.1, 5.0, 5.0, 5.1, 5.0, 5.0, 5.1, 10.0, 0.0, 10.1, 0.0, 10.0,
+            0.1,
         ],
     )
     .unwrap()
@@ -52,7 +52,6 @@ fn three_blobs() -> Array2<f64> {
 ///
 /// Tracking: #2198
 #[test]
-#[ignore = "divergence: OPTICS accepts eps=NaN / eps<0; tracking #2198"]
 fn divergence_eps_nan_dbscan_rejected() {
     let x = three_blobs();
     let result = OPTICS::<f64>::new(2)
@@ -77,7 +76,6 @@ fn divergence_eps_nan_dbscan_rejected() {
 ///
 /// Tracking: #2198
 #[test]
-#[ignore = "divergence: OPTICS accepts eps=NaN / eps<0; tracking #2198"]
 fn divergence_eps_negative_dbscan_rejected() {
     let x = three_blobs();
     let result = OPTICS::<f64>::new(2)
@@ -102,7 +100,6 @@ fn divergence_eps_negative_dbscan_rejected() {
 ///
 /// Tracking: #2198
 #[test]
-#[ignore = "divergence: OPTICS accepts eps=NaN / eps<0; tracking #2198"]
 fn divergence_eps_nan_xi_rejected() {
     let x = three_blobs();
     let result = OPTICS::<f64>::new(2).with_eps(f64::NAN).fit(&x, &());

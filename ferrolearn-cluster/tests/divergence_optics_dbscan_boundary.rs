@@ -16,6 +16,7 @@
 //! bit-exact from the repr literal):
 //!   * sklearn   `near_core[5] = 0.53851648071345  <= 0.53851648071345` -> TRUE
 //!   * ferrolearn `near_core[5] = 0.5385164807134504 <= 0.53851648071345` -> FALSE
+//!
 //! Points 5,6,7,8 are thus core-and-far in sklearn (forming cluster 0) but are
 //! treated as non-core noise in ferrolearn (all `-1`).
 //!
