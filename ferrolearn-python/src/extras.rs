@@ -3232,6 +3232,95 @@ py_transformer!(
     { ferrolearn_preprocess::Binarizer::<f64>::new(threshold).with_copy(copy) }
 );
 
+// Normalizer (#1146): hand-written pyclass (not the `py_transformer!` macro) so
+// the ctor can map sklearn's `norm` STRING ('l1'/'l2'/'max') to the closed Rust
+// `NormType` enum and reject any other string as a `ValueError` (sklearn
+// `_parameter_constraints {norm: StrOptions({"l1","l2","max"})}`,
+// `sklearn/preprocessing/_data.py:2055`, an `InvalidParameterError` ⊂ ValueError).
+// The macro's build block evaluates to a `Normalizer<f64>` with no fallible step,
+// so it cannot surface the bad-norm error; the hand-written `fit` resolves the
+// string first.
+//
+// sklearn's ctor is `__init__(self, norm="l2", *, copy=True)` (`_data.py:2058`):
+// `norm` is POSITIONAL-OR-KEYWORD, `copy` is keyword-only. The Python wrapper owns
+// that ABI; this `_RsNormalizer` takes both by keyword from `_make_rs`.
+//
+// `fit(x)` builds `Normalizer::<f64>::new(<NormType>).with_copy(copy)` and runs
+// `.fit(&x, &())` (sklearn `Normalizer.fit` "Only validates", `_data.py:2062`;
+// `_validate_data` default `force_all_finite=True` REJECTS NaN/±inf — normalizer.rs
+// REQ-3). `transform(x)` delegates to `FittedNormalizer::transform`. A FerroError
+// (non-finite / empty input) maps to `PyValueError`, matching sklearn's
+// `check_array(force_all_finite=True)` ValueError.
+#[pyclass(name = "_RsNormalizer")]
+pub struct RsNormalizer {
+    norm: String,
+    copy: bool,
+    // `FittedNormalizer` is not re-exported at the crate root (only `Normalizer`
+    // is, `ferrolearn-preprocess/src/lib.rs`); reach it via the public
+    // `normalizer` module so this binding does not widen the preprocess crate's
+    // re-export surface (same pattern as `RsBinarizer`).
+    fitted: Option<ferrolearn_preprocess::normalizer::FittedNormalizer<f64>>,
+}
+
+impl RsNormalizer {
+    // Map sklearn's `norm` string to the closed Rust `NormType` enum. An
+    // out-of-domain string is sklearn's `InvalidParameterError` (⊂ ValueError),
+    // so it surfaces here as a `PyValueError`
+    // (`_parameter_constraints {norm: StrOptions({"l1","l2","max"})}`,
+    // `sklearn/preprocessing/_data.py:2055`).
+    fn resolve_norm(norm: &str) -> PyResult<ferrolearn_preprocess::normalizer::NormType> {
+        match norm {
+            "l1" => Ok(ferrolearn_preprocess::normalizer::NormType::L1),
+            "l2" => Ok(ferrolearn_preprocess::normalizer::NormType::L2),
+            "max" => Ok(ferrolearn_preprocess::normalizer::NormType::Max),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "The 'norm' parameter of Normalizer must be a str among {{'l1', 'l2', \
+                 'max'}}. Got {other:?} instead."
+            ))),
+        }
+    }
+}
+
+#[pymethods]
+impl RsNormalizer {
+    #[new]
+    #[pyo3(signature = (norm="l2".to_string(), copy=true))]
+    fn new(norm: String, copy: bool) -> Self {
+        Self {
+            norm,
+            copy,
+            fitted: None,
+        }
+    }
+
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let normtype = Self::resolve_norm(&self.norm)?;
+        let x_nd = numpy2_to_ndarray(x);
+        let model = ferrolearn_preprocess::Normalizer::<f64>::new(normtype).with_copy(self.copy);
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

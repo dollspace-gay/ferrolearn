@@ -51,6 +51,7 @@ from ferrolearn._extras import (
     MultinomialNB,
     NMF,
     NearestCentroid,
+    Normalizer,
     Nystroem,
     OPTICS,
     OrthogonalMatchingPursuit,
@@ -130,6 +131,7 @@ __all__ = [
     "FactorAnalysis",
     # Preprocess extras
     "Binarizer",
+    "Normalizer",
     "MinMaxScaler",
     "MaxAbsScaler",
     "RobustScaler",

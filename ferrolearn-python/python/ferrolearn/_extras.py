@@ -53,6 +53,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsMultinomialNB,
     _RsNMF,
     _RsNearestCentroid,
+    _RsNormalizer,
     _RsNystroem,
     _RsOPTICS,
     _RsOrthogonalMatchingPursuit,
@@ -2254,6 +2255,62 @@ class Binarizer(_TransformerWrapper):
         # in every numeric dtype, so the values are unchanged.
         in_dtype = np.asarray(X).dtype
         if np.issubdtype(in_dtype, np.number) and out.dtype != in_dtype:
+            out = out.astype(in_dtype, copy=False)
+        return out
+
+
+class Normalizer(_TransformerWrapper):
+    """Normalize samples (rows) to unit norm, backed by Rust (#1146).
+
+    Mirrors ``sklearn.preprocessing.Normalizer``
+    (``sklearn/preprocessing/_data.py:1980-2110``): each sample (row) with at
+    least one non-zero component is scaled so its chosen ``norm`` (l1/l2/max)
+    equals 1; a zero-norm row is left unchanged. The constructor mirrors sklearn's
+    signature ``__init__(self, norm="l2", *, copy=True)`` (``_data.py:2058``) —
+    ``norm`` is POSITIONAL-OR-KEYWORD, ``copy`` is keyword-only. Both are threaded
+    into the Rust core via ``_make_rs`` so ``get_params``/``set_params``/``clone``
+    round-trip them.
+
+    ``copy`` is an accept-and-document no-op (ferrolearn's ``Transform`` always
+    returns a freshly allocated array, so ``copy=False`` produces identical
+    output; normalizer.rs REQ-5). A bad ``norm`` string (anything other than
+    ``'l1'``/``'l2'``/``'max'``) raises ``ValueError`` (sklearn
+    ``_parameter_constraints {norm: StrOptions({"l1","l2","max"})}``,
+    ``_data.py:2055``, an ``InvalidParameterError`` ⊂ ValueError), surfaced from
+    the Rust core's ``fit``. NaN/+-inf INPUT also raises ``ValueError``
+    (``check_array(force_all_finite=True)``, normalizer.rs REQ-2/REQ-3).
+
+    sklearn is STATELESS (``_more_tags() -> {"stateless": True}``,
+    ``_data.py:2110``): ``transform`` works WITHOUT a prior ``fit`` (#2213). The
+    overridden ``transform`` below builds the Rust core on demand.
+    """
+
+    def __init__(self, norm="l2", *, copy=True):
+        self.norm = norm
+        self.copy = copy
+
+    def _make_rs(self):
+        return _RsNormalizer(norm=self.norm, copy=self.copy)
+
+    def transform(self, X):
+        # sklearn Normalizer is STATELESS (`_more_tags() -> {"stateless": True}`,
+        # `_data.py:2110`; "does not need to be fitted"): `transform` works
+        # WITHOUT a prior `fit` (#2213). Build the Rust core on demand if `fit`
+        # was never called — `normalize` reads only `norm`, no fitted state. The
+        # on-demand `fit` also surfaces the bad-`norm`-string ValueError, matching
+        # sklearn's parameter validation.
+        if not hasattr(self, "_rs"):
+            self._rs = self._make_rs()
+            self._rs.fit(_f64(X))
+        out = np.asarray(self._rs.transform(_f64(X)))
+        # sklearn `normalize` -> `check_array(dtype=FLOAT_DTYPES)` (`_data.py:2104`
+        # -> `_data.py:1933`): a FLOATING input dtype is PRESERVED (float32->float32,
+        # float64->float64), but an INTEGER input is UPCAST to float64 (NOT
+        # int-preserved, unlike Binarizer #2214). The f64 Rust ABI always returns
+        # float64, so cast back ONLY when the input was a floating dtype; leave
+        # integer input as float64.
+        in_dtype = np.asarray(X).dtype
+        if np.issubdtype(in_dtype, np.floating) and out.dtype != in_dtype:
             out = out.astype(in_dtype, copy=False)
         return out
 
