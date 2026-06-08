@@ -32,9 +32,9 @@
 //! | REQ-1 (dense one-hot via per-feature category blocks) | SHIPPED | `Transform::transform for FittedOneHotEncoder` zero-fills an `Array2<F>` of width `n_output()` then, for each value, sets `out[[i, offsets[j]+idx]]=1` where `idx` is the value's index in `categories_[j]` (membership), mirroring `_BaseEncoder._transform` (`_encoders.py:206-240`) + the one-hot block expansion. Consumer: crate re-export `lib.rs`. |
 //! | REQ-2 (sparse-by-default output) | NOT-STARTED | open prereq blocker #1149. Dense `Array2<F>` only; sklearn defaults `sparse_output=True` → scipy CSR (`:531`,`:748`). |
 //! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; +/-inf is REJECTED at `fit`/`transform` (#2225, `force_all_finite="allow-nan"` allows NaN but not inf); string/object input is REQ-3-string (NOT-STARTED, no String path). |
-//! | REQ-4 (handle_unknown + set-membership error) | NOT-STARTED | open prereq blocker #1151. `transform` raises `InvalidParameter` ("Found unknown categories …") via `categories_` MEMBERSHIP (no longer a `max+1` comparison) — the default `handle_unknown='error'` ValueError mechanism now MATCHES (`_encoders.py:206-214`), but the `'ignore'`/`'infrequent_if_exist'` modes (`:541`) are still absent. R-DEV-2. |
+//! | REQ-4 (handle_unknown {'error','ignore'}) | SHIPPED | `OneHotHandleUnknown` enum `{ Error (#[default]), Ignore }` (mirrors sklearn's `handle_unknown` `_parameter_constraints` `StrOptions({"error","ignore","infrequent_if_exist"})` default `"error"`, `_encoders.py:732,750`) + `OneHotEncoder::with_handle_unknown`/`handle_unknown()` builder+getter, threaded into `FittedOneHotEncoder` (`handle_unknown` field + getter) by `Fit::fit` (handle_unknown affects ONLY transform; `categories_` learned identically). `Transform::transform` unknown branch (`cats.iter().position(...) == None`): `Error` → `InvalidParameter` "Found unknown categories … during transform" (the SHIPPED REQ-2 default `ValueError`, `_encoders.py:209-214`, UNCHANGED); `Ignore` → `continue` leaving that feature's one-hot block ALL-ZERO (`_encoders.py:215-240`: unknown row masked out, no encoded column set), every KNOWN feature still one-hots. The +/-inf rejection (#2225), ncols + 0-row guards UNCHANGED (inf is invalid input, not an "unknown category" — still errors in `Ignore`; NaN with NO nan-category is "unknown" → all-zero block in `Ignore`, with a nan-category one-hots it). Never panics (R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`): `ignore_multifeature_all_zero_block` (`[[100,0],[5,99]]→[[0,0,0,1,0],[0,1,0,0,0]]`), `ignore_fully_unknown_row_all_zero`, `ignore_known_row_normal_one_hot`, `error_default_unknown_rejected`, `with_handle_unknown_ignore_known_value_normal`, `ignore_inf_still_rejected`, `ignore_nan_no_category_all_zero`, `ignore_nan_with_category_one_hots`, `handle_unknown_default_and_builder_abi` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs` (`OneHotHandleUnknown`). R-DEV-2. STILL NOT-STARTED: `'infrequent_if_exist'` (REQ-5). |
 //! | REQ-5 (drop + infrequent grouping) | NOT-STARTED | open prereq blocker #1152. No `drop` (`:498-516`) / `min_frequency`/`max_categories` (`:566-`). |
-//! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then errors on an ALL-ZERO block (`block_sum == 0`) with `InvalidParameter` ("Samples can not be inverted when drop=None and handle_unknown='error' because they contain all zeros"), mirroring sklearn's two-step argmax-then-all-zero-check (`_encoders.py:1136-1168`); 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the drop-aware / `handle_unknown='ignore'` inverse (None for all-zeros, `:1141-1158`). |
+//! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then handles an ALL-ZERO block (`block_sum == 0`) per `handle_unknown` (sklearn `_encoders.py:1141`,`:1159-1168`): `Error` -> `InvalidParameter` ("Samples can not be inverted ... all zeros"); `Ignore` -> the unknown-category sentinel inverts to `None` in sklearn (`:1183`), represented here as `NaN` (Array2<F> cannot hold None, #2227) with the KNOWN feature blocks still recovered; 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the `drop`-aware inverse (REQ-5). The `handle_unknown='ignore'` inverse IS handled (#2227, all-zero -> NaN sentinel). |
 //! | REQ-7 (ctor + dtype + _parameter_constraints) | NOT-STARTED | open prereq blocker #1154. `new()` takes no params/validates nothing (`:728-762`). |
 //! | REQ-8 (PyO3 binding) | NOT-STARTED | open prereq blocker #1155. No `ferrolearn-python` registration (R-DEFER-1). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #1156. `ndarray::Array2`, not `ferray-core` (R-SUBSTRATE-1/2). |
@@ -44,6 +44,40 @@ use ferrolearn_core::traits::{Fit, FitTransform, Transform};
 use ndarray::Array2;
 use num_traits::Float;
 use std::cmp::Ordering;
+
+// ---------------------------------------------------------------------------
+// OneHotHandleUnknown
+// ---------------------------------------------------------------------------
+
+/// How [`FittedOneHotEncoder`] treats a category at `transform` time that was not
+/// seen during `fit` (an **unknown category**).
+///
+/// Mirrors scikit-learn's `OneHotEncoder(handle_unknown=...)` parameter
+/// (`sklearn/preprocessing/_encoders.py:732,750`), whose
+/// `_parameter_constraints` accepts `{'error', 'ignore', 'infrequent_if_exist'}`
+/// and whose default is `'error'`. ferrolearn ships `Error` (REQ-2) and `Ignore`
+/// (REQ-4); `'infrequent_if_exist'` is NOT-STARTED (REQ-5).
+///
+/// This is a distinct type from
+/// [`ordinal_encoder::HandleUnknown`](crate::ordinal_encoder::HandleUnknown):
+/// the one-hot encoder's modes are `{error, ignore}` while the ordinal encoder's
+/// are `{error, use_encoded_value}` (sklearn's two `handle_unknown` enums differ
+/// the same way).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OneHotHandleUnknown {
+    /// Raise an error on any unknown category at `transform` time (scikit-learn's
+    /// default `handle_unknown='error'`, the default here too). The unfitted
+    /// encoder's [`Transform::transform`] returns
+    /// [`FerroError::InvalidParameter`] ("Found unknown categories … during
+    /// transform", `_encoders.py:209-214`).
+    #[default]
+    Error,
+    /// Encode an unknown category as an **all-zero** one-hot block for that
+    /// feature, leaving every known feature untouched (scikit-learn's
+    /// `handle_unknown='ignore'`, `_encoders.py:215-240`: the unknown row is
+    /// masked out and no column in that feature's block is set).
+    Ignore,
+}
 
 // ---------------------------------------------------------------------------
 // OneHotEncoder (unfitted)
@@ -72,18 +106,47 @@ use std::cmp::Ordering;
 /// let encoded = fitted.transform(&x).unwrap();
 /// assert_eq!(encoded.ncols(), 5); // 3 + 2 category columns
 /// ```
+///
+/// Unknown categories at `transform` time are, by default, rejected
+/// ([`OneHotHandleUnknown::Error`], scikit-learn's `handle_unknown='error'`).
+/// Configuring [`with_handle_unknown`](OneHotEncoder::with_handle_unknown) with
+/// [`OneHotHandleUnknown::Ignore`] instead encodes an unknown category as an
+/// all-zero one-hot block, matching `OneHotEncoder(handle_unknown='ignore')`.
 #[derive(Debug, Clone)]
 pub struct OneHotEncoder<F> {
+    /// Strategy for unknown categories at `transform` time
+    /// (`handle_unknown`). Defaults to [`OneHotHandleUnknown::Error`].
+    handle_unknown: OneHotHandleUnknown,
     _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> OneHotEncoder<F> {
-    /// Create a new `OneHotEncoder`.
+    /// Create a new `OneHotEncoder` with scikit-learn's default
+    /// `handle_unknown='error'` ([`OneHotHandleUnknown::Error`]).
     #[must_use]
     pub fn new() -> Self {
         Self {
+            handle_unknown: OneHotHandleUnknown::Error,
             _marker: std::marker::PhantomData,
         }
+    }
+
+    /// Set the unknown-category strategy (`handle_unknown`).
+    ///
+    /// With [`OneHotHandleUnknown::Ignore`] an unknown category at `transform`
+    /// time becomes an all-zero one-hot block for that feature instead of an
+    /// error, matching scikit-learn's `OneHotEncoder(handle_unknown='ignore')`
+    /// (`_encoders.py:215-240`).
+    #[must_use]
+    pub fn with_handle_unknown(mut self, handle_unknown: OneHotHandleUnknown) -> Self {
+        self.handle_unknown = handle_unknown;
+        self
+    }
+
+    /// Return the configured unknown-category strategy (`handle_unknown`).
+    #[must_use]
+    pub fn handle_unknown(&self) -> OneHotHandleUnknown {
+        self.handle_unknown
     }
 }
 
@@ -115,6 +178,10 @@ pub struct FittedOneHotEncoder<F> {
     pub(crate) offsets: Vec<usize>,
     /// Total number of output columns (`Σ categories_[j].len()`).
     pub(crate) n_output: usize,
+    /// Strategy for unknown categories at `transform` time, threaded from the
+    /// unfitted [`OneHotEncoder`]. [`OneHotHandleUnknown::Error`] rejects an
+    /// unknown category; [`OneHotHandleUnknown::Ignore`] emits an all-zero block.
+    pub(crate) handle_unknown: OneHotHandleUnknown,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
@@ -145,6 +212,13 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
     #[must_use]
     pub fn n_output_features(&self) -> usize {
         self.n_output
+    }
+
+    /// Return the configured unknown-category strategy (`handle_unknown`),
+    /// threaded from the unfitted [`OneHotEncoder`].
+    #[must_use]
+    pub fn handle_unknown(&self) -> OneHotHandleUnknown {
+        self.handle_unknown
     }
 
     /// Invert a one-hot encoded matrix back to the original category values.
@@ -236,18 +310,32 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
                         argmax = k;
                     }
                 }
-                // All-zero block: cannot be inverted with drop=None and
-                // handle_unknown='error' (sklearn `_encoders.py:1164-1168`). We
-                // have no drop/ignore mode (REQ-4/5), so this is always an error.
+                // All-zero block: sklearn's behavior DEPENDS on handle_unknown
+                // (`_encoders.py:1141`,`:1159-1168`). With `handle_unknown='error'`
+                // (and drop=None) an all-zero row "can not be inverted" -> error.
+                // With `handle_unknown='ignore'` the all-zero block is the
+                // unknown-category sentinel and inverts to `None` (`:1183`,
+                // contract `:546-549`); the KNOWN feature blocks still recover
+                // normally. `Array2<F>` cannot hold Python `None`, so we use `NaN`
+                // as the representable missing-marker (documented #2227): the
+                // inverse SUCCEEDS, known features recover, unknown features -> NaN.
                 if block_sum == F::zero() {
-                    return Err(FerroError::InvalidParameter {
-                        name: "X".into(),
-                        reason: "Samples can not be inverted when drop=None and \
-                                 handle_unknown='error' because they contain all zeros"
-                            .into(),
-                    });
+                    match self.handle_unknown {
+                        OneHotHandleUnknown::Error => {
+                            return Err(FerroError::InvalidParameter {
+                                name: "X".into(),
+                                reason: "Samples can not be inverted when drop=None and \
+                                         handle_unknown='error' because they contain all zeros"
+                                    .into(),
+                            });
+                        }
+                        OneHotHandleUnknown::Ignore => {
+                            out[[i, j]] = F::nan();
+                        }
+                    }
+                } else {
+                    out[[i, j]] = cats[argmax];
                 }
-                out[[i, j]] = cats[argmax];
             }
         }
 
@@ -399,6 +487,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
             categories_,
             offsets,
             n_output,
+            // `handle_unknown` only affects `transform` (sklearn learns the same
+            // `categories_` regardless); thread the configured mode through.
+            handle_unknown: self.handle_unknown,
         })
     }
 }
@@ -417,10 +508,22 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
     /// `OneHotEncoder(sparse_output=False)` output column layout
     /// (`_BaseEncoder._transform`, `_encoders.py:206-240`).
     ///
-    /// A value not present in `categories_[j]` is an **unknown category**;
-    /// matching sklearn's default `handle_unknown='error'` it returns an error
-    /// (sklearn raises `ValueError("Found unknown categories … during
-    /// transform")`, `_encoders.py:209-214`).
+    /// A value not present in `categories_[j]` is an **unknown category**. Its
+    /// handling depends on the configured `handle_unknown`
+    /// ([`OneHotEncoder::with_handle_unknown`]):
+    /// - [`OneHotHandleUnknown::Error`] (the default): returns an error, matching
+    ///   sklearn's `handle_unknown='error'`
+    ///   (`ValueError("Found unknown categories … during transform")`,
+    ///   `_encoders.py:209-214`).
+    /// - [`OneHotHandleUnknown::Ignore`]: leaves that feature's one-hot block
+    ///   **all-zero** for this row (no column is set), matching sklearn's
+    ///   `handle_unknown='ignore'` (`_encoders.py:215-240`: the unknown row is
+    ///   masked out so no encoded column is set). Every KNOWN feature still emits
+    ///   its normal one-hot bit.
+    ///
+    /// The +/-inf rejection (#2225), the ncols guard, and the 0-row handling are
+    /// unaffected by `handle_unknown`: a non-finite +/-inf value is invalid input
+    /// (not an unknown category) and still errors even in `Ignore` mode.
     ///
     /// # Errors
     ///
@@ -428,7 +531,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
     /// match the number of features seen during fitting.
     ///
     /// Returns [`FerroError::InvalidParameter`] if any value is an unknown
-    /// category (not in the learned `categories_[j]` set).
+    /// category (not in the learned `categories_[j]` set) AND `handle_unknown`
+    /// is [`OneHotHandleUnknown::Error`] (the default); under
+    /// [`OneHotHandleUnknown::Ignore`] an unknown category never errors. Also
+    /// returned if any value is +/-infinite (invalid input, #2225).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.categories_.len();
         // sklearn `transform` -> `check_array(force_all_finite="allow-nan")`
@@ -467,24 +573,31 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
                     .position(|&c| c == value || (c.is_nan() && value.is_nan()))
                 {
                     Some(idx) => out[[i, offset + idx]] = F::one(),
-                    None => {
-                        // Unknown category under handle_unknown='error' (the
-                        // sklearn default): ValueError "Found unknown categories
-                        // … during transform" (`_encoders.py:209-214`). Format the
-                        // value via its `Display` impl when available; `F: Float`
-                        // is not `Display`, so report position + column.
-                        let v = value.to_f64();
-                        let shown = match v {
-                            Some(f) => format!("[{f}]"),
-                            None => "[<non-finite>]".to_string(),
-                        };
-                        return Err(FerroError::InvalidParameter {
-                            name: format!("x[{i},{j}]"),
-                            reason: format!(
-                                "Found unknown categories {shown} in column {j} during transform"
-                            ),
-                        });
-                    }
+                    None => match self.handle_unknown {
+                        // handle_unknown='ignore' (`_encoders.py:215-240`): the
+                        // unknown row is masked out and NO column in this
+                        // feature's block is set, so the per-feature one-hot block
+                        // stays ALL-ZERO. `out` is already zero-filled, so we just
+                        // skip — every KNOWN feature still sets its own bit.
+                        OneHotHandleUnknown::Ignore => continue,
+                        // handle_unknown='error' (the sklearn default, SHIPPED
+                        // REQ-2, UNCHANGED): ValueError "Found unknown categories
+                        // … during transform" (`_encoders.py:209-214`). `F: Float`
+                        // is not `Display`, so report the value via `to_f64`.
+                        OneHotHandleUnknown::Error => {
+                            let v = value.to_f64();
+                            let shown = match v {
+                                Some(f) => format!("[{f}]"),
+                                None => "[<non-finite>]".to_string(),
+                            };
+                            return Err(FerroError::InvalidParameter {
+                                name: format!("x[{i},{j}]"),
+                                reason: format!(
+                                    "Found unknown categories {shown} in column {j} during transform"
+                                ),
+                            });
+                        }
+                    },
                 }
             }
         }

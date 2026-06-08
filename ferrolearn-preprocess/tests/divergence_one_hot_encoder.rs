@@ -860,7 +860,6 @@ fn inverse_transform_nan_input_errors_vs_sklearn_oracle() {
 /// call must not error in `ignore` mode. This test asserts (a) the call does NOT
 /// error and (b) col1 recovers `0.0` — both fail today (the call returns `Err`).
 #[test]
-#[ignore = "divergence: inverse_transform errors on ignore-mode all-zero block; sklearn returns None for that feature; tracking #2227"]
 fn inverse_transform_ignore_all_zero_block_returns_none_not_err_vs_sklearn_oracle() {
     // Live oracle (sklearn 1.5.2, handle_unknown='ignore', run from /tmp):
     //   inverse_transform([[0.0,0.0,0.0,1.0,0.0]]) -> [[None, 0.0]]
