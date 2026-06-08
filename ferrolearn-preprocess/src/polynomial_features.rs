@@ -29,9 +29,11 @@
 //! crate re-export (`lib.rs`, grandfathered S5) + the `FittedPolynomialFeatures::transform` fitted
 //! path. HONEST (R-HONEST-3): a dense int-degree transformer — the polynomial VALUES + column ORDER
 //! match sklearn exactly, and the stateful `fit` → `FittedPolynomialFeatures` surface
-//! (`n_features_in_`/`n_output_features_`/`powers_` + the transform feature-count check) NOW SHIPS
-//! (REQ-4/REQ-5); `get_feature_names_out`, degree-tuple, `order`, sparse, full-ctor, PyO3, ferray
-//! stay NOT-STARTED.
+//! (`n_features_in_`/`n_output_features_`/`powers_` + the transform feature-count check) SHIPS
+//! (REQ-4/REQ-5), and the `ferrolearn-python` PyO3 binding (`_RsPolynomialFeatures` + the
+//! `ferrolearn.PolynomialFeatures` stateful wrapper surfacing the fitted attributes) NOW SHIPS
+//! (REQ-10); `get_feature_names_out`, degree-tuple, `order` (C/F memory layout), sparse, full-ctor,
+//! ferray stay NOT-STARTED.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -43,8 +45,8 @@
 //! | REQ-5 (powers_ attribute) | SHIPPED | FIXED #1184. `FittedPolynomialFeatures<F>` carries `powers_: Array2<usize>` of shape `(n_output_features_, n_features_in_)` (matching `n_features_in_`'s `usize` storage idiom; sklearn `powers_` is int), built in `fit` from the SAME `feature_combinations` the value math uses (so row order == output column order): each combination → a `bincount` row counting occurrences of each feature index `0..n_features_in_`, the bias empty-combo → an all-zeros row (sklearn `np.vstack([np.bincount(c, minlength=n_features_in_) for c in combinations])`, `_polynomial.py:262-264`). Accessor `powers(&self) -> &Array2<usize>`. Live-oracle tests: `fit_powers_2feat/3feat_*` EXACT-match sklearn `.powers_` for default / `interaction_only` / `include_bias=False`, asserting shape + every entry. Consumer: the `powers_` accessor on the re-exported `FittedPolynomialFeatures`. |
 //! | REQ-6 (get_feature_names_out) | NOT-STARTED | open prereq blocker #1185. None (sklearn `:266-303`). Depends on REQ-5. |
 //! | REQ-7 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1186. Dense-only (sklearn `:402-`,`:38-96`). |
-//! | REQ-9 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1187. Positional `new`, degree==0 only (sklearn `:194-207`). |
-//! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1188. No `ferrolearn-python` registration (R-DEFER-1). |
+//! | REQ-9 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1187. Positional `new`; validates only the `degree==0 && !include_bias` empty-output case (FIXED #2216: sklearn `_polynomial.py:326-330` rejects ONLY that case — `degree==0 && include_bias` is valid, emitting just the bias column). No keyword-only `*`-args, no `order`, no full `_parameter_constraints` (sklearn `:194-207`). |
+//! | REQ-10 (PyO3 binding) | SHIPPED | FIXED #1188. `_RsPolynomialFeatures` (hand `#[pyclass]`, `ferrolearn-python/src/extras.rs`) over `ferrolearn_preprocess::{PolynomialFeatures, FittedPolynomialFeatures}<f64>` exposes `fit(x)` (ctor `PolynomialFeatures::new(degree, interaction_only, include_bias)`, `degree==0 && !include_bias`/NaN/±inf → `PyValueError`; FIXED #2216 `degree==0 && include_bias` is valid → bias-only column), `transform(x)` (`FittedPolynomialFeatures::transform` — wrong col count → `ShapeMismatch` → `PyValueError`), and `#[getter]`s `n_features_in_` (sklearn `_polynomial.py:323`), `n_output_features_` (`:362`), `powers_` (`:250-264`, `usize` `Array2` → numpy i64). Registered in `lib.rs`. The `_extras.py::PolynomialFeatures(_TransformerWrapper)` wrapper mirrors sklearn's ctor `(degree=2, *, interaction_only=False, include_bias=True, order="C")` (`_polynomial.py:201`, `degree` positional-or-keyword), is STATEFUL (overridden `fit` builds/fits `_rs`; pre-fit `transform`/attribute access → `NotFittedError` via `check_is_fitted`), does the FLOAT-only dtype cast-back (`check_array(dtype=FLOAT_DTYPES)`, `:432`: int→f64, float32→float32, float64→float64), and surfaces `n_features_in_`/`n_output_features_`/`powers_` as `@property`s reading from `_rs`. `order` is validated against sklearn's `StrOptions({"C","F"})` (bad string → `ValueError`); `'F'` is accepted-but-documented (the returned array is always C-contiguous — F memory-layout is REQ-3 #1182 NOT-STARTED — but the VALUES match sklearn's 'F' output, which is a layout-only knob). #2215-CLASS f64-ABI CAVEAT: for FLOAT32 input the polynomial products are computed in float64 (the f64 ABI) then cast back to float32 (sklearn computes them in float32), so the cast-back float32 VALUES can diverge from sklearn's by ~1e-6 on high-degree terms (the same reduced-precision caveat class as #2215/#2205) — float64 input is bit-exact; the float32 value pin uses a TOLERANT `atol=1e-5`. Exported in `__init__.py`. Non-test consumer: `ferrolearn.PolynomialFeatures(...).fit_transform(X)` + `lib.rs` `add_class` + `__init__.py` re-export. Live oracle: `tests/divergence_polynomial_features_py.py` (33 pass, sklearn 1.5.2) — fit_transform VALUES (d∈{2,3} × default/interaction_only/no-bias, float64 bit-exact), `powers_` int-exact, `n_output_features_`/`n_features_in_`, pre-fit `NotFittedError`, wrong-n_features `ValueError`, dtype int→f64/float32-tolerant/float64-bit-exact, get_params keys=={degree,interaction_only,include_bias,order}/defaults/clone/set_params, pipeline, order='F' values + bad-order `ValueError`. `get_feature_names_out` stays NOT-STARTED (REQ-6 #1185). |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker #1189. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 use ferrolearn_core::error::FerroError;
@@ -98,16 +100,27 @@ impl<F: Float + Send + Sync + 'static> PolynomialFeatures<F> {
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InvalidParameter`] if `degree == 0`.
+    /// Returns [`FerroError::InvalidParameter`] if `degree == 0 && !include_bias`.
+    /// `degree == 0` is ALLOWED when `include_bias == true` — the output is a
+    /// single all-ones bias column (`powers_ == [[0,..,0]]`,
+    /// `n_output_features_ == 1`), mirroring scikit-learn, which only rejects the
+    /// `degree == 0 && include_bias == False` case
+    /// (`sklearn/preprocessing/_polynomial.py:326-330`: "Setting degree to zero
+    /// and include_bias to False would result in an empty output array.").
     pub fn new(
         degree: usize,
         interaction_only: bool,
         include_bias: bool,
     ) -> Result<Self, FerroError> {
-        if degree == 0 {
+        // sklearn `_polynomial.py:326-330`: ONLY reject degree==0 when
+        // include_bias is False (an empty output array); degree==0 with
+        // include_bias=True is valid and emits just the bias column.
+        if degree == 0 && !include_bias {
             return Err(FerroError::InvalidParameter {
                 name: "degree".into(),
-                reason: "degree must be at least 1".into(),
+                reason: "Setting degree to zero and include_bias to False would \
+                         result in an empty output array."
+                    .into(),
             });
         }
         Ok(Self {
@@ -164,9 +177,15 @@ impl<F: Float + Send + Sync + 'static> PolynomialFeatures<F> {
         // Generate combinations of degrees 1..=self.degree
         let mut stack: Vec<(Vec<usize>, usize)> = Vec::new();
 
-        // Start with each feature at degree 1
-        for i in 0..n_features {
-            stack.push((vec![i], i));
+        // Start with each feature at degree 1. For `degree == 0` there are NO
+        // degree>=1 combinations (sklearn `_combinations` ranges over
+        // `range(max(1, min_degree), max_degree + 1)` = `range(1, 1)` = empty,
+        // `_polynomial.py:215-217`), so only the bias empty-combo (if
+        // `include_bias`) is emitted.
+        if self.degree >= 1 {
+            for i in 0..n_features {
+                stack.push((vec![i], i));
+            }
         }
 
         while let Some((combo, last_idx)) = stack.pop() {
@@ -275,6 +294,15 @@ fn generate_poly_features<F: Float>(
         return out;
     }
 
+    if degree == 0 {
+        // sklearn `_polynomial.py:532-533`: for `_max_degree == 0` the build
+        // returns right after the bias column — NO degree-1 block, NO higher
+        // blocks. degree==0 here implies include_bias (new() rejects
+        // degree==0 && !include_bias), so `out` already holds the single
+        // all-ones bias column.
+        return out;
+    }
+
     // degree 1 block: copy X column-for-column.
     // `index[j]` is the output column where degree-(d-1) block for feature `j`
     // begins; the trailing `index[n_features]` marks one past the block end.
@@ -336,6 +364,13 @@ fn num_output_columns(
 ) -> usize {
     let mut total = usize::from(include_bias);
     if n_features == 0 {
+        return total;
+    }
+    if degree == 0 {
+        // sklearn `_combinations` emits no degree>=1 terms for degree==0
+        // (`range(max(1,0), 0+1)` = `range(1,1)` = empty); the only output
+        // column is the bias (`_polynomial.py:215-219`). degree==0 reaching here
+        // implies include_bias (new() rejects degree==0 && !include_bias).
         return total;
     }
     // Count combinations per degree by mirroring the incremental block sizes.
@@ -734,8 +769,42 @@ mod tests {
     }
 
     #[test]
-    fn test_invalid_degree_zero() {
-        assert!(PolynomialFeatures::<f64>::new(0, false, true).is_err());
+    fn test_degree0_include_bias_false_is_err() {
+        // sklearn `_polynomial.py:326-330`: degree==0 with include_bias=False is
+        // the ONLY degree==0 case that raises ("Setting degree to zero and
+        // include_bias to False would result in an empty output array.").
+        assert!(PolynomialFeatures::<f64>::new(0, false, false).is_err());
+        assert!(PolynomialFeatures::<f64>::new(0, true, false).is_err());
+    }
+
+    #[test]
+    fn test_degree0_include_bias_true_bias_only() -> Result<(), FerroError> {
+        // sklearn ORACLE (degree=0, include_bias=True): a single all-ones bias
+        // column, powers_ == [[0, 0]] (one all-zeros row), n_output_features_ == 1.
+        //   python3 -c "import numpy as np; from sklearn.preprocessing import \
+        //   PolynomialFeatures as P; m=P(degree=0, include_bias=True).fit( \
+        //   np.array([[2.,3.]])); print(m.transform(np.array([[2.,3.]])).tolist(), \
+        //   m.powers_.tolist(), m.n_output_features_)"
+        //   -> [[1.0]] [[0, 0]] 1
+        let poly = PolynomialFeatures::<f64>::new(0, false, true)?;
+        let x = array![[2.0, 3.0]];
+
+        // Stateless transform → single all-ones bias column.
+        let out = poly.transform(&x)?;
+        assert_eq!(out.shape(), &[1, 1]);
+        assert_abs_diff_eq!(out[[0, 0]], 1.0, epsilon = 1e-10);
+
+        // Fitted attributes: powers_ == [[0, 0]], n_output_features_ == 1.
+        let fitted = poly.fit(&x, &())?;
+        assert_eq!(fitted.n_output_features(), 1);
+        assert_eq!(fitted.powers().shape(), &[1, 2]);
+        assert_eq!(fitted.powers()[[0, 0]], 0);
+        assert_eq!(fitted.powers()[[0, 1]], 0);
+
+        // Fitted transform is byte-identical to the stateless path.
+        let out_fitted = fitted.transform(&x)?;
+        assert_eq!(out_fitted, out);
+        Ok(())
     }
 
     #[test]

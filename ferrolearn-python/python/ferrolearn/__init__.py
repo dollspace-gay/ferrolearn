@@ -55,6 +55,7 @@ from ferrolearn._extras import (
     Nystroem,
     OPTICS,
     OrthogonalMatchingPursuit,
+    PolynomialFeatures,
     PowerTransformer,
     QuadraticDiscriminantAnalysis,
     QuantileRegressor,
@@ -132,6 +133,7 @@ __all__ = [
     # Preprocess extras
     "Binarizer",
     "Normalizer",
+    "PolynomialFeatures",
     "MinMaxScaler",
     "MaxAbsScaler",
     "RobustScaler",

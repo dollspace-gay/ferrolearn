@@ -3321,6 +3321,142 @@ impl RsNormalizer {
     }
 }
 
+// PolynomialFeatures (#1188, REQ-10): hand-written pyclass (not the
+// `py_transformer!` macro) because it is STATEFUL — `fit` records the shape
+// metadata (`n_features_in_`/`n_output_features_`/`powers_`) the binding must
+// surface as fitted ATTRIBUTES, which the macro (fit/transform only) cannot
+// expose. Over `ferrolearn_preprocess::{PolynomialFeatures, FittedPolynomialFeatures}`.
+//
+// sklearn's ctor is `__init__(self, degree=2, *, interaction_only=False,
+// include_bias=True, order="C")` (`_polynomial.py:201`): `degree` is
+// POSITIONAL-OR-KEYWORD, the rest keyword-only. The Python wrapper owns that ABI
+// (and the `order` C/F handling, which is a memory-layout knob that does not
+// change VALUES — REQ-3 NOT-STARTED in the core); this `_RsPolynomialFeatures`
+// takes `degree`/`interaction_only`/`include_bias` by keyword from `_make_rs`.
+//
+// `fit(x)` builds `PolynomialFeatures::<f64>::new(degree, interaction_only,
+// include_bias)` (FIXED #2216: ONLY `degree==0 && !include_bias` →
+// `InvalidParameter` → `PyValueError`, mirroring sklearn `_polynomial.py:326-330`
+// "Setting degree to zero and include_bias to False would result in an empty
+// output array."; `degree==0 && include_bias` is valid → a single all-ones bias
+// column, `powers_ == [[0,..,0]]`, `n_output_features_ == 1`)
+// and runs `.fit(&x, &())` (sklearn `_validate_data` `force_all_finite=True`
+// REJECTS NaN/±inf — polynomial_features.rs REQ-8). `transform(x)` delegates to
+// `FittedPolynomialFeatures::transform`, which re-validates X then checks the
+// column count against `n_features_in_` (wrong count → `ShapeMismatch` →
+// `PyValueError`, sklearn `X has N features, but ... expecting M`). The fitted
+// attributes `n_features_in_`/`n_output_features_`/`powers_` are surfaced via
+// `#[getter]`s over the Rust fitted type (`_polynomial.py:323`/`:362`/`:250-264`);
+// `powers_` (the `usize` `(n_output_features_, n_features_in_)` exponent matrix)
+// is marshalled to a numpy int array (i64), mirroring sklearn's int `powers_`.
+//
+// #2215-class f64-ABI caveat: for float32 INPUT the Python wrapper upcasts to
+// float64 (the f64 ABI), so the polynomial PRODUCTS are computed in float64 then
+// cast back to float32; sklearn computes them in float32. The cast-back float32
+// VALUES can therefore differ from sklearn's by ~1e-6 on high-degree terms — the
+// same reduced-precision caveat class as #2215/#2205. float64 input is bit-exact.
+#[pyclass(name = "_RsPolynomialFeatures")]
+pub struct RsPolynomialFeatures {
+    degree: usize,
+    interaction_only: bool,
+    include_bias: bool,
+    // `FittedPolynomialFeatures` is re-exported at the crate root
+    // (`ferrolearn-preprocess/src/lib.rs`, `pub use polynomial_features::{...}`),
+    // so it is reachable directly (unlike `FittedBinarizer`/`FittedNormalizer`).
+    fitted: Option<ferrolearn_preprocess::FittedPolynomialFeatures<f64>>,
+}
+
+#[pymethods]
+impl RsPolynomialFeatures {
+    #[new]
+    #[pyo3(signature = (degree=2, interaction_only=false, include_bias=true))]
+    fn new(degree: usize, interaction_only: bool, include_bias: bool) -> Self {
+        Self {
+            degree,
+            interaction_only,
+            include_bias,
+            fitted: None,
+        }
+    }
+
+    // sklearn `PolynomialFeatures.fit(X, y=None)` (`_polynomial.py:306`): records
+    // shape metadata only. `degree==0` (ferrolearn's core minimum is 1) →
+    // `InvalidParameter` → `PyValueError`. NaN/±inf input → `PyValueError` via the
+    // shared `validate_poly_input` (REQ-8).
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let x_nd = numpy2_to_ndarray(x);
+        let model = ferrolearn_preprocess::PolynomialFeatures::<f64>::new(
+            self.degree,
+            self.interaction_only,
+            self.include_bias,
+        )
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `PolynomialFeatures.transform(X)` (`_polynomial.py:402`): re-validate
+    // X (REQ-8), generate the polynomial matrix, then check the column count
+    // against `n_features_in_` (wrong count → `ShapeMismatch` → `PyValueError`).
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `n_features_in_` (`_polynomial.py:323`, set by `_validate_data`):
+    // number of input features seen during `fit`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features_in())
+    }
+
+    // sklearn `n_output_features_` (`_polynomial.py:362`, == `_num_combinations`):
+    // total number of polynomial output columns.
+    #[getter]
+    fn n_output_features_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_output_features())
+    }
+
+    // sklearn `powers_` (`_polynomial.py:250-264`): the exponent matrix of shape
+    // `(n_output_features_, n_features_in_)`, `powers_[i, j]` the exponent of
+    // input feature `j` in output feature `i`. The Rust core stores it as
+    // `Array2<usize>` (matching the `n_features_in_` usize idiom); sklearn's
+    // `powers_` is an int array, so marshal usize → i64 numpy (the bias empty-combo
+    // row is all zeros either way).
+    #[getter]
+    fn powers_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let powers = fitted.powers();
+        let converted = powers.mapv(|v| v as i64);
+        Ok(PyArray2::from_array(py, &converted))
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

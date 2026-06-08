@@ -57,6 +57,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsNystroem,
     _RsOPTICS,
     _RsOrthogonalMatchingPursuit,
+    _RsPolynomialFeatures,
     _RsPowerTransformer,
     _RsQDA,
     _RsQuantileRegressor,
@@ -2313,6 +2314,129 @@ class Normalizer(_TransformerWrapper):
         if np.issubdtype(in_dtype, np.floating) and out.dtype != in_dtype:
             out = out.astype(in_dtype, copy=False)
         return out
+
+
+class PolynomialFeatures(_TransformerWrapper):
+    """Generate polynomial and interaction features, backed by Rust (#1188).
+
+    Mirrors ``sklearn.preprocessing.PolynomialFeatures``
+    (``sklearn/preprocessing/_polynomial.py:99-564``): for input features and a
+    given ``degree`` it generates all polynomial combinations up to that degree
+    (with the bias column, pure powers and interaction terms governed by
+    ``include_bias``/``interaction_only``). The constructor mirrors sklearn's
+    ``__init__(self, degree=2, *, interaction_only=False, include_bias=True,
+    order="C")`` (``_polynomial.py:201``) — ``degree`` is POSITIONAL-OR-KEYWORD,
+    the rest keyword-only. ``degree``/``interaction_only``/``include_bias`` are
+    threaded into the Rust core via ``_make_rs`` so ``get_params``/``set_params``/
+    ``clone`` round-trip them.
+
+    STATEFUL: unlike ``Binarizer``/``Normalizer`` this transformer must be
+    ``fit`` before ``transform`` (``fit`` records ``n_features_in_``/
+    ``n_output_features_``/``powers_``, ``_polynomial.py:306-400``). A pre-fit
+    ``transform`` raises ``NotFittedError`` (via ``check_is_fitted``), matching
+    sklearn. ``transform`` with a wrong feature count raises ``ValueError``
+    (sklearn ``X has N features, but PolynomialFeatures is expecting M``).
+
+    Fitted attributes surfaced from the Rust fitted type:
+
+    - ``n_features_in_`` (int, ``_polynomial.py:323``);
+    - ``n_output_features_`` (int, ``_polynomial.py:362``);
+    - ``powers_`` (int numpy array of shape ``(n_output_features_,
+      n_features_in_)``, ``_polynomial.py:250-264``) — ``powers_[i, j]`` is the
+      exponent of input feature ``j`` in output feature ``i``.
+
+    DTYPE: ``transform`` -> ``check_array(dtype=FLOAT_DTYPES)``
+    (``_polynomial.py:432``): a FLOATING input dtype is PRESERVED
+    (float32->float32, float64->float64), an INTEGER input is UPCAST to float64
+    (NOT int-preserved, like ``Normalizer`` #2214-analog). The f64 Rust ABI
+    always returns float64, so cast back ONLY when the input was a floating dtype.
+
+    #2215-class f64-ABI caveat: for FLOAT32 input the products are computed in
+    float64 (the f64 ABI) then cast back to float32, whereas sklearn computes them
+    in float32; the cast-back float32 VALUES can therefore differ from sklearn's by
+    ~1e-6 on high-degree terms (the same reduced-precision caveat class as
+    #2215/#2205). float64 input is bit-exact.
+
+    ``order`` ('C'/'F') is sklearn's output MEMORY-LAYOUT knob
+    (``_polynomial.py:201``); it does NOT change VALUES or column order. ferrolearn
+    accepts 'C' (the default, the returned C-contiguous layout) and validates the
+    value against sklearn's ``StrOptions({"C", "F"})`` (a bad string ->
+    ``ValueError``). ``order='F'`` is accepted-but-documented: the returned array is
+    always C-contiguous regardless (the F memory layout is NOT-STARTED in the core,
+    polynomial_features.rs REQ-3 #1182); the VALUES are identical to sklearn's
+    'F'-ordered output, only the in-memory contiguity differs.
+
+    ``get_feature_names_out`` is NOT exposed (polynomial_features.rs REQ-6 #1185).
+    """
+
+    def __init__(self, degree=2, *, interaction_only=False, include_bias=True,
+                 order="C"):
+        self.degree = degree
+        self.interaction_only = interaction_only
+        self.include_bias = include_bias
+        self.order = order
+
+    def _make_rs(self):
+        # `order` is an output memory-layout knob (`_polynomial.py:201`) that does
+        # NOT change values/column order. Validate it against sklearn's
+        # `StrOptions({"C", "F"})` (`_polynomial.py:198`) — a bad value is an
+        # InvalidParameterError (a ValueError subclass) — but it is not threaded
+        # into the Rust core (the returned array is always C-contiguous; F-layout
+        # is NOT-STARTED, REQ-3 #1182). 'F' values match sklearn's; only the
+        # in-memory contiguity differs.
+        if self.order not in ("C", "F"):
+            raise ValueError(
+                "The 'order' parameter of PolynomialFeatures must be a str among "
+                f"{{'C', 'F'}}. Got {self.order!r} instead."
+            )
+        return _RsPolynomialFeatures(
+            degree=self.degree, interaction_only=self.interaction_only,
+            include_bias=self.include_bias)
+
+    def fit(self, X, y=None):
+        # STATEFUL fit: build + fit the Rust core, recording the shape metadata.
+        # NOTE: do NOT set `self.n_features_in_` as an instance attribute (the
+        # base `_TransformerWrapper.fit` does) — here `n_features_in_` is a
+        # read-only @property reading from `self._rs`, so the assignment would
+        # raise AttributeError. `check_is_fitted` keys off `_rs`.
+        self._rs = self._make_rs()
+        self._rs.fit(_f64(X))
+        return self
+
+    def transform(self, X):
+        # STATEFUL: require a prior fit. sklearn's `transform` calls
+        # `check_is_fitted(self)` (`_polynomial.py:430`), raising NotFittedError
+        # before any work. `_TransformerWrapper` would instead AttributeError on
+        # the missing `self._rs`, which is NOT what sklearn raises — so guard here.
+        check_is_fitted(self, "_rs")
+        out = np.asarray(self._rs.transform(_f64(X)))
+        # sklearn `transform` -> `check_array(dtype=FLOAT_DTYPES)`
+        # (`_polynomial.py:432`): a FLOATING input dtype is PRESERVED
+        # (float32->float32, float64->float64), an INTEGER input is UPCAST to
+        # float64. The f64 Rust ABI always returns float64, so cast back ONLY when
+        # the input was a floating dtype; leave integer input as float64.
+        # (#2215-class caveat: float32 products are computed in float64 then cast
+        # back, so float32 VALUES can differ from sklearn's ~1e-6 on high-degree
+        # terms — float64 is bit-exact.)
+        in_dtype = np.asarray(X).dtype
+        if np.issubdtype(in_dtype, np.floating) and out.dtype != in_dtype:
+            out = out.astype(in_dtype, copy=False)
+        return out
+
+    @property
+    def n_features_in_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_features_in_)
+
+    @property
+    def n_output_features_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_output_features_)
+
+    @property
+    def powers_(self):
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.powers_)
 
 
 class MinMaxScaler(_TransformerWrapper):

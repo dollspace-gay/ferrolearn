@@ -264,8 +264,6 @@ def test_bad_order_string_raises_value_error_both():
 # Tracking: #2216
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skip(reason="divergence: PolynomialFeatures(degree=0, include_bias=True) "
-                         "raises ValueError vs sklearn bias-only output; tracking #2216")
 def test_degree0_include_bias_true_matches_sklearn():
     # sklearn ORACLE: degree=0 with include_bias=True is VALID and produces a
     # single all-ones bias column (_polynomial.py:325-330 only rejects the
@@ -281,3 +279,13 @@ def test_degree0_include_bias_true_matches_sklearn():
     np.testing.assert_allclose(fr_out, sk_out, rtol=0, atol=0)
     np.testing.assert_array_equal(np.asarray(fr.powers_), sk_powers)
     assert int(fr.n_output_features_) == int(sk_n_out)
+
+
+def test_degree0_include_bias_false_raises_value_error_both():
+    # sklearn ORACLE: degree=0 with include_bias=False raises ValueError
+    # ("Setting degree to zero and include_bias to False would result in an
+    # empty output array.", _polynomial.py:326-330). ferrolearn must match.
+    with pytest.raises(ValueError):
+        SkPoly(degree=0, include_bias=False).fit_transform(_X)
+    with pytest.raises(ValueError):
+        fl.PolynomialFeatures(degree=0, include_bias=False).fit_transform(_X)
