@@ -1057,3 +1057,422 @@ fn green_explicit_auto_still_default() {
     assert_eq!(out[[1, 0]], 2.0, "auto dog -> 2");
     assert_eq!(out[[2, 0]], 0.0, "auto bird -> 0");
 }
+
+// ===========================================================================
+// REQ-8 — min_frequency / max_categories infrequent grouping.
+//
+// The OrdinalEncoder ANALOG of the SHIPPED OneHotEncoder REQ-5b: the same
+// `_identify_infrequent` algorithm, but the infrequent categories collapse to a
+// single shared ORDINAL CODE (not a one-hot column). `categories_` keeps ALL
+// categories; only the emitted code is folded. The inverse of the shared code
+// is the REAL String `"infrequent_sklearn"` (not a NaN proxy).
+//
+// EVERY expected value below is grounded in a LIVE sklearn 1.5.2 oracle call
+// (R-CHAR-3). The oracle commands are quoted inline above each test.
+// ===========================================================================
+
+/// Build an `n x 1` column by repeating each `(value, count)` pair.
+fn make_1col_rep(spec: &[(&str, usize)]) -> Array2<String> {
+    let mut vals: Vec<String> = Vec::new();
+    for &(v, c) in spec {
+        for _ in 0..c {
+            vals.push(v.to_string());
+        }
+    }
+    let n = vals.len();
+    Array2::from_shape_vec((n, 1), vals).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8a: min_frequency=2.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   >>> from sklearn.preprocessing import OrdinalEncoder
+//   >>> X = [['a']]*5+[['b']]*5+[['c']]*1+[['d']]*1
+//   >>> e = OrdinalEncoder(min_frequency=2).fit(X)
+//   >>> [list(c) for c in e.categories_]            -> [['a','b','c','d']]
+//   >>> [list(c) for c in e.infrequent_categories_] -> [['c','d']]
+//   >>> e.transform([['a'],['b'],['c'],['d']]).tolist()
+//                                                   -> [[0.],[1.],[2.],[2.]]
+//   >>> e.inverse_transform([[0.],[1.],[2.]]).tolist()
+//                                                   -> [['a'],['b'],['infrequent_sklearn']]
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_min_frequency_two_categories_transform_inverse() {
+    let enc = OrdinalEncoder::new().with_min_frequency(2);
+    let x = make_1col_rep(&[("a", 5), ("b", 5), ("c", 1), ("d", 1)]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // categories_ keeps ALL categories (oracle: [['a','b','c','d']]).
+    assert_eq!(
+        fitted.categories()[0],
+        ["a", "b", "c", "d"],
+        "categories_ keeps all (oracle)"
+    );
+    // infrequent_categories_ == [['c','d']] (oracle).
+    assert_eq!(
+        fitted.infrequent_categories()[0],
+        ["c", "d"],
+        "infrequent_categories_ (oracle)"
+    );
+
+    // transform: a->0, b->1, c&d->2 (shared trailing code; oracle).
+    let probe = make_1col(&["a", "b", "c", "d"]);
+    let out = fitted.transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], 0.0, "a -> 0");
+    assert_eq!(out[[1, 0]], 1.0, "b -> 1");
+    assert_eq!(out[[2, 0]], 2.0, "c -> 2 (infrequent)");
+    assert_eq!(out[[3, 0]], 2.0, "d -> 2 (infrequent, same code)");
+
+    // inverse: 0->'a', 1->'b', 2->'infrequent_sklearn' (oracle).
+    let inv = fitted
+        .inverse_transform(&Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap())
+        .unwrap();
+    assert_eq!(inv[[0, 0]], "a", "inverse 0 -> 'a' (frequent)");
+    assert_eq!(inv[[1, 0]], "b", "inverse 1 -> 'b' (frequent)");
+    assert_eq!(
+        inv[[2, 0]],
+        "infrequent_sklearn",
+        "inverse 2 -> 'infrequent_sklearn' (shared infrequent code)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8b: max_categories=K keeps top (K-1) frequent + 1 infrequent group.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a']]*5+[['b']]*4+[['c']]*3+[['d']]*2+[['e']]*1
+//   >>> e = OrdinalEncoder(max_categories=3).fit(X)
+//   >>> [list(c) for c in e.categories_]            -> [['a','b','c','d','e']]
+//   >>> [list(c) for c in e.infrequent_categories_] -> [['c','d','e']]
+//   >>> e.transform([['a'],['b'],['c'],['d'],['e']]).tolist()
+//                                            -> [[0.],[1.],[2.],[2.],[2.]]
+//   >>> e.inverse_transform([[0.],[1.],[2.]]).tolist()
+//                                            -> [['a'],['b'],['infrequent_sklearn']]
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_max_categories_keeps_top_k_minus_one() {
+    let enc = OrdinalEncoder::new().with_max_categories(3);
+    let x = make_1col_rep(&[("a", 5), ("b", 4), ("c", 3), ("d", 2), ("e", 1)]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.categories()[0], ["a", "b", "c", "d", "e"]);
+    assert_eq!(
+        fitted.infrequent_categories()[0],
+        ["c", "d", "e"],
+        "top-2 frequent (a,b), rest infrequent (oracle)"
+    );
+
+    let probe = make_1col(&["a", "b", "c", "d", "e"]);
+    let out = fitted.transform(&probe).unwrap();
+    assert_eq!(
+        out.column(0).to_vec(),
+        vec![0.0, 1.0, 2.0, 2.0, 2.0],
+        "a->0 b->1 c,d,e->2 (oracle)"
+    );
+
+    let inv = fitted
+        .inverse_transform(&Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap())
+        .unwrap();
+    assert_eq!(inv.column(0).to_vec(), vec!["a", "b", "infrequent_sklearn"]);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8c: max_categories TIE-BREAK favors the LARGER index (stable argsort).
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a']]*5+[['b']]*3+[['c']]*3+[['d']]*1   # b,c tie at count 3
+//   >>> e = OrdinalEncoder(max_categories=3).fit(X)   # keep 2 frequent
+//   >>> [list(c) for c in e.infrequent_categories_]   -> [['b','d']]
+//   >>> e.transform([['a'],['b'],['c'],['d']]).tolist()
+//                                            -> [[0.],[2.],[1.],[2.]]
+//   >>> e.inverse_transform([[0.],[1.],[2.]]).tolist()
+//                                            -> [['a'],['c'],['infrequent_sklearn']]
+// The tie between b and c (both count 3) is broken in favor of the LARGER
+// index: c (index 2) stays frequent, b (index 1) becomes infrequent.
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_max_categories_tiebreak_favors_larger_index() {
+    let enc = OrdinalEncoder::new().with_max_categories(3);
+    let x = make_1col_rep(&[("a", 5), ("b", 3), ("c", 3), ("d", 1)]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // Tie b=c=3: c (larger index) frequent, b infrequent (oracle).
+    assert_eq!(
+        fitted.infrequent_categories()[0],
+        ["b", "d"],
+        "tie favors larger index: b infrequent, c frequent (oracle)"
+    );
+
+    let probe = make_1col(&["a", "b", "c", "d"]);
+    let out = fitted.transform(&probe).unwrap();
+    assert_eq!(
+        out.column(0).to_vec(),
+        vec![0.0, 2.0, 1.0, 2.0],
+        "a->0 c->1 (2nd frequent slot) b,d->2 (oracle)"
+    );
+
+    // inverse: slot 1 -> 'c' (the second frequent category in original order).
+    let inv = fitted
+        .inverse_transform(&Array2::from_shape_vec((3, 1), vec![0.0, 1.0, 2.0]).unwrap())
+        .unwrap();
+    assert_eq!(
+        inv.column(0).to_vec(),
+        vec!["a", "c", "infrequent_sklearn"],
+        "inverse 1 -> 'c' (frequent), 2 -> infrequent_sklearn (oracle)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8d: BOTH min_frequency AND max_categories set; multi-feature where only
+// some features have infrequent categories.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a','p']]*5+[['b','q']]*5+[['c','p']]*1+[['d','q']]*1
+//   >>> e = OrdinalEncoder(min_frequency=2, max_categories=10).fit(X)
+//   >>> [list(c) for c in e.categories_]
+//                                  -> [['a','b','c','d'], ['p','q']]
+//   >>> [None if c is None else list(c) for c in e.infrequent_categories_]
+//                                  -> [['c','d'], None]
+//   >>> e.transform([['a','p'],['b','q'],['c','p'],['d','q']]).tolist()
+//                                  -> [[0.,0.],[1.,1.],[2.,0.],[2.,1.]]
+// Col 0: c,d infrequent (count 1 < 2). Col 1: p,q both count 6 -> no
+// infrequent (the empty inner Vec is sklearn's `None`).
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_both_set_multifeature_some_without_infrequent() {
+    let enc = OrdinalEncoder::new()
+        .with_min_frequency(2)
+        .with_max_categories(10);
+    let x = make_2col(&[
+        ("a", "p"),
+        ("a", "p"),
+        ("a", "p"),
+        ("a", "p"),
+        ("a", "p"),
+        ("b", "q"),
+        ("b", "q"),
+        ("b", "q"),
+        ("b", "q"),
+        ("b", "q"),
+        ("c", "p"),
+        ("d", "q"),
+    ]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.categories()[0], ["a", "b", "c", "d"]);
+    assert_eq!(fitted.categories()[1], ["p", "q"]);
+    // Col 0 has infrequent {c,d}; col 1 has NONE (empty == sklearn None).
+    assert_eq!(fitted.infrequent_categories()[0], ["c", "d"]);
+    assert!(
+        fitted.infrequent_categories()[1].is_empty(),
+        "col 1 has no infrequent categories (sklearn None == empty)"
+    );
+
+    let probe = make_2col(&[("a", "p"), ("b", "q"), ("c", "p"), ("d", "q")]);
+    let out = fitted.transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], 0.0);
+    assert_eq!(out[[0, 1]], 0.0);
+    assert_eq!(out[[1, 0]], 1.0);
+    assert_eq!(out[[1, 1]], 1.0);
+    assert_eq!(out[[2, 0]], 2.0, "c -> 2 (infrequent col 0)");
+    assert_eq!(out[[2, 1]], 0.0, "p -> 0 (frequent col 1, unchanged)");
+    assert_eq!(out[[3, 0]], 2.0, "d -> 2 (infrequent col 0)");
+    assert_eq!(out[[3, 1]], 1.0, "q -> 1 (frequent col 1, unchanged)");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8e: min_frequency=0 / max_categories=0 -> InvalidParameterError.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> OrdinalEncoder(min_frequency=0).fit([['a'],['b']])
+//        -> InvalidParameterError: The 'min_frequency' parameter ... must be an
+//           int in the range [1, inf).
+//   >>> OrdinalEncoder(max_categories=0).fit([['a'],['b']])
+//        -> InvalidParameterError: The 'max_categories' parameter ... [1, inf).
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_zero_thresholds_rejected() {
+    let x = make_1col(&["a", "b"]);
+    let r_min = OrdinalEncoder::new().with_min_frequency(0).fit(&x, &());
+    assert!(r_min.is_err(), "min_frequency=0 -> Err (oracle)");
+    let r_max = OrdinalEncoder::new().with_max_categories(0).fit(&x, &());
+    assert!(r_max.is_err(), "max_categories=0 -> Err (oracle)");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8f: infrequent + handle_unknown='use_encoded_value' + unknown_value.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a']]*5+[['b']]*5+[['c']]*1
+//   >>> e = OrdinalEncoder(min_frequency=2,
+//   ...     handle_unknown='use_encoded_value', unknown_value=-1).fit(X)
+//   >>> e.transform([['a'],['c'],['zzz']]).tolist()
+//                                  -> [[0.],[2.],[-1.]]
+// A known-but-infrequent value 'c' -> 2.0 (the trailing infrequent code); an
+// UNKNOWN value 'zzz' -> -1.0 (unknown_value). The two are DISTINCT codes.
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_infrequent_plus_use_encoded_value_distinct_codes() {
+    let enc = OrdinalEncoder::new()
+        .with_min_frequency(2)
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(-1.0);
+    let x = make_1col_rep(&[("a", 5), ("b", 5), ("c", 1)]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    let probe = make_1col(&["a", "c", "zzz"]);
+    let out = fitted.transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], 0.0, "a -> 0 (frequent)");
+    assert_eq!(out[[1, 0]], 2.0, "c -> 2 (known infrequent)");
+    assert_eq!(out[[2, 0]], -1.0, "zzz -> -1 (unknown_value, distinct)");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8g: unknown_value collision keys off the EFFECTIVE code count.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a']]*5+[['b']]*5+[['c']]*1+[['d']]*1   # 4 cats, codes 0,1,2
+//   >>> OrdinalEncoder(min_frequency=2,
+//   ...     handle_unknown='use_encoded_value', unknown_value=3).fit(X)  # OK
+//   >>> OrdinalEncoder(min_frequency=2,
+//   ...     handle_unknown='use_encoded_value', unknown_value=2).fit(X)  # ValueError
+// With min_frequency=2 the feature emits 3 codes (0,1,2-infrequent), so
+// unknown_value=3 is fine but =2 collides with the infrequent code. (Without
+// grouping, len(categories_)=4 so =3 would collide -- REQ-5 baseline below.)
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_unknown_value_collision_uses_effective_code_count() {
+    let x = make_1col_rep(&[("a", 5), ("b", 5), ("c", 1), ("d", 1)]);
+    // uv=3 accepted under infrequent (effective 3 codes: 0,1,2).
+    let ok = OrdinalEncoder::new()
+        .with_min_frequency(2)
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(3.0)
+        .fit(&x, &());
+    assert!(ok.is_ok(), "uv=3 OK under infrequent (3 codes) (oracle)");
+    // uv=2 collides with the infrequent code.
+    let collide = OrdinalEncoder::new()
+        .with_min_frequency(2)
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(2.0)
+        .fit(&x, &());
+    assert!(collide.is_err(), "uv=2 collides infrequent code (oracle)");
+    // REQ-5 baseline (no grouping): uv=3 collides (len(categories_)=4).
+    let base = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(3.0)
+        .fit(&x, &());
+    assert!(base.is_err(), "uv=3 collides without grouping (REQ-5)");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8h: None (default) -> REQ-1/2/3/5 UNCHANGED.
+//
+// LIVE oracle (sklearn 1.5.2): an OrdinalEncoder with no min_frequency /
+// max_categories has NO `_infrequent_indices` attribute and behaves identically
+// to the SHIPPED encoder.
+//   >>> OrdinalEncoder().fit([['x'],['y'],['x']]).categories_  -> [['x','y']]
+//   >>> hasattr(., '_infrequent_indices')                      -> False
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_disabled_default_unchanged() {
+    let enc = OrdinalEncoder::new();
+    let x = make_1col(&["x", "y", "x"]);
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(fitted.categories()[0], ["x", "y"]);
+    // No infrequent categories when disabled (empty == sklearn None).
+    assert!(
+        fitted.infrequent_categories()[0].is_empty(),
+        "disabled -> no infrequent (oracle: no _infrequent_indices)"
+    );
+    // transform is the plain idx as f64 (SHIPPED REQ-2).
+    let out = fitted.transform(&x).unwrap();
+    assert_eq!(out.column(0).to_vec(), vec![0.0, 1.0, 0.0]);
+    // inverse is the plain SHIPPED REQ-9 roundtrip.
+    let inv = fitted.inverse_transform(&out).unwrap();
+    assert_eq!(inv.column(0).to_vec(), vec!["x", "y", "x"]);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8i: inverse roundtrip where some values are infrequent -> the infrequent
+// values do NOT round-trip to the original (they map to 'infrequent_sklearn'),
+// matching sklearn's documented non-roundtrip.
+//
+// LIVE oracle (sklearn 1.5.2):
+//   >>> X = [['a']]*5+[['b']]*5+[['c']]*1+[['d']]*1
+//   >>> e = OrdinalEncoder(min_frequency=2).fit(X)
+//   >>> t = e.transform([['a'],['c'],['d']])      -> [[0.],[2.],[2.]]
+//   >>> e.inverse_transform(t).tolist()
+//          -> [['a'],['infrequent_sklearn'],['infrequent_sklearn']]
+// 'a' round-trips; 'c'/'d' collapse to 'infrequent_sklearn' (documented
+// non-roundtrip, like sklearn).
+// ---------------------------------------------------------------------------
+#[test]
+fn req8_inverse_infrequent_non_roundtrip() {
+    let enc = OrdinalEncoder::new().with_min_frequency(2);
+    let x = make_1col_rep(&[("a", 5), ("b", 5), ("c", 1), ("d", 1)]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    let probe = make_1col(&["a", "c", "d"]);
+    let t = fitted.transform(&probe).unwrap();
+    assert_eq!(t.column(0).to_vec(), vec![0.0, 2.0, 2.0]);
+
+    let inv = fitted.inverse_transform(&t).unwrap();
+    assert_eq!(
+        inv.column(0).to_vec(),
+        vec!["a", "infrequent_sklearn", "infrequent_sklearn"],
+        "frequent 'a' round-trips; infrequent 'c'/'d' -> 'infrequent_sklearn' (oracle)"
+    );
+}
+
+// ===========================================================================
+// REQ-8 (#1163) — INTERLEAVED infrequent fixture (the critic-flagged coverage
+// gap): infrequent categories sit BETWEEN frequent ones by sort order, so the
+// frequent ordinals must compact (c,e -> slots 1,2) and the inverse back-map
+// must recover the RIGHT original category, not the categories_ index.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   X = [['a']]*5 + [['b']]*1 + [['c']]*4 + [['d']]*1 + [['e']]*3
+//   e = OrdinalEncoder(min_frequency=2).fit(X)   # b,d infrequent (count 1<2)
+//   e.categories_            -> [['a','b','c','d','e']]
+//   e.infrequent_categories_ -> [['b','d']]
+//   e.transform([['a'],['b'],['c'],['d'],['e']]) -> [[0],[3],[1],[3],[2]]
+//   e.inverse_transform([[0],[1],[2],[3]]) -> [['a'],['c'],['e'],['infrequent_sklearn']]
+// ===========================================================================
+#[test]
+fn req8_interleaved_infrequent_remap_and_inverse() {
+    use ferrolearn_core::traits::Fit;
+    use ferrolearn_preprocess::OrdinalEncoder;
+
+    let mut rows: Vec<&str> = Vec::new();
+    rows.extend(std::iter::repeat_n("a", 5));
+    rows.extend(std::iter::repeat_n("b", 1));
+    rows.extend(std::iter::repeat_n("c", 4));
+    rows.extend(std::iter::repeat_n("d", 1));
+    rows.extend(std::iter::repeat_n("e", 3));
+    let x = make_1col(&rows);
+
+    let fitted = OrdinalEncoder::new()
+        .with_min_frequency(2)
+        .fit(&x, &())
+        .unwrap();
+
+    // infrequent_categories_ == [['b','d']]
+    assert_eq!(fitted.infrequent_categories()[0], vec!["b", "d"]);
+
+    // transform: a->0, b->3(infrequent), c->1, d->3, e->2
+    let probe = make_1col(&["a", "b", "c", "d", "e"]);
+    let out = fitted.transform(&probe).unwrap();
+    let got: Vec<f64> = out.iter().copied().collect();
+    assert_eq!(got, vec![0.0, 3.0, 1.0, 3.0, 2.0], "interleaved remap");
+
+    // inverse: 0->a, 1->c, 2->e, 3->infrequent_sklearn (the back-map recovers
+    // the RIGHT frequent category, not the categories_ index).
+    let inv_in = ndarray::Array2::from_shape_vec((4, 1), vec![0.0_f64, 1.0, 2.0, 3.0]).unwrap();
+    let inv = fitted.inverse_transform(&inv_in).unwrap();
+    assert_eq!(inv[[0, 0]], "a");
+    assert_eq!(inv[[1, 0]], "c");
+    assert_eq!(inv[[2, 0]], "e");
+    assert_eq!(inv[[3, 0]], "infrequent_sklearn");
+}

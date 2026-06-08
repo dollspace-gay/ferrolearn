@@ -27,7 +27,7 @@
 //! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | SHIPPED | `HandleUnknown` enum `{ Error, UseEncodedValue }` (default `Error`) + `unknown_value: Option<f64>` on `OrdinalEncoder`, threaded into `FittedOrdinalEncoder` via `with_handle_unknown`/`with_unknown_value` builders. `Fit::fit` runs the 3 sklearn validations (`_encoders.py:1473-1526`) AFTER the unchanged `categories_` compute, mapping sklearn's `TypeError`/`ValueError` → `FerroError::InvalidParameter`: (a) `UseEncodedValue` && `unknown_value is None` (sklearn `:1481` `not isinstance(.,Integral)` TypeError); (b) `Error` && `unknown_value is Some` (sklearn `:1488` TypeError); (c) `UseEncodedValue` && non-nan integer `v` with `0 <= v < max_cardinality` (sklearn `:1518-1526` ValueError collision). `Transform::transform` branches unknown categories: `UseEncodedValue` → write `unknown_value` (incl. nan) (sklearn `:1591` `X_trans[~X_mask] = self.unknown_value`); `Error` → `InvalidParameter` (the SHIPPED REQ-2 default, UNCHANGED). Seen categories still map to `idx as f64` (UNCHANGED). NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle: `green_use_encoded_value_minus_one`, `green_use_encoded_value_nan`, `green_use_encoded_value_multifeature`, `red_uev_requires_unknown_value`, `red_error_mode_forbids_unknown_value`, `red_unknown_value_collision_in_range`, `green_unknown_value_negative_or_oob_or_nan_ok`, `green_error_mode_unknown_still_rejected` (`tests/divergence_ordinal_encoder.rs`). Configurable `dtype`/`encoded_missing_value` interplay stays OUT OF SCOPE (REQ-3/REQ-6). Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
 //! | REQ-7 (explicit categories param) | SHIPPED | `Categories` enum `{ Auto, Explicit(Vec<Vec<String>>) }` (default `Auto`) + `#[must_use] OrdinalEncoder::with_categories(Vec<Vec<String>>)` builder + `categories_param()` getter (named to avoid colliding with `FittedOrdinalEncoder::categories`). `Fit::fit` branches on the param AFTER the 0-row guard: `Auto` → the SHIPPED REQ-1 sorted-unique compute (UNCHANGED); `Explicit(lists)` → use each `lists[j]` AS-GIVEN for `categories_[j]` (GIVEN order, NOT re-sorted) + the index map in that order, mirroring sklearn `_encoders.py:114` `cats = np.array(self.categories[i])`. Validations match `_BaseEncoder._fit`: list-count ≠ n_features → `ShapeMismatch` ("Shape mismatch: if categories is an array, it has to be of shape (n_features,)." `:85-89`); an EMPTY list → `InvalidParameter` (sklearn indexes `cats[0]` -> IndexError in both modes, `:114-117`, #2229); a list with duplicate elements → `InvalidParameter` ("In column {j}, the predefined categories contain duplicate elements." `:136-141`); under [`HandleUnknown::Error`] (default) a data value not in its column's list → `InvalidParameter` ("Found unknown categories [{v}] in column {j} during fit" `:153-160`), while under [`HandleUnknown::UseEncodedValue`] this fit-time subset check is SKIPPED (out-of-set data is encoded to `unknown_value` at transform). The REQ-5 unknown_value validations still apply (the `max_cardinality` collision check now keys off the explicit list lengths). `Transform`/`inverse_transform`/`categories()`/`get_feature_names_out` are UNCHANGED — they already read `categories_`/`category_to_index`, which now reflect the explicit given-order set. NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle (`tests/divergence_ordinal_encoder.rs`): `green_explicit_given_order_not_sorted`, `green_explicit_unsorted_accepted`, `red_explicit_error_mode_data_not_in_cats_fits_err`, `green_explicit_use_encoded_value_out_of_set_ok`, `red_explicit_n_features_mismatch`, `green_explicit_multifeature_each_own_order`, `red_explicit_duplicate_categories`, `green_explicit_inverse_roundtrip_given_order`, `green_explicit_auto_still_default`. Consumer: crate re-export (`lib.rs:142`, `Categories` re-exported). Configurable numeric/`bytes` categories + the nan-last rule stay OUT OF SCOPE (String-only path, REQ-4/REQ-6). |
-//! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
+//! | REQ-8 (min_frequency/max_categories infrequent) | SHIPPED | #1163: `OrdinalEncoder::with_min_frequency`/`with_max_categories` (+`min_frequency()`/`max_categories()` getters) add the integer-count infrequent thresholds (`_encoders.py:1289-1315`). The OrdinalEncoder ANALOG of the SHIPPED OneHotEncoder REQ-5b (`one_hot_encoder.rs`): the SAME `_identify_infrequent` algorithm (reused as `identify_infrequent` + `build_infrequent_map`, mirroring `_BaseEncoder._identify_infrequent` `:275-318` + `_default_to_infrequent_mappings` `:373-400`: min_frequency `count < min_freq` FIRST, then max_categories keeps top `max_categories-1` by count via a STABLE argsort over the full count array — ties favor the LARGER index; `max_categories==1` → all infrequent), but the infrequent categories collapse to a single shared ORDINAL CODE `n_frequent` (NOT a one-hot column): frequent categories keep codes `0..n_frequent` in their original sorted order, every infrequent category emits `n_frequent`. `Fit::fit` runs the `_parameter_constraints` check FIRST (`min_frequency`/`max_categories` `Some(0)` → `InvalidParameter` "must be an int in the range [1, inf)", BEFORE the data, `Interval(Integral,1,None)`), then (after the SHIPPED `categories_` compute, UNCHANGED — `categories_` keeps ALL categories) builds per-feature `infrequent_indices_`/`infrequent_map`/`n_frequent` from the fit-data category counts. `FittedOrdinalEncoder::infrequent_categories()` exposes the infrequent VALUES per feature (`infrequent_categories_`, `:255-262`). `Transform` routes a found category index through `infrequent_map[j]` then casts to f64 (frequent → own code, infrequent → shared trailing code; `_map_infrequent_categories`, `:402-452`); with grouping DISABLED the map is the identity so REQ-2 is UNCHANGED. `inverse_transform`: a code `< n_frequent` → the frequent category at that remapped slot (via the frequent-only category list); a code `== n_frequent` (exact float equality on the raw label) → the REAL String `"infrequent_sklearn"` (`:1644`,`:1675-1677`) — representable, UNLIKE OneHotEncoder's NaN proxy; the truncate+wrap numpy index logic applies over the frequent-only list (SHIPPED REQ-9 path UNCHANGED when disabled). The `unknown_value` collision check now keys off the EFFECTIVE code count `n_frequent + 1` (verified live: `min_frequency=2` over 4 cats → 3 codes → `unknown_value=3` accepted, `=2` collides). `get_feature_names_out` is UNCHANGED (OrdinalEncoder is one-to-one — infrequent does NOT add columns). NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle (`tests/divergence_ordinal_encoder.rs`): `req8_min_frequency_two_categories_transform_inverse`, `req8_max_categories_keeps_top_k_minus_one`, `req8_max_categories_tiebreak_favors_larger_index`, `req8_both_set_multifeature_some_without_infrequent`, `req8_zero_thresholds_rejected`, `req8_infrequent_plus_use_encoded_value_distinct_codes`, `req8_unknown_value_collision_uses_effective_code_count`, `req8_disabled_default_unchanged`, `req8_inverse_infrequent_non_roundtrip`. Consumer: crate re-export `lib.rs:142`. STILL NOT-STARTED (R-HONEST-3): the FLOAT-fraction `min_frequency` (`:1296-1297`,`:297-299`) and the explicit-`categories`+infrequent interaction stay unimplemented. |
 //! | REQ-9 (inverse_transform) | SHIPPED | `FittedOrdinalEncoder::inverse_transform(&Array2<f64>) -> Array2<String>` reuses the SHIPPED `categories_` (REQ-1): each cell is an ordinal index into `categories[j]`, mirroring sklearn `X_tr[:, i] = self.categories_[i][labels]` (`_encoders.py:1595-1679`). Validates the index BEFORE lookup (no panic, R-CODE-2): an exact non-negative integer in `[0, len)` → `categories[j][index].clone()`; 0-row → `InsufficientSamples` (symmetry with the #2220 transform guard); ncols-mismatch → `ShapeMismatch` (sklearn `:1619`). FAITHFUL to numpy: mirrors `labels.astype("int64")` (truncate toward zero, Rust `as i64`) + numpy fancy indexing (negative WRAP, `-1.0` → last category, `-2.0` → `len-2`), raising only once the wrapped index leaves `[0, len)` (`_encoders.py:1664`,`:1679`). Non-finite (NaN/±inf) → `InvalidParameter` (sklearn IndexError/ValueError; guarded because Rust `f64 as i64` saturates NaN→0). Critic-verified vs live sklearn 1.5.2 oracle: `green_inverse_roundtrip_multifeature`, `green_inverse_held_out_valid_ordinals`, `green_inverse_negative_wraps_like_numpy` (`-1.0`→'dog', `-2.0`→'cat', `-3.0`→Err), `green_inverse_non_integer_truncates_like_numpy` (`1.5`→'dog', `0.7`→'cat'), `red_inverse_out_of_range_positive` (`9.0`→Err), `red_inverse_ncols_mismatch`, `red_inverse_zero_row`, `red_inverse_use_encoded_value_unknown_cell` (`tests/divergence_ordinal_encoder.rs`). SCOPE LIMITATION (R-HONEST-3): the `unknown_value`-cell → `None` inverse (sklearn `:1673`) is unrepresentable in `Array2<String>` (would need `Array2<Option<String>>`), so a `use_encoded_value` cell equal to `unknown_value` ERRORS (checked BEFORE the index logic so the sentinel is not silently wrapped) instead of yielding `None`; the default `Error`-mode encoder has only valid ordinals so its inverse is COMPLETE and bit-exact. Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-10 (get_feature_names_out + n_features_in_) | SHIPPED | `FittedOrdinalEncoder::n_features_in()` (= `n_features()`, sklearn `n_features_in_`) + `get_feature_names_out(input_features)` — `OneToOneFeatureMixin` (one output col per input col) returns the INPUT names unchanged: `None` -> `["x0","x1",..]` (`_check_feature_names_in`), `Some(names)` -> verbatim, a wrong-length `input_features` -> `ShapeMismatch` (sklearn ValueError). Live-oracle test `req10_feature_names_out_and_n_features_in` (`['x0','x1']`, `['a','b']`, wrong-length Err). feature_names_in_ (string input-name capture) stays NOT-STARTED (ferrolearn fit takes positional columns, no input names). Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-11 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1166. `new()` takes no params (`:1320-1386`). |
@@ -137,6 +137,21 @@ pub struct OrdinalEncoder {
     /// Sentinel written for unknown categories when `handle_unknown` is
     /// [`HandleUnknown::UseEncodedValue`]. May be `f64::NAN`.
     unknown_value: Option<f64>,
+    /// Minimum frequency (count) below which a category is grouped into the
+    /// single trailing "infrequent" ordinal index for that feature
+    /// (`min_frequency`). `None` (the default) disables the min-frequency
+    /// threshold. Mirrors scikit-learn's `OrdinalEncoder(min_frequency=...)`
+    /// (`sklearn/preprocessing/_encoders.py:1289-1297`). SCOPE (R-HONEST-3):
+    /// only the integer-count form is supported — sklearn also accepts a FLOAT
+    /// fraction `min_frequency * n_samples` (`:1296-1297`,`:297-299`), which is
+    /// NOT-STARTED here.
+    min_frequency: Option<usize>,
+    /// Upper limit on the number of output ordinal codes per feature when
+    /// grouping infrequent categories (`max_categories`); the infrequent group
+    /// itself counts toward this limit. `None` (the default) imposes no limit.
+    /// Mirrors scikit-learn's `OrdinalEncoder(max_categories=...)`
+    /// (`sklearn/preprocessing/_encoders.py:1301-1315`).
+    max_categories: Option<usize>,
 }
 
 impl OrdinalEncoder {
@@ -148,6 +163,8 @@ impl OrdinalEncoder {
             categories: Categories::Auto,
             handle_unknown: HandleUnknown::Error,
             unknown_value: None,
+            min_frequency: None,
+            max_categories: None,
         }
     }
 
@@ -215,6 +232,71 @@ impl OrdinalEncoder {
     pub fn unknown_value(&self) -> Option<f64> {
         self.unknown_value
     }
+
+    /// Set the minimum-frequency threshold for infrequent grouping
+    /// (`min_frequency`, integer count).
+    ///
+    /// At `fit` time a category whose count in the training data is **strictly
+    /// less than** `min_frequency` is grouped with the other infrequent
+    /// categories into a single trailing ordinal index `n_frequent` for that
+    /// feature (the frequent categories keep ordinal indices `0..n_frequent` in
+    /// their original sorted order), matching scikit-learn's
+    /// `OrdinalEncoder(min_frequency=...)` integer form
+    /// (`sklearn/preprocessing/_encoders.py:1289-1297`, `_identify_infrequent`
+    /// `:295-296` `category_count < self.min_frequency`).
+    ///
+    /// Unlike [`crate::OneHotEncoder`], the infrequent group collapses to ONE
+    /// **ordinal index** (not a one-hot column), so `categories_` is unchanged
+    /// (all categories retained) — only the emitted ordinal code is shared.
+    ///
+    /// SCOPE (R-HONEST-3): only the integer-count form is supported. sklearn
+    /// also accepts a FLOAT `min_frequency` interpreted as the fraction
+    /// `min_frequency * n_samples` (`_encoders.py:1296-1297`,`:297-299`); the
+    /// float-fraction form is NOT-STARTED here.
+    #[must_use]
+    pub fn with_min_frequency(mut self, min_frequency: usize) -> Self {
+        self.min_frequency = Some(min_frequency);
+        self
+    }
+
+    /// Set the maximum number of output ordinal codes per feature for infrequent
+    /// grouping (`max_categories`).
+    ///
+    /// At `fit` time, if a feature would otherwise produce more than
+    /// `max_categories` distinct ordinal codes, the least-frequent categories
+    /// are grouped into the single trailing infrequent index so the number of
+    /// codes is at most `max_categories` (the infrequent group itself counts
+    /// toward the limit). Mirrors scikit-learn's
+    /// `OrdinalEncoder(max_categories=...)`
+    /// (`sklearn/preprocessing/_encoders.py:1301-1315`, `_identify_infrequent`
+    /// `:303-315`).
+    #[must_use]
+    pub fn with_max_categories(mut self, max_categories: usize) -> Self {
+        self.max_categories = Some(max_categories);
+        self
+    }
+
+    /// Return the configured minimum-frequency threshold (`min_frequency`), or
+    /// `None` if infrequent grouping by frequency is disabled.
+    #[must_use]
+    pub fn min_frequency(&self) -> Option<usize> {
+        self.min_frequency
+    }
+
+    /// Return the configured maximum ordinal-code limit (`max_categories`), or
+    /// `None` if no limit is imposed.
+    #[must_use]
+    pub fn max_categories(&self) -> Option<usize> {
+        self.max_categories
+    }
+
+    /// Whether infrequent grouping is enabled (either `min_frequency` or
+    /// `max_categories` is set). Mirrors scikit-learn's `_infrequent_enabled`
+    /// (`_encoders.py:271-273`: `(max_categories is not None and
+    /// max_categories >= 1) or min_frequency is not None`).
+    fn infrequent_enabled(&self) -> bool {
+        self.min_frequency.is_some() || self.max_categories.is_some_and(|m| m >= 1)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,6 +319,33 @@ pub struct FittedOrdinalEncoder {
     /// [`HandleUnknown::UseEncodedValue`] (threaded from the unfitted encoder;
     /// validated to be present in that mode during `fit`).
     pub(crate) unknown_value: Option<f64>,
+    /// Per-feature indices into `categories[j]` of the categories grouped as
+    /// **infrequent** (`min_frequency`/`max_categories`), sorted ascending.
+    /// Mirrors scikit-learn's private `_infrequent_indices[j]`
+    /// (`_encoders.py:336-340`,`:367-370`). Empty when feature `j` has no
+    /// infrequent categories (sklearn's `None`); with infrequent grouping
+    /// disabled every entry is empty. Length `categories.len()`. The categories
+    /// themselves are NOT removed from `categories[j]` (unlike one-hot column
+    /// dropping) — only their emitted ordinal code is folded.
+    pub(crate) infrequent_indices_: Vec<Vec<usize>>,
+    /// Per-feature mapping from a `categories[j]` index to its emitted ORDINAL
+    /// code. Mirrors scikit-learn's `_default_to_infrequent_mappings[j]`
+    /// (`_encoders.py:373-400`): a frequent category maps to its remapped slot
+    /// `0..n_frequent` (frequent categories keep their original sorted order),
+    /// every infrequent category maps to the single trailing index
+    /// `n_frequent`. When feature `j` has no infrequent categories the mapping
+    /// is the identity `0..len` (sklearn stores `None`; the identity is the
+    /// representable equivalent). Length `categories.len()`, with
+    /// `infrequent_map[j].len() == categories[j].len()`. Used by `transform`
+    /// and `inverse_transform`.
+    pub(crate) infrequent_map: Vec<Vec<usize>>,
+    /// Per-feature number of frequent categories (`n_frequent`): the trailing
+    /// infrequent ordinal index when feature `j` has infrequent categories.
+    /// Equals `categories[j].len() - infrequent_indices_[j].len()`. When feature
+    /// `j` has no infrequent categories this equals `categories[j].len()` (the
+    /// identity map's range). Length `categories.len()`. Used by
+    /// `inverse_transform` to recognise the shared infrequent code.
+    pub(crate) n_frequent: Vec<usize>,
 }
 
 impl FittedOrdinalEncoder {
@@ -246,6 +355,31 @@ impl FittedOrdinalEncoder {
     #[must_use]
     pub fn categories(&self) -> &[Vec<String>] {
         &self.categories
+    }
+
+    /// Return the infrequent category **values** for each feature
+    /// (`infrequent_categories_`).
+    ///
+    /// `infrequent_categories()[j]` is the sorted list of category values from
+    /// `categories[j]` that were grouped into the single trailing "infrequent"
+    /// ordinal code (because their training count fell below `min_frequency`
+    /// and/or beyond the `max_categories` limit). An EMPTY inner `Vec` means
+    /// feature `j` had no infrequent categories (scikit-learn returns `None`
+    /// there; an empty list is the representable equivalent). With infrequent
+    /// grouping disabled every entry is empty. Mirrors scikit-learn's
+    /// `OrdinalEncoder.infrequent_categories_` (`_encoders.py:255-262`):
+    /// `category[indices]` over `_infrequent_indices`.
+    #[must_use]
+    pub fn infrequent_categories(&self) -> Vec<Vec<String>> {
+        self.infrequent_indices_
+            .iter()
+            .enumerate()
+            .map(|(j, idxs)| {
+                idxs.iter()
+                    .filter_map(|&idx| self.categories.get(j).and_then(|c| c.get(idx)).cloned())
+                    .collect()
+            })
+            .collect()
     }
 
     /// Return the number of input columns (features).
@@ -397,7 +531,43 @@ impl FittedOrdinalEncoder {
 
         for j in 0..n_features {
             let cats = &self.categories[j];
-            let len = cats.len() as i64;
+            // Infrequent grouping (REQ-8). When feature `j` has infrequent
+            // categories, the valid ordinal codes are `0..=n_frequent[j]`: codes
+            // `0..n_frequent` index the FREQUENT-only category list (the original
+            // `categories[j]` with the infrequent entries removed, order
+            // preserved — sklearn `frequent_categories_mask`,
+            // `_encoders.py:1648-1652`), and the shared trailing code
+            // `n_frequent` inverts to the literal String `"infrequent_sklearn"`
+            // (`_encoders.py:1675-1677` `X_tr[mask, idx] = "infrequent_sklearn"`).
+            // UNLIKE `OneHotEncoder`'s NaN proxy, this is a REAL representable
+            // String. With grouping disabled `infrequent_indices_[j]` is empty,
+            // so this branch is skipped and the SHIPPED REQ-9 path runs unchanged.
+            let frequent_only: Option<Vec<String>> = if self
+                .infrequent_indices_
+                .get(j)
+                .is_some_and(|v| !v.is_empty())
+            {
+                let map = &self.infrequent_map[j];
+                let nf = self.n_frequent[j];
+                // Slot `s` (in `0..nf`) → the `categories[j]` element whose
+                // remapped code is `s` (frequent categories keep their order).
+                let mut fo: Vec<String> = Vec::with_capacity(nf);
+                for s in 0..nf {
+                    if let Some(orig) = map.iter().position(|&c| c == s)
+                        && let Some(cat) = cats.get(orig)
+                    {
+                        fo.push(cat.clone());
+                    }
+                }
+                Some(fo)
+            } else {
+                None
+            };
+            // The category list the numpy index logic indexes into: the
+            // frequent-only list when grouping is active for this feature, else
+            // the full `categories[j]` (SHIPPED REQ-9, UNCHANGED).
+            let index_cats: &[String] = frequent_only.as_deref().unwrap_or(cats);
+            let len = index_cats.len() as i64;
             for i in 0..n_samples {
                 let v = x[[i, j]];
                 // `use_encoded_value`: sklearn maps a cell equal to
@@ -418,6 +588,17 @@ impl FittedOrdinalEncoder {
                              represent (would need Array2<Option<String>>)"
                         ),
                     });
+                }
+                // Infrequent: a cell EXACTLY equal to the shared trailing code
+                // `n_frequent` (a float equality, computed on the RAW label
+                // BEFORE the int cast — sklearn `labels == infrequent_encoding_value`,
+                // `_encoders.py:1644`) inverts to `"infrequent_sklearn"`. A cell
+                // that merely truncates to `n_frequent` (e.g. `2.5`) does NOT —
+                // it falls through to the frequent-only index logic and errors out
+                // of range, matching the live oracle.
+                if frequent_only.is_some() && v == self.n_frequent[j] as f64 {
+                    out[[i, j]] = "infrequent_sklearn".to_string();
+                    continue;
                 }
                 // sklearn does `labels.astype('int64')` then `categories_[j][idx]`
                 // (`_encoders.py:1664`,`:1679`). A non-finite cell overflows the
@@ -452,7 +633,10 @@ impl FittedOrdinalEncoder {
                     });
                 }
                 // `idx` is now provably in `[0, len)` (checked above) — no panic.
-                out[[i, j]] = cats[idx as usize].clone();
+                // `index_cats` is the frequent-only list under infrequent
+                // grouping (so a frequent code maps to its frequent category),
+                // else the full `categories[j]` (SHIPPED REQ-9, UNCHANGED).
+                out[[i, j]] = index_cats[idx as usize].clone();
             }
         }
 
@@ -475,6 +659,108 @@ impl FittedOrdinalEncoder {
 #[inline]
 fn ordinal_index_to_f64(idx: usize) -> f64 {
     idx as f64
+}
+
+/// Identify the indices of infrequent categories for one feature, given the
+/// per-category training `counts` (aligned with `categories[j]`) and the
+/// `min_frequency`/`max_categories` thresholds.
+///
+/// Mirrors scikit-learn's `_BaseEncoder._identify_infrequent`
+/// (`_encoders.py:275-318`). This is the SAME algorithm the SHIPPED
+/// `OneHotEncoder` REQ-5b uses (`one_hot_encoder.rs::identify_infrequent`):
+/// 1. min_frequency: a category with `count < min_frequency` is infrequent
+///    (`:295-296`, integer form only).
+/// 2. max_categories: if (after step 1) the feature would still produce more
+///    than `max_categories` ordinal codes — counted as `n_remaining_frequent +
+///    1` for the infrequent group (`:303`) — the least-frequent categories are
+///    additionally marked infrequent until only `max_categories - 1` frequent
+///    categories remain (`:304-315`). Ties broken by a STABLE sort over the
+///    FULL count array, so among equal counts the SMALLER category index is
+///    marked infrequent first (sklearn `np.argsort(kind="mergesort")[:-k]`),
+///    i.e. the LARGER index is favoured to stay frequent. `max_categories == 1`
+///    (frequent_category_count 0) makes every category infrequent (`:307-309`).
+///
+/// Returns the sorted-ascending infrequent indices (empty if none — sklearn's
+/// `None`). Never panics (R-CODE-2).
+fn identify_infrequent(
+    counts: &[usize],
+    min_frequency: Option<usize>,
+    max_categories: Option<usize>,
+) -> Vec<usize> {
+    let n = counts.len();
+    let mut infrequent_mask = vec![false; n];
+
+    // Step 1: min_frequency (integer count). `count < min_frequency`.
+    if let Some(min_freq) = min_frequency {
+        for (idx, &c) in counts.iter().enumerate() {
+            if c < min_freq {
+                infrequent_mask[idx] = true;
+            }
+        }
+    }
+
+    // Step 2: max_categories on the survivors. `n_current_features` counts the
+    // remaining frequent categories PLUS 1 for the infrequent group
+    // (`_encoders.py:303`).
+    if let Some(max_cat) = max_categories {
+        let n_infreq = infrequent_mask.iter().filter(|&&m| m).count();
+        let n_current_features = n - n_infreq + 1;
+        if max_cat < n_current_features {
+            // `max_categories` includes the one infrequent category.
+            let frequent_category_count = max_cat - 1;
+            if frequent_category_count == 0 {
+                // All categories are infrequent (`:307-309`).
+                infrequent_mask.iter_mut().for_each(|m| *m = true);
+            } else {
+                // Stable argsort over the FULL count array (ascending by count,
+                // ties by ascending index), then mark the smallest
+                // `n - frequent_category_count` levels infrequent — i.e. keep the
+                // top `frequent_category_count` by count, with ties resolved in
+                // favor of the LARGER index (`np.argsort(kind="mergesort")[:-k]`,
+                // `:312-315`).
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| counts[a].cmp(&counts[b]).then(a.cmp(&b)));
+                let keep = frequent_category_count.min(n);
+                let cut = n - keep;
+                for &idx in &order[..cut] {
+                    infrequent_mask[idx] = true;
+                }
+            }
+        }
+    }
+
+    infrequent_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &m)| if m { Some(idx) } else { None })
+        .collect()
+}
+
+/// Build the per-feature mapping from a `categories[j]` index to its emitted
+/// ORDINAL code.
+///
+/// Mirrors scikit-learn's `_default_to_infrequent_mappings[j]`
+/// (`_encoders.py:373-400`): frequent categories take codes `0..n_frequent` in
+/// their original (ascending-index) order; every infrequent category maps to
+/// the single trailing code `n_frequent`. With no infrequent categories the
+/// mapping is the identity `0..n`. `infrequent` must be sorted ascending. Never
+/// panics (R-CODE-2): every index is bounds-checked.
+fn build_infrequent_map(n: usize, infrequent: &[usize]) -> Vec<usize> {
+    if infrequent.is_empty() {
+        return (0..n).collect();
+    }
+    let n_frequent = n - infrequent.len();
+    let mut map = vec![n_frequent; n];
+    let mut next_frequent = 0usize;
+    for (idx, slot) in map.iter_mut().enumerate() {
+        if infrequent.binary_search(&idx).is_ok() {
+            // Infrequent → the trailing code (already set to `n_frequent`).
+        } else {
+            *slot = next_frequent;
+            next_frequent += 1;
+        }
+    }
+    map
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +805,26 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
     /// `unknown_value` while in [`HandleUnknown::Error`] mode; or an
     /// `unknown_value` that collides with an already-used encoding index.
     fn fit(&self, x: &Array2<String>, _y: &()) -> Result<FittedOrdinalEncoder, FerroError> {
+        // sklearn `_parameter_constraints` (`@_fit_context`, validated BEFORE the
+        // data): `min_frequency` and `max_categories` are each
+        // `Interval(Integral, 1, None)` — a value of 0 raises
+        // `InvalidParameterError` ("must be an int in the range [1, inf)").
+        // REQ-8, verified live: `OrdinalEncoder(min_frequency=0).fit` →
+        // InvalidParameterError. (handle_unknown is a type-safe Rust enum, so its
+        // StrOptions constraint is provided by the type system.)
+        if self.min_frequency == Some(0) {
+            return Err(FerroError::InvalidParameter {
+                name: "min_frequency".into(),
+                reason: "must be an int in the range [1, inf)".into(),
+            });
+        }
+        if self.max_categories == Some(0) {
+            return Err(FerroError::InvalidParameter {
+                name: "max_categories".into(),
+                reason: "must be an int in the range [1, inf)".into(),
+            });
+        }
+
         let n_samples = x.nrows();
         if n_samples == 0 {
             return Err(FerroError::InsufficientSamples {
@@ -668,6 +974,49 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
             }
         }
 
+        // Infrequent grouping (REQ-8). When `min_frequency`/`max_categories` are
+        // set, fold the least-frequent categories of each feature into a single
+        // shared trailing ORDINAL code (the frequent categories keep codes
+        // `0..n_frequent` in their original sorted order). `categories` is NOT
+        // changed (all categories retained, sklearn keeps `categories_` whole and
+        // only remaps the emitted index, `_encoders.py:1289-1370`) — only the
+        // per-feature `infrequent_map` / `infrequent_indices_` / `n_frequent` are
+        // built. With grouping disabled the map is the identity and every feature
+        // has no infrequent categories.
+        let mut infrequent_indices_: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+        let mut infrequent_map: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+        let mut n_frequent: Vec<usize> = Vec::with_capacity(n_features);
+        if self.infrequent_enabled() {
+            for (j, cats) in categories.iter().enumerate() {
+                // Per-category training counts ALIGNED with `categories[j]`
+                // (sklearn `_unique(Xi, return_counts=True)`,
+                // `_encoders.py:99-102`). Built from the fit data through the
+                // category→index map, so it works for BOTH the Auto and Explicit
+                // category sets. (A datum not in an explicit list contributes no
+                // count — under `handle_unknown='error'` the subset check above
+                // already rejected it; under `use_encoded_value` it is an unknown
+                // that does not affect category frequencies.)
+                let map = &category_to_index[j];
+                let mut counts = vec![0usize; cats.len()];
+                for i in 0..n_samples {
+                    if let Some(&idx) = map.get(&x[[i, j]]) {
+                        counts[idx] += 1;
+                    }
+                }
+                let infreq = identify_infrequent(&counts, self.min_frequency, self.max_categories);
+                let imap = build_infrequent_map(cats.len(), &infreq);
+                n_frequent.push(cats.len() - infreq.len());
+                infrequent_indices_.push(infreq);
+                infrequent_map.push(imap);
+            }
+        } else {
+            for cats in &categories {
+                infrequent_indices_.push(Vec::new());
+                infrequent_map.push((0..cats.len()).collect());
+                n_frequent.push(cats.len());
+            }
+        }
+
         // Validation (a'): sklearn (`_encoders.py:1481-1487`) requires
         // `unknown_value` to be an INTEGER or `np.nan` when
         // `handle_unknown='use_encoded_value'` — a non-integer float raises
@@ -701,7 +1050,18 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
             && !v.is_nan()
             && v.fract() == 0.0
         {
-            let max_cardinality = categories.iter().map(Vec::len).max().unwrap_or(0);
+            // sklearn's collision check keys off the EFFECTIVE number of distinct
+            // output codes per feature: with infrequent grouping a feature emits
+            // `n_frequent + 1` codes (the shared infrequent index), so its
+            // cardinality for the unknown_value collision is `n_frequent + 1`, NOT
+            // `len(categories_)` (verified live: `min_frequency=2` over 4 cats →
+            // 3 codes → `unknown_value=3` is accepted, `=2` collides). With
+            // grouping disabled `n_frequent[j] == categories[j].len()` and there
+            // is no infrequent code, so this reduces to the SHIPPED REQ-5 check.
+            let max_cardinality = (0..n_features)
+                .map(|j| n_frequent[j] + usize::from(!infrequent_indices_[j].is_empty()))
+                .max()
+                .unwrap_or(0);
             // `0 <= v < max_cardinality` with v an integer-valued f64.
             if v >= 0.0 && v < max_cardinality as f64 {
                 return Err(FerroError::InvalidParameter {
@@ -719,6 +1079,9 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
             category_to_index,
             handle_unknown: self.handle_unknown,
             unknown_value: self.unknown_value,
+            infrequent_indices_,
+            infrequent_map,
+            n_frequent,
         })
     }
 }
@@ -775,12 +1138,27 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
 
         for j in 0..n_features {
             let map = &self.category_to_index[j];
+            // Per-feature infrequent remapping (REQ-8): a found category's
+            // `categories[j]` index is routed through `infrequent_map[j]` to its
+            // emitted ordinal code (a frequent category → its remapped slot
+            // `0..n_frequent`, an infrequent category → the shared trailing code
+            // `n_frequent`), mirroring sklearn `_map_infrequent_categories`
+            // (`_encoders.py:402-452`: `X_int = np.take(mapping, X_int)`). With
+            // grouping DISABLED `infrequent_map[j]` is the identity, so the code
+            // equals `idx` — the SHIPPED REQ-2 behaviour is UNCHANGED.
+            let imap = self.infrequent_map.get(j);
             for i in 0..n_samples {
                 let cat = &x[[i, j]];
                 match map.get(cat) {
-                    // Cast the ordinal index to f64 (sklearn's float64 default,
-                    // `_encoders.py:1262`). Lossless: indices are < 2^53.
-                    Some(&idx) => out[[i, j]] = ordinal_index_to_f64(idx),
+                    // Route the category index through the infrequent map, then
+                    // cast the resulting ordinal code to f64 (sklearn's float64
+                    // default, `_encoders.py:1262`). Lossless: codes are < 2^53.
+                    // Bounds-safe: `imap.get(idx)` falls back to the raw `idx`
+                    // (R-CODE-2) — `imap` always has `categories[j].len()` entries.
+                    Some(&idx) => {
+                        let code = imap.and_then(|m| m.get(idx)).copied().unwrap_or(idx);
+                        out[[i, j]] = ordinal_index_to_f64(code);
+                    }
                     None => match self.handle_unknown {
                         // handle_unknown='use_encoded_value': write the sentinel
                         // (which may be NaN). sklearn `_encoders.py:1591`
