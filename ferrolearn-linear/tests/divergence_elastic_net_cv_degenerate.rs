@@ -67,7 +67,6 @@ fn seed1_x() -> Array2<f64> {
 /// ferrolearn returns `alpha_ = 1e-6`.
 /// Tracking: #2243
 #[test]
-#[ignore = "divergence: ElasticNetCV degenerate alpha_max fills 1e-6 not np.finfo.resolution 1e-15; tracking #2243"]
 fn divergence_elastic_net_cv_degenerate_alpha_max_constant_y() {
     let x = seed1_x();
     let y = Array1::from_elem(12, 7.0);

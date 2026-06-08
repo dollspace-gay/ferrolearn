@@ -387,10 +387,24 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
             // Generate alpha grid for this l1_ratio.
             let alpha_max = compute_alpha_max_enet(x, y, l1_ratio, self.fit_intercept);
-            let alpha_grid = if alpha_max <= F::zero() {
-                vec![F::from(1e-6).unwrap(); self.n_alphas]
+            // Degenerate branch: when y is constant the centered cross-product is
+            // all-zero, so alpha_max == 0. sklearn's `_alpha_grid`
+            // (`_coordinate_descent.py:180-183`) tests `alpha_max <=
+            // np.finfo(float).resolution` and fills the whole grid with that same
+            // resolution. `np.finfo(float)` is ALWAYS np.float64 regardless of the
+            // input dtype, so the resolution is the constant 1e-15 for both f32 and
+            // f64 (verified live: float32 constant-y input also yields 1e-15, NOT
+            // the f32 resolution 1e-6). `unwrap_or_else(F::epsilon)` keeps this
+            // panic-free (R-CODE-2); 1e-15 is representable in both f32 and f64.
+            let resolution = F::from(1e-15_f64).unwrap_or_else(F::epsilon);
+            let alpha_grid = if alpha_max <= resolution {
+                vec![resolution; self.n_alphas]
             } else {
-                logspace(alpha_max, F::from(1e-3).unwrap(), self.n_alphas)
+                logspace(
+                    alpha_max,
+                    F::from(1e-3).unwrap_or_else(F::epsilon),
+                    self.n_alphas,
+                )
             };
 
             for &alpha in &alpha_grid {
