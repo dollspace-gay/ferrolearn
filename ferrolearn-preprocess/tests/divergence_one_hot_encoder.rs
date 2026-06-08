@@ -283,3 +283,284 @@ fn zero_row_fit_errors_vs_sklearn_oracle() {
         "0-row fit must error, matching sklearn's minimum-1-sample requirement"
     );
 }
+
+// ---------------------------------------------------------------------------
+// REQ-6 — inverse_transform (argmax + all-zero error) == sklearn EXACTLY.
+// ---------------------------------------------------------------------------
+
+/// `inverse_transform(transform(X)) == X` for the multi-feature fixture with the
+/// NON-contiguous column `{2,5,9}`. Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.,0.],[5.,1.],[9.,0.],[5.,1.]]); \
+///   print(e.inverse_transform(e.transform([[2.,0.],[5.,1.],[9.,0.],[5.,1.]])).tolist())"
+///   -> [[2.0, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]]
+/// ```
+#[test]
+fn inverse_transform_roundtrip_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    //   [[2.0, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]]
+    let sklearn_expected: Array2<f64> = array![[2.0, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let encoded = fitted.transform(&x).unwrap();
+    let recovered = fitted.inverse_transform(&encoded).unwrap();
+    assert_eq!(
+        recovered, sklearn_expected,
+        "inverse_transform(transform(X)) vs sklearn oracle"
+    );
+    // And it recovers the original input exactly.
+    assert_eq!(recovered, x, "inverse roundtrip recovers original X");
+}
+
+/// `inverse_transform` of a HELD-OUT clean one-hot matrix (not produced by this
+/// fitted encoder's own transform): `[[0,1,0,1,0]]` -> `[[5,0]]` — col0 argmax
+/// at block index 1 (category `5`), col1 argmax at block index 0 (category `0`).
+/// Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.,0.],[5.,1.],[9.,0.],[5.,1.]]); \
+///   print(e.inverse_transform([[0,1,0,1,0]]).tolist())"
+///   -> [[5.0, 0.0]]
+/// ```
+#[test]
+fn inverse_transform_held_out_one_hot_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp): [[5.0, 0.0]]
+    let sklearn_expected: Array2<f64> = array![[5.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let held_out = array![[0.0_f64, 1.0, 0.0, 1.0, 0.0]];
+    let recovered = fitted.inverse_transform(&held_out).unwrap();
+    assert_eq!(
+        recovered, sklearn_expected,
+        "inverse_transform([[0,1,0,1,0]]) vs sklearn oracle"
+    );
+}
+
+/// `inverse_transform` over MULTIPLE feature blocks (2,3,2) with a clean one-hot
+/// per block recovers the original rows. Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[0.,1.,8.],[1.,3.,9.],[0.,5.,8.],[1.,1.,9.]]; \
+///   e=OneHotEncoder(sparse_output=False).fit(X); \
+///   print(e.inverse_transform(e.transform(X)).tolist())"
+///   -> [[0.0, 1.0, 8.0], [1.0, 3.0, 9.0], [0.0, 5.0, 8.0], [1.0, 1.0, 9.0]]
+/// ```
+#[test]
+fn inverse_transform_multiblock_argmax_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    let sklearn_expected: Array2<f64> = array![
+        [0.0, 1.0, 8.0],
+        [1.0, 3.0, 9.0],
+        [0.0, 5.0, 8.0],
+        [1.0, 1.0, 9.0],
+    ];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![
+        [0.0_f64, 1.0, 8.0],
+        [1.0, 3.0, 9.0],
+        [0.0, 5.0, 8.0],
+        [1.0, 1.0, 9.0],
+    ];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let encoded = fitted.transform(&x).unwrap();
+    let recovered = fitted.inverse_transform(&encoded).unwrap();
+    assert_eq!(
+        recovered, sklearn_expected,
+        "multiblock inverse_transform vs sklearn oracle"
+    );
+}
+
+/// An ALL-ZERO per-feature block cannot be inverted (drop=None,
+/// handle_unknown='error') -> Err, matching live sklearn's ValueError.
+/// Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.,0.],[5.,1.],[9.,0.],[5.,1.]]); \
+///   e.inverse_transform([[0,0,0,0,0]])"
+///   -> ValueError: Samples [0] can not be inverted when drop=None and
+///      handle_unknown='error' because they contain all zeros
+/// ```
+#[test]
+fn inverse_transform_all_zero_block_errors_vs_sklearn_oracle() {
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let all_zero = array![[0.0_f64, 0.0, 0.0, 0.0, 0.0]];
+    let err = fitted.inverse_transform(&all_zero);
+    assert!(
+        err.is_err(),
+        "all-zero block must error (sklearn ValueError 'can not be inverted ... all zeros')"
+    );
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("can not be inverted") && msg.contains("all zeros"),
+        "error message should mirror sklearn's all-zeros ValueError, got: {msg}"
+    );
+}
+
+/// `inverse_transform` with the wrong number of columns -> Err (sklearn's
+/// "Shape of the passed X data is not correct" ValueError).
+/// Live sklearn: fit a 5-output encoder, `inverse_transform([[0,1,0]])`
+/// -> ValueError "Expected 5 columns, got 3".
+#[test]
+fn inverse_transform_ncols_mismatch_errors_vs_sklearn_oracle() {
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let bad = array![[0.0_f64, 1.0, 0.0]]; // 3 cols, expected n_output == 5
+    assert!(
+        fitted.inverse_transform(&bad).is_err(),
+        "ncols != n_output must error (ShapeMismatch), matching sklearn"
+    );
+}
+
+/// `inverse_transform` of a 0-row matrix -> Err (sklearn check_array min-1-sample).
+#[test]
+fn inverse_transform_zero_row_errors() {
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let empty: Array2<f64> = Array2::zeros((0, 5));
+    assert!(
+        fitted.inverse_transform(&empty).is_err(),
+        "0-row inverse_transform must error (InsufficientSamples)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-6 — get_feature_names_out == sklearn EXACTLY (float label formatting).
+// ---------------------------------------------------------------------------
+
+/// `get_feature_names_out` for WHOLE-NUMBER categories == live sklearn EXACTLY:
+/// `['x0_2.0','x0_5.0','x0_9.0','x1_0.0','x1_1.0']` (default input_features
+/// `x0`,`x1`; the `.0` is Python `str(np.float64)` rendering of whole floats).
+/// Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.,0.],[5.,1.],[9.,0.],[5.,1.]]); \
+///   print(list(e.get_feature_names_out()))"
+///   -> ['x0_2.0', 'x0_5.0', 'x0_9.0', 'x1_0.0', 'x1_1.0']
+/// ```
+#[test]
+fn get_feature_names_out_whole_numbers_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    let sklearn_expected = ["x0_2.0", "x0_5.0", "x0_9.0", "x1_0.0", "x1_1.0"];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        sklearn_expected,
+        "get_feature_names_out (whole numbers) vs sklearn oracle"
+    );
+}
+
+/// `get_feature_names_out` with a FRACTIONAL category renders `2.5` as `x0_2.5`.
+/// Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.5,0.],[5.,1.]]); \
+///   print(list(e.get_feature_names_out()))"
+///   -> ['x0_2.5', 'x0_5.0', 'x1_0.0', 'x1_1.0']
+/// ```
+#[test]
+fn get_feature_names_out_fractional_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    let sklearn_expected = ["x0_2.5", "x0_5.0", "x1_0.0", "x1_1.0"];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.5_f64, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        sklearn_expected,
+        "get_feature_names_out (fractional 2.5) vs sklearn oracle"
+    );
+}
+
+/// `get_feature_names_out` with a NEGATIVE whole category renders `-3.0` as
+/// `x0_-3.0`. Live sklearn:
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[-3.,0.],[5.,1.]]); \
+///   print(list(e.get_feature_names_out()))"
+///   -> ['x0_-3.0', 'x0_5.0', 'x1_0.0', 'x1_1.0']
+/// ```
+#[test]
+fn get_feature_names_out_negative_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    let sklearn_expected = ["x0_-3.0", "x0_5.0", "x1_0.0", "x1_1.0"];
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[-3.0_f64, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        sklearn_expected,
+        "get_feature_names_out (negative -3.0) vs sklearn oracle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-6 DIVERGENCE — inverse_transform does NOT validate NaN/inf input.
+// tracking #2224
+// ---------------------------------------------------------------------------
+
+/// Divergence: ferrolearn's `FittedOneHotEncoder::inverse_transform`
+/// (`ferrolearn-preprocess/src/one_hot_encoder.rs:182`) diverges from
+/// `sklearn/preprocessing/_encoders.py:1092` for an encoded matrix that
+/// contains a `NaN` (or `inf`).
+///
+/// sklearn's `inverse_transform` runs
+/// `X = check_array(X, accept_sparse="csr")` (`_encoders.py:1092`) with the
+/// default `force_all_finite=True`, so ANY non-finite cell in the input matrix
+/// raises before the argmax ever runs:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.],[5.],[9.]]); \
+///   e.inverse_transform(np.array([[0.0, np.nan, 0.0]]))"
+///   -> ValueError: Input contains NaN.
+/// python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False).fit([[2.],[5.],[9.]]); \
+///   e.inverse_transform(np.array([[np.inf, 0.0, 0.0]]))"
+///   -> ValueError: Input contains infinity or a value too large for dtype('float64').
+/// ```
+///
+/// ferrolearn performs NO finiteness check: for `[[0, NaN, 0]]` the block sum is
+/// `NaN` (so `block_sum == 0` is false → no all-zero error) and the argmax loop
+/// `v > max_val` skips the `NaN`, leaving `argmax = 0`, so it returns
+/// `Ok([[2.0]])` instead of erroring. Likewise `[[inf, 0, 0]]` returns
+/// `Ok([[inf... → 2.0]])`. sklearn ERRORS; ferrolearn returns `Ok`.
+///
+/// This is a release-blocker observable-behavior divergence (sklearn raises a
+/// `ValueError`, ferrolearn silently produces output) and is NOT covered by the
+/// 8 REQ-6 tests nor by the documented extreme-magnitude float-label divergence.
+#[test]
+#[ignore = "divergence: inverse_transform lacks NaN/inf input validation (sklearn check_array errors); tracking #2224"]
+fn inverse_transform_nan_input_errors_vs_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, run from /tmp):
+    //   inverse_transform([[0.0, nan, 0.0]]) -> ValueError: Input contains NaN.
+    //   inverse_transform([[inf, 0.0, 0.0]]) -> ValueError: Input contains infinity ...
+    let enc = OneHotEncoder::<f64>::new();
+    let x = array![[2.0_f64], [5.0], [9.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // A block with a NaN: sklearn errors at check_array; ferrolearn must too.
+    let nan_block = array![[0.0_f64, f64::NAN, 0.0]];
+    assert!(
+        fitted.inverse_transform(&nan_block).is_err(),
+        "inverse_transform of a NaN-containing matrix must error, matching sklearn's \
+         check_array `ValueError: Input contains NaN.` (_encoders.py:1092); \
+         ferrolearn silently returns Ok"
+    );
+
+    // A block with an inf: sklearn errors at check_array; ferrolearn must too.
+    let inf_block = array![[f64::INFINITY, 0.0, 0.0]];
+    assert!(
+        fitted.inverse_transform(&inf_block).is_err(),
+        "inverse_transform of an inf-containing matrix must error, matching sklearn's \
+         check_array `ValueError: Input contains infinity ...` (_encoders.py:1092); \
+         ferrolearn silently returns Ok"
+    );
+}
