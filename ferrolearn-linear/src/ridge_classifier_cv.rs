@@ -37,6 +37,49 @@
 //! | REQ-11a (store_cv_results/cv_results_) | SHIPPED | #2248. `RidgeClassifierCV<F>` adds `pub store_cv_results: bool` (default `false`, mirroring sklearn's documented default, `_ridge.py:2547`/`:2727`; the ctor `store_cv_results=None` sentinel resolves to `False`, `_ridge.py:2349-2350`) + `with_store_cv_results` builder + getter. `fn gcv_scores_svd`/`fn gcv_scores_eigen in ridge_classifier_cv.rs` retain the un-summed per-sample-per-target squared LOO errors `(c / G_inverse_diag)²` (the SAME terms the alpha-selection sums) into an `Array3<F>` shaped `(n_samples, n_targets, n_alphas)` — alpha axis = input `alphas` order, target axis = indicator columns — mirroring sklearn `cv_results_` (`squared_errors.ravel()`, `_ridge.py:2152`; reshape to `(n_samples, n_y, n_alphas)`, `_ridge.py:2199-2204`). `FittedRidgeClassifierCV<F>` stores `cv_results_: Option<Array3<F>>` + `pub fn cv_results(&self) -> Option<&Array3<F>>` (`None` when `store_cv_results=false`). The selection sum is byte-identical regardless of the flag, so `alpha_`/`coef_`/`predict` are unchanged. Non-test consumer: crate-root re-export `pub use ridge_classifier_cv::{RidgeClassifierCV, FittedRidgeClassifierCV}` in `lib.rs`. Verification (live sklearn 1.5.2, R-CHAR-3): binary `store_cv_results=True` on `oracle_x`, `y=[0,0,0,0,0,1,1,1]`, `alphas=[0.1,1,10]` → `cv_results_` shape `(8,1,3)` values `[[0.01905,0.014503,0.000155],…,[0.595118,0.52245,0.111111]]`; 3-class `y=[0,0,1,1,2,2,1,0]` → `(8,3,3)` per-target; non-monotone `alphas=[10,0.1,1]` → axis-0 ↔ alpha 10. Tests `ridge_classifier_cv_store_cv_results_binary_matches_sklearn`, `…_multiclass_…`, `…_none_default`, `…_alpha_axis_order` PASS. |
 //! | REQ-11b (scoring/cv/class_weight/store_cv_values ctor params) | NOT-STARTED | #2248. sklearn's `RidgeClassifierCV` ctor also exposes `scoring` (when set, `cv_results_` stores predictions/scores not squared errors, `_ridge.py:2153-2156`/`:2211-2218`), `cv` (actual k-fold instead of the GCV path), `class_weight` (`_ridge.py:2812`/`:2836`), and the DEPRECATED `store_cv_values` alias (`_ridge.py:2826`/`:2333-2348`). ferrolearn carries only `alphas`/`fit_intercept`/`store_cv_results`; these remain unimplemented. |
 //!
+//! ## Documented precision caveat — eigen-path alpha selection at a degenerate
+//! fp-tie (#2253)
+//!
+//! On a DEGENERATE eigen-path fixture where the closed-form leave-one-out
+//! squared errors are mathematically equal across every candidate `alpha` — a
+//! near-perfect-fit point such as `RidgeClassifierCV(alphas=[0.1,1,10])` on the
+//! 2-sample / 2-feature `X=[[1,2],[6,5]]`, `y=[0,1]` (`n_samples (2) <=
+//! n_features (2)` → the `gcv_scores_eigen` Gram path) — ferrolearn's selected
+//! `alpha_` can diverge from scikit-learn's by the floating-point ORDER of the
+//! eigendecomposition, NOT by any formula difference.
+//!
+//! The GCV formula here is byte-for-byte structurally identical to sklearn's
+//! `_solve_eigen_gram` (`_ridge.py:1914-1933`): `w = 1/(eigvals+alpha)`,
+//! intercept-dim regularization cancelled (`_ridge.py:1928`), `c = Q·(w⊙Qᵀy)`
+//! (`_ridge.py:1930`), `G_inverse_diag = Σ_j w_j Q[:,j]²` (`_ridge.py:1931`),
+//! `squared_errors = (c/G_inverse_diag)²` (`_ridge.py:2149`), `score =
+//! -squared_errors.mean()` (`_ridge.py:2148`/`:2216`), strict `> best_score`
+//! update keeping the first/smallest-index alpha on a tie (`_ridge.py:2185`).
+//! The DIVERGENCE is upstream of that formula: at the degenerate Gram matrix
+//! `K = [[9.5,-7.5],[-7.5,9.5]]` the symmetric eigenvector entry is exactly
+//! `±1/√2`, but ferray's `eigh` (`ferray-linalg/src/decomp/eigen.rs`) rounds it
+//! to `0x3fe6a09e667f3bcd = 0.707106781186547_6` while scipy's LAPACK rounds to
+//! `0x3fe6a09e667f3bcc = 0.707106781186547_5` (a 1-ULP difference). With
+//! ferray's value the scalar-accumulated `(c/G_inverse_diag)²` collapses to
+//! bit-exact `4.0` for ALL three alphas (a TRUE tie → first-wins keeps
+//! `alpha_=0.1`), whereas scipy's LAPACK rounding leaves a ~2e-15 excess on the
+//! smaller-alpha means (`4.000000000000002, 4.000000000000002, 4.0`) so
+//! sklearn's strict-max picks `alpha_=10.0`.
+//!
+//! The mathematically-exact LOO squared error at this degenerate 2-point
+//! perfect-fit is the SAME constant for every alpha — sklearn's choice rests
+//! entirely on a 2e-15 fp-noise spread its LAPACK eigendecomposition happens to
+//! retain and ours happens to erase. No formula change reproduces scipy's exact
+//! spread without bit-replicating LAPACK's eigendecomposition, so this is the
+//! R-DEV-1 "documented tolerances where sklearn is NOT deterministic" boundary
+//! (analogous to the f32-ABI / RNG-order caveats), NOT a fixable divergence. The
+//! NON-degenerate eigen/SVD-path `alpha_`/`cv_results_` stay bit-exact (the
+//! `ridge_classifier_cv_*_matches_sklearn` + `…_store_cv_results_*` oracle tests
+//! and the 1-D `ridge_cv` GCV pins remain green); the caveat is STRICTLY the
+//! degenerate fp-tie. The pin
+//! `divergence_ridge_classifier_cv_alpha_select_n2_eigen`
+//! (`tests/divergence_ridge_classifier_cv_alpha_tie.rs`) stays `#[ignore]` with
+//! this rationale.
 //! # Examples
 //!
 //! ```

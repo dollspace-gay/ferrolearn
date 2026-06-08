@@ -42,7 +42,18 @@ use ndarray::{Array2, array};
 ///
 /// Tracking: #2253
 #[test]
-#[ignore = "divergence: RidgeClassifierCV alpha_ tie-break (eigen path all-4.0 vs sklearn 10.0) on n=2; tracking #2253"]
+#[ignore = "documented precision caveat #2253: eigen-path GCV alpha selection at a \
+            degenerate fp-tie. ferray's eigh rounds the symmetric eigenvector to \
+            0.7071067811865476 (1 ULP from scipy LAPACK's 0.7071067811865475), \
+            collapsing every per-alpha (c/G_inverse_diag)^2 to bit-exact 4.0 (a TRUE \
+            tie -> first-wins alpha_=0.1) whereas scipy's LAPACK rounding retains a \
+            ~2e-15 spread (4.000000000000002, 4.000000000000002, 4.0) so sklearn's \
+            strict-> picks alpha_=10.0. The GCV formula is byte-identical to sklearn's \
+            _solve_eigen_gram; the divergence is purely the LAPACK fp-order at the \
+            degenerate Gram matrix and is unmatchable without bit-replicating LAPACK's \
+            eigendecomposition (R-DEV-1 non-deterministic-tolerance boundary). See the \
+            module //! caveat in src/ridge_classifier_cv.rs. Non-degenerate alpha_ is \
+            bit-exact."]
 fn divergence_ridge_classifier_cv_alpha_select_n2_eigen() {
     let x = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 6.0, 5.0]).unwrap();
     let y = array![0usize, 1];
