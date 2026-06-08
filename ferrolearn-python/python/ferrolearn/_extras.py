@@ -57,6 +57,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsNystroem,
     _RsOPTICS,
     _RsOneHotEncoder,
+    _RsOrdinalEncoder,
     _RsOrthogonalMatchingPursuit,
     _RsPolynomialFeatures,
     _RsPowerTransformer,
@@ -2754,6 +2755,221 @@ class OneHotEncoder(_TransformerWrapper):
         if np.issubdtype(self._fitted_dtype, np.integer):
             return [c.astype(self._fitted_dtype) for c in raw]
         return raw
+
+    @property
+    def n_features_in_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_features_in_)
+
+
+class OrdinalEncoder(BaseEstimator):
+    """Encode categorical STRING features as an ordinal integer array, backed by
+    Rust (#1167, REQ-12).
+
+    Mirrors ``sklearn.preprocessing.OrdinalEncoder``
+    (``sklearn/preprocessing/_encoders.py:1235-1679``) for the STRING input path.
+    Each input column's categories are mapped to integers ``0..n_categories-1``;
+    with ``categories='auto'`` the per-column category set is the sorted-unique
+    values, with an explicit ``categories=[list, ...]`` the lists are used in the
+    GIVEN order. The output is ``float64`` (sklearn's ``dtype=np.float64`` default,
+    ``_encoders.py:1439``).
+
+    This is the FIRST string-input ferrolearn binding: ``fit``/``transform`` accept
+    a numpy str/object 2-D array OR a Python list-of-lists of str (converted by
+    ``_to_rows`` to ``list[list[str]]`` across the Rust ABI), ``transform`` returns
+    a float64 numpy array, and ``inverse_transform`` returns a numpy object array
+    of the original strings.
+
+    The constructor mirrors sklearn's KEYWORD-ONLY signature ``__init__(self, *,
+    categories="auto", dtype=np.float64, handle_unknown="error",
+    unknown_value=None, encoded_missing_value=np.nan, min_frequency=None,
+    max_categories=None)`` (``_encoders.py:1435-1452``). All 7 params are held for
+    ``get_params``/``set_params``/``clone`` round-trip; ``categories``,
+    ``handle_unknown`` and ``unknown_value`` are threaded into the Rust core.
+
+    STATEFUL: must be ``fit`` before ``transform``/``inverse_transform``/attribute
+    access. Pre-fit access raises ``NotFittedError`` (via ``check_is_fitted`` on
+    ``_rs``), matching sklearn.
+
+    Fitted attributes surfaced from the Rust fitted type:
+
+    - ``categories_`` (a LIST of 1-D str arrays, one per input feature,
+      ``_encoders.py:1319``): the per-feature category set;
+    - ``n_features_in_`` (int): number of input feature columns.
+
+    ``get_feature_names_out(input_features=None)`` returns ``['x0', 'x1', ...]``
+    (``OneToOneFeatureMixin``); a non-None ``input_features`` is passed through
+    verbatim (matching sklearn, which uses ``input_features`` as the output names).
+
+    SCOPE (honest, R-HONEST-3 — does NOT match sklearn in every regime; the gaps
+    are SURFACED as errors, never silently mismatched):
+
+    - ``handle_unknown``: ``'error'`` (default) and ``'use_encoded_value'`` (with
+      an ``unknown_value`` sentinel) are supported; any other string raises
+      ``ValueError`` (sklearn ``InvalidParameterError ⊂ ValueError``,
+      ``_encoders.py:1425``).
+    - ``encoded_missing_value`` (REQ-6 NOT-STARTED #1161): a NON-NaN value raises
+      ``NotImplementedError`` (the Rust core has no missing-value concept).
+    - ``min_frequency``/``max_categories`` (REQ-8 NOT-STARTED #1163): a non-None
+      value raises ``NotImplementedError`` (no infrequent grouping).
+    - ``dtype``: only ``np.float64`` is supported (the Rust output is f64,
+      ``_encoders.py:1439``); a non-float64 dtype raises ``NotImplementedError``
+      (configurable dtype is REQ-3 follow-on #1158).
+    - input is STRING-only (``Array2<String>``, REQ-4 NOT-STARTED #1159); numeric
+      input is coerced to str by ``_to_rows`` (sklearn accepts object/str arrays).
+
+    ``inverse_transform``: with ``handle_unknown='use_encoded_value'`` a cell equal
+    to ``unknown_value`` inverts to ``None`` in sklearn; the Rust core's
+    ``Array2<String>`` cannot represent ``None`` (ordinal_encoder.rs REQ-9 scope),
+    so such a cell raises ``ValueError`` (documented divergence). The default
+    ``'error'``-mode inverse is COMPLETE and bit-exact.
+    """
+
+    def __init__(self, *, categories="auto", dtype=np.float64,
+                 handle_unknown="error", unknown_value=None,
+                 encoded_missing_value=np.nan, min_frequency=None,
+                 max_categories=None):
+        self.categories = categories
+        self.dtype = dtype
+        self.handle_unknown = handle_unknown
+        self.unknown_value = unknown_value
+        self.encoded_missing_value = encoded_missing_value
+        self.min_frequency = min_frequency
+        self.max_categories = max_categories
+
+    @staticmethod
+    def _to_rows(X):
+        # Convert the input (a numpy str/object 2-D array OR a list-of-lists) to a
+        # Python `list[list[str]]` for the Rust ABI. sklearn accepts object/str
+        # arrays (`_check_X` -> `check_array(dtype=None)`, `_encoders.py:45`); we
+        # coerce every cell to `str` (matching `np.asarray(X).astype(str)`). A
+        # non-2-D input raises ValueError (sklearn `check_array` requires 2-D).
+        arr = np.asarray(X)
+        if arr.ndim != 2:
+            raise ValueError(
+                f"Expected a 2D array, got an array with {arr.ndim} dimension(s)."
+            )
+        # ferrolearn's OrdinalEncoder core is STRING-only and sorts its categories
+        # LEXICOGRAPHICALLY; sklearn sorts NUMERIC categories numerically (1,2,10
+        # not '1','10','2'). Coercing numeric input via `.astype(str)` would
+        # silently produce WRONG ordinals (#2230), so REJECT numeric-dtype input
+        # rather than mis-encode it (numeric/mixed-dtype input is REQ-4
+        # NOT-STARTED). String/object arrays are accepted (sklearn `check_array(
+        # dtype=None)`, `_encoders.py:45`); a string column that happens to look
+        # numeric is still string-sorted, matching sklearn for string input.
+        if np.issubdtype(arr.dtype, np.number):
+            raise NotImplementedError(
+                "ferrolearn OrdinalEncoder is string-only; numeric/mixed-dtype "
+                "input is not yet supported (REQ-4): the core sorts categories "
+                "lexicographically, which would give wrong ordinals for numeric "
+                "categories (e.g. 1, 10, 2). Pass string categories."
+            )
+        # `.astype(str)` coerces object/str cells; `.tolist()` yields nested str lists.
+        return arr.astype(str).tolist()
+
+    def _check_unsupported(self):
+        # Surface the NOT-STARTED scope HONESTLY (R-HONEST-3): a NON-default value
+        # for a param ferrolearn cannot honor raises rather than silently
+        # mismatching sklearn. These are accepted at __init__ for get_params/clone
+        # ABI parity.
+        # dtype: only float64 (the Rust core's output is f64, `_encoders.py:1439`);
+        # a configurable dtype is REQ-3 follow-on #1158.
+        if self.dtype is not np.float64 and self.dtype != np.float64:
+            raise NotImplementedError(
+                "ferrolearn OrdinalEncoder only supports dtype=np.float64 "
+                "(configurable output dtype is ordinal_encoder.rs REQ-3 follow-on "
+                "#1158)."
+            )
+        # encoded_missing_value: default np.nan; a non-NaN value needs a
+        # missing-value concept the Rust core lacks (REQ-6 NOT-STARTED #1161).
+        emv = self.encoded_missing_value
+        emv_is_nan = isinstance(emv, float) and np.isnan(emv)
+        if not emv_is_nan:
+            raise NotImplementedError(
+                "ferrolearn OrdinalEncoder does not support a non-NaN "
+                "encoded_missing_value (missing-value encoding is "
+                "ordinal_encoder.rs REQ-6 NOT-STARTED #1161)."
+            )
+        if self.min_frequency is not None:
+            raise NotImplementedError(
+                "ferrolearn OrdinalEncoder does not support min_frequency "
+                "(infrequent grouping is ordinal_encoder.rs REQ-8 NOT-STARTED "
+                "#1163)."
+            )
+        if self.max_categories is not None:
+            raise NotImplementedError(
+                "ferrolearn OrdinalEncoder does not support max_categories "
+                "(infrequent grouping is ordinal_encoder.rs REQ-8 NOT-STARTED "
+                "#1163)."
+            )
+
+    def _make_rs(self):
+        # `categories`, `handle_unknown`, and `unknown_value` are threaded into the
+        # Rust core. `categories='auto'` -> None (Categories::Auto); an explicit
+        # list -> a list-of-lists of str (Categories::Explicit). The bad-string
+        # ValueError surfaces from the Rust ctor/fit (`_encoders.py:1425`).
+        if self.categories == "auto":
+            cats = None
+        else:
+            # An explicit list of array-likes: coerce each to a Python list of str
+            # (matching sklearn `np.array(self.categories[i], dtype=object)`).
+            cats = [[str(c) for c in col] for col in self.categories]
+        uv = None if self.unknown_value is None else float(self.unknown_value)
+        return _RsOrdinalEncoder(handle_unknown=self.handle_unknown,
+                                 unknown_value=uv, categories=cats)
+
+    def fit(self, X, y=None):
+        # STATEFUL fit: validate the unsupported scope, build + fit the Rust core.
+        # `check_is_fitted` keys off `_rs`.
+        self._check_unsupported()
+        self._rs = self._make_rs()
+        self._rs.fit(self._to_rows(X))
+        return self
+
+    def fit_transform(self, X, y=None):
+        # sklearn's TransformerMixin.fit_transform; OrdinalEncoder is the rare
+        # estimator that does NOT inherit TransformerMixin's fit_transform here
+        # (it subclasses only BaseEstimator), so provide it explicitly.
+        return self.fit(X, y).transform(X)
+
+    def transform(self, X):
+        # sklearn `transform` calls `check_is_fitted` (`_encoders.py:1577`),
+        # raising NotFittedError before any work.
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.transform(self._to_rows(X)), dtype=np.float64)
+
+    def inverse_transform(self, X):
+        # sklearn `inverse_transform(self, X)` (`_encoders.py:1595`): map each
+        # ordinal index back to its category string. The Rust core returns a
+        # `list[list[str]]`; marshal to a numpy OBJECT array (matching sklearn's
+        # object-dtype string output, `_encoders.py:1624`). A `use_encoded_value`
+        # cell equal to `unknown_value` raises ValueError (the Rust core cannot
+        # produce sklearn's `None`, ordinal_encoder.rs REQ-9 scope, #1167).
+        check_is_fitted(self, "_rs")
+        rows = self._rs.inverse_transform(np.ascontiguousarray(X, dtype=np.float64))
+        return np.asarray(rows, dtype=object)
+
+    def get_feature_names_out(self, input_features=None):
+        # sklearn `OneToOneFeatureMixin.get_feature_names_out`: one output name per
+        # input feature. `input_features=None` -> `['x0', 'x1', ...]`; a non-None
+        # `input_features` is used verbatim as the output names (sklearn passes it
+        # through `_check_feature_names_in`).
+        check_is_fitted(self, "_rs")
+        if input_features is None:
+            return np.asarray(self._rs.feature_names_out, dtype=object)
+        n = int(self._rs.n_features_in_)
+        names = np.asarray(input_features, dtype=object)
+        if names.shape[0] != n:
+            raise ValueError(
+                "input_features should have length equal to number of features "
+                f"({n}), got {names.shape[0]}."
+            )
+        return names
+
+    @property
+    def categories_(self):
+        check_is_fitted(self, "_rs")
+        return [np.asarray(c, dtype=object) for c in self._rs.categories_]
 
     @property
     def n_features_in_(self):

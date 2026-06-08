@@ -3859,6 +3859,238 @@ impl RsOneHotEncoder {
     }
 }
 
+// OrdinalEncoder (#1167, REQ-12): hand-written pyclass (not the `py_transformer!`
+// macro) — it is the FIRST STRING-INPUT binding: `fit`/`transform` take a Python
+// list-of-lists of `str` (marshalled via PyO3's `Vec<Vec<String>>` extraction,
+// NOT a numpy f64 array), `transform` returns `Array2<f64>`, and
+// `inverse_transform` returns string rows. It is STATEFUL with a string→enum knob
+// (`handle_unknown`) AND an `inverse_transform` method AND a ragged `categories_`
+// (a Python list of per-feature str arrays) the macro cannot express. Over
+// `ferrolearn_preprocess::{OrdinalEncoder, FittedOrdinalEncoder, HandleUnknown,
+// Categories}`.
+//
+// sklearn's ctor is keyword-only `__init__(self, *, categories="auto",
+// dtype=np.float64, handle_unknown="error", unknown_value=None,
+// encoded_missing_value=np.nan, min_frequency=None, max_categories=None)`
+// (`sklearn/preprocessing/_encoders.py:1435-1452`). The Python wrapper owns that
+// full 7-key ABI (for `get_params`/`clone` parity); this `_RsOrdinalEncoder`
+// takes only the three knobs the String path consumes: `handle_unknown`
+// (default "error"), `unknown_value` (`Option<f64>`, default None), and
+// `categories` (`Option<Vec<Vec<String>>>`, None → `Categories::Auto`, Some →
+// `Categories::Explicit`). The string is mapped to `HandleUnknown` via
+// `resolve_handle_unknown`: "error"→`Error`, "use_encoded_value"→`UseEncodedValue`;
+// any other string is sklearn's `InvalidParameterError` (⊂ ValueError,
+// `_encoders.py:1425` `StrOptions({"error","use_encoded_value"})`), surfaced as
+// `PyValueError`.
+//
+// STRING I/O marshalling: `fit(rows)`/`transform(rows)` extract a Python
+// `list[list[str]]` to `Vec<Vec<String>>`, validate the rows are rectangular
+// (all the same length, else `PyValueError` — sklearn `check_array` raises on a
+// ragged input), and build `Array2<String>` via `Array2::from_shape_vec`.
+// `inverse_transform(x: PyReadonlyArray2<f64>)` returns the
+// `FittedOrdinalEncoder::inverse_transform` output as `Vec<Vec<String>>` (→ a
+// Python list-of-lists of str). The `use_encoded_value`→None inverse ERRORS (the
+// `Array2<String>` core cannot represent None, ordinal_encoder.rs REQ-9 scope) →
+// `PyValueError` (documented).
+//
+// SCOPE (honest, R-HONEST-3): the core is STRING-ONLY (`Array2<String>` input,
+// REQ-4 NOT-STARTED #1159). `encoded_missing_value` (REQ-6 #1161),
+// `min_frequency`/`max_categories` (REQ-8 #1163), and a non-float64 `dtype`
+// (REQ-3 follow-on #1158) are owned by the Python wrapper (a non-default value →
+// `NotImplementedError`). Output is fixed-`f64`.
+//
+// `fit` runs `OrdinalEncoder::fit` (the REQ-5 handle_unknown/unknown_value
+// validations + the REQ-7 explicit-categories validations → `FerroError` →
+// `PyValueError`). `transform`/`inverse_transform` delegate to the fitted type.
+// `categories_` is the per-feature `&[Vec<String>]` marshalled as a Python LIST
+// of str arrays (ragged); `get_feature_names_out()`/`n_features_in_` are the
+// feature-name list / feature count.
+#[pyclass(name = "_RsOrdinalEncoder")]
+pub struct RsOrdinalEncoder {
+    handle_unknown: String,
+    unknown_value: Option<f64>,
+    // None → `Categories::Auto`; Some(lists) → `Categories::Explicit(lists)`.
+    categories: Option<Vec<Vec<String>>>,
+    // `FittedOrdinalEncoder` is re-exported at the crate root
+    // (`ferrolearn-preprocess/src/lib.rs:142`).
+    fitted: Option<ferrolearn_preprocess::FittedOrdinalEncoder>,
+}
+
+impl RsOrdinalEncoder {
+    // Map sklearn's `handle_unknown` string to the closed Rust `HandleUnknown`
+    // enum. Any string outside {"error", "use_encoded_value"} is sklearn's
+    // `InvalidParameterError` (⊂ ValueError, `_encoders.py:1425`
+    // `StrOptions({"error","use_encoded_value"})`) → `PyValueError`.
+    fn resolve_handle_unknown(
+        handle_unknown: &str,
+    ) -> PyResult<ferrolearn_preprocess::HandleUnknown> {
+        match handle_unknown {
+            "error" => Ok(ferrolearn_preprocess::HandleUnknown::Error),
+            "use_encoded_value" => Ok(ferrolearn_preprocess::HandleUnknown::UseEncodedValue),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "The 'handle_unknown' parameter of OrdinalEncoder must be a str among \
+                 {{'error', 'use_encoded_value'}}. Got {other:?} instead."
+            ))),
+        }
+    }
+
+    // Convert a Python list-of-lists of `str` (`Vec<Vec<String>>` rows) to a
+    // rectangular `Array2<String>`. sklearn's `check_array` requires a rectangular
+    // 2-D input; a ragged input (rows of differing length) raises `ValueError`,
+    // mirrored here as `PyValueError`. A 0-row input yields a `(0, 0)` array;
+    // the core's `fit`/`transform` 0-row guard then surfaces the sklearn
+    // "minimum of 1 sample" error. NEVER panics (R-CODE-2): the shape is computed
+    // from the validated row lengths so `from_shape_vec` cannot fail.
+    fn rows_to_array2(rows: &[Vec<String>]) -> PyResult<ndarray::Array2<String>> {
+        let n_rows = rows.len();
+        let n_cols = rows.first().map_or(0, Vec::len);
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != n_cols {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "input rows must all have the same length (row 0 has {n_cols} \
+                     columns, row {i} has {}); a ragged input is not a valid 2-D \
+                     array",
+                    row.len()
+                )));
+            }
+        }
+        let flat: Vec<String> = rows.iter().flatten().cloned().collect();
+        ndarray::Array2::from_shape_vec((n_rows, n_cols), flat).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "could not build a 2-D array from the input rows: {e}"
+            ))
+        })
+    }
+}
+
+#[pymethods]
+impl RsOrdinalEncoder {
+    #[new]
+    #[pyo3(signature = (handle_unknown="error".to_string(), unknown_value=None, categories=None))]
+    fn new(
+        handle_unknown: String,
+        unknown_value: Option<f64>,
+        categories: Option<Vec<Vec<String>>>,
+    ) -> Self {
+        Self {
+            handle_unknown,
+            unknown_value,
+            categories,
+            fitted: None,
+        }
+    }
+
+    // sklearn `OrdinalEncoder.fit(X, y=None)` (`_encoders.py:1454`): learns the
+    // per-feature `categories_` (sorted-unique for `categories='auto'`, or the
+    // given-order explicit lists). The bad-`handle_unknown`-string ValueError is
+    // surfaced here (the string→enum map); the REQ-5 handle_unknown/unknown_value
+    // validations (`_encoders.py:1473-1526`) and the REQ-7 explicit-categories
+    // validations (`_encoders.py:84-160`) surface as FerroError → PyValueError.
+    // A ragged / 0-row input → PyValueError.
+    fn fit(&mut self, rows: Vec<Vec<String>>) -> PyResult<()> {
+        let handle = Self::resolve_handle_unknown(&self.handle_unknown)?;
+        let x_nd = Self::rows_to_array2(&rows)?;
+        let mut model = ferrolearn_preprocess::OrdinalEncoder::new().with_handle_unknown(handle);
+        if let Some(uv) = self.unknown_value {
+            model = model.with_unknown_value(uv);
+        }
+        if let Some(cats) = &self.categories {
+            model = model.with_categories(cats.clone());
+        }
+        use ferrolearn_core::Fit;
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `OrdinalEncoder.transform(X)` (`_encoders.py:1563`): the per-feature
+    // ordinal index matrix as `float64`. Unknown category (handle_unknown=
+    // 'error') / wrong feature count / 0-row / ragged input → PyValueError.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        rows: Vec<Vec<String>>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = Self::rows_to_array2(&rows)?;
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `OrdinalEncoder.inverse_transform(X)` (`_encoders.py:1595`): map each
+    // ordinal index back to its category string. Returns a Python list-of-lists of
+    // str (`Vec<Vec<String>>`). With handle_unknown='use_encoded_value', a cell
+    // equal to `unknown_value` inverts to `None` in sklearn; the Rust core's
+    // `Array2<String>` cannot represent None (ordinal_encoder.rs REQ-9 scope), so
+    // such a cell ERRORS → PyValueError (documented divergence). Out-of-range
+    // index / wrong shape / 0-row → PyValueError.
+    fn inverse_transform(&self, x: PyReadonlyArray2<'_, f64>) -> PyResult<Vec<Vec<String>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let inv = fitted
+            .inverse_transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        // `Array2<String>` → Python list-of-lists of str (row-major).
+        let rows: Vec<Vec<String>> = inv
+            .rows()
+            .into_iter()
+            .map(|row| row.iter().cloned().collect())
+            .collect();
+        Ok(rows)
+    }
+
+    // sklearn `categories_` (`_encoders.py:1319`, a LIST of arrays, one per input
+    // feature, the per-feature category set). The Rust core stores it as
+    // `&[Vec<String>]`, so marshal to a Python LIST of str lists (ragged —
+    // per-feature blocks differ in length), mirroring sklearn's list-of-arrays.
+    #[getter]
+    fn categories_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::PyList;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let cols: Vec<Vec<String>> = fitted.categories().to_vec();
+        PyList::new(py, cols)
+    }
+
+    // sklearn `get_feature_names_out(input_features=None)`
+    // (`OneToOneFeatureMixin.get_feature_names_out`): one output name per input
+    // feature, the default `["x0", "x1", ...]`. The Rust core emits the
+    // `Vec<String>` directly.
+    #[getter]
+    fn feature_names_out(&self) -> PyResult<Vec<String>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        fitted
+            .get_feature_names_out(None)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))
+    }
+
+    // sklearn `n_features_in_` (`_encoders.py:1324`): number of input features
+    // (columns) seen during `fit`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features_in())
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

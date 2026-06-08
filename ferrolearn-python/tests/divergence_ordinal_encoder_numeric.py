@@ -1,25 +1,20 @@
-"""Divergence pin: ferrolearn.OrdinalEncoder SILENTLY produces wrong ordinals for
-NUMERIC input (#2230, REQ-12 follow-on).
+"""ferrolearn.OrdinalEncoder rejects NUMERIC input rather than mis-encoding it
+(#2230, REQ-12 / REQ-4 scope).
 
-Verification model B (goal.md R-CHAR-3): the expected values are computed by the
-LIVE sklearn 1.5.2 oracle (`SkOrd`) in the test itself and compared against
-`import ferrolearn`. No expected value is literal-copied from the ferrolearn side.
+Verification model B (goal.md R-CHAR-3): the sklearn behavior is computed by the
+LIVE sklearn 1.5.2 oracle (`SkOrd`) and contrasted with `import ferrolearn`.
 
-Root cause: `OrdinalEncoder._to_rows` (ferrolearn-python/python/ferrolearn/_extras.py:2854)
-does `np.asarray(X).astype(str).tolist()`, coercing numeric cells to strings BEFORE
-the Rust core sorts them. sklearn instead determines each feature's category set with
-`_unique(Xi)` (`sklearn/preprocessing/_encoders.py:99`, appended at `:164`), which
-sorts NUMERICALLY for int/float input.
+Background: ferrolearn's OrdinalEncoder core is STRING-only and sorts categories
+LEXICOGRAPHICALLY; sklearn sorts NUMERIC categories numerically (1, 2, 10 not
+'1', '10', '2', `sklearn/preprocessing/_encoders.py:99`). The binding originally
+coerced numeric input via `np.asarray(X).astype(str)`, which SILENTLY produced
+wrong ordinals (string-sort order) for numeric categories.
 
-For X = [[1], [2], [10]]:
-  sklearn:    categories_ = [array([ 1,  2, 10])] (int64)  -> transform [[0],[1],[2]]
-  ferrolearn: categories_ = [array(['1','10','2'])] (str)  -> transform [[0],[2],[1]]
-because string-sort orders '1' < '10' < '2'. This is a SILENT wrong-ordinal
-divergence: the binding ACCEPTS numeric input and returns a *different* (incorrect)
-encoding rather than erroring, so the documented "string-only scope, numeric coerced
-to str" claim hides an observable mismatch that breaks every numeric downstream model.
-This is NOT documented scope (no NotImplementedError is raised); it is a release
-blocker.
+Fix (#2230): `OrdinalEncoder._to_rows` now REJECTS numeric-dtype input with
+`NotImplementedError` (numeric/mixed-dtype input is REQ-4 NOT-STARTED) instead of
+mis-encoding it. The honest scope: ferrolearn.OrdinalEncoder supports STRING
+categories; for numeric categories sklearn is required. This avoids the
+silent-wrong-ordinal release blocker.
 
 Tracking: #2230
 """
@@ -31,21 +26,29 @@ import ferrolearn as fl
 from sklearn.preprocessing import OrdinalEncoder as SkOrd
 
 
-@pytest.mark.skip(
-    reason="divergence: OrdinalEncoder._to_rows .astype(str) string-sorts numeric "
-    "input -> wrong ordinals vs sklearn numeric sort; tracking #2230"
-)
-def test_numeric_int_input_ordinal_matches_sklearn():
+def test_numeric_input_rejected_not_silently_miscoded():
     # Integers whose string order (1, 10, 2) differs from their numeric order
-    # (1, 2, 10) -- the minimal input that exposes the .astype(str) bug.
+    # (1, 2, 10): the input that exposed the silent .astype(str) divergence.
     X = [[1], [2], [10]]
 
+    # sklearn handles numeric categories (numeric sort): categories_ == [1,2,10].
+    sk_out = SkOrd().fit_transform(X)
+    assert sk_out.tolist() == [[0.0], [1.0], [2.0]]
+
+    # ferrolearn is string-only: it REJECTS numeric input (NotImplementedError),
+    # rather than string-sorting it into wrong ordinals ([[0],[2],[1]]).
+    with pytest.raises(NotImplementedError):
+        fl.OrdinalEncoder().fit(X)
+    with pytest.raises(NotImplementedError):
+        fl.OrdinalEncoder().fit_transform(np.array([[1.0], [2.0], [10.0]]))
+
+
+def test_string_input_still_works():
+    # String categories that LOOK numeric are still string-sorted, matching
+    # sklearn for STRING input ('1' < '10' < '2').
+    X = [["1"], ["2"], ["10"]]
     sk = SkOrd().fit(X)
-    sk_out = sk.transform(X)
-
     fe = fl.OrdinalEncoder().fit(X)
-    fe_out = np.asarray(fe.transform(X))
-
-    # sklearn sorts numerically: categories_ == [1, 2, 10] -> transform [[0],[1],[2]].
-    # ferrolearn string-sorts: categories_ == ['1','10','2'] -> transform [[0],[2],[1]].
-    np.testing.assert_array_equal(fe_out, sk_out)
+    np.testing.assert_array_equal(
+        np.asarray(fe.transform(X)), sk.transform(X)
+    )
