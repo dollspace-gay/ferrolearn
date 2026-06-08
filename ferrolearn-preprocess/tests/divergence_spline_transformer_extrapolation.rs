@@ -106,7 +106,6 @@ fn assert_query_matches_oracle(
 ///
 /// Tracking: #2326.
 #[test]
-#[ignore = "divergence: ferrolearn lacks default extrapolation='constant' clamp; tracking #2326"]
 fn divergence_extrapolation_constant_default_degree3() {
     let x_fit = array![[0.0], [0.3], [0.6], [1.0]];
     let x_query = array![[-0.5], [1.5]];
@@ -130,7 +129,6 @@ fn divergence_extrapolation_constant_default_degree3() {
 /// ferrolearn returns [[0,0,0,0],[2.0,-5.5,4.5,...]] (extended-knot Cox-de Boor,
 /// including a negative extrapolated value). Tracking: #2326.
 #[test]
-#[ignore = "divergence: ferrolearn lacks default extrapolation='constant' clamp; tracking #2326"]
 fn divergence_extrapolation_constant_default_degree2() {
     let x_fit = array![[0.0], [0.5], [1.0]];
     let x_query = array![[-1.0], [2.0]];
@@ -152,7 +150,6 @@ fn divergence_extrapolation_constant_default_degree2() {
 /// ferrolearn returns [[0,0,0],[-2.0,3.0,...]] (linear extrapolation over the
 /// extended knots, including a negative value). Tracking: #2326.
 #[test]
-#[ignore = "divergence: ferrolearn lacks default extrapolation='constant' clamp; tracking #2326"]
 fn divergence_extrapolation_constant_default_degree1() {
     let x_fit = array![[0.0], [0.5], [1.0]];
     let x_query = array![[-1.0], [2.0]];
@@ -176,7 +173,6 @@ fn divergence_extrapolation_constant_default_degree1() {
 /// ferrolearn fits NaN silently (returns Ok) and emits NaN basis values on
 /// transform. This test asserts the sklearn contract: fit MUST error on NaN.
 #[test]
-#[ignore = "divergence: ferrolearn accepts NaN silently, sklearn raises ValueError; tracking #2327"]
 fn divergence_nan_input_must_error() {
     let st = SplineTransformer::<f64>::new(3, 2, KnotStrategy::Uniform);
     let x = array![[0.0], [f64::NAN], [1.0]];

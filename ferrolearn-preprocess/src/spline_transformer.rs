@@ -20,7 +20,7 @@
 //! |-----|-------|--------|--------------------|
 //! | REQ-1 | Output dimensions (`n_knots+degree-1` cols/feature) + B-spline structural properties (partition-of-unity, non-negativity) | SHIPPED | [`FittedSplineTransformer::transform`]; sklearn `n_splines` `_polynomial.py:875`; tests `green_guard_column_count_per_feature` / `_partition_of_unity` / `_non_negativity` |
 //! | REQ-2 | Uniform-knot basis VALUE parity — EXTENDED edge-spacing knots + scipy `BSpline` design matrix | SHIPPED | [`FittedSplineTransformer`] knot construction matches sklearn `_polynomial.py:908-923` + `:925-940`; verified across degree∈{1,2,3}, multi-feature, both base endpoints in `tests/divergence_spline_transformer.rs` (was DIV-1 #1332) |
-//! | REQ-3 | `extrapolation` param (`constant`/`linear`/`continue`/`periodic`/`error`) for out-of-base-interval values | NOT-STARTED | no param; sklearn `_polynomial.py:619-633,721,1023-1123` — blocker #1333 |
+//! | REQ-3 | `extrapolation` param: DEFAULT `constant` (clamp out-of-range to boundary basis) + NaN/Inf reject at fit/transform | SHIPPED (Constant default + finiteness); other modes NOT-STARTED | [`Extrapolation::Constant`] is the default; [`FittedSplineTransformer::transform`] clamps each value to `[xmin, xmax]` before evaluating the basis (mirrors sklearn `_polynomial.py:721` default + `:1059-1087` constant clamp); fit/transform reject non-finite input (sklearn `_validate_data` `:833-839`). Tests `divergence_extrapolation_constant_default_degree{1,2,3}` + `divergence_nan_input_must_error` in `tests/divergence_spline_transformer_extrapolation.rs`. Modes `linear`/`continue`/`periodic`/`error` remain NOT-STARTED — blocker #1333 |
 //! | REQ-4 | `include_bias` param (drop one column when `false`) | NOT-STARTED | no param; sklearn `_polynomial.py:635,942` — blocker #1334 |
 //! | REQ-5 | Quantile knots via `np.percentile`-exact (ferrolearn uses linear-interp percentile) | NOT-STARTED | `spline_transformer.rs` Quantile path; sklearn `_polynomial.py:747-753` — blocker #1335 |
 //! | REQ-6 | Error/parameter contracts (`n_samples<2`, `n_knots<2`, transform ncols, unfitted) | SHIPPED | [`SplineTransformer::fit`]; `degree==0` is now ALLOWED (piecewise-constant), matching sklearn `_parameter_constraints` `degree: Interval(Integral, 0, None, closed="left")` (`_polynomial.py:705`). `n_knots<2` rejection matches `n_knots: Interval(Integral, 2, None, closed="left")` (`:704`). The `n_samples>=2` requirement also MATCHES sklearn (`_validate_data(..., ensure_min_samples=2)`, `_polynomial.py:830`) — NOT a divergence. (blocker #1336) |
@@ -46,6 +46,44 @@ pub enum KnotStrategy {
     Uniform,
     /// Knots are placed at quantiles of the data.
     Quantile,
+}
+
+// ---------------------------------------------------------------------------
+// Extrapolation
+// ---------------------------------------------------------------------------
+
+/// How to handle values outside the base knot interval `[xmin, xmax]`.
+///
+/// Mirrors scikit-learn's `extrapolation` parameter
+/// (`sklearn/preprocessing/_polynomial.py:707-709`,`:721`). The default is
+/// [`Extrapolation::Constant`] (sklearn's `__init__` default
+/// `extrapolation="constant"`, `_polynomial.py:721`).
+///
+/// Only [`Extrapolation::Constant`] is currently implemented. The remaining
+/// sklearn modes (`linear`, `continue`, `periodic`, `error`) are NOT-STARTED
+/// and surface a [`FerroError::InvalidParameter`] from the transform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Extrapolation {
+    /// Clamp out-of-range values to the boundary spline basis: for `x < xmin`
+    /// the basis is evaluated at `xmin`, for `x > xmax` at `xmax`. This is the
+    /// DEFAULT, matching sklearn `extrapolation="constant"`
+    /// (`_polynomial.py:721` default; the constant clamp at `:1059-1087` sets
+    /// the out-of-range row's first/last `degree` basis columns to the boundary
+    /// basis values `f_min[:degree]` / `f_max[-degree:]` — equivalent to
+    /// clamping `x` to `[xmin, xmax]` before evaluating the basis, since the
+    /// columns beyond `degree` are zero at the boundary).
+    #[default]
+    Constant,
+    /// Linearly continue the boundary splines (sklearn `"linear"`,
+    /// `_polynomial.py:1089-1123`). NOT-STARTED.
+    Linear,
+    /// Pass scipy `extrapolate=True` (sklearn `"continue"`). NOT-STARTED.
+    Continue,
+    /// Periodic splines (sklearn `"periodic"`). NOT-STARTED.
+    Periodic,
+    /// Raise on out-of-range input (sklearn `"error"`,
+    /// `_polynomial.py:1047-1058`). NOT-STARTED.
+    Error,
 }
 
 // ---------------------------------------------------------------------------
@@ -88,16 +126,31 @@ pub struct SplineTransformer<F> {
     degree: usize,
     /// Knot placement strategy.
     knots: KnotStrategy,
+    /// Out-of-range extrapolation policy (default [`Extrapolation::Constant`]).
+    extrapolation: Extrapolation,
     _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> SplineTransformer<F> {
-    /// Create a new `SplineTransformer`.
+    /// Create a new `SplineTransformer` with the DEFAULT extrapolation policy
+    /// ([`Extrapolation::Constant`], matching sklearn's `extrapolation="constant"`
+    /// default, `_polynomial.py:721`).
     pub fn new(n_knots: usize, degree: usize, knots: KnotStrategy) -> Self {
+        Self::with_extrapolation(n_knots, degree, knots, Extrapolation::Constant)
+    }
+
+    /// Create a new `SplineTransformer` with an explicit extrapolation policy.
+    pub fn with_extrapolation(
+        n_knots: usize,
+        degree: usize,
+        knots: KnotStrategy,
+        extrapolation: Extrapolation,
+    ) -> Self {
         Self {
             n_knots,
             degree,
             knots,
+            extrapolation,
             _marker: std::marker::PhantomData,
         }
     }
@@ -119,6 +172,12 @@ impl<F: Float + Send + Sync + 'static> SplineTransformer<F> {
     pub fn knot_strategy(&self) -> KnotStrategy {
         self.knots
     }
+
+    /// Return the out-of-range extrapolation policy.
+    #[must_use]
+    pub fn extrapolation(&self) -> Extrapolation {
+        self.extrapolation
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Default for SplineTransformer<F> {
@@ -138,10 +197,17 @@ impl<F: Float + Send + Sync + 'static> Default for SplineTransformer<F> {
 pub struct FittedSplineTransformer<F> {
     /// Full knot vector per feature (including boundary knots with multiplicity).
     knot_vectors: Vec<Vec<F>>,
+    /// Per-feature base-interval lower bound (`xmin = knots[degree]`, the fit min).
+    /// Used to clamp out-of-range values under [`Extrapolation::Constant`].
+    xmin: Vec<F>,
+    /// Per-feature base-interval upper bound (`xmax = knots[n_basis]`, the fit max).
+    xmax: Vec<F>,
     /// Degree of the B-spline.
     degree: usize,
     /// Number of basis functions per feature.
     n_basis: usize,
+    /// Out-of-range extrapolation policy.
+    extrapolation: Extrapolation,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedSplineTransformer<F> {
@@ -162,6 +228,25 @@ impl<F: Float + Send + Sync + 'static> FittedSplineTransformer<F> {
     pub fn n_output_features(&self) -> usize {
         self.knot_vectors.len() * self.n_basis
     }
+
+    /// Return the out-of-range extrapolation policy.
+    #[must_use]
+    pub fn extrapolation(&self) -> Extrapolation {
+        self.extrapolation
+    }
+}
+
+/// Reject non-finite (NaN/Inf) entries in `x`, mirroring sklearn's
+/// `_validate_data(..., force_all_finite=True)` (`_polynomial.py:833-839`),
+/// which raises `ValueError("Input X contains NaN.")` / infinity.
+fn reject_non_finite<F: Float>(x: &Array2<F>, context: &str) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: format!("Input X contains NaN or infinity. ({context})"),
+        });
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -263,6 +348,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
     /// - [`FerroError::InsufficientSamples`] if the input has fewer than 2 rows.
     /// - [`FerroError::InvalidParameter`] if `n_knots` < 2.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedSplineTransformer<F>, FerroError> {
+        // sklearn `_validate_data(..., force_all_finite=True)` rejects NaN/Inf at
+        // fit (`_polynomial.py:833-839`). Match that contract.
+        reject_non_finite(x, "SplineTransformer::fit")?;
+
         let n_samples = x.nrows();
         if n_samples < 2 {
             return Err(FerroError::InsufficientSamples {
@@ -281,6 +370,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
         let n_features = x.ncols();
         let n_basis = self.n_knots + self.degree - 1;
         let mut knot_vectors = Vec::with_capacity(n_features);
+        let mut xmin = Vec::with_capacity(n_features);
+        let mut xmax = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
             let mut col_vals: Vec<F> = x.column(j).iter().copied().collect();
@@ -288,6 +379,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
 
             let min_val = col_vals[0];
             let max_val = col_vals[col_vals.len() - 1];
+
+            // Base-interval boundaries used by `Extrapolation::Constant`: a value
+            // below `xmin`/above `xmax` is clamped to the boundary before the
+            // basis is evaluated (sklearn `_polynomial.py:1059-1087`). These are
+            // the fit min/max, equal to `knots[degree]`/`knots[n_basis]` in the
+            // extended knot vector.
+            xmin.push(min_val);
+            xmax.push(max_val);
 
             // Compute interior knots
             let interior_knots: Vec<F> = match self.knots {
@@ -368,8 +467,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SplineTransformer<
 
         Ok(FittedSplineTransformer {
             knot_vectors,
+            xmin,
+            xmax,
             degree: self.degree,
             n_basis,
+            extrapolation: self.extrapolation,
         })
     }
 }
@@ -394,6 +496,27 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSplineTran
             });
         }
 
+        // sklearn validates the transform input too (`_validate_data` in
+        // `transform`), rejecting NaN/Inf.
+        reject_non_finite(x, "FittedSplineTransformer::transform")?;
+
+        // Only `Constant` extrapolation is implemented. The other sklearn modes
+        // are NOT-STARTED — surface a clear error rather than emit wrong values.
+        match self.extrapolation {
+            Extrapolation::Constant => {}
+            Extrapolation::Linear
+            | Extrapolation::Continue
+            | Extrapolation::Periodic
+            | Extrapolation::Error => {
+                return Err(FerroError::InvalidParameter {
+                    name: "extrapolation".into(),
+                    reason: "only Extrapolation::Constant is implemented; \
+                             linear/continue/periodic/error are NOT-STARTED (blocker #1333)"
+                        .into(),
+                });
+            }
+        }
+
         let n_samples = x.nrows();
         let n_out = n_features * self.n_basis;
         let mut out = Array2::zeros((n_samples, n_out));
@@ -401,9 +524,24 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSplineTran
         for j in 0..n_features {
             let knots = &self.knot_vectors[j];
             let col_offset = j * self.n_basis;
+            let lo = self.xmin[j];
+            let hi = self.xmax[j];
 
             for i in 0..n_samples {
-                let val = x[[i, j]];
+                // `Extrapolation::Constant`: clamp the value to the base interval
+                // `[xmin, xmax]` before evaluating the basis. At the boundary,
+                // only the first/last `degree` basis columns are non-zero, so the
+                // clamp reproduces sklearn's `f_min[:degree]` / `f_max[-degree:]`
+                // assignment (`_polynomial.py:1059-1087`). The clamp is a no-op
+                // for in-range values, preserving the verified in-range basis.
+                let raw = x[[i, j]];
+                let val = if raw < lo {
+                    lo
+                } else if raw > hi {
+                    hi
+                } else {
+                    raw
+                };
                 let basis_vals = bspline_basis(val, knots, self.degree, self.n_basis);
                 for (k, &bv) in basis_vals.iter().enumerate() {
                     out[[i, col_offset + k]] = bv;
