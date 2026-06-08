@@ -46,7 +46,7 @@
 //! | REQ-2 | Reconstruction weights `W` (local least-squares + reg + normalize) | SHIPPED | `compute_weights` reg `R = reg·trace if trace>0 else reg` matches `barycenter_weights` (`_locally_linear.py:72-79`, NO /k — fixed #1460); `w/Σw` normalize; verified via the embedding parity |
 //! | REQ-3 | `M = (I-W)ᵀ(I-W)` + bottom-eigenvector extraction (skip trivial) | SHIPPED | `fit`; matches `null_space(M, n_components, k_skip=1)` `_locally_linear.py:295-301` selection |
 //! | REQ-4 | Structural (embedding shape, deterministic, columns centered) | SHIPPED (scoped) | shape + determinism + column-centering guards |
-//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, n_neighbors 0/≥n, negative reg) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, n_neighbors 0/≥n, negative reg, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards; divergence error tests. NON-FINITE: `fit` calls `reject_non_finite` (`lle.rs` symbol `reject_non_finite`) BEFORE the kNN/reconstruction-weight/eigen math, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_locally_linear.py:793`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_lle_fit_nan`/`_fit_inf` match the live sklearn 1.5.2 oracle (#2290). (`transform` out-of-sample is REQ-8 NOT-STARTED, so no transform gate yet.) |
 //! | REQ-6 | `method` ∈ {hessian, modified, ltsa} | NOT-STARTED | standard only; sklearn `_locally_linear.py:201-460` — blocker #1461 |
 //! | REQ-7 | `eigen_solver='arpack'` + `random_state` + per-component sign convention (CARVE-OUT) | NOT-STARTED | dense faer; sklearn `_locally_linear.py:173-188` — blocker #1462 |
 //! | REQ-8 | `transform` out-of-sample (barycenter weights on new points) | NOT-STARTED | sklearn `_locally_linear.py:851` — blocker #1463 |
@@ -58,6 +58,26 @@ use crate::mds::eigh_faer;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
 use ndarray::Array2;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `LocallyLinearEmbedding.fit`
+/// (`sklearn/manifold/_locally_linear.py:793`; out-of-sample `transform` at
+/// `:872`), raising `ValueError("Input X contains NaN.")` /
+/// `"... contains infinity ..."` (`sklearn/utils/validation.py:147-154`) BEFORE
+/// the kNN / reconstruction-weight / eigen math. NaN AND infinity are both
+/// rejected. The message names "NaN" and "infinity" to mirror sklearn's
+/// `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // LLE (unfitted)
@@ -351,6 +371,11 @@ impl Fit<Array2<f64>, ()> for LLE {
                 reason: "must be non-negative".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the kNN / reconstruction-weight / eigen math
+        // (sklearn's `_validate_data(force_all_finite=True)` at
+        // `_locally_linear.py:793`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         // Step 1: Find neighbors.
         let neighbors = find_neighbors(x, self.n_neighbors);

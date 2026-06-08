@@ -51,7 +51,7 @@
 //! | REQ-1 | ddof=1 centering + scaling | SHIPPED | `centre_scale` (n-1) = sklearn `_pls.py:142,145` |
 //! | REQ-2 | `scale=True/False` toggle | SHIPPED | green-guard |
 //! | REQ-3 | ctor defaults `max_iter=500`/`tol=1e-6` | SHIPPED | = sklearn `_pls.py:60` |
-//! | REQ-4 | Error/parameter contracts | SHIPPED (scoped) | `fit` guards; FLAG: sklearn raises `InvalidParameterError` |
+//! | REQ-4 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards. NON-FINITE: all 4 estimators' `fit` (BEFORE NIPALS/SVD; rejects X then Y) + `transform` call `reject_non_finite` (`cross_decomposition.rs` symbol `reject_non_finite`), returning the CLEAN finiteness `InvalidParameter{name:"X"|"Y", reason:"Input X|Y contains NaN or infinity."}` = sklearn `_validate_data`/`check_array` `force_all_finite=True` (`_pls.py:265`/`:272` for `_PLS`, `:1067`/`:1074` for PLSSVD, `utils/validation.py:147-154`) — REPLACES the incidental NIPALS `ConvergenceFailure` / SVD `NumericalInstability` for non-finite X (R-DEV-2). `tests/divergence_nonfinite_spillover.rs::divergence_pls_regression_fit_nan`/`_pls_canonical_fit_nan`/`_pls_svd_fit_nan`/`_cca_fit_nan` match the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `InvalidParameterError` |
 //! | REQ-5 | f32/f64 generic | SHIPPED | green-guard |
 //! | REQ-6 | Fitted shapes | SHIPPED | green-guards |
 //! | REQ-7 | Deflation-mode split (regression vs canonical) | SHIPPED | `greenguard_regression_vs_canonical_differ` |
@@ -82,6 +82,30 @@ use std::any::TypeId;
 
 /// Result type for SVD: `(U, S, Vt)`.
 type SvdResult<F> = Result<(Array2<F>, Array1<F>, Array2<F>), FerroError>;
+
+/// Reject a non-finite input matrix the way sklearn's `_validate_data` /
+/// `check_array` does.
+///
+/// sklearn validates BOTH X (`_validate_data`) and y (`check_array`) with the
+/// default `force_all_finite=True` at the top of every cross-decomposition
+/// `fit` (`cross_decomposition/_pls.py:265`/`:272` for `_PLS`,
+/// `:1067`/`:1074` for `PLSSVD`) and re-validates X in `transform`, raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the NIPALS / SVD math.
+/// Calling this FIRST means a non-finite input yields the CLEAN finiteness
+/// rejection instead of the incidental NIPALS `ConvergenceFailure` / SVD
+/// `NumericalInstability`. NaN AND infinity are both rejected. The `name`
+/// ("X" / "Y") and the message ("NaN"/"infinity") mirror sklearn's `ValueError`.
+/// Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(m: &Array2<F>, name: &str) -> Result<(), FerroError> {
+    if m.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: name.into(),
+            reason: format!("Input {name} contains NaN or infinity."),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Helper: centre and optionally scale columns of a matrix
@@ -692,6 +716,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSSVD<F> {
             });
         }
 
+        // Reject NaN/Inf in X (then Y) BEFORE the SVD, so a non-finite input
+        // gives the CLEAN finiteness rejection rather than the incidental SVD
+        // `NumericalInstability` (sklearn `_validate_data`/`check_array`
+        // `force_all_finite=True`, `_pls.py:1067`/`:1074`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x, "X")?;
+        reject_non_finite(y, "Y")?;
+
         // Centre and optionally scale.
         let (xc, x_mean, x_std) = centre_scale(x, self.scale);
         let (yc, y_mean, y_std) = centre_scale(y, self.scale);
@@ -759,6 +791,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPLSSVD<F> 
     ///
     /// Returns [`FerroError::ShapeMismatch`] if X has the wrong number of columns.
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        reject_non_finite(x, "X")?;
         let xc = apply_centre_scale(x, &self.x_mean_, &self.x_std_, "FittedPLSSVD::transform")?;
         Ok(xc.dot(&self.x_weights_))
     }
@@ -1343,6 +1376,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSRegressi
             });
         }
 
+        // Reject NaN/Inf in X (then Y) BEFORE NIPALS, so a non-finite input
+        // gives the CLEAN finiteness rejection rather than the incidental NIPALS
+        // `ConvergenceFailure` (sklearn `_validate_data`/`check_array`
+        // `force_all_finite=True`, `_pls.py:265`/`:272`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x, "X")?;
+        reject_non_finite(y, "Y")?;
+
         // Centre and optionally scale.
         let (xc, x_mean, x_std) = centre_scale(x, self.scale);
         let (yc, y_mean, y_std) = centre_scale(y, self.scale);
@@ -1438,6 +1479,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPLSRegress
     ///
     /// Returns [`FerroError::ShapeMismatch`] if X has the wrong number of columns.
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        reject_non_finite(x, "X")?;
         let xc = apply_centre_scale(
             x,
             &self.x_mean_,
@@ -1675,6 +1717,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSCanonica
             });
         }
 
+        // Reject NaN/Inf in X (then Y) BEFORE NIPALS, so a non-finite input
+        // gives the CLEAN finiteness rejection rather than the incidental NIPALS
+        // `ConvergenceFailure` (sklearn `_validate_data`/`check_array`
+        // `force_all_finite=True`, `_pls.py:265`/`:272`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x, "X")?;
+        reject_non_finite(y, "Y")?;
+
         let (xc, x_mean, x_std) = centre_scale(x, self.scale);
         let (yc, y_mean, y_std) = centre_scale(y, self.scale);
 
@@ -1714,6 +1764,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPLSCanonic
     ///
     /// Returns [`FerroError::ShapeMismatch`] if X has the wrong number of columns.
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        reject_non_finite(x, "X")?;
         let xc = apply_centre_scale(
             x,
             &self.x_mean_,
@@ -1939,6 +1990,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for CCA<F> {
             });
         }
 
+        // Reject NaN/Inf in X (then Y) BEFORE NIPALS, so a non-finite input
+        // gives the CLEAN finiteness rejection rather than the incidental SVD
+        // `NumericalInstability` (sklearn `_validate_data`/`check_array`
+        // `force_all_finite=True`, `_pls.py:265`/`:272`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x, "X")?;
+        reject_non_finite(y, "Y")?;
+
         let (xc, x_mean, x_std) = centre_scale(x, self.scale);
         let (yc, y_mean, y_std) = centre_scale(y, self.scale);
 
@@ -1978,6 +2037,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedCCA<F> {
     ///
     /// Returns [`FerroError::ShapeMismatch`] if X has the wrong number of columns.
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        reject_non_finite(x, "X")?;
         let xc = apply_centre_scale(x, &self.x_mean_, &self.x_std_, "FittedCCA::transform")?;
 
         let ptw = self.x_loadings_.t().dot(&self.x_weights_);

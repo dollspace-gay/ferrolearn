@@ -50,7 +50,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | Structural: `components_` shape `(n_topics,n_words)`, `n_iter_`==max_iter, seed-determinism, digamma accuracy | SHIPPED (scoped) | `fit` stores `components_=lambda` (`:440`), `n_iter_=max_iter` (`:443`, matches sklearn default `evaluate_every=-1` `_lda.py:695`); `digamma` (`:277`) matches scipy.special.psi ~1.17e-10; green-guards + in-module tests. STRUCTURAL, NOT values (REQ-4) |
 //! | REQ-2 | `components_` non-negativity | SHIPPED | M-step adds non-negative suff-stats to non-negative init; `test_lda_components_non_negative` + green-guard |
-//! | REQ-3 | transform doc-topic shape + each row sums to 1 + topic separation + error contracts | SHIPPED (scoped) | `transform` normalizes gamma rows (`:642-654` = sklearn `_lda.py:745`); fit/transform guards. FLAG: sklearn raises `ValueError`, defaults n_components=10, doesn't pre-reject 0 words |
+//! | REQ-3 | transform doc-topic shape + each row sums to 1 + topic separation + error contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `transform` normalizes gamma rows (= sklearn `_lda.py:745`); fit/transform guards. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`lda_topic.rs` symbol `reject_non_finite`) BEFORE the non-negativity check and the VB iterations, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_check_non_neg_array`'s `_validate_data(force_all_finite=True)` finiteness-before-non-negativity (`_lda.py:566` before `:572`, `utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_lda_fit_nan` matches the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `ValueError`, defaults n_components=10, doesn't pre-reject 0 words |
 //! | REQ-4 | EXACT `components_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Uniform+beta/Xoshiro init vs Gamma(100,0.01)/numpy RandomState VI (`_lda.py:419-421`) — blocker #1541 |
 //! | REQ-5 | transform doc-topic VALUE parity | NOT-STARTED | CARVE-OUT, folds into REQ-4 (downstream of components_, no injectable API) — blocker #1542 |
 //! | REQ-6 | Gamma(100,0.01) init (components + per-doc gamma) | NOT-STARTED | sklearn `_lda.py:96-99,:419-421` — blocker #1543 |
@@ -72,6 +72,26 @@ use ndarray::Array2;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Uniform};
 use rand_xoshiro::Xoshiro256PlusPlus;
+
+/// Reject non-finite input the way sklearn's `_check_non_neg_array` does.
+///
+/// sklearn's `LatentDirichletAllocation` runs `_check_non_neg_array` which calls
+/// `_validate_data` with the default `force_all_finite=True`
+/// (`sklearn/decomposition/_lda.py:566`) BEFORE the non-negativity check
+/// (`check_non_negative`, `:572`) and any variational-Bayes math, raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). NaN AND infinity are both rejected,
+/// finiteness BEFORE non-negativity. The message names "NaN" and "infinity" to
+/// mirror sklearn's `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Learning method enum
@@ -427,6 +447,11 @@ impl Fit<Array2<f64>, ()> for LatentDirichletAllocation {
                 reason: "document-term matrix must have at least 1 word".into(),
             });
         }
+        // Reject NaN/Inf BEFORE the non-negativity check and the VB iterations
+        // (sklearn's `_check_non_neg_array` runs `_validate_data(force_all_finite
+        // =True)` at `_lda.py:566` before `check_non_negative` at `:572`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
         for &val in x {
             if val < 0.0 {
                 return Err(FerroError::InvalidParameter {
@@ -652,6 +677,10 @@ impl Transform<Array2<f64>> for FittedLatentDirichletAllocation {
                 context: "FittedLatentDirichletAllocation::transform".into(),
             });
         }
+        // Reject NaN/Inf BEFORE the non-negativity check and the E-step (sklearn
+        // re-validates via `_check_non_neg_array` `_validate_data(force_all_finite
+        // =True)` `_lda.py:566` before `check_non_negative`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
         for &val in x {
             if val < 0.0 {
                 return Err(FerroError::InvalidParameter {

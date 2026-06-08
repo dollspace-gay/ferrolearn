@@ -46,7 +46,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | Structural: `components_` shape `(n_components,n_features)`, transform codes shape, OMP n-nonzero cap + LassoCd sparsity, finite `reconstruction_err_`, `n_iter_` in `[1, max_iter]`, seed-determinism | SHIPPED (scoped) | `fit`/`transform` (`dictionary_learning.rs:495`/`:622`); green-guards in `tests/divergence_dictionary_learning.rs` + in-module tests. STRUCTURAL only, NOT component values (REQ-4) |
 //! | REQ-2 | Dictionary atoms unit L2-norm | SHIPPED | `normalise_dictionary` (`:251`); `test_dictlearn_dictionary_atoms_normalised` + green-guard. FLAG: sklearn `_update_dict` projects onto the unit BALL `/= max(norm,1)` (`_dict_learning.py:548`) so sklearn atoms have norm ≤ 1; ferrolearn uses the unit SPHERE (norm == 1) — coincide at convergence, folds into REQ-7 carve-out |
-//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples 0, n_features 0, alpha<0, transform col mismatch) | SHIPPED (scoped) | `fit`/`transform` guards (`:499-523`,`:624`); FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None` |
+//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples 0, n_features 0, alpha<0, transform col mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`dictionary_learning.rs` symbol `reject_non_finite`) BEFORE the alternating optimisation / sparse-coding, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_dict_learning.py:1674`,`:1113`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_dictionary_learning_fit_nan` matches the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None` |
 //! | REQ-4 | EXACT `components_` value parity with sklearn `_dict_learning` | NOT-STARTED | CARVE-OUT (R-DEFER-3): SVD init + LARS lasso + `_update_dict` BCD/resampling + numpy RNG vs ferrolearn random-Gaussian-init + CD + normal-equations; all value candidates gated on the RNG-coupled dictionary (no injectable-dict API) — blocker #1513 |
 //! | REQ-5 | `fit_algorithm="lars"` / LARS solver | NOT-STARTED | sklearn default `_dict_learning.py:1595,:1671`; ferrolearn CD-only (`DictFitAlgorithm::CoordinateDescent`) — blocker #1514 |
 //! | REQ-6 | SVD-based `dict_init`/`code_init` init | NOT-STARTED | sklearn `_dict_learning.py:581-584`; ferrolearn random Gaussian — blocker #1515 |
@@ -69,6 +69,26 @@ use ndarray::Array2;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use rand_xoshiro::Xoshiro256PlusPlus;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `DictionaryLearning.fit_transform`/`transform`
+/// (`sklearn/decomposition/_dict_learning.py:1674`,`:1113`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE any sparse-coding /
+/// dictionary-update math. NaN AND infinity are both rejected. The message
+/// names "NaN" and "infinity" to mirror sklearn's `ValueError`. Never panics
+/// (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Algorithm enums
@@ -553,6 +573,10 @@ impl Fit<Array2<f64>, ()> for DictionaryLearning {
                 reason: "must be non-negative".into(),
             });
         }
+        // Reject NaN/Inf BEFORE the SVD-free alternating optimisation (sklearn's
+        // `_validate_data(force_all_finite=True)` at `_dict_learning.py:1674`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let n_components = self.n_components;
         let seed = self.random_state.unwrap_or(0);
@@ -664,6 +688,11 @@ impl Transform<Array2<f64>> for FittedDictionaryLearning {
                 context: "FittedDictionaryLearning::transform".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the sparse-coding step (sklearn re-validates with
+        // `_validate_data(reset=False, force_all_finite=True)` at
+        // `_dict_learning.py:1113`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let n_samples = x.nrows();
         let n_components = self.components_.nrows();

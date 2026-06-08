@@ -94,7 +94,14 @@ fn x_nonneg_nan() -> Array2<f64> {
     x
 }
 fn y_finite() -> Array2<f64> {
-    array![[1.0, 0.0], [2.0, 1.0], [3.0, 0.5], [4.0, 2.0], [5.0, 1.0], [6.0, 3.0]]
+    array![
+        [1.0, 0.0],
+        [2.0, 1.0],
+        [3.0, 0.5],
+        [4.0, 2.0],
+        [5.0, 1.0],
+        [6.0, 3.0]
+    ]
 }
 
 /// True iff `e` is the clean finiteness rejection the fixed estimators emit
@@ -120,7 +127,6 @@ macro_rules! pin_fit_rejects {
         /// ferrolearn: Ok(garbage) or incidental NumericalInstability/
         /// ConvergenceFailure (see module header). Tracking: #2290.
         #[test]
-        #[ignore = "divergence: spillover decomp/manifold estimator does not reject NaN/Inf input (sklearn ValueError); tracking #2290"]
         fn $name() {
             let r: Result<(), FerroError> = ($build)(x_nan());
             assert!(
@@ -134,44 +140,89 @@ macro_rules! pin_fit_rejects {
 }
 
 // --- fit(X_nan): single-input decomposition/manifold estimators ---
-pin_fit_rejects!(divergence_incremental_pca_fit_nan, "IncrementalPCA", |x: Array2<f64>| {
-    IncrementalPCA::<f64>::new(2).fit(&x, &()).map(|_| ())
+pin_fit_rejects!(
+    divergence_incremental_pca_fit_nan,
+    "IncrementalPCA",
+    |x: Array2<f64>| { IncrementalPCA::<f64>::new(2).fit(&x, &()).map(|_| ()) }
+);
+pin_fit_rejects!(divergence_sparse_pca_fit_nan, "SparsePCA", |x: Array2<
+    f64,
+>| {
+    SparsePCA::<f64>::new(2)
+        .with_random_state(0)
+        .fit(&x, &())
+        .map(|_| ())
 });
-pin_fit_rejects!(divergence_sparse_pca_fit_nan, "SparsePCA", |x: Array2<f64>| {
-    SparsePCA::<f64>::new(2).with_random_state(0).fit(&x, &()).map(|_| ())
-});
-pin_fit_rejects!(divergence_minibatch_nmf_fit_nan, "MiniBatchNMF", |_x: Array2<f64>| {
-    MiniBatchNMF::<f64>::new(2).with_random_state(0).fit(&x_nonneg_nan(), &()).map(|_| ())
-});
-pin_fit_rejects!(divergence_lda_fit_nan, "LatentDirichletAllocation", |_x: Array2<f64>| {
-    LatentDirichletAllocation::new(2).with_random_state(0).fit(&x_nonneg_nan(), &()).map(|_| ())
-});
-pin_fit_rejects!(divergence_dictionary_learning_fit_nan, "DictionaryLearning", |x: Array2<f64>| {
-    DictionaryLearning::new(2).with_random_state(0).fit(&x, &()).map(|_| ())
-});
+pin_fit_rejects!(
+    divergence_minibatch_nmf_fit_nan,
+    "MiniBatchNMF",
+    |_x: Array2<f64>| {
+        MiniBatchNMF::<f64>::new(2)
+            .with_random_state(0)
+            .fit(&x_nonneg_nan(), &())
+            .map(|_| ())
+    }
+);
+pin_fit_rejects!(
+    divergence_lda_fit_nan,
+    "LatentDirichletAllocation",
+    |_x: Array2<f64>| {
+        LatentDirichletAllocation::new(2)
+            .with_random_state(0)
+            .fit(&x_nonneg_nan(), &())
+            .map(|_| ())
+    }
+);
+pin_fit_rejects!(
+    divergence_dictionary_learning_fit_nan,
+    "DictionaryLearning",
+    |x: Array2<f64>| {
+        DictionaryLearning::new(2)
+            .with_random_state(0)
+            .fit(&x, &())
+            .map(|_| ())
+    }
+);
 pin_fit_rejects!(divergence_mds_fit_nan, "MDS", |x: Array2<f64>| {
     MDS::new(2).fit(&x, &()).map(|_| ())
 });
 pin_fit_rejects!(divergence_isomap_fit_nan, "Isomap", |x: Array2<f64>| {
     Isomap::new(2).with_n_neighbors(4).fit(&x, &()).map(|_| ())
 });
-pin_fit_rejects!(divergence_spectral_embedding_fit_nan, "SpectralEmbedding", |x: Array2<f64>| {
-    SpectralEmbedding::new(2).fit(&x, &()).map(|_| ())
-});
-pin_fit_rejects!(divergence_lle_fit_nan, "LocallyLinearEmbedding", |x: Array2<f64>| {
-    LLE::new(2).with_n_neighbors(3).fit(&x, &()).map(|_| ())
-});
+pin_fit_rejects!(
+    divergence_spectral_embedding_fit_nan,
+    "SpectralEmbedding",
+    |x: Array2<f64>| { SpectralEmbedding::new(2).fit(&x, &()).map(|_| ()) }
+);
+pin_fit_rejects!(
+    divergence_lle_fit_nan,
+    "LocallyLinearEmbedding",
+    |x: Array2<f64>| { LLE::new(2).with_n_neighbors(3).fit(&x, &()).map(|_| ()) }
+);
 pin_fit_rejects!(divergence_tsne_fit_nan, "TSNE", |x: Array2<f64>| {
-    Tsne::new().with_n_components(2).with_perplexity(2.0).with_random_state(0).fit(&x, &()).map(|_| ())
+    Tsne::new()
+        .with_n_components(2)
+        .with_perplexity(2.0)
+        .with_random_state(0)
+        .fit(&x, &())
+        .map(|_| ())
 });
 
 // --- fit(X_nan, Y): cross-decomposition ---
-pin_fit_rejects!(divergence_pls_regression_fit_nan, "PLSRegression", |x: Array2<f64>| {
-    PLSRegression::<f64>::new(1).fit(&x, &y_finite()).map(|_| ())
-});
-pin_fit_rejects!(divergence_pls_canonical_fit_nan, "PLSCanonical", |x: Array2<f64>| {
-    PLSCanonical::<f64>::new(1).fit(&x, &y_finite()).map(|_| ())
-});
+pin_fit_rejects!(
+    divergence_pls_regression_fit_nan,
+    "PLSRegression",
+    |x: Array2<f64>| {
+        PLSRegression::<f64>::new(1)
+            .fit(&x, &y_finite())
+            .map(|_| ())
+    }
+);
+pin_fit_rejects!(
+    divergence_pls_canonical_fit_nan,
+    "PLSCanonical",
+    |x: Array2<f64>| { PLSCanonical::<f64>::new(1).fit(&x, &y_finite()).map(|_| ()) }
+);
 pin_fit_rejects!(divergence_pls_svd_fit_nan, "PLSSVD", |x: Array2<f64>| {
     PLSSVD::<f64>::new(1).fit(&x, &y_finite()).map(|_| ())
 });
@@ -181,21 +232,31 @@ pin_fit_rejects!(divergence_cca_fit_nan, "CCA", |x: Array2<f64>| {
 
 // --- fit(X_inf): a representative Inf-side pin (sklearn raises the infinity
 //     ValueError; SpectralEmbedding returns Ok(garbage)) ---
-pin_fit_rejects!(divergence_spectral_embedding_fit_inf, "SpectralEmbedding(Inf)", |_x: Array2<f64>| {
-    SpectralEmbedding::new(2).fit(&x_inf(), &()).map(|_| ())
-});
-pin_fit_rejects!(divergence_lle_fit_inf, "LocallyLinearEmbedding(Inf)", |_x: Array2<f64>| {
-    LLE::new(2).with_n_neighbors(3).fit(&x_inf(), &()).map(|_| ())
-});
+pin_fit_rejects!(
+    divergence_spectral_embedding_fit_inf,
+    "SpectralEmbedding(Inf)",
+    |_x: Array2<f64>| { SpectralEmbedding::new(2).fit(&x_inf(), &()).map(|_| ()) }
+);
+pin_fit_rejects!(
+    divergence_lle_fit_inf,
+    "LocallyLinearEmbedding(Inf)",
+    |_x: Array2<f64>| {
+        LLE::new(2)
+            .with_n_neighbors(3)
+            .fit(&x_inf(), &())
+            .map(|_| ())
+    }
+);
 
 // --- transform(X_nan) after a finite fit: sklearn re-validates and raises ---
 /// Divergence: transform(X_nan) after a finite fit does not reject. sklearn 1.5.2
 /// re-runs `_validate_data(reset=False)` (force_all_finite=True) and raises
 /// `ValueError("Input X contains NaN.")`. Tracking: #2290.
 #[test]
-#[ignore = "divergence: spillover transform does not reject NaN input (sklearn ValueError); tracking #2290"]
 fn divergence_incremental_pca_transform_nan() {
-    let fitted = IncrementalPCA::<f64>::new(2).fit(&x_finite(), &()).expect("finite fit");
+    let fitted = IncrementalPCA::<f64>::new(2)
+        .fit(&x_finite(), &())
+        .expect("finite fit");
     let r = fitted.transform(&x_nan()).map(|_| ());
     assert!(
         is_finiteness_rejection(&r),
@@ -204,10 +265,11 @@ fn divergence_incremental_pca_transform_nan() {
 }
 
 #[test]
-#[ignore = "divergence: spillover transform does not reject NaN input (sklearn ValueError); tracking #2290"]
 fn divergence_sparse_pca_transform_nan() {
-    let fitted =
-        SparsePCA::<f64>::new(2).with_random_state(0).fit(&x_finite(), &()).expect("finite fit");
+    let fitted = SparsePCA::<f64>::new(2)
+        .with_random_state(0)
+        .fit(&x_finite(), &())
+        .expect("finite fit");
     let r = fitted.transform(&x_nan()).map(|_| ());
     assert!(
         is_finiteness_rejection(&r),
@@ -216,7 +278,6 @@ fn divergence_sparse_pca_transform_nan() {
 }
 
 #[test]
-#[ignore = "divergence: spillover transform does not reject NaN input (sklearn ValueError); tracking #2290"]
 fn divergence_minibatch_nmf_transform_nan() {
     let fitted = MiniBatchNMF::<f64>::new(2)
         .with_random_state(0)
@@ -230,9 +291,11 @@ fn divergence_minibatch_nmf_transform_nan() {
 }
 
 #[test]
-#[ignore = "divergence: spillover transform does not reject NaN input (sklearn ValueError); tracking #2290"]
 fn divergence_isomap_transform_nan() {
-    let fitted = Isomap::new(2).with_n_neighbors(4).fit(&x_finite(), &()).expect("finite fit");
+    let fitted = Isomap::new(2)
+        .with_n_neighbors(4)
+        .fit(&x_finite(), &())
+        .expect("finite fit");
     let r = fitted.transform(&x_nan()).map(|_| ());
     assert!(
         is_finiteness_rejection(&r),

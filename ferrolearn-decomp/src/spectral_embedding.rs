@@ -47,7 +47,7 @@
 //! | REQ-2 | Structural embedding (shape `(n_samples, n_components)`, well-separated clusters separate, deterministic) | SHIPPED (scoped) | in-module + divergence structural guards |
 //! | REQ-3 | Normalized symmetric Laplacian `L_sym = I - D^{-1/2} W D^{-1/2}` (diagonal excluded, matching scipy) | SHIPPED | `normalised_laplacian`; matches `csgraph_laplacian(normed=True)` |
 //! | REQ-4 | RBF affinity off-diagonal `exp(-gamma·‖·‖²)` | SHIPPED (scoped) | `build_affinity_matrix` matches `rbf_kernel` off-diagonal (diagonal correctly 0 for the embedding Laplacian) |
-//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, <2 samples, kNN n_neighbors 0/≥n, gamma≤0) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-5 | Error/parameter contracts (n_components 0/≥n, <2 samples, kNN n_neighbors 0/≥n, gamma≤0, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards; divergence error tests. NON-FINITE: `fit` calls `reject_non_finite` (`spectral_embedding.rs` symbol `reject_non_finite`) BEFORE building the affinity matrix / Laplacian eigendecomposition, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_spectral_embedding.py:741`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_spectral_embedding_fit_nan`/`_fit_inf` match the live sklearn 1.5.2 oracle (#2290) |
 //! | REQ-6 | kNN affinity GRAPH parity (`kneighbors_graph(include_self=True)` symmetrized `0.5(A+Aᵀ)`) | NOT-STARTED | sklearn `_spectral_embedding.py:689-710` — blocker #1445 |
 //! | REQ-7 | `eigen_solver`/`random_state` + degenerate-eigenvalue subspace basis (CARVE-OUT) + symmetric-fixture sign-flip ULP tie | NOT-STARTED | sklearn `_spectral_embedding.py:347-465` — blocker #1446 |
 //! | REQ-8 | Default `affinity='nearest_neighbors'` + `gamma=None→1/n_features` + precomputed/callable affinity | NOT-STARTED | sklearn `_spectral_embedding.py:660-715` — blocker #1447 |
@@ -59,6 +59,26 @@ use crate::mds::eigh_faer;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
 use ndarray::Array2;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `SpectralEmbedding.fit`
+/// (`sklearn/manifold/_spectral_embedding.py:741`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE building the affinity matrix
+/// and the Laplacian eigendecomposition. NaN AND infinity are both rejected.
+/// The message names "NaN" and "infinity" to mirror sklearn's `ValueError`.
+/// Never panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Affinity type
@@ -267,6 +287,10 @@ impl Fit<Array2<f64>, ()> for SpectralEmbedding {
                 context: "SpectralEmbedding::fit requires at least 2 samples".into(),
             });
         }
+        // Reject NaN/Inf BEFORE building the affinity matrix and the Laplacian
+        // eigendecomposition (sklearn's `_validate_data(force_all_finite=True)`
+        // at `_spectral_embedding.py:741`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
         // We need n_components + 1 eigenvectors (to skip the trivial one).
         if self.n_components >= n {
             return Err(FerroError::InvalidParameter {

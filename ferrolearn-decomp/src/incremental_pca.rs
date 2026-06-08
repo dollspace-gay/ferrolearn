@@ -63,7 +63,7 @@
 //! | REQ-6 | `explained_variance_` = `S²/(n_total−1)` | SHIPPED | matches sklearn (single 1.8e-15); `test_explained_variance_positive` |
 //! | REQ-7 | `singular_values_` | SHIPPED | matches sklearn (single 1.3e-15) |
 //! | REQ-8 | `components_` rows unit-norm | SHIPPED | `test_components_approx_unit_length` |
-//! | REQ-9 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`partial_fit`/`transform` guards. FLAG: ferrolearn rejects `n_components>=n_features`; sklearn allows `n_components==n_features ≤ min(n,p)` (REQ-14 #1590) |
+//! | REQ-9 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`partial_fit`/`transform` guards. NON-FINITE: `partial_fit_batch` (the fit/partial_fit core) + `transform` call `reject_non_finite` (`incremental_pca.rs` symbol `reject_non_finite`) BEFORE the incremental-SVD/projection math, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_incremental_pca.py:227`,`:281`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_incremental_pca_fit_nan`/`_transform_nan` match the live sklearn 1.5.2 oracle (#2290). FLAG: ferrolearn rejects `n_components>=n_features`; sklearn allows `n_components==n_features ≤ min(n,p)` (REQ-14 #1590) |
 //! | REQ-10 | `n_samples_seen` accumulation + `partial_fit` chaining + batch chunking | SHIPPED | `test_partial_fit_chaining`, `test_n_samples_seen`, `test_batch_size_*` |
 //! | REQ-12 | f32/f64 generic | SHIPPED | `test_f32_support` |
 //! | REQ-15 | running `var_` fitted attr + accessor | SHIPPED | `var_` field + `var()` accessor; matches sklearn `var_` exactly (was #1591, retired into REQ-3) |
@@ -81,6 +81,25 @@ use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `IncrementalPCA.fit`/`partial_fit`/`transform`
+/// (`sklearn/decomposition/_incremental_pca.py:227`,`:281`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE any SVD math. NaN AND
+/// infinity are both rejected. The message names "NaN" and "infinity" to mirror
+/// sklearn's `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // IncrementalPCA (unfitted)
@@ -271,6 +290,11 @@ impl<F: Float + Send + Sync + 'static> FittedIncrementalPCA<F> {
                 context: "IncrementalPCA::partial_fit_batch: feature dimension mismatch".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE any incremental-SVD math (sklearn
+        // `_validate_data(force_all_finite=True)` at `_incremental_pca.py:227`
+        // (fit) / `:281` (partial_fit), `utils/validation.py:147-154`).
+        reject_non_finite(x_batch)?;
 
         let n_components = self.components_.nrows();
         let last_count = self.n_samples_seen_;
@@ -643,6 +667,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedIncrementa
                 context: "FittedIncrementalPCA::transform".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the projection (sklearn re-validates with
+        // `_validate_data(reset=False, force_all_finite=True)` at
+        // `_incremental_pca.py:281`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let mut x_centred = x.to_owned();
         for mut row in x_centred.rows_mut() {

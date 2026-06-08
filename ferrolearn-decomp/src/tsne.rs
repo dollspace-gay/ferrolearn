@@ -55,7 +55,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | Structural: embedding shape + early-exag/momentum/Barnes-Hut(or exact) GD runs + determinism | SHIPPED (scoped) | `fit` (`tsne.rs:538`); `test_tsne_basic_shape`/`_3d_embedding`/`_exact_mode`/`_reproducibility` |
 //! | REQ-2 | Perplexity binary-search affinities → valid symmetric joint P | SHIPPED (scoped) | `compute_pij_row` (`:410`) + `compute_joint_probabilities` (`:467`); P internal (no accessor). `/2n` ≡ sklearn `/sum(P)` (conditional rows sum to 1, verified) |
-//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples<2, perplexity ≤0/≥n, learning_rate ≤0, theta <0) | SHIPPED (scoped) | `fit` guards (`:554-593`). FLAG: sklearn raises `InvalidParameterError`, enforces `early_exaggeration in [1,inf)`, `max_iter>=250`, `angle in [0,1]`, `n_components<4` for barnes_hut |
+//! | REQ-3 | Error/parameter contracts (n_components 0, n_samples<2, perplexity ≤0/≥n, learning_rate ≤0, theta <0, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards. NON-FINITE: `fit` calls `reject_non_finite` (`tsne.rs` symbol `reject_non_finite`) BEFORE the affinity/gradient-descent math, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_t_sne.py:884`,`:891`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_tsne_fit_nan` matches the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `InvalidParameterError`, enforces `early_exaggeration in [1,inf)`, `max_iter>=250`, `angle in [0,1]`, `n_components<4` for barnes_hut |
 //! | REQ-4 | Cluster SEPARATION (the "did t-SNE work" check) + finite kl_divergence_≥0 + n_iter_ | SHIPPED (scoped) | `test_tsne_separates_clusters` (3-NN recovery > 0.8) + `compute_kl_divergence` (`:496`); green-guard `separates_clusters_knn_recovery` |
 //! | REQ-5 | EXACT `embedding_`/`kl_divergence_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): random Xoshiro init vs sklearn deterministic PCA default + non-convex local minima + learning_rate 200-vs-auto + Barnes-Hut — blocker #1597 |
 //! | REQ-6 | `init='pca'` default + `init='random'`(`1e-4*randn`) + ndarray init | NOT-STARTED | sklearn `_t_sne.py:837,:1019-1036`; ferrolearn always random — blocker #1598 |
@@ -77,6 +77,25 @@ use ndarray::Array2;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
 use rand_xoshiro::Xoshiro256PlusPlus;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `TSNE._fit` for both the barnes_hut and exact branches
+/// (`sklearn/manifold/_t_sne.py:884`,`:891`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the affinity / gradient-descent
+/// math. NaN AND infinity are both rejected. The message names "NaN" and
+/// "infinity" to mirror sklearn's `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Tsne (unfitted)
@@ -622,6 +641,11 @@ impl Fit<Array2<f64>, ()> for Tsne {
                 reason: "must be non-negative".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the affinity / gradient-descent math (sklearn's
+        // `_validate_data(force_all_finite=True)` at `_t_sne.py:884` (barnes_hut)
+        // / `:891` (exact), `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let dim = self.n_components;
 

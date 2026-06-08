@@ -47,7 +47,7 @@
 //! | REQ-2 | Classical-MDS DISTANCE-PRESERVATION (embedding pairwise distances reconstruct the input Euclidean dissimilarities — exact at full rank `n_components ≥ rank`, best low-rank approximation otherwise) | SHIPPED | `classical_mds` double-centre `B=-0.5 J D² J` + eigendecomp + `X_k=v_k·√max(λ_k,0)`; reconstructs the input distance matrix to ~1e-15 (full-rank 2D/3D + precomputed oracle tests in `tests/divergence_mds.rs`). Consumers: re-export `lib.rs:95` + `isomap.rs:38,339` (Isomap on geodesic distances) |
 //! | REQ-3 | Structural (embedding shape `(n_samples, n_components)`, deterministic given input) | SHIPPED (scoped) | `fit`; shape + determinism guards |
 //! | REQ-4 | Kruskal stress-1 computation | SHIPPED (scoped) | `kruskal_stress` `√(Σ(d_o-d_e)²/Σ d_o²)`; stress≈0 on a perfect embedding. NOTE sklearn `stress_` is raw SSR `((dis-disparities)²)/2` — a DIFFERENT definition (REQ-8) |
-//! | REQ-5 | Error/parameter contracts (n_components 0 / > n_samples) | SHIPPED (scoped) | `fit` guards. NOTE ferrolearn rejects `n_components > n_samples`; sklearn has no such upper bound (ABI divergence, REQ-8) |
+//! | REQ-5 | Error/parameter contracts (n_components 0 / > n_samples, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards. NON-FINITE: `fit` calls `reject_non_finite` (`mds.rs` symbol `reject_non_finite`) BEFORE the dissimilarity/eigendecomposition math, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_mds.py:627`,`utils/validation.py:147-154`). `tests/divergence_nonfinite_spillover.rs::divergence_mds_fit_nan` matches the live sklearn 1.5.2 oracle (#2290). NOTE ferrolearn rejects `n_components > n_samples`; sklearn has no such upper bound (ABI divergence, REQ-8) |
 //! | REQ-6 | SMACOF algorithm (iterative stress majorization + `n_init`=4 restarts + `random_state`) | NOT-STARTED | sklearn `_mds.py:22-167,348-387` — blocker #1453 |
 //! | REQ-7 | `metric=False` non-metric MDS (IsotonicRegression on disparities) | NOT-STARTED | sklearn `_mds.py:130-144` — blocker #1454 |
 //! | REQ-8 | `normalized_stress` + sklearn `stress_` (raw SSR) definition + `max_iter`/`eps` | NOT-STARTED | sklearn `_mds.py:147,160-165` — blocker #1455 |
@@ -58,6 +58,24 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
 use ndarray::Array2;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `MDS.fit`/`fit_transform` (`sklearn/manifold/_mds.py:627`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the dissimilarity / SMACOF
+/// math. NaN AND infinity are both rejected. The message names "NaN" and
+/// "infinity" to mirror sklearn's `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Dissimilarity type
@@ -301,6 +319,11 @@ impl Fit<Array2<f64>, ()> for MDS {
                 reason: "must be at least 1".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the dissimilarity / eigendecomposition math
+        // (sklearn's `_validate_data(force_all_finite=True)` at `_mds.py:627`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let sq_dist = match self.dissimilarity {
             Dissimilarity::Euclidean => {

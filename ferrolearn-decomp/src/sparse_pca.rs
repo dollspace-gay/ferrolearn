@@ -47,7 +47,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | `transform` = RIDGE regression (`ridge_alpha=0.01`), not plain projection | SHIPPED | `transform` solves `U = (X−mean_)·Cᵀ·(C·Cᵀ + 0.01·I)⁻¹` == `ridge_regression(components_.T, X_centered.T, 0.01, solver="cholesky")` (sklearn `_sparse_pca.py:119-121`); matches the sklearn ridge oracle on ferrolearn's own fitted components to 1e-6 in `tests/divergence_sparse_pca.rs::divergence_transform_is_ridge_not_projection` (was #1477, fixed). Consumers: re-export `lib.rs:99`, `_RsSparsePCA` `extras.rs:1129` |
 //! | REQ-2 | Structural: components sparsity (L1→exact zeros), shape `(n_components,n_features)`, mean centering, error-decrease, determinism | SHIPPED (scoped) | `fn fit` centers via per-feature `mean` (= `mean_ = X.mean(axis=0)` `_sparse_pca.py:83`), alternating soft-threshold sparse-coding + dictionary update, seeded `StdRng` ⇒ deterministic. Green-guards in `tests/divergence_sparse_pca.rs` + in-module tests. STRUCTURAL only, NOT component VALUES (REQ-4) |
-//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, <2 samples, transform col mismatch) | SHIPPED (scoped) | `fn fit` guards (`InvalidParameter`/`InsufficientSamples`); `transform` `ShapeMismatch`. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features`/`n_samples<2` |
+//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, <2 samples, transform col mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fn fit` guards (`InvalidParameter`/`InsufficientSamples`); `transform` `ShapeMismatch`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`sparse_pca.rs` symbol `reject_non_finite`) BEFORE the sparse-coding/ridge math, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_sparse_pca.py:81`,`:116`,`utils/validation.py:147-154`) — the real input gate (the `is_finite` at `:641-642` is TEST-only). `tests/divergence_nonfinite_spillover.rs::divergence_sparse_pca_fit_nan`/`_transform_nan` match the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features`/`n_samples<2` |
 //! | REQ-4 | EXACT `components_` value parity with sklearn `dict_learning` | NOT-STARTED | CARVE-OUT (R-DEFER-3): LARS lasso + numpy RNG + `svd_flip` + per-feature alpha scaling (`_sparse_pca.py:308-336`, `_dict_learning.py:120`) vs ferrolearn random-init soft-threshold-CD + LS update — blocker #1478 |
 //! | REQ-5 | `ridge_alpha` ctor/builder param exposure | NOT-STARTED | sklearn `SparsePCA(ridge_alpha=0.01)` `_sparse_pca.py:284`; ferrolearn hard-codes 0.01 in `transform` (REQ-1) — blocker #1479 |
 //! | REQ-6 | `method` (`lars`/`cd`) field + LARS sparse-coding path | NOT-STARTED | sklearn `method="lars"` → `dict_learning(method=)` `_sparse_pca.py:287/:319`; ferrolearn single soft-threshold CD coder — blocker #1480 |
@@ -65,6 +65,26 @@ use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Uniform};
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `SparsePCA.fit`/`transform` (`sklearn/decomposition/_sparse_pca.py:81`,
+/// `:116`), raising `ValueError("Input X contains NaN.")` /
+/// `"... contains infinity ..."` (`sklearn/utils/validation.py:147-154`) BEFORE
+/// any decomposition / ridge math. NaN AND infinity are both rejected. The
+/// message names "NaN" and "infinity" to mirror sklearn's `ValueError`. Never
+/// panics (R-CODE-2). (The `is_finite` checks in `#[cfg(test)]` below are
+/// test-only and do NOT gate input — this guard is the real input gate.)
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // SparsePCA (unfitted)
@@ -314,6 +334,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SparsePCA<F> {
             });
         }
 
+        // Reject NaN/Inf BEFORE the alternating sparse-coding math (sklearn
+        // `_validate_data(force_all_finite=True)` at `_sparse_pca.py:81`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
+
         let n_comp = self.n_components;
         let n_f = F::from(n_samples).unwrap();
         let alpha_f = F::from(self.alpha).unwrap_or_else(F::one);
@@ -530,6 +555,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedSparsePCA<
                 context: "FittedSparsePCA::transform".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the ridge projection (sklearn re-validates with
+        // `_validate_data(reset=False, force_all_finite=True)` at
+        // `_sparse_pca.py:116`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let mut x_centered = x.to_owned();
         for mut row in x_centered.rows_mut() {

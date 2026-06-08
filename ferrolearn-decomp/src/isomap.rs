@@ -47,7 +47,7 @@
 //! | REQ-1 | Isomap embedding VALUE parity (classical MDS on geodesic distances + KernelPCA `svd_flip` deterministic sign) | SHIPPED | `fit` applies the per-column max-abs-positive sign flip (sklearn `svd_flip` `_kernel_pca.py:373`); element-wise matches live sklearn EXACTLY (no sign alignment) across n_neighbors {3,4,5}, n_components {1,2,3}, 3 fixtures in `tests/divergence_isomap.rs` (was #1468, fixed). Consumer: re-export `lib.rs:89` |
 //! | REQ-2 | Geodesic distance matrix parity (kNN graph + Dijkstra == sklearn `dist_matrix_`) | SHIPPED | `build_knn_graph` + `all_pairs_shortest_paths` match sklearn `kneighbors_graph(mode=distance)` + `shortest_path` (`_isomap.py:242-299`); verified via sign-robust embedding + embedding-distance equality |
 //! | REQ-3 | Structural (embedding shape, deterministic) | SHIPPED (scoped) | shape + determinism guards. NOTE disconnected-graph: ferrolearn errors (NumericalInstability), sklearn warns+completes (REQ-9) |
-//! | REQ-4 | Error/parameter contracts (n_components 0/>n, n_neighbors 0/≥n, <2 samples, disconnected) | SHIPPED (scoped) | `fit` guards; divergence error tests |
+//! | REQ-4 | Error/parameter contracts (n_components 0/>n, n_neighbors 0/≥n, <2 samples, disconnected, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards; divergence error tests. NON-FINITE: `fit` (BEFORE the kNN graph) + `transform` call `reject_non_finite` (`isomap.rs` symbol `reject_non_finite`), returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `nbrs_.fit/kneighbors` `_validate_data(force_all_finite=True)` (`_isomap.py:228`,`:411`,`utils/validation.py:147-154`) — REPLACES the incidental "kNN graph disconnected" `NumericalInstability` for non-finite X (R-DEV-2). `tests/divergence_nonfinite_spillover.rs::divergence_isomap_fit_nan`/`_transform_nan` match the live sklearn 1.5.2 oracle (#2290) |
 //! | REQ-5 | `transform` out-of-sample (geodesic-graph-linked, not Euclidean) | NOT-STARTED | `transform` uses raw Euclidean to-train distances; sklearn `_isomap.py:419-460` — blocker #1469 |
 //! | REQ-6 | `radius` mode + `radius_neighbors_graph` | NOT-STARTED | sklearn `_isomap.py:253-261` — blocker #1470 |
 //! | REQ-7 | `path_method` (FW/Floyd-Warshall vs D/Dijkstra) + `eigen_solver`/`tol`/`max_iter` | NOT-STARTED | sklearn `_isomap.py:299,233-240` — blocker #1471 |
@@ -62,6 +62,28 @@ use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::Array2;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn validates X with `force_all_finite=True` (the `check_array` default)
+/// inside `Isomap`'s `nbrs_.fit(X)` / `nbrs_.kneighbors(X)` (NearestNeighbors)
+/// at the top of `_fit_transform` (`sklearn/manifold/_isomap.py:228`) and
+/// `transform` (`:411`), raising `ValueError("Input X contains NaN.")` /
+/// `"... contains infinity ..."` (`sklearn/utils/validation.py:147-154`) BEFORE
+/// the kNN graph / geodesic / MDS math. Calling this FIRST means a non-finite X
+/// yields the CLEAN finiteness rejection instead of the incidental "kNN graph
+/// disconnected" `NumericalInstability`. NaN AND infinity are both rejected. The
+/// message names "NaN" and "infinity" to mirror sklearn's `ValueError`. Never
+/// panics (R-CODE-2).
+fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Isomap (unfitted)
@@ -317,6 +339,13 @@ impl Fit<Array2<f64>, ()> for Isomap {
             });
         }
 
+        // Reject NaN/Inf BEFORE the kNN graph, so a non-finite X gives the CLEAN
+        // finiteness rejection rather than the incidental "kNN graph
+        // disconnected" `NumericalInstability` (sklearn validates X inside
+        // `nbrs_.fit(X)` with `force_all_finite=True`, `_isomap.py:228`,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
+
         // Step 1: pairwise Euclidean distances.
         let sq_dist = pairwise_sq_distances(x);
 
@@ -456,6 +485,11 @@ impl Transform<Array2<f64>> for FittedIsomap {
                 context: "FittedIsomap::transform".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE the kNN / Nystroem projection (sklearn validates
+        // X inside `nbrs_.kneighbors(X)` with `force_all_finite=True`,
+        // `_isomap.py:411`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let n_test = x.nrows();
         let n_train = self.x_train_.nrows();

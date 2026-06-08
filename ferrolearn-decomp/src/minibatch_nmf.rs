@@ -42,7 +42,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | Structural: components shape `(n_components,n_features)`, finite `reconstruction_err_`, `n_iter_` in `[1, max_iter]`, seed-determinism | SHIPPED (scoped) | `fit` (`minibatch_nmf.rs:365`) stores `components_` shape, finite Frobenius `reconstruction_err_`, positive `n_iter_`; seeded `StdRng` ⇒ deterministic. Green-guards in `tests/divergence_minibatch_nmf.rs` + in-module tests. STRUCTURAL only, NOT component values (REQ-4) |
 //! | REQ-2 | Non-negativity of `components_` (H) and `transform` (W) — NMF invariant | SHIPPED | `fit` clamps H ≥ 0 (`:468-470`); `update_w_batch` clamps W ≥ 0 (`:340-344`). Green-guard `guard_nonnegative` + `test_minibatch_nmf_components_nonnegative` |
-//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, negative input, 0 samples, transform col mismatch) | SHIPPED (scoped) | `fit` guards (`:368-399`); `transform` `ShapeMismatch` (`:509-515`). FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features` |
+//! | REQ-3 | Error / parameter contracts (n_components 0/>n_features, negative input, 0 samples, transform col mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards; `transform` `ShapeMismatch`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`minibatch_nmf.rs` symbol `reject_non_finite`) BEFORE the non-negativity check and the factorization, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` finiteness-before-non-negativity (`_nmf.py:2236`,`:2407`,`utils/validation.py:147-154`) — the real input gate (the `is_finite` at `:664` is TEST-only). `tests/divergence_nonfinite_spillover.rs::divergence_minibatch_nmf_fit_nan`/`_transform_nan` match the live sklearn 1.5.2 oracle (#2290). FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, does not pre-reject `n_components>n_features` |
 //! | REQ-4 | EXACT `components_` value parity with sklearn online MU | NOT-STARTED | CARVE-OUT (R-DEFER-3): NNDSVDa + EWA aggregates A/B + `forget_factor` rho + numpy RNG (`_nmf.py:2254-2349`) vs ferrolearn CD-W + plain-MU-H + deterministic batching — blocker #1486 |
 //! | REQ-5 | `transform` = `_solve_W` MU formula | NOT-STARTED | CARVE-OUT, folds into REQ-4: critic confirmed (live oracle) ferrolearn's 5-iter CD reaches the SAME convex NNLS optimum as sklearn `_solve_W` (residual match relative ~1.4e-5 on its own H); not observable — blocker #1487 |
 //! | REQ-6 | `beta_loss` (kullback-leibler/itakura-saito) + `_gamma` | NOT-STARTED | sklearn `_nmf.py:2011,:2057-2062,:89`; ferrolearn is Frobenius-only — blocker #1488 |
@@ -65,6 +65,29 @@ use ndarray::Array2;
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Uniform};
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `MiniBatchNMF.fit`/`fit_transform`/`transform`
+/// (`sklearn/decomposition/_nmf.py:2236`,`:2407`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the non-negativity check and
+/// any factorization math. NaN AND infinity are both rejected, and finiteness
+/// is checked BEFORE non-negativity (sklearn's `_validate_data` → `check_array`
+/// finiteness runs before `_check_X`'s non-negative `check_non_negative`). The
+/// message names "NaN" and "infinity" to mirror sklearn's `ValueError`. Never
+/// panics (R-CODE-2). (The `is_finite` check in `#[cfg(test)]` below is
+/// test-only and does NOT gate input — this guard is the real input gate.)
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Configuration enums
@@ -419,6 +442,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MiniBatchNMF<F> {
             });
         }
 
+        // Reject NaN/Inf BEFORE the non-negativity check and the factorization
+        // (sklearn's `_validate_data(force_all_finite=True)` at `_nmf.py:2236`
+        // runs `check_array` finiteness BEFORE `_check_X`'s non-negativity,
+        // `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
+
         // Check non-negativity.
         for &v in x.iter() {
             if v < F::zero() {
@@ -544,6 +573,10 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMiniBatchN
                 context: "FittedMiniBatchNMF::transform".into(),
             });
         }
+
+        // Reject NaN/Inf BEFORE solving for W (sklearn re-validates with
+        // `_validate_data(force_all_finite=True)`, `utils/validation.py:147-154`).
+        reject_non_finite(x)?;
 
         let n_samples = x.nrows();
         let n_comp = self.components_.nrows();
