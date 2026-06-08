@@ -1,41 +1,31 @@
-//! Divergence pins (R-CODE-2 release-blocker): ferrolearn-tree's ACCEPT-set
-//! DecisionTree* and Bagging* builders STACK-OVERFLOW (process abort, SIGABRT)
-//! when `fit` is called with NaN in `X`, whereas scikit-learn 1.5.2 ACCEPTS NaN
-//! and returns a fitted model.
+//! Native NaN support: the ACCEPT-set DecisionTree* (and the Bagging* learners
+//! that build them) no longer STACK-OVERFLOW on `fit(X_nan, ...)`; they accept
+//! NaN and produce a fitted model, matching scikit-learn 1.5.2.
 //!
-//! Root cause: the recursive CART builder (`build_classification_tree` /
-//! `build_regression_tree` in `decision_tree.rs`) chooses a split threshold and
-//! partitions with `x[[i, feature]] <= threshold`. A NaN feature value (or a
-//! NaN-derived threshold) makes every `<=` comparison `false`, so a node of `n`
-//! samples partitions into `(n, 0)` — the recursion descends on the SAME `n`
-//! samples without shrinking, unbounded, until the stack overflows and the
-//! process aborts. Bagging* fits DecisionTree base learners, so it inherits the
-//! abort.
+//! Root cause (now FIXED): the recursive CART builder partitioned with
+//! `x[[i, feature]] <= threshold`, which sends every NaN right (`NaN <= t` is
+//! `false`); a NaN-derived split could yield `(n, 0)` and the recursion
+//! descended on the same `n` samples unbounded until the stack overflowed.
+//! `decision_tree.rs` now implements sklearn's native missing-value splitter
+//! (`node_split_best`, `_splitter.pyx:293`): NaN sorts last, the best split
+//! records a per-node `missing_go_to_left` direction (`tree_.missing_go_to_left`,
+//! `_tree.pyx:746`), the partition + predict route NaN to that direction
+//! (`_apply_dense`, `_tree.pyx:1015-1025`), so a node's samples always shrink
+//! and the recursion terminates.
 //!
-//! sklearn contract: the tree base passes `force_all_finite=False`
-//! (`sklearn/tree/_classes.py:248-250`) and supports missing values natively
-//! (`_compute_missing_values_in_feature_mask`, `_classes.py:256-258`), so
-//! `DecisionTreeClassifier(random_state=0).fit(X_nan, y)` returns a fitted model
-//! (live oracle: FIT-OK). RandomForest*/HistGB* also accept NaN and do NOT abort
-//! in ferrolearn (separate code paths) — those are documented NOT-STARTED
-//! missing-value-support value-mismatches, not abort blockers, and are NOT
-//! pinned here.
-//!
-//! NOTE ON THE ARTIFACT: a Rust stack overflow is uncatchable (it raises SIGABRT
-//! and aborts the whole test process — `catch_unwind` and a bounded-stack thread
-//! both still abort). These tests are therefore `#[ignore]`d so the default
-//! suite stays green; running them with `--ignored` ABORTS the test binary
-//! (signal 6), which is the failing artifact that pins the blocker. They go
-//! green only when `fit(X_nan, ...)` returns (Ok, per sklearn accept-set
-//! semantics, or a clean `Err` — either way: no abort).
+//! sklearn contract: `force_all_finite=False` (`sklearn/tree/_classes.py:248-250`)
+//! ⇒ `DecisionTree*.fit(X_nan, y)` returns a fitted model. The DecisionTree pins
+//! below now assert sklearn PARITY (fit succeeds AND predict matches sklearn);
+//! the Bagging pins (bootstrap + RNG, so exact predictions are RNG-dependent and
+//! not array-compared) assert fit SUCCEEDS — they inherit the DecisionTree fix.
 //!
 //! Tracking: #2277.
 
-use ferrolearn_core::Fit;
+use ferrolearn_core::{Fit, Predict};
 use ferrolearn_tree::{
     BaggingClassifier, BaggingRegressor, DecisionTreeClassifier, DecisionTreeRegressor,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn x_nan() -> Array2<f64> {
     let mut x = Array2::from_shape_vec(
@@ -53,58 +43,60 @@ fn yr() -> Array1<f64> {
     array![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 }
 
-/// sklearn `DecisionTreeClassifier(random_state=0).fit(X_nan, y)` returns a
-/// fitted model (accepts NaN, `_classes.py:248-250` `force_all_finite=False`);
-/// ferrolearn STACK-OVERFLOWS (process abort). Tracking: #2277.
+/// sklearn `DecisionTreeClassifier().fit(X_nan, y)` succeeds; splits on the clean
+/// feature 1 (`tree_.feature[0]==1`, `threshold==4.5`); `predict == y`.
+/// (oracle: `DecisionTreeClassifier().fit(X,y); c.tree_.feature[0]==1,
+/// c.tree_.threshold[0]==4.5, c.predict(X)==[0,0,0,1,1,1]`.) Was a stack-overflow
+/// abort. Tracking: #2277.
 #[test]
-#[ignore = "divergence(R-CODE-2): DecisionTreeClassifier.fit(NaN) stack-overflow abort; sklearn accepts NaN; tracking #2277"]
 fn divergence_decision_tree_classifier_nan_stack_overflow() {
-    // Reaching this call aborts the process (SIGABRT) on current ferrolearn.
-    let r = DecisionTreeClassifier::<f64>::new().fit(&x_nan(), &yc());
-    assert!(
-        r.is_ok() || r.is_err(),
-        "fit must return (sklearn accepts NaN), not abort via stack overflow"
-    );
+    let fitted = DecisionTreeClassifier::<f64>::new()
+        .fit(&x_nan(), &yc())
+        .expect("fit must accept NaN (sklearn force_all_finite=False), not abort");
+    // Parity with sklearn (split on the clean feature, exact predictions).
+    assert_eq!(fitted.predict(&x_nan()).unwrap(), array![0, 0, 0, 1, 1, 1]);
 }
 
-/// sklearn `DecisionTreeRegressor(random_state=0).fit(X_nan, y)` returns a
-/// fitted model; ferrolearn STACK-OVERFLOWS. Tracking: #2277.
+/// sklearn `DecisionTreeRegressor().fit(X_nan, y)` succeeds; splits on the clean
+/// feature 1 (`threshold==4.5`); `predict == y`. Was a stack-overflow abort.
+/// Tracking: #2277.
 #[test]
-#[ignore = "divergence(R-CODE-2): DecisionTreeRegressor.fit(NaN) stack-overflow abort; sklearn accepts NaN; tracking #2277"]
 fn divergence_decision_tree_regressor_nan_stack_overflow() {
-    let r = DecisionTreeRegressor::<f64>::new().fit(&x_nan(), &yr());
-    assert!(
-        r.is_ok() || r.is_err(),
-        "fit must return (sklearn accepts NaN), not abort via stack overflow"
-    );
+    let fitted = DecisionTreeRegressor::<f64>::new()
+        .fit(&x_nan(), &yr())
+        .expect("fit must accept NaN, not abort");
+    let preds = fitted.predict(&x_nan()).unwrap();
+    for (p, e) in preds.iter().zip([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]) {
+        assert!((p - e).abs() < 1e-12, "{p} != {e}");
+    }
 }
 
-/// sklearn `BaggingClassifier(...).fit(X_nan, y)` returns a fitted model
-/// (DecisionTree base accepts NaN); ferrolearn STACK-OVERFLOWS. Tracking: #2277.
+/// `BaggingClassifier` builds DecisionTree base learners; it inherits the
+/// missing-value fix and no longer overflows. sklearn
+/// `BaggingClassifier(...).fit(X_nan, y)` returns a fitted model (bootstrap + RNG
+/// ⇒ exact predictions are RNG-dependent, so only fit-success is asserted).
+/// Tracking: #2277.
 #[test]
-#[ignore = "divergence(R-CODE-2): BaggingClassifier.fit(NaN) stack-overflow abort; sklearn accepts NaN; tracking #2277"]
 fn divergence_bagging_classifier_nan_stack_overflow() {
-    let r = BaggingClassifier::<f64>::new()
+    let fitted = BaggingClassifier::<f64>::new()
         .with_n_estimators(3)
         .with_random_state(0)
-        .fit(&x_nan(), &yc());
-    assert!(
-        r.is_ok() || r.is_err(),
-        "fit must return (sklearn accepts NaN), not abort via stack overflow"
-    );
+        .fit(&x_nan(), &yc())
+        .expect("fit must accept NaN (DecisionTree base inherits the fix), not abort");
+    // Smoke: predict runs without panic / abort on the NaN data.
+    let preds = fitted.predict(&x_nan()).unwrap();
+    assert_eq!(preds.len(), 6);
 }
 
-/// sklearn `BaggingRegressor(...).fit(X_nan, y)` returns a fitted model;
-/// ferrolearn STACK-OVERFLOWS. Tracking: #2277.
+/// `BaggingRegressor` builds DecisionTree base learners; inherits the fix. Was a
+/// stack-overflow abort. Tracking: #2277.
 #[test]
-#[ignore = "divergence(R-CODE-2): BaggingRegressor.fit(NaN) stack-overflow abort; sklearn accepts NaN; tracking #2277"]
 fn divergence_bagging_regressor_nan_stack_overflow() {
-    let r = BaggingRegressor::<f64>::new()
+    let fitted = BaggingRegressor::<f64>::new()
         .with_n_estimators(3)
         .with_random_state(0)
-        .fit(&x_nan(), &yr());
-    assert!(
-        r.is_ok() || r.is_err(),
-        "fit must return (sklearn accepts NaN), not abort via stack overflow"
-    );
+        .fit(&x_nan(), &yr())
+        .expect("fit must accept NaN, not abort");
+    let preds = fitted.predict(&x_nan()).unwrap();
+    assert_eq!(preds.len(), 6);
 }

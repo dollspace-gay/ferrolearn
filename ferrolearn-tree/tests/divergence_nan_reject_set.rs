@@ -29,7 +29,7 @@ use ferrolearn_tree::{
     ExtraTreesClassifier, ExtraTreesRegressor, GradientBoostingClassifier,
     GradientBoostingRegressor, IsolationForest,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn x_nan() -> Array2<f64> {
     let mut x = Array2::from_shape_vec(
@@ -70,7 +70,10 @@ fn divergence_extra_tree_regressor_nan_not_rejected() {
     let r = ExtraTreeRegressor::<f64>::new()
         .with_random_state(0)
         .fit(&x_nan(), &yr());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `ExtraTreesClassifier(...).fit(X_nan, y)` -> ValueError. Tracking: #2278.
@@ -81,7 +84,10 @@ fn divergence_extra_trees_classifier_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yc());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `ExtraTreesRegressor(...).fit(X_nan, y)` -> ValueError. Tracking: #2278.
@@ -92,7 +98,10 @@ fn divergence_extra_trees_regressor_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yr());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `AdaBoostClassifier(...).fit(X_nan, y)` -> ValueError. Tracking: #2278.
@@ -103,7 +112,10 @@ fn divergence_adaboost_classifier_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yc());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `AdaBoostRegressor(...).fit(X_nan, y)` -> ValueError. Tracking: #2278.
@@ -114,7 +126,10 @@ fn divergence_adaboost_regressor_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yr());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `GradientBoostingClassifier(...).fit(X_nan, y)` -> ValueError.
@@ -126,7 +141,10 @@ fn divergence_gradient_boosting_classifier_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yc());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `GradientBoostingRegressor(...).fit(X_nan, y)` -> ValueError.
@@ -138,7 +156,10 @@ fn divergence_gradient_boosting_regressor_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &yr());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }
 
 /// sklearn `IsolationForest(...).fit(X_nan)` -> ValueError. Tracking: #2278.
@@ -149,5 +170,8 @@ fn divergence_isolation_forest_nan_not_rejected() {
         .with_n_estimators(3)
         .with_random_state(0)
         .fit(&x_nan(), &());
-    assert!(r.is_err(), "sklearn raises ValueError; ferrolearn returned Ok");
+    assert!(
+        r.is_err(),
+        "sklearn raises ValueError; ferrolearn returned Ok"
+    );
 }

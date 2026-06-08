@@ -40,7 +40,6 @@ use ndarray::{Array1, Array2, array};
 
 /// clf fit with +Inf in X: sklearn raises ValueError; ferrolearn returns Ok.
 #[test]
-#[ignore = "divergence: DT clf fit accepts +Inf in X vs sklearn ValueError (validation.py:172); tracking #2279"]
 fn clf_fit_pos_inf_rejected_like_sklearn() {
     let inf = f64::INFINITY;
     let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 8.0, 9.0, inf]).unwrap();
@@ -57,7 +56,6 @@ fn clf_fit_pos_inf_rejected_like_sklearn() {
 
 /// clf fit with -Inf in X: sklearn raises ValueError; ferrolearn returns Ok.
 #[test]
-#[ignore = "divergence: DT clf fit accepts -Inf in X vs sklearn ValueError (validation.py:172); tracking #2279"]
 fn clf_fit_neg_inf_rejected_like_sklearn() {
     let ninf = f64::NEG_INFINITY;
     let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 8.0, 9.0, ninf]).unwrap();
@@ -74,7 +72,6 @@ fn clf_fit_neg_inf_rejected_like_sklearn() {
 /// clf predict with +Inf in the query (trained on finite X): sklearn validates
 /// predict input and raises ValueError; ferrolearn returns Ok.
 #[test]
-#[ignore = "divergence: DT clf predict accepts +Inf query vs sklearn ValueError (validation.py:172); tracking #2279"]
 fn clf_predict_pos_inf_rejected_like_sklearn() {
     let inf = f64::INFINITY;
     let x = Array2::from_shape_vec((4, 1), vec![1.0, 2.0, 8.0, 9.0]).unwrap();
@@ -92,7 +89,6 @@ fn clf_predict_pos_inf_rejected_like_sklearn() {
 
 /// reg fit with +Inf in X: sklearn raises ValueError; ferrolearn returns Ok.
 #[test]
-#[ignore = "divergence: DT reg fit accepts +Inf in X vs sklearn ValueError (validation.py:172); tracking #2279"]
 fn reg_fit_pos_inf_rejected_like_sklearn() {
     let inf = f64::INFINITY;
     let x = Array2::from_shape_vec((5, 1), vec![1.0, 2.0, 8.0, 9.0, inf]).unwrap();

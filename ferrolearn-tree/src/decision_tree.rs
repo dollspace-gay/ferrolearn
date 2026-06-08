@@ -42,6 +42,7 @@
 //! | REQ-6 (predict / predict_proba / multiclass) | SHIPPED | `fn predict`/`fn predict_proba`/`fn predict_log_proba` (consumed by `RsDecisionTreeClassifier` + the pipeline adapter); pinned by `clf_predict_and_proba_oracle` + the per-criterion/param predict pins. Multi-output (2-D y) NOT-STARTED (#668). |
 //! | REQ-7 (class_weight + random_state) | SHIPPED (class_weight) | `pub enum ClassWeight<F>{None,Balanced,Explicit}` + `with_class_weight` + `fn compute_class_weight` on `DecisionTreeClassifier` (regressor has none); weighted impurity/leaf/gates via `fn weighted_compute_impurity`/`fn weighted_classification_node_value` (forest/extra-tree path unchanged). Pinned by `req7_clf_class_weight_oracle` (None/Explicit/Balanced split+predict+proba) + `test_compute_class_weight_balanced`. `random_state`/`splitter='random'` determinism = NOT-STARTED RNG boundary #670. |
 //! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #671. Imports `ndarray`, not `ferray-core` (R-SUBSTRATE). |
+//! | REQ-9 (native missing-value / NaN support) | SHIPPED | DecisionTree ACCEPTS NaN in `X` (`force_all_finite=False`, `_classes.py:248-250`); `fn fit` no longer rejects/aborts. The best-split search (`fn find_best_classification_split`/`fn find_best_regression_split`) sorts NaN last (`fn sort_indices_by_feature`), evaluates missing→LEFT and missing→RIGHT plus the `threshold=+∞` all-missing-right candidate (`node_split_best`, `_splitter.pyx:430-519`), and records the better direction as a per-split-node `missing_go_to_left` flag (in `NodeMeta`, extracted into `FittedDecisionTree*::missing_go_to_left`, sklearn `tree_.missing_go_to_left`, `_tree.pyx:746`). `fn partition_with_missing` routes NaN at fit-partition and `fn traverse_tree` routes NaN at predict to that direction (`_apply_dense`, `_tree.pyx:1015-1025`), eliminating the #2277 `(n,0)`-split stack overflow. **Non-test consumers**: `DecisionTreeClassifier`/`Regressor` `fit`/`predict` (re-exported at the crate root + the `RsDecisionTreeClassifier` PyO3 registration), and `BaggingClassifier`/`BaggingRegressor` (build DecisionTree base learners ⇒ inherit the fix, no longer overflow). Pinned by `divergence_tree_missing_values.rs` (clf/reg missing→left + missing→right + `threshold=+∞` deep tree + multi-feature, threshold/direction/predict matching live sklearn 1.5.2) and the rewritten `divergence_nan_stack_overflow.rs` (#2277 fit-succeeds + predict parity). All-finite trees are byte-identical (the 348 lib + `divergence_decision_tree` oracle pins stay green; `clf_all_finite_byte_identical_oracle`). The ExtraTree / random-splitter path does NOT support missing values (sklearn `_splitter.pyx:834`) — out of scope here. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -297,6 +298,19 @@ struct NodeMeta<F> {
     /// The node's own class distribution (classifier only) — the collapsed
     /// leaf's `predict_proba` row when pruned. `None` for regressors.
     distribution: Option<Vec<F>>,
+    /// For a SPLIT node, the direction a *missing* (NaN) value at the split
+    /// feature is routed: `true` ⇒ left child, `false` ⇒ right child. `false`
+    /// for leaves and for splits on a feature with no missing values.
+    ///
+    /// Mirrors sklearn's per-split-node `tree_.missing_go_to_left`
+    /// (`_tree.pyx:746-747,1017-1021`). The estimator builders ALWAYS record
+    /// `NodeMeta` (so this travels index-aligned with the flat `Vec<Node<F>>`
+    /// through best-first serialization and `ccp_alpha` pruning); the
+    /// `FittedDecisionTree*` structs extract it into their `missing_go_to_left`
+    /// vector for NaN-aware traversal. The forest builders pass `None` (no
+    /// `NodeMeta`), so their trees and the shared `Node::Split` enum are
+    /// byte-identical / unchanged.
+    missing_go_to_left: bool,
 }
 
 /// Data references for classification tree building.
@@ -525,6 +539,11 @@ pub struct FittedDecisionTreeClassifier<F> {
     n_features: usize,
     /// Per-feature importance scores (normalised to sum to 1).
     feature_importances: Array1<F>,
+    /// Per-node missing (NaN) routing direction, index-aligned with `nodes`
+    /// (`true` ⇒ left child). sklearn's `tree_.missing_go_to_left`
+    /// (`_tree.pyx:746`). Consulted by NaN-aware traversal at predict; for an
+    /// all-finite tree every entry is `false` and traversal is unchanged.
+    missing_go_to_left: Vec<bool>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedDecisionTreeClassifier<F> {
@@ -556,12 +575,13 @@ impl<F: Float + Send + Sync + 'static> FittedDecisionTreeClassifier<F> {
                 context: "number of features must match fitted model".into(),
             });
         }
+        reject_infinite(x)?;
         let n_samples = x.nrows();
         let n_classes = self.classes.len();
         let mut proba = Array2::zeros((n_samples, n_classes));
         for i in 0..n_samples {
             let row = x.row(i);
-            let leaf = traverse_tree(&self.nodes, &row);
+            let leaf = traverse_tree(&self.nodes, &self.missing_go_to_left, &row);
             if let Node::Leaf {
                 class_distribution: Some(ref dist),
                 ..
@@ -651,6 +671,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
                 reason: "must be at least 1".into(),
             });
         }
+        // sklearn rejects ±Inf in X even with `force_all_finite=False`
+        // (NaN is allowed by the missing-value path; Inf is fatal).
+        reject_infinite(x)?;
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.iter().copied().collect();
@@ -722,8 +745,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             threshold: self.min_impurity_decrease,
         };
 
-        // Record per-node pruning metadata only when `ccp_alpha > 0` (the cost
-        // of the side vec is otherwise skipped, and forest trees never need it).
+        // The estimator builders ALWAYS record `NodeMeta` (index-aligned with
+        // `nodes`) so the per-split-node `missing_go_to_left` flag travels
+        // through best-first serialization and `ccp_alpha` pruning. Forest
+        // builders still pass `None` (no meta) and stay byte-identical.
         let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
         let mut meta: Vec<NodeMeta<F>> = Vec::new();
@@ -731,27 +756,35 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             // Best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`):
             // expand the frontier node with the highest impurity improvement
             // until `max_leaf_nodes` leaves are reached.
-            let meta_arg = if prune { Some(&mut meta) } else { None };
             build_classification_tree_best_first(
                 &data,
                 &indices,
                 &mut nodes,
-                meta_arg,
+                Some(&mut meta),
                 &params,
                 &gate,
                 max_leaf_nodes,
             );
         } else {
-            let meta_arg = if prune { Some(&mut meta) } else { None };
             build_classification_tree(
-                &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+                &data,
+                &indices,
+                &mut nodes,
+                Some(&mut meta),
+                0,
+                &params,
+                &gate,
+                None,
             );
         }
 
         if prune {
-            nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+            let (pruned_nodes, pruned_meta) = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+            nodes = pruned_nodes;
+            meta = pruned_meta;
         }
 
+        let missing_go_to_left = missing_directions(&meta);
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
         Ok(FittedDecisionTreeClassifier {
@@ -759,8 +792,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Decisio
             classes,
             n_features,
             feature_importances,
+            missing_go_to_left,
         })
     }
+}
+
+/// Extract the per-node `missing_go_to_left` flags (index-aligned with the flat
+/// node vector) from the build's `NodeMeta` side table.
+fn missing_directions<F>(meta: &[NodeMeta<F>]) -> Vec<bool> {
+    meta.iter().map(|m| m.missing_go_to_left).collect()
 }
 
 impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedDecisionTreeClassifier<F> {
@@ -781,11 +821,12 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedDecisionTree
                 context: "number of features must match fitted model".into(),
             });
         }
+        reject_infinite(x)?;
         let n_samples = x.nrows();
         let mut predictions = Array1::zeros(n_samples);
         for i in 0..n_samples {
             let row = x.row(i);
-            let leaf = traverse_tree(&self.nodes, &row);
+            let leaf = traverse_tree(&self.nodes, &self.missing_go_to_left, &row);
             if let Node::Leaf { value, .. } = self.nodes[leaf] {
                 predictions[i] = float_to_usize(value);
             }
@@ -1004,6 +1045,11 @@ pub struct FittedDecisionTreeRegressor<F> {
     n_features: usize,
     /// Per-feature importance scores (normalised to sum to 1).
     feature_importances: Array1<F>,
+    /// Per-node missing (NaN) routing direction, index-aligned with `nodes`
+    /// (`true` ⇒ left child). sklearn's `tree_.missing_go_to_left`
+    /// (`_tree.pyx:746`). All-`false` for an all-finite tree (traversal
+    /// unchanged).
+    missing_go_to_left: Vec<bool>,
 }
 
 impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTreeRegressor<F> {
@@ -1051,6 +1097,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
                 reason: "must be at least 1".into(),
             });
         }
+        // sklearn rejects ±Inf in X even with `force_all_finite=False`
+        // (NaN is allowed by the missing-value path; Inf is fatal).
+        reject_infinite(x)?;
 
         // Poisson requires non-negative targets with a strictly positive sum,
         // mirroring sklearn's check (`_classes.py:267-277`): negative y raises
@@ -1101,39 +1150,49 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for DecisionTre
             threshold: self.min_impurity_decrease,
         };
 
-        // Record per-node pruning metadata only when `ccp_alpha > 0`.
+        // Always record `NodeMeta` on the estimator path so the per-split-node
+        // `missing_go_to_left` flag survives best-first serialization / pruning.
         let prune = self.ccp_alpha > F::zero();
         let mut nodes: Vec<Node<F>> = Vec::new();
         let mut meta: Vec<NodeMeta<F>> = Vec::new();
         if let Some(max_leaf_nodes) = self.max_leaf_nodes {
             // Best-first growth (`BestFirstTreeBuilder`, `_tree.pyx:407`).
-            let meta_arg = if prune { Some(&mut meta) } else { None };
             build_regression_tree_best_first(
                 &data,
                 &indices,
                 &mut nodes,
-                meta_arg,
+                Some(&mut meta),
                 &params,
                 &gate,
                 max_leaf_nodes,
             );
         } else {
-            let meta_arg = if prune { Some(&mut meta) } else { None };
             build_regression_tree(
-                &data, &indices, &mut nodes, meta_arg, 0, &params, &gate, None,
+                &data,
+                &indices,
+                &mut nodes,
+                Some(&mut meta),
+                0,
+                &params,
+                &gate,
+                None,
             );
         }
 
         if prune {
-            nodes = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+            let (pruned_nodes, pruned_meta) = prune_ccp(&nodes, &meta, n_samples, self.ccp_alpha);
+            nodes = pruned_nodes;
+            meta = pruned_meta;
         }
 
+        let missing_go_to_left = missing_directions(&meta);
         let feature_importances = compute_feature_importances(&nodes, n_features, n_samples);
 
         Ok(FittedDecisionTreeRegressor {
             nodes,
             n_features,
             feature_importances,
+            missing_go_to_left,
         })
     }
 }
@@ -1189,11 +1248,12 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedDecisionTree
                 context: "number of features must match fitted model".into(),
             });
         }
+        reject_infinite(x)?;
         let n_samples = x.nrows();
         let mut predictions = Array1::zeros(n_samples);
         for i in 0..n_samples {
             let row = x.row(i);
-            let leaf = traverse_tree(&self.nodes, &row);
+            let leaf = traverse_tree(&self.nodes, &self.missing_go_to_left, &row);
             if let Node::Leaf { value, .. } = self.nodes[leaf] {
                 predictions[i] = value;
             }
@@ -1271,21 +1331,63 @@ fn effective_min_samples_leaf<F: Float>(
     min_samples_leaf.max(ceil_weight)
 }
 
+/// Reject `±Inf` in `x` while ALLOWING `NaN` (missing values).
+///
+/// Mirrors scikit-learn's `_assert_all_finite(..., allow_nan=True)` path: the
+/// DecisionTree base passes `force_all_finite=False` (`_classes.py:248-250`),
+/// which only suppresses the NaN error — `has_inf` stays fatal and raises
+/// `ValueError("Input X contains infinity or a value too large for dtype ...")`
+/// (`sklearn/utils/validation.py:147-172`). `is_infinite()` is true for `±Inf`
+/// and false for `NaN`/finite, so NaN passes through to the missing-value path
+/// while `±Inf` is rejected. Applied at fit AND predict, classifier AND
+/// regressor.
+fn reject_infinite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| v.is_infinite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains infinity or a value too large for dtype.".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Sort `idxs` ascending by feature `feat` of `x`, putting any NaN last.
 ///
 /// Uses `Ordering::Equal` as the fallback for incomparable (NaN) pairs so the
 /// sort is total without panicking — no `partial_cmp(..).unwrap()` in
 /// production (R-CODE-2 / R-APG-1).
 fn sort_indices_by_feature<F: Float>(idxs: &mut [usize], x: &Array2<F>, feat: usize) {
+    use std::cmp::Ordering;
     idxs.sort_by(|&a, &b| {
-        x[[a, feat]]
-            .partial_cmp(&x[[b, feat]])
-            .unwrap_or(std::cmp::Ordering::Equal)
+        let va = x[[a, feat]];
+        let vb = x[[b, feat]];
+        // Force NaN (missing) values to sort LAST, mirroring sklearn's
+        // partitioner which packs missing values into `samples[-n_missing:]`
+        // (`_splitter.pyx:918-944`). `partial_cmp(..).unwrap_or(Equal)` alone
+        // leaves NaN unordered (NaN comparisons are `None` ⇒ `Equal`), which
+        // would scatter missing values through the sorted prefix.
+        match (va.is_nan(), vb.is_nan()) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => va.partial_cmp(&vb).unwrap_or(Ordering::Equal),
+        }
     });
 }
 
-/// Traverse the tree from root to leaf for a single sample, returning the leaf node index.
-fn traverse_tree<F: Float>(nodes: &[Node<F>], sample: &ndarray::ArrayView1<F>) -> usize {
+/// Traverse the tree from root to leaf for a single sample, routing NaN
+/// (missing) values to each split node's learned `missing_go_to_left`
+/// direction.
+///
+/// `missing` is index-aligned with `nodes` (`true` ⇒ left). Finite values
+/// compare `<= threshold` as usual; NaN routes to the learned direction
+/// (`_tree.pyx:1015-1025`, `_apply_dense`). A `threshold = +∞` split (the
+/// "all-missing-right" candidate) routes finite values left, NaN right.
+fn traverse_tree<F: Float>(
+    nodes: &[Node<F>],
+    missing: &[bool],
+    sample: &ndarray::ArrayView1<F>,
+) -> usize {
     let mut idx = 0;
     loop {
         match &nodes[idx] {
@@ -1296,22 +1398,32 @@ fn traverse_tree<F: Float>(nodes: &[Node<F>], sample: &ndarray::ArrayView1<F>) -
                 right,
                 ..
             } => {
-                if sample[*feature] <= *threshold {
-                    idx = *left;
+                let v = sample[*feature];
+                idx = if v.is_nan() {
+                    if missing.get(idx).copied().unwrap_or(false) {
+                        *left
+                    } else {
+                        *right
+                    }
+                } else if v <= *threshold {
+                    *left
                 } else {
-                    idx = *right;
-                }
+                    *right
+                };
             }
             Node::Leaf { .. } => return idx,
         }
     }
 }
 
-/// Traverse a tree from root to leaf for a single sample (crate-public wrapper).
+/// Traverse a tree from root to leaf for a single sample (crate-public wrapper
+/// for the forest ensembles, which do not carry missing-value routing).
 ///
-/// Returns the index of the leaf node in the flat node vector.
+/// Routes finite values via `<= threshold`; NaN goes right (the default
+/// direction), matching the byte-identical pre-missing-value behaviour for the
+/// random-splitter trees that never set a direction.
 pub(crate) fn traverse<F: Float>(nodes: &[Node<F>], sample: &ndarray::ArrayView1<F>) -> usize {
-    traverse_tree(nodes, sample)
+    traverse_tree(nodes, &[], sample)
 }
 
 /// Convert a `Float` value to `usize` (for class labels stored as floats).
@@ -1619,6 +1731,8 @@ fn make_weighted_classification_leaf<F: Float>(
             n_samples,
             value,
             distribution: Some(distribution),
+            // Leaf node: no missing-value routing.
+            missing_go_to_left: false,
         });
     }
     idx
@@ -1715,6 +1829,8 @@ fn make_classification_leaf<F: Float>(
             n_samples,
             value,
             distribution: Some(distribution),
+            // Leaf node: no missing-value routing.
+            missing_go_to_left: false,
         });
     }
     idx
@@ -1774,16 +1890,21 @@ fn build_classification_tree<F: Float>(
     // where `improvement_inner = parent − Σ(n_child/n_node)·imp_child`; the
     // tree-normalized improvement of `_criterion.pyx:188` is then
     // `(n_node/N)·improvement_inner = best_impurity_decrease / N`.
-    let gated = best.filter(|&(_, _, best_impurity_decrease)| {
+    let gated = best.filter(|&(_, _, best_impurity_decrease, _)| {
         let n_total_f = F::from(gate.n_total).unwrap_or_else(F::one);
         let improvement = best_impurity_decrease / n_total_f;
         !gate.rejects(improvement)
     });
 
-    if let Some((best_feature, best_threshold, best_impurity_decrease)) = gated {
-        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
-            .iter()
-            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+    if let Some((best_feature, best_threshold, best_impurity_decrease, missing_go_to_left)) = gated
+    {
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = partition_with_missing(
+            indices,
+            data.x,
+            best_feature,
+            best_threshold,
+            missing_go_to_left,
+        );
 
         let node_idx = nodes.len();
         nodes.push(Node::Leaf {
@@ -1800,6 +1921,7 @@ fn build_classification_tree<F: Float>(
                 n_samples: 0,
                 value: F::zero(),
                 distribution: None,
+                missing_go_to_left: false,
             });
         }
 
@@ -1855,6 +1977,7 @@ fn build_classification_tree<F: Float>(
                 n_samples: n,
                 value: F::from(majority_class).unwrap_or_else(F::zero),
                 distribution: Some(distribution),
+                missing_go_to_left,
             };
         }
 
@@ -1878,9 +2001,9 @@ fn find_best_classification_split<F: Float>(
     indices: &[usize],
     min_samples_leaf: usize,
     rng: Option<&mut StdRng>,
-) -> Option<(usize, F, F)> {
+) -> Option<(usize, F, F, bool)> {
     let n = indices.len();
-    let n_f = F::from(n).unwrap();
+    let n_f = F::from(n).unwrap_or_else(F::one);
     let n_features = data.x.ncols();
 
     let mut parent_counts = vec![0usize; data.n_classes];
@@ -1909,6 +2032,7 @@ fn find_best_classification_split<F: Float>(
     let mut best_score = F::neg_infinity();
     let mut best_feature = 0;
     let mut best_threshold = F::zero();
+    let mut best_missing_left = false;
     // The weighted node mass `W_node` (= Σ sample_weight over the node), used to
     // rescale the returned `best_impurity_decrease = improvement_inner · W_node`
     // on the weighted path so it mirrors sklearn's `improvement·N` convention.
@@ -1935,96 +2059,236 @@ fn find_best_classification_split<F: Float>(
 
     for feat in candidate_features {
         let mut sorted_indices: Vec<usize> = indices.to_vec();
+        // NaN sorts last (`sort_indices_by_feature`), mirroring sklearn's
+        // partitioner which packs missing values into `samples[-n_missing:]`
+        // (`_splitter.pyx:918-944`).
         sort_indices_by_feature(&mut sorted_indices, data.x, feat);
+        let n_missing = sorted_indices
+            .iter()
+            .filter(|&&i| data.x[[i, feat]].is_nan())
+            .count();
+        let n_nonmissing = n - n_missing;
+        // All values missing ⇒ no non-missing split point (`_splitter.pyx:402`,
+        // `end_non_missing == start`).
+        if n_nonmissing == 0 {
+            continue;
+        }
+        let has_missing = n_missing > 0;
 
-        // Constant-feature band: if the sorted spread (max - min) over this
-        // node is within FEATURE_THRESHOLD, sklearn treats the feature as
-        // constant and never splits on it (`_splitter.pyx:405`).
+        // Constant-feature band over the NON-missing samples only
+        // (`_splitter.pyx:405`, `feature_values[end_non_missing-1] <=
+        // feature_values[start] + FEATURE_THRESHOLD`).
         let feat_min = data.x[[sorted_indices[0], feat]];
-        let feat_max = data.x[[sorted_indices[n - 1], feat]];
+        let feat_max = data.x[[sorted_indices[n_nonmissing - 1], feat]];
         if feat_max <= feat_min + threshold_band {
             continue;
         }
 
-        let mut left_counts = vec![0usize; data.n_classes];
-        let mut right_counts = parent_counts.clone();
-        let mut left_n = 0usize;
-
-        // Weighted running child counts (mirrors `left_counts`/`right_counts`)
-        // on the `class_weight` path; `right_w_counts` starts at the weighted
-        // parent counts and mass is moved left as the scan advances.
-        let mut left_w_counts = vec![F::zero(); data.n_classes];
-        let mut right_w_counts = weighted_parent
-            .as_ref()
-            .map_or_else(Vec::new, |(wc, _, _)| wc.clone());
-        let mut left_w = F::zero();
-
-        for split_pos in 0..n - 1 {
-            let idx = sorted_indices[split_pos];
-            let cls = data.y[idx];
-            left_counts[cls] += 1;
-            right_counts[cls] -= 1;
-            left_n += 1;
-            let right_n = n - left_n;
-            if let Some((_, _, sw)) = weighted_parent.as_ref() {
-                let w = sw[idx];
-                left_w_counts[cls] = left_w_counts[cls] + w;
-                right_w_counts[cls] = right_w_counts[cls] - w;
-                left_w = left_w + w;
+        // The missing block's per-class weighted counts + total weighted mass
+        // (moved together to one child), and its integer class counts.
+        let (missing_w_counts, missing_w) = match weighted_parent.as_ref() {
+            Some((_, _, sw)) => {
+                let mut mc = vec![F::zero(); data.n_classes];
+                let mut mw = F::zero();
+                for &i in &sorted_indices[n_nonmissing..] {
+                    mc[data.y[i]] = mc[data.y[i]] + sw[i];
+                    mw = mw + sw[i];
+                }
+                (mc, mw)
             }
+            None => (Vec::new(), F::zero()),
+        };
+        let mut missing_counts = vec![0usize; data.n_classes];
+        for &i in &sorted_indices[n_nonmissing..] {
+            missing_counts[data.y[i]] += 1;
+        }
 
-            // Only consider a split where adjacent sorted values differ by more
-            // than FEATURE_THRESHOLD (sklearn's `next_p` skip, `_splitter.pyx`).
-            let next_idx = sorted_indices[split_pos + 1];
-            if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
-                continue;
-            }
+        // NON-missing parent counts: the running right-child starts here (the
+        // missing block is folded into the chosen child separately, so it must
+        // NOT already be in the running counts). `parent_counts` includes the
+        // missing samples, so subtract them.
+        let nonmissing_parent_counts: Vec<usize> = parent_counts
+            .iter()
+            .zip(missing_counts.iter())
+            .map(|(p, m)| p - m)
+            .collect();
+        let nonmissing_weighted_parent: Vec<F> = match weighted_parent.as_ref() {
+            Some((wc, _, _)) => wc
+                .iter()
+                .zip(missing_w_counts.iter())
+                .map(|(p, m)| *p - *m)
+                .collect(),
+            None => Vec::new(),
+        };
 
-            // `min_samples_leaf` counts RAW samples even under sample_weight
-            // (`_splitter.pyx:451`).
-            if left_n < min_samples_leaf || right_n < min_samples_leaf {
-                continue;
-            }
+        // sklearn searches once with no missing, twice otherwise: pass 0 sends
+        // missing → right, pass 1 sends missing → left (`_splitter.pyx:428-431`).
+        // With no missing, only pass 0 runs and `missing_go_to_left` stays
+        // false (the byte-identical original path).
+        let n_searches = if has_missing { 2 } else { 1 };
 
-            let (impurity_decrease, weighted_n) = if let Some((_, total_w, _)) =
-                weighted_parent.as_ref()
-            {
-                let right_w = *total_w - left_w;
-                // Weighted `min_weight_fraction_leaf` child gate
-                // (`_splitter.pyx:470`): each child's weighted mass must meet
-                // `min_weight_leaf`. Default `0.0` never rejects.
-                if left_w < data.min_weight_leaf || right_w < data.min_weight_leaf {
+        for search in 0..n_searches {
+            let missing_to_left = search == 1;
+
+            // Running NON-missing left counts; right starts at the NON-missing
+            // parent counts and mass is moved left as the scan advances over the
+            // sorted non-missing prefix. The missing block is folded into the
+            // chosen child separately (`combine_missing_*`).
+            let mut left_counts = vec![0usize; data.n_classes];
+            let mut right_counts = nonmissing_parent_counts.clone();
+            let mut left_w_counts = vec![F::zero(); data.n_classes];
+            let mut right_w_counts = nonmissing_weighted_parent.clone();
+            let mut left_nm = 0usize;
+            let mut left_w_nm = F::zero();
+
+            for split_pos in 0..n_nonmissing - 1 {
+                let idx = sorted_indices[split_pos];
+                let cls = data.y[idx];
+                left_counts[cls] += 1;
+                right_counts[cls] -= 1;
+                left_nm += 1;
+                if let Some((_, _, sw)) = weighted_parent.as_ref() {
+                    let w = sw[idx];
+                    left_w_counts[cls] = left_w_counts[cls] + w;
+                    right_w_counts[cls] = right_w_counts[cls] - w;
+                    left_w_nm = left_w_nm + w;
+                }
+
+                // Adjacent sorted (non-missing) values must differ by more than
+                // FEATURE_THRESHOLD (sklearn's `next_p` skip, `_splitter.pyx`).
+                let next_idx = sorted_indices[split_pos + 1];
+                if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
                     continue;
                 }
-                let left_impurity =
-                    weighted_compute_impurity::<F>(&left_w_counts, left_w, data.criterion);
-                let right_impurity =
-                    weighted_compute_impurity::<F>(&right_w_counts, right_w, data.criterion);
-                // improvement_inner = parent − (W_L/W_node)·imp_L − (W_R/W_node)·imp_R
-                // (`_criterion.pyx:188`, weighted-mass child weights).
-                let denom = if *total_w > F::zero() {
-                    *total_w
-                } else {
-                    F::one()
-                };
-                let weighted_child = (left_w * left_impurity + right_w * right_impurity) / denom;
-                (parent_impurity - weighted_child, *total_w)
-            } else {
-                let left_impurity = compute_impurity::<F>(&left_counts, left_n, data.criterion);
-                let right_impurity = compute_impurity::<F>(&right_counts, right_n, data.criterion);
-                let left_weight = F::from(left_n).unwrap_or_else(F::one) / n_f;
-                let right_weight = F::from(right_n).unwrap_or_else(F::one) / n_f;
-                let weighted_child_impurity =
-                    left_weight * left_impurity + right_weight * right_impurity;
-                (parent_impurity - weighted_child_impurity, n_f)
-            };
 
-            if impurity_decrease > best_score {
-                best_score = impurity_decrease;
-                best_feature = feat;
-                best_weighted_n = weighted_n;
-                let two = F::from(2.0).unwrap_or_else(F::one);
-                best_threshold = (data.x[[idx, feat]] + data.x[[next_idx, feat]]) / two;
+                // Fold the missing block into the chosen child's sample counts.
+                let (left_n, right_n) = if missing_to_left {
+                    (left_nm + n_missing, n_nonmissing - left_nm)
+                } else {
+                    (left_nm, n_nonmissing - left_nm + n_missing)
+                };
+
+                // `min_samples_leaf` counts RAW samples even under sample_weight
+                // (`_splitter.pyx:451`).
+                if left_n < min_samples_leaf || right_n < min_samples_leaf {
+                    continue;
+                }
+
+                let (impurity_decrease, weighted_n) = if let Some((_, total_w, _)) =
+                    weighted_parent.as_ref()
+                {
+                    // The NON-missing right mass = (total − missing) − left_nm;
+                    // `combine_missing_weighted` then folds the missing block in.
+                    let right_w_nm = *total_w - missing_w - left_w_nm;
+                    let (lc, rc, left_w, right_w) = combine_missing_weighted(
+                        &left_w_counts,
+                        &right_w_counts,
+                        left_w_nm,
+                        right_w_nm,
+                        &missing_w_counts,
+                        missing_w,
+                        missing_to_left,
+                    );
+                    // Weighted `min_weight_fraction_leaf` child gate
+                    // (`_splitter.pyx:470`). Default `0.0` never rejects.
+                    if left_w < data.min_weight_leaf || right_w < data.min_weight_leaf {
+                        continue;
+                    }
+                    let left_impurity = weighted_compute_impurity::<F>(&lc, left_w, data.criterion);
+                    let right_impurity =
+                        weighted_compute_impurity::<F>(&rc, right_w, data.criterion);
+                    let denom = if *total_w > F::zero() {
+                        *total_w
+                    } else {
+                        F::one()
+                    };
+                    let weighted_child =
+                        (left_w * left_impurity + right_w * right_impurity) / denom;
+                    (parent_impurity - weighted_child, *total_w)
+                } else {
+                    let (lc, rc) = combine_missing_counts(
+                        &left_counts,
+                        &right_counts,
+                        &missing_counts,
+                        missing_to_left,
+                    );
+                    let left_impurity = compute_impurity::<F>(&lc, left_n, data.criterion);
+                    let right_impurity = compute_impurity::<F>(&rc, right_n, data.criterion);
+                    let left_weight = F::from(left_n).unwrap_or_else(F::one) / n_f;
+                    let right_weight = F::from(right_n).unwrap_or_else(F::one) / n_f;
+                    let weighted_child_impurity =
+                        left_weight * left_impurity + right_weight * right_impurity;
+                    (parent_impurity - weighted_child_impurity, n_f)
+                };
+
+                if impurity_decrease > best_score {
+                    best_score = impurity_decrease;
+                    best_feature = feat;
+                    best_weighted_n = weighted_n;
+                    best_missing_left = if has_missing { missing_to_left } else { false };
+                    let two = F::from(2.0).unwrap_or_else(F::one);
+                    best_threshold = (data.x[[idx, feat]] + data.x[[next_idx, feat]]) / two;
+                }
+            }
+        }
+
+        // The extra candidate: ALL non-missing left, ALL missing right
+        // (threshold = +∞, `missing_go_to_left = 0`), evaluated only when there
+        // ARE missing values (`_splitter.pyx:498-519`).
+        if has_missing {
+            let left_n = n_nonmissing;
+            let right_n = n_missing;
+            if left_n >= min_samples_leaf && right_n >= min_samples_leaf {
+                let candidate = if let Some((pwc, total_w, _)) = weighted_parent.as_ref() {
+                    let left_w = *total_w - missing_w;
+                    let right_w = missing_w;
+                    if left_w >= data.min_weight_leaf && right_w >= data.min_weight_leaf {
+                        let mut lc = pwc.clone();
+                        for (c, m) in lc.iter_mut().zip(missing_w_counts.iter()) {
+                            *c = *c - *m;
+                        }
+                        let left_impurity =
+                            weighted_compute_impurity::<F>(&lc, left_w, data.criterion);
+                        let right_impurity = weighted_compute_impurity::<F>(
+                            &missing_w_counts,
+                            right_w,
+                            data.criterion,
+                        );
+                        let denom = if *total_w > F::zero() {
+                            *total_w
+                        } else {
+                            F::one()
+                        };
+                        let weighted_child =
+                            (left_w * left_impurity + right_w * right_impurity) / denom;
+                        Some((parent_impurity - weighted_child, *total_w))
+                    } else {
+                        None
+                    }
+                } else {
+                    let mut lc = parent_counts.clone();
+                    for (c, m) in lc.iter_mut().zip(missing_counts.iter()) {
+                        *c -= *m;
+                    }
+                    let left_impurity = compute_impurity::<F>(&lc, left_n, data.criterion);
+                    let right_impurity =
+                        compute_impurity::<F>(&missing_counts, right_n, data.criterion);
+                    let left_weight = F::from(left_n).unwrap_or_else(F::one) / n_f;
+                    let right_weight = F::from(right_n).unwrap_or_else(F::one) / n_f;
+                    let weighted_child_impurity =
+                        left_weight * left_impurity + right_weight * right_impurity;
+                    Some((parent_impurity - weighted_child_impurity, n_f))
+                };
+
+                if let Some((decrease, weighted_n)) = candidate
+                    && decrease > best_score
+                {
+                    best_score = decrease;
+                    best_feature = feat;
+                    best_weighted_n = weighted_n;
+                    best_missing_left = false;
+                    best_threshold = F::infinity();
+                }
             }
         }
     }
@@ -2044,10 +2308,95 @@ fn find_best_classification_split<F: Float>(
         // apply the same global denominator, so this scaling keeps the
         // unweighted path byte-identical and yields sklearn-consistent
         // (post-normalization) weighted importances.
-        Some((best_feature, best_threshold, best_score * best_weighted_n))
+        Some((
+            best_feature,
+            best_threshold,
+            best_score * best_weighted_n,
+            best_missing_left,
+        ))
     } else {
         None
     }
+}
+
+/// Fold a missing block's integer class counts into the left or right child's
+/// running counts (the non-missing running split), returning `(left, right)`.
+fn combine_missing_counts(
+    left_counts: &[usize],
+    right_counts: &[usize],
+    missing_counts: &[usize],
+    missing_to_left: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut lc = left_counts.to_vec();
+    let mut rc = right_counts.to_vec();
+    if missing_to_left {
+        for (c, m) in lc.iter_mut().zip(missing_counts.iter()) {
+            *c += *m;
+        }
+    } else {
+        for (c, m) in rc.iter_mut().zip(missing_counts.iter()) {
+            *c += *m;
+        }
+    }
+    (lc, rc)
+}
+
+/// Fold a missing block's weighted class counts/mass into the left or right
+/// child's running weighted counts/mass, returning `(lc, rc, left_w, right_w)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads both children's weighted counts + masses plus the missing block"
+)]
+fn combine_missing_weighted<F: Float>(
+    left_w_counts: &[F],
+    right_w_counts: &[F],
+    left_w: F,
+    right_w: F,
+    missing_w_counts: &[F],
+    missing_w: F,
+    missing_to_left: bool,
+) -> (Vec<F>, Vec<F>, F, F) {
+    let mut lc = left_w_counts.to_vec();
+    let mut rc = right_w_counts.to_vec();
+    if missing_to_left {
+        for (c, m) in lc.iter_mut().zip(missing_w_counts.iter()) {
+            *c = *c + *m;
+        }
+        (lc, rc, left_w + missing_w, right_w)
+    } else {
+        for (c, m) in rc.iter_mut().zip(missing_w_counts.iter()) {
+            *c = *c + *m;
+        }
+        (lc, rc, left_w, right_w + missing_w)
+    }
+}
+
+/// Partition `indices` into `(left, right)` for a split on `feature` at
+/// `threshold`, routing NaN (missing) samples to the side given by
+/// `missing_go_to_left` rather than the `<= threshold` comparison.
+///
+/// Mirrors sklearn's predict/fit routing (`_tree.pyx:1015-1025`,
+/// `_apply_dense`): `isnan(x) ⇒ left if missing_go_to_left else right`,
+/// otherwise `x <= threshold ⇒ left`. The current `<=`-only partition sent NaN
+/// right always (NaN `<= t` is `false`), which on a NaN-derived `(n,0)` split
+/// drove the unbounded recursion (#2277). A `threshold = +∞` split (the
+/// "all non-missing left, all missing right" candidate) routes every finite
+/// value left and every NaN right, exactly as sklearn's `INFINITY` threshold.
+fn partition_with_missing<F: Float>(
+    indices: &[usize],
+    x: &Array2<F>,
+    feature: usize,
+    threshold: F,
+    missing_go_to_left: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    indices.iter().partition(|&&i| {
+        let v = x[[i, feature]];
+        if v.is_nan() {
+            missing_go_to_left
+        } else {
+            v <= threshold
+        }
+    })
 }
 
 /// Push a regression leaf node (and, when `meta` is `Some`, its pruning
@@ -2071,6 +2420,8 @@ fn push_regression_leaf<F: Float>(
             n_samples,
             value,
             distribution: None,
+            // Leaf node: no missing-value routing.
+            missing_go_to_left: false,
         });
     }
     idx
@@ -2123,7 +2474,7 @@ fn build_regression_tree<F: Float>(
     // `FriedmanMSE.impurity_improvement = diff²/(n_L·n_R·n_node)`
     // (`_criterion.pyx:1573`) — already tree-normalized, with NO extra `1/N`
     // factor — so the improvement is `best_impurity_decrease / n_node = score`.
-    let gated = best.filter(|&(_, _, best_impurity_decrease)| {
+    let gated = best.filter(|&(_, _, best_impurity_decrease, _)| {
         let denom = match data.criterion {
             RegressionCriterion::FriedmanMse => n,
             _ => gate.n_total,
@@ -2133,10 +2484,15 @@ fn build_regression_tree<F: Float>(
         !gate.rejects(improvement)
     });
 
-    if let Some((best_feature, best_threshold, best_impurity_decrease)) = gated {
-        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = indices
-            .iter()
-            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+    if let Some((best_feature, best_threshold, best_impurity_decrease, missing_go_to_left)) = gated
+    {
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = partition_with_missing(
+            indices,
+            data.x,
+            best_feature,
+            best_threshold,
+            missing_go_to_left,
+        );
 
         let node_idx = nodes.len();
         nodes.push(Node::Leaf {
@@ -2152,6 +2508,7 @@ fn build_regression_tree<F: Float>(
                 n_samples: 0,
                 value: F::zero(),
                 distribution: None,
+                missing_go_to_left: false,
             });
         }
 
@@ -2191,6 +2548,7 @@ fn build_regression_tree<F: Float>(
                 n_samples: n,
                 value: leaf_value,
                 distribution: None,
+                missing_go_to_left,
             };
         }
 
@@ -2211,9 +2569,9 @@ fn find_best_regression_split<F: Float>(
     indices: &[usize],
     min_samples_leaf: usize,
     rng: Option<&mut StdRng>,
-) -> Option<(usize, F, F)> {
+) -> Option<(usize, F, F, bool)> {
     let n = indices.len();
-    let n_f = F::from(n).unwrap();
+    let n_f = F::from(n).unwrap_or_else(F::one);
     let n_features = data.x.ncols();
 
     let parent_sum: F = indices
@@ -2233,6 +2591,7 @@ fn find_best_regression_split<F: Float>(
     let mut best_score = F::neg_infinity();
     let mut best_feature = 0;
     let mut best_threshold = F::zero();
+    let mut best_missing_left = false;
 
     let candidate_features: Vec<usize> = match (data.max_features_per_split, rng) {
         (Some(k), Some(rng)) => {
@@ -2249,105 +2608,324 @@ fn find_best_regression_split<F: Float>(
 
     for feat in candidate_features {
         let mut sorted_indices: Vec<usize> = indices.to_vec();
+        // NaN sorts last; missing values form the suffix `sorted_indices[nm..]`
+        // (`_splitter.pyx:918-944`).
         sort_indices_by_feature(&mut sorted_indices, data.x, feat);
+        let n_missing = sorted_indices
+            .iter()
+            .filter(|&&i| data.x[[i, feat]].is_nan())
+            .count();
+        let n_nonmissing = n - n_missing;
+        if n_nonmissing == 0 {
+            continue;
+        }
+        let has_missing = n_missing > 0;
+        let missing_slice = &sorted_indices[n_nonmissing..];
 
-        // Constant-feature band: spread (max - min) within FEATURE_THRESHOLD ⇒
-        // sklearn treats the feature as constant (`_splitter.pyx:405`).
+        // Constant-feature band over the NON-missing samples only
+        // (`_splitter.pyx:405`).
         let feat_min = data.x[[sorted_indices[0], feat]];
-        let feat_max = data.x[[sorted_indices[n - 1], feat]];
+        let feat_max = data.x[[sorted_indices[n_nonmissing - 1], feat]];
         if feat_max <= feat_min + threshold_band {
             continue;
         }
 
-        let mut left_sum = F::zero();
-        let mut left_sum_sq = F::zero();
-        let mut left_n: usize = 0;
+        // The missing block's target sum / sum-of-squares (for MSE/FriedmanMSE).
+        let missing_sum: F = missing_slice
+            .iter()
+            .map(|&i| data.y[i])
+            .fold(F::zero(), |a, b| a + b);
+        let missing_sum_sq: F = missing_slice
+            .iter()
+            .map(|&i| data.y[i] * data.y[i])
+            .fold(F::zero(), |a, b| a + b);
 
-        for split_pos in 0..n - 1 {
-            let idx = sorted_indices[split_pos];
-            let val = data.y[idx];
-            left_sum = left_sum + val;
-            left_sum_sq = left_sum_sq + val * val;
-            left_n += 1;
-            let right_n = n - left_n;
+        // Two passes when there are missing values: pass 0 missing→right,
+        // pass 1 missing→left (`_splitter.pyx:428-431`); single pass otherwise
+        // (byte-identical to the original no-missing scan).
+        let n_searches = if has_missing { 2 } else { 1 };
 
-            // Adjacent sorted values must differ by more than FEATURE_THRESHOLD
-            // (sklearn's `next_p` skip, `_splitter.pyx`).
-            let next_idx = sorted_indices[split_pos + 1];
-            if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
-                continue;
+        for search in 0..n_searches {
+            let missing_to_left = search == 1;
+
+            let mut left_sum = F::zero();
+            let mut left_sum_sq = F::zero();
+            let mut left_nm: usize = 0;
+
+            for split_pos in 0..n_nonmissing - 1 {
+                let idx = sorted_indices[split_pos];
+                let val = data.y[idx];
+                left_sum = left_sum + val;
+                left_sum_sq = left_sum_sq + val * val;
+                left_nm += 1;
+
+                // Adjacent sorted (non-missing) values must differ by more than
+                // FEATURE_THRESHOLD (sklearn's `next_p` skip, `_splitter.pyx`).
+                let next_idx = sorted_indices[split_pos + 1];
+                if data.x[[next_idx, feat]] <= data.x[[idx, feat]] + threshold_band {
+                    continue;
+                }
+
+                // Sample counts with the missing block folded into the chosen side.
+                let (left_n, right_n) = if missing_to_left {
+                    (left_nm + n_missing, n_nonmissing - left_nm)
+                } else {
+                    (left_nm, n_nonmissing - left_nm + n_missing)
+                };
+                if left_n < min_samples_leaf || right_n < min_samples_leaf {
+                    continue;
+                }
+
+                let score = regression_split_score(
+                    data,
+                    &sorted_indices,
+                    n_nonmissing,
+                    missing_slice,
+                    left_nm,
+                    left_sum,
+                    left_sum_sq,
+                    missing_sum,
+                    missing_sum_sq,
+                    parent_sum,
+                    parent_sum_sq,
+                    parent_mse,
+                    parent_impurity,
+                    n_f,
+                    missing_to_left,
+                );
+
+                if score > best_score {
+                    best_score = score;
+                    best_feature = feat;
+                    best_missing_left = if has_missing { missing_to_left } else { false };
+                    best_threshold = (data.x[[idx, feat]] + data.x[[next_idx, feat]])
+                        / F::from(2.0).unwrap_or_else(F::one);
+                }
             }
+        }
 
-            if left_n < min_samples_leaf || right_n < min_samples_leaf {
-                continue;
-            }
-
-            let left_n_f = F::from(left_n).unwrap_or_else(F::one);
-            let right_n_f = F::from(right_n).unwrap_or_else(F::one);
-            let right_sum = parent_sum - left_sum;
-
-            // Per-criterion split score (higher = better). All four reduce to a
-            // "parent impurity minus weighted child impurity" improvement so the
-            // shared `> best_score` argmax + `> 0` accept gate below is reused.
-            let score = match data.criterion {
-                // squared_error: parent_mse − (n_L·mse_L + n_R·mse_R)/n
-                // (`_criterion.pyx:1094` / children_impurity), kept byte-identical
-                // to the prior MSE path.
-                RegressionCriterion::Mse => {
-                    let left_mean = left_sum / left_n_f;
-                    let left_mse = left_sum_sq / left_n_f - left_mean * left_mean;
-                    let right_sum_sq = parent_sum_sq - left_sum_sq;
-                    let right_mean = right_sum / right_n_f;
-                    let right_mse = right_sum_sq / right_n_f - right_mean * right_mean;
-                    let weighted_child_mse = (left_n_f * left_mse + right_n_f * right_mse) / n_f;
-                    parent_mse - weighted_child_mse
+        // Extra candidate: ALL non-missing left, ALL missing right (threshold
+        // = +∞, missing→right; `_splitter.pyx:498-519`).
+        if has_missing {
+            let left_n = n_nonmissing;
+            let right_n = n_missing;
+            if left_n >= min_samples_leaf && right_n >= min_samples_leaf {
+                let left_slice = &sorted_indices[..n_nonmissing];
+                let nm_sum = parent_sum - missing_sum;
+                let nm_sum_sq = parent_sum_sq - missing_sum_sq;
+                let score = regression_partitioned_score(
+                    data,
+                    left_slice,
+                    missing_slice,
+                    nm_sum,
+                    nm_sum_sq,
+                    missing_sum,
+                    missing_sum_sq,
+                    parent_mse,
+                    parent_impurity,
+                    n_f,
+                );
+                if score > best_score {
+                    best_score = score;
+                    best_feature = feat;
+                    best_missing_left = false;
+                    best_threshold = F::infinity();
                 }
-                // friedman_mse proxy (`FriedmanMSE.impurity_improvement`,
-                // `_criterion.pyx:1557-1574`, n_outputs == 1):
-                //   diff = n_R·sum_L − n_L·sum_R;
-                //   improvement = diff² / (n_L·n_R·n_node).
-                RegressionCriterion::FriedmanMse => {
-                    let diff = right_n_f * left_sum - left_n_f * right_sum;
-                    diff * diff / (left_n_f * right_n_f * n_f)
-                }
-                // absolute_error: parent_mae − (n_L·mae_L + n_R·mae_R)/n
-                // (`MAE.node_impurity`/`children_impurity`, L1 around each child
-                // median, `_criterion.pyx:1450-1519`).
-                RegressionCriterion::AbsoluteError => {
-                    let left_slice = &sorted_indices[..left_n];
-                    let right_slice = &sorted_indices[left_n..];
-                    let left_mae = mae_for_indices(data.y, left_slice);
-                    let right_mae = mae_for_indices(data.y, right_slice);
-                    let weighted_child_mae = (left_n_f * left_mae + right_n_f * right_mae) / n_f;
-                    parent_impurity - weighted_child_mae
-                }
-                // poisson: parent_deviance − (n_L·dev_L + n_R·dev_R)/n
-                // (`Poisson.poisson_loss`, `_criterion.pyx:1671-1708`). A child
-                // with a non-positive sum yields +∞ deviance ⇒ −∞ score ⇒ never
-                // selected, mirroring sklearn's `y_sum <= EPSILON ⇒ INFINITY`.
-                RegressionCriterion::Poisson => {
-                    let left_slice = &sorted_indices[..left_n];
-                    let right_slice = &sorted_indices[left_n..];
-                    let left_dev = poisson_deviance_for_indices(data.y, left_slice);
-                    let right_dev = poisson_deviance_for_indices(data.y, right_slice);
-                    let weighted_child_dev = (left_n_f * left_dev + right_n_f * right_dev) / n_f;
-                    parent_impurity - weighted_child_dev
-                }
-            };
-
-            if score > best_score {
-                best_score = score;
-                best_feature = feat;
-                best_threshold = (data.x[[idx, feat]] + data.x[[next_idx, feat]])
-                    / F::from(2.0).unwrap_or_else(F::one);
             }
         }
     }
 
     if best_score > F::zero() {
-        Some((best_feature, best_threshold, best_score * n_f))
+        Some((
+            best_feature,
+            best_threshold,
+            best_score * n_f,
+            best_missing_left,
+        ))
     } else {
         None
+    }
+}
+
+/// Per-criterion split score for a regression split at the non-missing scan
+/// position `left_nm`, with the missing block routed to the side given by
+/// `missing_to_left`.
+///
+/// The left non-missing prefix is `sorted_indices[..left_nm]`, the right
+/// non-missing suffix is `sorted_indices[left_nm..n_nonmissing]`, and
+/// `missing_slice` is the missing block. For MSE / FriedmanMSE the child stats
+/// are computed from running sums (`left_sum`/`left_sum_sq` are the left
+/// non-missing prefix sums, the missing block's `missing_sum`/`missing_sum_sq`
+/// fold into the chosen side) — byte-identical to the prior scan when
+/// `missing_slice` is empty. For MAE / Poisson the explicit child index lists
+/// are built so the median / deviance helpers see exactly the child's samples.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "threads running sums + the missing block + parent stats for all four criteria"
+)]
+fn regression_split_score<F: Float>(
+    data: &RegressionData<'_, F>,
+    sorted_indices: &[usize],
+    n_nonmissing: usize,
+    missing_slice: &[usize],
+    left_nm: usize,
+    left_sum: F,
+    left_sum_sq: F,
+    missing_sum: F,
+    missing_sum_sq: F,
+    parent_sum: F,
+    parent_sum_sq: F,
+    parent_mse: F,
+    parent_impurity: F,
+    n_f: F,
+    missing_to_left: bool,
+) -> F {
+    // Right non-missing prefix sums (parent − left, before folding the missing
+    // block in).
+    let right_nm_sum = parent_sum - left_sum - missing_sum;
+    let right_nm_sum_sq = parent_sum_sq - left_sum_sq - missing_sum_sq;
+
+    // Fold the missing block's sums into the chosen child.
+    let (l_sum, l_sum_sq, r_sum, r_sum_sq) = if missing_to_left {
+        (
+            left_sum + missing_sum,
+            left_sum_sq + missing_sum_sq,
+            right_nm_sum,
+            right_nm_sum_sq,
+        )
+    } else {
+        (
+            left_sum,
+            left_sum_sq,
+            right_nm_sum + missing_sum,
+            right_nm_sum_sq + missing_sum_sq,
+        )
+    };
+
+    match data.criterion {
+        RegressionCriterion::Mse | RegressionCriterion::FriedmanMse => {
+            let nm_left = left_nm
+                + if missing_to_left {
+                    missing_slice.len()
+                } else {
+                    0
+                };
+            let nm_right = (n_nonmissing - left_nm)
+                + if missing_to_left {
+                    0
+                } else {
+                    missing_slice.len()
+                };
+            let left_n_f = F::from(nm_left).unwrap_or_else(F::one);
+            let right_n_f = F::from(nm_right).unwrap_or_else(F::one);
+            match data.criterion {
+                RegressionCriterion::FriedmanMse => {
+                    let diff = right_n_f * l_sum - left_n_f * r_sum;
+                    diff * diff / (left_n_f * right_n_f * n_f)
+                }
+                _ => {
+                    let left_mean = l_sum / left_n_f;
+                    let left_mse = l_sum_sq / left_n_f - left_mean * left_mean;
+                    let right_mean = r_sum / right_n_f;
+                    let right_mse = r_sum_sq / right_n_f - right_mean * right_mean;
+                    let weighted_child_mse = (left_n_f * left_mse + right_n_f * right_mse) / n_f;
+                    parent_mse - weighted_child_mse
+                }
+            }
+        }
+        RegressionCriterion::AbsoluteError | RegressionCriterion::Poisson => {
+            // Build the explicit child index lists (median / Poisson deviance
+            // need the actual samples, not just sums).
+            let (left_idx, right_idx) =
+                build_regression_children(sorted_indices, n_nonmissing, left_nm, missing_to_left);
+            regression_partitioned_score(
+                data,
+                &left_idx,
+                &right_idx,
+                F::zero(),
+                F::zero(),
+                F::zero(),
+                F::zero(),
+                parent_mse,
+                parent_impurity,
+                n_f,
+            )
+        }
+    }
+}
+
+/// Build the explicit `(left, right)` child index lists from the sorted
+/// non-missing scan position `left_nm` and the missing suffix, routing the
+/// missing block to `missing_to_left`.
+fn build_regression_children(
+    sorted_indices: &[usize],
+    n_nonmissing: usize,
+    left_nm: usize,
+    missing_to_left: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let nm_left = &sorted_indices[..left_nm];
+    let nm_right = &sorted_indices[left_nm..n_nonmissing];
+    let missing = &sorted_indices[n_nonmissing..];
+    let mut left: Vec<usize> = nm_left.to_vec();
+    let mut right: Vec<usize> = nm_right.to_vec();
+    if missing_to_left {
+        left.extend_from_slice(missing);
+    } else {
+        right.extend_from_slice(missing);
+    }
+    (left, right)
+}
+
+/// Per-criterion regression split score from explicit child index lists.
+///
+/// For MAE / Poisson the median / deviance helpers run over the exact child
+/// indices; the `*_sum*` arguments are unused there (passed `0`). For MSE /
+/// FriedmanMSE the running sums are recomputed from the child lists.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "shared scorer over explicit child index lists for all four criteria"
+)]
+fn regression_partitioned_score<F: Float>(
+    data: &RegressionData<'_, F>,
+    left_idx: &[usize],
+    right_idx: &[usize],
+    _left_sum: F,
+    _left_sum_sq: F,
+    _missing_sum: F,
+    _missing_sum_sq: F,
+    parent_mse: F,
+    parent_impurity: F,
+    n_f: F,
+) -> F {
+    let left_n_f = F::from(left_idx.len()).unwrap_or_else(F::one);
+    let right_n_f = F::from(right_idx.len()).unwrap_or_else(F::one);
+    match data.criterion {
+        RegressionCriterion::Mse => {
+            let left_mean = mean_value(data.y, left_idx);
+            let left_mse = mse_for_indices(data.y, left_idx, left_mean);
+            let right_mean = mean_value(data.y, right_idx);
+            let right_mse = mse_for_indices(data.y, right_idx, right_mean);
+            let weighted_child_mse = (left_n_f * left_mse + right_n_f * right_mse) / n_f;
+            parent_mse - weighted_child_mse
+        }
+        RegressionCriterion::FriedmanMse => {
+            let left_sum = mean_value(data.y, left_idx) * left_n_f;
+            let right_sum = mean_value(data.y, right_idx) * right_n_f;
+            let diff = right_n_f * left_sum - left_n_f * right_sum;
+            diff * diff / (left_n_f * right_n_f * n_f)
+        }
+        RegressionCriterion::AbsoluteError => {
+            let left_mae = mae_for_indices(data.y, left_idx);
+            let right_mae = mae_for_indices(data.y, right_idx);
+            let weighted_child_mae = (left_n_f * left_mae + right_n_f * right_mae) / n_f;
+            parent_impurity - weighted_child_mae
+        }
+        RegressionCriterion::Poisson => {
+            let left_dev = poisson_deviance_for_indices(data.y, left_idx);
+            let right_dev = poisson_deviance_for_indices(data.y, right_idx);
+            let weighted_child_dev = (left_n_f * left_dev + right_n_f * right_dev) / n_f;
+            parent_impurity - weighted_child_dev
+        }
     }
 }
 
@@ -2636,10 +3214,11 @@ struct FrontierRecord<F> {
     /// Tree-normalized impurity improvement of this node's best split, used to
     /// order the frontier max-heap (`_compare_records`, `_tree.pyx:392`).
     improvement: F,
-    /// This node's candidate split `(feature, threshold, best_impurity_decrease)`
+    /// This node's candidate split
+    /// `(feature, threshold, best_impurity_decrease, missing_go_to_left)`
     /// (`best_impurity_decrease` is the finder's `improvement_inner · n_node`).
     /// `None` ⇒ the node is a leaf (no expandable split).
-    split: Option<(usize, F, F)>,
+    split: Option<(usize, F, F, bool)>,
     /// Monotone insertion counter: the tie-break for equal `improvement`
     /// (lower id popped first), documenting sklearn's heap which is unstable on
     /// exact ties.
@@ -2694,6 +3273,7 @@ fn serialize_best_first_arena<F: Float>(
             n_samples: 0,
             value: F::zero(),
             distribution: None,
+            missing_go_to_left: false,
         });
     }
     stack.push((0usize, root_slot));
@@ -2734,12 +3314,14 @@ fn serialize_best_first_arena<F: Float>(
                         n_samples: 0,
                         value: F::zero(),
                         distribution: None,
+                        missing_go_to_left: false,
                     });
                     meta.push(NodeMeta {
                         impurity: F::zero(),
                         n_samples: 0,
                         value: F::zero(),
                         distribution: None,
+                        missing_go_to_left: false,
                     });
                 }
                 nodes[slot] = Node::Split {
@@ -2836,13 +3418,13 @@ fn build_classification_tree_best_first<F: Float>(
             } else {
                 // No per-split RNG feature sampling on the estimator surface.
                 find_best_classification_split(data, &node_indices, params.min_samples_leaf, None)
-                    .filter(|&(_, _, best_impurity_decrease)| {
+                    .filter(|&(_, _, best_impurity_decrease, _)| {
                         let improvement = best_impurity_decrease / n_total_f;
                         !gate.rejects(improvement)
                     })
             };
 
-            let improvement = split.map_or(F::zero(), |(_, _, bid)| bid / n_total_f);
+            let improvement = split.map_or(F::zero(), |(_, _, bid, _)| bid / n_total_f);
             FrontierRecord {
                 arena_idx,
                 indices: node_indices,
@@ -2874,14 +3456,18 @@ fn build_classification_tree_best_first<F: Float>(
 
         // Expand: materialize this split, push both children.
         max_split_nodes -= 1;
-        let (best_feature, best_threshold, best_impurity_decrease) = match record.split {
-            Some(s) => s,
-            None => continue,
-        };
-        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = record
-            .indices
-            .iter()
-            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+        let (best_feature, best_threshold, best_impurity_decrease, missing_go_to_left) =
+            match record.split {
+                Some(s) => s,
+                None => continue,
+            };
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = partition_with_missing(
+            &record.indices,
+            data.x,
+            best_feature,
+            best_threshold,
+            missing_go_to_left,
+        );
 
         let left_slot = arena.len();
         arena.push(placeholder_build_leaf::<F>());
@@ -2916,6 +3502,7 @@ fn build_classification_tree_best_first<F: Float>(
                 n_samples: n,
                 value: F::from(majority_class).unwrap_or_else(F::zero),
                 distribution: Some(distribution),
+                missing_go_to_left,
             })
         } else {
             None
@@ -2981,6 +3568,8 @@ fn make_classification_build_leaf<F: Float>(
             n_samples: n,
             value,
             distribution: Some(distribution.clone()),
+            // Leaf node: no missing-value routing.
+            missing_go_to_left: false,
         })
     } else {
         None
@@ -3015,55 +3604,59 @@ fn build_regression_tree_best_first<F: Float>(
     let mut arena: Vec<BuildNode<F>> = Vec::new();
     let mut seq: u64 = 0;
 
-    let evaluate = |arena_idx: usize,
-                    node_indices: Vec<usize>,
-                    depth: usize,
-                    seq: u64|
-     -> FrontierRecord<F> {
-        let n = node_indices.len();
-        let parent_impurity = regression_node_impurity(data.y, &node_indices, data.criterion);
-        let cannot_split = n < params.min_samples_split
-            || params.max_depth.is_some_and(|d| depth >= d)
-            || parent_impurity <= F::epsilon();
+    let evaluate =
+        |arena_idx: usize, node_indices: Vec<usize>, depth: usize, seq: u64| -> FrontierRecord<F> {
+            let n = node_indices.len();
+            let parent_impurity = regression_node_impurity(data.y, &node_indices, data.criterion);
+            let cannot_split = n < params.min_samples_split
+                || params.max_depth.is_some_and(|d| depth >= d)
+                || parent_impurity <= F::epsilon();
 
-        let split = if cannot_split {
-            None
-        } else {
-            find_best_regression_split(data, &node_indices, params.min_samples_leaf, None).filter(
-                |&(_, _, best_impurity_decrease)| {
-                    // friedman_mse improvement is already tree-normalized per
-                    // `_criterion.pyx:1573` (`/n_node`); the rest divide by N.
-                    let denom = match data.criterion {
-                        RegressionCriterion::FriedmanMse => n,
-                        _ => gate.n_total,
-                    };
-                    let denom_f = F::from(denom).unwrap_or_else(F::one);
-                    let improvement = best_impurity_decrease / denom_f;
-                    !gate.rejects(improvement)
-                },
-            )
+            let split = if cannot_split {
+                None
+            } else {
+                find_best_regression_split(data, &node_indices, params.min_samples_leaf, None)
+                    .filter(|&(_, _, best_impurity_decrease, _)| {
+                        // friedman_mse improvement is already tree-normalized per
+                        // `_criterion.pyx:1573` (`/n_node`); the rest divide by N.
+                        let denom = match data.criterion {
+                            RegressionCriterion::FriedmanMse => n,
+                            _ => gate.n_total,
+                        };
+                        let denom_f = F::from(denom).unwrap_or_else(F::one);
+                        let improvement = best_impurity_decrease / denom_f;
+                        !gate.rejects(improvement)
+                    })
+            };
+
+            // Frontier ORDERING uses a numerically-stable two-pass recomputation of
+            // the chosen split's tree-normalized improvement (the finder's
+            // `bid / N` uses the naive `Σy²/n − mean²` variance whose catastrophic
+            // cancellation can flip the relative order of two near-equal
+            // improvements vs sklearn's running-sum criterion — e.g. the k=4
+            // regressor oracle where two depth-2 nodes differ by ~2e-17). The
+            // split itself (feature/threshold/stored `impurity_decrease`) is
+            // UNCHANGED; only the heap key is recomputed stably.
+            let improvement = split.map_or(F::zero(), |(feat, threshold, bid, mgl)| {
+                stable_regression_improvement(
+                    data,
+                    &node_indices,
+                    feat,
+                    threshold,
+                    mgl,
+                    bid,
+                    gate.n_total,
+                )
+            });
+            FrontierRecord {
+                arena_idx,
+                indices: node_indices,
+                depth,
+                improvement,
+                split,
+                seq,
+            }
         };
-
-        // Frontier ORDERING uses a numerically-stable two-pass recomputation of
-        // the chosen split's tree-normalized improvement (the finder's
-        // `bid / N` uses the naive `Σy²/n − mean²` variance whose catastrophic
-        // cancellation can flip the relative order of two near-equal
-        // improvements vs sklearn's running-sum criterion — e.g. the k=4
-        // regressor oracle where two depth-2 nodes differ by ~2e-17). The
-        // split itself (feature/threshold/stored `impurity_decrease`) is
-        // UNCHANGED; only the heap key is recomputed stably.
-        let improvement = split.map_or(F::zero(), |(feat, threshold, bid)| {
-            stable_regression_improvement(data, &node_indices, feat, threshold, bid, gate.n_total)
-        });
-        FrontierRecord {
-            arena_idx,
-            indices: node_indices,
-            depth,
-            improvement,
-            split,
-            seq,
-        }
-    };
 
     arena.push(placeholder_build_leaf::<F>());
     let mut frontier: Vec<FrontierRecord<F>> = vec![evaluate(0, indices.to_vec(), 0, seq)];
@@ -3081,14 +3674,18 @@ fn build_regression_tree_best_first<F: Float>(
         }
 
         max_split_nodes -= 1;
-        let (best_feature, best_threshold, best_impurity_decrease) = match record.split {
-            Some(s) => s,
-            None => continue,
-        };
-        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = record
-            .indices
-            .iter()
-            .partition(|&&i| data.x[[i, best_feature]] <= best_threshold);
+        let (best_feature, best_threshold, best_impurity_decrease, missing_go_to_left) =
+            match record.split {
+                Some(s) => s,
+                None => continue,
+            };
+        let (left_indices, right_indices): (Vec<usize>, Vec<usize>) = partition_with_missing(
+            &record.indices,
+            data.x,
+            best_feature,
+            best_threshold,
+            missing_go_to_left,
+        );
 
         let left_slot = arena.len();
         arena.push(placeholder_build_leaf::<F>());
@@ -3101,6 +3698,7 @@ fn build_regression_tree_best_first<F: Float>(
                 n_samples: record.indices.len(),
                 value: regression_leaf_value(data.y, &record.indices, data.criterion),
                 distribution: None,
+                missing_go_to_left,
             })
         } else {
             None
@@ -3146,15 +3744,15 @@ fn stable_regression_improvement<F: Float>(
     node_indices: &[usize],
     feature: usize,
     threshold: F,
+    missing_go_to_left: bool,
     naive_bid: F,
     n_total: usize,
 ) -> F {
     let n = node_indices.len();
     let n_f = F::from(n).unwrap_or_else(F::one);
     let n_total_f = F::from(n_total).unwrap_or_else(F::one);
-    let (left, right): (Vec<usize>, Vec<usize>) = node_indices
-        .iter()
-        .partition(|&&i| data.x[[i, feature]] <= threshold);
+    let (left, right): (Vec<usize>, Vec<usize>) =
+        partition_with_missing(node_indices, data.x, feature, threshold, missing_go_to_left);
     let n_l = F::from(left.len()).unwrap_or_else(F::one);
     let n_r = F::from(right.len()).unwrap_or_else(F::one);
 
@@ -3213,6 +3811,8 @@ fn make_regression_build_leaf<F: Float>(
             n_samples: n,
             value,
             distribution: None,
+            // Leaf node: no missing-value routing.
+            missing_go_to_left: false,
         })
     } else {
         None
@@ -3269,10 +3869,10 @@ fn prune_ccp<F: Float>(
     meta: &[NodeMeta<F>],
     n_total: usize,
     ccp_alpha: F,
-) -> Vec<Node<F>> {
+) -> (Vec<Node<F>>, Vec<NodeMeta<F>>) {
     let n_nodes = nodes.len();
     if n_nodes <= 1 {
-        return nodes.to_vec();
+        return (nodes.to_vec(), meta.to_vec());
     }
     let total_w = F::from(n_total).unwrap_or_else(F::one);
 
@@ -3388,34 +3988,43 @@ fn prune_ccp<F: Float>(
     rebuild_pruned_tree(nodes, meta, &in_subtree, &leaves_in_subtree)
 }
 
-/// Rebuild a compacted flat `Vec<Node<F>>` from the surviving nodes after a
-/// `ccp_alpha` prune.
+/// Rebuild a compacted `(Vec<Node<F>>, Vec<NodeMeta<F>>)` from the surviving
+/// nodes after a `ccp_alpha` prune.
 ///
 /// A surviving node that is `leaves_in_subtree` becomes a [`Node::Leaf`] using
 /// the node's OWN stored collapse value / distribution (`meta`), mirroring
 /// sklearn's `_build_pruned_tree` copying the original node's value into the
 /// pruned leaf. Surviving split nodes keep their `feature`/`threshold`/
 /// `impurity_decrease`/`n_samples`, with child indices remapped into the
-/// compacted vec. The traversal is depth-first pre-order from the root so the
-/// resulting layout matches the original builder's ordering.
+/// compacted vec. The per-node `NodeMeta` (carrying `missing_go_to_left`) is
+/// emitted index-aligned with the compacted nodes — a pruned-to-leaf node keeps
+/// its `meta` but `false`-routes (a leaf never consults the flag), and a
+/// surviving split keeps its original direction. The traversal is depth-first
+/// pre-order from the root so the resulting layout matches the original
+/// builder's ordering.
 fn rebuild_pruned_tree<F: Float>(
     nodes: &[Node<F>],
     meta: &[NodeMeta<F>],
     in_subtree: &[bool],
     leaves_in_subtree: &[bool],
-) -> Vec<Node<F>> {
+) -> (Vec<Node<F>>, Vec<NodeMeta<F>>) {
     let mut new_nodes: Vec<Node<F>> = Vec::new();
+    let mut new_meta: Vec<NodeMeta<F>> = Vec::new();
     // (old_idx, slot_in_new_nodes) — the slot was reserved with a placeholder.
     let mut stack: Vec<(usize, usize)> = Vec::new();
 
     let root_slot = new_nodes.len();
     new_nodes.push(placeholder_leaf::<F>());
+    new_meta.push(meta[0].clone());
     stack.push((0usize, root_slot));
 
     while let Some((old_idx, slot)) = stack.pop() {
         if !in_subtree[old_idx] {
             continue;
         }
+        // The surviving node carries the original node's `NodeMeta` (its own
+        // collapse value/distribution + missing direction).
+        new_meta[slot] = meta[old_idx].clone();
         let is_leaf = leaves_in_subtree[old_idx] || matches!(nodes[old_idx], Node::Leaf { .. });
         if is_leaf {
             let m = &meta[old_idx];
@@ -3436,8 +4045,10 @@ fn rebuild_pruned_tree<F: Float>(
             // Reserve child slots (left then right) and fill in pointers.
             let left_slot = new_nodes.len();
             new_nodes.push(placeholder_leaf::<F>());
+            new_meta.push(placeholder_meta::<F>());
             let right_slot = new_nodes.len();
             new_nodes.push(placeholder_leaf::<F>());
+            new_meta.push(placeholder_meta::<F>());
             new_nodes[slot] = Node::Split {
                 feature,
                 threshold,
@@ -3452,7 +4063,18 @@ fn rebuild_pruned_tree<F: Float>(
             stack.push((left, left_slot));
         }
     }
-    new_nodes
+    (new_nodes, new_meta)
+}
+
+/// A placeholder `NodeMeta` reserving a slot before its real contents are known.
+fn placeholder_meta<F: Float>() -> NodeMeta<F> {
+    NodeMeta {
+        impurity: F::zero(),
+        n_samples: 0,
+        value: F::zero(),
+        distribution: None,
+        missing_go_to_left: false,
+    }
 }
 
 /// A placeholder leaf used to reserve a slot before its real contents are known.
@@ -4604,6 +5226,7 @@ mod tests {
                 classes: vec![0],
                 n_features: x.ncols(),
                 feature_importances: Array1::zeros(x.ncols()),
+                missing_go_to_left: vec![false],
             },
         }
     }
@@ -4665,6 +5288,7 @@ mod tests {
                 nodes: vec![placeholder_leaf::<f64>()],
                 n_features: x.ncols(),
                 feature_importances: Array1::zeros(x.ncols()),
+                missing_go_to_left: vec![false],
             },
         }
     }
