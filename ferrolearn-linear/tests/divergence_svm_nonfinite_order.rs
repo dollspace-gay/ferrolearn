@@ -35,25 +35,23 @@
 //! Every one of `SVC`/`SVR`/`NuSVC`/`NuSVR` raises `ValueError("Input X contains
 //! NaN.")` — the **finiteness** error — on this input.
 //!
-//! DIVERGENCE: ferrolearn's batch-6 guard fires the X-finiteness check AFTER the
-//! X/y length (`ShapeMismatch`) check at each fit entry:
-//!   - `SVC::fit`   — `svm.rs:2027` (ShapeMismatch) precedes `svm.rs:2051` (finite)
-//!   - `SVR::fit`   — `svm.rs:3288` (ShapeMismatch) precedes `svm.rs:3320` (finite)
-//!   - `NuSVC::fit` — `nu_svm.rs:253` (ShapeMismatch) precedes `nu_svm.rs:272` (finite)
-//!   - `NuSVR::fit` — `nu_svm.rs:671` (ShapeMismatch) precedes `nu_svm.rs:690` (finite)
-//! so on the BOTH-bad input ferrolearn returns `FerroError::ShapeMismatch` where
-//! sklearn raises the finiteness `ValueError` — an exception-class divergence
-//! (R-DEV-2 exception/ABI parity), the SAME validation-ORDER category pinned for
-//! the batch-5 CV estimators. The 25 batch-6 non-finite tests all use a
-//! WELL-SHAPED `y`, so none of them exercises this ordering.
+//! FIXED (#2270): each of `SVC::fit`/`SVR::fit` (`svm.rs`) and
+//! `NuSVC::fit`/`NuSVR::fit` (`nu_svm.rs`) now runs the X-finiteness guard (and
+//! the `y`-finiteness guard for the regressors) BEFORE the X/y length
+//! (`ShapeMismatch`) check, matching `check_X_y`'s
+//! `check_array(force_all_finite=True)`-then-`check_consistent_length` order. So
+//! on the BOTH-bad input the four fits now return the finiteness
+//! `InvalidParameter` (sklearn's `ValueError("Input X contains NaN.")`), NOT a
+//! `ShapeMismatch`. The 25 batch-6 non-finite tests all use a WELL-SHAPED `y`, so
+//! none of them exercises this ordering; these four pins do.
 //!
 //! Tracking: #2270.
 
-use ferrolearn_core::error::FerroError;
 use ferrolearn_core::Fit;
+use ferrolearn_core::error::FerroError;
 use ferrolearn_linear::nu_svm::{NuSVC, NuSVR};
 use ferrolearn_linear::svm::{LinearKernel, SVC, SVR};
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 /// 3-row X with a NaN at [0,1].
 fn xc_nan() -> Array2<f64> {
@@ -88,54 +86,50 @@ fn assert_finite_err_not_shape<T>(res: Result<T, FerroError>) {
     }
 }
 
-/// Divergence: `SVC::fit` checks X/y length (`svm.rs:2027`, ShapeMismatch)
-/// BEFORE X-finiteness (`svm.rs:2051`); sklearn's `check_X_y`
-/// (`sklearn/svm/_base.py:190`) checks X-finiteness first.
+/// `SVC::fit` runs the X-finiteness guard BEFORE the X/y length
+/// (`ShapeMismatch`) check, matching sklearn's `check_X_y`
+/// (`sklearn/svm/_base.py:190`) which validates X-finiteness first.
 /// Input: `X=[[1,NaN],[2,2],[3,3]]`, `y=[0,1]`.
-/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns
-/// `ShapeMismatch`.
+/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns the
+/// finiteness `InvalidParameter` (NOT `ShapeMismatch`).
 /// Tracking: #2270
 #[test]
-#[ignore = "divergence: SVC non-finite-X guard ordered after y-length check; tracking #2270"]
 fn svc_nonfinite_x_precedes_length_check() {
     let res = SVC::<f64, LinearKernel>::new(LinearKernel).fit(&xc_nan(), &yc_short());
     assert_finite_err_not_shape(res);
 }
 
-/// Divergence: `SVR::fit` checks X/y length (`svm.rs:3288`) BEFORE X-finiteness
-/// (`svm.rs:3320`); sklearn checks X-finiteness first.
+/// `SVR::fit` runs the X-/y-finiteness guards BEFORE the X/y length
+/// (`ShapeMismatch`) check; sklearn's `check_X_y` validates finiteness first.
 /// Input: `X=[[1,NaN],[2,2],[3,3]]`, `y=[0.0,1.0]`.
-/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns
-/// `ShapeMismatch`.
+/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns the
+/// finiteness `InvalidParameter` (NOT `ShapeMismatch`).
 /// Tracking: #2270
 #[test]
-#[ignore = "divergence: SVR non-finite-X guard ordered after y-length check; tracking #2270"]
 fn svr_nonfinite_x_precedes_length_check() {
     let res = SVR::<f64, LinearKernel>::new(LinearKernel).fit(&xc_nan(), &array![0.0f64, 1.0]);
     assert_finite_err_not_shape(res);
 }
 
-/// Divergence: `NuSVC::fit` checks X/y length (`nu_svm.rs:253`) BEFORE
-/// X-finiteness (`nu_svm.rs:272`); sklearn checks X-finiteness first.
+/// `NuSVC::fit` runs the X-finiteness guard BEFORE the X/y length
+/// (`ShapeMismatch`) check; sklearn's `check_X_y` validates X-finiteness first.
 /// Input: `X=[[1,NaN],[2,2],[3,3]]`, `y=[0,1]`.
-/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns
-/// `ShapeMismatch`.
+/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns the
+/// finiteness `InvalidParameter` (NOT `ShapeMismatch`).
 /// Tracking: #2270
 #[test]
-#[ignore = "divergence: NuSVC non-finite-X guard ordered after y-length check; tracking #2270"]
 fn nusvc_nonfinite_x_precedes_length_check() {
     let res = NuSVC::<f64, LinearKernel>::new(LinearKernel).fit(&xc_nan(), &yc_short());
     assert_finite_err_not_shape(res);
 }
 
-/// Divergence: `NuSVR::fit` checks X/y length (`nu_svm.rs:671`) BEFORE
-/// X-finiteness (`nu_svm.rs:690`); sklearn checks X-finiteness first.
+/// `NuSVR::fit` runs the X-/y-finiteness guards BEFORE the X/y length
+/// (`ShapeMismatch`) check; sklearn's `check_X_y` validates finiteness first.
 /// Input: `X=[[1,NaN],[2,2],[3,3]]`, `y=[0.0,1.0]`.
-/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns
-/// `ShapeMismatch`.
+/// sklearn raises `ValueError("Input X contains NaN.")`; ferrolearn returns the
+/// finiteness `InvalidParameter` (NOT `ShapeMismatch`).
 /// Tracking: #2270
 #[test]
-#[ignore = "divergence: NuSVR non-finite-X guard ordered after y-length check; tracking #2270"]
 fn nusvr_nonfinite_x_precedes_length_check() {
     let res = NuSVR::<f64, LinearKernel>::new(LinearKernel).fit(&xc_nan(), &array![0.0f64, 1.0]);
     assert_finite_err_not_shape(res);

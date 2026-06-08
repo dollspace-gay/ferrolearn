@@ -250,29 +250,33 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 context: "NuSVC requires at least one sample".into(),
             });
         }
+        // Reject non-finite input (NaN / +/-inf) in X BEFORE the X/y length
+        // (`ShapeMismatch`) check. `NuSVC::fit` calls `crate::svm::solve_nu_svc`
+        // DIRECTLY (the genuine `Solver_NU` dual) — it does NOT route through the
+        // guarded `crate::svm::SVC::fit`, so it needs its OWN finiteness guard.
+        // Mirrors sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)`
+        // (`sklearn/svm/_base.py:190`) which routes to `check_X_y`:
+        // `check_array(X, force_all_finite=True)` runs BEFORE
+        // `check_consistent_length(X, y)` (`_base.py:208`), so on an input that is
+        // BOTH non-finite AND length-mismatched sklearn raises the finiteness
+        // `ValueError("Input X contains NaN.")` / `"… contains infinity …"`, NOT a
+        // consistency error (#2270). `y` is class labels (`Array1<usize>`), finite
+        // by type, so only X is checked. `.iter().any(|v| !v.is_finite())` catches
+        // NaN and +/-inf; on finite input the guard never fires (the nu-SVC fitted
+        // attributes are byte-identical and a finite length-mismatch still yields
+        // `ShapeMismatch`).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         if n_samples != y.len() {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        // Reject non-finite input (NaN / +/-inf) in X BEFORE the nu-SVC solve.
-        // `NuSVC::fit` calls `crate::svm::solve_nu_svc` DIRECTLY (the genuine
-        // `Solver_NU` dual) — it does NOT route through the guarded
-        // `crate::svm::SVC::fit`, so it needs its OWN finiteness guard. Mirrors
-        // sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)`
-        // (`sklearn/svm/_base.py:190-197`, default `force_all_finite=True`) ->
-        // `ValueError("Input X contains NaN.")` / `"… contains infinity …"`. `y`
-        // is class labels (`Array1<usize>`), finite by type, so only X is
-        // checked. `.iter().any(|v| !v.is_finite())` catches NaN and +/-inf; on
-        // finite input the guard never fires (the nu-SVC fitted attributes are
-        // byte-identical).
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "X".into(),
-                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -668,25 +672,22 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 context: "NuSVR requires at least one sample".into(),
             });
         }
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
         // Reject non-finite input (NaN / +/-inf) in X or the float target y
-        // BEFORE the nu-SVR solve. `NuSVR::fit` calls `crate::svm::solve_nu_svr`
-        // DIRECTLY (the genuine `2l`-variable `Solver_NU` dual) — it does NOT
-        // route through the guarded `crate::svm::SVR::fit`, so it needs its OWN
-        // finiteness guard. Mirrors sklearn's `BaseLibSVM.fit` ->
-        // `_validate_data(X, y, …)` (`sklearn/svm/_base.py:190-197`, default
-        // `force_all_finite=True`) -> `ValueError("Input X contains NaN.")` /
-        // `"Input y contains NaN."` / `"… contains infinity …"`. NuSVR's `y` is
-        // float regression targets, so both X and y are checked.
-        // `.iter().any(|v| !v.is_finite())` catches NaN and +/-inf; on finite
-        // input the guard never fires (the fitted attributes are byte-identical).
+        // BEFORE the X/y length (`ShapeMismatch`) check. `NuSVR::fit` calls
+        // `crate::svm::solve_nu_svr` DIRECTLY (the genuine `2l`-variable
+        // `Solver_NU` dual) — it does NOT route through the guarded
+        // `crate::svm::SVR::fit`, so it needs its OWN finiteness guard. Mirrors
+        // sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)`
+        // (`sklearn/svm/_base.py:190`) which routes to `check_X_y`:
+        // `check_array(X, force_all_finite=True)` then `check_array(y)` both run
+        // BEFORE `check_consistent_length(X, y)` (`_base.py:208`), so on an input
+        // that is BOTH non-finite AND length-mismatched sklearn raises the
+        // finiteness `ValueError("Input X contains NaN.")` /
+        // `"Input y contains NaN."` / `"… contains infinity …"`, NOT a consistency
+        // error (#2270). NuSVR's `y` is float regression targets, so both X and y
+        // are checked. `.iter().any(|v| !v.is_finite())` catches NaN and +/-inf;
+        // on finite input the guard never fires (the fitted attributes are
+        // byte-identical and a finite length-mismatch still yields `ShapeMismatch`).
         if x.iter().any(|v| !v.is_finite()) {
             return Err(FerroError::InvalidParameter {
                 name: "X".into(),
@@ -697,6 +698,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             return Err(FerroError::InvalidParameter {
                 name: "y".into(),
                 reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
             });
         }
 

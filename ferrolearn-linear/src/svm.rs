@@ -2024,14 +2024,6 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
     fn fit(&self, x: &Array2<F>, y: &Array1<usize>) -> Result<FittedSVC<F, K>, FerroError> {
         let (n_samples, _n_features) = x.dim();
 
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
         if self.c <= F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "C".into(),
@@ -2039,19 +2031,31 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             });
         }
 
-        // Reject non-finite input (NaN / +/-inf) in X BEFORE the SMO solve,
-        // mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, ...)`
-        // (`sklearn/svm/_base.py:190-197`) which keeps the default
-        // `force_all_finite=True` and raises `ValueError("Input X contains NaN.")`
-        // / `"... contains infinity ..."`. `y` is class labels (`Array1<usize>`),
-        // already finite by type, so only `X` needs the float finiteness check.
-        // `.iter().any(|v| !v.is_finite())` catches both NaN and +/-inf; on
-        // finite input the guard never fires, so the fitted SVC attributes
-        // (`support_`/`dual_coef_`/`intercept_`/`coef_`) are byte-identical.
+        // Reject non-finite input (NaN / +/-inf) in X BEFORE the X/y length
+        // (`ShapeMismatch`) check, mirroring sklearn's `BaseLibSVM.fit` ->
+        // `_validate_data(X, y, ...)` (`sklearn/svm/_base.py:190`) which routes to
+        // `check_X_y`: `check_array(X, force_all_finite=True)` runs BEFORE
+        // `check_consistent_length(X, y)` (`_base.py:208`), so on an input that is
+        // BOTH non-finite AND length-mismatched sklearn raises the finiteness
+        // `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`,
+        // NOT a consistency error (#2270). `y` is class labels
+        // (`Array1<usize>`), already finite by type, so only `X` needs the float
+        // finiteness check. `.iter().any(|v| !v.is_finite())` catches both NaN and
+        // +/-inf; on finite input the guard never fires, so the fitted SVC
+        // attributes (`support_`/`dual_coef_`/`intercept_`/`coef_`) are
+        // byte-identical and a finite length-mismatch still yields `ShapeMismatch`.
         if x.iter().any(|v| !v.is_finite()) {
             return Err(FerroError::InvalidParameter {
                 name: "X".into(),
                 reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
             });
         }
 
@@ -3285,14 +3289,6 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedSVR<F, K>, FerroError> {
         let (n_samples, _n_features) = x.dim();
 
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
         if self.c <= F::zero() {
             return Err(FerroError::InvalidParameter {
                 name: "C".into(),
@@ -3309,14 +3305,19 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
         }
 
         // Reject non-finite input (NaN / +/-inf) in X or the float target y
-        // BEFORE the SMO solve, mirroring sklearn's `BaseLibSVM.fit` ->
-        // `_validate_data(X, y, ...)` (`sklearn/svm/_base.py:190-197`) which keeps
-        // the default `force_all_finite=True` and raises
-        // `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` /
-        // `"... contains infinity ..."`. SVR's `y` is float regression targets,
-        // so both X and y are finiteness-checked. `.iter().any(|v|
-        // !v.is_finite())` catches NaN and +/-inf; on finite input the guard
-        // never fires, so the fitted SVR attributes are byte-identical.
+        // BEFORE the X/y length (`ShapeMismatch`) check, mirroring sklearn's
+        // `BaseLibSVM.fit` -> `_validate_data(X, y, ...)`
+        // (`sklearn/svm/_base.py:190`) which routes to `check_X_y`:
+        // `check_array(X, force_all_finite=True)` then `check_array(y)` both run
+        // BEFORE `check_consistent_length(X, y)` (`_base.py:208`), so on an input
+        // that is BOTH non-finite AND length-mismatched sklearn raises the
+        // finiteness `ValueError("Input X contains NaN.")` /
+        // `"Input y contains NaN."` / `"... contains infinity ..."`, NOT a
+        // consistency error (#2270). SVR's `y` is float regression targets, so
+        // both X and y are finiteness-checked. `.iter().any(|v| !v.is_finite())`
+        // catches NaN and +/-inf; on finite input the guard never fires, so the
+        // fitted SVR attributes are byte-identical and a finite length-mismatch
+        // still yields `ShapeMismatch`.
         if x.iter().any(|v| !v.is_finite()) {
             return Err(FerroError::InvalidParameter {
                 name: "X".into(),
@@ -3327,6 +3328,14 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             return Err(FerroError::InvalidParameter {
                 name: "y".into(),
                 reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
+        if n_samples != y.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "y length must match number of samples in X".into(),
             });
         }
 
