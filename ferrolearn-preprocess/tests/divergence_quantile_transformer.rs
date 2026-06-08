@@ -1063,3 +1063,267 @@ fn divergence_inverse_rejects_inf() {
          force_all_finite=allow-nan), but ferrolearn returned Ok"
     );
 }
+
+// ===========================================================================
+// REQ-9 — `quantile_transform` free function (sklearn
+// `quantile_transform`, `_data.py:2978`,`:3107-3119`).
+//
+// The free fn delegates to `QuantileTransformer::new(...).fit(...).transform`
+// (no quantile math duplicated). Oracle = live sklearn 1.5.2
+// `quantile_transform` with `subsample=None` (the deterministic no-subsample
+// path), matching n_quantiles so both sides build identical reference grids
+// (R-CHAR-3). Every expected constant is produced by the `// oracle:`
+// `python3 -c` call printed above it — never copied from ferrolearn.
+// ===========================================================================
+
+use ferrolearn_preprocess::quantile_transformer::quantile_transform;
+
+/// `quantile_transform(X, axis=0, n_quantiles=5, Uniform)` on a 2-feature
+/// distinct fixture matches sklearn column-by-column, AND equals the SHIPPED
+/// estimator's `fit_transform` (the free fn must be a faithful wrapper).
+#[test]
+fn free_fn_axis0_uniform_matches_sklearn_and_estimator() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   X=np.array([[1.,10.],[2.,20.],[3.,5.],[4.,40.],[5.,15.]]); \
+    //   print(quantile_transform(X, axis=0, n_quantiles=5, output_distribution='uniform', subsample=None).tolist())"
+    //   -> [[0.0,0.25],[0.25,0.75],[0.5,0.0],[0.75,1.0],[1.0,0.5]]
+    let sk: [[f64; 2]; 5] = [
+        [0.0, 0.25],
+        [0.25, 0.75],
+        [0.5, 0.0],
+        [0.75, 1.0],
+        [1.0, 0.5],
+    ];
+    let x = array![
+        [1.0, 10.0],
+        [2.0, 20.0],
+        [3.0, 5.0],
+        [4.0, 40.0],
+        [5.0, 15.0]
+    ];
+
+    let out = quantile_transform(&x, 0, 5, OutputDistribution::Uniform, 0).unwrap();
+    for (i, row) in sk.iter().enumerate() {
+        for (j, &expected) in row.iter().enumerate() {
+            assert!(
+                (out[[i, j]] - expected).abs() <= 1e-9,
+                "[{i},{j}] free fn = {}, sklearn = {expected}",
+                out[[i, j]]
+            );
+        }
+    }
+
+    // The free fn MUST equal QuantileTransformer::new(...).fit(X).transform(X).
+    let est = QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0)
+        .fit(&x, &())
+        .unwrap()
+        .transform(&x)
+        .unwrap();
+    for (a, b) in out.iter().zip(est.iter()) {
+        assert!(
+            (a - b).abs() <= 1e-15,
+            "free fn != estimator fit_transform: {a} vs {b}"
+        );
+    }
+}
+
+/// `quantile_transform(X, axis=0, Uniform)` on a column with TIED values matches
+/// sklearn (the forward/reversed-averaged plateau mapping survives the wrapper).
+#[test]
+fn free_fn_axis0_uniform_tied_matches_sklearn() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   print(quantile_transform(np.array([[1.],[2.],[2.],[2.],[5.]]), axis=0, n_quantiles=5, \
+    //   output_distribution='uniform', subsample=None).ravel().tolist())"
+    //   -> [0.0, 0.5, 0.5, 0.5, 1.0]
+    let sk: [f64; 5] = [0.0, 0.5, 0.5, 0.5, 1.0];
+    let x = array![[1.0], [2.0], [2.0], [2.0], [5.0]];
+
+    let out = quantile_transform(&x, 0, 5, OutputDistribution::Uniform, 0).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        assert!(
+            (out[[i, 0]] - expected).abs() <= 1e-9,
+            "row {i}: free fn = {}, sklearn = {expected}",
+            out[[i, 0]]
+        );
+    }
+}
+
+/// `quantile_transform(X, axis=0, Normal)` matches sklearn to ~1e-7 (inherits the
+/// REQ-3 Acklam ppf accuracy through the estimator).
+#[test]
+fn free_fn_axis0_normal_matches_sklearn() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   X=np.array([[1.,10.],[2.,20.],[3.,5.],[4.,40.],[5.,15.]]); \
+    //   print(quantile_transform(X, axis=0, n_quantiles=5, output_distribution='normal', subsample=None).tolist())"
+    //   -> [[-5.199337582605575,-0.6744897501960817],[-0.6744897501960817,0.6744897501960817],
+    //       [0.0,-5.199337582605575],[0.6744897501960817,5.19933758270342],[5.19933758270342,0.0]]
+    let sk: [[f64; 2]; 5] = [
+        [-5.199337582605575, -0.6744897501960817],
+        [-0.6744897501960817, 0.6744897501960817],
+        [0.0, -5.199337582605575],
+        [0.6744897501960817, 5.19933758270342],
+        [5.19933758270342, 0.0],
+    ];
+    let x = array![
+        [1.0, 10.0],
+        [2.0, 20.0],
+        [3.0, 5.0],
+        [4.0, 40.0],
+        [5.0, 15.0]
+    ];
+
+    let out = quantile_transform(&x, 0, 5, OutputDistribution::Normal, 0).unwrap();
+    for (i, row) in sk.iter().enumerate() {
+        for (j, &expected) in row.iter().enumerate() {
+            assert!(
+                (out[[i, j]] - expected).abs() <= 1e-7,
+                "[{i},{j}] free fn Normal = {}, sklearn = {expected}",
+                out[[i, j]]
+            );
+        }
+    }
+}
+
+/// `quantile_transform(X, axis=1)` on a NON-SQUARE fixture (3x4) matches sklearn
+/// `quantile_transform(X, axis=1)` (= `fit_transform(X.T).T`). A non-square
+/// fixture makes a transpose bug observable. Also equals the manual
+/// transpose-fit_transform-transpose path.
+#[test]
+fn free_fn_axis1_nonsquare_matches_sklearn_and_manual_transpose() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   X=np.array([[10.,5.,8.,1.],[2.,9.,4.,7.],[6.,3.,11.,0.]]); \
+    //   print(quantile_transform(X, axis=1, n_quantiles=4, output_distribution='uniform', subsample=None).tolist())"
+    //   -> [[1.0,0.3333333333333334,0.666666666666667,0.0],
+    //       [0.0,1.0,0.33333333333333337,0.666666666666667],
+    //       [0.6666666666666667,0.3333333333333334,1.0,0.0]]
+    let sk: [[f64; 4]; 3] = [
+        [1.0, 0.333_333_333_333_333_4, 0.666_666_666_666_667, 0.0],
+        [0.0, 1.0, 0.333_333_333_333_333_37, 0.666_666_666_666_667],
+        [0.666_666_666_666_666_7, 0.333_333_333_333_333_4, 1.0, 0.0],
+    ];
+    let x = array![
+        [10.0, 5.0, 8.0, 1.0],
+        [2.0, 9.0, 4.0, 7.0],
+        [6.0, 3.0, 11.0, 0.0]
+    ];
+
+    let out = quantile_transform(&x, 1, 4, OutputDistribution::Uniform, 0).unwrap();
+    assert_eq!(
+        out.dim(),
+        (3, 4),
+        "axis=1 must preserve original (3,4) shape"
+    );
+    for (i, row) in sk.iter().enumerate() {
+        for (j, &expected) in row.iter().enumerate() {
+            assert!(
+                (out[[i, j]] - expected).abs() <= 1e-9,
+                "[{i},{j}] free fn axis=1 = {}, sklearn = {expected}",
+                out[[i, j]]
+            );
+        }
+    }
+
+    // Manual transpose-fit_transform-transpose must equal the free fn.
+    let xt = x.t().to_owned();
+    let manual_t = QuantileTransformer::<f64>::new(4, OutputDistribution::Uniform, 0)
+        .fit(&xt, &())
+        .unwrap()
+        .transform(&xt)
+        .unwrap();
+    let manual = manual_t.t().to_owned();
+    for (a, b) in out.iter().zip(manual.iter()) {
+        assert!(
+            (a - b).abs() <= 1e-15,
+            "axis=1 free fn != manual transpose path: {a} vs {b}"
+        );
+    }
+}
+
+/// `quantile_transform(X, axis=2)` (any axis ∉ {0,1}) returns `Err(InvalidParameter)`,
+/// mirroring sklearn's `ValueError("axis should be either equal to 0 or 1...")`.
+#[test]
+fn free_fn_invalid_axis_errors() {
+    let x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+    let err = quantile_transform(&x, 2, 3, OutputDistribution::Uniform, 0);
+    match err {
+        Err(ferrolearn_core::error::FerroError::InvalidParameter { name, reason }) => {
+            assert_eq!(name, "axis");
+            assert!(
+                reason.contains("axis should be either equal to 0 or 1"),
+                "reason was: {reason}"
+            );
+        }
+        other => panic!("expected InvalidParameter for axis=2, got {other:?}"),
+    }
+}
+
+/// f32 path: the free fn is generic and produces the same uniform ranks (~1e-6).
+#[test]
+fn free_fn_f32_axis0_uniform() {
+    // oracle (same as f64): quantile_transform([[1.],[2.],[3.],[4.],[5.]], axis=0,
+    //   n_quantiles=5, uniform, subsample=None) -> [0.0,0.25,0.5,0.75,1.0]
+    let sk: [f32; 5] = [0.0, 0.25, 0.5, 0.75, 1.0];
+    let x: ndarray::Array2<f32> = array![[1.0f32], [2.0], [3.0], [4.0], [5.0]];
+    let out = quantile_transform(&x, 0, 5, OutputDistribution::Uniform, 0).unwrap();
+    for (i, &expected) in sk.iter().enumerate() {
+        assert!(
+            (out[[i, 0]] - expected).abs() <= 1e-6,
+            "row {i}: f32 free fn = {}, sklearn = {expected}",
+            out[[i, 0]]
+        );
+    }
+}
+
+// ===========================================================================
+// DIV-E — quantile_transform axis=1 on a single-column X (transpose -> 1 sample)
+// rejects where sklearn succeeds. sklearn `quantile_transform`
+// (`sklearn/preprocessing/_data.py:3117-3118` `X = n.fit_transform(X.T).T`)
+// transposes a (n,1) matrix to (1,n) -> fits on n_samples=1, clamps
+// n_quantiles to 1 (`:2785` warning + `:2790` `max(1, min(n_quantiles,
+// n_samples))`), and returns all-zeros. ferrolearn's `QuantileTransformer::fit`
+// (`quantile_transformer.rs:469`) hard-rejects `n_samples < 2` with
+// `InsufficientSamples`, so the free fn returns `Err` where sklearn returns Ok.
+// This also affects axis=0 on a single-row (1, n_features) input.
+// ===========================================================================
+
+/// Divergence: `quantile_transform(X, axis=1, ...)` on a `(5, 1)` matrix
+/// diverges from sklearn `quantile_transform` (`_data.py:3117-3118`).
+///
+/// axis=1 transposes X to its transpose `(1, 5)` and runs `fit_transform` on it
+/// (`X.T` has n_samples=1). sklearn clamps `n_quantiles` to `n_samples=1`
+/// (`_data.py:2785`,`:2790`) and succeeds, returning the original `(5, 1)` shape
+/// filled with `0.0`. ferrolearn's `fit` (`quantile_transformer.rs:469`:
+/// `if n_samples < 2 { return Err(InsufficientSamples ...) }`) rejects the
+/// single-sample transposed matrix, so the free fn returns `Err`.
+///
+/// Input: `[[1.],[2.],[3.],[4.],[5.]]`, axis=1, n_quantiles=5, Uniform.
+/// sklearn returns `Ok` shape `(5,1)` = `[[0.],[0.],[0.],[0.],[0.]]`.
+/// ferrolearn returns `Err(InsufficientSamples)`.
+/// Tracking: #2218
+#[test]
+#[ignore = "divergence: quantile_transform axis=1 on single-column rejects (n_samples<2 guard) where sklearn clamps n_quantiles and succeeds; tracking #2218"]
+fn divergence_free_fn_axis1_single_column_rejected() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   import warnings; warnings.filterwarnings('ignore'); \
+    //   X=np.array([[1.],[2.],[3.],[4.],[5.]]); \
+    //   o=quantile_transform(X, axis=1, n_quantiles=5, output_distribution='uniform', subsample=None); \
+    //   print(o.shape, o.ravel().tolist())"
+    //   -> (5, 1) [0.0, 0.0, 0.0, 0.0, 0.0]
+    let sk: [f64; 5] = [0.0, 0.0, 0.0, 0.0, 0.0];
+    let x = array![[1.0], [2.0], [3.0], [4.0], [5.0]];
+
+    let out = quantile_transform(&x, 1, 5, OutputDistribution::Uniform, 0)
+        .expect("sklearn returns Ok((5,1)) for axis=1 single-column; ferrolearn must too");
+    assert_eq!(
+        out.dim(),
+        (5, 1),
+        "axis=1 single-column must preserve original (5,1) shape"
+    );
+    for (i, &expected) in sk.iter().enumerate() {
+        assert!(
+            (out[[i, 0]] - expected).abs() <= 1e-9,
+            "row {i}: ferrolearn = {}, sklearn = {expected}",
+            out[[i, 0]]
+        );
+    }
+}
