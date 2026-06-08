@@ -1027,7 +1027,12 @@ where
                 // branch only fires for 1 <= p < 2.
                 p.powf(two_minus_p) / two_minus_p
             } else {
-                t.powf(two_minus_p) / (one_minus_p * two_minus_p)
+                // sklearn clamps the first deviance term to `np.maximum(y_true, 0)`
+                // (`_regression.py:1283`); only the `y_true^(2-p)` term is clamped,
+                // the middle `y_true * y_pred^(1-p)` term uses the raw `y_true`.
+                // For `power < 0`, this keeps negative `y_true` finite instead of
+                // producing `NaN` from `(-t)^(non-integer)`.
+                t.max(zero).powf(two_minus_p) / (one_minus_p * two_minus_p)
                     - t * p.powf(one_minus_p) / one_minus_p
                     + p.powf(two_minus_p) / two_minus_p
             };
@@ -1228,7 +1233,10 @@ where
             let two = F::from(2.0).unwrap();
             let one_minus_p = F::one() - power;
             let two_minus_p = two - power;
-            t.powf(two_minus_p) / (one_minus_p * two_minus_p)
+            // sklearn clamps the first deviance term to `np.maximum(y_true, 0)`
+            // (`_regression.py:1283`); only the `y_true^(2-p)` term is clamped,
+            // the middle `y_true * y_pred^(1-p)` term uses the raw `y_true`.
+            t.max(F::zero()).powf(two_minus_p) / (one_minus_p * two_minus_p)
                 - t * p.powf(one_minus_p) / one_minus_p
                 + p.powf(two_minus_p) / two_minus_p
         }

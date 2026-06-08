@@ -35,7 +35,6 @@ use ndarray::array;
 const SK_TWEEDIE_NEG_YTRUE: f64 = 5.59634389721963;
 
 #[test]
-#[ignore = "divergence: mean_tweedie_deviance power<0 misses max(y_true,0) clamp -> NaN; tracking #2294"]
 fn divergence_mean_tweedie_power_neg_negative_ytrue_clamp() {
     let y_true = array![-2.0_f64, 1.0, 3.0];
     let y_pred = array![1.5_f64, 2.5, 2.0];
@@ -55,7 +54,6 @@ fn divergence_mean_tweedie_power_neg_negative_ytrue_clamp() {
 const SK_D2_TWEEDIE_NEG_YTRUE: f64 = 0.6220978677967901;
 
 #[test]
-#[ignore = "divergence: d2_tweedie_score power<0 misses max(y_true,0) clamp -> NaN; tracking #2294"]
 fn divergence_d2_tweedie_power_neg_negative_ytrue_clamp() {
     let y_true = array![-2.0_f64, 1.0, 3.0, 5.0];
     let y_pred = array![1.5_f64, 2.5, 2.0, 4.0];
