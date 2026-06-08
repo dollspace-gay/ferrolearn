@@ -30,6 +30,7 @@
 //! | REQ-17 (n_iter_) | SHIPPED | `FittedLogisticRegression::n_iter` (via `LbfgsOptimizer::minimize_reporting`) + getter `n_iter()`; positive int `<= max_iter`, deterministic (R-DEV-7: contract not literal sklearn count). Consumer: `RsLogisticRegression::n_iter_`. |
 //! | REQ-18 (sample_weight) | SHIPPED | `fit_with_sample_weight(x,y,Option<&Array1<F>>)` threads per-sample weights into logloss+grad in both branches; `Fit::fit` delegates `None` (byte-identical). Consumer: `RsLogisticRegression::fit`. Verified vs oracle (weighted coef/intercept, integer-weight≡row-dup). |
 //! | REQ-19 (random_state/n_jobs) | SHIPPED | `random_state`/`n_jobs` ctor fields + `with_random_state`/`with_n_jobs`; documented no-ops on the deterministic lbfgs path (R-DEV-7). Consumer: `RsLogisticRegression` get_params/clone parity. |
+//! | REQ-21 (non-finite input rejected) | SHIPPED | The shared fit entry `fit_with_sample_weight` (`Fit::fit` delegates with `None`) rejects any NaN/+/-inf in X or `sample_weight` BEFORE the LBFGS solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_logistic.py:1223`) + `_check_sample_weight` (`_logistic.py:303`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `y` is `Array1<usize>` (integer labels), finite by type, so only X + sample_weight are checked. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `LogisticRegression().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch4.rs::logreg_*`). Non-test consumer: the existing `fit_with_sample_weight` / `RsLogisticRegression` consumers. (#2263) |
 //! | REQ-9..11,13..16,20 NOT-STARTED | penalty l1/elasticnet/none (#442), solver variants (#443), multi_class=ovr (#444), dual (#446), intercept_scaling (#447), l1_ratio (#448), warm_start (#449), ferray substrate (#453). |
 //!
 //! acto-critic: binary + multinomial coef/intercept/predict_proba match the live oracle to ~1e-8 at
@@ -326,6 +327,34 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> LogisticRegression<F> {
                 required: 1,
                 actual: 0,
                 context: "LogisticRegression requires at least one sample".into(),
+            });
+        }
+
+        // Non-finite input validation (#2263). sklearn `LogisticRegression.fit`
+        // -> `self._validate_data(X, y, ...)` (`_logistic.py:1223`) keeps the
+        // default `force_all_finite=True`, so `check_array` rejects any NaN or
+        // +/-inf in X with a `ValueError("Input X contains NaN.")` /
+        // `"... contains infinity ..."` BEFORE the LBFGS solve. sklearn also
+        // validates `sample_weight` via `_check_sample_weight` (default
+        // `force_all_finite=True`, `_logistic.py:303`), raising on a non-finite
+        // weight. `y` is `Array1<usize>` here (integer class labels), so it is
+        // finite by construction — only X + sample_weight need the runtime
+        // check. `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf
+        // (bounds-safe, no panic, R-CODE-2). The finite path is byte-identical
+        // (the guard never fires on finite input). This is the shared fit entry
+        // (`Fit::fit` delegates here with `None`).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if let Some(sw) = sample_weight
+            && sw.iter().any(|v| !v.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
             });
         }
 

@@ -76,6 +76,7 @@
 //! | REQ-14 (binary decision_function shape `(n,)`) | NOT-STARTED | open prereq blocker #600. `fn decision_function` always returns `(n, n_classes)`; sklearn collapses binary to `(n,)` (`discriminant_analysis.py:651-657,739`). Binding-ABI layer (parallel to QDA #581). |
 //! | REQ-15 (tol parameter) | SHIPPED | `LDA::with_tol` sets the svd-solver rank threshold (sklearn default `1e-4`, `discriminant_analysis.py:354,362`); `fn fit` reads `self.tol` into BOTH rank cutoffs `rank = Σ(S > tol)` (`:532`) and `rank2 = Σ(S2 > tol·S2[0])` (`:554`), REPLACING the prior hardcoded `1e-4`. Default `1e-4` ⇒ byte-identical to prior behavior (all existing svd-fit oracle tests stay green). Consumer: `fn fit` reads `self.tol` in both rank thresholds. Test `lda_tol_param` (field default `1e-4` + `with_tol` plumb-through). #601. |
 //! | REQ-16 (ferray array-type substrate) | NOT-STARTED | open prereq blocker #602. The two SVDs run on `ferray::linalg::svd`; the owned array type is still `ndarray` (crate-wide deferral, cf. qda.rs REQ-12 #585). |
+//! | REQ-17 (non-finite input rejected) | SHIPPED | The shared `fn fit` entry rejects any NaN/+/-inf in X BEFORE the solver dispatch (svd/lsqr/eigen) with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`discriminant_analysis.py:589`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `y` is `Array1<usize>` (integer labels), finite by type; LDA's `fit` takes no `sample_weight`, so X is the only runtime check. All three solvers dispatch downstream of the guard, so it covers every solver path. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `LinearDiscriminantAnalysis().fit` raises `ValueError` for NaN/+inf/-inf in X (`tests/divergence_linear_nonfinite_batch4.rs::lda_*`). Non-test consumer: the existing `Fit for LDA` consumers (`Predict for FittedLDA`, crate-root `pub use`). (#2263) |
 //!
 //! # Examples
 //!
@@ -1064,6 +1065,25 @@ impl<F: LinalgFloat + ScalarOperand> Fit<Array2<F>, Array1<usize>> for LDA<F> {
                 required: n_classes + 1,
                 actual: n_samples,
                 context: "LDA: number of samples must exceed number of classes".into(),
+            });
+        }
+
+        // Non-finite input validation (#2263). sklearn `LinearDiscriminantAnalysis.fit`
+        // -> `self._validate_data(X, y, ensure_min_samples=2, ...)`
+        // (`discriminant_analysis.py:589`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X with a `ValueError("Input X contains NaN.")` / `"... contains
+        // infinity ..."` BEFORE the solver dispatch (svd/lsqr/eigen). `y` is
+        // `Array1<usize>` here (integer class labels), finite by construction, so
+        // only X needs the runtime check; LDA's `fit` takes no `sample_weight`.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2). This is the shared fit entry — all three solvers
+        // (svd default, lsqr, eigen) dispatch downstream of it, so the guard
+        // covers every solver. The finite path is byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

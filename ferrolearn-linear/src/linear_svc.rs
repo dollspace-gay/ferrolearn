@@ -63,6 +63,7 @@
 //! | REQ-10 (C-scaling convention) | SHIPPED | the `c / n_f` division is removed; the dual CD uses `upper_bound = C` (hinge) / `diag = 0.5/C` (squared_hinge), so `coef_` tracks `C` like liblinear. Pinned by `linear_svc_coef_c_dependence` (C=0.1 → `0.0784651864625997`, C=1.0 → `0.12835213611984458`). |
 //! | REQ-11 (n_iter_/n_features_in_ + param validation) | SHIPPED | `fn n_features_in` (returns the stored `n_features`, set by `_validate_data`, `_classes.py:302`) and `fn n_iter` (the max dual-CD outer-iteration count across the binary/OvR fits, `n_iter_ = n_iter_.max().item()`, `_classes.py:338`) on `FittedLinearSVC`; `fn fit` validates `tol > 0` (`Interval(Real, 0.0, None, closed="neither")`, `_classes.py:237`). Pinned by `linear_svc_attrs_and_tol_validation in tests/divergence_linear_svc_fit.rs` (#627). `n_features_in_` (oracle `2`) and the `tol <= 0` reject are exact; `n_iter_` is the documented shuffle-path RNG boundary (ferrolearn sweeps natural order, sklearn's liblinear shuffles `index` each sweep, cf. SGD), so the pin bounds `n_iter` in `[1, max_iter]` rather than exact-matching. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #628. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
+//! | REQ-13 (non-finite input rejected) | SHIPPED | `fn fit` rejects any NaN/+/-inf in X BEFORE the dual coordinate-descent solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`svm/_classes.py:302`, the liblinear `_fit_liblinear` path; cf. `svm/_base.py:190`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `y` is `Array1<usize>` (integer labels), finite by type, and ferrolearn's `LinearSVC::fit` takes no `sample_weight` argument, so X is the only runtime check. The guard sits ahead of both the OvR and Crammer-Singer dispatch, so it covers every solver path. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `LinearSVC().fit` raises `ValueError` for NaN/+inf/-inf in X (`tests/divergence_linear_nonfinite_batch4.rs::linsvc_*`). Non-test consumer: `pub use linear_svc::{…}` (`lib.rs`) + `RsLinearSVC` (PyO3). (#2263) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
@@ -1517,6 +1518,24 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             return Err(FerroError::InvalidParameter {
                 name: "intercept_scaling".into(),
                 reason: "must be greater than 0 when fit_intercept is true".into(),
+            });
+        }
+
+        // Non-finite input validation (#2263). sklearn `LinearSVC.fit`
+        // -> `self._validate_data(X, y, ...)` (`svm/_classes.py:302`, the shared
+        // liblinear `_fit_liblinear` path; cf. `svm/_base.py:190`) keeps the
+        // default `force_all_finite=True`, so `check_array` rejects any NaN or
+        // +/-inf in X with a `ValueError("Input X contains NaN.")` / `"...
+        // contains infinity ..."` BEFORE the dual coordinate-descent solve. `y`
+        // is `Array1<usize>` (integer class labels), finite by type, and
+        // ferrolearn's `LinearSVC::fit` takes no `sample_weight` argument, so X is
+        // the only runtime check. `.iter().any(|v| !v.is_finite())` rejects both
+        // NaN and Inf (bounds-safe, no panic, R-CODE-2); the finite path is
+        // byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

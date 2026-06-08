@@ -52,6 +52,7 @@
 //! | REQ-8 (tol/max_iter + n_iter_) | SHIPPED | `fn fit` counts dual-CD outer iterations into `FittedLinearSVR::n_iter`, exposed via `#[must_use] pub fn n_iter` (mirrors `n_iter_ = n_iter_.max().item()`, `_classes.py:603`); emits the `ConvergenceWarning`-equivalent via `eprintln!` at `max_iter` (`_base.py:1234-1238`, crate qda/lda warning channel). Pinned by `tests/divergence_linear_svr_fit.rs::linear_svr_n_iter` (`1 <= n_iter <= max_iter`). |
 //! | REQ-9 (param validation + n_features_in_) | SHIPPED | `fn fit` validates `tol > 0` → `FerroError::InvalidParameter` (sklearn `"tol": [Interval(Real, 0.0, None, closed="neither")]`, `_classes.py:508`); `max_iter` is `usize` so `>= 0` always (sklearn `Interval(Integral,0,None,closed="left")`, `:516`) — documented, no check. Keeps `C>0`/`epsilon>=0` (both match sklearn's empirical fit-time behavior — negative epsilon raises ValueError at fit). `FittedLinearSVR` stores `n_features_in` (= `X.ncols()`), exposed via `#[must_use] pub fn n_features_in` mirroring `n_features_in_` (`_validate_data`, `_classes.py:569-576`). Pinned by `tests/divergence_linear_svr_fit.rs::{linear_svr_tol_validation, linear_svr_n_features_in}`. The `intercept_`-shape (length-1 ndarray vs scalar) sub-item is a binding-ABI concern deferred to the ferrolearn-python layer (cf. #600); `intercept()` keeps returning the scalar. Consumer: `pub use linear_svr::{…}` (`lib.rs`) + `PipelineEstimator` impl. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #615. Imports `ndarray`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `fn fit` rejects any NaN/+/-inf in X OR y BEFORE the dual coordinate-descent solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`svm/_classes.py:302`, the liblinear `_fit_liblinear` path; cf. `svm/_base.py:190`) → `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` / `"... contains infinity ..."`. `y` is `Array1<F>` (float regression targets), so X AND y are checked; ferrolearn's `LinearSVR::fit` takes no `sample_weight` argument. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `LinearSVR().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch4.rs::linsvr_*`). Non-test consumer: `pub use linear_svr::{…}` (`lib.rs`) + `PipelineEstimator` impl. (#2263) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -378,6 +379,30 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
             return Err(FerroError::InvalidParameter {
                 name: "intercept_scaling".into(),
                 reason: "must be greater than 0 when fit_intercept is true".into(),
+            });
+        }
+
+        // Non-finite input validation (#2263). sklearn `LinearSVR.fit`
+        // -> `self._validate_data(X, y, ...)` (`svm/_classes.py:302`, the shared
+        // liblinear `_fit_liblinear` path; cf. `svm/_base.py:190`) keeps the
+        // default `force_all_finite=True`, so `check_array` rejects any NaN or
+        // +/-inf in X OR y with a `ValueError("Input X contains NaN.")` /
+        // `"Input y contains NaN."` / `"... contains infinity ..."` BEFORE the
+        // dual coordinate-descent solve. `y` is `Array1<F>` (float regression
+        // targets), so X AND y need the runtime check; ferrolearn's `LinearSVR::
+        // fit` takes no `sample_weight` argument.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2); the finite path is byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

@@ -68,6 +68,7 @@
 //! | REQ-18 (SGDOneClassSVM) | SHIPPED | `pub struct SGDOneClassSVM<F>` (`nu`/`fit_intercept`/`max_iter`/`tol`/`shuffle`/`learning_rate`/`eta0`/`power_t`/`random_state`/`n_iter_no_change` + `new`/`#[must_use]` builders, defaults `_stochastic_gradient.py:2245-2281`) with `fn fit_one_class` + `impl Fit<Array2<F>, ()> for SGDOneClassSVM` (X-only fit, `y` ignored, `_stochastic_gradient.py:2554`): builds `y = ones(n)`, `alpha = nu/2` (`:2588`), `penalty = L2`, `l1_ratio = 0`, `one_class = true` (`:2262-2289,2312`), inits the SGD intercept `b = 1` (offset init 0 -> `1 - 0`, `:2238,2325`), calls the reused `fn train_binary_sgd` Hinge kernel, then stores `coef_ = w`, `offset_ = 1 - b` (`:2377`). The one-class intercept term lives in `fn train_binary_sgd`: when `hyper.one_class` the gated intercept update gains `- 2*eta*alpha` (`intercept_update = -eta*grad - 2*eta*alpha`), mirroring `_sgd_fast.pyx.tp:641-642` (`if one_class: intercept_update -= 2.*eta*alpha`); `pub one_class: bool` was added to `SGDHyper` (default `false` via `fn clf_hyper`/`reg_hyper`, leaving the clf/reg intercept update byte-identical — the existing 15 divergence tests stay green). `pub struct FittedSGDOneClassSVM<F>` exposes `coef()`/`offset()`/`decision_function()` (`X·coef_ - offset_`, `:2622`)/`score_samples()` (`+ offset_ = X·coef_`, `:2639`) and `impl Predict<Array2<F>>` returning `Array1<isize>` of `+1`/`-1` (`(decision >= 0) ? +1 : -1`, `:2655-2657`). Consumer: `pub use sgd::{SGDOneClassSVM, FittedSGDOneClassSVM}` from `ferrolearn-linear/src/lib.rs` (the grandfathered public-API boundary, matching `SGDClassifier`/`SGDRegressor`). Tests: divergence `sgd_one_class_svm_decision` (live oracle nu=0.5/eta0=0.05/constant/max_iter=10/shuffle=false: coef `[0.009883660184666337, 0.009883660184666337]`, offset `1.1102230246251565e-16`, 1e-7) and `sgd_one_class_svm_predict` (nu=0.8/eta0=0.1/max_iter=15: coef `[0.20020636453962284, 0.12292535592963398]`, offset `0.10000000000000009`, predict `[1,-1,1,-1]`). `_stochastic_gradient.py:2084-2668` / `_sgd_fast.pyx.tp:639-644`. Closes #536. |
 //! | REQ-19 (anti-pattern cleanup) | SHIPPED | `fn compute_lr`'s `_Phantom` arm returns `eta0` (the `unreachable!()` macro was removed earlier), and every production `F::from(<f64 literal>).unwrap()` / `F::from(<literal>).unwrap_or_else(|| ...)` constant-construction site is now `fn cst<F: Float>(x: f64) -> F { F::from(x).unwrap_or_else(F::zero) }` (a private module-level infallible-for-f32/f64 constant helper, defined after the imports). 23 call sites replaced: LogLoss `18.0`/`-18.0`/`1e18` (`_sgd_fast.pyx.tp:267-283`), SquaredError/Huber `0.5` (`:291-295,315-331`), ModifiedHuber `4.0`/`-2.0` (`:178-194`), SquaredHinge/SquaredEpsilonInsensitive/intercept/one-class `2.0` (`:254-258,379-387,641-642,2588`), and the `SGDClassifier`/`SGDRegressor`/`SGDOneClassSVM` `::new` defaults (`0.0`/`0.0001`/`0.15`/`1e-3`/`0.5`/`0.25`/`0.01`/`0.01`/`0.5`, `_stochastic_gradient.py:1242-1256,2042-2068,2245-2281`). No numeric literal changed -> byte-identical for f32/f64; all 25 `divergence_sgd_fit` + full lib/doctest suites stay green. No production panicking constant-conversion remains outside `#[cfg(test)]` in `sgd.rs` (verified by grep). Per R-APG-1 / R-CODE-2. The runtime `F::from(<usize>)` conversions (`t`, `n_samples`, `num_iter`, `count`, `from_usize`) and the deliberately-non-zero-fallback constants (`max_dloss` `1e12`->`F::max_value`, `eta_floor` `1e-6`, `divisor` `5.0`) already used `unwrap_or_else` and were already gate-compliant. Closes #537. |
 //! | REQ-20 (ferray substrate migration) | NOT-STARTED | blocker #538. Still `ndarray` + `StdRng` (R-SUBSTRATE-1). |
+//! | REQ-21 (non-finite input rejected) | SHIPPED | All three SGD fit entries reject any NaN/+/-inf in their float inputs BEFORE the SGD kernel with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_stochastic_gradient.py:1476` clf/reg base, `:2392` one-class) + `_check_sample_weight` (`:1501`) → `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` / `"... contains infinity ..."`. `SGDClassifier::fit_with_sample_weight` checks X + `sample_weight` (`y: Array1<usize>` finite by type); `SGDRegressor::fit_with_sample_weight` checks X + y (`Array1<F>`) + `sample_weight`; the SEPARATE `SGDOneClassSVM::fit_one_class` arm (X-only fit, no y/sample_weight) checks X. `Fit::fit` delegates to the `fit_with_sample_weight` entries with unit weights, so the guard covers the default path too. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; finite paths byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X for SGDClassifier/SGDRegressor, NaN/inf in y + sample_weight for SGDRegressor, NaN in sample_weight for SGDClassifier all raise `ValueError` (`tests/divergence_linear_nonfinite_batch4.rs::sgd_*`). Non-test consumer: the existing `Fit for SGDClassifier`/`SGDRegressor` + `pub use sgd::{...}` boundary. (#2263) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -1537,6 +1538,31 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDClassifier<F> {
                 expected: vec![n_samples],
                 actual: vec![sample_weight.len()],
                 context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        // Non-finite input validation (#2263). sklearn `SGDClassifier.fit`
+        // -> `self._validate_data(X, y, ...)` (`_stochastic_gradient.py:1476`)
+        // keeps the default `force_all_finite=True`, so `check_array` rejects any
+        // NaN or +/-inf in X with a `ValueError("Input X contains NaN.")` /
+        // `"... contains infinity ..."` BEFORE the SGD kernel. sklearn also
+        // validates `sample_weight` via `_check_sample_weight` (default
+        // `force_all_finite=True`, `_stochastic_gradient.py:1501`). `y` is
+        // `Array1<usize>` (integer class labels), finite by type, so only X +
+        // sample_weight need the runtime check. `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2); the finite
+        // path is byte-identical. This is the SGDClassifier fit entry (`Fit::fit`
+        // delegates here with unit weights).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if sample_weight.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
             });
         }
 
@@ -3030,6 +3056,38 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDRegressor<F> {
             });
         }
 
+        // Non-finite input validation (#2263). sklearn `SGDRegressor.fit`
+        // -> `self._validate_data(X, y, ...)` (`_stochastic_gradient.py:1476`,
+        // the shared `BaseSGD` base path) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError("Input X contains NaN.")` /
+        // `"Input y contains NaN."` / `"... contains infinity ..."` BEFORE the
+        // SGD kernel. sklearn also validates `sample_weight` via
+        // `_check_sample_weight` (default `force_all_finite=True`,
+        // `_stochastic_gradient.py:1501`). `y` is `Array1<F>` (float targets), so
+        // X, y, AND sample_weight all need the runtime check.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2); the finite path is byte-identical. This is the
+        // SGDRegressor fit entry (`Fit::fit` delegates here with unit weights).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+        if sample_weight.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
+            });
+        }
+
         let n_features = x.ncols();
         let hyper = reg_hyper(self);
         let mut w = Array1::<F>::zeros(n_features);
@@ -3469,6 +3527,23 @@ impl<F: Float> SGDOneClassSVM<F> {
                 context: "SGDOneClassSVM requires at least one sample".into(),
             });
         }
+
+        // Non-finite input validation (#2263) — SEPARATE SGD arm. sklearn
+        // `SGDOneClassSVM.fit` -> `self._validate_data(X, None, ...)`
+        // (`_stochastic_gradient.py:2392`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X with a `ValueError("Input X contains NaN.")` / `"... contains
+        // infinity ..."` BEFORE the SGD kernel. This is an X-only fit (no `y`, no
+        // `sample_weight` argument), so X is the only runtime check.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2); the finite path is byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         // `eta0 > 0` is required for the constant/invscaling/adaptive schedules
         // (mirrors `_more_validate_params`, `_stochastic_gradient.py:149-153`);
         // the `optimal` schedule accepts `eta0 == 0`.
