@@ -119,8 +119,11 @@ fn api_proof_kbins_and_splines() {
 #[test]
 fn api_proof_encoders() {
     let x_cat = Array2::from_shape_vec((4, 2), vec![0usize, 1, 1, 0, 0, 2, 2, 1]).unwrap();
-    let f = OneHotEncoder::<f64>::new().fit(&x_cat, &()).unwrap();
-    let _ = f.transform(&x_cat).unwrap();
+    // OneHotEncoder now takes Array2<F> categories (REQ-3 #1150 sorted-unique).
+    let x_cat_ohe =
+        Array2::from_shape_vec((4, 2), vec![0.0_f64, 1., 1., 0., 0., 2., 2., 1.]).unwrap();
+    let f = OneHotEncoder::<f64>::new().fit(&x_cat_ohe, &()).unwrap();
+    let _ = f.transform(&x_cat_ohe).unwrap();
 
     // OrdinalEncoder smoke (constructor only; per-column string fit varies).
     let _ = OrdinalEncoder::new();

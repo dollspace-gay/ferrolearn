@@ -218,6 +218,10 @@ fn json_to_array2_nan(value: &serde_json::Value) -> Array2<f64> {
 }
 
 /// Helper: parse a JSON nested array into an `Array2<usize>`.
+#[allow(
+    dead_code,
+    reason = "OneHotEncoder migrated to Array2<F> input (REQ-3 #1150); helper retained for other usize fixtures"
+)]
 fn json_to_array2_usize(value: &serde_json::Value) -> Array2<usize> {
     let rows: Vec<Vec<usize>> = value
         .as_array()
@@ -389,7 +393,7 @@ fn test_one_hot_encoder_oracle() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../../fixtures/one_hot_encoder.json")).unwrap();
 
-    let x = json_to_array2_usize(&fixture["input"]["X"]);
+    let x = json_to_array2(&fixture["input"]["X"]);
     let expected_transformed = json_to_array2(&fixture["expected"]["transformed"]);
 
     let enc = ferrolearn_preprocess::OneHotEncoder::<f64>::new();

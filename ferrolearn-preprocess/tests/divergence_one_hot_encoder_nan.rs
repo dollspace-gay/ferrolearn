@@ -50,7 +50,6 @@ use ndarray::array;
 ///
 /// Tracking: #2223
 #[test]
-#[ignore = "divergence: NaN-column categories_ corrupt (NaN duplicated, not sorted-last) vs sklearn _unique single-trailing-nan; tracking #2223"]
 fn categories_nan_column_single_trailing_vs_sklearn_oracle() {
     // Live sklearn 1.5.2 oracle (run from /tmp):
     //   categories_ == [[1.0, 2.0, nan]]  -> exactly 3 categories for the column.
@@ -99,7 +98,6 @@ fn categories_nan_column_single_trailing_vs_sklearn_oracle() {
 ///
 /// Tracking: #2223
 #[test]
-#[ignore = "divergence: transform errors on NaN row present in fitted categories_; sklearn one-hots it; tracking #2223"]
 fn transform_nan_row_one_hots_vs_sklearn_oracle() {
     // Live sklearn 1.5.2 oracle (run from /tmp): transform succeeds and the NaN
     // rows (rows 1 and 3) are one-hot in the LAST (NaN) column.
@@ -115,6 +113,14 @@ fn transform_nan_row_one_hots_vs_sklearn_oracle() {
     // sklearn: 3 output columns, NaN rows one-hot in the last column.
     assert_eq!(out.shape(), &[4, 3], "shape vs sklearn oracle [4,3]");
     // Row 1 (NaN) and row 3 (NaN) -> [0,0,1] (the trailing NaN block column).
-    assert_eq!(out.row(1).to_vec(), vec![0.0, 0.0, 1.0], "NaN row 1 vs sklearn");
-    assert_eq!(out.row(3).to_vec(), vec![0.0, 0.0, 1.0], "NaN row 3 vs sklearn");
+    assert_eq!(
+        out.row(1).to_vec(),
+        vec![0.0, 0.0, 1.0],
+        "NaN row 1 vs sklearn"
+    );
+    assert_eq!(
+        out.row(3).to_vec(),
+        vec![0.0, 0.0, 1.0],
+        "NaN row 3 vs sklearn"
+    );
 }

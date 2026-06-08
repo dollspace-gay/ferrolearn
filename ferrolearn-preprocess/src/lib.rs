@@ -22,7 +22,7 @@
 //!
 //! ## Encoders
 //!
-//! - [`OneHotEncoder`] — encode `Array2<usize>` categorical columns as binary columns
+//! - [`OneHotEncoder`] — encode `Array2<F>` numeric categorical columns as binary columns (per-column sorted-unique `categories_`)
 //! - [`LabelEncoder`] — map `Array1<String>` labels to integer indices
 //! - [`ordinal_encoder::OrdinalEncoder`] — map string categories to integers in
 //!   order of first appearance

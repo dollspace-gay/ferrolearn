@@ -46,6 +46,10 @@ fn json_to_array2_with_nan(value: &serde_json::Value) -> Array2<f64> {
 }
 
 /// Parse a JSON nested array of non-negative integers into an `Array2<usize>`.
+#[allow(
+    dead_code,
+    reason = "OneHotEncoder migrated to Array2<F> input (REQ-3 #1150); helper retained for other usize fixtures"
+)]
 fn json_to_array2_usize(value: &serde_json::Value) -> Array2<usize> {
     let rows: Vec<Vec<usize>> = value
         .as_array()
@@ -410,7 +414,7 @@ fn conformance_kbins_discretizer() {
 #[test]
 fn conformance_one_hot_encoder() {
     let fx = load_fixture("one_hot_encoder");
-    let x = json_to_array2_usize(&fx.input["X"]);
+    let x = json_to_array2_with_nan(&fx.input["X"]);
     let (rel, abs) = fx.tolerance(TOL_PREPROCESS_REL, TOL_PREPROCESS_ABS);
 
     let sparse = fx.params["sparse_output"].as_bool().unwrap_or(false);
