@@ -620,7 +620,6 @@ fn req7_inverse_inf_rejected() {
 ///
 /// Tracking: #2306
 #[test]
-#[ignore = "divergence: f32 transform subtracts f64 median, not sklearn's f32 center_ (#2305-analog); tracking #2306"]
 fn divergence_f32_transform_uses_f64_median_not_f32_center() {
     let x = array![[0.1f32], [0.2], [0.3], [0.4]];
     let fitted = RobustScaler::<f32>::new().fit(&x, &()).unwrap();
@@ -632,7 +631,8 @@ fn divergence_f32_transform_uses_f64_median_not_f32_center() {
     for i in 0..4 {
         let got = out[[i, 0]].to_bits();
         assert_eq!(
-            got, sk_bits[i],
+            got,
+            sk_bits[i],
             "f32 transform row {i}: sklearn bits {} ({}), ferrolearn bits {} ({})",
             sk_bits[i],
             f32::from_bits(sk_bits[i]),

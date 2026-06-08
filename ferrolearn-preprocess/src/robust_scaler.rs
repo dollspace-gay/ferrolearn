@@ -45,19 +45,28 @@ use num_traits::Float;
 // Helper: compute quantile of a sorted slice
 // ---------------------------------------------------------------------------
 
-/// Compute the `q`-th quantile (0.0–1.0) of a sorted slice using numpy's default
-/// `'linear'` interpolation at the virtual index `(n-1)*q`.
+/// Compute the `q`-th quantile (0.0–1.0) of a sorted f64 slice using numpy's
+/// default `'linear'` interpolation at the virtual index `(n-1)*q`, **in f64**.
 ///
-/// Total / non-panicking (R-CODE-2): an EMPTY slice returns `F::nan()` rather
+/// The input column values are pre-upcast to `f64` (`to_f64()`), the virtual
+/// index, fraction, and the interpolation `sorted[lo] + frac*(sorted[hi]-sorted[lo])`
+/// are all computed in f64, and the result is f64 — matching numpy's
+/// `np.nanpercentile`/`np.nanmedian`, which UPCASTS float32 input to float64 for
+/// the interpolation and returns a float64 result (`_data.py:1614`,`:1630`,
+/// `:1634-1635`; #2206). For f64 input this is byte-identical to the prior
+/// in-`F` path (the upcast is a no-op); for f32 input the fraction no longer
+/// rounds in f32, so `scale_`/`center_` match sklearn's float64 nanpercentile.
+///
+/// Total / non-panicking (R-CODE-2): an EMPTY slice returns `f64::NAN` rather
 /// than indexing out of bounds. This is the all-NaN-column path — sklearn's
 /// `np.nanpercentile` / `np.nanmedian` over a column with no finite values also
-/// yields `nan` (`_data.py:1614`,`:1630`). Finite, non-empty input is unchanged.
-fn quantile_sorted<F: Float>(sorted: &[F], q: f64) -> F {
+/// yields `nan`. Finite, non-empty input is unchanged.
+fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
     let n = sorted.len();
     if n == 0 {
         // Empty slice (an all-NaN column once NaNs are filtered out): no finite
         // value to interpolate -> NaN, matching np.nanpercentile([], q) -> nan.
-        return F::nan();
+        return f64::NAN;
     }
     if n == 1 {
         return sorted[0];
@@ -68,7 +77,7 @@ fn quantile_sorted<F: Float>(sorted: &[F], q: f64) -> F {
     if lo == hi {
         return sorted[lo];
     }
-    let frac = F::from(idx - lo as f64).unwrap_or_else(F::zero);
+    let frac = idx - lo as f64;
     sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
@@ -217,17 +226,26 @@ impl<F: Float + Send + Sync + 'static> Default for RobustScaler<F> {
 /// OUTPUT matches sklearn exactly. The getters are intentionally NOT `Option`.
 #[derive(Debug, Clone)]
 pub struct FittedRobustScaler<F> {
-    /// Per-column medians learned during fitting.
+    /// Per-column medians (`center_`) learned during fitting.
+    ///
+    /// Stored as `F` — the INPUT dtype. sklearn's `center_ = np.nanmedian(X, axis=0)`
+    /// (`_data.py:1614`) returns the input dtype (float32 for f32 input, float64 for
+    /// f64), UNLIKE `scale_`/`np.nanpercentile` which upcasts to float64 (`:1630`,
+    /// `#2206`). The median is still COMPUTED in f64 (np.nanmedian upcasts internally
+    /// for the q=50 interpolation), then ROUNDED to `F` here — so the stored value
+    /// matches numpy's float32 `center_`. `transform` then does `X(F) -= center_(F)`
+    /// (`:1672-1673`) with both operands in `F`, matching sklearn bit-for-bit (#2306).
+    /// For `F=f64` `F::from(f64)` is exact → identical to the prior path.
     pub(crate) median: Array1<F>,
-    /// Per-column interquartile ranges (Q75 − Q25) learned during fitting.
-    pub(crate) iqr: Array1<F>,
+    /// Per-column interquartile ranges (Q75 − Q25) learned during fitting (f64).
+    pub(crate) iqr: Array1<f64>,
     /// Per-column effective scale: `_handle_zeros_in_scale(iqr)`, i.e. the raw
-    /// IQR on non-constant columns and `1.0` on zero-IQR/constant columns.
+    /// IQR on non-constant columns and `1.0` on zero-IQR/constant columns (f64).
     ///
     /// Mirrors sklearn `RobustScaler.scale_`
     /// (`_data.py:1634-1635`: `self.scale_ = quantiles[1] - quantiles[0];`
     /// `self.scale_ = _handle_zeros_in_scale(self.scale_, copy=False)`).
-    pub(crate) scale_: Array1<F>,
+    pub(crate) scale_: Array1<f64>,
     /// Whether `transform` centers (subtracts the median).
     ///
     /// Copied from the unfitted [`RobustScaler::with_centering`] in [`Fit::fit`];
@@ -238,6 +256,11 @@ pub struct FittedRobustScaler<F> {
     /// Copied from the unfitted [`RobustScaler::with_scaling`] in [`Fit::fit`];
     /// governs `if with_scaling: X /= scale_` (`_data.py:1674-1675`).
     pub(crate) with_scaling: bool,
+    /// `center_` (`median`) is stored in `F` (sklearn `np.nanmedian` returns the
+    /// input dtype, `_data.py:1614`; #2306); `scale_`/`iqr` are f64 (sklearn float64
+    /// attributes, np.nanpercentile, #2206). `F` also governs the dtype of the
+    /// `transform`/`inverse_transform` I/O arrays.
+    pub(crate) _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
@@ -277,14 +300,26 @@ impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
 
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let med = self.median[j];
+            // `center_` (`median`) is `F` — the input dtype (np.nanmedian,
+            // `_data.py:1614`; #2306). Promote to f64 for the per-op arithmetic.
+            let med = self.median[j].to_f64().unwrap_or(f64::NAN);
             let scale = self.scale_[j];
+            // sklearn `inverse_transform`: `if with_scaling: X *= scale_` then
+            // `if with_centering: X += center_` (`_data.py:1706-1708`). `scale_` is
+            // f64 (np.nanpercentile, #2206), `center_` is `F` (np.nanmedian, #2306);
+            // numpy applies
+            // each in-place op as a SEPARATE store back into the `F`-typed array,
+            // so the per-element result of EACH op rounds to `F` — two roundings
+            // in the REVERSE order of `transform` (multiply-then-round,
+            // add-then-round, #2305). For `F=f64` `F::from(f64)` is exact →
+            // identical to the prior path; for f32 each step rounds to f32. NaN
+            // propagates.
             for v in &mut col {
                 if self.with_scaling {
-                    *v = *v * scale;
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) * scale).unwrap_or_else(F::nan);
                 }
                 if self.with_centering {
-                    *v = *v + med;
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) + med).unwrap_or_else(F::nan);
                 }
             }
         }
@@ -292,14 +327,20 @@ impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
     }
 
     /// Return the per-column medians learned during fitting.
+    ///
+    /// Stored as `F` — the input dtype, matching sklearn's
+    /// `center_ = np.nanmedian(X, axis=0)` (`_data.py:1614`), which returns the
+    /// input dtype (float32 for f32, float64 for f64), UNLIKE `scale_` /
+    /// [`scale`](Self::scale) which stays f64 (#2306). Equal to the prior value for
+    /// `F=f64`.
     #[must_use]
     pub fn median(&self) -> &Array1<F> {
         &self.median
     }
 
-    /// Return the per-column IQR values learned during fitting.
+    /// Return the per-column IQR values learned during fitting (f64).
     #[must_use]
-    pub fn iqr(&self) -> &Array1<F> {
+    pub fn iqr(&self) -> &Array1<f64> {
         &self.iqr
     }
 
@@ -307,7 +348,8 @@ impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
     ///
     /// Mirrors sklearn `RobustScaler.center_` — "The median value for each
     /// feature in the training set" (`_data.py:1505-1514`). Equal to
-    /// [`median`](Self::median).
+    /// [`median`](Self::median). `F` — the input dtype, matching
+    /// `np.nanmedian(X, axis=0)` (`_data.py:1614`; #2306).
     #[must_use]
     pub fn center(&self) -> &Array1<F> {
         &self.median
@@ -318,9 +360,10 @@ impl<F: Float + Send + Sync + 'static> FittedRobustScaler<F> {
     /// Mirrors sklearn `RobustScaler.scale_` = `_handle_zeros_in_scale(iqr)`
     /// (`_data.py:1634-1635`, `:88`): equal to the raw [`iqr`](Self::iqr) on
     /// non-constant columns, but `1.0` on zero-IQR/constant columns (so it
-    /// differs from [`iqr`](Self::iqr) there).
+    /// differs from [`iqr`](Self::iqr) there). f64 (sklearn float64 attribute,
+    /// #2206).
     #[must_use]
-    pub fn scale(&self) -> &Array1<F> {
+    pub fn scale(&self) -> &Array1<f64> {
         &self.scale_
     }
 }
@@ -369,7 +412,10 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         }
 
         let n_features = x.ncols();
-        let mut median_arr = Array1::zeros(n_features);
+        // `median_arr` holds the f64-computed medians; it is ROUNDED to `F` when
+        // stored on the fitted scaler (see below) to match np.nanmedian returning
+        // the input dtype (#2306).
+        let mut median_arr = Array1::<f64>::zeros(n_features);
         let mut iqr_arr = Array1::zeros(n_features);
 
         // Convert the F percentiles (0..=100) to the f64 fractions (0..=1) that
@@ -387,11 +433,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
             // column collects no finite values -> the sorted slice is empty ->
             // `quantile_sorted` returns NaN (no panic, no OOB index), matching
             // `np.nanmedian`/`np.nanpercentile` -> nan on an all-NaN column.
-            let mut col: Vec<F> = x
+            // UPCAST the finite column values to f64 BEFORE sorting +
+            // interpolating, mirroring `np.nanpercentile`/`np.nanmedian`, which
+            // upcast float32 input to float64 for the interpolation and return a
+            // float64 result (`_data.py:1614`,`:1630`,`:1634-1635`; #2206). For
+            // `F=f64` `to_f64()` is a no-op → byte-identical to the prior path.
+            let mut col: Vec<f64> = x
                 .column(j)
                 .iter()
-                .copied()
                 .filter(|v| !v.is_nan())
+                .map(|v| v.to_f64().unwrap_or(f64::NAN))
                 .collect();
             col.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -409,17 +460,26 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RobustScaler<F> {
         // columns, 1.0 on near-constant columns. sklearn `_handle_zeros_in_scale`
         // (`_data.py:114-119`, called `:1635`) uses `constant_mask = scale <
         // 10 * finfo(dtype).eps` — a tiny-but-nonzero IQR (NOT just exactly 0) is
-        // replaced by 1.0 (#2204). This is the effective scale `transform`
-        // already divides by.
-        let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
-        let scale_arr = iqr_arr.mapv(|v| if v < ten_eps { F::one() } else { v });
+        // replaced by 1.0 (#2204). `scale_` is FLOAT64 (np.nanpercentile upcasts,
+        // #2206), so the eps is f64 eps regardless of `F`.
+        let ten_eps = f64::EPSILON * 10.0;
+        let scale_arr = iqr_arr.mapv(|v| if v < ten_eps { 1.0 } else { v });
+
+        // ROUND the f64-computed median to `F` — sklearn's `center_ = np.nanmedian`
+        // returns the INPUT dtype (float32 for f32, float64 for f64), so the stored
+        // `center_` is `F`-precision; only `scale_` stays float64 (`_data.py:1614`
+        // vs `:1630`; #2306). For `F=f64` `F::from(f64)` is exact (no-op); for f32 a
+        // non-f32-representable median rounds to the same float32 bits as
+        // np.nanmedian, so `transform`'s `X(f32) -= center_(f32)` matches sklearn.
+        let median_f = median_arr.mapv(|v| F::from(v).unwrap_or_else(F::nan));
 
         Ok(FittedRobustScaler {
-            median: median_arr,
+            median: median_f,
             iqr: iqr_arr,
             scale_: scale_arr,
             with_centering: self.with_centering,
             with_scaling: self.with_scaling,
+            _marker: std::marker::PhantomData,
         })
     }
 }
@@ -467,26 +527,33 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedRobustScal
 
         let mut out = x.to_owned();
         for (j, mut col) in out.columns_mut().into_iter().enumerate() {
-            let med = self.median[j];
-            let iqr = self.iqr[j];
-            // A near-constant IQR is replaced by an effective scale of 1,
-            // matching sklearn `_handle_zeros_in_scale` (`_data.py:114-119`,
-            // called `:1635`): `constant_mask = scale < 10 * finfo(dtype).eps`
-            // (NOT just exactly 0, #2204). The column is still centered
-            // (`X -= center_`, `:1673`) then divided by the effective scale
-            // (`X /= scale_`, `:1675`).
-            let ten_eps = F::epsilon() * F::from(10.0).unwrap_or_else(F::one);
-            let scale_eff = if iqr < ten_eps { F::one() } else { iqr };
+            // `center_` (`median`) is `F` — the input dtype, matching np.nanmedian
+            // (`_data.py:1614`; #2306). Promote to f64 for the per-op arithmetic.
+            let med = self.median[j].to_f64().unwrap_or(f64::NAN);
+            // Use the STORED `scale_` (= `_handle_zeros_in_scale(iqr)`, computed
+            // in `fit`: the raw IQR on non-constant columns, `1.0` on near-constant
+            // columns where `iqr < 10*f64::EPSILON`, #2204). `scale_` is f64
+            // (np.nanpercentile upcasts f32 -> f64, #2206).
+            let scale_eff = self.scale_[j];
             // Conditional center/scale mirroring sklearn `transform`
             // (`_data.py:1672-1675`): `if with_centering: X -= center_` then
-            // `if with_scaling: X /= scale_`. When `with_centering && with_scaling`
-            // this is byte-identical to the prior path.
+            // `if with_scaling: X /= scale_`. sklearn does `X(F) -= center_(F)` —
+            // BOTH operands the input dtype `F` (center_ is float32 for f32 input),
+            // so the subtraction's f64 result rounds to `F` the SAME as sklearn's
+            // f32 in-place subtract: because `med` is already the `F`-rounded
+            // median, `v.to_f64() - med` followed by `F::from(..)` reproduces
+            // sklearn's `X(f32) -= center_(f32)` bit-for-bit (#2306). `scale_` is
+            // f64, applied as a SEPARATE in-place op, again rounding to `F` (#2305).
+            // For `F=f64` `F::from(f64)` is exact → byte-identical to the prior
+            // path. NaN propagates.
             for v in &mut col {
                 if self.with_centering {
-                    *v = *v - med;
+                    // X -= center_ (operand is the F-rounded median; round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) - med).unwrap_or_else(F::nan);
                 }
                 if self.with_scaling {
-                    *v = *v / scale_eff;
+                    // X /= scale_ (round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) / scale_eff).unwrap_or_else(F::nan);
                 }
             }
         }
