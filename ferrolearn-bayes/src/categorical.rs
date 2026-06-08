@@ -81,6 +81,7 @@
 //! | REQ-9b (PyO3 binding + sample_weight surface) | NOT-STARTED | open prereq blocker **#923**. **CategoricalNB has NO PyO3 binding** — no `_RsCategoricalNB` in `ferrolearn-python/src/extras.rs`, no `ferrolearn.CategoricalNB` (grep confirms zero `CategoricalNB` hits under `ferrolearn-python/`), so `import ferrolearn` cannot reach it; the Rust fitted accessors (REQ-9a) are not bridged to Python (`feature_log_prob_` / `category_count_` / `class_count_` / `class_log_prior_` / `n_categories_` / `classes_` / `n_features_in_`, `naive_bayes.py:1266-1303`). Also subsumes the wrong-length `class_prior` error-TYPE sub-item (REQ-5) and the negative-feature MESSAGE/TYPE-parity sub-item (REQ-3). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (`sample_weight` + `partial_fit` new-category/new-class extension + negative validation) | NOT-STARTED | open prereq blocker **#924**. sklearn `fit(X, y, sample_weight=None)` (`naive_bayes.py:1353`, `:712`) weights the binarized `Y` so `class_count_ = Y.sum(axis=0)` and the `np.bincount(X_feature[mask], weights=...)` per-category counts become weighted (`naive_bayes.py:1468-1496`). ferrolearn's `impl Fit<Array2<F>, Array1<usize>>` is `fn fit(&self, x, y)` — NO `sample_weight` on `fit` or `partial_fit`; also the `partial_fit` new-category/new-class EXTENSION (R-DEV-7 deviation) and `partial_fit` negative-validation gap carved out of REQ-7 live here. |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#925**. `categorical.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
+//! | REQ-12 (non-finite input rejected, finiteness-FIRST) | SHIPPED | `Fit::fit for CategoricalNB` AND `FittedCategoricalNB::partial_fit` reject any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) ABOVE the alpha guard, the negative-feature guard, and the `to_usize` category mapping, mirroring sklearn `CategoricalNB._check_X_y` → `self._validate_data(X, y, dtype="int", force_all_finite=True, ...)` (`naive_bayes.py:1435-1438`) which raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."` BEFORE `check_non_negative(X, "CategoricalNB (input X)")` (`naive_bayes.py:1439`). Finiteness-first verified live: NaN-AND-negative cell → `ValueError("Input X contains NaN.")`. y is integer-typed; `fit`/`partial_fit` take no `sample_weight` (REQ-10 NOT-STARTED), so only X is guarded. Finite path byte-identical (in-tree `categorical` tests unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `tests/divergence_nb_nonfinite.rs::categorical_*`. Non-test consumer: the existing `Fit::fit` / pipeline `fit_pipeline` consumers (CategoricalNB has no PyO3 binding, REQ-9b). (#2271) |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -273,6 +274,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Categor
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn `CategoricalNB.fit` -> `self._check_X_y(X, y)` ->
+        // `self._validate_data(X, y, dtype="int", force_all_finite=True, ...)`
+        // (`naive_bayes.py:1435-1438`) raises `ValueError("Input X contains
+        // NaN.")` / `"... contains infinity ..."` for any NaN/+/-inf in X — and
+        // this runs BEFORE `check_non_negative(X, "CategoricalNB (input X)")`
+        // (`naive_bayes.py:1439`) AND before the `dtype="int"` integer cast /
+        // category indexing. So finiteness is validated FIRST: a NaN-AND-negative
+        // cell yields the NaN error, not the negative error (verified live).
+        // Place the finiteness guard ABOVE the negative-feature and category
+        // (`to_usize`) handling. y is integer-typed; ferrolearn `fit` takes no
+        // `sample_weight` (REQ-10 NOT-STARTED), so only X is guarded. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -496,6 +515,18 @@ impl<F: Float + Send + Sync + 'static> FittedCategoricalNB<F> {
                 expected: vec![self.n_features],
                 actual: vec![n_features],
                 context: "number of features must match fitted CategoricalNB".into(),
+            });
+        }
+
+        // sklearn `CategoricalNB.partial_fit` -> `self._check_X_y(X, y, ...)` ->
+        // `self._validate_data(..., dtype="int", force_all_finite=True)`
+        // (`naive_bayes.py:1435-1438`) raises a `ValueError` for any NaN/+/-inf
+        // in X BEFORE `check_non_negative` (`naive_bayes.py:1439`): finiteness
+        // FIRST. Guard X ABOVE the non-negative guard. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

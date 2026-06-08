@@ -78,6 +78,7 @@
 //! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedMultinomialNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.log_theta`, sklearn `feature_log_prob_`, `naive_bayes.py:892`), `class_log_prior(&self) -> &Array1<F>` (`&self.log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:880`), and `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:879`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`MultinomialNB().coef_` raises `AttributeError`), so no `coef_` / `intercept_` getter is added. Live oracle (`X=[[3,1,0],[2,0,1],[4,2,0],[0,1,4],[1,0,3],[0,2,5]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[-0.4700036292,-1.3862943611,-2.0794415417],[-2.2512917986,-1.558144618,-0.3794896217]]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `feature_count_ = [[9,3,1],[1,3,12]]`, `class_count_ = [3,3]`. In-tree `multinomial_feature_log_prob_and_class_log_prior_match_sklearn` / `multinomial_feature_count_and_class_count_match_sklearn`. |
 //! | REQ-9b (PyO3 surface) | NOT-STARTED | open prereq blocker **#902**. `_RsMultinomialNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior)` + `fit` + `predict` — no `class_prior` / `force_alpha` kwargs, no `predict_proba` / `predict_log_proba` / `predict_joint_log_proba` / `score` / `partial_fit` (which the library HAS), no fitted-attr getters bridged to Python (`feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_`). `coef_` / `intercept_` are deprecated/removed in sklearn 1.5.2 (raise `AttributeError`) and stay absent. Also subsumes the negative-feature MESSAGE-parity sub-item (REQ-5) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#903**. `multinomial.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
+//! | REQ-11 (non-finite input rejected, finiteness-FIRST) | SHIPPED | `Fit::fit for MultinomialNB` AND `FittedMultinomialNB::partial_fit` reject any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) ABOVE the existing non-negative-feature guard, mirroring sklearn `_BaseDiscreteNB.fit`/`partial_fit` → `self._check_X_y(X, y)` → `self._validate_data(..., force_all_finite=True)` (`naive_bayes.py:576-578`, `:668`) which runs BEFORE `_count` → `check_non_negative(X, "MultinomialNB (input X)")` (`naive_bayes.py:881`). The finiteness-first ordering is verified live: a cell that is both NaN AND negative yields `ValueError("Input X contains NaN.")`, NOT the negative error. y is integer-typed (`Array1<usize>`); `fit`/`partial_fit` take no `sample_weight` (REQ-8 NOT-STARTED), so only X is guarded. Finite path byte-identical (guard never fires on finite input — in-tree `multinomial` tests unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `tests/divergence_nb_nonfinite.rs::multinomial_*` (NaN/+inf/-inf reject + NaN-before-negative ordering, fit + partial_fit). Non-test consumer: the existing `Fit::fit` / `_RsMultinomialNB` / pipeline consumers. (#2271) |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -212,6 +213,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Multino
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn `_BaseDiscreteNB.fit` -> `self._check_X_y(X, y)` ->
+        // `self._validate_data(X, y, accept_sparse="csr", reset=...)`
+        // (`naive_bayes.py:576-578`), keeping the default `force_all_finite=True`
+        // so `check_array` raises `ValueError("Input X contains NaN.")` /
+        // `"... contains infinity ..."` for any NaN/+/-inf in X — and this runs
+        // BEFORE `_count` -> `check_non_negative(X, ...)` (`naive_bayes.py:881`).
+        // So finiteness is validated FIRST: a value that is both NaN AND negative
+        // yields the NaN error, not the negative error (verified live). Place the
+        // finiteness guard ABOVE the non-negative guard to match that ordering. y
+        // is integer-typed (`Array1<usize>`); ferrolearn `fit` takes no
+        // `sample_weight` (REQ-8 NOT-STARTED), so only X is guarded. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -352,6 +371,17 @@ impl<F: Float + Send + Sync + 'static> FittedMultinomialNB<F> {
             });
         }
 
+        // sklearn `_BaseDiscreteNB.partial_fit` -> `self._check_X_y(X, y, ...)`
+        // (`naive_bayes.py:668`, `force_all_finite=True`) BEFORE `_count` ->
+        // `check_non_negative` (`naive_bayes.py:881`): finiteness FIRST. Guard
+        // X for NaN/+/-inf ABOVE the non-negative guard. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         if x.iter().any(|&v| v < F::zero()) {
             return Err(FerroError::InvalidParameter {
                 name: "X".into(),
@@ -359,7 +389,9 @@ impl<F: Float + Send + Sync + 'static> FittedMultinomialNB<F> {
             });
         }
 
-        let n_feat_f = F::from(n_features).unwrap();
+        let n_feat_f = F::from(n_features).ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert n_features to float".into(),
+        })?;
 
         // Accumulate counts for each existing class.
         for (ci, &class_label) in self.classes.clone().iter().enumerate() {

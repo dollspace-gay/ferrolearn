@@ -82,6 +82,7 @@
 //! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedBernoulliNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.log_prob`, sklearn `feature_log_prob_`, `naive_bayes.py:1201`), `class_log_prior(&self) -> &Array1<F>` (`&self.log_prior`, sklearn `class_log_prior_`, `naive_bayes.py:600`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:1189`), and `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:1190`). `coef_` / `intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`hasattr(BernoulliNB().fit(...), 'coef_') == False`), so no `coef_` / `intercept_` getter is added. Live oracle (`X=[[1,1,0],[1,0,0],[1,1,0],[0,0,1],[0,1,1],[0,0,1]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[-0.2231435513,-0.5108256238,-1.6094379124],[-1.6094379124,-0.9162907319,-0.2231435513]]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`, `feature_count_ = [[3,2,0],[0,1,3]]`, `class_count_ = [3,3]`. In-tree `bernoulli_feature_log_prob_and_class_log_prior_match_sklearn` / `bernoulli_feature_count_and_class_count_match_sklearn`. |
 //! | REQ-9b (PyO3 surface + `sample_weight`) | NOT-STARTED | open prereq blocker **#909**. `_RsBernoulliNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, binarize)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters bridged to Python (`feature_log_prob_` / `class_log_prior_` / `feature_count_` / `class_count_` / `classes_` / `n_features_in_`). `coef_` / `intercept_` are deprecated/removed in sklearn 1.5.2 (`hasattr == False`) and stay absent. Also subsumes the `class_prior` wrong-length MESSAGE/TYPE-parity sub-item (REQ-4: `InvalidParameter` vs `ValueError`) and the `partial_fit` `classes=` surface (REQ-7 gap). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#910**. `bernoulli.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `Fit::fit for BernoulliNB` AND `FittedBernoulliNB::partial_fit` reject any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) right after the shape check and BEFORE binarization, mirroring sklearn `_BaseDiscreteNB.fit`/`partial_fit` → `self._check_X_y(X, y)` → `self._validate_data(..., force_all_finite=True)` (`naive_bayes.py:576-578`, `:668`) which raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."` before `binarize`. The `binarize`-param guard (NaN/inf/negative threshold) is unchanged and stays first (param validation, sklearn `_validate_params` runs first). y is integer-typed; `fit`/`partial_fit` take no `sample_weight` (REQ-8 NOT-STARTED), so only X is guarded. Finite path byte-identical (in-tree `bernoulli` tests unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `tests/divergence_nb_nonfinite.rs::bernoulli_*`. Non-test consumer: the existing `Fit::fit` / `_RsBernoulliNB` / pipeline consumers. (#2271) |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -283,6 +284,21 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Bernoul
             });
         }
 
+        // sklearn `_BaseDiscreteNB.fit` -> `self._check_X_y(X, y)` ->
+        // `self._validate_data(X, y, accept_sparse="csr", reset=...)`
+        // (`naive_bayes.py:576-578`/`:1183-1187`, `force_all_finite=True`) raises
+        // `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+        // for any NaN/+/-inf in X BEFORE binarization. Guard X here, ABOVE the
+        // binarize step (binarizing a NaN/inf would otherwise silently map it to
+        // 0/1). y is integer-typed; ferrolearn `fit` takes no `sample_weight`
+        // (REQ-8 NOT-STARTED), so only X is guarded. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         // Optionally binarize.
         let x_bin = if let Some(threshold) = self.binarize {
             binarize_array(x, threshold)
@@ -409,6 +425,17 @@ impl<F: Float + Send + Sync + 'static> FittedBernoulliNB<F> {
                 expected: vec![self.log_prob.ncols()],
                 actual: vec![n_features],
                 context: "number of features must match fitted BernoulliNB".into(),
+            });
+        }
+
+        // sklearn `_BaseDiscreteNB.partial_fit` -> `self._check_X_y(X, y, ...)`
+        // (`naive_bayes.py:668`, `force_all_finite=True`): NaN/+/-inf in X raises
+        // a `ValueError` BEFORE binarization. Guard X ABOVE the binarize step.
+        // (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

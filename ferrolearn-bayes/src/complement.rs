@@ -86,6 +86,7 @@
 //! | REQ-9a (Rust fitted-attribute accessors) | SHIPPED | `FittedComplementNB` exposes `feature_log_prob(&self) -> &Array2<F>` (`&self.weights`, sklearn `feature_log_prob_`, `naive_bayes.py:1042`), `feature_count(&self) -> &Array2<F>` (`&self.feature_counts`, sklearn `feature_count_`, `naive_bayes.py:961`), `class_count(&self) -> Array1<F>` (the integer `class_counts` cast to `F`, sklearn `class_count_`, `naive_bayes.py:951`), `feature_all(&self) -> Array1<F>` (DERIVED `feature_counts.sum_axis(Axis(0))`, sklearn `feature_all_ = feature_count_.sum(axis=0)`, `naive_bayes.py:1029`), and `class_log_prior(&self) -> Array1<F>` (DERIVED empirical `log(class_count_) - log(class_count_.sum())`, sklearn `class_log_prior_`, `naive_bayes.py:600`). `coef_`/`intercept_` are DEPRECATED and REMOVED in sklearn 1.5.2 (`hasattr(ComplementNB().fit(...), 'coef_') == False`), so no `coef_`/`intercept_` getter is added. Live oracle (`X=[[5,1,0],[4,2,0],[6,0,1],[0,1,5],[1,0,4],[0,2,6]]`, `y=[0,0,0,1,1,1]`): `feature_log_prob_ = [[2.3978952728,1.7047480922,0.3184537311],[0.3184537311,1.7047480922,2.3978952728]]`, `feature_count_ = [[15,3,1],[1,3,15]]`, `class_count_ = [3,3]`, `feature_all_ = [16,6,16]`, `class_log_prior_ = [-0.6931471806,-0.6931471806]`. In-tree `complement_feature_log_prob_and_count_match_sklearn` / `complement_feature_all_class_count_prior_match_sklearn`. |
 //! | REQ-9b (PyO3 surface + `sample_weight`) | NOT-STARTED | open prereq blocker **#916**. `_RsComplementNB` (`ferrolearn-python/src/extras.rs`, the `py_classifier!` macro) exposes ONLY `new(alpha, fit_prior, norm)` + `fit` + `predict` — NO `class_prior`/`force_alpha` kwargs, NO `predict_proba`/`predict_log_proba`/`predict_joint_log_proba`/`score`/`partial_fit` (which the library HAS), NO fitted-attr getters bridged to Python (`feature_log_prob_` / `feature_all_` / `feature_count_` / `class_count_` / `class_log_prior_` / `classes_` / `n_features_in_`). `coef_`/`intercept_` are deprecated/removed in sklearn 1.5.2 (`hasattr == False`) and stay absent. Also subsumes the negative-feature MESSAGE/TYPE-parity sub-item (REQ-7: `InvalidParameter` vs `ValueError`) and the `class_prior` wrong-length TYPE sub-item (REQ-4). The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#917**. `complement.rs` imports `ndarray::{Array1, Array2}` + `num_traits::{Float, FromPrimitive, ToPrimitive}` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
+//! | REQ-11 (non-finite input rejected, finiteness-FIRST) | SHIPPED | `Fit::fit for ComplementNB` AND `FittedComplementNB::partial_fit` reject any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) ABOVE the existing non-negative-feature guard, mirroring sklearn `_BaseDiscreteNB.fit`/`partial_fit` → `self._check_X_y(X, y)` → `self._validate_data(..., force_all_finite=True)` (`naive_bayes.py:576-578`, `:668`) which runs BEFORE `_count` → `check_non_negative(X, "ComplementNB (input X)")` (`naive_bayes.py:1027`). Finiteness-first verified live: NaN-AND-negative cell → `ValueError("Input X contains NaN.")`, not the negative error. y is integer-typed; `fit`/`partial_fit` take no `sample_weight` (REQ-8 NOT-STARTED), so only X is guarded. Finite path byte-identical (in-tree `complement` tests unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `tests/divergence_nb_nonfinite.rs::complement_*`. Non-test consumer: the existing `Fit::fit` / `_RsComplementNB` / pipeline consumers. (#2271) |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -231,6 +232,24 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Complem
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn `_BaseDiscreteNB.fit` -> `self._check_X_y(X, y)` ->
+        // `self._validate_data(X, y, accept_sparse="csr", reset=...)`
+        // (`naive_bayes.py:576-578`, `force_all_finite=True`) raises
+        // `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+        // for any NaN/+/-inf in X BEFORE `_count` ->
+        // `check_non_negative(X, "ComplementNB (input X)")`
+        // (`naive_bayes.py:1027`). Finiteness is validated FIRST: a NaN-AND-
+        // negative cell yields the NaN error, not the negative one (verified
+        // live). Guard finiteness ABOVE the non-negative guard. y is integer-
+        // typed; ferrolearn `fit` takes no `sample_weight` (REQ-8 NOT-STARTED),
+        // so only X is guarded. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -389,6 +408,17 @@ impl<F: Float + Send + Sync + 'static> FittedComplementNB<F> {
                 expected: vec![self.weights.ncols()],
                 actual: vec![n_features],
                 context: "number of features must match fitted ComplementNB".into(),
+            });
+        }
+
+        // sklearn `_BaseDiscreteNB.partial_fit` -> `self._check_X_y(X, y, ...)`
+        // (`naive_bayes.py:668`, `force_all_finite=True`) BEFORE `_count` ->
+        // `check_non_negative` (`naive_bayes.py:1027`): finiteness FIRST. Guard
+        // X for NaN/+/-inf ABOVE the non-negative guard. (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

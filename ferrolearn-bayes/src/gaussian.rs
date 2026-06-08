@@ -58,6 +58,7 @@
 //! | REQ-7 (fitted accessors `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_`) | SHIPPED | sklearn exposes these (`naive_bayes.py:171-202`). `FittedGaussianNB` now provides `#[must_use]` getters mirroring each: `theta()` → `&self.theta` (`theta_`, `:171`), `var()` → `&self.sigma` (smoothed `var_`, `:202`), `epsilon()` → `self.epsilon_` (`epsilon_ = var_smoothing * np.var(X, axis=0).max()`, `:431`, threaded from the `fn fit` `epsilon` local), `class_count()` → `class_counts` cast to `F` (`class_count_`, `:173`), `class_prior()` → `log_prior.mapv(exp)` (empirical `class_prior_ = class_count_ / class_count_.sum()`, `:176`/`:502`). Non-test consumer: `_RsGaussianNB::fit`/`classes_` (`ferrolearn-python/src/classifiers.rs`) → `FittedGaussianNB`. Verified: live-sklearn pins `gaussian_theta_and_var_match_sklearn`, `gaussian_epsilon_matches_sklearn`, `gaussian_class_count_and_prior_match_sklearn` — on `X=[[1,2],[1.5,1.8],[2,2.5],[6,7],[6.5,6.8],[7,7.5]]`, `y=[0,0,0,1,1,1]`, sklearn `theta_=[[1.5,2.1],[6.5,7.1]]`, `var_=[[0.166666673083,0.086666673083],...]`, `epsilon_=6.416666666666667e-9`, `class_count_=[3,3]`, `class_prior_=[0.5,0.5]`; ferrolearn matches. |
 //! | REQ-8 (PyO3 surface — `var_smoothing` / `priors` / `sample_weight` + getters) | NOT-STARTED | open prereq blocker **#897**. `_RsGaussianNB` (`ferrolearn-python/src/classifiers.rs`) exposes `new(var_smoothing)` / `fit` / `predict` / `predict_proba` / `classes_` only — no `priors` kwarg, no `sample_weight` on `fit`, no `theta_` / `var_` / `epsilon_` / `class_count_` / `class_prior_` getters, no `predict_log_proba` / `score` / `partial_fit`. The fix belongs in `ferrolearn-python` (multi-file). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker **#898**. `gaussian.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` (the wrong substrate, R-SUBSTRATE-1); not migrated to `ferray-core`. |
+//! | REQ-10 (non-finite input rejected) | SHIPPED | `Fit::fit for GaussianNB` AND `FittedGaussianNB::partial_fit` reject any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) right after the shape check, BEFORE the Gaussian fit / Welford update, mirroring sklearn `GaussianNB._partial_fit` → `self._validate_data(X, y, reset=first_call)` (`naive_bayes.py:423`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). y is integer-typed (`Array1<usize>`), so only X is guarded; GaussianNB.fit/partial_fit take no `sample_weight` in ferrolearn (REQ-5/REQ-7 NOT-STARTED). The finite path is byte-identical (guard never fires on finite input — all in-tree `gaussian` tests unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `GaussianNB().fit`/`.partial_fit` raise `ValueError` for NaN/+inf/-inf in X (`tests/divergence_nb_nonfinite.rs::gaussian_*`). Non-test consumer: the existing `Fit::fit` / `_RsGaussianNB` / pipeline `fit_pipeline` consumers. (#2271) |
 
 use crate::base::BaseNB;
 use ferrolearn_core::error::FerroError;
@@ -177,6 +178,22 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Gaussia
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn `GaussianNB.fit` -> `_partial_fit(..., _refit=True)` ->
+        // `self._validate_data(X, y, reset=first_call)` (`naive_bayes.py:423`),
+        // which keeps the default `force_all_finite=True`, so `check_array`
+        // rejects any NaN or +/-inf in X with a `ValueError` ("Input X contains
+        // NaN." / "... contains infinity ...") BEFORE the Gaussian fit runs. y is
+        // integer-typed (`Array1<usize>`) here, so only X needs a finiteness
+        // guard. `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf
+        // (bounds-safe, no panic, R-CODE-2), matching the linear-sweep idiom
+        // (`lasso.rs`). (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -334,6 +351,17 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianNB<F> {
                 expected: vec![self.theta.ncols()],
                 actual: vec![n_features],
                 context: "number of features must match fitted GaussianNB".into(),
+            });
+        }
+
+        // sklearn `GaussianNB.partial_fit` -> `_partial_fit` ->
+        // `self._validate_data(X, y, reset=first_call)` (`naive_bayes.py:423`,
+        // `force_all_finite=True`): NaN/+/-inf in X raises a `ValueError` BEFORE
+        // the Welford update. Mirror it here (X only; y is `usize`). (#2271)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
