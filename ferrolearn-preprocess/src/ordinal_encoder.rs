@@ -11,14 +11,16 @@
 //! `:1235`). Design doc: `.design/preprocess/ordinal_encoder.md`. Expected values from the live
 //! sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export (`lib.rs:121`, grandfathered S5).
 //! HONEST (R-HONEST-3): a FAITHFUL String-only ordinal encoder — `categories_`=sorted-unique and
-//! the ordinal VALUES match sklearn bit-for-bit on the string path; divergences are the output
-//! container dtype (`usize` vs float64), String-only input, and the absent param/feature surface.
+//! the ordinal VALUES match sklearn bit-for-bit on the string path; the output container is now
+//! `Array2<f64>` (sklearn's `dtype=np.float64` default, `:1262`); remaining divergences are
+//! String-only input, the absent configurable `dtype` param, and the rest of the param/feature
+//! surface.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
 //! | REQ-1 (string fit → sorted-unique categories_) | SHIPPED | `Fit::fit` per column → `categories_`=sorted-unique (`Vec<String>::sort`, lexicographic) + index map; rejects 0 rows (`InsufficientSamples`, matches sklearn `check_array`). Mirrors `_BaseEncoder._fit` `categories_=_unique(Xi)` (`_encoders.py:99`). Critic-verified vs live oracle: `green_value_match_and_categories` (`[['bird','cat','dog'],['large','medium','small']]`), `green_lexicographic_sort_matches_np_unique` + `green_non_ascii_codepoint_order` (== `np.unique`), `green_empty_fit_rejected_matches_sklearn`. Consumer: re-export `lib.rs:121`. |
-//! | REQ-2 (transform + fit_transform, ordinal values + unknown rejection) | SHIPPED | `Transform::transform` maps category→`usize` ordinal index, unknown → `InvalidParameter` (matches `handle_unknown='error'` default `ValueError`), ncols-mismatch → `ShapeMismatch`. Critic-verified: ordinal VALUES `[[1,2],[2,0],[1,1],[0,2]]` == live oracle (integer-equal to sklearn float), `green_unknown_category_rejected`, `green_fit_transform_equals_oracle`. Consumer: re-export `lib.rs:121`. |
-//! | REQ-3 (output dtype float64 + dtype param) | NOT-STARTED | open prereq blocker #1158. `Array2<usize>` output; sklearn defaults float64 (`:1262`) + `dtype` param. Values equal, container dtype diverges (R-DEV-3); coupled to NaN-sentinel features (REQ-5/6). |
+//! | REQ-2 (transform + fit_transform, ordinal values + unknown rejection) | SHIPPED | `Transform::transform` maps category→ordinal index (now cast to `f64` via `ordinal_index_to_f64`), unknown → `InvalidParameter` (matches `handle_unknown='error'` default `ValueError`), ncols-mismatch → `ShapeMismatch`. The unknown/ncols-mismatch LOGIC is byte-for-byte UNCHANGED by the dtype fix. Critic-verified: ordinal VALUES `[[1.,2.],[2.,0.],[1.,1.],[0.,2.]]` == live oracle, `green_unknown_category_rejected`, `green_fit_transform_equals_oracle`. Consumer: re-export `lib.rs:142`. |
+//! | REQ-3 (output dtype float64) | SHIPPED | `Transform::Output = Array2<f64>` on BOTH `Transform` impls (`FittedOrdinalEncoder` + the unfitted `OrdinalEncoder` shim) and `FitTransform::fit_transform`; each cell is the ordinal index cast via `ordinal_index_to_f64` (`idx as f64`, lossless < 2^53), matching sklearn's default `dtype=np.float64` output container (`_encoders.py:1262`, `transform` casts `X_int.astype(self.dtype)`). The REQ-1/REQ-2 fit + unknown-rejection LOGIC is unchanged. Critic-verified vs live oracle: `green_fit_transform_f64_oracle` (multi-feature f64 matrix), `green_exact_integer_index_to_f64` (index 10 → `10.0`), plus the value guards over `Array2<f64>`. A CONFIGURABLE non-float64 output dtype (`int32` etc.) is a FOLLOW-ON (blocker #1158 remains open for the `dtype` ctor param); ferrolearn's output is fixed to sklearn's `float64` DEFAULT. This unblocks REQ-5's float `unknown_value` sentinel. Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-4 (numeric/mixed-dtype input) | NOT-STARTED | open prereq blocker #1159. `Array2<String>`-only; sklearn accepts int/str/object (`np.unique` numeric sort). |
 //! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | NOT-STARTED | open prereq blocker #1160. Unknowns always error (`:1265`,`:1274`). |
 //! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
@@ -64,8 +66,9 @@ use std::collections::HashMap;
 /// ).unwrap();
 /// let fitted = enc.fit(&data, &()).unwrap();
 /// let encoded = fitted.transform(&data).unwrap();
-/// assert_eq!(encoded[[0, 0]], 0); // "cat" is index 0 in col 0
-/// assert_eq!(encoded[[1, 0]], 1); // "dog" is index 1 in col 0
+/// // Output is `Array2<f64>`, matching sklearn's `dtype=np.float64` default.
+/// assert_eq!(encoded[[0, 0]], 0.0); // "cat" is index 0 in col 0
+/// assert_eq!(encoded[[1, 0]], 1.0); // "dog" is index 1 in col 0
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct OrdinalEncoder;
@@ -107,6 +110,23 @@ impl FittedOrdinalEncoder {
     pub fn n_features(&self) -> usize {
         self.categories.len()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Cast an ordinal category index to `f64`, matching scikit-learn's default
+/// `OrdinalEncoder(dtype=np.float64)` output container
+/// (`sklearn/preprocessing/_encoders.py:1262`).
+///
+/// `f64` exactly represents every integer up to `2^53`, so this is lossless for
+/// any realistic category count. Indices above `2^53` (astronomically more
+/// categories than memory could hold) round to the nearest `f64`, never panic
+/// (R-CODE-2) — the same silent float rounding numpy performs.
+#[inline]
+fn ordinal_index_to_f64(idx: usize) -> f64 {
+    idx as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -172,10 +192,20 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
 }
 
 impl Transform<Array2<String>> for FittedOrdinalEncoder {
-    type Output = Array2<usize>;
+    type Output = Array2<f64>;
     type Error = FerroError;
 
-    /// Transform string categories to integer indices.
+    /// Transform string categories to ordinal indices, returned as `f64`.
+    ///
+    /// Each cell is the (lexicographic) category index cast to `f64`. The
+    /// ordinal VALUES are unchanged from the integer mapping; only the output
+    /// container dtype is `f64`, matching scikit-learn's
+    /// `OrdinalEncoder(dtype=np.float64)` default
+    /// (`sklearn/preprocessing/_encoders.py:1262`). A configurable non-float64
+    /// output dtype (e.g. `int32`) is OUT OF SCOPE here — ferrolearn's output is
+    /// the fixed sklearn DEFAULT `f64`; a `dtype` param is a follow-on design
+    /// (blocker #1158). `f64` exactly represents every integer up to `2^53`, so
+    /// the cast is lossless for any realistic category count.
     ///
     /// # Errors
     ///
@@ -184,8 +214,19 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
     ///
     /// Returns [`FerroError::InvalidParameter`] if any category was not seen
     /// during fitting.
-    fn transform(&self, x: &Array2<String>) -> Result<Array2<usize>, FerroError> {
+    fn transform(&self, x: &Array2<String>) -> Result<Array2<f64>, FerroError> {
         let n_features = self.categories.len();
+        // sklearn `OrdinalEncoder.transform` -> `_transform` -> `_check_X` ->
+        // `check_array` (`_encoders.py:45`) enforces a minimum of 1 sample BEFORE
+        // the n_features comparison (#2220, symmetric with the 0-row fit guard).
+        // A 0-row input raises "Found array with 0 sample(s) ... minimum of 1".
+        if x.nrows() == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "FittedOrdinalEncoder::transform".into(),
+            });
+        }
         if x.ncols() != n_features {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![x.nrows(), n_features],
@@ -202,7 +243,9 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
             for i in 0..n_samples {
                 let cat = &x[[i, j]];
                 match map.get(cat) {
-                    Some(&idx) => out[[i, j]] = idx,
+                    // Cast the ordinal index to f64 (sklearn's float64 default,
+                    // `_encoders.py:1262`). Lossless: indices are < 2^53.
+                    Some(&idx) => out[[i, j]] = ordinal_index_to_f64(idx),
                     None => {
                         return Err(FerroError::InvalidParameter {
                             name: format!("x[{i},{j}]"),
@@ -220,11 +263,11 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
 /// Implement `Transform` on the unfitted encoder to satisfy the
 /// `FitTransform: Transform` supertrait bound.
 impl Transform<Array2<String>> for OrdinalEncoder {
-    type Output = Array2<usize>;
+    type Output = Array2<f64>;
     type Error = FerroError;
 
     /// Always returns an error — the encoder must be fitted first.
-    fn transform(&self, _x: &Array2<String>) -> Result<Array2<usize>, FerroError> {
+    fn transform(&self, _x: &Array2<String>) -> Result<Array2<f64>, FerroError> {
         Err(FerroError::InvalidParameter {
             name: "OrdinalEncoder".into(),
             reason: "encoder must be fitted before calling transform; use fit() first".into(),
@@ -240,7 +283,7 @@ impl FitTransform<Array2<String>> for OrdinalEncoder {
     /// # Errors
     ///
     /// Returns an error if fitting or transformation fails.
-    fn fit_transform(&self, x: &Array2<String>) -> Result<Array2<usize>, FerroError> {
+    fn fit_transform(&self, x: &Array2<String>) -> Result<Array2<f64>, FerroError> {
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
     }
@@ -279,14 +322,15 @@ mod tests {
         assert_eq!(fitted.categories()[1], vec!["large", "medium", "small"]);
 
         let encoded = fitted.transform(&x).unwrap();
-        assert_eq!(encoded[[0, 0]], 1); // "cat"  -> 1 (lex pos)
-        assert_eq!(encoded[[1, 0]], 2); // "dog"  -> 2
-        assert_eq!(encoded[[2, 0]], 1); // "cat"  -> 1
-        assert_eq!(encoded[[3, 0]], 0); // "bird" -> 0
-        assert_eq!(encoded[[0, 1]], 2); // "small"  -> 2
-        assert_eq!(encoded[[1, 1]], 0); // "large"  -> 0
-        assert_eq!(encoded[[2, 1]], 1); // "medium" -> 1
-        assert_eq!(encoded[[3, 1]], 2); // "small"  -> 2
+        // Output container is `Array2<f64>` (sklearn's `dtype=np.float64`).
+        assert_eq!(encoded[[0, 0]], 1.0); // "cat"  -> 1 (lex pos)
+        assert_eq!(encoded[[1, 0]], 2.0); // "dog"  -> 2
+        assert_eq!(encoded[[2, 0]], 1.0); // "cat"  -> 1
+        assert_eq!(encoded[[3, 0]], 0.0); // "bird" -> 0
+        assert_eq!(encoded[[0, 1]], 2.0); // "small"  -> 2
+        assert_eq!(encoded[[1, 1]], 0.0); // "large"  -> 0
+        assert_eq!(encoded[[2, 1]], 1.0); // "medium" -> 1
+        assert_eq!(encoded[[3, 1]], 2.0); // "small"  -> 2
     }
 
     #[test]
@@ -346,10 +390,10 @@ mod tests {
         // Lex order: blue (0), green (1), red (2)
         assert_eq!(fitted.categories()[0], vec!["blue", "green", "red"]);
         let encoded = fitted.transform(&x).unwrap();
-        assert_eq!(encoded[[0, 0]], 2); // red
-        assert_eq!(encoded[[1, 0]], 1); // green
-        assert_eq!(encoded[[2, 0]], 0); // blue
-        assert_eq!(encoded[[3, 0]], 2); // red
+        assert_eq!(encoded[[0, 0]], 2.0); // red
+        assert_eq!(encoded[[1, 0]], 1.0); // green
+        assert_eq!(encoded[[2, 0]], 0.0); // blue
+        assert_eq!(encoded[[3, 0]], 2.0); // red
     }
 
     #[test]

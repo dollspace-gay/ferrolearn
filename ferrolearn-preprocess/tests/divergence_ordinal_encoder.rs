@@ -27,13 +27,28 @@
 //! >>> .transform([['a','b'],['b','a']]) -> [[0.,1.],[1.,0.]]
 //! ```
 //!
-//! VERDICT: the existing String-ordinal path matches the oracle bit-for-bit on
+//! VERDICT: the String-ordinal path matches the oracle bit-for-bit on
 //! categories_, ordinal values, sort order (incl. non-ASCII), duplicate folding,
 //! multi-column independence, single-row fit, unknown-category rejection, and
-//! empty-fit rejection. These are GREEN guards (verify-and-document). The only
-//! divergence is the output container dtype (`Array2<usize>` vs sklearn float64),
-//! a NOT-STARTED structural gap (REQ-3) coupled to the absent unknown_value /
-//! encoded_missing_value NaN-sentinel surface — NOT pinned here (values equal).
+//! empty-fit rejection. These are GREEN guards (verify-and-document). REQ-3 (the
+//! output container dtype) is now SHIPPED: `transform`/`fit_transform` return
+//! `Array2<f64>`, matching sklearn's `dtype=np.float64` default (`:1262`), so the
+//! oracle f64 VALUES are asserted directly over an `f64` container (a compile-time
+//! type guarantee + a value check). The CONFIGURABLE non-float64 `dtype` ctor
+//! param remains a follow-on (blocker #1158).
+//!
+//! Additional live oracle (sklearn 1.5.2, run from /tmp):
+//! ```text
+//! >>> from sklearn.preprocessing import OrdinalEncoder
+//! >>> o = OrdinalEncoder().fit_transform(
+//! ...   [['bird','large'],['dog','small'],['cat','medium'],['bird','small']])
+//! >>> o.tolist(); o.dtype
+//!     -> [[0.,0.],[2.,2.],[1.,1.],[0.,2.]]   float64
+//! >>> cats=['b00','b01','b02','b03','b04','b05','b06','b07','b08','b09','b10']
+//! >>> e=OrdinalEncoder().fit([[c] for c in cats])
+//! >>> e.transform([['b10']]).tolist(); e.transform([['b10']]).dtype
+//!     -> [[10.0]]   float64        # lex index 10 -> exact 10.0
+//! ```
 
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
 use ferrolearn_preprocess::OrdinalEncoder;
@@ -65,15 +80,14 @@ fn make_1col(vals: &[&str]) -> Array2<String> {
 //                  ['bird','small']])
 //     -> [[1.,2.],[2.,0.],[1.,1.],[0.,2.]]
 //   categories_ -> [['bird','cat','dog'], ['large','medium','small']]
-// sklearn `_encoders.py:99` `result = _unique(Xi)` (sorted unique).
-// ferrolearn emits the same VALUES as usize; we compare against the sklearn
-// INTEGER values (the float64 values cast to usize). R-CHAR-3: expected values
-// are the live-oracle outputs, not ferrolearn literals.
+// sklearn `_encoders.py:99` `result = _unique(Xi)` (sorted unique); the output
+// dtype is float64 (`:1262`). R-CHAR-3: expected values are the live-oracle
+// float64 outputs, not ferrolearn literals.
 // ===========================================================================
 #[test]
 fn green_value_match_and_categories() {
-    // Expected from the LIVE sklearn oracle (see header).
-    let sk_values: [[usize; 2]; 4] = [[1, 2], [2, 0], [1, 1], [0, 2]];
+    // Expected from the LIVE sklearn oracle (see header) — float64 values.
+    let sk_values: [[f64; 2]; 4] = [[1., 2.], [2., 0.], [1., 1.], [0., 2.]];
     let sk_cat0 = ["bird", "cat", "dog"];
     let sk_cat1 = ["large", "medium", "small"];
 
@@ -89,13 +103,14 @@ fn green_value_match_and_categories() {
     assert_eq!(fitted.categories()[0], sk_cat0, "categories_[0] (col 0)");
     assert_eq!(fitted.categories()[1], sk_cat1, "categories_[1] (col 1)");
 
-    let encoded = fitted.transform(&x).unwrap();
+    // Output is now `Array2<f64>` (REQ-3, sklearn `dtype=np.float64`).
+    let encoded: ndarray::Array2<f64> = fitted.transform(&x).unwrap();
     for (i, row) in sk_values.iter().enumerate() {
         for (j, &expect) in row.iter().enumerate() {
             assert_eq!(
                 encoded[[i, j]],
                 expect,
-                "ordinal value at [{i},{j}] vs sklearn float64-cast-usize"
+                "ordinal value at [{i},{j}] vs sklearn float64 oracle"
             );
         }
     }
@@ -138,7 +153,7 @@ fn green_lexicographic_sort_matches_np_unique() {
 #[test]
 fn green_non_ascii_codepoint_order() {
     let sk_cats = ["Z", "a", "z", "ä", "é", "€"];
-    let sk_tf: [usize; 3] = [5, 0, 1]; // for €, Z, a
+    let sk_tf: [f64; 3] = [5., 0., 1.]; // for €, Z, a (oracle float64)
 
     let enc = OrdinalEncoder::new();
     let x = make_1col(&["z", "é", "a", "Z", "€", "ä"]);
@@ -210,8 +225,8 @@ fn green_empty_fit_rejected_matches_sklearn() {
 // ===========================================================================
 #[test]
 fn green_fit_transform_equals_oracle() {
-    let sk_values: [[usize; 2]; 4] = [[1, 2], [2, 0], [1, 1], [0, 2]];
-    let expected = Array2::from_shape_vec(
+    let sk_values: [[f64; 2]; 4] = [[1., 2.], [2., 0.], [1., 1.], [0., 2.]];
+    let expected: Array2<f64> = Array2::from_shape_vec(
         (4, 2),
         sk_values.iter().flat_map(|r| r.iter().copied()).collect(),
     )
@@ -257,15 +272,81 @@ fn green_duplicates_independence_single_row() {
     assert_eq!(fitted.categories()[0], ["a", "b"], "indep col0");
     assert_eq!(fitted.categories()[1], ["a", "b"], "indep col1");
     let out = fitted.transform(&indep).unwrap();
-    // Oracle: [[0.,1.],[1.,0.]]
-    assert_eq!(out[[0, 0]], 0);
-    assert_eq!(out[[0, 1]], 1);
-    assert_eq!(out[[1, 0]], 1);
-    assert_eq!(out[[1, 1]], 0);
+    // Oracle: [[0.,1.],[1.,0.]] (float64)
+    assert_eq!(out[[0, 0]], 0.0);
+    assert_eq!(out[[0, 1]], 1.0);
+    assert_eq!(out[[1, 0]], 1.0);
+    assert_eq!(out[[1, 1]], 0.0);
 
     // Single-row fit.
     let single = make_2col(&[("solo", "x")]);
     let fitted = enc.fit(&single, &()).unwrap();
     assert_eq!(fitted.categories()[0], ["solo"], "single-row col0");
     assert_eq!(fitted.categories()[1], ["x"], "single-row col1");
+}
+
+// ===========================================================================
+// GREEN GUARD 8 (REQ-3) — output container dtype is float64, value-EXACT to the
+// live oracle's float64 matrix over an `Array2<f64>` (type guarantee + values).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   OrdinalEncoder().fit_transform(
+//     [['bird','large'],['dog','small'],['cat','medium'],['bird','small']])
+//   -> [[0.,0.],[2.,2.],[1.,1.],[0.,2.]]   dtype float64
+//   (col0 cats ['bird','cat','dog']; col1 cats ['large','medium','small'])
+// The `Array2<f64>` binding is a COMPILE-TIME proof of REQ-3 (the output is no
+// longer `Array2<usize>`); the value asserts match the oracle bit-for-bit.
+// ===========================================================================
+#[test]
+fn green_fit_transform_f64_oracle() {
+    // Expected from the LIVE sklearn oracle (see header) — float64.
+    let sk: [[f64; 2]; 4] = [[0., 0.], [2., 2.], [1., 1.], [0., 2.]];
+
+    let enc = OrdinalEncoder::new();
+    let x = make_2col(&[
+        ("bird", "large"),
+        ("dog", "small"),
+        ("cat", "medium"),
+        ("bird", "small"),
+    ]);
+
+    // Explicit `Array2<f64>` type annotation: REQ-3 compile-time guarantee that
+    // the output container is float64, matching sklearn `dtype=np.float64`.
+    let encoded: Array2<f64> = enc.fit_transform(&x).unwrap();
+    assert_eq!(encoded.dim(), (4, 2), "shape vs oracle");
+    for (i, row) in sk.iter().enumerate() {
+        for (j, &expect) in row.iter().enumerate() {
+            assert_eq!(
+                encoded[[i, j]],
+                expect,
+                "f64 ordinal at [{i},{j}] vs oracle"
+            );
+        }
+    }
+}
+
+// ===========================================================================
+// GREEN GUARD 9 (REQ-3) — a large ordinal index casts to an EXACT f64
+// (lossless, sklearn float64). Index 10 -> 10.0.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   cats=['b00','b01','b02','b03','b04','b05','b06','b07','b08','b09','b10']
+//   e=OrdinalEncoder().fit([[c] for c in cats])
+//   e.transform([['b10']]) -> [[10.0]]  dtype float64   (lex index 10)
+// ===========================================================================
+#[test]
+fn green_exact_integer_index_to_f64() {
+    let cats = [
+        "b00", "b01", "b02", "b03", "b04", "b05", "b06", "b07", "b08", "b09", "b10",
+    ];
+    let enc = OrdinalEncoder::new();
+    let x = make_1col(&cats);
+    let fitted = enc.fit(&x, &()).unwrap();
+    // Lexicographic order keeps b00..b10 already sorted -> b10 is index 10.
+    assert_eq!(fitted.categories()[0][10], "b10", "lex index 10 is b10");
+
+    let probe = make_1col(&["b10"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    // Oracle: [[10.0]]. f64 represents 10 exactly.
+    assert_eq!(out[[0, 0]], 10.0, "index 10 -> exact 10.0 (lossless f64)");
 }

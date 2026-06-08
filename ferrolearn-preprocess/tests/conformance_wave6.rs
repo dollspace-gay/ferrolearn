@@ -46,10 +46,10 @@ fn conformance_ordinal_encoder() {
 
     let expected = json_to_array2(&fx.expected["transformed"]);
     assert_eq!(xt.shape(), expected.shape(), "OrdinalEncoder shape");
-    // ferrolearn returns Array2<usize>; compare integer-cast equality.
+    // ferrolearn returns Array2<f64> (REQ-3 #1158, matching sklearn's default
+    // dtype=np.float64); the ordinal indices are exact integers in f64.
     for (i, (&a, &e)) in xt.iter().zip(expected.iter()).enumerate() {
-        let e_u = e as usize;
-        assert_eq!(a, e_u, "OrdinalEncoder[{i}] actual={a} expected={e_u}");
+        assert_eq!(a, e, "OrdinalEncoder[{i}] actual={a} expected={e}");
     }
 }
 

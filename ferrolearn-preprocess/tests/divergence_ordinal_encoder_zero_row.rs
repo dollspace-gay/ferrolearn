@@ -56,7 +56,6 @@ fn make_2col(rows: &[(&str, &str)]) -> Array2<String> {
 /// sklearn returns: Err (ValueError). ferrolearn returns: Ok(shape (0,2)).
 /// Tracking: #2220.
 #[test]
-#[ignore = "divergence: OrdinalEncoder::transform accepts 0-row input (sklearn check_array rejects <1 samples, _encoders.py:45/validation.py:1087); tracking #2220"]
 fn divergence_zero_row_transform_should_error() {
     let enc = OrdinalEncoder::new();
     let x_train = make_2col(&[("a", "x"), ("b", "y")]);
