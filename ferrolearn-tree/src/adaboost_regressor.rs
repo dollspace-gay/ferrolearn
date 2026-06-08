@@ -47,6 +47,7 @@
 //! | REQ-7 | numpy weighted-bootstrap resampling / end-to-end sklearn parity | NOT-STARTED (#705, boundary) |
 //! | REQ-9 | PyO3 binding (ferrolearn-python regressor registration) | NOT-STARTED (#706) |
 //! | REQ-10 | ferray substrate migration | NOT-STARTED (#707) |
+//! | REQ-11 | Reject non-finite input (NaN+Inf): `fn reject_non_finite` at the top of `AdaBoostRegressor::fit` (+ float-`y` finite check) rejects NaN AND infinity. sklearn validates X/y up front (`_weight_boosting.py:133-141`, default `force_all_finite=True`, `y_numeric=True`) BEFORE any base learner ⇒ `ValueError`, even though the ferrolearn `DecisionTree` base now accepts NaN (#2277). Consumer: the existing `fit`/`fit_pipeline` entries. Pinned by `divergence_adaboost_regressor_nan_not_rejected` (live sklearn 1.5.2 raises). | SHIPPED |
 
 use crate::decision_tree::{self, Node, build_regression_tree_with_feature_subset};
 use ferrolearn_core::error::FerroError;
@@ -55,6 +56,25 @@ use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// sklearn's `AdaBoostRegressor.fit` validates X (and the numeric y) up front
+/// via `_validate_data(..., y_numeric=True)` with the default
+/// `force_all_finite=True` (`sklearn/ensemble/_weight_boosting.py:133-141`),
+/// raising `ValueError("Input X contains NaN.")` (`validation.py:147-154`)
+/// BEFORE any base learner is built — so although ferrolearn's `DecisionTree`
+/// base now accepts NaN (#2277), AdaBoostRegressor rejects it at its own entry,
+/// matching sklearn. NaN AND infinity are both rejected. Never panics.
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // AdaBoostLoss
@@ -266,6 +286,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for AdaBoostReg
             return Err(FerroError::InvalidParameter {
                 name: "learning_rate".into(),
                 reason: "must be positive".into(),
+            });
+        }
+        // Reject non-finite X (and the float target y) up front, before building
+        // any base learner, matching sklearn (`_weight_boosting.py:133-141`,
+        // `y_numeric=True`).
+        reject_non_finite(x)?;
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

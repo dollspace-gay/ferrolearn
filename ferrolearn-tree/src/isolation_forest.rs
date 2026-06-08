@@ -50,6 +50,7 @@
 //! | REQ-7a | `max_features` + `bootstrap` params + `max_samples` int/'auto'-string representation | NOT-STARTED (#728) |
 //! | REQ-7b | Subsample WITHOUT replacement (`bootstrap=False`) | NOT-STARTED (#729) |
 //! | REQ-10 | ferray substrate migration | NOT-STARTED (#731) |
+//! | REQ-11 | Reject non-finite input (NaN+Inf): `fn reject_non_finite` at the top of `IsolationForest::fit` rejects NaN AND infinity. sklearn validates X up front (`_iforest.py:291`, default `force_all_finite=True`) BEFORE any isolation tree ⇒ `ValueError`; the `ExtraTreeRegressor(splitter='random')` base learner has no missing-value support. Consumer: the existing `fit` entry (crate-root re-export + pipeline adapter). Pinned by `divergence_isolation_forest_nan_not_rejected` (live sklearn 1.5.2 raises). | SHIPPED |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -58,6 +59,25 @@ use num_traits::Float;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// sklearn's `IsolationForest.fit` validates X up front via
+/// `_validate_data(X, accept_sparse=["csc"], dtype=tree_dtype)` with the default
+/// `force_all_finite=True` (`sklearn/ensemble/_iforest.py:291`), raising
+/// `ValueError("Input X contains NaN.")` (`validation.py:147-154`) BEFORE any
+/// isolation tree is built. The `ExtraTreeRegressor(splitter='random')` base
+/// learner does NOT support missing values, so NaN AND infinity are both
+/// rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // IsolationTree node representation
@@ -360,6 +380,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IsolationForest<F>
                 });
             }
         }
+        // Reject non-finite X up front, before building any isolation tree,
+        // matching sklearn (`_iforest.py:291`).
+        reject_non_finite(x)?;
 
         let effective_max_samples = self.max_samples.min(n_samples);
         let max_depth = (effective_max_samples as f64).log2().ceil() as usize;

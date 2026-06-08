@@ -45,6 +45,7 @@
 //! | REQ-7 | `class_weight` (balanced / subsample / explicit) | NOT-STARTED (#683) |
 //! | REQ-8 | Regressor `criterion` passthrough (friedman_mse/absolute_error/poisson; currently pinned MSE) | NOT-STARTED (#684) |
 //! | REQ-10 | ferray substrate migration | NOT-STARTED (#685) |
+//! | REQ-11 | Reject non-finite input (NaN+Inf): `fn reject_non_finite` at the top of BOTH `ExtraTreesClassifier::fit` and `ExtraTreesRegressor::fit` (+ float-`y` finite check in the regressor) — `ExtraTree*` (`splitter='random'`) base learners do NOT support missing values, so sklearn's `_compute_missing_values_in_feature_mask` runs `assert_all_finite(X)` (`_classes.py:213-214`) during the up-front `_validate_data` (`_forest.py:363-380`) ⇒ `ValueError`. Consumers: the existing `fit` entries (crate-root re-export + PyO3). Pinned by `divergence_extra_trees_classifier_nan_not_rejected`/`divergence_extra_trees_regressor_nan_not_rejected` (live sklearn 1.5.2 raises). | SHIPPED |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -75,6 +76,25 @@ fn resolve_max_features(strategy: MaxFeatures, n_features: usize) -> usize {
         MaxFeatures::Fraction(f) => ((n_features as f64) * f).ceil() as usize,
     };
     result.max(1).min(n_features)
+}
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// `ExtraTrees*` build `ExtraTree*` (`splitter='random'`) base learners whose
+/// `_support_missing_values` is `False`, so sklearn's
+/// `_compute_missing_values_in_feature_mask` calls `assert_all_finite(X)`
+/// (`sklearn/tree/_classes.py:213-214`) during `_forest.py`'s up-front
+/// `_validate_data(..., force_all_finite=False)` mask computation
+/// (`_forest.py:363-380`), raising `ValueError("Input X contains NaN.")`
+/// (`validation.py:147-154`). NaN AND infinity are both rejected. Never panics.
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Internal tree parameter struct helper.
@@ -379,6 +399,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for ExtraTr
                 reason: "must be at least 1".into(),
             });
         }
+        // Reject non-finite X before building the (random-splitter) base trees,
+        // matching sklearn's up-front `_validate_data` (`_forest.py:363-380`).
+        reject_non_finite(x)?;
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.iter().copied().collect();
@@ -824,6 +847,16 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for ExtraTreesR
             return Err(FerroError::InvalidParameter {
                 name: "n_estimators".into(),
                 reason: "must be at least 1".into(),
+            });
+        }
+        // Reject non-finite X (and the float target y) before building the
+        // (random-splitter) base trees, matching sklearn's up-front
+        // `_validate_data` (`_forest.py:363-380`, `y_numeric`).
+        reject_non_finite(x)?;
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

@@ -47,6 +47,7 @@
 //! | REQ-6 (predict / predict_proba) | SHIPPED | `fn predict`/`fn predict_proba`/`fn predict_log_proba` (consumed by `RsExtraTreeClassifier` + pipeline adapter); rows sum to 1. Exact leaf-frequency values RNG-dependent (boundary); multi-output NOT-STARTED (#689). |
 //! | REQ-7 (random_state determinism) | SHIPPED | `random_state: Option<u64>` seeds `StdRng`; same seed ⇒ identical tree (`pin2_clf_random_state_reproducible`). Exact numpy-MT19937 cross-impl parity is the DOCUMENTED RNG boundary (#668/#670). |
 //! | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #690. Imports `ndarray` + `rand::StdRng`, not `ferray-core`/`ferray::random` (R-SUBSTRATE). |
+//! | REQ-9 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of BOTH `ExtraTreeClassifier::fit` and `ExtraTreeRegressor::fit` (+ a float-`y` finite check in the regressor) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"/"y"}`. UNLIKE the CART `DecisionTree*` base (which accepts NaN via `force_all_finite=False`, `_classes.py:248-250`), `ExtraTree*` use `splitter='random'` ⇒ `allow_nan=False` (`_classes.py:1085-1090`/`:1416-1421`) ⇒ `_support_missing_values` False ⇒ `assert_all_finite(X)` (`_classes.py:213-214`) raises `ValueError` (`validation.py:147-154`). Consumers: the existing `fit` entries (re-exported at the crate root + `RsExtraTreeClassifier` PyO3 reg). Pinned by `divergence_nan_reject_set.rs` (`divergence_extra_tree_classifier_nan_not_rejected`, `divergence_extra_tree_regressor_nan_not_rejected`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -330,6 +331,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for ExtraTr
                 reason: "must be at least 1".into(),
             });
         }
+        // Reject non-finite X up front (random splitter has no missing-value
+        // support — `_classes.py:213-214`/`:1085-1090`).
+        reject_non_finite(x)?;
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.iter().copied().collect();
@@ -655,6 +659,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for ExtraTreeRe
                 reason: "must be at least 1".into(),
             });
         }
+        // Reject non-finite X (and the float target y) up front: the random
+        // splitter has no missing-value support, and sklearn validates X/y
+        // finiteness in `_validate_data` before any criterion-specific check
+        // (`_classes.py:213-214`/`:1416-1421`).
+        reject_non_finite(x)?;
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
 
         // Poisson requires non-negative targets with a strictly positive sum,
         // mirroring sklearn's check (`_classes.py:267-277`) and the analogous
@@ -779,6 +794,27 @@ impl<F: Float + Send + Sync + 'static> FittedPipelineEstimator<F> for FittedExtr
 // ---------------------------------------------------------------------------
 // Internal: helpers
 // ---------------------------------------------------------------------------
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's up-front `_validate_data(..., force_all_finite=True)` for
+/// the random-splitter path: `ExtraTree*` use `splitter='random'`, so
+/// `allow_nan` is `False` (`sklearn/tree/_classes.py:1085-1090`/`:1416-1421`),
+/// `_support_missing_values` returns `False`, and the data check calls
+/// `assert_all_finite(X)` (`_classes.py:213-214`), which raises
+/// `ValueError("Input X contains NaN.")` (`sklearn/utils/validation.py:147-154`).
+/// Unlike the CART `DecisionTree*` base (which accepts NaN via
+/// `force_all_finite=False`), the random splitter does NOT support missing
+/// values, so NaN AND infinity are both rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 /// Resolve the `MaxFeatures` strategy to a concrete number.
 fn resolve_max_features(strategy: MaxFeatures, n_features: usize) -> usize {

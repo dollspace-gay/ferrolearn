@@ -65,6 +65,7 @@
 //! | REQ-10 | Early stopping (`n_iter_no_change`/`validation_fraction`/`tol`) + `ccp_alpha`/`max_features`/`min_impurity_decrease`/`init`/`staged_predict` | NOT-STARTED (#741) |
 //! | REQ-11 | PyO3 binding fidelity — RsGradientBoosting{Regressor,Classifier} thin (no loss/subsample/predict_proba/feature_importances_/classes_) | NOT-STARTED (#759) |
 //! | REQ-12 | ferray substrate migration | NOT-STARTED (#744) |
+//! | REQ-13 | Reject non-finite input (NaN+Inf): `fn reject_non_finite` at the top of BOTH `GradientBoostingRegressor::fit` (+ float-`y` finite check) and `GradientBoostingClassifier::fit` rejects NaN AND infinity. sklearn validates X/y up front (`_gb.py:659-661`, default `force_all_finite=True`) BEFORE any base learner ⇒ `ValueError`, even though the ferrolearn `DecisionTree` base now accepts NaN (#2277). Consumers: the existing `fit` entries (crate-root re-export + `RsGradientBoosting{Regressor,Classifier}` PyO3 reg). Pinned by `divergence_gradient_boosting_regressor_nan_not_rejected`/`divergence_gradient_boosting_classifier_nan_not_rejected` (live sklearn 1.5.2 raises). | SHIPPED |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasFeatureImportances};
@@ -79,6 +80,25 @@ use rand::seq::index::sample as rand_sample_indices;
 use crate::decision_tree::{
     self, Node, build_regression_tree_with_feature_subset, compute_feature_importances,
 };
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// sklearn's `BaseGradientBoosting.fit` validates X (and y) up front via
+/// `_validate_data(...)` with the default `force_all_finite=True`
+/// (`sklearn/ensemble/_gb.py:659-661`), raising
+/// `ValueError("Input X contains NaN.")` (`validation.py:147-154`) BEFORE any
+/// base learner is built — so although ferrolearn's `DecisionTree` base now
+/// accepts NaN (#2277), GradientBoosting rejects it at its own entry, matching
+/// sklearn. NaN AND infinity are both rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Regression loss enum
@@ -304,8 +324,19 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for GradientBoo
                 reason: "must be in (0, 1]".into(),
             });
         }
+        // Reject non-finite X (and the float target y) up front, before building
+        // any base learner, matching sklearn (`_gb.py:659-661`).
+        reject_non_finite(x)?;
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
 
-        let lr = F::from(self.learning_rate).unwrap();
+        // `learning_rate` is `>0.0` (checked above) ⇒ representable; the
+        // fallback keeps this conversion panic-free (R-CODE-2).
+        let lr = F::from(self.learning_rate).unwrap_or_else(F::one);
         let params = decision_tree::TreeParams {
             max_depth: self.max_depth,
             min_samples_split: self.min_samples_split,
@@ -721,6 +752,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>>
                 reason: "must be in (0, 1]".into(),
             });
         }
+        // Reject non-finite X up front, before building any base learner,
+        // matching sklearn (`_gb.py:659-661`).
+        reject_non_finite(x)?;
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.iter().copied().collect();

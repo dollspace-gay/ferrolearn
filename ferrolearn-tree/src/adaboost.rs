@@ -57,6 +57,7 @@
 //! | REQ-1b | `algorithm` default match-1.5.2-literal (`'SAMME.R'`) — deliberate R-DEV-6 deviation | NOT-STARTED (#713) |
 //! | REQ-12 | Empty-ensemble worse-than-random raises `ValueError` (`:687-692`) | NOT-STARTED (#715) |
 //! | REQ-13 | ferray substrate migration | NOT-STARTED (#716) |
+//! | REQ-14 | Reject non-finite input (NaN+Inf): `fn reject_non_finite` at the top of `AdaBoostClassifier::fit` rejects NaN AND infinity. sklearn validates X up front (`_weight_boosting.py:133-141`, default `force_all_finite=True`) BEFORE any base learner ⇒ `ValueError`, even though the ferrolearn `DecisionTree` base now accepts NaN (#2277). Consumer: the existing `fit` entry (`RsAdaBoostClassifier` PyO3 reg). Pinned by `divergence_adaboost_classifier_nan_not_rejected` (live sklearn 1.5.2 raises). | SHIPPED |
 
 use crate::decision_tree::{
     self, ClassificationCriterion, Node, build_weighted_classification_tree_with_feature_subset,
@@ -67,6 +68,25 @@ use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
 use ferrolearn_core::traits::{Fit, Predict};
 use ndarray::{Array1, Array2};
 use num_traits::{Float, FromPrimitive, ToPrimitive};
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// sklearn's `AdaBoostClassifier.fit` validates X up front via
+/// `_validate_data(...)` with the default `force_all_finite=True`
+/// (`sklearn/ensemble/_weight_boosting.py:133-141`), raising
+/// `ValueError("Input X contains NaN.")` (`validation.py:147-154`) BEFORE any
+/// base learner is built — so although ferrolearn's `DecisionTree` base now
+/// accepts NaN (#2277), AdaBoost rejects it at its own entry, matching sklearn.
+/// NaN AND infinity are both rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Algorithm enum
@@ -245,6 +265,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for AdaBoos
                 reason: "must be positive".into(),
             });
         }
+        // Reject non-finite X up front (before building any base learner),
+        // matching sklearn (`_weight_boosting.py:133-141`).
+        reject_non_finite(x)?;
 
         // Determine unique classes.
         let mut classes: Vec<usize> = y.iter().copied().collect();
