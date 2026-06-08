@@ -45,6 +45,7 @@
 //! | REQ-8b (n<p Woodbury branch: structural + observable contract) | SHIPPED | `n_samples < n_features` selects `fn update_sigma_woodbury` (sklearn `_update_sigma_woodbury`, `_bayes.py:670-674`, `:732-748`): inverts the well-conditioned `(n,n)` `eye/alpha + (Xk·invλ)·Xkᵀ` via `fn invert_dense` (`ferray::linalg::inv`) instead of the rank-deficient `(p,p)` Gram block. Constant-y all-pruned (`intercept_=mean(y)`, coef 0, no panic) and recoverable-sparse cases match the live oracle (same kept set, coef within eigensolver-backend tolerance). Verified by `divergence_ard_woodbury.rs` (Rust) + `divergence_ard_woodbury.py` (pytest) vs live sklearn 1.5.2. |
 //! | REQ-8c (n<p EXACT bit-parity on chaotic ill-conditioned trajectories) | NOT-STARTED | Blocked on ferray `scipy.linalg.pinvh` primitive (#2165, R-SUBSTRATE-5): sklearn's `_update_sigma_woodbury` inverts `A` with `pinvh` (LAPACK `syev` + eigenvalue cutoff `max|λ|·N·eps`); ferray exposes only an LU `inv`. On cond~2e8 EM trajectories even numpy's `eigh` differs from scipy's `pinvh` (~1.67), so exact `n_iter_`/coef parity in n<p is genuinely substrate-blocked. `fn update_sigma_woodbury` carries a minimal `pinvh`-cutoff floor on the singular-inverse retry (constant-y path) but does NOT reproduce the full eigenvalue-cutoff trajectory. The OBSERVABLE contract is SHIPPED (REQ-8b); only the exact-bit-chaotic tail is deferred. |
 //! | REQ-9 (array-type ferray substrate) | NOT-STARTED | #480; the kept-Gram inverse already on `ferray::linalg::inv`, the array type is still `ndarray`. |
+//! | REQ-10 (non-finite input rejected) | SHIPPED | `Fit for ARDRegression`'s `fn fit` rejects any NaN/+/-inf in X or y BEFORE centering/EM with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_bayes.py:624-631`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `ARDRegression.fit(X, y)` takes NO `sample_weight` (sklearn `_bayes.py:606`), so only X/y are checked. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `ARDRegression().fit` raises `ValueError` for NaN/+inf/-inf in X, NaN/inf in y (`tests/divergence_linear_nonfinite_batch3.rs::ard_*`). Non-test consumer: the existing `Fit::fit` / `RsARDRegression` consumers. (#2261) |
 //!
 //! acto-critic + builder: the fit was rewritten to sklearn's per-iteration ARD (was wrongly
 //! pruning relevant features); coef_/alpha_/lambda_/pruned-set now match the live oracle. The
@@ -563,6 +564,28 @@ impl<F: LinalgFloat + Send + Sync + ScalarOperand + FromPrimitive> Fit<Array2<F>
                 required: 2,
                 actual: n_samples,
                 context: "ARDRegression requires at least 2 samples".into(),
+            });
+        }
+
+        // Non-finite input validation, mirroring sklearn's
+        // `self._validate_data(X, y, ..., y_numeric=True, ensure_min_samples=2)`
+        // (`_bayes.py:624-631`) which keeps the default `force_all_finite=True`,
+        // so `check_array` rejects any NaN or +/-inf in X OR y with a
+        // `ValueError` BEFORE the EM loop. `ARDRegression.fit(X, y)` takes NO
+        // `sample_weight` (sklearn `_bayes.py:610`), so only X/y are checked.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-
+        // safe, no panic, R-CODE-2), matching the crate idiom (`ridge.rs`). The
+        // finite path is byte-identical (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

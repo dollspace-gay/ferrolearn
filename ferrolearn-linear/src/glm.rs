@@ -51,6 +51,7 @@
 //! | REQ-9 (Tweedie default power=0.0) | SHIPPED | `TweedieRegressor::new` sets `power: 0.0` (sklearn default, `glm.py:867`). Consumer: `TweedieRegressor::default`/`new` (crate-root export); oracle test `glm_tweedie_default_power` (`new().power == 0.0`) green. |
 //! | REQ-11 (warm_start) | SHIPPED | #557. **R-DEV-2 (API parity):** `pub warm_start: bool` (default `false`) + `#[must_use] fn with_warm_start` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`, mirroring sklearn's `warm_start` parameter (`"boolean"`, default `False`, `glm.py:146, :158, :576, :708, :874`). **R-DEV-7 (Rust analog — immutable-estimator design, observable contract preserved):** sklearn's `warm_start=True` reuses the stateful `self.coef_`/`self.intercept_` mutated across `fit` calls as the optimizer's start (`glm.py:243-254`); ferrolearn's estimators are immutable (`fit(&self, ...)` never mutates `self`, no `self.coef_` to reuse), so the warm-start point is supplied EXPLICITLY via `pub coef_init: Option<(Array1<F>, F)>` + `#[must_use] fn with_coef_init(coef, intercept)`. `fn fit_glm_irls` seeds the IRLS coefficient vector (and derived `eta`/`mu`) from `coef_init` when `warm_start && coef_init.is_some()` (validating `feature_coef.len() == n_features`, else `ShapeMismatch`); otherwise the cold start (`coef = 0`) is byte-for-byte preserved. The penalized GLM objective is convex, so the converged `coef_`/`intercept_` are warm-start-INVARIANT — the init only changes the starting point (and iteration count), never the optimum — so the warm fit matches the cold fit AND the sklearn oracle (`glm.py:244-256`). Consumer: each estimator's `Fit::fit` (crate-root export) — the `warm_start`/`coef_init` fields are part of the boundary estimator ABI. Oracle tests `glm_warm_start_observable_contract` (warm fit from a perturbed init == cold fit == live sklearn 1.5.2 oracle `coef_=[0.38388477,0.20240006]`, `intercept_=-0.51935653` to 1e-6/1e-4) and `glm_warm_start_init_used` (seeding the exact optimum with `max_iter=1` lands at the solution, a cold `max_iter=1` fit does not — proves the init is genuinely used) green in `tests/divergence_glm_fit.rs`; the 20 pre-existing glm divergence tests stay green (all cold-start, byte-identical). |
 //! | REQ-12 (sample_weight) | SHIPPED | `fn fit_with_sample_weight` on `GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor` threads an `Array1<F>` `sample_weight` into `fn fit_glm_irls`, where the IRLS `W` diagonal becomes `s_i * w_irls,i` (`weights[i] = weights[i] * sample_weight[i]`) and the L2-penalty scale is `weight_sum = S = sum_i s_i` (`sample_weight.iter().fold(..)`), matching sklearn's `sample_weight`-averaged deviance objective normalized by `sum(sample_weight)` (`glm.py:229-242`; `_check_sample_weight`, `glm.py:208-211`). Consumer: each estimator's `Fit::fit` (crate-root export) delegates with an all-ones weight vector, so the unweighted path is byte-identical (`weight_sum = n_samples`). Oracle tests `glm_poisson_sample_weight` (coef `[0.35738828,0.19717462]`, int `-0.43719203`) and `glm_gamma_sample_weight` (coef `[0.23049054,0.11350454]`, int `0.41955357`) green in `tests/divergence_glm_fit.rs`; the 8 pre-existing unweighted oracle tests stay green. |
+//! | REQ-15 (non-finite input rejected) | SHIPPED | The shared IRLS entry `fn fit_glm_irls` — which every estimator (`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`/`GLMRegressor`) routes through — rejects any NaN/+/-inf in X, y, or `sample_weight` BEFORE the y-domain check and the IRLS loop with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`glm.py:189-196`) + `_check_sample_weight` (default `force_all_finite=True`, `glm.py:211`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. Placed ONCE at the shared entry (R-DEFER-8 single instance). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the unweighted `Fit::fit` delegates an all-ones weight). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`(`.fit`) raise `ValueError` for NaN/+inf/-inf in X, NaN/inf in y, and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch3.rs::{poisson,gamma,tweedie}_*`). Non-test consumer: each estimator's crate-root-exported `Fit::fit`. (#2261) |
 //! | REQ-14 (n_iter_ + per-family y-domain validation) | SHIPPED | #560. Per-family y-domain guard in `fn fit_glm_irls`: `YDomain::for_power(family.domain_power())` then `y.iter().any(|&yi| !y_domain.contains(yi))` → `FerroError::InvalidParameter{name:"y", reason:"Some value(s) of y are out of the valid range of the loss '<loss>'."}`, mirroring sklearn's `if not base_loss.in_y_true_range(y): raise ValueError(...)` (`glm.py:221-225`). The valid range is keyed on the family's Tweedie `power` (NOT the link — verified vs the live oracle that `HalfTweedieLoss(p).interval_y_true == HalfTweedieLossIdentity(p).interval_y_true`): `power <= 0` unconstrained (Normal), `0 < power < 2` → `y >= 0` (Poisson `power=1`), `power >= 2` → `y > 0` (Gamma `power=2`, open at 0). `FittedGLMRegressor` gains `n_iter: usize` (the IRLS iteration count captured in the convergence loop) with `#[must_use] pub fn n_iter(&self) -> usize` — sklearn's `n_iter_` is the lbfgs count (`glm.py:110-114, :283`); ferrolearn's is the IRLS count (solvers differ, both report iterations-to-convergence). Consumer: `FittedGLMRegressor::n_iter` accessor on the crate-root-exported fitted type. Oracle tests `glm_gamma_rejects_zero_y` (Gamma rejects `y==0`, accepts `y>0`), `glm_tweedie_power2_rejects_zero_y` (`power=2.0` rejects `y==0`; `power=1.5` accepts it), `glm_poisson_rejects_negative_y` (rejects `y<0`, accepts `y==0`), `glm_n_iter_exposed` (`1 <= n_iter() <= max_iter`) green in `tests/divergence_glm_fit.rs`; the 10 pre-existing glm divergence tests stay green (all their `y` are in-domain). |
 
 use ferrolearn_core::error::FerroError;
@@ -1549,6 +1550,43 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
             expected: vec![n_samples],
             actual: vec![sample_weight.len()],
             context: "sample_weight length must match number of samples in X".into(),
+        });
+    }
+
+    // Non-finite input validation, mirroring sklearn's
+    // `self._validate_data(X, y, ..., y_numeric=True)` (`glm.py:189-196`) which
+    // keeps the default `force_all_finite=True`, so `check_array` rejects any
+    // NaN or +/-inf in X OR y with a `ValueError` BEFORE the IRLS loop. sklearn
+    // also validates `sample_weight` via `_check_sample_weight` (default
+    // `force_all_finite=True`, `glm.py:211`). This is the SHARED IRLS entry that
+    // every estimator (PoissonRegressor/GammaRegressor/TweedieRegressor/
+    // GLMRegressor) routes through, so the check lands ONCE here.
+    // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+    // no panic, R-CODE-2), matching the crate idiom (`ridge.rs`). The finite
+    // path is byte-identical (the guard never fires on finite input). The
+    // sample_weight finiteness check MUST precede the non-negative check below:
+    // sklearn's `_check_sample_weight` runs `check_array(force_all_finite=True)`
+    // first, so a `-inf` weight raises the infinity `ValueError` (verified live),
+    // NOT a non-negative error. This guard also precedes the per-family y-domain
+    // validation so a non-finite y is reported as a finiteness failure
+    // (`is_finite()` is `false` for NaN/Inf), matching sklearn's `check_array`
+    // running before `in_y_true_range`.
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+    if sample_weight.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "sample_weight".into(),
+            reason: "Input sample_weight contains NaN or infinity.".into(),
         });
     }
 

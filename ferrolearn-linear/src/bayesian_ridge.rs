@@ -54,6 +54,7 @@
 //! | REQ-8 (predict return_std / full sigma_) | SHIPPED | `FittedBayesianRidge.sigma_full` is the full `(n_features, n_features)` covariance `(1/α)·Vhᵀ·diag(1/(eig+λ/α))·Vh` (`_bayes.py:333-337`), getter `fn sigma_full`; `fn predict_with_std` returns `(mean, sqrt(diag(X·sigma_·Xᵀ)+1/α))` (`_bayes.py:367-371`). Consumer: `RsBayesianRidge::predict(return_std=True)` + `sigma_` getter (`extras.rs`) → `_extras.py::BayesianRidge.predict`/`sigma_`. Verified by `divergence_bayesian_ridge_return_std_ac1` (Rust) + `test_bayesian_ridge_return_std_matches_sklearn`/`_sigma_full_matches_sklearn` (pytest). |
 //! | REQ-9 (sample_weight) | SHIPPED | `fn fit_with_sample_weight(x, y, Option<&Array1<F>>)` rescales centered `(X, y)` by `sqrt(sample_weight)` via `fn rescale_data` (sklearn `_rescale_data`, `_bayes.py:254-256`) with weighted offsets via `fn weighted_means`; `Fit::fit` delegates `None` (byte-identical). Consumer: `RsBayesianRidge::fit(x, y, sample_weight=None)` (`extras.rs`) → `_extras.py::BayesianRidge.fit`. Verified by `divergence_bayesian_ridge_sample_weight` (Rust) + `test_bayesian_ridge_sample_weight_matches_sklearn` (pytest) vs live sklearn. |
 //! | REQ-10 (ferray substrate) | SHIPPED (SVD) | the SVD runs on `ferray::linalg::svd` (`ferray-linalg/src/decomp/svd.rs:40`), bridged ndarray↔ferray at the `fn fit` boundary (R-SUBSTRATE-4), mirroring sklearn `scipy.linalg.svd` (`_bayes.py:287`). Remaining `ndarray` array-type migration tracked by #471. |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `fn fit_with_sample_weight` (the shared entry `Fit::fit` delegates to) rejects any NaN/+/-inf in X, y, or `sample_weight` BEFORE centering/SVD with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_bayes.py:238-239`) + `_check_sample_weight` (default `force_all_finite=True`, `_bayes.py:244`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `BayesianRidge().fit` raises `ValueError` for NaN/+inf/-inf in X, NaN/inf in y, and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch3.rs::bayesian_ridge_*`). Non-test consumer: the existing `Fit::fit` / `RsBayesianRidge` consumers. (#2261) |
 
 use ferray::linalg::{LinalgFloat, svd};
 use ferray::{Array as FerrayArray, Ix2 as FerrayIx2};
@@ -518,6 +519,37 @@ impl<F: LinalgFloat + ScalarOperand + FromPrimitive> BayesianRidge<F> {
                 expected: vec![n_samples],
                 actual: vec![sw.len()],
                 context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        // Non-finite input validation, mirroring sklearn's
+        // `self._validate_data(X, y, ..., y_numeric=True)` (`_bayes.py:238-239`)
+        // which keeps the default `force_all_finite=True`, so `check_array`
+        // rejects any NaN or +/-inf in X OR y with a `ValueError` BEFORE the
+        // SVD/EM loop. sklearn also validates `sample_weight` via
+        // `_check_sample_weight` (default `force_all_finite=True`,
+        // `_bayes.py:244`). `.iter().any(|v| !v.is_finite())` rejects both NaN
+        // and Inf (bounds-safe, no panic, R-CODE-2), matching the crate idiom
+        // (`ridge.rs`/`lasso.rs`). The finite path is byte-identical (the guard
+        // never fires on finite input). `Fit::fit` delegates here with `None`.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+        if let Some(w) = sample_weight
+            && w.iter().any(|v| !v.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
             });
         }
 

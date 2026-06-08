@@ -32,6 +32,7 @@
 //! | REQ-8 (sample_weight) | SHIPPED | `RidgeClassifier::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` forwards weights into the underlying weighted ridge on the indicator matrix `Y`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off[t]=Σwᵢ·Y[i,t]/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescale of `X`/`Y` (sklearn `_rescale_data`, `_ridge.py:682-688`), per-target `linalg::solve_ridge` with `alpha` UNSCALED, `intercept[t]=y_off[t]−Σⱼ x_off[j]·coef[j,t]`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body). Mirrors `RidgeClassifier.fit(X, y, sample_weight=None)` (`_ridge.py:1220`) forwarding through `_prepare_data` (`_ridge.py:1305`) into `_BaseRidge.fit`. Oracle tests `ridge_classifier_sample_weight_matches_sklearn` (alpha=1 binary coef `[0.25333333, 0.36]`, intercept `-1.70666667`, differs from unweighted `[0.31840796, 0.31840796]`), `ridge_classifier_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #395. |
 //! | REQ-9 (RidgeClassifierCV) | SHIPPED | `RidgeClassifierCV<F>`/`FittedRidgeClassifierCV<F>` in the sibling module `ridge_classifier_cv.rs` mirror `class RidgeClassifierCV` (`_ridge.py:2676`): `impl Fit for RidgeClassifierCV` binarizes `y` to a `{-1,+1}` indicator (binary single column / multiclass one-hot, `LabelBinarizer(pos_label=1, neg_label=-1)`, `_ridge.py:1300-1301`); `fn select_alpha_gcv` selects ONE shared `alpha` by leave-one-out GCV over the binarized multi-target problem (closed-form LOO errors `(c / G_inverse_diag)²` summed over all indicator columns + samples, `-squared_errors.mean()`, `_ridge.py:2148-2150` + `_score_without_scorer` `:2211-2218`, sharing `_RidgeGCV` `_ridge.py:1688`); the selected `alpha_` drives a multi-output `Ridge::fit` refit → `coef_`/`intercept_`/`classes_` + `HasClasses`/`HasCoefficients`. That module's own REQ-10 row is SHIPPED. Non-test consumer: crate-root re-export `pub use ridge_classifier_cv::{RidgeClassifierCV, FittedRidgeClassifierCV}` in `lib.rs` (the grandfathered R-DEFER-1/S5 re-export boundary, same path by which sibling CV estimator `RidgeCV` ships). Verification (live sklearn 1.5.2): `cargo test -p ferrolearn-linear --lib ridge_classifier_cv` PASS (7 tests incl. `ridge_classifier_cv_binary_matches_sklearn`, `ridge_classifier_cv_multiclass_matches_sklearn` to <1e-6). NOTE: blocker #396 is the SEPARATE ferray-substrate concern (tracked at REQ-11 of `.design/linear/ridge_classifier.md`), NOT the missing estimator. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | solve_ridge already on ferray::linalg fallback; coef storage ndarray (tied to #359). |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `fn fit_with_sample_weight` (the shared entry `Fit::fit` delegates to) rejects any NaN/+/-inf in X or `sample_weight` BEFORE the indicator solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` in `RidgeClassifier._prepare_data` (`_ridge.py:1291-1298`) + `_check_sample_weight` (default `force_all_finite=True`, `_ridge.py:1305`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. RidgeClassifier solves the binarized indicator targets DIRECTLY via `linalg::solve_ridge`/`nonneg_ridge_cd` (it does NOT delegate to the #2259-guarded `Ridge::fit`), so the X guard is owned here; the target `y: Array1<usize>` is finite by type (sklearn binarizes the labels), so no `y` check is needed. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `RidgeClassifier().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch3.rs::ridge_classifier_*`). Non-test consumer: the existing `Fit::fit` / `RsRidgeClassifier` consumers. (#2261) |
 //!
 //! acto-critic: binary + multiclass coef_/intercept_/decision_function match the live oracle to
 //! 1e-9; classes_ returns original label values (no #368-style collapse); one divergence (#405,
@@ -397,6 +398,35 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                 expected: vec![n_samples],
                 actual: vec![w.len()],
                 context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        // Non-finite input validation, mirroring sklearn's `_validate_data(X, y,
+        // ...)` in `RidgeClassifier._prepare_data` (`_ridge.py:1291-1298`) which
+        // keeps the default `force_all_finite=True`, so `check_array` rejects any
+        // NaN or +/-inf in X with a `ValueError` BEFORE the indicator solve.
+        // RidgeClassifier solves the binarized indicator targets DIRECTLY via
+        // `linalg::solve_ridge`/`nonneg_ridge_cd` (it does NOT delegate to the
+        // #2259-guarded `Ridge::fit`), so X must be checked here. The target `y`
+        // is `Array1<usize>` — finite by type, no `y` check needed (sklearn
+        // binarizes the labels). sklearn also validates `sample_weight` via
+        // `_check_sample_weight` (default `force_all_finite=True`,
+        // `_ridge.py:1305`). `.iter().any(|v| !v.is_finite())` rejects both NaN
+        // and Inf (bounds-safe, no panic, R-CODE-2). The finite path is byte-
+        // identical (the guard never fires on finite input). `Fit::fit` delegates
+        // here with `None`.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if let Some(w) = sample_weight
+            && w.iter().any(|v| !v.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
             });
         }
 
