@@ -477,37 +477,16 @@ fn find_best_split_from_histograms<F: Float>(
                 .saturating_sub(left_count)
                 .saturating_sub(nan.count);
 
-            // Try NaN goes left.
-            {
-                let lg = left_grad + nan.grad_sum;
-                let lh = left_hess + nan.hess_sum;
-                let lc = left_count + nan.count;
-                let rg = right_grad_no_nan;
-                let rh = right_hess_no_nan;
-                let rc = right_count_no_nan;
-
-                if lc >= min_samples_leaf && rc >= min_samples_leaf {
-                    let gain = lg * lg / (lh + l2_regularization)
-                        + rg * rg / (rh + l2_regularization)
-                        - parent_gain;
-                    if gain > F::zero() {
-                        let better = match &best {
-                            None => true,
-                            Some(curr) => gain > curr.gain,
-                        };
-                        if better {
-                            best = Some(SplitCandidate {
-                                feature: j,
-                                threshold_bin: b as u16,
-                                gain,
-                                nan_goes_left: true,
-                            });
-                        }
-                    }
-                }
-            }
-
-            // Try NaN goes right.
+            // Try NaN goes RIGHT first. sklearn scans left-to-right by default,
+            // which sends missing values to the right child
+            // (`splitting.pyx:719-720`, `missing_go_to_left = False`). Because
+            // this direction is evaluated FIRST and the tie-break below is a
+            // STRICT `gain > curr.gain`, missing→right wins every equal-gain tie
+            // — including the no-missing-at-node case where both directions give
+            // identical gain. This matches sklearn, where the right-to-left scan
+            // (missing→left) is only run when missing values are present and must
+            // STRICTLY beat the running best gain to flip the direction
+            // (`splitting.pyx:567-575,822,834`).
             {
                 let lg = left_grad;
                 let lh = left_hess;
@@ -531,6 +510,41 @@ fn find_best_split_from_histograms<F: Float>(
                                 threshold_bin: b as u16,
                                 gain,
                                 nan_goes_left: false,
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Try NaN goes LEFT second. Mirrors sklearn's right-to-left scan
+            // (`splitting.pyx:833-834`, `missing_go_to_left = True`): it only
+            // wins when sending missing values left STRICTLY improves the gain
+            // over the missing→right default. When `nan.count == 0` both
+            // directions produce identical gain, so this strict check never
+            // flips the default — preserving the missing→right contract.
+            {
+                let lg = left_grad + nan.grad_sum;
+                let lh = left_hess + nan.hess_sum;
+                let lc = left_count + nan.count;
+                let rg = right_grad_no_nan;
+                let rh = right_hess_no_nan;
+                let rc = right_count_no_nan;
+
+                if lc >= min_samples_leaf && rc >= min_samples_leaf {
+                    let gain = lg * lg / (lh + l2_regularization)
+                        + rg * rg / (rh + l2_regularization)
+                        - parent_gain;
+                    if gain > F::zero() {
+                        let better = match &best {
+                            None => true,
+                            Some(curr) => gain > curr.gain,
+                        };
+                        if better {
+                            best = Some(SplitCandidate {
+                                feature: j,
+                                threshold_bin: b as u16,
+                                gain,
+                                nan_goes_left: true,
                             });
                         }
                     }

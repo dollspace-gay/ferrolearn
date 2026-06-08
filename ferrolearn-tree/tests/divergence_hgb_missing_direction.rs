@@ -12,14 +12,14 @@
 //! When a node observed NO missing values during fit, sklearn fixes a definite
 //! default for missing values seen at predict time:
 //!
-//!   - `sklearn/ensemble/_hist_gradient_boosting/splitting.pyx:758-759`:
-//!     "If no missing value are present in the data this method [right-to-left]
-//!      isn't called since only calling
-//!      _find_best_bin_to_split_left_to_right is enough."
-//!   - `sklearn/ensemble/_hist_gradient_boosting/splitting.pyx:719-720` (the
-//!     left-to-right scan, the ONLY scan when no missing in training):
-//!         # we scan from left to right so missing values go to the right
-//!         split_info.missing_go_to_left = False
+//! - `sklearn/ensemble/_hist_gradient_boosting/splitting.pyx:758-759`:
+//!   "If no missing value are present in the data this method [right-to-left]
+//!   isn't called since only calling
+//!   _find_best_bin_to_split_left_to_right is enough."
+//! - `sklearn/ensemble/_hist_gradient_boosting/splitting.pyx:719-720` (the
+//!   left-to-right scan, the ONLY scan when no missing in training):
+//!   `# we scan from left to right so missing values go to the right`;
+//!   `split_info.missing_go_to_left = False`
 //!
 //! i.e. sklearn's contract is: a node that saw no missing values sends missing
 //! values to the RIGHT child at predict time.
@@ -70,13 +70,8 @@ use ndarray::{Array1, Array2};
 ///
 /// Tracking: #2280
 #[test]
-#[ignore = "divergence: HGBC routes missing LEFT for no-missing-in-training nodes; sklearn splitting.pyx:719-720 routes RIGHT; tracking #2280"]
 fn divergence_hgbc_missing_default_direction() {
-    let x = Array2::from_shape_vec(
-        (8, 1),
-        vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-    )
-    .unwrap();
+    let x = Array2::from_shape_vec((8, 1), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]).unwrap();
     let y = Array1::from(vec![0usize, 0, 0, 0, 1, 1, 1, 1]);
 
     let model = HistGradientBoostingClassifier::<f64>::new()
