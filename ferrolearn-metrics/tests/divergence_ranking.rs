@@ -275,3 +275,40 @@ fn dcg_ndcg_2d_sample_weight_matches_sklearn() -> Result<(), FerroError> {
     );
     Ok(())
 }
+
+// ===========================================================================
+// RED pin — exception parity (R-DEV-2): k=0 (#2296)
+// ===========================================================================
+
+/// Divergence: `dcg_score`/`ndcg_score` accept `k = 0` and return `Ok(0.0)`,
+/// but sklearn constrains `k` to `Interval(Integral, 1, None, closed="left")`
+/// (`sklearn/metrics/_ranking.py:1595`) and raises `InvalidParameterError` for
+/// `k = 0`:
+///
+///   python3 -c "import numpy as np; from sklearn.metrics import dcg_score; \
+///     dcg_score(np.array([[3.,2.,1.]]), np.array([[3.,2.,1.]]), k=0)"
+///   # InvalidParameterError: The 'k' parameter of dcg_score must be an int in
+///   #   the range [1, inf) or None. Got 0 instead.
+///   # (ndcg_score raises the identical error.)
+///
+/// ferrolearn clamps `k = k.unwrap_or(n_labels).min(n_labels)` with no lower
+/// bound, so `k = 0` zeroes the discount and returns `Ok(0.0)` instead of an
+/// error. sklearn never produces a DCG/NDCG of 0.0 via `k = 0` — it rejects the
+/// call. Tracking: #2296
+#[test]
+#[ignore = "divergence: dcg/ndcg accept k=0, sklearn raises InvalidParameterError; tracking #2296"]
+fn divergence_dcg_ndcg_k_zero_rejected() {
+    let y_true = array![[3.0_f64, 2.0, 1.0]];
+    let y_score = array![[3.0_f64, 2.0, 1.0]];
+    // sklearn rejects k=0 for both; ferrolearn must return Err (R-DEV-2).
+    let dcg = dcg_score(&y_true, &y_score, Some(0), None, None);
+    let ndcg = ndcg_score(&y_true, &y_score, Some(0), None);
+    assert!(
+        dcg.is_err(),
+        "dcg_score k=0: sklearn raises InvalidParameterError; ferrolearn returned {dcg:?}"
+    );
+    assert!(
+        ndcg.is_err(),
+        "ndcg_score k=0: sklearn raises InvalidParameterError; ferrolearn returned {ndcg:?}"
+    );
+}
