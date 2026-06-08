@@ -828,3 +828,123 @@ fn reaudit_g_f32_constant_column() {
         assert_eq!(&got, row, "(g) f32 ordinal row {i} mismatch");
     }
 }
+
+// ===========================================================================
+// DIV-KM-1 / DIV-KM-2 — kmeans convergence divergence on NON-degenerate data.
+//
+// REQ-2 in the source REQ table claims kmeans is "SHIPPED (scoped) ... matches
+// sklearn Lloyd on well-separated data", carving out only "EXACT parity on
+// degenerate/duplicate-heavy data (empty-cluster relocation)" as #1378. The two
+// tests below show kmeans ALSO diverges on ordinary, moderately-separated,
+// all-DISTINCT data where ferrolearn produces NO empty cluster — i.e. plain
+// Lloyd converging to a different (worse) local optimum than sklearn's KMeans.
+// These are RNG-INVARIANT in sklearn (identical for random_state in {0,1,2,42,7}),
+// so they are NOT the documented kmeans-RNG non-parity.
+//
+// All expected values from the LIVE sklearn 1.5.2 oracle (/tmp, warnings off,
+// subsample=None). R-CHAR-3: never copied from ferrolearn.
+// sklearn cite: `sklearn/preprocessing/_discretization.py:285-300`
+//   centers = KMeans(n_bins, init=uniform-midpoints, n_init=1).fit(col)
+//   centers.sort(); bin_edges = r_[col_min, midpoints(centers), col_max]
+// ===========================================================================
+
+/// Divergence DIV-KM-1 (tracking #2321): kmeans `bin_edges_` diverges from
+/// `sklearn/preprocessing/_discretization.py:285-300` on moderately-separated,
+/// all-distinct data with NO empty cluster on the ferrolearn side.
+///
+/// LIVE ORACLE (sklearn 1.5.2, random_state in {0,1,2,42,7} all identical):
+///   X = [[0.4],[5.9],[7.6],[9.7],[10.1],[11.9],[22.2],[28.2]], n_bins=3, kmeans
+///   -> n_bins_ = [3]
+///   -> bin_edges_ = [0.4, 7.6, 17.883333333333333, 28.2]
+///   -> transform   = [0,0,1,1,1,1,2,2]
+/// ferrolearn currently returns bin_edges_ = [0.4, 6.4875, 17.5125, 28.2]
+///   (Lloyd converges to a different local optimum; interior edges off by ~1.1).
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+#[ignore = "divergence: kmeans bin_edges_ Lloyd local-optimum mismatch on non-degenerate data; tracking #2321"]
+fn divergence_km1_kmeans_edges_nonempty() {
+    // sklearn oracle interior edges (outer edges are col_min/col_max == 0.4/28.2).
+    const SK_EDGES: [f64; 4] = [0.4, 7.6, 17.883_333_333_333_333, 28.2];
+
+    let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> =
+        array![[0.4], [5.9], [7.6], [9.7], [10.1], [11.9], [22.2], [28.2]];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(
+        edges.len(),
+        SK_EDGES.len(),
+        "DIV-KM-1: sklearn keeps 4 edges; ferrolearn has {} {edges:?}",
+        edges.len()
+    );
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!(
+            (*e - s).abs() <= 1e-6,
+            "DIV-KM-1: kmeans edge {e} != sklearn {s} (sklearn edges {SK_EDGES:?}, ferrolearn {edges:?})"
+        );
+    }
+}
+
+/// Divergence DIV-KM-2 (tracking #2322): kmeans `transform`/`n_bins_` diverges
+/// from `sklearn/preprocessing/_discretization.py:285-312` on clustered data.
+/// ferrolearn's Lloyd ends with an empty MIDDLE bin so the high group maps to
+/// bin 2; sklearn's partition assigns the high group across bins 1 and 2. This
+/// is a bin-ASSIGNMENT flip (observable in transform), distinct from the edge
+/// magnitude case above.
+///
+/// LIVE ORACLE (sklearn 1.5.2, random_state in {0,1,2,3,42} all identical):
+///   X = [[0],[1],[2],[3],[4],[20],[21],[22]], n_bins=3, kmeans
+///   -> n_bins_ = [3]
+///   -> bin_edges_ = [0.0, 11.25, 21.25, 22.0]
+///   -> transform   = [0,0,0,0,0,1,1,2]
+/// ferrolearn currently returns
+///   bin_edges_ = [0.0, 6.5, 16.0, 22.0], transform = [0,0,0,0,0,2,2,2].
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+#[ignore = "divergence: kmeans transform bin-assignment flip from different Lloyd partition; tracking #2322"]
+fn divergence_km2_kmeans_transform_flip() {
+    const SK_EDGES: [f64; 4] = [0.0, 11.25, 21.25, 22.0];
+    const SK_TRANSFORM: [f64; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0];
+
+    let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> =
+        array![[0.0], [1.0], [2.0], [3.0], [4.0], [20.0], [21.0], [22.0]];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    let edges = &fitted.bin_edges()[0];
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!(
+            (*e - s).abs() <= 1e-6,
+            "DIV-KM-2: kmeans edge {e} != sklearn {s} (sklearn {SK_EDGES:?}, ferrolearn {edges:?})"
+        );
+    }
+    let out = match fitted.transform(&x) {
+        Ok(o) => o,
+        Err(e) => {
+            assert!(false, "transform failed: {e:?}");
+            return;
+        }
+    };
+    let got: Vec<f64> = out.iter().copied().collect();
+    assert_eq!(
+        got, SK_TRANSFORM,
+        "DIV-KM-2: sklearn transform = {SK_TRANSFORM:?}; ferrolearn gave {got:?}"
+    );
+}
