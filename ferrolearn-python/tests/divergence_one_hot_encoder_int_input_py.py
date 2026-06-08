@@ -31,11 +31,6 @@ import ferrolearn as fl
 from sklearn.preprocessing import OneHotEncoder as SkOHE
 
 
-@pytest.mark.skip(
-    reason="divergence: int input silently coerced to f64 -> "
-    "get_feature_names_out 'x0_2.0' vs sklearn 'x0_2' and categories_ float64 "
-    "vs int64; tracking #2228"
-)
 def test_int_input_feature_names_and_categories_dtype_match_sklearn():
     # Integer input. sklearn keeps int64 categories_ and int feature-name labels.
     X = np.array([[2, 0], [5, 1], [9, 0]], dtype=np.int64)

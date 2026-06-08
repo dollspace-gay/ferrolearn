@@ -3670,6 +3670,195 @@ impl RsQuantileTransformer {
     }
 }
 
+// OneHotEncoder (#1155, REQ-8): hand-written pyclass (not the `py_transformer!`
+// macro) because it is STATEFUL with a constructor string→enum knob
+// (`handle_unknown`) AND an `inverse_transform` method AND fitted ATTRIBUTES
+// (`categories_`/`feature_names_out`/`n_features_in_`) — the ragged `categories_`
+// (a Python list of per-feature 1-D arrays) the macro (fit/transform only) cannot
+// express. Over `ferrolearn_preprocess::{OneHotEncoder, FittedOneHotEncoder,
+// OneHotHandleUnknown}`.
+//
+// sklearn's ctor is keyword-only `__init__(self, *, categories="auto", drop=None,
+// sparse_output=True, dtype=np.float64, handle_unknown="error", min_frequency=None,
+// max_categories=None, feature_name_combiner="concat")`
+// (`sklearn/preprocessing/_encoders.py:743-762`). The Python wrapper owns that full
+// 8-key ABI (for `get_params`/`clone` parity); this `_RsOneHotEncoder` takes the
+// single knob the dense numeric path consumes — `handle_unknown` (default "error")
+// — from `_make_rs`. The string is mapped to `OneHotHandleUnknown` via
+// `resolve_handle_unknown`: "error"→`Error`, "ignore"→`Ignore`; the third sklearn
+// option "infrequent_if_exist" (REQ-5 NOT-STARTED #1152) raises `PyNotImplementedError`;
+// any other string is sklearn's `InvalidParameterError` (⊂ ValueError,
+// `_encoders.py:732` `StrOptions({"error","ignore","infrequent_if_exist"})`),
+// surfaced here as `PyValueError`.
+//
+// SCOPE (honest, R-HONEST-3): the core is DENSE-ONLY (sparse output is REQ-2
+// NOT-STARTED #1149). sklearn DEFAULTS `sparse_output=True` (scipy CSR); the
+// `sparse_output=False`/`True` decision is owned by the Python wrapper (a True
+// value raises a clear dense-only error). `drop`/`min_frequency`/`max_categories`/
+// `feature_name_combiner != "concat"`/`categories != "auto"` are also owned by the
+// Python wrapper (a non-default value → `NotImplementedError`). dtype: the core
+// emits f64 categories.
+//
+// `fit(x)` builds `OneHotEncoder::<f64>::new().with_handle_unknown(...)` and runs
+// `.fit(&x, &())` (0 rows / +/-inf → FerroError → `PyValueError`).
+// `transform(x)`/`inverse_transform(x)` delegate to the fitted type
+// (`FittedOneHotEncoder::{transform, inverse_transform}`; unknown-category Error /
+// shape / all-zero → `PyValueError`). In `handle_unknown='ignore'` the inverse of
+// an all-zero block flows through as `NaN` (the None-sentinel, one_hot_encoder.rs
+// #2227). Fitted attributes: `categories_` is the per-feature `&[Vec<f64>]`
+// marshalled as a Python LIST of 1-D f64 numpy arrays (ragged, matching sklearn's
+// `categories_` list-of-arrays, `_encoders.py` `categories_`); `feature_names_out`
+// is `get_feature_names_out()` as a `Vec<String>` (Python list of str);
+// `n_features_in_` is the feature count.
+#[pyclass(name = "_RsOneHotEncoder")]
+pub struct RsOneHotEncoder {
+    handle_unknown: String,
+    // `FittedOneHotEncoder` is re-exported at the crate root
+    // (`ferrolearn-preprocess/src/lib.rs`, `pub use one_hot_encoder::{...}`).
+    fitted: Option<ferrolearn_preprocess::FittedOneHotEncoder<f64>>,
+}
+
+impl RsOneHotEncoder {
+    // Map sklearn's `handle_unknown` string to the closed Rust
+    // `OneHotHandleUnknown` enum. "infrequent_if_exist" is a VALID sklearn option
+    // but ferrolearn does not implement infrequent grouping (REQ-5 NOT-STARTED
+    // #1152) → `PyNotImplementedError`. Any other string is sklearn's
+    // `InvalidParameterError` (⊂ ValueError, `_encoders.py:732`
+    // `StrOptions({"error","ignore","infrequent_if_exist"})`) → `PyValueError`.
+    fn resolve_handle_unknown(
+        handle_unknown: &str,
+    ) -> PyResult<ferrolearn_preprocess::OneHotHandleUnknown> {
+        match handle_unknown {
+            "error" => Ok(ferrolearn_preprocess::OneHotHandleUnknown::Error),
+            "ignore" => Ok(ferrolearn_preprocess::OneHotHandleUnknown::Ignore),
+            "infrequent_if_exist" => Err(pyo3::exceptions::PyNotImplementedError::new_err(
+                "ferrolearn OneHotEncoder does not implement handle_unknown=\
+                 'infrequent_if_exist' (infrequent grouping is REQ-5 NOT-STARTED #1152)",
+            )),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "The 'handle_unknown' parameter of OneHotEncoder must be a str among \
+                 {{'error', 'ignore', 'infrequent_if_exist'}}. Got {other:?} instead."
+            ))),
+        }
+    }
+}
+
+#[pymethods]
+impl RsOneHotEncoder {
+    #[new]
+    #[pyo3(signature = (handle_unknown="error".to_string()))]
+    fn new(handle_unknown: String) -> Self {
+        Self {
+            handle_unknown,
+            fitted: None,
+        }
+    }
+
+    // sklearn `OneHotEncoder.fit(X, y=None)` (`_encoders.py`): learns the
+    // per-feature sorted-unique `categories_`. The bad-`handle_unknown`-string
+    // ValueError / 'infrequent_if_exist' NotImplementedError is surfaced here (the
+    // string→enum map). 0 rows / +/-inf → FerroError → PyValueError.
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let handle = Self::resolve_handle_unknown(&self.handle_unknown)?;
+        let x_nd = numpy2_to_ndarray(x);
+        let model = ferrolearn_preprocess::OneHotEncoder::<f64>::new().with_handle_unknown(handle);
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `OneHotEncoder.transform(X)` (`_encoders.py:1009`): dense one-hot
+    // matrix (per-feature category blocks). Unknown category (handle_unknown=
+    // 'error') / wrong feature count / +/-inf → FerroError → PyValueError.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `OneHotEncoder.inverse_transform(X)` (`_encoders.py:1086`): reduce
+    // each per-feature block to its category via argmax. With handle_unknown=
+    // 'ignore' an all-zero block inverts to `None` in sklearn; the Rust core
+    // represents that as `NaN` (Array2<f64> cannot hold None, one_hot_encoder.rs
+    // #2227). All-zero under 'error' / wrong shape / 0 rows → FerroError →
+    // PyValueError.
+    fn inverse_transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .inverse_transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `categories_` (`_encoders.py`, a LIST of arrays, one per input
+    // feature, each the sorted-unique category set). The Rust core stores it as
+    // `&[Vec<f64>]` (per-feature, ragged), so marshal to a Python LIST of 1-D f64
+    // numpy arrays (ragged — feature blocks can differ in length), mirroring
+    // sklearn's list-of-arrays `categories_`.
+    #[getter]
+    fn categories_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        use pyo3::types::PyList;
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let arrays: Vec<Bound<'py, PyArray1<f64>>> = fitted
+            .categories()
+            .iter()
+            .map(|cats| {
+                let arr = Array1::from_vec(cats.clone());
+                ndarray1_to_numpy(py, &arr)
+            })
+            .collect();
+        PyList::new(py, arrays)
+    }
+
+    // sklearn `get_feature_names_out()` (`_encoders.py:1191`, default
+    // `input_features=None` + `feature_name_combiner="concat"`): `["x0_2.0", ...]`.
+    // The Rust core emits the `Vec<String>` directly (membership-based, the float
+    // label matches Python `str(np.float64)` in the categorical range,
+    // one_hot_encoder.rs `category_label`); marshal to a Python list of str.
+    #[getter]
+    fn feature_names_out(&self) -> PyResult<Vec<String>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.get_feature_names_out())
+    }
+
+    // sklearn `n_features_in_` (`_encoders.py`, set by `_check_n_features`):
+    // number of input features (columns) seen during `fit`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features())
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

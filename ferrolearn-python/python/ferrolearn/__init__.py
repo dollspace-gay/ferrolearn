@@ -54,6 +54,7 @@ from ferrolearn._extras import (
     Normalizer,
     Nystroem,
     OPTICS,
+    OneHotEncoder,
     OrthogonalMatchingPursuit,
     PolynomialFeatures,
     PowerTransformer,
@@ -134,6 +135,7 @@ __all__ = [
     # Preprocess extras
     "Binarizer",
     "Normalizer",
+    "OneHotEncoder",
     "PolynomialFeatures",
     "MinMaxScaler",
     "MaxAbsScaler",

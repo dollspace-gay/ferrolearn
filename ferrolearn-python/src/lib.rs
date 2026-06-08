@@ -93,6 +93,7 @@ fn _ferrolearn_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<extras::RsNormalizer>()?;
     m.add_class::<extras::RsPolynomialFeatures>()?;
     m.add_class::<extras::RsQuantileTransformer>()?;
+    m.add_class::<extras::RsOneHotEncoder>()?;
     m.add_class::<extras::RsMinMaxScaler>()?;
     m.add_class::<extras::RsMaxAbsScaler>()?;
     m.add_class::<extras::RsRobustScaler>()?;

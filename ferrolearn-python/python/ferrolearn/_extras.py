@@ -56,6 +56,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsNormalizer,
     _RsNystroem,
     _RsOPTICS,
+    _RsOneHotEncoder,
     _RsOrthogonalMatchingPursuit,
     _RsPolynomialFeatures,
     _RsPowerTransformer,
@@ -2576,6 +2577,183 @@ class QuantileTransformer(_TransformerWrapper):
     def references_(self):
         check_is_fitted(self, "_rs")
         return np.asarray(self._rs.references_)
+
+    @property
+    def n_features_in_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_features_in_)
+
+
+class OneHotEncoder(_TransformerWrapper):
+    """Encode categorical numeric features as a one-hot dense array, backed by
+    Rust (#1155, REQ-8).
+
+    Mirrors ``sklearn.preprocessing.OneHotEncoder``
+    (``sklearn/preprocessing/_encoders.py:458-1230``) for the DENSE numeric path
+    (``sparse_output=False``). For each input column it learns the sorted-unique
+    category set (``categories_``) and expands each value into a per-feature
+    one-hot block; the blocks are concatenated left-to-right. The constructor
+    mirrors sklearn's KEYWORD-ONLY signature ``__init__(self, *, categories="auto",
+    drop=None, sparse_output=True, dtype=np.float64, handle_unknown="error",
+    min_frequency=None, max_categories=None, feature_name_combiner="concat")``
+    (``_encoders.py:743-762``). All 8 params are held for
+    ``get_params``/``set_params``/``clone`` round-trip; ``handle_unknown`` is the
+    only one threaded into the Rust core via ``_make_rs``.
+
+    STATEFUL: must be ``fit`` before ``transform``/``inverse_transform``/attribute
+    access (``fit`` records ``categories_``/``n_features_in_``). Pre-fit access
+    raises ``NotFittedError`` (via ``check_is_fitted``), matching sklearn.
+
+    Fitted attributes surfaced from the Rust fitted type:
+
+    - ``categories_`` (a LIST of 1-D float arrays, one per input feature,
+      ``_encoders.py`` ``categories_``): the per-feature sorted-unique values;
+    - ``n_features_in_`` (int): number of input feature columns.
+
+    ``get_feature_names_out(input_features=None)`` returns ``['x0_2.0', ...]``
+    (the default ``input_features`` + ``"concat"`` combiner). A non-None
+    ``input_features`` is NOT-STARTED (one_hot_encoder.rs REQ-6) →
+    ``NotImplementedError``.
+
+    SCOPE (honest, R-HONEST-3 — does NOT match sklearn in every regime; the gaps
+    are SURFACED as errors, never silently mismatched):
+
+    - ``sparse_output``: sklearn DEFAULTS ``True`` (returns a scipy CSR matrix);
+      ferrolearn's core is DENSE-ONLY (one_hot_encoder.rs REQ-2 NOT-STARTED #1149).
+      The param is accepted for the ctor ABI / ``get_params`` parity, but a value
+      of ``True`` (the default) raises a clear dense-only error at ``fit`` —
+      ``sparse_output=False`` MUST be passed. (Accepting and silently returning
+      dense while claiming ``sparse_output=True`` would violate R-HONEST-3.)
+    - ``handle_unknown``: ``'error'`` (default) and ``'ignore'`` are supported;
+      ``'infrequent_if_exist'`` (REQ-5 NOT-STARTED #1152) raises
+      ``NotImplementedError``; any other string raises ``ValueError`` (sklearn
+      ``InvalidParameterError ⊂ ValueError``, ``_encoders.py:732``).
+    - ``drop``/``min_frequency``/``max_categories``/``feature_name_combiner !=
+      'concat'``/``categories != 'auto'`` (REQ-5/REQ-7 NOT-STARTED #1152/#1154):
+      accepted for ``get_params`` parity, but a NON-default value raises
+      ``NotImplementedError``.
+    - ``dtype``: the Rust core's categories are f64; the dense output is float64.
+
+    ``inverse_transform``: with ``handle_unknown='ignore'`` an all-zero (unknown)
+    block inverts to ``None`` in sklearn; the f64 Rust ABI represents that as
+    ``NaN`` (Array2<f64> cannot hold ``None``, one_hot_encoder.rs #2227) — the
+    KNOWN feature columns still recover.
+    """
+
+    def __init__(self, *, categories="auto", drop=None, sparse_output=True,
+                 dtype=np.float64, handle_unknown="error", min_frequency=None,
+                 max_categories=None, feature_name_combiner="concat"):
+        self.categories = categories
+        self.drop = drop
+        self.sparse_output = sparse_output
+        self.dtype = dtype
+        self.handle_unknown = handle_unknown
+        self.min_frequency = min_frequency
+        self.max_categories = max_categories
+        self.feature_name_combiner = feature_name_combiner
+
+    def _check_unsupported(self):
+        # Surface the NOT-STARTED scope HONESTLY (R-HONEST-3): a NON-default value
+        # for a param ferrolearn cannot honor raises rather than silently
+        # mismatching sklearn. These are accepted at __init__ purely for
+        # get_params/clone ABI parity.
+        if self.sparse_output:
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder is dense-only; pass sparse_output=False "
+                "(sparse-by-default output is one_hot_encoder.rs REQ-2 NOT-STARTED "
+                "#1149)."
+            )
+        if self.categories != "auto":
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder only supports categories='auto' "
+                "(explicit categories is REQ-7 NOT-STARTED #1154)."
+            )
+        if self.drop is not None:
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder does not support drop (REQ-5 "
+                "NOT-STARTED #1152)."
+            )
+        if self.min_frequency is not None:
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder does not support min_frequency "
+                "(infrequent grouping is REQ-5 NOT-STARTED #1152)."
+            )
+        if self.max_categories is not None:
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder does not support max_categories "
+                "(infrequent grouping is REQ-5 NOT-STARTED #1152)."
+            )
+        if self.feature_name_combiner != "concat":
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder only supports "
+                "feature_name_combiner='concat' (REQ-6 NOT-STARTED)."
+            )
+
+    def _make_rs(self):
+        # `handle_unknown` is the only param threaded into the Rust core. The
+        # bad-string ValueError / 'infrequent_if_exist' NotImplementedError
+        # surfaces from the Rust ctor/fit (`_encoders.py:732` StrOptions).
+        return _RsOneHotEncoder(handle_unknown=self.handle_unknown)
+
+    def fit(self, X, y=None):
+        # STATEFUL fit: validate the unsupported scope (esp. sparse_output, which
+        # defaults to True and MUST be set False), build + fit the Rust core. Do
+        # NOT set `self.n_features_in_` (it is a read-only @property reading from
+        # `self._rs`). `check_is_fitted` keys off `_rs`.
+        self._check_unsupported()
+        # sklearn preserves the INPUT dtype in categories_ and the feature-name
+        # labels (int input -> int64 categories_, 'x0_2'; #2228). The f64 Rust
+        # core only sees float64, so remember the original dtype to cast back.
+        self._fitted_dtype = np.asarray(X).dtype
+        self._rs = self._make_rs()
+        self._rs.fit(_f64(X))
+        return self
+
+    def transform(self, X):
+        # STATEFUL: require a prior fit. sklearn's `transform` calls
+        # `check_is_fitted(self)` (`_encoders.py:1009`), raising NotFittedError
+        # before any work. Guard here (the base wrapper would AttributeError).
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.transform(_f64(X)))
+
+    def inverse_transform(self, X, *, Xt=None):
+        # sklearn `inverse_transform(self, X)` (`_encoders.py:1086`): reduce each
+        # per-feature one-hot block back to its category. NaN marks the
+        # unknown-category (all-zero, handle_unknown='ignore') sentinel (sklearn's
+        # `None`; #2227). `Xt` is sklearn's deprecated alias for `X`.
+        X = _deprecate_Xt_in_inverse_transform(X, Xt)
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.inverse_transform(_f64(X)))
+
+    def get_feature_names_out(self, input_features=None):
+        # sklearn `get_feature_names_out(self, input_features=None)`
+        # (`_encoders.py:1191`): default `input_features=None` uses `["x0", ...]`
+        # + the "concat" combiner -> `['x0_2.0', ...]`. A non-None
+        # `input_features` is one_hot_encoder.rs REQ-6 NOT-STARTED.
+        check_is_fitted(self, "_rs")
+        if input_features is not None:
+            raise NotImplementedError(
+                "ferrolearn OneHotEncoder.get_feature_names_out does not support "
+                "a non-None input_features (one_hot_encoder.rs REQ-6 NOT-STARTED)."
+            )
+        # Generate the names in PYTHON from the dtype-cast categories_ (#2228):
+        # int input -> 'x0_2' (the f64 core would emit 'x0_2.0'), and Python's
+        # str(np.float64) matches sklearn for fractional/extreme values too.
+        return np.asarray(
+            [f"x{j}_{cat}" for j, col in enumerate(self.categories_) for cat in col],
+            dtype=object,
+        )
+
+    @property
+    def categories_(self):
+        check_is_fitted(self, "_rs")
+        raw = [np.asarray(c) for c in self._rs.categories_]
+        # sklearn preserves the input dtype (#2228); the f64 core returns float64.
+        # Cast back to an INTEGER input dtype (the whole-valued categories are
+        # exact); leave float input as float64.
+        if np.issubdtype(self._fitted_dtype, np.integer):
+            return [c.astype(self._fitted_dtype) for c in raw]
+        return raw
 
     @property
     def n_features_in_(self):
