@@ -432,7 +432,6 @@ fn req9_f32_nan_fit_ignored() {
 ///
 /// Tracking: #2206
 #[test]
-#[ignore = "divergence: RobustScaler f32 percentile interp in f32 vs sklearn nanpercentile float64 upcast; tracking #2206"]
 #[allow(
     clippy::excessive_precision,
     reason = "the fixture values are written at full precision precisely BECAUSE \
@@ -456,12 +455,12 @@ fn divergence_f32_nanpercentile_upcasts_to_float64() {
         .unwrap();
 
     // LIVE sklearn 1.5.2 oracle (np.nanpercentile upcasts f32 -> f64, returns
-    // a float64 scale_ == 11.409824218750146). Compare in f64 so the divergence
-    // from sklearn's float64 result is unambiguous (not masked by f32 rounding
-    // of the constant). Tolerance is generous f32-ulp (1e-5); ferrolearn's f32
-    // interp is off by ~3.3e-4, so this assertion FAILS today.
+    // a float64 scale_ == 11.409824218750146). Post-#2206, ferrolearn computes the
+    // percentile interpolation in f64 and stores `scale_` as f64 too (sklearn's
+    // float64 attribute dtype), so `scale()[0]` is already f64 — directly
+    // comparable to sklearn's float64 result within the generous f32-ulp 1e-5.
     let sk_scale_f64: f64 = 11.409_824_218_750_146;
-    let f_scale_f64 = f64::from(fitted.scale()[0]);
+    let f_scale_f64 = fitted.scale()[0];
     assert!(
         (f_scale_f64 - sk_scale_f64).abs() <= 1e-5,
         "f32 scale_: sklearn(float64 nanpercentile)={sk_scale_f64}, \
@@ -580,4 +579,65 @@ fn req7_inverse_inf_rejected() {
             .is_err(),
         "inverse_transform must reject +inf (allow-nan)"
     );
+}
+
+// ===========================================================================
+// #2305-ANALOG residual: f32 transform per-op rounding uses the f64 median
+// instead of sklearn's float32 `center_`.
+//
+// sklearn's `np.nanmedian` of a float32 column returns a *float32* `center_`
+// (`_data.py:1614`); only `np.nanpercentile` upcasts `scale_` to float64
+// (`:1630`,`:1634`). So sklearn's transform computes `X(f32) -= center_(f32)`
+// (`:1672-1673`) — the subtraction operand is the f32-ROUNDED median. ferrolearn
+// stores `median`/`center_` as f64 (the #2206 fix upcast EVERYTHING) and
+// subtracts the UNROUNDED f64 median in `transform` (robust_scaler.rs:522),
+// rounding to f32 only afterward. When the f64 median is not exactly
+// f32-representable, the f32-rounded subtraction result differs by up to a few
+// ULP — exactly the StandardScaler #2305 residual, here on `center_`'s dtype.
+// ===========================================================================
+
+/// Divergence: ferrolearn's `FittedRobustScaler::<f32>::transform`
+/// (`robust_scaler.rs:519-528`) subtracts the **f64** stored median, whereas
+/// scikit-learn subtracts the **float32** `center_` returned by `np.nanmedian`
+/// (`sklearn/preprocessing/_data.py:1614`,`:1672-1673`). For a column whose
+/// f64 median is not exactly f32-representable, sklearn's
+/// `X(f32) -= center_(f32)` rounds the operand FIRST, giving a different f32
+/// result than ferrolearn's `f32(x_f64 - median_f64)`.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   X = np.array([[0.1],[0.2],[0.3],[0.4]], dtype=np.float32)
+///   r = RobustScaler().fit(X)              # center_ dtype == float32, == 0.25
+///                                          # scale_  dtype == float64
+///   r.transform(X.copy())  -> f32 bits (view uint32):
+///     row0 = 3212836864 (-1.0)
+///     row1 = 3198855849 (-0.333333283662796)
+///     row2 = 1051372205 ( 0.33333340287208557)
+///     row3 = 1065353216 ( 1.0)
+/// ferrolearn (f64 median 0.2500000074505806 subtracted, then f32-rounded)
+/// returns row1 == 3198855851, row2 == 1051372203 — 2 ULP off on rows 1 and 2.
+/// (Masked by the 1e-5 tolerance the other f32 tests use; visible only at the
+/// bit level, like the StandardScaler #2305 residual.)
+///
+/// Tracking: #2306
+#[test]
+#[ignore = "divergence: f32 transform subtracts f64 median, not sklearn's f32 center_ (#2305-analog); tracking #2306"]
+fn divergence_f32_transform_uses_f64_median_not_f32_center() {
+    let x = array![[0.1f32], [0.2], [0.3], [0.4]];
+    let fitted = RobustScaler::<f32>::new().fit(&x, &()).unwrap();
+    let out = fitted.transform(&x).unwrap();
+
+    // LIVE sklearn 1.5.2 oracle f32 transform bits (np.nanmedian center_ is
+    // float32 == 0.25; X(f32) -= center_(f32) rounds the operand first).
+    let sk_bits: [u32; 4] = [3_212_836_864, 3_198_855_849, 1_051_372_205, 1_065_353_216];
+    for i in 0..4 {
+        let got = out[[i, 0]].to_bits();
+        assert_eq!(
+            got, sk_bits[i],
+            "f32 transform row {i}: sklearn bits {} ({}), ferrolearn bits {} ({})",
+            sk_bits[i],
+            f32::from_bits(sk_bits[i]),
+            got,
+            out[[i, 0]]
+        );
+    }
 }
