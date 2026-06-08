@@ -1933,6 +1933,34 @@ py_classifier!(
     }
 );
 
+// QDA decision_function (REQ-7 #581): the `py_classifier!` macro exposes only
+// fit/predict, so a SECOND `#[pymethods]` block (requires pyo3
+// `multiple-pymethods`, mirroring the discrete-NB attr pattern above) adds the
+// raw `(n_samples, n_classes)` SVD log-posterior from the stored `FittedQDA`
+// (`FittedQDA::decision_function`, qda.rs:411). The binary `(n,)` collapse
+// (`dec_func[:, 1] - dec_func[:, 0]`, discriminant_analysis.py:998-1002) happens
+// in the `_extras.py::QuadraticDiscriminantAnalysis.decision_function` override,
+// keeping this method the verbatim Rust shape. Not-fitted → `PyRuntimeError`
+// (same path as `predict`); FerroError → `PyValueError` (no panic).
+#[pymethods]
+impl RsQDA {
+    fn decision_function<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let dec = fitted
+            .decision_function(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &dec))
+    }
+}
+
 // ===========================================================================
 // Bayes (extras)
 // ===========================================================================

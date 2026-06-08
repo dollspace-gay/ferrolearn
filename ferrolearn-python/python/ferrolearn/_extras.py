@@ -12,6 +12,7 @@ from sklearn.base import (
     RegressorMixin,
     TransformerMixin,
 )
+from sklearn.utils import check_array
 from sklearn.utils.deprecation import _deprecate_Xt_in_inverse_transform
 from sklearn.utils.validation import check_is_fitted
 
@@ -1315,6 +1316,34 @@ class QuadraticDiscriminantAnalysis(_ClassifierWrapper):
 
     def _make_rs(self):
         return _RsQDA(reg_param=self.reg_param)
+
+    def decision_function(self, X):
+        """QDA decision function (REQ-7 #581, sklearn
+        discriminant_analysis.py:978-1002).
+
+        The Rust `_RsQDA.decision_function` returns the raw per-class SVD
+        log-posterior `(n_samples, n_classes)` (FittedQDA::decision_function,
+        qda.rs:411). sklearn collapses the binary case to the `(n_samples,)`
+        log-likelihood ratio of the positive class `class_[1]`
+        (`dec_func[:, 1] - dec_func[:, 0]`, discriminant_analysis.py:1000-1001);
+        the multiclass case is returned verbatim. This override is QDA-specific
+        (the other `_ClassifierWrapper` subclasses have no raw-score accessor /
+        different decision_function semantics).
+        """
+        check_is_fitted(self)
+        # sklearn's QDA `decision_function` routes through
+        # `self._validate_data(X, reset=False)` (discriminant_analysis.py:967),
+        # which defaults to `force_all_finite=True` and `ensure_min_samples=1`:
+        # non-finite or zero-row X is rejected with a ValueError BEFORE any score
+        # is computed (#2254 NaN/Inf, #2255 empty X). Mirror that with the SAME
+        # `check_array` call (input_name="X" + estimator=self give byte-for-byte
+        # message parity with the live sklearn 1.5.2 oracle).
+        check_array(X, input_name="X", estimator=self,
+                    ensure_min_samples=1, dtype=np.float64)
+        raw = np.asarray(self._rs.decision_function(_f64(X)))
+        if raw.ndim == 2 and raw.shape[1] == 2:
+            return raw[:, 1] - raw[:, 0]
+        return raw
 
 
 class _DiscreteNBWrapper(_ClassifierWrapper):

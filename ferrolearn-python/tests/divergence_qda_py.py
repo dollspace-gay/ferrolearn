@@ -148,9 +148,6 @@ def test_decision_function_before_fit_raises():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skip(reason="divergence: QDA.decision_function accepts NaN/Inf X "
-                         "(returns scores) where sklearn raises ValueError; "
-                         "tracking #2254")
 def test_decision_function_nan_input_raises_like_sklearn():
     """sklearn rejects non-finite X in `decision_function`
     (`discriminant_analysis.py:967` `_validate_data(reset=False)` ->
@@ -172,9 +169,6 @@ def test_decision_function_nan_input_raises_like_sklearn():
         f.decision_function(Xn)
 
 
-@pytest.mark.skip(reason="divergence: QDA.decision_function accepts Inf X "
-                         "(returns scores) where sklearn raises ValueError; "
-                         "tracking #2254")
 def test_decision_function_inf_input_raises_like_sklearn():
     """sklearn rejects +/-Inf X in `decision_function`
     (`discriminant_analysis.py:967` `_validate_data(reset=False)`):
@@ -192,9 +186,6 @@ def test_decision_function_inf_input_raises_like_sklearn():
         f.decision_function(Xi)
 
 
-@pytest.mark.skip(reason="divergence: QDA.decision_function returns (0,) on "
-                         "0-row X where sklearn raises ValueError (min 1 "
-                         "sample); tracking #2255")
 def test_decision_function_empty_X_raises_like_sklearn():
     """sklearn's `_validate_data` enforces ``ensure_min_samples=1``, so a
     0-row X raises ``ValueError("Found array with 0 sample(s) ... a minimum
