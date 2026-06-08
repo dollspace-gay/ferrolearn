@@ -57,6 +57,7 @@
 //! | REQ-7 | Novelty `available_if` method gating (`_lof.py:221-227,:322-331,:385-396,:426-436`) | NOT-STARTED (#851) |
 //! | REQ-8 | PyO3 binding + meta-crate re-export | NOT-STARTED (#852) |
 //! | REQ-9 | ferray array substrate (currently `ndarray` + `num-traits`) | NOT-STARTED (#853) |
+//! | REQ-10 | non-finite input rejected | SHIPPED | `Fit::fit for LocalOutlierFactor` rejects any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) AFTER the `n_neighbors`/`contamination` constructor-param checks but BEFORE the `n_samples < 2` check and the LOF pipeline — mirroring sklearn's `@_fit_context` `estimator._validate_params()` (`sklearn/base.py:1466`) running BEFORE the `fit` body's `_validate_data` (unsupervised `X = self._validate_data(X, accept_sparse="csr", order="C")`, `_base.py:517`, `force_all_finite=True` → `ValueError`). So `n_neighbors=0` + NaN X raises on `n_neighbors` (#2273). The QUERY path also guards: `fn compute_lof` (the kernel behind `predict`/`score_samples`/`decision_function` on NEW data) rejects a non-finite query X with the same `InvalidParameter { name: "X" }` BEFORE the brute-force k-NN — a NaN distance previously reached the new-data sort `partial_cmp(...).unwrap()` and PANICKED (R-CODE-2, #2274). Unsupervised → X only. `LocalOutlierFactor::fit_predict` routes through `fit` (no separate validation arm), so it inherits the fit guard, matching sklearn's `fit_predict` → `fit` (`_lof.py:231-256`). Finite path byte-identical (guard never fires on finite input — all in-tree tests unchanged). Non-test consumer: the existing `Fit::fit` / crate re-export consumers. Verified vs live sklearn 1.5.2 (R-CHAR-3): `LocalOutlierFactor().fit` AND `.fit_predict` raise `ValueError` for NaN/+inf/-inf in X (`tests/divergence_neighbors_nonfinite.rs::lof_*`); param-before-finiteness `tests/divergence_neighbors_nonfinite_param_order.rs::lof_param_before_finiteness_order` (#2273). (#2272, #2273, #2274) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -336,6 +337,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor
     ///   `contamination` is a `Fraction` not in `(0, 0.5]`.
     /// - [`FerroError::InsufficientSamples`] if there are fewer than 2 samples.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedLocalOutlierFactor<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `_validate_data(...)` finiteness check (`:1472` → `self._fit(X)`,
+        // `sklearn/neighbors/_lof.py:279`). So the `n_neighbors == 0` and
+        // `contamination` constructor-param checks precede the finiteness guard;
+        // a doubly-degenerate input (`n_neighbors=0` AND NaN X) raises on
+        // `n_neighbors`, not the data. (#2273)
         let n_samples = x.nrows();
 
         if self.n_neighbors == 0 {
@@ -354,6 +363,23 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LocalOutlierFactor
             return Err(FerroError::InvalidParameter {
                 name: "contamination".into(),
                 reason: "must be in (0, 0.5]".into(),
+            });
+        }
+
+        // Unsupervised, so `_fit` takes the no-`requires_y` branch
+        // `X = self._validate_data(X, accept_sparse="csr", order="C")`
+        // (`sklearn/neighbors/_base.py:517`), default `force_all_finite=True` →
+        // `check_array` rejects any NaN/+/-inf in X with a `ValueError` AFTER
+        // param validation (above) and BEFORE the LOF pipeline. `.iter().any(|v|
+        // !v.is_finite())` rejects NaN and Inf (bounds-safe, no panic, R-CODE-2).
+        // Unsupervised → X only. `LocalOutlierFactor::fit_predict` calls this
+        // `fit` (then `predict`), so it inherits the guard — no separate arm to
+        // patch (sklearn `fit_predict` likewise routes through `fit`,
+        // `_lof.py:231-256`). (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -480,6 +506,21 @@ impl<F: Float + Send + Sync + 'static> FittedLocalOutlierFactor<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `LocalOutlierFactor.predict` /
+        // `score_samples` / `decision_function` re-validate the query X via
+        // `check_array(X, accept_sparse="csr")` (`_lof.py:347`/`:418`,
+        // `force_all_finite=True`) → `ValueError` on a non-finite query. Without
+        // this guard a NaN distance would reach the new-data sort
+        // (`partial_cmp(...).unwrap()`) and PANIC (R-CODE-2 violation). Guarding
+        // here covers `predict`, `score_samples`, and `decision_function`, which
+        // all route through `compute_lof`. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

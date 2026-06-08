@@ -73,6 +73,7 @@
 //! | REQ-12 | clf no-neighbor error type/message: sklearn raises `ValueError("No neighbors found for test samples %r, ...")` (`_classification.py:781-787`); `fn predict`/`pub fn predict_proba` empty branch raise `FerroError::InvalidParameter` with a different message (type/message surfaces at the PyO3 boundary). | NOT-STARTED (#886) |
 //! | REQ-13 | PyO3 binding + meta-crate re-export: no `RsRadiusNeighbors{Classifier,Regressor}` in `ferrolearn-python/src/` (verified absent by `grep -ni radiusneighbors`) and no meta-crate re-export; `import ferrolearn` cannot construct either estimator. | NOT-STARTED (#887) |
 //! | REQ-14 | ferray substrate: `radius_neighbors.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#888) |
+//! | REQ-15 | non-finite input rejected: both `Fit::fit for RadiusNeighborsClassifier` (X only — labels are integer `Array1<usize>`) and `Fit::fit for RadiusNeighborsRegressor` (X AND float `Array1<F>` y) reject any NaN/+/-inf with `FerroError::InvalidParameter { name: "X"/"y", reason: "Input X/y contains NaN or infinity." }` AFTER the `radius < 0` constructor-param check (radius=0 is valid, `_base.py:397`, #2275) but BEFORE the length/sample checks and the spatial-index build — mirroring sklearn's `@_fit_context` `estimator._validate_params()` (`sklearn/base.py:1466`) running BEFORE the `fit` body's `self._validate_data(X, y, ...)` (`sklearn/neighbors/_base.py:475`, `force_all_finite=True` → `ValueError`). So `radius<0` + NaN X raises on `radius` (#2273); `radius=0` + NaN X falls through to the finiteness guard and raises on `X` (#2275). The QUERY path also guards: `fn predict` (clf + reg), `pub fn predict_proba`, and `pub(crate) fn radius_neighbors_impl` reject a non-finite query X with the same `InvalidParameter { name: "X" }` BEFORE the radius search, mirroring `RadiusNeighborsMixin.radius_neighbors`'s `_validate_data(X, ..., reset=False)` (`sklearn/neighbors/_base.py:824` analog) — a NaN query previously yielded a silent empty neighborhood (outlier_label/`np.nan` value) rather than sklearn's clean `ValueError` (#2274). `.iter().any(\|v\| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — all in-tree tests unchanged). Non-test consumers: the existing `Fit::fit` / pipeline `fit_pipeline` / `graph.rs radius_neighbors_graph` consumers. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `RadiusNeighbors{Classifier,Regressor}().fit` raise `ValueError` for NaN/+inf/-inf in X (and NaN/inf in regressor y) — `tests/divergence_neighbors_nonfinite.rs::radius_*`. | SHIPPED (#2272, #2273, #2274) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -316,13 +317,43 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>>
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of samples in
     /// `x` and `y` differ.
-    /// Returns [`FerroError::InvalidParameter`] if `radius` is non-positive.
+    /// Returns [`FerroError::InvalidParameter`] if `radius` is negative.
     /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
     fn fit(
         &self,
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedRadiusNeighborsClassifier<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `self._validate_data(X, y, ...)` finiteness check
+        // (`:1472` → `NeighborsBase._fit`, `sklearn/neighbors/_base.py:475`). So
+        // the `radius` constructor-param constraint is checked BEFORE the
+        // finiteness guard; a doubly-degenerate input (`radius<=0` AND NaN X)
+        // raises on `radius`, not the data. (#2273) sklearn's constraint is
+        // `Interval(Real, 0, None, closed="both")` (`sklearn/neighbors/_base.py:397`),
+        // so `radius == 0` is VALID — only a NEGATIVE radius is rejected. (#2275)
+        if self.radius < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "radius".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
+
+        // `_validate_data` keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN/+/-inf in X with a `ValueError` AFTER
+        // param validation (above) and BEFORE the index/classes are built.
+        // `.iter().any(|v| !v.is_finite())` rejects NaN and Inf (bounds-safe, no
+        // panic, R-CODE-2). `y` is integer `Array1<usize>`, always finite, so
+        // only X is guarded here. (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         let n_samples = x.nrows();
 
         if n_samples != y.len() {
@@ -330,13 +361,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>>
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if self.radius <= F::zero() {
-            return Err(FerroError::InvalidParameter {
-                name: "radius".into(),
-                reason: "must be positive".into(),
             });
         }
 
@@ -391,6 +415,19 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRadiusNeighb
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `RadiusNeighborsMixin
+        // .radius_neighbors` re-validates the query X via
+        // `self._validate_data(X, ..., reset=False)`
+        // (`sklearn/neighbors/_base.py:824` analog, `force_all_finite=True`), so a
+        // NaN/inf query raises `ValueError` before the search rather than
+        // silently producing an empty neighborhood (→ outlier_label/error). (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -500,6 +537,16 @@ impl<F: Float + Send + Sync + 'static> FittedRadiusNeighborsClassifier<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard (see `predict`): sklearn re-validates the
+        // query X (`_validate_data(..., reset=False)`, `force_all_finite=True`)
+        // so a NaN/inf query raises before the search. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -627,10 +674,25 @@ pub(crate) fn radius_neighbors_impl<F: Float + Send + Sync + 'static>(
             context: "number of features must match training data".into(),
         });
     }
-    if radius <= F::zero() {
+    // Query-time finiteness guard: sklearn `RadiusNeighborsMixin
+    // .radius_neighbors` re-validates the query X via
+    // `self._validate_data(X, ..., reset=False)` (`force_all_finite=True`,
+    // `sklearn/neighbors/_base.py:824` analog), so a NaN/inf query raises before
+    // the search rather than silently returning an empty per-row set. (#2274)
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    // sklearn's `radius` constraint is `Interval(Real, 0, None, closed="both")`
+    // (`sklearn/neighbors/_base.py:397`): `radius == 0` is VALID (a 0-radius
+    // search returns only exact-coincident points, distance `<= 0`); only a
+    // NEGATIVE radius is rejected. (#2275)
+    if radius < F::zero() {
         return Err(FerroError::InvalidParameter {
             name: "radius".into(),
-            reason: "must be positive".into(),
+            reason: "must be non-negative".into(),
         });
     }
 
@@ -789,13 +851,49 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for RadiusNeigh
     ///
     /// Returns [`FerroError::ShapeMismatch`] if the number of samples in
     /// `x` and `y` differ.
-    /// Returns [`FerroError::InvalidParameter`] if `radius` is non-positive.
+    /// Returns [`FerroError::InvalidParameter`] if `radius` is negative.
     /// Returns [`FerroError::InsufficientSamples`] if there are no samples.
     fn fit(
         &self,
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<FittedRadiusNeighborsRegressor<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `self._validate_data(X, y, ...)` finiteness check
+        // (`:1472` → `NeighborsBase._fit`, `sklearn/neighbors/_base.py:475`). So
+        // the `radius` constructor-param constraint precedes the finiteness
+        // guard; a doubly-degenerate input (`radius<=0` AND NaN X) raises on
+        // `radius`, not the data. (#2273) sklearn's constraint is
+        // `Interval(Real, 0, None, closed="both")` (`sklearn/neighbors/_base.py:397`),
+        // so `radius == 0` is VALID — only a NEGATIVE radius is rejected. (#2275)
+        if self.radius < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "radius".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
+
+        // `_validate_data` keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN/+/-inf in X OR (float) y with a
+        // `ValueError` AFTER param validation (above) and BEFORE the index is
+        // built. `.iter().any(|v| !v.is_finite())` rejects NaN and Inf
+        // (bounds-safe, no panic, R-CODE-2). The regressor `y` is `Array1<F>`
+        // (float targets), so both X and y are guarded. (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
         let n_samples = x.nrows();
 
         if n_samples != y.len() {
@@ -803,13 +901,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for RadiusNeigh
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if self.radius <= F::zero() {
-            return Err(FerroError::InvalidParameter {
-                name: "radius".into(),
-                reason: "must be positive".into(),
             });
         }
 
@@ -862,6 +953,20 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedRadiusNeighb
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `RadiusNeighborsMixin
+        // .radius_neighbors` re-validates the query X via
+        // `self._validate_data(X, ..., reset=False)`
+        // (`sklearn/neighbors/_base.py:824` analog, `force_all_finite=True`), so a
+        // NaN/inf query raises `ValueError` before the search. Distinct from the
+        // empty-neighborhood `np.nan` value path below (which is for FINITE
+        // queries with no in-radius neighbor). (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -1098,8 +1203,11 @@ mod tests {
     #[test]
     fn test_classifier_invalid_radius() {
         let (x, y) = clf_train_data();
+        // sklearn's `radius` interval is `Interval(Real, 0, None, closed="both")`
+        // (`sklearn/neighbors/_base.py:397`): radius=0 is VALID (fits), only a
+        // negative radius raises. (#2275)
         let clf = RadiusNeighborsClassifier::<f64>::new().with_radius(0.0);
-        assert!(clf.fit(&x, &y).is_err());
+        assert!(clf.fit(&x, &y).is_ok());
 
         let clf_neg = RadiusNeighborsClassifier::<f64>::new().with_radius(-1.0);
         assert!(clf_neg.fit(&x, &y).is_err());
@@ -1323,8 +1431,10 @@ mod tests {
         let x = Array2::from_shape_vec((3, 1), vec![1.0, 2.0, 3.0]).unwrap();
         let y = array![1.0, 2.0, 3.0];
 
+        // radius=0 is VALID per sklearn's closed-both `[0, inf)` interval
+        // (`sklearn/neighbors/_base.py:397`); only a negative radius raises. (#2275)
         let reg = RadiusNeighborsRegressor::<f64>::new().with_radius(0.0);
-        assert!(reg.fit(&x, &y).is_err());
+        assert!(reg.fit(&x, &y).is_ok());
 
         let reg_neg = RadiusNeighborsRegressor::<f64>::new().with_radius(-1.0);
         assert!(reg_neg.fit(&x, &y).is_err());

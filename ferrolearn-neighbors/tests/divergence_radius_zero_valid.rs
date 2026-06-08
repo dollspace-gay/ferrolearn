@@ -56,7 +56,6 @@ fn x_nan() -> Array2<f64> {
 /// (`radius_neighbors.rs:335`).
 /// Tracking: #2275
 #[test]
-#[ignore = "divergence: sklearn radius=0 is a VALID param (Interval closed=both, _base.py:397); ferrolearn rejects radius<=0; tracking #2275"]
 fn radius_classifier_zero_finite_fits_in_sklearn() {
     let y: Array1<usize> = array![0usize, 0, 1];
     let res = RadiusNeighborsClassifier::<f64>::new()
@@ -74,7 +73,6 @@ fn radius_classifier_zero_finite_fits_in_sklearn() {
 /// (A) regressor: `radius=0` + finite X — sklearn fits; ferrolearn errors.
 /// Tracking: #2275
 #[test]
-#[ignore = "divergence: sklearn radius=0 is a VALID param (Interval closed=both, _base.py:397); ferrolearn rejects radius<=0; tracking #2275"]
 fn radius_regressor_zero_finite_fits_in_sklearn() {
     let y: Array1<f64> = array![0.0f64, 0.0, 1.0];
     let res = RadiusNeighborsRegressor::<f64>::new()
@@ -95,7 +93,6 @@ fn radius_regressor_zero_finite_fits_in_sklearn() {
 /// `InvalidParameter { name: "radius", .. }`.
 /// Tracking: #2275
 #[test]
-#[ignore = "divergence: radius=0 valid in sklearn so NaN X gives finiteness err (name=X); ferrolearn gives radius param err; tracking #2275"]
 fn radius_classifier_zero_nan_is_finiteness_error_not_radius() {
     let y: Array1<usize> = array![0usize, 0, 1];
     let err = RadiusNeighborsClassifier::<f64>::new()
@@ -110,6 +107,49 @@ fn radius_classifier_zero_nan_is_finiteness_error_not_radius() {
             "sklearn raises the finiteness ValueError(Input X contains NaN.) for \
              radius=0 + NaN (radius=0 is a valid param, _base.py:397); ferrolearn \
              named `{name}` (the spurious radius<=0 check fired first)"
+        ),
+        other => panic!("expected InvalidParameter, got {other:?}"),
+    }
+}
+
+/// Boundary: a NEGATIVE radius is STILL rejected (only `radius >= 0` is valid).
+/// sklearn's interval is `Interval(Real, 0, None, closed="both")`
+/// (`sklearn/neighbors/_base.py:397`): `radius=-1.0` raises
+/// `InvalidParameterError` (`The 'radius' parameter ... must be a float in the
+/// range [0, inf)`). ferrolearn must keep returning the `radius` param error for
+/// a negative radius — the #2275 loosening (`<=` → `<`) must not over-loosen.
+/// Tracking: #2275
+#[test]
+fn radius_classifier_negative_still_rejected() {
+    let y: Array1<usize> = array![0usize, 0, 1];
+    let err = RadiusNeighborsClassifier::<f64>::new()
+        .with_radius(-1.0)
+        .fit(&x_finite(), &y)
+        .expect_err("sklearn raises InvalidParameterError for radius=-1.0");
+    match err {
+        FerroError::InvalidParameter { name, .. } => assert_eq!(
+            name, "radius",
+            "negative radius is out of sklearn's [0, inf) interval (_base.py:397); \
+             ferrolearn named `{name}`"
+        ),
+        other => panic!("expected InvalidParameter, got {other:?}"),
+    }
+}
+
+/// Boundary (regressor): a NEGATIVE radius is STILL rejected.
+/// Tracking: #2275
+#[test]
+fn radius_regressor_negative_still_rejected() {
+    let y: Array1<f64> = array![0.0f64, 0.0, 1.0];
+    let err = RadiusNeighborsRegressor::<f64>::new()
+        .with_radius(-1.0)
+        .fit(&x_finite(), &y)
+        .expect_err("sklearn raises InvalidParameterError for radius=-1.0");
+    match err {
+        FerroError::InvalidParameter { name, .. } => assert_eq!(
+            name, "radius",
+            "negative radius is out of sklearn's [0, inf) interval (_base.py:397); \
+             ferrolearn named `{name}`"
         ),
         other => panic!("expected InvalidParameter, got {other:?}"),
     }

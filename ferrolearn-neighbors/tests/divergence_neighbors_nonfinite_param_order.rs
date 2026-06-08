@@ -40,12 +40,12 @@
 //! Every expected behavior is the LIVE sklearn oracle (goal.md R-CHAR-3),
 //! NEVER copied from the ferrolearn side.
 
-use ferrolearn_core::error::FerroError;
 use ferrolearn_core::Fit;
+use ferrolearn_core::error::FerroError;
 use ferrolearn_neighbors::{
     KNeighborsClassifier, LocalOutlierFactor, NearestCentroid, NearestNeighbors,
 };
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 /// 3-point fixture with a NaN in X[0,0] (so the data is non-finite).
 fn x_nan() -> Array2<f64> {
@@ -64,7 +64,6 @@ fn y3() -> Array1<usize> {
 /// `InvalidParameter { name: "X" }`.
 /// Tracking: #2273
 #[test]
-#[ignore = "divergence: neighbors param-validation must precede finiteness (sklearn base.py:1466); tracking #2273"]
 fn knn_classifier_param_before_finiteness_order() {
     let err = KNeighborsClassifier::<f64>::new()
         .with_n_neighbors(0)
@@ -89,7 +88,6 @@ fn knn_classifier_param_before_finiteness_order() {
 /// returns `InvalidParameter { name: "X" }`.
 /// Tracking: #2273
 #[test]
-#[ignore = "divergence: neighbors param-validation must precede finiteness (sklearn base.py:1466); tracking #2273"]
 fn nearest_neighbors_param_before_finiteness_order() {
     let err = NearestNeighbors::<f64>::new()
         .with_n_neighbors(0)
@@ -112,7 +110,6 @@ fn nearest_neighbors_param_before_finiteness_order() {
 /// `InvalidParameter { name: "X" }`.
 /// Tracking: #2273
 #[test]
-#[ignore = "divergence: neighbors param-validation must precede finiteness (sklearn base.py:1466); tracking #2273"]
 fn lof_param_before_finiteness_order() {
     let err = LocalOutlierFactor::<f64>::new()
         .with_n_neighbors(0)
@@ -136,7 +133,6 @@ fn lof_param_before_finiteness_order() {
 /// returns `InvalidParameter { name: "X" }`.
 /// Tracking: #2273
 #[test]
-#[ignore = "divergence: neighbors param-validation must precede finiteness (sklearn base.py:1466); tracking #2273"]
 fn nearest_centroid_param_before_finiteness_order() {
     let err = NearestCentroid::<f64>::new()
         .with_shrink_threshold(0.0)

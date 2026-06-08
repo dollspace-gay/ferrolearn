@@ -73,6 +73,7 @@
 //! | REQ-10 | constructor params + callable weights: `leaf_size=30`/`p=2`/`metric='minkowski'`/`metric_params=None`/`n_jobs=None` (`_classification.py:199-203`) and `weights` as a callable (`:190`). `KNeighbors{Classifier,Regressor}` have only `n_neighbors`/`algorithm`/`weights ∈ {Uniform, Distance}` — Euclidean-only, no callable variant. | NOT-STARTED (#876) |
 //! | REQ-11 | PyO3 surface under-exposed: bind `predict_proba`/classifier-`score`/`weights`/`algorithm` on `_RsKNeighborsClassifier` and `weights` on `_RsKNeighborsRegressor`. The bindings exist but expose only fit/predict(/classes_); distance-weighting and `predict_proba` are unreachable from `import ferrolearn`. | NOT-STARTED (#877) |
 //! | REQ-12 | ferray substrate: `knn.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#878) |
+//! | REQ-13 | non-finite input rejected: both `Fit::fit for KNeighborsClassifier` (X only — labels are integer `Array1<usize>`) and `Fit::fit for KNeighborsRegressor` (X AND float `Array1<F>` y) reject any NaN/+/-inf with `FerroError::InvalidParameter { name: "X"/"y", reason: "Input X/y contains NaN or infinity." }` AFTER the `n_neighbors == 0` constructor-param check but BEFORE the length checks and the spatial-index build — mirroring sklearn's `@_fit_context` `estimator._validate_params()` (`sklearn/base.py:1466`) running BEFORE the `fit` body's `_validate_data(X, y, ...)` finiteness check (`sklearn/neighbors/_base.py:475`, `force_all_finite=True` → `ValueError`). So a doubly-degenerate input (`n_neighbors=0` AND NaN X) raises on `n_neighbors`, matching the oracle (#2273). The QUERY path also guards: `fn predict` (clf + reg), `pub fn predict_proba`, and `pub(crate) fn kneighbors_impl` reject a non-finite query X with the same `InvalidParameter { name: "X" }` BEFORE the neighbor search, mirroring `KNeighborsMixin.kneighbors`'s `_validate_data(X, ..., reset=False)` (`sklearn/neighbors/_base.py:824`) — a NaN query previously PANICKED via an OOB neighbor index `y_train[usize::MAX]` (R-CODE-2 release-blocker, #2274). `.iter().any(\|v\| !v.is_finite())` catches NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — all in-tree tests unchanged). Non-test consumers: the existing `Fit::fit` / `_RsKNeighborsClassifier` / `_RsKNeighborsRegressor` / pipeline `fit_pipeline` consumers. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `KNeighbors{Classifier,Regressor}().fit` raise `ValueError` for NaN/+inf/-inf in X (and NaN/inf in regressor y) — `tests/divergence_neighbors_nonfinite.rs::knn_*`; param-before-finiteness order `tests/divergence_neighbors_nonfinite_param_order.rs::knn_classifier_param_before_finiteness_order` (#2273); predict NaN/inf query → Err not panic `tests/divergence_neighbors_predict_nonfinite.rs::knn_predict_{nan,inf}_query_returns_err_not_panic` (#2274). | SHIPPED (#2272, #2273, #2274) |
 
 use std::any::TypeId;
 
@@ -781,6 +782,36 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedKNeighborsClassifier<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `self._validate_data(X, y, ...)` finiteness check
+        // (`:1472` → `NeighborsBase._fit`, `sklearn/neighbors/_base.py:475`).
+        // So for a doubly-degenerate input (invalid `n_neighbors` AND NaN/inf in
+        // X), sklearn raises `InvalidParameterError` naming `n_neighbors`, NOT the
+        // data-finiteness `ValueError`. The `n_neighbors == 0` constructor-param
+        // check therefore precedes the finiteness guard. (#2273)
+        if self.n_neighbors == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "n_neighbors".into(),
+                reason: "must be at least 1".into(),
+            });
+        }
+
+        // sklearn `_validate_data` keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN or +/-inf in X with a `ValueError` BEFORE
+        // the index is built, but AFTER param validation (above) and BEFORE the
+        // data-shape/class checks (below). `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2). `y` is
+        // `Array1<usize>` (integer labels), always finite, so only X is guarded
+        // here. (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         let n_samples = x.nrows();
 
         if n_samples != y.len() {
@@ -788,13 +819,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for KNeighb
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if self.n_neighbors == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_neighbors".into(),
-                reason: "must be at least 1".into(),
             });
         }
 
@@ -847,6 +871,20 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsCl
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard. sklearn `KNeighborsMixin.kneighbors`
+        // re-validates the query X with `self._validate_data(X, ..., reset=False)`
+        // (`sklearn/neighbors/_base.py:824`), keeping `force_all_finite=True`, so
+        // a NaN/inf query raises `ValueError` BEFORE the neighbor search. Without
+        // this guard a NaN query flows into the kd_tree/heap search and yields an
+        // out-of-bounds neighbor index (`usize::MAX`), then `y_train[idx]` PANICS
+        // (R-CODE-2 violation). Return a clean `Err` instead. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -983,6 +1021,17 @@ impl<F: Float + Send + Sync + 'static> FittedKNeighborsClassifier<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard (see `predict`): sklearn re-validates the
+        // query X (`_validate_data(..., reset=False)`,
+        // `sklearn/neighbors/_base.py:824`) so a NaN/inf query raises before the
+        // neighbor search rather than producing an OOB index panic. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -1222,6 +1271,41 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
         x: &Array2<F>,
         y: &Array1<F>,
     ) -> Result<FittedKNeighborsRegressor<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `self._validate_data(X, y, ...)` finiteness check
+        // (`:1472` → `NeighborsBase._fit`, `sklearn/neighbors/_base.py:475`). So
+        // the `n_neighbors == 0` constructor-param check precedes the finiteness
+        // guard; a doubly-degenerate input (invalid `n_neighbors` AND NaN/inf)
+        // raises on `n_neighbors`, not the data. (#2273)
+        if self.n_neighbors == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "n_neighbors".into(),
+                reason: "must be at least 1".into(),
+            });
+        }
+
+        // `_validate_data` keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN or +/-inf in X OR (float) y with a
+        // `ValueError` BEFORE the index is built, AFTER param validation (above)
+        // and BEFORE the length check (below). `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2). The
+        // regressor `y` is `Array1<F>` (float targets), so both X and y are
+        // guarded. (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
         let n_samples = x.nrows();
 
         if n_samples != y.len() {
@@ -1229,13 +1313,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KNeighborsR
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if self.n_neighbors == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_neighbors".into(),
-                reason: "must be at least 1".into(),
             });
         }
 
@@ -1282,6 +1359,17 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKNeighborsRe
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard (see classifier `predict`): sklearn
+        // re-validates the query X (`_validate_data(..., reset=False)`,
+        // `sklearn/neighbors/_base.py:824`) so a NaN/inf query raises before the
+        // neighbor search rather than producing an OOB index panic. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -1446,6 +1534,17 @@ pub(crate) fn kneighbors_impl<F: Float + Send + Sync + 'static>(
             expected: vec![train_features],
             actual: vec![n_features],
             context: "number of features must match training data".into(),
+        });
+    }
+    // Query-time finiteness guard: sklearn `KNeighborsMixin.kneighbors`
+    // re-validates the query X with `self._validate_data(X, ..., reset=False)`
+    // (`sklearn/neighbors/_base.py:824`, `force_all_finite=True`), so a NaN/inf
+    // query raises `ValueError` before the neighbor search. Without it a NaN
+    // would flow into the heap/kd_tree search and yield an OOB index. (#2274)
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
         });
     }
     if n_neighbors == 0 {

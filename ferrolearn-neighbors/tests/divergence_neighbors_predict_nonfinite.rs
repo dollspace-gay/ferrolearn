@@ -31,8 +31,8 @@
 
 use ferrolearn_core::{Fit, Predict};
 use ferrolearn_neighbors::KNeighborsClassifier;
-use ndarray::{array, Array2};
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use ndarray::{Array2, array};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 
 fn fitted() -> ferrolearn_neighbors::FittedKNeighborsClassifier<f64> {
     let x = array![[0.0f64, 0.0], [1.0, 1.0], [5.0, 5.0], [6.0, 6.0]];
@@ -51,7 +51,6 @@ fn fitted() -> ferrolearn_neighbors::FittedKNeighborsClassifier<f64> {
 /// into the kd_tree search.
 /// Tracking: #2274
 #[test]
-#[ignore = "release-blocker: predict-time NaN panics (knn.rs:944) instead of Err; sklearn ValueError; tracking #2274"]
 fn knn_predict_nan_query_returns_err_not_panic() {
     let f = fitted();
     let q: Array2<f64> = array![[f64::NAN, 0.0]];
@@ -77,7 +76,6 @@ fn knn_predict_nan_query_returns_err_not_panic() {
 /// the query, so the +inf flows into the search.
 /// Tracking: #2274
 #[test]
-#[ignore = "release-blocker: predict-time inf query unvalidated; sklearn ValueError; tracking #2274"]
 fn knn_predict_inf_query_returns_err_not_panic() {
     let f = fitted();
     let q: Array2<f64> = array![[f64::INFINITY, 0.0]];

@@ -43,6 +43,7 @@
 //! | REQ-5 | `metric` param + `metric='manhattan'` median centroid (`NcMetric` + `with_metric`; feature-wise median `:167`, L1 predict `:218`) | SHIPPED (#841) |
 //! | REQ-6 | `shrink_threshold > 0` constraint (sklearn `InvalidParameterError` on 0/negative) | SHIPPED | `fit` rejects `shrink_threshold <= 0` (`_nearest_centroid.py:105` `closed="neither"`); `nearest_centroid_shrink_threshold_zero_rejected` |
 //! | REQ-7 | PyO3 binding fidelity + ferray substrate | NOT-STARTED (#843) |
+//! | REQ-8 | non-finite input rejected | SHIPPED | `Fit::fit for NearestCentroid` rejects any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) AFTER the `shrink_threshold <= 0` constructor-param check but BEFORE the sample/shape/`n_classes < 2` checks and the centroid math — mirroring sklearn's `@_fit_context` `estimator._validate_params()` (`sklearn/base.py:1466`) running BEFORE the `fit` body's `self._validate_data(X, y, ...)` (`_nearest_centroid.py:134`/`:136`, `force_all_finite=True` → `ValueError`). So `shrink_threshold=0` (`Interval(Real,0,None,closed="neither")`, `:105`) + NaN X raises on `shrink_threshold` (#2273). The QUERY path also guards: `fn predict for FittedNearestCentroid` rejects a non-finite query X with the same `InvalidParameter { name: "X" }` BEFORE the argmin, mirroring `pairwise_distances_argmin`'s `_validate_data(X, reset=False)` (a NaN query never satisfied `dist < best_dist`, silently returning the first class — a divergence from sklearn's clean `ValueError`, #2274). `y` is integer `Array1<usize>` and `fit` takes no `sample_weight`, so only X is guarded. Finite path byte-identical (guard never fires on finite input — all in-tree tests unchanged). Non-test consumer: the existing `Fit::fit` / `RsNearestCentroid` PyO3 binding. Verified vs live sklearn 1.5.2 (R-CHAR-3): `NearestCentroid().fit` raises `ValueError` for NaN/+inf/-inf in X (`tests/divergence_neighbors_nonfinite.rs::nearest_centroid_*`); param-before-finiteness `tests/divergence_neighbors_nonfinite_param_order.rs::nearest_centroid_param_before_finiteness_order` (#2273). (#2272, #2273, #2274) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasClasses;
@@ -172,6 +173,40 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
         x: &Array2<F>,
         y: &Array1<usize>,
     ) -> Result<FittedNearestCentroid<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `self._validate_data(X, y, ...)` finiteness check
+        // (`:1472` → `_nearest_centroid.py:134`/`:136`). So the `shrink_threshold`
+        // constraint `Interval(Real, 0, None, closed="neither")`
+        // (`_nearest_centroid.py:105`: STRICTLY positive; `0`/negatives raise
+        // `InvalidParameterError`) is checked BEFORE the finiteness guard; a
+        // doubly-degenerate input (`shrink_threshold<=0` AND NaN X) raises on
+        // `shrink_threshold`, not the data. (#2273)
+        if let Some(threshold) = self.shrink_threshold
+            && threshold <= F::zero()
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "shrink_threshold".into(),
+                reason: "must be strictly positive (> 0)".into(),
+            });
+        }
+
+        // `_validate_data` keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN/+/-inf in X with a `ValueError` AFTER
+        // param validation (above) and BEFORE `check_classification_targets` /
+        // the `n_classes < 2` check (`_nearest_centroid.py:147-151`) and the
+        // centroid computation. `.iter().any(|v| !v.is_finite())` rejects NaN and
+        // Inf (bounds-safe, no panic, R-CODE-2). `y` is integer `Array1<usize>`,
+        // always finite; `NearestCentroid.fit` takes no `sample_weight`, so only
+        // X is guarded here. (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         let (n_samples, n_features) = x.dim();
 
         if n_samples == 0 {
@@ -187,18 +222,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>> for Nearest
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if let Some(threshold) = self.shrink_threshold
-            && threshold <= F::zero()
-        {
-            // sklearn constraint `Interval(Real, 0, None, closed="neither")`
-            // (`_nearest_centroid.py:105`): shrink_threshold must be STRICTLY
-            // positive; `0` and negatives raise `InvalidParameterError`.
-            return Err(FerroError::InvalidParameter {
-                name: "shrink_threshold".into(),
-                reason: "must be strictly positive (> 0)".into(),
             });
         }
 
@@ -397,6 +420,20 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedNearestCentr
                 expected: vec![n_features_fitted],
                 actual: vec![n_features],
                 context: "number of features must match fitted NearestCentroid".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `NearestCentroid.predict` runs
+        // `pairwise_distances_argmin(X, self.centroids_, ...)`
+        // (`_nearest_centroid.py:217-219`), which re-validates the query X via
+        // `_validate_data(X, reset=False)` (`force_all_finite=True`) → raises
+        // `ValueError` on a non-finite query. Without this guard a NaN query never
+        // satisfies `dist < best_dist`, leaving the first class as a silent wrong
+        // answer (no panic, but a divergence from sklearn's clean error). (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

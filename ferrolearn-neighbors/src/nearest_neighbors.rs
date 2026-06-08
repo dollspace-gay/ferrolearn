@@ -59,6 +59,7 @@
 //! | REQ-8 | Estimator-level `kneighbors_graph` / `radius_neighbors_graph` with `X=None`/`include_self` zero-diagonal semantics (`KNeighborsMixin.kneighbors_graph`). `graph.rs` has standalone free fns + `FittedNearestNeighbors` methods, but the estimator has no `X=None`/`include_self` method contract of its own. | NOT-STARTED (#869) |
 //! | REQ-9 | PyO3 `NearestNeighbors` binding + meta-crate re-export (`import sklearn.neighbors` exposes `NearestNeighbors`). `ferrolearn-python` exposes no shim and the meta-crate no re-export. | NOT-STARTED (#870) |
 //! | REQ-10 | ferray substrate: `nearest_neighbors.rs` imports `ndarray::Array2` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). | NOT-STARTED (#871) |
+//! | REQ-11 | non-finite input rejected: `Fit::fit for NearestNeighbors` rejects any NaN/+/-inf in X (`x.iter().any(\|v\| !v.is_finite())` → `FerroError::InvalidParameter { name: "X", reason: "Input X contains NaN or infinity." }`) AFTER the `n_neighbors == 0` constructor-param check but BEFORE the spatial-index build — mirroring sklearn's `@_fit_context` `estimator._validate_params()` (`sklearn/base.py:1466`) running BEFORE the `fit` body's `_validate_data` (unsupervised `X = self._validate_data(X, accept_sparse="csr", order="C")`, `sklearn/neighbors/_base.py:517`, `force_all_finite=True` → `ValueError`). So `n_neighbors=0` + NaN X raises on `n_neighbors` (#2273). The QUERY path also guards: `pub fn kneighbors` and `pub fn radius_neighbors` reject a non-finite query X with the same `InvalidParameter { name: "X" }` BEFORE the search, mirroring `KNeighborsMixin.kneighbors`'s `_validate_data(X, ..., reset=False)` (`sklearn/neighbors/_base.py:824`) — preventing an OOB index on a NaN query (#2274). Unsupervised → X only. Finite path byte-identical (guard never fires on finite input — all in-tree tests unchanged). Non-test consumers: the existing `Fit::fit` / `graph.rs` `kneighbors_graph` consumers. Verified vs live sklearn 1.5.2 (R-CHAR-3): `NearestNeighbors().fit` raises `ValueError` for NaN/+inf/-inf in X (`tests/divergence_neighbors_nonfinite.rs::nearest_neighbors_*`); param-before-finiteness `tests/divergence_neighbors_nonfinite_param_order.rs::nearest_neighbors_param_before_finiteness_order` (#2273). | SHIPPED (#2272, #2273, #2274) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -231,10 +232,32 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NearestNeighbors<F
     /// (`KNeighborsMixin.kneighbors`, `sklearn/neighbors/_base.py:828`), so a
     /// fit with `n_neighbors > n_samples` succeeds and only `kneighbors` errors.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedNearestNeighbors<F>, FerroError> {
+        // sklearn validates CONSTRUCTOR PARAMS before the data: the
+        // `@_fit_context` decorator runs `estimator._validate_params()`
+        // (`sklearn/base.py:1466`) BEFORE the wrapped `fit` body's
+        // `_validate_data(...)` finiteness check (`:1472` → `self._fit(X)`,
+        // `sklearn/neighbors/_unsupervised.py:176`). So the `n_neighbors == 0`
+        // constructor-param check precedes the finiteness guard; a
+        // doubly-degenerate input (`n_neighbors=0` AND NaN/inf X) raises on
+        // `n_neighbors`, not the data. (#2273)
         if self.n_neighbors == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_neighbors".into(),
                 reason: "must be at least 1".into(),
+            });
+        }
+
+        // Unsupervised, so `_fit` takes the no-`requires_y` branch
+        // `X = self._validate_data(X, accept_sparse="csr", order="C")`
+        // (`sklearn/neighbors/_base.py:517`), default `force_all_finite=True` →
+        // `check_array` rejects any NaN/+/-inf in X with a `ValueError` BEFORE the
+        // index is built, AFTER param validation (above). `.iter().any(|v|
+        // !v.is_finite())` rejects NaN and Inf (bounds-safe, no panic, R-CODE-2).
+        // Unsupervised → X only (`_y` is `()`). (#2272, reordered #2273)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -285,6 +308,18 @@ impl<F: Float + Send + Sync + 'static> FittedNearestNeighbors<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `KNeighborsMixin.kneighbors`
+        // re-validates the query X with `self._validate_data(X, ..., reset=False)`
+        // (`sklearn/neighbors/_base.py:824`, `force_all_finite=True`), so a
+        // NaN/inf query raises `ValueError` before the neighbor search rather than
+        // letting a NaN flow into `find_knn` and produce an OOB index. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -351,6 +386,19 @@ impl<F: Float + Send + Sync + 'static> FittedNearestNeighbors<F> {
                 expected: vec![train_features],
                 actual: vec![n_features],
                 context: "number of features must match training data".into(),
+            });
+        }
+
+        // Query-time finiteness guard: sklearn `RadiusNeighborsMixin
+        // .radius_neighbors` re-validates the query X with
+        // `self._validate_data(X, ..., reset=False)`
+        // (`sklearn/neighbors/_base.py:824` analog), so a NaN/inf query raises
+        // `ValueError` before the search rather than silently returning an empty
+        // neighborhood. (#2274)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
