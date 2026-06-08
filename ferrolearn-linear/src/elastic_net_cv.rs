@@ -349,6 +349,35 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
+        // Non-finite input validation (#2265 batch5, ordering #2267). sklearn
+        // `ElasticNetCV.fit` (via `LinearModelCV.fit`) calls
+        // `self._validate_data(X, y, ...)` (`_coordinate_descent.py:1619`/
+        // `:1644`) — `check_X_params`/`check_y_params` do NOT set
+        // `force_all_finite=False`, so the default `True` applies and any NaN or
+        // +/-inf in X OR y raises a `ValueError` at the very TOP of `fit`, BEFORE
+        // `cv = check_cv(self.cv)` (`_coordinate_descent.py:1730`) and BEFORE the
+        // per-l1_ratio alpha grid / k-fold split. So for `n_samples < cv` WITH a
+        // NaN in X, sklearn raises the non-finite error, NOT the fold-count
+        // error — the finiteness check must therefore precede the `n_samples <
+        // cv` guard below (#2267). ferrolearn's `Fit::fit` takes only `(x, y)`
+        // (no `sample_weight` in the trait surface), so X and y are the validated
+        // inputs. `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf
+        // (bounds-safe, no panic, R-CODE-2), matching the crate idiom. The finite
+        // path is byte-identical (the guard never fires on finite input), and the
+        // `n_samples < cv`-with-FINITE-X case still hits the fold-count error.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
         if n_samples < self.cv {
             return Err(FerroError::InsufficientSamples {
                 required: self.cv,
@@ -361,31 +390,6 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             return Err(FerroError::InvalidParameter {
                 name: "n_alphas".into(),
                 reason: "must be at least 1".into(),
-            });
-        }
-
-        // Non-finite input validation (#2265 batch5). sklearn `ElasticNetCV.fit`
-        // (via `LinearModelCV.fit`) calls `self._validate_data(X, y, ...)`
-        // (`_coordinate_descent.py:1619`/`:1644`) — `check_X_params`/
-        // `check_y_params` do NOT set `force_all_finite=False`, so the default
-        // `True` applies and any NaN or +/-inf in X OR y raises a `ValueError`
-        // BEFORE the per-l1_ratio alpha grid / k-fold split. Checking up-front
-        // here gives the clean sklearn error before the grid / fold loop.
-        // ferrolearn's `Fit::fit` takes only `(x, y)` (no `sample_weight` in the
-        // trait surface), so X and y are the validated inputs. `.iter().any(|v|
-        // !v.is_finite())` rejects both NaN and Inf (bounds-safe, no panic,
-        // R-CODE-2), matching the crate idiom. The finite path is byte-identical
-        // (the guard never fires on finite input).
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "X".into(),
-                reason: "Input X contains NaN or infinity.".into(),
-            });
-        }
-        if y.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "y".into(),
-                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

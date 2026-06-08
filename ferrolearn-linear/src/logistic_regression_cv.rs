@@ -334,6 +334,30 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
             });
         }
 
+        // Non-finite input validation (#2265 batch5, ordering #2267). sklearn
+        // `LogisticRegressionCV.fit` calls `self._validate_data(X, y, ...)`
+        // (`_logistic.py:1868`) keeping the default `force_all_finite=True`, so
+        // any NaN or +/-inf in X raises a `ValueError` at the very TOP of `fit`,
+        // BEFORE `check_classification_targets` / `LabelEncoder().fit(y)`
+        // (`_logistic.py:1876`-`:1889`) and BEFORE the stratified k-fold split.
+        // So a NaN in X with `n_samples < cv` OR with a SINGLE class still raises
+        // the non-finite error first — the finiteness check must therefore
+        // precede BOTH the `n_samples < cv` guard and the class-count guard below
+        // (#2267). `y` is `Array1<usize>` (integer class labels) which can never
+        // be non-finite, and ferrolearn's `Fit::fit` takes only `(x, y)` (no
+        // `sample_weight` in the trait surface), so X is the sole
+        // non-finite-checkable input. `.iter().any(|v| !v.is_finite())` rejects
+        // both NaN and Inf (bounds-safe, no panic, R-CODE-2), matching the crate
+        // idiom. The finite path is byte-identical (the guard never fires on
+        // finite input), and the FINITE-X `n_samples < cv` / single-class cases
+        // still hit their respective `InsufficientSamples` guards below.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         if n_samples < self.cv {
             return Err(FerroError::InsufficientSamples {
                 required: self.cv,
@@ -351,25 +375,6 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usi
                 required: 2,
                 actual: classes.len(),
                 context: "LogisticRegressionCV requires at least 2 distinct classes".into(),
-            });
-        }
-
-        // Non-finite input validation (#2265 batch5). sklearn
-        // `LogisticRegressionCV.fit` calls `self._validate_data(X, y, ...)`
-        // (`_logistic.py:1868`) keeping the default `force_all_finite=True`, so
-        // any NaN or +/-inf in X raises a `ValueError` BEFORE the stratified
-        // k-fold split. Checking up-front here gives the clean sklearn error
-        // before the fold split / inner LBFGS fits. `y` is `Array1<usize>`
-        // (integer class labels) which can never be non-finite, and ferrolearn's
-        // `Fit::fit` takes only `(x, y)` (no `sample_weight` in the trait
-        // surface), so X is the sole non-finite-checkable input.
-        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-
-        // safe, no panic, R-CODE-2), matching the crate idiom. The finite path
-        // is byte-identical (the guard never fires on finite input).
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "X".into(),
-                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

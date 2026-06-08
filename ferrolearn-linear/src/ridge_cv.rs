@@ -277,14 +277,45 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             }
         }
 
+        // RidgeCV split-count guard for the `cv=Some(k)` path, ordered BEFORE the
+        // finiteness check (#2268, the MIRROR of #2267). sklearn routes the
+        // `cv=Some(k)` path through `GridSearchCV(KFold(n_splits=k))`, whose
+        // split-count check (`KFold._iter_test_indices`,
+        // `model_selection/_split.py:408`: `if self.n_splits > n_samples: raise
+        // ValueError("Cannot have number of splits n_splits={k} greater than the
+        // number of samples ...")`) fires BEFORE the per-fold `Ridge.fit`
+        // `_validate_data` (`_ridge.py:1242`). So for `n_samples < k` WITH a NaN
+        // in X, sklearn raises the split-count (`cv`) error, NOT the non-finite
+        // error. ferrolearn therefore checks the split-count for the
+        // `cv=Some(k)` arm FIRST, matching that ordering. (`select_alpha_kfold`
+        // re-checks `k<2`/`n<k` defensively; this up-front guard reproduces the
+        // same `FerroError` variants so the finite-input behaviour is unchanged.)
+        if let Some(k) = self.cv {
+            if k < 2 {
+                return Err(FerroError::InvalidParameter {
+                    name: "cv".into(),
+                    reason: "number of folds must be at least 2".into(),
+                });
+            }
+            if n_samples < k {
+                return Err(FerroError::InsufficientSamples {
+                    required: k,
+                    actual: n_samples,
+                    context: "RidgeCV requires at least as many samples as folds".into(),
+                });
+            }
+        }
+
         // Non-finite input validation (#2265 batch5). sklearn `RidgeCV.fit`
         // routes to `_RidgeGCV.fit` (`cv=None`) which calls
         // `self._validate_data(X, y, ...)` (`_ridge.py:2087`) keeping the default
         // `force_all_finite=True`, rejecting any NaN or +/-inf in X OR y with a
         // `ValueError` BEFORE the decomposition; the `cv=Some(k)` path routes
         // through `GridSearchCV` whose per-fold `Ridge.fit` (`_ridge.py:1242`)
-        // also rejects non-finite input. Checking up-front here gives the clean
-        // sklearn error BEFORE the GCV decomposition / fold split. ferrolearn's
+        // also rejects non-finite input — but only AFTER the `KFold` split-count
+        // check above (#2268). Checking finiteness here (after the `cv=Some(k)`
+        // split-count guard, before the GCV `cv=None` decomposition) gives the
+        // clean sklearn error and matches BOTH modes' ordering. ferrolearn's
         // `Fit::fit` takes only `(x, y)` (no `sample_weight` in the trait
         // surface), so X and y are the inputs validated. `.iter().any(|v|
         // !v.is_finite())` rejects both NaN and Inf (bounds-safe, no panic,

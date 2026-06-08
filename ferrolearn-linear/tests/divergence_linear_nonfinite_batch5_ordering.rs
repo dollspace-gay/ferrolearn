@@ -53,10 +53,10 @@
 //! RidgeCV(cv=5) n<cv NaN  -> ValueError: Cannot have number of splits n_splits=5 ...
 //! ```
 
-use ferrolearn_core::error::FerroError;
 use ferrolearn_core::Fit;
+use ferrolearn_core::error::FerroError;
 use ferrolearn_linear::{ElasticNetCV, LassoCV, LogisticRegressionCV, RidgeCV};
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 /// `true` iff the error is the non-finite `InvalidParameter` for `X` (the
 /// sklearn `ValueError: Input X contains NaN.` analog the batch-5 guard emits).
@@ -89,7 +89,6 @@ fn x3_nan() -> Array2<f64> {
 /// `InsufficientSamples`.
 /// Tracking: #2267
 #[test]
-#[ignore = "divergence: LassoCV validates n<cv before non-finite X; tracking #2267"]
 fn lasso_cv_validates_finiteness_before_fold_count_like_sklearn() {
     let x = x3_nan();
     let y: Array1<f64> = array![1.0, 2.0, 3.0];
@@ -112,7 +111,6 @@ fn lasso_cv_validates_finiteness_before_fold_count_like_sklearn() {
 /// `InsufficientSamples`.
 /// Tracking: #2267
 #[test]
-#[ignore = "divergence: ElasticNetCV validates n<cv before non-finite X; tracking #2267"]
 fn elastic_net_cv_validates_finiteness_before_fold_count_like_sklearn() {
     let x = x3_nan();
     let y: Array1<f64> = array![1.0, 2.0, 3.0];
@@ -135,7 +133,6 @@ fn elastic_net_cv_validates_finiteness_before_fold_count_like_sklearn() {
 /// NaN.`; ferrolearn returns `InsufficientSamples`.
 /// Tracking: #2267
 #[test]
-#[ignore = "divergence: LogisticRegressionCV validates n<cv before non-finite X; tracking #2267"]
 fn logistic_regression_cv_validates_finiteness_before_fold_count_like_sklearn() {
     let x = x3_nan();
     let yc: Array1<usize> = array![0usize, 1, 0];
@@ -160,7 +157,6 @@ fn logistic_regression_cv_validates_finiteness_before_fold_count_like_sklearn() 
 /// classes").
 /// Tracking: #2267
 #[test]
-#[ignore = "divergence: LogisticRegressionCV validates single-class before non-finite X; tracking #2267"]
 fn logistic_regression_cv_validates_finiteness_before_class_count_like_sklearn() {
     let mut x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
     x[[0, 0]] = f64::NAN;
@@ -193,7 +189,6 @@ fn logistic_regression_cv_validates_finiteness_before_class_count_like_sklearn()
 /// ordering here, but returns `InvalidParameter { name: "X", ... }`.
 /// Tracking: #2268
 #[test]
-#[ignore = "divergence: RidgeCV(cv=k) raises non-finite X before n_splits>n; tracking #2268"]
 fn ridge_cv_kfold_raises_split_count_before_finiteness_like_sklearn() {
     let x = x3_nan();
     let y: Array1<f64> = array![1.0, 2.0, 3.0];
