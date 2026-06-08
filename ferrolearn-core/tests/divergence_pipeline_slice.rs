@@ -1,16 +1,8 @@
-//! Divergence pin: `Pipeline::into_slice` rejects out-of-bounds / inverted
-//! ranges with an error, whereas sklearn's `Pipeline.__getitem__` slice arm
-//! uses Python slice semantics, which CLAMP (and never raise) for an end past
-//! the number of steps, a start past the number of steps, or start > end.
-//!
-//! ferrolearn cite: `ferrolearn-core/src/pipeline.rs:513-522`
-//!   ```text
-//!   pub fn into_slice(self, start: usize, end: usize) -> Result<Pipeline<F>, FerroError> {
-//!       let n_steps = self.len();
-//!       if start > end || end > n_steps {
-//!           return Err(FerroError::InvalidParameter { ... });
-//!       }
-//!   ```
+//! Regression guard (#2235, FIXED): `Pipeline::into_slice` now CLAMPS like a
+//! Python list slice, matching sklearn's `Pipeline.__getitem__` slice arm — an
+//! end past the number of steps clamps to all steps, a start past the number of
+//! steps yields an empty pipeline, and `start > end` yields an empty pipeline;
+//! it never raises (the function is now total, returning `Pipeline<F>` directly).
 //!
 //! sklearn cite: `sklearn/pipeline.py:307-312`
 //!   ```text
@@ -87,32 +79,25 @@ fn build_3step() -> Pipeline<f64> {
         .estimator_step("c", Box::new(SumE))
 }
 
-/// Divergence: `Pipeline::into_slice` raises where sklearn's slice CLAMPS.
+/// Regression guard (#2235, fixed): `Pipeline::into_slice` CLAMPS like a
+/// Python list slice instead of raising on out-of-range / inverted ranges.
 ///
 /// sklearn (`pipeline.py:307-312`, list-slice semantics) returns a valid
 /// sub-pipeline for an out-of-range / inverted slice; ferrolearn
-/// (`pipeline.rs:515`) returns `Err`. Tracking: #2235.
+/// `into_slice` (`pipeline.rs:515`) is now a total function that mirrors that
+/// clamping. Tracking: #2235.
 #[test]
-#[ignore = "divergence: into_slice errors on OOB/inverted ranges where sklearn list-slice clamps to a valid sub-pipeline; tracking #2235"]
 fn divergence_into_slice_clamps_like_python() {
     // Oracle: p[0:100] on 3 steps -> ['a','b','c'] (end past len: clamp to all,
-    // NO error). ferrolearn errors because end > n_steps.
-    let sub = build_3step()
-        .into_slice(0, 100)
-        .expect("sklearn p[0:100] clamps to all 3 steps, NO error; ferrolearn errors");
+    // NO error).
+    let sub = build_3step().into_slice(0, 100);
     assert_eq!(sub.step_names(), vec!["a", "b", "c"]);
 
     // Oracle: p[5:100] on 3 steps -> [] (start past len: empty, NO error).
-    // ferrolearn errors because end > n_steps (and start > n_steps).
-    let sub = build_3step()
-        .into_slice(5, 100)
-        .expect("sklearn p[5:100] (start past len) -> empty pipeline, NO error; ferrolearn errors");
+    let sub = build_3step().into_slice(5, 100);
     assert!(sub.step_names().is_empty());
 
     // Oracle: p[2:1] on 3 steps -> [] (start > end: empty, NO error).
-    // ferrolearn errors because start > end.
-    let sub = build_3step()
-        .into_slice(2, 1)
-        .expect("sklearn p[2:1] (start>end) -> empty pipeline, NO error; ferrolearn errors");
+    let sub = build_3step().into_slice(2, 1);
     assert!(sub.step_names().is_empty());
 }

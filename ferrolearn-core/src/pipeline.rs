@@ -18,7 +18,8 @@
 //! | REQ-1 (fit→transform chaining + final predict) | SHIPPED | `Fit for Pipeline` (fit each transformer, transform, fit final estimator) mirrors `Pipeline._fit` (`pipeline.py:406`); `Predict for FittedPipeline` mirrors `Pipeline.predict` (`pipeline.py:599`). Non-test consumers: `impl PipelineEstimator for GaussianNB in gaussian.rs`, `impl PipelineEstimator for BernoulliNB in bernoulli.rs`, `impl PipelineTransformer for KernelPCA in kernel_pca.rs`. (critic: fit-then-transform ≡ sklearn fused fit_transform to ≤1.1e-14 on KernelPCA.) |
 //! | REQ-2 (no-final-estimator rejected at fit) | SHIPPED | `Fit for Pipeline` returns `FerroError::InvalidParameter` when the estimator slot is unset; matches sklearn requiring a final predictor for `.predict` (`available_if` at `pipeline.py:549`). |
 //! | REQ-3 (fit_transform/transform/predict_proba/decision_function/score) | SHIPPED | `Pipeline::fit_transform` (`Fit::fit` then `transform_through`) mirrors `Pipeline.fit_transform` (`pipeline.py:489`); `FittedPipeline::{transform, predict_proba, decision_function, score}` run the private `transform_through` loop (`pipeline.py:599-600`/`:719-720`/`:768-769`/`:999-1000`) then delegate to the final estimator. `predict_proba`/`decision_function`/`score` forward to the new default-`Err` trait methods `predict_proba_pipeline`/`decision_function_pipeline`/`score_pipeline` on `FittedPipelineEstimator` (the `available_if(_final_estimator_has(...))` analog, `pipeline.py:674`/`:731`/`:960`); `transform` returns the transformer-prefix output (sklearn raises `AttributeError` for a non-transformer-final `transform`, `:858`). Non-test consumer: `impl FittedPipelineEstimator for FittedGaussianNBPipeline in gaussian.rs` overrides `predict_proba_pipeline` (→ `predict_proba`) + `score_pipeline` (→ `score`). Live-oracle verification: `gaussian_pipeline_predict_proba_score_match_sklearn` (StandardScaler+GaussianNB pipeline matches sklearn `predict_proba`/`score`/`transform`) + core `test_pipeline_fit_transform_equals_transform`/`test_pipeline_predict_proba_and_score_override`/`test_pipeline_predict_proba_default_is_err`. |
-//! | REQ-4 (named_steps/get_params/set_params/__getitem__) | NOT-STARTED | blocker #362. Only `step_names()` exists. |
+//! | REQ-4a (named_steps / `__getitem__` int+str+slice) | SHIPPED | `Pipeline::{named_steps, get_step, get_step_by_name, named_step, into_slice}` + `FittedPipeline::{named_steps, get_step, get_step_by_name, named_step}` over the existing `transforms`/`estimator` storage; mirror `Pipeline.named_steps` (`pipeline.py:325` `return Bunch(**dict(self.steps))`), integer/string/slice `Pipeline.__getitem__` (`pipeline.py:298-318`). A step is returned as a `PipelineStepRef`/`FittedPipelineStepRef` enum (the heterogeneous-`(name, obj)`-list analog, since a ferrolearn step is EITHER a `PipelineTransformer` OR a `PipelineEstimator`). `into_slice` consumes `self` (the trait-object steps are not `Clone`, so the new sub-pipeline MOVES the contiguous range, vs sklearn's shallow object-sharing copy `:310`). Non-test consumer: pub API on the grandfathered `Pipeline`/`FittedPipeline` boundary types (S5). Live-oracle verification (R-CHAR-3, sklearn 1.5.2): `test_pipeline_named_steps_match_sklearn`, `test_pipeline_get_step_*`, `test_pipeline_into_slice_*`. |
+//! | REQ-4b (get_params / set_params `<step>__<param>` nested protocol) | NOT-STARTED | blocker #362. The `PipelineTransformer`/`PipelineEstimator` trait objects expose NO `get_params`/reflection method, so the `_BaseComposition._get_params`/`_set_params` nested addressing (`pipeline.py:216`/`:237`) is not implementable without first adding a per-step reflection trait (e.g. `fn get_params(&self) -> BTreeMap<String, ParamValue>` on the step traits). Concrete blocker: a `get_params`/reflection method on the step traits. |
 //! | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | blocker #363. |
 //! | REQ-6 (fit_params / metadata routing) | NOT-STARTED | blocker #364. |
 //! | REQ-7 (make_pipeline auto-naming helper) | NOT-STARTED | blocker #365 (`pipeline.py:1220`). |
@@ -255,6 +256,22 @@ struct TransformStep<F: Float + Send + Sync + 'static> {
     step: Box<dyn PipelineTransformer<F>>,
 }
 
+/// A borrowed reference to a single step of an unfitted [`Pipeline`].
+///
+/// sklearn's `Pipeline.steps` is a flat list of `(name, obj)` tuples where
+/// every `obj` is duck-typed; `Pipeline.__getitem__` with an integer or string
+/// returns that single `obj` (`sklearn/pipeline.py:298-318`). ferrolearn encodes
+/// the transformer/estimator distinction in the type system, so a "step" is
+/// EITHER a [`PipelineTransformer`] OR a [`PipelineEstimator`]. This enum is the
+/// heterogeneous-step analog: the variant tells the caller which kind of step
+/// they reached, mirroring sklearn returning the underlying object.
+pub enum PipelineStepRef<'a, F: Float + Send + Sync + 'static> {
+    /// A transformer step (an intermediate step of the pipeline).
+    Transformer(&'a dyn PipelineTransformer<F>),
+    /// The final estimator step.
+    Estimator(&'a dyn PipelineEstimator<F>),
+}
+
 /// A dynamic-dispatch pipeline that composes transformers and a final estimator.
 ///
 /// Steps are added with [`transform_step`](Pipeline::transform_step) and the
@@ -349,6 +366,185 @@ impl<F: Float + Send + Sync + 'static> Pipeline<F> {
         let transformed = fitted.transform_through(x)?;
         Ok((fitted, transformed))
     }
+
+    /// Number of steps in the pipeline (transformer steps plus the final
+    /// estimator, if set).
+    ///
+    /// Mirrors `Pipeline.__len__` (`sklearn/pipeline.py:292-296`:
+    /// `return len(self.steps)`).
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.transforms.len() + usize::from(self.estimator.is_some())
+    }
+
+    /// Returns `true` if the pipeline has no steps at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the names of all steps (transformers, then the estimator if set)
+    /// in pipeline order.
+    ///
+    /// Mirrors the key ordering of `Pipeline.named_steps`
+    /// (`sklearn/pipeline.py:325`: `Bunch(**dict(self.steps))` keyed by step
+    /// name in `steps` order).
+    #[must_use]
+    pub fn step_names(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self.transforms.iter().map(|s| s.name.as_str()).collect();
+        if let Some((name, _)) = &self.estimator {
+            names.push(name.as_str());
+        }
+        names
+    }
+
+    /// Access every step by its name, in pipeline order, as a
+    /// `(name, step)` list.
+    ///
+    /// This is the trait-object analog of sklearn's `Pipeline.named_steps`,
+    /// which returns a `Bunch(**dict(self.steps))` — a name→step mapping
+    /// (`sklearn/pipeline.py:325`). Every step (each transformer, then the final
+    /// estimator if set) is reachable by its construction name. ferrolearn
+    /// returns an ordered `Vec` of `(name, PipelineStepRef)` rather than a hash
+    /// map so the pipeline order is preserved and the heterogeneous
+    /// transformer/estimator kinds are distinguishable.
+    #[must_use]
+    pub fn named_steps(&self) -> Vec<(&str, PipelineStepRef<'_, F>)> {
+        let mut steps: Vec<(&str, PipelineStepRef<'_, F>)> = self
+            .transforms
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    PipelineStepRef::Transformer(s.step.as_ref()),
+                )
+            })
+            .collect();
+        if let Some((name, est)) = &self.estimator {
+            steps.push((name.as_str(), PipelineStepRef::Estimator(est.as_ref())));
+        }
+        steps
+    }
+
+    /// Look up a single step by name.
+    ///
+    /// This is the string-key arm of sklearn's `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:317`: `return self.named_steps[ind]`), which raises
+    /// `KeyError` for an unknown name; ferrolearn returns `None` (R-CODE-2: no
+    /// panic).
+    #[must_use]
+    pub fn named_step(&self, name: &str) -> Option<PipelineStepRef<'_, F>> {
+        if let Some(ts) = self.transforms.iter().find(|s| s.name == name) {
+            return Some(PipelineStepRef::Transformer(ts.step.as_ref()));
+        }
+        match &self.estimator {
+            Some((est_name, est)) if est_name == name => {
+                Some(PipelineStepRef::Estimator(est.as_ref()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the step at position `index` (0-based, transformer steps first then
+    /// the final estimator).
+    ///
+    /// This is the integer arm of sklearn's `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:313-318`: `name, est = self.steps[ind]; return
+    /// est`), which raises `IndexError` out of range; ferrolearn returns `None`
+    /// (R-CODE-2: no panic).
+    #[must_use]
+    pub fn get_step(&self, index: usize) -> Option<PipelineStepRef<'_, F>> {
+        let n_transforms = self.transforms.len();
+        if index < n_transforms {
+            return Some(PipelineStepRef::Transformer(
+                self.transforms[index].step.as_ref(),
+            ));
+        }
+        if index == n_transforms
+            && let Some((_, est)) = &self.estimator
+        {
+            return Some(PipelineStepRef::Estimator(est.as_ref()));
+        }
+        None
+    }
+
+    /// Look up a single step by name (alias of [`named_step`](Pipeline::named_step)).
+    ///
+    /// Provided for symmetry with [`get_step`](Pipeline::get_step); mirrors the
+    /// string arm of `Pipeline.__getitem__` (`sklearn/pipeline.py:317`).
+    #[must_use]
+    pub fn get_step_by_name(&self, name: &str) -> Option<PipelineStepRef<'_, F>> {
+        self.named_step(name)
+    }
+
+    /// Build a sub-pipeline from the contiguous step range `[start, end)`,
+    /// consuming `self`.
+    ///
+    /// This is the slice arm of sklearn's `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:307-312`): `pipe[a:b]` returns
+    /// `Pipeline(self.steps[a:b], ...)` — a new pipeline over the contiguous
+    /// step range. sklearn slicing supports only a step of 1
+    /// (`:308-309`, otherwise `ValueError`); a contiguous Rust range is the step-1
+    /// analog by construction.
+    ///
+    /// The sliced steps are addressed in the unified order
+    /// (transformer steps `0..n_transforms`, then the estimator at
+    /// `n_transforms` if set), matching [`get_step`](Pipeline::get_step). A slice
+    /// that includes the estimator index keeps it as the final estimator; a slice
+    /// of only transformer indices yields an estimator-less pipeline (valid to
+    /// build, errors only at `fit` — mirroring sklearn, where `pipe[:k]` for a
+    /// transformer-only range is a `Pipeline` that simply lacks `.predict`).
+    ///
+    /// # Divergence from sklearn
+    ///
+    /// sklearn's slice is a SHALLOW copy that shares the underlying estimator
+    /// objects with the original pipeline (`sklearn/pipeline.py:303-305`). The
+    /// ferrolearn step trait objects are not `Clone`, so this method MOVES the
+    /// selected boxed steps into the new pipeline and therefore consumes `self`.
+    /// Slicing a [`FittedPipeline`] is NOT implemented for the same reason (the
+    /// fitted step trait objects are not `Clone`); it is NOT-STARTED under
+    /// blocker #362.
+    ///
+    /// Out-of-range bounds CLAMP and `start > end` yields an empty pipeline —
+    /// Python list-slice semantics, mirroring sklearn `Pipeline.__getitem__`'s
+    /// slice arm which slices `self.steps[ind]` (`pipeline.py:307-312`): an
+    /// ordinary Python slice never raises on out-of-range bounds (#2235). So
+    /// `into_slice(0, 100)` on 3 steps → all 3, `into_slice(5, 100)` → empty,
+    /// `into_slice(2, 1)` → empty. This is a TOTAL function (it cannot fail).
+    #[must_use]
+    pub fn into_slice(self, start: usize, end: usize) -> Pipeline<F> {
+        let n_steps = self.len();
+        // Python slice clamping: `end` past the length is clamped to the length;
+        // a `start >= end` (incl. start past the length) yields an empty range
+        // via the `idx >= start && idx < end` filter below.
+        let end = end.min(n_steps);
+
+        let Pipeline {
+            transforms,
+            estimator,
+        } = self;
+        let n_transforms = transforms.len();
+
+        let mut new_transforms = Vec::new();
+        let mut new_estimator = None;
+        for (idx, ts) in transforms.into_iter().enumerate() {
+            if idx >= start && idx < end {
+                new_transforms.push(ts);
+            }
+        }
+        // The estimator (if set) sits at unified index `n_transforms`.
+        if let Some(est) = estimator
+            && n_transforms >= start
+            && n_transforms < end
+        {
+            new_estimator = Some(est);
+        }
+
+        Pipeline {
+            transforms: new_transforms,
+            estimator: new_estimator,
+        }
+    }
 }
 
 impl<F: Float + Send + Sync + 'static> Default for Pipeline<F> {
@@ -430,6 +626,21 @@ struct FittedTransformStep<F: Float + Send + Sync + 'static> {
     step: Box<dyn FittedPipelineTransformer<F>>,
 }
 
+/// A borrowed reference to a single step of a [`FittedPipeline`].
+///
+/// The fitted analog of [`PipelineStepRef`]: a fitted step is EITHER a
+/// [`FittedPipelineTransformer`] (an intermediate step) OR the
+/// [`FittedPipelineEstimator`] (the final step). Returned by the
+/// `FittedPipeline` `named_steps` / `get_step` / `named_step` accessors, the
+/// fitted analog of sklearn's `Pipeline.__getitem__` over a fitted pipeline
+/// (`sklearn/pipeline.py:298-318`).
+pub enum FittedPipelineStepRef<'a, F: Float + Send + Sync + 'static> {
+    /// A fitted transformer step.
+    Transformer(&'a dyn FittedPipelineTransformer<F>),
+    /// The fitted final estimator step.
+    Estimator(&'a dyn FittedPipelineEstimator<F>),
+}
+
 /// A fitted pipeline that chains fitted transformers and a fitted estimator.
 ///
 /// Created by calling [`Fit::fit`] on a [`Pipeline`]. Implements
@@ -447,6 +658,96 @@ impl<F: Float + Send + Sync + 'static> FittedPipeline<F> {
         let mut names: Vec<&str> = self.transforms.iter().map(|s| s.name.as_str()).collect();
         names.push(&self.estimator.0);
         names
+    }
+
+    /// Number of steps in the fitted pipeline (every transformer step plus the
+    /// final estimator).
+    ///
+    /// Mirrors `Pipeline.__len__` (`sklearn/pipeline.py:292-296`). A
+    /// `FittedPipeline` always has exactly one final estimator (the type
+    /// guarantees it), so this is never zero.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.transforms.len() + 1
+    }
+
+    /// Always `false`: a fitted pipeline always has at least its final
+    /// estimator step.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// Access every fitted step by its name, in pipeline order, as a
+    /// `(name, step)` list.
+    ///
+    /// The fitted analog of sklearn's `Pipeline.named_steps`
+    /// (`sklearn/pipeline.py:325`: `Bunch(**dict(self.steps))`) — every fitted
+    /// step (each transformer, then the final estimator) is reachable by its
+    /// construction name, in pipeline order.
+    #[must_use]
+    pub fn named_steps(&self) -> Vec<(&str, FittedPipelineStepRef<'_, F>)> {
+        let mut steps: Vec<(&str, FittedPipelineStepRef<'_, F>)> = self
+            .transforms
+            .iter()
+            .map(|s| {
+                (
+                    s.name.as_str(),
+                    FittedPipelineStepRef::Transformer(s.step.as_ref()),
+                )
+            })
+            .collect();
+        steps.push((
+            self.estimator.0.as_str(),
+            FittedPipelineStepRef::Estimator(self.estimator.1.as_ref()),
+        ));
+        steps
+    }
+
+    /// Look up a single fitted step by name.
+    ///
+    /// The fitted analog of the string arm of `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:317`); returns `None` for an unknown name (R-CODE-2:
+    /// no panic, vs sklearn's `KeyError`).
+    #[must_use]
+    pub fn named_step(&self, name: &str) -> Option<FittedPipelineStepRef<'_, F>> {
+        if let Some(ts) = self.transforms.iter().find(|s| s.name == name) {
+            return Some(FittedPipelineStepRef::Transformer(ts.step.as_ref()));
+        }
+        if self.estimator.0 == name {
+            return Some(FittedPipelineStepRef::Estimator(self.estimator.1.as_ref()));
+        }
+        None
+    }
+
+    /// Get the fitted step at position `index` (0-based, transformer steps
+    /// first then the final estimator).
+    ///
+    /// The fitted analog of the integer arm of `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:313-318`); returns `None` out of range (R-CODE-2: no
+    /// panic, vs sklearn's `IndexError`).
+    #[must_use]
+    pub fn get_step(&self, index: usize) -> Option<FittedPipelineStepRef<'_, F>> {
+        let n_transforms = self.transforms.len();
+        if index < n_transforms {
+            return Some(FittedPipelineStepRef::Transformer(
+                self.transforms[index].step.as_ref(),
+            ));
+        }
+        if index == n_transforms {
+            return Some(FittedPipelineStepRef::Estimator(self.estimator.1.as_ref()));
+        }
+        None
+    }
+
+    /// Look up a single fitted step by name (alias of
+    /// [`named_step`](FittedPipeline::named_step)).
+    ///
+    /// Mirrors the string arm of `Pipeline.__getitem__`
+    /// (`sklearn/pipeline.py:317`).
+    #[must_use]
+    pub fn get_step_by_name(&self, name: &str) -> Option<FittedPipelineStepRef<'_, F>> {
+        self.named_step(name)
     }
 
     /// Run `x` through every fitted transformer step in order, returning the
@@ -1059,6 +1360,208 @@ mod tests {
         // Both rows predicted correctly → score 1.0.
         let s = fitted.score(&x, &y)?;
         assert!((s - 1.0).abs() < 1e-12);
+        Ok(())
+    }
+
+    // -- REQ-4a: named_steps / get_step / get_step_by_name / into_slice -------
+
+    fn is_transformer(r: &PipelineStepRef<'_, f64>) -> bool {
+        matches!(r, PipelineStepRef::Transformer(_))
+    }
+    fn is_estimator(r: &PipelineStepRef<'_, f64>) -> bool {
+        matches!(r, PipelineStepRef::Estimator(_))
+    }
+
+    #[test]
+    fn test_pipeline_named_steps_match_sklearn() {
+        // sklearn: Pipeline([('a',StandardScaler()),('b',MinMaxScaler()),
+        //                    ('c',GaussianNB())]).named_steps keys order
+        //   == ['a', 'b', 'c']  (live oracle, sklearn 1.5.2;
+        //   `named_steps = Bunch(**dict(self.steps))`, pipeline.py:325).
+        // Every step is reachable by its construction name, in order.
+        let pipeline = Pipeline::new()
+            .transform_step("a", Box::new(DoublingTransformer))
+            .transform_step("b", Box::new(DoublingTransformer))
+            .estimator_step("c", Box::new(SumEstimator));
+
+        let named = pipeline.named_steps();
+        let names: Vec<&str> = named.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // The two transformer steps are transformers; the final is the estimator.
+        assert!(is_transformer(&named[0].1));
+        assert!(is_transformer(&named[1].1));
+        assert!(is_estimator(&named[2].1));
+        // step_names() agrees with named_steps() key order.
+        assert_eq!(pipeline.step_names(), names);
+        // len() counts every step (3), matching sklearn len(pipe)==3.
+        assert_eq!(pipeline.len(), 3);
+        assert!(!pipeline.is_empty());
+    }
+
+    #[test]
+    fn test_pipeline_get_step_integer() {
+        // sklearn: p[0] -> first step object, p[2] -> last (estimator);
+        //   p[10] -> IndexError (live oracle). ferrolearn returns None OOB.
+        let pipeline = Pipeline::new()
+            .transform_step("a", Box::new(DoublingTransformer))
+            .transform_step("b", Box::new(DoublingTransformer))
+            .estimator_step("c", Box::new(SumEstimator));
+
+        assert!(matches!(
+            pipeline.get_step(0),
+            Some(PipelineStepRef::Transformer(_))
+        ));
+        assert!(matches!(
+            pipeline.get_step(1),
+            Some(PipelineStepRef::Transformer(_))
+        ));
+        assert!(matches!(
+            pipeline.get_step(2),
+            Some(PipelineStepRef::Estimator(_))
+        ));
+        // Out of range -> None (sklearn raises IndexError).
+        assert!(pipeline.get_step(3).is_none());
+        assert!(pipeline.get_step(10).is_none());
+    }
+
+    #[test]
+    fn test_pipeline_get_step_by_name() {
+        // sklearn: p['b'] -> the 'b' step; p['nope'] -> KeyError (live oracle).
+        let pipeline = Pipeline::new()
+            .transform_step("a", Box::new(DoublingTransformer))
+            .transform_step("b", Box::new(DoublingTransformer))
+            .estimator_step("c", Box::new(SumEstimator));
+
+        assert!(matches!(
+            pipeline.get_step_by_name("b"),
+            Some(PipelineStepRef::Transformer(_))
+        ));
+        assert!(matches!(
+            pipeline.get_step_by_name("c"),
+            Some(PipelineStepRef::Estimator(_))
+        ));
+        assert!(matches!(
+            pipeline.named_step("a"),
+            Some(PipelineStepRef::Transformer(_))
+        ));
+        // Unknown name -> None (sklearn raises KeyError).
+        assert!(pipeline.get_step_by_name("nope").is_none());
+        assert!(pipeline.named_step("nope").is_none());
+    }
+
+    #[test]
+    fn test_pipeline_into_slice() -> Result<(), FerroError> {
+        // sklearn: p[0:2].steps names == ['a','b'] (a sub-Pipeline of the
+        //   contiguous range; pipeline.py:310). p[:1] == ['a']. p[:] == all.
+        //   p[1:1] == [] (empty). (live oracle, sklearn 1.5.2.)
+        let build = || {
+            Pipeline::new()
+                .transform_step("a", Box::new(DoublingTransformer))
+                .transform_step("b", Box::new(DoublingTransformer))
+                .estimator_step("c", Box::new(SumEstimator))
+        };
+
+        // [0, 2) -> first two transformer steps, no estimator.
+        let sub = build().into_slice(0, 2);
+        assert_eq!(sub.step_names(), vec!["a", "b"]);
+        assert_eq!(sub.len(), 2);
+
+        // [0, 1) -> just the first step.
+        let sub = build().into_slice(0, 1);
+        assert_eq!(sub.step_names(), vec!["a"]);
+
+        // [0, 3) -> the whole pipeline (full range), estimator preserved.
+        let sub = build().into_slice(0, 3);
+        assert_eq!(sub.step_names(), vec!["a", "b", "c"]);
+
+        // [2, 3) -> just the estimator step.
+        let sub = build().into_slice(2, 3);
+        assert_eq!(sub.step_names(), vec!["c"]);
+
+        // Empty range -> empty pipeline.
+        let sub = build().into_slice(1, 1);
+        assert!(sub.step_names().is_empty());
+        assert!(sub.is_empty());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_pipeline_into_slice_clamps_like_python() {
+        // sklearn `Pipeline.__getitem__` slices `self.steps[ind]` (Python list
+        // slice, `pipeline.py:310`): out-of-range bounds CLAMP, never raise
+        // (#2235). Live oracle (sklearn 1.5.2, 2-step pipeline):
+        //   p[0:5].steps -> ['a','c'] (clamp); p[2:1] -> []; p[5:100] -> [].
+        let build = || {
+            Pipeline::new()
+                .transform_step("a", Box::new(DoublingTransformer))
+                .estimator_step("c", Box::new(SumEstimator))
+        };
+        // end past len (2) -> clamp to all.
+        assert_eq!(build().into_slice(0, 5).step_names(), vec!["a", "c"]);
+        // start > end -> empty.
+        assert!(build().into_slice(2, 1).is_empty());
+        // start past len -> empty.
+        assert!(build().into_slice(5, 100).is_empty());
+    }
+
+    #[test]
+    fn test_pipeline_into_slice_transformer_only_still_fits_estimatorless() -> Result<(), FerroError>
+    {
+        // A slice dropping the estimator yields an estimator-less pipeline that
+        // (like sklearn's transformer-only sub-pipeline) is valid to build but
+        // errors at fit (matches REQ-2's no-estimator rejection).
+        let pipeline = Pipeline::new()
+            .transform_step("a", Box::new(DoublingTransformer))
+            .estimator_step("c", Box::new(SumEstimator));
+        let sub = pipeline.into_slice(0, 1);
+        let x = Array2::<f64>::zeros((2, 2));
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        assert!(matches!(
+            sub.fit(&x, &y),
+            Err(FerroError::InvalidParameter { .. })
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_fitted_pipeline_named_steps_and_get_step() -> Result<(), FerroError> {
+        // The accessors work on the FITTED pipeline too. Names match
+        // construction order (sklearn named_steps on a fitted Pipeline).
+        let pipeline = Pipeline::new()
+            .transform_step("scaler", Box::new(DoublingTransformer))
+            .transform_step("norm", Box::new(DoublingTransformer))
+            .estimator_step("clf", Box::new(SumEstimator));
+        let x = Array2::<f64>::zeros((2, 3));
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+
+        let names: Vec<&str> = fitted.named_steps().iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["scaler", "norm", "clf"]);
+        assert_eq!(fitted.len(), 3);
+        assert!(!fitted.is_empty());
+
+        // get_step by integer.
+        assert!(matches!(
+            fitted.get_step(0),
+            Some(FittedPipelineStepRef::Transformer(_))
+        ));
+        assert!(matches!(
+            fitted.get_step(2),
+            Some(FittedPipelineStepRef::Estimator(_))
+        ));
+        assert!(fitted.get_step(3).is_none());
+
+        // get_step_by_name / named_step.
+        assert!(matches!(
+            fitted.get_step_by_name("norm"),
+            Some(FittedPipelineStepRef::Transformer(_))
+        ));
+        assert!(matches!(
+            fitted.named_step("clf"),
+            Some(FittedPipelineStepRef::Estimator(_))
+        ));
+        assert!(fitted.named_step("nope").is_none());
         Ok(())
     }
 }
