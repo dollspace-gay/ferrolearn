@@ -32,8 +32,8 @@
 //! | REQ-3 | `box-cox` method (`stats.boxcox` optimize + transform + check_positive) | NOT-STARTED | Yeo-Johnson only; sklearn `_data.py:3285,3448,3525` — blocker #1344 |
 //! | REQ-4 | `inverse_transform` (Yeo-Johnson + box-cox inverse) | NOT-STARTED | absent; sklearn `_data.py:3347-3424` — blocker #1345 |
 //! | REQ-5 | `power_transform` free function | NOT-STARTED | absent; sklearn `_data.py:3549` — blocker #1346 |
-//! | REQ-6 | Constant-feature → λ=1.0 skip + StandardScaler zero-scale handling | NOT-STARTED | ferrolearn optimizes constant cols (var=0 → -inf), `if s>0` skip; sklearn `_data.py:3300-3302` + `_handle_zeros_in_scale` — blocker #1347 |
-//! | REQ-7 | NaN-drop in optimize + `check_positive` box-cox error | NOT-STARTED | ferrolearn maps NaN→0; sklearn drops NaN `_data.py:3491`, box-cox `:3525` — blocker #1348 |
+//! | REQ-6 | Constant-feature → λ=1.0 skip + StandardScaler zero-scale handling | SHIPPED | [`PowerTransformer::fit`] calls `is_constant_feature` (mirroring sklearn `_is_constant_feature` `_data.py:72-85`) on each (NaN-dropped) column and sets `lambdas[j]=1.0` + `continue` (sklearn `:3299-3302`); the standardize path applies `_handle_zeros_in_scale` (constant → `std=1.0`, `:88-120`/`:1016-1021`) so [`FittedPowerTransformer::transform`] centers a constant column to 0 (always subtract-mean-then-÷scale). Consumers: `_RsPowerTransformer` PyO3 (`extras.rs:1171`, `lib.rs:84`) + `PipelineTransformer` + re-export. Verified by 4 oracle pins in `tests/divergence_power_transformer_edges.rs` (`divergence_constant_feature_lambda`, `divergence_constant_feature_transform_no_std`, `divergence_constant_feature_transform_standardize`, `divergence_single_sample_standardize`). |
+//! | REQ-7 | NaN-drop in optimize (+ `check_positive` box-cox error: NOT-STARTED, box-cox absent) | SHIPPED (NaN-drop) | [`PowerTransformer::fit`] filters `!is_nan()` before the Brent MLE + the standardize stats, mirroring sklearn `x = x[~np.isnan(x)]` (`_data.py:3491`); the transform passes NaN through. Consumers: `_RsPowerTransformer` PyO3 + `PipelineTransformer` + re-export. Verified by 2 oracle pins in `tests/divergence_power_transformer_edges.rs` (`divergence_nan_dropped_in_mle_lambda`, `divergence_nan_transform_finite_rows`). box-cox `check_positive` (`:3525`) remains absent (box-cox not shipped, blocker #1344). |
 //! | REQ-8 | `method`/`copy` ctor params + `_parameter_constraints` | NOT-STARTED | only `standardize`; sklearn `_data.py:3222,3226` — blocker #1349 |
 //! | REQ-9 | `get_feature_names_out` + `n_features_in_`/`feature_names_in_` fitted-attr surface (`lambdas_` accessor exists) | NOT-STARTED | `OneToOneFeatureMixin`; sklearn `_data.py` — blocker #1350 |
 //! | REQ-10 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1351 |
@@ -74,6 +74,21 @@ fn yeo_johnson<F: Float>(y: F, lambda: F) -> F {
             -((one - y).powf(two_minus_lambda) - one) / two_minus_lambda
         }
     }
+}
+
+/// Detect whether a feature is indistinguishable from a constant feature.
+///
+/// Mirrors sklearn's `_is_constant_feature` (`sklearn/preprocessing/_data.py:72-85`):
+/// using float64 machine epsilon, a feature is constant when
+/// `var <= n_samples * eps * var + (n_samples * mean * eps)^2`. This bound comes
+/// from the error analysis of the two-pass variance algorithm and is what
+/// `PowerTransformer._fit` (`:3299`) and `StandardScaler.fit` (`:1016`) use to
+/// detect zero-variance columns.
+fn is_constant_feature(var: f64, mean: f64, n_samples: usize) -> bool {
+    let eps = f64::EPSILON;
+    let n = n_samples as f64;
+    let upper_bound = n * eps * var + (n * mean * eps).powi(2);
+    var <= upper_bound
 }
 
 /// Compute the log-likelihood of a zero-mean, unit-variance normal distribution
@@ -258,13 +273,36 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PowerTransformer<F
         let mut lambdas = Array1::zeros(n_features);
 
         for j in 0..n_features {
-            // Convert column to f64 for the Brent optimizer.
+            // Convert column to f64 and DROP NaN values before the MLE, mirroring
+            // sklearn `_yeo_johnson_optimize` `x = x[~np.isnan(x)]`
+            // (`_data.py:3491`): lambda is estimated over the OBSERVED values only.
             let col_f64: Vec<f64> = x
                 .column(j)
                 .iter()
-                .copied()
-                .map(|v| v.to_f64().unwrap_or(0.0))
+                .filter_map(|v| {
+                    let f = v.to_f64().unwrap_or(f64::NAN);
+                    if f.is_nan() { None } else { Some(f) }
+                })
                 .collect();
+
+            // For yeo-johnson, leave constant features unchanged: lambda=1.0 is
+            // the identity transform. sklearn `_fit` skips the optimizer for a
+            // constant feature and sets `lambdas_[i] = 1.0` (`_data.py:3299-3302`,
+            // via `_is_constant_feature`). A constant column has a degenerate
+            // (variance-0 ⇒ -inf) objective, so the Brent search would otherwise
+            // wander to an interval endpoint.
+            let n_obs = col_f64.len();
+            let (mean, var) = if n_obs == 0 {
+                (0.0, 0.0)
+            } else {
+                let m = col_f64.iter().sum::<f64>() / n_obs as f64;
+                let v = col_f64.iter().map(|&x| (x - m) * (x - m)).sum::<f64>() / n_obs as f64;
+                (m, v)
+            };
+            if is_constant_feature(var, mean, n_obs) {
+                lambdas[j] = F::one();
+                continue;
+            }
 
             // Minimize the negative log-likelihood using Brent's method.
             let result = ferrolearn_numerical::optimize::brent_bounded(
@@ -288,32 +326,47 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PowerTransformer<F
             lambdas[j] = F::from(result.x).unwrap_or_else(F::one);
         }
 
-        // If standardize, compute mean and std of transformed data
+        // If standardize, compute mean and std of transformed data via the same
+        // `StandardScaler(copy=False)` path sklearn applies (`_data.py:3308-3314`).
+        // NaN values are disregarded in the statistics (and maintained during the
+        // transform), matching numpy's `np.mean`/`np.var` NaN behavior here being
+        // driven by the finite observed values. A near-constant (zero-variance)
+        // transformed column gets `scale_` set to 1.0 by `_handle_zeros_in_scale`
+        // (`:1019`, via `_is_constant_feature` on the raw variance, `:1016`), so a
+        // constant column is centered to 0 rather than left unscaled.
         let (means, stds) = if self.standardize {
-            let n = F::from(n_samples).unwrap_or_else(F::one);
             let mut means_arr = Array1::zeros(n_features);
             let mut stds_arr = Array1::zeros(n_features);
             for j in 0..n_features {
                 let lambda = lambdas[j];
-                let transformed: Vec<F> = x
+                let transformed: Vec<f64> = x
                     .column(j)
                     .iter()
                     .copied()
                     .map(|v| yeo_johnson(v, lambda))
+                    .filter_map(|v| {
+                        let f = v.to_f64().unwrap_or(f64::NAN);
+                        if f.is_nan() { None } else { Some(f) }
+                    })
                     .collect();
-                let mean = transformed
-                    .iter()
-                    .copied()
-                    .fold(F::zero(), |acc, v| acc + v)
-                    / n;
-                let variance = transformed
-                    .iter()
-                    .copied()
-                    .map(|v| (v - mean) * (v - mean))
-                    .fold(F::zero(), |acc, v| acc + v)
-                    / n;
-                means_arr[j] = mean;
-                stds_arr[j] = variance.sqrt();
+                let n_obs = transformed.len();
+                let (mean, variance) = if n_obs == 0 {
+                    (0.0, 0.0)
+                } else {
+                    let m = transformed.iter().sum::<f64>() / n_obs as f64;
+                    let v =
+                        transformed.iter().map(|&t| (t - m) * (t - m)).sum::<f64>() / n_obs as f64;
+                    (m, v)
+                };
+                // `_handle_zeros_in_scale`: a constant column ⇒ scale 1.0 so the
+                // centered column becomes exactly 0 (`_data.py:88-120`, `:1016-1021`).
+                let std = if is_constant_feature(variance, mean, n_obs) {
+                    1.0
+                } else {
+                    variance.sqrt()
+                };
+                means_arr[j] = F::from(mean).unwrap_or_else(F::zero);
+                stds_arr[j] = F::from(std).unwrap_or_else(F::one);
             }
             (Some(means_arr), Some(stds_arr))
         } else {
@@ -355,14 +408,17 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPowerTrans
                 *v = yeo_johnson(*v, lambda);
             }
 
-            // Standardize if requested
+            // Standardize if requested. `stds` already carries the
+            // `_handle_zeros_in_scale` semantics from `fit`: a constant column's
+            // scale is 1.0, never 0. So always subtract the mean then divide,
+            // matching `StandardScaler.transform` (`_data.py:3342-3343`) — a
+            // constant column is centered to 0 rather than left unscaled. NaN
+            // rows pass through unchanged (NaN arithmetic preserves NaN).
             if let (Some(means), Some(stds)) = (&self.means, &self.stds) {
                 let m = means[j];
                 let s = stds[j];
-                if s > F::zero() {
-                    for v in &mut col {
-                        *v = (*v - m) / s;
-                    }
+                for v in &mut col {
+                    *v = (*v - m) / s;
                 }
             }
         }

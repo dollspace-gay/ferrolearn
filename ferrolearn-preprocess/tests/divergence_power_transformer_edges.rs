@@ -8,7 +8,8 @@
 //! LIVE sklearn 1.5.2 oracle (run from /tmp) — never copied from ferrolearn
 //! (R-CHAR-3).
 //!
-//! Each test is `#[ignore]`d under its tracking blocker and FAILS today.
+//! These edges are now FIXED (REQ-6 constant-feature/zero-scale + REQ-7
+//! NaN-drop): all 6 pins are active `#[test]`s and pass against the oracle.
 
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::PowerTransformer;
@@ -55,7 +56,6 @@ const SK_NAN_XFORM_FINITE: [(usize, f64); 4] = [
 /// degenerate (variance=0 ⇒ -inf) objective lands on ~2.99999996.
 /// sklearn λ=1.0; ferrolearn λ≈3.0. Tracking blocker #1347.
 #[test]
-#[ignore = "divergence: constant feature λ≠1.0 (REQ-6 not-started); tracking #1347"]
 fn divergence_constant_feature_lambda() {
     let pt = PowerTransformer::<f64>::without_standardize();
     let x = array![[3.0], [3.0], [3.0], [3.0]];
@@ -72,7 +72,6 @@ fn divergence_constant_feature_lambda() {
 /// wrong λ≈3.0 maps each 3.0 to ((3+1)^3 - 1)/3 ≈ 21.0.
 /// sklearn xform=[3,3,3,3]; ferrolearn≈[21,21,21,21]. Tracking blocker #1347.
 #[test]
-#[ignore = "divergence: constant feature transform wrong (REQ-6 not-started); tracking #1347"]
 fn divergence_constant_feature_transform_no_std() {
     let pt = PowerTransformer::<f64>::without_standardize();
     let x = array![[3.0], [3.0], [3.0], [3.0]];
@@ -94,7 +93,6 @@ fn divergence_constant_feature_transform_no_std() {
 /// so it returns the raw (wrong-λ) transform ≈21.0.
 /// sklearn xform=[0,0,0,0]; ferrolearn≈[21,21,21,21]. Tracking blocker #1347.
 #[test]
-#[ignore = "divergence: constant feature std=True ≠0 (REQ-6 not-started); tracking #1347"]
 fn divergence_constant_feature_transform_standardize() {
     let pt = PowerTransformer::<f64>::new(); // standardize=true (default)
     let x = array![[3.0], [3.0], [3.0], [3.0]];
@@ -114,7 +112,6 @@ fn divergence_constant_feature_transform_standardize() {
 /// ferrolearn → λ≈3.0, transform ≈71.67.
 /// sklearn xform=[0.0]; ferrolearn≈[71.67]. Tracking blocker #1347.
 #[test]
-#[ignore = "divergence: single-sample std=True ≠0 (REQ-6 not-started); tracking #1347"]
 fn divergence_single_sample_standardize() {
     let pt = PowerTransformer::<f64>::new();
     let x = array![[5.0]];
@@ -139,7 +136,6 @@ fn divergence_single_sample_standardize() {
 /// spurious sample into the objective → a different λ (≈-0.708).
 /// Tracking blocker #1348.
 #[test]
-#[ignore = "divergence: NaN→0.0 poisons MLE λ (REQ-7 not-started); tracking #1348"]
 fn divergence_nan_dropped_in_mle_lambda() {
     let pt = PowerTransformer::<f64>::without_standardize();
     let x = array![[1.0], [2.0], [f64::NAN], [4.0], [5.0]];
@@ -157,7 +153,6 @@ fn divergence_nan_dropped_in_mle_lambda() {
 /// every finite row wrong (and only by side-effect leaves NaN as NaN).
 /// Tracking blocker #1348.
 #[test]
-#[ignore = "divergence: NaN-fixture transform values wrong (REQ-7 not-started); tracking #1348"]
 fn divergence_nan_transform_finite_rows() {
     let pt = PowerTransformer::<f64>::without_standardize();
     let x = array![[1.0], [2.0], [f64::NAN], [4.0], [5.0]];
