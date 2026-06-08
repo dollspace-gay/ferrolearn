@@ -28,7 +28,7 @@
 //! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
 //! | REQ-7 (explicit categories param) | NOT-STARTED | open prereq blocker #1162. Always `'auto'` (`:1252`). |
 //! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
-//! | REQ-9 (inverse_transform) | NOT-STARTED | open prereq blocker #1164. None. |
+//! | REQ-9 (inverse_transform) | SHIPPED | `FittedOrdinalEncoder::inverse_transform(&Array2<f64>) -> Array2<String>` reuses the SHIPPED `categories_` (REQ-1): each cell is an ordinal index into `categories[j]`, mirroring sklearn `X_tr[:, i] = self.categories_[i][labels]` (`_encoders.py:1595-1679`). Validates the index BEFORE lookup (no panic, R-CODE-2): an exact non-negative integer in `[0, len)` → `categories[j][index].clone()`; 0-row → `InsufficientSamples` (symmetry with the #2220 transform guard); ncols-mismatch → `ShapeMismatch` (sklearn `:1619`). FAITHFUL to numpy: mirrors `labels.astype("int64")` (truncate toward zero, Rust `as i64`) + numpy fancy indexing (negative WRAP, `-1.0` → last category, `-2.0` → `len-2`), raising only once the wrapped index leaves `[0, len)` (`_encoders.py:1664`,`:1679`). Non-finite (NaN/±inf) → `InvalidParameter` (sklearn IndexError/ValueError; guarded because Rust `f64 as i64` saturates NaN→0). Critic-verified vs live sklearn 1.5.2 oracle: `green_inverse_roundtrip_multifeature`, `green_inverse_held_out_valid_ordinals`, `green_inverse_negative_wraps_like_numpy` (`-1.0`→'dog', `-2.0`→'cat', `-3.0`→Err), `green_inverse_non_integer_truncates_like_numpy` (`1.5`→'dog', `0.7`→'cat'), `red_inverse_out_of_range_positive` (`9.0`→Err), `red_inverse_ncols_mismatch`, `red_inverse_zero_row`, `red_inverse_use_encoded_value_unknown_cell` (`tests/divergence_ordinal_encoder.rs`). SCOPE LIMITATION (R-HONEST-3): the `unknown_value`-cell → `None` inverse (sklearn `:1673`) is unrepresentable in `Array2<String>` (would need `Array2<Option<String>>`), so a `use_encoded_value` cell equal to `unknown_value` ERRORS (checked BEFORE the index logic so the sentinel is not silently wrapped) instead of yielding `None`; the default `Error`-mode encoder has only valid ordinals so its inverse is COMPLETE and bit-exact. Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-10 (get_feature_names_out + n_features_in_) | NOT-STARTED | open prereq blocker #1165. Only `n_features()`. |
 //! | REQ-11 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1166. `new()` takes no params (`:1320-1386`). |
 //! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1167. No `ferrolearn-python` registration (R-DEFER-1). |
@@ -205,6 +205,152 @@ impl FittedOrdinalEncoder {
     #[must_use]
     pub fn unknown_value(&self) -> Option<f64> {
         self.unknown_value
+    }
+
+    /// Convert ordinal indices back to the original category strings.
+    ///
+    /// This is the inverse of [`Transform::transform`]: each `f64` cell is read
+    /// as an ordinal index into the per-column `categories_` learned at `fit`
+    /// time, and the corresponding category string is returned. Reusing the
+    /// SHIPPED `categories_` (REQ-1), `inverse_transform(transform(X)) == X` for
+    /// any `X` whose every category was seen during `fit` (a bit-exact roundtrip
+    /// on the default `Error`-mode encoder). Mirrors scikit-learn's
+    /// `OrdinalEncoder.inverse_transform` (`sklearn/preprocessing/_encoders.py:1595`),
+    /// `X_tr[:, i] = self.categories_[i][labels]`.
+    ///
+    /// # Index contract (faithful to sklearn / numpy)
+    ///
+    /// Mirrors sklearn's `labels.astype("int64")` (`_encoders.py:1664`) followed
+    /// by numpy fancy indexing `categories_[j][labels]` (`:1679`):
+    /// - **truncates non-integers toward zero** (`1.5` → index `1` → that
+    ///   category; `0.7` → `0`) — Rust `f64 as i64` matches the C-style cast.
+    /// - **wraps small negatives** via numpy negative indexing (`-1.0` →
+    ///   `categories_[j][len-1]`, the LAST category; `-2.0` → `len-2`), raising
+    ///   only once the wrapped index still leaves `[0, len)` (`-3.0` with 2
+    ///   categories → `IndexError`).
+    /// - **errors** on an out-of-range positive ordinal (`9.0` with 2 categories
+    ///   → sklearn `IndexError`) and on a non-finite cell (NaN/±inf overflow the
+    ///   `astype("int64")` cast → sklearn `IndexError`/`ValueError`; guarded
+    ///   explicitly because Rust's `f64 as i64` saturates NaN→0, which would
+    ///   diverge).
+    ///
+    /// The roundtrip, held-out valid-ordinal, truncation, and negative-wrap paths
+    /// all match sklearn; out-of-range / non-finite both error.
+    ///
+    /// # `use_encoded_value` → `None` (SCOPE LIMITATION, R-HONEST-3)
+    ///
+    /// With [`HandleUnknown::UseEncodedValue`], sklearn maps a cell equal to
+    /// `unknown_value` back to `None` (`_encoders.py:1673`,
+    /// `X_tr[mask, idx] = None`). ferrolearn's `Array2<String>` output container
+    /// **cannot represent `None`** (it would require `Array2<Option<String>>`).
+    /// The configured `unknown_value` is itself out of the valid `[0, len)`
+    /// range (e.g. `-1`), so such a cell hits the out-of-range error path: this
+    /// inverse therefore ERRORS where sklearn returns `[[None, ...]]`. This is a
+    /// documented divergence, not a silent wrong-string — the honest behavior is
+    /// to error rather than fabricate a category. The default `Error`-mode
+    /// encoder produces only valid ordinals, so its inverse is COMPLETE and
+    /// bit-exact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows
+    /// (symmetry with `transform`'s #2220 guard and sklearn's `check_array`).
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
+    /// match the number of features seen during fitting (sklearn's
+    /// `_encoders.py:1619` "Shape of the passed X data is not correct").
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if any cell is not an exact
+    /// non-negative integer in `[0, categories_[j].len())` (sklearn's
+    /// `IndexError`, plus the strict negative/non-integer contract above).
+    pub fn inverse_transform(&self, x: &Array2<f64>) -> Result<Array2<String>, FerroError> {
+        let n_features = self.categories.len();
+        // Symmetric with `transform`'s 0-row guard (#2220) and sklearn's
+        // `check_array` minimum-of-1-sample (`_encoders.py:1610`): a 0-row input
+        // raises "Found array with 0 sample(s) ... a minimum of 1 is required".
+        if x.nrows() == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "FittedOrdinalEncoder::inverse_transform".into(),
+            });
+        }
+        // sklearn validates the column count (`_encoders.py:1619`) -> ValueError.
+        if x.ncols() != n_features {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), n_features],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedOrdinalEncoder::inverse_transform".into(),
+            });
+        }
+
+        let n_samples = x.nrows();
+        // `Array2::default` fills with the empty String; every cell is overwritten
+        // on the Ok path, so the default is never observed by the caller.
+        let mut out = Array2::<String>::default((n_samples, n_features));
+
+        for j in 0..n_features {
+            let cats = &self.categories[j];
+            let len = cats.len() as i64;
+            for i in 0..n_samples {
+                let v = x[[i, j]];
+                // `use_encoded_value`: sklearn maps a cell equal to
+                // `unknown_value` back to `None` (`_encoders.py:1673`) BEFORE the
+                // int cast / indexing. `Array2<String>` cannot hold `None`, so
+                // this cell errors (documented scope limitation, R-HONEST-3) —
+                // checked first so the configured sentinel (e.g. `-1`) is NOT
+                // silently wrapped to a real category by the numpy index logic.
+                if self.handle_unknown == HandleUnknown::UseEncodedValue
+                    && let Some(uv) = self.unknown_value
+                    && (v == uv || (v.is_nan() && uv.is_nan()))
+                {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: format!(
+                            "value {v} at row {i}, feature {j} equals unknown_value; \
+                             sklearn inverts it to None, which Array2<String> cannot \
+                             represent (would need Array2<Option<String>>)"
+                        ),
+                    });
+                }
+                // sklearn does `labels.astype('int64')` then `categories_[j][idx]`
+                // (`_encoders.py:1664`,`:1679`). A non-finite cell overflows the
+                // cast (NaN/+-inf -> IndexError/ValueError); reject it (R-CODE-2:
+                // Rust's `f64 as i64` would saturate NaN->0, diverging from numpy,
+                // so guard explicitly).
+                if !v.is_finite() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: format!(
+                            "value {v} at row {i}, feature {j} is not a finite ordinal \
+                             index (sklearn raises on NaN/inf astype('int64'))"
+                        ),
+                    });
+                }
+                // `astype('int64')` truncates toward zero (Rust `as i64` matches
+                // for finite values); numpy indexing then WRAPS a negative index
+                // by `+= len` (`-1` -> last category), raising only once the
+                // wrapped index still leaves `[0, len)`.
+                let mut idx = v as i64;
+                if idx < 0 {
+                    idx += len;
+                }
+                if idx < 0 || idx >= len {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: format!(
+                            "ordinal index {} at row {i} is out of bounds for the {len} \
+                             categories of feature {j} (sklearn IndexError)",
+                            v as i64
+                        ),
+                    });
+                }
+                // `idx` is now provably in `[0, len)` (checked above) — no panic.
+                out[[i, j]] = cats[idx as usize].clone();
+            }
+        }
+
+        Ok(out)
     }
 }
 

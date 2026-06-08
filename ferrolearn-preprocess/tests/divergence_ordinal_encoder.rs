@@ -562,3 +562,214 @@ fn green_error_mode_unknown_still_rejected() {
         "default error-mode must still reject unknown 'fish' (REQ-2 preserved)"
     );
 }
+
+// ===========================================================================
+// REQ-9 — inverse_transform.
+//
+// EVERY expected value below comes from a LIVE sklearn 1.5.2 oracle (R-CHAR-3),
+// reproduced via the `python3 -c` command cited above each test. The encoder
+// fixture for the block:
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     print([c.tolist() for c in e.categories_])"
+//   -> [['cat','dog'], ['x','y','z']]
+// ===========================================================================
+
+/// The shared fixture: fit on cat/dog x col0 and x/y/z col1.
+fn fit_inv_fixture() -> ferrolearn_preprocess::FittedOrdinalEncoder {
+    let enc = OrdinalEncoder::new();
+    let x = make_2col(&[("cat", "x"), ("dog", "y"), ("cat", "z")]);
+    enc.fit(&x, &()).unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 15 (REQ-9) — roundtrip: inverse_transform(transform(X)) == X,
+// multi-feature.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     X=[['cat','x'],['dog','y'],['cat','z']]; \
+//     print(e.inverse_transform(e.transform(X)).tolist())"
+//   -> [['cat','x'],['dog','y'],['cat','z']]   (== the original X)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_inverse_roundtrip_multifeature() {
+    let fitted = fit_inv_fixture();
+    let x = make_2col(&[("cat", "x"), ("dog", "y"), ("cat", "z")]);
+    let encoded = fitted.transform(&x).unwrap();
+    let recovered = fitted.inverse_transform(&encoded).unwrap();
+    // sklearn roundtrip recovers the original strings exactly.
+    assert_eq!(
+        recovered, x,
+        "inverse_transform(transform(X)) == X (oracle)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 16 (REQ-9) — held-out valid ordinals decode to the oracle strings.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     print(e.inverse_transform([[1.,0.]]).tolist())"
+//   -> [['dog','x']]   (col0 index 1 -> 'dog'; col1 index 0 -> 'x')
+// ---------------------------------------------------------------------------
+#[test]
+fn green_inverse_held_out_valid_ordinals() {
+    let fitted = fit_inv_fixture();
+    let probe = Array2::from_shape_vec((1, 2), vec![1.0_f64, 0.0]).unwrap();
+    let out = fitted.inverse_transform(&probe).unwrap();
+    // Oracle: [['dog','x']].
+    assert_eq!(out[[0, 0]], "dog", "col0 index 1 -> 'dog' (oracle)");
+    assert_eq!(out[[0, 1]], "x", "col1 index 0 -> 'x' (oracle)");
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 4 (REQ-9) — out-of-range POSITIVE ordinal -> Err (MATCHES sklearn
+// IndexError).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     e.inverse_transform([[9.,0.]])"
+//   -> IndexError: index 9 is out of bounds for axis 0 with size 2
+// ferrolearn maps sklearn's IndexError -> FerroError::InvalidParameter (Err).
+// ---------------------------------------------------------------------------
+#[test]
+fn red_inverse_out_of_range_positive() {
+    let fitted = fit_inv_fixture();
+    // col0 has 2 categories; index 9 is out of bounds.
+    let probe = Array2::from_shape_vec((1, 2), vec![9.0_f64, 0.0]).unwrap();
+    assert!(
+        fitted.inverse_transform(&probe).is_err(),
+        "index 9 with 2 categories -> sklearn IndexError; ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 5 (REQ-9) — NEGATIVE ordinal -> Err.
+//
+// DIVERGENCE (R-HONEST-3): sklearn does NOT error here — `-1.0` is cast to
+// int64 and numpy NEGATIVE INDEXING wraps it to the LAST category.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     print(e.inverse_transform([[-1.,0.]]).tolist())"
+//   -> [['dog','x']]   (numpy categories_[0][-1] == 'dog'; NOT an error)
+// ferrolearn now MIRRORS numpy's negative-index wrap (#1164 faithful).
+// ---------------------------------------------------------------------------
+#[test]
+fn green_inverse_negative_wraps_like_numpy() {
+    let fitted = fit_inv_fixture();
+    // LIVE oracle: inverse_transform([[-1.,0.]]) -> [['dog','x']]
+    // (categories_[0][-1] == 'dog'); [[-2.,0.]] -> [['cat','x']] (idx -2+2=0).
+    let probe = Array2::from_shape_vec((1, 2), vec![-1.0_f64, 0.0]).unwrap();
+    let out = fitted.inverse_transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], "dog");
+    assert_eq!(out[[0, 1]], "x");
+    let probe2 = Array2::from_shape_vec((1, 2), vec![-2.0_f64, 0.0]).unwrap();
+    let out2 = fitted.inverse_transform(&probe2).unwrap();
+    assert_eq!(out2[[0, 0]], "cat");
+    // -3.0 wraps to -1 (still < 0) -> out of bounds -> Err (sklearn IndexError).
+    let probe3 = Array2::from_shape_vec((1, 2), vec![-3.0_f64, 0.0]).unwrap();
+    assert!(fitted.inverse_transform(&probe3).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD (REQ-9) — NON-INTEGER ordinal truncates toward zero (sklearn).
+//
+// sklearn: `1.5` is cast to int64 (truncates toward zero -> 1) and decodes to
+// 'dog'; `0.7` -> 0 -> 'cat'. ferrolearn now MIRRORS this (#1164 faithful).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     print(e.inverse_transform([[1.5,0.]]).tolist())"
+//   -> [['dog','x']]   (astype('int64') truncates 1.5 -> 1 -> 'dog')
+// ---------------------------------------------------------------------------
+#[test]
+fn green_inverse_non_integer_truncates_like_numpy() {
+    let fitted = fit_inv_fixture();
+    let probe = Array2::from_shape_vec((1, 2), vec![1.5_f64, 0.0]).unwrap();
+    let out = fitted.inverse_transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], "dog"); // 1.5 -> 1 -> 'dog'
+    assert_eq!(out[[0, 1]], "x");
+    let probe2 = Array2::from_shape_vec((1, 2), vec![0.7_f64, 0.0]).unwrap();
+    let out2 = fitted.inverse_transform(&probe2).unwrap();
+    assert_eq!(out2[[0, 0]], "cat"); // 0.7 -> 0 -> 'cat'
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 7 (REQ-9) — ncols mismatch -> Err (MATCHES sklearn ValueError).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     e.inverse_transform([[1.,0.,2.]])"
+//   -> ValueError: Shape of the passed X data is not correct. Expected 2 columns, got 3.
+// ---------------------------------------------------------------------------
+#[test]
+fn red_inverse_ncols_mismatch() {
+    let fitted = fit_inv_fixture();
+    let probe = Array2::from_shape_vec((1, 3), vec![1.0_f64, 0.0, 2.0]).unwrap();
+    assert!(
+        fitted.inverse_transform(&probe).is_err(),
+        "3 cols when 2 expected -> sklearn ValueError; ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 8 (REQ-9) — 0-row input -> Err (MATCHES sklearn ValueError via
+// check_array, symmetric with the transform #2220 guard).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import \
+//     OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     e.inverse_transform(np.empty((0,2)))"
+//   -> ValueError: Found array with 0 sample(s) (shape=(0, 2)) while a minimum
+//      of 1 is required.
+// ---------------------------------------------------------------------------
+#[test]
+fn red_inverse_zero_row() {
+    let fitted = fit_inv_fixture();
+    let probe: Array2<f64> = Array2::from_shape_vec((0, 2), vec![]).unwrap();
+    assert!(
+        fitted.inverse_transform(&probe).is_err(),
+        "0-row inverse -> sklearn ValueError (check_array); ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 9 (REQ-9) — use_encoded_value unknown_value cell -> Err.
+//
+// SCOPE LIMITATION (R-HONEST-3): sklearn maps the `unknown_value` cell back to
+// `None`, which `Array2<String>` cannot represent (would need
+// `Array2<Option<String>>`). The `unknown_value` (-1) is itself out of the
+// valid `[0, len)` range, so ferrolearn takes the out-of-range error path.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(handle_unknown='use_encoded_value',unknown_value=-1)\
+//       .fit([['cat','x'],['dog','y'],['cat','z']]); \
+//     print(e.inverse_transform([[-1.,0.]]).tolist())"
+//   -> [[None, 'x']]   (the unknown_value cell decodes to None)
+// ferrolearn ERRORS (cannot represent None) — the honest, non-fabricating
+// behavior; the default Error-mode encoder's inverse is complete & bit-exact.
+// ---------------------------------------------------------------------------
+#[test]
+fn red_inverse_use_encoded_value_unknown_cell() {
+    let enc = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(-1.0);
+    let x_train = make_2col(&[("cat", "x"), ("dog", "y"), ("cat", "z")]);
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let probe = Array2::from_shape_vec((1, 2), vec![-1.0_f64, 0.0]).unwrap();
+    // sklearn returns [[None,'x']]; ferrolearn cannot represent None -> Err.
+    assert!(
+        fitted.inverse_transform(&probe).is_err(),
+        "use_encoded_value cell -> sklearn [[None,'x']]; ferrolearn errors (Array2<String> can't hold None)"
+    );
+}
