@@ -22,7 +22,7 @@
 //! | REQ-7 inverse_transform multiclass argmax | SHIPPED | `inverse_transform` else-branch; sklearn `_label.py:641` |
 //! | REQ-8 neg_label/pos_label ctor params + validation | SHIPPED (#1242) | `LabelBinarizer::with_neg_label`/`with_pos_label` + `Fit::fit` validation; `transform` neg/pos base+active; `inverse_transform` `(pos+neg)/2` threshold; consumer crate re-export `lib.rs`; sklearn `_label.py:263`,`:283-287`,`:579-583`,`:667` |
 //! | REQ-9 sparse_output CSR + constraint | NOT-STARTED (#1243) | sklearn `_label.py:563`,`:584-585`,`:289-294` |
-//! | REQ-10 `label_binarize` free function | NOT-STARTED (#1244) | sklearn `_label.py:430` |
+//! | REQ-10 `label_binarize` free function | SHIPPED (#1244) | `pub fn label_binarize` (this file): `neg<pos` validation (verbatim msg, sklearn `_label.py:499-504`); GIVEN-order columns (sklearn's "preserve label ordering" reorder `:587-590`, so `label_binarize([0,2,1],classes=[2,0,1])` → `[[0,1,0],[1,0,0],[0,0,1]]`); k==1 all-neg col (`:532-538`); single-col collapse gated on `type_of_target(y)=="binary"` AND `len(classes)==2` (NOT `len(classes)` alone — `:519`,`:531`,`:592-596`; "binary" = ≤2 distinct values for 1D int y, verified live, #2233), giving pos where `y==classes[1]` (the kept `Y[:,-1]` after reorder, `:596`); k==2 with multiclass y (3+ distinct) emits 2 cols, no collapse; k>2 one-hot in given order (`:552-577`); unseen label → all-neg row (`:556-559`). Consumer: crate re-export `lib.rs` (`pub use label_binarizer::label_binarize`). Live-oracle parity: `tests/divergence_label_binarizer.rs` (basic/neg-pos/binary/`[2,0,1]`-ordering/unseen/neg≥pos-err/==estimator). |
 //! | REQ-11 arbitrary label types + type_of_target/multilabel input | NOT-STARTED (#1245) | sklearn `_label.py:296`,`:543-550` (usize-only, R-DEV-3) |
 //! | REQ-12 PyO3 binding | NOT-STARTED (#1246) | `ferrolearn-python/src/` (absent) |
 //!
@@ -294,6 +294,20 @@ impl Transform<Array1<usize>> for FittedLabelBinarizer {
         let k = self.classes.len();
         let n = y.len();
 
+        // sklearn `LabelBinarizer.transform` delegates to `label_binarize`, which
+        // gates the binary single-column collapse on `type_of_target(y)=="binary"`
+        // (`_label.py:519`,`:531`) — computed on the TRANSFORM input `y`, NOT the
+        // fitted class count (#2234). For 1D integer `y`, "binary" means at most 2
+        // distinct values; a MULTICLASS transform input (3+ distinct) with 2
+        // fitted classes therefore emits the (n, 2) multi-column form, not the
+        // single column (e.g. fit([0,1]).transform([0,1,2]) -> [[1,0],[0,1],[0,0]]).
+        let y_is_binary = {
+            let mut distinct: Vec<usize> = y.iter().copied().collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            distinct.len() <= 2
+        };
+
         // The base ("absent") value is `neg_label`; the active ("present")
         // value is `pos_label`, mirroring sklearn `label_binarize`'s dense fill
         // `Y[Y == 0] = neg_label` (`_label.py:579-583`) and the `pos_label`
@@ -315,9 +329,10 @@ impl Transform<Array1<usize>> for FittedLabelBinarizer {
             // never `pos_label` (`sklearn/preprocessing/_label.py:532-538`:
             // `Y = np.zeros((len(y), 1)); Y += neg_label`).
             Ok(Array2::from_elem((n, 1), neg))
-        } else if k == 2 {
+        } else if k == 2 && y_is_binary {
             // Binary: single column, `pos_label` for the second class else
             // `neg_label`. The base is filled with `neg_label` (NOT zeros).
+            // Only when the transform input is itself binary (#2234).
             let mut out = Array2::from_elem((n, 1), neg);
             for (i, &label) in y.iter().enumerate() {
                 // Unseen labels are silently ignored (row left at `neg_label`),
@@ -340,6 +355,165 @@ impl Transform<Array1<usize>> for FittedLabelBinarizer {
             }
             Ok(out)
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `label_binarize` free function (sklearn `label_binarize`, `_label.py:430`)
+// ---------------------------------------------------------------------------
+
+/// Binarize integer labels one-vs-all against an EXPLICIT class list — the
+/// standalone, estimator-less API mirroring scikit-learn's `label_binarize`
+/// free function (`sklearn/preprocessing/_label.py:430`).
+///
+/// Unlike [`LabelBinarizer`], which discovers its classes by fitting, this
+/// function takes the class set as an explicit `classes` argument and encodes
+/// `y` against it. The output is a binary indicator matrix written with
+/// `pos_label` at active positions and `neg_label` everywhere else (defaults
+/// `0` / `1`).
+///
+/// # Column ordering (the headline)
+///
+/// The output **columns follow the GIVEN `classes` order**, NOT a sorted order.
+/// sklearn builds the indicator in sorted-class order internally
+/// (`sorted_class = np.sort(classes)`, `_label.py:542`; columns via
+/// `np.searchsorted`, `:558`) but then **reorders the columns back to the given
+/// `classes` order** in the "preserve label ordering" step (`:587-590`:
+/// `indices = np.searchsorted(sorted_class, classes); Y = Y[:, indices]`).
+/// So `label_binarize([0,2,1], classes=[2,0,1])` yields
+/// `[[0,1,0],[1,0,0],[0,0,1]]` — column `j` corresponds to `classes[j]`, the
+/// *given* class, with `pos_label` where `y[i] == classes[j]`. (Verified live
+/// vs sklearn 1.5.2; see `tests/divergence_label_binarizer.rs`.)
+///
+/// # Shape / collapse rules
+///
+/// The single-column collapse is gated on `type_of_target(y) == "binary"`, NOT
+/// on `len(classes)` (`_label.py:519` `y_type = type_of_target(y)`; `:531`
+/// `if y_type == "binary":`; the collapse at `:592-596`). For 1D integer `y`,
+/// `type_of_target` is "binary" iff `y` has at most two distinct values, else
+/// "multiclass" (verified live vs sklearn 1.5.2). Writing
+/// `y_is_binary = (distinct count of y) <= 2`:
+/// - `k == 1`: a single all-`neg_label` column (`_label.py:532-538`).
+/// - `k == 2` AND `y_is_binary`: a single column — `pos_label` where
+///   `y == classes[last]` (the LAST given class), else `neg_label`. sklearn
+///   builds both columns then takes `Y[:, -1]` after the reorder
+///   (`_label.py:596`), so the kept column is the one for the last *given*
+///   class. (When `classes` is sorted — as the fitted estimator always is —
+///   `classes[last]` is the second-sorted class, so this coincides with
+///   [`FittedLabelBinarizer::transform`]'s `idx == 1` rule.)
+/// - `k == 2` but `y` is multiclass (3+ distinct values): NO collapse —
+///   `k == 2` columns in given order (`y_type` is not "binary", so the `:592`
+///   single-column step is skipped). E.g. `label_binarize([0,1,2], classes=[0,1])`
+///   → `(3, 2)` `[[1,0],[0,1],[0,0]]`, with the unseen `2` leaving an all-`neg`
+///   row.
+/// - `k > 2`: `k` columns in given order, `pos_label` at the value's column.
+///
+/// A value in `y` not present in `classes` leaves its row all-`neg_label`,
+/// mirroring sklearn's `y_in_classes = np.isin(y, classes)` silent ignore
+/// (`_label.py:556-559`).
+///
+/// `classes` is expected to be unique (sklearn: "Uniquely holds the label for
+/// each class", `_label.py:447`); duplicate entries are not part of the matched
+/// contract.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `neg_label >= pos_label`, with
+/// the same verbatim message as [`LabelBinarizer`]'s `fit`
+/// (`_label.py:499-504`: `neg_label={neg} must be strictly less than
+/// pos_label={pos}.`). Returns [`FerroError::InsufficientSamples`] if `classes`
+/// is empty (sklearn cannot binarize against zero classes).
+#[must_use = "label_binarize returns a new indicator matrix"]
+pub fn label_binarize(
+    y: &Array1<usize>,
+    classes: &[usize],
+    neg_label: i64,
+    pos_label: i64,
+) -> Result<Array2<f64>, FerroError> {
+    // Validate neg_label < pos_label, mirroring sklearn `label_binarize`
+    // (`_label.py:499-504`) — the SAME verbatim message as the estimator's
+    // `fit` (`LabelBinarizer::fit`).
+    if neg_label >= pos_label {
+        return Err(FerroError::InvalidParameter {
+            name: "neg_label".into(),
+            reason: format!(
+                "neg_label={neg_label} must be strictly less than pos_label={pos_label}."
+            ),
+        });
+    }
+
+    let k = classes.len();
+    if k == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "label_binarize: classes".into(),
+        });
+    }
+
+    let n = y.len();
+    let neg = neg_label as f64;
+    let pos = pos_label as f64;
+
+    // Map each given class value to its GIVEN-order column index. The output
+    // columns follow the given `classes` order (sklearn's "preserve label
+    // ordering" reorder, `_label.py:587-590`), so column `j` belongs to
+    // `classes[j]`. For unique `classes` the last write wins identically; the
+    // contract assumes uniqueness (`_label.py:447`).
+    let class_to_col: std::collections::HashMap<usize, usize> =
+        classes.iter().enumerate().map(|(j, &c)| (c, j)).collect();
+
+    // The single-column collapse is gated on `type_of_target(y) == "binary"`,
+    // NOT on `len(classes)` (`_label.py:519` `y_type = type_of_target(y)`;
+    // `:531` `if y_type == "binary":`; the collapse itself at `:592-596`). For
+    // 1D integer `y`, `type_of_target` returns "binary" iff `y` has at most two
+    // distinct values, else "multiclass" (verified live vs sklearn 1.5.2:
+    // 1-distinct → "binary", 2-distinct → "binary", 3+ distinct → "multiclass").
+    // So `[5,5]` (1 distinct) and `[0,1,0]` (2 distinct) are binary, but
+    // `[0,1,2]` (3 distinct) is multiclass. When `k == 2` but `y` is multiclass,
+    // sklearn promotes to the `n_classes`-column form (`:539-540` only fires for
+    // `len(classes) >= 3`; here the non-binary `y_type` simply means the `:592`
+    // collapse is skipped), giving a `(n, 2)` indicator.
+    let mut distinct: Vec<usize> = y.iter().copied().collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let y_is_binary = distinct.len() <= 2;
+
+    if k == 1 {
+        // n_classes == 1: all-`neg_label` single column (`_label.py:532-538`:
+        // `Y = np.zeros((len(y), 1)); Y += neg_label`). sklearn reaches this only
+        // when `y_type == "binary"` too; for plain integer `y` a single class
+        // implies `y` has ≤1 distinct value, which is always binary, so this
+        // single-column form is unconditional here.
+        Ok(Array2::from_elem((n, 1), neg))
+    } else if k == 2 && y_is_binary {
+        // Binary `y` with exactly two classes: the single column kept after the
+        // given-order reorder is `Y[:, -1]` (`_label.py:596`) — the column for
+        // the LAST given class. So `pos_label` where `y == classes[1]`, else
+        // `neg_label`. Unseen labels (not in `classes`) stay at `neg_label`
+        // (`:556-559`).
+        let last_class = classes[1];
+        let mut out = Array2::from_elem((n, 1), neg);
+        for (i, &label) in y.iter().enumerate() {
+            if label == last_class {
+                out[[i, 0]] = pos;
+            }
+        }
+        Ok(out)
+    } else {
+        // `k` columns in GIVEN order, `pos_label` at the value's column
+        // (`_label.py:552-577` + the `:587-590` reorder to the given order).
+        // Reached for genuine multiclass (`k > 2`) AND for `k == 2` with a
+        // multiclass `y` (3+ distinct values), where sklearn skips the `:592`
+        // single-column collapse and emits the full `(n, k)` indicator. Unseen
+        // labels leave the row all-`neg_label` (`:556-559`).
+        let mut out = Array2::from_elem((n, k), neg);
+        for (i, &label) in y.iter().enumerate() {
+            if let Some(&col) = class_to_col.get(&label) {
+                out[[i, col]] = pos;
+            }
+        }
+        Ok(out)
     }
 }
 

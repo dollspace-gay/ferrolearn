@@ -533,7 +533,6 @@ fn req10_label_binarize_equals_estimator() {
 // Tracking: #2233
 // ===========================================================================
 #[test]
-#[ignore = "divergence: label_binarize collapses by len(classes) not type_of_target(y); tracking #2233"]
 fn divergence_label_binarize_binary_classes_multiclass_y() {
     let y: Array1<usize> = array![0, 1, 2];
     // sklearn-oracle: 2 columns, row for unseen label 2 all-zero.
@@ -541,4 +540,118 @@ fn divergence_label_binarize_binary_classes_multiclass_y() {
     let got = label_binarize(&y, &[0, 1], 0, 1).unwrap();
     assert_eq!(got.shape(), &[3, 2]);
     assert_eq!(got, expected);
+}
+
+// ===========================================================================
+// REGRESSION GUARDS for the #2233 type_of_target collapse gating.
+//
+// The single-column collapse is gated on `type_of_target(y) == "binary"` AND
+// `len(classes) == 2` (`_label.py:519`,`:531`,`:592-596`). For 1D integer `y`,
+// `type_of_target` is "binary" iff `y` has at most two distinct values
+// (verified live vs sklearn 1.5.2 below). These guards lock the FIVE corners:
+// binary y (collapse), k=3 (no collapse, both backends agree), single-distinct
+// y with 2 classes (still binary → collapse), and the 3-distinct multiclass y
+// (no collapse) covered by the pin above.
+// ===========================================================================
+
+/// Binary `y` (2 distinct values) with `classes=[0,1]` → still collapses to a
+/// single column (type_of_target([0,1,0])=="binary").
+/// Live oracle (sklearn 1.5.2, from /tmp):
+///   `type_of_target([0,1,0])` == "binary"
+///   `label_binarize([0,1,0], classes=[0,1]).tolist()` -> `[[0],[1],[0]]`
+#[test]
+fn req2233_binary_y_two_classes_collapses() {
+    let y: Array1<usize> = array![0, 1, 0];
+    let got = label_binarize(&y, &[0, 1], 0, 1).unwrap();
+    assert_eq!(got.shape(), &[3, 1]);
+    let expected: Array2<f64> = array![[0.0], [1.0], [0.0]];
+    assert_eq!(got, expected);
+}
+
+/// `k == 3` classes → no collapse, both backends agree (regression guard).
+/// Live oracle (sklearn 1.5.2, from /tmp):
+///   `label_binarize([0,1], classes=[0,1,2]).tolist()` -> `[[1,0,0],[0,1,0]]`
+#[test]
+fn req2233_three_classes_no_collapse() {
+    let y: Array1<usize> = array![0, 1];
+    let got = label_binarize(&y, &[0, 1, 2], 0, 1).unwrap();
+    assert_eq!(got.shape(), &[2, 3]);
+    let expected: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    assert_eq!(got, expected);
+}
+
+/// Single-distinct `y` with two classes → still "binary" → collapse (sklearn
+/// treats ≤2 distinct values as binary, so the kept column is `Y[:,-1]` = the
+/// column for `classes[1]`, with no `pos_label` since `y` never equals it).
+/// Live oracle (sklearn 1.5.2, from /tmp):
+///   `type_of_target([5,5])` == "binary"
+///   `label_binarize([5,5], classes=[5,9]).tolist()` -> `[[0],[0]]`
+///   `label_binarize([9,9], classes=[5,9]).tolist()` -> `[[1],[1]]`
+#[test]
+fn req2233_single_distinct_y_two_classes_collapses() {
+    let y: Array1<usize> = array![5, 5];
+    let got = label_binarize(&y, &[5, 9], 0, 1).unwrap();
+    assert_eq!(got.shape(), &[2, 1]);
+    assert_eq!(got, array![[0.0], [0.0]]);
+
+    // pos_label lands where y == classes[1] (= 9).
+    let y2: Array1<usize> = array![9, 9];
+    let got2 = label_binarize(&y2, &[5, 9], 0, 1).unwrap();
+    assert_eq!(got2.shape(), &[2, 1]);
+    assert_eq!(got2, array![[1.0], [1.0]]);
+}
+
+/// Multiclass `y` (3+ distinct) with two non-`{0,1}` classes → no collapse,
+/// `(n, 2)` indicator with the unseen label all-`neg`.
+/// Live oracle (sklearn 1.5.2, from /tmp):
+///   `type_of_target([5,9,3])` == "multiclass"
+///   `label_binarize([5,9,3], classes=[5,9]).tolist()` -> `[[1,0],[0,1],[0,0]]`
+#[test]
+fn req2233_multiclass_y_two_nonbinary_classes_no_collapse() {
+    let y: Array1<usize> = array![5, 9, 3];
+    let got = label_binarize(&y, &[5, 9], 0, 1).unwrap();
+    assert_eq!(got.shape(), &[3, 2]);
+    let expected: Array2<f64> = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+    assert_eq!(got, expected);
+}
+
+// ===========================================================================
+// #2234: LabelBinarizer ESTIMATOR transform also gates the binary collapse on
+// type_of_target(transform input y), NOT the fitted class count. A binary fit
+// followed by a MULTICLASS transform input gives the multi-column form.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   lb = LabelBinarizer().fit([0,1])           # 2 classes
+//   lb.transform([0,1,2]).tolist() -> [[1,0],[0,1],[0,0]]   shape (3,2)
+//   lb.transform([0,1,0]).tolist() -> [[0],[1],[0]]         shape (3,1) (binary y)
+// ===========================================================================
+#[test]
+fn divergence_2234_estimator_binary_fit_multiclass_transform() {
+    use ferrolearn_core::traits::Fit;
+    use ferrolearn_preprocess::label_binarizer::LabelBinarizer;
+    use ndarray::array;
+
+    let fitted = LabelBinarizer::new().fit(&array![0_usize, 1], &()).unwrap();
+
+    // multiclass transform input -> (3,2), NOT collapsed
+    let multi = fitted.transform(&array![0_usize, 1, 2]).unwrap();
+    assert_eq!(
+        multi.shape(),
+        &[3, 2],
+        "multiclass transform input -> 2 columns"
+    );
+    assert_eq!(multi[[0, 0]], 1.0);
+    assert_eq!(multi[[1, 1]], 1.0);
+    assert_eq!(multi[[2, 0]], 0.0);
+    assert_eq!(multi[[2, 1]], 0.0); // unseen label 2 -> all-neg row
+
+    // binary transform input -> (3,1), collapse preserved
+    let bin = fitted.transform(&array![0_usize, 1, 0]).unwrap();
+    assert_eq!(
+        bin.shape(),
+        &[3, 1],
+        "binary transform input -> single column"
+    );
+    assert_eq!(bin[[0, 0]], 0.0);
+    assert_eq!(bin[[1, 0]], 1.0);
 }

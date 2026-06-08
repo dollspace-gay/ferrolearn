@@ -173,7 +173,7 @@ pub use random_projection::{
 pub use feature_scoring::{
     chi2, compute_scores_classif, compute_scores_regression, f_classif, f_regression,
 };
-pub use label_binarizer::{FittedLabelBinarizer, LabelBinarizer};
+pub use label_binarizer::{FittedLabelBinarizer, LabelBinarizer, label_binarize};
 pub use multi_label_binarizer::{FittedMultiLabelBinarizer, MultiLabelBinarizer};
 pub use sequential_feature_selector::{
     Direction, FittedSequentialFeatureSelector, SequentialFeatureSelector,
