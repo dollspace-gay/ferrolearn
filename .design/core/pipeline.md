@@ -62,7 +62,18 @@ omitted. The data substrate is `ndarray` (not yet ferray).
   a pipeline from unnamed estimators with lowercased-type-name step names. NOT
   implemented: ferrolearn requires explicit step names.
 - REQ-8: `FeatureUnion` (`sklearn/pipeline.py:1329`) — parallel transformer fit +
-  horizontal concatenation of outputs. NOT implemented: no ferrolearn analog.
+  horizontal concatenation of outputs. SHIPPED (core fit/transform/hstack/
+  `get_feature_names_out`): `FeatureUnion`/`FittedFeatureUnion` fit every named
+  sub-transformer on the same `X` (`FeatureUnion.fit`, `:1643`) and hstack their
+  outputs left-to-right (`FeatureUnion.transform` → `_hstack`, `:1770`/`:1812`),
+  with `{name}__x{j}` feature-name prefixing (the `verbose_feature_names_out=True`
+  default, `:1567`/`:1608`). NOT-STARTED: `transformer_weights` (`:1369`),
+  `'drop'`/`'passthrough'` (`:1530`/`:1563`), `n_jobs` (`:1360`), metadata routing
+  (`:1859`), `verbose_feature_names_out=False` (`:1618`). `FeatureUnion::fit` also
+  validates transformer-name uniqueness up front, mirroring
+  `_validate_transformers` → `_validate_names` (`:1523-1525` →
+  `sklearn/utils/metaestimators.py:81-83`): a duplicate name returns
+  `FerroError::InvalidParameter` (sklearn's `ValueError` analog) instead of fitting.
 - REQ-9: ferray substrate. The pipeline data flow is typed on
   `ndarray::{Array1, Array2}`, the wrong-substrate numpy analog; the destination is
   ferray-core array types (R-SUBSTRATE-1/2). NOT-STARTED (cascading;
@@ -98,7 +109,7 @@ omitted. The data substrate is `ndarray` (not yet ferray).
 | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | open prereq blocker #363. ferrolearn has no `'passthrough'`/`None` step concept (`pipeline.py:251`, `:289`, `:471`) and no `memory`/`check_memory` transformer caching (`:388`). |
 | REQ-6 (fit_params / metadata routing) | NOT-STARTED | open prereq blocker #364. `PipelineEstimator::fit_pipeline` / `PipelineTransformer::fit_pipeline` accept no per-step params; sklearn forwards via `s__p` prefixing and `MetadataRouter` (`pipeline.py:468`, `:30`). |
 | REQ-7 (make_pipeline auto-naming) | NOT-STARTED | open prereq blocker #365. No `make_pipeline` analog; ferrolearn `transform_step`/`estimator_step` require explicit names, vs sklearn's `_name_estimators` lowercased-type naming (`pipeline.py:1220`). |
-| REQ-8 (FeatureUnion) | NOT-STARTED | open prereq blocker #366. No parallel-fit + hstack composite transformer (`pipeline.py:1329`). |
+| REQ-8 (FeatureUnion) | SHIPPED | impl: `struct FeatureUnion`/`FittedFeatureUnion in pipeline.rs`; `fn fit in Fit<Array2<F>, ()> for FeatureUnion` fits each named sub-transformer on the SAME `x` via `transformer.fit_pipeline(x, &empty_y)` (mirrors `FeatureUnion.fit` fitting every transformer on `X`, `sklearn/pipeline.py:1643`/`:1681`), recording each output width; `fn transform in Transform<Array2<F>> for FittedFeatureUnion` transforms `x` through each fitted transformer and copies each block into its contiguous column range left-to-right (mirrors `FeatureUnion.transform` → `_hstack` `np.hstack(Xs)`, `pipeline.py:1770`/`:1812`/`:1820`), validating row-alignment (`FerroError::ShapeMismatch` on a mismatched-rows block); `fn get_feature_names_out in FittedFeatureUnion` emits `{name}__x{j}` per block (the `verbose_feature_names_out=True` default prefix, `pipeline.py:1567`/`:1608-1616`; positional `x{j}` = the `OneToOneFeatureMixin` default since the trait objects expose no per-output names). y-handling: `fit_pipeline` requires `Array1<F>`, so the unsupervised sub-transformers get an empty `Array1::zeros(0)` (sklearn passes `y` through, transformers ignore it). Non-test production consumer: the pub API on the `pub mod pipeline` surface — the same boundary the grandfathered `Pipeline`/`FittedPipeline` types sit on (S5; neither `Pipeline` nor `FeatureUnion` is crate-root re-exported in `lib.rs`). Live-oracle verification (R-CHAR-3, sklearn 1.5.2): `test_feature_union_hstack_layout` (the `[ss|mm]` 2-block layout on `[[1,2],[3,4],[5,6]]` → `(3,4)`), `test_feature_union_get_feature_names_out` (`['ss__x0','ss__x1','mm__x0','mm__x1']`), `test_feature_union_single_transformer_width`, `test_feature_union_mixed_widths` (3+1 blocks, oracle StandardScaler+PCA(1) → `(3,4)`), `test_feature_union_empty` (`(n,0)`), `test_feature_union_row_count_consistency`, `test_feature_union_f32`; name-uniqueness validation at fit (mirrors `_validate_names`, `sklearn/utils/metaestimators.py:81-83` reached from `pipeline.py:1523-1525`): duplicate names → `FerroError::InvalidParameter`, pinned by `divergence_feature_union_duplicate_names_must_error` + positive guard `feature_union_unique_names_fit_ok`. NOT-STARTED: `transformer_weights` per-output scaling (`pipeline.py:1369`), `'drop'`/`'passthrough'` sentinels (`:1530`/`:1563`), `n_jobs` (`:1360`), metadata routing (`:1859`), `verbose_feature_names_out=False` (`:1618-1641`), ferray substrate. |
 | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #367. Pipeline trait surface and data flow are typed on `ndarray::{Array1, Array2}` (wrong substrate); destination is ferray-core (R-SUBSTRATE-1/2, grandfathered-transitional R-SUBSTRATE-4). |
 
 ## Architecture

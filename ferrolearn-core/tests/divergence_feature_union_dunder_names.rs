@@ -85,7 +85,6 @@ impl FittedPipelineTransformer<f64> for FIdT {
 ///
 /// Tracking: #2238
 #[test]
-#[ignore = "divergence: FeatureUnion::fit accepts '__'-containing names sklearn rejects; tracking #2238"]
 fn divergence_feature_union_dunder_name_must_error() {
     let union = FeatureUnion::<f64>::new()
         .with_transformer("a__b", Box::new(IdT))
@@ -104,5 +103,55 @@ fn divergence_feature_union_dunder_name_must_error() {
          sklearn/utils/metaestimators.py:91-95); ferrolearn accepted it and produced \
          get_feature_names_out: {:?}",
         result.map(|f| f.get_feature_names_out())
+    );
+}
+
+/// Guard: only the DOUBLE underscore is reserved. A name with a SINGLE
+/// underscore (`"a_b"`) must fit OK — sklearn's `_validate_names` only rejects
+/// `"__" in name` (`sklearn/utils/metaestimators.py:91`), not a lone `_`.
+///
+/// Live oracle (sklearn 1.5.2):
+///   `FeatureUnion([('a_b', StandardScaler())]).fit(X)` -> OK (no ValueError).
+#[test]
+fn single_underscore_name_is_ok() {
+    let union = FeatureUnion::<f64>::new().with_transformer("a_b", Box::new(IdT));
+    let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+    let result = union.fit(&x, &());
+
+    assert!(
+        result.is_ok(),
+        "FeatureUnion with a single-underscore name `a_b` must fit OK (only `__` \
+         is reserved, sklearn/utils/metaestimators.py:91); got error: {:?}",
+        result.err()
+    );
+}
+
+/// Guard: `__` at the START or END of a name is still a `__` occurrence, so it
+/// must error (sklearn's check is `"__" in name`, position-agnostic).
+///
+/// Live oracle (sklearn 1.5.2):
+///   `FeatureUnion([('__a', StandardScaler())]).fit(X)` -> ValueError, and
+///   `FeatureUnion([('a__', StandardScaler())]).fit(X)` -> ValueError.
+#[test]
+fn leading_or_trailing_dunder_name_must_error() {
+    let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+    let leading = FeatureUnion::<f64>::new()
+        .with_transformer("__a", Box::new(IdT))
+        .fit(&x, &());
+    assert!(
+        leading.is_err(),
+        "leading-`__` name `__a` must error (sklearn ValueError: Estimator names \
+         must not contain __: got ['__a'])"
+    );
+
+    let trailing = FeatureUnion::<f64>::new()
+        .with_transformer("a__", Box::new(IdT))
+        .fit(&x, &());
+    assert!(
+        trailing.is_err(),
+        "trailing-`__` name `a__` must error (sklearn ValueError: Estimator names \
+         must not contain __: got ['a__'])"
     );
 }

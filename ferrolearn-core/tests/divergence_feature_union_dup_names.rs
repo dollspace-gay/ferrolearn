@@ -40,9 +40,9 @@
 //!
 //! Tracking: #2237
 
+use ferrolearn_core::Fit;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FeatureUnion, FittedPipelineTransformer, PipelineTransformer};
-use ferrolearn_core::Fit;
 use ndarray::{Array1, Array2};
 
 /// Width-preserving identity transformer (the `OneToOneFeatureMixin` shape, like
@@ -74,7 +74,6 @@ impl FittedPipelineTransformer<f64> for FIdT {
 ///
 /// Tracking: #2237
 #[test]
-#[ignore = "divergence: FeatureUnion accepts duplicate transformer names (sklearn raises ValueError at fit); tracking #2237"]
 fn divergence_feature_union_duplicate_names_must_error() {
     let union = FeatureUnion::<f64>::new()
         .with_transformer("a", Box::new(IdT))
@@ -93,5 +92,26 @@ fn divergence_feature_union_duplicate_names_must_error() {
          sklearn/utils/metaestimators.py:81-83); ferrolearn accepted it and \
          produced colliding get_feature_names_out: {:?}",
         result.map(|f| f.get_feature_names_out())
+    );
+}
+
+/// Positive guard: UNIQUE transformer names (`[('a',..),('b',..)]`) must still
+/// fit successfully — the uniqueness check must not false-positive on distinct
+/// names. sklearn's `_validate_names` only raises when `len(set(names)) !=
+/// len(names)` (`sklearn/utils/metaestimators.py:81-83`); distinct names pass.
+#[test]
+fn feature_union_unique_names_fit_ok() {
+    let union = FeatureUnion::<f64>::new()
+        .with_transformer("a", Box::new(IdT))
+        .with_transformer("b", Box::new(IdT));
+    let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+    let result = union.fit(&x, &());
+
+    assert!(
+        result.is_ok(),
+        "FeatureUnion with unique transformer names must fit OK (sklearn accepts \
+         distinct names); got: {:?}",
+        result.err()
     );
 }

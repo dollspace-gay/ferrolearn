@@ -23,7 +23,7 @@
 //! | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | blocker #363. |
 //! | REQ-6 (fit_params / metadata routing) | NOT-STARTED | blocker #364. |
 //! | REQ-7 (make_pipeline auto-naming helper) | NOT-STARTED | blocker #365 (`pipeline.py:1220`). |
-//! | REQ-8 (FeatureUnion) | NOT-STARTED | blocker #366 (`pipeline.py:1329`). |
+//! | REQ-8 (FeatureUnion) | SHIPPED | `FeatureUnion`/`FittedFeatureUnion` in `pipeline.rs`: `impl Fit<Array2<F>, ()> for FeatureUnion` fits each named sub-transformer on the SAME `x` (mirrors `FeatureUnion.fit` fitting every transformer on `X`, `pipeline.py:1643`/`:1681`) recording each output width; the fit also validates transformer-name uniqueness up front (mirrors `_validate_transformers` → `_validate_names`, `pipeline.py:1523-1525` → `sklearn/utils/metaestimators.py:81-83`): a duplicate name returns `FerroError::InvalidParameter` (sklearn's `ValueError: Names provided are not unique` analog) instead of fitting; `impl Transform<Array2<F>> for FittedFeatureUnion` transforms `x` through each and horizontally concatenates the column blocks left-to-right in list order (mirrors `FeatureUnion.transform` → `_hstack`, `pipeline.py:1770`/`:1812` `np.hstack(Xs)`); `FittedFeatureUnion::get_feature_names_out` prefixes each block's positional `x{j}` with `{name}__` (the `verbose_feature_names_out=True` default, `pipeline.py:1567`/`:1608-1616`). Non-test consumer: the pub API on the `pub mod pipeline` surface (S5 — the same boundary the grandfathered `Pipeline`/`FittedPipeline` types live on; neither is crate-root re-exported). Live-oracle (sklearn 1.5.2): `FeatureUnion([('ss',StandardScaler()),('mm',MinMaxScaler())])` on `[[1,2],[3,4],[5,6]]` → `(3,4)` with column blocks `[ss|mm]` and names `['ss__x0','ss__x1','mm__x0','mm__x1']`. NOT-STARTED (no ferrolearn analog yet): `transformer_weights` per-output scaling (`pipeline.py:1369`), the `'drop'`/`'passthrough'` sentinels (`:1530`/`:1563`), `n_jobs` parallelism (`:1360`), metadata routing (`:1859`), `verbose_feature_names_out=False` non-prefixed mode (`:1618-1641`), and the ferray substrate (typed on `ndarray::{Array1,Array2}`). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | blocker #367 — data flow typed on `ndarray::{Array1,Array2}`; cascades (R-SUBSTRATE-4). |
 //!
 //! acto-critic verdict: NO DIVERGENCE FOUND in the implemented surface (chaining,
@@ -104,7 +104,7 @@ use num_traits::Float;
 
 use crate::dataset::check_consistent_length;
 use crate::error::FerroError;
-use crate::traits::{Fit, Predict};
+use crate::traits::{Fit, Predict, Transform};
 
 // ---------------------------------------------------------------------------
 // Trait-object interfaces for pipeline steps
@@ -950,6 +950,366 @@ pub fn as_estimator_step<F: Float + Send + Sync + 'static>(
 }
 
 // ---------------------------------------------------------------------------
+// FeatureUnion (unfitted)
+// ---------------------------------------------------------------------------
+
+/// A composite transformer that fits multiple named sub-transformers on the
+/// SAME input and horizontally concatenates their outputs.
+///
+/// This is the ferrolearn analog of scikit-learn's `sklearn.pipeline.FeatureUnion`
+/// (`sklearn/pipeline.py:1329`). Where a [`Pipeline`] chains transformers
+/// *sequentially* (each transformer sees the previous one's output),
+/// `FeatureUnion` applies every transformer *in parallel* to the same `X`, then
+/// concatenates the results column-wise: the output width is the sum of each
+/// sub-transformer's output width, and the columns appear left-to-right in the
+/// order the transformers were added (mirrors `FeatureUnion.transform` →
+/// `_hstack` `np.hstack(Xs)`, `sklearn/pipeline.py:1770`/`:1812`).
+///
+/// `FeatureUnion` reuses the [`PipelineTransformer`] / [`FittedPipelineTransformer`]
+/// trait objects already used by [`Pipeline`], so any transformer usable in a
+/// pipeline is usable in a feature union.
+///
+/// The type parameter `F` is the float type (`f32` or `f64`), defaulting to
+/// `f64` to match the rest of this module.
+///
+/// # Divergence from scikit-learn
+///
+/// This is the core fit / transform / hstack / `get_feature_names_out` subset.
+/// `transformer_weights` (per-transformer output scaling,
+/// `sklearn/pipeline.py:1369`), the `'drop'` / `'passthrough'` sentinels
+/// (`:1530`/`:1563`), `n_jobs` parallelism (`:1360`), metadata routing (`:1859`),
+/// and `verbose_feature_names_out=False` (`:1618`) are NOT implemented (REQ-8
+/// NOT-STARTED scope). The data substrate is `ndarray`, not yet ferray.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_core::pipeline::{
+///     FeatureUnion, PipelineTransformer, FittedPipelineTransformer,
+/// };
+/// use ferrolearn_core::{Transform, FerroError};
+/// use ndarray::{Array1, Array2};
+///
+/// // A transformer that returns its input unchanged.
+/// struct Identity;
+/// impl PipelineTransformer<f64> for Identity {
+///     fn fit_pipeline(
+///         &self,
+///         _x: &Array2<f64>,
+///         _y: &Array1<f64>,
+///     ) -> Result<Box<dyn FittedPipelineTransformer<f64>>, FerroError> {
+///         Ok(Box::new(FittedIdentity))
+///     }
+/// }
+/// struct FittedIdentity;
+/// impl FittedPipelineTransformer<f64> for FittedIdentity {
+///     fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+///         Ok(x.clone())
+///     }
+/// }
+///
+/// use ferrolearn_core::Fit;
+/// let union = FeatureUnion::<f64>::new()
+///     .with_transformer("a", Box::new(Identity))
+///     .with_transformer("b", Box::new(Identity));
+/// let x = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+/// let fitted = union.fit(&x, &()).unwrap();
+/// // Two identity transformers → output width 2 + 2 = 4.
+/// let out = fitted.transform(&x).unwrap();
+/// assert_eq!(out.dim(), (2, 4));
+/// assert_eq!(fitted.get_feature_names_out(), vec!["a__x0", "a__x1", "b__x0", "b__x1"]);
+/// ```
+pub struct FeatureUnion<F: Float + Send + Sync + 'static = f64> {
+    /// Ordered named transformers, all fit on the same input.
+    transformer_list: Vec<(String, Box<dyn PipelineTransformer<F>>)>,
+}
+
+impl<F: Float + Send + Sync + 'static> FeatureUnion<F> {
+    /// Create a new empty feature union.
+    ///
+    /// Sub-transformers are added with
+    /// [`with_transformer`](FeatureUnion::with_transformer). An empty union fits
+    /// successfully and transforms to a `(n_samples, 0)` matrix (the empty
+    /// `np.hstack` analog).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferrolearn_core::pipeline::FeatureUnion;
+    /// let union = FeatureUnion::<f64>::new();
+    /// assert_eq!(union.n_transformers(), 0);
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            transformer_list: Vec::new(),
+        }
+    }
+
+    /// Add a named transformer to the union using the builder pattern.
+    ///
+    /// Mirrors an entry of sklearn's `transformer_list`
+    /// (`sklearn/pipeline.py:1348`). Transformers are applied in the order they
+    /// are added; their outputs are concatenated left-to-right.
+    #[must_use]
+    pub fn with_transformer(mut self, name: &str, t: Box<dyn PipelineTransformer<F>>) -> Self {
+        self.transformer_list.push((name.to_owned(), t));
+        self
+    }
+
+    /// Returns the names of all sub-transformers, in union order.
+    ///
+    /// Mirrors the key order of sklearn's `named_transformers`
+    /// (`sklearn/pipeline.py:1478`: `Bunch(**dict(self.transformer_list))`).
+    #[must_use]
+    pub fn transformer_names(&self) -> Vec<&str> {
+        self.transformer_list
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Number of sub-transformers in the union.
+    #[must_use]
+    pub fn n_transformers(&self) -> usize {
+        self.transformer_list.len()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for FeatureUnion<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FeatureUnion<F> {
+    type Fitted = FittedFeatureUnion<F>;
+    type Error = FerroError;
+
+    /// Fit every sub-transformer on the SAME input `x`.
+    ///
+    /// Mirrors `FeatureUnion.fit` (`sklearn/pipeline.py:1643`), which fits each
+    /// transformer in `transformer_list` independently on the full `X` (every
+    /// transformer sees the same data, unlike the sequential `Pipeline`). The
+    /// per-transformer output width is recorded at fit time (by transforming `x`
+    /// once) so that `get_feature_names_out` can size each column block.
+    ///
+    /// # `y` handling
+    ///
+    /// sklearn's `FeatureUnion` threads `y` to each sub-transformer's `fit`
+    /// (`sklearn/pipeline.py:1681`/`_fit_one`), but feature-union transformers are
+    /// unsupervised and ignore it. ferrolearn's [`PipelineTransformer::fit_pipeline`]
+    /// requires an `Array1<F>` target, so this impl passes an empty
+    /// `Array1::zeros(0)` — the union's own `Fit` target type is `()` (it takes no
+    /// supervised target), and the empty array is the no-target sentinel handed to
+    /// each unsupervised sub-transformer.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FerroError`] from an individual sub-transformer's
+    /// `fit_pipeline` or its width-probing `transform_pipeline`.
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedFeatureUnion<F>, FerroError> {
+        // Validate transformer-name uniqueness BEFORE fitting any sub-transformer,
+        // mirroring `FeatureUnion._validate_transformers` → `_validate_names`
+        // (`sklearn/pipeline.py:1523-1525` → `sklearn/utils/metaestimators.py:81-83`),
+        // which sklearn runs on every fit/fit_transform: `if len(set(names)) !=
+        // len(names): raise ValueError("Names provided are not unique: {names!r}")`.
+        // R-DEV-2 (user-API ABI / exception parity): a duplicate name is a
+        // deliberate `ValueError`, so ferrolearn rejects it at fit with the
+        // closest analog, `FerroError::InvalidParameter`.
+        let names: Vec<&str> = self
+            .transformer_list
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
+        let mut seen = std::collections::HashSet::with_capacity(names.len());
+        if !names.iter().all(|name| seen.insert(*name)) {
+            return Err(FerroError::InvalidParameter {
+                name: "transformer_list".into(),
+                reason: format!("Names provided are not unique: {names:?}"),
+            });
+        }
+
+        // Reject any name containing the reserved `__` separator, mirroring the
+        // THIRD clause of `_validate_names`
+        // (`sklearn/utils/metaestimators.py:91-95`): `invalid_names = [name for
+        // name in names if "__" in name]; if invalid_names: raise
+        // ValueError("Estimator names must not contain __: got {0!r}")`. `__` is
+        // reserved for the nested-parameter addressing protocol
+        // (`<step>__<param>`), so it is forbidden anywhere in a step name (a
+        // single `_` is fine). sklearn runs this AFTER the uniqueness clause; we
+        // match that order. R-DEV-2 (exception parity): a deliberate `ValueError`,
+        // mapped to the closest analog `FerroError::InvalidParameter`. (The MIDDLE
+        // clause — names colliding with constructor-arg params,
+        // `metaestimators.py:84-90` — has no ferrolearn analog: `FeatureUnion`
+        // exposes no `get_params` params, so it is intentionally not mirrored.)
+        let invalid_names: Vec<&str> = names
+            .iter()
+            .copied()
+            .filter(|name| name.contains("__"))
+            .collect();
+        if !invalid_names.is_empty() {
+            return Err(FerroError::InvalidParameter {
+                name: "transformer_list".into(),
+                reason: format!("Estimator names must not contain __: got {invalid_names:?}"),
+            });
+        }
+
+        // FeatureUnion sub-transformers are unsupervised; sklearn passes `y`
+        // through but the transformers ignore it (`sklearn/pipeline.py:1681`).
+        // The empty target is the no-supervision sentinel for `fit_pipeline`.
+        let empty_y: Array1<F> = Array1::zeros(0);
+
+        let mut fitted = Vec::with_capacity(self.transformer_list.len());
+        let mut n_features_per = Vec::with_capacity(self.transformer_list.len());
+
+        for (name, transformer) in &self.transformer_list {
+            let fitted_t = transformer.fit_pipeline(x, &empty_y)?;
+            // Probe the output width once at fit so feature-name prefixing and
+            // the hstack column layout know each block's size.
+            let out = fitted_t.transform_pipeline(x)?;
+            n_features_per.push(out.ncols());
+            fitted.push((name.clone(), fitted_t));
+        }
+
+        Ok(FittedFeatureUnion {
+            fitted,
+            n_features_per,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// FittedFeatureUnion
+// ---------------------------------------------------------------------------
+
+/// A fitted [`FeatureUnion`]: each named sub-transformer is fitted, and the
+/// per-transformer output width is recorded for feature-name prefixing and the
+/// horizontal-concatenation column layout.
+///
+/// Created by calling [`Fit::fit`] on a [`FeatureUnion`]. Implements
+/// [`Transform<Array2<F>>`](Transform) producing the horizontally concatenated
+/// `Array2<F>`.
+pub struct FittedFeatureUnion<F: Float + Send + Sync + 'static = f64> {
+    /// Fitted sub-transformers, in union order.
+    fitted: Vec<(String, Box<dyn FittedPipelineTransformer<F>>)>,
+    /// The output column count of each sub-transformer, in union order
+    /// (recorded at fit). The total output width is the sum of these.
+    n_features_per: Vec<usize>,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedFeatureUnion<F> {
+    /// Returns the names of all fitted sub-transformers, in union order.
+    #[must_use]
+    pub fn transformer_names(&self) -> Vec<&str> {
+        self.fitted.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    /// Number of fitted sub-transformers in the union.
+    #[must_use]
+    pub fn n_transformers(&self) -> usize {
+        self.fitted.len()
+    }
+
+    /// Total output width: the sum of every sub-transformer's output column
+    /// count. Equals the number of columns in [`Transform::transform`]'s output.
+    #[must_use]
+    pub fn n_features_out(&self) -> usize {
+        self.n_features_per.iter().sum()
+    }
+
+    /// Output feature names, one per output column, in concatenation order.
+    ///
+    /// For each sub-transformer named `name` with output width `w`, this emits
+    /// `"{name}__x0" .. "{name}__x{w-1}"`, then moves on to the next
+    /// transformer's block. This mirrors `FeatureUnion.get_feature_names_out`
+    /// with the default `verbose_feature_names_out=True`
+    /// (`sklearn/pipeline.py:1567`/`:1608-1616`): sklearn prefixes each
+    /// sub-transformer's own feature name with `"{name}__"`.
+    ///
+    /// ferrolearn's [`PipelineTransformer`] trait objects do not expose their own
+    /// per-output feature names, so the positional default `x{j}` is used as the
+    /// suffix — this is sklearn's `OneToOneFeatureMixin` positional default
+    /// (`['x0','x1',...]`), which is exactly what `StandardScaler` /
+    /// `MinMaxScaler` and other column-preserving transformers produce. So a union
+    /// of two such transformers named `ss`/`mm` over 2-column input yields
+    /// `['ss__x0','ss__x1','mm__x0','mm__x1']`, matching the live oracle.
+    #[must_use]
+    pub fn get_feature_names_out(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.n_features_out());
+        for ((name, _), &width) in self.fitted.iter().zip(self.n_features_per.iter()) {
+            for j in 0..width {
+                names.push(format!("{name}__x{j}"));
+            }
+        }
+        names
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFeatureUnion<F> {
+    type Output = Array2<F>;
+    type Error = FerroError;
+
+    /// Transform `x` through every fitted sub-transformer and horizontally
+    /// concatenate the results.
+    ///
+    /// Mirrors `FeatureUnion.transform` (`sklearn/pipeline.py:1770`): each
+    /// transformer transforms the same `x`, then `self._hstack(Xs)`
+    /// (`np.hstack`, `:1812`/`:1820`) concatenates the outputs column-wise. The
+    /// output has shape `(n_samples, sum_of_widths)` and the columns appear in
+    /// transformer order: block 0 is the first transformer's full output, block 1
+    /// the second's, and so on. An empty union transforms to a `(n_samples, 0)`
+    /// matrix (the empty-`np.hstack` analog).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`FerroError`] from an individual sub-transformer. Returns
+    /// [`FerroError::ShapeMismatch`] if a sub-transformer's output does not have
+    /// `n_samples == x.nrows()` rows (the hstack requires row-aligned blocks).
+    fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_rows = x.nrows();
+
+        // Transform `x` through each sub-transformer, collecting the blocks and
+        // their widths. Validate each block is row-aligned before any copy.
+        let mut blocks: Vec<Array2<F>> = Vec::with_capacity(self.fitted.len());
+        let mut total_width = 0usize;
+        for (name, transformer) in &self.fitted {
+            let block = transformer.transform_pipeline(x)?;
+            if block.nrows() != n_rows {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![n_rows, block.ncols()],
+                    actual: vec![block.nrows(), block.ncols()],
+                    context: format!(
+                        "FeatureUnion transformer `{name}` produced {} rows, expected {n_rows} \
+                         (every sub-transformer output must be row-aligned for hstack)",
+                        block.nrows()
+                    ),
+                });
+            }
+            total_width += block.ncols();
+            blocks.push(block);
+        }
+
+        // Allocate the concatenated output and copy each block into its
+        // contiguous column range, left-to-right (bounds-safe: `col_offset` and
+        // each block width are derived from the blocks just collected).
+        let mut out = Array2::<F>::zeros((n_rows, total_width));
+        let mut col_offset = 0usize;
+        for block in &blocks {
+            let width = block.ncols();
+            for r in 0..n_rows {
+                for c in 0..width {
+                    out[[r, col_offset + c]] = block[[r, c]];
+                }
+            }
+            col_offset += width;
+        }
+
+        Ok(out)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1563,5 +1923,248 @@ mod tests {
         ));
         assert!(fitted.named_step("nope").is_none());
         Ok(())
+    }
+
+    // -- REQ-8: FeatureUnion -------------------------------------------------
+
+    /// A transformer that returns its input columns unchanged (width-preserving,
+    /// the OneToOneFeatureMixin shape — like sklearn's StandardScaler).
+    struct IdentityTransformer;
+
+    impl PipelineTransformer<f64> for IdentityTransformer {
+        fn fit_pipeline(
+            &self,
+            _x: &Array2<f64>,
+            _y: &Array1<f64>,
+        ) -> Result<Box<dyn FittedPipelineTransformer<f64>>, FerroError> {
+            Ok(Box::new(FittedIdentityTransformer))
+        }
+    }
+
+    struct FittedIdentityTransformer;
+
+    impl FittedPipelineTransformer<f64> for FittedIdentityTransformer {
+        fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+            Ok(x.clone())
+        }
+    }
+
+    /// A transformer that emits a single column: the row sum (width 1, regardless
+    /// of input width). Used to exercise mixed-width hstack blocks.
+    struct RowSumTransformer;
+
+    impl PipelineTransformer<f64> for RowSumTransformer {
+        fn fit_pipeline(
+            &self,
+            _x: &Array2<f64>,
+            _y: &Array1<f64>,
+        ) -> Result<Box<dyn FittedPipelineTransformer<f64>>, FerroError> {
+            Ok(Box::new(FittedRowSumTransformer))
+        }
+    }
+
+    struct FittedRowSumTransformer;
+
+    impl FittedPipelineTransformer<f64> for FittedRowSumTransformer {
+        fn transform_pipeline(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+            let sums: Vec<f64> = x.rows().into_iter().map(|r| r.sum()).collect();
+            Array2::from_shape_vec((x.nrows(), 1), sums).map_err(|e| FerroError::InvalidParameter {
+                name: "x".into(),
+                reason: e.to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_feature_union_hstack_layout() -> Result<(), FerroError> {
+        // sklearn (live, 1.5.2):
+        //   from sklearn.pipeline import FeatureUnion
+        //   from sklearn.preprocessing import StandardScaler, MinMaxScaler
+        //   import numpy as np
+        //   X = np.array([[1.,2.],[3.,4.],[5.,6.]])
+        //   fu = FeatureUnion([('ss',StandardScaler()),('mm',MinMaxScaler())]).fit(X)
+        //   fu.transform(X).shape        -> (3, 4)
+        //   # columns = [ss_col0, ss_col1, mm_col0, mm_col1]  (each transformer's
+        //   #   full output, concatenated left-to-right in transformer_list order)
+        // The hstack STRUCTURE is what's asserted here: two width-2 identity
+        // transformers → a width-4 output whose column blocks are each
+        // transformer's full output (here, the unchanged input twice). The block
+        // layout (transformer 0's cols, then transformer 1's cols) IS sklearn's
+        // _hstack ordering (pipeline.py:1812 np.hstack(Xs)).
+        let union = FeatureUnion::<f64>::new()
+            .with_transformer("a", Box::new(IdentityTransformer))
+            .with_transformer("b", Box::new(IdentityTransformer));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+
+        // Width = sum of widths = 2 + 2 = 4; rows preserved.
+        assert_eq!(out.dim(), (3, 4));
+        // Block 0 (cols 0..2) = transformer "a"'s output (== x).
+        assert_eq!(out.slice(ndarray::s![.., 0..2]).to_owned(), x);
+        // Block 1 (cols 2..4) = transformer "b"'s output (== x).
+        assert_eq!(out.slice(ndarray::s![.., 2..4]).to_owned(), x);
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_get_feature_names_out() -> Result<(), FerroError> {
+        // sklearn (live, 1.5.2): the SAME union as above ->
+        //   list(fu.get_feature_names_out())
+        //     == ['ss__x0','ss__x1','mm__x0','mm__x1']
+        // i.e. each transformer's positional output names ('x0','x1' — the
+        // OneToOneFeatureMixin default for StandardScaler/MinMaxScaler) prefixed
+        // by '{name}__' (verbose_feature_names_out=True default, pipeline.py:1608).
+        // ferrolearn's identity transformers are the width-preserving analog, so
+        // the NAMING semantics (prefix + positional x{j}) match exactly.
+        let union = FeatureUnion::<f64>::new()
+            .with_transformer("ss", Box::new(IdentityTransformer))
+            .with_transformer("mm", Box::new(IdentityTransformer));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+        let fitted = union.fit(&x, &())?;
+        assert_eq!(
+            fitted.get_feature_names_out(),
+            vec!["ss__x0", "ss__x1", "mm__x0", "mm__x1"]
+        );
+        // transformer_names() preserves union order; n_transformers/n_features_out.
+        assert_eq!(fitted.transformer_names(), vec!["ss", "mm"]);
+        assert_eq!(fitted.n_transformers(), 2);
+        assert_eq!(fitted.n_features_out(), 4);
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_single_transformer_width() -> Result<(), FerroError> {
+        // sklearn (live, 1.5.2):
+        //   FeatureUnion([('ss',StandardScaler())]).fit(X).transform(X).shape
+        //     -> (3, 2)   (single block == that transformer's width)
+        //   get_feature_names_out() -> ['ss__x0','ss__x1']
+        let union =
+            FeatureUnion::<f64>::new().with_transformer("ss", Box::new(IdentityTransformer));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+        assert_eq!(out.dim(), (3, 2));
+        assert_eq!(out, x);
+        assert_eq!(fitted.get_feature_names_out(), vec!["ss__x0", "ss__x1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_mixed_widths() -> Result<(), FerroError> {
+        // sklearn (live, 1.5.2) — a union whose transformers emit DIFFERENT
+        // widths concatenates their blocks correctly. Oracle (StandardScaler
+        // keeps 3 cols, PCA(1) emits 1):
+        //   X = np.array([[1.,2.,3.],[3.,4.,5.],[5.,6.,7.]])
+        //   fu = FeatureUnion([('ss',StandardScaler()),('pca',PCA(1))]).fit(X)
+        //   fu.transform(X).shape -> (3, 4)   (3 + 1)
+        //   list(fu.get_feature_names_out())
+        //     -> ['ss__x0','ss__x1','ss__x2','pca__pca0']
+        // ferrolearn analog: a width-3 identity + a width-1 row-sum transformer.
+        // The STRUCTURE (block 0 width 3, block 1 width 1; total 4) is sklearn's.
+        // (Names: ferrolearn uses the positional x{j} suffix for both blocks —
+        // the documented OneToOneFeatureMixin default, since the trait objects
+        // expose no per-output names.)
+        let union = FeatureUnion::<f64>::new()
+            .with_transformer("ident", Box::new(IdentityTransformer))
+            .with_transformer("rowsum", Box::new(RowSumTransformer));
+        let x = ndarray::array![[1.0, 2.0, 3.0], [3.0, 4.0, 5.0], [5.0, 6.0, 7.0]];
+
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+        // 3 (identity) + 1 (row sum) = 4 columns.
+        assert_eq!(out.dim(), (3, 4));
+        // Block 0 == x (identity).
+        assert_eq!(out.slice(ndarray::s![.., 0..3]).to_owned(), x);
+        // Block 1 == row sums.
+        let expected_sums = ndarray::array![[6.0], [12.0], [18.0]];
+        assert_eq!(out.slice(ndarray::s![.., 3..4]).to_owned(), expected_sums);
+        // Feature names reflect the per-block widths.
+        assert_eq!(
+            fitted.get_feature_names_out(),
+            vec!["ident__x0", "ident__x1", "ident__x2", "rowsum__x0"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_empty() -> Result<(), FerroError> {
+        // An empty union fits OK and transforms to a (n_samples, 0) matrix — the
+        // ferrolearn analog of sklearn's empty-hstack branch
+        //   `if not Xs: return np.zeros((X.shape[0], 0))` (pipeline.py:1808).
+        // (sklearn's PUBLIC FeatureUnion([]).fit raises at _validate_transformers'
+        // `zip(*[])`, a Python-tuple-unpack artifact, not a numerical contract —
+        // R-DEV-4: ferrolearn has no such unpack, and the empty-hstack shape is
+        // the documented (n, 0) result.)
+        let union = FeatureUnion::<f64>::new();
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0]];
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+        assert_eq!(out.dim(), (2, 0));
+        assert!(fitted.get_feature_names_out().is_empty());
+        assert_eq!(fitted.n_features_out(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_row_count_consistency() -> Result<(), FerroError> {
+        // Every sub-output has n_rows == X.nrows(); the hstacked result preserves
+        // the row count (live oracle: FeatureUnion outputs have X.shape[0] rows).
+        let union = FeatureUnion::<f64>::new()
+            .with_transformer("a", Box::new(IdentityTransformer))
+            .with_transformer("b", Box::new(RowSumTransformer));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+        assert_eq!(out.nrows(), x.nrows());
+        Ok(())
+    }
+
+    #[test]
+    fn test_feature_union_f32() -> Result<(), FerroError> {
+        // f32 generic support: same hstack layout for f32 data.
+        let union = FeatureUnion::<f32>::new()
+            .with_transformer("a", Box::new(IdentityTransformerF32))
+            .with_transformer("b", Box::new(IdentityTransformerF32));
+        let x = ndarray::array![[1.0f32, 2.0], [3.0, 4.0]];
+        let fitted = union.fit(&x, &())?;
+        let out = fitted.transform(&x)?;
+        assert_eq!(out.dim(), (2, 4));
+        assert_eq!(out.slice(ndarray::s![.., 0..2]).to_owned(), x);
+        assert_eq!(out.slice(ndarray::s![.., 2..4]).to_owned(), x);
+        Ok(())
+    }
+
+    /// f32 identity transformer (width-preserving) for the f32 union test.
+    struct IdentityTransformerF32;
+
+    impl PipelineTransformer<f32> for IdentityTransformerF32 {
+        fn fit_pipeline(
+            &self,
+            _x: &Array2<f32>,
+            _y: &Array1<f32>,
+        ) -> Result<Box<dyn FittedPipelineTransformer<f32>>, FerroError> {
+            Ok(Box::new(FittedIdentityTransformerF32))
+        }
+    }
+
+    struct FittedIdentityTransformerF32;
+
+    impl FittedPipelineTransformer<f32> for FittedIdentityTransformerF32 {
+        fn transform_pipeline(&self, x: &Array2<f32>) -> Result<Array2<f32>, FerroError> {
+            Ok(x.clone())
+        }
+    }
+
+    #[test]
+    fn test_feature_union_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<FeatureUnion<f64>>();
+        assert_send_sync::<FeatureUnion<f32>>();
+        assert_send_sync::<FittedFeatureUnion<f64>>();
+        assert_send_sync::<FittedFeatureUnion<f32>>();
     }
 }
