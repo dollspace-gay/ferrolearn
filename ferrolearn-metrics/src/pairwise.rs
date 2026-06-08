@@ -141,6 +141,39 @@ fn check_non_empty<F: Float>(
     Ok(())
 }
 
+/// Reject any non-finite (NaN or infinite) entry.
+///
+/// Mirrors scikit-learn's `check_pairwise_arrays(..., force_all_finite=True)`
+/// (`sklearn/metrics/pairwise.py:86`, `:174-199`) — the default for
+/// `euclidean`/`manhattan`/`cosine`/`chebyshev`/`pairwise_distances`/
+/// `pairwise_kernels`, which raises `ValueError` on any `np.nan`/`np.inf`.
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".to_string(),
+            reason: "Input contains NaN or infinity.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject any infinite entry while tolerating NaN.
+///
+/// Mirrors scikit-learn's `nan_euclidean_distances` validation, which calls
+/// `check_pairwise_arrays(..., force_all_finite="allow-nan")` — NaN is the
+/// missing-value sentinel (allowed), but infinities raise `ValueError`
+/// (live oracle 1.5.2: `nan_euclidean_distances([[inf,0]],[[1,1]])` →
+/// `ValueError: Input contains infinity or a value too large ...`).
+fn reject_infinite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| v.is_infinite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".to_string(),
+            reason: "Input contains infinity or a value too large for dtype.".to_string(),
+        });
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -185,6 +218,8 @@ where
 {
     check_feature_dim(x, y, "euclidean_distances")?;
     check_non_empty(x, y, "euclidean_distances")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
 
     let n = x.nrows();
     let m = y.nrows();
@@ -246,6 +281,8 @@ where
 {
     check_feature_dim(x, y, "manhattan_distances")?;
     check_non_empty(x, y, "manhattan_distances")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
 
     let n = x.nrows();
     let m = y.nrows();
@@ -298,6 +335,8 @@ where
 {
     check_feature_dim(x, y, "cosine_distances")?;
     check_non_empty(x, y, "cosine_distances")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
 
     let n = x.nrows();
     let m = y.nrows();
@@ -421,6 +460,8 @@ where
 {
     check_feature_dim(x, y, "chebyshev_distances")?;
     check_non_empty(x, y, "chebyshev_distances")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
     chebyshev_distances_inner(x, y)
 }
 
@@ -508,6 +549,10 @@ where
 {
     check_feature_dim(x, y, "nan_euclidean_distances")?;
     check_non_empty(x, y, "nan_euclidean_distances")?;
+    // sklearn uses force_all_finite="allow-nan" here: NaN is the missing-value
+    // sentinel (allowed), but infinities still raise ValueError.
+    reject_infinite(x)?;
+    reject_infinite(y)?;
 
     let n = x.nrows();
     let m = y.nrows();
@@ -663,6 +708,8 @@ where
 {
     check_feature_dim(x, y, "pairwise_kernels")?;
     check_non_empty(x, y, "pairwise_kernels")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
     let n = x.nrows();
     let m = y.nrows();
     let mut out = Array2::<F>::zeros((n, m));

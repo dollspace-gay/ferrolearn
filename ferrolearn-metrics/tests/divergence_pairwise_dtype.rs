@@ -93,7 +93,6 @@ fn divergence_euclidean_f32_cancellation_multifeature() {
 /// Parity contract: ferrolearn must NOT silently return a finite value. It
 /// currently returns `Ok(0.0)`.
 #[test]
-#[ignore = "divergence: euclidean NaN input -> 0.0 silently vs sklearn ValueError; tracking #2299"]
 fn divergence_euclidean_nan_input() {
     let x = array![[f64::NAN, 0.0_f64]];
     let y = array![[1.0_f64, 1.0]];
@@ -118,7 +117,6 @@ fn divergence_euclidean_nan_input() {
 ///
 /// ferrolearn currently returns `Ok(0.0)`.
 #[test]
-#[ignore = "divergence: cosine NaN input -> 0.0 silently vs sklearn ValueError; tracking #2299"]
 fn divergence_cosine_nan_input() {
     let x = array![[f64::NAN, 0.0_f64]];
     let y = array![[1.0_f64, 1.0]];
@@ -141,7 +139,6 @@ fn divergence_cosine_nan_input() {
 ///
 /// ferrolearn currently returns `Ok(0.0)`.
 #[test]
-#[ignore = "divergence: euclidean Inf input -> 0.0 silently vs sklearn ValueError; tracking #2299"]
 fn divergence_euclidean_inf_input() {
     let x = array![[f64::INFINITY, 0.0_f64]];
     let y = array![[1.0_f64, 1.0]];
