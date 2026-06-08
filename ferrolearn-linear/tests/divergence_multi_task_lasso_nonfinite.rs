@@ -41,7 +41,6 @@ fn fixture() -> (Array2<f64>, Array2<f64>) {
 }
 
 #[test]
-#[ignore = "divergence: MultiTaskLasso::fit accepts non-finite X/Y while sklearn _coordinate_descent.py:2602 raises ValueError; tracking #2"]
 fn mtl_rejects_non_finite_input_like_sklearn() {
     // 1. NaN in X: sklearn raises ValueError; ferrolearn must Err, not Ok.
     let (mut x, y) = fixture();
