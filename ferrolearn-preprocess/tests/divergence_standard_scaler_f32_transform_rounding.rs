@@ -45,14 +45,20 @@
 
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::StandardScaler;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Pin: f32 transform must match sklearn's two-step (per-op f32-rounded) result
 /// bit-for-bit. ferrolearn's single-rounding fused path is 1 ULP off.
 #[test]
-#[ignore = "divergence: StandardScaler<f32>::transform rounds once (fused f64) vs sklearn's two per-op f32 roundings (1 ULP off near 2^24); tracking #2305"]
 fn divergence_f32_transform_per_op_f32_rounding() {
     // Live sklearn 1.5.2 oracle f32 transform output (exact f32 values).
+    // The literals are sklearn's `repr` of the f32 results verbatim (more decimal
+    // digits than f32 can hold, but each rounds to the intended exact f32 bits) —
+    // kept full-precision for human cross-reference against the oracle.
+    #[allow(
+        clippy::excessive_precision,
+        reason = "sklearn-repr f32 literals kept verbatim for oracle cross-reference (R-CHAR-3); each rounds to the asserted f32 bits"
+    )]
     let sk_transform: [f32; 3] = [
         -0.7071068286895752_f32,
         -0.7071068286895752_f32,

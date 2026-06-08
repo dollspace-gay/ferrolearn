@@ -25,7 +25,7 @@
 //! | REQ-4 (PyO3 binding) | SHIPPED | `_RsStandardScaler` (`transformers.rs:12`, registered `lib.rs:22`) marshals `fit`/`transform`/`inverse_transform`/`mean_` over `FittedStandardScaler<f64>` — a real CPython consumer. |
 //! | REQ-5 (var_/scale_/n_samples_seen_ attrs) | SHIPPED | FIXED #1192; constant mask UPGRADED to `_is_constant_feature` (#1194 build). `FittedStandardScaler<F>` stores `var_` (population variance ddof=0 via the corrected Chan-Golub-LeVeque 2-pass reduction over FINITE values — `nuv = sum((x-mean)^2) - (sum(x-mean))^2/count`, `var = nuv/count`, matching sklearn `_incremental_mean_and_var` `extmath.py:1142-1178`), `scale_` (= `_handle_zeros_in_scale(sqrt(var_), constant_mask)`: `std` on non-constant cols, `1.0` where `_is_constant_feature` flags the col — VARIANCE-RELATIVE, not exact-zero), and `n_samples_seen_` (= n_rows), set in `Fit::fit`; getters `var()`/`scale()`/`n_samples_seen()` mirror sklearn `var_`/`scale_`/`n_samples_seen_` (`_data.py:1013-1023`). Live oracle `X=[[1,5],[2,5],[3,5]]` (`var_=[0.6666666666666666,0.0]`, `scale_=[0.816496580927726,1.0]`, `n_samples_seen_=3`): `standard_scaler_var_scale_nsamples_match_sklearn`, `standard_scaler_scale_differs_from_std_on_constant_col`, `standard_scaler_var_equals_std_squared_nonconstant`. Additive getters; `transform`/`inverse_transform` use stored `scale_`. |
 //! | REQ-6 (with_mean/with_std/copy params) | SHIPPED | FIXED #1193. `StandardScaler<F>` now carries `with_mean`/`with_std`/`copy` (default `true`, `new()`/`Default`), mirroring sklearn `__init__(*, copy=True, with_mean=True, with_std=True)` + `_parameter_constraints` (`_data.py:829-838`), with `#[must_use]` builders `with_with_mean`/`with_with_std`/`with_copy`. `with_mean`/`with_std` thread into `FittedStandardScaler<F>` (set in `Fit::fit`); `transform` is conditional `if with_mean: X -= mean_; if with_std: X /= scale_` and `inverse_transform` mirrors `if with_std: X *= scale_; if with_mean: X += mean_` (`_data.py:1064-1067`,`:1106-1109`). `copy` is ABI-only (fit/transform operate on owned copies). Critic-grounded vs live oracle `X=[[1,10],[2,20],[3,30]]`: default (T,T) → `[[-1.2247..],[0],[1.2247..]]` (regression-guarded bit-identical to pre-existing default fit), with_std=false (T,F) → center-only `[[-1,-10],[0,0],[1,10]]`, with_mean=false (F,T) → scale-only `[[1.2247..],[2.4495..],[3.6742..]]`, both-false (F,F) → identity, and inverse round-trip for all 4 configs. R-DEV-4 DEVIATION: sklearn nulls `mean_`/`scale_`/`var_` when a flag is `False`; ferrolearn always materializes them (getters return `&Array1`, not `Option`) — the flags govern transform APPLICATION so OUTPUT matches sklearn exactly. |
-//! | REQ-7 (NaN tolerance: allow-nan) | SHIPPED | FIXED #1194. `Fit::fit`'s per-column mean + population variance now compute over the FINITE values only (skip `is_nan()`), with the divisor = COUNT OF FINITE values (`new_sample_count = n_samples - nan_count`, `extmath.py:1132-1133`), mirroring sklearn `force_all_finite="allow-nan"` (`_data.py:918`) + `_incremental_mean_and_var` ("NaNs are ignored", `extmath.py:1100`). An ALL-NaN column → `mean`/`var_`/`scale_` = NaN (no panic, no division by zero). NaN inputs pass through `transform`/`inverse_transform` (`(nan-mean)/scale = nan`). inf-rejection (allow-nan REJECTS +/-inf, MinMaxScaler #2200 precedent): `fit`/`transform`/`inverse_transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Live-oracle tests `req7_nan_fit_single_column_ignored` (mean_=2,var_=1,scale_=1,transform `[[-1],[nan],[1]]`), `req7_nan_fit_multi_column_scattered`, `req7_all_nan_column_yields_nan_no_panic`, `req7_nan_passthrough_inverse_transform`, `inf_rejected_fit`/`inf_rejected_transform`/`inf_rejected_inverse_transform`, `nan_only_still_fits` (`tests/divergence_standard_scaler.rs`). Consumers: PyO3 `_RsStandardScaler` + `FittedPipelineTransformer` + re-export. **f32 caveat (#2205):** sklearn ALWAYS computes mean/variance in float64 accumulators even for float32 input (`_data.py:81-82`, `_incremental_mean_and_var`), returning float64 `mean_`/`var_`/`scale_`; ferrolearn computes the reduction generically in `F`, so on f32 a large-magnitude column (near 2^24) diverges (e.g. `mean` f32-rounds where sklearn's float64 mean does not). Same class as OPTICS #2195 (generic-F vs sklearn-float64-upcast); the f64 path (default + the f64 Python binding) is bit-exact. Tracked #2205, pinned `#[ignore]` in `tests/divergence_standard_scaler.rs::divergence_f32_uses_float64_accumulators`. Future fix: compute the mean/var reduction in f64 regardless of `F`. |
+//! | REQ-7 (NaN tolerance: allow-nan) | SHIPPED | FIXED #1194. `Fit::fit`'s per-column mean + population variance now compute over the FINITE values only (skip `is_nan()`), with the divisor = COUNT OF FINITE values (`new_sample_count = n_samples - nan_count`, `extmath.py:1132-1133`), mirroring sklearn `force_all_finite="allow-nan"` (`_data.py:918`) + `_incremental_mean_and_var` ("NaNs are ignored", `extmath.py:1100`). An ALL-NaN column → `mean`/`var_`/`scale_` = NaN (no panic, no division by zero). NaN inputs pass through `transform`/`inverse_transform` (`(nan-mean)/scale = nan`). inf-rejection (allow-nan REJECTS +/-inf, MinMaxScaler #2200 precedent): `fit`/`transform`/`inverse_transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Live-oracle tests `req7_nan_fit_single_column_ignored` (mean_=2,var_=1,scale_=1,transform `[[-1],[nan],[1]]`), `req7_nan_fit_multi_column_scattered`, `req7_all_nan_column_yields_nan_no_panic`, `req7_nan_passthrough_inverse_transform`, `inf_rejected_fit`/`inf_rejected_transform`/`inf_rejected_inverse_transform`, `nan_only_still_fits` (`tests/divergence_standard_scaler.rs`). Consumers: PyO3 `_RsStandardScaler` + `FittedPipelineTransformer` + re-export. **f32 float64-accumulator parity (FIXED #2205):** sklearn ALWAYS computes mean/variance in float64 accumulators even for float32 input (`_data.py:81-82`,`:999`; `_incremental_mean_and_var` via `_safe_accumulator_op`, `extmath.py:1050-1051`), returning float64 `mean_`/`var_`/`scale_`. `Fit::fit` now accumulates the finite-value sum + the squared-deviation sum in `f64` (via `to_f64()`) and STORES `mean`/`std`/`var_`/`scale_` as `Array1<f64>` (the getters `mean()`/`std()`/`var()`/`scale()` return `&Array1<f64>` regardless of `F`, mirroring sklearn's float64 attribute dtype); `transform`/`inverse_transform` compute `(x_f64 ∓ mean_)/scale_` in f64 and downcast the per-element result to `F` (numpy applies the float64 stats to the f32 array then stores the f32 result). For F=f64 every cast is exact → bit-identical to the prior path (regression-guarded by the f64 oracle tests). For F=f32 a large-magnitude column near 2^24 now matches sklearn (the f32 sum no longer rounds): live-oracle `X=[[16777216],[16777216],[16777220]]` f32 → `mean_=16777217.333…`, transform `[-0.7071068,-0.7071068,1.4142137]`. Test `divergence_f32_uses_float64_accumulators` (un-`#[ignore]`-ed). Same class as the pairwise euclidean f32 fix #2298. |
 //! | REQ-8 (scale free fn + axis) | NOT-STARTED | open prereq blocker #1195. No `scale` fn / axis=1 (`_data.py:133`). |
 //! | REQ-9 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1196. Single-shot (`_data.py:880-1025`). |
 //! | REQ-10 (sample_weight) | NOT-STARTED | open prereq blocker #1197. Unweighted (`_data.py:923-924`). |
@@ -165,17 +165,27 @@ impl<F: Float + Send + Sync + 'static> Default for StandardScaler<F> {
 #[derive(Debug, Clone)]
 pub struct FittedStandardScaler<F> {
     /// Per-column means learned during fitting.
-    pub(crate) mean: Array1<F>,
+    ///
+    /// Stored as `f64` regardless of `F`, mirroring sklearn: `mean_` is dtype
+    /// `float64` even for `float32` input (`_incremental_mean_and_var` upcasts
+    /// the accumulators via `_safe_accumulator_op`, `extmath.py:1050-1051`;
+    /// `_data.py:999`). The transform downcasts per-element to `F` on output
+    /// (#2205).
+    pub(crate) mean: Array1<f64>,
     /// Per-column standard deviations learned during fitting.
-    pub(crate) std: Array1<F>,
+    ///
+    /// `f64`-typed (= `sqrt(var_)`); see [`FittedStandardScaler::mean`] (#2205).
+    pub(crate) std: Array1<f64>,
     /// Per-column population variance (ddof=0) learned during fitting.
     ///
-    /// Mirrors sklearn `StandardScaler.var_` (`_data.py:1013-1023`).
-    pub(crate) var_: Array1<F>,
+    /// Mirrors sklearn `StandardScaler.var_` (`_data.py:1013-1023`), dtype
+    /// `float64` even for `float32` input (#2205).
+    pub(crate) var_: Array1<f64>,
     /// Per-column scale with zeros replaced by 1 (`_handle_zeros_in_scale`).
     ///
-    /// Mirrors sklearn `StandardScaler.scale_` (`_data.py:1013-1023`).
-    pub(crate) scale_: Array1<F>,
+    /// Mirrors sklearn `StandardScaler.scale_` (`_data.py:1013-1023`), dtype
+    /// `float64` even for `float32` input (#2205).
+    pub(crate) scale_: Array1<f64>,
     /// Number of samples (rows) seen during fitting.
     ///
     /// Mirrors sklearn `StandardScaler.n_samples_seen_` (`_data.py:1013-1023`).
@@ -190,27 +200,37 @@ pub struct FittedStandardScaler<F> {
     /// Copied from the unfitted [`StandardScaler::with_std`] in [`Fit::fit`];
     /// governs `if with_std: X /= scale_` (`_data.py:1066-1067`).
     pub(crate) with_std: bool,
+    /// Carries the `F` type parameter (the fitted statistics are stored as
+    /// `f64` to mirror sklearn's float64 attributes; `F` governs the
+    /// transform input/output dtype).
+    pub(crate) _marker: std::marker::PhantomData<F>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
     /// Return the per-column means learned during fitting.
+    ///
+    /// Returns `f64` regardless of `F`, mirroring sklearn `mean_` (dtype
+    /// `float64` even for `float32` input, #2205).
     #[must_use]
-    pub fn mean(&self) -> &Array1<F> {
+    pub fn mean(&self) -> &Array1<f64> {
         &self.mean
     }
 
     /// Return the per-column standard deviations learned during fitting.
+    ///
+    /// Returns `f64` regardless of `F` (= `sqrt(var_)`, #2205).
     #[must_use]
-    pub fn std(&self) -> &Array1<F> {
+    pub fn std(&self) -> &Array1<f64> {
         &self.std
     }
 
     /// Return the per-column population variance (ddof=0) learned during fitting.
     ///
     /// Mirrors sklearn `StandardScaler.var_` (`_data.py:1013-1023`): the raw
-    /// variance, which is `0.0` on a constant column.
+    /// variance, which is `0.0` on a constant column. Returns `f64` regardless
+    /// of `F` (dtype `float64` even for `float32` input, #2205).
     #[must_use]
-    pub fn var(&self) -> &Array1<F> {
+    pub fn var(&self) -> &Array1<f64> {
         &self.var_
     }
 
@@ -218,9 +238,10 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
     ///
     /// Mirrors sklearn `StandardScaler.scale_` (`_data.py:1013-1023`,
     /// `_handle_zeros_in_scale`, `:88`): equals `std()` on non-constant columns
-    /// and `1.0` on constant (zero-variance) columns.
+    /// and `1.0` on constant (zero-variance) columns. Returns `f64` regardless
+    /// of `F` (dtype `float64` even for `float32` input, #2205).
     #[must_use]
-    pub fn scale(&self) -> &Array1<F> {
+    pub fn scale(&self) -> &Array1<f64> {
         &self.scale_
     }
 
@@ -270,14 +291,28 @@ impl<F: Float + Send + Sync + 'static> FittedStandardScaler<F> {
         {
             // Conditional un-scale/un-center mirroring sklearn `inverse_transform`
             // (`_data.py:1106-1109`): `if with_std: X *= scale_` then
-            // `if with_mean: X += mean_`. `scale_` has zero-variance columns
-            // replaced by 1 (`_handle_zeros_in_scale`, `_data.py:88`).
+            // `if with_mean: X += mean_`. The stored `mean_`/`scale_` are f64
+            // (sklearn float64 attributes, #2205); numpy applies them in float64
+            // and downcasts to the input dtype, so the per-element result is
+            // computed in f64 then cast to `F` (f64-input is exact → unchanged).
+            // `scale_` has zero-variance columns replaced by 1
+            // (`_handle_zeros_in_scale`, `_data.py:88`).
+            //
+            // Each in-place op (`X *= scale_`, `X += mean_`) is a SEPARATE numpy
+            // store back into the `F`-typed array, so the per-element result of
+            // EACH op rounds to `F`: two roundings in the REVERSE order of
+            // `transform` (multiply-then-round, add-then-round). For F=f64
+            // `F::from(f64)` is exact → identical to the fused expression (no
+            // regression); for F=f32 each step rounds to f32, matching sklearn's
+            // two float32 roundings (#2305). NaN propagates through both steps.
             for v in &mut col {
                 if self.with_std {
-                    *v = *v * s;
+                    // X *= scale_ (round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) * s).unwrap_or_else(F::nan);
                 }
                 if self.with_mean {
-                    *v = *v + m;
+                    // X += mean_ (round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) + m).unwrap_or_else(F::nan);
                 }
             }
         }
@@ -319,9 +354,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
         }
 
         let n_features = x.ncols();
-        let mut mean = Array1::zeros(n_features);
-        let mut std_arr = Array1::zeros(n_features);
-        let mut var_arr = Array1::zeros(n_features);
+        // The fitted statistics are stored as `f64` regardless of `F`, mirroring
+        // sklearn's float64 `mean_`/`var_`/`scale_` attributes (#2205).
+        let mut mean = Array1::<f64>::zeros(n_features);
+        let mut std_arr = Array1::<f64>::zeros(n_features);
+        let mut var_arr = Array1::<f64>::zeros(n_features);
         // Per-feature finite sample count (= n_samples - NaN count), reused for
         // the `_is_constant_feature` bound. sklearn's `n_samples_seen_` is the
         // finite count under `allow-nan` (`extmath.py:1132-1133`, `_data.py:996`).
@@ -337,24 +374,33 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
             // `extmath.py:1132-1133`), NOT `n_samples`. An all-NaN column has
             // count 0 → mean/var = NaN (matching sklearn's `nan` there; no panic,
             // no division materialized).
+            // The mean/variance reduction accumulates in FLOAT64 regardless of
+            // `F`, mirroring sklearn's `_safe_accumulator_op`: numpy upcasts the
+            // sum/variance to `dtype=np.float64` whenever the input float dtype
+            // is < 8 bytes (`extmath.py:1050-1051`), so `_incremental_mean_and_var`
+            // returns float64 `mean_`/`var_`/`scale_` even for float32 input
+            // (`_data.py:999`,`:1016`). For F=f64 `to_f64()`/`F::from` are exact →
+            // identity (no regression); for F=f32 a large-magnitude column near
+            // 2^24 no longer f32-rounds the sum, matching sklearn (#2205, same
+            // class as the pairwise euclidean f32 fix #2298).
             let mut count: usize = 0;
-            let mut sum = F::zero();
+            let mut sum = 0.0f64;
             for v in col.iter().copied() {
                 if v.is_nan() {
                     continue;
                 }
                 count += 1;
-                sum = sum + v;
+                sum += v.to_f64().unwrap_or(f64::NAN);
             }
             finite_count[j] = count;
             if count == 0 {
                 // All-NaN column: mean/var/std = NaN (no division by zero).
-                mean[j] = F::nan();
-                var_arr[j] = F::nan();
-                std_arr[j] = F::nan();
+                mean[j] = f64::NAN;
+                var_arr[j] = f64::NAN;
+                std_arr[j] = f64::NAN;
                 continue;
             }
-            let cnt = F::from(count).unwrap_or_else(F::one);
+            let cnt = count as f64;
             let m = sum / cnt;
             // Corrected 2-pass variance (Chan/Golub/LeVeque), matching sklearn's
             // `_incremental_mean_and_var` first-batch reduction (`extmath.py:1142`
@@ -365,18 +411,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
             // the naive `sum((x-mean)^2)/count` would give `1.11e-16`); on
             // ordinary columns it is numerically negligible (byte-identical to
             // the prior `sum((x-mean)^2)/count` path on finite, normal-magnitude
-            // data).
-            let mut sum_dev = F::zero();
-            let mut sum_dev_sq = F::zero();
+            // data). Accumulated in f64 (see above).
+            let mut sum_dev = 0.0f64;
+            let mut sum_dev_sq = 0.0f64;
             for v in col.iter().copied() {
                 if v.is_nan() {
                     continue;
                 }
-                let d = v - m;
-                sum_dev = sum_dev + d;
-                sum_dev_sq = sum_dev_sq + d * d;
+                let d = v.to_f64().unwrap_or(f64::NAN) - m;
+                sum_dev += d;
+                sum_dev_sq += d * d;
             }
             let variance = (sum_dev_sq - (sum_dev * sum_dev) / cnt) / cnt;
+            // Store the f64 result directly (the fitted attributes are f64,
+            // mirroring sklearn's float64 `mean_`/`var_`/`scale_`, #2205).
             mean[j] = m;
             var_arr[j] = variance;
             std_arr[j] = variance.sqrt();
@@ -398,13 +446,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
         let f64_eps = f64::EPSILON;
         let mut scale_ = std_arr.clone();
         for j in 0..n_features {
-            let var_f64 = var_arr[j].to_f64().unwrap_or(f64::NAN);
-            let mean_f64 = mean[j].to_f64().unwrap_or(f64::NAN);
+            // `var_`/`mean` are already f64 (sklearn's float64 accumulators,
+            // #2205), so the constant-feature bound matches sklearn directly.
+            let var_f64 = var_arr[j];
+            let mean_f64 = mean[j];
             let n_f64 = finite_count[j] as f64;
             let upper_bound = n_f64 * f64_eps * var_f64 + (n_f64 * mean_f64 * f64_eps).powi(2);
             // `_is_constant_feature`: var <= upper_bound (`_data.py:85`).
             if var_f64 <= upper_bound {
-                scale_[j] = F::one();
+                scale_[j] = 1.0;
             }
         }
 
@@ -416,6 +466,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for StandardScaler<F> 
             n_samples_seen_: n_samples,
             with_mean: self.with_mean,
             with_std: self.with_std,
+            _marker: std::marker::PhantomData,
         })
     }
 }
@@ -465,16 +516,30 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedStandardSc
         {
             // Conditional center/scale mirroring sklearn `transform`
             // (`_data.py:1064-1067`): `if with_mean: X -= mean_` then
-            // `if with_std: X /= scale_`. `scale_` already has zero-variance
-            // columns replaced by 1 (`_handle_zeros_in_scale`, `_data.py:88`),
-            // so a constant column maps to `(x - mean) / 1 = 0`. When
-            // `with_mean && with_std` this is byte-identical to the prior path.
+            // `if with_std: X /= scale_`. `mean_`/`scale_` are f64 (sklearn's
+            // float64 attributes, #2205); numpy performs `X_f32 - mean_f64` in
+            // float64 and assigns the result back to the f32 array, so the
+            // center/scale is computed in f64 and the per-element result is
+            // downcast to `F` (the f64-input case is exact → unchanged). `scale_`
+            // already has zero-variance columns replaced by 1
+            // (`_handle_zeros_in_scale`, `_data.py:88`), so a constant column maps
+            // to `(x - mean) / 1 = 0`.
+            //
+            // Each in-place op (`X -= mean_`, `X /= scale_`) is a SEPARATE numpy
+            // store back into the `F`-typed array, so the per-element result of
+            // EACH op rounds to `F`: two roundings, not one fused rounding. For
+            // F=f64 `F::from(f64)` is exact → identical to the fused expression
+            // (no regression); for F=f32 each step rounds to f32, matching
+            // sklearn's two float32 roundings (1 ULP near 2^24, #2305). NaN
+            // propagates through both steps (`F::from(nan)` → nan).
             for v in &mut col {
                 if self.with_mean {
-                    *v = *v - m;
+                    // X -= mean_ (round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) - m).unwrap_or_else(F::nan);
                 }
                 if self.with_std {
-                    *v = *v / s;
+                    // X /= scale_ (round to F)
+                    *v = F::from(v.to_f64().unwrap_or(f64::NAN) / s).unwrap_or_else(F::nan);
                 }
             }
         }

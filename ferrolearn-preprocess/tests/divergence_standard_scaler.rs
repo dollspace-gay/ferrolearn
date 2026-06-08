@@ -611,7 +611,8 @@ fn req7_f32_constant_column_scale_one() -> Result<(), FerroError> {
     let scaler = StandardScaler::<f32>::new();
     let x = array![[5.0f32, 1.0], [5.0, 2.0], [5.0, 3.0]];
     let fitted = scaler.fit(&x, &())?;
-    assert_eq!(fitted.scale()[0], 1.0f32);
+    // `scale_` is float64 even for f32 input (sklearn float64 attributes, #2205).
+    assert_eq!(fitted.scale()[0], 1.0f64);
     let scaled = fitted.transform(&x)?;
     for i in 0..3 {
         assert!(scaled[[i, 0]].abs() < 1e-6);
@@ -654,7 +655,6 @@ fn req7_f32_constant_column_scale_one() -> Result<(), FerroError> {
 ///
 /// Tracking: #2205
 #[test]
-#[ignore = "divergence: StandardScaler<f32> computes mean_/var_/scale_ in f32 not float64 accumulators; tracking #2205"]
 #[allow(
     clippy::approx_constant,
     reason = "these are the LIVE sklearn 1.5.2 f32 transform-output oracle values \
@@ -676,8 +676,9 @@ fn divergence_f32_uses_float64_accumulators() {
     let fitted = scaler.fit(&x, &()).unwrap();
 
     // sklearn's mean_ (computed in float64) is 16777217.333..., NOT the f32
-    // value 16777218.0 that ferrolearn computes.
-    let ferro_mean = f64::from(fitted.mean()[0]);
+    // value 16777218.0 that ferrolearn previously computed. `mean()` now returns
+    // f64 (sklearn's float64 attribute, #2205).
+    let ferro_mean = fitted.mean()[0];
     assert!(
         (ferro_mean - SK_MEAN).abs() < 0.5,
         "mean_: ferrolearn (f32) ={ferro_mean}, sklearn (float64) ={SK_MEAN}"
