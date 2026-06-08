@@ -162,3 +162,172 @@ fn green_req7_multiclass_inverse_roundtrip() {
     let recovered = fitted.inverse_transform(&mat).unwrap();
     assert_eq!(recovered, y);
 }
+
+// ===========================================================================
+// REQ-8: neg_label / pos_label ctor params + validation.
+//
+// sklearn `LabelBinarizer.__init__(*, neg_label=0, pos_label=1, ...)`
+// (`_label.py:263`); the dense fill writes `pos_label` at active positions and
+// `neg_label` everywhere else (`:579-583`); `fit` rejects `neg_label >=
+// pos_label` verbatim (`:283-287`); `_inverse_binarize_thresholding` uses a
+// STRICT `y > threshold` with `threshold = (pos_label + neg_label) / 2`
+// (`:399-400`, `:667`).
+//
+// Every expected value below is a LIVE sklearn 1.5.2 oracle (run from /tmp).
+// ===========================================================================
+
+/// REQ-8: multiclass transform with neg_label=-1, pos_label=2.
+/// Live oracle:
+///   `LabelBinarizer(neg_label=-1,pos_label=2).fit([0,1,2]).transform([0,2]).tolist()`
+///     -> `[[2, -1, -1], [-1, -1, 2]]`
+#[test]
+fn req8_neg_pos_multiclass_transform() {
+    let lb = LabelBinarizer::new().with_neg_label(-1).with_pos_label(2);
+    let fitted = lb.fit(&array![0_usize, 1, 2], &()).unwrap();
+    let got = fitted.transform(&array![0_usize, 2]).unwrap();
+    let expected: Array2<f64> = array![[2.0, -1.0, -1.0], [-1.0, -1.0, 2.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-8: binary (k==2) single-column transform with neg_label=-1, pos_label=1.
+/// Live oracle:
+///   `LabelBinarizer(neg_label=-1,pos_label=1).fit([0,1]).transform([0,1,0]).tolist()`
+///     -> `[[-1], [1], [-1]]`
+#[test]
+fn req8_neg_pos_binary_single_column() {
+    let lb = LabelBinarizer::new().with_neg_label(-1).with_pos_label(1);
+    let fitted = lb.fit(&array![0_usize, 1], &()).unwrap();
+    let got = fitted.transform(&array![0_usize, 1, 0]).unwrap();
+    let expected: Array2<f64> = array![[-1.0], [1.0], [-1.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-8: single-class (k==1) transform -> all neg_label.
+/// Live oracle:
+///   `LabelBinarizer(neg_label=-1,pos_label=2).fit_transform([5,5,5]).tolist()`
+///     -> `[[-1], [-1], [-1]]`
+#[test]
+fn req8_neg_pos_single_class_all_neg() {
+    let lb = LabelBinarizer::new().with_neg_label(-1).with_pos_label(2);
+    let y = array![5_usize, 5, 5];
+    let fitted = lb.fit(&y, &()).unwrap();
+    let got = fitted.transform(&y).unwrap();
+    let expected: Array2<f64> = array![[-1.0], [-1.0], [-1.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-8: unseen label stays at neg_label (silent-ignore now -1).
+/// Live oracle:
+///   `LabelBinarizer(neg_label=-1,pos_label=2).fit([0,1,2]).transform([0,3]).tolist()`
+///     -> `[[2, -1, -1], [-1, -1, -1]]`
+#[test]
+fn req8_neg_pos_unseen_label_stays_neg() {
+    let lb = LabelBinarizer::new().with_neg_label(-1).with_pos_label(2);
+    let fitted = lb.fit(&array![0_usize, 1, 2], &()).unwrap();
+    let got = fitted.transform(&array![0_usize, 3]).unwrap();
+    let expected: Array2<f64> = array![[2.0, -1.0, -1.0], [-1.0, -1.0, -1.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-8: `neg_label >= pos_label` rejected at fit, verbatim message.
+/// Live oracle:
+///   `LabelBinarizer(neg_label=2,pos_label=1).fit([0,1])`
+///     -> ValueError: "neg_label=2 must be strictly less than pos_label=1."
+///   `LabelBinarizer(neg_label=1,pos_label=1).fit([0,1])`
+///     -> ValueError: "neg_label=1 must be strictly less than pos_label=1."
+#[test]
+fn req8_neg_ge_pos_rejected_at_fit() {
+    let err = LabelBinarizer::new()
+        .with_neg_label(2)
+        .with_pos_label(1)
+        .fit(&array![0_usize, 1], &())
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid parameter `neg_label`: neg_label=2 must be strictly less than pos_label=1."
+    );
+
+    let err = LabelBinarizer::new()
+        .with_neg_label(1)
+        .with_pos_label(1)
+        .fit(&array![0_usize, 1], &())
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "Invalid parameter `neg_label`: neg_label=1 must be strictly less than pos_label=1."
+    );
+}
+
+/// REQ-8: inverse_transform binary STRICT threshold = (pos+neg)/2.
+/// Live oracle (neg=-1,pos=1 -> threshold 0.0):
+///   `inverse_transform([[0.0]])` -> [0]; `[[0.1]]` -> [1]; `[[-0.1]]` -> [0]
+/// Live oracle (neg=2,pos=4 -> threshold 3.0):
+///   `inverse_transform([[3.0]])` -> [0]; `[[3.1]]` -> [1]
+#[test]
+fn req8_neg_pos_inverse_threshold() {
+    let fitted = LabelBinarizer::new()
+        .with_neg_label(-1)
+        .with_pos_label(1)
+        .fit(&array![0_usize, 1], &())
+        .unwrap();
+    assert_eq!(
+        fitted.inverse_transform(&array![[0.0_f64]]).unwrap(),
+        array![0_usize]
+    );
+    assert_eq!(
+        fitted.inverse_transform(&array![[0.1_f64]]).unwrap(),
+        array![1_usize]
+    );
+    assert_eq!(
+        fitted.inverse_transform(&array![[-0.1_f64]]).unwrap(),
+        array![0_usize]
+    );
+
+    let fitted = LabelBinarizer::new()
+        .with_neg_label(2)
+        .with_pos_label(4)
+        .fit(&array![0_usize, 1], &())
+        .unwrap();
+    assert_eq!(
+        fitted.inverse_transform(&array![[3.0_f64]]).unwrap(),
+        array![0_usize]
+    );
+    assert_eq!(
+        fitted.inverse_transform(&array![[3.1_f64]]).unwrap(),
+        array![1_usize]
+    );
+}
+
+/// REQ-8: inverse_transform multiclass round-trip with neg/pos.
+/// Live oracle:
+///   `LabelBinarizer(neg_label=-1,pos_label=2).fit([0,1,2]).inverse_transform(
+///       [[2,-1,-1],[-1,-1,2]])` -> [0, 2]
+#[test]
+fn req8_neg_pos_inverse_multiclass() {
+    let fitted = LabelBinarizer::new()
+        .with_neg_label(-1)
+        .with_pos_label(2)
+        .fit(&array![0_usize, 1, 2], &())
+        .unwrap();
+    let mat: Array2<f64> = array![[2.0, -1.0, -1.0], [-1.0, -1.0, 2.0]];
+    let recovered = fitted.inverse_transform(&mat).unwrap();
+    assert_eq!(recovered, array![0_usize, 2]);
+}
+
+/// REQ-1/2/3 preserved: defaults (neg=0,pos=1) reproduce the canonical 0/1.
+/// Live oracle:
+///   `LabelBinarizer().fit_transform([0,1,2,1]).tolist()`
+///     -> `[[1,0,0],[0,1,0],[0,0,1],[0,1,0]]`
+#[test]
+fn req8_defaults_preserve_zero_one() {
+    let lb = LabelBinarizer::new();
+    let y = array![0_usize, 1, 2, 1];
+    let fitted = lb.fit(&y, &()).unwrap();
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ];
+    assert_eq!(fitted.transform(&y).unwrap(), expected);
+}

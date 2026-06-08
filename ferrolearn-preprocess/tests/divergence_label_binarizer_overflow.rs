@@ -43,7 +43,6 @@ use ndarray::array;
 // debug, or wrong class in release) against current ferrolearn.
 // ===========================================================================
 #[test]
-#[ignore = "divergence: inverse_transform threshold (pos+neg) overflows i64 for large neg/pos (panic in debug, wrong class in release); sklearn handles via arbitrary-precision; tracking #2232"]
 fn divergence_inverse_threshold_overflow_large_neg_pos() {
     let neg: i64 = 1i64 << 62; // 4_611_686_018_427_387_904
     let pos: i64 = (1i64 << 62) + 1; // 4_611_686_018_427_387_905, > neg so fit accepts

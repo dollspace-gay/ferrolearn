@@ -141,7 +141,7 @@ fn api_proof_encoders() {
 
     // LabelBinarizer fits Array1<usize>.
     let y = binary_labels_usize();
-    let f = LabelBinarizer.fit(&y, &()).unwrap();
+    let f = LabelBinarizer::new().fit(&y, &()).unwrap();
     let _ = f.transform(&y).unwrap();
 
     // MultiLabelBinarizer fits Vec<Vec<usize>>.
