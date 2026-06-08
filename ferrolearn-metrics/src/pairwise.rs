@@ -224,23 +224,46 @@ where
     let n = x.nrows();
     let m = y.nrows();
     let d = x.ncols();
-    let two = F::from(2.0).unwrap();
 
-    // Precompute ||x_i||^2 and ||y_j||^2.
-    let x_sq: Vec<F> = (0..n)
-        .map(|i| (0..d).fold(F::zero(), |acc, k| acc + x[[i, k]] * x[[i, k]]))
+    // Accumulate the ||a||^2 + ||b||^2 - 2*a.b squared-distance trick in f64
+    // regardless of `F`, mirroring sklearn's float32 upcast path
+    // (`_euclidean_distances_upcast`, `sklearn/metrics/pairwise.py:401-404`):
+    // when inputs are float32, the squared terms `||x||^2` lose their low bits
+    // and the difference cancels (catastrophic cancellation), so sklearn
+    // computes the trick in float64 chunks then casts the result back. For
+    // F=f64 every `to_f64`/`F::from` is exact, so this is identity (no
+    // regression); the f64 native path computes natively.
+    let to_f64 = |v: F| v.to_f64().unwrap_or(f64::NAN);
+
+    // Precompute ||x_i||^2 and ||y_j||^2 in f64.
+    let x_sq: Vec<f64> = (0..n)
+        .map(|i| {
+            (0..d).fold(0.0_f64, |acc, k| {
+                let v = to_f64(x[[i, k]]);
+                acc + v * v
+            })
+        })
         .collect();
-    let y_sq: Vec<F> = (0..m)
-        .map(|j| (0..d).fold(F::zero(), |acc, k| acc + y[[j, k]] * y[[j, k]]))
+    let y_sq: Vec<f64> = (0..m)
+        .map(|j| {
+            (0..d).fold(0.0_f64, |acc, k| {
+                let v = to_f64(y[[j, k]]);
+                acc + v * v
+            })
+        })
         .collect();
 
     let mut result = Array2::<F>::zeros((n, m));
     for i in 0..n {
         for j in 0..m {
-            // dot product x_i . y_j
-            let dot = (0..d).fold(F::zero(), |acc, k| acc + x[[i, k]] * y[[j, k]]);
-            let sq_dist = (x_sq[i] + y_sq[j] - two * dot).max(F::zero());
-            result[[i, j]] = sq_dist.sqrt();
+            // dot product x_i . y_j in f64
+            let dot = (0..d).fold(0.0_f64, |acc, k| {
+                acc + to_f64(x[[i, k]]) * to_f64(y[[j, k]])
+            });
+            // ||x||^2 + ||y||^2 - 2*x.y, clamped at 0 (mirrors np.maximum(.,0),
+            // `pairwise.py:410`), all in f64; sqrt in f64; cast back to F.
+            let sq_dist = (x_sq[i] + y_sq[j] - 2.0 * dot).max(0.0);
+            result[[i, j]] = F::from(sq_dist.sqrt()).unwrap_or_else(F::zero);
         }
     }
 

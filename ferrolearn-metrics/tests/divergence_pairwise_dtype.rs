@@ -33,7 +33,6 @@ use ndarray::array;
 ///
 /// sklearn returns `8.0`; ferrolearn returns `0.0`.
 #[test]
-#[ignore = "divergence: euclidean f32 native-trick cancellation vs sklearn f64 upcast; tracking #2298"]
 fn divergence_euclidean_f32_cancellation_single() {
     let x = array![[1e5_f32]];
     let y = array![[100008.0_f32]];
@@ -58,7 +57,6 @@ fn divergence_euclidean_f32_cancellation_single() {
 ///
 /// sklearn returns `0.09375`; ferrolearn returns `0.0`.
 #[test]
-#[ignore = "divergence: euclidean f32 native-trick cancellation vs sklearn f64 upcast; tracking #2298"]
 fn divergence_euclidean_f32_cancellation_multifeature() {
     let x = array![[100000.0_f32, 200000.0]];
     let y = array![[100000.0_f32, 200000.1]];
