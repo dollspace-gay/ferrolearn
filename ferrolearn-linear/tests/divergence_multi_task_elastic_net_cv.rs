@@ -202,7 +202,6 @@ fn mtenet_cv_rejects_non_finite_input() {
 /// ferrolearn returns `alpha_ = 1e-6`.
 /// Tracking: #2242
 #[test]
-#[ignore = "divergence: degenerate alpha_max fills 1e-6 not np.finfo.resolution(1e-15); tracking #2242"]
 fn mtenet_cv_degenerate_alpha_max_constant_y() {
     let (x, _y) = fixture();
     let y: Array2<f64> = Array2::from_elem((12, 2), 5.0);

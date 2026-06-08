@@ -150,6 +150,18 @@ design = ".design/linear/elastic_net_cv.md"
 parity_ops = ["ElasticNetCV"]
 
 [[route]]
+crate_pattern = "ferrolearn-linear/src/multi_task_elastic_net_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/elastic_net_cv.md"
+parity_ops = ["MultiTaskElasticNetCV"]
+
+[[route]]
+crate_pattern = "ferrolearn-linear/src/multi_task_lasso_cv.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_coordinate_descent.py"]
+design = ".design/linear/lasso_cv.md"
+parity_ops = ["MultiTaskLassoCV"]
+
+[[route]]
 crate_pattern = "ferrolearn-linear/src/logistic_regression.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/linear_model/_logistic.py"]
 design = ".design/linear/logistic_regression.md"
