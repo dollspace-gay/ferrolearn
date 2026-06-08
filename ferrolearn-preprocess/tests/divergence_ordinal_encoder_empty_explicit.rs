@@ -56,7 +56,6 @@ fn make_1col(vals: &[&str]) -> Array2<String> {
 ///
 /// Tracking: #2229
 #[test]
-#[ignore = "divergence: OrdinalEncoder accepts empty explicit categories [[]] under use_encoded_value; sklearn raises IndexError (_encoders.py:117); tracking #2229"]
 fn divergence_empty_explicit_list_use_encoded_value_fit_must_err() {
     let enc = OrdinalEncoder::new()
         .with_categories(vec![vec![]]) // empty list for the single feature

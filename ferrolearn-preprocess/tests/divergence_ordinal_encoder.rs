@@ -54,6 +54,14 @@ use ferrolearn_core::traits::{Fit, FitTransform, Transform};
 use ferrolearn_preprocess::{HandleUnknown, OrdinalEncoder};
 use ndarray::Array2;
 
+/// Helper to build the `Vec<Vec<String>>` for explicit `with_categories`.
+fn cats(lists: &[&[&str]]) -> Vec<Vec<String>> {
+    lists
+        .iter()
+        .map(|l| l.iter().map(std::string::ToString::to_string).collect())
+        .collect()
+}
+
 /// Build an `n x 2` string array from `(col0, col1)` row tuples.
 fn make_2col(rows: &[(&str, &str)]) -> Array2<String> {
     let flat: Vec<String> = rows
@@ -810,4 +818,242 @@ fn req10_feature_names_out_and_n_features_in() {
     // wrong-length input_features -> Err (sklearn ValueError)
     let bad = vec!["only_one".to_string()];
     assert!(fitted.get_feature_names_out(Some(&bad)).is_err());
+}
+
+// ===========================================================================
+// REQ-7 (#1162) — explicit `categories` param (Categories::Explicit).
+//
+// EVERY expected value below comes from a LIVE sklearn 1.5.2 oracle (R-CHAR-3),
+// reproduced via the `python3 -c` command cited above each test.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 17 (REQ-7) — explicit categories used in the GIVEN order (NOT
+// re-sorted); ordinal indices follow the supplied order.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(categories=[['dog','cat','bird']]).fit([['cat'],['dog']]); \
+//     print([c.tolist() for c in e.categories_]); \
+//     print(e.transform([['cat'],['dog'],['bird']]).tolist())"
+//   -> [['dog', 'cat', 'bird']]            # GIVEN order, NOT sorted
+//      [[1.0], [0.0], [2.0]]               # cat->1, dog->0, bird->2 (given order)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_given_order_not_sorted() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["dog", "cat", "bird"]]));
+    let x = make_1col(&["cat", "dog"]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // categories_ are the GIVEN list, NOT sorted.
+    assert_eq!(
+        fitted.categories()[0],
+        ["dog", "cat", "bird"],
+        "categories_ in given order (oracle)"
+    );
+
+    let probe = make_1col(&["cat", "dog", "bird"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    // Oracle: [[1.0],[0.0],[2.0]].
+    assert_eq!(out[[0, 0]], 1.0, "cat -> index 1 (given order)");
+    assert_eq!(out[[1, 0]], 0.0, "dog -> index 0 (given order)");
+    assert_eq!(out[[2, 0]], 2.0, "bird -> index 2 (given order)");
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 18 (REQ-7) — UNSORTED explicit categories are ACCEPTED (no sort
+// requirement on the String path).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(categories=[['zebra','ant','moose']]).fit([['ant'],['zebra']]); \
+//     print([c.tolist() for c in e.categories_])"
+//   -> [['zebra', 'ant', 'moose']]   # accepted unsorted, given order preserved
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_unsorted_accepted() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["zebra", "ant", "moose"]]));
+    let x = make_1col(&["ant", "zebra"]);
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.categories()[0],
+        ["zebra", "ant", "moose"],
+        "unsorted explicit accepted, order preserved (oracle)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 10 (REQ-7) — explicit + handle_unknown='error' (default) + a data
+// value not in the explicit list -> Err AT FIT (matches sklearn ValueError).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder(categories=[['cat','dog']]).fit([['cat'],['fish']])"
+//   -> ValueError: Found unknown categories ['fish'] in column 0 during fit
+// ---------------------------------------------------------------------------
+#[test]
+fn red_explicit_error_mode_data_not_in_cats_fits_err() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["cat", "dog"]]));
+    let x = make_1col(&["cat", "fish"]);
+    assert!(
+        enc.fit(&x, &()).is_err(),
+        "sklearn ValueError 'Found unknown categories ... during fit'; ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 19 (REQ-7) — explicit + use_encoded_value: out-of-set data is OK
+// at fit (subset check SKIPPED) and is encoded to unknown_value at transform.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(categories=[['cat','dog']], \
+//       handle_unknown='use_encoded_value', unknown_value=-1)\
+//       .fit([['cat'],['fish']]); \
+//     print(e.transform([['fish'],['cat']]).tolist())"
+//   -> [[-1.0], [0.0]]   # fit OK (no subset error); fish->-1, cat->0 (given order)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_use_encoded_value_out_of_set_ok() {
+    let enc = OrdinalEncoder::new()
+        .with_categories(cats(&[&["cat", "dog"]]))
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(-1.0);
+    let x_train = make_1col(&["cat", "fish"]);
+    // fit must NOT error (subset check skipped under use_encoded_value).
+    let fitted = enc.fit(&x_train, &()).unwrap();
+
+    let probe = make_1col(&["fish", "cat"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    // Oracle: [[-1.0],[0.0]].
+    assert_eq!(out[[0, 0]], -1.0, "out-of-set 'fish' -> unknown_value -1");
+    assert_eq!(out[[1, 0]], 0.0, "'cat' -> index 0 (given order)");
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 11 (REQ-7) — explicit list-count != n_features -> Err
+// (ShapeMismatch, matches sklearn ValueError).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder(categories=[['cat','dog']]).fit([['cat','x'],['dog','y']])"
+//   -> ValueError: Shape mismatch: if categories is an array, it has to be of
+//      shape (n_features,).
+// (1 category list provided for 2-feature data.)
+// ---------------------------------------------------------------------------
+#[test]
+fn red_explicit_n_features_mismatch() {
+    // 1 category list, but the data has 2 columns.
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["cat", "dog"]]));
+    let x = make_2col(&[("cat", "x"), ("dog", "y")]);
+    assert!(
+        enc.fit(&x, &()).is_err(),
+        "1 cat-list for 2 features -> sklearn ValueError (shape mismatch); ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 20 (REQ-7) — multi-feature explicit, each column in its OWN given
+// order; transform indices follow the per-column order.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(categories=[['dog','cat'],['z','y','x']])\
+//       .fit([['cat','x'],['dog','y']]); \
+//     print([c.tolist() for c in e.categories_]); \
+//     print(e.transform([['cat','x'],['dog','z']]).tolist())"
+//   -> [['dog', 'cat'], ['z', 'y', 'x']]
+//      [[1.0, 2.0], [0.0, 0.0]]   # col0: cat->1,dog->0 ; col1: x->2,z->0
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_multifeature_each_own_order() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["dog", "cat"], &["z", "y", "x"]]));
+    let x = make_2col(&[("cat", "x"), ("dog", "y")]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.categories()[0], ["dog", "cat"], "col0 given order");
+    assert_eq!(fitted.categories()[1], ["z", "y", "x"], "col1 given order");
+
+    let probe = make_2col(&[("cat", "x"), ("dog", "z")]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    // Oracle: [[1.0,2.0],[0.0,0.0]].
+    assert_eq!(out[[0, 0]], 1.0, "col0 cat -> 1");
+    assert_eq!(out[[0, 1]], 2.0, "col1 x -> 2");
+    assert_eq!(out[[1, 0]], 0.0, "col0 dog -> 0");
+    assert_eq!(out[[1, 1]], 0.0, "col1 z -> 0");
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 12 (REQ-7) — explicit list with DUPLICATE elements -> Err
+// (matches sklearn ValueError).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder(categories=[['cat','cat','dog']]).fit([['cat'],['dog']])"
+//   -> ValueError: In column 0, the predefined categories contain duplicate
+//      elements.
+// ---------------------------------------------------------------------------
+#[test]
+fn red_explicit_duplicate_categories() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["cat", "cat", "dog"]]));
+    let x = make_1col(&["cat", "dog"]);
+    assert!(
+        enc.fit(&x, &()).is_err(),
+        "duplicate explicit categories -> sklearn ValueError; ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 21 (REQ-7) — inverse_transform with explicit (given-order)
+// categories roundtrips to the given-order strings.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(categories=[['dog','cat','bird']]).fit([['cat'],['dog']]); \
+//     print(e.inverse_transform([[1.],[0.],[2.]]).tolist())"
+//   -> [['cat'], ['dog'], ['bird']]   # index 1->cat, 0->dog, 2->bird (given order)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_inverse_roundtrip_given_order() {
+    let enc = OrdinalEncoder::new().with_categories(cats(&[&["dog", "cat", "bird"]]));
+    let x = make_1col(&["cat", "dog"]);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    let probe = Array2::from_shape_vec((3, 1), vec![1.0_f64, 0.0, 2.0]).unwrap();
+    let out = fitted.inverse_transform(&probe).unwrap();
+    // Oracle: [['cat'],['dog'],['bird']].
+    assert_eq!(out[[0, 0]], "cat", "index 1 -> 'cat' (given order)");
+    assert_eq!(out[[1, 0]], "dog", "index 0 -> 'dog' (given order)");
+    assert_eq!(out[[2, 0]], "bird", "index 2 -> 'bird' (given order)");
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 22 (REQ-7) — the DEFAULT categories='auto' path is UNCHANGED:
+// sorted-unique categories_, matching the SHIPPED REQ-1 behavior.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder().fit([['dog'],['cat'],['bird']]); \
+//     print([c.tolist() for c in e.categories_]); \
+//     print(e.transform([['cat'],['dog'],['bird']]).tolist())"
+//   -> [['bird', 'cat', 'dog']]          # AUTO -> sorted-unique
+//      [[1.0], [2.0], [0.0]]
+// ---------------------------------------------------------------------------
+#[test]
+fn green_explicit_auto_still_default() {
+    // No with_categories() -> Categories::Auto (default).
+    let enc = OrdinalEncoder::new();
+    let x = make_1col(&["dog", "cat", "bird"]);
+    let fitted = enc.fit(&x, &()).unwrap();
+    // AUTO path: sorted-unique (UNCHANGED REQ-1).
+    assert_eq!(
+        fitted.categories()[0],
+        ["bird", "cat", "dog"],
+        "auto -> sorted-unique (oracle)"
+    );
+    let probe = make_1col(&["cat", "dog", "bird"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], 1.0, "auto cat -> 1");
+    assert_eq!(out[[1, 0]], 2.0, "auto dog -> 2");
+    assert_eq!(out[[2, 0]], 0.0, "auto bird -> 0");
 }

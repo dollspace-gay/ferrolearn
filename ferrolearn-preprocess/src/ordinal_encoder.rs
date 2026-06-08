@@ -26,7 +26,7 @@
 //! | REQ-4 (numeric/mixed-dtype input) | NOT-STARTED | open prereq blocker #1159. `Array2<String>`-only; sklearn accepts int/str/object (`np.unique` numeric sort). |
 //! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | SHIPPED | `HandleUnknown` enum `{ Error, UseEncodedValue }` (default `Error`) + `unknown_value: Option<f64>` on `OrdinalEncoder`, threaded into `FittedOrdinalEncoder` via `with_handle_unknown`/`with_unknown_value` builders. `Fit::fit` runs the 3 sklearn validations (`_encoders.py:1473-1526`) AFTER the unchanged `categories_` compute, mapping sklearn's `TypeError`/`ValueError` → `FerroError::InvalidParameter`: (a) `UseEncodedValue` && `unknown_value is None` (sklearn `:1481` `not isinstance(.,Integral)` TypeError); (b) `Error` && `unknown_value is Some` (sklearn `:1488` TypeError); (c) `UseEncodedValue` && non-nan integer `v` with `0 <= v < max_cardinality` (sklearn `:1518-1526` ValueError collision). `Transform::transform` branches unknown categories: `UseEncodedValue` → write `unknown_value` (incl. nan) (sklearn `:1591` `X_trans[~X_mask] = self.unknown_value`); `Error` → `InvalidParameter` (the SHIPPED REQ-2 default, UNCHANGED). Seen categories still map to `idx as f64` (UNCHANGED). NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle: `green_use_encoded_value_minus_one`, `green_use_encoded_value_nan`, `green_use_encoded_value_multifeature`, `red_uev_requires_unknown_value`, `red_error_mode_forbids_unknown_value`, `red_unknown_value_collision_in_range`, `green_unknown_value_negative_or_oob_or_nan_ok`, `green_error_mode_unknown_still_rejected` (`tests/divergence_ordinal_encoder.rs`). Configurable `dtype`/`encoded_missing_value` interplay stays OUT OF SCOPE (REQ-3/REQ-6). Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
-//! | REQ-7 (explicit categories param) | NOT-STARTED | open prereq blocker #1162. Always `'auto'` (`:1252`). |
+//! | REQ-7 (explicit categories param) | SHIPPED | `Categories` enum `{ Auto, Explicit(Vec<Vec<String>>) }` (default `Auto`) + `#[must_use] OrdinalEncoder::with_categories(Vec<Vec<String>>)` builder + `categories_param()` getter (named to avoid colliding with `FittedOrdinalEncoder::categories`). `Fit::fit` branches on the param AFTER the 0-row guard: `Auto` → the SHIPPED REQ-1 sorted-unique compute (UNCHANGED); `Explicit(lists)` → use each `lists[j]` AS-GIVEN for `categories_[j]` (GIVEN order, NOT re-sorted) + the index map in that order, mirroring sklearn `_encoders.py:114` `cats = np.array(self.categories[i])`. Validations match `_BaseEncoder._fit`: list-count ≠ n_features → `ShapeMismatch` ("Shape mismatch: if categories is an array, it has to be of shape (n_features,)." `:85-89`); an EMPTY list → `InvalidParameter` (sklearn indexes `cats[0]` -> IndexError in both modes, `:114-117`, #2229); a list with duplicate elements → `InvalidParameter` ("In column {j}, the predefined categories contain duplicate elements." `:136-141`); under [`HandleUnknown::Error`] (default) a data value not in its column's list → `InvalidParameter` ("Found unknown categories [{v}] in column {j} during fit" `:153-160`), while under [`HandleUnknown::UseEncodedValue`] this fit-time subset check is SKIPPED (out-of-set data is encoded to `unknown_value` at transform). The REQ-5 unknown_value validations still apply (the `max_cardinality` collision check now keys off the explicit list lengths). `Transform`/`inverse_transform`/`categories()`/`get_feature_names_out` are UNCHANGED — they already read `categories_`/`category_to_index`, which now reflect the explicit given-order set. NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle (`tests/divergence_ordinal_encoder.rs`): `green_explicit_given_order_not_sorted`, `green_explicit_unsorted_accepted`, `red_explicit_error_mode_data_not_in_cats_fits_err`, `green_explicit_use_encoded_value_out_of_set_ok`, `red_explicit_n_features_mismatch`, `green_explicit_multifeature_each_own_order`, `red_explicit_duplicate_categories`, `green_explicit_inverse_roundtrip_given_order`, `green_explicit_auto_still_default`. Consumer: crate re-export (`lib.rs:142`, `Categories` re-exported). Configurable numeric/`bytes` categories + the nan-last rule stay OUT OF SCOPE (String-only path, REQ-4/REQ-6). |
 //! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
 //! | REQ-9 (inverse_transform) | SHIPPED | `FittedOrdinalEncoder::inverse_transform(&Array2<f64>) -> Array2<String>` reuses the SHIPPED `categories_` (REQ-1): each cell is an ordinal index into `categories[j]`, mirroring sklearn `X_tr[:, i] = self.categories_[i][labels]` (`_encoders.py:1595-1679`). Validates the index BEFORE lookup (no panic, R-CODE-2): an exact non-negative integer in `[0, len)` → `categories[j][index].clone()`; 0-row → `InsufficientSamples` (symmetry with the #2220 transform guard); ncols-mismatch → `ShapeMismatch` (sklearn `:1619`). FAITHFUL to numpy: mirrors `labels.astype("int64")` (truncate toward zero, Rust `as i64`) + numpy fancy indexing (negative WRAP, `-1.0` → last category, `-2.0` → `len-2`), raising only once the wrapped index leaves `[0, len)` (`_encoders.py:1664`,`:1679`). Non-finite (NaN/±inf) → `InvalidParameter` (sklearn IndexError/ValueError; guarded because Rust `f64 as i64` saturates NaN→0). Critic-verified vs live sklearn 1.5.2 oracle: `green_inverse_roundtrip_multifeature`, `green_inverse_held_out_valid_ordinals`, `green_inverse_negative_wraps_like_numpy` (`-1.0`→'dog', `-2.0`→'cat', `-3.0`→Err), `green_inverse_non_integer_truncates_like_numpy` (`1.5`→'dog', `0.7`→'cat'), `red_inverse_out_of_range_positive` (`9.0`→Err), `red_inverse_ncols_mismatch`, `red_inverse_zero_row`, `red_inverse_use_encoded_value_unknown_cell` (`tests/divergence_ordinal_encoder.rs`). SCOPE LIMITATION (R-HONEST-3): the `unknown_value`-cell → `None` inverse (sklearn `:1673`) is unrepresentable in `Array2<String>` (would need `Array2<Option<String>>`), so a `use_encoded_value` cell equal to `unknown_value` ERRORS (checked BEFORE the index logic so the sentinel is not silently wrapped) instead of yielding `None`; the default `Error`-mode encoder has only valid ordinals so its inverse is COMPLETE and bit-exact. Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-10 (get_feature_names_out + n_features_in_) | SHIPPED | `FittedOrdinalEncoder::n_features_in()` (= `n_features()`, sklearn `n_features_in_`) + `get_feature_names_out(input_features)` — `OneToOneFeatureMixin` (one output col per input col) returns the INPUT names unchanged: `None` -> `["x0","x1",..]` (`_check_feature_names_in`), `Some(names)` -> verbatim, a wrong-length `input_features` -> `ShapeMismatch` (sklearn ValueError). Live-oracle test `req10_feature_names_out_and_n_features_in` (`['x0','x1']`, `['a','b']`, wrong-length Err). feature_names_in_ (string input-name capture) stays NOT-STARTED (ferrolearn fit takes positional columns, no input names). Consumer: crate re-export `lib.rs:142`. |
@@ -59,6 +59,30 @@ pub enum HandleUnknown {
     /// (scikit-learn's `handle_unknown='use_encoded_value'`). Requires
     /// `unknown_value` to be set.
     UseEncodedValue,
+}
+
+// ---------------------------------------------------------------------------
+// Categories
+// ---------------------------------------------------------------------------
+
+/// How [`OrdinalEncoder`] determines, per column, the ordered category set used
+/// to assign ordinal indices.
+///
+/// Mirrors scikit-learn's `OrdinalEncoder(categories=...)` parameter
+/// (`sklearn/preprocessing/_encoders.py:1252`), which accepts `'auto'` or a
+/// list of per-feature category lists.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Categories {
+    /// Determine the categories automatically from the training data as the
+    /// sorted-unique values per column (scikit-learn's default `categories='auto'`).
+    #[default]
+    Auto,
+    /// Use the explicit, user-provided category lists. `Explicit(lists)[j]` is
+    /// the ordered category set for column `j`, used **as given** (the order is
+    /// preserved, NOT re-sorted), mirroring scikit-learn's
+    /// `categories=[list, ...]` (`_encoders.py:114`, the categories are used
+    /// `np.array(self.categories[i])` as-is).
+    Explicit(Vec<Vec<String>>),
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +128,10 @@ pub enum HandleUnknown {
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct OrdinalEncoder {
+    /// How the per-column category sets are determined ([`Categories::Auto`] =
+    /// sorted-unique from the data, the default; [`Categories::Explicit`] =
+    /// user-provided lists used in the given order).
+    categories: Categories,
     /// Strategy for unknown categories at `transform` time.
     handle_unknown: HandleUnknown,
     /// Sentinel written for unknown categories when `handle_unknown` is
@@ -117,9 +145,40 @@ impl OrdinalEncoder {
     #[must_use]
     pub fn new() -> Self {
         Self {
+            categories: Categories::Auto,
             handle_unknown: HandleUnknown::Error,
             unknown_value: None,
         }
+    }
+
+    /// Set the explicit per-column category lists (`categories=[list, ...]`).
+    ///
+    /// Each `lists[j]` is the ordered category set for column `j`, used **as
+    /// given** at `fit` time — the order is preserved (NOT re-sorted), so the
+    /// assigned ordinal indices follow the supplied order, matching
+    /// scikit-learn's `OrdinalEncoder(categories=...)`
+    /// (`sklearn/preprocessing/_encoders.py:114`).
+    ///
+    /// At `fit` time the number of lists must equal the number of input columns,
+    /// no list may contain duplicates, and (under the default
+    /// `handle_unknown='error'`) every value seen in the data must appear in its
+    /// column's list; otherwise [`Fit::fit`] returns an error. See [`Fit::fit`]
+    /// for the exact validation contract.
+    #[must_use]
+    pub fn with_categories(mut self, categories: Vec<Vec<String>>) -> Self {
+        self.categories = Categories::Explicit(categories);
+        self
+    }
+
+    /// Return the configured `categories` strategy ([`Categories::Auto`] or
+    /// [`Categories::Explicit`]).
+    ///
+    /// Named `categories_param` to avoid colliding with
+    /// [`FittedOrdinalEncoder::categories`], which returns the *learned*
+    /// per-column category lists after fitting.
+    #[must_use]
+    pub fn categories_param(&self) -> &Categories {
+        &self.categories
     }
 
     /// Set the unknown-category strategy (`handle_unknown`).
@@ -428,12 +487,30 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
 
     /// Fit the encoder by building per-column category-to-index mappings.
     ///
-    /// Categories are recorded in **lexicographic order** in each column,
-    /// matching scikit-learn's `OrdinalEncoder.categories_`.
+    /// With the default `categories='auto'` ([`Categories::Auto`]), categories
+    /// are recorded in **lexicographic order** in each column, matching
+    /// scikit-learn's `OrdinalEncoder.categories_`.
+    ///
+    /// With explicit categories ([`Categories::Explicit`], set via
+    /// [`OrdinalEncoder::with_categories`]), the user-provided lists are used in
+    /// the **given order** (NOT re-sorted), and the ordinal indices follow that
+    /// order, mirroring scikit-learn (`sklearn/preprocessing/_encoders.py:114`).
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows.
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if explicit categories are set but
+    /// the number of category lists differs from the number of input columns
+    /// (sklearn `_encoders.py:85-89` "Shape mismatch: if categories is an array,
+    /// it has to be of shape (n_features,).").
+    ///
+    /// Returns [`FerroError::InvalidParameter`] if an explicit category list
+    /// contains duplicate elements (sklearn `_encoders.py:136-141`), or — under
+    /// the default [`HandleUnknown::Error`] — if a value seen in the data is not
+    /// in its column's explicit list (sklearn `_encoders.py:153-160` "Found
+    /// unknown categories ... during fit"; SKIPPED under
+    /// [`HandleUnknown::UseEncodedValue`]).
     ///
     /// Returns [`FerroError::InvalidParameter`] for the `handle_unknown` /
     /// `unknown_value` validation failures (mirroring scikit-learn's
@@ -486,29 +563,109 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
         let mut categories = Vec::with_capacity(n_features);
         let mut category_to_index = Vec::with_capacity(n_features);
 
-        for j in 0..n_features {
-            // Collect unique categories then sort lexicographically so the
-            // assigned indices match sklearn's `OrdinalEncoder`, which
-            // documents `categories_ = sorted(unique(X[:, j]))`. (Older
-            // ferrolearn versions used first-seen order — #344.)
-            let mut unique: Vec<String> = Vec::new();
-            let mut seen_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-            for i in 0..n_samples {
-                let cat = &x[[i, j]];
-                if seen_set.insert(cat.clone()) {
-                    unique.push(cat.clone());
+        match &self.categories {
+            // `categories='auto'` (default): per column, sorted-unique from the
+            // data (SHIPPED REQ-1, UNCHANGED). sklearn `_encoders.py:98-99`
+            // `result = _unique(Xi)`.
+            Categories::Auto => {
+                for j in 0..n_features {
+                    // Collect unique categories then sort lexicographically so the
+                    // assigned indices match sklearn's `OrdinalEncoder`, which
+                    // documents `categories_ = sorted(unique(X[:, j]))`. (Older
+                    // ferrolearn versions used first-seen order — #344.)
+                    let mut unique: Vec<String> = Vec::new();
+                    let mut seen_set: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    for i in 0..n_samples {
+                        let cat = &x[[i, j]];
+                        if seen_set.insert(cat.clone()) {
+                            unique.push(cat.clone());
+                        }
+                    }
+                    unique.sort();
+
+                    let map: HashMap<String, usize> = unique
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, s)| (s.clone(), idx))
+                        .collect();
+
+                    categories.push(unique);
+                    category_to_index.push(map);
                 }
             }
-            unique.sort();
+            // `categories=[list, ...]` (explicit): use the user-provided lists in
+            // the GIVEN order (NOT re-sorted), mirroring sklearn `_encoders.py:84-160`.
+            Categories::Explicit(lists) => {
+                // sklearn (`_encoders.py:85-89`): the list count must match
+                // n_features, else ValueError -> map to `ShapeMismatch`.
+                if lists.len() != n_features {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n_features],
+                        actual: vec![lists.len()],
+                        context: "Shape mismatch: if categories is an array, it has to be of \
+                                  shape (n_features,)."
+                            .into(),
+                    });
+                }
 
-            let map: HashMap<String, usize> = unique
-                .iter()
-                .enumerate()
-                .map(|(idx, s)| (s.clone(), idx))
-                .collect();
+                for (j, list) in lists.iter().enumerate() {
+                    // sklearn (`_encoders.py:114-117`) indexes `cats[0]` on the
+                    // provided list BEFORE the duplicate/subset checks, so an
+                    // EMPTY explicit list raises `IndexError` at fit in BOTH
+                    // handle_unknown modes (#2229). Reject it here (the
+                    // use_encoded_value path would otherwise skip the subset
+                    // check and silently fit an empty category set).
+                    if list.is_empty() {
+                        return Err(FerroError::InvalidParameter {
+                            name: "categories".into(),
+                            reason: format!(
+                                "column {j} has an empty predefined category list; \
+                                 each feature needs at least one category"
+                            ),
+                        });
+                    }
+                    // sklearn (`_encoders.py:136-141`): a list with duplicate
+                    // elements raises ValueError. Build the index map detecting
+                    // duplicates in one pass (R-CODE-2: never panic).
+                    let mut map: HashMap<String, usize> = HashMap::with_capacity(list.len());
+                    for (idx, cat) in list.iter().enumerate() {
+                        if map.insert(cat.clone(), idx).is_some() {
+                            return Err(FerroError::InvalidParameter {
+                                name: "categories".into(),
+                                reason: format!(
+                                    "In column {j}, the predefined categories contain \
+                                     duplicate elements."
+                                ),
+                            });
+                        }
+                    }
 
-            categories.push(unique);
-            category_to_index.push(map);
+                    // sklearn (`_encoders.py:153-160`): under handle_unknown='error'
+                    // every value seen in the data must be present in the
+                    // predefined list, else ValueError. Under 'use_encoded_value'
+                    // this fit-time subset check is SKIPPED (out-of-set data is
+                    // fine — encoded to `unknown_value` later at transform time).
+                    if self.handle_unknown == HandleUnknown::Error {
+                        for i in 0..n_samples {
+                            let cat = &x[[i, j]];
+                            if !map.contains_key(cat) {
+                                return Err(FerroError::InvalidParameter {
+                                    name: "X".into(),
+                                    reason: format!(
+                                        "Found unknown categories [{cat}] in column {j} \
+                                         during fit"
+                                    ),
+                                });
+                            }
+                        }
+                    }
+
+                    // Use the list AS-GIVEN (preserve order — do NOT sort).
+                    categories.push(list.clone());
+                    category_to_index.push(map);
+                }
+            }
         }
 
         // Validation (a'): sklearn (`_encoders.py:1481-1487`) requires

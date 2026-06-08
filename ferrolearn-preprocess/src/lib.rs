@@ -139,7 +139,7 @@ pub use max_abs_scaler::{FittedMaxAbsScaler, MaxAbsScaler};
 pub use min_max_scaler::{FittedMinMaxScaler, MinMaxScaler};
 pub use normalizer::Normalizer;
 pub use one_hot_encoder::{FittedOneHotEncoder, OneHotDrop, OneHotEncoder, OneHotHandleUnknown};
-pub use ordinal_encoder::{FittedOrdinalEncoder, HandleUnknown, OrdinalEncoder};
+pub use ordinal_encoder::{Categories, FittedOrdinalEncoder, HandleUnknown, OrdinalEncoder};
 pub use polynomial_features::{FittedPolynomialFeatures, PolynomialFeatures};
 pub use power_transformer::{FittedPowerTransformer, PowerTransformer};
 pub use robust_scaler::{FittedRobustScaler, RobustScaler};
