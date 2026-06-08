@@ -62,9 +62,8 @@
 //! divergence — those are deliberately NOT pinned. Only the GLM family, which
 //! sklearn fits without raising, diverges.
 
-use ferrolearn_core::Fit;
 use ferrolearn_linear::{GammaRegressor, PoissonRegressor, TweedieRegressor};
-use ndarray::{array, Array1, Array2};
+use ndarray::{Array1, Array2, array};
 
 fn finite_xy() -> (Array2<f64>, Array1<f64>) {
     let x: Array2<f64> = array![
@@ -87,7 +86,6 @@ fn finite_negative_weight() -> Array1<f64> {
 }
 
 #[test]
-#[ignore = "divergence: GLM family rejects finite negative sample_weight; sklearn fits (no only_non_negative); tracking #2262"]
 fn poisson_accepts_finite_negative_sample_weight_like_sklearn() {
     // Oracle: PoissonRegressor().fit(X, y, sample_weight=[..,-1.0]) returns a
     // fitted model (coef_ ~= [-0.04268902, 0.24080026]); sklearn does NOT reject
@@ -103,7 +101,6 @@ fn poisson_accepts_finite_negative_sample_weight_like_sklearn() {
 }
 
 #[test]
-#[ignore = "divergence: GLM family rejects finite negative sample_weight; sklearn fits (no only_non_negative); tracking #2262"]
 fn gamma_accepts_finite_negative_sample_weight_like_sklearn() {
     // Oracle: GammaRegressor().fit(X, y, sample_weight=[..,-1.0]) returns a
     // fitted model (coef_ ~= [0.038, 0.14459]); sklearn does NOT reject.
@@ -118,7 +115,6 @@ fn gamma_accepts_finite_negative_sample_weight_like_sklearn() {
 }
 
 #[test]
-#[ignore = "divergence: GLM family rejects finite negative sample_weight; sklearn fits (no only_non_negative); tracking #2262"]
 fn tweedie_accepts_finite_negative_sample_weight_like_sklearn() {
     // Oracle: TweedieRegressor(power=1.5).fit(X, y, sample_weight=[..,-1.0])
     // returns a fitted model (coef_ ~= [0.00672, 0.18325]); sklearn does NOT

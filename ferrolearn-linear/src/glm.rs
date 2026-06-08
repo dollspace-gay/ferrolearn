@@ -1590,16 +1590,20 @@ fn fit_glm_irls<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static
         });
     }
 
-    // sklearn validates sample weights are non-negative
-    // (`_check_sample_weight`, `glm.py:211`).
-    for &si in sample_weight.iter() {
-        if si < F::zero() {
-            return Err(FerroError::InvalidParameter {
-                name: "sample_weight".into(),
-                reason: "sample weights must be non-negative".into(),
-            });
-        }
-    }
+    // sklearn's GLM family does NOT reject finite negative `sample_weight`: it
+    // calls `_check_sample_weight(sample_weight, X, dtype=loss_dtype)` WITHOUT
+    // `only_non_negative=True` (`glm.py:211`), so a finite negative weight passes
+    // validation and reaches the optimizer (verified live: `PoissonRegressor()
+    // .fit(X, y, sample_weight=[..,-1.0])` fits, coef `[-0.04268902, 0.24080026]`).
+    // Negative weights are mathematically valid for the GLM objective — the
+    // deviance is averaged `sum_i s_i * deviance_i` (`glm.py:229-242`), so a
+    // negative `s_i` simply NEGATES that sample's contribution. ferrolearn's IRLS
+    // uses `sample_weight` LINEARLY (`weights[i] *= sample_weight[i]` feeding the
+    // `X^T W X` / `X^T W z` accumulation in `weighted_ridge_solve`, NO `sqrt`), so
+    // a negative weight flows through unchanged and reaches the same optimum as
+    // sklearn's lbfgs. The non-finite guard above (#2261) still rejects NaN/Inf
+    // weights (sklearn's `_check_sample_weight` runs `check_array(force_all_finite
+    // =True)` first), matching exception parity for non-finite input.
 
     if n_samples == 0 {
         return Err(FerroError::InsufficientSamples {
