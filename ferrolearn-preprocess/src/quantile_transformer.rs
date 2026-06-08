@@ -299,15 +299,19 @@ impl<F: Float + Send + Sync + 'static> FittedQuantileTransformer<F> {
 /// Inverse of the standard normal CDF (probit / norm.ppf), accurate to ~1e-9
 /// via Acklam's rational approximation. Mirrors scipy `stats.norm.ppf` as used
 /// by sklearn QuantileTransformer (`_data.py:2856`), with the output clipped to
-/// +/- norm.ppf(1e-7 - spacing(1)) = +/- 5.199337582605575 (`_data.py:2860-2862`).
+/// sklearn's ASYMMETRIC bounds (`_data.py:2860-2862`):
+/// `clip_min = norm.ppf(BOUNDS_THRESHOLD - spacing(1)) = -5.199337582605575`,
+/// `clip_max = norm.ppf(1 - (BOUNDS_THRESHOLD - spacing(1))) = 5.19933758270342`
+/// (Δ ≈ 9.8e-11 — `norm.ppf` is not exactly symmetric about 0 at these args).
 fn probit<F: Float>(p: F) -> F {
-    let clip = F::from(5.199337582605575).unwrap_or_else(F::max_value);
+    let clip_min = F::from(-5.199337582605575).unwrap_or_else(F::min_value);
+    let clip_max = F::from(5.19933758270342).unwrap_or_else(F::max_value);
     let cf = |k: f64| F::from(k).unwrap_or_else(F::zero);
     if p <= F::zero() {
-        return -clip;
+        return clip_min;
     }
     if p >= F::one() {
-        return clip;
+        return clip_max;
     }
     let a = [
         -3.969683028665376e+01,
@@ -361,10 +365,10 @@ fn probit<F: Float>(p: F) -> F {
             + cf(c[5]))
             / ((((cf(d[0]) * qv + cf(d[1])) * qv + cf(d[2])) * qv + cf(d[3])) * qv + F::one())
     };
-    if x < -clip {
-        -clip
-    } else if x > clip {
-        clip
+    if x < clip_min {
+        clip_min
+    } else if x > clip_max {
+        clip_max
     } else {
         x
     }
@@ -588,8 +592,26 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedQuantileTr
 
         let mut out = x.to_owned();
 
+        // sklearn forward `_transform_col` bound masks (`_data.py:2829-2831`,
+        // `:2850-2851`): for `uniform` output the masks use EXACT equality
+        // against the landmark bounds — `lower_bounds_idx = X_col == quantiles[0]`,
+        // `upper_bounds_idx = X_col == quantiles[-1]` — and after the averaged
+        // interp the upper override is applied FIRST then the lower (`:2850-2851`),
+        // so a value matching BOTH bounds (e.g. a constant feature where every
+        // landmark == c) resolves to `lower_bound_y = references_[0] = 0`. The
+        // averaged-interp midpoint (#2318/#2319) is thus overridden at the
+        // exact-bound values. `lower_bound_y`/`upper_bound_y` are 0/1 (the
+        // [0,1] rank space) — the Normal `norm.ppf` + clip is applied afterwards.
+        let zero = F::zero();
+        let one = F::one();
+
         for j in 0..n_features {
             let feature_quantiles = &self.quantiles[j];
+            let (lower_bound_x, upper_bound_x) =
+                match (feature_quantiles.first(), feature_quantiles.last()) {
+                    (Some(&first), Some(&last)) => (first, last),
+                    _ => (zero, zero),
+                };
             for i in 0..out.nrows() {
                 let val = out[[i, j]];
                 if val.is_nan() {
@@ -618,9 +640,28 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedQuantileTr
                     interpolate_cdf(val, feature_quantiles, &self.references)
                 };
 
+                // Forward bound masks (`_data.py:2829-2831`,`:2850-2851`). UPPER
+                // applied first, then LOWER — so a value equal to BOTH bounds
+                // (constant feature) gets `lower_bound_y = 0`. Exact equality, as
+                // sklearn does on the f64 landmark values. Only override
+                // multi-landmark columns; the single-landmark path (above) already
+                // models its own output-distribution-dependent masks (#2219).
+                let rank = if feature_quantiles.len() == 1 {
+                    cdf_val
+                } else {
+                    let mut r = cdf_val;
+                    if val == upper_bound_x {
+                        r = one; // upper_bound_y = references_[-1] = 1
+                    }
+                    if val == lower_bound_x {
+                        r = zero; // lower_bound_y = references_[0] = 0
+                    }
+                    r
+                };
+
                 out[[i, j]] = match self.output_distribution {
-                    OutputDistribution::Uniform => cdf_val,
-                    OutputDistribution::Normal => probit(cdf_val),
+                    OutputDistribution::Uniform => rank,
+                    OutputDistribution::Normal => probit(rank),
                 };
             }
         }

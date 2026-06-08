@@ -45,7 +45,6 @@ use ndarray::array;
 ///
 /// Tracking: #2318
 #[test]
-#[ignore = "divergence: QuantileTransformer constant-feature uniform returns 0.5, sklearn returns 0.0 (missing forward bound mask _data.py:2829-2851); tracking #2318"]
 fn divergence_constant_feature_uniform() {
     // sklearn oracle value (np.nanpercentile of a constant column, masked to 0).
     const SK_UNIFORM: f64 = 0.0;
@@ -80,7 +79,6 @@ fn divergence_constant_feature_uniform() {
 ///
 /// Tracking: #2319
 #[test]
-#[ignore = "divergence: QuantileTransformer constant-feature normal returns 0.0, sklearn returns clip_min -5.1993 (missing forward bound mask _data.py:2826-2862); tracking #2319"]
 fn divergence_constant_feature_normal() {
     // sklearn oracle: stats.norm.ppf(0) clipped to clip_min.
     const SK_NORMAL_CLIP_MIN: f64 = -5.199337582605575;
