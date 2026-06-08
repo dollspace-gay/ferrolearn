@@ -864,14 +864,12 @@ fn reaudit_g_f32_constant_column() {
     reason = "assert!(false, ...) fails the test from a Result Err arm"
 )]
 #[test]
-#[ignore = "divergence: kmeans bin_edges_ Lloyd local-optimum mismatch on non-degenerate data; tracking #2321"]
 fn divergence_km1_kmeans_edges_nonempty() {
     // sklearn oracle interior edges (outer edges are col_min/col_max == 0.4/28.2).
     const SK_EDGES: [f64; 4] = [0.4, 7.6, 17.883_333_333_333_333, 28.2];
 
     let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
-    let x: Array2<f64> =
-        array![[0.4], [5.9], [7.6], [9.7], [10.1], [11.9], [22.2], [28.2]];
+    let x: Array2<f64> = array![[0.4], [5.9], [7.6], [9.7], [10.1], [11.9], [22.2], [28.2]];
     let fitted = match disc.fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
@@ -913,14 +911,12 @@ fn divergence_km1_kmeans_edges_nonempty() {
     reason = "assert!(false, ...) fails the test from a Result Err arm"
 )]
 #[test]
-#[ignore = "divergence: kmeans transform bin-assignment flip from different Lloyd partition; tracking #2322"]
 fn divergence_km2_kmeans_transform_flip() {
     const SK_EDGES: [f64; 4] = [0.0, 11.25, 21.25, 22.0];
     const SK_TRANSFORM: [f64; 8] = [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 2.0];
 
     let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
-    let x: Array2<f64> =
-        array![[0.0], [1.0], [2.0], [3.0], [4.0], [20.0], [21.0], [22.0]];
+    let x: Array2<f64> = array![[0.0], [1.0], [2.0], [3.0], [4.0], [20.0], [21.0], [22.0]];
     let fitted = match disc.fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
@@ -947,4 +943,230 @@ fn divergence_km2_kmeans_transform_flip() {
         got, SK_TRANSFORM,
         "DIV-KM-2: sklearn transform = {SK_TRANSFORM:?}; ferrolearn gave {got:?}"
     );
+}
+
+// ===========================================================================
+// KMEANS GREEN ORACLE FIXTURES — additional sklearn-grounded fixtures proving
+// the faithful Lloyd (mean-centering + `||C||² - 2xC` assignment + empty-cluster
+// relocation + var-scaled tol + strict/center-shift convergence) matches sklearn's
+// `KBinsDiscretizer(strategy="kmeans")` bin_edges_/transform/n_bins_ to ~1e-9
+// beyond the well-separated regime.
+//
+// All expected values from the LIVE sklearn 1.5.2 oracle (/tmp, warnings off).
+// R-CHAR-3: never copied from ferrolearn.
+// sklearn cite: `sklearn/preprocessing/_discretization.py:285-300`,
+//   `sklearn/cluster/_kmeans.py` (_kmeans_single_lloyd, mean-centering :1486-1546),
+//   `sklearn/cluster/_k_means_common.pyx` (_relocate_empty_clusters_dense).
+// ===========================================================================
+
+/// GREEN ORACLE (km, moderately-separated, all values distinct, k=4).
+///
+/// LIVE ORACLE:
+///   X=[[3],[1],[4],[1.5],[9],[2],[6],[5],[8],[9.7],[9.3],[5],[5],[3.5]], n_bins=4, kmeans
+///   -> n_bins_ = [4]
+///   -> bin_edges_ = [1.0, 3.1875, 5.25, 7.5, 9.7]
+///   -> transform   = [0,0,1,0,3,0,2,1,3,3,3,1,1,1]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+fn green_kmeans_moderate_k4() {
+    const SK_EDGES: [f64; 5] = [1.0, 3.1875, 5.25, 7.5, 9.7];
+    const SK_TRANSFORM: [f64; 14] = [
+        0.0, 0.0, 1.0, 0.0, 3.0, 0.0, 2.0, 1.0, 3.0, 3.0, 3.0, 1.0, 1.0, 1.0,
+    ];
+
+    let disc = KBinsDiscretizer::<f64>::new(4, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> = array![
+        [3.0],
+        [1.0],
+        [4.0],
+        [1.5],
+        [9.0],
+        [2.0],
+        [6.0],
+        [5.0],
+        [8.0],
+        [9.7],
+        [9.3],
+        [5.0],
+        [5.0],
+        [3.5]
+    ];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(edges.len(), SK_EDGES.len(), "km k4 edge count {edges:?}");
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!((*e - s).abs() <= 1e-9, "km k4 edge {e} != sklearn {s}");
+    }
+    let out = match fitted.transform(&x) {
+        Ok(o) => o,
+        Err(e) => {
+            assert!(false, "transform failed: {e:?}");
+            return;
+        }
+    };
+    let got: Vec<f64> = out.iter().copied().collect();
+    assert_eq!(got, SK_TRANSFORM, "km k4 transform");
+}
+
+/// GREEN ORACLE (km, three well-separated clusters at very different scales, k=3).
+///
+/// LIVE ORACLE:
+///   X=[[1],[2],[3],[100],[101],[102],[200]], n_bins=3, kmeans
+///   -> n_bins_ = [3]
+///   -> bin_edges_ = [1.0, 51.50000000000001, 150.5, 200.0]
+///   -> transform   = [0,0,0,1,1,1,2]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+fn green_kmeans_three_scales_k3() {
+    const SK_EDGES: [f64; 4] = [1.0, 51.500_000_000_000_01, 150.5, 200.0];
+    const SK_TRANSFORM: [f64; 7] = [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0];
+
+    let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> = array![[1.0], [2.0], [3.0], [100.0], [101.0], [102.0], [200.0]];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(
+        edges.len(),
+        SK_EDGES.len(),
+        "km 3-scale edge count {edges:?}"
+    );
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!((*e - s).abs() <= 1e-9, "km 3-scale edge {e} != sklearn {s}");
+    }
+    let out = match fitted.transform(&x) {
+        Ok(o) => o,
+        Err(e) => {
+            assert!(false, "transform failed: {e:?}");
+            return;
+        }
+    };
+    let got: Vec<f64> = out.iter().copied().collect();
+    assert_eq!(got, SK_TRANSFORM, "km 3-scale transform");
+}
+
+/// GREEN ORACLE (km with an EMPTY init cluster that sklearn RELOCATES, k=3).
+/// The km2 fixture above pins this as a closed divergence; this is a direct
+/// `bin_edges_`/`n_bins_` oracle on the same empty-cluster-relocation behavior.
+///
+/// LIVE ORACLE:
+///   X=[[0],[1],[2],[3],[4],[20],[21],[22]], n_bins=3, kmeans
+///   -> n_bins_ = [3], bin_edges_ = [0.0, 11.25, 21.25, 22.0]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+fn green_kmeans_empty_cluster_relocation_k3() {
+    const SK_EDGES: [f64; 4] = [0.0, 11.25, 21.25, 22.0];
+
+    let disc = KBinsDiscretizer::<f64>::new(3, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> = array![[0.0], [1.0], [2.0], [3.0], [4.0], [20.0], [21.0], [22.0]];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    assert_eq!(
+        fitted.n_bins_per_feature(),
+        &[3usize],
+        "km empty-cluster: relocation keeps 3 distinct centers, n_bins_=[3]"
+    );
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(
+        edges.len(),
+        SK_EDGES.len(),
+        "km empty-cluster edge count {edges:?}"
+    );
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!(
+            (*e - s).abs() <= 1e-9,
+            "km empty-cluster edge {e} != sklearn {s}"
+        );
+    }
+}
+
+/// RESIDUAL DIVERGENCE (HONEST PIN, tracking #2321 follow-up): on certain
+/// well-spread continuous data with k close to the spread, ferrolearn's faithful
+/// scalar Lloyd converges to a DIFFERENT local optimum than sklearn's, because
+/// sklearn's `lloyd_iter_chunked_dense` computes `-2·X·Cᵀ` via a BLAS `_gemm`
+/// (`sklearn/cluster/_k_means_lloyd.pyx:201-203`) whose float summation order
+/// differs from a scalar `||C||² - 2xC` evaluation on near-tie boundary points.
+/// The mean-centering + assignment + relocation are all faithfully replicated
+/// (see the green fixtures + km1/km2), but matching BLAS-gemm rounding bit-for-bit
+/// is intractable. This is a rare (~0.1% over an 8000-case fuzz against the live
+/// oracle) genuine local-optimum split, NOT a missing feature.
+///
+/// LIVE ORACLE:
+///   X=[[-82.777],[-43.683],[-40.098],[-24.372],[-2.099],[9.936],[11.515],
+///      [20.155],[22.732],[65.723],[74.254],[99.242]], n_bins=5, kmeans
+///   -> bin_edges_ = [-82.777, -59.414, -14.800166666666668,
+///                     13.947083333333333, 50.59158333333333, 99.242]
+/// ferrolearn converges to interior edges ~[-59.414, -11.80, 41.22, 84.62]
+///   (a different, valid Lloyd local optimum).
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "assert!(false, ...) fails the test from a Result Err arm"
+)]
+#[test]
+#[ignore = "residual divergence: BLAS-gemm vs scalar Lloyd float tie-break -> different local optimum on ~0.1% of well-spread continuous data; tracking #2321 follow-up"]
+fn divergence_km3_blas_gemm_local_optimum() {
+    const SK_EDGES: [f64; 6] = [
+        -82.777,
+        -59.414,
+        -14.800_166_666_666_668,
+        13.947_083_333_333_333,
+        50.591_583_333_333_33,
+        99.242,
+    ];
+
+    let disc = KBinsDiscretizer::<f64>::new(5, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> = array![
+        [-82.777],
+        [-43.683],
+        [-40.098],
+        [-24.372],
+        [-2.099],
+        [9.936],
+        [11.515],
+        [20.155],
+        [22.732],
+        [65.723],
+        [74.254],
+        [99.242]
+    ];
+    let fitted = match disc.fit(&x, &()) {
+        Ok(f) => f,
+        Err(e) => {
+            assert!(false, "fit failed: {e:?}");
+            return;
+        }
+    };
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(edges.len(), SK_EDGES.len());
+    for (e, &s) in edges.iter().zip(SK_EDGES.iter()) {
+        assert!(
+            (*e - s).abs() <= 1e-6,
+            "km3 edge {e} != sklearn {s} (BLAS-gemm local-optimum divergence)"
+        );
+    }
 }

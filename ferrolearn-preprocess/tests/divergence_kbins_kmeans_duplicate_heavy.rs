@@ -55,7 +55,6 @@ use ndarray::{Array2, array};
     reason = "assert!(false, ...) fails the test from a Result Err arm"
 )]
 #[test]
-#[ignore = "divergence: kmeans n_bins>n_distinct relocation/heaviest-fallback gives wrong n_bins_/edges (deterministic, NOT BLAS-order); tracking #2323"]
 fn divergence_kmeans_dup_heavy_more_bins_than_distinct() {
     // sklearn oracle (RNG-invariant): 4 edges => n_bins_ = 3.
     const SK_EDGES: [f64; 4] = [0.0, 0.5, 1.5, 2.0];
@@ -97,5 +96,56 @@ fn divergence_kmeans_dup_heavy_more_bins_than_distinct() {
     assert_eq!(
         got, SK_TRANSFORM,
         "dup-heavy: sklearn transform = {SK_TRANSFORM:?}; ferrolearn gave {got:?}"
+    );
+}
+
+/// Helper: assert ferrolearn kmeans `bin_edges()` matches the live sklearn 1.5.2
+/// oracle for a single-column duplicate-heavy input where `n_bins > n_distinct`.
+fn assert_kmeans_edges(col: &[f64], n_bins: usize, sk_edges: &[f64]) {
+    let disc = KBinsDiscretizer::<f64>::new(n_bins, BinEncoding::Ordinal, BinStrategy::KMeans);
+    let x: Array2<f64> = Array2::from_shape_vec((col.len(), 1), col.to_vec()).expect("shape (n,1)");
+    let fitted = disc.fit(&x, &()).expect("kmeans fit");
+    let edges = &fitted.bin_edges()[0];
+    assert_eq!(
+        edges.len(),
+        sk_edges.len(),
+        "dup-heavy {col:?} n_bins={n_bins}: sklearn keeps {} edges {sk_edges:?}; ferrolearn has {} {edges:?}",
+        sk_edges.len(),
+        edges.len()
+    );
+    for (e, &s) in edges.iter().zip(sk_edges.iter()) {
+        assert!(
+            (*e - s).abs() <= 1e-9,
+            "dup-heavy {col:?} n_bins={n_bins}: edge {e} != sklearn {s} (sklearn {sk_edges:?}, ferrolearn {edges:?})"
+        );
+    }
+}
+
+/// Additional `n_bins > n_distinct` fixtures, all from the LIVE sklearn 1.5.2 oracle
+/// (RNG-invariant; subsample=None; warnings off). After the relocation tie-break fix
+/// (far-point ties broken on DESCENDING index, matching `np.argpartition`'s
+/// introselect selection in `_k_means_common.pyx:190`) the duplicate-heavy empty
+/// clusters collapse onto sklearn's centers, so `bin_edges_`/`n_bins_` match.
+/// R-CHAR-3: every expected array below is sklearn output, never copied from ferrolearn.
+#[test]
+fn green_kmeans_dup_heavy_more_fixtures() {
+    // KBinsDiscretizer(n_bins=4,strategy='kmeans').fit([[0],[0],[0],[1],[2]])
+    //   -> bin_edges_ = [0.0, 0.5, 1.5, 2.0]  (n_bins_ = 3)
+    assert_kmeans_edges(&[0.0, 0.0, 0.0, 1.0, 2.0], 4, &[0.0, 0.5, 1.5, 2.0]);
+
+    // KBinsDiscretizer(n_bins=5,strategy='kmeans').fit([[1],[1],[1],[1],[2],[3]])
+    //   -> bin_edges_ = [1.0, 1.5, 2.5, 3.0]  (n_bins_ = 3)
+    assert_kmeans_edges(&[1.0, 1.0, 1.0, 1.0, 2.0, 3.0], 5, &[1.0, 1.5, 2.5, 3.0]);
+
+    // KBinsDiscretizer(n_bins=4,strategy='kmeans').fit([[2],[2],[2],[2],[2],[7]])
+    //   -> bin_edges_ = [2.0, 4.5, 7.0]  (n_bins_ = 2)
+    assert_kmeans_edges(&[2.0, 2.0, 2.0, 2.0, 2.0, 7.0], 4, &[2.0, 4.5, 7.0]);
+
+    // KBinsDiscretizer(n_bins=6,strategy='kmeans').fit([[3],[3],[3],[4],[4],[5],[5],[5]])
+    //   -> bin_edges_ = [3.0, 3.5, 4.5, 5.0]  (n_bins_ = 3)
+    assert_kmeans_edges(
+        &[3.0, 3.0, 3.0, 4.0, 4.0, 5.0, 5.0, 5.0],
+        6,
+        &[3.0, 3.5, 4.5, 5.0],
     );
 }

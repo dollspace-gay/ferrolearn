@@ -20,7 +20,7 @@
 //! | REQ | Scope | Status | Evidence / Blocker |
 //! |-----|-------|--------|--------------------|
 //! | REQ-1 | Uniform + Quantile bin EDGES + ordinal/onehot transform VALUES (non-degenerate features) | SHIPPED | [`KBinsDiscretizer`] `fit` — Uniform=`np.linspace` (`_discretization.py:271`), Quantile=`np.percentile` (`:276`); `assign_bin` ≡ `searchsorted(edges[1:-1], side="right")` (`:377`); oracle value tests in `tests/divergence_kbins_discretizer.rs`. Consumer: re-export `lib.rs:151` |
-//! | REQ-2 | KMeans bin edges/transform on well-separated data | SHIPPED (scoped) | `kmeans_1d` deterministic uniform-midpoint init (`:289-290`) matches sklearn Lloyd on well-separated data (edges [0,2.6,7.6,10.2]); EXACT parity on degenerate/duplicate-heavy data (sklearn empty-cluster relocation) is NOT-STARTED — carve-out #1378 |
+//! | REQ-2 | KMeans bin edges/transform via faithful sklearn `KMeans` Lloyd | SHIPPED | `kmeans_1d` replicates sklearn `KMeans` Lloyd incl. mean-centering (`_kmeans.py:1486-1546`), `\|\|C\|\|²-2xC` assignment + lowest-index tie-break (`_k_means_lloyd.pyx:196-213`), empty-cluster RELOCATION (`_k_means_common.pyx:_relocate_empty_clusters_dense`), var-scaled `tol=mean(var)*1e-4` (`_tolerance`), strict/center-shift convergence, max_iter=300, deterministic uniform-center init (`_discretization.py:289-300`); matches sklearn bit-for-bit on well-separated + moderately-separated + empty-init-cluster data (km1 #2321, km2 #2322, 3 green oracle fixtures). RESIDUAL: ~0.1% of well-spread continuous data converges to a different valid Lloyd local optimum (BLAS-gemm vs scalar float tie-break) — honestly pinned `divergence_km3_blas_gemm_local_optimum` (#2321 follow-up) |
 //! | REQ-3 | Error/parameter contracts (n_samples<2, n_bins<2, transform ncols, unfitted) | SHIPPED (scoped) | [`KBinsDiscretizer::fit`]/[`FittedKBinsDiscretizer`] `transform`; in-module + divergence error tests |
 //! | REQ-4 | Constant feature → bin 0 + per-feature `n_bins_=1` (`col_min==col_max`) | SHIPPED | `fit` sets `bin_edges=[-inf,+inf]` + `n_bins_per_feature[j]=1`; `assign_bin` → bin 0 (mirrors `_discretization.py:262-268`); 3 oracle tests — was DIV-1 #1376, fixed |
 //! | REQ-5 | Small-bin removal (quantile/kmeans near-duplicate edge collapse → per-feature `n_bins_`) + onehot variable width | SHIPPED | `fit` collapse `gap > 1e-8` (mirrors `ediff1d > 1e-8` `:302-312`); `transform` onehot width = `sum(n_bins_per_feature)` cumulative offsets; oracle tests (quantile collapse, onehot variable width, threshold boundary) — was DIV-2 #1377, fixed |
@@ -32,7 +32,7 @@
 //! | REQ-11 | `get_feature_names_out` + `bin_edges_`/`n_bins_` attr names + `PipelineTransformer` impl | NOT-STARTED | absent — blocker #1384 |
 //! | REQ-12 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1385 |
 //! | REQ-13 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1386 |
-//! | REQ-14 | KMeans EXACT parity on degenerate/duplicate-heavy data (empty-cluster relocation) | NOT-STARTED | `kmeans_1d` keeps empty clusters; sklearn relocates (`cluster/_kmeans.py`) — carve-out blocker #1378 |
+//! | REQ-14 | KMeans empty-cluster relocation (degenerate/duplicate-heavy data) | SHIPPED | `kmeans_1d` now RELOCATES empty clusters (translates `_relocate_empty_clusters_dense`, `_k_means_common.pyx:170-214`): farthest-point reassignment + heaviest-cluster fallback in `_average_centers`; km2 (#2322) + `green_kmeans_empty_cluster_relocation_k3`. Residual degenerate carve-out (more clusters than distinct samples / multi-empty argpartition tie order) folded into REQ-2's pinned BLAS-gemm residual — was carve-out #1378 |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
@@ -205,25 +205,43 @@ fn assign_bin<F: Float>(value: F, edges: &[F]) -> usize {
     n_bins - 1
 }
 
-/// Simple 1D k-means to find bin edges.
-fn kmeans_1d<F: Float>(values: &[F], n_bins: usize, max_iter: usize) -> Vec<F> {
+/// 1-D k-means bin edges, faithfully replicating scikit-learn 1.5.2's
+/// `KBinsDiscretizer(strategy="kmeans")` path (`sklearn/preprocessing/_discretization.py:285-300`).
+///
+/// sklearn runs ONE `KMeans(n_clusters=n_bins, init=uniform-bin-centers, n_init=1)`
+/// Lloyd fit on the column, sorts the resulting centers, and builds
+/// `bin_edges = np.r_[col_min, (centers[1:]+centers[:-1])*0.5, col_max]`.
+///
+/// This reproduces the full Lloyd machinery used by `KMeans.fit`
+/// (`sklearn/cluster/_kmeans.py` + `_k_means_lloyd.pyx` + `_k_means_common.pyx`):
+///
+/// - **Mean-centering** (`_kmeans.py:1486-1493,1543-1546`): `KMeans.fit` subtracts
+///   `X.mean(axis=0)` from both the data and the init "for more accurate distance
+///   computations", runs Lloyd on the centered data, then adds the mean back to the
+///   centers. The distance argmin is computed via `||C||² - 2·x·C` which is NOT
+///   translation-invariant in floating point, so this shift is load-bearing for
+///   the converged local optimum (not just numerical hygiene).
+/// - **Assignment** (`_k_means_lloyd.pyx:196-213`): each point goes to the center
+///   minimizing `pairwise[j] = ||C_j||² - 2·x·C_j` (the `x²` term is dropped since it
+///   is constant per point); ties resolve to the LOWEST center index (strict `<`).
+/// - **Center update** (`_k_means_lloyd.pyx:215-218`, `_k_means_common.pyx:_average_centers`):
+///   each new center is the mean of its assigned points.
+/// - **Empty-cluster relocation** (`_k_means_common.pyx:_relocate_empty_clusters_dense`,
+///   `:170-214`): for each empty cluster, take the points FARTHEST from their own
+///   assigned center (largest squared distance, descending) and move one into the
+///   empty cluster; the donor loses it. Skipped when `max(distances) == 0` (more
+///   clusters than distinct samples). Any cluster still empty after relocation is
+///   placed at the location of the heaviest cluster (`_average_centers` else-branch).
+/// - **Convergence** (`_kmeans.py:704-755`): stop on strict convergence (no label
+///   changed) OR when `center_shift_total = Σ_j (C_new[j] - C_old[j])² <= tol`, with
+///   `tol = mean(var(column)) * 1e-4` (`_tolerance`, `_kmeans.py:286-294`,
+///   population variance), OR `max_iter = 300`.
+///
+/// All intermediate arithmetic is done in `f64` (matching numpy's float64 default)
+/// regardless of `F`, then converted back to `F` for the edges.
+fn kmeans_1d<F: Float>(values: &[F], n_bins: usize) -> Vec<F> {
     let n = values.len();
-    if n <= n_bins || n_bins == 0 {
-        // Fallback to uniform
-        let min_v = values
-            .iter()
-            .copied()
-            .fold(F::infinity(), num_traits::Float::min);
-        let max_v = values
-            .iter()
-            .copied()
-            .fold(F::neg_infinity(), num_traits::Float::max);
-        return (0..=n_bins)
-            .map(|i| min_v + (max_v - min_v) * F::from(i).unwrap() / F::from(n_bins).unwrap())
-            .collect();
-    }
-
-    // Initialize centroids using uniform spacing
+    // Column min/max in F (the outer edges; sklearn uses the un-centered col_min/col_max).
     let min_v = values
         .iter()
         .copied()
@@ -233,61 +251,177 @@ fn kmeans_1d<F: Float>(values: &[F], n_bins: usize, max_iter: usize) -> Vec<F> {
         .copied()
         .fold(F::neg_infinity(), num_traits::Float::max);
 
-    let mut centroids: Vec<F> = (0..n_bins)
+    if n == 0 || n_bins == 0 {
+        // Degenerate: fall back to a uniform partition over [min, max].
+        return (0..=n_bins)
+            .map(|i| {
+                min_v
+                    + (max_v - min_v) * F::from(i).unwrap_or_else(F::zero)
+                        / fdiv_or_one::<F>(n_bins)
+            })
+            .collect();
+    }
+
+    // Work entirely in f64 (numpy float64 default).
+    let col: Vec<f64> = values.iter().map(|&v| v.to_f64().unwrap_or(0.0)).collect();
+    let col_min = col.iter().copied().fold(f64::INFINITY, f64::min);
+    let col_max = col.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    // Variance-scaled tolerance: tol = mean(var(column)) * 1e-4 (population variance,
+    // ddof=0), == sklearn `_tolerance(X, 1e-4)` (`_kmeans.py:286-294`).
+    let mean_all: f64 = col.iter().sum::<f64>() / (n as f64);
+    let var: f64 = col
+        .iter()
+        .map(|&x| (x - mean_all) * (x - mean_all))
+        .sum::<f64>()
+        / (n as f64);
+    let tol = var * 1e-4;
+
+    // KMeans.fit mean-centers X and the init (`_kmeans.py:1486-1493`).
+    let x_mean = mean_all;
+    let xc: Vec<f64> = col.iter().map(|&x| x - x_mean).collect();
+
+    // Uniform-bin-centers init (`_discretization.py:289-290`), then shifted by -x_mean.
+    let mut centers: Vec<f64> = (0..n_bins)
         .map(|i| {
-            min_v
-                + (max_v - min_v) * (F::from(i).unwrap() + F::from(0.5).unwrap())
-                    / F::from(n_bins).unwrap()
+            let lo = col_min + (col_max - col_min) * (i as f64) / (n_bins as f64);
+            let hi = col_min + (col_max - col_min) * ((i + 1) as f64) / (n_bins as f64);
+            (lo + hi) * 0.5 - x_mean
         })
         .collect();
 
+    let mut labels = vec![usize::MAX; n];
+    let mut labels_old = vec![usize::MAX; n];
+    let max_iter = 300usize;
+
     for _ in 0..max_iter {
-        // Assign each value to nearest centroid
-        let mut sums = vec![F::zero(); n_bins];
-        let mut counts = vec![0usize; n_bins];
+        let centers_old = centers.clone();
 
-        for &v in values {
-            let mut best_c = 0;
-            let mut best_dist = F::infinity();
-            for (c, &centroid) in centroids.iter().enumerate() {
-                let d = (v - centroid).abs();
-                if d < best_dist {
-                    best_dist = d;
-                    best_c = c;
+        // --- Assignment: argmin_j (||C_j||² - 2·x·C_j), ties -> lowest index. ---
+        let csq: Vec<f64> = centers_old.iter().map(|&c| c * c).collect();
+        for i in 0..n {
+            let xi = xc[i];
+            let mut best_j = 0usize;
+            let mut best = csq[0] - 2.0 * xi * centers_old[0];
+            for j in 1..n_bins {
+                let d = csq[j] - 2.0 * xi * centers_old[j];
+                if d < best {
+                    best = d;
+                    best_j = j;
                 }
             }
-            sums[best_c] = sums[best_c] + v;
-            counts[best_c] += 1;
+            labels[i] = best_j;
         }
 
-        // Update centroids
-        let mut converged = true;
-        for c in 0..n_bins {
-            if counts[c] > 0 {
-                let new_centroid = sums[c] / F::from(counts[c]).unwrap();
-                if (new_centroid - centroids[c]).abs() > F::from(1e-10).unwrap_or_else(F::epsilon) {
-                    converged = false;
+        // --- Accumulate per-cluster sum and weight (count). ---
+        let mut acc = vec![0.0f64; n_bins];
+        let mut wic = vec![0.0f64; n_bins];
+        for i in 0..n {
+            acc[labels[i]] += xc[i];
+            wic[labels[i]] += 1.0;
+        }
+
+        // --- Empty-cluster relocation (`_relocate_empty_clusters_dense`). ---
+        let empty: Vec<usize> = (0..n_bins).filter(|&j| wic[j] == 0.0).collect();
+        if !empty.is_empty() {
+            // distances[i] = (xc[i] - centers_old[labels[i]])²
+            let distances: Vec<f64> = (0..n)
+                .map(|i| {
+                    let d = xc[i] - centers_old[labels[i]];
+                    d * d
+                })
+                .collect();
+            let max_dist = distances.iter().copied().fold(0.0f64, f64::max);
+            if max_dist != 0.0 {
+                let n_empty = empty.len();
+                // far_from_centers: the n_empty points with the largest distance,
+                // in descending order. sklearn uses
+                // `np.argpartition(distances, -n_empty)[:-n_empty-1:-1]`
+                // (`_k_means_common.pyx:190`), whose introselect partition + reverse
+                // slice resolves equal-distance ties toward the HIGHEST original index
+                // (e.g. distances `[.04,.04,0,0,.04,.04]`, n_empty=2 -> far `[5, 4]`).
+                // Match that by breaking distance ties on DESCENDING index, so the
+                // duplicate-heavy `n_bins > n_distinct` relocation dumps the same
+                // points onto the empty clusters as sklearn (the centers then coincide
+                // and collapse under small-bin removal to sklearn's `n_bins_`).
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| {
+                    distances[b]
+                        .partial_cmp(&distances[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(b.cmp(&a))
+                });
+                for idx in 0..n_empty {
+                    let new_cluster = empty[idx];
+                    let far = order[idx];
+                    let old_cluster = labels[far];
+                    acc[old_cluster] -= xc[far];
+                    acc[new_cluster] = xc[far];
+                    wic[new_cluster] = 1.0;
+                    wic[old_cluster] -= 1.0;
                 }
-                centroids[c] = new_centroid;
             }
         }
-        if converged {
+
+        // --- Average; clusters still empty -> location of the heaviest cluster
+        //     (`_average_centers` else-branch). ---
+        let mut argmax_w = 0usize;
+        for j in 1..n_bins {
+            if wic[j] > wic[argmax_w] {
+                argmax_w = j;
+            }
+        }
+        for j in 0..n_bins {
+            if wic[j] > 0.0 {
+                centers[j] = acc[j] / wic[j];
+            } else if wic[argmax_w] > 0.0 {
+                centers[j] = acc[argmax_w] / wic[argmax_w];
+            } else {
+                centers[j] = centers_old[j];
+            }
+        }
+
+        // --- Convergence (`_kmeans.py:724-739`). ---
+        if labels == labels_old {
+            // Strict convergence: no label changed.
             break;
         }
+        let center_shift_tot: f64 = (0..n_bins)
+            .map(|j| {
+                let d = centers[j] - centers_old[j];
+                d * d
+            })
+            .sum();
+        if center_shift_tot <= tol {
+            break;
+        }
+        labels_old.copy_from_slice(&labels);
     }
 
-    // Sort centroids and compute edges as midpoints
-    centroids.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    // Shift centers back (`_kmeans.py:1546`) and sort (`_discretization.py:298`).
+    let mut centers_out: Vec<f64> = centers.iter().map(|&c| c + x_mean).collect();
+    centers_out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
+    // edges = [col_min, midpoints.., col_max] (`_discretization.py:299-300`).
     let mut edges = Vec::with_capacity(n_bins + 1);
     edges.push(min_v);
-    for i in 0..n_bins - 1 {
-        let mid = (centroids[i] + centroids[i + 1]) / (F::one() + F::one());
-        edges.push(mid);
+    for i in 0..n_bins.saturating_sub(1) {
+        let mid = (centers_out[i] + centers_out[i + 1]) * 0.5;
+        edges.push(F::from(mid).unwrap_or(min_v));
     }
     edges.push(max_v);
 
     edges
+}
+
+/// `F::from(n)` as a divisor, falling back to `F::one()` when `n == 0` to avoid a
+/// division by zero in the degenerate fallback path.
+fn fdiv_or_one<F: Float>(n: usize) -> F {
+    if n == 0 {
+        F::one()
+    } else {
+        F::from(n).unwrap_or_else(F::one)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +494,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KBinsDiscretizer<F
                         })
                         .collect()
                 }
-                BinStrategy::KMeans => kmeans_1d(&col_vals, self.n_bins, 100),
+                BinStrategy::KMeans => kmeans_1d(&col_vals, self.n_bins),
             };
 
             // Small-bin removal for quantile and kmeans only (sklearn
