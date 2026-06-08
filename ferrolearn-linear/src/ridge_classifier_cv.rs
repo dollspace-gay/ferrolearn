@@ -34,7 +34,8 @@
 //! | REQ | Status | Evidence |
 //! |---|---|---|
 //! | REQ-10 (`RidgeClassifierCV`) | SHIPPED | this module: shared-alpha LOO-GCV over the binarized indicator targets (`_ridge.py:2676` + `_RidgeGCV`, `_ridge.py:1688`), final multi-output Ridge refit. |
-//! | REQ-11 (store_cv_results/cv_results_ + scoring/cv/class_weight ctor params) | NOT-STARTED | #2248. sklearn ctor exposes scoring/cv/class_weight/store_cv_results (`_ridge.py:2676+`); `store_cv_results=True` populates `cv_results_` (`_ridge.py:2141-2204`, shape `(n_samples, n_y, n_alphas)` multiclass / `(n_samples, n_alphas)` binary). ferrolearn carries only `alphas`/`fit_intercept`. |
+//! | REQ-11a (store_cv_results/cv_results_) | SHIPPED | #2248. `RidgeClassifierCV<F>` adds `pub store_cv_results: bool` (default `false`, mirroring sklearn's documented default, `_ridge.py:2547`/`:2727`; the ctor `store_cv_results=None` sentinel resolves to `False`, `_ridge.py:2349-2350`) + `with_store_cv_results` builder + getter. `fn gcv_scores_svd`/`fn gcv_scores_eigen in ridge_classifier_cv.rs` retain the un-summed per-sample-per-target squared LOO errors `(c / G_inverse_diag)²` (the SAME terms the alpha-selection sums) into an `Array3<F>` shaped `(n_samples, n_targets, n_alphas)` — alpha axis = input `alphas` order, target axis = indicator columns — mirroring sklearn `cv_results_` (`squared_errors.ravel()`, `_ridge.py:2152`; reshape to `(n_samples, n_y, n_alphas)`, `_ridge.py:2199-2204`). `FittedRidgeClassifierCV<F>` stores `cv_results_: Option<Array3<F>>` + `pub fn cv_results(&self) -> Option<&Array3<F>>` (`None` when `store_cv_results=false`). The selection sum is byte-identical regardless of the flag, so `alpha_`/`coef_`/`predict` are unchanged. Non-test consumer: crate-root re-export `pub use ridge_classifier_cv::{RidgeClassifierCV, FittedRidgeClassifierCV}` in `lib.rs`. Verification (live sklearn 1.5.2, R-CHAR-3): binary `store_cv_results=True` on `oracle_x`, `y=[0,0,0,0,0,1,1,1]`, `alphas=[0.1,1,10]` → `cv_results_` shape `(8,1,3)` values `[[0.01905,0.014503,0.000155],…,[0.595118,0.52245,0.111111]]`; 3-class `y=[0,0,1,1,2,2,1,0]` → `(8,3,3)` per-target; non-monotone `alphas=[10,0.1,1]` → axis-0 ↔ alpha 10. Tests `ridge_classifier_cv_store_cv_results_binary_matches_sklearn`, `…_multiclass_…`, `…_none_default`, `…_alpha_axis_order` PASS. |
+//! | REQ-11b (scoring/cv/class_weight/store_cv_values ctor params) | NOT-STARTED | #2248. sklearn's `RidgeClassifierCV` ctor also exposes `scoring` (when set, `cv_results_` stores predictions/scores not squared errors, `_ridge.py:2153-2156`/`:2211-2218`), `cv` (actual k-fold instead of the GCV path), `class_weight` (`_ridge.py:2812`/`:2836`), and the DEPRECATED `store_cv_values` alias (`_ridge.py:2826`/`:2333-2348`). ferrolearn carries only `alphas`/`fit_intercept`/`store_cv_results`; these remain unimplemented. |
 //!
 //! # Examples
 //!
@@ -60,7 +61,7 @@ use ferray::{Array as FerrayArray, Ix2};
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::{HasClasses, HasCoefficients};
 use ferrolearn_core::traits::{Fit, Predict};
-use ndarray::{Array1, Array2, Axis, ScalarOperand};
+use ndarray::{Array1, Array2, Array3, Axis, ScalarOperand};
 use num_traits::{Float, FromPrimitive};
 
 use crate::Ridge;
@@ -83,6 +84,13 @@ pub struct RidgeClassifierCV<F> {
     /// Whether to fit an intercept (bias) term (sklearn `fit_intercept`,
     /// default `True`, `_ridge.py:2698`).
     pub fit_intercept: bool,
+    /// Whether to retain the per-sample cross-validation results
+    /// (`cv_results_`). Mirrors sklearn `store_cv_results` (documented default
+    /// `False`, `_ridge.py:2547`/`:2727`; the ctor sentinel `None` resolves to
+    /// `False`, `_ridge.py:2349-2350`). When `true`, the fitted model exposes the
+    /// per-sample-per-target-per-alpha squared leave-one-out errors via
+    /// [`FittedRidgeClassifierCV::cv_results`].
+    pub store_cv_results: bool,
 }
 
 impl<F: Float + FromPrimitive> RidgeClassifierCV<F> {
@@ -101,6 +109,7 @@ impl<F: Float + FromPrimitive> RidgeClassifierCV<F> {
         Self {
             alphas: vec![p1, one, ten],
             fit_intercept: true,
+            store_cv_results: false,
         }
     }
 
@@ -119,6 +128,18 @@ impl<F: Float + FromPrimitive> RidgeClassifierCV<F> {
     #[must_use]
     pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
         self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set whether to retain the cross-validation results (sklearn
+    /// `store_cv_results`, default `False`, `_ridge.py:2547`/`:2727`).
+    ///
+    /// When `true`, the fitted model's [`FittedRidgeClassifierCV::cv_results`]
+    /// returns the per-sample-per-target-per-alpha squared leave-one-out errors;
+    /// when `false` (the default) it returns `None`.
+    #[must_use]
+    pub fn with_store_cv_results(mut self, store_cv_results: bool) -> Self {
+        self.store_cv_results = store_cv_results;
         self
     }
 }
@@ -152,6 +173,12 @@ pub struct FittedRidgeClassifierCV<F> {
     is_binary: bool,
     /// Number of features (for the predict-time shape check).
     n_features: usize,
+    /// Per-sample cross-validation results, shape `(n_samples, n_targets,
+    /// n_alphas)`, populated only when `store_cv_results` was set. `Some` holds
+    /// the squared leave-one-out errors `(c / G_inverse_diag)²` (sklearn
+    /// `cv_results_`, `_ridge.py:2149`/`:2199-2204`); `None` when
+    /// `store_cv_results` is `false`.
+    cv_results_: Option<Array3<F>>,
 }
 
 impl<F: Float> FittedRidgeClassifierCV<F> {
@@ -187,6 +214,22 @@ impl<F: Float> FittedRidgeClassifierCV<F> {
     #[must_use]
     pub fn classes(&self) -> &[usize] {
         &self.classes
+    }
+
+    /// Returns the per-sample cross-validation results, shape
+    /// `(n_samples, n_targets, n_alphas)`, or `None` when `store_cv_results`
+    /// was not set.
+    ///
+    /// The values are the per-sample-per-target-per-alpha SQUARED leave-one-out
+    /// errors `(c / G_inverse_diag)²` that the GCV minimizes — the same
+    /// per-sample terms the alpha selection sums (sklearn `cv_results_`,
+    /// `_ridge.py:2149` `squared_errors`, reshaped to `(n_samples, n_y,
+    /// n_alphas)` at `_ridge.py:2199-2204`). The alpha axis follows the input
+    /// `alphas` order; the target axis follows the indicator columns (the sorted
+    /// `classes_`; a single column for binary problems).
+    #[must_use]
+    pub fn cv_results(&self) -> Option<&Array3<F>> {
+        self.cv_results_.as_ref()
     }
 }
 
@@ -330,7 +373,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         // the per-alpha score sums the squared LOO errors over every column and
         // sample (sklearn `-squared_errors.mean()` with `squared_errors` shape
         // `(n_samples, n_y)`, `_ridge.py:2148-2150`/`:2211-2218`).
-        let alpha_ = self.select_alpha_gcv(x, &y_indicator)?;
+        let (alpha_, cv_results_) = self.select_alpha_gcv(x, &y_indicator)?;
 
         // Final refit: multi-output Ridge at the selected alpha on the indicator
         // matrix (sklearn refits `coef_ = dual_coef_.T @ X` + `_set_intercept`,
@@ -356,6 +399,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             classes,
             is_binary,
             n_features,
+            cv_results_,
         })
     }
 }
@@ -378,7 +422,22 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     /// `_ridge.py:2148-2150`/`:2211-2218`). Ties → the first (smallest-index)
     /// alpha, matching sklearn's strict `alpha_score > best_score` update
     /// (`_ridge.py:2185`).
-    fn select_alpha_gcv(&self, x: &Array2<F>, y: &Array2<F>) -> Result<F, FerroError> {
+    ///
+    /// When `self.store_cv_results`, ALSO returns the per-sample-per-target
+    /// squared LOO errors as an `Array3<F>` shaped `(n_samples, n_targets,
+    /// n_alphas)` (alpha axis = input `alphas` order, target axis = indicator
+    /// columns) — the un-summed terms the alpha selection sums (sklearn
+    /// `cv_results_`, `_ridge.py:2149`/`:2199-2204`). The selection math itself
+    /// is unchanged, so `alpha_` stays bit-exact regardless of the flag.
+    #[allow(
+        clippy::type_complexity,
+        reason = "GCV returns the selected alpha plus the optional retained cv_results_ buffer in one pass to avoid recomputing the decomposition"
+    )]
+    fn select_alpha_gcv(
+        &self,
+        x: &Array2<F>,
+        y: &Array2<F>,
+    ) -> Result<(F, Option<Array3<F>>), FerroError> {
         let (n_samples, n_features) = x.dim();
 
         // Center X and Y per column (sklearn `_preprocess_data`,
@@ -401,7 +460,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
         };
 
         // Per-alpha total squared LOO error (summed over samples AND columns).
-        let scores = if n_samples > n_features {
+        // When `store_cv_results`, the score functions ALSO return the
+        // un-summed per-sample-per-target squared LOO errors as
+        // `(n_samples, n_targets, n_alphas)`.
+        let (scores, cv_results) = if n_samples > n_features {
             self.gcv_scores_svd(&x_c, &y_c)?
         } else {
             self.gcv_scores_eigen(&x_c, &y_c)?
@@ -416,7 +478,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             }
         }
 
-        Ok(best_alpha)
+        Ok((best_alpha, cv_results))
     }
 
     /// SVD-mode shared-alpha GCV totals, used when `n_samples > n_features`
@@ -427,7 +489,21 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     ///
     /// REPLICATES `crate::ridge_cv`'s verified 1-D SVD path, extended to
     /// accumulate over the columns of `Y` against the SAME `U`/singular values.
-    fn gcv_scores_svd(&self, x_c: &Array2<F>, y_c: &Array2<F>) -> Result<Vec<F>, FerroError> {
+    ///
+    /// When `self.store_cv_results`, the returned `Option<Array3<F>>` holds the
+    /// un-summed per-sample-per-target squared LOO errors shaped `(n_samples,
+    /// n_targets, n_alphas)` (sklearn `cv_results_`, `_ridge.py:2149`/
+    /// `:2199-2204`). The summation that selects `alpha_` is byte-identical
+    /// whether or not retention is enabled.
+    #[allow(
+        clippy::type_complexity,
+        reason = "returns the per-alpha totals plus the optional retained cv_results_ buffer computed in the same loop"
+    )]
+    fn gcv_scores_svd(
+        &self,
+        x_c: &Array2<F>,
+        y_c: &Array2<F>,
+    ) -> Result<(Vec<F>, Option<Array3<F>>), FerroError> {
         let n_samples = x_c.nrows();
         let n_targets = y_c.ncols();
         let one = <F as num_traits::One>::one();
@@ -474,8 +550,21 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             None
         };
 
+        // Optional cv_results_ retention buffer, shaped (n_samples, n_targets,
+        // n_alphas); the alpha axis follows the input `alphas` enumeration order
+        // (sklearn `cv_results_`, `_ridge.py:2199-2204`).
+        let mut cv_results = if self.store_cv_results {
+            Some(Array3::<F>::zeros((
+                n_samples,
+                n_targets,
+                self.alphas.len(),
+            )))
+        } else {
+            None
+        };
+
         let mut out = Vec::with_capacity(self.alphas.len());
-        for &alpha in &self.alphas {
+        for (a_idx, &alpha) in self.alphas.iter().enumerate() {
             let inv_alpha = one / alpha;
             // w_j = (singvals_sq_j + alpha)^-1 - alpha^-1 (sklearn :2045).
             let mut w: Vec<F> = singvals_sq
@@ -506,12 +595,19 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     }
                     c_it += inv_alpha * y_c[[i, t]];
                     let looe = c_it / g_i;
-                    total += looe * looe;
+                    let sq_err = looe * looe;
+                    total += sq_err;
+                    // Retain the un-summed per-sample-per-target squared LOO
+                    // error (`cv_results_[:, t, a]`, sklearn `_ridge.py:2152`
+                    // ravel + `:2199-2204` reshape).
+                    if let Some(buf) = cv_results.as_mut() {
+                        buf[[i, t, a_idx]] = sq_err;
+                    }
                 }
             }
             out.push(total);
         }
-        Ok(out)
+        Ok((out, cv_results))
     }
 
     /// Eigen-mode shared-alpha GCV totals, used when
@@ -522,7 +618,21 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     ///
     /// REPLICATES `crate::ridge_cv`'s verified 1-D eigen path, extended to
     /// accumulate over the columns of `Y` against the SAME `Q`/eigenvalues.
-    fn gcv_scores_eigen(&self, x_c: &Array2<F>, y_c: &Array2<F>) -> Result<Vec<F>, FerroError> {
+    ///
+    /// When `self.store_cv_results`, the returned `Option<Array3<F>>` holds the
+    /// un-summed per-sample-per-target squared LOO errors shaped `(n_samples,
+    /// n_targets, n_alphas)` (sklearn `cv_results_`, `_ridge.py:2149`/
+    /// `:2199-2204`). The summation that selects `alpha_` is byte-identical
+    /// whether or not retention is enabled.
+    #[allow(
+        clippy::type_complexity,
+        reason = "returns the per-alpha totals plus the optional retained cv_results_ buffer computed in the same loop"
+    )]
+    fn gcv_scores_eigen(
+        &self,
+        x_c: &Array2<F>,
+        y_c: &Array2<F>,
+    ) -> Result<(Vec<F>, Option<Array3<F>>), FerroError> {
         let n_samples = x_c.nrows();
         let n_targets = y_c.ncols();
         let one = <F as num_traits::One>::one();
@@ -566,8 +676,21 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             None
         };
 
+        // Optional cv_results_ retention buffer, shaped (n_samples, n_targets,
+        // n_alphas); the alpha axis follows the input `alphas` enumeration order
+        // (sklearn `cv_results_`, `_ridge.py:2199-2204`).
+        let mut cv_results = if self.store_cv_results {
+            Some(Array3::<F>::zeros((
+                n_samples,
+                n_targets,
+                self.alphas.len(),
+            )))
+        } else {
+            None
+        };
+
         let mut out = Vec::with_capacity(self.alphas.len());
-        for &alpha in &self.alphas {
+        for (a_idx, &alpha) in self.alphas.iter().enumerate() {
             // w_j = 1 / (eigvals_j + alpha) (sklearn :1919).
             let mut w: Vec<F> = eigvals.iter().map(|&ev| one / (ev + alpha)).collect();
             if let Some(d) = intercept_dim {
@@ -590,12 +713,19 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                         c_it += q[(i, j)] * (w[j] * qt_y[[j, t]]);
                     }
                     let looe = c_it / g_i;
-                    total += looe * looe;
+                    let sq_err = looe * looe;
+                    total += sq_err;
+                    // Retain the un-summed per-sample-per-target squared LOO
+                    // error (`cv_results_[:, t, a]`, sklearn `_ridge.py:2152`
+                    // ravel + `:2199-2204` reshape).
+                    if let Some(buf) = cv_results.as_mut() {
+                        buf[[i, t, a_idx]] = sq_err;
+                    }
                 }
             }
             out.push(total);
         }
-        Ok(out)
+        Ok((out, cv_results))
     }
 }
 
