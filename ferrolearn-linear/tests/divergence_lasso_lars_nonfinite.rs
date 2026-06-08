@@ -89,7 +89,6 @@ fn nonfinite_xy_cases() -> Vec<(Array2<f64>, Array1<f64>, &'static str)> {
 /// `_least_angle.py:1726` with `force_all_finite=True`) raises `ValueError`.
 /// sklearn raises for all five cases; ferrolearn returns `Ok` (NaN coef).
 /// Tracking: #2260.
-#[ignore = "divergence: LassoLars::fit accepts non-finite X/y (batch-2 #2259 missed it); tracking #2260"]
 #[test]
 fn lasso_lars_rejects_non_finite_input_like_sklearn() {
     let model = LassoLars::<f64>::new().with_alpha(0.1);

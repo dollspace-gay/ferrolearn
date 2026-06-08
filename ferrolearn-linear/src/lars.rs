@@ -28,6 +28,7 @@
 //! | REQ-3 (predict) | SHIPPED | `Predict for FittedLars`/`FittedLassoLars`. |
 //! | REQ-4 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
 //! | REQ-5..8 NOT-STARTED | coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
+//! | REQ-9 (Lars/LassoLars non-finite input rejected) | SHIPPED | `Fit::fit for Lars` AND the SEPARATE `Fit::fit for LassoLars` impl both reject any NaN/+/-inf in X or y BEFORE the LARS path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`Lars._fit` `_least_angle.py:1183`; `LassoLars.fit` override `_least_angle.py:1698` → `:1726`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; neither `Lars.fit` nor `LassoLars.fit` takes a `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lars().fit` / `LassoLars(alpha=0.1).fit` raise `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::lars_*`, `tests/divergence_lasso_lars_nonfinite.rs::lasso_lars_rejects_non_finite_input_like_sklearn`). Non-test consumer: the existing `Fit::fit` / `pub use Lars, LassoLars` boundary consumers. (#2259, #2260) |
 //!
 //! acto-critic + builder: `Lars` matched sklearn exactly; `LassoLars` diverged (used forward-stepwise
 //! OLS instead of the equiangular lasso path) — rewritten to sklearn's `_lars_path_solver` lasso
@@ -300,6 +301,27 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// - [`FerroError::InvalidParameter`] — `n_nonzero_coefs` exceeds feature count.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLars<F>, FerroError> {
         let (_n_samples, n_features) = validate_input(x, y, "Lars")?;
+
+        // Non-finite input validation (#2259). sklearn `Lars.fit` ->
+        // `self._validate_data(X, y, force_writeable=True, y_numeric=True,
+        // multi_output=True)` (`_least_angle.py:1183`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError` BEFORE the LARS path runs.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2). `Lars.fit` takes no `sample_weight`. The finite
+        // path is byte-identical (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
 
         let max_active = self.n_nonzero_coefs.unwrap_or(n_features);
         if max_active > n_features {
@@ -630,9 +652,32 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InsufficientSamples`] — zero samples.
-    /// - [`FerroError::InvalidParameter`] — `alpha` is negative.
+    /// - [`FerroError::InvalidParameter`] — `alpha` is negative, or `X`/`y`
+    ///   contain NaN or infinity (sklearn `force_all_finite=True` parity).
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLassoLars<F>, FerroError> {
         let (_n_samples, _n_features) = validate_input(x, y, "LassoLars")?;
+
+        // Non-finite input validation (#2260). `LassoLars.fit` is a SEPARATE
+        // override of `Lars.fit` in sklearn (`_least_angle.py:1698`) and calls
+        // `self._validate_data(X, y, force_writeable=True, y_numeric=True)`
+        // (`_least_angle.py:1726`) with the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN or +/-inf in X OR y with a `ValueError`
+        // BEFORE the LARS-Lasso path runs. `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2).
+        // `LassoLars.fit` takes no `sample_weight`. The finite path is
+        // byte-identical (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
 
         if self.alpha < F::zero() {
             return Err(FerroError::InvalidParameter {

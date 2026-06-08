@@ -20,6 +20,7 @@
 //! | REQ-4 (predict) | SHIPPED | `Predict for FittedOMP`. |
 //! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
 //! | REQ-6..10 NOT-STARTED | Gram/precompute path (#489), OrthogonalMatchingPursuitCV (#490), n_iter_ (#491), multi-output (#492), ferray substrate (#493). |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `Fit::fit for OrthogonalMatchingPursuit` rejects any NaN/+/-inf in X or y BEFORE the greedy path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_omp.py:772`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; OMP takes no `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `OrthogonalMatchingPursuit().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::omp_*`). Non-test consumer: the existing `Fit::fit` / `pub use OrthogonalMatchingPursuit` boundary consumers. (#2259) |
 //!
 //! acto-critic: the greedy path matches sklearn exactly (1e-12); the default-construction
 //! divergence (#488 — errored where sklearn applies 0.1·n_features) found and fixed. Two states
@@ -315,6 +316,28 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 required: 1,
                 actual: 0,
                 context: "OMP requires at least one sample".into(),
+            });
+        }
+
+        // Non-finite input validation (#2259). sklearn
+        // `OrthogonalMatchingPursuit.fit` ->
+        // `self._validate_data(X, y, multi_output=True, y_numeric=True)`
+        // (`_omp.py:772`) keeps the default `force_all_finite=True`, so
+        // `check_array` rejects any NaN or +/-inf in X OR y with a `ValueError`
+        // BEFORE the greedy path runs. `.iter().any(|v| !v.is_finite())` rejects
+        // both NaN and Inf (bounds-safe, no panic, R-CODE-2). `OrthogonalMatching
+        // Pursuit.fit` takes no `sample_weight`. The finite path is byte-identical
+        // (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

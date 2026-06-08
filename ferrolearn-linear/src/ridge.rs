@@ -32,6 +32,7 @@
 //! | REQ-11 (sample_weight) | SHIPPED | `Ridge::fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>)` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (fit_intercept), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_ridge.py:682-688`), `linalg::solve_ridge(&Xs, &ys, alpha)` with the penalty `alpha` UNSCALED (since `Xsᵀ·Xs == Xᵀ·W·X`), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None byte-identical to the historic centering + `solve_ridge` body; alpha=0 OLS min-norm fallback preserved). Oracle tests `ridge_fit_sample_weight_with_intercept_matches_sklearn` (alpha=1 coef `[0.9233502538, 1.39678511]`, intercept `-0.8033840948`, differs from unweighted `[0.8228070175, 1.3561403509]`), `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 coef `[0.7273779983, 1.3737799835]`, intercept 0), `ridge_fit_none_sample_weight_equals_unweighted` (byte-identical guard). Closes #389. |
 //! | REQ-12 (copy_X/random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders. `copy_x` ABI-only (fit never mutates `x`); `random_state` stored-but-no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
+//! | REQ-14 (non-finite input rejected) | SHIPPED | Both fit entries reject any NaN/+/-inf in X, y, or `sample_weight` BEFORE centering/solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_ridge.py:1242`) + `_check_sample_weight` (default `force_all_finite=True`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. The single-output `fit_with_sample_weight` (shared entry `Fit::fit` delegates to) checks X/y/sample_weight; the SEPARATE multi-output arm `Fit<Array2, Array2>::fit` checks X/y independently. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Ridge().fit` raises `ValueError` for NaN/+inf/-inf in X, NaN/inf in y, and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch2.rs::ridge_*`). Non-test consumer: the existing `Fit::fit` / `RsRidge` consumers. (#2259) |
 //!
 //! acto-critic: core L2 numerics (coef/intercept, alpha scaling, fit_intercept, f32) match the
 //! live oracle; one divergence (#392, alpha=0 rank-deficient min-norm) found and fixed.
@@ -455,6 +456,37 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             });
         }
 
+        // Non-finite input validation (#2259). sklearn `Ridge.fit` ->
+        // `self._validate_data(X, y, ...)` (`_ridge.py:1242`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError` BEFORE the solve. sklearn also validates
+        // `sample_weight` via `_check_sample_weight` (default `force_all_finite=
+        // True`), raising on a non-finite weight. `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2), matching
+        // the crate idiom (`linear_regression.rs`/`lasso.rs`). The finite path is
+        // byte-identical (the guard never fires on finite input). This is the
+        // shared single-output entry; `Fit::fit` delegates here with `None`.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+        if let Some(w) = sample_weight
+            && w.iter().any(|v| !v.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
+            });
+        }
+
         // Resolve the dense solver once (sklearn `resolve_solver`,
         // `_ridge.py:830`): `Auto` → `Cholesky` for the dense path. This is the
         // value stored as the fitted `solver_`. It governs only the
@@ -775,6 +807,24 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                 required: 1,
                 actual: 0,
                 context: "Ridge requires at least one sample".into(),
+            });
+        }
+
+        // Non-finite input validation (#2259) — SEPARATE multi-output arm.
+        // `Fit<Array2, Array2>::fit` does NOT delegate to
+        // `fit_with_sample_weight`, so the same `_validate_data(force_all_finite=
+        // True)` reject-at-fit contract (`_ridge.py:1242`, `multi_output=True`)
+        // is enforced here independently before centering/solve.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

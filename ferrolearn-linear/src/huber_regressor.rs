@@ -85,6 +85,20 @@
 //!   sample_weight=None)` → `_extras.py::HuberRegressor.fit(X, y,
 //!   sample_weight=None)`.
 //! - REQ-12 (ferray substrate): NOT-STARTED (blocker #502).
+//! - REQ-13 (non-finite input rejected): SHIPPED — `fit_with_sample_weight`
+//!   (the shared entry `Fit::fit` delegates to) rejects any NaN/+/-inf in X, y,
+//!   or `sample_weight` BEFORE the L-BFGS optimization with
+//!   `FerroError::InvalidParameter`, mirroring sklearn's
+//!   `_validate_data(force_all_finite=True)` (`_huber.py:297`) +
+//!   `_check_sample_weight` (default `force_all_finite=True`, `_huber.py:306`) →
+//!   `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`.
+//!   `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path
+//!   is byte-identical (the guard never fires on finite input). Verified vs the
+//!   live sklearn 1.5.2 oracle (R-CHAR-3): `HuberRegressor().fit` raises
+//!   `ValueError` for NaN/+inf/-inf in X, NaN/inf in y, and NaN/inf in
+//!   sample_weight (`tests/divergence_linear_nonfinite_batch2.rs::huber_*`).
+//!   Non-test consumer: the existing `Fit::fit` / `RsHuberRegressor` consumers.
+//!   (#2259)
 //!
 //! # Examples
 //!
@@ -680,6 +694,26 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> HuberRegr
             });
         }
 
+        // Non-finite input validation (#2259). sklearn `HuberRegressor.fit` ->
+        // `self._validate_data(X, y, ...)` (`_huber.py:297`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError` BEFORE the optimization. `.iter().any(|v|
+        // !v.is_finite())` rejects both NaN and Inf (bounds-safe, no panic,
+        // R-CODE-2). The finite path is byte-identical (the guard never fires on
+        // finite input). This is the shared entry `Fit::fit` delegates to.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
         // Materialize sample weights: `None` -> unit weights, mirroring sklearn
         // `_check_sample_weight(None, X) == np.ones(n_samples)`
         // (`sklearn/linear_model/_huber.py:306`).
@@ -693,11 +727,20 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> HuberRegr
                         context: "sample_weight length must match number of samples in X".into(),
                     });
                 }
-                // No non-negativity constraint: sklearn 1.5.2's `HuberRegressor.fit`
-                // runs `sample_weight` through `_check_sample_weight`
-                // (`sklearn/linear_model/_huber.py:306`), which validates length/dtype
-                // but NOT sign — negative weights flow straight into
-                // `_huber_loss_and_gradient` and the fit converges (#2159).
+                // sklearn 1.5.2's `HuberRegressor.fit` runs `sample_weight`
+                // through `_check_sample_weight` (`_huber.py:306`). That helper
+                // does NOT validate sign — negative weights flow straight into
+                // `_huber_loss_and_gradient` and the fit converges (#2159) — but
+                // it DOES keep the default `force_all_finite=True`, so a NaN or
+                // +/-inf weight raises `ValueError` BEFORE the optimization
+                // (#2259, confirmed against the live oracle). `.iter().any(|v|
+                // !v.is_finite())` rejects both (bounds-safe, no panic, R-CODE-2).
+                if w.iter().any(|v| !v.is_finite()) {
+                    return Err(FerroError::InvalidParameter {
+                        name: "sample_weight".into(),
+                        reason: "Input sample_weight contains NaN or infinity.".into(),
+                    });
+                }
                 w.clone()
             }
         };
