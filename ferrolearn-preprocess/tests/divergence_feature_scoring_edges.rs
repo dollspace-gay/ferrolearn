@@ -35,7 +35,6 @@ use ndarray::{Array1, array};
 /// (`f = msb / msw`, `0/0 = nan`) returns `f=nan, p=nan`.
 /// Tracking: #2312
 #[test]
-#[ignore = "divergence: f_classif constant feature -> sklearn nan/nan vs ferrolearn inf/0.0; tracking #2312"]
 #[allow(
     clippy::assertions_on_constants,
     reason = "error arm fails loudly without panic!/unwrap (anti-pattern gate)"
@@ -86,7 +85,6 @@ fn divergence_f_classif_constant_feature_nan() {
 /// `np.finfo(float64).max == 1.7976931348623157e+308`.
 /// Tracking: #2313
 #[test]
-#[ignore = "divergence: f_regression perfect-corr -> sklearn finfo.max vs ferrolearn inf (force_finite default); tracking #2313"]
 #[allow(
     clippy::assertions_on_constants,
     reason = "error arm fails loudly without panic!/unwrap (anti-pattern gate)"
@@ -133,7 +131,6 @@ fn divergence_f_regression_perfect_corr_force_finite() {
 /// `stat=nan, p=nan`.
 /// Tracking: #2314
 #[test]
-#[ignore = "divergence: chi2 all-zero column -> sklearn nan/nan vs ferrolearn 0.0/1.0 short-circuit; tracking #2314"]
 #[allow(
     clippy::assertions_on_constants,
     reason = "error arm fails loudly without panic!/unwrap (anti-pattern gate)"

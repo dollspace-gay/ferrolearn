@@ -154,7 +154,17 @@ pub fn f_classif<F: Float + Send + Sync + 'static>(
             let ms_between = ss_between / df_b;
             let ms_within = ss_within / df_w;
             if ms_within == F::zero() {
-                F::infinity()
+                // sklearn `f_oneway` computes `f = msb / msw`
+                // (`_univariate_selection.py:113`) without guarding the
+                // denominator. A CONSTANT feature has both msb == 0 and
+                // msw == 0, so `0.0 / 0.0 = nan` (and `fdtrc(.., nan) = nan`).
+                // Perfect separation has msb > 0 and msw == 0, so
+                // `msb / 0 = +inf` (and `fdtrc(.., inf) = 0`). Match both.
+                if ms_between == F::zero() {
+                    F::nan()
+                } else {
+                    F::infinity()
+                }
             } else {
                 ms_between / ms_within
             }
@@ -261,7 +271,15 @@ pub fn f_regression<F: Float + Send + Sync + 'static>(
 
         let r2 = r * r;
         let f = if r2 >= F::one() {
-            F::infinity()
+            // Perfect (anti-)correlation: r² == 1 → F would be +inf. sklearn's
+            // `f_regression` has `force_finite=True` by DEFAULT, which replaces
+            // the infinite F with `np.finfo(dtype).max`
+            // (`_univariate_selection.py:447-461,509-513`); the p-value stays 0.
+            // `F::max_value()` is the `np.finfo(dtype).max` analog (f64::MAX =
+            // 1.7976931348623157e+308). A constant feature yields denom == 0 →
+            // r == 0 → F == 0 above, p == sf(0) == 1, which already matches the
+            // `force_finite` nan→0.0/p→1.0 branch.
+            F::max_value()
         } else {
             r2 * (n_f - two) / (F::one() - r2)
         };
@@ -365,13 +383,6 @@ pub fn chi2<F: Float + Send + Sync + 'static>(
         let col = x.column(j);
         let total_sum = col.iter().copied().fold(F::zero(), |acc, v| acc + v);
 
-        if total_sum == F::zero() {
-            // All zero → chi2 = 0, p = 1
-            chi2_stats[j] = F::zero();
-            p_vals[j] = F::one();
-            continue;
-        }
-
         let mut chi2_val = F::zero();
 
         for rows in class_indices.values() {
@@ -382,10 +393,15 @@ pub fn chi2<F: Float + Send + Sync + 'static>(
                 .fold(F::zero(), |acc, v| acc + v);
             let expected = total_sum * n_k / n_f;
 
-            if expected > F::zero() {
-                let diff = observed - expected;
-                chi2_val = chi2_val + diff * diff / expected;
-            }
+            // sklearn `_chisquare` divides `(obs - exp)² / exp` under
+            // `np.errstate(invalid="ignore")` (`_univariate_selection.py:189-191`).
+            // For an all-zero feature column `expected == 0` and `observed == 0`,
+            // so IEEE `0.0 / 0.0 = nan`; the summed statistic is nan and
+            // `chdtrc(.., nan) = nan`. We mirror this by dividing unconditionally
+            // (the IEEE result is nan, never a trap — R-CODE-2) rather than
+            // short-circuiting the all-zero column to stat=0/p=1.
+            let diff = observed - expected;
+            chi2_val = chi2_val + diff * diff / expected;
         }
 
         chi2_stats[j] = chi2_val;
@@ -903,11 +919,15 @@ mod tests {
 
     #[test]
     fn test_chi2_all_zeros() {
+        // An all-zero feature column has expected == 0, so sklearn's `_chisquare`
+        // computes `0/0 = nan` for the statistic and `chdtrc(.., nan) = nan` for
+        // the p-value (`_univariate_selection.py:189-191`). Oracle (sklearn 1.5.2):
+        //   X=[[0,0],[0,0]], y=[0,1] -> chi2 -> stat=[nan,nan], p=[nan,nan].
         let x = array![[0.0_f64, 0.0], [0.0, 0.0]];
         let y: Array1<usize> = array![0, 1];
         let (chi2_stats, p_vals) = chi2(&x, &y).unwrap();
-        assert_eq!(chi2_stats[0], 0.0);
-        assert_eq!(p_vals[0], 1.0);
+        assert!(chi2_stats[0].is_nan());
+        assert!(p_vals[0].is_nan());
     }
 
     #[test]
