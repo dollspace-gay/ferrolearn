@@ -17,6 +17,10 @@
 //!
 //! See `.design/linear/ridge_cv.md` for the full requirements table.
 //!
+//! | REQ | Status | Evidence |
+//! |---|---|---|
+//! | REQ-9 (non-finite input rejected) | SHIPPED | `Fit for RidgeCV::fit` rejects any NaN/+/-inf in X or y BEFORE the GCV decomposition / k-fold split with `FerroError::InvalidParameter`, mirroring sklearn `_RidgeGCV.fit` `_validate_data(force_all_finite=True)` (`_ridge.py:2087`) and the `cv=Some(k)` `GridSearchCV`→`Ridge.fit` (`_ridge.py:1242`) path, both raising `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. ferrolearn's `Fit::fit` takes only `(x, y)` (no `sample_weight` in the trait surface), so X and y are validated. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (alpha_/coef_ unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X and NaN/inf in y all raise `ValueError`; all-finite `alpha_=0.1` unchanged (`tests/divergence_linear_nonfinite_batch5.rs::ridge_cv_*`). Non-test consumer: the existing `pub use ridge_cv::RidgeCV` boundary API. (#2265) |
+//!
 //! # Examples
 //!
 //! ```
@@ -271,6 +275,32 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
                     reason: "all alpha values must be non-negative".into(),
                 });
             }
+        }
+
+        // Non-finite input validation (#2265 batch5). sklearn `RidgeCV.fit`
+        // routes to `_RidgeGCV.fit` (`cv=None`) which calls
+        // `self._validate_data(X, y, ...)` (`_ridge.py:2087`) keeping the default
+        // `force_all_finite=True`, rejecting any NaN or +/-inf in X OR y with a
+        // `ValueError` BEFORE the decomposition; the `cv=Some(k)` path routes
+        // through `GridSearchCV` whose per-fold `Ridge.fit` (`_ridge.py:1242`)
+        // also rejects non-finite input. Checking up-front here gives the clean
+        // sklearn error BEFORE the GCV decomposition / fold split. ferrolearn's
+        // `Fit::fit` takes only `(x, y)` (no `sample_weight` in the trait
+        // surface), so X and y are the inputs validated. `.iter().any(|v|
+        // !v.is_finite())` rejects both NaN and Inf (bounds-safe, no panic,
+        // R-CODE-2), matching the crate idiom (`ridge.rs`, #2259). The finite
+        // path is byte-identical (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
         }
 
         // Route on the CV strategy, mirroring sklearn `_BaseRidgeCV.fit`

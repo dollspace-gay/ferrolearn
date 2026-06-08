@@ -20,6 +20,7 @@
 //! | REQ-4 (predict / fit_intercept / HasCoefficients) | SHIPPED | `Predict`/`HasCoefficients for FittedLassoCV`. |
 //! | REQ-5 (sklearn contiguous KFold) | SHIPPED | #421 fixed (abf5a14) — was round-robin. |
 //! | REQ-6..12 NOT-STARTED | mse_path_ (#422), alphas_/dual_gap_/n_iter_ (#423), eps as param (#424), positive (#425), precompute/n_jobs (#426), random_state/selection (#427), ferray substrate (#428). coef exact parity gated by CD-stopping #412. |
+//! | REQ-13 (non-finite input rejected) | SHIPPED | `Fit for LassoCV::fit` rejects any NaN/+/-inf in X or y BEFORE the alpha grid / k-fold split with `FerroError::InvalidParameter`, mirroring sklearn `LinearModelCV.fit` `_validate_data` (default `force_all_finite=True`, `_coordinate_descent.py:1619`/`:1644`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. ferrolearn's `Fit::fit` takes only `(x, y)` (no `sample_weight` in the trait surface), so X and y are validated. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (alpha grid / alpha_ / coef_ unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X and NaN/inf in y all raise `ValueError`; all-finite `alpha_=0.01` unchanged (`tests/divergence_linear_nonfinite_batch5.rs::lasso_cv_*`). Non-test consumer: the existing `pub use lasso_cv::LassoCV` boundary API. (#2265) |
 //!
 //! acto-critic: alpha grid matches sklearn <1e-9; the fold-strategy divergence (#421) found and
 //! fixed (alpha_ now matches to ~2e-17); residual coef_ difference is the tracked Lasso CD-stopping
@@ -323,6 +324,31 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 required: self.cv,
                 actual: n_samples,
                 context: "LassoCV requires at least as many samples as folds".into(),
+            });
+        }
+
+        // Non-finite input validation (#2265 batch5). sklearn `LassoCV.fit`
+        // (via `LinearModelCV.fit`) calls `self._validate_data(X, y, ...)`
+        // (`_coordinate_descent.py:1619`/`:1644`) — `check_X_params`/
+        // `check_y_params` do NOT set `force_all_finite=False`, so the default
+        // `True` applies and any NaN or +/-inf in X OR y raises a `ValueError`
+        // BEFORE the alpha grid / k-fold split. Checking up-front here gives the
+        // clean sklearn error before `compute_alpha_max` / the fold loop.
+        // ferrolearn's `Fit::fit` takes only `(x, y)` (no `sample_weight` in the
+        // trait surface), so X and y are the validated inputs. `.iter().any(|v|
+        // !v.is_finite())` rejects both NaN and Inf (bounds-safe, no panic,
+        // R-CODE-2), matching the crate idiom (`ridge.rs`/`lasso.rs`). The finite
+        // path is byte-identical (the guard never fires on finite input).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 
