@@ -19,6 +19,7 @@
 //! | REQ-4 transform unknown-label: ignore (all-neg_label row) | SHIPPED (#1239) | `transform` `if let Some(&idx) = class_to_idx.get`; sklearn `_label.py:556-559` |
 //! | REQ-5 transform single-class (k=1) → all-neg_label column | SHIPPED (#1240) | `transform` k==1 arm `Array2::from_elem`; sklearn `_label.py:532-538` |
 //! | REQ-6 inverse_transform binary STRICT threshold (`> (pos+neg)/2`) | SHIPPED (#1241) | `inverse_transform` k==2 branch; sklearn `_label.py:667` |
+//! | REQ-6b inverse_transform binary accepts 1-col AND 2-col indicator (dispatch on fitted type, not col count) | SHIPPED (#2340) | `inverse_transform` k==2 branch accepts `ncols ∈ {1,2}`, decodes `classes[last_col > threshold ? 1 : 0]` (2-col → `classes[y[:,1]]`, 1-col → `classes[y.ravel()]`); sklearn `_label.py:402-407`,`:647`,`:670-679` |
 //! | REQ-7 inverse_transform multiclass argmax | SHIPPED | `inverse_transform` else-branch; sklearn `_label.py:641` |
 //! | REQ-8 neg_label/pos_label ctor params + validation | SHIPPED (#1242) | `LabelBinarizer::with_neg_label`/`with_pos_label` + `Fit::fit` validation; `transform` neg/pos base+active; `inverse_transform` `(pos+neg)/2` threshold; consumer crate re-export `lib.rs`; sklearn `_label.py:263`,`:283-287`,`:579-583`,`:667` |
 //! | REQ-9 sparse_output CSR + constraint | NOT-STARTED (#1243) | sklearn `_label.py:563`,`:584-585`,`:289-294` |
@@ -164,46 +165,82 @@ impl FittedLabelBinarizer {
 
     /// Map a binary indicator matrix back to integer class labels.
     ///
-    /// For each row the class with the largest value (argmax) is chosen.
+    /// Dispatch follows sklearn's `LabelBinarizer.inverse_transform`, which
+    /// branches on the FITTED `y_type_` ("binary" vs "multiclass"), NOT on the
+    /// column count of `Y` (`sklearn/preprocessing/_label.py:402-407`). Here the
+    /// fitted type is "binary" iff exactly two classes were discovered
+    /// (`k == 2`):
+    ///
+    /// - **Multiclass** (`k != 2`): the class with the largest value (argmax)
+    ///   per row, mirroring `_inverse_binarize_multiclass`
+    ///   (`classes.take(Y.argmax(axis=1))`, `_label.py:641`). Requires exactly
+    ///   *K* columns.
+    /// - **Binary** (`k == 2`): `_inverse_binarize_thresholding` thresholds the
+    ///   indicator with a STRICT `y > threshold`
+    ///   (`threshold = (pos_label + neg_label) / 2`, `_label.py:399-400`,`:667`)
+    ///   then decodes (`_label.py:670-679`):
+    ///     - a **1-column** indicator → `classes[col0 > threshold ? 1 : 0]`
+    ///       (`classes[y.ravel()]`, `:679`);
+    ///     - a **2-column** indicator → `classes[col1 > threshold ? 1 : 0]`
+    ///       (`classes[y[:, 1]]`, `:673-674`): the SECOND column (after
+    ///       thresholding) selects the positive class; the first column is
+    ///       ignored. So `fit([10,20]).inverse_transform([[1,0],[0,1]])` →
+    ///       `[10, 20]` (verified vs the live sklearn 1.5.2 oracle).
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of columns does
-    /// not match the expected output width (1 for binary, *K* for multiclass).
+    /// Returns [`FerroError::ShapeMismatch`] if the number of columns does not
+    /// match an accepted width: a binary (`k == 2`) fitted binarizer accepts
+    /// BOTH 1 and 2 columns (`_label.py:647`,`:670-679`); otherwise exactly *K*
+    /// columns are required.
     pub fn inverse_transform(&self, y: &Array2<f64>) -> Result<Array1<usize>, FerroError> {
         let k = self.classes.len();
-        let expected_cols = if k == 2 { 1 } else { k };
-
-        if y.ncols() != expected_cols {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![y.nrows(), expected_cols],
-                actual: vec![y.nrows(), y.ncols()],
-                context: "FittedLabelBinarizer::inverse_transform".into(),
-            });
-        }
-
         let n = y.nrows();
         let mut result = Array1::zeros(n);
 
         if k == 2 {
-            // Single column: strict threshold at `(pos_label + neg_label) / 2`,
-            // matching sklearn `_inverse_binarize_thresholding` (`_label.py:667`):
-            // `y = np.array(y > threshold)` with default `threshold =
-            // (pos_label + neg_label) / 2` (`:399-400`). The comparison is STRICT,
-            // so an exact-threshold value maps to `classes[0]`. With the default
-            // `neg_label=0, pos_label=1` this reduces to `> 0.5`.
+            // Binary fitted type: sklearn dispatches to
+            // `_inverse_binarize_thresholding` on the fitted `y_type_ == "binary"`,
+            // which accepts EITHER a 1-column or a 2-column indicator and rejects
+            // wider ones (`_label.py:647`: `y.shape[1] > 2` raises; `:670-679`:
+            // 2-col → `classes[y[:, 1]]`, else `classes[y.ravel()]`).
+            let ncols = y.ncols();
+            if ncols != 1 && ncols != 2 {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![y.nrows(), 1],
+                    actual: vec![y.nrows(), ncols],
+                    context: "FittedLabelBinarizer::inverse_transform".into(),
+                });
+            }
+
+            // Strict threshold at `(pos_label + neg_label) / 2`, matching sklearn
+            // `_inverse_binarize_thresholding` (`_label.py:667`): `y = np.array(y >
+            // threshold)` with default `threshold = (pos_label + neg_label) / 2`
+            // (`:399-400`). STRICT, so an exact-threshold value maps to `classes[0]`.
+            // With the default `neg_label=0, pos_label=1` this reduces to `> 0.5`.
             // Cast EACH to f64 BEFORE the add: `i64 + i64` would overflow (and
             // panic in debug, R-CODE-2) for large-but-valid neg/pos like 2^62
             // (#2232). sklearn computes this in arbitrary-precision then /2.0.
             let threshold = (self.pos_label as f64 + self.neg_label as f64) / 2.0;
+            // The decisive column is the LAST one: `col1` for a 2-column indicator
+            // (`classes[y[:, 1]]`, `:673-674`, first column ignored) and `col0` for
+            // a 1-column indicator (`classes[y.ravel()]`, `:679`).
+            let decisive_col = ncols - 1;
             for i in 0..n {
-                result[i] = if y[[i, 0]] > threshold {
+                result[i] = if y[[i, decisive_col]] > threshold {
                     self.classes[1]
                 } else {
                     self.classes[0]
                 };
             }
         } else {
+            if y.ncols() != k {
+                return Err(FerroError::ShapeMismatch {
+                    expected: vec![y.nrows(), k],
+                    actual: vec![y.nrows(), y.ncols()],
+                    context: "FittedLabelBinarizer::inverse_transform".into(),
+                });
+            }
             // Multiclass: argmax per row
             for i in 0..n {
                 let row = y.row(i);

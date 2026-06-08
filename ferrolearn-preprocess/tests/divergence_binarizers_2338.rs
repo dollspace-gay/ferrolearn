@@ -10,7 +10,7 @@
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::label_binarizer::LabelBinarizer;
 use ferrolearn_preprocess::multi_label_binarizer::MultiLabelBinarizer;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Divergence: `MultiLabelBinarizer::fit` on an EMPTY label-set list diverges
 /// from `sklearn/preprocessing/_label.py:779` (`MultiLabelBinarizer.fit`):
@@ -29,7 +29,6 @@ use ndarray::{array, Array2};
 ///
 /// Tracking: #2339
 #[test]
-#[ignore = "divergence: MultiLabelBinarizer.fit([]) errors instead of empty classes_; tracking #2339"]
 fn divergence_mlb_empty_fit_succeeds() {
     let mlb = MultiLabelBinarizer::new();
     let y: Vec<Vec<usize>> = vec![];
@@ -66,7 +65,6 @@ fn divergence_mlb_empty_fit_succeeds() {
 ///
 /// Tracking: #2340
 #[test]
-#[ignore = "divergence: LabelBinarizer.inverse_transform rejects 2-col binary input; tracking #2340"]
 fn divergence_lb_binary_inverse_two_column() {
     let lb = LabelBinarizer::new();
     let fitted = lb.fit(&array![10_usize, 20], &()).unwrap();

@@ -20,7 +20,7 @@
 //! | REQ-7 arbitrary orderable+hashable labels + object dtype | NOT-STARTED (#1234) | sklearn `_label.py:788` (usize-only, R-DEV-3) |
 //! | REQ-8 optimized single-pass fit_transform | NOT-STARTED (#1235) | sklearn `_label.py:814-835` |
 //! | REQ-9 PyO3 binding | NOT-STARTED (#1236) | `ferrolearn-python/src/` (absent) |
-//! | REQ-1 edge: empty-`y` fit yields empty classes_ (no error) | NOT-STARTED (#1237) | sklearn `_label.py:779` |
+//! | REQ-1 edge: empty-`y` fit yields empty classes_ (no error) | SHIPPED (#2339) | `MultiLabelBinarizer::fit` (no empty-`y` rejection): empty `y` → `classes = []`; `transform([[]])` → `(1, 0)` `Array2`; sklearn `_label.py:779` |
 //!
 //! # Examples
 //!
@@ -152,22 +152,21 @@ impl Fit<Vec<Vec<usize>>, ()> for MultiLabelBinarizer {
 
     /// Fit the binarizer by discovering all unique labels.
     ///
+    /// An empty input (no samples) is accepted and yields an empty `classes_`,
+    /// mirroring sklearn `MultiLabelBinarizer.fit` where
+    /// `classes_ = sorted(set(itertools.chain.from_iterable(y)))` is the empty
+    /// set for `y == []` (`sklearn/preprocessing/_label.py:779`); sklearn raises
+    /// no error and a subsequent `transform([[]])` yields a `(1, 0)` matrix.
+    ///
     /// # Errors
     ///
-    /// Returns [`FerroError::InsufficientSamples`] if the input is empty.
+    /// This method does not return an error in the `usize` domain (kept as
+    /// `Result` for `Fit`-trait conformance and forward compatibility).
     fn fit(
         &self,
         y: &Vec<Vec<usize>>,
         _target: &(),
     ) -> Result<FittedMultiLabelBinarizer, FerroError> {
-        if y.is_empty() {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "MultiLabelBinarizer::fit".into(),
-            });
-        }
-
         let mut classes: Vec<usize> = y.iter().flatten().copied().collect();
         classes.sort_unstable();
         classes.dedup();
@@ -240,10 +239,22 @@ mod tests {
     }
 
     #[test]
-    fn test_fit_empty_input_error() {
+    fn test_fit_empty_input_yields_empty_classes() {
+        // sklearn 1.5.2: `MultiLabelBinarizer().fit([])` SUCCEEDS with
+        // `classes_ == []` (`sorted(set(chain.from_iterable([])))` is empty,
+        // `_label.py:779`), and `transform([[]])` is a `(1, 0)` matrix.
+        // Live oracle (from /tmp):
+        //   mlb = MultiLabelBinarizer().fit([]); mlb.classes_.tolist() -> []
+        //   mlb.transform([[]]).shape -> (1, 0)
         let mlb = MultiLabelBinarizer::new();
-        let y: Vec<Vec<usize>> = vec![];
-        assert!(mlb.fit(&y, &()).is_err());
+        let empty: Vec<Vec<usize>> = vec![];
+        let one_empty_sample = vec![vec![]];
+        let got = mlb.fit(&empty, &()).and_then(|fitted| {
+            fitted
+                .transform(&one_empty_sample)
+                .map(|m| m.shape().to_vec())
+        });
+        assert_eq!(got.ok(), Some(vec![1, 0]));
     }
 
     #[test]
