@@ -1608,3 +1608,53 @@ fn infrequent_max_categories_one_all_infrequent_vs_sklearn_oracle() {
         vec!["x0_infrequent_sklearn"]
     );
 }
+
+// ===========================================================================
+// REQ-7 (#1154): _parameter_constraints — min_frequency/max_categories >= 1.
+//
+// Live oracle (sklearn 1.5.2, sparse_output=False, run from /tmp):
+//   OneHotEncoder(min_frequency=0).fit(X) -> InvalidParameterError
+//     "The 'min_frequency' parameter ... must be ... in the range [1, inf)"
+//   OneHotEncoder(max_categories=0).fit(X) -> InvalidParameterError
+//   min_frequency=1 / max_categories=1 -> OK
+// (handle_unknown/drop are type-safe Rust enums -> their StrOptions
+//  constraints are compile-time, no runtime check.)
+// ===========================================================================
+#[test]
+fn req7_min_frequency_max_categories_must_be_at_least_one() {
+    use ferrolearn_core::traits::Fit;
+    use ferrolearn_preprocess::OneHotEncoder;
+    use ndarray::array;
+
+    let x = array![[1.0_f64], [1.0], [2.0], [2.0]];
+
+    // min_frequency=0 -> Err
+    assert!(
+        OneHotEncoder::<f64>::new()
+            .with_min_frequency(0)
+            .fit(&x, &())
+            .is_err(),
+        "min_frequency=0 must Err (sklearn Interval(Integral, 1, None))"
+    );
+    // max_categories=0 -> Err
+    assert!(
+        OneHotEncoder::<f64>::new()
+            .with_max_categories(0)
+            .fit(&x, &())
+            .is_err(),
+        "max_categories=0 must Err (sklearn Interval(Integral, 1, None))"
+    );
+    // min_frequency=1 and max_categories=1 -> OK
+    assert!(
+        OneHotEncoder::<f64>::new()
+            .with_min_frequency(1)
+            .fit(&x, &())
+            .is_ok()
+    );
+    assert!(
+        OneHotEncoder::<f64>::new()
+            .with_max_categories(1)
+            .fit(&x, &())
+            .is_ok()
+    );
+}
