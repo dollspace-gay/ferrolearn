@@ -29,7 +29,7 @@
 //! | REQ-7 (explicit categories param) | NOT-STARTED | open prereq blocker #1162. Always `'auto'` (`:1252`). |
 //! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
 //! | REQ-9 (inverse_transform) | SHIPPED | `FittedOrdinalEncoder::inverse_transform(&Array2<f64>) -> Array2<String>` reuses the SHIPPED `categories_` (REQ-1): each cell is an ordinal index into `categories[j]`, mirroring sklearn `X_tr[:, i] = self.categories_[i][labels]` (`_encoders.py:1595-1679`). Validates the index BEFORE lookup (no panic, R-CODE-2): an exact non-negative integer in `[0, len)` → `categories[j][index].clone()`; 0-row → `InsufficientSamples` (symmetry with the #2220 transform guard); ncols-mismatch → `ShapeMismatch` (sklearn `:1619`). FAITHFUL to numpy: mirrors `labels.astype("int64")` (truncate toward zero, Rust `as i64`) + numpy fancy indexing (negative WRAP, `-1.0` → last category, `-2.0` → `len-2`), raising only once the wrapped index leaves `[0, len)` (`_encoders.py:1664`,`:1679`). Non-finite (NaN/±inf) → `InvalidParameter` (sklearn IndexError/ValueError; guarded because Rust `f64 as i64` saturates NaN→0). Critic-verified vs live sklearn 1.5.2 oracle: `green_inverse_roundtrip_multifeature`, `green_inverse_held_out_valid_ordinals`, `green_inverse_negative_wraps_like_numpy` (`-1.0`→'dog', `-2.0`→'cat', `-3.0`→Err), `green_inverse_non_integer_truncates_like_numpy` (`1.5`→'dog', `0.7`→'cat'), `red_inverse_out_of_range_positive` (`9.0`→Err), `red_inverse_ncols_mismatch`, `red_inverse_zero_row`, `red_inverse_use_encoded_value_unknown_cell` (`tests/divergence_ordinal_encoder.rs`). SCOPE LIMITATION (R-HONEST-3): the `unknown_value`-cell → `None` inverse (sklearn `:1673`) is unrepresentable in `Array2<String>` (would need `Array2<Option<String>>`), so a `use_encoded_value` cell equal to `unknown_value` ERRORS (checked BEFORE the index logic so the sentinel is not silently wrapped) instead of yielding `None`; the default `Error`-mode encoder has only valid ordinals so its inverse is COMPLETE and bit-exact. Consumer: crate re-export `lib.rs:142`. |
-//! | REQ-10 (get_feature_names_out + n_features_in_) | NOT-STARTED | open prereq blocker #1165. Only `n_features()`. |
+//! | REQ-10 (get_feature_names_out + n_features_in_) | SHIPPED | `FittedOrdinalEncoder::n_features_in()` (= `n_features()`, sklearn `n_features_in_`) + `get_feature_names_out(input_features)` — `OneToOneFeatureMixin` (one output col per input col) returns the INPUT names unchanged: `None` -> `["x0","x1",..]` (`_check_feature_names_in`), `Some(names)` -> verbatim, a wrong-length `input_features` -> `ShapeMismatch` (sklearn ValueError). Live-oracle test `req10_feature_names_out_and_n_features_in` (`['x0','x1']`, `['a','b']`, wrong-length Err). feature_names_in_ (string input-name capture) stays NOT-STARTED (ferrolearn fit takes positional columns, no input names). Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-11 (full ctor + _parameter_constraints) | NOT-STARTED | open prereq blocker #1166. `new()` takes no params (`:1320-1386`). |
 //! | REQ-12 (PyO3 binding) | NOT-STARTED | open prereq blocker #1167. No `ferrolearn-python` registration (R-DEFER-1). |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1168. `ndarray`+`HashMap`, not `ferray-core` (R-SUBSTRATE-1/2). |
@@ -193,6 +193,53 @@ impl FittedOrdinalEncoder {
     #[must_use]
     pub fn n_features(&self) -> usize {
         self.categories.len()
+    }
+
+    /// Return the number of features seen during `fit`.
+    ///
+    /// Mirrors scikit-learn's `n_features_in_` attribute (set by `_validate_data`
+    /// at fit, `sklearn/base.py`). Equal to [`n_features`](Self::n_features); the
+    /// distinct name matches sklearn's fitted-attribute surface (REQ-10).
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.categories.len()
+    }
+
+    /// Return the output feature names, one per input feature.
+    ///
+    /// `OrdinalEncoder` is a `OneToOneFeatureMixin` (one output column per input
+    /// column), so `get_feature_names_out` returns the INPUT feature names
+    /// unchanged (`sklearn/utils/_set_output` / `OneToOneFeatureMixin.
+    /// get_feature_names_out`): with `input_features = None` the default names
+    /// `["x0", "x1", ...]` (`_check_feature_names_in`), otherwise the supplied
+    /// names verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] if `input_features` is `Some` but its
+    /// length differs from [`n_features_in`](Self::n_features_in) (sklearn raises
+    /// `ValueError("input_features should have length equal to number of features
+    /// ...")`).
+    pub fn get_feature_names_out(
+        &self,
+        input_features: Option<&[String]>,
+    ) -> Result<Vec<String>, FerroError> {
+        let n = self.categories.len();
+        match input_features {
+            None => Ok((0..n).map(|j| format!("x{j}")).collect()),
+            Some(names) => {
+                if names.len() != n {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n],
+                        actual: vec![names.len()],
+                        context: "FittedOrdinalEncoder::get_feature_names_out (input_features \
+                                  length must equal n_features_in_)"
+                            .into(),
+                    });
+                }
+                Ok(names.to_vec())
+            }
+        }
     }
 
     /// Return the configured unknown-category strategy.

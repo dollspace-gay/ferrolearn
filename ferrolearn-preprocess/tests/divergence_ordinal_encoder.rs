@@ -773,3 +773,41 @@ fn red_inverse_use_encoded_value_unknown_cell() {
         "use_encoded_value cell -> sklearn [[None,'x']]; ferrolearn errors (Array2<String> can't hold None)"
     );
 }
+
+// ===========================================================================
+// REQ-10 (#1165): get_feature_names_out (OneToOneFeatureMixin) + n_features_in_.
+//
+// Live oracle (sklearn 1.5.2, run from /tmp):
+//   e = OrdinalEncoder().fit([['cat','x'],['dog','y']])
+//   e.n_features_in_                    -> 2
+//   e.get_feature_names_out().tolist()  -> ['x0', 'x1']
+//   e.get_feature_names_out(['a','b'])  -> ['a', 'b']
+// ===========================================================================
+#[test]
+fn req10_feature_names_out_and_n_features_in() {
+    use ferrolearn_core::traits::Fit;
+    use ferrolearn_preprocess::OrdinalEncoder;
+    use ndarray::array;
+
+    let x = array![
+        ["cat".to_string(), "x".to_string()],
+        ["dog".to_string(), "y".to_string()]
+    ];
+    let fitted = OrdinalEncoder::new().fit(&x, &()).unwrap();
+
+    // n_features_in_ == 2
+    assert_eq!(fitted.n_features_in(), 2);
+
+    // default input_features=None -> ['x0','x1']
+    let names = fitted.get_feature_names_out(None).unwrap();
+    assert_eq!(names, vec!["x0".to_string(), "x1".to_string()]);
+
+    // explicit input_features -> returned verbatim (one-to-one)
+    let custom = vec!["a".to_string(), "b".to_string()];
+    let named = fitted.get_feature_names_out(Some(&custom)).unwrap();
+    assert_eq!(named, custom);
+
+    // wrong-length input_features -> Err (sklearn ValueError)
+    let bad = vec!["only_one".to_string()];
+    assert!(fitted.get_feature_names_out(Some(&bad)).is_err());
+}
