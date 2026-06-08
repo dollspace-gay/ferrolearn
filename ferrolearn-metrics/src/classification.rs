@@ -142,6 +142,39 @@ fn safe_div(numerator: f64, denominator: f64) -> f64 {
     }
 }
 
+/// Resolve the `Average::Binary` positive-class index in the sorted `classes`.
+///
+/// scikit-learn 1.5.2 reports the class whose LABEL VALUE equals `pos_label`
+/// (default `pos_label=1`), NOT the index-1 (larger) class
+/// (`sklearn/metrics/_classification.py:757` default `pos_label=1`;
+/// `:1573` `labels = [pos_label]`). For labels `{0, 1}` this is index 1
+/// (unchanged); for `{1, 2}` it is index 0.
+///
+/// Mirrors `_classification.py:1567-1572`: if `pos_label` (1) is not present in
+/// a binary label set, sklearn raises `ValueError`; we return
+/// [`FerroError::InvalidParameter`].
+fn binary_pos_index(classes: &[usize], context: &str) -> Result<usize, FerroError> {
+    const POS_LABEL: usize = 1;
+    if classes.len() != 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "average".into(),
+            reason: format!(
+                "{context}: Average::Binary requires exactly 2 classes, found {}",
+                classes.len()
+            ),
+        });
+    }
+    classes
+        .iter()
+        .position(|&c| c == POS_LABEL)
+        .ok_or_else(|| FerroError::InvalidParameter {
+            name: "pos_label".into(),
+            reason: format!(
+                "{context}: pos_label={POS_LABEL} is not a valid label. It should be one of {classes:?}"
+            ),
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -1004,17 +1037,8 @@ fn aggregate_metric(
 ) -> Result<f64, FerroError> {
     match average {
         Average::Binary => {
-            if classes.len() != 2 {
-                return Err(FerroError::InvalidParameter {
-                    name: "average".into(),
-                    reason: format!(
-                        "{context}: Average::Binary requires exactly 2 classes, found {}",
-                        classes.len()
-                    ),
-                });
-            }
-            // Positive class is the larger of the two (index 1).
-            Ok(safe_div(tp[1] as f64, (tp[1] + fp[1]) as f64))
+            let i = binary_pos_index(classes, context)?;
+            Ok(safe_div(tp[i] as f64, (tp[i] + fp[i]) as f64))
         }
         Average::Macro => {
             let sum: f64 = tp
@@ -1054,16 +1078,8 @@ fn aggregate_recall(
 ) -> Result<f64, FerroError> {
     match average {
         Average::Binary => {
-            if classes.len() != 2 {
-                return Err(FerroError::InvalidParameter {
-                    name: "average".into(),
-                    reason: format!(
-                        "{context}: Average::Binary requires exactly 2 classes, found {}",
-                        classes.len()
-                    ),
-                });
-            }
-            Ok(safe_div(tp[1] as f64, (tp[1] + fn_count[1]) as f64))
+            let i = binary_pos_index(classes, context)?;
+            Ok(safe_div(tp[i] as f64, (tp[i] + fn_count[i]) as f64))
         }
         Average::Macro => {
             let sum: f64 = tp
@@ -1103,17 +1119,9 @@ fn aggregate_f1(
 ) -> Result<f64, FerroError> {
     match average {
         Average::Binary => {
-            if classes.len() != 2 {
-                return Err(FerroError::InvalidParameter {
-                    name: "average".into(),
-                    reason: format!(
-                        "{context}: Average::Binary requires exactly 2 classes, found {}",
-                        classes.len()
-                    ),
-                });
-            }
-            let prec = safe_div(tp[1] as f64, (tp[1] + fp[1]) as f64);
-            let rec = safe_div(tp[1] as f64, (tp[1] + fn_count[1]) as f64);
+            let i = binary_pos_index(classes, context)?;
+            let prec = safe_div(tp[i] as f64, (tp[i] + fp[i]) as f64);
+            let rec = safe_div(tp[i] as f64, (tp[i] + fn_count[i]) as f64);
             Ok(safe_div(2.0 * prec * rec, prec + rec))
         }
         Average::Macro => {
@@ -1633,16 +1641,8 @@ pub fn jaccard_score(
         .collect();
     match average {
         Average::Binary => {
-            if classes.len() != 2 {
-                return Err(FerroError::InvalidParameter {
-                    name: "average".into(),
-                    reason: format!(
-                        "jaccard_score: Average::Binary requires exactly 2 classes, found {}",
-                        classes.len()
-                    ),
-                });
-            }
-            Ok(per_class[1])
+            let i = binary_pos_index(&classes, "jaccard_score")?;
+            Ok(per_class[i])
         }
         Average::Macro => Ok(per_class.iter().sum::<f64>() / classes.len() as f64),
         Average::Micro => {

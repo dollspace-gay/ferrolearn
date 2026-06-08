@@ -47,7 +47,6 @@ fn lab(v: &[usize]) -> Array1<usize> {
 /// ferrolearn (label 2): TP=2, FP=2 -> 0.5.
 /// Tracking: #2292
 #[test]
-#[ignore = "divergence: Average::Binary uses index-1 not pos_label=1; tracking #2292"]
 fn divergence_precision_binary_nonzero_labels() {
     const SK_PRECISION: f64 = 1.0;
     let yt = lab(&[1, 1, 1, 2, 2]);
@@ -71,7 +70,6 @@ fn divergence_precision_binary_nonzero_labels() {
 /// sklearn (label 1): TP=1, FN=2 -> 1/3. ferrolearn (label 2): TP=2, FN=0 -> 1.0.
 /// Tracking: #2292
 #[test]
-#[ignore = "divergence: Average::Binary uses index-1 not pos_label=1; tracking #2292"]
 fn divergence_recall_binary_nonzero_labels() {
     const SK_RECALL: f64 = 1.0 / 3.0;
     let yt = lab(&[1, 1, 1, 2, 2]);
@@ -96,7 +94,6 @@ fn divergence_recall_binary_nonzero_labels() {
 /// ferrolearn (label 2): prec=0.5, rec=1.0 -> f1=2/3.
 /// Tracking: #2292
 #[test]
-#[ignore = "divergence: Average::Binary uses index-1 not pos_label=1; tracking #2292"]
 fn divergence_f1_binary_nonzero_labels() {
     const SK_F1: f64 = 0.5;
     let yt = lab(&[1, 1, 1, 2, 2]);
@@ -121,7 +118,6 @@ fn divergence_f1_binary_nonzero_labels() {
 /// ferrolearn (label 2): prec=0.5, rec=1.0 -> F2 = 0.8333.
 /// Tracking: #2292
 #[test]
-#[ignore = "divergence: Average::Binary uses index-1 not pos_label=1; tracking #2292"]
 fn divergence_fbeta_binary_nonzero_labels() {
     const SK_FBETA2: f64 = 0.384_615_384_615_384_64;
     let yt = lab(&[1, 1, 1, 2, 2]);
@@ -146,7 +142,6 @@ fn divergence_fbeta_binary_nonzero_labels() {
 /// ferrolearn (label 2): TP=2, FP=2, FN=0 -> 0.5.
 /// Tracking: #2292
 #[test]
-#[ignore = "divergence: Average::Binary uses index-1 not pos_label=1; tracking #2292"]
 fn divergence_jaccard_binary_nonzero_labels() {
     const SK_JACCARD: f64 = 1.0 / 3.0;
     let yt = lab(&[1, 1, 1, 2, 2]);
