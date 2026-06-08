@@ -59,7 +59,7 @@
 //! | REQ-3 | SVD-EM algorithm = sklearn `lapack` (incl. one-sided convergence) | SHIPPED | `fit` mirrors `_factor_analysis.py:250-311`; faer thin SVD dispatched f64/f32 via `factor_analysis_svd` (TypeId, mirrors `pca.rs::eigen_dispatch`) |
 //! | REQ-4 | Structural: shapes, ψ>0, mean, n_iter≥1, finite ll, determinism | SHIPPED | in-module `test_fa_*` (17/17) + divergence green-guards; deterministic algorithm |
 //! | REQ-5 | `inverse_transform` structural round-trip | SHIPPED | `Z @ Wᵀ + mean` (transposed layout); col-mismatch `ShapeMismatch`; `green_inverse_transform_*` |
-//! | REQ-6 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch) | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, allows n_components 0/None, doesn't pre-reject n_samples<2 |
+//! | REQ-6 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, allows n_components 0/None, doesn't pre-reject n_samples<2. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`factor_analysis.rs` symbol `reject_non_finite`) BEFORE the SVD/projection, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_factor_analysis.py:222`/`:332`,`utils/validation.py:147-154`) — replaces the incidental faer `NoConvergence` `NumericalInstability` (R-DEV-2). `tests/divergence_nonfinite.rs::divergence_factor_analysis_fit_nan_`/`_transform_nan_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: FactorAnalysis `fit`/`transform` + re-export `lib.rs` |
 //! | REQ-7 | `PipelineTransformer` integration | SHIPPED | `fit_pipeline`/`transform_pipeline`; `test_fa_pipeline_transformer` |
 //! | REQ-8 | PyO3 `_RsFactorAnalysis` binding (scoped: fit/transform, scores up to sign) | SHIPPED | `extras.rs:1137`, registered `lib.rs:78`; f64-only, NO noise_variance_/loglike_/score getters |
 //! | REQ-9 | `svd_method='randomized'` + `iterated_power` RNG path | NOT-STARTED | sklearn `_factor_analysis.py:266-276`; ferrolearn lapack-only — blocker #1529 |
@@ -82,6 +82,26 @@ use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::any::TypeId;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `FactorAnalysis.fit`/`transform` (`_factor_analysis.py:222`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the SVD/EM iteration. This
+/// fires before the SVD, so the clean finiteness error replaces the incidental
+/// `NumericalInstability` (faer `NoConvergence`) the SVD would otherwise raise
+/// on non-finite input (R-DEV-2). NaN AND infinity both rejected. The message
+/// names "NaN" and "infinity" to mirror sklearn. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // FactorAnalysis (unfitted)
@@ -421,6 +441,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FactorAnalysis<F> 
             });
         }
 
+        // Finiteness: sklearn `FactorAnalysis.fit` runs `_validate_data`
+        // (`_factor_analysis.py:222`) with the default `force_all_finite=True`,
+        // raising `ValueError("Input X contains NaN."/"...infinity...")`
+        // (`utils/validation.py:147-154`) BEFORE the SVD/EM iteration. This
+        // fires before the SVD, so the clean finiteness error replaces the
+        // incidental `NumericalInstability` (faer `NoConvergence`) the SVD would
+        // otherwise raise (R-DEV-2). NaN AND infinity both rejected (#2288).
+        reject_non_finite(x)?;
+
         let k = self.n_components;
         let p = n_features;
         let n_f = F::from(n_samples).unwrap();
@@ -579,6 +608,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFactorAnal
                 context: "FittedFactorAnalysis::transform".into(),
             });
         }
+        // Finiteness on the query X: sklearn `FactorAnalysis.transform` runs
+        // `_validate_data(..., reset=False)` (`_factor_analysis.py:332`),
+        // `force_all_finite=True` raising a `ValueError` BEFORE the projection
+        // (`utils/validation.py:147-154`). NaN AND infinity both rejected (#2289).
+        reject_non_finite(x)?;
         let (n_samples, _) = x.dim();
         let k = self.components.ncols();
 

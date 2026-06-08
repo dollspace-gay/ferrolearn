@@ -35,7 +35,7 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_decomp::{FactorAnalysis, FastICA, KernelPCA, NMF, PCA, TruncatedSVD};
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 fn x_finite() -> Array2<f64> {
     array![
@@ -73,7 +73,10 @@ fn rejects_for_nonfinite<T>(r: &Result<T, FerroError>) -> bool {
         Ok(_) => false,
         Err(e) => {
             let m = format!("{e}").to_lowercase();
-            m.contains("nan") || m.contains("infinit") || m.contains("non-finite") || m.contains("finite")
+            m.contains("nan")
+                || m.contains("infinit")
+                || m.contains("non-finite")
+                || m.contains("finite")
         }
     }
 }
@@ -83,16 +86,16 @@ fn rejects_for_nonfinite<T>(r: &Result<T, FerroError>) -> bool {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_pca_fit_nan_rejects_for_finiteness() {
     // sklearn: PCA().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_pca.py:511`). ferrolearn: incidental NumericalInstability from gesdd,
     // not a finiteness rejection.
-    assert!(rejects_for_nonfinite(&PCA::<f64>::new(1).fit(&x_nan(), &())));
+    assert!(rejects_for_nonfinite(
+        &PCA::<f64>::new(1).fit(&x_nan(), &())
+    ));
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_truncated_svd_fit_nan_rejects_for_finiteness() {
     // sklearn: TruncatedSVD().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_truncated_svd.py:228`). ferrolearn: Ok(silent garbage).
@@ -102,7 +105,6 @@ fn divergence_truncated_svd_fit_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_nmf_fit_nan_rejects_for_finiteness() {
     // sklearn: NMF().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_nmf.py:1652`). ferrolearn: Ok(silent garbage). Non-negative input.
@@ -111,7 +113,6 @@ fn divergence_nmf_fit_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: NMF accepts NaN+negative; sklearn raises finiteness ValueError BEFORE non-negative check; tracking #2288"]
 fn divergence_nmf_fit_nan_and_negative_finiteness_fires_first() {
     // sklearn: NMF with a NaN AND a negative entry -> ValueError("Input X
     // contains NaN.") — `_validate_data` (`_nmf.py:1652`) runs BEFORE
@@ -124,7 +125,6 @@ fn divergence_nmf_fit_nan_and_negative_finiteness_fires_first() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_fast_ica_fit_nan_rejects_for_finiteness() {
     // sklearn: FastICA().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_fastica.py:564`). ferrolearn: Ok(silent garbage).
@@ -134,7 +134,6 @@ fn divergence_fast_ica_fit_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_kernel_pca_fit_nan_rejects_for_finiteness() {
     // sklearn: KernelPCA().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_kernel_pca.py:438`). ferrolearn: Ok(silent garbage).
@@ -144,7 +143,6 @@ fn divergence_kernel_pca_fit_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts NaN; sklearn raises ValueError 'Input X contains NaN.'; tracking #2288"]
 fn divergence_factor_analysis_fit_nan_rejects_for_finiteness() {
     // sklearn: FactorAnalysis().fit(X_nan) -> ValueError("Input X contains NaN.")
     // (`_factor_analysis.py:222`). ferrolearn: incidental NumericalInstability
@@ -159,7 +157,6 @@ fn divergence_factor_analysis_fit_nan_rejects_for_finiteness() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "divergence: decomp fit accepts +Inf; sklearn raises ValueError 'Input X contains infinity ...'; tracking #2288"]
 fn divergence_truncated_svd_fit_inf_rejects_for_finiteness() {
     assert!(rejects_for_nonfinite(
         &TruncatedSVD::<f64>::new(1).fit(&x_inf(), &())
@@ -167,7 +164,6 @@ fn divergence_truncated_svd_fit_inf_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts +Inf; sklearn raises ValueError 'Input X contains infinity ...'; tracking #2288"]
 fn divergence_fast_ica_fit_inf_rejects_for_finiteness() {
     assert!(rejects_for_nonfinite(
         &FastICA::<f64>::new(1).fit(&x_inf(), &())
@@ -175,7 +171,6 @@ fn divergence_fast_ica_fit_inf_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: decomp fit accepts +Inf; sklearn raises ValueError 'Input X contains infinity ...'; tracking #2288"]
 fn divergence_kernel_pca_fit_inf_rejects_for_finiteness() {
     assert!(rejects_for_nonfinite(
         &KernelPCA::<f64>::new(1).fit(&x_inf(), &())
@@ -183,11 +178,12 @@ fn divergence_kernel_pca_fit_inf_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: PCA fit raises wrong error type on +Inf; sklearn raises finiteness ValueError not an SVD NumericalInstability; tracking #2288"]
 fn divergence_pca_fit_inf_rejects_for_finiteness() {
     // sklearn: ValueError("Input X contains infinity ..."). ferrolearn: incidental
     // gesdd NumericalInstability — wrong error type (R-DEV-2).
-    assert!(rejects_for_nonfinite(&PCA::<f64>::new(1).fit(&x_inf(), &())));
+    assert!(rejects_for_nonfinite(
+        &PCA::<f64>::new(1).fit(&x_inf(), &())
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -195,7 +191,6 @@ fn divergence_pca_fit_inf_rejects_for_finiteness() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "divergence: PCA transform accepts NaN query; sklearn raises ValueError 'Input X contains NaN.'; tracking #2289"]
 fn divergence_pca_transform_nan_rejects_for_finiteness() {
     // sklearn: PCA().fit(Xf).transform(X_nan) -> ValueError (`_pca.py:824`,
     // _validate_data reset=False). ferrolearn: Ok(non-finite garbage).
@@ -205,7 +200,6 @@ fn divergence_pca_transform_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: TruncatedSVD transform accepts NaN query; sklearn raises ValueError; tracking #2289"]
 fn divergence_truncated_svd_transform_nan_rejects_for_finiteness() {
     // sklearn: `_truncated_svd.py:294`. ferrolearn: Ok(non-finite garbage).
     let f = TruncatedSVD::<f64>::new(1).fit(&x_finite(), &()).unwrap();
@@ -214,7 +208,6 @@ fn divergence_truncated_svd_transform_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: FactorAnalysis transform accepts NaN query; sklearn raises ValueError; tracking #2289"]
 fn divergence_factor_analysis_transform_nan_rejects_for_finiteness() {
     // sklearn: `_factor_analysis.py:332`. ferrolearn: Ok(non-finite garbage).
     let f = FactorAnalysis::<f64>::new(1).fit(&x_finite(), &()).unwrap();
@@ -223,7 +216,6 @@ fn divergence_factor_analysis_transform_nan_rejects_for_finiteness() {
 }
 
 #[test]
-#[ignore = "divergence: KernelPCA transform accepts NaN query; sklearn raises ValueError; tracking #2289"]
 fn divergence_kernel_pca_transform_nan_rejects_for_finiteness() {
     // sklearn: `_kernel_pca.py:499`. ferrolearn: Ok(non-finite garbage).
     let f = KernelPCA::<f64>::new(1).fit(&x_finite(), &()).unwrap();

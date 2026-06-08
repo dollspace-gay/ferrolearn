@@ -61,7 +61,7 @@
 //! | REQ-8 | NO centering (vs PCA) | SHIPPED | `test_truncated_svd_no_centering` |
 //! | REQ-9 | `explained_variance_ratio_` sums ≤ 1 (centered denom) | SHIPPED | verified over 200 fixtures; `test_truncated_svd_explained_variance_ratio_le_1` |
 //! | REQ-10 | `transform`/`inverse_transform` shape + algebra | SHIPPED | `X @ components.T` / `X @ components`; shape tests |
-//! | REQ-11 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards. FLAG: sklearn raises `ValueError`, rejects only `>n_features` (randomized), requires `ensure_min_features=2` |
+//! | REQ-11 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards. FLAG: sklearn raises `ValueError`, rejects only `>n_features` (randomized), requires `ensure_min_features=2`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`truncated_svd.rs` symbol `reject_non_finite`) BEFORE the SVD/projection, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_truncated_svd.py:228`/`:294`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_truncated_svd_fit_nan_`/`_fit_inf_`/`_transform_nan_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: `_RsTruncatedSVD` `fit`/`transform` (`extras.rs`) |
 //! | REQ-12 | f32/f64 generic | SHIPPED | `test_truncated_svd_f32` |
 //! | REQ-13 | `random_state` determinism (scoped, not bit-exact-vs-sklearn) | SHIPPED | `test_truncated_svd_random_state_reproducibility` |
 //! | REQ-14 | `PipelineTransformer` integration | SHIPPED | `test_truncated_svd_pipeline_integration` |
@@ -79,6 +79,25 @@ use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `TruncatedSVD.fit`/`transform`, raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the randomized SVD. The
+/// estimator has no missing-value support, so NaN AND infinity are both
+/// rejected. The message names "NaN" and "infinity" to mirror sklearn's
+/// `ValueError`. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // TruncatedSVD (unfitted)
@@ -577,6 +596,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for TruncatedSVD<F> {
             });
         }
 
+        // Finiteness: sklearn `TruncatedSVD.fit` runs `_validate_data`
+        // (`_truncated_svd.py:228`) with the default `force_all_finite=True`,
+        // raising `ValueError("Input X contains NaN."/"...infinity...")`
+        // (`utils/validation.py:147-154`) BEFORE the randomized SVD. NaN AND
+        // infinity both rejected — replaces the prior silent-garbage Ok (#2288).
+        reject_non_finite(x)?;
+
         let oversampling = 10usize.min(n_features.saturating_sub(self.n_components));
         let n_random = self.n_components + oversampling;
         let n_random = n_random.min(n_features);
@@ -720,6 +746,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedTruncatedS
                 context: "FittedTruncatedSVD::transform".into(),
             });
         }
+        // Finiteness on the query X: sklearn `TruncatedSVD.transform` runs
+        // `_validate_data(..., reset=False)` (`_truncated_svd.py:294`),
+        // `force_all_finite=True` raising a `ValueError` BEFORE the projection
+        // (`utils/validation.py:147-154`). NaN AND infinity both rejected (#2289).
+        reject_non_finite(x)?;
         Ok(x.dot(&self.components_.t()))
     }
 }

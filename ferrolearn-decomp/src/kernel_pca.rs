@@ -63,7 +63,7 @@
 //! | REQ-7 | embedding shape + `1/sqrt(eigval)` scaling | SHIPPED | `alphas = eigvec/sqrt(eigval)` (`:511-520`); shape tests |
 //! | REQ-8 | transform of NEW data (train-kernel centering) | SHIPPED | `transform` (`:550`); `test_kernel_pca_transform_new_data` |
 //! | REQ-9 | auto-gamma `1/n_features` | SHIPPED | `effective_gamma = gamma or 1/n_features` (`:465`); `test_kernel_pca_auto_gamma` |
-//! | REQ-10 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform` guards (n_components 0/>n_samples, n_samples<2, feature mismatch) |
+//! | REQ-10 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards (n_components 0/>n_samples, n_samples<2, feature mismatch). NON-FINITE: `fit`+`transform` call `reject_non_finite` (`kernel_pca.rs` symbol `reject_non_finite`) BEFORE the kernel matrix/projection, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_kernel_pca.py:438`/`:499`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_kernel_pca_fit_nan_`/`_fit_inf_`/`_transform_nan_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: KernelPCA `fit`/`transform` + re-export `lib.rs` |
 //! | REQ-11 | f32/f64 generic | SHIPPED | `test_kernel_pca_f32` |
 //! | REQ-12 | `eigen_solver` arpack/randomized + tol/max_iter/iterated_power/random_state | NOT-STARTED | sklearn `_kernel_pca.py:340-366`; ferrolearn dense Jacobi only — blocker #1564 |
 //! | REQ-13 | `remove_zero_eig` | NOT-STARTED | sklearn `_kernel_pca.py:381-383` — blocker #1565 |
@@ -80,6 +80,25 @@ use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `KernelPCA.fit`/`transform` (`_kernel_pca.py:438`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the kernel matrix /
+/// eigendecomposition. KernelPCA has no missing-value support, so NaN AND
+/// infinity are both rejected. The message names "NaN" and "infinity" to
+/// mirror sklearn. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Kernel type
@@ -496,6 +515,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KernelPCA<F> {
             });
         }
 
+        // Finiteness: sklearn `KernelPCA.fit` runs `_validate_data`
+        // (`_kernel_pca.py:438`) with the default `force_all_finite=True`,
+        // raising `ValueError("Input X contains NaN."/"...infinity...")`
+        // (`utils/validation.py:147-154`) BEFORE the kernel matrix /
+        // eigendecomposition. NaN AND infinity both rejected — replaces the
+        // prior silent-garbage `Ok` (#2288).
+        reject_non_finite(x)?;
+
         // Determine effective gamma.
         let effective_gamma = self.gamma.unwrap_or(1.0 / n_features as f64);
 
@@ -615,6 +642,13 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKernelPCA<
                 context: "FittedKernelPCA::transform".into(),
             });
         }
+
+        // Finiteness on the query X: sklearn `KernelPCA.transform` runs
+        // `_validate_data(..., reset=False)` (`_kernel_pca.py:499`),
+        // `force_all_finite=True` raising a `ValueError` BEFORE the kernel
+        // projection (`utils/validation.py:147-154`). NaN AND infinity both
+        // rejected (#2289).
+        reject_non_finite(x)?;
 
         let n_test = x.nrows();
         let n_train = self.x_fit_.nrows();

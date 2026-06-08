@@ -60,7 +60,7 @@
 //! |---|---|---|---|
 //! | REQ-1 | Structural: whitening + 3 nonlinearities (LogCosh/Exp/Cube) × 2 algorithms (Parallel/Deflation) recover finite sources `(n_samples,n_components)`, n_iter≥1, determinism, g(0)=0, + ICA source-recovery up to perm+sign+scale + whitening→identity covariance | SHIPPED (scoped) | `fit` (`fast_ica.rs:452`); green-guards `ica_correctness_recovers_known_sources` (abs-corr > 0.9), `whitening_produces_identity_covariance` + in-module tests. STRUCTURAL only, NOT exact values (REQ-4) |
 //! | REQ-2 | Fitted-attr shapes (components k×k, mixing n_features×k, mean) | SHIPPED | accessors `:205-229`; `fitted_attribute_shapes` |
-//! | REQ-3 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform feature mismatch) | SHIPPED (scoped) | `fit`/`transform` guards (`:455-476`,`:687`) |
+//! | REQ-3 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform feature mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`fast_ica.rs` symbol `reject_non_finite`) BEFORE whitening/the unmixing, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_fastica.py:564`/`:756`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_fast_ica_fit_nan_`/`_fit_inf_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: FastICA `fit`/`transform` + re-export `lib.rs` |
 //! | REQ-4 | EXACT `components`/source value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Xoshiro vs numpy RNG `w_init` + covariance-eigh vs SVD-default whitening + ICA perm/sign/scale identifiability — blocker #1572 |
 //! | REQ-5 | `components_ = W@K` attribute semantics | NOT-STARTED | ferrolearn `components()` returns `W` (k×k) + `whitening` (K) separately; sklearn `components_=W@K` (k×n_features, `_fastica.py:683`) — transform output matches — blocker #1573 |
 //! | REQ-6 | `mixing_ = pinv(components_)` | NOT-STARTED | ferrolearn `Kᵀ·Wᵀ` (`:657`) vs sklearn `pinv(components_)` (`_fastica.py:689`) — blocker #1574 |
@@ -83,6 +83,25 @@ use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, StandardNormal};
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `FastICA.fit`/`transform` (`_fastica.py:564`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE the whitening/ICA iteration.
+/// FastICA has no missing-value support, so NaN AND infinity are both rejected.
+/// The message names "NaN" and "infinity" to mirror sklearn. Never panics
+/// (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Configuration enums
@@ -507,6 +526,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FastICA<F> {
             });
         }
 
+        // Finiteness: sklearn `FastICA.fit` runs `_validate_data`
+        // (`_fastica.py:564`) with the default `force_all_finite=True`, raising
+        // `ValueError("Input X contains NaN."/"...infinity...")`
+        // (`utils/validation.py:147-154`) BEFORE whitening/the ICA iteration.
+        // NaN AND infinity both rejected — replaces the prior silent-garbage
+        // `Ok` (#2288).
+        reject_non_finite(x)?;
+
         let k = self.n_components;
         let n_f = F::from(n_samples).unwrap();
 
@@ -723,6 +750,11 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFastICA<F>
                 context: "FittedFastICA::transform".into(),
             });
         }
+        // Finiteness on the query X: sklearn `FastICA.transform` runs
+        // `_validate_data(..., reset=False)` (`_fastica.py:756`),
+        // `force_all_finite=True` raising a `ValueError` BEFORE the unmixing
+        // (`utils/validation.py:147-154`). NaN AND infinity both rejected (#2289).
+        reject_non_finite(x)?;
         // Centre.
         let mut xc = x.to_owned();
         for mut row in xc.rows_mut() {

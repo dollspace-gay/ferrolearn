@@ -63,7 +63,7 @@
 //! | REQ-4 | `explained_variance_` ordering/non-negativity + `explained_variance_ratio_` (÷ sum of ALL eigenvalues = sklearn `total_var`) | SHIPPED | matches sklearn element-wise to 1e-6 (critic green-guards); `test_pca_explained_variance_*`, `test_pca_n_components_equals_n_features` |
 //! | REQ-5 | `singular_values_` = `sqrt(eigval·(n−1))` ≥ 0 | SHIPPED | matches sklearn to 1e-6 (green-guard); `test_pca_singular_values_positive` |
 //! | REQ-6 | `inverse_transform` round-trip exact when `n_components == n_features` | SHIPPED | `test_pca_inverse_transform_roundtrip`/`_approx` + green-guard (sign-invariant) |
-//! | REQ-7 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch) | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards; FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None` |
+//! | REQ-7 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform/inverse_transform col mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform`/`inverse_transform` guards; FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`pca.rs` symbol `reject_non_finite`) BEFORE the SVD/projection, returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_pca.py:511`,`utils/validation.py:147-154`) — replaces the incidental gesdd `NumericalInstability` (R-DEV-2). `tests/divergence_nonfinite.rs::divergence_pca_fit_nan_rejects_for_finiteness`/`_fit_inf_`/`_transform_nan_` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: `_RsPCA` `fit`/`transform` (`transformers.rs`) |
 //! | REQ-8 | f32 generic support | SHIPPED | `test_pca_f32`; faer f32 eigensolver path |
 //! | REQ-9 | `PipelineTransformer` integration | SHIPPED | `pca.rs:509-536`; `test_pca_pipeline_integration` |
 //! | REQ-10 | PyO3 `_RsPCA` binding (fit/transform/inverse_transform + components_/explained_variance_/explained_variance_ratio_/mean_/singular_values_ getters) | SHIPPED | `transformers.rs:89`, registered `lib.rs:23`; inherits REQ-1's deterministic signs |
@@ -86,6 +86,25 @@ use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::any::TypeId;
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of every decomposition `fit`/`transform`, raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE any decomposition math. PCA
+/// has no missing-value support, so NaN AND infinity are both rejected. The
+/// message names "NaN" and "infinity" to mirror sklearn's `ValueError`. Never
+/// panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // PCA (unfitted)
@@ -2120,7 +2139,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for PCA<F> {
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
+        // Finiteness: sklearn `PCA.fit` runs `_validate_data` with the default
+        // `force_all_finite=True` (`_pca.py:511`), raising
+        // `ValueError("Input X contains NaN."/"...infinity...")`
+        // (`utils/validation.py:147-154`) BEFORE any SVD/eigendecomposition.
+        // This fires before the `gesdd`/faer call, so the clean finiteness error
+        // replaces the incidental `NumericalInstability` the SVD would otherwise
+        // raise on non-finite input (R-DEV-2). Decomposition has no
+        // missing-value support → NaN AND infinity both rejected (#2288).
+        reject_non_finite(x)?;
+
+        let n_f = F::from(n_samples).unwrap_or_else(F::one);
 
         // Step 1: compute mean and centre data.
         let mut mean = Array1::<F>::zeros(n_features);
@@ -2497,6 +2526,12 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedPCA<F> {
                 context: "FittedPCA::transform".into(),
             });
         }
+
+        // Finiteness on the query X: sklearn `PCA.transform` runs
+        // `_validate_data(..., reset=False)` (`_pca.py:824`), the default
+        // `force_all_finite=True` raising a `ValueError` BEFORE the projection
+        // (`utils/validation.py:147-154`). NaN AND infinity both rejected (#2289).
+        reject_non_finite(x)?;
 
         // Centre the data.
         let mut x_centered = x.to_owned();

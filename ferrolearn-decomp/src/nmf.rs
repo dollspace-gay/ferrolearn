@@ -58,7 +58,7 @@
 //! | REQ-8 | `beta_loss` (kullback-leibler/itakura-saito) + `_gamma` | NOT-STARTED | sklearn `_nmf.py:89,:919`; ferrolearn Frobenius-only — blocker #1612 |
 //! | REQ-9 | `transform` NNLS-W VALUE | NOT-STARTED | CARVE-OUT, folds into REQ-5 (downstream of carved-out H, no injectable-H API) — blocker #1613 |
 //! | REQ-10 | `inverse_transform` = `W·H` | SHIPPED | `nmf.rs:229` (`= _nmf.py:1238`); exact algebra + col-mismatch `ShapeMismatch` |
-//! | REQ-11 | Error/parameter contracts | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, doesn't pre-reject `>min(n,p)` |
+//! | REQ-11 | Error/parameter contracts (incl. NON-FINITE rejection, finiteness-before-nonnegative) | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, doesn't pre-reject `>min(n,p)`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`nmf.rs` symbol `reject_non_finite`) BEFORE the non-negativity check and factorization, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_nmf.py:1652`) which runs BEFORE `check_non_negative` (`_nmf.py:1706`), so a NaN+negative input rejects for finiteness first (`utils/validation.py:147-154`). `tests/divergence_nonfinite.rs::divergence_nmf_fit_nan_`/`_fit_nan_and_negative_finiteness_fires_first` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: re-export `lib.rs` + NMF `fit`/`transform` |
 //! | REQ-12 | PyO3 `_RsNMF` binding (thin n_components ctor + fit + transform) | SHIPPED (scoped) | `extras.rs:1116`, registered `lib.rs:75`; NO params/getters/inverse_transform |
 //! | REQ-13 | `n_components=None` default | NOT-STARTED | sklearn `_nmf.py:914` → min(n,p); ferrolearn requires explicit usize — blocker #1614 |
 //! | REQ-14 | `alpha_W`/`alpha_H`/`l1_ratio` regularization | NOT-STARTED | sklearn `_nmf.py:921-923,:1275` — blocker #1615 |
@@ -74,6 +74,26 @@ use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Uniform};
+
+/// Reject non-finite input the way sklearn's `_validate_data` does.
+///
+/// sklearn runs `check_array` with the default `force_all_finite=True` at the
+/// top of `NMF.fit`/`transform` (`_nmf.py:1652`), raising
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`) BEFORE `check_non_negative`
+/// (`_nmf.py:1706`) and the factorization. The finiteness check therefore wins
+/// even when a negative value is also present. NaN AND infinity both rejected.
+/// The message names "NaN" and "infinity" to mirror sklearn. Never panics
+/// (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Configuration enums
@@ -673,6 +693,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NMF<F> {
             });
         }
 
+        // Finiteness FIRST: sklearn `NMF.fit_transform` runs `_validate_data`
+        // (`_nmf.py:1652`) — default `force_all_finite=True` — BEFORE
+        // `check_non_negative` (`_nmf.py:1706`), so a NaN/Inf raises the
+        // finiteness `ValueError` even when a negative value is also present
+        // (`utils/validation.py:147-154`). Mirror that ordering here: reject
+        // non-finite, then check non-negativity. NaN AND infinity both rejected
+        // — replaces the prior silent-garbage `Ok` (#2288).
+        reject_non_finite(x)?;
+
         // Check non-negativity.
         for &val in x {
             if val < F::zero() {
@@ -734,6 +763,13 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedNMF<F> {
                 context: "FittedNMF::transform".into(),
             });
         }
+
+        // Finiteness FIRST (before the non-negativity check): sklearn
+        // `NMF.transform` likewise runs `_validate_data(force_all_finite=True)`
+        // before `check_non_negative`, so a NaN/Inf raises the finiteness
+        // `ValueError` (`utils/validation.py:147-154`) BEFORE the projection.
+        // NaN AND infinity both rejected (#2289).
+        reject_non_finite(x)?;
 
         // Check non-negativity.
         for &val in x {
