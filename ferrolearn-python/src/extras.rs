@@ -4091,6 +4091,131 @@ impl RsOrdinalEncoder {
     }
 }
 
+// LabelEncoder (#1137, REQ-7): hand-written pyclass — the 1-D STRING-INPUT analog
+// of `_RsOrdinalEncoder` (the JUST-added string-input binding). It is a TARGET
+// (`y`) encoder, NOT a feature transformer: `fit`/`transform` take a Python
+// `list[str]` (PyO3's `Vec<String>` extraction, NOT a numpy f64 array), `transform`
+// returns a numpy `int64` array of the per-label codes, `inverse_transform` takes
+// the int64 codes and returns the original string labels, and `classes_` is the
+// sorted-unique label list (a numpy str array). Over
+// `ferrolearn_preprocess::{LabelEncoder, FittedLabelEncoder}`.
+//
+// sklearn's `LabelEncoder` has NO constructor parameters
+// (`sklearn/preprocessing/_label.py:34`, `get_params() == {}`), so `#[new]` takes
+// none. `fit(y)` learns `classes_ = _unique(y)` (`_label.py:98`, sorted-unique);
+// `transform(y)` maps each label to its code, an unseen label →
+// `ValueError("y contains previously unseen labels: ...")` (the Rust core's
+// unknown-label `FerroError` carries the message; `_label.py:137` `_encode`);
+// `inverse_transform(y)` maps each int code back to its label, an out-of-range /
+// negative code → `ValueError` (`_label.py:158-160` `setdiff1d` guard).
+//
+// STRING I/O: the input is 1-D so there is no ragged-shape check (unlike the 2-D
+// OrdinalEncoder); `Vec<String>` → `Array1<String>::from_vec`. The transform
+// output `Array1<usize>` is marshalled to `PyArray1<i64>` (sklearn's codes are
+// int64). `inverse_transform` takes `Vec<i64>`: a negative code has no `usize`
+// image, so it is rejected as `PyValueError` BEFORE the cast (matching sklearn's
+// out-of-range `setdiff1d` guard, which rejects negatives too); a non-negative
+// code is cast to `usize` and an out-of-range one surfaces the core's
+// `InvalidParameter` → `PyValueError`. NEVER panics (R-CODE-2).
+//
+// SCOPE (honest, R-HONEST-3): the core is STRING-only (`Array1<String>`, REQ-4
+// NOT-STARTED #1135); the Python wrapper REJECTS numeric-dtype input (#2230
+// lesson: numeric labels would be string-sorted = wrong codes). The non-empty
+// string path value-matches the live sklearn 1.5.2 oracle exactly.
+#[pyclass(name = "_RsLabelEncoder")]
+pub struct RsLabelEncoder {
+    // `FittedLabelEncoder` is re-exported at the crate root
+    // (`ferrolearn-preprocess/src/lib.rs`).
+    fitted: Option<ferrolearn_preprocess::FittedLabelEncoder>,
+}
+
+#[pymethods]
+impl RsLabelEncoder {
+    // sklearn `LabelEncoder.__init__` (`_label.py:34`): no parameters
+    // (`get_params() == {}`).
+    #[new]
+    fn new() -> Self {
+        Self { fitted: None }
+    }
+
+    // sklearn `LabelEncoder.fit(y)` (`_label.py:84`): learns `classes_ =
+    // _unique(y)` (sorted-unique, `_label.py:98`). The input is a Python
+    // `list[str]` → `Array1<String>`.
+    fn fit(&mut self, labels: Vec<String>) -> PyResult<()> {
+        use ferrolearn_core::Fit;
+        let y_nd = Array1::from_vec(labels);
+        let fitted = ferrolearn_preprocess::LabelEncoder::new()
+            .fit(&y_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `LabelEncoder.transform(y)` (`_label.py:118`): map each label to its
+    // integer code as `int64` (`_label.py:137` `_encode`). An unseen label →
+    // `ValueError("y contains previously unseen labels: ...")` (the Rust core's
+    // unknown-label `FerroError` carries the message).
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        labels: Vec<String>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let y_nd = Array1::from_vec(labels);
+        let codes = fitted.transform(&y_nd).map_err(|e| {
+            // The core's unknown-label error becomes sklearn's exact message.
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "y contains previously unseen labels: {e}"
+            ))
+        })?;
+        Ok(ndarray1_usize_to_numpy(py, &codes))
+    }
+
+    // sklearn `LabelEncoder.inverse_transform(y)` (`_label.py:139`): map each
+    // integer code back to its label. A negative code has no `usize` image and an
+    // out-of-range code is unseen — both are sklearn's "previously unseen labels"
+    // `ValueError` (`_label.py:158-160` `setdiff1d` guard). Returns a Python
+    // `list[str]`.
+    fn inverse_transform(&self, codes: Vec<i64>) -> PyResult<Vec<String>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        // Reject negatives BEFORE the usize cast (a negative code is "unseen" in
+        // sklearn's setdiff1d guard; the cast would wrap to a huge usize).
+        let mut idx = Vec::with_capacity(codes.len());
+        for &c in &codes {
+            if c < 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "y contains previously unseen labels: [{c}]"
+                )));
+            }
+            idx.push(c as usize);
+        }
+        let y_nd = Array1::from_vec(idx);
+        let labels = fitted.inverse_transform(&y_nd).map_err(|e| {
+            pyo3::exceptions::PyValueError::new_err(format!(
+                "y contains previously unseen labels: {e}"
+            ))
+        })?;
+        Ok(labels.to_vec())
+    }
+
+    // sklearn `classes_` (`_label.py:98`): the sorted-unique label list, as a
+    // numpy str array (marshalled as a Python `list[str]`).
+    #[getter]
+    fn classes_(&self) -> PyResult<Vec<String>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.classes().to_vec())
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

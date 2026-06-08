@@ -42,6 +42,7 @@ from ferrolearn._extras import (
     KernelPCA,
     KernelRidge,
     KNeighborsRegressor,
+    LabelEncoder,
     Lars,
     LassoLars,
     LinearSVC,
@@ -135,6 +136,7 @@ __all__ = [
     "FactorAnalysis",
     # Preprocess extras
     "Binarizer",
+    "LabelEncoder",
     "Normalizer",
     "OneHotEncoder",
     "OrdinalEncoder",

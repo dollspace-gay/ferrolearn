@@ -38,11 +38,6 @@ import ferrolearn as fl
 from sklearn.preprocessing import LabelEncoder as SkLE
 
 
-@pytest.mark.skip(
-    reason="divergence: LabelEncoder.transform([]) on a string-fitted encoder "
-    "raises NotImplementedError (np.asarray([]) -> float64 -> numeric guard) "
-    "vs sklearn returning an empty array (_label.py:128-137); tracking #2231"
-)
 def test_empty_transform_after_string_fit_matches_sklearn():
     # Fit on STRING labels (the binding's supported, in-scope path).
     train = ["a", "b", "c"]

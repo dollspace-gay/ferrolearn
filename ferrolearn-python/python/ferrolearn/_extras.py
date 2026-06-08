@@ -44,6 +44,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsKNeighborsRegressor,
     _RsKernelPCA,
     _RsKernelRidge,
+    _RsLabelEncoder,
     _RsLars,
     _RsLassoLars,
     _RsLinearSVC,
@@ -2975,6 +2976,130 @@ class OrdinalEncoder(BaseEstimator):
     def n_features_in_(self):
         check_is_fitted(self, "_rs")
         return int(self._rs.n_features_in_)
+
+
+class LabelEncoder(BaseEstimator):
+    """Encode target labels with value between 0 and n_classes-1, backed by Rust
+    (#1137, REQ-7).
+
+    Mirrors ``sklearn.preprocessing.LabelEncoder``
+    (``sklearn/preprocessing/_label.py:34-165``) for the STRING input path. The
+    1-D ``y`` labels are mapped to integers ``0..n_classes-1`` in sorted-unique
+    order (``classes_ = _unique(y)``, ``_label.py:98``); ``transform`` returns an
+    ``int64`` array of codes and ``inverse_transform`` maps codes back to labels.
+
+    This is the 1-D STRING-INPUT analog of ``OrdinalEncoder`` (a TARGET ``y``
+    encoder, NOT a feature transformer): ``fit``/``transform`` accept a numpy
+    str/object 1-D array OR a Python list of str (converted by ``_to_labels`` to
+    ``list[str]`` across the Rust ABI), ``transform`` returns an int64 numpy
+    array, and ``inverse_transform`` returns a numpy object array of the original
+    labels.
+
+    sklearn's ``LabelEncoder`` has NO constructor parameters
+    (``get_params() == {}``, ``_label.py:34``); the no-arg ``__init__`` keeps
+    ``BaseEstimator.get_params`` returning ``{}`` for ``clone``/``set_params``
+    parity.
+
+    STATEFUL: must be ``fit`` before ``transform``/``inverse_transform``/
+    ``classes_``. Pre-fit access raises ``NotFittedError`` (via
+    ``check_is_fitted`` on ``_rs``), matching sklearn (``_label.py:131/152``).
+
+    SCOPE (honest, R-HONEST-3 — does NOT match sklearn in every regime; the gaps
+    are SURFACED as errors, never silently mismatched):
+
+    - input is STRING-only (``Array1<String>``, label_encoder.rs REQ-4
+      NOT-STARTED #1135). ferrolearn's core sorts its classes LEXICOGRAPHICALLY;
+      sklearn sorts NUMERIC labels numerically (1, 2, 10 not '1', '10', '2').
+      Coercing numeric input via ``.astype(str)`` would silently produce WRONG
+      codes (#2230 lesson), so NUMERIC-dtype input raises ``NotImplementedError``
+      rather than mis-encode it. String/object arrays are accepted (a string
+      label that happens to look numeric is still string-sorted, matching sklearn
+      for string input).
+    - input must be 1-D (``column_or_1d``, ``_label.py:97``); a 2-D input raises
+      ``ValueError``.
+
+    An unseen label at ``transform`` raises ``ValueError`` ("y contains
+    previously unseen labels: ...", ``_label.py:137``); an out-of-range / negative
+    code at ``inverse_transform`` raises ``ValueError`` (``_label.py:158-160``
+    ``setdiff1d`` guard).
+    """
+
+    def __init__(self):
+        """No tunable hyperparameters (sklearn LabelEncoder has no params,
+        ``_label.py:34``); a no-arg ``__init__`` makes ``BaseEstimator.get_params``
+        return ``{}`` for ``clone``/``set_params`` parity."""
+
+    @staticmethod
+    def _to_labels(y):
+        # Convert the input (a numpy str/object 1-D array OR a list) to a Python
+        # `list[str]` for the Rust ABI. sklearn's `column_or_1d` requires a 1-D
+        # input (`_label.py:97`); a 2-D input raises ValueError. ferrolearn's
+        # LabelEncoder core is STRING-only and sorts its classes LEXICOGRAPHICALLY;
+        # sklearn sorts NUMERIC labels numerically (1, 2, 10), so coercing numeric
+        # input via `.astype(str)` would silently produce WRONG codes (#2230) ->
+        # REJECT numeric-dtype input (numeric labels are REQ-4 NOT-STARTED #1135).
+        # A string label that looks numeric ('1', '10', '2') is still string-sorted,
+        # matching sklearn for string input.
+        arr = np.asarray(y)
+        if arr.ndim != 1:
+            raise ValueError(
+                f"y should be a 1d array, got an array of shape {arr.shape} instead."
+            )
+        # Only reject NON-EMPTY numeric input: `np.asarray([])` infers float64,
+        # so an EMPTY transform/fit must NOT trip the numeric guard (#2231).
+        # sklearn `transform([])` -> empty array, not an error; the empty call
+        # carries no numeric labels.
+        if arr.size > 0 and np.issubdtype(arr.dtype, np.number):
+            raise NotImplementedError(
+                "ferrolearn LabelEncoder is string-only; numeric/mixed-dtype "
+                "labels are not yet supported (REQ-4 #1135): the core sorts "
+                "classes lexicographically, which would give wrong codes for "
+                "numeric labels (e.g. 1, 10, 2). Pass string labels."
+            )
+        # `.astype(str)` coerces object/str cells; `.tolist()` yields a str list.
+        return arr.astype(str).tolist()
+
+    def fit(self, y):
+        # sklearn `LabelEncoder.fit(y)` (`_label.py:84`). STATEFUL: `check_is_fitted`
+        # keys off `_rs`.
+        self._rs = _RsLabelEncoder()
+        self._rs.fit(self._to_labels(y))
+        return self
+
+    def fit_transform(self, y):
+        # sklearn `LabelEncoder.fit_transform(y)` (`_label.py:101`). LabelEncoder
+        # is NOT a TransformerMixin here (it subclasses only BaseEstimator), so
+        # provide it explicitly (sklearn's own `fit_transform`, `_label.py:115`).
+        return self.fit(y).transform(y)
+
+    def transform(self, y):
+        # sklearn `transform` calls `check_is_fitted` (`_label.py:131`), raising
+        # NotFittedError before any work. Returns int64 codes (`_label.py:137`).
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.transform(self._to_labels(y)))
+
+    def inverse_transform(self, y):
+        # sklearn `inverse_transform(y)` (`_label.py:139`): map each int code back
+        # to its label. `check_is_fitted` (`_label.py:152`) raises NotFittedError
+        # pre-fit. The input is int codes; an out-of-range / negative code raises
+        # ValueError (`_label.py:158-160`). The Rust core returns a `list[str]`;
+        # marshal to a numpy OBJECT array (matching sklearn's str output).
+        check_is_fitted(self, "_rs")
+        codes = np.ascontiguousarray(y).astype(np.int64)
+        if codes.ndim != 1:
+            raise ValueError(
+                f"y should be a 1d array, got an array of shape {codes.shape} "
+                "instead."
+            )
+        labels = self._rs.inverse_transform(codes.tolist())
+        return np.asarray(labels, dtype=object)
+
+    @property
+    def classes_(self):
+        # sklearn `classes_` (`_label.py:98`): the sorted-unique label list, as a
+        # numpy str array.
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.classes_, dtype=object)
 
 
 class MinMaxScaler(_TransformerWrapper):
