@@ -10,13 +10,13 @@
 //! default, `sklearn/utils/validation.py:727`, `:1164`; raises at
 //! `validation.py:147-154`):
 //!   - SpectralClustering.fit: `sklearn/cluster/_spectral.py:691`
-//!       `X = self._validate_data(X, accept_sparse=["csr","csc","coo"], dtype=np.float64, ensure_min_samples=2)`
+//!     `X = self._validate_data(X, accept_sparse=["csr","csc","coo"], dtype=np.float64, ensure_min_samples=2)`
 //!   - AffinityPropagation.fit: `sklearn/cluster/_affinity_propagation.py:510`
-//!       `X = self._validate_data(X, accept_sparse="csr")`
+//!     `X = self._validate_data(X, accept_sparse="csr")`
 //!   - MiniBatchKMeans.fit: `sklearn/cluster/_kmeans.py:2073`
-//!       `X = self._validate_data(X, accept_sparse="csr", dtype=[np.float64, np.float32], ...)`
+//!     `X = self._validate_data(X, accept_sparse="csr", dtype=[np.float64, np.float32], ...)`
 //!   - LabelPropagation.fit / LabelSpreading.fit: `sklearn/semi_supervised/_label_propagation.py:258`
-//!       `X, y = self._validate_data(X, y, accept_sparse=["csr","csc"], reset=True)`
+//!     `X, y = self._validate_data(X, y, accept_sparse=["csr","csc"], reset=True)`
 //!
 //! Live oracle (sklearn 1.5.2), from /tmp — each raises:
 //!   SpectralClustering(n_clusters=2,random_state=0).fit(<+Inf X>)
@@ -94,7 +94,6 @@ fn y_semi() -> Array1<isize> {
 }
 
 #[test]
-#[ignore = "divergence: SpectralClustering::fit accepts +Inf; sklearn ValueError; tracking #2286"]
 fn divergence_spectral_fit_rejects_inf() {
     let r = SpectralClustering::new(2)
         .with_random_state(0)
@@ -106,7 +105,6 @@ fn divergence_spectral_fit_rejects_inf() {
 }
 
 #[test]
-#[ignore = "divergence: AffinityPropagation::fit accepts +Inf; sklearn ValueError; tracking #2286"]
 fn divergence_affinity_propagation_fit_rejects_inf() {
     let r = AffinityPropagation::<f64>::new().fit(&x_inf(), &());
     assert!(
@@ -116,7 +114,6 @@ fn divergence_affinity_propagation_fit_rejects_inf() {
 }
 
 #[test]
-#[ignore = "divergence: MiniBatchKMeans::fit accepts NaN; sklearn ValueError; tracking #2286"]
 fn divergence_mini_batch_kmeans_fit_rejects_nan() {
     let r = MiniBatchKMeans::new(2)
         .with_random_state(0)
@@ -129,7 +126,6 @@ fn divergence_mini_batch_kmeans_fit_rejects_nan() {
 }
 
 #[test]
-#[ignore = "divergence: MiniBatchKMeans::fit accepts +Inf; sklearn ValueError; tracking #2286"]
 fn divergence_mini_batch_kmeans_fit_rejects_inf() {
     let r = MiniBatchKMeans::new(2)
         .with_random_state(0)
@@ -142,7 +138,6 @@ fn divergence_mini_batch_kmeans_fit_rejects_inf() {
 }
 
 #[test]
-#[ignore = "divergence: LabelPropagation::fit accepts NaN; sklearn ValueError; tracking #2286"]
 fn divergence_label_propagation_fit_rejects_nan() {
     let r = LabelPropagation::<f64>::new().fit(&x_nan(), &y_semi());
     assert!(
@@ -152,7 +147,6 @@ fn divergence_label_propagation_fit_rejects_nan() {
 }
 
 #[test]
-#[ignore = "divergence: LabelPropagation::fit accepts +Inf; sklearn ValueError; tracking #2286"]
 fn divergence_label_propagation_fit_rejects_inf() {
     let r = LabelPropagation::<f64>::new().fit(&x_inf(), &y_semi());
     assert!(
@@ -162,7 +156,6 @@ fn divergence_label_propagation_fit_rejects_inf() {
 }
 
 #[test]
-#[ignore = "divergence: LabelSpreading::fit accepts NaN; sklearn ValueError; tracking #2286"]
 fn divergence_label_spreading_fit_rejects_nan() {
     let r = LabelSpreading::<f64>::new().fit(&x_nan(), &y_semi());
     assert!(
@@ -172,7 +165,6 @@ fn divergence_label_spreading_fit_rejects_nan() {
 }
 
 #[test]
-#[ignore = "divergence: LabelSpreading::fit accepts +Inf; sklearn ValueError; tracking #2286"]
 fn divergence_label_spreading_fit_rejects_inf() {
     let r = LabelSpreading::<f64>::new().fit(&x_inf(), &y_semi());
     assert!(

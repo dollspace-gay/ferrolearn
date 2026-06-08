@@ -78,6 +78,7 @@
 //! | REQ-12 (equal-similarities short-circuit) | NOT-STARTED | open prereq blocker #980. No `_equal_similarities_and_preferences` analog; `fn fit` runs the full loop for identical points. sklearn `:22-67` returns n or 1 clusters + a warning. |
 //! | REQ-13 (copy / verbose params) | NOT-STARTED | open prereq blocker #981. `AffinityPropagation` has `damping`/`max_iter`/`convergence_iter`/`preference` only; sklearn `__init__` `:468`/`:471` also has `copy=True`/`verbose=False`. |
 //! | REQ-14 (ferray substrate) | NOT-STARTED | open prereq blocker #982. imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`; no RNG layer (couples to REQ-4 needing `ferray::random`). R-SUBSTRATE-2. |
+//! | REQ-15 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `Fit::fit` (after the param/sample checks, BEFORE the similarity matrix / median-preference path that previously PANICKED on a NaN `total`) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `AffinityPropagation.fit` → `_validate_data(force_all_finite=True)` default (`_affinity_propagation.py:510`), which raises `ValueError` (`validation.py:147-154`). Consumer: the existing `fit` entry — crate re-export `pub use affinity_propagation::{AffinityPropagation, FittedAffinityPropagation}` (`lib.rs`). Pinned by `divergence_nonfinite_panic_spillover.rs` (`divergence_affinity_propagation_fit_nan_no_panic` — was a PROCESS ABORT) + `divergence_nonfinite_reject_spillover.rs` (`divergence_affinity_propagation_fit_rejects_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err` with no panic. Finite input byte-identical (the module's oracle pins stay green). Closes #2285 (panic) + #2286 (Inf-accept) for this estimator. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -211,6 +212,26 @@ impl<F: Float> FittedAffinityPropagation<F> {
     }
 }
 
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `AffinityPropagation.fit` →
+/// `self._validate_data(X, accept_sparse="csr")`
+/// (`sklearn/cluster/_affinity_propagation.py:510`), which keeps the
+/// `force_all_finite=True` default and raises
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). The check runs BEFORE the similarity
+/// matrix / median-preference path so a NaN/Inf never reaches the message-passing
+/// loop (which would otherwise produce garbage). Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Compute the squared Euclidean distance between two slices.
 fn squared_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
     a.iter()
@@ -279,6 +300,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for AffinityPropagatio
                 context: "AffinityPropagation requires at least 1 sample".into(),
             });
         }
+
+        // Reject non-finite X up front (NaN AND Inf), BEFORE the similarity
+        // matrix / median-preference path, mirroring sklearn's
+        // `_validate_data(force_all_finite=True)` reached from
+        // `AffinityPropagation.fit` (`_affinity_propagation.py:510`). Without
+        // this, a NaN `total` reaches the message-passing loop and produces
+        // garbage; sklearn instead raises `ValueError` (R-DEV-1, R-CODE-2).
+        reject_non_finite(x)?;
 
         // Handle single-sample case directly.
         if n == 1 {

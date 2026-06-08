@@ -86,6 +86,7 @@
 //! | REQ-9 (KMeans assign-labels parity) | NOT-STARTED | open prereq blocker **#934** (kmeans.rs unit). sklearn `k_means(maps, n_clusters, n_init, random_state)` uses k-means++ init with NumPy RNG (`_spectral.py:756`). ferrolearn `KMeans::new(k).with_n_init` is a separate unit with its own init/RNG — even a matched embedding would not guarantee identical labels. |
 //! | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker **#935**. `grep -rln SpectralClustering ferrolearn-python/` is EMPTY — no `_RsSpectralClustering`, so `import ferrolearn` cannot reach `SpectralClustering`. The only non-test consumer of `fit` / `fit_predict` / `labels()` is the crate re-export (`lib.rs`). |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#935**. `spectral.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `ferrolearn_core::NdarrayFaerBackend` (`eigh`); not migrated to `ferray-core` / `ferray::linalg` (R-SUBSTRATE-1/2). |
+//! | REQ-12 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `fn fit` (after the param/sample checks, before the RBF affinity / eigendecomposition) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `SpectralClustering.fit` → `_validate_data(force_all_finite=True)` default (`_spectral.py:691`), which raises `ValueError` (`validation.py:147-154`). ferrolearn previously rejected NaN (NaN affinities fail the eigendecomposition) but SILENTLY ACCEPTED +Inf; now both reject. Consumer: the existing `fit` entry — crate re-export `pub use spectral::{FittedSpectralClustering, SpectralClustering}` (`lib.rs`). Pinned by `divergence_nonfinite_reject_spillover.rs` (`divergence_spectral_fit_rejects_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). Closes #2286 for this estimator. |
 
 use crate::kmeans::KMeans;
 use ferrolearn_core::NdarrayFaerBackend;
@@ -186,6 +187,25 @@ impl<F: Float> FittedSpectralClustering<F> {
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `SpectralClustering.fit` →
+/// `self._validate_data(X, accept_sparse=["csr","csc","coo"], dtype=np.float64, ensure_min_samples=2)`
+/// (`sklearn/cluster/_spectral.py:691`), which keeps the `force_all_finite=True`
+/// default and raises `ValueError("Input X contains NaN.")` /
+/// `"... contains infinity ..."` (`sklearn/utils/validation.py:147-154`). NaN AND
+/// infinity are both rejected up front so neither reaches the RBF affinity /
+/// eigendecomposition. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 /// Build the RBF affinity matrix in `f64`.
 fn affinity_matrix<F: Float>(x: &Array2<F>, gamma: f64) -> Array2<f64> {
@@ -301,6 +321,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SpectralClustering
                 context: "SpectralClustering requires at least n_clusters samples".into(),
             });
         }
+
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(force_all_finite=True)` reached from
+        // `SpectralClustering.fit` (`_spectral.py:691`), which raises
+        // `ValueError` (R-DEV-1, R-CODE-2). ferrolearn previously rejected NaN
+        // (NaN affinities propagate to a failed eigendecomposition) but
+        // SILENTLY ACCEPTED +Inf — this rejects both.
+        reject_non_finite(x)?;
 
         let gamma64 = self.gamma.to_f64().unwrap_or(1.0);
 

@@ -71,6 +71,7 @@
 //! | REQ-11 (PyO3 binding thin surface + dtype) | NOT-STARTED | open prereq blocker #1053. `RsMiniBatchKMeans` exposes only `fit`/`predict`/`labels_` + ctor `(n_clusters,max_iter,random_state)` — omits `transform`/`cluster_centers_`/`inertia_`/`n_iter_` and `n_init`/`batch_size`/`tol`; marshals `labels_` as `int64` not sklearn `int32` (R-DEFER-7 last layer). |
 //! | REQ-12 (low-count cluster reassignment) | NOT-STARTED | open prereq blocker #1054. sklearn `_mini_batch_step` reassigns clusters whose counts fall below `reassignment_ratio*max_count` to random high-density points; ferrolearn `fn update_centers_mini_batch` has no reassignment. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1055. `mini_batch_kmeans.rs` imports `ndarray`/`num-traits`/`rand`/`rayon`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2; RNG entangled with REQ-7). |
+//! | REQ-14 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `Fit::fit` (after the param/sample checks, before init/mini-batch) AND in `Predict::predict` (on the query X) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `_validate_data(force_all_finite=True)` default reached from `MiniBatchKMeans.fit` (`_kmeans.py:2073`) and `MiniBatchKMeans.predict`→`_check_test_data`, which raise `ValueError` (`validation.py:147-154`). Consumers: the existing `fit`/`predict` entries — PyO3 `RsMiniBatchKMeans::fit`/`::predict` (`extras.rs`) + crate re-export `pub use mini_batch_kmeans::{...}` (`lib.rs`). Pinned by `divergence_nonfinite_reject_spillover.rs` (`divergence_mini_batch_kmeans_fit_rejects_nan`/`_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). Closes #2286 for this estimator. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -241,6 +242,26 @@ impl<F: Float> FittedMiniBatchKMeans<F> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `MiniBatchKMeans.fit` →
+/// `self._validate_data(X, accept_sparse="csr", dtype=[np.float64, np.float32], ...)`
+/// (`sklearn/cluster/_kmeans.py:2073`) and `MiniBatchKMeans.predict` →
+/// `_BaseKMeans._check_test_data` → `_validate_data`, both keeping the
+/// `force_all_finite=True` default, which raises
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). NaN AND infinity are both rejected.
+/// Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
 
 /// Compute the squared Euclidean distance between two slices.
 #[inline]
@@ -549,6 +570,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MiniBatchKMeans<F>
             });
         }
 
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(force_all_finite=True)` reached from
+        // `MiniBatchKMeans.fit` (`_kmeans.py:2073`), which raises `ValueError`
+        // (R-DEV-1, R-CODE-2).
+        reject_non_finite(x)?;
+
         let base_seed = self.random_state.unwrap_or(0);
         let mut best_result: Option<FittedMiniBatchKMeans<F>> = None;
 
@@ -648,6 +675,10 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedMiniBatchKMe
                 context: "FittedMiniBatchKMeans::predict".into(),
             });
         }
+        // Reject non-finite query X (NaN AND Inf), mirroring sklearn's
+        // `MiniBatchKMeans.predict` → `_check_test_data` → `_validate_data`
+        // (`force_all_finite=True`), which raises `ValueError`.
+        reject_non_finite(x)?;
         let (labels, _) = assign_clusters_mb(x, &self.cluster_centers_);
         Ok(labels)
     }

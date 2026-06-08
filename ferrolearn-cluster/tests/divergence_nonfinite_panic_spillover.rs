@@ -12,9 +12,9 @@
 //! default, `sklearn/utils/validation.py:727`, `:1164`; raises at
 //! `validation.py:147-154`):
 //!   - AffinityPropagation.fit: `sklearn/cluster/_affinity_propagation.py:510`
-//!       `X = self._validate_data(X, accept_sparse="csr")`
+//!     `X = self._validate_data(X, accept_sparse="csr")`
 //!   - BisectingKMeans.fit:     `sklearn/cluster/_bisect_k_means.py:380`
-//!       `X = self._validate_data(X, accept_sparse="csr", ...)`
+//!     `X = self._validate_data(X, accept_sparse="csr", ...)`
 //!
 //! Live oracle (sklearn 1.5.2), from /tmp:
 //!   AffinityPropagation(random_state=0).fit(<NaN X>)
@@ -82,7 +82,6 @@ fn x_inf() -> Array2<f64> {
 
 /// sklearn AffinityPropagation.fit(NaN) -> ValueError (clean). ferrolearn panics.
 #[test]
-#[ignore = "divergence: AffinityPropagation::fit panics on NaN; sklearn ValueError; tracking #2285"]
 fn divergence_affinity_propagation_fit_nan_no_panic() {
     panic::set_hook(Box::new(|_| {}));
     let res = panic::catch_unwind(|| AffinityPropagation::<f64>::new().fit(&x_nan(), &()));
@@ -99,10 +98,13 @@ fn divergence_affinity_propagation_fit_nan_no_panic() {
 /// sklearn BisectingKMeans.fit(NaN) -> ValueError (clean). ferrolearn panics
 /// in kmeans++ `rng.random_range` (NaN `total`).
 #[test]
-#[ignore = "divergence: BisectingKMeans::fit panics on NaN; sklearn ValueError; tracking #2285"]
 fn divergence_bisecting_kmeans_fit_nan_no_panic() {
     panic::set_hook(Box::new(|_| {}));
-    let res = panic::catch_unwind(|| BisectingKMeans::new(2).with_random_state(0).fit(&x_nan(), &()));
+    let res = panic::catch_unwind(|| {
+        BisectingKMeans::new(2)
+            .with_random_state(0)
+            .fit(&x_nan(), &())
+    });
     assert!(
         res.is_ok(),
         "BisectingKMeans::fit panicked on NaN; sklearn raises ValueError cleanly"
@@ -115,10 +117,13 @@ fn divergence_bisecting_kmeans_fit_nan_no_panic() {
 
 /// sklearn BisectingKMeans.fit(+Inf) -> ValueError (clean). ferrolearn panics.
 #[test]
-#[ignore = "divergence: BisectingKMeans::fit panics on Inf; sklearn ValueError; tracking #2285"]
 fn divergence_bisecting_kmeans_fit_inf_no_panic() {
     panic::set_hook(Box::new(|_| {}));
-    let res = panic::catch_unwind(|| BisectingKMeans::new(2).with_random_state(0).fit(&x_inf(), &()));
+    let res = panic::catch_unwind(|| {
+        BisectingKMeans::new(2)
+            .with_random_state(0)
+            .fit(&x_inf(), &())
+    });
     assert!(
         res.is_ok(),
         "BisectingKMeans::fit panicked on Inf; sklearn raises ValueError cleanly"

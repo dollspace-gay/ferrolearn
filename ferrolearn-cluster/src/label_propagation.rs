@@ -81,6 +81,7 @@
 //! | REQ-10 (validation / error ABI) | NOT-STARTED | open prereq blocker #1005. sklearn `check_classification_targets` + `_parameter_constraints` (`gamma∈[0,∞)`, etc.) raising `InvalidParameterError` (`:110-118,265`); ferrolearn `fn fit` raises `FerroError::InvalidParameter` (different type/ABI) and rejects `gamma>0` (stricter than sklearn's `[0,∞)`). |
 //! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1006. `grep LabelPropagation ferrolearn-python/` is EMPTY — no binding; `import ferrolearn` cannot reach `LabelPropagation`. Only consumer is the crate re-export. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1007. `label_propagation.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1/2). |
+//! | REQ-13 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called in `Fit::fit` (after the y-length/param checks, before the affinity build) rejects NaN AND infinity in the FEATURE matrix `X` with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `LabelPropagation.fit`→`BaseLabelPropagation.fit`→`_validate_data(X, y, force_all_finite=True)` default (`_label_propagation.py:258`), which raises `ValueError` (`validation.py:147-154`). `y` carries integer labels (the `-1` unlabeled sentinel) and is not finite-checked. Consumer: the existing `fit` entry — crate re-export `pub use label_propagation::{FittedLabelPropagation, LabelPropagation, LabelPropagationKernel}` (`lib.rs`). Pinned by `divergence_nonfinite_reject_spillover.rs` (`divergence_label_propagation_fit_rejects_nan`/`_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). Closes #2286 for this estimator. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -385,6 +386,26 @@ fn sq_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
 }
 
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `LabelPropagation.fit` (via `BaseLabelPropagation.fit`) →
+/// `self._validate_data(X, y, accept_sparse=["csr","csc"], reset=True)`
+/// (`sklearn/semi_supervised/_label_propagation.py:258`), which keeps the
+/// `force_all_finite=True` default and raises
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). Only the FEATURE matrix `X` is
+/// finite-checked here; `y` carries integer labels (the `-1` unlabeled
+/// sentinel). NaN AND infinity are both rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Build the RBF affinity matrix.
 ///
 /// Mirrors sklearn `rbf_kernel(X, X, gamma)` (`_label_propagation.py:147`):
@@ -632,6 +653,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<isize>> for LabelPr
                 reason: "must be positive for RBF kernel".into(),
             });
         }
+
+        // Reject non-finite X (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(force_all_finite=True)` reached from
+        // `LabelPropagation.fit` (`_label_propagation.py:258`), which raises
+        // `ValueError` (R-DEV-1, R-CODE-2). `y` is labels, not finite-checked.
+        reject_non_finite(x)?;
 
         if self.kernel == LabelPropagationKernel::Knn && self.n_neighbors == 0 {
             return Err(FerroError::InvalidParameter {

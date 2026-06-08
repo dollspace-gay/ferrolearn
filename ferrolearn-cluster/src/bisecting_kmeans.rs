@@ -73,6 +73,7 @@
 //! | REQ-10 (validation / error ABI) | NOT-STARTED | open prereq blocker #1032. sklearn `_parameter_constraints`/`InvalidParameterError` + `_check_params_vs_input` (`:208-215,389`); ferrolearn raises `FerroError::InvalidParameter`/`InsufficientSamples` (different type/ABI). |
 //! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1033. `grep BisectingKMeans ferrolearn-python/` is EMPTY — no binding. Only consumer is the crate re-export. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1034. `bisecting_kmeans.rs` imports `ndarray`/`num-traits`/`rand`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2). |
+//! | REQ-14 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `Fit::fit` (after the param/sample checks, BEFORE the kmeans++ centroid sampling in `fn run_2means` that previously PANICKED on a NaN `total`) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `BisectingKMeans.fit` → `_validate_data(force_all_finite=True)` default (`_bisect_k_means.py:380`), which raises `ValueError` (`validation.py:147-154`). Consumer: the existing `fit` entry — crate re-export `pub use bisecting_kmeans::{BisectingKMeans, BisectingStrategy, FittedBisectingKMeans}` (`lib.rs`). Pinned by `divergence_nonfinite_panic_spillover.rs` (`divergence_bisecting_kmeans_fit_nan_no_panic`/`_inf_no_panic` — were PROCESS ABORTS) — live sklearn 1.5.2 raises, ferrolearn now `Err` with no panic. Finite input byte-identical (the module's oracle pins stay green). Closes #2285 for this estimator. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -199,6 +200,27 @@ impl<F: Float> FittedBisectingKMeans<F> {
     pub fn n_clusters(&self) -> usize {
         self.cluster_centers_.nrows()
     }
+}
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `BisectingKMeans.fit` →
+/// `self._validate_data(X, accept_sparse="csr", dtype=[np.float64, np.float32], ...)`
+/// (`sklearn/cluster/_bisect_k_means.py:380`), which keeps the
+/// `force_all_finite=True` default and raises
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). The check runs BEFORE kmeans++
+/// centroid sampling, where a NaN `total` would otherwise make
+/// `rng.random_range(0..n)`'s upstream selection / the cumulative-sum path
+/// abort. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Compute the squared Euclidean distance between two slices.
@@ -387,6 +409,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for BisectingKMeans<F>
                 context: "BisectingKMeans requires at least n_clusters samples".into(),
             });
         }
+
+        // Reject non-finite X up front (NaN AND Inf), BEFORE the kmeans++
+        // centroid sampling in `run_2means` (where a NaN `total` previously
+        // aborted the process), mirroring sklearn's
+        // `_validate_data(force_all_finite=True)` reached from
+        // `BisectingKMeans.fit` (`_bisect_k_means.py:380`), which raises
+        // `ValueError` (R-DEV-1, R-CODE-2).
+        reject_non_finite(x)?;
 
         // Initialize with all samples in one cluster.
         let all_indices: Vec<usize> = (0..n_samples).collect();
