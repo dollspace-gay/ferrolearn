@@ -296,7 +296,6 @@ fn dcg_ndcg_2d_sample_weight_matches_sklearn() -> Result<(), FerroError> {
 /// error. sklearn never produces a DCG/NDCG of 0.0 via `k = 0` — it rejects the
 /// call. Tracking: #2296
 #[test]
-#[ignore = "divergence: dcg/ndcg accept k=0, sklearn raises InvalidParameterError; tracking #2296"]
 fn divergence_dcg_ndcg_k_zero_rejected() {
     let y_true = array![[3.0_f64, 2.0, 1.0]];
     let y_score = array![[3.0_f64, 2.0, 1.0]];

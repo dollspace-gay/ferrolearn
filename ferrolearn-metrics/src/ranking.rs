@@ -254,6 +254,16 @@ pub fn dcg_score<F: Float + Send + Sync + 'static>(
         });
     }
 
+    // sklearn constrains `k` to `Interval(Integral, 1, None, closed="left")`
+    // (`_ranking.py:1595`): k >= 1 or None. `k = Some(0)` raises
+    // `InvalidParameterError`; reject it before clamping (None / k >= 1 unchanged).
+    if k == Some(0) {
+        return Err(FerroError::InvalidParameter {
+            name: "k".into(),
+            reason: "k must be an int in the range [1, inf) or None.".into(),
+        });
+    }
+
     let k = k.unwrap_or(n_labels).min(n_labels);
 
     // sklearn returns `np.average(_dcg_sample_scores(...), weights=sample_weight)`
@@ -359,6 +369,16 @@ pub fn ndcg_score<F: Float + Send + Sync + 'static>(
         return Err(FerroError::InvalidParameter {
             name: "y_true".into(),
             reason: "ndcg_score should not be used on negative y_true values".into(),
+        });
+    }
+
+    // sklearn constrains `k` to `Interval(Integral, 1, None, closed="left")`
+    // (`_ranking.py:1595`): k >= 1 or None. `k = Some(0)` raises
+    // `InvalidParameterError`; reject it before clamping (None / k >= 1 unchanged).
+    if k == Some(0) {
+        return Err(FerroError::InvalidParameter {
+            name: "k".into(),
+            reason: "k must be an int in the range [1, inf) or None.".into(),
         });
     }
 
