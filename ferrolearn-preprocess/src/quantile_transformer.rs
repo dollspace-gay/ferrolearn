@@ -24,7 +24,7 @@
 //! | REQ-6 random subsample + random_state + n_quantiles>subsample error | NOT-STARTED (#1324) | sklearn `_data.py:2696-2700`,`:2774-2779` |
 //! | REQ-7 `inverse_transform` (reverse interp + `norm.cdf` + bounds + NaN) | SHIPPED (#1325) | `FittedQuantileTransformer::inverse_transform` + `norm_cdf` (ndtr via `erf`/`erfc`); sklearn `_data.py:2947`,`:2813-2851`,`:2821`. Uniform ~exact, Normal ~1e-7 (follows the forward REQ-3 ~1e-9 ndtr/probit contract). Consumer: crate re-export `pub use quantile_transformer::FittedQuantileTransformer` (`lib.rs`, boundary public API). Live-oracle: `tests/divergence_quantile_transformer.rs` (uniform/normal round-trip + held-out + bounds + NaN + `norm_cdf` sanity) |
 //! | REQ-8 `ignore_implicit_zeros` + sparse CSC | NOT-STARTED (#1326) | sklearn `_data.py:2709-2752` |
-//! | REQ-9 `quantile_transform` free function | NOT-STARTED (#1327) | sklearn `_data.py:2978` |
+//! | REQ-9 `quantile_transform` free function | SHIPPED (#1327) | `quantile_transform` free fn delegates to the SHIPPED `QuantileTransformer::new(n_quantiles, output_distribution, subsample)` + `Fit`→`FittedQuantileTransformer::transform` (NO quantile math duplicated); mirrors sklearn `quantile_transform(X, *, axis=0, n_quantiles=1000, output_distribution="uniform", ignore_implicit_zeros=False, subsample=1e5, random_state=None, copy=True)` (`_data.py:2978`,`:3107-3119`): `axis==0` → `fit_transform(X)` (per-feature, `:3115-3116`); `axis==1` → `fit_transform(X.T).T` (per-sample, `:3117-3118`, contiguous owned transpose); `axis ∉ {0,1}` → `InvalidParameter` "axis should be either equal to 0 or 1. Got axis=<n>" (matches the `else` ValueError `:3117`). SCOPE: `ignore_implicit_zeros`/`random_state`/`copy` are not surfaced (dense, deterministic, always-copy); `subsample` is threaded but the actual random subsampling is REQ-6 NOT-STARTED (#1324) so the path is deterministic and matches sklearn only for n_samples ≤ subsample (`subsample=None`/large in the oracle). Consumer: crate re-export `pub use quantile_transformer::quantile_transform` (`lib.rs`, boundary public API, R-DEFER-1). Live-oracle: `tests/divergence_quantile_transformer.rs` (axis=0 uniform/normal distinct+tied, axis=1 non-square, axis-error, == estimator fit_transform, multi-feature column-by-column, f32). |
 //! | REQ-10 `copy` + OneToOneFeatureMixin fitted-attr surface | NOT-STARTED (#1328) | sklearn `_data.py:2540`,`:2790-2795` |
 //! | REQ-11 PyO3 binding | SHIPPED (#1329) | `_RsQuantileTransformer` (`ferrolearn-python/src/extras.rs`) over `QuantileTransformer`/`FittedQuantileTransformer` exposes `fit`/`transform`/`inverse_transform` + the `#[getter]`s `quantiles_` (`&[Vec<F>]` → `(n_quantiles_, n_features)` numpy, transposed), `references_` (this module's `FittedQuantileTransformer::references`), `n_quantiles_` (effective, `FittedQuantileTransformer::n_quantiles` == `references().len()`, the `min(n_quantiles, n_samples)` clamp `_data.py:2790`), `n_features_in_`; `output_distribution` "uniform"/"normal" string→`OutputDistribution` (bad→`PyValueError`, `_data.py:2655` StrOptions). Python `class QuantileTransformer(_TransformerWrapper)` (`_extras.py`) mirrors sklearn's keyword-only ctor `(*, n_quantiles=1000, output_distribution="uniform", ignore_implicit_zeros=False, subsample=10_000, random_state=None, copy=True)` (`_data.py:2662`); pre-fit transform/attr→`NotFittedError`; n_quantiles>subsample→`ValueError` (`_data.py:2774`); registered `lib.rs`/`__init__.py` (non-test consumer, R-DEFER-1). SCOPE: `subsample`/`random_state` accepted for get_params compat but the deterministic path uses ALL samples (REQ-6 actual subsample NOT-STARTED #1324, RNG-gated #2118) — MATCHES sklearn only for n_samples ≤ subsample; `ignore_implicit_zeros` accepted-and-documented (REQ-8 dense-only #1326); `copy` no-op. float32 input → ~1e-5 tolerant (f64 ABI cast-back, #2215-class); Normal output → ~1e-7 (REQ-3 Acklam ppf/ndtr). Live-oracle: `tests/divergence_quantile_transformer_py.py`. |
 //! | REQ-12 ferray substrate | NOT-STARTED (#1330) | R-SUBSTRATE |
@@ -462,13 +462,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for QuantileTransforme
     ///
     /// # Errors
     ///
-    /// - [`FerroError::InsufficientSamples`] if the input has fewer than 2 rows.
+    /// - [`FerroError::InsufficientSamples`] if the input has 0 rows (empty).
     /// - [`FerroError::InvalidParameter`] if `n_quantiles` is less than 2.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedQuantileTransformer<F>, FerroError> {
         let n_samples = x.nrows();
-        if n_samples < 2 {
+        // sklearn accepts n_samples >= 1: `n_quantiles_ = max(1, min(n_quantiles,
+        // n_samples))` (`_data.py:2790`). Reject only the empty (0-row) case.
+        if n_samples < 1 {
             return Err(FerroError::InsufficientSamples {
-                required: 2,
+                required: 1,
                 actual: n_samples,
                 context: "QuantileTransformer::fit".into(),
             });
@@ -484,13 +486,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for QuantileTransforme
         let effective_quantiles = self.n_quantiles.min(n_samples);
 
         // numpy np.linspace(0,1,K): step = 1/(K-1) computed once, y[i] = i*step,
-        // endpoint y[K-1] pinned to exactly 1.0 (_data.py:2795).
+        // endpoint y[K-1] pinned to exactly 1.0 (_data.py:2795). For K == 1
+        // (n_samples == 1, sklearn `n_quantiles_ = max(1, ...)`) np.linspace
+        // returns the single point [0.0] — guard the 1/(K-1) divide that would
+        // otherwise yield 0 * (1/0) = NaN.
         let k = effective_quantiles;
-        let denom = F::from(k.saturating_sub(1)).unwrap_or_else(F::one);
-        let step = F::one() / denom;
-        let mut references: Vec<F> = (0..k)
-            .map(|i| F::from(i).unwrap_or_else(F::zero) * step)
-            .collect();
+        let mut references: Vec<F> = if k <= 1 {
+            vec![F::zero()]
+        } else {
+            let denom = F::from(k - 1).unwrap_or_else(F::one);
+            let step = F::one() / denom;
+            (0..k)
+                .map(|i| F::from(i).unwrap_or_else(F::zero) * step)
+                .collect()
+        };
         if k >= 2 {
             let last = references.len() - 1;
             references[last] = F::one();
@@ -586,7 +595,28 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedQuantileTr
                 if val.is_nan() {
                     continue;
                 }
-                let cdf_val = interpolate_cdf(val, feature_quantiles, &self.references);
+                let cdf_val = if feature_quantiles.len() == 1 {
+                    // Single landmark (n_quantiles_ == 1, e.g. a single-sample
+                    // fit). sklearn's forward bound masks are OUTPUT-DISTRIBUTION
+                    // DEPENDENT (`_data.py:2823-2828`, #2219):
+                    //   * Uniform uses EXACT-equality masks (X == bound), so a
+                    //     held-out value keeps the `np_interp` single-point clamp
+                    //     (references_[0] = 0) and the fitted value (== bound)
+                    //     also resolves to lower_bound_y = 0 → always 0.
+                    //   * Normal uses ±BOUNDS_THRESHOLD masks, so a value ABOVE
+                    //     the lone landmark → upper_bound_y = 1 (then
+                    //     probit(1) = +clip), at/below → lower_bound_y = 0
+                    //     (probit(0) = -clip).
+                    if self.output_distribution == OutputDistribution::Normal
+                        && val > feature_quantiles[0]
+                    {
+                        F::one()
+                    } else {
+                        F::zero()
+                    }
+                } else {
+                    interpolate_cdf(val, feature_quantiles, &self.references)
+                };
 
                 out[[i, j]] = match self.output_distribution {
                     OutputDistribution::Uniform => cdf_val,
@@ -625,6 +655,109 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for QuantileTrans
     fn fit_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Standalone `quantile_transform` free function (sklearn `quantile_transform`,
+// `_data.py:2978`)
+// ---------------------------------------------------------------------------
+
+/// Transform features using quantiles information — the standalone,
+/// estimator-less API mirroring scikit-learn's `quantile_transform` free
+/// function (`sklearn/preprocessing/_data.py:2978`,`:3107-3119`).
+///
+/// This is a thin wrapper that **reuses** the fitted estimator: it constructs a
+/// [`QuantileTransformer`] with the given parameters, then runs the SHIPPED
+/// [`Fit::fit`] → [`Transform::transform`] (i.e. `fit_transform`) — it does NOT
+/// reimplement any quantile math. Each call fits on the supplied data and
+/// immediately transforms it (sklearn `n = QuantileTransformer(...); X =
+/// n.fit_transform(X)`, `:3107-3116`).
+///
+/// # Parameters
+///
+/// - `x` — the data to transform, shape `(n_samples, n_features)`.
+/// - `axis` — axis along which to transform (sklearn `axis=0` default,
+///   `:3013-3015`). `axis == 0` transforms each **feature** (column)
+///   independently — `fit_transform(X)` (`:3115-3116`). `axis == 1` transforms
+///   each **sample** (row) independently — `fit_transform(X.T).T`
+///   (`:3117-3118`): the matrix is transposed (so rows become columns / the
+///   per-feature path operates on each original row), fit-transformed, then
+///   transposed back to the original orientation.
+/// - `n_quantiles` — number of quantile reference landmarks (sklearn default
+///   1000, clamped to `n_samples`, `:3017-3023`).
+/// - `output_distribution` — [`OutputDistribution::Uniform`] (sklearn default,
+///   `:3025-3027`) or [`OutputDistribution::Normal`].
+/// - `subsample` — maximum samples used to estimate the quantiles (`0` = use
+///   all). See the scope note below.
+///
+/// # Scope
+///
+/// Unlike sklearn's `quantile_transform`, the `ignore_implicit_zeros`,
+/// `random_state`, and `copy` keyword arguments are **not** surfaced: this path
+/// is dense, deterministic, and always returns a freshly allocated array
+/// (`copy` is implicitly `True`). The `subsample` parameter is threaded to the
+/// estimator, but the actual **random** subsampling is REQ-6 (#1324,
+/// NOT-STARTED): for `n_samples > subsample` the deterministic strided pick is
+/// used instead of sklearn's RNG draw, so this function matches sklearn's output
+/// only when `n_samples <= subsample` (use `subsample=None` or a large value on
+/// the sklearn side to compare). `NaN` is disregarded when fitting and preserved
+/// in the output (sklearn Notes, `:3078-3079`).
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `axis` is neither `0` nor `1`
+/// (mirroring sklearn's `ValueError("axis should be either equal to 0 or 1.
+/// Got axis={axis}")`). Also propagates any error from the underlying
+/// [`Fit::fit`] / [`Transform::transform`] (e.g.
+/// [`FerroError::InsufficientSamples`] for fewer than 2 rows along the chosen
+/// axis, [`FerroError::InvalidParameter`] for `n_quantiles < 2` or non-finite
+/// `±inf` input).
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_preprocess::quantile_transformer::{quantile_transform, OutputDistribution};
+/// use ndarray::array;
+///
+/// let x = array![[1.0_f64], [2.0], [3.0], [4.0], [5.0]];
+/// let out = quantile_transform(&x, 0, 5, OutputDistribution::Uniform, 0).unwrap();
+/// // First maps to 0.0, last to 1.0.
+/// assert!((out[[0, 0]] - 0.0_f64).abs() < 1e-9);
+/// assert!((out[[4, 0]] - 1.0_f64).abs() < 1e-9);
+/// ```
+#[must_use = "quantile_transform returns a new array; the input is not modified"]
+pub fn quantile_transform<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    axis: usize,
+    n_quantiles: usize,
+    output_distribution: OutputDistribution,
+    subsample: usize,
+) -> Result<Array2<F>, FerroError> {
+    let qt = QuantileTransformer::<F>::new(n_quantiles, output_distribution, subsample);
+    match axis {
+        // sklearn `if axis == 0: X = n.fit_transform(X)` (`_data.py:3115-3116`):
+        // each feature (column) transformed independently.
+        0 => {
+            let fitted = qt.fit(x, &())?;
+            fitted.transform(x)
+        }
+        // sklearn `else: X = n.fit_transform(X.T).T` (`_data.py:3117-3118`): each
+        // sample (row) transformed independently. Transpose to a CONTIGUOUS owned
+        // array so the per-feature `fit`/`transform` operates on each original
+        // row, then transpose the result back to the original orientation.
+        1 => {
+            let xt = x.t().to_owned();
+            let fitted = qt.fit(&xt, &())?;
+            let out_t = fitted.transform(&xt)?;
+            Ok(out_t.t().to_owned())
+        }
+        // sklearn `else: raise ValueError("axis should be either equal to 0 or 1.
+        // Got axis={axis}")` (`_data.py:3117` guard via `@validate_params`).
+        other => Err(FerroError::InvalidParameter {
+            name: "axis".into(),
+            reason: format!("axis should be either equal to 0 or 1. Got axis={other}"),
+        }),
     }
 }
 
@@ -700,9 +833,26 @@ mod tests {
 
     #[test]
     fn test_quantile_transformer_insufficient_samples_error() {
+        // sklearn accepts n_samples == 1 (clamps n_quantiles_ to 1, `_data.py:2790`);
+        // only the empty (0-row) case is rejected (#2218).
         let qt = QuantileTransformer::<f64>::new(100, OutputDistribution::Uniform, 0);
-        let x = array![[1.0]];
-        assert!(qt.fit(&x, &()).is_err());
+        let empty = ndarray::Array2::<f64>::zeros((0, 1));
+        assert!(qt.fit(&empty, &()).is_err());
+    }
+
+    #[test]
+    fn test_quantile_transformer_single_sample_all_zeros_no_nan() {
+        // sklearn: QuantileTransformer(5,'uniform').fit_transform([[7.]]) -> [[0.0]]
+        // (n_quantiles_ clamped to 1, references_=[0.0]). Must not produce NaN.
+        let qt = QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0);
+        let x = array![[7.0]];
+        let res = qt.fit_transform(&x);
+        assert!(res.is_ok(), "single-sample fit_transform must succeed");
+        if let Ok(out) = res {
+            assert_eq!(out.dim(), (1, 1));
+            let v = out[[0, 0]];
+            assert!(v.abs() <= 1e-12 && !v.is_nan());
+        }
     }
 
     #[test]

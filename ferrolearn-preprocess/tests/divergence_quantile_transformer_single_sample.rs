@@ -50,7 +50,6 @@ use ndarray::array;
 ///
 /// Tracking: #2219
 #[test]
-#[ignore = "divergence: single-sample Normal forward transform ignores sklearn exact upper/lower bound override, held-out value above landmark -> -clip instead of +clip; tracking #2219"]
 fn divergence_single_sample_normal_heldout_above_landmark() {
     // oracle: python3 -c "import numpy as np, warnings; warnings.simplefilter('ignore'); \
     //   from sklearn.preprocessing import QuantileTransformer; \
@@ -66,7 +65,11 @@ fn divergence_single_sample_normal_heldout_above_landmark() {
     // Sanity (these MATCH sklearn; not the divergence): fit clamps to 1 landmark.
     // oracle: qt.n_quantiles_ == 1, qt.references_ == [0.0]
     assert_eq!(fitted.n_quantiles(), 1, "n_quantiles_ should clamp to 1");
-    assert_eq!(fitted.references(), &[0.0_f64], "references_ should be [0.0]");
+    assert_eq!(
+        fitted.references(),
+        &[0.0_f64],
+        "references_ should be [0.0]"
+    );
 
     let out = fitted.transform(&array![[50.0_f64]]).unwrap();
     let actual = out[[0, 0]];

@@ -151,7 +151,7 @@ pub use iterative_imputer::{FittedIterativeImputer, InitialStrategy, IterativeIm
 pub use kbins_discretizer::{BinEncoding, BinStrategy, FittedKBinsDiscretizer, KBinsDiscretizer};
 pub use knn_imputer::{FittedKNNImputer, KNNImputer, KNNWeights};
 pub use quantile_transformer::{
-    FittedQuantileTransformer, OutputDistribution, QuantileTransformer,
+    FittedQuantileTransformer, OutputDistribution, QuantileTransformer, quantile_transform,
 };
 pub use rfe::{RFE, RFECV};
 pub use select_from_model::{FittedSelectFromModelExt, SelectFromModelExt, ThresholdStrategy};

@@ -170,12 +170,11 @@ fn green_uniform_distinct_multi_feature() {
 /// doc REQ-5 flagged DIVs), so the assertion is on `is_err()` shape only.
 #[test]
 fn green_error_contracts() {
-    // n_samples < 2 -> Err
+    // n_samples == 0 (empty) -> Err. sklearn ACCEPTS n_samples == 1 (clamps
+    // n_quantiles_ to 1, `_data.py:2790`), so only the empty case Errs (#2218).
     let qt = QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0);
-    assert!(
-        qt.fit(&array![[1.0]], &()).is_err(),
-        "single-sample fit should Err"
-    );
+    let empty = ndarray::Array2::<f64>::zeros((0, 1));
+    assert!(qt.fit(&empty, &()).is_err(), "empty (0-row) fit should Err");
 
     // n_quantiles < 2 -> Err
     let qt1 = QuantileTransformer::<f64>::new(1, OutputDistribution::Uniform, 0);
@@ -1301,7 +1300,6 @@ fn free_fn_f32_axis0_uniform() {
 /// ferrolearn returns `Err(InsufficientSamples)`.
 /// Tracking: #2218
 #[test]
-#[ignore = "divergence: quantile_transform axis=1 on single-column rejects (n_samples<2 guard) where sklearn clamps n_quantiles and succeeds; tracking #2218"]
 fn divergence_free_fn_axis1_single_column_rejected() {
     // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
     //   import warnings; warnings.filterwarnings('ignore'); \
@@ -1326,4 +1324,58 @@ fn divergence_free_fn_axis1_single_column_rejected() {
             out[[i, 0]]
         );
     }
+}
+
+/// #2218 (axis=0 single ROW): a `(1, n_features)` input has n_samples=1; sklearn
+/// `quantile_transform(X, axis=0, ...)` clamps `n_quantiles_` to 1 (`_data.py:2790`)
+/// and returns an all-zeros `(1, n_features)` matrix. ferrolearn must too.
+#[test]
+fn free_fn_axis0_single_row_all_zeros() {
+    // oracle: python3 -c "import numpy as np; from sklearn.preprocessing import quantile_transform; \
+    //   import warnings; warnings.filterwarnings('ignore'); \
+    //   o=quantile_transform(np.array([[1.,2.,3.]]), axis=0, n_quantiles=5, \
+    //   output_distribution='uniform', subsample=None); print(o.shape, o.ravel().tolist())"
+    //   -> (1, 3) [0.0, 0.0, 0.0]
+    let x = array![[1.0, 2.0, 3.0]];
+    let out = quantile_transform(&x, 0, 5, OutputDistribution::Uniform, 0)
+        .expect("sklearn returns Ok((1,3)) for single-row axis=0; ferrolearn must too");
+    assert_eq!(out.dim(), (1, 3), "single-row axis=0 must preserve (1,3)");
+    for &v in out.iter() {
+        let v: f64 = v;
+        assert!(
+            v.abs() <= 1e-12 && !v.is_nan(),
+            "single-row uniform transform must be all-zeros (no NaN), got {v}"
+        );
+    }
+}
+
+/// #2218 (core estimator path): `fit` accepts a single sample, clamps the
+/// effective reference grid to one point at 0.0 (NOT 0*(1/0)=NaN), and the
+/// Uniform `transform` of that single sample maps to 0.0. n_samples==0 still Errs.
+#[test]
+fn single_sample_fit_transform_all_zeros_no_nan() {
+    // oracle: QuantileTransformer(n_quantiles=5, 'uniform', subsample=10**9)
+    //   .fit_transform([[7.,42.]]) -> [[0.0, 0.0]] (n_quantiles_ clamped to 1).
+    let single = array![[7.0, 42.0]];
+    let fitted = QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0)
+        .fit(&single, &())
+        .expect("single-sample fit must succeed (sklearn clamps n_quantiles_ to 1)");
+    let out = fitted.transform(&single).unwrap();
+    assert_eq!(out.dim(), (1, 2));
+    for &v in out.iter() {
+        let v: f64 = v;
+        assert!(
+            v.abs() <= 1e-12 && !v.is_nan(),
+            "single-sample uniform transform must be 0.0 (no NaN/inf), got {v}"
+        );
+    }
+
+    // n_samples == 0 (empty) still rejected.
+    let empty = ndarray::Array2::<f64>::zeros((0, 2));
+    assert!(
+        QuantileTransformer::<f64>::new(5, OutputDistribution::Uniform, 0)
+            .fit(&empty, &())
+            .is_err(),
+        "empty (0-row) fit must still Err"
+    );
 }
