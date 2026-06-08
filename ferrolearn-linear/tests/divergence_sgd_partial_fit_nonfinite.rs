@@ -112,7 +112,6 @@ fn pinf_in_x() -> Array2<f64> {
 /// `Ok(FittedSGDClassifier)` (the guard lives only on the `Fit::fit` entry).
 /// Tracking: #2264
 #[test]
-#[ignore = "divergence: SGDClassifier::partial_fit accepts non-finite X (batch-4 #2263 missed the partial_fit arm); tracking #2264"]
 fn sgd_classifier_partial_fit_rejects_non_finite_x() {
     for x in [nan_in_x(), pinf_in_x()] {
         let res = SGDClassifier::<f64>::new().partial_fit(&x, &finite_yc());
@@ -134,7 +133,6 @@ fn sgd_classifier_partial_fit_rejects_non_finite_x() {
 /// sklearn raises `ValueError: Input X contains NaN.`; ferrolearn returns `Ok`.
 /// Tracking: #2264
 #[test]
-#[ignore = "divergence: FittedSGDClassifier::partial_fit accepts non-finite X (batch-4 #2263 missed the incremental partial_fit arm); tracking #2264"]
 fn sgd_classifier_incremental_partial_fit_rejects_non_finite_x() {
     let fitted = SGDClassifier::<f64>::new()
         .fit(&finite_x(), &finite_yc())
@@ -157,7 +155,6 @@ fn sgd_classifier_incremental_partial_fit_rejects_non_finite_x() {
 /// sklearn raises `ValueError: Input X contains NaN.`; ferrolearn returns `Ok`.
 /// Tracking: #2264
 #[test]
-#[ignore = "divergence: SGDRegressor::partial_fit accepts non-finite X (batch-4 #2263 missed the partial_fit arm); tracking #2264"]
 fn sgd_regressor_partial_fit_rejects_non_finite_x() {
     for x in [nan_in_x(), pinf_in_x()] {
         let res = SGDRegressor::<f64>::new().partial_fit(&x, &finite_yr());
@@ -175,7 +172,6 @@ fn sgd_regressor_partial_fit_rejects_non_finite_x() {
 /// sklearn raises `ValueError: Input y contains NaN.`; ferrolearn returns `Ok`.
 /// Tracking: #2264
 #[test]
-#[ignore = "divergence: SGDRegressor::partial_fit accepts non-finite y (batch-4 #2263 missed the partial_fit arm); tracking #2264"]
 fn sgd_regressor_partial_fit_rejects_non_finite_y() {
     let mut y = finite_yr();
     y[0] = f64::NAN;
@@ -197,7 +193,6 @@ fn sgd_regressor_partial_fit_rejects_non_finite_y() {
 /// sklearn raises `ValueError: Input X contains NaN.`; ferrolearn returns `Ok`.
 /// Tracking: #2264
 #[test]
-#[ignore = "divergence: FittedSGDRegressor::partial_fit accepts non-finite X (batch-4 #2263 missed the incremental partial_fit arm); tracking #2264"]
 fn sgd_regressor_incremental_partial_fit_rejects_non_finite_x() {
     let fitted = SGDRegressor::<f64>::new()
         .fit(&finite_x(), &finite_yr())

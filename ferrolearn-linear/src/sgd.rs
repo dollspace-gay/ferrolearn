@@ -2167,6 +2167,18 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             });
         }
 
+        // sklearn `SGDClassifier.partial_fit` validates X through
+        // `_validate_data(force_all_finite=True)` (`_stochastic_gradient.py:596`),
+        // raising `ValueError("Input X contains NaN.")` for any non-finite X
+        // BEFORE the kernel. `y` is integer labels (always finite by type).
+        // Mirrors the #2263 `fit_with_sample_weight` guard.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         // Use a single-epoch hyper for partial_fit.
         let mut hyper = self.hyper.clone();
         hyper.max_iter = 1;
@@ -2215,6 +2227,18 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             self.l1_ratio,
             self.validation_fraction,
         )?;
+
+        // sklearn `SGDClassifier.partial_fit` validates X through
+        // `_validate_data(force_all_finite=True)` (`_stochastic_gradient.py:596`),
+        // raising `ValueError("Input X contains NaN.")` for any non-finite X
+        // BEFORE the kernel (`validate_clf_params` checks shape/params, not
+        // finiteness). `y` is integer labels (always finite by type).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut classes: Vec<usize> = y.to_vec();
@@ -3208,6 +3232,24 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             });
         }
 
+        // sklearn `SGDRegressor.partial_fit` validates X and the float target y
+        // through `_validate_data(force_all_finite=True)`
+        // (`_stochastic_gradient.py:1476`), raising `ValueError("Input X contains
+        // NaN.")` / `"Input y contains NaN."` BEFORE the kernel. Mirrors the
+        // #2263 `fit_with_sample_weight` guard.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
         let mut hyper = self.hyper.clone();
         hyper.max_iter = 1;
         // `partial_fit` carries no per-sample weight here; uniform `1.0`.
@@ -3258,6 +3300,24 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
             &self.loss,
             self.validation_fraction,
         )?;
+
+        // sklearn `SGDRegressor.partial_fit` validates X and the float target y
+        // through `_validate_data(force_all_finite=True)`
+        // (`_stochastic_gradient.py:1476`), raising `ValueError("Input X contains
+        // NaN.")` / `"Input y contains NaN."` BEFORE the kernel
+        // (`validate_reg_params` checks shape/params, not finiteness).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut hyper = reg_hyper(&self);
