@@ -8,9 +8,10 @@
 //! Three pins (un-ignored, release-blockers) assert sklearn behavior and
 //! currently FAIL against ferrolearn. Four green-guards lock SHIPPED behavior.
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
-use ferrolearn_preprocess::label_binarizer::LabelBinarizer;
-use ndarray::{Array2, array};
+use ferrolearn_preprocess::label_binarizer::{LabelBinarizer, label_binarize};
+use ndarray::{Array1, Array2, array};
 
 // ===========================================================================
 // DIV-1 (REQ-4, HEADLINE): transform of an unseen label.
@@ -330,4 +331,214 @@ fn req8_defaults_preserve_zero_one() {
         [0.0, 1.0, 0.0],
     ];
     assert_eq!(fitted.transform(&y).unwrap(), expected);
+}
+
+// ===========================================================================
+// REQ-10: `label_binarize` free function (sklearn `_label.py:430`).
+//
+// Encodes `y` against an EXPLICIT `classes` list (not fit-discovered). Output
+// columns follow the GIVEN `classes` order via sklearn's "preserve label
+// ordering" reorder (`_label.py:587-590`); collapse by `k = classes.len()`
+// (k==1 all-neg col `:532-538`; k==2 single col = `Y[:,-1]` after reorder
+// `:596`; k>2 one-hot in given order); unseen labels → all-neg row
+// (`:556-559`); `neg>=pos` → ValueError verbatim (`:499-504`).
+//
+// Every expected value below is a LIVE sklearn 1.5.2 oracle (run from /tmp):
+//   from sklearn.preprocessing import label_binarize
+// ===========================================================================
+
+/// REQ-10: basic multiclass.
+/// Live oracle:
+///   `label_binarize([0,2,1], classes=[0,1,2]).tolist()`
+///     -> `[[1,0,0],[0,0,1],[0,1,0]]`
+#[test]
+fn req10_label_binarize_basic_multiclass() {
+    let y: Array1<usize> = array![0, 2, 1];
+    let got = label_binarize(&y, &[0, 1, 2], 0, 1).unwrap();
+    let expected: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-10: neg_label/pos_label.
+/// Live oracle:
+///   `label_binarize([0,2], classes=[0,1,2], neg_label=-1, pos_label=2).tolist()`
+///     -> `[[2,-1,-1],[-1,-1,2]]`
+#[test]
+fn req10_label_binarize_neg_pos() {
+    let y: Array1<usize> = array![0, 2];
+    let got = label_binarize(&y, &[0, 1, 2], -1, 2).unwrap();
+    let expected: Array2<f64> = array![[2.0, -1.0, -1.0], [-1.0, -1.0, 2.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-10: binary (k==2) single column.
+/// Live oracle:
+///   `label_binarize([0,1,0], classes=[0,1]).tolist()` -> `[[0],[1],[0]]`
+#[test]
+fn req10_label_binarize_binary_single_column() {
+    let y: Array1<usize> = array![0, 1, 0];
+    let got = label_binarize(&y, &[0, 1], 0, 1).unwrap();
+    let expected: Array2<f64> = array![[0.0], [1.0], [0.0]];
+    assert_eq!(got.shape(), &[3, 1]);
+    assert_eq!(got, expected);
+}
+
+/// REQ-10 (HEADLINE): the class-ordering case. With `classes=[2,0,1]` the
+/// output COLUMNS follow the GIVEN order, not a sorted order — sklearn reorders
+/// columns back to the given `classes` order (`_label.py:587-590`).
+/// Live oracle:
+///   `label_binarize([0,2,1], classes=[2,0,1]).tolist()`
+///     -> `[[0,1,0],[1,0,0],[0,0,1]]`
+///
+/// (Contrast: with sorted `classes=[0,1,2]` the same `y` gives
+/// `[[1,0,0],[0,0,1],[0,1,0]]` — DIFFERENT, confirming columns track the GIVEN
+/// order, where column `j` corresponds to `classes[j]`.)
+#[test]
+fn req10_label_binarize_given_class_ordering() {
+    let y: Array1<usize> = array![0, 2, 1];
+    let got = label_binarize(&y, &[2, 0, 1], 0, 1).unwrap();
+    let expected: Array2<f64> = array![[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-10: a value not in `classes` leaves its row all-`neg_label`
+/// (sklearn `np.isin` silent ignore, `_label.py:556-559`).
+/// Live oracle:
+///   `label_binarize([0,3,1], classes=[0,1,2]).tolist()`
+///     -> `[[1,0,0],[0,0,0],[0,1,0]]`  (label 3 ignored, row 1 all-zero)
+#[test]
+fn req10_label_binarize_unseen_label_all_neg_row() {
+    let y: Array1<usize> = array![0, 3, 1];
+    let got = label_binarize(&y, &[0, 1, 2], 0, 1).unwrap();
+    let expected: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+    assert_eq!(got, expected);
+}
+
+/// REQ-10: single-class (k==1) → all-`neg_label` single column.
+/// Live oracle:
+///   `label_binarize([5,5,5], classes=[5]).tolist()` -> `[[0],[0],[0]]`
+///   `label_binarize([5,5,5], classes=[5], neg_label=-1, pos_label=2).tolist()`
+///     -> `[[-1],[-1],[-1]]`
+#[test]
+fn req10_label_binarize_single_class() {
+    let y: Array1<usize> = array![5, 5, 5];
+    let got = label_binarize(&y, &[5], 0, 1).unwrap();
+    assert_eq!(got, array![[0.0], [0.0], [0.0]]);
+
+    let got_np = label_binarize(&y, &[5], -1, 2).unwrap();
+    assert_eq!(got_np, array![[-1.0], [-1.0], [-1.0]]);
+}
+
+/// REQ-10: `neg_label >= pos_label` rejected, verbatim message
+/// (sklearn `_label.py:499-504`).
+/// Live oracle:
+///   `label_binarize([0,1], classes=[0,1], neg_label=2, pos_label=1)`
+///     -> ValueError: "neg_label=2 must be strictly less than pos_label=1."
+#[test]
+fn req10_label_binarize_neg_ge_pos_rejected() {
+    let y: Array1<usize> = array![0, 1];
+    let err = label_binarize(&y, &[0, 1], 2, 1).unwrap_err();
+    assert!(matches!(
+        &err,
+        FerroError::InvalidParameter { name, reason }
+            if name == "neg_label"
+                && reason == "neg_label=2 must be strictly less than pos_label=1."
+    ));
+}
+
+/// REQ-10: the free fn equals the SHIPPED estimator's fit+transform when
+/// `classes` is the fit-discovered (sorted-unique) set. Both sides are
+/// independently checked against the same live sklearn oracle.
+/// Live oracle:
+///   `label_binarize([0,1,2,1], classes=[0,1,2]).tolist()`
+///     == `LabelBinarizer().fit([0,1,2]).transform([0,1,2,1]).tolist()`
+///     -> `[[1,0,0],[0,1,0],[0,0,1],[0,1,0]]`
+///   binary: `label_binarize([0,1,0,1], classes=[0,1])`
+///     == `LabelBinarizer().fit([0,1]).transform([0,1,0,1])` -> `[[0],[1],[0],[1]]`
+#[test]
+fn req10_label_binarize_equals_estimator() {
+    // multiclass
+    let y: Array1<usize> = array![0, 1, 2, 1];
+    let classes = [0_usize, 1, 2];
+    let free = label_binarize(&y, &classes, 0, 1).unwrap();
+    let fitted = LabelBinarizer::new()
+        .fit(&Array1::from(classes.to_vec()), &())
+        .unwrap();
+    let est = fitted.transform(&y).unwrap();
+    let oracle: Array2<f64> = array![
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 1.0, 0.0],
+    ];
+    assert_eq!(free, oracle);
+    assert_eq!(est, oracle);
+    assert_eq!(free, est);
+
+    // binary
+    let yb: Array1<usize> = array![0, 1, 0, 1];
+    let cb = [0_usize, 1];
+    let free_b = label_binarize(&yb, &cb, 0, 1).unwrap();
+    let fitted_b = LabelBinarizer::new()
+        .fit(&Array1::from(cb.to_vec()), &())
+        .unwrap();
+    let est_b = fitted_b.transform(&yb).unwrap();
+    let oracle_b: Array2<f64> = array![[0.0], [1.0], [0.0], [1.0]];
+    assert_eq!(free_b, oracle_b);
+    assert_eq!(est_b, oracle_b);
+    assert_eq!(free_b, est_b);
+
+    // neg/pos estimator equivalence
+    let yn: Array1<usize> = array![0, 2];
+    let cn = [0_usize, 1, 2];
+    let free_n = label_binarize(&yn, &cn, -1, 2).unwrap();
+    let fitted_n = LabelBinarizer::new()
+        .with_neg_label(-1)
+        .with_pos_label(2)
+        .fit(&Array1::from(cn.to_vec()), &())
+        .unwrap();
+    let est_n = fitted_n.transform(&yn).unwrap();
+    let oracle_n: Array2<f64> = array![[2.0, -1.0, -1.0], [-1.0, -1.0, 2.0]];
+    assert_eq!(free_n, oracle_n);
+    assert_eq!(est_n, oracle_n);
+    assert_eq!(free_n, est_n);
+}
+
+// ===========================================================================
+// DIV-REQ10 (the type_of_target collapse): k==2-sized `classes` but a
+// MULTICLASS `y` (plain integer labels).
+//
+// sklearn decides the binary single-column collapse from `type_of_target(y)`,
+// NOT from `len(classes)`:
+//   `sklearn/preprocessing/_label.py:519`   y_type = type_of_target(y)
+//   `sklearn/preprocessing/_label.py:531`   if y_type == "binary":
+//   `sklearn/preprocessing/_label.py:592-596`  if y_type == "binary": Y = Y[:,-1]...
+// For `y=[0,1,2]` we have `type_of_target([0,1,2]) == "multiclass"` (3 distinct
+// values), so the binary branch is NOT entered. sklearn builds a
+// `(n_samples, n_classes) = (3, 2)` indicator via searchsorted
+// (`:552-563`); the label `2` is not in `classes=[0,1]` so `np.isin`
+// (`:556`) drops it, leaving row 2 all-`neg_label`.
+//
+// Live oracle (sklearn 1.5.2, from /tmp):
+//   from sklearn.preprocessing import label_binarize
+//   label_binarize([0,1,2], classes=[0,1]).tolist()  -> [[1, 0], [0, 1], [0, 0]]
+//   (and type_of_target([0,1,2]) == "multiclass")
+//
+// ferrolearn collapses on `k = classes.len() == 2`
+// (`ferrolearn-preprocess/src/label_binarizer.rs:445-457`) and returns a
+// (3, 1) single column [[0],[1],[0]] — WRONG shape AND wrong values, silently.
+// This is plain integer labels (the matched scope), distinct from the
+// documented REQ-11 arbitrary-type/multilabel deferral (#1245).
+//
+// Tracking: #2233
+// ===========================================================================
+#[test]
+#[ignore = "divergence: label_binarize collapses by len(classes) not type_of_target(y); tracking #2233"]
+fn divergence_label_binarize_binary_classes_multiclass_y() {
+    let y: Array1<usize> = array![0, 1, 2];
+    // sklearn-oracle: 2 columns, row for unseen label 2 all-zero.
+    let expected: Array2<f64> = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
+    let got = label_binarize(&y, &[0, 1], 0, 1).unwrap();
+    assert_eq!(got.shape(), &[3, 2]);
+    assert_eq!(got, expected);
 }
