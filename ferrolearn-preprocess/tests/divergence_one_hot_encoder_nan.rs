@@ -124,3 +124,52 @@ fn transform_nan_row_one_hots_vs_sklearn_oracle() {
         "NaN row 3 vs sklearn"
     );
 }
+
+// ===========================================================================
+// #2225: +/-inf is REJECTED at fit AND transform (sklearn check_array
+// force_all_finite="allow-nan" allows NaN-as-category but rejects inf), while
+// NaN remains a valid category.
+//
+// Live oracle (sklearn 1.5.2, sparse_output=False, run from /tmp):
+//   OneHotEncoder(sparse_output=False).fit([[1.],[inf],[2.]]) -> ValueError
+//     "Input contains infinity or a value too large for dtype('float64')."
+//   OneHotEncoder(sparse_output=False).fit([[1.],[2.]]).transform([[inf]])
+//     -> ValueError (infinity)
+//   OneHotEncoder(sparse_output=False).fit([[1.],[nan],[2.]]) -> OK
+//     (categories_ = [[1.0, 2.0, nan]])
+// ===========================================================================
+#[test]
+fn inf_rejected_at_fit_and_transform_nan_allowed() {
+    use ferrolearn_core::traits::{Fit, Transform};
+    use ferrolearn_preprocess::OneHotEncoder;
+    use ndarray::array;
+
+    // +inf at fit -> Err
+    let x_inf = array![[1.0_f64], [f64::INFINITY], [2.0]];
+    assert!(
+        OneHotEncoder::<f64>::new().fit(&x_inf, &()).is_err(),
+        "fit must reject +inf (sklearn ValueError 'Input contains infinity')"
+    );
+    // -inf at fit -> Err
+    let x_ninf = array![[1.0_f64], [f64::NEG_INFINITY]];
+    assert!(OneHotEncoder::<f64>::new().fit(&x_ninf, &()).is_err());
+
+    // NaN at fit -> OK (NaN is a valid category, #2223)
+    let x_nan = array![[1.0_f64], [f64::NAN], [2.0]];
+    let fitted = OneHotEncoder::<f64>::new()
+        .fit(&x_nan, &())
+        .expect("NaN must be accepted as a category at fit");
+
+    // inf at transform -> Err (finite check before membership)
+    let fitted_finite = OneHotEncoder::<f64>::new()
+        .fit(&array![[1.0_f64], [2.0]], &())
+        .unwrap();
+    assert!(
+        fitted_finite.transform(&array![[f64::INFINITY]]).is_err(),
+        "transform must reject +inf"
+    );
+    // NaN at transform of the NaN-fitted encoder -> OK (one-hots the nan category)
+    let _ = fitted
+        .transform(&array![[f64::NAN]])
+        .expect("NaN transform of a NaN-category encoder must succeed");
+}

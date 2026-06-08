@@ -31,7 +31,7 @@
 //! |---|---|---|
 //! | REQ-1 (dense one-hot via per-feature category blocks) | SHIPPED | `Transform::transform for FittedOneHotEncoder` zero-fills an `Array2<F>` of width `n_output()` then, for each value, sets `out[[i, offsets[j]+idx]]=1` where `idx` is the value's index in `categories_[j]` (membership), mirroring `_BaseEncoder._transform` (`_encoders.py:206-240`) + the one-hot block expansion. Consumer: crate re-export `lib.rs`. |
 //! | REQ-2 (sparse-by-default output) | NOT-STARTED | open prereq blocker #1149. Dense `Array2<F>` only; sklearn defaults `sparse_output=True` → scipy CSR (`:531`,`:748`). |
-//! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; string/object input is REQ-3-string (NOT-STARTED, no String path). |
+//! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; +/-inf is REJECTED at `fit`/`transform` (#2225, `force_all_finite="allow-nan"` allows NaN but not inf); string/object input is REQ-3-string (NOT-STARTED, no String path). |
 //! | REQ-4 (handle_unknown + set-membership error) | NOT-STARTED | open prereq blocker #1151. `transform` raises `InvalidParameter` ("Found unknown categories …") via `categories_` MEMBERSHIP (no longer a `max+1` comparison) — the default `handle_unknown='error'` ValueError mechanism now MATCHES (`_encoders.py:206-214`), but the `'ignore'`/`'infrequent_if_exist'` modes (`:541`) are still absent. R-DEV-2. |
 //! | REQ-5 (drop + infrequent grouping) | NOT-STARTED | open prereq blocker #1152. No `drop` (`:498-516`) / `min_frequency`/`max_categories` (`:566-`). |
 //! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then errors on an ALL-ZERO block (`block_sum == 0`) with `InvalidParameter` ("Samples can not be inverted when drop=None and handle_unknown='error' because they contain all zeros"), mirroring sklearn's two-step argmax-then-all-zero-check (`_encoders.py:1136-1168`); 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the drop-aware / `handle_unknown='ignore'` inverse (None for all-zeros, `:1141-1158`). |
@@ -355,6 +355,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
                 context: "OneHotEncoder::fit".into(),
             });
         }
+        // sklearn `OneHotEncoder.fit` -> `check_array(force_all_finite="allow-nan")`:
+        // NaN is a valid CATEGORY (#2223), but +/-inf is REJECTED (verified live:
+        // fit([[inf]]) -> ValueError "Input contains infinity"). #2225.
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
 
         let n_features = x.ncols();
         let mut categories_: Vec<Vec<F>> = Vec::with_capacity(n_features);
@@ -422,6 +431,17 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
     /// category (not in the learned `categories_[j]` set).
     fn transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let n_features = self.categories_.len();
+        // sklearn `transform` -> `check_array(force_all_finite="allow-nan")`
+        // (`_encoders.py`): +/-inf is rejected with "Input contains infinity"
+        // BEFORE the per-feature membership lookup (so an inf value reports the
+        // finite-check error, NOT "unknown category"); NaN passes (it can be a
+        // known category). #2225.
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
+            });
+        }
         if x.ncols() != n_features {
             return Err(FerroError::ShapeMismatch {
                 expected: vec![x.nrows(), n_features],
