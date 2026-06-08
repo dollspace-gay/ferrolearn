@@ -3457,6 +3457,219 @@ impl RsPolynomialFeatures {
     }
 }
 
+// QuantileTransformer (#1329, REQ-11): hand-written pyclass (not the
+// `py_transformer!` macro) because it is STATEFUL with a constructor enum knob
+// (`output_distribution`) AND an `inverse_transform` method AND fitted ATTRIBUTES
+// (`quantiles_`/`references_`/`n_quantiles_`/`n_features_in_`) the macro
+// (fit/transform only) cannot express. Over
+// `ferrolearn_preprocess::{QuantileTransformer, FittedQuantileTransformer}`.
+//
+// sklearn's ctor is keyword-only `__init__(self, *, n_quantiles=1000,
+// output_distribution="uniform", ignore_implicit_zeros=False, subsample=10_000,
+// random_state=None, copy=True)` (`sklearn/preprocessing/_data.py:2662-2677`).
+// The Python wrapper owns that full ABI; this `_RsQuantileTransformer` takes the
+// three knobs the deterministic dense path consumes — `n_quantiles` (default
+// 1000), `output_distribution` (default "uniform"), `subsample` (default 10000) —
+// from `_make_rs`. `output_distribution` is mapped string→`OutputDistribution`
+// via `resolve_output_distribution`; an out-of-domain string is sklearn's
+// `InvalidParameterError` (⊂ ValueError, `_data.py:2655` `StrOptions({"uniform",
+// "normal"})`), surfaced here as `PyValueError`.
+//
+// SCOPE (honest): the actual random subsampling is REQ-6 (#1324, NOT-STARTED,
+// RNG-gated #2118). This binding's deterministic path uses ALL samples — the
+// core's `subsample` arg is set to 0 (= "use all"), so `subsample`/`random_state`
+// are accepted for sklearn get_params/clone compat but DO NOT subsample. This
+// MATCHES sklearn ONLY when `n_samples <= subsample` (the default 10000 — all
+// small fixtures). `ignore_implicit_zeros` (REQ-8 #1326, sparse) and `copy` are
+// accept-and-document at the Python layer (dense-only / no-op).
+//
+// `fit(x)` builds `QuantileTransformer::<f64>::new(n_quantiles, dist, 0)` and runs
+// `.fit(&x, &())` (insufficient-samples / n_quantiles<2 → FerroError →
+// `PyValueError`). `transform(x)`/`inverse_transform(x)` delegate to the fitted
+// type (`FittedQuantileTransformer::{transform, inverse_transform}`; ±inf in
+// inverse → `PyValueError`, NaN passes through). The fitted attributes:
+// `quantiles_` is the core's per-feature `&[Vec<f64>]` (length n_features, each
+// length n_quantiles_) marshalled as a `(n_quantiles_, n_features)` numpy array —
+// TRANSPOSED to match sklearn's `quantiles_` shape `(n_quantiles_, n_features_in_)`
+// (`_data.py:2610`); `references_` is the `[0,1]` linspace
+// (`FittedQuantileTransformer::references`, `_data.py:2795`); `n_quantiles_` is the
+// EFFECTIVE count after the `min(n_quantiles, n_samples)` clamp
+// (`FittedQuantileTransformer::n_quantiles` == references().len(), `_data.py:2790`);
+// `n_features_in_` is the feature count (`_data.py:2616`).
+//
+// #2215-class f64-ABI caveat: for float32 INPUT the Python wrapper upcasts to
+// float64 (the f64 ABI) then casts back, so float32 VALUES can differ from
+// sklearn's float32 by ~1e-5. Normal output follows the REQ-3 Acklam ppf / ndtr
+// contract (~1e-7). float64 uniform is ~1e-9.
+#[pyclass(name = "_RsQuantileTransformer")]
+pub struct RsQuantileTransformer {
+    n_quantiles: usize,
+    output_distribution: String,
+    // Accepted for the keyword-only ctor ABI parity. The deterministic dense path
+    // does NOT subsample (REQ-6 NOT-STARTED #1324); `fit` forces the core's
+    // `subsample` to 0 (use-all), so this field is not read by the binding — the
+    // Python `QuantileTransformer` wrapper holds its own `subsample` for
+    // `get_params`/`clone`/`set_params` round-trip and the n_quantiles>subsample
+    // ValueError. Kept on the pyclass for signature symmetry.
+    #[allow(
+        dead_code,
+        reason = "ctor-ABI parity; subsampling is REQ-6 NOT-STARTED #1324"
+    )]
+    subsample: usize,
+    // `FittedQuantileTransformer` is re-exported at the crate root
+    // (`ferrolearn-preprocess/src/lib.rs`, `pub use quantile_transformer::{...}`),
+    // so it is reachable directly (like `FittedPolynomialFeatures`).
+    fitted: Option<ferrolearn_preprocess::FittedQuantileTransformer<f64>>,
+}
+
+impl RsQuantileTransformer {
+    // Map sklearn's `output_distribution` string to the closed Rust
+    // `OutputDistribution` enum. An out-of-domain string is sklearn's
+    // `InvalidParameterError` (⊂ ValueError), so it surfaces here as a
+    // `PyValueError` (`_parameter_constraints {output_distribution:
+    // StrOptions({"uniform","normal"})}`, `_data.py:2655`).
+    fn resolve_output_distribution(
+        dist: &str,
+    ) -> PyResult<ferrolearn_preprocess::OutputDistribution> {
+        match dist {
+            "uniform" => Ok(ferrolearn_preprocess::OutputDistribution::Uniform),
+            "normal" => Ok(ferrolearn_preprocess::OutputDistribution::Normal),
+            other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "The 'output_distribution' parameter of QuantileTransformer must be a str \
+                 among {{'uniform', 'normal'}}. Got {other:?} instead."
+            ))),
+        }
+    }
+}
+
+#[pymethods]
+impl RsQuantileTransformer {
+    #[new]
+    #[pyo3(signature = (n_quantiles=1000, output_distribution="uniform".to_string(), subsample=10000))]
+    fn new(n_quantiles: usize, output_distribution: String, subsample: usize) -> Self {
+        Self {
+            n_quantiles,
+            output_distribution,
+            subsample,
+            fitted: None,
+        }
+    }
+
+    // sklearn `QuantileTransformer.fit(X, y=None)` (`_data.py:2754`): computes the
+    // per-feature quantile landmarks. The bad-`output_distribution`-string
+    // ValueError is surfaced here (the string→enum map). The core's `subsample`
+    // arg is 0 (use ALL samples) — the deterministic path does not subsample
+    // (REQ-6 NOT-STARTED #1324). Insufficient samples / n_quantiles<2 → FerroError
+    // → PyValueError.
+    fn fit(&mut self, x: PyReadonlyArray2<'_, f64>) -> PyResult<()> {
+        let dist = Self::resolve_output_distribution(&self.output_distribution)?;
+        let x_nd = numpy2_to_ndarray(x);
+        let model =
+            ferrolearn_preprocess::QuantileTransformer::<f64>::new(self.n_quantiles, dist, 0);
+        let fitted = model
+            .fit(&x_nd, &())
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        self.fitted = Some(fitted);
+        Ok(())
+    }
+
+    // sklearn `QuantileTransformer.transform(X)` (`_data.py:2884`): map each value
+    // through its empirical CDF (uniform) or the probit thereof (normal). Wrong
+    // feature count → `ShapeMismatch` → `PyValueError`.
+    fn transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `QuantileTransformer.inverse_transform(X)` (`_data.py:2947`): back-
+    // project transformed data to the original feature space (reverse interp +
+    // `norm.cdf` for normal). NaN passes through; ±inf → `PyValueError`
+    // (`_check_inputs(force_all_finite="allow-nan")`, `_data.py:2876`).
+    fn inverse_transform<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyReadonlyArray2<'_, f64>,
+    ) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let x_nd = numpy2_to_ndarray(x);
+        let xt = fitted
+            .inverse_transform(&x_nd)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        Ok(ndarray2_to_numpy(py, &xt))
+    }
+
+    // sklearn `quantiles_` (`_data.py:2610`, shape `(n_quantiles_, n_features_in_)`):
+    // the per-feature quantile landmarks. The Rust core stores them per-feature
+    // (`quantiles[j]` is feature `j`'s length-`n_quantiles_` landmark vector), so
+    // marshal to a `(n_quantiles_, n_features)` numpy array by TRANSPOSING into
+    // sklearn's `(n_quantiles_, n_features_in_)` layout.
+    #[getter]
+    fn quantiles_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let per_feature = fitted.quantiles();
+        let n_features = per_feature.len();
+        let n_quantiles = fitted.n_quantiles();
+        let mut out = Array2::<f64>::zeros((n_quantiles, n_features));
+        for (j, col) in per_feature.iter().enumerate() {
+            for (q, &v) in col.iter().enumerate() {
+                out[[q, j]] = v;
+            }
+        }
+        Ok(ndarray2_to_numpy(py, &out))
+    }
+
+    // sklearn `references_` (`_data.py:2613`/`:2795`, shape `(n_quantiles_,)`):
+    // the `[0, 1]` linspace quantile levels.
+    #[getter]
+    fn references_<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        let refs = Array1::from_vec(fitted.references().to_vec());
+        Ok(ndarray1_to_numpy(py, &refs))
+    }
+
+    // sklearn `n_quantiles_` (`_data.py:2606`/`:2790`): the EFFECTIVE quantile
+    // count after the `max(1, min(n_quantiles, n_samples))` clamp.
+    #[getter]
+    fn n_quantiles_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_quantiles())
+    }
+
+    // sklearn `n_features_in_` (`_data.py:2616`): number of input features seen
+    // during `fit`.
+    #[getter]
+    fn n_features_in_(&self) -> PyResult<usize> {
+        let fitted = self
+            .fitted
+            .as_ref()
+            .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("not fitted"))?;
+        Ok(fitted.n_features())
+    }
+}
+
 py_transformer!(
     RsMinMaxScaler,
     "_RsMinMaxScaler",

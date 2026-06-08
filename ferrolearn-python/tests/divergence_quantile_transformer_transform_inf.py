@@ -38,9 +38,6 @@ import ferrolearn as fl
 from sklearn.preprocessing import QuantileTransformer as SkQT
 
 
-@pytest.mark.skip(reason="divergence: transform accepts +-inf instead of raising "
-                         "ValueError (sklearn _data.py:2879 force_all_finite="
-                         "'allow-nan'); tracking #2217")
 def test_transform_inf_raises_value_error_like_sklearn():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")

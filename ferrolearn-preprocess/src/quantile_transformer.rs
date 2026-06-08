@@ -26,7 +26,7 @@
 //! | REQ-8 `ignore_implicit_zeros` + sparse CSC | NOT-STARTED (#1326) | sklearn `_data.py:2709-2752` |
 //! | REQ-9 `quantile_transform` free function | NOT-STARTED (#1327) | sklearn `_data.py:2978` |
 //! | REQ-10 `copy` + OneToOneFeatureMixin fitted-attr surface | NOT-STARTED (#1328) | sklearn `_data.py:2540`,`:2790-2795` |
-//! | REQ-11 PyO3 binding | NOT-STARTED (#1329) | `ferrolearn-python/src/` (absent) |
+//! | REQ-11 PyO3 binding | SHIPPED (#1329) | `_RsQuantileTransformer` (`ferrolearn-python/src/extras.rs`) over `QuantileTransformer`/`FittedQuantileTransformer` exposes `fit`/`transform`/`inverse_transform` + the `#[getter]`s `quantiles_` (`&[Vec<F>]` → `(n_quantiles_, n_features)` numpy, transposed), `references_` (this module's `FittedQuantileTransformer::references`), `n_quantiles_` (effective, `FittedQuantileTransformer::n_quantiles` == `references().len()`, the `min(n_quantiles, n_samples)` clamp `_data.py:2790`), `n_features_in_`; `output_distribution` "uniform"/"normal" string→`OutputDistribution` (bad→`PyValueError`, `_data.py:2655` StrOptions). Python `class QuantileTransformer(_TransformerWrapper)` (`_extras.py`) mirrors sklearn's keyword-only ctor `(*, n_quantiles=1000, output_distribution="uniform", ignore_implicit_zeros=False, subsample=10_000, random_state=None, copy=True)` (`_data.py:2662`); pre-fit transform/attr→`NotFittedError`; n_quantiles>subsample→`ValueError` (`_data.py:2774`); registered `lib.rs`/`__init__.py` (non-test consumer, R-DEFER-1). SCOPE: `subsample`/`random_state` accepted for get_params compat but the deterministic path uses ALL samples (REQ-6 actual subsample NOT-STARTED #1324, RNG-gated #2118) — MATCHES sklearn only for n_samples ≤ subsample; `ignore_implicit_zeros` accepted-and-documented (REQ-8 dense-only #1326); `copy` no-op. float32 input → ~1e-5 tolerant (f64 ABI cast-back, #2215-class); Normal output → ~1e-7 (REQ-3 Acklam ppf/ndtr). Live-oracle: `tests/divergence_quantile_transformer_py.py`. |
 //! | REQ-12 ferray substrate | NOT-STARTED (#1330) | R-SUBSTRATE |
 
 use ferrolearn_core::error::FerroError;
@@ -155,6 +155,27 @@ impl<F: Float + Send + Sync + 'static> FittedQuantileTransformer<F> {
     #[must_use]
     pub fn quantiles(&self) -> &[Vec<F>] {
         &self.quantiles
+    }
+
+    /// Return the reference quantile levels (the evenly-spaced `[0, 1]` grid).
+    ///
+    /// Mirrors scikit-learn `references_` (`_data.py:2795` `references_ =
+    /// np.linspace(0, 1, n_quantiles_, endpoint=True)`): a length-`n_quantiles_`
+    /// vector, where `n_quantiles_` is the effective (clamped) quantile count.
+    #[must_use]
+    pub fn references(&self) -> &[F] {
+        &self.references
+    }
+
+    /// Return the effective number of quantile reference points.
+    ///
+    /// Mirrors scikit-learn `n_quantiles_` (`_data.py:2790` `n_quantiles_ =
+    /// max(1, min(n_quantiles, n_samples))`): the requested `n_quantiles`
+    /// clamped down to the number of samples seen during `fit`. Equals
+    /// `references().len()`.
+    #[must_use]
+    pub fn n_quantiles(&self) -> usize {
+        self.references.len()
     }
 
     /// Return the number of features.
@@ -543,6 +564,16 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedQuantileTr
                 expected: vec![x.nrows(), n_features],
                 actual: vec![x.nrows(), x.ncols()],
                 context: "FittedQuantileTransformer::transform".into(),
+            });
+        }
+        // sklearn `transform` -> `_check_inputs(force_all_finite="allow-nan")`
+        // (`_data.py:2879`, called `:2943`): NaN passes through, but +/-inf
+        // raises ValueError (#2217, the forward mirror of the inverse #2212 guard
+        // above; MinMaxScaler #2200 precedent).
+        if x.iter().any(|v| v.is_infinite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains infinity or a value too large for dtype.".into(),
             });
         }
 

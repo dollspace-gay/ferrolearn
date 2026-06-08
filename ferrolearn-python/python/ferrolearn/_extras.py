@@ -61,6 +61,7 @@ from ferrolearn._ferrolearn_rs import (
     _RsPowerTransformer,
     _RsQDA,
     _RsQuantileRegressor,
+    _RsQuantileTransformer,
     _RsRANSACRegressor,
     _RsRBFSampler,
     _RsRandomForestRegressor,
@@ -2437,6 +2438,149 @@ class PolynomialFeatures(_TransformerWrapper):
     def powers_(self):
         check_is_fitted(self, "_rs")
         return np.asarray(self._rs.powers_)
+
+
+class QuantileTransformer(_TransformerWrapper):
+    """Map features to a uniform or normal distribution, backed by Rust (#1329).
+
+    Mirrors ``sklearn.preprocessing.QuantileTransformer``
+    (``sklearn/preprocessing/_data.py:2540-2975``): each feature is mapped
+    independently through its empirical CDF (from ``n_quantiles`` landmarks) to a
+    uniform ``[0, 1]`` distribution, then optionally to a standard normal via the
+    inverse-normal quantile function. The constructor mirrors sklearn's
+    KEYWORD-ONLY signature ``__init__(self, *, n_quantiles=1000,
+    output_distribution="uniform", ignore_implicit_zeros=False, subsample=10_000,
+    random_state=None, copy=True)`` (``_data.py:2662-2677``). All six params are
+    held for ``get_params``/``set_params``/``clone`` round-trip;
+    ``n_quantiles``/``output_distribution`` are threaded into the Rust core via
+    ``_make_rs``.
+
+    STATEFUL: must be ``fit`` before ``transform``/``inverse_transform`` (``fit``
+    records ``quantiles_``/``references_``/``n_quantiles_``/``n_features_in_``).
+    Pre-fit ``transform``/attribute access raises ``NotFittedError`` (via
+    ``check_is_fitted``), matching sklearn.
+
+    Fitted attributes surfaced from the Rust fitted type:
+
+    - ``n_quantiles_`` (int, ``_data.py:2606``/``:2790``): the EFFECTIVE quantile
+      count ``max(1, min(n_quantiles, n_samples))`` after the clamp;
+    - ``quantiles_`` (float array of shape ``(n_quantiles_, n_features_in_)``,
+      ``_data.py:2610``): the per-feature quantile landmarks;
+    - ``references_`` (float array of shape ``(n_quantiles_,)``,
+      ``_data.py:2613``/``:2795``): the ``np.linspace(0, 1, n_quantiles_)`` levels;
+    - ``n_features_in_`` (int, ``_data.py:2616``).
+
+    SCOPE (honest — does NOT match sklearn in every regime):
+
+    - ``subsample``/``random_state``: the ACTUAL random subsampling is
+      quantile_transformer.rs REQ-6 (#1324, NOT-STARTED, RNG-gated #2118). This
+      binding's deterministic path uses ALL samples (no subsample), so it MATCHES
+      sklearn ONLY when ``n_samples <= subsample`` (the default 10000 — all small
+      fixtures). For ``n_samples > subsample`` sklearn draws a random subsample and
+      this binding does NOT; the values then diverge. The
+      ``n_quantiles > subsample`` ValueError (``_data.py:2774-2779``) IS honored
+      below to match sklearn's parameter validation.
+    - ``ignore_implicit_zeros`` (REQ-8 #1326, sparse): accepted-and-documented;
+      dense-only (no effect, as in sklearn's own dense path, ``_data.py:2687``).
+    - ``copy``: accept-and-document no-op (ferrolearn's ``Transform`` always
+      returns a fresh array).
+
+    DTYPE: ``transform``/``inverse_transform`` -> ``check_array(dtype=FLOAT_DTYPES)``
+    (``_data.py:2870``): a FLOATING input dtype is PRESERVED (float32->float32,
+    float64->float64), an INTEGER input is UPCAST to float64. The f64 Rust ABI
+    always returns float64, so cast back ONLY when the input was a floating dtype.
+
+    #2215-class f64-ABI caveat: for FLOAT32 input the CDF lookup runs in float64
+    (the f64 ABI) then casts back to float32, whereas sklearn computes it in
+    float32; the cast-back float32 VALUES can differ from sklearn's by ~1e-5.
+    Normal output follows the Acklam ppf / ndtr contract (quantile_transformer.rs
+    REQ-3), agreeing with sklearn to ~1e-7; float64 uniform is ~1e-9.
+    """
+
+    def __init__(self, *, n_quantiles=1000, output_distribution="uniform",
+                 ignore_implicit_zeros=False, subsample=10_000,
+                 random_state=None, copy=True):
+        self.n_quantiles = n_quantiles
+        self.output_distribution = output_distribution
+        self.ignore_implicit_zeros = ignore_implicit_zeros
+        self.subsample = subsample
+        self.random_state = random_state
+        self.copy = copy
+
+    def _make_rs(self):
+        # sklearn raises ValueError when `subsample is not None and n_quantiles >
+        # subsample` (`_data.py:2774-2779`), BEFORE fitting. Replicate that
+        # parameter-validation contract here (the Rust core has no `subsample`
+        # cap — REQ-6 NOT-STARTED — so the binding owns this guard).
+        if self.subsample is not None and self.n_quantiles > self.subsample:
+            raise ValueError(
+                "The number of quantiles cannot be greater than the number of "
+                "samples used. Got {} quantiles and {} samples.".format(
+                    self.n_quantiles, self.subsample))
+        # The deterministic path uses ALL samples; the core's `subsample` arg is
+        # forced to 0 ("use all") inside `_RsQuantileTransformer.fit`. The bad
+        # `output_distribution`-string ValueError surfaces from the Rust ctor/fit
+        # (`_data.py:2655` StrOptions). `subsample` is passed for signature
+        # symmetry only.
+        return _RsQuantileTransformer(
+            n_quantiles=self.n_quantiles,
+            output_distribution=self.output_distribution,
+            subsample=(self.subsample if self.subsample is not None else 0))
+
+    def fit(self, X, y=None):
+        # STATEFUL fit: build + fit the Rust core, recording the landmarks. Do NOT
+        # set `self.n_features_in_` (it is a read-only @property reading from
+        # `self._rs`). `check_is_fitted` keys off `_rs`.
+        self._rs = self._make_rs()
+        self._rs.fit(_f64(X))
+        return self
+
+    def transform(self, X):
+        # STATEFUL: require a prior fit. sklearn's `transform` calls
+        # `check_is_fitted(self)` (`_data.py:2884`), raising NotFittedError before
+        # any work. Guard here (the base wrapper would AttributeError instead).
+        check_is_fitted(self, "_rs")
+        out = np.asarray(self._rs.transform(_f64(X)))
+        return self._cast_back(out, X)
+
+    def inverse_transform(self, X):
+        # sklearn `inverse_transform(self, X)` (`_data.py:2947`): back-project to
+        # the original feature space. NaN passes through; +-inf -> ValueError
+        # (`_check_inputs(force_all_finite="allow-nan")`, `_data.py:2876`).
+        check_is_fitted(self, "_rs")
+        out = np.asarray(self._rs.inverse_transform(_f64(X)))
+        return self._cast_back(out, X)
+
+    @staticmethod
+    def _cast_back(out, X):
+        # sklearn `_check_inputs(dtype=FLOAT_DTYPES)` (`_data.py:2870`): a FLOATING
+        # input dtype is PRESERVED (float32->float32), an INTEGER input is UPCAST
+        # to float64. The f64 Rust ABI always returns float64, so cast back ONLY
+        # when the input was floating; leave integer input as float64.
+        in_dtype = np.asarray(X).dtype
+        if np.issubdtype(in_dtype, np.floating) and out.dtype != in_dtype:
+            out = out.astype(in_dtype, copy=False)
+        return out
+
+    @property
+    def n_quantiles_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_quantiles_)
+
+    @property
+    def quantiles_(self):
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.quantiles_)
+
+    @property
+    def references_(self):
+        check_is_fitted(self, "_rs")
+        return np.asarray(self._rs.references_)
+
+    @property
+    def n_features_in_(self):
+        check_is_fitted(self, "_rs")
+        return int(self._rs.n_features_in_)
 
 
 class MinMaxScaler(_TransformerWrapper):

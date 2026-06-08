@@ -59,6 +59,7 @@ from ferrolearn._extras import (
     PowerTransformer,
     QuadraticDiscriminantAnalysis,
     QuantileRegressor,
+    QuantileTransformer,
     RANSACRegressor,
     RBFSampler,
     RandomForestRegressor,
@@ -138,6 +139,7 @@ __all__ = [
     "MaxAbsScaler",
     "RobustScaler",
     "PowerTransformer",
+    "QuantileTransformer",
     # Kernel extras
     "KernelRidge",
     "Nystroem",
