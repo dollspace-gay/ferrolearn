@@ -34,6 +34,7 @@
 //! | REQ | Status | Evidence |
 //! |---|---|---|
 //! | REQ-10 (`RidgeClassifierCV`) | SHIPPED | this module: shared-alpha LOO-GCV over the binarized indicator targets (`_ridge.py:2676` + `_RidgeGCV`, `_ridge.py:1688`), final multi-output Ridge refit. |
+//! | REQ-11 (store_cv_results/cv_results_ + scoring/cv/class_weight ctor params) | NOT-STARTED | #2248. sklearn ctor exposes scoring/cv/class_weight/store_cv_results (`_ridge.py:2676+`); `store_cv_results=True` populates `cv_results_` (`_ridge.py:2141-2204`, shape `(n_samples, n_y, n_alphas)` multiclass / `(n_samples, n_alphas)` binary). ferrolearn carries only `alphas`/`fit_intercept`. |
 //!
 //! # Examples
 //!
