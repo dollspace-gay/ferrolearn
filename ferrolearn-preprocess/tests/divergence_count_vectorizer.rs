@@ -31,7 +31,6 @@ fn fit_vocab(docs: &[&str], cv: CountVectorizer) -> Vec<String> {
 ///
 /// Tracking: #2336
 #[test]
-#[ignore = "divergence: fit returns Ok empty-vocab instead of ValueError when all tokens <2 chars; tracking #2336"]
 fn divergence_empty_vocab_all_single_char() {
     // "a b c d": every token is a single char and dropped by the 2+ char rule,
     // leaving an empty vocabulary. sklearn raises; ferrolearn must too.
@@ -58,7 +57,6 @@ fn divergence_empty_vocab_all_single_char() {
 ///
 /// Tracking: #2337
 #[test]
-#[ignore = "divergence: fit returns Ok empty-vocab instead of ValueError when min_df prunes all terms; tracking #2337"]
 fn divergence_empty_vocab_min_df_prunes_all() {
     // 2 docs, min_df=5: no term appears in >=5 docs, so every term is pruned.
     // sklearn raises (max_df default 1.0 -> max_doc_count=2 < min_doc_count=5).

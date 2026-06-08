@@ -16,7 +16,7 @@
 //! | REQ-2 default token_pattern (drop length-1, `_` word char) | SHIPPED (#1217) | `fn tokenize`; sklearn `text.py:1161`, `build_tokenizer:350` |
 //! | REQ-3 binary count clipping | SHIPPED | `FittedCountVectorizer::transform`; sklearn `text.py:1374` |
 //! | REQ-4 lowercase toggle | SHIPPED | `fn tokenize`; sklearn `text.py:1157`,`:323` |
-//! | REQ-5 max_df/min_df int-vs-float duality + threshold errors | NOT-STARTED (#1219; ceil sub-fix shipped #1218) | `fit` df-filter; sklearn `text.py:1379-1382`,`:1236-1239` |
+//! | REQ-5 max_df/min_df int-vs-float duality + threshold errors | NOT-STARTED (#1219; ceil sub-fix shipped #1218; max_df<min_df + post-prune empty-vocab errors shipped #2337) | `fit` df-filter; sklearn `text.py:1379-1382`,`:1236-1239` |
 //! | REQ-6 ngram_range word n-grams | NOT-STARTED (#1220) | sklearn `_word_ngrams` `text.py:242` |
 //! | REQ-7 max_features top-N + tie/sort | SHIPPED (scoped) | `fit`; sklearn `_limit_features` `text.py:1222-1227` |
 //! | REQ-8 tokenizer/token_pattern/preprocessor/analyzer/strip_accents | NOT-STARTED (#1221) | sklearn `build_analyzer` `text.py:419` |
@@ -25,7 +25,8 @@
 //! | REQ-11 sparse CSR output | NOT-STARTED (#1224) | sklearn `_count_vocab` `text.py:1299-1304` |
 //! | REQ-12 get_feature_names_out contract | NOT-STARTED (#1225) | sklearn `text.py:1455` |
 //! | REQ-13 HashingVectorizer | NOT-STARTED (#1226) | sklearn `class HashingVectorizer` `text.py:562` |
-//! | REQ-14 full 16-param ctor + _parameter_constraints + empty-vocab error | NOT-STARTED (#1227) | sklearn `text.py:1124-1148`,`:1236-1239` |
+//! | REQ-14 full 16-param ctor + _parameter_constraints | NOT-STARTED (#1227) | sklearn `text.py:1124-1148` |
+//! | REQ-14a empty-vocabulary ValueError parity (post-tokenize + max_df<min_df + post-prune) | SHIPPED (#2336 #2337) | `CountVectorizer::fit` empty-vocab/`max_df`/post-prune `Err(InvalidParameter)`; sklearn `text.py:1277-1279`,`:1381-1382`,`:1236-1239`. Consumer: crate re-export `pub use count_vectorizer::CountVectorizer` (`lib.rs`). |
 //! | REQ-15 PyO3 binding | NOT-STARTED (#1228) | `ferrolearn-python/src/transformers.rs` (absent) |
 
 use std::collections::HashMap;
@@ -156,6 +157,33 @@ impl CountVectorizer {
             }
         }
 
+        // Empty-vocabulary error (before df-pruning). sklearn's `_count_vocab`
+        // raises `ValueError("empty vocabulary; perhaps the documents only
+        // contain stop words")` when the assembled vocabulary is empty
+        // (`sklearn/feature_extraction/text.py:1277-1279`). This fires when every
+        // token is dropped by the token_pattern (e.g. all length-1 tokens).
+        if df_counts.is_empty() {
+            return Err(FerroError::InvalidParameter {
+                name: "vocabulary".into(),
+                reason: "empty vocabulary; perhaps the documents only contain stop words".into(),
+            });
+        }
+
+        // max_df-vs-min_df cross-validation. sklearn computes the document-count
+        // bounds (`text.py:1379-1380`) and raises
+        // `ValueError("max_df corresponds to < documents than min_df")` when the
+        // max_df bound is below the min_df bound (`text.py:1381-1382`). Here
+        // `max_df` is a float proportion (bound = `max_df * n_doc`) and `min_df`
+        // is an absolute document count (bound = `min_df`).
+        let max_df_count = self.max_df * n_docs as f64;
+        let min_doc_count = self.min_df as f64;
+        if max_df_count < min_doc_count {
+            return Err(FerroError::InvalidParameter {
+                name: "max_df".into(),
+                reason: "max_df corresponds to < documents than min_df".into(),
+            });
+        }
+
         // Filter by min_df and max_df.
         //
         // sklearn 1.5.2 computes `max_doc_count = max_df * n_doc` as a FLOAT with
@@ -165,7 +193,7 @@ impl CountVectorizer {
         // document count against the un-rounded float threshold. (Note: sklearn
         // also accepts an integer `max_df` as an absolute count; that int-vs-float
         // duality is a separate gap and is intentionally not implemented here.)
-        let max_df_count = self.max_df * n_docs as f64;
+        // (`max_df_count` is computed above for the max_df-vs-min_df check.)
         let mut vocab: Vec<String> = df_counts
             .into_iter()
             .filter(|(_, count)| *count >= self.min_df && (*count as f64) <= max_df_count)
@@ -195,6 +223,18 @@ impl CountVectorizer {
             });
             vocab.truncate(max_f);
             vocab.sort(); // restore alphabetical order for consistent indexing
+        }
+
+        // Post-pruning empty-vocabulary error. sklearn's `_limit_features` raises
+        // `ValueError("After pruning, no terms remain. Try a lower min_df or a
+        // higher max_df.")` when the df/max_features filter removes every term
+        // (`sklearn/feature_extraction/text.py:1236-1239`).
+        if vocab.is_empty() {
+            return Err(FerroError::InvalidParameter {
+                name: "vocabulary".into(),
+                reason: "After pruning, no terms remain. Try a lower min_df or a higher max_df."
+                    .into(),
+            });
         }
 
         // Build vocabulary mapping.
