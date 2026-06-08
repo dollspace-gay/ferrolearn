@@ -87,6 +87,7 @@
 //! | REQ-9 (PyO3 binding VALUE parity) | SHIPPED | impl `#[pyclass(name = "_RsDBSCAN")] RsDBSCAN` (`ferrolearn-python/src/extras.rs`): `fn new(eps=0.5, min_samples=5)`, `fn fit` calling `ferrolearn_cluster::DBSCAN::<f64>::new(self.eps).with_min_samples(self.min_samples)`, `#[getter] labels_`; registered via `m.add_class::<extras::RsDBSCAN>()` (`ferrolearn-python/src/lib.rs`), surfaced as `ferrolearn.DBSCAN` (`fit_predict` / `labels_`). Non-test consumer: `import ferrolearn; ferrolearn.DBSCAN(...).fit(X).labels_`. Since the Rust core value-matches (REQ-1/2), `import ferrolearn` matches `import sklearn` on the Euclidean / no-`sample_weight` path. The binding does NOT yet re-expose `core_sample_indices_` / `components_` / `sample_weight` / `metric` (only `labels_` via `#[getter]`) — those ride their own REQs. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker **#951**. `dbscan.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float` + `std::collections::VecDeque`; not migrated to `ferray-core` (R-SUBSTRATE-1/2). The PyO3 boundary uses `numpy2_to_ndarray` (`extras.rs`), an `ndarray` bridge, not `ferray::numpy_interop`. |
 //! | REQ-11 (exact eps-boundary neighbor parity) | NOT-STARTED | open prereq blocker **#952**. `fn region_query` (`dbscan.rs`) includes a neighbor when `squared_euclidean ≤ eps*eps`; sklearn routes through `NearestNeighbors(radius=eps).radius_neighbors` (`_dbscan.py:411-422`) whose `euclidean_distances`/tree distance computation rounds differently at the exact boundary. For an edge whose true distance ≈ `eps` (e.g. exactly `1.3` with `eps=1.3`, or `0.9999999999999998` with `eps=1.0`), the two disagree on inclusion → flips core status / merges clusters, diverging from the oracle `labels_`/`core_sample_indices_`. Reproducing sklearn's exact boundary requires its `euclidean_distances` dot-product rounding AND its `algorithm`-dependent neighbor search (#949) — not a single-file fix. Documented (no committed failing test per R-DEFER-6 / the kdtree #831 + balltree #858 convention). |
+//! | REQ-12 (reject non-finite input) | SHIPPED | impl `Fit::fit` checks `x.iter().any(\|v\| !v.is_finite())` up front (after the `eps`/`min_samples` param checks, before metric resolution / `region_query`) and returns `Err(FerroError::InvalidParameter{name:"X"})`, rejecting NaN AND infinity. Mirrors sklearn's `_validate_data(X, accept_sparse="csr")` (`force_all_finite=True` default) reached from `DBSCAN.fit` (`_dbscan.py:395`), which raises `ValueError` (`validation.py:147-154`). Consumers: the existing `fit` entry — PyO3 `RsDBSCAN::fit` (`extras.rs`) + crate re-export `pub use dbscan::{DBSCAN, FittedDBSCAN}` (`lib.rs`). Pinned by `divergence_nonfinite_reject.rs` (`divergence_dbscan_fit_rejects_nan/_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -475,6 +476,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for DBSCAN<F> {
             return Err(FerroError::InvalidParameter {
                 name: "min_samples".into(),
                 reason: "must be at least 1".into(),
+            });
+        }
+
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(X, accept_sparse="csr")` (`force_all_finite=True`
+        // default) reached from `DBSCAN.fit` (`sklearn/cluster/_dbscan.py:395`),
+        // which raises `ValueError("Input X contains NaN.")`
+        // (`sklearn/utils/validation.py:147-154`). Never panics (R-CODE-2).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

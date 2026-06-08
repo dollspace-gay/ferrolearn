@@ -31,7 +31,20 @@ use ndarray::Array2;
 fn x_nan() -> Array2<f64> {
     Array2::from_shape_vec(
         (6, 2),
-        vec![1.0, 2.0, 3.0, f64::NAN, 5.0, 6.0, 7.0, 8.0, 1.1, 2.1, 3.1, 4.1],
+        vec![
+            1.0,
+            2.0,
+            3.0,
+            f64::NAN,
+            5.0,
+            6.0,
+            7.0,
+            8.0,
+            1.1,
+            2.1,
+            3.1,
+            4.1,
+        ],
     )
     .unwrap()
 }
@@ -64,49 +77,66 @@ fn x_finite() -> Array2<f64> {
 }
 
 #[test]
-#[ignore = "divergence: KMeans::fit accepts NaN (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_kmeans_fit_rejects_nan() {
-    let r = KMeans::new(2).with_n_init(2).with_random_state(0).fit(&x_nan(), &());
-    assert!(r.is_err(), "sklearn KMeans.fit raises ValueError on NaN; ferrolearn must Err");
+    let r = KMeans::new(2)
+        .with_n_init(2)
+        .with_random_state(0)
+        .fit(&x_nan(), &());
+    assert!(
+        r.is_err(),
+        "sklearn KMeans.fit raises ValueError on NaN; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: KMeans::fit accepts +Inf (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_kmeans_fit_rejects_inf() {
-    let r = KMeans::new(2).with_n_init(2).with_random_state(0).fit(&x_inf(), &());
-    assert!(r.is_err(), "sklearn KMeans.fit raises ValueError on Inf; ferrolearn must Err");
+    let r = KMeans::new(2)
+        .with_n_init(2)
+        .with_random_state(0)
+        .fit(&x_inf(), &());
+    assert!(
+        r.is_err(),
+        "sklearn KMeans.fit raises ValueError on Inf; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: DBSCAN::fit accepts NaN (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_dbscan_fit_rejects_nan() {
     let r = DBSCAN::new(0.5).with_min_samples(2).fit(&x_nan(), &());
-    assert!(r.is_err(), "sklearn DBSCAN.fit raises ValueError on NaN; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn DBSCAN.fit raises ValueError on NaN; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: DBSCAN::fit accepts +Inf (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_dbscan_fit_rejects_inf() {
     let r = DBSCAN::new(0.5).with_min_samples(2).fit(&x_inf(), &());
-    assert!(r.is_err(), "sklearn DBSCAN.fit raises ValueError on Inf; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn DBSCAN.fit raises ValueError on Inf; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: MeanShift::fit accepts NaN (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_mean_shift_fit_rejects_nan() {
     let r = MeanShift::new().with_bandwidth(2.0).fit(&x_nan(), &());
-    assert!(r.is_err(), "sklearn MeanShift.fit raises ValueError on NaN; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn MeanShift.fit raises ValueError on NaN; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: MeanShift::fit accepts +Inf (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_mean_shift_fit_rejects_inf() {
     let r = MeanShift::new().with_bandwidth(2.0).fit(&x_inf(), &());
-    assert!(r.is_err(), "sklearn MeanShift.fit raises ValueError on Inf; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn MeanShift.fit raises ValueError on Inf; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: KMeans::predict accepts NaN (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_kmeans_predict_rejects_nan() {
     let fitted = KMeans::new(2)
         .with_n_init(2)
@@ -115,11 +145,13 @@ fn divergence_kmeans_predict_rejects_nan() {
         .expect("finite fit ok");
     let q = Array2::from_shape_vec((1, 2), vec![1.0, f64::NAN]).unwrap();
     let r = fitted.predict(&q);
-    assert!(r.is_err(), "sklearn KMeans.predict raises ValueError on NaN; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn KMeans.predict raises ValueError on NaN; ferrolearn must Err"
+    );
 }
 
 #[test]
-#[ignore = "divergence: GaussianMixture::predict accepts NaN (Ok-garbage) vs sklearn ValueError; tracking #2283"]
 fn divergence_gmm_predict_rejects_nan() {
     let fitted = GaussianMixture::<f64>::new(2)
         .with_max_iter(10)
@@ -127,5 +159,8 @@ fn divergence_gmm_predict_rejects_nan() {
         .expect("finite fit ok");
     let q = Array2::from_shape_vec((1, 2), vec![1.0, f64::NAN]).unwrap();
     let r = fitted.predict(&q);
-    assert!(r.is_err(), "sklearn GaussianMixture.predict raises ValueError on NaN; ferrolearn must Err");
+    assert!(
+        r.is_err(),
+        "sklearn GaussianMixture.predict raises ValueError on NaN; ferrolearn must Err"
+    );
 }

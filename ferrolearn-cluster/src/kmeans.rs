@@ -67,6 +67,7 @@
 //! | REQ-11 (`score` + `fit_transform`) | NOT-STARTED | open prereq blocker #1042. sklearn `KMeans.score(X) = -inertia` (`_kmeans.py:1156-1184`) + `fit_transform`; ferrolearn `FittedKMeans` has neither (only `fn fit_predict`); `RsKMeans` has no `score`/`fit_transform`. |
 //! | REQ-12 (ferrolearn-python binding `n_init` default + `labels_` dtype) | NOT-STARTED | open prereq blocker #1043. PyO3 `RsKMeans::new` signature `n_init=10` + Python `ferrolearn.KMeans` `n_init=10` diverge from sklearn's effective `1` for k-means++ (R-DEFER-7 last layer); binding marshals `labels_` to `int64`, not sklearn `int32`. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1044. `kmeans.rs` imports `ndarray`/`num-traits`/`rand`/`rayon`, not `ferray-core`/`ferray::linalg`/`ferray::random` (R-SUBSTRATE-1/2; RNG entangled with REQ-8). |
+//! | REQ-15 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `Fit::fit` (after the param/sample checks, before k-means++/Lloyd) AND in `Predict::predict` (on the query X) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `_validate_data(force_all_finite=True)` default reached from `KMeans.fit` (`_kmeans.py:1464`) and `KMeans.predict`→`_check_test_data` (`:950`), which raise `ValueError` (`validation.py:147-154`). Consumers: the existing `fit`/`predict` entries — PyO3 `RsKMeans::fit`/`::predict` (`clusterers.rs`) + crate re-export `pub use kmeans::{FittedKMeans, KMeans}` (`lib.rs`). Pinned by `divergence_nonfinite_reject.rs` (`divergence_kmeans_fit_rejects_nan/_inf`, `divergence_kmeans_predict_rejects_nan`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -191,6 +192,24 @@ impl<F: Float> FittedKMeans<F> {
     pub fn n_iter(&self) -> usize {
         self.n_iter_
     }
+}
+
+/// Reject `X` containing any non-finite value (NaN or infinity).
+///
+/// Mirrors sklearn's `_validate_data(..., force_all_finite=True)` (the default),
+/// which `KMeans.fit` (`sklearn/cluster/_kmeans.py:1464`) and `KMeans.predict` →
+/// `_check_test_data` (`:950`) reach: both raise
+/// `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`
+/// (`sklearn/utils/validation.py:147-154`). Clustering has no missing-value
+/// support, so NaN AND infinity are both rejected. Never panics (R-CODE-2).
+fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Compute the squared Euclidean distance between two slices.
@@ -479,6 +498,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
             });
         }
 
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(..., force_all_finite=True)` (the default) reached from
+        // `KMeans.fit` (`sklearn/cluster/_kmeans.py:1464`), which raises
+        // `ValueError("Input X contains NaN.")` (`sklearn/utils/validation.py:147-154`).
+        reject_non_finite(x)?;
+
         let base_seed = self.random_state.unwrap_or(0);
         let mut best_result: Option<FittedKMeans<F>> = None;
 
@@ -585,6 +610,11 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedKMeans<F> {
                 context: "number of features must match fitted KMeans model".into(),
             });
         }
+
+        // Reject non-finite query X (NaN AND Inf), mirroring sklearn's
+        // `KMeans.predict` → `_check_test_data` `_validate_data`
+        // (`sklearn/cluster/_kmeans.py:1091`/`:950`), which raises `ValueError`.
+        reject_non_finite(x)?;
 
         let (labels, _inertia) = assign_clusters(x, &self.cluster_centers_);
         Ok(labels)

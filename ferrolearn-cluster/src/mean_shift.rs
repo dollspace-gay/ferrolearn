@@ -74,6 +74,7 @@
 //! | REQ-10 (error ABI `InvalidParameterError` + no-neighbour `ValueError`) | NOT-STARTED | open prereq blocker #992. sklearn rejects `bandwidth<=0` with `InvalidParameterError` (`(0,inf)`, `_mean_shift.py:440`) and raises `ValueError` when no seed has neighbours (`:516-522`); ferrolearn raises `FerroError::InvalidParameter` (matching bound, different type/ABI) and cannot hit the no-neighbour case. |
 //! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #993. `grep MeanShift ferrolearn-python/` empty — `RsKMeans` is registered but no `RsMeanShift`, so `import ferrolearn` cannot reach `MeanShift`. Only consumer is the crate re-export. |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #994. `mean_shift.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE-1/2). |
+//! | REQ-13 (reject non-finite input) | SHIPPED | impl `Fit::fit` checks `x.iter().any(\|v\| !v.is_finite())` up front (after the `n_samples==0` check, before bandwidth estimation, which reads X) AND `Predict::predict` checks the query X, both returning `Err(FerroError::InvalidParameter{name:"X"})`, rejecting NaN AND infinity. Mirrors sklearn's `_validate_data(X)` (`force_all_finite=True` default) reached from `MeanShift.fit` (`_mean_shift.py:485`) and `MeanShift.predict` (`:576`), which raise `ValueError` (`validation.py:147-154`). Consumers: the existing `fit`/`predict` entries + crate re-export `pub use mean_shift::{FittedMeanShift, MeanShift}` (`lib.rs`). Pinned by `divergence_nonfinite_reject.rs` (`divergence_mean_shift_fit_rejects_nan/_inf`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -397,6 +398,18 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MeanShift<F> {
             });
         }
 
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(X)` (`force_all_finite=True` default) reached from
+        // `MeanShift.fit` (`sklearn/cluster/_mean_shift.py:485`), which raises
+        // `ValueError("Input X contains NaN.")` (`validation.py:147-154`). This
+        // also precedes bandwidth estimation, which reads X. Never panics.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         // Resolve bandwidth.
         let bandwidth = match self.bandwidth {
             Some(bw) => {
@@ -581,6 +594,17 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedMeanShift<F>
                 expected: vec![expected],
                 actual: vec![n_features],
                 context: "number of features must match the fitted MeanShift model".into(),
+            });
+        }
+
+        // Reject non-finite query X (NaN AND Inf), mirroring sklearn's
+        // `MeanShift.predict` → `_validate_data(X, reset=False)`
+        // (`_mean_shift.py:576`), which raises `ValueError`
+        // (`validation.py:147-154`). Never panics.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

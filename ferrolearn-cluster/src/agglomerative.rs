@@ -92,6 +92,7 @@
 //! | REQ-10 (`n_leaves_`/`n_connected_components_`) | SHIPPED | `FittedAgglomerativeClustering` now stores `pub n_leaves_: usize` / `pub n_connected_components_: usize` with accessors `n_leaves()`/`n_connected_components()`; `Fit::fit` sets `n_leaves_ = n_samples`, `n_connected_components_ = 1` for the unstructured (`connectivity=None`) path (`_agglomerative.py:1083-1085`: `ward_tree`/`linkage_tree` return `(children_, 1, n_samples, None[, distances])`). Live-oracle test `n_leaves_and_connected_components_unstructured` (`tests/divergence_agglomerative_threshold.rs`, both fixtures, all 4 linkages). Consumer: `Fit::fit` (production path) + the accessors. `memory` caching (`:1006`/`:1076`) stays NOT-STARTED (open blocker #967): it is an opt-in perf/persistence wrapper with no observable attribute divergence in the default `memory=None` path. |
 //! | REQ-11 (PyO3 binding parity) | SHIPPED | `#[pyclass(name="_RsAgglomerativeClustering")]` (`ferrolearn-python/src/extras.rs`): `fn new(n_clusters=2)`, `fn fit` → `ferrolearn_cluster::AgglomerativeClustering::<f64>::new(self.n_clusters)`, `#[getter] labels_`; registered in `ferrolearn-python/src/lib.rs`, wrapped `class AgglomerativeClustering(_ClusterWrapper)` in `python/ferrolearn/_extras.py`, exported in `__init__.py`. `ferrolearn.AgglomerativeClustering(n_clusters=2).fit(X).labels_` matches sklearn up to label permutation (REQ-1). Hard-wires Ward (no `linkage`/`metric`/`distance_threshold` arg). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #968. `agglomerative.rs` imports `ndarray::{Array1, Array2}` + `num_traits::Float`, not `ferray-core`; the PyO3 boundary uses `numpy2_to_ndarray`, not `ferray::numpy_interop` (R-SUBSTRATE). |
+//! | REQ-13 (reject non-finite input — R-CODE-2 panic fix) | SHIPPED | impl `Fit::fit` checks `x.iter().any(\|v\| !v.is_finite())` BEFORE the `agglomerate(...)` call and returns `Err(FerroError::InvalidParameter{name:"X"})`, rejecting NaN AND infinity. This eliminates the #2282 PANIC: NaN/Inf distances previously mis-routed the nn-chain so `condensed_index`'s `usize` arithmetic underflowed (`agglomerative.rs` `fn condensed_index`). Mirrors sklearn's `_validate_data(X, ensure_min_samples=2)` (`force_all_finite=True` default) reached from `AgglomerativeClustering.fit` (`_agglomerative.py:989`), which raises `ValueError` (`validation.py:147-154`). Consumers: the existing `fit` entry — PyO3 `RsAgglomerativeClustering` + crate re-export + `birch.rs`/`feature_agglomeration.rs`. Pinned by `divergence_nonfinite_panic.rs` (`divergence_agglomerative_fit_nan_no_panic`, `divergence_agglomerative_fit_inf_no_panic`: fit(NaN/Inf) is a clean `Err`, no abort) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the threshold/dendrogram oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
@@ -846,6 +847,21 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for AgglomerativeClust
                 required: k,
                 actual: n_samples,
                 context: "AgglomerativeClustering requires at least n_clusters samples".into(),
+            });
+        }
+
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(X, ensure_min_samples=2)` (`force_all_finite=True`
+        // default) reached from `AgglomerativeClustering.fit`
+        // (`sklearn/cluster/_agglomerative.py:989`), which raises
+        // `ValueError("Input X contains NaN.")` (`validation.py:147-154`). This
+        // MUST precede `agglomerate`: NaN/Inf distances otherwise mis-route the
+        // nn-chain and underflow `condensed_index`'s `usize` arithmetic (the
+        // #2282 panic). Never panics (R-CODE-2).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 

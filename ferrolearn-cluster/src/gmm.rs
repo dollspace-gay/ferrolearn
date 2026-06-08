@@ -71,6 +71,7 @@
 //! | REQ-12 (off-well-separated VALUE parity) | NOT-STARTED | open prereq blocker #1099. exact `weights_`/`means_`/`covariances_` parity on overlapping/general data blocked by the different init (REQ-11) + numpy RNG (R-SUBSTRATE-5). |
 //! | REQ-13 (PyO3 binding full surface) | NOT-STARTED | open prereq blocker #1100. `RsGaussianMixture` omits `covariance_type`/`tol`/`n_init` params + `weights_`/`means_`/`covariances_`/`predict_proba`/`score`/`aic`/`bic`/`n_iter_` getters (R-DEFER-7 last layer). |
 //! | REQ-14 (ferray substrate) | NOT-STARTED | open prereq blocker #1101. `gmm.rs` imports `ndarray`/`num-traits`/`rand`, not `ferray-core`/`ferray::random` (R-SUBSTRATE-1/2). |
+//! | REQ-15 (reject non-finite input — R-CODE-2 panic fix) | SHIPPED | impl `Fit::fit` checks `x.iter().any(\|v\| !v.is_finite())` BEFORE the EM/`run_em` runs (after the `n_components`/`n_init`/`n_samples` checks) AND `Predict::predict` checks the query X, both returning `Err(FerroError::InvalidParameter{name:"X"})`, rejecting NaN AND infinity. The fit check eliminates the #2282 PANIC: NaN data made the k-means++ init sampling `total` NaN so `rng.random_range(0.0..total)` panicked. Mirrors sklearn's `_validate_data(force_all_finite=True)` default reached from `BaseMixture.fit_predict` (`mixture/_base.py:212`) and `GaussianMixture.predict` (`:384`), which raise `ValueError` (`validation.py:147-154`). Consumers: the existing `fit`/`predict` entries — PyO3 `RsGaussianMixture` (`extras.rs`) + crate re-export. Pinned by `divergence_nonfinite_panic.rs` (`divergence_gmm_fit_nan/_inf_no_panic`: clean `Err`, no abort) + `divergence_nonfinite_reject.rs` (`divergence_gmm_predict_rejects_nan`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -922,6 +923,21 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for GaussianMixture<F>
             });
         }
 
+        // Reject non-finite X up front (NaN AND Inf), mirroring sklearn's
+        // `_validate_data(X, dtype=..., ensure_min_samples=2)`
+        // (`force_all_finite=True` default) reached from
+        // `BaseMixture.fit_predict` (`sklearn/mixture/_base.py:212`), which
+        // raises `ValueError("Input X contains NaN.")` (`validation.py:147-154`).
+        // This MUST precede the EM runs: NaN data makes the k-means++ init
+        // sampling total NaN and `rng.random_range(0.0..total)` panics (the
+        // #2282 panic). Never panics (R-CODE-2).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         let base_seed = self.random_state.unwrap_or(0);
         let mut best: Option<FittedGaussianMixture<F>> = None;
 
@@ -982,6 +998,16 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedGaussianMixt
     /// Returns [`FerroError::ShapeMismatch`] if the feature count differs
     /// from the fitted model.
     fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        // Reject non-finite query X (NaN AND Inf), mirroring sklearn's
+        // `GaussianMixture.predict` → `_validate_data(X, reset=False)`
+        // (`sklearn/mixture/_base.py:384`), which raises `ValueError`
+        // (`validation.py:147-154`). Never panics (R-CODE-2).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
         let resp = self.transform(x)?;
         let labels: Array1<usize> = resp
             .rows()
