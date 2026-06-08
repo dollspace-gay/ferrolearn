@@ -480,3 +480,201 @@ fn nusvc_multiclass_ovo_matches_oracle() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-9: probability / predict_proba (NuSVC, #653).
+//
+// `NuSVC(probability=True)` exposes `predict_proba` via the Platt-scaling
+// internal 5-fold CV trained with the NU-SVC sub-solver (the SAME `svm_type`
+// as the outer model, libsvm `svm_binary_svc_probability` `svm.cpp:2147-2150`,
+// `_impl in ("c_svc","nu_svc")` `_base.py:825`).
+//
+// The predict_proba VALUES are NOT bit-matchable against sklearn: libsvm seeds
+// the CV fold permutation with `random_state` (`svm.cpp:2116-2122`), so
+// sklearn's `probA_`/`probB_`/`predict_proba` are NON-DETERMINISTIC across
+// `random_state` (the same documented boundary SVC's REQ-9 carries, R-DEV-4).
+// These pins therefore assert only sklearn's DOCUMENTED STRUCTURAL CONTRACT
+// (R-CHAR-3 — invariants, NOT copied ferrolearn values):
+//   - predict_proba shape (n, n_classes); columns = classes_ in sorted order
+//     (`_base.py:844-847`);
+//   - every row is a probability distribution (sums to 1, values in [0,1]);
+//   - binary P(classes_[1]) monotone non-decreasing in the decision value
+//     (the sigmoid `1/(1+exp(A f + B))` contract);
+//   - predict_log_proba == log(predict_proba) (`_base.py:894`);
+//   - probability=False -> predict_proba raises (`_base.py:822-823`/856-860).
+// Live oracle confirmation (sklearn 1.5.2): on the binary 10x2 set below,
+//   NuSVC(kernel='linear',nu=0.5,probability=True,random_state=0)
+//   .predict_proba(X).sum(1) == [1.,...,1.]; P(class1) rises monotonically with
+//   the decision value; NuSVC(probability=False).predict_proba raises.
+// ===========================================================================
+
+/// Binary 10x2 fit with `probability=True` (linear nu-SVC), nu=0.5.
+fn nusvc_proba_binary_fit() -> ferrolearn_linear::nu_svm::FittedNuSVC<f64, LinearKernel> {
+    let x = Array2::from_shape_vec(
+        (10, 2),
+        vec![
+            1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 2.0, 2.0, 1.5, 1.5, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0, 6.0,
+            6.0, 5.5, 5.5,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 0, 0, 1, 1, 1, 1, 1];
+    NuSVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_nu(0.5)
+        .with_tol(1e-6)
+        .with_max_iter(200_000)
+        .with_probability(true)
+        .fit(&x, &y)
+        .unwrap()
+}
+
+#[test]
+fn nusvc_predict_proba_raises_when_probability_false() {
+    // probability=false (default): predict_proba/predict_log_proba error,
+    // mirroring sklearn's raise (`_base.py:822-823`/856-860). Live oracle:
+    // NuSVC(probability=False).predict_proba -> AttributeError.
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 1.0, 2.0, 1.0, 1.0, 2.0, 5.0, 5.0, 6.0, 5.0, 5.0, 6.0],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1];
+    let fitted = NuSVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_nu(0.5)
+        .fit(&x, &y)
+        .unwrap();
+    let q = Array2::from_shape_vec((1, 2), vec![3.0, 3.0]).unwrap();
+    assert!(
+        fitted.predict_proba(&q).is_err(),
+        "predict_proba must raise when probability=false (sklearn _base.py:822)"
+    );
+    assert!(
+        fitted.predict_log_proba(&q).is_err(),
+        "predict_log_proba must raise when probability=false"
+    );
+}
+
+#[test]
+fn nusvc_predict_proba_binary_rows_sum_to_one() {
+    // sklearn contract (`_base.py:844-847`): predict_proba is (n, n_classes),
+    // columns = classes_ sorted; each row a probability distribution.
+    let fitted = nusvc_proba_binary_fit();
+    let x = Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 1.5, 1.5, 5.0, 5.0, 5.5, 5.5]).unwrap();
+    let p = fitted.predict_proba(&x).unwrap();
+    assert_eq!(
+        p.dim(),
+        (4, 2),
+        "predict_proba shape must be (n, n_classes)"
+    );
+    for s in 0..4 {
+        let row_sum = p[[s, 0]] + p[[s, 1]];
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "row {s} sums to {row_sum}, must be 1 (probability distribution)"
+        );
+        for c in 0..2 {
+            assert!(
+                p[[s, c]] >= 0.0 && p[[s, c]] <= 1.0,
+                "p[{s},{c}] = {} out of [0,1]",
+                p[[s, c]]
+            );
+        }
+    }
+}
+
+#[test]
+fn nusvc_predict_proba_binary_monotone_in_decision() {
+    // STRUCTURAL invariant (sklearn's sigmoid contract `1/(1+exp(A f + B))`):
+    // P(classes_[1]) is monotone non-decreasing in the binary decision value.
+    // Confirmed live: sklearn NuSVC(probability=True) P(class1) rises with df.
+    let fitted = nusvc_proba_binary_fit();
+    let x = Array2::from_shape_vec(
+        (5, 2),
+        vec![1.0, 1.0, 2.5, 2.5, 3.5, 3.5, 4.5, 4.5, 6.0, 6.0],
+    )
+    .unwrap();
+    let p = fitted.predict_proba(&x).unwrap();
+    let df = fitted.decision_function(&x).unwrap();
+    let bin = df.as_binary().expect("binary scores");
+
+    let mut order: Vec<usize> = (0..5).collect();
+    order.sort_by(|&a, &b| {
+        bin[a]
+            .partial_cmp(&bin[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let mut prev = f64::NEG_INFINITY;
+    for &s in &order {
+        let p1 = p[[s, 1]];
+        assert!(
+            p1 >= prev - 1e-9,
+            "P(class_1) not monotone in decision: sample {s} df={} p1={p1} prev={prev}",
+            bin[s]
+        );
+        prev = p1;
+    }
+}
+
+#[test]
+fn nusvc_predict_log_proba_equals_log_of_proba() {
+    // sklearn `predict_log_proba = np.log(predict_proba)` (`_base.py:894`).
+    let fitted = nusvc_proba_binary_fit();
+    let x = Array2::from_shape_vec((3, 2), vec![1.0, 1.0, 3.5, 3.5, 6.0, 6.0]).unwrap();
+    let p = fitted.predict_proba(&x).unwrap();
+    let lp = fitted.predict_log_proba(&x).unwrap();
+    assert_eq!(lp.dim(), p.dim());
+    for s in 0..3 {
+        for c in 0..2 {
+            assert!(
+                (lp[[s, c]] - p[[s, c]].ln()).abs() < 1e-12,
+                "log_proba[{s},{c}] = {} != ln(proba) {}",
+                lp[[s, c]],
+                p[[s, c]].ln()
+            );
+        }
+    }
+}
+
+#[test]
+fn nusvc_predict_proba_multiclass_rows_sum_to_one() {
+    // 3-class: predict_proba is (n, 3), each row a probability distribution
+    // (Wu-Lin-Weng coupling). Live oracle: sklearn NuSVC 3-class predict_proba
+    // rows sum to 1; probA_ has 3 entries (n_pairs).
+    let x = Array2::from_shape_vec(
+        (9, 2),
+        vec![
+            0.0, 0.0, 0.5, 0.0, 0.0, 0.5, 5.0, 0.0, 5.5, 0.0, 5.0, 0.5, 0.0, 5.0, 0.5, 5.0, 0.0,
+            5.5,
+        ],
+    )
+    .unwrap();
+    let y = array![0usize, 0, 0, 1, 1, 1, 2, 2, 2];
+    let fitted = NuSVC::<f64, LinearKernel>::new(LinearKernel)
+        .with_nu(0.5)
+        .with_tol(1e-6)
+        .with_max_iter(200_000)
+        .with_probability(true)
+        .fit(&x, &y)
+        .unwrap();
+    let q = Array2::from_shape_vec((3, 2), vec![0.25, 0.25, 5.0, 0.25, 0.25, 5.0]).unwrap();
+    let p = fitted.predict_proba(&q).unwrap();
+    assert_eq!(p.dim(), (3, 3), "predict_proba shape must be (n, 3)");
+    for s in 0..3 {
+        let row_sum: f64 = (0..3).map(|c| p[[s, c]]).sum();
+        assert!(
+            (row_sum - 1.0).abs() < 1e-9,
+            "row {s} sums to {row_sum}, must be 1"
+        );
+        for c in 0..3 {
+            assert!(
+                p[[s, c]] >= 0.0 && p[[s, c]] <= 1.0,
+                "p[{s},{c}] = {} out of [0,1]",
+                p[[s, c]]
+            );
+        }
+    }
+    // probA_/probB_ length = n_pairs = 3 (structural contract).
+    assert_eq!(fitted.prob_a().len(), 3, "probA_ length must be n_pairs=3");
+    assert_eq!(fitted.prob_b().len(), 3, "probB_ length must be n_pairs=3");
+    assert!(fitted.probability(), "probability() must be true");
+}

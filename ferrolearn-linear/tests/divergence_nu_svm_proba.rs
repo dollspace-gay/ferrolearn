@@ -48,7 +48,6 @@ use ndarray::{Array2, array};
 /// every sklearn random_state.
 /// Tracking: #2245
 #[test]
-#[ignore = "divergence: NuSVC predict_proba degenerates to uniform 1/N (probA_=0) on small per-pair folds; tracking #2245"]
 fn divergence_nusvc_predict_proba_multiclass_argmax_orientation() {
     let x = Array2::from_shape_vec(
         (9, 2),
@@ -89,7 +88,8 @@ fn divergence_nusvc_predict_proba_multiclass_argmax_orientation() {
             }
         }
         assert_eq!(
-            best, expect,
+            best,
+            expect,
             "predict_proba row {s} argmax={best} != sklearn cluster class {expect}; \
              ferrolearn proba={:?} (uniform 1/3 means probA_/probB_ degenerated to 0; \
              sklearn argmax is {expect} for every random_state, svm.cpp:2107-2203)",
@@ -118,7 +118,6 @@ fn divergence_nusvc_predict_proba_multiclass_argmax_orientation() {
 /// `P(class1 | [5,0]) > 0.5`; both are sklearn invariants, not copied values.
 /// Tracking: #2245
 #[test]
-#[ignore = "divergence: NuSVC probA_/probB_ degenerate to 0 on a 6-sample separable pair (contiguous folds single-class); tracking #2245"]
 fn divergence_nusvc_prob_a_degenerate_small_pair() {
     let x = Array2::from_shape_vec(
         (6, 2),

@@ -979,6 +979,14 @@ fn sub_decision_value<F: Float, K: Kernel<F>>(
     val
 }
 
+/// A freshly-trained binary sub-model in this crate's (ferrolearn) sign
+/// convention: support-vector feature rows, their coefficients
+/// (`alpha_i·y_i`, `class_pos = +1` side), and the decision bias such that
+/// [`sub_decision_value`] is positive favoring `class_pos`. Returned by the
+/// per-solver TRAINER closure that [`platt_cv_sigmoid`] invokes on each CV
+/// training fold.
+pub(crate) type SubModel<F> = (Vec<Vec<F>>, Vec<F>, F);
+
 /// Fit the per-ovo-pair Platt sigmoid `(A, B)` via a DETERMINISTIC 5-fold CV
 /// over the pair's samples, mirroring libsvm's `svm_binary_svc_probability`
 /// (`sklearn/svm/src/libsvm/svm.cpp:2107-2203`) EXCEPT for the fold
@@ -988,47 +996,85 @@ fn sub_decision_value<F: Float, K: Kernel<F>>(
 /// (`svm.cpp:2116-2122`), which makes the resulting `(A, B)` (sklearn's
 /// `probA_`/`probB_`) and thus `predict_proba` NON-DETERMINISTIC across
 /// `random_state`. To keep ferrolearn deterministic (it has no libsvm RNG
-/// seed; cf. the documented SGD shuffle boundary), the folds here are
-/// CONTIGUOUS (`fold i = [i·l/5, (i+1)·l/5)`), with NO shuffle. The rest is a
-/// faithful transcription: train `smo_binary` on the 4 training folds,
+/// seed; cf. the documented SGD shuffle boundary, R-DEV-4), the folds here use a
+/// DETERMINISTIC CLASS-STRATIFIED assignment instead of libsvm's random shuffle:
+/// each sample's fold is its WITHIN-CLASS running index modulo `nr_fold`. Because
+/// the per-ovo-pair samples arrive GROUPED by class, a naive contiguous
+/// `[i·l/5, (i+1)·l/5)` split would make whole folds single-class — so the 4-fold
+/// training set could miss a class entirely and `sigmoid_train` would collapse to
+/// the degenerate `(A, B) = (0, 0)`. Stratifying within class keeps both classes
+/// in every training set (when each class has ≥2 samples), restoring libsvm's
+/// structural contract (a non-degenerate sigmoid) without its randomness. The
+/// rest is a faithful transcription: train a binary sub-model on the 4 training
+/// folds,
 /// `predict_values` the held-out fold (in libsvm sign), with the degenerate
 /// one-class-fold fallbacks (`+1` / `-1` / `0`, `svm.cpp:2161-2169`), then
 /// [`sigmoid_train`] over all out-of-fold decisions.
+///
+/// # The `train_fold` trainer abstraction
+///
+/// libsvm's `svm_binary_svc_probability` trains each CV sub-model with the
+/// SAME `svm_type` as the outer model (`svm.cpp:2147-2150`, a copy of the
+/// outer `svm_parameter` with `probability=0`): C-SVC sub-models for `SVC`,
+/// NU-SVC sub-models for `NuSVC`. ferrolearn threads that choice through a
+/// `train_fold` closure: given the training-fold `(data, labels)` (in
+/// ferrolearn sign, `class_pos = +1`), it returns the fitted [`SubModel`]
+/// (`Some`) or `None` on a degenerate/failed sub-solve. `SVC` passes a
+/// closure wrapping [`smo_binary`] (C-SVC); `NuSVC` passes a closure wrapping
+/// [`solve_nu_svc`] (the genuine `Solver_NU`). The CV split, degenerate-fold
+/// fallbacks, held-out scoring via [`sub_decision_value`], and the final
+/// [`sigmoid_train`] are SOLVER-AGNOSTIC, so SVC's `(A, B)` is byte-identical
+/// to the pre-refactor inline-`smo_binary` path.
 ///
 /// `sub_labels` is ferrolearn's sign (`+1` = higher-index `class_pos`,
 /// `-1` = lower-index `class_neg`). The decision values and labels passed to
 /// [`sigmoid_train`] are converted to libsvm sign (`+1` = lower-index
 /// `class_neg`, matching `raw_ovo`) so the fitted `(A, B)` is consistent with
 /// the raw ovo decision used by [`FittedSVC::predict_proba`].
-#[allow(
-    clippy::too_many_arguments,
-    reason = "mirrors smo_binary's per-class box bounds (cp, cn) + solver \
-              hyperparameters threaded through the CV folds"
-)]
-fn platt_cv_sigmoid<F: Float, K: Kernel<F>>(
+pub(crate) fn platt_cv_sigmoid<F: Float, K: Kernel<F>>(
     sub_data: &[Vec<F>],
     sub_labels: &[F],
     kernel: &K,
-    cp: F,
-    cn: F,
-    tol: F,
-    max_iter: usize,
-    cache_size: usize,
+    train_fold: impl Fn(&[Vec<F>], &[F]) -> Option<SubModel<F>>,
 ) -> (F, F) {
     let l = sub_data.len();
     let nr_fold = 5usize;
     // Out-of-fold decision value per sample, in libsvm sign (+1 = class_neg).
     let mut dec_values = vec![F::zero(); l];
 
-    for fold in 0..nr_fold {
-        let begin = fold * l / nr_fold;
-        let end = (fold + 1) * l / nr_fold;
+    // DETERMINISTIC class-stratified fold assignment. libsvm shuffles the fold
+    // permutation with an RNG (`svm.cpp:2116-2122`) so each fold mixes both
+    // classes; ferrolearn stays deterministic (no libsvm RNG seed; cf. the
+    // sanctioned SGD-shuffle boundary, R-DEV-4) by instead assigning each sample
+    // to a fold by its WITHIN-CLASS running index modulo `nr_fold`. The
+    // per-ovo-pair samples arrive GROUPED by class (`[class_neg..., class_pos...]`,
+    // built by the `FittedSVC::fit` loop), so a CONTIGUOUS `[i·l/5, (i+1)·l/5)`
+    // split would make whole folds single-class and the 4-fold training set could
+    // MISS a class entirely → a trivial sub-model → constant held-out decisions →
+    // `sigmoid_train` returns the degenerate `(A, B) = (0, 0)`. Spreading each
+    // class proportionally across all folds keeps BOTH classes in every training
+    // set whenever each class has ≥2 samples, restoring the structural contract
+    // (a non-degenerate sigmoid) at every input — matching libsvm's intent
+    // without its randomness.
+    let mut pos_seen = 0usize;
+    let mut neg_seen = 0usize;
+    let mut fold_of = vec![0usize; l];
+    for (j, &lab) in sub_labels.iter().enumerate() {
+        if lab > F::zero() {
+            fold_of[j] = pos_seen % nr_fold;
+            pos_seen += 1;
+        } else {
+            fold_of[j] = neg_seen % nr_fold;
+            neg_seen += 1;
+        }
+    }
 
-        // Training set = all samples outside [begin, end).
+    for fold in 0..nr_fold {
+        // Training set = all samples NOT assigned to this fold.
         let mut tr_data: Vec<Vec<F>> = Vec::with_capacity(l);
         let mut tr_labels: Vec<F> = Vec::with_capacity(l);
         for (j, row) in sub_data.iter().enumerate() {
-            if j < begin || j >= end {
+            if fold_of[j] != fold {
                 tr_data.push(row.clone());
                 tr_labels.push(sub_labels[j]);
             }
@@ -1048,50 +1094,40 @@ fn platt_cv_sigmoid<F: Float, K: Kernel<F>>(
         // Degenerate folds: libsvm assigns a constant decision
         // (`svm.cpp:2161-2169`). In ferrolearn sign a held-out sample gets
         // +1 (all-positive train), -1 (all-negative train), or 0 (empty); we
-        // store the libsvm-sign value = negation.
+        // store the libsvm-sign value = negation. The held-out fold is now the
+        // (non-contiguous) set `{ j : fold_of[j] == fold }`, not a slice.
+        let held_out = (0..l).filter(|&j| fold_of[j] == fold);
         if p_count == 0 && n_count == 0 {
-            for d in dec_values.iter_mut().take(end).skip(begin) {
-                *d = F::zero();
+            for j in held_out {
+                dec_values[j] = F::zero();
             }
             continue;
         } else if n_count == 0 {
             // train all +1 (class_pos) -> ferrolearn dec +1 -> libsvm -1.
-            for d in dec_values.iter_mut().take(end).skip(begin) {
-                *d = -F::one();
+            for j in held_out {
+                dec_values[j] = -F::one();
             }
             continue;
         } else if p_count == 0 {
-            for d in dec_values.iter_mut().take(end).skip(begin) {
-                *d = F::one();
+            for j in held_out {
+                dec_values[j] = F::one();
             }
             continue;
         }
 
-        // Train a probability-free sub-model on the training folds.
-        let Ok(sub) = smo_binary(
-            &tr_data, &tr_labels, kernel, cp, cn, tol, max_iter, cache_size,
-        ) else {
-            // A failed sub-solve falls back to a neutral 0 decision.
-            for d in dec_values.iter_mut().take(end).skip(begin) {
-                *d = F::zero();
+        // Train a probability-free sub-model on the training folds via the
+        // per-solver trainer (C-SVC for SVC, NU-SVC for NuSVC).
+        let Some((sv_data, sv_coefs, bias)) = train_fold(&tr_data, &tr_labels) else {
+            // A failed/degenerate sub-solve falls back to a neutral 0 decision.
+            for j in held_out {
+                dec_values[j] = F::zero();
             }
             continue;
         };
 
-        // Extract the sub-model's support vectors.
-        let eps = F::from(1e-8).unwrap_or_else(F::epsilon);
-        let mut sv_data: Vec<Vec<F>> = Vec::new();
-        let mut sv_coefs: Vec<F> = Vec::new();
-        for (k, &alpha) in sub.alphas.iter().enumerate() {
-            if alpha > eps {
-                sv_data.push(tr_data[k].clone());
-                sv_coefs.push(alpha * tr_labels[k]);
-            }
-        }
-
         // Score the held-out fold; store in libsvm sign (negate ferrolearn).
-        for j in begin..end {
-            let dec_ferro = sub_decision_value(&sv_data, &sv_coefs, sub.bias, kernel, &sub_data[j]);
+        for j in held_out {
+            let dec_ferro = sub_decision_value(&sv_data, &sv_coefs, bias, kernel, &sub_data[j]);
             dec_values[j] = -dec_ferro;
         }
     }
@@ -1475,6 +1511,20 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
     /// and bias are stored verbatim. The resulting public `dual_coef_`/
     /// `intercept_` then carry the binary nu_svc sign flip exactly as `c_svc`
     /// does (`_base.py:258-262`, predicate `_impl in ["c_svc","nu_svc"]`).
+    ///
+    /// When `probability` is `true`, `prob_a`/`prob_b` are the per-ovo-pair
+    /// sigmoid `(A, B)` parameters fitted by [`platt_cv_sigmoid`] with the
+    /// NU-SVC sub-solver ([`solve_nu_svc`]) ([`NuSVC`](crate::nu_svm::NuSVC)
+    /// REQ-9), so the assembled [`FittedSVC`]'s
+    /// [`Self::predict_proba`]/[`Self::predict_log_proba`] work identically to
+    /// a `probability=true` C-SVC fit — the coupling/`sigmoid_predict` path is
+    /// solver-agnostic (it consumes only `raw_ovo` + `prob_a`/`prob_b`). When
+    /// `probability` is `false`, `prob_a`/`prob_b` are empty.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "carries the full nu-ovo assembly plus the probability state \
+                  (probability flag + per-pair probA/probB) in one constructor"
+    )]
     pub(crate) fn from_nu_ovo(
         kernel: K,
         pairs: Vec<NuOvoPair<F>>,
@@ -1483,6 +1533,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
         y_train: Vec<usize>,
         decision_function_shape: SvmDecisionShape,
         break_ties: bool,
+        probability: bool,
+        prob_a: Vec<F>,
+        prob_b: Vec<F>,
     ) -> Self {
         let binary_models = pairs
             .into_iter()
@@ -1504,9 +1557,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
             y_train,
             decision_function_shape,
             break_ties,
-            probability: false,
-            prob_a: Vec::new(),
-            prob_b: Vec::new(),
+            probability,
+            prob_a,
+            prob_b,
         }
     }
 }
@@ -1732,6 +1785,30 @@ impl<F: Float, K: Kernel<F>> FittedSVC<F, K> {
     /// `probability=false` (delegated from [`Self::predict_proba`]).
     pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         self.predict_proba(x).map(|p| p.mapv(F::ln))
+    }
+
+    /// Whether Platt-scaling probability estimates were fitted
+    /// (`probability`, `sklearn/svm/_classes.py`); when `false`,
+    /// [`Self::predict_proba`]/[`Self::predict_log_proba`] raise.
+    #[must_use]
+    pub fn probability(&self) -> bool {
+        self.probability
+    }
+
+    /// The per-ovo-pair Platt sigmoid `A` parameters (`probA_`,
+    /// `sklearn/svm/_base.py`), length `n_class·(n_class-1)/2`. Empty when
+    /// fitted with `probability=false`.
+    #[must_use]
+    pub fn prob_a(&self) -> Array1<F> {
+        Array1::from_vec(self.prob_a.clone())
+    }
+
+    /// The per-ovo-pair Platt sigmoid `B` parameters (`probB_`,
+    /// `sklearn/svm/_base.py`), length `n_class·(n_class-1)/2`. Empty when
+    /// fitted with `probability=false`.
+    #[must_use]
+    pub fn prob_b(&self) -> Array1<F> {
+        Array1::from_vec(self.prob_b.clone())
     }
 }
 
@@ -2056,16 +2133,32 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 }
 
                 // Platt-scaling CV for this ovo pair (only when probability).
+                // The CV sub-models are C-SVC (the SAME svm_type as the outer
+                // model, libsvm `svm.cpp:2147-2150`): the `train_fold` closure
+                // wraps `smo_binary` + SV extraction, returning the fitted
+                // sub-model in this crate's sign (`class_pos = +1`).
                 if self.probability {
+                    let (tol, max_iter, cache_size) = (self.tol, self.max_iter, self.cache_size);
+                    let sub_eps = F::from(1e-8).unwrap_or_else(F::epsilon);
                     let (a, b) = platt_cv_sigmoid(
                         &sub_data,
                         &sub_labels,
                         &kernel,
-                        cp,
-                        cn,
-                        self.tol,
-                        self.max_iter,
-                        self.cache_size,
+                        |tr_data: &[Vec<F>], tr_labels: &[F]| {
+                            let sub = smo_binary(
+                                tr_data, tr_labels, &kernel, cp, cn, tol, max_iter, cache_size,
+                            )
+                            .ok()?;
+                            let mut sv_d: Vec<Vec<F>> = Vec::new();
+                            let mut sv_c: Vec<F> = Vec::new();
+                            for (k, &alpha) in sub.alphas.iter().enumerate() {
+                                if alpha > sub_eps {
+                                    sv_d.push(tr_data[k].clone());
+                                    sv_c.push(alpha * tr_labels[k]);
+                                }
+                            }
+                            Some((sv_d, sv_c, sub.bias))
+                        },
                     );
                     prob_a.push(a);
                     prob_b.push(b);

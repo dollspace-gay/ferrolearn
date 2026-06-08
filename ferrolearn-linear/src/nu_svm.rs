@@ -65,8 +65,8 @@
 //! | REQ-6 (decision_function propagates SvmScores) | SHIPPED | `FittedNuSVC::decision_function in nu_svm.rs` returns `Result<SvmScores<F>, FerroError>` from the inner `FittedSVC`; binary `(n,)`, ovr `(n,n_classes)` (`_base.py:538-541`). Pinned by `divergence_nusvc_decision_function_delegation`. |
 //! | REQ-7 (predict — ovo voting + tie-break) | SHIPPED | `FittedNuSVC::predict in nu_svm.rs` delegates to the inner `FittedSVC::predict` (libsvm ovo voting, lower-index tie-break, `_base.py:813-814`). Pinned by `nusvc_predict_labels_match_on_separable in tests/divergence_nu_svm.rs` + `test_nusvc_oracle_attrs`. |
 //! | REQ-8 (multiclass NuSVC one-vs-one) | SHIPPED | `NuSVC::fit in nu_svm.rs` trains one `solve_nu_svc` per class pair over `classes = np.unique(y)`, `<2`-class -> `InsufficientSamples` (`_base.py:741-745`), assembled via `from_nu_ovo`. Smoke test `test_nusvc_multiclass in nu_svm.rs`. |
-//! | REQ-9 (probability / predict_proba) | NOT-STARTED | open #653. No `probability`/`predict_proba` on `NuSVC` (shares root cause with svm.md probability work). |
-//! | REQ-10 (constructor params/defaults) | SHIPPED (R-DEV-7 design difference) | NuSVC: `nu` (0.5), `tol` (1e-3), `cache_size` (200), `max_iter` (0 = sklearn `-1`), `decision_function_shape` (Ovr), `break_ties` (false); NuSVR: `nu` (0.5), **`c` (1.0)**, `tol`, `cache_size` (200), `max_iter` (0), NO `epsilon`. `kernel`/`degree`/`gamma`/`coef0` are the type parameter `K` (R-DEV-7, as for SVC); `probability`/`class_weight`/`random_state` unused (NOT-STARTED REQ-9 / deterministic solver). |
+//! | REQ-9 (probability / predict_proba) | SHIPPED | `pub probability: bool` field on `NuSVC` (default `false`, `_classes.py:1129`, `with_probability`) + `predict_proba`/`predict_log_proba`/`prob_a`/`prob_b`/`probability` on `FittedNuSVC`. `NuSVC::fit in nu_svm.rs` (when `self.probability`) runs the shared `crate::svm::platt_cv_sigmoid` PER OVO PAIR with a `train_fold` closure wrapping the **NU-SVC** sub-solver `crate::svm::solve_nu_svc` (the SAME `svm_type` as the outer model, libsvm `svm_binary_svc_probability` `svm.cpp:2147-2150` — NOT `smo_binary`/C-SVC) → per-pair `(probA_, probB_)`, stored on the inner `FittedSVC` via `crate::svm::FittedSVC::from_nu_ovo`. `FittedNuSVC::predict_proba in nu_svm.rs` delegates to `FittedSVC::predict_proba` (the `sigmoid_predict` → `multiclass_probability` coupling is solver-agnostic, consuming only `raw_ovo` + `prob_a`/`prob_b`): binary `[P(classes[0]),P(classes[1])]`, multiclass pairwise → coupling, rows sum to 1, clamp `[1e-7,1-1e-7]`; `predict_log_proba` = `predict_proba.ln()` (`_base.py:866-894`). `probability=false` → `InvalidParameter` "predict_proba is not available when fitted with probability=False" (`_base.py:856-860`; no `NotFitted` variant by R-DEV-4 typestate). **RNG-CV value divergence (documented, NOT a gap, the SAME boundary SVC's REQ-9 carries):** libsvm seeds the CV fold permutation with `random_state` (`svm.cpp:2116-2122`), so sklearn's `probA_`/`probB_`/`predict_proba` are NON-DETERMINISTIC; ferrolearn uses a DETERMINISTIC contiguous 5-fold split, so it does NOT bit-match sklearn's VALUES — only the machinery + structural invariants + the raise contract are verified (R-CHAR-3: the asserted invariants are sklearn's DOCUMENTED contract). `class_weight`/`random_state` NOT-STARTED (deterministic solver, as for SVC). Non-test consumer: `fn fit in nu_svm.rs` consumes `self.probability` (the boundary `NuSVC`/`FittedNuSVC` types are re-exported at the crate root). Pinned by `nusvc_predict_proba_raises_when_probability_false`/`nusvc_predict_proba_binary_rows_sum_to_one`/`nusvc_predict_proba_binary_monotone_in_decision`/`nusvc_predict_log_proba_equals_log_of_proba`/`nusvc_predict_proba_multiclass_rows_sum_to_one in tests/divergence_nu_svm.rs`. |
+//! | REQ-10 (constructor params/defaults) | SHIPPED (R-DEV-7 design difference) | NuSVC: `nu` (0.5), `tol` (1e-3), `cache_size` (200), `max_iter` (0 = sklearn `-1`), `decision_function_shape` (Ovr), `break_ties` (false); NuSVR: `nu` (0.5), **`c` (1.0)**, `tol`, `cache_size` (200), `max_iter` (0), NO `epsilon`. `kernel`/`degree`/`gamma`/`coef0` are the type parameter `K` (R-DEV-7, as for SVC); NuSVC now carries `probability` (default `false`, REQ-9 SHIPPED); `class_weight`/`random_state` unused (deterministic solver). |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open #655. `nu_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE; consistent with svm.rs REQ-10 #643). |
 
 use ferrolearn_core::error::FerroError;
@@ -75,7 +75,8 @@ use ndarray::{Array1, Array2, ScalarOperand};
 use num_traits::Float;
 
 use crate::svm::{
-    FittedSVC, Kernel, NuOvoPair, SvmDecisionShape, SvmScores, solve_nu_svc, solve_nu_svr,
+    FittedSVC, Kernel, NuOvoPair, SvmDecisionShape, SvmScores, platt_cv_sigmoid, solve_nu_svc,
+    solve_nu_svr,
 };
 
 // ---------------------------------------------------------------------------
@@ -115,6 +116,22 @@ pub struct NuSVC<F, K> {
     /// Whether `predict` breaks ties by the ovr decision confidence
     /// (`break_ties`, `sklearn/svm/_classes.py`, default `false`).
     pub break_ties: bool,
+    /// Whether to enable Platt-scaling probability estimates (`probability`,
+    /// `sklearn/svm/_classes.py:1129`, default `False`). When `true`,
+    /// [`Fit::fit`] runs a per-ovo-pair 5-fold internal CV using the
+    /// NU-SVC sub-solver ([`solve_nu_svc`]) — the SAME `svm_type` as the outer
+    /// model, libsvm `svm_binary_svc_probability` (`svm.cpp:2147-2150`) — to fit
+    /// the sigmoid `(probA_, probB_)`, enabling
+    /// [`FittedNuSVC::predict_proba`]/[`FittedNuSVC::predict_log_proba`].
+    ///
+    /// Like SVC's `probability` (svm.rs REQ-9), the predict_proba VALUES do NOT
+    /// bit-match sklearn: libsvm seeds the CV fold permutation with
+    /// `random_state` (`svm.cpp:2116-2122`), making sklearn's
+    /// `probA_`/`probB_`/`predict_proba` NON-DETERMINISTIC; ferrolearn uses a
+    /// DETERMINISTIC contiguous 5-fold split, so only the machinery + the
+    /// structural invariants (rows sum to 1, monotone in the decision value,
+    /// the raise-when-`probability=false`) are verified (R-DEV-4 / R-CHAR-3).
+    pub probability: bool,
 }
 
 impl<F: Float, K: Kernel<F>> NuSVC<F, K> {
@@ -132,6 +149,7 @@ impl<F: Float, K: Kernel<F>> NuSVC<F, K> {
             cache_size: 200,
             decision_function_shape: SvmDecisionShape::Ovr,
             break_ties: false,
+            probability: false,
         }
     }
 
@@ -139,6 +157,18 @@ impl<F: Float, K: Kernel<F>> NuSVC<F, K> {
     #[must_use]
     pub fn with_nu(mut self, nu: F) -> Self {
         self.nu = nu;
+        self
+    }
+
+    /// Enable/disable Platt-scaling probability estimates (`sklearn`
+    /// `probability`, default `false`, `_classes.py:1129`). When `true`,
+    /// [`Fit::fit`] runs the per-ovo-pair 5-fold internal CV with the NU-SVC
+    /// sub-solver to fit the sigmoid `(probA_, probB_)`, enabling
+    /// [`FittedNuSVC::predict_proba`]. See the [`NuSVC::probability`] field doc
+    /// for the documented RNG-CV value divergence.
+    #[must_use]
+    pub fn with_probability(mut self, probability: bool) -> Self {
+        self.probability = probability;
         self
     }
 
@@ -246,6 +276,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
 
         let n_classes = classes.len();
         let mut pairs: Vec<NuOvoPair<F>> = Vec::new();
+        // Per-ovo-pair Platt sigmoid params (only filled when `probability`).
+        let mut prob_a: Vec<F> = Vec::new();
+        let mut prob_b: Vec<F> = Vec::new();
 
         for ci in 0..n_classes {
             for cj in (ci + 1)..n_classes {
@@ -287,6 +320,32 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                         .into(),
                 })?;
 
+                // Platt-scaling CV for this ovo pair (only when probability).
+                // libsvm's `svm_binary_svc_probability` trains the CV sub-models
+                // with the SAME `svm_type` as the outer model
+                // (`svm.cpp:2147-2150`): for NuSVC that is NU-SVC, so the
+                // `train_fold` closure wraps `solve_nu_svc` (NOT `smo_binary`,
+                // which is C-SVC). The returned `NuSvcModel` is already in this
+                // crate's sign (`class_pos = +1`), exactly the `SubModel`
+                // `(sv_data, sv_coefs, bias)` the shared CV expects.
+                if self.probability {
+                    let (nu, tol, max_iter, cache_size) =
+                        (self.nu, self.tol, self.max_iter, self.cache_size);
+                    let (a, b) = platt_cv_sigmoid(
+                        &sub_data,
+                        &sub_labels,
+                        &kernel,
+                        |tr_data: &[Vec<F>], tr_labels: &[F]| {
+                            let sub = solve_nu_svc(
+                                tr_data, tr_labels, &kernel, nu, tol, max_iter, cache_size,
+                            )?;
+                            Some((sub.sv_data, sub.sv_coefs, sub.bias_internal))
+                        },
+                    );
+                    prob_a.push(a);
+                    prob_b.push(b);
+                }
+
                 // Map per-pair SV rows back to ORIGINAL training-row indices.
                 let sv_indices: Vec<usize> =
                     model.sv_indices.iter().map(|&k| sub_indices[k]).collect();
@@ -310,6 +369,9 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             y.to_vec(),
             self.decision_function_shape,
             self.break_ties,
+            self.probability,
+            prob_a,
+            prob_b,
         );
         Ok(FittedNuSVC(inner))
     }
@@ -386,6 +448,65 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
     #[must_use]
     pub fn coef(&self) -> Option<Array2<F>> {
         self.0.coef()
+    }
+
+    /// Class probability estimates, shape `(n_samples, n_classes)`; columns
+    /// correspond to `classes_` in sorted order (`sklearn/svm/_base.py:829-864`,
+    /// `_impl in ("c_svc","nu_svc")`). Delegates to the inner
+    /// [`FittedSVC::predict_proba`], whose `prob_a`/`prob_b` were fitted by the
+    /// per-ovo-pair NU-SVC Platt CV ([`platt_cv_sigmoid`] over
+    /// [`solve_nu_svc`]). For the binary case the row is
+    /// `[P(classes[0]), P(classes[1])]`; multiclass uses the Wu-Lin-Weng
+    /// coupling. Rows sum to 1; values clamped to `[1e-7, 1-1e-7]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when the model was fitted with
+    /// `probability=false` (`predict_proba is not available when fitted with
+    /// probability=False`, `_base.py:856-860`).
+    ///
+    /// **RNG-CV value divergence (documented, NOT a gap):** the predict_proba
+    /// VALUES do NOT bit-match sklearn — libsvm seeds the CV fold permutation
+    /// with `random_state` (`svm.cpp:2116-2122`); ferrolearn uses a
+    /// DETERMINISTIC contiguous 5-fold split (R-DEV-4). Only the machinery +
+    /// structural invariants are verified. See [`NuSVC::probability`].
+    pub fn predict_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        self.0.predict_proba(x)
+    }
+
+    /// Natural-log class probability estimates, shape `(n_samples, n_classes)`
+    /// = `predict_proba(x).ln()` (`sklearn/svm/_base.py:866-894`), delegating to
+    /// the inner [`FittedSVC::predict_log_proba`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when the model was fitted with
+    /// `probability=false` (delegated from [`Self::predict_proba`]).
+    pub fn predict_log_proba(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        self.0.predict_log_proba(x)
+    }
+
+    /// Whether Platt-scaling probability estimates were fitted (`probability`);
+    /// when `false`, [`Self::predict_proba`]/[`Self::predict_log_proba`] raise.
+    #[must_use]
+    pub fn probability(&self) -> bool {
+        self.0.probability()
+    }
+
+    /// The per-ovo-pair Platt sigmoid `A` parameters (`probA_`,
+    /// `sklearn/svm/_base.py`), length `n_class·(n_class-1)/2`. Empty when
+    /// fitted with `probability=false`.
+    #[must_use]
+    pub fn prob_a(&self) -> Array1<F> {
+        self.0.prob_a()
+    }
+
+    /// The per-ovo-pair Platt sigmoid `B` parameters (`probB_`,
+    /// `sklearn/svm/_base.py`), length `n_class·(n_class-1)/2`. Empty when
+    /// fitted with `probability=false`.
+    #[must_use]
+    pub fn prob_b(&self) -> Array1<F> {
+        self.0.prob_b()
     }
 }
 
