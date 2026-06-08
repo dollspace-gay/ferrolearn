@@ -2,8 +2,10 @@
 //!
 //! Each column's categories are mapped to integers `0, 1, 2, ...` in
 //! **lexicographic order** (matching scikit-learn's `OrdinalEncoder`).
-//! Unknown categories seen during
-//! `transform` produce an error.
+//! Unknown categories seen during `transform` produce an error by default
+//! (`handle_unknown='error'`); with `handle_unknown='use_encoded_value'` they
+//! are instead encoded as a configurable `unknown_value` sentinel
+//! (matching scikit-learn's `OrdinalEncoder`).
 //!
 //! # `## REQ status`
 //!
@@ -22,7 +24,7 @@
 //! | REQ-2 (transform + fit_transform, ordinal values + unknown rejection) | SHIPPED | `Transform::transform` maps category→ordinal index (now cast to `f64` via `ordinal_index_to_f64`), unknown → `InvalidParameter` (matches `handle_unknown='error'` default `ValueError`), ncols-mismatch → `ShapeMismatch`. The unknown/ncols-mismatch LOGIC is byte-for-byte UNCHANGED by the dtype fix. Critic-verified: ordinal VALUES `[[1.,2.],[2.,0.],[1.,1.],[0.,2.]]` == live oracle, `green_unknown_category_rejected`, `green_fit_transform_equals_oracle`. Consumer: re-export `lib.rs:142`. |
 //! | REQ-3 (output dtype float64) | SHIPPED | `Transform::Output = Array2<f64>` on BOTH `Transform` impls (`FittedOrdinalEncoder` + the unfitted `OrdinalEncoder` shim) and `FitTransform::fit_transform`; each cell is the ordinal index cast via `ordinal_index_to_f64` (`idx as f64`, lossless < 2^53), matching sklearn's default `dtype=np.float64` output container (`_encoders.py:1262`, `transform` casts `X_int.astype(self.dtype)`). The REQ-1/REQ-2 fit + unknown-rejection LOGIC is unchanged. Critic-verified vs live oracle: `green_fit_transform_f64_oracle` (multi-feature f64 matrix), `green_exact_integer_index_to_f64` (index 10 → `10.0`), plus the value guards over `Array2<f64>`. A CONFIGURABLE non-float64 output dtype (`int32` etc.) is a FOLLOW-ON (blocker #1158 remains open for the `dtype` ctor param); ferrolearn's output is fixed to sklearn's `float64` DEFAULT. This unblocks REQ-5's float `unknown_value` sentinel. Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-4 (numeric/mixed-dtype input) | NOT-STARTED | open prereq blocker #1159. `Array2<String>`-only; sklearn accepts int/str/object (`np.unique` numeric sort). |
-//! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | NOT-STARTED | open prereq blocker #1160. Unknowns always error (`:1265`,`:1274`). |
+//! | REQ-5 (handle_unknown='use_encoded_value' + unknown_value) | SHIPPED | `HandleUnknown` enum `{ Error, UseEncodedValue }` (default `Error`) + `unknown_value: Option<f64>` on `OrdinalEncoder`, threaded into `FittedOrdinalEncoder` via `with_handle_unknown`/`with_unknown_value` builders. `Fit::fit` runs the 3 sklearn validations (`_encoders.py:1473-1526`) AFTER the unchanged `categories_` compute, mapping sklearn's `TypeError`/`ValueError` → `FerroError::InvalidParameter`: (a) `UseEncodedValue` && `unknown_value is None` (sklearn `:1481` `not isinstance(.,Integral)` TypeError); (b) `Error` && `unknown_value is Some` (sklearn `:1488` TypeError); (c) `UseEncodedValue` && non-nan integer `v` with `0 <= v < max_cardinality` (sklearn `:1518-1526` ValueError collision). `Transform::transform` branches unknown categories: `UseEncodedValue` → write `unknown_value` (incl. nan) (sklearn `:1591` `X_trans[~X_mask] = self.unknown_value`); `Error` → `InvalidParameter` (the SHIPPED REQ-2 default, UNCHANGED). Seen categories still map to `idx as f64` (UNCHANGED). NEVER panics (R-CODE-2). Critic-verified vs live sklearn 1.5.2 oracle: `green_use_encoded_value_minus_one`, `green_use_encoded_value_nan`, `green_use_encoded_value_multifeature`, `red_uev_requires_unknown_value`, `red_error_mode_forbids_unknown_value`, `red_unknown_value_collision_in_range`, `green_unknown_value_negative_or_oob_or_nan_ok`, `green_error_mode_unknown_still_rejected` (`tests/divergence_ordinal_encoder.rs`). Configurable `dtype`/`encoded_missing_value` interplay stays OUT OF SCOPE (REQ-3/REQ-6). Consumer: crate re-export `lib.rs:142`. |
 //! | REQ-6 (encoded_missing_value / NaN) | NOT-STARTED | open prereq blocker #1161. No missing-value concept (`:1283`). |
 //! | REQ-7 (explicit categories param) | NOT-STARTED | open prereq blocker #1162. Always `'auto'` (`:1252`). |
 //! | REQ-8 (min_frequency/max_categories infrequent) | NOT-STARTED | open prereq blocker #1163. No infrequent folding (`:1289-1315`). |
@@ -38,6 +40,28 @@ use ndarray::Array2;
 use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
+// HandleUnknown
+// ---------------------------------------------------------------------------
+
+/// How [`OrdinalEncoder`] treats categories at `transform` time that were not
+/// seen during `fit`.
+///
+/// Mirrors scikit-learn's `OrdinalEncoder(handle_unknown=...)` parameter
+/// (`sklearn/preprocessing/_encoders.py:1262`), which accepts `'error'` and
+/// `'use_encoded_value'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HandleUnknown {
+    /// Raise an error on any unknown category (scikit-learn's default
+    /// `handle_unknown='error'`). This is also the default here.
+    #[default]
+    Error,
+    /// Encode unknown categories with the configured `unknown_value` sentinel
+    /// (scikit-learn's `handle_unknown='use_encoded_value'`). Requires
+    /// `unknown_value` to be set.
+    UseEncodedValue,
+}
+
+// ---------------------------------------------------------------------------
 // OrdinalEncoder (unfitted)
 // ---------------------------------------------------------------------------
 
@@ -47,6 +71,14 @@ use std::collections::HashMap;
 /// mapping from the unique string categories (sorted lexicographically)
 /// to consecutive integers `0, 1, 2, ...`, and returns a
 /// [`FittedOrdinalEncoder`].
+///
+/// Unknown categories at `transform` time are, by default, rejected
+/// ([`HandleUnknown::Error`]). Configuring
+/// [`with_handle_unknown`](OrdinalEncoder::with_handle_unknown) with
+/// [`HandleUnknown::UseEncodedValue`] plus
+/// [`with_unknown_value`](OrdinalEncoder::with_unknown_value) instead encodes
+/// unknown categories as the supplied sentinel (which may be `f64::NAN`),
+/// matching scikit-learn's `OrdinalEncoder(handle_unknown='use_encoded_value')`.
 ///
 /// # Examples
 ///
@@ -71,13 +103,58 @@ use std::collections::HashMap;
 /// assert_eq!(encoded[[1, 0]], 1.0); // "dog" is index 1 in col 0
 /// ```
 #[derive(Debug, Clone, Default)]
-pub struct OrdinalEncoder;
+pub struct OrdinalEncoder {
+    /// Strategy for unknown categories at `transform` time.
+    handle_unknown: HandleUnknown,
+    /// Sentinel written for unknown categories when `handle_unknown` is
+    /// [`HandleUnknown::UseEncodedValue`]. May be `f64::NAN`.
+    unknown_value: Option<f64>,
+}
 
 impl OrdinalEncoder {
-    /// Create a new `OrdinalEncoder`.
+    /// Create a new `OrdinalEncoder` with scikit-learn's defaults
+    /// (`handle_unknown='error'`, no `unknown_value`).
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            handle_unknown: HandleUnknown::Error,
+            unknown_value: None,
+        }
+    }
+
+    /// Set the unknown-category strategy (`handle_unknown`).
+    ///
+    /// With [`HandleUnknown::UseEncodedValue`] an `unknown_value` must also be
+    /// supplied via [`with_unknown_value`](OrdinalEncoder::with_unknown_value);
+    /// otherwise [`Fit::fit`] returns an error (matching scikit-learn's
+    /// validation).
+    #[must_use]
+    pub fn with_handle_unknown(mut self, handle_unknown: HandleUnknown) -> Self {
+        self.handle_unknown = handle_unknown;
+        self
+    }
+
+    /// Set the sentinel written for unknown categories under
+    /// [`HandleUnknown::UseEncodedValue`]. May be `f64::NAN`.
+    ///
+    /// Setting this while `handle_unknown` is [`HandleUnknown::Error`] causes
+    /// [`Fit::fit`] to return an error (matching scikit-learn's validation).
+    #[must_use]
+    pub fn with_unknown_value(mut self, unknown_value: f64) -> Self {
+        self.unknown_value = Some(unknown_value);
+        self
+    }
+
+    /// Return the configured unknown-category strategy.
+    #[must_use]
+    pub fn handle_unknown(&self) -> HandleUnknown {
+        self.handle_unknown
+    }
+
+    /// Return the configured unknown-category sentinel, if any.
+    #[must_use]
+    pub fn unknown_value(&self) -> Option<f64> {
+        self.unknown_value
     }
 }
 
@@ -94,6 +171,13 @@ pub struct FittedOrdinalEncoder {
     pub(crate) categories: Vec<Vec<String>>,
     /// Per-column category-to-index maps.
     pub(crate) category_to_index: Vec<HashMap<String, usize>>,
+    /// Strategy for unknown categories at `transform` time (threaded from the
+    /// unfitted [`OrdinalEncoder`]).
+    pub(crate) handle_unknown: HandleUnknown,
+    /// Sentinel for unknown categories under
+    /// [`HandleUnknown::UseEncodedValue`] (threaded from the unfitted encoder;
+    /// validated to be present in that mode during `fit`).
+    pub(crate) unknown_value: Option<f64>,
 }
 
 impl FittedOrdinalEncoder {
@@ -109,6 +193,18 @@ impl FittedOrdinalEncoder {
     #[must_use]
     pub fn n_features(&self) -> usize {
         self.categories.len()
+    }
+
+    /// Return the configured unknown-category strategy.
+    #[must_use]
+    pub fn handle_unknown(&self) -> HandleUnknown {
+        self.handle_unknown
+    }
+
+    /// Return the configured unknown-category sentinel, if any.
+    #[must_use]
+    pub fn unknown_value(&self) -> Option<f64> {
+        self.unknown_value
     }
 }
 
@@ -145,6 +241,13 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
     /// # Errors
     ///
     /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows.
+    ///
+    /// Returns [`FerroError::InvalidParameter`] for the `handle_unknown` /
+    /// `unknown_value` validation failures (mirroring scikit-learn's
+    /// `TypeError`/`ValueError` at `_encoders.py:1473-1526`): selecting
+    /// [`HandleUnknown::UseEncodedValue`] without an `unknown_value`; setting an
+    /// `unknown_value` while in [`HandleUnknown::Error`] mode; or an
+    /// `unknown_value` that collides with an already-used encoding index.
     fn fit(&self, x: &Array2<String>, _y: &()) -> Result<FittedOrdinalEncoder, FerroError> {
         let n_samples = x.nrows();
         if n_samples == 0 {
@@ -153,6 +256,37 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
                 actual: 0,
                 context: "OrdinalEncoder::fit".into(),
             });
+        }
+
+        // Validation (a)/(b) on the param SHAPE — independent of the data, but
+        // matching sklearn these are evaluated in `fit`, AFTER the 0-row
+        // `check_array` guard above and (for the collision check) AFTER the
+        // categories_ compute below. (a)/(b) map sklearn's `TypeError`
+        // (`_encoders.py:1481-1493`).
+        match (self.handle_unknown, self.unknown_value) {
+            // (a) use_encoded_value REQUIRES an unknown_value (an int or nan).
+            // sklearn: `not isinstance(unknown_value, Integral)` -> TypeError
+            // (`:1481`); `unknown_value is None` falls into that branch.
+            (HandleUnknown::UseEncodedValue, None) => {
+                return Err(FerroError::InvalidParameter {
+                    name: "unknown_value".into(),
+                    reason: "unknown_value should be set (an integer or NaN) when \
+                             handle_unknown is 'use_encoded_value'"
+                        .into(),
+                });
+            }
+            // (b) error-mode forbids a set unknown_value. sklearn: `:1488`
+            // `elif self.unknown_value is not None` -> TypeError.
+            (HandleUnknown::Error, Some(v)) => {
+                return Err(FerroError::InvalidParameter {
+                    name: "unknown_value".into(),
+                    reason: format!(
+                        "unknown_value should only be set when handle_unknown is \
+                         'use_encoded_value', got {v}"
+                    ),
+                });
+            }
+            _ => {}
         }
 
         let n_features = x.ncols();
@@ -184,9 +318,57 @@ impl Fit<Array2<String>, ()> for OrdinalEncoder {
             category_to_index.push(map);
         }
 
+        // Validation (a'): sklearn (`_encoders.py:1481-1487`) requires
+        // `unknown_value` to be an INTEGER or `np.nan` when
+        // `handle_unknown='use_encoded_value'` — a non-integer float raises
+        // `TypeError` BEFORE the range/collision check (#2221). `f64` cannot
+        // express "integral", so a non-nan value with a fractional part is
+        // rejected here.
+        if self.handle_unknown == HandleUnknown::UseEncodedValue
+            && let Some(v) = self.unknown_value
+            && !v.is_nan()
+            && v.fract() != 0.0
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "unknown_value".into(),
+                reason: format!(
+                    "unknown_value should be an integer or np.nan when \
+                     handle_unknown is 'use_encoded_value', got {v}"
+                ),
+            });
+        }
+
+        // Validation (c): collision of a non-nan integer unknown_value with an
+        // already-used encoding index. sklearn (`_encoders.py:1518-1526`) loops
+        // each column's cardinality and raises `ValueError` if
+        // `0 <= unknown_value < cardinality`; that is equivalent to comparing
+        // against the maximum cardinality. The earlier sklearn check
+        // (`:1481`) already guaranteed `unknown_value` is an int or nan, so a
+        // non-integer / nan value is fine here, as is a negative value or one
+        // `>= max_cardinality`.
+        if self.handle_unknown == HandleUnknown::UseEncodedValue
+            && let Some(v) = self.unknown_value
+            && !v.is_nan()
+            && v.fract() == 0.0
+        {
+            let max_cardinality = categories.iter().map(Vec::len).max().unwrap_or(0);
+            // `0 <= v < max_cardinality` with v an integer-valued f64.
+            if v >= 0.0 && v < max_cardinality as f64 {
+                return Err(FerroError::InvalidParameter {
+                    name: "unknown_value".into(),
+                    reason: format!(
+                        "The used value for unknown_value {v} is one of the \
+                         values already used for encoding the seen categories"
+                    ),
+                });
+            }
+        }
+
         Ok(FittedOrdinalEncoder {
             categories,
             category_to_index,
+            handle_unknown: self.handle_unknown,
+            unknown_value: self.unknown_value,
         })
     }
 }
@@ -213,7 +395,10 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
     /// match the number of features seen during fitting.
     ///
     /// Returns [`FerroError::InvalidParameter`] if any category was not seen
-    /// during fitting.
+    /// during fitting AND `handle_unknown` is [`HandleUnknown::Error`] (the
+    /// default). Under [`HandleUnknown::UseEncodedValue`], unknown categories
+    /// are instead encoded as the configured `unknown_value` sentinel (which may
+    /// be `f64::NAN`), matching sklearn `_encoders.py:1591`.
     fn transform(&self, x: &Array2<String>) -> Result<Array2<f64>, FerroError> {
         let n_features = self.categories.len();
         // sklearn `OrdinalEncoder.transform` -> `_transform` -> `_check_X` ->
@@ -246,12 +431,35 @@ impl Transform<Array2<String>> for FittedOrdinalEncoder {
                     // Cast the ordinal index to f64 (sklearn's float64 default,
                     // `_encoders.py:1262`). Lossless: indices are < 2^53.
                     Some(&idx) => out[[i, j]] = ordinal_index_to_f64(idx),
-                    None => {
-                        return Err(FerroError::InvalidParameter {
-                            name: format!("x[{i},{j}]"),
-                            reason: format!("unknown category \"{cat}\" in column {j}"),
-                        });
-                    }
+                    None => match self.handle_unknown {
+                        // handle_unknown='use_encoded_value': write the sentinel
+                        // (which may be NaN). sklearn `_encoders.py:1591`
+                        // `X_trans[~X_mask] = self.unknown_value`. `fit`
+                        // guaranteed `unknown_value` is `Some` in this mode, but
+                        // we never panic (R-CODE-2): fall back to the Error path
+                        // if it were somehow `None`.
+                        HandleUnknown::UseEncodedValue => match self.unknown_value {
+                            Some(v) => out[[i, j]] = v,
+                            None => {
+                                return Err(FerroError::InvalidParameter {
+                                    name: format!("x[{i},{j}]"),
+                                    reason: format!(
+                                        "unknown category \"{cat}\" in column {j} and \
+                                         no unknown_value configured"
+                                    ),
+                                });
+                            }
+                        },
+                        // handle_unknown='error' (default): reject (SHIPPED
+                        // REQ-2, UNCHANGED). sklearn raises ValueError
+                        // "Found unknown categories ... during transform".
+                        HandleUnknown::Error => {
+                            return Err(FerroError::InvalidParameter {
+                                name: format!("x[{i},{j}]"),
+                                reason: format!("unknown category \"{cat}\" in column {j}"),
+                            });
+                        }
+                    },
                 }
             }
         }

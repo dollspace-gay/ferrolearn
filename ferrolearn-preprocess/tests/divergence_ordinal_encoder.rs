@@ -51,7 +51,7 @@
 //! ```
 
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::OrdinalEncoder;
+use ferrolearn_preprocess::{HandleUnknown, OrdinalEncoder};
 use ndarray::Array2;
 
 /// Build an `n x 2` string array from `(col0, col1)` row tuples.
@@ -349,4 +349,216 @@ fn green_exact_integer_index_to_f64() {
     let out: Array2<f64> = fitted.transform(&probe).unwrap();
     // Oracle: [[10.0]]. f64 represents 10 exactly.
     assert_eq!(out[[0, 0]], 10.0, "index 10 -> exact 10.0 (lossless f64)");
+}
+
+// ===========================================================================
+// REQ-5 — handle_unknown='use_encoded_value' + unknown_value.
+//
+// EVERY expected value below comes from a LIVE sklearn 1.5.2 oracle (R-CHAR-3),
+// reproduced via the `python3 -c` command cited above each test.
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 10 (REQ-5) — use_encoded_value with unknown_value=-1.0: unknown
+// categories -> -1.0, seen categories -> their ordinal index.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(handle_unknown='use_encoded_value',unknown_value=-1)\
+//       .fit([['cat'],['dog'],['cat']]); \
+//     print(e.transform([['bird'],['dog']]).tolist())"
+//   -> [[-1.0], [1.0]]
+// (categories_[0]=['cat','dog']; 'bird' unknown -> -1.0; 'dog' -> index 1.)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_use_encoded_value_minus_one() {
+    let sk: [f64; 2] = [-1.0, 1.0]; // 'bird' (unknown), 'dog' (index 1)
+
+    let enc = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(-1.0);
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+    let fitted = enc.fit(&x_train, &()).unwrap();
+
+    let probe = make_1col(&["bird", "dog"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    assert_eq!(out[[0, 0]], sk[0], "unknown 'bird' -> -1.0 (oracle)");
+    assert_eq!(out[[1, 0]], sk[1], "seen 'dog' -> 1.0 (oracle)");
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 11 (REQ-5) — multi-feature use_encoded_value, unknown_value=-1.0.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     e=OrdinalEncoder(handle_unknown='use_encoded_value',unknown_value=-1)\
+//       .fit([['cat','x'],['dog','y'],['cat','x']]); \
+//     print(e.transform([['bird','z'],['dog','x']]).tolist())"
+//   -> [[-1.0, -1.0], [1.0, 0.0]]
+// (col0 cats ['cat','dog']; col1 cats ['x','y']; 'bird'/'z' unknown -> -1.0;
+//  'dog'->1, 'x'->0.)
+// ---------------------------------------------------------------------------
+#[test]
+fn green_use_encoded_value_multifeature() {
+    let sk: [[f64; 2]; 2] = [[-1.0, -1.0], [1.0, 0.0]];
+
+    let enc = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(-1.0);
+    let x_train = make_2col(&[("cat", "x"), ("dog", "y"), ("cat", "x")]);
+    let fitted = enc.fit(&x_train, &()).unwrap();
+
+    let probe = make_2col(&[("bird", "z"), ("dog", "x")]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    for (i, row) in sk.iter().enumerate() {
+        for (j, &expect) in row.iter().enumerate() {
+            assert_eq!(out[[i, j]], expect, "multi-feature uev at [{i},{j}]");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 12 (REQ-5) — use_encoded_value with unknown_value=nan: unknown
+// categories -> NaN, seen categories -> their ordinal index.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import \
+//     OrdinalEncoder; e=OrdinalEncoder(handle_unknown='use_encoded_value',\
+//     unknown_value=np.nan).fit([['cat'],['dog'],['cat']]); \
+//     print(e.transform([['bird'],['dog']]).tolist())"
+//   -> [[nan], [1.0]]
+// ---------------------------------------------------------------------------
+#[test]
+fn green_use_encoded_value_nan() {
+    let enc = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(f64::NAN);
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+    let fitted = enc.fit(&x_train, &()).unwrap();
+
+    let probe = make_1col(&["bird", "dog"]);
+    let out: Array2<f64> = fitted.transform(&probe).unwrap();
+    assert!(out[[0, 0]].is_nan(), "unknown 'bird' -> NaN (oracle nan)");
+    assert_eq!(out[[1, 0]], 1.0, "seen 'dog' -> 1.0 (oracle)");
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 1 (REQ-5) — use_encoded_value WITHOUT unknown_value -> fit Err.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder(handle_unknown='use_encoded_value')\
+//       .fit([['cat'],['dog'],['cat']])"
+//   -> TypeError: unknown_value should be an integer or np.nan when
+//      handle_unknown is 'use_encoded_value', got None.
+// ferrolearn maps sklearn's TypeError -> FerroError::InvalidParameter (Err).
+// ---------------------------------------------------------------------------
+#[test]
+fn red_uev_requires_unknown_value() {
+    let enc = OrdinalEncoder::new().with_handle_unknown(HandleUnknown::UseEncodedValue);
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+    assert!(
+        enc.fit(&x_train, &()).is_err(),
+        "sklearn raises TypeError (no unknown_value); ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 2 (REQ-5) — error-mode WITH unknown_value set -> fit Err.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder(handle_unknown='error',unknown_value=-1)\
+//       .fit([['cat'],['dog'],['cat']])"
+//   -> TypeError: unknown_value should only be set when handle_unknown is
+//      'use_encoded_value', got -1.
+// ---------------------------------------------------------------------------
+#[test]
+fn red_error_mode_forbids_unknown_value() {
+    // Default handle_unknown is Error; set an unknown_value to provoke the Err.
+    let enc = OrdinalEncoder::new().with_unknown_value(-1.0);
+    assert_eq!(
+        enc.handle_unknown(),
+        HandleUnknown::Error,
+        "default is Error"
+    );
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+    assert!(
+        enc.fit(&x_train, &()).is_err(),
+        "sklearn raises TypeError (unknown_value in error mode); ferrolearn must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// RED GUARD 3 (REQ-5) — unknown_value collides with an in-range encoding index
+// -> fit Err; while negative / >= max_cardinality / nan all SUCCEED.
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import \
+//     OrdinalEncoder
+//   for v in [1,-1,5,np.nan]:
+//       try:
+//           OrdinalEncoder(handle_unknown='use_encoded_value',unknown_value=v)\
+//               .fit([['cat'],['dog'],['cat']]); print(v,'OK')
+//       except Exception as e: print(v,type(e).__name__)"
+//   -> 1 ValueError   (in [0, n_categories=2) -> collision)
+//      -1 OK          (negative)
+//      5 OK           (>= max_cardinality)
+//      nan OK         (nan sentinel)
+//   (collision msg: "The used value for unknown_value 1 is one of the values
+//    already used for encoding the seen categories.")
+// ---------------------------------------------------------------------------
+#[test]
+fn red_unknown_value_collision_in_range() {
+    // categories_[0] = ['cat','dog'] -> max_cardinality = 2; valid indices 0,1.
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+
+    // v = 1.0 collides (in [0, 2)) -> Err.
+    let collide = OrdinalEncoder::new()
+        .with_handle_unknown(HandleUnknown::UseEncodedValue)
+        .with_unknown_value(1.0);
+    assert!(
+        collide.fit(&x_train, &()).is_err(),
+        "unknown_value=1 in [0,2) collides; sklearn ValueError -> Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 13 (REQ-5) — unknown_value -1 (negative), 5 (>= cardinality), nan
+// all PASS fit (companions to RED GUARD 3; same live oracle session).
+// ---------------------------------------------------------------------------
+#[test]
+fn green_unknown_value_negative_or_oob_or_nan_ok() {
+    let x_train = make_1col(&["cat", "dog", "cat"]);
+
+    for v in [-1.0, 5.0, f64::NAN] {
+        let enc = OrdinalEncoder::new()
+            .with_handle_unknown(HandleUnknown::UseEncodedValue)
+            .with_unknown_value(v);
+        assert!(
+            enc.fit(&x_train, &()).is_ok(),
+            "unknown_value={v} is OK in sklearn (negative / out-of-range / nan)"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD 14 (REQ-5) — DEFAULT (handle_unknown='error') still rejects
+// unknown categories at transform (REQ-2 preserved, UNCHANGED).
+//
+// LIVE oracle (sklearn 1.5.2, run from /tmp):
+//   python3 -c "from sklearn.preprocessing import OrdinalEncoder; \
+//     OrdinalEncoder().fit([['cat'],['dog']]).transform([['fish']])"
+//   -> ValueError: Found unknown categories ['fish'] in column 0 during transform
+// ---------------------------------------------------------------------------
+#[test]
+fn green_error_mode_unknown_still_rejected() {
+    let enc = OrdinalEncoder::new(); // default Error mode
+    assert_eq!(enc.handle_unknown(), HandleUnknown::Error);
+    assert_eq!(enc.unknown_value(), None);
+    let fitted = enc.fit(&make_1col(&["cat", "dog"]), &()).unwrap();
+    assert!(
+        fitted.transform(&make_1col(&["fish"])).is_err(),
+        "default error-mode must still reject unknown 'fish' (REQ-2 preserved)"
+    );
 }

@@ -60,7 +60,6 @@ fn make_1col(vals: &[&str]) -> Array2<String> {
 /// range/collision branch and it has no integrality guard.
 /// Tracking: #2221
 #[test]
-#[ignore = "divergence: non-integer unknown_value accepted; sklearn requires Integral-or-nan (TypeError); tracking #2221"]
 fn divergence_noninteger_unknown_value_accepted() {
     // categories_[0] = ['cat','dog'] -> max_cardinality = 2.
     let x_train = make_1col(&["cat", "dog", "cat"]);
