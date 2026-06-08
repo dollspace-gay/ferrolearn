@@ -55,7 +55,6 @@ const TOL: f64 = 1e-6;
 ///
 /// Tracking #1405 (root: ferrolearn-linear BayesianRidge not wired in).
 #[test]
-#[ignore = "divergence: round-robin uses Ridge(alpha=1) not BayesianRidge default; tracking #1405"]
 fn divergence_round_robin_values_small() {
     let imp = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean);
     let x = array![[1.0, 2.0], [3.0, f64::NAN], [f64::NAN, 6.0]];
@@ -102,7 +101,6 @@ fn divergence_round_robin_values_small() {
 ///
 /// Tracking #1405 (estimator) and #1407 (default order ascending vs roman).
 #[test]
-#[ignore = "divergence: Ridge(alpha=1)+roman order vs BayesianRidge+ascending; tracking #1405"]
 fn divergence_round_robin_values_three_features() {
     let imp = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean);
     let x = array![
@@ -165,9 +163,12 @@ fn divergence_round_robin_values_three_features() {
 ///
 /// Tracking #1408 (min_value/max_value clip missing).
 #[test]
-#[ignore = "divergence: no min_value/max_value clip; sklearn clips each iteration; tracking #1408"]
 fn divergence_min_max_clip_bound() {
-    let imp = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean);
+    // sklearn oracle: IterativeImputer(random_state=0, max_iter=10, tol=1e-3,
+    //                                  min_value=5.0, max_value=7.0)
+    let imp = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean)
+        .with_min_value(5.0)
+        .with_max_value(7.0);
     let x: Array2<f64> = array![
         [1.0, 2.0, 3.0],
         [2.0, f64::NAN, 5.0],

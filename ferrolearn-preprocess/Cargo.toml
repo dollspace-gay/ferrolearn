@@ -13,6 +13,13 @@ categories = ["science", "algorithms"]
 [dependencies]
 ferrolearn-core.workspace = true
 ferrolearn-numerical.workspace = true
+# IterativeImputer routes its round-robin through the default BayesianRidge
+# estimator (sklearn `_iterative.py:732-735`), so ferrolearn-linear is a
+# production dependency, not test-only.
+ferrolearn-linear = { path = "../ferrolearn-linear" }
+# Names the LinalgFloat bound BayesianRidge::fit requires (same substrate
+# ferrolearn-linear uses); IterativeImputer's own compute stays on ndarray.
+ferray = { workspace = true }
 ndarray.workspace = true
 num-traits.workspace = true
 rand.workspace = true
@@ -24,4 +31,3 @@ float-cmp.workspace = true
 serde_json.workspace = true
 proptest = "1"
 ferrolearn-test-oracle = { path = "../ferrolearn-test-oracle" }
-ferrolearn-linear = { path = "../ferrolearn-linear" }

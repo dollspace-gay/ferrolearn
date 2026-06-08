@@ -38,16 +38,64 @@ const TOL: f64 = 1e-6;
 /// `len(imputation_sequence_) == 50`).
 fn x_e() -> Array2<f64> {
     array![
-        [3.745401188473625, 9.50714306409916, 7.319939418114051, 5.986584841970366, 1.5601864044243652],
+        [
+            3.745401188473625,
+            9.50714306409916,
+            7.319939418114051,
+            5.986584841970366,
+            1.5601864044243652
+        ],
         [1.5599452033620265, N, N, N, 7.080725777960454],
-        [0.20584494295802447, 9.699098521619943, 8.324426408004218, 2.1233911067827616, 1.8182496720710062],
-        [1.8340450985343382, N, 5.247564316322379, N, 2.9122914019804194],
+        [
+            0.20584494295802447,
+            9.699098521619943,
+            8.324426408004218,
+            2.1233911067827616,
+            1.8182496720710062
+        ],
+        [
+            1.8340450985343382,
+            N,
+            5.247564316322379,
+            N,
+            2.9122914019804194
+        ],
         [6.118528947223795, N, N, 3.663618432936917, 4.56069984217036],
-        [7.851759613930136, 1.9967378215835974, N, 5.924145688620425, N],
-        [6.075448519014383, 1.7052412368729153, 0.6505159298527952, N, 9.656320330745594],
-        [8.08397348116461, 3.0461376917337066, 0.9767211400638387, 6.842330265121569, 4.4015249373960135],
-        [N, 4.951769101112702, 0.34388521115218396, 9.093204020787821, 2.587799816000169],
-        [6.62522284353982, 3.1171107608941098, 5.200680211778108, N, N]
+        [
+            7.851759613930136,
+            1.9967378215835974,
+            N,
+            5.924145688620425,
+            N
+        ],
+        [
+            6.075448519014383,
+            1.7052412368729153,
+            0.6505159298527952,
+            N,
+            9.656320330745594
+        ],
+        [
+            8.08397348116461,
+            3.0461376917337066,
+            0.9767211400638387,
+            6.842330265121569,
+            4.4015249373960135
+        ],
+        [
+            N,
+            4.951769101112702,
+            0.34388521115218396,
+            9.093204020787821,
+            2.587799816000169
+        ],
+        [
+            6.62522284353982,
+            3.1171107608941098,
+            5.200680211778108,
+            N,
+            N
+        ]
     ]
 }
 
@@ -70,7 +118,6 @@ fn x_e() -> Array2<f64> {
 ///
 /// Tracking: #2331
 #[test]
-#[ignore = "divergence: IterativeImputer transform replays only the last round (n_iter>1 non-converged); sklearn replays all rounds; tracking #2331"]
 fn divergence_transform_replay_nonconverged_full_matrix() {
     let x = x_e();
     let out = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean)
@@ -111,7 +158,6 @@ fn divergence_transform_replay_nonconverged_full_matrix() {
 ///
 /// Tracking: #2331
 #[test]
-#[ignore = "divergence: IterativeImputer fit_transform/transform replays only the last round; sklearn replays all rounds; tracking #2331"]
 fn divergence_transform_replay_two_round() {
     let x = x_e();
     let imp = IterativeImputer::<f64>::new(2, 1e-3, InitialStrategy::Mean);
@@ -156,7 +202,6 @@ fn divergence_transform_replay_two_round() {
 ///
 /// Tracking: #2331
 #[test]
-#[ignore = "divergence: IterativeImputer inductive transform replays only the last round (non-converged training); tracking #2331"]
 fn divergence_transform_replay_new_matrix() {
     let fitted = IterativeImputer::<f64>::new(10, 1e-3, InitialStrategy::Mean)
         .fit(&x_e(), &())
