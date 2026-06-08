@@ -23,9 +23,10 @@
 //! sklearn 1.5.2 oracle (R-CHAR-3). Consumer: crate re-export (`lib.rs`, grandfathered S5).
 //! HONEST (R-HONEST-3): ferrolearn ships a numeric (`F`-input) DENSE encoder whose `categories_`
 //! and column layout now match sklearn's `sparse_output=False` output for ANY finite numeric
-//! columns (contiguous or not); sparse-by-default output, string/object categories, `drop`,
-//! `handle_unknown='ignore'`, infrequent grouping, `inverse_transform`/`get_feature_names_out`,
-//! the full ctor surface and the ferray substrate stay NOT-STARTED. The PyO3 binding ships the
+//! columns (contiguous or not); `drop` ({None,'first','if_binary'}, REQ-5a) IS shipped, as are
+//! `handle_unknown='ignore'` and `inverse_transform`/`get_feature_names_out`. Sparse-by-default
+//! output, string/object categories, infrequent grouping (`min_frequency`/`max_categories`,
+//! REQ-5b), the full ctor surface and the ferray substrate stay NOT-STARTED. The PyO3 binding ships the
 //! DENSE numeric path (`ferrolearn.OneHotEncoder`, REQ-8) with the unsupported surface surfaced
 //! as `NotImplementedError`/`ValueError` rather than silently mismatched (R-HONEST-3).
 //!
@@ -35,7 +36,8 @@
 //! | REQ-2 (sparse-by-default output) | NOT-STARTED | open prereq blocker #1149. Dense `Array2<F>` only; sklearn defaults `sparse_output=True` → scipy CSR (`:531`,`:748`). |
 //! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; +/-inf is REJECTED at `fit`/`transform` (#2225, `force_all_finite="allow-nan"` allows NaN but not inf); string/object input is REQ-3-string (NOT-STARTED, no String path). |
 //! | REQ-4 (handle_unknown {'error','ignore'}) | SHIPPED | `OneHotHandleUnknown` enum `{ Error (#[default]), Ignore }` (mirrors sklearn's `handle_unknown` `_parameter_constraints` `StrOptions({"error","ignore","infrequent_if_exist"})` default `"error"`, `_encoders.py:732,750`) + `OneHotEncoder::with_handle_unknown`/`handle_unknown()` builder+getter, threaded into `FittedOneHotEncoder` (`handle_unknown` field + getter) by `Fit::fit` (handle_unknown affects ONLY transform; `categories_` learned identically). `Transform::transform` unknown branch (`cats.iter().position(...) == None`): `Error` → `InvalidParameter` "Found unknown categories … during transform" (the SHIPPED REQ-2 default `ValueError`, `_encoders.py:209-214`, UNCHANGED); `Ignore` → `continue` leaving that feature's one-hot block ALL-ZERO (`_encoders.py:215-240`: unknown row masked out, no encoded column set), every KNOWN feature still one-hots. The +/-inf rejection (#2225), ncols + 0-row guards UNCHANGED (inf is invalid input, not an "unknown category" — still errors in `Ignore`; NaN with NO nan-category is "unknown" → all-zero block in `Ignore`, with a nan-category one-hots it). Never panics (R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`): `ignore_multifeature_all_zero_block` (`[[100,0],[5,99]]→[[0,0,0,1,0],[0,1,0,0,0]]`), `ignore_fully_unknown_row_all_zero`, `ignore_known_row_normal_one_hot`, `error_default_unknown_rejected`, `with_handle_unknown_ignore_known_value_normal`, `ignore_inf_still_rejected`, `ignore_nan_no_category_all_zero`, `ignore_nan_with_category_one_hots`, `handle_unknown_default_and_builder_abi` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs` (`OneHotHandleUnknown`). R-DEV-2. STILL NOT-STARTED: `'infrequent_if_exist'` (REQ-5). |
-//! | REQ-5 (drop + infrequent grouping) | NOT-STARTED | open prereq blocker #1152. No `drop` (`:498-516`) / `min_frequency`/`max_categories` (`:566-`). |
+//! | REQ-5a (`drop` {None,'first','if_binary'}) | SHIPPED | #1152: `OneHotDrop` enum `{ None_ (#[default]), First, IfBinary }` (mirrors sklearn `drop` `_parameter_constraints` `StrOptions({"first","if_binary"})` / `None`, `_encoders.py:730`,`:498-516`) + `OneHotEncoder::with_drop`/`drop()` builder+getter, threaded into `Fit::fit` which computes `drop_idx_: Vec<Option<usize>>` (sklearn `_compute_drop_idx`, `_encoders.py:812-831`: `None_`→all `None`; `First`→all `Some(0)` (empty feature `None`); `IfBinary`→`Some(0)` iff `len==2` else `None`) and recomputes `offsets`/`n_output` from the per-feature BLOCK WIDTH `len - (drop_idx is Some)`. `FittedOneHotEncoder::drop_idx_()` accessor exposes it. `Transform::transform` (`_encoders.py:1033-1046`): the dropped category emits an ALL-ZERO block; a kept category at membership index `idx` maps to output col `offset + (idx if idx<d else idx-1)` (the `X_int > to_drop` decrement). `inverse_transform` (`_encoders.py:1124-1172`): an all-zero block with `drop_idx_[j]==Some(d)` inverts to the DROPPED category `categories_[j][d]` in BOTH handle_unknown modes (sklearn checks `_drop_idx_after_grouping[i] is not None` FIRST, bypassing the all-zeros error / None paths); a 0-width fully-dropped feature fills the dropped category (`:1132-1135`); a kept block position `pos>=d` maps to category `pos+1`. `get_feature_names_out` OMITS the dropped category (`_compute_transformed_categories` `remove_dropped=True`, `:909`,`:1209-1212`). DROP+IGNORE interaction (verified LIVE, sklearn 1.5.2): `drop` + `handle_unknown='ignore'` is ALLOWED (does NOT raise at fit; warns on unknown at transform, encoding the unknown as an all-zero block == the dropped category) — ferrolearn matches (fit imposes no constraint). NEVER panics: every drop-shift index uses `get`/bounds-checked arithmetic (R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`, `drop=...`): `drop_first_*`, `drop_if_binary_*`, `drop_inverse_roundtrip_*`, `drop_single_category_fully_dropped_*`, `drop_shift_3cat_*`, `drop_plus_ignore_allowed_*`, `drop_idx_abi_*`, `drop_none_unchanged_*` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs` (`OneHotDrop`). R-DEV-2. |
+//! | REQ-5b (infrequent grouping `min_frequency`/`max_categories`) | NOT-STARTED | open prereq blocker #1152. `min_frequency`/`max_categories` (`:566-587`) infrequent-category grouping + `'infrequent_if_exist'` + the array-of-explicit-categories `drop` form (`:515-516`,`:833-880`) are unimplemented. |
 //! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then handles an ALL-ZERO block (`block_sum == 0`) per `handle_unknown` (sklearn `_encoders.py:1141`,`:1159-1168`): `Error` -> `InvalidParameter` ("Samples can not be inverted ... all zeros"); `Ignore` -> the unknown-category sentinel inverts to `None` in sklearn (`:1183`), represented here as `NaN` (Array2<F> cannot hold None, #2227) with the KNOWN feature blocks still recovered; 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the `drop`-aware inverse (REQ-5). The `handle_unknown='ignore'` inverse IS handled (#2227, all-zero -> NaN sentinel). |
 //! | REQ-7 (ctor + dtype + _parameter_constraints) | NOT-STARTED | open prereq blocker #1154. `new()` takes no params/validates nothing (`:728-762`). |
 //! | REQ-8 (PyO3 binding) | SHIPPED | #1155: `ferrolearn-python` exposes `ferrolearn.OneHotEncoder` over `{OneHotEncoder, FittedOneHotEncoder, OneHotHandleUnknown}`. The Rust shim `_RsOneHotEncoder` (hand `#[pyclass]`, `ferrolearn-python/src/extras.rs`) ctor takes `handle_unknown: String = "error"` mapped via `resolve_handle_unknown` ("error"→`Error`, "ignore"→`Ignore`, "infrequent_if_exist"→`PyNotImplementedError` REQ-5, bad→`PyValueError` per `_encoders.py:732` `StrOptions({"error","ignore","infrequent_if_exist"})`); `fit` builds `OneHotEncoder::<f64>::new().with_handle_unknown(..)` + runs `Fit`; `transform`/`inverse_transform`→`PyArray2<f64>` (FerroError→`PyValueError`; the `Ignore`-mode all-zero inverse flows through as NaN, #2227); `#[getter]`s `categories_` (a Python LIST of 1-D f64 numpy arrays via `PyList`), `feature_names_out` (`get_feature_names_out()`→`Vec<String>`), `n_features_in_` (`n_features()`). Registered in `lib.rs` (`m.add_class::<extras::RsOneHotEncoder>()`). The Python wrapper `_extras.py::OneHotEncoder(_TransformerWrapper)` mirrors sklearn's KEYWORD-ONLY 8-key ctor `(*, categories="auto", drop=None, sparse_output=True, dtype=np.float64, handle_unknown="error", min_frequency=None, max_categories=None, feature_name_combiner="concat")` (`_encoders.py:743-762`) for `get_params`/`clone` parity; `_make_rs` threads `handle_unknown`; `fit` calls `_check_unsupported` which HONESTLY (R-HONEST-3) rejects the core's gaps — `sparse_output=True` (the sklearn DEFAULT; dense-only REQ-2 #1149)/`categories!='auto'`/`drop`/`min_frequency`/`max_categories`/`feature_name_combiner!='concat'` (REQ-5/REQ-7 #1152/#1154) → `NotImplementedError`; `transform`/`inverse_transform`/`categories_`/`n_features_in_`/`get_feature_names_out(input_features=None)` guarded by `check_is_fitted`→`NotFittedError` pre-fit (`input_features!=None`→`NotImplementedError` REQ-6). Boundary consumer (R-DEFER-1): the `_extras.py::OneHotEncoder` wrapper + `lib.rs` `add_class` + `__init__.py` re-export. Live-oracle parity (model B, sklearn 1.5.2 `sparse_output=False`): `tests/divergence_one_hot_encoder_py.py` (17 pass) — multi-feature non-contiguous `transform`/`fit_transform`/`categories_`, `handle_unknown='ignore'` all-zero block, `inverse_transform` roundtrip + ignore-NaN-vs-None known-feature recovery, `get_feature_names_out` (`['x0_2.0',...]`), pre-fit `NotFittedError`, bad-handle_unknown `ValueError`, `infrequent_if_exist`/unsupported-param `NotImplementedError`, dense-only `sparse_output=True` error, `get_params` 8-key parity, `clone`. R-DEFER-1 satisfied. |
@@ -82,6 +84,45 @@ pub enum OneHotHandleUnknown {
 }
 
 // ---------------------------------------------------------------------------
+// OneHotDrop
+// ---------------------------------------------------------------------------
+
+/// Which category (if any) to drop from each feature's one-hot block at
+/// `transform` time (`OneHotEncoder(drop=...)`).
+///
+/// Mirrors scikit-learn's `OneHotEncoder(drop=...)` parameter, whose
+/// `_parameter_constraints` accepts `{'first', 'if_binary'}`, an array-like, or
+/// `None` (`sklearn/preprocessing/_encoders.py:730`, default `None`). Dropping a
+/// category removes one output column per feature, which is useful to break the
+/// collinearity an unregularized linear model would otherwise see
+/// (`_encoders.py:498-516`).
+///
+/// ferrolearn ships the `None`/`'first'`/`'if_binary'` modes (REQ-5). The
+/// array-of-explicit-categories form (`drop[i]` = the category to drop in
+/// feature `i`, `_encoders.py:515-516`) is NOT-STARTED.
+///
+/// The variant is named `None_` (not `None`) to avoid colliding with
+/// [`Option::None`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OneHotDrop {
+    /// Retain all categories — no column is dropped (scikit-learn's default
+    /// `drop=None`, `_encoders.py:509`,`:812-813`: `drop_idx_ = None`). The
+    /// default here too.
+    #[default]
+    None_,
+    /// Drop the **first** category of every feature (scikit-learn's
+    /// `drop='first'`, `_encoders.py:510-511`,`:815-816`: `drop_idx_[j] = 0` for
+    /// every feature). A feature with only one category is dropped entirely (its
+    /// block width becomes 0).
+    First,
+    /// Drop the first category of every feature that has **exactly two**
+    /// categories, leaving 1-category and 3+-category features intact
+    /// (scikit-learn's `drop='if_binary'`, `_encoders.py:512-514`,`:817-831`:
+    /// `drop_idx_[j] = 0` iff `len(categories_[j]) == 2`, else `None`).
+    IfBinary,
+}
+
+// ---------------------------------------------------------------------------
 // OneHotEncoder (unfitted)
 // ---------------------------------------------------------------------------
 
@@ -119,6 +160,9 @@ pub struct OneHotEncoder<F> {
     /// Strategy for unknown categories at `transform` time
     /// (`handle_unknown`). Defaults to [`OneHotHandleUnknown::Error`].
     handle_unknown: OneHotHandleUnknown,
+    /// Which category (if any) to drop per feature (`drop`). Defaults to
+    /// [`OneHotDrop::None_`] (retain all categories).
+    drop: OneHotDrop,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -129,6 +173,7 @@ impl<F: Float + Send + Sync + 'static> OneHotEncoder<F> {
     pub fn new() -> Self {
         Self {
             handle_unknown: OneHotHandleUnknown::Error,
+            drop: OneHotDrop::None_,
             _marker: std::marker::PhantomData,
         }
     }
@@ -149,6 +194,25 @@ impl<F: Float + Send + Sync + 'static> OneHotEncoder<F> {
     #[must_use]
     pub fn handle_unknown(&self) -> OneHotHandleUnknown {
         self.handle_unknown
+    }
+
+    /// Set the drop strategy (`drop`).
+    ///
+    /// With [`OneHotDrop::First`] the first category of every feature is dropped
+    /// from the output; with [`OneHotDrop::IfBinary`] only binary (2-category)
+    /// features lose their first category. The dropped category produces an
+    /// all-zero one-hot block, matching scikit-learn's `OneHotEncoder(drop=...)`
+    /// (`_encoders.py:498-516`).
+    #[must_use]
+    pub fn with_drop(mut self, drop: OneHotDrop) -> Self {
+        self.drop = drop;
+        self
+    }
+
+    /// Return the configured drop strategy (`drop`).
+    #[must_use]
+    pub fn drop(&self) -> OneHotDrop {
+        self.drop
     }
 }
 
@@ -174,16 +238,26 @@ pub struct FittedOneHotEncoder<F> {
     /// is the sorted set of distinct values seen in input column `j`; its length
     /// is the number of output columns devoted to that feature's block.
     pub(crate) categories_: Vec<Vec<F>>,
-    /// Per-column output-block start offsets (prefix sums of
-    /// `categories_[j].len()`). Output column `offsets[j] + idx` is the one-hot
-    /// bit for `categories_[j][idx]`. Has length `categories_.len()`.
+    /// Per-column output-block start offsets (prefix sums of the per-feature
+    /// **block width**). The block width of feature `j` is
+    /// `categories_[j].len() - (1 if drop_idx_[j].is_some() else 0)`. Output
+    /// column `offsets[j] + pos` is the one-hot bit for the `pos`-th *kept*
+    /// category of feature `j`. Has length `categories_.len()`.
     pub(crate) offsets: Vec<usize>,
-    /// Total number of output columns (`Σ categories_[j].len()`).
+    /// Total number of output columns (`Σ block_width(j)`), accounting for any
+    /// dropped categories (`drop`).
     pub(crate) n_output: usize,
     /// Strategy for unknown categories at `transform` time, threaded from the
     /// unfitted [`OneHotEncoder`]. [`OneHotHandleUnknown::Error`] rejects an
     /// unknown category; [`OneHotHandleUnknown::Ignore`] emits an all-zero block.
     pub(crate) handle_unknown: OneHotHandleUnknown,
+    /// Per-feature index into `categories_[j]` of the category to drop, or `None`
+    /// for "no drop" on that feature (`drop_idx_`). Has length
+    /// `categories_.len()`. Mirrors scikit-learn's public `drop_idx_`
+    /// (`_encoders.py:608-615`,`:885-902`): `drop='first'` → every entry
+    /// `Some(0)`; `drop='if_binary'` → `Some(0)` iff the feature has exactly two
+    /// categories else `None`; `drop=None` → every entry `None`.
+    pub(crate) drop_idx_: Vec<Option<usize>>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
@@ -221,6 +295,28 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
     #[must_use]
     pub fn handle_unknown(&self) -> OneHotHandleUnknown {
         self.handle_unknown
+    }
+
+    /// Return the per-feature drop index (`drop_idx_`).
+    ///
+    /// `drop_idx_()[j]` is `Some(d)` if category `categories_[j][d]` is dropped
+    /// from feature `j`'s one-hot block (its block width is one less than
+    /// `categories_[j].len()`, and that category encodes to an all-zero block),
+    /// or `None` if no category is dropped from that feature. Mirrors
+    /// scikit-learn's public `drop_idx_` attribute (`_encoders.py:608-615`). With
+    /// `drop=None` (the default) every entry is `None`.
+    #[must_use]
+    pub fn drop_idx_(&self) -> &[Option<usize>] {
+        &self.drop_idx_
+    }
+
+    /// Return the width of feature `j`'s one-hot block: `categories_[j].len()`
+    /// minus one if that feature has a dropped category. Bounds-safe: a `j` past
+    /// the end yields 0 (R-CODE-2).
+    fn block_width(&self, j: usize) -> usize {
+        let len = self.categories_.get(j).map_or(0, Vec::len);
+        let dropped = matches!(self.drop_idx_.get(j), Some(Some(_)));
+        len - usize::from(dropped && len > 0)
     }
 
     /// Invert a one-hot encoded matrix back to the original category values.
@@ -288,23 +384,36 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
 
         for j in 0..n_features {
             let cats = &self.categories_[j];
-            let block_len = cats.len();
-            // A unique-category column has an empty `categories_[j]` only if the
-            // training column was empty, which `fit` rejects (0 rows); a
-            // 1-category column has block_len == 1. Guard anyway (R-CODE-2).
-            if block_len == 0 {
+            let drop_d = self.drop_idx_.get(j).copied().flatten();
+            // The per-feature block WIDTH after drop (the number of output columns
+            // for this feature). With a dropped category the block is one narrower
+            // than `categories_[j]` (`_encoders.py:1124-1127` `cats_wo_dropped`).
+            let block_width = self.block_width(j);
+            let offset = self.offsets[j];
+
+            // A feature whose entire (single) category was dropped has a
+            // zero-width block (`drop='first'` on a 1-category feature). Every row
+            // inverts to that dropped category, with no columns consumed (sklearn
+            // `n_categories == 0` branch, `_encoders.py:1132-1135`).
+            if block_width == 0 {
+                if let Some(&cat) = drop_d.and_then(|d| cats.get(d)) {
+                    for i in 0..n_samples {
+                        out[[i, j]] = cat;
+                    }
+                }
                 continue;
             }
-            let offset = self.offsets[j];
+
             for i in 0..n_samples {
                 // Argmax over the per-feature block (numpy `argmax`: index of the
                 // maximum, FIRST on ties). Track the block sum to detect the
-                // all-zero (uninvertible) case separately, mirroring sklearn's
-                // two-step argmax-then-all-zero-check (`_encoders.py:1138-1168`).
+                // all-zero case separately, mirroring sklearn's two-step
+                // argmax-then-all-zero-check (`_encoders.py:1136-1172`). `argmax`
+                // is a BLOCK position in `0..block_width`.
                 let mut argmax: usize = 0;
                 let mut max_val = x[[i, offset]];
                 let mut block_sum = max_val;
-                for k in 1..block_len {
+                for k in 1..block_width {
                     let v = x[[i, offset + k]];
                     block_sum = block_sum + v;
                     if v > max_val {
@@ -312,31 +421,51 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
                         argmax = k;
                     }
                 }
-                // All-zero block: sklearn's behavior DEPENDS on handle_unknown
-                // (`_encoders.py:1141`,`:1159-1168`). With `handle_unknown='error'`
-                // (and drop=None) an all-zero row "can not be inverted" -> error.
-                // With `handle_unknown='ignore'` the all-zero block is the
-                // unknown-category sentinel and inverts to `None` (`:1183`,
-                // contract `:546-549`); the KNOWN feature blocks still recover
-                // normally. `Array2<F>` cannot hold Python `None`, so we use `NaN`
-                // as the representable missing-marker (documented #2227): the
-                // inverse SUCCEEDS, known features recover, unknown features -> NaN.
                 if block_sum == F::zero() {
-                    match self.handle_unknown {
-                        OneHotHandleUnknown::Error => {
-                            return Err(FerroError::InvalidParameter {
-                                name: "X".into(),
-                                reason: "Samples can not be inverted when drop=None and \
-                                         handle_unknown='error' because they contain all zeros"
-                                    .into(),
-                            });
+                    // All-zero block. With a dropped category this is the
+                    // LEGITIMATE encoding of the dropped value, so it inverts to
+                    // that category in BOTH handle_unknown modes — sklearn checks
+                    // `_drop_idx_after_grouping[i] is not None` FIRST and maps the
+                    // all-zero row to the dropped category (`_encoders.py:1150-1158`
+                    // for ignore, `:1169-1172` for error), bypassing the
+                    // "can not be inverted" / None paths.
+                    if drop_d.is_some() {
+                        if let Some(&cat) = drop_d.and_then(|d| cats.get(d)) {
+                            out[[i, j]] = cat;
                         }
-                        OneHotHandleUnknown::Ignore => {
-                            out[[i, j]] = F::nan();
+                    } else {
+                        // No drop on this feature: the existing handle_unknown
+                        // semantics (`_encoders.py:1141`,`:1159-1168`).
+                        match self.handle_unknown {
+                            OneHotHandleUnknown::Error => {
+                                return Err(FerroError::InvalidParameter {
+                                    name: "X".into(),
+                                    reason: "Samples can not be inverted when drop=None and \
+                                         handle_unknown='error' because they contain all zeros"
+                                        .into(),
+                                });
+                            }
+                            // `handle_unknown='ignore'` all-zero block -> None in
+                            // sklearn (`:1183`); `Array2<F>` cannot hold None so we
+                            // use NaN as the representable sentinel (#2227).
+                            OneHotHandleUnknown::Ignore => {
+                                out[[i, j]] = F::nan();
+                            }
                         }
                     }
                 } else {
-                    out[[i, j]] = cats[argmax];
+                    // Map the block POSITION back to a `categories_[j]` index: with
+                    // a dropped category `d`, positions `>= d` correspond to the
+                    // category one higher (the dropped category was removed),
+                    // matching sklearn's `cats_wo_dropped` indexing
+                    // (`_encoders.py:1124-1139`). Bounds-safe via `get` (R-CODE-2).
+                    let cat_idx = match drop_d {
+                        Some(d) if argmax >= d => argmax + 1,
+                        _ => argmax,
+                    };
+                    if let Some(&cat) = cats.get(cat_idx) {
+                        out[[i, j]] = cat;
+                    }
                 }
             }
         }
@@ -372,7 +501,14 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
     pub fn get_feature_names_out(&self) -> Vec<String> {
         let mut names = Vec::with_capacity(self.n_output);
         for (j, cats) in self.categories_.iter().enumerate() {
-            for &c in cats {
+            // The dropped category's name is OMITTED (sklearn
+            // `_compute_transformed_categories` with `remove_dropped=True`,
+            // `_encoders.py:1209-1212`,`:909`).
+            let drop_d = self.drop_idx_.get(j).copied().flatten();
+            for (idx, &c) in cats.iter().enumerate() {
+                if drop_d == Some(idx) {
+                    continue;
+                }
                 names.push(format!("x{j}_{}", Self::category_label(c)));
             }
         }
@@ -457,8 +593,6 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
 
         let n_features = x.ncols();
         let mut categories_: Vec<Vec<F>> = Vec::with_capacity(n_features);
-        let mut offsets: Vec<usize> = Vec::with_capacity(n_features);
-        let mut n_output: usize = 0;
 
         for j in 0..n_features {
             // Collect this column's values, sort ascending (sklearn `np.unique`
@@ -480,9 +614,37 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
             // trailing NaN run to a single sorted-last category, #2223).
             col.dedup_by(|a, b| a == b || (a.is_nan() && b.is_nan()));
 
-            offsets.push(n_output);
-            n_output += col.len();
             categories_.push(col);
+        }
+
+        // Compute `drop_idx_` from `drop` + the learned `categories_`
+        // (sklearn `_compute_drop_idx`, `_encoders.py:812-831`). `drop=None` →
+        // every feature `None`; `drop='first'` → every feature `Some(0)`;
+        // `drop='if_binary'` → `Some(0)` iff the feature has exactly two
+        // categories, else `None`.
+        let drop_idx_: Vec<Option<usize>> = match self.drop {
+            OneHotDrop::None_ => vec![None; n_features],
+            OneHotDrop::First => categories_
+                .iter()
+                .map(|cats| if cats.is_empty() { None } else { Some(0) })
+                .collect(),
+            OneHotDrop::IfBinary => categories_
+                .iter()
+                .map(|cats| if cats.len() == 2 { Some(0) } else { None })
+                .collect(),
+        };
+
+        // Recompute the output-column layout AFTER drop: each feature's block
+        // width is `len(categories_[j]) - (1 if drop_idx_[j] is Some)`. `offsets`
+        // is the prefix sum of those widths; `n_output` the total
+        // (sklearn `_n_features_outs`, `_encoders.py:1049`,`feature_indices`).
+        let mut offsets: Vec<usize> = Vec::with_capacity(n_features);
+        let mut n_output: usize = 0;
+        for j in 0..n_features {
+            offsets.push(n_output);
+            let len = categories_[j].len();
+            let dropped = drop_idx_[j].is_some();
+            n_output += len - usize::from(dropped && len > 0);
         }
 
         Ok(FittedOneHotEncoder {
@@ -490,8 +652,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
             offsets,
             n_output,
             // `handle_unknown` only affects `transform` (sklearn learns the same
-            // `categories_` regardless); thread the configured mode through.
+            // `categories_` regardless); thread the configured mode through. Note
+            // (verified live, sklearn 1.5.2): `drop` + `handle_unknown='ignore'`
+            // is ALLOWED — sklearn does NOT raise at fit; it warns on unknown at
+            // transform and encodes the unknown as an all-zero block (the same as
+            // the dropped category). So fit imposes no drop+ignore constraint.
             handle_unknown: self.handle_unknown,
+            drop_idx_,
         })
     }
 }
@@ -564,6 +731,12 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
         for j in 0..n_features {
             let cats = &self.categories_[j];
             let offset = self.offsets[j];
+            // The per-feature dropped category index, if any (`drop_idx_[j]`).
+            // Used to shift kept categories down by one and to emit an all-zero
+            // block for the dropped category (sklearn `transform`,
+            // `_encoders.py:1033-1046`: `X_int > to_drop` decrements, the dropped
+            // cell is masked out).
+            let drop_d = self.drop_idx_.get(j).copied().flatten();
             for i in 0..n_samples {
                 let value = x[[i, j]];
                 // Membership lookup: find the value's index in the sorted-unique
@@ -574,7 +747,20 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
                     .iter()
                     .position(|&c| c == value || (c.is_nan() && value.is_nan()))
                 {
-                    Some(idx) => out[[i, offset + idx]] = F::one(),
+                    Some(idx) => match drop_d {
+                        // The dropped category encodes to an ALL-ZERO block: set
+                        // nothing (sklearn masks the dropped cell out of `X_mask`,
+                        // `_encoders.py:1037,1046`). `out` is already zero-filled.
+                        Some(d) if idx == d => {}
+                        // A KEPT category after a drop shifts down by one when its
+                        // index is past the dropped one (sklearn `X_int > to_drop`
+                        // decrements, `_encoders.py:1045`): the output column is
+                        // `idx` if `idx < d`, else `idx - 1`.
+                        Some(d) if idx > d => out[[i, offset + idx - 1]] = F::one(),
+                        // No drop on this feature, or a kept category before the
+                        // dropped one (`idx < d`): the column is `offset + idx`.
+                        _ => out[[i, offset + idx]] = F::one(),
+                    },
                     None => match self.handle_unknown {
                         // handle_unknown='ignore' (`_encoders.py:215-240`): the
                         // unknown row is masked out and NO column in this

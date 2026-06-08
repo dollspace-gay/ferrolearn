@@ -63,7 +63,7 @@
 //! ```
 
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::{OneHotEncoder, OneHotHandleUnknown};
+use ferrolearn_preprocess::{OneHotDrop, OneHotEncoder, OneHotHandleUnknown};
 use ndarray::{Array2, array};
 
 // ---------------------------------------------------------------------------
@@ -890,4 +890,316 @@ fn inverse_transform_ignore_all_zero_block_returns_none_not_err_vs_sklearn_oracl
         "ignore-mode inverse_transform must still recover the KNOWN col1 \
          category 0.0 (sklearn returns [[None, 0.0]])"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-5a — drop {None,'first','if_binary'} == sklearn EXACTLY.
+//   (`sklearn/preprocessing/_encoders.py` `drop` `_parameter_constraints` `:730`;
+//    `_compute_drop_idx` `:812-831`; transform drop-shift `:1033-1046`;
+//    inverse all-zero->dropped `:1124-1172`; feature-name omit `:909`,`:1209`.)
+//
+// Every expected value below is a LIVE sklearn 1.5.2 call (sparse_output=False,
+// drop=...), quoted inline (R-CHAR-3) — NEVER copied from ferrolearn:
+//
+//   # drop='first' on [[2,0],[5,1],[9,0]]:
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, drop='first').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(list(e.drop_idx_)); print(e.transform([[2.,0.],[5.,1.],[9.,0.]]).tolist()); \
+//     print(list(e.get_feature_names_out())); \
+//     print(e.inverse_transform(e.transform([[2.,0.],[5.,1.],[9.,0.]])).tolist())"
+//     -> drop_idx_ [0, 0]
+//        transform [[0,0,0],[1,0,1],[0,1,0]]
+//        names ['x0_5.0','x0_9.0','x1_1.0']
+//        inverse [[2,0],[5,1],[9,0]]
+//
+//   # drop='if_binary' on [[2,0,8],[5,1,9],[9,0,8]] (3/2/2 cats):
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     X=[[2.,0.,8.],[5.,1.,9.],[9.,0.,8.]]; \
+//     e=OneHotEncoder(sparse_output=False, drop='if_binary').fit(X); \
+//     print(list(e.drop_idx_)); print(e.transform(X).tolist()); \
+//     print(list(e.get_feature_names_out())); print(e.inverse_transform(e.transform(X)).tolist())"
+//     -> drop_idx_ [None, 0, 0]
+//        transform [[1,0,0,0,0],[0,1,0,1,1],[0,0,1,0,0]]
+//        names ['x0_2.0','x0_5.0','x0_9.0','x1_1.0','x2_9.0']
+//        inverse [[2,0,8],[5,1,9],[9,0,8]]
+//
+//   # drop-shift, single col {2,5,9} drop first (cat 9 at block idx 2 -> col 1):
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, drop='first').fit([[2.],[5.],[9.]]); \
+//     print(e.transform([[2.]]).tolist(), e.transform([[5.]]).tolist(), e.transform([[9.]]).tolist())"
+//     -> [[0,0]] [[1,0]] [[0,1]]
+//
+//   # single-category feature fully dropped by drop='first' (block width 0):
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     X=[[2.,7.],[5.,7.],[9.,7.]]; \
+//     e=OneHotEncoder(sparse_output=False, drop='first').fit(X); \
+//     print(list(e.drop_idx_), e.transform(X).shape[1]); \
+//     print(e.transform(X).tolist()); print(list(e.get_feature_names_out())); \
+//     print(e.inverse_transform(e.transform(X)).tolist())"
+//     -> drop_idx_ [0, 0], n_out 2
+//        transform [[0,0],[1,0],[0,1]]
+//        names ['x0_5.0','x0_9.0']
+//        inverse [[2,7],[5,7],[9,7]]
+//
+//   # drop + handle_unknown='ignore' is ALLOWED (does NOT raise at fit):
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, drop='first', handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(list(e.drop_idx_)); \
+//     print(e.transform([[100.,0.]]).tolist())  # unknown -> all-zero (like dropped)"
+//     -> drop_idx_ [0, 0]; transform [[0,0,0]]  (col0 100 unknown -> [0,0]; col1 0 -> [0])  (warns)
+// ---------------------------------------------------------------------------
+
+/// `drop='first'`: `drop_idx_ == [Some(0),Some(0)]`, the transform matrix, the
+/// n_output (3 = 2+1), and `get_feature_names_out` all match the live sklearn
+/// oracle on `[[2,0],[5,1],[9,0]]`.
+#[test]
+fn drop_first_transform_idx_names_match_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop='first'):
+    //   drop_idx_ [0,0]; transform [[0,0,0],[1,0,1],[0,1,0]];
+    //   names ['x0_5.0','x0_9.0','x1_1.0']
+    let sklearn_transform: Array2<f64> = array![[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::First);
+    assert_eq!(enc.drop(), OneHotDrop::First, "with_drop sets the mode");
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(
+        fitted.drop_idx_(),
+        &[Some(0), Some(0)],
+        "drop='first' drop_idx_ == [Some(0),Some(0)] vs sklearn [0,0]"
+    );
+    assert_eq!(
+        fitted.n_output_features(),
+        3,
+        "drop='first' n_output == 2+1 == 3 (sklearn)"
+    );
+    let out = fitted.transform(&x).unwrap();
+    assert_eq!(out, sklearn_transform, "drop='first' transform vs sklearn");
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        ["x0_5.0", "x0_9.0", "x1_1.0"],
+        "drop='first' get_feature_names_out (dropped cat omitted) vs sklearn"
+    );
+}
+
+/// `drop='if_binary'` on a 3/2/2-cat fixture: `drop_idx_ == [None,Some(0),Some(0)]`
+/// (only the binary features lose a category), transform + n_output + names ==
+/// the live sklearn oracle on `[[2,0,8],[5,1,9],[9,0,8]]`.
+#[test]
+fn drop_if_binary_idx_transform_names_match_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop='if_binary'):
+    //   drop_idx_ [None,0,0]; n_out 5; transform [[1,0,0,0,0],[0,1,0,1,1],[0,0,1,0,0]];
+    //   names ['x0_2.0','x0_5.0','x0_9.0','x1_1.0','x2_9.0']
+    let sklearn_transform: Array2<f64> = array![
+        [1.0, 0.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 1.0, 1.0],
+        [0.0, 0.0, 1.0, 0.0, 0.0],
+    ];
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::IfBinary);
+    let x = array![[2.0_f64, 0.0, 8.0], [5.0, 1.0, 9.0], [9.0, 0.0, 8.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(
+        fitted.drop_idx_(),
+        &[None, Some(0), Some(0)],
+        "drop='if_binary' drop_idx_ == [None,Some(0),Some(0)] vs sklearn [None,0,0]"
+    );
+    assert_eq!(
+        fitted.n_output_features(),
+        5,
+        "drop='if_binary' n_output == 3+1+1 == 5 (sklearn)"
+    );
+    let out = fitted.transform(&x).unwrap();
+    assert_eq!(
+        out, sklearn_transform,
+        "drop='if_binary' transform vs sklearn"
+    );
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        ["x0_2.0", "x0_5.0", "x0_9.0", "x1_1.0", "x2_9.0"],
+        "drop='if_binary' names (only binary features drop) vs sklearn"
+    );
+}
+
+/// `inverse_transform(transform(X)) == X` WITH drop='first': an all-zero block
+/// decodes to the DROPPED category (not an error, not None). Live sklearn:
+/// inverse of the dropped-category row recovers the original.
+#[test]
+fn drop_first_inverse_roundtrip_dropped_category_match_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop='first'):
+    //   inverse(transform(X)) == [[2,0],[5,1],[9,0]]  (the all-zero col0 block of
+    //   row 0 decodes to the DROPPED category 2.0)
+    let sklearn_expected: Array2<f64> = array![[2.0, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::First);
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    let encoded = fitted.transform(&x).unwrap();
+    let recovered = fitted.inverse_transform(&encoded).unwrap();
+    assert_eq!(
+        recovered, sklearn_expected,
+        "drop='first' inverse_transform(transform(X)) (all-zero -> dropped cat) vs sklearn"
+    );
+    assert_eq!(recovered, x, "drop roundtrip recovers original X");
+}
+
+/// A single-category feature with `drop='first'` is dropped ENTIRELY (block width
+/// 0): the inverse still recovers that (dropped, only) category. Live sklearn on
+/// `[[2,7],[5,7],[9,7]]`: col1 has the single category 7.0 -> dropped -> 0 cols;
+/// inverse fills 7.0.
+#[test]
+fn drop_first_single_category_fully_dropped_match_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop='first'):
+    //   drop_idx_ [0,0]; n_out 2; transform [[0,0],[1,0],[0,1]];
+    //   names ['x0_5.0','x0_9.0']; inverse [[2,7],[5,7],[9,7]]
+    let sklearn_transform: Array2<f64> = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    let sklearn_inverse: Array2<f64> = array![[2.0, 7.0], [5.0, 7.0], [9.0, 7.0]];
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::First);
+    let x = array![[2.0_f64, 7.0], [5.0, 7.0], [9.0, 7.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(
+        fitted.drop_idx_(),
+        &[Some(0), Some(0)],
+        "single-cat col1 still gets drop_idx_ Some(0)"
+    );
+    assert_eq!(
+        fitted.n_output_features(),
+        2,
+        "single-cat col1 fully dropped -> only col0's 2 kept cols (sklearn n_out 2)"
+    );
+    let out = fitted.transform(&x).unwrap();
+    assert_eq!(
+        out, sklearn_transform,
+        "single-cat-dropped transform vs sklearn"
+    );
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        ["x0_5.0", "x0_9.0"],
+        "single-cat-dropped feature contributes no name vs sklearn"
+    );
+    let recovered = fitted.inverse_transform(&out).unwrap();
+    assert_eq!(
+        recovered, sklearn_inverse,
+        "fully-dropped feature inverts to its dropped category 7.0 vs sklearn"
+    );
+}
+
+/// The drop-shift: a feature with 3+ categories where the dropped idx is 0, a
+/// NON-dropped category maps to the correctly shifted column. Live sklearn on
+/// `{2,5,9}` drop='first': cat 9 (membership idx 2) -> block col 1 (2-1), cat 5
+/// (idx 1) -> col 0, cat 2 (idx 0, dropped) -> all-zero.
+#[test]
+fn drop_first_shift_3cat_columns_match_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop='first', single col {2,5,9}):
+    //   transform([[2.]]) [[0,0]]; transform([[5.]]) [[1,0]]; transform([[9.]]) [[0,1]]
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::First);
+    let x = array![[2.0_f64], [5.0], [9.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(
+        fitted.transform(&array![[2.0_f64]]).unwrap(),
+        array![[0.0_f64, 0.0]],
+        "dropped cat 2 (idx 0) -> all-zero block vs sklearn"
+    );
+    assert_eq!(
+        fitted.transform(&array![[5.0_f64]]).unwrap(),
+        array![[1.0_f64, 0.0]],
+        "kept cat 5 (idx 1) -> shifted col 0 vs sklearn"
+    );
+    assert_eq!(
+        fitted.transform(&array![[9.0_f64]]).unwrap(),
+        array![[0.0_f64, 1.0]],
+        "kept cat 9 (idx 2, > dropped 0) -> shifted col 1 (idx-1) vs sklearn"
+    );
+    // And the shifted block inverts back through cat_idx = pos+1 for pos>=d.
+    assert_eq!(
+        fitted.inverse_transform(&array![[0.0_f64, 1.0]]).unwrap(),
+        array![[9.0_f64]],
+        "block pos 1 (>= dropped 0) -> category idx 2 == 9.0 vs sklearn"
+    );
+}
+
+/// `drop` + `handle_unknown='ignore'` is ALLOWED in sklearn 1.5.2 (does NOT raise
+/// at fit). Mirror it: fit succeeds, and an unknown value encodes to an all-zero
+/// block (identical to the dropped category). Live sklearn:
+/// `OneHotEncoder(drop='first', handle_unknown='ignore').fit([[2,0],[5,1],[9,0]])`
+/// does not raise; `transform([[100,0]])` -> `[[0,0,0]]` (warns).
+#[test]
+fn drop_plus_ignore_allowed_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2): fit does NOT raise; drop_idx_ [0,0];
+    //   transform([[100,0]]) -> [[0,0,0]] (col0 100 unknown -> all-zero like dropped).
+    let enc = OneHotEncoder::<f64>::new()
+        .with_drop(OneHotDrop::First)
+        .with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    // sklearn does NOT raise at fit for drop + handle_unknown='ignore'.
+    let fitted = enc
+        .fit(&x, &())
+        .expect("drop + handle_unknown='ignore' must NOT error at fit (sklearn 1.5.2 allows it)");
+    assert_eq!(fitted.drop_idx_(), &[Some(0), Some(0)]);
+    // An unknown value -> all-zero block (same as the dropped category).
+    let out = fitted.transform(&array![[100.0_f64, 0.0]]).unwrap();
+    assert_eq!(
+        out,
+        array![[0.0_f64, 0.0, 0.0]],
+        "drop+ignore: unknown col0 -> all-zero; col1 0 is the dropped cat -> all-zero vs sklearn"
+    );
+}
+
+/// `drop` ABI: default is `None_`, `with_drop` sets the mode, `drop()` reads it
+/// back; `drop_idx_()` is all-`None` for the default and exposed on the fitted
+/// encoder. The enum default matches sklearn's `drop=None` default (`:747`).
+#[test]
+fn drop_default_and_builder_abi() {
+    // sklearn default drop=None (_encoders.py:747) -> None_ default.
+    assert_eq!(OneHotDrop::default(), OneHotDrop::None_);
+    let default_enc = OneHotEncoder::<f64>::new();
+    assert_eq!(default_enc.drop(), OneHotDrop::None_);
+    let derived: OneHotEncoder<f64> = OneHotEncoder::default();
+    assert_eq!(derived.drop(), OneHotDrop::None_);
+
+    let first_enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::First);
+    assert_eq!(first_enc.drop(), OneHotDrop::First);
+
+    // The default-mode fitted encoder reports all-None drop_idx_ (no drop).
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = default_enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.drop_idx_(),
+        &[None, None],
+        "drop=None -> drop_idx_ all None (sklearn drop_idx_ is None)"
+    );
+}
+
+/// `drop=None` (the default) leaves REQ-3/4/6 unchanged: the multifeature fixture
+/// transforms to the FULL one-hot (no column dropped), matching the existing
+/// REQ-3 oracle. Regression guard that adding `drop` did not perturb the default.
+#[test]
+fn drop_none_default_transform_unchanged_vs_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, drop=None == default): the same matrix as the
+    // REQ-1/REQ-3 `transform_multifeature_matches_sklearn_oracle` test.
+    let sklearn_expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+    ];
+    let enc = OneHotEncoder::<f64>::new().with_drop(OneHotDrop::None_);
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    assert_eq!(
+        fitted.n_output_features(),
+        5,
+        "drop=None keeps all 5 columns"
+    );
+    assert_eq!(
+        fitted.transform(&x).unwrap(),
+        sklearn_expected,
+        "drop=None default transform == full one-hot (REQ-3 unchanged)"
+    );
+    // Roundtrip still works (REQ-6 unchanged under drop=None).
+    let recovered = fitted
+        .inverse_transform(&fitted.transform(&x).unwrap())
+        .unwrap();
+    assert_eq!(recovered, x, "drop=None inverse roundtrip unchanged");
 }
