@@ -125,7 +125,7 @@ pub use omp::{FittedOMP, OrthogonalMatchingPursuit};
 pub use one_class_svm::{FittedOneClassSVM, OneClassSVM};
 pub use qda::{FittedQDA, QDA};
 pub use quantile_regressor::{FittedQuantileRegressor, QuantileRegressor};
-pub use ransac::{FittedRANSACRegressor, RANSACRegressor};
+pub use ransac::{FittedRANSACRegressor, MinSamples, RANSACRegressor, RansacLoss};
 pub use ridge::{FittedRidge, FittedRidgeMulti, Ridge};
 pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
 pub use ridge_classifier_cv::{FittedRidgeClassifierCV, RidgeClassifierCV};

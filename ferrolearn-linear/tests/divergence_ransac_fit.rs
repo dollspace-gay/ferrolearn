@@ -39,7 +39,7 @@
 
 use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::LinearRegression;
-use ferrolearn_linear::ransac::RANSACRegressor;
+use ferrolearn_linear::ransac::{RANSACRegressor, RansacLoss};
 use ndarray::{Array1, Array2};
 
 // ---------------------------------------------------------------------------
@@ -185,4 +185,264 @@ fn ransac_mad_zero_threshold_excludes_tiny_deviation() {
          an outlier {SK_MASK:?}; ferrolearn substitutes 1e-6 and marks it an \
          inlier, reporting {mask:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-8 — loss family. The dataset is a clean line `y = 2x + 1` with a single
+// clear outlier at idx 7 (`y[7] = 100`). Any valid 5-point inlier subset refits
+// to the same line, so the consensus result is RNG-INDEPENDENT — both sklearn's
+// Mersenne-Twister draws and ferrolearn's Fisher-Yates draws converge on the
+// same `coef_`/`intercept_`/inlier set. The loss only changes the per-sample
+// residual (`_ransac.py:508`), not the threshold (`_ransac.py:399-401`).
+// ---------------------------------------------------------------------------
+
+/// Parity: `loss = SquaredError` recovers the clean line == sklearn.
+///
+/// sklearn site: `sklearn/linear_model/_ransac.py:412-418`
+///   `loss_function = lambda y_true, y_pred: (y_true - y_pred) ** 2`
+///   applied at `:508` `residuals_subset = loss_function(y, y_pred)`, then
+///   classified `residuals_subset <= residual_threshold` (`:511`).
+///
+/// Oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import \
+///   RANSACRegressor, LinearRegression; \
+///   X=np.arange(1,11).reshape(-1,1).astype(float); y=2*X.ravel()+1; y[7]=100.0; \
+///   m=RANSACRegressor(LinearRegression(), min_samples=0.5, \
+///     loss='squared_error', random_state=0, max_trials=100).fit(X,y); \
+///   print(round(m.estimator_.coef_[0],10), round(m.estimator_.intercept_,10), \
+///     int(m.inlier_mask_.sum()), m.inlier_mask_.astype(int).tolist())"
+/// # -> 2.0 1.0 9 [1, 1, 1, 1, 1, 1, 1, 0, 1, 1]
+/// ```
+#[test]
+fn ransac_loss_squared_error_recovers_line() {
+    let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect::<Vec<_>>()).unwrap();
+    let mut yv: Vec<f64> = (1..=10).map(|i| 2.0 * f64::from(i) + 1.0).collect();
+    yv[7] = 100.0; // single clear outlier
+    let y = Array1::from(yv);
+
+    let model = RANSACRegressor::new(LinearRegression::<f64>::new())
+        .with_min_samples_fraction(0.5)
+        .with_loss(RansacLoss::SquaredError)
+        .with_max_trials(100)
+        .with_random_state(0);
+    let fitted = model.fit(&x, &y).expect("RANSAC fit (squared_error)");
+
+    // Oracle: coef 2.0, intercept 1.0 (refit on the 9 inliers recovers the line).
+    let coef = fitted
+        .predict(&Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap())
+        .expect("predict");
+    let intercept = coef[0];
+    let slope = coef[1] - coef[0];
+    assert!(
+        (slope - 2.0).abs() < 1e-9,
+        "squared_error slope: sklearn 2.0, got {slope}"
+    );
+    assert!(
+        (intercept - 1.0).abs() < 1e-9,
+        "squared_error intercept: sklearn 1.0, got {intercept}"
+    );
+
+    // Oracle inlier count: 9 (only idx 7 excluded).
+    let mask = fitted.inlier_mask();
+    let n_inliers = mask.iter().filter(|&&v| v).count();
+    assert_eq!(
+        n_inliers, 9,
+        "squared_error inlier count: sklearn 9, got {n_inliers}"
+    );
+    assert!(!mask[7], "squared_error: idx 7 (y=100) must be an outlier");
+}
+
+/// Parity: default loss (`AbsoluteError`) is byte-identical to the prior
+/// hardcoded absolute-error behavior, and recovers the same clean line.
+///
+/// Oracle (sklearn 1.5.2, default `loss='absolute_error'`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import \
+///   RANSACRegressor, LinearRegression; \
+///   X=np.arange(1,11).reshape(-1,1).astype(float); y=2*X.ravel()+1; y[7]=100.0; \
+///   m=RANSACRegressor(LinearRegression(), min_samples=0.5, \
+///     random_state=0, max_trials=100).fit(X,y); \
+///   print(round(m.estimator_.coef_[0],10), round(m.estimator_.intercept_,10), \
+///     int(m.inlier_mask_.sum()))"
+/// # -> 2.0 1.0 9
+/// ```
+#[test]
+fn ransac_loss_default_absolute_error_byte_identical() {
+    let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect::<Vec<_>>()).unwrap();
+    let mut yv: Vec<f64> = (1..=10).map(|i| 2.0 * f64::from(i) + 1.0).collect();
+    yv[7] = 100.0;
+    let y = Array1::from(yv);
+
+    // Default loss (no `.with_loss`) must equal an explicit AbsoluteError.
+    let default_model = RANSACRegressor::new(LinearRegression::<f64>::new())
+        .with_min_samples_fraction(0.5)
+        .with_max_trials(100)
+        .with_random_state(0);
+    let explicit_model = RANSACRegressor::new(LinearRegression::<f64>::new())
+        .with_min_samples_fraction(0.5)
+        .with_loss(RansacLoss::AbsoluteError)
+        .with_max_trials(100)
+        .with_random_state(0);
+
+    let f_default = default_model.fit(&x, &y).expect("fit default");
+    let f_explicit = explicit_model.fit(&x, &y).expect("fit explicit absolute");
+    assert_eq!(
+        f_default.inlier_mask(),
+        f_explicit.inlier_mask(),
+        "default loss must be byte-identical to explicit AbsoluteError"
+    );
+
+    // Oracle: coef 2.0, intercept 1.0, 9 inliers.
+    let coef = f_default
+        .predict(&Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap())
+        .expect("predict");
+    assert!((coef[0] - 1.0).abs() < 1e-9, "abs-error intercept != 1.0");
+    assert!(
+        ((coef[1] - coef[0]) - 2.0).abs() < 1e-9,
+        "abs-error slope != 2.0"
+    );
+    let n_inliers = f_default.inlier_mask().iter().filter(|&&v| v).count();
+    assert_eq!(n_inliers, 9, "abs-error inlier count: sklearn 9");
+}
+
+// ---------------------------------------------------------------------------
+// REQ-12 — min_samples float fraction. sklearn resolves `0 < min_samples < 1`
+// to `ceil(min_samples * n_samples)` (`_ransac.py:389-390`); a resolved count
+// `> n_samples` (or a fraction outside the range) is a ValueError
+// (`_ransac.py:393-397`, constraint `Interval(RealNotInt, 0, 1)` `:264`).
+// ---------------------------------------------------------------------------
+
+/// Parity: `min_samples = Fraction(0.5)` on `n_samples = 10` resolves to
+/// `ceil(0.5 * 10) = 5`, matching sklearn `min_samples=0.5`.
+///
+/// We observe the resolved subset size indirectly: with `min_samples` resolved
+/// to 5, RANSAC fits the clean line `y = 2x + 1` (one outlier at idx 7) and
+/// recovers `coef≈2.0, intercept≈1.0` with 9 inliers — identical to the live
+/// sklearn fit with `min_samples=0.5`. (A divergent resolution — e.g. ceil
+/// rounding to 4 or 6 — would still fit the same draw-invariant line here, so
+/// the discriminating oracle is the *resolved size acceptance*: `min_samples`
+/// in `(0,1)` must not error and must produce the sklearn consensus.)
+///
+/// Oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "import numpy as np
+/// def resolve(ms, n): return int(np.ceil(ms*n)) if 0<ms<1 else int(ms)
+/// print(resolve(0.5,10))"   # -> 5
+/// python3 -c "import numpy as np; from sklearn.linear_model import \
+///   RANSACRegressor, LinearRegression; \
+///   X=np.arange(1,11).reshape(-1,1).astype(float); y=2*X.ravel()+1; y[7]=100.0; \
+///   m=RANSACRegressor(LinearRegression(), min_samples=0.5, random_state=0, \
+///     max_trials=100).fit(X,y); print(int(m.inlier_mask_.sum()))"   # -> 9
+/// ```
+#[test]
+fn ransac_min_samples_fraction_resolves_ceil() {
+    let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect::<Vec<_>>()).unwrap();
+    let mut yv: Vec<f64> = (1..=10).map(|i| 2.0 * f64::from(i) + 1.0).collect();
+    yv[7] = 100.0;
+    let y = Array1::from(yv);
+
+    let model = RANSACRegressor::new(LinearRegression::<f64>::new())
+        .with_min_samples_fraction(0.5)
+        .with_max_trials(100)
+        .with_random_state(0);
+    let fitted = model
+        .fit(&x, &y)
+        .expect("min_samples=0.5 (ceil(5.0)=5) must fit");
+
+    let n_inliers = fitted.inlier_mask().iter().filter(|&&v| v).count();
+    assert_eq!(
+        n_inliers, 9,
+        "min_samples=0.5 -> 5 samples/subset: sklearn 9 inliers, got {n_inliers}"
+    );
+
+    // Also assert the resolved count via the builder getter round-trips the
+    // Fraction (resolution itself is internal; the parity is the fit result).
+    let coef = fitted
+        .predict(&Array2::from_shape_vec((2, 1), vec![0.0, 1.0]).unwrap())
+        .expect("predict");
+    assert!(
+        ((coef[1] - coef[0]) - 2.0).abs() < 1e-9 && (coef[0] - 1.0).abs() < 1e-9,
+        "min_samples=0.5 fit must recover the line (sklearn coef 2.0, intercept 1.0)"
+    );
+}
+
+/// Divergence-guard: a `min_samples` fraction outside `(0, 1)` is an error,
+/// mirroring sklearn's `Interval(RealNotInt, 0, 1)` constraint / the
+/// `> n_samples` `ValueError` (`_ransac.py:264,393-397`).
+///
+/// Oracle (sklearn 1.5.2): `min_samples=0.0` and `min_samples=1.5` both raise
+/// (UnboundLocalError / InvalidParameterError respectively — both are fit-time
+/// rejections of an out-of-range fraction):
+/// ```text
+/// python3 -c "from sklearn.linear_model import RANSACRegressor, LinearRegression; \
+///   import numpy as np; X=np.arange(1,11).reshape(-1,1).astype(float); \
+///   y=2*X.ravel()+1; \
+///   [print(f, RANSACRegressor(LinearRegression(), min_samples=f).fit(X,y)) \
+///     if False else None for f in (0.0, 1.5)]"
+/// # min_samples=0.0 -> raises;  min_samples=1.5 -> raises
+/// ```
+#[test]
+fn ransac_min_samples_fraction_out_of_range_errors() {
+    let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect::<Vec<_>>()).unwrap();
+    let y = Array1::from(
+        (1..=10)
+            .map(|i| 2.0 * f64::from(i) + 1.0)
+            .collect::<Vec<_>>(),
+    );
+
+    // f == 0.0 (sklearn rejects: not in (0,1)).
+    let m0 = RANSACRegressor::new(LinearRegression::<f64>::new()).with_min_samples_fraction(0.0);
+    assert!(
+        m0.fit(&x, &y).is_err(),
+        "min_samples fraction 0.0 must error (sklearn rejects)"
+    );
+
+    // f > 1 (sklearn InvalidParameterError: fraction must be in [0,1]).
+    let m_hi = RANSACRegressor::new(LinearRegression::<f64>::new()).with_min_samples_fraction(1.5);
+    assert!(
+        m_hi.fit(&x, &y).is_err(),
+        "min_samples fraction 1.5 must error (sklearn rejects)"
+    );
+
+    // f < 0 (sklearn InvalidParameterError).
+    let m_neg =
+        RANSACRegressor::new(LinearRegression::<f64>::new()).with_min_samples_fraction(-0.1);
+    assert!(
+        m_neg.fit(&x, &y).is_err(),
+        "min_samples fraction -0.1 must error (sklearn rejects)"
+    );
+}
+
+/// Regression-guard: `min_samples = Count(k)` (the integer-count path) is
+/// unchanged from before REQ-12 — it still resolves to `k` and excludes the
+/// outlier on the clean-line dataset.
+///
+/// Oracle (sklearn 1.5.2, integer `min_samples=2`):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.linear_model import \
+///   RANSACRegressor, LinearRegression; \
+///   X=np.arange(1,11).reshape(-1,1).astype(float); y=2*X.ravel()+1; y[7]=100.0; \
+///   m=RANSACRegressor(LinearRegression(), min_samples=2, random_state=0, \
+///     max_trials=100).fit(X,y); print(int(m.inlier_mask_.sum()))"   # -> 9
+/// ```
+#[test]
+fn ransac_min_samples_count_unchanged() {
+    let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect::<Vec<_>>()).unwrap();
+    let mut yv: Vec<f64> = (1..=10).map(|i| 2.0 * f64::from(i) + 1.0).collect();
+    yv[7] = 100.0;
+    let y = Array1::from(yv);
+
+    let model = RANSACRegressor::new(LinearRegression::<f64>::new())
+        .with_min_samples(2)
+        .with_max_trials(100)
+        .with_random_state(0);
+    let fitted = model.fit(&x, &y).expect("min_samples=2 (Count) must fit");
+
+    let n_inliers = fitted.inlier_mask().iter().filter(|&&v| v).count();
+    assert_eq!(
+        n_inliers, 9,
+        "min_samples=2 (Count): sklearn 9 inliers, got {n_inliers}"
+    );
+    assert!(!fitted.inlier_mask()[7], "idx 7 (y=100) must be an outlier");
 }

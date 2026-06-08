@@ -52,11 +52,11 @@
 //! | REQ-5 (refit-once; mask from subset model) | SHIPPED | `fn fit` records `inlier_mask_best` from the SUBSET model (no in-loop refit/recompute) and refits the base estimator ONCE after the loop on `(x_inlier_best, y_inlier_best)`, mirroring `_ransac.py:544,602,605`. The stored `inlier_mask` is never recomputed from the refit. Verified by the green divergence suite + module unit tests. Closed #513. |
 //! | REQ-6 (n_inliers_best init / acceptance gate) | SHIPPED | `fn fit` initializes `n_inliers_best = 1` (`_ransac.py:451`), skips only when `n_inliers_subset < n_inliers_best` (`_ransac.py:515`), and no longer gates on `n_inliers >= min_samples`. The up-front `n_samples < min_samples` guard mirrors `_ransac.py:393-397`. Closed #514. |
 //! | REQ-7 (dynamic max_trials + stop criteria) | NOT-STARTED | open blocker #515. `fn fit` runs a FIXED `for _ in 0..self.max_trials` loop; no `_dynamic_max_trials` shrink, no `stop_n_inliers`/`stop_score`/`stop_probability`/`max_skips`, no `n_trials_`/`n_skips_*` tracking. |
-//! | REQ-8 (loss='squared_error') | NOT-STARTED | open blocker #516. `fn fit` hardcodes absolute-error residuals (`(preds[i] - y[i]).abs()`); no `loss` parameter. |
+//! | REQ-8 (loss='squared_error') | SHIPPED | impl: `pub enum RansacLoss { #[default] AbsoluteError, SquaredError }` + field `loss: RansacLoss` + `with_loss` builder (sklearn default `'absolute_error'`, `_ransac.py:301`). `fn fit` branches the per-sample residual: `AbsoluteError → (preds[i]-y[i]).abs()`, `SquaredError → { let d = preds[i]-y[i]; d*d }`, mirroring `_ransac.py:407,414` and applied at the `residuals <= residual_threshold` classification (`_ransac.py:508,511`); the MAD-default threshold stays loss-independent (`_ransac.py:399-401`). Consumer: boundary types re-exported at crate root + `RansacLoss` re-exported (`pub use ransac::{...RansacLoss} in lib.rs`). Tests (live-oracle, RNG-independent): `ransac_loss_squared_error_recovers_line`, `ransac_loss_default_absolute_error_byte_identical` (tests/divergence_ransac_fit.rs). Closed #516. |
 //! | REQ-9 (MAD-zero parity) | SHIPPED | `fn fit` uses the MAD value directly (`mad(&y.to_vec())`) with no `1e-6` substitution, so a constant target yields threshold `0.0` per `_ransac.py:399-401`. Test: `ransac_mad_zero_threshold_excludes_tiny_deviation` (tests/divergence_ransac_fit.rs) — idx 7 (residual 1e-7) is an OUTLIER. Closed #517. |
 //! | REQ-10 (introspection attributes) | NOT-STARTED | open blocker #518. `FittedRANSACRegressor` exposes only `inlier_mask()`; no `estimator_`/`n_trials_`/`n_skips_*`/`n_features_in_`. |
 //! | REQ-11 (is_data_valid / is_model_valid / max_skips) | NOT-STARTED | open blocker #519. `RANSACRegressor` has no such fields. |
-//! | REQ-12 (min_samples float fraction) | NOT-STARTED | open blocker #520. `min_samples: Option<usize>` accepts only integer counts. |
+//! | REQ-12 (min_samples float fraction) | SHIPPED | impl: `pub enum MinSamples<F> { Count(usize), Fraction(F) }` + field `min_samples: Option<MinSamples<F>>` + builders `with_min_samples(usize) → Count`, `with_min_samples_fraction(F) → Fraction`, getter `min_samples()`. `fn fit` resolves `None → n_features+1` (unchanged), `Count(k) → k`, `Fraction(f) → ceil(f·n_samples)` validating `0 < f < 1` (else `FerroError::InvalidParameter`), with the resolved-count `> n_samples → InvalidParameter` guard mirroring `_ransac.py:382-397` (sklearn `ValueError`). Consumer: boundary types re-exported at crate root + `MinSamples` re-exported (`pub use ransac::{...MinSamples} in lib.rs`). Tests (live-oracle): `ransac_min_samples_fraction_resolves_ceil`, `ransac_min_samples_fraction_out_of_range_errors`, `ransac_min_samples_count_unchanged` (tests/divergence_ransac_fit.rs). Closed #520. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open blocker #521. Still on `ndarray` + `rand::rngs::StdRng`, not `ferray-core`/`ferray::random`. |
 //!
 //! # Examples
@@ -88,6 +88,52 @@ use rand::Rng;
 use rand::SeedableRng;
 
 // ---------------------------------------------------------------------------
+// Loss family (REQ-8)
+// ---------------------------------------------------------------------------
+
+/// Per-sample residual function used to classify inliers.
+///
+/// Mirrors scikit-learn's `RANSACRegressor(loss=...)` string options
+/// (`sklearn/linear_model/_ransac.py:284,405-418`), constrained by
+/// `StrOptions({"absolute_error", "squared_error"})`. The residual produced
+/// here is compared (boundary-inclusive) against `residual_threshold`; the
+/// MAD-based default threshold itself is computed identically regardless of the
+/// loss (`_ransac.py:399-401` is unconditional — only the per-sample residual at
+/// `_ransac.py:508` changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RansacLoss {
+    /// Absolute error per sample: `|y_true − y_pred|`
+    /// (`_ransac.py:407`, sklearn default).
+    #[default]
+    AbsoluteError,
+    /// Squared error per sample: `(y_true − y_pred)²` (`_ransac.py:414`).
+    SquaredError,
+}
+
+// ---------------------------------------------------------------------------
+// min_samples specification (REQ-12)
+// ---------------------------------------------------------------------------
+
+/// How `min_samples` (the per-trial subset size) is specified.
+///
+/// Mirrors scikit-learn's `min_samples` parameter, which is `int (>= 1)` for an
+/// absolute count or `float ([0, 1])` for a relative fraction
+/// (`sklearn/linear_model/_ransac.py:115-125`; constraint
+/// `Interval(Integral, 1, None) | Interval(RealNotInt, 0, 1, closed="both")`,
+/// `_ransac.py:262-266`). The resolution at fit time is:
+/// `0 < f < 1 → ceil(f · n_samples)` (`_ransac.py:389-390`); an integer count is
+/// used directly (`_ransac.py:391-392`). A resolved count larger than
+/// `n_samples` is a `ValueError` (`_ransac.py:393-397`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MinSamples<F> {
+    /// An absolute number of samples per subset (`min_samples >= 1`).
+    Count(usize),
+    /// A fraction of `n_samples` per subset, resolved to
+    /// `ceil(fraction · n_samples)` (sklearn `0 < min_samples < 1`).
+    Fraction(F),
+}
+
+// ---------------------------------------------------------------------------
 // RANSACRegressor (unfitted)
 // ---------------------------------------------------------------------------
 
@@ -105,13 +151,24 @@ use rand::SeedableRng;
 pub struct RANSACRegressor<F, E> {
     /// The base estimator.
     pub estimator: E,
-    /// Minimum number of samples for fitting.
-    pub min_samples: Option<usize>,
-    /// Residual threshold: points with absolute residual below this are
-    /// considered inliers. If `None`, uses the MAD of the target.
+    /// Minimum number of samples per subset. `None` resolves to
+    /// `n_features + 1` (the `LinearRegression` default,
+    /// `sklearn/linear_model/_ransac.py:388`); a [`MinSamples::Count`] is an
+    /// absolute count, a [`MinSamples::Fraction`] resolves to
+    /// `ceil(fraction · n_samples)` (`_ransac.py:389-390`).
+    pub min_samples: Option<MinSamples<F>>,
+    /// Residual threshold: points whose per-sample residual (under [`loss`]) is
+    /// `<= threshold` are considered inliers. If `None`, uses the MAD of the
+    /// target.
+    ///
+    /// [`loss`]: RANSACRegressor::loss
     pub residual_threshold: Option<F>,
     /// Maximum number of random trials.
     pub max_trials: usize,
+    /// Per-sample residual loss used for inlier classification. Defaults to
+    /// [`RansacLoss::AbsoluteError`] (sklearn default,
+    /// `sklearn/linear_model/_ransac.py:301`).
+    pub loss: RansacLoss,
     /// Optional random seed for reproducibility.
     pub random_state: Option<u64>,
 }
@@ -121,7 +178,7 @@ impl<F: Float, E> RANSACRegressor<F, E> {
     ///
     /// Defaults: `min_samples = None` (auto: n_features + 1),
     /// `residual_threshold = None` (auto: MAD), `max_trials = 100`,
-    /// `random_state = None`.
+    /// `loss = AbsoluteError` (sklearn default), `random_state = None`.
     #[must_use]
     pub fn new(estimator: E) -> Self {
         Self {
@@ -129,14 +186,48 @@ impl<F: Float, E> RANSACRegressor<F, E> {
             min_samples: None,
             residual_threshold: None,
             max_trials: 100,
+            loss: RansacLoss::AbsoluteError,
             random_state: None,
         }
     }
 
-    /// Set the minimum number of samples for fitting.
+    /// Set the minimum number of samples per subset as an absolute count
+    /// ([`MinSamples::Count`]). Mirrors sklearn `min_samples` as an `int >= 1`.
     #[must_use]
     pub fn with_min_samples(mut self, min_samples: usize) -> Self {
-        self.min_samples = Some(min_samples);
+        self.min_samples = Some(MinSamples::Count(min_samples));
+        self
+    }
+
+    /// Set the minimum number of samples per subset as a fraction of
+    /// `n_samples` ([`MinSamples::Fraction`]), resolved at fit time to
+    /// `ceil(fraction · n_samples)`. Mirrors sklearn `min_samples` as a
+    /// `float` in `(0, 1)` (`sklearn/linear_model/_ransac.py:389-390`).
+    ///
+    /// The fraction is validated at fit time: a value outside `(0, 1)` (or one
+    /// whose resolved count exceeds `n_samples`) yields
+    /// [`FerroError::InvalidParameter`], mirroring sklearn's `ValueError`
+    /// (`_ransac.py:393-397`).
+    #[must_use]
+    pub fn with_min_samples_fraction(mut self, fraction: F) -> Self {
+        self.min_samples = Some(MinSamples::Fraction(fraction));
+        self
+    }
+
+    /// Returns the configured `min_samples` specification (`None` = auto).
+    #[must_use]
+    pub fn min_samples(&self) -> Option<MinSamples<F>> {
+        self.min_samples
+    }
+
+    /// Set the per-sample residual loss used for inlier classification.
+    ///
+    /// Mirrors sklearn `RANSACRegressor(loss=...)`
+    /// (`sklearn/linear_model/_ransac.py:284`). Defaults to
+    /// [`RansacLoss::AbsoluteError`].
+    #[must_use]
+    pub fn with_loss(mut self, loss: RansacLoss) -> Self {
+        self.loss = loss;
         self
     }
 
@@ -318,7 +409,60 @@ where
             });
         }
 
-        let min_samples = self.min_samples.unwrap_or(n_features + 1).max(1);
+        // Resolve `min_samples` per sklearn (`_ransac.py:382-397`):
+        //   None        -> n_features + 1 (the LinearRegression default).
+        //   Count(k)     -> k (integer count, `>= 1` branch); `k < 1` is a
+        //                   ValueError per the parameter constraint
+        //                   `Interval(Integral, 1, None, closed="left")`
+        //                   (`_ransac.py:263`) — never silently coerced.
+        //   Fraction(f)  -> ceil(f * n_samples) for `0 < f < 1`; a fraction
+        //                   outside (0, 1) is a ValueError.
+        // A resolved count `> n_samples` is a ValueError (`_ransac.py:393-397`).
+        let min_samples = match self.min_samples {
+            None => (n_features + 1).max(1),
+            Some(MinSamples::Count(k)) => {
+                // sklearn rejects `min_samples < 1` at parameter validation
+                // (`Interval(Integral, 1, None, closed="left")`,
+                // `_ransac.py:263`); do not coerce `0` to `1`.
+                if k < 1 {
+                    return Err(FerroError::InvalidParameter {
+                        name: "min_samples".into(),
+                        reason: "min_samples must be >= 1".into(),
+                    });
+                }
+                k
+            }
+            Some(MinSamples::Fraction(f)) => {
+                // sklearn's float branch is `0 < min_samples < 1`
+                // (`_ransac.py:389`); a float `>= 1` would take the integer
+                // branch — for the explicit `Fraction` variant we require a
+                // genuine fraction in (0, 1).
+                if !(f > F::zero() && f < F::one()) {
+                    return Err(FerroError::InvalidParameter {
+                        name: "min_samples".into(),
+                        reason: "min_samples fraction must be in the open \
+                                 interval (0, 1); use with_min_samples for an \
+                                 absolute count"
+                            .into(),
+                    });
+                }
+                // ceil(f * n_samples) (`_ransac.py:390`).
+                let raw = f * F::from(n_samples).unwrap_or_else(F::one);
+                let resolved = raw.ceil();
+                // n_samples >= 1 and 0 < f < 1 keep `resolved` finite and >= 1.
+                let resolved = resolved.to_usize().unwrap_or(1).max(1);
+                if resolved > n_samples {
+                    return Err(FerroError::InvalidParameter {
+                        name: "min_samples".into(),
+                        reason: format!(
+                            "`min_samples` may not be larger than number of \
+                             samples: n_samples = {n_samples}."
+                        ),
+                    });
+                }
+                resolved
+            }
+        };
 
         if n_samples < min_samples {
             return Err(FerroError::InsufficientSamples {
@@ -374,12 +518,23 @@ where
                 Err(_) => continue,
             };
 
-            // Classify inliers: `residuals <= residual_threshold`, boundary
-            // inclusive (`_ransac.py:511-512`).
+            // Per-sample residual under the configured loss (`_ransac.py:508`,
+            // `residuals_subset = loss_function(y, y_pred)`):
+            //   AbsoluteError -> |y − y_pred|  (`_ransac.py:407`)
+            //   SquaredError  -> (y − y_pred)² (`_ransac.py:414`)
+            // The residual is then compared, boundary-inclusive, to
+            // `residual_threshold` (`_ransac.py:511-512`); the MAD-default
+            // threshold is loss-independent (`_ransac.py:399-401`).
             let mut inlier_mask_subset = vec![false; n_samples];
             let mut inlier_idxs_subset: Vec<usize> = Vec::new();
             for i in 0..n_samples {
-                let residual = (preds[i] - y[i]).abs();
+                let residual = match self.loss {
+                    RansacLoss::AbsoluteError => (preds[i] - y[i]).abs(),
+                    RansacLoss::SquaredError => {
+                        let d = preds[i] - y[i];
+                        d * d
+                    }
+                };
                 if residual <= threshold {
                     inlier_mask_subset[i] = true;
                     inlier_idxs_subset.push(i);

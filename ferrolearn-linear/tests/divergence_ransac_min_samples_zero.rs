@@ -44,7 +44,6 @@ use ndarray::{Array1, Array2};
 ///
 /// Tracking: #2251
 #[test]
-#[ignore = "divergence: RANSAC min_samples Count(0) silently coerces to 1 vs sklearn ValueError; tracking #2251"]
 fn ransac_min_samples_count_zero_must_error() {
     let x = Array2::from_shape_vec((10, 1), (1..=10).map(f64::from).collect()).unwrap();
     let y = Array1::from(
