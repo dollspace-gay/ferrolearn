@@ -51,7 +51,6 @@ fn labels(v: &[isize]) -> Array1<isize> {
 ///
 /// Tracking: #2301
 #[test]
-#[ignore = "divergence: silhouette singleton cluster sample = 1.0, sklearn = 0.0; tracking #2301"]
 fn divergence_silhouette_samples_singleton() {
     let x: Array2<f64> = array![
         [0.0, 0.0],
@@ -91,7 +90,6 @@ fn divergence_silhouette_samples_singleton() {
 ///
 /// Tracking: #2301
 #[test]
-#[ignore = "divergence: silhouette_score mean inflated by singleton=1.0 vs sklearn=0.0; tracking #2301"]
 fn divergence_silhouette_score_singleton() {
     let x: Array2<f64> = array![
         [0.0, 0.0],
@@ -139,7 +137,6 @@ fn divergence_silhouette_score_singleton() {
 ///
 /// Tracking: #2302
 #[test]
-#[ignore = "divergence: NMI single-side mi==0 returns 1.0, sklearn 0.0; tracking #2302"]
 fn divergence_nmi_single_side_geometric() {
     let lt = labels(&[0, 0, 0]);
     let lp = labels(&[0, 1, 2]);
@@ -183,7 +180,6 @@ fn divergence_nmi_single_side_geometric() {
 ///
 /// Tracking: #2303
 #[test]
-#[ignore = "divergence: ARI single-sample mismatched labels = 0.0, sklearn = 1.0; tracking #2303"]
 fn divergence_ari_single_sample_mismatched() {
     let ari = adjusted_rand_score(&labels(&[0]), &labels(&[5])).unwrap();
     // sklearn 1.5.2 live oracle: 1.0 (no pairs ⇒ fn==fp==0 ⇒ full agreement).

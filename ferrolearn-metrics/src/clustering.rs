@@ -210,10 +210,19 @@ where
 
         let ci_members = &cluster_indices[ci_idx];
 
+        // Size-1 cluster: sklearn maps the NaN intra-cluster distance to a
+        // silhouette of 0.0 (`np.nan_to_num`,
+        // `sklearn/metrics/cluster/_unsupervised.py:317-318`) and STILL averages
+        // it in (`silhouette_score` is `np.mean` over every sample,
+        // `_unsupervised.py:54,128`). So the singleton contributes 0.0 to the
+        // sum but is counted -> `s_i == 0`, `count += 1`.
+        if ci_members.len() <= 1 {
+            count += 1;
+            continue;
+        }
+
         // a(i): mean intra-cluster distance (exclude self)
-        let a_i = if ci_members.len() <= 1 {
-            F::zero()
-        } else {
+        let a_i = {
             let mut dist_sum = F::zero();
             for &j in ci_members {
                 if j == i {
@@ -380,12 +389,12 @@ pub fn adjusted_rand_score(
     let comb_n = n_choose_2(n_u64);
 
     if comb_n == 0 {
-        // Only one sample — convention: ARI = 1 if labels agree, else 0.
-        return Ok(if labels_true[0] == labels_pred[0] {
-            1.0
-        } else {
-            0.0
-        });
+        // No pairs at all (n < 2): there are no discordant pairs, so
+        // `fn == 0 && fp == 0` holds and ARI is full agreement -> 1.0,
+        // REGARDLESS of the raw label names. sklearn
+        // `sklearn/metrics/cluster/_supervised.py:448-450`:
+        //   `if fn == 0 and fp == 0: return 1.0`.
+        return Ok(1.0);
     }
 
     let prod_ab = sum_comb_a as f64 * sum_comb_b as f64;
@@ -922,9 +931,17 @@ where
 
         let ci_members = &cluster_indices[ci_idx];
 
-        let a_i = if ci_members.len() <= 1 {
-            F::zero()
-        } else {
+        // Size-1 cluster: sklearn divides the intra-cluster distance by
+        // `(label_freq - 1) == 0` -> NaN -> `np.nan_to_num` -> 0.0
+        // (`sklearn/metrics/cluster/_unsupervised.py:317-318`). The silhouette
+        // coefficient of a sample that is the sole member of its cluster is 0.0,
+        // not `(b - 0)/max(0, b) == 1.0`. `result` is pre-initialized to zero,
+        // so skipping the singleton leaves the sklearn-matching value.
+        if ci_members.len() <= 1 {
+            continue;
+        }
+
+        let a_i = {
             let mut dist_sum = F::zero();
             for &j in ci_members {
                 if j == i {
@@ -1544,6 +1561,21 @@ pub fn normalized_mutual_info_score(
         }
     }
 
+    // Both labelings a single cluster (zero entropy on both sides) is a perfect
+    // match by convention -> 1.0. sklearn handles this BEFORE the mi==0 check
+    // (`sklearn/metrics/cluster/_supervised.py:1152-1156`).
+    if r == 1 && s == 1 {
+        return Ok(1.0);
+    }
+
+    // The single-cluster special case has been dealt with above, so mi==0 here
+    // cannot be a perfect match: the nmi must be 0.0 whatever the normalization
+    // (e.g. one side is a single label -> entropy 0 -> Geometric/Min normalizer 0).
+    // sklearn `_supervised.py:1163-1167`: `if mi == 0: return 0.0`.
+    if mi == 0.0 {
+        return Ok(0.0);
+    }
+
     let h_true = entropy_from_counts(&a, n_f);
     let h_pred = entropy_from_counts(&b, n_f);
 
@@ -1553,11 +1585,6 @@ pub fn normalized_mutual_info_score(
         NmiMethod::Min => h_true.min(h_pred),
         NmiMethod::Max => h_true.max(h_pred),
     };
-
-    if normalizer.abs() < f64::EPSILON {
-        // Both entropies are zero => single cluster in each => perfect by convention.
-        return Ok(1.0);
-    }
 
     Ok(mi / normalizer)
 }
