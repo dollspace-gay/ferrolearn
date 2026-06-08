@@ -63,7 +63,7 @@
 //! ```
 
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::OneHotEncoder;
+use ferrolearn_preprocess::{OneHotEncoder, OneHotHandleUnknown};
 use ndarray::{Array2, array};
 
 // ---------------------------------------------------------------------------
@@ -281,6 +281,255 @@ fn zero_row_fit_errors_vs_sklearn_oracle() {
     assert!(
         enc.fit(&x_empty, &()).is_err(),
         "0-row fit must error, matching sklearn's minimum-1-sample requirement"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-4 — handle_unknown {'error','ignore'} == sklearn EXACTLY.
+//   (`sklearn/preprocessing/_encoders.py` __init__ handle_unknown='error'
+//    default `:750`; _transform ignore -> all-zero block `:206-240`.)
+//
+// All expected values below are LIVE sklearn 1.5.2 calls (sparse_output=False),
+// quoted inline (R-CHAR-3) — NEVER copied from ferrolearn:
+//
+//   # ignore, multi-feature all-zero block:
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(e.transform([[100.,0.],[5.,99.]]).tolist())"
+//     -> [[0.0,0.0,0.0,1.0,0.0],[0.0,1.0,0.0,0.0,0.0]]
+//
+//   # ignore, fully-unknown row -> all zeros:
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(e.transform([[100.,99.]]).tolist())"
+//     -> [[0.0,0.0,0.0,0.0,0.0]]
+//
+//   # ignore, all-known row -> normal one-hot:
+//   python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(e.transform([[9.,1.]]).tolist())"
+//     -> [[0.0,0.0,1.0,0.0,1.0]]
+//
+//   # ignore, +inf still rejected (invalid input, not 'unknown category'):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+//     OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]).transform([[np.inf,0.]])"
+//     -> ValueError: Input contains infinity or a value too large for dtype('float64').
+//
+//   # ignore, NaN with NO nan category -> all-zero block (NaN is 'unknown'):
+//   python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+//     print(e.transform([[np.nan,0.]]).tolist())"
+//     -> [[0.0,0.0,0.0,1.0,0.0]]
+//
+//   # ignore, NaN WITH a learned nan category -> one-hots it:
+//   python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+//     e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[np.nan,1.],[9.,0.]]); \
+//     print([c.tolist() for c in e.categories_]); print(e.transform([[np.nan,0.]]).tolist())"
+//     -> [[2.0, 9.0, nan], [0.0, 1.0]]
+//        [[0.0,0.0,1.0,1.0,0.0]]
+// ---------------------------------------------------------------------------
+
+/// `handle_unknown='ignore'`, multi-feature: an unknown value in one feature
+/// yields an ALL-ZERO block for THAT feature, while a known value in the other
+/// feature still one-hots. Live sklearn:
+///   transform([[100,0],[5,99]]) -> [[0,0,0,1,0],[0,1,0,0,0]].
+/// Row 0: col0 unknown 100 -> [0,0,0]; col1 known 0 -> [1,0].
+/// Row 1: col0 known 5 -> [0,1,0]; col1 unknown 99 -> [0,0].
+#[test]
+fn ignore_multifeature_all_zero_block_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, sparse_output=False, handle_unknown='ignore'):
+    let sklearn_expected: Array2<f64> = array![
+        [0.0, 0.0, 0.0, 1.0, 0.0], // 100 unknown -> [0,0,0]; 0 known -> [1,0]
+        [0.0, 1.0, 0.0, 0.0, 0.0], // 5 known -> [0,1,0]; 99 unknown -> [0,0]
+    ];
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let out = fitted
+        .transform(&array![[100.0_f64, 0.0], [5.0, 99.0]])
+        .unwrap();
+    assert_eq!(out.shape(), &[2, 5], "shape vs sklearn oracle");
+    assert_eq!(
+        out, sklearn_expected,
+        "handle_unknown='ignore' all-zero-block multi-feature vs sklearn oracle"
+    );
+}
+
+/// `handle_unknown='ignore'`, a row where EVERY feature is unknown -> all zeros.
+/// Live sklearn: transform([[100,99]]) -> [[0,0,0,0,0]].
+#[test]
+fn ignore_fully_unknown_row_all_zero_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2): [[0.0,0.0,0.0,0.0,0.0]]
+    let sklearn_expected: Array2<f64> = array![[0.0, 0.0, 0.0, 0.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let out = fitted.transform(&array![[100.0_f64, 99.0]]).unwrap();
+    assert_eq!(
+        out, sklearn_expected,
+        "handle_unknown='ignore' fully-unknown row -> all zeros vs sklearn oracle"
+    );
+}
+
+/// `handle_unknown='ignore'` does NOT change a fully-KNOWN row: normal one-hot.
+/// Live sklearn: transform([[9,1]]) -> [[0,0,1,0,1]].
+#[test]
+fn ignore_known_row_normal_one_hot_matches_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2): [[0.0,0.0,1.0,0.0,1.0]]
+    let sklearn_expected: Array2<f64> = array![[0.0, 0.0, 1.0, 0.0, 1.0]];
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let out = fitted.transform(&array![[9.0_f64, 1.0]]).unwrap();
+    assert_eq!(
+        out, sklearn_expected,
+        "handle_unknown='ignore' known row -> normal one-hot (Ignore doesn't change known values)"
+    );
+}
+
+/// The DEFAULT (`handle_unknown='error'`, REQ-2 preserved) still rejects an
+/// unknown category with a `ValueError`-mirroring error. Live sklearn:
+/// fit([[2,0],[5,1],[9,0]]) then transform([[100,0]]) -> ValueError
+/// "Found unknown categories ...".
+#[test]
+fn error_default_unknown_rejected_vs_sklearn_oracle() {
+    // Default ctor == handle_unknown='error'; unknown -> Err (REQ-2 preserved).
+    let enc = OneHotEncoder::<f64>::new();
+    assert_eq!(
+        enc.handle_unknown(),
+        OneHotHandleUnknown::Error,
+        "new() defaults to Error (sklearn handle_unknown='error')"
+    );
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let err = fitted.transform(&array![[100.0_f64, 0.0]]);
+    assert!(
+        err.is_err(),
+        "default Error mode must reject the unknown 100.0 (sklearn ValueError)"
+    );
+    let msg = format!("{:?}", err.unwrap_err());
+    assert!(
+        msg.contains("Found unknown categories") && msg.contains("during transform"),
+        "error message should mirror sklearn's 'Found unknown categories ... during transform', got: {msg}"
+    );
+    // Error mode + a fully-known transform -> normal one-hot (unchanged path).
+    let ok = fitted.transform(&array![[9.0_f64, 1.0]]).unwrap();
+    assert_eq!(
+        ok,
+        array![[0.0_f64, 0.0, 1.0, 0.0, 1.0]],
+        "error-mode known transform == sklearn normal one-hot"
+    );
+}
+
+/// `with_handle_unknown(Ignore)` + a value that IS known -> normal one-hot
+/// (Ignore does not change KNOWN values). Live sklearn (ignore mode, known row):
+/// transform([[9,1]]) -> [[0,0,1,0,1]].
+#[test]
+fn ignore_known_value_unchanged_vs_sklearn_oracle() {
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    assert_eq!(
+        enc.handle_unknown(),
+        OneHotHandleUnknown::Ignore,
+        "with_handle_unknown(Ignore) sets the mode"
+    );
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    // The fitted encoder also reports the threaded mode.
+    assert_eq!(fitted.handle_unknown(), OneHotHandleUnknown::Ignore);
+    let out = fitted.transform(&array![[9.0_f64, 1.0]]).unwrap();
+    assert_eq!(
+        out,
+        array![[0.0_f64, 0.0, 1.0, 0.0, 1.0]],
+        "Ignore mode on a KNOWN value == sklearn normal one-hot"
+    );
+}
+
+/// `handle_unknown='ignore'` does NOT relax the +/-inf rejection (#2225): an
+/// infinite value is INVALID INPUT (not an "unknown category"), so it still
+/// errors even in Ignore mode. Live sklearn (ignore mode):
+/// transform([[inf,0]]) -> ValueError "Input contains infinity ...".
+#[test]
+fn ignore_inf_still_rejected_vs_sklearn_oracle() {
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let err = fitted.transform(&array![[f64::INFINITY, 0.0]]);
+    assert!(
+        err.is_err(),
+        "+inf is invalid input (not an unknown category) and must error even in Ignore mode, \
+         matching sklearn's check_array 'Input contains infinity ...'"
+    );
+}
+
+/// `handle_unknown='ignore'`, a `NaN` value when there is NO learned NaN
+/// category -> the NaN is "unknown" -> all-zero block (NOT an error). Live
+/// sklearn: fit([[2,0],[5,1],[9,0]]) then transform([[nan,0]]) ->
+/// [[0,0,0,1,0]] (col0 nan-unknown -> [0,0,0]; col1 known 0 -> [1,0]).
+#[test]
+fn ignore_nan_no_category_all_zero_vs_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2): [[0.0,0.0,0.0,1.0,0.0]]
+    let sklearn_expected: Array2<f64> = array![[0.0, 0.0, 0.0, 1.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    let out = fitted.transform(&array![[f64::NAN, 0.0]]).unwrap();
+    assert_eq!(
+        out, sklearn_expected,
+        "Ignore + NaN with no nan-category -> all-zero block vs sklearn oracle"
+    );
+}
+
+/// `handle_unknown='ignore'`, a `NaN` value WHEN a NaN category WAS learned ->
+/// the NaN one-hots its (sorted-last) category, exactly as a known value would.
+/// Live sklearn: fit([[2,0],[nan,1],[9,0]]) -> categories_ [[2,9,nan],[0,1]];
+/// transform([[nan,0]]) -> [[0,0,1,1,0]] (col0 nan at block idx 2; col1 known 0).
+#[test]
+fn ignore_nan_with_category_one_hots_vs_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2):
+    //   categories_ == [[2.0, 9.0, nan], [0.0, 1.0]]
+    //   transform([[nan,0]]) == [[0.0,0.0,1.0,1.0,0.0]]
+    let sklearn_expected: Array2<f64> = array![[0.0, 0.0, 1.0, 1.0, 0.0]];
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [f64::NAN, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+    // The NaN sorts LAST in col0's categories_ (#2223): {2, 9, NaN}.
+    let cats0 = &fitted.categories()[0];
+    assert_eq!(cats0.len(), 3, "col0 has 3 categories incl. NaN");
+    assert_eq!(cats0[0], 2.0);
+    assert_eq!(cats0[1], 9.0);
+    assert!(cats0[2].is_nan(), "NaN category sorts last");
+    let out = fitted.transform(&array![[f64::NAN, 0.0]]).unwrap();
+    assert_eq!(
+        out, sklearn_expected,
+        "Ignore + NaN WITH a learned nan-category -> one-hots it vs sklearn oracle"
+    );
+}
+
+/// `handle_unknown` ABI: default is `Error`, `with_handle_unknown` sets the mode,
+/// `handle_unknown()` reads it back on both the unfitted and fitted encoder; the
+/// enum default matches sklearn's `handle_unknown='error'` default (`:750`).
+#[test]
+fn handle_unknown_default_and_builder_abi() {
+    // sklearn default handle_unknown='error' (_encoders.py:750) -> Error default.
+    assert_eq!(OneHotHandleUnknown::default(), OneHotHandleUnknown::Error);
+    let default_enc = OneHotEncoder::<f64>::new();
+    assert_eq!(default_enc.handle_unknown(), OneHotHandleUnknown::Error);
+    // Default::default() agrees with new().
+    let derived: OneHotEncoder<f64> = OneHotEncoder::default();
+    assert_eq!(derived.handle_unknown(), OneHotHandleUnknown::Error);
+
+    let ignore_enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    assert_eq!(ignore_enc.handle_unknown(), OneHotHandleUnknown::Ignore);
+
+    // The mode threads through fit to the FittedOneHotEncoder.
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    assert_eq!(
+        ignore_enc.fit(&x, &()).unwrap().handle_unknown(),
+        OneHotHandleUnknown::Ignore
+    );
+    assert_eq!(
+        default_enc.fit(&x, &()).unwrap().handle_unknown(),
+        OneHotHandleUnknown::Error
     );
 }
 
@@ -561,5 +810,85 @@ fn inverse_transform_nan_input_errors_vs_sklearn_oracle() {
         "inverse_transform of an inf-containing matrix must error, matching sklearn's \
          check_array `ValueError: Input contains infinity ...` (_encoders.py:1092); \
          ferrolearn silently returns Ok"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-6 DIVERGENCE — inverse_transform of an IGNORE-mode all-zero block must
+// NOT error; sklearn returns None for that feature (the OTHER features still
+// invert). ferrolearn's inverse_transform ignores `handle_unknown` and ALWAYS
+// errors on an all-zero block. tracking #2227
+// ---------------------------------------------------------------------------
+
+/// Divergence: ferrolearn's `FittedOneHotEncoder::inverse_transform`
+/// (`ferrolearn-preprocess/src/one_hot_encoder.rs:316-323`) diverges from
+/// `sklearn/preprocessing/_encoders.py:1141-1158,1178-1183` for an encoder
+/// fitted with `handle_unknown='ignore'` when a per-feature block is all-zero.
+///
+/// sklearn's `inverse_transform` consults `self.handle_unknown`: when it is
+/// `'ignore'` (`_encoders.py:1141`), an all-zero block (`sub.sum(axis=1) == 0`,
+/// `:1145`) is collected into `found_unknown[i]` (`:1154`) and, at `:1178-1183`,
+/// the result is upcast to object and the cell set to `None` — it is NOT an
+/// error. Only when `handle_unknown != 'ignore'` (the `else` at `:1159`) does an
+/// all-zero block raise the "can not be inverted ... all zeros" `ValueError`
+/// (`:1164-1168`). The error path is GATED on the mode; the all-zero block in
+/// the OTHER (known) features still inverts normally.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.preprocessing import OneHotEncoder; \
+///   e=OneHotEncoder(sparse_output=False, handle_unknown='ignore').fit([[2.,0.],[5.,1.],[9.,0.]]); \
+///   print(e.inverse_transform([[0.0,0.0,0.0,1.0,0.0]]).tolist())"
+///   -> [[None, 0.0]]
+/// ```
+/// col0's block `[0,0,0]` is all-zero → sklearn returns `None` (not an error);
+/// col1's block `[1,0]` argmaxes to category `0.0`. The recovered row is
+/// `[None, 0.0]`.
+///
+/// ferrolearn's `inverse_transform` performs the all-zero check
+/// (`block_sum == F::zero()` at `:316`) UNCONDITIONALLY — it never consults
+/// `self.handle_unknown` — so for THIS ignore-mode encoder it returns
+/// `Err(InvalidParameter "... can not be inverted ... all zeros")` instead of
+/// recovering col1 and denoting col0 as unknown. sklearn returns `Ok`;
+/// ferrolearn returns `Err`.
+///
+/// This is a release-blocker observable divergence: sklearn's documented
+/// `handle_unknown='ignore'` contract is "In the inverse transform, an unknown
+/// category will be denoted as None" (`_encoders.py:546-549`). ferrolearn errors
+/// where sklearn succeeds. Even granting that `Array2<F>` cannot hold a Python
+/// `None`, the KNOWN feature (col1 → `0.0`) is independently invertible and the
+/// call must not error in `ignore` mode. This test asserts (a) the call does NOT
+/// error and (b) col1 recovers `0.0` — both fail today (the call returns `Err`).
+#[test]
+#[ignore = "divergence: inverse_transform errors on ignore-mode all-zero block; sklearn returns None for that feature; tracking #2227"]
+fn inverse_transform_ignore_all_zero_block_returns_none_not_err_vs_sklearn_oracle() {
+    // Live oracle (sklearn 1.5.2, handle_unknown='ignore', run from /tmp):
+    //   inverse_transform([[0.0,0.0,0.0,1.0,0.0]]) -> [[None, 0.0]]
+    // (col0 all-zero block -> None/unknown; col1 known one-hot -> 0.0)
+    let enc = OneHotEncoder::<f64>::new().with_handle_unknown(OneHotHandleUnknown::Ignore);
+    let x_train = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0]];
+    let fitted = enc.fit(&x_train, &()).unwrap();
+
+    // Row: col0 block [0,0,0] all-zero (unknown), col1 block [1,0] -> category 0.0.
+    let encoded = array![[0.0_f64, 0.0, 0.0, 1.0, 0.0]];
+    let recovered = fitted.inverse_transform(&encoded);
+
+    // sklearn does NOT error in ignore mode: the all-zero block becomes None and
+    // every OTHER feature still inverts. ferrolearn unconditionally errors.
+    assert!(
+        recovered.is_ok(),
+        "ignore-mode inverse_transform of an all-zero block must NOT error \
+         (sklearn `_encoders.py:1141` denotes it None, not a ValueError); \
+         ferrolearn errors unconditionally regardless of handle_unknown"
+    );
+
+    // The KNOWN feature (col1) must still recover its category 0.0 (sklearn's
+    // [[None, 0.0]] — col1 is independently invertible).
+    let out = recovered.unwrap();
+    assert_eq!(
+        out[[0, 1]],
+        0.0,
+        "ignore-mode inverse_transform must still recover the KNOWN col1 \
+         category 0.0 (sklearn returns [[None, 0.0]])"
     );
 }
