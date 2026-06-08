@@ -151,6 +151,56 @@ impl<F: Float + Send + Sync + 'static> FittedSimpleImputer<F> {
 // Helper: compute median of a non-empty Vec (may contain NaN — caller filters)
 // ---------------------------------------------------------------------------
 
+/// Sum a slice using numpy's pairwise-summation algorithm, in `F` precision.
+///
+/// scikit-learn's `Mean` strategy computes the per-column mean via
+/// `np.ma.mean(masked_X, axis=0)` (`sklearn/impute/_base.py:498`), whose
+/// reduction is numpy's pairwise summation over the observed values in the input
+/// dtype.  A naive left-to-right fold diverges from this by many ULPs for an
+/// `f32` column.  This mirrors numpy's `pairwise_sum`
+/// (`numpy/_core/src/umath/loops_utils.h.src`): blocks of `len > 128` split in
+/// half (with the split rounded down to a multiple of 8), and the `<= 128` base
+/// case accumulates into 8 partial sums (unrolled by 8) before combining them as
+/// a balanced tree `((r0+r1)+(r2+r3)) + ((r4+r5)+(r6+r7))`.  For `F = f64`
+/// pairwise and sequential agree to f64 ULPs.
+fn pairwise_sum<F: Float>(values: &[F]) -> F {
+    let n = values.len();
+    if n == 0 {
+        return F::zero();
+    }
+    if n < 8 {
+        // Sequential base case for very short runs (numpy does the same).
+        let mut s = values[0];
+        for &v in &values[1..] {
+            s = s + v;
+        }
+        return s;
+    }
+    if n <= 128 {
+        // Eight partial accumulators, unrolled by 8 (numpy's inner block).
+        let mut r = [F::zero(); 8];
+        r.copy_from_slice(&values[..8]);
+        let mut i = 8;
+        while i + 8 <= n {
+            for j in 0..8 {
+                r[j] = r[j] + values[i + j];
+            }
+            i += 8;
+        }
+        // Balanced-tree combine of the eight partials.
+        let mut res = ((r[0] + r[1]) + (r[2] + r[3])) + ((r[4] + r[5]) + (r[6] + r[7]));
+        // Tail elements (n not a multiple of 8) folded sequentially.
+        for &v in &values[i..] {
+            res = res + v;
+        }
+        return res;
+    }
+    // Recursive split; numpy rounds the half-point down to a multiple of 8.
+    let mut half = n / 2;
+    half -= half % 8;
+    pairwise_sum(&values[..half]) + pairwise_sum(&values[half..])
+}
+
 /// Compute the median of a non-empty slice of finite (non-NaN) values.
 ///
 /// Uses a sort-and-interpolate approach.  Panics if the slice is empty.
@@ -259,8 +309,34 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for SimpleImputer<F> {
 
             fill_values[j] = match &self.strategy {
                 ImputeStrategy::Mean => {
+                    // sklearn computes the mean via `np.ma.mean(masked_X, axis=0)`
+                    // (`sklearn/impute/_base.py:498`). `np.ma.mean` divides
+                    // `MaskedArray.sum` by the count of observed (non-masked)
+                    // elements; `MaskedArray.sum` does `self.filled(0).sum(axis)`
+                    // (`numpy/ma/core.py:5242,5251`), i.e. it sums the FULL-LENGTH
+                    // column with masked (NaN) entries set to 0, using numpy's
+                    // PAIRWISE summation, then divides by the OBSERVED count. The
+                    // fill rounds to `F` only at the transform assignment into the
+                    // output array (`:625-635`).
+                    //
+                    // numpy's pairwise tree shape depends on the FULL array length
+                    // and element POSITIONS, so summing the full column (NaN->0) is
+                    // NOT bit-equal to summing only the compressed observed values
+                    // when NaN is scattered (the zeros sit at different tree
+                    // positions, shifting f32 partial sums by a few ULPs). Build the
+                    // full-length NaN->0 column and pairwise-sum THAT, then divide by
+                    // the observed count, to be bit-identical to `np.ma.mean`.
+                    //
+                    // For F=f64 pairwise and sequential agree to f64 ULPs, and with
+                    // no NaN the full-length and compressed sums are identical (the
+                    // #2308 no-NaN pin and the f64 oracle tests guard no-regression).
+                    let col_filled: Vec<F> = x
+                        .column(j)
+                        .iter()
+                        .map(|v| if v.is_nan() { F::zero() } else { *v })
+                        .collect();
                     let n = F::from(col_vals.len()).unwrap_or_else(F::one);
-                    col_vals.iter().copied().fold(F::zero(), |acc, v| acc + v) / n
+                    pairwise_sum(&col_filled) / n
                 }
                 ImputeStrategy::Median => {
                     let mut vals = col_vals.clone();

@@ -62,7 +62,6 @@ const COL_BITS: [u32; 200] = [2143289344,2143289344,2143289344,2143289344,214328
 /// `strategy='mean'`, transform a trailing NaN row -> fill = `-189490.19f32`
 /// (bits `3359181964`). ferrolearn compresses then pairwise-sums -> `-189490.1f32`
 /// (bits `3359181958`), differing by 6 f32 ULPs.
-#[ignore = "divergence: SimpleImputer<f32> mean compresses observed values before pairwise_sum, sklearn np.ma.mean sums full masked array (filled-0); tracking #2309"]
 #[test]
 fn divergence_f32_mean_nan_scatter_compressed_vs_full_pairwise() {
     // sklearn oracle: exact f32 bit pattern of out[-1,0].
