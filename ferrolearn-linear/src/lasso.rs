@@ -33,6 +33,7 @@
 //! | REQ-12 (dual-gap stopping criterion) | SHIPPED | `Fit::fit for Lasso` now uses sklearn's two-level criterion (`_cd_fast.pyx:167-249`): `tol_scaled = tol·(target·target)` (`:167-168`), per sweep track `w_max`/`d_w_max`, gate on `w_max==0 || d_w_max/w_max < tol || last_iter` (`:207-211`), and inside the gate break only when the UN-normalized gap `lasso_dual_gap(...)·n < tol_scaled` (`:249`). Matches sklearn's `coef_` to ≤1e-7 and `n_iter_` exactly (20 at alpha=0.3 and alpha=0.1). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`, `lasso_dual_gap_stopping_second_alpha`). |
 //! | REQ-13 (MultiTaskLasso) | SHIPPED | Separate estimator: `MultiTaskLasso<F>`/`FittedMultiTaskLasso<F>` in `multi_task_lasso.rs` (`Fit<Array2<F>, Array2<F>> for MultiTaskLasso`). Multi-output L2,1 (group-Lasso) block coordinate descent porting `_cd_fast.pyx::enet_coordinate_descent_multi_task` (`:740-959`) with `l2_reg=0`, `l1_reg=α·n` (`MultiTaskLasso = MultiTaskElasticNet(l1_ratio=1)`, `_coordinate_descent.py:2663`): per-feature block soft-threshold `W[j,:] = tmp·max(1−l1_reg/‖tmp‖₂,0)/norm_cols_X[j]`, rank-1 residual maintenance, two-level relative-change + L21 dual-gap stop (`:903-952`, `tol_scaled = tol·‖Yc‖_F²`); `coef_` stored `(n_tasks, n_features)`, per-task `intercept_`, `n_iter_`. Verified vs live sklearn 1.5.2 (R-CHAR-3): `MultiTaskLasso(alpha=0.3)` on `X=[[1,2],[2,1],[3,4],[4,3],[5,5]]`/`Y=[[3,1],[2.5,2],[7.1,3.5],[6,4.2],[11.2,6]]` → `coef_=[[0.7874471321,1.3745821226],[0.8341004367,0.3460953631]]`, `intercept_=[-0.5260877641,-0.2005873993]`, `n_iter_=19`. Tests `multi_task_lasso_*` in `multi_task_lasso.rs` + the live-oracle integration pins in `tests/divergence_multi_task_lasso.rs` (alpha grid, 3-task, exact-zero group sparsity, predict shape/values). Non-test consumer: `MultiTaskLasso`/`FittedMultiTaskLasso` re-exported at the crate root (`ferrolearn_linear::MultiTaskLasso`, boundary API per S5/R-DEFER-1). Design-doc REQ-13 row in `.design/linear/lasso.md` already SHIPPED. Closes #413. |
 //! | REQ-14 (ferray substrate) | NOT-STARTED | #414 (CD is elementwise; coef storage ndarray, tied to #359). |
+//! | REQ-15 (non-finite input rejected) | SHIPPED | `Fit::fit for Lasso` rejects any NaN/+/-inf in X or y BEFORE coordinate descent with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:980`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — `test_lasso_*` unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lasso().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::lasso_*`). Non-test consumer: the existing `Fit::fit` / `RsLasso` / `LassoCV` consumers. (#2256) |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — converged coef/intercept, sparsity support set, alpha
 //! scaling, alpha=0, fit_intercept=false, f32, and defaults all match the live oracle. Two
@@ -398,7 +399,29 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
+        // sklearn `Lasso(ElasticNet).fit` -> `self._validate_data(X, y, ...)`
+        // (`_coordinate_descent.py:980`); the call keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError` BEFORE coordinate descent runs.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2), matching the crate idiom (`multi_task_lasso.rs`).
+        // (#2256)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
+        let n_f = F::from(n_samples).ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert n_samples to float".into(),
+        })?;
 
         // Center data if fitting intercept.
         let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {

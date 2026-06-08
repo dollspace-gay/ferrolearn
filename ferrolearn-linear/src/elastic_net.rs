@@ -38,6 +38,7 @@
 //! | REQ-11 (precompute/Gram) | SHIPPED | `pub precompute: bool` field (default `false`) on `ElasticNet` + `with_precompute` builder, mirroring sklearn `ElasticNet(precompute=False)` (`_coordinate_descent.py:774`). When `true`, `Fit::fit` runs CD on the precomputed `Q = Xcᵀ Xc` / `q = Xcᵀ yc` with an incrementally-maintained `H = Q·w` (sklearn `_cd_fast.pyx enet_coordinate_descent_gram`); `tmp = (q[j]−H[j])/n + col_norms[j]·w[j] ≡` the direct path's `rho_j + (XⱼᵀXⱼ/n)·w_old` since `Xⱼᵀr = q[j]−(Q·w)[j]`, then `soft_threshold(tmp, α·l1_ratio)/(col_norm + α·(1−l1_ratio))` keeps the L2 term in the denominator, so it reaches the SAME unique optimum (to ~1e-10 fp reassociation) with the SAME coordinate order + dual-gap stopping. `precompute=false` (default) is the byte-identical direct path. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_precompute_matches_sklearn`, `enet_precompute_default_false_unchanged`, `enet_precompute_equals_direct`). |
 //! | REQ-9 (warm_start) | SHIPPED | `ElasticNet<F>` carries `pub warm_start: bool` (default `false`) + `pub coef_init: Option<Array1<F>>` (default `None`) with `with_warm_start`/`with_coef_init` builders, mirroring sklearn `ElasticNet(warm_start=False)` (`_coordinate_descent.py:795`). R-DEV-4 adaptation: ferrolearn estimators are immutable value types — there is no mutable `self.coef_` carried across repeated `.fit()` calls like sklearn's mutable estimator (`_coordinate_descent.py:1062-1063` reuses `self.coef_` when `warm_start`), so the prior coefficient vector is supplied EXPLICITLY via `coef_init` (sklearn's path solver seeds the same way: `_coordinate_descent.py:648-651`, `coef_ = np.zeros(...)` when `coef_init is None` else `np.asfortranarray(coef_init, ...)`). In `Fit::fit`, when `warm_start && coef_init.is_some()` the init vector is length-validated (`ShapeMismatch` on mismatch) and `w` is cloned from it (the direct path also seeds `residual = y_work − X_work·w`; the Gram path's `H = Q·w` already derives from the actual `w`); otherwise `w = zeros` — BYTE-IDENTICAL to the cold path. The numerics are identical, only the CD start point changes, so warm-from-converged reaches the same unique optimum in fewer sweeps. Verification (live sklearn 1.5.2 oracle, R-CHAR-3): cold `ElasticNet(alpha=0.5, l1_ratio=0.5)` → coef `[0.7643620892, 1.2564536255]`, `n_iter_=14`; warm (refit from converged coef) → coef `[0.7642996441, 1.2564980309]`, `n_iter_=1`. Tests `enet_warm_start_from_converged_matches_sklearn`, `enet_warm_start_default_unchanged`, `enet_warm_start_none_coef_init_equals_cold`, `enet_warm_start_coef_init_wrong_len_errors`. |
 //! | REQ-14..15 NOT-STARTED | MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-16 (non-finite input rejected) | SHIPPED | `Fit::fit for ElasticNet` rejects any NaN/+/-inf in X or y BEFORE coordinate descent with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:980`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `ElasticNet().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::enet_*`). Non-test consumer: the existing `Fit::fit` / `RsElasticNet` / `ElasticNetCV` consumers. (#2256) |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -460,7 +461,29 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             });
         }
 
-        let n_f = F::from(n_samples).unwrap();
+        // sklearn `ElasticNet.fit` -> `self._validate_data(X, y, ...)`
+        // (`_coordinate_descent.py:980`); the call keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR y with a `ValueError` BEFORE coordinate descent runs.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf (bounds-safe,
+        // no panic, R-CODE-2), matching the crate idiom (`multi_task_lasso.rs`).
+        // (#2256)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
+        let n_f = F::from(n_samples).ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert n_samples to float".into(),
+        })?;
 
         // Center data when fitting intercept.
         let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {

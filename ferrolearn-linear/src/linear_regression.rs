@@ -28,6 +28,7 @@
 //! | REQ-8 (sample_weight in fit) | SHIPPED | `LinearRegression::fit_with_sample_weight` solves WEIGHTED least squares `min Σᵢ wᵢ(yᵢ−xᵢ·w)²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` (mirrors `_average(...,weights=sample_weight)`, `_base.py:193`/`:198`), centering, then `√wᵢ` row-rescaling (`_rescale_data`, `_base.py:641`), `linalg::solve_lstsq` on the rescaled design, `intercept = y_off − x_off·coef` (`_set_intercept`, `_base.py:320`); `fit_intercept=false` skips centering, intercept 0. `Fit::fit` delegates `fit_with_sample_weight(x, y, None)` (None path byte-identical to the historic OLS body). Oracle tests `linreg_fit_sample_weight_with_intercept_matches_sklearn` (coef 2.0935828877, intercept −0.2326203209), `linreg_fit_sample_weight_no_intercept_matches_sklearn` (coef 2.0350877193, intercept 0), `linreg_fit_none_sample_weight_equals_unweighted`. Mirrors `fit(..., sample_weight=None)` (`_base.py:582`). Closes #373. |
 //! | REQ-9 (rank_/singular_/copy_X/n_jobs) | SHIPPED | `FittedLinearRegression` stores `rank_`/`singular_` (captured from `linalg::solve_lstsq` on the matrix actually solved — centered `X` when `fit_intercept`, raw `X` otherwise, matching sklearn `_base.py:687`), exposed via `rank()`/`singular_values()`; `LinearRegression` adds `copy_x` (default `true`) + `n_jobs` (default `None`) fields with `with_copy_x`/`with_n_jobs` builders, mirroring `_parameter_constraints` (`_base.py:561`) and the ctor (`_base.py:572-573`). `copy_x` is ABI-only (fit never mutates `x`); `n_jobs` stored-but-ignored (single-threaded). Oracle tests `linreg_rank_singular_match_sklearn_with_intercept` (rank 2, singular `[1.61803399, 0.61803399]` on centered X), `linreg_singular_no_intercept_matches_raw_x` (singular `[5.25371017, 0.63129192]` on raw X), `linreg_copy_x_default_and_builder`. Closes #374. |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | blocker #375 — OLS solve now on `ferray::linalg::lstsq`, but `LinearRegression`'s coef storage is still `ndarray` (coef return type tied to #359); fully on-substrate when the boundary `ndarray` types migrate. |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | `fit_with_sample_weight` (the shared entry `Fit::fit` delegates to) rejects any NaN/+/-inf in X or y BEFORE centering/solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_base.py:609`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `LinearRegression().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::linreg_*`). Non-test consumer: the existing `Fit::fit` / `RsLinearRegression` consumers. (#2256) |
 //!
 //! Two states only per goal.md R-DEFER-2. The OLS min-norm contract (#376/#377)
 //! is fixed in `linalg.rs` via the ferray substrate.
@@ -188,6 +189,40 @@ impl<
                 expected: vec![n_samples],
                 actual: vec![w.len()],
                 context: "sample_weight length must match number of samples in X".into(),
+            });
+        }
+
+        // sklearn `LinearRegression.fit` -> `self._validate_data(X, y, ...)`
+        // (`_base.py:609`); the call keeps the default `force_all_finite=True`,
+        // so `check_array` rejects any NaN or +/-inf in X OR y with a
+        // `ValueError` BEFORE the solve. `.iter().any(|v| !v.is_finite())`
+        // rejects both NaN and Inf (bounds-safe, no panic, R-CODE-2), matching
+        // the crate idiom (`multi_task_lasso.rs`). (#2256)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+
+        // sklearn validates `sample_weight` via `_check_sample_weight` ->
+        // `check_array(..., input_name="sample_weight")`
+        // (`sklearn/utils/validation.py:2043-2050`), keeping the default
+        // `force_all_finite=True`, so any NaN or +/-inf weight raises a
+        // `ValueError` BEFORE the weighted centering / √w rescaling. Mirror it
+        // with the same NaN+Inf-rejecting idiom as X/y above (#2258).
+        if let Some(w) = sample_weight
+            && w.iter().any(|v| !v.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "Input sample_weight contains NaN or infinity.".into(),
             });
         }
 
@@ -535,6 +570,27 @@ impl<
                 required: 1,
                 actual: 0,
                 context: "LinearRegression requires at least one sample".into(),
+            });
+        }
+
+        // sklearn `LinearRegression.fit` -> `self._validate_data(X, y, ...,
+        // multi_output=True, ...)` (`_base.py:609`) keeps the default
+        // `force_all_finite=True`, so `check_array` rejects any NaN or +/-inf in
+        // X OR the 2-D Y with a `ValueError` BEFORE the solve — regardless of
+        // output dimensionality. This separate multi-output arm does NOT route
+        // through `fit_with_sample_weight`, so it needs the SAME finite-check.
+        // `.iter().any(|v| !v.is_finite())` (Array2's element iterator) rejects
+        // both NaN and Inf (bounds-safe, no panic, R-CODE-2). (#2257)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

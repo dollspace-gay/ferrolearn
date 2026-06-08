@@ -71,7 +71,6 @@ fn finite_y2() -> Array2<f64> {
 /// `fit_with_sample_weight`, which this arm does not call.
 /// Tracking: #2257
 #[test]
-#[ignore = "divergence: multi-output Fit<Array2,Array2> arm skips non-finite check (X NaN); tracking #2257"]
 fn linreg_multioutput_rejects_nan_in_x_like_sklearn() {
     let mut x = finite_x();
     x[[0, 0]] = f64::NAN;
@@ -90,7 +89,6 @@ fn linreg_multioutput_rejects_nan_in_x_like_sklearn() {
 /// `ValueError: Input y contains NaN.`; ferrolearn returns `Ok(..)`.
 /// Tracking: #2257
 #[test]
-#[ignore = "divergence: multi-output Fit<Array2,Array2> arm skips non-finite check (Y NaN); tracking #2257"]
 fn linreg_multioutput_rejects_nan_in_y2_like_sklearn() {
     let x = finite_x();
     let mut y2 = finite_y2();
@@ -108,7 +106,6 @@ fn linreg_multioutput_rejects_nan_in_y2_like_sklearn() {
 /// `ValueError: Input y contains infinity ...`; ferrolearn returns `Ok(..)`.
 /// Tracking: #2257
 #[test]
-#[ignore = "divergence: multi-output Fit<Array2,Array2> arm skips non-finite check (Y +inf); tracking #2257"]
 fn linreg_multioutput_rejects_inf_in_y2_like_sklearn() {
     let x = finite_x();
     let mut y2 = finite_y2();
@@ -134,7 +131,6 @@ fn linreg_multioutput_rejects_inf_in_y2_like_sklearn() {
 /// `Ok(..)` — the #2256 guard checks X and y only, never `sample_weight`.
 /// Tracking: #2258
 #[test]
-#[ignore = "divergence: sample_weight non-finite (NaN) not validated; tracking #2258"]
 fn linreg_rejects_nan_sample_weight_like_sklearn() {
     let x = finite_x();
     let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0];
@@ -152,7 +148,6 @@ fn linreg_rejects_nan_sample_weight_like_sklearn() {
 /// `Ok(..)`.
 /// Tracking: #2258
 #[test]
-#[ignore = "divergence: sample_weight non-finite (inf) not validated; tracking #2258"]
 fn linreg_rejects_inf_sample_weight_like_sklearn() {
     let x = finite_x();
     let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0];
