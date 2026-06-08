@@ -20,7 +20,8 @@
 //! | REQ-3 (fit_transform/transform/predict_proba/decision_function/score) | SHIPPED | `Pipeline::fit_transform` (`Fit::fit` then `transform_through`) mirrors `Pipeline.fit_transform` (`pipeline.py:489`); `FittedPipeline::{transform, predict_proba, decision_function, score}` run the private `transform_through` loop (`pipeline.py:599-600`/`:719-720`/`:768-769`/`:999-1000`) then delegate to the final estimator. `predict_proba`/`decision_function`/`score` forward to the new default-`Err` trait methods `predict_proba_pipeline`/`decision_function_pipeline`/`score_pipeline` on `FittedPipelineEstimator` (the `available_if(_final_estimator_has(...))` analog, `pipeline.py:674`/`:731`/`:960`); `transform` returns the transformer-prefix output (sklearn raises `AttributeError` for a non-transformer-final `transform`, `:858`). Non-test consumer: `impl FittedPipelineEstimator for FittedGaussianNBPipeline in gaussian.rs` overrides `predict_proba_pipeline` (→ `predict_proba`) + `score_pipeline` (→ `score`). Live-oracle verification: `gaussian_pipeline_predict_proba_score_match_sklearn` (StandardScaler+GaussianNB pipeline matches sklearn `predict_proba`/`score`/`transform`) + core `test_pipeline_fit_transform_equals_transform`/`test_pipeline_predict_proba_and_score_override`/`test_pipeline_predict_proba_default_is_err`. |
 //! | REQ-4a (named_steps / `__getitem__` int+str+slice) | SHIPPED | `Pipeline::{named_steps, get_step, get_step_by_name, named_step, into_slice}` + `FittedPipeline::{named_steps, get_step, get_step_by_name, named_step}` over the existing `transforms`/`estimator` storage; mirror `Pipeline.named_steps` (`pipeline.py:325` `return Bunch(**dict(self.steps))`), integer/string/slice `Pipeline.__getitem__` (`pipeline.py:298-318`). A step is returned as a `PipelineStepRef`/`FittedPipelineStepRef` enum (the heterogeneous-`(name, obj)`-list analog, since a ferrolearn step is EITHER a `PipelineTransformer` OR a `PipelineEstimator`). `into_slice` consumes `self` (the trait-object steps are not `Clone`, so the new sub-pipeline MOVES the contiguous range, vs sklearn's shallow object-sharing copy `:310`). Non-test consumer: pub API on the grandfathered `Pipeline`/`FittedPipeline` boundary types (S5). Live-oracle verification (R-CHAR-3, sklearn 1.5.2): `test_pipeline_named_steps_match_sklearn`, `test_pipeline_get_step_*`, `test_pipeline_into_slice_*`. |
 //! | REQ-4b (get_params / set_params `<step>__<param>` nested protocol) | NOT-STARTED | blocker #362. The `PipelineTransformer`/`PipelineEstimator` trait objects expose NO `get_params`/reflection method, so the `_BaseComposition._get_params`/`_set_params` nested addressing (`pipeline.py:216`/`:237`) is not implementable without first adding a per-step reflection trait (e.g. `fn get_params(&self) -> BTreeMap<String, ParamValue>` on the step traits). Concrete blocker: a `get_params`/reflection method on the step traits. |
-//! | REQ-5 (passthrough steps + memory caching) | NOT-STARTED | blocker #363. |
+//! | REQ-5a (passthrough steps) | SHIPPED | `PassthroughTransformer`/`FittedPassthroughTransformer in pipeline.rs` are a reusable identity transformer (`impl PipelineTransformer` `fit_pipeline` → `Box::new(FittedPassthroughTransformer)`; `transform_pipeline(&self, x) → Ok(x.clone())`), the Rust analog of sklearn's `'passthrough'`/`None` step (`sklearn/pipeline.py:251`/`:266` `_validate_steps` allows it, `:275-290` `_iter(filter_passthrough=True)` skips it so `Xt` passes through, `:337` it stays visible in `named_steps`). ferrolearn types the transformer/estimator split, so the no-op IS a concrete identity transformer placed in the chain — no `filter_passthrough` loop branch needed (the step is genuinely identity). Non-test production consumer: the pub `Pipeline::passthrough_step` builder (the `('name','passthrough')` analog, delegating to `transform_step` with a `PassthroughTransformer`), plus the pub API on the `pub mod pipeline` surface (S5 — same boundary as `Pipeline`/`FeatureUnion`, not crate-root re-exported). Live-oracle (R-CHAR-3, sklearn 1.5.2): `Pipeline([('p','passthrough')]).fit(X).transform(X) == X`; passthrough before/after a transformer == the transformer alone; the step appears in `named_steps`/`steps`. Pinned by `test_passthrough_step_is_identity`, `test_passthrough_before_transformer_is_noop`, `test_passthrough_after_transformer_is_noop`, `test_passthrough_step_appears_in_step_names`, `test_passthrough_transformer_standalone_identity`, `test_passthrough_transformer_f32`. |
+//! | REQ-5b (memory caching) | NOT-STARTED | blocker #363. No `memory=`/`check_memory`/`fit_transform_one_cached` transformer caching (`sklearn/pipeline.py:388-390`); requires a joblib disk-cache substrate with no ferrolearn analog yet. |
 //! | REQ-6 (fit_params / metadata routing) | NOT-STARTED | blocker #364. |
 //! | REQ-7 (make_pipeline auto-naming helper) | NOT-STARTED | blocker #365 (`pipeline.py:1220`). |
 //! | REQ-8 (FeatureUnion) | SHIPPED | `FeatureUnion`/`FittedFeatureUnion` in `pipeline.rs`: `impl Fit<Array2<F>, ()> for FeatureUnion` fits each named sub-transformer on the SAME `x` (mirrors `FeatureUnion.fit` fitting every transformer on `X`, `pipeline.py:1643`/`:1681`) recording each output width; the fit also validates transformer-name uniqueness up front (mirrors `_validate_transformers` → `_validate_names`, `pipeline.py:1523-1525` → `sklearn/utils/metaestimators.py:81-83`): a duplicate name returns `FerroError::InvalidParameter` (sklearn's `ValueError: Names provided are not unique` analog) instead of fitting; `impl Transform<Array2<F>> for FittedFeatureUnion` transforms `x` through each and horizontally concatenates the column blocks left-to-right in list order (mirrors `FeatureUnion.transform` → `_hstack`, `pipeline.py:1770`/`:1812` `np.hstack(Xs)`); `FittedFeatureUnion::get_feature_names_out` prefixes each block's positional `x{j}` with `{name}__` (the `verbose_feature_names_out=True` default, `pipeline.py:1567`/`:1608-1616`). Non-test consumer: the pub API on the `pub mod pipeline` surface (S5 — the same boundary the grandfathered `Pipeline`/`FittedPipeline` types live on; neither is crate-root re-exported). Live-oracle (sklearn 1.5.2): `FeatureUnion([('ss',StandardScaler()),('mm',MinMaxScaler())])` on `[[1,2],[3,4],[5,6]]` → `(3,4)` with column blocks `[ss|mm]` and names `['ss__x0','ss__x1','mm__x0','mm__x1']`. NOT-STARTED (no ferrolearn analog yet): `transformer_weights` per-output scaling (`pipeline.py:1369`), the `'drop'`/`'passthrough'` sentinels (`:1530`/`:1563`), `n_jobs` parallelism (`:1360`), metadata routing (`:1859`), `verbose_feature_names_out=False` non-prefixed mode (`:1618-1641`), and the ferray substrate (typed on `ndarray::{Array1,Array2}`). |
@@ -315,6 +316,23 @@ impl<F: Float + Send + Sync + 'static> Pipeline<F> {
             step,
         });
         self
+    }
+
+    /// Add a named `'passthrough'` (identity no-op) transformer step.
+    ///
+    /// This is the ergonomic analog of an sklearn `('name', 'passthrough')` step:
+    /// a transformer that leaves the running data unchanged but is still a real,
+    /// named step (visible in [`step_names`](Pipeline::step_names) /
+    /// [`named_steps`](Pipeline::named_steps)). It delegates to
+    /// [`transform_step`](Pipeline::transform_step) with a
+    /// [`PassthroughTransformer`], so a passthrough step placed anywhere in the
+    /// chain is a genuine no-op — fitting skips it and transforming passes `Xt`
+    /// through unchanged, mirroring sklearn's `_iter(filter_passthrough=True)`
+    /// dropping `'passthrough'` (`sklearn/pipeline.py:289`) while
+    /// `named_steps`/`__getitem__` still show it (`:337`).
+    #[must_use]
+    pub fn passthrough_step(self, name: &str) -> Self {
+        self.transform_step(name, Box::new(PassthroughTransformer::<F>::new()))
     }
 
     /// Set the final estimator step.
@@ -947,6 +965,136 @@ pub fn as_estimator_step<F: Float + Send + Sync + 'static>(
     e: impl PipelineEstimator<F> + 'static,
 ) -> Box<dyn PipelineStep<F>> {
     Box::new(EstimatorStepWrapper(Box::new(e)))
+}
+
+// ---------------------------------------------------------------------------
+// PassthroughTransformer: the `'passthrough'` step analog (identity no-op)
+// ---------------------------------------------------------------------------
+
+/// A no-op transformer step: fit does nothing and transform returns its input
+/// unchanged.
+///
+/// This is the ferrolearn analog of scikit-learn's `'passthrough'` (and `None`)
+/// pipeline step. In sklearn, a `Pipeline` step whose object is the string
+/// `'passthrough'` (or `None`) is a transformer that is *skipped* during
+/// fit/transform — `_iter(filter_passthrough=True)` drops it
+/// (`sklearn/pipeline.py:275-290`), so the running `Xt` passes through unchanged
+/// — yet the step is still visible in `named_steps` / `steps` / `__getitem__`
+/// (`sklearn/pipeline.py:337`: `"passthrough" if estimator is None else
+/// estimator`). The net behavior is identity: `Pipeline([('p','passthrough')])
+/// .fit(X).transform(X) == X` (verified against the live 1.5.2 oracle).
+///
+/// ferrolearn encodes the transformer/estimator distinction in the type system
+/// (there is no untyped `steps` list to hold a sentinel string), so rather than a
+/// `filter_passthrough` branch in the fit/transform loop, the passthrough step is
+/// a concrete, reusable *identity transformer*: its `fit_pipeline` is a no-op and
+/// its [`FittedPassthroughTransformer::transform_pipeline`] returns `x.clone()`.
+/// Placed anywhere in a [`Pipeline`] it leaves the running data unchanged and
+/// still appears in [`Pipeline::step_names`] / [`Pipeline::named_steps`], exactly
+/// matching sklearn's observable contract. The ergonomic builder
+/// [`Pipeline::passthrough_step`] adds one under a given name (the `('name',
+/// 'passthrough')` analog).
+///
+/// The type parameter `F` is the float type (`f32` or `f64`), defaulting to
+/// `f64` to match the rest of this module.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_core::pipeline::{PassthroughTransformer, FittedPipelineTransformer};
+/// use ferrolearn_core::pipeline::PipelineTransformer;
+/// use ndarray::{Array1, Array2};
+///
+/// let p = PassthroughTransformer::<f64>::new();
+/// let x = Array2::from_shape_vec((2, 2), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
+/// let y = Array1::<f64>::zeros(2);
+/// let fitted = p.fit_pipeline(&x, &y).unwrap();
+/// // Identity: transform returns the input unchanged.
+/// assert_eq!(fitted.transform_pipeline(&x).unwrap(), x);
+/// ```
+pub struct PassthroughTransformer<F: Float + Send + Sync + 'static = f64> {
+    /// `PassthroughTransformer` holds no state; the marker ties the no-op to the
+    /// float type `F` so it slots into an `F`-typed [`Pipeline`].
+    _marker: core::marker::PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> PassthroughTransformer<F> {
+    /// Create a new passthrough (identity) transformer.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ferrolearn_core::pipeline::PassthroughTransformer;
+    /// let p = PassthroughTransformer::<f64>::new();
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for PassthroughTransformer<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> PipelineTransformer<F> for PassthroughTransformer<F> {
+    /// Fitting a passthrough step does nothing (there are no parameters to learn);
+    /// it yields a [`FittedPassthroughTransformer`] whose transform is the
+    /// identity. Mirrors sklearn skipping a `'passthrough'` step at fit
+    /// (`_iter(filter_passthrough=True)`, `sklearn/pipeline.py:289`), so the
+    /// running `Xt` is unaffected.
+    fn fit_pipeline(
+        &self,
+        _x: &Array2<F>,
+        _y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineTransformer<F>>, FerroError> {
+        Ok(Box::new(FittedPassthroughTransformer::new()))
+    }
+}
+
+/// The fitted half of a [`PassthroughTransformer`]: an identity transform.
+///
+/// [`transform_pipeline`](FittedPassthroughTransformer::transform_pipeline)
+/// returns its input unchanged, the fitted analog of sklearn's skipped
+/// `'passthrough'` step leaving the running `Xt` unchanged
+/// (`sklearn/pipeline.py:275-290`).
+pub struct FittedPassthroughTransformer<F: Float + Send + Sync + 'static = f64> {
+    /// No fitted state; the marker ties the identity transform to `F`.
+    _marker: core::marker::PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedPassthroughTransformer<F> {
+    /// Create a new fitted passthrough (identity) transformer.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            _marker: core::marker::PhantomData,
+        }
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for FittedPassthroughTransformer<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FittedPipelineTransformer<F>
+    for FittedPassthroughTransformer<F>
+{
+    /// Return the input unchanged (identity).
+    ///
+    /// This is the no-op that makes a passthrough step transparent: the data the
+    /// next step (or final estimator) sees is exactly what entered. Matches
+    /// sklearn's `'passthrough'` net behavior `Pipeline([('p','passthrough')])
+    /// .transform(X) == X` (live 1.5.2 oracle).
+    fn transform_pipeline(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        Ok(x.clone())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1923,6 +2071,160 @@ mod tests {
         ));
         assert!(fitted.named_step("nope").is_none());
         Ok(())
+    }
+
+    // -- REQ-5a: passthrough steps -------------------------------------------
+
+    #[test]
+    fn test_passthrough_step_is_identity() -> Result<(), FerroError> {
+        // Live oracle (sklearn 1.5.2):
+        //   from sklearn.pipeline import Pipeline; import numpy as np
+        //   X = np.array([[1.,2.],[3.,4.],[5.,6.]])
+        //   p = Pipeline([('p','passthrough')]).fit(X)
+        //   np.array_equal(p.transform(X), X)   -> True
+        // A pipeline whose only transformer is a passthrough step leaves X
+        // unchanged. ferrolearn needs a final estimator slot to fit, so we add a
+        // SumEstimator after; transform() (the transformer prefix) must equal X.
+        let pipeline = Pipeline::new()
+            .passthrough_step("p")
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0, 2.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        // transform() applies only the (passthrough) transformer prefix -> X.
+        assert_eq!(fitted.transform(&x)?, x);
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_before_transformer_is_noop() -> Result<(), FerroError> {
+        // Live oracle (sklearn 1.5.2):
+        //   Pipeline([('pass','passthrough'),('ss',StandardScaler())]).fit(X)
+        //     .transform(X)
+        //   == Pipeline([('ss',StandardScaler())]).fit(X).transform(X)   -> True
+        // A passthrough BEFORE a real transformer is a no-op: the result equals
+        // the transformer alone. ferrolearn analog: a passthrough before a
+        // DoublingTransformer == the doubler alone.
+        let with_pass = Pipeline::new()
+            .passthrough_step("pass")
+            .transform_step("dbl", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let without_pass = Pipeline::new()
+            .transform_step("dbl", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+
+        let a = with_pass.fit(&x, &y)?.transform(&x)?;
+        let b = without_pass.fit(&x, &y)?.transform(&x)?;
+        assert_eq!(a, b);
+        // And it equals the doubler applied to X.
+        assert_eq!(a, x.mapv(|v| v * 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_after_transformer_is_noop() -> Result<(), FerroError> {
+        // Live oracle (sklearn 1.5.2):
+        //   Pipeline([('ss',StandardScaler()),('pass','passthrough')]).transform(X)
+        //   == Pipeline([('ss',StandardScaler())]).transform(X)   -> True
+        // A passthrough AFTER a real transformer is a no-op. ferrolearn analog:
+        // doubler then passthrough == doubler alone.
+        let with_pass = Pipeline::new()
+            .transform_step("dbl", Box::new(DoublingTransformer))
+            .passthrough_step("pass")
+            .estimator_step("sum", Box::new(SumEstimator));
+        let without_pass = Pipeline::new()
+            .transform_step("dbl", Box::new(DoublingTransformer))
+            .estimator_step("sum", Box::new(SumEstimator));
+        let x = ndarray::array![[1.0, 2.0], [3.0, 4.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+
+        let a = with_pass.fit(&x, &y)?.transform(&x)?;
+        let b = without_pass.fit(&x, &y)?.transform(&x)?;
+        assert_eq!(a, b);
+        assert_eq!(a, x.mapv(|v| v * 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_step_appears_in_step_names() -> Result<(), FerroError> {
+        // Live oracle (sklearn 1.5.2):
+        //   p = Pipeline([('p','passthrough'),('ss',StandardScaler())]).fit(X)
+        //   list(p.named_steps.keys())  -> ['p', 'ss']
+        //   p['p']                      -> 'passthrough'   (still visible)
+        // A passthrough step is a real, named step: it shows up in
+        // step_names()/named_steps() in order, exactly like sklearn.
+        let pipeline = Pipeline::new()
+            .passthrough_step("p")
+            .transform_step("dbl", Box::new(DoublingTransformer))
+            .estimator_step("clf", Box::new(SumEstimator));
+
+        assert_eq!(pipeline.step_names(), vec!["p", "dbl", "clf"]);
+        let named: Vec<&str> = pipeline.named_steps().iter().map(|(n, _)| *n).collect();
+        assert_eq!(named, vec!["p", "dbl", "clf"]);
+        // The passthrough step is a transformer-kind step (reachable by name).
+        assert!(matches!(
+            pipeline.named_step("p"),
+            Some(PipelineStepRef::Transformer(_))
+        ));
+
+        // And it survives onto the fitted pipeline's introspection.
+        let x = Array2::<f64>::zeros((2, 2));
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        assert_eq!(fitted.step_names(), vec!["p", "dbl", "clf"]);
+        assert!(matches!(
+            fitted.named_step("p"),
+            Some(FittedPipelineStepRef::Transformer(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_transformer_standalone_identity() -> Result<(), FerroError> {
+        // A standalone PassthroughTransformer: fit_pipeline + transform_pipeline
+        // is the identity (the building block the no-op step is made of). This is
+        // the pointwise restatement of sklearn's 'passthrough' == identity
+        // (Pipeline([('p','passthrough')]).transform(X) == X, live 1.5.2).
+        let p = PassthroughTransformer::<f64>::new();
+        let x = ndarray::array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+        let y = Array1::from_vec(vec![0.0, 1.0]);
+        let fitted = p.fit_pipeline(&x, &y)?;
+        assert_eq!(fitted.transform_pipeline(&x)?, x);
+        // Default constructs the same no-op.
+        let fitted2 = PassthroughTransformer::<f64>::default().fit_pipeline(&x, &y)?;
+        assert_eq!(fitted2.transform_pipeline(&x)?, x);
+        // The fitted half also has a public constructor/Default.
+        assert_eq!(
+            FittedPassthroughTransformer::<f64>::new().transform_pipeline(&x)?,
+            x
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_transformer_f32() -> Result<(), FerroError> {
+        // f32 generic support: the identity no-op for f32 data.
+        let pipeline = Pipeline::<f32>::new()
+            .passthrough_step("p")
+            .transform_step("dbl", Box::new(DoublingTransformerF32))
+            .estimator_step("sum", Box::new(SumEstimatorF32));
+        let x = ndarray::array![[1.0f32, 2.0], [3.0, 4.0]];
+        let y = Array1::from_vec(vec![0.0f32, 1.0]);
+        let fitted = pipeline.fit(&x, &y)?;
+        // passthrough then doubler == doubler alone.
+        assert_eq!(fitted.transform(&x)?, x.mapv(|v| v * 2.0));
+        Ok(())
+    }
+
+    #[test]
+    fn test_passthrough_transformer_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<PassthroughTransformer<f64>>();
+        assert_send_sync::<PassthroughTransformer<f32>>();
+        assert_send_sync::<FittedPassthroughTransformer<f64>>();
+        assert_send_sync::<FittedPassthroughTransformer<f32>>();
     }
 
     // -- REQ-8: FeatureUnion -------------------------------------------------
