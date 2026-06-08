@@ -34,7 +34,7 @@
 //! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; string/object input is REQ-3-string (NOT-STARTED, no String path). |
 //! | REQ-4 (handle_unknown + set-membership error) | NOT-STARTED | open prereq blocker #1151. `transform` raises `InvalidParameter` ("Found unknown categories …") via `categories_` MEMBERSHIP (no longer a `max+1` comparison) — the default `handle_unknown='error'` ValueError mechanism now MATCHES (`_encoders.py:206-214`), but the `'ignore'`/`'infrequent_if_exist'` modes (`:541`) are still absent. R-DEV-2. |
 //! | REQ-5 (drop + infrequent grouping) | NOT-STARTED | open prereq blocker #1152. No `drop` (`:498-516`) / `min_frequency`/`max_categories` (`:566-`). |
-//! | REQ-6 (inverse_transform + get_feature_names_out) | NOT-STARTED | open prereq blocker #1153. Neither (`:1068`, `:1187`). |
+//! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then errors on an ALL-ZERO block (`block_sum == 0`) with `InvalidParameter` ("Samples can not be inverted when drop=None and handle_unknown='error' because they contain all zeros"), mirroring sklearn's two-step argmax-then-all-zero-check (`_encoders.py:1136-1168`); 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the drop-aware / `handle_unknown='ignore'` inverse (None for all-zeros, `:1141-1158`). |
 //! | REQ-7 (ctor + dtype + _parameter_constraints) | NOT-STARTED | open prereq blocker #1154. `new()` takes no params/validates nothing (`:728-762`). |
 //! | REQ-8 (PyO3 binding) | NOT-STARTED | open prereq blocker #1155. No `ferrolearn-python` registration (R-DEFER-1). |
 //! | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #1156. `ndarray::Array2`, not `ferray-core` (R-SUBSTRATE-1/2). |
@@ -145,6 +145,171 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
     #[must_use]
     pub fn n_output_features(&self) -> usize {
         self.n_output
+    }
+
+    /// Invert a one-hot encoded matrix back to the original category values.
+    ///
+    /// For each input feature `j` the per-feature block
+    /// `x[:, offsets[j] .. offsets[j] + categories_[j].len()]` is reduced to a
+    /// single category via **argmax** (the index of the maximum value in the
+    /// block, first-max on ties — numpy `argmax` semantics), and the original
+    /// value `categories_[j][argmax]` is written to `out[[i, j]]`. This mirrors
+    /// scikit-learn's `OneHotEncoder.inverse_transform`
+    /// (`sklearn/preprocessing/_encoders.py:1136-1139`):
+    /// `labels = sub.argmax(axis=1); X_tr[:, i] = cats[labels]`.
+    ///
+    /// After the argmax, an **all-zero block** (a row whose per-feature block
+    /// sums to zero) cannot be inverted. With no `drop` and the default
+    /// `handle_unknown='error'` (the only mode ferrolearn ships — REQ-4/5), this
+    /// is an error, matching sklearn's
+    /// `ValueError("Samples [...] can not be inverted when drop=None and
+    /// handle_unknown='error' because they contain all zeros")`
+    /// (`_encoders.py:1160-1168`). A proper one-hot row from
+    /// [`Transform::transform`] has exactly one `1` per block, so argmax always
+    /// finds it and the block sum is never zero.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::InsufficientSamples`] if `x` has zero rows (sklearn
+    ///   `check_array` requires a minimum of 1 sample).
+    /// - [`FerroError::ShapeMismatch`] if `x.ncols() != n_output` (sklearn's
+    ///   "Shape of the passed X data is not correct" `ValueError`,
+    ///   `_encoders.py:1100-1104`).
+    /// - [`FerroError::InvalidParameter`] if any per-feature block is all-zero
+    ///   (the sklearn all-zeros `ValueError`, `_encoders.py:1164-1168`).
+    ///
+    /// Never panics: every block slice is bounds-checked (R-CODE-2).
+    pub fn inverse_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let n_samples = x.nrows();
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "FittedOneHotEncoder::inverse_transform".into(),
+            });
+        }
+        // sklearn `inverse_transform` -> `check_array(X, accept_sparse="csr")`
+        // (`_encoders.py:1092`) with the DEFAULT `force_all_finite=True`, so a
+        // NaN or +/-inf cell in the one-hot matrix raises BEFORE the argmax
+        // (#2224). A valid one-hot row is all 0/1 (finite); a non-finite cell is
+        // invalid input.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if x.ncols() != self.n_output {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples, self.n_output],
+                actual: vec![n_samples, x.ncols()],
+                context: "FittedOneHotEncoder::inverse_transform".into(),
+            });
+        }
+
+        let n_features = self.categories_.len();
+        let mut out = Array2::zeros((n_samples, n_features));
+
+        for j in 0..n_features {
+            let cats = &self.categories_[j];
+            let block_len = cats.len();
+            // A unique-category column has an empty `categories_[j]` only if the
+            // training column was empty, which `fit` rejects (0 rows); a
+            // 1-category column has block_len == 1. Guard anyway (R-CODE-2).
+            if block_len == 0 {
+                continue;
+            }
+            let offset = self.offsets[j];
+            for i in 0..n_samples {
+                // Argmax over the per-feature block (numpy `argmax`: index of the
+                // maximum, FIRST on ties). Track the block sum to detect the
+                // all-zero (uninvertible) case separately, mirroring sklearn's
+                // two-step argmax-then-all-zero-check (`_encoders.py:1138-1168`).
+                let mut argmax: usize = 0;
+                let mut max_val = x[[i, offset]];
+                let mut block_sum = max_val;
+                for k in 1..block_len {
+                    let v = x[[i, offset + k]];
+                    block_sum = block_sum + v;
+                    if v > max_val {
+                        max_val = v;
+                        argmax = k;
+                    }
+                }
+                // All-zero block: cannot be inverted with drop=None and
+                // handle_unknown='error' (sklearn `_encoders.py:1164-1168`). We
+                // have no drop/ignore mode (REQ-4/5), so this is always an error.
+                if block_sum == F::zero() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "X".into(),
+                        reason: "Samples can not be inverted when drop=None and \
+                                 handle_unknown='error' because they contain all zeros"
+                            .into(),
+                    });
+                }
+                out[[i, j]] = cats[argmax];
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// Return the output feature names, one per output column.
+    ///
+    /// For each input feature `j`, for each category `c` in `categories_[j]`,
+    /// emits `format!("x{j}_{c}")` where `c` is rendered to match Python's
+    /// `str(np.float64(c))`. This mirrors scikit-learn's
+    /// `OneHotEncoder.get_feature_names_out` with the default `input_features`
+    /// (`["x0", "x1", ...]`) and the `"concat"` name combiner
+    /// (`feature + "_" + str(category)`, `_encoders.py:1217,1224`). For the
+    /// whole-number fixture `[[2,0],[5,1],[9,0],[5,1]]` this yields
+    /// `["x0_2.0", "x0_5.0", "x0_9.0", "x1_0.0", "x1_1.0"]`.
+    ///
+    /// # Float-rendering divergence (HONEST, R-HONEST-3)
+    ///
+    /// The category is rendered via [`Self::category_label`], which appends `.0`
+    /// to integer-valued floats (`2.0 → "2.0"`, `-3.0 → "-3.0"`, matching
+    /// Python) and uses Rust's shortest round-trip `Display` otherwise
+    /// (`2.5 → "2.5"`). For category values in the usual categorical range
+    /// (small whole or fractional numbers) this is byte-identical to Python.
+    /// It DIVERGES for extreme magnitudes: Python's `repr`/`str` switches to
+    /// scientific notation at `|v| >= 1e16` and `0 < |v| < 1e-4`
+    /// (`1e+20`, `1e-07`), while Rust's `Display` prints the full decimal
+    /// (`100000000000000000000`, `0.0000001`). Such values are not plausible
+    /// one-hot categories; the divergence is documented rather than papered over.
+    /// `NaN` renders as `"nan"` (matching Python's `str(nan)`).
+    #[must_use]
+    pub fn get_feature_names_out(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.n_output);
+        for (j, cats) in self.categories_.iter().enumerate() {
+            for &c in cats {
+                names.push(format!("x{j}_{}", Self::category_label(c)));
+            }
+        }
+        names
+    }
+
+    /// Render a category value to a string matching Python's `str(np.float64(v))`
+    /// for the categorical-value range (see [`Self::get_feature_names_out`] for
+    /// the documented extreme-magnitude divergence).
+    ///
+    /// Python's `str(float)` always shows a decimal point for whole floats
+    /// (`2.0`, not `2`), so an integer-valued finite float gets a `.0` suffix;
+    /// otherwise Rust's shortest round-trip `Display` is used. `NaN → "nan"`.
+    fn category_label(v: F) -> String {
+        let Some(f) = v.to_f64() else {
+            return "nan".to_string();
+        };
+        if f.is_nan() {
+            return "nan".to_string();
+        }
+        if f.is_finite() && f == f.trunc() {
+            // Whole-valued finite float: Python prints e.g. "2.0", "-3.0".
+            format!("{f:.1}")
+        } else {
+            // Fractional or non-finite: shortest round-trip Display ("2.5").
+            format!("{f}")
+        }
     }
 }
 

@@ -537,7 +537,6 @@ fn get_feature_names_out_negative_matches_sklearn_oracle() {
 /// `ValueError`, ferrolearn silently produces output) and is NOT covered by the
 /// 8 REQ-6 tests nor by the documented extreme-magnitude float-label divergence.
 #[test]
-#[ignore = "divergence: inverse_transform lacks NaN/inf input validation (sklearn check_array errors); tracking #2224"]
 fn inverse_transform_nan_input_errors_vs_sklearn_oracle() {
     // Live oracle (sklearn 1.5.2, run from /tmp):
     //   inverse_transform([[0.0, nan, 0.0]]) -> ValueError: Input contains NaN.
