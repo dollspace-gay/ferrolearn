@@ -52,9 +52,8 @@ fn fixture() -> (Array2<f64>, Array2<f64>) {
 /// it centers, runs block CD, and returns `Ok(FittedMultiTaskElasticNet)` whose
 /// `coef_` is NaN-poisoned. R-DEV-2 error-contract divergence.
 ///
-/// Tracking: #2240
+/// Tracking: #2240 (FIXED — finiteness check ported from `MultiTaskLasso`).
 #[test]
-#[ignore = "divergence: MultiTaskElasticNet::fit accepts non-finite X/Y (sklearn raises ValueError); tracking #2240"]
 fn mten_rejects_non_finite_input_like_sklearn() {
     // 1. NaN in X: sklearn raises ValueError; ferrolearn must Err, not Ok.
     let (mut x, y) = fixture();
@@ -117,5 +116,71 @@ fn mten_rejects_non_finite_input_like_sklearn() {
     assert!(
         res.is_err(),
         "sklearn raises ValueError for Inf in Y; ferrolearn must return Err"
+    );
+}
+
+/// Divergence (#2241, KNOWN sibling gap): `FittedMultiTaskElasticNet` exposed
+/// `n_iter()` but no `dual_gap()`, while sklearn sets `self.dual_gap_`.
+///
+/// sklearn unpacks the solver's gap into `self.dual_gap_`
+/// (`_coordinate_descent.py:2636`) then scales it to the `(1 / (2 * n_samples))`
+/// objective via `self.dual_gap_ /= n_samples` (`:2652`). The solver
+/// `enet_coordinate_descent_multi_task` returns the final-iterate `gap`
+/// (`_cd_fast.pyx:961`, the value computed at `:944-948` with the L2 terms).
+///
+/// Live sklearn 1.5.2 oracle (R-CHAR-3), never copied from ferrolearn:
+///   python3 -c "import numpy as np;
+///     from sklearn.linear_model import MultiTaskElasticNet;
+///     X=np.array([[1,2],[2,1],[3,4],[4,3],[5,5]],float);
+///     Y=np.array([[3,1],[2.5,2],[7.1,3.5],[6,4.2],[11.2,6]]);
+///     print(MultiTaskElasticNet(alpha=0.3,l1_ratio=0.5).fit(X,Y).dual_gap_);
+///     print(MultiTaskElasticNet(alpha=0.1,l1_ratio=0.3).fit(X,Y).dual_gap_);
+///     print(MultiTaskElasticNet(alpha=0.5,l1_ratio=0.7).fit(X,Y).dual_gap_)"
+///   -> 0.00013249752857635855
+///      0.0001427148140240142
+///      0.00011562007067524859
+///
+/// Tracking: #2241
+#[test]
+fn mten_dual_gap_matches_sklearn() {
+    use approx::assert_relative_eq;
+
+    let (x, y) = fixture();
+
+    // alpha=0.3, l1_ratio=0.5 -> dual_gap_ = 0.00013249752857635855, n_iter_=16.
+    let fitted = MultiTaskElasticNet::<f64>::new()
+        .with_alpha(0.3)
+        .with_l1_ratio(0.5)
+        .fit(&x, &y)
+        .expect("fit should succeed on finite input");
+    assert_relative_eq!(
+        fitted.dual_gap(),
+        0.000_132_497_528_576_358_55,
+        epsilon = 1e-9
+    );
+    assert_eq!(fitted.n_iter(), 16, "n_iter_ must be unchanged by the fix");
+
+    // alpha=0.1, l1_ratio=0.3 -> dual_gap_ = 0.0001427148140240142.
+    let fitted = MultiTaskElasticNet::<f64>::new()
+        .with_alpha(0.1)
+        .with_l1_ratio(0.3)
+        .fit(&x, &y)
+        .expect("fit should succeed on finite input");
+    assert_relative_eq!(
+        fitted.dual_gap(),
+        0.000_142_714_814_024_014_2,
+        epsilon = 1e-9
+    );
+
+    // alpha=0.5, l1_ratio=0.7 -> dual_gap_ = 0.00011562007067524859.
+    let fitted = MultiTaskElasticNet::<f64>::new()
+        .with_alpha(0.5)
+        .with_l1_ratio(0.7)
+        .fit(&x, &y)
+        .expect("fit should succeed on finite input");
+    assert_relative_eq!(
+        fitted.dual_gap(),
+        0.000_115_620_070_675_248_59,
+        epsilon = 1e-9
     );
 }

@@ -31,7 +31,7 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-14 (MultiTaskElasticNet, multi-output L1/L21 mixed-norm block CD) | SHIPPED | `MultiTaskElasticNet<F>` / `FittedMultiTaskElasticNet<F>` in this module: `impl Fit<Array2<F>, Array2<F>>` runs block coordinate descent porting `_cd_fast.pyx::enet_coordinate_descent_multi_task` (`:740-960`, full `l2_reg != 0` version): `l1_reg = alpha*l1_ratio*n`, `l2_reg = alpha*(1-l1_ratio)*n`, per-feature block update `W[j,:] = tmp * max(1 - l1_reg/||tmp||, 0) / (norm_cols_X[j] + l2_reg)` (`:872-874`), residual rank-1 maintenance, and the two-level relative-change + dual-gap stop (`:903-950`, `XtA = Xc^T R - l2_reg*W`, `gap += l1_reg*||W||_21 - const*R_dot_Y + 0.5*l2_reg*(1+const^2)*||W||_F^2`, `tol_scaled = tol*||Y||_F^2`). `coef_` is stored `(n_tasks, n_features)` matching sklearn `coef_`. Verified against the live sklearn 1.5.2 oracle (R-CHAR-3): on `X=[[1,2],[2,1],[3,4],[4,3],[5,5]]`, `Y=[[3,1],[2.5,2],[7.1,3.5],[6,4.2],[11.2,6]]`, `MultiTaskElasticNet(alpha=0.3, l1_ratio=0.5)` -> `coef_=[[0.8163842473,1.3248847997],[0.8318338149,0.3403462995]]`, `intercept_=[-0.4638071409,-0.1765403432]`, `n_iter_=16`. Tests `multi_task_elastic_net_matches_sklearn`, `multi_task_elastic_net_no_intercept_matches_sklearn`, `multi_task_elastic_net_predict_matches_sklearn`, `multi_task_elastic_net_l1_ratio_one_equals_multitask_lasso`, `multi_task_elastic_net_validation_errors`. Non-test consumer: `MultiTaskElasticNet` is the public estimator boundary API re-exported at the crate root (`ferrolearn_linear::MultiTaskElasticNet`, grandfathered boundary per goal.md S5). |
+//! | REQ-14 (MultiTaskElasticNet, multi-output L1/L21 mixed-norm block CD) | SHIPPED | `MultiTaskElasticNet<F>` / `FittedMultiTaskElasticNet<F>` in this module: `impl Fit<Array2<F>, Array2<F>>` runs block coordinate descent porting `_cd_fast.pyx::enet_coordinate_descent_multi_task` (`:740-960`, full `l2_reg != 0` version): `l1_reg = alpha*l1_ratio*n`, `l2_reg = alpha*(1-l1_ratio)*n`, per-feature block update `W[j,:] = tmp * max(1 - l1_reg/||tmp||, 0) / (norm_cols_X[j] + l2_reg)` (`:872-874`), residual rank-1 maintenance, and the two-level relative-change + dual-gap stop (`:903-950`, `XtA = Xc^T R - l2_reg*W`, `gap += l1_reg*||W||_21 - const*R_dot_Y + 0.5*l2_reg*(1+const^2)*||W||_F^2`, `tol_scaled = tol*||Y||_F^2`). `coef_` is stored `(n_tasks, n_features)` matching sklearn `coef_`. Verified against the live sklearn 1.5.2 oracle (R-CHAR-3): on `X=[[1,2],[2,1],[3,4],[4,3],[5,5]]`, `Y=[[3,1],[2.5,2],[7.1,3.5],[6,4.2],[11.2,6]]`, `MultiTaskElasticNet(alpha=0.3, l1_ratio=0.5)` -> `coef_=[[0.8163842473,1.3248847997],[0.8318338149,0.3403462995]]`, `intercept_=[-0.4638071409,-0.1765403432]`, `n_iter_=16`. Input validation matches sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:2602`; both `check_X_params`/`check_y_params` at `:2595`,`:2601` inherit the default `force_all_finite=True`): any NaN/+/-inf in X or Y is rejected with `FerroError::InvalidParameter` BEFORE the solver (ported from the `MultiTaskLasso` sibling; #2240, `tests/divergence_multi_task_elastic_net.rs::mten_rejects_non_finite_input_like_sklearn`). The `dual_gap_` fitted attribute is now exposed via the `dual_gap: F` field + `#[must_use] pub fn dual_gap()` getter: `Fit::fit` captures the final block-CD duality gap (the value deciding convergence, the gap with the l2 terms at `_cd_fast.pyx:944-948`) into `final_gap` and stores it scaled `final_gap / n_samples`, mirroring `self.dual_gap_ /= n_samples` (`_coordinate_descent.py:2652`, unpacked at `:2636`, returned at `_cd_fast.pyx:961`). Verified against the live sklearn 1.5.2 oracle (R-CHAR-3): `MultiTaskElasticNet(alpha=0.3, l1_ratio=0.5)` -> `dual_gap_=0.00013249752857635855`, `alpha=0.1, l1_ratio=0.3` -> `0.0001427148140240142`, `alpha=0.5, l1_ratio=0.7` -> `0.00011562007067524859` (#2241, `tests/divergence_multi_task_elastic_net.rs::mten_dual_gap_matches_sklearn`, tol 1e-9). Tests `multi_task_elastic_net_matches_sklearn`, `multi_task_elastic_net_no_intercept_matches_sklearn`, `multi_task_elastic_net_predict_matches_sklearn`, `multi_task_elastic_net_l1_ratio_one_equals_multitask_lasso`, `multi_task_elastic_net_validation_errors`. Non-test consumer: `MultiTaskElasticNet` is the public estimator boundary API re-exported at the crate root (`ferrolearn_linear::MultiTaskElasticNet`, grandfathered boundary per goal.md S5). |
 //!
 //! # Examples
 //!
@@ -159,6 +159,9 @@ pub struct FittedMultiTaskElasticNet<F> {
     /// Number of block-coordinate-descent sweeps run by the solver (1-based;
     /// mirrors sklearn `MultiTaskElasticNet.n_iter_`).
     n_iter: usize,
+    /// Duality gap at the returned solution, on the `(1 / (2 * n_samples))`-scaled
+    /// objective (mirrors sklearn `MultiTaskElasticNet.dual_gap_`).
+    dual_gap: F,
 }
 
 impl<F: Float> FittedMultiTaskElasticNet<F> {
@@ -181,6 +184,20 @@ impl<F: Float> FittedMultiTaskElasticNet<F> {
     #[must_use]
     pub fn n_iter(&self) -> usize {
         self.n_iter
+    }
+
+    /// Duality gap at the returned solution, on the `(1 / (2 * n_samples))`-scaled
+    /// objective.
+    ///
+    /// Mirrors sklearn's `MultiTaskElasticNet.dual_gap_` attribute
+    /// (`_coordinate_descent.py:2636` — unpacked from
+    /// `enet_coordinate_descent_multi_task` — then `:2652`
+    /// `self.dual_gap_ /= n_samples`, the final objective-scaling). This is the
+    /// final block-CD duality gap (the value that decided convergence), scaled by
+    /// `1 / n_samples` so the exposed value matches sklearn's `dual_gap_`.
+    #[must_use]
+    pub fn dual_gap(&self) -> F {
+        self.dual_gap
     }
 }
 
@@ -240,6 +257,27 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 required: 1,
                 actual: 0,
                 context: "MultiTaskElasticNet requires at least one sample".into(),
+            });
+        }
+
+        // sklearn `MultiTaskElasticNet.fit` -> `self._validate_data(X, y,
+        // validate_separately=(check_X_params, check_y_params))`
+        // (`_coordinate_descent.py:2602`); both param dicts (`:2595`,`:2601`)
+        // inherit the default `force_all_finite=True`, so `check_array` rejects
+        // any NaN or +/-inf in X OR Y with a `ValueError` BEFORE the solver runs.
+        // `.iter().any(|v| !v.is_finite())` rejects both NaN and Inf, matching
+        // the crate idiom (e.g. `one_hot_encoder.rs`). Ported verbatim from the
+        // `MultiTaskLasso` sibling (`multi_task_lasso.rs`). (#2240)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 
@@ -308,6 +346,10 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         let d_w_tol = self.tol;
 
         let mut n_iter_done = 0usize;
+        // Final duality gap (un-normalized objective, like sklearn's
+        // `enet_coordinate_descent_multi_task` return); scaled by `1/n` on store
+        // to mirror `dual_gap_ /= n_samples` (`_coordinate_descent.py:2652`).
+        let mut final_gap = F::zero();
 
         for it in 0..self.max_iter {
             n_iter_done = it + 1; // 1-based, mirroring sklearn `n_iter_`.
@@ -413,6 +455,11 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
                 gap = gap + l1_reg * w21 - const_factor * ry
                     + half * l2_reg * (F::one() + const_factor * const_factor) * w_norm2;
 
+                // Record the most recent gap; whichever iteration last runs the
+                // dual-gap check (the convergence break or the final sweep) is the
+                // value sklearn returns as `dual_gap_` (pre `/n_samples`).
+                final_gap = gap;
+
                 if gap < tol_scaled {
                     break;
                 }
@@ -435,6 +482,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             coefficients,
             intercepts,
             n_iter: n_iter_done,
+            // sklearn `_coordinate_descent.py:2652`: `self.dual_gap_ /= n_samples`
+            // maps the solver's un-normalized gap to the `(1/2n)`-scaled objective.
+            dual_gap: final_gap / n_f,
         })
     }
 }
