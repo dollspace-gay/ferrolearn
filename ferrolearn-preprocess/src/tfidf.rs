@@ -16,7 +16,7 @@
 //! |---|---|---|
 //! | REQ-1 (default smooth idf_) | SHIPPED | `fit` smooth branch `idf = ln((1+n)/(1+df))+1` = sklearn `log(n/df)+1` after `df+=1;n+=1` (`text.py:1660-1666`). Critic-verified vs live oracle (`[1.0,1.6931471805599454,...]`); `green_req1_*` in `tests/divergence_tfidf.rs`. Consumer: re-export `lib.rs:142`. |
 //! | REQ-2 (default transform: idf×tf + l2) | SHIPPED | `transform` ×idf per column then L2 row-normalize, mirroring sklearn `X.data *= idf_[indices]` + `normalize` (`text.py:1705-1708`). Critic-verified FULL oracle vector `[[0.50854232,0.86103700,0],...]` (`green_req2_default_fit_transform_l2_full_vector`). |
-//! | REQ-3 (smooth_idf=False) | SHIPPED | `fit` else-branch `ln(n/df)+1` (`text.py:1660-1666`); oracle `[1.0,2.09861228866811,...]`. DEVIATION (R-DEV-4): `df==0` edge → ferrolearn `1.0` vs sklearn `inf` (avoids the `0*inf=nan` footgun; a CountVectorizer never emits all-zero columns). |
+//! | REQ-3 (smooth_idf=False) | SHIPPED | `fit` else-branch `ln(n/df)+1` (`text.py:1660-1666`); oracle `[1.0,2.09861228866811,...]`. `df==0` edge → `ln(n/0)+1 = +inf`, FAITHFUL to sklearn `np.log(n_samples/df)+1.0` (`text.py:1666`, value `+inf`). `transform` guards `tf==0` so a df=0 column's zeros stay 0 (not `0*inf=nan`), mirroring sklearn's sparse `X.data *= idf_[X.indices]` (`text.py:1705`); a non-zero count in a df=0 column yields `inf`. |
 //! | REQ-4 (norm l1/l2/None) | SHIPPED | `match self.norm` mirrors sklearn `normalize(X, norm)` (`text.py:1707-1708`); l1/None full vectors critic-verified vs oracle. |
 //! | REQ-5 (sublinear_tf) | SHIPPED | `1 + ln(tf)` for tf>0, mirroring sklearn `log(X.data); +=1` (`text.py:1698-1700`); oracle `[[2.386294361119891,1.0]]`. |
 //! | REQ-6 (use_idf=False) | SHIPPED | `idf = None` path → TF+norm only, mirroring sklearn `if self.use_idf` (`text.py:1654`,`:1702`); critic-verified value-match + `idf()==None`. |
@@ -158,12 +158,12 @@ impl<F: Float + Send + Sync + 'static> TfidfTransformer<F> {
                     // idf = ln((1 + n) / (1 + df)) + 1
                     idf_vec[j] = ((F::one() + n_f) / (F::one() + df_f)).ln() + F::one();
                 } else {
-                    // idf = ln(n / df) + 1
-                    if df > 0 {
-                        idf_vec[j] = (n_f / df_f).ln() + F::one();
-                    } else {
-                        idf_vec[j] = F::one();
-                    }
+                    // idf = ln(n / df) + 1. For a df==0 column (a term that
+                    // never occurs), `n / 0 = +inf` and `ln(+inf) = +inf`, so
+                    // idf = +inf — matching sklearn `np.log(n_samples / df) + 1.0`
+                    // (`text.py:1666`), which evaluates `log(n/0) = inf` for the
+                    // unsmoothed path (RuntimeWarning divide-by-zero, value +inf).
+                    idf_vec[j] = (n_f / df_f).ln() + F::one();
                 }
             }
             Some(idf_vec)
@@ -242,11 +242,18 @@ impl<F: Float + Send + Sync + 'static> FittedTfidfTransformer<F> {
             result.mapv_inplace(|v| if v > F::zero() { F::one() + v.ln() } else { v });
         }
 
-        // Multiply by IDF.
+        // Multiply by IDF. sklearn applies `X.data *= idf_[X.indices]` on a CSR
+        // matrix (`text.py:1705`), where only stored (non-zero) entries are
+        // touched — a zero count is never multiplied, so a df=0 column's `inf`
+        // idf yields 0, not `0 * inf = nan`. We replicate the sparse semantics by
+        // guarding `tf == 0`: zeros stay zero; non-zero tf in a df=0 column gives
+        // `tf * inf = inf` (matching sklearn for a new doc with a non-zero count).
         if let Some(ref idf) = self.idf {
             for mut row in result.rows_mut() {
                 for (j, v) in row.iter_mut().enumerate() {
-                    *v = *v * idf[j];
+                    if *v != F::zero() {
+                        *v = *v * idf[j];
+                    }
                 }
             }
         }
