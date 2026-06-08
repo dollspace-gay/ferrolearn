@@ -68,6 +68,7 @@
 //! | REQ-9 (probability / predict_proba) | SHIPPED | `pub probability: bool` field on `NuSVC` (default `false`, `_classes.py:1129`, `with_probability`) + `predict_proba`/`predict_log_proba`/`prob_a`/`prob_b`/`probability` on `FittedNuSVC`. `NuSVC::fit in nu_svm.rs` (when `self.probability`) runs the shared `crate::svm::platt_cv_sigmoid` PER OVO PAIR with a `train_fold` closure wrapping the **NU-SVC** sub-solver `crate::svm::solve_nu_svc` (the SAME `svm_type` as the outer model, libsvm `svm_binary_svc_probability` `svm.cpp:2147-2150` — NOT `smo_binary`/C-SVC) → per-pair `(probA_, probB_)`, stored on the inner `FittedSVC` via `crate::svm::FittedSVC::from_nu_ovo`. `FittedNuSVC::predict_proba in nu_svm.rs` delegates to `FittedSVC::predict_proba` (the `sigmoid_predict` → `multiclass_probability` coupling is solver-agnostic, consuming only `raw_ovo` + `prob_a`/`prob_b`): binary `[P(classes[0]),P(classes[1])]`, multiclass pairwise → coupling, rows sum to 1, clamp `[1e-7,1-1e-7]`; `predict_log_proba` = `predict_proba.ln()` (`_base.py:866-894`). `probability=false` → `InvalidParameter` "predict_proba is not available when fitted with probability=False" (`_base.py:856-860`; no `NotFitted` variant by R-DEV-4 typestate). **RNG-CV value divergence (documented, NOT a gap, the SAME boundary SVC's REQ-9 carries):** libsvm seeds the CV fold permutation with `random_state` (`svm.cpp:2116-2122`), so sklearn's `probA_`/`probB_`/`predict_proba` are NON-DETERMINISTIC; ferrolearn uses a DETERMINISTIC contiguous 5-fold split, so it does NOT bit-match sklearn's VALUES — only the machinery + structural invariants + the raise contract are verified (R-CHAR-3: the asserted invariants are sklearn's DOCUMENTED contract). `class_weight`/`random_state` NOT-STARTED (deterministic solver, as for SVC). Non-test consumer: `fn fit in nu_svm.rs` consumes `self.probability` (the boundary `NuSVC`/`FittedNuSVC` types are re-exported at the crate root). Pinned by `nusvc_predict_proba_raises_when_probability_false`/`nusvc_predict_proba_binary_rows_sum_to_one`/`nusvc_predict_proba_binary_monotone_in_decision`/`nusvc_predict_log_proba_equals_log_of_proba`/`nusvc_predict_proba_multiclass_rows_sum_to_one in tests/divergence_nu_svm.rs`. |
 //! | REQ-10 (constructor params/defaults) | SHIPPED (R-DEV-7 design difference) | NuSVC: `nu` (0.5), `tol` (1e-3), `cache_size` (200), `max_iter` (0 = sklearn `-1`), `decision_function_shape` (Ovr), `break_ties` (false); NuSVR: `nu` (0.5), **`c` (1.0)**, `tol`, `cache_size` (200), `max_iter` (0), NO `epsilon`. `kernel`/`degree`/`gamma`/`coef0` are the type parameter `K` (R-DEV-7, as for SVC); NuSVC now carries `probability` (default `false`, REQ-9 SHIPPED); `class_weight`/`random_state` unused (deterministic solver). |
 //! | REQ-11 (ferray substrate) | NOT-STARTED | open #655. `nu_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE; consistent with svm.rs REQ-10 #643). |
+//! | REQ-12 (non-finite input rejected) | SHIPPED | Both fit entries reject any NaN/+/-inf BEFORE the nu solve with `FerroError::InvalidParameter`, mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)` (`_base.py:190-197`, default `force_all_finite=True`) -> `ValueError`. **`NuSVC::fit`/`NuSVR::fit in nu_svm.rs` call `crate::svm::solve_nu_svc`/`solve_nu_svr` DIRECTLY — they do NOT route through the guarded `SVC::fit`/`SVR::fit`, so each carries its OWN guard.** `NuSVC::fit` checks `X` (`y` is `Array1<usize>` labels, finite by type); `NuSVR::fit` checks `X` AND the float target `y`. ferrolearn's `Fit::fit` has no `sample_weight` argument, so the sklearn `sample_weight`-finiteness raise has no fit-entry counterpart. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the nu-SVC/nu-SVR oracle pins stay green). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X for both, NaN/inf in y for NuSVR, all raise `ValueError` (`tests/divergence_svm_nonfinite.rs::{nusvc_*,nusvr_*}`). Non-test consumer: the existing `Fit::fit` consumers + the crate-root `pub use nu_svm::{NuSVC, NuSVR, …}` re-exports. (#2269) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -254,6 +255,24 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // Reject non-finite input (NaN / +/-inf) in X BEFORE the nu-SVC solve.
+        // `NuSVC::fit` calls `crate::svm::solve_nu_svc` DIRECTLY (the genuine
+        // `Solver_NU` dual) — it does NOT route through the guarded
+        // `crate::svm::SVC::fit`, so it needs its OWN finiteness guard. Mirrors
+        // sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)`
+        // (`sklearn/svm/_base.py:190-197`, default `force_all_finite=True`) ->
+        // `ValueError("Input X contains NaN.")` / `"… contains infinity …"`. `y`
+        // is class labels (`Array1<usize>`), finite by type, so only X is
+        // checked. `.iter().any(|v| !v.is_finite())` catches NaN and +/-inf; on
+        // finite input the guard never fires (the nu-SVC fitted attributes are
+        // byte-identical).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
@@ -654,6 +673,30 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 expected: vec![n_samples],
                 actual: vec![y.len()],
                 context: "y length must match number of samples in X".into(),
+            });
+        }
+
+        // Reject non-finite input (NaN / +/-inf) in X or the float target y
+        // BEFORE the nu-SVR solve. `NuSVR::fit` calls `crate::svm::solve_nu_svr`
+        // DIRECTLY (the genuine `2l`-variable `Solver_NU` dual) — it does NOT
+        // route through the guarded `crate::svm::SVR::fit`, so it needs its OWN
+        // finiteness guard. Mirrors sklearn's `BaseLibSVM.fit` ->
+        // `_validate_data(X, y, …)` (`sklearn/svm/_base.py:190-197`, default
+        // `force_all_finite=True`) -> `ValueError("Input X contains NaN.")` /
+        // `"Input y contains NaN."` / `"… contains infinity …"`. NuSVR's `y` is
+        // float regression targets, so both X and y are checked.
+        // `.iter().any(|v| !v.is_finite())` catches NaN and +/-inf; on finite
+        // input the guard never fires (the fitted attributes are byte-identical).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

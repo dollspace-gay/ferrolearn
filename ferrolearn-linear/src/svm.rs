@@ -61,6 +61,7 @@
 //! | REQ-8 (constructor param surface + defaults) | SHIPPED | `shrinking` (`SVC`/`SVR`, default `true`, `with_shrinking`; accepted for API parity, shrinking-invariant optimum so DOES NOT alter results — R-DEV-7); `break_ties` (`SVC`, default `false`, `with_break_ties`; `fn predict in svm.rs` ovr-argmax branch for `break_ties=true`+ovr+`n_classes>2`, `InvalidParameter` for the ovo combo, `_base.py:801-814`); default alignment `cache_size=200`, `max_iter=0` (= sklearn `-1`, no iteration limit; the `smo_binary`/`smo_svr` loops treat `0` as unbounded); REQ-1's `gamma` enum (`scale`/`auto`/float); and now **`class_weight`** (`SVC`, `pub class_weight: ClassWeight<F>` default `None`, `with_class_weight`). `fn compute_class_weight in svm.rs` mirrors `sklearn.utils.compute_class_weight` as called by `BaseSVC._validate_targets` (`class_weight_ = compute_class_weight(class_weight, classes, y)`, `_base.py:740`): `None`→1.0, `Balanced`→`n_samples/(n_classes·count_c)` (`_classes.py:122-124`), `Explicit`→1.0 default overridden by map. `fn smo_binary in svm.rs` now takes per-class box bounds `(cp, cn)` (the `y=+1`/`y=-1` upper bounds) instead of a scalar `c`, applied in the WSS `in_up`/`in_low` tests, the analytic-update box clip, and the free-SV bias recovery (`0<alpha_i<C_i`); when `cp==cn` the math is identical to before (the 13 divergence pins stay green). `fn fit in svm.rs` (SVC) computes `weights = compute_class_weight(...)` ONCE over the full `y`, then per ovo pair `(ci,cj)`: `cp = C·weights[cj]`, `cn = C·weights[ci]` (libsvm `weighted_C`, `_base.py:740`). Non-test consumer: `fn fit in svm.rs` consumes `self.class_weight` (the boundary `SVC`/`FittedSVC` types are re-exported at the crate root + consumed by `nu_svm.rs`). Pinned: `test_svc_class_weight_smoke`/`test_compute_class_weight_balanced`/`test_svc_break_ties_changes_label`/`test_svc_break_ties_ovo_errors`/`test_svc_default_params in svm.rs` (live oracle on the imbalanced 8×2 set: None `dual_coef_ [[-0.5,-1,1,0.5]]`/`intercept_ [-2.0]`/`support_ [1,3,5,6]`; balanced `[[-0.8,-0.8,1.3333,0.2667]]`/`-1.6667`; `{0:1,1:5}` `support_ [1,3,4,5]`/`-2.0`; R-CHAR-3, 1e-2; None≠balanced intercept). **R-DEV-7 design difference (preserved contract, NOT a gap):** estimator-level `kernel`(string-select)/`degree`/`coef0` are the type parameter `K`, set by construction; `random_state` is unused (ferrolearn's SMO is deterministic). `class_weight` is SVC-only (sklearn SVR has no `class_weight`). |
 //! | REQ-9 (probability / predict_proba) | SHIPPED | `pub probability: bool` field on `SVC` (default `false`, `with_probability`) + `prob_a`/`prob_b`/`probability` on `FittedSVC`. The DETERMINISTIC Platt machinery is transcribed from libsvm: `fn sigmoid_train in svm.rs` (Newton iteration + prior init + target smoothing + step-halving line search, `svm.cpp:1919-2030`), `fn sigmoid_predict in svm.rs` (overflow-safe form, `svm.cpp:2032-2040`), `fn multiclass_probability in svm.rs` (Wu-Lin-Weng 2004 coupling, `svm.cpp:2043-2104`). `fn platt_cv_sigmoid in svm.rs` runs a per-ovo-pair 5-fold CV at fit time when `probability=true` (`svm.cpp:2107-2203`). `FittedSVC::predict_proba in svm.rs` builds the pairwise matrix via `sigmoid_predict` (clamped `[1e-7,1-1e-7]`, `svm.cpp:2937`) -> `multiclass_probability` -> `(n,n_classes)`; binary -> `[P(classes[0]),P(classes[1])]`; rows sum to 1. `FittedSVC::predict_log_proba` = `predict_proba.ln()` (`_base.py:866-894`). `probability=false` -> `InvalidParameter` carrying sklearn's `NotFittedError` text "predict_proba is not available when fitted with probability=False" (`_base.py:856-860`; no `NotFitted` variant by R-DEV-4 typestate). **RNG-CV boundary (documented divergence, NOT a gap):** libsvm's CV fold permutation is RNG-seeded, so sklearn's `probA_`/`probB_`/`predict_proba` are NON-DETERMINISTIC across `random_state` (`probA_` = -0.7749 at rs=0 vs -1.0541 at rs=1; the docstring admits CV-dependence). ferrolearn uses a DETERMINISTIC contiguous 5-fold split (analogous to the documented SGD shuffle boundary), so it does NOT bit-match sklearn's predict_proba VALUES — only the deterministic machinery + structural invariants + the raise contract are verified (R-CHAR-3: the asserted invariants are sklearn's DOCUMENTED contract, not copied values). Pinned by `test_svc_predict_proba_raises_when_probability_false`/`test_svc_predict_proba_binary_rows_sum_to_one`/`test_svc_predict_proba_binary_monotone_in_decision`/`test_svc_predict_log_proba_equals_log_of_proba`/`test_svc_predict_proba_multiclass_rows_sum_to_one`/`test_sigmoid_predict_overflow_safe`/`test_multiclass_probability_binary_reduces_to_pairwise in svm.rs`. Non-test consumer: `fn fit in svm.rs` (SVC) consumes `self.probability` (the boundary `SVC`/`FittedSVC` types are re-exported at the crate root + consumed by `nu_svm.rs`). |
 //! | REQ-10 (ferray substrate) | NOT-STARTED | open #643. `svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core`/`ferray::linalg` (R-SUBSTRATE). |
+//! | REQ-11 (non-finite input rejected) | SHIPPED | Both fit entries reject any NaN/+/-inf BEFORE the SMO solve with `FerroError::InvalidParameter`, mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)` (`_base.py:190-197`, default `force_all_finite=True`) -> `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` / `"… contains infinity …"`. `SVC::fit in svm.rs` checks `X` (`y` is `Array1<usize>` labels, finite by type); `SVR::fit in svm.rs` checks `X` AND the float target `y`. ferrolearn's `Fit::fit` signature has no `sample_weight` argument, so the sklearn `sample_weight`-finiteness raise has no fit-entry counterpart here. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — the 13+ SVC/SVR divergence pins stay green). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X for both, NaN/inf in y for SVR, all raise `ValueError` (`tests/divergence_svm_nonfinite.rs::{svc_*,svr_*}`). Non-test consumer: the existing `Fit::fit` consumers + the crate-root `pub use svm::{SVC, SVR, …}` re-exports. (#2269) |
 
 use std::collections::HashMap;
 
@@ -2038,6 +2039,22 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
             });
         }
 
+        // Reject non-finite input (NaN / +/-inf) in X BEFORE the SMO solve,
+        // mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, ...)`
+        // (`sklearn/svm/_base.py:190-197`) which keeps the default
+        // `force_all_finite=True` and raises `ValueError("Input X contains NaN.")`
+        // / `"... contains infinity ..."`. `y` is class labels (`Array1<usize>`),
+        // already finite by type, so only `X` needs the float finiteness check.
+        // `.iter().any(|v| !v.is_finite())` catches both NaN and +/-inf; on
+        // finite input the guard never fires, so the fitted SVC attributes
+        // (`support_`/`dual_coef_`/`intercept_`/`coef_`) are byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         // Determine unique classes.
         let mut classes: Vec<usize> = y.to_vec();
         classes.sort_unstable();
@@ -3288,6 +3305,28 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static>
                 required: 1,
                 actual: 0,
                 context: "SVR requires at least one sample".into(),
+            });
+        }
+
+        // Reject non-finite input (NaN / +/-inf) in X or the float target y
+        // BEFORE the SMO solve, mirroring sklearn's `BaseLibSVM.fit` ->
+        // `_validate_data(X, y, ...)` (`sklearn/svm/_base.py:190-197`) which keeps
+        // the default `force_all_finite=True` and raises
+        // `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` /
+        // `"... contains infinity ..."`. SVR's `y` is float regression targets,
+        // so both X and y are finiteness-checked. `.iter().any(|v|
+        // !v.is_finite())` catches NaN and +/-inf; on finite input the guard
+        // never fires, so the fitted SVR attributes are byte-identical.
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
             });
         }
 

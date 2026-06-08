@@ -52,6 +52,7 @@
 //! | REQ-5 (predict +1/-1) | SHIPPED | `fn predict in one_class_svm.rs` returns `+1` (inlier) / `-1` (outlier); labels match the live oracle `[-1,1,-1,-1,1,1,1]` (pinned by `divergence_pin3_predict_labels_648 in tests/divergence_one_class_svm.rs`, R-CHAR-3). The boundary uses a `|rho|`-relative slack so on-margin points (`decision≈0` modulo float roundoff) take libsvm's observable label (`+1`), reproducing the oracle (R-DEV-3 observable contract); libsvm's exact `(sum>0)?+1:-1` (`svm.cpp:2837-2838`) differs only at a genuine `decision==0` (measure-zero / degenerate edge). |
 //! | REQ-6 (constructor params/defaults) | SHIPPED | `OneClassSVM::new` now mirrors sklearn's exact param surface defaults (`_classes.py:1712-1721`, live `inspect.signature`): `nu=0.5`, `tol=1e-3`, `cache_size=200` (was `1024`; accepted for parity, no kernel cache in this module), `max_iter=0` (was `10000`) = sklearn `max_iter=-1` ("no iteration limit"), and a new `pub shrinking: bool` field (default `true`) + `#[must_use] with_shrinking` — accepted for API parity, shrinking-invariant one-class optimum so DOES NOT alter the fit (no shrinking heuristic, R-DEV-7), mirroring `svm.rs`'s `SVC`/`SVR`. `fn fit`'s SMO loop treats `max_iter == 0` as unbounded (run to convergence) via the sentinel guard `if self.max_iter != 0 && iter >= self.max_iter { break; }` (same as `svm.rs`'s `smo_binary`/`smo_svr`); the KKT-gap break (`i_max_grad - j_min_grad < tol`) terminates the default-0 fit. R-DEV-7 design difference (preserved contract, NOT a gap): estimator-level `kernel`(string)/`degree`/`coef0` are the type parameter `K` set by construction, `gamma` resolution is REQ-2; `verbose`/`random_state` are unused (deterministic SMO). Pinned by `test_one_class_svm_default_params` (asserts `nu==0.5`, `tol==1e-3`, `max_iter==0`, `cache_size==200`, `shrinking==true` against the live `OneClassSVM.__init__` signature, R-DEV-2) + `test_one_class_svm_default_max_iter_converges` (default-0 fit converges, no infinite loop) + `test_one_class_svm_builder_pattern` (`with_shrinking`) in `one_class_svm.rs`. The 6 divergence pins use explicit `with_max_iter(1_000_000)` and stay green. |
 //! | REQ-7 (ferray substrate) | NOT-STARTED | open prereq blocker #652. `one_class_svm.rs` imports `ndarray::{Array1, Array2, ScalarOperand}`, not `ferray-core` (R-SUBSTRATE). |
+//! | REQ-8 (non-finite input rejected) | SHIPPED | `fn fit in one_class_svm.rs` rejects any NaN/+/-inf in X BEFORE the one-class SMO solve with `FerroError::InvalidParameter`, mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)` (`_base.py:190-197`, default `force_all_finite=True`) -> `ValueError("Input X contains NaN.")` / `"… contains infinity …"`. OneClassSVM is unsupervised (`Fit<Array2<F>, ()>`, X only — sklearn's `OneClassSVM.fit(X)` passes a synthetic all-ones `y`), so only X is checked; ferrolearn's `Fit::fit` has no `sample_weight` argument. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the 6 one-class divergence pins stay green). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X all raise `ValueError` (`tests/divergence_svm_nonfinite.rs::ocs_*`). Non-test consumer: the existing `Fit::fit` consumer + the crate-root `pub use one_class_svm::{OneClassSVM, …}` re-export. (#2269) |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict};
@@ -206,6 +207,23 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static, K: Kernel<F> + 'static> F
                 required: 1,
                 actual: 0,
                 context: "OneClassSVM requires at least one sample".into(),
+            });
+        }
+
+        // Reject non-finite input (NaN / +/-inf) in X BEFORE the one-class SMO
+        // solve, mirroring sklearn's `BaseLibSVM.fit` -> `_validate_data(X, y, …)`
+        // (`sklearn/svm/_base.py:190-197`, default `force_all_finite=True`) ->
+        // `ValueError("Input X contains NaN.")` / `"… contains infinity …"`.
+        // OneClassSVM is unsupervised (`Fit<Array2<F>, ()>`, X only — sklearn's
+        // `OneClassSVM.fit(X)` passes a synthetic all-ones `y`), so only X is
+        // finiteness-checked; ferrolearn's `Fit::fit` has no `sample_weight`
+        // argument. `.iter().any(|v| !v.is_finite())` catches both NaN and
+        // +/-inf; on finite input the guard never fires (the fitted
+        // `support_`/`dual_coef_`/`intercept_`/`offset_` are byte-identical).
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
             });
         }
 
