@@ -209,8 +209,9 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
     ///
     /// - [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers of
     ///   samples.
-    /// - [`FerroError::InvalidParameter`] if `alphas` is empty or contains a
-    ///   negative value.
+    /// - [`FerroError::InvalidParameter`] if `x` contains a non-finite value
+    ///   (NaN/±Inf), or if `alphas` is empty or contains a non-positive value
+    ///   (`alpha <= 0`; the GCV path is undefined at `alpha = 0`).
     /// - [`FerroError::InsufficientSamples`] if there are no samples or fewer
     ///   than two distinct classes.
     fn fit(
@@ -228,6 +229,22 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             });
         }
 
+        // sklearn `RidgeClassifierCV.fit` -> `_BaseRidge._prepare_data` calls
+        // `self._validate_data(X, y, ..., force_all_finite=True[default])`
+        // (`_ridge.py:1291`), so any NaN/+/-inf in X raises a `ValueError`
+        // BEFORE any decomposition. Fire this up front so BOTH the wide/eigen
+        // (`n_samples <= n_features`, today `Ok(NaN)`) and the SVD
+        // (`n_samples > n_features`, today an incidental linalg-convergence
+        // error) paths get the same clean validation rejection. `y` is class
+        // labels (`usize`, always finite by type), so only X is checked —
+        // mirroring the sibling pattern in `multi_task_lasso.rs`. (#2246)
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+
         if self.alphas.is_empty() {
             return Err(FerroError::InvalidParameter {
                 name: "alphas".into(),
@@ -239,10 +256,18 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'sta
             // `<F as num_traits::Zero>::zero()`: the `LinalgFloat` bound pulls
             // `ferray::Element` (also defining `zero`) into scope, making a bare
             // `F::zero()` ambiguous. Disambiguate to `num_traits::Zero`.
-            if a < <F as num_traits::Zero>::zero() {
+            //
+            // Strictly positive (`a <= 0` rejected, not just `a < 0`): on the
+            // GCV path (ferrolearn's only path, `cv is None`) sklearn validates
+            // each alpha with `Interval(Real, 0, None, closed="neither")`
+            // (`_ridge.py:2259`) / `include_boundaries="neither"`
+            // (`_ridge.py:2354-2360`), raising `ValueError("alphas[i] == 0.0,
+            // must be > 0.0")` because "_RidgeGCV does not work for alpha = 0"
+            // (`_ridge.py:2354`). (#2247)
+            if a <= <F as num_traits::Zero>::zero() {
                 return Err(FerroError::InvalidParameter {
                     name: "alphas".into(),
-                    reason: "all alpha values must be non-negative".into(),
+                    reason: "alphas must be > 0.0".into(),
                 });
             }
         }

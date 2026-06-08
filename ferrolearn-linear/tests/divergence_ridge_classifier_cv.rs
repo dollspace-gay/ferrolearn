@@ -11,7 +11,7 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
 use ferrolearn_linear::RidgeClassifierCV;
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Divergence: `RidgeClassifierCV::fit` accepts non-finite `X` on the
 /// eigen/wide path (`n_samples <= n_features`) and returns `Ok(_)` with NaN
@@ -38,12 +38,24 @@ use ndarray::{array, Array2};
 ///
 /// Tracking: #2246
 #[test]
-#[ignore = "divergence: RidgeClassifierCV accepts non-finite X (eigen path Ok(NaN)) vs sklearn ValueError; tracking #2246"]
 fn divergence_nonfinite_x_wide_eigen_accepts_nan() {
     // n_samples (3) <= n_features (4) → eigen/wide GCV path.
     let x = Array2::from_shape_vec(
         (3, 4),
-        vec![1.0, 2.0, 3.0, f64::INFINITY, 2.0, 1.0, 0.0, 1.0, 3.0, 1.0, 1.0, 2.0],
+        vec![
+            1.0,
+            2.0,
+            3.0,
+            f64::INFINITY,
+            2.0,
+            1.0,
+            0.0,
+            1.0,
+            3.0,
+            1.0,
+            1.0,
+            2.0,
+        ],
     )
     .unwrap();
     let y = array![0usize, 0, 1];
@@ -83,12 +95,24 @@ fn divergence_nonfinite_x_wide_eigen_accepts_nan() {
 ///
 /// Tracking: #2246
 #[test]
-#[ignore = "divergence: RidgeClassifierCV non-finite X surfaces incidental SVD error, not clean validation; tracking #2246"]
 fn divergence_nonfinite_x_svd_incidental_error() {
     // n_samples (6) > n_features (2) → SVD GCV path.
     let x = Array2::from_shape_vec(
         (6, 2),
-        vec![1.0, 2.0, 2.0, 1.0, 3.0, 1.0, 1.0, f64::NAN, 6.0, 5.0, 5.0, 6.0],
+        vec![
+            1.0,
+            2.0,
+            2.0,
+            1.0,
+            3.0,
+            1.0,
+            1.0,
+            f64::NAN,
+            6.0,
+            5.0,
+            5.0,
+            6.0,
+        ],
     )
     .unwrap();
     let y = array![0usize, 0, 0, 0, 1, 1];
@@ -134,7 +158,6 @@ fn divergence_nonfinite_x_svd_incidental_error() {
 ///
 /// Tracking: #2247
 #[test]
-#[ignore = "divergence: RidgeClassifierCV accepts alphas=0.0 vs sklearn ValueError (must be > 0.0); tracking #2247"]
 fn divergence_alphas_zero_accepted() {
     let x = Array2::from_shape_vec(
         (8, 2),
