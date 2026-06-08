@@ -1203,3 +1203,408 @@ fn drop_none_default_transform_unchanged_vs_sklearn_oracle() {
         .unwrap();
     assert_eq!(recovered, x, "drop=None inverse roundtrip unchanged");
 }
+
+// ===========================================================================
+// REQ-5b: infrequent grouping (min_frequency / max_categories)
+//
+// R-CHAR-3: every expected value below is the output of a LIVE sklearn 1.5.2
+// `OneHotEncoder(sparse_output=False, min_frequency=/max_categories=)` call,
+// quoted inline as the `python3 -c` command that produced it. Sparse default is
+// not used (we ship dense).
+// ===========================================================================
+
+/// Build a single-column `Array2<f64>` from `(value, count)` pairs (the rows are
+/// `value` repeated `count` times, concatenated in order).
+fn col_from_counts(pairs: &[(f64, usize)]) -> Array2<f64> {
+    let mut rows: Vec<f64> = Vec::new();
+    for &(v, c) in pairs {
+        for _ in 0..c {
+            rows.push(v);
+        }
+    }
+    let n = rows.len();
+    Array2::from_shape_vec((n, 1), rows).unwrap()
+}
+
+/// `min_frequency=2` headline (the dispatch fixture).
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*5+[[3.]]*1+[[4.]]*1; \
+///   e=OneHotEncoder(sparse_output=False, min_frequency=2).fit(X); \
+///   print([c.tolist() for c in e.categories_]); \
+///   print([c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.],[4.]]).tolist()); \
+///   print(list(e.get_feature_names_out()))"
+///   -> [[1.0, 2.0, 3.0, 4.0]]
+///      [[3.0, 4.0]]
+///      [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]
+///      ['x0_1.0', 'x0_2.0', 'x0_infrequent_sklearn']
+/// ```
+#[test]
+fn infrequent_min_frequency_basic_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 5), (3.0, 1), (4.0, 1)]);
+    let enc = OneHotEncoder::<f64>::new().with_min_frequency(2);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // categories_ keeps ALL categories (the infrequent ones are still present).
+    assert_eq!(fitted.categories(), &[vec![1.0, 2.0, 3.0, 4.0]]);
+    // infrequent_categories_ == [[3.0, 4.0]].
+    assert_eq!(fitted.infrequent_categories(), vec![vec![3.0, 4.0]]);
+    // n_output == 3 (2 frequent + 1 trailing infrequent column).
+    assert_eq!(fitted.n_output_features(), 3);
+
+    let probe = array![[1.0_f64], [2.0], [3.0], [4.0]];
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0], // 3.0 -> trailing infrequent col
+        [0.0, 0.0, 1.0], // 4.0 -> trailing infrequent col
+    ];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        vec!["x0_1.0", "x0_2.0", "x0_infrequent_sklearn"]
+    );
+}
+
+/// `max_categories=3` with distinct counts `{1:5,2:4,3:3,4:1}`.
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*4+[[3.]]*3+[[4.]]*1; \
+///   e=OneHotEncoder(sparse_output=False, max_categories=3).fit(X); \
+///   print([c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.],[4.]]).tolist())"
+///   -> [[3.0, 4.0]]
+///      [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]
+/// ```
+#[test]
+fn infrequent_max_categories_topk_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 4), (3.0, 3), (4.0, 1)]);
+    let enc = OneHotEncoder::<f64>::new().with_max_categories(3);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.infrequent_categories(), vec![vec![3.0, 4.0]]);
+    assert_eq!(fitted.n_output_features(), 3);
+
+    let probe = array![[1.0_f64], [2.0], [3.0], [4.0]];
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+}
+
+/// `max_categories=3` TIE-BREAK: all four categories share count 3.
+///
+/// sklearn's stable argsort keeps the LARGER category indices frequent, so the
+/// SMALLER ones (1.0, 2.0) become infrequent.
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*3+[[2.]]*3+[[3.]]*3+[[4.]]*3; \
+///   e=OneHotEncoder(sparse_output=False, max_categories=3).fit(X); \
+///   print([c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.],[4.]]).tolist())"
+///   -> [[1.0, 2.0]]
+///      [[0.0,0.0,1.0],[0.0,0.0,1.0],[1.0,0.0,0.0],[0.0,1.0,0.0]]
+/// ```
+#[test]
+fn infrequent_max_categories_tiebreak_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 3), (2.0, 3), (3.0, 3), (4.0, 3)]);
+    let enc = OneHotEncoder::<f64>::new().with_max_categories(3);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.infrequent_categories(), vec![vec![1.0, 2.0]]);
+
+    let probe = array![[1.0_f64], [2.0], [3.0], [4.0]];
+    let expected: Array2<f64> = array![
+        [0.0, 0.0, 1.0], // 1.0 infrequent -> trailing col
+        [0.0, 0.0, 1.0], // 2.0 infrequent -> trailing col
+        [1.0, 0.0, 0.0], // 3.0 frequent -> slot 0
+        [0.0, 1.0, 0.0], // 4.0 frequent -> slot 1
+    ];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+}
+
+/// BOTH `min_frequency=2` AND `max_categories=3` set, counts
+/// `{1:5,2:4,3:3,4:2,5:1}`. min_frequency removes only `5` (count 1); then
+/// max_categories trims the survivors to the top 2 frequent `{1,2}`, grouping
+/// `{3,4,5}` infrequent.
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*4+[[3.]]*3+[[4.]]*2+[[5.]]*1; \
+///   e=OneHotEncoder(sparse_output=False, min_frequency=2, max_categories=3).fit(X); \
+///   print([c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.],[4.],[5.]]).tolist()); \
+///   print(list(e.get_feature_names_out()))"
+///   -> [[3.0, 4.0, 5.0]]
+///      [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0],[0.0,0.0,1.0],[0.0,0.0,1.0]]
+///      ['x0_1.0', 'x0_2.0', 'x0_infrequent_sklearn']
+/// ```
+#[test]
+fn infrequent_both_thresholds_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 4), (3.0, 3), (4.0, 2), (5.0, 1)]);
+    let enc = OneHotEncoder::<f64>::new()
+        .with_min_frequency(2)
+        .with_max_categories(3);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.infrequent_categories(), vec![vec![3.0, 4.0, 5.0]]);
+
+    let probe = array![[1.0_f64], [2.0], [3.0], [4.0], [5.0]];
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+    ];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        vec!["x0_1.0", "x0_2.0", "x0_infrequent_sklearn"]
+    );
+}
+
+/// Multi-feature: only col0 has infrequent categories; col1 (counts `{10:6,20:5}`)
+/// has none. The offsets must place col1's block right after col0's 3-wide block.
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.,10.]]*5+[[2.,20.]]*5+[[3.,10.]]*1; \
+///   e=OneHotEncoder(sparse_output=False, min_frequency=2).fit(X); \
+///   print([None if c is None else c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.,10.],[2.,20.],[3.,10.]]).tolist()); \
+///   print(list(e.get_feature_names_out()))"
+///   -> [[3.0], None]
+///      [[1.0,0.0,0.0,1.0,0.0],[0.0,1.0,0.0,0.0,1.0],[0.0,0.0,1.0,1.0,0.0]]
+///      ['x0_1.0','x0_2.0','x0_infrequent_sklearn','x1_10.0','x1_20.0']
+/// ```
+#[test]
+fn infrequent_multifeature_offsets_vs_sklearn_oracle() {
+    // col0: 1.0 x5, 2.0 x5, 3.0 x1 (3.0 infrequent). col1: 10.0 x6, 20.0 x5.
+    let mut rows: Vec<[f64; 2]> = Vec::new();
+    for _ in 0..5 {
+        rows.push([1.0, 10.0]);
+    }
+    for _ in 0..5 {
+        rows.push([2.0, 20.0]);
+    }
+    rows.push([3.0, 10.0]);
+    let flat: Vec<f64> = rows.iter().flatten().copied().collect();
+    let x = Array2::from_shape_vec((rows.len(), 2), flat).unwrap();
+
+    let enc = OneHotEncoder::<f64>::new().with_min_frequency(2);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // col0 has [3.0] infrequent; col1 has none (empty).
+    assert_eq!(fitted.infrequent_categories(), vec![vec![3.0], vec![]]);
+    assert_eq!(fitted.n_output_features(), 5); // (2 freq + 1 infreq) + 2
+
+    let probe = array![[1.0_f64, 10.0], [2.0, 20.0], [3.0, 10.0]];
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0, 0.0], // 3.0 -> col0 infrequent, 10.0 -> col1 slot 0
+    ];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        vec![
+            "x0_1.0",
+            "x0_2.0",
+            "x0_infrequent_sklearn",
+            "x1_10.0",
+            "x1_20.0"
+        ]
+    );
+}
+
+/// A feature whose categories are all above threshold has NO infrequent column;
+/// the block is the plain full one-hot (REQ-3 layout unchanged).
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*5+[[3.]]*5; \
+///   e=OneHotEncoder(sparse_output=False, min_frequency=2).fit(X); \
+///   print([None if c is None else c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.]]).tolist()); \
+///   print(list(e.get_feature_names_out()))"
+///   -> [None]
+///      [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
+///      ['x0_1.0', 'x0_2.0', 'x0_3.0']
+/// ```
+#[test]
+fn infrequent_no_infrequent_full_block_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 5), (3.0, 5)]);
+    let enc = OneHotEncoder::<f64>::new().with_min_frequency(2);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // No infrequent categories: empty list (sklearn's None).
+    assert_eq!(fitted.infrequent_categories(), vec![Vec::<f64>::new()]);
+    assert_eq!(fitted.n_output_features(), 3); // no extra infrequent column
+
+    let probe = array![[1.0_f64], [2.0], [3.0]];
+    let expected: Array2<f64> = array![[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        vec!["x0_1.0", "x0_2.0", "x0_3.0"]
+    );
+}
+
+/// inverse_transform: a frequent column inverts to its category; the trailing
+/// infrequent column inverts to `NaN` (DOCUMENTED divergence — sklearn returns
+/// the string `'infrequent_sklearn'` which `Array2<f64>` cannot hold).
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*5+[[3.]]*1+[[4.]]*1; \
+///   e=OneHotEncoder(sparse_output=False, min_frequency=2).fit(X); \
+///   print(e.inverse_transform([[0.,0.,1.]]).tolist()); \
+///   print(e.inverse_transform([[1.,0.,0.],[0.,1.,0.]]).tolist())"
+///   -> [['infrequent_sklearn']]   (we map -> NaN)
+///      [[1.0], [2.0]]
+/// ```
+#[test]
+fn infrequent_inverse_trailing_col_is_nan_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 5), (3.0, 1), (4.0, 1)]);
+    let enc = OneHotEncoder::<f64>::new().with_min_frequency(2);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    // The infrequent column -> NaN (sklearn 'infrequent_sklearn'; not
+    // representable in Array2<f64>).
+    let inv_infreq = fitted
+        .inverse_transform(&array![[0.0_f64, 0.0, 1.0]])
+        .unwrap();
+    assert!(
+        inv_infreq[[0, 0]].is_nan(),
+        "infrequent column inverts to NaN (sklearn 'infrequent_sklearn')"
+    );
+
+    // Frequent columns invert to their category values.
+    let inv_freq = fitted
+        .inverse_transform(&array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        .unwrap();
+    assert_eq!(inv_freq, array![[1.0_f64], [2.0]]);
+
+    // Roundtrip: transform [1,3,4,2] then invert -> [1, NaN, NaN, 2]
+    // (3.0 and 4.0 are infrequent -> NaN).
+    // sklearn: inverse_transform(transform([[1.],[3.],[4.],[2.]]))
+    //   -> [1.0, 'infrequent_sklearn', 'infrequent_sklearn', 2.0]
+    let probe = array![[1.0_f64], [3.0], [4.0], [2.0]];
+    let recovered = fitted
+        .inverse_transform(&fitted.transform(&probe).unwrap())
+        .unwrap();
+    assert_eq!(recovered[[0, 0]], 1.0);
+    assert!(recovered[[1, 0]].is_nan());
+    assert!(recovered[[2, 0]].is_nan());
+    assert_eq!(recovered[[3, 0]], 2.0);
+}
+
+/// `min_frequency` (or `max_categories`) combined with `drop` is a DEFERRED
+/// interaction (REQ-5a × REQ-5b): `fit` returns an error (sklearn allows it).
+#[test]
+fn infrequent_with_drop_is_rejected() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 5), (3.0, 1)]);
+    let enc = OneHotEncoder::<f64>::new()
+        .with_min_frequency(2)
+        .with_drop(OneHotDrop::First);
+    let err = enc.fit(&x, &());
+    assert!(
+        err.is_err(),
+        "infrequent grouping + drop must be rejected (deferred interaction)"
+    );
+
+    let enc2 = OneHotEncoder::<f64>::new()
+        .with_max_categories(2)
+        .with_drop(OneHotDrop::IfBinary);
+    assert!(
+        enc2.fit(&x, &()).is_err(),
+        "max_categories + drop=if_binary also rejected"
+    );
+}
+
+/// Defaults (no min_frequency, no max_categories) leave REQ-3/4/5a unchanged.
+///
+/// Live oracle (sklearn 1.5.2, default — no infrequent params):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[2.,0.],[5.,1.],[9.,0.],[5.,1.]]; \
+///   e=OneHotEncoder(sparse_output=False).fit(X); print(e.transform(X).tolist())"
+///   -> [[1.0,0.0,0.0,1.0,0.0],[0.0,1.0,0.0,0.0,1.0],
+///       [0.0,0.0,1.0,1.0,0.0],[0.0,1.0,0.0,0.0,1.0]]
+/// ```
+#[test]
+fn infrequent_disabled_default_unchanged_vs_sklearn_oracle() {
+    let enc = OneHotEncoder::<f64>::new();
+    assert_eq!(enc.min_frequency(), None);
+    assert_eq!(enc.max_categories(), None);
+
+    let x = array![[2.0_f64, 0.0], [5.0, 1.0], [9.0, 0.0], [5.0, 1.0]];
+    let fitted = enc.fit(&x, &()).unwrap();
+    // Every feature has an EMPTY infrequent list (grouping disabled).
+    assert_eq!(
+        fitted.infrequent_categories(),
+        vec![Vec::<f64>::new(), Vec::<f64>::new()]
+    );
+    let expected: Array2<f64> = array![
+        [1.0, 0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 1.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0, 1.0],
+    ];
+    assert_eq!(fitted.transform(&x).unwrap(), expected);
+    // Inverse roundtrip unchanged.
+    assert_eq!(
+        fitted
+            .inverse_transform(&fitted.transform(&x).unwrap())
+            .unwrap(),
+        x
+    );
+}
+
+/// `max_categories=1` groups EVERY category into the single infrequent column.
+///
+/// Live oracle (sklearn 1.5.2):
+/// ```text
+/// python3 -c "from sklearn.preprocessing import OneHotEncoder; \
+///   X=[[1.]]*5+[[2.]]*4+[[3.]]*3; \
+///   e=OneHotEncoder(sparse_output=False, max_categories=1).fit(X); \
+///   print([c.tolist() for c in e.infrequent_categories_]); \
+///   print(e.transform([[1.],[2.],[3.]]).tolist()); \
+///   print(list(e.get_feature_names_out()))"
+///   -> [[1.0, 2.0, 3.0]]
+///      [[1.0],[1.0],[1.0]]
+///      ['x0_infrequent_sklearn']
+/// ```
+#[test]
+fn infrequent_max_categories_one_all_infrequent_vs_sklearn_oracle() {
+    let x = col_from_counts(&[(1.0, 5), (2.0, 4), (3.0, 3)]);
+    let enc = OneHotEncoder::<f64>::new().with_max_categories(1);
+    let fitted = enc.fit(&x, &()).unwrap();
+
+    assert_eq!(fitted.infrequent_categories(), vec![vec![1.0, 2.0, 3.0]]);
+    assert_eq!(fitted.n_output_features(), 1);
+
+    let probe = array![[1.0_f64], [2.0], [3.0]];
+    let expected: Array2<f64> = array![[1.0], [1.0], [1.0]];
+    assert_eq!(fitted.transform(&probe).unwrap(), expected);
+    assert_eq!(
+        fitted.get_feature_names_out(),
+        vec!["x0_infrequent_sklearn"]
+    );
+}

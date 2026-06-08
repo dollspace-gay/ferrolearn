@@ -37,7 +37,7 @@
 //! | REQ-3 (categories_ = sorted unique set) | SHIPPED | `Fit::fit` computes `categories_[j]` = per-column values sorted via `partial_cmp` then exact-equality deduped to the sorted-unique set (`_BaseEncoder._fit:99` `categories_=_unique(Xi)`); precomputes `offsets` (prefix sums of `categories_[j].len()`) + `n_output`; rejects 0 rows (`InsufficientSamples`). `categories()` accessor exposes the learned sets. Transform is membership-based (value's index in `categories_[j]`), so non-contiguous integers (`[2,5,9]` → 3 columns, NOT 10) and arbitrary finite floats encode correctly — bit-exact to live sklearn 1.5.2 `sparse_output=False`: `categories_`/`transform`/non-contiguous-headline/offsets guards in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export `lib.rs`. SCOPE: numeric `F` input; exact float equality for membership (np.unique semantics — documented); NaN-as-a-category is HANDLED (#2223): NaN sorts LAST + collapses to one category (sklearn `_encode.py:70-74`), a NaN row one-hots its column; +/-inf is REJECTED at `fit`/`transform` (#2225, `force_all_finite="allow-nan"` allows NaN but not inf); string/object input is REQ-3-string (NOT-STARTED, no String path). |
 //! | REQ-4 (handle_unknown {'error','ignore'}) | SHIPPED | `OneHotHandleUnknown` enum `{ Error (#[default]), Ignore }` (mirrors sklearn's `handle_unknown` `_parameter_constraints` `StrOptions({"error","ignore","infrequent_if_exist"})` default `"error"`, `_encoders.py:732,750`) + `OneHotEncoder::with_handle_unknown`/`handle_unknown()` builder+getter, threaded into `FittedOneHotEncoder` (`handle_unknown` field + getter) by `Fit::fit` (handle_unknown affects ONLY transform; `categories_` learned identically). `Transform::transform` unknown branch (`cats.iter().position(...) == None`): `Error` → `InvalidParameter` "Found unknown categories … during transform" (the SHIPPED REQ-2 default `ValueError`, `_encoders.py:209-214`, UNCHANGED); `Ignore` → `continue` leaving that feature's one-hot block ALL-ZERO (`_encoders.py:215-240`: unknown row masked out, no encoded column set), every KNOWN feature still one-hots. The +/-inf rejection (#2225), ncols + 0-row guards UNCHANGED (inf is invalid input, not an "unknown category" — still errors in `Ignore`; NaN with NO nan-category is "unknown" → all-zero block in `Ignore`, with a nan-category one-hots it). Never panics (R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`): `ignore_multifeature_all_zero_block` (`[[100,0],[5,99]]→[[0,0,0,1,0],[0,1,0,0,0]]`), `ignore_fully_unknown_row_all_zero`, `ignore_known_row_normal_one_hot`, `error_default_unknown_rejected`, `with_handle_unknown_ignore_known_value_normal`, `ignore_inf_still_rejected`, `ignore_nan_no_category_all_zero`, `ignore_nan_with_category_one_hots`, `handle_unknown_default_and_builder_abi` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs` (`OneHotHandleUnknown`). R-DEV-2. STILL NOT-STARTED: `'infrequent_if_exist'` (REQ-5). |
 //! | REQ-5a (`drop` {None,'first','if_binary'}) | SHIPPED | #1152: `OneHotDrop` enum `{ None_ (#[default]), First, IfBinary }` (mirrors sklearn `drop` `_parameter_constraints` `StrOptions({"first","if_binary"})` / `None`, `_encoders.py:730`,`:498-516`) + `OneHotEncoder::with_drop`/`drop()` builder+getter, threaded into `Fit::fit` which computes `drop_idx_: Vec<Option<usize>>` (sklearn `_compute_drop_idx`, `_encoders.py:812-831`: `None_`→all `None`; `First`→all `Some(0)` (empty feature `None`); `IfBinary`→`Some(0)` iff `len==2` else `None`) and recomputes `offsets`/`n_output` from the per-feature BLOCK WIDTH `len - (drop_idx is Some)`. `FittedOneHotEncoder::drop_idx_()` accessor exposes it. `Transform::transform` (`_encoders.py:1033-1046`): the dropped category emits an ALL-ZERO block; a kept category at membership index `idx` maps to output col `offset + (idx if idx<d else idx-1)` (the `X_int > to_drop` decrement). `inverse_transform` (`_encoders.py:1124-1172`): an all-zero block with `drop_idx_[j]==Some(d)` inverts to the DROPPED category `categories_[j][d]` in BOTH handle_unknown modes (sklearn checks `_drop_idx_after_grouping[i] is not None` FIRST, bypassing the all-zeros error / None paths); a 0-width fully-dropped feature fills the dropped category (`:1132-1135`); a kept block position `pos>=d` maps to category `pos+1`. `get_feature_names_out` OMITS the dropped category (`_compute_transformed_categories` `remove_dropped=True`, `:909`,`:1209-1212`). DROP+IGNORE interaction (verified LIVE, sklearn 1.5.2): `drop` + `handle_unknown='ignore'` is ALLOWED (does NOT raise at fit; warns on unknown at transform, encoding the unknown as an all-zero block == the dropped category) — ferrolearn matches (fit imposes no constraint). NEVER panics: every drop-shift index uses `get`/bounds-checked arithmetic (R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`, `drop=...`): `drop_first_*`, `drop_if_binary_*`, `drop_inverse_roundtrip_*`, `drop_single_category_fully_dropped_*`, `drop_shift_3cat_*`, `drop_plus_ignore_allowed_*`, `drop_idx_abi_*`, `drop_none_unchanged_*` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs` (`OneHotDrop`). R-DEV-2. |
-//! | REQ-5b (infrequent grouping `min_frequency`/`max_categories`) | NOT-STARTED | open prereq blocker #1152. `min_frequency`/`max_categories` (`:566-587`) infrequent-category grouping + `'infrequent_if_exist'` + the array-of-explicit-categories `drop` form (`:515-516`,`:833-880`) are unimplemented. |
+//! | REQ-5b (infrequent grouping `min_frequency`/`max_categories`) | SHIPPED | #1152: `OneHotEncoder::with_min_frequency`/`with_max_categories` (+`min_frequency()`/`max_categories()` getters) add the integer-count infrequent thresholds (`_encoders.py:566-587`,`:733-738`). `Fit::fit` computes per-category training counts (the run-length over the sorted column) and, when `infrequent_enabled`, calls `identify_infrequent` (mirrors `_BaseEncoder._identify_infrequent`, `_encoders.py:275-318`: min_frequency `count < min_freq` FIRST, then max_categories on the survivors via a STABLE argsort over the full count array keeping the top `max_categories-1` — ties favor the LARGER index; `max_categories==1` → all infrequent) + `build_infrequent_map` (mirrors `_default_to_infrequent_mappings`, `:373-400`: frequent → its remapped slot `0..n_frequent`, infrequent → the trailing slot). `FittedOneHotEncoder` carries `infrequent_indices_` + the per-feature `infrequent_map`; `block_width` becomes `n_frequent + 1` (sklearn `_compute_n_features_outs`, `:948-953`); `offsets`/`n_output` recomputed from it. `infrequent_categories()` exposes the infrequent VALUES per feature (`infrequent_categories_`, `:254-262`,`:625-633`). `Transform::transform` routes a found category through `infrequent_map[j][idx]` (frequent → own col, infrequent → trailing col; `_map_infrequent_categories`, `:442-452`). `inverse_transform` maps the trailing infrequent column to `F::nan()` (DOCUMENTED SCOPE, R-HONEST-3: `Array2<F>` cannot hold sklearn's `'infrequent_sklearn'` string, `:1675-1677`, like the ignore-None NaN proxy #2227), frequent cols → their category. `get_feature_names_out` emits the frequent names + a trailing `"x{j}_infrequent_sklearn"` (`_compute_transformed_categories`, `:913-921`). Infrequent grouping REQUIRES `drop==None_` — combining it errors `InvalidParameter` (REQ-5a×5b interaction DEFERRED; sklearn allows it). Never panics (every remap bounds-checked, R-CODE-2). Live-oracle parity (sklearn 1.5.2 `sparse_output=False`): `infrequent_min_frequency_*`, `infrequent_max_categories_*`, `infrequent_max_categories_tiebreak`, `infrequent_both_*`, `infrequent_inverse_*`, `infrequent_feature_names_*`, `infrequent_multifeature_offsets`, `infrequent_no_infrequent_*`, `infrequent_drop_rejected`, `infrequent_disabled_unchanged` (`tests/divergence_one_hot_encoder.rs`). Consumer: crate re-export `lib.rs`. STILL NOT-STARTED: the FLOAT-fraction `min_frequency` (`:573-575`,`:297-299`), `drop`+infrequent (`:518-520`,`:818-902`), and `'infrequent_if_exist'` (`:550-560`) stay unimplemented. |
 //! | REQ-6 (inverse_transform + get_feature_names_out) | SHIPPED | `FittedOneHotEncoder::inverse_transform` reduces each per-feature block `x[:, offsets[j]..offsets[j]+len(categories_[j])]` via **argmax** (numpy first-max-on-ties) to `categories_[j][argmax]`, then handles an ALL-ZERO block (`block_sum == 0`) per `handle_unknown` (sklearn `_encoders.py:1141`,`:1159-1168`): `Error` -> `InvalidParameter` ("Samples can not be inverted ... all zeros"); `Ignore` -> the unknown-category sentinel inverts to `None` in sklearn (`:1183`), represented here as `NaN` (Array2<F> cannot hold None, #2227) with the KNOWN feature blocks still recovered; 0-row → `InsufficientSamples`, `ncols != n_output` → `ShapeMismatch` (`:1100-1104`). Never panics (block slices bounds-checked, R-CODE-2). `FittedOneHotEncoder::get_feature_names_out` emits `format!("x{j}_{cat}")` over `categories_` with default `input_features=["x0",..]` + the `"concat"` combiner (`feature+"_"+str(category)`, `:1217,1224`) → `["x0_2.0","x0_5.0","x0_9.0","x1_0.0","x1_1.0"]`; the float label via `category_label` appends `.0` to whole-valued floats (Python `str(np.float64)`: `2.0`/`-3.0`/`2.5`), `NaN→"nan"`. Live-oracle parity (roundtrip incl. non-contiguous `{2,5,9}`, held-out `[[0,1,0,1,0]]→[[5,0]]`, all-zero/ncols/0-row errors, feature names whole+fractional+negative) in `tests/divergence_one_hot_encoder.rs`. Consumer: crate re-export (`lib.rs:141`). DOCUMENTED DIVERGENCE (R-HONEST-3): the float label uses Rust `Display` for non-whole values, so it diverges from Python's scientific notation at `|v|>=1e16` / `0<|v|<1e-4` (`1e+20`/`1e-07` vs full decimal) — not a plausible category. STILL NOT-STARTED within REQ-6: the `input_features=`/`feature_name_combiner=` params (`:1192,1222`) and the `drop`-aware inverse (REQ-5). The `handle_unknown='ignore'` inverse IS handled (#2227, all-zero -> NaN sentinel). |
 //! | REQ-7 (ctor + dtype + _parameter_constraints) | NOT-STARTED | open prereq blocker #1154. `new()` takes no params/validates nothing (`:728-762`). |
 //! | REQ-8 (PyO3 binding) | SHIPPED | #1155: `ferrolearn-python` exposes `ferrolearn.OneHotEncoder` over `{OneHotEncoder, FittedOneHotEncoder, OneHotHandleUnknown}`. The Rust shim `_RsOneHotEncoder` (hand `#[pyclass]`, `ferrolearn-python/src/extras.rs`) ctor takes `handle_unknown: String = "error"` mapped via `resolve_handle_unknown` ("error"→`Error`, "ignore"→`Ignore`, "infrequent_if_exist"→`PyNotImplementedError` REQ-5, bad→`PyValueError` per `_encoders.py:732` `StrOptions({"error","ignore","infrequent_if_exist"})`); `fit` builds `OneHotEncoder::<f64>::new().with_handle_unknown(..)` + runs `Fit`; `transform`/`inverse_transform`→`PyArray2<f64>` (FerroError→`PyValueError`; the `Ignore`-mode all-zero inverse flows through as NaN, #2227); `#[getter]`s `categories_` (a Python LIST of 1-D f64 numpy arrays via `PyList`), `feature_names_out` (`get_feature_names_out()`→`Vec<String>`), `n_features_in_` (`n_features()`). Registered in `lib.rs` (`m.add_class::<extras::RsOneHotEncoder>()`). The Python wrapper `_extras.py::OneHotEncoder(_TransformerWrapper)` mirrors sklearn's KEYWORD-ONLY 8-key ctor `(*, categories="auto", drop=None, sparse_output=True, dtype=np.float64, handle_unknown="error", min_frequency=None, max_categories=None, feature_name_combiner="concat")` (`_encoders.py:743-762`) for `get_params`/`clone` parity; `_make_rs` threads `handle_unknown`; `fit` calls `_check_unsupported` which HONESTLY (R-HONEST-3) rejects the core's gaps — `sparse_output=True` (the sklearn DEFAULT; dense-only REQ-2 #1149)/`categories!='auto'`/`drop`/`min_frequency`/`max_categories`/`feature_name_combiner!='concat'` (REQ-5/REQ-7 #1152/#1154) → `NotImplementedError`; `transform`/`inverse_transform`/`categories_`/`n_features_in_`/`get_feature_names_out(input_features=None)` guarded by `check_is_fitted`→`NotFittedError` pre-fit (`input_features!=None`→`NotImplementedError` REQ-6). Boundary consumer (R-DEFER-1): the `_extras.py::OneHotEncoder` wrapper + `lib.rs` `add_class` + `__init__.py` re-export. Live-oracle parity (model B, sklearn 1.5.2 `sparse_output=False`): `tests/divergence_one_hot_encoder_py.py` (17 pass) — multi-feature non-contiguous `transform`/`fit_transform`/`categories_`, `handle_unknown='ignore'` all-zero block, `inverse_transform` roundtrip + ignore-NaN-vs-None known-feature recovery, `get_feature_names_out` (`['x0_2.0',...]`), pre-fit `NotFittedError`, bad-handle_unknown `ValueError`, `infrequent_if_exist`/unsupported-param `NotImplementedError`, dense-only `sparse_output=True` error, `get_params` 8-key parity, `clone`. R-DEFER-1 satisfied. |
@@ -163,6 +163,20 @@ pub struct OneHotEncoder<F> {
     /// Which category (if any) to drop per feature (`drop`). Defaults to
     /// [`OneHotDrop::None_`] (retain all categories).
     drop: OneHotDrop,
+    /// Minimum frequency (count) below which a category is grouped into the
+    /// trailing "infrequent" output column (`min_frequency`). `None` (the
+    /// default) disables the min-frequency threshold. Mirrors scikit-learn's
+    /// `OneHotEncoder(min_frequency=...)` (`_encoders.py:566-577`,`:734-738`).
+    /// SCOPE: only the integer-count form is supported — sklearn also accepts a
+    /// FLOAT fraction `min_frequency * n_samples` (`:573-575`,`_encoders.py:297`),
+    /// which is NOT-STARTED here.
+    min_frequency: Option<usize>,
+    /// Upper limit on the number of output columns per feature when grouping
+    /// infrequent categories (`max_categories`); the infrequent column itself
+    /// counts toward this limit. `None` (the default) imposes no limit. Mirrors
+    /// scikit-learn's `OneHotEncoder(max_categories=...)`
+    /// (`_encoders.py:579-587`,`:733`).
+    max_categories: Option<usize>,
     _marker: std::marker::PhantomData<F>,
 }
 
@@ -174,6 +188,8 @@ impl<F: Float + Send + Sync + 'static> OneHotEncoder<F> {
         Self {
             handle_unknown: OneHotHandleUnknown::Error,
             drop: OneHotDrop::None_,
+            min_frequency: None,
+            max_categories: None,
             _marker: std::marker::PhantomData,
         }
     }
@@ -213,6 +229,70 @@ impl<F: Float + Send + Sync + 'static> OneHotEncoder<F> {
     #[must_use]
     pub fn drop(&self) -> OneHotDrop {
         self.drop
+    }
+
+    /// Set the minimum-frequency threshold for infrequent grouping
+    /// (`min_frequency`, integer count).
+    ///
+    /// At `fit` time a category whose count in the training data is **strictly
+    /// less than** `min_frequency` is grouped into a single trailing
+    /// "infrequent" output column for that feature, matching scikit-learn's
+    /// `OneHotEncoder(min_frequency=...)` integer form
+    /// (`_encoders.py:566-577`, `_identify_infrequent` `:295-296`
+    /// `category_count < self.min_frequency`).
+    ///
+    /// Enabling infrequent grouping (`min_frequency` and/or `max_categories`)
+    /// requires `drop == OneHotDrop::None_`; combining it with `drop` is a
+    /// deferred interaction (REQ-5a×5b) and [`Fit::fit`] returns an error.
+    ///
+    /// SCOPE (R-HONEST-3): only the integer-count form is supported. sklearn
+    /// also accepts a FLOAT `min_frequency` interpreted as the fraction
+    /// `min_frequency * n_samples` (`_encoders.py:573-575`,`:297-299`); the
+    /// float-fraction form is NOT-STARTED here.
+    #[must_use]
+    pub fn with_min_frequency(mut self, min_frequency: usize) -> Self {
+        self.min_frequency = Some(min_frequency);
+        self
+    }
+
+    /// Set the maximum number of output columns per feature for infrequent
+    /// grouping (`max_categories`).
+    ///
+    /// At `fit` time, if a feature would otherwise produce more than
+    /// `max_categories` output columns, the least-frequent categories are
+    /// grouped into a single trailing "infrequent" column so the block width is
+    /// at most `max_categories` (the infrequent column itself counts toward the
+    /// limit). Mirrors scikit-learn's `OneHotEncoder(max_categories=...)`
+    /// (`_encoders.py:579-587`, `_identify_infrequent` `:303-315`).
+    ///
+    /// Enabling infrequent grouping requires `drop == OneHotDrop::None_` (see
+    /// [`Self::with_min_frequency`]).
+    #[must_use]
+    pub fn with_max_categories(mut self, max_categories: usize) -> Self {
+        self.max_categories = Some(max_categories);
+        self
+    }
+
+    /// Return the configured minimum-frequency threshold (`min_frequency`), or
+    /// `None` if infrequent grouping by frequency is disabled.
+    #[must_use]
+    pub fn min_frequency(&self) -> Option<usize> {
+        self.min_frequency
+    }
+
+    /// Return the configured maximum output-column limit (`max_categories`), or
+    /// `None` if no limit is imposed.
+    #[must_use]
+    pub fn max_categories(&self) -> Option<usize> {
+        self.max_categories
+    }
+
+    /// Whether infrequent grouping is enabled (either `min_frequency` or
+    /// `max_categories` is set). Mirrors scikit-learn's `_infrequent_enabled`
+    /// (`_encoders.py:264-273`: `(max_categories is not None and
+    /// max_categories >= 1) or min_frequency is not None`).
+    fn infrequent_enabled(&self) -> bool {
+        self.min_frequency.is_some() || self.max_categories.is_some_and(|m| m >= 1)
     }
 }
 
@@ -258,6 +338,26 @@ pub struct FittedOneHotEncoder<F> {
     /// `Some(0)`; `drop='if_binary'` → `Some(0)` iff the feature has exactly two
     /// categories else `None`; `drop=None` → every entry `None`.
     pub(crate) drop_idx_: Vec<Option<usize>>,
+    /// Per-feature indices into `categories_[j]` of the categories grouped as
+    /// **infrequent** (`min_frequency`/`max_categories`), sorted ascending.
+    /// Mirrors scikit-learn's private `_infrequent_indices[j]`
+    /// (`_encoders.py:336-340`,`:367-370`): the indices `idx` such that
+    /// `categories_[j][idx]` is an infrequent category. Empty when feature `j`
+    /// has no infrequent categories (sklearn's `None`). With infrequent grouping
+    /// disabled every entry is empty. Length `categories_.len()`.
+    pub(crate) infrequent_indices_: Vec<Vec<usize>>,
+    /// Per-feature mapping from a `categories_[j]` index to its OUTPUT column
+    /// offset WITHIN feature `j`'s block (before adding `offsets[j]`). Mirrors
+    /// scikit-learn's `_default_to_infrequent_mappings[j]`
+    /// (`_encoders.py:373-400`): a frequent category maps to its remapped slot
+    /// `0..n_frequent`, every infrequent category maps to the single trailing
+    /// slot `n_frequent`. When feature `j` has no infrequent categories the
+    /// mapping is the identity `0..len` (sklearn stores `None`; the identity is
+    /// the representable equivalent). Length `categories_.len()`, with
+    /// `infrequent_map[j].len() == categories_[j].len()`. Used by `transform`,
+    /// `inverse_transform`, and `get_feature_names_out` to place each category in
+    /// the right output column without recomputing the grouping.
+    pub(crate) infrequent_map: Vec<Vec<usize>>,
 }
 
 impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
@@ -310,11 +410,55 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
         &self.drop_idx_
     }
 
+    /// Return the infrequent category **values** for each feature
+    /// (`infrequent_categories_`).
+    ///
+    /// `infrequent_categories()[j]` is the sorted list of category values from
+    /// `categories_[j]` that were grouped into the single trailing "infrequent"
+    /// output column (because their training count fell below `min_frequency`
+    /// and/or beyond the `max_categories` limit). An EMPTY inner `Vec` means
+    /// feature `j` had no infrequent categories (scikit-learn returns `None`
+    /// there; an empty list is the representable equivalent). With infrequent
+    /// grouping disabled every entry is empty. Mirrors scikit-learn's
+    /// `OneHotEncoder.infrequent_categories_`
+    /// (`_encoders.py:254-262`,`:625-633`): `category[indices]` over
+    /// `_infrequent_indices`.
+    #[must_use]
+    pub fn infrequent_categories(&self) -> Vec<Vec<F>> {
+        self.infrequent_indices_
+            .iter()
+            .enumerate()
+            .map(|(j, idxs)| {
+                idxs.iter()
+                    .filter_map(|&idx| self.categories_.get(j).and_then(|c| c.get(idx)).copied())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Whether feature `j` has any infrequent categories (a trailing infrequent
+    /// output column). Bounds-safe: a `j` past the end yields `false`.
+    fn has_infrequent(&self, j: usize) -> bool {
+        self.infrequent_indices_
+            .get(j)
+            .is_some_and(|v| !v.is_empty())
+    }
+
     /// Return the width of feature `j`'s one-hot block: `categories_[j].len()`
     /// minus one if that feature has a dropped category. Bounds-safe: a `j` past
     /// the end yields 0 (R-CODE-2).
     fn block_width(&self, j: usize) -> usize {
         let len = self.categories_.get(j).map_or(0, Vec::len);
+        // Infrequent grouping (REQ-5b) and `drop` (REQ-5a) are mutually
+        // exclusive — `fit` rejects their combination — so at most one branch
+        // applies. With infrequent categories the block is `n_frequent + 1`
+        // trailing infrequent column (sklearn `_compute_n_features_outs`
+        // `_encoders.py:948-953`: `output[i] -= infreq.size - 1`, i.e.
+        // `len - n_infreq + 1`).
+        let n_infreq = self.infrequent_indices_.get(j).map_or(0, Vec::len);
+        if n_infreq > 0 {
+            return len - n_infreq + 1;
+        }
         let dropped = matches!(self.drop_idx_.get(j), Some(Some(_)));
         len - usize::from(dropped && len > 0)
     }
@@ -453,6 +597,27 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
                             }
                         }
                     }
+                } else if self.has_infrequent(j) {
+                    // Infrequent grouping (REQ-5b). The block POSITION `argmax`
+                    // is a slot in `infrequent_map[j]`. The TRAILING slot
+                    // (`n_frequent`) is the infrequent column: sklearn inverts it
+                    // to the string `'infrequent_sklearn'` (`_encoders.py:1675-1677`,
+                    // `_compute_transformed_categories:917`), which an `Array2<F>`
+                    // cannot hold — NaN is the representable proxy (DOCUMENTED
+                    // SCOPE, R-HONEST-3, like the ignore-None case #2227). A
+                    // frequent slot inverts to the unique `categories_[j]` index
+                    // that maps to it (`labels = cats_wo_dropped[argmax]`,
+                    // `:1138-1139`). Bounds-safe via `get` (R-CODE-2).
+                    let map = self.infrequent_map.get(j);
+                    let n_frequent = block_width - 1; // the trailing slot index
+                    if argmax >= n_frequent {
+                        out[[i, j]] = F::nan();
+                    } else if let Some(&cat) = map
+                        .and_then(|m| m.iter().position(|&s| s == argmax))
+                        .and_then(|orig| cats.get(orig))
+                    {
+                        out[[i, j]] = cat;
+                    }
                 } else {
                     // Map the block POSITION back to a `categories_[j]` index: with
                     // a dropped category `d`, positions `>= d` correspond to the
@@ -505,6 +670,27 @@ impl<F: Float + Send + Sync + 'static> FittedOneHotEncoder<F> {
             // `_compute_transformed_categories` with `remove_dropped=True`,
             // `_encoders.py:1209-1212`,`:909`).
             let drop_d = self.drop_idx_.get(j).copied().flatten();
+            // Infrequent grouping (REQ-5b): emit only the FREQUENT category names
+            // then a single trailing `"x{j}_infrequent_sklearn"` column — the
+            // infrequent categories collapse into that one column (sklearn
+            // `_compute_transformed_categories`, `_encoders.py:913-921`:
+            // `cats[frequent_mask] + ['infrequent_sklearn']`). Infrequent and
+            // `drop` are mutually exclusive, so `drop_d` is `None` here.
+            if self.has_infrequent(j) {
+                let map = self.infrequent_map.get(j);
+                let n_frequent = self.block_width(j).saturating_sub(1);
+                for slot in 0..n_frequent {
+                    // The unique frequent category whose remapped slot is `slot`.
+                    if let Some(&c) = map
+                        .and_then(|m| m.iter().position(|&s| s == slot))
+                        .and_then(|orig| cats.get(orig))
+                    {
+                        names.push(format!("x{j}_{}", Self::category_label(c)));
+                    }
+                }
+                names.push(format!("x{j}_infrequent_sklearn"));
+                continue;
+            }
             for (idx, &c) in cats.iter().enumerate() {
                 if drop_d == Some(idx) {
                     continue;
@@ -591,8 +777,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
             });
         }
 
+        let infrequent_enabled = self.infrequent_enabled();
+
         let n_features = x.ncols();
         let mut categories_: Vec<Vec<F>> = Vec::with_capacity(n_features);
+        // Per-feature, per-category training counts ALIGNED with `categories_[j]`
+        // (`category_counts[j][idx]` is the count of `categories_[j][idx]`).
+        // Only needed when infrequent grouping is enabled — sklearn computes
+        // counts via `_unique(Xi, return_counts=True)` (`_encoders.py:99-102`).
+        let mut category_counts: Vec<Vec<usize>> = Vec::with_capacity(n_features);
 
         for j in 0..n_features {
             // Collect this column's values, sort ascending (sklearn `np.unique`
@@ -607,21 +800,71 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
                 (false, true) => Ordering::Less,
                 (false, false) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             });
-            // Dedup to the sorted-unique set: consecutive EXACT-equal values
-            // collapse (an ULP-apart pair stays distinct, like `np.unique`), AND
-            // consecutive NaNs collapse to ONE — `dedup` alone would keep every
-            // NaN (`NaN != NaN`), so handle it explicitly (sklearn collapses the
-            // trailing NaN run to a single sorted-last category, #2223).
-            col.dedup_by(|a, b| a == b || (a.is_nan() && b.is_nan()));
+            // Build the sorted-unique set AND, when infrequent grouping is
+            // enabled, the per-category run-length count (the sorted column has
+            // each category's occurrences contiguous, so a run length is the
+            // count). Consecutive EXACT-equal values collapse (an ULP-apart pair
+            // stays distinct, like `np.unique`), AND consecutive NaNs collapse to
+            // ONE (`dedup` alone keeps every NaN since `NaN != NaN`; sklearn
+            // collapses the trailing NaN run to a single sorted-last category,
+            // #2223).
+            let mut cats: Vec<F> = Vec::with_capacity(col.len());
+            let mut counts: Vec<usize> = Vec::with_capacity(col.len());
+            for v in col {
+                match cats.last() {
+                    Some(&last) if last == v || (last.is_nan() && v.is_nan()) => {
+                        if let Some(c) = counts.last_mut() {
+                            *c += 1;
+                        }
+                    }
+                    _ => {
+                        cats.push(v);
+                        counts.push(1);
+                    }
+                }
+            }
+            categories_.push(cats);
+            category_counts.push(counts);
+        }
 
-            categories_.push(col);
+        // Infrequent grouping (REQ-5b). When enabled, identify each feature's
+        // infrequent category indices and build the per-feature index→output
+        // column mapping; otherwise every feature has no infrequent categories
+        // and the mapping is the identity.
+        let mut infrequent_indices_: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+        let mut infrequent_map: Vec<Vec<usize>> = Vec::with_capacity(n_features);
+        if infrequent_enabled {
+            // REQ-5a × REQ-5b interaction is DEFERRED: combining infrequent
+            // grouping with `drop` is rejected at fit (sklearn ALLOWS it, but the
+            // remapping is intricate — documented scope, R-HONEST-3). Require
+            // `drop == None_`.
+            if self.drop != OneHotDrop::None_ {
+                return Err(FerroError::InvalidParameter {
+                    name: "drop".into(),
+                    reason: "infrequent grouping (min_frequency/max_categories) with drop is not \
+                             yet supported"
+                        .into(),
+                });
+            }
+            for counts in &category_counts {
+                let infreq = identify_infrequent(counts, self.min_frequency, self.max_categories);
+                let map = build_infrequent_map(counts.len(), &infreq);
+                infrequent_indices_.push(infreq);
+                infrequent_map.push(map);
+            }
+        } else {
+            for cats in &categories_ {
+                infrequent_indices_.push(Vec::new());
+                infrequent_map.push((0..cats.len()).collect());
+            }
         }
 
         // Compute `drop_idx_` from `drop` + the learned `categories_`
         // (sklearn `_compute_drop_idx`, `_encoders.py:812-831`). `drop=None` →
         // every feature `None`; `drop='first'` → every feature `Some(0)`;
         // `drop='if_binary'` → `Some(0)` iff the feature has exactly two
-        // categories, else `None`.
+        // categories, else `None`. (With infrequent grouping active `drop` is
+        // forced to `None_` above, so every entry is `None`.)
         let drop_idx_: Vec<Option<usize>> = match self.drop {
             OneHotDrop::None_ => vec![None; n_features],
             OneHotDrop::First => categories_
@@ -634,23 +877,11 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
                 .collect(),
         };
 
-        // Recompute the output-column layout AFTER drop: each feature's block
-        // width is `len(categories_[j]) - (1 if drop_idx_[j] is Some)`. `offsets`
-        // is the prefix sum of those widths; `n_output` the total
-        // (sklearn `_n_features_outs`, `_encoders.py:1049`,`feature_indices`).
-        let mut offsets: Vec<usize> = Vec::with_capacity(n_features);
-        let mut n_output: usize = 0;
-        for j in 0..n_features {
-            offsets.push(n_output);
-            let len = categories_[j].len();
-            let dropped = drop_idx_[j].is_some();
-            n_output += len - usize::from(dropped && len > 0);
-        }
-
-        Ok(FittedOneHotEncoder {
+        let mut fitted = FittedOneHotEncoder {
             categories_,
-            offsets,
-            n_output,
+            // Placeholder; recomputed below from per-feature block widths.
+            offsets: Vec::new(),
+            n_output: 0,
             // `handle_unknown` only affects `transform` (sklearn learns the same
             // `categories_` regardless); thread the configured mode through. Note
             // (verified live, sklearn 1.5.2): `drop` + `handle_unknown='ignore'`
@@ -659,8 +890,128 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OneHotEncoder<F> {
             // the dropped category). So fit imposes no drop+ignore constraint.
             handle_unknown: self.handle_unknown,
             drop_idx_,
-        })
+            infrequent_indices_,
+            infrequent_map,
+        };
+
+        // Recompute the output-column layout from each feature's block width:
+        // `block_width(j)` is `n_frequent + 1` with infrequent grouping (the
+        // trailing infrequent column), else `len - (1 if dropped)`. `offsets` is
+        // the prefix sum of those widths; `n_output` the total (sklearn
+        // `_compute_n_features_outs`, `_encoders.py:936-955`; `feature_indices`,
+        // `:1049`).
+        let mut offsets: Vec<usize> = Vec::with_capacity(n_features);
+        let mut n_output: usize = 0;
+        for j in 0..n_features {
+            offsets.push(n_output);
+            n_output += fitted.block_width(j);
+        }
+        fitted.offsets = offsets;
+        fitted.n_output = n_output;
+
+        Ok(fitted)
     }
+}
+
+/// Identify the indices of infrequent categories for one feature, given the
+/// per-category training `counts` (aligned with `categories_[j]`) and the
+/// `min_frequency`/`max_categories` thresholds.
+///
+/// Mirrors scikit-learn's `_BaseEncoder._identify_infrequent`
+/// (`_encoders.py:275-318`):
+/// 1. min_frequency: a category with `count < min_frequency` is infrequent
+///    (`:295-296`, integer form only — the float-fraction form is out of scope).
+/// 2. max_categories: if (after step 1) the feature would still produce more
+///    than `max_categories` output columns — counted as `n_remaining_frequent +
+///    1` for the infrequent group (`:303`) — the least-frequent categories are
+///    additionally marked infrequent until only `max_categories - 1` frequent
+///    categories remain (`:304-315`). Ties broken by a STABLE sort over the
+///    FULL count array, so among equal counts the SMALLER category index is
+///    marked infrequent first (sklearn `np.argsort(kind="mergesort")[:-k]`).
+///    `max_categories == 1` (frequent_category_count 0) makes every category
+///    infrequent (`:307-309`).
+///
+/// Returns the sorted-ascending infrequent indices (empty if none — sklearn's
+/// `None`). Never panics (R-CODE-2).
+fn identify_infrequent(
+    counts: &[usize],
+    min_frequency: Option<usize>,
+    max_categories: Option<usize>,
+) -> Vec<usize> {
+    let n = counts.len();
+    let mut infrequent_mask = vec![false; n];
+
+    // Step 1: min_frequency (integer count). `count < min_frequency`.
+    if let Some(min_freq) = min_frequency {
+        for (idx, &c) in counts.iter().enumerate() {
+            if c < min_freq {
+                infrequent_mask[idx] = true;
+            }
+        }
+    }
+
+    // Step 2: max_categories on the survivors. `n_current_features` counts the
+    // remaining frequent categories PLUS 1 for the infrequent group
+    // (`_encoders.py:303`).
+    if let Some(max_cat) = max_categories {
+        let n_infreq = infrequent_mask.iter().filter(|&&m| m).count();
+        let n_current_features = n - n_infreq + 1;
+        if max_cat < n_current_features {
+            // `max_categories` includes the one infrequent category.
+            let frequent_category_count = max_cat - 1;
+            if frequent_category_count == 0 {
+                // All categories are infrequent (`:307-309`).
+                infrequent_mask.iter_mut().for_each(|m| *m = true);
+            } else {
+                // Stable argsort over the FULL count array (ascending by count,
+                // ties by ascending index), then mark the smallest
+                // `n - frequent_category_count` levels infrequent — i.e. keep the
+                // top `frequent_category_count` by count, with ties resolved in
+                // favor of the LARGER index (`np.argsort(kind="mergesort")[:-k]`,
+                // `:312-315`).
+                let mut order: Vec<usize> = (0..n).collect();
+                order.sort_by(|&a, &b| counts[a].cmp(&counts[b]).then(a.cmp(&b)));
+                let keep = frequent_category_count.min(n);
+                let cut = n - keep;
+                for &idx in &order[..cut] {
+                    infrequent_mask[idx] = true;
+                }
+            }
+        }
+    }
+
+    infrequent_mask
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &m)| if m { Some(idx) } else { None })
+        .collect()
+}
+
+/// Build the per-feature mapping from a `categories_[j]` index to its output
+/// column slot WITHIN the feature's block (before adding `offsets[j]`).
+///
+/// Mirrors scikit-learn's `_default_to_infrequent_mappings[j]`
+/// (`_encoders.py:373-400`): frequent categories take slots `0..n_frequent` in
+/// their original (ascending-index) order; every infrequent category maps to the
+/// single trailing slot `n_frequent`. With no infrequent categories the mapping
+/// is the identity `0..n`. `infrequent` must be sorted ascending. Never panics
+/// (R-CODE-2): every index is bounds-checked.
+fn build_infrequent_map(n: usize, infrequent: &[usize]) -> Vec<usize> {
+    if infrequent.is_empty() {
+        return (0..n).collect();
+    }
+    let n_frequent = n - infrequent.len();
+    let mut map = vec![n_frequent; n];
+    let mut next_frequent = 0usize;
+    for (idx, slot) in map.iter_mut().enumerate() {
+        if infrequent.binary_search(&idx).is_ok() {
+            // Infrequent → the trailing slot (already set to `n_frequent`).
+        } else {
+            *slot = next_frequent;
+            next_frequent += 1;
+        }
+    }
+    map
 }
 
 impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEncoder<F> {
@@ -737,6 +1088,15 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
             // `_encoders.py:1033-1046`: `X_int > to_drop` decrements, the dropped
             // cell is masked out).
             let drop_d = self.drop_idx_.get(j).copied().flatten();
+            // The per-feature infrequent remapping (REQ-5b). When feature `j` has
+            // infrequent categories, a found category index maps to its block
+            // slot via `infrequent_map[j][idx]` (a frequent category → its
+            // remapped slot, an infrequent category → the trailing slot). When
+            // there are none the map is the identity and `infreq` is `false`, so
+            // the existing `drop` path is unchanged (the two are mutually
+            // exclusive — `fit` rejects their combination).
+            let infreq = self.has_infrequent(j);
+            let infreq_map = self.infrequent_map.get(j);
             for i in 0..n_samples {
                 let value = x[[i, j]];
                 // Membership lookup: find the value's index in the sorted-unique
@@ -747,6 +1107,14 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedOneHotEnco
                     .iter()
                     .position(|&c| c == value || (c.is_nan() && value.is_nan()))
                 {
+                    // Infrequent grouping active: place the value in its remapped
+                    // block slot (`_BaseEncoder._map_infrequent_categories`,
+                    // `_encoders.py:442-452`: `X_int = np.take(mapping, X_int)`).
+                    Some(idx) if infreq => {
+                        if let Some(&slot) = infreq_map.and_then(|m| m.get(idx)) {
+                            out[[i, offset + slot]] = F::one();
+                        }
+                    }
                     Some(idx) => match drop_d {
                         // The dropped category encodes to an ALL-ZERO block: set
                         // nothing (sklearn masks the dropped cell out of `X_mask`,
