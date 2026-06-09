@@ -38,7 +38,6 @@ const SK_N_COMPONENTS: usize = 5;
 const SK_N_FEATURES: usize = 20;
 
 #[test]
-#[ignore = "divergence: components_ orientation (n_features,n_components) vs sklearn (n_components,n_features); tracking #2346"]
 fn divergence_gaussian_components_orientation() {
     let x = Array2::<f64>::ones((10, SK_N_FEATURES));
     let proj = GaussianRandomProjection::<f64>::new(SK_N_COMPONENTS).random_state(0);
@@ -55,7 +54,6 @@ fn divergence_gaussian_components_orientation() {
 }
 
 #[test]
-#[ignore = "divergence: components_ orientation (n_features,n_components) vs sklearn (n_components,n_features); tracking #2346"]
 fn divergence_sparse_components_orientation() {
     let x = Array2::<f64>::ones((30, SK_N_FEATURES));
     let proj = SparseRandomProjection::<f64>::new(SK_N_COMPONENTS).random_state(0);

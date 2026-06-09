@@ -359,11 +359,13 @@ fn verify_transform_equals_xr() {
         Err(e) => panic!("gaussian transform: {e:?}"),
     };
     assert_eq!(gout.shape(), &[7, 5]);
-    let expected = x.dot(g.projection());
+    // components_ is now stored (n_components, n_features) (sklearn :419);
+    // transform is X @ components_.T (sklearn :604, :810). (#2346 orientation.)
+    let expected = x.dot(&g.projection().t());
     for (a, b) in gout.iter().zip(expected.iter()) {
         assert!(
             (a - b).abs() < 1e-12,
-            "gaussian transform != X@R: {a} vs {b}"
+            "gaussian transform != X@components_.T: {a} vs {b}"
         );
     }
 
@@ -380,9 +382,14 @@ fn verify_transform_equals_xr() {
         Err(e) => panic!("sparse transform: {e:?}"),
     };
     assert_eq!(sout.shape(), &[7, 5]);
-    let expected_s = x.dot(s.projection());
+    // components_ is now (n_components, n_features); transform is X @ components_.T
+    // (sklearn :810). (#2346 orientation.)
+    let expected_s = x.dot(&s.projection().t());
     for (a, b) in sout.iter().zip(expected_s.iter()) {
-        assert!((a - b).abs() < 1e-12, "sparse transform != X@R: {a} vs {b}");
+        assert!(
+            (a - b).abs() < 1e-12,
+            "sparse transform != X@components_.T: {a} vs {b}"
+        );
     }
 }
 

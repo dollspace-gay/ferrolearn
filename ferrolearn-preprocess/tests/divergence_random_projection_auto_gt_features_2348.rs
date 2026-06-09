@@ -28,9 +28,7 @@
 //! `n_features`, so `fit` SUCCEEDS and builds a (5920, 50) `components_`.
 
 use ferrolearn_core::traits::Fit;
-use ferrolearn_preprocess::random_projection::{
-    GaussianRandomProjection, SparseRandomProjection,
-};
+use ferrolearn_preprocess::random_projection::{GaussianRandomProjection, SparseRandomProjection};
 use ndarray::Array2;
 
 /// Divergence: ferrolearn's auto `fit` diverges from
@@ -39,7 +37,6 @@ use ndarray::Array2;
 /// jl(1000, eps=0.1) == 5920 (live sklearn 1.5.2) > n_features == 50.
 /// Tracking: #2348
 #[test]
-#[ignore = "divergence: auto n_components_ > n_features must error (sklearn random_projection.py:399-405); tracking #2348"]
 fn gaussian_auto_n_components_gt_features_errors() {
     // jl(1000, 0.1) == 5920 (live sklearn 1.5.2), > n_features == 50.
     let x = Array2::<f64>::ones((1000, 50));
@@ -57,7 +54,6 @@ fn gaussian_auto_n_components_gt_features_errors() {
 /// Same divergence for SparseRandomProjection (shares `resolve_n_components`).
 /// Tracking: #2348
 #[test]
-#[ignore = "divergence: auto n_components_ > n_features must error (sklearn random_projection.py:399-405); tracking #2348"]
 fn sparse_auto_n_components_gt_features_errors() {
     let x = Array2::<f64>::ones((1000, 50));
     let proj = SparseRandomProjection::<f64>::new_auto()
