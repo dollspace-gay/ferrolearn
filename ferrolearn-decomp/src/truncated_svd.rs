@@ -572,19 +572,38 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for TruncatedSVD<F> {
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedTruncatedSVD<F>, FerroError> {
         let (n_samples, n_features) = x.dim();
 
+        // sklearn `TruncatedSVD.fit` runs `_validate_data(..., ensure_min_features=2)`
+        // (`_truncated_svd.py:228`), raising
+        // `ValueError("Found array with N feature(s) ... while a minimum of 2 is
+        // required by TruncatedSVD.")` BEFORE any SVD (#2384). A single-feature X
+        // (n_features < 2) is rejected here, mirroring sklearn's message intent.
+        if n_features < 2 {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: format!(
+                    "Found array with {n_features} feature(s) (shape=({n_samples}, \
+                     {n_features})) while a minimum of 2 is required by TruncatedSVD"
+                ),
+            });
+        }
+
         if self.n_components == 0 {
             return Err(FerroError::InvalidParameter {
                 name: "n_components".into(),
                 reason: "must be at least 1".into(),
             });
         }
-        if self.n_components > n_features.min(n_samples) {
+        // sklearn's randomized branch rejects ONLY `n_components > n_features`
+        // (`_truncated_svd.py:241`: `if self.n_components > X.shape[1]: raise
+        // ValueError`); n_samples does NOT enter the bound. n_components between
+        // n_samples and n_features is ACCEPTED (#2383) — the upper bound is
+        // n_features, NOT min(n_samples, n_features).
+        if self.n_components > n_features {
             return Err(FerroError::InvalidParameter {
                 name: "n_components".into(),
                 reason: format!(
-                    "n_components ({}) exceeds min(n_samples, n_features) = {}",
-                    self.n_components,
-                    n_features.min(n_samples)
+                    "n_components ({}) must be <= n_features ({})",
+                    self.n_components, n_features
                 ),
             });
         }

@@ -41,12 +41,13 @@ use ndarray::array;
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "divergence: TruncatedSVD::fit rejects n_components in (n_samples, n_features]; sklearn randomized accepts n_components<=n_features (_truncated_svd.py:241); tracking #2383"]
 fn divergence_n_components_between_n_samples_and_n_features_accepted() {
     // X: n_samples=2, n_features=4. n_components=3 satisfies sklearn's
     // randomized rule (3 <= n_features=4) so sklearn fits without error.
     let x = array![[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]];
-    let result = TruncatedSVD::<f64>::new(3).with_random_state(0).fit(&x, &());
+    let result = TruncatedSVD::<f64>::new(3)
+        .with_random_state(0)
+        .fit(&x, &());
     // sklearn oracle: the fit SUCCEEDS (no ValueError) because only
     // n_components > n_features is rejected (_truncated_svd.py:241).
     assert!(
@@ -75,11 +76,12 @@ fn divergence_n_components_between_n_samples_and_n_features_accepted() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "divergence: TruncatedSVD::fit accepts single-feature X; sklearn ensure_min_features=2 raises ValueError (_truncated_svd.py:228); tracking #2384"]
 fn divergence_single_feature_rejected_min_features_2() {
     // X: n_features == 1. sklearn rejects via ensure_min_features=2.
     let x = array![[1.0], [2.0], [3.0]];
-    let result = TruncatedSVD::<f64>::new(1).with_random_state(0).fit(&x, &());
+    let result = TruncatedSVD::<f64>::new(1)
+        .with_random_state(0)
+        .fit(&x, &());
     // sklearn oracle: raises ValueError (minimum of 2 features required).
     assert!(
         result.is_err(),
