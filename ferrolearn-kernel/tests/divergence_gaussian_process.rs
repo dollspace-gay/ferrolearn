@@ -394,3 +394,80 @@ fn green_normalize_y_constant_target() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// RED PIN — Matern general-nu fallback propagates into GPR predict/std.
+// ---------------------------------------------------------------------------
+
+/// Divergence: `GaussianProcessRegressor` with a `MaternKernel(length_scale=1.0,
+/// nu=3.5)` diverges from sklearn `GaussianProcessRegressor(kernel=Matern(1.0,
+/// nu=3.5), optimizer=None)`.
+///
+/// Root cause: `gp_kernels.rs` `MaternKernel::compute` only implements the
+/// closed forms for `nu ∈ {0.5, 1.5, 2.5}` and silently FALLS BACK TO RBF for
+/// any other `nu` (`gp_kernels.rs` Matern `compute` final `else` branch:
+/// "Fallback: treat as RBF-like for unsupported nu"). sklearn instead uses the
+/// general modified-Bessel Matern formula (`sklearn/gaussian_process/kernels.py:1646-1660`).
+/// Because the kernel matrix `K(X,X)`, `K_trans(Xs,X)`, and `K_trans@alpha_`
+/// (`_gpr.py:443`) and the predictive variance `diag - Σv²` (`_gpr.py:481`) all
+/// flow from the (wrong) kernel values, BOTH the posterior mean AND the
+/// predictive std diverge at the `GaussianProcessRegressor` level — not merely
+/// inside `gp_kernels`.
+///
+/// Input: X=[[0],[1],[2],[3],[4]], y=[0,1,4,9,16], Xs=[[0.5],[2.5]],
+/// kernel=Matern(length_scale=1.0, nu=3.5), alpha=1e-10, optimizer=None.
+///
+/// Live oracle (sklearn 1.5.2, run from /tmp):
+/// ```text
+/// python3 -c "
+/// import numpy as np
+/// from sklearn.gaussian_process import GaussianProcessRegressor as GPR
+/// from sklearn.gaussian_process.kernels import Matern
+/// X=np.array([[0.],[1.],[2.],[3.],[4.]]); y=np.array([0.,1.,4.,9.,16.])
+/// Xs=np.array([[0.5],[2.5]])
+/// m=GPR(kernel=Matern(length_scale=1.0, nu=3.5), alpha=1e-10, optimizer=None).fit(X,y)
+/// mean,std=m.predict(Xs, return_std=True)
+/// print(mean.tolist()); print(std.tolist())
+/// "
+/// -> mean=[0.24976284367227203, 5.840091440863044]
+///    std =[0.24774695377373654, 0.23044163180966473]
+/// ```
+///
+/// ferrolearn returns the RBF(1.0) values instead:
+///   mean=[0.0996264781126002, 5.814671556548165]  (== the RBF green guard!)
+///   std =[0.1184472917869879, 0.09004190831342587]
+/// i.e. ferrolearn's Matern(1.0, nu=3.5) GP is byte-for-byte its RBF(1.0) GP,
+/// which is the fingerprint of the silent RBF fallback.
+///
+/// Tracking: #2375 (GPR-level); root blocker gp_kernels #1914.
+#[test]
+#[ignore = "divergence: GPR Matern general-nu (3.5) predict/std falls back to RBF; tracking #2375"]
+fn divergence_matern_general_nu_predict_std() {
+    use ferrolearn_kernel::MaternKernel;
+
+    // Live sklearn 1.5.2 oracle (see doc-comment command above).
+    const ORACLE_MEAN: [f64; 2] = [0.249_762_843_672_272_03, 5.840_091_440_863_044];
+    const ORACLE_STD: [f64; 2] = [0.247_746_953_773_736_54, 0.230_441_631_809_664_73];
+
+    let gp =
+        GaussianProcessRegressor::new(Box::new(MaternKernel::new(1.0, 3.5))).alpha(1e-10);
+    let fitted = gp.fit(&x_train(), &y_train()).unwrap();
+    let (mean, std) = fitted.predict_with_std(&x_query()).unwrap();
+
+    for (i, &expected) in ORACLE_MEAN.iter().enumerate() {
+        assert!(
+            (mean[i] - expected).abs() < 1e-6,
+            "Matern(nu=3.5) GPR mean[{i}]: ferrolearn={}, sklearn={expected} \
+             (ferrolearn silently falls back to RBF for nu ∉ {{0.5,1.5,2.5}})",
+            mean[i]
+        );
+    }
+    for (i, &expected) in ORACLE_STD.iter().enumerate() {
+        assert!(
+            (std[i] - expected).abs() < 1e-6,
+            "Matern(nu=3.5) GPR std[{i}]: ferrolearn={}, sklearn={expected} \
+             (RBF fallback corrupts the predictive variance too)",
+            std[i]
+        );
+    }
+}
