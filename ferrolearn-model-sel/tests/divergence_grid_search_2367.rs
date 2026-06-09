@@ -187,8 +187,12 @@ fn grid_neg_mse_picks_least_negative() {
     }
     let (x, y) = fixture();
     let grid = param_grid! { "alpha" => [0.1_f64, 1.0_f64, 10.0_f64, 100.0_f64] };
-    let mut gs =
-        GridSearchCV::new(Box::new(ridge_factory()), grid, Box::new(KFold::new(4)), neg_mse);
+    let mut gs = GridSearchCV::new(
+        Box::new(ridge_factory()),
+        grid,
+        Box::new(KFold::new(4)),
+        neg_mse,
+    );
     gs.fit(&x, &y).unwrap();
 
     let results = gs.cv_results().unwrap();
