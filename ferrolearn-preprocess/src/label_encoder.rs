@@ -105,7 +105,7 @@ impl FittedLabelEncoder {
             if idx >= n_classes {
                 return Err(FerroError::InvalidParameter {
                     name: format!("y[{i}]"),
-                    reason: format!("index {idx} is out of range (n_classes = {n_classes})"),
+                    reason: format!("y contains previously unseen labels: [{idx}]"),
                 });
             }
             out.push(self.classes[idx].clone());
@@ -171,7 +171,7 @@ impl Transform<Array1<String>> for FittedLabelEncoder {
                 None => {
                     return Err(FerroError::InvalidParameter {
                         name: format!("x[{i}]"),
-                        reason: format!("unknown label \"{label}\""),
+                        reason: format!("y contains previously unseen labels: \"{label}\""),
                     });
                 }
             }

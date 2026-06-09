@@ -25,6 +25,7 @@
 //! `error.rs:87` `"Invalid parameter `{name}`: {reason}"`):
 //!   - transform unseen -> `Invalid parameter `x[1]`: unknown label "c"`
 //!   - inverse OOB      -> `Invalid parameter `y[1]`: index 2 is out of range (n_classes = 2)`
+//!
 //! Neither contains the sklearn phrase "y contains previously unseen labels".
 
 use ferrolearn_core::traits::{Fit, Transform};
@@ -42,7 +43,6 @@ fn str_arr(v: &[&str]) -> Array1<String> {
 /// whose Display lacks the documented sklearn phrase.
 /// Tracking: #2354
 #[test]
-#[ignore = "divergence: unseen-label transform message != sklearn 'y contains previously unseen labels'; tracking #2354"]
 fn divergence_unseen_label_transform_message() {
     let enc = LabelEncoder::new();
     let fitted = enc.fit(&str_arr(&["a", "b"]), &()).unwrap();
@@ -65,7 +65,6 @@ fn divergence_unseen_label_transform_message() {
 /// whose Display lacks the documented sklearn phrase.
 /// Tracking: #2355
 #[test]
-#[ignore = "divergence: inverse OOB message != sklearn 'y contains previously unseen labels'; tracking #2355"]
 fn divergence_inverse_transform_oob_message() {
     let enc = LabelEncoder::new();
     let fitted = enc.fit(&str_arr(&["a", "b"]), &()).unwrap();
