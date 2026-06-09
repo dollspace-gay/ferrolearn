@@ -360,3 +360,121 @@ fn green_inverse_transform_shape_and_col_mismatch() {
     let z_bad = Array2::<f64>::zeros((5, 3));
     assert!(fitted.inverse_transform(&z_bad).is_err());
 }
+
+// ===========================================================================
+// DIV-3 — DEFAULT `tol` parity (REQ-16). FAILING.
+// ===========================================================================
+//
+// sklearn `FactorAnalysis` documents and constructs with `tol=1e-2`
+// (`sklearn/decomposition/_factor_analysis.py:72` "tol : float, default=1e-2",
+// `:185` `tol=1e-2`). ferrolearn's `FactorAnalysis::new`
+// (`ferrolearn-decomp/src/factor_analysis.rs:134-144`) constructs with
+// `tol: 1e-3`. Because the EM stops on the one-sided criterion
+// `(ll - old_ll) < tol` (`_factor_analysis.py:293`), the wrong default tol
+// makes the DEFAULT-constructed estimator iterate further and stop at a
+// different fitted state: it reports a DIFFERENT `n_iter_` and a DIFFERENT
+// final `loglike_`/`log_likelihood` than the default-constructed sklearn
+// estimator on the same data (R-DEV-1 fitted-attribute parity / R-DEV-2
+// constructor-default parity).
+//
+// Live sklearn 1.5.2 LAPACK oracle (R-CHAR-3), run from /tmp, sklearn DEFAULTS
+// `FactorAnalysis(n_components=2, svd_method='lapack')` on probe1:
+//   n_iter_       = 15
+//   loglike_[-1]  = -27.644987554315705
+//   (noise_variance_ = [0.009165047048366848, 0.1892982298298851,
+//                       0.014331031175260911, 0.06276200772936313])
+//
+// ferrolearn DEFAULT `FactorAnalysis::<f64>::new(2)` on probe1 (tol=1e-3):
+//   n_iter()         = 26
+//   log_likelihood() = -27.618738915522783
+// (Cross-check: when ferrolearn's tol is explicitly set to sklearn's default
+//  1e-2 via `.with_tol(1e-2)` the EM matches sklearn to ~1e-13 — n_iter=15,
+//  ll=-27.644987554315730 — confirming the divergence is the DEFAULT tol value,
+//  not the EM math. The FIXER must change `new()`'s default tol to 1e-2; do NOT
+//  fix here.)
+//
+// Tracking: #2392 (relates #1536, #2391)
+
+/// Divergence: ferrolearn's default-constructed `FactorAnalysis::new`
+/// (`ferrolearn-decomp/src/factor_analysis.rs:140`, `tol: 1e-3`) diverges from
+/// sklearn's default `FactorAnalysis` (`_factor_analysis.py:185`, `tol=1e-2`).
+/// On probe1 sklearn DEFAULT reports `n_iter_=15`,
+/// `loglike_[-1]=-27.644987554315705`; ferrolearn DEFAULT reports `n_iter()=26`,
+/// `log_likelihood()=-27.618738915522783`. Tracking: #2392
+#[ignore = "divergence: FactorAnalysis::new default tol=1e-3 vs sklearn 1e-2 -> wrong n_iter_/loglike_; tracking #2392"]
+#[test]
+fn divergence_fa_default_tol_n_iter_and_loglike() {
+    // Live sklearn 1.5.2 LAPACK oracle, sklearn DEFAULTS (tol=1e-2). R-CHAR-3.
+    let sk_n_iter: usize = 15;
+    #[allow(
+        clippy::excessive_precision,
+        reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
+    )]
+    let sk_loglike: f64 = -27.644987554315705;
+
+    let x = probe1();
+    // DEFAULT-constructed ferrolearn estimator (no `.with_tol`) — must mirror a
+    // default-constructed sklearn `FactorAnalysis`.
+    let fitted = FactorAnalysis::<f64>::new(2)
+        .fit(&x, &())
+        .expect("fit probe1 default");
+
+    assert_eq!(
+        fitted.n_iter(),
+        sk_n_iter,
+        "n_iter_: sklearn default (tol=1e-2) {sk_n_iter}, ferrolearn default {}",
+        fitted.n_iter()
+    );
+    let got_ll = fitted.log_likelihood();
+    assert!(
+        (got_ll - sk_loglike).abs() < 1e-6,
+        "final loglike: sklearn default (tol=1e-2) {sk_loglike}, ferrolearn default {got_ll} (diff {})",
+        (got_ll - sk_loglike).abs()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GREEN GUARD — the EM math itself is CLEAN when tol is matched to sklearn's
+// default. This PASSES today and documents that the DIV-3 divergence is purely
+// the default tol value, not the SVD-EM / noise_variance / loglike update.
+// ---------------------------------------------------------------------------
+
+/// Green guard: with `tol` explicitly set to sklearn's default 1e-2,
+/// ferrolearn's EM matches the live sklearn 1.5.2 LAPACK oracle (n_iter,
+/// final loglike, noise_variance) to ~1e-6. Confirms the EM update is correct.
+#[test]
+fn green_fa_matched_tol_matches_sklearn() {
+    // Live sklearn 1.5.2 LAPACK oracle, tol=1e-2. R-CHAR-3.
+    let sk_n_iter: usize = 15;
+    #[allow(
+        clippy::excessive_precision,
+        reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
+    )]
+    let sk_loglike: f64 = -27.644987554315705;
+    #[allow(
+        clippy::excessive_precision,
+        reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
+    )]
+    let sk_noise = [
+        0.009165047048366848_f64,
+        0.1892982298298851,
+        0.014331031175260911,
+        0.06276200772936313,
+    ];
+
+    let x = probe1();
+    let fitted = FactorAnalysis::<f64>::new(2)
+        .with_tol(1e-2)
+        .fit(&x, &())
+        .expect("fit probe1 tol=1e-2");
+
+    assert_eq!(fitted.n_iter(), sk_n_iter);
+    assert!((fitted.log_likelihood() - sk_loglike).abs() < 1e-6);
+    for (i, &exp) in sk_noise.iter().enumerate() {
+        assert!(
+            (fitted.noise_variance()[i] - exp).abs() < 1e-6,
+            "noise_variance[{i}]: sklearn {exp}, ferrolearn {}",
+            fitted.noise_variance()[i]
+        );
+    }
+}
