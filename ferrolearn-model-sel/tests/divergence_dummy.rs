@@ -16,8 +16,9 @@
 //! REQ-9 multi-output (#1694). The REQ-4 error-VARIANT divergence
 //! (FerroError::InvalidParameter vs ValueError) is tracked at #1692.
 //!
-//! RED PIN (FAILS now, `#[ignore]`d): REQ-6 quantile rounding-order divergence
-//! at quantile=1/3 (#2370).
+//! REGRESSION GUARD (was a RED PIN, now PASSES): REQ-6 quantile rounding-order
+//! parity at quantile=1/3 — `quantile_value` replicates `np.percentile`'s
+//! `quantile*100/100*(n-1)` virtual index and two-branch `_lerp` (#2370 fixed).
 
 use ferrolearn_core::Fit;
 use ferrolearn_core::Predict;
@@ -187,7 +188,7 @@ fn green_regressor_constant_tiles() {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-6 (RED PIN): quantile rounding-order divergence. FAILS now — #[ignore]d.
+// REQ-6 (REGRESSION GUARD): quantile rounding-order parity. PASSES now (#2370).
 // ---------------------------------------------------------------------------
 
 /// Divergence: ferrolearn's `DummyRegressor` `quantile` strategy diverges from
@@ -214,9 +215,10 @@ fn green_regressor_constant_tiles() {
 /// ```
 /// ferrolearn returns exactly `20.0` (hex `0x1.4000000000000p+4`) — 1 ULP high.
 /// A genuine R-DEV-1 value divergence in a SHIPPED deterministic path.
-/// Tracking: #2370
+/// Tracking: #2370 (FIXED — `quantile_value` now replicates sklearn's
+/// `np.percentile(y, q=quantile*100)`: the `*100.0`/`/100.0` virtual-index
+/// round-trip plus numpy's two-branch `_lerp` (`b - (b-a)*(1-t)` where `t>=0.5`).
 #[test]
-#[ignore = "divergence: DummyRegressor quantile q*(n-1) vs sklearn q*100/100*(n-1) (1 ULP high); tracking #2370"]
 fn divergence_regressor_quantile_rounding_order() {
     // Oracle value bit-pattern from the LIVE sklearn 1.5.2 call above
     // (`float(...).hex()` == '0x1.3ffffffffffffp+4'), NOT copied from ferrolearn.

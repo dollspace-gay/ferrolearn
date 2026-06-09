@@ -409,17 +409,42 @@ fn quantile_value<F: Float + FromPrimitive>(y: &Array1<F>, q: f64) -> Result<F, 
     if n == 1 {
         return Ok(sorted[0]);
     }
-    let pos = q * (n - 1) as f64;
+    // Match sklearn's quantile path bit-for-bit: `percentile = quantile * 100.0`
+    // (`sklearn/dummy.py:599`) then `np.percentile(y, q=percentile)`, whose
+    // virtual index is `percentile / 100.0 * (n - 1)` (`sklearn/dummy.py:601`).
+    // The `*100.0` then `/100.0` round-trip rounds differently from a direct
+    // `q * (n - 1)`, reproducing numpy's exact virtual index (e.g. q=1/3, n=4 →
+    // 0.9999999999999998, NOT 1.0). For "clean landing" quantiles where the
+    // round-trip is identity (0, 0.25, 0.5, 0.9, 1.0 here) this is unchanged.
+    let percentile = q * 100.0;
+    let pos = percentile / 100.0 * (n - 1) as f64;
     let lo = pos.floor() as usize;
     let hi = pos.ceil() as usize;
     if lo == hi {
         Ok(sorted[lo])
     } else {
-        let frac = F::from(pos - lo as f64).ok_or_else(|| FerroError::InvalidParameter {
+        // numpy's `_lerp` (numpy/lib/_function_base_impl.py `_lerp`) is a
+        // TWO-branch formula, not the naive `a + (b-a)*t`: it computes
+        // `a + (b-a)*t` but, where `t >= 0.5`, instead computes
+        // `b - (b-a)*(1-t)`. The branch switch changes the rounding and is what
+        // makes `np.percentile` bit-exact. For q=1/3, n=4 → t=0.9999999999999998
+        // (>= 0.5) → `b - (b-a)*(1-t)` = 19.999999999999996, matching sklearn's
+        // `np.percentile(y, q=quantile*100)` (`sklearn/dummy.py:601`).
+        let t = pos - lo as f64;
+        let frac = F::from(t).ok_or_else(|| FerroError::InvalidParameter {
             name: "fraction".into(),
             reason: "could not convert to F".into(),
         })?;
-        Ok(sorted[lo] + (sorted[hi] - sorted[lo]) * frac)
+        let diff = sorted[hi] - sorted[lo];
+        if t >= 0.5 {
+            let one_minus = F::from(1.0 - t).ok_or_else(|| FerroError::InvalidParameter {
+                name: "fraction".into(),
+                reason: "could not convert to F".into(),
+            })?;
+            Ok(sorted[hi] - diff * one_minus)
+        } else {
+            Ok(sorted[lo] + diff * frac)
+        }
     }
 }
 
