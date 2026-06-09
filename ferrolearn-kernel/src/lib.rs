@@ -22,7 +22,7 @@
 //!   approximation (binary and multi-class one-vs-rest), with Rasmussen &
 //!   Williams Algorithm 3.2 predictions and `log_marginal_likelihood()` for
 //!   hyperparameter selection.
-//! - **GP Kernels** — RBF, Matern (0.5/1.5/2.5), Constant, White, DotProduct,
+//! - **GP Kernels** — RBF, Matern (any nu via closed forms / Bessel K_ν), Constant, White, DotProduct,
 //!   plus Sum and Product kernel composition via the [`gp_kernels::GPKernel`] trait.
 //! - **[`KernelRidge`]** — Kernel ridge regression in dual form
 //!   `(K + αI) c = y` with RBF / Polynomial / Linear / Sigmoid / Laplacian
@@ -43,6 +43,7 @@
 //! - Calling `predict()` on an unfitted model is a compile-time error.
 
 pub mod bandwidth;
+pub mod bessel;
 pub mod confidence;
 pub mod diagnostics;
 pub mod gaussian_process;

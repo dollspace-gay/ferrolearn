@@ -42,10 +42,11 @@ The gaps (all NOT-STARTED, all oracle-pinnable):
    a `fixed` flag. ferrolearn has `get_params`/`set_params`/`n_params` returning
    log-space values but NO bounds, NO `Hyperparameter` objects, NO `fixed`
    support.
-3. **Matern unsupported-`nu` fallback (DIVERGENCE).** ferrolearn's
-   `MaternKernel::compute` silently returns an RBF formula for `nu ∉ {0.5, 1.5,
-   2.5}`. sklearn evaluates general `nu` via the modified Bessel function
-   (`:1729-1735`) and `nu=inf` → RBF (`:1727-1728`).
+3. **Matern general-`nu` (Bessel) — SHIPPED (REQ-10).** `MaternKernel::compute`
+   now evaluates the modified-Bessel Matern `(2^{1-ν}/Γ(ν))·t^ν·K_ν(t)`,
+   `t=√(2ν)·(d/l)` for `nu ∉ {0.5,1.5,2.5,inf}` (`:1729-1735`) and `nu=inf` → RBF
+   (`:1727-1728`), via the new `bessel::bessel_k` (`scipy.special.kv` analog) and
+   `statrs` `gamma`. (Was the silent-RBF-fallback divergence.)
 4. **WhiteKernel `Y is None` semantics (DIVERGENCE).** sklearn: `Y is None` →
    `noise_level*eye(n)` (`:1404`); `Y is not None` → `zeros((n,m))` (`:1416`).
    ferrolearn's `compute(x1, x2)` instead checks ROW EQUALITY, so
@@ -191,10 +192,10 @@ The gaps (all NOT-STARTED, all oracle-pinnable):
   [0.693147, 0.405465, -2.302585]`, `.bounds.shape == (3,2)`, `.n_dims == 3`.
   ferrolearn has no `bounds`/`n_dims`/`Hyperparameter`. Oracle-pinnable.
 - AC-10 (REQ-10): `Matern(length_scale=1.0, nu=3.5)(X) = [[1, 0.544942,
-  0.544942], ...]` (true Bessel Matern) whereas ferrolearn's fallback returns
-  `RBF(length_scale=1.0)(X) = [[1, 0.606531, 0.606531], ...]` — `0.544942 ≠
-  0.606531`. Also `Matern(nu=inf)(X) == RBF(1.0)(X)`. Oracle-pinnable (the
-  fallback is the divergence).
+  0.544942], ...]` (true Bessel Matern) — `MaternKernel::new(1.0, 3.5).compute`
+  now MATCHES this (was the wrong RBF `0.606531`); `Matern(nu=inf)(X) ==
+  RBF(1.0)(X)`. SHIPPED — guarded by `matern_general_nu_35_matches_sklearn` and
+  `matern_nu_inf_is_rbf`.
 - AC-11 (REQ-11): `WhiteKernel(0.1)(X)` (Y=None) is `0.1·I`; `WhiteKernel(0.1)(
   X, X)` (Y=X explicit) is the all-zeros `(3,3)` matrix. ferrolearn's
   `compute(X, X)` returns `0.1·I` (row-equality path) — diverges from sklearn's
@@ -216,7 +217,7 @@ The gaps (all NOT-STARTED, all oracle-pinnable):
 | REQ | Status | Evidence |
 |---|---|---|
 | REQ-1 (RBF formula) | SHIPPED | `RBFKernel::compute` in `gp_kernels.rs` does `sq.mapv(\|d\| (-d/(two*ls2)).exp())` over `squared_distances`, and `diagonal` returns `from_elem(n, 1)` — mirrors `RBF.__call__` `K = exp(-0.5·sqdist)` (`kernels.py:1558-1562`). Live oracle (`X=[[0,0],[1,0],[0,1]]`): `RBF(length_scale=1.5)(X) = [[1, 0.800737, 0.800737],[0.800737, 1, 0.64118],[0.800737, 0.64118, 1]]`. Non-test consumer: `gaussian_process.rs` `fn fit` (`let mut k_mat = self.kernel.compute(x, x)`) / `fn predict` (`self.kernel.compute(x, &self.x_train)`); `gp_classifier.rs` `fn fit_binary_gpc` (`kernel.compute(x, x)`). In-crate `rbf_self_covariance_is_one`/`rbf_cross_covariance`/`rbf_length_scale_effect`. Verification: `cargo test -p ferrolearn-kernel --lib gp_kernels` (32 passed). Deterministic / oracle-pinnable. |
-| REQ-2 (Matern 0.5/1.5/2.5) | SHIPPED | `MaternKernel::compute` branches on `nu ≈ 0.5/1.5/2.5`: `(-r/ls).exp()`; `(1+√3·r/ls)·exp(-√3·r/ls)`; `(1+√5·r/ls+5/3·(r/ls)²)·exp(-√5·r/ls)` — mirrors `Matern.__call__` (`kernels.py:1719-1726`). Live oracle: `Matern(1.0, nu=1.5)(X) = [[1, 0.483358, 0.483358], ...]`, `nu=2.5 → [[1, 0.523994, ...]]`, `nu=0.5 → [[1, 0.367879, ...]]`. Consumer: `gaussian_process.rs` test `predict_with_matern` uses `MaternKernel::new(1.0, 1.5)` through `GaussianProcessRegressor` (production fit path). In-crate `matern_05_is_exponential`/`matern_15_at_zero`/`matern_25_at_zero`. Deterministic / oracle-pinnable. (The `nu ∉ {0.5,1.5,2.5}` fallback is REQ-10, NOT-STARTED.) |
+| REQ-2 (Matern 0.5/1.5/2.5) | SHIPPED | `MaternKernel::compute` branches on `nu ≈ 0.5/1.5/2.5`: `(-r/ls).exp()`; `(1+√3·r/ls)·exp(-√3·r/ls)`; `(1+√5·r/ls+5/3·(r/ls)²)·exp(-√5·r/ls)` — mirrors `Matern.__call__` (`kernels.py:1719-1726`). Live oracle: `Matern(1.0, nu=1.5)(X) = [[1, 0.483358, 0.483358], ...]`, `nu=2.5 → [[1, 0.523994, ...]]`, `nu=0.5 → [[1, 0.367879, ...]]`. Consumer: `gaussian_process.rs` test `predict_with_matern` uses `MaternKernel::new(1.0, 1.5)` through `GaussianProcessRegressor` (production fit path). In-crate `matern_05_is_exponential`/`matern_15_at_zero`/`matern_25_at_zero`. Deterministic / oracle-pinnable. (General `nu` is REQ-10, now SHIPPED via the Bessel `K_ν` path.) |
 | REQ-3 (Constant) | SHIPPED | `ConstantKernel::compute` returns `from_elem((n,m), constant_value)`; `diagonal` returns `from_elem(n, constant_value)` — mirrors `ConstantKernel.__call__`/`diag` (`kernels.py:1275`). Live oracle: `ConstantKernel(2.0)(X)` all-2.0. Non-test consumer: used inside `ProductKernel`/`SumKernel` in `gaussian_process.rs`/`gp_classifier.rs` GP fit paths. In-crate `constant_kernel`/`constant_diagonal`. Deterministic / oracle-pinnable. |
 | REQ-4 (DotProduct) | SHIPPED | `DotProductKernel::compute` does `x1.dot(&x2.t()).mapv(\|v\| v + s0_sq)`; `diagonal` does `row.dot(&row) + s0_sq` — mirrors `DotProduct.__call__` `K = sigma_0² + X·Yᵀ` (`kernels.py:2113`). Live oracle: `DotProduct(1.0)(X) = [[1,1,1],[1,2,1],[1,1,2]]`. Non-test consumer: `gaussian_process.rs` test `predict_with_dot_product` drives `GaussianProcessRegressor::new(Box::new(DotProductKernel::new(1.0)))` through the production fit/predict. In-crate `dot_product_at_origin`/`dot_product_linear`/`dot_product_diagonal`. Deterministic / oracle-pinnable. |
 | REQ-5 (Sum/Product + theta order) | SHIPPED | `SumKernel::compute` returns `m1+m2`, `ProductKernel::compute` returns `m1*m2`; both `diagonal` combine `d1`/`d2`; `get_params` does `params = k1.get_params(); params.extend(k2.get_params())` — matching sklearn's `Sum`/`Product` `__call__` and `theta` concatenation (`kernels.py:796`, `:893`). Live oracle: `(RBF(1.5)+WhiteKernel(0.1)).theta = [0.405465, -2.302585] = [ln 1.5, ln 0.1]` (k1 then k2). Non-test consumer: `gaussian_process.rs` `predict_with_sum_kernel` (`SumKernel::new(RBF, White)`) and `predict_with_product_kernel` (`ProductKernel::new(Const, RBF)`) drive `GaussianProcessRegressor` production fit. In-crate `sum_kernel`/`product_kernel_scaling`/`sum_kernel_params`. Deterministic / oracle-pinnable. |
@@ -224,12 +225,12 @@ The gaps (all NOT-STARTED, all oracle-pinnable):
 | REQ-7 (GPR/GPC consumer) | SHIPPED | `lib.rs` re-exports `pub use gp_kernels::{ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel, SumKernel, WhiteKernel}`. Non-test production consumers: `gaussian_process.rs` holds `kernel: Box<dyn GPKernel<F>>` and calls `compute` in `fn fit` (`let mut k_mat = self.kernel.compute(x, x)`) and `fn predict` (`compute(x, &self.x_train)`), and `diagonal` in the predictive-variance path (`let k_star_diag = self.kernel.diagonal(x)`); `gp_classifier.rs` calls `kernel.compute(x, x)` in `fn fit_binary_gpc` and `model.kernel.compute(x, &model.x_train)` in `fn predict`. Verification: `cargo test -p ferrolearn-kernel --lib gaussian_process gp_classifier`. (No Python binding for GP — consumer is the Rust GPR/GPC, which IS the public estimator API per R-DEFER-1/S5.) |
 | REQ-8 (eval_gradient / dK/dθ) | NOT-STARTED | blocker issue to be filed by critic. The `GPKernel` trait has only `compute`/`diagonal` — NO gradient method. sklearn every `__call__(X, eval_gradient=True)` returns `(K, K_gradient)` of shape `(n,n,n_dims)` (RBF `:1569-1582`, Matern `:1742-1781`, Constant `:1280-1291`, White `:1405-1412`, DotProduct/Sum/Product). Live oracle: `RBF(1.0)(X, eval_gradient=True)[1].shape == (3,3,1)`, `[:,:,0] = [[0, 0.606531, 0.606531],[0.606531, 0, 0.735759],[0.606531, 0.735759, 0]]`. Consequence: GPR's log-marginal-likelihood gradient optimizer cannot be driven — `gaussian_process.rs` stores `n_restarts_optimizer` but `fn fit` performs a single fixed-kernel Cholesky solve with NO optimizer loop, so hyperparameters are never tuned (REQ-8/REQ-9 are jointly the missing optimization capability). Oracle-pinnable per kernel. |
 | REQ-9 (theta/bounds/Hyperparameter/fixed) | NOT-STARTED | blocker issue to be filed by critic. ferrolearn exposes `get_params`/`set_params`/`n_params` (flat log vector) but NO `bounds`, NO `Hyperparameter` objects (sklearn `:52`), NO `fixed` flag, NO `n_dims`/`clone_with_theta`. sklearn's `Kernel` base exposes `theta` `:287-309`, `bounds` `:342-358` (log-transformed `(n_dims,2)`), `hyperparameters` `:277-285`, `n_dims` `:272-275`. Live oracle: `(Const(2.0)*RBF(1.5)+White(0.1)).bounds.shape == (3,2)`, `.n_dims == 3`. Without bounds + the `fixed` flag, GPR's L-BFGS-B optimizer (REQ-8) has no search box and cannot pin a hyperparameter. Oracle-pinnable on `bounds`/`n_dims`. |
-| REQ-10 (Matern general nu / inf) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-1 numerical contract). `MaternKernel::compute` `else { ... RBF ... }` silently returns the RBF formula (`length_scale=ls`) for any `nu ∉ {0.5,1.5,2.5}`. sklearn evaluates the true modified-Bessel Matern `(2^{1-ν}/Γ(ν))·t^ν·K_ν(t)`, `t=√(2ν)·d` (`kernels.py:1729-1735`) and `nu=inf → exp(-d²/2)` (RBF, `:1727-1728`). Live oracle: `Matern(1.0, nu=3.5)(X) = [[1, 0.544942, 0.544942], ...]` vs ferrolearn's fallback `RBF(1.0)(X) = [[1, 0.606531, ...]]` — `0.544942 ≠ 0.606531`. Needs a `gamma`/`besselk` (`kv`) primitive (likely a ferray/special-function gap, R-SUBSTRATE-5). Oracle-pinnable. |
+| REQ-10 (Matern general nu / inf) | SHIPPED (#1914, #2375) | `MaternKernel::compute` evaluates the modified-Bessel Matern `(2^{1-ν}/Γ(ν))·t^ν·K_ν(t)`, `t=√(2ν)·(d/l)` for `nu ∉ {0.5,1.5,2.5,inf}` (`kernels.py:1729-1735`), `nu=inf → exp(-d²/2)` (RBF, `:1727-1728`), and `d≈0 → 1.0`. `K_ν` via the new `bessel::bessel_k` (Numerical Recipes `bessik`: Temme series for `x≤2`, CF2 continued fraction for `x>2`, upward order recurrence; ~1e-10 vs `scipy.special.kv`); `Γ` via `statrs::function::gamma::gamma`. Live oracle (`X=[[0,0],[1,0],[0,1]]`): `Matern(1.0, nu=3.5)(X)[0,1] = 0.5449424471128748` (was the wrong RBF `0.6065306597126334`). Non-test consumer: `GaussianProcessRegressor` (`gaussian_process.rs` `fn fit`/`fn predict` via `kernel.compute`) — guarded green by `tests/divergence_gaussian_process.rs::divergence_matern_general_nu_predict_std` (un-ignored: Matern(1.0,3.5) GPR `predict` mean=[0.2498,5.8401], std=[0.2477,0.2304] ~1e-6). In-crate: `gp_kernels::tests::{matern_general_nu_35_matches_sklearn, matern_general_nu_07_matches_sklearn, matern_nu_inf_is_rbf, matern_general_agrees_with_closed_forms}`, `bessel::tests::{kv_matches_scipy_oracle, kv_half_integer_closed_form, kv_boundaries_no_panic}`. (The `K_ν`/`Γ` primitives live in-crate as the unblock; a future ferray special-functions analog is R-SUBSTRATE-5 follow-up, not a gate on this REQ.) |
 | REQ-11 (WhiteKernel Y-is-None) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-3 output contract). `WhiteKernel::compute(x1, x2)` checks ROW EQUALITY (`if n1==n2 { ... rows identical → noise_level on the diagonal }`). sklearn distinguishes by argument: `kernel(X)` (Y=None) → `noise_level*eye(n)` (`:1404`), `kernel(X, Y)` → `zeros((n,m))` (`:1416`). Live oracle: `WhiteKernel(0.1)(X)` is `0.1·I` but `WhiteKernel(0.1)(X, X)` (explicit Y) is the all-zeros `(3,3)`; ferrolearn returns `0.1·I` for the explicit-Y call. The trait has no "Y is None" channel — `compute` always takes two arrays. For the GPR training path `K(X,X)` both give `noise*I` (REQ-7 unaffected), but `compute(X, X)` diverges from `kernel(X, Y=X)`. Oracle-pinnable. |
 | REQ-12 (anisotropic length_scale) | NOT-STARTED | blocker issue to be filed by critic (R-DEV-2 ABI). `RBFKernel`/`MaternKernel` hold `length_scale: F` (scalar). sklearn accepts `length_scale: float OR ndarray(n_features,)` (`:1472-1475`) with the `anisotropic` property `:1512-1514` and a dimension-wise gradient path (`:1576-1582`). Live oracle: `RBF(length_scale=[1.0, 2.0])(X)` (per-feature scaling) cannot be expressed by any scalar-`l` ferrolearn RBF. Oracle-pinnable once an array-`length_scale` constructor exists. |
 | REQ-13 (missing kernels) | NOT-STARTED | blocker issue to be filed by critic (builder territory). No ferrolearn analog for `RationalQuadratic` (`kernels.py:1798`, `k = (1 + d²/(2αl²))^{-α}`), `ExpSineSquared` (`:1954`, periodic), `Exponentiation` (`:993`, `kernel ** exponent`), `CompoundKernel` (`:514`, the per-class GPC kernel stack). These are real mirrored surface (each evaluates in the live oracle), not out-of-scope. Oracle-pinnable per kernel once built. |
 | REQ-14 (constructor defaults / Default) | SHIPPED (#1918) | FIXED — added `impl<F: Float> Default` for all five kernels with sklearn's keyword defaults: `RBFKernel` `length_scale=1.0` (`kernels.py:1508`), `MaternKernel` `length_scale=1.0`/`nu=1.5` (`:1678`), `ConstantKernel` `constant_value=1.0` (`:1233`), `DotProductKernel` `sigma_0=1.0` (`:2156`), `WhiteKernel` `noise_level=1.0` (`:1363`). Each `default()` delegates to `new(...)` with `F::one()` (Matern `nu` via `F::from(1.5)`). Also clears latent `clippy::new_without_default`. Guard `gp_kernels::tests::gp_kernel_defaults_match_sklearn` (`assert_eq!` on each public field vs the sklearn symbolic default). (The Sum/Product `theta` ordering MATCHES — REQ-5.) |
-| REQ-15 (ferray substrate) | NOT-STARTED | blocker issue to be filed by critic (R-SUBSTRATE-1). `gp_kernels.rs` imports `ndarray::{Array1, Array2}`; `squared_distances`/`euclidean_distances`/`compute`/`diagonal` operate on `ndarray`. Destination: `ferray-core` (array type), `ferray-ufunc` (elementwise `exp`/distance), `ferray::linalg` (the `X·Yᵀ` dot for DotProduct). Not migrated. The Bessel primitive for REQ-10 belongs in `ferray::stats`/a special-functions analog (`scipy.special.kv`/`gamma`). |
+| REQ-15 (ferray substrate) | NOT-STARTED | blocker issue to be filed by critic (R-SUBSTRATE-1). `gp_kernels.rs` imports `ndarray::{Array1, Array2}`; `squared_distances`/`euclidean_distances`/`compute`/`diagonal` operate on `ndarray`. Destination: `ferray-core` (array type), `ferray-ufunc` (elementwise `exp`/distance), `ferray::linalg` (the `X·Yᵀ` dot for DotProduct). Not migrated. The new `bessel::bessel_k`/`statrs` `gamma` primitives for REQ-10 are likewise unmigrated — their destination is a `ferray::stats`/special-functions analog (`scipy.special.kv`/`gamma`); implemented in-crate now as the REQ-10 unblock (R-SUBSTRATE-5 follow-up). |
 
 ## Architecture
 
@@ -259,11 +260,13 @@ kernel, hence NOT-STARTED rather than absent-by-design.
 
 The kernel formulas themselves (REQ-1..5) are value-exact: `squared_distances`/
 `euclidean_distances` build the pairwise distance matrix, and each `compute`
-applies the closed-form covariance. Three element-wise divergences in the
-existing kernels are pinned NOT-STARTED: the Matern `else` RBF fallback for
-unsupported `nu` (REQ-10), the WhiteKernel row-equality vs `Y is None` semantics
-(REQ-11), and the scalar-only `length_scale` (REQ-12). Constructor defaults
-(REQ-14) and four missing kernels (REQ-13) round out the surface gap.
+applies the closed-form covariance. The former Matern `else` RBF fallback for
+unsupported `nu` is now the true modified-Bessel formula (REQ-10, SHIPPED — the
+`bessel::bessel_k` `K_ν` + `statrs` `gamma`). Two element-wise divergences in the
+existing kernels remain pinned NOT-STARTED: the WhiteKernel row-equality vs
+`Y is None` semantics (REQ-11) and the scalar-only `length_scale` (REQ-12).
+Constructor defaults (REQ-14, SHIPPED) and four missing kernels (REQ-13) round
+out the surface gap.
 
 Invariants: `compute` returns `(n1, n2)`; `diagonal` returns `(n,)`; for every
 stationary kernel `diagonal(X)` ≡ `compute(X, X)` diagonal (1 for RBF/Matern,
@@ -300,10 +303,6 @@ all deterministic, all oracle-pinnable now):
   trait method is added.
 - REQ-9 (theta/bounds): `(Const(2.0)*RBF(1.5)+White(0.1)).bounds.shape ==
   (3,2)`, `.n_dims == 3`. ferrolearn exposes neither.
-- REQ-10 (Matern general nu): `Matern(1.0, nu=3.5)(X) = [[1, 0.544942,
-  0.544942], ...]` vs ferrolearn's fallback `RBF(1.0)(X) = [[1, 0.606531, ...]]`
-  — the off-by-Bessel mismatch is the pinned divergence; `Matern(nu=inf)(X) ==
-  RBF(1.0)(X)`.
 - REQ-11 (WhiteKernel Y-is-None): `WhiteKernel(0.1)(X, X)` (explicit Y) is the
   all-zeros `(3,3)` in sklearn; ferrolearn's `compute(X, X)` returns `0.1·I`.
 - REQ-12 (anisotropic): `RBF(length_scale=[1.0, 2.0])(X)` ≠ any scalar-`l` RBF.
@@ -317,12 +316,12 @@ all deterministic, all oracle-pinnable now):
 Per R-DEFER-2 the table is binary SHIPPED/NOT-STARTED. SHIPPED: REQ-1 (RBF),
 REQ-2 (Matern 0.5/1.5/2.5), REQ-3 (Constant), REQ-4 (DotProduct), REQ-5
 (Sum/Product + theta order), REQ-6 (log-space round-trip), REQ-7 (GPR/GPC
-consumer) — impl + non-test GP consumer + green verification. NOT-STARTED (the
-critic files per-REQ `-l blocker` issues): REQ-8 (eval_gradient / `dK/dθ`),
-REQ-9 (theta/bounds/Hyperparameter/fixed), REQ-10 (Matern general-`nu`/Bessel +
-`nu=inf`), REQ-11 (WhiteKernel `Y is None` semantics), REQ-12 (anisotropic
-`length_scale`), REQ-13 (RationalQuadratic/ExpSineSquared/Exponentiation/
-CompoundKernel), REQ-14 (constructor defaults / `Default`), REQ-15 (ferray
+consumer), REQ-10 (Matern general-`nu`/Bessel + `nu=inf`), REQ-14 (constructor
+defaults / `Default`) — impl + non-test GP consumer + green verification.
+NOT-STARTED (the critic files per-REQ `-l blocker` issues): REQ-8 (eval_gradient
+/ `dK/dθ`), REQ-9 (theta/bounds/Hyperparameter/fixed), REQ-11 (WhiteKernel
+`Y is None` semantics), REQ-12 (anisotropic `length_scale`), REQ-13
+(RationalQuadratic/ExpSineSquared/Exponentiation/CompoundKernel), REQ-15 (ferray
 substrate). GP kernels are deterministic, so every NOT-STARTED is a
 missing-feature or element-wise-divergence blocker that is oracle-pinnable now —
 there is no RNG/generator carve-out here (cf. `nystroem.md` REQ-8).

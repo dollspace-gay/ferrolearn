@@ -1122,6 +1122,22 @@ design = ".design/kernel/gp_kernels.md"
 parity_ops = ["RBF", "Matern", "ConstantKernel", "WhiteKernel", "DotProduct", "Sum", "Product"]
 
 [[route]]
+crate_pattern = "ferrolearn-kernel/src/bessel.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/kernels.py"]
+design = ".design/kernel/gp_kernels.md"
+parity_ops = ["kv"]
+
+# The crate-root re-export aggregator (mirrors the ferrolearn-linear/src/lib.rs
+# and ferrolearn-preprocess/src/lib.rs precedent: routed against the crate's
+# public API boundary). Declares the per-module re-exports; the `mod bessel;`
+# wiring for the general-nu Matern K_ν lands here.
+[[route]]
+crate_pattern = "ferrolearn-kernel/src/lib.rs"
+upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/kernels.py"]
+design = ".design/kernel/gp_kernels.md"
+parity_ops = ["re-export boundary"]
+
+[[route]]
 crate_pattern = "ferrolearn-kernel/src/gaussian_process.rs"
 upstream = ["/home/doll/scikit-learn/sklearn/gaussian_process/_gpr.py"]
 design = ".design/kernel/gaussian_process.md"

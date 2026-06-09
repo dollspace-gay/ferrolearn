@@ -441,7 +441,6 @@ fn green_normalize_y_constant_target() {
 ///
 /// Tracking: #2375 (GPR-level); root blocker gp_kernels #1914.
 #[test]
-#[ignore = "divergence: GPR Matern general-nu (3.5) predict/std falls back to RBF; tracking #2375"]
 fn divergence_matern_general_nu_predict_std() {
     use ferrolearn_kernel::MaternKernel;
 
@@ -449,8 +448,7 @@ fn divergence_matern_general_nu_predict_std() {
     const ORACLE_MEAN: [f64; 2] = [0.249_762_843_672_272_03, 5.840_091_440_863_044];
     const ORACLE_STD: [f64; 2] = [0.247_746_953_773_736_54, 0.230_441_631_809_664_73];
 
-    let gp =
-        GaussianProcessRegressor::new(Box::new(MaternKernel::new(1.0, 3.5))).alpha(1e-10);
+    let gp = GaussianProcessRegressor::new(Box::new(MaternKernel::new(1.0, 3.5))).alpha(1e-10);
     let fitted = gp.fit(&x_train(), &y_train()).unwrap();
     let (mean, std) = fitted.predict_with_std(&x_query()).unwrap();
 

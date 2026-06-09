@@ -10,7 +10,7 @@
 //! | Kernel | Formula |
 //! |--------|---------|
 //! | [`RBFKernel`] | `k(x, x') = exp(-||x - x'||^2 / (2 l^2))` |
-//! | [`MaternKernel`] | Matern family (nu = 0.5, 1.5, 2.5) |
+//! | [`MaternKernel`] | Matern family (any nu via closed forms / Bessel K_ν / nu=inf→RBF) |
 //! | [`ConstantKernel`] | `k(x, x') = c` |
 //! | [`WhiteKernel`] | `k(x, x') = sigma^2 * delta(x, x')` |
 //! | [`DotProductKernel`] | `k(x, x') = sigma_0^2 + x . x'` |
@@ -28,12 +28,12 @@
 //! oracle-verified element-wise (18 green guards in `tests/divergence_gp_kernels.rs`).
 //! The gaps are missing-feature / prerequisite blockers, not value errors.
 //!
-//! **7 SHIPPED / 8 NOT-STARTED.**
+//! **8 SHIPPED / 7 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
 //! | REQ-1 (`RBFKernel`) | SHIPPED | `exp(-‖x−x'‖²/(2·length_scale²))` matches `RBF(length_scale)` (`kernels.py:1445`); oracle element-wise <1e-12. |
-//! | REQ-2 (`MaternKernel`, nu ∈ {0.5, 1.5, 2.5}) | SHIPPED | the three closed-form Matern formulas match `Matern(length_scale, nu)` (`:1598`) for the supported nu; oracle <1e-12. (General nu is REQ-10.) |
+//! | REQ-2 (`MaternKernel`, nu ∈ {0.5, 1.5, 2.5}) | SHIPPED | the three closed-form Matern formulas match `Matern(length_scale, nu)` (`:1598`) for the supported nu; oracle <1e-12. (General nu is REQ-10, now SHIPPED.) |
 //! | REQ-3 (`ConstantKernel`) | SHIPPED | `k = constant_value` matches `ConstantKernel(constant_value)` (`:1184`); oracle. |
 //! | REQ-4 (`DotProductKernel`) | SHIPPED | `k = sigma_0² + x·x'` matches `DotProduct(sigma_0)` (`:2099`); oracle. |
 //! | REQ-5 (`SumKernel` / `ProductKernel`) | SHIPPED | `k1 ± k2` / `k1·k2` element-wise + diagonal match sklearn `Sum`/`Product` (`:796`,`:893`); theta concatenation order (k1 then k2) matches. |
@@ -41,7 +41,7 @@
 //! | REQ-7 (production consumer) | SHIPPED | `GaussianProcessRegressor`/`GaussianProcessClassifier` (`gaussian_process.rs`, `gp_classifier.rs`) consume `compute`/`diagonal` in `fit`/`predict`; re-exported via `lib.rs`. |
 //! | REQ-8 (`eval_gradient` / dK/dθ) | NOT-STARTED | trait has `compute`/`diagonal` only; sklearn `__call__(eval_gradient=True)` returns `(K, K_gradient)` shape `(n,n,n_dims)` for the GPR LML optimizer. Blocker #1912. |
 //! | REQ-9 (theta/bounds/Hyperparameter machinery) | NOT-STARTED | no `bounds`/`Hyperparameter`/`fixed`/`n_dims`; only flat log-space params (`:272-358`). Blocker #1913. |
-//! | REQ-10 (Matern general nu) | NOT-STARTED | `compute` falls back to RBF for nu ∉ {0.5,1.5,2.5}; sklearn uses the modified-Bessel general formula + nu=∞→RBF (`:1646-1660`). Oracle `Matern(1.0,3.5)[0,1]=0.5449` vs ferrolearn RBF `0.6065`. Needs a `kv`/`gamma` special function. Blocker #1914. |
+//! | REQ-10 (Matern general nu) | SHIPPED | `MaternKernel::compute` now evaluates the modified-Bessel general formula `(2^{1-ν}/Γ(ν))·(√(2ν)·d)^ν·K_ν(√(2ν)·d)` for nu ∉ {0.5,1.5,2.5,inf} (`kernels.py:1729-1735`) and `nu=inf → exp(-d²/2)` (RBF, `:1727-1728`); `d≈0 → 1.0`. `K_ν` via `crate::bessel::bessel_k` (Numerical Recipes `bessik`, Temme series + CF2, ~1e-10 vs `scipy.special.kv`); Γ via `statrs::function::gamma::gamma`. Oracle `Matern(1.0,3.5)(X)[0,1]=0.5449424471128748` matches (no longer the RBF `0.6065`). Non-test consumer: `GaussianProcessRegressor` (`gaussian_process.rs` `fn fit`/`predict` via `kernel.compute`) — guarded by `tests/divergence_gaussian_process.rs::divergence_matern_general_nu_predict_std` (un-ignored). In-crate: `matern_general_nu_35_matches_sklearn`/`matern_general_nu_07_matches_sklearn`/`matern_nu_inf_is_rbf`/`matern_general_agrees_with_closed_forms`; `bessel::tests::kv_matches_scipy_oracle`. (Closes #1914, #2375.) |
 //! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
 //! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
 //! | REQ-13 (missing kernels) | NOT-STARTED | no `RationalQuadratic` (`:1798`), `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). Blocker #1917. |
@@ -192,19 +192,29 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for RBFKernel<F> {
 
 /// Matern kernel with parameter `nu` controlling smoothness.
 ///
-/// Supported values of `nu`:
+/// Any `nu > 0` is supported, matching `sklearn.gaussian_process.kernels.Matern`.
+/// The half-integer cases use the analytic closed forms; `nu = inf` reduces to
+/// the [`RBFKernel`]; every other `nu` evaluates the general modified-Bessel
+/// formula (`kernels.py:1729-1735`).
+///
 /// - `0.5`: Exponential kernel (Ornstein-Uhlenbeck). Produces rough, non-differentiable paths.
 /// - `1.5`: Once-differentiable functions. Good default for many applications.
 /// - `2.5`: Twice-differentiable functions. Smoother than 1.5, less smooth than RBF.
+/// - `inf`: equivalent to the RBF (squared-exponential) kernel.
 ///
-/// For nu = 0.5: `k(x,x') = exp(-r/l)` where `r = ||x - x'||`
-/// For nu = 1.5: `k(x,x') = (1 + sqrt(3)*r/l) * exp(-sqrt(3)*r/l)`
-/// For nu = 2.5: `k(x,x') = (1 + sqrt(5)*r/l + 5*r^2/(3*l^2)) * exp(-sqrt(5)*r/l)`
+/// Closed forms (`r = ||x - x'||`):
+/// - nu = 0.5: `k(x,x') = exp(-r/l)`
+/// - nu = 1.5: `k(x,x') = (1 + sqrt(3)*r/l) * exp(-sqrt(3)*r/l)`
+/// - nu = 2.5: `k(x,x') = (1 + sqrt(5)*r/l + 5*r^2/(3*l^2)) * exp(-sqrt(5)*r/l)`
+///
+/// General nu (`d = r/l`, `K_ν` the modified Bessel function of the second kind):
+/// `k(x,x') = (2^{1-ν}/Γ(ν)) · (sqrt(2ν)·d)^ν · K_ν(sqrt(2ν)·d)`, with the limit
+/// `k → 1` as `d → 0`.
 #[derive(Debug, Clone)]
 pub struct MaternKernel<F> {
     /// Length scale parameter.
     pub length_scale: F,
-    /// Smoothness parameter. Must be one of `0.5`, `1.5`, or `2.5`.
+    /// Smoothness parameter. Any `nu > 0` (or `inf` for the RBF limit).
     pub nu: F,
 }
 
@@ -214,7 +224,9 @@ impl<F: Float> MaternKernel<F> {
     /// # Arguments
     ///
     /// * `length_scale` - Length scale parameter (positive).
-    /// * `nu` - Smoothness parameter. Must be `0.5`, `1.5`, or `2.5`.
+    /// * `nu` - Smoothness parameter. Any `nu > 0` (or `inf` for the RBF limit);
+    ///   the half-integer values `0.5/1.5/2.5` use the closed forms, all other
+    ///   `nu` use the general modified-Bessel formula.
     #[must_use]
     pub fn new(length_scale: F, nu: F) -> Self {
         Self { length_scale, nu }
@@ -255,12 +267,34 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for MaternKernel<F> {
                 let r_over_l = r / ls;
                 (F::one() + z + five_thirds * r_over_l * r_over_l) * (-z).exp()
             })
-        } else {
-            // Fallback: treat as RBF-like for unsupported nu
-            let two = F::from(2.0).unwrap();
+        } else if self.nu.is_infinite() {
+            // nu = inf: the RBF (squared-exponential) limit
+            // (`kernels.py:1727-1728`: `K = exp(-(dists**2)/2)`).
+            let two = F::one() + F::one();
             let ls2 = ls * ls;
             let sq = squared_distances(x1, x2);
             sq.mapv(|d| (-d / (two * ls2)).exp())
+        } else {
+            // General nu: the modified-Bessel Matern (`kernels.py:1729-1735`):
+            //   K = (2^{1-ν}/Γ(ν)) · t^ν · K_ν(t),  t = √(2ν)·(d/l),
+            // where d is the Euclidean distance and K_ν is the modified Bessel
+            // function of the second kind (`scipy.special.kv` → `bessel_k`).
+            // At d → 0 the kernel limit is 1 (sklearn adds `eps` to dodge the
+            // 0·∞; we special-case d ≈ 0 → 1.0 directly).
+            let nu = self.nu.to_f64().unwrap_or(f64::NAN);
+            let gamma_nu = statrs::function::gamma::gamma(nu);
+            let coef = 2.0_f64.powf(1.0 - nu) / gamma_nu;
+            let sqrt_2nu = (2.0 * nu).sqrt();
+            let eps = F::from(1e-12).unwrap_or_else(F::zero);
+            dists.mapv(|r| {
+                if r <= eps {
+                    return F::one();
+                }
+                let d = (r / ls).to_f64().unwrap_or(f64::NAN);
+                let t = sqrt_2nu * d;
+                let val = coef * t.powf(nu) * crate::bessel::bessel_k(nu, t);
+                F::from(val).unwrap_or_else(F::zero)
+            })
         }
     }
 
@@ -748,6 +782,94 @@ mod tests {
         let diag = k.diagonal(&x);
         for &d in &diag {
             assert_abs_diff_eq!(d, 1.0, epsilon = 1e-12);
+        }
+    }
+
+    /// General-nu Matern via the modified Bessel `K_ν` (REQ-10).
+    /// Live sklearn 1.5.2 oracle (R-CHAR-3), `X=[[0,0],[1,0],[0,1]]` (== `make_x1`):
+    /// `Matern(length_scale=1.0, nu=3.5)(X)` →
+    /// `[[1, 0.5449424471128748, 0.5449424471128748],
+    ///   [0.5449424471128748, 1, 0.3280670124332057],
+    ///   [0.5449424471128748, 0.3280670124332057, 1]]`.
+    /// Generated by:
+    /// `python3 -c "import numpy as np; from sklearn.gaussian_process.kernels \
+    ///   import Matern; X=np.array([[0.,0.],[1.,0.],[0.,1.]]); \
+    ///   print(Matern(length_scale=1.0,nu=3.5)(X).tolist())"`.
+    #[test]
+    fn matern_general_nu_35_matches_sklearn() {
+        let k = MaternKernel::new(1.0, 3.5);
+        let x = make_x1();
+        let km = k.compute(&x, &x);
+        // diagonal = 1 (d=0 limit)
+        for i in 0..3 {
+            assert_abs_diff_eq!(km[[i, i]], 1.0, epsilon = 1e-12);
+        }
+        // off-diagonal: distance 1 -> 0.5449424471128748,
+        // distance sqrt(2) -> 0.3280670124332057.
+        assert_abs_diff_eq!(km[[0, 1]], 0.544_942_447_112_874_8, epsilon = 1e-9);
+        assert_abs_diff_eq!(km[[0, 2]], 0.544_942_447_112_874_8, epsilon = 1e-9);
+        assert_abs_diff_eq!(km[[1, 2]], 0.328_067_012_433_205_7, epsilon = 1e-9);
+        // This is NOT the RBF value (would be 0.6065306597126334) — the silent
+        // fallback is gone.
+        assert!((km[[0, 1]] - 0.606_530_659_712_633_4).abs() > 1e-3);
+    }
+
+    /// Non-half-integer nu (`nu=0.7`) Matern via `K_ν`. Live sklearn oracle:
+    /// `Matern(length_scale=1.0, nu=0.7)(X)[0,1] = 0.406181840375756`,
+    /// `[1,2] = 0.26180486407843745`.
+    #[test]
+    fn matern_general_nu_07_matches_sklearn() {
+        let k = MaternKernel::new(1.0, 0.7);
+        let x = make_x1();
+        let km = k.compute(&x, &x);
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 0.406_181_840_375_756, epsilon = 1e-9);
+        assert_abs_diff_eq!(km[[1, 2]], 0.261_804_864_078_437_45, epsilon = 1e-9);
+    }
+
+    /// nu = inf reduces to the RBF kernel (`kernels.py:1727-1728`).
+    /// Live oracle: `Matern(length_scale=1.0, nu=np.inf)(X) == RBF(1.0)(X)`.
+    #[test]
+    fn matern_nu_inf_is_rbf() {
+        let x = make_x1();
+        let km = MaternKernel::new(1.0, f64::INFINITY).compute(&x, &x);
+        let rbf = RBFKernel::new(1.0).compute(&x, &x);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert_abs_diff_eq!(km[[i, j]], rbf[[i, j]], epsilon = 1e-12);
+            }
+        }
+    }
+
+    /// Cross-check: the general-nu Bessel formula AGREES with the dedicated
+    /// closed forms at `nu ∈ {1.5, 2.5}` (the closed forms ARE the analytic
+    /// simplification of the Bessel formula for half-integer nu).
+    #[test]
+    fn matern_general_agrees_with_closed_forms() {
+        use crate::bessel::bessel_k;
+        let gamma = statrs::function::gamma::gamma;
+        for &d in &[0.5_f64, 1.0, 2.0, 3.7] {
+            // nu = 1.5 closed form: (1 + sqrt(3) d)·exp(-sqrt(3) d)
+            let z3 = 3.0_f64.sqrt() * d;
+            let closed_15 = (1.0 + z3) * (-z3).exp();
+            let nu = 1.5;
+            let t = (2.0 * nu).sqrt() * d;
+            let gen_15 = 2.0_f64.powf(1.0 - nu) / gamma(nu) * t.powf(nu) * bessel_k(nu, t);
+            assert!(
+                (gen_15 - closed_15).abs() < 1e-9,
+                "nu=1.5 d={d}: general={gen_15}, closed={closed_15}"
+            );
+
+            // nu = 2.5 closed form: (1 + sqrt(5) d + 5 d^2/3)·exp(-sqrt(5) d)
+            let z5 = 5.0_f64.sqrt() * d;
+            let closed_25 = (1.0 + z5 + 5.0 * d * d / 3.0) * (-z5).exp();
+            let nu = 2.5;
+            let t = (2.0 * nu).sqrt() * d;
+            let gen_25 = 2.0_f64.powf(1.0 - nu) / gamma(nu) * t.powf(nu) * bessel_k(nu, t);
+            assert!(
+                (gen_25 - closed_25).abs() < 1e-9,
+                "nu=2.5 d={d}: general={gen_25}, closed={closed_25}"
+            );
         }
     }
 
