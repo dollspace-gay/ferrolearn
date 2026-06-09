@@ -5,7 +5,7 @@
 //! `sklearn.feature_selection.VarianceThreshold`. Expected values come from the
 //! LIVE sklearn 1.5.2 oracle (cited inline), never copied from ferrolearn.
 
-use ferrolearn_core::traits::{Fit, Transform};
+use ferrolearn_core::traits::Fit;
 use ferrolearn_preprocess::feature_selection::VarianceThreshold;
 use ndarray::array;
 
@@ -26,7 +26,6 @@ use ndarray::array;
 /// ferrolearn computes var = NaN for column 0 and DROPS it (support == []).
 /// Tracking: #2350
 #[test]
-#[ignore = "divergence: VarianceThreshold uses raw Welford not np.nanvar, drops NaN columns; tracking #2350"]
 fn divergence_variance_threshold_nanvar_keeps_column() {
     let sel = VarianceThreshold::<f64>::new(0.0);
     let x = array![[1.0, 7.0], [2.0, 7.0], [f64::NAN, 7.0]];
@@ -59,7 +58,6 @@ fn divergence_variance_threshold_nanvar_keeps_column() {
 /// ```
 /// Tracking: #2351
 #[test]
-#[ignore = "divergence: VarianceThreshold does not raise when all features removed; tracking #2351"]
 fn divergence_variance_threshold_all_removed_raises() {
     let sel = VarianceThreshold::<f64>::new(0.0);
     let x = array![[5.0, 3.0], [5.0, 3.0], [5.0, 3.0]];
@@ -84,7 +82,6 @@ fn divergence_variance_threshold_all_removed_raises() {
 /// ```
 /// Tracking: #2351
 #[test]
-#[ignore = "divergence: VarianceThreshold single-sample does not raise; tracking #2351"]
 fn divergence_variance_threshold_single_sample_raises() {
     let sel = VarianceThreshold::<f64>::new(0.0);
     let x = array![[1.0, 2.0, 3.0]];

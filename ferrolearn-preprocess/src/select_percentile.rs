@@ -14,6 +14,7 @@
 //! |---|---|---|
 //! | REQ-1 ANOVA F-score value match (f_classif, finite) | SHIPPED | `anova_f_scores`; sklearn `_univariate_selection.py:127`,`:43-117` |
 //! | REQ-2 selection mask `_get_support_mask` (threshold + tie-fill) | SHIPPED (#1274) | `SelectPercentile::fit` `numpy_percentile`; sklearn `_univariate_selection.py:669-686` |
+//! | REQ-2b `numpy_percentile` NaN/inf PROPAGATION (numpy is NOT nan-aware) | SHIPPED (#2352) | `numpy_percentile` replicates numpy's `_get_indexes`+`_lerp` verbatim: `vi=(q/100)(n-1)`, `lo=floor(vi)`, `hi=lo+1` (clamped), `diff=b-a`, `a+diff*t` / `b-diff*(1-t)` — ALWAYS forming `diff` even at `lo==hi`, so a NaN/`inf` poisons the threshold to NaN and `scores > NaN` → EMPTY mask (the old `lo==hi → sorted[lo]` short-circuit dodged this). Oracle: scores `[inf,0.2,nan]`, pct=50 → np.percentile=NaN → support `[]`; ferrolearn matched (inf case exact, not just NaN). Test: `tests/divergence_select_percentile_2349.rs`. |
 //! | REQ-3 InsufficientSamples / ShapeMismatch / InvalidParameter errors | SHIPPED | `fit` / `transform` guards; sklearn `_univariate_selection.py:662` |
 //! | REQ-4 `_clean_nans` (NaN scores → dtype.min) | NOT-STARTED (#1275) | sklearn `_univariate_selection.py:24`,`:678` |
 //! | REQ-5 pluggable score_func (chi2/f_regression/mutual_info_*) | NOT-STARTED (#1276) | sklearn `_univariate_selection.py:202`,`:405`,`:596-599` |
@@ -92,12 +93,36 @@ fn anova_f_scores<F: Float>(x: &Array2<F>, y: &Array1<usize>) -> Vec<F> {
     scores
 }
 
-/// Compute `np.percentile(sorted, q)` with the default `'linear'` interpolation.
+/// Compute `np.percentile(sorted, q)` with the default `'linear'` interpolation,
+/// replicating numpy's EXACT lerp — including its `inf`/`NaN` propagation.
 ///
-/// `sorted` must be ascending. `q` is in `[0, 100]`. Mirrors numpy's default
-/// percentile (linear interpolation), the same idiom as `quantile_sorted` in
-/// `robust_scaler.rs`. Used to reproduce sklearn `_get_support_mask`
+/// `sorted` must be ascending. `q` is in `[0, 100]`. Used to reproduce sklearn
+/// `_get_support_mask` `threshold = np.percentile(scores, 100 - percentile)`
 /// (`_univariate_selection.py:679`).
+///
+/// numpy is NOT nan-aware: a NaN (or an `inf`-poisoned interpolation) in the
+/// score array produces a NaN threshold, and `scores > NaN` is false for every
+/// feature → an EMPTY mask (#2352). We mirror numpy's algorithm verbatim
+/// (`numpy/lib/_function_base_impl.py` `_get_indexes` + `_lerp`):
+///
+/// ```text
+/// vi = (q/100) * (n - 1)                  # virtual index (linear method)
+/// lo = floor(vi); hi = lo + 1             # neighbouring integer indices
+/// if vi >= n - 1: lo = hi = n - 1         # clamp to the last element
+/// if vi < 0:      lo = hi = 0             # clamp to the first element
+/// a = sorted[lo]; b = sorted[hi]; t = vi - floor(vi)
+/// diff = b - a
+/// lerp = a + diff * t                     # t < 0.5 branch
+/// if t >= 0.5: lerp = b - diff * (1 - t)  # t >= 0.5 branch
+/// ```
+///
+/// The crucial footgun (R-DEV-4): numpy ALWAYS forms `diff = b - a` and
+/// `diff * t` even when the two bracketing values are equal/`inf`. So
+/// `[0.2, inf]` at the top gives `inf - 0.2 = inf`, `inf * 0 = NaN`; and two
+/// `inf`s give `inf - inf = NaN`. The previous `lo == hi → sorted[lo]`
+/// short-circuit dodged this arithmetic and returned a finite threshold,
+/// diverging from numpy (it selected the `+inf` feature when sklearn selects
+/// nothing).
 fn numpy_percentile<F: Float>(sorted: &[F], q: f64) -> F {
     let n = sorted.len();
     if n == 0 {
@@ -106,14 +131,30 @@ fn numpy_percentile<F: Float>(sorted: &[F], q: f64) -> F {
     if n == 1 {
         return sorted[0];
     }
-    let idx = (q / 100.0) * (n - 1) as f64;
-    let lo = idx.floor() as usize;
-    let hi = idx.ceil() as usize;
-    if lo == hi {
-        return sorted[lo];
+    let vi = (q / 100.0) * (n - 1) as f64;
+    let prev = vi.floor();
+    // numpy's _get_indexes: previous = floor(vi), next = previous + 1, then
+    // clamp both to n-1 when vi >= n-1 (negative-index trick) and to 0 when
+    // vi < 0. For q in [0, 100] only the upper clamp ever fires.
+    let (lo, hi) = if vi >= (n - 1) as f64 {
+        (n - 1, n - 1)
+    } else if vi < 0.0 {
+        (0, 0)
+    } else {
+        let lo = prev as usize;
+        (lo, lo + 1)
+    };
+    let t = F::from(vi - prev).unwrap_or_else(F::zero);
+    let a = sorted[lo];
+    let b = sorted[hi];
+    let diff = b - a;
+    if t >= F::from(0.5).unwrap_or_else(F::zero) {
+        // numpy: subtract(b, diff * (1 - t)) where t >= 0.5.
+        b - diff * (F::one() - t)
+    } else {
+        // numpy: add(a, diff * t).
+        a + diff * t
     }
-    let frac = F::from(idx - lo as f64).unwrap_or_else(F::zero);
-    sorted[lo] + (sorted[hi] - sorted[lo]) * frac
 }
 
 /// Build a new `Array2<F>` containing only the columns listed in `indices`.

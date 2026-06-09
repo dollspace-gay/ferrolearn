@@ -5,7 +5,7 @@
 use ferrolearn_core::traits::Fit;
 use ferrolearn_preprocess::feature_selection::ScoreFunc;
 use ferrolearn_preprocess::select_percentile::SelectPercentile;
-use ndarray::{array, Array1};
+use ndarray::{Array1, array};
 
 /// Divergence: sklearn's `SelectPercentile._get_support_mask`
 /// (`sklearn/feature_selection/_univariate_selection.py:678-679`) computes the
@@ -30,7 +30,6 @@ use ndarray::{array, Array1};
 /// ferrolearn returns `[0]`.
 /// Tracking: #2352
 #[test]
-#[ignore = "divergence: SelectPercentile threshold not NaN-poisoned by inf+finfo.min like np.percentile; tracking #2352"]
 fn divergence_select_percentile_inf_constant_nan_threshold() {
     let sel = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif);
     let x = array![

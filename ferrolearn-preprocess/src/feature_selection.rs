@@ -29,7 +29,8 @@
 //! | REQ-2 | [`SelectKBest`] ANOVA F-score VALUES (finite / non-constant) | SHIPPED | `anova_f_scores` matches `f_oneway` `_univariate_selection.py:43-117`; oracle score tests (tol 1e-9) |
 //! | REQ-3 | [`SelectKBest`] top-k SELECTION (tie-break + constant-feature + k-boundary) | SHIPPED | matches sklearn `mask[argsort(scores, mergesort)[-k:]]` `:794` (ties → higher index) + `_clean_nans` `:24-33` (constant feature → NaN → finfo.min → ranks last) + `k>n_features` clamp-keep-all `:774-779`; constant `anova_f_scores` now NaN (was +inf), verified across multi-tie/multi-constant/k∈{0,all,>n}/mixed/f32 (21 oracle tests — was DIV-A/B #1425 + DIV-C #1426, fixed) |
 //! | REQ-4 | Error/parameter contracts (VarianceThreshold threshold<0/zero-rows; SelectKBest zero-rows/y-mismatch) | SHIPPED (scoped) | per-fn guards; divergence error tests |
-//! | REQ-5 | VarianceThreshold `threshold==0` peak-to-peak guard (`min(var, ptp)>0`) + `np.nanvar` NaN-handling | NOT-STARTED | sklearn `_variance_threshold.py:113-120` — blocker #1427 |
+//! | REQ-5a | VarianceThreshold `np.nanvar` NaN-handling + "no feature meets threshold" ValueError | SHIPPED | `fit` skips NaN in the Welford pass (population var over FINITE values, ddof=0, all-NaN col → NaN), matching `np.nanvar` (`_variance_threshold.py:112`, `force_all_finite="allow-nan"` `:103`); raises `InvalidParameter("No feature in X meets the variance threshold {:.5}" [+ " (X contains only one sample)"])` when no `var > threshold`, matching `:121-126`. Oracle: `X=[[1,7],[2,7],[NaN,7]]` → `variances_=[0.25,0.0]`, support `[0]`; all-constant / single-sample → ValueError. Consumer: re-export `lib.rs` + `PipelineTransformer`. Tests: `tests/divergence_variance_threshold_2349.rs` (#2350 #2351). |
+//! | REQ-5b | VarianceThreshold `threshold==0` peak-to-peak guard (`min(var, ptp)`) | NOT-STARTED | sklearn `_variance_threshold.py:113-120` — blocker #1427 (ptp-guard only; nanvar+ValueError shipped as REQ-5a) |
 //! | REQ-6 | SelectKBest `k='all'` string + pluggable `score_func` (chi2/f_regression/mutual_info) + general `_clean_nans` | NOT-STARTED | `usize` k + `FClassif` only; sklearn `_univariate_selection.py:770-795` — blocker #1428 |
 //! | REQ-7 | `GenericUnivariateSelect` (mode meta-selector) | NOT-STARTED | absent (route parity_op); sklearn `_univariate_selection.py:1054` — blocker #1429 |
 //! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) + `scores_`/`pvalues_`/`n_features_in_` attrs | NOT-STARTED | sklearn `_univariate_selection.py:526` — blocker #1430 |
@@ -185,34 +186,71 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for VarianceThreshold<
             });
         }
 
-        let n = F::from(n_samples).unwrap_or_else(F::one);
         let n_features = x.ncols();
         let mut variances = Array1::zeros(n_features);
         let mut selected_indices = Vec::new();
 
         for j in 0..n_features {
             let col = x.column(j);
-            // Welford's online algorithm — numerically stable and yields
-            // *exactly* zero for constant columns, matching numpy/sklearn.
-            // The naive `sum((v-mean)^2) / n` accumulates FP error during
-            // the `sum / n` step and produces ~1e-34 noise on constant
-            // columns, defeating the `threshold=0.0 ⇒ drop constants`
-            // contract that sklearn ships.
+            // sklearn computes `variances_ = np.nanvar(X, axis=0)`
+            // (`_variance_threshold.py:112`, `force_all_finite="allow-nan"`
+            // `:103`): NaN entries are IGNORED and the population variance
+            // (ddof=0) is taken over the FINITE values only. We replicate
+            // np.nanvar with a NaN-skipping Welford pass — numerically stable,
+            // yields *exactly* zero for constant columns (defeating the
+            // ~1e-34 FP noise the naive `Σ(v-mean)²/n` accumulates), and a
+            // column whose finite values are e.g. {1, 2} has nanvar 0.25 even
+            // though it contains a NaN. An ALL-NaN column has zero finite
+            // values → nanvar is NaN (np.nanvar of an all-NaN slice → NaN with
+            // a "Degrees of freedom <= 0" warning), and `NaN > threshold` is
+            // false so the column is dropped (matching `_get_support_mask`
+            // `variances_ > threshold` `:133`).
             let mut mean = F::zero();
             let mut m2 = F::zero();
             let mut count = F::zero();
             for &v in col.iter() {
+                if v.is_nan() {
+                    continue;
+                }
                 count = count + F::one();
                 let delta = v - mean;
                 mean = mean + delta / count;
                 let delta2 = v - mean;
                 m2 = m2 + delta * delta2;
             }
-            let var = m2 / n;
+            // np.nanvar over zero finite values → NaN (ddof=0, empty slice).
+            let var = if count == F::zero() {
+                F::nan()
+            } else {
+                m2 / count
+            };
             variances[j] = var;
             if var > self.threshold {
                 selected_indices.push(j);
             }
+        }
+
+        // sklearn raises when NO feature meets the threshold
+        // (`_variance_threshold.py:121-126`):
+        //   if np.all(~np.isfinite(variances_) | (variances_ <= threshold)):
+        //       msg = "No feature in X meets the variance threshold {0:.5f}"
+        //       if X.shape[0] == 1: msg += " (X contains only one sample)"
+        //       raise ValueError(msg.format(threshold))
+        // A column counts as "not meeting" when its variance is non-finite
+        // (NaN/inf) OR `<= threshold`. The single-sample case falls in here
+        // naturally (every finite variance is 0 ≤ threshold). `selected_indices`
+        // already holds exactly the columns with `variance > threshold`, so an
+        // empty selection is precisely the raise condition.
+        if selected_indices.is_empty() {
+            let threshold = self.threshold.to_f64().unwrap_or(0.0);
+            let mut reason = format!("No feature in X meets the variance threshold {threshold:.5}");
+            if n_samples == 1 {
+                reason.push_str(" (X contains only one sample)");
+            }
+            return Err(FerroError::InvalidParameter {
+                name: "threshold".into(),
+                reason,
+            });
         }
 
         Ok(FittedVarianceThreshold {
@@ -820,10 +858,18 @@ mod tests {
 
     #[test]
     fn test_variance_threshold_stores_variances() {
+        // A single constant column has variance 0, which does not exceed the
+        // default threshold 0.0 — sklearn raises ValueError("No feature in X
+        // meets the variance threshold 0.00000")
+        // (`_variance_threshold.py:121-126`). Use a NON-constant column to
+        // exercise the variance-storage path on a fit that succeeds.
         let sel = VarianceThreshold::<f64>::default();
-        let x = array![[0.0], [0.0], [0.0]]; // constant → var = 0
-        let fitted = sel.fit(&x, &()).unwrap();
-        assert_abs_diff_eq!(fitted.variances()[0], 0.0, epsilon = 1e-15);
+        let x = array![[0.0], [2.0], [4.0]]; // var = 8/3 ~ 2.667 > 0 -> kept
+        let fitted = sel.fit(&x, &());
+        assert!(fitted.is_ok(), "non-constant column should fit");
+        if let Ok(f) = fitted {
+            assert_abs_diff_eq!(f.variances()[0], 8.0 / 3.0, epsilon = 1e-15);
+        }
     }
 
     #[test]
@@ -851,14 +897,22 @@ mod tests {
 
     #[test]
     fn test_variance_threshold_all_constant_columns() {
+        // Both columns are constant → no feature meets the threshold → sklearn
+        // raises ValueError("No feature in X meets the variance threshold
+        // 0.00000") (`_variance_threshold.py:121-126`). ferrolearn surfaces it
+        // as InvalidParameter (maps to ValueError at the Python boundary).
         let sel = VarianceThreshold::<f64>::new(0.0);
         let x = array![[5.0, 3.0], [5.0, 3.0], [5.0, 3.0]];
-        let fitted = sel.fit(&x, &()).unwrap();
-        // Both columns are constant: both removed
-        assert_eq!(fitted.selected_indices().len(), 0);
-        let out = fitted.transform(&x).unwrap();
-        assert_eq!(out.ncols(), 0);
-        assert_eq!(out.nrows(), 3);
+        let err = sel.fit(&x, &());
+        let reason = match &err {
+            Err(FerroError::InvalidParameter { reason, .. }) => Some(reason.clone()),
+            _ => None,
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("No feature in X meets the variance threshold 0.00000"),
+            "all-constant X must raise sklearn's ValueError, got {err:?}"
+        );
     }
 
     #[test]
