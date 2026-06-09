@@ -30,7 +30,6 @@ use ferrolearn_decomp::{Dissimilarity, MDS};
 use ndarray::array;
 
 #[test]
-#[ignore = "divergence: MDS norm==0 convergence criterion breaks early (n_iter_ 2 vs sklearn 5); tracking #2407"]
 fn divergence_mds_norm0_niter() {
     // sklearn `_smacof_single` runs the FULL max_iter when the embedding
     // collapses to the origin (dis==0 -> nan comparison never breaks).

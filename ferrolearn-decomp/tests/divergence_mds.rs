@@ -1,65 +1,42 @@
 //! Divergence / green-guard audit for `ferrolearn_decomp::mds`
-//! (`MDS` / `FittedMDS`, classical metric MDS / PCoA) against scikit-learn
-//! 1.5.2 `sklearn/manifold/_mds.py`.
+//! (`MDS` / `FittedMDS`, SMACOF metric MDS) against scikit-learn 1.5.2
+//! `sklearn/manifold/_mds.py`.
 //!
-//! CRITICAL CARVE-OUT (REQ-1, #1451-A): ferrolearn implements CLASSICAL
-//! (metric) MDS / PCoA via closed-form eigendecomposition of the double-centred
-//! Gram matrix (`classical_mds`, `mds.rs:195`). sklearn `MDS`
-//! (`_mds.py:395`) is SMACOF: iterative stress majorization
-//! (`_smacof_single`, `_mds.py:22-167`) from `n_init=4` numpy-`RandomState`
-//! random inits (`X = random_state.uniform(...)`, `_mds.py:113`), keeping the
-//! lowest-stress run (`_mds.py:363-365`). EXACT coordinate parity is therefore
-//! structurally IMPOSSIBLE (different algorithm + RNG + arbitrary
-//! rotation/reflection). No coordinate-parity test exists here by design
-//! (R-DEFER-3).
+//! ALGORITHM: ferrolearn's `MDS` is now SMACOF (matching sklearn), an iterative
+//! Guttman-transform stress majorization (`_smacof_single`, `_mds.py:104-167`).
+//! Parity is exact (~1e-6) on the FIXED-INIT path (`MDS::with_init(X0)` ↔
+//! sklearn `smacof(init=X0, n_init=1)`): with a fixed init the Guttman
+//! trajectory is deterministic and the embedding matches element-wise.
 //!
-//! The verifiable COMMON property both algorithms target is DISTANCE
-//! PRESERVATION (REQ-2): the embedding's pairwise Euclidean distances
-//! reconstruct the INPUT pairwise distance matrix. The oracle for that is the
-//! INPUT distance matrix itself (`euclidean_distances`, computed live from
-//! sklearn 1.5.2 in `/tmp`), NOT sklearn's SMACOF coordinates (R-CHAR-3).
+//! The DEFAULT random-init path (`n_init` restarts, `random_state.uniform`,
+//! `_mds.py:113`) is a documented NON-PARITY carve-out (Xoshiro ≠ numpy
+//! RandomState, REQ-1, same class as KMeans #1388). It is NOT pinned for an
+//! exact value here; instead the fixed-init parity tests below carry the
+//! element-wise oracle (R-CHAR-3, live sklearn 1.5.2 from `/tmp`).
 //!
 //! These are GREEN-GUARDS: they MUST PASS where ferrolearn holds. A FAIL marks
-//! a genuine divergence in the SHIPPED classical-MDS scope.
+//! a genuine divergence in the SHIPPED SMACOF scope.
 
 use ferrolearn_core::traits::Fit;
 use ferrolearn_decomp::{Dissimilarity, MDS};
 use ndarray::{Array2, array};
 
-/// Compute the pairwise Euclidean distance matrix of an embedding, in-test.
-fn pairwise_euclidean(emb: &Array2<f64>) -> Array2<f64> {
-    let n = emb.nrows();
-    let mut d = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let mut sq = 0.0;
-            for k in 0..emb.ncols() {
-                let diff = emb[[i, k]] - emb[[j, k]];
-                sq += diff * diff;
-            }
-            let dist = sq.sqrt();
-            d[[i, j]] = dist;
-            d[[j, i]] = dist;
-        }
-    }
-    d
+/// A fixed init shared by the parity guards (the sklearn-oracle init X0).
+fn fixed_init() -> Array2<f64> {
+    array![[0.1, 0.2], [0.3, -0.1], [-0.2, 0.4], [0.5, 0.05]]
 }
 
-/// Assert two distance matrices are elementwise equal within `tol`.
-fn assert_dist_eq(actual: &Array2<f64>, expected: &Array2<f64>, tol: f64) {
-    assert_eq!(
-        actual.dim(),
-        expected.dim(),
-        "distance-matrix shape mismatch"
-    );
-    let n = expected.nrows();
-    for i in 0..n {
-        for j in 0..n {
+/// Assert two embeddings are elementwise equal within `tol`.
+fn assert_emb_eq(actual: &Array2<f64>, expected: &Array2<f64>, tol: f64) {
+    assert_eq!(actual.dim(), expected.dim(), "embedding shape mismatch");
+    let (rows, cols) = expected.dim();
+    for i in 0..rows {
+        for j in 0..cols {
             let a = actual[[i, j]];
             let e = expected[[i, j]];
             assert!(
                 (a - e).abs() <= tol,
-                "distance [{i},{j}] = {a}, expected {e} (|diff| = {}, tol {tol})",
+                "embedding [{i},{j}] = {a}, expected {e} (|diff| = {}, tol {tol})",
                 (a - e).abs()
             );
         }
@@ -67,188 +44,119 @@ fn assert_dist_eq(actual: &Array2<f64>, expected: &Array2<f64>, tol: f64) {
 }
 
 // ---------------------------------------------------------------------------
-// (a) DISTANCE-PRESERVATION at FULL RANK — headline SHIPPED claim (REQ-2).
+// (a) FIXED-INIT SMACOF parity (Euclidean) — element-wise vs sklearn.
 // ---------------------------------------------------------------------------
 
-/// Green-guard (REQ-2, AC-2): the classical-MDS embedding of the 3-4-5
-/// rectangle `[[0,0],[3,0],[0,4],[3,4]]` at `n_components=2` (full rank for 2D
-/// data) reconstructs the INPUT pairwise distance matrix EXACTLY.
+/// Green-guard (REQ-6, parity): `MDS::new(2).with_init(X0).fit(X)` matches
+/// sklearn `MDS(dissimilarity='euclidean').fit_transform(X, init=X0)`
+/// element-wise.
 ///
-/// Oracle (sklearn 1.5.2, `/tmp`):
-///   `euclidean_distances([[0,0],[3,0],[0,4],[3,4]])`
-///   = `[[0,3,4,5],[3,0,5,4],[4,5,0,3],[5,4,3,0]]`.
-/// This is the INPUT distance matrix — the ground truth any MDS must preserve
-/// (R-CHAR-3) — NOT sklearn's SMACOF coordinates.
-/// Mirrors the stress objective sklearn's `_smacof_single` (`_mds.py:147`)
-/// minimizes, achieved here in closed form (`classical_mds`, `mds.rs:195`).
+/// Live sklearn 1.5.2 oracle (`/tmp`, R-CHAR-3) on the 3-4-5 rectangle:
+/// ```text
+/// stress_ = 0.0013111846996572488, n_iter_ = 13,
+/// embedding = [[-2.164424557023, -1.234049962647],
+///              [ 0.57663887645,  -2.435876213413],
+///              [-0.587315085045,  2.433308813391],
+///              [ 2.175100765618,  1.236617362669]]
+/// ```
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
 )]
-fn green_distance_preservation_full_rank_2d() {
+fn green_smacof_fixed_init_euclidean_parity() {
     let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]];
-    let expected_input_dist: Array2<f64> = array![
-        [0.0, 3.0, 4.0, 5.0],
-        [3.0, 0.0, 5.0, 4.0],
-        [4.0, 5.0, 0.0, 3.0],
-        [5.0, 4.0, 3.0, 0.0],
+    let sk_emb: Array2<f64> = array![
+        [-2.164_424_557_023, -1.234_049_962_647],
+        [0.576_638_876_45, -2.435_876_213_413],
+        [-0.587_315_085_045, 2.433_308_813_391],
+        [2.175_100_765_618, 1.236_617_362_669],
     ];
-
-    let fitted = match MDS::new(2).fit(&x, &()) {
+    let fitted = match MDS::new(2).with_init(fixed_init()).fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
-            assert!(
-                false,
-                "MDS::new(2).fit failed on full-rank 2D fixture: {e:?}"
-            );
+            assert!(false, "fixed-init euclidean fit failed: {e:?}");
             return;
         }
     };
-    let emb_dist = pairwise_euclidean(fitted.embedding());
-    assert_dist_eq(&emb_dist, &expected_input_dist, 1e-9);
+    assert_emb_eq(fitted.embedding(), &sk_emb, 1e-6);
+    assert!((fitted.stress() - 0.001_311_184_699_657_248_8).abs() <= 1e-6);
+    assert_eq!(fitted.n_iter(), 13);
 }
 
 // ---------------------------------------------------------------------------
-// (b) DISTANCE-PRESERVATION on a 3D->3D Euclidean fixture (full rank).
+// (b) FIXED-INIT SMACOF parity (precomputed) — element-wise vs sklearn.
 // ---------------------------------------------------------------------------
 
-/// Green-guard (REQ-2): a full-rank 3D dataset embedded at `n_components=3`
-/// reconstructs the INPUT distance matrix exactly.
+/// Green-guard (REQ-6/REQ-9 precomputed, parity): a precomputed non-Euclidean
+/// dissimilarity matrix with a fixed init matches sklearn `smacof(D, init=X0,
+/// n_init=1)` element-wise.
 ///
-/// Oracle (sklearn 1.5.2, `/tmp`):
-///   `euclidean_distances([[0,0,0],[2,0,0],[0,3,0],[0,0,4]])` =
-///   `[[0, 2, 3, 4],
-///     [2, 0, sqrt(13)=3.605551275464, sqrt(20)=4.472135955],
-///     [3, 3.605551275464, 0, 5],
-///     [4, 4.472135955, 5, 0]]`.
+/// Live sklearn 1.5.2 oracle (`/tmp`, R-CHAR-3):
+/// ```text
+/// smacof(D, metric=True, init=X0, n_init=1, normalized_stress=False)
+///   -> stress = 3.148219331054871, n_iter = 13,
+///      embedding = [[-3.333717200034, -1.658330631573],
+///                   [-0.431085112947, -0.700165295708],
+///                   [-0.78675047678,   2.465105803376],
+///                   [ 4.551552789761, -0.106609876095]]
+/// ```
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
 )]
-fn green_distance_preservation_full_rank_3d() {
-    let x = array![
-        [0.0, 0.0, 0.0],
-        [2.0, 0.0, 0.0],
-        [0.0, 3.0, 0.0],
-        [0.0, 0.0, 4.0],
+fn green_smacof_fixed_init_precomputed_parity() {
+    let d: Array2<f64> = array![
+        [0.0, 2.0, 5.0, 9.0],
+        [2.0, 0.0, 3.0, 4.0],
+        [5.0, 3.0, 0.0, 6.0],
+        [9.0, 4.0, 6.0, 0.0],
     ];
-    let s13 = 13.0_f64.sqrt(); // 3.605551275463989
-    let s20 = 20.0_f64.sqrt(); // 4.47213595499958
-    let expected_input_dist: Array2<f64> = array![
-        [0.0, 2.0, 3.0, 4.0],
-        [2.0, 0.0, s13, s20],
-        [3.0, s13, 0.0, 5.0],
-        [4.0, s20, 5.0, 0.0],
+    let sk_emb: Array2<f64> = array![
+        [-3.333_717_200_034, -1.658_330_631_573],
+        [-0.431_085_112_947, -0.700_165_295_708],
+        [-0.786_750_476_78, 2.465_105_803_376],
+        [4.551_552_789_761, -0.106_609_876_095],
     ];
-
-    let fitted = match MDS::new(3).fit(&x, &()) {
+    let fitted = match MDS::new(2)
+        .with_dissimilarity(Dissimilarity::Precomputed)
+        .with_init(fixed_init())
+        .fit(&d, &())
+    {
         Ok(f) => f,
         Err(e) => {
-            assert!(
-                false,
-                "MDS::new(3).fit failed on full-rank 3D fixture: {e:?}"
-            );
+            assert!(false, "fixed-init precomputed fit failed: {e:?}");
             return;
         }
     };
-    let emb_dist = pairwise_euclidean(fitted.embedding());
-    assert_dist_eq(&emb_dist, &expected_input_dist, 1e-9);
+    assert_emb_eq(fitted.embedding(), &sk_emb, 1e-6);
+    assert!((fitted.stress() - 3.148_219_331_054_871).abs() <= 1e-6);
+    assert_eq!(fitted.n_iter(), 13);
 }
 
 // ---------------------------------------------------------------------------
-// (c) REDUCED RANK best-approximation (projection — do NOT assert exact dists).
+// (c) FIXED-INIT DETERMINISM — the Guttman trajectory is deterministic.
 // ---------------------------------------------------------------------------
 
-/// Green-guard (REQ-2 best-low-rank / REQ-3 shape): a near-planar 3D dataset
-/// embedded at `n_components=2` yields a shape-`(4,2)` embedding whose stress
-/// is finite and `>= 0`. This is a projection (rank reduction), so distances
-/// are only APPROXIMATED — assert structure + finiteness, not exact distances.
+/// Green-guard (REQ-3): two fixed-init fits on the same input produce
+/// bitwise-identical embeddings (the Guttman iterates are deterministic from a
+/// fixed init, unlike the default RNG path).
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
 )]
-fn green_reduced_rank_best_approximation() {
-    // Near-planar (tiny z-perturbation) — best rank-2 approx is close but lossy.
-    let x = array![
-        [0.0, 0.0, 0.0],
-        [1.0, 0.0, 0.01],
-        [0.0, 1.0, 0.0],
-        [1.0, 1.0, 0.01],
-    ];
-    let fitted = match MDS::new(2).fit(&x, &()) {
-        Ok(f) => f,
-        Err(e) => {
-            assert!(
-                false,
-                "MDS::new(2).fit failed on near-planar 3D fixture: {e:?}"
-            );
-            return;
-        }
-    };
-    assert_eq!(fitted.embedding().dim(), (4, 2), "embedding must be (4,2)");
-    assert!(
-        fitted.embedding().iter().all(|v| v.is_finite()),
-        "embedding must be finite"
-    );
-    let s = fitted.stress();
-    assert!(s.is_finite(), "stress must be finite, got {s}");
-    assert!(s >= 0.0, "stress must be >= 0, got {s}");
-}
-
-// ---------------------------------------------------------------------------
-// (d) STRESS ~ 0 on the full-rank exact fixture (REQ-4).
-// ---------------------------------------------------------------------------
-
-/// Green-guard (REQ-4, AC-4): a perfect (full-rank) embedding has ~zero Kruskal
-/// stress-1. On fixture (a), `stress()` must be `<= 1e-6` — a perfect
-/// distance reconstruction has zero stress by definition
-/// (`kruskal_stress`, `mds.rs:151`).
-#[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
-)]
-fn green_stress_zero_on_perfect_embedding() {
+fn green_fixed_init_determinism_identical_runs() {
     let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]];
-    let fitted = match MDS::new(2).fit(&x, &()) {
-        Ok(f) => f,
-        Err(e) => {
-            assert!(false, "MDS::new(2).fit failed: {e:?}");
-            return;
-        }
-    };
-    let s = fitted.stress();
-    assert!(
-        s.abs() <= 1e-6,
-        "Kruskal stress-1 on perfect full-rank embedding must be ~0, got {s}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// (e) DETERMINISM — classical MDS has no RNG (REQ-3).
-// ---------------------------------------------------------------------------
-
-/// Green-guard (REQ-3, AC-3): classical MDS is deterministic (no RNG, unlike
-/// sklearn's RNG-seeded SMACOF). Two independent fits on the same input produce
-/// bitwise-identical embeddings.
-#[test]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
-)]
-fn green_determinism_identical_runs() {
-    let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]];
-    let f1 = match MDS::new(2).fit(&x, &()) {
+    let f1 = match MDS::new(2).with_init(fixed_init()).fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
             assert!(false, "first fit failed: {e:?}");
             return;
         }
     };
-    let f2 = match MDS::new(2).fit(&x, &()) {
+    let f2 = match MDS::new(2).with_init(fixed_init()).fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
             assert!(false, "second fit failed: {e:?}");
@@ -270,48 +178,45 @@ fn green_determinism_identical_runs() {
 }
 
 // ---------------------------------------------------------------------------
-// (f) PRECOMPUTED — fit on a valid Euclidean distance matrix at full rank.
+// (d) DEFAULT random-init runs and produces a finite, shaped embedding.
 // ---------------------------------------------------------------------------
 
-/// Green-guard (REQ-9 precomputed path, REQ-2): `Dissimilarity::Precomputed`
-/// fed a VALID Euclidean distance matrix `D` (the 3-4-5 rectangle's distances)
-/// at full rank reconstructs `D` exactly.
-///
-/// Oracle (sklearn 1.5.2, `/tmp`): `D = euclidean_distances([[0,0],[3,0],
-/// [0,4],[3,4]]) = [[0,3,4,5],[3,0,5,4],[4,5,0,3],[5,4,3,0]]` (R-CHAR-3 —
-/// the precomputed input distances ARE the ground truth).
+/// Green-guard (REQ-6 default path): the DEFAULT random-init SMACOF runs
+/// (`n_init=4` restarts) and yields a finite shape-`(4,2)` embedding with a
+/// finite, non-negative raw stress. The COORDINATE VALUE is a documented
+/// non-parity carve-out (Xoshiro ≠ numpy RandomState, REQ-1) — only structure
+/// and finiteness are asserted here.
 #[test]
 #[allow(
     clippy::assertions_on_constants,
     reason = "assert!(false, ...) reports the unexpected fit Err with diagnostics"
 )]
-fn green_precomputed_reconstructs_distances() {
-    let d: Array2<f64> = array![
-        [0.0, 3.0, 4.0, 5.0],
-        [3.0, 0.0, 5.0, 4.0],
-        [4.0, 5.0, 0.0, 3.0],
-        [5.0, 4.0, 3.0, 0.0],
-    ];
-    let fitted = match MDS::new(2)
-        .with_dissimilarity(Dissimilarity::Precomputed)
-        .fit(&d, &())
-    {
+fn green_default_random_init_finite() {
+    let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]];
+    let fitted = match MDS::new(2).with_random_state(0).fit(&x, &()) {
         Ok(f) => f,
         Err(e) => {
-            assert!(false, "precomputed fit failed: {e:?}");
+            assert!(false, "default random-init fit failed: {e:?}");
             return;
         }
     };
     assert_eq!(fitted.embedding().dim(), (4, 2));
-    let emb_dist = pairwise_euclidean(fitted.embedding());
-    assert_dist_eq(&emb_dist, &d, 1e-9);
+    assert!(
+        fitted.embedding().iter().all(|v| v.is_finite()),
+        "embedding must be finite"
+    );
+    let s = fitted.stress();
+    assert!(
+        s.is_finite() && s >= 0.0,
+        "stress must be finite >= 0, got {s}"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// (g) ERROR CONTRACTS (REQ-5).
+// (e) ERROR CONTRACTS (REQ-5).
 // ---------------------------------------------------------------------------
 
-/// Green-guard (REQ-5, AC-5): `n_components == 0` -> `fit` returns `Err`.
+/// Green-guard (REQ-5): `n_components == 0` -> `fit` returns `Err`.
 #[test]
 fn green_error_n_components_zero() {
     let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]];
@@ -321,15 +226,40 @@ fn green_error_n_components_zero() {
     );
 }
 
-/// Green-guard (REQ-5, AC-5): `n_components > n_samples` -> `fit` returns
-/// `Err` (ferrolearn's scoped guard; note sklearn has no such upper bound —
-/// `_mds.py:535` admits `Interval(Integral, 1, None)` — so ferrolearn is
-/// stricter, FLAGGED in the design doc REQ-5, not pinned as a divergence here).
+/// Green-guard (REQ-5): `n_components > n_samples` -> `fit` returns `Err`
+/// (ferrolearn's scoped guard; sklearn has no such upper bound —
+/// `Interval(Integral, 1, None)`, `_mds.py:174` — so ferrolearn is stricter,
+/// FLAGGED in the design doc REQ-5, not pinned as a divergence here).
 #[test]
 fn green_error_n_components_exceeds_n_samples() {
     let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]]; // 4 samples
     assert!(
         MDS::new(10).fit(&x, &()).is_err(),
         "n_components(10) > n_samples(4) must error"
+    );
+}
+
+/// Green-guard (REQ-5): a non-square Precomputed input -> `fit` returns `Err`.
+#[test]
+fn green_error_precomputed_not_square() {
+    let x = array![[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]];
+    assert!(
+        MDS::new(1)
+            .with_dissimilarity(Dissimilarity::Precomputed)
+            .fit(&x, &())
+            .is_err(),
+        "non-square Precomputed must error"
+    );
+}
+
+/// Green-guard (REQ-9): a fixed init with the wrong row count -> `Err`
+/// (mirrors sklearn's shape check `_mds.py:118-121`).
+#[test]
+fn green_error_init_wrong_shape() {
+    let x = array![[0.0, 0.0], [3.0, 0.0], [0.0, 4.0], [3.0, 4.0]]; // 4 samples
+    let bad_init = array![[0.1, 0.2], [0.3, -0.1]]; // 2 rows, not 4
+    assert!(
+        MDS::new(2).with_init(bad_init).fit(&x, &()).is_err(),
+        "init with wrong n_samples must error"
     );
 }
