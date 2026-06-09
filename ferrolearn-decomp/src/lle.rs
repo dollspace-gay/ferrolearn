@@ -326,6 +326,7 @@ impl Fit<Array2<f64>, ()> for LLE {
     ///   is singular.
     fn fit(&self, x: &Array2<f64>, _y: &()) -> Result<FittedLLE, FerroError> {
         let n = x.nrows();
+        let n_features = x.ncols();
 
         if self.n_components == 0 {
             return Err(FerroError::InvalidParameter {
@@ -353,6 +354,16 @@ impl Fit<Array2<f64>, ()> for LLE {
                     "n_neighbors ({}) must be less than n_samples ({})",
                     self.n_neighbors, n
                 ),
+            });
+        }
+        // sklearn rejects an output dimension larger than the input dimension
+        // (`if n_components > d_in: raise ValueError(...)`,
+        // `_locally_linear.py:222-225`, where `d_in = X.shape[1]`). The
+        // boundary `n_components == n_features` is accepted.
+        if self.n_components > n_features {
+            return Err(FerroError::InvalidParameter {
+                name: "n_components".into(),
+                reason: "output dimension must be less than or equal to input dimension".into(),
             });
         }
         // Need n_components + 1 eigenvectors (skipping the trivial one).

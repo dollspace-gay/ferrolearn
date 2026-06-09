@@ -23,9 +23,11 @@
 //!
 //! LIVE sklearn 1.5.2 oracle (R-CHAR-3), X = 6 samples x 2 features,
 //! n_components=3, n_neighbors=4, method='standard', eigen_solver='dense':
-//!   >>> LocallyLinearEmbedding(n_components=3, n_neighbors=4,
-//!   ...     method='standard', eigen_solver='dense').fit_transform(X)
-//!   ValueError: output dimension must be less than or equal to input dimension
+//! ```python
+//! >>> LocallyLinearEmbedding(n_components=3, n_neighbors=4,
+//! ...     method='standard', eigen_solver='dense').fit_transform(X)
+//! ValueError: output dimension must be less than or equal to input dimension
+//! ```
 //! The boundary `n_components == d_in == 2` is ACCEPTED by sklearn (shape (6,2)).
 //!
 //! Expected (sklearn): `fit` returns `Err` for n_components=3 (> d_in=2).
@@ -41,7 +43,6 @@ use ndarray::array;
 /// `n_components = 3 < n_samples = 6`, so ferrolearn's sample-count guard does
 /// not fire while sklearn's `n_components > d_in` guard does.
 #[test]
-#[ignore = "divergence: LLE::fit accepts n_components > n_features (sklearn raises ValueError); tracking #2403"]
 fn divergence_lle_n_components_gt_n_features() {
     let x = array![
         [0.0, 0.0],
