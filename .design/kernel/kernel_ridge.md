@@ -117,7 +117,7 @@ ferray substrate — is NOT-STARTED.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (dual solve) | SHIPPED | `pub fn fit` in `kernel_ridge.rs` forms `K` via `compute_kernel_matrix`, does `k[[i, i]] = k[[i, i]] + self.alpha`, then `cholesky_solve(&k, y).or_else(|_| gaussian_solve(&k, y))` — mirrors `_solve_cholesky_kernel` (`_ridge.py:247` `K.flat[::n_samples+1] += alpha[0]`, `:253` `linalg.solve(K, y, assume_a="pos")` with `:259` `lstsq` fallback). `predict` returns `k_new.dot(&self.dual_coef)` = `kernel_ridge.py:237` `np.dot(K, self.dual_coef_)`. Non-test consumer: `ferrolearn-python/src/extras.rs` (`RsKernelRidge` → `KernelRidge::<f64>::new()`), re-exported in `lib.rs` (`pub use kernel_ridge::{FittedKernelRidge, KernelRidge}`). Verification: oracle parity below; `cargo test -p ferrolearn-kernel --lib` 192 passed. |
+| REQ-1 (dual solve) | SHIPPED | `pub fn fit` in `kernel_ridge.rs` forms `K` via `compute_kernel_matrix`, does `k[[i, i]] = k[[i, i]] + self.alpha`, then `cholesky_solve(&k, y).or_else(|_| gaussian_solve(&k, y)).unwrap_or_else(|_| lstsq_min_norm_solve(&k, y))` — mirrors `_solve_cholesky_kernel` (`_ridge.py:247` `K.flat[::n_samples+1] += alpha[0]`, `:253` `linalg.solve(K, y, assume_a="pos")` with `:254-259` `lstsq` fallback on `LinAlgError`). The lstsq fallback is now value-matching: `fn lstsq_min_norm_solve` computes the minimum-norm least-squares solution via a symmetric (Jacobi) eigendecomposition pseudo-inverse with cutoff `n·eps·max\|λ\|` (= `scipy.linalg.lstsq` default `cond=None` rank cutoff `max(M,N)·eps·max(s)`). Singular kernels (`alpha=0` + duplicate rows) that previously returned `Err(NumericalInstability)` now succeed with sklearn's min-norm `dual_coef_` (tests `divergence_singular_kernel_lstsq_fallback{,_min_norm}`, live oracle `~1e-9`). The well-conditioned (positive-definite) path is unchanged — Cholesky still wins, bit-exact. `predict` returns `k_new.dot(&self.dual_coef)` = `kernel_ridge.py:237` `np.dot(K, self.dual_coef_)`. Non-test consumer: `ferrolearn-python/src/extras.rs` (`RsKernelRidge` → `KernelRidge::<f64>::new()`), re-exported in `lib.rs` (`pub use kernel_ridge::{FittedKernelRidge, KernelRidge}`). Verification: oracle parity below; `cargo test -p ferrolearn-kernel` 301 passed, 0 failed. Warning-absent gap: sklearn emits a "Singular matrix in solving dual problem" `warnings.warn` (`_ridge.py:255-258`); ferrolearn has no warning facade, so the fit succeeds silently (documented divergence, not a value gap). |
 | REQ-2 (linear parity) | SHIPPED | `KernelType::Linear` in `kernel_value` returns `<x,y>`. Live oracle (`alpha=0.5`, `kernel='linear'`, `X=[[0],[1],[2],[3],[4]]`, `y=[0,1,4,9,16]`): sklearn `dual_coef_ = [0.0, -4.55737704918033, -5.1147540983606525, -1.6721311475409892, 5.770491803278692]`; ferrolearn `[0.0, -4.5573770491803325, -5.114754098360658, -1.6721311475409832, 5.7704918032786905]` — match to ~1e-13. `predict` likewise matches. Consumer: same as REQ-1. Deterministic / oracle-pinnable. |
 | REQ-3 (rbf parity) | SHIPPED | `KernelType::Rbf` in `kernel_value` returns `exp(-gamma·||x-y||²)`; `fit` resolves `gamma=None → 1/n_features` (`self.gamma.unwrap_or_else(|| F::one()/F::from(n_features))`), matching `pairwise` rbf default. Live oracle (`alpha=0.5`, `gamma=0.5`): sklearn `dual_coef_[4]=9.953434595974752`, ferrolearn `9.953434595974752`; default-gamma case also matches to ~1e-13 (full vectors in Verification). Consumer: same as REQ-1. Deterministic / oracle-pinnable. |
 | REQ-4 (poly/sigmoid formula) | SHIPPED | `KernelType::Polynomial` computes `(gamma·dot + coef0)^degree` and `KernelType::Sigmoid` computes `(gamma·dot + coef0).tanh()` in `kernel_value` — identical to sklearn's `polynomial_kernel`/`sigmoid_kernel`. The kernel *value* formula matches when `gamma/degree/coef0` are supplied explicitly; the **default** mismatch is REQ-5, not this REQ. Consumer: same as REQ-1. Deterministic / oracle-pinnable. |
@@ -152,12 +152,22 @@ The solve is the contract's numerical core. ferrolearn's `fn cholesky_solve`
 performs an explicit `L Lᵀ` factorization and forward/back substitution,
 returning `NumericalInstability` if a diagonal pivot is `≤ 0` (non-PD); on that
 error `fn fit` falls back to `fn gaussian_solve` (partial-pivot Gaussian
-elimination). sklearn calls `linalg.solve(K, y, assume_a="pos")` (a LAPACK
-Cholesky) and on `LinAlgError` falls back to `linalg.lstsq` (`_ridge.py:253-259`).
-The fallbacks are not numerically identical (Gaussian elimination vs
-least-squares), but for the PD case (the common path, and every value-parity
-check above) both take the Cholesky branch and agree to ~1e-13. The `gamma=None`
-default resolves identically (`1/n_features`).
+elimination), and if that also fails (a genuinely singular kernel — e.g.
+`alpha=0` with duplicate rows) to `fn lstsq_min_norm_solve`. sklearn calls
+`linalg.solve(K, y, assume_a="pos")` (a LAPACK Cholesky) and on `LinAlgError`
+falls back to `linalg.lstsq` (`_ridge.py:253-259`). For the PD case (the common
+path, and every value-parity check above) both take the Cholesky branch and
+agree to ~1e-13. For the singular case ferrolearn now matches sklearn's
+`linalg.lstsq` minimum-norm least-squares result: `fn lstsq_min_norm_solve`
+forms the symmetric eigendecomposition `K = V diag(λ) Vᵀ` (cyclic Jacobi,
+unconditionally convergent for real symmetric matrices), drops eigenvalues with
+`|λ| ≤ n·eps·max|λ|` (matching `scipy.linalg.lstsq`'s `cond=None` rank cutoff
+`max(M,N)·eps·max(s)`; `K` square so `M==N==n`), and returns
+`x = Σ_{|λ_i|>cutoff} (vᵢᵀy / λ_i) vᵢ`. The lstsq path is a fallback only — the
+well-conditioned `dual_coef_` is bit-exact-unchanged. sklearn additionally emits
+a `warnings.warn` on the singular branch (`_ridge.py:255-258`); ferrolearn has no
+warning facade so the fit succeeds silently (documented divergence). The
+`gamma=None` default resolves identically (`1/n_features`).
 
 Invariants: `K` is symmetric PSD; adding `alpha ≥ 0` to the diagonal makes it PD
 for `alpha > 0`; `predict` requires `X.ncols() == X_fit.ncols()` and otherwise

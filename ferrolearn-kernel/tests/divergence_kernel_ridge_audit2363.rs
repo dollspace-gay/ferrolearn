@@ -210,7 +210,6 @@ fn audit_single_sample_dual_coef() {
 /// ferrolearn: `fit` returns `Err(NumericalInstability)`.
 /// Tracking: #2364.
 #[test]
-#[ignore = "divergence: KernelRidge errors on singular kernel vs sklearn lstsq fallback; tracking #2364"]
 fn divergence_singular_kernel_lstsq_fallback() {
     let x = Array2::from_shape_vec((3, 2), vec![1.0, 2.0, 1.0, 2.0, 3.0, 1.0]).unwrap();
     let y = array![1.0, 1.0, 2.0f64];
@@ -227,6 +226,42 @@ fn divergence_singular_kernel_lstsq_fallback() {
         assert!(
             (preds[i] - sk_pred[i]).abs() < 1e-9,
             "singular-kernel predict[{i}] = {} vs sklearn {}",
+            preds[i],
+            sk_pred[i]
+        );
+    }
+}
+
+/// Second singular-kernel fixture: a different duplicate pattern (rows 0 and 2
+/// identical, 4 samples) whose minimum-norm lstsq prediction differs from `y`
+/// (no exact interpolant exists). Confirms the lstsq fallback reproduces
+/// sklearn's min-norm solution element-wise, not merely "fit succeeds".
+///
+/// Oracle: `KernelRidge(alpha=0.0, kernel='linear').fit(X, y)`,
+/// `X = [[2,0],[0,1],[2,0],[1,1]]`, `y = [3,1,3,4]`.
+/// Tracking: #2364.
+#[test]
+fn divergence_singular_kernel_lstsq_fallback_min_norm() {
+    let x = Array2::from_shape_vec((4, 2), vec![2.0, 0.0, 0.0, 1.0, 2.0, 0.0, 1.0, 1.0]).unwrap();
+    let y = array![3.0, 1.0, 3.0, 4.0f64];
+    let fitted = KernelRidge::<f64>::new()
+        .with_alpha(0.0)
+        .with_kernel(KernelType::Linear)
+        .fit(&x, &y)
+        .expect("sklearn falls back to lstsq and succeeds on a singular kernel");
+
+    // Live sklearn 1.5.2 oracle (minimum-norm lstsq predictions).
+    let sk_pred = [
+        3.176_470_588_235_300_6,
+        1.705_882_352_941_177,
+        3.176_470_588_235_300_6,
+        3.294_117_647_058_828,
+    ];
+    let preds = fitted.predict(&x).unwrap();
+    for i in 0..4 {
+        assert!(
+            (preds[i] - sk_pred[i]).abs() < 1e-9,
+            "singular-kernel(min-norm) predict[{i}] = {} vs sklearn {}",
             preds[i],
             sk_pred[i]
         );

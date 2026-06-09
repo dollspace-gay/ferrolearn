@@ -44,6 +44,7 @@
 //! | REQ | Behavior | Status | Evidence |
 //! |-----|----------|--------|----------|
 //! | REQ-1 | dual solve `(K + alpha·I) dual_coef = y` | SHIPPED | `fn fit` + `fn cholesky_solve`/`fn gaussian_solve` = sklearn `_solve_cholesky_kernel`; `fn predict` = `K · dual_coef` (`kernel_ridge.py:201-237`) |
+//! | REQ-1b | singular-kernel lstsq fallback | SHIPPED | `fn lstsq_min_norm_solve` (eigh-pseudo-inverse, cutoff `n·eps·max\|λ\|`) called by `fn fit` when both `cholesky_solve` and `gaussian_solve` fail = sklearn `_solve_cholesky_kernel` lstsq fallback on `LinAlgError` (`_ridge.py:254-259` `dual_coef = linalg.lstsq(K, y)[0]`); `divergence_singular_kernel_lstsq_fallback{,_min_norm}` match live sklearn min-norm predict `~1e-9`. Warning-absent gap documented (no ferrolearn warning facade). Consumer: same `RsKernelRidge` as REQ-1. |
 //! | REQ-2 | linear kernel value parity | SHIPPED | `parity_linear_dual_coef_and_predict` matches live sklearn `~1e-9` |
 //! | REQ-3 | rbf kernel value parity (`gamma=None`→`1/n_features` + explicit) | SHIPPED | `parity_rbf_default_and_explicit_gamma` `~1e-9` |
 //! | REQ-4 | poly/sigmoid kernel formula (explicit coef0) | SHIPPED | `fn compute_kernel_matrix` (`nystroem.rs`); `parity_poly_explicit_coef0` |
@@ -265,6 +266,139 @@ fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, F
     Ok(x)
 }
 
+/// Symmetric eigendecomposition `A = V diag(w) Vᵀ` via the cyclic Jacobi method.
+///
+/// `A` must be symmetric (the regularized kernel matrix `K + alpha·I` always is).
+/// Returns `(w, V)` where `w` are the eigenvalues and the columns of `V` are the
+/// corresponding orthonormal eigenvectors. The method is unconditionally
+/// convergent for real symmetric matrices, so it does not error on a singular
+/// (rank-deficient) `A` — singular `A` simply yields near-zero eigenvalues,
+/// which the caller drops in the pseudo-inverse.
+fn jacobi_eigh<F: Float>(a: &Array2<F>) -> (Array1<F>, Array2<F>) {
+    let n = a.nrows();
+    let mut m = a.clone();
+    let mut v = Array2::<F>::eye(n);
+
+    if n <= 1 {
+        let mut w = Array1::<F>::zeros(n);
+        if n == 1 {
+            w[0] = m[[0, 0]];
+        }
+        return (w, v);
+    }
+
+    // Cyclic Jacobi sweeps. 100 sweeps is far beyond the ~log2(n) typically
+    // needed; the loop also exits early once the off-diagonal mass is negligible.
+    let two = F::one() + F::one();
+    for _ in 0..100 {
+        // Sum of squared off-diagonal entries (convergence measure).
+        let mut off = F::zero();
+        for p in 0..n {
+            for q in (p + 1)..n {
+                off = off + m[[p, q]] * m[[p, q]];
+            }
+        }
+        if off <= F::zero() {
+            break;
+        }
+
+        for p in 0..n {
+            for q in (p + 1)..n {
+                let apq = m[[p, q]];
+                if apq == F::zero() {
+                    continue;
+                }
+                let app = m[[p, p]];
+                let aqq = m[[q, q]];
+                // Jacobi rotation angle: cot(2θ) = (aqq - app) / (2·apq).
+                let theta = (aqq - app) / (two * apq);
+                let t = if theta >= F::zero() {
+                    F::one() / (theta + (theta * theta + F::one()).sqrt())
+                } else {
+                    -F::one() / (-theta + (theta * theta + F::one()).sqrt())
+                };
+                let c = F::one() / (t * t + F::one()).sqrt();
+                let s = t * c;
+
+                // Apply rotation to columns p and q of M, then rows p and q
+                // (M := Jᵀ M J), preserving symmetry.
+                for k in 0..n {
+                    let mkp = m[[k, p]];
+                    let mkq = m[[k, q]];
+                    m[[k, p]] = c * mkp - s * mkq;
+                    m[[k, q]] = s * mkp + c * mkq;
+                }
+                for k in 0..n {
+                    let mpk = m[[p, k]];
+                    let mqk = m[[q, k]];
+                    m[[p, k]] = c * mpk - s * mqk;
+                    m[[q, k]] = s * mpk + c * mqk;
+                }
+                // Accumulate eigenvectors (V := V J).
+                for k in 0..n {
+                    let vkp = v[[k, p]];
+                    let vkq = v[[k, q]];
+                    v[[k, p]] = c * vkp - s * vkq;
+                    v[[k, q]] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    let mut w = Array1::<F>::zeros(n);
+    for i in 0..n {
+        w[i] = m[[i, i]];
+    }
+    (w, v)
+}
+
+/// Minimum-norm least-squares solution of the symmetric system `A @ x = b`.
+///
+/// Mirrors scikit-learn's `lstsq` fallback in `_solve_cholesky_kernel`
+/// (`sklearn/linear_model/_ridge.py:254-259`): when the direct Cholesky solve
+/// raises `LinAlgError` on a singular kernel, sklearn falls back to
+/// `scipy.linalg.lstsq(K, y)[0]`, the SVD-based minimum-norm least-squares
+/// solution. For a symmetric `A` the SVD min-norm solution equals the
+/// eigendecomposition pseudo-inverse `A⁺ b = Σ_{|λ_i|>cutoff} (vᵢᵀb / λ_i) vᵢ`.
+///
+/// The singular-value cutoff matches `scipy.linalg.lstsq`'s default
+/// (`cond=None`): singular values `≤ rcond·max|λ|` are treated as zero, with
+/// `rcond = max(M, N)·eps` (the LAPACK gelsd default). Because `A` is square
+/// (`M == N == n`), this is `n·eps·max|λ|`.
+fn lstsq_min_norm_solve<F: Float + 'static>(a: &Array2<F>, b: &Array1<F>) -> Array1<F> {
+    let n = a.nrows();
+    if n == 0 {
+        return Array1::<F>::zeros(0);
+    }
+
+    let (w, v) = jacobi_eigh(a);
+
+    // cutoff = rcond * max|eigenvalue|, rcond = max(M, N) * eps = n * eps.
+    let mut max_abs = F::zero();
+    for &wi in w.iter() {
+        let wabs = wi.abs();
+        if wabs > max_abs {
+            max_abs = wabs;
+        }
+    }
+    // n as F via repeated addition (F::from is fallible; avoid it).
+    let mut n_as_f = F::zero();
+    for _ in 0..n {
+        n_as_f = n_as_f + F::one();
+    }
+    let cutoff = n_as_f * F::epsilon() * max_abs;
+
+    // x = V diag(1/λ_i for |λ_i| > cutoff else 0) Vᵀ b.
+    let vt_b = v.t().dot(b);
+    let mut scaled = Array1::<F>::zeros(n);
+    for i in 0..n {
+        if w[i].abs() > cutoff {
+            scaled[i] = vt_b[i] / w[i];
+        }
+    }
+    v.dot(&scaled)
+}
+
 /// Solve `A @ x = b` via Gaussian elimination with partial pivoting (fallback).
 fn gaussian_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
     let n = a.nrows();
@@ -396,8 +530,21 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<F>> for KernelRidge
             k[[i, i]] = k[[i, i]] + self.alpha;
         }
 
-        // Solve (K + alpha*I) @ dual_coef = y
-        let dual_coef = cholesky_solve(&k, y).or_else(|_| gaussian_solve(&k, y))?;
+        // Solve (K + alpha*I) @ dual_coef = y.
+        //
+        // The well-conditioned path is unchanged: a positive-definite kernel is
+        // solved by Cholesky (bit-exact with the previous behavior). When both
+        // the Cholesky factorization and the Gaussian-elimination fallback fail
+        // on a singular kernel (e.g. alpha=0 with duplicate rows), fall back to
+        // the minimum-norm least-squares solution, mirroring sklearn's
+        // `_solve_cholesky_kernel` lstsq fallback on `LinAlgError`
+        // (`sklearn/linear_model/_ridge.py:254-259`:
+        // `except np.linalg.LinAlgError: ... dual_coef = linalg.lstsq(K, y)[0]`).
+        // sklearn additionally emits a "Singular matrix in solving dual problem"
+        // warning; ferrolearn has no warning facade, so the fit simply succeeds.
+        let dual_coef = cholesky_solve(&k, y)
+            .or_else(|_| gaussian_solve(&k, y))
+            .unwrap_or_else(|_| lstsq_min_norm_solve(&k, y));
 
         Ok(FittedKernelRidge {
             x_fit: x.clone(),
