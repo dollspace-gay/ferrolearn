@@ -88,7 +88,6 @@ fn fit(x: &Array2<f64>) -> FittedFastICA<f64> {
 ///
 /// Tracking: #2411
 #[test]
-#[ignore = "divergence: mixing != pinv(components), X_centered != S@mixing.T (err ~8.7 vs sklearn 1.8e-15); tracking #2411"]
 fn divergence_fast_ica_mixing_pinv_contract() {
     let x = mixed_fixture();
     let f = fit(&x);
@@ -134,7 +133,6 @@ fn divergence_fast_ica_mixing_pinv_contract() {
 ///
 /// Tracking: #2412
 #[test]
-#[ignore = "divergence: components is W not W@K; S != X_centered@components.T (err ~3.5 vs sklearn 1e-10); tracking #2412"]
 fn divergence_fast_ica_components_transform_contract() {
     let x = mixed_fixture();
     let f = fit(&x);

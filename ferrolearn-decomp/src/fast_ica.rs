@@ -59,11 +59,11 @@
 //! | REQ | Scope | Status | Evidence / Blocker |
 //! |---|---|---|---|
 //! | REQ-1 | Structural: whitening + 3 nonlinearities (LogCosh/Exp/Cube) × 2 algorithms (Parallel/Deflation) recover finite sources `(n_samples,n_components)`, n_iter≥1, determinism, g(0)=0, + ICA source-recovery up to perm+sign+scale + whitening→identity covariance | SHIPPED (scoped) | `fit` (`fast_ica.rs:452`); green-guards `ica_correctness_recovers_known_sources` (abs-corr > 0.9), `whitening_produces_identity_covariance` + in-module tests. STRUCTURAL only, NOT exact values (REQ-4) |
-//! | REQ-2 | Fitted-attr shapes (components k×k, mixing n_features×k, mean) | SHIPPED | accessors `:205-229`; `fitted_attribute_shapes` |
+//! | REQ-2 | Fitted-attr shapes (components k×n_features, mixing n_features×k, mean) | SHIPPED | accessors `components`/`mixing`/`mean`/`n_iter`; `fitted_attribute_shapes` |
 //! | REQ-3 | Error/parameter contracts (n_components 0/>n_features, n_samples<2, transform feature mismatch, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`fast_ica.rs` symbol `reject_non_finite`) BEFORE whitening/the unmixing, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_fastica.py:564`/`:756`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_fast_ica_fit_nan_`/`_fit_inf_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: FastICA `fit`/`transform` + re-export `lib.rs` |
 //! | REQ-4 | EXACT `components`/source value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): Xoshiro vs numpy RNG `w_init` + covariance-eigh vs SVD-default whitening + ICA perm/sign/scale identifiability — blocker #1572 |
-//! | REQ-5 | `components_ = W@K` attribute semantics | NOT-STARTED | ferrolearn `components()` returns `W` (k×k) + `whitening` (K) separately; sklearn `components_=W@K` (k×n_features, `_fastica.py:683`) — transform output matches — blocker #1573 |
-//! | REQ-6 | `mixing_ = pinv(components_)` | NOT-STARTED | ferrolearn `Kᵀ·Wᵀ` (`:657`) vs sklearn `pinv(components_)` (`_fastica.py:689`) — blocker #1574 |
+//! | REQ-5 | `components_ = W@K` attribute semantics | SHIPPED | `components = w.dot(&whitening)` (= W@K, k×n_features) per sklearn `_fastica.py:683`; `transform` returns `(X−mean)@components_.T` (`:762`). Transform contract `S == (X−mean)@components_.T` pinned by `divergence_fast_ica_components_transform_contract` (#2412, was wrong by ~3.52). |
+//! | REQ-6 | `mixing_ = pinv(components_)` | SHIPPED | `mixing = pinv(components)` (`pinv` symbol: symmetric-eigendecomp `Aᵀ(AAᵀ)⁻¹` Moore-Penrose pseudo-inverse) per sklearn `_fastica.py:689`, replacing the old `Kᵀ·Wᵀ`. Inverse contract `X−mean == S@mixing_.T` pinned by `divergence_fast_ica_mixing_pinv_contract` (#2411, was wrong by ~8.71). |
 //! | REQ-7 | `whiten_solver` svd(default)/eigh + `whiten` modes + `X1*=sqrt(n)` + unit-variance `S_std` rescale | NOT-STARTED | sklearn `_fastica.py:605-631,:676-681` — blocker #1575 |
 //! | REQ-8 | `fun` as callable + `fun_args` (alpha) | NOT-STARTED | sklearn `_fastica.py:141-150`; ferrolearn 3-enum only — blocker #1576 |
 //! | REQ-9 | `w_init` custom init param | NOT-STARTED | sklearn `_fastica.py:638-641` — blocker #1577 |
@@ -74,7 +74,7 @@
 //! | REQ-14 | PyO3 `_RsFastICA` binding surface (n_components/fit/transform only) | NOT-STARTED | blocker #1582 |
 //! | REQ-15 | ferray substrate | NOT-STARTED | `ndarray` + `rand` + hand-rolled Jacobi — blocker #1583 |
 //!
-//! Count: **3 SHIPPED (REQ-1,2,3) / 12 NOT-STARTED (REQ-4..15)**.
+//! Count: **5 SHIPPED (REQ-1,2,3,5,6) / 10 NOT-STARTED (REQ-4,7..15)**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -232,18 +232,29 @@ impl<F: Float + Send + Sync + 'static> Default for FastICA<F> {
 /// Implements [`Transform<Array2<F>>`] to unmix new signals.
 #[derive(Debug, Clone)]
 pub struct FittedFastICA<F> {
-    /// Unmixing matrix (applied after whitening), shape `(n_components, n_components_white)`.
+    /// Unmixing operator on centered data (`components_ = W @ K`), shape
+    /// `(n_components, n_features)`.
     ///
-    /// To recover sources from whitened data: `S = unmixing @ X_white`.
+    /// To recover sources from centered data: `S = (X - mean) @ components_.T`
+    /// (sklearn `_fastica.py:683`).
     components: Array2<F>,
 
-    /// Mixing matrix (pseudo-inverse of the unmixing), shape `(n_features, n_components)`.
+    /// Mixing matrix (`pinv(components_)`), shape `(n_features, n_components)`
+    /// (sklearn `_fastica.py:689`).
     mixing: Array2<F>,
 
     /// Per-feature mean, shape `(n_features,)`.
     mean: Array1<F>,
 
-    /// Whitening matrix, shape `(n_components, n_features)`.
+    /// Whitening matrix `K` (sklearn `whitening_`), shape `(n_components, n_features)`.
+    ///
+    /// Retained as the sklearn `whitening_` attribute (REQ-12). Now that
+    /// `transform` uses the composed `components_ = W @ K` directly, this is no
+    /// longer read internally; kept for the forthcoming `whitening_` accessor.
+    #[allow(
+        dead_code,
+        reason = "sklearn whitening_ attribute (REQ-12 #1580); composed into components_, accessor pending"
+    )]
     whitening: Array2<F>,
 
     /// Number of iterations performed.
@@ -254,13 +265,13 @@ pub struct FittedFastICA<F> {
 }
 
 impl<F: Float + Send + Sync + 'static> FittedFastICA<F> {
-    /// Unmixing matrix applied to whitened data, shape `(n_components, n_components)`.
+    /// Unmixing operator on centered data (`W @ K`), shape `(n_components, n_features)`.
     #[must_use]
     pub fn components(&self) -> &Array2<F> {
         &self.components
     }
 
-    /// Mixing matrix (approximate pseudo-inverse of unmixing + whitening).
+    /// Mixing matrix (`pinv(components_)`), shape `(n_features, n_components)`.
     #[must_use]
     pub fn mixing(&self) -> &Array2<F> {
         &self.mixing
@@ -408,6 +419,63 @@ fn sym_orthogonalise<F: Float + Send + Sync + 'static>(
     }
     *w = w_new;
     Ok(())
+}
+
+/// Moore-Penrose pseudo-inverse of a `(k × n)` matrix `a` (k ≤ n, full row
+/// rank in practice for `components_ = W @ K`).
+///
+/// Mirrors sklearn's `mixing_ = linalg.pinv(self.components_)`
+/// (`sklearn/decomposition/_fastica.py:689`). Computed via the symmetric
+/// eigendecomposition of `a aᵀ` (a `k × k` symmetric matrix):
+/// `a aᵀ = V D Vᵀ` ⇒ `a⁺ = aᵀ V D⁺ Vᵀ`, where `D⁺` inverts the eigenvalues
+/// above a relative threshold (zeroing the rest, the Moore-Penrose
+/// rank-deficient convention). For full-row-rank `a` this is exact:
+/// `a⁺ = aᵀ (a aᵀ)⁻¹`. Returns shape `(n × k)`. Never panics (R-CODE-2):
+/// the eigendecomposition `Result` is propagated.
+fn pinv<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Result<Array2<F>, FerroError> {
+    let k = a.nrows();
+    let n = a.ncols();
+    // Gram matrix g = a aᵀ  (k × k, symmetric).
+    let g = a.dot(&a.t());
+    let max_iter = k * k * 100 + 1000;
+    let (eigenvalues, eigenvectors) = jacobi_eigen_small(&g, max_iter)?;
+    // Relative threshold (rcond) on the eigenvalues of a aᵀ — singular values
+    // squared. sklearn's pinv uses rcond ≈ max(m,n)·eps on the singular values;
+    // here we threshold on the eigenvalues (sv²) with a conservative bound.
+    let mut max_ev = F::zero();
+    for i in 0..k {
+        if eigenvalues[i] > max_ev {
+            max_ev = eigenvalues[i];
+        }
+    }
+    let rcond = F::from(1e-15).unwrap_or_else(F::epsilon);
+    let cutoff = max_ev * rcond;
+    // ginv = V D⁺ Vᵀ  (k × k), then a⁺ = aᵀ ginv  (n × k).
+    let mut ginv = Array2::<F>::zeros((k, k));
+    for idx in 0..k {
+        let d = eigenvalues[idx];
+        if d > cutoff {
+            let inv_d = F::one() / d;
+            for r in 0..k {
+                for c in 0..k {
+                    ginv[[r, c]] =
+                        ginv[[r, c]] + inv_d * eigenvectors[[r, idx]] * eigenvectors[[c, idx]];
+                }
+            }
+        }
+    }
+    // a⁺ = aᵀ · ginv  →  (n × k)
+    let mut pinv_mat = Array2::<F>::zeros((n, k));
+    for r in 0..n {
+        for c in 0..k {
+            let mut acc = F::zero();
+            for j in 0..k {
+                acc = acc + a[[j, r]] * ginv[[j, c]];
+            }
+            pinv_mat[[r, c]] = acc;
+        }
+    }
+    Ok(pinv_mat)
 }
 
 /// Jacobi eigendecomposition for a small k×k symmetric matrix.
@@ -708,15 +776,20 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for FastICA<F> {
             }
         }
 
-        // --- Mixing matrix ---------------------------------------------------
-        // The full unmixing pipeline is: s = W @ K @ (x - mean)
-        // where K is the whitening matrix (k × n_features), W is k × k.
-        // The mixing matrix M satisfies s ≈ W K x_c, so x_c ≈ K^T W^T s (Moore-Penrose pseudo-inverse).
-        // mixing = K^T W^T  (n_features × k)
-        let mixing = whitening.t().dot(&w.t()); // n_features × k
+        // --- Components & mixing matrix --------------------------------------
+        // sklearn stores the FULL unmixing operator on centered data:
+        // `components_ = W @ K` (`_fastica.py:683`, shape k × n_features), so the
+        // transform contract `S = (X - mean_) @ components_.T` holds; and
+        // `mixing_ = linalg.pinv(components_)` (`_fastica.py:689`, the
+        // Moore-Penrose pseudo-inverse, shape n_features × k), so the inverse
+        // contract `X - mean_ == S @ mixing_.T` holds. The previous `KᵀWᵀ` was
+        // only an approximation of the pinv (exact only when K's rows are
+        // orthonormal), diverging by O(1).
+        let components = w.dot(&whitening); // (k × n_features)
+        let mixing = pinv(&components)?; // (n_features × k)
 
         Ok(FittedFastICA {
-            components: w,
+            components,
             mixing,
             mean,
             whitening,
@@ -734,7 +807,7 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFastICA<F>
     type Output = Array2<F>;
     type Error = FerroError;
 
-    /// Unmix new signals: `S = (W @ K @ (X - mean)^T)^T`.
+    /// Unmix new signals: `S = (X - mean) @ components_.T` (`components_ = W @ K`).
     ///
     /// Returns an array of shape `(n_samples, n_components)`.
     ///
@@ -762,10 +835,12 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedFastICA<F>
                 *v = *v - m;
             }
         }
-        // Whiten: X_w = K @ X_c^T  (k × n), transpose to n × k.
-        let x_white = self.whitening.dot(&xc.t()).t().to_owned(); // n × k
-        // Unmix: S = (W @ X_w^T)^T = X_w @ W^T  (n × k)
-        let sources = x_white.dot(&self.components.t());
+        // Unmix directly with the stored full unmixing operator:
+        // S = (X - mean) @ components_.T, where components_ = W @ K
+        // (sklearn `_fastica.py:762` `np.dot(X, self.components_.T)`). This is
+        // identical to applying K then W explicitly, but uses the composed
+        // matrix so the stored `components_` satisfies the transform contract.
+        let sources = xc.dot(&self.components.t()); // n × k
         Ok(sources)
     }
 }

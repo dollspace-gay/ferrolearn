@@ -25,19 +25,25 @@
 //! RNG carve-outs). The MEANINGFUL, observable correctness check is recovery up to
 //! perm+sign+scale (abs-correlation ≈ 1, see `ica_correctness_recovers_known_sources`).
 //!
-//! ## Attribute-semantics divergences (NOT-STARTED, investigated — NOT pinned here)
+//! ## Attribute-semantics divergences (FIXED — audit #2410 / pins #2411,#2412)
 //!
-//! - REQ-5 (#1573): sklearn `components_ = W @ K` shape `(k, n_features)`
-//!   (`_fastica.py:683`); ferrolearn `components()` returns `W` shape `(k, k)`
-//!   (`fast_ica.rs:208`,`:660`) with `whitening` (= `K`) stored separately. This is
-//!   an attribute-EXPOSURE choice, NOT a transform-output bug: the transform output
-//!   `(X−mean) @ (W@K)ᵀ` matches sklearn's `(X−mean) @ components_.T`
-//!   (`_fastica.py:762`) because ferrolearn applies `K` then `W` explicitly
-//!   (`fast_ica.rs:702-704`). Confirmed structurally correct by
-//!   `transform_equals_centered_unmix_via_w_at_k`.
-//! - REQ-6 (#1574): sklearn `mixing_ = pinv(components_)` (`_fastica.py:689`);
-//!   ferrolearn `mixing = Kᵀ Wᵀ` (`fast_ica.rs:657`). Attribute-semantics, not a
-//!   transform divergence.
+//! CORRECTION (R-HONEST-4): the prior conclusion below — that the
+//! `components_`/`mixing_` differences were "attribute-EXPOSURE only, NOT a bug"
+//! and that "NO deterministic, observable, non-RNG-coupled, non-identifiability
+//! -gated numeric divergence was found" — was WRONG. Audit #2410 pinned two
+//! DETERMINISTIC, sign/permutation/scale-INVARIANT contracts the old attributes
+//! violated by O(1) (`divergence_fast_ica_attrs_2410.rs`, #2411 / #2412). The
+//! root cause is now FIXED in `fast_ica.rs`:
+//!
+//! - REQ-5 (#2412): sklearn `components_ = W @ K` shape `(k, n_features)`
+//!   (`_fastica.py:683`); ferrolearn now stores `components = w.dot(&whitening)`
+//!   (= `W @ K`), and `transform` returns `(X − mean) @ components_.T`
+//!   (`_fastica.py:762`). The transform contract `S == (X − mean) @ components_.T`
+//!   now HOLDS.
+//! - REQ-6 (#2411): sklearn `mixing_ = pinv(components_)` (`_fastica.py:689`);
+//!   ferrolearn now computes `mixing = pinv(components)` (SVD-equivalent
+//!   symmetric-eigendecomposition pseudo-inverse), replacing the old `Kᵀ Wᵀ`
+//!   transpose-product. The inverse contract `X − mean == S @ mixing_.T` now HOLDS.
 //!
 //! ## Whitening invariant (investigated — NOT a bug)
 //!
@@ -51,13 +57,13 @@
 //!
 //! ## Conclusion
 //!
-//! Every value candidate is gated on the `w_init` RNG, the eigh-vs-svd whitening
-//! convention, or the perm+sign+scale ICA identifiability — i.e. all are carve-out
-//! gated. NO deterministic, observable, non-RNG-coupled, non-identifiability-gated
-//! numeric divergence with a clean R-CHAR-3 oracle was found. This is a
-//! verify-and-document unit (same class as minibatch_nmf / lda). Everything below is a
-//! STRUCTURAL GREEN-GUARD that PASSES against current code and pins contracts the
-//! generator must not regress.
+//! The element-wise `components`/source VALUE divergence remains a genuine
+//! carve-out (gated on the `w_init` RNG, the eigh-vs-svd whitening convention,
+//! and the perm+sign+scale ICA identifiability). However — contrary to the prior
+//! audit — the `components_`/`mixing_` ATTRIBUTE contracts WERE a deterministic,
+//! identifiability-invariant divergence (now fixed, see above + #2411/#2412).
+//! Everything below is a STRUCTURAL GREEN-GUARD that PASSES against current code
+//! and pins contracts the generator must not regress.
 
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_decomp::{Algorithm, FastICA, FittedFastICA, NonLinearity};
@@ -216,8 +222,9 @@ fn whitening_produces_identity_covariance() {
 // GREEN-GUARD: fitted-attribute shapes (REQ-2)
 // ---------------------------------------------------------------------------
 
-/// GREEN-GUARD (REQ-2): sources `(n_samples, k)`, components `(k, k)`,
-/// mixing `(n_features, k)`, mean `(n_features,)`. (Structural shapes; sklearn's
+/// GREEN-GUARD (REQ-2): sources `(n_samples, k)`, components `(k, n_features)`
+/// (= `W@K`; here k == n_features == 2), mixing `(n_features, k)`,
+/// mean `(n_features,)`. (Structural shapes; sklearn's
 /// `mean_` is `(n_features,)`, `whitening_` is `(k, n_features)` — design-doc Probe 1.)
 #[test]
 fn fitted_attribute_shapes() {
@@ -227,7 +234,11 @@ fn fitted_attribute_shapes() {
     let sources = fitted.transform(&x).expect("transform");
 
     assert_eq!(sources.dim(), (50, 2), "sources (n_samples, k)");
-    assert_eq!(fitted.components().dim(), (2, 2), "components (k, k)");
+    assert_eq!(
+        fitted.components().dim(),
+        (2, 2),
+        "components (k, n_features)"
+    );
     assert_eq!(fitted.mixing().dim(), (2, 2), "mixing (n_features, k)");
     assert_eq!(fitted.mean().len(), 2, "mean (n_features,)");
 }
