@@ -20,3 +20,4 @@ rand.workspace = true
 approx.workspace = true
 serde_json.workspace = true
 ferrolearn-test-oracle = { path = "../ferrolearn-test-oracle" }
+ferrolearn-linear = { path = "../ferrolearn-linear" }
