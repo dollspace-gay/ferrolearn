@@ -82,7 +82,6 @@ fn fit_cd_nndsvd() -> ferrolearn_decomp::FittedNMF<f64> {
 /// 0.6092353143399691]; ferrolearn returns ~[0.318, 0.0147, 0.487, ...] (~5.2x
 /// smaller). Expected values are the LIVE sklearn 1.5.2 oracle.
 #[test]
-#[ignore = "divergence: NMF components_ (cd,nndsvd) ~5x off vs sklearn NNDSVD+CD; tracking #2394"]
 fn divergence_components_cd_nndsvd() {
     let fitted = fit_cd_nndsvd();
     // sklearn 1.5.2 oracle, m.components_.tolist() (row 0):
@@ -112,7 +111,6 @@ fn divergence_components_cd_nndsvd() {
 /// (`nmf.rs:563`) stops when the reconstruction-error DELTA drops below `tol`,
 /// reaching only 50. Expected value is the LIVE sklearn 1.5.2 oracle.
 #[test]
-#[ignore = "divergence: NMF n_iter_ (cd) 50 vs sklearn 151 (recon-delta vs violation tol); tracking #2395"]
 fn divergence_n_iter_cd_nndsvd() {
     let fitted = fit_cd_nndsvd();
     // sklearn 1.5.2 oracle: m.n_iter_ == 151.
@@ -133,7 +131,6 @@ fn divergence_n_iter_cd_nndsvd() {
 /// different local optimum (downstream of the wrong NNDSVD init / stopping
 /// rule). Expected value is the LIVE sklearn 1.5.2 oracle.
 #[test]
-#[ignore = "divergence: NMF reconstruction_err_ (cd,nndsvd) 5.5147 vs sklearn 5.5136 (>1e-6); tracking #2396"]
 fn divergence_reconstruction_err_cd_nndsvd() {
     let fitted = fit_cd_nndsvd();
     // sklearn 1.5.2 oracle: m.reconstruction_err_ == 5.513563243249451.
@@ -148,27 +145,30 @@ fn divergence_reconstruction_err_cd_nndsvd() {
 
 /// Divergence (#2397): `transform(X)` (the W document-topic matrix) for
 /// CD+NNDSVD. sklearn `NMF.transform` (`sklearn/decomposition/_nmf.py:1213`)
-/// solves W with H fixed via the same CD/NNLS objective; for the fit data this
-/// returns the W of `fit_transform`. ferrolearn `transform` (`nmf.rs:757`)
-/// instead runs 200 multiplicative-update steps from a constant 0.1 seed with
-/// H fixed, producing a W that is uniformly ~5.4x too large. sklearn W[0] =
-/// [0.7208617466878319, 1.2958572601871108, 0.7663393327001597]; ferrolearn
-/// returns ~[3.92, 4.28, 2.64]. Expected values are the LIVE sklearn 1.5.2
-/// oracle.
+/// solves `W` with `H` fixed via `_fit_transform(X, H=components_,
+/// update_H=False)`: for the `cd` solver `W` starts at ZEROS (`_nmf.py:1254`)
+/// and only `W` is updated, re-solving the NNLS `min_{W>=0} ||X - W·H||²`.
+///
+/// NOTE: sklearn's own `transform(X)` does NOT equal `fit_transform`'s W on the
+/// training data — the re-solve has its own (looser) violation-ratio stop, so
+/// sklearn's `transform W[0] = [0.7208388473417567, 1.29584414848054,
+/// 0.7663490877861501]` differs by ~2e-5 from `fit_transform W[0] =
+/// [0.7208617..., 1.2958572..., 0.7663393...]`. We pin to sklearn's `TRANSFORM`
+/// output (the contract `NMF.transform` actually returns), the faithful target.
+/// ferrolearn previously ran 200 multiplicative-update steps from a constant
+/// `0.1` seed (`nmf.rs`), producing a W uniformly ~5.4x too large (~[3.92, 4.28,
+/// 2.64]). Expected values are the LIVE sklearn 1.5.2 oracle
+/// (`m.transform(X)[0].tolist()`, run from /tmp, R-CHAR-3).
 #[test]
-#[ignore = "divergence: NMF transform W (cd,nndsvd) ~5.4x off vs sklearn NNLS transform; tracking #2397"]
 fn divergence_transform_w_cd_nndsvd() {
     let fitted = fit_cd_nndsvd();
     let w = fitted
         .transform(&fixture_12x6())
         .expect("transform should succeed");
     assert_eq!(w.dim(), (12, 3), "transform W shape");
-    // sklearn 1.5.2 oracle, W.tolist()[0]:
-    let sk_w_row0 = [
-        0.7208617466878319,
-        1.2958572601871108,
-        0.7663393327001597,
-    ];
+    // sklearn 1.5.2 oracle: m.transform(X)[0].tolist() (the re-solve W, the
+    // value sklearn's NMF.transform actually returns — NOT fit_transform's W).
+    let sk_w_row0 = [0.7208388473417567, 1.29584414848054, 0.7663490877861501];
     for (k, &expected) in sk_w_row0.iter().enumerate() {
         let actual = w[[0, k]];
         assert!(

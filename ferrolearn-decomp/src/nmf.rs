@@ -42,21 +42,26 @@
 //! open blocker). Non-test consumers: crate re-export (`lib.rs:97`), the PyO3
 //! `_RsNMF` binding (`ferrolearn-python/src/extras.rs:1116`, registered `lib.rs:75`),
 //! `PipelineTransformer`. Oracle = live sklearn 1.5.2 (`_nmf.py`, `class NMF`), run
-//! from `/tmp` (R-CHAR-3). ferrolearn defaults to MU + random init + pseudo-NNDSVD;
-//! exact component VALUES are a carve-out (sklearn default cd + nndsvda + numpy RNG;
-//! NMF identifiable only up to permutation/scaling).
+//! from `/tmp` (R-CHAR-3). ferrolearn's ctor still DEFAULTS to MU + Random init;
+//! exact component VALUES on the RANDOM/MU path are a carve-out (numpy RNG vs Rust
+//! RNG; NMF identifiable only up to permutation/scaling). BUT the DETERMINISTIC
+//! `init='nndsvd', solver='cd'` path is now BIT-EXACT to sklearn (#2398/#2394/#2395/
+//! #2396/#2397): the real SVD-based NNDSVD init (`init_nndsvd` via
+//! `ferray::linalg::svd_lapack` + `svd_flip_u_based`), the violation-ratio CD
+//! convergence (`solve_coordinate_descent`/`update_cd_sweep`), and the CD transform
+//! W-solve all reproduce sklearn to ~1e-9 (`tests/divergence_nmf_cd_nndsvd_2393.rs`).
 //!
 //! | REQ | Scope | Status | Evidence / Blocker |
 //! |---|---|---|---|
 //! | REQ-1 | Structural: `components_` shape `(n_components,n_features)`, transform W shape, finite + decreasing `reconstruction_err_`, `n_iter_`, seed-determinism | SHIPPED (scoped) | `fit` (`nmf.rs:617`); green-guards + in-module tests. STRUCTURAL, NOT values (REQ-5) |
 //! | REQ-2 | Non-negativity of `components_` (H) + transform (W) | SHIPPED | MU multiplicative + CD clamp; `test_nmf_components_non_negative`/`_transform_non_negative` |
-//! | REQ-3 | Both solvers (MU/CD) × both inits (Random/pseudo-NNDSVD) run | SHIPPED | `fit` dispatch (`:657-670`); 4-combo tests |
+//! | REQ-3 | Both solvers (MU/CD) × both inits (Random/NNDSVD) run | SHIPPED | `fit` dispatch (`:657-670`); 4-combo tests |
 //! | REQ-4 | Reconstruction QUALITY (`‖X−WH‖` small/decreasing — "did NMF work") | SHIPPED | `reconstruction_error` (`:247`) monotone-decreasing + small residual; `test_nmf_*` |
-//! | REQ-5 | EXACT `components_` value parity | NOT-STARTED | CARVE-OUT (R-DEFER-3): random-init/MU-default/pseudo-NNDSVD/numpy-RNG vs sklearn cd+nndsvda; perm/scale identifiable — blocker #1609 |
-//! | REQ-6 | real `init="nndsvda"` default + SVD `nndsvd`/`nndsvdar`/`custom` | NOT-STARTED | sklearn `_nmf.py:225-374,:1000`; ferrolearn pseudo-NNDSVD (Jacobi of XᵀX), default Random — blocker #1610 |
-//! | REQ-7 | `solver="cd"` DEFAULT | NOT-STARTED | sklearn `_nmf.py:917`; ferrolearn defaults MU — blocker #1611 |
+//! | REQ-5 | EXACT `components_` value parity | SHIPPED (deterministic cd+nndsvd path) / NOT-STARTED (random/MU) | The DETERMINISTIC `init='nndsvd', solver='cd'` `components_` is bit-exact to sklearn — `divergence_components_cd_nndsvd` (`tests/divergence_nmf_cd_nndsvd_2393.rs`) matches `components_[0]` to 1e-6 (was #2394). The random-init/MU path stays a CARVE-OUT (numpy vs Rust RNG, perm/scale) — blocker #1609 |
+//! | REQ-6 | real SVD `init='nndsvd'` (+ `nndsvda`/`nndsvdar`/`custom`, `nndsvda` default) | SHIPPED (`nndsvd`) / NOT-STARTED (nndsvda default + nndsvdar/custom) | `init_nndsvd` (`nmf.rs` symbol `init_nndsvd`) now does the REAL SVD-based NNDSVD = sklearn `_initialize_nmf` (`_nmf.py:320-358`): `svd_lapack` (LAPACK gesdd, the SAME driver `randomized_svd`/scipy use) → `svd_flip_u_based` (`extmath.py` `svd_flip(u_based_decision=True)`) → leading-triplet `sqrt(S[0])·\|U\|`/`sqrt(S[0])·\|Vt\|` + per-component pos/neg-part split `lbd=sqrt(S[j]·sigma)` → `<eps`-zero. `test_nmf_nndsvd_init_matches_sklearn` matches sklearn `_initialize_nmf(X,3,'nndsvd')` W/H to 1e-9. STILL NOT-STARTED: the `nndsvda`/`nndsvdar` zero-fill + `custom` + `init=None→nndsvda` default — blocker #1610 |
+//! | REQ-7 | `solver='cd'` matching `_fit_coordinate_descent` (+ cd DEFAULT) | SHIPPED (cd algorithm) / NOT-STARTED (cd ctor DEFAULT) | `solve_coordinate_descent`/`update_cd_sweep` now match sklearn's Cython `_update_cdnmf_fast` (Gram-based per-coordinate `W[i,t]=max(0,W[i,t]−grad/hess)`, in-place sweep) + the VIOLATION-RATIO stop `violation/violation_init<=tol` (`_nmf.py:500-525`), reproducing sklearn `n_iter_` (`divergence_n_iter_cd_nndsvd` → 151) + `reconstruction_err_` (`divergence_reconstruction_err_cd_nndsvd` → 5.5136, 1e-6). STILL NOT-STARTED: `NMF::new` still defaults to `MultiplicativeUpdate` not `cd` — blocker #1611 |
 //! | REQ-8 | `beta_loss` (kullback-leibler/itakura-saito) + `_gamma` | NOT-STARTED | sklearn `_nmf.py:89,:919`; ferrolearn Frobenius-only — blocker #1612 |
-//! | REQ-9 | `transform` NNLS-W VALUE | NOT-STARTED | CARVE-OUT, folds into REQ-5 (downstream of carved-out H, no injectable-H API) — blocker #1613 |
+//! | REQ-9 | `transform` NNLS-W VALUE | SHIPPED | `transform` (`impl Transform for FittedNMF`) now solves W via the CD with H fixed = `_fit_transform(X, H=components_, update_H=False)` (`_nmf.py:1213`): W=zeros (`_nmf.py:1254`), violation-ratio CD. `divergence_transform_w_cd_nndsvd` matches sklearn `m.transform(X)[0]` to 1e-6 (was #2397) |
 //! | REQ-10 | `inverse_transform` = `W·H` | SHIPPED | `nmf.rs:229` (`= _nmf.py:1238`); exact algebra + col-mismatch `ShapeMismatch` |
 //! | REQ-11 | Error/parameter contracts (incl. NON-FINITE rejection, finiteness-before-nonnegative) | SHIPPED (scoped) | `fit`/`transform` guards. FLAG: sklearn raises `InvalidParameterError`, accepts `n_components=None`, doesn't pre-reject `>min(n,p)`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`nmf.rs` symbol `reject_non_finite`) BEFORE the non-negativity check and factorization, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_nmf.py:1652`) which runs BEFORE `check_non_negative` (`_nmf.py:1706`), so a NaN+negative input rejects for finiteness first (`utils/validation.py:147-154`). `tests/divergence_nonfinite.rs::divergence_nmf_fit_nan_`/`_fit_nan_and_negative_finiteness_fires_first` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: re-export `lib.rs` + NMF `fit`/`transform` |
 //! | REQ-12 | PyO3 `_RsNMF` binding (thin n_components ctor + fit + transform) | SHIPPED (scoped) | `extras.rs:1116`, registered `lib.rs:75`; NO params/getters/inverse_transform |
@@ -65,7 +70,10 @@
 //! | REQ-15 | `shuffle` (CD) + fitted attrs `n_components_`/`n_features_in_` | NOT-STARTED | sklearn `_nmf.py:924` — blocker #1616 |
 //! | REQ-16 | ferray substrate | NOT-STARTED | `ndarray` + `rand` + hand-rolled Jacobi — blocker #1617 |
 //!
-//! Count: **7 SHIPPED (REQ-1,2,3,4,10,11,12) / 9 NOT-STARTED (REQ-5,6,7,8,9,13,14,15,16)**.
+//! Count: **9 SHIPPED (REQ-1,2,3,4,9,10,11,12 + REQ-6/7 cd+nndsvd algorithm) / 7
+//! NOT-STARTED (REQ-8,13,14,15,16 + REQ-6 nndsvda-default/nndsvdar/custom + REQ-7
+//! cd-ctor-default)**. REQ-5 is SHIPPED on the deterministic cd+nndsvd path,
+//! NOT-STARTED on random/MU (carve-out #1609).
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -74,6 +82,7 @@ use ndarray::{Array1, Array2};
 use num_traits::Float;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Uniform};
+use std::any::TypeId;
 
 /// Reject non-finite input the way sklearn's `_validate_data` does.
 ///
@@ -334,73 +343,306 @@ fn init_random<F: Float>(
     (w, h)
 }
 
-/// NNDSVD initialization: compute a truncated SVD-like initialization.
-///
-/// Uses a simple approach: compute `X^T X`, eigendecompose, then use the
-/// top eigenvectors to initialize H, and solve for W = X * H^+ (pseudoinverse).
-fn init_nndsvd<F: Float + Send + Sync + 'static>(
-    x: &Array2<F>,
-    n_components: usize,
-    seed: u64,
-) -> Result<(Array2<F>, Array2<F>), FerroError> {
-    let (n_samples, n_features) = x.dim();
-
-    // Compute mean of X for scale.
-    let mut total = F::zero();
-    for &v in x {
-        total = total + v;
-    }
-    let avg = (total / F::from(n_samples * n_features).unwrap())
-        .abs()
-        .sqrt();
-    let avg = if avg < eps::<F>() { F::one() } else { avg };
-
-    // Compute X^T X.
-    let xtx = x.t().dot(x);
-
-    // Eigendecompose with Jacobi.
-    let max_iter = n_features * n_features * 100 + 1000;
-    let (eigenvalues, eigenvectors) = jacobi_eigen_symmetric(&xtx, max_iter)?;
-
-    // Sort eigenvalues descending.
-    let mut indices: Vec<usize> = (0..n_features).collect();
-    indices.sort_by(|&a, &b| {
-        eigenvalues[b]
-            .partial_cmp(&eigenvalues[a])
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-
-    // Build H from top eigenvectors (as rows), clamp negatives to zero.
-    let mut h = Array2::<F>::zeros((n_components, n_features));
-    for (k, &idx) in indices.iter().take(n_components).enumerate() {
-        for j in 0..n_features {
-            let val = eigenvectors[[j, idx]];
-            h[[k, j]] = if val > F::zero() { val } else { F::zero() };
+/// Bridge an `ndarray::Array2<f64>` into a `ferray` 2-D array.
+fn ndarray_to_ferray_f64(a: &Array2<f64>) -> Result<ferray::Array<f64, ferray::Ix2>, FerroError> {
+    let (m, n) = a.dim();
+    let data: Vec<f64> = a.iter().copied().collect();
+    ferray::Array::<f64, ferray::Ix2>::from_vec(ferray::Ix2::new([m, n]), data).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray array construction failed: {e}"),
         }
-        // Ensure row is not all zeros.
-        let row_sum: F = h.row(k).iter().copied().fold(F::zero(), |a, b| a + b);
-        if row_sum < eps::<F>() {
-            // Fall back to small random values.
-            let mut rng: rand::rngs::StdRng =
-                SeedableRng::seed_from_u64(seed.wrapping_add(k as u64));
-            let uniform = Uniform::new(0.0f64, 1.0f64).unwrap();
-            for j in 0..n_features {
-                h[[k, j]] = F::from(uniform.sample(&mut rng)).unwrap_or_else(F::zero) * avg;
+    })
+}
+
+/// Bridge an `ndarray::Array2<f32>` into a `ferray` 2-D array.
+fn ndarray_to_ferray_f32(a: &Array2<f32>) -> Result<ferray::Array<f32, ferray::Ix2>, FerroError> {
+    let (m, n) = a.dim();
+    let data: Vec<f32> = a.iter().copied().collect();
+    ferray::Array::<f32, ferray::Ix2>::from_vec(ferray::Ix2::new([m, n]), data).map_err(|e| {
+        FerroError::NumericalInstability {
+            message: format!("ferray array construction failed: {e}"),
+        }
+    })
+}
+
+/// Full thin SVD of `a` (`m × n`) returning `(U, s, Vt)` via
+/// `ferray::linalg::svd_lapack` (LAPACK `gesdd`). `U` is `(m, k)`, `s` length
+/// `k`, `Vt` is `(k, n)` with `k = min(m, n)`. This is the SAME driver
+/// `scipy.linalg.svd` calls and the SAME helper `pca.rs` uses, so the spectrum
+/// and singular vectors are bit-identical to scipy/sklearn (up to per-vector
+/// sign, fixed by [`svd_flip_u_based`]).
+#[allow(
+    clippy::type_complexity,
+    reason = "(U, s, Vt) is the standard thin-SVD triple, not worth a named struct"
+)]
+fn svd_full_f64(a: &Array2<f64>) -> Result<(Array2<f64>, Array1<f64>, Array2<f64>), FerroError> {
+    let fa = ndarray_to_ferray_f64(a)?;
+    let (u, s, vt) =
+        ferray::linalg::svd_lapack(&fa, false).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd_lapack (gesdd) failed: {e}"),
+        })?;
+    Ok((u.into_ndarray(), s.into_ndarray(), vt.into_ndarray()))
+}
+
+/// f32 analogue of [`svd_full_f64`].
+#[allow(
+    clippy::type_complexity,
+    reason = "(U, s, Vt) is the standard thin-SVD triple, not worth a named struct"
+)]
+fn svd_full_f32(a: &Array2<f32>) -> Result<(Array2<f32>, Array1<f32>, Array2<f32>), FerroError> {
+    let fa = ndarray_to_ferray_f32(a)?;
+    let (u, s, vt) =
+        ferray::linalg::svd_lapack(&fa, false).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd_lapack (gesdd) failed: {e}"),
+        })?;
+    Ok((u.into_ndarray(), s.into_ndarray(), vt.into_ndarray()))
+}
+
+/// sklearn's `svd_flip(U, Vt, u_based_decision=True)`
+/// (`sklearn/utils/extmath.py`): for each column `k` of `U`, find the entry with
+/// the largest absolute value (numpy `argmax` — first index on ties via strict
+/// `>`); if that entry is negative, negate column `k` of `U` and row `k` of
+/// `Vt`. This is the sign convention `randomized_svd` applies, so the
+/// deterministic top-`k` full SVD reproduces sklearn's `_initialize_nmf`
+/// `U`/`Vt` exactly.
+fn svd_flip_u_based<F: Float>(u: &mut Array2<F>, vt: &mut Array2<F>) {
+    let (m, k) = u.dim();
+    let n = vt.ncols();
+    for col in 0..k {
+        let mut max_abs = F::neg_infinity();
+        let mut max_row = 0usize;
+        for row in 0..m {
+            let av = u[[row, col]].abs();
+            if av > max_abs {
+                max_abs = av;
+                max_row = row;
+            }
+        }
+        if u[[max_row, col]] < F::zero() {
+            for row in 0..m {
+                u[[row, col]] = -u[[row, col]];
+            }
+            for j in 0..n {
+                vt[[col, j]] = -vt[[col, j]];
             }
         }
     }
+}
 
-    // Compute W = X * H^T * (H * H^T)^{-1}, but simpler: use multiplicative
-    // update step starting from random W.
+/// Compute the top-`n_components` `(U, S, Vt)` of `X` (sign-corrected by
+/// [`svd_flip_u_based`]) for the NNDSVD init. f64/f32 route through
+/// `ferray::linalg::svd_lapack` (LAPACK `gesdd`, sklearn's `gesdd` driver);
+/// exotic `F` falls back to a Jacobi eigendecomposition of `XᵀX` reconstructing
+/// `U = X·V/s`.
+#[allow(
+    clippy::type_complexity,
+    reason = "(U, s, Vt) is the standard thin-SVD triple, not worth a named struct"
+)]
+fn nndsvd_svd<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    n_components: usize,
+) -> Result<(Array2<F>, Array1<F>, Array2<F>), FerroError> {
+    let (n_samples, n_features) = x.dim();
+    let k = n_components;
+
+    // f64/f32 fast path through ferray's LAPACK gesdd SVD (sklearn's driver).
+    let full = if TypeId::of::<F>() == TypeId::of::<f64>() {
+        // SAFETY: TypeId proves F == f64; the cast/transmute is between identical
+        // types, the same pattern PCA's `svd_dispatch` uses.
+        let x_f64: &Array2<f64> = unsafe { &*(std::ptr::from_ref(x).cast::<Array2<f64>>()) };
+        let (u, s, vt) = svd_full_f64(x_f64)?;
+        let u_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f64>, Array2<F>>(&u) };
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f64>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f64>, Array2<F>>(&vt) };
+        std::mem::forget(u);
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Some((u_f, s_f, vt_f))
+    } else if TypeId::of::<F>() == TypeId::of::<f32>() {
+        // SAFETY: TypeId proves F == f32; the cast/transmute is between identical
+        // types, the same pattern PCA's `svd_dispatch` uses.
+        let x_f32: &Array2<f32> = unsafe { &*(std::ptr::from_ref(x).cast::<Array2<f32>>()) };
+        let (u, s, vt) = svd_full_f32(x_f32)?;
+        let u_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f32>, Array2<F>>(&u) };
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f32>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f32>, Array2<F>>(&vt) };
+        std::mem::forget(u);
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Some((u_f, s_f, vt_f))
+    } else {
+        None
+    };
+
+    let (mut u, s, mut vt) = match full {
+        Some((u_full, s_full, vt_full)) => {
+            // Truncate the thin SVD to the leading k triplets.
+            let u_t = u_full.slice(ndarray::s![.., ..k]).to_owned();
+            let s_t = s_full.slice(ndarray::s![..k]).to_owned();
+            let vt_t = vt_full.slice(ndarray::s![..k, ..]).to_owned();
+            (u_t, s_t, vt_t)
+        }
+        None => {
+            // Exotic-F fallback: V/S from Jacobi(XᵀX), U = X·V/s.
+            let max_iter = n_features * n_features * 100 + 1000;
+            let xtx = x.t().dot(x);
+            let (eigenvalues, eigenvectors) = jacobi_eigen_symmetric(&xtx, max_iter)?;
+            let mut indices: Vec<usize> = (0..n_features).collect();
+            indices.sort_by(|&a, &b| {
+                eigenvalues[b]
+                    .partial_cmp(&eigenvalues[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            let mut s_t = Array1::<F>::zeros(k);
+            let mut vt_t = Array2::<F>::zeros((k, n_features));
+            for (row, &idx) in indices.iter().take(k).enumerate() {
+                let sv = eigenvalues[idx].max(F::zero()).sqrt();
+                s_t[row] = sv;
+                for j in 0..n_features {
+                    vt_t[[row, j]] = eigenvectors[[j, idx]];
+                }
+            }
+            // U = X · Vᵀᵀ / s = X · V / s; columns where s ~ 0 stay zero.
+            let mut u_t = Array2::<F>::zeros((n_samples, k));
+            for row in 0..k {
+                let sv = s_t[row];
+                if sv <= eps::<F>() {
+                    continue;
+                }
+                for i in 0..n_samples {
+                    let mut acc = F::zero();
+                    for j in 0..n_features {
+                        acc = acc + x[[i, j]] * vt_t[[row, j]];
+                    }
+                    u_t[[i, row]] = acc / sv;
+                }
+            }
+            (u_t, s_t, vt_t)
+        }
+    };
+
+    svd_flip_u_based(&mut u, &mut vt);
+    Ok((u, s, vt))
+}
+
+/// NNDSVD initialization (Boutsidis & Gallopoulos, 2008), matching sklearn's
+/// `_initialize_nmf(X, n_components, init="nndsvd")`
+/// (`sklearn/decomposition/_nmf.py:320-358`).
+///
+/// `U, S, Vt = svd(X)` (top `n_components`, sign-corrected like
+/// `randomized_svd`). The leading triplet seeds `W[:,0] = sqrt(S[0])·|U[:,0]|`,
+/// `H[0,:] = sqrt(S[0])·|Vt[0,:]|`. For each later component the positive and
+/// negative parts of `U[:,j]`/`Vt[j,:]` are split, the larger-norm pair chosen,
+/// and scaled by `lbd = sqrt(S[j]·sigma)`. Entries below machine `eps` are
+/// zeroed (plain `nndsvd`: zeros stay). Deterministic — no RNG.
+fn init_nndsvd<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    n_components: usize,
+) -> Result<(Array2<F>, Array2<F>), FerroError> {
+    let (n_samples, n_features) = x.dim();
+    let (u, s, vt) = nndsvd_svd(x, n_components)?;
+
+    // sklearn uses `eps = np.finfo(X.dtype).eps`. Match per concrete F.
+    let machine_eps = if TypeId::of::<F>() == TypeId::of::<f32>() {
+        F::from(f32::EPSILON).unwrap_or_else(F::epsilon)
+    } else {
+        F::from(f64::EPSILON).unwrap_or_else(F::epsilon)
+    };
+
     let mut w = Array2::<F>::zeros((n_samples, n_components));
-    // Solve W by least squares: W = X * H^T * pinv(H * H^T)
-    // For simplicity, initialize W = X * H^T and normalize.
-    let ht = h.t();
-    let w_init = x.dot(&ht);
+    let mut h = Array2::<F>::zeros((n_components, n_features));
+
+    // Leading singular triplet is non-negative — use as-is.
+    let sqrt_s0 = s[0].max(F::zero()).sqrt();
     for i in 0..n_samples {
-        for k in 0..n_components {
-            let val = w_init[[i, k]];
-            w[[i, k]] = if val > F::zero() { val } else { eps::<F>() };
+        w[[i, 0]] = sqrt_s0 * u[[i, 0]].abs();
+    }
+    for j in 0..n_features {
+        h[[0, j]] = sqrt_s0 * vt[[0, j]].abs();
+    }
+
+    for comp in 1..n_components {
+        // Positive / negative parts of U[:,comp] and Vt[comp,:].
+        let mut xp_nrm_sq = F::zero();
+        let mut xn_nrm_sq = F::zero();
+        for i in 0..n_samples {
+            let val = u[[i, comp]];
+            if val > F::zero() {
+                xp_nrm_sq = xp_nrm_sq + val * val;
+            } else {
+                xn_nrm_sq = xn_nrm_sq + val * val;
+            }
+        }
+        let mut yp_nrm_sq = F::zero();
+        let mut yn_nrm_sq = F::zero();
+        for j in 0..n_features {
+            let val = vt[[comp, j]];
+            if val > F::zero() {
+                yp_nrm_sq = yp_nrm_sq + val * val;
+            } else {
+                yn_nrm_sq = yn_nrm_sq + val * val;
+            }
+        }
+        let x_p_nrm = xp_nrm_sq.sqrt();
+        let y_p_nrm = yp_nrm_sq.sqrt();
+        let x_n_nrm = xn_nrm_sq.sqrt();
+        let y_n_nrm = yn_nrm_sq.sqrt();
+
+        let m_p = x_p_nrm * y_p_nrm;
+        let m_n = x_n_nrm * y_n_nrm;
+
+        // `use_positive`, `nrm_u`, `nrm_v`, `sigma`.
+        let (use_positive, nrm_u, nrm_v, sigma) = if m_p > m_n {
+            (true, x_p_nrm, y_p_nrm, m_p)
+        } else {
+            (false, x_n_nrm, y_n_nrm, m_n)
+        };
+
+        let lbd = (s[comp] * sigma).max(F::zero()).sqrt();
+
+        // W[:,comp] = lbd * (selected part of U[:,comp]) / nrm_u.
+        for i in 0..n_samples {
+            let val = u[[i, comp]];
+            let part = if use_positive {
+                if val > F::zero() { val } else { F::zero() }
+            } else if val < F::zero() {
+                -val
+            } else {
+                F::zero()
+            };
+            w[[i, comp]] = if nrm_u > F::zero() {
+                lbd * (part / nrm_u)
+            } else {
+                F::zero()
+            };
+        }
+        // H[comp,:] = lbd * (selected part of Vt[comp,:]) / nrm_v.
+        for j in 0..n_features {
+            let val = vt[[comp, j]];
+            let part = if use_positive {
+                if val > F::zero() { val } else { F::zero() }
+            } else if val < F::zero() {
+                -val
+            } else {
+                F::zero()
+            };
+            h[[comp, j]] = if nrm_v > F::zero() {
+                lbd * (part / nrm_v)
+            } else {
+                F::zero()
+            };
+        }
+    }
+
+    // sklearn: `W[W < eps] = 0; H[H < eps] = 0` (plain nndsvd: zeros stay).
+    for val in &mut w {
+        if *val < machine_eps {
+            *val = F::zero();
+        }
+    }
+    for val in &mut h {
+        if *val < machine_eps {
+            *val = F::zero();
         }
     }
 
@@ -557,96 +799,117 @@ fn solve_multiplicative_update<F: Float + 'static>(
     max_iter
 }
 
-/// Coordinate descent solver.
+/// One cyclic coordinate-descent sweep over the columns of `w`, with `ht`
+/// playing the role of `Ht` (`= H.T`). Mirrors sklearn's Cython
+/// `_update_cdnmf_fast` (`sklearn/decomposition/_cdnmf_fast.pyx`):
 ///
-/// Updates each element of H and W by solving a scalar minimization problem.
+/// ```text
+/// HHt = Ht.T @ Ht ; XHt = X @ Ht
+/// for t in 0..n_components:
+///     for i in 0..n_samples:
+///         grad = -XHt[i,t] + sum_r HHt[t,r] * W[i,r]    # W updated in place
+///         pg   = grad if W[i,t] != 0 else min(0, grad)  # projected gradient
+///         violation += |pg|
+///         if HHt[t,t] != 0: W[i,t] = max(W[i,t] - grad / HHt[t,t], 0)
+/// ```
+///
+/// Returns the accumulated projected-gradient `violation`. `w` is mutated in
+/// place so later coordinates in the sweep see the already-updated entries.
+/// To update `H`, call with `X.T`, `Ht`, `W` (the symmetry sklearn exploits in
+/// `_fit_coordinate_descent`).
+fn update_cd_sweep<F: Float + 'static>(x: &Array2<F>, w: &mut Array2<F>, ht: &Array2<F>) -> F {
+    let n_components = ht.ncols();
+    let n_samples = w.nrows();
+
+    // HHt = Ht.T @ Ht  (n_components × n_components)
+    let hht = ht.t().dot(ht);
+    // XHt = X @ Ht      (n_samples × n_components)
+    let xht = x.dot(ht);
+
+    let mut violation = F::zero();
+    for t in 0..n_components {
+        let hess = hht[[t, t]];
+        for i in 0..n_samples {
+            // grad = GW[i,t] where GW = W @ HHt - XHt
+            let mut grad = -xht[[i, t]];
+            for r in 0..n_components {
+                grad = grad + hht[[t, r]] * w[[i, r]];
+            }
+            // projected gradient
+            let pg = if w[[i, t]] == F::zero() {
+                grad.min(F::zero())
+            } else {
+                grad
+            };
+            violation = violation + pg.abs();
+            if hess != F::zero() {
+                w[[i, t]] = (w[[i, t]] - grad / hess).max(F::zero());
+            }
+        }
+    }
+    violation
+}
+
+/// Coordinate-descent solver, matching sklearn's `_fit_coordinate_descent`
+/// (`sklearn/decomposition/_nmf.py:410-527`).
+///
+/// Each iteration updates `W` (via [`update_cd_sweep`] over `Ht = H.T`) and, if
+/// `update_h`, `H` (via the `X.T`/`Ht`/`W` symmetry), accumulating the total
+/// projected-gradient `violation`. The stopping rule is the VIOLATION RATIO
+/// `violation / violation_init <= tol` (`_nmf.py:513-525`), NOT a
+/// reconstruction-error delta. `H` is carried as its transpose `ht` (`= H.T`)
+/// throughout — the `C`-order layout sklearn keeps (`_nmf.py:495`). Returns the
+/// 1-based iteration count `n_iter` sklearn stores as `n_iter_`.
 fn solve_coordinate_descent<F: Float + 'static>(
     x: &Array2<F>,
     w: &mut Array2<F>,
     h: &mut Array2<F>,
     max_iter: usize,
     tol: f64,
+    update_h: bool,
 ) -> usize {
-    let (n_samples, n_features) = x.dim();
-    let n_components = h.nrows();
     let tol_f = F::from(tol).unwrap_or_else(F::epsilon);
-    let epsilon = eps::<F>();
-    let mut prev_err = reconstruction_error(x, w, h);
 
-    for iteration in 0..max_iter {
-        // Update H: for each k, j, solve for H[k,j]
-        // H[k,j] = max(0, (W[:,k]^T * (X[:,j] - W * H[:,j] + W[:,k]*H[k,j])) / (W[:,k]^T W[:,k]))
-        for k in 0..n_components {
-            let mut wk_norm_sq = F::zero();
-            for i in 0..n_samples {
-                wk_norm_sq = wk_norm_sq + w[[i, k]] * w[[i, k]];
-            }
+    // Work on Ht = H.T (n_features × n_components), as sklearn does.
+    let mut ht = h.t().to_owned();
+    let xt = x.t().to_owned();
 
-            if wk_norm_sq < epsilon {
-                continue;
-            }
+    let mut violation_init = F::zero();
+    let mut n_iter = if max_iter == 0 { 0 } else { 1 };
 
-            for j in 0..n_features {
-                // Compute residual + current contribution.
-                let mut numerator = F::zero();
-                for i in 0..n_samples {
-                    let mut wh_ij = F::zero();
-                    for kk in 0..n_components {
-                        if kk != k {
-                            wh_ij = wh_ij + w[[i, kk]] * h[[kk, j]];
-                        }
-                    }
-                    numerator = numerator + w[[i, k]] * (x[[i, j]] - wh_ij);
-                }
+    for iteration in 1..=max_iter {
+        n_iter = iteration;
+        let mut violation = F::zero();
 
-                h[[k, j]] = if numerator > F::zero() {
-                    numerator / wk_norm_sq
-                } else {
-                    F::zero()
-                };
-            }
+        // Update W (Ht plays the role of Ht).
+        violation = violation + update_cd_sweep(x, w, &ht);
+
+        // Update H (symmetry: X.T, Ht, W).
+        if update_h {
+            violation = violation + update_cd_sweep(&xt, &mut ht, w);
         }
 
-        // Update W: for each i, k, solve for W[i,k]
-        for k in 0..n_components {
-            let mut hk_norm_sq = F::zero();
-            for j in 0..n_features {
-                hk_norm_sq = hk_norm_sq + h[[k, j]] * h[[k, j]];
-            }
-
-            if hk_norm_sq < epsilon {
-                continue;
-            }
-
-            for i in 0..n_samples {
-                let mut numerator = F::zero();
-                for j in 0..n_features {
-                    let mut wh_ij = F::zero();
-                    for kk in 0..n_components {
-                        if kk != k {
-                            wh_ij = wh_ij + w[[i, kk]] * h[[kk, j]];
-                        }
-                    }
-                    numerator = numerator + h[[k, j]] * (x[[i, j]] - wh_ij);
-                }
-
-                w[[i, k]] = if numerator > F::zero() {
-                    numerator / hk_norm_sq
-                } else {
-                    F::zero()
-                };
-            }
+        if iteration == 1 {
+            violation_init = violation;
         }
-
-        // Check convergence.
-        let err = reconstruction_error(x, w, h);
-        if (prev_err - err).abs() < tol_f {
-            return iteration + 1;
+        if violation_init == F::zero() {
+            break;
         }
-        prev_err = err;
+        if violation / violation_init <= tol_f {
+            break;
+        }
     }
 
-    max_iter
+    // Write Ht.T back into H.
+    if update_h {
+        for k in 0..h.nrows() {
+            for j in 0..h.ncols() {
+                h[[k, j]] = ht[[j, k]];
+            }
+        }
+    }
+
+    n_iter
 }
 
 // ---------------------------------------------------------------------------
@@ -717,7 +980,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NMF<F> {
         // Initialize W and H.
         let (mut w, mut h) = match self.init {
             NMFInit::Random => init_random(n_samples, n_features, self.n_components, seed),
-            NMFInit::Nndsvd => init_nndsvd(x, self.n_components, seed)?,
+            NMFInit::Nndsvd => init_nndsvd(x, self.n_components)?,
         };
 
         // Solve.
@@ -726,7 +989,7 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NMF<F> {
                 solve_multiplicative_update(x, &mut w, &mut h, self.max_iter, self.tol)
             }
             NMFSolver::CoordinateDescent => {
-                solve_coordinate_descent(x, &mut w, &mut h, self.max_iter, self.tol)
+                solve_coordinate_descent(x, &mut w, &mut h, self.max_iter, self.tol, true)
             }
         };
 
@@ -746,8 +1009,17 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedNMF<F> {
 
     /// Project data onto the learned NMF components.
     ///
-    /// Solves for `W` in `X ~ W * H` using multiplicative updates with
-    /// `H` fixed to the learned components.
+    /// Mirrors sklearn `NMF.transform` (`sklearn/decomposition/_nmf.py:1213`):
+    /// `W = _fit_transform(X, H=self.components_, update_H=False)[0]` — solve the
+    /// non-negative least squares `min_{W>=0} ||X - W·H||²` for the FIXED fitted
+    /// `H` via the same coordinate descent. With `solver="cd"`, `W` is
+    /// initialised to ZEROS (`_nmf.py:1254`) and only `W` is updated
+    /// (`update_H=False`), so `transform` re-solves `W` rather than returning the
+    /// fitted `W` — both reach the convex NNLS optimum but, like sklearn itself,
+    /// the re-solve has its own (looser) violation-ratio stop, so `transform(X)`
+    /// differs slightly (~2e-5 here) from `fit_transform`'s co-optimised `W`.
+    ///
+    /// Uses `max_iter = 200`, `tol = 1e-4` (sklearn's `NMF` defaults).
     ///
     /// # Errors
     ///
@@ -783,23 +1055,14 @@ impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedNMF<F> {
 
         let n_samples = x.nrows();
         let n_components = self.components_.nrows();
-        let epsilon = eps::<F>();
 
-        // Initialize W with uniform small values.
+        // sklearn `_check_w_h` inits W to zeros for the `cd` solver when
+        // `update_H=False` (`_nmf.py:1253-1254`); H stays the fitted components_.
         let mut w = Array2::<F>::zeros((n_samples, n_components));
-        let init_val = F::from(0.1).unwrap_or_else(F::one);
-        w.fill(init_val);
+        let mut h = self.components_.clone();
 
-        // Run multiplicative updates with H fixed.
-        let h = &self.components_;
-        for _iter in 0..200 {
-            let wt_num = x.dot(&h.t());
-            let wt_den = w.dot(h).dot(&h.t());
-
-            for (w_val, (num, den)) in w.iter_mut().zip(wt_num.iter().zip(wt_den.iter())) {
-                *w_val = *w_val * (*num / (*den + epsilon));
-            }
-        }
+        // Solve W with H fixed (update_H=false) via the violation-ratio CD.
+        solve_coordinate_descent(x, &mut w, &mut h, 200, 1e-4, false);
 
         Ok(w)
     }
@@ -1136,6 +1399,77 @@ mod tests {
         let nmf = NMF::<f64>::new(1);
         let x = Array2::<f64>::zeros((0, 3));
         assert!(nmf.fit(&x, &()).is_err());
+    }
+
+    /// NNDSVD init (isolated) matches sklearn's `_initialize_nmf(X, 3,
+    /// init='nndsvd')` element-wise. Expected `H`/`W` are the LIVE sklearn 1.5.2
+    /// oracle (`_initialize_nmf`, run from /tmp, R-CHAR-3) on the deterministic
+    /// `(RandomState(0).rand(12,6)*5).round(3)` fixture — the SVD pos/neg split
+    /// + `lbd = sqrt(S[j]*sigma)` scaling, NOT copied from ferrolearn.
+    #[test]
+    fn test_nmf_nndsvd_init_matches_sklearn() {
+        let x: Array2<f64> = array![
+            [2.744, 3.576, 3.014, 2.724, 2.118, 3.229],
+            [2.188, 4.459, 4.818, 1.917, 3.959, 2.644],
+            [2.84, 4.628, 0.355, 0.436, 0.101, 4.163],
+            [3.891, 4.35, 4.893, 3.996, 2.307, 3.903],
+            [0.591, 3.2, 0.717, 4.723, 2.609, 2.073],
+            [1.323, 3.871, 2.281, 2.842, 0.094, 3.088],
+            [3.06, 3.085, 4.719, 3.409, 1.798, 2.185],
+            [3.488, 0.301, 3.334, 3.353, 1.052, 0.645],
+            [1.577, 1.819, 2.851, 2.193, 4.942, 0.51],
+            [1.044, 0.807, 3.266, 1.266, 2.332, 1.222],
+            [0.795, 0.552, 3.282, 0.691, 0.983, 1.844],
+            [4.105, 0.486, 4.19, 0.48, 4.882, 2.343],
+        ];
+        let result = init_nndsvd(&x, 3);
+        assert!(
+            result.is_ok(),
+            "init_nndsvd should succeed on the 12x6 fixture"
+        );
+        let (w, h) = match result {
+            Ok(pair) => pair,
+            Err(_) => return,
+        };
+        assert_eq!(h.dim(), (3, 6));
+        assert_eq!(w.dim(), (12, 3));
+        // sklearn 1.5.2 oracle: _initialize_nmf(X, 3, init='nndsvd').
+        let sk_h: [[f64; 6]; 3] = [
+            [
+                1.7741112747292909,
+                2.0242809154746326,
+                2.3973352370908354,
+                1.7673562411021053,
+                1.7161976904877514,
+                1.750048077389621,
+            ],
+            [
+                0.0,
+                1.5897115406013913,
+                0.0,
+                0.41349076122979694,
+                0.0,
+                1.0036389906737029,
+            ],
+            [
+                0.0,
+                0.00561171974406682,
+                0.0,
+                1.6761257358883248,
+                0.3407178035232749,
+                0.0,
+            ],
+        ];
+        for (k, row) in sk_h.iter().enumerate() {
+            for (j, &expected) in row.iter().enumerate() {
+                assert_abs_diff_eq!(h[[k, j]], expected, epsilon = 1e-9);
+            }
+        }
+        // W column 0 (leading triplet: sqrt(S[0])*|U[:,0]|).
+        let sk_w_col0_head = [1.5111518021294372, 1.7749072337282812, 1.0616211988216013];
+        for (i, &expected) in sk_w_col0_head.iter().enumerate() {
+            assert_abs_diff_eq!(w[[i, 0]], expected, epsilon = 1e-9);
+        }
     }
 
     #[test]
