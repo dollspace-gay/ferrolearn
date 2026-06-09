@@ -623,7 +623,12 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IncrementalPCA<F> 
                 }
                 bs
             }
-            None => n_samples,
+            // sklearn: `batch_size_ = 5 * n_features` when `batch_size is None`
+            // (`sklearn/decomposition/_incremental_pca.py:236-237`), to balance
+            // approximation accuracy and memory. `5*n_features` may exceed
+            // `n_samples` (→ a single batch, handled by the gen_batches loop
+            // below — no panic, R-CODE-2).
+            None => 5 * n_features,
         };
 
         // Slice into batches exactly like sklearn's

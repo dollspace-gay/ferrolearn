@@ -133,7 +133,6 @@ const X: [f64; 90] = [
 /// `[6.38417462, 5.30464741]` — diverges ~1.1e-2 / ~3e-2 (>> 1e-6).
 /// Tracking: #2387 (REQ-13 #1589)
 #[test]
-#[ignore = "divergence: IncrementalPCA batch_size=None default is n_samples, sklearn uses 5*n_features; tracking #2387 (REQ-13 #1589)"]
 fn divergence_batch_size_default_5x_n_features() {
     let x = Array2::from_shape_vec((30, 3), X.to_vec()).unwrap();
     let f = IncrementalPCA::<f64>::new(2).fit(&x, &()).unwrap();
