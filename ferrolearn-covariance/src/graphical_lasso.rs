@@ -414,14 +414,16 @@ where
 ///   `dual_gap = sum(emp_cov*precision_) - p + alpha*(|precision_|.sum()
 ///   - |diag(precision_)|.sum())` (`_dual_gap`, `:57-66`).
 ///
-/// `max_inner_iter` caps the inner Gram coordinate descent (sklearn passes the
-/// outer `max_iter`; either works as long as it is large enough to converge).
-/// Returns `(covariance_, precision_, n_iter)`.
+/// The inner Gram coordinate descent is capped at the OUTER `max_iter`, matching
+/// sklearn's `enet_coordinate_descent_gram(..., max_iter, ...)` (`:146`); the
+/// legacy `_max_inner_iter` parameter is retained for ABI compatibility but no
+/// longer drives the inner cap (it diverged from sklearn in the non-converged
+/// regime — see the call site). Returns `(covariance_, precision_, n_iter)`.
 fn solve_glasso<F: Float>(
     emp_cov: &Array2<F>,
     alpha: F,
     max_iter: usize,
-    max_inner_iter: usize,
+    _max_inner_iter: usize,
     tol: F,
 ) -> (Array2<F>, Array2<F>, usize) {
     let p = emp_cov.nrows();
@@ -504,15 +506,17 @@ fn solve_glasso<F: Float>(
                 k += 1;
             }
 
-            // Inner Gram lasso (`:139-150`).
-            enet_coordinate_descent_gram(
-                &mut coefs,
-                alpha,
-                &sub_cov,
-                &row,
-                max_inner_iter,
-                enet_tol,
-            );
+            // Inner Gram lasso (`:139-150`). sklearn passes the OUTER `max_iter`
+            // as the inner CD's iteration cap (`:146`:
+            // `enet_coordinate_descent_gram(..., max_iter, enet_tol, ...)`), NOT
+            // an independent inner cap. This matters in the non-converged regime:
+            // when `max_iter` is small (e.g. 3) the inner CD is ALSO truncated to
+            // `max_iter` sweeps, so its coefs (and the resulting precision
+            // iterate) match sklearn's truncated path bit-for-bit. Using the
+            // larger `max_inner_iter` over-converged the inner solve and diverged
+            // by ~3.7e-6. The converged (default max_iter=100) path is unaffected:
+            // the inner CD reaches its duality-gap stop well before 100 sweeps.
+            enet_coordinate_descent_gram(&mut coefs, alpha, &sub_cov, &row, max_iter, enet_tol);
 
             // Update precision_ (`:163-168`). Use the CURRENT covariance_ column
             // (before the covariance update below).
