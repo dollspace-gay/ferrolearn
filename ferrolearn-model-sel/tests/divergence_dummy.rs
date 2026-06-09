@@ -15,6 +15,9 @@
 //! test possible): REQ-2 predict_proba (#1691), REQ-8 sample_weight (#1693),
 //! REQ-9 multi-output (#1694). The REQ-4 error-VARIANT divergence
 //! (FerroError::InvalidParameter vs ValueError) is tracked at #1692.
+//!
+//! RED PIN (FAILS now, `#[ignore]`d): REQ-6 quantile rounding-order divergence
+//! at quantile=1/3 (#2370).
 
 use ferrolearn_core::Fit;
 use ferrolearn_core::Predict;
@@ -181,6 +184,58 @@ fn green_regressor_constant_tiles() {
     assert_eq!(preds.len(), 2);
     assert!((preds[0] - 42.5).abs() < 1e-12);
     assert!((preds[1] - 42.5).abs() < 1e-12);
+}
+
+// ---------------------------------------------------------------------------
+// REQ-6 (RED PIN): quantile rounding-order divergence. FAILS now — #[ignore]d.
+// ---------------------------------------------------------------------------
+
+/// Divergence: ferrolearn's `DummyRegressor` `quantile` strategy diverges from
+/// `sklearn/dummy.py:601`:
+/// ```python
+/// percentile = self.quantile * 100.0
+/// self.constant_ = np.percentile(y, axis=0, q=percentile)
+/// ```
+/// sklearn forms `percentile = quantile*100` (here `1/3*100 == 33.33333333333333`,
+/// already rounded), then numpy's virtual index is `percentile/100 * (n-1) ==
+/// 0.9999999999999998`, so it INTERPOLATES below the second order statistic.
+/// ferrolearn instead computes `pos = q*(n-1)` directly
+/// (`dummy.rs:412`, `let pos = q * (n - 1) as f64;`); for `q=1/3, n=4` that is
+/// `(1.0/3.0)*3.0 == 1.0` EXACTLY, so `lo == hi` and it returns `sorted[1]`
+/// verbatim with no interpolation.
+///
+/// Input: `strategy='quantile', quantile=1.0/3.0`, `y=[10, 20, 30, 40]`.
+/// LIVE sklearn 1.5.2 oracle (run from /tmp):
+/// ```text
+/// import numpy as np; from sklearn.dummy import DummyRegressor
+/// DummyRegressor(strategy='quantile', quantile=1/3) \
+///   .fit(np.zeros((4,2)), np.array([10.,20.,30.,40.])).constant_[0,0]
+/// # -> 19.999999999999996   (hex 0x1.3ffffffffffffp+4)
+/// ```
+/// ferrolearn returns exactly `20.0` (hex `0x1.4000000000000p+4`) — 1 ULP high.
+/// A genuine R-DEV-1 value divergence in a SHIPPED deterministic path.
+/// Tracking: #2370
+#[test]
+#[ignore = "divergence: DummyRegressor quantile q*(n-1) vs sklearn q*100/100*(n-1) (1 ULP high); tracking #2370"]
+fn divergence_regressor_quantile_rounding_order() {
+    // Oracle value bit-pattern from the LIVE sklearn 1.5.2 call above
+    // (`float(...).hex()` == '0x1.3ffffffffffffp+4'), NOT copied from ferrolearn.
+    let sklearn_constant: f64 = f64::from_bits(0x4033_ffff_ffff_ffff);
+    // Self-check that the literal bit-pattern really is the oracle value.
+    assert_eq!(sklearn_constant, 19.999_999_999_999_996_f64);
+
+    let y: Array1<f64> = array![10.0, 20.0, 30.0, 40.0];
+    let ferro_constant = reg_value(DummyRegressorStrategy::Quantile(1.0 / 3.0), &y);
+
+    // np.percentile is bit-deterministic for this input; assert bit-exact parity.
+    assert_eq!(
+        ferro_constant.to_bits(),
+        sklearn_constant.to_bits(),
+        "quantile=1/3 on [10,20,30,40]: sklearn={sklearn_constant:.17} (bits {:#018x}), \
+         ferrolearn={ferro_constant:.17} (bits {:#018x})",
+        sklearn_constant.to_bits(),
+        ferro_constant.to_bits(),
+    );
 }
 
 // ---------------------------------------------------------------------------
