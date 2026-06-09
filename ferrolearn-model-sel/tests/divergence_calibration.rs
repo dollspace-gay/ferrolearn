@@ -259,3 +259,142 @@ fn divergence_isotonic_tied_scores_make_unique() {
         );
     }
 }
+
+// ===========================================================================
+// REQ-SIGMOID / REQ-ISOTONIC — DIVERGENCE PINS: missing label_binarize
+// (binary classes other than {0,1})
+// ===========================================================================
+
+/// Divergence: ferrolearn's `fit_sigmoid` (calibration.rs:307-315) diverges
+/// from `sklearn/calibration.py:664` `Y = label_binarize(y, classes=classes)`
+/// for a binary problem whose class labels are `{1, 2}` (positive class = 2).
+///
+/// sklearn binarizes the targets against the two observed classes BEFORE
+/// calibration: `label_binarize([1,1,1,2,2,2], classes=[1,2]) -> [0,0,0,1,1,1]`,
+/// so the GREATER class (2) becomes the positive label `1`. ferrolearn instead
+/// hardcodes `l == 1` as the positive class (`calibration.rs:307` n_pos count,
+/// `:315` target assignment), which treats class **1** as positive and class
+/// **2** as negative — the probabilities come out INVERTED.
+///
+/// LIVE ORACLE (sklearn 1.5.2):
+/// ```text
+/// from sklearn.calibration import _sigmoid_calibration
+/// from sklearn.preprocessing import label_binarize
+/// from scipy.special import expit; import numpy as np
+/// F=np.array([-2.,-1.,0.,1.,2.,3.]); y=np.array([1,1,1,2,2,2]); classes=np.array([1,2])
+/// Yb=label_binarize(y,classes=classes).ravel()      # [0,0,0,1,1,1]
+/// A,B=_sigmoid_calibration(F,Yb)                     # A=-0.7531014189, B=0.3765507609
+/// expit(-(A*F+B)) ->
+///   [0.13207290955683026,0.24422529560198641,0.40695908022667143,
+///    0.59304089494793,0.755774685411561,0.8679270786519747]
+/// ```
+/// ferrolearn produces `[0.8679,0.7558,0.5930,0.4070,0.2442,0.1321]` (the
+/// oracle reversed) — MAX ABS DIFF ~0.736.
+/// Tracking: #2372
+#[test]
+#[ignore = "divergence: fit_sigmoid hardcodes l==1 positive, no label_binarize; tracking #2372"]
+fn divergence_sigmoid_binary_classes_1_2() {
+    let scores = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let labels = [1, 1, 1, 2, 2, 2]; // binary classes {1,2}, positive = 2
+    let got = calibrate_and_predict(CalibrationMethod::Sigmoid, 3, &scores, &labels, &scores);
+
+    // sklearn P(class=2) = expit(-(A*f+B)) on label_binarize'd targets.
+    let oracle = [
+        0.132_072_909_556_830_26,
+        0.244_225_295_601_986_41,
+        0.406_959_080_226_671_43,
+        0.593_040_894_947_93,
+        0.755_774_685_411_561,
+        0.867_927_078_651_974_7,
+    ];
+    for (i, (&g, &o)) in got.iter().zip(oracle.iter()).enumerate() {
+        assert!(
+            (g - o).abs() < 1e-6,
+            "sigmoid prob[{i}] ferro={g} sklearn={o} diff={}",
+            (g - o).abs()
+        );
+    }
+}
+
+/// Divergence: ferrolearn's `fit_sigmoid` (calibration.rs:307-315) diverges
+/// from `sklearn/calibration.py:664` `label_binarize` for a binary problem
+/// whose class labels are `{0, 2}` (positive class = 2).
+///
+/// sklearn binarizes `[0,0,0,2,2,2]` against `classes=[0,2]` to `[0,0,0,1,1,1]`
+/// (the greater class 2 -> positive 1) and produces a non-trivial sigmoid map.
+/// ferrolearn counts `n_pos = #(l==1) = 0` (NO label equals 1), so EVERY target
+/// becomes `t_neg = 1/(n_neg+2) = 1/8`, collapsing the fit to the constant
+/// probability 0.125 for all queries.
+///
+/// LIVE ORACLE (sklearn 1.5.2):
+/// ```text
+/// y=np.array([0,0,0,2,2,2]); classes=np.array([0,2])
+/// Yb=label_binarize(y,classes=classes).ravel()   # [0,0,0,1,1,1]
+/// A,B=_sigmoid_calibration(np.array([-2.,-1.,0.,1.,2.,3.]),Yb)
+/// expit(-(A*F+B)) ->
+///   [0.13207290955683026,0.24422529560198641,0.40695908022667143,
+///    0.59304089494793,0.755774685411561,0.8679270786519747]
+/// ```
+/// ferrolearn produces the CONSTANT `[0.125,0.125,0.125,0.125,0.125,0.125]`.
+/// Tracking: #2372
+#[test]
+#[ignore = "divergence: fit_sigmoid hardcodes l==1 positive, no label_binarize; tracking #2372"]
+fn divergence_sigmoid_binary_classes_0_2() {
+    let scores = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
+    let labels = [0, 0, 0, 2, 2, 2]; // binary classes {0,2}, positive = 2
+    let got = calibrate_and_predict(CalibrationMethod::Sigmoid, 3, &scores, &labels, &scores);
+
+    let oracle = [
+        0.132_072_909_556_830_26,
+        0.244_225_295_601_986_41,
+        0.406_959_080_226_671_43,
+        0.593_040_894_947_93,
+        0.755_774_685_411_561,
+        0.867_927_078_651_974_7,
+    ];
+    for (i, (&g, &o)) in got.iter().zip(oracle.iter()).enumerate() {
+        assert!(
+            (g - o).abs() < 1e-6,
+            "sigmoid prob[{i}] ferro={g} sklearn={o} diff={}",
+            (g - o).abs()
+        );
+    }
+}
+
+/// Divergence: ferrolearn's `fit_isotonic` (calibration.rs:396) diverges from
+/// `sklearn/calibration.py:664` `label_binarize` for binary classes `{1,2}`.
+///
+/// sklearn binarizes `[1,1,1,2,2,2]` -> `[0,0,0,1,1,1]` (positive = greater
+/// class 2) then runs `IsotonicRegression(out_of_bounds="clip")`, yielding an
+/// increasing step map. ferrolearn maps `l == 1 -> 1.0` else `0.0`, producing
+/// targets `[1,1,1,0,0,0]` (DECREASING) which PAV pools to the constant 0.5.
+///
+/// LIVE ORACLE (sklearn 1.5.2):
+/// ```text
+/// from sklearn.isotonic import IsotonicRegression
+/// from sklearn.preprocessing import label_binarize
+/// s=np.array([0.,1.,2.,3.,4.,5.]); y=np.array([1,1,1,2,2,2]); classes=np.array([1,2])
+/// Yb=label_binarize(y,classes=classes).ravel().astype(float)   # [0,0,0,1,1,1]
+/// ir=IsotonicRegression(out_of_bounds='clip').fit(s,Yb)
+/// ir.predict([0.,1.5,2.5,3.5,5.]) -> [0.0, 0.0, 0.5, 1.0, 1.0]
+/// ```
+/// ferrolearn produces the CONSTANT `[0.5,0.5,0.5,0.5,0.5]`.
+/// Tracking: #2373
+#[test]
+#[ignore = "divergence: fit_isotonic hardcodes l==1 positive, no label_binarize; tracking #2373"]
+fn divergence_isotonic_binary_classes_1_2() {
+    let scores = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+    let labels = [1, 1, 1, 2, 2, 2];
+    let queries = [0.0, 1.5, 2.5, 3.5, 5.0];
+    let got = calibrate_and_predict(CalibrationMethod::Isotonic, 3, &scores, &labels, &queries);
+
+    let oracle = [0.0, 0.0, 0.5, 1.0, 1.0];
+    for (i, (&g, &o)) in got.iter().zip(oracle.iter()).enumerate() {
+        assert!(
+            (g - o).abs() < 1e-6,
+            "isotonic prob[{i}] (q={}) ferro={g} sklearn={o} diff={}",
+            queries[i],
+            (g - o).abs()
+        );
+    }
+}
