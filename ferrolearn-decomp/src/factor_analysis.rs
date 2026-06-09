@@ -69,7 +69,7 @@
 //! | REQ-13 | `score`/`score_samples` Gaussian log-likelihood | NOT-STARTED | sklearn `_factor_analysis.py:388-426` — blocker #1533 |
 //! | REQ-14 | `get_covariance`/`get_precision` METHODS | NOT-STARTED | value matches via accessors but no method — blocker #1534 |
 //! | REQ-15 | `n_components=None` default + `copy` + `n_features_in_` | NOT-STARTED | sklearn `_factor_analysis.py:228-229` — blocker #1535 |
-//! | REQ-16 | `tol` DEFAULT 1e-3 vs sklearn 1e-2 (criterion now matches) | NOT-STARTED | blocker #1536 |
+//! | REQ-16 | `tol` DEFAULT now 1e-2 matching sklearn `_factor_analysis.py:185` | SHIPPED | `tol: 1e-2` in `pub fn new` — closes #2392/#1536 |
 //! | REQ-17 | `components_` ORIENTATION (ferro `(n_features,n_components)` = sklearn `components_.T`) | NOT-STARTED | blocker #1537 |
 //! | REQ-18 | production `assert_eq!` debug-assert in `transform` (R-CODE-2) | NOT-STARTED | blocker #1538 |
 //! | REQ-19 | ferray substrate | NOT-STARTED | `ndarray` + faer-direct + hand-rolled Cholesky — blocker #1539 |
@@ -131,13 +131,13 @@ pub struct FactorAnalysis<F> {
 impl<F: Float + Send + Sync + 'static> FactorAnalysis<F> {
     /// Create a new `FactorAnalysis` with `n_components` factors.
     ///
-    /// Defaults: `max_iter = 1000`, `tol = 1e-3`, no fixed random seed.
+    /// Defaults: `max_iter = 1000`, `tol = 1e-2`, no fixed random seed.
     #[must_use]
     pub fn new(n_components: usize) -> Self {
         Self {
             n_components,
             max_iter: 1000,
-            tol: 1e-3,
+            tol: 1e-2,
             random_state: None,
             _marker: std::marker::PhantomData,
         }

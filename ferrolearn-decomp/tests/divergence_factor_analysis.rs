@@ -122,32 +122,33 @@ fn implied_covariance(w: &Array2<f64>, psi: &Array1<f64>) -> Array2<f64> {
 /// machine precision). Tracking: #1527
 #[test]
 fn divergence_fa_rotation_invariant_covariance() {
-    // sklearn 1.5.2 LAPACK oracle, tol=1e-3 (== ferrolearn default tol).
+    // sklearn 1.5.2 LAPACK oracle, tol=1e-2 (== ferrolearn DEFAULT tol, now
+    // matching sklearn `_factor_analysis.py:185`; was tol=1e-3 before #2392).
     #[allow(
         clippy::excessive_precision,
         reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
     )]
     let sk_cov_diag = [
-        1.364839477029_f64,
-        1.343938974198,
-        3.336181722712,
-        0.948086111619,
+        1.364869529838_f64,
+        1.347659729737,
+        3.33640246802,
+        0.947929114262,
     ];
     #[allow(
         clippy::excessive_precision,
         reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
     )]
     let sk_noise = [
-        0.009962591317_f64,
-        0.158130095209,
-        0.012643079339,
-        0.063252661937,
+        0.009165047048_f64,
+        0.18929822983,
+        0.014331031175,
+        0.062762007729,
     ];
     #[allow(
         clippy::excessive_precision,
         reason = "live sklearn 1.5.2 oracle (R-CHAR-3)"
     )]
-    let sk_loglike: f64 = -27.61873891552277;
+    let sk_loglike: f64 = -27.644987554315705;
 
     let x = probe1();
     let fitted = FactorAnalysis::<f64>::new(2)
@@ -401,7 +402,6 @@ fn green_inverse_transform_shape_and_col_mismatch() {
 /// On probe1 sklearn DEFAULT reports `n_iter_=15`,
 /// `loglike_[-1]=-27.644987554315705`; ferrolearn DEFAULT reports `n_iter()=26`,
 /// `log_likelihood()=-27.618738915522783`. Tracking: #2392
-#[ignore = "divergence: FactorAnalysis::new default tol=1e-3 vs sklearn 1e-2 -> wrong n_iter_/loglike_; tracking #2392"]
 #[test]
 fn divergence_fa_default_tol_n_iter_and_loglike() {
     // Live sklearn 1.5.2 LAPACK oracle, sklearn DEFAULTS (tol=1e-2). R-CHAR-3.
