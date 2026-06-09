@@ -81,6 +81,7 @@ use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+use std::any::TypeId;
 
 /// Reject non-finite input the way sklearn's `_validate_data` does.
 ///
@@ -625,15 +626,33 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for IncrementalPCA<F> 
             None => n_samples,
         };
 
+        // Slice into batches exactly like sklearn's
+        // `gen_batches(n_samples, batch_size_, min_batch_size=self.n_components or 0)`
+        // (`sklearn/decomposition/_incremental_pca.py:241-243`,
+        // `sklearn/utils/_chunking.py:67-75`). The `min_batch_size = n_components`
+        // term MERGES a trailing remainder smaller than `n_components` into the
+        // previous full batch (e.g. 20 rows, batch_size 6, n_components 3 →
+        // batches 6+6+8, NOT 6+6+6+2), so the incremental merge sequence — and
+        // hence `components_`/`singular_values_`/`explained_variance_` — matches
+        // sklearn (#2386).
+        let min_batch_size = self.n_components;
         let mut state: Option<FittedIncrementalPCA<F>> = None;
         let mut start = 0;
-        while start < n_samples {
-            let end = (start + batch_size).min(n_samples);
-            let batch = x.slice(ndarray::s![start..end, ..]).to_owned();
-            if batch.nrows() > 0 {
-                state = Some(self.partial_fit(&batch, state)?);
+        for _ in 0..(n_samples / batch_size) {
+            let end = start + batch_size;
+            // Skip this full batch when the remainder after it would be a
+            // too-small trailing batch (`end + min_batch_size > n`): leave
+            // `start` unchanged so the trailing rows fold into the final slice.
+            if end + min_batch_size > n_samples {
+                continue;
             }
+            let batch = x.slice(ndarray::s![start..end, ..]).to_owned();
+            state = Some(self.partial_fit(&batch, state)?);
             start = end;
+        }
+        if start < n_samples {
+            let batch = x.slice(ndarray::s![start..n_samples, ..]).to_owned();
+            state = Some(self.partial_fit(&batch, state)?);
         }
 
         state.ok_or_else(|| FerroError::InsufficientSamples {
@@ -711,12 +730,30 @@ fn stack_vertical<F: Float>(a: &Array2<F>, b: &Array2<F>) -> Array2<F> {
 /// `(U, sigma, Vt)` triple returned by [`thin_svd`].
 type SvdTriple<F> = (Array2<F>, Array1<F>, Array2<F>);
 
-/// Thin SVD via Jacobi eigendecomposition of the smaller of M^T M or M M^T.
+/// Thin SVD of the merge matrix `m` via `ferray::linalg::svd_lapack` (LAPACK
+/// `gesdd`) for f64/f32, with a Jacobi-eigendecomposition fallback for exotic
+/// float types.
+///
+/// This routes the incremental-PCA merge SVD through the SAME LAPACK `gesdd`
+/// driver `scipy.linalg.svd(X, full_matrices=False)` calls in sklearn's
+/// `IncrementalPCA.partial_fit` (`sklearn/decomposition/_incremental_pca.py:356`),
+/// exactly as `pca.rs` does for `PCA`'s `full` solver. The hand-rolled Jacobi
+/// `thin_svd` failed to reproduce LAPACK's SVD of the recursively-stacked merge
+/// matrix to working precision (single-batch ~1e-15; 4-batch ~1e-2 — far past
+/// the R-DEV-1 ~1e-6 bar, #2386); LAPACK `gesdd` is bit-identical to scipy
+/// (ferray #2116), so the multi-batch spectrum now matches sklearn.
 ///
 /// Returns `(U, sigma, Vt)` where:
-/// - `sigma` has length `max_rank`, sorted descending.
-/// - `Vt` has shape `(max_rank, n_features)`.
-/// - `U` has shape `(n_rows, max_rank)`.
+/// - `sigma` has length `max_rank`, sorted descending (non-increasing, the
+///   LAPACK `gesdd` contract).
+/// - `Vt` has shape `(max_rank, n_features)`, row `k` = `k`-th right singular
+///   vector — exactly sklearn's `Vt[:n_components_]` (`_incremental_pca.py:362`).
+/// - `U` is unused by the caller (sklearn's `svd_flip(U, Vt,
+///   u_based_decision=False)` only needs `Vt`), so an empty `(nr, 0)` matrix is
+///   returned to keep the SVD engine from doing wasted work.
+///
+/// Never panics (R-CODE-2): a `svd_lapack`/conversion failure propagates as
+/// [`FerroError::NumericalInstability`].
 fn thin_svd<F: Float + Send + Sync + 'static>(
     m: &Array2<F>,
     max_rank: usize,
@@ -732,86 +769,128 @@ fn thin_svd<F: Float + Send + Sync + 'static>(
 
     let rank = max_rank.min(nr).min(nc);
 
-    // Decide whether to work with M M^T (small rows) or M^T M (small cols).
-    if nr <= nc {
-        // M M^T is (nr x nr) — cheaper when nr <= nc.
-        let mmt = m.dot(&m.t());
-        let max_iter = nr * nr * 100 + 1000;
-        let (eigenvalues, eigenvectors) = jacobi_eigen_symmetric(&mmt, max_iter)?;
+    // Full thin SVD (`min(nr, nc)` singular values / Vt rows). LAPACK `gesdd`
+    // for f64/f32; Jacobi fallback for exotic F. `s_full`/`vt_full` come back
+    // descending, then we truncate to `rank` (sklearn truncates `Vt`/`S` to
+    // `n_components_`, `_incremental_pca.py:362-363`).
+    let (s_full, vt_full) = thin_svd_full(m)?;
 
-        let mut indices: Vec<usize> = (0..nr).collect();
-        indices.sort_by(|&a, &b| {
-            eigenvalues[b]
-                .partial_cmp(&eigenvalues[a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        let mut sigma = Array1::zeros(rank);
-        let mut u = Array2::zeros((nr, rank));
-        let mut vt = Array2::zeros((rank, nc));
-
-        for (out_k, &eigen_idx) in indices.iter().take(rank).enumerate() {
-            let ev = eigenvalues[eigen_idx];
-            let sv = if ev > F::zero() { ev.sqrt() } else { F::zero() };
-            sigma[out_k] = sv;
-
-            for i in 0..nr {
-                u[[i, out_k]] = eigenvectors[[i, eigen_idx]];
-            }
-
-            // V = M^T U / sigma
-            if sv > F::from(1e-30).unwrap_or_else(F::epsilon) {
-                for j in 0..nc {
-                    let mut val = F::zero();
-                    for i in 0..nr {
-                        val = val + m[[i, j]] * u[[i, out_k]];
-                    }
-                    vt[[out_k, j]] = val / sv;
-                }
+    let mut sigma = Array1::zeros(rank);
+    let mut vt = Array2::zeros((rank, nc));
+    for k in 0..rank {
+        sigma[k] = if k < s_full.len() {
+            s_full[k]
+        } else {
+            F::zero()
+        };
+        if k < vt_full.nrows() {
+            for j in 0..nc {
+                vt[[k, j]] = vt_full[[k, j]];
             }
         }
+    }
 
-        Ok((u, sigma, vt))
+    // `U` is unused at the call site (svd_flip with `u_based_decision=False`
+    // operates only on `Vt`); return an empty matrix.
+    Ok((Array2::zeros((nr, 0)), sigma, vt))
+}
+
+/// `(S, Vt)` full thin-SVD of `m`: `S` are the `min(nr, nc)` singular values in
+/// non-increasing order, `Vt` is `(min(nr, nc), nc)`. f64/f32 dispatch to
+/// `ferray::linalg::svd_lapack` (LAPACK `gesdd`); other float types use the
+/// Jacobi eigendecomposition of the Gram matrix as a fallback.
+fn thin_svd_full<F: Float + Send + Sync + 'static>(
+    m: &Array2<F>,
+) -> Result<(Array1<F>, Array2<F>), FerroError> {
+    // SAFETY: each branch checks `TypeId` at runtime and only reinterprets the
+    // ndarray buffers when the concrete type matches (`F == f64` / `F == f32`),
+    // so every transmute is between identical types. Same pattern as
+    // `pca.rs::svd_dispatch`. `forget` prevents a double free of the moved-out
+    // f64/f32 arrays.
+    if TypeId::of::<F>() == TypeId::of::<f64>() {
+        let m_f64: &Array2<f64> = unsafe { &*(std::ptr::from_ref(m).cast::<Array2<f64>>()) };
+        let (s, vt) = ferray_svd_lapack_f64(m_f64)?;
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f64>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f64>, Array2<F>>(&vt) };
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Ok((s_f, vt_f))
+    } else if TypeId::of::<F>() == TypeId::of::<f32>() {
+        let m_f32: &Array2<f32> = unsafe { &*(std::ptr::from_ref(m).cast::<Array2<f32>>()) };
+        let (s, vt) = ferray_svd_lapack_f32(m_f32)?;
+        let s_f: Array1<F> = unsafe { std::mem::transmute_copy::<Array1<f32>, Array1<F>>(&s) };
+        let vt_f: Array2<F> = unsafe { std::mem::transmute_copy::<Array2<f32>, Array2<F>>(&vt) };
+        std::mem::forget(s);
+        std::mem::forget(vt);
+        Ok((s_f, vt_f))
     } else {
-        // M^T M is (nc x nc) — cheaper when nc < nr.
+        // Exotic-F fallback: eigendecompose the Gram matrix C = MᵀM
+        // (nc × nc). Its eigenvectors are the right singular vectors V;
+        // singular values are sqrt(max(eigval, 0)), sorted descending.
+        let nc = m.ncols();
         let mtm = m.t().dot(m);
         let max_iter = nc * nc * 100 + 1000;
         let (eigenvalues, eigenvectors) = jacobi_eigen_symmetric(&mtm, max_iter)?;
-
         let mut indices: Vec<usize> = (0..nc).collect();
         indices.sort_by(|&a, &b| {
             eigenvalues[b]
                 .partial_cmp(&eigenvalues[a])
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-
-        let mut sigma = Array1::zeros(rank);
-        let mut u = Array2::zeros((nr, rank));
-        let mut vt = Array2::zeros((rank, nc));
-
-        for (out_k, &eigen_idx) in indices.iter().take(rank).enumerate() {
-            let ev = eigenvalues[eigen_idx];
-            let sv = if ev > F::zero() { ev.sqrt() } else { F::zero() };
-            sigma[out_k] = sv;
-
+        let size = m.nrows().min(nc);
+        let mut s = Array1::<F>::zeros(size);
+        let mut vt = Array2::<F>::zeros((size, nc));
+        for (k, &idx) in indices.iter().take(size).enumerate() {
+            let ev = eigenvalues[idx];
+            s[k] = if ev > F::zero() { ev.sqrt() } else { F::zero() };
             for j in 0..nc {
-                vt[[out_k, j]] = eigenvectors[[j, eigen_idx]];
-            }
-
-            // U = M V / sigma
-            if sv > F::from(1e-30).unwrap_or_else(F::epsilon) {
-                for i in 0..nr {
-                    let mut val = F::zero();
-                    for j in 0..nc {
-                        val = val + m[[i, j]] * vt[[out_k, j]];
-                    }
-                    u[[i, out_k]] = val / sv;
-                }
+                vt[[k, j]] = eigenvectors[[j, idx]];
             }
         }
-
-        Ok((u, sigma, vt))
+        Ok((s, vt))
     }
+}
+
+/// Thin SVD of an f64 matrix via `ferray::linalg::svd_lapack` (LAPACK `gesdd`),
+/// mirroring `scipy.linalg.svd(X, full_matrices=False)` of sklearn's
+/// `IncrementalPCA.partial_fit` (`sklearn/decomposition/_incremental_pca.py:356`).
+/// Returns `(s, vt)`: `s` the `min(m, n)` singular values descending, `vt` the
+/// `(min(m, n), n)` right singular vectors. `U` is not needed (svd_flip uses
+/// only `Vt`). Copies the `pca.rs::ferray_svd_lapack_f64` bridge (R-SUBSTRATE-4).
+fn ferray_svd_lapack_f64(a: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), FerroError> {
+    let (m, n) = a.dim();
+    let data: Vec<f64> = a.iter().copied().collect();
+    let fa = ferray::Array::<f64, ferray::Ix2>::from_vec(ferray::Ix2::new([m, n]), data).map_err(
+        |e| FerroError::NumericalInstability {
+            message: format!("ferray array construction failed: {e}"),
+        },
+    )?;
+    let (_u, s, vt) =
+        ferray::linalg::svd_lapack(&fa, false).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd_lapack (gesdd) failed: {e}"),
+        })?;
+    let s_nd: Array1<f64> = s.into_ndarray();
+    let vt_nd: Array2<f64> = vt.into_ndarray();
+    Ok((s_nd, vt_nd))
+}
+
+/// Thin SVD of an f32 matrix via `ferray::linalg::svd_lapack` (LAPACK `gesdd`).
+/// See [`ferray_svd_lapack_f64`].
+fn ferray_svd_lapack_f32(a: &Array2<f32>) -> Result<(Array1<f32>, Array2<f32>), FerroError> {
+    let (m, n) = a.dim();
+    let data: Vec<f32> = a.iter().copied().collect();
+    let fa = ferray::Array::<f32, ferray::Ix2>::from_vec(ferray::Ix2::new([m, n]), data).map_err(
+        |e| FerroError::NumericalInstability {
+            message: format!("ferray array construction failed: {e}"),
+        },
+    )?;
+    let (_u, s, vt) =
+        ferray::linalg::svd_lapack(&fa, false).map_err(|e| FerroError::NumericalInstability {
+            message: format!("ferray svd_lapack (gesdd) failed: {e}"),
+        })?;
+    let s_nd: Array1<f32> = s.into_ndarray();
+    let vt_nd: Array2<f32> = vt.into_ndarray();
+    Ok((s_nd, vt_nd))
 }
 
 /// Jacobi eigendecomposition for symmetric matrices.
