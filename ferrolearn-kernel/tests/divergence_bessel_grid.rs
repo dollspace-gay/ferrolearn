@@ -157,7 +157,7 @@ fn bessel_k_matches_scipy_grid() {
             worst_rel = rel;
             worst = (nu, x, got, expected);
         }
-        if !(rel < 1e-6) {
+        if rel >= 1e-6 || rel.is_nan() {
             mismatches.push(format!(
                 "bessel_k({nu}, {x}) = {got:e}, scipy = {expected:e}, rel = {rel:e}"
             ));

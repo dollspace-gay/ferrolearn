@@ -43,7 +43,6 @@ use ndarray::{Array1, Array2};
 /// Divergence: ferrolearn GPC LML at non-converged `max_iter` diverges from
 /// sklearn `_gpc.py:438-462` (LML-change-criterion + one-step-lagged `pi_`).
 #[test]
-#[ignore = "divergence: GPC posterior-mode convergence criterion (LML-change vs max-f-change) + pi_ one-step lag; tracking #2378"]
 fn divergence_gpc_lml_low_max_iter() {
     // Deterministic binary fixture: optimizer=None, fixed RBF(1.0), y in {0,1}.
     let x = Array2::from_shape_vec((6, 1), vec![0.0, 0.5, 1.0, 3.0, 3.5, 4.0]).unwrap();
@@ -54,7 +53,7 @@ fn divergence_gpc_lml_low_max_iter() {
     let sklearn_lml: [(usize, f64); 3] = [
         (1, -3.595_122_002_617_317),
         (2, -3.528_271_390_834_048_4),
-        (3, -3.525_887_081_214_580_8),
+        (3, -3.525_887_081_214_581),
     ];
 
     for (max_iter, expected) in sklearn_lml {

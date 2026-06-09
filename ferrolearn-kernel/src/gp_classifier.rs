@@ -31,7 +31,7 @@
 //! |---|---|---|
 //! | REQ-1 (binary posterior mode f̂/π̂) | SHIPPED | `fit_binary_gpc` Newton/Laplace loop (`_gpc.py:438-450`); oracle `pi_` match. |
 //! | REQ-2 (binary latent-sign predict) | SHIPPED | FIXED #1932: binary `predict` now decides by the sign of `f̄* = K*·(y−π̂)` (`np.where(f_star>0, ...)`, `_gpc.py:289-291`), NOT argmax-of-proba; pinned by `divergence_binary_predict_latent_sign` (was `[0,0,1]` vs sklearn `[0,1,1]` at `f̄*=+6.9e-17`). |
-//! | REQ-3 (binary LML value) | SHIPPED | `binary_log_marginal_likelihood` algebraically equals sklearn's `Z` (`_gpc.py:454-458`); oracle `-3.5259`. |
+//! | REQ-3 (binary LML value) | SHIPPED | `fit_binary_gpc` computes & stores the loop-internal LML `Z = -0.5 a·f - Σlog1p(exp(-(2y-1)f)) - Σlog diag(L)` (`_gpc.py:454-458`), returned by `log_marginal_likelihood`; oracle `-3.5259`. |
 //! | REQ-4 (score / mean accuracy) | SHIPPED | `score` = accuracy on `predict` (sklearn `ClassifierMixin.score`); oracle `1.0`. |
 //! | REQ-5 (classes ordering) | SHIPPED | sorted-unique `classes`, matching `np.unique(y)` (`_gpc.py:721`). |
 //! | REQ-6 (max_iter_predict default 100) | SHIPPED | `new` sets `max_iter=100` (`_gpc.py:159`,`:665`). |
@@ -39,7 +39,7 @@
 //! | REQ-8 (production consumer) | SHIPPED | `lib.rs` re-export — the boundary estimator API (no Python GP binding, R-DEFER-1/S5). |
 //! | REQ-9 (predict_proba LAMBDAS/COEFS squash) | SHIPPED | FIXED #1931: `predict_binary_proba` now uses sklearn's 5-term LAMBDAS/COEFS erf approximation (`_gpc.py:31-37`,`:324-331`) via `statrs` `erf`, not the MacKay probit; oracle-verified element-wise (~1e-13) across high/low/boundary/far/coincident points. Pinned by `divergence_binary_predict_proba_squashing`. |
 //! | REQ-10 (hyperparameter optimization) | NOT-STARTED | `fit` never optimizes; sklearn default `optimizer="fmin_l_bfgs_b"` (`_gpc.py:215-254`). Needs gp_kernels `eval_gradient` #1912 + `bounds` #1913 + L-BFGS-B. Blocker #1934. |
-//! | REQ-11 (posterior-mode convergence + W-clamp) | NOT-STARTED | converges on max-f-change<tol + clamps W to 1e-12; sklearn uses LML-change<1e-10, no clamp (`_gpc.py:454-462`). Benign at the fixtures (π̂ matches). Blocker #1935. |
+//! | REQ-11 (posterior-mode convergence criterion + pi_ lag) | SHIPPED | FIXED #2378: `fit_binary_gpc` now computes the LML INSIDE the Newton loop and breaks when it stops increasing (`lml - prev_lml < 1e-10`, `_gpc.py:454-462`), NOT on max-f-change<tol; `pi_hat`/`l_factor`/stored `lml` are the LAST iteration's pre-update temporaries (the one-step `self.pi_` lag, `_gpc.py:438`,`:264-266`). At a non-converged `max_iter` the LML now matches sklearn (~1e-6); the converged default path is unchanged. Pinned by `divergence_gpc_lml_low_max_iter`. The W-clamp (≥1e-12, no sklearn analog) remains and is benign at the fixtures (π̂ matches). |
 //! | REQ-12 (multi-class LML aggregation) | SHIPPED | FIXED #1933: `log_marginal_likelihood` now returns the MEAN of per-binary LMLs for multi-class (`np.mean`, `_gpc.py:743-749`), not the sum; oracle `-5.2469` (3-class). Pinned by `divergence_multiclass_lml_mean_vs_sum`. |
 //! | REQ-13 (OvR predict_proba normalization) | SHIPPED | multi-class `predict_proba` row-normalizes the per-class LAMBDAS/COEFS probabilities; with REQ-9 fixed, the full `n×n_classes` matrix matches sklearn's OvR `predict_proba` (`_gpc.py:779-807`) element-wise (~1e-13). Guard `green_audit_multiclass_ovr_predict_proba`. |
 //! | REQ-14 (multi_class one_vs_one) | NOT-STARTED | OvR-only; sklearn supports `multi_class="one_vs_one"` (`_gpc.py:734-737`). Blocker #1937. |
@@ -155,9 +155,6 @@ impl<F: Float + Send + Sync + 'static> GaussianProcessClassifier<F> {
 struct FittedBinaryGPC<F: Float + Send + Sync + 'static> {
     /// Training features.
     x_train: Array2<F>,
-    /// Latent function values at convergence. Used in the log marginal
-    /// likelihood computation (R&W eq. 3.32).
-    f_hat: Array1<F>,
     /// Sigmoid(f_hat) — class probabilities at training points. Used in the
     /// predictive mean `f_bar* = K* @ (y - pi_hat)` and predictive variance.
     pi_hat: Array1<F>,
@@ -168,6 +165,14 @@ struct FittedBinaryGPC<F: Float + Send + Sync + 'static> {
     /// variance via R&W eq. 3.24 (`v = L^{-1} sqrt(W) K(x*, X)^T`) and in
     /// `log|B| = 2 sum log L_ii` for the marginal likelihood.
     l_factor: Array2<F>,
+    /// Log-marginal-likelihood computed INSIDE the posterior-mode Newton loop
+    /// (sklearn's `_posterior_mode` return value `_gpc.py:454-470`, stored as
+    /// `log_marginal_likelihood_value_` at `_gpc.py:256-258`). This is the value
+    /// at the iteration where the LML-change criterion broke — at a non-converged
+    /// `max_iter` it differs from a post-hoc recompute from `pi_hat`/`f_hat`
+    /// (off-convergence `a != y - pi`), so it is captured in the loop rather than
+    /// recomputed. At full convergence it equals the algebraic R&W eq. 3.32 form.
+    lml: F,
     /// Kernel used during fitting.
     kernel: Box<dyn GPKernel<F>>,
 }
@@ -209,10 +214,16 @@ impl<F: Float + Send + Sync + 'static> FittedGaussianProcessClassifier<F> {
     /// selection and model comparison.
     #[must_use]
     pub fn log_marginal_likelihood(&self) -> F {
+        // Each binary model carries the log-marginal-likelihood computed inside
+        // its posterior-mode Newton loop and stored at the break point — exactly
+        // sklearn's `base_estimator_.log_marginal_likelihood_value_`
+        // (`_gpc.py:256-258`,`:454-470`). At a non-converged `max_iter` this is
+        // the loop value, NOT a post-hoc recompute (which would assume the
+        // convergence identity `a = y - pi`).
         let sum = self
             .binary_models
             .iter()
-            .map(binary_log_marginal_likelihood)
+            .map(|m| m.lml)
             .fold(F::zero(), |a, b| a + b);
         // Mean of the per-binary LMLs (sklearn `_gpc.py:743-749`). `binary_models`
         // is never empty after a successful fit (>= 2 classes => >= 1 model);
@@ -328,7 +339,6 @@ fn fit_binary_gpc<F: Float + Send + Sync + 'static>(
     x: &Array2<F>,
     y_binary: &Array1<F>,
     max_iter: usize,
-    tol: F,
 ) -> Result<FittedBinaryGPC<F>, FerroError> {
     let n = x.nrows();
     let k_mat = kernel.compute(x, x);
@@ -336,22 +346,42 @@ fn fit_binary_gpc<F: Float + Send + Sync + 'static>(
     // Initialize latent function values to zero
     let mut f = Array1::<F>::zeros(n);
 
+    // Compile-time-constant conversions (never fail for f32/f64; `unwrap_or`
+    // avoids a production `.unwrap`, R-CODE-2). 1e-12 is the W-clamp floor,
+    // 1e-10 is sklearn's LML-change break threshold (`_gpc.py:462`).
+    let w_floor = F::from(1e-12).unwrap_or_else(F::epsilon);
+    let lml_eps = F::from(1e-10).unwrap_or_else(F::epsilon);
+    let half = F::from(0.5).unwrap_or_else(|| F::one() / (F::one() + F::one()));
+
+    // sklearn computes the log-marginal-likelihood INSIDE the Newton loop and
+    // breaks when it stops increasing (`lml - log_marginal_likelihood < 1e-10`,
+    // `_gpc.py:454-462`), NOT on the change in `f`. The temporaries `pi`, `L`
+    // (and `lml`) from the LAST EXECUTED iteration are what sklearn stores:
+    // `self.pi_ = pi` is `expit(f)` from the TOP of the loop body — i.e. the
+    // pre-update f (a deliberate one-step lag), and `log_marginal_likelihood_value_`
+    // is the loop's last `lml` (`_gpc.py:264-266`,`:256-258`).
+    let mut prev_lml = F::neg_infinity();
+    // Carried-out temporaries: pi_ (pre-update lag), the Cholesky factor L, and
+    // the loop-internal lml of the last executed iteration. `max_iter >= 1`
+    // (sklearn constraint `max_iter_predict >= 1`), so the loop runs at least
+    // once and these are always overwritten with real values.
+    let mut pi_hat: Array1<F> = f.mapv(sigmoid);
+    let mut l_final = Array2::<F>::zeros((n, n));
+    let mut lml_final = F::neg_infinity();
+
     for _iter in 0..max_iter {
-        // pi = sigmoid(f)
+        // pi = sigmoid(f) — from the CURRENT (pre-update) f. This is sklearn's
+        // `pi = expit(f)` at the TOP of the loop (`_gpc.py:438`); the LAST
+        // iteration's value becomes `self.pi_` (the one-step lag).
         let pi: Array1<F> = f.mapv(sigmoid);
 
         // W = diag(pi * (1 - pi))
         let w: Array1<F> = pi
             .iter()
-            .zip(f.iter())
-            .map(|(&p, _)| {
+            .map(|&p| {
                 let w_val = p * (F::one() - p);
                 // Clamp to avoid zero/negative
-                if w_val < F::from(1e-12).unwrap() {
-                    F::from(1e-12).unwrap()
-                } else {
-                    w_val
-                }
+                if w_val < w_floor { w_floor } else { w_val }
             })
             .collect();
 
@@ -399,100 +429,51 @@ fn fit_binary_gpc<F: Float + Send + Sync + 'static>(
             .map(|(&b, &s)| b - s)
             .collect();
 
-        // f_new = K @ a
+        // f_new = K @ a  (`_gpc.py:450`)
         let f_new = mat_vec_mul(&k_mat, &a);
 
-        // Check convergence
-        let max_change = f_new
-            .iter()
-            .zip(f.iter())
-            .map(|(&fn_i, &f_i)| (fn_i - f_i).abs())
-            .fold(F::zero(), |a, b| if a > b { a } else { b });
+        // Log-marginal-likelihood, computed on the UPDATED f, using this
+        // iteration's a and L (`_gpc.py:454-458`):
+        //   lml = -0.5 a^T f - sum log1p(exp(-(2y-1) f)) - sum log diag(L)
+        // The `log1p(exp(...))` form is sklearn's numerically-stable Bernoulli
+        // term; y is the {0,1} y_binary, so (2y-1) is the {-1,+1} sign.
+        let mut quad = F::zero();
+        for (&ai, &fi) in a.iter().zip(f_new.iter()) {
+            quad = quad + ai * fi;
+        }
+        let mut data_fit = F::zero();
+        for (&yi, &fi) in y_binary.iter().zip(f_new.iter()) {
+            let signed = (yi + yi - F::one()) * fi; // (2y - 1) * f
+            data_fit = data_fit + (-signed).exp().ln_1p();
+        }
+        let mut log_det = F::zero();
+        for i in 0..n {
+            log_det = log_det + l[[i, i]].ln();
+        }
+        let lml = -half * quad - data_fit - log_det;
 
+        // Stash this iteration's temporaries as the candidates sklearn stores.
+        pi_hat = pi;
+        l_final = l;
+        lml_final = lml;
         f = f_new;
 
-        if max_change < tol {
+        // Break when the LML stops increasing (`_gpc.py:462`). The `f` update
+        // and the temporaries above are RETAINED from this iteration.
+        if lml - prev_lml < lml_eps {
             break;
         }
+        prev_lml = lml;
     }
-
-    // Final pi and L
-    let pi_hat: Array1<F> = f.mapv(sigmoid);
-    let w_final: Array1<F> = pi_hat
-        .iter()
-        .map(|&p| {
-            let w_val = p * (F::one() - p);
-            if w_val < F::from(1e-12).unwrap() {
-                F::from(1e-12).unwrap()
-            } else {
-                w_val
-            }
-        })
-        .collect();
-    let sqrt_w_final: Array1<F> = w_final.mapv(num_traits::Float::sqrt);
-    let mut b_final = Array2::<F>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..n {
-            b_final[[i, j]] = sqrt_w_final[i] * k_mat[[i, j]] * sqrt_w_final[j];
-        }
-        b_final[[i, i]] = b_final[[i, i]] + F::one();
-    }
-    let l_final = cholesky_gpc(&b_final)?;
 
     Ok(FittedBinaryGPC {
         x_train: x.clone(),
-        f_hat: f,
         pi_hat,
         y_binary: y_binary.clone(),
         l_factor: l_final,
+        lml: lml_final,
         kernel: kernel.clone_box(),
     })
-}
-
-/// Approximate Laplace log marginal likelihood for one binary GP.
-///
-/// Per Rasmussen & Williams "Gaussian Processes for Machine Learning"
-/// eq. 3.32 / Algorithm 5.1:
-///
-/// `log Z_LA ≈ -½ f_hat^T (y - pi_hat) + Σᵢ [yᵢ log πᵢ + (1-yᵢ) log(1-πᵢ)]
-///            - Σᵢ log L_ii`
-///
-/// where the first term uses the identity `K^{-1} f_hat = y - pi_hat`
-/// at convergence of the Newton iteration, and `L` is the Cholesky factor
-/// of `B = I + sqrt(W) K sqrt(W)`.
-fn binary_log_marginal_likelihood<F: Float + Send + Sync + 'static>(
-    model: &FittedBinaryGPC<F>,
-) -> F {
-    let half = F::from(0.5).unwrap();
-    let eps = F::from(1e-300).unwrap();
-
-    // Quadratic term: -1/2 f_hat^T (y - pi_hat).
-    let mut quadratic = F::zero();
-    for ((&fi, &yi), &pi) in model
-        .f_hat
-        .iter()
-        .zip(model.y_binary.iter())
-        .zip(model.pi_hat.iter())
-    {
-        quadratic = quadratic + fi * (yi - pi);
-    }
-    quadratic = -half * quadratic;
-
-    // Log Bernoulli likelihood: sum y log pi + (1-y) log (1-pi).
-    let mut log_lik = F::zero();
-    for (&yi, &pi) in model.y_binary.iter().zip(model.pi_hat.iter()) {
-        let pi_clamped = pi.max(eps).min(F::one() - eps);
-        log_lik = log_lik + yi * pi_clamped.ln() + (F::one() - yi) * (F::one() - pi_clamped).ln();
-    }
-
-    // Log determinant: log |B| / 2 = sum log L_ii  (since |B| = (prod L_ii)^2).
-    let n = model.l_factor.nrows();
-    let mut log_det_half = F::zero();
-    for i in 0..n {
-        log_det_half = log_det_half + model.l_factor[[i, i]].ln();
-    }
-
-    quadratic + log_lik - log_det_half
 }
 
 /// Predictive latent posterior mean `f_bar* = K* @ (y - pi_hat)` for one
@@ -765,16 +746,14 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array1<usize>>
             // Binary: single model, y = 0 or 1 (map to the second class)
             let y_binary: Array1<F> =
                 y.mapv(|v| if v == classes[1] { F::one() } else { F::zero() });
-            let model =
-                fit_binary_gpc(self.kernel.as_ref(), x, &y_binary, self.max_iter, self.tol)?;
+            let model = fit_binary_gpc(self.kernel.as_ref(), x, &y_binary, self.max_iter)?;
             vec![model]
         } else {
             // Multi-class: one-vs-rest
             let mut models = Vec::with_capacity(classes.len());
             for &cls in &classes {
                 let y_binary: Array1<F> = y.mapv(|v| if v == cls { F::one() } else { F::zero() });
-                let model =
-                    fit_binary_gpc(self.kernel.as_ref(), x, &y_binary, self.max_iter, self.tol)?;
+                let model = fit_binary_gpc(self.kernel.as_ref(), x, &y_binary, self.max_iter)?;
                 models.push(model);
             }
             models
