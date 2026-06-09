@@ -25,7 +25,7 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_decomp::{Kernel, KernelPCA};
-use ndarray::{array, Array2};
+use ndarray::{Array2, array};
 
 /// Deterministic distinct-eigenvalue fixture (6 samples, 2 features).
 fn fixture() -> Array2<f64> {
@@ -63,7 +63,6 @@ fn fixture() -> Array2<f64> {
 ///
 /// Tracking: #2389
 #[test]
-#[ignore = "divergence: KernelPCA rejects n_components>n_samples; sklearn clamps via min(); tracking #2389"]
 fn divergence_n_components_exceeds_samples_clamps() {
     let x = fixture(); // 6 samples
     let fitted = KernelPCA::<f64>::new(10)
@@ -110,7 +109,6 @@ fn divergence_n_components_exceeds_samples_clamps() {
 ///
 /// Tracking: #2390
 #[test]
-#[ignore = "divergence: KernelPCA clamps non-PSD negative eigenvalues; sklearn raises ValueError; tracking #2390"]
 fn divergence_non_psd_kernel_raises() {
     let x = fixture();
     let result = KernelPCA::<f64>::new(5)

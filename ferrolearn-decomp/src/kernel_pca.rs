@@ -63,7 +63,7 @@
 //! | REQ-7 | embedding shape + `1/sqrt(eigval)` scaling | SHIPPED | `alphas = eigvec/sqrt(eigval)` (`:511-520`); shape tests |
 //! | REQ-8 | transform of NEW data (train-kernel centering) | SHIPPED | `transform` (`:550`); `test_kernel_pca_transform_new_data` |
 //! | REQ-9 | auto-gamma `1/n_features` | SHIPPED | `effective_gamma = gamma or 1/n_features` (`:465`); `test_kernel_pca_auto_gamma` |
-//! | REQ-10 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards (n_components 0/>n_samples, n_samples<2, feature mismatch). NON-FINITE: `fit`+`transform` call `reject_non_finite` (`kernel_pca.rs` symbol `reject_non_finite`) BEFORE the kernel matrix/projection, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_kernel_pca.py:438`/`:499`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_kernel_pca_fit_nan_`/`_fit_inf_`/`_transform_nan_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: KernelPCA `fit`/`transform` + re-export `lib.rs` |
+//! | REQ-10 | Error/parameter contracts (incl. NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards (n_components 0, n_samples<2, feature mismatch). **n_components > n_samples CLAMPS** to `min(n_samples, n_components)` and fits = sklearn `_kernel_pca.py:337` (was #2389, fixed; the `n_comp_effective` binding in `fit`); pin `tests/divergence_kernel_pca_2389.rs::divergence_n_components_exceeds_samples_clamps`. **NON-PSD centered kernel RAISES**: a significant negative eigenvalue (`min_eig < -1e-5*max_eig` AND `< -1e-10`) → `InvalidParameter{name:"kernel", reason:"... not positive semi-definite ..."}` = sklearn `_check_psd_eigenvalues` (`_kernel_pca.py:368`, `utils/validation.py:1942-1963`); tiny negatives still clip to 0 (was #2390, fixed; the PSD check in `fit`); pin `tests/divergence_kernel_pca_2389.rs::divergence_non_psd_kernel_raises`. NON-FINITE: `fit`+`transform` call `reject_non_finite` (`kernel_pca.rs` symbol `reject_non_finite`) BEFORE the kernel matrix/projection, returning `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `_validate_data(force_all_finite=True)` (`_kernel_pca.py:438`/`:499`,`utils/validation.py:147-154`) — replaces the prior silent-garbage `Ok`. `tests/divergence_nonfinite.rs::divergence_kernel_pca_fit_nan_`/`_fit_inf_`/`_transform_nan_rejects_for_finiteness` match the live sklearn 1.5.2 oracle. Was #2288/#2289, fixed. Consumer: KernelPCA `fit`/`transform` + re-export `lib.rs` |
 //! | REQ-11 | f32/f64 generic | SHIPPED | `test_kernel_pca_f32` |
 //! | REQ-12 | `eigen_solver` arpack/randomized + tol/max_iter/iterated_power/random_state | NOT-STARTED | sklearn `_kernel_pca.py:340-366`; ferrolearn dense Jacobi only — blocker #1564 |
 //! | REQ-13 | `remove_zero_eig` | NOT-STARTED | sklearn `_kernel_pca.py:381-383` — blocker #1565 |
@@ -482,10 +482,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KernelPCA<F> {
     /// Fit Kernel PCA by computing the kernel matrix, centring it in
     /// feature space, and eigendecomposing.
     ///
+    /// `n_components` greater than the number of samples is CLAMPED to
+    /// `min(n_samples, n_components)` and fitted (matching sklearn
+    /// `_kernel_pca.py:337`), not rejected.
+    ///
     /// # Errors
     ///
-    /// - [`FerroError::InvalidParameter`] if `n_components` is zero or exceeds
-    ///   the number of samples.
+    /// - [`FerroError::InvalidParameter`] if `n_components` is zero, or if the
+    ///   centered kernel is not positive semi-definite (a significant negative
+    ///   eigenvalue, matching sklearn `_check_psd_eigenvalues`).
     /// - [`FerroError::InsufficientSamples`] if there are fewer than 2 samples.
     /// - [`FerroError::ConvergenceFailure`] if the Jacobi eigendecomposition
     ///   does not converge.
@@ -505,15 +510,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KernelPCA<F> {
                 context: "KernelPCA::fit requires at least 2 samples".into(),
             });
         }
-        if self.n_components > n_samples {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: format!(
-                    "n_components ({}) exceeds n_samples ({})",
-                    self.n_components, n_samples
-                ),
-            });
-        }
+        // sklearn caps the effective number of components at the kernel matrix
+        // dimension rather than erroring: `n_components = min(K.shape[0],
+        // self.n_components)` (`_kernel_pca.py:337`). The centered kernel is
+        // `n_samples x n_samples`, so at most `n_samples` components exist.
+        // ferrolearn previously returned `Err(InvalidParameter)` here (#2389);
+        // now it clamps and fits to match sklearn.
+        let n_comp_effective = self.n_components.min(n_samples);
 
         // Finiteness: sklearn `KernelPCA.fit` runs `_validate_data`
         // (`_kernel_pca.py:438`) with the default `force_all_finite=True`,
@@ -557,7 +560,56 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KernelPCA<F> {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let n_comp = self.n_components;
+        let n_comp = n_comp_effective;
+
+        // PSD check (sklearn `_check_psd_eigenvalues`, `_kernel_pca.py:368`,
+        // `utils/validation.py:1942-1963`): sklearn runs the check on the
+        // eigenvalues RETURNED BY `eigh(K, subset_by_index=(N-n_comp, N-1))`
+        // (`_kernel_pca.py:350-352`) — i.e. on the SELECTED top-`n_comp`
+        // eigenvalues, NOT the full spectrum. A SIGNIFICANT negative eigenvalue
+        // among that subset (`min_eig < -significant_neg_ratio * max_eig` AND
+        // `min_eig < -significant_neg_value`, with `significant_neg_ratio=1e-5`,
+        // `significant_neg_value=1e-10` for double precision) means the centered
+        // kernel is not PSD → sklearn RAISES `ValueError`. ferrolearn previously
+        // silently clamped ALL negatives to 0 and returned a garbage embedding
+        // (#2390); now it surfaces an error. Tiny (numerical-noise) negatives in
+        // the selected subset are still clipped to 0 below. The thresholds use
+        // the f64 constants (sklearn `is_double_precision` branch); f32 inputs
+        // are evaluated with the same ratio/value cast into `F` — the ratio test
+        // dominates and is dtype-agnostic for the non-PSD case being guarded.
+        {
+            let selected: Vec<F> = indices
+                .iter()
+                .take(n_comp)
+                .map(|&i| eigenvalues[i])
+                .collect();
+            if !selected.is_empty() {
+                let max_eig = selected
+                    .iter()
+                    .copied()
+                    .fold(F::neg_infinity(), |a, b| if b > a { b } else { a });
+                let min_eig = selected
+                    .iter()
+                    .copied()
+                    .fold(F::infinity(), |a, b| if b < a { b } else { a });
+                let significant_neg_ratio = F::from(1e-5).unwrap_or_else(F::epsilon);
+                let significant_neg_value = F::from(1e-10).unwrap_or_else(F::epsilon);
+                if max_eig > F::zero()
+                    && min_eig < -significant_neg_ratio * max_eig
+                    && min_eig < -significant_neg_value
+                {
+                    return Err(FerroError::InvalidParameter {
+                        name: "kernel".into(),
+                        reason: "There are significant negative eigenvalues. \
+                                 Either the matrix is not positive semi-definite (PSD), \
+                                 or there was an issue while computing the \
+                                 eigendecomposition of the matrix."
+                            .into(),
+                    });
+                }
+            }
+        }
+
         let mut alphas = Array2::<F>::zeros((n_samples, n_comp));
         let mut top_eigenvalues = Array1::<F>::zeros(n_comp);
 
@@ -856,10 +908,23 @@ mod tests {
     }
 
     #[test]
-    fn test_kernel_pca_invalid_n_components_too_large() {
-        let kpca = KernelPCA::<f64>::new(20);
+    fn test_kernel_pca_n_components_too_large_clamps() {
+        // sklearn clamps n_components to min(n_samples, n_components) and fits
+        // (`_kernel_pca.py:337`), it does NOT error (#2389).
+        let kpca = KernelPCA::<f64>::new(20).with_kernel(Kernel::Linear);
         let x = linear_dataset(); // 5 samples
-        assert!(kpca.fit(&x, &()).is_err());
+        let eig_len = kpca.fit(&x, &()).ok().map(|f| f.eigenvalues().len());
+        assert_eq!(
+            eig_len,
+            Some(5),
+            "clamps to n_samples=5 eigenvalues and fits (_kernel_pca.py:337)"
+        );
+        let shape = kpca
+            .fit(&x, &())
+            .and_then(|f| f.transform(&x))
+            .ok()
+            .map(|p| p.dim());
+        assert_eq!(shape, Some((5, 5)));
     }
 
     #[test]

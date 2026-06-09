@@ -303,12 +303,33 @@ fn green_err_n_components_zero() {
     assert!(matches!(r, Err(FerroError::InvalidParameter { .. })));
 }
 
-/// Green-guard (REQ-10): n_components > n_samples -> Err.
+/// Green-guard (REQ-10): n_components > n_samples CLAMPS to
+/// `min(n_samples, n_components)` and fits — it does NOT error.
+///
+/// sklearn `_kernel_pca.py:337`: `n_components = min(K.shape[0],
+/// self.n_components)`, so `KernelPCA(n_components=20, kernel='linear',
+/// eigen_solver='dense').fit(X)` on a 7-sample X yields `eigenvalues_.shape ==
+/// (7,)` and `transform(X).shape == (7, 7)` (live sklearn 1.5.2 oracle,
+/// R-CHAR-3). The prior version of this guard pinned ferrolearn's WRONG
+/// `Err(InvalidParameter)` as correct; it is corrected here (#2389).
 #[test]
 fn green_err_n_components_too_large() {
     let x = fixture(); // 7 samples
-    let r = KernelPCA::<f64>::new(20).fit(&x, &());
-    assert!(matches!(r, Err(FerroError::InvalidParameter { .. })));
+    let fitted = KernelPCA::<f64>::new(20)
+        .with_kernel(Kernel::Linear)
+        .fit(&x, &())
+        .expect("sklearn clamps n_components to n_samples and fits (_kernel_pca.py:337)");
+    assert_eq!(
+        fitted.eigenvalues().len(),
+        7,
+        "sklearn clamps to n_samples=7 eigenvalues (_kernel_pca.py:337)"
+    );
+    let projected = fitted.transform(&x).expect("transform");
+    assert_eq!(
+        projected.dim(),
+        (7, 7),
+        "sklearn transform shape is (n_samples, min(n_samples, n_components)) = (7, 7)"
+    );
 }
 
 /// Green-guard (REQ-10): n_samples < 2 -> Err.
