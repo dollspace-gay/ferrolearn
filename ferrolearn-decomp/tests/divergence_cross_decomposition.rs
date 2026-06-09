@@ -446,7 +446,7 @@ fn greenguard_fitted_shapes() {
     assert_eq!(fitted.y_loadings().dim(), (2, 2)); // (q, k)
     assert_eq!(fitted.x_scores().dim(), (5, 2)); // (n, k)
     assert_eq!(fitted.y_scores().dim(), (5, 2));
-    assert_eq!(fitted.coefficients().dim(), (3, 2)); // internal (p, q)
+    assert_eq!(fitted.coefficients().dim(), (2, 3)); // sklearn coef_ (n_targets, n_features), _pls.py:400
 
     let svd = PLSSVD::<f64>::new(2).fit(&x, &y).expect("PLSSVD fit");
     assert_eq!(svd.x_weights().dim(), (3, 2));
@@ -520,7 +520,7 @@ fn greenguard_error_contracts() {
     // n_components == 0
     assert!(PLSRegression::<f64>::new(0).fit(&x, &y).is_err());
 
-    // n_components too large (X has 3 features, Y has 2 -> max 2)
+    // n_components too large (PLSRegression bound = n_features_x = 3, _pls.py:294)
     assert!(PLSRegression::<f64>::new(99).fit(&x, &y).is_err());
 
     // insufficient samples

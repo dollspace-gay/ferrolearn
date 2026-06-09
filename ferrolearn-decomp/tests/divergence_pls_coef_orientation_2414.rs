@@ -63,7 +63,6 @@ fn max_abs_diff(a: &Array2<f64>, b: &Array2<f64>) -> f64 {
 /// `coefficients()` is `(3, 2)`. The public accessor advertises the wrong shape.
 /// Tracking: #2414
 #[test]
-#[ignore = "divergence: PLSRegression::coefficients() shape is (p,q) not sklearn coef_ (q,p); tracking #2414"]
 fn divergence_pls_coef_orientation_shape() {
     let (x, y) = fixture();
     let fitted = PLSRegression::<f64>::new(2)
@@ -100,7 +99,6 @@ fn divergence_pls_coef_orientation_shape() {
 /// it FAILS on value because the scaling is not absorbed.
 /// Tracking: #2414
 #[test]
-#[ignore = "divergence: PLSRegression::coefficients() is scaled-space, not raw-space sklearn coef_; tracking #2414"]
 fn divergence_pls_coef_value_vs_sklearn_coef() {
     let (x, y) = fixture();
     let fitted = PLSRegression::<f64>::new(2)
@@ -119,23 +117,24 @@ fn divergence_pls_coef_value_vs_sklearn_coef() {
         [0.04427986, 0.01921339, 0.0957523]
     ];
 
-    // Transpose ferrolearn's (p, q) matrix to (q, p) so the comparison is purely
-    // about value-space (scaling), not orientation. If shapes still mismatch the
-    // accessor is doubly divergent; guard so the assert message is meaningful.
+    // `coefficients()` now returns sklearn's documented `coef_` directly:
+    // shape (n_targets, n_features) = (2, 3) in RAW (un-scaled) space
+    // (`_pls.py:399-400`). Compare element-wise WITHOUT transposing — the fix
+    // both re-orients AND absorbs the y_std/x_std scaling.
     assert_eq!(
-        coef.t().dim(),
+        coef.dim(),
         sk_coef.dim(),
-        "ferrolearn coefficients().T shape {:?} != sklearn coef_ shape {:?}",
-        coef.t().dim(),
+        "ferrolearn coefficients() shape {:?} != sklearn coef_ shape {:?}",
+        coef.dim(),
         sk_coef.dim()
     );
-    let ferro_t = coef.t().to_owned();
-    let diff = max_abs_diff(&ferro_t, &sk_coef);
+    let ferro = coef.to_owned();
+    let diff = max_abs_diff(&ferro, &sk_coef);
     assert!(
         diff < 1e-6,
-        "ferrolearn coefficients().T diverges from sklearn coef_ by {diff:e} \
-         (ferrolearn coef is centred+scaled space, sklearn coef_ is raw space, \
-         _pls.py:399-400); ferro.T={ferro_t:?} sklearn={sk_coef:?}"
+        "ferrolearn coefficients() diverges from sklearn coef_ by {diff:e} \
+         (sklearn coef_ is raw space (B * y_std).T / x_std, _pls.py:399-400); \
+         ferro={ferro:?} sklearn={sk_coef:?}"
     );
 }
 
@@ -154,7 +153,6 @@ fn divergence_pls_coef_value_vs_sklearn_coef() {
 /// its bound is `min(3, 1, 5) = 1`. ferrolearn returns `Err` where sklearn fits.
 /// Tracking: #2415
 #[test]
-#[ignore = "divergence: PLSRegression n_components bound min(p,q,n) vs sklearn regression bound p; tracking #2415"]
 fn divergence_pls_n_components_regression_bound() {
     // p=3 features, q=1 target. sklearn regression rank_upper_bound = p = 3.
     let x = array![

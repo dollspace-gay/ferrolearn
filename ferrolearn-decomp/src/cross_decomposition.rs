@@ -1261,8 +1261,10 @@ pub struct FittedPLSRegression<F> {
     x_loadings_: Array2<F>,
     /// Y-loadings Q, shape `(n_features_y, n_components)`.
     y_loadings_: Array2<F>,
-    /// Regression coefficients B, shape `(n_features_x, n_features_y)`.
-    /// B = W (P^T W)^{-1} Q^T.
+    /// Regression coefficients `coef_`, shape `(n_targets, n_features)`, in
+    /// RAW (un-scaled) space — sklearn's documented `coef_` attribute
+    /// (`_pls.py:399-400`): `coef_ = (x_rotations_ @ y_loadings_.T * y_std).T
+    /// / x_std`. `Y_pred = (X - x_mean) @ coef_.T + y_mean`.
     coefficients_: Array2<F>,
     /// X-scores T from training, shape `(n_samples, n_components)`.
     x_scores_: Array2<F>,
@@ -1276,7 +1278,14 @@ pub struct FittedPLSRegression<F> {
     y_mean_: Array1<F>,
     /// Per-feature std of X (None if not scaled).
     x_std_: Option<Array1<F>>,
-    /// Per-feature std of Y (None if not scaled).
+    /// Per-feature std of Y (None if not scaled). Mirrors sklearn's fitted
+    /// `_y_std` (`_pls.py:305`); since the y-scaling is now absorbed into the
+    /// raw-space `coef_` (`_pls.py:400`), `predict` no longer reads it directly,
+    /// but it is retained as part of the fitted state for parity/introspection.
+    #[allow(
+        dead_code,
+        reason = "fitted _y_std mirror; y-scaling is absorbed into coef_ so predict no longer reads it"
+    )]
     y_std_: Option<Array1<F>>,
 }
 
@@ -1299,9 +1308,12 @@ impl<F: Float + Send + Sync + 'static> FittedPLSRegression<F> {
         &self.y_loadings_
     }
 
-    /// Regression coefficient matrix B, shape `(n_features_x, n_features_y)`.
+    /// Regression coefficient matrix `coef_`, shape `(n_targets, n_features)`,
+    /// in RAW (un-scaled) space — matching sklearn's documented `coef_`
+    /// attribute (`sklearn/cross_decomposition/_pls.py:399-400`).
     ///
-    /// `Y_pred = X_centred @ B + y_mean`.
+    /// `Y_pred = (X - x_mean) @ coef_.T + y_mean` (the scaling is absorbed into
+    /// `coef_`, so prediction only centres X, never scales it; `_pls.py:530-531`).
     #[must_use]
     pub fn coefficients(&self) -> &Array2<F> {
         &self.coefficients_
@@ -1357,12 +1369,17 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSRegressi
             });
         }
 
-        let max_components = n_features_x.min(n_features_y).min(n_samples_x);
+        // PLSRegression (deflation_mode="regression") bounds n_components by the
+        // rank of XᵀX = n_features_x = p ALONE (sklearn `_pls.py:294`:
+        // `rank_upper_bound = p if self.deflation_mode == "regression" else
+        // min(n, p, q)`). PLSCanonical/CCA keep the min(n, p, q) bound in their
+        // own `fit` impls.
+        let max_components = n_features_x;
         if self.n_components > max_components {
             return Err(FerroError::InvalidParameter {
                 name: "n_components".into(),
                 reason: format!(
-                    "n_components ({}) exceeds min(n_features_x, n_features_y, n_samples) ({})",
+                    "n_components ({}) exceeds n_features_x ({})",
                     self.n_components, max_components
                 ),
             });
@@ -1400,15 +1417,29 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, Array2<F>> for PLSRegressi
             WeightMode::A,
         )?;
 
-        // Compute regression coefficients: B = W (P^T W)^{-1} Q^T.
+        // Compute the internal pre-scale coefficient B = W (PᵀW)⁻¹ Qᵀ, which is
+        // exactly sklearn's `x_rotations_ @ y_loadings_.T` (`_pls.py:391-399`),
+        // shape (n_features_x, n_targets) = (p, q), in the centred+scaled space.
         let ptw = result.x_loadings.t().dot(&result.x_weights);
         let ptw_inv = invert_square(&ptw)?;
-        let coefficients = result.x_weights.dot(&ptw_inv).dot(&result.y_loadings.t());
+        let b = result.x_weights.dot(&ptw_inv).dot(&result.y_loadings.t());
 
-        // If we scaled, adjust coefficients to work on the original scale.
-        // The stored coefficients operate on centred (and scaled) X, producing
-        // centred (and scaled) Y. We leave them in this internal space and
-        // apply the scaling in predict/transform.
+        // Lift B into sklearn's documented `coef_` = (B * y_std).T / x_std
+        // (`_pls.py:400`), shape (n_targets, n_features) = (q, p), in RAW
+        // (un-scaled) space. The y_std column-scaling and x_std row-scaling are
+        // absorbed so that `predict(X) = (X - x_mean) @ coef_.T + y_mean` needs
+        // no separate /x_std (`_pls.py:530-531`). When scale=false the stored
+        // stds are `None`, i.e. all ones, leaving B^T unchanged.
+        let (p, q) = b.dim();
+        let mut coefficients: Array2<F> = Array2::zeros((q, p));
+        for i in 0..p {
+            let x_std_i = x_std.as_ref().map_or_else(F::one, |s| s[i]);
+            for j in 0..q {
+                let y_std_j = y_std.as_ref().map_or_else(F::one, |s| s[j]);
+                // coef_[j, i] = (B[i, j] * y_std[j]) / x_std[i]
+                coefficients[[j, i]] = b[[i, j]] * y_std_j / x_std_i;
+            }
+        }
 
         Ok(FittedPLSRegression {
             x_weights_: result.x_weights,
@@ -1432,31 +1463,38 @@ impl<F: Float + Send + Sync + 'static> Predict<Array2<F>> for FittedPLSRegressio
 
     /// Predict Y from X using the fitted PLS regression model.
     ///
-    /// Computes `Y_pred = X_centred @ B`, then un-scales and un-centres.
+    /// Mirrors sklearn `predict` (`_pls.py:530-531`): only CENTRE X (no `/x_std`,
+    /// the scaling is absorbed into `coef_`), then
+    /// `Y_pred = (X - x_mean) @ coef_.T + y_mean`.
     ///
     /// # Errors
     ///
     /// Returns [`FerroError::ShapeMismatch`] if X has the wrong number of columns.
     fn predict(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
-        let xc = apply_centre_scale(
-            x,
-            &self.x_mean_,
-            &self.x_std_,
-            "FittedPLSRegression::predict",
-        )?;
+        let (n_samples, n_features) = x.dim();
+        let expected = self.x_mean_.len();
+        if n_features != expected {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples, expected],
+                actual: vec![n_samples, n_features],
+                context: "FittedPLSRegression::predict: X column count mismatch".into(),
+            });
+        }
+        reject_non_finite(x, "X")?;
 
-        let mut y_pred = xc.dot(&self.coefficients_);
-
-        // Un-scale Y.
-        if let Some(ref ys) = self.y_std_ {
-            for mut row in y_pred.rows_mut() {
-                for (v, &s) in row.iter_mut().zip(ys.iter()) {
-                    *v = *v * s;
-                }
+        // Centre X only (the coef_ is in raw space and already absorbs /x_std).
+        let mut xc = x.clone();
+        for mut row in xc.rows_mut() {
+            for (v, &m) in row.iter_mut().zip(self.x_mean_.iter()) {
+                *v = *v - m;
             }
         }
 
-        // Un-centre Y.
+        // Y_pred = X_centred @ coef_.T + y_mean. coef_ is (n_targets, n_features),
+        // so coef_.T is (n_features, n_targets).
+        let mut y_pred = xc.dot(&self.coefficients_.t());
+
+        // Add the intercept (y_mean).
         for mut row in y_pred.rows_mut() {
             for (v, &m) in row.iter_mut().zip(self.y_mean_.iter()) {
                 *v = *v + m;
@@ -2253,8 +2291,8 @@ mod tests {
         let y = array![[1.0, 0.5], [2.0, 1.0], [3.0, 1.5], [4.0, 2.0]];
         let pls = PLSRegression::<f64>::new(2);
         let fitted = pls.fit(&x, &y).unwrap();
-        // B shape: (n_features_x, n_features_y)
-        assert_eq!(fitted.coefficients().dim(), (3, 2));
+        // sklearn coef_ shape: (n_targets, n_features) (_pls.py:400)
+        assert_eq!(fitted.coefficients().dim(), (2, 3));
     }
 
     #[test]
@@ -2288,9 +2326,12 @@ mod tests {
     fn test_plsregression_too_many_components() {
         let x = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let y = array![[1.0], [2.0], [3.0]];
-        // min(2, 1, 3) = 1, asking for 2 is too many.
-        let pls = PLSRegression::<f64>::new(2);
+        // sklearn regression bound is n_features = p = 2 (_pls.py:294), so
+        // n_components=2 is VALID; only n_components > p (= 3 here) is too many.
+        let pls = PLSRegression::<f64>::new(3);
         assert!(pls.fit(&x, &y).is_err());
+        // n_components == p is accepted (matches sklearn).
+        assert!(PLSRegression::<f64>::new(2).fit(&x, &y).is_ok());
     }
 
     #[test]
