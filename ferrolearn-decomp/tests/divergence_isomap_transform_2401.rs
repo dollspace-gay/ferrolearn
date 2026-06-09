@@ -101,7 +101,6 @@ fn max_abs_positive_sign(col: &[f64]) -> f64 {
 /// ~0.14, col-1 by ~0.33 — both >> 1e-6.
 /// Tracking: #2401.
 #[test]
-#[ignore = "divergence: transform uses raw-Euclidean Nystroem not geodesic-graph-linked kernel (sklearn _isomap.py:430); tracking #2401"]
 fn divergence_transform_out_of_sample() {
     let fitted = Isomap::new(2)
         .with_n_neighbors(4)

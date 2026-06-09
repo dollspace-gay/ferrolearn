@@ -9,7 +9,12 @@ use ferrolearn_core::traits::Fit;
 use ferrolearn_decomp::{NMF, NMFInit, NMFSolver};
 use ndarray::{Array2, array};
 
-fn fit_cd(x: &Array2<f64>, k: usize, max_iter: usize, tol: f64) -> ferrolearn_decomp::FittedNMF<f64> {
+fn fit_cd(
+    x: &Array2<f64>,
+    k: usize,
+    max_iter: usize,
+    tol: f64,
+) -> ferrolearn_decomp::FittedNMF<f64> {
     NMF::<f64>::new(k)
         .with_solver(NMFSolver::CoordinateDescent)
         .with_init(NMFInit::Nndsvd)
@@ -96,8 +101,17 @@ fn divergence_edge_k_eq_nfeat() {
     let fitted = fit_cd(&x, 4, 200, 1e-4);
     assert_finite_nonneg("k_eq_nfeat H", fitted.components());
     assert_eq!(fitted.n_iter(), 120, "n_iter_ k_eq_nfeat");
-    assert_close("recon k_eq_nfeat", fitted.reconstruction_err(), 0.001043623244759193);
-    let sk_comp0 = [0.12653082328725238, 1.0789382480526568, 1.3503991478817718, 2.6461854326059155];
+    assert_close(
+        "recon k_eq_nfeat",
+        fitted.reconstruction_err(),
+        0.001043623244759193,
+    );
+    let sk_comp0 = [
+        0.12653082328725238,
+        1.0789382480526568,
+        1.3503991478817718,
+        2.6461854326059155,
+    ];
     let h = fitted.components();
     for (j, &e) in sk_comp0.iter().enumerate() {
         assert_close(&format!("comp k_eq_nfeat [0][{j}]"), h[[0, j]], e);
@@ -118,8 +132,17 @@ fn divergence_edge_zero_row() {
     let fitted = fit_cd(&x, 2, 200, 1e-4);
     assert_finite_nonneg("zero_row H", fitted.components());
     assert_eq!(fitted.n_iter(), 50, "n_iter_ zero_row");
-    assert_close("recon zero_row", fitted.reconstruction_err(), 4.688901827868638);
-    let sk_comp0 = [1.9048037407615392, 1.8464340319158339, 1.8971743171661242, 0.0];
+    assert_close(
+        "recon zero_row",
+        fitted.reconstruction_err(),
+        4.688901827868638,
+    );
+    let sk_comp0 = [
+        1.9048037407615392,
+        1.8464340319158339,
+        1.8971743171661242,
+        0.0,
+    ];
     let h = fitted.components();
     for (j, &e) in sk_comp0.iter().enumerate() {
         assert_close(&format!("comp zero_row [0][{j}]"), h[[0, j]], e);
@@ -141,8 +164,17 @@ fn divergence_edge_rank_deficient() {
     let fitted = fit_cd(&x, 3, 200, 1e-4);
     assert_finite_nonneg("rank_def H", fitted.components());
     assert_eq!(fitted.n_iter(), 120, "n_iter_ rank_def");
-    assert_close("recon rank_def", fitted.reconstruction_err(), 0.000752377404029985);
-    let sk_comp0 = [1.7157150970719655, 1.606666382320096, 1.3975170714934835, 1.7157150970719655];
+    assert_close(
+        "recon rank_def",
+        fitted.reconstruction_err(),
+        0.000752377404029985,
+    );
+    let sk_comp0 = [
+        1.7157150970719655,
+        1.606666382320096,
+        1.3975170714934835,
+        1.7157150970719655,
+    ];
     let h = fitted.components();
     for (j, &e) in sk_comp0.iter().enumerate() {
         assert_close(&format!("comp rank_def [0][{j}]"), h[[0, j]], e);
@@ -162,8 +194,17 @@ fn divergence_edge_max_iter1_and_tol() {
     ];
     let f1 = fit_cd(&x, 2, 1, 1e-4);
     assert_eq!(f1.n_iter(), 1, "n_iter_ max_iter1");
-    assert_close("recon max_iter1", f1.reconstruction_err(), 4.598985199724485);
-    let sk_c0_mi1 = [1.322311062457787, 1.5818174457309582, 1.9781893091479412, 1.9118066011108688];
+    assert_close(
+        "recon max_iter1",
+        f1.reconstruction_err(),
+        4.598985199724485,
+    );
+    let sk_c0_mi1 = [
+        1.322311062457787,
+        1.5818174457309582,
+        1.9781893091479412,
+        1.9118066011108688,
+    ];
     let h1 = f1.components();
     for (j, &e) in sk_c0_mi1.iter().enumerate() {
         assert_close(&format!("comp max_iter1 [0][{j}]"), h1[[0, j]], e);
@@ -171,7 +212,12 @@ fn divergence_edge_max_iter1_and_tol() {
     let f2 = fit_cd(&x, 2, 200, 1e-3);
     assert_eq!(f2.n_iter(), 48, "n_iter_ tol1e3");
     assert_close("recon tol1e3", f2.reconstruction_err(), 3.7268772029842276);
-    let sk_c0_t = [0.0, 2.151375968331528, 1.5556591488971483, 1.3735811534648343];
+    let sk_c0_t = [
+        0.0,
+        2.151375968331528,
+        1.5556591488971483,
+        1.3735811534648343,
+    ];
     let h2 = f2.components();
     for (j, &e) in sk_c0_t.iter().enumerate() {
         assert_close(&format!("comp tol1e3 [0][{j}]"), h2[[0, j]], e);

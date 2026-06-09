@@ -48,7 +48,7 @@
 //! | REQ-2 | Geodesic distance matrix parity (kNN graph + Dijkstra == sklearn `dist_matrix_`) | SHIPPED | `build_knn_graph` + `all_pairs_shortest_paths` match sklearn `kneighbors_graph(mode=distance)` + `shortest_path` (`_isomap.py:242-299`); verified via sign-robust embedding + embedding-distance equality |
 //! | REQ-3 | Structural (embedding shape, deterministic) | SHIPPED (scoped) | shape + determinism guards. NOTE disconnected-graph: ferrolearn errors (NumericalInstability), sklearn warns+completes (REQ-9) |
 //! | REQ-4 | Error/parameter contracts (n_components 0/>n, n_neighbors 0/≥n, <2 samples, disconnected, NON-FINITE rejection) | SHIPPED (scoped) | `fit`/`transform` guards; divergence error tests. NON-FINITE: `fit` (BEFORE the kNN graph) + `transform` call `reject_non_finite` (`isomap.rs` symbol `reject_non_finite`), returning the CLEAN finiteness `InvalidParameter{name:"X", reason:"Input X contains NaN or infinity."}` = sklearn `nbrs_.fit/kneighbors` `_validate_data(force_all_finite=True)` (`_isomap.py:228`,`:411`,`utils/validation.py:147-154`) — REPLACES the incidental "kNN graph disconnected" `NumericalInstability` for non-finite X (R-DEV-2). `tests/divergence_nonfinite_spillover.rs::divergence_isomap_fit_nan`/`_transform_nan` match the live sklearn 1.5.2 oracle (#2290) |
-//! | REQ-5 | `transform` out-of-sample (geodesic-graph-linked, not Euclidean) | NOT-STARTED | `transform` uses raw Euclidean to-train distances; sklearn `_isomap.py:419-460` — blocker #1469 |
+//! | REQ-5 | `transform` out-of-sample (geodesic-graph-linked, not Euclidean) | SHIPPED | `transform` links each query into the TRAINING geodesic graph: kNN of the query (Euclidean, same `k`) → `G_X[j] = min_k(dist_matrix_[k,j] + d_k)` (sklearn `_isomap.py:430`) → `K_pred = -0.5*G_X²` (`:432-433`) → out-of-sample `KernelCenterer` double-centering with the TRAINING `G = -0.5*dist_matrix_²` means (`preprocessing/_data.py:2455-2459`) → project onto `scaled_alphas = eigenvectors_/sqrt(eigenvalues_) = embedding_/eigenvalues_` (`_kernel_pca.py:504-512`), reusing the sign-flipped `embedding_` so the sign matches REQ-1. Stored fit state: `dist_matrix_`, `g_fit_col_means_`/`g_fit_grand_mean_` (the `G` centerer means), `eigenvalues_`, `embedding_`, `n_neighbors_`. Matches the live sklearn 1.5.2 oracle to <1e-6 sign-exact (`tests/divergence_isomap_transform_2401.rs::divergence_transform_out_of_sample`, was #1469/#2401). Consumer: re-export `lib.rs:89` |
 //! | REQ-6 | `radius` mode + `radius_neighbors_graph` | NOT-STARTED | sklearn `_isomap.py:253-261` — blocker #1470 |
 //! | REQ-7 | `path_method` (FW/Floyd-Warshall vs D/Dijkstra) + `eigen_solver`/`tol`/`max_iter` | NOT-STARTED | sklearn `_isomap.py:299,233-240` — blocker #1471 |
 //! | REQ-8 | `metric`/`p` (non-Euclidean minkowski) + `metric_params` | NOT-STARTED | Euclidean only; sklearn `_isomap.py:194-195` — blocker #1472 |
@@ -140,24 +140,37 @@ impl Isomap {
 /// A fitted Isomap model holding the learned embedding and training data.
 ///
 /// Created by calling [`Fit::fit`] on an [`Isomap`]. Implements
-/// [`Transform<Array2<f64>>`] for out-of-sample projection using
-/// nearest-neighbor interpolation against the training embedding.
+/// [`Transform<Array2<f64>>`] for out-of-sample projection by linking each query
+/// into the training geodesic graph and applying the precomputed-KernelPCA
+/// projection — mirroring sklearn `Isomap.transform`
+/// (`sklearn/manifold/_isomap.py:386-435`).
 #[derive(Debug, Clone)]
 pub struct FittedIsomap {
-    /// The embedding, shape `(n_samples, n_components)`.
+    /// The embedding, shape `(n_samples, n_components)`. Carries the deterministic
+    /// `svd_flip` sign (REQ-1, clean). The transform reuses this exact array so
+    /// its sign is consistent with the embedding by construction.
     embedding_: Array2<f64>,
-    /// Training data, stored for out-of-sample extension.
+    /// Training data, stored for the query's k-nearest-training-neighbor search.
     x_train_: Array2<f64>,
-    /// Number of neighbors used during fitting.
-    _n_neighbors: usize,
-    /// Kernel matrix eigenvalues from the MDS step (top n_components).
+    /// Number of neighbors used during fitting (the query kNN uses the same `k`,
+    /// matching sklearn `self.nbrs_.kneighbors(X)`, `_isomap.py:411`).
+    n_neighbors_: usize,
+    /// Kernel matrix eigenvalues from the MDS step (top n_components, clamped
+    /// `>= 0`). Equal to sklearn's `kernel_pca_.eigenvalues_`.
     eigenvalues_: Vec<f64>,
-    /// Kernel matrix eigenvectors from the MDS step, shape `(n_train, n_components)`.
-    eigenvectors_: Array2<f64>,
-    /// Mean of the squared geodesic distance rows, for Nystroem extension.
-    geo_sq_row_means_: Vec<f64>,
-    /// Grand mean of the squared geodesic distances.
-    geo_sq_grand_mean_: f64,
+    /// Geodesic shortest-path distance matrix, shape `(n_train, n_train)`. Equal
+    /// to sklearn's `dist_matrix_` (`_isomap.py:299`); the transform links each
+    /// query through it (`G_X[i] = min_k(dist_matrix_[k] + dist(query, k))`,
+    /// `_isomap.py:430`).
+    dist_matrix_: Array2<f64>,
+    /// Column means of the TRAINING precomputed kernel `G = -0.5 * dist_matrix_²`
+    /// (sklearn `KernelCenterer.K_fit_rows_`, `preprocessing/_data.py:2423`). Since
+    /// `dist_matrix_` is symmetric, `G`'s column means equal its row means; this is
+    /// `-0.5 * mean_j(dist_matrix_[i,j]²)` per index.
+    g_fit_col_means_: Vec<f64>,
+    /// Grand mean of the TRAINING precomputed kernel `G = -0.5 * dist_matrix_²`
+    /// (sklearn `KernelCenterer.K_fit_all_`, `preprocessing/_data.py:2424`).
+    g_fit_grand_mean_: f64,
 }
 
 impl FittedIsomap {
@@ -429,9 +442,16 @@ impl Fit<Array2<f64>, ()> for Isomap {
             }
         }
 
-        let (eigenvalues, eigenvectors) = eigh_faer(&b)?;
+        let (eigenvalues, _eigenvectors) = eigh_faer(&b)?;
 
-        // Sort eigenvalues descending, select top n_components
+        // Sort eigenvalues descending, select top n_components. The eigenVALUES
+        // alone are needed: the transform projects with the scaled alphas
+        // `eigenvectors_ / sqrt(eigenvalues_)`, and since
+        // `embedding_[:,k] = eigenvectors_[:,k] * sqrt(eigenvalues_[k])`
+        // (`mds.rs` `embedding[i,k] = v_ik * sqrt(lambda_k)`), the scaled alphas
+        // are `embedding_[:,k] / eigenvalues_[k]` — derivable from the
+        // SIGN-FLIPPED `embedding`, so the transform sign is consistent with the
+        // embedding (REQ-1) by construction, no separate sign flip needed.
         let mut indices: Vec<usize> = (0..n).collect();
         indices.sort_by(|&a, &b_idx| {
             eigenvalues[b_idx]
@@ -441,22 +461,28 @@ impl Fit<Array2<f64>, ()> for Isomap {
 
         let n_comp = self.n_components.min(n);
         let mut top_eigenvalues = Vec::with_capacity(n_comp);
-        let mut top_eigenvectors = Array2::<f64>::zeros((n, n_comp));
-        for (k, &idx) in indices.iter().take(n_comp).enumerate() {
+        for &idx in indices.iter().take(n_comp) {
             top_eigenvalues.push(eigenvalues[idx].max(0.0));
-            for i in 0..n {
-                top_eigenvectors[[i, k]] = eigenvectors[[i, idx]];
-            }
         }
+
+        // The TRAINING precomputed kernel is `G = -0.5 * dist_matrix_²`
+        // (sklearn `_isomap.py:306-307`); `kernel_pca_`'s `KernelCenterer` was fit
+        // on it. Its column means (`K_fit_rows_`) and grand mean (`K_fit_all_`,
+        // `preprocessing/_data.py:2423-2424`) are `-0.5 *` the `geo_sq` means
+        // computed above (`geo_sq = dist_matrix_²`, symmetric ⇒ col mean = row
+        // mean). Store them so the transform can double-center `G_X` with the
+        // TRAINING means (out-of-sample KernelCenterer, `_data.py:2455-2459`).
+        let g_fit_col_means_: Vec<f64> = col_means.iter().map(|&m| -0.5 * m).collect();
+        let g_fit_grand_mean_ = -0.5 * grand_mean;
 
         Ok(FittedIsomap {
             embedding_: embedding,
             x_train_: x.to_owned(),
-            _n_neighbors: self.n_neighbors,
+            n_neighbors_: self.n_neighbors,
             eigenvalues_: top_eigenvalues,
-            eigenvectors_: top_eigenvectors,
-            geo_sq_row_means_: row_means,
-            geo_sq_grand_mean_: grand_mean,
+            dist_matrix_: geodesic,
+            g_fit_col_means_,
+            g_fit_grand_mean_,
         })
     }
 }
@@ -467,15 +493,34 @@ impl Transform<Array2<f64>> for FittedIsomap {
 
     /// Project new data into the Isomap embedding space.
     ///
-    /// Uses the Nystroem approximation: for each new point, compute the
-    /// Euclidean distance to all training points, approximate geodesic
-    /// distances using the k nearest training neighbors, then project
-    /// using the stored eigenvectors and eigenvalues.
+    /// Mirrors sklearn `Isomap.transform` (`sklearn/manifold/_isomap.py:386-435`):
+    /// link each query INTO the training geodesic graph, then apply the
+    /// precomputed-KernelPCA projection.
+    ///
+    /// For each query `q`:
+    /// 1. find its `n_neighbors` nearest TRAINING points (Euclidean), with their
+    ///    distances `d_k` and training indices `k` (sklearn
+    ///    `nbrs_.kneighbors(X)`, `_isomap.py:411`);
+    /// 2. the geodesic distance to every training point `j` is the shortest path
+    ///    THROUGH the graph:
+    ///    `G_X[j] = min_k (dist_matrix_[k, j] + d_k)` (`_isomap.py:430`);
+    /// 3. form the precomputed kernel row `K_pred = -0.5 * G_X²`
+    ///    (`_isomap.py:432-433`);
+    /// 4. double-center `K_pred` with the TRAINING `KernelCenterer` means
+    ///    (`K_pred[j] -= K_fit_rows_[j]; K_pred[j] -= rowmean(K_pred);
+    ///    K_pred += K_fit_all_`, `preprocessing/_data.py:2455-2459`);
+    /// 5. project onto the scaled eigenvectors `eigenvectors_ / sqrt(eigenvalues_)`
+    ///    (`_kernel_pca.py:504-512`). Since
+    ///    `embedding_[:,c] = eigenvectors_[:,c] * sqrt(eigenvalues_[c])`, the
+    ///    scaled alphas equal `embedding_[:,c] / eigenvalues_[c]` — derived from
+    ///    the sign-flipped `embedding`, so the transform sign is consistent with
+    ///    the embedding (REQ-1) by construction.
     ///
     /// # Errors
     ///
-    /// Returns [`FerroError::ShapeMismatch`] if the number of features
-    /// does not match the training data.
+    /// - [`FerroError::ShapeMismatch`] if the number of features does not match
+    ///   the training data.
+    /// - [`FerroError::InvalidParameter`] if `x` contains NaN or infinity.
     fn transform(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
         let n_features = self.x_train_.ncols();
         if x.ncols() != n_features {
@@ -486,66 +531,81 @@ impl Transform<Array2<f64>> for FittedIsomap {
             });
         }
 
-        // Reject NaN/Inf BEFORE the kNN / Nystroem projection (sklearn validates
-        // X inside `nbrs_.kneighbors(X)` with `force_all_finite=True`,
-        // `_isomap.py:411`, `utils/validation.py:147-154`).
+        // Reject NaN/Inf BEFORE the kNN / projection (sklearn validates X inside
+        // `nbrs_.kneighbors(X)` with `force_all_finite=True`, `_isomap.py:411`,
+        // `utils/validation.py:147-154`).
         reject_non_finite(x)?;
 
         let n_test = x.nrows();
         let n_train = self.x_train_.nrows();
         let n_comp = self.eigenvalues_.len();
+        let k = self.n_neighbors_;
 
         let mut result = Array2::<f64>::zeros((n_test, n_comp));
 
         for t in 0..n_test {
-            // Compute Euclidean distances from the test point to all training points.
+            // Step 1: the query's `n_neighbors` nearest TRAINING points (Euclidean),
+            // keeping each neighbor's distance `d_k` and training index `k`
+            // (sklearn `nbrs_.kneighbors(X)`, `_isomap.py:411`).
             let mut dists: Vec<(f64, usize)> = (0..n_train)
                 .map(|i| {
                     let mut sq = 0.0;
-                    for k in 0..n_features {
-                        let diff = x[[t, k]] - self.x_train_[[i, k]];
+                    for f in 0..n_features {
+                        let diff = x[[t, f]] - self.x_train_[[i, f]];
                         sq += diff * diff;
                     }
                     (sq.sqrt(), i)
                 })
                 .collect();
             dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+            let neighbors = &dists[..k.min(n_train)];
 
-            // Use the distances to the training points as an approximation
-            // of geodesic distances (for points close to the manifold this
-            // is reasonable). Square them for the Nystroem formula.
-            let delta_sq: Vec<f64> = dists.iter().map(|&(d, _)| d * d).collect();
-
-            // Nystroem projection:
-            // embedding_k = (1 / (2 * sqrt(lambda_k))) * sum_i v_ki * (mu_i - delta_sq_i)
-            // where mu_i = row_mean_i of squared geodesic distances and
-            // delta_sq_i = sq distance from new point to training point i.
-            //
-            // But using the correct Nystroem formula:
-            // x_new_k = (1 / sqrt(lambda_k)) * sum_i v_ki * b_i
-            // where b_i = -0.5 * (delta_sq_i - row_mean_i - mean(delta_sq) + grand_mean)
-            let delta_sq_mean: f64 = delta_sq.iter().sum::<f64>() / n_train as f64;
-
-            // Reorder delta_sq by original training index
-            let mut delta_sq_ordered = vec![0.0; n_train];
-            for &(d, idx) in &dists {
-                delta_sq_ordered[idx] = d * d;
+            // Step 2: geodesic distance from the query to every training point `j`
+            // is the shortest path through the graph via one of the query's kNN:
+            // `G_X[j] = min_k (dist_matrix_[k, j] + d_k)` (`_isomap.py:430`).
+            // Step 3: precomputed kernel row `K_pred[j] = -0.5 * G_X[j]²`
+            // (`_isomap.py:432-433`).
+            let mut k_pred = vec![0.0_f64; n_train];
+            for (j, slot) in k_pred.iter_mut().enumerate() {
+                let mut g_xj = f64::INFINITY;
+                for &(d_k, nbr) in neighbors {
+                    let cand = self.dist_matrix_[[nbr, j]] + d_k;
+                    if cand < g_xj {
+                        g_xj = cand;
+                    }
+                }
+                *slot = -0.5 * g_xj * g_xj;
             }
 
-            for k in 0..n_comp {
-                let eigval = self.eigenvalues_[k];
-                if eigval <= 1e-12 {
+            // Step 4: out-of-sample KernelCenterer double-centering with the
+            // TRAINING means (`preprocessing/_data.py:2455-2459`):
+            // `K_pred_cols = rowmean(K_pred)` over the n_train training columns,
+            // then `K_pred[j] -= K_fit_rows_[j]; K_pred[j] -= K_pred_cols;
+            // K_pred += K_fit_all_`.
+            let row_mean: f64 = k_pred.iter().sum::<f64>() / n_train as f64;
+            for (j, val) in k_pred.iter_mut().enumerate() {
+                *val = *val - self.g_fit_col_means_[j] - row_mean + self.g_fit_grand_mean_;
+            }
+
+            // Step 5: project onto the scaled eigenvectors
+            // `scaled_alphas[:,c] = eigenvectors_[:,c] / sqrt(eigenvalues_[c])`
+            // (`_kernel_pca.py:504-512`). With
+            // `embedding_[i,c] = eigenvectors_[i,c] * sqrt(eigenvalues_[c])`, this
+            // is `embedding_[i,c] / eigenvalues_[c]` — reusing the sign-flipped
+            // `embedding`, so the sign matches REQ-1. Null-space components
+            // (eigenvalue 0) contribute nothing, matching sklearn's
+            // `non_zeros = np.flatnonzero(self.eigenvalues_)` masking
+            // (`_kernel_pca.py:505-509`).
+            for c in 0..n_comp {
+                let eigval = self.eigenvalues_[c];
+                if eigval <= 0.0 {
                     continue;
                 }
-                let scale = 1.0 / eigval.sqrt();
                 let mut sum = 0.0;
-                for (i, &dsq_i) in delta_sq_ordered.iter().enumerate().take(n_train) {
-                    let b_i = -0.5
-                        * (dsq_i - self.geo_sq_row_means_[i] - delta_sq_mean
-                            + self.geo_sq_grand_mean_);
-                    sum += self.eigenvectors_[[i, k]] * b_i;
+                for (j, &kpj) in k_pred.iter().enumerate() {
+                    sum += kpj * (self.embedding_[[j, c]] / eigval);
                 }
-                result[[t, k]] = sum * scale;
+                result[[t, c]] = sum;
             }
         }
 
@@ -643,9 +703,21 @@ mod tests {
         let fitted = iso.fit(&x, &()).unwrap();
         let projected = fitted.transform(&x).unwrap();
         let emb = fitted.embedding();
-        // They won't be exactly equal because the Nystroem approximation
-        // differs from exact MDS, but they should be correlated.
+        // Transforming the training data reproduces the stored embedding: for a
+        // training point, its kNN includes itself at distance 0, so
+        // `G_X[j] = min_k(dist_matrix_[k,j] + d_k) = dist_matrix_[self, j]`, and
+        // the precomputed-KernelPCA projection equals the embedding row (sklearn
+        // `transform(X_train) == embedding_`). Sign-EXACT (the transform reuses
+        // the sign-flipped `embedding_` as its scaled alphas).
         assert_eq!(projected.dim(), emb.dim());
+        for i in 0..emb.nrows() {
+            for j in 0..emb.ncols() {
+                assert!(
+                    (projected[[i, j]] - emb[[i, j]]).abs() < 1e-9,
+                    "transform(X_train) must reproduce embedding_ at [{i},{j}]"
+                );
+            }
+        }
     }
 
     #[test]
