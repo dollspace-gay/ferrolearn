@@ -5,9 +5,13 @@
 //! encodings, and the cross-fit `fit_transform`.
 //!
 //! Every expected value below is a LIVE sklearn 1.5.2 oracle result (run from
-//! /tmp), NEVER copied from the ferrolearn side (R-CHAR-3). Each test FAILS
-//! against the current ferrolearn implementation and is `#[ignore]`'d with its
-//! tracking issue.
+//! /tmp), NEVER copied from the ferrolearn side (R-CHAR-3). These tests pinned
+//! NOT-STARTED divergences; they are now GREEN after the `Smooth::Auto`
+//! empirical-Bayes encoding, the `smooth="auto"` default, and the cross-fit
+//! `fit_transform` shipped (#2342 #2343 #2344). NOTE (R-HONEST-4): the C cross-fit
+//! pin originally captured sklearn's DEFAULT non-reproducible `shuffle=True`
+//! output; it is now pinned against the REPRODUCIBLE deterministic `shuffle=False`
+//! KFold oracle (see `divergence_crossfit_fit_transform`).
 //!
 //! Oracle session (sklearn 1.5.2):
 //! ```text
@@ -30,17 +34,19 @@
 //! >>> float(e.target_mean_)  -> 3.8333333333333335
 //!   (lambda_ = var*count / (var*count + ssd/count); enc = lam*mean + (1-lam)*ymean)
 //!
-//! # C — cross-fit fit_transform, default cv=5, smooth=10.0,
+//! # C — cross-fit fit_transform, cv=5, smooth=10.0, DETERMINISTIC (shuffle=False),
 //! #     X=[[0],[1],[0],[1],[0],[1],[0],[1],[0],[1]], y=1..10:
-//! >>> e = TargetEncoder(smooth=10.0, target_type='continuous')
+//! >>> e = TargetEncoder(smooth=10.0, target_type='continuous', shuffle=False)
 //! >>> e.fit_transform(X, y).ravel()
-//!       -> [5.821428571428571, 6.211538461538462, 5.134615384615385,
-//!           5.964285714285714, 5.535714285714286, 6.211538461538462,
-//!           4.678571428571429, 5.678571428571429, 5.134615384615385,
-//!           4.821428571428571]
-//!   ferrolearn has no fit_transform; Fit+Transform returns the FULL-encoding
-//!   (non-cross-fit) transform [5.3333..,5.6666.. alternating], which is what
-//!   sklearn's .transform() (NOT .fit_transform()) returns.
+//!       -> [6.357142857142857, 6.642857142857143, 5.857142857142857,
+//!           6.142857142857143, 5.357142857142857, 5.642857142857143,
+//!           4.857142857142857, 5.142857142857143, 4.357142857142857,
+//!           4.642857142857143]
+//!   ferrolearn's `fit_transform` cross-fits over the same deterministic KFold;
+//!   sklearn's DEFAULT `shuffle=True` output is non-reproducible (no seed) so the
+//!   reproducible `shuffle=False` oracle is pinned (R-HONEST-4). Fit+Transform
+//!   (full encodings) differs: [5.3333..,5.6666.. alternating] == sklearn's
+//!   .transform() (NOT .fit_transform()).
 //! ```
 
 use ferrolearn_core::traits::{Fit, Transform};
@@ -61,7 +67,6 @@ use ndarray::{Array1, Array2, array};
 ///   encodings_[0] -> [1.5308641975308643, 3.506172839506173, 10.0]
 /// ferrolearn default (smooth=1.0) yields the fixed-smooth values, which differ.
 #[test]
-#[ignore = "divergence: default smooth=1.0 vs sklearn default smooth='auto'; tracking #2342"]
 fn divergence_default_smooth_is_auto() {
     // sklearn 1.5.2 live oracle — DEFAULT encoder (smooth='auto'):
     const SK_CAT0: f64 = 1.530_864_197_530_864_3;
@@ -111,7 +116,6 @@ fn divergence_default_smooth_is_auto() {
 /// We pin against ferrolearn's BEST fixed-smooth approximation (the default
 /// smooth=1.0); the empirical-Bayes values are unreachable, so this FAILS.
 #[test]
-#[ignore = "divergence: no smooth='auto' empirical-Bayes encodings; tracking #2343"]
 fn divergence_smooth_auto_empirical_bayes() {
     // sklearn 1.5.2 live oracle — smooth='auto':
     const SK_CAT0: f64 = 3.122_887_864_823_349;
@@ -158,45 +162,67 @@ fn divergence_smooth_auto_empirical_bayes() {
 /// `Transform`, which uses the FULL `encodings_` (sklearn's `.transform()`,
 /// explicitly NOT equal to `.fit_transform()` per `_target_encoder.py:308-311`).
 ///
-/// Live oracle (sklearn 1.5.2): smooth=10.0, default cv=5,
-/// X=[[0],[1],[0],[1],[0],[1],[0],[1],[0],[1]], y=1..10:
-///   fit_transform(X,y).ravel() ->
-///     [5.821428571428571, 6.211538461538462, 5.134615384615385,
-///      5.964285714285714, 5.535714285714286, 6.211538461538462,
-///      4.678571428571429, 5.678571428571429, 5.134615384615385,
-///      4.821428571428571]
-///   ferrolearn Fit+Transform -> the full-encoding [5.333..,5.666.. alternating]
-///   (== sklearn .transform(), NOT .fit_transform()), so this FAILS.
+/// Live oracle (sklearn 1.5.2): smooth=10.0, cv=5, DETERMINISTIC KFold
+/// (`shuffle=False`), X=[[0],[1],[0],[1],[0],[1],[0],[1],[0],[1]], y=1..10:
+///   TargetEncoder(smooth=10.0, target_type='continuous', shuffle=False)
+///       .fit_transform(X,y).ravel() ->
+///     [6.357142857142857, 6.642857142857143, 5.857142857142857,
+///      6.142857142857143, 5.357142857142857, 5.642857142857143,
+///      4.857142857142857, 5.142857142857143, 4.357142857142857,
+///      4.642857142857143]
+///
+/// NOTE (R-HONEST-4): the original pin captured sklearn's DEFAULT `shuffle=True`
+/// `fit_transform` output ([5.821.., …]) which is NON-REPRODUCIBLE (no seed),
+/// so it could not be matched. ferrolearn's `fit_transform` exposes no
+/// `shuffle`/`random_state` (REQ-8 NOT-STARTED), so it implements sklearn's
+/// deterministic `shuffle=False` KFold (`_split.py:521-534`), whose oracle output
+/// is the stable values above (verified bit-stable across 20 runs). This still
+/// pins the cross-fit DIVERGENCE: `fit_transform` (cross-fit) != `fit().transform()`
+/// (full encodings), per `_target_encoder.py:235-238`.
 #[test]
-#[ignore = "divergence: no cross-fit fit_transform (Fit+Transform = full encodings); tracking #2344"]
 fn divergence_crossfit_fit_transform() {
-    // sklearn 1.5.2 live oracle — fit_transform (cross-fit, cv=5, smooth=10.0):
+    // sklearn 1.5.2 live oracle — fit_transform (cross-fit, cv=5, smooth=10.0,
+    // shuffle=False — the reproducible deterministic-KFold path):
     let sk_fit_transform: [f64; 10] = [
-        5.821_428_571_428_571,
-        6.211_538_461_538_462,
-        5.134_615_384_615_385,
-        5.964_285_714_285_714,
-        5.535_714_285_714_286,
-        6.211_538_461_538_462,
-        4.678_571_428_571_429,
-        5.678_571_428_571_429,
-        5.134_615_384_615_385,
-        4.821_428_571_428_571,
+        6.357_142_857_142_857,
+        6.642_857_142_857_143,
+        5.857_142_857_142_857,
+        6.142_857_142_857_143,
+        5.357_142_857_142_857,
+        5.642_857_142_857_143,
+        4.857_142_857_142_857,
+        5.142_857_142_857_143,
+        4.357_142_857_142_857,
+        4.642_857_142_857_143,
     ];
 
     let x: Array2<usize> = array![[0], [1], [0], [1], [0], [1], [0], [1], [0], [1]];
     let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
 
-    // ferrolearn's closest-to-fit_transform: fit then transform on the same X.
-    let fitted = TargetEncoder::<f64>::new(10.0).fit(&x, &y).unwrap();
-    let out = fitted.transform(&x).unwrap();
+    // ferrolearn's cross-fit fit_transform (deterministic KFold, cv=5).
+    let out = TargetEncoder::<f64>::new(10.0)
+        .fit_transform(&x, &y)
+        .unwrap();
 
     for i in 0..10 {
         assert!(
             (out[[i, 0]] - sk_fit_transform[i]).abs() < 1e-7,
-            "row {i}: ferro Fit+Transform={} != sklearn fit_transform (cross-fit)={}",
+            "row {i}: ferro fit_transform={} != sklearn fit_transform (cross-fit, shuffle=False)={}",
             out[[i, 0]],
             sk_fit_transform[i]
         );
     }
+
+    // Cross-fit MUST differ from the full-encoding fit().transform() (the leakage
+    // distinction, `_target_encoder.py:235-238`).
+    let full = TargetEncoder::<f64>::new(10.0)
+        .fit(&x, &y)
+        .unwrap()
+        .transform(&x)
+        .unwrap();
+    let differs = (0..10).any(|i| (out[[i, 0]] - full[[i, 0]]).abs() > 1e-9);
+    assert!(
+        differs,
+        "fit_transform (cross-fit) must differ from fit().transform() (full encodings)"
+    );
 }

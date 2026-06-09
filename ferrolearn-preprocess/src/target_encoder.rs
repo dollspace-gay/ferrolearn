@@ -30,8 +30,8 @@
 //! | REQ-1 manual-`smooth` m-estimate value match (f64, bit-exact) | SHIPPED | `TargetEncoder::fit` / `transform`; sklearn `_target_encoder_fast.pyx:60-75`, `_target_encoder.py:289`,`:383` (#1261 pairwise sum, #1262 formula) |
 //! | REQ-2 unseen category → `target_mean_` (global mean) | SHIPPED | `transform` `unwrap_or(global_mean)`; sklearn `_target_encoder.py:324-345` |
 //! | REQ-3 InsufficientSamples / ShapeMismatch / InvalidParameter errors | SHIPPED | `fit` / `transform` guards; sklearn `_target_encoder.py:189` |
-//! | REQ-4 `smooth="auto"` empirical-Bayes default | NOT-STARTED (#1264) | sklearn `_target_encoder.py:85-89`,`:189` |
-//! | REQ-5 cross-fitting `fit_transform` (KFold/StratifiedKFold) | NOT-STARTED (#1265) | sklearn `_target_encoder.py:232`,`:254-303` |
+//! | REQ-4 `smooth="auto"` empirical-Bayes encoding + DEFAULT | SHIPPED | `Smooth` enum `{ Auto, Fixed(F) }` (`Default`/`TargetEncoder::default` → `Auto`); `fit_feature_encoding` Auto branch (two-pass means/ssd, `lambda_ = y_variance*count/(y_variance*count+ssd/count)`, NaN→y_mean), `population_variance_f64` (ddof=0) computed once in `fit`; sklearn `_target_encoder_fast.pyx:140-165`, `_target_encoder.py:199`,`:416`. Consumer: `TargetEncoder::fit`/`fit_transform`/`default` (the `Smooth` field drives the encoding branch) + the public module path `ferrolearn_preprocess::target_encoder::Smooth` (`pub mod target_encoder` in `lib.rs`). Verify: pins `divergence_default_smooth_is_auto`/`divergence_smooth_auto_empirical_bayes` green (#2342 #2343) |
+//! | REQ-5 cross-fitting `fit_transform` (deterministic KFold) | SHIPPED | `TargetEncoder::fit_transform` cross-fits over `kfold_test_ranges` (contiguous no-shuffle folds, `cv` default 5), per-fold `fit_feature_encoding` on TRAIN rows → encode TEST rows (unseen-in-train → `y_train_mean`); sklearn `_target_encoder.py:232`,`:254-303`, `_split.py:521-534`. Consumer: crate re-export (`lib.rs`). Verify: pin `divergence_crossfit_fit_transform` green (#2344). NOTE: `shuffle`/`random_state` (REQ-8 NOT-STARTED) absent → deterministic `shuffle=False` KFold only |
 //! | REQ-6 `target_type` binary/multiclass | NOT-STARTED (#1266) | sklearn `_target_encoder.py:269-273`,`:376-379` |
 //! | REQ-7 `categories` param + `categories_`/`target_type_`/`classes_` | NOT-STARTED (#1267) | sklearn `_target_encoder.py:197`,`:358-381` |
 //! | REQ-8 `cv`/`shuffle`/`random_state` params | NOT-STARTED (#1268) | sklearn `_target_encoder.py:200-209` |
@@ -46,6 +46,34 @@ use ferrolearn_core::traits::{Fit, Transform};
 use ndarray::{Array1, Array2};
 use num_traits::Float;
 use std::collections::HashMap;
+
+/// The smoothing strategy for [`TargetEncoder`].
+///
+/// Mirrors scikit-learn's `smooth` parameter
+/// (`sklearn/preprocessing/_target_encoder.py:189`,
+/// `"smooth": [StrOptions({"auto"}), Interval(Real, 0, None, closed="left")]`),
+/// whose DEFAULT is the string `"auto"` (an empirical-Bayes estimate,
+/// `_target_encoder.py:85-89`) rather than a fixed numeric value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Smooth<F> {
+    /// `smooth="auto"` — the empirical-Bayes shrinkage estimate
+    /// (`_target_encoder_fast.pyx:140-165`): per category blend the category
+    /// mean toward the global mean by a `lambda_` derived from the
+    /// within-category sum-of-squared deviations vs the overall target variance.
+    Auto,
+    /// A fixed numeric smoothing factor `m` driving the m-estimate
+    /// `(smooth * y_mean + Σyᵢ) / (smooth + count)`
+    /// (`_target_encoder_fast.pyx:60-75`). Must be non-negative.
+    Fixed(F),
+}
+
+impl<F: Float> Default for Smooth<F> {
+    /// The default matches scikit-learn's constructor default `smooth="auto"`
+    /// (`_target_encoder.py:199`).
+    fn default() -> Self {
+        Smooth::Auto
+    }
+}
 
 /// Sum a slice reproducing NumPy's pairwise summation (the algorithm behind
 /// `np.add.reduce` / `np.mean`), so a ferrolearn mean bit-matches sklearn's
@@ -101,6 +129,133 @@ fn pairwise_sum<F: Float>(data: &[F]) -> F {
     }
 }
 
+/// `np.mean(y)` over the first `n` elements via NumPy pairwise summation
+/// (`_target_encoder.py:383` `target_mean_ = np.mean(y, axis=0)`).
+fn mean_pairwise<F: Float>(y: &Array1<F>, n: usize) -> F {
+    let total = if let Some(slice) = y.as_slice() {
+        pairwise_sum(slice)
+    } else {
+        let v: Vec<F> = y.iter().copied().collect();
+        pairwise_sum(&v)
+    };
+    total / F::from(n).unwrap_or_else(F::one)
+}
+
+/// The POPULATION variance of `y` (`np.var(y)`, ddof=0), computed in f64 to
+/// match scikit-learn's C `double` accumulation. sklearn evaluates
+/// `y_variance = np.var(y)` once per fit (`_target_encoder.py:416`) and feeds it
+/// into the empirical-Bayes `lambda_` (`_target_encoder_fast.pyx:152-156`).
+///
+/// `mean_f64` is the already-computed `np.mean(y)` (`np.var` subtracts the same
+/// mean); the squared deviations are reduced via NumPy pairwise summation, which
+/// `np.var` uses internally.
+fn population_variance_f64<F: Float>(y: &Array1<F>, mean_f64: f64) -> f64 {
+    let n = y.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let sq: Vec<f64> = y
+        .iter()
+        .map(|&v| {
+            let d = v.to_f64().unwrap_or(0.0) - mean_f64;
+            d * d
+        })
+        .collect();
+    pairwise_sum(&sq) / n as f64
+}
+
+/// Learn the per-category encoding for ONE feature column.
+///
+/// Dispatches on the [`Smooth`] strategy. All arithmetic is done in f64
+/// (matching sklearn's C `double` accumulators, `_target_encoder_fast.pyx:42,44`)
+/// then cast to `F`; for `F = f64` the round-trip is the identity.
+///
+/// - [`Smooth::Fixed`] reproduces `_fit_encoding_fast` (`:55-77`): seed each
+///   category with `(smooth*y_mean, smooth)`, add `(yᵢ, 1)` per sample, then
+///   `encoding = sum/count`, or `y_mean` when `count == 0`.
+/// - [`Smooth::Auto`] reproduces `_fit_encoding_fast_auto_smooth`
+///   (`:120-165`): two passes (mean, then sum-of-squared-diffs), a per-category
+///   `lambda_ = y_variance*count / (y_variance*count + ssd/count)`, blended as
+///   `lambda_*mean + (1-lambda_)*y_mean`; a NaN `lambda_` (count 0, or
+///   `y_variance == 0 && ssd == 0`) falls back to `y_mean`.
+fn fit_feature_encoding<F: Float>(
+    col: &[usize],
+    y: &Array1<F>,
+    smooth: Smooth<F>,
+    y_mean_f64: f64,
+    y_variance_f64: Option<f64>,
+) -> HashMap<usize, F> {
+    match smooth {
+        Smooth::Fixed(s) => {
+            let smooth_f64 = s.to_f64().unwrap_or(0.0);
+            // Seed each category's accumulator with `(smooth*y_mean, smooth)`,
+            // add each sample's `(yᵢ, 1)` in row order, then `sum/count`
+            // (`_target_encoder_fast.pyx:60-75`).
+            let mut stats: HashMap<usize, (f64, f64)> = HashMap::new();
+            for (i, &cat) in col.iter().enumerate() {
+                let entry = stats
+                    .entry(cat)
+                    .or_insert((smooth_f64 * y_mean_f64, smooth_f64));
+                entry.0 += y[i].to_f64().unwrap_or(0.0);
+                entry.1 += 1.0;
+            }
+            let mut map: HashMap<usize, F> = HashMap::new();
+            for (&cat, &(sum, count)) in &stats {
+                // `count` is `smooth + n_cat`; it is 0 only when smooth==0 AND
+                // the category has no rows — which cannot happen here since a
+                // category key exists only if a sample produced it. Guard anyway
+                // to mirror sklearn's `if counts[cat]==0 -> y_mean` (`:72-73`).
+                let encoded = if count == 0.0 {
+                    y_mean_f64
+                } else {
+                    sum / count
+                };
+                map.insert(cat, F::from(encoded).unwrap_or_else(F::zero));
+            }
+            map
+        }
+        Smooth::Auto => {
+            let y_variance = y_variance_f64.unwrap_or(0.0);
+            // First pass: per-category sum + count (-> means).
+            let mut sums: HashMap<usize, f64> = HashMap::new();
+            let mut counts: HashMap<usize, f64> = HashMap::new();
+            for (i, &cat) in col.iter().enumerate() {
+                *sums.entry(cat).or_insert(0.0) += y[i].to_f64().unwrap_or(0.0);
+                *counts.entry(cat).or_insert(0.0) += 1.0;
+            }
+            let means: HashMap<usize, f64> = sums
+                .iter()
+                .map(|(&cat, &s)| (cat, s / counts[&cat]))
+                .collect();
+            // Second pass: per-category sum of squared deviations from the mean
+            // (`_target_encoder_fast.pyx:143-149`).
+            let mut ssd: HashMap<usize, f64> = HashMap::new();
+            for (i, &cat) in col.iter().enumerate() {
+                let diff = y[i].to_f64().unwrap_or(0.0) - means[&cat];
+                *ssd.entry(cat).or_insert(0.0) += diff * diff;
+            }
+            let mut map: HashMap<usize, F> = HashMap::new();
+            for (&cat, &mean) in &means {
+                let count = counts[&cat];
+                let ssd_cat = ssd[&cat];
+                // lambda_ = y_variance*count / (y_variance*count + ssd/count)
+                // (`_target_encoder_fast.pyx:152-156`).
+                let denom = y_variance * count + ssd_cat / count;
+                let lambda = (y_variance * count) / denom;
+                let encoded = if lambda.is_nan() {
+                    // NaN when count==0 OR (y_variance==0 AND ssd==0): -> y_mean
+                    // (`_target_encoder_fast.pyx:157-161`).
+                    y_mean_f64
+                } else {
+                    lambda * mean + (1.0 - lambda) * y_mean_f64
+                };
+                map.insert(cat, F::from(encoded).unwrap_or_else(F::zero));
+            }
+            map
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TargetEncoder (unfitted)
 // ---------------------------------------------------------------------------
@@ -113,8 +268,14 @@ fn pairwise_sum<F: Float>(data: &[F]) -> F {
 ///
 /// # Parameters
 ///
-/// - `smooth` — smoothing factor (default 1.0). Higher values regularise more
-///   toward the global mean. Set to 0 for no smoothing.
+/// - `smooth` — the smoothing strategy ([`Smooth`]). The DEFAULT is
+///   [`Smooth::Auto`] (empirical Bayes), matching scikit-learn's constructor
+///   default `smooth="auto"` (`_target_encoder.py:199`). [`Smooth::Fixed`]
+///   selects the fixed m-estimate; higher values regularise more toward the
+///   global mean, `Fixed(0)` is no smoothing.
+/// - `cv` — the number of cross-fitting folds used by
+///   [`fit_transform`](TargetEncoder::fit_transform) (default 5, matching
+///   scikit-learn's `cv=5`, `_target_encoder.py:200`).
 ///
 /// # Examples
 ///
@@ -133,26 +294,59 @@ fn pairwise_sum<F: Float>(data: &[F]) -> F {
 #[must_use]
 #[derive(Debug, Clone)]
 pub struct TargetEncoder<F> {
-    /// Smoothing factor.
-    smooth: F,
+    /// Smoothing strategy.
+    smooth: Smooth<F>,
+    /// Number of cross-fitting folds for `fit_transform`.
+    cv: usize,
 }
 
 impl<F: Float + Send + Sync + 'static> TargetEncoder<F> {
-    /// Create a new `TargetEncoder` with the given smoothing factor.
+    /// Create a new `TargetEncoder` with a FIXED smoothing factor.
+    ///
+    /// This is shorthand for [`with_smooth`](Self::with_smooth) with
+    /// [`Smooth::Fixed`] and `cv = 5`.
     pub fn new(smooth: F) -> Self {
-        Self { smooth }
+        Self {
+            smooth: Smooth::Fixed(smooth),
+            cv: 5,
+        }
     }
 
-    /// Return the smoothing factor.
+    /// Create a new `TargetEncoder` with the given smoothing strategy and
+    /// `cv = 5` (matching scikit-learn's default).
+    pub fn with_smooth(smooth: Smooth<F>) -> Self {
+        Self { smooth, cv: 5 }
+    }
+
+    /// Set the number of cross-fitting folds used by
+    /// [`fit_transform`](Self::fit_transform).
+    pub fn with_cv(mut self, cv: usize) -> Self {
+        self.cv = cv;
+        self
+    }
+
+    /// Return the smoothing strategy.
     #[must_use]
-    pub fn smooth(&self) -> F {
+    pub fn smooth(&self) -> Smooth<F> {
         self.smooth
+    }
+
+    /// Return the number of cross-fitting folds.
+    #[must_use]
+    pub fn cv(&self) -> usize {
+        self.cv
     }
 }
 
 impl<F: Float + Send + Sync + 'static> Default for TargetEncoder<F> {
+    /// The default uses [`Smooth::Auto`] (empirical Bayes) and `cv = 5`,
+    /// matching scikit-learn's `TargetEncoder()` (`smooth="auto"`, `cv=5`,
+    /// `_target_encoder.py:199-200`).
     fn default() -> Self {
-        Self::new(F::one())
+        Self {
+            smooth: Smooth::Auto,
+            cv: 5,
+        }
     }
 }
 
@@ -216,7 +410,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<usize>, Array1<F>> for TargetE
                 context: "TargetEncoder::fit — y must have same length as x rows".into(),
             });
         }
-        if self.smooth < F::zero() {
+        if let Smooth::Fixed(s) = self.smooth
+            && s < F::zero()
+        {
             return Err(FerroError::InvalidParameter {
                 name: "smooth".into(),
                 reason: "smoothing factor must be non-negative".into(),
@@ -227,59 +423,162 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<usize>, Array1<F>> for TargetE
         // sklearn: target_mean_ = np.mean(y, axis=0) (_target_encoder.py:383),
         // which reduces via NumPy pairwise summation. Reproduce it bit-for-bit so
         // the mean matches on mixed-magnitude targets.
-        let global_mean = if let Some(slice) = y.as_slice() {
-            pairwise_sum(slice)
-        } else {
-            let v: Vec<F> = y.iter().copied().collect();
-            pairwise_sum(&v)
-        } / F::from(n_samples).unwrap_or_else(F::one);
-
-        let mut category_maps = Vec::with_capacity(n_features);
-
-        // sklearn accumulates the per-category sums/counts and the smoothing seed
-        // in C `double` REGARDLESS of the input `Y_DTYPE`, and `encodings_` is
-        // always float64 (`_target_encoder_fast.pyx:42,44,68` `double sums[...]`,
-        // `double counts[...]`, `sums[cat] += y[i]`). So accumulate per category in
-        // f64 even when `F = f32`, then cast the final per-category encoding to `F`.
-        // For `F = f64` this round-trip is the identity (#1263).
-        let smooth_f64 = self.smooth.to_f64().unwrap_or(0.0);
+        let global_mean = mean_pairwise(y, n_samples);
         let global_mean_f64 = global_mean.to_f64().unwrap_or(0.0);
 
+        // For `smooth="auto"` (empirical Bayes) sklearn needs the POPULATION
+        // variance of the full target, computed once per fit
+        // (`_target_encoder.py:416` `y_variance = np.var(y)`).
+        let y_variance_f64 = match self.smooth {
+            Smooth::Auto => Some(population_variance_f64(y, global_mean_f64)),
+            Smooth::Fixed(_) => None,
+        };
+
+        let mut category_maps = Vec::with_capacity(n_features);
         for j in 0..n_features {
-            // Collect (sum, count) per category. Match sklearn's
-            // `_target_encoder_fast.pyx:60-75` bit-for-bit: seed each category's
-            // accumulator with `smooth * y_mean` FIRST (`:60` `sums[cat]=smooth_sum`),
-            // then add each target sequentially in row order (`:68` `sums[cat]+=y[i]`).
-            // So the accumulated f64 is `smooth*y_mean + y[0] + y[1] + ...`.
-            let mut cat_stats: HashMap<usize, (f64, usize)> = HashMap::new();
-            for i in 0..n_samples {
-                let cat = x[[i, j]];
-                let entry = cat_stats
-                    .entry(cat)
-                    .or_insert_with(|| (smooth_f64 * global_mean_f64, 0usize));
-                entry.0 += y[i].to_f64().unwrap_or(0.0);
-                entry.1 += 1;
-            }
-
-            // Per category: `encoding = sums[cat] / counts[cat]`
-            // (`_target_encoder_fast.pyx:75`), where `counts[cat] = smooth + count`
-            // (count seeded from `smooth` at `:61`) and `sums[cat]` already includes
-            // the `smooth*y_mean` seed. i.e. `(smooth*y_mean + Σyᵢ) / (smooth + count)`,
-            // all in f64 (matching sklearn's C double), then cast to `F`.
-            let mut cat_map: HashMap<usize, F> = HashMap::new();
-            for (&cat, &(sum, count)) in &cat_stats {
-                let count_f = count as f64;
-                let encoded_f64 = sum / (smooth_f64 + count_f);
-                cat_map.insert(cat, F::from(encoded_f64).unwrap_or_else(F::zero));
-            }
-
-            category_maps.push(cat_map);
+            let col: Vec<usize> = (0..n_samples).map(|i| x[[i, j]]).collect();
+            category_maps.push(fit_feature_encoding(
+                &col,
+                y,
+                self.smooth,
+                global_mean_f64,
+                y_variance_f64,
+            ));
         }
 
         Ok(FittedTargetEncoder {
             category_maps,
             global_mean,
         })
+    }
+}
+
+/// The contiguous (un-shuffled) KFold test-index folds over `n` samples.
+///
+/// Mirrors scikit-learn's `KFold._iter_test_indices`
+/// (`sklearn/model_selection/_split.py:521-534`) with `shuffle=False`: the
+/// indices are `0..n` in order, split into `k` consecutive folds where the
+/// first `n % k` folds have size `n // k + 1` and the rest `n // k`. Returns a
+/// vec of `(test_start, test_end)` half-open ranges.
+fn kfold_test_ranges(n: usize, k: usize) -> Vec<(usize, usize)> {
+    let base = n / k;
+    let rem = n % k;
+    let mut ranges = Vec::with_capacity(k);
+    let mut current = 0usize;
+    for fold in 0..k {
+        let size = base + usize::from(fold < rem);
+        ranges.push((current, current + size));
+        current += size;
+    }
+    ranges
+}
+
+impl<F: Float + Send + Sync + 'static> TargetEncoder<F> {
+    /// Cross-fitting `fit_transform`: encode each row using encodings learned on
+    /// the OTHER folds, preventing target leakage.
+    ///
+    /// Mirrors scikit-learn's `TargetEncoder.fit_transform`
+    /// (`sklearn/preprocessing/_target_encoder.py:232-303`): for the
+    /// continuous/binary single-output case it uses a deterministic `KFold`
+    /// (`cv` folds, NO shuffle — ferrolearn exposes no `shuffle`/`random_state`,
+    /// so this is sklearn's reproducible `shuffle=False` path, `:262`); for each
+    /// `(train, test)` fold it fits the per-feature encodings on the TRAIN rows
+    /// (with that fold's `y_train_mean`) and writes the TEST rows through those
+    /// train-encodings (`:277-302`). A category unseen in the train fold encodes
+    /// to `y_train_mean` (the `count == 0 -> y_mean` rule, mirroring
+    /// `_transform_X_ordinal`'s unknown-category fallback, `:494-497`).
+    ///
+    /// Note `fit(X,y).transform(X)` does NOT equal `fit_transform(X,y)`
+    /// (`:235-238`): `transform` uses the full-data `encodings_`, `fit_transform`
+    /// is cross-fit.
+    ///
+    /// # Errors
+    ///
+    /// - [`FerroError::InsufficientSamples`] if the input has zero rows.
+    /// - [`FerroError::ShapeMismatch`] if `x` rows and `y` length differ.
+    /// - [`FerroError::InvalidParameter`] if a [`Smooth::Fixed`] factor is
+    ///   negative, or if `cv < 2` / `cv` exceeds the sample count (sklearn
+    ///   requires `cv >= 2`, `_target_encoder.py:190`, and `KFold` rejects more
+    ///   splits than samples, `_split.py:408-414`).
+    pub fn fit_transform(&self, x: &Array2<usize>, y: &Array1<F>) -> Result<Array2<F>, FerroError> {
+        let n_samples = x.nrows();
+        if n_samples == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "TargetEncoder::fit_transform".into(),
+            });
+        }
+        if y.len() != n_samples {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![y.len()],
+                context: "TargetEncoder::fit_transform — y must have same length as x rows".into(),
+            });
+        }
+        if let Smooth::Fixed(s) = self.smooth
+            && s < F::zero()
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "smooth".into(),
+                reason: "smoothing factor must be non-negative".into(),
+            });
+        }
+        // sklearn `_parameter_constraints` requires `cv >= 2`
+        // (`_target_encoder.py:190`); `KFold` additionally rejects more splits
+        // than samples (`_split.py:408-414`).
+        if self.cv < 2 {
+            return Err(FerroError::InvalidParameter {
+                name: "cv".into(),
+                reason: "cv must be at least 2".into(),
+            });
+        }
+        if self.cv > n_samples {
+            return Err(FerroError::InvalidParameter {
+                name: "cv".into(),
+                reason: "cv cannot exceed the number of samples".into(),
+            });
+        }
+
+        let n_features = x.ncols();
+        let mut out = Array2::zeros((n_samples, n_features));
+
+        for (test_start, test_end) in kfold_test_ranges(n_samples, self.cv) {
+            // Train indices are everything OUTSIDE the contiguous test fold.
+            let train_idx: Vec<usize> = (0..n_samples)
+                .filter(|&i| i < test_start || i >= test_end)
+                .collect();
+
+            // y_train_mean = np.mean(y[train]) (`_target_encoder.py:279`).
+            let y_train: Vec<F> = train_idx.iter().map(|&i| y[i]).collect();
+            let y_train_arr = Array1::from(y_train);
+            let train_mean = mean_pairwise(&y_train_arr, train_idx.len());
+            let train_mean_f64 = train_mean.to_f64().unwrap_or(0.0);
+            let train_var_f64 = match self.smooth {
+                Smooth::Auto => Some(population_variance_f64(&y_train_arr, train_mean_f64)),
+                Smooth::Fixed(_) => None,
+            };
+
+            for j in 0..n_features {
+                // Fit this fold's per-feature encoding on the TRAIN rows.
+                let train_col: Vec<usize> = train_idx.iter().map(|&i| x[[i, j]]).collect();
+                let enc = fit_feature_encoding(
+                    &train_col,
+                    &y_train_arr,
+                    self.smooth,
+                    train_mean_f64,
+                    train_var_f64,
+                );
+                // Encode the TEST rows; a category unseen in the train fold ->
+                // the train y_mean (`_transform_X_ordinal`, `:494-497`).
+                for i in test_start..test_end {
+                    let cat = x[[i, j]];
+                    out[[i, j]] = *enc.get(&cat).unwrap_or(&train_mean);
+                }
+            }
+        }
+
+        Ok(out)
     }
 }
 
@@ -422,8 +721,13 @@ mod tests {
 
     #[test]
     fn test_target_encoder_default() {
+        // sklearn's DEFAULT is smooth="auto" (`_target_encoder.py:199`), NOT a
+        // fixed value; `new(F)` is the explicit fixed-smooth constructor.
         let enc = TargetEncoder::<f64>::default();
-        assert_abs_diff_eq!(enc.smooth(), 1.0, epsilon = 1e-10);
+        assert_eq!(enc.smooth(), Smooth::Auto);
+        assert_eq!(enc.cv(), 5);
+        let fixed = TargetEncoder::<f64>::new(1.0);
+        assert_eq!(fixed.smooth(), Smooth::Fixed(1.0));
     }
 
     #[test]
