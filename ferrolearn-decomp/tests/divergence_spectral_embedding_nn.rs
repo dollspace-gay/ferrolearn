@@ -9,18 +9,18 @@
 //! as one of its own `n_neighbors`, and the symmetrization AVERAGES (weight
 //! 0.5 for one-directional edges, 1.0 for mutual edges).
 //!
-//! ferrolearn's `Affinity::NearestNeighbors` instead:
-//!   - EXCLUDES self when selecting the `k` nearest (so each point keeps `k`
-//!     genuine neighbors rather than `k-1`),
-//!   - symmetrizes by UNION with weight 1.0 (not 0.5 averaging),
-//!   - sets the diagonal to 0 (irrelevant — `csgraph_laplacian` zeroes it).
-//! (`ferrolearn-decomp/src/spectral_embedding.rs:202-232`).
+//! ferrolearn's `Affinity::NearestNeighbors` arm
+//! (`ferrolearn-decomp/src/spectral_embedding.rs`) now mirrors this exactly:
+//!   - INCLUDES self as the first of the `n_neighbors` neighbors (each row of
+//!     the connectivity matrix `A` has `k` ones: self + the `k-1` nearest
+//!     others),
+//!   - symmetrizes by AVERAGING `0.5 * (A + A.T)`,
+//!   - zeroes the self-loop diagonal so the off-diagonal-row-sum degree / `dd`
+//!     / normalized Laplacian match scipy's `csgraph_laplacian` (which ignores
+//!     self-loops), exactly as the RBF arm relies on.
 //!
-//! These different affinity graphs yield a DIFFERENT normalized Laplacian and
-//! hence a DIFFERENT embedding. The divergence is NOT a free sign: it survives
-//! any per-column sign flip (min max-abs difference ~0.35, far above 1e-6).
-//!
-//! Tracking: #2409.
+//! This test pins that parity (was a divergence of ~0.35, far above 1e-6, that
+//! survived any per-column sign flip). Tracking: #2409.
 
 use ferrolearn_core::traits::Fit;
 use ferrolearn_decomp::{Affinity, SpectralEmbedding};
@@ -70,7 +70,6 @@ fn signed_col_maxdiff(ferro: &Array2<f64>, sk: &[f64; 5], col: usize) -> f64 {
 /// structurally different embedding (e.g. col0 ≈ [0.408, 0, 0, 0, -0.408]).
 /// The mismatch survives any per-column sign flip.
 #[test]
-#[ignore = "divergence: nearest_neighbors affinity (include_self + 0.5 symmetrization) mismatch; tracking #2409"]
 fn divergence_spectral_embedding_nearest_neighbors_affinity() {
     let x = line5();
     let se = SpectralEmbedding::new(2).with_affinity(Affinity::NearestNeighbors { n_neighbors: 3 });

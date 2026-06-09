@@ -200,9 +200,20 @@ fn build_affinity_matrix(x: &Array2<f64>, affinity: &Affinity) -> Array2<f64> {
             w
         }
         Affinity::NearestNeighbors { n_neighbors } => {
-            let k = *n_neighbors;
-            let mut w = Array2::<f64>::zeros((n, n));
-            // Compute all pairwise distances.
+            // Mirror sklearn's `kneighbors_graph(X, n_neighbors_,
+            // include_self=True, mode='connectivity')` followed by the
+            // `0.5 * (A + A.T)` symmetrization
+            // (`sklearn/manifold/_spectral_embedding.py:703-709`).
+            //
+            // `include_self=True` marks each sample as the FIRST of its own
+            // `n_neighbors` neighbors (`sklearn/neighbors/_graph.py:34-43`,
+            // `_query_include_self`), so each row of the connectivity matrix
+            // `A` has EXACTLY `k` ones: the point itself plus the `k - 1`
+            // nearest OTHER points. Clamp `k` to `n` so we never overrun the
+            // sample count (R-CODE-2: never panic — `fit` already rejects
+            // `n_neighbors >= n`, this is defence in depth).
+            let k = (*n_neighbors).min(n);
+            // Compute all pairwise squared distances.
             let mut sq_dist = Array2::<f64>::zeros((n, n));
             for i in 0..n {
                 for j in (i + 1)..n {
@@ -215,18 +226,41 @@ fn build_affinity_matrix(x: &Array2<f64>, affinity: &Affinity) -> Array2<f64> {
                     sq_dist[[j, i]] = sq;
                 }
             }
-            // For each point, find k nearest neighbors.
+            // Build the (asymmetric) connectivity matrix `A`: for each point
+            // `i`, set `A[i][i] = 1` (self) and `A[i][j] = 1` for the `k - 1`
+            // nearest OTHER points `j`. Ties are broken by ascending index
+            // (a STABLE sort over index-ordered candidates), matching numpy's
+            // `argpartition`/`argsort` stable tie-break.
+            let mut a = Array2::<f64>::zeros((n, n));
             for i in 0..n {
-                let mut neighbors: Vec<(f64, usize)> = (0..n)
+                a[[i, i]] = 1.0; // self is the first neighbor (include_self=True)
+                let mut others: Vec<(f64, usize)> = (0..n)
                     .filter(|&j| j != i)
                     .map(|j| (sq_dist[[i, j]], j))
                     .collect();
-                neighbors
-                    .sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                for &(_, j) in neighbors.iter().take(k) {
-                    w[[i, j]] = 1.0;
-                    w[[j, i]] = 1.0; // symmetric
+                // Stable sort by distance; equal distances keep ascending-index
+                // order (the Vec is built in ascending `j` order).
+                others.sort_by(|p, q| p.0.partial_cmp(&q.0).unwrap_or(std::cmp::Ordering::Equal));
+                for &(_, j) in others.iter().take(k.saturating_sub(1)) {
+                    a[[i, j]] = 1.0;
                 }
+            }
+            // Symmetrize by AVERAGING: `0.5 * (A + A.T)`. A one-directional
+            // edge → 0.5, a bidirectional edge → 1.0, the self-diagonal → 1.0.
+            let mut w = Array2::<f64>::zeros((n, n));
+            for i in 0..n {
+                for j in 0..n {
+                    w[[i, j]] = 0.5 * (a[[i, j]] + a[[j, i]]);
+                }
+            }
+            // Zero the self-loop diagonal. scipy's `csgraph_laplacian(normed=True)`
+            // (which sklearn applies to the symmetrized affinity) IGNORES the
+            // matrix diagonal — the degree is the OFF-diagonal row-sum — so
+            // dropping the `1.0` self-loop here makes the downstream degree /
+            // `dd` / normalized Laplacian match scipy (and hence sklearn)
+            // exactly, exactly as the RBF arm relies on (`W_ii = 0`).
+            for i in 0..n {
+                w[[i, i]] = 0.0;
             }
             w
         }
