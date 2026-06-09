@@ -281,6 +281,19 @@ fn fit_chain(
                     ),
                 });
             }
+            // sklearn `_BaseChain.fit` (`sklearn/multioutput.py:733`):
+            //   `elif sorted(self.order_) != list(range(Y.shape[1])):`
+            //   `    raise ValueError("invalid order")`
+            // `order` must be a PERMUTATION of `0..n_targets`, not merely the
+            // right length — a duplicate/out-of-range index would alias a column.
+            let mut sorted_order = o.clone();
+            sorted_order.sort_unstable();
+            if sorted_order.iter().copied().ne(0..n_targets) {
+                return Err(FerroError::InvalidParameter {
+                    name: "order".into(),
+                    reason: "invalid order".into(),
+                });
+            }
             o.clone()
         }
         None => (0..n_targets).collect(),

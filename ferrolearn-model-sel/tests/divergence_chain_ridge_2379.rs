@@ -44,6 +44,10 @@ struct FittedRidge {
     intercept: f64,
 }
 
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit i/j/c index arithmetic in Gaussian elimination"
+)]
 fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
     let n = b.len();
     for col in 0..n {
@@ -72,6 +76,10 @@ fn solve(mut a: Vec<Vec<f64>>, mut b: Vec<f64>) -> Vec<f64> {
 }
 
 impl PipelineEstimator<f64> for RidgeBase {
+    #[allow(
+        clippy::needless_range_loop,
+        reason = "explicit i/j index arithmetic building the ridge normal equations"
+    )]
     fn fit_pipeline(
         &self,
         x: &Array2<f64>,
@@ -223,6 +231,10 @@ fn assert_close(p: &Array2<f64>, expected: &[[f64; 2]], tol: f64, label: &str) {
 // (instead of true y0) P[0,1] would be ~5.306, not 5.139.
 // ---------------------------------------------------------------------------
 #[test]
+#[allow(
+    clippy::excessive_precision,
+    reason = "verbatim live sklearn 1.5.2 oracle literals; truncating would change the compared bits"
+)]
 fn regressor_chain_ridge_predict_default_order() {
     const SK: [[f64; 2]; 3] = [
         [3.909449244060475, 5.139146868250540],
@@ -250,6 +262,10 @@ fn regressor_chain_ridge_predict_default_order() {
 // target1 was fitted first. A chain-order leak would swap the columns.
 // ---------------------------------------------------------------------------
 #[test]
+#[allow(
+    clippy::excessive_precision,
+    reason = "verbatim live sklearn 1.5.2 oracle literals; truncating would change the compared bits"
+)]
 fn regressor_chain_ridge_predict_order_reversed() {
     const SK: [[f64; 2]; 3] = [
         [3.909449244060475, 5.139146868250540],
@@ -278,6 +294,10 @@ fn regressor_chain_ridge_predict_order_reversed() {
 //   #     [2.906695464362851, 4.084881209503239, 4.299546436285097]]
 // ---------------------------------------------------------------------------
 #[test]
+#[allow(
+    clippy::excessive_precision,
+    reason = "verbatim live sklearn 1.5.2 oracle literals; truncating would change the compared bits"
+)]
 fn regressor_chain_ridge_predict_three_targets_order_201() {
     const SK: [[f64; 3]; 3] = [
         [3.909449244060475, 5.139146868250539, 5.024924406047516],
