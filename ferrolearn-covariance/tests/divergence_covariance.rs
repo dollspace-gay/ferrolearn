@@ -93,7 +93,6 @@ fn green_empirical_covariance_parity() {
 // Tracking: #1701
 // ===========================================================================
 #[test]
-#[ignore = "divergence: precision_ inverts cov+1e-8*I (cholesky reg) vs sklearn exact pinvh _empirical_covariance.py:216; tracking #1701"]
 #[allow(
     clippy::needless_range_loop,
     reason = "explicit i/j index compare of ndarray vs nested-Vec sklearn oracle"

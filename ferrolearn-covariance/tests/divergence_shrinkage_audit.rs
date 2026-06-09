@@ -37,8 +37,10 @@ use ndarray::{Array2, array};
 //   (max abs diff ~4569, ~0.76% relative) — DIVERGES >> 1e-7.
 // ===========================================================================
 #[test]
-#[ignore = "divergence: precision_ inverts cov+1e-8*I (cholesky reg); small-variance data blows up vs sklearn pinvh _empirical_covariance.py:216; tracking #2358"]
-#[allow(clippy::needless_range_loop, reason = "explicit index compare vs oracle")]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "explicit index compare vs oracle"
+)]
 fn divergence_precision_small_variance_blowup() {
     let x: Array2<f64> = array![
         [0.001, 0.002],
@@ -82,7 +84,6 @@ fn divergence_precision_small_variance_blowup() {
 //   ferrolearn returns shrinkage_ == 1.0 — DIVERGES.
 // ===========================================================================
 #[test]
-#[ignore = "divergence: LedoitWolf shrinkage_ for n_features==1 is sklearn 0.0 (hard-coded _shrunk_covariance.py:30-33) but ferrolearn 1.0 (delta=0 branch); tracking #2359"]
 fn divergence_ledoit_wolf_single_feature_shrinkage() {
     let x: Array2<f64> = array![[1.0], [2.0], [4.0], [8.0], [3.0]];
     // sklearn 1.5.2 live oracle: LedoitWolf().fit(X).shrinkage_
@@ -110,7 +111,6 @@ fn divergence_ledoit_wolf_single_feature_shrinkage() {
 //   ferrolearn returns shrinkage_ == 1.0 — DIVERGES.
 // ===========================================================================
 #[test]
-#[ignore = "divergence: OAS shrinkage_ for n_features==1 is sklearn 0.0 (hard-coded _shrunk_covariance.py:57-61) but ferrolearn 1.0 (den==0 branch); tracking #2360"]
 fn divergence_oas_single_feature_shrinkage() {
     let x: Array2<f64> = array![[1.0], [2.0], [4.0], [8.0], [3.0]];
     // sklearn 1.5.2 live oracle: OAS().fit(X).shrinkage_

@@ -47,10 +47,10 @@
 //! | REQ | Behavior | Status | Evidence |
 //! |-----|----------|--------|----------|
 //! | REQ-1 | EmpiricalCovariance `covariance_`/`location_` (biased MLE) | SHIPPED | `fn fit` (`empirical_cov`, ddof=0); `green_empirical_covariance_parity` vs live oracle |
-//! | REQ-1b | `precision_` exact (sklearn `pinvh`) | NOT-STARTED | `cholesky` adds `reg=1e-8` to the diagonal → `precision_` off `~1.7e-8` (`_empirical_covariance.py:216`) — blocker #1705 |
+//! | REQ-1b | `precision_` exact (sklearn `pinvh`) | SHIPPED | `fn pinvh` (Jacobi `eigh`; `cutoff = max(\|s\|)·N·eps`, scipy default `atol=0`, `rtol=N·eps`; `A⁺ = Σ_{\|λ\|>cutoff} v_k v_kᵀ/λ_k`) replaces `spd_inverse(&cov)?` at the EmpiricalCovariance/ShrunkCovariance/LedoitWolf/OAS precision sites; NO `1e-8` reg (`_empirical_covariance.py:212`); consumer = `pub fn fit for EmpiricalCovariance`; ill-conditioned `divergence_precision_small_variance_blowup` (cov~1e-6 → precision~6e5 bit-matches), well-conditioned tests unchanged |
 //! | REQ-2 | ShrunkCovariance `(1-s)·emp + s·(tr/p)·I` | SHIPPED | `fn fit`; `green_shrunk_covariance_parity` |
-//! | REQ-3 | LedoitWolf `shrinkage_` + `covariance_` | SHIPPED | `fn fit`; `green_ledoit_wolf_parity` |
-//! | REQ-4 | OAS shrinkage formula (sklearn 1.5.2) | SHIPPED | `fn fit` = `num=alpha+mu²`, `den=(n+1)(alpha−mu²/p)` (`_shrunk_covariance.py:79-87`, fixed #1702); `divergence_oas_formula` |
+//! | REQ-3 | LedoitWolf `shrinkage_` + `covariance_` | SHIPPED | `fn fit`; `green_ledoit_wolf_parity`; p=1 hard-codes `shrinkage_=0.0` (`_shrunk_covariance.py:30-33`), `divergence_ledoit_wolf_single_feature_shrinkage` |
+//! | REQ-4 | OAS shrinkage formula (sklearn 1.5.2) | SHIPPED | `fn fit` = `num=alpha+mu²`, `den=(n+1)(alpha−mu²/p)` (`_shrunk_covariance.py:79-87`, fixed #1702); `divergence_oas_formula`; p=1 hard-codes `shrinkage_=0.0` (`_shrunk_covariance.py:57-61`), `divergence_oas_single_feature_shrinkage` |
 //! | REQ-5 | MinCovDet exact `support_`/`raw_*`/`covariance_` | NOT-STARTED | FastMCD RNG carve-out (numpy MT vs Xoshiro), R-DEFER-3 — blocker #1706 |
 //! | REQ-6 | MCD support size `h` | SHIPPED | structural (`h` from `support_fraction`) |
 //! | REQ-7 | MCD consistency correction + reweighting | SHIPPED | structural (SPD output; chi² uses Wilson-Hilferty approx vs scipy `chi2.isf`, see #1706) |
@@ -205,6 +205,125 @@ fn spd_inverse<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Result<Array2
         }
     }
     Ok(inv)
+}
+
+/// Hermitian (symmetric) pseudo-inverse, matching `scipy.linalg.pinvh`.
+///
+/// sklearn computes `precision_ = linalg.pinvh(covariance, check_finite=False)`
+/// (`_empirical_covariance.py:212`) for every deterministic covariance
+/// estimator (`EmpiricalCovariance._set_covariance`). `scipy.linalg.pinvh`
+/// pseudo-inverts a symmetric matrix via its eigendecomposition:
+///
+/// ```text
+/// s, u = eigh(A)                  # eigenvalues s, eigenvectors u (columns)
+/// cutoff = atol + max(|s|) * rtol # atol = 0, rtol = max(A.shape) * eps  (defaults)
+/// keep   = |s| > cutoff
+/// A^+    = (u[:, keep] / s[keep]) @ u[:, keep]^T
+/// ```
+///
+/// Unlike a Cholesky inverse with a fixed diagonal regularisation, this adds
+/// NO perturbation to the matrix, so on ill-conditioned covariances (tiny
+/// eigenvalues) the precision matches sklearn exactly rather than diverging by
+/// the regularisation term. On a well-conditioned matrix every eigenvalue
+/// survives the cutoff and the result equals the ordinary inverse.
+///
+/// The eigendecomposition uses the cyclic Jacobi method (the matrix is
+/// symmetric by construction here, so all eigenvalues/eigenvectors are real),
+/// mirroring `scipy.linalg.eigh`'s symmetric solver. `cutoff` reproduces
+/// scipy's default `atol=0`, `rtol = max(M, N) * finfo(dtype).eps`.
+fn pinvh<F: Float + Send + Sync + 'static>(a: &Array2<F>) -> Array2<F> {
+    let n = a.nrows();
+    if n == 0 {
+        return Array2::<F>::zeros((0, 0));
+    }
+
+    // Cyclic Jacobi eigenvalue decomposition of the symmetric matrix `a`.
+    // After convergence the diagonal of `m` holds the eigenvalues and the
+    // columns of `v` the corresponding (orthonormal) eigenvectors.
+    let mut m = a.clone();
+    let mut v = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        v[[i, i]] = F::one();
+    }
+    let two = F::one() + F::one();
+    let max_sweeps = 100usize;
+    for _ in 0..max_sweeps {
+        // Off-diagonal Frobenius magnitude; stop once negligible.
+        let mut off = F::zero();
+        for p in 0..n {
+            for q in (p + 1)..n {
+                off = off + m[[p, q]] * m[[p, q]];
+            }
+        }
+        if off.sqrt() <= F::epsilon() {
+            break;
+        }
+        for p in 0..n {
+            for q in (p + 1)..n {
+                if m[[p, q]] == F::zero() {
+                    continue;
+                }
+                let app = m[[p, p]];
+                let aqq = m[[q, q]];
+                let apq = m[[p, q]];
+                let theta = (aqq - app) / (two * apq);
+                let sign = if theta >= F::zero() {
+                    F::one()
+                } else {
+                    -F::one()
+                };
+                let t = sign / (theta.abs() + (theta * theta + F::one()).sqrt());
+                let c = F::one() / (t * t + F::one()).sqrt();
+                let s = t * c;
+                // Apply the Givens rotation J^T A J to rows/columns p, q.
+                for k in 0..n {
+                    let mkp = m[[k, p]];
+                    let mkq = m[[k, q]];
+                    m[[k, p]] = c * mkp - s * mkq;
+                    m[[k, q]] = s * mkp + c * mkq;
+                }
+                for k in 0..n {
+                    let mpk = m[[p, k]];
+                    let mqk = m[[q, k]];
+                    m[[p, k]] = c * mpk - s * mqk;
+                    m[[q, k]] = s * mpk + c * mqk;
+                }
+                for k in 0..n {
+                    let vkp = v[[k, p]];
+                    let vkq = v[[k, q]];
+                    v[[k, p]] = c * vkp - s * vkq;
+                    v[[k, q]] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+
+    // cutoff = max(|s|) * (max(M, N) * eps); scipy default atol=0, rtol=N*eps.
+    let mut max_eig = F::zero();
+    for i in 0..n {
+        let e = m[[i, i]].abs();
+        if e > max_eig {
+            max_eig = e;
+        }
+    }
+    let n_f = F::from(n).unwrap_or_else(F::one);
+    let cutoff = max_eig * (n_f * F::epsilon());
+
+    // A^+ = sum_{k : |lambda_k| > cutoff} (1/lambda_k) v_k v_k^T.
+    let mut inv = Array2::<F>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            let mut acc = F::zero();
+            for k in 0..n {
+                let lam = m[[k, k]];
+                if lam.abs() > cutoff {
+                    acc = acc + v[[i, k]] * (F::one() / lam) * v[[j, k]];
+                }
+            }
+            inv[[i, j]] = acc;
+        }
+    }
+    inv
 }
 
 /// Compute Mahalanobis distances for each row of `x` given location and precision.
@@ -580,7 +699,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for EmpiricalCovarianc
         };
 
         let cov = empirical_cov(x, &location, self.assume_centered);
-        let precision = spd_inverse(&cov)?;
+        // sklearn: precision_ = pinvh(covariance_) (`_empirical_covariance.py:212`).
+        let precision = pinvh(&cov);
 
         Ok(FittedCovariance {
             covariance_: cov,
@@ -682,7 +802,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for ShrunkCovariance<F
 
         let cov_emp = empirical_cov(x, &location, self.assume_centered);
         let cov = shrink_covariance(&cov_emp, self.shrinkage, p);
-        let precision = spd_inverse(&cov)?;
+        // sklearn: precision_ = pinvh(covariance_) (`_empirical_covariance.py:212`).
+        let precision = pinvh(&cov);
 
         Ok(FittedCovariance {
             covariance_: cov,
@@ -903,8 +1024,13 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LedoitWolf<F> {
         }
         let beta = beta_sum / (n_f * n_f * p_f * p_f);
 
-        // Optimal shrinkage
-        let shrinkage = if delta > F::zero() {
+        // Optimal shrinkage. sklearn `_ledoit_wolf` hard-codes `0.0` for a
+        // single feature ("the result is the same whatever the shrinkage",
+        // `_shrunk_covariance.py:30-33`) — the general formula's `delta == 0`
+        // branch would otherwise yield 1.0.
+        let shrinkage = if p == 1 {
+            F::zero()
+        } else if delta > F::zero() {
             let ratio = beta / delta;
             if ratio < F::zero() {
                 F::zero()
@@ -918,7 +1044,8 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for LedoitWolf<F> {
         };
 
         let cov = shrink_covariance(&s, shrinkage, p);
-        let precision = spd_inverse(&cov)?;
+        // sklearn: precision_ = pinvh(covariance_) (`_empirical_covariance.py:212`).
+        let precision = pinvh(&cov);
 
         Ok(FittedLedoitWolf {
             inner: FittedCovariance {
@@ -1104,21 +1231,29 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for OAS<F> {
         //   num   = alpha + mu^2
         //   den   = (n_samples + 1) * (alpha - mu^2 / n_features)
         //   shrinkage = 1.0 if den == 0 else min(num / den, 1.0)
-        let mu = trace(&s) / p_f;
-        let alpha = trace_sq(&s) / (p_f * p_f);
-        let mu_sq = mu * mu;
-        let num = alpha + mu_sq;
-        let den = (n_f + F::one()) * (alpha - mu_sq / p_f);
-
-        let shrinkage = if den == F::zero() {
-            F::one()
+        // sklearn `_oas` hard-codes `shrinkage = 0.0` for a single feature
+        // ("the result is the same whatever the shrinkage",
+        // `_shrunk_covariance.py:57-61`) — the general formula's `den == 0`
+        // branch (alpha == mu²/p when p==1) would otherwise yield 1.0.
+        let shrinkage = if p == 1 {
+            F::zero()
         } else {
-            let ratio = num / den;
-            if ratio > F::one() { F::one() } else { ratio }
+            let mu = trace(&s) / p_f;
+            let alpha = trace_sq(&s) / (p_f * p_f);
+            let mu_sq = mu * mu;
+            let num = alpha + mu_sq;
+            let den = (n_f + F::one()) * (alpha - mu_sq / p_f);
+            if den == F::zero() {
+                F::one()
+            } else {
+                let ratio = num / den;
+                if ratio > F::one() { F::one() } else { ratio }
+            }
         };
 
         let cov = shrink_covariance(&s, shrinkage, p);
-        let precision = spd_inverse(&cov)?;
+        // sklearn: precision_ = pinvh(covariance_) (`_empirical_covariance.py:212`).
+        let precision = pinvh(&cov);
 
         Ok(FittedOAS {
             inner: FittedCovariance {
