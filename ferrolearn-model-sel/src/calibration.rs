@@ -34,6 +34,7 @@
 //! | REQ | Status | Notes |
 //! |---|---|---|
 //! | REQ-SIGMOID (Platt calibrated probabilities) | SHIPPED | `fit_sigmoid` Newton on the convex Platt NLL with targets `t_pos=(n_pos+1)/(n_pos+2)`, `t_neg=1/(n_neg+2)` (`:827-829`); same convex minimum as sklearn `_sigmoid_calibration` L-BFGS-B (sign reparam `a=-A`). Matches live oracle to 6.66e-9 for scores under the rescale threshold. Guards `green_sigmoid_well_separated_matches_oracle`, `green_sigmoid_mixed_nonseparable_matches_oracle`. |
+//! | REQ-LABEL-BINARIZE (binary positive = greater sorted class) | SHIPPED | `fn positive_class_label` returns the GREATER of the two observed labels (`labels.max()`), consumed by `fit_sigmoid` (n_pos/n_neg counts + target assignment) and `fit_isotonic` (`l == positive_class -> 1.0`). Mirrors sklearn `Y = label_binarize(y, classes=classes)` (`calibration.py:664`) keeping the last (greatest sorted) class column as positive `1` (`preprocessing/_label.py:531-600`, `Y = Y[:, -1]`). For `{0,1}` positive=`1` (UNCHANGED — no regression), `{1,2}`→`2`, `{0,2}`→`2`. Pins `divergence_sigmoid_binary_classes_1_2`, `divergence_sigmoid_binary_classes_0_2`, `divergence_isotonic_binary_classes_1_2` (live oracle, #2372/#2373). The A/B Newton numeric core + isotonic PAVA are unchanged — only the positive-class selection. |
 //! | REQ-ISOTONIC (isotonic calibrated probabilities) | SHIPPED | `fit_isotonic` PAV with sklearn `_make_unique` tie pre-averaging (`isotonic.py:319-322`, fixed #1810) + block-ENDPOINT breakpoints `(lo,mean)`/`(hi,mean)` reproducing `IsotonicRegression(out_of_bounds="clip")` `X_thresholds_`/`y_thresholds_` (flat-within-block, ramp-between) — was block-midpoint breakpoints (fixed #1800). Matches live oracle across monotone/heavy-pool/OOB/single-block/decreasing/tied cases. Tests `divergence_isotonic_breakpoints_1800`, `divergence_isotonic_tied_scores_make_unique`. |
 //! | REQ-ENSEMBLE (ensemble=True default — K averaged calibrators) | NOT-STARTED | ferrolearn does the `ensemble=False` single-calibrator path; sklearn default `ensemble=True` averages K per-fold calibrated classifiers (`:411-426`,`:474-500`). Architectural. Blocker #1801. |
 //! | REQ-STRATIFIED-CV (cv=None ⇒ StratifiedKFold) | NOT-STARTED | plain non-stratified `kfold_indices`; sklearn `check_cv(classifier=True)` ⇒ 5-fold StratifiedKFold (`:409`). Blocker #1802. |
@@ -293,6 +294,13 @@ fn sigmoid_fn(x: f64) -> f64 {
 /// Target probabilities are set following Platt (1999):
 ///   t_i = (y_i * N_+ + 1) / (N_+ + 2)  if y_i = 1
 ///   t_i = 1 / (N_- + 2)                 if y_i = 0
+///
+/// The positive class is the GREATER of the two sorted observed labels,
+/// mirroring sklearn's `Y = label_binarize(y, classes=classes)`
+/// (`sklearn/calibration.py:664`): for binary `y`, `label_binarize` keeps the
+/// last (greatest sorted) class column, so the greater label maps to the
+/// positive target `1` (`sklearn/preprocessing/_label.py:531-600`). For `{0,1}`
+/// labels the positive class is `1` (unchanged); for `{1,2}` it is `2`.
 fn fit_sigmoid(scores: &Array1<f64>, labels: &Array1<usize>) -> Result<(f64, f64), FerroError> {
     let n = scores.len();
     if n == 0 {
@@ -303,16 +311,20 @@ fn fit_sigmoid(scores: &Array1<f64>, labels: &Array1<usize>) -> Result<(f64, f64
         });
     }
 
+    // The positive class is the greater of the two sorted observed labels
+    // (sklearn `label_binarize`: greatest class column is the positive `1`).
+    let positive_class = positive_class_label(labels);
+
     // Compute target probabilities.
-    let n_pos = labels.iter().filter(|&&l| l == 1).count() as f64;
-    let n_neg = labels.iter().filter(|&&l| l != 1).count() as f64;
+    let n_pos = labels.iter().filter(|&&l| l == positive_class).count() as f64;
+    let n_neg = labels.iter().filter(|&&l| l != positive_class).count() as f64;
 
     let t_pos = (n_pos + 1.0) / (n_pos + 2.0);
     let t_neg = 1.0 / (n_neg + 2.0);
 
     let targets: Vec<f64> = labels
         .iter()
-        .map(|&l| if l == 1 { t_pos } else { t_neg })
+        .map(|&l| if l == positive_class { t_pos } else { t_neg })
         .collect();
 
     // Newton's method to minimise NLL.
@@ -389,11 +401,18 @@ fn fit_isotonic(
         });
     }
 
+    // The positive class is the greater of the two sorted observed labels
+    // (sklearn `Y = label_binarize(y, classes=classes)`, `calibration.py:664`:
+    // the greatest-class column is the positive `1`,
+    // `sklearn/preprocessing/_label.py:531-600`). For `{0,1}` it is `1`
+    // (unchanged); for `{1,2}` it is `2`.
+    let positive_class = positive_class_label(labels);
+
     // Sort by score.
     let mut indexed: Vec<(f64, f64)> = scores
         .iter()
         .zip(labels.iter())
-        .map(|(&s, &l)| (s, if l == 1 { 1.0 } else { 0.0 }))
+        .map(|(&s, &l)| (s, if l == positive_class { 1.0 } else { 0.0 }))
         .collect();
     indexed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -489,6 +508,23 @@ fn isotonic_lookup(mapping: &[(f64, f64)], score: f64) -> f64 {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Determine the positive-class label for a binary calibration target.
+///
+/// Mirrors scikit-learn's `Y = label_binarize(y, classes=classes)`
+/// (`sklearn/calibration.py:664`) where, for a binary problem, `classes` is the
+/// sorted unique of `y` and `label_binarize` keeps the LAST (greatest sorted)
+/// class column as the positive `1` (`sklearn/preprocessing/_label.py:531-600`).
+/// The positive class is therefore the GREATER of the two observed labels: for
+/// `{0,1}` it is `1` (unchanged from the historical `l == 1` convention); for
+/// `{1,2}` it is `2`; for `{0,2}` it is `2`.
+///
+/// Degenerate inputs never panic (R-CODE-2): an empty label set or an
+/// all-one-class set returns that single max label (or `1` when empty), so the
+/// historical `{0,1}` behaviour is preserved.
+fn positive_class_label(labels: &Array1<usize>) -> usize {
+    labels.iter().copied().max().unwrap_or(1)
+}
 
 /// Generate K-fold train/validation index splits.
 fn kfold_indices(n_samples: usize, k: usize) -> Vec<(Vec<usize>, Vec<usize>)> {

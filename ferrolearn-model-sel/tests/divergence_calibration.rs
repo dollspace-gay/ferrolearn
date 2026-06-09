@@ -292,7 +292,6 @@ fn divergence_isotonic_tied_scores_make_unique() {
 /// oracle reversed) — MAX ABS DIFF ~0.736.
 /// Tracking: #2372
 #[test]
-#[ignore = "divergence: fit_sigmoid hardcodes l==1 positive, no label_binarize; tracking #2372"]
 fn divergence_sigmoid_binary_classes_1_2() {
     let scores = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
     let labels = [1, 1, 1, 2, 2, 2]; // binary classes {1,2}, positive = 2
@@ -338,7 +337,6 @@ fn divergence_sigmoid_binary_classes_1_2() {
 /// ferrolearn produces the CONSTANT `[0.125,0.125,0.125,0.125,0.125,0.125]`.
 /// Tracking: #2372
 #[test]
-#[ignore = "divergence: fit_sigmoid hardcodes l==1 positive, no label_binarize; tracking #2372"]
 fn divergence_sigmoid_binary_classes_0_2() {
     let scores = [-2.0, -1.0, 0.0, 1.0, 2.0, 3.0];
     let labels = [0, 0, 0, 2, 2, 2]; // binary classes {0,2}, positive = 2
@@ -381,7 +379,6 @@ fn divergence_sigmoid_binary_classes_0_2() {
 /// ferrolearn produces the CONSTANT `[0.5,0.5,0.5,0.5,0.5]`.
 /// Tracking: #2373
 #[test]
-#[ignore = "divergence: fit_isotonic hardcodes l==1 positive, no label_binarize; tracking #2373"]
 fn divergence_isotonic_binary_classes_1_2() {
     let scores = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
     let labels = [1, 1, 1, 2, 2, 2];
