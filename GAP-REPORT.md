@@ -1,648 +1,202 @@
-# sklearn vs ferrolearn — Gap Report
-
-> Generated 2026-03-25 by parallel analysis of scikit-learn source (HEAD) against ferrolearn workspace (15 crates, 697 tests).
-
-## Executive Summary
-
-| Category | sklearn items | ferrolearn items | Coverage |
-|----------|:---:|:---:|:---:|
-| Linear Models | 38 | 14 | 37% |
-| Tree + Ensemble | 20 | 9 | 45% |
-| Neighbors | 13 | 6 | 46% |
-| Naive Bayes | 5 | 4 | 80% |
-| Clustering + Mixture | 17 | 12 | 71% |
-| Decomposition + Cross-Decomp | 30 | 15 | 50% |
-| Preprocessing + Features | 65 | 26 | 40% |
-| Metrics | 72 | 17 | 24% |
-| Model Selection + Pipeline | 40 | 18 | 45% |
-| Uncovered Modules (SVM, GP, NN, etc.) | ~60 | 4 | 7% |
-| **Total** | **~360** | **~125** | **~35%** |
-
-### Strongest coverage
-- **Naive Bayes** (80%) — 4 of 5 estimators, missing only CategoricalNB
-- **Clustering** (71%) — 12 estimators including HDBSCAN, OPTICS, Spectral, GMM, LabelPropagation/Spreading
-- **Decomposition** (50%) — 15 modules including PCA, ICA, NMF, LDA, t-SNE, UMAP, manifold methods
-
-### Largest gaps
-- **Metrics** (24%) — missing ranking metrics, pairwise distances, many classification/regression metrics
-- **Uncovered modules** (7%) — entire sklearn domains with no ferrolearn crate (GP, NN, covariance, calibration, multiclass/multioutput strategies)
-- **Linear Models** (37%) — missing all CV variants, LARS, GLMs, multi-task estimators
-
----
-
-## 1. Linear Models (`sklearn.linear_model` → `ferrolearn-linear`)
-
-### Present (14 estimators)
-| Estimator | Notes |
-|-----------|-------|
-| LinearRegression | OLS via QR decomposition |
-| Ridge | L2-regularized, Cholesky |
-| Lasso | L1-regularized, coordinate descent |
-| ElasticNet | L1+L2, coordinate descent |
-| BayesianRidge | Evidence maximization |
-| LogisticRegression | Binary/multiclass, L-BFGS |
-| HuberRegressor | Robust, IRLS |
-| SGDClassifier | Multiple loss functions |
-| SGDRegressor | Multiple loss functions |
-| RANSACRegressor | Robust meta-estimator |
-| IsotonicRegression | PAV algorithm |
-| LDA | Linear Discriminant Analysis |
-| SVC | SMO with kernels (Linear/RBF/Poly/Sigmoid) |
-| SVR | SMO with kernels |
-
-### Missing (24 estimators)
-
-**High priority:**
-| Estimator | Description |
-|-----------|-------------|
-| RidgeCV | Cross-validated Ridge |
-| LassoCV | Cross-validated Lasso |
-| ElasticNetCV | Cross-validated ElasticNet |
-| ARDRegression | Bayesian automatic feature selection |
-| RidgeClassifier | Ridge for classification |
-| RidgeClassifierCV | Cross-validated RidgeClassifier |
-
-**Medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| Lars | Least Angle Regression |
-| LarsCV | Cross-validated LARS |
-| LassoLars | Lasso via LARS |
-| LassoLarsCV | Cross-validated LassoLars |
-| LassoLarsIC | Lasso LARS with AIC/BIC |
-| OrthogonalMatchingPursuit | Greedy sparse approximation |
-| OrthogonalMatchingPursuitCV | Cross-validated OMP |
-| MultiTaskLasso | L1 across multiple targets |
-| MultiTaskElasticNet | L1+L2 across multiple targets |
-| MultiTaskLassoCV | Cross-validated multi-task Lasso |
-| MultiTaskElasticNetCV | Cross-validated multi-task ElasticNet |
-| QuantileRegressor | Conditional quantile regression |
-| TheilSenRegressor | Nonparametric robust estimator |
-
-**Low-medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| GammaRegressor | GLM, Gamma family |
-| PoissonRegressor | GLM, Poisson family |
-| TweedieRegressor | GLM, Tweedie family |
-| PassiveAggressiveClassifier | Online hinge loss (deprecated sklearn 1.8) |
-| PassiveAggressiveRegressor | Online regression (deprecated sklearn 1.8) |
-
-### Partial implementations
-- **LogisticRegression** — missing: LogisticRegressionCV, L1/elasticnet penalties, liblinear/sag/saga solvers, sample_weight, class_weight
-- **SGDClassifier/SGDRegressor** — missing: momentum/Nesterov, L1/elasticnet penalties, warm_start, class_weight, sample_weight
-
----
-
-## 2. Tree + Ensemble (`sklearn.tree` + `sklearn.ensemble` → `ferrolearn-tree`)
-
-### Present (9 estimators)
-| Estimator | Notes |
-|-----------|-------|
-| DecisionTreeClassifier | CART, Gini/Entropy |
-| DecisionTreeRegressor | CART, MSE |
-| RandomForestClassifier | Rayon parallel, max_features strategies |
-| RandomForestRegressor | Bootstrap aggregation |
-| GradientBoostingClassifier | Log loss, exponential |
-| GradientBoostingRegressor | MSE, MAE, Huber, Quantile |
-| HistGradientBoostingClassifier | Binning, subtraction trick, native NaN |
-| HistGradientBoostingRegressor | Histogram-based |
-| AdaBoostClassifier | SAMME/SAMME.R |
-
-### Missing (11 estimators)
-
-**High priority:**
-| Estimator | Description |
-|-----------|-------------|
-| ExtraTreeClassifier | Extremely randomized tree |
-| ExtraTreeRegressor | Extremely randomized tree (regression) |
-| ExtraTreesClassifier | Ensemble of extra trees |
-| ExtraTreesRegressor | Ensemble of extra trees (regression) |
-| BaggingClassifier | Generic bagging meta-estimator |
-| BaggingRegressor | Generic bagging (regression) |
-| AdaBoostRegressor | AdaBoost for regression |
-
-**Medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| StackingClassifier | Meta-learner stacking |
-| StackingRegressor | Meta-learner stacking (regression) |
-| VotingClassifier | Hard/soft voting ensemble |
-| VotingRegressor | Voting ensemble (regression) |
-| IsolationForest | Anomaly detection |
-
-### Partial implementations (existing estimators)
-- **DecisionTree***: missing `splitter` (best vs random), `max_leaf_nodes`, `ccp_alpha` (cost-complexity pruning), `class_weight`, `monotonic_cst`, sample_weight
-- **RandomForest***: missing `warm_start`, `oob_score`, `max_samples`, sample_weight
-- **All tree models**: missing `export_graphviz`, `export_text` for visualization
-
----
-
-## 3. Neighbors (`sklearn.neighbors` → `ferrolearn-neighbors`)
-
-### Present (6 items)
-| Item | Notes |
-|------|-------|
-| KNeighborsClassifier | Uniform/Distance/Custom weights, Auto/KdTree/BallTree/BruteForce |
-| KNeighborsRegressor | Same weight/algorithm options |
-| KdTree | Spatial index for low-dim |
-| BallTree | Spatial index for high-dim |
-| Algorithm enum | Auto/KdTree/BallTree/BruteForce |
-| Weights enum | Uniform/Distance/Custom |
-
-### Missing (7 estimators)
-
-**High priority:**
-| Estimator | Description |
-|-----------|-------------|
-| RadiusNeighborsClassifier | All neighbors within radius |
-| RadiusNeighborsRegressor | Radius-based regression |
-| NearestNeighbors | Unsupervised neighbor search |
-
-**Medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| LocalOutlierFactor | Local density outlier detection |
-| NearestCentroid | Centroid-based classifier |
-
-**Lower priority:**
-| Estimator | Description |
-|-----------|-------------|
-| NeighborhoodComponentsAnalysis | Metric learning |
-| KernelDensity | Kernel density estimation |
-
-### Partial implementations
-- **Distance metrics** — hardcoded Euclidean; sklearn supports minkowski, manhattan, and many scipy metrics
-- **Sparse data** — not supported; sklearn handles CSR/CSC input
-- **Precomputed distances** — not supported; sklearn accepts `metric='precomputed'`
-
----
-
-## 4. Naive Bayes (`sklearn.naive_bayes` → `ferrolearn-bayes`)
-
-### Present (4 estimators)
-| Estimator | Notes |
-|-----------|-------|
-| GaussianNB | var_smoothing, predict_proba |
-| MultinomialNB | alpha smoothing |
-| BernoulliNB | alpha, binarize threshold |
-| ComplementNB | alpha, imbalanced-data variant |
-
-### Missing (1 estimator)
-| Estimator | Priority | Description |
-|-----------|----------|-------------|
-| CategoricalNB | HIGH | Naive Bayes for categorical features |
-
-### Cross-cutting gaps (all 4 estimators)
-- `partial_fit` — incremental/online learning (MEDIUM)
-- `class_prior` parameter — user-specified priors (MEDIUM)
-- `sample_weight` support (LOW)
-- Fitted attribute introspection traits (LOW)
-
----
-
-## 5. Clustering + Mixture (`sklearn.cluster` + `sklearn.mixture` → `ferrolearn-cluster`)
-
-### Present (12 estimators)
-| Estimator | Notes |
-|-----------|-------|
-| KMeans | k-Means++ init, Rayon parallel, multi-start |
-| MiniBatchKMeans | Online variant, learning rate |
-| DBSCAN | Density-based, epsilon/min_samples |
-| HDBSCAN | Hierarchical DBSCAN, auto clusters |
-| OPTICS | Reachability ordering |
-| AgglomerativeClustering | Ward/Complete/Average/Single linkage |
-| Birch | Balanced iterative reducing |
-| SpectralClustering | Graph Laplacian eigenmap |
-| MeanShift | Mode-seeking |
-| GaussianMixture | EM, 4 covariance types |
-| LabelPropagation | Semi-supervised (unique to ferrolearn-cluster) |
-| LabelSpreading | Semi-supervised (unique to ferrolearn-cluster) |
-
-### Missing (6 estimators)
-
-**High priority:**
-| Estimator | Description |
-|-----------|-------------|
-| AffinityPropagation | Message-passing, auto cluster count |
-| BisectingKMeans | Divisive hierarchical k-means |
-
-**Medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| BayesianGaussianMixture | Dirichlet process GMM |
-| FeatureAgglomeration | Feature-space hierarchical clustering |
-| SpectralBiclustering | Row+column biclustering |
-| SpectralCoclustering | Log-diagonal biclustering |
-
-### Missing utilities
-- `estimate_bandwidth`, `cluster_optics_dbscan`, `cluster_optics_xi` (MEDIUM)
-
----
-
-## 6. Decomposition (`sklearn.decomposition` + `sklearn.cross_decomposition` → `ferrolearn-decomp`)
-
-### Present (15 modules)
-| Estimator | Notes |
-|-----------|-------|
-| PCA | Full fit/transform, explained variance |
-| IncrementalPCA | Online/mini-batch |
-| TruncatedSVD | Randomized algorithm |
-| FastICA | logcosh/exp/cube nonlinearities |
-| NMF | MU + CD solvers, NNDSVD init |
-| KernelPCA | Non-linear dimensionality reduction |
-| FactorAnalysis | Probabilistic latent factors |
-| LatentDirichletAllocation | Topic modeling |
-| DictionaryLearning | Sparse coding with learned dictionary |
-| MDS | Classical multidimensional scaling |
-| Isomap | Geodesic distances on kNN graphs |
-| LLE | Locally Linear Embedding |
-| SpectralEmbedding | Laplacian Eigenmaps |
-| t-SNE | Barnes-Hut approximation |
-| UMAP | Topological manifold learning (beyond sklearn) |
-
-### Missing (15 items)
-
-**High priority (cross-decomposition — entirely absent):**
-| Estimator | Description |
-|-----------|-------------|
-| PLSRegression | Partial Least Squares regression |
-| PLSCanonical | PLS canonical correlation |
-| CCA | Canonical Correlation Analysis |
-| PLSSVD | SVD of cross-covariance |
-
-**Medium priority:**
-| Estimator | Description |
-|-----------|-------------|
-| SparsePCA | L1-penalized PCA |
-| MiniBatchSparsePCA | Online SparsePCA |
-| MiniBatchNMF | Online NMF |
-| MiniBatchDictionaryLearning | Online dictionary learning |
-| SparseCoder | Transform-only sparse encoder |
-
-**Low priority (utility functions):**
-- `dict_learning`, `dict_learning_online`, `fastica`, `non_negative_factorization`, `randomized_svd`, `sparse_encode`
-
----
-
-## 7. Preprocessing + Feature Engineering (`sklearn.preprocessing` + `feature_extraction` + `feature_selection` + `impute` → `ferrolearn-preprocess`)
-
-### Present (26 items)
-| Category | Implemented |
-|----------|-------------|
-| **Scalers** (6/6) | StandardScaler, MinMaxScaler, MaxAbsScaler, RobustScaler, Normalizer, PowerTransformer |
-| **Encoders** (4/4) | OneHotEncoder, OrdinalEncoder, LabelEncoder, TargetEncoder |
-| **Discretizers** (2/2) | KBinsDiscretizer, SplineTransformer |
-| **Feature Engineering** (3/3) | PolynomialFeatures, Binarizer, FunctionTransformer |
-| **Imputers** (3/3) | SimpleImputer, KNNImputer, IterativeImputer |
-| **Feature Selection** (5/11) | VarianceThreshold, SelectKBest, SelectPercentile, RFE, RFECV |
-| **Composition** (1) | ColumnTransformer |
-
-### Missing (39 items)
-
-**High priority:**
-| Item | Description |
-|------|-------------|
-| LabelBinarizer | Multilabel one-vs-rest binarization |
-| MultiLabelBinarizer | Multi-hot label encoding |
-| SelectFromModel | Feature selection from fitted model importances |
-| SequentialFeatureSelector | Forward/backward greedy selection |
-
-**Medium-high priority (feature selection score functions):**
-| Function | Description |
-|----------|-------------|
-| f_classif | ANOVA F-statistic for classification |
-| f_regression | Univariate F-statistic for regression |
-| chi2 | Chi-squared test for non-negative features |
-| mutual_info_classif | Mutual information for classification |
-| mutual_info_regression | Mutual information for regression |
-| SelectFdr / SelectFpr / SelectFwe | Statistical threshold selectors |
-| GenericUnivariateSelect | Configurable univariate filter |
-
-**Medium priority (feature extraction — entire submodule absent):**
-| Item | Description |
-|------|-------------|
-| CountVectorizer | Bag-of-words term frequency |
-| TfidfVectorizer | TF-IDF from raw text |
-| TfidfTransformer | TF-IDF on pre-tokenized counts |
-| HashingVectorizer | Hashing trick for text |
-| DictVectorizer | Dict to sparse matrix |
-| FeatureHasher | Generic feature hashing |
-
-**Low priority:**
-- Stateless preprocessing functions (`scale`, `robust_scale`, `minmax_scale`, etc.)
-- Image feature extraction (`PatchExtractor`, `extract_patches_2d`, etc.)
-- `MissingIndicator`
-- `KernelCenterer`
-
-### Partial implementations
-- **RFE/RFECV** — accepts pre-computed importance vectors rather than wrapping estimators (architectural choice to avoid circular deps)
-- **SelectFromModel** — exists as pass-through; needs meta-estimator wrapping
-
----
-
-## 8. Metrics (`sklearn.metrics` → `ferrolearn-metrics`)
-
-### Present (17 functions)
-| Category | Implemented |
-|----------|-------------|
-| **Classification** (7) | accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix, log_loss |
-| **Regression** (6) | mean_absolute_error, mean_squared_error, root_mean_squared_error, r2_score, mean_absolute_percentage_error, explained_variance_score |
-| **Clustering** (4) | silhouette_score, adjusted_rand_score, adjusted_mutual_info, davies_bouldin_score |
-
-### Missing (55 items)
-
-**High priority — classification:**
-| Metric | Description |
-|--------|-------------|
-| balanced_accuracy_score | Class-balanced accuracy |
-| matthews_corrcoef | MCC for binary classification |
-| cohen_kappa_score | Inter-rater agreement |
-| fbeta_score | Weighted harmonic mean |
-| classification_report | Text summary report |
-| brier_score_loss | Probabilistic prediction error |
-| hamming_loss | Fraction of incorrect labels |
-| jaccard_score | Intersection / union |
-
-**High priority — regression:**
-| Metric | Description |
-|--------|-------------|
-| median_absolute_error | Median of absolute residuals |
-| max_error | Maximum absolute error |
-| mean_squared_log_error | MSE on log-transformed targets |
-| root_mean_squared_log_error | RMSE on log-transformed targets |
-
-**High priority — clustering:**
-| Metric | Description |
-|--------|-------------|
-| silhouette_samples | Per-sample silhouette |
-| calinski_harabasz_score | Variance ratio criterion |
-| homogeneity_score / completeness_score / v_measure_score | Homogeneity/completeness/V-measure |
-
-**High priority — ranking (entire category absent):**
-| Metric | Description |
-|--------|-------------|
-| auc | Area under arbitrary curve |
-| average_precision_score | Average precision for ranking |
-| roc_curve | FPR/TPR at thresholds |
-| precision_recall_curve | Precision/recall at thresholds |
-| ndcg_score | Normalized DCG |
-| top_k_accuracy_score | Top-k accuracy |
-
-**Medium-high priority — pairwise (entire category absent):**
-| Item | Description |
-|------|-------------|
-| pairwise_distances | Pairwise distance computation |
-| euclidean_distances | Pairwise Euclidean |
-| pairwise_kernels | Pairwise kernel matrices |
-| DistanceMetric | Distance metric class |
-
-**Medium priority:**
-- Scorer utilities (`make_scorer`, `get_scorer`, `check_scoring`)
-- Threshold curves (`det_curve`, `confusion_matrix_at_thresholds`)
-- Additional clustering metrics (`rand_score`, `normalized_mutual_info_score`, `fowlkes_mallows_score`)
-- Deviance metrics (`mean_poisson_deviance`, `mean_gamma_deviance`, `mean_tweedie_deviance`)
-
----
-
-## 9. Model Selection + Pipeline (`sklearn.model_selection` + `pipeline` + `compose` → `ferrolearn-model-sel` + `ferrolearn-core`)
-
-### Present (18 items)
-| Category | Implemented |
-|----------|-------------|
-| **CV Splitters** (3) | KFold, StratifiedKFold, TimeSeriesSplit |
-| **Search** (3) | GridSearchCV, RandomizedSearchCV, HalvingGridSearchCV |
-| **Distributions** (5) | Uniform, LogUniform, IntUniform, Choice, Distribution trait |
-| **Validation** (2) | cross_val_score, train_test_split |
-| **Meta-estimators** (2) | CalibratedClassifierCV, SelfTrainingClassifier |
-| **Pipeline** (2) | Pipeline (dynamic-dispatch), TypedPipeline (compile-time) |
-| **Macro** (1) | param_grid! |
-
-### Missing (22 items)
-
-**High priority — CV splitters:**
-| Splitter | Description |
-|----------|-------------|
-| LeaveOneOut | LOO cross-validation |
-| RepeatedKFold | Multiple independent k-fold runs |
-| RepeatedStratifiedKFold | Stratified repeated k-fold |
-| GroupKFold | Group-aware k-fold |
-| ShuffleSplit | Random train/test splits |
-| StratifiedShuffleSplit | Stratified random splits |
-
-**High priority — validation functions:**
-| Function | Description |
-|----------|-------------|
-| cross_validate | Multi-metric CV with timing |
-| cross_val_predict | Aggregate predictions across folds |
-| learning_curve | Score vs training set size |
-| validation_curve | Score vs hyperparameter value |
-| permutation_test_score | Statistical significance |
-
-**High priority — search:**
-| Estimator | Description |
-|-----------|-------------|
-| HalvingRandomSearchCV | Successive halving + random sampling |
-
-**Medium priority — pipeline:**
-| Item | Description |
-|------|-------------|
-| FeatureUnion | Parallel transformer composition |
-| TransformedTargetRegressor | Target-space transformation |
-| make_pipeline | Convenience constructor |
-
-**Medium priority — other:**
-| Item | Description |
-|------|-------------|
-| LeavePOut | Leave-P-out CV |
-| PredefinedSplit | Custom fold indices |
-| GroupShuffleSplit | Group-aware shuffle split |
-| FixedThresholdClassifier | Custom probability threshold |
-| TunedThresholdClassifierCV | Threshold tuning via CV |
-
----
-
-## 10. Uncovered sklearn Modules (no dedicated ferrolearn crate)
-
-These represent entire sklearn domains with minimal or no coverage.
-
-### SVM (`sklearn.svm`) — PARTIALLY COVERED via ferrolearn-linear
-
-| Estimator | Status | Priority |
-|-----------|--------|----------|
-| SVC | Implemented (ferrolearn-linear) | -- |
-| SVR | Implemented (ferrolearn-linear) | -- |
-| LinearSVC | **Missing** | HIGH |
-| LinearSVR | **Missing** | HIGH |
-| NuSVC | **Missing** | MEDIUM |
-| NuSVR | **Missing** | MEDIUM |
-| OneClassSVM | **Missing** | MEDIUM |
-
-### Gaussian Processes — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| GaussianProcessClassifier | HIGH |
-| GaussianProcessRegressor | HIGH |
-| GP Kernels (RBF, Matern, ConstantKernel, WhiteKernel, DotProduct, RationalQuadratic, ExpSineSquared) | HIGH |
-| Kernel operators (Sum, Product, Exponentiation) | MEDIUM |
-
-### Neural Networks — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| MLPClassifier | HIGH |
-| MLPRegressor | HIGH |
-| BernoulliRBM | MEDIUM |
-
-### Discriminant Analysis — PARTIALLY COVERED
-
-| Estimator | Status | Priority |
-|-----------|--------|----------|
-| LinearDiscriminantAnalysis | Implemented as LDA (ferrolearn-linear) | -- |
-| QuadraticDiscriminantAnalysis | **Missing** | HIGH |
-
-### Manifold Learning — MOSTLY COVERED via ferrolearn-decomp
-
-| Estimator | Status |
-|-----------|--------|
-| MDS, t-SNE, Isomap, LLE, SpectralEmbedding | Implemented |
-| trustworthiness() metric | **Missing** (LOW) |
-
-### Semi-Supervised — PARTIALLY COVERED
-
-| Estimator | Status | Priority |
-|-----------|--------|----------|
-| LabelPropagation | Implemented (ferrolearn-cluster) | -- |
-| LabelSpreading | Implemented (ferrolearn-cluster) | -- |
-| SelfTrainingClassifier | Implemented (ferrolearn-model-sel) | -- |
-
-### Kernel Approximation — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| RBFSampler | HIGH |
-| Nystroem | HIGH |
-| AdditiveChi2Sampler | MEDIUM |
-| SkewedChi2Sampler | MEDIUM |
-| PolynomialCountSketch | LOW |
-
-### Kernel Ridge — MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| KernelRidge | HIGH |
-
-### Covariance Estimation — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| EmpiricalCovariance | MEDIUM |
-| ShrunkCovariance | MEDIUM |
-| LedoitWolf | MEDIUM |
-| OAS | MEDIUM |
-| MinCovDet | MEDIUM |
-| EllipticEnvelope | MEDIUM |
-| GraphicalLasso / GraphicalLassoCV | LOW |
-
-### Multi-class / Multi-output — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| OneVsRestClassifier | HIGH |
-| OneVsOneClassifier | HIGH |
-| MultiOutputClassifier | HIGH |
-| MultiOutputRegressor | HIGH |
-| ClassifierChain | MEDIUM |
-| RegressorChain | MEDIUM |
-| OutputCodeClassifier | MEDIUM |
-
-### Random Projection — COMPLETELY MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| GaussianRandomProjection | MEDIUM |
-| SparseRandomProjection | MEDIUM |
-
-### Calibration — PARTIALLY COVERED
-
-| Estimator | Status | Priority |
-|-----------|--------|----------|
-| CalibratedClassifierCV | Implemented (ferrolearn-model-sel) | -- |
-| calibration_curve() | **Missing** | MEDIUM |
-
-### Isotonic Regression — COVERED
-
-| Estimator | Status |
-|-----------|--------|
-| IsotonicRegression | Implemented (ferrolearn-linear) |
-
-### Dummy Estimators — MISSING
-
-| Estimator | Priority |
-|-----------|----------|
-| DummyClassifier | LOW |
-| DummyRegressor | LOW |
-
-### Inspection — MISSING
-
-| Function | Priority |
-|----------|----------|
-| partial_dependence | MEDIUM |
-| permutation_importance | MEDIUM |
-
----
-
-## Priority Tiers for Future Work
-
-### Tier 1 — High Impact, Commonly Used
-
-These gaps affect the most common ML workflows:
-
-1. **Cross-validated model variants** — RidgeCV, LassoCV, ElasticNetCV (users expect auto-tuning)
-2. **Metrics expansion** — balanced_accuracy, MCC, classification_report, roc_curve, precision_recall_curve, auc, pairwise_distances
-3. **Extra Trees + Bagging** — ExtraTrees*, Bagging*, AdaBoostRegressor (common ensemble baselines)
-4. **CV splitters** — RepeatedKFold, ShuffleSplit, GroupKFold (essential for proper evaluation)
-5. **Multi-class/multi-output strategies** — OvR, OvO, MultiOutput* (needed for real-world multiclass)
-6. **Validation functions** — cross_validate, learning_curve, validation_curve
-7. **Gaussian Processes** — GP classifier/regressor + kernel library
-8. **Neural Networks** — MLP classifier/regressor
-9. **Kernel methods** — KernelRidge, RBFSampler, Nystroem
-
-### Tier 2 — Medium Impact, Specialized
-
-10. **Cross-decomposition** — PLS, CCA (common in chemometrics, bioinformatics)
-11. **Feature selection functions** — f_classif, chi2, mutual_info_*, SelectFromModel
-12. **Text feature extraction** — CountVectorizer, TfidfVectorizer (large NLP use case)
-13. **Covariance estimation** — LedoitWolf, EllipticEnvelope
-14. **Stacking/Voting ensembles** — StackingClassifier/Regressor, VotingClassifier/Regressor
-15. **SVM variants** — LinearSVC, LinearSVR, NuSVC, NuSVR
-16. **QDA** — QuadraticDiscriminantAnalysis
-17. **Decision tree enhancements** — ccp_alpha pruning, random splitter, max_leaf_nodes, oob_score
-
-### Tier 3 — Lower Impact, Niche
-
-18. **Sparse PCA variants** — SparsePCA, MiniBatchSparsePCA
-19. **LARS family** — Lars, LassoLars and CV variants
-20. **GLM family** — PoissonRegressor, GammaRegressor, TweedieRegressor
-21. **Random projection** — GaussianRandomProjection, SparseRandomProjection
-22. **Semi-supervised** (partially covered already)
-23. **Dummy estimators** — DummyClassifier, DummyRegressor
-24. **Pipeline enhancements** — FeatureUnion, make_pipeline, TransformedTargetRegressor
-25. **Inspection tools** — partial_dependence, permutation_importance
-26. **Deprecated estimators** — Perceptron, PassiveAggressive* (deprecated in sklearn 1.8)
-
----
-
-## What ferrolearn Has That sklearn Doesn't
-
-| Feature | Crate | Notes |
-|---------|-------|-------|
-| UMAP | ferrolearn-decomp | sklearn requires separate umap-learn package |
-| HDBSCAN | ferrolearn-cluster | Only added to sklearn recently |
-| TypedPipeline | ferrolearn-core | Compile-time type-safe pipeline (Rust-specific) |
-| Kernel regression (Nadaraya-Watson, Local Polynomial) | ferrolearn-kernel | Not in sklearn |
-| Wild bootstrap CI, heteroscedasticity tests | ferrolearn-kernel | Statistical diagnostics |
-| Scipy-equivalent numerical foundations | ferrolearn-numerical | Optimization, interpolation, integration |
-| DynKernel runtime kernel selection | ferrolearn-kernel | Dynamic dispatch kernel selection |
-| Silverman/Scott/CV bandwidth selection | ferrolearn-kernel | Automatic bandwidth for kernel methods |
+# sklearn vs ferrolearn Gap Report
+
+Generated 2026-06-25 from the current worktree.
+
+This replaces the stale 2026-03-25 report. The old report materially
+understated the current ferrolearn surface: many items it marked missing now
+exist in source, including `CategoricalNB`, radius neighbors, `LocalOutlierFactor`,
+`NearestCentroid`, covariance estimators, Gaussian processes, neural-network
+estimators, many linear CV estimators, ExtraTrees/Bagging/Voting, and much of
+model selection.
+
+## Evidence and Scope
+
+- sklearn baseline: official stable scikit-learn API reference, version 1.9.0:
+  <https://scikit-learn.org/stable/api/index.html>.
+- Local oracle runtime: `sklearn 1.5.2` is installed in this workspace and is
+  the version cited by most current `divergence_*` tests.
+- Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
+- ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
+- Test evidence: the current tree contains 319 `tests/divergence_*.rs` files.
+
+The exact API gap list below was produced by parsing the sklearn 1.9.0 API
+index for public classes/functions and comparing it with current public Rust
+symbols in `ferrolearn-*/src`. It is an exact-name/public-surface comparison,
+not a crate-path compatibility check: a present item may live in a different
+ferrolearn crate/module than sklearn's Python module. Obvious aliases are
+normalized (`HDBSCAN`/`Hdbscan`, `TSNE`/`Tsne`, `LocallyLinearEmbedding`/`LLE`,
+`KDTree`/`KdTree`, `LinearDiscriminantAnalysis`/`LDA`,
+`QuadraticDiscriminantAnalysis`/`QDA`). Presence does not prove behavioral
+parity.
+
+## Summary
+
+ferrolearn is now broad but still not sklearn-parity complete.
+
+- Scoped ML-facing sklearn API gaps: 110 exact public items missing across the
+  modules listed below.
+- Whole sklearn infrastructure areas are not counted in that 110: callbacks,
+  frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
+  display/plotting classes, metadata routing, and Python object compatibility.
+- Existing Rust implementations frequently expose a narrower or Rust-idiomatic
+  API: fewer constructor parameters, fewer fitted attributes, different error
+  types/messages, less sparse/object/string/dataframe support, less `sample_weight`
+  and `multioutput` support, and incomplete `get_feature_names_out` /
+  `feature_names_in_` behavior.
+- Many exact-value differences are documented as boundaries around numpy RNG,
+  BLAS/LAPACK summation order, scipy solver choices, or deliberate Rust API
+  choices. These are still parity gaps when the target is sklearn behavior.
+
+## Exact sklearn API Gaps
+
+These names are present in sklearn 1.9.0 and absent from ferrolearn's current
+public Rust surface after the alias normalization above.
+
+| sklearn module | Missing public items |
+|---|---|
+| `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram`, `lasso_path`, `orthogonal_mp`, `orthogonal_mp_gram`, `ridge_regression` |
+| `sklearn.svm` | `l1_min_c` |
+| `sklearn.tree` | `export_graphviz`, `export_text`, `plot_tree` |
+| `sklearn.ensemble` | `StackingClassifier`, `StackingRegressor` |
+| `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
+| `sklearn.cluster` | `SpectralBiclustering`, `SpectralCoclustering`, `cluster_optics_xi`, `compute_optics_graph`, `kmeans_plusplus`, `ward_tree` |
+| `sklearn.decomposition` | `MiniBatchDictionaryLearning`, `MiniBatchSparsePCA`, `SparseCoder`, `dict_learning`, `dict_learning_online`, `non_negative_factorization`, `sparse_encode` |
+| `sklearn.preprocessing` | `KernelCenterer`, `add_dummy_feature`, `maxabs_scale`, `minmax_scale`, `power_transform` |
+| `sklearn.impute` | `MissingIndicator` |
+| `sklearn.feature_selection` | `GenericUnivariateSelect`, `SelectorMixin`, `mutual_info_classif`, `mutual_info_regression`, `r_regression` |
+| `sklearn.feature_extraction` | `DictVectorizer`, `FeatureHasher` |
+| `sklearn.feature_extraction.text` | `HashingVectorizer`, `TfidfVectorizer` |
+| `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
+| `sklearn.compose` | `make_column_selector` |
+| `sklearn.metrics` | `class_likelihood_ratios`, `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `consensus_score`, `pairwise_distances_chunked`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
+| `sklearn.metrics.pairwise` | `additive_chi2_kernel`, `chi2_kernel`, `cosine_similarity`, `distance_metrics`, `haversine_distances`, `kernel_metrics`, `laplacian_kernel`, `paired_cosine_distances`, `paired_distances`, `paired_euclidean_distances`, `paired_manhattan_distances` |
+| `sklearn.model_selection` | `check_cv`, `ParameterGrid`, `ParameterSampler`, `LearningCurveDisplay`, `ValidationCurveDisplay` |
+| `sklearn.calibration` | `CalibrationDisplay` |
+| `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |
+| `sklearn.gaussian_process.kernels` | `CompoundKernel`, `ExpSineSquared`, `Exponentiation`, `Hyperparameter`, `RationalQuadratic` |
+| `sklearn.manifold` | `ClassicalMDS`, `locally_linear_embedding`, `smacof`, `trustworthiness` |
+| `sklearn.datasets` | `fetch_20newsgroups_vectorized`, `fetch_lfw_pairs`, `fetch_lfw_people`, `fetch_olivetti_faces`, `fetch_rcv1`, `fetch_species_distributions`, `load_sample_image`, `load_sample_images`, `make_biclusters`, `make_checkerboard`, `make_sparse_coded_signal` |
+| `sklearn.inspection` | `DecisionBoundaryDisplay`, `PartialDependenceDisplay` |
+
+The following scoped modules had no exact public-item miss in this pass:
+`sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
+`sklearn.discriminant_analysis`, `sklearn.pipeline`,
+`sklearn.random_projection`, `sklearn.semi_supervised`,
+`sklearn.kernel_ridge`, `sklearn.gaussian_process`, `sklearn.covariance`,
+`sklearn.neural_network`, `sklearn.dummy`, `sklearn.multiclass`,
+`sklearn.multioutput`, and `sklearn.isotonic`. This means only that names
+exist; it is not a value- or contract-parity claim.
+
+## Whole Areas Outside the Exact Gap Count
+
+These are sklearn public areas with no full ferrolearn equivalent or no Python
+protocol equivalent:
+
+- `sklearn.callback`: `AutoPropagatedCallback`, `CallbackContext`,
+  `CallbackSupportMixin`, `FitCallback`, `ProgressBar`, `ScoringMonitor`,
+  `ScoringMonitorLog`, `with_callbacks`.
+- `sklearn.frozen`: `FrozenEstimator`.
+- `sklearn.exceptions`: sklearn's public warning/error class family
+  (`ConvergenceWarning`, `NotFittedError`, `UndefinedMetricWarning`, and
+  related classes) has no full Rust or Python compatibility equivalent.
+- `sklearn.experimental`: import gates such as `enable_halving_search_cv` and
+  `enable_iterative_imputer` do not exist; ferrolearn exposes the corresponding
+  implemented APIs directly.
+- `sklearn.base`: the Python `BaseEstimator` protocol, mixins, `clone`, and
+  `is_classifier`/`is_regressor`/`is_clusterer`/`is_outlier_detector` style
+  runtime discovery are not fully mirrored by Rust traits.
+- `sklearn.utils`: only a small validation subset exists in `ferrolearn-core`;
+  broad utilities like tags, indexing, resampling, random-state compatibility,
+  `estimator_html_repr`, metadata routing, and estimator checks are absent.
+- Display and plotting APIs are broadly absent beyond the exact display names
+  listed above.
+
+## Behavioral and Contract Gaps by Area
+
+The source and tests document many narrower gaps. Important recurring themes:
+
+| ferrolearn area | Current parity gaps and inaccuracies |
+|---|---|
+| Core / pipeline | Rust typestate gives stronger compile-time guarantees but is not sklearn's Python estimator protocol. Full `BaseEstimator` behavior, `get_params`/`set_params`/`clone`, metadata routing, estimator tags, HTML representation, and broad `check_estimator` compatibility are absent. Pipeline and `FeatureUnion` behavior has separate divergence tests for slicing and duplicate/dunder names. |
+| Linear / SVM / discriminant | Many estimator names exist, but exact sklearn helper functions and several estimator variants are still missing (see API table). Known gaps include LDA binary `decision_function` shape, OMP Gram/precompute/CV/multi-output/n_iter surfaces, solver-option differences, `sample_weight`/`class_weight` coverage gaps, libsvm probability RNG/value differences, and Rust `FerroError` ABI instead of sklearn `ValueError`/`InvalidParameterError`/warnings. |
+| Tree / ensemble | Stacking and tree export/plot helpers are absent. Implementations still differ in AdaBoost decision/probability/SAMME.R/base-estimator behavior, Voting's heterogeneous estimator/weight/transform surface, random and missing-value routing details, HGB bin threshold and missing-direction behavior, RNG exactness, and sklearn visualization/export attributes. |
+| Neighbors | Missing transformer, density, and metric-learning estimators remain. Present estimators still have gaps around `X=None` self-query behavior, `sort_results`, `include_self`, constructor surfaces (`radius`, `metric`, `p`, `metric_params`, `n_jobs`), sparse/precomputed distances, exact error messages, and some tie/order behavior. |
+| Naive Bayes | All five estimator names exist, but base/discrete sklearn conveniences are incomplete: `coef_`/`intercept_` properties, shared `_count`/`_update_feature_log_prob` style internals, exact prior/alpha edge semantics, `sample_weight`, warning/error ABI, and some `partial_fit` edge contracts remain narrower than sklearn. |
+| Cluster / mixture / semi-supervised | Exact missing items include biclustering/coclustering and several standalone functions. Present estimators have documented non-parity around BIRCH's CF-tree splitting and online API, BisectingKMeans centers/inertia/label numbering/tree-descent prediction, KMeans/MiniBatchKMeans defaults and RNG/local-optimum details, BayesianGMM pruning, Agglomerative full dendrogram/label numbering, FeatureAgglomeration inverse-transform shape behavior, HDBSCAN/OPTICS boundary precision, and semi-supervised zero-row/probability edge cases. |
+| Decomposition / manifold / cross-decomposition | Missing decomposition helper functions and sparse/dictionary online variants remain. Present estimators still have gaps such as PCA `svd_solver` override/ARPACK/MLE/parameter surface, repeated-eigenbasis exactness, rank-deficient score precision, PLS fitted attributes/constructor modes/inverse transform/PyO3 bindings, LDA topic-model RNG initialization, and manifold helper-function/API differences. |
+| Preprocess / impute / feature extraction / feature selection | This remains one of the biggest contract-parity areas. Exact missing names include `KernelCenterer`, `MissingIndicator`, mutual-information scoring, generic univariate selection, dict/hash/text/image extraction APIs, and several free functions. Common gaps include dense-only implementations where sklearn supports sparse, limited string/object/mixed dtype handling, incomplete feature-name plumbing, reduced Python/PyO3 exposure, random-projection RNG and component-orientation differences, KBins k-means/local-optimum edge cases, spline/quantile/power-transform edge cases, TF-IDF unsmoothed idf behavior, and degenerate feature-scoring semantics. |
+| Metrics / scoring / pairwise | Many metrics now exist, but missing display, threshold, consensus, chunked pairwise, and several pairwise-kernel functions remain. Regression metrics are documented as mostly 1D/unweighted; `sample_weight`, `multioutput`, keyword/default surfaces, exact validation exceptions, and PyO3 exposure are incomplete. Scorer utilities are present but not full sklearn scoring/protocol parity. |
+| Model selection / compose / calibration / multiclass / multioutput | Many names exist, but some exact sklearn public names are absent (`ParameterGrid`, `ParameterSampler`, `check_cv`, displays). Several implementations use Rust closures or simplified wrappers rather than sklearn's estimator-cloning protocol. RNG exactness, result-table parity, threshold/calibration displays, and some group/splitter edge semantics remain documented divergence areas. |
+| Kernel / GP / covariance / neural | Core estimator names exist, but GP kernels are incomplete (`RationalQuadratic`, `ExpSineSquared`, `Exponentiation`, `CompoundKernel`, `Hyperparameter`). Kernel approximation is missing three sklearn estimators. Covariance and neural crates have public surfaces but many fitted-state items are still in conformance exclusions or have narrower solver/optimizer/attribute contracts than sklearn. |
+| Datasets / fetch | Many toy/generator/fetch names exist, but 11 sklearn dataset APIs are absent. Fetcher signatures are narrower than sklearn: common sklearn options such as `return_X_y`, `as_frame`, `download_if_missing`, shuffle/random-state controls, retry/delay knobs, and some large-network value parity checks are absent or unverified. |
+| Sparse / numerical / IO | `ferrolearn-sparse` is closer to scipy sparse than sklearn, but not full scipy parity; helper gaps remain. `ferrolearn-numerical` targets scipy-like primitives and should not be counted as sklearn estimator parity. `ferrolearn-io` adds JSON/MessagePack/ONNX/PMML-style facilities, but these are not sklearn API equivalents. |
+| Python bindings | `ferrolearn-python` exposes only a subset of Rust estimators. Many Rust implementations have no Python wrapper, and wrappers generally do not provide full sklearn estimator protocol compatibility. |
+
+## Stale or Inaccurate Documentation Claims
+
+These documentation issues should be corrected separately from implementation
+work:
+
+- Root `README.md` still says the workspace has 14 crates, but current
+  `Cargo.toml` lists 22 members.
+- Root `README.md` says MSRV is 1.85, while `Cargo.toml` sets
+  `rust-version = "1.88"`.
+- The previous `GAP-REPORT.md` listed many now-present APIs as missing,
+  including `CategoricalNB`, radius neighbors, `NearestNeighbors`,
+  `LocalOutlierFactor`, `NearestCentroid`, many linear CV estimators,
+  covariance, kernel/GP, neural-network, ensemble, and model-selection items.
+- Several crate README parity summaries are optimistic relative to current
+  source/test caveats. They should point to this report or to the relevant
+  `tests/divergence_*.rs` files instead of claiming broad exact parity.
+- Some test files retain historical "divergence" wording even after a fix has
+  made the pin a green guard. Treat `divergence_*` filenames as evidence
+  locations, not proof that the current assertion is failing.
+
+## Evidence Inventory
+
+Current divergence-test count by crate:
+
+| Crate | `divergence_*.rs` files |
+|---|---:|
+| `ferrolearn-bayes` | 8 |
+| `ferrolearn-cluster` | 30 |
+| `ferrolearn-core` | 3 |
+| `ferrolearn-covariance` | 6 |
+| `ferrolearn-datasets` | 4 |
+| `ferrolearn-decomp` | 35 |
+| `ferrolearn-kernel` | 10 |
+| `ferrolearn-linear` | 62 |
+| `ferrolearn-metrics` | 13 |
+| `ferrolearn-model-sel` | 31 |
+| `ferrolearn-neighbors` | 17 |
+| `ferrolearn-neural` | 5 |
+| `ferrolearn-numerical` | 7 |
+| `ferrolearn-preprocess` | 66 |
+| `ferrolearn-sparse` | 4 |
+| `ferrolearn-tree` | 18 |
+
+The highest-signal files for future parity work are:
+
+- API surface inventories and exclusions:
+  `ferrolearn-*/tests/conformance/_surface_inventory.toml` and
+  `ferrolearn-*/tests/conformance/_surface_exclusions.toml`.
+- Source-level requirement tables in implementation files such as
+  `ferrolearn-preprocess/src/lib.rs`, `ferrolearn-metrics/src/regression.rs`,
+  `ferrolearn-cluster/src/birch.rs`, `ferrolearn-cluster/src/bisecting_kmeans.rs`,
+  `ferrolearn-decomp/src/pca.rs`, `ferrolearn-decomp/src/cross_decomposition.rs`,
+  `ferrolearn-neighbors/src/nearest_neighbors.rs`, and
+  `ferrolearn-tree/src/adaboost.rs`.
+- Current Python bindings in `ferrolearn-python/src/lib.rs` and wrapper modules.
+
+## Recommended Next Work
+
+1. Fix stale user-facing docs first: root `README.md` crate count, MSRV, and
+   broad parity claims.
+2. Convert the exact API gap table into tracked issues by module, separating
+   estimators from standalone helpers/displays.
+3. Add a generated parity-inventory script so this report can be refreshed
+   repeatably from sklearn docs and Rust public symbols.
+4. For behavioral parity, prioritize areas where present APIs return different
+   values rather than merely narrower Rust surfaces: metrics edge cases,
+   preprocessing degeneracies, tree/ensemble prediction behavior, neighbor
+   query semantics, and cluster/decomposition RNG or solver differences.
