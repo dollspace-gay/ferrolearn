@@ -9,8 +9,10 @@
 //! TfidfTransformer` `:1483`, `TfidfVectorizer` `:1721`). Design doc:
 //! `.design/preprocess/tfidf.md`. Expected values from the live sklearn 1.5.2 oracle (R-CHAR-3).
 //! Consumer: crate re-export (`lib.rs:142`, grandfathered S5). HONEST (R-HONEST-3): a faithful
-//! DENSE `TfidfTransformer` — the full numeric contract (IDF formula, sublinear-tf, l1/l2/None
-//! norm) value-matches sklearn; sparse, `TfidfVectorizer`, param-validation, PyO3 are NOT-STARTED.
+//! DENSE `TfidfTransformer` plus scoped DENSE `TfidfVectorizer` — the full numeric contract
+//! (IDF formula, sublinear-tf, l1/l2/None norm) value-matches sklearn; sparse,
+//! analyzer/tokenizer hooks, n-grams, stop words, dtype/fixed-vocabulary, param-validation,
+//! PyO3 are NOT-STARTED.
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
@@ -23,10 +25,11 @@
 //! | REQ-7 (idf_ attribute exposure) | SHIPPED | `idf() -> Option<&Array1<F>>` mirrors sklearn fitted attr `idf_` (`text.py:1666`). |
 //! | REQ-8 (sparse CSR I/O) | NOT-STARTED | open prereq blocker #1211. Dense `Array2<F>` only; sklearn accept_sparse + sparse output (`text.py:1648`). |
 //! | REQ-9 (ctor surface + _parameter_constraints) | NOT-STARTED | open prereq blocker #1212. Closed `TfidfNorm` enum; no runtime validation / InvalidParameterError (`text.py:1614-1625`, R-DEV-2). |
-//! | REQ-10 (TfidfVectorizer) | NOT-STARTED | open prereq blocker #1213. No raw-text→TF-IDF chain (`text.py:1721`). |
+//! | REQ-10 (TfidfVectorizer) | SHIPPED (scoped) / residual open | `TfidfVectorizer` chains the shipped `CountVectorizer` and `TfidfTransformer` for dense f64 raw text; `tests/divergence_tfidf_vectorizer.rs` pins default, transform, sublinear_tf, use_idf=false, and max_features against sklearn 1.5.2. Residual analyzer/tokenizer hooks, n-grams, stop words, sparse CSR, dtype/fixed vocabulary, and PyO3 stay open under #1213/#1211/#1220-#1228. |
 //! | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1214. No `ferrolearn-python` registration (R-DEFER-1). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1215. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
+use crate::count_vectorizer::{CountVectorizer, FittedCountVectorizer};
 use ferrolearn_core::error::FerroError;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -285,6 +288,220 @@ impl<F: Float + Send + Sync + 'static> FittedTfidfTransformer<F> {
         }
 
         Ok(result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TfidfVectorizer
+// ---------------------------------------------------------------------------
+
+/// Raw-text vectorizer that combines count vectorization and TF-IDF weighting.
+///
+/// This is the dense `f64` analogue of scikit-learn's
+/// `sklearn.feature_extraction.text.TfidfVectorizer` for the options already
+/// supported by [`CountVectorizer`] and [`TfidfTransformer`].
+#[derive(Debug, Clone)]
+pub struct TfidfVectorizer {
+    /// Maximum number of features (vocabulary size). `None` means no limit.
+    pub max_features: Option<usize>,
+    /// Minimum document frequency (absolute count) for a term to be included.
+    pub min_df: usize,
+    /// Maximum document frequency as a fraction of total documents.
+    pub max_df: f64,
+    /// If `true`, all counts are clipped to 0/1 before TF-IDF weighting.
+    pub binary: bool,
+    /// If `true`, lowercase all tokens before counting.
+    pub lowercase: bool,
+    /// Row normalization mode.
+    pub norm: TfidfNorm,
+    /// Whether to use IDF weighting.
+    pub use_idf: bool,
+    /// Whether to smooth IDF.
+    pub smooth_idf: bool,
+    /// Whether to apply sublinear TF scaling.
+    pub sublinear_tf: bool,
+}
+
+impl TfidfVectorizer {
+    /// Create a new `TfidfVectorizer` with sklearn-like defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_features: None,
+            min_df: 1,
+            max_df: 1.0,
+            binary: false,
+            lowercase: true,
+            norm: TfidfNorm::L2,
+            use_idf: true,
+            smooth_idf: true,
+            sublinear_tf: false,
+        }
+    }
+
+    /// Set the maximum number of features.
+    #[must_use]
+    pub fn max_features(mut self, n: usize) -> Self {
+        self.max_features = Some(n);
+        self
+    }
+
+    /// Set the minimum document frequency.
+    #[must_use]
+    pub fn min_df(mut self, min_df: usize) -> Self {
+        self.min_df = min_df;
+        self
+    }
+
+    /// Set the maximum document frequency as a fraction of total documents.
+    #[must_use]
+    pub fn max_df(mut self, max_df: f64) -> Self {
+        self.max_df = max_df;
+        self
+    }
+
+    /// Enable or disable binary counting before TF-IDF weighting.
+    #[must_use]
+    pub fn binary(mut self, binary: bool) -> Self {
+        self.binary = binary;
+        self
+    }
+
+    /// Enable or disable lowercasing before tokenization.
+    #[must_use]
+    pub fn lowercase(mut self, lowercase: bool) -> Self {
+        self.lowercase = lowercase;
+        self
+    }
+
+    /// Set the row normalization mode.
+    #[must_use]
+    pub fn norm(mut self, norm: TfidfNorm) -> Self {
+        self.norm = norm;
+        self
+    }
+
+    /// Set whether to use IDF weighting.
+    #[must_use]
+    pub fn use_idf(mut self, use_idf: bool) -> Self {
+        self.use_idf = use_idf;
+        self
+    }
+
+    /// Set whether to smooth IDF.
+    #[must_use]
+    pub fn smooth_idf(mut self, smooth: bool) -> Self {
+        self.smooth_idf = smooth;
+        self
+    }
+
+    /// Set whether to apply sublinear TF scaling.
+    #[must_use]
+    pub fn sublinear_tf(mut self, sublinear: bool) -> Self {
+        self.sublinear_tf = sublinear;
+        self
+    }
+
+    /// Fit the vectorizer on a corpus of documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] from the delegated count-vectorizer or TF-IDF
+    /// transformer fit paths.
+    pub fn fit(&self, docs: &[String]) -> Result<FittedTfidfVectorizer, FerroError> {
+        let count_vectorizer = self.build_count_vectorizer();
+        let fitted_counts = count_vectorizer.fit(docs)?;
+        let counts = fitted_counts.transform(docs)?;
+        let fitted_tfidf = self.build_tfidf_transformer().fit(&counts)?;
+        Ok(FittedTfidfVectorizer {
+            count_vectorizer: fitted_counts,
+            tfidf_transformer: fitted_tfidf,
+        })
+    }
+
+    /// Fit the vectorizer and return the TF-IDF matrix for the training corpus.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] from the delegated count-vectorizer or TF-IDF
+    /// transformer paths.
+    pub fn fit_transform(&self, docs: &[String]) -> Result<Array2<f64>, FerroError> {
+        let fitted = self.fit(docs)?;
+        fitted.transform(docs)
+    }
+
+    fn build_count_vectorizer(&self) -> CountVectorizer {
+        CountVectorizer {
+            max_features: self.max_features,
+            min_df: self.min_df,
+            max_df: self.max_df,
+            binary: self.binary,
+            lowercase: self.lowercase,
+        }
+    }
+
+    fn build_tfidf_transformer(&self) -> TfidfTransformer<f64> {
+        TfidfTransformer::<f64>::new()
+            .norm(self.norm)
+            .use_idf(self.use_idf)
+            .smooth_idf(self.smooth_idf)
+            .sublinear_tf(self.sublinear_tf)
+    }
+}
+
+impl Default for TfidfVectorizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A fitted raw-text TF-IDF vectorizer.
+#[derive(Debug, Clone)]
+pub struct FittedTfidfVectorizer {
+    count_vectorizer: FittedCountVectorizer,
+    tfidf_transformer: FittedTfidfTransformer<f64>,
+}
+
+impl FittedTfidfVectorizer {
+    /// Return the learned vocabulary as a sorted slice of terms.
+    #[must_use]
+    pub fn vocabulary(&self) -> &[String] {
+        self.count_vectorizer.vocabulary()
+    }
+
+    /// Return the vocabulary mapping (term -> column index).
+    #[must_use]
+    pub fn vocabulary_map(&self) -> &std::collections::HashMap<String, usize> {
+        self.count_vectorizer.vocabulary_map()
+    }
+
+    /// Return the IDF weights, if `use_idf` was enabled.
+    #[must_use]
+    pub fn idf(&self) -> Option<&Array1<f64>> {
+        self.tfidf_transformer.idf()
+    }
+
+    /// Return the fitted count vectorizer used by this estimator.
+    #[must_use]
+    pub fn count_vectorizer(&self) -> &FittedCountVectorizer {
+        &self.count_vectorizer
+    }
+
+    /// Return the fitted TF-IDF transformer used by this estimator.
+    #[must_use]
+    pub fn tfidf_transformer(&self) -> &FittedTfidfTransformer<f64> {
+        &self.tfidf_transformer
+    }
+
+    /// Transform documents into a dense TF-IDF matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError`] from the delegated count-vectorizer or TF-IDF
+    /// transformer paths.
+    pub fn transform(&self, docs: &[String]) -> Result<Array2<f64>, FerroError> {
+        let counts = self.count_vectorizer.transform(docs)?;
+        self.tfidf_transformer.transform(&counts)
     }
 }
 

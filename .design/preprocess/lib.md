@@ -138,7 +138,7 @@ submodule, or the crate fails to compile.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (re-export boundary — six `__all__` lists) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:106-163`) surfaces every implemented estimator at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`), projection (`GaussianRandomProjection`, `SparseRandomProjection`), and compose (`ColumnTransformer`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess` → 429 lib + 44 doctests, 0 failed; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
+| REQ-1 (re-export boundary — six `__all__` lists) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:106-163`) surfaces every implemented estimator at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`), projection (`GaussianRandomProjection`, `SparseRandomProjection`), and compose (`ColumnTransformer`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess` → 486 lib + 46 doctests, 0 failed; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
 | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker **#1362** (crate-root substrate, R-SUBSTRATE-1). `lib.rs`'s doc-comment examples and every submodule operate on `ndarray::{Array1, Array2}` with `F: num_traits::Float + Send + Sync + 'static`; `ferrolearn-preprocess/Cargo.toml` declares `ndarray.workspace = true` + `num-traits.workspace = true`, not `ferray-core` / `ferray-ufunc`. The whole crate is on the wrong substrate; migration cascades through all 33 submodules. Not migrated. |
 
 ## Architecture
@@ -179,10 +179,8 @@ ABSENT: `GenericUnivariateSelect`, `mutual_info_classif`,
 `mutual_info_regression`, `f_oneway`, and the `SelectorMixin` base trait.
 
 **`sklearn.feature_extraction.text` (`text.py:34-43`).**
-PRESENT: `CountVectorizer`, `TfidfTransformer` (`:143-144`).
-ABSENT: `HashingVectorizer`, `TfidfVectorizer` (the fused
-count+tfidf vectorizer; ferrolearn ships the two stages separately but not the
-fused convenience class).
+PRESENT: `CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer` (`:143-144`).
+ABSENT: `HashingVectorizer`.
 
 **`sklearn.impute` (`impute/__init__.py:13`).**
 PRESENT: `MissingIndicator`, `SimpleImputer`, `KNNImputer`, `IterativeImputer`
@@ -226,8 +224,8 @@ Commands establishing the SHIPPED claim:
 - `cargo build -p ferrolearn-preprocess` — every `pub use` in `:106-163` resolves;
   a build failure here would mean a re-export names a non-existent type (REQ-1
   boundary integrity).
-- `cargo test -p ferrolearn-preprocess` — 429 lib unit tests + 44 doctests,
-  0 failed (baseline `51f60dc0`).
+- `cargo test -p ferrolearn-preprocess` — 486 lib unit tests + 46 doctests,
+  0 failed in the current worktree.
 - `cargo build -p ferrolearn` — the meta-crate compiles against the re-export
   boundary, exercising `pub use ferrolearn_preprocess as preprocess;`
   (`ferrolearn/src/lib.rs:36`).

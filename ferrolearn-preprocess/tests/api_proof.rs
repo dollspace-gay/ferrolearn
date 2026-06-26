@@ -17,8 +17,8 @@ use ferrolearn_preprocess::{
     PolynomialFeatures, PowerTransformer, QuantileTransformer, RobustScaler, ScoreFunc, SelectFdr,
     SelectFpr, SelectFwe, SelectKBest, SelectPercentile, SequentialFeatureSelector, SimpleImputer,
     SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
-    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, maxabs_scale,
-    minmax_scale, power_transform, r_regression,
+    TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression,
+    maxabs_scale, minmax_scale, power_transform, r_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -302,6 +302,11 @@ fn api_proof_text() {
     let counts_f64 = counts.mapv(|v| v);
     let f = TfidfTransformer::<f64>::new().fit(&counts_f64).unwrap();
     let _ = f.transform(&counts_f64).unwrap();
+
+    let f = TfidfVectorizer::new().fit(&docs).unwrap();
+    let tfidf = f.transform(&docs).unwrap();
+    assert_eq!(tfidf.nrows(), 3);
+    assert_eq!(tfidf.ncols(), f.vocabulary().len());
 }
 
 // =============================================================================

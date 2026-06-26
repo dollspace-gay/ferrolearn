@@ -23,17 +23,19 @@ exposes `idf_` as a fitted NumPy attribute. `TfidfVectorizer` (`text.py:1721`)
 chains `CountVectorizer` + `TfidfTransformer` over raw text documents.
 
 `ferrolearn-preprocess/src/tfidf.rs` ships a faithful **dense** `TfidfTransformer<F>`
-/ `FittedTfidfTransformer<F>` pair that implements the full numeric contract for
-the default and configured paths: all four parameters (`norm`, `use_idf`,
+/ `FittedTfidfTransformer<F>` pair and a scoped dense `TfidfVectorizer` /
+`FittedTfidfVectorizer` pair. The transformer implements the full numeric contract
+for the default and configured paths: all four parameters (`norm`, `use_idf`,
 `smooth_idf`, `sublinear_tf`) are present and behaviorally correct, the IDF formula
 and l2/l1/None normalization value-match the live sklearn oracle to ULP tolerance
-(see Probes), and `idf()` exposes the learned weights. What is **absent**: sparse
-(CSR) input/output (ferrolearn computes on `ndarray::Array2`), `TfidfVectorizer`
-(no raw-text → TF-IDF chain type — only `CountVectorizer` and `TfidfTransformer`
-exist separately), `_parameter_constraints`-style validation / typed param errors
-(R-DEV-2), a PyO3 binding, and the ferray substrate. The non-test boundary consumer
-is the crate re-export `pub use tfidf::{FittedTfidfTransformer, TfidfNorm,
-TfidfTransformer}` (`lib.rs` line 142).
+(see Probes), and `idf()` exposes the learned weights. `TfidfVectorizer` chains the
+existing dense `CountVectorizer` and `TfidfTransformer` over `Vec<String>` and
+re-exposes `vocabulary()` plus `idf()`. What is **absent**: sparse (CSR)
+input/output (ferrolearn computes on `ndarray::Array2`), analyzer/tokenizer hooks,
+n-grams, stop words, dtype/fixed-vocabulary support, `_parameter_constraints`-style
+validation / typed param errors (R-DEV-2), a PyO3 binding, and the ferray substrate.
+The non-test boundary consumer is the crate re-export `pub use tfidf::{...,
+TfidfVectorizer}` (`lib.rs` text-processing re-export).
 
 ## Probes (live sklearn oracle, 1.5.2)
 
@@ -68,6 +70,16 @@ print('none', np.round(T(norm=None).fit_transform(c).toarray(),8).tolist())"
 python3 -c "import numpy as np; from sklearn.feature_extraction.text import TfidfTransformer as T; \
 print(np.round(T(sublinear_tf=True,use_idf=False,norm=None).fit_transform(np.array([[4.,1.]])).toarray(),8).tolist())"
 # -> [[2.38629436, 1.0]]   (ferrolearn test_tfidf_sublinear_tf pins exactly this; MATCH)
+
+# REQ-10 — TfidfVectorizer dense raw-doc chain, default path
+python3 -c "from sklearn.feature_extraction.text import TfidfVectorizer; docs=['cat cat dog','dog fish','cat bird']; \
+v=TfidfVectorizer(); X=v.fit_transform(docs); \
+print(v.get_feature_names_out().tolist()); print(v.idf_.tolist()); print(X.toarray().tolist()); \
+print(v.transform(['cat dog bird','fish unknown']).toarray().tolist())"
+# -> ['bird', 'cat', 'dog', 'fish']
+# -> [1.6931471805599454, 1.2876820724517808, 1.2876820724517808, 1.6931471805599454]
+# -> [[0.0, 0.8944271909999159, 0.4472135954999579, 0.0], ...]
+# -> [[0.680918560398684, 0.5178561161676974, 0.5178561161676974, 0.0], [0.0, 0.0, 0.0, 1.0]]
 
 # REQ-9 — _parameter_constraints reject bad norm (R-DEV-2 error-type contract)
 python3 -c "from sklearn.feature_extraction.text import TfidfTransformer; import numpy as np; \
@@ -132,8 +144,9 @@ TfidfTransformer(norm='l3').fit(np.array([[1.,0.]]))"
   is sparse. (No sparse signature exists today.)
 - AC-9 (REQ-9): constructing/fitting with `norm='l3'` (or a non-boolean flag)
   yields the sklearn-matching error type (REQ-9 Probe → `InvalidParameterError`).
-- AC-10 (REQ-10): a `TfidfVectorizer` type accepts `Vec<String>` and produces a
-  TF-IDF matrix equal to `CountVectorizer` + `TfidfTransformer`; exposes `idf_`.
+- AC-10 (REQ-10): `TfidfVectorizer` accepts `Vec<String>` and produces the REQ-10
+  Probe vectors for default, fitted transform, `sublinear_tf`, `use_idf=false`, and
+  `max_features`; exposes `idf()` and `vocabulary()`.
 - AC-11 (REQ-11): `python3 -c "import ferrolearn; ferrolearn.feature_extraction.TfidfTransformer"`
   resolves and `.transform` matches sklearn on the REQ-2 Probe.
 - AC-12 (REQ-12): the compute path uses `ferray-core` (no `ndarray`/`num_traits`
@@ -152,13 +165,14 @@ TfidfTransformer(norm='l3').fit(np.array([[1.,0.]]))"
 | REQ-7 (idf_ attribute exposure) | SHIPPED | impl `pub fn idf(&self) -> Option<&Array1<F>> in FittedTfidfTransformer (tfidf.rs)` returns the learned vector (or `None` when `use_idf=false`), mirroring the sklearn fitted attr `idf_` (`text.py:1666`). Non-test consumer: `lib.rs` line 142 (the getter is part of the re-exported fitted type's public surface). Verification: `test_tfidf_smooth_idf` reads `fitted.idf().unwrap()`. Note: ferrolearn exposes IDF via a `fn idf()` accessor, not a public field named `idf_`. |
 | REQ-8 (sparse CSR I/O) | NOT-STARTED | open prereq blocker #1211. `fit`/`transform` take `&Array2<F>` (dense) and return `Array2<F>`; there is no `sprs`/CSR signature. sklearn validates `accept_sparse=('csr','csc')` and returns a sparse matrix (`text.py:1648`, `:1684`). |
 | REQ-9 (ctor surface + _parameter_constraints) | NOT-STARTED | open prereq blocker #1212. All four params exist as builder setters, but `norm` is a closed Rust enum (`TfidfNorm`) so there is no runtime string-validation / typed `InvalidParameterError` path; no `_parameter_constraints` analog (REQ-9 Probe → `InvalidParameterError`) (R-DEV-2). |
-| REQ-10 (TfidfVectorizer) | NOT-STARTED | open prereq blocker #1213. No `TfidfVectorizer` type exists — only `CountVectorizer` and `TfidfTransformer` separately; the raw-text→TF-IDF chain and its `idf_` property (`text.py:1721`, `:1991-2006`, `:2037-2097`) are unimplemented. |
+| REQ-10 (TfidfVectorizer) | SHIPPED scoped / residual open | `TfidfVectorizer` / `FittedTfidfVectorizer` in `tfidf.rs` chain the shipped dense `CountVectorizer` and `TfidfTransformer` over raw `Vec<String>` documents and expose `vocabulary()` / `idf()` accessors, mirroring the scoped sklearn raw-text → TF-IDF flow (`text.py:1721`, `:1991-2006`, `:2037-2097`). Non-test consumer: crate re-export `pub use tfidf::{..., TfidfVectorizer}`. Verification: `tests/divergence_tfidf_vectorizer.rs` pins default `fit`/`transform`, `sublinear_tf`, `use_idf=false`, `max_features`, and rejection contracts against live sklearn 1.5.2. Residual gaps remain for analyzer/tokenizer hooks, n-grams, stop words, sparse CSR, dtype/fixed vocabulary, full ctor validation, and PyO3. |
 | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1214. No `ferrolearn-python` registration; `import ferrolearn` cannot expose `TfidfTransformer`/`TfidfVectorizer` (boundary consumer per R-DEFER-1). |
 | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1215. Compute path uses `ndarray::Array2`/`Array1` + `num_traits::Float` + `mapv_inplace`/`rows_mut`, not `ferray-core` (R-SUBSTRATE-1/2). |
 
 ## Architecture
 
-**ferrolearn (existing).** Two generic types in `tfidf.rs`. The unfitted
+**ferrolearn (existing).** Two generic transformer types plus a dense vectorizer
+pair in `tfidf.rs`. The unfitted
 `TfidfTransformer<F>` holds the four public params (`norm: TfidfNorm`, `use_idf:
 bool`, `smooth_idf: bool`, `sublinear_tf: bool`) plus a `PhantomData<F>`, with a
 builder API (`new`, `norm`, `use_idf`, `smooth_idf`, `sublinear_tf`) and
@@ -171,7 +185,10 @@ unsmooth IDF, returning `Some(idf_vec)` (else `None`). The fitted
 (b) shape-checks `counts.ncols() == idf.len()` when IDF present
 (`FerroError::ShapeMismatch`), (c) applies sublinear TF in place, (d) multiplies
 each row element-wise by `idf[j]`, (e) row-normalizes per `TfidfNorm`. Generic
-bound `F: Float + Send + Sync + 'static` supports f32/f64.
+bound `F: Float + Send + Sync + 'static` supports f32/f64. `TfidfVectorizer` is
+the raw-text dense f64 wrapper: it stores the supported CountVectorizer knobs
+(`max_features`, `min_df`, `max_df`, `binary`, `lowercase`) plus the TF-IDF knobs
+and returns `FittedTfidfVectorizer { FittedCountVectorizer, FittedTfidfTransformer<f64> }`.
 
 **sklearn (target contract).** `TfidfTransformer(OneToOneFeatureMixin,
 TransformerMixin, BaseEstimator)` (`text.py:1483`) with `_parameter_constraints`
@@ -190,12 +207,13 @@ sublinear (`log` then `+1`), `X.data *= idf_[X.indices]`, then
 **Numeric equivalence.** The IDF formula, sublinear TF, IDF multiply, and l1/l2/None
 normalization all value-match the live oracle to ULP tolerance (Probes REQ-1..5).
 The substantive divergences are structural, not numeric: dense-only I/O (REQ-8),
-enum-typed `norm` with no runtime validation contract (REQ-9), the missing
-`TfidfVectorizer` chain (REQ-10), and the absent binding/substrate (REQ-11/12).
+enum-typed `norm` with no runtime validation contract (REQ-9), residual
+TfidfVectorizer CountVectorizer-surface gaps (analyzer/tokenizer hooks, n-grams,
+stop words, dtype/fixed vocabulary), and the absent binding/substrate (REQ-11/12).
 
 ## Verification
 
-Commands establishing the SHIPPED claims (REQ-1..7):
+Commands establishing the SHIPPED claims (REQ-1..7 and REQ-10 scoped):
 
 ```bash
 # Oracle (Probes REQ-1..5) — see Probes block above; all value-match dense ferrolearn output.
@@ -206,20 +224,19 @@ cargo test -p ferrolearn-preprocess   # incl. test_tfidf_basic, test_tfidf_no_id
                                        # test_tfidf_sublinear_tf, test_tfidf_smooth_idf,
                                        # test_tfidf_no_smooth_idf, test_tfidf_empty,
                                        # test_tfidf_shape_mismatch, test_tfidf_f32
+cargo test -p ferrolearn-preprocess --test divergence_tfidf_vectorizer
 cargo clippy -p ferrolearn-preprocess --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The existing `#[test]`s pin REQ-1/3/5/6/7 against **exact oracle values**
-(`test_tfidf_smooth_idf`: `idf[1] == 2f64.ln()+1`; `test_tfidf_no_smooth_idf`:
-`3f64.ln()+1`; `test_tfidf_sublinear_tf`: `1+4f64.ln()`). REQ-2 and REQ-4 are
-currently pinned only by their **norm property** (`row_norm ≈ 1`,
-`row_l1 ≈ 1`, identity for None) — NOT by the full oracle value vector
-`[[0.50854232,0.861037,0],…]`. This is the single most fixable gap: the critic
-should add an oracle-grounded `#[test]` asserting the REQ-2 dense output equals
-the REQ-2 Probe to 1e-8 (R-CHAR-3). `api_proof.rs` (`tests/`) is a test-only
-consumer and does not count toward R-DEFER-1; the lib.rs re-export is the
-non-test boundary consumer. No currently-green command establishes REQ-8..12.
+The divergence tests pin REQ-1..7 against exact oracle values: `green_req1_*`,
+`green_req2_default_fit_transform_l2_full_vector`, `green_req3_*`,
+`green_req4_norm_l1_full_vector`, `green_req4_norm_none_full_vector`,
+`green_req5_sublinear_tf`, and `green_req6_use_idf_false_l2`.
+`tests/divergence_tfidf_vectorizer.rs` pins REQ-10's raw-document fused path.
+`api_proof.rs` (`tests/`) is a test-only consumer and does not count toward
+R-DEFER-1; the lib.rs re-export is the non-test boundary consumer. No currently
+green command establishes REQ-8/9/11/12.
 
 ## Blockers
 
@@ -231,8 +248,9 @@ Each NOT-STARTED REQ files a `-l blocker` issue (the orchestrator assigns
 - #1212 — REQ-9: closed `TfidfNorm` enum with no runtime
   string-validation / `InvalidParameterError` path; no `_parameter_constraints`
   analog (R-DEV-2).
-- #1213 — REQ-10: no `TfidfVectorizer` type chaining
-  `CountVectorizer` + `TfidfTransformer`; no `idf_` property re-exposure.
+- #1213 — REQ-10 residual: `TfidfVectorizer` exists for the dense shipped subset,
+  but analyzer/tokenizer hooks, n-grams, stop words, dtype/fixed vocabulary, full
+  sklearn ctor validation, and PyO3 remain out of scope.
 - #1214 — REQ-11: no `ferrolearn-python` registration of `TfidfTransformer`/
   `TfidfVectorizer`.
 - #1215 — REQ-12: compute path on `ndarray`/`num_traits`, not `ferray-core`.

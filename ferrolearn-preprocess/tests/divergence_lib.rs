@@ -80,6 +80,7 @@ use ferrolearn_preprocess::{
     FittedStandardScaler,
     FittedTargetEncoder,
     FittedTfidfTransformer,
+    FittedTfidfVectorizer,
     FittedVarianceThreshold,
     FunctionTransformer,
     GaussianRandomProjection,
@@ -125,6 +126,7 @@ use ferrolearn_preprocess::{
     TargetEncoder,
     TfidfNorm,
     TfidfTransformer,
+    TfidfVectorizer,
     ThresholdStrategy,
     VarianceThreshold,
     add_dummy_feature,
@@ -263,6 +265,8 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedCountVectorizer>();
     name_type::<TfidfTransformer<f64>>();
     name_type::<FittedTfidfTransformer<f64>>();
+    name_type::<TfidfVectorizer>();
+    name_type::<FittedTfidfVectorizer>();
 
     // --- impute (IterativeImputer is experimental in sklearn 1.5.2) ---
     name_type::<SimpleImputer<f64>>();

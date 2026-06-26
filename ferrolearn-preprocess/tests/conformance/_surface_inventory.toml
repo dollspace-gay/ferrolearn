@@ -189,6 +189,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::FittedTfidfVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::FittedVarianceThreshold"
 phase = "preprocess"
 fixture = ""
@@ -415,6 +420,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_preprocess::TfidfTransformer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::TfidfVectorizer"
 phase = "preprocess"
 fixture = ""
 
