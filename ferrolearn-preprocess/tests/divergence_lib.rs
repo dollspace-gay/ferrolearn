@@ -55,6 +55,7 @@ use ferrolearn_preprocess::{
     FittedIterativeImputer,
     FittedKBinsDiscretizer,
     FittedKNNImputer,
+    FittedKernelCenterer,
     FittedLabelBinarizer,
     FittedLabelEncoder,
     FittedMaxAbsScaler,
@@ -87,6 +88,7 @@ use ferrolearn_preprocess::{
     KBinsDiscretizer,
     KNNImputer,
     KNNWeights,
+    KernelCenterer,
     KnotStrategy,
     LabelBinarizer,
     LabelEncoder,
@@ -157,8 +159,8 @@ fn name_type<T>() {}
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
-/// (R-CHAR-3); ABSENT names (`KernelCenterer`,
-/// `GenericUnivariateSelect`, `mutual_info_*`, `r_regression`,
+/// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
+/// `mutual_info_*`, `r_regression`,
 /// `f_oneway`, `SelectorMixin`, `MissingIndicator`,
 /// `johnson_lindenstrauss_min_dim`, `make_column_selector`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`, `TfidfVectorizer`) are
@@ -191,6 +193,8 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedSplineTransformer<f64>>();
     name_type::<KBinsDiscretizer<f64>>();
     name_type::<FittedKBinsDiscretizer<f64>>();
+    name_type::<KernelCenterer<f64>>();
+    name_type::<FittedKernelCenterer<f64>>();
     name_type::<TargetEncoder<f64>>();
     name_type::<FittedTargetEncoder<f64>>();
     // preprocessing free functions shipped at the crate root

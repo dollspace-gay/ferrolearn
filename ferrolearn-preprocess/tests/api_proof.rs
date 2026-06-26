@@ -11,10 +11,10 @@ use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, CountVectorizer, Direction,
     FunctionTransformer, GaussianRandomProjection, InitialStrategy, IterativeImputer,
-    KBinsDiscretizer, KNNImputer, KNNWeights, KnotStrategy, LabelBinarizer, LabelEncoder,
-    MaxAbsScaler, MinMaxScaler, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
-    OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer, RobustScaler,
-    ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
+    KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy, LabelBinarizer,
+    LabelEncoder, MaxAbsScaler, MinMaxScaler, MultiLabelBinarizer, Normalizer, OneHotEncoder,
+    OrdinalEncoder, OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer,
+    RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
     SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
     StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, add_dummy_feature, chi2,
     f_classif, f_regression, maxabs_scale, minmax_scale, power_transform,
@@ -90,6 +90,9 @@ fn api_proof_feature_engineering() {
         .unwrap();
     let _ = Binarizer::<f64>::new(50.0).transform(&x).unwrap();
     let _ = add_dummy_feature(&x, 1.0).unwrap();
+    let k = array![[9.0, 2.0, -2.0], [2.0, 14.0, -13.0], [-2.0, -13.0, 21.0]];
+    let fitted = KernelCenterer::<f64>::new().fit(&k, &()).unwrap();
+    let _ = fitted.transform(&k).unwrap();
     // FunctionTransformer takes an element-wise Fn(F) -> F.
     let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0)
         .transform(&x)
