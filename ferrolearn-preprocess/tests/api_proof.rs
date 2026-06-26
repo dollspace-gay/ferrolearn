@@ -18,7 +18,7 @@ use ferrolearn_preprocess::{
     SelectFpr, SelectFwe, SelectKBest, SelectPercentile, SequentialFeatureSelector, SimpleImputer,
     SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
     VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, maxabs_scale,
-    minmax_scale, power_transform,
+    minmax_scale, power_transform, r_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -282,6 +282,8 @@ fn api_proof_feature_selection() {
     assert_eq!(chi2_stats.len(), 3);
     let (r_stats, _p) = f_regression::<f64>(&x, &y_f64).unwrap();
     assert_eq!(r_stats.len(), 3);
+    let corr = r_regression::<f64>(&x, &y_f64).unwrap();
+    assert_eq!(corr.len(), 3);
 }
 
 // =============================================================================

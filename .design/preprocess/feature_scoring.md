@@ -1,4 +1,4 @@
-# f_classif / f_regression / chi2 — univariate feature scoring
+# f_classif / r_regression / f_regression / chi2 — univariate feature scoring
 
 <!--
 tier: 3-component
@@ -8,23 +8,25 @@ upstream: scikit-learn 1.5.2
 upstream-paths:
   - sklearn/feature_selection/_univariate_selection.py  # f_oneway (:43-117) computes the one-way ANOVA F via ss_alldata/sums_args/square_of_sums_alldata -> ssbn/sswn -> msb/msw -> f = msb/msw, prob = special.fdtrc(dfbn, dfwn, f) (:116); f_classif (:127-173) groups X by np.unique(y) and calls f_oneway(*args) (:172-173); _chisquare (:176-192) chisq = ((f_obs-f_exp)**2/f_exp).sum(axis=0), p = special.chdtrc(k-1, chisq) (:192); chi2 (:202-288) observed = Y.T@X (LabelBinarizer one-hot), feature_count = X.sum(0), class_prob = Y.mean(0), expected = class_prob.T@feature_count, _chisquare(observed, expected) (:275-288); r_regression (:300-393) Pearson corr (center/force_finite); f_regression (:405-...) corr from r_regression, F = corr**2/(1-corr**2)*deg_of_freedom (deg=n-2 when center), p = stats.f.sf(F, 1, deg). p-values come from scipy.special.fdtrc / chdtrc (exact).
 ferrolearn-module: ferrolearn-preprocess/src/feature_scoring.rs
-parity-ops: f_classif, f_regression, chi2
+parity-ops: f_classif, r_regression, f_regression, chi2
 crosslink-issue: 1416
 -->
 
 ## Summary
 
 scikit-learn's univariate scoring functions `f_classif`
-(`_univariate_selection.py:127`, via `f_oneway` `:43-117`), `f_regression` (`:405`,
-via `r_regression` `:300`) and `chi2` (`:202`, via `_chisquare` `:176`) each return
-a `(statistic, p_value)` pair per feature: an ANOVA F-statistic, a
-Pearson-correlation-derived F-statistic, and a chi-squared statistic respectively.
+(`_univariate_selection.py:127`, via `f_oneway` `:43-117`), `r_regression`
+(`:301`), `f_regression` (`:405`, via `r_regression`) and `chi2` (`:202`, via
+`_chisquare` `:176`) compute per-feature ANOVA F-statistics, signed Pearson
+correlations, Pearson-correlation-derived F-statistics, and chi-squared
+statistics respectively.
 The p-values come from `scipy.special.fdtrc` (the exact F-distribution survival
 function) and `scipy.special.chdtrc` (the exact chi-squared survival function).
 
-`ferrolearn-preprocess/src/feature_scoring.rs` ships the three statistic
-computations — `f_classif` (`:62`), `f_regression` (`:181`), `chi2` (`:294`) — each
-returning `(Array1<F> statistics, Array1<F> p_values)`, plus the
+`ferrolearn-preprocess/src/feature_scoring.rs` ships the statistic
+computations — `f_classif`, `r_regression`, `f_regression`, `chi2` — where
+`r_regression` returns signed correlations and the others return
+`(Array1<F> statistics, Array1<F> p_values)`, plus the
 `compute_scores_classif` (`:656`) / `compute_scores_regression` (`:678`)
 score-only dispatchers and a set of hand-rolled distribution helpers
 (`f_distribution_sf` `:392`, `chi2_distribution_sf` `:419`,
@@ -33,12 +35,12 @@ score-only dispatchers and a set of hand-rolled distribution helpers
 **DETERMINISTIC numeric-parity unit** — no RNG; the statistics are value-verifiable
 against the live oracle to ~1e-15.
 
-This is a **shipped-partial** unit: **5 SHIPPED** (REQ-1 `f_classif` F-statistic
+This is a **shipped-partial** unit: **6 SHIPPED** (REQ-1 `f_classif` F-statistic
 parity, REQ-2 `f_regression` F-statistic parity, REQ-3 `chi2` statistic parity,
-REQ-4 p-value parity, REQ-5 error / parameter contracts) / **6 NOT-STARTED** (REQ-6
-`f_regression` `center=False` + `force_finite`; REQ-7 `r_regression` free fn +
-returning correlation; REQ-8 sparse `chi2`; REQ-9 `mutual_info_*`; REQ-10 PyO3
-binding; REQ-11 ferray substrate).
+REQ-4 p-value parity, REQ-5 error / parameter contracts, REQ-7 `r_regression`) /
+**5 NOT-STARTED** (REQ-6 `f_regression` `center=False` + `force_finite`; REQ-8
+sparse `chi2`; REQ-9 `mutual_info_*`; REQ-10 PyO3 binding; REQ-11 ferray
+substrate).
 
 **P-value parity (REQ-4, now SHIPPED).** The F-statistics and chi-squared
 statistics match scipy to machine precision, and the p-values for all three
@@ -204,11 +206,15 @@ independent (gamma-based) and matches `special.chdtrc` to ~1e-9. REQ-4 is SHIPPE
   (`:234-237`) and on `r²>=1` returns `F=inf` (`:241-243`) — no `center`/`force_finite`
   parameters and no finite-max clamp. NOT-STARTED on blocker #1418.
 
-- REQ-7: **`r_regression` free function + `f_regression` returning correlation**
-  (NOT-STARTED). sklearn exposes `r_regression` (`:300`) returning the signed Pearson
-  correlation coefficients (range `[-1, 1]`) as a standalone scoring function.
-  ferrolearn has no `r_regression`; the correlation is computed internally inside
-  `f_regression` (`:234-238`) and never surfaced. NOT-STARTED on blocker #1419.
+- REQ-7: **`r_regression` free function returning signed Pearson correlation**
+  (SHIPPED). `r_regression` mirrors sklearn defaults (`center=True`,
+  `force_finite=True`) and `r_regression_with_options` exposes the explicit
+  `center` / `force_finite` controls from `_univariate_selection.py:301-393`.
+  The implementation uses sklearn's centered identity
+  `dot(y - mean(y), X) / (||X_centered|| * ||y_centered||)` and maps undefined
+  NaN correlations to `0.0` when `force_finite=true`. Verification:
+  `tests/divergence_r_regression.rs` pins centered, uncentered, constant-feature,
+  constant-target, and validation contracts against the live sklearn 1.5.2 oracle.
 
 - REQ-8: **sparse `chi2` (CSR)** (NOT-STARTED). sklearn's `chi2` accepts
   `accept_sparse="csr"` (`:264`) and computes `observed = Y.T @ X` via
@@ -273,8 +279,9 @@ independent (gamma-based) and matches `special.chdtrc` to ~1e-9. REQ-4 is SHIPPE
 - AC-6 (REQ-6): `f_regression(X, y, center=False)` and the `force_finite=False`
   `nan` path; ferrolearn `f_regression` has neither parameter. NOT-STARTED.
 
-- AC-7 (REQ-7): `r_regression(X, y)` returns signed correlations in `[-1, 1]`;
-  ferrolearn has no `r_regression` and never surfaces the correlation. NOT-STARTED.
+- AC-7 (REQ-7): `r_regression(X, y)` returns signed correlations in `[-1, 1]`
+  and mirrors sklearn's `center=True, force_finite=True` defaults; the options
+  variant covers `center=False` and `force_finite=False`. SHIPPED.
 
 - AC-8 (REQ-8): `chi2(X_csr, y)` on a sparse `X` matches the dense result;
   ferrolearn `chi2` rejects/has no sparse path. NOT-STARTED.
@@ -300,7 +307,7 @@ independent (gamma-based) and matches `special.chdtrc` to ~1e-9. REQ-4 is SHIPPE
 | REQ-4 (p-values vs scipy `fdtrc`/`chdtrc`) | SHIPPED | impl `f_distribution_sf in feature_scoring.rs` (`:414`) maps `z = d2/(d2+d1·x)`, `a = d2/2`, `b = d1/2` (`:425-428`) into `regularized_incomplete_beta in feature_scoring.rs` (`:549`) + `betacf in feature_scoring.rs` (`:574`), a Numerical Recipes §6.4 Lentz continued fraction with the `x < (a+1)/(a+b+2)` symmetry flip (`:564-568`), now matching `special.betainc` / `special.fdtrc` / `stats.f.sf` to ~13-15 significant figures (Probe D). The chi-squared path `chi2_distribution_sf in feature_scoring.rs` (`:441`) -> `upper_regularized_gamma in feature_scoring.rs` (`:460`) matches `chdtrc` to ~1e-9. Non-test consumer: boundary re-export `pub use feature_scoring::{... f_classif, f_regression, chi2 ...}` (`lib.rs:173-175`) — the p-value vector is part of each fn's `(statistics, p_values)` return. Verification: `cargo test -p ferrolearn-preprocess --test divergence_feature_scoring` (29 tests green) — `divergence_f_classif_pvalues`, `divergence_f_regression_pvalues`, the `reaudit_fclassif_*`/`reaudit_fregression_*` small-p (tail to ~1e-23)/large-p/moderate/p≈0.5/varied-df probes, `greenguard_chi2_pvalues`, `reaudit_chi2_3class_df2_pvalues`. Was DIV-1, blocker #1417, now RESOLVED. |
 | REQ-5 (error / parameter contracts) | SHIPPED | impl `f_classif` (`:62`) returns `Err(InsufficientSamples)` on empty `x` (`:67-73`), `Err(ShapeMismatch)` on `y.len() != n_rows` (`:74-80`), `Err(InvalidParameter)` on `< 2` classes (`:89-94`); `f_regression` (`:181`) returns `Err(InsufficientSamples)` on `< 3` rows (`:186-192`) and `Err(ShapeMismatch)` on length mismatch (`:193-199`); `chi2` (`:294`) returns `Err(InsufficientSamples)` on empty `x` (`:299-305`), `Err(ShapeMismatch)` on length mismatch (`:306-312`), and `Err(InvalidParameter)` on any negative feature (`:315-326`) — mirroring sklearn `if np.any(X < 0): raise ValueError("Input X must be non-negative.")` (`sklearn/feature_selection/_univariate_selection.py:265-266`). Non-test consumer: boundary re-export (`lib.rs:173-175`). Verification: `cargo test -p ferrolearn-preprocess --lib` → `test_f_classif_empty_input`, `test_f_classif_shape_mismatch`, `test_f_classif_single_class_error`, `test_f_regression_too_few_samples`, `test_f_regression_shape_mismatch`, `test_chi2_negative_value_error`, `test_chi2_empty_input`, `test_chi2_shape_mismatch` green. |
 | REQ-6 (`f_regression` `center=False` + `force_finite`) | NOT-STARTED | open prereq blocker #1418. `f_regression in feature_scoring.rs` (`:181`) has no `center`/`force_finite` parameters: it always centers (`x_mean`/`y_mean` subtracted `:205-231`), returns `r=0`→`F=0` on a constant feature (`:234-237`) and `F=inf` on `r²>=1` (`:241-243`) — no `finfo.max` clamp / `p=0.0`. sklearn's `f_regression(..., center=True, force_finite=True)` (`:405`) maps the nan case to `F=0.0`/`p=1.0` and the perfect-correlation case to `F=finfo.max`/`p=0.0` (`:447-461`) and supports `center=False` (`:369-381`). |
-| REQ-7 (`r_regression` free fn + correlation surface) | NOT-STARTED | open prereq blocker #1419. sklearn exposes `r_regression` (`sklearn/feature_selection/_univariate_selection.py:300`) returning signed Pearson coefficients in `[-1, 1]`. ferrolearn has no `r_regression`; the correlation is computed only inside `f_regression` (`:234-238`) and is never returned. |
+| REQ-7 (`r_regression` free fn + correlation surface) | SHIPPED | `r_regression` and `r_regression_with_options` in `feature_scoring.rs` mirror sklearn's signed Pearson correlation helper (`sklearn/feature_selection/_univariate_selection.py:301-393`). Defaults are `center=true` and `force_finite=true`; the options helper exposes both controls. Non-test consumer: crate-root re-export in `lib.rs` plus API proof. Verification: `tests/divergence_r_regression.rs` pins centered, uncentered, constant-feature/target force-finite, and validation behavior against live sklearn 1.5.2. |
 | REQ-8 (sparse `chi2` CSR) | NOT-STARTED | open prereq blocker #1420. sklearn's `chi2` accepts `accept_sparse="csr"` (`:264`) and forms `observed = safe_sparse_dot(Y.T, X)` over sparse `X` (`:275`). ferrolearn's `chi2` (`:294`) takes only dense `Array2<F>`; there is no `sprs::CsMat` overload. |
 | REQ-9 (`mutual_info_classif` / `mutual_info_regression`) | NOT-STARTED | open prereq blocker #1421 (out of this file's scope). The `mutual_info_*` score functions live in the SEPARATE `sklearn/feature_selection/_mutual_info.py` (k-NN entropy estimators with RNG), not in `_univariate_selection.py`. They are absent from `feature_scoring.rs` — not-translated. |
 | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1422. No CPython binding for `f_classif`/`f_regression`/`chi2` exists in `ferrolearn-python/src` (`grep -rn "f_classif\|f_regression\|chi2" ferrolearn-python/src` finds none), so the scoring functions are unreachable from Python. |
@@ -451,13 +458,14 @@ The in-module `#[test]`s pin REQ-1/2/3 (the statistics) and REQ-5 (every error
 path); the in-module `test_*_p_values_bounded` only assert `p ∈ [0,1]`, but REQ-4 is
 established by the `tests/divergence_feature_scoring.rs` oracle suite above, which
 pins the F-SF and chi2 p-values against scipy (29 tests GREEN post-#1417). No green
-command establishes REQ-6..REQ-11 (`center`/`force_finite`, `r_regression`, sparse
+command establishes REQ-6 and REQ-8..REQ-11 (`f_regression center`/`force_finite`, sparse
 `chi2`, `mutual_info_*`, PyO3, ferray).
 
 ## Blockers
 
 REQ-1 (`f_classif` F-statistic), REQ-2 (`f_regression` F-statistic), REQ-3 (`chi2`
-statistic), REQ-4 (p-value parity), and REQ-5 (error / parameter contracts) are
+statistic), REQ-4 (p-value parity), REQ-5 (error / parameter contracts), and
+REQ-7 (`r_regression`) are
 SHIPPED — the module is compiled (`lib.rs:96`) and re-exported (`lib.rs:173-175`, the
 grandfathered boundary consumer), the statistics match the live oracle to ~1e-15,
 the p-values match scipy `fdtrc`/`chdtrc`, and the tests are green.
@@ -479,8 +487,6 @@ tracking issue #1416:
 
 - #1418 — REQ-6: no `center` / `force_finite` parameters on `f_regression`
   (`sklearn/feature_selection/_univariate_selection.py:405`, `:369-381`, `:447-461`).
-- #1419 — REQ-7: no `r_regression` free function returning signed correlations
-  (`:300`).
 - #1420 — REQ-8: no sparse (CSR) `chi2` path (`:264`, `:275`).
 - #1421 — REQ-9: no `mutual_info_classif` / `mutual_info_regression`
   (separate `_mutual_info.py` unit — out of this file's scope, not-translated).

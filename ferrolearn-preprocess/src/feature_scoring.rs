@@ -4,6 +4,7 @@
 //! per-feature statistics and p-values:
 //!
 //! - [`f_classif`] — ANOVA F-statistic for classification.
+//! - [`r_regression`] — Pearson correlation between each feature and target.
 //! - [`f_regression`] — univariate F-statistic via Pearson correlation.
 //! - [`chi2`] — chi-squared statistic for non-negative features.
 //!
@@ -27,8 +28,8 @@
 //! | REQ-3 | [`chi2`] statistic value parity | SHIPPED | matches sklearn `_chisquare` `:176-192`; oracle stat tests (tol 1e-9) |
 //! | REQ-4 | p-values for all three (F-distribution + chi2 survival functions) | SHIPPED | `f_distribution_sf` (rewritten `regularized_incomplete_beta` + `betacf` Lentz CF, was DIV-1 #1417 fixed) matches scipy `fdtrc`; `chi2_distribution_sf` matches `chdtrc`; verified across small-p (1e-23 tail), large-p, moderate, varied df1∈{1,2,4}/df2∈{3..48} (29 oracle tests, ~13-15 sig figs) |
 //! | REQ-5 | Error/parameter contracts (empty, shape mismatch, <2 classes, <3 samples f_regression, negative chi2 features) | SHIPPED (scoped) | per-fn guards; divergence error tests |
-//! | REQ-6 | `f_regression` `center=False` + `force_finite` (nan/inf handling) | NOT-STARTED | sklearn `:300-449` — blocker #1418 |
-//! | REQ-7 | `r_regression` free function (signed Pearson correlation) | NOT-STARTED | sklearn `:300-393` — blocker #1419 |
+//! | REQ-6 | `f_regression` `center=False` + `force_finite` (nan/inf handling) | NOT-STARTED | sklearn `:405-465` — blocker #1418 |
+//! | REQ-7 | `r_regression` free function (signed Pearson correlation) | SHIPPED | `r_regression` + `r_regression_with_options` mirror sklearn `:301-393`, including `center` and `force_finite`; oracle tests in `tests/divergence_r_regression.rs`. Consumer: re-export `lib.rs` + API proof. |
 //! | REQ-8 | sparse `chi2` (CSR `observed = Y.T@X`) | NOT-STARTED | dense only; sklearn `:202-288` — blocker #1420 |
 //! | REQ-9 | `mutual_info_classif`/`mutual_info_regression` | NOT-STARTED | `sklearn/feature_selection/_mutual_info.py` — blocker #1421 |
 //! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1422 |
@@ -175,6 +176,139 @@ pub fn f_classif<F: Float + Send + Sync + 'static>(
     }
 
     Ok((f_stats, p_vals))
+}
+
+// ===========================================================================
+// r_regression — Pearson correlation coefficient
+// ===========================================================================
+
+/// Compute Pearson's r between every feature and the regression target.
+///
+/// This mirrors `sklearn.feature_selection.r_regression(X, y)` with default
+/// `center=true` and `force_finite=true`.
+///
+/// # Errors
+///
+/// - [`FerroError::InsufficientSamples`] if `x` has zero rows.
+/// - [`FerroError::InvalidParameter`] if `x` has zero columns or `x`/`y`
+///   contain NaN or infinity.
+/// - [`FerroError::ShapeMismatch`] if `x.nrows() != y.len()`.
+pub fn r_regression<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+) -> Result<Array1<F>, FerroError> {
+    r_regression_with_options(x, y, true, true)
+}
+
+/// Compute Pearson's r with explicit sklearn `center` and `force_finite`
+/// options.
+///
+/// `center=false` uses uncentered row norms and dot products. When
+/// `force_finite=true`, undefined correlations produced by constant features
+/// or a constant target are replaced with `0.0`, matching sklearn's
+/// NaN-to-zero branch.
+pub fn r_regression_with_options<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    center: bool,
+    force_finite: bool,
+) -> Result<Array1<F>, FerroError> {
+    validate_regression_xy(x, y, "r_regression")?;
+
+    let n_samples = x.nrows();
+    let n_features = x.ncols();
+    let n_f = F::from(n_samples).unwrap();
+
+    let y_mean = if center {
+        y.iter().copied().fold(F::zero(), |acc, v| acc + v) / n_f
+    } else {
+        F::zero()
+    };
+    let y_norm_sq = y
+        .iter()
+        .copied()
+        .map(|yi| {
+            let centered = yi - y_mean;
+            centered * centered
+        })
+        .fold(F::zero(), |acc, v| acc + v);
+    let y_norm = y_norm_sq.sqrt();
+
+    let mut corr = Array1::zeros(n_features);
+    for j in 0..n_features {
+        let col = x.column(j);
+        let x_norm_sq = if center {
+            let x_mean = col.iter().copied().fold(F::zero(), |acc, v| acc + v) / n_f;
+            let raw_norm_sq = col
+                .iter()
+                .copied()
+                .map(|v| v * v)
+                .fold(F::zero(), |acc, v| acc + v);
+            raw_norm_sq - n_f * x_mean * x_mean
+        } else {
+            col.iter()
+                .copied()
+                .map(|v| v * v)
+                .fold(F::zero(), |acc, v| acc + v)
+        };
+        let x_norm = x_norm_sq.sqrt();
+        let numerator = col
+            .iter()
+            .copied()
+            .zip(y.iter().copied())
+            .map(|(xi, yi)| xi * (yi - y_mean))
+            .fold(F::zero(), |acc, v| acc + v);
+
+        let value = numerator / (x_norm * y_norm);
+        corr[j] = if force_finite && value.is_nan() {
+            F::zero()
+        } else {
+            value
+        };
+    }
+
+    Ok(corr)
+}
+
+fn validate_regression_xy<F: Float>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    context: &str,
+) -> Result<(), FerroError> {
+    let n_samples = x.nrows();
+    if n_samples == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: context.into(),
+        });
+    }
+    if x.ncols() == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "x".into(),
+            reason: format!("{context} requires at least one feature"),
+        });
+    }
+    if y.len() != n_samples {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![y.len()],
+            context: format!("{context} — y must have same length as x rows"),
+        });
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "x".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
 }
 
 // ===========================================================================

@@ -140,6 +140,8 @@ use ferrolearn_preprocess::{
     minmax_scale,
     power_transform,
     quantile_transform,
+    r_regression,
+    r_regression_with_options,
 };
 
 /// Type-level no-op: forces `T` to be named, so removing the corresponding
@@ -163,7 +165,7 @@ fn name_type<T>() {}
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
-/// `mutual_info_*`, `r_regression`,
+/// `mutual_info_*`,
 /// `f_oneway`, `SelectorMixin`,
 /// `johnson_lindenstrauss_min_dim`, `make_column_selector`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`, `TfidfVectorizer`) are
@@ -251,6 +253,8 @@ fn boundary_integrity_six_module_all_surface() {
     let _chi2 = chi2::<f64>;
     let _f_classif = f_classif::<f64>;
     let _f_regression = f_regression::<f64>;
+    let _r_regression = r_regression::<f64>;
+    let _r_regression_with_options = r_regression_with_options::<f64>;
     let _scores_classif = compute_scores_classif::<f64>;
     let _scores_regression = compute_scores_regression::<f64>;
 

@@ -324,6 +324,16 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::r_regression"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::r_regression_with_options"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::Remainder"
 phase = "preprocess"
 fixture = ""
