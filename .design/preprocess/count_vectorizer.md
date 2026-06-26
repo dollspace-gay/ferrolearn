@@ -35,12 +35,14 @@ core: an unfitted `CountVectorizer` struct with five params
 an `Array2<f64>` count matrix. The tokenizer (`fn tokenize`) **splits on every
 non-word boundary (`\w` = alphanumeric or `_`) and keeps tokens of length ≥ 2** —
 matching sklearn's default token pattern `r"(?u)\b\w\w+\b"` (REQ-2 SHIPPED,
-#1217). There is no n-gram support,
-no custom `token_pattern`/`tokenizer`/`preprocessor`/`analyzer`, no `stop_words`,
-no `strip_accents`, no `vocabulary` param, no `dtype`, no sparse output, no
-`HashingVectorizer`, no `get_feature_names_out`, and no PyO3 binding. The `min_df`
-(`usize`) / `max_df` (`f64`) typing **cannot express** sklearn's int-or-float
-duality on either threshold.
+#1217). The same file also ships a scoped dense `HashingVectorizer` using signed
+MurmurHash3 x86-32, `n_features`, `alternate_sign`, `binary`, `lowercase`, and
+L1/L2/None row normalization. There is still no n-gram support, no custom
+`token_pattern`/`tokenizer`/`preprocessor`/`analyzer`, no `stop_words`, no
+`strip_accents`, no `vocabulary` param, no `dtype`, no sparse output, no
+`get_feature_names_out`, and no PyO3 binding. The `min_df` (`usize`) / `max_df`
+(`f64`) typing **cannot express** sklearn's int-or-float duality on either
+threshold.
 
 ## Probes (live sklearn oracle, 1.5.2)
 
@@ -78,8 +80,13 @@ print(list(CountVectorizer(ngram_range=(1,2)).fit(['the cat sat']).get_feature_n
 
 # REQ-13 — HashingVectorizer: fixed-width hashed features, no vocabulary:
 python3 -c "from sklearn.feature_extraction.text import HashingVectorizer; \
-print(HashingVectorizer(n_features=8).transform(['the cat sat']).shape)"
-# -> (1, 8)   (ferrolearn: no HashingVectorizer)
+X = HashingVectorizer(n_features=8).transform(['the cat sat']); \
+print(X.shape); print(X.toarray().tolist())"
+# -> (1, 8)
+#    [[0.0, 0.0, 0.0, 0.0, 0.5773502691896258, 0.0,
+#      -0.5773502691896258, 0.5773502691896258]]
+#    ferrolearn HashingVectorizer matches this dense row; residual: output is
+#    dense Array2<f64> instead of CSR.
 ```
 
 ## Requirements
@@ -149,7 +156,7 @@ print(HashingVectorizer(n_features=8).transform(['the cat sat']).shape)"
 - AC-12 (REQ-12): a `get_feature_names_out()`-shaped accessor returns the sorted
   term array and errors when unfitted.
 - AC-13 (REQ-13): a `HashingVectorizer` with `n_features=8` transforms
-  `['the cat sat']` to width 8 (REQ-13 Probe).
+  `['the cat sat']` to the signed/L2-normalized row in the REQ-13 Probe.
 - AC-15 (REQ-15): `python3 -c "import ferrolearn; ferrolearn.feature_extraction.CountVectorizer"`
   resolves and `.fit_transform` matches `sklearn` on the REQ-1 Probe.
 
@@ -169,7 +176,7 @@ print(HashingVectorizer(n_features=8).transform(['the cat sat']).shape)"
 | REQ-10 (fixed vocabulary param + dtype) | NOT-STARTED | open prereq blocker #1223. No `vocabulary` ctor param (sklearn `_count_vocab` fixed-vocab path `:1242-1244`) and no `dtype` (`:1147`); `FittedCountVectorizer` exposes `vocabulary()`/`vocabulary_map()` but the vocabulary cannot be supplied by the user. |
 | REQ-11 (sparse CSR output) | NOT-STARTED | open prereq blocker #1224. `transform` returns a dense `Array2<f64>` (`Array2::<f64>::zeros((n_docs, n_vocab))`); sklearn returns `scipy.sparse.csr_matrix` (`_count_vocab:1299-1304`). No `sprs`-based sparse path. |
 | REQ-12 (get_feature_names_out contract) | NOT-STARTED | open prereq blocker #1225. `vocabulary()` returns `&[String]` (sorted) and `vocabulary_map()` returns `&HashMap`, but there is no `get_feature_names_out`-shaped accessor with the fitted-state / `input_features` checks (`text.py:1455`). |
-| REQ-13 (HashingVectorizer) | NOT-STARTED | open prereq blocker #1226. No `HashingVectorizer` type anywhere in the crate; sklearn `class HashingVectorizer` (`text.py:562`, `transform:859`) with `n_features`/`alternate_sign`/`norm` is absent (REQ-13 Probe → width 8). |
+| REQ-13 (HashingVectorizer) | SHIPPED (scoped: dense default analyzer) | impl `HashingVectorizer` in `count_vectorizer.rs` is stateless, validates `n_features` in sklearn's `[1, 2147483647)` range, hashes tokens with signed MurmurHash3 x86-32 seed 0, maps columns by `abs(hash) % n_features`, applies `alternate_sign`, `binary`, `lowercase`, and L1/L2/None row normalization. Non-test consumer: crate re-export `pub use count_vectorizer::{CountVectorizer, FittedCountVectorizer, HashingVectorizer};`. Verification (R-CHAR-3): `tests/divergence_hashing_vectorizer.rs` pins the default `n_features=8` row, unsigned/signed counts, `binary`, L1, lowercase toggle, and default token-pattern single-character drop against sklearn 1.5.2 oracles; in-module MurmurHash smoke tests match `sklearn.utils.murmurhash3_32("foo", seed=0/42)`. **Residual:** dense `Array2<f64>` output, no sparse CSR, no custom analyzer/tokenizer/preprocessor/stop_words/strip_accents/input/encoding/decode_error/dtype, and no PyO3 binding. |
 | REQ-14 (ctor surface + _parameter_constraints) | NOT-STARTED | open prereq blocker #1227. The ferrolearn ctor exposes 5 params (`max_features`, `min_df`, `max_df`, `binary`, `lowercase`); sklearn's 16 (`input`, `encoding`, `decode_error`, `strip_accents`, `preprocessor`, `tokenizer`, `stop_words`, `token_pattern`, `ngram_range`, `analyzer`, `vocabulary`, `dtype` + the 4 present) and `_parameter_constraints` validation / exception types (`:1124-1148`) are absent (R-DEV-2). Note `fit` validates `max_df ∈ (0,1]` only — incompatible with sklearn's int-or-float interval. |
 | REQ-14a (empty-vocabulary ValueError parity) | SHIPPED (#2336, #2337) | impl `pub fn fit in count_vectorizer.rs` now raises three sklearn-parity `Err(FerroError::InvalidParameter)`s: (a) after building df counts, an empty vocabulary → `"empty vocabulary; perhaps the documents only contain stop words"`, mirroring `_count_vocab` (`text.py:1277-1279`); (b) `max_df_count < min_doc_count` → `"max_df corresponds to < documents than min_df"`, mirroring `fit_transform` (`text.py:1381-1382`); (c) after df/max_features pruning, an empty vocabulary → `"After pruning, no terms remain. Try a lower min_df or a higher max_df."`, mirroring `_limit_features` (`text.py:1236-1239`). Non-test consumer: crate re-export `pub use count_vectorizer::CountVectorizer` (`ferrolearn-preprocess/src/lib.rs`). Verification (R-CHAR-3, live oracle 1.5.2): `CountVectorizer().fit(['a b c d'])` → ValueError "empty vocabulary…" (guard `divergence_empty_vocab_all_single_char` un-ignored, PASS); `CountVectorizer(min_df=5).fit(['aa bb','cc dd'])` → ValueError "max_df corresponds to < documents than min_df" (guard `divergence_empty_vocab_min_df_prunes_all` un-ignored, PASS). Non-empty cases unchanged. |
 | REQ-15 (PyO3 binding) | NOT-STARTED | open prereq blocker #1228. No `RsCountVectorizer` `#[pyclass]` in `ferrolearn-python/src/transformers.rs`; `import ferrolearn` cannot expose this vectorizer (boundary consumer per R-DEFER-1). |
@@ -217,7 +224,8 @@ each threshold; the `max_df ∈ (0,1]` validation actively rejects sklearn-valid
 int `max_df`.
 (b) **dense vs sparse** (REQ-11): the `Array2<f64>` output is not the CSR contract.
 The richer analysis surface (n-grams, custom analyzers, stop words, fixed
-vocabulary, `HashingVectorizer`) and the PyO3 binding are wholesale absent.
+vocabulary) and the PyO3 binding remain absent; `HashingVectorizer` is present
+only for the scoped dense default-analyzer path.
 
 ## Verification
 
@@ -231,6 +239,9 @@ print(list(cv.get_feature_names_out())); print(X.toarray().tolist())"
 #   -> ['cat', 'mat', 'on', 'sat', 'the'] ; [[1,0,0,1,1],[1,1,1,1,2]]
 # ferrolearn equivalent: CountVectorizer::new().fit(&docs).vocabulary() / .transform(&docs)
 
+# HashingVectorizer oracle guard:
+cargo test -p ferrolearn-preprocess --test divergence_hashing_vectorizer
+
 # Crate gauntlet:
 cargo test -p ferrolearn-preprocess        # incl. test_count_vectorizer_basic, _binary,
                                            # _lowercase, _no_lowercase, _max_features, _min_df,
@@ -239,18 +250,16 @@ cargo clippy -p ferrolearn-preprocess --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
-The existing `#[test]`s exercise only the default lowercase/whitespace path and
-are **hand-written, not oracle-grounded** (expected values are not derived from a
-live sklearn call) — the critic should add an oracle-pinned `#[test]` matching
-the REQ-1 Probe (R-CHAR-3), and a guard pinning the REQ-2 tokenization
-divergence (the `max_features` test currently asserts sklearn-incompatible
-behavior). No currently-green command establishes any of REQ-2, REQ-5, REQ-6,
-REQ-8..REQ-15.
+The older in-module `#[test]`s exercise the default lowercase/whitespace path and
+are mostly hand-written. The routed divergence suites are the oracle-grounded
+evidence for REQ-2 tokenization, REQ-13 hashing, and selected df/max-feature
+edge cases. No currently-green command establishes REQ-6, REQ-8..REQ-12, REQ-14,
+or REQ-15.
 
 ## Blockers
 
-Two divergences were FIXED this iteration; the rest remain open `-l blocker`
-issues referenced by the REQ status table:
+Recent fixed divergences and remaining open `-l blocker` issues referenced by
+the REQ status table:
 
 - #1217 — REQ-2 (CLOSED, fixed): default tokenizer kept length-1 tokens and
   split on `_`; now mirrors `r"(?u)\b\w\w+\b"` (drops length-1, `_` is a word
@@ -268,7 +277,9 @@ issues referenced by the REQ status table:
 - #1224 — REQ-11: dense `Array2<f64>` output, not CSR (`sprs`) sparse.
 - #1225 — REQ-12: no `get_feature_names_out`-shaped accessor with
   fitted-state / `input_features` checks.
-- #1226 — REQ-13: no `HashingVectorizer`.
+- #1226 — REQ-13 (CLOSED, fixed): scoped dense `HashingVectorizer` with
+  sklearn-compatible MurmurHash3 x86-32 hashing, sign handling, binary clipping,
+  lowercase toggle, and row normalization.
 - #1227 — REQ-14: ctor exposes 5 of 16 params; missing
   `_parameter_constraints` validation / exception types + empty-vocab error
   (R-DEV-2).

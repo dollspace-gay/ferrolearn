@@ -89,6 +89,7 @@ use ferrolearn_preprocess::{
     GenericUnivariateMode,
     GenericUnivariateParam,
     GenericUnivariateSelect,
+    HashingVectorizer,
     ImputeStrategy,
     InitialStrategy,
     IterativeImputer,
@@ -184,7 +185,7 @@ fn name_type<T>() {}
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`mutual_info_*`,
 /// `f_oneway`,
-/// `TransformedTargetRegressor`, `HashingVectorizer`) are
+/// `TransformedTargetRegressor`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
 #[allow(
     clippy::assertions_on_constants,
@@ -283,6 +284,7 @@ fn boundary_integrity_six_module_all_surface() {
     // --- feature_extraction.text ---
     name_type::<CountVectorizer>();
     name_type::<FittedCountVectorizer>();
+    name_type::<HashingVectorizer>();
     name_type::<TfidfTransformer<f64>>();
     name_type::<FittedTfidfTransformer<f64>>();
     name_type::<TfidfVectorizer>();

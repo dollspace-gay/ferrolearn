@@ -24,11 +24,12 @@
 //! | REQ-10 fixed vocabulary param + dtype | NOT-STARTED (#1223) | sklearn `_count_vocab` `text.py:1242-1244`,`:1147` |
 //! | REQ-11 sparse CSR output | NOT-STARTED (#1224) | sklearn `_count_vocab` `text.py:1299-1304` |
 //! | REQ-12 get_feature_names_out contract | NOT-STARTED (#1225) | sklearn `text.py:1455` |
-//! | REQ-13 HashingVectorizer | NOT-STARTED (#1226) | sklearn `class HashingVectorizer` `text.py:562` |
+//! | REQ-13 HashingVectorizer | SHIPPED scoped | dense [`HashingVectorizer`] with MurmurHash3 x86-32, `n_features`, `alternate_sign`, `binary`, `norm`, lowercase; tests in `tests/divergence_hashing_vectorizer.rs` |
 //! | REQ-14 full 16-param ctor + _parameter_constraints | NOT-STARTED (#1227) | sklearn `text.py:1124-1148` |
 //! | REQ-14a empty-vocabulary ValueError parity (post-tokenize + max_df<min_df + post-prune) | SHIPPED (#2336 #2337) | `CountVectorizer::fit` empty-vocab/`max_df`/post-prune `Err(InvalidParameter)`; sklearn `text.py:1277-1279`,`:1381-1382`,`:1236-1239`. Consumer: crate re-export `pub use count_vectorizer::CountVectorizer` (`lib.rs`). |
 //! | REQ-15 PyO3 binding | NOT-STARTED (#1228) | `ferrolearn-python/src/transformers.rs` (absent) |
 
+use crate::tfidf::TfidfNorm;
 use std::collections::HashMap;
 
 use ferrolearn_core::error::FerroError;
@@ -327,6 +328,166 @@ impl FittedCountVectorizer {
 }
 
 // ---------------------------------------------------------------------------
+// HashingVectorizer
+// ---------------------------------------------------------------------------
+
+/// Stateless text vectorizer using signed 32-bit MurmurHash3 feature hashing.
+///
+/// This is the dense Rust analogue of scikit-learn's default word-analyzer
+/// `HashingVectorizer` path. It reuses the same tokenization semantics as
+/// [`CountVectorizer`] and emits a dense `Array2<f64>` instead of sklearn's CSR
+/// sparse matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HashingVectorizer {
+    /// Number of hashed output columns.
+    pub n_features: usize,
+    /// If `true`, negative MurmurHash3 values contribute with a negative sign.
+    pub alternate_sign: bool,
+    /// If `true`, non-zero entries are clipped to 1 after duplicate summing.
+    pub binary: bool,
+    /// If `true`, lowercase all tokens before hashing.
+    pub lowercase: bool,
+    /// Optional row normalization. sklearn defaults to L2 normalization.
+    pub norm: TfidfNorm,
+}
+
+impl HashingVectorizer {
+    /// Create a new `HashingVectorizer` with sklearn-like defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            n_features: 1 << 20,
+            alternate_sign: true,
+            binary: false,
+            lowercase: true,
+            norm: TfidfNorm::L2,
+        }
+    }
+
+    /// Set the number of hashed output columns.
+    #[must_use]
+    pub fn n_features(mut self, n_features: usize) -> Self {
+        self.n_features = n_features;
+        self
+    }
+
+    /// Enable or disable alternating signs.
+    #[must_use]
+    pub fn alternate_sign(mut self, alternate_sign: bool) -> Self {
+        self.alternate_sign = alternate_sign;
+        self
+    }
+
+    /// Enable or disable binary clipping.
+    #[must_use]
+    pub fn binary(mut self, binary: bool) -> Self {
+        self.binary = binary;
+        self
+    }
+
+    /// Enable or disable lowercasing.
+    #[must_use]
+    pub fn lowercase(mut self, lowercase: bool) -> Self {
+        self.lowercase = lowercase;
+        self
+    }
+
+    /// Set the row normalization mode.
+    #[must_use]
+    pub fn norm(mut self, norm: TfidfNorm) -> Self {
+        self.norm = norm;
+        self
+    }
+
+    /// Stateless fit: validate parameters and return `self`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when `n_features` is outside
+    /// sklearn's accepted range `[1, i32::MAX)`.
+    pub fn fit(&self, _docs: &[String]) -> Result<Self, FerroError> {
+        self.validate()?;
+        Ok(self.clone())
+    }
+
+    /// Stateless partial fit, matching sklearn's no-op `partial_fit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when `n_features` is invalid.
+    pub fn partial_fit(&self, docs: &[String]) -> Result<Self, FerroError> {
+        self.fit(docs)
+    }
+
+    /// Transform documents into a dense hashed feature matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when `n_features` is invalid and
+    /// [`FerroError::InsufficientSamples`] when the document slice is empty.
+    pub fn transform(&self, docs: &[String]) -> Result<Array2<f64>, FerroError> {
+        self.validate()?;
+        if docs.is_empty() {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "HashingVectorizer::transform".into(),
+            });
+        }
+
+        let mut matrix = Array2::<f64>::zeros((docs.len(), self.n_features));
+        for (row, doc) in docs.iter().enumerate() {
+            for token in tokenize(doc, self.lowercase) {
+                let hash = murmurhash3_32_signed(token.as_bytes(), 0);
+                let col = signed_hash_index(hash, self.n_features);
+                let value = if self.alternate_sign && hash < 0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                matrix[[row, col]] += value;
+            }
+        }
+
+        if self.binary {
+            for value in &mut matrix {
+                if *value != 0.0 {
+                    *value = 1.0;
+                }
+            }
+        }
+
+        normalize_dense_rows(&mut matrix, self.norm);
+        Ok(matrix)
+    }
+
+    /// Fit and transform in one pass.
+    ///
+    /// # Errors
+    ///
+    /// Propagates validation errors from [`Self::transform`].
+    pub fn fit_transform(&self, docs: &[String]) -> Result<Array2<f64>, FerroError> {
+        self.fit(docs)?.transform(docs)
+    }
+
+    fn validate(&self) -> Result<(), FerroError> {
+        if self.n_features == 0 || self.n_features >= i32::MAX as usize {
+            return Err(FerroError::InvalidParameter {
+                name: "n_features".into(),
+                reason: "must be in [1, 2147483647)".into(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl Default for HashingVectorizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tokenizer
 // ---------------------------------------------------------------------------
 
@@ -351,6 +512,104 @@ fn tokenize(doc: &str, lowercase: bool) -> Vec<String> {
         .collect()
 }
 
+fn signed_hash_index(hash: i32, n_features: usize) -> usize {
+    let magnitude = u64::from(hash.unsigned_abs());
+    (magnitude % n_features as u64) as usize
+}
+
+fn normalize_dense_rows(matrix: &mut Array2<f64>, norm: TfidfNorm) {
+    match norm {
+        TfidfNorm::L1 => {
+            for mut row in matrix.rows_mut() {
+                let denom: f64 = row.iter().map(|v| v.abs()).sum();
+                if denom > 0.0 {
+                    for v in &mut row {
+                        *v /= denom;
+                    }
+                }
+            }
+        }
+        TfidfNorm::L2 => {
+            for mut row in matrix.rows_mut() {
+                let denom = row.iter().map(|v| v * v).sum::<f64>().sqrt();
+                if denom > 0.0 {
+                    for v in &mut row {
+                        *v /= denom;
+                    }
+                }
+            }
+        }
+        TfidfNorm::None => {}
+    }
+}
+
+fn murmurhash3_32_signed(bytes: &[u8], seed: u32) -> i32 {
+    let hash = murmurhash3_32_u32(bytes, seed);
+    hash as i32
+}
+
+fn murmurhash3_32_u32(bytes: &[u8], seed: u32) -> u32 {
+    const C1: u32 = 0xcc9e2d51;
+    const C2: u32 = 0x1b873593;
+
+    let mut h1 = seed;
+    let nblocks = bytes.len() / 4;
+
+    for i in 0..nblocks {
+        let offset = i * 4;
+        let mut k1 = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(15);
+        k1 = k1.wrapping_mul(C2);
+
+        h1 ^= k1;
+        h1 = h1.rotate_left(13);
+        h1 = h1.wrapping_mul(5).wrapping_add(0xe654_6b64);
+    }
+
+    let tail = &bytes[nblocks * 4..];
+    let mut k1 = 0_u32;
+    match tail.len() {
+        3 => {
+            k1 ^= (tail[2] as u32) << 16;
+            k1 ^= (tail[1] as u32) << 8;
+            k1 ^= tail[0] as u32;
+        }
+        2 => {
+            k1 ^= (tail[1] as u32) << 8;
+            k1 ^= tail[0] as u32;
+        }
+        1 => {
+            k1 ^= tail[0] as u32;
+        }
+        _ => {}
+    }
+    if !tail.is_empty() {
+        k1 = k1.wrapping_mul(C1);
+        k1 = k1.rotate_left(15);
+        k1 = k1.wrapping_mul(C2);
+        h1 ^= k1;
+    }
+
+    h1 ^= bytes.len() as u32;
+    fmix32(h1)
+}
+
+fn fmix32(mut h: u32) -> u32 {
+    h ^= h >> 16;
+    h = h.wrapping_mul(0x85eb_ca6b);
+    h ^= h >> 13;
+    h = h.wrapping_mul(0xc2b2_ae35);
+    h ^= h >> 16;
+    h
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -359,6 +618,15 @@ fn tokenize(doc: &str, lowercase: bool) -> Vec<String> {
 mod tests {
     use super::*;
     use approx::assert_abs_diff_eq;
+
+    #[test]
+    fn murmurhash3_matches_sklearn_smoke_values() {
+        assert_eq!(murmurhash3_32_signed(b"foo", 0), -156908512);
+        assert_eq!(murmurhash3_32_signed(b"foo", 42), -1322301282);
+        assert_eq!(murmurhash3_32_u32(b"foo", 0), 4138058784);
+        assert_eq!(murmurhash3_32_u32(b"foo", 42), 2972666014);
+        assert_eq!(signed_hash_index(-1132748958, 8), 6);
+    }
 
     #[test]
     fn test_count_vectorizer_basic() {

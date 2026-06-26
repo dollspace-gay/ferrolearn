@@ -39,6 +39,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::HashingVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::Direction"
 phase = "preprocess"
 fixture = ""

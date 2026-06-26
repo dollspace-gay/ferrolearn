@@ -11,18 +11,18 @@ use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, ColumnSelector, ColumnTransformer,
     CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection,
-    GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, InitialStrategy,
-    IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy,
-    LabelBinarizer, LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler, MissingIndicator,
-    MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
-    OutputDistribution, PatchExtractor, PolynomialFeatures, PowerTransformer, QuantileTransformer,
-    Remainder, RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest,
-    SelectPercentile, SelectorMixin, SequentialFeatureSelector, SimpleImputer,
-    SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
-    TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2, extract_patches_2d, f_classif,
-    f_regression, grid_to_graph, img_to_graph, johnson_lindenstrauss_min_dim, make_column_selector,
-    make_column_transformer, maxabs_scale, minmax_scale, power_transform, r_regression,
-    reconstruct_from_patches_2d,
+    GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, HashingVectorizer,
+    InitialStrategy, IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer,
+    KnotStrategy, LabelBinarizer, LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler,
+    MissingIndicator, MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder,
+    OrdinalEncoder, OutputDistribution, PatchExtractor, PolynomialFeatures, PowerTransformer,
+    QuantileTransformer, Remainder, RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe,
+    SelectKBest, SelectPercentile, SelectorMixin, SequentialFeatureSelector, SimpleImputer,
+    SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfNorm,
+    TfidfTransformer, TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2,
+    extract_patches_2d, f_classif, f_regression, grid_to_graph, img_to_graph,
+    johnson_lindenstrauss_min_dim, make_column_selector, make_column_transformer, maxabs_scale,
+    minmax_scale, power_transform, r_regression, reconstruct_from_patches_2d,
 };
 use ndarray::{Array1, Array2, Array3, array};
 
@@ -358,6 +358,12 @@ fn api_proof_text() {
     let f = CountVectorizer::new().fit(&docs).unwrap();
     let counts = f.transform(&docs).unwrap();
     assert_eq!(counts.nrows(), 3);
+    let hashed = HashingVectorizer::new()
+        .n_features(8)
+        .norm(TfidfNorm::None)
+        .transform(&docs)
+        .unwrap();
+    assert_eq!(hashed.dim(), (3, 8));
     let counts_f64 = counts.mapv(|v| v);
     let f = TfidfTransformer::<f64>::new().fit(&counts_f64).unwrap();
     let _ = f.transform(&counts_f64).unwrap();
