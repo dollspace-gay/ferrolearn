@@ -269,6 +269,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::sparse_encode"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::SpectralEmbedding"
 phase = "decomp"
 fixture = ""

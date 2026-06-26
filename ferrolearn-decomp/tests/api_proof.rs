@@ -11,7 +11,7 @@ use ferrolearn_decomp::{
     Isomap, Kernel, KernelPCA, LLE, LatentDirichletAllocation, LdaLearningMethod, MDS,
     MiniBatchNMF, MiniBatchNMFInit, NMF, NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical,
     PLSRegression, PLSSVD, SparsePCA, SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric,
-    locally_linear_embedding, non_negative_factorization, smacof, trustworthiness,
+    locally_linear_embedding, non_negative_factorization, smacof, sparse_encode, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -240,7 +240,11 @@ fn api_proof_factor_analysis() {
 #[test]
 fn api_proof_dictionary_learning() {
     let x = small_2d_data();
-    for tx_algo in [DictTransformAlgorithm::Omp, DictTransformAlgorithm::LassoCd] {
+    for tx_algo in [
+        DictTransformAlgorithm::Omp,
+        DictTransformAlgorithm::LassoCd,
+        DictTransformAlgorithm::Threshold,
+    ] {
         let f = DictionaryLearning::new(2)
             .with_alpha(0.1)
             .with_max_iter(20)
@@ -253,6 +257,22 @@ fn api_proof_dictionary_learning() {
             .unwrap();
         let _ = f.transform(&x).unwrap();
     }
+
+    let dictionary = Array2::from_shape_vec(
+        (3, 4),
+        vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    )
+    .unwrap();
+    let codes = sparse_encode(
+        &x,
+        &dictionary,
+        DictTransformAlgorithm::Omp,
+        Some(2),
+        None,
+        1000,
+    )
+    .unwrap();
+    assert_eq!(codes.dim(), (12, 3));
 }
 
 // =============================================================================

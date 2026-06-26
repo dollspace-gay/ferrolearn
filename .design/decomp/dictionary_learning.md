@@ -8,7 +8,7 @@ upstream: scikit-learn 1.5.2
 upstream-paths:
   - sklearn/decomposition/_dict_learning.py  # class DictionaryLearning(_BaseSparseCoding, BaseEstimator) (:1372-1711). ctor (:1588-1629): n_components=None, *, alpha=1, max_iter=1000, tol=1e-8, fit_algorithm="lars", transform_algorithm="omp", transform_n_nonzero_coefs=None, transform_alpha=None, n_jobs=None, code_init=None, dict_init=None, callback=None, verbose=False, split_sign=False, random_state=None, positive_code=False, positive_dict=False, transform_max_iter=1000. _parameter_constraints (:1565-1586): fit_algorithm StrOptions({"lars","cd"}), transform_algorithm StrOptions({"lasso_lars","lasso_cd","lars","omp","threshold"}). fit_transform (:1651-1702): method = "lasso_" + self.fit_algorithm (:1671, default "lars" -> "lasso_lars"); n_components = X.shape[1] if None (:1676-1679); V, U, E, self.n_iter_ = _dict_learning(X, n_components, alpha, tol, max_iter, method, method_max_iter=transform_max_iter, ..., code_init, dict_init, ..., random_state, positive_dict, positive_code) (:1681-1698); self.components_ = U (:1699); self.error_ = E (:1700); returns V (the codes). _dict_learning (:554-674): SVD-based init (code, S, dictionary = linalg.svd(X, full_matrices=False) + svd_flip, DETERMINISTIC given X, :581-584) when dict_init/code_init None; alternating sparse_encode (:620, LARS/CD lasso) + _update_dict (:632-640). _update_dict (:474-551): block-coordinate descent per atom dictionary[k] += (B[:,k] - A[k] @ dictionary)/A[k,k] (:531); UNUSED-ATOM RESAMPLING newd = Y[random_state.choice(n_samples)] + noise (:534-540) when A[k,k] <= 1e-6; optional positive clip (:544-545); unit-ball projection dictionary[k] /= max(norm, 1) (:548). _BaseSparseCoding._transform (:1110-1139) / transform (:1141-1159): sparse_encode(X, components_, algorithm=transform_algorithm, transform_n_nonzero_coefs, alpha=transform_alpha or alpha, max_iter=transform_max_iter, positive=positive_code) then optional split_sign (:1131-1137). class MiniBatchDictionaryLearning(_BaseSparseCoding, BaseEstimator) (:1715) — online variant (batch_size, max_no_improvement, partial_fit), ABSENT in ferrolearn.
 ferrolearn-module: ferrolearn-decomp/src/dictionary_learning.rs
-parity-ops: DictionaryLearning
+parity-ops: DictionaryLearning, sparse_encode
 crosslink-issue: 1512
 -->
 
@@ -24,7 +24,7 @@ sparse codes `A` such that `X ≈ A·D`, solving
 dictionary-update step (with `A` fixed). The exposed surface is the unfitted
 `DictionaryLearning { n_components, alpha (1.0), max_iter (1000), tol (1e-8),
 fit_algorithm: DictFitAlgorithm{CoordinateDescent}, transform_algorithm:
-DictTransformAlgorithm{Omp|LassoCd}, transform_n_nonzero_coefs, random_state }`
+DictTransformAlgorithm{Omp|LassoCd|Threshold}, transform_n_nonzero_coefs, random_state }`
 (`dictionary_learning.rs`, struct at line 70; builders `with_alpha`/`with_max_iter`/
 `with_tol`/`with_fit_algorithm`/`with_transform_algorithm`/
 `with_transform_n_nonzero_coefs`/`with_random_state`, accessors) and the fitted
@@ -33,7 +33,9 @@ reconstruction_err_, transform_algorithm_, transform_n_nonzero_coefs_ }`
 (`dictionary_learning.rs`, struct at line 210, accessors `components`/`n_iter`/
 `reconstruction_err`), re-exported at the crate root (`pub use
 dictionary_learning::{DictFitAlgorithm, DictTransformAlgorithm, DictionaryLearning,
-FittedDictionaryLearning}`, `lib.rs:84`). The path is **f64-ONLY** — `impl
+FittedDictionaryLearning}`, `lib.rs:84`). The standalone `sparse_encode` helper
+also exposes fixed-dictionary sparse coding for OMP, lasso-cd, and threshold,
+returning `(n_samples, n_components)` codes. The path is **f64-ONLY** — `impl
 Fit<Array2<f64>, ()>` (`dictionary_learning.rs`, impl at line 483), NOT generic over
 `<F>`. There is NO PyO3 binding (a `grep -rn DictionaryLearning
 ferrolearn-python/src/` is empty) and NO `tests/divergence_dictionary_learning.rs`.
@@ -60,22 +62,31 @@ init + different solver + different dict update + different RNG ⇒ the `compone
 VALUES diverge (same class as the `minibatch_nmf` / `sparse_pca` RNG carve-outs); no
 failing test is asserted (R-DEFER-3).
 
+**SPARSE_ENCODE VALUE PARITY (SHIPPED scoped).**
+`ferrolearn_decomp::sparse_encode` covers
+`sklearn.decomposition.sparse_encode` for dense f64 OMP, lasso-cd, and threshold
+paths. `tests/divergence_sparse_encode.rs` pins OMP, threshold, and lasso-cd
+against the live sklearn 1.5.2 oracle on a fixed dictionary. Residual unsupported
+paths are `lasso_lars`, `lars`, positive coding, precomputed `gram`/`cov`, `init`,
+and `n_jobs`.
+
 As of this iteration: the STRUCTURAL unit-L2 dictionary atoms, the `components_`
 shape `(n_components, n_features)`, the sparse-code `transform` (shape + OMP
-n-nonzero cap + LassoCd sparsity), the monitored/finite `reconstruction_err_` and
+n-nonzero cap + LassoCd/threshold sparsity), the standalone `sparse_encode`
+OMP/lasso-cd/threshold value-parity slice, the monitored/finite `reconstruction_err_` and
 positive `n_iter_`, the error & parameter contracts (n_components 0, n_samples 0,
 n_features 0, alpha < 0, transform col mismatch), and determinism given a seed
 (REQ-1,2,3) are SHIPPED scoped; exact `components_` value parity (REQ-4, CARVE-OUT
 `#1513`), `fit_algorithm="lars"`/LARS solver (REQ-5, `#1514`), SVD-based
 `dict_init`/`code_init` init (REQ-6, `#1515`), `_update_dict` BCD + atom resampling
 (REQ-7, `#1516`), `transform_alpha` + the full transform-algorithm set
-(`lasso_lars`/`lars`/`threshold`; ferrolearn only `omp`/`lasso_cd`) (REQ-8,
-`#1517`), `split_sign` (REQ-9, `#1518`), `positive_code`/`positive_dict` (REQ-10,
+(`lasso_lars`/`lars`; ferrolearn ships `omp`/`lasso_cd`/`threshold`) plus positive
+coding/precomputed sparse_encode paths (REQ-8 residual, `#1517`), `split_sign` (REQ-9, `#1518`), `positive_code`/`positive_dict` (REQ-10,
 `#1519`), `transform_max_iter` (REQ-11, `#1520`), `MiniBatchDictionaryLearning`
 (REQ-12, `#1521`), `error_`/`n_components_`/`n_features_in_` fitted attrs (REQ-13,
 `#1522`), generic `F` (f64-only) (REQ-14, `#1523`), the PyO3 binding (REQ-15,
 `#1524`), and the ferray substrate (REQ-16, `#1525`) are NOT-STARTED —
-**3 SHIPPED / 13 NOT-STARTED**.
+**3 SHIPPED (REQ-1,2,3) + REQ-8 sparse_encode/threshold scoped / residual gaps open**.
 
 `DictionaryLearning` / `FittedDictionaryLearning` are existing pub APIs whose
 non-test consumer is the crate re-export (`lib.rs:84`, boundary public API,
@@ -84,7 +95,7 @@ grandfathered S5/R-DEFER-1). There is NO PyO3 binding (REQ-15 NOT-STARTED).
 ## Probes (live sklearn oracle, 1.5.2, run from /tmp)
 
 ```bash
-# PROBE 1 (REQ-1/2 SHIPPED scoped + REQ-4/13 NOT-STARTED) — components_ shape
+# PROBE 1 (REQ-1/2 SHIPPED scoped + REQ-4 residual) — components_ shape
 # (n_components, n_features), atoms UNIT L2-NORM, n_iter_, error_ vector,
 # n_features_in_. Fixed 6x4 X. VALUES generated by sklearn, never copied from
 # ferrolearn (R-CHAR-3).
@@ -254,17 +265,17 @@ print('max nnz per row:', int(max((np.abs(r)>1e-12).sum() for r in Xt)))"
   BCD, NO unused-atom resampling (so a dead atom stays dead), and `normalise_dictionary`
   (`:580`) projects onto the unit SPHERE (`/= norm`), not the unit ball.
 
-- REQ-8: **`transform_alpha` + the full transform-algorithm set
-  (`lasso_lars`/`lars`/`threshold`) (NOT-STARTED; `#1517`).** sklearn's
+- REQ-8: **`sparse_encode` + transform-algorithm coverage
+  (SHIPPED scoped / residual open; `#1517`).** sklearn's
   `transform_algorithm` (`_dict_learning.py:1596`, default `"omp"`, constraint
   `StrOptions({"lasso_lars","lasso_cd","lars","omp","threshold"})` `:1571-1573`)
   selects among five sparse coders in `sparse_encode`, and `transform_alpha`
   (`:1598`, defaulting to `alpha` `_dict_learning.py:1115-1116`) sets the L1 penalty /
-  threshold for the lasso / threshold algorithms. ferrolearn's
-  `DictTransformAlgorithm` enum (`dictionary_learning.rs:54`) has only `Omp` and
-  `LassoCd` (no `lasso_lars`/`lars`/`threshold`), and `transform`
-  (`dictionary_learning.rs:638-645`) hard-uses the fit `alpha_` for LassoCd — there is
-  no `transform_alpha` field.
+  threshold for the lasso / threshold algorithms. ferrolearn now exposes
+  `sparse_encode` for dense f64 `Omp`, `LassoCd`, and `Threshold`, and
+  `FittedDictionaryLearning::transform` delegates through the same fixed-dictionary
+  path. Residual gaps: no `lasso_lars`/`lars`, no `transform_alpha` field, no positive
+  coding, no precomputed `gram`/`cov`, no `init`, and no `n_jobs`.
 
 - REQ-9: **`split_sign` (NOT-STARTED; `#1518`).** sklearn's
   `DictionaryLearning(split_sign=False)` (`_dict_learning.py:1604`), when `True`,
@@ -380,7 +391,7 @@ literal-copied from ferrolearn (R-CHAR-3).
   `method="lasso_lars"`; sklearn exposes the `error_` vector,
   `n_components_`/`n_features_in_`, and the `MiniBatchDictionaryLearning` class.
   ferrolearn has `fit_algorithm` CD-only (no LARS, default CD),
-  `transform_algorithm` `Omp`/`LassoCd` only (no `lasso_lars`/`lars`/`threshold`), no
+  `transform_algorithm` `Omp`/`LassoCd`/`Threshold` (no `lasso_lars`/`lars`), no
   `transform_alpha`/`split_sign`/`positive_code`/`positive_dict`/`transform_max_iter`/
   `code_init`/`dict_init`, a scalar `reconstruction_err_` (not the `error_` vector),
   no `n_components_`/`n_features_in_`, and no `MiniBatchDictionaryLearning`.
@@ -411,8 +422,8 @@ is REQ-2 — it is STRUCTURAL unit-norm (the in-tree test asserts each atom's L2
 ≈ 1, not oracle component parity); it also carries a FLAG that sklearn projects onto
 the unit BALL (`max(norm, 1)`) whereas ferrolearn uses the unit SPHERE (`/= norm`),
 coincident only for a converged dictionary. #1512 is this doc's crosslink tracking
-issue. Count: **3 SHIPPED (REQ-1,2,3) / 13 NOT-STARTED
-(REQ-4,5,6,7,8,9,10,11,12,13,14,15,16)**.
+issue. Count: **3 SHIPPED (REQ-1,2,3) + REQ-8 sparse_encode/threshold scoped /
+residual gaps open (REQ-4,5,6,7,8,9,10,11,12,13,14,15,16)**.
 
 | REQ | Status | Evidence |
 |---|---|---|
@@ -423,7 +434,7 @@ issue. Count: **3 SHIPPED (REQ-1,2,3) / 13 NOT-STARTED
 | REQ-5 (`fit_algorithm="lars"` LARS + `cd` option) | NOT-STARTED | open prereq blocker **#1514**. sklearn `DictionaryLearning(fit_algorithm="lars")` (`_dict_learning.py:1595`, `StrOptions({"lars","cd"})` `:1570`) → `method = "lasso_" + fit_algorithm` (`:1671`, default `"lasso_lars"`) → LARS lasso in `sparse_encode` (`:620`). ferrolearn `DictFitAlgorithm` (`dictionary_learning.rs:47`) has a SINGLE `CoordinateDescent` variant (no `Lars`); `fn fit` always sparse-codes via `lasso_cd_single` (fn at line 271) — no LARS path, default is CD not `"lars"`. |
 | REQ-6 (SVD-based `dict_init`/`code_init` init) | NOT-STARTED | open prereq blocker **#1515**. sklearn `_dict_learning` (`_dict_learning.py:554`) defaults to SVD init `code, S, dictionary = linalg.svd(X, full_matrices=False)` + `svd_flip` + `S[:,np.newaxis]*dictionary` (`:581-584`, deterministic given X) and supports warm-restart `code_init`/`dict_init` (`:1600-1601`,`:576-579`). ferrolearn inits a random Gaussian `Normal(0,1)` via `Xoshiro256PlusPlus::seed_from_u64(random_state.unwrap_or(0))` + `normalise_dictionary` (`dictionary_learning.rs:530-536`) — NOT SVD, no `code_init`/`dict_init` fields. |
 | REQ-7 (`_update_dict` BCD + atom resampling + unit-BALL projection) | NOT-STARTED | open prereq blocker **#1516**. sklearn `_update_dict` (`_dict_learning.py:474-551`): per-atom BCD `dictionary[k] += (B[:,k]−A[k]@dictionary)/A[k,k]` (`:531`), unused-atom (`A[k,k]≤1e-6`) RESAMPLE `newd = Y[random_state.choice(n_samples)] + noise` (`:534-540`, numpy `RandomState`), unit-BALL projection `/= max(norm, 1)` (`:548`). ferrolearn updates the whole `D` by normal-equations LS `D[:,j]=solve((AᵀA+1e-10·I), AᵀX[:,j])` (`dictionary_learning.rs:554-578`) — NO per-atom BCD, NO unused-atom resampling, and `normalise_dictionary` (`:580`) projects onto the unit SPHERE (`/= norm`). |
-| REQ-8 (`transform_alpha` + `lasso_lars`/`lars`/`threshold` transform algorithms) | NOT-STARTED | open prereq blocker **#1517**. sklearn `transform_algorithm` (`_dict_learning.py:1596`, `StrOptions({"lasso_lars","lasso_cd","lars","omp","threshold"})` `:1571-1573`) + `transform_alpha` (`:1598`, defaults to `alpha` `:1115-1116`) select among five `sparse_encode` coders. ferrolearn `DictTransformAlgorithm` (`dictionary_learning.rs:54`) has only `Omp`/`LassoCd` (no `lasso_lars`/`lars`/`threshold`); `transform` (`:638-645`) hard-uses fit `alpha_` for LassoCd — no `transform_alpha` field. |
+| REQ-8 (`sparse_encode` + transform algorithm coverage) | SHIPPED scoped / residual open | open prereq blocker **#1517** remains for the residual. sklearn `transform_algorithm` (`_dict_learning.py:1596`, `StrOptions({"lasso_lars","lasso_cd","lars","omp","threshold"})` `:1571-1573`) + `transform_alpha` (`:1598`, defaults to `alpha` `:1115-1116`) select among five `sparse_encode` coders. ferrolearn `sparse_encode` and `DictTransformAlgorithm` now cover dense f64 `Omp`, `LassoCd`, and `Threshold`, with value pins in `tests/divergence_sparse_encode.rs`. Residual gaps: no `lasso_lars`/`lars`, no `transform_alpha` field, no positive coding, no precomputed `gram`/`cov`, no `init`, and no `n_jobs`. |
 | REQ-9 (`split_sign`) | NOT-STARTED | open prereq blocker **#1518**. sklearn `DictionaryLearning(split_sign=False)` (`_dict_learning.py:1604`), when True, splits the code into positive/negative parts (`split_code[:,:n]=max(code,0)`, `split_code[:,n:]=-min(code,0)`, `_BaseSparseCoding._transform` `:1131-1137`), doubling the output features. ferrolearn `transform` (`impl Transform for FittedDictionaryLearning` fn at line 622) has NO `split_sign` field — raw `(n_samples, n_components)` codes only. |
 | REQ-10 (`positive_code` / `positive_dict`) | NOT-STARTED | open prereq blocker **#1519**. sklearn `DictionaryLearning(positive_code=False, positive_dict=False)` (`_dict_learning.py:1606-1607`) enforces non-negativity on codes (`sparse_encode(positive=positive_code)` `:1697`/`:627`) and dict atoms (`np.clip(dictionary[k],0,None)` `:544-545`), gated by `_check_positive_coding` (`:30-34`/`:1669`). ferrolearn `DictionaryLearning` (`dictionary_learning.rs` struct at line 70) has NO `positive_code`/`positive_dict` fields, no non-negativity constraint. |
 | REQ-11 (`transform_max_iter`) | NOT-STARTED | open prereq blocker **#1520**. sklearn `DictionaryLearning(transform_max_iter=1000)` (`_dict_learning.py:1608`) caps the `lasso_cd`/`lasso_lars` transform inner iterations (`sparse_encode(max_iter=...)` `:1126`/`:1688`). ferrolearn `transform` hard-codes `200` lasso-CD iters (`lasso_cd_single(&self.components_, self.alpha_, 200)` `dictionary_learning.rs:643`) — no `transform_max_iter` field. |
@@ -474,20 +485,16 @@ random-Gaussian-`Xoshiro` init + soft-threshold-CD + normal-equations-LS update
 produce DIFFERENT component values (CARVE-OUT).
 
 **Transform (`impl Transform for FittedDictionaryLearning`, fn at line 622) —
-REQ-1.** Validates the column count (`:624-630` — REQ-3), then for each sample
-sparse-codes via `omp_single` (fn at line 327, orthogonal matching pursuit capped at
-`transform_n_nonzero_coefs_`) for `Omp` or `lasso_cd_single` (fn at line 271, using
-the fit `alpha_`) for `LassoCd` (`:638-649`), returning codes `(n_samples,
-n_components)`. This is sklearn's `_BaseSparseCoding._transform` → `sparse_encode`
-(`_dict_learning.py:1110-1139`) restricted to `omp`/`lasso_cd` — NO `split_sign`
-(REQ-9), NO `transform_alpha` and NO `lasso_lars`/`lars`/`threshold` algorithms
-(REQ-8), NO `transform_max_iter` (REQ-11, hard-coded 200), NO `positive_code`
-(REQ-10). **INVESTIGATE (critic):** the OMP / lasso_cd transform is DETERMINISTIC
-given a FIXED dictionary, so on an injected dictionary a transform value pin against
-the sklearn `sparse_encode` oracle would be FIXABLE — but the `FittedDictionaryLearning`
-fields are PRIVATE and there is no public constructor from an arbitrary `D`, so the
-transform values are reachable only through the fitted (carved-out) `components_`. The
-critic decides whether to add such a constructor / pin.
+REQ-1/8 scoped.** Validates the column count (`:624-630` — REQ-3), then delegates to
+the same fixed-dictionary sparse coding path as public `sparse_encode`: OMP capped by
+`transform_n_nonzero_coefs_`, LassoCd with the fit `alpha_`, or Threshold with the fit
+`alpha_`, returning codes `(n_samples, n_components)`. This is sklearn's
+`_BaseSparseCoding._transform` → `sparse_encode` (`_dict_learning.py:1110-1139`)
+restricted to `omp`/`lasso_cd`/`threshold` — NO `split_sign` (REQ-9), NO
+`transform_alpha`, NO `lasso_lars`/`lars`, NO positive coding / precomputed
+`gram`/`cov` / `init` / `n_jobs` (REQ-8 residual), and NO `transform_max_iter`
+(REQ-11, hard-coded 200). `tests/divergence_sparse_encode.rs` pins public
+`sparse_encode` against sklearn for a fixed dictionary.
 
 **sklearn (target contract).** `class DictionaryLearning(_BaseSparseCoding,
 BaseEstimator)` (`_dict_learning.py:1372`) takes `__init__(n_components=None, *,
@@ -512,13 +519,15 @@ dictionary atoms (REQ-2), and the scoped error & parameter contracts (REQ-3). It
 lacks: exact `components_` value parity (REQ-4, CARVE-OUT `#1513`);
 `fit_algorithm="lars"`/LARS (REQ-5, `#1514`); SVD-based `dict_init`/`code_init`
 init (REQ-6, `#1515`); `_update_dict` BCD + atom resampling (REQ-7, `#1516`);
-`transform_alpha` + `lasso_lars`/`lars`/`threshold` (REQ-8, `#1517`); `split_sign`
-(REQ-9, `#1518`); `positive_code`/`positive_dict` (REQ-10, `#1519`);
+`transform_alpha` + `lasso_lars`/`lars` + positive/precomputed sparse_encode paths
+(REQ-8 residual, `#1517`); `split_sign` (REQ-9, `#1518`);
+`positive_code`/`positive_dict` (REQ-10, `#1519`);
 `transform_max_iter` (REQ-11, `#1520`); `MiniBatchDictionaryLearning` (REQ-12,
 `#1521`); `error_`/`n_components_`/`n_features_in_` attrs (REQ-13, `#1522`);
 generic `F` (REQ-14, `#1523`); the PyO3 binding (REQ-15, `#1524`); and the ferray
 substrate (REQ-16, `#1525`). This is a
-**structure-SHIPPED-algorithm-NOT-STARTED** unit (3 SHIPPED / 13 NOT-STARTED).
+**structure-SHIPPED plus sparse_encode-scoped** unit (3 SHIPPED + REQ-8 scoped /
+residual gaps open).
 
 ## Verification
 
@@ -591,9 +600,10 @@ items the dispatcher files / numbers; none are filed by this doc — markdown on
   sklearn's `_update_dict` (`_dict_learning.py:474-551`): per-atom BCD (`:531`),
   unused-atom resampling from a numpy `RandomState` (`:534-540`), and the unit-BALL
   projection `/= max(norm, 1)` (`:548`).
-- **#1517** — REQ-8: add a `transform_alpha` field (default `alpha`,
-  `_dict_learning.py:1598`/`:1115-1116`) and the `lasso_lars`/`lars`/`threshold`
-  transform-algorithm variants (`_dict_learning.py:1571-1573`).
+- **#1517** — REQ-8 residual: add a `transform_alpha` field (default `alpha`,
+  `_dict_learning.py:1598`/`:1115-1116`), the `lasso_lars`/`lars`
+  transform-algorithm variants (`_dict_learning.py:1571-1573`), and the positive /
+  precomputed sparse_encode paths.
 - **#1518** — REQ-9: add a `split_sign` field + the positive/negative code split
   (`_BaseSparseCoding._transform` `_dict_learning.py:1131-1137`).
 - **#1519** — REQ-10: add `positive_code`/`positive_dict` fields + the

@@ -36,7 +36,8 @@
 //! - [`trustworthiness`] — neighborhood-preservation score for manifold embeddings.
 //! - [`LatentDirichletAllocation`] — Latent Dirichlet Allocation topic model.
 //!   Discovers latent topics in document-term matrices.
-//! - [`DictionaryLearning`] — Sparse coding with a learned dictionary.
+//! - [`DictionaryLearning`] / [`sparse_encode`] — Sparse coding with a learned
+//!   or fixed dictionary.
 //!
 //! ## Pipeline Integration
 //!
@@ -87,6 +88,7 @@ pub use cross_decomposition::{
 };
 pub use dictionary_learning::{
     DictFitAlgorithm, DictTransformAlgorithm, DictionaryLearning, FittedDictionaryLearning,
+    sparse_encode,
 };
 pub use factor_analysis::{FactorAnalysis, FittedFactorAnalysis};
 pub use fast_ica::{Algorithm, FastICA, FittedFastICA, NonLinearity};

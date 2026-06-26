@@ -51,7 +51,7 @@
 //! | REQ-5 | `fit_algorithm="lars"` / LARS solver | NOT-STARTED | sklearn default `_dict_learning.py:1595,:1671`; ferrolearn CD-only (`DictFitAlgorithm::CoordinateDescent`) — blocker #1514 |
 //! | REQ-6 | SVD-based `dict_init`/`code_init` init | NOT-STARTED | sklearn `_dict_learning.py:581-584`; ferrolearn random Gaussian — blocker #1515 |
 //! | REQ-7 | `_update_dict` BCD + unused-atom resampling + unit-BALL projection | NOT-STARTED | sklearn `_dict_learning.py:474-551`; ferrolearn normal-equations LS + unit-SPHERE — blocker #1516 |
-//! | REQ-8 | `transform_alpha` + lasso_lars/lars/threshold algorithms + alpha/n_features scaling | NOT-STARTED | sklearn `_dict_learning.py:141,:1141`; ferrolearn Omp/LassoCd only, raw alpha — blocker #1517 |
+//! | REQ-8 | `sparse_encode` + transform algorithms | SHIPPED (scoped) / residual open | `sparse_encode` supports OMP, LassoCd, and Threshold; `tests/divergence_sparse_encode.rs` pins OMP/threshold/lasso_cd against sklearn 1.5.2. Residual `lasso_lars`/`lars`, `transform_alpha`, positive codes, n_jobs/gram/cov/init: blocker #1517 |
 //! | REQ-9 | `split_sign` | NOT-STARTED | sklearn `_dict_learning.py:1131-1137` — blocker #1518 |
 //! | REQ-10 | `positive_code`/`positive_dict` | NOT-STARTED | sklearn `_dict_learning.py:544-545` — blocker #1519 |
 //! | REQ-11 | `transform_max_iter` ctor param | NOT-STARTED | sklearn `_dict_learning.py:1608` — blocker #1520 |
@@ -61,7 +61,9 @@
 //! | REQ-15 | PyO3 binding | NOT-STARTED | no `_RsDictionaryLearning`; only consumer is re-export `lib.rs:83` — blocker #1524 |
 //! | REQ-16 | ferray substrate | NOT-STARTED | dense `ndarray::Array2` + `rand`/`rand_distr` — blocker #1525 |
 //!
-//! Count: **3 SHIPPED (REQ-1,2,3) / 13 NOT-STARTED (REQ-4..16)**.
+//! Count: **3 SHIPPED (REQ-1,2,3) + REQ-8 sparse_encode/threshold scoped /
+//! residual NOT-STARTED areas remain for value-parity, LARS, SVD init,
+//! sklearn dictionary update, positive coding, attrs, bindings, and substrate**.
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Transform};
@@ -108,6 +110,32 @@ pub enum DictTransformAlgorithm {
     Omp,
     /// Coordinate descent (lasso).
     LassoCd,
+    /// Soft-threshold the dictionary/data covariance.
+    Threshold,
+}
+
+/// Sparse-code rows of `x` against a fixed dictionary.
+///
+/// This is a scoped Rust analogue of scikit-learn's
+/// `sklearn.decomposition.sparse_encode` for the supported algorithms:
+/// [`DictTransformAlgorithm::Omp`], [`DictTransformAlgorithm::LassoCd`], and
+/// [`DictTransformAlgorithm::Threshold`]. The LARS variants, positive-code
+/// constraints, precomputed `gram`/`cov`, `init`, and `n_jobs` are still tracked
+/// gaps.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for shape mismatches, non-finite data, empty
+/// dictionaries, zero OMP sparsity, or negative `alpha`.
+pub fn sparse_encode(
+    x: &Array2<f64>,
+    dictionary: &Array2<f64>,
+    algorithm: DictTransformAlgorithm,
+    n_nonzero_coefs: Option<usize>,
+    alpha: Option<f64>,
+    max_iter: usize,
+) -> Result<Array2<f64>, FerroError> {
+    sparse_encode_checked(x, dictionary, algorithm, n_nonzero_coefs, alpha, max_iter)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,6 +478,96 @@ fn omp_single(x_row: &[f64], d: &Array2<f64>, max_nonzero: usize) -> Vec<f64> {
     a
 }
 
+fn threshold_single(x_row: &[f64], d: &Array2<f64>, alpha: f64) -> Vec<f64> {
+    let n_components = d.nrows();
+    let n_features = d.ncols();
+    let mut code = vec![0.0; n_components];
+    for k in 0..n_components {
+        let mut cov = 0.0;
+        for j in 0..n_features {
+            cov += d[[k, j]] * x_row[j];
+        }
+        code[k] = soft_threshold(cov, alpha);
+    }
+    code
+}
+
+fn default_n_nonzero_coefs(n_features: usize, n_components: usize) -> usize {
+    (n_features / 10).max(1).min(n_components)
+}
+
+fn sparse_encode_checked(
+    x: &Array2<f64>,
+    dictionary: &Array2<f64>,
+    algorithm: DictTransformAlgorithm,
+    n_nonzero_coefs: Option<usize>,
+    alpha: Option<f64>,
+    max_iter: usize,
+) -> Result<Array2<f64>, FerroError> {
+    if dictionary.nrows() == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "dictionary".into(),
+            reason: "must contain at least one atom".into(),
+        });
+    }
+    if dictionary.ncols() == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "dictionary".into(),
+            reason: "must have at least one feature".into(),
+        });
+    }
+    if x.ncols() != dictionary.ncols() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![x.nrows(), dictionary.ncols()],
+            actual: vec![x.nrows(), x.ncols()],
+            context: "sparse_encode".into(),
+        });
+    }
+
+    reject_non_finite(x)?;
+    reject_non_finite(dictionary)?;
+
+    if let Some(alpha) = alpha
+        && alpha < 0.0
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "alpha".into(),
+            reason: "must be non-negative".into(),
+        });
+    }
+    if let Some(0) = n_nonzero_coefs {
+        return Err(FerroError::InvalidParameter {
+            name: "n_nonzero_coefs".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+
+    let n_samples = x.nrows();
+    let n_features = x.ncols();
+    let n_components = dictionary.nrows();
+    let mut codes = Array2::<f64>::zeros((n_samples, n_components));
+
+    let l1_alpha = alpha.unwrap_or(1.0);
+    let max_nonzero =
+        n_nonzero_coefs.unwrap_or_else(|| default_n_nonzero_coefs(n_features, n_components));
+
+    for i in 0..n_samples {
+        let x_row: Vec<f64> = (0..n_features).map(|j| x[[i, j]]).collect();
+        let row_code = match algorithm {
+            DictTransformAlgorithm::Omp => omp_single(&x_row, dictionary, max_nonzero),
+            DictTransformAlgorithm::LassoCd => {
+                lasso_cd_single(&x_row, dictionary, l1_alpha, max_iter)
+            }
+            DictTransformAlgorithm::Threshold => threshold_single(&x_row, dictionary, l1_alpha),
+        };
+        for k in 0..n_components {
+            codes[[i, k]] = row_code[k];
+        }
+    }
+
+    Ok(codes)
+}
+
 /// Solve a small symmetric positive definite system Ax = b using
 /// Gaussian elimination with partial pivoting. Returns None if singular.
 #[allow(clippy::needless_range_loop)]
@@ -694,26 +812,14 @@ impl Transform<Array2<f64>> for FittedDictionaryLearning {
         // `_dict_learning.py:1113`, `utils/validation.py:147-154`).
         reject_non_finite(x)?;
 
-        let n_samples = x.nrows();
-        let n_components = self.components_.nrows();
-        let mut codes = Array2::<f64>::zeros((n_samples, n_components));
-
-        for i in 0..n_samples {
-            let x_row: Vec<f64> = (0..n_features).map(|j| x[[i, j]]).collect();
-            let a = match self.transform_algorithm_ {
-                DictTransformAlgorithm::Omp => {
-                    omp_single(&x_row, &self.components_, self.transform_n_nonzero_coefs_)
-                }
-                DictTransformAlgorithm::LassoCd => {
-                    lasso_cd_single(&x_row, &self.components_, self.alpha_, 200)
-                }
-            };
-            for k in 0..n_components {
-                codes[[i, k]] = a[k];
-            }
-        }
-
-        Ok(codes)
+        sparse_encode_checked(
+            x,
+            &self.components_,
+            self.transform_algorithm_,
+            Some(self.transform_n_nonzero_coefs_),
+            Some(self.alpha_),
+            200,
+        )
     }
 }
 
