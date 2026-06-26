@@ -28,7 +28,8 @@ Validated against scikit-learn 1.8.0 head-to-head — see the
 |-------|-------------|
 | `KernelPCA` | Non-linear PCA via RBF, polynomial, or sigmoid kernels |
 | `Isomap` | Isometric mapping via geodesic distances on a kNN graph |
-| `MDS` | Classical and metric Multidimensional Scaling |
+| `ClassicalMDS` | Principal coordinates analysis / classical MDS |
+| `MDS` | SMACOF metric Multidimensional Scaling |
 | `SpectralEmbedding` | Laplacian Eigenmaps |
 | `LLE` | Locally Linear Embedding (standard + modified) |
 | `Tsne` | t-distributed Stochastic Neighbor Embedding |

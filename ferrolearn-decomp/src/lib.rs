@@ -18,6 +18,8 @@
 //!   matrix `X` into `W * H` where both factors are non-negative.
 //! - [`KernelPCA`] — Kernel PCA. Non-linear dimensionality reduction via
 //!   a kernel-induced feature space.
+//! - [`ClassicalMDS`] — Principal coordinates analysis / classical MDS via
+//!   eigendecomposition.
 //! - [`MDS`] / [`smacof`] — SMACOF Multidimensional Scaling. Embeds data
 //!   preserving pairwise distances.
 //! - [`Isomap`] — Isometric Mapping. Non-linear dimensionality reduction
@@ -94,7 +96,7 @@ pub use lda_topic::{
     FittedLatentDirichletAllocation, LatentDirichletAllocation, LdaLearningMethod,
 };
 pub use lle::{FittedLLE, LLE};
-pub use mds::{Dissimilarity, FittedMDS, MDS, smacof};
+pub use mds::{ClassicalMDS, Dissimilarity, FittedClassicalMDS, FittedMDS, MDS, smacof};
 pub use minibatch_nmf::{FittedMiniBatchNMF, MiniBatchNMF, MiniBatchNMFInit};
 pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver};
 pub use pca::{FittedPCA, PCA};

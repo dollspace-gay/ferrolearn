@@ -90,7 +90,7 @@
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Fit;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::{Rng, SeedableRng};
 
 /// Reject non-finite input the way sklearn's `_validate_data` does.
@@ -123,6 +123,114 @@ pub enum Dissimilarity {
     Euclidean,
     /// The input is already a square pairwise-distance matrix.
     Precomputed,
+}
+
+// ---------------------------------------------------------------------------
+// ClassicalMDS (unfitted)
+// ---------------------------------------------------------------------------
+
+/// Classical multidimensional scaling configuration.
+///
+/// This is the Rust public surface corresponding to
+/// `sklearn.manifold.ClassicalMDS`: it computes pairwise dissimilarities
+/// (or consumes a precomputed dissimilarity matrix), double-centres the squared
+/// dissimilarities, eigendecomposes the centred matrix, applies sklearn's
+/// deterministic `svd_flip` sign convention, and returns the closed-form
+/// embedding.
+#[derive(Debug, Clone)]
+pub struct ClassicalMDS {
+    /// Number of embedding dimensions.
+    n_components: usize,
+    /// Whether input is a feature matrix or a precomputed distance matrix.
+    metric: Dissimilarity,
+}
+
+impl ClassicalMDS {
+    /// Create a new `ClassicalMDS` that embeds into `n_components` dimensions.
+    ///
+    /// The default metric is Euclidean, matching sklearn's
+    /// `ClassicalMDS(metric="euclidean")` default.
+    #[must_use]
+    pub fn new(n_components: usize) -> Self {
+        Self {
+            n_components,
+            metric: Dissimilarity::Euclidean,
+        }
+    }
+
+    /// Set the metric mode.
+    ///
+    /// `Dissimilarity::Euclidean` computes pairwise Euclidean distances from a
+    /// feature matrix. `Dissimilarity::Precomputed` treats the input as an
+    /// already-computed symmetric dissimilarity matrix.
+    #[must_use]
+    pub fn with_metric(mut self, metric: Dissimilarity) -> Self {
+        self.metric = metric;
+        self
+    }
+
+    /// Alias for [`ClassicalMDS::with_metric`] retained for consistency with
+    /// [`MDS::with_dissimilarity`].
+    #[must_use]
+    pub fn with_dissimilarity(self, dissimilarity: Dissimilarity) -> Self {
+        self.with_metric(dissimilarity)
+    }
+
+    /// Return the configured number of components.
+    #[must_use]
+    pub fn n_components(&self) -> usize {
+        self.n_components
+    }
+
+    /// Return the configured metric mode.
+    #[must_use]
+    pub fn metric(&self) -> Dissimilarity {
+        self.metric
+    }
+
+    /// Fit and return the embedding coordinates.
+    ///
+    /// This mirrors sklearn's `ClassicalMDS.fit_transform` convenience while the
+    /// primary ferrolearn stateful API remains [`Fit::fit`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation errors as [`Fit::fit`].
+    pub fn fit_transform(&self, x: &Array2<f64>) -> Result<Array2<f64>, FerroError> {
+        Ok(self.fit(x, &())?.embedding().clone())
+    }
+}
+
+/// A fitted ClassicalMDS model holding the learned embedding.
+#[derive(Debug, Clone)]
+pub struct FittedClassicalMDS {
+    /// The embedding, shape `(n_samples, min(n_components, n_samples))`.
+    embedding_: Array2<f64>,
+    /// The pairwise dissimilarity matrix actually used.
+    dissimilarity_matrix_: Array2<f64>,
+    /// Eigenvalues of the double-centred dissimilarity matrix selected for the
+    /// embedding, sorted descending.
+    eigenvalues_: Array1<f64>,
+}
+
+impl FittedClassicalMDS {
+    /// The embedding coordinates.
+    #[must_use]
+    pub fn embedding(&self) -> &Array2<f64> {
+        &self.embedding_
+    }
+
+    /// The pairwise dissimilarity matrix used for the fit.
+    #[must_use]
+    pub fn dissimilarity_matrix(&self) -> &Array2<f64> {
+        &self.dissimilarity_matrix_
+    }
+
+    /// Selected eigenvalues of the double-centred dissimilarity matrix.
+    #[must_use]
+    pub fn eigenvalues(&self) -> &Array1<f64> {
+        &self.eigenvalues_
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -377,6 +485,25 @@ fn euclidean_distances(x: &Array2<f64>) -> Array2<f64> {
         }
     }
     d
+}
+
+/// Validate that a precomputed dissimilarity matrix is symmetric.
+fn ensure_symmetric(x: &Array2<f64>, context: &str) -> Result<(), FerroError> {
+    let n = x.nrows();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let a = x[[i, j]];
+            let b = x[[j, i]];
+            let scale = a.abs().max(b.abs()).max(1.0);
+            if (a - b).abs() > 1e-12 * scale {
+                return Err(FerroError::InvalidParameter {
+                    name: "X".into(),
+                    reason: format!("{context} must be symmetric"),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One SMACOF run (metric MDS) from a fixed starting configuration `init`.
@@ -715,9 +842,152 @@ pub(crate) fn classical_mds(
     Ok((embedding, stress))
 }
 
+/// sklearn-style ClassicalMDS on a dissimilarity matrix.
+///
+/// Unlike the internal `classical_mds` helper used by Isomap, this keeps the
+/// selected eigenvalues as sklearn reports them and applies sklearn's
+/// `svd_flip(U, None)` sign convention before scaling eigenvectors.
+fn classical_mds_sklearn(
+    dissimilarities: &Array2<f64>,
+    n_components: usize,
+) -> Result<(Array2<f64>, Array1<f64>), FerroError> {
+    let n = dissimilarities.nrows();
+    let n_f = n as f64;
+
+    let sq_dist = dissimilarities.mapv(|v| v * v);
+    let mut row_means = vec![0.0; n];
+    let mut col_means = vec![0.0; n];
+    let mut grand_mean = 0.0;
+
+    for i in 0..n {
+        for j in 0..n {
+            row_means[i] += sq_dist[[i, j]];
+            col_means[j] += sq_dist[[i, j]];
+            grand_mean += sq_dist[[i, j]];
+        }
+    }
+    for i in 0..n {
+        row_means[i] /= n_f;
+        col_means[i] /= n_f;
+    }
+    grand_mean /= n_f * n_f;
+
+    let mut b = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        for j in 0..n {
+            b[[i, j]] = -0.5 * (sq_dist[[i, j]] - row_means[i] - col_means[j] + grand_mean);
+        }
+    }
+
+    let (eigenvalues, eigenvectors) = eigh_faer(&b)?;
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b_idx| {
+        eigenvalues[b_idx]
+            .partial_cmp(&eigenvalues[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let n_comp = n_components.min(n);
+    let mut embedding = Array2::<f64>::zeros((n, n_comp));
+    let mut selected_eigenvalues = Array1::<f64>::zeros(n_comp);
+
+    for (k, &idx) in indices.iter().take(n_comp).enumerate() {
+        let eigval = eigenvalues[idx];
+        selected_eigenvalues[k] = eigval;
+
+        // sklearn `svd_flip(U, None)` with u_based_decision=True: find the
+        // maximum-absolute entry in each eigenvector column and make it positive.
+        let mut max_abs = 0.0_f64;
+        let mut sign = 1.0_f64;
+        for i in 0..n {
+            let v = eigenvectors[[i, idx]];
+            let a = v.abs();
+            if a > max_abs {
+                max_abs = a;
+                sign = if v < 0.0 { -1.0 } else { 1.0 };
+            }
+        }
+
+        let scale = eigval.sqrt();
+        for i in 0..n {
+            embedding[[i, k]] = sign * eigenvectors[[i, idx]] * scale;
+        }
+    }
+
+    Ok((embedding, selected_eigenvalues))
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementations
 // ---------------------------------------------------------------------------
+
+impl Fit<Array2<f64>, ()> for ClassicalMDS {
+    type Fitted = FittedClassicalMDS;
+    type Error = FerroError;
+
+    /// Fit ClassicalMDS.
+    ///
+    /// Computes pairwise Euclidean distances for feature input or validates a
+    /// precomputed symmetric dissimilarity matrix, then performs classical MDS.
+    fn fit(&self, x: &Array2<f64>, _y: &()) -> Result<FittedClassicalMDS, FerroError> {
+        if self.n_components == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "n_components".into(),
+                reason: "must be at least 1".into(),
+            });
+        }
+
+        reject_non_finite(x)?;
+
+        let dissimilarity_matrix = match self.metric {
+            Dissimilarity::Euclidean => {
+                if x.nrows() == 0 {
+                    return Err(FerroError::InsufficientSamples {
+                        required: 1,
+                        actual: 0,
+                        context: "ClassicalMDS::fit requires at least 1 sample".into(),
+                    });
+                }
+                if x.ncols() == 0 {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![x.nrows(), 1],
+                        actual: vec![x.nrows(), 0],
+                        context: "ClassicalMDS::fit requires at least 1 feature".into(),
+                    });
+                }
+                euclidean_distances(x)
+            }
+            Dissimilarity::Precomputed => {
+                if x.nrows() != x.ncols() {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![x.nrows(), x.nrows()],
+                        actual: vec![x.nrows(), x.ncols()],
+                        context: "ClassicalMDS with Precomputed metric requires a square matrix"
+                            .into(),
+                    });
+                }
+                if x.nrows() == 0 {
+                    return Err(FerroError::InsufficientSamples {
+                        required: 1,
+                        actual: 0,
+                        context: "ClassicalMDS::fit requires at least 1 sample".into(),
+                    });
+                }
+                ensure_symmetric(x, "ClassicalMDS precomputed dissimilarity")?;
+                x.clone()
+            }
+        };
+
+        let (embedding, eigenvalues) =
+            classical_mds_sklearn(&dissimilarity_matrix, self.n_components)?;
+
+        Ok(FittedClassicalMDS {
+            embedding_: embedding,
+            dissimilarity_matrix_: dissimilarity_matrix,
+            eigenvalues_: eigenvalues,
+        })
+    }
+}
 
 impl Fit<Array2<f64>, ()> for MDS {
     type Fitted = FittedMDS;

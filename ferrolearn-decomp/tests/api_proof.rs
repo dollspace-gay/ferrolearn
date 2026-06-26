@@ -6,11 +6,12 @@
 
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_decomp::{
-    Affinity, Algorithm, CCA, DictFitAlgorithm, DictTransformAlgorithm, DictionaryLearning,
-    Dissimilarity, FactorAnalysis, FastICA, IncrementalPCA, Isomap, Kernel, KernelPCA, LLE,
-    LatentDirichletAllocation, LdaLearningMethod, MDS, MiniBatchNMF, MiniBatchNMFInit, NMF,
-    NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical, PLSRegression, PLSSVD, SparsePCA,
-    SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric, smacof, trustworthiness,
+    Affinity, Algorithm, CCA, ClassicalMDS, DictFitAlgorithm, DictTransformAlgorithm,
+    DictionaryLearning, Dissimilarity, FactorAnalysis, FastICA, FittedClassicalMDS, IncrementalPCA,
+    Isomap, Kernel, KernelPCA, LLE, LatentDirichletAllocation, LdaLearningMethod, MDS,
+    MiniBatchNMF, MiniBatchNMFInit, NMF, NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical,
+    PLSRegression, PLSSVD, SparsePCA, SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric,
+    smacof, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -271,6 +272,13 @@ fn api_proof_latent_dirichlet_allocation() {
 #[test]
 fn api_proof_mds() {
     let x = small_2d_data();
+    let classical: FittedClassicalMDS = ClassicalMDS::new(2).fit(&x, &()).unwrap();
+    assert_eq!(classical.embedding().dim(), (12, 2));
+    assert_eq!(classical.dissimilarity_matrix().dim(), (12, 12));
+    assert_eq!(classical.eigenvalues().len(), 2);
+    let classical_embedding = ClassicalMDS::new(2).fit_transform(&x).unwrap();
+    assert_eq!(classical_embedding.dim(), (12, 2));
+
     let f = MDS::new(2)
         .with_dissimilarity(Dissimilarity::Euclidean)
         .fit(&x, &())

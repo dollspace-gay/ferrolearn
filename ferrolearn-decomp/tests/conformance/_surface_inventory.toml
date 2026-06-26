@@ -19,6 +19,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::ClassicalMDS"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::DictFitAlgorithm"
 phase = "decomp"
 fixture = ""
@@ -50,6 +55,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_decomp::FittedCCA"
+phase = "decomp"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_decomp::FittedClassicalMDS"
 phase = "decomp"
 fixture = ""
 
