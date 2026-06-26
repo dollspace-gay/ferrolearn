@@ -32,7 +32,7 @@ use ferrolearn_tree::{
     HistClassificationLoss, HistGradientBoostingClassifier, HistGradientBoostingRegressor,
     HistRegressionLoss, IsolationForest, MaxFeatures, RandomForestClassifier,
     RandomForestRegressor, RandomTreesEmbedding, RegressionCriterion, RegressionLoss,
-    VotingClassifier, VotingRegressor,
+    VotingClassifier, VotingRegressor, export_text,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -96,6 +96,8 @@ fn api_proof_decision_tree() {
         .with_criterion(ClassificationCriterion::Gini);
     let f = m.fit(&x, &y_cls).unwrap();
     let _ = f.nodes();
+    let rules = export_text(f.nodes(), Some(&["x0", "x1"]), None, Some(10), 3, 2, false).unwrap();
+    assert!(rules.contains("class:"));
     assert_eq!(f.n_features(), 2);
     let preds = f.predict(&x).unwrap();
     assert_eq!(preds.len(), 12);
@@ -120,6 +122,9 @@ fn api_proof_decision_tree() {
         .with_criterion(RegressionCriterion::Mse);
     let fr = mr.fit(&x, &y_reg).unwrap();
     let _ = fr.nodes();
+    let reg_rules =
+        export_text(fr.nodes(), Some(&["x0", "x1"]), None, Some(10), 3, 2, false).unwrap();
+    assert!(reg_rules.contains("value:"));
     assert_eq!(fr.n_features(), 2);
     let preds_r = fr.predict(&x).unwrap();
     assert_eq!(preds_r.len(), 12);

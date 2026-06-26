@@ -220,6 +220,303 @@ pub enum Node<F> {
     },
 }
 
+/// Export a fitted tree's rules in a sklearn-style text representation.
+///
+/// This mirrors `sklearn.tree.export_text` for ferrolearn's flat [`Node`] tree
+/// storage. Pass [`FittedDecisionTreeClassifier::nodes`] or
+/// [`FittedDecisionTreeRegressor::nodes`] as `nodes`.
+///
+/// `feature_names=None` uses `feature_0`, `feature_1`, ... names. For
+/// classifier leaves, `class_names` can override the displayed class labels;
+/// otherwise the numeric leaf class value is printed. Regressor leaves are
+/// printed as `value: [...]`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `nodes` is empty, `spacing == 0`,
+/// a child index is out of range, a split feature is not covered by
+/// `feature_names`, or `class_names` does not match a classifier leaf's class
+/// distribution length.
+pub fn export_text<F>(
+    nodes: &[Node<F>],
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    max_depth: Option<usize>,
+    spacing: usize,
+    decimals: usize,
+    show_weights: bool,
+) -> Result<String, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    if nodes.is_empty() {
+        return Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "must contain at least one node".into(),
+        });
+    }
+    if spacing == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "spacing".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    if let Some(names) = class_names {
+        for node in nodes {
+            if let Node::Leaf {
+                class_distribution: Some(distribution),
+                ..
+            } = node
+            {
+                if names.len() != distribution.len() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "class_names".into(),
+                        reason: format!(
+                            "must contain {} items for this classifier tree; got {}",
+                            distribution.len(),
+                            names.len()
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut report = String::new();
+    export_text_recurse(
+        nodes,
+        0,
+        1,
+        feature_names,
+        class_names,
+        max_depth,
+        spacing,
+        decimals,
+        show_weights,
+        &mut report,
+    )?;
+    Ok(report)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_text_recurse<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    depth: usize,
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    max_depth: Option<usize>,
+    spacing: usize,
+    decimals: usize,
+    show_weights: bool,
+    report: &mut String,
+) -> Result<(), FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    let indent = export_text_indent(depth, spacing);
+    if max_depth.is_some_and(|limit| depth > limit + 1) {
+        let subtree_depth = export_text_subtree_depth(nodes, node_idx)?;
+        if subtree_depth == 1 {
+            export_text_leaf(
+                &nodes[node_idx],
+                &indent,
+                class_names,
+                decimals,
+                show_weights,
+                report,
+            )?;
+        } else {
+            report.push_str(&format!(
+                "{indent} truncated branch of depth {subtree_depth}\n"
+            ));
+        }
+        return Ok(());
+    }
+
+    match &nodes[node_idx] {
+        Node::Split {
+            feature,
+            threshold,
+            left,
+            right,
+            ..
+        } => {
+            if *left >= nodes.len() || *right >= nodes.len() {
+                return Err(FerroError::InvalidParameter {
+                    name: "nodes".into(),
+                    reason: "split child index is out of range".into(),
+                });
+            }
+            let feature_name = match feature_names {
+                Some(names) => names
+                    .get(*feature)
+                    .ok_or_else(|| FerroError::InvalidParameter {
+                        name: "feature_names".into(),
+                        reason: format!(
+                            "must contain a name for feature index {feature}; got {} names",
+                            names.len()
+                        ),
+                    })?
+                    .to_string(),
+                None => format!("feature_{feature}"),
+            };
+            let threshold = export_text_number(*threshold, decimals);
+            report.push_str(&format!("{indent} {feature_name} <= {threshold}\n"));
+            export_text_recurse(
+                nodes,
+                *left,
+                depth + 1,
+                feature_names,
+                class_names,
+                max_depth,
+                spacing,
+                decimals,
+                show_weights,
+                report,
+            )?;
+            report.push_str(&format!("{indent} {feature_name} >  {threshold}\n"));
+            export_text_recurse(
+                nodes,
+                *right,
+                depth + 1,
+                feature_names,
+                class_names,
+                max_depth,
+                spacing,
+                decimals,
+                show_weights,
+                report,
+            )
+        }
+        Node::Leaf { .. } => export_text_leaf(
+            &nodes[node_idx],
+            &indent,
+            class_names,
+            decimals,
+            show_weights,
+            report,
+        ),
+    }
+}
+
+fn export_text_indent(depth: usize, spacing: usize) -> String {
+    let mut indent = String::new();
+    for _ in 1..depth {
+        indent.push('|');
+        indent.push_str(&" ".repeat(spacing));
+    }
+    indent.push('|');
+    indent.push_str(&"-".repeat(spacing));
+    indent
+}
+
+fn export_text_subtree_depth<F>(nodes: &[Node<F>], node_idx: usize) -> Result<usize, FerroError> {
+    match nodes.get(node_idx) {
+        Some(Node::Leaf { .. }) => Ok(1),
+        Some(Node::Split { left, right, .. }) => {
+            if *left >= nodes.len() || *right >= nodes.len() {
+                return Err(FerroError::InvalidParameter {
+                    name: "nodes".into(),
+                    reason: "split child index is out of range".into(),
+                });
+            }
+            let left_depth = export_text_subtree_depth(nodes, *left)?;
+            let right_depth = export_text_subtree_depth(nodes, *right)?;
+            Ok(1 + left_depth.max(right_depth))
+        }
+        None => Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "node index is out of range".into(),
+        }),
+    }
+}
+
+fn export_text_leaf<F>(
+    node: &Node<F>,
+    indent: &str,
+    class_names: Option<&[&str]>,
+    decimals: usize,
+    show_weights: bool,
+    report: &mut String,
+) -> Result<(), FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    match node {
+        Node::Leaf {
+            value,
+            class_distribution: Some(distribution),
+            n_samples,
+        } => {
+            if let Some(names) = class_names {
+                if names.len() != distribution.len() {
+                    return Err(FerroError::InvalidParameter {
+                        name: "class_names".into(),
+                        reason: format!(
+                            "must contain {} items for this classifier tree; got {}",
+                            distribution.len(),
+                            names.len()
+                        ),
+                    });
+                }
+            }
+            if show_weights {
+                let weights = distribution
+                    .iter()
+                    .map(|p| {
+                        let weight = p.to_f64().unwrap_or(0.0) * (*n_samples as f64);
+                        format!("{weight:.decimals$}")
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                report.push_str(&format!("{indent} weights: [{weights}]"));
+            } else {
+                report.push_str(indent);
+            }
+            let class_name = export_text_class_name(*value, distribution, class_names);
+            report.push_str(&format!(" class: {class_name}\n"));
+            Ok(())
+        }
+        Node::Leaf { value, .. } => {
+            let value = export_text_number(*value, decimals);
+            report.push_str(&format!("{indent} value: [{value}]\n"));
+            Ok(())
+        }
+        Node::Split { .. } => Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "expected a leaf node".into(),
+        }),
+    }
+}
+
+fn export_text_class_name<F>(value: F, distribution: &[F], class_names: Option<&[&str]>) -> String
+where
+    F: Float + ToPrimitive,
+{
+    let class_idx = distribution
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(idx, _)| idx)
+        .unwrap_or(0);
+    if let Some(names) = class_names.and_then(|names| names.get(class_idx)) {
+        return (*names).to_string();
+    }
+    value
+        .to_i64()
+        .filter(|i| F::from(*i).is_some_and(|v| v == value))
+        .map_or_else(|| export_text_number(value, 2), |i| i.to_string())
+}
+
+fn export_text_number<F>(value: F, decimals: usize) -> String
+where
+    F: Float + ToPrimitive,
+{
+    let value = value.to_f64().unwrap_or(f64::NAN);
+    format!("{value:.decimals$}")
+}
+
 // ---------------------------------------------------------------------------
 // Internal config structs (to reduce argument counts)
 // ---------------------------------------------------------------------------

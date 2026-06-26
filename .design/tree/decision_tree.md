@@ -11,7 +11,7 @@ upstream-paths:
   - sklearn/tree/_splitter.pyx      # BestSplitter / node_split_best (:293), FEATURE_THRESHOLD (:33), midpoint threshold (:479)
   - sklearn/tree/_tree.pyx          # DepthFirstTreeBuilder / BestFirstTreeBuilder (max_leaf_nodes), ccp pruning
 ferrolearn-module: ferrolearn-tree/src/decision_tree.rs
-parity-ops: DecisionTreeClassifier, DecisionTreeRegressor
+parity-ops: DecisionTreeClassifier, DecisionTreeRegressor, export_text
 crosslink-issue: 658
 -->
 

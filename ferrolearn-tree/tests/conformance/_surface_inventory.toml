@@ -54,6 +54,11 @@ phase = "tree"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_tree::export_text"
+phase = "tree"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_tree::ExtraTreeClassifier"
 phase = "tree"
 fixture = ""
@@ -257,4 +262,3 @@ fixture = ""
 path = "ferrolearn_tree::VotingRegressor"
 phase = "tree"
 fixture = ""
-

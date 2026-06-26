@@ -68,6 +68,7 @@ pub use bagging::{
 pub use decision_tree::{
     ClassificationCriterion, DecisionTreeClassifier, DecisionTreeRegressor,
     FittedDecisionTreeClassifier, FittedDecisionTreeRegressor, Node, RegressionCriterion,
+    export_text,
 };
 pub use extra_tree::{
     ExtraTreeClassifier, ExtraTreeRegressor, FittedExtraTreeClassifier, FittedExtraTreeRegressor,

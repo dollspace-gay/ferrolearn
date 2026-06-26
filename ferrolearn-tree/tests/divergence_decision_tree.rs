@@ -24,7 +24,7 @@
 
 use ferrolearn_core::introspection::HasFeatureImportances;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_tree::{DecisionTreeClassifier, DecisionTreeRegressor, Node};
+use ferrolearn_tree::{DecisionTreeClassifier, DecisionTreeRegressor, Node, export_text};
 use ndarray::{Array1, Array2, array};
 
 /// Build the design-doc oracle classifier dataset.
@@ -57,6 +57,52 @@ fn root_split(nodes: &[Node<f64>]) -> Option<(usize, f64)> {
         }) => Some((*feature, *threshold)),
         _ => None,
     }
+}
+
+/// Public helper: `ferrolearn_tree::export_text` mirrors sklearn's text report
+/// for a one-split classifier tree.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeClassifier, export_text; \
+///     X=np.array([[0.],[1.],[2.],[3.]]); y=np.array([0,0,1,1]); \
+///     print(repr(export_text(DecisionTreeClassifier(max_depth=1,random_state=0).fit(X,y),feature_names=['x'],decimals=1)))"
+///   -> "|--- x <= 1.5\n|   |--- class: 0\n|--- x >  1.5\n|   |--- class: 1\n"
+#[test]
+fn green_export_text_classifier_stump_matches_sklearn() {
+    let x = Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+    let y = Array1::from(vec![0usize, 0, 1, 1]);
+    let fitted = DecisionTreeClassifier::<f64>::new()
+        .with_max_depth(Some(1))
+        .fit(&x, &y)
+        .unwrap();
+    let text = export_text(fitted.nodes(), Some(&["x"]), None, Some(10), 3, 1, false).unwrap();
+    assert_eq!(
+        text,
+        "|--- x <= 1.5\n|   |--- class: 0\n|--- x >  1.5\n|   |--- class: 1\n"
+    );
+}
+
+/// Public helper: `ferrolearn_tree::export_text` mirrors sklearn's text report
+/// for a one-split regressor tree.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.tree import DecisionTreeRegressor, export_text; \
+///     X=np.array([[0.],[1.],[2.],[3.]]); y=np.array([1.,1.,3.,3.]); \
+///     print(repr(export_text(DecisionTreeRegressor(max_depth=1,random_state=0).fit(X,y),feature_names=['x'],decimals=1)))"
+///   -> "|--- x <= 1.5\n|   |--- value: [1.0]\n|--- x >  1.5\n|   |--- value: [3.0]\n"
+#[test]
+fn green_export_text_regressor_stump_matches_sklearn() {
+    let x = Array2::from_shape_vec((4, 1), vec![0.0, 1.0, 2.0, 3.0]).unwrap();
+    let y = Array1::from(vec![1.0, 1.0, 3.0, 3.0]);
+    let fitted = DecisionTreeRegressor::<f64>::new()
+        .with_max_depth(Some(1))
+        .fit(&x, &y)
+        .unwrap();
+    let text = export_text(fitted.nodes(), Some(&["x"]), None, Some(10), 3, 1, false).unwrap();
+    assert_eq!(
+        text,
+        "|--- x <= 1.5\n|   |--- value: [1.0]\n|--- x >  1.5\n|   |--- value: [3.0]\n"
+    );
 }
 
 // ===========================================================================
