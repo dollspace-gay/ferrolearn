@@ -10,7 +10,7 @@ use ferrolearn_decomp::{
     Dissimilarity, FactorAnalysis, FastICA, IncrementalPCA, Isomap, Kernel, KernelPCA, LLE,
     LatentDirichletAllocation, LdaLearningMethod, MDS, MiniBatchNMF, MiniBatchNMFInit, NMF,
     NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical, PLSRegression, PLSSVD, SparsePCA,
-    SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric,
+    SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -342,6 +342,13 @@ fn api_proof_tsne() {
         .unwrap();
     let emb = f.embedding();
     assert_eq!(emb.dim(), (12, 2));
+}
+
+#[test]
+fn api_proof_trustworthiness() {
+    let x = small_2d_data();
+    let score = trustworthiness(&x, &x, 3).unwrap();
+    assert!((0.0..=1.0).contains(&score));
 }
 
 #[test]

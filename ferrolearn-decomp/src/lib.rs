@@ -30,6 +30,7 @@
 //!   dimensionality reduction using Barnes-Hut approximation.
 //! - [`Umap`] — Uniform Manifold Approximation and Projection. Fast non-linear
 //!   dimensionality reduction based on topological data analysis.
+//! - [`trustworthiness`] — neighborhood-preservation score for manifold embeddings.
 //! - [`LatentDirichletAllocation`] — Latent Dirichlet Allocation topic model.
 //!   Discovers latent topics in document-term matrices.
 //! - [`DictionaryLearning`] — Sparse coding with a learned dictionary.
@@ -72,6 +73,7 @@ pub mod pca;
 pub mod sparse_pca;
 pub mod spectral_embedding;
 pub mod truncated_svd;
+pub mod trustworthiness;
 pub mod tsne;
 pub mod umap;
 
@@ -99,5 +101,6 @@ pub use pca::{FittedPCA, PCA};
 pub use sparse_pca::{FittedSparsePCA, SparsePCA};
 pub use spectral_embedding::{Affinity, FittedSpectralEmbedding, SpectralEmbedding};
 pub use truncated_svd::{FittedTruncatedSVD, TruncatedSVD};
+pub use trustworthiness::trustworthiness;
 pub use tsne::{FittedTsne, Tsne};
 pub use umap::{FittedUmap, Umap, UmapMetric};

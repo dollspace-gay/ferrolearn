@@ -259,6 +259,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::trustworthiness"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::Tsne"
 phase = "decomp"
 fixture = ""
@@ -272,4 +277,3 @@ fixture = ""
 path = "ferrolearn_decomp::UmapMetric"
 phase = "decomp"
 fixture = ""
-
