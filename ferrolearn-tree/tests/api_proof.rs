@@ -6,7 +6,8 @@
 //!
 //! Coverage:
 //! - DecisionTreeClassifier / Regressor: builders + fit/predict/score/
-//!   predict_proba/predict_log_proba (cls), feature_importances_
+//!   predict_proba/predict_log_proba (cls), feature_importances_,
+//!   export_text/export_graphviz/plot_tree
 //! - ExtraTreeClassifier / Regressor: same
 //! - RandomForestClassifier / Regressor: same plus parallel-fit smoke
 //! - ExtraTreesClassifier / Regressor: same
@@ -32,7 +33,8 @@ use ferrolearn_tree::{
     HistClassificationLoss, HistGradientBoostingClassifier, HistGradientBoostingRegressor,
     HistRegressionLoss, IsolationForest, MaxFeatures, RandomForestClassifier,
     RandomForestRegressor, RandomTreesEmbedding, RegressionCriterion, RegressionLoss,
-    VotingClassifier, VotingRegressor, export_text,
+    TreePlotAnnotation, TreePlotOptions, VotingClassifier, VotingRegressor, export_graphviz,
+    export_text, plot_tree,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -98,6 +100,32 @@ fn api_proof_decision_tree() {
     let _ = f.nodes();
     let rules = export_text(f.nodes(), Some(&["x0", "x1"]), None, Some(10), 3, 2, false).unwrap();
     assert!(rules.contains("class:"));
+    let plot_options = TreePlotOptions {
+        precision: 2,
+        node_ids: true,
+        rounded: true,
+        ..TreePlotOptions::default()
+    };
+    let dot = export_graphviz(
+        f.nodes(),
+        Some(&["x0", "x1"]),
+        Some(&["zero", "one"]),
+        plot_options,
+    )
+    .unwrap();
+    assert!(dot.starts_with("digraph Tree {"));
+    assert!(dot.contains("class = zero") || dot.contains("class = one"));
+    assert!(dot.contains("headlabel=\"True\""));
+    let annotations: Vec<TreePlotAnnotation> = plot_tree(
+        f.nodes(),
+        Some(&["x0", "x1"]),
+        Some(&["zero", "one"]),
+        plot_options,
+    )
+    .unwrap();
+    assert_eq!(annotations.len(), f.nodes().len());
+    assert_eq!(annotations[0].node_id, 0);
+    assert!(annotations[0].label.contains("node #0"));
     assert_eq!(f.n_features(), 2);
     let preds = f.predict(&x).unwrap();
     assert_eq!(preds.len(), 12);
@@ -125,6 +153,26 @@ fn api_proof_decision_tree() {
     let reg_rules =
         export_text(fr.nodes(), Some(&["x0", "x1"]), None, Some(10), 3, 2, false).unwrap();
     assert!(reg_rules.contains("value:"));
+    let reg_dot = export_graphviz(
+        fr.nodes(),
+        Some(&["x0", "x1"]),
+        None,
+        TreePlotOptions {
+            precision: 2,
+            filled: true,
+            ..TreePlotOptions::default()
+        },
+    )
+    .unwrap();
+    assert!(reg_dot.contains("value = ["));
+    let reg_plot = plot_tree(
+        fr.nodes(),
+        Some(&["x0", "x1"]),
+        None,
+        TreePlotOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(reg_plot.len(), fr.nodes().len());
     assert_eq!(fr.n_features(), 2);
     let preds_r = fr.predict(&x).unwrap();
     assert_eq!(preds_r.len(), 12);

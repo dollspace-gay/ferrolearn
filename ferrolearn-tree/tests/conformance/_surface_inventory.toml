@@ -59,6 +59,11 @@ phase = "tree"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_tree::export_graphviz"
+phase = "tree"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_tree::ExtraTreeClassifier"
 phase = "tree"
 fixture = ""
@@ -254,11 +259,26 @@ phase = "tree"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_tree::plot_tree"
+phase = "tree"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_tree::VotingClassifier"
 phase = "tree"
 fixture = ""
 
 [[item]]
 path = "ferrolearn_tree::VotingRegressor"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::TreePlotAnnotation"
+phase = "tree"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_tree::TreePlotOptions"
 phase = "tree"
 fixture = ""

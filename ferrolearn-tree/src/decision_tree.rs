@@ -220,6 +220,67 @@ pub enum Node<F> {
     },
 }
 
+/// Options shared by [`export_graphviz`] and [`plot_tree`].
+///
+/// Defaults mirror sklearn's visualization helpers where the Rust return types
+/// have direct equivalents: full depth, precision 3, no node IDs, raw sample
+/// counts, unfilled boxes, square corners, and top-down orientation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TreePlotOptions {
+    /// Maximum depth to render. `None` renders the full tree.
+    pub max_depth: Option<usize>,
+    /// Decimal precision for thresholds and values.
+    pub precision: usize,
+    /// Include the node index in each label.
+    pub node_ids: bool,
+    /// Show sample counts as percentages of the root sample count.
+    pub proportion: bool,
+    /// Mark boxes as rounded in Graphviz output.
+    pub rounded: bool,
+    /// Add simple fill colors by node type / majority class.
+    pub filled: bool,
+    /// Orient Graphviz output left-to-right instead of top-down.
+    pub rotate: bool,
+}
+
+impl Default for TreePlotOptions {
+    fn default() -> Self {
+        Self {
+            max_depth: None,
+            precision: 3,
+            node_ids: false,
+            proportion: false,
+            rounded: false,
+            filled: false,
+            rotate: false,
+        }
+    }
+}
+
+/// One rendered annotation returned by [`plot_tree`].
+///
+/// This is a Rust-native equivalent of sklearn's matplotlib annotation output:
+/// it carries the rendered label, normalized coordinates, optional parent edge,
+/// and optional fill color. Callers can render these annotations in any frontend
+/// rather than depending on matplotlib.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TreePlotAnnotation {
+    /// Node index in the flat [`Node`] array.
+    pub node_id: usize,
+    /// Multiline text shown for the node.
+    pub label: String,
+    /// Normalized horizontal position in `[0, 1]`.
+    pub x: f64,
+    /// Normalized vertical position in `[0, 1]`, root at `0`.
+    pub y: f64,
+    /// Parent node index, if this is not the root.
+    pub parent: Option<usize>,
+    /// Edge label from parent. The root split uses `True` / `False` like sklearn.
+    pub edge_label: Option<String>,
+    /// Optional fill color in `#RRGGBB` form when [`TreePlotOptions::filled`] is set.
+    pub fill_color: Option<String>,
+}
+
 /// Export a fitted tree's rules in a sklearn-style text representation.
 ///
 /// This mirrors `sklearn.tree.export_text` for ferrolearn's flat [`Node`] tree
@@ -267,17 +328,16 @@ where
                 class_distribution: Some(distribution),
                 ..
             } = node
+                && names.len() != distribution.len()
             {
-                if names.len() != distribution.len() {
-                    return Err(FerroError::InvalidParameter {
-                        name: "class_names".into(),
-                        reason: format!(
-                            "must contain {} items for this classifier tree; got {}",
-                            distribution.len(),
-                            names.len()
-                        ),
-                    });
-                }
+                return Err(FerroError::InvalidParameter {
+                    name: "class_names".into(),
+                    reason: format!(
+                        "must contain {} items for this classifier tree; got {}",
+                        distribution.len(),
+                        names.len()
+                    ),
+                });
             }
         }
     }
@@ -449,17 +509,17 @@ where
             class_distribution: Some(distribution),
             n_samples,
         } => {
-            if let Some(names) = class_names {
-                if names.len() != distribution.len() {
-                    return Err(FerroError::InvalidParameter {
-                        name: "class_names".into(),
-                        reason: format!(
-                            "must contain {} items for this classifier tree; got {}",
-                            distribution.len(),
-                            names.len()
-                        ),
-                    });
-                }
+            if let Some(names) = class_names
+                && names.len() != distribution.len()
+            {
+                return Err(FerroError::InvalidParameter {
+                    name: "class_names".into(),
+                    reason: format!(
+                        "must contain {} items for this classifier tree; got {}",
+                        distribution.len(),
+                        names.len()
+                    ),
+                });
             }
             if show_weights {
                 let weights = distribution
@@ -494,12 +554,7 @@ fn export_text_class_name<F>(value: F, distribution: &[F], class_names: Option<&
 where
     F: Float + ToPrimitive,
 {
-    let class_idx = distribution
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-        .map(|(idx, _)| idx)
-        .unwrap_or(0);
+    let class_idx = argmax_first_float(distribution);
     if let Some(names) = class_names.and_then(|names| names.get(class_idx)) {
         return (*names).to_string();
     }
@@ -515,6 +570,690 @@ where
 {
     let value = value.to_f64().unwrap_or(f64::NAN);
     format!("{value:.decimals$}")
+}
+
+/// Export a fitted tree in Graphviz DOT format.
+///
+/// This mirrors the core output of `sklearn.tree.export_graphviz` for
+/// ferrolearn's flat [`Node`] tree storage. It returns the DOT string directly
+/// instead of writing to a Python file-like object. Pass
+/// [`FittedDecisionTreeClassifier::nodes`] or
+/// [`FittedDecisionTreeRegressor::nodes`] as `nodes`.
+///
+/// Current scoped differences from sklearn: impurity text, exact color
+/// gradients, `leaves_parallel`, HTML special-character labels, and file-handle
+/// output are not implemented. Split-node values are reconstructed from child
+/// leaves because ferrolearn does not store sklearn's full per-node `value`
+/// tensor in each split node.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `nodes` is empty, a child index is
+/// out of range, a split feature is not covered by `feature_names`, or
+/// `class_names` does not match a classifier leaf's class distribution length.
+pub fn export_graphviz<F>(
+    nodes: &[Node<F>],
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    options: TreePlotOptions,
+) -> Result<String, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    validate_tree_plot_inputs(nodes, feature_names, class_names)?;
+
+    let mut dot = String::new();
+    dot.push_str("digraph Tree {\n");
+    dot.push_str("node [shape=box");
+    let mut styles = Vec::new();
+    if options.filled {
+        styles.push("filled");
+    }
+    if options.rounded {
+        styles.push("rounded");
+    }
+    if styles.is_empty() {
+        dot.push_str(", fontname=\"helvetica\"] ;\n");
+    } else {
+        dot.push_str(&format!(
+            ", style=\"{}\", color=\"black\", fontname=\"helvetica\"] ;\n",
+            styles.join(", ")
+        ));
+    }
+    dot.push_str("edge [fontname=\"helvetica\"] ;\n");
+    if options.rotate {
+        dot.push_str("rankdir=LR ;\n");
+    }
+
+    let root_samples = node_n_samples(&nodes[0]);
+    export_graphviz_recurse(
+        nodes,
+        0,
+        0,
+        None,
+        None,
+        root_samples,
+        feature_names,
+        class_names,
+        options,
+        &mut dot,
+    )?;
+    dot.push('}');
+    Ok(dot)
+}
+
+/// Build a deterministic, renderer-agnostic tree plot representation.
+///
+/// This is a Rust-native counterpart to `sklearn.tree.plot_tree`. Instead of
+/// returning matplotlib artists, it returns positioned [`TreePlotAnnotation`]
+/// records that can be rendered by a caller. The layout uses the same broad
+/// Reingold-Tilford idea as sklearn: leaves are spaced uniformly left-to-right
+/// and internal nodes are centered over their visible children.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] under the same malformed-tree and
+/// naming conditions as [`export_graphviz`].
+pub fn plot_tree<F>(
+    nodes: &[Node<F>],
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    options: TreePlotOptions,
+) -> Result<Vec<TreePlotAnnotation>, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    validate_tree_plot_inputs(nodes, feature_names, class_names)?;
+
+    let root_samples = node_n_samples(&nodes[0]);
+    let max_visible_depth = visible_tree_depth(nodes, 0, 0, options.max_depth)?;
+    let mut annotations = Vec::new();
+    let mut next_leaf_x = 0.0;
+    plot_tree_recurse(
+        nodes,
+        0,
+        0,
+        None,
+        None,
+        root_samples,
+        max_visible_depth,
+        feature_names,
+        class_names,
+        options,
+        &mut next_leaf_x,
+        &mut annotations,
+    )?;
+    let max_x = if next_leaf_x > 1.0 {
+        next_leaf_x - 1.0
+    } else {
+        1.0
+    };
+    let max_y = max_visible_depth.max(1) as f64;
+    for annotation in &mut annotations {
+        annotation.x /= max_x;
+        annotation.y /= max_y;
+    }
+    annotations.sort_by_key(|annotation| annotation.node_id);
+    Ok(annotations)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn export_graphviz_recurse<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    depth: usize,
+    parent: Option<usize>,
+    edge_label: Option<&str>,
+    root_samples: usize,
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    options: TreePlotOptions,
+    dot: &mut String,
+) -> Result<(), FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    let visible = options.max_depth.is_none_or(|max_depth| depth <= max_depth);
+    let label = if visible {
+        tree_plot_label(
+            nodes,
+            node_idx,
+            root_samples,
+            feature_names,
+            class_names,
+            options,
+        )?
+    } else {
+        "(...)".to_string()
+    };
+
+    dot.push_str(&format!(
+        "{node_idx} [label=\"{}\"",
+        graphviz_escape_label(&label)
+    ));
+    if options.filled {
+        dot.push_str(&format!(
+            ", fillcolor=\"{}\"",
+            tree_plot_fill_color(nodes, node_idx, visible)?
+        ));
+    }
+    dot.push_str("] ;\n");
+
+    if let Some(parent_idx) = parent {
+        dot.push_str(&format!("{parent_idx} -> {node_idx}"));
+        if let Some(label) = edge_label {
+            let angle = if label == "True" { 45 } else { -45 };
+            dot.push_str(&format!(
+                " [labeldistance=2.5, labelangle={angle}, headlabel=\"{label}\"]"
+            ));
+        }
+        dot.push_str(" ;\n");
+    }
+
+    if !visible {
+        return Ok(());
+    }
+    if let Node::Split { left, right, .. } = nodes[node_idx] {
+        let left_label = (node_idx == 0).then_some("True");
+        let right_label = (node_idx == 0).then_some("False");
+        export_graphviz_recurse(
+            nodes,
+            left,
+            depth + 1,
+            Some(node_idx),
+            left_label,
+            root_samples,
+            feature_names,
+            class_names,
+            options,
+            dot,
+        )?;
+        export_graphviz_recurse(
+            nodes,
+            right,
+            depth + 1,
+            Some(node_idx),
+            right_label,
+            root_samples,
+            feature_names,
+            class_names,
+            options,
+            dot,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plot_tree_recurse<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    depth: usize,
+    parent: Option<usize>,
+    edge_label: Option<String>,
+    root_samples: usize,
+    max_visible_depth: usize,
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    options: TreePlotOptions,
+    next_leaf_x: &mut f64,
+    annotations: &mut Vec<TreePlotAnnotation>,
+) -> Result<f64, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    let visible = options.max_depth.is_none_or(|max_depth| depth <= max_depth);
+    let (x, label) = match nodes[node_idx] {
+        Node::Split { left, right, .. } if visible => {
+            let left_edge = (node_idx == 0).then(|| "True".to_string());
+            let right_edge = (node_idx == 0).then(|| "False".to_string());
+            let left_x = plot_tree_recurse(
+                nodes,
+                left,
+                depth + 1,
+                Some(node_idx),
+                left_edge,
+                root_samples,
+                max_visible_depth,
+                feature_names,
+                class_names,
+                options,
+                next_leaf_x,
+                annotations,
+            )?;
+            let right_x = plot_tree_recurse(
+                nodes,
+                right,
+                depth + 1,
+                Some(node_idx),
+                right_edge,
+                root_samples,
+                max_visible_depth,
+                feature_names,
+                class_names,
+                options,
+                next_leaf_x,
+                annotations,
+            )?;
+            (
+                (left_x + right_x) / 2.0,
+                tree_plot_label(
+                    nodes,
+                    node_idx,
+                    root_samples,
+                    feature_names,
+                    class_names,
+                    options,
+                )?,
+            )
+        }
+        _ => {
+            let x = *next_leaf_x;
+            *next_leaf_x += 1.0;
+            let label = if visible {
+                tree_plot_label(
+                    nodes,
+                    node_idx,
+                    root_samples,
+                    feature_names,
+                    class_names,
+                    options,
+                )?
+            } else {
+                "(...)".to_string()
+            };
+            (x, label)
+        }
+    };
+
+    annotations.push(TreePlotAnnotation {
+        node_id: node_idx,
+        label,
+        x,
+        y: depth.min(max_visible_depth) as f64,
+        parent,
+        edge_label,
+        fill_color: options
+            .filled
+            .then(|| tree_plot_fill_color(nodes, node_idx, visible))
+            .transpose()?,
+    });
+    Ok(x)
+}
+
+fn validate_tree_plot_inputs<F>(
+    nodes: &[Node<F>],
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+) -> Result<(), FerroError>
+where
+    F: Float,
+{
+    if nodes.is_empty() {
+        return Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "must contain at least one node".into(),
+        });
+    }
+
+    validate_tree_plot_node(nodes, 0, feature_names, class_names)
+}
+
+fn validate_tree_plot_node<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+) -> Result<(), FerroError>
+where
+    F: Float,
+{
+    match nodes.get(node_idx) {
+        Some(Node::Split {
+            feature,
+            left,
+            right,
+            ..
+        }) => {
+            if *left >= nodes.len() || *right >= nodes.len() {
+                return Err(FerroError::InvalidParameter {
+                    name: "nodes".into(),
+                    reason: "split child index is out of range".into(),
+                });
+            }
+            if let Some(names) = feature_names
+                && *feature >= names.len()
+            {
+                return Err(FerroError::InvalidParameter {
+                    name: "feature_names".into(),
+                    reason: format!(
+                        "must contain a name for feature index {feature}; got {} names",
+                        names.len()
+                    ),
+                });
+            }
+            validate_tree_plot_node(nodes, *left, feature_names, class_names)?;
+            validate_tree_plot_node(nodes, *right, feature_names, class_names)
+        }
+        Some(Node::Leaf {
+            class_distribution: Some(distribution),
+            ..
+        }) => {
+            if let Some(names) = class_names
+                && names.len() != distribution.len()
+            {
+                return Err(FerroError::InvalidParameter {
+                    name: "class_names".into(),
+                    reason: format!(
+                        "must contain {} items for this classifier tree; got {}",
+                        distribution.len(),
+                        names.len()
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Some(Node::Leaf { .. }) => Ok(()),
+        None => Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "node index is out of range".into(),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tree_plot_label<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    root_samples: usize,
+    feature_names: Option<&[&str]>,
+    class_names: Option<&[&str]>,
+    options: TreePlotOptions,
+) -> Result<String, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    let node = &nodes[node_idx];
+    let mut lines = Vec::new();
+    if options.node_ids {
+        lines.push(format!("node #{node_idx}"));
+    }
+    if let Node::Split {
+        feature, threshold, ..
+    } = node
+    {
+        let feature_name = feature_names
+            .and_then(|names| names.get(*feature))
+            .map_or_else(|| format!("x[{feature}]"), |name| (*name).to_string());
+        lines.push(format!(
+            "{feature_name} <= {}",
+            format_compact_number(threshold.to_f64().unwrap_or(f64::NAN), options.precision)
+        ));
+    }
+
+    lines.push(format_samples(
+        node_n_samples(node),
+        root_samples,
+        options.proportion,
+        options.precision,
+    ));
+    match tree_plot_value(nodes, node_idx)? {
+        TreePlotValue::Classification(counts) => {
+            let display_counts = if options.proportion {
+                normalize_counts(&counts)
+            } else {
+                counts
+            };
+            lines.push(format!(
+                "value = [{}]",
+                format_number_vec(&display_counts, options.precision)
+            ));
+            lines.push(format!(
+                "class = {}",
+                tree_plot_class_name(node, &display_counts, class_names, options.precision)
+            ));
+        }
+        TreePlotValue::Regression { total, weight } => {
+            let value = if weight == 0 {
+                f64::NAN
+            } else {
+                total / weight as f64
+            };
+            lines.push(format!(
+                "value = [{}]",
+                format_compact_number(value, options.precision)
+            ));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
+fn format_samples(
+    n_samples: usize,
+    root_samples: usize,
+    proportion: bool,
+    precision: usize,
+) -> String {
+    if proportion {
+        let percent = if root_samples == 0 {
+            0.0
+        } else {
+            100.0 * n_samples as f64 / root_samples as f64
+        };
+        format!("samples = {}%", format_compact_number(percent, precision))
+    } else {
+        format!("samples = {n_samples}")
+    }
+}
+
+fn tree_plot_class_name<F>(
+    node: &Node<F>,
+    counts: &[f64],
+    class_names: Option<&[&str]>,
+    precision: usize,
+) -> String
+where
+    F: Float + ToPrimitive,
+{
+    let class_idx = argmax_first_f64(counts);
+    if let Some(name) = class_names.and_then(|names| names.get(class_idx)) {
+        return (*name).to_string();
+    }
+    if let Node::Leaf { value, .. } = node {
+        return format_compact_number(value.to_f64().unwrap_or(f64::NAN), precision);
+    }
+    class_idx.to_string()
+}
+
+fn node_n_samples<F>(node: &Node<F>) -> usize {
+    match node {
+        Node::Split { n_samples, .. } | Node::Leaf { n_samples, .. } => *n_samples,
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TreePlotValue {
+    Classification(Vec<f64>),
+    Regression { total: f64, weight: usize },
+}
+
+fn tree_plot_value<F>(nodes: &[Node<F>], node_idx: usize) -> Result<TreePlotValue, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    match &nodes[node_idx] {
+        Node::Leaf {
+            class_distribution: Some(distribution),
+            n_samples,
+            ..
+        } => Ok(TreePlotValue::Classification(
+            distribution
+                .iter()
+                .map(|p| p.to_f64().unwrap_or(0.0) * *n_samples as f64)
+                .collect(),
+        )),
+        Node::Leaf {
+            value, n_samples, ..
+        } => Ok(TreePlotValue::Regression {
+            total: value.to_f64().unwrap_or(f64::NAN) * *n_samples as f64,
+            weight: *n_samples,
+        }),
+        Node::Split { left, right, .. } => {
+            let left_value = tree_plot_value(nodes, *left)?;
+            let right_value = tree_plot_value(nodes, *right)?;
+            combine_tree_plot_values(left_value, right_value)
+        }
+    }
+}
+
+fn combine_tree_plot_values(
+    left: TreePlotValue,
+    right: TreePlotValue,
+) -> Result<TreePlotValue, FerroError> {
+    match (left, right) {
+        (TreePlotValue::Classification(mut left), TreePlotValue::Classification(right)) => {
+            if left.len() != right.len() {
+                return Err(FerroError::InvalidParameter {
+                    name: "nodes".into(),
+                    reason: "classifier leaves have inconsistent class distribution lengths".into(),
+                });
+            }
+            for (left_value, right_value) in left.iter_mut().zip(right) {
+                *left_value += right_value;
+            }
+            Ok(TreePlotValue::Classification(left))
+        }
+        (
+            TreePlotValue::Regression {
+                total: left_total,
+                weight: left_weight,
+            },
+            TreePlotValue::Regression {
+                total: right_total,
+                weight: right_weight,
+            },
+        ) => Ok(TreePlotValue::Regression {
+            total: left_total + right_total,
+            weight: left_weight + right_weight,
+        }),
+        _ => Err(FerroError::InvalidParameter {
+            name: "nodes".into(),
+            reason: "tree mixes classifier and regressor leaves".into(),
+        }),
+    }
+}
+
+fn normalize_counts(counts: &[f64]) -> Vec<f64> {
+    let total: f64 = counts.iter().sum();
+    if total == 0.0 {
+        return vec![0.0; counts.len()];
+    }
+    counts.iter().map(|count| count / total).collect()
+}
+
+fn format_number_vec(values: &[f64], precision: usize) -> String {
+    values
+        .iter()
+        .map(|value| format_compact_number(*value, precision))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn format_compact_number(value: f64, precision: usize) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    let mut formatted = format!("{value:.precision$}");
+    if formatted.contains('.') {
+        while formatted.ends_with('0') {
+            formatted.pop();
+        }
+        if formatted.ends_with('.') {
+            formatted.pop();
+        }
+    }
+    if formatted == "-0" {
+        "0".to_string()
+    } else {
+        formatted
+    }
+}
+
+fn graphviz_escape_label(label: &str) -> String {
+    label
+        .replace('\\', r"\\")
+        .replace('"', r#"\""#)
+        .replace('\n', r"\n")
+}
+
+fn tree_plot_fill_color<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    visible: bool,
+) -> Result<String, FerroError>
+where
+    F: Float + ToPrimitive,
+{
+    if !visible {
+        return Ok("#C0C0C0".to_string());
+    }
+    match tree_plot_value(nodes, node_idx)? {
+        TreePlotValue::Classification(counts) => {
+            const COLORS: [&str; 10] = [
+                "#e58139", "#399de5", "#3cb371", "#d65f5f", "#8e44ad", "#f1c40f", "#16a085",
+                "#e377c2", "#7f7f7f", "#bcbd22",
+            ];
+            let class_idx = argmax_first_f64(&counts);
+            Ok(COLORS[class_idx % COLORS.len()].to_string())
+        }
+        TreePlotValue::Regression { .. } => Ok("#f5f5f5".to_string()),
+    }
+}
+
+fn visible_tree_depth<F>(
+    nodes: &[Node<F>],
+    node_idx: usize,
+    depth: usize,
+    max_depth: Option<usize>,
+) -> Result<usize, FerroError> {
+    if max_depth.is_some_and(|limit| depth > limit) {
+        return Ok(depth);
+    }
+    match nodes[node_idx] {
+        Node::Leaf { .. } => Ok(depth),
+        Node::Split { left, right, .. } => {
+            let left_depth = visible_tree_depth(nodes, left, depth + 1, max_depth)?;
+            let right_depth = visible_tree_depth(nodes, right, depth + 1, max_depth)?;
+            Ok(left_depth.max(right_depth))
+        }
+    }
+}
+
+fn argmax_first_float<F>(values: &[F]) -> usize
+where
+    F: Float,
+{
+    let mut best_idx = 0;
+    let mut best_value = F::neg_infinity();
+    for (idx, value) in values.iter().copied().enumerate() {
+        if value > best_value {
+            best_idx = idx;
+            best_value = value;
+        }
+    }
+    best_idx
+}
+
+fn argmax_first_f64(values: &[f64]) -> usize {
+    let mut best_idx = 0;
+    let mut best_value = f64::NEG_INFINITY;
+    for (idx, value) in values.iter().copied().enumerate() {
+        if value > best_value {
+            best_idx = idx;
+            best_value = value;
+        }
+    }
+    best_idx
 }
 
 // ---------------------------------------------------------------------------
