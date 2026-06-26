@@ -46,6 +46,8 @@ use ferrolearn_preprocess::{
     ColumnTransformer,
     // sklearn.feature_extraction root/text public classes (PRESENT)
     CountVectorizer,
+    DictValue,
+    DictVectorizer,
     // sklearn.feature_selection __all__ (PRESENT)
     Direction,
     FeatureHasher,
@@ -53,6 +55,7 @@ use ferrolearn_preprocess::{
     FittedBinaryEncoder,
     FittedColumnTransformer,
     FittedCountVectorizer,
+    FittedDictVectorizer,
     // sklearn.random_projection __all__ (PRESENT)
     FittedGaussianRandomProjection,
     FittedGenericUnivariateSelect,
@@ -288,6 +291,9 @@ fn boundary_integrity_covered_module_all_surface() {
     // --- feature_extraction root/text ---
     name_type::<CountVectorizer>();
     name_type::<FittedCountVectorizer>();
+    name_type::<DictValue>();
+    name_type::<DictVectorizer>();
+    name_type::<FittedDictVectorizer>();
     name_type::<FeatureHasher>();
     name_type::<FeatureHasherInputType>();
     name_type::<HashingVectorizer>();

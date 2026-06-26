@@ -84,7 +84,7 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (re-export boundary) | SHIPPED | the crate-root `pub use` blocks surface every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums, [`SelectorMixin`], [`FeatureHasherInputType`], the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns, `johnson_lindenstrauss_min_dim`, and scoped image helpers), mirroring the covered sklearn `__all__` surfaces. The surfaced set is the documented subset that is implemented; not-yet-translated names (`DictVectorizer`, `mutual_info_*`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
+//! | REQ-1 (re-export boundary) | SHIPPED | the crate-root `pub use` blocks surface every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums, [`SelectorMixin`], [`DictValue`], [`FeatureHasherInputType`], the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns, `johnson_lindenstrauss_min_dim`, and scoped image helpers), mirroring the covered sklearn `__all__` surfaces. The surfaced set is the documented subset that is implemented; not-yet-translated names (`mutual_info_*`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
 //! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across the modules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
 //!
 //! `BinaryEncoder`/`FittedBinaryEncoder` (`:169`) is a `category_encoders`-style
@@ -95,6 +95,7 @@ pub mod binarizer;
 pub mod binary_encoder;
 pub mod column_transformer;
 pub mod count_vectorizer;
+pub mod dict_vectorizer;
 pub mod dummy_feature;
 pub mod feature_hasher;
 pub mod feature_scoring;
@@ -138,6 +139,7 @@ pub use column_transformer::{
     ColumnSelector, ColumnTransformer, FittedColumnTransformer, Remainder, make_column_selector,
     make_column_transformer,
 };
+pub use dict_vectorizer::{DictValue, DictVectorizer, FittedDictVectorizer};
 pub use dummy_feature::add_dummy_feature;
 pub use feature_hasher::{FeatureHasher, FeatureHasherInputType};
 pub use feature_selection::{

@@ -39,6 +39,21 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::DictValue"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::DictVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedDictVectorizer"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::FeatureHasher"
 phase = "preprocess"
 fixture = ""

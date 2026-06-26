@@ -10,8 +10,8 @@ use ferrolearn_preprocess::imputer::ImputeStrategy;
 use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, ColumnSelector, ColumnTransformer,
-    CountVectorizer, Direction, FeatureHasher, FeatureHasherInputType, FunctionTransformer,
-    GaussianRandomProjection, GenericUnivariateMode, GenericUnivariateParam,
+    CountVectorizer, DictValue, DictVectorizer, Direction, FeatureHasher, FeatureHasherInputType,
+    FunctionTransformer, GaussianRandomProjection, GenericUnivariateMode, GenericUnivariateParam,
     GenericUnivariateSelect, HashingVectorizer, InitialStrategy, IterativeImputer,
     KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy, LabelBinarizer,
     LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler, MissingIndicator,
@@ -390,6 +390,12 @@ fn api_proof_text() {
         .transform_strings(&[vec!["cat".to_string(), "dog".to_string()]])
         .unwrap();
     assert_eq!(string_features.dim(), (1, 8));
+
+    let mut dict_sample = HashMap::new();
+    dict_sample.insert("city".to_string(), DictValue::from("Dubai"));
+    dict_sample.insert("temperature".to_string(), DictValue::from(33.0));
+    let (dict_fitted, dict_features) = DictVectorizer::new().fit_transform(&[dict_sample]).unwrap();
+    assert_eq!(dict_features.dim(), (1, dict_fitted.feature_names().len()));
 }
 
 // =============================================================================
