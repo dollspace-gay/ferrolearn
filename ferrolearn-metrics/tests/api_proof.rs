@@ -9,6 +9,7 @@
 use ferrolearn_metrics::{
     // Classification
     Average,
+    ClassLikelihoodUndefined,
     // Pairwise
     Metric,
     // Clustering
@@ -28,6 +29,8 @@ use ferrolearn_metrics::{
     calinski_harabasz_score,
     chebyshev_distances,
     chi2_kernel,
+    class_likelihood_ratios,
+    class_likelihood_ratios_with_options,
     classification_report,
     cohen_kappa_score,
     completeness_score,
@@ -151,6 +154,16 @@ fn api_proof_classification_binary_scores() {
     let (_fpr2, _fnr, _t3) = det_curve(&y_true, &y_score).unwrap();
     let _ = brier_score_loss(&y_true, &y_prob).unwrap();
     let _ = hinge_loss(&y_true, &y_dec).unwrap();
+    let y_pred = array![0usize, 1, 0, 1, 1, 0];
+    let _ = class_likelihood_ratios(&y_true, &y_pred).unwrap();
+    let _ = class_likelihood_ratios_with_options(
+        &y_true,
+        &y_pred,
+        Some([0, 1]),
+        None,
+        ClassLikelihoodUndefined::Worst,
+    )
+    .unwrap();
 
     // calibration curve
     let (_frac_pos, _mean_pred) = calibration_curve(&y_true, &y_prob, 3).unwrap();

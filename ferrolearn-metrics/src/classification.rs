@@ -13,6 +13,7 @@
 //! - [`auc`] — area under an arbitrary curve via trapezoidal rule
 //! - [`average_precision_score`] — average precision from precision-recall curve
 //! - [`confusion_matrix`] — matrix of true/predicted class counts
+//! - [`class_likelihood_ratios`] — binary positive/negative likelihood ratios
 //! - [`log_loss`] — cross-entropy loss for probabilistic classifiers
 //!
 //! ## REQ status
@@ -37,15 +38,16 @@
 //! | REQ-9 | `calibration_curve` `np.searchsorted(linspace(0,1,n_bins+1)[1:-1], prob)` binning (`calibration.py:1035`) | SHIPPED |
 //! | REQ-10 | `top_k_accuracy_score` value + mergesort tie-break (higher index first, `_ranking.py:2043`) | SHIPPED |
 //! | REQ-11 | `brier_score_loss` (binary) + `hinge_loss` (binary) value (`_classification.py`) | SHIPPED |
-//! | REQ-12 | `zero_division` param options (`0.0`/`1.0`/`nan` + `UndefinedMetricWarning`) | NOT-STARTED (#813) |
-//! | REQ-13 | `average='samples'`/`None` + `pos_label` for the averaged metrics | NOT-STARTED (#814) |
-//! | REQ-14 | `roc_auc_score` `multi_class='ovr'/'ovo'` + `average` + 2D score input | NOT-STARTED (#815) |
-//! | REQ-15 | `cohen_kappa_score` `weights` + `classification_report` `digits`/format + `precision_recall_fscore_support` per-class output | NOT-STARTED (#816) |
-//! | REQ-16 | `sample_weight` (all metrics) + `confusion_matrix` `normalize` + `labels` | NOT-STARTED (#817) |
-//! | REQ-17 | Arbitrary-label substrate (str/negative/non-contiguous via LabelEncoder); currently `Array1<usize>` | NOT-STARTED (#818) |
-//! | REQ-18 | `d2_brier_score` has NO sklearn 1.5.2 analog — out of scope (`translate, not innovate`) | NOT-STARTED (#819) |
-//! | REQ-19 | PyO3 binding | NOT-STARTED (#820) |
-//! | REQ-20 | ferray substrate migration | NOT-STARTED (#821) |
+//! | REQ-12 | `class_likelihood_ratios` default value + `labels`/`sample_weight`/undefined replacement (`_classification.py`) | SHIPPED |
+//! | REQ-13 | `zero_division` param options (`0.0`/`1.0`/`nan` + `UndefinedMetricWarning`) | NOT-STARTED (#813) |
+//! | REQ-14 | `average='samples'`/`None` + `pos_label` for the averaged metrics | NOT-STARTED (#814) |
+//! | REQ-15 | `roc_auc_score` `multi_class='ovr'/'ovo'` + `average` + 2D score input | NOT-STARTED (#815) |
+//! | REQ-16 | `cohen_kappa_score` `weights` + `classification_report` `digits`/format + `precision_recall_fscore_support` per-class output | NOT-STARTED (#816) |
+//! | REQ-17 | `sample_weight` (remaining metrics) + `confusion_matrix` `normalize` + `labels` | NOT-STARTED (#817) |
+//! | REQ-18 | Arbitrary-label substrate (str/negative/non-contiguous via LabelEncoder); currently `Array1<usize>` | NOT-STARTED (#818) |
+//! | REQ-19 | `d2_brier_score` has NO sklearn 1.5.2 analog — out of scope (`translate, not innovate`) | NOT-STARTED (#819) |
+//! | REQ-20 | PyO3 binding | NOT-STARTED (#820) |
+//! | REQ-21 | ferray substrate migration | NOT-STARTED (#821) |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -77,6 +79,32 @@ pub enum Average {
     Micro,
     /// Class-support-weighted mean over all classes.
     Weighted,
+}
+
+/// Replacement policy for undefined class likelihood ratios.
+///
+/// scikit-learn exposes this as `replace_undefined_by`, accepting `np.nan`,
+/// `1.0`, or a `{"LR+": value, "LR-": value}` dictionary. The Rust API models
+/// those choices explicitly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ClassLikelihoodUndefined {
+    /// Return `NaN` for undefined ratios.
+    Nan,
+    /// Return the worst usable scores: `LR+ = 1.0`, `LR- = 1.0`.
+    Worst,
+    /// Return explicit replacement values for `LR+` and `LR-`.
+    Values {
+        /// Replacement for the positive likelihood ratio. Must be `NaN` or `>= 1.0`.
+        lr_positive: f64,
+        /// Replacement for the negative likelihood ratio. Must be `NaN` or in `[0.0, 1.0]`.
+        lr_negative: f64,
+    },
+}
+
+impl Default for ClassLikelihoodUndefined {
+    fn default() -> Self {
+        Self::Nan
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +201,68 @@ fn binary_pos_index(classes: &[usize], context: &str) -> Result<usize, FerroErro
                 "{context}: pos_label={POS_LABEL} is not a valid label. It should be one of {classes:?}"
             ),
         })
+}
+
+fn validate_class_likelihood_replacements(
+    replace_undefined_by: ClassLikelihoodUndefined,
+) -> Result<(f64, f64), FerroError> {
+    match replace_undefined_by {
+        ClassLikelihoodUndefined::Nan => Ok((f64::NAN, f64::NAN)),
+        ClassLikelihoodUndefined::Worst => Ok((1.0, 1.0)),
+        ClassLikelihoodUndefined::Values {
+            lr_positive,
+            lr_negative,
+        } => {
+            let valid_positive = lr_positive.is_nan() || lr_positive >= 1.0;
+            let valid_negative = lr_negative.is_nan() || (0.0..=1.0).contains(&lr_negative);
+            if valid_positive && valid_negative {
+                Ok((lr_positive, lr_negative))
+            } else {
+                Err(FerroError::InvalidParameter {
+                    name: "replace_undefined_by".into(),
+                    reason: "`LR+` replacement must be NaN or >= 1.0 and `LR-` replacement must be NaN or in [0.0, 1.0]".into(),
+                })
+            }
+        }
+    }
+}
+
+fn resolve_class_likelihood_labels(
+    y_true: &Array1<usize>,
+    y_pred: &Array1<usize>,
+    labels: Option<[usize; 2]>,
+) -> Result<[usize; 2], FerroError> {
+    if let Some(labels) = labels {
+        if labels[0] == labels[1] {
+            return Err(FerroError::InvalidParameter {
+                name: "labels".into(),
+                reason: "class_likelihood_ratios requires two distinct labels".into(),
+            });
+        }
+        for label in y_true.iter().chain(y_pred.iter()) {
+            if *label != labels[0] && *label != labels[1] {
+                return Err(FerroError::InvalidParameter {
+                    name: "y_true/y_pred".into(),
+                    reason: format!(
+                        "class_likelihood_ratios only supports binary classification, found label {label}"
+                    ),
+                });
+            }
+        }
+        return Ok(labels);
+    }
+
+    let classes = unique_classes(y_true, y_pred);
+    if classes.len() != 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "y_true/y_pred".into(),
+            reason: format!(
+                "class_likelihood_ratios only supports binary classification, found {} classes",
+                classes.len()
+            ),
+        });
+    }
+    Ok([classes[0], classes[1]])
 }
 
 // ---------------------------------------------------------------------------
@@ -487,6 +577,119 @@ pub fn roc_auc_score(y_true: &Array1<usize>, y_score: &Array1<f64>) -> Result<f6
 
     auc /= (n_pos * n_neg) as f64;
     Ok(auc)
+}
+
+/// Compute binary classification positive and negative likelihood ratios.
+///
+/// The positive likelihood ratio is `LR+ = sensitivity / (1 - specificity)`,
+/// where `sensitivity = TP / (TP + FN)` and
+/// `specificity = TN / (TN + FP)`. The negative likelihood ratio is
+/// `LR- = (1 - sensitivity) / specificity`.
+///
+/// This convenience wrapper mirrors sklearn's defaults: labels are inferred
+/// from the sorted union of `y_true` and `y_pred`, no sample weights are used,
+/// and undefined ratios return `NaN`.
+///
+/// # Arguments
+///
+/// * `y_true` — ground-truth binary class labels.
+/// * `y_pred` — predicted binary class labels.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if array lengths differ.
+/// Returns [`FerroError::InsufficientSamples`] if the arrays are empty.
+/// Returns [`FerroError::InvalidParameter`] if the labels are not binary.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::classification::class_likelihood_ratios;
+/// use ndarray::array;
+///
+/// let y_true = array![0usize, 1, 0, 1, 0];
+/// let y_pred = array![1usize, 1, 0, 0, 0];
+/// let (lr_pos, lr_neg) = class_likelihood_ratios(&y_true, &y_pred).unwrap();
+/// assert!((lr_pos - 1.5).abs() < 1e-12);
+/// assert!((lr_neg - 0.75).abs() < 1e-12);
+/// ```
+pub fn class_likelihood_ratios(
+    y_true: &Array1<usize>,
+    y_pred: &Array1<usize>,
+) -> Result<(f64, f64), FerroError> {
+    class_likelihood_ratios_with_options(y_true, y_pred, None, None, ClassLikelihoodUndefined::Nan)
+}
+
+/// Compute binary class likelihood ratios with sklearn-style options.
+///
+/// `labels` selects the negative and positive classes as
+/// `[negative_class, positive_class]`. `sample_weight` contributes weighted
+/// confusion counts. `replace_undefined_by` controls only ratios whose
+/// denominator is undefined, matching sklearn's `replace_undefined_by` option.
+pub fn class_likelihood_ratios_with_options(
+    y_true: &Array1<usize>,
+    y_pred: &Array1<usize>,
+    labels: Option<[usize; 2]>,
+    sample_weight: Option<&Array1<f64>>,
+    replace_undefined_by: ClassLikelihoodUndefined,
+) -> Result<(f64, f64), FerroError> {
+    let n = y_true.len();
+    check_same_length(n, y_pred.len(), "class_likelihood_ratios: y_true vs y_pred")?;
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "class_likelihood_ratios".into(),
+        });
+    }
+    if let Some(weights) = sample_weight {
+        check_same_length(
+            n,
+            weights.len(),
+            "class_likelihood_ratios: y_true vs sample_weight",
+        )?;
+    }
+
+    let [negative_label, positive_label] = resolve_class_likelihood_labels(y_true, y_pred, labels)?;
+    let (undefined_lr_pos, undefined_lr_neg) =
+        validate_class_likelihood_replacements(replace_undefined_by)?;
+
+    let mut tn = 0.0;
+    let mut fp = 0.0;
+    let mut fn_count = 0.0;
+    let mut tp = 0.0;
+
+    for i in 0..n {
+        let t = y_true[i];
+        let p = y_pred[i];
+        let weight = sample_weight.map_or(1.0, |weights| weights[i]);
+        match (t == positive_label, p == positive_label) {
+            (true, true) => tp += weight,
+            (true, false) => fn_count += weight,
+            (false, true) => fp += weight,
+            (false, false) => {
+                if t == negative_label && p == negative_label {
+                    tn += weight;
+                }
+            }
+        }
+    }
+
+    let support_pos = tp + fn_count;
+    let support_neg = tn + fp;
+
+    let positive_likelihood_ratio = if fp == 0.0 {
+        undefined_lr_pos
+    } else {
+        (tp * support_neg) / (fp * support_pos)
+    };
+    let negative_likelihood_ratio = if tn == 0.0 {
+        undefined_lr_neg
+    } else {
+        (fn_count * support_neg) / (tn * support_pos)
+    };
+
+    Ok((positive_likelihood_ratio, negative_likelihood_ratio))
 }
 
 /// Compute the confusion matrix.

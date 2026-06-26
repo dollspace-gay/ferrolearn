@@ -9,6 +9,11 @@ phase = "metrics"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_metrics::ClassLikelihoodUndefined"
+phase = "metrics"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_metrics::BUILTIN_SCORER_NAMES"
 phase = "metrics"
 fixture = ""
@@ -42,4 +47,3 @@ fixture = ""
 path = "ferrolearn_metrics::ScoringInput"
 phase = "metrics"
 fixture = ""
-

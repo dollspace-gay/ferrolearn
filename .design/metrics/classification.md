@@ -4,12 +4,12 @@
 tier: 3-component
 status: draft
 baseline-commit: 2df4489e
-upstream: scikit-learn 1.5.2 (commit 156ef14)
+upstream: scikit-learn 1.5.2 (commit 156ef14); `class_likelihood_ratios` tracked from local sklearn mirror commit f1cc4e7
 upstream-paths:
-  - sklearn/metrics/_classification.py   # accuracy_score (:169); confusion_matrix (:257); multilabel_confusion_matrix (:431); cohen_kappa_score (:649); jaccard_score (:752); matthews_corrcoef (:940); zero_one_loss (:1037); f1_score (:1132); fbeta_score (:1325); precision_recall_fscore_support (:1614); precision_score (:2056); recall_score (:2236); balanced_accuracy_score (:2407); classification_report (:2508); hamming_loss (:2739); log_loss (:2843); hinge_loss (:2998); brier_score_loss (:3151); d2_log_loss_score (:3289)
+  - sklearn/metrics/_classification.py   # accuracy_score (:169); confusion_matrix (:257); multilabel_confusion_matrix (:431); cohen_kappa_score (:649); jaccard_score (:752); matthews_corrcoef (:940); zero_one_loss (:1037); f1_score (:1132); fbeta_score (:1325); precision_recall_fscore_support (:1614); precision_score (:2056); recall_score (:2236); class_likelihood_ratios (local mirror :2240); balanced_accuracy_score (:2407); classification_report (:2508); hamming_loss (:2739); log_loss (:2843); hinge_loss (:2998); brier_score_loss (:3151); d2_log_loss_score (:3289)
   - sklearn/metrics/_ranking.py          # auc (:52); average_precision_score (:127); det_curve (:282); roc_auc_score (:420); precision_recall_curve (:879); roc_curve (:1053); top_k_accuracy_score (:1891)
 ferrolearn-module: ferrolearn-metrics/src/classification.rs
-parity-ops: accuracy_score, precision_score, recall_score, f1_score, fbeta_score, jaccard_score, precision_recall_fscore_support, confusion_matrix, multilabel_confusion_matrix, matthews_corrcoef, cohen_kappa_score, balanced_accuracy_score, hamming_loss, zero_one_loss, classification_report, log_loss, hinge_loss, brier_score_loss, d2_log_loss_score, roc_auc_score, roc_curve, precision_recall_curve, det_curve, average_precision_score, auc, top_k_accuracy_score, calibration_curve, d2_brier_score
+parity-ops: accuracy_score, precision_score, recall_score, f1_score, fbeta_score, jaccard_score, precision_recall_fscore_support, confusion_matrix, multilabel_confusion_matrix, matthews_corrcoef, cohen_kappa_score, class_likelihood_ratios, balanced_accuracy_score, hamming_loss, zero_one_loss, classification_report, log_loss, hinge_loss, brier_score_loss, d2_log_loss_score, roc_auc_score, roc_curve, precision_recall_curve, det_curve, average_precision_score, auc, top_k_accuracy_score, calibration_curve, d2_brier_score
 crosslink-issue: 806  # tracking issue for the classification-metrics unit (Layer 1 — ferrolearn-metrics block)
 -->
 
@@ -19,13 +19,14 @@ crosslink-issue: 806  # tracking issue for the classification-metrics unit (Laye
 functions of scikit-learn's `sklearn/metrics/_classification.py` plus the binary
 ranking-curve functions hosted in `sklearn/metrics/_ranking.py` (`roc_curve`,
 `precision_recall_curve`, `auc`, `average_precision_score`, `det_curve`,
-`roc_auc_score`, `top_k_accuracy_score`). It exposes **28** public functions and
-one public enum (`Average`).
+`roc_auc_score`, `top_k_accuracy_score`). It exposes **30** public functions and
+two public enums (`Average`, `ClassLikelihoodUndefined`).
 
-Twenty-seven of the 28 functions have a direct scikit-learn counterpart; **one
+Twenty-eight of the 30 functions have a direct scikit-learn counterpart; **one
 (`d2_brier_score`) has NO sklearn 1.5.2 analog** — `from sklearn.metrics import
-d2_brier_score` raises `ImportError` — so it is an out-of-scope invention
-(goal.md "we translate, not innovate"). `calibration_curve` mirrors
+d2_brier_score` raises `ImportError` — and
+`class_likelihood_ratios_with_options` is the Rust options-bearing companion for
+sklearn's keyword parameters. `calibration_curve` mirrors
 `sklearn.calibration.calibration_curve` (`sklearn/calibration.py:937`), which
 lives outside the two routed upstream files.
 
@@ -38,8 +39,10 @@ sklearn 1.5.2 oracle on its supported signature** — `accuracy_score`,
 `brier_score_loss` (default `pos_label`), `hinge_loss` (binary),
 `top_k_accuracy_score` (normalize default), `hamming_loss`, `zero_one_loss`,
 `multilabel_confusion_matrix`, the precision/recall/F1 family, and
-`d2_log_loss_score` — within their narrower (binary/integer-label,
-no-`sample_weight`) contract. But **most functions DIVERGE on at least one
+`d2_log_loss_score`, plus `class_likelihood_ratios` including `labels`,
+`sample_weight`, and undefined replacement options — within their narrower
+(binary/integer-label, mostly no-`sample_weight`) contract. But **most functions
+DIVERGE on at least one
 parameter or edge** the oracle exercises:
 
 1. **`log_loss` clips probabilities to `1e-15`** (hard-coded `EPS` constant);
@@ -61,7 +64,8 @@ parameter or edge** the oracle exercises:
    value on a bin boundary (e.g. `0.5` with `n_bins=2`) lands in a different bin.
 
 Pervasive signature gaps (every affected function): **`sample_weight`** (absent
-on all 28), **`zero_division`** (absent on precision/recall/F1/fbeta/jaccard —
+on most classification metrics; present for `class_likelihood_ratios` through
+`class_likelihood_ratios_with_options`), **`zero_division`** (absent on precision/recall/F1/fbeta/jaccard —
 ferrolearn hard-codes the `0.0` convention via `safe_div`, which matches sklearn's
 **default** but not `zero_division=1`/`np.nan`), **`labels`** (absent on
 confusion_matrix/log_loss/hinge/precision_recall_fscore_support/etc.),
@@ -145,10 +149,11 @@ true label is among the top-`k` scores.
 
 All public functions live in `ferrolearn-metrics/src/classification.rs`. Label
 inputs are `&Array1<usize>`; scores/probabilities are `&Array1<F>`/`&Array1<f64>`
-or `&Array2<f64>`. The averaging enum is `pub enum Average { Binary, Macro,
-Micro, Weighted }` (no `Samples`, no `None`/per-class output). The 0/0 convention
-is the private `fn safe_div` (returns `0.0`) — equivalent to sklearn's
-**default** `zero_division=0.0` but not configurable.
+or `&Array2<f64>`. Public enums are `Average { Binary, Macro, Micro, Weighted }`
+(no `Samples`, no `None`/per-class output) and
+`ClassLikelihoodUndefined` (Rust modeling of `replace_undefined_by`). The 0/0
+convention for the averaged metrics is the private `fn safe_div` (returns `0.0`)
+— equivalent to sklearn's **default** `zero_division=0.0` but not configurable.
 
 - **`pub fn accuracy_score(y_true, y_pred)`** — fraction correct; **no
   `normalize`, no `sample_weight`** (matches sklearn default value).
@@ -166,6 +171,11 @@ is the private `fn safe_div` (returns `0.0`) — equivalent to sklearn's
   per-class; no `labels`/`zero_division`/`sample_weight`/`warn_for`.
 - **`pub fn confusion_matrix(y_true, y_pred)`** — sorted-union labels only; **no
   `labels` reordering, no `sample_weight`, no `normalize`**.
+- **`pub fn class_likelihood_ratios(y_true, y_pred)`** and
+  **`pub fn class_likelihood_ratios_with_options(...)`** — binary LR+/LR-
+  values match sklearn, including explicit `[negative, positive]` labels,
+  `sample_weight`, and undefined-ratio replacement. Still typed on
+  `Array1<usize>` rather than arbitrary sklearn labels.
 - **`pub fn multilabel_confusion_matrix(y_true, y_pred)`** — `(n_classes, 2, 2)`
   `[[TN,FP],[FN,TP]]` stack; sorted-union classes; no `labels`/`sample_weight`.
 - **`pub fn matthews_corrcoef(y_true, y_pred)`** — Gorodkin MCC; **zero
@@ -225,10 +235,12 @@ is the private `fn safe_div` (returns `0.0`) — equivalent to sklearn's
 **Internal helpers:** `fn check_same_length`, `fn unique_classes`,
 `fn per_class_counts`, `fn safe_div` (the `0.0` zero-division), `fn aggregate_metric`/
 `fn aggregate_recall`/`fn aggregate_f1`, `fn validate_binary_scores`,
-`fn sort_by_score_desc`.
+`fn sort_by_score_desc`, `fn resolve_class_likelihood_labels`,
+`fn validate_class_likelihood_replacements`.
 
 **Consumers (non-test):** crate re-export (`lib.rs`: `pub use classification::{
-Average, accuracy_score, … d2_log_loss_score }` — all 28 fns + `Average`).
+Average, ClassLikelihoodUndefined, accuracy_score, … d2_log_loss_score }` — all
+30 fns + the two enums).
 These are existing pub APIs (grandfathered, S5/R-DEFER-1). `scorer.rs` does NOT
 yet consume any classification metric (its classification-scorer registry is
 NOT-STARTED, blocked on #783). No `ferrolearn-python` binding exposes the
@@ -300,6 +312,11 @@ classification metrics (a binding gap, REQ-17).
   classification metrics; `ferrolearn-python` exposes no shim.
 - REQ-24: **ferray substrate (R-SUBSTRATE).** `classification.rs` imports
   `ndarray::{Array1, Array2, Array3}` + `num_traits::Float`, not `ferray-core`.
+- REQ-25: **`class_likelihood_ratios` parity (R-DEV-1/2).** Match local mirror
+  `_classification.py:2240`: binary LR+/LR- values, `[negative, positive]`
+  `labels`, `sample_weight`, and `replace_undefined_by` replacement ranges.
+  SHIPPED for `Array1<usize>` labels via `ClassLikelihoodUndefined`; arbitrary
+  hashable labels remain covered by REQ-22.
 
 ## Acceptance criteria
 
@@ -342,10 +359,13 @@ never literal-copied from ferrolearn (R-CHAR-3).
   `precision_recall_curve` arrays `p=[0.5,0.667,0.5,1,1] r=[1,1,0.5,0.5,0]`;
   `confusion_matrix` default counts; `f1_score(...,Micro) == accuracy` for
   balanced classes — all already match sklearn and bound the correctness present.
+- AC-10 (REQ-25, shipped): `class_likelihood_ratios([1]*3+[0]*17,
+  [1]*2+[0]*10+[1]*8)` must return `LR+ = 34/24`, `LR- = 17/27`; with
+  `sample_weight=[1]*15+[0]*5`, it must return `24/9` and `12/27`.
 
 ## REQ status table
 
-Binary (R-DEFER-2). All 28 functions + `Average` are existing pub APIs
+Binary (R-DEFER-2). All 30 functions + `Average`/`ClassLikelihoodUndefined` are existing pub APIs
 re-exported at the crate root (`lib.rs`); that re-export is the non-test
 production-consumer surface (grandfathered S5/R-DEFER-1). Cites use symbol anchors
 (ferrolearn) / `file:line` (sklearn 1.5.2). Live oracle = installed sklearn
@@ -380,6 +400,7 @@ exposes AND has a non-test consumer + tests + symbol anchor; otherwise
 | REQ-22 (arbitrary-label substrate) | NOT-STARTED | open prereq blocker #828. Every function takes `&Array1<usize>` labels; sklearn accepts arbitrary hashable labels via `LabelEncoder` and exposes `pos_label`/`classes_` over them (`_classification.py` validation path). |
 | REQ-23 (PyO3 binding) | NOT-STARTED | open prereq blocker #829. `ferrolearn-python` exposes no classification-metric shim; `import ferrolearn` cannot call what `import sklearn.metrics` provides. |
 | REQ-24 (ferray substrate) | NOT-STARTED | open prereq blocker #830. `classification.rs` imports `ndarray::{Array1, Array2, Array3}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). |
+| REQ-25 (`class_likelihood_ratios`) | SHIPPED | `pub fn class_likelihood_ratios` + `pub fn class_likelihood_ratios_with_options` mirror local mirror `_classification.py:2240`: binary-only LR+/LR-, sorted default labels or explicit `[negative, positive]`, `sample_weight`, and `replace_undefined_by` via `ClassLikelihoodUndefined`. Verification: `tests/divergence_class_likelihood_ratios.rs` pins sklearn's `34/24`, `17/27`, weighted `24/9`, `12/27`, undefined replacements, and nonbinary errors; crate-root re-export is the production consumer. |
 
 ## Architecture
 
@@ -398,10 +419,13 @@ probabilities are `Array1<F>`/`Array1<f64>` or `Array2<f64>`. Five families:
    configurability (`zero_division`, `pos_label`, `'samples'`/`None`, `labels`,
    `sample_weight`) and `precision_recall_fscore_support`'s total-vs-per-class
    `support` (REQ-19) and `classification_report`'s `digits=4` (REQ-18).
-2. **Confusion matrices** (`confusion_matrix`, `multilabel_confusion_matrix`):
+2. **Confusion matrices / likelihood ratios** (`confusion_matrix`,
+   `multilabel_confusion_matrix`, `class_likelihood_ratios`):
    sorted-union labels via `fn unique_classes`; `confusion_matrix` uses
    `partition_point` to index. Diverge on `labels`/`normalize`/`sample_weight`
-   (REQ-3/4).
+   (REQ-3/4). `class_likelihood_ratios_with_options` uses its own weighted
+   binary 2x2 fold so LR+/LR- can support sklearn's labels/sample-weight/
+   undefined-replacement surface without changing the existing matrix API.
 3. **Agreement / correlation** (`matthews_corrcoef`, `cohen_kappa_score`):
    confusion-matrix-derived. `matthews_corrcoef`'s **zero-denominator→`0.0`**
    convention matches sklearn (REQ-5, value-correct). `cohen_kappa_score` is
@@ -434,19 +458,22 @@ counts; MCC value + zero-denom→`0.0`; balanced-accuracy `adjusted` values;
 binary `hinge_loss`/`brier_score_loss`(default pos_label)/`roc_auc_score`;
 `precision_recall_curve` arrays + endpoint; `auc` trapezoid; binary **step**
 `average_precision_score`; `top_k_accuracy_score` default fraction; `hamming_loss`/
-`zero_one_loss`. **Invariants NOT held vs sklearn:** `log_loss` clip eps (REQ-8);
+`zero_one_loss`; `class_likelihood_ratios` values/options.
+**Invariants NOT held vs sklearn:** `log_loss` clip eps (REQ-8);
 `cohen_kappa_score` `weights` (REQ-6); `roc_curve` `drop_intermediate` (REQ-12);
 `det_curve` endpoint (REQ-14); `calibration_curve` binning (REQ-17); multiclass
 `roc_auc_score` (REQ-11); `pos_label` (REQ-1/10); `zero_division` configurability
 (REQ-1/19); `normalize` on accuracy/log_loss/top_k (REQ-2/8/16); `labels`/
-`sample_weight` (all); per-class `support` (REQ-18/19); arbitrary labels (REQ-22).
+`sample_weight` (most remaining metrics); per-class `support` (REQ-18/19);
+arbitrary labels (REQ-22).
 
-**Function inventory vs sklearn:** 27 of 28 have a counterpart in
+**Function inventory vs sklearn:** 28 of 30 have a direct counterpart in
 `_classification.py`/`_ranking.py`; `calibration_curve` mirrors
 `sklearn/calibration.py:937` (outside the two routed files); **`d2_brier_score`
-has no sklearn 1.5.2 counterpart** (REQ-21). sklearn classification functions NOT
-present in ferrolearn: `class_likelihood_ratios`, `precision_recall_fscore_support`
-with per-class output, `dcg`/`ndcg` (these live in `ranking.rs`).
+has no sklearn 1.5.2 counterpart** (REQ-21), and
+`class_likelihood_ratios_with_options` is the Rust options companion for
+sklearn's keyword parameters. `precision_recall_fscore_support` exists but still
+has per-class output gaps; `dcg`/`ndcg` live in `ranking.rs`.
 
 ## Verification
 
@@ -454,6 +481,7 @@ Library crate (green at baseline `2df4489e` for the existing — narrower —
 contract):
 ```
 cargo test -p ferrolearn-metrics --lib classification   # 53 passed; 0 failed
+cargo test -p ferrolearn-metrics --test divergence_class_likelihood_ratios
 cargo clippy -p ferrolearn-metrics --all-targets -- -D warnings
 cargo fmt --all --check
 ```

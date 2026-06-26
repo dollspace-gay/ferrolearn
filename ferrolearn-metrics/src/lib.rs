@@ -17,6 +17,7 @@
 //! | [`classification::auc`] | Area under an arbitrary curve (trapezoidal rule) |
 //! | [`classification::average_precision_score`] | Average precision from PR curve |
 //! | [`classification::confusion_matrix`] | Matrix of true vs. predicted counts |
+//! | [`classification::class_likelihood_ratios`] | Binary positive/negative likelihood ratios |
 //! | [`classification::log_loss`] | Cross-entropy loss for probabilistic classifiers |
 //! | [`classification::top_k_accuracy_score`] | Fraction of samples with true label in top-k predictions |
 //! | [`classification::calibration_curve`] | Calibration curve (reliability diagram) data |
@@ -84,8 +85,9 @@ pub mod scorer;
 
 // Flat re-exports for convenient access.
 pub use classification::{
-    Average, accuracy_score, auc, average_precision_score, balanced_accuracy_score,
-    brier_score_loss, calibration_curve, classification_report, cohen_kappa_score,
+    Average, ClassLikelihoodUndefined, accuracy_score, auc, average_precision_score,
+    balanced_accuracy_score, brier_score_loss, calibration_curve, class_likelihood_ratios,
+    class_likelihood_ratios_with_options, classification_report, cohen_kappa_score,
     confusion_matrix, d2_brier_score, d2_log_loss_score, det_curve, f1_score, fbeta_score,
     hamming_loss, hinge_loss, jaccard_score, log_loss, matthews_corrcoef,
     multilabel_confusion_matrix, precision_recall_curve, precision_recall_fscore_support,
