@@ -46,8 +46,10 @@
 //! | [`pairwise::pairwise_distances`] | Distance matrix with selectable metric |
 //! | [`pairwise::euclidean_distances`] | Optimised L2 pairwise distances |
 //! | [`pairwise::manhattan_distances`] | L1 pairwise distances |
+//! | [`pairwise::cosine_similarity`] | Normalized dot-product similarity |
 //! | [`pairwise::cosine_distances`] | `1 - cosine_similarity` pairwise distances |
 //! | [`pairwise::chebyshev_distances`] | L-infinity pairwise distances |
+//! | [`pairwise::paired_distances`] | Row-wise distances between paired rows |
 //!
 //! ## Example
 //!
@@ -94,8 +96,10 @@ pub use clustering::{
 };
 pub use pairwise::{
     DistanceMetric, Metric, PairwiseKernel, chebyshev_distances, cosine_distances,
-    euclidean_distances, manhattan_distances, nan_euclidean_distances, pairwise_distances,
-    pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels,
+    cosine_similarity, euclidean_distances, manhattan_distances, nan_euclidean_distances,
+    paired_cosine_distances, paired_distances, paired_euclidean_distances,
+    paired_manhattan_distances, pairwise_distances, pairwise_distances_argmin,
+    pairwise_distances_argmin_min, pairwise_kernels,
 };
 pub use ranking::{
     coverage_error, dcg_score, label_ranking_average_precision_score, label_ranking_loss,

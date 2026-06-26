@@ -9,7 +9,9 @@
 //! - [`euclidean_distances`] — L2 (Euclidean) distance, optimised via the
 //!   identity `||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b`
 //! - [`manhattan_distances`] — L1 (Manhattan / city-block) distance
+//! - [`cosine_similarity`] — normalized dot-product similarity
 //! - [`cosine_distances`] — `1 - cosine_similarity`
+//! - [`paired_distances`] — row-wise distance dispatcher for paired arrays
 //! - [`pairwise_distances`] — dispatcher that selects the above via the
 //!   [`Metric`] enum
 //!
@@ -18,8 +20,8 @@
 //! Mirrors `sklearn.metrics.pairwise` (`sklearn/metrics/pairwise.py`). See
 //! `.design/metrics/pairwise.md`. Non-test consumer: crate re-export. The
 //! present distance/kernel functions are value-correct vs the live oracle
-//! (verified to ULP); the missing kernels / `paired_*` family / `cosine_similarity`
-//! / `haversine` / ABI params are NOT-STARTED.
+//! (verified to ULP); the missing standalone kernels / `haversine` / ABI params
+//! are NOT-STARTED.
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
@@ -30,8 +32,8 @@
 //! | REQ-5 | `pairwise_distances` dispatcher via `Metric` enum (== direct functions == sklearn) (`pairwise.py:2196`) | SHIPPED |
 //! | REQ-6 | `pairwise_distances_argmin` / `_argmin_min`: value + tie-break to first index (`pairwise.py:692,:841`) | SHIPPED |
 //! | REQ-7 | `pairwise_kernels` value for the present kernels (linear/polynomial/rbf/sigmoid/laplacian) (`pairwise.py:2469`) | SHIPPED |
-//! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | NOT-STARTED (#789) |
-//! | REQ-9 | `paired_*` family (euclidean/manhattan/cosine/distances, `(n,)` output) | NOT-STARTED (#790) |
+//! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | PARTIAL (`cosine_similarity` SHIPPED; standalone kernels NOT-STARTED #789) |
+//! | REQ-9 | `paired_*` family (euclidean/manhattan/cosine/distances, `(n,)` output) | SHIPPED |
 //! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | NOT-STARTED (#791) |
 //! | REQ-11 | ABI params: `squared=`, `missing_values=`, string-metric aliases (`l1`/`l2`/`cityblock`), kernel defaults + chi2/additive_chi2/cosine in the kernel registry | NOT-STARTED (#792) |
 //! | REQ-12 | `Y=None` self-distance API + arbitrary-magnitude diagonal-zeroing contract (`pairwise.py:414-415`) | NOT-STARTED (#793) |
@@ -39,7 +41,7 @@
 //! | REQ-14 | ferray substrate migration | NOT-STARTED (#795) |
 
 use ferrolearn_core::FerroError;
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use num_traits::Float;
 
 /// Distance metric selector for [`pairwise_distances`].
@@ -138,6 +140,26 @@ fn check_non_empty<F: Float>(
             context: format!("{context}: feature dimension must be at least 1"),
         });
     }
+    Ok(())
+}
+
+/// Validate sklearn's `check_paired_arrays` contract for row-wise distances.
+fn check_paired_arrays<F: Float>(
+    x: &Array2<F>,
+    y: &Array2<F>,
+    context: &str,
+) -> Result<(), FerroError> {
+    check_feature_dim(x, y, context)?;
+    check_non_empty(x, y, context)?;
+    if x.nrows() != y.nrows() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![x.nrows(), x.ncols()],
+            actual: vec![y.nrows(), y.ncols()],
+            context: format!("{context}: paired distance inputs must have the same number of rows"),
+        });
+    }
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
     Ok(())
 }
 
@@ -399,6 +421,30 @@ where
     Ok(result)
 }
 
+/// Compute pairwise cosine similarity.
+///
+/// Cosine similarity is the normalized dot product between every row of `x`
+/// and every row of `y`. If either row is all zero, sklearn's normalization
+/// yields a zero similarity.
+///
+/// # Arguments
+///
+/// * `x` — array of shape `(n, d)`.
+/// * `y` — array of shape `(m, d)`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if `x` and `y` have different
+/// numbers of columns.
+/// Returns [`FerroError::InsufficientSamples`] if either matrix is empty.
+pub fn cosine_similarity<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    let distances = cosine_distances(x, y)?;
+    Ok(distances.mapv(|d| F::one() - d))
+}
+
 /// Compute pairwise Chebyshev (L-infinity) distances.
 ///
 /// For each pair of rows `(x_i, y_j)`, the Chebyshev distance is
@@ -530,6 +576,131 @@ where
         Metric::Manhattan => manhattan_distances(x, y),
         Metric::Cosine => cosine_distances(x, y),
         Metric::Chebyshev => chebyshev_distances(x, y),
+    }
+}
+
+/// Compute row-wise Euclidean distances between paired rows.
+///
+/// Returns a length-`n` vector where entry `i` is the Euclidean distance
+/// between `x.row(i)` and `y.row(i)`, matching
+/// `sklearn.metrics.pairwise.paired_euclidean_distances`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different feature
+/// dimensions or different row counts.
+pub fn paired_euclidean_distances<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array1<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    check_paired_arrays(x, y, "paired_euclidean_distances")?;
+    let mut out = Array1::<F>::zeros(x.nrows());
+    for i in 0..x.nrows() {
+        let sq_sum = (0..x.ncols()).fold(0.0_f64, |acc, k| {
+            let diff =
+                x[[i, k]].to_f64().unwrap_or(f64::NAN) - y[[i, k]].to_f64().unwrap_or(f64::NAN);
+            acc + diff * diff
+        });
+        out[i] = F::from(sq_sum.sqrt()).unwrap_or_else(F::zero);
+    }
+    Ok(out)
+}
+
+/// Compute row-wise Manhattan distances between paired rows.
+///
+/// Returns a length-`n` vector where entry `i` is the L1/city-block distance
+/// between `x.row(i)` and `y.row(i)`, matching
+/// `sklearn.metrics.pairwise.paired_manhattan_distances`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different feature
+/// dimensions or different row counts.
+pub fn paired_manhattan_distances<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array1<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    check_paired_arrays(x, y, "paired_manhattan_distances")?;
+    let mut out = Array1::<F>::zeros(x.nrows());
+    for i in 0..x.nrows() {
+        out[i] = (0..x.ncols()).fold(F::zero(), |acc, k| acc + (x[[i, k]] - y[[i, k]]).abs());
+    }
+    Ok(out)
+}
+
+/// Compute row-wise cosine distances between paired rows.
+///
+/// sklearn implements this as half the squared row norm of
+/// `normalize(x) - normalize(y)`. That means a zero row paired with a nonzero
+/// row has distance `0.5`, unlike [`cosine_distances`]' matrix convention of
+/// `1.0` for any zero-vector pair.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different feature
+/// dimensions or different row counts.
+pub fn paired_cosine_distances<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array1<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    check_paired_arrays(x, y, "paired_cosine_distances")?;
+    let half = F::from(0.5).unwrap();
+    let mut out = Array1::<F>::zeros(x.nrows());
+    for i in 0..x.nrows() {
+        let x_norm = (0..x.ncols())
+            .fold(F::zero(), |acc, k| acc + x[[i, k]] * x[[i, k]])
+            .sqrt();
+        let y_norm = (0..y.ncols())
+            .fold(F::zero(), |acc, k| acc + y[[i, k]] * y[[i, k]])
+            .sqrt();
+        let mut sq_sum = F::zero();
+        for k in 0..x.ncols() {
+            let x_unit = if x_norm == F::zero() {
+                F::zero()
+            } else {
+                x[[i, k]] / x_norm
+            };
+            let y_unit = if y_norm == F::zero() {
+                F::zero()
+            } else {
+                y[[i, k]] / y_norm
+            };
+            let diff = x_unit - y_unit;
+            sq_sum = sq_sum + diff * diff;
+        }
+        out[i] = half * sq_sum;
+    }
+    Ok(out)
+}
+
+/// Compute row-wise distances between paired rows using a selected metric.
+///
+/// Mirrors sklearn's `paired_distances` dispatcher for Euclidean, Manhattan,
+/// and cosine paired distances. [`Metric::Chebyshev`] is rejected because it is
+/// not one of sklearn's supported paired-distance metrics.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] for [`Metric::Chebyshev`].
+/// Returns [`FerroError::ShapeMismatch`] if the arrays have different feature
+/// dimensions or different row counts.
+pub fn paired_distances<F>(
+    x: &Array2<F>,
+    y: &Array2<F>,
+    metric: Metric,
+) -> Result<Array1<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    match metric {
+        Metric::Euclidean => paired_euclidean_distances(x, y),
+        Metric::Manhattan => paired_manhattan_distances(x, y),
+        Metric::Cosine => paired_cosine_distances(x, y),
+        Metric::Chebyshev => Err(FerroError::InvalidParameter {
+            name: "metric".to_string(),
+            reason: "paired_distances supports Euclidean, Manhattan, and Cosine metrics"
+                .to_string(),
+        }),
     }
 }
 

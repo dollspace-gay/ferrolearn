@@ -6,9 +6,11 @@
 //!
 //! VERDICT (this audit): NO deterministic VALUE divergence was found in the
 //! PRESENT functions. The present functions (`euclidean_distances`,
-//! `manhattan_distances`, `cosine_distances`, `chebyshev_distances`,
+//! `manhattan_distances`, `cosine_similarity`, `cosine_distances`,
+//! `chebyshev_distances`,
 //! `nan_euclidean_distances`, `pairwise_distances` via `Metric`,
-//! `pairwise_distances_argmin`/`_argmin_min`, `pairwise_kernels` rbf)
+//! `paired_*`, `pairwise_distances_argmin`/`_argmin_min`,
+//! `pairwise_kernels` rbf)
 //! reproduce sklearn's exact float64 values on every case probed — including
 //! the rounding-level results (e.g. `cosine_distances([[1,1]],[[-1,-1]]) ==
 //! 1.9999999999999998` matches sklearn to the ULP).
@@ -18,8 +20,8 @@
 //! failing tests on the existing API (a missing function/param cannot be
 //! called): no `squared=`, no `missing_values=`, no string-metric ABI, no
 //! kernel defaults, missing `chi2`/`additive_chi2`/`cosine` kernels,
-//! `paired_*`/`haversine`/`chunked`, no PyO3 binding. They are tracked as
-//! NOT-STARTED REQs (blockers #790-#803), not as RED pins.
+//! `haversine`/`chunked`, no PyO3 binding. They are tracked as
+//! NOT-STARTED REQs (blockers #791-#803), not as RED pins.
 //!
 //! Two diagonal probes were run and did NOT reproduce a divergence:
 //!   - euclidean `X==X` diagonal (f32 AND large-magnitude f64): ferrolearn
@@ -36,9 +38,10 @@
 //! contracts are correct and must stay green.
 
 use ferrolearn_metrics::pairwise::{
-    Metric, PairwiseKernel, chebyshev_distances, cosine_distances, euclidean_distances,
-    manhattan_distances, nan_euclidean_distances, pairwise_distances, pairwise_distances_argmin,
-    pairwise_distances_argmin_min, pairwise_kernels,
+    Metric, PairwiseKernel, chebyshev_distances, cosine_distances, cosine_similarity,
+    euclidean_distances, manhattan_distances, nan_euclidean_distances, paired_cosine_distances,
+    paired_distances, paired_euclidean_distances, paired_manhattan_distances, pairwise_distances,
+    pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels,
 };
 use ndarray::array;
 
@@ -137,6 +140,131 @@ fn green_cosine_edges() {
         SK_OPP,
         "cosine opposite: sklearn 1.9999999999999998, ferrolearn {}",
         d_opp[[0, 0]]
+    );
+}
+
+/// Guard: `cosine_similarity` matches sklearn's normalized dot product,
+/// including zero-row behavior (similarity 0.0).
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     cosine_similarity as c; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(c(X,Y).tolist())"
+///   # [[0.0, 0.0], [0.5773502691896258, 0.816496580927726]]
+#[test]
+fn green_cosine_similarity_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let sim = cosine_similarity(&x, &y).unwrap();
+    const SK: [[f64; 2]; 2] = [[0.0, 0.0], [0.5773502691896258, 0.816496580927726]];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (sim[[i, j]] - SK[i][j]).abs() < 1e-15,
+                "cosine_similarity[{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                sim[[i, j]]
+            );
+        }
+    }
+}
+
+/// Guard: `paired_euclidean_distances` returns a length-`n` row-wise vector.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     paired_euclidean_distances as p; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(p(X,Y).tolist())"
+///   # [1.0, 1.0]
+#[test]
+fn green_paired_euclidean_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let distances = paired_euclidean_distances(&x, &y).unwrap();
+    const SK: [f64; 2] = [1.0, 1.0];
+    for i in 0..2 {
+        assert!(
+            (distances[i] - SK[i]).abs() < 1e-12,
+            "paired_euclidean[{i}]: sklearn={}, ferrolearn={}",
+            SK[i],
+            distances[i]
+        );
+    }
+}
+
+/// Guard: `paired_manhattan_distances` matches sklearn's row-wise L1 output.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     paired_manhattan_distances as p; X=np.array([[1.,1.,0.],[0.,1.,0.],\
+///     [0.,0.,1.]]); Y=np.array([[0.,1.,0.],[0.,0.,1.],[0.,0.,0.]]); \
+///     print(p(X,Y).tolist())"
+///   # [1.0, 2.0, 1.0]
+#[test]
+fn green_paired_manhattan_matches_sklearn() {
+    let x = array![[1.0_f64, 1.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    let y = array![[0.0_f64, 1.0, 0.0], [0.0, 0.0, 1.0], [0.0, 0.0, 0.0]];
+    let distances = paired_manhattan_distances(&x, &y).unwrap();
+    const SK: [f64; 3] = [1.0, 2.0, 1.0];
+    for i in 0..3 {
+        assert!(
+            (distances[i] - SK[i]).abs() < 1e-12,
+            "paired_manhattan[{i}]: sklearn={}, ferrolearn={}",
+            SK[i],
+            distances[i]
+        );
+    }
+}
+
+/// Guard: `paired_cosine_distances` matches sklearn's normalized-difference
+/// implementation, including zero-row vs nonzero-row distance `0.5`.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     paired_cosine_distances as p; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(p(X,Y).tolist())"
+///   # [0.5, 0.183503419072274]
+#[test]
+fn green_paired_cosine_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let distances = paired_cosine_distances(&x, &y).unwrap();
+    const SK: [f64; 2] = [0.5, 0.183503419072274];
+    for i in 0..2 {
+        assert!(
+            (distances[i] - SK[i]).abs() < 1e-15,
+            "paired_cosine[{i}]: sklearn={}, ferrolearn={}",
+            SK[i],
+            distances[i]
+        );
+    }
+}
+
+/// Guard: `paired_distances` dispatches to sklearn's supported paired metrics
+/// and rejects Chebyshev, which sklearn does not allow for paired distances.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     paired_distances as p; print(p(np.array([[0.,1.],[1.,1.]]), \
+///     np.array([[0.,1.],[2.,1.]]), metric='euclidean').tolist())"
+///   # [0.0, 1.0]
+#[test]
+fn green_paired_distances_dispatch_matches_sklearn() {
+    let x = array![[0.0_f64, 1.0], [1.0, 1.0]];
+    let y = array![[0.0_f64, 1.0], [2.0, 1.0]];
+    let distances = paired_distances(&x, &y, Metric::Euclidean).unwrap();
+    const SK: [f64; 2] = [0.0, 1.0];
+    for i in 0..2 {
+        assert!(
+            (distances[i] - SK[i]).abs() < 1e-12,
+            "paired_distances(Euclidean)[{i}]: sklearn={}, ferrolearn={}",
+            SK[i],
+            distances[i]
+        );
+    }
+    assert!(
+        paired_distances(&x, &y, Metric::Chebyshev).is_err(),
+        "sklearn rejects metric='chebyshev' for paired_distances"
     );
 }
 

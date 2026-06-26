@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 105 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 100 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -68,7 +68,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
 | `sklearn.compose` | `make_column_selector` |
 | `sklearn.metrics` | `class_likelihood_ratios`, `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `consensus_score`, `pairwise_distances_chunked`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
-| `sklearn.metrics.pairwise` | `additive_chi2_kernel`, `chi2_kernel`, `cosine_similarity`, `distance_metrics`, `haversine_distances`, `kernel_metrics`, `laplacian_kernel`, `paired_cosine_distances`, `paired_distances`, `paired_euclidean_distances`, `paired_manhattan_distances` |
+| `sklearn.metrics.pairwise` | `additive_chi2_kernel`, `chi2_kernel`, `distance_metrics`, `haversine_distances`, `kernel_metrics`, `laplacian_kernel` |
 | `sklearn.model_selection` | `check_cv`, `ParameterGrid`, `ParameterSampler`, `LearningCurveDisplay`, `ValidationCurveDisplay` |
 | `sklearn.calibration` | `CalibrationDisplay` |
 | `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |

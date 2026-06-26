@@ -32,6 +32,7 @@ use ferrolearn_metrics::{
     confusion_matrix,
     contingency_matrix,
     cosine_distances,
+    cosine_similarity,
     davies_bouldin_score,
     // Ranking
     dcg_score,
@@ -67,6 +68,10 @@ use ferrolearn_metrics::{
     ndcg_score,
     normalized_mutual_info_score,
     pair_confusion_matrix,
+    paired_cosine_distances,
+    paired_distances,
+    paired_euclidean_distances,
+    paired_manhattan_distances,
     pairwise_distances,
     pairwise_distances_argmin,
     pairwise_distances_argmin_min,
@@ -241,11 +246,17 @@ fn api_proof_clustering_with_features() {
 fn api_proof_pairwise() {
     let x: Array2<f64> = ndarray::array![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]];
     let y: Array2<f64> = ndarray::array![[0.0, 1.0], [3.0, 3.0]];
+    let y_paired: Array2<f64> = ndarray::array![[0.0, 1.0], [3.0, 3.0], [2.0, 1.0]];
 
     let _ = euclidean_distances::<f64>(&x, &y).unwrap();
     let _ = manhattan_distances::<f64>(&x, &y).unwrap();
     let _ = cosine_distances::<f64>(&x, &y).unwrap();
+    let _ = cosine_similarity::<f64>(&x, &y).unwrap();
     let _ = chebyshev_distances::<f64>(&x, &y).unwrap();
+    let _ = paired_euclidean_distances::<f64>(&x, &y_paired).unwrap();
+    let _ = paired_manhattan_distances::<f64>(&x, &y_paired).unwrap();
+    let _ = paired_cosine_distances::<f64>(&x, &y_paired).unwrap();
+    let _ = paired_distances::<f64>(&x, &y_paired, Metric::Euclidean).unwrap();
     for m in [
         Metric::Euclidean,
         Metric::Manhattan,
