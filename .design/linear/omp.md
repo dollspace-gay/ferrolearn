@@ -16,10 +16,10 @@ active set, re-solves OLS on the active columns, and recomputes the residual
 until either `n_nonzero_coefs` features are selected or the squared residual
 norm falls below `tol`. The ferrolearn target owns the single-target,
 non-precomputed (Cholesky/dense) path of `OrthogonalMatchingPursuit` plus the
-dense single-output `orthogonal_mp` helper and the precomputed-Gram
-single-output `orthogonal_mp_gram` helper. The estimator Gram/precompute
-dispatch, multi-output, estimator `n_iter_`, and `OrthogonalMatchingPursuitCV`
-are not yet implemented.
+dense single-output `orthogonal_mp` helper, the precomputed-Gram single-output
+`orthogonal_mp_gram` helper, and the dense single-output
+`OrthogonalMatchingPursuitCV` estimator. The estimator Gram/precompute dispatch,
+multi-output support, and ferray substrate migration are not yet implemented.
 
 ## Requirements
 - REQ-1: Greedy OMP fit produces `coef_`/`intercept_` matching sklearn's
@@ -71,6 +71,10 @@ are not yet implemented.
   `n_samples`; mismatched feature count returns `ShapeMismatch`.
 - AC-5 (REQ-5): `coefficients()` length equals `n_features`; with
   `fit_intercept=false` the intercept is exactly `0`.
+- AC-6 (REQ-7): `OrthogonalMatchingPursuitCV(cv=3, max_iter=2)` selects
+  `n_nonzero_coefs_ == 1`, matches sklearn coefficients/intercept, and predicts
+  the oracle values on the dense fixture.
+- AC-7 (REQ-8): fitted OMP and fitted OMP-CV expose `n_iter()`.
 
 ## REQ status table
 
@@ -82,8 +86,8 @@ are not yet implemented.
 | REQ-4 (predict) | SHIPPED | impl `fn predict in omp.rs` (`Ok(x.dot(&self.coefficients) + self.intercept)`; `ShapeMismatch` on feature-count mismatch) mirrors `LinearModel._decision_function`. Non-test consumer: `pub use` re-export + `impl FittedPipelineEstimator for FittedOMP` (`predict_pipeline` calls `self.predict`). Verification: `cargo test -p ferrolearn-linear` (`test_predict`, `test_predict_feature_mismatch`). |
 | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | impl `fn fit in omp.rs` centering branch (`x - &x_mean`, `y - y_mean`, `intercept = *ym - xm.dot(&w)`) mirrors `_set_intercept` (`_omp.py:815`); `impl HasCoefficients for FittedOMP` exposes `coefficients()`/`intercept()` (sklearn `coef_`/`intercept_`). Non-test consumer: `pub use` re-export in `lib.rs`. Verification: `cargo test -p ferrolearn-linear` (`test_has_coefficients`, `test_no_intercept`). |
 | REQ-6 (estimator precompute Gram dispatch) | NOT-STARTED | open prereq blocker #489. sklearn's default `precompute='auto'` builds the Gram matrix when `n_samples > n_features` and dispatches estimator fitting to `orthogonal_mp_gram`/`_gram_omp` (`_omp.py:481`,`:152`,`:417`); ferrolearn estimator fitting still always uses the dense per-feature correlation path. |
-| REQ-7 (OrthogonalMatchingPursuitCV) | NOT-STARTED | open prereq blocker #490. sklearn's `OrthogonalMatchingPursuitCV` (`_omp.py:894`) cross-validates `n_nonzero_coefs` via `_omp_path_residues`; it is a routed `parity_op` with no ferrolearn type. |
-| REQ-8 (n_iter_) | NOT-STARTED | open prereq blocker #491. sklearn exposes `n_iter_` (active-feature count, `_omp.py:799`); `FittedOMP` stores only `coefficients` and `intercept` — no iteration/active-count attribute. |
+| REQ-7 (OrthogonalMatchingPursuitCV) | SHIPPED | `OrthogonalMatchingPursuitCV<F>` in `omp.rs`, re-exported from `lib.rs`, mirrors sklearn's dense single-output CV estimator (`_omp.py:901`). It resolves `max_iter` to `min(max(int(0.1*n_features),5), n_features)` when unset/zero, uses deterministic K-fold splits (`cv=None -> 5`, integer `cv` supported), computes fold residual paths using the same train-mean centering as `_omp_path_residues`, selects `argmin(mean MSE)+1`, and refits full-data `OrthogonalMatchingPursuit` with that support size. Narrower Rust surface: arbitrary splitter objects, `n_jobs`, `verbose`, `copy`, metadata routing, and multi-output are not implemented. Verification: live sklearn oracle in `tests/divergence_omp_cv.rs` (`omp_cv_matches_sklearn_cv3`, `omp_cv_no_intercept_matches_sklearn`, `omp_cv_validation_errors`); API proof: `api_proof_omp`. |
+| REQ-8 (n_iter_) | SHIPPED | `FittedOMP<F>` now stores `n_iter` from `solve_omp` and exposes `pub fn n_iter(&self) -> usize`; `FittedOrthogonalMatchingPursuitCV<F>` exposes the full-data refit `n_iter()` as well. This mirrors sklearn's active-feature count (`_omp.py:799`, `_omp.py:1151`). Verification: `tests/divergence_omp_cv.rs` asserts `n_iter()==1`; helper APIs already expose `n_iter`. |
 | REQ-9 (multi-output) | NOT-STARTED | open prereq blocker #492. sklearn loops over target columns (`_omp.py:444`) and yields `coef_` of shape `(n_targets, n_features)`; ferrolearn's `Fit<Array2<F>, Array1<F>>` accepts only a 1-D target. |
 | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #493. `omp.rs` imports `ndarray::{Array1, Array2, ...}` and hand-rolls `cholesky_solve`/`gaussian_solve`; per R-SUBSTRATE-2 the unit is not fully shipped until centering and the active-set solve run on `ferray-core` / `ferray::linalg`. |
 | REQ-11 (`orthogonal_mp` public helper) | SHIPPED | `pub fn orthogonal_mp` + `OrthogonalMpOptions` / `OrthogonalMpResult` in `omp.rs`, re-exported from `lib.rs`, provide the dense single-output Rust analogue of `sklearn.linear_model.orthogonal_mp` (`_omp.py:14`). The helper uses the raw design (no centering/intercept), shares the estimator's greedy solver, returns final coefficients plus `n_iter`, and optionally captures the coefficient path as `(n_features, n_iter)`. It also mirrors sklearn's helper-specific validation where `tol` allows an over-large `n_nonzero_coefs` request to stop by residual tolerance instead of raising. Oracle tests: `orthogonal_mp_helper_k1_matches_sklearn`, `orthogonal_mp_helper_path_matches_sklearn`, `orthogonal_mp_helper_tol_allows_large_n_like_sklearn`; API proof: `api_proof_omp`. |
@@ -96,7 +100,8 @@ plus the `with_n_nonzero_coefs` / `with_tol` / `with_fit_intercept` builders
 (defaults `None`/`None`/`true`, mirroring sklearn's `__init__` signature at
 `_omp.py:742` — except sklearn's `precompute='auto'` has no ferrolearn field, see
 REQ-6). Fitting yields `FittedOMP<F>` holding `coefficients: Array1<F>` (a full
-`n_features`-length vector, zero outside the support) and `intercept: F`.
+`n_features`-length vector, zero outside the support), `intercept: F`, and
+`n_iter: usize`.
 
 `fn fit in omp.rs` performs: shape/sample validation
 (`ShapeMismatch`/`InsufficientSamples`); optional column-mean and target-mean
@@ -117,17 +122,26 @@ Xy_active`; tolerance stopping uses
 precomputed residual norm tracked by sklearn's `_gram_omp`. The estimator intercept is
 recovered as `y_mean − x_mean · w` (`_set_intercept`, `_omp.py:815`).
 
+`OrthogonalMatchingPursuitCV::fit` validates dense single-output input, uses
+K-fold splits in sklearn's deterministic order, calls a local
+`omp_path_residues` equivalent for each fold, truncates all folds to the shortest
+path length, chooses the support size with minimum mean squared validation
+residue, and refits `OrthogonalMatchingPursuit` on all samples. This reproduces
+the sklearn fixture for both `fit_intercept=true` and `false`.
+
 Key invariants matching sklearn: features are selected at most once (ferrolearn
 skips `in_support[j]` columns; sklearn breaks on `lam < n_active`); the active
 set grows monotonically; `coef_` is sparse with support equal to the selected
-indices. Remaining divergences are catalogued as REQ-6 (estimator Gram dispatch), REQ-8
-(`n_iter_`), REQ-9 (multi-output), and REQ-10 (substrate).
+indices. Remaining divergences are catalogued as REQ-6 (estimator Gram dispatch),
+REQ-9 (multi-output), and REQ-10 (substrate).
 
 The estimator participates in pipelines through `impl PipelineEstimator for
-OrthogonalMatchingPursuit` and `impl FittedPipelineEstimator for FittedOMP`, and
-is re-exported at the crate boundary by `pub use omp::{FittedOMP,
-OrthogonalMatchingPursuit, OrthogonalMpOptions, OrthogonalMpGramOptions,
-OrthogonalMpResult, orthogonal_mp, orthogonal_mp_gram}` in `lib.rs`.
+OrthogonalMatchingPursuit` / `OrthogonalMatchingPursuitCV` and the matching
+`FittedPipelineEstimator` impls, and is re-exported at the crate boundary by
+`pub use omp::{FittedOMP, FittedOrthogonalMatchingPursuitCV,
+OrthogonalMatchingPursuit, OrthogonalMatchingPursuitCV, OrthogonalMpOptions,
+OrthogonalMpGramOptions, OrthogonalMpResult, orthogonal_mp,
+orthogonal_mp_gram}` in `lib.rs`.
 
 ## Verification
 - `cargo test -p ferrolearn-linear` — exercises `test_simple_linear`,
@@ -148,6 +162,12 @@ OrthogonalMpResult, orthogonal_mp, orthogonal_mp_gram}` in `lib.rs`.
   sklearn `OMP().fit(X, y)` → `n_nonzero_coefs_ = 1`, 1 non-zero coefficient;
   ferrolearn `OrthogonalMatchingPursuit::new().fit(X, y)` now matches the
   selected coefficient/intercept in `tests/divergence_omp_default.rs`.
+- Live sklearn oracle (REQ-7/REQ-8), dense CV fixture:
+  `OrthogonalMatchingPursuitCV(cv=3, max_iter=2)` → `coef_=[2.02,0,0]`,
+  `intercept_=0.04666666666666863`, `n_nonzero_coefs_=1`, `n_iter_=1`,
+  `predict(X[:2])=[2.06666667,4.08666667]`; `fit_intercept=False` →
+  `coef_=[2.03076923,0,0]`, `intercept_=0`, `predict(X[:2])=[2.03076923,4.06153846]`.
+  Pinned by `tests/divergence_omp_cv.rs`.
 - Live sklearn oracle (REQ-11), small raw helper fixture:
   `orthogonal_mp(X, y, n_nonzero_coefs=1) -> [2.0, 0.0]`;
   `orthogonal_mp(X, y, n_nonzero_coefs=2, return_path=True) ->

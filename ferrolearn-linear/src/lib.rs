@@ -126,8 +126,9 @@ pub use multi_task_lasso::{FittedMultiTaskLasso, MultiTaskLasso};
 pub use multi_task_lasso_cv::{FittedMultiTaskLassoCV, MultiTaskLassoCV};
 pub use nu_svm::{FittedNuSVC, FittedNuSVR, NuSVC, NuSVR};
 pub use omp::{
-    FittedOMP, OrthogonalMatchingPursuit, OrthogonalMpGramOptions, OrthogonalMpOptions,
-    OrthogonalMpResult, orthogonal_mp, orthogonal_mp_gram,
+    FittedOMP, FittedOrthogonalMatchingPursuitCV, OrthogonalMatchingPursuit,
+    OrthogonalMatchingPursuitCV, OrthogonalMpGramOptions, OrthogonalMpOptions, OrthogonalMpResult,
+    orthogonal_mp, orthogonal_mp_gram,
 };
 pub use one_class_svm::{FittedOneClassSVM, OneClassSVM};
 pub use qda::{FittedQDA, QDA};

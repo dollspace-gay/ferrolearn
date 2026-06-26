@@ -23,11 +23,11 @@ use ferrolearn_linear::{
     GLMFamily, GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA,
     Lars, LarsPathOptions, Lasso, LassoCV, LassoLars, LassoPathOptions, LinearRegression,
     LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss, LogisticRegression, LogisticRegressionCV,
-    NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit, OrthogonalMpGramOptions,
-    OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore,
-    Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
-    TweedieRegressor, enet_path, l1_min_c, lars_path, lars_path_gram, lasso_path, orthogonal_mp,
-    orthogonal_mp_gram, ridge_regression,
+    NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit, OrthogonalMatchingPursuitCV,
+    OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor,
+    RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions,
+    SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, enet_path, l1_min_c, lars_path,
+    lars_path_gram, lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -263,6 +263,21 @@ fn api_proof_omp() {
         .fit(&x, &y)
         .unwrap();
     let _ = f.score(&x, &y, None).unwrap();
+    let x_cv = array![
+        [1.0, 0.0, 0.0],
+        [2.0, 0.1, 0.0],
+        [3.0, 0.0, 0.1],
+        [4.0, 0.1, 0.0],
+    ];
+    let y_cv = array![2.1, 4.0, 6.2, 8.1];
+    let f_cv = OrthogonalMatchingPursuitCV::<f64>::new()
+        .with_cv(2)
+        .with_max_iter(1)
+        .fit(&x_cv, &y_cv)
+        .unwrap();
+    let _ = f_cv.score(&x_cv, &y_cv, None).unwrap();
+    assert_eq!(f_cv.n_nonzero_coefs(), 1);
+
     let helper = orthogonal_mp(
         &x,
         &y,

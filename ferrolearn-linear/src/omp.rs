@@ -19,7 +19,10 @@
 //! | REQ-3 (tol stopping ‖r‖²≤tol) | SHIPPED | residual-norm stopping (minor strict-before vs ≤-after boundary, equivalent for typical inputs). |
 //! | REQ-4 (predict) | SHIPPED | `Predict for FittedOMP`. |
 //! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
-//! | REQ-6..10 NOT-STARTED | Estimator Gram/precompute dispatch (#489), OrthogonalMatchingPursuitCV (#490), estimator `n_iter_` (#491), multi-output (#492), ferray substrate (#493). |
+//! | REQ-6 NOT-STARTED | Estimator Gram/precompute dispatch (#489). |
+//! | REQ-7 (OrthogonalMatchingPursuitCV) | SHIPPED | `OrthogonalMatchingPursuitCV` cross-validates `n_nonzero_coefs` over K-fold OMP residual paths, then refits full-data `OrthogonalMatchingPursuit`. Oracle tests `omp_cv_*_matches_sklearn`. |
+//! | REQ-8 (`n_iter_`) | SHIPPED | `FittedOMP::n_iter()` and `FittedOrthogonalMatchingPursuitCV::n_iter()` expose the active-set iteration count. |
+//! | REQ-9..10 NOT-STARTED | Multi-output (#492), ferray substrate (#493). |
 //! | REQ-11 (non-finite input rejected) | SHIPPED | `Fit::fit for OrthogonalMatchingPursuit` rejects any NaN/+/-inf in X or y BEFORE the greedy path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_omp.py:772`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; OMP takes no `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `OrthogonalMatchingPursuit().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::omp_*`). Non-test consumer: the existing `Fit::fit` / `pub use OrthogonalMatchingPursuit` boundary consumers. (#2259) |
 //! | REQ-12 (`orthogonal_mp` helper) | SHIPPED | `pub fn orthogonal_mp` exposes the dense single-output helper path with `n_iter` and optional coefficient path, reusing the estimator's greedy Cholesky OMP core. Oracle tests `orthogonal_mp_helper_*_matches_sklearn`. |
 //! | REQ-13 (`orthogonal_mp_gram` helper) | SHIPPED | `pub fn orthogonal_mp_gram` exposes the single-output precomputed-Gram helper with sklearn's Gram-specific default/validation semantics, `n_iter`, and optional coefficient path. Oracle tests `orthogonal_mp_gram_helper_*_matches_sklearn`. |
@@ -134,6 +137,75 @@ pub struct FittedOMP<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+    /// Number of active-set iterations / selected features.
+    n_iter: usize,
+}
+
+/// Cross-validated Orthogonal Matching Pursuit.
+///
+/// Selects `n_nonzero_coefs` by K-fold cross-validation over the OMP path, then
+/// refits [`OrthogonalMatchingPursuit`] on the full dataset with the selected
+/// support size. This mirrors sklearn's `OrthogonalMatchingPursuitCV` for dense
+/// single-output regression.
+#[derive(Debug, Clone)]
+pub struct OrthogonalMatchingPursuitCV<F> {
+    /// Maximum OMP iterations to evaluate. `None` uses sklearn's default
+    /// `min(max(int(0.1 * n_features), 5), n_features)`.
+    pub max_iter: Option<usize>,
+    /// Number of K-fold splits. `None` uses sklearn's default 5 folds.
+    pub cv: Option<usize>,
+    /// Whether to fit an intercept.
+    pub fit_intercept: bool,
+    _marker: core::marker::PhantomData<F>,
+}
+
+impl<F: Float> OrthogonalMatchingPursuitCV<F> {
+    /// Create a new cross-validated OMP estimator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_iter: None,
+            cv: None,
+            fit_intercept: true,
+            _marker: core::marker::PhantomData,
+        }
+    }
+
+    /// Set the maximum number of path iterations to evaluate.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = Some(max_iter);
+        self
+    }
+
+    /// Set the number of K-fold splits.
+    #[must_use]
+    pub fn with_cv(mut self, cv: usize) -> Self {
+        self.cv = Some(cv);
+        self
+    }
+
+    /// Set whether to fit an intercept.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+}
+
+impl<F: Float> Default for OrthogonalMatchingPursuitCV<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted cross-validated OMP model.
+#[derive(Debug, Clone)]
+pub struct FittedOrthogonalMatchingPursuitCV<F> {
+    coefficients: Array1<F>,
+    intercept: F,
+    n_nonzero_coefs: usize,
+    n_iter: usize,
 }
 
 /// Options for [`orthogonal_mp`].
@@ -853,6 +925,103 @@ where
     })
 }
 
+fn kfold_indices(n_samples: usize, n_splits: usize) -> Vec<(Vec<usize>, Vec<usize>)> {
+    let base = n_samples / n_splits;
+    let extra = n_samples % n_splits;
+    let mut folds = Vec::with_capacity(n_splits);
+    let mut start = 0usize;
+    for fold in 0..n_splits {
+        let fold_size = base + usize::from(fold < extra);
+        let end = start + fold_size;
+        let test: Vec<usize> = (start..end).collect();
+        let train: Vec<usize> = (0..start).chain(end..n_samples).collect();
+        folds.push((train, test));
+        start = end;
+    }
+    folds
+}
+
+fn take_rows2<F: Float>(x: &Array2<F>, rows: &[usize]) -> Array2<F> {
+    let mut out = Array2::<F>::zeros((rows.len(), x.ncols()));
+    for (out_i, &src_i) in rows.iter().enumerate() {
+        out.row_mut(out_i).assign(&x.row(src_i));
+    }
+    out
+}
+
+fn take_rows1<F: Float>(y: &Array1<F>, rows: &[usize]) -> Array1<F> {
+    let mut out = Array1::<F>::zeros(rows.len());
+    for (out_i, &src_i) in rows.iter().enumerate() {
+        out[out_i] = y[src_i];
+    }
+    out
+}
+
+fn omp_path_residues<F>(
+    x_train: &Array2<F>,
+    y_train: &Array1<F>,
+    x_test: &Array2<F>,
+    y_test: &Array1<F>,
+    fit_intercept: bool,
+    max_iter: usize,
+) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    let (x_train_work, y_train_work, x_test_work, y_test_work) = if fit_intercept {
+        let x_mean =
+            x_train
+                .mean_axis(Axis(0))
+                .ok_or_else(|| FerroError::NumericalInstability {
+                    message: "failed to compute column means".into(),
+                })?;
+        let y_mean = y_train
+            .mean()
+            .ok_or_else(|| FerroError::NumericalInstability {
+                message: "failed to compute target mean".into(),
+            })?;
+        (
+            x_train - &x_mean,
+            y_train - y_mean,
+            x_test - &x_mean,
+            y_test - y_mean,
+        )
+    } else {
+        (
+            x_train.clone(),
+            y_train.clone(),
+            x_test.clone(),
+            y_test.clone(),
+        )
+    };
+
+    let solved = solve_omp(
+        &x_train_work,
+        &y_train_work,
+        Some(max_iter),
+        None,
+        true,
+        false,
+    )?;
+    let path = solved
+        .path
+        .ok_or_else(|| FerroError::NumericalInstability {
+            message: "OMP path was not returned".into(),
+        })?;
+
+    let n_steps = path.ncols();
+    let n_test = x_test_work.nrows();
+    let mut residues = Array2::<F>::zeros((n_steps, n_test));
+    for step in 0..n_steps {
+        let coef = path.column(step);
+        let preds = x_test_work.dot(&coef);
+        for i in 0..n_test {
+            residues[[step, i]] = preds[i] - y_test_work[i];
+        }
+    }
+    Ok(residues)
+}
+
 // ---------------------------------------------------------------------------
 // Fit
 // ---------------------------------------------------------------------------
@@ -921,6 +1090,108 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         Ok(FittedOMP {
             coefficients: w,
             intercept,
+            n_iter: solved.n_iter,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array2<F>, Array1<F>>
+    for OrthogonalMatchingPursuitCV<F>
+{
+    type Fitted = FittedOrthogonalMatchingPursuitCV<F>;
+    type Error = FerroError;
+
+    fn fit(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<FittedOrthogonalMatchingPursuitCV<F>, FerroError> {
+        validate_omp_inputs(x, y)?;
+        if x.ncols() < 2 {
+            return Err(FerroError::InsufficientSamples {
+                required: 2,
+                actual: x.ncols(),
+                context: "OrthogonalMatchingPursuitCV requires at least two features".into(),
+            });
+        }
+
+        let n_features = x.ncols();
+        let default_max_iter = ((n_features as f64 * 0.1) as usize).max(5).min(n_features);
+        let max_iter = self
+            .max_iter
+            .filter(|&value| value > 0)
+            .unwrap_or(default_max_iter)
+            .min(n_features);
+        if max_iter == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "max_iter".into(),
+                reason: "must be positive after default resolution".into(),
+            });
+        }
+
+        let n_splits = self.cv.unwrap_or(5);
+        if n_splits < 2 || n_splits > x.nrows() {
+            return Err(FerroError::InvalidParameter {
+                name: "cv".into(),
+                reason: format!("must be in [2, {}]", x.nrows()),
+            });
+        }
+
+        let mut fold_residues = Vec::with_capacity(n_splits);
+        for (train_idx, test_idx) in kfold_indices(x.nrows(), n_splits) {
+            let x_train = take_rows2(x, &train_idx);
+            let y_train = take_rows1(y, &train_idx);
+            let x_test = take_rows2(x, &test_idx);
+            let y_test = take_rows1(y, &test_idx);
+            fold_residues.push(omp_path_residues(
+                &x_train,
+                &y_train,
+                &x_test,
+                &y_test,
+                self.fit_intercept,
+                max_iter,
+            )?);
+        }
+
+        let min_early_stop = fold_residues.iter().map(Array2::nrows).min().unwrap_or(0);
+        if min_early_stop == 0 {
+            return Err(FerroError::NumericalInstability {
+                message: "OMP CV produced an empty coefficient path".into(),
+            });
+        }
+
+        let mut best_idx = 0usize;
+        let mut best_mse = F::infinity();
+        for step in 0..min_early_stop {
+            let mut mse_sum = F::zero();
+            for residues in &fold_residues {
+                let row = residues.row(step);
+                let mse = row
+                    .iter()
+                    .copied()
+                    .map(|r| r * r)
+                    .fold(F::zero(), |a, b| a + b)
+                    / F::from(row.len()).unwrap_or_else(F::one);
+                mse_sum = mse_sum + mse;
+            }
+            let mean_mse = mse_sum / F::from(fold_residues.len()).unwrap_or_else(F::one);
+            if mean_mse < best_mse {
+                best_mse = mean_mse;
+                best_idx = step;
+            }
+        }
+        let best_n_nonzero_coefs = best_idx + 1;
+
+        let fitted = OrthogonalMatchingPursuit::<F>::new()
+            .with_n_nonzero_coefs(best_n_nonzero_coefs)
+            .with_fit_intercept(self.fit_intercept)
+            .fit(x, y)?;
+
+        Ok(FittedOrthogonalMatchingPursuitCV {
+            coefficients: fitted.coefficients().clone(),
+            intercept: fitted.intercept(),
+            n_nonzero_coefs: best_n_nonzero_coefs,
+            n_iter: fitted.n_iter(),
         })
     }
 }
@@ -928,6 +1199,28 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 // ---------------------------------------------------------------------------
 // Predict / HasCoefficients / Pipeline
 // ---------------------------------------------------------------------------
+
+impl<F: Float> FittedOMP<F> {
+    /// Return the active-set iteration count.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+}
+
+impl<F: Float> FittedOrthogonalMatchingPursuitCV<F> {
+    /// Return the cross-validated number of non-zero coefficients.
+    #[must_use]
+    pub fn n_nonzero_coefs(&self) -> usize {
+        self.n_nonzero_coefs
+    }
+
+    /// Return the final refit active-set iteration count.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+}
 
 impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for FittedOMP<F> {
     type Output = Array1<F>;
@@ -953,7 +1246,37 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for Fi
     }
 }
 
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
+    for FittedOrthogonalMatchingPursuitCV<F>
+{
+    type Output = Array1<F>;
+    type Error = FerroError;
+
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        if x.ncols() != self.coefficients.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.coefficients.len()],
+                actual: vec![x.ncols()],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+        Ok(x.dot(&self.coefficients) + self.intercept)
+    }
+}
+
 impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F> for FittedOMP<F> {
+    fn coefficients(&self) -> &Array1<F> {
+        &self.coefficients
+    }
+
+    fn intercept(&self) -> F {
+        self.intercept
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
+    for FittedOrthogonalMatchingPursuitCV<F>
+{
     fn coefficients(&self) -> &Array1<F> {
         &self.coefficients
     }
@@ -977,7 +1300,30 @@ where
     }
 }
 
+impl<F> PipelineEstimator<F> for OrthogonalMatchingPursuitCV<F>
+where
+    F: Float + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
+    fn fit_pipeline(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        let fitted = self.fit(x, y)?;
+        Ok(Box::new(fitted))
+    }
+}
+
 impl<F> FittedPipelineEstimator<F> for FittedOMP<F>
+where
+    F: Float + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        self.predict(x)
+    }
+}
+
+impl<F> FittedPipelineEstimator<F> for FittedOrthogonalMatchingPursuitCV<F>
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
 {
