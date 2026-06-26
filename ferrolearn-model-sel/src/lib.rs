@@ -49,6 +49,7 @@
 pub mod calibration;
 pub mod chain;
 pub mod cross_validation;
+pub mod display;
 pub mod distributions;
 pub mod dummy;
 pub mod feature_union;
@@ -71,7 +72,10 @@ pub mod time_series_split;
 pub mod transformed_target;
 pub mod validation_curve;
 
-pub use calibration::{CalibratedClassifierCV, CalibrationMethod, FittedCalibratedClassifierCV};
+pub use calibration::{
+    CalibratedClassifierCV, CalibrationMethod, CalibrationStrategy, FittedCalibratedClassifierCV,
+    calibration_curve,
+};
 pub use chain::{
     ClassifierChain, FittedClassifierChain, FittedOutputCodeClassifier, FittedRegressorChain,
     OutputCodeClassifier, RegressorChain,
@@ -80,6 +84,10 @@ pub use cross_validation::{
     CheckedCv, CrossValidateResult, CrossValidator, KFold, StratifiedKFold, check_cv,
     check_cv_with_options, cross_val_predict, cross_val_score, cross_validate,
     permutation_test_score,
+};
+pub use display::{
+    CalibrationDisplay, DecisionBoundaryDisplay, LearningCurveDisplay, PartialDependenceDisplay,
+    PartialDependenceKind, ValidationCurveDisplay,
 };
 pub use dummy::{
     DummyClassifier, DummyClassifierStrategy, DummyRegressor, DummyRegressorStrategy,

@@ -39,7 +39,7 @@
 //! | REQ-ENSEMBLE (ensemble=True default — K averaged calibrators) | NOT-STARTED | ferrolearn does the `ensemble=False` single-calibrator path; sklearn default `ensemble=True` averages K per-fold calibrated classifiers (`:411-426`,`:474-500`). Architectural. Blocker #1801. |
 //! | REQ-STRATIFIED-CV (cv=None ⇒ StratifiedKFold) | NOT-STARTED | plain non-stratified `kfold_indices`; sklearn `check_cv(classifier=True)` ⇒ 5-fold StratifiedKFold (`:409`). Blocker #1802. |
 //! | REQ-MULTICLASS (predict_proba (n,n_classes) + OvR + classes_) | NOT-STARTED | binary-only `Array1<f64>`; no per-class calibrators / normalization / `classes_` (`:664-674`,`:709-765`). Architectural. Blocker #1803. |
-//! | REQ-CALIBRATION-CURVE (`calibration_curve` function) | NOT-STARTED | absent in ferrolearn; sklearn bins y_prob → per-bin (prob_true, prob_pred) (`:937`). Missing function. Blocker #1804. |
+//! | REQ-CALIBRATION-CURVE (`calibration_curve` function) | SHIPPED (scoped) | `calibration_curve` bins binary labels/probabilities into `(prob_true, prob_pred)` with uniform or quantile bins, dropping empty bins like sklearn (`:1225`). Gaps: `usize` labels only, no sample weights, narrower `pos_label=None` compatibility. |
 //! | REQ-SAMPLE-WEIGHT (sample_weight channel) | NOT-STARTED | `fit_sigmoid`/`fit_isotonic` take only `(scores, labels)`; sklearn weights priors/PAV (`:821-823`,`:673`). Blocker #1805. |
 //! | REQ-SIGMOID-RESCALE (large-score rescaling) | NOT-STARTED | no `max_abs_prediction_threshold=30` rescaling (`:811-815`); coincides for scores under threshold (REQ-SIGMOID), diverges in conditioning for very large scores. Blocker #1806. |
 //! | REQ-METHOD-DEFAULT (default method='sigmoid' / cv=None) | NOT-STARTED | `new(fit_fn, method, cv)` mandatory; sklearn defaults `method="sigmoid"`/`cv=None` (`:268-281`). Blocker #1807. |
@@ -65,6 +65,157 @@ pub type FitFn =
 ///
 /// Maps a feature matrix to raw decision scores (one per sample).
 pub type PredictFn = Box<dyn Fn(&Array2<f64>) -> Result<Array1<f64>, FerroError>>;
+
+// ---------------------------------------------------------------------------
+// Calibration curve
+// ---------------------------------------------------------------------------
+
+/// Binning strategy for [`calibration_curve`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationStrategy {
+    /// Equal-width bins over `[0, 1]`.
+    Uniform,
+    /// Bins with edges determined by probability quantiles.
+    Quantile,
+}
+
+/// Compute true and predicted probabilities for a binary calibration curve.
+///
+/// This mirrors the data layer of `sklearn.calibration.calibration_curve` for
+/// dense `usize` binary labels and `f64` probabilities. Empty bins are omitted
+/// from the returned arrays, so their length can be smaller than `n_bins`.
+pub fn calibration_curve(
+    y_true: &Array1<usize>,
+    y_prob: &Array1<f64>,
+    n_bins: usize,
+    strategy: CalibrationStrategy,
+    pos_label: Option<usize>,
+) -> Result<(Array1<f64>, Array1<f64>), FerroError> {
+    if y_true.len() != y_prob.len() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![y_true.len()],
+            actual: vec![y_prob.len()],
+            context: "calibration_curve: y_true vs y_prob".into(),
+        });
+    }
+    if y_true.is_empty() {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "calibration_curve".into(),
+        });
+    }
+    if n_bins == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_bins".into(),
+            reason: "must be >= 1".into(),
+        });
+    }
+    if y_prob
+        .iter()
+        .any(|&prob| !prob.is_finite() || !(0.0..=1.0).contains(&prob))
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "y_prob".into(),
+            reason: "values must be finite probabilities in [0, 1]".into(),
+        });
+    }
+
+    let positive_label = resolve_positive_label(y_true, pos_label)?;
+    let bins = calibration_bins(y_prob, n_bins, strategy);
+    let inner_edges = &bins[1..bins.len() - 1];
+
+    let mut bin_sums = vec![0.0; n_bins];
+    let mut bin_true = vec![0.0; n_bins];
+    let mut bin_total = vec![0usize; n_bins];
+
+    for (&label, &prob) in y_true.iter().zip(y_prob.iter()) {
+        let bin_id = inner_edges.partition_point(|edge| *edge < prob);
+        bin_sums[bin_id] += prob;
+        if label == positive_label {
+            bin_true[bin_id] += 1.0;
+        }
+        bin_total[bin_id] += 1;
+    }
+
+    let mut prob_true = Vec::new();
+    let mut prob_pred = Vec::new();
+    for bin_id in 0..n_bins {
+        let total = bin_total[bin_id];
+        if total != 0 {
+            let total_f = total as f64;
+            prob_true.push(bin_true[bin_id] / total_f);
+            prob_pred.push(bin_sums[bin_id] / total_f);
+        }
+    }
+
+    Ok((Array1::from_vec(prob_true), Array1::from_vec(prob_pred)))
+}
+
+fn resolve_positive_label(
+    y_true: &Array1<usize>,
+    pos_label: Option<usize>,
+) -> Result<usize, FerroError> {
+    let mut labels = y_true.iter().copied().collect::<Vec<_>>();
+    labels.sort_unstable();
+    labels.dedup();
+    if labels.len() > 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "y_true".into(),
+            reason: format!("only binary classification is supported; got labels {labels:?}"),
+        });
+    }
+
+    if let Some(label) = pos_label {
+        if labels.contains(&label) {
+            return Ok(label);
+        }
+        return Err(FerroError::InvalidParameter {
+            name: "pos_label".into(),
+            reason: format!("label {label} is not present in y_true"),
+        });
+    }
+
+    Ok(if labels.contains(&1) {
+        1
+    } else {
+        *labels.last().expect("non-empty labels after y_true check")
+    })
+}
+
+fn calibration_bins(
+    y_prob: &Array1<f64>,
+    n_bins: usize,
+    strategy: CalibrationStrategy,
+) -> Vec<f64> {
+    match strategy {
+        CalibrationStrategy::Uniform => {
+            (0..=n_bins).map(|idx| idx as f64 / n_bins as f64).collect()
+        }
+        CalibrationStrategy::Quantile => {
+            let mut sorted = y_prob.to_vec();
+            sorted.sort_by(|a, b| a.total_cmp(b));
+            (0..=n_bins)
+                .map(|idx| percentile_sorted(&sorted, idx as f64 / n_bins as f64))
+                .collect()
+        }
+    }
+}
+
+fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi {
+        sorted[lo]
+    } else {
+        let frac = rank - lo as f64;
+        sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+    }
+}
 
 // ---------------------------------------------------------------------------
 // CalibrationMethod

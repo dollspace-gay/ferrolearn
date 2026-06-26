@@ -20,14 +20,16 @@ use ferrolearn_model_sel::distributions::{Choice, Distribution, IntUniform, LogU
 use ferrolearn_model_sel::learning_curve::learning_curve;
 use ferrolearn_model_sel::validation_curve::validation_curve;
 use ferrolearn_model_sel::{
-    CalibratedClassifierCV, CalibrationMethod, CrossValidateResult, DummyClassifier,
-    DummyClassifierStrategy, DummyRegressor, DummyRegressorStrategy, FeatureUnion, GridSearchCV,
-    HalvingGridSearchCV, HalvingRandomSearchCV, KFold, LeaveOneOut, LeavePOut,
+    CalibratedClassifierCV, CalibrationDisplay, CalibrationMethod, CalibrationStrategy,
+    CrossValidateResult, DecisionBoundaryDisplay, DummyClassifier, DummyClassifierStrategy,
+    DummyRegressor, DummyRegressorStrategy, FeatureUnion, GridSearchCV, HalvingGridSearchCV,
+    HalvingRandomSearchCV, KFold, LearningCurveDisplay, LeaveOneOut, LeavePOut,
     MultiOutputClassifier, MultiOutputRegressor, OneVsOneClassifier, OneVsRestClassifier, ParamSet,
-    ParamValue, ParameterGrid, ParameterSampler, PredefinedSplit, RandomizedSearchCV,
-    RepeatedKFold, RepeatedStratifiedKFold, SelfTrainingClassifier, ShuffleSplit, StratifiedKFold,
-    StratifiedShuffleSplit, TimeSeriesSplit, TransformedTargetRegressor, check_cv, param_grid,
-    train_test_split,
+    ParamValue, ParameterGrid, ParameterSampler, PartialDependenceDisplay, PartialDependenceKind,
+    PredefinedSplit, RandomizedSearchCV, RepeatedKFold, RepeatedStratifiedKFold,
+    SelfTrainingClassifier, ShuffleSplit, StratifiedKFold, StratifiedShuffleSplit, TimeSeriesSplit,
+    TransformedTargetRegressor, ValidationCurveDisplay, calibration_curve, check_cv, param_grid,
+    partial_dependence, train_test_split,
 };
 use ndarray::{Array1, Array2, array};
 use rand::SeedableRng;
@@ -327,6 +329,63 @@ fn api_proof_curves_signatures() {
         neg_mse,
     )
     .is_err();
+}
+
+// =============================================================================
+// Display helpers
+// =============================================================================
+#[test]
+fn api_proof_display_helpers() {
+    let learning_display = LearningCurveDisplay::new(
+        vec![2, 4],
+        array![[1.0, 3.0], [2.0, 4.0]],
+        array![[0.0, 2.0], [1.0, 5.0]],
+        Some("Score".into()),
+    );
+    assert_eq!(learning_display.train_score_mean(), array![2.0, 3.0]);
+
+    let validation_display = ValidationCurveDisplay::new(
+        "alpha",
+        array![0.1, 1.0],
+        array![[1.0, 1.0], [0.0, 2.0]],
+        array![[0.5, 0.7], [0.2, 0.4]],
+        None,
+    );
+    assert_eq!(validation_display.param_name, "alpha");
+    assert_eq!(validation_display.param_range.len(), 2);
+
+    let y_true = array![0usize, 0, 0, 0, 1, 1, 1, 1, 1];
+    let y_prob = array![0.1, 0.2, 0.3, 0.4, 0.65, 0.7, 0.8, 0.9, 1.0];
+    let (prob_true, prob_pred) =
+        calibration_curve(&y_true, &y_prob, 3, CalibrationStrategy::Uniform, None).unwrap();
+    assert_eq!(prob_true.len(), 3);
+    assert_eq!(prob_pred.len(), 3);
+    let calibration_display = CalibrationDisplay::from_predictions(
+        &y_true,
+        &y_prob,
+        3,
+        CalibrationStrategy::Uniform,
+        None,
+    )
+    .unwrap();
+    assert_eq!(calibration_display.y_prob.len(), y_prob.len());
+    let _quantile = CalibrationStrategy::Quantile;
+
+    let xx0 = array![[0.0, 1.0], [0.0, 1.0]];
+    let xx1 = array![[0.0, 0.0], [1.0, 1.0]];
+    let response = array![[0.0, 1.0], [1.0, 0.0]];
+    let decision_display =
+        DecisionBoundaryDisplay::new(xx0, xx1, response, 2, None, None, None).unwrap();
+    assert_eq!(decision_display.response.dim(), (2, 2));
+
+    let x = array![[1.0, 2.0], [3.0, 4.0]];
+    let grid = array![0.0, 1.0];
+    let pd_result =
+        partial_dependence(|x: &Array2<f64>| Ok(x.column(0).to_owned()), &x, 0, &grid).unwrap();
+    let pd_display = PartialDependenceDisplay::from_single_feature(pd_result, 0, "x0").unwrap();
+    assert_eq!(pd_display.kind, PartialDependenceKind::Average);
+    let _individual = PartialDependenceKind::Individual;
+    let _both = PartialDependenceKind::Both;
 }
 
 // =============================================================================

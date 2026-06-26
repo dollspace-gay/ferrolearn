@@ -14,6 +14,21 @@ phase = "model_sel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_model_sel::CalibrationDisplay"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::CalibrationStrategy"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::calibration_curve"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_model_sel::ClassifierChain"
 phase = "model_sel"
 fixture = ""
@@ -25,6 +40,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_model_sel::CrossValidator"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::DecisionBoundaryDisplay"
 phase = "model_sel"
 fixture = ""
 
@@ -179,6 +199,11 @@ phase = "model_sel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_model_sel::LearningCurveDisplay"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_model_sel::LeaveOneGroupOut"
 phase = "model_sel"
 fixture = ""
@@ -245,6 +270,16 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_model_sel::PartialDependenceResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::PartialDependenceDisplay"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::PartialDependenceKind"
 phase = "model_sel"
 fixture = ""
 
@@ -330,5 +365,10 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_model_sel::ValidationCurveResult"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ValidationCurveDisplay"
 phase = "model_sel"
 fixture = ""
