@@ -19,6 +19,7 @@
 //! - **[`NearestNeighbors`]** — Unsupervised nearest neighbor search (no labels).
 //! - **[`KNeighborsTransformer`]** — Transform samples into a k-neighbors graph.
 //! - **[`RadiusNeighborsTransformer`]** — Transform samples into a radius-neighbors graph.
+//! - **[`KernelDensity`]** — Dense Euclidean Gaussian kernel density estimation.
 //!
 //! # Spatial Indexing
 //!
@@ -55,6 +56,7 @@ pub mod balltree;
 pub mod graph;
 pub mod introselect;
 pub mod kdtree;
+pub mod kernel_density;
 pub mod knn;
 pub mod local_outlier_factor;
 pub mod nearest_centroid;
@@ -67,6 +69,7 @@ pub use graph::{
     KNeighborsTransformer, RadiusNeighborsTransformer, kneighbors_graph, radius_neighbors_graph,
     sort_graph_by_row_values,
 };
+pub use kernel_density::{FittedKernelDensity, KernelDensity, KernelDensityKernel};
 
 // Re-export the main types at the crate root.
 pub use knn::{

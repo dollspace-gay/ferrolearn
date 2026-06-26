@@ -11,6 +11,7 @@
 //! - NearestNeighbors: kneighbors, radius_neighbors, kneighbors_graph,
 //!   radius_neighbors_graph, n_samples_fit, shape
 //! - KNeighborsTransformer / RadiusNeighborsTransformer: builders + fit + transform
+//! - KernelDensity: builders + fit + score_samples + score
 //! - NearestCentroid: fit, predict, score, centroids
 //! - LocalOutlierFactor: fit, fit_predict, predict, decision_function,
 //!   score_samples, lof_scores, offset, negative_outlier_factor, with_novelty
@@ -29,10 +30,11 @@ use ferrolearn_neighbors::nearest_centroid::{FittedNearestCentroid, NearestCentr
 use ferrolearn_neighbors::nearest_neighbors::NearestNeighbors;
 use ferrolearn_neighbors::{
     FittedKNeighborsClassifier, FittedKNeighborsRegressor, FittedKNeighborsTransformer,
-    FittedRadiusNeighborsClassifier, FittedRadiusNeighborsRegressor,
+    FittedKernelDensity, FittedRadiusNeighborsClassifier, FittedRadiusNeighborsRegressor,
     FittedRadiusNeighborsTransformer, GraphMode, KNeighborsClassifier, KNeighborsRegressor,
-    KNeighborsTransformer, RadiusNeighborsClassifier, RadiusNeighborsRegressor,
-    RadiusNeighborsTransformer, kneighbors_graph, radius_neighbors_graph, sort_graph_by_row_values,
+    KNeighborsTransformer, KernelDensity, KernelDensityKernel, RadiusNeighborsClassifier,
+    RadiusNeighborsRegressor, RadiusNeighborsTransformer, kneighbors_graph, radius_neighbors_graph,
+    sort_graph_by_row_values,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -284,6 +286,40 @@ fn api_proof_neighbor_graph_transformers() {
 }
 
 // =============================================================================
+// KernelDensity
+// =============================================================================
+#[test]
+fn api_proof_kernel_density() {
+    let x = array![[0.0], [1.0], [2.0]];
+    let q = array![[0.0], [1.5]];
+
+    let model = KernelDensity::<f64>::new()
+        .with_bandwidth(1.0)
+        .with_kernel(KernelDensityKernel::Gaussian)
+        .with_algorithm(Algorithm::Auto)
+        .with_leaf_size(40);
+    assert_relative_eq!(model.bandwidth(), 1.0, epsilon = 1e-12);
+    assert_eq!(model.kernel(), KernelDensityKernel::Gaussian);
+    assert_eq!(model.algorithm(), Algorithm::Auto);
+    assert_eq!(model.leaf_size(), 40);
+
+    let fitted: FittedKernelDensity<f64> = model.fit(&x, &()).unwrap();
+    assert_eq!(fitted.n_features_in(), 1);
+    assert_eq!(fitted.n_samples_fit(), 3);
+    assert_eq!(fitted.kernel(), KernelDensityKernel::Gaussian);
+    let scores = fitted.score_samples(&q).unwrap();
+    assert_eq!(scores.len(), 2);
+    assert_relative_eq!(scores[0], -1.4625939022307919, epsilon = 1e-12);
+    assert_relative_eq!(
+        fitted.score(&q).unwrap(),
+        scores.iter().copied().sum::<f64>(),
+        epsilon = 1e-12
+    );
+
+    let _: KernelDensity<f64> = Default::default();
+}
+
+// =============================================================================
 // NearestCentroid
 // =============================================================================
 #[test]
@@ -463,6 +499,12 @@ fn api_proof_f32_compiles() {
     let _ = NearestNeighbors::<f32>::new()
         .with_n_neighbors(3)
         .fit(&x32, &())
+        .unwrap();
+    let _ = KernelDensity::<f32>::new()
+        .with_bandwidth(1.0)
+        .fit(&x32, &())
+        .unwrap()
+        .score_samples(&x32)
         .unwrap();
     let _ = kneighbors_graph(&x32, 2, GraphMode::Connectivity).unwrap();
     let _ = radius_neighbors_graph(&x32, 1.0f32, GraphMode::Distance).unwrap();

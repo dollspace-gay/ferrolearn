@@ -24,6 +24,11 @@ phase = "neighbors"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_neighbors::FittedKernelDensity"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_neighbors::FittedLocalOutlierFactor"
 phase = "neighbors"
 fixture = ""
@@ -70,6 +75,16 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_neighbors::KNeighborsRegressor"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::KernelDensity"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::KernelDensityKernel"
 phase = "neighbors"
 fixture = ""
 
