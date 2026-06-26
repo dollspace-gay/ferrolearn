@@ -14,6 +14,11 @@ phase = "neighbors"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_neighbors::FittedKNeighborsTransformer"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_neighbors::FittedKNeighborsRegressor"
 phase = "neighbors"
 fixture = ""
@@ -39,6 +44,11 @@ phase = "neighbors"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_neighbors::FittedRadiusNeighborsTransformer"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_neighbors::FittedRadiusNeighborsRegressor"
 phase = "neighbors"
 fixture = ""
@@ -50,6 +60,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_neighbors::KNeighborsClassifier"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_neighbors::KNeighborsTransformer"
 phase = "neighbors"
 fixture = ""
 
@@ -79,6 +94,11 @@ phase = "neighbors"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_neighbors::RadiusNeighborsTransformer"
+phase = "neighbors"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_neighbors::RadiusNeighborsRegressor"
 phase = "neighbors"
 fixture = ""
@@ -87,4 +107,3 @@ fixture = ""
 path = "ferrolearn_neighbors::Weights"
 phase = "neighbors"
 fixture = ""
-

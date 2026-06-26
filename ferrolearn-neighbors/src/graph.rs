@@ -27,7 +27,7 @@
 //! | REQ-8 | PyO3 binding + ferray sparse substrate | NOT-STARTED (#829) |
 
 use ferrolearn_core::error::FerroError;
-use ferrolearn_core::traits::Fit;
+use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_sparse::CsrMatrix;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -46,6 +46,295 @@ pub enum GraphMode {
     Connectivity,
     /// Store the actual distance for every neighbor edge.
     Distance,
+}
+
+/// Transform samples into a weighted graph of their k nearest neighbors.
+///
+/// Mirrors sklearn's `KNeighborsTransformer` default surface for dense
+/// Euclidean data. The fitted transformer stores a [`NearestNeighbors`] index
+/// and [`Transform::transform`] returns a CSR matrix with shape
+/// `(n_queries, n_samples_fit)`. Like sklearn, `mode=Distance` asks for one
+/// extra neighbor so fitting data transformed against itself keeps the explicit
+/// diagonal entry while still exposing `n_neighbors` non-self distances.
+#[derive(Debug, Clone)]
+pub struct KNeighborsTransformer<F> {
+    mode: GraphMode,
+    n_neighbors: usize,
+    algorithm: Algorithm,
+    leaf_size: usize,
+    _marker: std::marker::PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> KNeighborsTransformer<F> {
+    /// Create a transformer with sklearn defaults:
+    /// `mode=Distance`, `n_neighbors=5`, `algorithm=Auto`, `leaf_size=30`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            mode: GraphMode::Distance,
+            n_neighbors: 5,
+            algorithm: Algorithm::Auto,
+            leaf_size: 30,
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Set graph value mode.
+    #[must_use]
+    pub fn with_mode(mut self, mode: GraphMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the configured neighbor count.
+    #[must_use]
+    pub fn with_n_neighbors(mut self, n_neighbors: usize) -> Self {
+        self.n_neighbors = n_neighbors;
+        self
+    }
+
+    /// Set the neighbor-search algorithm.
+    #[must_use]
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
+
+    /// Set the tree leaf size.
+    #[must_use]
+    pub fn with_leaf_size(mut self, leaf_size: usize) -> Self {
+        self.leaf_size = leaf_size;
+        self
+    }
+
+    /// Return the graph value mode.
+    #[must_use]
+    pub fn mode(&self) -> GraphMode {
+        self.mode
+    }
+
+    /// Return the configured neighbor count.
+    #[must_use]
+    pub fn n_neighbors(&self) -> usize {
+        self.n_neighbors
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for KNeighborsTransformer<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted [`KNeighborsTransformer`].
+#[derive(Debug)]
+pub struct FittedKNeighborsTransformer<F> {
+    neighbors: FittedNearestNeighbors<F>,
+    mode: GraphMode,
+    n_neighbors: usize,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedKNeighborsTransformer<F> {
+    /// Number of features observed during fitting.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.neighbors.shape().1
+    }
+
+    /// Number of fitted samples.
+    #[must_use]
+    pub fn n_samples_fit(&self) -> usize {
+        self.neighbors.n_samples_fit()
+    }
+
+    /// Graph value mode used by transforms.
+    #[must_use]
+    pub fn mode(&self) -> GraphMode {
+        self.mode
+    }
+
+    /// Configured sklearn `n_neighbors` value.
+    #[must_use]
+    pub fn n_neighbors(&self) -> usize {
+        self.n_neighbors
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KNeighborsTransformer<F> {
+    type Fitted = FittedKNeighborsTransformer<F>;
+    type Error = FerroError;
+
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<Self::Fitted, Self::Error> {
+        let neighbors = NearestNeighbors::<F>::new()
+            .with_n_neighbors(self.n_neighbors)
+            .with_algorithm(self.algorithm)
+            .with_leaf_size(self.leaf_size)
+            .fit(x, &())?;
+        Ok(FittedKNeighborsTransformer {
+            neighbors,
+            mode: self.mode,
+            n_neighbors: self.n_neighbors,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedKNeighborsTransformer<F> {
+    type Output = CsrMatrix<F>;
+    type Error = FerroError;
+
+    fn transform(&self, x: &Array2<F>) -> Result<Self::Output, Self::Error> {
+        let add_one = usize::from(self.mode == GraphMode::Distance);
+        let query_k =
+            self.n_neighbors
+                .checked_add(add_one)
+                .ok_or_else(|| FerroError::InvalidParameter {
+                    name: "n_neighbors".into(),
+                    reason: "n_neighbors overflow".into(),
+                })?;
+        self.neighbors.kneighbors_graph(x, Some(query_k), self.mode)
+    }
+}
+
+/// Transform samples into a weighted graph of neighbors within a radius.
+///
+/// Mirrors sklearn's `RadiusNeighborsTransformer` default surface for dense
+/// Euclidean data. The fitted transformer returns CSR graphs with shape
+/// `(n_queries, n_samples_fit)`.
+#[derive(Debug, Clone)]
+pub struct RadiusNeighborsTransformer<F> {
+    mode: GraphMode,
+    radius: F,
+    algorithm: Algorithm,
+    leaf_size: usize,
+}
+
+impl<F: Float + Send + Sync + 'static> RadiusNeighborsTransformer<F> {
+    /// Create a transformer with sklearn defaults:
+    /// `mode=Distance`, `radius=1.0`, `algorithm=Auto`, `leaf_size=30`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            mode: GraphMode::Distance,
+            radius: F::one(),
+            algorithm: Algorithm::Auto,
+            leaf_size: 30,
+        }
+    }
+
+    /// Set graph value mode.
+    #[must_use]
+    pub fn with_mode(mut self, mode: GraphMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Set the search radius.
+    #[must_use]
+    pub fn with_radius(mut self, radius: F) -> Self {
+        self.radius = radius;
+        self
+    }
+
+    /// Set the neighbor-search algorithm.
+    #[must_use]
+    pub fn with_algorithm(mut self, algorithm: Algorithm) -> Self {
+        self.algorithm = algorithm;
+        self
+    }
+
+    /// Set the tree leaf size.
+    #[must_use]
+    pub fn with_leaf_size(mut self, leaf_size: usize) -> Self {
+        self.leaf_size = leaf_size;
+        self
+    }
+
+    /// Return the graph value mode.
+    #[must_use]
+    pub fn mode(&self) -> GraphMode {
+        self.mode
+    }
+
+    /// Return the configured radius.
+    #[must_use]
+    pub fn radius(&self) -> F {
+        self.radius
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for RadiusNeighborsTransformer<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted [`RadiusNeighborsTransformer`].
+#[derive(Debug)]
+pub struct FittedRadiusNeighborsTransformer<F> {
+    neighbors: FittedNearestNeighbors<F>,
+    mode: GraphMode,
+    radius: F,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedRadiusNeighborsTransformer<F> {
+    /// Number of features observed during fitting.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.neighbors.shape().1
+    }
+
+    /// Number of fitted samples.
+    #[must_use]
+    pub fn n_samples_fit(&self) -> usize {
+        self.neighbors.n_samples_fit()
+    }
+
+    /// Graph value mode used by transforms.
+    #[must_use]
+    pub fn mode(&self) -> GraphMode {
+        self.mode
+    }
+
+    /// Radius used by transforms.
+    #[must_use]
+    pub fn radius(&self) -> F {
+        self.radius
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for RadiusNeighborsTransformer<F> {
+    type Fitted = FittedRadiusNeighborsTransformer<F>;
+    type Error = FerroError;
+
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<Self::Fitted, Self::Error> {
+        if self.radius < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "radius".into(),
+                reason: "must be non-negative".into(),
+            });
+        }
+        let neighbors = NearestNeighbors::<F>::new()
+            .with_algorithm(self.algorithm)
+            .with_leaf_size(self.leaf_size)
+            .fit(x, &())?;
+        Ok(FittedRadiusNeighborsTransformer {
+            neighbors,
+            mode: self.mode,
+            radius: self.radius,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>>
+    for FittedRadiusNeighborsTransformer<F>
+{
+    type Output = CsrMatrix<F>;
+    type Error = FerroError;
+
+    fn transform(&self, x: &Array2<F>) -> Result<Self::Output, Self::Error> {
+        self.neighbors
+            .radius_neighbors_graph(x, self.radius, self.mode)
+    }
 }
 
 /// Compute the (weighted) graph of k-Neighbors for points in `x`.

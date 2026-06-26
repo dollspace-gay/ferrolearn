@@ -17,6 +17,8 @@
 //! - **[`RadiusNeighborsRegressor`]** — Predicts target values as the (weighted)
 //!   mean of all training points within a given radius.
 //! - **[`NearestNeighbors`]** — Unsupervised nearest neighbor search (no labels).
+//! - **[`KNeighborsTransformer`]** — Transform samples into a k-neighbors graph.
+//! - **[`RadiusNeighborsTransformer`]** — Transform samples into a radius-neighbors graph.
 //!
 //! # Spatial Indexing
 //!
@@ -60,7 +62,11 @@ pub mod nearest_neighbors;
 pub mod radius_neighbors;
 pub mod sk_kdtree;
 
-pub use graph::{GraphMode, kneighbors_graph, radius_neighbors_graph, sort_graph_by_row_values};
+pub use graph::{
+    FittedKNeighborsTransformer, FittedRadiusNeighborsTransformer, GraphMode,
+    KNeighborsTransformer, RadiusNeighborsTransformer, kneighbors_graph, radius_neighbors_graph,
+    sort_graph_by_row_values,
+};
 
 // Re-export the main types at the crate root.
 pub use knn::{

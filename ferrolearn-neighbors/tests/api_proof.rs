@@ -10,6 +10,7 @@
 //! - RadiusNeighborsClassifier / Regressor: same set with radius_neighbors
 //! - NearestNeighbors: kneighbors, radius_neighbors, kneighbors_graph,
 //!   radius_neighbors_graph, n_samples_fit, shape
+//! - KNeighborsTransformer / RadiusNeighborsTransformer: builders + fit + transform
 //! - NearestCentroid: fit, predict, score, centroids
 //! - LocalOutlierFactor: fit, fit_predict, predict, decision_function,
 //!   score_samples, lof_scores, offset, negative_outlier_factor, with_novelty
@@ -19,7 +20,7 @@
 //! - Algorithm and Weights enum coverage
 
 use approx::assert_relative_eq;
-use ferrolearn_core::traits::{Fit, Predict};
+use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_neighbors::balltree::BallTree;
 use ferrolearn_neighbors::kdtree::KdTree;
 use ferrolearn_neighbors::knn::{Algorithm, Weights};
@@ -27,10 +28,11 @@ use ferrolearn_neighbors::local_outlier_factor::{FittedLocalOutlierFactor, Local
 use ferrolearn_neighbors::nearest_centroid::{FittedNearestCentroid, NearestCentroid};
 use ferrolearn_neighbors::nearest_neighbors::NearestNeighbors;
 use ferrolearn_neighbors::{
-    FittedKNeighborsClassifier, FittedKNeighborsRegressor, FittedRadiusNeighborsClassifier,
-    FittedRadiusNeighborsRegressor, GraphMode, KNeighborsClassifier, KNeighborsRegressor,
-    RadiusNeighborsClassifier, RadiusNeighborsRegressor, kneighbors_graph, radius_neighbors_graph,
-    sort_graph_by_row_values,
+    FittedKNeighborsClassifier, FittedKNeighborsRegressor, FittedKNeighborsTransformer,
+    FittedRadiusNeighborsClassifier, FittedRadiusNeighborsRegressor,
+    FittedRadiusNeighborsTransformer, GraphMode, KNeighborsClassifier, KNeighborsRegressor,
+    KNeighborsTransformer, RadiusNeighborsClassifier, RadiusNeighborsRegressor,
+    RadiusNeighborsTransformer, kneighbors_graph, radius_neighbors_graph, sort_graph_by_row_values,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -240,6 +242,45 @@ fn api_proof_nearest_neighbors() {
     assert_eq!(nn.shape(), (6, 2));
 
     let _: NearestNeighbors<f64> = Default::default();
+}
+
+// =============================================================================
+// Neighbor graph transformers
+// =============================================================================
+#[test]
+fn api_proof_neighbor_graph_transformers() {
+    let (x, _, _) = two_clusters_2d();
+
+    let k_transformer = KNeighborsTransformer::<f64>::new()
+        .with_n_neighbors(2)
+        .with_mode(GraphMode::Distance)
+        .with_algorithm(Algorithm::BruteForce)
+        .with_leaf_size(20);
+    assert_eq!(k_transformer.n_neighbors(), 2);
+    assert_eq!(k_transformer.mode(), GraphMode::Distance);
+    let fitted_k: FittedKNeighborsTransformer<f64> = k_transformer.fit(&x, &()).unwrap();
+    assert_eq!(fitted_k.n_features_in(), 2);
+    assert_eq!(fitted_k.n_samples_fit(), 6);
+    assert_eq!(fitted_k.n_neighbors(), 2);
+    let k_graph = fitted_k.transform(&x).unwrap();
+    assert_eq!(k_graph.n_rows(), 6);
+    assert_eq!(k_graph.n_cols(), 6);
+
+    let r_transformer = RadiusNeighborsTransformer::<f64>::new()
+        .with_radius(1.0)
+        .with_mode(GraphMode::Connectivity)
+        .with_algorithm(Algorithm::Auto)
+        .with_leaf_size(20);
+    assert_eq!(r_transformer.mode(), GraphMode::Connectivity);
+    assert_relative_eq!(r_transformer.radius(), 1.0, epsilon = 1e-12);
+    let fitted_r: FittedRadiusNeighborsTransformer<f64> = r_transformer.fit(&x, &()).unwrap();
+    assert_eq!(fitted_r.n_features_in(), 2);
+    assert_eq!(fitted_r.n_samples_fit(), 6);
+    assert_eq!(fitted_r.mode(), GraphMode::Connectivity);
+    assert_relative_eq!(fitted_r.radius(), 1.0, epsilon = 1e-12);
+    let r_graph = fitted_r.transform(&x).unwrap();
+    assert_eq!(r_graph.n_rows(), 6);
+    assert_eq!(r_graph.n_cols(), 6);
 }
 
 // =============================================================================

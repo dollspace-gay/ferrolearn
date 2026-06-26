@@ -17,7 +17,7 @@ model selection.
   the version cited by most current `divergence_*` tests.
 - Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
 - ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
-- Test evidence: the current tree contains 353 `tests/divergence_*.rs` files.
+- Test evidence: the current tree contains 354 `tests/divergence_*.rs` files.
 
 The exact API gap list below was produced by parsing the sklearn 1.9.0 API
 index for public classes/functions and comparing it with current public Rust
@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 38 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 36 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -57,7 +57,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.linear_model` | `LarsCV`, `LassoLarsCV`, `TheilSenRegressor` |
 | `sklearn.tree` | `export_graphviz`, `plot_tree` |
 | `sklearn.ensemble` | `StackingClassifier`, `StackingRegressor` |
-| `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
+| `sklearn.neighbors` | `KernelDensity`, `NeighborhoodComponentsAnalysis` |
 | `sklearn.cluster` | `SpectralBiclustering`, `SpectralCoclustering` |
 | `sklearn.decomposition` | `MiniBatchDictionaryLearning`, `MiniBatchSparsePCA`, `SparseCoder`, `dict_learning`, `dict_learning_online` |
 | `sklearn.feature_selection` | `mutual_info_classif`, `mutual_info_regression` |
@@ -112,7 +112,7 @@ The source and tests document many narrower gaps. Important recurring themes:
 | Core / pipeline | Rust typestate gives stronger compile-time guarantees but is not sklearn's Python estimator protocol. Full `BaseEstimator` behavior, `get_params`/`set_params`/`clone`, metadata routing, estimator tags, HTML representation, and broad `check_estimator` compatibility are absent. Pipeline and `FeatureUnion` behavior has separate divergence tests for slicing and duplicate/dunder names. |
 | Linear / SVM / discriminant | Many estimator names exist, but exact sklearn helper functions and several estimator variants are still missing (see API table). Known gaps include LDA binary `decision_function` shape, OMP Gram/precompute/CV/multi-output/n_iter surfaces, solver-option differences, `sample_weight`/`class_weight` coverage gaps, libsvm probability RNG/value differences, and Rust `FerroError` ABI instead of sklearn `ValueError`/`InvalidParameterError`/warnings. |
 | Tree / ensemble | Stacking and tree export/plot helpers are absent. Implementations still differ in AdaBoost decision/probability/SAMME.R/base-estimator behavior, Voting's heterogeneous estimator/weight/transform surface, random and missing-value routing details, HGB bin threshold and missing-direction behavior, RNG exactness, and sklearn visualization/export attributes. |
-| Neighbors | Missing transformer, density, and metric-learning estimators remain. Present estimators still have gaps around `X=None` self-query behavior, `sort_results`, `include_self`, constructor surfaces (`radius`, `metric`, `p`, `metric_params`, `n_jobs`), sparse/precomputed distances, exact error messages, and some tie/order behavior. |
+| Neighbors | The k-neighbor and radius-neighbor graph transformer names now exist, but density and metric-learning estimators remain missing. Present estimators still have gaps around `X=None` self-query behavior, `sort_results`, `include_self`, constructor surfaces (`radius`, `metric`, `p`, `metric_params`, `n_jobs`), sparse/precomputed distances, exact error messages, and some tie/order behavior. |
 | Naive Bayes | All five estimator names exist, but base/discrete sklearn conveniences are incomplete: `coef_`/`intercept_` properties, shared `_count`/`_update_feature_log_prob` style internals, exact prior/alpha edge semantics, `sample_weight`, warning/error ABI, and some `partial_fit` edge contracts remain narrower than sklearn. |
 | Cluster / mixture / semi-supervised | Exact missing items include biclustering/coclustering. Present estimators have documented non-parity around BIRCH's CF-tree splitting and online API, BisectingKMeans centers/inertia/label numbering/tree-descent prediction, KMeans/MiniBatchKMeans defaults and RNG/local-optimum details, BayesianGMM pruning, Agglomerative full dendrogram/label numbering, FeatureAgglomeration inverse-transform shape behavior, HDBSCAN/OPTICS boundary precision, and semi-supervised zero-row/probability edge cases. |
 | Decomposition / manifold / cross-decomposition | Missing decomposition helper functions and sparse/dictionary online variants remain. Present estimators still have gaps such as PCA `svd_solver` override/ARPACK/MLE/parameter surface, repeated-eigenbasis exactness, rank-deficient score precision, PLS fitted attributes/constructor modes/inverse transform/PyO3 bindings, LDA topic-model RNG initialization, and manifold helper-function/API differences. |
@@ -160,7 +160,7 @@ Current divergence-test count by crate:
 | `ferrolearn-linear` | 68 |
 | `ferrolearn-metrics` | 16 |
 | `ferrolearn-model-sel` | 31 |
-| `ferrolearn-neighbors` | 17 |
+| `ferrolearn-neighbors` | 18 |
 | `ferrolearn-neural` | 5 |
 | `ferrolearn-numerical` | 7 |
 | `ferrolearn-preprocess` | 78 |
