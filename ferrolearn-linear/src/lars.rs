@@ -30,6 +30,7 @@
 //! | REQ-5..8 NOT-STARTED | fitted coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
 //! | REQ-9 (Lars/LassoLars non-finite input rejected) | SHIPPED | `Fit::fit for Lars` AND the SEPARATE `Fit::fit for LassoLars` impl both reject any NaN/+/-inf in X or y BEFORE the LARS path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`Lars._fit` `_least_angle.py:1183`; `LassoLars.fit` override `_least_angle.py:1698` → `:1726`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; neither `Lars.fit` nor `LassoLars.fit` takes a `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lars().fit` / `LassoLars(alpha=0.1).fit` raise `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::lars_*`, `tests/divergence_lasso_lars_nonfinite.rs::lasso_lars_rejects_non_finite_input_like_sklearn`). Non-test consumer: the existing `Fit::fit` / `pub use Lars, LassoLars` boundary consumers. (#2259, #2260) |
 //! | REQ-10 (`lars_path` public helper) | SHIPPED | `pub fn lars_path` + `LarsPathOptions` / `LarsPathResult` expose the dense single-output Rust analogue of `sklearn.linear_model.lars_path`, returning alphas, final active indices, coefficient path `(n_features, n_alphas)`, and `n_iter`. Oracle tests `lars_path_*_matches_sklearn`. |
+//! | REQ-11 (`lars_path_gram` public helper) | SHIPPED | `pub fn lars_path_gram` exposes the sufficient-statistics analogue of `sklearn.linear_model.lars_path_gram`, taking `Xy`, `Gram`, and `n_samples`, and returning the same `LarsPathResult` surface. Oracle tests `lars_path_gram_*_matches_sklearn`. |
 //!
 //! acto-critic + builder: `Lars` matched sklearn exactly; `LassoLars` diverged (used forward-stepwise
 //! OLS instead of the equiangular lasso path) — rewritten to sklearn's `_lars_path_solver` lasso
@@ -347,9 +348,57 @@ where
         options.max_iter,
         options.method == LarsPathMethod::Lasso,
         options.alpha_min,
+        None,
     )?;
 
     let n_features = x.ncols();
+    let n_alphas = path.alphas.len();
+    let mut coefficients = Array2::<F>::zeros((n_features, n_alphas));
+    for (alpha_idx, coef) in path.coefficients.iter().enumerate() {
+        coefficients.column_mut(alpha_idx).assign(coef);
+    }
+
+    Ok(LarsPathResult {
+        alphas: Array1::from_vec(path.alphas),
+        active: path.active,
+        coefficients,
+        n_iter: path.n_iter,
+    })
+}
+
+/// Compute a dense single-output LARS or LARS-Lasso path from sufficient
+/// statistics.
+///
+/// This is the Rust analogue of `sklearn.linear_model.lars_path_gram`: `xy`
+/// is `X.T @ y`, `gram` is `X.T @ X`, and `n_samples` is the equivalent sample
+/// count used to scale returned alphas and `alpha_min`.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent `xy` / `gram` shapes, empty input,
+/// non-finite values, invalid `n_samples`, invalid `alpha_min`, non-positive
+/// definite Gram matrices, or other numerical failures in the path solver.
+pub fn lars_path_gram<F>(
+    xy: &Array1<F>,
+    gram: &Array2<F>,
+    n_samples: usize,
+    options: LarsPathOptions<F>,
+) -> Result<LarsPathResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    validate_lars_path_gram_inputs(xy, gram, n_samples, options.alpha_min)?;
+    let (x, y) = gram_to_surrogate_design(xy, gram)?;
+    let path = compute_lars_path(
+        &x,
+        &y,
+        options.max_iter,
+        options.method == LarsPathMethod::Lasso,
+        options.alpha_min,
+        Some(n_samples),
+    )?;
+
+    let n_features = xy.len();
     let n_alphas = path.alphas.len();
     let mut coefficients = Array2::<F>::zeros((n_features, n_alphas));
     for (alpha_idx, coef) in path.coefficients.iter().enumerate() {
@@ -377,6 +426,115 @@ struct LarsPathComputation<F> {
     active: Vec<usize>,
     coefficients: Vec<Array1<F>>,
     n_iter: usize,
+}
+
+fn validate_lars_path_gram_inputs<F: Float>(
+    xy: &Array1<F>,
+    gram: &Array2<F>,
+    n_samples: usize,
+    alpha_min: F,
+) -> Result<(), FerroError> {
+    let (rows, cols) = gram.dim();
+    if rows != cols {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![rows, rows],
+            actual: vec![rows, cols],
+            context: "Gram must be square".into(),
+        });
+    }
+    if rows != xy.len() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![rows],
+            actual: vec![xy.len()],
+            context: "Xy length must match Gram dimension".into(),
+        });
+    }
+    if rows == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "lars_path_gram requires at least one feature".into(),
+        });
+    }
+    if n_samples == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_samples".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if gram.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "Gram".into(),
+            reason: "Input Gram contains NaN or infinity.".into(),
+        });
+    }
+    if xy.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "Xy".into(),
+            reason: "Input Xy contains NaN or infinity.".into(),
+        });
+    }
+    if alpha_min < F::zero() || !alpha_min.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "alpha_min".into(),
+            reason: "must be finite and non-negative".into(),
+        });
+    }
+    Ok(())
+}
+
+fn gram_to_surrogate_design<F>(
+    xy: &Array1<F>,
+    gram: &Array2<F>,
+) -> Result<(Array2<F>, Array1<F>), FerroError>
+where
+    F: Float + 'static,
+{
+    let n_features = xy.len();
+    let mut chol = Array2::<F>::zeros((n_features, n_features));
+    let eps = F::epsilon();
+
+    for i in 0..n_features {
+        for j in 0..=i {
+            let mut sum = gram[[i, j]];
+            for k in 0..j {
+                sum = sum - chol[[i, k]] * chol[[j, k]];
+            }
+            if i == j {
+                if sum <= eps {
+                    return Err(FerroError::NumericalInstability {
+                        message: "Gram matrix is not positive definite".into(),
+                    });
+                }
+                chol[[i, j]] = sum.sqrt();
+            } else {
+                let denom = chol[[j, j]];
+                if denom.abs() <= eps {
+                    return Err(FerroError::NumericalInstability {
+                        message: "Gram matrix has a near-zero Cholesky pivot".into(),
+                    });
+                }
+                chol[[i, j]] = sum / denom;
+            }
+        }
+    }
+
+    let mut y = Array1::<F>::zeros(n_features);
+    for i in 0..n_features {
+        let mut sum = xy[i];
+        for j in 0..i {
+            sum = sum - chol[[i, j]] * y[j];
+        }
+        let diag = chol[[i, i]];
+        if diag.abs() <= eps {
+            return Err(FerroError::NumericalInstability {
+                message: "Gram matrix has a near-zero Cholesky pivot".into(),
+            });
+        }
+        y[i] = sum / diag;
+    }
+
+    Ok((chol.t().to_owned(), y))
 }
 
 /// Center `x` and `y` for intercept fitting, returning centred arrays and means.
@@ -502,7 +660,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let path = compute_lars_path(&x_work, &y_work, max_active, false, F::zero())?;
+        let path = compute_lars_path(&x_work, &y_work, max_active, false, F::zero(), None)?;
         let w = path
             .coefficients
             .last()
@@ -545,9 +703,10 @@ fn compute_lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 's
     max_steps: usize,
     lasso_modification: bool,
     alpha_min: F,
+    alpha_n_samples: Option<usize>,
 ) -> Result<LarsPathComputation<F>, FerroError> {
     let (n_samples, n_features) = x.dim();
-    let n_f = F::from(n_samples).unwrap_or_else(F::one);
+    let n_f = F::from(alpha_n_samples.unwrap_or(n_samples)).unwrap_or_else(F::one);
     let mut beta = Array1::<F>::zeros(n_features);
     // Coefficients at the start of the current iteration (sklearn `prev_coef`).
     let mut prev_beta = Array1::<F>::zeros(n_features);
@@ -878,7 +1037,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let path = compute_lars_path(&x_work, &y_work, self.max_iter, true, self.alpha)?;
+        let path = compute_lars_path(&x_work, &y_work, self.max_iter, true, self.alpha, None)?;
         let w = path
             .coefficients
             .last()

@@ -110,7 +110,7 @@ pub use huber_regressor::{FittedHuberRegressor, HuberRegressor};
 pub use isotonic::{FittedIsotonicRegression, IsotonicRegression};
 pub use lars::{
     FittedLars, FittedLassoLars, Lars, LarsPathMethod, LarsPathOptions, LarsPathResult, LassoLars,
-    lars_path,
+    lars_path, lars_path_gram,
 };
 pub use lasso::{FittedLasso, Lasso, LassoPathOptions, LassoPathResult, lasso_path};
 pub use lasso_cv::{FittedLassoCV, LassoCV};

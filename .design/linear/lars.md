@@ -20,7 +20,9 @@ on the diabetes dataset; `LassoLars` now routes through the same equiangular
 `compute_lars_path` with the §3.3 drop condition and `alpha_min` stopping,
 reproducing sklearn `LassoLars.coef_` to 1e-4 (REQ-2 SHIPPED). The crate also
 exports a dense single-output `lars_path` helper that returns sklearn-style
-alphas, active indices, coefficient paths, and iteration count for raw X/y.
+alphas, active indices, coefficient paths, and iteration count for raw X/y, plus
+the sufficient-statistics `lars_path_gram` helper for `Xy = X.T @ y` and
+`Gram = X.T @ X`.
 
 ## Requirements
 - REQ-1: `Lars` with `method="lar"` produces `coef_` / `intercept_` matching
@@ -43,6 +45,8 @@ alphas, active indices, coefficient paths, and iteration count for raw X/y.
 - REQ-10: Public `lars_path` helper — raw dense single-output path helper
   returning alphas, active feature indices, coefficient path, and iteration
   count for `method="lar"` and `method="lasso"`.
+- REQ-11: Public `lars_path_gram` helper — sufficient-statistics path helper
+  returning the same path artifacts from `Xy`, `Gram`, and `n_samples`.
 
 ## Acceptance criteria
 - AC-1: `Lars(n_nonzero_coefs=5)` `coef_` matches sklearn within `1e-6` on the
@@ -66,6 +70,8 @@ alphas, active indices, coefficient paths, and iteration count for raw X/y.
 - AC-7: `lars_path(X, y, method="lar")` and `method="lasso"` return alphas,
   active indices, coefficient paths, and `n_iter` matching sklearn on a raw
   dense fixture.
+- AC-8: `lars_path_gram(X.T @ y, X.T @ X, n_samples)` returns the same path
+  artifacts matching sklearn's sufficient-statistics helper.
 
 ## REQ status table
 
@@ -80,6 +86,7 @@ alphas, active indices, coefficient paths, and iteration count for raw X/y.
 | REQ-7 (LarsCV/LassoLarsCV/LassoLarsIC) | NOT-STARTED | open prereq blocker #485. sklearn defines `LarsCV` (`:1517`), `LassoLarsCV` (`:1831`), `LassoLarsIC` (`:2029`); ferrolearn has no analog. Separate routed translation units. |
 | REQ-8 (ferray substrate) | NOT-STARTED | open prereq blocker #486. `lars.rs` computes on `ndarray::{Array1, Array2}` with hand-rolled `fn cholesky_solve` / `fn gaussian_solve` instead of `ferray-core` arrays and `ferray::linalg`. sklearn uses LAPACK `potrs` / BLAS via scipy (`sklearn/linear_model/_least_angle.py:618`). |
 | REQ-10 (`lars_path` public helper) | SHIPPED | `pub fn lars_path` + `LarsPathOptions` / `LarsPathResult` in `lars.rs`, re-exported from `lib.rs`, provide the dense single-output Rust analogue of `sklearn.linear_model.lars_path` (`_least_angle.py:67`). The helper uses raw `X`/`y` (no centering/intercept), supports `LarsPathMethod::{Lar,Lasso}`, `max_iter`, and `alpha_min`, and returns alphas, final active indices, coefficient path `(n_features, n_alphas)`, and `n_iter`. Verification: live sklearn oracle fixture in `tests/divergence_lars_path.rs` (`lars_path_lar_matches_sklearn`, `lars_path_lasso_matches_sklearn`, `lars_path_alpha_min_interpolates_like_sklearn`, `lars_path_negative_alpha_min_errors`); API proof: `api_proof_lars_family`. |
+| REQ-11 (`lars_path_gram` public helper) | SHIPPED | `pub fn lars_path_gram` in `lars.rs`, re-exported from `lib.rs`, provides the sufficient-statistics Rust analogue of `sklearn.linear_model.lars_path_gram` (`_least_angle.py:257`). The helper validates `Xy`, square `Gram`, and positive `n_samples`, derives an equivalent Cholesky surrogate design with matching `X.T @ X` / `X.T @ y`, calls the shared `compute_lars_path` with sklearn's provided `n_samples` alpha scaling, and returns the same `LarsPathResult` surface as `lars_path`. Verification: live sklearn oracle fixture in `tests/divergence_lars_path_gram.rs` (`lars_path_gram_lar_matches_sklearn`, `lars_path_gram_lasso_matches_sklearn`, `lars_path_gram_alpha_min_interpolates_like_sklearn`, `lars_path_gram_shape_and_parameter_errors`); API proof: `api_proof_lars_family`. |
 
 ## Architecture
 
@@ -133,6 +140,9 @@ zero-initialized full-length vector in `fn compute_lars_path`).
 calls `compute_lars_path` without centering, and returns alphas, active indices,
 coefficient path, and iteration count. This mirrors sklearn's helper contract;
 callers that need intercept behavior center `X` and `y` before calling it.
+`lars_path_gram` accepts `Xy`, `Gram`, and `n_samples`, constructs a Cholesky
+surrogate design with the same sufficient statistics, and uses the supplied
+`n_samples` to scale alphas like sklearn.
 
 **Path/attribute gap.** Neither fitted type stores the per-step path. sklearn's
 `Lars` exposes `coef_path_` (shape `(n_features, n_steps+1)`), `alphas_`,
@@ -164,7 +174,11 @@ Commands establishing the SHIPPED claims:
   public `lars_path` helper against live sklearn 1.5.2 oracle values for
   `method="lar"`, `method="lasso"`, alpha-min interpolation, active indices,
   coefficient paths, and `n_iter`.
+- `cargo test -p ferrolearn-linear --test divergence_lars_path_gram` — pins the
+  public `lars_path_gram` helper against live sklearn 1.5.2 oracle values for
+  sufficient-statistics `method="lar"`, `method="lasso"`, alpha-min
+  interpolation, active indices, coefficient paths, and `n_iter`.
 
 NOT-STARTED REQs are gated on blockers #483 (fitted path attributes), #484
 (constructor params / `n_nonzero_coefs` default 500), #485 (CV/IC variants), and
-#486 (ferray substrate). REQ-2 and REQ-10 are SHIPPED.
+#486 (ferray substrate). REQ-2, REQ-10, and REQ-11 are SHIPPED.

@@ -26,7 +26,7 @@ use ferrolearn_linear::{
     NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit, OrthogonalMpGramOptions,
     OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore,
     Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
-    TweedieRegressor, enet_path, l1_min_c, lars_path, lasso_path, orthogonal_mp,
+    TweedieRegressor, enet_path, l1_min_c, lars_path, lars_path_gram, lasso_path, orthogonal_mp,
     orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
@@ -240,6 +240,19 @@ fn api_proof_lars_family() {
     assert_eq!(path.alphas().len(), 2);
     assert_eq!(path.coefficients().dim(), (x.ncols(), 2));
     assert_eq!(path.n_iter(), 1);
+
+    let xy = x.t().dot(&y);
+    let gram = x.t().dot(&x);
+    let gram_path = lars_path_gram(
+        &xy,
+        &gram,
+        x.nrows(),
+        LarsPathOptions::default().with_max_iter(1),
+    )
+    .unwrap();
+    assert_eq!(gram_path.alphas().len(), 2);
+    assert_eq!(gram_path.coefficients().dim(), (x.ncols(), 2));
+    assert_eq!(gram_path.n_iter(), 1);
 }
 
 #[test]
