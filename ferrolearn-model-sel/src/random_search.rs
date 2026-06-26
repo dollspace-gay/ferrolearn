@@ -49,7 +49,7 @@
 //! | REQ-LIST-OF-DICTS (list of distribution-dicts + per-iter rng.choice) | NOT-STARTED | `param_distributions` is a single `Vec<(name, dist)>`; sklearn accepts a list of dicts and `rng.choice`s one per iter (`:332`). Blocker #1785. |
 //! | REQ-REFIT (refit + best_estimator_ + delegating predict/score) | NOT-STARTED | search-only struct; sklearn `refit=True` default (`:1046-1061`). Blocker #1777 (shared with grid_search). |
 //! | REQ-CVRESULTS (cv_results_ richness) | NOT-STARTED | shared `CvResults` lacks std/rank/split/times/`param_<name>` (`:1095`,`:1117`,`:1129`). Blocker #1778 (shared). |
-//! | REQ-DEFAULT-CV/SCORING/N-ITER (n_iter=10, cv=None 5-fold, scoring=None) | NOT-STARTED | all mandatory; no `check_cv`/`check_scoring`/default n_iter (`:1576`,`:928`,`:857`). Blocker #1779 (shared). |
+//! | REQ-DEFAULT-CV/SCORING/N-ITER (n_iter=10, cv=None 5-fold, scoring=None) | NOT-STARTED | all mandatory; this driver does not yet consume `check_cv`/`check_scoring` defaults or default n_iter (`:1576`,`:928`,`:857`). Blocker #1779 (shared). |
 //! | REQ-PARALLEL (n_jobs/pre_dispatch/verbose/return_train_score/multimetric) | NOT-STARTED | none exposed (`:1576` init). Blocker #1780 (shared). |
 //! | REQ-ERROR-SCORE (error_score=np.nan continue) | NOT-STARTED | CROSS-UNIT — `fit` delegates to `cross_val_score` which `?`-propagates; sklearn nan-fills + continues (`:996`). Owned by `cross_validation.rs` per S8. |
 //! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random` (R-SUBSTRATE-1). Blocker #1781. |

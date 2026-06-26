@@ -8,6 +8,7 @@
 //! - [`train_test_split`] — shuffle and split data into train/test sets.
 //! - [`KFold`] — k-fold cross-validation splitter.
 //! - [`StratifiedKFold`] — stratified k-fold that preserves class balance.
+//! - [`check_cv`] — normalize `None`/integer CV choices into KFold/StratifiedKFold.
 //! - [`cross_val_score`] — evaluate a pipeline using cross-validation.
 //! - [`cross_validate`] — like `cross_val_score` but with timing and optional
 //!   training scores.
@@ -76,8 +77,9 @@ pub use chain::{
     OutputCodeClassifier, RegressorChain,
 };
 pub use cross_validation::{
-    CrossValidateResult, CrossValidator, KFold, StratifiedKFold, cross_val_predict,
-    cross_val_score, cross_validate, permutation_test_score,
+    CheckedCv, CrossValidateResult, CrossValidator, KFold, StratifiedKFold, check_cv,
+    check_cv_with_options, cross_val_predict, cross_val_score, cross_validate,
+    permutation_test_score,
 };
 pub use dummy::{
     DummyClassifier, DummyClassifierStrategy, DummyRegressor, DummyRegressorStrategy,

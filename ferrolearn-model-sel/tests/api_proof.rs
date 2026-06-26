@@ -26,7 +26,7 @@ use ferrolearn_model_sel::{
     MultiOutputClassifier, MultiOutputRegressor, OneVsOneClassifier, OneVsRestClassifier, ParamSet,
     ParamValue, ParameterGrid, ParameterSampler, PredefinedSplit, RandomizedSearchCV,
     RepeatedKFold, RepeatedStratifiedKFold, SelfTrainingClassifier, ShuffleSplit, StratifiedKFold,
-    StratifiedShuffleSplit, TimeSeriesSplit, TransformedTargetRegressor, param_grid,
+    StratifiedShuffleSplit, TimeSeriesSplit, TransformedTargetRegressor, check_cv, param_grid,
     train_test_split,
 };
 use ndarray::{Array1, Array2, array};
@@ -47,6 +47,9 @@ fn api_proof_splitters() {
     let y = array![0usize, 0, 1, 1, 2, 2, 0, 1, 2];
     let folds = StratifiedKFold::new(3).split(&y).unwrap();
     assert_eq!(folds.len(), 3);
+    let checked = check_cv(Some(3), Some(&y), true).unwrap();
+    assert!(checked.is_stratified());
+    assert_eq!(checked.split(y.len(), Some(&y)).unwrap().len(), 3);
 
     // TimeSeriesSplit
     let folds = TimeSeriesSplit::new(3)

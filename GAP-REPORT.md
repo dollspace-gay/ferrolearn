@@ -17,7 +17,7 @@ model selection.
   the version cited by most current `divergence_*` tests.
 - Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
 - ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
-- Test evidence: the current tree contains 332 `tests/divergence_*.rs` files.
+- Test evidence: the current tree contains 333 `tests/divergence_*.rs` files.
 
 The exact API gap list below was produced by parsing the sklearn 1.9.0 API
 index for public classes/functions and comparing it with current public Rust
@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 70 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 69 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -66,7 +66,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
 | `sklearn.compose` | `make_column_selector` |
 | `sklearn.metrics` | `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
-| `sklearn.model_selection` | `check_cv`, `LearningCurveDisplay`, `ValidationCurveDisplay` |
+| `sklearn.model_selection` | `LearningCurveDisplay`, `ValidationCurveDisplay` |
 | `sklearn.calibration` | `CalibrationDisplay` |
 | `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |
 | `sklearn.gaussian_process.kernels` | `CompoundKernel`, `ExpSineSquared`, `Exponentiation`, `Hyperparameter`, `RationalQuadratic` |
@@ -122,7 +122,7 @@ The source and tests document many narrower gaps. Important recurring themes:
 | Decomposition / manifold / cross-decomposition | Missing decomposition helper functions and sparse/dictionary online variants remain. Present estimators still have gaps such as PCA `svd_solver` override/ARPACK/MLE/parameter surface, repeated-eigenbasis exactness, rank-deficient score precision, PLS fitted attributes/constructor modes/inverse transform/PyO3 bindings, LDA topic-model RNG initialization, and manifold helper-function/API differences. |
 | Preprocess / impute / feature extraction / feature selection | This remains one of the biggest contract-parity areas. Exact missing names include mutual-information scoring, generic univariate selection, and dict/hash/text/image extraction APIs. Common gaps include dense-only implementations where sklearn supports sparse, limited string/object/mixed dtype handling, incomplete feature-name plumbing, reduced Python/PyO3 exposure, random-projection RNG and component-orientation differences, KBins k-means/local-optimum edge cases, spline/quantile/power-transform edge cases, TF-IDF unsmoothed idf behavior, and degenerate feature-scoring semantics. |
 | Metrics / scoring / pairwise | Many metrics now exist, but missing display, threshold, consensus, chunked pairwise, and several pairwise-kernel functions remain. Regression metrics are documented as mostly 1D/unweighted; `sample_weight`, `multioutput`, keyword/default surfaces, exact validation exceptions, and PyO3 exposure are incomplete. Scorer utilities are present but not full sklearn scoring/protocol parity. |
-| Model selection / compose / calibration / multiclass / multioutput | Many names exist, but some exact sklearn public names are absent (`check_cv` and displays). Several implementations use Rust closures or simplified wrappers rather than sklearn's estimator-cloning protocol. RNG exactness, result-table parity, threshold/calibration displays, and some group/splitter edge semantics remain documented divergence areas. |
+| Model selection / compose / calibration / multiclass / multioutput | Many names exist, but some exact sklearn public names are still absent (display helpers remain). Several implementations use Rust closures or simplified wrappers rather than sklearn's estimator-cloning protocol. RNG exactness, result-table parity, threshold/calibration displays, and some group/splitter edge semantics remain documented divergence areas. |
 | Kernel / GP / covariance / neural | Core estimator names exist, but GP kernels are incomplete (`RationalQuadratic`, `ExpSineSquared`, `Exponentiation`, `CompoundKernel`, `Hyperparameter`). Kernel approximation is missing three sklearn estimators. Covariance and neural crates have public surfaces but many fitted-state items are still in conformance exclusions or have narrower solver/optimizer/attribute contracts than sklearn. |
 | Datasets / fetch | Many toy/generator/fetch names exist, but 11 sklearn dataset APIs are absent. Fetcher signatures are narrower than sklearn: common sklearn options such as `return_X_y`, `as_frame`, `download_if_missing`, shuffle/random-state controls, retry/delay knobs, and some large-network value parity checks are absent or unverified. |
 | Sparse / numerical / IO | `ferrolearn-sparse` is closer to scipy sparse than sklearn, but not full scipy parity; helper gaps remain. `ferrolearn-numerical` targets scipy-like primitives and should not be counted as sklearn estimator parity. `ferrolearn-io` adds JSON/MessagePack/ONNX/PMML-style facilities, but these are not sklearn API equivalents. |

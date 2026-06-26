@@ -288,8 +288,9 @@ fold loop.
 Where ferrolearn DIVERGES (all NOT-STARTED, each with a filed blocker):
 
 - **Default cv / classifier-aware stratification** (REQ-5, #1757): `cv` is a
-  mandatory `&dyn CrossValidator`; there is no `check_cv` 5-fold default and no
-  `is_classifier` → StratifiedKFold-vs-KFold dispatch (`:2286`, `:2206-2214`).
+  mandatory `&dyn CrossValidator`; this driver does not yet consume the public
+  `check_cv` 5-fold default or `is_classifier` → StratifiedKFold-vs-KFold
+  dispatch (`:2286`, `:2206-2214`).
 - **Default scoring** (REQ-6, #1757): `scoring` is a mandatory fn; there is no
   `check_scoring` default (r2 for regressor / accuracy for classifier, `:2287`).
 - **error_score=np.nan** (REQ-7, #1758): ferrolearn propagates a fit/score failure

@@ -26,10 +26,11 @@
 //! | REQ-CVPREDICT (original-order OOF placement) | SHIPPED | each OOF prediction placed at its original index (`:1054`). Guard `guard_cross_val_predict_original_order_placement`. |
 //! | REQ-CVPREDICT-PARTITION (non-partition ⇒ error) | SHIPPED | requires a partition cv; non-partition (uncovered/duplicate/out-of-range test index) ⇒ `InvalidParameter`, mirroring `_check_is_permutation` (`:1054`) — was 0.0-filling silently (fixed #1793). Test `pin_1793_cross_val_predict_non_partition_must_error`. |
 //! | REQ-PERM (permutation_test_score p-value) | SHIPPED | `(count(perm>=real)+1)/(n_perm+1)` (`:1697`), real_score = mean CV. Guard `guard_permutation_test_score_pvalue_formula`. Exact perm scores are RNG carve-out. |
+//! | REQ-CHECK-CV (`check_cv`) | SHIPPED | `check_cv(None, ..)` / `check_cv(Some(k), ..)` returns `CheckedCv::KFold` for regressors or classifier calls without `y`, and `CheckedCv::StratifiedKFold` for classifier calls with a 1-D integer target, mirroring `_split.py:2697-2745` for the int/None branch. |
 //! | REQ-ERROR-SCORE (error_score=np.nan continue) | SHIPPED | `cross_val_score`/`cross_validate` NaN-fill a failing fold (fit ⇒ both; independent test/train scoring) and continue, matching default `error_score=np.nan` (`_fit_and_score :890-915`) — was `?`-aborting. Test `pin_1790_error_score_nan_continue`. This unit OWNS the blocker grid/random/curve units deferred here (S8). |
 //! | REQ-SKFOLD-CV (StratifiedKFold as CrossValidator) | NOT-STARTED | trait `fold_indices(n_samples)` has no y channel, so `StratifiedKFold` can't be passed to `cross_val_score`/`GridSearchCV`. Architectural. Blocker #1794. |
 //! | REQ-SHUFFLE-RNG (shuffle / permutation exact membership) | NOT-STARTED | `SmallRng` vs numpy — R-DEFER-3 carve-out (NO failing test); structural (sizes, partition, seed-determinism-across-runs) is SHIPPED. Blocker #1795. |
-//! | REQ-DEFAULTS (cv=None/scoring=None/groups/n_jobs/return_estimator/multimetric) | NOT-STARTED | `cv`/`scoring` mandatory; no `check_cv`/`check_scoring`/groups/n_jobs (`:560`,`:122`). Blocker #1796. |
+//! | REQ-DEFAULTS (scoring=None/groups/n_jobs/return_estimator/multimetric) | NOT-STARTED | `cross_val_*` drivers still require explicit `cv`/`scoring`; `check_cv` is public but not yet wired into those drivers. No `check_scoring`/groups/n_jobs (`:560`,`:122`). Blocker #1796. |
 //! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random`. Blocker #1797. |
 //! | REQ-X-2 (non-test production consumer — widest in crate) | SHIPPED | `cross_val_score` called by `GridSearchCV`/`RandomizedSearchCV`/halving searches; `KFold` flows as `&dyn CrossValidator`; whole surface re-exported in `lib.rs`. |
 
@@ -129,6 +130,12 @@ impl KFold {
     pub fn random_state(mut self, seed: u64) -> Self {
         self.random_state = Some(seed);
         self
+    }
+
+    /// Return the number of splits.
+    #[must_use]
+    pub fn n_splits(&self) -> usize {
+        self.n_splits
     }
 
     /// Produce `(train_indices, test_indices)` pairs for each fold.
@@ -272,6 +279,12 @@ impl StratifiedKFold {
     pub fn random_state(mut self, seed: u64) -> Self {
         self.random_state = Some(seed);
         self
+    }
+
+    /// Return the number of splits.
+    #[must_use]
+    pub fn n_splits(&self) -> usize {
+        self.n_splits
     }
 
     /// Generate `(train_indices, test_indices)` pairs for each fold,
@@ -423,6 +436,124 @@ impl StratifiedKFold {
             folds.push((train, test));
         }
         Ok(folds)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// check_cv
+// ---------------------------------------------------------------------------
+
+/// Checked cross-validation splitter returned by [`check_cv`].
+///
+/// This enum models sklearn's integer/`None` `check_cv` branch in Rust. A
+/// stratified splitter needs `y` at split time, so callers use
+/// [`CheckedCv::split`] instead of erasing the value behind [`CrossValidator`].
+#[derive(Debug, Clone)]
+pub enum CheckedCv {
+    /// Non-stratified K-fold splitter.
+    KFold(KFold),
+    /// Class-stratified K-fold splitter.
+    StratifiedKFold(StratifiedKFold),
+}
+
+impl CheckedCv {
+    /// Return `true` when this checked splitter is stratified.
+    #[must_use]
+    pub fn is_stratified(&self) -> bool {
+        matches!(self, Self::StratifiedKFold(_))
+    }
+
+    /// Return the number of splits.
+    #[must_use]
+    pub fn n_splits(&self) -> usize {
+        match self {
+            Self::KFold(cv) => cv.n_splits(),
+            Self::StratifiedKFold(cv) => cv.n_splits(),
+        }
+    }
+
+    /// Generate train/test splits.
+    ///
+    /// `y` is required only when the checked splitter is
+    /// [`CheckedCv::StratifiedKFold`]. This mirrors sklearn's returned object:
+    /// `KFold.split(X)` ignores `y`, while `StratifiedKFold.split(X, y)` needs
+    /// the target labels.
+    pub fn split(
+        &self,
+        n_samples: usize,
+        y: Option<&Array1<usize>>,
+    ) -> Result<FoldSplits, FerroError> {
+        match self {
+            Self::KFold(cv) => cv.split_result(n_samples),
+            Self::StratifiedKFold(cv) => {
+                let y = y.ok_or_else(|| FerroError::InvalidParameter {
+                    name: "y".into(),
+                    reason: "y is required for stratified cross-validation".into(),
+                })?;
+                if y.len() != n_samples {
+                    return Err(FerroError::ShapeMismatch {
+                        expected: vec![n_samples],
+                        actual: vec![y.len()],
+                        context: "CheckedCv::split: y length must equal n_samples".into(),
+                    });
+                }
+                cv.split(y)
+            }
+        }
+    }
+}
+
+/// Normalize `cv` into a concrete cross-validation splitter.
+///
+/// This is the Rust analog of `sklearn.model_selection.check_cv` for the
+/// integer/`None` branch. `None` selects the sklearn default of five folds.
+/// When `classifier` is `true` and a 1-D integer target `y` is provided,
+/// [`StratifiedKFold`] is returned; otherwise [`KFold`] is returned.
+///
+/// Python-specific inputs such as splitter objects, arbitrary iterables, string
+/// rejection, and target-type inference beyond `Array1<usize>` are deliberately
+/// outside this typed Rust helper. Existing custom splitters can still be
+/// passed directly to APIs that accept [`CrossValidator`].
+pub fn check_cv(
+    cv: Option<usize>,
+    y: Option<&Array1<usize>>,
+    classifier: bool,
+) -> Result<CheckedCv, FerroError> {
+    check_cv_with_options(cv, y, classifier, false, None)
+}
+
+/// Like [`check_cv`], with the sklearn 1.9 integer/`None` branch's shuffle
+/// controls.
+///
+/// Exact shuffled membership is an RNG boundary (`SmallRng` vs numpy), but the
+/// fold sizes, partition structure, and seed determinism are preserved.
+pub fn check_cv_with_options(
+    cv: Option<usize>,
+    y: Option<&Array1<usize>>,
+    classifier: bool,
+    shuffle: bool,
+    random_state: Option<u64>,
+) -> Result<CheckedCv, FerroError> {
+    let n_splits = cv.unwrap_or(5);
+    if n_splits < 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "cv".into(),
+            reason: format!("n_splits must be >= 2, got {n_splits}"),
+        });
+    }
+
+    if classifier && y.is_some() {
+        let mut splitter = StratifiedKFold::new(n_splits).shuffle(shuffle);
+        if let Some(seed) = random_state {
+            splitter = splitter.random_state(seed);
+        }
+        Ok(CheckedCv::StratifiedKFold(splitter))
+    } else {
+        let mut splitter = KFold::new(n_splits).shuffle(shuffle);
+        if let Some(seed) = random_state {
+            splitter = splitter.random_state(seed);
+        }
+        Ok(CheckedCv::KFold(splitter))
     }
 }
 

@@ -428,8 +428,9 @@ failing test):
   `validation_curve` REQ-7.
 
 And several whole features are absent (missing-feature blockers): default
-`train_sizes`/`cv`/`scoring` (REQ-DEFAULTS, #1769, mandatory args, no `check_cv`/
-`check_scoring`/`is_classifier` dispatch), `shuffle`+`random_state` prefix
+`train_sizes`/`cv`/`scoring` (REQ-DEFAULTS, #1769, mandatory args; this driver
+does not yet consume the public `check_cv` default, `check_scoring`, or
+`is_classifier` dispatch), `shuffle`+`random_state` prefix
 permutation (REQ-SHUFFLE, #1770), the `groups` channel
 (REQ-GROUPS, #1771, `CrossValidator::fold_indices` has no group channel),
 `return_times`/`exploit_incremental_learning`/`fit_params` (REQ-EXTRAS, #1772),

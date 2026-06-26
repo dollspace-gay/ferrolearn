@@ -1,11 +1,11 @@
-# cross_validation (KFold / StratifiedKFold / CrossValidator / cross_val_score / cross_validate / cross_val_predict / permutation_test_score)
+# cross_validation (KFold / StratifiedKFold / check_cv / CrossValidator / cross_val_score / cross_validate / cross_val_predict / permutation_test_score)
 
 <!--
 tier: 3-component
 status: draft
 baseline-commit: 699b4835d444cfa3c0d2ea5631b7b840bdb60f89
 upstream-paths:
-  - sklearn/model_selection/_split.py        # KFold (:441), _iter_test_indices (:521), StratifiedKFold (:665), _make_test_folds (:746-806)
+  - sklearn/model_selection/_split.py        # KFold (:441), _iter_test_indices (:521), StratifiedKFold (:665), _make_test_folds (:746-806), check_cv (:2697)
   - sklearn/model_selection/_validation.py   # cross_validate (:122), cross_val_score (:560), _fit_and_score (:729), cross_val_predict (:1054), permutation_test_score (:1502)
 -->
 
@@ -15,7 +15,8 @@ upstream-paths:
 crate. It mirrors scikit-learn's cross-validation core from two upstream files:
 
 - the **splitters** `KFold` (`sklearn/model_selection/_split.py:441`) and
-  `StratifiedKFold` (`:665`), plus the `CrossValidator` trait that abstracts a
+  `StratifiedKFold` (`:665`), the `check_cv` helper (`:2697`) for the
+  integer/`None` branch, plus the `CrossValidator` trait that abstracts a
   fold-index generator (the ferrolearn analog of `BaseCrossValidator`);
 - the **scoring drivers** `cross_val_score` (`sklearn/model_selection/_validation.py:560`),
   `cross_validate` (`:122`), `cross_val_predict` (`:1054`), and
@@ -53,7 +54,8 @@ blockers — the critic should pin failing tests for each:
 
 The remaining gaps are architectural NOT-STARTED (StratifiedKFold has no
 `CrossValidator` impl — the trait `fold_indices(n_samples)` has no y/groups
-channel; mandatory `cv`/`scoring`; no `return_estimator`/`return_indices`/
+channel; the cross-validation drivers do not yet consume `check_cv` defaults and
+still require explicit `cv`/`scoring`; no `return_estimator`/`return_indices`/
 multimetric/groups/n_jobs) or an R-DEFER-3 RNG carve-out (shuffle/permutation
 EXACT membership: `SmallRng` vs numpy — blocker, NO failing test).
 
@@ -90,6 +92,16 @@ EXACT membership: `SmallRng` vs numpy — blocker, NO failing test).
   `self.shuffle`), then `test_folds[y_encoded == k] = folds_for_class` —
   class-`k` samples (in ORIGINAL order) are block-assigned to folds.
   NON-shuffled is fully DETERMINISTIC.
+
+### `check_cv` (`sklearn/model_selection/_split.py:2697`)
+- `:2697-2745` — `cv = 5 if cv is None else cv`; if `cv` is an integer and
+  `classifier=True` with `y` typed as binary or multiclass, return
+  `StratifiedKFold(cv, shuffle=shuffle, random_state=random_state)`, otherwise
+  return `KFold(cv, shuffle=shuffle, random_state=random_state)`.
+- `:2747-2767` — Python-only object/iterable wrapping and string rejection.
+  ferrolearn's typed Rust helper does not model arbitrary Python iterables or
+  duck-typed objects; callers can pass existing Rust `CrossValidator`
+  implementations directly where those APIs accept them.
 
 ### `cross_val_score` (`sklearn/model_selection/_validation.py:560`)
 - `:560-575` — `cross_val_score(estimator, X, y=None, *, groups=None,
@@ -150,6 +162,14 @@ EXACT membership: `SmallRng` vs numpy — blocker, NO failing test).
   `ValueError` only if `n_splits > ALL` class counts (`:770-774`) and WARNS
   otherwise (`:775-781`). **DEVIATE-actual** (R-DEV-2 — wrong error condition).
   NOT-STARTED (blocker #1792).
+- REQ-CHECK-CV (integer/`None` `check_cv` branch): `check_cv(None, ..)` uses
+  five folds; `check_cv(Some(k), None/_, classifier=false)` and classifier calls
+  without `y` return `KFold`; classifier calls with `Array1<usize>` `y` return
+  `StratifiedKFold`. The returned `CheckedCv` exposes `split(n_samples, y)` so
+  the stratified branch can receive target labels. **MATCH** (R-DEV-1/2) for the
+  typed Rust analog of sklearn's integer/`None` branch. SHIPPED. Python
+  iterable/object wrapping and broad `type_of_target` are outside this typed
+  surface.
 - REQ-CVS (cross_val_score mechanic): per-fold build train/test subsets, fit a
   fresh pipeline, predict on test, score; return the per-fold test scores.
   **MATCH** (R-DEV-1/3) for the NON-FAILING path. Mirrors `cross_validate ->
@@ -189,12 +209,13 @@ EXACT membership: `SmallRng` vs numpy — blocker, NO failing test).
   `Mersenne`, so EXACT membership differs. Per R-DEFER-3 this is a carve-out:
   blocker, NO failing test. The STRUCTURAL facts (fold sizes, partition,
   seed-determinism-across-runs) ARE SHIPPED. NOT-STARTED (blocker #1795).
-- REQ-DEFAULTS (cv=None / scoring=None / groups / n_jobs / fit_params /
-  return_estimator / return_indices / multimetric): ferrolearn requires a
-  MANDATORY `cv` and `scoring` fn, has no `groups`/`n_jobs`/`fit_params` channel,
-  and `cross_validate` lacks `return_estimator`/`return_indices`/multimetric.
-  sklearn defaults `cv=None` (→5-fold classifier-aware via `check_cv`),
-  `scoring=None` (→`check_scoring`), and supports all of those (`:122`, `:560`).
+- REQ-DEFAULTS (driver defaults / scoring=None / groups / n_jobs / fit_params /
+  return_estimator / return_indices / multimetric): ferrolearn now exposes
+  `check_cv`, but the scoring drivers still require an explicit `cv` and
+  `scoring` fn, have no `groups`/`n_jobs`/`fit_params` channel, and
+  `cross_validate` lacks `return_estimator`/`return_indices`/multimetric.
+  sklearn's drivers default `cv=None` (→5-fold classifier-aware via `check_cv`),
+  `scoring=None` (→`check_scoring`), and support all of those (`:122`, `:560`).
   **MATCH-intent / gap**. NOT-STARTED (blocker #1796).
 - REQ-X-1 (R-SUBSTRATE): production code uses `ndarray::{Array1, Array2}` (array
   type), `rand::{SeedableRng, rngs::SmallRng, seq::SliceRandom}` (random
@@ -251,6 +272,20 @@ come from the oracle, never copied from the ferrolearn side).
   DIVERGENCE. NOT-STARTED (blocker #1792). (Contrast: `y=[0,0,1,1]`, `n_splits=3`
   — n_splits > ALL class counts — sklearn raises `ValueError`; ferrolearn also
   errors. The divergence is ONLY the "one-class-too-small" case.)
+- AC-CHECK-CV (REQ-CHECK-CV): live oracle
+  ```
+  python3 -c "import numpy as np
+  from sklearn.model_selection import check_cv
+  y=np.array([0,1,0,1,0,0,1,1,1])
+  cv=check_cv(3, y, classifier=True)
+  print(type(cv).__name__, [[int(i) for i in te] for _,te in cv.split(np.ones(len(y)), y)])"
+  # -> StratifiedKFold [[0,1,2],[3,4,6],[5,7,8]]
+  ```
+  ferrolearn `check_cv(Some(3), Some(&y), true)` returns
+  `CheckedCv::StratifiedKFold`, and `split(y.len(), Some(&y))` matches those
+  test folds. Regressor / classifier-without-y `check_cv(Some(3), ..)` returns
+  `KFold` with `[[0,1,2],[3,4,5],[6,7,8]]`; `check_cv(None, None, false)`
+  returns five-fold KFold with `[[0,1],[2,3],[4,5],[6,7],[8,9]]` for `n=10`.
 - AC-CVS (REQ-CVS): `cross_val_score` returns one score per fold on the
   non-failing path. ferrolearn tests
   `test_cross_val_score_returns_correct_number_of_scores` (5 scores for
@@ -341,6 +376,7 @@ come from the oracle, never copied from the ferrolearn side).
 | REQ-KFOLD (non-shuffled KFold membership, DETERMINISTIC) | SHIPPED | impl `fn split_result in cross_validation.rs` (and `impl CrossValidator for KFold`'s `fn fold_indices`) builds `indices = (0..n_samples).collect()`, computes `base_size = n/k`, `remainder = n%k`, and `pos += base_size + if fold < remainder { 1 } else { 0 }` so the first `remainder` folds get `+1`, then emits CONSECUTIVE slices `indices[test_start..test_end]` as the test fold — exactly sklearn's `fold_sizes = np.full(n_splits, n//n_splits); fold_sizes[:n % n_splits] += 1` and consecutive `indices[start:stop]` (`sklearn/model_selection/_split.py:521-535`). It rejects `n_splits < 2` (`FerroError::InvalidParameter`) and `n_samples < n_splits` (`FerroError::InsufficientSamples`). Live oracle (AC-KFOLD): `KFold(3,shuffle=False).split(np.zeros((10,1)))` → `[[0,1,2,3],[4,5,6],[7,8,9]]` matches ferrolearn. Tests: `test_kfold_fold_sizes_unequal` (10/3 → sizes differ by ≤1), `test_kfold_no_overlap_full_coverage`, `test_kfold_invalid_n_splits`, `test_kfold_insufficient_samples`. The exact `n=10,k=3` membership is the oracle-pinnable `#[test]` (R-CHAR-3). Non-test consumer: REQ-X-2 (`&dyn CrossValidator` in `grid_search.rs`/`random_search.rs`/halving). |
 | REQ-SKFOLD (non-shuffled StratifiedKFold membership, DETERMINISTIC) | NOT-STARTED | open prereq blocker #1791. DIVERGENCE. impl `fn split in cross_validation.rs` sorts classes LEXICOGRAPHICALLY (`classes.sort_unstable()`) and assigns folds by a rotating `fold_offset` round-robin (`base = count/k`, `extra = count%k`, the `extra` folds starting at `fold_offset` get `+1`, `fold_offset = (fold_offset + extra) % k` across classes), block-assigning each class's samples in original order. sklearn `_make_test_folds` instead encodes classes by ORDER OF APPEARANCE (`np.unique(return_index)` + `class_perm`, `:760-765`), computes `allocation[i,k] = bincount(y_order[i::n_splits])[k]` over the SORTED encoded labels (`:786-792`), and block-assigns (`:798-805`). Oracle (AC-SKFOLD): `y=[2,2,2,2,0,0,0,0,1,1,1,1]`, k=3 → sklearn `[[0,1,4,8],[2,5,6,9],[3,7,10,11]]` vs ferrolearn `[[0,4,5,8],[1,6,9,10],[2,3,7,11]]`. (On y whose appearance order == lexicographic and counts divisible cases they coincide — `test_skfold_basic`/`test_skfold_class_balance` pass — but the appearance-order case diverges.) |
 | REQ-SKFOLD-ERRWARN (StratifiedKFold error-vs-warn) | NOT-STARTED | open prereq blocker #1792. DIVERGENCE. impl `fn split in cross_validation.rs` loops over each class and returns `Err(FerroError::InsufficientSamples { .. })` as soon as ANY `count < self.n_splits`. sklearn raises `ValueError` ONLY when `np.all(self.n_splits > y_counts)` — i.e. EVERY class count < n_splits (`sklearn/model_selection/_split.py:770-774`) — and merely `warnings.warn(... UserWarning)` when `self.n_splits > min_groups` but not all (`:775-781`). Oracle (AC-SKFOLD-ERRWARN): `y=[0]*5+[1]*2`, n_splits=3 → sklearn SUCCEEDS with a UserWarning; ferrolearn errors. Test `test_skfold_class_too_small` currently ASSERTS the (divergent) error — the critic should pin a test that the one-class-too-small case SUCCEEDS. |
+| REQ-CHECK-CV (integer/None `check_cv` branch) | SHIPPED | impl `pub fn check_cv` and `pub fn check_cv_with_options in cross_validation.rs` normalize `cv.unwrap_or(5)`, reject `n_splits < 2`, and choose `CheckedCv::StratifiedKFold` iff `classifier && y.is_some()`, otherwise `CheckedCv::KFold`. `CheckedCv::split(n_samples, y)` dispatches to `KFold::split_result(n_samples)` or `StratifiedKFold::split(y)` with a y-required and y-length guard. This mirrors sklearn `check_cv`'s integer/`None` branch (`_split.py:2697-2745`): `None→5`, classifier with binary/multiclass `y` → `StratifiedKFold`, otherwise `KFold`. Narrower typed surface: no Python iterable/object wrapping/string rejection, and `Array1<usize>` is the binary/multiclass target channel. Verification: live sklearn oracle fixture `tests/divergence_check_cv.rs` pins KFold int, KFold None default, classifier-without-y KFold, binary/multiclass StratifiedKFold memberships, plus validation errors; `tests/api_proof.rs` covers the crate-root re-export. |
 | REQ-CVS (cross_val_score mechanic, non-failing path) | SHIPPED | impl `pub fn cross_val_score in cross_validation.rs` shape-checks `y.len() == x.nrows()` (`FerroError::ShapeMismatch`), calls `cv.fold_indices(n_samples)?`, and per fold copies the train/test row subsets into fresh `Array2`/`Array1`, fits `pipeline.fit(&x_train, &y_train)?`, predicts `fitted.predict(&x_test)?`, and pushes `scoring(&y_test, &y_pred)?` — returning `Array1::from_vec(scores)` of length `n_folds`. This mirrors `cross_validate` → `cv_results["test_score"]` (`sklearn/model_selection/_validation.py:560`, `:122`) for the NON-FAILING path (the failing path is REQ-ERROR-SCORE). Live oracle (AC-CVS): `cross_val_score(LinearRegression(), X, y, cv=KFold(5))` returns 5 scores. Tests: `test_cross_val_score_returns_correct_number_of_scores`, `test_cross_val_score_perfect_constant_target`, `test_cross_val_score_with_transformer`, `test_cross_val_score_shape_mismatch`. Non-test consumer: REQ-X-2 — `cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?` in `GridSearchCV::fit` (`grid_search.rs`) and `RandomizedSearchCV::fit` (`random_search.rs`). |
 | REQ-CVALIDATE (cross_validate test/train + timing) | SHIPPED | impl `pub fn cross_validate in cross_validation.rs` runs the REQ-CVS fold loop, wraps the fit in `Instant::now()`/`elapsed().as_secs_f64()` (`fit_times`) and the test predict+score in another (`score_times`), and when `return_train_score` is `true` additionally computes `fitted.predict(&x_train)?` → `scoring(&y_train, &y_train_pred)?` into `train_scores`. Returns `CrossValidateResult { test_scores, train_scores: Option<Vec<f64>>, fit_times, score_times }`, mirroring sklearn's dict `test_score`/`fit_time`/`score_time`/`train_score` (`sklearn/model_selection/_validation.py:122`). Tests: `test_cross_validate_returns_correct_fold_count` (test_scores/fit_times/score_times len 5, train_scores `None`), `test_cross_validate_with_train_scores` (train_scores `Some`, len 5), `test_cross_validate_timing_non_negative`, `test_cross_validate_perfect_constant_target`, `test_cross_validate_shape_mismatch`. Honest underclaim: `return_estimator`/`return_indices`/multimetric scoring are ABSENT (REQ-DEFAULTS, NOT-STARTED). Non-test consumer: REQ-X-2 (re-export `pub use cross_validation::CrossValidateResult, cross_validate in lib.rs`). |
 | REQ-CVPREDICT (cross_val_predict original-order, partition case) | SHIPPED | impl `pub fn cross_val_predict in cross_validation.rs` shape-checks `y`, allocates `predictions = Array1::<f64>::zeros(n_samples)`, and per fold fits on train, predicts on test, and writes `predictions[idx] = y_pred[j]` for each `(j, idx)` in `test_idx` — placing each out-of-fold prediction at its ORIGINAL sample position. On a PARTITION cv (every sample in exactly one test fold) this matches sklearn's "each sample predicted once, returned in original order" (`sklearn/model_selection/_validation.py:1054`). Live oracle (AC-CVPREDICT): `cross_val_predict(LinearRegression(), X, y, cv=KFold(5))` has length 10. Tests: `test_cross_val_predict_length`, `test_cross_val_predict_constant_target` (constant y → constant preds at every position), `test_cross_val_predict_with_transformer`, `test_cross_val_predict_shape_mismatch`. The NON-PARTITION case diverges — REQ-CVPREDICT-PARTITION. Non-test consumer: REQ-X-2 (re-export). |
@@ -349,9 +385,9 @@ come from the oracle, never copied from the ferrolearn side).
 | REQ-ERROR-SCORE (error_score=np.nan continue — KEY fixable, cross-unit OWNER) | NOT-STARTED | open prereq blocker #1790. DIVERGENCE. impl `pub fn cross_val_score`/`cross_validate`/`cross_val_predict in cross_validation.rs` each `?`-propagate `pipeline.fit(...)`, `fitted.predict(...)`, and `scoring(...)` — a single fold failure ABORTS the whole call with `Err`. sklearn `_fit_and_score` with the default `error_score=np.nan` NaN-fills BOTH train and test for the failing fold (independent `_score` calls), emits `FitFailedWarning`, and CONTINUES (`sklearn/model_selection/_validation.py:729`, `:890-905`, `:910`/`:915`). Oracle (AC-ERROR-SCORE): an estimator failing on the fold whose train rows include `X[:,0]==99` → `cross_val_score` returns `[-9.25, nan, nan]` (`np.isnan(...).any() == True`), NOT an error. DETERMINISTIC, fixable (same pattern as `validation_curve` #1758/#1762). This unit OWNS the blocker the curve/search units deferred here (S8 — `grid_search.rs`/`random_search.rs` REQ-ERROR-SCORE both cite this owner). The critic should pin a failing test: a one-fold-failing pipeline ⇒ `cross_val_score` returns scores with NaN in that fold, not `Err`. |
 | REQ-SKFOLD-CV (StratifiedKFold has no CrossValidator impl) | NOT-STARTED | open prereq blocker #1794. ARCHITECTURAL. `StratifiedKFold` in `cross_validation.rs` exposes only the inherent `pub fn split(&self, y: &Array1<usize>) -> Result<FoldSplits, FerroError>` and has NO `impl CrossValidator for StratifiedKFold` — because the trait `pub trait CrossValidator { fn fold_indices(&self, n_samples: usize) -> ... }` takes ONLY `n_samples` (no y/groups channel). Consequently `&StratifiedKFold` is not `&dyn CrossValidator`, so it cannot be passed to `cross_val_score`/`cross_validate`/`cross_val_predict`/`GridSearchCV`/`RandomizedSearchCV` (all of which take `&dyn CrossValidator` / `Box<dyn CrossValidator>`). Oracle (AC-SKFOLD-CV): `cross_val_score(&pipeline, x, y, &StratifiedKFold::new(3), scoring)` does not type-check. Same channel-gap class as `group_splitters`/`StratifiedShuffleSplit` (REQ-SSS-3 in splitters.md). |
 | REQ-SHUFFLE-RNG (shuffle + permutation EXACT membership — RNG carve-out) | NOT-STARTED | open prereq blocker #1795. R-DEFER-3 carve-out (blocker, NO failing test). The `shuffle` path of `KFold`/`StratifiedKFold` (`indices.shuffle(&mut rng)` / per-stratum `class_indices.get_mut(class).unwrap().shuffle(&mut rng)`) and `permutation_test_score`'s `indices.shuffle(&mut rng)` all use `rand::rngs::SmallRng`, whose stream differs from numpy's `RandomState`/`check_random_state`. So EXACT shuffled fold membership and the EXACT `perm_scores` sequence cannot match sklearn. Per R-DEFER-3 only the STRUCTURAL facts are pinned (and SHIPPED): shuffled folds remain a disjoint covering partition of `0..n` of the same sizes as the non-shuffled case, and `random_state(seed)` makes the stream reproducible ACROSS RUNS (`test_kfold_shuffle_deterministic`, `test_skfold_shuffle_deterministic`, `test_permutation_test_score_deterministic`). No failing test for the membership. |
-| REQ-DEFAULTS (cv=None / scoring=None / groups / n_jobs / return_estimator / return_indices / multimetric) | NOT-STARTED | open prereq blocker #1796. API-shape + feature gaps. ferrolearn `cross_val_score`/`cross_validate`/`cross_val_predict`/`permutation_test_score in cross_validation.rs` take a MANDATORY `cv: &dyn CrossValidator` and (the scoring ones) a MANDATORY `scoring: fn(&Array1<f64>, &Array1<f64>) -> Result<f64, FerroError>`, and have NO `groups`/`n_jobs`/`fit_params`/`pre_dispatch` channel. sklearn defaults `cv=None` → 5-fold classifier-aware `check_cv`, `scoring=None` → `check_scoring` (`sklearn/model_selection/_validation.py:560`, `:122`), threads `groups` to `cv.split(X, y, groups)`, and `cross_validate` additionally supports `return_estimator`/`return_indices`/multimetric scoring (`:122`). `CrossValidateResult` carries none of those. The no-cv / no-scoring / multimetric forms are unrepresentable. |
+| REQ-DEFAULTS (driver defaults / scoring=None / groups / n_jobs / return_estimator / return_indices / multimetric) | NOT-STARTED | open prereq blocker #1796. API-shape + feature gaps remain after REQ-CHECK-CV. ferrolearn `cross_val_score`/`cross_validate`/`cross_val_predict`/`permutation_test_score in cross_validation.rs` still take a MANDATORY `cv: &dyn CrossValidator` and (the scoring ones) a MANDATORY `scoring: fn(&Array1<f64>, &Array1<f64>) -> Result<f64, FerroError>`, and have NO `groups`/`n_jobs`/`fit_params`/`pre_dispatch` channel. sklearn drivers default `cv=None` → 5-fold classifier-aware `check_cv`, `scoring=None` → `check_scoring` (`sklearn/model_selection/_validation.py:560`, `:122`), thread `groups` to `cv.split(X, y, groups)`, and `cross_validate` additionally supports `return_estimator`/`return_indices`/multimetric scoring (`:122`). `CrossValidateResult` carries none of those. The no-cv / no-scoring / multimetric driver forms are still unrepresentable. |
 | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | open prereq blocker #1797. Production code in `cross_validation.rs` imports `use ndarray::{Array1, Array2}` (array type), `use rand::{SeedableRng, rngs::SmallRng, seq::SliceRandom}` (random substrate), and `std::collections::HashMap`, and builds `Array2::from_shape_vec(...)` / `Array1` subsets per fold. Per R-SUBSTRATE-1 the destination is `ferray-core` (array) and `ferray::random` (sampling/shuffle); `ndarray`/`rand` are the wrong substrate. Until migrated this unit is not on the ferray substrate (R-SUBSTRATE-2). |
-| REQ-X-2 (non-test production consumer — the WIDEST in the crate) | SHIPPED | `pub fn cross_val_score in cross_validation.rs` is called in production by FOUR internal consumers: `GridSearchCV::fit` (`grid_search.rs` — `let scores = cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?`), `RandomizedSearchCV::fit` (`random_search.rs` — same call), and both halving searches (`halving_grid_search.rs`, `halving_random_search.rs` — `cross_val_score(&pipeline, &x_sub, &y_sub, self.cv.as_ref(), self.scoring)`). `KFold` flows into all of them as `&dyn CrossValidator` (each takes `Box<dyn CrossValidator>`/`&dyn CrossValidator`; their tests/examples construct `Box::new(KFold::new(k))`). The whole surface — `CrossValidateResult, CrossValidator, KFold, StratifiedKFold, cross_val_predict, cross_val_score, cross_validate, permutation_test_score` — is re-exported at `pub use cross_validation::{...} in lib.rs`. This is the widest-consumed unit in `ferrolearn-model-sel`. Honest underclaim: `StratifiedKFold` reaches production only via the inherent `split(&Array1<usize>)` + re-export (no `&dyn CrossValidator` path — REQ-SKFOLD-CV); no `ferrolearn-python` binding exists. |
+| REQ-X-2 (non-test production consumer — the WIDEST in the crate) | SHIPPED | `pub fn cross_val_score in cross_validation.rs` is called in production by FOUR internal consumers: `GridSearchCV::fit` (`grid_search.rs` — `let scores = cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?`), `RandomizedSearchCV::fit` (`random_search.rs` — same call), and both halving searches (`halving_grid_search.rs`, `halving_random_search.rs` — `cross_val_score(&pipeline, &x_sub, &y_sub, self.cv.as_ref(), self.scoring)`). `KFold` flows into all of them as `&dyn CrossValidator` (each takes `Box<dyn CrossValidator>`/`&dyn CrossValidator`; their tests/examples construct `Box::new(KFold::new(k))`). The whole surface — `CheckedCv, CrossValidateResult, CrossValidator, KFold, StratifiedKFold, check_cv, check_cv_with_options, cross_val_predict, cross_val_score, cross_validate, permutation_test_score` — is re-exported at `pub use cross_validation::{...} in lib.rs`. This is the widest-consumed unit in `ferrolearn-model-sel`. Honest underclaim: `StratifiedKFold` reaches production only via the inherent `split(&Array1<usize>)` + re-export / `CheckedCv` (no `&dyn CrossValidator` path — REQ-SKFOLD-CV); no `ferrolearn-python` binding exists. |
 
 ## Architecture
 

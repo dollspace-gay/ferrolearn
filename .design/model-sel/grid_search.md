@@ -375,8 +375,8 @@ blocker — architectural / missing-feature, no single-fixer test):
   (`:1095`, `:1117`, `:1129`, `:1134-1139`); `CvResults` has only
   `params`/`mean_scores`/`all_scores`.
 - **default cv** (REQ-DEFAULT-CV, #1779): `cv` is a mandatory `Box<dyn
-  CrossValidator>`; no `check_cv` 5-fold default and no `is_classifier` →
-  StratifiedKFold/KFold dispatch (`:928`).
+  CrossValidator>`; this driver does not yet consume the public `check_cv`
+  5-fold default or `is_classifier` → StratifiedKFold/KFold dispatch (`:928`).
 - **default scoring** (REQ-DEFAULT-SCORING, #1779): `scoring` is a mandatory fn; no
   `check_scoring` r2/accuracy default (`:857`).
 - **n_jobs/pre_dispatch/verbose/return_train_score/multimetric** (REQ-PARALLEL,
