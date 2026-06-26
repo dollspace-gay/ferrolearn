@@ -17,7 +17,7 @@ use ferrolearn_preprocess::{
     ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
     SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
     StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, chi2, f_classif,
-    f_regression, maxabs_scale,
+    f_regression, maxabs_scale, minmax_scale,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -48,6 +48,8 @@ fn api_proof_scalers() {
         .unwrap()
         .fit_transform(&x)
         .unwrap();
+    let _ = minmax_scale(&x, (0.0, 1.0), 0).unwrap();
+    let _ = minmax_scale(&x, (-1.0, 1.0), 1).unwrap();
     let _ = MaxAbsScaler::<f64>::new().fit_transform(&x).unwrap();
     let _ = maxabs_scale(&x, 0).unwrap();
     let _ = maxabs_scale(&x, 1).unwrap();

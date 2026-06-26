@@ -33,9 +33,9 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 109 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 108 exact public items missing across the
   modules listed below.
-- Whole sklearn infrastructure areas are not counted in that 110: callbacks,
+- Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
   display/plotting classes, metadata routing, and Python object compatibility.
 - Existing Rust implementations frequently expose a narrower or Rust-idiomatic
@@ -61,7 +61,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
 | `sklearn.cluster` | `SpectralBiclustering`, `SpectralCoclustering`, `cluster_optics_xi`, `compute_optics_graph`, `kmeans_plusplus`, `ward_tree` |
 | `sklearn.decomposition` | `MiniBatchDictionaryLearning`, `MiniBatchSparsePCA`, `SparseCoder`, `dict_learning`, `dict_learning_online`, `non_negative_factorization`, `sparse_encode` |
-| `sklearn.preprocessing` | `KernelCenterer`, `add_dummy_feature`, `minmax_scale`, `power_transform` |
+| `sklearn.preprocessing` | `KernelCenterer`, `add_dummy_feature`, `power_transform` |
 | `sklearn.impute` | `MissingIndicator` |
 | `sklearn.feature_selection` | `GenericUnivariateSelect`, `SelectorMixin`, `mutual_info_classif`, `mutual_info_regression`, `r_regression` |
 | `sklearn.feature_extraction` | `DictVectorizer`, `FeatureHasher` |

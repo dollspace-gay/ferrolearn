@@ -11,8 +11,9 @@
 //!   * RED pins — the constant/zero-range column divergence; these FAIL today
 //!     and must be flipped by the generator (tracking blocker #1170).
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::MinMaxScaler;
+use ferrolearn_preprocess::{MinMaxScaler, minmax_scale};
 use ndarray::array;
 
 // ===========================================================================
@@ -191,6 +192,72 @@ fn req3_feature_range_validation_rejects() {
     // sklearn: (1,0) -> ValueError; (1,1) -> ValueError (_data.py:475-479).
     assert!(MinMaxScaler::<f64>::with_feature_range(1.0, 0.0).is_err());
     assert!(MinMaxScaler::<f64>::with_feature_range(1.0, 1.0).is_err());
+}
+
+// ===========================================================================
+// REQ-9 — minmax_scale free function + axis
+// ===========================================================================
+
+/// REQ-9: `minmax_scale(X, axis=0)` mirrors sklearn's functional wrapper,
+/// which delegates to `MinMaxScaler(...).fit_transform(X)` (`_data.py:731`).
+/// Live oracle:
+/// `minmax_scale([[-2.,1.,2.],[-1.,0.,1.]], axis=0)`
+/// -> `[[0.0,1.0,1.0],[1.0,0.0,0.0]]`.
+#[test]
+fn req9_minmax_scale_axis0_matches_sklearn() {
+    let sk = array![[0.0, 1.0, 1.0], [1.0, 0.0, 0.0]];
+    let x = array![[-2.0_f64, 1.0, 2.0], [-1.0, 0.0, 1.0]];
+    let out = minmax_scale(&x, (0.0, 1.0), 0).unwrap();
+    for (a, b) in out.iter().zip(sk.iter()) {
+        assert!((a - b).abs() < 1e-12, "got {a}, sklearn {b}");
+    }
+}
+
+/// REQ-9: `minmax_scale(X, axis=1)` mirrors sklearn's row-wise branch,
+/// `MinMaxScaler(...).fit_transform(X.T).T` (`_data.py:733-734`).
+/// Live oracle:
+/// `minmax_scale([[-2.,1.,2.],[-1.,0.,1.]], axis=1)`
+/// -> `[[0.0,0.75,1.0],[0.0,0.5,1.0]]`.
+#[test]
+fn req9_minmax_scale_axis1_matches_sklearn() {
+    let sk = array![[0.0, 0.75, 1.0], [0.0, 0.5, 1.0]];
+    let x = array![[-2.0_f64, 1.0, 2.0], [-1.0, 0.0, 1.0]];
+    let out = minmax_scale(&x, (0.0, 1.0), 1).unwrap();
+    for (a, b) in out.iter().zip(sk.iter()) {
+        assert!((a - b).abs() < 1e-12, "got {a}, sklearn {b}");
+    }
+}
+
+/// REQ-9: custom `feature_range` is threaded through the functional wrapper.
+/// Live oracle:
+/// `minmax_scale([[0.],[5.],[10.]], feature_range=(-1,1), axis=0)`
+/// -> `[[-1.0],[0.0],[1.0]]`.
+#[test]
+fn req9_minmax_scale_custom_range_matches_sklearn() {
+    let sk = array![[-1.0], [0.0], [1.0]];
+    let x = array![[0.0_f64], [5.0], [10.0]];
+    let out = minmax_scale(&x, (-1.0, 1.0), 0).unwrap();
+    for (a, b) in out.iter().zip(sk.iter()) {
+        assert!((a - b).abs() < 1e-12, "got {a}, sklearn {b}");
+    }
+}
+
+/// REQ-9: invalid `axis` is rejected before fitting, matching sklearn's
+/// two-valued axis contract for the functional helper.
+#[test]
+fn req9_minmax_scale_invalid_axis_errors() {
+    let x = array![[1.0, 2.0]];
+    let err = minmax_scale(&x, (0.0, 1.0), 2).unwrap_err();
+    assert!(matches!(err, FerroError::InvalidParameter { .. }));
+}
+
+/// REQ-9: invalid `feature_range` is rejected through the same constructor
+/// guard as the estimator path.
+#[test]
+fn req9_minmax_scale_invalid_feature_range_errors() {
+    let x = array![[1.0, 2.0]];
+    let err = minmax_scale(&x, (1.0, 1.0), 0).unwrap_err();
+    assert!(matches!(err, FerroError::InvalidParameter { .. }));
 }
 
 // ===========================================================================

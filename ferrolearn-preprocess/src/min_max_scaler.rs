@@ -23,7 +23,7 @@
 //! | REQ-5 (scale_/min_/data_range_/n_samples_seen_) | SHIPPED | FIXED #1172. `Fit::fit` computes `data_range_[j]=data_max[j]-data_min[j]`, `scale_[j]=(fr1-fr0)/handle_zeros(data_range_[j])`, `min_[j]=fr0-data_min[j]*scale_[j]`, `n_samples_seen_=n_rows`, mirroring sklearn (`_data.py:507-514`, `_handle_zeros_in_scale` `:88`). Additive: getters `scale()`/`min()`/`data_range()`/`n_samples_seen()`; `transform`/`inverse_transform` unchanged. Live-oracle tests `min_max_attrs_match_sklearn`, `min_max_scale_handles_zero_range_constant_col`. |
 //! | REQ-6 (inverse_transform) | SHIPPED | FIXED #1173. `FittedMinMaxScaler::inverse_transform` reverses the affine map: per column `j`, `x_orig = (x_scaled - fr0) * span / range_width + data_min[j]` (`span = data_max[j]-data_min[j]`, `range_width = fr1-fr0`), matching sklearn `X -= self.min_; X /= self.scale_` (`_data.py:549-587`,`:508-511`,`:88`). The single formula round-trips both regular and constant columns (`span==0 -> data_min[j]`). `ShapeMismatch` on column-count mismatch (mirrors `transform`). Oracle-grounded in-module tests: `min_max_inverse_roundtrip_matches_sklearn`, `min_max_inverse_custom_range_matches_sklearn`, `min_max_inverse_constant_col`, `min_max_inverse_shape_mismatch`. Consumer: crate re-export (`lib.rs:118`, grandfathered S5). |
 //! | REQ-8 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1174. Single-shot fit (`_data.py:489-515`). |
-//! | REQ-9 (minmax_scale free fn + axis) | NOT-STARTED | open prereq blocker #1175. No free fn / axis=1 (`_data.py:589`). |
+//! | REQ-9 (minmax_scale free fn + axis) | SHIPPED | `minmax_scale` free fn delegates to `MinMaxScaler::with_feature_range` (`axis=0` native column-wise scaling, `axis=1` transpose -> fit/transform -> transpose back), mirroring sklearn `minmax_scale` (`_data.py:589`,`:731-734`). `copy` remains an accept-and-document no-op under ferrolearn's owned-return transform contract, and the Rust API accepts `Array2` like the estimator path rather than sklearn's additional 1D convenience reshape. Live-oracle tests in `tests/divergence_min_max_scaler.rs`: `req9_minmax_scale_axis0_matches_sklearn`, `req9_minmax_scale_axis1_matches_sklearn`, `req9_minmax_scale_custom_range_matches_sklearn`, `req9_minmax_scale_invalid_axis_errors`, `req9_minmax_scale_invalid_feature_range_errors`. |
 //! | REQ-10 (copy / clip params) | SHIPPED | FIXED #1176. `MinMaxScaler<F>` gains `clip: bool` (default `false`) + `#[must_use] with_clip` builder + `clip()` getter, threaded onto `FittedMinMaxScaler`. `Transform::transform` applies a NaN-safe element-wise clamp to `[feature_range.0, feature_range.1]` AFTER the affine map when `clip` is set (`if x < lo {lo} else if x > hi {hi} else {x}` leaves NaN unchanged), mirroring sklearn `if self.clip: np.clip(X, fr[0], fr[1])` (`_data.py:411`,`:545-546`). `copy: bool` (default `true`) + `with_copy`/`copy()` is an ACCEPT-AND-DOCUMENT no-op: ferrolearn's `Transform` always returns a fresh array, so `copy` has no observable effect (documented; behavior unchanged). Live-oracle tests `req10_clip_default_range_out_of_range_holdout`, `req10_clip_custom_range_out_of_range_holdout`, `req10_clip_with_nan_passthrough`, `req10_copy_is_no_op_on_values`. Consumers: PyO3 `_RsMinMaxScaler` + `FittedPipelineTransformer` + re-export `lib.rs:118`. (`_parameter_constraints` validation surface stays as the existing `with_feature_range` guard, REQ-3.) |
 //! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1177. None (OneToOneFeatureMixin). |
 //! | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1178. `ndarray`+`num_traits`, not `ferray-core` (R-SUBSTRATE-1/2). |
@@ -508,6 +508,50 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for MinMaxScaler<
     fn fit_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
+    }
+}
+
+/// Scale each feature or sample to a target range.
+///
+/// This is the functional form of [`MinMaxScaler`], mirroring scikit-learn's
+/// `minmax_scale(X, feature_range=(0, 1), axis=0, copy=True)`
+/// (`sklearn/preprocessing/_data.py:589`):
+///
+/// - `axis == 0` scales each feature/column independently, equivalent to
+///   `MinMaxScaler::with_feature_range(...).fit_transform(X)`.
+/// - `axis == 1` scales each sample/row independently by applying the column
+///   scaler to `X.T`, then transposing the result back.
+///
+/// The sklearn `copy` parameter is intentionally omitted: ferrolearn transforms
+/// always return an owned array, so the input is never modified in place.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `axis` is not `0` or `1`, or if
+/// `feature_range.0 >= feature_range.1`. Otherwise, propagates the same
+/// validation errors as [`MinMaxScaler`].
+#[must_use = "minmax_scale returns the scaled array; use the returned value"]
+pub fn minmax_scale<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    feature_range: (F, F),
+    axis: usize,
+) -> Result<Array2<F>, FerroError> {
+    if axis != 0 && axis != 1 {
+        return Err(FerroError::InvalidParameter {
+            name: "axis".into(),
+            reason: format!("axis should be either equal to 0 or 1. Got axis={axis}"),
+        });
+    }
+
+    let scaler = MinMaxScaler::<F>::with_feature_range(feature_range.0, feature_range.1)?;
+    if axis == 0 {
+        let fitted = scaler.fit(x, &())?;
+        fitted.transform(x)
+    } else {
+        let xt = x.t().to_owned();
+        let fitted = scaler.fit(&xt, &())?;
+        let out_t = fitted.transform(&xt)?;
+        Ok(out_t.t().to_owned())
     }
 }
 

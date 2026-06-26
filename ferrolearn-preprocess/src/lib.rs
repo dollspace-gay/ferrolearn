@@ -136,7 +136,7 @@ pub use function_transformer::FunctionTransformer;
 pub use imputer::{FittedSimpleImputer, ImputeStrategy, SimpleImputer};
 pub use label_encoder::{FittedLabelEncoder, LabelEncoder};
 pub use max_abs_scaler::{FittedMaxAbsScaler, MaxAbsScaler, maxabs_scale};
-pub use min_max_scaler::{FittedMinMaxScaler, MinMaxScaler};
+pub use min_max_scaler::{FittedMinMaxScaler, MinMaxScaler, minmax_scale};
 pub use normalizer::Normalizer;
 pub use one_hot_encoder::{FittedOneHotEncoder, OneHotDrop, OneHotEncoder, OneHotHandleUnknown};
 pub use ordinal_encoder::{Categories, FittedOrdinalEncoder, HandleUnknown, OrdinalEncoder};
