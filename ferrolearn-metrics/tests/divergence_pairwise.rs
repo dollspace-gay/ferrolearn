@@ -9,8 +9,8 @@
 //! `manhattan_distances`, `cosine_similarity`, `cosine_distances`,
 //! `chebyshev_distances`,
 //! `nan_euclidean_distances`, `pairwise_distances` via `Metric`,
-//! `paired_*`, `pairwise_distances_argmin`/`_argmin_min`,
-//! `pairwise_kernels` rbf)
+//! `haversine_distances`, `paired_*`, `pairwise_distances_argmin`/`_argmin_min`,
+//! `pairwise_kernels`, and the named chi2/laplacian helpers)
 //! reproduce sklearn's exact float64 values on every case probed — including
 //! the rounding-level results (e.g. `cosine_distances([[1,1]],[[-1,-1]]) ==
 //! 1.9999999999999998` matches sklearn to the ULP).
@@ -19,9 +19,8 @@
 //! pairwise.md`) are ALL ABI / missing-surface gaps that are NOT pinnable as
 //! failing tests on the existing API (a missing function/param cannot be
 //! called): no `squared=`, no `missing_values=`, no string-metric ABI, no
-//! kernel defaults, missing `chi2`/`additive_chi2`/`cosine` kernels,
-//! `haversine`/`chunked`, no PyO3 binding. They are tracked as
-//! NOT-STARTED REQs (blockers #791-#803), not as RED pins.
+//! kernel defaults, chunked generation, no PyO3 binding. They are tracked as
+//! NOT-STARTED REQs, not as RED pins.
 //!
 //! Two diagonal probes were run and did NOT reproduce a divergence:
 //!   - euclidean `X==X` diagonal (f32 AND large-magnitude f64): ferrolearn
@@ -38,10 +37,12 @@
 //! contracts are correct and must stay green.
 
 use ferrolearn_metrics::pairwise::{
-    Metric, PairwiseKernel, chebyshev_distances, cosine_distances, cosine_similarity,
-    euclidean_distances, manhattan_distances, nan_euclidean_distances, paired_cosine_distances,
-    paired_distances, paired_euclidean_distances, paired_manhattan_distances, pairwise_distances,
-    pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels,
+    Metric, PairwiseKernel, additive_chi2_kernel, chebyshev_distances, chi2_kernel,
+    cosine_distances, cosine_similarity, distance_metrics, euclidean_distances,
+    haversine_distances, kernel_metrics, laplacian_kernel, manhattan_distances,
+    nan_euclidean_distances, paired_cosine_distances, paired_distances, paired_euclidean_distances,
+    paired_manhattan_distances, pairwise_distances, pairwise_distances_argmin,
+    pairwise_distances_argmin_min, pairwise_kernels,
 };
 use ndarray::array;
 
@@ -432,5 +433,186 @@ fn green_pairwise_kernels_rbf() {
         (k[[1, 0]] - SK1).abs() < 1e-18,
         "rbf[1]: sklearn={SK1}, ferrolearn={}",
         k[[1, 0]]
+    );
+}
+
+/// Guard: `laplacian_kernel` matches sklearn's standalone helper at explicit
+/// `gamma=0.5`.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     laplacian_kernel as l; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(l(X,Y,gamma=.5).tolist())"
+///   # [[0.6065306597126334, 0.36787944117144233],
+///   #  [0.36787944117144233, 0.6065306597126334]]
+#[test]
+fn green_laplacian_kernel_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let k = laplacian_kernel(&x, &y, 0.5).unwrap();
+    const SK: [[f64; 2]; 2] = [
+        [0.6065306597126334, 0.36787944117144233],
+        [0.36787944117144233, 0.6065306597126334],
+    ];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (k[[i, j]] - SK[i][j]).abs() < 1e-15,
+                "laplacian_kernel[{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                k[[i, j]]
+            );
+        }
+    }
+}
+
+/// Guard: `additive_chi2_kernel` matches sklearn, including zero-denominator
+/// terms contributing 0.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     additive_chi2_kernel as a; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(a(X,Y).tolist())"
+///   # [[-1.0, -2.0], [-2.0, -1.0]]
+#[test]
+fn green_additive_chi2_kernel_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let k = additive_chi2_kernel(&x, &y).unwrap();
+    const SK: [[f64; 2]; 2] = [[-1.0, -2.0], [-2.0, -1.0]];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (k[[i, j]] - SK[i][j]).abs() < 1e-12,
+                "additive_chi2_kernel[{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                k[[i, j]]
+            );
+        }
+    }
+    assert!(
+        additive_chi2_kernel(&array![[1.0_f64, -1.0]], &array![[1.0_f64, 1.0]]).is_err(),
+        "sklearn raises ValueError when X contains negative values"
+    );
+}
+
+/// Guard: `chi2_kernel` is `exp(gamma * additive_chi2_kernel)`, matching
+/// sklearn at `gamma=1`.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     chi2_kernel as c; X=np.array([[0.,0.,0.],[1.,1.,1.]]); \
+///     Y=np.array([[1.,0.,0.],[1.,1.,0.]]); print(c(X,Y).tolist())"
+///   # [[0.36787944117144233, 0.1353352832366127],
+///   #  [0.1353352832366127, 0.36787944117144233]]
+#[test]
+fn green_chi2_kernel_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let k = chi2_kernel(&x, &y, 1.0).unwrap();
+    const SK: [[f64; 2]; 2] = [
+        [0.36787944117144233, 0.1353352832366127],
+        [0.1353352832366127, 0.36787944117144233],
+    ];
+    for i in 0..2 {
+        for j in 0..2 {
+            assert!(
+                (k[[i, j]] - SK[i][j]).abs() < 1e-15,
+                "chi2_kernel[{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                k[[i, j]]
+            );
+        }
+    }
+    assert!(
+        chi2_kernel(&x, &y, 0.0).is_err(),
+        "sklearn rejects gamma=0 for chi2_kernel"
+    );
+}
+
+/// Guard: `haversine_distances` matches sklearn angular output for `(lat, lon)`
+/// rows in radians.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics.pairwise import \
+///     haversine_distances as h; X=np.array([[0.,0.],[0.,np.pi/2],\
+///     [np.pi/2,0.]]); print(h(X,X[:2]).tolist())"
+///   # [[0.0, 1.5707963267948963],
+///   #  [1.5707963267948963, 0.0],
+///   #  [1.5707963267948963, 1.5707963267948963]]
+#[test]
+fn green_haversine_distances_matches_sklearn() {
+    let x = array![
+        [0.0_f64, 0.0],
+        [0.0, std::f64::consts::FRAC_PI_2],
+        [std::f64::consts::FRAC_PI_2, 0.0]
+    ];
+    let y = array![[0.0_f64, 0.0], [0.0, std::f64::consts::FRAC_PI_2]];
+    let d = haversine_distances(&x, &y).unwrap();
+    const SK: [[f64; 2]; 3] = [
+        [0.0, 1.5707963267948963],
+        [1.5707963267948963, 0.0],
+        [1.5707963267948963, 1.5707963267948963],
+    ];
+    for i in 0..3 {
+        for j in 0..2 {
+            assert!(
+                (d[[i, j]] - SK[i][j]).abs() < 1e-15,
+                "haversine_distances[{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                d[[i, j]]
+            );
+        }
+    }
+    assert!(
+        haversine_distances(&array![[0.0_f64, 0.0, 0.0]], &array![[0.0_f64, 0.0, 0.0]]).is_err(),
+        "sklearn rejects haversine inputs that are not 2D coordinates"
+    );
+}
+
+/// Guard: registry helpers expose the same sklearn metric keys.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "from sklearn.metrics.pairwise import distance_metrics, \
+///     kernel_metrics; print(sorted(distance_metrics().keys())); \
+///     print(sorted(kernel_metrics().keys()))"
+///   # ['cityblock', 'cosine', 'euclidean', 'haversine', 'l1', 'l2',
+///   #  'manhattan', 'nan_euclidean', 'precomputed']
+///   # ['additive_chi2', 'chi2', 'cosine', 'laplacian', 'linear', 'poly',
+///   #  'polynomial', 'rbf', 'sigmoid']
+#[test]
+fn green_registry_metric_names_match_sklearn() {
+    let mut distance = distance_metrics().to_vec();
+    distance.sort_unstable();
+    assert_eq!(
+        distance,
+        vec![
+            "cityblock",
+            "cosine",
+            "euclidean",
+            "haversine",
+            "l1",
+            "l2",
+            "manhattan",
+            "nan_euclidean",
+            "precomputed"
+        ]
+    );
+
+    let mut kernels = kernel_metrics().to_vec();
+    kernels.sort_unstable();
+    assert_eq!(
+        kernels,
+        vec![
+            "additive_chi2",
+            "chi2",
+            "cosine",
+            "laplacian",
+            "linear",
+            "poly",
+            "polynomial",
+            "rbf",
+            "sigmoid"
+        ]
     );
 }

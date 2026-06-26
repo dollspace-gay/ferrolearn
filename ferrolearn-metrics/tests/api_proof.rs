@@ -17,6 +17,7 @@ use ferrolearn_metrics::{
     // Scorer
     Scorer,
     accuracy_score,
+    additive_chi2_kernel,
     adjusted_mutual_info,
     adjusted_rand_score,
     auc,
@@ -26,6 +27,7 @@ use ferrolearn_metrics::{
     calibration_curve,
     calinski_harabasz_score,
     chebyshev_distances,
+    chi2_kernel,
     classification_report,
     cohen_kappa_score,
     completeness_score,
@@ -37,6 +39,7 @@ use ferrolearn_metrics::{
     // Ranking
     dcg_score,
     det_curve,
+    distance_metrics,
     euclidean_distances,
     // Regression
     explained_variance_score,
@@ -44,10 +47,13 @@ use ferrolearn_metrics::{
     fbeta_score,
     fowlkes_mallows_score,
     hamming_loss,
+    haversine_distances,
     hinge_loss,
     homogeneity_completeness_v_measure,
     homogeneity_score,
     jaccard_score,
+    kernel_metrics,
+    laplacian_kernel,
     log_loss,
     make_scorer,
     manhattan_distances,
@@ -253,6 +259,11 @@ fn api_proof_pairwise() {
     let _ = cosine_distances::<f64>(&x, &y).unwrap();
     let _ = cosine_similarity::<f64>(&x, &y).unwrap();
     let _ = chebyshev_distances::<f64>(&x, &y).unwrap();
+    let _ = haversine_distances::<f64>(
+        &ndarray::array![[0.0, 0.0], [0.0, std::f64::consts::FRAC_PI_2]],
+        &ndarray::array![[0.0, 0.0]],
+    )
+    .unwrap();
     let _ = paired_euclidean_distances::<f64>(&x, &y_paired).unwrap();
     let _ = paired_manhattan_distances::<f64>(&x, &y_paired).unwrap();
     let _ = paired_cosine_distances::<f64>(&x, &y_paired).unwrap();
@@ -269,6 +280,14 @@ fn api_proof_pairwise() {
     let mut x_nan = x.clone();
     x_nan[[0, 0]] = f64::NAN;
     let _ = nan_euclidean_distances::<f64>(&x_nan, &y).unwrap();
+
+    let x_nonneg: Array2<f64> = ndarray::array![[0.0, 0.0, 0.0], [1.0, 1.0, 1.0]];
+    let y_nonneg: Array2<f64> = ndarray::array![[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]];
+    let _ = additive_chi2_kernel::<f64>(&x_nonneg, &y_nonneg).unwrap();
+    let _ = chi2_kernel::<f64>(&x_nonneg, &y_nonneg, 1.0).unwrap();
+    let _ = laplacian_kernel::<f64>(&x_nonneg, &y_nonneg, 0.5).unwrap();
+    assert!(distance_metrics().contains(&"haversine"));
+    assert!(kernel_metrics().contains(&"chi2"));
 
     let idx = pairwise_distances_argmin::<f64>(&x, &y, Metric::Euclidean).unwrap();
     assert_eq!(idx.len(), 3);
@@ -289,8 +308,11 @@ fn api_proof_pairwise() {
             coef0: 0.0,
         },
         PairwiseKernel::Laplacian { gamma: 0.5 },
+        PairwiseKernel::Cosine,
+        PairwiseKernel::AdditiveChi2,
+        PairwiseKernel::Chi2 { gamma: 1.0 },
     ] {
-        let _ = pairwise_kernels::<f64>(&x, &y, kernel).unwrap();
+        let _ = pairwise_kernels::<f64>(&x_nonneg, &y_nonneg, kernel).unwrap();
     }
 }
 

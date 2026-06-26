@@ -49,7 +49,11 @@
 //! | [`pairwise::cosine_similarity`] | Normalized dot-product similarity |
 //! | [`pairwise::cosine_distances`] | `1 - cosine_similarity` pairwise distances |
 //! | [`pairwise::chebyshev_distances`] | L-infinity pairwise distances |
+//! | [`pairwise::haversine_distances`] | Angular great-circle distances |
 //! | [`pairwise::paired_distances`] | Row-wise distances between paired rows |
+//! | [`pairwise::chi2_kernel`] | Exponential chi-squared kernel |
+//! | [`pairwise::additive_chi2_kernel`] | Additive chi-squared kernel |
+//! | [`pairwise::laplacian_kernel`] | Laplacian kernel |
 //!
 //! ## Example
 //!
@@ -95,11 +99,12 @@ pub use clustering::{
     silhouette_score, v_measure_score,
 };
 pub use pairwise::{
-    DistanceMetric, Metric, PairwiseKernel, chebyshev_distances, cosine_distances,
-    cosine_similarity, euclidean_distances, manhattan_distances, nan_euclidean_distances,
-    paired_cosine_distances, paired_distances, paired_euclidean_distances,
-    paired_manhattan_distances, pairwise_distances, pairwise_distances_argmin,
-    pairwise_distances_argmin_min, pairwise_kernels,
+    DISTANCE_METRIC_NAMES, DistanceMetric, KERNEL_METRIC_NAMES, Metric, PairwiseKernel,
+    additive_chi2_kernel, chebyshev_distances, chi2_kernel, cosine_distances, cosine_similarity,
+    distance_metrics, euclidean_distances, haversine_distances, kernel_metrics, laplacian_kernel,
+    manhattan_distances, nan_euclidean_distances, paired_cosine_distances, paired_distances,
+    paired_euclidean_distances, paired_manhattan_distances, pairwise_distances,
+    pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels,
 };
 pub use ranking::{
     coverage_error, dcg_score, label_ranking_average_precision_score, label_ranking_loss,

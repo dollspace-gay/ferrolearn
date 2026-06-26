@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 100 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 94 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -68,7 +68,6 @@ public Rust surface after the alias normalization above.
 | `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
 | `sklearn.compose` | `make_column_selector` |
 | `sklearn.metrics` | `class_likelihood_ratios`, `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `consensus_score`, `pairwise_distances_chunked`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
-| `sklearn.metrics.pairwise` | `additive_chi2_kernel`, `chi2_kernel`, `distance_metrics`, `haversine_distances`, `kernel_metrics`, `laplacian_kernel` |
 | `sklearn.model_selection` | `check_cv`, `ParameterGrid`, `ParameterSampler`, `LearningCurveDisplay`, `ValidationCurveDisplay` |
 | `sklearn.calibration` | `CalibrationDisplay` |
 | `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |
@@ -81,10 +80,10 @@ The following scoped modules had no exact public-item miss in this pass:
 `sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
 `sklearn.discriminant_analysis`, `sklearn.pipeline`, `sklearn.preprocessing`,
 `sklearn.random_projection`, `sklearn.semi_supervised`,
-`sklearn.kernel_ridge`, `sklearn.gaussian_process`, `sklearn.covariance`,
-`sklearn.neural_network`, `sklearn.dummy`, `sklearn.multiclass`,
-`sklearn.multioutput`, and `sklearn.isotonic`. This means only that names
-exist; it is not a value- or contract-parity claim.
+`sklearn.metrics.pairwise`, `sklearn.kernel_ridge`, `sklearn.gaussian_process`,
+`sklearn.covariance`, `sklearn.neural_network`, `sklearn.dummy`,
+`sklearn.multiclass`, `sklearn.multioutput`, and `sklearn.isotonic`. This means
+only that names exist; it is not a value- or contract-parity claim.
 
 ## Whole Areas Outside the Exact Gap Count
 

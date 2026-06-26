@@ -8,7 +8,7 @@ upstream: scikit-learn 1.5.2 (commit 156ef14)
 upstream-paths:
   - sklearn/metrics/pairwise.py   # euclidean_distances (:268); _euclidean_distances (:375); nan_euclidean_distances (:430); haversine_distances (:973); manhattan_distances (:1034); cosine_distances (:1094); paired_euclidean_distances (:1146); paired_manhattan_distances (:1190); paired_cosine_distances (:1224); paired_distances (:1262); linear_kernel (:1351); polynomial_kernel (:1403); sigmoid_kernel (:1466); rbf_kernel (:1524); laplacian_kernel (:1580); cosine_similarity (:1634); additive_chi2_kernel (:1696); chi2_kernel (:1772); pairwise_distances_argmin_min (:692); pairwise_distances_argmin (:841); pairwise_distances_chunked (:2013); pairwise_distances (:2196); pairwise_kernels (:2469)
 ferrolearn-module: ferrolearn-metrics/src/pairwise.rs
-parity-ops: euclidean_distances, manhattan_distances, cosine_distances, chebyshev_distances, nan_euclidean_distances, pairwise_distances, pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels
+parity-ops: euclidean_distances, manhattan_distances, cosine_similarity, cosine_distances, chebyshev_distances, haversine_distances, nan_euclidean_distances, paired_euclidean_distances, paired_manhattan_distances, paired_cosine_distances, paired_distances, additive_chi2_kernel, chi2_kernel, laplacian_kernel, distance_metrics, kernel_metrics, pairwise_distances, pairwise_distances_argmin, pairwise_distances_argmin_min, pairwise_kernels
 crosslink-issue: 788
 -->
 
@@ -49,19 +49,18 @@ function **diverges from sklearn on the API/ABI contract** in at least one of:
    Chebyshev) — sklearn's `pairwise_distances` accepts a **string metric ABI**
    covering `euclidean`/`l2`/`manhattan`/`l1`/`cityblock`/`cosine`/`chebyshev`
    plus the full scipy `cdist` metric set (`:2196`, `_VALID_METRICS`).
-5. **The `PairwiseKernel<F>` enum requires explicit params with no defaults** and
-   omits three sklearn kernels — sklearn `pairwise_kernels` accepts the string set
+5. **The `PairwiseKernel<F>` enum requires explicit params with no defaults** —
+   sklearn `pairwise_kernels` accepts the string set
    `{linear, poly/polynomial, rbf, sigmoid, laplacian, cosine, chi2,
    additive_chi2}` with `gamma=1/n_features` / `coef0`/`degree` defaults
    (`:2469`, `PAIRWISE_KERNEL_FUNCTIONS`).
 
-Beyond the present functions, a large part of `pairwise.py` is **routed here but
-NOT implemented**: `haversine_distances`, the `paired_*` family
-(`paired_euclidean_distances`/`paired_manhattan_distances`/
-`paired_cosine_distances`/`paired_distances`), the named kernel functions
-(`linear_kernel`/`polynomial_kernel`/`sigmoid_kernel`/`rbf_kernel`/
-`laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel`), `cosine_similarity`,
-and `pairwise_distances_chunked`. These are NOT-STARTED REQs.
+Beyond the present functions, the routed but NOT implemented pieces are now
+the chunked generator (`pairwise_distances_chunked`) and the remaining
+standalone kernel helper names (`linear_kernel`/`polynomial_kernel`/
+`sigmoid_kernel`/`rbf_kernel`). ferrolearn exposes their formulas through
+`PairwiseKernel<F>`, but not as those Python-named free functions with sklearn's
+default-parameter ABI.
 
 All present functions are existing pub APIs re-exported at the crate root
 (`lib.rs`: `pub use pairwise::{ … }`); they are grandfathered under
@@ -139,15 +138,15 @@ sigmoid}`). Defaults: `gamma = 1/n_features` when `None`
 - **additive_chi2** (`:1696`): `−Σ (x−y)²/(x+y)`.
 - **cosine** = `cosine_similarity` (`:1634`).
 
-### Functions with no ferrolearn counterpart
+### Additional sklearn functions in this module
 
 - **haversine_distances** (`:973`): great-circle distance, 2-feature
   `(lat, lon)` in radians.
 - **paired_euclidean/manhattan/cosine_distances**, **paired_distances**
   (`:1146`-`:1281`): elementwise row-paired distance — `X` and `Y` same shape,
   output shape `(n_samples,)`, NOT a full `(n, m)` matrix.
-- **cosine_similarity** (`:1634`): standalone similarity (ferrolearn computes it
-  inline inside `cosine_distances` but exposes no public function).
+- **cosine_similarity** (`:1634`): standalone normalized dot-product
+  similarity.
 - **pairwise_distances_chunked** (`:2013`): generator yielding distance-matrix
   chunks with an optional `reduce_func` for memory-bounded streaming.
 
@@ -172,6 +171,13 @@ All public functions live in `ferrolearn-metrics/src/pairwise.rs`, generic over
   features where neither value is NaN, `n_valid == 0 → NaN`, else
   `sqrt(sq_sum * n_features / n_valid)`. **Hardcodes NaN as the sentinel (no
   `missing_values` arg), no `squared` arg, no `X is Y` diagonal special-case.**
+- **`pub fn cosine_similarity`** — normalized dot-product similarity; zero rows
+  normalize to similarity `0.0`, matching sklearn.
+- **`pub fn haversine_distances`** — angular great-circle distance for
+  `(latitude, longitude)` rows in radians, requiring exactly two features.
+- **`pub fn paired_euclidean_distances`**, **`paired_manhattan_distances`**,
+  **`paired_cosine_distances`**, **`paired_distances`** — row-paired `(n,)`
+  outputs matching sklearn's paired-distance family.
 - **`pub fn pairwise_distances(x, y, metric: Metric)`** — dispatcher over the
   **`Metric`** enum `{Euclidean, Manhattan, Cosine, Chebyshev}` — a closed
   4-variant set, **not** sklearn's string ABI / scipy metric set.
@@ -180,9 +186,13 @@ All public functions live in `ferrolearn-metrics/src/pairwise.rs`, generic over
 - **`pub fn pairwise_distances_argmin_min(x, y, metric)`** — `(idx, mins)`.
 - **`pub fn pairwise_kernels(x, y, kernel: PairwiseKernel<F>)`** — dispatcher
   over **`PairwiseKernel<F>`** `{Linear, Polynomial{degree,gamma,coef0},
-  Rbf{gamma}, Sigmoid{gamma,coef0}, Laplacian{gamma}}`. **All params explicit
-  (no `gamma=1/n_features` / `coef0=1` / `degree=3` defaults); omits
-  `chi2`, `additive_chi2`, `cosine`.**
+  Rbf{gamma}, Sigmoid{gamma,coef0}, Laplacian{gamma}, Cosine, AdditiveChi2,
+  Chi2{gamma}}`. **All params explicit (no `gamma=1/n_features` / `coef0=1` /
+  `degree=3` defaults).**
+- **`pub fn additive_chi2_kernel`**, **`chi2_kernel`**, **`laplacian_kernel`** —
+  standalone dense helpers for the sklearn-named chi2 and laplacian kernels.
+- **`pub fn distance_metrics`**, **`kernel_metrics`** — registry-name helpers
+  exposing the sklearn metric-key sets as Rust string slices.
 
 **Traits/types:** `pub trait DistanceMetric<F>` (the dyn-friendly `DistanceMetric`
 analog, with `pairwise` + a default `distance` for single points); `impl
@@ -193,8 +203,11 @@ special-cases cannot be expressed).
 
 **Consumers (non-test):** crate re-export — `lib.rs`
 `pub use pairwise::{ DistanceMetric, Metric, PairwiseKernel,
-chebyshev_distances, cosine_distances, euclidean_distances, manhattan_distances,
-nan_euclidean_distances, pairwise_distances, pairwise_distances_argmin,
+additive_chi2_kernel, chebyshev_distances, chi2_kernel, cosine_similarity,
+cosine_distances, distance_metrics, euclidean_distances, haversine_distances,
+kernel_metrics, laplacian_kernel, manhattan_distances, nan_euclidean_distances,
+paired_cosine_distances, paired_distances, paired_euclidean_distances,
+paired_manhattan_distances, pairwise_distances, pairwise_distances_argmin,
 pairwise_distances_argmin_min, pairwise_kernels }`. These are existing pub APIs
 (grandfathered, S5/R-DEFER-1). **No `ferrolearn-python` binding** exposes any
 pairwise function (REQ-13).
@@ -223,30 +236,31 @@ pairwise function (REQ-13).
   `:2196`: the **string `metric` ABI** (`euclidean`/`l2`, `manhattan`/`l1`/
   `cityblock`, `cosine`, `chebyshev`, `nan_euclidean`, `haversine`,
   `precomputed`, scipy set) with aliases. ferrolearn exposes a closed 4-variant
-  `Metric` enum — no string ABI, no scipy metrics, no `precomputed`/`haversine`.
+  `Metric` enum — no string ABI, no scipy metrics, no `precomputed` dispatch.
 - REQ-7: **`pairwise_kernels` dispatcher + kernel set (R-DEV-1/2).** Match
   `:2469`: the **string kernel ABI** `{linear, poly/polynomial, rbf, sigmoid,
   laplacian, cosine, chi2, additive_chi2}` with `gamma=1/n_features`/`coef0=1`/
   `degree=3` defaults. ferrolearn's `PairwiseKernel<F>` enum requires explicit
-  params and omits `cosine`/`chi2`/`additive_chi2`. (linear/poly/rbf/sigmoid/
-  laplacian formulas value-correct given matching params.)
+  params. All listed formulas are value-correct given matching params.
 - REQ-8: **`pairwise_distances_argmin` parity (R-DEV-1).** Match `:841`:
   nearest-row index, ties→first (matches), but `metric` is the `Metric` enum not
   the string ABI; chunking is internal sklearn detail (R-DEV-7, not observable).
 - REQ-9: **`pairwise_distances_argmin_min` parity (R-DEV-1/3).** Match `:692`:
   `(indices, min_distances)` — value-correct; same `metric`-ABI caveat as REQ-8.
-- REQ-10: **`cosine_similarity` (MISSING, R-DEV-1).** sklearn exposes a public
-  `cosine_similarity` (`:1634`); ferrolearn computes it only inline inside
-  `cosine_distances` — no public function.
-- REQ-11: **Named kernel functions (MISSING, R-DEV-1).** sklearn exposes
+- REQ-10: **`cosine_similarity` (R-DEV-1).** sklearn exposes a public
+  `cosine_similarity` (`:1634`); ferrolearn exposes a dense public helper that
+  matches sklearn's zero-row behavior.
+- REQ-11: **Named kernel functions (PARTIAL, R-DEV-1).** sklearn exposes
   `linear_kernel`/`polynomial_kernel`/`sigmoid_kernel`/`rbf_kernel`/
   `laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel` (`:1351`-`:1772`) as
-  standalone functions with their default-`gamma` contract; ferrolearn has none.
+  standalone functions with their default-`gamma` contract; ferrolearn now
+  exposes dense `laplacian_kernel`, `chi2_kernel`, and `additive_chi2_kernel`.
+  The linear/polynomial/sigmoid/rbf formulas remain enum-only.
 - REQ-12: **`paired_*` family + `haversine_distances` + `pairwise_distances_chunked`
-  (MISSING, R-DEV-1/3).** sklearn `paired_euclidean/manhattan/cosine_distances`,
-  `paired_distances` (`:1146`-`:1281`, output shape `(n_samples,)`),
-  `haversine_distances` (`:973`), and `pairwise_distances_chunked` (`:2013`,
-  streaming generator). None exist in ferrolearn.
+  (PARTIAL, R-DEV-1/3).** sklearn `paired_euclidean/manhattan/cosine_distances`,
+  `paired_distances` (`:1146`-`:1281`, output shape `(n_samples,)`), and
+  `haversine_distances` (`:973`) are now public and value-pinned; the
+  `pairwise_distances_chunked` streaming generator (`:2013`) is still missing.
 - REQ-13: **PyO3 binding (R-DEFER-1).** `import sklearn.metrics.pairwise` exposes
   these; `ferrolearn-python` exposes no pairwise shim.
 - REQ-14: **ferray substrate (R-SUBSTRATE).** `pairwise.rs` imports
@@ -286,15 +300,15 @@ never literal-copied from ferrolearn (R-CHAR-3).
   `polynomial_kernel(...)` → `[3.375, 15.625]` (`gamma=0.5,coef0=1,degree=3`);
   `chi2_kernel(...)` → `[0.13533528, 0.00673795]`. ferrolearn's `Rbf{gamma}` with
   `gamma=0.5` reproduces the rbf values, but the **default `gamma=1/n_features`**
-  is the caller's responsibility (no default), and `chi2`/`additive_chi2`/`cosine`
-  are absent.
+  is the caller's responsibility (no default).
 - AC-9 (REQ-8/9, must stay green): `pairwise_distances_argmin([[0,0]],
   [[1,0],[1,0],[2,0]])` → `[0]` (tie→first); `_argmin_min` → `([0],[1.0])`.
   ferrolearn matches.
-- AC-10 (REQ-10/11/12 MISSING): `cosine_similarity([[1,2],[3,4]],[[1,0]])` →
+- AC-10 (REQ-10/11/12 shipped/partial): `cosine_similarity([[1,2],[3,4]],[[1,0]])` →
   `[0.4472136, 0.6]`; `additive_chi2_kernel(...)` → `[-2,-5]`;
   `paired_euclidean_distances([[0,0],[1,1]],[[1,0],[1,2]])` → `[1.0, 1.0]`;
-  `haversine_distances` over `(lat,lon)` radians. None are callable in ferrolearn.
+  `haversine_distances` over `(lat,lon)` radians. These are now callable in
+  ferrolearn and pinned in `tests/divergence_pairwise.rs`.
 
 ## REQ status table
 
@@ -314,12 +328,12 @@ are NOT-STARTED.
 | REQ-4 (Chebyshev / `Metric::Chebyshev`) | NOT-STARTED | open prereq blocker #793. `pub fn chebyshev_distances` (`max|x−y|`) is value-correct vs `pairwise_distances(metric="chebyshev")`, but sklearn has **no named `chebyshev_distances`** — the ABI is the `"chebyshev"` string through scipy `cdist` (`:2196`). Folded into REQ-6: the named function + the 4-variant `Metric` enum are an ABI divergence. |
 | REQ-5 (`nan_euclidean_distances`) | NOT-STARTED | open prereq blocker #794. `pub fn nan_euclidean_distances` formula `sqrt(n_feat/n_present·sq)` + all-missing→NaN match `:540-547` (AC-5); but **hardcodes NaN (no `missing_values=`, `:508`,`:513`), no `squared=`, no `X is Y` diagonal** (`:532-535`). Pin AC-6: `missing_values=0` → sklearn `[[nan]]`, inexpressible. |
 | REQ-6 (`pairwise_distances` + metric ABI) | NOT-STARTED | open prereq blocker #795. `pub fn pairwise_distances(x,y,metric:Metric)` dispatches a **closed 4-variant `Metric` enum** `{Euclidean,Manhattan,Cosine,Chebyshev}`; sklearn `:2196` takes a **string `metric`** with aliases (`l1`/`cityblock`/`manhattan`, `l2`/`euclidean`) + the scipy `cdist` set + `precomputed`/`haversine`/`nan_euclidean`. Pin AC-7: `metric="cityblock"`==`"l1"`==`"manhattan"` — no alias surface. |
-| REQ-7 (`pairwise_kernels` + kernel set) | NOT-STARTED | open prereq blocker #796. `pub fn pairwise_kernels(x,y,kernel:PairwiseKernel<F>)`: linear/poly/rbf/sigmoid/laplacian formulas value-correct **given matching params**, but the enum **requires explicit `gamma`/`coef0`/`degree` (no `gamma=1/n_features`/`coef0=1`/`degree=3` defaults, `:2469`)** and **omits `cosine`/`chi2`/`additive_chi2`**. Pin AC-8: `chi2_kernel(...)`=`[0.1353,0.00674]` inexpressible; rbf value matches at `gamma=0.5`. |
+| REQ-7 (`pairwise_kernels` + kernel set) | PARTIAL | open prereq blocker #796. `pub fn pairwise_kernels(x,y,kernel:PairwiseKernel<F>)`: linear/poly/rbf/sigmoid/laplacian/cosine/chi2/additive_chi2 formulas are value-correct **given matching params**, but the enum **requires explicit `gamma`/`coef0`/`degree` (no `gamma=1/n_features`/`coef0=1`/`degree=3` defaults, `:2469`)**. Pins cover RBF and standalone chi2 helpers. |
 | REQ-8 (`pairwise_distances_argmin`) | NOT-STARTED | open prereq blocker #797. `pub fn pairwise_distances_argmin` nearest-row index, strict `<` ⇒ ties→first matches `:841` (AC-9); but `metric:Metric` not the string ABI (depends on REQ-6). |
 | REQ-9 (`pairwise_distances_argmin_min`) | NOT-STARTED | open prereq blocker #798. `pub fn pairwise_distances_argmin_min` `(idx,mins)` value-correct vs `:692` (AC-9); same `metric`-ABI dependence on REQ-6. |
-| REQ-10 (`cosine_similarity` MISSING) | NOT-STARTED | open prereq blocker #799. sklearn `:1634` exposes public `cosine_similarity`; ferrolearn computes it only inline inside `cosine_distances`, no public function. Pin AC-10: `cosine_similarity([[1,2],[3,4]],[[1,0]])`=`[0.4472,0.6]`. |
-| REQ-11 (named kernel functions MISSING) | NOT-STARTED | open prereq blocker #800. sklearn `linear_kernel`/`polynomial_kernel`/`sigmoid_kernel`/`rbf_kernel`/`laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel` (`:1351`-`:1772`) — standalone functions with default-`gamma`; ferrolearn has none (only the `PairwiseKernel` enum dispatcher). Pin AC-10: `additive_chi2_kernel(...)`=`[-2,-5]`. |
-| REQ-12 (`paired_*`/`haversine`/`chunked` MISSING) | NOT-STARTED | open prereq blocker #801. `paired_euclidean/manhattan/cosine_distances`+`paired_distances` (`:1146`-`:1281`, output `(n_samples,)`), `haversine_distances` (`:973`), `pairwise_distances_chunked` (`:2013`) — none exist. Pin AC-10: `paired_euclidean_distances([[0,0],[1,1]],[[1,0],[1,2]])`=`[1,1]`. |
+| REQ-10 (`cosine_similarity`) | SHIPPED | sklearn `:1634` exposes public `cosine_similarity`; `pub fn cosine_similarity` is value-pinned in `tests/divergence_pairwise.rs`, including zero-row behavior. |
+| REQ-11 (named kernel functions) | PARTIAL | open prereq blocker #800. sklearn `linear_kernel`/`polynomial_kernel`/`sigmoid_kernel`/`rbf_kernel`/`laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel` (`:1351`-`:1772`) — standalone functions with default-`gamma`; ferrolearn ships dense `laplacian_kernel`, `chi2_kernel`, and `additive_chi2_kernel`, while linear/poly/sigmoid/rbf remain enum-only. |
+| REQ-12 (`paired_*`/`haversine`/`chunked`) | PARTIAL | open prereq blocker #801. `paired_euclidean/manhattan/cosine_distances`+`paired_distances` (`:1146`-`:1281`, output `(n_samples,)`) and `haversine_distances` (`:973`) are value-pinned; `pairwise_distances_chunked` (`:2013`) is still missing. |
 | REQ-13 (PyO3 binding) | NOT-STARTED | open prereq blocker #802. `ferrolearn-python` exposes no pairwise shim; `import ferrolearn` cannot call what `import sklearn.metrics.pairwise` provides. |
 | REQ-14 (ferray substrate) | NOT-STARTED | open prereq blocker #803. `pairwise.rs` imports `ndarray::Array2`/`Array1` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). |
 
@@ -363,15 +377,11 @@ tie-break-to-first; the rbf/poly/sigmoid/laplacian/linear kernel formulas at
 matching params. **Invariants NOT held vs sklearn:** the `X is Y` self-distance
 diagonal-zeroing (euclidean/cosine/nan-euclidean); `squared=`/`missing_values=`
 options; the string metric ABI + aliases + scipy metric set; the string kernel
-ABI + `gamma`/`coef0`/`degree` defaults + `cosine`/`chi2`/`additive_chi2`
-kernels.
+ABI + `gamma`/`coef0`/`degree` defaults.
 
-**MISSING functions (routed, not implemented):** `cosine_similarity`,
-`linear_kernel`, `polynomial_kernel`, `sigmoid_kernel`, `rbf_kernel`,
-`laplacian_kernel`, `chi2_kernel`, `additive_chi2_kernel`,
-`paired_euclidean_distances`, `paired_manhattan_distances`,
-`paired_cosine_distances`, `paired_distances`, `haversine_distances`,
-`pairwise_distances_chunked` (REQ-10/11/12).
+**MISSING functions (routed, not implemented):** `linear_kernel`,
+`polynomial_kernel`, `sigmoid_kernel`, `rbf_kernel`,
+`pairwise_distances_chunked` (REQ-11/12).
 
 ## Verification
 
@@ -396,13 +406,13 @@ python3 -c "import numpy as np; from sklearn.metrics.pairwise import euclidean_d
 python3 -c "from sklearn.metrics.pairwise import nan_euclidean_distances as n; print(n([[0.,3]],[[0.,0]],missing_values=0))"   # [[nan]]
 # REQ-6 metric string aliases: ferro Metric enum has no string surface
 python3 -c "import numpy as np; from sklearn.metrics import pairwise_distances as p; X=np.array([[0.,0],[3,4]]); Y=np.array([[1.,2]]); print(p(X,Y,metric='cityblock').ravel(), p(X,Y,metric='l1').ravel(), p(X,Y,metric='chebyshev').ravel())"  # [3 4] [3 4] [2 2]
-# REQ-7 kernel defaults + chi2: ferro PairwiseKernel has no defaults, no chi2
+# REQ-7 kernel defaults: ferro PairwiseKernel has no default gamma/coef0/degree
 python3 -c "import numpy as np; from sklearn.metrics.pairwise import rbf_kernel as r, chi2_kernel as c; X=np.array([[1.,2],[3,4]]); Y=np.array([[1.,0]]); print(r(X,Y).ravel(), c(X,Y).ravel())"  # [0.1353 4.54e-5] [0.1353 0.00674]
-# REQ-10 cosine_similarity MISSING
+# REQ-10 cosine_similarity baseline
 python3 -c "import numpy as np; from sklearn.metrics.pairwise import cosine_similarity as cs; print(cs(np.array([[1.,2],[3,4]]),np.array([[1.,0]])).ravel())"  # [0.4472 0.6]
-# REQ-11 additive_chi2 MISSING
+# REQ-11 additive_chi2 baseline
 python3 -c "import numpy as np; from sklearn.metrics.pairwise import additive_chi2_kernel as a; print(a(np.array([[1.,2],[3,4]]),np.array([[1.,0]])).ravel())"  # [-2 -5]
-# REQ-12 paired_euclidean MISSING (output shape (n,))
+# REQ-12 paired_euclidean baseline (output shape (n,))
 python3 -c "from sklearn.metrics.pairwise import paired_euclidean_distances as pe; print(pe([[0.,0],[1,1]],[[1.,0],[1,2]]))"  # [1. 1.]
 # Value baselines that must stay green (already match):
 python3 -c "from sklearn.metrics.pairwise import euclidean_distances as e, cosine_distances as c, nan_euclidean_distances as n; print(e([[0.,0],[3,0]],[[0.,4]]).ravel(), c([[1.,0]],[[0.,0]]).ravel(), n([[float('nan'),3]],[[0.,0]]).ravel())"  # [4 5] [1.] [4.2426]
@@ -433,20 +443,18 @@ NOT-STARTED; each carries an open prereq blocker.
   `nan_euclidean` (`:2196`). Pin: `metric="cityblock"`==`"l1"`==`"manhattan"`.
 - #796 — REQ-7 (`pairwise_kernels`): `PairwiseKernel<F>` requires explicit
   `gamma`/`coef0`/`degree` (no `gamma=1/n_features`/`coef0=1`/`degree=3` defaults,
-  `:2469`); omits `cosine`/`chi2`/`additive_chi2`. Pin: `chi2_kernel` value.
+  `:2469`). Pin: `chi2_kernel` value.
 - #797 — REQ-8 (`pairwise_distances_argmin`): inherits the `Metric`-enum ABI
   (#795); tie→first matches.
 - #798 — REQ-9 (`pairwise_distances_argmin_min`): inherits the `Metric`-enum ABI
   (#795); values match.
-- #799 — REQ-10 (`cosine_similarity` MISSING): no public function (`:1634`). Pin:
-  `cosine_similarity([[1,2],[3,4]],[[1,0]])`=`[0.4472,0.6]`.
-- #800 — REQ-11 (named kernels MISSING): `linear_kernel`/`polynomial_kernel`/
-  `sigmoid_kernel`/`rbf_kernel`/`laplacian_kernel`/`chi2_kernel`/
-  `additive_chi2_kernel` (`:1351`-`:1772`). Pin: `additive_chi2_kernel`=`[-2,-5]`.
-- #801 — REQ-12 (`paired_*`/`haversine`/`chunked` MISSING): `paired_euclidean/
-  manhattan/cosine_distances`+`paired_distances` (`:1146`-`:1281`, output
-  `(n_samples,)`), `haversine_distances` (`:973`), `pairwise_distances_chunked`
-  (`:2013`). Pin: `paired_euclidean_distances([[0,0],[1,1]],[[1,0],[1,2]])`=`[1,1]`.
+- #799 — REQ-10 (`cosine_similarity`): public function shipped and value-pinned.
+- #800 — REQ-11 (named kernels PARTIAL): standalone `laplacian_kernel`,
+  `chi2_kernel`, and `additive_chi2_kernel` are shipped; `linear_kernel`/
+  `polynomial_kernel`/`sigmoid_kernel`/`rbf_kernel` remain enum-only.
+- #801 — REQ-12 (`paired_*`/`haversine`/`chunked` PARTIAL): `paired_euclidean/
+  manhattan/cosine_distances`+`paired_distances` and `haversine_distances` are
+  shipped; `pairwise_distances_chunked` (`:2013`) remains missing.
 - #802 — REQ-13: no `ferrolearn-python` pairwise binding.
 - #803 — REQ-14: migrate `pairwise.rs` off `ndarray`/`num-traits` to the ferray
   substrate (R-SUBSTRATE).

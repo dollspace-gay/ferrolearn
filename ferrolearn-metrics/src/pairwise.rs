@@ -11,7 +11,9 @@
 //! - [`manhattan_distances`] — L1 (Manhattan / city-block) distance
 //! - [`cosine_similarity`] — normalized dot-product similarity
 //! - [`cosine_distances`] — `1 - cosine_similarity`
+//! - [`haversine_distances`] — angular great-circle distance for `(lat, lon)`
 //! - [`paired_distances`] — row-wise distance dispatcher for paired arrays
+//! - [`distance_metrics`] / [`kernel_metrics`] — sklearn-style registry names
 //! - [`pairwise_distances`] — dispatcher that selects the above via the
 //!   [`Metric`] enum
 //!
@@ -20,8 +22,7 @@
 //! Mirrors `sklearn.metrics.pairwise` (`sklearn/metrics/pairwise.py`). See
 //! `.design/metrics/pairwise.md`. Non-test consumer: crate re-export. The
 //! present distance/kernel functions are value-correct vs the live oracle
-//! (verified to ULP); the missing standalone kernels / `haversine` / ABI params
-//! are NOT-STARTED.
+//! (verified to ULP); ABI params and chunked streaming remain NOT-STARTED.
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
@@ -31,11 +32,11 @@
 //! | REQ-4 | `nan_euclidean_distances` value: `weight = n_features/n_present` rescaling, all-NaN pair → NaN (`pairwise.py:430-540`) | SHIPPED |
 //! | REQ-5 | `pairwise_distances` dispatcher via `Metric` enum (== direct functions == sklearn) (`pairwise.py:2196`) | SHIPPED |
 //! | REQ-6 | `pairwise_distances_argmin` / `_argmin_min`: value + tie-break to first index (`pairwise.py:692,:841`) | SHIPPED |
-//! | REQ-7 | `pairwise_kernels` value for the present kernels (linear/polynomial/rbf/sigmoid/laplacian) (`pairwise.py:2469`) | SHIPPED |
-//! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | PARTIAL (`cosine_similarity` SHIPPED; standalone kernels NOT-STARTED #789) |
+//! | REQ-7 | `pairwise_kernels` value for the present kernels (linear/polynomial/rbf/sigmoid/laplacian/cosine/chi2/additive_chi2) (`pairwise.py:2469`) | SHIPPED |
+//! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | PARTIAL (`cosine_similarity`/`laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel` SHIPPED; linear/poly/rbf/sigmoid remain enum-only) |
 //! | REQ-9 | `paired_*` family (euclidean/manhattan/cosine/distances, `(n,)` output) | SHIPPED |
-//! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | NOT-STARTED (#791) |
-//! | REQ-11 | ABI params: `squared=`, `missing_values=`, string-metric aliases (`l1`/`l2`/`cityblock`), kernel defaults + chi2/additive_chi2/cosine in the kernel registry | NOT-STARTED (#792) |
+//! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | PARTIAL (`haversine_distances` SHIPPED; chunked NOT-STARTED #791) |
+//! | REQ-11 | ABI params: `squared=`, `missing_values=`, string-metric aliases (`l1`/`l2`/`cityblock`), kernel defaults + chi2/additive_chi2/cosine in the kernel registry | PARTIAL (registry-name helpers SHIPPED; Python string ABI/defaults NOT-STARTED #792) |
 //! | REQ-12 | `Y=None` self-distance API + arbitrary-magnitude diagonal-zeroing contract (`pairwise.py:414-415`) | NOT-STARTED (#793) |
 //! | REQ-13 | PyO3 binding | NOT-STARTED (#794) |
 //! | REQ-14 | ferray substrate migration | NOT-STARTED (#795) |
@@ -43,6 +44,32 @@
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
 use num_traits::Float;
+
+/// sklearn pairwise distance registry names supported by ferrolearn.
+pub const DISTANCE_METRIC_NAMES: &[&str] = &[
+    "cityblock",
+    "cosine",
+    "euclidean",
+    "haversine",
+    "l1",
+    "l2",
+    "manhattan",
+    "precomputed",
+    "nan_euclidean",
+];
+
+/// sklearn pairwise kernel registry names supported by ferrolearn.
+pub const KERNEL_METRIC_NAMES: &[&str] = &[
+    "additive_chi2",
+    "chi2",
+    "linear",
+    "polynomial",
+    "poly",
+    "rbf",
+    "laplacian",
+    "sigmoid",
+    "cosine",
+];
 
 /// Distance metric selector for [`pairwise_distances`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +218,28 @@ fn reject_infinite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
         return Err(FerroError::InvalidParameter {
             name: "X".to_string(),
             reason: "Input contains infinity or a value too large for dtype.".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Reject negative entries for kernels that require histogram-like inputs.
+fn reject_negative<F: Float>(x: &Array2<F>, name: &str) -> Result<(), FerroError> {
+    if x.iter().any(|v| *v < F::zero()) {
+        return Err(FerroError::InvalidParameter {
+            name: name.to_string(),
+            reason: format!("{name} contains negative values."),
+        });
+    }
+    Ok(())
+}
+
+/// Reject non-positive scale parameters where sklearn requires `gamma > 0`.
+fn reject_non_positive<F: Float>(value: F, name: &str) -> Result<(), FerroError> {
+    if value <= F::zero() || !value.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: name.to_string(),
+            reason: format!("{name} must be positive and finite."),
         });
     }
     Ok(())
@@ -445,6 +494,47 @@ where
     Ok(distances.mapv(|d| F::one() - d))
 }
 
+/// Compute pairwise Haversine angular distances for latitude/longitude rows.
+///
+/// Each row must contain exactly two features: latitude and longitude in
+/// radians. The returned values are angular distances; multiply by a sphere
+/// radius to obtain physical distances.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if the feature dimension is not 2.
+/// Returns [`FerroError::ShapeMismatch`] if `x` and `y` have different numbers
+/// of columns.
+pub fn haversine_distances<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    check_feature_dim(x, y, "haversine_distances")?;
+    check_non_empty(x, y, "haversine_distances")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
+    if x.ncols() != 2 {
+        return Err(FerroError::InvalidParameter {
+            name: "X".to_string(),
+            reason: "Haversine distance only valid in 2 dimensions.".to_string(),
+        });
+    }
+
+    let two = F::one() + F::one();
+    let half = F::from(0.5).unwrap();
+    let mut result = Array2::<F>::zeros((x.nrows(), y.nrows()));
+    for i in 0..x.nrows() {
+        for j in 0..y.nrows() {
+            let d_lat = (x[[i, 0]] - y[[j, 0]]) * half;
+            let d_lon = (x[[i, 1]] - y[[j, 1]]) * half;
+            let a = d_lat.sin() * d_lat.sin()
+                + x[[i, 0]].cos() * y[[j, 0]].cos() * d_lon.sin() * d_lon.sin();
+            result[[i, j]] = two * a.sqrt().asin();
+        }
+    }
+    Ok(result)
+}
+
 /// Compute pairwise Chebyshev (L-infinity) distances.
 ///
 /// For each pair of rows `(x_i, y_j)`, the Chebyshev distance is
@@ -577,6 +667,16 @@ where
         Metric::Cosine => cosine_distances(x, y),
         Metric::Chebyshev => chebyshev_distances(x, y),
     }
+}
+
+/// Return the sklearn-style distance metric registry names supported here.
+pub fn distance_metrics() -> &'static [&'static str] {
+    DISTANCE_METRIC_NAMES
+}
+
+/// Return the sklearn-style kernel metric registry names supported here.
+pub fn kernel_metrics() -> &'static [&'static str] {
+    KERNEL_METRIC_NAMES
 }
 
 /// Compute row-wise Euclidean distances between paired rows.
@@ -815,6 +915,72 @@ pub enum PairwiseKernel<F> {
         /// Bandwidth parameter.
         gamma: F,
     },
+    /// `K(x, y) = cosine_similarity(x, y)`
+    Cosine,
+    /// `K(x, y) = -sum((x - y)^2 / (x + y))`
+    AdditiveChi2,
+    /// `K(x, y) = exp(gamma * additive_chi2_kernel(x, y))`
+    Chi2 {
+        /// Scaling parameter.
+        gamma: F,
+    },
+}
+
+/// Compute the additive chi-squared kernel.
+///
+/// Inputs must be non-negative. Terms with `x_k + y_k == 0` contribute `0`,
+/// matching sklearn's dense path.
+pub fn additive_chi2_kernel<F>(x: &Array2<F>, y: &Array2<F>) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    check_feature_dim(x, y, "additive_chi2_kernel")?;
+    check_non_empty(x, y, "additive_chi2_kernel")?;
+    reject_non_finite(x)?;
+    reject_non_finite(y)?;
+    reject_negative(x, "X")?;
+    reject_negative(y, "Y")?;
+
+    let mut result = Array2::<F>::zeros((x.nrows(), y.nrows()));
+    for i in 0..x.nrows() {
+        for j in 0..y.nrows() {
+            let mut value = F::zero();
+            for k in 0..x.ncols() {
+                let denom = x[[i, k]] + y[[j, k]];
+                if denom == F::zero() {
+                    continue;
+                }
+                let diff = x[[i, k]] - y[[j, k]];
+                value = value - (diff * diff) / denom;
+            }
+            result[[i, j]] = value;
+        }
+    }
+    Ok(result)
+}
+
+/// Compute the exponential chi-squared kernel.
+///
+/// Equivalent to `exp(gamma * additive_chi2_kernel(x, y))`.
+pub fn chi2_kernel<F>(x: &Array2<F>, y: &Array2<F>, gamma: F) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    reject_non_positive(gamma, "gamma")?;
+    let additive = additive_chi2_kernel(x, y)?;
+    Ok(additive.mapv(|v| (gamma * v).exp()))
+}
+
+/// Compute the standalone laplacian kernel.
+///
+/// Equivalent to `exp(-gamma * manhattan_distances(x, y))`.
+pub fn laplacian_kernel<F>(x: &Array2<F>, y: &Array2<F>, gamma: F) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    reject_non_positive(gamma, "gamma")?;
+    let distances = manhattan_distances(x, y)?;
+    Ok(distances.mapv(|d| (-gamma * d).exp()))
 }
 
 /// For each row in `X`, return the index of the closest row in `Y` under the
@@ -959,16 +1125,11 @@ where
             }
         }
         PairwiseKernel::Laplacian { gamma } => {
-            for i in 0..n {
-                for j in 0..m {
-                    let mut s = F::zero();
-                    for k in 0..x.ncols() {
-                        s = s + (x[[i, k]] - y[[j, k]]).abs();
-                    }
-                    out[[i, j]] = (-gamma * s).exp();
-                }
-            }
+            return laplacian_kernel(x, y, gamma);
         }
+        PairwiseKernel::Cosine => return cosine_similarity(x, y),
+        PairwiseKernel::AdditiveChi2 => return additive_chi2_kernel(x, y),
+        PairwiseKernel::Chi2 { gamma } => return chi2_kernel(x, y, gamma),
     }
     Ok(out)
 }
