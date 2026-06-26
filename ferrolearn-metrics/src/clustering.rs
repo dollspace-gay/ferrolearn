@@ -12,6 +12,7 @@
 //! - [`homogeneity_score`] — each cluster contains only one class
 //! - [`completeness_score`] — all samples of a class are in one cluster
 //! - [`v_measure_score`] — harmonic mean of homogeneity and completeness
+//! - [`consensus_score`] — similarity between two sets of biclusters
 //!
 //! Noise points (label == -1, as used by DBSCAN) are excluded from all
 //! silhouette and Calinski-Harabasz computations but are counted in
@@ -39,6 +40,7 @@
 //! | REQ-14 | Missing surface: public `entropy`, `contingency_matrix` `eps`/`sparse`, `mutual_info_score` `contingency=`, crate-root `AmiMethod` re-export | NOT-STARTED (#803) |
 //! | REQ-15 | PyO3 binding | NOT-STARTED (#804) |
 //! | REQ-16 | ferray substrate migration | NOT-STARTED (#805) |
+//! | REQ-17 | `consensus_score` Jaccard bicluster matching (`_bicluster.py`) | SHIPPED |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -101,6 +103,230 @@ fn unique_cluster_labels(labels: &Array1<isize>) -> Vec<isize> {
 #[inline]
 fn n_choose_2(n: u64) -> u64 {
     if n < 2 { 0 } else { n * (n - 1) / 2 }
+}
+
+fn validate_bicluster_indicators(
+    rows: &Array2<bool>,
+    cols: &Array2<bool>,
+    name: &str,
+) -> Result<(), FerroError> {
+    if rows.nrows() != cols.nrows() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![rows.nrows()],
+            actual: vec![cols.nrows()],
+            context: format!("consensus_score: {name} rows vs columns biclusters"),
+        });
+    }
+    if rows.nrows() == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: format!("consensus_score: {name} biclusters"),
+        });
+    }
+    if rows.ncols() == 0 || cols.ncols() == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: name.into(),
+            reason:
+                "bicluster indicators must have at least one row feature and one column feature"
+                    .into(),
+        });
+    }
+    Ok(())
+}
+
+fn bicluster_jaccard(
+    a_rows: &Array2<bool>,
+    a_cols: &Array2<bool>,
+    a_idx: usize,
+    b_rows: &Array2<bool>,
+    b_cols: &Array2<bool>,
+    b_idx: usize,
+) -> Result<f64, FerroError> {
+    if a_rows.ncols() != b_rows.ncols() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![a_rows.ncols()],
+            actual: vec![b_rows.ncols()],
+            context: "consensus_score: row indicator width".into(),
+        });
+    }
+    if a_cols.ncols() != b_cols.ncols() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![a_cols.ncols()],
+            actual: vec![b_cols.ncols()],
+            context: "consensus_score: column indicator width".into(),
+        });
+    }
+
+    let row_intersection = (0..a_rows.ncols())
+        .filter(|&j| a_rows[[a_idx, j]] && b_rows[[b_idx, j]])
+        .count();
+    let col_intersection = (0..a_cols.ncols())
+        .filter(|&j| a_cols[[a_idx, j]] && b_cols[[b_idx, j]])
+        .count();
+    let intersection = row_intersection * col_intersection;
+
+    let a_size = a_rows.row(a_idx).iter().filter(|&&v| v).count()
+        * a_cols.row(a_idx).iter().filter(|&&v| v).count();
+    let b_size = b_rows.row(b_idx).iter().filter(|&&v| v).count()
+        * b_cols.row(b_idx).iter().filter(|&&v| v).count();
+    let denominator = a_size + b_size - intersection;
+
+    if denominator == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "biclusters".into(),
+            reason: "empty biclusters cannot define a Jaccard similarity".into(),
+        });
+    }
+
+    Ok(intersection as f64 / denominator as f64)
+}
+
+fn hungarian_minimize_square(cost: &[Vec<f64>]) -> Vec<usize> {
+    let n = cost.len();
+    let m = cost.first().map_or(0, Vec::len);
+    let mut u = vec![0.0; n + 1];
+    let mut v = vec![0.0; m + 1];
+    let mut p = vec![0usize; m + 1];
+    let mut way = vec![0usize; m + 1];
+
+    for i in 1..=n {
+        p[0] = i;
+        let mut j0 = 0usize;
+        let mut minv = vec![f64::INFINITY; m + 1];
+        let mut used = vec![false; m + 1];
+
+        loop {
+            used[j0] = true;
+            let i0 = p[j0];
+            let mut delta = f64::INFINITY;
+            let mut j1 = 0usize;
+
+            for j in 1..=m {
+                if used[j] {
+                    continue;
+                }
+                let cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                if cur < minv[j] {
+                    minv[j] = cur;
+                    way[j] = j0;
+                }
+                if minv[j] < delta {
+                    delta = minv[j];
+                    j1 = j;
+                }
+            }
+
+            for j in 0..=m {
+                if used[j] {
+                    u[p[j]] += delta;
+                    v[j] -= delta;
+                } else {
+                    minv[j] -= delta;
+                }
+            }
+            j0 = j1;
+            if p[j0] == 0 {
+                break;
+            }
+        }
+
+        loop {
+            let j1 = way[j0];
+            p[j0] = p[j1];
+            j0 = j1;
+            if j0 == 0 {
+                break;
+            }
+        }
+    }
+
+    let mut assignment = vec![usize::MAX; n];
+    for j in 1..=m {
+        if p[j] != 0 {
+            assignment[p[j] - 1] = j - 1;
+        }
+    }
+    assignment
+}
+
+// ---------------------------------------------------------------------------
+// consensus_score
+// ---------------------------------------------------------------------------
+
+/// Compute the similarity of two sets of biclusters.
+///
+/// Each bicluster set is represented as a pair of boolean indicator matrices:
+/// one over rows and one over columns. Row `i` in `a_rows` and row `i` in
+/// `a_cols` form the `i`th bicluster in set `a`; likewise for `b`.
+///
+/// The score is sklearn's `consensus_score(..., similarity="jaccard")`:
+/// pairwise bicluster Jaccard similarities are computed, the best one-to-one
+/// matching is selected with a linear-sum assignment, and the matched sum is
+/// divided by the size of the larger bicluster set.
+///
+/// # Arguments
+///
+/// * `a_rows` — row indicators for bicluster set `a`, shape `(n_a, n_rows)`.
+/// * `a_cols` — column indicators for bicluster set `a`, shape `(n_a, n_cols)`.
+/// * `b_rows` — row indicators for bicluster set `b`, shape `(n_b, n_rows)`.
+/// * `b_cols` — column indicators for bicluster set `b`, shape `(n_b, n_cols)`.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if a set has mismatched row/column
+/// bicluster counts or if the compared row/column indicator widths differ.
+/// Returns [`FerroError::InsufficientSamples`] if either set has no biclusters.
+/// Returns [`FerroError::InvalidParameter`] if an empty bicluster makes the
+/// Jaccard denominator undefined.
+///
+/// # Examples
+///
+/// ```
+/// use ferrolearn_metrics::clustering::consensus_score;
+/// use ndarray::array;
+///
+/// let a_rows = array![[true, false], [false, true]];
+/// let a_cols = array![[false, true], [true, false]];
+/// let b_rows = array![[false, true], [true, false]];
+/// let b_cols = array![[true, false], [false, true]];
+/// let score = consensus_score(&a_rows, &a_cols, &b_rows, &b_cols).unwrap();
+/// assert_eq!(score, 1.0);
+/// ```
+pub fn consensus_score(
+    a_rows: &Array2<bool>,
+    a_cols: &Array2<bool>,
+    b_rows: &Array2<bool>,
+    b_cols: &Array2<bool>,
+) -> Result<f64, FerroError> {
+    validate_bicluster_indicators(a_rows, a_cols, "a")?;
+    validate_bicluster_indicators(b_rows, b_cols, "b")?;
+
+    let n_a = a_rows.nrows();
+    let n_b = b_rows.nrows();
+    let n = n_a.max(n_b);
+    let mut similarities = Array2::<f64>::zeros((n_a, n_b));
+    for i in 0..n_a {
+        for j in 0..n_b {
+            similarities[[i, j]] = bicluster_jaccard(a_rows, a_cols, i, b_rows, b_cols, j)?;
+        }
+    }
+
+    let mut cost = vec![vec![0.0; n]; n];
+    for i in 0..n_a {
+        for j in 0..n_b {
+            cost[i][j] = 1.0 - similarities[[i, j]];
+        }
+    }
+    let assignment = hungarian_minimize_square(&cost);
+    let matched_sum = assignment
+        .iter()
+        .enumerate()
+        .take(n_a)
+        .filter_map(|(i, &j)| (j < n_b).then_some(similarities[[i, j]]))
+        .sum::<f64>();
+
+    Ok(matched_sum / n as f64)
 }
 
 // ---------------------------------------------------------------------------

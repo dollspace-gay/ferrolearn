@@ -95,10 +95,10 @@ pub use classification::{
 };
 pub use clustering::{
     NmiMethod, adjusted_mutual_info, adjusted_rand_score, calinski_harabasz_score,
-    completeness_score, contingency_matrix, davies_bouldin_score, fowlkes_mallows_score,
-    homogeneity_completeness_v_measure, homogeneity_score, mutual_info_score,
-    normalized_mutual_info_score, pair_confusion_matrix, rand_score, silhouette_samples,
-    silhouette_score, v_measure_score,
+    completeness_score, consensus_score, contingency_matrix, davies_bouldin_score,
+    fowlkes_mallows_score, homogeneity_completeness_v_measure, homogeneity_score,
+    mutual_info_score, normalized_mutual_info_score, pair_confusion_matrix, rand_score,
+    silhouette_samples, silhouette_score, v_measure_score,
 };
 pub use pairwise::{
     DISTANCE_METRIC_NAMES, DistanceMetric, KERNEL_METRIC_NAMES, Metric, PairwiseKernel,

@@ -8,9 +8,10 @@ upstream: scikit-learn 1.5.2 (commit 156ef14)
 upstream-paths:
   - sklearn/metrics/cluster/_supervised.py     # check_clusterings(:32); _generalized_average(:78); contingency_matrix(:104); pair_confusion_matrix(:190); rand_score(:275); adjusted_rand_score(:353); homogeneity_completeness_v_measure(:463); homogeneity_score(:563); completeness_score(:639); v_measure_score(:716); mutual_info_score(:820); adjusted_mutual_info_score(:936); normalized_mutual_info_score(:1069); fowlkes_mallows_score(:1184); entropy(:1268)
   - sklearn/metrics/cluster/_unsupervised.py    # silhouette_score(:54); _silhouette_reduce(:144); silhouette_samples(:206); calinski_harabasz_score(:328); davies_bouldin_score(:399)
+  - sklearn/metrics/cluster/_bicluster.py       # consensus_score
   - sklearn/metrics/cluster/_expected_mutual_info_fast.pyx   # expected_mutual_information (Cython; private surface, EMI for AMI)
 ferrolearn-module: ferrolearn-metrics/src/clustering.rs
-parity-ops: silhouette_score, silhouette_samples, adjusted_rand_score, rand_score, adjusted_mutual_info, normalized_mutual_info_score, v_measure_score, homogeneity_score, completeness_score, homogeneity_completeness_v_measure, davies_bouldin_score, calinski_harabasz_score, fowlkes_mallows_score, mutual_info_score, contingency_matrix, pair_confusion_matrix
+parity-ops: silhouette_score, silhouette_samples, adjusted_rand_score, rand_score, adjusted_mutual_info, normalized_mutual_info_score, v_measure_score, homogeneity_score, completeness_score, homogeneity_completeness_v_measure, davies_bouldin_score, calinski_harabasz_score, fowlkes_mallows_score, mutual_info_score, contingency_matrix, pair_confusion_matrix, consensus_score
 crosslink-issue: 796
 -->
 
@@ -20,7 +21,7 @@ crosslink-issue: 796
 clustering-evaluation functions of scikit-learn's `sklearn/metrics/cluster/`
 package — `_supervised.py` (label-vs-label agreement metrics) and
 `_unsupervised.py` (feature-space cluster-quality metrics). It implements
-**sixteen** public sklearn functions plus the supporting enums `AmiMethod` /
+**seventeen** public sklearn functions plus the supporting enums `AmiMethod` /
 `NmiMethod`:
 
 - **Unsupervised (feature-space):** `silhouette_score`, `silhouette_samples`,
@@ -30,7 +31,7 @@ package — `_supervised.py` (label-vs-label agreement metrics) and
   `normalized_mutual_info_score`, `v_measure_score`, `homogeneity_score`,
   `completeness_score`, `homogeneity_completeness_v_measure`,
   `fowlkes_mallows_score`, `mutual_info_score`, `contingency_matrix`,
-  `pair_confusion_matrix`.
+  `pair_confusion_matrix`, `consensus_score`.
 
 Under honest underclaim (R-HONEST-3), **most present functions value-match the
 live sklearn 1.5.2 oracle on the supported numeric path** — the EMI-bearing AMI
@@ -60,7 +61,7 @@ binding; on the `ndarray` substrate rather than ferray). The three cleanest
    **`(1.0, 1.0, 1.0)`** / `1.0` (`_supervised.py:531-532`). ferrolearn returns
    `Err(InsufficientSamples)`.
 
-All sixteen functions plus `NmiMethod` are existing pub APIs re-exported at the
+All seventeen functions plus `NmiMethod` are existing pub APIs re-exported at the
 crate root (`lib.rs`: `pub use clustering::{...}`); that re-export is the
 non-test production-consumer surface, grandfathered under S5/R-DEFER-1. (Note:
 `adjusted_mutual_info_with_method` and `AmiMethod` are **not** re-exported at the
@@ -209,11 +210,17 @@ has no such convention (it `LabelEncode`s all labels including `-1`).
 - **`pub fn pair_confusion_matrix`** — `2x2 Array2<u64>` via the same
   contingency-sum identities; `saturating_sub` guards. Value matches sklearn
   (`[[8,2],[0,2]]`, `[[8,0],[0,4]]`).
+- **`pub fn consensus_score`** — Jaccard similarity over boolean bicluster
+  `(rows, columns)` indicator matrices, then a best rectangular assignment and
+  division by the larger bicluster-set size. Value matches sklearn
+  `_bicluster.py` for the public example, partial overlap, and rectangular
+  matching.
 
 **Internal helpers:** `fn check_labels_same_length`, `fn check_x_labels_compat`,
 `fn euclidean_dist`, `fn row_euclidean_dist`, `fn unique_cluster_labels` (noise
 filter), `fn n_choose_2`, `fn build_contingency_table`, `fn entropy_from_counts`,
-`fn expected_mutual_info`, `fn precompute_log_factorials`. The `trait LetIf` +
+`fn expected_mutual_info`, `fn precompute_log_factorials`,
+`fn bicluster_jaccard`, `fn hungarian_minimize_square`. The `trait LetIf` +
 `partition_point` pattern maps a label to its sorted-class index.
 
 **Consumers (non-test):** crate re-export
@@ -222,7 +229,7 @@ adjusted_rand_score, calinski_harabasz_score, completeness_score,
 contingency_matrix, davies_bouldin_score, fowlkes_mallows_score,
 homogeneity_completeness_v_measure, homogeneity_score, mutual_info_score,
 normalized_mutual_info_score, pair_confusion_matrix, rand_score,
-silhouette_samples, silhouette_score, v_measure_score }`). This is the
+silhouette_samples, silhouette_score, v_measure_score, consensus_score }`). This is the
 grandfathered non-test production surface (S5/R-DEFER-1). **`AmiMethod` and
 `adjusted_mutual_info_with_method` are NOT re-exported at the crate root** (only
 reachable via `ferrolearn_metrics::clustering::`). The `scorer.rs` registry does
@@ -271,14 +278,17 @@ not yet wire any clustering scorer (its REQ-6 NOT-STARTED, `#784`), and
 - REQ-15: **`contingency_matrix` (R-DEV-2).** `eps`/`sparse`/`dtype` keyword args
   (`:104-106`); ferrolearn is dense-`u64`-only.
 - REQ-16: **`pair_confusion_matrix` (R-DEV-1).** `2x2` int64 identities (`:190`).
-- REQ-17: **`entropy` public surface (R-DEV-2, MISSING).** sklearn exposes
+- REQ-17: **`consensus_score` (R-DEV-1/2).** Match `_bicluster.py`: Jaccard
+  bicluster similarities, rectangular linear-sum assignment, and denominator
+  `max(n_a, n_b)`. SHIPPED for boolean indicator matrices.
+- REQ-18: **`entropy` public surface (R-DEV-2, MISSING).** sklearn exposes
   `entropy(labels)` (`:1268`) as a public `cluster` function; ferrolearn has only
   the private `fn entropy_from_counts`.
-- REQ-18: **PyO3 binding (R-DEFER-1).** `import sklearn.metrics` exposes these
+- REQ-19: **PyO3 binding (R-DEFER-1).** `import sklearn.metrics` exposes these
   clustering metrics; `ferrolearn-python` exposes no shim.
-- REQ-19: **ferray substrate (R-SUBSTRATE).** `clustering.rs` imports
+- REQ-20: **ferray substrate (R-SUBSTRATE).** `clustering.rs` imports
   `ndarray::{Array1,Array2}` + `num_traits::Float`, not `ferray-core`.
-- REQ-20: **Crate-root re-export of `AmiMethod` + `adjusted_mutual_info_with_method`
+- REQ-21: **Crate-root re-export of `AmiMethod` + `adjusted_mutual_info_with_method`
   (R-DEV-2).** Both are pub in the module but absent from the `lib.rs` re-export,
   so the AMI averaging selector is unreachable via `ferrolearn_metrics::*`.
 
@@ -317,7 +327,10 @@ never literal-copied from ferrolearn (R-CHAR-3).
   `mutual_info_score([0,1,1,0,1,0],[0,1,0,0,1,1]) == 0.0566330122651324`;
   `pair_confusion_matrix([0,0,1,2],[0,0,1,1]) == [[8,2],[0,2]]`;
   `contingency_matrix([0,0,1,1,2,2],[1,0,2,1,0,2]) == [[1,1,0],[0,1,1],[1,0,1]]`.
-- AC-8 (REQ-1/3, must stay green): on
+- AC-8 (REQ-17, shipped): sklearn public example returns
+  `consensus_score(a, b) == 1.0`; partial overlap fixture returns `0.5`; a
+  rectangular one-vs-two fixture returns `0.07142857142857142`.
+- AC-9 (REQ-1/3, must stay green): on
   `X=[[0,0],[0.1,0.1],[10,10],[10.1,10.1]]`, `labels=[0,0,1,1]`,
   `silhouette_score ≈ 0.9899997499937521`, `davies_bouldin_score ≈
   0.009999999999997726`, `calinski_harabasz_score ≈ 20000.0` — all match sklearn
@@ -325,7 +338,7 @@ never literal-copied from ferrolearn (R-CHAR-3).
 
 ## REQ status table
 
-Binary (R-DEFER-2). All sixteen functions + `NmiMethod` are existing pub APIs
+Binary (R-DEFER-2). All seventeen functions + `NmiMethod` are existing pub APIs
 re-exported at the crate root (`lib.rs`); that re-export is the non-test
 production-consumer surface (grandfathered, S5/R-DEFER-1). Cites use symbol
 anchors (ferrolearn) / `file:line` (sklearn 1.5.2). Live oracle = installed
@@ -351,10 +364,11 @@ anchors. Honest underclaim (R-HONEST-3).
 | REQ-14 (`mutual_info_score`) | NOT-STARTED | open prereq blocker #805. impl `pub fn mutual_info_score` value-matches (`0.0566330122651324` mixed, `0.0` single-cluster, AC-7) but **omits the `contingency=` keyword passthrough** (sklearn `:820,886-894`) — a real API-surface gap (used by `homogeneity_completeness_v_measure`/AMI/NMI in sklearn). Per-term eps-zero + `clip(.,0,None)` also absent (immaterial on tested cases). |
 | REQ-15 (`contingency_matrix`) | NOT-STARTED | open prereq blocker #806. impl `pub fn contingency_matrix` value/ordering matches the **dense** sklearn output (`[[1,1,0],[0,1,1],[1,0,1]]`, AC-7) but **omits `eps`/`sparse`/`dtype`** (`_supervised.py:104-106`); returns `Array2<u64>` only. |
 | REQ-16 (`pair_confusion_matrix`) | SHIPPED | impl `pub fn pair_confusion_matrix` mirrors `_supervised.py:190,259-264`. Consumer: `lib.rs` re-export. Verification: `pair_confusion_matrix([0,0,1,2],[0,0,1,1]) == [[8,2],[0,2]]` and `([0,0,1,1],[1,1,0,0]) == [[8,0],[0,4]]` match oracle (AC-7); `#[test]`s exercise the identities. |
-| REQ-17 (`entropy` public surface, MISSING) | NOT-STARTED | open prereq blocker #807. sklearn exposes `entropy(labels)` as a public `cluster` function (`_supervised.py:1268`, empty→1.0, single→0.0); ferrolearn has only the private `fn entropy_from_counts`. No public `entropy` is exported. |
-| REQ-18 (PyO3 binding) | NOT-STARTED | open prereq blocker #808. `ferrolearn-python` exposes no clustering-metric shim; `import ferrolearn` cannot call what `import sklearn.metrics` provides. |
-| REQ-19 (ferray substrate) | NOT-STARTED | open prereq blocker #809. `clustering.rs` imports `ndarray::{Array1,Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). |
-| REQ-20 (crate-root `AmiMethod`/`adjusted_mutual_info_with_method`) | NOT-STARTED | open prereq blocker #810. `lib.rs` re-exports `adjusted_mutual_info` + `NmiMethod` but **not** `AmiMethod` or `adjusted_mutual_info_with_method`, so the AMI averaging selector is unreachable as `ferrolearn_metrics::AmiMethod` (only `ferrolearn_metrics::clustering::AmiMethod`). |
+| REQ-17 (`consensus_score`) | SHIPPED | impl `pub fn consensus_score` mirrors `_bicluster.py`: pairwise bicluster Jaccard, rectangular linear assignment, and division by `max(n_a,n_b)`. Consumer: `lib.rs` re-export. Verification: `tests/divergence_consensus_score.rs` pins sklearn's public example (`1.0`), partial overlap (`0.5`), rectangular matching (`0.07142857142857142`), and invalid-shape errors. |
+| REQ-18 (`entropy` public surface, MISSING) | NOT-STARTED | open prereq blocker #807. sklearn exposes `entropy(labels)` as a public `cluster` function (`_supervised.py:1268`, empty→1.0, single→0.0); ferrolearn has only the private `fn entropy_from_counts`. No public `entropy` is exported. |
+| REQ-19 (PyO3 binding) | NOT-STARTED | open prereq blocker #808. `ferrolearn-python` exposes no clustering-metric shim; `import ferrolearn` cannot call what `import sklearn.metrics` provides. |
+| REQ-20 (ferray substrate) | NOT-STARTED | open prereq blocker #809. `clustering.rs` imports `ndarray::{Array1,Array2}` + `num_traits::Float`, not `ferray-core` (R-SUBSTRATE). |
+| REQ-21 (crate-root `AmiMethod`/`adjusted_mutual_info_with_method`) | NOT-STARTED | open prereq blocker #810. `lib.rs` re-exports `adjusted_mutual_info` + `NmiMethod` but **not** `AmiMethod` or `adjusted_mutual_info_with_method`, so the AMI averaging selector is unreachable as `ferrolearn_metrics::AmiMethod` (only `ferrolearn_metrics::clustering::AmiMethod`). |
 
 ## Architecture
 
@@ -393,15 +407,15 @@ for the homogeneity family (REQ-10/11/12); `v_measure_score` missing `beta`
 (REQ-9); NMI missing arithmetic default (REQ-8); `metric`/`sample_size`/
 `random_state` (REQ-2); `eps`/`sparse`/`dtype` on `contingency_matrix` (REQ-15);
 `contingency=` passthrough on `mutual_info_score` (REQ-14); public `entropy`
-(REQ-17); PyO3 binding (REQ-18); ferray substrate (REQ-19); crate-root re-export
-of `AmiMethod` (REQ-20). The `-1` noise convention on the feature-space metrics is
+(REQ-18); PyO3 binding (REQ-19); ferray substrate (REQ-20); crate-root re-export
+of `AmiMethod` (REQ-21). The `-1` noise convention on the feature-space metrics is
 a ferrolearn extension with no sklearn counterpart — benign on noise-free input
 but a latent divergence if a caller mirrors sklearn's "encode `-1` as a real
 cluster" expectation.
 
 **Missing functions.** sklearn's `cluster` package additionally exposes the
 public function **`entropy`** (`_supervised.py:1268`) — ferrolearn has it only as
-the private `fn entropy_from_counts` (REQ-17). `expected_mutual_information`
+the private `fn entropy_from_counts` (REQ-18). `expected_mutual_information`
 (Cython `_expected_mutual_info_fast.pyx`) is **private** sklearn surface (imported
 internally by AMI), so it is not "missing" — ferrolearn's equivalent
 `fn expected_mutual_info` is correctly private. `_generalized_average`,
@@ -415,13 +429,14 @@ contract; 44 clustering `#[test]`s + 2 `#[cfg(kani)]` range/non-negativity
 proofs):
 ```
 cargo test -p ferrolearn-metrics --lib clustering        # 44 passed, 0 failed
+cargo test -p ferrolearn-metrics --test divergence_consensus_score
 cargo clippy -p ferrolearn-metrics --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 The existing `#[test]`s pin ferrolearn's behavior (incl. the value-correct
 `test_ami_mixed_labels_matches_sklearn_arithmetic`, the EMI/arithmetic-default
 pin) but do NOT cover the divergence cases below, so they leave REQ-2/4/6/8/9/10/
-11/12/14/15/17/18/19/20 NOT-STARTED.
+11/12/14/15/18/19/20/21 NOT-STARTED.
 
 Live sklearn oracle (installed 1.5.2, run from `/tmp`) — the deterministic
 divergences a critic should pin first (R-CHAR-3 expected values):
@@ -446,8 +461,8 @@ A characterization pin (R-CHAR-3) for each NOT-STARTED deterministic REQ belongs
 in `ferrolearn-metrics/tests/divergence_clustering.rs`, asserting the live-sklearn
 expected values above and FAILING against current `clustering.rs` (REQ-6 must
 catch the panic; REQ-4/10/11/12 assert the value/`Ok` sklearn returns). The
-SHIPPED REQs (1,3,5,7,13,16) are pinned green by the in-`#[cfg(test)]` suite +
-the oracle baselines (AC-4/7/8).
+SHIPPED REQs (1,3,5,7,13,16,17) are pinned green by the in-`#[cfg(test)]` suite +
+the oracle baselines (AC-4/7/9) and `tests/divergence_consensus_score.rs`.
 
 ## Blockers to open
 
@@ -470,11 +485,11 @@ the oracle baselines (AC-4/7/8).
 - #805 — REQ-14 (`mutual_info_score`): no `contingency=` keyword passthrough
   (`:820,886-894`); per-term eps-zero + `clip(.,0,None)` absent.
 - #806 — REQ-15 (`contingency_matrix`): no `eps`/`sparse`/`dtype` (`:104-106`).
-- #807 — REQ-17 (`entropy`): missing public `entropy(labels)` function
+- #807 — REQ-18 (`entropy`): missing public `entropy(labels)` function
   (`_supervised.py:1268`); only private `fn entropy_from_counts`.
-- #808 — REQ-18: no `ferrolearn-python` clustering-metric binding.
-- #809 — REQ-19: migrate `clustering.rs` off `ndarray`/`num-traits` to the ferray
+- #808 — REQ-19: no `ferrolearn-python` clustering-metric binding.
+- #809 — REQ-20: migrate `clustering.rs` off `ndarray`/`num-traits` to the ferray
   substrate (R-SUBSTRATE).
-- #810 — REQ-20: re-export `AmiMethod` + `adjusted_mutual_info_with_method` at the
+- #810 — REQ-21: re-export `AmiMethod` + `adjusted_mutual_info_with_method` at the
   crate root (`lib.rs`) so the AMI averaging selector is reachable as
   `ferrolearn_metrics::*`.

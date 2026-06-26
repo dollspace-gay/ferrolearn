@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 88 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 87 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -65,7 +65,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.feature_extraction.text` | `HashingVectorizer`, `TfidfVectorizer` |
 | `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
 | `sklearn.compose` | `make_column_selector` |
-| `sklearn.metrics` | `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `consensus_score`, `pairwise_distances_chunked`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
+| `sklearn.metrics` | `confusion_matrix_at_thresholds`, `metric_at_thresholds`, `pairwise_distances_chunked`, `ConfusionMatrixDisplay`, `DetCurveDisplay`, `PrecisionRecallDisplay`, `PredictionErrorDisplay`, `RocCurveDisplay` |
 | `sklearn.model_selection` | `check_cv`, `LearningCurveDisplay`, `ValidationCurveDisplay` |
 | `sklearn.calibration` | `CalibrationDisplay` |
 | `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |
@@ -162,7 +162,7 @@ Current divergence-test count by crate:
 | `ferrolearn-decomp` | 35 |
 | `ferrolearn-kernel` | 10 |
 | `ferrolearn-linear` | 62 |
-| `ferrolearn-metrics` | 14 |
+| `ferrolearn-metrics` | 15 |
 | `ferrolearn-model-sel` | 31 |
 | `ferrolearn-neighbors` | 17 |
 | `ferrolearn-neural` | 5 |

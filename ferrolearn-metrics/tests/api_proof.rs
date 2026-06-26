@@ -35,6 +35,7 @@ use ferrolearn_metrics::{
     cohen_kappa_score,
     completeness_score,
     confusion_matrix,
+    consensus_score,
     contingency_matrix,
     cosine_distances,
     cosine_similarity,
@@ -238,6 +239,13 @@ fn api_proof_clustering_label_only() {
     assert_eq!(cm.nrows(), 3);
     let pcm = pair_confusion_matrix(&labels_true, &labels_pred).unwrap();
     assert_eq!(pcm.shape(), &[2, 2]);
+
+    let a_rows = array![[true, false], [false, true]];
+    let a_cols = array![[false, true], [true, false]];
+    let b_rows = array![[false, true], [true, false]];
+    let b_cols = array![[true, false], [false, true]];
+    let score = consensus_score(&a_rows, &a_cols, &b_rows, &b_cols).unwrap();
+    assert_eq!(score, 1.0);
 }
 
 #[test]
