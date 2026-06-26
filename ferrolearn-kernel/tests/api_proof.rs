@@ -8,6 +8,7 @@
 //! - Nystroem: builders + fit + transform, every KernelType variant
 //! - RBFSampler: builders + fit + transform
 //! - AdditiveChi2Sampler: builders + fit + transform
+//! - SkewedChi2Sampler: builders + fit + transform
 //! - GaussianProcessRegressor: fit + predict + predict_with_std + sample_y +
 //!   log_marginal_likelihood + score
 //! - GaussianProcessClassifier: fit + predict + predict_proba + predict_log_proba
@@ -26,12 +27,12 @@ use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
     AdditiveChi2Sampler, BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy,
     DotProductKernel, EpanechnikovKernel, ExpSineSquared, Exponentiation,
-    FittedAdditiveChi2Sampler, GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor,
-    HeteroscedasticityTest, Hyperparameter, HyperparameterBounds, KernelRidge, KernelType,
-    LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem, ProductKernel, RBFKernel,
-    RBFSampler, RationalQuadratic, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
-    WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
-    silverman_bandwidth,
+    FittedAdditiveChi2Sampler, FittedSkewedChi2Sampler, GaussianKernel, GaussianProcessClassifier,
+    GaussianProcessRegressor, HeteroscedasticityTest, Hyperparameter, HyperparameterBounds,
+    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
+    ProductKernel, RBFKernel, RBFSampler, RationalQuadratic, SkewedChi2Sampler, SumKernel,
+    TricubeKernel, TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test,
+    residual_diagnostics, scott_bandwidth, silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -150,6 +151,23 @@ fn api_proof_additive_chi2_sampler() {
         .fit(&x, &dummy_y)
         .unwrap();
     assert_eq!(custom.transform(&x).unwrap().dim(), (3, 14));
+}
+
+#[test]
+fn api_proof_skewed_chi2_sampler() {
+    let x = array![[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]];
+    let dummy_y = ();
+    let m = SkewedChi2Sampler::<f64>::new()
+        .with_skewedness(0.5)
+        .with_n_components(8)
+        .with_random_state(42);
+    let f: FittedSkewedChi2Sampler<f64> = m.fit(&x, &dummy_y).unwrap();
+    assert_eq!(f.n_features_in(), 2);
+    assert_eq!(f.n_components(), 8);
+    assert_eq!(f.random_weights().dim(), (2, 8));
+    assert_eq!(f.random_offset().len(), 8);
+    let embedded = f.transform(&x).unwrap();
+    assert_eq!(embedded.dim(), (3, 8));
 }
 
 // =============================================================================

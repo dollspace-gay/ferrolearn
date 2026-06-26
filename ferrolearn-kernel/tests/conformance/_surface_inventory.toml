@@ -119,6 +119,11 @@ phase = "kernel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_kernel::FittedSkewedChi2Sampler"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::GPKernel"
 phase = "kernel"
 fixture = ""
@@ -220,6 +225,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_kernel::ResidualDiagnosticsResult"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::SkewedChi2Sampler"
 phase = "kernel"
 fixture = ""
 

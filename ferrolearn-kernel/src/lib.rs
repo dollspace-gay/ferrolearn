@@ -35,6 +35,8 @@
 //!   approximating the RBF kernel with a randomized cosine feature map.
 //! - **[`AdditiveChi2Sampler`]** — Deterministic explicit feature map for the
 //!   additive chi-squared kernel.
+//! - **[`SkewedChi2Sampler`]** — Random Fourier features for the skewed
+//!   chi-squared kernel.
 //!
 //! # Design
 //!
@@ -61,6 +63,7 @@ pub mod local_polynomial;
 pub mod nadaraya_watson;
 pub mod nystroem;
 pub mod rbf_sampler;
+pub mod skewed_chi2_sampler;
 pub mod weights;
 
 pub use additive_chi2_sampler::{AdditiveChi2Sampler, FittedAdditiveChi2Sampler};
@@ -89,6 +92,7 @@ pub use local_polynomial::{FittedLocalPolynomialRegression, LocalPolynomialRegre
 pub use nadaraya_watson::{FittedNadarayaWatson, NadarayaWatson};
 pub use nystroem::{FittedNystroem, KernelType, Nystroem};
 pub use rbf_sampler::{FittedRBFSampler, RBFSampler};
+pub use skewed_chi2_sampler::{FittedSkewedChi2Sampler, SkewedChi2Sampler};
 
 use ndarray::{Array1, Array2};
 use num_traits::Float;
