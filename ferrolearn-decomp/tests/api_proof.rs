@@ -10,7 +10,7 @@ use ferrolearn_decomp::{
     Dissimilarity, FactorAnalysis, FastICA, IncrementalPCA, Isomap, Kernel, KernelPCA, LLE,
     LatentDirichletAllocation, LdaLearningMethod, MDS, MiniBatchNMF, MiniBatchNMFInit, NMF,
     NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical, PLSRegression, PLSSVD, SparsePCA,
-    SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric, trustworthiness,
+    SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric, smacof, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -285,6 +285,13 @@ fn api_proof_mds() {
         .with_dissimilarity(Dissimilarity::Precomputed)
         .fit(&dist, &())
         .unwrap();
+
+    let d = ndarray::array![[0.0, 1.0, 2.0], [1.0, 0.0, 1.5], [2.0, 1.5, 0.0]];
+    let init = ndarray::array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+    let (smacof_embedding, _stress, n_iter) =
+        smacof(&d, 2, Some(&init), 1, 300, 1e-3, false, None).unwrap();
+    assert_eq!(smacof_embedding.dim(), (3, 2));
+    assert!(n_iter > 0);
 }
 
 #[test]

@@ -259,6 +259,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::smacof"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::trustworthiness"
 phase = "decomp"
 fixture = ""

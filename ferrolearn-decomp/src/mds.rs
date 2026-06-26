@@ -44,6 +44,25 @@
 //! assert_eq!(fitted.embedding().ncols(), 2);
 //! ```
 //!
+//! The standalone [`smacof`] helper exposes the sklearn function shape directly
+//! for callers that already have a precomputed dissimilarity matrix:
+//!
+//! ```
+//! use ferrolearn_decomp::smacof;
+//! use ndarray::array;
+//!
+//! let d = array![
+//!     [0.0, 1.0, 1.0],
+//!     [1.0, 0.0, 2.0],
+//!     [1.0, 2.0, 0.0],
+//! ];
+//! let init = array![[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]];
+//! let (embedding, _stress, n_iter) =
+//!     smacof(&d, 2, Some(&init), 1, 300, 1e-3, false, None).unwrap();
+//! assert_eq!(embedding.dim(), (3, 2));
+//! assert!(n_iter > 0);
+//! ```
+//!
 //! ## REQ status
 //!
 //! Translation target: scikit-learn 1.5.2 `class MDS` + `smacof`
@@ -62,7 +81,7 @@
 //! | REQ-3 | Structural (embedding shape `(n_samples, n_components)`, deterministic for a fixed init) | SHIPPED | `fit`; shape + fixed-init determinism guards |
 //! | REQ-4 | Kruskal stress-1 (`normalized_stress=True`) | SHIPPED | `smacof_single` `normalized_stress` arm `√(raw / (Σ disparities²/2))` (`_mds.py:148-149`); `kruskal_stress` helper retained |
 //! | REQ-5 | Error/parameter contracts (n_components 0 / > n_samples, NON-FINITE rejection) | SHIPPED (scoped) | `fit` guards. NON-FINITE: `reject_non_finite` BEFORE the SMACOF math = sklearn `_validate_data(force_all_finite=True)` (`_mds.py:627`,`utils/validation.py:147-154`) |
-//! | REQ-6 | SMACOF algorithm (Guttman majorization + `n_init` restarts + `random_state` + `init`) | SHIPPED | `smacof_single` (`_mds.py:22-167`) + `smacof` (`_mds.py:187-392`, `n_init`/min-stress, `init` forces `n_init=1`); consumer: `MDS::fit` |
+//! | REQ-6 | SMACOF algorithm (Guttman majorization + `n_init` restarts + `random_state` + `init`) | SHIPPED | `smacof_single` (`_mds.py:22-167`) + public `smacof` (`_mds.py:187-392`, `n_init`/min-stress, `init` forces `n_init=1`); consumer: `MDS::fit` |
 //! | REQ-7 | `metric=False` non-metric MDS (IsotonicRegression on disparities) | NOT-STARTED | sklearn `_mds.py:130-144` — blocker #1454 |
 //! | REQ-8 | `normalized_stress` + sklearn `stress_` (raw SSR) definition + `max_iter`/`eps` | SHIPPED | `stress_` raw SSR/2 default (`_mds.py:147`), `with_normalized_stress` Kruskal-1 (`:148-149`), `with_max_iter`/`with_eps` (`:157-165`); consumer `MDS::fit` |
 //! | REQ-9 | `dissimilarity_matrix_`/`n_iter_`/`embedding_` fitted attrs + `init` | SHIPPED | `FittedMDS::{dissimilarity_matrix, n_iter, embedding, stress}` accessors; `fit` sets all four (`_mds.py:636-654`) |
@@ -497,7 +516,7 @@ fn smacof_single(
     clippy::too_many_arguments,
     reason = "mirrors sklearn smacof's parameter set (dissimilarities, n_components, init, n_init, max_iter, eps, normalized_stress, random_state)"
 )]
-fn smacof(
+fn smacof_impl(
     disparities: &Array2<f64>,
     n_components: usize,
     init: Option<&Array2<f64>>,
@@ -537,6 +556,84 @@ fn smacof(
         let x0 = Array2::<f64>::zeros((n, n_components));
         smacof_single(disparities, &x0, max_iter, eps, normalized_stress)
     })
+}
+
+/// Run metric SMACOF on a precomputed dissimilarity matrix.
+///
+/// This is the public helper corresponding to `sklearn.manifold.smacof` for the
+/// metric (`metric=True`) path. It returns `(embedding, stress, n_iter)`, where
+/// `stress` is raw SSR/2 by default or Kruskal Stress-1 when
+/// `normalized_stress` is `true`. A fixed `init` forces a single deterministic
+/// run, matching sklearn's `smacof(init=X0, n_init=1)` path.
+///
+/// The default random-initialization path uses ferrolearn's Rust RNG, not
+/// numpy's `RandomState`, so fixed `init` is the value-parity path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors sklearn smacof's parameter set (dissimilarities, n_components, init, n_init, max_iter, eps, normalized_stress, random_state)"
+)]
+pub fn smacof(
+    dissimilarities: &Array2<f64>,
+    n_components: usize,
+    init: Option<&Array2<f64>>,
+    n_init: usize,
+    max_iter: usize,
+    eps: f64,
+    normalized_stress: bool,
+    random_state: Option<u64>,
+) -> Result<(Array2<f64>, f64, usize), FerroError> {
+    if n_components == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+
+    reject_non_finite(dissimilarities)?;
+
+    let n_samples = dissimilarities.nrows();
+    if n_samples != dissimilarities.ncols() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples, n_samples],
+            actual: vec![dissimilarities.nrows(), dissimilarities.ncols()],
+            context: "smacof requires a square dissimilarity matrix".into(),
+        });
+    }
+    if n_samples < 2 {
+        return Err(FerroError::InsufficientSamples {
+            required: 2,
+            actual: n_samples,
+            context: "smacof requires at least 2 samples".into(),
+        });
+    }
+
+    if let Some(x0) = init {
+        reject_non_finite(x0)?;
+        if x0.nrows() != n_samples {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples, n_components],
+                actual: vec![x0.nrows(), x0.ncols()],
+                context: "smacof init must have shape (n_samples, n_components)".into(),
+            });
+        }
+        if x0.ncols() == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "init".into(),
+                reason: "must have at least one component column".into(),
+            });
+        }
+    }
+
+    Ok(smacof_impl(
+        dissimilarities,
+        n_components,
+        init,
+        n_init,
+        max_iter,
+        eps,
+        normalized_stress,
+        random_state,
+    ))
 }
 
 /// Eigendecompose a symmetric matrix using faer's self-adjoint eigen.
@@ -728,7 +825,7 @@ impl Fit<Array2<f64>, ()> for MDS {
             .as_ref()
             .map_or(self.n_components, ndarray::Array2::ncols);
 
-        let (embedding, stress, n_iter) = smacof(
+        let (embedding, stress, n_iter) = smacof_impl(
             &dissimilarity_matrix,
             n_components,
             self.init.as_ref(),
