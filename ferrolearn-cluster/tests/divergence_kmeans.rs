@@ -20,9 +20,9 @@
 //! All sklearn expected values were produced from the installed sklearn 1.5.2
 //! oracle (run from /tmp), never literal-copied from the ferrolearn side.
 
-use ferrolearn_cluster::KMeans;
+use ferrolearn_cluster::{KMeans, kmeans_plusplus, kmeans_plusplus_with_options};
 use ferrolearn_core::{Fit, Predict, Transform};
-use ndarray::Array2;
+use ndarray::{Array1, Array2, array};
 
 /// Canonicalize a label vector to a permutation-invariant partition signature:
 /// each distinct label is renamed to the index of its first occurrence. Two
@@ -47,6 +47,70 @@ fn canonicalize(labels: &[usize]) -> Vec<usize> {
 // ----------------------------------------------------------------------------
 // (A) GREEN-GUARDS — SHIPPED contracts, must PASS against current code.
 // ----------------------------------------------------------------------------
+
+/// Standalone `kmeans_plusplus` public helper: single-sample output exactly
+/// matches sklearn's deterministic result.
+///
+/// Live oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.cluster import kmeans_plusplus; \
+///   c,i=kmeans_plusplus(np.array([[1.,2.]]),1,random_state=0); \
+///   print(c.tolist(), i.tolist())"
+/// # [[1.0, 2.0]] [0]
+/// ```
+#[test]
+fn green_kmeans_plusplus_single_sample_matches_sklearn() {
+    let x = array![[1.0_f64, 2.0]];
+    let (centers, indices) = kmeans_plusplus(&x, 1, Some(0)).unwrap();
+    assert_eq!(centers, x);
+    assert_eq!(indices.to_vec(), vec![0]);
+}
+
+/// Standalone weighted `kmeans_plusplus`: zero sample weight excludes the first
+/// sample from the first-center draw, matching sklearn's `sample_weight`
+/// behavior on this deterministic two-row fixture.
+///
+/// Live oracle:
+/// ```text
+/// python3 -c "import numpy as np; from sklearn.cluster import kmeans_plusplus; \
+///   X=np.array([[0.,0.],[10.,0.]]); w=np.array([0.,1.]); \
+///   c,i=kmeans_plusplus(X,2,sample_weight=w,random_state=0); \
+///   print(c.tolist(), i.tolist())"
+/// # [[10.0, 0.0], [0.0, 0.0]] [1, 0]
+/// ```
+#[test]
+fn green_kmeans_plusplus_weighted_zero_weight_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0], [10.0, 0.0]];
+    let weights = Array1::from(vec![0.0, 1.0]);
+    let (centers, indices) =
+        kmeans_plusplus_with_options(&x, 2, Some(&weights), Some(0), None).unwrap();
+    assert_eq!(centers, array![[10.0_f64, 0.0], [0.0, 0.0]]);
+    assert_eq!(indices.to_vec(), vec![1, 0]);
+}
+
+/// Standalone `kmeans_plusplus` validation mirrors sklearn's core public
+/// constraints: `n_clusters >= 1`, `n_samples >= n_clusters`, positive
+/// `n_local_trials`, matching `sample_weight` length, and finite non-negative
+/// weights.
+#[test]
+fn green_kmeans_plusplus_rejects_invalid_parameters() {
+    let x = array![[0.0_f64, 0.0], [1.0, 1.0]];
+    assert!(kmeans_plusplus(&x, 0, Some(0)).is_err());
+    assert!(kmeans_plusplus(&x, 3, Some(0)).is_err());
+    assert!(
+        kmeans_plusplus_with_options(&x, 1, None, Some(0), Some(0)).is_err(),
+        "sklearn requires n_local_trials >= 1"
+    );
+    assert!(
+        kmeans_plusplus_with_options(&x, 1, Some(&Array1::from(vec![1.0])), Some(0), None).is_err(),
+        "sample_weight length must match n_samples"
+    );
+    assert!(
+        kmeans_plusplus_with_options(&x, 1, Some(&Array1::from(vec![-1.0, 2.0])), Some(0), None)
+            .is_err(),
+        "sample_weight must be non-negative"
+    );
+}
 
 /// REQ-1 green-guard (2-blob partition up-to-permutation).
 ///

@@ -6,6 +6,7 @@
 //!
 //! - **[`KMeans`]** — K-Means clustering with k-Means++ initialization
 //!   and parallelized assignment via Rayon (REQ-6).
+//! - **[`kmeans_plusplus`]** — standalone k-means++ center initializer.
 //! - **[`DBSCAN`]** — Density-Based Spatial Clustering of Applications
 //!   with Noise (REQ-7).
 //! - **[`GaussianMixture`]** — Gaussian Mixture Models via the
@@ -106,7 +107,7 @@ pub use feature_agglomeration::{
 };
 pub use gmm::{CovarianceType, FittedGaussianMixture, GaussianMixture};
 pub use hdbscan::{FittedHdbscan, Hdbscan};
-pub use kmeans::{FittedKMeans, KMeans};
+pub use kmeans::{FittedKMeans, KMeans, kmeans_plusplus, kmeans_plusplus_with_options};
 pub use label_propagation::{FittedLabelPropagation, LabelPropagation, LabelPropagationKernel};
 pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel};
 pub use mean_shift::{FittedMeanShift, MeanShift};

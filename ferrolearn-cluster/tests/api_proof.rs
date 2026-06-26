@@ -25,6 +25,7 @@ use ferrolearn_cluster::{
     FeatureAgglomeration, GaussianMixture, Hdbscan, KMeans, LabelPropagation,
     LabelPropagationKernel, LabelSpreading, LabelSpreadingKernel, Linkage, MeanShift,
     MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering, WeightPriorType,
+    kmeans_plusplus, kmeans_plusplus_with_options,
 };
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ndarray::{Array1, Array2, array};
@@ -62,6 +63,15 @@ fn assert_proba_well_formed(proba: &Array2<f64>, n_samples: usize, n_components:
 #[test]
 fn api_proof_kmeans() {
     let x = two_blobs();
+
+    let (init_centers, init_indices) = kmeans_plusplus::<f64>(&x, 2, Some(42)).unwrap();
+    assert_eq!(init_centers.dim(), (2, 2));
+    assert_eq!(init_indices.len(), 2);
+    let weights = Array1::from(vec![1.0; x.nrows()]);
+    let (weighted_centers, weighted_indices) =
+        kmeans_plusplus_with_options::<f64>(&x, 2, Some(&weights), Some(42), Some(1)).unwrap();
+    assert_eq!(weighted_centers.dim(), (2, 2));
+    assert_eq!(weighted_indices.len(), 2);
 
     let m = KMeans::<f64>::new(2)
         .with_max_iter(100)

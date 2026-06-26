@@ -53,14 +53,14 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `Fit::fit` (greedy k-means++ `fn kmeans_plus_plus` → Lloyd `fn assign_clusters_into`/`fn recompute_centroids_into` → best-of-`n_init`) recovers sklearn's grouping on well-separated data. Consumers: PyO3 `RsKMeans::fit` (`clusterers.rs`) + crate re-export `pub use kmeans::{FittedKMeans, KMeans}` (`lib.rs`). Guards: `green_req1_two_blob_partition`, `green_req1_three_blob_partition` in `tests/divergence_kmeans.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `labels_` integers + `cluster_centers_`/`inertia_` VALUES (REQ-9) diverge. |
+//! | REQ-1 (`labels_` PARTITION up-to-permutation, separable data) | SHIPPED | impl `Fit::fit` (greedy k-means++ `fn kmeans_plusplus_inner` → Lloyd `fn assign_clusters_into`/`fn recompute_centroids_into` → best-of-`n_init`) recovers sklearn's grouping on well-separated data. Consumers: PyO3 `RsKMeans::fit` (`clusterers.rs`) + crate re-export `pub use kmeans::{FittedKMeans, KMeans, kmeans_plusplus, kmeans_plusplus_with_options}` (`lib.rs`). Guards: `green_req1_two_blob_partition`, `green_req1_three_blob_partition` in `tests/divergence_kmeans.rs` (canonicalized, live-oracle). Underclaim: PARTITION up-to-permutation only — `labels_` integers + `cluster_centers_`/`inertia_` VALUES (REQ-9) diverge. |
 //! | REQ-2 (`predict` nearest-center contract) | SHIPPED | impl `Predict::predict` (`fn nearest_center`) returns argmin-squared-euclidean center index + `FerroError::ShapeMismatch`; `transform(X).argmin(1) == predict(X)`. Consumers: PyO3 `RsKMeans::predict` + crate re-export. Guard: `green_req2_predict_is_transform_argmin`. |
 //! | REQ-3 (`transform` distance-to-centers contract) | SHIPPED | impl `Transform::transform` returns shape `(n_samples, n_clusters)`, column j = Euclidean distance to center j (= sklearn `_BaseKMeans.transform`). Consumers: PyO3 `RsKMeans::transform` + crate re-export. Guard: `green_req3_transform_shape_and_nonneg`. Underclaim: CONTRACT only — distances track `cluster_centers_` (REQ-9). |
 //! | REQ-4 (PyO3 binding marshalling) | SHIPPED | impl `#[pyclass(name="_RsKMeans")] RsKMeans` (`ferrolearn-python/src/clusterers.rs`) marshals `fit`/`predict`/`transform` + `cluster_centers_`/`labels_`/`inertia_`/`n_iter_` getters; registered in `ferrolearn-python/src/lib.rs`, wrapped `class KMeans(...)` in `python/ferrolearn/_clusterers.py`, exported in `__init__.py`. Verification: `maturin develop` + `pytest tests/ -q`. Underclaim: marshalling/shape contract — the binding's `n_init=10` signature default + `int64` label dtype diverge (REQ-12); fitted VALUES inherit REQ-9. |
 //! | REQ-6 (`labels_`/`inertia_` consistency with final centers) | SHIPPED | impl `Fit::fit` runs a final E-step (`inertia = assign_clusters_into(&mut labels, x, &centers)`) after the Lloyd loop so `labels_`/`inertia_` match the post-swap `cluster_centers_`, mirroring sklearn's post-loop E-step re-run (`_kmeans.py:605-625`). Invariant `fit(X).predict(X) == labels_` now holds. Guard: `pin_req6_predict_equals_labels`. Fixed #1037. |
 //! | REQ-14 (`n_init` constructor default = 1) | SHIPPED | impl `fn new` defaults `n_init: 1`, matching sklearn `n_init="auto"` → 1 for the default `init="k-means++"` (`_kmeans.py:886-896`). Guard: `pin_req14_n_init_default_is_one`. Fixed #1045. (The PyO3 binding's `n_init=10` signature default is the separate REQ-12.) |
 //! | REQ-5 (convergence criterion + relative tol) | NOT-STARTED | open prereq blocker #1036. sklearn converges on label-no-change OR `(center_shift**2).sum() <= mean(var(X))*tol` (`_kmeans.py:286-294,586-601`); ferrolearn uses absolute `tol` + `max_shift < tol` MAX-euclidean-shift (`fn recompute_centroids_into` + `fn fit`). Different threshold/reduction → different `n_iter_` + stop point. |
-//! | REQ-7 (`init` param + random/array/callable + exact k-means++) | NOT-STARTED | open prereq blocker #1038. sklearn `init ∈ {"k-means++","random"}|callable|array` default `"k-means++"` (`_kmeans.py:1391`); ferrolearn has NO `init` param (always greedy k-means++, `fn kmeans_plus_plus`). Default matches; param surface + non-default inits missing; exact k-means++ diverges (numpy RNG, REQ-8). |
+//! | REQ-7 (`init` param + random/array/callable + exact k-means++) | PARTIAL | Public `kmeans_plusplus` + `kmeans_plusplus_with_options` now expose sklearn's standalone k-means++ initializer shape `(centers, indices)`, `sample_weight`, and `n_local_trials`; KMeans still has NO `init` param (always greedy k-means++). Default matches; non-default `random`/array/callable inits missing; exact k-means++ seeded output diverges (numpy RNG, REQ-8). |
 //! | REQ-8 (`random_state` numpy-RNG parity) | NOT-STARTED | open prereq blocker #1039. sklearn `check_random_state` + numpy RNG; ferrolearn `StdRng::seed_from_u64` (`fn fit`). Different RNG → exact centers/labels/inertia/n_iter cannot match. Depends on a ferray `random` analog (R-SUBSTRATE-5); blocks REQ-9. |
 //! | REQ-9 (centers/inertia/label-integers/n_iter VALUE parity) | NOT-STARTED | open prereq blocker #1040. Exact values diverge via numpy-RNG (REQ-8), convergence + relative tol (REQ-5), and empty-cluster relocation — sklearn moves an emptied center to the farthest sample (`_relocate_empty_clusters_dense`), ferrolearn keeps the old center (`fn recompute_centroids_into` else-branch). Gated on REQ-5/REQ-8. |
 //! | REQ-10 (ctor/fit surface init/algorithm/copy_x/verbose/sample_weight + n_clusters=8 + error ABI) | NOT-STARTED | open prereq blocker #1041. sklearn `__init__` (`_kmeans.py:1387-1411`) + `fit(sample_weight)` + `_check_params_vs_input` (`InvalidParameterError`, `:875-908`) + `n_features_in_`; ferrolearn `KMeans<F>` has `n_clusters/max_iter/tol/n_init/random_state` only + `FerroError` ABI. |
@@ -68,6 +68,7 @@
 //! | REQ-12 (ferrolearn-python binding `n_init` default + `labels_` dtype) | NOT-STARTED | open prereq blocker #1043. PyO3 `RsKMeans::new` signature `n_init=10` + Python `ferrolearn.KMeans` `n_init=10` diverge from sklearn's effective `1` for k-means++ (R-DEFER-7 last layer); binding marshals `labels_` to `int64`, not sklearn `int32`. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #1044. `kmeans.rs` imports `ndarray`/`num-traits`/`rand`/`rayon`, not `ferray-core`/`ferray::linalg`/`ferray::random` (R-SUBSTRATE-1/2; RNG entangled with REQ-8). |
 //! | REQ-15 (reject non-finite input) | SHIPPED | `fn reject_non_finite` called at the top of `Fit::fit` (after the param/sample checks, before k-means++/Lloyd) AND in `Predict::predict` (on the query X) rejects NaN AND infinity with `FerroError::InvalidParameter{name:"X"}`, mirroring sklearn's `_validate_data(force_all_finite=True)` default reached from `KMeans.fit` (`_kmeans.py:1464`) and `KMeans.predict`→`_check_test_data` (`:950`), which raise `ValueError` (`validation.py:147-154`). Consumers: the existing `fit`/`predict` entries — PyO3 `RsKMeans::fit`/`::predict` (`clusterers.rs`) + crate re-export `pub use kmeans::{FittedKMeans, KMeans}` (`lib.rs`). Pinned by `divergence_nonfinite_reject.rs` (`divergence_kmeans_fit_rejects_nan/_inf`, `divergence_kmeans_predict_rejects_nan`) — live sklearn 1.5.2 raises, ferrolearn now `Err`. Finite input byte-identical (the module's oracle pins stay green). |
+//! | REQ-16 (`kmeans_plusplus` standalone helper) | SHIPPED | `pub fn kmeans_plusplus` + `pub fn kmeans_plusplus_with_options` mirror sklearn's public helper output shape `(centers, indices)`, weighted seeding, and `n_local_trials`; crate-root re-export is the production consumer. Verification: `tests/divergence_kmeans.rs` pins deterministic sklearn outputs and validation constraints; `tests/api_proof.rs` exercises both public functions. Underclaim: no `x_squared_norms` precompute argument and seeded exact indices still diverge via Rust `StdRng` vs NumPy RNG (REQ-8). |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, Predict, Transform};
@@ -219,24 +220,110 @@ fn squared_euclidean<F: Float>(a: &[F], b: &[F]) -> F {
         .fold(F::zero(), |acc, (&ai, &bi)| acc + (ai - bi) * (ai - bi))
 }
 
+fn validate_kmeans_plusplus_inputs<F: Float>(
+    x: &Array2<F>,
+    n_clusters: usize,
+    sample_weight: Option<&Array1<F>>,
+    n_local_trials: Option<usize>,
+) -> Result<Vec<F>, FerroError> {
+    let n_samples = x.nrows();
+    if n_clusters == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_clusters".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    if n_samples < n_clusters {
+        return Err(FerroError::InsufficientSamples {
+            required: n_clusters,
+            actual: n_samples,
+            context: "kmeans_plusplus requires at least n_clusters samples".into(),
+        });
+    }
+    if let Some(n_local_trials) = n_local_trials {
+        if n_local_trials == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "n_local_trials".into(),
+                reason: "must be at least 1".into(),
+            });
+        }
+    }
+    reject_non_finite(x)?;
+
+    let weights = if let Some(sample_weight) = sample_weight {
+        if sample_weight.len() != n_samples {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![n_samples],
+                actual: vec![sample_weight.len()],
+                context: "sample_weight length must match n_samples".into(),
+            });
+        }
+        let mut sum = F::zero();
+        for &w in sample_weight {
+            if !w.is_finite() || w < F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "sample_weight".into(),
+                    reason: "sample_weight entries must be finite and non-negative".into(),
+                });
+            }
+            sum = sum + w;
+        }
+        if sum <= F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: "sample_weight must sum to a positive value".into(),
+            });
+        }
+        sample_weight.to_vec()
+    } else {
+        vec![F::one(); n_samples]
+    };
+
+    Ok(weights)
+}
+
+fn weighted_random_index<F: Float>(weights: &[F], total_weight: F, rng: &mut StdRng) -> usize {
+    let threshold = F::from(rng.random::<f64>()).unwrap_or_else(F::zero) * total_weight;
+    let mut cumsum = F::zero();
+    for (i, &w) in weights.iter().enumerate() {
+        cumsum = cumsum + w;
+        if cumsum > threshold {
+            return i;
+        }
+    }
+    weights.len().saturating_sub(1)
+}
+
 /// Greedy k-Means++ initialization (Arthur & Vassilvitskii 2007 with the
 /// scikit-learn-style multi-trial improvement). At each pick, sample
-/// `2 + log(k)` candidates with probability proportional to D(x)² and keep
-/// the one minimising the resulting potential.
-fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Array2<F> {
+/// `2 + log(k)` candidates with probability proportional to weighted D(x)^2
+/// and keep the one minimising the resulting potential.
+fn kmeans_plusplus_inner<F: Float>(
+    x: &Array2<F>,
+    k: usize,
+    sample_weight: &[F],
+    rng: &mut StdRng,
+    n_local_trials: Option<usize>,
+) -> (Array2<F>, Array1<usize>) {
     let n_samples = x.nrows();
     let n_features = x.ncols();
     let mut centers = Array2::zeros((k, n_features));
+    let mut indices = Array1::zeros(k);
 
     if n_samples == 0 {
-        return centers;
+        return (centers, indices);
     }
 
-    let first_idx = rng.random_range(0..n_samples);
+    let total_weight = sample_weight
+        .iter()
+        .copied()
+        .fold(F::zero(), |acc, w| acc + w);
+    let first_idx = weighted_random_index(sample_weight, total_weight, rng);
     centers.row_mut(0).assign(&x.row(first_idx));
+    indices[0] = first_idx;
 
     if k == 1 {
-        return centers;
+        return (centers, indices);
     }
 
     // Distance from each sample to its nearest selected centre.
@@ -249,13 +336,17 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
         }
     }
 
-    let n_trials = (2 + (k as f64).ln().floor() as usize).max(1);
+    let n_trials = n_local_trials.unwrap_or_else(|| (2 + (k as f64).ln().floor() as usize).max(1));
 
     for c in 1..k {
-        let total: F = min_dists.iter().fold(F::zero(), |acc, &d| acc + d);
+        let total: F = min_dists
+            .iter()
+            .zip(sample_weight.iter())
+            .fold(F::zero(), |acc, (&d, &w)| acc + d * w);
         if total <= F::zero() {
-            let idx = rng.random_range(0..n_samples);
+            let idx = 0;
             centers.row_mut(c).assign(&x.row(idx));
+            indices[c] = idx;
             continue;
         }
 
@@ -268,7 +359,7 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
             let mut cumsum = F::zero();
             let mut candidate = n_samples - 1;
             for i in 0..n_samples {
-                cumsum = cumsum + min_dists[i];
+                cumsum = cumsum + min_dists[i] * sample_weight[i];
                 if cumsum >= threshold {
                     candidate = i;
                     break;
@@ -283,7 +374,7 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
                 if d < new_dists[i] {
                     new_dists[i] = d;
                 }
-                potential = potential + new_dists[i];
+                potential = potential + new_dists[i] * sample_weight[i];
             }
 
             if best_potential.is_none_or(|bp| potential < bp) {
@@ -294,12 +385,57 @@ fn kmeans_plus_plus<F: Float>(x: &Array2<F>, k: usize, rng: &mut StdRng) -> Arra
         }
 
         centers.row_mut(c).assign(&x.row(best_candidate));
+        indices[c] = best_candidate;
         if let Some(d) = best_new_dists {
             min_dists = d;
         }
     }
 
-    centers
+    (centers, indices)
+}
+
+/// Initialize cluster centers according to the k-means++ strategy.
+///
+/// Returns `(centers, indices)`, where `centers` has shape
+/// `(n_clusters, n_features)` and `indices` contains the selected row index for
+/// each center. This mirrors `sklearn.cluster.kmeans_plusplus` for the default
+/// k-means++ initializer shape. Seeded exact row choices still differ from
+/// sklearn because ferrolearn uses Rust's `StdRng`, not NumPy's RandomState.
+pub fn kmeans_plusplus<F>(
+    x: &Array2<F>,
+    n_clusters: usize,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array1<usize>), FerroError>
+where
+    F: Float,
+{
+    kmeans_plusplus_with_options(x, n_clusters, None, random_state, None)
+}
+
+/// Initialize cluster centers with k-means++ options.
+///
+/// `sample_weight` controls the first-center and potential weighting, matching
+/// sklearn's weighted seeding semantics. `n_local_trials = None` uses
+/// `2 + floor(ln(n_clusters))`, while `Some(1)` recovers vanilla k-means++.
+pub fn kmeans_plusplus_with_options<F>(
+    x: &Array2<F>,
+    n_clusters: usize,
+    sample_weight: Option<&Array1<F>>,
+    random_state: Option<u64>,
+    n_local_trials: Option<usize>,
+) -> Result<(Array2<F>, Array1<usize>), FerroError>
+where
+    F: Float,
+{
+    let weights = validate_kmeans_plusplus_inputs(x, n_clusters, sample_weight, n_local_trials)?;
+    let mut rng = StdRng::seed_from_u64(random_state.unwrap_or(0));
+    Ok(kmeans_plusplus_inner(
+        x,
+        n_clusters,
+        &weights,
+        &mut rng,
+        n_local_trials,
+    ))
 }
 
 /// Minimum work units (samples * features) before we parallelize.
@@ -516,7 +652,9 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for KMeans<F> {
             let mut rng = StdRng::seed_from_u64(base_seed.wrapping_add(run as u64));
 
             // k-Means++ initialization.
-            let mut centers = kmeans_plus_plus(x, self.n_clusters, &mut rng);
+            let weights = vec![F::one(); n_samples];
+            let (mut centers, _) =
+                kmeans_plusplus_inner(x, self.n_clusters, &weights, &mut rng, None);
 
             let mut n_iter = 0;
 

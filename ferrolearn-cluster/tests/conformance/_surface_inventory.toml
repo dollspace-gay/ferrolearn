@@ -154,6 +154,16 @@ phase = "cluster"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_cluster::kmeans_plusplus"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::kmeans_plusplus_with_options"
+phase = "cluster"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_cluster::LabelPropagation"
 phase = "cluster"
 fixture = ""
@@ -212,4 +222,3 @@ fixture = ""
 path = "ferrolearn_cluster::WeightPriorType"
 phase = "cluster"
 fixture = ""
-
