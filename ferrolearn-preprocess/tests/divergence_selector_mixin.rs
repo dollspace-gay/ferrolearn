@@ -18,9 +18,9 @@
 
 use ferrolearn_core::traits::{Fit, Transform};
 use ferrolearn_preprocess::{
-    Direction, RFE, RFECV, ScoreFunc, SelectFdr, SelectFpr, SelectFromModelExt, SelectFwe,
-    SelectKBest, SelectPercentile, SelectorMixin, SequentialFeatureSelector, ThresholdStrategy,
-    VarianceThreshold,
+    Direction, GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, RFE, RFECV,
+    ScoreFunc, SelectFdr, SelectFpr, SelectFromModelExt, SelectFwe, SelectKBest, SelectPercentile,
+    SelectorMixin, SequentialFeatureSelector, ThresholdStrategy, VarianceThreshold,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -102,6 +102,15 @@ fn selector_mixin_is_shared_across_fitted_selectors() {
         .fit(&x, &y_usize)
         .unwrap();
     assert_selector(&percentile, 3);
+
+    let generic = GenericUnivariateSelect::<f64>::new(
+        ScoreFunc::FClassif,
+        GenericUnivariateMode::KBest,
+        GenericUnivariateParam::Value(2.0),
+    )
+    .fit(&x, &y_usize)
+    .unwrap();
+    assert_selector(&generic, 3);
 
     let p_values = array![0.001_f64, 0.2, 0.9];
     let fpr = SelectFpr::<f64>::new(0.05).fit(&p_values, &()).unwrap();

@@ -24,9 +24,10 @@ supplies boolean support masks, support indices, dense inverse-transform zero-fi
 and selected feature names.
 
 Implemented for: `FittedVarianceThreshold`, `FittedSelectKBest`,
-`SelectFromModel`, `FittedSelectPercentile`, `FittedSelectFpr`,
-`FittedSelectFdr`, `FittedSelectFwe`, `FittedSelectFromModelExt`, `RFE`,
-`RFECV`, and `FittedSequentialFeatureSelector`.
+`FittedGenericUnivariateSelect`, `SelectFromModel`, `FittedSelectPercentile`,
+`FittedSelectFpr`, `FittedSelectFdr`, `FittedSelectFwe`,
+`FittedSelectFromModelExt`, `RFE`, `RFECV`, and
+`FittedSequentialFeatureSelector`.
 
 Residual gaps: sparse matrices, pandas output, Python `BaseEstimator`/fitted-state
 checks, sklearn attribute names such as `feature_names_in_`, and estimator

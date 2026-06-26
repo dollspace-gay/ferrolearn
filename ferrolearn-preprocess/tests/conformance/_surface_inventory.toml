@@ -384,6 +384,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::GenericUnivariateSelect"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::SelectPercentile"
 phase = "preprocess"
 fixture = ""

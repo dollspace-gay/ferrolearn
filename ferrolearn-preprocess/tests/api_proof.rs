@@ -10,7 +10,8 @@ use ferrolearn_preprocess::imputer::ImputeStrategy;
 use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, ColumnSelector, ColumnTransformer,
-    CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection, InitialStrategy,
+    CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection,
+    GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, InitialStrategy,
     IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy,
     LabelBinarizer, LabelEncoder, MaxAbsScaler, MinMaxScaler, MissingIndicator,
     MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
@@ -278,6 +279,15 @@ fn api_proof_feature_selection() {
     let f = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif)
         .fit(&x, &y)
         .unwrap();
+    let _ = f.transform(&x).unwrap();
+    let f = GenericUnivariateSelect::<f64>::new(
+        ScoreFunc::FClassif,
+        GenericUnivariateMode::KBest,
+        GenericUnivariateParam::Value(2.0),
+    )
+    .fit(&x, &y)
+    .unwrap();
+    let _ = f.get_support_indices();
     let _ = f.transform(&x).unwrap();
 
     // SelectFpr/Fdr/Fwe take p-values (Array1<F>) — get them from f_classif first.

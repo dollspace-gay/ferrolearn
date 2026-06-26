@@ -11,6 +11,7 @@ use ndarray::Array2;
 use num_traits::Float;
 
 use crate::feature_selection::{FittedSelectKBest, FittedVarianceThreshold, SelectFromModel};
+use crate::generic_univariate_select::FittedGenericUnivariateSelect;
 use crate::rfe::{RFE, RFECV};
 use crate::select_from_model::FittedSelectFromModelExt;
 use crate::select_percentile::FittedSelectPercentile;
@@ -128,6 +129,16 @@ impl<F: Float + Send + Sync + 'static> SelectorMixin<F> for FittedVarianceThresh
 }
 
 impl<F: Float + Send + Sync + 'static> SelectorMixin<F> for FittedSelectKBest<F> {
+    fn n_features_in(&self) -> usize {
+        self.scores().len()
+    }
+
+    fn selected_indices(&self) -> &[usize] {
+        self.selected_indices()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> SelectorMixin<F> for FittedGenericUnivariateSelect<F> {
     fn n_features_in(&self) -> usize {
         self.scores().len()
     }

@@ -15,7 +15,7 @@
 //! Mirrors the bayes/lib precedent (`ferrolearn-bayes/tests/divergence_lib.rs`,
 //! `api_proof` pattern): this file PINS the public surface. The single
 //! `use ferrolearn_preprocess::{...}` block below names every re-exported item
-//! the design doc claims PRESENT. If any re-export at `lib.rs:106-163` is ever
+//! the design doc claims PRESENT. If any re-export at `lib.rs:132-202` is ever
 //! removed or renamed, this test file fails to COMPILE — that compile failure is
 //! the boundary's regression guard (AC-1: every name in the `pub use` block
 //! resolves to an existing type/function).
@@ -29,7 +29,7 @@
 //! `.design/preprocess/lib.md` Probes), not transcribed from the ferrolearn side.
 
 // The compile-time boundary guard. Every name here is a re-export at
-// `ferrolearn-preprocess/src/lib.rs:106-163`. Removal => unresolved import =>
+// `ferrolearn-preprocess/src/lib.rs:132-202`. Removal => unresolved import =>
 // this crate's test build fails. This is intentional and load-bearing.
 use ferrolearn_preprocess::{
     // supporting enums for the preprocessing estimators
@@ -51,6 +51,7 @@ use ferrolearn_preprocess::{
     FittedCountVectorizer,
     // sklearn.random_projection __all__ (PRESENT)
     FittedGaussianRandomProjection,
+    FittedGenericUnivariateSelect,
     // sklearn.impute __all__ (PRESENT; IterativeImputer is experimental in 1.5.2)
     FittedIterativeImputer,
     FittedKBinsDiscretizer,
@@ -84,6 +85,9 @@ use ferrolearn_preprocess::{
     FittedVarianceThreshold,
     FunctionTransformer,
     GaussianRandomProjection,
+    GenericUnivariateMode,
+    GenericUnivariateParam,
+    GenericUnivariateSelect,
     ImputeStrategy,
     InitialStrategy,
     IterativeImputer,
@@ -164,12 +168,11 @@ fn name_type<T>() {}
 ///   * `sklearn/compose/__init__.py:15-20` (`__all__`)
 ///
 /// Each re-exported estimator surfaced at `ferrolearn-preprocess/src/lib.rs`
-/// (`:106-163`) is named below. If any `pub use` is removed/renamed the `use`
+/// (`:132-202`) is named below. If any `pub use` is removed/renamed the `use`
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
-/// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
-/// `mutual_info_*`,
+/// (R-CHAR-3); ABSENT names (`mutual_info_*`,
 /// `f_oneway`,
 /// `johnson_lindenstrauss_min_dim`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`) are
@@ -235,6 +238,10 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedVarianceThreshold<f64>>();
     name_type::<SelectKBest<f64>>();
     name_type::<FittedSelectKBest<f64>>();
+    name_type::<GenericUnivariateSelect<f64>>();
+    name_type::<FittedGenericUnivariateSelect<f64>>();
+    name_type::<GenericUnivariateMode>();
+    name_type::<GenericUnivariateParam>();
     name_type::<&dyn SelectorMixin<f64>>();
     name_type::<SelectPercentile<f64>>();
     name_type::<FittedSelectPercentile<f64>>();
