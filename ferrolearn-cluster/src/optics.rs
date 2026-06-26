@@ -633,7 +633,7 @@ struct SteepDownArea {
 /// (the float-fraction `<= 1` resolution in `cluster_optics_xi` `:900-906` is
 /// REQ-10, out of scope), so only the `None → min_samples` default is applied
 /// here.
-fn cluster_optics_xi<F: Float>(
+pub fn cluster_optics_xi<F: Float>(
     reachability: &Array1<F>,
     predecessor: &Array1<i64>,
     ordering: &[usize],

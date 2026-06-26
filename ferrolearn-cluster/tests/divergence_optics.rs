@@ -18,8 +18,8 @@
 //!       * `green_ordering_small10`            — REQ-2 ordering VALUE after the #1080 fix
 //!         (formerly `divergence_ordering_small10`; the fix landed so the pin is green)
 
-use ferrolearn_cluster::OPTICS;
 use ferrolearn_cluster::optics::OpticsClusterMethod;
+use ferrolearn_cluster::{OPTICS, cluster_optics_xi};
 use ferrolearn_core::Fit;
 use ndarray::Array2;
 
@@ -1054,6 +1054,33 @@ fn green_xi_labels_hierarchy_doctest() {
         "cluster_hierarchy_ keeps nested clusters: {} > {n_unique}",
         fitted.cluster_hierarchy().nrows()
     );
+}
+
+/// Public helper: `ferrolearn_cluster::cluster_optics_xi` mirrors
+/// `sklearn.cluster.cluster_optics_xi` when fed a fitted OPTICS graph.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import OPTICS, cluster_optics_xi; \
+///     X=np.array([[1,2],[2,5],[3,6],[8,7],[8,8],[7,3]]); \
+///     m=OPTICS(min_samples=2,cluster_method='xi').fit(X); \
+///     labels,hierarchy=cluster_optics_xi(reachability=m.reachability_,predecessor=m.predecessor_,ordering=m.ordering_,min_samples=2); \
+///     print(labels.tolist()); print(hierarchy.tolist())"
+///   -> labels_:           [0, 0, 0, 1, 1, 1]
+///      cluster_hierarchy_: [[0, 2], [3, 5], [0, 5]]
+#[test]
+fn green_cluster_optics_xi_public_helper_doctest() {
+    let fitted = OPTICS::<f64>::new(2).fit(&docstring(), &()).unwrap();
+    let (labels, hierarchy) = cluster_optics_xi(
+        fitted.reachability(),
+        fitted.predecessor(),
+        fitted.ordering(),
+        0.05,
+        2,
+        None,
+        true,
+    );
+    assert_eq!(labels.as_slice().unwrap(), &[0, 0, 0, 1, 1, 1]);
+    assert_hierarchy(&hierarchy, &[[0, 2], [3, 5], [0, 5]]);
 }
 
 /// REQ-5/REQ-8. `three_blobs` (min_samples=2, default xi=0.05): three leaf
