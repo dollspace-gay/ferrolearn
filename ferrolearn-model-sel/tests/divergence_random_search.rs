@@ -14,9 +14,9 @@
 //!   #1784 carve-out (the #1774 reclassification precedent: green-guard the
 //!   current behavior because the faithful fix needs a `Distribution`-trait
 //!   cardinality extension, not a single-file edit).
-//! - `divergence_empty_param_distributions` is an `#[ignore]`'d FAILING pin: an
-//!   UNCLAIMED divergence where sklearn runs 1 empty candidate but ferrolearn
-//!   errors. Tracking #1788 (new-blocker).
+//! - `green_empty_param_distributions_one_candidate` pins the fixed empty-grid
+//!   edge: sklearn runs exactly one empty candidate, and ferrolearn now does the
+//!   same. Tracking #1788.
 //!
 //! All expected values come from the LIVE sklearn 1.5.2 oracle (run from /tmp),
 //! never copied from the ferrolearn side (R-CHAR-3).
@@ -24,7 +24,7 @@
 use ferrolearn_core::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, Pipeline, PipelineEstimator};
 use ferrolearn_model_sel::distributions::{Choice, Distribution, Uniform};
-use ferrolearn_model_sel::{KFold, ParamSet, ParamValue, RandomizedSearchCV};
+use ferrolearn_model_sel::{KFold, ParamSet, ParamValue, ParameterSampler, RandomizedSearchCV};
 use ndarray::{Array1, Array2};
 
 // ---------------------------------------------------------------------------
@@ -133,6 +133,50 @@ fn green_req1_continuous_with_replacement_count() {
     for folds in &results.all_scores {
         assert_eq!(folds.len(), SK_N_FOLDS);
     }
+}
+
+/// Green guard: the standalone public `ParameterSampler` surface yields the
+/// same count as sklearn's continuous with-replacement branch.
+///
+/// Oracle (live sklearn 1.5.2, from /tmp):
+/// ```text
+/// from scipy.stats import uniform
+/// from sklearn.model_selection import ParameterSampler
+/// len(list(ParameterSampler({'a': uniform(0,1)}, n_iter=7, random_state=42))) -> 7
+/// ```
+#[test]
+fn green_parameter_sampler_public_surface_count() {
+    let sampler = ParameterSampler::new(
+        vec![("a".into(), Box::new(Uniform::new(0.0, 1.0)))],
+        7,
+        Some(42),
+    );
+    assert_eq!(sampler.len(), 7);
+    let samples = sampler.sample().unwrap();
+    assert_eq!(samples.len(), 7);
+    for sample in samples {
+        assert!(
+            sample.contains_key("a"),
+            "each sampled parameter set must include key 'a'"
+        );
+    }
+}
+
+/// Green guard: `ParameterSampler` with an empty distribution set yields one
+/// empty candidate, matching sklearn's empty-grid cap.
+///
+/// Oracle (live sklearn 1.5.2, from /tmp):
+/// ```text
+/// from sklearn.model_selection import ParameterSampler
+/// list(ParameterSampler({}, n_iter=3, random_state=0)) -> [{}]
+/// ```
+#[test]
+fn green_parameter_sampler_empty_grid_one_candidate() {
+    let sampler = ParameterSampler::new(Vec::new(), 3, Some(0));
+    assert_eq!(sampler.len(), 1);
+    let samples = sampler.sample().unwrap();
+    assert_eq!(samples.len(), 1);
+    assert!(samples[0].is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -421,18 +465,14 @@ fn green_1784_choice_with_replacement_no_cap() {
 }
 
 // ---------------------------------------------------------------------------
-// FAILING pin — UNCLAIMED divergence: empty param_distributions (#1788)
+// GREEN guard — empty param_distributions yields one candidate (#1788)
 // ---------------------------------------------------------------------------
 
-/// Divergence (UNCLAIMED by the design doc): sklearn `RandomizedSearchCV` with an
-/// EMPTY parameter grid `{}` runs successfully with exactly ONE trivial (empty)
-/// candidate — `_is_all_lists()` is vacuously True for `{}`, `grid_size = 1`, so
-/// `n_iter` is capped to `min(n_iter, 1) = 1` and a single empty `ParamSet` is
-/// yielded (`sklearn/model_selection/_search.py:313-328`, `:345-347`).
-///
-/// ferrolearn `RandomizedSearchCV::fit` (`random_search.rs:131-136`) instead
-/// REJECTS an empty `param_distributions` with `FerroError::InvalidParameter`,
-/// never running the search.
+/// Green guard: sklearn `RandomizedSearchCV` with an EMPTY parameter grid `{}`
+/// runs successfully with exactly ONE trivial (empty) candidate — `_is_all_lists()`
+/// is vacuously True for `{}`, `grid_size = 1`, so `n_iter` is capped to
+/// `min(n_iter, 1) = 1` and a single empty `ParamSet` is yielded
+/// (`sklearn/model_selection/_search.py:313-328`, `:345-347`).
 ///
 /// Oracle (live sklearn 1.5.2, from /tmp):
 /// ```text
@@ -443,11 +483,9 @@ fn green_1784_choice_with_replacement_no_cap() {
 /// len(rs.cv_results_['params'])     -> 1
 /// (also: ParameterSampler({}, n_iter=3, random_state=0) -> [{}], len 1, + UserWarning)
 /// ```
-/// sklearn returns 1 candidate; ferrolearn returns an error. This is a
-/// DETERMINISTIC count divergence on the empty-grid edge. Tracking #1788
-/// (new-blocker).
+/// sklearn returns 1 candidate; ferrolearn now matches that count. Tracking #1788.
 #[test]
-fn divergence_empty_param_distributions() {
+fn green_empty_param_distributions_one_candidate() {
     // sklearn (oracle): empty grid -> exactly ONE empty candidate.
     const SK_N_CANDIDATES: usize = 1;
 
@@ -463,7 +501,7 @@ fn divergence_empty_param_distributions() {
     let x = Array2::<f64>::zeros((30, 2));
     let y = Array1::<f64>::from_elem(30, 1.0);
 
-    // sklearn fits successfully; ferrolearn currently returns Err here.
+    // sklearn fits successfully; ferrolearn must match that empty-grid behavior.
     rs.fit(&x, &y)
         .expect("sklearn runs an empty grid as 1 candidate; ferrolearn must not error");
 

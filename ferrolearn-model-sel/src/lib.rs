@@ -19,6 +19,7 @@
 //! - [`TimeSeriesSplit`] — time-series aware cross-validation splitter.
 //! - [`HalvingGridSearchCV`] — successive-halving hyperparameter search.
 //! - [`HalvingRandomSearchCV`] — successive-halving search with random sampling.
+//! - [`ParameterGrid`] / [`ParameterSampler`] — sklearn-named parameter iterators.
 //! - [`macro@param_grid`] — macro for building Cartesian-product parameter grids.
 //! - [`ParamValue`] / [`ParamSet`] — hyperparameter value and set types.
 //! - [`distributions`] — sampling distributions for [`RandomizedSearchCV`].
@@ -102,8 +103,8 @@ pub use multioutput::{
     FittedMultiOutputClassifier, FittedMultiOutputRegressor, MultiOutputClassifier,
     MultiOutputRegressor,
 };
-pub use param_grid::{ParamSet, ParamValue};
-pub use random_search::RandomizedSearchCV;
+pub use param_grid::{ParamSet, ParamValue, ParameterGrid};
+pub use random_search::{ParameterSampler, RandomizedSearchCV};
 pub use self_training::{FittedSelfTrainingClassifier, SelfTrainingClassifier, UNLABELED};
 pub use split::train_test_split;
 pub use splitters::{

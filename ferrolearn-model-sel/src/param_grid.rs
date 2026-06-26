@@ -2,6 +2,7 @@
 //!
 //! This module defines:
 //!
+//! - [`ParameterGrid`] — an explicit sklearn-named Cartesian-product grid.
 //! - [`ParamValue`] — a dynamically-typed hyperparameter value.
 //! - [`ParamSet`] — a single parameter configuration (`HashMap<String, ParamValue>`).
 //! - [`macro@crate::param_grid`] — a macro that builds the Cartesian product
@@ -28,17 +29,19 @@
 //! | REQ | Behavior | Status | Evidence |
 //! |-----|----------|--------|----------|
 //! | REQ-1 | Cartesian-product contents | SHIPPED | `param_grid!` iterative product = `itertools.product` contents; `guard_cartesian_product_contents_match` (set equality vs live oracle) |
-//! | REQ-2 | enumeration order (sorted keys) | SHIPPED | macro sorts axes `axes.sort_by(\|a,b\| a.0.cmp(&b.0))` = sklearn `sorted(p.items())` (`_search.py:157`, fixed #1698); `divergence_enumeration_order_sorted_keys` |
+//! | REQ-2 | enumeration order (sorted keys) | SHIPPED | macro and `ParameterGrid::new` sort axes by key = sklearn `sorted(p.items())` (`_search.py:157`, fixed #1698); `green_enumeration_order_sorted_keys`, `green_parameter_grid_public_surface_matches_sklearn` |
 //! | REQ-3 | list-of-dicts grid (union of sub-grids) | NOT-STARTED | `param_grid!` is single-dict only (`_search.py:114-117`) — blocker #1700 |
 //! | REQ-4 | `len`/indexing surface | SHIPPED | native `Vec` `.len()`/`[i]` (R-DEV-7); sklearn's lazy O(1) `__getitem__` not ported (eager materialization) |
-//! | REQ-5 | empty-value-list rejection | NOT-STARTED | `param_grid!{ "a"=>[] }` yields `[]`; sklearn raises `ValueError` (`_search.py:138-142`); a macro has no `Result` channel — blocker #1699 (empty-dict → `[{}]` matches) |
+//! | REQ-5 | empty-value-list rejection | SHIPPED for `ParameterGrid`; NOT-STARTED for macro | `ParameterGrid::new` rejects empty value lists with `FerroError::InvalidParameter`; `param_grid!{ "a"=>[] }` still yields `[]` because a macro has no `Result` channel — blocker #1699 (empty-dict → `[{}]` matches) |
 //! | REQ-6 | `ParamValue` type coverage | SHIPPED | enum + `From` for f64/f32/i64/i32/usize/bool/String/&str |
-//! | REQ-7 | non-test production consumer | SHIPPED | `ParamSet`/`param_grid!` consumed by `grid_search.rs` + `random_search.rs` |
+//! | REQ-7 | non-test production consumer | SHIPPED | `ParameterGrid`/`ParamSet`/`ParamValue` are re-exported; `ParamSet`/`param_grid!` consumed by `grid_search.rs` + `random_search.rs` |
 //! | REQ-8 | ferray substrate | SHIPPED (N/A) | no array layer (strings/values only) |
 //!
 //! Reference: scikit-learn 1.5.2 (commit 156ef14).
 
 use std::collections::HashMap;
+
+use ferrolearn_core::FerroError;
 
 /// A dynamically-typed hyperparameter value.
 ///
@@ -70,6 +73,111 @@ impl std::fmt::Display for ParamValue {
 ///
 /// Created by [`macro@crate::param_grid`] or built manually.
 pub type ParamSet = HashMap<String, ParamValue>;
+
+/// Explicit sklearn-named parameter-grid surface.
+///
+/// This is the eager Rust analog of `sklearn.model_selection.ParameterGrid`:
+/// it materializes every Cartesian-product combination as a [`ParamSet`],
+/// enumerating axes in sorted-key order. Unlike the [`macro@crate::param_grid`]
+/// macro, this constructor has a [`Result`] channel and rejects empty value
+/// lists, matching sklearn's `ValueError` for invalid grids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParameterGrid {
+    params: Vec<ParamSet>,
+}
+
+impl ParameterGrid {
+    /// Build a single-dict Cartesian-product parameter grid.
+    ///
+    /// The input is a list of `(name, values)` axes. Keys are sorted before
+    /// enumeration so the sequence matches sklearn's `sorted(p.items())`
+    /// order. An empty axis list yields one empty [`ParamSet`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when any axis has no values.
+    pub fn new(mut axes: Vec<(String, Vec<ParamValue>)>) -> Result<Self, FerroError> {
+        for (name, values) in &axes {
+            if values.is_empty() {
+                return Err(FerroError::InvalidParameter {
+                    name: name.clone(),
+                    reason: "parameter grid values must be a non-empty sequence".to_string(),
+                });
+            }
+        }
+
+        axes.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let mut result: Vec<ParamSet> = vec![ParamSet::new()];
+        for (name, values) in axes {
+            let mut next = Vec::with_capacity(result.len() * values.len());
+            for existing in &result {
+                for val in &values {
+                    let mut entry = existing.clone();
+                    entry.insert(name.clone(), val.clone());
+                    next.push(entry);
+                }
+            }
+            result = next;
+        }
+
+        Ok(Self { params: result })
+    }
+
+    /// Wrap already-materialized parameter combinations.
+    pub fn from_params(params: Vec<ParamSet>) -> Self {
+        Self { params }
+    }
+
+    /// Return the materialized combinations.
+    pub fn as_slice(&self) -> &[ParamSet] {
+        &self.params
+    }
+
+    /// Consume the grid and return the materialized combinations.
+    pub fn into_vec(self) -> Vec<ParamSet> {
+        self.params
+    }
+
+    /// Number of combinations.
+    pub fn len(&self) -> usize {
+        self.params.len()
+    }
+
+    /// Whether the materialized grid contains no combinations.
+    pub fn is_empty(&self) -> bool {
+        self.params.is_empty()
+    }
+
+    /// Iterate over the materialized combinations.
+    pub fn iter(&self) -> std::slice::Iter<'_, ParamSet> {
+        self.params.iter()
+    }
+}
+
+impl IntoIterator for ParameterGrid {
+    type Item = ParamSet;
+    type IntoIter = std::vec::IntoIter<ParamSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.params.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a ParameterGrid {
+    type Item = &'a ParamSet;
+    type IntoIter = std::slice::Iter<'a, ParamSet>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl From<ParameterGrid> for Vec<ParamSet> {
+    fn from(grid: ParameterGrid) -> Self {
+        grid.into_vec()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // param_grid! macro

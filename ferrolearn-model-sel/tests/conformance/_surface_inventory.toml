@@ -229,6 +229,16 @@ phase = "model_sel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_model_sel::ParameterGrid"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_model_sel::ParameterSampler"
+phase = "model_sel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_model_sel::ParamValue"
 phase = "model_sel"
 fixture = ""
@@ -322,4 +332,3 @@ fixture = ""
 path = "ferrolearn_model_sel::ValidationCurveResult"
 phase = "model_sel"
 fixture = ""
-

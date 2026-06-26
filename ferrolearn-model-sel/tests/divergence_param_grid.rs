@@ -1,4 +1,4 @@
-//! Divergence tests for `param_grid!` / `ParamValue` / `ParamSet` vs
+//! Divergence tests for `ParameterGrid` / `param_grid!` / `ParamValue` / `ParamSet` vs
 //! scikit-learn 1.5.2 `sklearn.model_selection.ParameterGrid`.
 //!
 //! Upstream: `sklearn/model_selection/_search.py` class `ParameterGrid`
@@ -13,7 +13,7 @@
 //! ```
 //! No expected value is copied from the ferrolearn side.
 
-use ferrolearn_model_sel::{ParamSet, ParamValue, param_grid};
+use ferrolearn_model_sel::{ParamSet, ParamValue, ParameterGrid, param_grid};
 
 /// Build the `ParamSet` the live sklearn oracle yields, for comparison.
 /// Keys/values transcribed from the oracle dump (NOT from ferrolearn output).
@@ -25,28 +25,18 @@ fn oracle_set(pairs: &[(&str, ParamValue)]) -> ParamSet {
 }
 
 // ---------------------------------------------------------------------------
-// REQ-2 — enumeration ORDER parity (FAILING / headline divergence).
+// REQ-2 — enumeration ORDER parity.
 // ---------------------------------------------------------------------------
 
-/// Divergence: `param_grid!` enumerates combinations in WRITTEN key order,
-/// whereas `sklearn/model_selection/_search.py:157`
-/// (`items = sorted(p.items())`) sorts keys before `itertools.product`
-/// (`:162`), so the SEQUENCE differs when keys are written non-sorted.
+/// Guard: `param_grid!` enumerates combinations in sklearn's sorted-key order
+/// (`sklearn/model_selection/_search.py:157` sorts keys before
+/// `itertools.product` at `:162`).
 ///
 /// Input: keys written as `b`, then `a` (non-sorted).
 /// LIVE ORACLE `list(ParameterGrid({'b':[1,2], 'a':[10,20]}))`:
 ///   `[{a:10,b:1}, {a:10,b:2}, {a:20,b:1}, {a:20,b:2}]`  (a slowest).
-/// ferrolearn `param_grid!{"b"=>[1,2], "a"=>[10,20]}`:
-///   `[{b:1,a:10}, {b:1,a:20}, {b:2,a:10}, {b:2,a:20}]`  (b slowest).
-/// The i-th entries differ (e.g. index 1).
-///
-/// This MATTERS: `GridSearchCV::fit` iterates the `Vec` in order and breaks
-/// equal-CV-score ties by position, so the order divergence changes the
-/// selected best params on a tie.
-///
-/// Release-blocker: left un-ignored. Tracking: #1698 (parent #1697).
 #[test]
-fn divergence_enumeration_order_sorted_keys() {
+fn green_enumeration_order_sorted_keys() {
     let grid = param_grid! {
         "b" => [1_i64, 2_i64],
         "a" => [10_i64, 20_i64],
@@ -74,6 +64,49 @@ fn divergence_enumeration_order_sorted_keys() {
              (sklearn/model_selection/_search.py:157)"
         );
     }
+}
+
+/// Guard: the explicit public `ParameterGrid` surface gives the same
+/// sorted-key sequence as sklearn and can be consumed as materialized
+/// `Vec<ParamSet>`.
+///
+/// LIVE ORACLE `list(ParameterGrid({'b':[1,2], 'a':[10,20]}))`:
+///   `[{a:10,b:1}, {a:10,b:2}, {a:20,b:1}, {a:20,b:2}]`.
+#[test]
+fn green_parameter_grid_public_surface_matches_sklearn() {
+    let grid = ParameterGrid::new(vec![
+        (
+            "b".to_string(),
+            vec![ParamValue::Int(1), ParamValue::Int(2)],
+        ),
+        (
+            "a".to_string(),
+            vec![ParamValue::Int(10), ParamValue::Int(20)],
+        ),
+    ])
+    .unwrap();
+
+    let expected: Vec<ParamSet> = vec![
+        oracle_set(&[("a", ParamValue::Int(10)), ("b", ParamValue::Int(1))]),
+        oracle_set(&[("a", ParamValue::Int(10)), ("b", ParamValue::Int(2))]),
+        oracle_set(&[("a", ParamValue::Int(20)), ("b", ParamValue::Int(1))]),
+        oracle_set(&[("a", ParamValue::Int(20)), ("b", ParamValue::Int(2))]),
+    ];
+
+    assert_eq!(grid.len(), expected.len());
+    assert_eq!(grid.as_slice(), expected.as_slice());
+    assert_eq!(grid.into_vec(), expected);
+}
+
+/// Guard: explicit `ParameterGrid` rejects empty value lists, matching sklearn's
+/// `ValueError` from `_search.py:138-142`.
+#[test]
+fn green_parameter_grid_empty_value_list_rejected() {
+    let result = ParameterGrid::new(vec![("a".to_string(), Vec::new())]);
+    assert!(
+        result.is_err(),
+        "sklearn raises ValueError for ParameterGrid({{'a': []}})"
+    );
 }
 
 // ---------------------------------------------------------------------------

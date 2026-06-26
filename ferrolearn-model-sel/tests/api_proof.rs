@@ -24,9 +24,10 @@ use ferrolearn_model_sel::{
     DummyClassifierStrategy, DummyRegressor, DummyRegressorStrategy, FeatureUnion, GridSearchCV,
     HalvingGridSearchCV, HalvingRandomSearchCV, KFold, LeaveOneOut, LeavePOut,
     MultiOutputClassifier, MultiOutputRegressor, OneVsOneClassifier, OneVsRestClassifier, ParamSet,
-    ParamValue, PredefinedSplit, RandomizedSearchCV, RepeatedKFold, RepeatedStratifiedKFold,
-    SelfTrainingClassifier, ShuffleSplit, StratifiedKFold, StratifiedShuffleSplit, TimeSeriesSplit,
-    TransformedTargetRegressor, param_grid, train_test_split,
+    ParamValue, ParameterGrid, ParameterSampler, PredefinedSplit, RandomizedSearchCV,
+    RepeatedKFold, RepeatedStratifiedKFold, SelfTrainingClassifier, ShuffleSplit, StratifiedKFold,
+    StratifiedShuffleSplit, TimeSeriesSplit, TransformedTargetRegressor, param_grid,
+    train_test_split,
 };
 use ndarray::{Array1, Array2, array};
 use rand::SeedableRng;
@@ -152,6 +153,20 @@ fn api_proof_param_grid_and_distributions() {
     };
     assert_eq!(grid.len(), 6);
 
+    let parameter_grid = ParameterGrid::new(vec![
+        (
+            "alpha".to_string(),
+            vec![ParamValue::Float(0.01), ParamValue::Float(0.1)],
+        ),
+        (
+            "fit_intercept".to_string(),
+            vec![ParamValue::Bool(true), ParamValue::Bool(false)],
+        ),
+    ])
+    .unwrap();
+    assert_eq!(parameter_grid.len(), 4);
+    let _: Vec<ParamSet> = parameter_grid.clone().into_vec();
+
     // ParamValue conversions
     let _f = ParamValue::Float(1.0);
     let _i = ParamValue::Int(2);
@@ -164,6 +179,14 @@ fn api_proof_param_grid_and_distributions() {
     let _ = LogUniform::new(0.001, 1.0).sample(&mut rng);
     let _ = IntUniform::new(1, 10).sample(&mut rng);
     let _ = Choice::new(vec![ParamValue::Int(1), ParamValue::Int(2)]).sample(&mut rng);
+
+    let sampler = ParameterSampler::new(
+        vec![("alpha".to_string(), Box::new(Uniform::new(0.0, 1.0)))],
+        3,
+        Some(7),
+    );
+    let samples = sampler.sample().unwrap();
+    assert_eq!(samples.len(), 3);
 }
 
 // =============================================================================

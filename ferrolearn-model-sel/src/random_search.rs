@@ -1,9 +1,9 @@
 //! Randomized hyperparameter search with cross-validation.
 //!
-//! [`RandomizedSearchCV`] samples `n_iter` random parameter combinations from
-//! the supplied distributions, evaluates each using cross-validation, and
-//! records the results in a [`CvResults`] struct (re-exported from
-//! [`crate::grid_search`]).
+//! [`ParameterSampler`] draws random parameter combinations from supplied
+//! distributions. [`RandomizedSearchCV`] evaluates those samples using
+//! cross-validation and records the results in a [`CvResults`] struct
+//! (re-exported from [`crate::grid_search`]).
 //!
 //! # Example
 //!
@@ -40,10 +40,10 @@
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
-//! | REQ-1 (random-sampling mechanic — continuous WITH-replacement) | SHIPPED | `fit` draws `n_iter` ParamSets (one value per distribution) and `cross_val_score`s each; mirrors `ParameterSampler.__iter__` else-branch (`:330-341`), `__len__` = `n_iter` non-all-lists (`:349`). Tests `green_req1_continuous_with_replacement_count`, `test_random_search_samples_correct_n_iter`. |
+//! | REQ-1 (random-sampling mechanic — continuous WITH-replacement) | SHIPPED | `ParameterSampler::sample` draws `n_iter` ParamSets (one value per distribution) and `fit` `cross_val_score`s each; mirrors `ParameterSampler.__iter__` else-branch (`:330-341`), `__len__` = `n_iter` non-all-lists (`:349`). Tests `green_req1_continuous_with_replacement_count`, `green_parameter_sampler_public_surface_count`, `test_random_search_samples_correct_n_iter`. |
 //! | REQ-2 (seed determinism across runs — structural) | SHIPPED | `SmallRng::seed_from_u64(seed)` ⇒ same seed → same draws; mirrors the `random_state` reproducibility contract (`:309`, R-DEV-1). Exact numpy values NOT claimed (carve-out #1786). Guard `green_req2_seed_determinism_across_runs`. |
 //! | REQ-BESTIDX-MEAN (best_index + unweighted mean via shared CvResults) | SHIPPED | `best_params`/`best_score` route through the FIXED `CvResults::best_index` (first-on-tie, NaN-worst — grid_search #1776/#1782) and `push` mean = `scores.mean()` = `np.average(weights=None)` (`:840`, `:1097`). Guards `green_reqbestidx_first_on_tie_through_random_search`, `green_reqbestidx_nan_worst_through_random_search`. |
-//! | REQ-EMPTY-GRID (empty param_distributions ⇒ 1 empty candidate) | SHIPPED | empty `param_distributions` now evaluates exactly ONE empty `ParamSet` (capped to 1), matching sklearn's empty-grid ⇒ `grid_size 1` ⇒ `min(n_iter,1)` (`:313-328`,`:345-347`) — was rejected with `InvalidParameter`. Test `divergence_empty_param_distributions` (#1788). |
+//! | REQ-EMPTY-GRID (empty param_distributions ⇒ 1 empty candidate) | SHIPPED | empty `param_distributions` now evaluates exactly ONE empty `ParamSet` (capped to 1), matching sklearn's empty-grid ⇒ `grid_size 1` ⇒ `min(n_iter,1)` (`:313-328`,`:345-347`). Tests `green_parameter_sampler_empty_grid_one_candidate`, `green_empty_param_distributions_one_candidate` (#1788). |
 //! | REQ-RNG-EXACT (exact sampled values / draw order) | NOT-STARTED | R-DEFER-3 carve-out (NO failing test): `SmallRng` vs numpy `check_random_state` (`:309`), insertion vs `sorted(dist.items())` draw order (`:334`) — bit-exact match needs `ferray::random`. Blocker #1786. |
 //! | REQ-WITHOUT-REPLACEMENT (all-discrete ⇒ without-replacement + cap + warning) | NOT-STARTED | sklearn `_is_all_lists` samples distinct + caps `n_iter` at grid_size + UserWarning (`:313-328`); ferrolearn always with-replacement. `Distribution` trait has no cardinality/discreteness — architectural. Blocker #1784. |
 //! | REQ-LIST-OF-DICTS (list of distribution-dicts + per-iter rng.choice) | NOT-STARTED | `param_distributions` is a single `Vec<(name, dist)>`; sklearn accepts a list of dicts and `rng.choice`s one per iter (`:332`). Blocker #1785. |
@@ -53,7 +53,7 @@
 //! | REQ-PARALLEL (n_jobs/pre_dispatch/verbose/return_train_score/multimetric) | NOT-STARTED | none exposed (`:1576` init). Blocker #1780 (shared). |
 //! | REQ-ERROR-SCORE (error_score=np.nan continue) | NOT-STARTED | CROSS-UNIT — `fit` delegates to `cross_val_score` which `?`-propagates; sklearn nan-fills + continues (`:996`). Owned by `cross_validation.rs` per S8. |
 //! | REQ-X-1 (R-SUBSTRATE) | NOT-STARTED | `ndarray` + `rand`/`SmallRng`; destination `ferray-core` + `ferray::random` (R-SUBSTRATE-1). Blocker #1781. |
-//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use random_search::RandomizedSearchCV` in `lib.rs` (boundary estimator API, S5/R-DEFER-1); shared `CvResults` cross-consumed by halving searches. |
+//! | REQ-X-2 (non-test production consumer) | SHIPPED | re-exported `pub use random_search::{ParameterSampler, RandomizedSearchCV}` in `lib.rs` (boundary estimator API, S5/R-DEFER-1); shared `CvResults` cross-consumed by halving searches. |
 
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
@@ -66,6 +66,92 @@ use crate::cross_validation::{CrossValidator, cross_val_score};
 use crate::distributions::Distribution;
 use crate::grid_search::CvResults;
 use crate::param_grid::ParamSet;
+
+// ---------------------------------------------------------------------------
+// ParameterSampler
+// ---------------------------------------------------------------------------
+
+/// Explicit sklearn-named parameter sampler surface.
+///
+/// This is the Rust analog of the continuous / with-replacement branch of
+/// `sklearn.model_selection.ParameterSampler`: it draws `n_iter` independent
+/// [`ParamSet`]s by sampling one value from each supplied distribution. Empty
+/// distributions yield one empty candidate, matching sklearn's empty-grid
+/// behavior.
+pub struct ParameterSampler {
+    param_distributions: Vec<(String, Box<dyn Distribution>)>,
+    n_iter: usize,
+    random_state: Option<u64>,
+}
+
+impl ParameterSampler {
+    /// Create a new [`ParameterSampler`].
+    pub fn new(
+        param_distributions: Vec<(String, Box<dyn Distribution>)>,
+        n_iter: usize,
+        random_state: Option<u64>,
+    ) -> Self {
+        Self {
+            param_distributions,
+            n_iter,
+            random_state,
+        }
+    }
+
+    /// Draw all parameter samples.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InvalidParameter`] when `n_iter == 0`.
+    pub fn sample(&self) -> Result<Vec<ParamSet>, FerroError> {
+        if self.n_iter == 0 {
+            return Err(FerroError::InvalidParameter {
+                name: "n_iter".into(),
+                reason: "n_iter must be > 0".into(),
+            });
+        }
+
+        let mut rng: SmallRng = match self.random_state {
+            Some(seed) => SmallRng::seed_from_u64(seed),
+            None => SmallRng::from_os_rng(),
+        };
+
+        let n_eval = if self.param_distributions.is_empty() {
+            1
+        } else {
+            self.n_iter
+        };
+
+        Ok((0..n_eval)
+            .map(|_| self.sample_one(&mut rng))
+            .collect::<Vec<_>>())
+    }
+
+    /// Number of samples this sampler will yield.
+    ///
+    /// Empty distributions are capped to one empty sample, mirroring sklearn's
+    /// empty-grid behavior.
+    pub fn len(&self) -> usize {
+        if self.param_distributions.is_empty() {
+            usize::from(self.n_iter > 0)
+        } else {
+            self.n_iter
+        }
+    }
+
+    /// Whether this sampler will yield no samples.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Sample a single [`ParamSet`] by drawing one value from each distribution.
+    fn sample_one(&self, rng: &mut SmallRng) -> ParamSet {
+        self.param_distributions
+            .iter()
+            .map(|(name, dist)| (name.clone(), dist.sample(rng)))
+            .collect()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // RandomizedSearchCV
@@ -128,14 +214,6 @@ impl<'a> RandomizedSearchCV<'a> {
         }
     }
 
-    /// Sample a single [`ParamSet`] by drawing one value from each distribution.
-    fn sample_params(&self, rng: &mut SmallRng) -> ParamSet {
-        self.param_distributions
-            .iter()
-            .map(|(name, dist)| (name.clone(), dist.sample(rng)))
-            .collect()
-    }
-
     /// Run the randomized search.
     ///
     /// Samples `n_iter` parameter combinations, builds a pipeline for each,
@@ -158,24 +236,18 @@ impl<'a> RandomizedSearchCV<'a> {
             });
         }
 
-        let mut rng: SmallRng = match self.random_state {
-            Some(seed) => SmallRng::seed_from_u64(seed),
-            None => SmallRng::from_os_rng(),
-        };
-
         let mut results = CvResults::new();
 
-        // Empty distributions => one trivial empty candidate (sklearn's empty
-        // grid has grid_size == 1, capping n_iter to 1). The non-empty path is
-        // unchanged: it loops exactly n_iter times with replacement.
-        let n_eval = if self.param_distributions.is_empty() {
-            1
-        } else {
-            self.n_iter
-        };
+        let sampler = ParameterSampler::new(
+            std::mem::take(&mut self.param_distributions),
+            self.n_iter,
+            self.random_state,
+        );
+        let samples = sampler.sample();
+        self.param_distributions = sampler.param_distributions;
+        let samples = samples?;
 
-        for _ in 0..n_eval {
-            let params = self.sample_params(&mut rng);
+        for params in samples {
             let pipeline = (self.pipeline_factory)(&params);
             let scores = cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?;
             results.push(params, scores);

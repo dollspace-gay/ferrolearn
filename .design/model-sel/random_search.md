@@ -19,15 +19,14 @@ each, records per-fold scores, and reports the best combination. It is
 `GridSearchCV`'s sibling and SHARES the `CvResults` result type defined in
 `grid_search.rs`.
 
-ferrolearn exposes `pub struct RandomizedSearchCV<'a>` with a
-`pipeline_factory: Box<dyn Fn(&ParamSet) -> Pipeline + 'a>`, a single
-`param_distributions: Vec<(String, Box<dyn Distribution>)>`, `n_iter: usize`, a
-`cv: Box<dyn CrossValidator>`, a `scoring: fn(&Array1<f64>, &Array1<f64>) ->
-Result<f64, FerroError>`, and an optional `random_state: Option<u64>`.
-`fit(&mut self, x, y)` rejects `n_iter == 0` and an empty `param_distributions`
-(`InvalidParameter`), seeds a `SmallRng` (`seed_from_u64(seed)` or `from_os_rng()`
-when `None`), then `for _ in 0..n_iter` samples ONE value from EACH distribution
-(`sample_params`, insertion order), builds a pipeline via the factory, calls
+ferrolearn exposes `pub struct ParameterSampler` and
+`pub struct RandomizedSearchCV<'a>`. `ParameterSampler` owns a single
+`param_distributions: Vec<(String, Box<dyn Distribution>)>`, `n_iter: usize`, and
+an optional `random_state: Option<u64>`; `sample()` rejects `n_iter == 0`, seeds a
+`SmallRng` (`seed_from_u64(seed)` or `from_os_rng()` when `None`), then samples
+ONE value from EACH distribution per candidate. An empty distribution list yields
+one empty `ParamSet`, matching sklearn's empty-grid cap. `RandomizedSearchCV`
+uses that sampler in `fit`, builds a pipeline via the factory, calls
 `cross_val_score`, and pushes the per-fold scores into the shared `CvResults`.
 Accessors `cv_results()`/`best_params()`/`best_score()` read the search back via
 `CvResults::best_index`.
@@ -133,6 +132,11 @@ blocker with NO failing test).
   draw order differ from numpy (`SmallRng` vs `check_random_state`/`RandomState`)
   — that exact-match is an R-DEFER-3 carve-out (REQ-RNG-EXACT, below), NOT part of
   this REQ. SHIPPED.
+- REQ-EMPTY-GRID (empty param_distributions ⇒ one empty candidate): sklearn treats
+  an empty distribution dict as an all-list grid with `grid_size = 1`, so
+  `ParameterSampler({}, n_iter=3)` yields `[{}]` and `RandomizedSearchCV` evaluates
+  exactly one candidate. ferrolearn `ParameterSampler::sample` mirrors that cap
+  and `RandomizedSearchCV::fit` evaluates the single empty `ParamSet`. SHIPPED.
 - REQ-BESTIDX-MEAN (best_index + mean via shared `CvResults`): `best_score`/
   `best_params` select the candidate via `CvResults::best_index` (the shared FIXED
   first-on-tie / NaN-worst reduction — `grid_search.md` REQ-BESTIDX) and
@@ -208,8 +212,9 @@ blocker with NO failing test).
   rngs::SmallRng}` (random); the destination substrate is `ferray-core` +
   `ferray::random` (R-SUBSTRATE-1). NOT-STARTED (shared blocker #1781).
 - REQ-X-2 (non-test production consumer): the crate re-export boundary
-  `pub use random_search::RandomizedSearchCV in lib.rs` (S5/R-DEFER-1 boundary
-  grandfathering — `RandomizedSearchCV` IS a public estimator type). SHIPPED.
+  `pub use random_search::{ParameterSampler, RandomizedSearchCV} in lib.rs`
+  (S5/R-DEFER-1 boundary grandfathering — these are public model-selection
+  surfaces). SHIPPED.
 
 ## Acceptance criteria
 
@@ -247,6 +252,16 @@ come from the oracle, NEVER copied from the ferrolearn side).
   sampled `alpha` is pairwise-equal across the two runs. (The EXACT VALUES differ
   from sklearn's — REQ-RNG-EXACT carve-out #1786 — so this AC checks
   determinism-across-runs, never numpy-value equality.)
+- AC-EMPTY-GRID (REQ-EMPTY-GRID): an empty distribution dict yields exactly one
+  empty candidate. Oracle (live sklearn):
+  ```
+  python3 -c "from sklearn.model_selection import ParameterSampler
+  print(list(ParameterSampler({}, n_iter=3, random_state=0)))"
+  # -> [{}]
+  ```
+  ferrolearn `ParameterSampler::new(Vec::new(), 3, Some(0)).sample()` returns a
+  single empty `ParamSet`, and `RandomizedSearchCV::fit` evaluates exactly that
+  one candidate.
 - AC-BESTIDX-MEAN (REQ-BESTIDX-MEAN, unweighted mean + first-on-tie best_index):
   `mean_test_score` is the simple mean of per-split scores, and on a tie the FIRST
   candidate is best. Oracle (live sklearn — mean is unweighted; argmin first-wins):
@@ -367,11 +382,12 @@ come from the oracle, NEVER copied from the ferrolearn side).
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (random-sampling mechanic — continuous WITH-replacement) | SHIPPED | impl `pub fn fit in random_search.rs`: after rejecting `n_iter==0` / empty `param_distributions` (`FerroError::InvalidParameter`) and seeding `SmallRng`, `for _ in 0..self.n_iter { let params = self.sample_params(&mut rng); let pipeline = (self.pipeline_factory)(&params); let scores = cross_val_score(&pipeline, x, y, self.cv.as_ref(), self.scoring)?; results.push(params, scores); }`; `fn sample_params in random_search.rs` draws ONE value per distribution (`self.param_distributions.iter().map(|(name, dist)| (name.clone(), dist.sample(rng))).collect()`). Mirrors `ParameterSampler.__iter__` ELSE branch (`sklearn/model_selection/_search.py:330-341`, WITH-replacement) driven by `_run_search` → `evaluate_candidates(ParameterSampler(...))` (`:1958-1964`); `__len__` returns `n_iter` for the non-all-lists case (`:349`). Oracle (AC-1): `len(list(ParameterSampler({'a': uniform(0,1)}, n_iter=15, random_state=0))) == 15`. Tests: `test_random_search_samples_correct_n_iter` (`params.len()==7`), `test_random_search_with_int_uniform`/`_with_choice`/`_with_log_uniform`. Non-test consumer: REQ-X-2. |
-| REQ-2 (seed determinism across runs — structural) | SHIPPED | impl `pub fn fit in random_search.rs`: `let mut rng: SmallRng = match self.random_state { Some(seed) => SmallRng::seed_from_u64(seed), None => SmallRng::from_os_rng() };` — same seed ⇒ same draw sequence across runs. Mirrors sklearn's `random_state` determinism CONTRACT (`:309` `check_random_state(self.random_state)`, R-DEV-1 reproducibility MATCH item). Oracle (AC-2): two `ParameterSampler`s with `random_state=7` yield identical sequences. Test: `test_random_search_deterministic_with_seed` (two instances, `random_state=Some(99)`, asserts pairwise-equal sampled `alpha`). The EXACT numpy values are NOT claimed (REQ-RNG-EXACT carve-out #1786). Non-test consumer: REQ-X-2. |
+| REQ-1 (random-sampling mechanic — continuous WITH-replacement) | SHIPPED | `ParameterSampler::sample` rejects `n_iter==0`, seeds `SmallRng`, and draws one `ParamSet` per iteration by sampling ONE value per distribution; `RandomizedSearchCV::fit` delegates candidate creation to `ParameterSampler`, then builds a pipeline and calls `cross_val_score` for each sample. Mirrors `ParameterSampler.__iter__` ELSE branch (`sklearn/model_selection/_search.py:330-341`, WITH-replacement) driven by `_run_search` → `evaluate_candidates(ParameterSampler(...))` (`:1958-1964`); `__len__` returns `n_iter` for the non-all-lists case (`:349`). Oracle (AC-1): `len(list(ParameterSampler({'a': uniform(0,1)}, n_iter=15, random_state=0))) == 15`. Tests: `green_parameter_sampler_public_surface_count`, `test_random_search_samples_correct_n_iter`, `test_random_search_with_int_uniform`/`_with_choice`/`_with_log_uniform`. Non-test consumer: REQ-X-2. |
+| REQ-2 (seed determinism across runs — structural) | SHIPPED | `ParameterSampler::sample` seeds `SmallRng` from `random_state`; same seed ⇒ same draw sequence across runs. Mirrors sklearn's `random_state` determinism CONTRACT (`:309` `check_random_state(self.random_state)`, R-DEV-1 reproducibility MATCH item). Oracle (AC-2): two `ParameterSampler`s with `random_state=7` yield identical sequences. Tests: `green_parameter_sampler_public_surface_count`, `test_random_search_deterministic_with_seed` (two instances, `random_state=Some(99)`, asserts pairwise-equal sampled `alpha`). The EXACT numpy values are NOT claimed (REQ-RNG-EXACT carve-out #1786). Non-test consumer: REQ-X-2. |
+| REQ-EMPTY-GRID (empty param_distributions ⇒ 1 empty candidate) | SHIPPED | `ParameterSampler::sample` caps an empty `param_distributions` list to one empty `ParamSet`, and `RandomizedSearchCV::fit` evaluates that single candidate. Mirrors sklearn's empty-grid path: `_is_all_lists()` is vacuously true, `ParameterGrid({})` has `grid_size = 1`, and `__len__` is `min(n_iter, 1)` (`sklearn/model_selection/_search.py:313-328`, `:345-347`). Tests: `green_parameter_sampler_empty_grid_one_candidate`, `green_empty_param_distributions_one_candidate`. |
 | REQ-BESTIDX-MEAN (best_index + unweighted mean via shared CvResults) | SHIPPED | impl `pub fn best_params`/`pub fn best_score in random_search.rs` route through `results.best_index()` (the SHARED `pub fn best_index in grid_search.rs` — the FIXED first-on-tie / NaN-worst reduction, `grid_search.md` REQ-BESTIDX #1776); `pub(crate) fn push in grid_search.rs` (`impl CvResults`) sets `mean = scores.mean()`. Mirrors `_select_best_index` `rank_test_score.argmin()` (`sklearn/model_selection/_search.py:840`) + `np.average(array, axis=1, weights=None)` (`:1097`, UNWEIGHTED). Oracle (AC-BESTIDX-MEAN): `np.isclose(mean_test_score[0], np.mean(splits)) == True`, tie `ranks==[1,1]` ⇒ argmin index 0. Test: `test_random_search_best_params_selected_correctly` (`best_score().abs() < 1e-10`). `random_search.rs` CONSUMES the shared reduction; the tie-break fixable divergence is OWNED by `grid_search.md` (#1776), not a random_search blocker. Non-test consumer: REQ-X-2. |
-| REQ-RNG-EXACT (exact sampled values / draw order — R-DEFER-3 CARVE-OUT) | NOT-STARTED | open prereq blocker #1786 (NO failing test). sklearn draws via numpy `check_random_state` (`sklearn/model_selection/_search.py:309`); discrete `v[rng.randint(len(v))]`, keys SORTED per iter (`:334`). impl `pub fn fit`/`fn sample_params in random_search.rs` use `SmallRng` and sample in INSERTION order — the exact value stream is unreproducible across the two PRNGs. R-DEFER-3 carve-out: the `random_state` CONTRACT (determinism-across-runs) is SHIPPED via REQ-2; bit-exact numpy agreement is a substrate difference (resolved by REQ-X-1 `ferray::random`), NOT a single-spot deterministic fix — hence a blocker with NO failing `#[test]`. |
-| REQ-WITHOUT-REPLACEMENT (all-discrete ⇒ without-replacement + cap + UserWarning) | NOT-STARTED | open prereq blocker #1784. sklearn `_is_all_lists()` branch (`sklearn/model_selection/_search.py:313-328`) samples DISTINCT via `sample_without_replacement`, caps `n_iter = grid_size` when `grid_size < n_iter` with a `UserWarning`; `__len__` → `min(n_iter, grid_size)` (`:347`). impl `pub fn fit in random_search.rs` ALWAYS loops `0..n_iter` with `sample_params` (WITH replacement, no cap, no warning); `pub trait Distribution in distributions.rs` exposes only `fn sample(&self, rng) -> ParamValue` — NO discreteness/cardinality method, so the all-lists case and `grid_size` are undetectable. Oracle (AC-WITHOUT-REPL): `len(list(ParameterSampler({'c':[1,2,3]}, n_iter=15, random_state=0))) == 3` (capped, distinct, + UserWarning); ferrolearn `Choice([1,2,3])` + `n_iter=15` → 15 with dups (`test_random_search_with_choice`). DETERMINISTIC-but-ARCHITECTURAL: needs a `Distribution`-trait extension + without-replacement sampler. |
+| REQ-RNG-EXACT (exact sampled values / draw order — R-DEFER-3 CARVE-OUT) | NOT-STARTED | open prereq blocker #1786 (NO failing test). sklearn draws via numpy `check_random_state` (`sklearn/model_selection/_search.py:309`); discrete `v[rng.randint(len(v))]`, keys SORTED per iter (`:334`). `ParameterSampler::sample_one` uses `SmallRng` and samples in insertion order — the exact value stream is unreproducible across the two PRNGs. R-DEFER-3 carve-out: the `random_state` CONTRACT (determinism-across-runs) is SHIPPED via REQ-2; bit-exact numpy agreement is a substrate difference (resolved by REQ-X-1 `ferray::random`), NOT a single-spot deterministic fix — hence a blocker with NO failing `#[test]`. |
+| REQ-WITHOUT-REPLACEMENT (all-discrete ⇒ without-replacement + cap + UserWarning) | NOT-STARTED | open prereq blocker #1784. sklearn `_is_all_lists()` branch (`sklearn/model_selection/_search.py:313-328`) samples DISTINCT via `sample_without_replacement`, caps `n_iter = grid_size` when `grid_size < n_iter` with a `UserWarning`; `__len__` → `min(n_iter, grid_size)` (`:347`). `ParameterSampler` always uses the continuous/with-replacement branch for non-empty distributions (no cap, duplicates possible, no warning); `pub trait Distribution in distributions.rs` exposes only `fn sample(&self, rng) -> ParamValue` — NO discreteness/cardinality method, so the all-lists case and `grid_size` are undetectable. Oracle (AC-WITHOUT-REPL): `len(list(ParameterSampler({'c':[1,2,3]}, n_iter=15, random_state=0))) == 3` (capped, distinct, + UserWarning); ferrolearn `Choice([1,2,3])` + `n_iter=15` → 15 with dups (`test_random_search_with_choice`). DETERMINISTIC-but-ARCHITECTURAL: needs a `Distribution`-trait extension + without-replacement sampler. |
 | REQ-LIST-OF-DICTS (list of distribution-dicts + per-iter rng.choice) | NOT-STARTED | open prereq blocker #1785. sklearn accepts a LIST of distribution-dicts and picks one per iter via `rng.choice(self.param_distributions)` (`sklearn/model_selection/_search.py:330-341`). impl `pub fn new in random_search.rs` takes a SINGLE `param_distributions: Vec<(String, Box<dyn Distribution>)>` and samples EVERY distribution every iter. Oracle (AC-LIST-OF-DICTS): `ParameterSampler([{'a':[1]}, {'b':[2]}], n_iter=10, random_state=0)` is valid; ferrolearn has no list-of-dicts form. Missing-feature (architectural). |
 | REQ-REFIT (refit + best_estimator_ + delegating predict/score) | NOT-STARTED | open prereq blocker #1777 (shared with `grid_search.md` REQ-REFIT). sklearn `refit=True` DEFAULT (`sklearn/model_selection/_search.py:1576`) refits on full data (`:1046-1061`) and delegates `predict`/`predict_proba`/`score`/`transform` (`:577`, `:546-552`). impl `pub struct RandomizedSearchCV in random_search.rs` is search-only — fields `pipeline_factory`/`param_distributions`/`n_iter`/`cv`/`scoring`/`random_state`/`results`, accessors `cv_results`/`best_params`/`best_score` only; NO refit, NO `best_estimator_`, NO `predict`/`score`. Oracle (AC-REFIT): `hasattr(rs,'best_estimator_') == True`, `rs.predict(...) == [5.0,5.0]`. Architectural blocker (no single-fixer test). |
 | REQ-CVRESULTS (cv_results_ richness) | NOT-STARTED | open prereq blocker #1778 (shared `CvResults`, same as `grid_search.md` REQ-CVRESULTS). sklearn `cv_results_` has `std_test_score` (`:1117`), `rank_test_score` (`:1129`), `split{i}_test_score` (`:1095`), timing (`:1134-1135`), `param_<name>`/`params` (`:1137-1139`). impl `pub struct CvResults in grid_search.rs` (consumed via `use crate::grid_search::CvResults in random_search.rs`) has ONLY `params`/`mean_scores`/`all_scores`. Oracle (AC-CVRESULTS): key set includes `std_test_score`/`rank_test_score`/`split0_test_score`/`mean_fit_time`. Missing-feature blocker (no single-fixer test). |
@@ -379,7 +395,7 @@ come from the oracle, NEVER copied from the ferrolearn side).
 | REQ-PARALLEL (n_jobs/pre_dispatch/verbose/return_train_score/multimetric) | NOT-STARTED | open prereq blocker #1780 (shared with `grid_search.md` REQ-PARALLEL). sklearn exposes `n_jobs`/`pre_dispatch="2*n_jobs"`/`verbose`/`return_train_score`/multimetric (`sklearn/model_selection/_search.py:1576` init). impl `pub fn new in random_search.rs` signature `(pipeline_factory, param_distributions, n_iter, cv, scoring, random_state)` — none of these channels exist. Missing-feature blocker (no single-fixer test). |
 | REQ-ERROR-SCORE (error_score=np.nan continue) | NOT-STARTED | CROSS-UNIT (owned by `cross_validation.rs`, NOT a random_search blocker — S8). sklearn `error_score=np.nan` fills a failing cell and CONTINUES (`sklearn/model_selection/_search.py:996`). impl `pub fn fit in random_search.rs` delegates each candidate to `cross_val_score(...)?`; `cross_val_score in cross_validation.rs` propagates a failure via `?` and aborts. Real divergence, but lives in `cross_validation.rs`'s iteration unit — classified there per S8/R-DEFER-5, not pinned as a random_search blocker. |
 | REQ-X-1 (R-SUBSTRATE ndarray + rand → ferray) | NOT-STARTED | open prereq blocker #1781 (shared substrate blocker). Production code in `random_search.rs` imports `use ndarray::{Array1, Array2}` (array type) and `use rand::{SeedableRng, rngs::SmallRng}` (random); `fit` takes `x: &Array2<f64>`/`y: &Array1<f64>`. Per R-SUBSTRATE-1 the destination is `ferray-core` + `ferray::random`; `ndarray`/`rand` are the wrong substrate. Not on the ferray substrate (R-SUBSTRATE-2). |
-| REQ-X-2 (non-test production consumer) | SHIPPED | `pub struct RandomizedSearchCV` is re-exported at `pub use random_search::RandomizedSearchCV in lib.rs` — the boundary public estimator API per S5/R-DEFER-1 grandfathering (`RandomizedSearchCV` IS the public API surface, alongside its external users and the prospective `ferrolearn-python` binding). It has no internal non-test caller; the re-export IS the production consumer. (Note: `halving_random_search.rs` builds its OWN search and does not call `RandomizedSearchCV`; only the SHARED `CvResults` is cross-consumed.) |
+| REQ-X-2 (non-test production consumer) | SHIPPED | `pub struct ParameterSampler` and `pub struct RandomizedSearchCV` are re-exported at `pub use random_search::{ParameterSampler, RandomizedSearchCV} in lib.rs` — the boundary public model-selection API per S5/R-DEFER-1 grandfathering. `RandomizedSearchCV` consumes `ParameterSampler` internally; the re-export is the production boundary for both surfaces. (Note: `halving_random_search.rs` builds its OWN search and does not call `RandomizedSearchCV`; only the SHARED `CvResults` is cross-consumed.) |
 
 ## Architecture
 
@@ -399,12 +415,14 @@ RandomizedSearchCV body is `_run_search(evaluate_candidates)` →
 random_state=self.random_state))` (`:1958-1964`); for distributions with `rvs`,
 `ParameterSampler.__iter__` loops `for _ in range(self.n_iter)`, sorts the dict
 keys, and draws `v.rvs(random_state=rng)` per key (`:330-341`), with
-`__len__ == n_iter` (`:349`). ferrolearn loops `for _ in 0..self.n_iter`, calls
-`sample_params` (one value per distribution, in insertion order), builds a fresh
-`(self.pipeline_factory)(&params)`, and `cross_val_score`s it — the factory
-closure is the R-DEV-7 analog of `clone(base_estimator).set_params(**parameters)`
-(Rust has no `set_params` reflection). `n_iter == 0` and an empty distribution
-list are eager `FerroError::InvalidParameter` guards.
+`__len__ == n_iter` (`:349`). ferrolearn exposes `ParameterSampler::sample`,
+which loops for the effective sample count, draws one value per distribution in
+insertion order, and returns materialized `ParamSet`s. `RandomizedSearchCV::fit`
+builds a fresh `(self.pipeline_factory)(&params)` for each sample and
+`cross_val_score`s it — the factory closure is the R-DEV-7 analog of
+`clone(base_estimator).set_params(**parameters)` (Rust has no `set_params`
+reflection). `n_iter == 0` is an eager `FerroError::InvalidParameter` guard; an
+empty distribution list yields one empty candidate (REQ-EMPTY-GRID).
 
 Seed determinism ACROSS RUNS (REQ-2) is the structural `random_state` contract:
 `SmallRng::seed_from_u64(seed)` (or `from_os_rng()` when `None`) — two runs with
@@ -452,11 +470,11 @@ cell with nan and continues (`:996`); ferrolearn's `cross_val_score` propagates 
 fit/score failure via `?` and aborts. Real, but OWNED by `cross_validation.rs`
 (per S8), not pinned here.
 
-`RandomizedSearchCV` reaches production via the re-export
-`pub use random_search::RandomizedSearchCV in lib.rs` (REQ-X-2). The SHARED
-`CvResults` (defined in `grid_search.rs`) is the cross-consumed type;
-`halving_random_search.rs` builds its OWN search loop and does not call
-`RandomizedSearchCV`.
+`ParameterSampler` and `RandomizedSearchCV` reach production via the re-export
+`pub use random_search::{ParameterSampler, RandomizedSearchCV} in lib.rs`
+(REQ-X-2). The SHARED `CvResults` (defined in `grid_search.rs`) is the
+cross-consumed type; `halving_random_search.rs` builds its OWN search loop and
+does not call `RandomizedSearchCV`.
 
 ## Verification
 
@@ -486,6 +504,15 @@ Commands establishing the SHIPPED claims (baseline
   print('same-seed identical:', a==b)"
   # -> same-seed identical: True
   ```
+- REQ-EMPTY-GRID oracle (live sklearn 1.5.2):
+  ```
+  python3 -c "from sklearn.model_selection import ParameterSampler
+  print(list(ParameterSampler({}, n_iter=3, random_state=0)))"
+  # -> [{}]
+  ```
+  ferrolearn `green_parameter_sampler_empty_grid_one_candidate` and
+  `green_empty_param_distributions_one_candidate` pin the same one-candidate
+  behavior.
 - REQ-BESTIDX-MEAN oracle (live sklearn 1.5.2 — unweighted mean + first-on-tie):
   ```
   python3 -c "import numpy as np
@@ -529,13 +556,15 @@ Commands establishing the SHIPPED claims (baseline
 - REQ-X-1 substrate: `grep -n "ndarray\|rand::" random_search.rs` shows production
   `use ndarray::{Array1, Array2}` + `use rand::{SeedableRng, rngs::SmallRng}` —
   wrong substrate, migration owed (#1781).
-- REQ-X-2 consumer: `grep -rn "RandomizedSearchCV" ferrolearn-model-sel/src` shows
-  `pub use random_search::RandomizedSearchCV in lib.rs` (the production re-export
-  boundary; no internal non-test caller).
+- REQ-X-2 consumer: `grep -rn "ParameterSampler\|RandomizedSearchCV" ferrolearn-model-sel/src`
+  shows `pub use random_search::{ParameterSampler, RandomizedSearchCV} in lib.rs`
+  (the production re-export boundary) and `RandomizedSearchCV::fit` consuming
+  `ParameterSampler`.
 
 SHIPPED: REQ-1 (random-sampling mechanic — continuous WITH-replacement),
-REQ-2 (seed determinism across runs), REQ-BESTIDX-MEAN (best_index + unweighted
-mean via shared `CvResults`), REQ-X-2 (consumer — re-export).
+REQ-2 (seed determinism across runs), REQ-EMPTY-GRID (one empty candidate),
+REQ-BESTIDX-MEAN (best_index + unweighted mean via shared `CvResults`), REQ-X-2
+(consumer — re-export).
 NOT-STARTED: REQ-RNG-EXACT (R-DEFER-3 RNG carve-out, NO failing test, #1786),
 REQ-WITHOUT-REPLACEMENT (deterministic-but-architectural, #1784),
 REQ-LIST-OF-DICTS (#1785), REQ-REFIT (#1777), REQ-CVRESULTS (#1778),
