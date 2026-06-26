@@ -189,6 +189,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::locally_linear_embedding"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::LatentDirichletAllocation"
 phase = "decomp"
 fixture = ""

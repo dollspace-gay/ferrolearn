@@ -35,7 +35,8 @@
 //!
 //! ## REQ status
 //!
-//! Translation target: scikit-learn 1.5.2 `class LocallyLinearEmbedding`
+//! Translation target: scikit-learn 1.5.2 `class LocallyLinearEmbedding` and
+//! standalone `locally_linear_embedding`
 //! (`sklearn/manifold/_locally_linear.py`, `method='standard'`). Tracking:
 //! #1459. Each REQ is BINARY — SHIPPED (impl + non-test consumer + tests + green
 //! verification) or NOT-STARTED (with a concrete open blocker).
@@ -50,7 +51,7 @@
 //! | REQ-6 | `method` ∈ {hessian, modified, ltsa} | NOT-STARTED | standard only; sklearn `_locally_linear.py:201-460` — blocker #1461 |
 //! | REQ-7 | `eigen_solver='arpack'` + `random_state` + per-component sign convention (CARVE-OUT) | NOT-STARTED | dense faer; sklearn `_locally_linear.py:173-188` — blocker #1462 |
 //! | REQ-8 | `transform` out-of-sample (barycenter weights on new points) | NOT-STARTED | sklearn `_locally_linear.py:851` — blocker #1463 |
-//! | REQ-9 | `reconstruction_error_`/`nbrs_`/`embedding_` attrs + `neighbors_algorithm` + `tol`/`max_iter` | NOT-STARTED | sklearn `_locally_linear.py:785` — blocker #1464 |
+//! | REQ-9 | Standard-path `reconstruction_error_` equivalent | SHIPPED (scoped) | `locally_linear_embedding` returns `(embedding, reconstruction_error)` and `FittedLLE::reconstruction_error()` exposes the fitted value; `tests/divergence_locally_linear_embedding.rs` pins sklearn `0.0001765118939348609`. Residual `nbrs_`/`neighbors_algorithm`/`tol`/`max_iter` surface: blocker #1464 |
 //! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1465 |
 //! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array2` only — blocker #1466 |
 
@@ -77,6 +78,26 @@ fn reject_non_finite(x: &Array2<f64>) -> Result<(), FerroError> {
         });
     }
     Ok(())
+}
+
+/// Compute a standard locally linear embedding and reconstruction error.
+///
+/// This is the standard dense path corresponding to scikit-learn's
+/// `locally_linear_embedding(..., method="standard", eigen_solver="dense")`.
+/// Hessian, modified LLE, LTSA, and ARPACK solver variants remain outside this
+/// scoped helper.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for invalid parameters, non-finite input, insufficient
+/// samples, or singular local covariance systems.
+pub fn locally_linear_embedding(
+    x: &Array2<f64>,
+    n_neighbors: usize,
+    n_components: usize,
+    reg: f64,
+) -> Result<(Array2<f64>, f64), FerroError> {
+    standard_lle_embedding(x, n_neighbors, n_components, reg)
 }
 
 // ---------------------------------------------------------------------------
@@ -154,6 +175,8 @@ impl LLE {
 pub struct FittedLLE {
     /// The embedding, shape `(n_samples, n_components)`.
     embedding_: Array2<f64>,
+    /// Sum of selected non-trivial eigenvalues of `(I - W)^T (I - W)`.
+    reconstruction_error_: f64,
 }
 
 impl FittedLLE {
@@ -161,6 +184,12 @@ impl FittedLLE {
     #[must_use]
     pub fn embedding(&self) -> &Array2<f64> {
         &self.embedding_
+    }
+
+    /// Reconstruction error returned by sklearn's standard dense LLE path.
+    #[must_use]
+    pub fn reconstruction_error(&self) -> f64 {
+        self.reconstruction_error_
     }
 }
 
@@ -305,6 +334,122 @@ fn compute_weights(
     Ok(w)
 }
 
+fn validate_lle_params(
+    x: &Array2<f64>,
+    n_neighbors: usize,
+    n_components: usize,
+    reg: f64,
+) -> Result<(), FerroError> {
+    let n = x.nrows();
+    let n_features = x.ncols();
+
+    if n_components == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    if n_neighbors == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_neighbors".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    if n < 2 {
+        return Err(FerroError::InsufficientSamples {
+            required: 2,
+            actual: n,
+            context: "LLE::fit requires at least 2 samples".into(),
+        });
+    }
+    if n_neighbors >= n {
+        return Err(FerroError::InvalidParameter {
+            name: "n_neighbors".into(),
+            reason: format!("n_neighbors ({n_neighbors}) must be less than n_samples ({n})"),
+        });
+    }
+    // sklearn rejects an output dimension larger than the input dimension
+    // (`if n_components > d_in: raise ValueError(...)`,
+    // `_locally_linear.py:222-225`, where `d_in = X.shape[1]`). The
+    // boundary `n_components == n_features` is accepted.
+    if n_components > n_features {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: "output dimension must be less than or equal to input dimension".into(),
+        });
+    }
+    // Need n_components + 1 eigenvectors (skipping the trivial one).
+    if n_components >= n {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: format!("n_components ({n_components}) must be less than n_samples ({n})"),
+        });
+    }
+    if reg < 0.0 {
+        return Err(FerroError::InvalidParameter {
+            name: "reg".into(),
+            reason: "must be non-negative".into(),
+        });
+    }
+
+    Ok(())
+}
+
+fn standard_lle_embedding(
+    x: &Array2<f64>,
+    n_neighbors: usize,
+    n_components: usize,
+    reg: f64,
+) -> Result<(Array2<f64>, f64), FerroError> {
+    let n = x.nrows();
+
+    validate_lle_params(x, n_neighbors, n_components, reg)?;
+
+    // Reject NaN/Inf BEFORE the kNN / reconstruction-weight / eigen math
+    // (sklearn's `_validate_data(force_all_finite=True)` at
+    // `_locally_linear.py:793`, `utils/validation.py:147-154`).
+    reject_non_finite(x)?;
+
+    // Step 1: Find neighbors.
+    let neighbors = find_neighbors(x, n_neighbors);
+
+    // Step 2: Compute reconstruction weights.
+    let w = compute_weights(x, &neighbors, reg)?;
+
+    // Step 3: Construct M = (I - W)^T (I - W).
+    let mut iw = Array2::<f64>::zeros((n, n));
+    for i in 0..n {
+        iw[[i, i]] = 1.0;
+        for j in 0..n {
+            iw[[i, j]] -= w[[i, j]];
+        }
+    }
+    let m = iw.t().dot(&iw);
+
+    // Step 4: Eigendecompose M.
+    let (eigenvalues, eigenvectors) = eigh_faer(&m)?;
+
+    // Sort eigenvalues ascending, then skip the first (smallest, ~0)
+    // eigenvector and take the next n_components.
+    let mut indices: Vec<usize> = (0..n).collect();
+    indices.sort_by(|&a, &b| {
+        eigenvalues[a]
+            .partial_cmp(&eigenvalues[b])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let selected: Vec<usize> = indices.iter().skip(1).take(n_components).copied().collect();
+    let reconstruction_error = selected.iter().map(|&idx| eigenvalues[idx]).sum();
+    let mut embedding = Array2::<f64>::zeros((n, n_components));
+    for (k, &idx) in selected.iter().enumerate() {
+        for i in 0..n {
+            embedding[[i, k]] = eigenvectors[[i, idx]];
+        }
+    }
+
+    Ok((embedding, reconstruction_error))
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementations
 // ---------------------------------------------------------------------------
@@ -325,109 +470,12 @@ impl Fit<Array2<f64>, ()> for LLE {
     /// - [`FerroError::NumericalInstability`] if a local covariance matrix
     ///   is singular.
     fn fit(&self, x: &Array2<f64>, _y: &()) -> Result<FittedLLE, FerroError> {
-        let n = x.nrows();
-        let n_features = x.ncols();
-
-        if self.n_components == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: "must be at least 1".into(),
-            });
-        }
-        if self.n_neighbors == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_neighbors".into(),
-                reason: "must be at least 1".into(),
-            });
-        }
-        if n < 2 {
-            return Err(FerroError::InsufficientSamples {
-                required: 2,
-                actual: n,
-                context: "LLE::fit requires at least 2 samples".into(),
-            });
-        }
-        if self.n_neighbors >= n {
-            return Err(FerroError::InvalidParameter {
-                name: "n_neighbors".into(),
-                reason: format!(
-                    "n_neighbors ({}) must be less than n_samples ({})",
-                    self.n_neighbors, n
-                ),
-            });
-        }
-        // sklearn rejects an output dimension larger than the input dimension
-        // (`if n_components > d_in: raise ValueError(...)`,
-        // `_locally_linear.py:222-225`, where `d_in = X.shape[1]`). The
-        // boundary `n_components == n_features` is accepted.
-        if self.n_components > n_features {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: "output dimension must be less than or equal to input dimension".into(),
-            });
-        }
-        // Need n_components + 1 eigenvectors (skipping the trivial one).
-        if self.n_components >= n {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: format!(
-                    "n_components ({}) must be less than n_samples ({})",
-                    self.n_components, n
-                ),
-            });
-        }
-        if self.reg < 0.0 {
-            return Err(FerroError::InvalidParameter {
-                name: "reg".into(),
-                reason: "must be non-negative".into(),
-            });
-        }
-
-        // Reject NaN/Inf BEFORE the kNN / reconstruction-weight / eigen math
-        // (sklearn's `_validate_data(force_all_finite=True)` at
-        // `_locally_linear.py:793`, `utils/validation.py:147-154`).
-        reject_non_finite(x)?;
-
-        // Step 1: Find neighbors.
-        let neighbors = find_neighbors(x, self.n_neighbors);
-
-        // Step 2: Compute reconstruction weights.
-        let w = compute_weights(x, &neighbors, self.reg)?;
-
-        // Step 3: Construct M = (I - W)^T (I - W).
-        // I - W
-        let mut iw = Array2::<f64>::zeros((n, n));
-        for i in 0..n {
-            iw[[i, i]] = 1.0;
-            for j in 0..n {
-                iw[[i, j]] -= w[[i, j]];
-            }
-        }
-        // M = (I-W)^T (I-W)
-        let m = iw.t().dot(&iw);
-
-        // Step 4: Eigendecompose M.
-        let (eigenvalues, eigenvectors) = eigh_faer(&m)?;
-
-        // Sort eigenvalues ascending.
-        let mut indices: Vec<usize> = (0..n).collect();
-        indices.sort_by(|&a, &b| {
-            eigenvalues[a]
-                .partial_cmp(&eigenvalues[b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-
-        // Skip the first (smallest, ~0) eigenvector, take next n_components.
-        let n_comp = self.n_components;
-        let mut embedding = Array2::<f64>::zeros((n, n_comp));
-        for (k, &idx) in indices.iter().skip(1).take(n_comp).enumerate() {
-            for i in 0..n {
-                embedding[[i, k]] = eigenvectors[[i, idx]];
-            }
-        }
+        let (embedding, reconstruction_error) =
+            standard_lle_embedding(x, self.n_neighbors, self.n_components, self.reg)?;
 
         Ok(FittedLLE {
             embedding_: embedding,
+            reconstruction_error_: reconstruction_error,
         })
     }
 }
@@ -474,6 +522,7 @@ mod tests {
         let x = grid_data();
         let fitted = lle.fit(&x, &()).unwrap();
         assert_eq!(fitted.embedding().dim(), (9, 2));
+        assert!(fitted.reconstruction_error().is_finite());
     }
 
     #[test]

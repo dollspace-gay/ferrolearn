@@ -8,7 +8,7 @@ upstream: scikit-learn 1.5.2
 upstream-paths:
   - sklearn/manifold/_locally_linear.py  # barycenter_weights (:29-80): per point C = Y[ind] - X[i] (:70), G = C Cᵀ (:71), trace = np.trace(G) (:72), R = reg*trace if trace>0 else reg (:73-76, NO /k), G.flat[::n_neighbors+1] += R (:77), w = solve(G, ones, assume_a="pos") (:78), B[i] = w / Σw (:79). null_space (:125-196): dense path eigh(M, subset_by_index=(k_skip, k+k_skip-1)) (:192-194) then eigen_vectors[:, argsort(abs(eigenvalues))] (:195-196) — eigenvectors UNIT-NORM, NO sqrt-eigenvalue scaling, NO deterministic sign flip; arpack path eigsh(M, k+k_skip, sigma=0.0), eigen_vectors[:, k_skip:] (:173-188). _locally_linear_embedding (:201-): method=="standard" builds W = barycenter_kneighbors_graph (:235), M = (I-W)ᵀ(I-W) (:239-246), null_space(M, n_components, k_skip=1) (:295-301). class LocallyLinearEmbedding(BaseEstimator,...) (:603-): __init__(n_neighbors=5, n_components=2, reg=1e-3, eigen_solver="auto", tol=1e-6, max_iter=100, method="standard", hessian_tol=1e-4, modified_tol=1e-12, neighbors_algorithm="auto", random_state=None, n_jobs=None) (:756-783); method ∈ {standard, hessian, modified, ltsa}; _fit_transform (:785) sets nbrs_, embedding_, reconstruction_error_; transform out-of-sample via barycenter_weights (:851-).
 ferrolearn-module: ferrolearn-decomp/src/lle.rs
-parity-ops: LocallyLinearEmbedding
+parity-ops: LocallyLinearEmbedding, locally_linear_embedding
 crosslink-issue: 1459
 -->
 
@@ -20,10 +20,11 @@ for the `method='standard'` arm: find k-nearest neighbors, solve the local
 least-squares reconstruction weights `W` (`compute_weights`, `lle.rs:162`),
 build `M = (I − W)ᵀ(I − W)`, eigendecompose, and take the bottom
 `n_components` eigenvectors (skipping the trivial near-zero eigenvector) as the
-embedding (`fn fit`, `lle.rs:272`). The exposed surface is the unfitted
-`LLE { n_components, n_neighbors, reg }` (`lle.rs:50`) and the fitted
-`FittedLLE { embedding_ }` (`lle.rs:113`), re-exported at the crate root
-(`pub use lle::{FittedLLE, LLE}`, `lib.rs:94`).
+embedding (`fn fit`). The exposed surface is the unfitted
+`LLE { n_components, n_neighbors, reg }`, the fitted
+`FittedLLE { embedding_, reconstruction_error_ }`, and the standalone
+`locally_linear_embedding` helper for sklearn's standard dense function path,
+all re-exported at the crate root.
 
 **STANDARD-LLE VALUE PARITY (SHIPPED, was DIV `#1460`, now RESOLVED).**
 ferrolearn's local-covariance regularization now matches sklearn's
@@ -44,19 +45,26 @@ landed); REQ-3..5 (the `M` construction + bottom-eigenvector selection, the
 structural shape/determinism, and the error/parameter contracts) are SHIPPED
 scoped.
 
+The standalone sklearn function name is also present: `locally_linear_embedding`
+returns `(embedding, reconstruction_error)` for the standard dense path and is
+guarded by `tests/divergence_locally_linear_embedding.rs` against the live
+sklearn 1.5.2 oracle (`reconstruction_error = 0.0001765118939348609` on the
+10x3 fixture).
+
 At baseline `91124e74` (reg fix `#1460` applied): the standard-LLE `|embedding|`
 value parity (REQ-1) and the reconstruction weights `W` (REQ-2) are SHIPPED; the
 `M = (I−W)ᵀ(I−W)` + bottom-eigenvector extraction (REQ-3), embedding
 shape/determinism (REQ-4), and error/parameter contracts (REQ-5) are SHIPPED
 scoped. The non-standard `method` arms (REQ-6), the
 `eigen_solver='arpack'`/`random_state`/sign convention (REQ-7), `transform`
-out-of-sample (REQ-8), the `reconstruction_error_`/`nbrs_` attrs +
-`neighbors_algorithm`/`tol`/`max_iter` surface (REQ-9), the PyO3 binding
-(REQ-10), and the ferray substrate (REQ-11) are NOT-STARTED — **5 SHIPPED / 6
-NOT-STARTED**.
+out-of-sample (REQ-8), the remaining `nbrs_` attr plus
+`neighbors_algorithm`/`tol`/`max_iter` surface (REQ-9 residual), the PyO3
+binding (REQ-10), and the ferray substrate (REQ-11) are NOT-STARTED. The
+standard-path reconstruction-error value in REQ-9 is now SHIPPED scoped.
 
-`LLE` / `FittedLLE` are existing pub APIs whose non-test consumer is the crate
-re-export (`lib.rs:94`, boundary public API, grandfathered S5/R-DEFER-1). There
+`LLE` / `FittedLLE` / `locally_linear_embedding` are existing pub APIs whose
+non-test consumer is the crate re-export (boundary public API, grandfathered
+S5/R-DEFER-1). There
 is **no PyO3 binding** (`grep -rln LocallyLinear ferrolearn-python/` is empty;
 the `lle` substring match in `classifiers.rs` is the spurious `ndarray::Array1`
 token) and **no `transform` / `Transform`** (sklearn's `LocallyLinearEmbedding`
@@ -287,7 +295,9 @@ The least-confident SHIPPED claim is REQ-3 — it covers the `M` construction an
 the `null_space` SELECTION RULE (skip the trivial eigenvector, keep the next
 `n_components`); the eigenvector VALUES are now pinned by the REQ-1/2 parity
 probes. #1459 is this doc's crosslink tracking issue. Count: **5 SHIPPED
-(REQ-1..5) / 6 NOT-STARTED (REQ-6..11)**.
+(REQ-1..5), plus the REQ-9 standard-path reconstruction-error slice SHIPPED
+scoped; 5 NOT-STARTED areas remain (REQ-6..8, REQ-10..11) plus residual REQ-9
+attrs/parameters.**
 
 | REQ | Status | Evidence |
 |---|---|---|
@@ -299,7 +309,7 @@ probes. #1459 is this doc's crosslink tracking issue. Count: **5 SHIPPED
 | REQ-6 (`method ∈ {hessian, modified, ltsa}`) | NOT-STARTED | open prereq blocker **#1461**. sklearn `_locally_linear_embedding` builds a different `M` for each `method` — `standard` (`_locally_linear.py:234`), `hessian` Hessian eigenmaps (`:248`), `modified` MLLE (`:280`), `ltsa` (`:380+`). ferrolearn implements ONLY `standard` (`fn fit` `lle.rs:272`) and exposes no `method` parameter on `LLE` (`lle.rs:50`). |
 | REQ-7 (`eigen_solver='arpack'` + `random_state` + per-component sign convention) | NOT-STARTED | open prereq blocker **#1462** (sign is a CARVE-OUT). sklearn `null_space` has an `arpack` path `eigsh(M, k+k_skip, sigma=0.0, ..., v0=_init_arpack_v0(..., random_state))` (`_locally_linear.py:173-188`); and even on the dense path the per-component SIGN of each eigenvector is solver-arbitrary — sklearn applies NO deterministic sign flip, so `embedding_[:,j]` and `−embedding_[:,j]` are equivalent. ferrolearn has only the dense `eigh_faer` path (`lle.rs:354`), no `eigen_solver`/`random_state` field, no sign convention. Exact per-component SIGN parity is structurally impossible; the verifiable target is the sign-robust `\|embedding\|` (REQ-1, SHIPPED). |
 | REQ-8 (`transform` out-of-sample via barycenter weights) | NOT-STARTED | open prereq blocker **#1463**. sklearn `LocallyLinearEmbedding.transform` (`_locally_linear.py:851-`) embeds NEW points by `barycenter_weights` against the fitted `nbrs_`, then applies them to the training `embedding_` (Probe REQ-9: `hasattr(transform)==True`). ferrolearn has NO `Transform` impl and no `transform` method — `FittedLLE` exposes only `embedding()` (`lle.rs:121`). |
-| REQ-9 (`reconstruction_error_`/`nbrs_`/`embedding_` attrs + `neighbors_algorithm`/`tol`/`max_iter`) | NOT-STARTED | open prereq blocker **#1464**. sklearn `_fit_transform` (`_locally_linear.py:785`) sets `nbrs_`, `embedding_`, `reconstruction_error_` (Probe REQ-9: `0.0001765...`), and the ctor takes `neighbors_algorithm="auto"`, `tol=1e-6`, `max_iter=100` (`:756-783`). ferrolearn exposes only `embedding()` (`lle.rs:121`) — NO `reconstruction_error_`, NO `nbrs_`, NO `neighbors_algorithm`/`tol`/`max_iter` fields on `LLE` (`lle.rs:50`). |
+| REQ-9 (`reconstruction_error_`/`nbrs_`/`embedding_` attrs + `neighbors_algorithm`/`tol`/`max_iter`) | SHIPPED scoped / residual open | sklearn `_fit_transform` (`_locally_linear.py:785`) sets `nbrs_`, `embedding_`, `reconstruction_error_` (Probe REQ-9: `0.0001765118939348609`), and the ctor takes `neighbors_algorithm="auto"`, `tol=1e-6`, `max_iter=100` (`:756-783`). ferrolearn now exposes `FittedLLE::reconstruction_error()` and the standalone `locally_linear_embedding` helper returns `(embedding, reconstruction_error)` for the standard dense path; `tests/divergence_locally_linear_embedding.rs` pins both values against sklearn 1.5.2. Residual blocker **#1464**: no `nbrs_`, no `neighbors_algorithm`/`tol`/`max_iter` fields, and no full sklearn fitted-attribute object surface. |
 | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker **#1465**. `grep -rln LocallyLinear ferrolearn-python/` is EMPTY (the `lle` substring in `classifiers.rs` is the spurious `ndarray::Array1` token) — no `_RsLocallyLinearEmbedding`, so `import ferrolearn` cannot reach `LocallyLinearEmbedding`/`transform`/`embedding_`/`reconstruction_error_`. The only non-test consumer of `fit`/`embedding()` is the crate re-export (`lib.rs:94`). |
 | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker **#1466**. `lle.rs` computes on `ndarray::Array2<f64>` (`lle.rs:39`) and eigendecomposes via faer (`use crate::mds::eigh_faer`, `lle.rs:36`; `eigh_faer(&m)`, `lle.rs:354` → `faer::Mat::self_adjoint_eigen`), not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). |
 
@@ -365,16 +375,17 @@ the trivial bottom one. `transform` (`:851-`) embeds new points via
 **The remaining gap.** ferrolearn ships standard-LLE `|embedding|` value parity
 (REQ-1) and the reconstruction weights `W` (REQ-2) — the `#1460` reg fix landed —
 plus the `M = (I−W)ᵀ(I−W)` construction + bottom-eigenvector selection (REQ-3),
-the embedding shape/determinism (REQ-4), and the scoped error contracts (REQ-5).
-It lacks: the non-standard `method` arms (REQ-6);
+the embedding shape/determinism (REQ-4), the scoped error contracts (REQ-5), the
+standalone `locally_linear_embedding` name, and the standard-path
+reconstruction-error value. It lacks: the non-standard `method` arms (REQ-6);
 `eigen_solver='arpack'`/`random_state`/sign (REQ-7, sign-carve-out); `transform`
-(REQ-8); the `reconstruction_error_`/`nbrs_` attrs +
-`neighbors_algorithm`/`tol`/`max_iter` surface (REQ-9); the PyO3 binding (REQ-10);
-and the ferray substrate (REQ-11). This is a **standard-LLE-value-parity-SHIPPED**
-unit — the LLE pipeline ships with sklearn-matching weights/embedding; the
+(REQ-8); the residual `nbrs_` attr plus `neighbors_algorithm`/`tol`/`max_iter`
+surface (REQ-9); the PyO3 binding (REQ-10); and the ferray substrate (REQ-11).
+This is a **standard-LLE-value-parity-SHIPPED** unit — the LLE pipeline ships
+with sklearn-matching weights/embedding/error for the standard dense path; the
 remaining work is non-standard methods, the arpack solver, out-of-sample
-transform, the attribute surface, the binding, and the substrate (5 SHIPPED / 6
-NOT-STARTED).
+transform, the residual attribute/config surface, the binding, and the
+substrate.
 
 ## Verification
 
@@ -382,6 +393,7 @@ Library crate (green at baseline `91124e74`):
 ```bash
 cargo test -p ferrolearn-decomp lle                          # 14/14 in-module + api_proof_lle
 cargo test -p ferrolearn-decomp --test divergence_lle        # parity + green-guards
+cargo test -p ferrolearn-decomp --test divergence_locally_linear_embedding
 cargo clippy -p ferrolearn-decomp --all-targets -- -D warnings
 cargo fmt --all --check
 ```

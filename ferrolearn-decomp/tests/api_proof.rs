@@ -11,7 +11,7 @@ use ferrolearn_decomp::{
     Isomap, Kernel, KernelPCA, LLE, LatentDirichletAllocation, LdaLearningMethod, MDS,
     MiniBatchNMF, MiniBatchNMFInit, NMF, NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical,
     PLSRegression, PLSSVD, SparsePCA, SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric,
-    smacof, trustworthiness,
+    locally_linear_embedding, smacof, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -324,6 +324,12 @@ fn api_proof_lle() {
         .unwrap();
     let emb = f.embedding();
     assert_eq!(emb.dim(), (12, 2));
+    assert!(f.reconstruction_error().is_finite());
+
+    let (standalone_embedding, reconstruction_error) =
+        locally_linear_embedding(&x, 3, 2, 1e-3).unwrap();
+    assert_eq!(standalone_embedding.dim(), (12, 2));
+    assert!(reconstruction_error.is_finite());
 }
 
 #[test]

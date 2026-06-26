@@ -17,7 +17,7 @@ model selection.
   the version cited by most current `divergence_*` tests.
 - Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
 - ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
-- Test evidence: the current tree contains 336 `tests/divergence_*.rs` files.
+- Test evidence: the current tree contains 337 `tests/divergence_*.rs` files.
 
 The exact API gap list below was produced by parsing the sklearn 1.9.0 API
 index for public classes/functions and comparing it with current public Rust
@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 66 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 65 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -70,7 +70,6 @@ public Rust surface after the alias normalization above.
 | `sklearn.calibration` | `CalibrationDisplay` |
 | `sklearn.kernel_approximation` | `AdditiveChi2Sampler`, `PolynomialCountSketch`, `SkewedChi2Sampler` |
 | `sklearn.gaussian_process.kernels` | `CompoundKernel`, `ExpSineSquared`, `Exponentiation`, `Hyperparameter`, `RationalQuadratic` |
-| `sklearn.manifold` | `locally_linear_embedding` |
 | `sklearn.datasets` | `fetch_20newsgroups_vectorized`, `fetch_lfw_pairs`, `fetch_lfw_people`, `fetch_olivetti_faces`, `fetch_rcv1`, `fetch_species_distributions`, `load_sample_image`, `load_sample_images`, `make_biclusters`, `make_checkerboard`, `make_sparse_coded_signal` |
 | `sklearn.inspection` | `DecisionBoundaryDisplay`, `PartialDependenceDisplay` |
 
@@ -78,8 +77,8 @@ The following scoped modules had no exact public-item miss in this pass:
 `sklearn.svm`, `sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
 `sklearn.discriminant_analysis`, `sklearn.pipeline`, `sklearn.preprocessing`,
 `sklearn.impute`, `sklearn.random_projection`, `sklearn.semi_supervised`,
-`sklearn.metrics.pairwise`, `sklearn.kernel_ridge`, `sklearn.gaussian_process`,
-`sklearn.covariance`, `sklearn.neural_network`, `sklearn.dummy`,
+`sklearn.metrics.pairwise`, `sklearn.manifold`, `sklearn.kernel_ridge`,
+`sklearn.gaussian_process`, `sklearn.covariance`, `sklearn.neural_network`, `sklearn.dummy`,
 `sklearn.multiclass`, `sklearn.multioutput`, and `sklearn.isotonic`. This means
 only that names exist; it is not a value- or contract-parity claim.
 
@@ -159,7 +158,7 @@ Current divergence-test count by crate:
 | `ferrolearn-core` | 3 |
 | `ferrolearn-covariance` | 6 |
 | `ferrolearn-datasets` | 4 |
-| `ferrolearn-decomp` | 36 |
+| `ferrolearn-decomp` | 37 |
 | `ferrolearn-kernel` | 10 |
 | `ferrolearn-linear` | 68 |
 | `ferrolearn-metrics` | 15 |

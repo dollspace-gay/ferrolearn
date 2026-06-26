@@ -26,8 +26,8 @@
 //!   via geodesic distances on a kNN graph.
 //! - [`SpectralEmbedding`] — Laplacian Eigenmaps. Non-linear dimensionality
 //!   reduction via the normalised graph Laplacian.
-//! - [`LLE`] — Locally Linear Embedding. Non-linear dimensionality reduction
-//!   preserving local reconstruction weights.
+//! - [`LLE`] / [`locally_linear_embedding`] — Locally Linear Embedding.
+//!   Non-linear dimensionality reduction preserving local reconstruction weights.
 //! - [`Tsne`] — t-distributed Stochastic Neighbor Embedding. Non-linear
 //!   dimensionality reduction using Barnes-Hut approximation.
 //! - [`Umap`] — Uniform Manifold Approximation and Projection. Fast non-linear
@@ -95,7 +95,7 @@ pub use kernel_pca::{FittedKernelPCA, Kernel, KernelPCA};
 pub use lda_topic::{
     FittedLatentDirichletAllocation, LatentDirichletAllocation, LdaLearningMethod,
 };
-pub use lle::{FittedLLE, LLE};
+pub use lle::{FittedLLE, LLE, locally_linear_embedding};
 pub use mds::{ClassicalMDS, Dissimilarity, FittedClassicalMDS, FittedMDS, MDS, smacof};
 pub use minibatch_nmf::{FittedMiniBatchNMF, MiniBatchNMF, MiniBatchNMFInit};
 pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver};
