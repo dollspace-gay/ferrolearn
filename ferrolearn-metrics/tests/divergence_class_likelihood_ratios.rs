@@ -26,12 +26,12 @@ fn likelihood_ratios_match_sklearn_oracle_and_weighted_path() {
     // sklearn test fixture:
     // tn=9, fp=8, fn=1, tp=2 -> LR+=34/24, LR-=17/27.
     let mut y_true_values = vec![1usize; 3];
-    y_true_values.extend(std::iter::repeat(0usize).take(17));
+    y_true_values.extend(std::iter::repeat_n(0usize, 17));
     let y_true = Array1::from(y_true_values);
 
     let mut y_pred_values = vec![1usize; 2];
-    y_pred_values.extend(std::iter::repeat(0usize).take(10));
-    y_pred_values.extend(std::iter::repeat(1usize).take(8));
+    y_pred_values.extend(std::iter::repeat_n(0usize, 10));
+    y_pred_values.extend(std::iter::repeat_n(1usize, 8));
     let y_pred = Array1::from(y_pred_values);
 
     let (lr_pos, lr_neg) = class_likelihood_ratios(&y_true, &y_pred).unwrap();
@@ -44,7 +44,7 @@ fn likelihood_ratios_match_sklearn_oracle_and_weighted_path() {
 
     // Ignore the last five false positives: tn=9, fp=3, fn=1, tp=2.
     let mut sample_weight_values = vec![1.0_f64; 15];
-    sample_weight_values.extend(std::iter::repeat(0.0_f64).take(5));
+    sample_weight_values.extend(std::iter::repeat_n(0.0_f64, 5));
     let sample_weight = Array1::from(sample_weight_values);
     let (weighted_pos, weighted_neg) = class_likelihood_ratios_with_options(
         &y_true,

@@ -10,6 +10,8 @@
 //! - [`roc_auc_score`] — area under the ROC curve (binary classification)
 //! - [`roc_curve`] — compute ROC curve (FPR, TPR, thresholds)
 //! - [`precision_recall_curve`] — compute precision-recall curve
+//! - [`confusion_matrix_at_thresholds`] — binary confusion counts per threshold
+//! - [`metric_at_thresholds`] — evaluate a binary metric at every score threshold
 //! - [`auc`] — area under an arbitrary curve via trapezoidal rule
 //! - [`average_precision_score`] — average precision from precision-recall curve
 //! - [`confusion_matrix`] — matrix of true/predicted class counts
@@ -39,15 +41,17 @@
 //! | REQ-10 | `top_k_accuracy_score` value + mergesort tie-break (higher index first, `_ranking.py:2043`) | SHIPPED |
 //! | REQ-11 | `brier_score_loss` (binary) + `hinge_loss` (binary) value (`_classification.py`) | SHIPPED |
 //! | REQ-12 | `class_likelihood_ratios` default value + `labels`/`sample_weight`/undefined replacement (`_classification.py`) | SHIPPED |
-//! | REQ-13 | `zero_division` param options (`0.0`/`1.0`/`nan` + `UndefinedMetricWarning`) | NOT-STARTED (#813) |
-//! | REQ-14 | `average='samples'`/`None` + `pos_label` for the averaged metrics | NOT-STARTED (#814) |
-//! | REQ-15 | `roc_auc_score` `multi_class='ovr'/'ovo'` + `average` + 2D score input | NOT-STARTED (#815) |
-//! | REQ-16 | `cohen_kappa_score` `weights` + `classification_report` `digits`/format + `precision_recall_fscore_support` per-class output | NOT-STARTED (#816) |
-//! | REQ-17 | `sample_weight` (remaining metrics) + `confusion_matrix` `normalize` + `labels` | NOT-STARTED (#817) |
-//! | REQ-18 | Arbitrary-label substrate (str/negative/non-contiguous via LabelEncoder); currently `Array1<usize>` | NOT-STARTED (#818) |
-//! | REQ-19 | `d2_brier_score` has NO sklearn 1.5.2 analog — out of scope (`translate, not innovate`) | NOT-STARTED (#819) |
-//! | REQ-20 | PyO3 binding | NOT-STARTED (#820) |
-//! | REQ-21 | ferray substrate migration | NOT-STARTED (#821) |
+//! | REQ-13 | `confusion_matrix_at_thresholds` + `metric_at_thresholds` threshold ordering, duplicate-score batching, and zero-weight filtering (`_ranking.py`) | SHIPPED |
+//! | REQ-14 | `zero_division` param options (`0.0`/`1.0`/`nan` + `UndefinedMetricWarning`) | NOT-STARTED (#813) |
+//! | REQ-15 | `average='samples'`/`None` + `pos_label` for the averaged metrics | NOT-STARTED (#814) |
+//! | REQ-16 | `roc_auc_score` `multi_class='ovr'/'ovo'` + `average` + 2D score input | NOT-STARTED (#815) |
+//! | REQ-17 | `cohen_kappa_score` `weights` + `classification_report` `digits`/format + `precision_recall_fscore_support` per-class output | NOT-STARTED (#816) |
+//! | REQ-18 | `sample_weight` (remaining metrics) + `confusion_matrix` `normalize` + `labels` | NOT-STARTED (#817) |
+//! | REQ-19 | Arbitrary-label substrate (str/negative/non-contiguous via LabelEncoder); currently `Array1<usize>` | NOT-STARTED (#818) |
+//! | REQ-20 | `metric_at_thresholds` Python `metric_params` and collection-valued metric outputs | NOT-STARTED (#822) |
+//! | REQ-21 | `d2_brier_score` has NO sklearn 1.5.2 analog — out of scope (`translate, not innovate`) | NOT-STARTED (#819) |
+//! | REQ-22 | PyO3 binding | NOT-STARTED (#820) |
+//! | REQ-23 | ferray substrate migration | NOT-STARTED (#821) |
 
 use ferrolearn_core::FerroError;
 use ndarray::{Array1, Array2};
@@ -55,6 +59,10 @@ use num_traits::Float;
 
 /// Result type for curve functions that return `(x, y, thresholds)` arrays.
 type CurveResult<F> = Result<(Array1<F>, Array1<F>, Array1<F>), FerroError>;
+
+/// Result type for `confusion_matrix_at_thresholds`.
+type ThresholdConfusionResult<F> =
+    Result<(Array1<F>, Array1<F>, Array1<F>, Array1<F>, Array1<F>), FerroError>;
 
 /// Averaging strategy for multi-class precision, recall, and F1.
 ///
@@ -876,6 +884,260 @@ fn sort_by_score_desc<F: Float>(y_true: &Array1<usize>, y_score: &Array1<F>) -> 
             .then_with(|| b.1.cmp(&a.1))
     });
     pairs
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ThresholdRow<F> {
+    score: F,
+    label: usize,
+    weight: F,
+}
+
+fn sorted_threshold_rows<F>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+    sample_weight: Option<&Array1<F>>,
+    context: &str,
+) -> Result<Vec<ThresholdRow<F>>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    let n = y_true.len();
+    check_same_length(n, y_score.len(), &format!("{context}: y_true vs y_score"))?;
+    if let Some(weight) = sample_weight {
+        check_same_length(
+            n,
+            weight.len(),
+            &format!("{context}: y_true vs sample_weight"),
+        )?;
+    }
+    if n == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: context.into(),
+        });
+    }
+
+    let mut rows = Vec::with_capacity(n);
+    for i in 0..n {
+        let score = y_score[i];
+        if !score.is_finite() {
+            return Err(FerroError::InvalidParameter {
+                name: "y_score".into(),
+                reason: format!("{context} requires finite scores"),
+            });
+        }
+        let weight = sample_weight.map_or_else(F::one, |weights| weights[i]);
+        if !weight.is_finite() {
+            return Err(FerroError::InvalidParameter {
+                name: "sample_weight".into(),
+                reason: format!("{context} requires finite sample weights"),
+            });
+        }
+        if weight != F::zero() {
+            rows.push(ThresholdRow {
+                score,
+                label: y_true[i],
+                weight,
+            });
+        }
+    }
+
+    if rows.is_empty() {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: format!("{context}: nonzero sample_weight"),
+        });
+    }
+
+    rows.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    Ok(rows)
+}
+
+/// Compute binary confusion matrix terms at every distinct score threshold.
+///
+/// Returns `(tns, fps, fns, tps, thresholds)`, matching sklearn's
+/// `confusion_matrix_at_thresholds`: thresholds are unique `y_score` values in
+/// descending order, predictions are `y_score >= threshold`, and tied scores
+/// are consumed as one batch.
+///
+/// # Errors
+///
+/// Returns [`FerroError::ShapeMismatch`] if input lengths differ,
+/// [`FerroError::InsufficientSamples`] if no samples are provided, and
+/// [`FerroError::InvalidParameter`] if labels are not binary `0`/`1` or scores
+/// are non-finite.
+pub fn confusion_matrix_at_thresholds<F>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+) -> ThresholdConfusionResult<F>
+where
+    F: Float + Send + Sync + 'static,
+{
+    confusion_matrix_at_thresholds_impl(y_true, y_score, None)
+}
+
+/// Weighted variant of [`confusion_matrix_at_thresholds`].
+///
+/// Zero-weighted samples are filtered before threshold extraction, mirroring
+/// sklearn's `_sort_inputs_and_compute_classification_thresholds`.
+pub fn confusion_matrix_at_thresholds_with_sample_weight<F>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+    sample_weight: &Array1<F>,
+) -> ThresholdConfusionResult<F>
+where
+    F: Float + Send + Sync + 'static,
+{
+    confusion_matrix_at_thresholds_impl(y_true, y_score, Some(sample_weight))
+}
+
+fn confusion_matrix_at_thresholds_impl<F>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+    sample_weight: Option<&Array1<F>>,
+) -> ThresholdConfusionResult<F>
+where
+    F: Float + Send + Sync + 'static,
+{
+    for &label in y_true {
+        if label > 1 {
+            return Err(FerroError::InvalidParameter {
+                name: "y_true".into(),
+                reason: format!(
+                    "confusion_matrix_at_thresholds requires binary labels (0 or 1), found label {label}"
+                ),
+            });
+        }
+    }
+
+    let rows = sorted_threshold_rows(
+        y_true,
+        y_score,
+        sample_weight,
+        "confusion_matrix_at_thresholds",
+    )?;
+    let total_pos = rows
+        .iter()
+        .filter(|row| row.label == 1)
+        .fold(F::zero(), |acc, row| acc + row.weight);
+    let total_neg = rows
+        .iter()
+        .filter(|row| row.label == 0)
+        .fold(F::zero(), |acc, row| acc + row.weight);
+
+    let mut thresholds = Vec::new();
+    let mut tps = Vec::new();
+    let mut fps = Vec::new();
+    let mut tp = F::zero();
+    let mut fp = F::zero();
+    let mut i = 0;
+    while i < rows.len() {
+        let score = rows[i].score;
+        while i < rows.len() && rows[i].score == score {
+            if rows[i].label == 1 {
+                tp = tp + rows[i].weight;
+            } else {
+                fp = fp + rows[i].weight;
+            }
+            i += 1;
+        }
+        thresholds.push(score);
+        tps.push(tp);
+        fps.push(fp);
+    }
+
+    let tns: Vec<F> = fps.iter().map(|&value| total_neg - value).collect();
+    let fns: Vec<F> = tps.iter().map(|&value| total_pos - value).collect();
+
+    Ok((
+        Array1::from_vec(tns),
+        Array1::from_vec(fps),
+        Array1::from_vec(fns),
+        Array1::from_vec(tps),
+        Array1::from_vec(thresholds),
+    ))
+}
+
+/// Evaluate a binary metric function at every distinct score threshold.
+///
+/// `metric_func` is called as `metric_func(sorted_y_true, y_pred)`, where
+/// `y_pred` is computed as `(y_score >= threshold)` after sklearn-style stable
+/// descending score sorting. The returned thresholds are unique `y_score`
+/// values in descending order.
+pub fn metric_at_thresholds<F, M>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+    metric_func: M,
+) -> Result<(Array1<f64>, Array1<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+    M: Fn(&Array1<usize>, &Array1<usize>) -> Result<f64, FerroError>,
+{
+    let rows = sorted_threshold_rows(y_true, y_score, None, "metric_at_thresholds")?;
+    metric_at_thresholds_from_rows(&rows, |yt, yp, _weights| metric_func(yt, yp))
+}
+
+/// Weighted variant of [`metric_at_thresholds`].
+///
+/// Zero-weighted samples are filtered before threshold extraction. The metric
+/// closure receives sorted `y_true`, thresholded predictions, and the sorted
+/// nonzero sample weights.
+pub fn metric_at_thresholds_with_sample_weight<F, M>(
+    y_true: &Array1<usize>,
+    y_score: &Array1<F>,
+    sample_weight: &Array1<F>,
+    metric_func: M,
+) -> Result<(Array1<f64>, Array1<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+    M: Fn(&Array1<usize>, &Array1<usize>, &Array1<F>) -> Result<f64, FerroError>,
+{
+    let rows = sorted_threshold_rows(y_true, y_score, Some(sample_weight), "metric_at_thresholds")?;
+    metric_at_thresholds_from_rows(&rows, metric_func)
+}
+
+fn metric_at_thresholds_from_rows<F, M>(
+    rows: &[ThresholdRow<F>],
+    metric_func: M,
+) -> Result<(Array1<f64>, Array1<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+    M: Fn(&Array1<usize>, &Array1<usize>, &Array1<F>) -> Result<f64, FerroError>,
+{
+    let sorted_y_true = Array1::from_vec(rows.iter().map(|row| row.label).collect());
+    let sorted_weight = Array1::from_vec(rows.iter().map(|row| row.weight).collect());
+
+    let mut thresholds = Vec::new();
+    let mut i = 0;
+    while i < rows.len() {
+        let score = rows[i].score;
+        thresholds.push(score);
+        while i < rows.len() && rows[i].score == score {
+            i += 1;
+        }
+    }
+
+    let mut metric_values = Vec::with_capacity(thresholds.len());
+    for &threshold in &thresholds {
+        let y_pred = Array1::from_vec(
+            rows.iter()
+                .map(|row| usize::from(row.score >= threshold))
+                .collect(),
+        );
+        metric_values.push(metric_func(&sorted_y_true, &y_pred, &sorted_weight)?);
+    }
+
+    Ok((
+        Array1::from_vec(metric_values),
+        Array1::from_vec(thresholds),
+    ))
 }
 
 /// Compute the Receiver Operating Characteristic (ROC) curve.

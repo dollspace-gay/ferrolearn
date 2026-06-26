@@ -14,6 +14,8 @@
 //! | [`classification::roc_auc_score`] | Area under the ROC curve (binary) |
 //! | [`classification::roc_curve`] | Compute ROC curve (FPR, TPR, thresholds) |
 //! | [`classification::precision_recall_curve`] | Compute precision-recall curve |
+//! | [`classification::confusion_matrix_at_thresholds`] | Confusion counts at score thresholds |
+//! | [`classification::metric_at_thresholds`] | Metric values at score thresholds |
 //! | [`classification::auc`] | Area under an arbitrary curve (trapezoidal rule) |
 //! | [`classification::average_precision_score`] | Average precision from PR curve |
 //! | [`classification::confusion_matrix`] | Matrix of true vs. predicted counts |
@@ -89,8 +91,10 @@ pub use classification::{
     Average, ClassLikelihoodUndefined, accuracy_score, auc, average_precision_score,
     balanced_accuracy_score, brier_score_loss, calibration_curve, class_likelihood_ratios,
     class_likelihood_ratios_with_options, classification_report, cohen_kappa_score,
-    confusion_matrix, d2_brier_score, d2_log_loss_score, det_curve, f1_score, fbeta_score,
-    hamming_loss, hinge_loss, jaccard_score, log_loss, matthews_corrcoef,
+    confusion_matrix, confusion_matrix_at_thresholds,
+    confusion_matrix_at_thresholds_with_sample_weight, d2_brier_score, d2_log_loss_score,
+    det_curve, f1_score, fbeta_score, hamming_loss, hinge_loss, jaccard_score, log_loss,
+    matthews_corrcoef, metric_at_thresholds, metric_at_thresholds_with_sample_weight,
     multilabel_confusion_matrix, precision_recall_curve, precision_recall_fscore_support,
     precision_score, recall_score, roc_auc_score, roc_curve, top_k_accuracy_score, zero_one_loss,
 };

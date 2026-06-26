@@ -35,6 +35,8 @@ use ferrolearn_metrics::{
     cohen_kappa_score,
     completeness_score,
     confusion_matrix,
+    confusion_matrix_at_thresholds,
+    confusion_matrix_at_thresholds_with_sample_weight,
     consensus_score,
     contingency_matrix,
     cosine_distances,
@@ -72,6 +74,8 @@ use ferrolearn_metrics::{
     mean_squared_log_error,
     mean_tweedie_deviance,
     median_absolute_error,
+    metric_at_thresholds,
+    metric_at_thresholds_with_sample_weight,
     multilabel_confusion_matrix,
     mutual_info_score,
     nan_euclidean_distances,
@@ -153,6 +157,31 @@ fn api_proof_classification_binary_scores() {
     let _ = roc_auc_score(&y_true, &y_score).unwrap();
     let (_fpr, _tpr, _t) = roc_curve(&y_true, &y_score).unwrap();
     let (_p, _r, _t2) = precision_recall_curve(&y_true, &y_score).unwrap();
+    let (_tns, _fps, _fns, _tps, _t_cm) =
+        confusion_matrix_at_thresholds(&y_true, &y_score).unwrap();
+    let sample_weight = array![1.0_f64, 2.0, 3.0, 1.0, 2.0, 1.0];
+    let (_w_tns, _w_fps, _w_fns, _w_tps, _w_t_cm) =
+        confusion_matrix_at_thresholds_with_sample_weight(&y_true, &y_score, &sample_weight)
+            .unwrap();
+    let (_metric_values, _metric_thresholds) =
+        metric_at_thresholds(&y_true, &y_score, accuracy_score).unwrap();
+    let (_weighted_metric_values, _weighted_metric_thresholds) =
+        metric_at_thresholds_with_sample_weight(
+            &y_true,
+            &y_score,
+            &sample_weight,
+            |yt, yp, weights| {
+                let total: f64 = weights.sum();
+                let correct: f64 = yt
+                    .iter()
+                    .zip(yp.iter())
+                    .zip(weights.iter())
+                    .filter_map(|((&t, &p), &w)| (t == p).then_some(w))
+                    .sum();
+                Ok(correct / total)
+            },
+        )
+        .unwrap();
     let _ = average_precision_score(&y_true, &y_score).unwrap();
     let (_fpr2, _fnr, _t3) = det_curve(&y_true, &y_score).unwrap();
     let _ = brier_score_loss(&y_true, &y_prob).unwrap();

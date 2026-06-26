@@ -14,6 +14,11 @@ phase = "metrics"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_metrics::confusion_matrix_at_thresholds"
+phase = "metrics"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_metrics::BUILTIN_SCORER_NAMES"
 phase = "metrics"
 fixture = ""
@@ -25,6 +30,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_metrics::Metric"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::metric_at_thresholds"
 phase = "metrics"
 fixture = ""
 
