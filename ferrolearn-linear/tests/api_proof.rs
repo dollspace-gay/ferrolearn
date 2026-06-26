@@ -16,7 +16,10 @@
 use approx::assert_relative_eq;
 use ferrolearn_core::introspection::HasClasses;
 use ferrolearn_core::traits::{Fit, Predict};
-use ferrolearn_linear::sgd::{ClassifierLoss, LearningRateSchedule, RegressorLoss};
+use ferrolearn_linear::sgd::{
+    ClassifierLoss, LearningRateSchedule, PassiveAggressiveClassifierLoss,
+    PassiveAggressiveRegressorLoss, RegressorLoss,
+};
 use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
     ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, EnetPathOptions,
@@ -24,10 +27,11 @@ use ferrolearn_linear::{
     Lars, LarsPathOptions, Lasso, LassoCV, LassoLars, LassoPathOptions, LinearRegression,
     LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss, LogisticRegression, LogisticRegressionCV,
     NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit, OrthogonalMatchingPursuitCV,
-    OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor,
-    RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions,
-    SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, enet_path, l1_min_c, lars_path,
-    lars_path_gram, lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
+    OrthogonalMpGramOptions, OrthogonalMpOptions, PassiveAggressiveClassifier,
+    PassiveAggressiveRegressor, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor,
+    RegressorScore, Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier,
+    SGDRegressor, SVC, SVR, TweedieRegressor, enet_path, l1_min_c, lars_path, lars_path_gram,
+    lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -426,6 +430,27 @@ fn api_proof_sgd_classifier_and_regressor() {
         .with_max_iter(200)
         .with_random_state(42);
     let f = reg.fit(&xr, &yr).unwrap();
+    let _ = f.predict(&xr).unwrap();
+    let _ = f.score(&xr, &yr, None).unwrap();
+
+    let pac = PassiveAggressiveClassifier::<f64>::new()
+        .with_loss(PassiveAggressiveClassifierLoss::SquaredHinge)
+        .with_c(0.7)
+        .with_max_iter(3)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false);
+    let f = pac.fit(&x, &y_cls).unwrap();
+    let _ = f.predict(&x).unwrap();
+    let _ = f.score(&x, &y_cls, None).unwrap();
+    assert_eq!(f.classes().len(), 2);
+
+    let par = PassiveAggressiveRegressor::<f64>::new()
+        .with_loss(PassiveAggressiveRegressorLoss::SquaredEpsilonInsensitive)
+        .with_c(0.8)
+        .with_max_iter(3)
+        .with_tol(f64::NEG_INFINITY)
+        .with_shuffle(false);
+    let f = par.fit(&xr, &yr).unwrap();
     let _ = f.predict(&xr).unwrap();
     let _ = f.score(&xr, &yr, None).unwrap();
 }

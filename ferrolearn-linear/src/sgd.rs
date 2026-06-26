@@ -69,6 +69,7 @@
 //! | REQ-19 (anti-pattern cleanup) | SHIPPED | `fn compute_lr`'s `_Phantom` arm returns `eta0` (the `unreachable!()` macro was removed earlier), and every production `F::from(<f64 literal>).unwrap()` / `F::from(<literal>).unwrap_or_else(|| ...)` constant-construction site is now `fn cst<F: Float>(x: f64) -> F { F::from(x).unwrap_or_else(F::zero) }` (a private module-level infallible-for-f32/f64 constant helper, defined after the imports). 23 call sites replaced: LogLoss `18.0`/`-18.0`/`1e18` (`_sgd_fast.pyx.tp:267-283`), SquaredError/Huber `0.5` (`:291-295,315-331`), ModifiedHuber `4.0`/`-2.0` (`:178-194`), SquaredHinge/SquaredEpsilonInsensitive/intercept/one-class `2.0` (`:254-258,379-387,641-642,2588`), and the `SGDClassifier`/`SGDRegressor`/`SGDOneClassSVM` `::new` defaults (`0.0`/`0.0001`/`0.15`/`1e-3`/`0.5`/`0.25`/`0.01`/`0.01`/`0.5`, `_stochastic_gradient.py:1242-1256,2042-2068,2245-2281`). No numeric literal changed -> byte-identical for f32/f64; all 25 `divergence_sgd_fit` + full lib/doctest suites stay green. No production panicking constant-conversion remains outside `#[cfg(test)]` in `sgd.rs` (verified by grep). Per R-APG-1 / R-CODE-2. The runtime `F::from(<usize>)` conversions (`t`, `n_samples`, `num_iter`, `count`, `from_usize`) and the deliberately-non-zero-fallback constants (`max_dloss` `1e12`->`F::max_value`, `eta_floor` `1e-6`, `divisor` `5.0`) already used `unwrap_or_else` and were already gate-compliant. Closes #537. |
 //! | REQ-20 (ferray substrate migration) | NOT-STARTED | blocker #538. Still `ndarray` + `StdRng` (R-SUBSTRATE-1). |
 //! | REQ-21 (non-finite input rejected) | SHIPPED | All three SGD fit entries reject any NaN/+/-inf in their float inputs BEFORE the SGD kernel with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_stochastic_gradient.py:1476` clf/reg base, `:2392` one-class) + `_check_sample_weight` (`:1501`) → `ValueError("Input X contains NaN.")` / `"Input y contains NaN."` / `"... contains infinity ..."`. `SGDClassifier::fit_with_sample_weight` checks X + `sample_weight` (`y: Array1<usize>` finite by type); `SGDRegressor::fit_with_sample_weight` checks X + y (`Array1<F>`) + `sample_weight`; the SEPARATE `SGDOneClassSVM::fit_one_class` arm (X-only fit, no y/sample_weight) checks X. `Fit::fit` delegates to the `fit_with_sample_weight` entries with unit weights, so the guard covers the default path too. `.iter().any(|v| !v.is_finite())` catches NaN and Inf; finite paths byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): NaN/+inf/-inf in X for SGDClassifier/SGDRegressor, NaN/inf in y + sample_weight for SGDRegressor, NaN in sample_weight for SGDClassifier all raise `ValueError` (`tests/divergence_linear_nonfinite_batch4.rs::sgd_*`). Non-test consumer: the existing `Fit for SGDClassifier`/`SGDRegressor` + `pub use sgd::{...}` boundary. (#2263) |
+//! | REQ-22 (passive-aggressive wrappers + pa1/pa2 schedules) | SHIPPED | `LearningRateSchedule::{Pa1,Pa2}` implement sklearn's `_plain_sgd` passive-aggressive updates (`pa1`: `min(C, loss/||x||^2)` with zero-norm skip; `pa2`: `loss/(||x||^2 + 0.5/C)`) and the classifier/regressor sign rules (`_sgd_fast.pyx.tp:514-537`). `PassiveAggressiveClassifier` maps user loss `Hinge`/`SquaredHinge` to PA-I/PA-II while fitting hinge loss, and `PassiveAggressiveRegressor` maps `EpsilonInsensitive`/`SquaredEpsilonInsensitive` to PA-I/PA-II while fitting epsilon-insensitive loss, matching `_passive_aggressive.py:275-329,546-595`. Both expose dense Rust builders, fitted wrappers, `Predict`, `HasCoefficients`, and pipeline integration; narrower surface: no warm start, `n_jobs`, sparse/object data, Python deprecation warnings, or `partial_fit` wrapper API. Tests: `tests/divergence_passive_aggressive.rs` pins PA-I/PA-II classifier and regressor coefficients/intercepts/predictions against the live sklearn 1.5.2 oracle with `shuffle=False`, plus validation errors; `tests/api_proof.rs` covers crate-root public names. |
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
@@ -393,6 +394,16 @@ pub enum LearningRateSchedule<F> {
     /// Adaptive: starts at `eta0`, halved when loss fails to decrease for
     /// 5 consecutive epochs. Stops when `eta < 1e-6`.
     Adaptive,
+    /// Passive-Aggressive I: `eta = min(eta0, loss / ||x||^2)`.
+    ///
+    /// sklearn exposes this as `learning_rate="pa1"` for hinge-style
+    /// classification and epsilon-insensitive regression losses.
+    Pa1,
+    /// Passive-Aggressive II: `eta = loss / (||x||^2 + 0.5 / eta0)`.
+    ///
+    /// sklearn exposes this as `learning_rate="pa2"` for the same loss families
+    /// as [`Pa1`](Self::Pa1).
+    Pa2,
     #[doc(hidden)]
     _Phantom(std::marker::PhantomData<F>),
 }
@@ -418,6 +429,7 @@ fn compute_lr<F: Float>(
         LearningRateSchedule::Optimal => F::one() / (alpha * (optimal_init + t_f - F::one())),
         LearningRateSchedule::InvScaling => eta0 / t_f.powf(power_t),
         LearningRateSchedule::Adaptive => eta0,
+        LearningRateSchedule::Pa1 | LearningRateSchedule::Pa2 => eta0,
         // `_Phantom` is an uninhabited marker arm; fall back to `eta0` rather
         // than aborting (R-APG-1 forbids the unreach macro in production).
         LearningRateSchedule::_Phantom(_) => eta0,
@@ -1234,6 +1246,10 @@ where
     // and alpha, so it is computed once per fit, before the epoch loop
     // (`_sgd_fast.pyx.tp:565-570`).
     let opt_init = optimal_init(loss_fn, hyper.alpha);
+    let pa_schedule = matches!(
+        hyper.learning_rate,
+        LearningRateSchedule::Pa1 | LearningRateSchedule::Pa2
+    );
 
     // Effective l1_ratio from the penalty (`_sgd_fast.pyx.tp:558-561`):
     // `L2 -> 0.0`, `L1 -> 1.0`, `ElasticNet -> user l1_ratio`.
@@ -1277,18 +1293,24 @@ where
         let mut epoch_loss = F::zero();
 
         for &i in &indices {
-            t += 1;
+            if !pa_schedule {
+                t += 1;
+            }
 
-            let eta = match hyper.learning_rate {
-                LearningRateSchedule::Adaptive => current_eta,
-                _ => compute_lr(
-                    &hyper.learning_rate,
-                    hyper.eta0,
-                    hyper.alpha,
-                    hyper.power_t,
-                    opt_init,
-                    t,
-                ),
+            let eta = if pa_schedule {
+                hyper.eta0
+            } else {
+                match hyper.learning_rate {
+                    LearningRateSchedule::Adaptive => current_eta,
+                    _ => compute_lr(
+                        &hyper.learning_rate,
+                        hyper.eta0,
+                        hyper.alpha,
+                        hyper.power_t,
+                        opt_init,
+                        t,
+                    ),
+                }
             };
 
             // Compute prediction: w^T x_i + b.
@@ -1298,24 +1320,39 @@ where
                 y_pred = y_pred + weights[j] * xi[j];
             }
 
-            // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before forming the
-            // update, matching `_sgd_fast.pyx.tp:613-620`.
-            let grad = loss_fn
-                .gradient(y_binary[i], y_pred)
-                .max(-max_dloss)
-                .min(max_dloss);
-            // Per-sample weight scaling: `update *= class_weight * sample_weight`
-            // (`_sgd_fast.pyx.tp:630`). `update = -eta*dloss`, so scaling the
-            // update by `w_i` is equivalent to scaling the (clipped) gradient
-            // `dloss` by `w_i` BEFORE forming both the weight data term and the
-            // (gated) intercept gradient term. This multiplies ONLY the
-            // gradient-derived part; the L2 shrink, L1 truncation and the
-            // one-class offset below are unaffected. `g` is the scaled gradient.
-            let g = grad * sample_w[i];
             // `sumloss` is the SUM (not mean) of per-sample losses over the
             // epoch (`_sgd_fast.pyx.tp:597`), computed from the UNWEIGHTED loss
             // (the weight only multiplies `update`, not `loss.loss(y, p)`).
-            epoch_loss = epoch_loss + loss_fn.loss(y_binary[i], y_pred);
+            let sample_loss = loss_fn.loss(y_binary[i], y_pred);
+            epoch_loss = epoch_loss + sample_loss;
+
+            let scaled_update = match hyper.learning_rate {
+                LearningRateSchedule::Pa1 => {
+                    let sq_norm = xi.iter().fold(F::zero(), |acc, &v| acc + v * v);
+                    if sq_norm == F::zero() {
+                        continue;
+                    }
+                    t += 1;
+                    let update = (sample_loss / sq_norm).min(hyper.eta0) * y_binary[i];
+                    update * sample_w[i]
+                }
+                LearningRateSchedule::Pa2 => {
+                    let sq_norm = xi.iter().fold(F::zero(), |acc, &v| acc + v * v);
+                    let denom = sq_norm + cst::<F>(0.5) / hyper.eta0;
+                    t += 1;
+                    sample_loss / denom * y_binary[i] * sample_w[i]
+                }
+                _ => {
+                    // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before
+                    // forming `update = -eta * dloss`, matching
+                    // `_sgd_fast.pyx.tp:613-620`.
+                    let grad = loss_fn
+                        .gradient(y_binary[i], y_pred)
+                        .max(-max_dloss)
+                        .min(max_dloss);
+                    -eta * grad * sample_w[i]
+                }
+            };
 
             // L2 shrink: scale the whole weight vector by the CLAMPED factor
             // `max(0, 1 - (1-eff)*eta*alpha)` BEFORE the gradient add, mirroring
@@ -1327,10 +1364,10 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] * shrink;
             }
-            // Gradient add `w.add(x, update)` with the scaled `update = -eta*g`
-            // (`_sgd_fast.pyx.tp:637-638`); `g` is the sample-weighted gradient.
+            // Gradient/additive PA step `w.add(x, update)` with the
+            // sample-weighted scalar update (`_sgd_fast.pyx.tp:630,637-638`).
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * g * xi[j];
+                weights[j] = weights[j] + scaled_update * xi[j];
             }
             // The intercept update is gated on `fit_intercept` and is NOT
             // regularized (`intercept_decay=1`, `_sgd_fast.pyx.tp:639-644`:
@@ -1345,7 +1382,7 @@ where
             // modified and stays at its init value (`0` clf/reg, `1` one-class).
             if hyper.fit_intercept {
                 let two = cst::<F>(2.0);
-                let mut intercept_update = -eta * g;
+                let mut intercept_update = scaled_update;
                 if hyper.one_class {
                     intercept_update = intercept_update - two * eta * hyper.alpha;
                 }
@@ -1525,6 +1562,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> SGDClassifier<F> {
         validate_clf_params(
             x,
             y,
+            &self.loss,
             &self.learning_rate,
             self.eta0,
             self.alpha,
@@ -1614,6 +1652,8 @@ fn schedule_requires_eta0<F: Float>(schedule: &LearningRateSchedule<F>) -> bool 
         LearningRateSchedule::Constant
             | LearningRateSchedule::InvScaling
             | LearningRateSchedule::Adaptive
+            | LearningRateSchedule::Pa1
+            | LearningRateSchedule::Pa2
     )
 }
 
@@ -1642,6 +1682,7 @@ fn validate_validation_fraction<F: Float>(validation_fraction: F) -> Result<(), 
 fn validate_clf_params<F: Float>(
     x: &Array2<F>,
     y: &Array1<usize>,
+    loss: &ClassifierLoss,
     schedule: &LearningRateSchedule<F>,
     eta0: F,
     alpha: F,
@@ -1667,6 +1708,16 @@ fn validate_clf_params<F: Float>(
         return Err(FerroError::InvalidParameter {
             name: "eta0".into(),
             reason: "must be positive".into(),
+        });
+    }
+    if matches!(
+        schedule,
+        LearningRateSchedule::Pa1 | LearningRateSchedule::Pa2
+    ) && !matches!(loss, ClassifierLoss::Hinge | ClassifierLoss::SquaredHinge)
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "learning_rate".into(),
+            reason: "pa1 and pa2 only work with hinge or squared_hinge loss".into(),
         });
     }
     if alpha < F::zero() {
@@ -2221,6 +2272,7 @@ impl<F: Float + Send + Sync + ScalarOperand + 'static> PartialFit<Array2<F>, Arr
         validate_clf_params(
             x,
             y,
+            &self.loss,
             &self.learning_rate,
             self.eta0,
             self.alpha,
@@ -2679,6 +2731,10 @@ where
     // and alpha, so it is computed once per fit, before the epoch loop
     // (`_sgd_fast.pyx.tp:565-570`).
     let opt_init = optimal_init(loss_fn, hyper.alpha);
+    let pa_schedule = matches!(
+        hyper.learning_rate,
+        LearningRateSchedule::Pa1 | LearningRateSchedule::Pa2
+    );
 
     // Effective l1_ratio from the penalty (`_sgd_fast.pyx.tp:558-561`):
     // `L2 -> 0.0`, `L1 -> 1.0`, `ElasticNet -> user l1_ratio`.
@@ -2715,18 +2771,24 @@ where
         let mut epoch_loss = F::zero();
 
         for &i in &indices {
-            t += 1;
+            if !pa_schedule {
+                t += 1;
+            }
 
-            let eta = match hyper.learning_rate {
-                LearningRateSchedule::Adaptive => current_eta,
-                _ => compute_lr(
-                    &hyper.learning_rate,
-                    hyper.eta0,
-                    hyper.alpha,
-                    hyper.power_t,
-                    opt_init,
-                    t,
-                ),
+            let eta = if pa_schedule {
+                hyper.eta0
+            } else {
+                match hyper.learning_rate {
+                    LearningRateSchedule::Adaptive => current_eta,
+                    _ => compute_lr(
+                        &hyper.learning_rate,
+                        hyper.eta0,
+                        hyper.alpha,
+                        hyper.power_t,
+                        opt_init,
+                        t,
+                    ),
+                }
             };
 
             let xi = x.row(i);
@@ -2735,19 +2797,48 @@ where
                 y_pred = y_pred + weights[j] * xi[j];
             }
 
-            // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before forming the
-            // update, matching `_sgd_fast.pyx.tp:613-620`.
-            let grad = loss_fn
-                .gradient(y[i], y_pred)
-                .max(-max_dloss)
-                .min(max_dloss);
-            // Per-sample weight scaling: `update *= class_weight * sample_weight`
-            // with `class_weight = 1` for regression (`_sgd_fast.pyx.tp:630`).
-            // `g` is the sample-weighted gradient, scaling ONLY the gradient term.
-            let g = grad * sample_w[i];
             // `sumloss` is the SUM (not mean) of per-sample losses over the
             // epoch (`_sgd_fast.pyx.tp:597`), computed from the UNWEIGHTED loss.
-            epoch_loss = epoch_loss + loss_fn.loss(y[i], y_pred);
+            let sample_loss = loss_fn.loss(y[i], y_pred);
+            epoch_loss = epoch_loss + sample_loss;
+
+            let scaled_update = match hyper.learning_rate {
+                LearningRateSchedule::Pa1 => {
+                    let sq_norm = xi.iter().fold(F::zero(), |acc, &v| acc + v * v);
+                    if sq_norm == F::zero() {
+                        continue;
+                    }
+                    t += 1;
+                    let direction = if y[i] - y_pred < F::zero() {
+                        -F::one()
+                    } else {
+                        F::one()
+                    };
+                    let update = (sample_loss / sq_norm).min(hyper.eta0) * direction;
+                    update * sample_w[i]
+                }
+                LearningRateSchedule::Pa2 => {
+                    let sq_norm = xi.iter().fold(F::zero(), |acc, &v| acc + v * v);
+                    let denom = sq_norm + cst::<F>(0.5) / hyper.eta0;
+                    t += 1;
+                    let direction = if y[i] - y_pred < F::zero() {
+                        -F::one()
+                    } else {
+                        F::one()
+                    };
+                    sample_loss / denom * direction * sample_w[i]
+                }
+                _ => {
+                    // Clip the gradient to `[-MAX_DLOSS, MAX_DLOSS]` before
+                    // forming `update = -eta * dloss`, matching
+                    // `_sgd_fast.pyx.tp:613-620`.
+                    let grad = loss_fn
+                        .gradient(y[i], y_pred)
+                        .max(-max_dloss)
+                        .min(max_dloss);
+                    -eta * grad * sample_w[i]
+                }
+            };
 
             // L2 shrink: clamped multiplicative factor
             // `max(0, 1 - (1-eff)*eta*alpha)` applied to the whole weight vector
@@ -2757,19 +2848,19 @@ where
             for j in 0..n_features {
                 weights[j] = weights[j] * shrink;
             }
-            // Gradient add `w.add(x, -eta*g)` with the scaled `g`
-            // (`_sgd_fast.pyx.tp:637-638`).
+            // Gradient/additive PA step `w.add(x, update)` with the
+            // sample-weighted scalar update (`_sgd_fast.pyx.tp:630,637-638`).
             for j in 0..n_features {
-                weights[j] = weights[j] - eta * g * xi[j];
+                weights[j] = weights[j] + scaled_update * xi[j];
             }
             // The intercept update is gated on `fit_intercept` and is NOT
             // regularized (`_sgd_fast.pyx.tp:639-644`: `if fit_intercept == 1:
             // intercept_update = update; ... intercept += intercept_update *
-            // intercept_decay`). `update = -eta*g` is the SCALED update. When
+            // intercept_decay`). `update` is sample-weighted. When
             // `fit_intercept` is false the intercept is never modified and stays
             // at its init value `0` (`intercept` enters this fn as `0`).
             if hyper.fit_intercept {
-                *intercept = *intercept - eta * g;
+                *intercept = *intercept + scaled_update;
             }
 
             // L1 cumulative penalty (Tsuruoka truncated gradient), applied AFTER
@@ -2978,6 +3069,20 @@ fn validate_reg_params<F: Float>(
         return Err(FerroError::InvalidParameter {
             name: "eta0".into(),
             reason: "must be positive".into(),
+        });
+    }
+    if matches!(
+        schedule,
+        LearningRateSchedule::Pa1 | LearningRateSchedule::Pa2
+    ) && !matches!(
+        loss,
+        RegressorLoss::EpsilonInsensitive(_) | RegressorLoss::SquaredEpsilonInsensitive(_)
+    ) {
+        return Err(FerroError::InvalidParameter {
+            name: "learning_rate".into(),
+            reason: "pa1 and pa2 only work with epsilon_insensitive or \
+                     squared_epsilon_insensitive loss"
+                .into(),
         });
     }
     if alpha < F::zero() {
@@ -3369,6 +3474,560 @@ where
 }
 
 impl<F> FittedPipelineEstimator<F> for FittedSGDRegressor<F>
+where
+    F: Float + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        self.predict(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PassiveAggressiveClassifier / PassiveAggressiveRegressor
+// ---------------------------------------------------------------------------
+
+/// User-facing loss selector for [`PassiveAggressiveClassifier`].
+///
+/// sklearn's deprecated `PassiveAggressiveClassifier` maps `hinge` to PA-I and
+/// `squared_hinge` to PA-II, while the underlying optimization loss passed to
+/// the SGD kernel remains hinge in both cases (`_passive_aggressive.py:275-304`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveAggressiveClassifierLoss {
+    /// PA-I (`learning_rate="pa1"`).
+    Hinge,
+    /// PA-II (`learning_rate="pa2"`).
+    SquaredHinge,
+}
+
+/// Passive-Aggressive linear classifier.
+///
+/// Mirrors sklearn's `PassiveAggressiveClassifier` dense deterministic path by
+/// routing to the shared SGD kernel with hinge loss, `learning_rate=pa1/pa2`,
+/// `eta0=C`, and no L2/L1 regularization. The Rust surface is intentionally
+/// narrower: dense arrays only, no warm start, no `n_jobs`, no Python warnings.
+#[derive(Debug, Clone)]
+pub struct PassiveAggressiveClassifier<F> {
+    /// Aggressiveness parameter `C`; sklearn requires `C > 0`.
+    pub c: F,
+    /// Whether to fit the intercept.
+    pub fit_intercept: bool,
+    /// Maximum number of epochs for `fit`.
+    pub max_iter: usize,
+    /// Convergence tolerance. Use `F::neg_infinity()` to mirror sklearn
+    /// `tol=None`.
+    pub tol: F,
+    /// Whether to split off validation data for early stopping.
+    pub early_stopping: bool,
+    /// Validation hold-out fraction when early stopping.
+    pub validation_fraction: F,
+    /// Consecutive non-improving epochs before convergence.
+    pub n_iter_no_change: usize,
+    /// Whether to shuffle samples each epoch.
+    pub shuffle: bool,
+    /// Optional shuffle seed.
+    pub random_state: Option<u64>,
+    /// User-facing PA variant selector.
+    pub loss: PassiveAggressiveClassifierLoss,
+    /// Per-class weighting strategy.
+    pub class_weight: ClassWeight<F>,
+    /// Averaged-SGD threshold.
+    pub average: usize,
+}
+
+impl<F: Float> PassiveAggressiveClassifier<F> {
+    /// Create a classifier with sklearn-compatible defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            c: F::one(),
+            fit_intercept: true,
+            max_iter: 1000,
+            tol: cst(1e-3),
+            early_stopping: false,
+            validation_fraction: cst(0.1),
+            n_iter_no_change: 5,
+            shuffle: true,
+            random_state: None,
+            loss: PassiveAggressiveClassifierLoss::Hinge,
+            class_weight: ClassWeight::None,
+            average: 0,
+        }
+    }
+
+    /// Set the PA aggressiveness parameter `C`.
+    #[must_use]
+    pub fn with_c(mut self, c: F) -> Self {
+        self.c = c;
+        self
+    }
+
+    /// Set the user-facing loss selector (`hinge` -> PA-I, `squared_hinge` -> PA-II).
+    #[must_use]
+    pub fn with_loss(mut self, loss: PassiveAggressiveClassifierLoss) -> Self {
+        self.loss = loss;
+        self
+    }
+
+    /// Set whether the intercept is fit.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the maximum number of epochs.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Enable or disable early stopping.
+    #[must_use]
+    pub fn with_early_stopping(mut self, early_stopping: bool) -> Self {
+        self.early_stopping = early_stopping;
+        self
+    }
+
+    /// Set the validation fraction for early stopping.
+    #[must_use]
+    pub fn with_validation_fraction(mut self, validation_fraction: F) -> Self {
+        self.validation_fraction = validation_fraction;
+        self
+    }
+
+    /// Set the non-improving epoch patience.
+    #[must_use]
+    pub fn with_n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
+        self
+    }
+
+    /// Set whether training samples are shuffled each epoch.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = shuffle;
+        self
+    }
+
+    /// Set the shuffle seed.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
+        self
+    }
+
+    /// Set class weighting.
+    #[must_use]
+    pub fn with_class_weight(mut self, class_weight: ClassWeight<F>) -> Self {
+        self.class_weight = class_weight;
+        self
+    }
+
+    /// Set the averaged-SGD threshold.
+    #[must_use]
+    pub fn with_average(mut self, average: usize) -> Self {
+        self.average = average;
+        self
+    }
+
+    fn as_sgd(&self) -> SGDClassifier<F> {
+        let learning_rate = match self.loss {
+            PassiveAggressiveClassifierLoss::Hinge => LearningRateSchedule::Pa1,
+            PassiveAggressiveClassifierLoss::SquaredHinge => LearningRateSchedule::Pa2,
+        };
+        SGDClassifier::new()
+            .with_loss(ClassifierLoss::Hinge)
+            .with_learning_rate(learning_rate)
+            .with_eta0(self.c)
+            .with_alpha(F::zero())
+            .with_fit_intercept(self.fit_intercept)
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_early_stopping(self.early_stopping)
+            .with_validation_fraction(self.validation_fraction)
+            .with_n_iter_no_change(self.n_iter_no_change)
+            .with_shuffle(self.shuffle)
+            .with_class_weight(self.class_weight.clone())
+            .with_average(self.average)
+    }
+}
+
+impl<F: Float> Default for PassiveAggressiveClassifier<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted [`PassiveAggressiveClassifier`].
+#[derive(Debug, Clone)]
+pub struct FittedPassiveAggressiveClassifier<F> {
+    inner: FittedSGDClassifier<F>,
+}
+
+impl<F: Float> FittedPassiveAggressiveClassifier<F> {
+    /// Coefficients of the first binary subproblem.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array1<F> {
+        &self.inner.weight_matrix[0]
+    }
+
+    /// Intercept of the first binary subproblem.
+    #[must_use]
+    pub fn intercept(&self) -> F {
+        self.inner.intercepts[0]
+    }
+
+    /// Sorted class labels.
+    #[must_use]
+    pub fn classes(&self) -> &[usize] {
+        &self.inner.classes
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<usize>>
+    for PassiveAggressiveClassifier<F>
+{
+    type Fitted = FittedPassiveAggressiveClassifier<F>;
+    type Error = FerroError;
+
+    fn fit(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<usize>,
+    ) -> Result<FittedPassiveAggressiveClassifier<F>, FerroError> {
+        let mut model = self.as_sgd();
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        Ok(FittedPassiveAggressiveClassifier {
+            inner: model.fit(x, y)?,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
+    for FittedPassiveAggressiveClassifier<F>
+{
+    type Output = Array1<usize>;
+    type Error = FerroError;
+
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<usize>, FerroError> {
+        self.inner.predict(x)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
+    for FittedPassiveAggressiveClassifier<F>
+{
+    fn coefficients(&self) -> &Array1<F> {
+        self.coefficients()
+    }
+
+    fn intercept(&self) -> F {
+        self.intercept()
+    }
+}
+
+impl<F> PipelineEstimator<F> for PassiveAggressiveClassifier<F>
+where
+    F: Float + ToPrimitive + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
+    fn fit_pipeline(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        let y_usize: Array1<usize> = y.mapv(|v| v.to_usize().unwrap_or(0));
+        let fitted = self.fit(x, &y_usize)?;
+        Ok(Box::new(FittedPassiveAggressiveClassifierPipeline(fitted)))
+    }
+}
+
+struct FittedPassiveAggressiveClassifierPipeline<F>(FittedPassiveAggressiveClassifier<F>)
+where
+    F: Float + Send + Sync + 'static;
+
+unsafe impl<F> Send for FittedPassiveAggressiveClassifierPipeline<F> where
+    F: Float + Send + Sync + 'static
+{
+}
+unsafe impl<F> Sync for FittedPassiveAggressiveClassifierPipeline<F> where
+    F: Float + Send + Sync + 'static
+{
+}
+
+impl<F> FittedPipelineEstimator<F> for FittedPassiveAggressiveClassifierPipeline<F>
+where
+    F: Float + ToPrimitive + FromPrimitive + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        let preds = self.0.predict(x)?;
+        Ok(preds.mapv(|v| F::from_usize(v).unwrap_or_else(F::nan)))
+    }
+}
+
+/// User-facing loss selector for [`PassiveAggressiveRegressor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassiveAggressiveRegressorLoss {
+    /// PA-I (`learning_rate="pa1"`).
+    EpsilonInsensitive,
+    /// PA-II (`learning_rate="pa2"`).
+    SquaredEpsilonInsensitive,
+}
+
+/// Passive-Aggressive linear regressor.
+///
+/// Mirrors sklearn's `PassiveAggressiveRegressor` dense deterministic path by
+/// routing to the shared SGD kernel with epsilon-insensitive loss,
+/// `learning_rate=pa1/pa2`, `eta0=C`, and no L2/L1 regularization.
+#[derive(Debug, Clone)]
+pub struct PassiveAggressiveRegressor<F> {
+    /// Aggressiveness parameter `C`; sklearn requires `C > 0`.
+    pub c: F,
+    /// Whether to fit the intercept.
+    pub fit_intercept: bool,
+    /// Maximum number of epochs for `fit`.
+    pub max_iter: usize,
+    /// Convergence tolerance. Use `F::neg_infinity()` to mirror sklearn
+    /// `tol=None`.
+    pub tol: F,
+    /// Whether to split off validation data for early stopping.
+    pub early_stopping: bool,
+    /// Validation hold-out fraction when early stopping.
+    pub validation_fraction: F,
+    /// Consecutive non-improving epochs before convergence.
+    pub n_iter_no_change: usize,
+    /// Whether to shuffle samples each epoch.
+    pub shuffle: bool,
+    /// Optional shuffle seed.
+    pub random_state: Option<u64>,
+    /// User-facing PA variant selector.
+    pub loss: PassiveAggressiveRegressorLoss,
+    /// Epsilon-insensitive tube width.
+    pub epsilon: F,
+    /// Averaged-SGD threshold.
+    pub average: usize,
+}
+
+impl<F: Float> PassiveAggressiveRegressor<F> {
+    /// Create a regressor with sklearn-compatible defaults.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            c: F::one(),
+            fit_intercept: true,
+            max_iter: 1000,
+            tol: cst(1e-3),
+            early_stopping: false,
+            validation_fraction: cst(0.1),
+            n_iter_no_change: 5,
+            shuffle: true,
+            random_state: None,
+            loss: PassiveAggressiveRegressorLoss::EpsilonInsensitive,
+            epsilon: cst(0.1),
+            average: 0,
+        }
+    }
+
+    /// Set the PA aggressiveness parameter `C`.
+    #[must_use]
+    pub fn with_c(mut self, c: F) -> Self {
+        self.c = c;
+        self
+    }
+
+    /// Set the user-facing loss selector.
+    #[must_use]
+    pub fn with_loss(mut self, loss: PassiveAggressiveRegressorLoss) -> Self {
+        self.loss = loss;
+        self
+    }
+
+    /// Set the epsilon-insensitive tube width.
+    #[must_use]
+    pub fn with_epsilon(mut self, epsilon: F) -> Self {
+        self.epsilon = epsilon;
+        self
+    }
+
+    /// Set whether the intercept is fit.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set the maximum number of epochs.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Enable or disable early stopping.
+    #[must_use]
+    pub fn with_early_stopping(mut self, early_stopping: bool) -> Self {
+        self.early_stopping = early_stopping;
+        self
+    }
+
+    /// Set the validation fraction for early stopping.
+    #[must_use]
+    pub fn with_validation_fraction(mut self, validation_fraction: F) -> Self {
+        self.validation_fraction = validation_fraction;
+        self
+    }
+
+    /// Set the non-improving epoch patience.
+    #[must_use]
+    pub fn with_n_iter_no_change(mut self, n_iter_no_change: usize) -> Self {
+        self.n_iter_no_change = n_iter_no_change;
+        self
+    }
+
+    /// Set whether training samples are shuffled each epoch.
+    #[must_use]
+    pub fn with_shuffle(mut self, shuffle: bool) -> Self {
+        self.shuffle = shuffle;
+        self
+    }
+
+    /// Set the shuffle seed.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
+        self
+    }
+
+    /// Set the averaged-SGD threshold.
+    #[must_use]
+    pub fn with_average(mut self, average: usize) -> Self {
+        self.average = average;
+        self
+    }
+
+    fn as_sgd(&self) -> SGDRegressor<F> {
+        let learning_rate = match self.loss {
+            PassiveAggressiveRegressorLoss::EpsilonInsensitive => LearningRateSchedule::Pa1,
+            PassiveAggressiveRegressorLoss::SquaredEpsilonInsensitive => LearningRateSchedule::Pa2,
+        };
+        SGDRegressor::new()
+            .with_loss(RegressorLoss::EpsilonInsensitive(self.epsilon))
+            .with_learning_rate(learning_rate)
+            .with_eta0(self.c)
+            .with_alpha(F::zero())
+            .with_l1_ratio(F::zero())
+            .with_fit_intercept(self.fit_intercept)
+            .with_max_iter(self.max_iter)
+            .with_tol(self.tol)
+            .with_early_stopping(self.early_stopping)
+            .with_validation_fraction(self.validation_fraction)
+            .with_n_iter_no_change(self.n_iter_no_change)
+            .with_shuffle(self.shuffle)
+            .with_average(self.average)
+    }
+}
+
+impl<F: Float> Default for PassiveAggressiveRegressor<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted [`PassiveAggressiveRegressor`].
+#[derive(Debug, Clone)]
+pub struct FittedPassiveAggressiveRegressor<F> {
+    inner: FittedSGDRegressor<F>,
+}
+
+impl<F: Float> FittedPassiveAggressiveRegressor<F> {
+    /// Learned coefficient vector.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array1<F> {
+        &self.inner.weights
+    }
+
+    /// Learned intercept.
+    #[must_use]
+    pub fn intercept(&self) -> F {
+        self.inner.intercept
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Fit<Array2<F>, Array1<F>>
+    for PassiveAggressiveRegressor<F>
+{
+    type Fitted = FittedPassiveAggressiveRegressor<F>;
+    type Error = FerroError;
+
+    fn fit(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<FittedPassiveAggressiveRegressor<F>, FerroError> {
+        let mut model = self.as_sgd();
+        if let Some(seed) = self.random_state {
+            model = model.with_random_state(seed);
+        }
+        Ok(FittedPassiveAggressiveRegressor {
+            inner: model.fit(x, y)?,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>>
+    for FittedPassiveAggressiveRegressor<F>
+{
+    type Output = Array1<F>;
+    type Error = FerroError;
+
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        self.inner.predict(x)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F>
+    for FittedPassiveAggressiveRegressor<F>
+{
+    fn coefficients(&self) -> &Array1<F> {
+        self.coefficients()
+    }
+
+    fn intercept(&self) -> F {
+        self.intercept()
+    }
+}
+
+impl<F> PipelineEstimator<F> for PassiveAggressiveRegressor<F>
+where
+    F: Float + ScalarOperand + Send + Sync + 'static,
+{
+    fn fit_pipeline(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        let fitted = self.fit(x, y)?;
+        Ok(Box::new(fitted))
+    }
+}
+
+impl<F> FittedPipelineEstimator<F> for FittedPassiveAggressiveRegressor<F>
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
 {

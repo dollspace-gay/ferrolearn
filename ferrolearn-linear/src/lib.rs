@@ -142,8 +142,9 @@ pub use ridge_classifier::{FittedRidgeClassifier, RidgeClassifier};
 pub use ridge_classifier_cv::{FittedRidgeClassifierCV, RidgeClassifierCV};
 pub use ridge_cv::{FittedRidgeCV, RidgeCV};
 pub use sgd::{
-    FittedSGDClassifier, FittedSGDOneClassSVM, FittedSGDRegressor, SGDClassifier, SGDOneClassSVM,
-    SGDRegressor,
+    FittedPassiveAggressiveClassifier, FittedPassiveAggressiveRegressor, FittedSGDClassifier,
+    FittedSGDOneClassSVM, FittedSGDRegressor, PassiveAggressiveClassifier,
+    PassiveAggressiveRegressor, SGDClassifier, SGDOneClassSVM, SGDRegressor,
 };
 pub use svm::{
     FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,

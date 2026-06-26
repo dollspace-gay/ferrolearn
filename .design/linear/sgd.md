@@ -14,22 +14,18 @@ upstream-paths:
 
 `ferrolearn-linear/src/sgd.rs` mirrors scikit-learn's
 `sklearn.linear_model.SGDClassifier` and `SGDRegressor` (and is routed to also
-cover `SGDOneClassSVM`): linear models trained by stochastic gradient descent
-over a configurable convex loss with an L2 penalty and a learning-rate schedule.
-The current implementation ships the four classifier losses
-(`hinge`/`log_loss`/`modified_huber`/`squared_error`), three regressor losses
-(`squared_error`/`huber`/`epsilon_insensitive`), the `constant`/`invscaling`
-schedules, an L2 inline penalty, one-vs-all multiclass, `partial_fit`, and
-pipeline integration. It **diverges from sklearn** on: the `optimal` schedule
-`t0` offset, the `adaptive` schedule trigger/divisor, the L2 update form
-(inline vs `wscale` shrinkage), convergence (single-epoch mean-loss delta vs
-`best_loss`/`n_iter_no_change`/sumloss), and a large set of missing
-parameters/features (`penalty=l1|elasticnet`, `l1_ratio`, `fit_intercept`,
-`shuffle`, `n_iter_no_change`, `early_stopping`, `validation_fraction`,
-`average`/ASGD, `warm_start`, `class_weight`, `epsilon`/`DEFAULT_EPSILON`,
-classifier defaults `learning_rate='optimal'`/`eta0=0.0`/`power_t=0.5`,
-`squared_hinge`, `perceptron`, `squared_epsilon_insensitive`), and the entire
-`SGDOneClassSVM` estimator. The substrate is `ndarray`, not ferray.
+cover `SGDOneClassSVM` plus the passive-aggressive wrapper estimators): linear
+models trained by stochastic gradient descent over a configurable convex loss
+with inline penalties and a learning-rate schedule. The current implementation
+ships the classifier and regressor loss families used by sklearn's SGD and
+passive-aggressive estimators, `constant`/`optimal`/`invscaling`/`adaptive` and
+`pa1`/`pa2` schedules, L2/L1/elastic-net update math, one-vs-all multiclass,
+`partial_fit` for SGD, `SGDOneClassSVM`, `PassiveAggressiveClassifier`,
+`PassiveAggressiveRegressor`, sample/class weights on `fit`, early stopping,
+averaging, and pipeline integration. Remaining divergences include sparse input,
+Python warning/error ABI, warm start, `n_jobs`, exact numpy-RNG shuffle and
+validation-split parity, richer fitted attributes, and ferray substrate
+migration. The substrate is `ndarray`, not ferray.
 
 `_sag.py` (SAG/SAGA solvers) is a secondary upstream listed by the route; it is
 **not** the engine behind sklearn's SGD estimators (it backs `Ridge`/`LogisticRegression`
@@ -81,8 +77,13 @@ Per sample `(x, y)` within an epoch (`_sgd_fast.pyx.tp:581-661`):
    - `invscaling`: `eta = eta0 / pow(t, power_t)`.
    - `adaptive`: holds `eta` constant within the schedule block; decreased only
      by the convergence handler (step 8).
-3. **dloss** `dloss = loss.dloss(y, p)`, clipped to `±MAX_DLOSS = 1e12`
-   (`:613-619`); `update = -eta * dloss` (`:620`); then
+   - `pa1`: `update = min(eta0, loss(y,p) / ||x||^2)`; if `||x||^2 == 0`,
+     skip the update (`:514-518`).
+   - `pa2`: `update = loss(y,p) / (||x||^2 + 0.5 / eta0)` (`:519-521`).
+3. **update scalar** for non-PA schedules: `dloss = loss.dloss(y, p)`, clipped
+   to `±MAX_DLOSS = 1e12` (`:613-619`); `update = -eta * dloss` (`:620`). For
+   PA schedules, multiply the positive PA step by `y` for hinge classification
+   or by `sign(y - p)` for epsilon-insensitive regression (`:532-537`). Then
    `update *= class_weight * sample_weight` (`:630`).
 4. **L2 shrink** (`penalty_type >= L2`, `:632-635`): scale the *whole* weight
    vector by `max(0, 1 - (1 - l1_ratio) * eta * alpha)` via `w.scale(...)` —
