@@ -32,8 +32,9 @@
 //! | REQ-11 (n_iter_ / dual_gap_ attrs) | SHIPPED | `FittedLasso<F>` carries `n_iter`/`dual_gap` fields + `n_iter()`/`dual_gap()` getters, mirroring sklearn `Lasso.n_iter_` (`_coordinate_descent.py:1103`) and `dual_gap_` (`:1108`). `fn lasso_dual_gap` computes the duality gap on the CD design (centered/raw) using sklearn's `_cd_fast.pyx:216-247` formula (`l1_reg = α·n`, `beta=0`) with a final `/n` mapping to the `(1/2n)` objective. With REQ-12's dual-gap stopping criterion now landed, `n_iter_`'s VALUE matches sklearn exactly (`n_iter_ == 20` at alpha=0.3 and alpha=0.1 on the fixture); `dual_gap_` matches sklearn's formula/value (`0.00011701482` at alpha=0.3). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_formula_matches_numpy`, `lasso_fitted_dual_gap_and_n_iter`, `lasso_fields_dont_change_coef`, `lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`). |
 //! | REQ-12 (dual-gap stopping criterion) | SHIPPED | `Fit::fit for Lasso` now uses sklearn's two-level criterion (`_cd_fast.pyx:167-249`): `tol_scaled = tol·(target·target)` (`:167-168`), per sweep track `w_max`/`d_w_max`, gate on `w_max==0 || d_w_max/w_max < tol || last_iter` (`:207-211`), and inside the gate break only when the UN-normalized gap `lasso_dual_gap(...)·n < tol_scaled` (`:249`). Matches sklearn's `coef_` to ≤1e-7 and `n_iter_` exactly (20 at alpha=0.3 and alpha=0.1). Verification: `cargo test -p ferrolearn-linear --lib lasso` (`lasso_dual_gap_stopping_matches_sklearn_coef_and_niter`, `lasso_dual_gap_stopping_second_alpha`). |
 //! | REQ-13 (MultiTaskLasso) | SHIPPED | Separate estimator: `MultiTaskLasso<F>`/`FittedMultiTaskLasso<F>` in `multi_task_lasso.rs` (`Fit<Array2<F>, Array2<F>> for MultiTaskLasso`). Multi-output L2,1 (group-Lasso) block coordinate descent porting `_cd_fast.pyx::enet_coordinate_descent_multi_task` (`:740-959`) with `l2_reg=0`, `l1_reg=α·n` (`MultiTaskLasso = MultiTaskElasticNet(l1_ratio=1)`, `_coordinate_descent.py:2663`): per-feature block soft-threshold `W[j,:] = tmp·max(1−l1_reg/‖tmp‖₂,0)/norm_cols_X[j]`, rank-1 residual maintenance, two-level relative-change + L21 dual-gap stop (`:903-952`, `tol_scaled = tol·‖Yc‖_F²`); `coef_` stored `(n_tasks, n_features)`, per-task `intercept_`, `n_iter_`. Verified vs live sklearn 1.5.2 (R-CHAR-3): `MultiTaskLasso(alpha=0.3)` on `X=[[1,2],[2,1],[3,4],[4,3],[5,5]]`/`Y=[[3,1],[2.5,2],[7.1,3.5],[6,4.2],[11.2,6]]` → `coef_=[[0.7874471321,1.3745821226],[0.8341004367,0.3460953631]]`, `intercept_=[-0.5260877641,-0.2005873993]`, `n_iter_=19`. Tests `multi_task_lasso_*` in `multi_task_lasso.rs` + the live-oracle integration pins in `tests/divergence_multi_task_lasso.rs` (alpha grid, 3-task, exact-zero group sparsity, predict shape/values). Non-test consumer: `MultiTaskLasso`/`FittedMultiTaskLasso` re-exported at the crate root (`ferrolearn_linear::MultiTaskLasso`, boundary API per S5/R-DEFER-1). Design-doc REQ-13 row in `.design/linear/lasso.md` already SHIPPED. Closes #413. |
-//! | REQ-14 (ferray substrate) | NOT-STARTED | #414 (CD is elementwise; coef storage ndarray, tied to #359). |
-//! | REQ-15 (non-finite input rejected) | SHIPPED | `Fit::fit for Lasso` rejects any NaN/+/-inf in X or y BEFORE coordinate descent with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:980`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — `test_lasso_*` unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lasso().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::lasso_*`). Non-test consumer: the existing `Fit::fit` / `RsLasso` / `LassoCV` consumers. (#2256) |
+//! | REQ-14 (`lasso_path` public helper) | SHIPPED | `pub fn lasso_path` + `LassoPathOptions` / `LassoPathResult` expose the dense single-output Rust analogue of `sklearn.linear_model.lasso_path`, returning sorted alphas, coefficient path `(n_features, n_alphas)`, dual gaps, and per-alpha iteration counts. Oracle tests `lasso_path_*_matches_sklearn`. |
+//! | REQ-15 (ferray substrate) | NOT-STARTED | #414 (CD is elementwise; coef storage ndarray, tied to #359). |
+//! | REQ-16 (non-finite input rejected) | SHIPPED | `Fit::fit for Lasso` rejects any NaN/+/-inf in X or y BEFORE coordinate descent with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:980`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input — `test_lasso_*` unchanged). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lasso().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::lasso_*`). Non-test consumer: the existing `Fit::fit` / `RsLasso` / `LassoCV` consumers. (#2256) |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — converged coef/intercept, sparsity support set, alpha
 //! scaling, alpha=0, fit_intercept=false, f32, and defaults all match the live oracle. Two
@@ -288,6 +289,334 @@ pub struct FittedLasso<F> {
     n_iter: usize,
     /// Duality gap at the returned solution (mirrors sklearn `Lasso.dual_gap_`).
     dual_gap: F,
+}
+
+/// Options for [`lasso_path`].
+#[derive(Debug, Clone)]
+pub struct LassoPathOptions<F> {
+    /// Explicit alphas. When provided, values are sorted descending to match
+    /// sklearn's path helper.
+    pub alphas: Option<Vec<F>>,
+    /// Ratio between the smallest and largest generated alpha.
+    pub eps: F,
+    /// Number of generated alphas when [`LassoPathOptions::alphas`] is `None`.
+    pub n_alphas: usize,
+    /// Maximum coordinate-descent sweeps per alpha.
+    pub max_iter: usize,
+    /// Coordinate-descent tolerance.
+    pub tol: F,
+    /// Whether to run coordinate descent on a precomputed Gram matrix.
+    pub precompute: bool,
+    /// Coordinate-selection order.
+    pub selection: CoordSelection,
+    /// Seed used when `selection == CoordSelection::Random`.
+    pub random_state: Option<u64>,
+    /// Whether coefficients are constrained to be non-negative.
+    pub positive: bool,
+}
+
+impl<F: Float> LassoPathOptions<F> {
+    /// Create default options matching sklearn's dense helper defaults for the
+    /// supported single-output path: `eps=1e-3`, `n_alphas=100`,
+    /// `max_iter=1000`, `tol=1e-4`, cyclic selection, and `positive=false`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            alphas: None,
+            eps: F::from(1e-3).unwrap(),
+            n_alphas: 100,
+            max_iter: 1000,
+            tol: F::from(1e-4).unwrap(),
+            precompute: false,
+            selection: CoordSelection::Cyclic,
+            random_state: None,
+            positive: false,
+        }
+    }
+
+    /// Set an explicit alpha grid.
+    #[must_use]
+    pub fn with_alphas(mut self, alphas: Vec<F>) -> Self {
+        self.alphas = Some(alphas);
+        self
+    }
+
+    /// Set the generated-grid min/max alpha ratio.
+    #[must_use]
+    pub fn with_eps(mut self, eps: F) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// Set the number of generated alphas.
+    #[must_use]
+    pub fn with_n_alphas(mut self, n_alphas: usize) -> Self {
+        self.n_alphas = n_alphas;
+        self
+    }
+
+    /// Set maximum coordinate-descent sweeps per alpha.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set coordinate-descent tolerance.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set whether to use the Gram/precompute solver.
+    #[must_use]
+    pub fn with_precompute(mut self, precompute: bool) -> Self {
+        self.precompute = precompute;
+        self
+    }
+
+    /// Set coordinate-selection order.
+    #[must_use]
+    pub fn with_selection(mut self, selection: CoordSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Set RNG seed for random coordinate selection.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
+        self
+    }
+
+    /// Set whether coefficients are constrained to be non-negative.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
+        self
+    }
+}
+
+impl<F: Float> Default for LassoPathOptions<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result returned by [`lasso_path`].
+#[derive(Debug, Clone)]
+pub struct LassoPathResult<F> {
+    alphas: Array1<F>,
+    coefficients: Array2<F>,
+    dual_gaps: Array1<F>,
+    n_iters: Vec<usize>,
+}
+
+impl<F: Float> LassoPathResult<F> {
+    /// Borrow the alpha grid, sorted descending.
+    #[must_use]
+    pub fn alphas(&self) -> &Array1<F> {
+        &self.alphas
+    }
+
+    /// Borrow the coefficient path, shaped `(n_features, n_alphas)`.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array2<F> {
+        &self.coefficients
+    }
+
+    /// Borrow the dual gaps, one per alpha.
+    #[must_use]
+    pub fn dual_gaps(&self) -> &Array1<F> {
+        &self.dual_gaps
+    }
+
+    /// Borrow the per-alpha coordinate-descent iteration counts.
+    #[must_use]
+    pub fn n_iters(&self) -> &[usize] {
+        &self.n_iters
+    }
+}
+
+/// Compute a dense single-output Lasso regularization path.
+///
+/// This is the Rust analogue of `sklearn.linear_model.lasso_path` for dense
+/// `ndarray` inputs and a one-dimensional target. Inputs are used as provided:
+/// no intercept is fitted and no centering is performed. Callers that need an
+/// intercept should center `X` and `y` before calling this helper, matching
+/// sklearn's path-helper contract.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent shapes, empty input, non-finite
+/// values, invalid alpha-grid options, or solver errors from the per-alpha
+/// coordinate-descent fits.
+pub fn lasso_path<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: LassoPathOptions<F>,
+) -> Result<LassoPathResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    validate_lasso_path_inputs(x, y)?;
+    if options.max_iter == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "max_iter".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if options.tol < F::zero() || !options.tol.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "tol".into(),
+            reason: "must be finite and non-negative".into(),
+        });
+    }
+
+    let alphas_vec = resolve_lasso_alphas(x, y, &options)?;
+    let n_features = x.ncols();
+    let n_alphas = alphas_vec.len();
+
+    let mut coefficients = Array2::<F>::zeros((n_features, n_alphas));
+    let mut dual_gaps = Array1::<F>::zeros(n_alphas);
+    let mut n_iters = Vec::with_capacity(n_alphas);
+    let mut previous_coef: Option<Array1<F>> = None;
+
+    for (alpha_idx, &alpha) in alphas_vec.iter().enumerate() {
+        let mut model = Lasso::<F>::new()
+            .with_alpha(alpha)
+            .with_max_iter(options.max_iter)
+            .with_tol(options.tol)
+            .with_fit_intercept(false)
+            .with_precompute(options.precompute)
+            .with_selection(options.selection)
+            .with_positive(options.positive);
+        if let Some(seed) = options.random_state {
+            model = model.with_random_state(seed);
+        }
+        if let Some(coef) = previous_coef.clone() {
+            model = model.with_warm_start(true).with_coef_init(coef);
+        }
+
+        let fitted = model.fit(x, y)?;
+        coefficients
+            .column_mut(alpha_idx)
+            .assign(fitted.coefficients());
+        dual_gaps[alpha_idx] = fitted.dual_gap();
+        n_iters.push(fitted.n_iter());
+        previous_coef = Some(fitted.coefficients().clone());
+    }
+
+    Ok(LassoPathResult {
+        alphas: Array1::from_vec(alphas_vec),
+        coefficients,
+        dual_gaps,
+        n_iters,
+    })
+}
+
+fn validate_lasso_path_inputs<F: Float>(x: &Array2<F>, y: &Array1<F>) -> Result<(), FerroError> {
+    let n_samples = x.nrows();
+    if n_samples != y.len() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![y.len()],
+            context: "y length must match number of samples in X".into(),
+        });
+    }
+    if n_samples == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "lasso_path requires at least one sample".into(),
+        });
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_lasso_alphas<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: &LassoPathOptions<F>,
+) -> Result<Vec<F>, FerroError>
+where
+    F: Float + FromPrimitive + 'static,
+{
+    if let Some(alphas) = &options.alphas {
+        if alphas.is_empty() {
+            return Err(FerroError::InvalidParameter {
+                name: "alphas".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+        let mut alphas = alphas.clone();
+        for alpha in &alphas {
+            if !alpha.is_finite() || *alpha < F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "alphas".into(),
+                    reason: "must contain finite non-negative values".into(),
+                });
+            }
+        }
+        alphas.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+        return Ok(alphas);
+    }
+
+    if options.n_alphas == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_alphas".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if options.eps <= F::zero() || !options.eps.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "eps".into(),
+            reason: "must be finite and positive".into(),
+        });
+    }
+
+    let n_f = F::from(x.nrows()).ok_or_else(|| FerroError::NumericalInstability {
+        message: "failed to convert n_samples to float".into(),
+    })?;
+    let x_ty = x.t().dot(y);
+    let mut alpha_max = x_ty.iter().fold(F::zero(), |acc, &v| acc.max(v.abs())) / n_f;
+    if alpha_max <= F::zero() {
+        alpha_max = F::epsilon();
+    }
+
+    if options.n_alphas == 1 {
+        return Ok(vec![alpha_max]);
+    }
+
+    let eps_f64 = options
+        .eps
+        .to_f64()
+        .ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert eps to f64".into(),
+        })?;
+    let denom = (options.n_alphas - 1) as f64;
+    let mut alphas = Vec::with_capacity(options.n_alphas);
+    for i in 0..options.n_alphas {
+        let ratio = eps_f64.powf(i as f64 / denom);
+        let ratio_f = F::from(ratio).ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert generated alpha ratio".into(),
+        })?;
+        alphas.push(alpha_max * ratio_f);
+    }
+    Ok(alphas)
 }
 
 /// Lasso duality gap on the `(1/2n)`-scaled objective, mirroring sklearn's

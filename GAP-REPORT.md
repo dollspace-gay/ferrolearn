@@ -17,7 +17,7 @@ model selection.
   the version cited by most current `divergence_*` tests.
 - Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
 - ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
-- Test evidence: the current tree contains 319 `tests/divergence_*.rs` files.
+- Test evidence: the current tree contains 326 `tests/divergence_*.rs` files.
 
 The exact API gap list below was produced by parsing the sklearn 1.9.0 API
 index for public classes/functions and comparing it with current public Rust
@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 78 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 77 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -54,7 +54,7 @@ public Rust surface after the alias normalization above.
 
 | sklearn module | Missing public items |
 |---|---|
-| `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram`, `lasso_path` |
+| `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram` |
 | `sklearn.tree` | `export_graphviz`, `plot_tree` |
 | `sklearn.ensemble` | `StackingClassifier`, `StackingRegressor` |
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
@@ -161,13 +161,13 @@ Current divergence-test count by crate:
 | `ferrolearn-datasets` | 4 |
 | `ferrolearn-decomp` | 35 |
 | `ferrolearn-kernel` | 10 |
-| `ferrolearn-linear` | 62 |
+| `ferrolearn-linear` | 64 |
 | `ferrolearn-metrics` | 15 |
 | `ferrolearn-model-sel` | 31 |
 | `ferrolearn-neighbors` | 17 |
 | `ferrolearn-neural` | 5 |
 | `ferrolearn-numerical` | 7 |
-| `ferrolearn-preprocess` | 66 |
+| `ferrolearn-preprocess` | 69 |
 | `ferrolearn-sparse` | 4 |
 | `ferrolearn-tree` | 18 |
 

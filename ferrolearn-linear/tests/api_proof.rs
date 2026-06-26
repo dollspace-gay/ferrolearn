@@ -21,12 +21,12 @@ use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
     ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, GLMFamily,
     GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA, Lars, Lasso,
-    LassoCV, LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
-    LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
-    OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor,
-    RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions,
-    SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c, orthogonal_mp,
-    orthogonal_mp_gram, ridge_regression,
+    LassoCV, LassoLars, LassoPathOptions, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR,
+    LinearSVRLoss, LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM,
+    OrthogonalMatchingPursuit, OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA,
+    QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier,
+    RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c,
+    lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -129,6 +129,17 @@ fn api_proof_lasso_family() {
         .fit(&x, &y)
         .unwrap();
     let _ = f_cv.score(&x, &y, None).unwrap();
+
+    let path = lasso_path(
+        &x,
+        &y,
+        LassoPathOptions::default().with_alphas(vec![0.1, 0.01]),
+    )
+    .unwrap();
+    assert_eq!(path.alphas().len(), 2);
+    assert_eq!(path.coefficients().dim(), (x.ncols(), 2));
+    assert_eq!(path.dual_gaps().len(), 2);
+    assert_eq!(path.n_iters().len(), 2);
 }
 
 #[test]
