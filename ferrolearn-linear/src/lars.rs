@@ -27,10 +27,11 @@
 //! | REQ-2 (LassoLars method='lasso' path) | SHIPPED | `LassoLars::fit` → `compute_lars_path` lasso branch (drop condition `z=-coef/least_squares`, alpha_min stopping, interpolation; `_least_angle.py:413+`). coef_/active-set match oracle at alpha=0.1/0.5/1.0. Closed #482 (was forward-stepwise OLS). |
 //! | REQ-3 (predict) | SHIPPED | `Predict for FittedLars`/`FittedLassoLars`. |
 //! | REQ-4 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
-//! | REQ-5..8 NOT-STARTED | fitted coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
+//! | REQ-5..8 NOT-STARTED | fitted coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
 //! | REQ-9 (Lars/LassoLars non-finite input rejected) | SHIPPED | `Fit::fit for Lars` AND the SEPARATE `Fit::fit for LassoLars` impl both reject any NaN/+/-inf in X or y BEFORE the LARS path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`Lars._fit` `_least_angle.py:1183`; `LassoLars.fit` override `_least_angle.py:1698` → `:1726`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; neither `Lars.fit` nor `LassoLars.fit` takes a `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lars().fit` / `LassoLars(alpha=0.1).fit` raise `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::lars_*`, `tests/divergence_lasso_lars_nonfinite.rs::lasso_lars_rejects_non_finite_input_like_sklearn`). Non-test consumer: the existing `Fit::fit` / `pub use Lars, LassoLars` boundary consumers. (#2259, #2260) |
 //! | REQ-10 (`lars_path` public helper) | SHIPPED | `pub fn lars_path` + `LarsPathOptions` / `LarsPathResult` expose the dense single-output Rust analogue of `sklearn.linear_model.lars_path`, returning alphas, final active indices, coefficient path `(n_features, n_alphas)`, and `n_iter`. Oracle tests `lars_path_*_matches_sklearn`. |
 //! | REQ-11 (`lars_path_gram` public helper) | SHIPPED | `pub fn lars_path_gram` exposes the sufficient-statistics analogue of `sklearn.linear_model.lars_path_gram`, taking `Xy`, `Gram`, and `n_samples`, and returning the same `LarsPathResult` surface. Oracle tests `lars_path_gram_*_matches_sklearn`. |
+//! | REQ-12 (`LassoLarsIC`) | SHIPPED | `LassoLarsIC` / `FittedLassoLarsIC` compute the LARS-Lasso path and select the minimum AIC/BIC criterion knot (`_least_angle.py:2268-2308`), including OLS-based default noise-variance estimation (`:2312-2337`). Verification: `tests/divergence_lasso_lars_ic.rs` pins explicit-variance AIC/BIC and estimated-noise fits to the live sklearn 1.5.2 oracle; `tests/api_proof.rs` covers the crate-root API. |
 //!
 //! acto-critic + builder: `Lars` matched sklearn exactly; `LassoLars` diverged (used forward-stepwise
 //! OLS instead of the equiangular lasso path) — rewritten to sklearn's `_lars_path_solver` lasso
@@ -54,6 +55,7 @@
 //! assert_eq!(preds.len(), 5);
 //! ```
 
+use ferray::linalg::LinalgFloat;
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::pipeline::{FittedPipelineEstimator, PipelineEstimator};
@@ -203,6 +205,128 @@ pub struct FittedLassoLars<F> {
     coefficients: Array1<F>,
     /// Learned intercept (bias) term.
     intercept: F,
+}
+
+/// Information criterion used by [`LassoLarsIC`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LassoLarsICCriterion {
+    /// Akaike information criterion.
+    Aic,
+    /// Bayesian information criterion.
+    Bic,
+}
+
+/// Lasso-LARS model selected by AIC or BIC.
+///
+/// This mirrors sklearn's dense single-output `LassoLarsIC`: it computes the
+/// full LARS-Lasso path, evaluates the information criterion at each knot, and
+/// selects the alpha with the smallest criterion value. The Rust surface omits
+/// sklearn's sparse/object inputs, `positive`, `precompute`, `copy_X`, `eps`,
+/// Python warnings, and metadata routing.
+#[derive(Debug, Clone)]
+pub struct LassoLarsIC<F> {
+    /// Information criterion used to choose the path knot.
+    pub criterion: LassoLarsICCriterion,
+    /// Maximum number of LARS path iterations.
+    pub max_iter: usize,
+    /// Whether to fit an intercept (bias) term.
+    pub fit_intercept: bool,
+    /// Optional externally supplied noise variance. When `None`, an OLS
+    /// variance estimate is computed, matching sklearn's default.
+    pub noise_variance: Option<F>,
+}
+
+impl<F: Float> LassoLarsIC<F> {
+    /// Create a new `LassoLarsIC` with sklearn-compatible defaults:
+    /// `criterion=AIC`, `max_iter=500`, `fit_intercept=true`,
+    /// `noise_variance=None`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            criterion: LassoLarsICCriterion::Aic,
+            max_iter: 500,
+            fit_intercept: true,
+            noise_variance: None,
+        }
+    }
+
+    /// Set the information criterion.
+    #[must_use]
+    pub fn with_criterion(mut self, criterion: LassoLarsICCriterion) -> Self {
+        self.criterion = criterion;
+        self
+    }
+
+    /// Set the maximum number of LARS path iterations.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set whether to fit an intercept term.
+    #[must_use]
+    pub fn with_fit_intercept(mut self, fit_intercept: bool) -> Self {
+        self.fit_intercept = fit_intercept;
+        self
+    }
+
+    /// Set an externally supplied noise variance.
+    #[must_use]
+    pub fn with_noise_variance(mut self, noise_variance: F) -> Self {
+        self.noise_variance = Some(noise_variance);
+        self
+    }
+}
+
+impl<F: Float> Default for LassoLarsIC<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Fitted [`LassoLarsIC`] model.
+#[derive(Debug, Clone)]
+pub struct FittedLassoLarsIC<F> {
+    coefficients: Array1<F>,
+    intercept: F,
+    alpha: F,
+    alphas: Array1<F>,
+    criterion: Array1<F>,
+    noise_variance: F,
+    n_iter: usize,
+}
+
+impl<F: Float> FittedLassoLarsIC<F> {
+    /// Selected alpha value.
+    #[must_use]
+    pub fn alpha(&self) -> F {
+        self.alpha
+    }
+
+    /// Path alpha values.
+    #[must_use]
+    pub fn alphas(&self) -> &Array1<F> {
+        &self.alphas
+    }
+
+    /// Criterion values aligned to [`alphas`](Self::alphas).
+    #[must_use]
+    pub fn criterion(&self) -> &Array1<F> {
+        &self.criterion
+    }
+
+    /// Noise variance used to compute the criterion.
+    #[must_use]
+    pub fn noise_variance(&self) -> F {
+        self.noise_variance
+    }
+
+    /// Number of LARS path iterations.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
 }
 
 /// Path variant solved by [`lars_path`].
@@ -1052,6 +1176,157 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     }
 }
 
+fn estimate_lasso_lars_ic_noise_variance<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    fit_intercept: bool,
+) -> Result<F, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static,
+{
+    let (n_samples, n_features) = x.dim();
+    let intercept_df = usize::from(fit_intercept);
+    if n_samples <= n_features + intercept_df {
+        return Err(FerroError::InvalidParameter {
+            name: "noise_variance".into(),
+            reason: "cannot estimate noise variance when n_samples <= n_features + fit_intercept; \
+                     provide noise_variance explicitly"
+                .into(),
+        });
+    }
+    let (coef, _rank, _singular) = crate::linalg::solve_lstsq(x, y)?;
+    let pred = x.dot(&coef);
+    let rss = y
+        .iter()
+        .zip(pred.iter())
+        .fold(<F as num_traits::Zero>::zero(), |acc, (&yi, &pi)| {
+            let r = yi - pi;
+            acc + r * r
+        });
+    let denom =
+        F::from(n_samples - n_features - intercept_df).unwrap_or_else(<F as num_traits::One>::one);
+    Ok(rss / denom)
+}
+
+// ---------------------------------------------------------------------------
+// Fit — LassoLarsIC
+// ---------------------------------------------------------------------------
+
+impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static>
+    Fit<Array2<F>, Array1<F>> for LassoLarsIC<F>
+{
+    type Fitted = FittedLassoLarsIC<F>;
+    type Error = FerroError;
+
+    /// Fit the Lasso-LARS IC model.
+    ///
+    /// Computes the LARS-Lasso coefficient path, evaluates AIC/BIC with degrees
+    /// of freedom equal to the number of non-zero coefficients at each knot, and
+    /// selects the minimum-criterion alpha. This mirrors sklearn
+    /// `LassoLarsIC.fit` for dense single-output input.
+    fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedLassoLarsIC<F>, FerroError> {
+        let (n_samples, n_features) = validate_input(x, y, "LassoLarsIC")?;
+
+        if x.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "Input X contains NaN or infinity.".into(),
+            });
+        }
+        if y.iter().any(|v| !v.is_finite()) {
+            return Err(FerroError::InvalidParameter {
+                name: "y".into(),
+                reason: "Input y contains NaN or infinity.".into(),
+            });
+        }
+        if let Some(noise_variance) = self.noise_variance
+            && (noise_variance < <F as num_traits::Zero>::zero() || !noise_variance.is_finite())
+        {
+            return Err(FerroError::InvalidParameter {
+                name: "noise_variance".into(),
+                reason: "must be finite and non-negative".into(),
+            });
+        }
+
+        let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
+        let path = compute_lars_path(
+            &x_work,
+            &y_work,
+            self.max_iter,
+            true,
+            <F as num_traits::Zero>::zero(),
+            None,
+        )?;
+        if path.coefficients.is_empty() {
+            return Err(FerroError::NumericalInstability {
+                message: "LassoLarsIC path produced no coefficients".into(),
+            });
+        }
+
+        let noise_variance = match self.noise_variance {
+            Some(v) => v,
+            None => estimate_lasso_lars_ic_noise_variance(&x_work, &y_work, self.fit_intercept)?,
+        };
+        let n_samples_f = F::from(n_samples).unwrap_or_else(<F as num_traits::One>::one);
+        let criterion_factor = match self.criterion {
+            LassoLarsICCriterion::Aic => F::from(2.0).unwrap_or_else(<F as num_traits::One>::one),
+            LassoLarsICCriterion::Bic => n_samples_f.ln(),
+        };
+        let two_pi =
+            F::from(2.0 * std::f64::consts::PI).unwrap_or_else(<F as num_traits::One>::one);
+        let eps = F::epsilon();
+
+        let mut criterion_values = Vec::with_capacity(path.coefficients.len());
+        for coef in &path.coefficients {
+            let pred = x_work.dot(coef);
+            let rss = y_work.iter().zip(pred.iter()).fold(
+                <F as num_traits::Zero>::zero(),
+                |acc, (&yi, &pi)| {
+                    let r = yi - pi;
+                    acc + r * r
+                },
+            );
+            let degrees_of_freedom = coef.iter().filter(|&&c| c.abs() > eps).count();
+            let dof_f = F::from(degrees_of_freedom).unwrap_or_else(<F as num_traits::Zero>::zero);
+            let value = n_samples_f * (two_pi * noise_variance).ln()
+                + rss / noise_variance
+                + criterion_factor * dof_f;
+            criterion_values.push(value);
+        }
+
+        let mut best_idx = 0usize;
+        let mut best_value = criterion_values[0];
+        for (idx, &value) in criterion_values.iter().enumerate().skip(1) {
+            if value < best_value {
+                best_value = value;
+                best_idx = idx;
+            }
+        }
+
+        let coefficients = path
+            .coefficients
+            .get(best_idx)
+            .cloned()
+            .unwrap_or_else(|| Array1::<F>::zeros(n_features));
+        let intercept = compute_intercept(&x_mean, &y_mean, &coefficients);
+        let alpha = path
+            .alphas
+            .get(best_idx)
+            .copied()
+            .unwrap_or_else(<F as num_traits::Zero>::zero);
+
+        Ok(FittedLassoLarsIC {
+            coefficients,
+            intercept,
+            alpha,
+            alphas: Array1::from_vec(path.alphas),
+            criterion: Array1::from_vec(criterion_values),
+            noise_variance,
+            n_iter: path.n_iter,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Predict / HasCoefficients / Pipeline — FittedLars
 // ---------------------------------------------------------------------------
@@ -1166,6 +1441,76 @@ where
 }
 
 impl<F> FittedPipelineEstimator<F> for FittedLassoLars<F>
+where
+    F: Float + ScalarOperand + Send + Sync + 'static,
+{
+    fn predict_pipeline(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        self.predict(x)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Predict / HasCoefficients / Pipeline — FittedLassoLarsIC
+// ---------------------------------------------------------------------------
+
+impl<F: Float> FittedLassoLarsIC<F> {
+    /// Learned coefficient vector.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array1<F> {
+        &self.coefficients
+    }
+
+    /// Learned intercept.
+    #[must_use]
+    pub fn intercept(&self) -> F {
+        self.intercept
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> Predict<Array2<F>> for FittedLassoLarsIC<F> {
+    type Output = Array1<F>;
+    type Error = FerroError;
+
+    /// Predict target values for the given feature matrix.
+    ///
+    /// Computes `X @ coefficients + intercept`.
+    fn predict(&self, x: &Array2<F>) -> Result<Array1<F>, FerroError> {
+        if x.ncols() != self.coefficients.len() {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![self.coefficients.len()],
+                actual: vec![x.ncols()],
+                context: "number of features must match fitted model".into(),
+            });
+        }
+        Ok(x.dot(&self.coefficients) + self.intercept)
+    }
+}
+
+impl<F: Float + Send + Sync + ScalarOperand + 'static> HasCoefficients<F> for FittedLassoLarsIC<F> {
+    fn coefficients(&self) -> &Array1<F> {
+        &self.coefficients
+    }
+
+    fn intercept(&self) -> F {
+        self.intercept
+    }
+}
+
+impl<F> PipelineEstimator<F> for LassoLarsIC<F>
+where
+    F: Float + FromPrimitive + LinalgFloat + ScalarOperand + Send + Sync + 'static,
+{
+    fn fit_pipeline(
+        &self,
+        x: &Array2<F>,
+        y: &Array1<F>,
+    ) -> Result<Box<dyn FittedPipelineEstimator<F>>, FerroError> {
+        let fitted = self.fit(x, y)?;
+        Ok(Box::new(fitted))
+    }
+}
+
+impl<F> FittedPipelineEstimator<F> for FittedLassoLarsIC<F>
 where
     F: Float + ScalarOperand + Send + Sync + 'static,
 {
