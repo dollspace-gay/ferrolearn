@@ -16,7 +16,7 @@
 //! Mirrors the bayes/lib precedent (`ferrolearn-bayes/tests/divergence_lib.rs`,
 //! `api_proof` pattern): this file PINS the public surface. The single
 //! `use ferrolearn_preprocess::{...}` block below names every re-exported item
-//! the design doc claims PRESENT. If any re-export at `lib.rs:132-204` is ever
+//! the design doc claims PRESENT. If any re-export at `lib.rs:134-208` is ever
 //! removed or renamed, this test file fails to COMPILE — that compile failure is
 //! the boundary's regression guard (AC-1: every name in the `pub use` block
 //! resolves to an existing type/function).
@@ -30,7 +30,7 @@
 //! `.design/preprocess/lib.md` Probes), not transcribed from the ferrolearn side.
 
 // The compile-time boundary guard. Every name here is a re-export at
-// `ferrolearn-preprocess/src/lib.rs:132-204`. Removal => unresolved import =>
+// `ferrolearn-preprocess/src/lib.rs:134-208`. Removal => unresolved import =>
 // this crate's test build fails. This is intentional and load-bearing.
 use ferrolearn_preprocess::{
     // supporting enums for the preprocessing estimators
@@ -100,14 +100,17 @@ use ferrolearn_preprocess::{
     LabelBinarizer,
     LabelEncoder,
     MaxAbsScaler,
+    MaxPatches,
     MinMaxScaler,
     MissingIndicator,
     MissingIndicatorFeatures,
     MultiLabelBinarizer,
+    NComponents,
     Normalizer,
     OneHotEncoder,
     OrdinalEncoder,
     OutputDistribution,
+    PatchExtractor,
     PolynomialFeatures,
     PowerTransformer,
     QuantileTransformer,
@@ -141,10 +144,12 @@ use ferrolearn_preprocess::{
     chi2,
     compute_scores_classif,
     compute_scores_regression,
+    extract_patches_2d,
     f_classif,
     f_regression,
     grid_to_graph,
     img_to_graph,
+    johnson_lindenstrauss_min_dim,
     make_column_selector,
     make_column_transformer,
     maxabs_scale,
@@ -153,6 +158,7 @@ use ferrolearn_preprocess::{
     quantile_transform,
     r_regression,
     r_regression_with_options,
+    reconstruct_from_patches_2d,
 };
 
 /// Type-level no-op: forces `T` to be named, so removing the corresponding
@@ -172,15 +178,13 @@ fn name_type<T>() {}
 ///   * `sklearn/compose/__init__.py:15-20` (`__all__`)
 ///
 /// Each re-exported estimator surfaced at `ferrolearn-preprocess/src/lib.rs`
-/// (`:132-204`) is named below. If any `pub use` is removed/renamed the `use`
+/// (`:134-208`) is named below. If any `pub use` is removed/renamed the `use`
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`mutual_info_*`,
 /// `f_oneway`,
-/// `johnson_lindenstrauss_min_dim`,
-/// `TransformedTargetRegressor`, `HashingVectorizer`, `PatchExtractor`,
-/// `extract_patches_2d`, `reconstruct_from_patches_2d`) are
+/// `TransformedTargetRegressor`, `HashingVectorizer`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
 #[allow(
     clippy::assertions_on_constants,
@@ -235,6 +239,7 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<BinStrategy>();
     name_type::<KnotStrategy>();
     name_type::<OutputDistribution>();
+    name_type::<MaxPatches>();
     name_type::<TfidfNorm>();
     name_type::<ImputeStrategy<f64>>();
 
@@ -284,8 +289,11 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedTfidfVectorizer>();
 
     // --- feature_extraction.image (scoped dense helper subset) ---
+    name_type::<PatchExtractor<f64>>();
     let _grid_to_graph = grid_to_graph::<f64>;
     let _img_to_graph = img_to_graph::<f64>;
+    let _extract_patches_2d = extract_patches_2d::<f64>;
+    let _reconstruct_from_patches_2d = reconstruct_from_patches_2d::<f64>;
 
     // --- impute (IterativeImputer is experimental in sklearn 1.5.2) ---
     name_type::<SimpleImputer<f64>>();
@@ -305,6 +313,8 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedGaussianRandomProjection<f64>>();
     name_type::<SparseRandomProjection<f64>>();
     name_type::<FittedSparseRandomProjection<f64>>();
+    name_type::<NComponents>();
+    let _johnson_lindenstrauss_min_dim = johnson_lindenstrauss_min_dim::<f64>;
 
     // --- compose ---
     name_type::<ColumnTransformer>();

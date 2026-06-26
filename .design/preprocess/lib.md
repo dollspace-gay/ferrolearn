@@ -9,7 +9,7 @@ upstream-paths:
   - sklearn/preprocessing/__init__.py     # __all__ (:30-60)
   - sklearn/feature_selection/__init__.py  # __all__ (:27-47)
   - sklearn/feature_extraction/text.py     # __all__ (:34-43)
-  - sklearn/feature_extraction/image.py    # __all__ (:23-26); scoped helper subset
+  - sklearn/feature_extraction/image.py    # __all__ (:23-26); scoped dense helper surface
   - sklearn/impute/__init__.py             # __all__ (:13)
   - sklearn/random_projection.py           # __all__ (:50-54)
   - sklearn/compose/__init__.py            # __all__ (:15-20)
@@ -22,20 +22,21 @@ crosslink-issue: 1361
 
 `ferrolearn-preprocess/src/lib.rs` is the crate's **public-API surface** — the
 analog of the `__all__` re-export boundary of **six** scikit-learn modules plus
-a scoped `sklearn.feature_extraction.image` helper subset
+a scoped dense `sklearn.feature_extraction.image` helper surface
 (`sklearn.preprocessing`, `sklearn.feature_selection`,
 `sklearn.feature_extraction.text`, `sklearn.impute`, `sklearn.random_projection`,
-`sklearn.compose`, plus `grid_to_graph`/`img_to_graph`) collapsed under one crate root. It is **not** an estimator: it
+`sklearn.compose`, plus `grid_to_graph`/`img_to_graph`/patch helpers) collapsed under one crate root. It is **not** an estimator: it
 owns no `fit`/`transform` logic. Two things live in this translation unit:
 
-1. **Module declarations** — the `pub mod` block (`:93-130`) for the 38 submodules
+1. **Module declarations** — the `pub mod` block (`:94-131`) for the 38 submodules
    (one per transformer / selector / encoder / imputer family, plus the shared
    `feature_scoring`, `image`, and `stat_selectors` helpers).
-2. **The re-export block** — the `pub use` blocks (`:132-204`) that surface each
+2. **The re-export block** — the `pub use` blocks (`:134-208`) that surface each
    implemented estimator's unfitted + `Fitted*` type pair (plus supporting enums
    like `ImputeStrategy`, `BinStrategy`, `OutputDistribution`, `KnotStrategy`,
-   `ThresholdStrategy`, `Direction`, `TfidfNorm`, and the `chi2`/`f_classif`/
-   `f_regression`/`r_regression` free functions) at the crate root.
+   `ThresholdStrategy`, `Direction`, `TfidfNorm`, `MaxPatches`, `NComponents`,
+   and the `chi2`/`f_classif`/`f_regression`/`r_regression`/JL/image free
+   functions) at the crate root.
 
 **This doc covers the boundary only.** Per-estimator value parity — each
 transformer's `fit`/`transform` matching its sklearn analog to ULPs — lives in the
@@ -47,7 +48,7 @@ kbins_discretizer, target_encoder, spline_transformer, knn_imputer,
 select_from_model, select_percentile, rfe, sequential_feature_selector,
 count_vectorizer, tfidf, ...}.md`. This doc does **not** re-litigate per-estimator
 parity; it covers only (a) the re-export surface mirroring the six modules'
-`__all__` plus the scoped image helper subset, and (b) the ferray-substrate gap.
+`__all__` plus the scoped image helper surface, and (b) the ferray-substrate gap.
 
 ## Probes (live sklearn 1.5.2 oracle)
 
@@ -94,8 +95,9 @@ Observed (sklearn 1.5.2):
   `HashingVectorizer`, `TfidfTransformer`, `TfidfVectorizer` (`text.py:34-43`).
 - `feature_extraction.image.__all__` = `['PatchExtractor',
   'extract_patches_2d', 'grid_to_graph', 'img_to_graph',
-  'reconstruct_from_patches_2d']`; ferrolearn currently ships the dense graph
-  helper subset `grid_to_graph` and `img_to_graph`.
+  'reconstruct_from_patches_2d']`; ferrolearn ships all five names as scoped
+  dense Rust helpers (`grid_to_graph`, `img_to_graph`, `extract_patches_2d`,
+  `reconstruct_from_patches_2d`, `PatchExtractor`).
 
 Boundary integrity (the re-export surface resolves):
 
@@ -105,17 +107,17 @@ cargo doc  -p ferrolearn-preprocess --no-deps
 ```
 
 A passing `cargo build` is the load-bearing check for REQ-1: every name in the
-`pub use` block (`:132-204`) must name a type that actually exists in its
+`pub use` block (`:134-208`) must name a type that actually exists in its
 submodule, or the crate fails to compile.
 
 ## Requirements
 
 - REQ-1 (re-export boundary): the crate root surfaces, via the `pub use` block
-  (`:132-204`), exactly the estimators ferrolearn implements that mirror the six
+  (`:134-208`), exactly the estimators ferrolearn implements that mirror the six
   modules' `__all__` — each as an unfitted + `Fitted*` pair per the project naming
   convention (CLAUDE.md) — plus the supporting enums and the
-  `chi2`/`f_classif`/`f_regression`/`r_regression` scoring functions and the
-  scoped `grid_to_graph`/`img_to_graph` image helpers. The surfaced set is a
+  `chi2`/`f_classif`/`f_regression`/`r_regression` scoring functions,
+  `johnson_lindenstrauss_min_dim`, and the scoped image helpers. The surfaced set is a
   documented subset of the union of the six `__all__` lists plus image helpers (the boundary ships
   exactly what is implemented; the not-yet-translated names are enumerated in
   Architecture). It has non-test production consumers: the meta-crate re-export
@@ -127,10 +129,10 @@ submodule, or the crate fails to compile.
 ## Acceptance criteria
 
 - AC-1 (REQ-1): `cargo build -p ferrolearn-preprocess` succeeds — every name in
-  the `pub use` block (`:132-204`) resolves to an existing type/function. Each
+  the `pub use` block (`:134-208`) resolves to an existing type/function. Each
   re-exported estimator is reachable as `ferrolearn_preprocess::<Type>` and is
   routed by its own `.design/preprocess/<doc>.md`. The surfaced estimator set is a
-  subset of the union of the six `__all__` lists plus the image helper subset above; every PRESENT entry in the
+  subset of the union of the six `__all__` lists plus the image helper surface above; every PRESENT entry in the
   Architecture mapping resolves, and no ABSENT entry is claimed re-exported.
 - AC-2 (REQ-1, consumers): `cargo build -p ferrolearn` (meta-crate) and
   `cargo build -p ferrolearn-python` succeed against the boundary — i.e. the
@@ -146,14 +148,14 @@ submodule, or the crate fails to compile.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (re-export boundary — six `__all__` lists plus image helper subset) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:132-204`) surfaces every implemented estimator/helper at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `GenericUnivariateSelect`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `SelectorMixin`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`), image graph helpers (`grid_to_graph`, `img_to_graph`), projection (`GaussianRandomProjection`, `SparseRandomProjection`), and compose (`ColumnTransformer`, `make_column_selector`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `feature_extraction/image.py:23-26` scoped subset, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_image_graph`; `cargo test -p ferrolearn-preprocess --test divergence_lib`; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
+| REQ-1 (re-export boundary — six `__all__` lists plus image helper surface) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:134-208`) surfaces every implemented estimator/helper at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `GenericUnivariateSelect`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `SelectorMixin`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`), image helpers (`PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d`), projection (`GaussianRandomProjection`, `SparseRandomProjection`, `johnson_lindenstrauss_min_dim`), and compose (`ColumnTransformer`, `make_column_selector`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `feature_extraction/image.py:23-26` scoped dense surface, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_image_graph`; `cargo test -p ferrolearn-preprocess --test divergence_image_patches`; `cargo test -p ferrolearn-preprocess --test divergence_lib`; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
 | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker **#1362** (crate-root substrate, R-SUBSTRATE-1). `lib.rs`'s doc-comment examples and every submodule operate on `ndarray::{Array1, Array2}` with `F: num_traits::Float + Send + Sync + 'static`; `ferrolearn-preprocess/Cargo.toml` declares `ndarray.workspace = true` + `num-traits.workspace = true`, not `ferray-core` / `ferray-ufunc`. The whole crate is on the wrong substrate; migration cascades through all 38 submodules. Not migrated. |
 
 ## Architecture
 
 **This is a boundary, not an estimator.** `lib.rs` has no transformer state. Its
-surface, in source order, is the `pub mod` block (`:93-130`) followed by the
-`pub use` re-export blocks (`:132-204`). The re-export block hoists each
+surface, in source order, is the `pub mod` block (`:94-131`) followed by the
+`pub use` re-export blocks (`:134-208`). The re-export block hoists each
 implemented estimator's unfitted + `Fitted*` type pair (and supporting
 enums/functions) to the crate root, mirroring the *function* of the six modules'
 `__all__` plus the scoped image helper subset: defining the importable public surface. Below is the
@@ -185,28 +187,30 @@ PRESENT: `CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`.
 ABSENT: `HashingVectorizer`.
 
 **`sklearn.feature_extraction.image` (`image.py:23-26`).**
-PRESENT scoped dense helper subset: `grid_to_graph`, `img_to_graph`.
-ABSENT: `PatchExtractor`, `extract_patches_2d`, and
-`reconstruct_from_patches_2d`.
+PRESENT scoped dense helper surface: `PatchExtractor`, `extract_patches_2d`,
+`grid_to_graph`, `img_to_graph`, and `reconstruct_from_patches_2d`.
+ABSENT exact names: none. Residual contracts remain in `.design/preprocess/image.md`
+for sparse graph returns, color/channel patch tensors, exact NumPy RNG stream
+parity, Python ABI, and 3D image helper support.
 
 **`sklearn.impute` (`impute/__init__.py:13`).**
 PRESENT: `MissingIndicator`, `SimpleImputer`, `KNNImputer`, `IterativeImputer`
-(`:116`, `:132`, `:130`). Note `IterativeImputer` is experimental in sklearn
-1.5.2 (reached via `enable_iterative_imputer`, hence not in the literal `__all__`
-at `:13`); ferrolearn surfaces it unconditionally.
+in the crate-root re-export block. Note `IterativeImputer` is experimental in
+sklearn 1.5.2 (reached via `enable_iterative_imputer`, hence not in the literal
+`__all__` at `:13`); ferrolearn surfaces it unconditionally.
 ABSENT: none from the literal `impute.__all__`.
 
 **`sklearn.random_projection` (`random_projection.py:50-54`).**
-PRESENT: `GaussianRandomProjection`, `SparseRandomProjection`.
-ABSENT: the `johnson_lindenstrauss_min_dim` free function (the dimension-bound
-helper — present in sklearn's `__all__`, not re-exported here).
+PRESENT: `GaussianRandomProjection`, `SparseRandomProjection`, and
+`johnson_lindenstrauss_min_dim`.
+ABSENT exact names: none.
 
 **`sklearn.compose` (`compose/__init__.py:15-20`).**
 PRESENT: `ColumnTransformer`, `make_column_selector`, `make_column_transformer`
-(`:108-111`).
+in the crate-root re-export block.
 ABSENT: `TransformedTargetRegressor`.
 
-**Extension (no sklearn analog).** `BinaryEncoder`/`FittedBinaryEncoder` (`:129`)
+**Extension (no sklearn analog).** `BinaryEncoder`/`FittedBinaryEncoder` (`:169`)
 is a `category_encoders`-style base-N categorical encoder with **no** scikit-learn
 `__all__` entry. It is documented as a ferrolearn extension of the boundary, not a
 sklearn-parity item and not an ABSENT gap — the same treatment
@@ -229,11 +233,14 @@ rule).
 
 Commands establishing the SHIPPED claim:
 
-- `cargo build -p ferrolearn-preprocess` — every `pub use` in `:132-204` resolves;
+- `cargo build -p ferrolearn-preprocess` — every `pub use` in `:134-208` resolves;
   a build failure here would mean a re-export names a non-existent type (REQ-1
   boundary integrity).
-- `cargo test -p ferrolearn-preprocess` — 486 lib unit tests + 46 doctests,
-  0 failed in the current worktree.
+- `cargo test -p ferrolearn-preprocess --test divergence_lib` — compile-pins
+  every crate-root re-export named in this boundary.
+- `cargo test -p ferrolearn-preprocess --test divergence_image_graph` and
+  `cargo test -p ferrolearn-preprocess --test divergence_image_patches` — pin the
+  scoped image helper values and shapes against live sklearn 1.5.2 oracles.
 - `cargo build -p ferrolearn` — the meta-crate compiles against the re-export
   boundary, exercising `pub use ferrolearn_preprocess as preprocess;`
   (`ferrolearn/src/lib.rs:36`).

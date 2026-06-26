@@ -13,17 +13,18 @@ use ferrolearn_preprocess::{
     CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection,
     GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, InitialStrategy,
     IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy,
-    LabelBinarizer, LabelEncoder, MaxAbsScaler, MinMaxScaler, MissingIndicator,
+    LabelBinarizer, LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler, MissingIndicator,
     MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
-    OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer, Remainder,
-    RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
-    SelectorMixin, SequentialFeatureSelector, SimpleImputer, SparseRandomProjection,
-    SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer, TfidfVectorizer,
-    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, grid_to_graph,
-    img_to_graph, make_column_selector, make_column_transformer, maxabs_scale, minmax_scale,
-    power_transform, r_regression,
+    OutputDistribution, PatchExtractor, PolynomialFeatures, PowerTransformer, QuantileTransformer,
+    Remainder, RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest,
+    SelectPercentile, SelectorMixin, SequentialFeatureSelector, SimpleImputer,
+    SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
+    TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2, extract_patches_2d, f_classif,
+    f_regression, grid_to_graph, img_to_graph, johnson_lindenstrauss_min_dim, make_column_selector,
+    make_column_transformer, maxabs_scale, minmax_scale, power_transform, r_regression,
+    reconstruct_from_patches_2d,
 };
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array1, Array2, Array3, array};
 
 fn small_data() -> Array2<f64> {
     Array2::from_shape_vec(
@@ -105,6 +106,21 @@ fn api_proof_feature_engineering() {
     let image = array![[0.0_f64, 0.0], [0.0, 1.0]];
     assert_eq!(grid_to_graph::<f64>(2, 2, 1, None).unwrap().dim(), (4, 4));
     assert_eq!(img_to_graph(&image, None).unwrap().dim(), (4, 4));
+    let patches = extract_patches_2d(&image, (1, 1), Some(MaxPatches::Count(2)), Some(0)).unwrap();
+    assert_eq!(patches.dim(), (2, 1, 1));
+    assert_eq!(
+        reconstruct_from_patches_2d(&patches, (1, 2)).unwrap().dim(),
+        (1, 2)
+    );
+    let image_batch = Array3::<f64>::zeros((1, 10, 10));
+    assert_eq!(
+        PatchExtractor::<f64>::new()
+            .patch_size((2, 2))
+            .transform(&image_batch)
+            .unwrap()
+            .dim(),
+        (81, 2, 2)
+    );
 }
 
 #[test]
@@ -358,6 +374,10 @@ fn api_proof_text() {
 #[test]
 fn api_proof_random_projection() {
     let x = Array2::<f64>::from_shape_vec((8, 50), (0..400).map(|i| i as f64).collect()).unwrap();
+    assert_eq!(
+        johnson_lindenstrauss_min_dim(1000_usize, 0.1_f64).unwrap(),
+        5920
+    );
     let _ = GaussianRandomProjection::<f64>::new(10)
         .fit_transform(&x)
         .unwrap();

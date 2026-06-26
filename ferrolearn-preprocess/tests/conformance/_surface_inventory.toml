@@ -204,7 +204,22 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::extract_patches_2d"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::grid_to_graph"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::img_to_graph"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::johnson_lindenstrauss_min_dim"
 phase = "preprocess"
 fixture = ""
 
@@ -214,7 +229,7 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
-path = "ferrolearn_preprocess::img_to_graph"
+path = "ferrolearn_preprocess::reconstruct_from_patches_2d"
 phase = "preprocess"
 fixture = ""
 
@@ -274,6 +289,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::MaxPatches"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::MissingIndicator"
 phase = "preprocess"
 fixture = ""
@@ -304,12 +324,22 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::NComponents"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::OneHotEncoder"
 phase = "preprocess"
 fixture = ""
 
 [[item]]
 path = "ferrolearn_preprocess::OrdinalEncoder"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::PatchExtractor"
 phase = "preprocess"
 fixture = ""
 
