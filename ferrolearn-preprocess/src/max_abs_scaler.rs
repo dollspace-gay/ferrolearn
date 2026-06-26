@@ -25,7 +25,7 @@
 //! | REQ-5 (NaN tolerance: allow-nan) | SHIPPED | FIXED #1202. `Fit::fit`'s per-column `max(\|x\|)` reduction now SKIPS NaN via an `Option<F>` accumulator (`continue` on `is_nan()`), mirroring sklearn `max_abs = _nanmax(abs(X), axis=0)` under `force_all_finite='allow-nan'` (`_data.py:1263`,`:1256`): a column with at least one finite value gets the finite max-abs; an ALL-NaN column gets `max_abs = F::nan()` (NaN passes `_handle_zeros_in_scale` since NaN != 0 → `scale_` NaN → transform/inverse NaN; no panic, no zero-substitution). `transform`/`inverse_transform` now divide/multiply by `scale_` (so a NaN-column maps to NaN, a zero-column to identity); NaN inputs pass through (`nan/scale = nan`, `nan*scale = nan`). inf-rejection (allow-nan REJECTS ±inf, MinMaxScaler #2200 precedent): `fit`/`transform`/`inverse_transform` return `InvalidParameter` ("Input X contains infinity...") on any `is_infinite()` element. Live-oracle tests `req5_nan_fit_single_column_ignored`, `req5_nan_fit_multi_column_scattered`, `req5_all_nan_column_yields_nan_no_panic`, `req5_nan_passthrough_inverse_transform`, `inf_rejected_fit`/`inf_rejected_transform`/`inf_rejected_inverse_transform`, `nan_only_still_fits` in `tests/divergence_max_abs_scaler.rs`. Consumers: PyO3 `_RsMaxAbsScaler` + `FittedPipelineTransformer` + re-export. |
 //! | REQ-6 (scale_/n_samples_seen_ attrs) | SHIPPED | `FittedMaxAbsScaler<F>` stores `scale_ = max_abs.mapv(\|m\| if m==0 {1} else {m})` (mirroring sklearn `scale_ = _handle_zeros_in_scale(max_abs_)` `_data.py:1272`,`:88` — `1.0` on all-zero columns) and `n_samples_seen_ = n_samples` (`:1266`), set in `Fit::fit`. Getters `scale()`/`n_samples_seen()` (`#[must_use]`). Oracle (`MaxAbsScaler().fit([[1,0],[-3,0],[2,0]])` → `max_abs_=[3,0]`, `scale_=[3,1]`, `n_samples_seen_=3`): tests `max_abs_scale_nsamples_match_sklearn`, `max_abs_scale_differs_from_max_abs_on_zero_col`. `transform`/`inverse_transform` unchanged (still divide/multiply by `max_abs`; identical to dividing by `scale_` since they coincide off the all-zero columns). |
 //! | REQ-7 (partial_fit / streaming) | NOT-STARTED | open prereq blocker #1204. Single-shot (`_data.py:1232-1273`). |
-//! | REQ-8 (maxabs_scale free fn + axis) | NOT-STARTED | open prereq blocker #1205. No `maxabs_scale` / axis=1 (`_data.py:1351`). |
+//! | REQ-8 (maxabs_scale free fn + axis) | SHIPPED | `maxabs_scale` free fn delegates to `MaxAbsScaler` (`axis=0` native column-wise scaling, `axis=1` transpose -> fit/transform -> transpose back), mirroring sklearn `maxabs_scale` (`_data.py:1351`,`:1416-1418`). `copy` remains an accept-and-document no-op under ferrolearn's owned-return transform contract. Live-oracle tests in `tests/divergence_max_abs_scaler.rs`: `green_req8_maxabs_scale_axis0_matches_sklearn`, `green_req8_maxabs_scale_axis1_matches_sklearn`, `green_req8_maxabs_scale_invalid_axis_errors`. |
 //! | REQ-9 (copy param + _parameter_constraints) | SHIPPED | FIXED #1206. `MaxAbsScaler<F>` gains a `copy: bool` field (default `true`) + `#[must_use] with_copy(self, bool) -> Self` builder + `copy()` getter, mirroring sklearn `__init__(*, copy=True)` (`_data.py:1190`) under `_parameter_constraints {copy:["boolean"]}` (`:1188`). ACCEPT-AND-DOCUMENT no-op: ferrolearn's [`Transform`] always returns a freshly allocated array (`to_owned()`), so `copy` has no observable effect (documented; behavior unchanged) — the direct analog of MinMaxScaler REQ-10's `copy` no-op. Live-oracle test `req9_copy_is_no_op_on_values`. Consumers: PyO3 `_RsMaxAbsScaler` + re-export. |
 //! | REQ-10 (sparse CSR/CSC) | NOT-STARTED | open prereq blocker #1207. Dense-only; MaxAbsScaler is sklearn's flagship sparse-safe scaler (`_data.py:1260-1261`,`:1303`). |
 //! | REQ-11 (get_feature_names_out / n_features_in_) | NOT-STARTED | open prereq blocker #1208. None (OneToOneFeatureMixin). |
@@ -361,6 +361,47 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for MaxAbsScaler<
     fn fit_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
+    }
+}
+
+/// Scale each feature or sample by its maximum absolute value.
+///
+/// This is the functional form of [`MaxAbsScaler`], mirroring scikit-learn's
+/// `maxabs_scale(X, axis=0, copy=True)` (`sklearn/preprocessing/_data.py:1351`):
+///
+/// - `axis == 0` scales each feature/column independently, equivalent to
+///   `MaxAbsScaler().fit_transform(X)`.
+/// - `axis == 1` scales each sample/row independently by applying the column
+///   scaler to `X.T`, then transposing the result back.
+///
+/// The sklearn `copy` parameter is intentionally omitted: ferrolearn transforms
+/// always return an owned array, so the input is never modified in place.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InvalidParameter`] if `axis` is not `0` or `1`.
+/// Otherwise, propagates the same validation errors as [`MaxAbsScaler`].
+#[must_use = "maxabs_scale returns the scaled array; use the returned value"]
+pub fn maxabs_scale<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    axis: usize,
+) -> Result<Array2<F>, FerroError> {
+    let scaler = MaxAbsScaler::<F>::new();
+    match axis {
+        0 => {
+            let fitted = scaler.fit(x, &())?;
+            fitted.transform(x)
+        }
+        1 => {
+            let xt = x.t().to_owned();
+            let fitted = scaler.fit(&xt, &())?;
+            let out_t = fitted.transform(&xt)?;
+            Ok(out_t.t().to_owned())
+        }
+        other => Err(FerroError::InvalidParameter {
+            name: "axis".into(),
+            reason: format!("axis should be either equal to 0 or 1. Got axis={other}"),
+        }),
     }
 }
 

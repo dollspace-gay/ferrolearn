@@ -14,7 +14,7 @@
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::MaxAbsScaler;
+use ferrolearn_preprocess::{MaxAbsScaler, maxabs_scale};
 use ndarray::array;
 
 // ===========================================================================
@@ -205,6 +205,53 @@ fn green_req3_inverse_zero_maxabs_matches() {
     for (a, b) in out.iter().zip(sk.iter()) {
         assert!((a - b).abs() < 1e-15, "got {a}, sklearn {b}");
     }
+}
+
+// ===========================================================================
+// REQ-8 — maxabs_scale free function + axis
+// ===========================================================================
+
+/// GREEN: `maxabs_scale(X, axis=0)` mirrors sklearn's functional wrapper,
+/// which delegates to `MaxAbsScaler().fit_transform(X)` (`_data.py:1416`).
+/// Live oracle:
+/// `maxabs_scale([[-3.,1.],[0.,-2.],[2.,4.]], axis=0)`
+/// -> `[[-1.0,0.25],[0.0,-0.5],[0.6666666666666666,1.0]]`.
+#[test]
+fn green_req8_maxabs_scale_axis0_matches_sklearn() {
+    let sk = array![[-1.0, 0.25], [0.0, -0.5], [0.666_666_666_666_666_6, 1.0]];
+    let x = array![[-3.0_f64, 1.0], [0.0, -2.0], [2.0, 4.0]];
+    let out = maxabs_scale(&x, 0).unwrap();
+    for (a, b) in out.iter().zip(sk.iter()) {
+        assert!((a - b).abs() < 1e-12, "got {a}, sklearn {b}");
+    }
+}
+
+/// GREEN: `maxabs_scale(X, axis=1)` mirrors sklearn's row-wise branch,
+/// `MaxAbsScaler().fit_transform(X.T).T` (`_data.py:1418`).
+/// Live oracle:
+/// `maxabs_scale([[1.,2.,-4.],[0.,0.,0.],[3.,-6.,1.]], axis=1)`
+/// -> `[[0.25,0.5,-1.0],[0.0,0.0,0.0],[0.5,-1.0,0.16666666666666666]]`.
+#[test]
+fn green_req8_maxabs_scale_axis1_matches_sklearn() {
+    let sk = array![
+        [0.25, 0.5, -1.0],
+        [0.0, 0.0, 0.0],
+        [0.5, -1.0, 0.166_666_666_666_666_66],
+    ];
+    let x = array![[1.0_f64, 2.0, -4.0], [0.0, 0.0, 0.0], [3.0, -6.0, 1.0]];
+    let out = maxabs_scale(&x, 1).unwrap();
+    for (a, b) in out.iter().zip(sk.iter()) {
+        assert!((a - b).abs() < 1e-12, "got {a}, sklearn {b}");
+    }
+}
+
+/// GREEN: invalid `axis` is rejected before fitting, matching sklearn's
+/// two-valued axis contract for the functional helper.
+#[test]
+fn green_req8_maxabs_scale_invalid_axis_errors() {
+    let x = array![[1.0, 2.0]];
+    let err = maxabs_scale(&x, 2).unwrap_err();
+    assert!(matches!(err, FerroError::InvalidParameter { .. }));
 }
 
 // ===========================================================================
