@@ -17,9 +17,13 @@
 //!
 //! Tracking: #488 (default n_nonzero_coefs).
 
+use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
-use ferrolearn_linear::{OrthogonalMatchingPursuit, OrthogonalMpOptions, orthogonal_mp};
+use ferrolearn_linear::{
+    OrthogonalMatchingPursuit, OrthogonalMpGramOptions, OrthogonalMpOptions, orthogonal_mp,
+    orthogonal_mp_gram,
+};
 use ndarray::{Array1, Array2, array};
 
 fn diabetes() -> (Array2<f64>, Array1<f64>) {
@@ -71,6 +75,10 @@ fn small_raw_omp_fixture() -> (Array2<f64>, Array1<f64>) {
         array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]],
         array![1.0, 2.0, 3.0, 4.0],
     )
+}
+
+fn small_raw_omp_gram_fixture() -> (Array2<f64>, Array1<f64>, f64) {
+    (array![[6.0, 3.0], [3.0, 3.0]], array![12.0, 9.0], 30.0)
 }
 
 /// Public helper parity: sklearn `orthogonal_mp(X, y, n_nonzero_coefs=1)`
@@ -143,6 +151,124 @@ fn orthogonal_mp_helper_tol_allows_large_n_like_sklearn() {
     assert_eq!(result.n_iter(), 2);
     assert!((result.coefficients()[0] - 1.0).abs() < 1e-12);
     assert!((result.coefficients()[1] - 2.0).abs() < 1e-12);
+}
+
+/// Public Gram helper parity: sklearn
+/// `orthogonal_mp_gram(Gram, Xy, n_nonzero_coefs=1)` returns the one-step
+/// coefficient vector.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp_gram([[6,3],[3,3]], [12,9], n_nonzero_coefs=1) -> [2.0, 0.0]`.
+#[test]
+fn orthogonal_mp_gram_helper_k1_matches_sklearn() {
+    let (gram, xy, _) = small_raw_omp_gram_fixture();
+    let result = orthogonal_mp_gram(
+        &gram,
+        &xy,
+        OrthogonalMpGramOptions::default().with_n_nonzero_coefs(Some(1)),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 1);
+    assert!((result.coefficients()[0] - 2.0).abs() < 1e-12);
+    assert!(result.coefficients()[1].abs() < 1e-12);
+    assert!(result.path().is_none());
+}
+
+/// Public Gram helper parity for coefficient paths and `return_n_iter`
+/// equivalent.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp_gram(Gram, Xy, n_nonzero_coefs=2, return_path=True)`
+/// -> `[[2.0, 1.0], [0.0, 2.0]]`; `return_n_iter=True` -> `2`.
+#[test]
+fn orthogonal_mp_gram_helper_path_matches_sklearn() {
+    let (gram, xy, _) = small_raw_omp_gram_fixture();
+    let result = orthogonal_mp_gram(
+        &gram,
+        &xy,
+        OrthogonalMpGramOptions::default()
+            .with_n_nonzero_coefs(Some(2))
+            .with_return_path(true),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 2);
+    assert!((result.coefficients()[0] - 1.0).abs() < 1e-12);
+    assert!((result.coefficients()[1] - 2.0).abs() < 1e-12);
+    let path = result.path().expect("return_path=true should capture path");
+    assert_eq!(path.dim(), (2, 2));
+    assert!((path[[0, 0]] - 2.0).abs() < 1e-12);
+    assert!(path[[1, 0]].abs() < 1e-12);
+    assert!((path[[0, 1]] - 1.0).abs() < 1e-12);
+    assert!((path[[1, 1]] - 2.0).abs() < 1e-12);
+}
+
+/// Public Gram helper parity: when `tol` is supplied, sklearn's Gram helper
+/// requires `norms_squared` and stops by residual tolerance over at most all
+/// features.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp_gram(Gram, Xy, n_nonzero_coefs=3, tol=0.1,
+/// norms_squared=np.array([30.0])) -> [1.0, 2.0]`.
+#[test]
+fn orthogonal_mp_gram_helper_tol_matches_sklearn() {
+    let (gram, xy, norms_squared) = small_raw_omp_gram_fixture();
+    let result = orthogonal_mp_gram(
+        &gram,
+        &xy,
+        OrthogonalMpGramOptions::default()
+            .with_n_nonzero_coefs(Some(3))
+            .with_tol(Some(0.1))
+            .with_norms_squared(Some(norms_squared)),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 2);
+    assert!((result.coefficients()[0] - 1.0).abs() < 1e-12);
+    assert!((result.coefficients()[1] - 2.0).abs() < 1e-12);
+}
+
+/// Gram-helper-specific parity: sklearn uses `int(0.1 * n_features)` without
+/// the dense helper's lower bound of one, so a two-feature Gram matrix raises
+/// when neither stopping criterion is provided.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp_gram(Gram, Xy, n_nonzero_coefs=None, tol=None)` raises
+/// `ValueError("The number of atoms must be positive")`.
+#[test]
+fn orthogonal_mp_gram_helper_default_small_feature_count_errors_like_sklearn() {
+    let (gram, xy, _) = small_raw_omp_gram_fixture();
+    let err = orthogonal_mp_gram(&gram, &xy, OrthogonalMpGramOptions::default()).unwrap_err();
+
+    assert!(matches!(
+        err,
+        FerroError::InvalidParameter {
+            name,
+            ..
+        } if name == "n_nonzero_coefs"
+    ));
+}
+
+/// Guard the sklearn contract that the Gram helper cannot use tolerance
+/// stopping without the original target norm.
+#[test]
+fn orthogonal_mp_gram_helper_tol_requires_norms_squared() {
+    let (gram, xy, _) = small_raw_omp_gram_fixture();
+    let err = orthogonal_mp_gram(
+        &gram,
+        &xy,
+        OrthogonalMpGramOptions::default().with_tol(Some(0.1)),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        err,
+        FerroError::InvalidParameter {
+            name,
+            ..
+        } if name == "norms_squared"
+    ));
 }
 
 // ---------------------------------------------------------------------------

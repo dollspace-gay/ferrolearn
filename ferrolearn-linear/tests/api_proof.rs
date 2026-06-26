@@ -23,9 +23,10 @@ use ferrolearn_linear::{
     GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA, Lars, Lasso,
     LassoCV, LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
     LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
-    OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore,
-    Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
-    TweedieRegressor, l1_min_c, orthogonal_mp, ridge_regression,
+    OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor,
+    RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions,
+    SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c, orthogonal_mp,
+    orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -230,6 +231,20 @@ fn api_proof_omp() {
     assert_eq!(helper.coefficients().len(), x.ncols());
     assert_eq!(helper.n_iter(), 1);
     assert!(helper.path().is_some());
+
+    let gram = x.t().dot(&x);
+    let xy = x.t().dot(&y);
+    let gram_helper = orthogonal_mp_gram(
+        &gram,
+        &xy,
+        OrthogonalMpGramOptions::default()
+            .with_n_nonzero_coefs(Some(1))
+            .with_return_path(true),
+    )
+    .unwrap();
+    assert_eq!(gram_helper.coefficients().len(), x.ncols());
+    assert_eq!(gram_helper.n_iter(), 1);
+    assert!(gram_helper.path().is_some());
 }
 
 #[test]
