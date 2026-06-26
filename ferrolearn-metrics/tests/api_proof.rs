@@ -85,6 +85,8 @@ use ferrolearn_metrics::{
     pairwise_distances,
     pairwise_distances_argmin,
     pairwise_distances_argmin_min,
+    pairwise_distances_chunked,
+    pairwise_distances_chunked_reduce,
     pairwise_kernels,
     precision_recall_curve,
     precision_recall_fscore_support,
@@ -297,6 +299,18 @@ fn api_proof_pairwise() {
     ] {
         let _ = pairwise_distances::<f64>(&x, &y, m).unwrap();
     }
+    let chunks =
+        pairwise_distances_chunked::<f64>(&x, Some(&y), Metric::Euclidean, Some(0.0)).unwrap();
+    assert_eq!(chunks.len(), 3);
+    let sums = pairwise_distances_chunked_reduce::<f64, f64, _>(
+        &x,
+        Some(&y),
+        Metric::Euclidean,
+        Some(0.0),
+        |chunk, _start| Ok(chunk.iter().copied().sum()),
+    )
+    .unwrap();
+    assert_eq!(sums.len(), 3);
 
     let mut x_nan = x.clone();
     x_nan[[0, 0]] = f64::NAN;

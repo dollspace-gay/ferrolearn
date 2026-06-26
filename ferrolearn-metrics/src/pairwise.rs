@@ -13,6 +13,7 @@
 //! - [`cosine_distances`] — `1 - cosine_similarity`
 //! - [`haversine_distances`] — angular great-circle distance for `(lat, lon)`
 //! - [`paired_distances`] — row-wise distance dispatcher for paired arrays
+//! - [`pairwise_distances_chunked`] — vertical chunks of a pairwise distance matrix
 //! - [`distance_metrics`] / [`kernel_metrics`] — sklearn-style registry names
 //! - [`pairwise_distances`] — dispatcher that selects the above via the
 //!   [`Metric`] enum
@@ -22,7 +23,7 @@
 //! Mirrors `sklearn.metrics.pairwise` (`sklearn/metrics/pairwise.py`). See
 //! `.design/metrics/pairwise.md`. Non-test consumer: crate re-export. The
 //! present distance/kernel functions are value-correct vs the live oracle
-//! (verified to ULP); ABI params and chunked streaming remain NOT-STARTED.
+//! (verified to ULP); ABI params remain NOT-STARTED.
 //!
 //! | REQ | Description | Status |
 //! |-----|-------------|--------|
@@ -35,14 +36,14 @@
 //! | REQ-7 | `pairwise_kernels` value for the present kernels (linear/polynomial/rbf/sigmoid/laplacian/cosine/chi2/additive_chi2) (`pairwise.py:2469`) | SHIPPED |
 //! | REQ-8 | Standalone kernel functions + `cosine_similarity` (linear/polynomial/rbf/sigmoid/laplacian/chi2/additive_chi2) | PARTIAL (`cosine_similarity`/`laplacian_kernel`/`chi2_kernel`/`additive_chi2_kernel` SHIPPED; linear/poly/rbf/sigmoid remain enum-only) |
 //! | REQ-9 | `paired_*` family (euclidean/manhattan/cosine/distances, `(n,)` output) | SHIPPED |
-//! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | PARTIAL (`haversine_distances` SHIPPED; chunked NOT-STARTED #791) |
+//! | REQ-10 | `haversine_distances` + `pairwise_distances_chunked` | SHIPPED |
 //! | REQ-11 | ABI params: `squared=`, `missing_values=`, string-metric aliases (`l1`/`l2`/`cityblock`), kernel defaults + chi2/additive_chi2/cosine in the kernel registry | PARTIAL (registry-name helpers SHIPPED; Python string ABI/defaults NOT-STARTED #792) |
 //! | REQ-12 | `Y=None` self-distance API + arbitrary-magnitude diagonal-zeroing contract (`pairwise.py:414-415`) | NOT-STARTED (#793) |
 //! | REQ-13 | PyO3 binding | NOT-STARTED (#794) |
 //! | REQ-14 | ferray substrate migration | NOT-STARTED (#795) |
 
 use ferrolearn_core::FerroError;
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, s};
 use num_traits::Float;
 
 /// sklearn pairwise distance registry names supported by ferrolearn.
@@ -667,6 +668,86 @@ where
         Metric::Cosine => cosine_distances(x, y),
         Metric::Chebyshev => chebyshev_distances(x, y),
     }
+}
+
+fn pairwise_chunk_n_rows(
+    n_samples_y: usize,
+    max_n_rows: usize,
+    working_memory_mib: Option<f64>,
+) -> Result<usize, FerroError> {
+    if let Some(working_memory_mib) = working_memory_mib {
+        if !working_memory_mib.is_finite() || working_memory_mib < 0.0 {
+            return Err(FerroError::InvalidParameter {
+                name: "working_memory".to_string(),
+                reason: "working_memory must be finite and non-negative MiB".to_string(),
+            });
+        }
+        let row_bytes = 8.0 * n_samples_y as f64;
+        let requested_rows = ((working_memory_mib * 1024.0 * 1024.0) / row_bytes).floor();
+        if requested_rows < 1.0 {
+            Ok(1)
+        } else if requested_rows >= max_n_rows as f64 {
+            Ok(max_n_rows)
+        } else {
+            Ok(requested_rows as usize)
+        }
+    } else {
+        Ok(max_n_rows)
+    }
+}
+
+/// Compute a pairwise distance matrix in contiguous vertical chunks.
+///
+/// This is the Rust-native counterpart to
+/// `sklearn.metrics.pairwise_distances_chunked` without `reduce_func`: each
+/// returned matrix is a row-contiguous slice of the full pairwise distance
+/// matrix. `y = None` mirrors sklearn's `Y=None` self-distance form.
+///
+/// `working_memory_mib` follows sklearn's chunk sizing convention: rows are
+/// sized as if each output value takes 8 bytes, at least one row is emitted
+/// even when the requested budget is too small, and `None` emits one full
+/// matrix chunk.
+pub fn pairwise_distances_chunked<F>(
+    x: &Array2<F>,
+    y: Option<&Array2<F>>,
+    metric: Metric,
+    working_memory_mib: Option<f64>,
+) -> Result<Vec<Array2<F>>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    pairwise_distances_chunked_reduce(x, y, metric, working_memory_mib, |chunk, _start| Ok(chunk))
+}
+
+/// Compute pairwise distance chunks and reduce each chunk with a callback.
+///
+/// The reducer receives `(D_chunk, start)`, matching sklearn's
+/// `reduce_func(D_chunk, start)` calling convention. The callback return values
+/// are collected in chunk order.
+pub fn pairwise_distances_chunked_reduce<F, R, Reduce>(
+    x: &Array2<F>,
+    y: Option<&Array2<F>>,
+    metric: Metric,
+    working_memory_mib: Option<f64>,
+    mut reduce_func: Reduce,
+) -> Result<Vec<R>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+    Reduce: FnMut(Array2<F>, usize) -> Result<R, FerroError>,
+{
+    let y = y.unwrap_or(x);
+    check_feature_dim(x, y, "pairwise_distances_chunked")?;
+    check_non_empty(x, y, "pairwise_distances_chunked")?;
+    let chunk_n_rows = pairwise_chunk_n_rows(y.nrows(), x.nrows(), working_memory_mib)?;
+
+    let mut out = Vec::new();
+    for start in (0..x.nrows()).step_by(chunk_n_rows) {
+        let stop = (start + chunk_n_rows).min(x.nrows());
+        let x_chunk = x.slice(s![start..stop, ..]).to_owned();
+        let d_chunk = pairwise_distances(&x_chunk, y, metric)?;
+        out.push(reduce_func(d_chunk, start)?);
+    }
+    Ok(out)
 }
 
 /// Return the sklearn-style distance metric registry names supported here.

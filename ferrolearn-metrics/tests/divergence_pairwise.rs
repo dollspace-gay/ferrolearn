@@ -42,7 +42,8 @@ use ferrolearn_metrics::pairwise::{
     haversine_distances, kernel_metrics, laplacian_kernel, manhattan_distances,
     nan_euclidean_distances, paired_cosine_distances, paired_distances, paired_euclidean_distances,
     paired_manhattan_distances, pairwise_distances, pairwise_distances_argmin,
-    pairwise_distances_argmin_min, pairwise_kernels,
+    pairwise_distances_argmin_min, pairwise_distances_chunked, pairwise_distances_chunked_reduce,
+    pairwise_kernels,
 };
 use ndarray::array;
 
@@ -366,6 +367,94 @@ fn green_pairwise_distances_dispatch_euclidean() {
         d[[0, 0]],
         d[[1, 0]]
     );
+}
+
+/// Guard: `pairwise_distances_chunked` with `working_memory=0` yields one
+/// contiguous row per chunk, matching sklearn's at-least-one-row rule.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics import \
+///     pairwise_distances_chunked; X=np.array([[0.,0.],[3.,4.],[6.,8.]]); \
+///     Y=np.array([[0.,0.],[0.,5.]]); chunks=list( \
+///     pairwise_distances_chunked(X,Y,metric='euclidean',working_memory=0)); \
+///     print([c.shape for c in chunks]); print([c.tolist() for c in chunks])"
+///   # [(1, 2), (1, 2), (1, 2)]
+///   # [[[0.0, 5.0]], [[5.0, 3.1622776601683795]], [[10.0, 6.708203932499369]]]
+#[test]
+fn green_pairwise_distances_chunked_row_chunks_match_sklearn() {
+    let x = array![[0.0_f64, 0.0], [3.0, 4.0], [6.0, 8.0]];
+    let y = array![[0.0_f64, 0.0], [0.0, 5.0]];
+    let chunks = pairwise_distances_chunked(&x, Some(&y), Metric::Euclidean, Some(0.0)).unwrap();
+    assert_eq!(chunks.len(), 3);
+    const SK: [[[f64; 2]; 1]; 3] = [
+        [[0.0, 5.0]],
+        [[5.0, 3.1622776601683795]],
+        [[10.0, 6.708203932499369]],
+    ];
+    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+        assert_eq!(chunk.shape(), &[1, 2]);
+        for j in 0..2 {
+            assert!(
+                (chunk[[0, j]] - SK[chunk_idx][0][j]).abs() < 1e-12,
+                "pairwise_distances_chunked chunk {chunk_idx}[0,{j}]: sklearn={}, ferrolearn={}",
+                SK[chunk_idx][0][j],
+                chunk[[0, j]]
+            );
+        }
+    }
+}
+
+/// Guard: `Y=None` produces self-distance chunks, and `None` working memory
+/// emits one full chunk for this small input, matching sklearn's default
+/// config path.
+///
+/// Oracle (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.metrics import \
+///     pairwise_distances_chunked; X=np.array([[0.,0.],[3.,4.],[6.,8.]]); \
+///     chunks=list(pairwise_distances_chunked(X,metric='euclidean')); \
+///     print([c.shape for c in chunks]); print(chunks[0].tolist())"
+///   # [(3, 3)]
+///   # [[0.0, 5.0, 10.0], [5.0, 0.0, 5.0], [10.0, 5.0, 0.0]]
+#[test]
+fn green_pairwise_distances_chunked_self_default_matches_sklearn() {
+    let x = array![[0.0_f64, 0.0], [3.0, 4.0], [6.0, 8.0]];
+    let chunks = pairwise_distances_chunked(&x, None, Metric::Euclidean, None).unwrap();
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].shape(), &[3, 3]);
+    const SK: [[f64; 3]; 3] = [[0.0, 5.0, 10.0], [5.0, 0.0, 5.0], [10.0, 5.0, 0.0]];
+    for i in 0..3 {
+        for j in 0..3 {
+            assert!(
+                (chunks[0][[i, j]] - SK[i][j]).abs() < 1e-12,
+                "pairwise_distances_chunked self [{i},{j}]: sklearn={}, ferrolearn={}",
+                SK[i][j],
+                chunks[0][[i, j]]
+            );
+        }
+    }
+}
+
+/// Guard: reducer callbacks receive the same chunk stream and sklearn-style
+/// `start` row offsets.
+///
+/// Oracle chunk stream:
+///   python3 -c "import numpy as np; from sklearn.metrics import \
+///     pairwise_distances_chunked; X=np.array([[0.,0.],[3.,4.],[6.,8.]]); \
+///     print([float(c.sum()) for c in pairwise_distances_chunked( \
+///     X,metric='euclidean',working_memory=0)])"
+///   # [15.0, 10.0, 15.0]
+#[test]
+fn green_pairwise_distances_chunked_reduce_receives_start_rows() {
+    let x = array![[0.0_f64, 0.0], [3.0, 4.0], [6.0, 8.0]];
+    let reductions = pairwise_distances_chunked_reduce(
+        &x,
+        None,
+        Metric::Euclidean,
+        Some(0.0),
+        |chunk, start| Ok((start, chunk.iter().copied().sum::<f64>())),
+    )
+    .unwrap();
+    assert_eq!(reductions, vec![(0, 15.0), (1, 10.0), (2, 15.0)]);
 }
 
 /// Guard: `pairwise_distances_argmin` ties break to the LOWEST index, matching
