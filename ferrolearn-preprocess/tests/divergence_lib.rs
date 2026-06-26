@@ -7,6 +7,7 @@
 //!
 //!   * `sklearn.preprocessing`        (`preprocessing/__init__.py:30-60` `__all__`)
 //!   * `sklearn.feature_selection`    (`feature_selection/__init__.py:27-47` `__all__`)
+//!   * `sklearn.feature_extraction`   (`feature_extraction/__init__.py` `__all__`)
 //!   * `sklearn.feature_extraction.text` (`text.py:34-43`)
 //!   * `sklearn.feature_extraction.image` (`image.py:23-26` scoped subset)
 //!   * `sklearn.impute`               (`impute/__init__.py:13` `__all__`)
@@ -16,7 +17,7 @@
 //! Mirrors the bayes/lib precedent (`ferrolearn-bayes/tests/divergence_lib.rs`,
 //! `api_proof` pattern): this file PINS the public surface. The single
 //! `use ferrolearn_preprocess::{...}` block below names every re-exported item
-//! the design doc claims PRESENT. If any re-export at `lib.rs:134-208` is ever
+//! the design doc claims PRESENT. If any crate-root re-export is ever
 //! removed or renamed, this test file fails to COMPILE — that compile failure is
 //! the boundary's regression guard (AC-1: every name in the `pub use` block
 //! resolves to an existing type/function).
@@ -30,7 +31,7 @@
 //! `.design/preprocess/lib.md` Probes), not transcribed from the ferrolearn side.
 
 // The compile-time boundary guard. Every name here is a re-export at
-// `ferrolearn-preprocess/src/lib.rs:134-208`. Removal => unresolved import =>
+// `ferrolearn-preprocess/src/lib.rs`. Removal => unresolved import =>
 // this crate's test build fails. This is intentional and load-bearing.
 use ferrolearn_preprocess::{
     // supporting enums for the preprocessing estimators
@@ -43,10 +44,12 @@ use ferrolearn_preprocess::{
     // sklearn.compose __all__ (PRESENT)
     ColumnSelector,
     ColumnTransformer,
-    // sklearn.feature_extraction.text public classes (PRESENT)
+    // sklearn.feature_extraction root/text public classes (PRESENT)
     CountVectorizer,
     // sklearn.feature_selection __all__ (PRESENT)
     Direction,
+    FeatureHasher,
+    FeatureHasherInputType,
     FittedBinaryEncoder,
     FittedColumnTransformer,
     FittedCountVectorizer,
@@ -167,11 +170,12 @@ use ferrolearn_preprocess::{
 /// fully-applied type regardless of its generic arity.
 fn name_type<T>() {}
 
-/// Boundary-integrity guard for the six-module `__all__` re-export surface.
+/// Boundary-integrity guard for the covered sklearn `__all__` re-export surface.
 ///
 /// Mirrors the *function* of:
 ///   * `sklearn/preprocessing/__init__.py:30-60` (`__all__`)
 ///   * `sklearn/feature_selection/__init__.py:27-47` (`__all__`)
+///   * `sklearn/feature_extraction/__init__.py` (`__all__`)
 ///   * `sklearn/feature_extraction/text.py:34-43`
 ///   * `sklearn/feature_extraction/image.py:23-26` (scoped subset)
 ///   * `sklearn/impute/__init__.py:13` (`__all__`)
@@ -179,7 +183,7 @@ fn name_type<T>() {}
 ///   * `sklearn/compose/__init__.py:15-20` (`__all__`)
 ///
 /// Each re-exported estimator surfaced at `ferrolearn-preprocess/src/lib.rs`
-/// (`:134-208`) is named below. If any `pub use` is removed/renamed the `use`
+/// is named below. If any `pub use` is removed/renamed the `use`
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
@@ -193,7 +197,7 @@ fn name_type<T>() {}
 the assert!(true) only keeps the harness green when every re-export resolves"
 )]
 #[test]
-fn boundary_integrity_six_module_all_surface() {
+fn boundary_integrity_covered_module_all_surface() {
     // --- preprocessing: unfitted + Fitted* pairs (and single-type transformers) ---
     name_type::<StandardScaler<f64>>();
     name_type::<FittedStandardScaler<f64>>();
@@ -281,9 +285,11 @@ fn boundary_integrity_six_module_all_surface() {
     let _scores_classif = compute_scores_classif::<f64>;
     let _scores_regression = compute_scores_regression::<f64>;
 
-    // --- feature_extraction.text ---
+    // --- feature_extraction root/text ---
     name_type::<CountVectorizer>();
     name_type::<FittedCountVectorizer>();
+    name_type::<FeatureHasher>();
+    name_type::<FeatureHasherInputType>();
     name_type::<HashingVectorizer>();
     name_type::<TfidfTransformer<f64>>();
     name_type::<FittedTfidfTransformer<f64>>();
@@ -334,6 +340,6 @@ fn boundary_integrity_six_module_all_surface() {
     // the COMPILE itself (boundary integrity); this keeps the harness green.
     assert!(
         true,
-        "boundary integrity holds: all six-module __all__ re-exports resolved"
+        "boundary integrity holds: all covered sklearn __all__ re-exports resolved"
     );
 }

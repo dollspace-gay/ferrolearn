@@ -73,9 +73,9 @@
 //! ## REQ status
 //!
 //! Binary (R-DEFER-2) for the crate-root RE-EXPORT BOUNDARY — this file is the
-//! public-API surface, NOT an estimator. Mirrors the `__all__` of six sklearn
+//! public-API surface, NOT an estimator. Mirrors the covered `__all__` of sklearn
 //! modules: `preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`,
-//! `feature_extraction/text.py:34-43`, `impute/__init__.py:13`,
+//! `feature_extraction/__init__.py`, `feature_extraction/text.py:34-43`, `impute/__init__.py:13`,
 //! `feature_extraction/image.py:23-26` (scoped helper subset),
 //! `random_projection.py:50-54`, `compose/__init__.py:15-20`. Design doc:
 //! `.design/preprocess/lib.md`. Per-estimator value parity lives in the sibling
@@ -84,8 +84,8 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block (`:134-208`) surfaces every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums, [`SelectorMixin`], the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns, `johnson_lindenstrauss_min_dim`, and scoped image helpers), mirroring the six modules' `__all__` plus the implemented `feature_extraction.image` helper surface. The surfaced set is the documented subset that is implemented; not-yet-translated names (`mutual_info_*`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
-//! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across all 38 submodules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
+//! | REQ-1 (re-export boundary) | SHIPPED | the crate-root `pub use` blocks surface every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums, [`SelectorMixin`], [`FeatureHasherInputType`], the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns, `johnson_lindenstrauss_min_dim`, and scoped image helpers), mirroring the covered sklearn `__all__` surfaces. The surfaced set is the documented subset that is implemented; not-yet-translated names (`DictVectorizer`, `mutual_info_*`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
+//! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across the modules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
 //!
 //! `BinaryEncoder`/`FittedBinaryEncoder` (`:169`) is a `category_encoders`-style
 //! extension with no sklearn `__all__` analog — an extension of the boundary, not
@@ -96,10 +96,12 @@ pub mod binary_encoder;
 pub mod column_transformer;
 pub mod count_vectorizer;
 pub mod dummy_feature;
+pub mod feature_hasher;
 pub mod feature_scoring;
 pub mod feature_selection;
 pub mod function_transformer;
 pub mod generic_univariate_select;
+mod hashing;
 pub mod image;
 pub mod imputer;
 pub mod iterative_imputer;
@@ -137,6 +139,7 @@ pub use column_transformer::{
     make_column_transformer,
 };
 pub use dummy_feature::add_dummy_feature;
+pub use feature_hasher::{FeatureHasher, FeatureHasherInputType};
 pub use feature_selection::{
     FittedSelectKBest, FittedVarianceThreshold, ScoreFunc, SelectFromModel, SelectKBest,
     VarianceThreshold,

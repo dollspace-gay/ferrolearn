@@ -10,14 +10,15 @@ use ferrolearn_preprocess::imputer::ImputeStrategy;
 use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, ColumnSelector, ColumnTransformer,
-    CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection,
-    GenericUnivariateMode, GenericUnivariateParam, GenericUnivariateSelect, HashingVectorizer,
-    InitialStrategy, IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer,
-    KnotStrategy, LabelBinarizer, LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler,
-    MissingIndicator, MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder,
-    OrdinalEncoder, OutputDistribution, PatchExtractor, PolynomialFeatures, PowerTransformer,
-    QuantileTransformer, Remainder, RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe,
-    SelectKBest, SelectPercentile, SelectorMixin, SequentialFeatureSelector, SimpleImputer,
+    CountVectorizer, Direction, FeatureHasher, FeatureHasherInputType, FunctionTransformer,
+    GaussianRandomProjection, GenericUnivariateMode, GenericUnivariateParam,
+    GenericUnivariateSelect, HashingVectorizer, InitialStrategy, IterativeImputer,
+    KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy, LabelBinarizer,
+    LabelEncoder, MaxAbsScaler, MaxPatches, MinMaxScaler, MissingIndicator,
+    MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
+    OutputDistribution, PatchExtractor, PolynomialFeatures, PowerTransformer, QuantileTransformer,
+    Remainder, RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest,
+    SelectPercentile, SelectorMixin, SequentialFeatureSelector, SimpleImputer,
     SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfNorm,
     TfidfTransformer, TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2,
     extract_patches_2d, f_classif, f_regression, grid_to_graph, img_to_graph,
@@ -25,6 +26,7 @@ use ferrolearn_preprocess::{
     minmax_scale, power_transform, r_regression, reconstruct_from_patches_2d,
 };
 use ndarray::{Array1, Array2, Array3, array};
+use std::collections::HashMap;
 
 fn small_data() -> Array2<f64> {
     Array2::from_shape_vec(
@@ -372,6 +374,22 @@ fn api_proof_text() {
     let tfidf = f.transform(&docs).unwrap();
     assert_eq!(tfidf.nrows(), 3);
     assert_eq!(tfidf.ncols(), f.vocabulary().len());
+
+    let mut sample = HashMap::new();
+    sample.insert("cat".to_string(), 2.0);
+    sample.insert("dog".to_string(), 1.0);
+    let hashed_features = FeatureHasher::new()
+        .n_features(8)
+        .alternate_sign(false)
+        .transform_dict(&[sample])
+        .unwrap();
+    assert_eq!(hashed_features.dim(), (1, 8));
+    let string_features = FeatureHasher::new()
+        .n_features(8)
+        .input_type(FeatureHasherInputType::String)
+        .transform_strings(&[vec!["cat".to_string(), "dog".to_string()]])
+        .unwrap();
+    assert_eq!(string_features.dim(), (1, 8));
 }
 
 // =============================================================================
