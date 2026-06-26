@@ -12,7 +12,7 @@
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
-use ferrolearn_linear::Ridge;
+use ferrolearn_linear::{Ridge, RidgeRegressionOptions, RidgeSolver, ridge_regression};
 use ndarray::{Array1, Array2, array};
 
 /// Fixed 20x5 design matrix, row-major, from
@@ -304,6 +304,85 @@ fn ridge_fit_intercept_false_parity() {
         "fit_intercept=False intercept should be 0, got {}",
         fitted.intercept()
     );
+}
+
+/// Public helper parity: sklearn `ridge_regression(X, y, alpha=1.0)` solves
+/// the raw dense normal equation without centering or fitting an intercept.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `ridge_regression(X, y, alpha=1.0) -> [0.1754385964912277, 0.35087719298245645]`.
+#[test]
+fn ridge_regression_default_matches_sklearn() {
+    let x: Array2<f64> = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+    let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0];
+
+    let result = ridge_regression(&x, &y, 1.0, RidgeRegressionOptions::default()).unwrap();
+
+    assert!((result.coefficients()[0] - 0.175_438_596_491_227_7).abs() < 1e-10);
+    assert!((result.coefficients()[1] - 0.350_877_192_982_456_45).abs() < 1e-10);
+    assert_eq!(result.intercept(), None);
+    assert_eq!(result.n_iter(), None);
+    assert_eq!(result.solver(), RidgeSolver::Cholesky);
+}
+
+/// Public helper parity: sklearn implements `sample_weight` for the direct
+/// helper by row-rescaling `X` and `y` before the dense solve.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `ridge_regression(X, y, alpha=1.0, sample_weight=[1,2,1,0.5])`
+/// -> `[0.17391304347826278, 0.35610766045548503]`.
+#[test]
+fn ridge_regression_sample_weight_matches_sklearn() {
+    let x: Array2<f64> = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+    let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0];
+    let sample_weight: Array1<f64> = array![1.0, 2.0, 1.0, 0.5];
+    let options = RidgeRegressionOptions::default().with_sample_weight(Some(&sample_weight));
+
+    let result = ridge_regression(&x, &y, 1.0, options).unwrap();
+
+    assert!((result.coefficients()[0] - 0.173_913_043_478_262_78).abs() < 1e-10);
+    assert!((result.coefficients()[1] - 0.356_107_660_455_485_03).abs() < 1e-10);
+    assert_eq!(result.intercept(), None);
+}
+
+/// Public helper parity for the explicit SVD solver and alpha=0 min-norm
+/// branch.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `ridge_regression(X, y, alpha=0.0, solver="svd")`
+/// -> `[3.0531133177191805e-16, 0.4999999999999996]`.
+#[test]
+fn ridge_regression_svd_alpha_zero_matches_sklearn() {
+    let x: Array2<f64> = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+    let y: Array1<f64> = array![1.0, 2.0, 3.0, 4.0];
+    let options = RidgeRegressionOptions::default().with_solver(RidgeSolver::Svd);
+
+    let result = ridge_regression(&x, &y, 0.0, options).unwrap();
+
+    assert!(result.coefficients()[0].abs() < 1e-9);
+    assert!((result.coefficients()[1] - 0.5).abs() < 1e-9);
+    assert_eq!(result.solver(), RidgeSolver::Svd);
+}
+
+/// Public helper parity for `positive=True`; sklearn uses L-BFGS-B, while
+/// ferrolearn's Ridge path solves the same non-negative ridge objective by
+/// projected coordinate descent.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `ridge_regression(X, y, alpha=1.0, positive=True, solver="lbfgs")`
+/// -> `[0.7333333333333334, 0.0]`.
+#[test]
+fn ridge_regression_positive_matches_sklearn() {
+    let x: Array2<f64> = array![[1.0, -2.0], [2.0, -1.0], [3.0, -4.0]];
+    let y: Array1<f64> = array![1.0, 2.0, 2.0];
+    let options = RidgeRegressionOptions::default().with_positive(true);
+
+    let result = ridge_regression(&x, &y, 1.0, options).unwrap();
+
+    assert!((result.coefficients()[0] - 0.733_333_333_333_333_4).abs() < 1e-8);
+    assert!(result.coefficients()[1].abs() < 1e-12);
+    assert!(result.coefficients().iter().all(|&coef| coef >= 0.0));
+    assert!(result.n_iter().is_some());
 }
 
 /// Regression guard: f32 parity at alpha=10.0. PASSES against current ferrolearn.

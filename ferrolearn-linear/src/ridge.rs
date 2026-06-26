@@ -33,6 +33,7 @@
 //! | REQ-12 (copy_X/random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders. `copy_x` ABI-only (fit never mutates `x`); `random_state` stored-but-no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
 //! | REQ-13 (ferray substrate) | NOT-STARTED | #391 (alpha=0 fallback already on ferray::linalg::lstsq; coef return tied to #359). |
 //! | REQ-14 (non-finite input rejected) | SHIPPED | Both fit entries reject any NaN/+/-inf in X, y, or `sample_weight` BEFORE centering/solve with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_ridge.py:1242`) + `_check_sample_weight` (default `force_all_finite=True`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. The single-output `fit_with_sample_weight` (shared entry `Fit::fit` delegates to) checks X/y/sample_weight; the SEPARATE multi-output arm `Fit<Array2, Array2>::fit` checks X/y independently. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Ridge().fit` raises `ValueError` for NaN/+inf/-inf in X, NaN/inf in y, and NaN/inf in sample_weight (`tests/divergence_linear_nonfinite_batch2.rs::ridge_*`). Non-test consumer: the existing `Fit::fit` / `RsRidge` consumers. (#2259) |
+//! | REQ-15 (`ridge_regression` public helper) | SHIPPED | `pub fn ridge_regression` solves the dense ndarray analogue of `sklearn.linear_model.ridge_regression` (`_ridge.py:627`) through the same raw, weighted, SVD, and positive paths used by `Ridge`, defaulting to the uncentered normal-equation helper contract. Oracle tests `ridge_regression_*_matches_sklearn`. |
 //!
 //! acto-critic: core L2 numerics (coef/intercept, alpha scaling, fit_intercept, f32) match the
 //! live oracle; one divergence (#392, alpha=0 rank-deficient min-norm) found and fixed.
@@ -95,6 +96,175 @@ pub enum RidgeSolver {
     /// [`Cholesky`](RidgeSolver::Cholesky) on the strictly-convex ridge
     /// problem (unique minimizer).
     Svd,
+}
+
+/// Options for [`ridge_regression`].
+///
+/// This mirrors the dense ndarray subset of sklearn's
+/// `sklearn.linear_model.ridge_regression` keyword arguments. The default
+/// helper contract does **not** fit an intercept; it solves the raw normal
+/// equation exactly as sklearn documents for dense inputs. Set
+/// [`with_return_intercept`](Self::with_return_intercept) to return a centered
+/// intercept fit through ferrolearn's [`Ridge`] estimator path.
+#[derive(Debug, Clone, Copy)]
+pub struct RidgeRegressionOptions<'a, F> {
+    /// Optional per-sample weights (`sample_weight`).
+    pub sample_weight: Option<&'a Array1<F>>,
+    /// Dense solver (`solver`).
+    pub solver: RidgeSolver,
+    /// Maximum iterations for the positive constrained solver.
+    pub max_iter: Option<usize>,
+    /// Convergence tolerance for the positive constrained solver.
+    pub tol: F,
+    /// Whether to constrain coefficients to be non-negative.
+    pub positive: bool,
+    /// Whether to return an intercept fit.
+    pub return_intercept: bool,
+}
+
+impl<'a, F: Float> RidgeRegressionOptions<'a, F> {
+    /// Create default options matching sklearn's dense helper defaults:
+    /// `sample_weight=None`, `solver='auto'`, `max_iter=None`, `tol=1e-4`,
+    /// `positive=False`, and `return_intercept=False`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            sample_weight: None,
+            solver: RidgeSolver::Auto,
+            max_iter: None,
+            tol: F::from(1e-4).unwrap_or_else(F::epsilon),
+            positive: false,
+            return_intercept: false,
+        }
+    }
+
+    /// Set optional per-sample weights.
+    #[must_use]
+    pub fn with_sample_weight(mut self, sample_weight: Option<&'a Array1<F>>) -> Self {
+        self.sample_weight = sample_weight;
+        self
+    }
+
+    /// Set the dense solver.
+    #[must_use]
+    pub fn with_solver(mut self, solver: RidgeSolver) -> Self {
+        self.solver = solver;
+        self
+    }
+
+    /// Set the maximum iterations for the positive constrained solver.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: Option<usize>) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the convergence tolerance for the positive constrained solver.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set whether to constrain coefficients to be non-negative.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
+        self
+    }
+
+    /// Set whether to return an intercept fit.
+    #[must_use]
+    pub fn with_return_intercept(mut self, return_intercept: bool) -> Self {
+        self.return_intercept = return_intercept;
+        self
+    }
+}
+
+impl<'a, F: Float> Default for RidgeRegressionOptions<'a, F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result returned by [`ridge_regression`].
+#[derive(Debug, Clone)]
+pub struct RidgeRegressionResult<F> {
+    coefficients: Array1<F>,
+    n_iter: Option<usize>,
+    intercept: Option<F>,
+    solver: RidgeSolver,
+}
+
+impl<F: Float> RidgeRegressionResult<F> {
+    /// Borrow the fitted coefficient vector.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array1<F> {
+        &self.coefficients
+    }
+
+    /// Return the number of iterations used by an iterative/constrained path.
+    #[must_use]
+    pub fn n_iter(&self) -> Option<usize> {
+        self.n_iter
+    }
+
+    /// Return the intercept when requested through
+    /// [`RidgeRegressionOptions::with_return_intercept`].
+    #[must_use]
+    pub fn intercept(&self) -> Option<F> {
+        self.intercept
+    }
+
+    /// Return the resolved dense solver used by the helper.
+    #[must_use]
+    pub fn solver(&self) -> RidgeSolver {
+        self.solver
+    }
+}
+
+/// Solve the dense ridge regression normal equation.
+///
+/// This is the Rust analogue of `sklearn.linear_model.ridge_regression` for
+/// dense `ndarray` inputs and single-output targets. By default it follows the
+/// helper's raw-design contract and returns only coefficients for
+/// `min ||y - Xw||² + alpha * ||w||²`. Optional sample weights, dense solver
+/// choice (`auto`/`cholesky`/`svd`), and `positive=True` are routed through the
+/// same implementation used by [`Ridge`].
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent shapes, negative `alpha`, non-finite
+/// inputs, empty data, or solver failures.
+pub fn ridge_regression<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    alpha: F,
+    options: RidgeRegressionOptions<'_, F>,
+) -> Result<RidgeRegressionResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + LinalgFloat + 'static,
+{
+    let model = Ridge::<F>::new()
+        .with_alpha(alpha)
+        .with_fit_intercept(options.return_intercept)
+        .with_solver(options.solver)
+        .with_max_iter(options.max_iter)
+        .with_tol(options.tol)
+        .with_positive(options.positive);
+    let fitted = model.fit_with_sample_weight(x, y, options.sample_weight)?;
+    let intercept = if options.return_intercept {
+        Some(fitted.intercept)
+    } else {
+        None
+    };
+
+    Ok(RidgeRegressionResult {
+        coefficients: fitted.coefficients,
+        n_iter: fitted.n_iter_,
+        intercept,
+        solver: fitted.solver_,
+    })
 }
 
 impl RidgeSolver {

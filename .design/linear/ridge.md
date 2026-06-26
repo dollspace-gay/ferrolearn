@@ -14,8 +14,9 @@ upstream-paths:
 least squares with an L2 penalty, `||y - Xw||^2_2 + alpha * ||w||^2_2`, solved in closed form. The
 ferrolearn implementation covers sklearn's default dense path — `solver='auto'` → `'cholesky'` with
 `fit_intercept` handled by centering — and exposes `Ridge<F>` / `FittedRidge<F>` (single output) plus
-`FittedRidgeMulti<F>` (2-D `Y`). It does NOT cover sklearn's alternate solvers, per-target `alpha`,
-`positive`, `sample_weight`, `max_iter`/`tol`/`n_iter_`, `copy_X`, or `random_state`.
+`FittedRidgeMulti<F>` (2-D `Y`). It also exposes the dense single-output
+`sklearn.linear_model.ridge_regression` helper through `ridge_regression`. The remaining estimator gaps
+are sklearn's iterative solvers and the ferray substrate migration.
 
 ## Requirements
 - REQ-1: Fit `coef_` and `intercept_` by minimizing `||y - Xw||^2_2 + alpha * ||w||^2_2` via Cholesky
@@ -42,6 +43,10 @@ ferrolearn implementation covers sklearn's default dense path — `solver='auto'
 - REQ-12: `copy_X` and `random_state` constructor parameters.
 - REQ-13 (substrate): run the owned array/linalg computation on ferray (`ferray-core` array type,
   `ferray::linalg` Cholesky) rather than `ndarray` + the in-crate `linalg` Cholesky.
+- REQ-14: Public `ridge_regression` helper — solve the dense single-output helper contract from
+  `sklearn.linear_model.ridge_regression`, defaulting to the uncentered normal equation while supporting
+  sample weights, dense solver selection (`auto`/`cholesky`/`svd`), `positive=True`, and optional
+  intercept return through a fixed Rust result struct.
 
 ## Acceptance criteria
 - AC-1: On `X = [[1,0],[0,1],[1,1],[2,2]]`, `y = [1,2,3,6]`, `alpha=1.0`, `fit_intercept=true`,
@@ -72,6 +77,7 @@ ferrolearn implementation covers sklearn's default dense path — `solver='auto'
 | REQ-11 (sample_weight) | SHIPPED | impl `pub fn fit_with_sample_weight(x, y, sample_weight: Option<&Array1<F>>) in ridge.rs` solves WEIGHTED ridge `min Σᵢ wᵢ(yᵢ−xᵢ·coef)² + alpha·‖coef‖²`: weighted offsets `x_off[j]=Σwᵢx[i,j]/Σwᵢ`, `y_off=Σwᵢyᵢ/Σwᵢ` for `fit_intercept`, centering, then `√wᵢ` row-rescaling (sklearn `_rescale_data`, `sklearn/linear_model/_ridge.py:682-688`), `crate::linalg::solve_ridge(&x_scaled, &y_scaled, self.alpha)` with the penalty `alpha` UNSCALED (since `(√w·Xc)ᵀ(√w·Xc) == Xcᵀ·W·Xc`, the cholesky solve `(Xsᵀ·Xs + alpha·I)·coef = Xsᵀ·ys` IS the weighted ridge normal equation), `intercept = y_off − x_off·coef`; `fit_intercept=false` skips centering (raw `√w`-rescale, intercept 0). `Fit::fit` now delegates `self.fit_with_sample_weight(x, y, None)`, keeping the `None` path BYTE-IDENTICAL to the historic centering + `solve_ridge` body (and the alpha=0 OLS min-norm fallback from REQ-5). Shape validation: `sample_weight` length must equal `n_samples` else `ShapeMismatch`. Verification: live `Ridge(alpha=1.0).fit(X,y,sample_weight=w)` gives `coef_=[0.9233502538, 1.39678511]`, `intercept_=-0.8033840948`; `cargo test -p ferrolearn-linear` `ridge_fit_sample_weight_with_intercept_matches_sklearn`, `ridge_fit_sample_weight_no_intercept_matches_sklearn` (alpha=2 fit_intercept=False coef `[0.7273779983, 1.3737799835]`), `ridge_fit_none_sample_weight_equals_unweighted` all green. Closed #389. |
 | REQ-12 (copy_X / random_state) | SHIPPED | `Ridge<F>` adds `pub copy_x: bool` (default `true`) and `pub random_state: Option<u64>` (default `None`) fields with `with_copy_x`/`with_random_state` builders, mirroring sklearn ctor `copy_X=True` (`_ridge.py:898`) and `random_state=None` (`_ridge.py:903`). `copy_x` is ABI-only (fit never mutates `x`); `random_state` is stored but no-op for the deterministic Cholesky solver (only `sag`/`saga` use it, `_ridge.py:898`/`:903`). Test: `ridge_copy_x_random_state_defaults_and_builders`. Closes #390. |
 | REQ-13 (ferray substrate) | NOT-STARTED | open prereq blocker #391 (refs #359 coef-return shape, #375 solve_ridge → `ferray::linalg`). `ridge.rs` operates on `ndarray::{Array1, Array2}` and `crate::linalg::solve_ridge` (in-crate Cholesky), not `ferray-core` arrays / `ferray::linalg` (R-SUBSTRATE-1/2). |
+| REQ-14 (`ridge_regression` public helper) | SHIPPED | `pub fn ridge_regression` + `RidgeRegressionOptions` / `RidgeRegressionResult` in `ridge.rs`, re-exported from `lib.rs`, provide the dense single-output Rust analogue of `sklearn.linear_model.ridge_regression` (`_ridge.py:627`). Default options set `return_intercept=false`, so the helper solves the raw normal equation `min ||y-Xw||² + alpha||w||²` without centering, matching sklearn's direct helper default. `sample_weight` delegates to the same row-rescaling path as `Ridge::fit_with_sample_weight`; `solver=Svd` delegates to `linalg::solve_ridge_svd`; `positive=true` delegates to the non-negative ridge CD path. Oracle tests: `ridge_regression_default_matches_sklearn`, `ridge_regression_sample_weight_matches_sklearn`, `ridge_regression_svd_alpha_zero_matches_sklearn`, `ridge_regression_positive_matches_sklearn`; API proof: `api_proof_ridge_family`. |
 
 ## Architecture
 The module owns two estimator surfaces, both produced by the unfitted `Ridge<F> { alpha, fit_intercept }`
@@ -113,9 +119,8 @@ returns the identical solution — the choice only affects the factorization. Th
 as `FittedRidge::solver_`. The iterative solvers (`lsqr`/`sparse_cg`/`sag`/`saga`/`lbfgs`, REQ-8b) remain
 NOT-STARTED, pinned on #386 (iterative/SGD substrate + RNG).
 
-**Gaps.** The remaining unimplemented surface is NOT-STARTED: the 2-D path lacks a consumer (REQ-6), the
-iterative solvers (REQ-8b), and the ferray substrate (REQ-13). Each is pinned by an open blocker
-referenced above.
+**Gaps.** The remaining unimplemented surface is NOT-STARTED: the iterative solvers (REQ-8b) and the
+ferray substrate (REQ-13). Each is pinned by an open blocker referenced above.
 
 ## Verification
 Commands that establish the SHIPPED claims (REQ-1..REQ-5):
@@ -136,6 +141,10 @@ REQ-8a (dense solvers) is verified by `cargo test -p ferrolearn-linear` (`ridge:
 4 tests) against the live sklearn 1.5.2 oracle (`Ridge(alpha=1.0, solver='svd')` coef
 `[0.8228070175, 1.3561403509]`, intercept `-0.5768421053`).
 
-The still-NOT-STARTED REQs (REQ-6, REQ-8b, REQ-13) have no green verification by construction — they are
-pinned by open blockers #384, #386, #391 and become SHIPPED only when the impl plus a non-test consumer
-plus a passing sklearn-grounded test all land.
+REQ-14 (`ridge_regression`) is verified by `cargo test -p ferrolearn-linear --test
+divergence_ridge_numeric ridge_regression -- --nocapture` and `cargo test -p ferrolearn-linear --test
+api_proof api_proof_ridge_family -- --exact`.
+
+The still-NOT-STARTED REQs (REQ-8b, REQ-13) have no green verification by construction — they are
+pinned by open blockers #386 and #391 and become SHIPPED only when the impl plus a non-test consumer plus
+a passing sklearn-grounded test all land.

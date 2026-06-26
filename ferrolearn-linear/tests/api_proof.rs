@@ -24,7 +24,8 @@ use ferrolearn_linear::{
     LassoCV, LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
     LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
     PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV,
-    RidgeClassifier, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c,
+    RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
+    TweedieRegressor, l1_min_c, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -100,6 +101,9 @@ fn api_proof_ridge_family() {
     let f = Ridge::<f64>::new().with_alpha(1.0).fit(&x, &y).unwrap();
     let _ = f.predict(&x).unwrap();
     let _ = f.score(&x, &y, None).unwrap();
+    let rr = ridge_regression(&x, &y, 1.0, RidgeRegressionOptions::default()).unwrap();
+    assert_eq!(rr.coefficients().len(), x.ncols());
+    assert!(rr.intercept().is_none());
 
     let f_cv = RidgeCV::<f64>::new()
         .with_alphas(vec![0.1, 1.0, 10.0])
