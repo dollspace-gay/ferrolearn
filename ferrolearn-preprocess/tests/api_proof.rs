@@ -16,8 +16,8 @@ use ferrolearn_preprocess::{
     OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer, RobustScaler,
     ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
     SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
-    StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, chi2, f_classif,
-    f_regression, maxabs_scale, minmax_scale, power_transform,
+    StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, add_dummy_feature, chi2,
+    f_classif, f_regression, maxabs_scale, minmax_scale, power_transform,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -89,6 +89,7 @@ fn api_proof_feature_engineering() {
         .transform(&x)
         .unwrap();
     let _ = Binarizer::<f64>::new(50.0).transform(&x).unwrap();
+    let _ = add_dummy_feature(&x, 1.0).unwrap();
     // FunctionTransformer takes an element-wise Fn(F) -> F.
     let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0)
         .transform(&x)

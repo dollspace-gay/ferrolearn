@@ -122,6 +122,7 @@ use ferrolearn_preprocess::{
     TfidfTransformer,
     ThresholdStrategy,
     VarianceThreshold,
+    add_dummy_feature,
     // feature-scoring free functions (chi2 / f_classif / f_regression in
     // feature_selection.__all__, plus ferrolearn compute_scores_* helpers)
     chi2,
@@ -130,6 +131,10 @@ use ferrolearn_preprocess::{
     f_classif,
     f_regression,
     make_column_transformer,
+    maxabs_scale,
+    minmax_scale,
+    power_transform,
+    quantile_transform,
 };
 
 /// Type-level no-op: forces `T` to be named, so removing the corresponding
@@ -152,8 +157,8 @@ fn name_type<T>() {}
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
-/// (R-CHAR-3); ABSENT names (`KernelCenterer`, the preprocessing free-function
-/// shortcuts, `GenericUnivariateSelect`, `mutual_info_*`, `r_regression`,
+/// (R-CHAR-3); ABSENT names (`KernelCenterer`,
+/// `GenericUnivariateSelect`, `mutual_info_*`, `r_regression`,
 /// `f_oneway`, `SelectorMixin`, `MissingIndicator`,
 /// `johnson_lindenstrauss_min_dim`, `make_column_selector`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`, `TfidfVectorizer`) are
@@ -188,6 +193,12 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedKBinsDiscretizer<f64>>();
     name_type::<TargetEncoder<f64>>();
     name_type::<FittedTargetEncoder<f64>>();
+    // preprocessing free functions shipped at the crate root
+    let _add_dummy_feature = add_dummy_feature::<f64>;
+    let _maxabs_scale = maxabs_scale::<f64>;
+    let _minmax_scale = minmax_scale::<f64>;
+    let _power_transform = power_transform::<f64>;
+    let _quantile_transform = quantile_transform::<f64>;
     name_type::<OneHotEncoder<f64>>();
     name_type::<FittedOneHotEncoder<f64>>();
     name_type::<OrdinalEncoder>();
