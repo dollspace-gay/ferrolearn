@@ -37,6 +37,8 @@
 //!   additive chi-squared kernel.
 //! - **[`SkewedChi2Sampler`]** — Random Fourier features for the skewed
 //!   chi-squared kernel.
+//! - **[`PolynomialCountSketch`]** — Tensor Sketch approximation of polynomial
+//!   kernel feature maps.
 //!
 //! # Design
 //!
@@ -62,6 +64,7 @@ pub mod kernels;
 pub mod local_polynomial;
 pub mod nadaraya_watson;
 pub mod nystroem;
+pub mod polynomial_count_sketch;
 pub mod rbf_sampler;
 pub mod skewed_chi2_sampler;
 pub mod weights;
@@ -91,6 +94,7 @@ pub use kernels::{
 pub use local_polynomial::{FittedLocalPolynomialRegression, LocalPolynomialRegression};
 pub use nadaraya_watson::{FittedNadarayaWatson, NadarayaWatson};
 pub use nystroem::{FittedNystroem, KernelType, Nystroem};
+pub use polynomial_count_sketch::{FittedPolynomialCountSketch, PolynomialCountSketch};
 pub use rbf_sampler::{FittedRBFSampler, RBFSampler};
 pub use skewed_chi2_sampler::{FittedSkewedChi2Sampler, SkewedChi2Sampler};
 

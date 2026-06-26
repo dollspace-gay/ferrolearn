@@ -6,6 +6,7 @@
 //! Coverage:
 //! - KernelRidge: builders + fit + predict + score, every KernelType variant
 //! - Nystroem: builders + fit + transform, every KernelType variant
+//! - PolynomialCountSketch: builders + fit + transform
 //! - RBFSampler: builders + fit + transform
 //! - AdditiveChi2Sampler: builders + fit + transform
 //! - SkewedChi2Sampler: builders + fit + transform
@@ -27,12 +28,13 @@ use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
     AdditiveChi2Sampler, BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy,
     DotProductKernel, EpanechnikovKernel, ExpSineSquared, Exponentiation,
-    FittedAdditiveChi2Sampler, FittedSkewedChi2Sampler, GaussianKernel, GaussianProcessClassifier,
-    GaussianProcessRegressor, HeteroscedasticityTest, Hyperparameter, HyperparameterBounds,
-    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
-    ProductKernel, RBFKernel, RBFSampler, RationalQuadratic, SkewedChi2Sampler, SumKernel,
-    TricubeKernel, TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test,
-    residual_diagnostics, scott_bandwidth, silverman_bandwidth,
+    FittedAdditiveChi2Sampler, FittedPolynomialCountSketch, FittedSkewedChi2Sampler,
+    GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor, HeteroscedasticityTest,
+    Hyperparameter, HyperparameterBounds, KernelRidge, KernelType, LocalPolynomialRegression,
+    MaternKernel, NadarayaWatson, Nystroem, PolynomialCountSketch, ProductKernel, RBFKernel,
+    RBFSampler, RationalQuadratic, SkewedChi2Sampler, SumKernel, TricubeKernel, TriweightKernel,
+    UniformKernel, WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
+    silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -114,6 +116,25 @@ fn api_proof_nystroem() {
         assert_eq!(embedded.nrows(), 10);
         assert_eq!(embedded.ncols(), 5);
     }
+}
+
+#[test]
+fn api_proof_polynomial_count_sketch() {
+    let (x, _) = regression_data();
+    let dummy_y = ();
+    let m = PolynomialCountSketch::<f64>::new()
+        .with_gamma(0.5)
+        .with_degree(3)
+        .with_coef0(2.0)
+        .with_n_components(8)
+        .with_random_state(42);
+    let f: FittedPolynomialCountSketch<f64> = m.fit(&x, &dummy_y).unwrap();
+    assert_eq!(f.n_features_in(), 1);
+    assert_eq!(f.degree(), 3);
+    assert_eq!(f.index_hash().dim(), (3, 2));
+    assert_eq!(f.bit_hash().dim(), (3, 2));
+    let embedded = f.transform(&x).unwrap();
+    assert_eq!(embedded.dim(), (10, 8));
 }
 
 // =============================================================================

@@ -114,6 +114,11 @@ phase = "kernel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_kernel::FittedPolynomialCountSketch"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::FittedRBFSampler"
 phase = "kernel"
 fixture = ""
@@ -205,6 +210,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_kernel::ProductKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::PolynomialCountSketch"
 phase = "kernel"
 fixture = ""
 
