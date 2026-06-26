@@ -7,22 +7,26 @@
 //! ## REQ status
 //!
 //! Mirrors `sklearn/datasets/_samples_generator.py` (v1.5.2, commit 156ef14).
-//! Design doc: `.design/datasets/generators.md` (22 REQs). Every REQ is BINARY
+//! Design doc: `.design/datasets/generators.md`. Every REQ is BINARY
 //! (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). The dominant
 //! blocker is the RNG substrate (REQ-20): ferrolearn samples from `SmallRng` +
 //! `rand_distr`, sklearn from numpy's Mersenne-Twister `RandomState`, so exact
 //! element-wise value parity for every *stochastic* generator is impossible until
 //! `ferray::random` ships (R-SUBSTRATE-5). The DETERMINISTIC (RNG-independent)
-//! divergences are oracle-pinnable now; two are fixed this iteration.
+//! divergences are oracle-pinnable now, and the shipped slices below pin the
+//! deterministic or structural contracts that do not depend on numpy RNG.
 //!
-//! **4 SHIPPED / 18 NOT-STARTED.**
+//! **8 SHIPPED scoped / 17 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
 //! | REQ-4 (`make_moons` deterministic geometry) | SHIPPED | `make_moons` now uses `theta = PI * i / (m - 1)` (`n_upper.saturating_sub(1).max(1)`), matching `np.linspace(0, pi, m)` endpoint=True (`_samples_generator.py:901-904`). Element-wise vs the live oracle (`make_moons(shuffle=False, noise=None)`) at n=10 and edge cases n=2/3/11 (odd splits, single-point `linspace(0,pi,1)==[0.0]`) within 1e-12. Tests: `divergence_moons_geometry`, `guard_moons_*` in `tests/divergence_generators*.rs`. The `shuffle` default + Gaussian-noise value parity are REQ-5 (NOT-STARTED, RNG). |
 //! | REQ-6 (`make_circles` deterministic geometry) | SHIPPED | `theta = 2*PI*i/n_outer` + inner radius `factor` match `np.linspace(0,2pi,n,endpoint=False)` (`_samples_generator.py:813-818`); element-wise vs live `make_circles(shuffle=False, noise=None, factor=0.5)` within 1e-12 (`guard_circles_geometry_oracle_parity`). `shuffle`/`factor` default + noise parity are REQ-7 (NOT-STARTED). |
 //! | REQ-18 (`make_hastie_10_2` label encoding) | SHIPPED | returns `Array1<F>` with labels `{-1.0, +1.0}` (`if s > 9.34 { F::one() } else { -F::one() }`), matching sklearn's float64 `{-1.0,+1.0}` (`_samples_generator.py:567-568`); strict `> 9.34` threshold preserved. Pinned by `divergence_hastie_label_encoding` (label set + dtype, oracle-grounded, no RNG match needed). The X *values* remain RNG-blocked (REQ-20). |
-//! | REQ-22 (production consumer) | SHIPPED | all 17 generators re-exported at the crate root (`lib.rs` `pub use generators::{...}`) — the grandfathered boundary surface (R-DEFER-1/S5). |
+//! | REQ-22 (production consumer) | SHIPPED | all 20 generators re-exported at the crate root (`lib.rs` `pub use generators::{...}`) — the grandfathered boundary surface (R-DEFER-1/S5). |
+//! | REQ-23 (`make_sparse_coded_signal` public surface + shape/structure) | SHIPPED scoped | dictionary/code/data shapes match sklearn and each code row has exactly `n_nonzero_coefs`; exact values remain RNG-blocked. |
+//! | REQ-24 (`make_biclusters` public surface + masks) | SHIPPED scoped | returns `(X, rows, cols)` with diagonal bicluster membership masks and optional shuffle/noise; exact multinomial/RNG values remain blocked. |
+//! | REQ-25 (`make_checkerboard` public surface + masks) | SHIPPED scoped | returns checkerboard block matrix plus row/column masks for row×column clusters; exact multinomial/RNG values remain blocked. |
 //! | REQ-1 (`make_classification` algo+sig) | NOT-STARTED | one-blob-per-class + `i % n_classes` vs sklearn hypercube-vertex method; missing 11 params. Blocker #1894 (+ RNG #1893). |
 //! | REQ-2 (`make_regression` sig+parity) | NOT-STARTED | missing `n_targets`/`bias`/`effective_rank`/`tail_strength`/`shuffle`/`coef`; `Uniform(-10,10)` vs `100*uniform`. Blocker #1895 (+ RNG #1893). |
 //! | REQ-3 (`make_blobs` sig+assignment) | NOT-STARTED | `i % centers` interleave vs contiguous per-center blocks; missing `center_box`/per-center-std/`shuffle`/`return_centers`. Blocker #1895 (+ RNG #1893). |
@@ -30,7 +34,7 @@
 //! | REQ-7 (`make_circles` shuffle+parity) | NOT-STARTED | no `shuffle`; `factor` required (sklearn default 0.8); noise RNG. Blocker: RNG #1893. |
 //! | REQ-8 (`make_swiss_roll` parity+hole) | NOT-STARTED | missing `hole`; value parity RNG. Blocker: RNG #1893. |
 //! | REQ-9 (`make_s_curve` parity) | NOT-STARTED | value parity RNG. Blocker: RNG #1893. |
-//! | REQ-10 (`make_sparse_uncorrelated` weights+parity) | NOT-STARTED | weights FIXED #1896: now 4 sklearn weights `[1,2,-2,-1.5]` (`_samples_generator.py:1619-1623`), pinned exact by `make_sparse_uncorrelated_weights_match_sklearn`. Remaining gap: `y~N(loc,1)` additive Gaussian noise still absent (deterministic `y_loc`). Blocker #1893 (RNG). |
+//! | REQ-10 (`make_sparse_uncorrelated` weights+parity) | SHIPPED scoped / residual open | weights FIXED #1896: now 4 sklearn weights `[1,2,-2,-1.5]` (`_samples_generator.py:1619-1623`), pinned exact by `make_sparse_uncorrelated_weights_match_sklearn`. Remaining gap: `y~N(loc,1)` additive Gaussian noise still absent (deterministic `y_loc`). Blocker #1893 (RNG). |
 //! | REQ-11 (`make_friedman1` parity) | NOT-STARTED | formula matches; value parity RNG. Blocker: RNG #1893. |
 //! | REQ-12 (`make_friedman2` parity+order) | NOT-STARTED | per-row vs whole-matrix draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
 //! | REQ-13 (`make_friedman3` 1e-6+parity) | NOT-STARTED | spurious `+1e-6` on X0; draw order; value parity RNG. Blocker #1897 (+ RNG #1893). |
@@ -58,6 +62,83 @@ fn make_rng(random_state: Option<u64>) -> SmallRng {
     match random_state {
         Some(seed) => SmallRng::seed_from_u64(seed),
         None => SmallRng::from_os_rng(),
+    }
+}
+
+fn invalid_param(name: &str, reason: impl Into<String>) -> FerroError {
+    FerroError::InvalidParameter {
+        name: name.into(),
+        reason: reason.into(),
+    }
+}
+
+fn f64_matrix_to_generic<F>(source: &Array2<f64>, name: &str) -> Result<Array2<F>, FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    let mut out = Array2::<F>::zeros(source.raw_dim());
+    for ((i, j), &value) in source.indexed_iter() {
+        out[[i, j]] = F::from(value).ok_or_else(|| {
+            invalid_param(
+                name,
+                format!("could not convert value at ({i}, {j}) to output type"),
+            )
+        })?;
+    }
+    Ok(out)
+}
+
+fn random_permutation(
+    rng: &mut SmallRng,
+    n: usize,
+    context: &str,
+) -> Result<Vec<usize>, FerroError> {
+    let u01 = Uniform::new(0.0_f64, 1.0_f64).map_err(|e| invalid_param(context, e.to_string()))?;
+    let mut order: Vec<usize> = (0..n).collect();
+    for i in (1..n).rev() {
+        let j = (u01.sample(rng) * (i + 1) as f64).floor() as usize;
+        order.swap(i, j.min(i));
+    }
+    Ok(order)
+}
+
+fn balanced_labels(n_items: usize, n_clusters: usize) -> Vec<usize> {
+    let base = n_items / n_clusters;
+    let remainder = n_items % n_clusters;
+    let mut labels = Vec::with_capacity(n_items);
+    for cluster in 0..n_clusters {
+        let size = base + usize::from(cluster < remainder);
+        labels.extend(std::iter::repeat_n(cluster, size));
+    }
+    labels
+}
+
+fn membership_matrix(labels: &[usize], n_clusters: usize) -> Array2<bool> {
+    let mut out = Array2::from_elem((n_clusters, labels.len()), false);
+    for (idx, &label) in labels.iter().enumerate() {
+        out[[label, idx]] = true;
+    }
+    out
+}
+
+fn sample_uniform(
+    rng: &mut SmallRng,
+    low: f64,
+    high: f64,
+    context: &str,
+) -> Result<f64, FerroError> {
+    if !low.is_finite() || !high.is_finite() || low > high {
+        return Err(invalid_param(
+            context,
+            format!("expected finite low <= high, got low={low}, high={high}"),
+        ));
+    }
+    if low == high {
+        Ok(low)
+    } else {
+        Uniform::new(low, high)
+            .map_err(|e| invalid_param(context, e.to_string()))
+            .map(|dist| dist.sample(rng))
     }
 }
 
@@ -951,7 +1032,7 @@ where
             .map(|_| feature_dist.sample(&mut rng))
             .collect();
 
-        // Target = sum of (weight_i * feature_i) for the first 5 features.
+        // Target = sum of (weight_i * feature_i) for the first 4 features.
         let target: f64 = weights.iter().enumerate().map(|(i, &w)| w * row[i]).sum();
 
         for &v in &row {
@@ -968,6 +1049,281 @@ where
     let y = Array1::from_vec(y_data);
 
     Ok((x, y))
+}
+
+// ---------------------------------------------------------------------------
+// Sparse coded signal
+// ---------------------------------------------------------------------------
+
+/// Generate a signal as a sparse combination of dictionary elements.
+///
+/// This is a dense Rust analogue of sklearn's
+/// `datasets.make_sparse_coded_signal`: it returns `(data, dictionary, code)`
+/// with shapes `(n_samples, n_features)`, `(n_components, n_features)`, and
+/// `(n_samples, n_components)`. Each row of `code` has exactly
+/// `n_nonzero_coefs` non-zero entries and `data = code.dot(dictionary)`.
+///
+/// Exact element-wise value parity remains RNG-blocked because ferrolearn uses
+/// `SmallRng`/`rand_distr` rather than numpy's `RandomState`.
+#[allow(
+    clippy::type_complexity,
+    reason = "sklearn returns a three-array tuple (data, dictionary, code)"
+)]
+pub fn make_sparse_coded_signal<F>(
+    n_samples: usize,
+    n_components: usize,
+    n_features: usize,
+    n_nonzero_coefs: usize,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array2<F>, Array2<F>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    if n_samples == 0 {
+        return Err(invalid_param("n_samples", "must be at least 1"));
+    }
+    if n_components == 0 {
+        return Err(invalid_param("n_components", "must be at least 1"));
+    }
+    if n_features == 0 {
+        return Err(invalid_param("n_features", "must be at least 1"));
+    }
+    if n_nonzero_coefs > n_components {
+        return Err(invalid_param(
+            "n_nonzero_coefs",
+            format!("must be <= n_components ({n_components}), got {n_nonzero_coefs}"),
+        ));
+    }
+
+    let mut rng = make_rng(random_state);
+    let normal = Normal::new(0.0_f64, 1.0_f64)
+        .map_err(|e| invalid_param("normal_distribution", e.to_string()))?;
+
+    let mut dictionary = Array2::<f64>::zeros((n_components, n_features));
+    for component in 0..n_components {
+        let mut norm_sq = 0.0_f64;
+        for feature in 0..n_features {
+            let value = normal.sample(&mut rng);
+            dictionary[[component, feature]] = value;
+            norm_sq += value * value;
+        }
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            for feature in 0..n_features {
+                dictionary[[component, feature]] /= norm;
+            }
+        }
+    }
+
+    let mut code = Array2::<f64>::zeros((n_samples, n_components));
+    for sample in 0..n_samples {
+        let active = random_permutation(&mut rng, n_components, "n_nonzero_coefs")?;
+        for &component in active.iter().take(n_nonzero_coefs) {
+            code[[sample, component]] = normal.sample(&mut rng);
+        }
+    }
+
+    let data = code.dot(&dictionary);
+    Ok((
+        f64_matrix_to_generic(&data, "data")?,
+        f64_matrix_to_generic(&dictionary, "dictionary")?,
+        f64_matrix_to_generic(&code, "code")?,
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Bicluster and checkerboard generators
+// ---------------------------------------------------------------------------
+
+/// Generate a constant block diagonal structure array for biclustering.
+///
+/// Returns `(X, rows, cols)`, where `rows` has shape `(n_clusters, n_rows)` and
+/// `cols` has shape `(n_clusters, n_cols)`. `rows[[k, i]]` and `cols[[k, j]]`
+/// mark membership in the `k`-th diagonal bicluster. With `noise == 0` and
+/// `shuffle == false`, cells outside diagonal biclusters are zero and every
+/// diagonal block is constant.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "sklearn's generator exposes shape, noise, value range, shuffle, and RNG controls"
+)]
+pub fn make_biclusters<F>(
+    n_rows: usize,
+    n_cols: usize,
+    n_clusters: usize,
+    noise: f64,
+    minval: f64,
+    maxval: f64,
+    shuffle: bool,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array2<bool>, Array2<bool>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    if n_rows == 0 {
+        return Err(invalid_param("n_rows", "must be at least 1"));
+    }
+    if n_cols == 0 {
+        return Err(invalid_param("n_cols", "must be at least 1"));
+    }
+    if n_clusters == 0 {
+        return Err(invalid_param("n_clusters", "must be at least 1"));
+    }
+    if noise < 0.0 || !noise.is_finite() {
+        return Err(invalid_param("noise", "must be finite and non-negative"));
+    }
+
+    let mut rng = make_rng(random_state);
+    let mut row_labels = balanced_labels(n_rows, n_clusters);
+    let mut col_labels = balanced_labels(n_cols, n_clusters);
+    let constants: Vec<f64> = (0..n_clusters)
+        .map(|_| sample_uniform(&mut rng, minval, maxval, "bicluster_value"))
+        .collect::<Result<_, _>>()?;
+
+    let mut result = Array2::<f64>::zeros((n_rows, n_cols));
+    for i in 0..n_rows {
+        for j in 0..n_cols {
+            if row_labels[i] == col_labels[j] {
+                result[[i, j]] = constants[row_labels[i]];
+            }
+        }
+    }
+
+    if noise > 0.0 {
+        let normal = Normal::new(0.0_f64, noise)
+            .map_err(|e| invalid_param("noise_distribution", e.to_string()))?;
+        for value in &mut result {
+            *value += normal.sample(&mut rng);
+        }
+    }
+
+    if shuffle {
+        let row_perm = random_permutation(&mut rng, n_rows, "row_shuffle")?;
+        let col_perm = random_permutation(&mut rng, n_cols, "col_shuffle")?;
+        let mut shuffled = Array2::<f64>::zeros((n_rows, n_cols));
+        let mut shuffled_rows = Vec::with_capacity(n_rows);
+        let mut shuffled_cols = Vec::with_capacity(n_cols);
+        for (new_i, &old_i) in row_perm.iter().enumerate() {
+            shuffled_rows.push(row_labels[old_i]);
+            for (new_j, &old_j) in col_perm.iter().enumerate() {
+                shuffled[[new_i, new_j]] = result[[old_i, old_j]];
+            }
+        }
+        for &old_j in &col_perm {
+            shuffled_cols.push(col_labels[old_j]);
+        }
+        result = shuffled;
+        row_labels = shuffled_rows;
+        col_labels = shuffled_cols;
+    }
+
+    let rows = membership_matrix(&row_labels, n_clusters);
+    let cols = membership_matrix(&col_labels, n_clusters);
+    Ok((f64_matrix_to_generic(&result, "biclusters")?, rows, cols))
+}
+
+/// Generate an array with block checkerboard structure for biclustering.
+///
+/// Returns `(X, rows, cols)` where the first dimension of `rows` and `cols`
+/// enumerates every row-cluster/column-cluster pair in row-major order, matching
+/// sklearn's checkerboard mask contract.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::type_complexity,
+    reason = "sklearn's generator exposes row/column clusters, noise, value range, shuffle, and RNG controls"
+)]
+pub fn make_checkerboard<F>(
+    n_rows: usize,
+    n_cols: usize,
+    n_row_clusters: usize,
+    n_col_clusters: usize,
+    noise: f64,
+    minval: f64,
+    maxval: f64,
+    shuffle: bool,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array2<bool>, Array2<bool>), FerroError>
+where
+    F: Float + Send + Sync + 'static,
+{
+    if n_rows == 0 {
+        return Err(invalid_param("n_rows", "must be at least 1"));
+    }
+    if n_cols == 0 {
+        return Err(invalid_param("n_cols", "must be at least 1"));
+    }
+    if n_row_clusters == 0 {
+        return Err(invalid_param("n_row_clusters", "must be at least 1"));
+    }
+    if n_col_clusters == 0 {
+        return Err(invalid_param("n_col_clusters", "must be at least 1"));
+    }
+    if noise < 0.0 || !noise.is_finite() {
+        return Err(invalid_param("noise", "must be finite and non-negative"));
+    }
+
+    let mut rng = make_rng(random_state);
+    let mut row_labels = balanced_labels(n_rows, n_row_clusters);
+    let mut col_labels = balanced_labels(n_cols, n_col_clusters);
+    let mut constants = Array2::<f64>::zeros((n_row_clusters, n_col_clusters));
+    for row_cluster in 0..n_row_clusters {
+        for col_cluster in 0..n_col_clusters {
+            constants[[row_cluster, col_cluster]] =
+                sample_uniform(&mut rng, minval, maxval, "checkerboard_value")?;
+        }
+    }
+
+    let mut result = Array2::<f64>::zeros((n_rows, n_cols));
+    for i in 0..n_rows {
+        for j in 0..n_cols {
+            result[[i, j]] = constants[[row_labels[i], col_labels[j]]];
+        }
+    }
+
+    if noise > 0.0 {
+        let normal = Normal::new(0.0_f64, noise)
+            .map_err(|e| invalid_param("noise_distribution", e.to_string()))?;
+        for value in &mut result {
+            *value += normal.sample(&mut rng);
+        }
+    }
+
+    if shuffle {
+        let row_perm = random_permutation(&mut rng, n_rows, "row_shuffle")?;
+        let col_perm = random_permutation(&mut rng, n_cols, "col_shuffle")?;
+        let mut shuffled = Array2::<f64>::zeros((n_rows, n_cols));
+        let mut shuffled_rows = Vec::with_capacity(n_rows);
+        let mut shuffled_cols = Vec::with_capacity(n_cols);
+        for (new_i, &old_i) in row_perm.iter().enumerate() {
+            shuffled_rows.push(row_labels[old_i]);
+            for (new_j, &old_j) in col_perm.iter().enumerate() {
+                shuffled[[new_i, new_j]] = result[[old_i, old_j]];
+            }
+        }
+        for &old_j in &col_perm {
+            shuffled_cols.push(col_labels[old_j]);
+        }
+        result = shuffled;
+        row_labels = shuffled_rows;
+        col_labels = shuffled_cols;
+    }
+
+    let n_blocks = n_row_clusters * n_col_clusters;
+    let mut rows = Array2::from_elem((n_blocks, n_rows), false);
+    let mut cols = Array2::from_elem((n_blocks, n_cols), false);
+    for row_cluster in 0..n_row_clusters {
+        for col_cluster in 0..n_col_clusters {
+            let block = row_cluster * n_col_clusters + col_cluster;
+            for (i, &label) in row_labels.iter().enumerate() {
+                rows[[block, i]] = label == row_cluster;
+            }
+            for (j, &label) in col_labels.iter().enumerate() {
+                cols[[block, j]] = label == col_cluster;
+            }
+        }
+    }
+
+    Ok((f64_matrix_to_generic(&result, "checkerboard")?, rows, cols))
 }
 
 // ---------------------------------------------------------------------------

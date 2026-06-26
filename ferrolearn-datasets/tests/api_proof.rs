@@ -8,10 +8,11 @@
 
 use ferrolearn_datasets::{
     load_breast_cancer, load_diabetes, load_digits, load_iris, load_linnerud, load_olivetti_faces,
-    load_wine, make_blobs, make_circles, make_classification, make_friedman1, make_friedman2,
-    make_friedman3, make_gaussian_quantiles, make_hastie_10_2, make_low_rank_matrix, make_moons,
-    make_multilabel_classification, make_regression, make_s_curve, make_sparse_spd_matrix,
-    make_sparse_uncorrelated, make_spd_matrix, make_swiss_roll,
+    load_wine, make_biclusters, make_blobs, make_checkerboard, make_circles, make_classification,
+    make_friedman1, make_friedman2, make_friedman3, make_gaussian_quantiles, make_hastie_10_2,
+    make_low_rank_matrix, make_moons, make_multilabel_classification, make_regression,
+    make_s_curve, make_sparse_coded_signal, make_sparse_spd_matrix, make_sparse_uncorrelated,
+    make_spd_matrix, make_swiss_roll,
 };
 
 #[test]
@@ -119,4 +120,24 @@ fn api_proof_classification_extras() {
     let (x, y) = make_multilabel_classification::<f64>(30, 5, 4, 2, Some(7)).unwrap();
     assert_eq!((x.nrows(), x.ncols()), (30, 5));
     assert_eq!((y.nrows(), y.ncols()), (30, 4));
+}
+
+#[test]
+fn api_proof_bicluster_and_sparse_code_generators() {
+    let (data, dictionary, code) = make_sparse_coded_signal::<f64>(12, 6, 4, 2, Some(7)).unwrap();
+    assert_eq!((data.nrows(), data.ncols()), (12, 4));
+    assert_eq!((dictionary.nrows(), dictionary.ncols()), (6, 4));
+    assert_eq!((code.nrows(), code.ncols()), (12, 6));
+
+    let (x, rows, cols) =
+        make_biclusters::<f64>(10, 8, 2, 0.0, 10.0, 20.0, false, Some(7)).unwrap();
+    assert_eq!((x.nrows(), x.ncols()), (10, 8));
+    assert_eq!((rows.nrows(), rows.ncols()), (2, 10));
+    assert_eq!((cols.nrows(), cols.ncols()), (2, 8));
+
+    let (x, rows, cols) =
+        make_checkerboard::<f64>(9, 8, 3, 2, 0.0, 10.0, 20.0, false, Some(7)).unwrap();
+    assert_eq!((x.nrows(), x.ncols()), (9, 8));
+    assert_eq!((rows.nrows(), rows.ncols()), (6, 9));
+    assert_eq!((cols.nrows(), cols.ncols()), (6, 8));
 }

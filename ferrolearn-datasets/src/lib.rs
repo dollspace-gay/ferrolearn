@@ -10,7 +10,8 @@
 //!   [`load_digits`], [`load_linnerud`], [`load_olivetti_faces`].
 //! - **[`generators`]** — synthetic dataset generators:
 //!   [`make_classification`], [`make_regression`], [`make_blobs`],
-//!   [`make_moons`], [`make_circles`], [`make_swiss_roll`], [`make_s_curve`].
+//!   [`make_moons`], [`make_circles`], [`make_swiss_roll`], [`make_s_curve`],
+//!   [`make_sparse_coded_signal`], [`make_biclusters`], [`make_checkerboard`].
 //!
 //! All functions are generic over `F: num_traits::Float` and return
 //! `Result<T, ferrolearn_core::FerroError>`.
@@ -32,8 +33,9 @@ pub use toy::{
 
 // Re-export synthetic generators at the crate root.
 pub use generators::{
-    make_blobs, make_circles, make_classification, make_friedman1, make_friedman2, make_friedman3,
-    make_gaussian_quantiles, make_hastie_10_2, make_low_rank_matrix, make_moons,
-    make_multilabel_classification, make_regression, make_s_curve, make_sparse_spd_matrix,
-    make_sparse_uncorrelated, make_spd_matrix, make_swiss_roll,
+    make_biclusters, make_blobs, make_checkerboard, make_circles, make_classification,
+    make_friedman1, make_friedman2, make_friedman3, make_gaussian_quantiles, make_hastie_10_2,
+    make_low_rank_matrix, make_moons, make_multilabel_classification, make_regression,
+    make_s_curve, make_sparse_coded_signal, make_sparse_spd_matrix, make_sparse_uncorrelated,
+    make_spd_matrix, make_swiss_roll,
 };

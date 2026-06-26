@@ -15,8 +15,9 @@ generators in `sklearn/datasets/_samples_generator.py`: `make_classification`,
 `make_regression`, `make_blobs`, `make_moons`, `make_circles`, `make_swiss_roll`,
 `make_s_curve`, `make_sparse_uncorrelated`, `make_friedman1/2/3`,
 `make_low_rank_matrix`, `make_spd_matrix`, `make_sparse_spd_matrix`,
-`make_gaussian_quantiles`, `make_hastie_10_2`, `make_multilabel_classification`
-(17 public functions, all re-exported at the crate root in
+`make_gaussian_quantiles`, `make_hastie_10_2`, `make_multilabel_classification`,
+`make_sparse_coded_signal`, `make_biclusters`, and `make_checkerboard`
+(20 public functions, all re-exported at the crate root in
 `ferrolearn-datasets/src/lib.rs`).
 
 This is a **value-parity** contract over the **existing** code. The module is
@@ -52,13 +53,12 @@ one of five classes, and most diverge in several at once:
    return values diverges from sklearn's output contract (R-DEV-3). Several of
    these are oracle-pinnable without an RNG match.
 
-`make_sparse_coded_signal`, `make_biclusters`, `make_checkerboard` exist in
-`_samples_generator.py` (`:1473`, `:2110`, `:2232`) but have **no ferrolearn
-analog** in `generators.rs`; they are out of scope for this unit (missing-
-estimator work, builder territory) and not given REQs here.
-
-No `.rs` edits are proposed here. Every gap is recorded as a NOT-STARTED REQ with
-a concrete prerequisite; the acto-critic files the `#NNN` blocker issues.
+`make_sparse_coded_signal`, `make_biclusters`, and `make_checkerboard` are now
+present as scoped dense Rust analogues. They close the exact public-name gap and
+pin sklearn's structural contracts (shapes, masks, sparse-code cardinality,
+dictionary normalization, block constancy), but they do not claim element-wise
+stochastic parity because they still use `SmallRng` rather than numpy
+`RandomState`.
 
 ## Upstream cites (read-only, tag 1.5.2, commit 156ef14)
 
@@ -92,6 +92,10 @@ a concrete prerequisite; the acto-critic files the `#NNN` blocker issues.
   default 0.5, `effective_rank` default 10).
 - `make_sparse_uncorrelated` `:1568-1625` (`y ~ N(X0 + 2·X1 − 2·X2 − 1.5·X3, 1)`
   `:1619-1623` — 4 informative weights `[1, 2, −2, −1.5]`, NOT 5).
+- `make_sparse_coded_signal` `:1537-1565` (returns `(Y, D, X)` transposed to
+  `(n_samples, n_features)`, `(n_components, n_features)`,
+  `(n_samples, n_components)`; dictionary columns normalized before transpose;
+  exactly `n_nonzero_coefs` active code entries per sample).
 - `make_spd_matrix` `:1635-1672` (signature `make_spd_matrix(n_dim, *,
   random_state)`; `A=uniform`, SVD of `AᵀA`, `U·(1+diag(uniform))·Vᵀ`
   `:1666-1670`).
@@ -105,6 +109,10 @@ a concrete prerequisite; the acto-critic files the `#NNN` blocker issues.
 - `make_gaussian_quantiles` `:1980-2086` (keyword-only `mean`/`cov`,
   `multivariate_normal` `:2067`, argsort by squared distance + **X reordered**
   `:2070-2071`, contiguous quantile labels `:2074-2081`, `shuffle` `:2083-2084`).
+- `make_biclusters` `:2141-2254` (constant diagonal bicluster blocks,
+  `(X, rows, cols)` masks, optional noise/shuffle).
+- `make_checkerboard` `:2263-2418` (row/column cluster-pair blocks, rows/cols
+  masks stacked in row-major block order, optional noise/shuffle).
 
 ## Requirements
 
@@ -138,8 +146,7 @@ output-contract) that is independently checkable.
 - REQ-9 (make_s_curve value parity): match `t = 3π(uniform−0.5)`, `X1 =
   2·uniform`, and noise value parity.
 - REQ-10 (make_sparse_uncorrelated weights + value parity): match the **4**
-  informative weights `[1, 2, −2, −1.5]` and the `y ~ N(·, 1)` noise draw (NOT 5
-  fixed weights `[1,2,3,4,5]`).
+  informative weights `[1, 2, −2, −1.5]` and the `y ~ N(·, 1)` noise draw.
 - REQ-11 (make_friedman1 value parity): formula matches; element-wise parity is
   RNG-blocked.
 - REQ-12 (make_friedman2 value parity + RNG order): formula matches but X is
@@ -172,6 +179,18 @@ output-contract) that is independently checkable.
 - REQ-21 (ferray array substrate): array types are `ferray-core`, not `ndarray`.
 - REQ-22 (production consumer): each public generator has a non-test consumer
   (the `lib.rs` re-export is the boundary surface).
+- REQ-23 (make_sparse_coded_signal public surface + structure): expose
+  `make_sparse_coded_signal` and match sklearn's output shapes, row-wise
+  code sparsity, dictionary normalization, and `data = code @ dictionary`.
+  Element-wise values remain RNG-blocked.
+- REQ-24 (make_biclusters public surface + masks): expose `make_biclusters`
+  and match sklearn's `(X, rows, cols)` shape and diagonal block membership
+  contract for dense arrays. Exact multinomial sizing/shuffle/value streams
+  remain RNG-blocked and Rust-signature divergent.
+- REQ-25 (make_checkerboard public surface + masks): expose
+  `make_checkerboard` and match sklearn's row/column cluster-pair mask
+  contract for dense arrays. Exact multinomial sizing/shuffle/value streams
+  remain RNG-blocked and Rust-signature divergent.
 
 ## Acceptance criteria
 
@@ -197,9 +216,9 @@ output-contract) that is independently checkable.
   exactly (endpoint=False matches). The geometry slice of REQ-6 PASSES; the
   `shuffle`/value slice (REQ-7) does not.
 - AC-6 (REQ-10, deterministic structure): live `make_sparse_uncorrelated` uses 4
-  weights `[1,2,−2,−1.5]`; ferrolearn uses 5 weights `[1,2,3,4,5]` and a
-  noise-free `y` (no `N(·,1)` draw). The weight set + noise model diverge
-  independently of the RNG. FAILS.
+  weights `[1,2,−2,−1.5]`; ferrolearn now matches that fixed weight set but
+  still emits noise-free `y_loc` rather than `y ~ N(y_loc, 1)`. The residual
+  target-noise value parity is RNG-blocked.
 - AC-7 (REQ-13, deterministic): `min(X[:,0])` for ferrolearn `make_friedman3` is
   `≥ 1e-6` (the spurious offset); sklearn's X0 is `uniform(0,100)` with no
   offset. Oracle-pinnable on the X0 lower bound at fixed seed structure.
@@ -219,10 +238,12 @@ output-contract) that is independently checkable.
 
 ## REQ status
 
-Headline: of the 22 REQs, **4 are SHIPPED** (REQ-4 make_moons geometry and
-REQ-18 make_hastie label encoding, both FIXED in the #1890 iteration; REQ-6
-make_circles geometry slice; REQ-22 production-consumer for the grandfathered
-boundary re-exports) and **18 are NOT-STARTED**. The dominant blocker is the RNG substrate (REQ-20): it gates every
+Headline: of the 25 REQs, **8 are SHIPPED scoped** (REQ-4 make_moons geometry
+and REQ-18 make_hastie label encoding, both FIXED in the #1890 iteration;
+REQ-6 make_circles geometry slice; REQ-10 make_sparse_uncorrelated's fixed
+weight slice; REQ-22 production-consumer for the
+grandfathered boundary re-exports; REQ-23/24/25 for the three newly surfaced
+dataset helpers) and **17 are NOT-STARTED**. The dominant blocker is the RNG substrate (REQ-20): it gates every
 value-parity REQ. Independently of the RNG, the wrong-signature / wrong-algorithm
 / output-contract divergences (REQ-1/2/3/10/14/15/16/17/18/19) would *still* be
 NOT-STARTED even with a numpy-compatible RNG. The deterministic-geometry REQs
@@ -241,7 +262,7 @@ critic without any RNG match.
 | REQ-7 (make_circles shuffle+parity) | NOT-STARTED | `pub fn make_circles in generators.rs` never shuffles and `factor` is a required argument with no default; sklearn defaults `factor=0.8`, `shuffle=True` (`_samples_generator.py:748-749`, `:826-827`) and noise is a `generator.normal` draw (`:829-830`). Value parity + default RNG-blocked. Blocker: REQ-20 + `shuffle`/`factor` defaults. Blocker issue to be filed by critic. |
 | REQ-8 (make_swiss_roll parity+hole) | NOT-STARTED | `pub fn make_swiss_roll in generators.rs` draws `t ~ Uniform(1.5π, 4.5π)` and `height ~ Uniform(0,21)` per-row via `rand_distr`; sklearn computes `t = 1.5π·(1 + 2·uniform)` (mathematically the same support but a different RNG draw) and `y = 21·uniform`, then `x=t·cos t`, `z=t·sin t` (`_samples_generator.py:1889-1901`) and adds noise as a `(3, n)` block. Lacks the `hole` parameter (`:1837`, `:1891-1898`). Value parity RNG-blocked; `hole` is a missing feature. Blocker: REQ-20 + `hole`. Blocker issue to be filed by critic. |
 | REQ-9 (make_s_curve parity) | NOT-STARTED | `pub fn make_s_curve in generators.rs` draws `t ~ Uniform(−1.5π, 1.5π)`, `height ~ Uniform(0,2)`; sklearn uses `t = 3π·(uniform − 0.5)`, `X1 = 2·uniform`, `z = sign(t)·(cos t − 1)` (`_samples_generator.py:1957-1961`). The formula for X matches but the per-row RNG draw order/values differ. Value parity RNG-blocked. Blocker: REQ-20. Blocker issue to be filed by critic. |
-| REQ-10 (make_sparse_uncorrelated weights+parity) | NOT-STARTED | `pub fn make_sparse_uncorrelated in generators.rs` uses **5** fixed weights `let weights = [1.0, 2.0, 3.0, 4.0, 5.0];` and a noise-free `y = Σ wᵢ·Xᵢ`; sklearn uses **4** weights `[1, 2, −2, −1.5]` and `y ~ N(X0 + 2·X1 − 2·X2 − 1.5·X3, 1)` (`_samples_generator.py:1619-1623`). Wrong weight set + missing target noise — both deterministic-structural divergences (oracle-pinnable on the weight pattern, AC-6) plus RNG for the noise draw. Blocker: correct weights `[1,2,−2,−1.5]` + the `N(·,1)` target draw + REQ-20. Blocker issue to be filed by critic. |
+| REQ-10 (make_sparse_uncorrelated weights+parity) | SHIPPED scoped / residual open | `pub fn make_sparse_uncorrelated in generators.rs` now uses sklearn's fixed weights `[1, 2, -2, -1.5]` for `y_loc = X0 + 2·X1 − 2·X2 − 1.5·X3` (`_samples_generator.py:1619-1623`), pinned by `make_sparse_uncorrelated_weights_match_sklearn`. Residual open: sklearn adds `generator.normal(loc=y_loc, scale=1.0)`, while ferrolearn emits noise-free `y_loc`; exact target values remain RNG-blocked on REQ-20. |
 | REQ-11 (make_friedman1 parity) | NOT-STARTED | `pub fn make_friedman1 in generators.rs` formula matches sklearn (`10·sin(π·x0·x1) + 20·(x2−0.5)² + 10·x3 + 5·x4 + noise`, `_samples_generator.py:1178-1184`), but X is drawn per-row from `rand_distr::Uniform` and noise from `rand_distr::Normal` — different bit-stream from numpy. Value parity RNG-blocked. Blocker: REQ-20. Blocker issue to be filed by critic. |
 | REQ-12 (make_friedman2 parity+RNG order) | NOT-STARTED | `pub fn make_friedman2 in generators.rs` draws each row's 4 uniforms then scales (`r0 = u01.sample()*100.0; r1 = 40π + u01.sample()*(560−40)π; …`); sklearn draws the **whole** `(n,4)` uniform matrix first, then column-scales (`X = generator.uniform(size=(n,4)); X[:,0]*=100; …`, `_samples_generator.py:1259-1264`). Both the RNG substrate and the draw *order* diverge. Value parity RNG-blocked + ordering. Blocker: REQ-20 + whole-matrix draw order. Blocker issue to be filed by critic. |
 | REQ-13 (make_friedman3 1e-6 + parity) | NOT-STARTED | `pub fn make_friedman3 in generators.rs` adds a spurious offset `let r0 = u01.sample(&mut rng) * 100.0 + 1e-6;` to X0 that sklearn does NOT (`X[:, 0] *= 100`, `_samples_generator.py:1344`). DETERMINISTIC divergence in the X0 column (oracle-pinnable: ferrolearn `min(X[:,0]) ≥ 1e-6`, AC-7), plus the same per-row vs whole-matrix RNG-order issue as REQ-12. Blocker: remove the `+1e-6` + REQ-20 + draw order. Blocker issue to be filed by critic. |
@@ -253,11 +274,14 @@ critic without any RNG match.
 | REQ-19 (make_multilabel_classification algo+return) | NOT-STARTED | `pub fn make_multilabel_classification in generators.rs` picks `n_labels.clamp(1, n_classes)` distinct random classes per sample and fabricates X as `uniform − 0.5 + Σ(c+1)·0.1` — NOT sklearn's Poisson/Multinomial word-generation process (`_samples_generator.py:451-496`). Returns `(X, Array2<usize>)` only; lacks `length`/`allow_unlabeled`/`sparse`/`return_indicator`/`return_distributions` and the `p_c`/`p_w_c` returns (`:340-352`, `:498-503`). Wrong-algorithm + return-contract + signature. Blocker: full Poisson/Multinomial rewrite + CSR/indicator returns + 5 missing params + REQ-20. Blocker issue to be filed by critic. |
 | REQ-20 (RNG substrate) | NOT-STARTED | `generators.rs` imports `use rand::rngs::SmallRng;` and `use rand_distr::{Distribution, Normal, Uniform};`; `fn make_rng` returns a `SmallRng`. R-SUBSTRATE-1 requires `ferray::random` (the numpy `RandomState` analog). Without it, no stochastic generator can value-match the live oracle (Mersenne-Twister bit-stream). This is the shared prerequisite for REQ-2/5/7/8/9/11/12/13/14/15/16/17/18(X)/19 value parity. Per R-SUBSTRATE-5 the fix belongs in ferray; until it ships, every value-parity REQ is NOT-STARTED on it. Blocker issue to be filed by critic. |
 | REQ-21 (ferray array substrate) | NOT-STARTED | `generators.rs` uses `use ndarray::{Array1, Array2};` and returns `ndarray::Array2<F>`/`Array1<F>`/`Array1<usize>`. R-SUBSTRATE-1 requires `ferray-core` array types. Blocker: migrate the array types to the ferray analog (bridge via `into_ndarray()` during transition). Blocker issue to be filed by critic. |
-| REQ-22 (production consumer) | SHIPPED (boundary re-export) | All 17 generators are re-exported at the crate root: `ferrolearn-datasets/src/lib.rs` `pub use generators::{ make_blobs, make_circles, make_classification, make_friedman1, make_friedman2, make_friedman3, make_gaussian_quantiles, make_hastie_10_2, make_low_rank_matrix, make_moons, make_multilabel_classification, make_regression, make_s_curve, make_sparse_spd_matrix, make_sparse_uncorrelated, make_spd_matrix, make_swiss_roll };`. These are existing grandfathered boundary pub APIs (R-DEFER-1/S5: consumers are external users + the future `ferrolearn-python` `datasets` binding). Verification: `grep -rn "make_classification\|make_blobs\|make_moons" ferrolearn-* --include=*.rs | grep -v '#\[cfg(test\|/tests/'` → only the `lib.rs` re-exports; no in-workspace non-test caller located. Underclaim: this is the boundary-grandfather clause only — no internal production consumer exists today (the `ferrolearn-python` datasets binding is not yet present). |
+| REQ-22 (production consumer) | SHIPPED (boundary re-export) | All 20 generators are re-exported at the crate root: `ferrolearn-datasets/src/lib.rs` `pub use generators::{ make_biclusters, make_blobs, make_checkerboard, make_circles, make_classification, make_friedman1, make_friedman2, make_friedman3, make_gaussian_quantiles, make_hastie_10_2, make_low_rank_matrix, make_moons, make_multilabel_classification, make_regression, make_s_curve, make_sparse_coded_signal, make_sparse_spd_matrix, make_sparse_uncorrelated, make_spd_matrix, make_swiss_roll };`. These are existing grandfathered boundary pub APIs (R-DEFER-1/S5: consumers are external users + the future `ferrolearn-python` `datasets` binding). Verification: `cargo test -p ferrolearn-datasets --test api_proof` names the crate-root exports directly. Underclaim: this is the boundary-grandfather clause only — no internal production consumer exists today (the `ferrolearn-python` datasets binding is not yet present). |
+| REQ-23 (`make_sparse_coded_signal` public surface + structure) | SHIPPED scoped / residual open | `pub fn make_sparse_coded_signal` returns `(data, dictionary, code)` with sklearn-shaped dense arrays and guarantees each code row has exactly `n_nonzero_coefs` active components, dictionary rows are L2-normalized, and `data == code.dot(dictionary)`. Verification: `cargo test -p ferrolearn-datasets --test divergence_bicluster_generators`. Residual open: sklearn's numpy `RandomState` values, exact parameter validation messages, and sparse/object/Python protocol compatibility. |
+| REQ-24 (`make_biclusters` public surface + masks) | SHIPPED scoped / residual open | `pub fn make_biclusters` returns dense `(X, rows, cols)` with `(n_clusters,n_rows)` and `(n_clusters,n_cols)` boolean masks. With `noise=0` and `shuffle=false`, diagonal bicluster cells are constant and off-diagonal cells are zero. Verification: `cargo test -p ferrolearn-datasets --test divergence_bicluster_generators`. Residual open: sklearn's multinomial row/column sizes, numpy shuffle/value RNG, tuple-shaped `shape`/Python signature, exact validation ABI. |
+| REQ-25 (`make_checkerboard` public surface + masks) | SHIPPED scoped / residual open | `pub fn make_checkerboard` returns dense `(X, rows, cols)` with one mask row per row-cluster/column-cluster pair, matching sklearn's row-major block-mask contract. With `noise=0`, each block is internally constant. Verification: `cargo test -p ferrolearn-datasets --test divergence_bicluster_generators`. Residual open: sklearn's multinomial row/column sizes, numpy shuffle/value RNG, `n_clusters` int-or-pair signature, exact validation ABI. |
 
 ## Architecture
 
-`generators.rs` is a single file of 17 free functions plus `fn make_rng` (the
+`generators.rs` is a single file of 20 free functions plus `fn make_rng` (the
 RNG factory). There is no fitted/unfitted estimator split — these are pure data-
 generating functions, mirroring sklearn's `@validate_params`-decorated
 module-level `make_*` functions. The crate-root re-exports in
@@ -289,18 +313,24 @@ Divergence map (function → divergence classes):
 - **Output-contract**: `make_hastie_10_2` (`{0,1}` `usize` vs `{−1,+1}` float),
   `make_gaussian_quantiles` (X not reordered; rank-labelled in place vs argsort-
   reordered with contiguous blocks).
-- **Deterministic-structure + value(RNG)**: `make_sparse_uncorrelated` (5 weights
-  `[1,2,3,4,5]` vs 4 weights `[1,2,−2,−1.5]`; no target noise).
+- **Deterministic-structure + value(RNG)**: `make_sparse_uncorrelated` now
+  matches sklearn's four fixed weights `[1,2,−2,−1.5]`; the residual gap is the
+  target-noise draw `y ~ N(y_loc, 1)`.
 - **Geometry-correct, value(RNG)-only**: `make_circles` (outer/inner geometry
   matches at `noise=None`; only `shuffle`/`factor` default + noise diverge),
   `make_friedman1`/`make_friedman2` (formula matches; RNG bit-stream + (friedman2)
   draw order diverge), `make_swiss_roll`/`make_s_curve` (manifold formula matches;
   RNG draw + (swiss_roll) `hole` diverge).
+- **Scoped structural analogues + value(RNG)**: `make_sparse_coded_signal`,
+  `make_biclusters`, and `make_checkerboard` now expose sklearn-named public
+  functions and dense shape/mask/code invariants, but not sklearn's exact
+  numpy-RNG values or full Python signatures.
 
 Invariant the existing code DOES honor across all generators: shape correctness
 (every `X` has the documented `(n_samples, n_features)` / `(·, 3)` / `(·, 2)`
-shape) and seed-reproducibility within ferrolearn (same `random_state` → same
-output, pinned by the in-crate `*_reproducible` tests). Shape + self-
+shape), seed-reproducibility within ferrolearn (same `random_state` → same
+output, pinned by the in-crate `*_reproducible` tests), and scoped structural
+contracts for the three newly surfaced helpers. Shape + self-
 reproducibility is NOT value parity (R-HONEST-1/3): a generator is SHIPPED for
 value parity only when it matches the live sklearn oracle element-wise, which
 none of the stochastic generators can until REQ-20 lands.
@@ -313,10 +343,11 @@ ferrolearn side, per R-CHAR-3):
 
 ```bash
 cargo test -p ferrolearn-datasets --lib generators   # in-crate shape/reproducibility tests pass
+cargo test -p ferrolearn-datasets --test divergence_bicluster_generators
+cargo test -p ferrolearn-datasets --test api_proof
 ```
 
-Deterministic, oracle-pinnable NOW (the critic adds these as FAILING `#[test]`s,
-no RNG match required):
+Deterministic or structural, oracle-pinnable slices (no RNG match required):
 
 ```bash
 # REQ-4 make_moons geometry (endpoint off-by-one):
@@ -341,7 +372,7 @@ _,y=make_blobs(n_samples=[3,3,4], centers=None, n_features=2, random_state=0); p
 
 # REQ-10 make_sparse_uncorrelated weight set:
 python3 -c "from sklearn.datasets import make_sparse_uncorrelated  # y ~ N(X0+2X1-2X2-1.5X3, 1)"
-# ferrolearn uses [1,2,3,4,5] with no target noise
+# ferrolearn matches [1,2,-2,-1.5] for y_loc but still has no target noise draw
 
 # REQ-13 make_friedman3 spurious 1e-6: ferrolearn min(X[:,0]) >= 1e-6 ; sklearn uniform(0,100)
 
@@ -349,19 +380,20 @@ python3 -c "from sklearn.datasets import make_sparse_uncorrelated  # y ~ N(X0+2X
 python3 -c "from sklearn.datasets import make_gaussian_quantiles  # X = X[argsort(dist)]"
 ```
 
-RNG-BLOCKED value-parity REQs (REQ-2/5/7/8/9/11/12/13/14/15/16/17/18-X/19) cannot
-be pinned to element-wise equality until ferray exposes a numpy-compatible
-`RandomState` (REQ-20). Per R-SUBSTRATE-5 the critic files the ferray-RNG blocker
-and marks these NOT-STARTED; the fix lands in ferray, then the value-parity tests
-go green. Do NOT pin a tautological "ferrolearn == ferrolearn" test for these
-(R-CHAR-3).
+RNG-BLOCKED value-parity REQs
+(REQ-2/5/7/8/9/11/12/13/14/15/16/17/18-X/19/23-values/24-values/25-values)
+cannot be pinned to element-wise equality until ferray exposes a
+numpy-compatible `RandomState` (REQ-20). Per R-SUBSTRATE-5 the critic files the
+ferray-RNG blocker and marks these value slices NOT-STARTED; the fix lands in
+ferray, then the value-parity tests go green. Do NOT pin a tautological
+"ferrolearn == ferrolearn" test for these (R-CHAR-3).
 
 Consumer check (REQ-22):
 
 ```bash
-grep -rn "make_classification\|make_blobs\|make_moons\|make_circles\|make_regression" \
-  ferrolearn-* --include=*.rs | grep -v '#\[cfg(test' | grep -v '/tests/'
-# -> only the ferrolearn-datasets/src/lib.rs re-exports (boundary surface)
+cargo test -p ferrolearn-datasets --test api_proof
+# -> names all 20 crate-root generator exports, including make_sparse_coded_signal,
+#    make_biclusters, and make_checkerboard.
 ```
 
 Each NOT-STARTED REQ above is an open work item; the acto-critic pins the
