@@ -29,9 +29,11 @@
 //! Both are marked `#[ignore]` (tracking #938) so the orchestrator suite stays
 //! green; run with `--ignored` to confirm they FAIL against current code.
 
-use ferrolearn_cluster::{AgglomerativeClustering, Linkage};
+use ferrolearn_cluster::{AgglomerativeClustering, Linkage, ward_tree};
 use ferrolearn_core::Fit;
 use ndarray::Array2;
+
+const TOL: f64 = 1e-12;
 
 /// Small generic 6-point fixture, no degenerate ties. Three loose pairs/triples
 /// arranged so the scipy merge order and the sklearn `_hc_cut` label numbering
@@ -43,6 +45,48 @@ fn fixture() -> Array2<f64> {
         vec![0.0, 0.0, 0.2, 0.1, 0.9, 1.1, 3.0, 3.2, 3.3, 3.0, 6.0, 0.2],
     )
     .unwrap()
+}
+
+/// Public helper: `ferrolearn_cluster::ward_tree` mirrors
+/// `sklearn.cluster.ward_tree` for the unstructured dense-array path.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import ward_tree; \
+///     X=np.array([[1,2],[1,4],[1,0],[4,2],[4,4],[4,0]], dtype=float); \
+///     print(ward_tree(X)); print(ward_tree(X, return_distance=True))"
+///   -> children: [[0,1],[3,5],[2,6],[4,7],[8,9]]
+///      n_connected_components: 1
+///      n_leaves: 6
+///      parents: None
+///      distances: [2.0, 2.0, 3.4641016151377544, 3.4641016151377544, 5.196152422706632]
+#[test]
+fn green_ward_tree_public_helper_docstring() {
+    let x = Array2::from_shape_vec(
+        (6, 2),
+        vec![1.0, 2.0, 1.0, 4.0, 1.0, 0.0, 4.0, 2.0, 4.0, 4.0, 4.0, 0.0],
+    )
+    .unwrap();
+    let tree = ward_tree(&x, true).unwrap();
+    assert_eq!(tree.children, vec![(0, 1), (3, 5), (2, 6), (4, 7), (8, 9)]);
+    assert_eq!(tree.n_connected_components, 1);
+    assert_eq!(tree.n_leaves, 6);
+    assert!(tree.parents.is_none());
+
+    let distances = tree.distances.as_ref().unwrap();
+    let expected: [f64; 5] = [
+        2.0,
+        2.0,
+        3.4641016151377544,
+        3.4641016151377544,
+        5.196152422706632,
+    ];
+    assert_eq!(distances.len(), expected.len());
+    for (actual, expected) in distances.iter().zip(expected) {
+        assert!(
+            (*actual - expected).abs() <= TOL,
+            "ward_tree distance: ferro={actual} sklearn={expected}"
+        );
+    }
 }
 
 /// REQ-6: `children_` must be the FULL scipy dendrogram — shape

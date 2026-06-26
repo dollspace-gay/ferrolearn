@@ -95,7 +95,9 @@ pub mod spectral;
 
 // Re-export the main types at the crate root.
 pub use affinity_propagation::{AffinityPropagation, FittedAffinityPropagation};
-pub use agglomerative::{AgglomerativeClustering, FittedAgglomerativeClustering, Linkage};
+pub use agglomerative::{
+    AgglomerativeClustering, FittedAgglomerativeClustering, Linkage, WardTree, ward_tree,
+};
 pub use bayesian_gmm::{
     BayesianCovType, BayesianGaussianMixture, FittedBayesianGaussianMixture, WeightPriorType,
 };

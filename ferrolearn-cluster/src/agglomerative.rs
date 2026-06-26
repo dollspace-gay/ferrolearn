@@ -261,6 +261,25 @@ pub struct FittedAgglomerativeClustering<F> {
     _marker: std::marker::PhantomData<F>,
 }
 
+/// Result returned by [`ward_tree`].
+///
+/// Mirrors scikit-learn's unstructured `ward_tree(..., connectivity=None)`
+/// fields. `parents` is always `None` for the unstructured path, while
+/// `distances` is populated only when `return_distance` is `true`.
+#[derive(Debug, Clone)]
+pub struct WardTree<F> {
+    /// The full Ward dendrogram, shape `(n_samples - 1, 2)`.
+    pub children: Vec<(usize, usize)>,
+    /// Number of connected components. Always `1` for `connectivity=None`.
+    pub n_connected_components: usize,
+    /// Number of leaves in the tree.
+    pub n_leaves: usize,
+    /// Parent array for structured connectivity builds. Always `None` here.
+    pub parents: Option<Array1<usize>>,
+    /// Per-merge Ward distances when requested.
+    pub distances: Option<Array1<F>>,
+}
+
 impl<F: Float> FittedAgglomerativeClustering<F> {
     /// Return the cluster label for each training sample.
     #[must_use]
@@ -600,6 +619,57 @@ fn full_dendrogram<F: Float>(x: &Array2<F>, linkage: Linkage) -> Dendrogram {
             union_find_relabel(merges, n)
         }
     }
+}
+
+/// Build the unstructured Ward tree for a dense feature matrix.
+///
+/// This is the ferrolearn translation of scikit-learn's
+/// `ward_tree(X, connectivity=None, return_distance=...)` path. It returns the
+/// full dendrogram, `n_connected_components = 1`, `n_leaves = n_samples`, no
+/// parents array, and optionally the per-merge distances.
+///
+/// # Errors
+///
+/// Returns [`FerroError::InsufficientSamples`] for fewer than two samples and
+/// [`FerroError::InvalidParameter`] if `x` contains NaN or infinity.
+pub fn ward_tree<F: Float>(
+    x: &Array2<F>,
+    return_distance: bool,
+) -> Result<WardTree<F>, FerroError> {
+    let n_samples = x.nrows();
+    if n_samples < 2 {
+        return Err(FerroError::InsufficientSamples {
+            required: 2,
+            actual: n_samples,
+            context: "ward_tree requires at least 2 samples".into(),
+        });
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+
+    let (children, raw_distances) = full_dendrogram(x, Linkage::Ward);
+    let distances = if return_distance {
+        Some(Array1::from(
+            raw_distances
+                .iter()
+                .map(|&d| F::from(d).unwrap_or_else(F::zero))
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        None
+    };
+
+    Ok(WardTree {
+        children,
+        n_connected_components: 1,
+        n_leaves: n_samples,
+        parents: None,
+        distances,
+    })
 }
 
 /// Collect all descendant leaves of `node` in the dendrogram, mirroring

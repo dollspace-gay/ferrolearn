@@ -232,3 +232,13 @@ fixture = ""
 path = "ferrolearn_cluster::WeightPriorType"
 phase = "cluster"
 fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::WardTree"
+phase = "cluster"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_cluster::ward_tree"
+phase = "cluster"
+fixture = ""

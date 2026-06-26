@@ -24,8 +24,9 @@ use ferrolearn_cluster::{
     BayesianGaussianMixture, Birch, BisectingKMeans, BisectingStrategy, CovarianceType, DBSCAN,
     FeatureAgglomeration, GaussianMixture, Hdbscan, KMeans, LabelPropagation,
     LabelPropagationKernel, LabelSpreading, LabelSpreadingKernel, Linkage, MeanShift,
-    MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering, WeightPriorType,
-    cluster_optics_xi, compute_optics_graph, kmeans_plusplus, kmeans_plusplus_with_options,
+    MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering, WardTree,
+    WeightPriorType, cluster_optics_xi, compute_optics_graph, kmeans_plusplus,
+    kmeans_plusplus_with_options, ward_tree,
 };
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ndarray::{Array1, Array2, array};
@@ -195,6 +196,13 @@ fn api_proof_optics() {
 #[test]
 fn api_proof_agglomerative_clustering() {
     let x = two_blobs();
+    let tree = ward_tree(&x, true).unwrap();
+    let _: WardTree<f64> = tree.clone();
+    assert_eq!(tree.children.len(), x.nrows() - 1);
+    assert_eq!(tree.n_connected_components, 1);
+    assert_eq!(tree.n_leaves, x.nrows());
+    assert!(tree.parents.is_none());
+    assert_eq!(tree.distances.as_ref().unwrap().len(), x.nrows() - 1);
     for linkage in [
         Linkage::Ward,
         Linkage::Complete,

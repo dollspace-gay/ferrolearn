@@ -7,7 +7,7 @@ baseline-commit: 75ac7a41
 upstream: scikit-learn 1.5.2 (commit 156ef14)
 upstream-paths:
   - sklearn/cluster/_agglomerative.py     # class AgglomerativeClustering(ClusterMixin, BaseEstimator) (:781); _parameter_constraints (:934-947); __init__ defaults n_clusters=2/metric='euclidean'/linkage='ward'/distance_threshold=None/compute_full_tree='auto'/compute_distances=False (:949-968); fit -> _validate_data(ensure_min_samples=2) (:989); _fit n_clusters^distance_threshold XOR validation (:1022-1027); ward requires euclidean (:1034-1038); _TREE_BUILDERS dispatch (:720-725, :1040); children_/n_connected_components_/n_leaves_ (:1083-1085); distances_ + n_clusters_ from distance_threshold (:1087-1095); _hc_cut tree-cut + label numbering (:731-775); children_ doc (n_samples-1, 2) full dendrogram (:902-908)
-parity-ops: AgglomerativeClustering (.__init__, .fit, .fit_predict, .labels_, .n_clusters_, .children_)
+parity-ops: AgglomerativeClustering (.__init__, .fit, .fit_predict, .labels_, .n_clusters_, .children_), ward_tree
 crosslink-issue: 962
 -->
 
