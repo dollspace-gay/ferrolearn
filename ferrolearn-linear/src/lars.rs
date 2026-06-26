@@ -23,12 +23,13 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (Lars method='lar' path) | SHIPPED | `lars_path` (equiangular); `Lars(n_nonzero_coefs=5)` coef_/intercept_ match sklearn EXACTLY (1e-6) on diabetes. Consumer: `pub use Lars` (boundary API). |
-//! | REQ-2 (LassoLars method='lasso' path) | SHIPPED | `LassoLars::fit` → `lars_path` lasso branch (drop condition `z=-coef/least_squares`, alpha_min stopping, interpolation; `_least_angle.py:413+`). coef_/active-set match oracle at alpha=0.1/0.5/1.0. Closed #482 (was forward-stepwise OLS). |
+//! | REQ-1 (Lars method='lar' path) | SHIPPED | `compute_lars_path` (equiangular); `Lars(n_nonzero_coefs=5)` coef_/intercept_ match sklearn EXACTLY (1e-6) on diabetes. Consumer: `pub use Lars` (boundary API). |
+//! | REQ-2 (LassoLars method='lasso' path) | SHIPPED | `LassoLars::fit` → `compute_lars_path` lasso branch (drop condition `z=-coef/least_squares`, alpha_min stopping, interpolation; `_least_angle.py:413+`). coef_/active-set match oracle at alpha=0.1/0.5/1.0. Closed #482 (was forward-stepwise OLS). |
 //! | REQ-3 (predict) | SHIPPED | `Predict for FittedLars`/`FittedLassoLars`. |
 //! | REQ-4 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
-//! | REQ-5..8 NOT-STARTED | coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
+//! | REQ-5..8 NOT-STARTED | fitted coef_path_/alphas_/active_/n_iter_ attrs (#483), constructor param parity (#484), LarsCV/LassoLarsCV/LassoLarsIC (#485, separate units), ferray substrate (#486; path on ndarray/faer). |
 //! | REQ-9 (Lars/LassoLars non-finite input rejected) | SHIPPED | `Fit::fit for Lars` AND the SEPARATE `Fit::fit for LassoLars` impl both reject any NaN/+/-inf in X or y BEFORE the LARS path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`Lars._fit` `_least_angle.py:1183`; `LassoLars.fit` override `_least_angle.py:1698` → `:1726`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; neither `Lars.fit` nor `LassoLars.fit` takes a `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `Lars().fit` / `LassoLars(alpha=0.1).fit` raise `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::lars_*`, `tests/divergence_lasso_lars_nonfinite.rs::lasso_lars_rejects_non_finite_input_like_sklearn`). Non-test consumer: the existing `Fit::fit` / `pub use Lars, LassoLars` boundary consumers. (#2259, #2260) |
+//! | REQ-10 (`lars_path` public helper) | SHIPPED | `pub fn lars_path` + `LarsPathOptions` / `LarsPathResult` expose the dense single-output Rust analogue of `sklearn.linear_model.lars_path`, returning alphas, final active indices, coefficient path `(n_features, n_alphas)`, and `n_iter`. Oracle tests `lars_path_*_matches_sklearn`. |
 //!
 //! acto-critic + builder: `Lars` matched sklearn exactly; `LassoLars` diverged (used forward-stepwise
 //! OLS instead of the equiangular lasso path) — rewritten to sklearn's `_lars_path_solver` lasso
@@ -203,12 +204,180 @@ pub struct FittedLassoLars<F> {
     intercept: F,
 }
 
+/// Path variant solved by [`lars_path`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LarsPathMethod {
+    /// Least Angle Regression path (`method="lar"` in sklearn).
+    Lar,
+    /// Lasso path solved by LARS with coefficient-drop steps
+    /// (`method="lasso"` in sklearn).
+    Lasso,
+}
+
+/// Options for [`lars_path`].
+#[derive(Debug, Clone)]
+pub struct LarsPathOptions<F> {
+    /// Maximum number of LARS path iterations.
+    pub max_iter: usize,
+    /// Minimum alpha/correlation along the path.
+    pub alpha_min: F,
+    /// Path variant to solve.
+    pub method: LarsPathMethod,
+}
+
+impl<F: Float> LarsPathOptions<F> {
+    /// Create default options matching sklearn's dense helper defaults for the
+    /// supported Rust surface: `max_iter=500`, `alpha_min=0`, `method=Lar`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            max_iter: 500,
+            alpha_min: F::zero(),
+            method: LarsPathMethod::Lar,
+        }
+    }
+
+    /// Set the maximum number of LARS iterations.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set the minimum alpha/correlation along the path.
+    #[must_use]
+    pub fn with_alpha_min(mut self, alpha_min: F) -> Self {
+        self.alpha_min = alpha_min;
+        self
+    }
+
+    /// Select the LARS path variant.
+    #[must_use]
+    pub fn with_method(mut self, method: LarsPathMethod) -> Self {
+        self.method = method;
+        self
+    }
+}
+
+impl<F: Float> Default for LarsPathOptions<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result returned by [`lars_path`].
+#[derive(Debug, Clone)]
+pub struct LarsPathResult<F> {
+    alphas: Array1<F>,
+    active: Vec<usize>,
+    coefficients: Array2<F>,
+    n_iter: usize,
+}
+
+impl<F: Float> LarsPathResult<F> {
+    /// Borrow the alpha values at each path knot.
+    #[must_use]
+    pub fn alphas(&self) -> &Array1<F> {
+        &self.alphas
+    }
+
+    /// Borrow the active feature indices at the end of the path.
+    #[must_use]
+    pub fn active(&self) -> &[usize] {
+        &self.active
+    }
+
+    /// Borrow the coefficient path, shaped `(n_features, n_alphas)`.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array2<F> {
+        &self.coefficients
+    }
+
+    /// Number of LARS iterations run.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+}
+
+/// Compute a dense single-output LARS or LARS-Lasso path.
+///
+/// This is the Rust analogue of `sklearn.linear_model.lars_path` for dense
+/// `ndarray` inputs and a one-dimensional target. Inputs are used as provided:
+/// no intercept is fitted and no centering is performed. Callers that need an
+/// intercept should center `X` and `y` before calling this helper, matching
+/// sklearn's path-helper contract.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent shapes, empty input, non-finite
+/// values, invalid `alpha_min`, singular active-set Gram matrices, or other
+/// numerical failures in the path solver.
+pub fn lars_path<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: LarsPathOptions<F>,
+) -> Result<LarsPathResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    validate_input(x, y, "lars_path")?;
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+    if options.alpha_min < F::zero() || !options.alpha_min.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "alpha_min".into(),
+            reason: "must be finite and non-negative".into(),
+        });
+    }
+
+    let path = compute_lars_path(
+        x,
+        y,
+        options.max_iter,
+        options.method == LarsPathMethod::Lasso,
+        options.alpha_min,
+    )?;
+
+    let n_features = x.ncols();
+    let n_alphas = path.alphas.len();
+    let mut coefficients = Array2::<F>::zeros((n_features, n_alphas));
+    for (alpha_idx, coef) in path.coefficients.iter().enumerate() {
+        coefficients.column_mut(alpha_idx).assign(coef);
+    }
+
+    Ok(LarsPathResult {
+        alphas: Array1::from_vec(path.alphas),
+        active: path.active,
+        coefficients,
+        n_iter: path.n_iter,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
 /// Centred data: `(x_centred, y_centred, x_mean, y_mean)`.
 type CentredData<F> = (Array2<F>, Array1<F>, Option<Array1<F>>, Option<F>);
+
+#[derive(Debug, Clone)]
+struct LarsPathComputation<F> {
+    alphas: Vec<F>,
+    active: Vec<usize>,
+    coefficients: Vec<Array1<F>>,
+    n_iter: usize,
+}
 
 /// Center `x` and `y` for intercept fitting, returning centred arrays and means.
 fn center_data<F: Float + FromPrimitive + ScalarOperand + 'static>(
@@ -333,7 +502,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let w = lars_path(&x_work, &y_work, max_active, false, F::zero())?;
+        let path = compute_lars_path(&x_work, &y_work, max_active, false, F::zero())?;
+        let w = path
+            .coefficients
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Array1::<F>::zeros(n_features));
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
 
         Ok(FittedLars {
@@ -364,14 +538,14 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 /// the maximum correlation `C / n_samples` drops to `alpha_min`, interpolating
 /// the final coefficients at exactly `alpha_min` (`:657`–`:669`).
 ///
-/// Returns the final coefficient vector. `x` and `y` are assumed centred.
-fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
+/// Returns the full coefficient path. `x` and `y` are assumed centred.
+fn compute_lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
     x: &Array2<F>,
     y: &Array1<F>,
     max_steps: usize,
     lasso_modification: bool,
     alpha_min: F,
-) -> Result<Array1<F>, FerroError> {
+) -> Result<LarsPathComputation<F>, FerroError> {
     let (n_samples, n_features) = x.dim();
     let n_f = F::from(n_samples).unwrap_or_else(F::one);
     let mut beta = Array1::<F>::zeros(n_features);
@@ -394,9 +568,11 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
     // `prev_alpha` = C / n_samples from the previous iteration, used for the
     // alpha_min interpolation (`:664`).
     let mut prev_alpha = F::zero();
+    let mut path_alphas = Vec::new();
+    let mut path_coefficients = Vec::new();
 
     let mut step = 0;
-    while step < max_steps {
+    loop {
         // Current correlations c = X^T (y - mu) and the maximum |correlation|.
         let residual = y - &mu;
         let mut corr = Array1::<F>::zeros(n_features);
@@ -414,8 +590,8 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
         // alpha = C / n_samples (sklearn `:657`). For LARS-Lasso, stop once
         // alpha drops to alpha_min, interpolating the final coefficients at
         // exactly alpha_min (`:658`–`:669`).
-        let alpha = c_max / n_f;
-        if lasso_modification && alpha <= alpha_min + eq_tol {
+        let mut alpha = c_max / n_f;
+        if alpha <= alpha_min + eq_tol {
             if (alpha - alpha_min).abs() > eq_tol && step > 0 {
                 let denom = prev_alpha - alpha;
                 if denom.abs() > eps {
@@ -426,9 +602,18 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
                     }
                 }
             }
+            alpha = alpha_min;
+            path_alphas.push(alpha);
+            path_coefficients.push(beta.clone());
             break;
         }
+
+        path_alphas.push(alpha);
+        path_coefficients.push(beta.clone());
         if c_max <= eps {
+            break;
+        }
+        if step >= max_steps || active.len() >= n_features {
             break;
         }
 
@@ -621,7 +806,12 @@ fn lars_path<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static>(
         }
     }
 
-    Ok(beta)
+    Ok(LarsPathComputation {
+        alphas: path_alphas,
+        active,
+        coefficients: path_coefficients,
+        n_iter: step,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -637,8 +827,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     /// Fit the Lasso-LARS model.
     ///
     /// Routes through the equiangular LARS-Lasso homotopy path
-    /// ([`lars_path`] with `lasso_modification = true`, `alpha_min = alpha`),
-    /// mirroring sklearn `_lars_path_solver` (`method == "lasso"`,
+    /// (`compute_lars_path` with `lasso_modification = true`,
+    /// `alpha_min = alpha`), mirroring sklearn `_lars_path_solver` (`method == "lasso"`,
     /// `sklearn/linear_model/_least_angle.py:413+`). At each knot the standard
     /// LARS join step competes with the Efron §3.3 drop step (the length at
     /// which an active coefficient crosses zero); the smaller is taken, and on
@@ -688,7 +878,12 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
 
         let (x_work, y_work, x_mean, y_mean) = center_data(x, y, self.fit_intercept)?;
 
-        let w = lars_path(&x_work, &y_work, self.max_iter, true, self.alpha)?;
+        let path = compute_lars_path(&x_work, &y_work, self.max_iter, true, self.alpha)?;
+        let w = path
+            .coefficients
+            .last()
+            .cloned()
+            .unwrap_or_else(|| Array1::<F>::zeros(x.ncols()));
         let intercept = compute_intercept(&x_mean, &y_mean, &w);
 
         Ok(FittedLassoLars {

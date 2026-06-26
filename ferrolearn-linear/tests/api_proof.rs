@@ -21,12 +21,13 @@ use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
     ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, EnetPathOptions,
     GLMFamily, GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA,
-    Lars, Lasso, LassoCV, LassoLars, LassoPathOptions, LinearRegression, LinearSVC, LinearSVCLoss,
-    LinearSVR, LinearSVRLoss, LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM,
-    OrthogonalMatchingPursuit, OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA,
-    QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier,
-    RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, enet_path,
-    l1_min_c, lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
+    Lars, LarsPathOptions, Lasso, LassoCV, LassoLars, LassoPathOptions, LinearRegression,
+    LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss, LogisticRegression, LogisticRegressionCV,
+    NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit, OrthogonalMpGramOptions,
+    OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore,
+    Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
+    TweedieRegressor, enet_path, l1_min_c, lars_path, lasso_path, orthogonal_mp,
+    orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -234,6 +235,11 @@ fn api_proof_lars_family() {
         .fit(&x, &y)
         .unwrap();
     let _ = f2.score(&x, &y, None).unwrap();
+
+    let path = lars_path(&x, &y, LarsPathOptions::default().with_max_iter(1)).unwrap();
+    assert_eq!(path.alphas().len(), 2);
+    assert_eq!(path.coefficients().dim(), (x.ncols(), 2));
+    assert_eq!(path.n_iter(), 1);
 }
 
 #[test]
