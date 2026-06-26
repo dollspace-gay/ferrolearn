@@ -1,4 +1,4 @@
-# ColumnTransformer / make_column_transformer — per-column-subset composition meta-transformer
+# ColumnTransformer / make_column_transformer / make_column_selector — per-column-subset composition meta-transformer
 
 <!--
 tier: 3-component
@@ -8,7 +8,7 @@ upstream: scikit-learn 1.5.2
 upstream-paths:
   - sklearn/compose/_column_transformer.py  # ColumnTransformer(TransformerMixin, _BaseComposition) (:59); __init__(transformers, *, remainder="drop", sparse_threshold=0.3, n_jobs=None, transformer_weights=None, verbose=False, verbose_feature_names_out=True, force_int_remainder_cols=True) (:290-309); _parameter_constraints remainder {'drop','passthrough'} or estimator (:277-281), sparse_threshold Interval(Real,0,1) (:282); fit_transform calls _call_func_on_transformers(_fit_transform_one) IN LIST ORDER then _hstack(list(Xs)) (:976-1006); transform (:1008-1089); _validate_remainder remaining = sorted(set(range(n_features_in_)) - cols) (:546-547) -> _remainder=("remainder", self.remainder, remainder_cols) (:550) appended LAST via chain in _iter (:460-462); _hstack np.hstack(Xs) dense / sparse.hstack when sparse_output_ (:1091-1200), sparse_output_ = density < sparse_threshold (:998); _get_feature_name_out_for_transformer (:584) + verbose prefix f"{name}__{i}" (:662); get_feature_names_out (:599); named_transformers_ Bunch (:574-582), transformers_ (:694-726); make_column_transformer(*transformers, remainder="drop", sparse_threshold=0.3, ...) (:1334) -> _get_transformer_list -> _name_estimators lowercased-class-name dedup (:1326,:1456-1465); make_column_selector (:1468).
 ferrolearn-module: ferrolearn-preprocess/src/column_transformer.rs
-parity-ops: ColumnTransformer, make_column_transformer
+parity-ops: ColumnTransformer, make_column_transformer, make_column_selector
 crosslink-issue: 1434
 -->
 
@@ -45,8 +45,9 @@ ferrolearn output is bit-for-bit equal to sklearn's on the oracle fixtures (Prob
 
 This is a **shipped-partial** unit: **3 SHIPPED** (REQ-1 column routing + output
 ordering + drop/passthrough + overlapping fan-out + combined VALUES; REQ-2
-`make_column_transformer` builds the CT; REQ-3 error/parameter contracts) /
-**8 NOT-STARTED** (REQ-4 non-index `ColumnSelector`s + `make_column_selector`;
+`make_column_transformer` builds the CT; REQ-3 error/parameter contracts), plus
+REQ-4's scoped dense-numeric `make_column_selector(&Array2<f64>)`. There are
+**8 residual NOT-STARTED areas** (REQ-4 non-index `ColumnSelector`s;
 REQ-5 estimator-remainder + step-level `'drop'`/`'passthrough'`; REQ-6
 `sparse_threshold`/sparse output + `transformer_weights` + `n_jobs`/`verbose`; REQ-7
 `get_feature_names_out`/`verbose_feature_names_out` + sklearn class-name auto-naming;
@@ -213,14 +214,17 @@ parity-verified.
   ferrolearn does not have (REQ-5 / REQ-6).
 
 - REQ-4: **non-index `ColumnSelector`s (str / slice / bool-mask / callable /
-  `make_column_selector`)** (NOT-STARTED). sklearn's `columns` may be an int, str,
-  slice, boolean mask, or a callable applied to the fitted dataframe
-  (`_validate_column_callables` `:520`, `_get_column_indices`), and
+  dataframe dtype/name selectors)** (SHIPPED scoped / residual open). sklearn's
+  `columns` may be an int, str, slice, boolean mask, or a callable applied to the
+  fitted dataframe (`_validate_column_callables` `:520`, `_get_column_indices`), and
   `make_column_selector` (`:1468`) builds a callable selecting by dtype / name regex.
-  ferrolearn's `enum ColumnSelector` (`column_transformer.rs:53-61`) has the single
-  variant `Indices(Vec<usize>)` — no string/label selection (ferrolearn has no
-  dataframe column-name concept), no slice, no boolean mask, no callable, and no
-  `make_column_selector`. NOT-STARTED on prereq blocker #1435.
+  ferrolearn now ships `make_column_selector(&Array2<f64>) -> ColumnSelector`
+  (`column_transformer.rs`) for the dense all-numeric case: it returns
+  `ColumnSelector::Indices(0..x.ncols())`, matching sklearn
+  `make_column_selector(dtype_include=np.number)` on an all-numeric DataFrame.
+  Residual blocker #1435 remains for string/label selection, slice selectors,
+  boolean masks, callables, regex/name matching, and dtype include/exclude behavior
+  on dataframe-like inputs.
 
 - REQ-5: **`remainder` as an ESTIMATOR + step-level `'drop'`/`'passthrough'`
   transformer** (NOT-STARTED). sklearn allows `remainder` to be a fitted estimator
@@ -314,9 +318,11 @@ parity-verified.
   matrix whose `ncols != n_features_in` → `Err(ShapeMismatch)`. Pinned by
   `test_invalid_column_index_out_of_range`, `test_shape_mismatch_on_transform`.
 
-- AC-4 (REQ-4): `ColumnSelector` accepts string labels / slices / boolean masks /
-  callables and `make_column_selector(dtype_include=…)`; ferrolearn has only
-  `Indices(Vec<usize>)`. NOT-STARTED.
+- AC-4 (REQ-4): `make_column_selector(&x)` on dense `Array2<f64>` returns
+  `ColumnSelector::Indices(vec![0, 1, ..., x.ncols()-1])` and can be used inside
+  `ColumnTransformer` to match sklearn `make_column_selector(dtype_include=np.number)`
+  on an all-numeric DataFrame. Residual string labels / slices / boolean masks /
+  callables / regex names / dtype include-exclude selectors remain open.
 
 - AC-5 (REQ-5): `ColumnTransformer(..., remainder=StandardScaler())` fits the
   remainder columns with an estimator, and a step transformer of `'passthrough'`
@@ -353,10 +359,10 @@ parity-verified.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (routing + ordering + drop/passthrough + overlap + combined VALUES) | SHIPPED | impl `impl Fit<Array2<f64>,()> for ColumnTransformer` (`pub fn fit in column_transformer.rs`, `:236`) builds `covered = ⋃ resolved_selectors` and `remainder_indices = (0..n_features).filter(|c| !covered.contains(c))` (ASCENDING), fitting each transformer on `select_columns(x, &indices)` via `fit_pipeline`; `impl Transform<Array2<f64>> for FittedColumnTransformer` (`pub fn transform in column_transformer.rs`, `:371`) pushes each `transform_pipeline` output in REGISTRATION ORDER then appends `select_columns(x, &self.remainder_indices)` LAST iff `matches!(self.remainder, Remainder::Passthrough)` and returns `hstack(&parts)`. Mirrors sklearn `fit_transform` → `_call_func_on_transformers(... _fit_transform_one ...)` in list order then `self._hstack(list(Xs))` (`sklearn/compose/_column_transformer.py:976-1006`), remainder `remaining = sorted(set(range(n_features_in_)) - cols)` (`:546-547`) chained LAST (`:460-462`), dense `np.hstack(Xs)` (`:1200`); overlap supported because each step gets its own `select_columns` copy. Non-test consumer: boundary re-export `pub use column_transformer::{ColumnSelector, ColumnTransformer, FittedColumnTransformer, Remainder, make_column_transformer}` (`lib.rs:128-129`) + `impl PipelineTransformer<f64>/FittedPipelineTransformer<f64>` (used by `ferrolearn_core::pipeline::Pipeline`). Verification: Probe A passthrough `(3,4)` `[[-1.22474487,-1.22474487,0,5],…]`, Probe B drop `(3,3)`, Probe C overlap `(3,2)` — all bit-for-bit (`~1e-15`) vs sklearn; `cargo test -p ferrolearn-preprocess --lib column_transformer` → 22 tests green (`test_basic_two_transformers_drop_remainder`, `test_remainder_drop`, `test_remainder_passthrough`, `test_overlapping_column_selections`, `test_passthrough_values_are_exact`, `test_output_shape_partial_passthrough`, `test_remainder_indices_accessor`). Composition verified; sub-transformer VALUES owned by StandardScaler / MinMaxScaler units. |
+| REQ-1 (routing + ordering + drop/passthrough + overlap + combined VALUES) | SHIPPED | impl `impl Fit<Array2<f64>,()> for ColumnTransformer` (`pub fn fit in column_transformer.rs`, `:236`) builds `covered = ⋃ resolved_selectors` and `remainder_indices = (0..n_features).filter(|c| !covered.contains(c))` (ASCENDING), fitting each transformer on `select_columns(x, &indices)` via `fit_pipeline`; `impl Transform<Array2<f64>> for FittedColumnTransformer` (`pub fn transform in column_transformer.rs`, `:371`) pushes each `transform_pipeline` output in REGISTRATION ORDER then appends `select_columns(x, &self.remainder_indices)` LAST iff `matches!(self.remainder, Remainder::Passthrough)` and returns `hstack(&parts)`. Mirrors sklearn `fit_transform` → `_call_func_on_transformers(... _fit_transform_one ...)` in list order then `self._hstack(list(Xs))` (`sklearn/compose/_column_transformer.py:976-1006`), remainder `remaining = sorted(set(range(n_features_in_)) - cols)` (`:546-547`) chained LAST (`:460-462`), dense `np.hstack(Xs)` (`:1200`); overlap supported because each step gets its own `select_columns` copy. Non-test consumer: boundary re-export `pub use column_transformer::{ColumnSelector, ColumnTransformer, FittedColumnTransformer, Remainder, make_column_selector, make_column_transformer}` (`lib.rs:128-129`) + `impl PipelineTransformer<f64>/FittedPipelineTransformer<f64>` (used by `ferrolearn_core::pipeline::Pipeline`). Verification: Probe A passthrough `(3,4)` `[[-1.22474487,-1.22474487,0,5],…]`, Probe B drop `(3,3)`, Probe C overlap `(3,2)` — all bit-for-bit (`~1e-15`) vs sklearn; `cargo test -p ferrolearn-preprocess --lib column_transformer` → 22 tests green (`test_basic_two_transformers_drop_remainder`, `test_remainder_drop`, `test_remainder_passthrough`, `test_overlapping_column_selections`, `test_passthrough_values_are_exact`, `test_output_shape_partial_passthrough`, `test_remainder_indices_accessor`). Composition verified; sub-transformer VALUES owned by StandardScaler / MinMaxScaler units. |
 | REQ-2 (`make_column_transformer` builds the CT) | SHIPPED | impl `pub fn make_column_transformer in column_transformer.rs` (`:465`) enumerates `(Box<dyn PipelineTransformer<f64>>, ColumnSelector)` pairs, names each `format!("transformer-{i}")`, and defers to `ColumnTransformer::new`, mirroring sklearn `make_column_transformer(*transformers, remainder="drop", …)` → `_get_transformer_list` → `ColumnTransformer(transformer_list, …)` (`sklearn/compose/_column_transformer.py:1334`, `:1456-1465`). Non-test consumer: boundary re-export (`lib.rs:128-129`). Verification: `cargo test -p ferrolearn-preprocess --lib column_transformer` → `test_make_column_transformer_auto_names` (`transformer_names() == ["transformer-0","transformer-1"]`), `test_make_column_transformer_single`; Probe A built via `make_column_transformer` yields the same matrix as the explicit form. SCOPED: AUTO-NAMING differs — sklearn `_name_estimators` lowercased-class-name (`:1326`, Probe D `['standardscaler','minmaxscaler']`) vs ferrolearn positional `transformer-N`; naming gap folded into REQ-7. |
 | REQ-3 (error / parameter contracts) | SHIPPED | impl `ColumnSelector::resolve` (`column_transformer.rs:70-86`) returns `Err(InvalidParameter { name: "ColumnSelector::Indices", reason: "column index {idx} is out of range …" })` for `idx >= n_features`; `ColumnTransformer::fit` re-wraps it as `InvalidParameter { name: format!("ColumnTransformer step '{name}'"), … }` resolving ALL selectors eagerly before fitting (`column_transformer.rs:258-268`) — mirroring sklearn validating columns in `fit_transform` before fitting any step (`sklearn/compose/_column_transformer.py:962-969`). `FittedColumnTransformer::transform` returns `Err(ShapeMismatch { …, context: "FittedColumnTransformer::transform" })` on `x.ncols() != n_features_in` (`column_transformer.rs:388-395`), and `hstack` returns `ShapeMismatch` on row-count mismatch (`:148-154`). Non-test consumer: boundary re-export (`lib.rs:128-129`). Verification: `cargo test -p ferrolearn-preprocess --lib column_transformer` → `test_invalid_column_index_out_of_range`, `test_shape_mismatch_on_transform`. SCOPED to the dense `Array2<f64>` API: sklearn's `remainder ∈ {'drop','passthrough'} or estimator` / `sparse_threshold ∈ [0,1]` constraints (`_parameter_constraints` `:277-282`) are parameters ferrolearn lacks (REQ-5 / REQ-6). |
-| REQ-4 (non-index `ColumnSelector`s + `make_column_selector`) | NOT-STARTED | open prereq blocker #1435. sklearn `columns` may be int/str/slice/bool-mask/callable (`_validate_column_callables` `sklearn/compose/_column_transformer.py:520`) and `make_column_selector` (`:1468`) selects by dtype / name regex. ferrolearn's `enum ColumnSelector` (`column_transformer.rs:53-61`) has only `Indices(Vec<usize>)` — no string/slice/bool/callable selection and no `make_column_selector`. |
+| REQ-4 (non-index `ColumnSelector`s + `make_column_selector`) | SHIPPED scoped / residual open | `make_column_selector(&Array2<f64>) -> ColumnSelector` (`column_transformer.rs`) returns all dense numeric column indices in ascending order, matching sklearn `make_column_selector(dtype_include=np.number)` on an all-numeric DataFrame. Verification: `cargo test -p ferrolearn-preprocess --test divergence_make_column_selector`; `tests/api_proof.rs` covers the root re-export and `ColumnTransformer` integration. Residual blocker #1435 remains for sklearn `columns` int/str/slice/bool-mask/callable (`_validate_column_callables` `sklearn/compose/_column_transformer.py:520`) plus `make_column_selector` regex/dtype include-exclude behavior on dataframe-like inputs (`:1468`). |
 | REQ-5 (estimator-remainder + step-level `'drop'`/`'passthrough'`) | NOT-STARTED | open prereq blocker #1436. sklearn `remainder` may be an estimator fit on the uncovered columns (`__init__` `:294`, doc `:108-110`, `_validate_remainder` `:550`) and a step transformer may be the string `'drop'`/`'passthrough'`. ferrolearn's `enum Remainder` (`column_transformer.rs:97-104`) is only `Drop`/`Passthrough` (remainder columns are passed through verbatim, never fit by an estimator) and a step is always a real `Box<dyn PipelineTransformer<f64>>`. |
 | REQ-6 (`sparse_threshold` + sparse output + `transformer_weights` + `n_jobs`/`verbose`) | NOT-STARTED | open prereq blocker #1437. sklearn sets `sparse_output_ = density < sparse_threshold` (`fit_transform` `sklearn/compose/_column_transformer.py:991-1000`) and `_hstack` returns `sparse.hstack(...).tocsr()` when sparse (`:1105-1120`); `__init__` carries `sparse_threshold`, `n_jobs`, `transformer_weights`, `verbose` (`:290-309`). ferrolearn's `hstack` (`column_transformer.rs:133`) is dense-`Array2<f64>` only — no sparse path / `sparse_threshold`, no `transformer_weights`, no `n_jobs`, no `verbose`. |
 | REQ-7 (`get_feature_names_out` + `verbose_feature_names_out` + class-name auto-naming) | NOT-STARTED | open prereq blocker #1438. sklearn builds per-transformer names (`_get_feature_name_out_for_transformer` `sklearn/compose/_column_transformer.py:584`), verbose-prefixes `f"{name}__{i}"` (`:662`) via `get_feature_names_out` (`:599`) → `['std__x0','std__x1','mm__x2','remainder__x3']` (Probe E), and `make_column_transformer` names by lowercased class name (`_name_estimators` `:1326`, Probe D). ferrolearn exposes `transformer_names()` (`column_transformer.rs:353`) only — no `get_feature_names_out`, no `name__feat` prefixing, positional `transformer-N` naming (`:472`). |
@@ -382,7 +388,10 @@ exposes the composition meta-transformer plus two private helpers:
   (`:1105-1120`) is absent (REQ-6).
 - `enum ColumnSelector { Indices(Vec<usize>) }` (`:53-61`) with
   `fn resolve(&self, n_features) -> Result<Vec<usize>, FerroError>` (`:70-86`)
-  validating every index `< n_features`. Single variant only (REQ-4).
+  validating every index `< n_features`. Single variant only for fitted
+  transformers; `make_column_selector(&Array2<f64>) -> ColumnSelector` builds the
+  all-columns dense numeric selector for the scoped sklearn helper analogue
+  (REQ-4).
 - `enum Remainder { Drop, Passthrough }` (`:97-104`) — no estimator-remainder (REQ-5).
 - `ColumnTransformer { transformers: Vec<(String, Box<dyn PipelineTransformer<f64>>,
   ColumnSelector)>, remainder: Remainder }` (`new`, `:213-230`). Its
@@ -406,7 +415,8 @@ exposes the composition meta-transformer plus two private helpers:
   `transformer-{i}` naming, then `ColumnTransformer::new`.
 
 All public types are re-exported `pub use column_transformer::{ColumnSelector,
-ColumnTransformer, FittedColumnTransformer, Remainder, make_column_transformer}`
+ColumnTransformer, FittedColumnTransformer, Remainder, make_column_selector,
+make_column_transformer}`
 (`lib.rs:128-129`) — that boundary re-export + the `PipelineTransformer` /
 `FittedPipelineTransformer` integration are the grandfathered consumers (S5 /
 R-DEFER-1) pinning the SHIPPED rows. There is NO PyO3 binding (REQ-10).
@@ -431,14 +441,16 @@ lowercased class name, deduped).
 (ascending) + overlapping-column fan-out + the combined output VALUES (REQ-1,
 oracle-verified bit-for-bit on Probe A/B/C given the parity-verified StandardScaler /
 MinMaxScaler sub-transformers); `make_column_transformer` builds an equivalent CT
-(REQ-2); and the dense error/parameter contracts hold (REQ-3). The remaining gaps are
-input-flexibility and surface: only `Indices` selectors (REQ-4), only `Drop`/`Passthrough`
+(REQ-2); the dense error/parameter contracts hold (REQ-3); and
+`make_column_selector(&Array2<f64>)` covers the all-numeric dense helper case
+(REQ-4 scoped). The remaining gaps are input-flexibility and surface: only `Indices`
+selectors beyond that helper (REQ-4 residual), only `Drop`/`Passthrough`
 remainder — no estimator-remainder (REQ-5), dense-only — no `sparse_threshold` /
 `transformer_weights` / `n_jobs` / `verbose` (REQ-6), no `get_feature_names_out` /
 `verbose_feature_names_out` prefix / class-name auto-naming (REQ-7), no
 `named_transformers_` / `transformers_` / `feature_names_in_` (REQ-8), `f64`-only
 (REQ-9), no PyO3 (REQ-10), and the non-ferray substrate (REQ-11). This is a
-**shipped-partial** unit (3 SHIPPED / 8 NOT-STARTED).
+**shipped-partial** unit (3 SHIPPED + REQ-4 scoped helper / 8 residual open areas).
 
 ## Verification
 
@@ -463,6 +475,7 @@ cargo test -p ferrolearn-preprocess --lib column_transformer            # 22 tes
 #   REQ-2: test_make_column_transformer_auto_names, test_make_column_transformer_single
 #   REQ-3: test_invalid_column_index_out_of_range, test_shape_mismatch_on_transform,
 #          test_transformer_names_explicit
+cargo test -p ferrolearn-preprocess --test divergence_make_column_selector
 cargo clippy -p ferrolearn-preprocess --all-targets -- -D warnings
 cargo fmt --all --check
 
@@ -513,7 +526,9 @@ mismatch), all 22 GREEN; the Probe A/B/C oracle gates pin the combined output sh
 VALUES bit-for-bit. No green command establishes REQ-4 (non-index selectors), REQ-5
 (estimator-remainder), REQ-6 (`sparse_threshold` / `transformer_weights` / `n_jobs`),
 REQ-7 (`get_feature_names_out` / class-name naming), REQ-8 (`named_transformers_` /
-`transformers_`), REQ-9 (generic `F`), REQ-10 (PyO3), or REQ-11 (ferray).
+`transformers_`), REQ-9 (generic `F`), REQ-10 (PyO3), or REQ-11 (ferray). The
+separate `divergence_make_column_selector` gate establishes the dense all-numeric
+REQ-4 helper scope only.
 
 ## Blockers
 
@@ -524,13 +539,17 @@ re-exported (`lib.rs:128-129`, the grandfathered boundary consumer) plus
 pipeline-integrated, the combined output matches the live oracle bit-for-bit on the
 passthrough / drop / overlap fixtures (given the independently parity-verified
 StandardScaler / MinMaxScaler sub-transformers), and the 22 in-module tests are green.
+REQ-4's `make_column_selector(&Array2<f64>)` helper is shipped for dense all-numeric
+inputs and covered by `tests/divergence_make_column_selector.rs`.
 
-The remaining REQs (REQ-4..11) are NOT-STARTED. Each should be filed as a `-l blocker`
+The remaining residual REQs (REQ-4..11) are NOT-STARTED. Each should be filed as a `-l blocker`
 issue against tracking issue #1434 (placeholder `#1435` … `#1442` until filed):
 
-- #1435 — REQ-4: only `ColumnSelector::Indices(Vec<usize>)`
-  (`column_transformer.rs:53-61`); no str/slice/bool-mask/callable selection and no
-  `make_column_selector` (`sklearn/compose/_column_transformer.py:520`, `:1468`).
+- #1435 — REQ-4 residual: only `ColumnSelector::Indices(Vec<usize>)`
+  (`column_transformer.rs:53-61`) plus the dense all-columns
+  `make_column_selector(&Array2<f64>)`; no str/slice/bool-mask/callable selection,
+  regex/name matching, or dtype include/exclude dataframe behavior
+  (`sklearn/compose/_column_transformer.py:520`, `:1468`).
 - #1436 — REQ-5: `enum Remainder` is only `Drop`/`Passthrough`
   (`column_transformer.rs:97-104`); no estimator-remainder and no step-level
   `'drop'`/`'passthrough'` (`_column_transformer.py:294`, `:550`).

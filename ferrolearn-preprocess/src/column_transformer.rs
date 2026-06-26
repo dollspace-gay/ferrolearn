@@ -39,7 +39,8 @@
 //! ## REQ status
 //!
 //! Translation target: scikit-learn 1.5.2 `ColumnTransformer` +
-//! `make_column_transformer` (`sklearn/compose/_column_transformer.py:59`).
+//! `make_column_transformer` + `make_column_selector`
+//! (`sklearn/compose/_column_transformer.py:59`).
 //! Tracking: #1434. Each REQ is BINARY — SHIPPED (impl + non-test consumer +
 //! tests + green verification) or NOT-STARTED (with a concrete open blocker).
 //! DETERMINISTIC composition meta-transformer: this unit owns the column
@@ -51,7 +52,7 @@
 //! | REQ-1 | Column routing + output ORDERING (transformer outputs in registration/list order, remainder appended LAST in ascending column order) + `Drop`/`Passthrough` + OVERLAPPING columns + combined output VALUES (index selectors) | SHIPPED | [`ColumnTransformer`] `fit`/`transform` (hstack in list order + remainder `(0..n).filter(!covered)` ascending) matches sklearn `_hstack` `_column_transformer.py:976-1006,1091` + `_validate_remainder` `sorted(set(range)-cols)` `:546`; 8 oracle tests in `tests/divergence_column_transformer.rs`. Consumer: re-export `lib.rs:128` + `PipelineTransformer` |
 //! | REQ-2 | [`make_column_transformer`] builds a composing `ColumnTransformer` | SHIPPED (scoped) | auto-names `transformer-N` (sklearn uses lowercased class names — naming gap folded into REQ-7); oracle value test |
 //! | REQ-3 | Error/parameter contracts (out-of-range column index, transform ncols mismatch) | SHIPPED (scoped) | [`ColumnTransformer::fit`]/[`FittedColumnTransformer`] `transform`; divergence error tests |
-//! | REQ-4 | Non-index `ColumnSelector`s (str/slice/bool-mask/callable) + `make_column_selector` | NOT-STARTED | `Indices` only; sklearn `_column_transformer.py:1468` — blocker #1435 |
+//! | REQ-4 | Non-index `ColumnSelector`s (str/slice/bool-mask/callable) + `make_column_selector` | SHIPPED (scoped) / residual open | `make_column_selector(&Array2<f64>)` returns all dense numeric column indices, mirroring sklearn `dtype_include=np.number` for an all-numeric DataFrame; residual string/slice/bool/callable/pattern/dtype dataframe selectors remain blocker #1435 |
 //! | REQ-5 | `remainder` as an estimator + `'drop'`/`'passthrough'` as a STEP transformer | NOT-STARTED | sklearn `_column_transformer.py:277-281,460-462` — blocker #1436 |
 //! | REQ-6 | `sparse_threshold` + sparse output + `transformer_weights` + `n_jobs`/`verbose` | NOT-STARTED | dense only; sklearn `_column_transformer.py:282,998,1091-1200` — blocker #1437 |
 //! | REQ-7 | `get_feature_names_out` + `verbose_feature_names_out` (`name__feature`) + class-name auto-naming | NOT-STARTED | sklearn `_column_transformer.py:599,662,1456-1465` — blocker #1438 |
@@ -73,7 +74,7 @@ use ndarray::{Array1, Array2};
 ///
 /// Currently the only supported variant is [`Indices`](ColumnSelector::Indices),
 /// which selects columns by their zero-based integer positions.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColumnSelector {
     /// Select columns by zero-based index.
     ///
@@ -496,6 +497,19 @@ pub fn make_column_transformer(
         .map(|(i, (t, s))| (format!("transformer-{i}"), t, s))
         .collect();
     ColumnTransformer::new(named, remainder)
+}
+
+/// Build a dense numeric column selector for every column in `x`.
+///
+/// This is the scoped ferrolearn analogue of scikit-learn's
+/// `make_column_selector(dtype_include=np.number)` for an all-numeric
+/// `DataFrame`: every feature column is selected, in ascending column order.
+/// Pattern matching, dtype include/exclude filtering, string labels, boolean
+/// masks, and callable selectors remain outside ferrolearn's dense `Array2`
+/// surface.
+#[must_use]
+pub fn make_column_selector(x: &Array2<f64>) -> ColumnSelector {
+    ColumnSelector::Indices((0..x.ncols()).collect())
 }
 
 // ---------------------------------------------------------------------------

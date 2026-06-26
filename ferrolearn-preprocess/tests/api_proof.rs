@@ -9,16 +9,17 @@ use ferrolearn_preprocess::feature_selection::SelectFromModel as FeatureSelectio
 use ferrolearn_preprocess::imputer::ImputeStrategy;
 use ferrolearn_preprocess::normalizer::NormType;
 use ferrolearn_preprocess::{
-    BinEncoding, BinStrategy, Binarizer, BinaryEncoder, CountVectorizer, Direction,
-    FunctionTransformer, GaussianRandomProjection, InitialStrategy, IterativeImputer,
-    KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy, LabelBinarizer,
-    LabelEncoder, MaxAbsScaler, MinMaxScaler, MissingIndicator, MissingIndicatorFeatures,
-    MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder, OutputDistribution,
-    PolynomialFeatures, PowerTransformer, QuantileTransformer, RobustScaler, ScoreFunc, SelectFdr,
-    SelectFpr, SelectFwe, SelectKBest, SelectPercentile, SequentialFeatureSelector, SimpleImputer,
-    SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
-    TfidfVectorizer, VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression,
-    maxabs_scale, minmax_scale, power_transform, r_regression,
+    BinEncoding, BinStrategy, Binarizer, BinaryEncoder, ColumnSelector, ColumnTransformer,
+    CountVectorizer, Direction, FunctionTransformer, GaussianRandomProjection, InitialStrategy,
+    IterativeImputer, KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy,
+    LabelBinarizer, LabelEncoder, MaxAbsScaler, MinMaxScaler, MissingIndicator,
+    MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
+    OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer, Remainder,
+    RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
+    SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
+    StandardScaler, TargetEncoder, TfidfTransformer, TfidfVectorizer, VarianceThreshold,
+    add_dummy_feature, chi2, f_classif, f_regression, make_column_selector,
+    make_column_transformer, maxabs_scale, minmax_scale, power_transform, r_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -98,6 +99,31 @@ fn api_proof_feature_engineering() {
     let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0)
         .transform(&x)
         .unwrap();
+}
+
+#[test]
+fn api_proof_column_transformer() {
+    let x = small_data();
+    let selector = make_column_selector(&x);
+    assert_eq!(selector, ColumnSelector::Indices(vec![0, 1, 2]));
+
+    let ct = ColumnTransformer::new(
+        vec![(
+            "std".into(),
+            Box::new(StandardScaler::<f64>::new()),
+            selector.clone(),
+        )],
+        Remainder::Drop,
+    );
+    let fitted = ct.fit(&x, &()).unwrap();
+    assert_eq!(fitted.transform(&x).unwrap().dim(), x.dim());
+
+    let ct = make_column_transformer(
+        vec![(Box::new(StandardScaler::<f64>::new()), selector)],
+        Remainder::Drop,
+    );
+    let fitted = ct.fit(&x, &()).unwrap();
+    assert_eq!(fitted.transform(&x).unwrap().dim(), x.dim());
 }
 
 // =============================================================================

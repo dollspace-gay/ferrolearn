@@ -137,6 +137,7 @@ use ferrolearn_preprocess::{
     compute_scores_regression,
     f_classif,
     f_regression,
+    make_column_selector,
     make_column_transformer,
     maxabs_scale,
     minmax_scale,
@@ -169,8 +170,8 @@ fn name_type<T>() {}
 /// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
 /// `mutual_info_*`,
 /// `f_oneway`, `SelectorMixin`,
-/// `johnson_lindenstrauss_min_dim`, `make_column_selector`,
-/// `TransformedTargetRegressor`, `HashingVectorizer`, `TfidfVectorizer`) are
+/// `johnson_lindenstrauss_min_dim`,
+/// `TransformedTargetRegressor`, `HashingVectorizer`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
 #[allow(
     clippy::assertions_on_constants,
@@ -292,6 +293,7 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedColumnTransformer>();
     name_type::<ColumnSelector>();
     name_type::<Remainder>();
+    let _make_selector = make_column_selector;
     let _make_ct = make_column_transformer;
 
     // --- ferrolearn extension (no sklearn __all__ analog) ---

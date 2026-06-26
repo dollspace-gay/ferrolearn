@@ -204,6 +204,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::make_column_selector"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::GaussianRandomProjection"
 phase = "preprocess"
 fixture = ""
