@@ -39,7 +39,8 @@
 //!
 //! Design: `.design/decomp/nmf.md`. Tracking: #1608. Each REQ is BINARY — SHIPPED
 //! (impl + non-test consumer + tests + green verification) or NOT-STARTED (concrete
-//! open blocker). Non-test consumers: crate re-export (`lib.rs:97`), the PyO3
+//! open blocker). Includes the standalone `non_negative_factorization` helper.
+//! Non-test consumers: crate re-export (`lib.rs:97`), the PyO3
 //! `_RsNMF` binding (`ferrolearn-python/src/extras.rs:1116`, registered `lib.rs:75`),
 //! `PipelineTransformer`. Oracle = live sklearn 1.5.2 (`_nmf.py`, `class NMF`), run
 //! from `/tmp` (R-CHAR-3). ferrolearn's ctor still DEFAULTS to MU + Random init;
@@ -48,8 +49,10 @@
 //! `init='nndsvd', solver='cd'` path is now BIT-EXACT to sklearn (#2398/#2394/#2395/
 //! #2396/#2397): the real SVD-based NNDSVD init (`init_nndsvd` via
 //! `ferray::linalg::svd_lapack` + `svd_flip_u_based`), the violation-ratio CD
-//! convergence (`solve_coordinate_descent`/`update_cd_sweep`), and the CD transform
-//! W-solve all reproduce sklearn to ~1e-9 (`tests/divergence_nmf_cd_nndsvd_2393.rs`).
+//! convergence (`solve_coordinate_descent`/`update_cd_sweep`), the CD transform
+//! W-solve, and the standalone `non_negative_factorization` W/H/n_iter all
+//! reproduce sklearn to ~1e-9 (`tests/divergence_nmf_cd_nndsvd_2393.rs`,
+//! `tests/divergence_non_negative_factorization.rs`).
 //!
 //! | REQ | Scope | Status | Evidence / Blocker |
 //! |---|---|---|---|
@@ -102,6 +105,32 @@ fn reject_non_finite<F: Float>(x: &Array2<F>) -> Result<(), FerroError> {
         });
     }
     Ok(())
+}
+
+/// Compute non-negative matrix factorization, returning `(W, H, n_iter)`.
+///
+/// This is the no-regularization Frobenius-loss path corresponding to
+/// scikit-learn's `non_negative_factorization(..., update_H=true,
+/// beta_loss="frobenius", alpha_W=0, alpha_H=0, l1_ratio=0, shuffle=false)`.
+/// Pass [`NMFInit::Nndsvd`] with [`NMFSolver::CoordinateDescent`] for the
+/// deterministic sklearn-parity path pinned by the divergence tests.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] when input validation fails or NNDSVD initialization
+/// cannot be computed.
+pub fn non_negative_factorization<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    n_components: usize,
+    init: NMFInit,
+    solver: NMFSolver,
+    max_iter: usize,
+    tol: f64,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array2<F>, usize), FerroError> {
+    let (w, h, n_iter, _) =
+        factorize_nmf(x, n_components, init, solver, max_iter, tol, random_state)?;
+    Ok((w, h, n_iter))
 }
 
 // ---------------------------------------------------------------------------
@@ -313,6 +342,49 @@ fn reconstruction_error<F: Float + 'static>(x: &Array2<F>, w: &Array2<F>, h: &Ar
         err = err + diff * diff;
     }
     err.sqrt()
+}
+
+fn validate_nmf_input<F: Float>(x: &Array2<F>, n_components: usize) -> Result<(), FerroError> {
+    let (n_samples, n_features) = x.dim();
+
+    if n_components == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: "must be at least 1".into(),
+        });
+    }
+    if n_samples == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "NMF::fit".into(),
+        });
+    }
+    if n_components > n_samples.min(n_features) {
+        return Err(FerroError::InvalidParameter {
+            name: "n_components".into(),
+            reason: format!(
+                "n_components ({n_components}) exceeds min(n_samples, n_features) = {}",
+                n_samples.min(n_features)
+            ),
+        });
+    }
+
+    // Finiteness FIRST: sklearn `NMF.fit_transform` and
+    // `non_negative_factorization` run `check_array` before
+    // `check_non_negative`, so NaN/Inf wins even when negatives are present.
+    reject_non_finite(x)?;
+
+    for &val in x {
+        if val < F::zero() {
+            return Err(FerroError::InvalidParameter {
+                name: "X".into(),
+                reason: "NMF requires all entries in X to be non-negative".into(),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 /// Small epsilon to prevent division by zero.
@@ -912,6 +984,39 @@ fn solve_coordinate_descent<F: Float + 'static>(
     n_iter
 }
 
+fn factorize_nmf<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    n_components: usize,
+    init: NMFInit,
+    solver: NMFSolver,
+    max_iter: usize,
+    tol: f64,
+    random_state: Option<u64>,
+) -> Result<(Array2<F>, Array2<F>, usize, F), FerroError> {
+    let (n_samples, n_features) = x.dim();
+    validate_nmf_input(x, n_components)?;
+
+    let seed = random_state.unwrap_or(0);
+
+    let (mut w, mut h) = match init {
+        NMFInit::Random => init_random(n_samples, n_features, n_components, seed),
+        NMFInit::Nndsvd => init_nndsvd(x, n_components)?,
+    };
+
+    let n_iter = match solver {
+        NMFSolver::MultiplicativeUpdate => {
+            solve_multiplicative_update(x, &mut w, &mut h, max_iter, tol)
+        }
+        NMFSolver::CoordinateDescent => {
+            solve_coordinate_descent(x, &mut w, &mut h, max_iter, tol, true)
+        }
+    };
+
+    let reconstruction_err = reconstruction_error(x, &w, &h);
+
+    Ok((w, h, n_iter, reconstruction_err))
+}
+
 // ---------------------------------------------------------------------------
 // Trait implementations
 // ---------------------------------------------------------------------------
@@ -930,70 +1035,15 @@ impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for NMF<F> {
     /// - [`FerroError::InsufficientSamples`] if there are zero samples.
     /// - [`FerroError::ConvergenceFailure`] if NNDSVD initialization fails.
     fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedNMF<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
-
-        if self.n_components == 0 {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: "must be at least 1".into(),
-            });
-        }
-        if n_samples == 0 {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "NMF::fit".into(),
-            });
-        }
-        if self.n_components > n_samples.min(n_features) {
-            return Err(FerroError::InvalidParameter {
-                name: "n_components".into(),
-                reason: format!(
-                    "n_components ({}) exceeds min(n_samples, n_features) = {}",
-                    self.n_components,
-                    n_samples.min(n_features)
-                ),
-            });
-        }
-
-        // Finiteness FIRST: sklearn `NMF.fit_transform` runs `_validate_data`
-        // (`_nmf.py:1652`) — default `force_all_finite=True` — BEFORE
-        // `check_non_negative` (`_nmf.py:1706`), so a NaN/Inf raises the
-        // finiteness `ValueError` even when a negative value is also present
-        // (`utils/validation.py:147-154`). Mirror that ordering here: reject
-        // non-finite, then check non-negativity. NaN AND infinity both rejected
-        // — replaces the prior silent-garbage `Ok` (#2288).
-        reject_non_finite(x)?;
-
-        // Check non-negativity.
-        for &val in x {
-            if val < F::zero() {
-                return Err(FerroError::InvalidParameter {
-                    name: "X".into(),
-                    reason: "NMF requires all entries in X to be non-negative".into(),
-                });
-            }
-        }
-
-        let seed = self.random_state.unwrap_or(0);
-
-        // Initialize W and H.
-        let (mut w, mut h) = match self.init {
-            NMFInit::Random => init_random(n_samples, n_features, self.n_components, seed),
-            NMFInit::Nndsvd => init_nndsvd(x, self.n_components)?,
-        };
-
-        // Solve.
-        let n_iter = match self.solver {
-            NMFSolver::MultiplicativeUpdate => {
-                solve_multiplicative_update(x, &mut w, &mut h, self.max_iter, self.tol)
-            }
-            NMFSolver::CoordinateDescent => {
-                solve_coordinate_descent(x, &mut w, &mut h, self.max_iter, self.tol, true)
-            }
-        };
-
-        let reconstruction_err = reconstruction_error(x, &w, &h);
+        let (_, h, n_iter, reconstruction_err) = factorize_nmf(
+            x,
+            self.n_components,
+            self.init,
+            self.solver,
+            self.max_iter,
+            self.tol,
+            self.random_state,
+        )?;
 
         Ok(FittedNMF {
             components_: h,

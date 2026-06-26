@@ -14,8 +14,9 @@
 //! - [`TruncatedSVD`] — Truncated Singular Value Decomposition using the
 //!   randomized algorithm. Does **not** centre data, making it suitable for
 //!   sparse inputs.
-//! - [`NMF`] — Non-negative Matrix Factorization. Decomposes a non-negative
-//!   matrix `X` into `W * H` where both factors are non-negative.
+//! - [`NMF`] / [`non_negative_factorization`] — Non-negative Matrix
+//!   Factorization. Decomposes a non-negative matrix `X` into `W * H` where
+//!   both factors are non-negative.
 //! - [`KernelPCA`] — Kernel PCA. Non-linear dimensionality reduction via
 //!   a kernel-induced feature space.
 //! - [`ClassicalMDS`] — Principal coordinates analysis / classical MDS via
@@ -98,7 +99,7 @@ pub use lda_topic::{
 pub use lle::{FittedLLE, LLE, locally_linear_embedding};
 pub use mds::{ClassicalMDS, Dissimilarity, FittedClassicalMDS, FittedMDS, MDS, smacof};
 pub use minibatch_nmf::{FittedMiniBatchNMF, MiniBatchNMF, MiniBatchNMFInit};
-pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver};
+pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver, non_negative_factorization};
 pub use pca::{FittedPCA, PCA};
 pub use sparse_pca::{FittedSparsePCA, SparsePCA};
 pub use spectral_embedding::{Affinity, FittedSpectralEmbedding, SpectralEmbedding};

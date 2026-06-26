@@ -11,7 +11,7 @@ use ferrolearn_decomp::{
     Isomap, Kernel, KernelPCA, LLE, LatentDirichletAllocation, LdaLearningMethod, MDS,
     MiniBatchNMF, MiniBatchNMFInit, NMF, NMFInit, NMFSolver, NonLinearity, PCA, PLSCanonical,
     PLSRegression, PLSSVD, SparsePCA, SpectralEmbedding, TruncatedSVD, Tsne, Umap, UmapMetric,
-    locally_linear_embedding, smacof, trustworthiness,
+    locally_linear_embedding, non_negative_factorization, smacof, trustworthiness,
 };
 use ndarray::Array2;
 
@@ -156,6 +156,20 @@ fn api_proof_nmf() {
             let _ = f.n_iter();
         }
     }
+
+    let (w, h, n_iter) = non_negative_factorization(
+        &x,
+        2,
+        NMFInit::Nndsvd,
+        NMFSolver::CoordinateDescent,
+        100,
+        1e-4,
+        Some(0),
+    )
+    .unwrap();
+    assert_eq!(w.dim(), (8, 2));
+    assert_eq!(h.dim(), (2, 5));
+    assert!(n_iter > 0);
 }
 
 #[test]

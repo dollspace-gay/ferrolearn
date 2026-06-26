@@ -8,7 +8,7 @@ upstream: scikit-learn 1.5.2
 upstream-paths:
   - sklearn/decomposition/_nmf.py  # class NMF(_BaseNMF) (:912-1130). ctor (:912-925): n_components=None, *, init=None, solver="cd", beta_loss="frobenius", tol=1e-4, max_iter=200, random_state=None, alpha_W=0.0, alpha_H="same", l1_ratio=0.0, verbose=0, shuffle=False. solver="cd" DEFAULT (:917). init=None -> "nndsvda" if n_components < min(n_samples, n_features) else "random" (:1000 _check_params / :302 _initialize_nmf). _initialize_nmf (:225-374): "random" (:317-328, avg-scaled randn abs), "nndsvd" (SVD-based: U,S,V = randomized_svd / svd, sign-corrected pos/neg split, :330-360), "nndsvda" (zeros -> average of X, :362-363), "nndsvdar" (zeros -> small random, :364-368), "custom" (:281-299). fit_transform (:1100-1130) -> _fit_transform (:1157+): solver "cd" -> _fit_coordinate_descent (:1268 call / :340 def), "mu" -> _fit_multiplicative_update (:1270 call); components_ = H, reconstruction_err_ = _beta_divergence(X, W, H, beta_loss, square_root=True), n_iter_. transform (:1213): W = _fit_transform(X, H=self.components_, update_H=False)[0] -> NNLS for W with H fixed. inverse_transform (:1238): W @ self.components_. _compute_regularization (:1275) for alpha_W/alpha_H/l1_ratio. _beta_divergence (:89), _gamma per beta_loss.
 ferrolearn-module: ferrolearn-decomp/src/nmf.rs
-parity-ops: NMF
+parity-ops: NMF, non_negative_factorization
 crosslink-issue: 1608
 -->
 
@@ -30,7 +30,17 @@ reconstruction_err_, n_iter_ }` (`nmf.rs`, struct at line 193, accessors
 'static` (both f32 and f64, `test_nmf_f32`). Re-exported at the crate root
 (`pub use nmf::{FittedNMF, NMF, NMFInit, NMFSolver}`, `lib.rs:97`) and bound in PyO3
 as `_RsNMF` (`ferrolearn-python/src/extras.rs:1116`, registered `lib.rs:75`, via the
-`py_transformer!` macro). There is NO `tests/divergence_nmf.rs` yet.
+`py_transformer!` macro). The standalone `non_negative_factorization` helper is
+also public and returns sklearn's `(W, H, n_iter)` tuple for the no-regularization
+Frobenius path.
+
+**STANDALONE FUNCTION VALUE PARITY (SHIPPED scoped).**
+`ferrolearn_decomp::non_negative_factorization` covers
+`sklearn.decomposition.non_negative_factorization` for `update_H=true`,
+`beta_loss="frobenius"`, `alpha_W=0`, `alpha_H=0`, `l1_ratio=0`,
+`shuffle=false`. On the deterministic `init='nndsvd'`, `solver='cd'` path,
+`tests/divergence_non_negative_factorization.rs` pins `W[0]`, `H[0]`, `n_iter`
+and `||X-WH||_F` against the live sklearn 1.5.2 oracle.
 
 **DEFAULT DIVERGENCE: solver + init.** ferrolearn defaults to
 `solver = MultiplicativeUpdate` + `init = Random` (`nmf.rs:105-106`), whereas sklearn
@@ -61,20 +71,19 @@ injectable-`H` constructor), so `transform` value parity FOLDS INTO this carve-o
 (REQ-9, INVESTIGATE-for-critic, like `minibatch_nmf` `#1487`).
 
 As of this iteration: the STRUCTURAL `components_` shape `(n_components, n_features)`,
-W/H non-negativity, finite `reconstruction_err_` that DECREASES with more
-iterations/components, positive `n_iter_`, determinism given a seed, f32 + f64, the
-two solvers (MU/CD) × two inits (Random/pseudo-NNDSVD) all run (REQ-1,2,3), the
-reconstruction-quality "did NMF work" signal `||X − W·H||` small (REQ-4), the
+W/H non-negativity, finite `reconstruction_err_`, positive `n_iter_`, determinism
+given a seed, f32 + f64, the two solvers (MU/CD) × two inits (Random/NNDSVD) all
+run (REQ-1,2,3), the reconstruction-quality "did NMF work" signal `||X − W·H||`
+small (REQ-4), deterministic `init="nndsvd"` + `solver="cd"` value parity for
+`components_`, `n_iter_`, `reconstruction_err_`, `transform` W, and standalone
+`non_negative_factorization` W/H/n_iter (REQ-5/6/7/9 scoped), the
 `inverse_transform` `W·H` algebra (REQ-10), the scoped error/parameter contracts
-(REQ-11), and the thin PyO3 binding (REQ-12, scoped) are SHIPPED; exact `components_`
-value parity (REQ-5, CARVE-OUT `#1609`), real `init="nndsvda"` default + SVD-based
-`nndsvd`/`nndsvdar`/`custom` (REQ-6, `#1610`), `solver="cd"` default (REQ-7,
-`#1611`), `beta_loss` (kl/is) + `_gamma` (REQ-8, `#1612`), the `transform` NNLS-W
-value (REQ-9, CARVE-OUT — folds into REQ-5, `#1613`), `n_components=None` default
-(REQ-13, `#1614`), regularization `alpha_W`/`alpha_H`/`l1_ratio` (REQ-14,
-`#1615`), `shuffle` (CD) + fitted attrs `n_components_`/`n_features_in_` (REQ-15,
-`#1616`), and the ferray substrate (REQ-16, `#1617`) are NOT-STARTED —
-**7 SHIPPED / 9 NOT-STARTED**.
+(REQ-11), and the thin PyO3 binding (REQ-12, scoped) are SHIPPED. Remaining open
+work: random/MU exact values (`#1609`), `nndsvda` default + `nndsvdar`/`custom`
+(`#1610`), `NMF::new` still defaulting to MU rather than cd (`#1611`), `beta_loss`
+KL/IS (`#1612`), `n_components=None` default (`#1614`), regularization
+`alpha_W`/`alpha_H`/`l1_ratio` (`#1615`), `shuffle` and fitted attrs
+`n_components_`/`n_features_in_` (`#1616`), and the ferray substrate (`#1617`).
 
 `NMF` / `FittedNMF` are existing pub APIs whose non-test consumers are the crate
 re-export (`lib.rs:97`), the `_RsNMF` PyO3 binding (`extras.rs:1116`, registered
@@ -107,7 +116,7 @@ print('||X-WH||:', round(float(np.linalg.norm(X-W@m.components_)),6))"
 # -> transform W shape: (4, 2) W non-neg: True          => W shape (n_samples,k) + non-neg (REQ-1/2)
 # -> ||X-WH||: 0.17132                                  => RECONSTRUCTION QUALITY: small (REQ-4 "did NMF work")
 
-# PROBE 2 (REQ-6/7/8/13/14/15 NOT-STARTED) — ctor defaults: solver='cd', init=None,
+# PROBE 2 (REQ-6/7/8/13/14/15 residual gaps) — ctor defaults: solver='cd', init=None,
 # beta_loss, alpha_*, l1_ratio, shuffle.
 python3 -c "
 from sklearn.decomposition import NMF
@@ -116,7 +125,7 @@ for p in ['n_components','init','solver','beta_loss','tol','max_iter','random_st
     print(f'{p} =', getattr(m,p))"
 # -> n_components = warn  init = None  solver = cd  beta_loss = frobenius  tol = 0.0001
 # -> max_iter = 200  random_state = None  alpha_W = 0.0  alpha_H = same  l1_ratio = 0.0  shuffle = False
-#    => sklearn DEFAULTS solver='cd' (REQ-7) + init=None->'nndsvda' (REQ-6); has beta_loss
+#    => sklearn DEFAULTS solver='cd' (REQ-7 residual) + init=None->'nndsvda' (REQ-6 residual); has beta_loss
 #       (REQ-8), alpha_W/alpha_H/l1_ratio (REQ-14), shuffle (REQ-15), n_components=None (REQ-13).
 #       ferrolearn defaults solver=MultiplicativeUpdate + init=Random (nmf.rs:105-106), no such params.
 
@@ -415,17 +424,12 @@ are the crate re-export (`lib.rs:97`), the `_RsNMF` PyO3 binding (`extras.rs:111
 registered `lib.rs:75`), and the `PipelineTransformer` impl (`nmf.rs:744`) — boundary
 public API, grandfathered S5/R-DEFER-1. Cites use symbol anchors (ferrolearn) /
 `file:line` (sklearn 1.5.2). Live oracle = installed sklearn 1.5.2, run from `/tmp`.
-**EXACT `components_` VALUE PARITY DIVERGES (R-HONEST-3, REQ-5 NOT-STARTED, CARVE-OUT
-`#1609`):** ferrolearn's Rust-`StdRng` uniform init (default `Random`) / pseudo-NNDSVD
-+ DEFAULT MU solver (`nmf.rs:617`) ≠ sklearn's SVD-based `nndsvda` default + `cd`
-default solver (`_nmf.py:912-1130`), and NMF is identifiable only up to
-permutation/scaling. **`transform` NNLS-W VALUE folds into the carve-out (REQ-9,
-`#1613`):** the `W` solve sits atop the carved-out `H` and `FittedNMF`'s fields are
-private. The least-confident SHIPPED claim is REQ-10 (`inverse_transform`) — the `W·H`
-algebra is exact and matches sklearn (Probe 3), but there is NO in-tree `#[test]`
-pinning it directly (the doctest exercises `transform`, not `inverse_transform`); a
-green-guard would harden it. #1608 is this doc's crosslink tracking issue. Count:
-**7 SHIPPED (REQ-1,2,3,4,10,11,12) / 9 NOT-STARTED (REQ-5,6,7,8,9,13,14,15,16)**.
+**VALUE PARITY STATUS.** Deterministic `init="nndsvd"` + `solver="cd"` is SHIPPED
+for `components_`, `n_iter_`, `reconstruction_err_`, `transform` W, and standalone
+`non_negative_factorization` W/H/n_iter. Random/MU and sklearn-default
+`init=None -> nndsvda` remain carve-outs/residual gaps because NMF is identifiable
+only up to permutation/scaling and sklearn uses defaults/RNG paths not yet mirrored.
+#1608 is this doc's crosslink tracking issue.
 
 | REQ | Status | Evidence |
 |---|---|---|
@@ -433,11 +437,11 @@ green-guard would harden it. #1608 is this doc's crosslink tracking issue. Count
 | REQ-2 (structural: non-negativity of components_ + W) | SHIPPED | MU updates are multiplicative on non-negative factors (`solve_multiplicative_update` `nmf.rs:478-495`), CD clamps each entry to `max(0,…)` (`solve_coordinate_descent` `:550-554`/`:581-585`), `transform`'s W is MU from a positive const (`:727-734`) — all stored `H` / returned `W` `≥ 0`. Probe 1 sklearn `components_` + `transform W` non-negative. **Scope: STRUCTURAL, NOT value parity (REQ-5).** Non-test consumers: re-export `lib.rs:97`, `_RsNMF` `extras.rs:1116`. Verification: `cargo test -p ferrolearn-decomp nmf` → `test_nmf_components_non_negative`, `test_nmf_transform_non_negative` PASS. |
 | REQ-3 (both solvers MU/CD × both inits Random/pseudo-NNDSVD run) | SHIPPED | `fn fit` (`nmf.rs:617`) dispatches init via `match self.init` (`:657-660`, `init_random` `:263` / `init_nndsvd` `:289`) and solver via `match self.solver` (`:663-670`, `solve_multiplicative_update` `:461` / `solve_coordinate_descent` `:511`) — all 4 combos fit. **Scope: STRUCTURAL each-path-runs, NOT value parity (REQ-5), real NNDSVD (REQ-6) or default-solver (REQ-7).** Non-test consumer: re-export `lib.rs:97`. Verification: `cargo test -p ferrolearn-decomp nmf` → `test_nmf_coordinate_descent_solver` `(2,4)`, `test_nmf_nndsvd_init` `(2,4)`, `test_nmf_cd_with_nndsvd` `(2,4)`, `test_nmf_medium_dataset_mu` `(3,4)`, `test_nmf_getters` PASS. |
 | REQ-4 (reconstruction QUALITY: ‖X−WH‖ small / decreasing — "did NMF work") | SHIPPED | `reconstruction_error` (`nmf.rs:247`) computes `‖X−W·H‖_F`; solvers monotonically reduce it, breaking on `|prev−err|<tol` (`:499`/`:591`); `test_nmf_medium_dataset_mu` asserts converged err `< 10.0`. Probe 1 sklearn `‖X−WH‖=0.17132` (init='random'), Probe 3 `0.854916` (default) confirm a small residual. **Scope: residual small/decreasing, NOT a tolerance match to sklearn's exact `reconstruction_err_` (folds into REQ-5).** Non-test consumer: re-export `lib.rs:97`. Verification: `cargo test -p ferrolearn-decomp nmf` → `test_nmf_medium_dataset_mu`, `test_nmf_reconstruction_error_decreases`, `test_nmf_more_components_lower_error` PASS. |
-| REQ-5 (EXACT `components_` value parity) | NOT-STARTED | open prereq blocker **#1609** (CARVE-OUT, R-DEFER-3). sklearn `fit_transform` (`_nmf.py:1100-1130`): `nndsvda` SVD init (`:225`/`:362`) + DEFAULT `cd` solver (`:340`), `components_ = H`. ferrolearn `fn fit` (`nmf.rs:617`): Rust `StdRng` uniform `init_random` (`:263`, default) / Jacobi-pseudo-NNDSVD `init_nndsvd` (`:289`) + DEFAULT MU `solve_multiplicative_update` (`:461`). Probe 1 sklearn `components_ row0 = [2.389149, 2.232745, 2.076342]` (init='random') / Probe 3 `[1.949292, 2.460614, 2.971937]` (default) NOT reproduced. NMF identifiable only up to permutation/scaling; no failing test (same class as `minibatch_nmf` / `dictionary_learning` / `sparse_pca` RNG carve-outs). |
-| REQ-6 (real `init="nndsvda"` default + SVD `nndsvd`/`nndsvdar`/`custom`) | NOT-STARTED | open prereq blocker **#1610**. sklearn defaults `init=None` → `"nndsvda"` (`_nmf.py:302`/`:1000`); `_initialize_nmf` (`:225-374`) implements real `nndsvd` (`svd(X)` + `svd_flip`, pos/neg split `u·sqrt(s)`/`sqrt(s)·v` `:330-360`), `nndsvda` (zeros→avg `:362`), `nndsvdar` (zeros→small random `:364`), `custom`. ferrolearn `NMFInit` (`nmf.rs:61`) has only `Random` (default `:106`) and `Nndsvd`; `init_nndsvd` (`:289`) is a Jacobi eigendecomp of `XᵀX` with negatives clamped `0` (`:322-327`) + `W=(X·Hᵀ)₊` (`:343-353`) — NOT SVD-based NNDSVD/nndsvda/nndsvdar, no `custom`, default `Random` not `nndsvda`. |
-| REQ-7 (`solver="cd"` DEFAULT) | NOT-STARTED | open prereq blocker **#1611**. sklearn defaults `solver="cd"` (`_nmf.py:917`) → `_fit_coordinate_descent` (`:340`). ferrolearn `NMF::new` defaults `solver=NMFSolver::MultiplicativeUpdate` (`nmf.rs:105`) — sklearn's NON-default. ferrolearn's `CoordinateDescent` variant (`:56`) exists but is not default and is a different element-wise CD (`:524-587`) from sklearn's `_update_cdnmf_fast` feature-block CD. |
+| REQ-5 (EXACT `components_` value parity) | SHIPPED deterministic / residual open | `tests/divergence_nmf_cd_nndsvd_2393.rs::divergence_components_cd_nndsvd` pins deterministic `init='nndsvd', solver='cd'` `components_[0]` against sklearn 1.5.2 to 1e-6; `tests/divergence_non_negative_factorization.rs` pins the same `H[0]` through the standalone function. Residual blocker **#1609**: random/MU/default paths remain RNG/default-sensitive carve-outs. |
+| REQ-6 (real `init="nndsvda"` default + SVD `nndsvd`/`nndsvdar`/`custom`) | SHIPPED `nndsvd` / residual open | `init_nndsvd` now uses LAPACK SVD + sklearn-style sign flip and pos/neg split; `test_nmf_nndsvd_init_matches_sklearn` and the cd+nndsvd divergence tests pin the path. Residual blocker **#1610**: no `nndsvda` default, no `nndsvdar`, no `custom`, and `NMF::new` still defaults to `Random`. |
+| REQ-7 (`solver="cd"` DEFAULT) | SHIPPED cd algorithm / residual open | `solve_coordinate_descent`/`update_cd_sweep` reproduce sklearn's violation-ratio CD path on the deterministic fixture (`n_iter_ == 151`, reconstruction norm `5.513563243249451`). Residual blocker **#1611**: `NMF::new` still defaults to `MultiplicativeUpdate`, not sklearn's `solver="cd"`. |
 | REQ-8 (`beta_loss` kl/is + `_gamma`) | NOT-STARTED | open prereq blocker **#1612**. sklearn `NMF(beta_loss="frobenius")` (`_nmf.py:919`, `StrOptions({"frobenius","kullback-leibler","itakura-saito"})`) + `_beta_divergence` (`:89`) + `_gamma` per `_beta_loss` for the MM step. ferrolearn `NMF<F>` (`nmf.rs:78`) has NO `beta_loss` field — only hard-coded Frobenius `reconstruction_error` (`:247`) + Frobenius MU/CD; no `_gamma`, no KL/IS. |
-| REQ-9 (`transform` NNLS-W VALUE) | NOT-STARTED | open prereq blocker **#1613** (CARVE-OUT — folds into REQ-5). sklearn `transform` (`_nmf.py:1213`): `W = _fit_transform(X, H=components_, update_H=False)[0]` — NNLS for `W` with `H` fixed. ferrolearn `transform` (`impl Transform for FittedNMF`, `nmf.rs:696`) solves `W` with `H` fixed too, via 200-iter MU (`:727-734`) from CONSTANT `0.1` init (`:722-723`). Both reach the same convex NNLS optimum, but `W` sits atop the carved-out fitted `H` (REQ-5) and `FittedNMF`'s fields are PRIVATE (no injectable-`H` API), so a transform value pin is gated on REQ-5. **INVESTIGATE (critic):** like `minibatch_nmf` `#1487` — add an injectable-`H` constructor + NNLS-residual green-guard, or fold into REQ-5. No failing test (R-DEFER-3). |
+| REQ-9 (`transform` NNLS-W VALUE) | SHIPPED deterministic | `FittedNMF::transform` solves W with H fixed via coordinate descent; `tests/divergence_nmf_cd_nndsvd_2393.rs::divergence_transform_w_cd_nndsvd` pins sklearn `NMF.transform(X)[0]` to 1e-6. `tests/divergence_non_negative_factorization.rs` separately pins the standalone fit W returned by sklearn's `non_negative_factorization`. |
 | REQ-10 (`inverse_transform` = `W·H`) | SHIPPED | sklearn `NMF.inverse_transform(W)` (`_nmf.py:1238`) = `W @ components_`. ferrolearn `FittedNMF::inverse_transform` (`nmf.rs:229`) returns `w.dot(&self.components_)` (`:238`) after a `w.ncols()==n_components` check (`:231-237`, `ShapeMismatch`) — EXACT same `W·H` algebra (deterministic, no value carve-out). Probe 3 sklearn `inverse_transform == W@H: True`. Non-test consumer: re-export `lib.rs:97`. **FLAG:** NOT exposed through `_RsNMF` (the `py_transformer!` macro `extras.rs:107` binds only ctor + `fit` + `transform`); no dedicated in-tree `#[test]` pins it (least-confident SHIPPED — a green-guard would harden the algebra). |
 | REQ-11 (error / parameter contracts, scoped) | SHIPPED | `fn fit` (`nmf.rs:617`) returns `Err(InvalidParameter{name:"n_components", ... "must be at least 1"})` for `==0` (`:620-625`), `Err(InsufficientSamples{required:1,...})` for `0` samples (`:626-632`), `Err(InvalidParameter{name:"n_components", ... "exceeds min(n_samples, n_features)"})` for `>min(n,p)` (`:633-642`), `Err(InvalidParameter{name:"X", ... "non-negative"})` on a negative entry (`:645-652`); `transform` returns `Err(ShapeMismatch)` on column mismatch (`:698-704`) + `Err(InvalidParameter{name:"X"})` on a negative entry (`:707-714`). Non-test consumer: re-export `lib.rs:97`. Verification: `cargo test -p ferrolearn-decomp nmf` (`test_nmf_invalid_n_components_zero`, `_invalid_n_components_too_large`, `_insufficient_samples`, `_negative_input_rejected`, `_transform_shape_mismatch`, `_transform_negative_rejected`, `_zero_entries`) PASS. **FLAG (candidate DIVs):** sklearn validates via `_parameter_constraints` + `check_non_negative` raising `InvalidParameterError`/`ValueError` (not `FerroError`); accepts `n_components=None` (REQ-13); does NOT pre-reject `n_components > min(n,p)` (downgrades `nndsvda`→`random`). |
 | REQ-12 (PyO3 binding: thin `n_components` ctor + `fit` + `transform`) | SHIPPED (scoped) | sklearn exposes `NMF` via `import sklearn.decomposition`. ferrolearn binds `_RsNMF` (`extras.rs:1116`, registered `lib.rs:75`) via `py_transformer!` (`extras.rs:107`): `__new__(n_components=2)` + `fit(X)` + `transform(X)` over `FittedNMF<f64>`. Inherits REQ-1/2/4 structural behaviour + the REQ-5 value carve-out. **Scope: thin fit/transform only — NOT `solver`/`init`/`tol`/`max_iter`/`random_state` params, NOT `components_`/`reconstruction_err_`/`n_iter_` getters, NOT `inverse_transform` (REQ-10).** This binding is the CPython non-test consumer of `FittedNMF<f64>`. |
@@ -517,22 +521,23 @@ square_root=True)`, `n_iter_`. `transform` (`:1213`) solves NNLS `W` with `H` fi
 
 **The remaining gap.** ferrolearn ships the STRUCTURAL shapes / non-negativity /
 finite-decreasing error / determinism (REQ-1,2), the four init×solver paths (REQ-3),
-the reconstruction-quality signal (REQ-4), the `inverse_transform` algebra (REQ-10),
-the scoped error/parameter contracts (REQ-11), and the thin PyO3 binding (REQ-12). It
-lacks: exact `components_` value parity (REQ-5, CARVE-OUT `#1609`); the real
-`nndsvda` default + SVD-based `nndsvd`/`nndsvdar`/`custom` (REQ-6, `#1610`); the
-`solver="cd"` default (REQ-7, `#1611`); `beta_loss` + `_gamma` (REQ-8, `#1612`);
-the `transform` NNLS-W value (REQ-9, CARVE-OUT, folds into REQ-5, `#1613`);
-`n_components=None` (REQ-13, `#1614`); regularization (REQ-14, `#1615`);
-`shuffle` + `n_components_`/`n_features_in_` attrs (REQ-15, `#1616`); and the ferray
-substrate (REQ-16, `#1617`). This is a **structure-SHIPPED-algorithm-NOT-STARTED**
-unit (7 SHIPPED / 9 NOT-STARTED).
+the reconstruction-quality signal (REQ-4), deterministic cd+nndsvd value parity
+for the fitted and standalone paths (REQ-5/6/7/9 scoped), the `inverse_transform`
+algebra (REQ-10), the scoped error/parameter contracts (REQ-11), and the thin PyO3
+binding (REQ-12). It lacks: random/MU exact values (`#1609`), `nndsvda` default +
+`nndsvdar`/`custom` (REQ-6 residual, `#1610`), the `NMF::new` `solver="cd"` default
+(REQ-7 residual, `#1611`), `beta_loss` + `_gamma` (REQ-8, `#1612`),
+`n_components=None` (REQ-13, `#1614`), regularization (REQ-14, `#1615`), `shuffle`
++ `n_components_`/`n_features_in_` attrs (REQ-15, `#1616`), and the ferray substrate
+(REQ-16, `#1617`).
 
 ## Verification
 
 Library crate (green at baseline `5b4b4d15`):
 ```bash
 cargo test -p ferrolearn-decomp nmf                        # in-module #[test]s + doctest
+cargo test -p ferrolearn-decomp --test divergence_nmf_cd_nndsvd_2393
+cargo test -p ferrolearn-decomp --test divergence_non_negative_factorization
 cargo clippy -p ferrolearn-decomp --all-targets -- -D warnings
 cargo fmt --all --check
 ```
@@ -549,10 +554,11 @@ The in-tree `#[test]`s pin REQ-1/2/3/4/11 (STRUCTURAL): `test_nmf_basic_fit` `(2
 `test_nmf_insufficient_samples`, `test_nmf_negative_input_rejected`,
 `test_nmf_transform_shape_mismatch`, `test_nmf_transform_negative_rejected` (REQ-11);
 plus `test_nmf_pipeline_integration` (the `PipelineTransformer` consumer) and the
-module doctest. REQ-10 (`inverse_transform` algebra) has NO dedicated `#[test]` — a
-green-guard would harden it (least-confident SHIPPED). There is NO
-`tests/divergence_nmf.rs` yet. REQ-5 (`components_` value parity) and REQ-9
-(`transform` NNLS-W) are CARVE-OUTs (R-DEFER-3, no failing test).
+module doctest. REQ-10 (`inverse_transform` algebra) is pinned by
+`tests/divergence_nmf.rs::green_inverse_transform_equals_w_dot_h`. Deterministic
+cd+nndsvd value parity is pinned by `tests/divergence_nmf_cd_nndsvd_2393.rs`;
+standalone `non_negative_factorization` W/H/n_iter parity is pinned by
+`tests/divergence_non_negative_factorization.rs`.
 
 Live sklearn oracle (installed 1.5.2, run from `/tmp`) — the REQ-1/2/4 structure +
 quality and the REQ-5 components value gap:

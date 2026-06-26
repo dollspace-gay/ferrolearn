@@ -224,6 +224,11 @@ phase = "decomp"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_decomp::non_negative_factorization"
+phase = "decomp"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_decomp::NMFInit"
 phase = "decomp"
 fixture = ""
