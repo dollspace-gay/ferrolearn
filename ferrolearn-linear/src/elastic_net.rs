@@ -37,8 +37,10 @@
 //! | REQ-10 (selection='random' + random_state) | SHIPPED | Reuses `pub enum CoordSelection { Cyclic, Random }` from `lasso.rs` + `pub selection`/`pub random_state` fields on `ElasticNet` with `with_selection`/`with_random_state` builders, mirroring sklearn `ElasticNet(selection=..., random_state=...)` (`_coordinate_descent.py` `__init__`). `Fit::fit`'s CD loop visits `0..n_features` in order for `Cyclic` (BYTE-IDENTICAL to the prior cyclic path, so coef_/`n_iter_`/dual-gap stay unchanged) and shuffles a reused index `Vec` each sweep for `Random` via `StdRng::seed_from_u64(random_state.unwrap_or(0))` (sklearn `_cd_fast.pyx` `enet_coordinate_descent` `random` branch picks `ii` instead of `f_iter`); per-coordinate update math + dual-gap stopping (REQ-13) are unchanged. The ElasticNet optimum is unique, so `Random` converges to the same optimum (≈3e-4 from cyclic due to stopping-within-tol). Exact bit-match to sklearn's `selection='random'` is numpy-MT19937-RNG-blocked (Rust `StdRng` ≠ numpy MT), so the random path verifies convergence-to-the-unique-optimum, not bitwise sklearn parity; the cyclic default IS bit-exact. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_selection_cyclic_default_unchanged`, `enet_selection_random_converges_to_optimum`). |
 //! | REQ-11 (precompute/Gram) | SHIPPED | `pub precompute: bool` field (default `false`) on `ElasticNet` + `with_precompute` builder, mirroring sklearn `ElasticNet(precompute=False)` (`_coordinate_descent.py:774`). When `true`, `Fit::fit` runs CD on the precomputed `Q = Xcᵀ Xc` / `q = Xcᵀ yc` with an incrementally-maintained `H = Q·w` (sklearn `_cd_fast.pyx enet_coordinate_descent_gram`); `tmp = (q[j]−H[j])/n + col_norms[j]·w[j] ≡` the direct path's `rho_j + (XⱼᵀXⱼ/n)·w_old` since `Xⱼᵀr = q[j]−(Q·w)[j]`, then `soft_threshold(tmp, α·l1_ratio)/(col_norm + α·(1−l1_ratio))` keeps the L2 term in the denominator, so it reaches the SAME unique optimum (to ~1e-10 fp reassociation) with the SAME coordinate order + dual-gap stopping. `precompute=false` (default) is the byte-identical direct path. Verification: `cargo test -p ferrolearn-linear --lib elastic_net` (`enet_precompute_matches_sklearn`, `enet_precompute_default_false_unchanged`, `enet_precompute_equals_direct`). |
 //! | REQ-9 (warm_start) | SHIPPED | `ElasticNet<F>` carries `pub warm_start: bool` (default `false`) + `pub coef_init: Option<Array1<F>>` (default `None`) with `with_warm_start`/`with_coef_init` builders, mirroring sklearn `ElasticNet(warm_start=False)` (`_coordinate_descent.py:795`). R-DEV-4 adaptation: ferrolearn estimators are immutable value types — there is no mutable `self.coef_` carried across repeated `.fit()` calls like sklearn's mutable estimator (`_coordinate_descent.py:1062-1063` reuses `self.coef_` when `warm_start`), so the prior coefficient vector is supplied EXPLICITLY via `coef_init` (sklearn's path solver seeds the same way: `_coordinate_descent.py:648-651`, `coef_ = np.zeros(...)` when `coef_init is None` else `np.asfortranarray(coef_init, ...)`). In `Fit::fit`, when `warm_start && coef_init.is_some()` the init vector is length-validated (`ShapeMismatch` on mismatch) and `w` is cloned from it (the direct path also seeds `residual = y_work − X_work·w`; the Gram path's `H = Q·w` already derives from the actual `w`); otherwise `w = zeros` — BYTE-IDENTICAL to the cold path. The numerics are identical, only the CD start point changes, so warm-from-converged reaches the same unique optimum in fewer sweeps. Verification (live sklearn 1.5.2 oracle, R-CHAR-3): cold `ElasticNet(alpha=0.5, l1_ratio=0.5)` → coef `[0.7643620892, 1.2564536255]`, `n_iter_=14`; warm (refit from converged coef) → coef `[0.7642996441, 1.2564980309]`, `n_iter_=1`. Tests `enet_warm_start_from_converged_matches_sklearn`, `enet_warm_start_default_unchanged`, `enet_warm_start_none_coef_init_equals_cold`, `enet_warm_start_coef_init_wrong_len_errors`. |
-//! | REQ-14..15 NOT-STARTED | MultiTaskElasticNet (#418), ferray substrate (#419). |
+//! | REQ-14 (MultiTaskElasticNet) | SHIPPED | Implemented in `multi_task_elastic_net.rs`; see `.design/linear/elastic_net.md`. |
+//! | REQ-15 (`enet_path` public helper) | SHIPPED | `pub fn enet_path` + `EnetPathOptions` / `EnetPathResult` expose the dense single-output Rust analogue of `sklearn.linear_model.enet_path`, returning sorted alphas, coefficient path `(n_features, n_alphas)`, dual gaps, and per-alpha iteration counts. Oracle tests `enet_path_*_matches_sklearn`. |
 //! | REQ-16 (non-finite input rejected) | SHIPPED | `Fit::fit for ElasticNet` rejects any NaN/+/-inf in X or y BEFORE coordinate descent with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_coordinate_descent.py:980`, default `force_all_finite=True` → `check_array` raises `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`). `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; the finite path is byte-identical (the guard never fires on finite input). Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `ElasticNet().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite.rs::enet_*`). Non-test consumer: the existing `Fit::fit` / `RsElasticNet` / `ElasticNetCV` consumers. (#2256) |
+//! | REQ-substrate (ferray) | NOT-STARTED | Open prereq blocker #419; this module still computes on `ndarray`. |
 //!
 //! acto-critic: NO DIVERGENCE FOUND — coef/intercept grid parity, l1_ratio=1↔Lasso, l1_ratio=0↔L2,
 //! sparsity support, default l1_ratio, and a badly-scaled-feature stress all match the live oracle.
@@ -297,6 +299,360 @@ pub struct FittedElasticNet<F> {
     n_iter: usize,
     /// Duality gap at the returned solution (mirrors sklearn `ElasticNet.dual_gap_`).
     dual_gap: F,
+}
+
+/// Options for [`enet_path`].
+#[derive(Debug, Clone)]
+pub struct EnetPathOptions<F> {
+    /// Explicit alphas. When provided, values are sorted descending to match
+    /// sklearn's path helper.
+    pub alphas: Option<Vec<F>>,
+    /// Ratio between the smallest and largest generated alpha.
+    pub eps: F,
+    /// Number of generated alphas when [`EnetPathOptions::alphas`] is `None`.
+    pub n_alphas: usize,
+    /// L1/L2 mixing ratio.
+    pub l1_ratio: F,
+    /// Maximum coordinate-descent sweeps per alpha.
+    pub max_iter: usize,
+    /// Coordinate-descent tolerance.
+    pub tol: F,
+    /// Whether to run coordinate descent on a precomputed Gram matrix.
+    pub precompute: bool,
+    /// Coordinate-selection order.
+    pub selection: CoordSelection,
+    /// Seed used when `selection == CoordSelection::Random`.
+    pub random_state: Option<u64>,
+    /// Whether coefficients are constrained to be non-negative.
+    pub positive: bool,
+}
+
+impl<F: Float> EnetPathOptions<F> {
+    /// Create default options matching sklearn's dense helper defaults for the
+    /// supported single-output path: `eps=1e-3`, `n_alphas=100`,
+    /// `l1_ratio=0.5`, `max_iter=1000`, `tol=1e-4`, cyclic selection, and
+    /// `positive=false`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            alphas: None,
+            eps: F::from(1e-3).unwrap(),
+            n_alphas: 100,
+            l1_ratio: F::from(0.5).unwrap(),
+            max_iter: 1000,
+            tol: F::from(1e-4).unwrap(),
+            precompute: false,
+            selection: CoordSelection::Cyclic,
+            random_state: None,
+            positive: false,
+        }
+    }
+
+    /// Set an explicit alpha grid.
+    #[must_use]
+    pub fn with_alphas(mut self, alphas: Vec<F>) -> Self {
+        self.alphas = Some(alphas);
+        self
+    }
+
+    /// Set the generated-grid min/max alpha ratio.
+    #[must_use]
+    pub fn with_eps(mut self, eps: F) -> Self {
+        self.eps = eps;
+        self
+    }
+
+    /// Set the number of generated alphas.
+    #[must_use]
+    pub fn with_n_alphas(mut self, n_alphas: usize) -> Self {
+        self.n_alphas = n_alphas;
+        self
+    }
+
+    /// Set the L1/L2 mixing ratio.
+    #[must_use]
+    pub fn with_l1_ratio(mut self, l1_ratio: F) -> Self {
+        self.l1_ratio = l1_ratio;
+        self
+    }
+
+    /// Set maximum coordinate-descent sweeps per alpha.
+    #[must_use]
+    pub fn with_max_iter(mut self, max_iter: usize) -> Self {
+        self.max_iter = max_iter;
+        self
+    }
+
+    /// Set coordinate-descent tolerance.
+    #[must_use]
+    pub fn with_tol(mut self, tol: F) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set whether to use the Gram/precompute solver.
+    #[must_use]
+    pub fn with_precompute(mut self, precompute: bool) -> Self {
+        self.precompute = precompute;
+        self
+    }
+
+    /// Set coordinate-selection order.
+    #[must_use]
+    pub fn with_selection(mut self, selection: CoordSelection) -> Self {
+        self.selection = selection;
+        self
+    }
+
+    /// Set RNG seed for random coordinate selection.
+    #[must_use]
+    pub fn with_random_state(mut self, seed: u64) -> Self {
+        self.random_state = Some(seed);
+        self
+    }
+
+    /// Set whether coefficients are constrained to be non-negative.
+    #[must_use]
+    pub fn with_positive(mut self, positive: bool) -> Self {
+        self.positive = positive;
+        self
+    }
+}
+
+impl<F: Float> Default for EnetPathOptions<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result returned by [`enet_path`].
+#[derive(Debug, Clone)]
+pub struct EnetPathResult<F> {
+    alphas: Array1<F>,
+    coefficients: Array2<F>,
+    dual_gaps: Array1<F>,
+    n_iters: Vec<usize>,
+}
+
+impl<F: Float> EnetPathResult<F> {
+    /// Borrow the alpha grid, sorted descending.
+    #[must_use]
+    pub fn alphas(&self) -> &Array1<F> {
+        &self.alphas
+    }
+
+    /// Borrow the coefficient path, shaped `(n_features, n_alphas)`.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array2<F> {
+        &self.coefficients
+    }
+
+    /// Borrow the dual gaps, one per alpha.
+    #[must_use]
+    pub fn dual_gaps(&self) -> &Array1<F> {
+        &self.dual_gaps
+    }
+
+    /// Borrow the per-alpha coordinate-descent iteration counts.
+    #[must_use]
+    pub fn n_iters(&self) -> &[usize] {
+        &self.n_iters
+    }
+}
+
+/// Compute a dense single-output ElasticNet regularization path.
+///
+/// This is the Rust analogue of `sklearn.linear_model.enet_path` for dense
+/// `ndarray` inputs and a one-dimensional target. Inputs are used as provided:
+/// no intercept is fitted and no centering is performed. Callers that need an
+/// intercept should center `X` and `y` before calling this helper, matching
+/// sklearn's path-helper contract.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent shapes, empty input, non-finite
+/// values, invalid alpha-grid options, invalid `l1_ratio`, or solver errors
+/// from the per-alpha coordinate-descent fits.
+pub fn enet_path<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: EnetPathOptions<F>,
+) -> Result<EnetPathResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    validate_enet_path_inputs(x, y)?;
+    if options.max_iter == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "max_iter".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if options.tol < F::zero() || !options.tol.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "tol".into(),
+            reason: "must be finite and non-negative".into(),
+        });
+    }
+    if options.l1_ratio < F::zero() || options.l1_ratio > F::one() || !options.l1_ratio.is_finite()
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "l1_ratio".into(),
+            reason: "must be finite and in [0, 1]".into(),
+        });
+    }
+
+    let alphas_vec = resolve_enet_alphas(x, y, &options)?;
+    let n_features = x.ncols();
+    let n_alphas = alphas_vec.len();
+
+    let mut coefficients = Array2::<F>::zeros((n_features, n_alphas));
+    let mut dual_gaps = Array1::<F>::zeros(n_alphas);
+    let mut n_iters = Vec::with_capacity(n_alphas);
+    let mut previous_coef: Option<Array1<F>> = None;
+
+    for (alpha_idx, &alpha) in alphas_vec.iter().enumerate() {
+        let mut model = ElasticNet::<F>::new()
+            .with_alpha(alpha)
+            .with_l1_ratio(options.l1_ratio)
+            .with_max_iter(options.max_iter)
+            .with_tol(options.tol)
+            .with_fit_intercept(false)
+            .with_precompute(options.precompute)
+            .with_selection(options.selection)
+            .with_positive(options.positive);
+        if let Some(seed) = options.random_state {
+            model = model.with_random_state(seed);
+        }
+        if let Some(coef) = previous_coef.clone() {
+            model = model.with_warm_start(true).with_coef_init(coef);
+        }
+
+        let fitted = model.fit(x, y)?;
+        coefficients
+            .column_mut(alpha_idx)
+            .assign(fitted.coefficients());
+        dual_gaps[alpha_idx] = fitted.dual_gap();
+        n_iters.push(fitted.n_iter());
+        previous_coef = Some(fitted.coefficients().clone());
+    }
+
+    Ok(EnetPathResult {
+        alphas: Array1::from_vec(alphas_vec),
+        coefficients,
+        dual_gaps,
+        n_iters,
+    })
+}
+
+fn validate_enet_path_inputs<F: Float>(x: &Array2<F>, y: &Array1<F>) -> Result<(), FerroError> {
+    let n_samples = x.nrows();
+    if n_samples != y.len() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![y.len()],
+            context: "y length must match number of samples in X".into(),
+        });
+    }
+    if n_samples == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "enet_path requires at least one sample".into(),
+        });
+    }
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_enet_alphas<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: &EnetPathOptions<F>,
+) -> Result<Vec<F>, FerroError>
+where
+    F: Float + FromPrimitive + 'static,
+{
+    if let Some(alphas) = &options.alphas {
+        if alphas.is_empty() {
+            return Err(FerroError::InvalidParameter {
+                name: "alphas".into(),
+                reason: "must not be empty".into(),
+            });
+        }
+        let mut alphas = alphas.clone();
+        for alpha in &alphas {
+            if !alpha.is_finite() || *alpha < F::zero() {
+                return Err(FerroError::InvalidParameter {
+                    name: "alphas".into(),
+                    reason: "must contain finite non-negative values".into(),
+                });
+            }
+        }
+        alphas.sort_by(|a, b| b.partial_cmp(a).unwrap_or(core::cmp::Ordering::Equal));
+        return Ok(alphas);
+    }
+
+    if options.l1_ratio == F::zero() {
+        return Err(FerroError::InvalidParameter {
+            name: "l1_ratio".into(),
+            reason: "automatic alpha grid generation is not supported for l1_ratio=0".into(),
+        });
+    }
+    if options.n_alphas == 0 {
+        return Err(FerroError::InvalidParameter {
+            name: "n_alphas".into(),
+            reason: "must be positive".into(),
+        });
+    }
+    if options.eps <= F::zero() || !options.eps.is_finite() {
+        return Err(FerroError::InvalidParameter {
+            name: "eps".into(),
+            reason: "must be finite and positive".into(),
+        });
+    }
+
+    let n_f = F::from(x.nrows()).ok_or_else(|| FerroError::NumericalInstability {
+        message: "failed to convert n_samples to float".into(),
+    })?;
+    let x_ty = x.t().dot(y);
+    let mut alpha_max =
+        x_ty.iter().fold(F::zero(), |acc, &v| acc.max(v.abs())) / (n_f * options.l1_ratio);
+    if alpha_max <= F::zero() {
+        alpha_max = F::epsilon();
+    }
+
+    if options.n_alphas == 1 {
+        return Ok(vec![alpha_max]);
+    }
+
+    let eps_f64 = options
+        .eps
+        .to_f64()
+        .ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert eps to f64".into(),
+        })?;
+    let denom = (options.n_alphas - 1) as f64;
+    let mut alphas = Vec::with_capacity(options.n_alphas);
+    for i in 0..options.n_alphas {
+        let ratio = eps_f64.powf(i as f64 / denom);
+        let ratio_f = F::from(ratio).ok_or_else(|| FerroError::NumericalInstability {
+            message: "failed to convert generated alpha ratio".into(),
+        })?;
+        alphas.push(alpha_max * ratio_f);
+    }
+    Ok(alphas)
 }
 
 impl<F: Float> FittedElasticNet<F> {

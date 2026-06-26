@@ -19,14 +19,14 @@ use ferrolearn_core::traits::{Fit, Predict};
 use ferrolearn_linear::sgd::{ClassifierLoss, LearningRateSchedule, RegressorLoss};
 use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
-    ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, GLMFamily,
-    GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA, Lars, Lasso,
-    LassoCV, LassoLars, LassoPathOptions, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR,
-    LinearSVRLoss, LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM,
+    ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, EnetPathOptions,
+    GLMFamily, GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA,
+    Lars, Lasso, LassoCV, LassoLars, LassoPathOptions, LinearRegression, LinearSVC, LinearSVCLoss,
+    LinearSVR, LinearSVRLoss, LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM,
     OrthogonalMatchingPursuit, OrthogonalMpGramOptions, OrthogonalMpOptions, PoissonRegressor, QDA,
     QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV, RidgeClassifier,
-    RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c,
-    lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
+    RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, enet_path,
+    l1_min_c, lasso_path, orthogonal_mp, orthogonal_mp_gram, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -153,6 +153,19 @@ fn api_proof_elastic_net_family() {
     let _ = f.score(&x, &y, None).unwrap();
     let f_cv = ElasticNetCV::<f64>::new().fit(&x, &y).unwrap();
     let _ = f_cv.score(&x, &y, None).unwrap();
+
+    let path = enet_path(
+        &x,
+        &y,
+        EnetPathOptions::default()
+            .with_l1_ratio(0.5)
+            .with_alphas(vec![0.1, 0.01]),
+    )
+    .unwrap();
+    assert_eq!(path.alphas().len(), 2);
+    assert_eq!(path.coefficients().dim(), (x.ncols(), 2));
+    assert_eq!(path.dual_gaps().len(), 2);
+    assert_eq!(path.n_iters().len(), 2);
 }
 
 #[test]
