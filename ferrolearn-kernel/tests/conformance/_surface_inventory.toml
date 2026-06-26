@@ -144,6 +144,16 @@ phase = "kernel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_kernel::Hyperparameter"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::HyperparameterBounds"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::Kernel"
 phase = "kernel"
 fixture = ""

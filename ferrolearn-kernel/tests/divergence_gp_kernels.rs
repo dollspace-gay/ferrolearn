@@ -5,9 +5,10 @@
 //! Translation unit #1911. GP kernels are DETERMINISTIC, so every kernel-matrix
 //! value is directly oracle-comparable. The SHIPPED kernels (RBF, Matern
 //! nu∈{0.5,1.5,2.5}, RationalQuadratic, ExpSineSquared, Constant, DotProduct,
-//! White, Sum, Product, Exponentiation, CompoundKernel) are pinned here
-//! as PASSING oracle GREEN GUARDS: each `compute`/`diagonal` is asserted
-//! element-wise (~1e-12) against the live sklearn 1.5.2 oracle.
+//! White, Sum, Product, Exponentiation, CompoundKernel, and Hyperparameter
+//! metadata) are pinned here as PASSING oracle GREEN GUARDS: each
+//! `compute`/`diagonal` or metadata surface is asserted against the live sklearn
+//! 1.5.2 oracle.
 //!
 //! R-CHAR-3: every expected literal below was produced by a live `sklearn`
 //! call run from `/tmp` (sklearn 1.5.2), NEVER copied from ferrolearn's own
@@ -19,7 +20,8 @@
 //! are `-l blocker` issues WITHOUT a stranded red test:
 //!
 //! - REQ-8 eval_gradient / analytic dK/dθ (no trait method) — blocker.
-//! - REQ-9 theta/bounds/Hyperparameter/fixed/n_dims machinery — blocker.
+//! - REQ-9 full theta/bounds/fixed optimizer machinery — blocker. REQ-19 ships
+//!   default Hyperparameter metadata, log-space bounds, and n_dims guards.
 //! - REQ-11 WhiteKernel `Y is None` vs explicit-`Y` semantics — blocker (needs a
 //!   self/Y=None channel across every kernel + GPR/GPC).
 //! - REQ-12 anisotropic (array) length_scale — blocker.
@@ -33,7 +35,8 @@
 
 use ferrolearn_kernel::{
     CompoundKernel, ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel,
-    MaternKernel, ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
+    Hyperparameter, HyperparameterBounds, MaternKernel, ProductKernel, RBFKernel,
+    RationalQuadratic, SumKernel, WhiteKernel,
 };
 use ndarray::{Array2, Array3, array};
 
@@ -76,6 +79,22 @@ fn assert_stack(actual: &Array3<f64>, expected: &[&[&[f64]]]) {
                 );
             }
         }
+    }
+}
+
+fn assert_default_log_bounds(actual: &Array2<f64>, rows: usize) {
+    assert_eq!(actual.dim(), (rows, 2), "bounds shape");
+    for (i, row) in actual.rows().into_iter().enumerate() {
+        assert!(
+            (row[0] - 1e-5_f64.ln()).abs() < 1e-12,
+            "bounds[{i},0] = {} != sklearn ln(1e-5)",
+            row[0]
+        );
+        assert!(
+            (row[1] - 1e5_f64.ln()).abs() < 1e-12,
+            "bounds[{i},1] = {} != sklearn ln(1e5)",
+            row[1]
+        );
     }
 }
 
@@ -348,6 +367,127 @@ fn green_rbf_theta_log_transform() {
 }
 
 // ---------------------------------------------------------------------------
+// REQ-19 — Hyperparameter / bounds / n_dims metadata  (GREEN GUARD)
+// oracle: sklearn Hyperparameter repeats a single numeric bounds row for
+// vector-valued parameters, derives fixed=True from bounds="fixed", and scalar
+// GP kernels expose default numeric bounds `(1e-5, 1e5)` in log space.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn green_hyperparameter_constructor_repeats_bounds_and_derives_fixed() {
+    // sklearn 1.5.2, /tmp:
+    // Hyperparameter("length_scale","numeric",(1e-5,1e5),3).bounds.tolist()
+    // == [[1e-5,1e5],[1e-5,1e5],[1e-5,1e5]], fixed == False
+    let hp = Hyperparameter::<f64>::new(
+        "length_scale",
+        "numeric",
+        HyperparameterBounds::Numeric(vec![(1e-5_f64, 1e5_f64)]),
+        3,
+        None,
+    );
+    assert_eq!(hp.name, "length_scale");
+    assert_eq!(hp.value_type, "numeric");
+    assert_eq!(hp.n_elements, 3);
+    assert!(!hp.fixed);
+    let bounds = hp.bounds_array().unwrap();
+    assert_eq!(bounds.dim(), (3, 2));
+    for row in bounds.rows() {
+        assert!((row[0] - 1e-5_f64).abs() < 1e-15);
+        assert!((row[1] - 1e5_f64).abs() < 1e-9);
+    }
+
+    // sklearn 1.5.2, /tmp:
+    // Hyperparameter("length_scale","numeric","fixed").fixed == True
+    let fixed = Hyperparameter::<f64>::fixed("length_scale", "numeric", 1);
+    assert!(fixed.fixed);
+    assert!(fixed.bounds_array().is_none());
+}
+
+#[test]
+fn green_scalar_kernel_hyperparameters_bounds_and_n_dims() {
+    // sklearn 1.5.2, /tmp:
+    // RBF(1.5).hyperparameters == [Hyperparameter(name="length_scale", ...)]
+    // RBF(1.5).bounds == [[ln(1e-5), ln(1e5)]], n_dims == 1
+    let rbf = RBFKernel::new(1.5);
+    let rbf_hyperparameters = rbf.hyperparameters();
+    assert_eq!(rbf_hyperparameters.len(), 1);
+    assert_eq!(rbf_hyperparameters[0].name, "length_scale");
+    assert_eq!(rbf_hyperparameters[0].value_type, "numeric");
+    assert_eq!(rbf_hyperparameters[0].n_elements, 1);
+    assert!(!rbf_hyperparameters[0].fixed);
+    assert_eq!(rbf.n_dims(), 1);
+    assert_default_log_bounds(&rbf.bounds(), 1);
+
+    // sklearn 1.5.2, /tmp:
+    // RationalQuadratic(...).hyperparameters names: ["alpha", "length_scale"]
+    let rq = RationalQuadratic::new(1.3, 0.7);
+    let rq_names: Vec<_> = rq
+        .hyperparameters()
+        .into_iter()
+        .map(|hyperparameter| hyperparameter.name)
+        .collect();
+    assert_eq!(rq_names, vec!["alpha", "length_scale"]);
+    assert_eq!(rq.n_dims(), 2);
+    assert_default_log_bounds(&rq.bounds(), 2);
+
+    // sklearn 1.5.2, /tmp:
+    // ExpSineSquared(...).hyperparameters names: ["length_scale", "periodicity"]
+    let periodic = ExpSineSquared::new(1.3, 2.0);
+    let periodic_names: Vec<_> = periodic
+        .hyperparameters()
+        .into_iter()
+        .map(|hyperparameter| hyperparameter.name)
+        .collect();
+    assert_eq!(periodic_names, vec!["length_scale", "periodicity"]);
+    assert_eq!(periodic.n_dims(), 2);
+    assert_default_log_bounds(&periodic.bounds(), 2);
+}
+
+#[test]
+fn green_composite_hyperparameter_names_bounds_and_n_dims() {
+    // sklearn 1.5.2, /tmp:
+    // (ConstantKernel(2.0)*RBF(1.5)+WhiteKernel(0.1)).hyperparameters names
+    // == ["k1__k1__constant_value", "k1__k2__length_scale", "k2__noise_level"]
+    // theta == [ln(2.0), ln(1.5), ln(0.1)], bounds.shape == (3,2), n_dims == 3
+    let k = SumKernel::new(
+        Box::new(ProductKernel::new(
+            Box::new(ConstantKernel::new(2.0)),
+            Box::new(RBFKernel::new(1.5)),
+        )),
+        Box::new(WhiteKernel::new(0.1)),
+    );
+    let names: Vec<_> = k
+        .hyperparameters()
+        .into_iter()
+        .map(|hyperparameter| hyperparameter.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec![
+            "k1__k1__constant_value",
+            "k1__k2__length_scale",
+            "k2__noise_level"
+        ]
+    );
+    let theta = k.get_params();
+    let theta_oracle = [
+        std::f64::consts::LN_2,
+        0.405_465_108_108_164_4_f64,
+        -2.302_585_092_994_045_5,
+    ];
+    assert_eq!(theta.len(), theta_oracle.len());
+    for (i, &e) in theta_oracle.iter().enumerate() {
+        assert!(
+            (theta[i] - e).abs() < 1e-12,
+            "theta[{i}] = {} != sklearn {e}",
+            theta[i]
+        );
+    }
+    assert_eq!(k.n_dims(), 3);
+    assert_default_log_bounds(&k.bounds(), 3);
+}
+
+// ---------------------------------------------------------------------------
 // REQ-13 — RationalQuadratic  (GREEN GUARD)
 // oracle: RationalQuadratic(length_scale=1.3, alpha=0.7)(X), (X, X2),
 // .diag(X), and theta order [ln alpha, ln length_scale].
@@ -594,4 +734,7 @@ fn green_compound_kernel_theta_log_order() {
             params[i]
         );
     }
+    assert_eq!(k.hyperparameters().len(), 0);
+    assert_eq!(k.n_dims(), 3);
+    assert_default_log_bounds(&k.bounds(), 3);
 }

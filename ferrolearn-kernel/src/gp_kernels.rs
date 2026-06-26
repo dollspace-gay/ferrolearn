@@ -26,13 +26,13 @@
 //! ## REQ status
 //!
 //! Mirrors `sklearn.gaussian_process.kernels` (`kernels.py`, v1.5.2 commit
-//! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (18 REQs). Every REQ is
+//! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (19 REQs). Every REQ is
 //! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GP
 //! kernels are DETERMINISTIC, so the existing kernels' matrix values are directly
-//! oracle-verified element-wise (30 green guards in `tests/divergence_gp_kernels.rs`).
+//! oracle-verified element-wise (33 green guards in `tests/divergence_gp_kernels.rs`).
 //! The gaps are missing-feature / prerequisite blockers, not value errors.
 //!
-//! **13 SHIPPED / 5 NOT-STARTED.**
+//! **14 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -44,7 +44,7 @@
 //! | REQ-6 (log-space `get_params`/`set_params`) | SHIPPED | hyperparameters round-trip in log space, matching sklearn `theta` (e.g. `(RBF(1.5)+White(0.1)).theta == [ln1.5, ln0.1]`); oracle-verified. |
 //! | REQ-7 (production consumer) | SHIPPED | `GaussianProcessRegressor`/`GaussianProcessClassifier` (`gaussian_process.rs`, `gp_classifier.rs`) consume `compute`/`diagonal` in `fit`/`predict`; re-exported via `lib.rs`. |
 //! | REQ-8 (`eval_gradient` / dK/dθ) | NOT-STARTED | trait has `compute`/`diagonal` only; sklearn `__call__(eval_gradient=True)` returns `(K, K_gradient)` shape `(n,n,n_dims)` for the GPR LML optimizer. Blocker #1912. |
-//! | REQ-9 (theta/bounds/Hyperparameter machinery) | NOT-STARTED | no `bounds`/`Hyperparameter`/`fixed`/`n_dims`; only flat log-space params (`:272-358`). Blocker #1913. |
+//! | REQ-9 (full theta/bounds/fixed optimizer machinery) | NOT-STARTED | no `clone_with_theta`, no constructor-level custom/fixed bounds, and no optimizer integration; REQ-19 ships default `Hyperparameter`/`bounds`/`n_dims` metadata. Blocker #1913. |
 //! | REQ-10 (Matern general nu) | SHIPPED | `MaternKernel::compute` now evaluates the modified-Bessel general formula `(2^{1-ν}/Γ(ν))·(√(2ν)·d)^ν·K_ν(√(2ν)·d)` for nu ∉ {0.5,1.5,2.5,inf} (`kernels.py:1729-1735`) and `nu=inf → exp(-d²/2)` (RBF, `:1727-1728`); `d≈0 → 1.0`. `K_ν` via `crate::bessel::bessel_k` (Numerical Recipes `bessik`, Temme series + CF2, ~1e-10 vs `scipy.special.kv`); Γ via `statrs::function::gamma::gamma`. Oracle `Matern(1.0,3.5)(X)[0,1]=0.5449424471128748` matches (no longer the RBF `0.6065`). Non-test consumer: `GaussianProcessRegressor` (`gaussian_process.rs` `fn fit`/`predict` via `kernel.compute`) — guarded by `tests/divergence_gaussian_process.rs::divergence_matern_general_nu_predict_std` (un-ignored). In-crate: `matern_general_nu_35_matches_sklearn`/`matern_general_nu_07_matches_sklearn`/`matern_nu_inf_is_rbf`/`matern_general_agrees_with_closed_forms`; `bessel::tests::kv_matches_scipy_oracle`. (Closes #1914, #2375.) |
 //! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
 //! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
@@ -54,9 +54,149 @@
 //! | REQ-16 (`ExpSineSquared`) | SHIPPED | periodic formula `exp(-2 sin²(πd/p)/l²)` matches sklearn `ExpSineSquared` (`:1954`). |
 //! | REQ-17 (`Exponentiation`) | SHIPPED | wraps any `GPKernel` and raises matrix/diagonal values to `exponent`, matching sklearn `Exponentiation` (`:993`). |
 //! | REQ-18 (`CompoundKernel`) | SHIPPED | stacks child kernel matrices along axis 2 and child diagonals as columns, matching sklearn `CompoundKernel` (`:514`). |
+//! | REQ-19 (`Hyperparameter` metadata) | SHIPPED | public hyperparameter specs, log-space bounds, and `n_dims` for shipped scalar GP kernels match sklearn defaults. |
 
 use ndarray::{Array1, Array2, Array3};
 use num_traits::Float;
+
+/// Bounds specification for a GP kernel hyperparameter.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HyperparameterBounds<F> {
+    /// A numeric lower/upper pair per element.
+    Numeric(Vec<(F, F)>),
+    /// A fixed hyperparameter excluded from optimization.
+    Fixed,
+}
+
+/// Specification of a GP kernel hyperparameter.
+///
+/// Mirrors sklearn's `Hyperparameter` named tuple: `name`, `value_type`,
+/// `bounds`, `n_elements`, and `fixed`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hyperparameter<F> {
+    /// Hyperparameter name.
+    pub name: String,
+    /// Hyperparameter value type. sklearn currently uses `"numeric"`.
+    pub value_type: String,
+    /// Raw non-log bounds or a fixed marker.
+    pub bounds: HyperparameterBounds<F>,
+    /// Number of scalar elements represented by this hyperparameter.
+    pub n_elements: usize,
+    /// Whether this hyperparameter is excluded from optimization.
+    pub fixed: bool,
+}
+
+impl<F: Float> Hyperparameter<F> {
+    /// Create a new hyperparameter specification.
+    ///
+    /// Numeric single-row bounds are repeated for vector-valued parameters,
+    /// matching sklearn's `Hyperparameter.__new__` behavior.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `n_elements == 0` or numeric bounds have neither one row nor
+    /// `n_elements` rows.
+    #[must_use]
+    pub fn new(
+        name: impl Into<String>,
+        value_type: impl Into<String>,
+        bounds: HyperparameterBounds<F>,
+        n_elements: usize,
+        fixed: Option<bool>,
+    ) -> Self {
+        assert!(n_elements > 0, "n_elements must be positive");
+
+        let normalized_bounds = match bounds {
+            HyperparameterBounds::Numeric(mut pairs) => {
+                if pairs.len() == 1 && n_elements > 1 {
+                    pairs = vec![pairs[0]; n_elements];
+                }
+                assert_eq!(
+                    pairs.len(),
+                    n_elements,
+                    "bounds should have either 1 or {n_elements} rows"
+                );
+                HyperparameterBounds::Numeric(pairs)
+            }
+            HyperparameterBounds::Fixed => HyperparameterBounds::Fixed,
+        };
+        let fixed = fixed.unwrap_or(matches!(normalized_bounds, HyperparameterBounds::Fixed));
+
+        Self {
+            name: name.into(),
+            value_type: value_type.into(),
+            bounds: normalized_bounds,
+            n_elements,
+            fixed,
+        }
+    }
+
+    /// Create a scalar numeric hyperparameter.
+    #[must_use]
+    pub fn numeric(name: impl Into<String>, lower: F, upper: F) -> Self {
+        Self::new(
+            name,
+            "numeric",
+            HyperparameterBounds::Numeric(vec![(lower, upper)]),
+            1,
+            None,
+        )
+    }
+
+    /// Create a fixed hyperparameter.
+    #[must_use]
+    pub fn fixed(
+        name: impl Into<String>,
+        value_type: impl Into<String>,
+        n_elements: usize,
+    ) -> Self {
+        Self::new(
+            name,
+            value_type,
+            HyperparameterBounds::Fixed,
+            n_elements,
+            None,
+        )
+    }
+
+    /// Return numeric bounds as a `(n_elements, 2)` matrix.
+    #[must_use]
+    pub fn bounds_array(&self) -> Option<Array2<F>> {
+        match &self.bounds {
+            HyperparameterBounds::Numeric(pairs) => {
+                let mut values = Vec::with_capacity(pairs.len() * 2);
+                for &(lower, upper) in pairs {
+                    values.push(lower);
+                    values.push(upper);
+                }
+                Some(Array2::from_shape_vec((pairs.len(), 2), values).unwrap())
+            }
+            HyperparameterBounds::Fixed => None,
+        }
+    }
+
+    fn with_name(mut self, name: String) -> Self {
+        self.name = name;
+        self
+    }
+}
+
+fn default_positive_hyperparameter<F: Float>(name: &str) -> Hyperparameter<F> {
+    Hyperparameter::numeric(name, F::from(1e-5).unwrap(), F::from(1e5).unwrap())
+}
+
+fn prefixed_hyperparameters<F: Float>(
+    prefix: &str,
+    hyperparameters: Vec<Hyperparameter<F>>,
+) -> Vec<Hyperparameter<F>> {
+    hyperparameters
+        .into_iter()
+        .map(|hp| {
+            let name = format!("{prefix}__{}", hp.name);
+            hp.with_name(name)
+        })
+        .collect()
+}
 
 /// Trait for covariance kernels used in Gaussian Process models.
 ///
@@ -84,6 +224,37 @@ pub trait GPKernel<F: Float>: Send + Sync {
 
     /// Number of tunable hyperparameters.
     fn n_params(&self) -> usize;
+
+    /// Number of non-fixed hyperparameter elements, matching sklearn `n_dims`.
+    fn n_dims(&self) -> usize {
+        self.hyperparameters()
+            .iter()
+            .filter(|hyperparameter| !hyperparameter.fixed)
+            .map(|hyperparameter| hyperparameter.n_elements)
+            .sum()
+    }
+
+    /// Hyperparameter metadata, matching sklearn's `hyperparameters` property.
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        Vec::new()
+    }
+
+    /// Log-transformed non-fixed bounds, matching sklearn's `bounds` property.
+    fn bounds(&self) -> Array2<F> {
+        let mut rows = Vec::new();
+        for hyperparameter in self.hyperparameters() {
+            if hyperparameter.fixed {
+                continue;
+            }
+            if let HyperparameterBounds::Numeric(pairs) = hyperparameter.bounds {
+                for (lower, upper) in pairs {
+                    rows.push(lower.ln());
+                    rows.push(upper.ln());
+                }
+            }
+        }
+        Array2::from_shape_vec((rows.len() / 2, 2), rows).unwrap()
+    }
 
     /// Get the current hyperparameter values (in log space for positive params).
     fn get_params(&self) -> Vec<F>;
@@ -178,6 +349,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for RBFKernel<F> {
 
     fn n_params(&self) -> usize {
         1
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![default_positive_hyperparameter("length_scale")]
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -314,6 +489,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for MaternKernel<F> {
         1 // only length_scale is optimizable; nu is fixed
     }
 
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![default_positive_hyperparameter("length_scale")]
+    }
+
     fn get_params(&self) -> Vec<F> {
         vec![self.length_scale.ln()]
     }
@@ -384,6 +563,13 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for RationalQuadratic<F> {
 
     fn n_params(&self) -> usize {
         2
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![
+            default_positive_hyperparameter("alpha"),
+            default_positive_hyperparameter("length_scale"),
+        ]
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -458,6 +644,13 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for ExpSineSquared<F> {
         2
     }
 
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![
+            default_positive_hyperparameter("length_scale"),
+            default_positive_hyperparameter("periodicity"),
+        ]
+    }
+
     fn get_params(&self) -> Vec<F> {
         vec![self.length_scale.ln(), self.periodicity.ln()]
     }
@@ -512,6 +705,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for ConstantKernel<F> {
 
     fn n_params(&self) -> usize {
         1
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![default_positive_hyperparameter("constant_value")]
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -594,6 +791,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for WhiteKernel<F> {
         1
     }
 
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![default_positive_hyperparameter("noise_level")]
+    }
+
     fn get_params(&self) -> Vec<F> {
         vec![self.noise_level.ln()]
     }
@@ -658,6 +859,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for DotProductKernel<F> {
         1
     }
 
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        vec![default_positive_hyperparameter("sigma_0")]
+    }
+
     fn get_params(&self) -> Vec<F> {
         vec![self.sigma_0.ln()]
     }
@@ -715,6 +920,12 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for SumKernel<F> {
 
     fn n_params(&self) -> usize {
         self.k1.n_params() + self.k2.n_params()
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        let mut hyperparameters = prefixed_hyperparameters("k1", self.k1.hyperparameters());
+        hyperparameters.extend(prefixed_hyperparameters("k2", self.k2.hyperparameters()));
+        hyperparameters
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -780,6 +991,12 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for ProductKernel<F> {
 
     fn n_params(&self) -> usize {
         self.k1.n_params() + self.k2.n_params()
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        let mut hyperparameters = prefixed_hyperparameters("k1", self.k1.hyperparameters());
+        hyperparameters.extend(prefixed_hyperparameters("k2", self.k2.hyperparameters()));
+        hyperparameters
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -848,6 +1065,10 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for Exponentiation<F> {
 
     fn n_params(&self) -> usize {
         self.kernel.n_params()
+    }
+
+    fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        prefixed_hyperparameters("kernel", self.kernel.hyperparameters())
     }
 
     fn get_params(&self) -> Vec<F> {
@@ -949,6 +1170,34 @@ impl<F: Float + Send + Sync + 'static> CompoundKernel<F> {
         self.kernels.iter().map(|kernel| kernel.n_params()).sum()
     }
 
+    /// Number of stacked non-fixed child hyperparameter elements.
+    #[must_use]
+    pub fn n_dims(&self) -> usize {
+        self.kernels.iter().map(|kernel| kernel.n_dims()).sum()
+    }
+
+    /// CompoundKernel's own hyperparameters, matching sklearn's empty
+    /// `hyperparameters` property while theta/bounds delegate to children.
+    #[must_use]
+    pub fn hyperparameters(&self) -> Vec<Hyperparameter<F>> {
+        Vec::new()
+    }
+
+    /// Stack child log-space bounds in child order.
+    #[must_use]
+    pub fn bounds(&self) -> Array2<F> {
+        let n_dims = self.n_dims();
+        let mut values = Vec::with_capacity(n_dims * 2);
+        for kernel in &self.kernels {
+            let bounds = kernel.bounds();
+            for row in bounds.rows() {
+                values.push(row[0]);
+                values.push(row[1]);
+            }
+        }
+        Array2::from_shape_vec((n_dims, 2), values).unwrap()
+    }
+
     /// Concatenate child log-space hyperparameters in child order.
     #[must_use]
     pub fn get_params(&self) -> Vec<F> {
@@ -994,6 +1243,98 @@ mod tests {
 
     fn make_x2() -> Array2<f64> {
         Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 1.0, 1.0]).unwrap()
+    }
+
+    // --- Hyperparameter metadata ---
+
+    #[test]
+    fn hyperparameter_numeric_repeats_single_bounds_row() {
+        let hp = Hyperparameter::new(
+            "length_scale",
+            "numeric",
+            HyperparameterBounds::Numeric(vec![(1e-5, 1e5)]),
+            3,
+            None,
+        );
+        assert_eq!(hp.name, "length_scale");
+        assert_eq!(hp.value_type, "numeric");
+        assert_eq!(hp.n_elements, 3);
+        assert!(!hp.fixed);
+        let bounds = hp.bounds_array().unwrap();
+        assert_eq!(bounds.dim(), (3, 2));
+        for row in bounds.rows() {
+            assert_abs_diff_eq!(row[0], 1e-5, epsilon = 1e-15);
+            assert_abs_diff_eq!(row[1], 1e5, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn hyperparameter_fixed_derives_fixed_flag() {
+        let hp = Hyperparameter::<f64>::fixed("length_scale", "numeric", 1);
+        assert_eq!(hp.name, "length_scale");
+        assert!(hp.fixed);
+        assert!(hp.bounds_array().is_none());
+    }
+
+    #[test]
+    fn rbf_hyperparameters_bounds_and_n_dims_match_sklearn() {
+        let k = RBFKernel::new(1.5);
+        let hyperparameters = k.hyperparameters();
+        assert_eq!(hyperparameters.len(), 1);
+        assert_eq!(hyperparameters[0].name, "length_scale");
+        assert_eq!(hyperparameters[0].value_type, "numeric");
+        assert_eq!(hyperparameters[0].n_elements, 1);
+        assert!(!hyperparameters[0].fixed);
+        assert_eq!(k.n_dims(), 1);
+
+        let bounds = k.bounds();
+        assert_eq!(bounds.dim(), (1, 2));
+        assert_abs_diff_eq!(bounds[[0, 0]], 1e-5f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(bounds[[0, 1]], 1e5f64.ln(), epsilon = 1e-12);
+    }
+
+    #[test]
+    fn composite_hyperparameter_names_and_bounds_match_sklearn() {
+        let k = SumKernel::new(
+            Box::new(ProductKernel::new(
+                Box::new(ConstantKernel::new(2.0)),
+                Box::new(RBFKernel::new(1.5)),
+            )),
+            Box::new(WhiteKernel::new(0.1)),
+        );
+        let names: Vec<_> = k
+            .hyperparameters()
+            .into_iter()
+            .map(|hyperparameter| hyperparameter.name)
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "k1__k1__constant_value",
+                "k1__k2__length_scale",
+                "k2__noise_level"
+            ]
+        );
+        assert_eq!(k.n_dims(), 3);
+        assert_eq!(k.bounds().dim(), (3, 2));
+        for row in k.bounds().rows() {
+            assert_abs_diff_eq!(row[0], 1e-5f64.ln(), epsilon = 1e-12);
+            assert_abs_diff_eq!(row[1], 1e5f64.ln(), epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    fn compound_kernel_bounds_stack_child_bounds() {
+        let k = CompoundKernel::new(vec![
+            Box::new(RBFKernel::new(1.5)),
+            Box::new(RationalQuadratic::new(1.3, 0.7)),
+        ]);
+        assert_eq!(k.n_dims(), 3);
+        assert_eq!(k.bounds().dim(), (3, 2));
+        for row in k.bounds().rows() {
+            assert_abs_diff_eq!(row[0], 1e-5f64.ln(), epsilon = 1e-12);
+            assert_abs_diff_eq!(row[1], 1e5f64.ln(), epsilon = 1e-12);
+        }
     }
 
     // --- RBF ---

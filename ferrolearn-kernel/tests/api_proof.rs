@@ -25,11 +25,11 @@ use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
     BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel,
     EpanechnikovKernel, ExpSineSquared, Exponentiation, GaussianKernel, GaussianProcessClassifier,
-    GaussianProcessRegressor, HeteroscedasticityTest, KernelRidge, KernelType,
-    LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem, ProductKernel, RBFKernel,
-    RBFSampler, RationalQuadratic, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
-    WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
-    silverman_bandwidth,
+    GaussianProcessRegressor, HeteroscedasticityTest, Hyperparameter, HyperparameterBounds,
+    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
+    ProductKernel, RBFKernel, RBFSampler, RationalQuadratic, SumKernel, TricubeKernel,
+    TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test, residual_diagnostics,
+    scott_bandwidth, silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -195,9 +195,23 @@ fn api_proof_gp_kernel_zoo() {
     use ferrolearn_kernel::GPKernel;
     let x = Array2::from_shape_vec((4, 2), vec![0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0]).unwrap();
 
+    let hp = Hyperparameter::new(
+        "length_scale",
+        "numeric",
+        HyperparameterBounds::Numeric(vec![(1e-5, 1e5)]),
+        2,
+        None,
+    );
+    assert_eq!(hp.bounds_array().unwrap().dim(), (2, 2));
+    assert!(!hp.fixed);
+    assert!(Hyperparameter::<f64>::fixed("length_scale", "numeric", 1).fixed);
+
     let rbf = RBFKernel::new(1.0);
     assert_eq!(rbf.compute(&x, &x).dim(), (4, 4));
     assert_eq!(rbf.diagonal(&x).len(), 4);
+    assert_eq!(rbf.hyperparameters()[0].name, "length_scale");
+    assert_eq!(rbf.bounds().dim(), (1, 2));
+    assert_eq!(rbf.n_dims(), 1);
 
     for nu in [0.5, 1.5, 2.5] {
         let m = MaternKernel::new(1.0, nu);
@@ -208,11 +222,19 @@ fn api_proof_gp_kernel_zoo() {
     assert_eq!(rq.compute(&x, &x).dim(), (4, 4));
     assert_eq!(rq.diagonal(&x).len(), 4);
     assert_eq!(rq.get_params().len(), 2);
+    assert_eq!(
+        rq.hyperparameters()
+            .iter()
+            .map(|hyperparameter| hyperparameter.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["alpha", "length_scale"]
+    );
 
     let periodic = ExpSineSquared::new(1.3, 2.0);
     assert_eq!(periodic.compute(&x, &x).dim(), (4, 4));
     assert_eq!(periodic.diagonal(&x).len(), 4);
     assert_eq!(periodic.get_params().len(), 2);
+    assert_eq!(periodic.n_dims(), 2);
 
     let c = ConstantKernel::new(2.0);
     let _ = c.compute(&x, &x);
@@ -228,6 +250,7 @@ fn api_proof_gp_kernel_zoo() {
         Box::new(WhiteKernel::new(0.1)),
     );
     let _ = s.compute(&x, &x);
+    assert_eq!(s.bounds().dim(), (2, 2));
 
     let p = ProductKernel::new(
         Box::new(RBFKernel::new(1.0)),
@@ -248,6 +271,8 @@ fn api_proof_gp_kernel_zoo() {
     assert_eq!(compound.compute_stack(&x, &x).dim(), (4, 4, 3));
     assert_eq!(compound.diagonal_stack(&x).dim(), (4, 3));
     assert_eq!(compound.get_params().len(), 3);
+    assert_eq!(compound.bounds().dim(), (3, 2));
+    assert_eq!(compound.n_dims(), 3);
 }
 
 // =============================================================================
