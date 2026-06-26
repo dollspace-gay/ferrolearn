@@ -141,7 +141,7 @@ pub use normalizer::Normalizer;
 pub use one_hot_encoder::{FittedOneHotEncoder, OneHotDrop, OneHotEncoder, OneHotHandleUnknown};
 pub use ordinal_encoder::{Categories, FittedOrdinalEncoder, HandleUnknown, OrdinalEncoder};
 pub use polynomial_features::{FittedPolynomialFeatures, PolynomialFeatures};
-pub use power_transformer::{FittedPowerTransformer, PowerTransformer};
+pub use power_transformer::{FittedPowerTransformer, PowerTransformer, power_transform};
 pub use robust_scaler::{FittedRobustScaler, RobustScaler};
 pub use standard_scaler::{FittedStandardScaler, StandardScaler};
 

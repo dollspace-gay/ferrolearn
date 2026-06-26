@@ -19,7 +19,7 @@
 //! out) and the scoped error contracts (REQ-2); these PASS today.
 
 use ferrolearn_core::traits::{Fit, Transform};
-use ferrolearn_preprocess::PowerTransformer;
+use ferrolearn_preprocess::{PowerTransformer, power_transform};
 use ndarray::{Array2, array};
 
 // ===========================================================================
@@ -285,6 +285,52 @@ fn green_unfitted_transform_errors() {
     assert!(
         pt.transform(&x).is_err(),
         "unfitted transform must return Err"
+    );
+}
+
+// ===========================================================================
+// REQ-5 — power_transform free function (Yeo-Johnson surface)
+// ===========================================================================
+
+/// Green guard (REQ-5): `power_transform(X, standardize=true)` delegates to the
+/// default Yeo-Johnson `PowerTransformer().fit_transform(X)` wrapper shape
+/// (`_data.py:3741-3742`). Live sklearn oracle is the all-positive standardized
+/// fixture above.
+#[test]
+fn green_req5_power_transform_standardized_matches_sklearn() {
+    let x = array![[1.0_f64], [2.0], [3.0], [4.0], [5.0]];
+    let out = power_transform(&x, true).unwrap();
+    for (i, &sk) in SK_POS_STD_XFORM.iter().enumerate() {
+        let got = out[[i, 0]];
+        assert!(
+            (got - sk).abs() < 1e-5,
+            "power_transform standardized row {i}: ferrolearn={got}, sklearn={sk}"
+        );
+    }
+}
+
+/// Green guard (REQ-5): `standardize=false` is threaded to the transformer,
+/// matching sklearn `PowerTransformer(standardize=False).fit_transform(X)`.
+#[test]
+fn green_req5_power_transform_without_standardize_matches_sklearn() {
+    let x = array![[1.0_f64], [2.0], [3.0], [4.0], [5.0]];
+    let out = power_transform(&x, false).unwrap();
+    for (i, &sk) in SK_POS_XFORM.iter().enumerate() {
+        let got = out[[i, 0]];
+        assert!(
+            (got - sk).abs() < 1e-5,
+            "power_transform unstandardized row {i}: ferrolearn={got}, sklearn={sk}"
+        );
+    }
+}
+
+/// Green guard (REQ-5): functional wrapper propagates fit validation errors.
+#[test]
+fn green_req5_power_transform_zero_samples_errors() {
+    let x: Array2<f64> = Array2::zeros((0, 2));
+    assert!(
+        power_transform(&x, true).is_err(),
+        "power_transform on zero samples must return Err"
     );
 }
 

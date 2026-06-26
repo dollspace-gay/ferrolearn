@@ -17,7 +17,7 @@ use ferrolearn_preprocess::{
     ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
     SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
     StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, chi2, f_classif,
-    f_regression, maxabs_scale, minmax_scale,
+    f_regression, maxabs_scale, minmax_scale, power_transform,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -68,6 +68,8 @@ fn api_proof_scalers() {
 fn api_proof_power_quantile() {
     let x = small_data();
     let _ = PowerTransformer::<f64>::new().fit_transform(&x).unwrap();
+    let _ = power_transform(&x, true).unwrap();
+    let _ = power_transform(&x, false).unwrap();
     for dist in [OutputDistribution::Uniform, OutputDistribution::Normal] {
         let _ = QuantileTransformer::<f64>::new(8, dist, 0)
             .fit_transform(&x)

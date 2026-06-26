@@ -31,7 +31,7 @@
 //! | REQ-2 | Error/parameter contracts (`n_samples==0`, transform ncols, unfitted) | SHIPPED (scoped) | [`PowerTransformer::fit`]/[`FittedPowerTransformer::transform`]; in-module + divergence error-contract tests |
 //! | REQ-3 | `box-cox` method (`stats.boxcox` optimize + transform + check_positive) | NOT-STARTED | Yeo-Johnson only; sklearn `_data.py:3285,3448,3525` — blocker #1344 |
 //! | REQ-4 | `inverse_transform` (Yeo-Johnson + box-cox inverse) | NOT-STARTED | absent; sklearn `_data.py:3347-3424` — blocker #1345 |
-//! | REQ-5 | `power_transform` free function | NOT-STARTED | absent; sklearn `_data.py:3549` — blocker #1346 |
+//! | REQ-5 | `power_transform` free function | SHIPPED (Yeo-Johnson surface) | `power_transform` free fn delegates to `PowerTransformer` and mirrors sklearn's wrapper shape (`PowerTransformer(...).fit_transform(X)`, `_data.py:3549`,`:3741-3742`) for the shipped Yeo-Johnson implementation, including the `standardize` flag. `copy` remains an accept-and-document no-op under ferrolearn's owned-return transform contract. `method='box-cox'` remains NOT-STARTED under REQ-3/REQ-8. Live-oracle tests in `tests/divergence_power_transformer.rs`: `green_req5_power_transform_standardized_matches_sklearn`, `green_req5_power_transform_without_standardize_matches_sklearn`, `green_req5_power_transform_zero_samples_errors`. |
 //! | REQ-6 | Constant-feature → λ=1.0 skip + StandardScaler zero-scale handling | SHIPPED | [`PowerTransformer::fit`] calls `is_constant_feature` (mirroring sklearn `_is_constant_feature` `_data.py:72-85`) on each (NaN-dropped) column and sets `lambdas[j]=1.0` + `continue` (sklearn `:3299-3302`); the standardize path applies `_handle_zeros_in_scale` (constant → `std=1.0`, `:88-120`/`:1016-1021`) so [`FittedPowerTransformer::transform`] centers a constant column to 0 (always subtract-mean-then-÷scale). Consumers: `_RsPowerTransformer` PyO3 (`extras.rs:1171`, `lib.rs:84`) + `PipelineTransformer` + re-export. Verified by 4 oracle pins in `tests/divergence_power_transformer_edges.rs` (`divergence_constant_feature_lambda`, `divergence_constant_feature_transform_no_std`, `divergence_constant_feature_transform_standardize`, `divergence_single_sample_standardize`). |
 //! | REQ-7 | NaN-drop in optimize (+ `check_positive` box-cox error: NOT-STARTED, box-cox absent) | SHIPPED (NaN-drop) | [`PowerTransformer::fit`] filters `!is_nan()` before the Brent MLE + the standardize stats, mirroring sklearn `x = x[~np.isnan(x)]` (`_data.py:3491`); the transform passes NaN through. Consumers: `_RsPowerTransformer` PyO3 + `PipelineTransformer` + re-export. Verified by 2 oracle pins in `tests/divergence_power_transformer_edges.rs` (`divergence_nan_dropped_in_mle_lambda`, `divergence_nan_transform_finite_rows`). box-cox `check_positive` (`:3525`) remains absent (box-cox not shipped, blocker #1344). |
 //! | REQ-8 | `method`/`copy` ctor params + `_parameter_constraints` | NOT-STARTED | only `standardize`; sklearn `_data.py:3222,3226` — blocker #1349 |
@@ -453,6 +453,32 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for PowerTransfor
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
     }
+}
+
+/// Apply a Yeo-Johnson power transform in functional form.
+///
+/// This mirrors scikit-learn's `power_transform(..., method="yeo-johnson",
+/// standardize=...)` wrapper shape (`sklearn/preprocessing/_data.py:3549`),
+/// delegating to [`PowerTransformer`] and returning `fit_transform(X)`.
+///
+/// `method="box-cox"` and sklearn's `copy` parameter are not exposed here:
+/// Box-Cox is not implemented in [`PowerTransformer`] yet, and ferrolearn
+/// transforms always return an owned array rather than mutating in place.
+///
+/// # Errors
+///
+/// Propagates the same validation errors as [`PowerTransformer::fit_transform`].
+#[must_use = "power_transform returns the transformed array; use the returned value"]
+pub fn power_transform<F: Float + Send + Sync + 'static>(
+    x: &Array2<F>,
+    standardize: bool,
+) -> Result<Array2<F>, FerroError> {
+    let transformer = if standardize {
+        PowerTransformer::<F>::new()
+    } else {
+        PowerTransformer::<F>::without_standardize()
+    };
+    transformer.fit_transform(x)
 }
 
 // ---------------------------------------------------------------------------
