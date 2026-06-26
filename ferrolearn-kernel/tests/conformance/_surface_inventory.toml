@@ -59,6 +59,16 @@ phase = "kernel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_kernel::ExpSineSquared"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::Exponentiation"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::FittedGaussianProcessClassifier"
 phase = "kernel"
 fixture = ""

@@ -12,24 +12,26 @@
 //! | [`RBFKernel`] | `k(x, x') = exp(-||x - x'||^2 / (2 l^2))` |
 //! | [`MaternKernel`] | Matern family (any nu via closed forms / Bessel K_ν / nu=inf→RBF) |
 //! | [`RationalQuadratic`] | `k(x, x') = (1 + ||x - x'||² / (2αl²))^{-α}` |
+//! | [`ExpSineSquared`] | `k(x, x') = exp(-2 sin²(π||x-x'||/p) / l²)` |
 //! | [`ConstantKernel`] | `k(x, x') = c` |
 //! | [`WhiteKernel`] | `k(x, x') = sigma^2 * delta(x, x')` |
 //! | [`DotProductKernel`] | `k(x, x') = sigma_0^2 + x . x'` |
 //! | [`SumKernel`] | `k = k1 + k2` |
 //! | [`ProductKernel`] | `k = k1 * k2` |
+//! | [`Exponentiation`] | `k = base^exponent` |
 //!
 //! Kernels can be composed via `+` and `*` operators on `Box<dyn GPKernel<F>>`.
 //!
 //! ## REQ status
 //!
 //! Mirrors `sklearn.gaussian_process.kernels` (`kernels.py`, v1.5.2 commit
-//! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (15 REQs). Every REQ is
+//! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (18 REQs). Every REQ is
 //! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GP
 //! kernels are DETERMINISTIC, so the existing kernels' matrix values are directly
-//! oracle-verified element-wise (21 green guards in `tests/divergence_gp_kernels.rs`).
+//! oracle-verified element-wise (27 green guards in `tests/divergence_gp_kernels.rs`).
 //! The gaps are missing-feature / prerequisite blockers, not value errors.
 //!
-//! **10 SHIPPED / 6 NOT-STARTED.**
+//! **12 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -46,9 +48,11 @@
 //! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
 //! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
 //! | REQ-13 (`RationalQuadratic`) | SHIPPED | isotropic formula `(1 + d²/(2αl²))^{-α}` matches sklearn `RationalQuadratic` (`:1798`). |
-//! | REQ-14 (constructor defaults / `Default`) | SHIPPED | `Default` impls call `new()` with sklearn's keyword defaults for RBF, Matern, RationalQuadratic, Constant, White, and DotProduct; guarded by `gp_kernel_defaults_match_sklearn`. |
+//! | REQ-14 (constructor defaults / `Default`) | SHIPPED | `Default` impls call `new()` with sklearn's keyword defaults for RBF, Matern, RationalQuadratic, ExpSineSquared, Constant, White, and DotProduct; guarded by `gp_kernel_defaults_match_sklearn`. |
 //! | REQ-15 (ferray substrate) | NOT-STARTED | `ndarray` arrays vs `ferray-core` (R-SUBSTRATE-1). Blocker #1919. |
-//! | REQ-16 (remaining missing kernels) | NOT-STARTED | no `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). |
+//! | REQ-16 (`ExpSineSquared`) | SHIPPED | periodic formula `exp(-2 sin²(πd/p)/l²)` matches sklearn `ExpSineSquared` (`:1954`). |
+//! | REQ-17 (`Exponentiation`) | SHIPPED | wraps any `GPKernel` and raises matrix/diagonal values to `exponent`, matching sklearn `Exponentiation` (`:993`). |
+//! | REQ-18 (remaining missing kernel) | NOT-STARTED | no `CompoundKernel` (`:514`). |
 
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -398,6 +402,76 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for RationalQuadratic<F> {
 }
 
 // ---------------------------------------------------------------------------
+// Exp-Sine-Squared Kernel
+// ---------------------------------------------------------------------------
+
+/// Exp-Sine-Squared covariance kernel, also called the periodic kernel.
+///
+/// This mirrors `sklearn.gaussian_process.kernels.ExpSineSquared`'s isotropic
+/// variant:
+///
+/// `k(x, x') = exp(-2 * sin(π * ||x - x'|| / periodicity)^2 / length_scale^2)`
+#[derive(Debug, Clone)]
+pub struct ExpSineSquared<F> {
+    /// Length scale parameter.
+    pub length_scale: F,
+    /// Periodicity parameter.
+    pub periodicity: F,
+}
+
+impl<F: Float> ExpSineSquared<F> {
+    /// Create a new Exp-Sine-Squared kernel.
+    #[must_use]
+    pub fn new(length_scale: F, periodicity: F) -> Self {
+        Self {
+            length_scale,
+            periodicity,
+        }
+    }
+}
+
+impl<F: Float> Default for ExpSineSquared<F> {
+    /// Mirrors sklearn `ExpSineSquared(length_scale=1.0, periodicity=1.0)`.
+    fn default() -> Self {
+        Self::new(F::one(), F::one())
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> GPKernel<F> for ExpSineSquared<F> {
+    fn compute(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array2<F> {
+        let two = F::from(2.0).unwrap();
+        let pi = F::from(std::f64::consts::PI).unwrap();
+        let ls2 = self.length_scale * self.length_scale;
+        let dists = euclidean_distances(x1, x2);
+        dists.mapv(|d| {
+            let sin_arg = (pi * d / self.periodicity).sin();
+            (-(two * sin_arg * sin_arg) / ls2).exp()
+        })
+    }
+
+    fn diagonal(&self, x: &Array2<F>) -> Array1<F> {
+        Array1::from_elem(x.nrows(), F::one())
+    }
+
+    fn n_params(&self) -> usize {
+        2
+    }
+
+    fn get_params(&self) -> Vec<F> {
+        vec![self.length_scale.ln(), self.periodicity.ln()]
+    }
+
+    fn set_params(&mut self, params: &[F]) {
+        self.length_scale = params[0].exp();
+        self.periodicity = params[1].exp();
+    }
+
+    fn clone_box(&self) -> Box<dyn GPKernel<F>> {
+        Box::new(self.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Constant Kernel
 // ---------------------------------------------------------------------------
 
@@ -727,6 +801,70 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for ProductKernel<F> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Exponentiation Kernel
+// ---------------------------------------------------------------------------
+
+/// Exponentiation of a base kernel: `k(x, x') = base(x, x')^exponent`.
+///
+/// This mirrors `sklearn.gaussian_process.kernels.Exponentiation`. The exponent
+/// itself is a structural parameter, not a log-space hyperparameter; `theta`
+/// and `set_params` delegate to the wrapped kernel.
+pub struct Exponentiation<F: Float + Send + Sync + 'static> {
+    /// Base kernel.
+    pub kernel: Box<dyn GPKernel<F>>,
+    /// Scalar exponent applied to the base covariance.
+    pub exponent: F,
+}
+
+impl<F: Float + Send + Sync + 'static> std::fmt::Debug for Exponentiation<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Exponentiation")
+            .field("exponent", &self.exponent.to_f64())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Exponentiation<F> {
+    /// Create an exponentiated kernel.
+    pub fn new(kernel: Box<dyn GPKernel<F>>, exponent: F) -> Self {
+        Self { kernel, exponent }
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> GPKernel<F> for Exponentiation<F> {
+    fn compute(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array2<F> {
+        self.kernel
+            .compute(x1, x2)
+            .mapv(|value| value.powf(self.exponent))
+    }
+
+    fn diagonal(&self, x: &Array2<F>) -> Array1<F> {
+        self.kernel
+            .diagonal(x)
+            .mapv(|value| value.powf(self.exponent))
+    }
+
+    fn n_params(&self) -> usize {
+        self.kernel.n_params()
+    }
+
+    fn get_params(&self) -> Vec<F> {
+        self.kernel.get_params()
+    }
+
+    fn set_params(&mut self, params: &[F]) {
+        self.kernel.set_params(params);
+    }
+
+    fn clone_box(&self) -> Box<dyn GPKernel<F>> {
+        Box::new(Exponentiation {
+            kernel: self.kernel.clone_box(),
+            exponent: self.exponent,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -996,6 +1134,41 @@ mod tests {
         assert_abs_diff_eq!(k.length_scale, 0.5, epsilon = 1e-12);
     }
 
+    // --- ExpSineSquared ---
+
+    #[test]
+    fn exp_sine_squared_default_matches_sklearn() {
+        let k = ExpSineSquared::new(1.0, 1.0);
+        let x = make_x1();
+        let km = k.compute(&x, &x);
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[1, 2]], 0.155_950_569_259_009_13, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn exp_sine_squared_cross_covariance() {
+        let k = ExpSineSquared::new(1.3, 2.0);
+        let km = k.compute(&make_x1(), &make_x2());
+        assert_eq!(km.dim(), (3, 2));
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 0.472_714_571_288_163, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[1, 0]], 0.306_225_980_058_042_4, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn exp_sine_squared_params_roundtrip() {
+        let mut k = ExpSineSquared::new(1.3, 2.0);
+        let params = k.get_params();
+        assert_eq!(params.len(), 2);
+        assert_abs_diff_eq!(params[0], 1.3f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 2.0f64.ln(), epsilon = 1e-12);
+
+        k.set_params(&[0.7f64.ln(), 1.5f64.ln()]);
+        assert_abs_diff_eq!(k.length_scale, 0.7, epsilon = 1e-12);
+        assert_abs_diff_eq!(k.periodicity, 1.5, epsilon = 1e-12);
+    }
+
     // --- Constant ---
 
     #[test]
@@ -1185,6 +1358,35 @@ mod tests {
         }
     }
 
+    // --- Exponentiation ---
+
+    #[test]
+    fn exponentiation_rbf_matches_sklearn() {
+        let k = Exponentiation::new(Box::new(RBFKernel::new(1.5)), 2.0);
+        let km = k.compute(&make_x1(), &make_x1());
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 0.641_180_388_429_954_6, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[1, 2]], 0.411_112_290_507_187_5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn exponentiation_diagonal_and_params_delegate() {
+        let mut k = Exponentiation::new(Box::new(RationalQuadratic::new(1.3, 0.7)), 0.5);
+        let diag = k.diagonal(&make_x1());
+        for &d in &diag {
+            assert_abs_diff_eq!(d, 1.0, epsilon = 1e-12);
+        }
+        let params = k.get_params();
+        assert_eq!(params.len(), 2);
+        assert_abs_diff_eq!(params[0], 0.7f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 1.3f64.ln(), epsilon = 1e-12);
+
+        k.set_params(&[2.0f64.ln(), 0.5f64.ln()]);
+        let params = k.get_params();
+        assert_abs_diff_eq!(params[0], 2.0f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 0.5f64.ln(), epsilon = 1e-12);
+    }
+
     // --- Clone ---
 
     #[test]
@@ -1214,6 +1416,9 @@ mod tests {
         // RationalQuadratic(length_scale=1.0, alpha=1.0) kernels.py:1859
         assert_eq!(RationalQuadratic::<f64>::default().length_scale, 1.0);
         assert_eq!(RationalQuadratic::<f64>::default().alpha, 1.0);
+        // ExpSineSquared(length_scale=1.0, periodicity=1.0) kernels.py:2017
+        assert_eq!(ExpSineSquared::<f64>::default().length_scale, 1.0);
+        assert_eq!(ExpSineSquared::<f64>::default().periodicity, 1.0);
         // ConstantKernel(constant_value=1.0) kernels.py:1233
         assert_eq!(ConstantKernel::<f64>::default().constant_value, 1.0);
         // DotProduct(sigma_0=1.0) kernels.py:2156

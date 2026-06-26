@@ -23,8 +23,9 @@
 //!   Williams Algorithm 3.2 predictions and `log_marginal_likelihood()` for
 //!   hyperparameter selection.
 //! - **GP Kernels** — RBF, Matern (any nu via closed forms / Bessel K_ν),
-//!   RationalQuadratic, Constant, White, DotProduct, plus Sum and Product
-//!   kernel composition via the [`gp_kernels::GPKernel`] trait.
+//!   RationalQuadratic, ExpSineSquared, Constant, White, DotProduct, plus Sum,
+//!   Product, and Exponentiation composition via the [`gp_kernels::GPKernel`]
+//!   trait.
 //! - **[`KernelRidge`]** — Kernel ridge regression in dual form
 //!   `(K + αI) c = y` with RBF / Polynomial / Linear / Sigmoid / Laplacian
 //!   / Cosine kernels.
@@ -71,8 +72,8 @@ pub use diagnostics::{
 pub use gaussian_process::{FittedGaussianProcessRegressor, GaussianProcessRegressor};
 pub use gp_classifier::{FittedGaussianProcessClassifier, GaussianProcessClassifier};
 pub use gp_kernels::{
-    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel,
-    RationalQuadratic, SumKernel, WhiteKernel,
+    ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel, MaternKernel,
+    ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
 };
 pub use kernel_ridge::{FittedKernelRidge, KernelRidge};
 pub use kernels::{

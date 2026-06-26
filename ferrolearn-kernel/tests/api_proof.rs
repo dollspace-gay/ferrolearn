@@ -12,7 +12,8 @@
 //! - GaussianProcessClassifier: fit + predict + predict_proba + predict_log_proba
 //!   + log_marginal_likelihood + score
 //! - GP kernels: RBFKernel, MaternKernel (3 nu values), RationalQuadratic,
-//!   ConstantKernel, WhiteKernel, DotProductKernel, SumKernel, ProductKernel
+//!   ExpSineSquared, ConstantKernel, WhiteKernel, DotProductKernel, SumKernel,
+//!   ProductKernel, Exponentiation
 //! - NadarayaWatson + LocalPolynomialRegression with every Kernel variant
 //!   (Gaussian, Epanechnikov, Tricube, Biweight, Triweight, Uniform, Cosine)
 //! - Bandwidth helpers: scott_bandwidth, silverman_bandwidth,
@@ -23,11 +24,12 @@ use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
     BiweightKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel, EpanechnikovKernel,
-    GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor, HeteroscedasticityTest,
-    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
-    ProductKernel, RBFKernel, RBFSampler, RationalQuadratic, SumKernel, TricubeKernel,
-    TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test, residual_diagnostics,
-    scott_bandwidth, silverman_bandwidth,
+    ExpSineSquared, Exponentiation, GaussianKernel, GaussianProcessClassifier,
+    GaussianProcessRegressor, HeteroscedasticityTest, KernelRidge, KernelType,
+    LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem, ProductKernel, RBFKernel,
+    RBFSampler, RationalQuadratic, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
+    WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
+    silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -207,6 +209,11 @@ fn api_proof_gp_kernel_zoo() {
     assert_eq!(rq.diagonal(&x).len(), 4);
     assert_eq!(rq.get_params().len(), 2);
 
+    let periodic = ExpSineSquared::new(1.3, 2.0);
+    assert_eq!(periodic.compute(&x, &x).dim(), (4, 4));
+    assert_eq!(periodic.diagonal(&x).len(), 4);
+    assert_eq!(periodic.get_params().len(), 2);
+
     let c = ConstantKernel::new(2.0);
     let _ = c.compute(&x, &x);
 
@@ -227,6 +234,11 @@ fn api_proof_gp_kernel_zoo() {
         Box::new(ConstantKernel::new(2.0)),
     );
     let _ = p.compute(&x, &x);
+
+    let pow = Exponentiation::new(Box::new(RBFKernel::new(1.0)), 2.0);
+    assert_eq!(pow.compute(&x, &x).dim(), (4, 4));
+    assert_eq!(pow.diagonal(&x).len(), 4);
+    assert_eq!(pow.get_params().len(), 1);
 }
 
 // =============================================================================

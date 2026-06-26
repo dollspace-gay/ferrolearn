@@ -4,8 +4,8 @@
 //!
 //! Translation unit #1911. GP kernels are DETERMINISTIC, so every kernel-matrix
 //! value is directly oracle-comparable. The SHIPPED kernels (RBF, Matern
-//! nu∈{0.5,1.5,2.5}, RationalQuadratic, Constant, DotProduct, White, Sum,
-//! Product) are pinned here
+//! nu∈{0.5,1.5,2.5}, RationalQuadratic, ExpSineSquared, Constant, DotProduct,
+//! White, Sum, Product, Exponentiation) are pinned here
 //! as PASSING oracle GREEN GUARDS: each `compute`/`diagonal` is asserted
 //! element-wise (~1e-12) against the live sklearn 1.5.2 oracle.
 //!
@@ -24,7 +24,7 @@
 //!   self/Y=None channel across every kernel + GPR/GPC).
 //! - REQ-12 anisotropic (array) length_scale — blocker.
 //! - REQ-15 ferray substrate — blocker.
-//! - REQ-16 ExpSineSquared/Exponentiation/Compound — blocker.
+//! - REQ-18 CompoundKernel — blocker.
 //!
 //! VERDICT: the SHIPPED formulas all match the live oracle element-wise. No
 //! genuine single-file-fixable element-wise mismatch was found in the existing
@@ -33,8 +33,8 @@
 //! issues, not pinned as stranded red tests (R-LOOP-3).
 
 use ferrolearn_kernel::{
-    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel,
-    RationalQuadratic, SumKernel, WhiteKernel,
+    ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel, MaternKernel,
+    ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
 };
 use ndarray::{Array2, array};
 
@@ -385,4 +385,112 @@ fn green_rational_quadratic_diag_and_theta() {
             params[i]
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-16 — ExpSineSquared  (GREEN GUARD)
+// oracle: ExpSineSquared(length_scale=1.3, periodicity=2.0)(X), (X, X2),
+// .diag(X), and theta order [ln length_scale, ln periodicity].
+// ---------------------------------------------------------------------------
+
+#[test]
+fn green_exp_sine_squared_self() {
+    // sklearn 1.5.2, /tmp:
+    // ExpSineSquared(length_scale=1.3, periodicity=2.0)(X)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.3062259800580424, 0.3062259800580424],
+        &[0.3062259800580424, 1.0, 0.472714571288163],
+        &[0.3062259800580424, 0.472714571288163, 1.0],
+    ];
+    let k = ExpSineSquared::new(1.3, 2.0);
+    let x = x3();
+    assert_mat(&k.compute(&x, &x), expected);
+}
+
+#[test]
+fn green_exp_sine_squared_cross() {
+    // sklearn 1.5.2, /tmp:
+    // ExpSineSquared(length_scale=1.3, periodicity=2.0)(X, X2)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.472714571288163],
+        &[0.3062259800580424, 0.3062259800580424],
+        &[0.3062259800580424, 0.3062259800580424],
+    ];
+    let k = ExpSineSquared::new(1.3, 2.0);
+    assert_mat(&k.compute(&x3(), &x2()), expected);
+}
+
+#[test]
+fn green_exp_sine_squared_diag_and_theta() {
+    // sklearn 1.5.2, /tmp:
+    // ExpSineSquared(length_scale=1.3, periodicity=2.0).diag(X) == [1,1,1]
+    // theta == [ln(length_scale), ln(periodicity)]
+    //       == [0.26236426446749106, 0.6931471805599453]
+    let k = ExpSineSquared::new(1.3, 2.0);
+    for &v in &k.diagonal(&x3()) {
+        assert!((v - 1.0).abs() < 1e-12, "diag {v} != 1");
+    }
+
+    let theta_oracle = [0.262_364_264_467_491_06_f64, std::f64::consts::LN_2];
+    let params = k.get_params();
+    assert_eq!(params.len(), 2);
+    for (i, &e) in theta_oracle.iter().enumerate() {
+        assert!(
+            (params[i] - e).abs() < 1e-12,
+            "theta[{i}] = {} != sklearn {e}",
+            params[i]
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// REQ-17 — Exponentiation  (GREEN GUARD)
+// oracle: Exponentiation(RBF(length_scale=1.5), exponent=2.0)(X), (X, X2),
+// .diag(X), and theta delegation to the base kernel.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn green_exponentiation_rbf_self() {
+    // sklearn 1.5.2, /tmp:
+    // Exponentiation(RBF(length_scale=1.5), exponent=2.0)(X)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.6411803884299546, 0.6411803884299546],
+        &[0.6411803884299546, 1.0, 0.4111122905071875],
+        &[0.6411803884299546, 0.4111122905071875, 1.0],
+    ];
+    let k = Exponentiation::new(Box::new(RBFKernel::new(1.5)), 2.0);
+    let x = x3();
+    assert_mat(&k.compute(&x, &x), expected);
+}
+
+#[test]
+fn green_exponentiation_rbf_cross() {
+    // sklearn 1.5.2, /tmp:
+    // Exponentiation(RBF(length_scale=1.5), exponent=2.0)(X, X2)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.4111122905071875],
+        &[0.6411803884299546, 0.6411803884299546],
+        &[0.6411803884299546, 0.6411803884299546],
+    ];
+    let k = Exponentiation::new(Box::new(RBFKernel::new(1.5)), 2.0);
+    assert_mat(&k.compute(&x3(), &x2()), expected);
+}
+
+#[test]
+fn green_exponentiation_diag_and_theta() {
+    // sklearn 1.5.2, /tmp:
+    // Exponentiation(RBF(length_scale=1.5), exponent=2.0).diag(X) == [1,1,1]
+    // theta delegates to the base RBF kernel: [ln(1.5)].
+    let k = Exponentiation::new(Box::new(RBFKernel::new(1.5)), 2.0);
+    for &v in &k.diagonal(&x3()) {
+        assert!((v - 1.0).abs() < 1e-12, "diag {v} != 1");
+    }
+
+    let params = k.get_params();
+    assert_eq!(params.len(), 1);
+    assert!(
+        (params[0] - 0.405_465_108_108_164_4).abs() < 1e-12,
+        "theta[0] = {} != sklearn ln(1.5)",
+        params[0]
+    );
 }
