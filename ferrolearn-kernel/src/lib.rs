@@ -24,8 +24,8 @@
 //!   hyperparameter selection.
 //! - **GP Kernels** — RBF, Matern (any nu via closed forms / Bessel K_ν),
 //!   RationalQuadratic, ExpSineSquared, Constant, White, DotProduct, plus Sum,
-//!   Product, and Exponentiation composition via the [`gp_kernels::GPKernel`]
-//!   trait.
+//!   Product and Exponentiation via the [`gp_kernels::GPKernel`] trait, plus
+//!   CompoundKernel stacking APIs.
 //! - **[`KernelRidge`]** — Kernel ridge regression in dual form
 //!   `(K + αI) c = y` with RBF / Polynomial / Linear / Sigmoid / Laplacian
 //!   / Cosine kernels.
@@ -72,8 +72,8 @@ pub use diagnostics::{
 pub use gaussian_process::{FittedGaussianProcessRegressor, GaussianProcessRegressor};
 pub use gp_classifier::{FittedGaussianProcessClassifier, GaussianProcessClassifier};
 pub use gp_kernels::{
-    ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel, MaternKernel,
-    ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
+    CompoundKernel, ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel,
+    MaternKernel, ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
 };
 pub use kernel_ridge::{FittedKernelRidge, KernelRidge};
 pub use kernels::{

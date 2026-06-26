@@ -34,6 +34,11 @@ phase = "kernel"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_kernel::CompoundKernel"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::CrossValidatedBandwidth"
 phase = "kernel"
 fixture = ""

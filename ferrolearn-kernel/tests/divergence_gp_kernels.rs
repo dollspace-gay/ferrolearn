@@ -5,7 +5,7 @@
 //! Translation unit #1911. GP kernels are DETERMINISTIC, so every kernel-matrix
 //! value is directly oracle-comparable. The SHIPPED kernels (RBF, Matern
 //! nu∈{0.5,1.5,2.5}, RationalQuadratic, ExpSineSquared, Constant, DotProduct,
-//! White, Sum, Product, Exponentiation) are pinned here
+//! White, Sum, Product, Exponentiation, CompoundKernel) are pinned here
 //! as PASSING oracle GREEN GUARDS: each `compute`/`diagonal` is asserted
 //! element-wise (~1e-12) against the live sklearn 1.5.2 oracle.
 //!
@@ -24,7 +24,6 @@
 //!   self/Y=None channel across every kernel + GPR/GPC).
 //! - REQ-12 anisotropic (array) length_scale — blocker.
 //! - REQ-15 ferray substrate — blocker.
-//! - REQ-18 CompoundKernel — blocker.
 //!
 //! VERDICT: the SHIPPED formulas all match the live oracle element-wise. No
 //! genuine single-file-fixable element-wise mismatch was found in the existing
@@ -33,10 +32,10 @@
 //! issues, not pinned as stranded red tests (R-LOOP-3).
 
 use ferrolearn_kernel::{
-    ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel, MaternKernel,
-    ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
+    CompoundKernel, ConstantKernel, DotProductKernel, ExpSineSquared, Exponentiation, GPKernel,
+    MaternKernel, ProductKernel, RBFKernel, RationalQuadratic, SumKernel, WhiteKernel,
 };
-use ndarray::{Array2, array};
+use ndarray::{Array2, Array3, array};
 
 /// `X = [[0,0],[1,0],[0,1]]` — the canonical 3-point design used by every
 /// oracle command in `.design/kernel/gp_kernels.md`.
@@ -59,6 +58,23 @@ fn assert_mat(actual: &Array2<f64>, expected: &[&[f64]]) {
                 (a - e).abs() < 1e-12,
                 "K[{i},{j}] = {a} but sklearn oracle = {e}"
             );
+        }
+    }
+}
+
+fn assert_stack(actual: &Array3<f64>, expected: &[&[&[f64]]]) {
+    assert_eq!(actual.shape()[0], expected.len(), "row count");
+    for (i, row) in expected.iter().enumerate() {
+        assert_eq!(actual.shape()[1], row.len(), "col count");
+        for (j, cell) in row.iter().enumerate() {
+            assert_eq!(actual.shape()[2], cell.len(), "stack depth");
+            for (k, &e) in cell.iter().enumerate() {
+                let a = actual[[i, j, k]];
+                assert!(
+                    (a - e).abs() < 1e-12,
+                    "K[{i},{j},{k}] = {a} but sklearn oracle = {e}"
+                );
+            }
         }
     }
 }
@@ -493,4 +509,89 @@ fn green_exponentiation_diag_and_theta() {
         "theta[0] = {} != sklearn ln(1.5)",
         params[0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-18 — CompoundKernel  (GREEN GUARD)
+// oracle: CompoundKernel([RBF(1.5), DotProduct(0.5), WhiteKernel(0.1)])(X),
+// (X, X2), .diag(X), and theta child-concatenation order.
+// ---------------------------------------------------------------------------
+
+fn compound_oracle_kernel() -> CompoundKernel<f64> {
+    CompoundKernel::new(vec![
+        Box::new(RBFKernel::new(1.5)),
+        Box::new(DotProductKernel::new(0.5)),
+        Box::new(WhiteKernel::new(0.1)),
+    ])
+}
+
+#[test]
+fn green_compound_kernel_self_stack() {
+    // sklearn 1.5.2, /tmp:
+    // CompoundKernel([RBF(length_scale=1.5), DotProduct(sigma_0=0.5),
+    //                 WhiteKernel(noise_level=0.1)])(X)
+    let expected: &[&[&[f64]]] = &[
+        &[
+            &[1.0, 0.25, 0.1],
+            &[0.8007374029168081, 0.25, 0.0],
+            &[0.8007374029168081, 0.25, 0.0],
+        ],
+        &[
+            &[0.8007374029168081, 0.25, 0.0],
+            &[1.0, 1.25, 0.1],
+            &[0.6411803884299546, 0.25, 0.0],
+        ],
+        &[
+            &[0.8007374029168081, 0.25, 0.0],
+            &[0.6411803884299546, 0.25, 0.0],
+            &[1.0, 1.25, 0.1],
+        ],
+    ];
+    let k = compound_oracle_kernel();
+    assert_stack(&k.compute_stack(&x3(), &x3()), expected);
+}
+
+#[test]
+fn green_compound_kernel_cross_and_diag_stack() {
+    // sklearn 1.5.2, /tmp:
+    // CompoundKernel([...])(X, X2)
+    let expected_cross: &[&[&[f64]]] = &[
+        &[&[1.0, 0.25, 0.0], &[0.6411803884299546, 0.25, 0.0]],
+        &[
+            &[0.8007374029168081, 0.25, 0.0],
+            &[0.8007374029168081, 1.25, 0.0],
+        ],
+        &[
+            &[0.8007374029168081, 0.25, 0.0],
+            &[0.8007374029168081, 1.25, 0.0],
+        ],
+    ];
+    let k = compound_oracle_kernel();
+    assert_stack(&k.compute_stack(&x3(), &x2()), expected_cross);
+
+    // sklearn 1.5.2, /tmp: CompoundKernel([...]).diag(X)
+    let expected_diag: &[&[f64]] = &[&[1.0, 0.25, 0.1], &[1.0, 1.25, 0.1], &[1.0, 1.25, 0.1]];
+    assert_mat(&k.diagonal_stack(&x3()), expected_diag);
+}
+
+#[test]
+fn green_compound_kernel_theta_log_order() {
+    // sklearn 1.5.2, /tmp:
+    // CompoundKernel([RBF(1.5), DotProduct(0.5), WhiteKernel(0.1)]).theta
+    // == [ln(1.5), ln(0.5), ln(0.1)].
+    let k = compound_oracle_kernel();
+    let params = k.get_params();
+    let theta_oracle = [
+        0.405_465_108_108_164_4_f64,
+        -std::f64::consts::LN_2,
+        -2.302_585_092_994_045_5,
+    ];
+    assert_eq!(params.len(), theta_oracle.len());
+    for (i, &e) in theta_oracle.iter().enumerate() {
+        assert!(
+            (params[i] - e).abs() < 1e-12,
+            "theta[{i}] = {} != sklearn {e}",
+            params[i]
+        );
+    }
 }

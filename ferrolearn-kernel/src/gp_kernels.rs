@@ -19,6 +19,7 @@
 //! | [`SumKernel`] | `k = k1 + k2` |
 //! | [`ProductKernel`] | `k = k1 * k2` |
 //! | [`Exponentiation`] | `k = base^exponent` |
+//! | [`CompoundKernel`] | `K = stack([k1, k2, ...], axis=2)` |
 //!
 //! Kernels can be composed via `+` and `*` operators on `Box<dyn GPKernel<F>>`.
 //!
@@ -28,10 +29,10 @@
 //! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (18 REQs). Every REQ is
 //! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GP
 //! kernels are DETERMINISTIC, so the existing kernels' matrix values are directly
-//! oracle-verified element-wise (27 green guards in `tests/divergence_gp_kernels.rs`).
+//! oracle-verified element-wise (30 green guards in `tests/divergence_gp_kernels.rs`).
 //! The gaps are missing-feature / prerequisite blockers, not value errors.
 //!
-//! **12 SHIPPED / 5 NOT-STARTED.**
+//! **13 SHIPPED / 5 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -52,9 +53,9 @@
 //! | REQ-15 (ferray substrate) | NOT-STARTED | `ndarray` arrays vs `ferray-core` (R-SUBSTRATE-1). Blocker #1919. |
 //! | REQ-16 (`ExpSineSquared`) | SHIPPED | periodic formula `exp(-2 sin²(πd/p)/l²)` matches sklearn `ExpSineSquared` (`:1954`). |
 //! | REQ-17 (`Exponentiation`) | SHIPPED | wraps any `GPKernel` and raises matrix/diagonal values to `exponent`, matching sklearn `Exponentiation` (`:993`). |
-//! | REQ-18 (remaining missing kernel) | NOT-STARTED | no `CompoundKernel` (`:514`). |
+//! | REQ-18 (`CompoundKernel`) | SHIPPED | stacks child kernel matrices along axis 2 and child diagonals as columns, matching sklearn `CompoundKernel` (`:514`). |
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3};
 use num_traits::Float;
 
 /// Trait for covariance kernels used in Gaussian Process models.
@@ -865,6 +866,122 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for Exponentiation<F> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Compound Kernel
+// ---------------------------------------------------------------------------
+
+/// Stack of several kernels, matching sklearn's `CompoundKernel`.
+///
+/// sklearn returns a third-order tensor from `CompoundKernel.__call__`: each
+/// child kernel matrix is stacked along axis 2. The existing [`GPKernel`] trait
+/// returns only a 2D matrix, so this type exposes the sklearn-shaped
+/// [`compute_stack`](Self::compute_stack) and [`diagonal_stack`](Self::diagonal_stack)
+/// APIs directly instead of pretending the stack is a single covariance matrix.
+pub struct CompoundKernel<F: Float + Send + Sync + 'static> {
+    /// Child kernels in stack order.
+    pub kernels: Vec<Box<dyn GPKernel<F>>>,
+}
+
+impl<F: Float + Send + Sync + 'static> std::fmt::Debug for CompoundKernel<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompoundKernel")
+            .field("n_kernels", &self.kernels.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Clone for CompoundKernel<F> {
+    fn clone(&self) -> Self {
+        Self {
+            kernels: self
+                .kernels
+                .iter()
+                .map(|kernel| kernel.clone_box())
+                .collect(),
+        }
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> CompoundKernel<F> {
+    /// Create a stack of child kernels.
+    #[must_use]
+    pub fn new(kernels: Vec<Box<dyn GPKernel<F>>>) -> Self {
+        Self { kernels }
+    }
+
+    /// Number of child kernels.
+    #[must_use]
+    pub fn n_kernels(&self) -> usize {
+        self.kernels.len()
+    }
+
+    /// Compute `np.dstack([kernel(X1, X2) for kernel in kernels])`.
+    #[must_use]
+    pub fn compute_stack(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array3<F> {
+        let mut stack = Array3::<F>::zeros((x1.nrows(), x2.nrows(), self.kernels.len()));
+        for (kernel_idx, kernel) in self.kernels.iter().enumerate() {
+            let matrix = kernel.compute(x1, x2);
+            for i in 0..x1.nrows() {
+                for j in 0..x2.nrows() {
+                    stack[[i, j, kernel_idx]] = matrix[[i, j]];
+                }
+            }
+        }
+        stack
+    }
+
+    /// Compute `np.vstack([kernel.diag(X) for kernel in kernels]).T`.
+    #[must_use]
+    pub fn diagonal_stack(&self, x: &Array2<F>) -> Array2<F> {
+        let mut stack = Array2::<F>::zeros((x.nrows(), self.kernels.len()));
+        for (kernel_idx, kernel) in self.kernels.iter().enumerate() {
+            let diag = kernel.diagonal(x);
+            for i in 0..x.nrows() {
+                stack[[i, kernel_idx]] = diag[i];
+            }
+        }
+        stack
+    }
+
+    /// Number of stacked child hyperparameters.
+    #[must_use]
+    pub fn n_params(&self) -> usize {
+        self.kernels.iter().map(|kernel| kernel.n_params()).sum()
+    }
+
+    /// Concatenate child log-space hyperparameters in child order.
+    #[must_use]
+    pub fn get_params(&self) -> Vec<F> {
+        let mut params = Vec::new();
+        for kernel in &self.kernels {
+            params.extend(kernel.get_params());
+        }
+        params
+    }
+
+    /// Set child log-space hyperparameters in child order.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `params.len() != self.n_params()`.
+    pub fn set_params(&mut self, params: &[F]) {
+        assert_eq!(
+            params.len(),
+            self.n_params(),
+            "CompoundKernel expected {} params, got {}",
+            self.n_params(),
+            params.len()
+        );
+
+        let mut offset = 0;
+        for kernel in &mut self.kernels {
+            let n_params = kernel.n_params();
+            kernel.set_params(&params[offset..offset + n_params]);
+            offset += n_params;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1385,6 +1502,69 @@ mod tests {
         let params = k.get_params();
         assert_abs_diff_eq!(params[0], 2.0f64.ln(), epsilon = 1e-12);
         assert_abs_diff_eq!(params[1], 0.5f64.ln(), epsilon = 1e-12);
+    }
+
+    // --- CompoundKernel ---
+
+    #[test]
+    fn compound_kernel_stack_matches_sklearn() {
+        let k = CompoundKernel::new(vec![
+            Box::new(RBFKernel::new(1.5)),
+            Box::new(DotProductKernel::new(0.5)),
+            Box::new(WhiteKernel::new(0.1)),
+        ]);
+        let stack = k.compute_stack(&make_x1(), &make_x1());
+        assert_eq!(stack.dim(), (3, 3, 3));
+        assert_abs_diff_eq!(stack[[0, 0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[0, 1, 0]], 0.800_737_402_916_808_1, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[1, 2, 0]], 0.641_180_388_429_954_6, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[0, 0, 1]], 0.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[1, 1, 1]], 1.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[0, 0, 2]], 0.1, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[0, 1, 2]], 0.0, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn compound_kernel_cross_and_diagonal_stack() {
+        let k = CompoundKernel::new(vec![
+            Box::new(RBFKernel::new(1.5)),
+            Box::new(DotProductKernel::new(0.5)),
+            Box::new(WhiteKernel::new(0.1)),
+        ]);
+        let stack = k.compute_stack(&make_x1(), &make_x2());
+        assert_eq!(stack.dim(), (3, 2, 3));
+        assert_abs_diff_eq!(stack[[0, 1, 0]], 0.641_180_388_429_954_6, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[1, 1, 1]], 1.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(stack[[1, 1, 2]], 0.0, epsilon = 1e-12);
+
+        let diag = k.diagonal_stack(&make_x1());
+        assert_eq!(diag.dim(), (3, 3));
+        assert_abs_diff_eq!(diag[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[[0, 1]], 0.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[[0, 2]], 0.1, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[[1, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[[1, 1]], 1.25, epsilon = 1e-12);
+        assert_abs_diff_eq!(diag[[1, 2]], 0.1, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn compound_kernel_params_roundtrip() {
+        let mut k = CompoundKernel::new(vec![
+            Box::new(RBFKernel::new(1.5)),
+            Box::new(RationalQuadratic::new(1.3, 0.7)),
+        ]);
+        assert_eq!(k.n_kernels(), 2);
+        assert_eq!(k.n_params(), 3);
+        let params = k.get_params();
+        assert_abs_diff_eq!(params[0], 1.5f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 0.7f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[2], 1.3f64.ln(), epsilon = 1e-12);
+
+        k.set_params(&[2.0f64.ln(), 0.5f64.ln(), 0.8f64.ln()]);
+        let params = k.get_params();
+        assert_abs_diff_eq!(params[0], 2.0f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 0.5f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[2], 0.8f64.ln(), epsilon = 1e-12);
     }
 
     // --- Clone ---

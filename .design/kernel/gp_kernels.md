@@ -14,9 +14,11 @@ upstream-paths:
 kernels in `sklearn/gaussian_process/kernels.py` — the `Kernel` family used to
 build covariance matrices for `GaussianProcessRegressor`/`Classifier`. ferrolearn
 exposes the `GPKernel` trait (`compute`/`diagonal`/`n_params`/`get_params`/
-`set_params`/`clone_box`) and ten kernels: `RBFKernel`, `MaternKernel`,
+`set_params`/`clone_box`) and ten trait kernels: `RBFKernel`, `MaternKernel`,
 `RationalQuadratic`, `ExpSineSquared`, `ConstantKernel`, `WhiteKernel`,
 `DotProductKernel`, `SumKernel`, `ProductKernel`, `Exponentiation`.
+`CompoundKernel` separately exposes sklearn's third-axis stack surface through
+`compute_stack`/`diagonal_stack`.
 The non-test production consumer is the in-crate GPR/GPC: `compute`/`diagonal`
 drive the covariance-matrix construction in `gaussian_process.rs`
 (`fn fit`/`fn predict`) and `gp_classifier.rs` (`fn fit_binary_gpc`/`fn predict`).
@@ -24,10 +26,11 @@ There is NO Python binding for GP — the consumer is wholly the Rust GPR/GPC.
 
 The **base kernel-matrix formulas** for RBF, Matern (`nu ∈ {0.5, 1.5, 2.5}`),
 RationalQuadratic, ExpSineSquared, Constant, DotProduct, Sum/Product composition,
-and Exponentiation are value-exact against the live sklearn 1.5.2 oracle and
-have a real consumer — these are SHIPPED. GP kernels are deterministic, so every
-divergence below is oracle-pinnable *now* (unlike the RNG/generator carve-outs
-in `nystroem.md`); the gaps are missing-feature blockers, not
+Exponentiation, and CompoundKernel stacking are value-exact against the live
+sklearn 1.5.2 oracle and have a real consumer or public stack API — these are
+SHIPPED. GP kernels are deterministic, so every divergence below is
+oracle-pinnable *now* (unlike the RNG/generator carve-outs in `nystroem.md`);
+the gaps are missing-feature blockers, not
 value-of-existing-output divergences.
 
 The remaining gaps are all oracle-pinnable:
@@ -53,9 +56,7 @@ The remaining gaps are all oracle-pinnable:
 4. **Anisotropic `length_scale` — MISSING.** sklearn RBF/Matern accept an
    array `length_scale` (`:1472-1475`, `anisotropic` property `:1512-1514`);
    ferrolearn holds a scalar `length_scale: F`.
-5. **Remaining missing kernel.** `CompoundKernel` (`:514`) has NO ferrolearn
-   analog.
-6. **Substrate (R-SUBSTRATE-1).** `ndarray` instead of `ferray-core` /
+5. **Substrate (R-SUBSTRATE-1).** `ndarray` instead of `ferray-core` /
    `ferray::linalg`.
 
 ## Upstream reference (scikit-learn 1.5.2, commit 156ef14)
@@ -93,7 +94,7 @@ The remaining gaps are all oracle-pinnable:
     `dstack`s the two sub-gradients.
   - `class RationalQuadratic` `:1798`, `class ExpSineSquared` `:1954`,
     `class Exponentiation` `:993` — implemented formula surfaces in ferrolearn.
-    `class CompoundKernel` `:514` — no ferrolearn analog.
+    `class CompoundKernel` `:514` — implemented stack surface in ferrolearn.
 
 ## Requirements
 
@@ -229,9 +230,12 @@ The remaining gaps are all oracle-pinnable:
 - AC-17 (REQ-17): `(RBF(length_scale=1.5)**2.0)(X)` equals
   `[[1, 0.6411803884299546, 0.6411803884299546], ...]`; cross-evaluation,
   `diag(X)==[1,1,1]`, and delegated theta `[ln(1.5)]` match sklearn.
-- AC-18 (REQ-18): `CompoundKernel([RBF(), DotProduct()])(X)` evaluates in
-  sklearn; ferrolearn has no type for the stacked `(n, n, n_kernels)` output.
-  Oracle-pinnable once represented.
+- AC-18 (REQ-18): `CompoundKernel([RBF(1.5), DotProduct(0.5),
+  WhiteKernel(0.1)])(X)` returns a `(3,3,3)` stack whose first cell is
+  `[1.0, 0.25, 0.1]`; `(X, X2)` returns `(3,2,3)`; `.diag(X)` returns
+  `[[1.0, 0.25, 0.1], ...]`; theta order is `[ln(1.5), ln(0.5), ln(0.1)]`.
+  ferrolearn mirrors this through `compute_stack`, `diagonal_stack`, and
+  concatenated `get_params`.
 
 ## REQ status table
 
@@ -254,7 +258,7 @@ The remaining gaps are all oracle-pinnable:
 | REQ-15 (ferray substrate) | NOT-STARTED | blocker issue to be filed by critic (R-SUBSTRATE-1). `gp_kernels.rs` imports `ndarray::{Array1, Array2}`; `squared_distances`/`euclidean_distances`/`compute`/`diagonal` operate on `ndarray`. Destination: `ferray-core` (array type), `ferray-ufunc` (elementwise `exp`/distance), `ferray::linalg` (the `X·Yᵀ` dot for DotProduct). Not migrated. The new `bessel::bessel_k`/`statrs` `gamma` primitives for REQ-10 are likewise unmigrated — their destination is a `ferray::stats`/special-functions analog (`scipy.special.kv`/`gamma`); implemented in-crate now as the REQ-10 unblock (R-SUBSTRATE-5 follow-up). |
 | REQ-16 (`ExpSineSquared`) | SHIPPED | Added `pub struct ExpSineSquared<F>` with sklearn's constructor order `new(length_scale, periodicity)`, `Default` = `(1.0, 1.0)`, `compute` formula `exp(-2*sin(pi*d/periodicity)^2/length_scale^2)`, `diagonal` = ones, and `get_params`/`set_params` theta order `[ln(length_scale), ln(periodicity)]`. Live oracle (`X=[[0,0],[1,0],[0,1]]`, `X2=[[0,0],[1,1]]`): `ExpSineSquared(length_scale=1.3, periodicity=2.0)(X)[0,1] = 0.3062259800580424`, `[1,2] = 0.472714571288163`; cross row0 `[1.0, 0.472714571288163]`; `theta = [0.26236426446749106, 0.6931471805599453]`. Non-test consumer: the public `GaussianProcessRegressor`/`GaussianProcessClassifier` accept any `Box<dyn GPKernel<F>>`, so `ExpSineSquared` is consumed through the same production `kernel.compute`/`diagonal` path as the other GP kernels. Verification: `tests/divergence_gp_kernels.rs::{green_exp_sine_squared_self, green_exp_sine_squared_cross, green_exp_sine_squared_diag_and_theta}` plus in-crate `exp_sine_squared_*` tests and API inventory entry. |
 | REQ-17 (`Exponentiation`) | SHIPPED | Added `pub struct Exponentiation<F>` wrapping `Box<dyn GPKernel<F>>` plus structural `exponent`; `compute`/`diagonal` raise wrapped values with `powf(exponent)` and `n_params`/`get_params`/`set_params` delegate to the wrapped kernel, matching sklearn `Exponentiation` (`kernels.py:993`). Live oracle (`X=[[0,0],[1,0],[0,1]]`, `X2=[[0,0],[1,1]]`): `Exponentiation(RBF(length_scale=1.5), exponent=2.0)(X)[0,1] = 0.6411803884299546`, `[1,2] = 0.4111122905071875`; cross row0 `[1.0, 0.4111122905071875]`; delegated `theta = [0.4054651081081644]`. Non-test consumer: the public GP estimators consume it through the existing `GPKernel` trait object path. Verification: `tests/divergence_gp_kernels.rs::{green_exponentiation_rbf_self, green_exponentiation_rbf_cross, green_exponentiation_diag_and_theta}` plus in-crate `exponentiation_*` tests and API inventory entry. |
-| REQ-18 (`CompoundKernel`) | NOT-STARTED | blocker issue to be filed by critic (builder territory). No ferrolearn analog for `CompoundKernel` (`kernels.py:514`), sklearn's stacked kernel used for per-class GPC covariance (`__call__` returns `np.dstack([...])`, `diag` returns `np.vstack([...]).T`). This is real mirrored surface, not out-of-scope. Oracle-pinnable once built. |
+| REQ-18 (`CompoundKernel`) | SHIPPED | Added `pub struct CompoundKernel<F>` with child `Vec<Box<dyn GPKernel<F>>>`, sklearn-shaped `compute_stack` (`np.dstack([kernel(X,Y) ...])`), `diagonal_stack` (`np.vstack([kernel.diag(X) ...]).T`), and child-order `get_params`/`set_params`. Live oracle (`X=[[0,0],[1,0],[0,1]]`, `X2=[[0,0],[1,1]]`): `CompoundKernel([RBF(1.5), DotProduct(0.5), WhiteKernel(0.1)])(X).shape == (3,3,3)`, cell `[0,0,:] = [1.0, 0.25, 0.1]`, cross shape `(3,2,3)`, `diag(X) = [[1.0,0.25,0.1], [1.0,1.25,0.1], [1.0,1.25,0.1]]`, `theta = [0.4054651081081644, -0.6931471805599453, -2.3025850929940455]`. Verification: `tests/divergence_gp_kernels.rs::{green_compound_kernel_self_stack, green_compound_kernel_cross_and_diag_stack, green_compound_kernel_theta_log_order}` plus in-crate `compound_kernel_*` tests and API inventory entry. |
 
 ## Architecture
 
@@ -282,7 +286,7 @@ search. So the missing gradient/theta/bounds surface has no *current* ferrolearn
 consumer either; it is the prerequisite for ever matching sklearn's *tuned*
 kernel, hence NOT-STARTED rather than absent-by-design.
 
-The kernel formulas themselves (REQ-1..5, REQ-13, REQ-16, and REQ-17) are value-exact:
+The kernel formulas themselves (REQ-1..5, REQ-13, REQ-16, REQ-17, and REQ-18) are value-exact:
 `squared_distances`/`euclidean_distances` build the pairwise distance matrix, and each `compute`
 applies the closed-form covariance. The former Matern `else` RBF fallback for
 unsupported `nu` is now the true modified-Bessel formula (REQ-10, SHIPPED — the
@@ -290,45 +294,49 @@ unsupported `nu` is now the true modified-Bessel formula (REQ-10, SHIPPED — th
 existing kernels remain pinned NOT-STARTED: the WhiteKernel row-equality vs
 `Y is None` semantics (REQ-11) and the scalar-only `length_scale` (REQ-12).
 Constructor defaults (REQ-14, SHIPPED), shipped `RationalQuadratic` (REQ-13),
-shipped `ExpSineSquared`/`Exponentiation` (REQ-16/17), and the remaining missing
-`CompoundKernel` (REQ-18) round out the surface gap.
+shipped `ExpSineSquared`/`Exponentiation` (REQ-16/17), and shipped
+`CompoundKernel` stacking (REQ-18) round out the formula/stack surface.
 
 Invariants: `compute` returns `(n1, n2)`; `diagonal` returns `(n,)`; for every
 stationary kernel `diagonal(X)` ≡ `compute(X, X)` diagonal (1 for
 RBF/Matern/RationalQuadratic/ExpSineSquared, `constant_value` for Constant,
 `noise_level` for White, `‖xᵢ‖²+σ₀²` for DotProduct; `Exponentiation` delegates
-then raises). `K(X,X)` is symmetric PSD — pinned by `rbf_positive_semidefinite`/
+then raises; `CompoundKernel::diagonal_stack` returns these child diagonals as
+columns). `K(X,X)` is symmetric PSD — pinned by `rbf_positive_semidefinite`/
 `matern_15_positive_semidefinite`. The covariance matrix `K + alpha·I` consumed
 by GPR is PD for `alpha > 0`.
 
 ## Verification
 
 Commands establishing the SHIPPED claims (run after the
-`ExpSineSquared`/`Exponentiation` slice):
+`CompoundKernel` slice):
 
-- `cargo test -p ferrolearn-kernel --lib gp_kernels` → 45 passed, 0 failed;
-  covers REQ-1..6/13/16/17: `rbf_*`, `matern_*`, `rational_quadratic_*`,
-  `exp_sine_squared_*`, `exponentiation_*`, `constant_*`, `white_*`,
-  `dot_product_*`, `sum_*`, `product_*`, `*_params_roundtrip`,
+- `cargo test -p ferrolearn-kernel --lib gp_kernels` → 48 passed, 0 failed;
+  covers
+  REQ-1..6/13/16/17/18: `rbf_*`, `matern_*`, `rational_quadratic_*`,
+  `exp_sine_squared_*`, `exponentiation_*`, `compound_kernel_*`, `constant_*`,
+  `white_*`, `dot_product_*`, `sum_*`, `product_*`, `*_params_roundtrip`,
   `*_positive_semidefinite`.
-- `cargo test -p ferrolearn-kernel --test divergence_gp_kernels` → 27 passed,
+- `cargo test -p ferrolearn-kernel --test divergence_gp_kernels` → 30 passed,
   0 failed, including `green_rational_quadratic_*`,
-  `green_exp_sine_squared_*`, and `green_exponentiation_*` oracle guards.
-- `cargo test -p ferrolearn-kernel` → full kernel crate suite passed (209 lib
+  `green_exp_sine_squared_*`, `green_exponentiation_*`, and
+  `green_compound_kernel_*` oracle guards.
+- `cargo test -p ferrolearn-kernel` → full kernel crate suite passed (212 lib
   tests, all integration tests, and 5 doctests).
 - `cargo test -p ferrolearn-kernel --lib gaussian_process gp_classifier` →
   exercises the production consumer (REQ-7): `predict_with_matern`,
   `predict_with_dot_product`, `predict_with_sum_kernel`,
   `predict_with_product_kernel` drive `GaussianProcessRegressor` through
   `kernel.compute`/`diagonal`.
-- Base-formula oracle (REQ-1..5/13/16/17, R-CHAR-3 — expected from sklearn, never copied
+- Base-formula oracle (REQ-1..5/13/16/17/18, R-CHAR-3 — expected from sklearn, never copied
   from ferrolearn), `X=[[0,0],[1,0],[0,1]]`:
-  `python3 -c "import numpy as np; from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel, DotProduct, RationalQuadratic, ExpSineSquared; X=np.array([[0.,0.],[1.,0.],[0.,1.]]); print(RBF(length_scale=1.5)(X).tolist()); print(Matern(length_scale=1.0,nu=2.5)(X).tolist()); print(DotProduct(sigma_0=1.0)(X).tolist()); print(RationalQuadratic(length_scale=1.3,alpha=0.7)(X).tolist()); print(ExpSineSquared(length_scale=1.3,periodicity=2.0)(X).tolist()); print((RBF(length_scale=1.5)**2.0)(X).tolist())"`
+  `python3 -c "import numpy as np; from sklearn.gaussian_process.kernels import RBF, Matern, ConstantKernel, DotProduct, RationalQuadratic, ExpSineSquared, WhiteKernel, CompoundKernel; X=np.array([[0.,0.],[1.,0.],[0.,1.]]); print(RBF(length_scale=1.5)(X).tolist()); print(Matern(length_scale=1.0,nu=2.5)(X).tolist()); print(DotProduct(sigma_0=1.0)(X).tolist()); print(RationalQuadratic(length_scale=1.3,alpha=0.7)(X).tolist()); print(ExpSineSquared(length_scale=1.3,periodicity=2.0)(X).tolist()); print((RBF(length_scale=1.5)**2.0)(X).tolist()); print(CompoundKernel([RBF(length_scale=1.5), DotProduct(sigma_0=0.5), WhiteKernel(noise_level=0.1)])(X).tolist())"`
   → RBF `[[1, 0.800737, ...]]`, Matern `[[1, 0.523994, ...]]`, DotProduct
   `[[1,1,1],[1,2,1],[1,1,2]]`, RationalQuadratic
   `[[1, 0.7813226961811082, ...]]`, ExpSineSquared
-  `[[1, 0.3062259800580424, ...]]`, and Exponentiation(RBF, 2)
-  `[[1, 0.6411803884299546, ...]]`. A critic pins these as Rust `#[test]`s
+  `[[1, 0.3062259800580424, ...]]`, Exponentiation(RBF, 2)
+  `[[1, 0.6411803884299546, ...]]`, and CompoundKernel stack cell `[0,0,:]`
+  `[1.0, 0.25, 0.1]`. A critic pins these as Rust `#[test]`s
   comparing `compute` to the live oracle.
 
 Open divergences and missing features documented as blockers (NOT-STARTED,
@@ -343,19 +351,17 @@ oracle expected values — all deterministic, all oracle-pinnable now):
 - REQ-11 (WhiteKernel Y-is-None): `WhiteKernel(0.1)(X, X)` (explicit Y) is the
   all-zeros `(3,3)` in sklearn; ferrolearn's `compute(X, X)` returns `0.1·I`.
 - REQ-12 (anisotropic): `RBF(length_scale=[1.0, 2.0])(X)` ≠ any scalar-`l` RBF.
-- REQ-18 (remaining missing kernel): `CompoundKernel([...])` evaluates in
-  sklearn; no ferrolearn type.
-
 Per R-DEFER-2 the table is binary SHIPPED/NOT-STARTED. SHIPPED: REQ-1 (RBF),
 REQ-2 (Matern 0.5/1.5/2.5), REQ-3 (Constant), REQ-4 (DotProduct), REQ-5
 (Sum/Product + theta order), REQ-6 (log-space round-trip), REQ-7 (GPR/GPC
 consumer), REQ-10 (Matern general-`nu`/Bessel + `nu=inf`), REQ-13
 (`RationalQuadratic`), REQ-14 (constructor defaults / `Default`), REQ-16
-(`ExpSineSquared`), REQ-17 (`Exponentiation`) — impl + non-test GP consumer +
-green verification.
+(`ExpSineSquared`), REQ-17 (`Exponentiation`), REQ-18 (`CompoundKernel`) —
+implementation plus non-test GP consumer or public stack API plus green
+verification.
 NOT-STARTED (the critic files per-REQ `-l blocker` issues): REQ-8 (eval_gradient
 / `dK/dθ`), REQ-9 (theta/bounds/Hyperparameter/fixed), REQ-11 (WhiteKernel
 `Y is None` semantics), REQ-12 (anisotropic `length_scale`), REQ-15 (ferray
-substrate), REQ-18 (CompoundKernel). GP kernels are deterministic, so every NOT-STARTED is a
+substrate). GP kernels are deterministic, so every NOT-STARTED is a
 missing-feature or element-wise-divergence blocker that is oracle-pinnable now —
 there is no RNG/generator carve-out here (cf. `nystroem.md` REQ-8).

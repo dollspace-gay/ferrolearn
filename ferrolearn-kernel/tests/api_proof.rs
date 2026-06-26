@@ -13,7 +13,7 @@
 //!   + log_marginal_likelihood + score
 //! - GP kernels: RBFKernel, MaternKernel (3 nu values), RationalQuadratic,
 //!   ExpSineSquared, ConstantKernel, WhiteKernel, DotProductKernel, SumKernel,
-//!   ProductKernel, Exponentiation
+//!   ProductKernel, Exponentiation, CompoundKernel
 //! - NadarayaWatson + LocalPolynomialRegression with every Kernel variant
 //!   (Gaussian, Epanechnikov, Tricube, Biweight, Triweight, Uniform, Cosine)
 //! - Bandwidth helpers: scott_bandwidth, silverman_bandwidth,
@@ -23,8 +23,8 @@
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
-    BiweightKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel, EpanechnikovKernel,
-    ExpSineSquared, Exponentiation, GaussianKernel, GaussianProcessClassifier,
+    BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel,
+    EpanechnikovKernel, ExpSineSquared, Exponentiation, GaussianKernel, GaussianProcessClassifier,
     GaussianProcessRegressor, HeteroscedasticityTest, KernelRidge, KernelType,
     LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem, ProductKernel, RBFKernel,
     RBFSampler, RationalQuadratic, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
@@ -239,6 +239,15 @@ fn api_proof_gp_kernel_zoo() {
     assert_eq!(pow.compute(&x, &x).dim(), (4, 4));
     assert_eq!(pow.diagonal(&x).len(), 4);
     assert_eq!(pow.get_params().len(), 1);
+
+    let compound = CompoundKernel::new(vec![
+        Box::new(RBFKernel::new(1.0)),
+        Box::new(DotProductKernel::new(0.5)),
+        Box::new(WhiteKernel::new(0.1)),
+    ]);
+    assert_eq!(compound.compute_stack(&x, &x).dim(), (4, 4, 3));
+    assert_eq!(compound.diagonal_stack(&x).dim(), (4, 3));
+    assert_eq!(compound.get_params().len(), 3);
 }
 
 // =============================================================================
