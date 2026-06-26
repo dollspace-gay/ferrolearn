@@ -33,6 +33,8 @@
 //!   producing a dense feature embedding usable with linear models.
 //! - **[`RBFSampler`]** — Random Fourier features (Rahimi & Recht 2007) for
 //!   approximating the RBF kernel with a randomized cosine feature map.
+//! - **[`AdditiveChi2Sampler`]** — Deterministic explicit feature map for the
+//!   additive chi-squared kernel.
 //!
 //! # Design
 //!
@@ -44,6 +46,7 @@
 //!   that implements [`Predict`](ferrolearn_core::Predict).
 //! - Calling `predict()` on an unfitted model is a compile-time error.
 
+pub mod additive_chi2_sampler;
 pub mod bandwidth;
 pub mod bessel;
 pub mod confidence;
@@ -60,6 +63,7 @@ pub mod nystroem;
 pub mod rbf_sampler;
 pub mod weights;
 
+pub use additive_chi2_sampler::{AdditiveChi2Sampler, FittedAdditiveChi2Sampler};
 pub use bandwidth::{CrossValidatedBandwidth, CvStrategy, scott_bandwidth, silverman_bandwidth};
 pub use confidence::{
     BiasCorrection, ConfidenceIntervalResult, ConformalResult, VarianceFunctionResult,

@@ -7,6 +7,7 @@
 //! - KernelRidge: builders + fit + predict + score, every KernelType variant
 //! - Nystroem: builders + fit + transform, every KernelType variant
 //! - RBFSampler: builders + fit + transform
+//! - AdditiveChi2Sampler: builders + fit + transform
 //! - GaussianProcessRegressor: fit + predict + predict_with_std + sample_y +
 //!   log_marginal_likelihood + score
 //! - GaussianProcessClassifier: fit + predict + predict_proba + predict_log_proba
@@ -23,13 +24,14 @@
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ferrolearn_kernel::bandwidth::BandwidthStrategy;
 use ferrolearn_kernel::{
-    BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy, DotProductKernel,
-    EpanechnikovKernel, ExpSineSquared, Exponentiation, GaussianKernel, GaussianProcessClassifier,
-    GaussianProcessRegressor, HeteroscedasticityTest, Hyperparameter, HyperparameterBounds,
-    KernelRidge, KernelType, LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem,
-    ProductKernel, RBFKernel, RBFSampler, RationalQuadratic, SumKernel, TricubeKernel,
-    TriweightKernel, UniformKernel, WhiteKernel, heteroscedasticity_test, residual_diagnostics,
-    scott_bandwidth, silverman_bandwidth,
+    AdditiveChi2Sampler, BiweightKernel, CompoundKernel, ConstantKernel, CosineKernel, CvStrategy,
+    DotProductKernel, EpanechnikovKernel, ExpSineSquared, Exponentiation,
+    FittedAdditiveChi2Sampler, GaussianKernel, GaussianProcessClassifier, GaussianProcessRegressor,
+    HeteroscedasticityTest, Hyperparameter, HyperparameterBounds, KernelRidge, KernelType,
+    LocalPolynomialRegression, MaternKernel, NadarayaWatson, Nystroem, ProductKernel, RBFKernel,
+    RBFSampler, RationalQuadratic, SumKernel, TricubeKernel, TriweightKernel, UniformKernel,
+    WhiteKernel, heteroscedasticity_test, residual_diagnostics, scott_bandwidth,
+    silverman_bandwidth,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -128,6 +130,26 @@ fn api_proof_rbf_sampler() {
     let embedded = f.transform(&x).unwrap();
     assert_eq!(embedded.nrows(), 10);
     assert_eq!(embedded.ncols(), 8);
+}
+
+#[test]
+fn api_proof_additive_chi2_sampler() {
+    let x = array![[0.0, 1.0], [2.0, 3.0], [4.0, 5.0]];
+    let dummy_y = ();
+    let m = AdditiveChi2Sampler::<f64>::new().with_sample_steps(3);
+    let f: FittedAdditiveChi2Sampler<f64> = m.fit(&x, &dummy_y).unwrap();
+    assert_eq!(f.n_features_in(), 2);
+    assert_eq!(f.sample_steps(), 3);
+    assert_eq!(f.n_features_out(), 10);
+    let embedded = f.transform(&x).unwrap();
+    assert_eq!(embedded.dim(), (3, 10));
+
+    let custom = AdditiveChi2Sampler::<f64>::new()
+        .with_sample_steps(4)
+        .with_sample_interval(0.7)
+        .fit(&x, &dummy_y)
+        .unwrap();
+    assert_eq!(custom.transform(&x).unwrap().dim(), (3, 14));
 }
 
 // =============================================================================

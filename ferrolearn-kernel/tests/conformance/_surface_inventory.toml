@@ -4,6 +4,11 @@
 # OR be listed in `_surface_exclusions.toml` with a reason.
 
 [[item]]
+path = "ferrolearn_kernel::AdditiveChi2Sampler"
+phase = "kernel"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_kernel::BiasCorrection"
 phase = "kernel"
 fixture = ""
@@ -80,6 +85,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_kernel::FittedGaussianProcessRegressor"
+phase = "kernel"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_kernel::FittedAdditiveChi2Sampler"
 phase = "kernel"
 fixture = ""
 
