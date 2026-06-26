@@ -86,9 +86,10 @@ pub enum Average {
 /// scikit-learn exposes this as `replace_undefined_by`, accepting `np.nan`,
 /// `1.0`, or a `{"LR+": value, "LR-": value}` dictionary. The Rust API models
 /// those choices explicitly.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum ClassLikelihoodUndefined {
     /// Return `NaN` for undefined ratios.
+    #[default]
     Nan,
     /// Return the worst usable scores: `LR+ = 1.0`, `LR- = 1.0`.
     Worst,
@@ -99,12 +100,6 @@ pub enum ClassLikelihoodUndefined {
         /// Replacement for the negative likelihood ratio. Must be `NaN` or in `[0.0, 1.0]`.
         lr_negative: f64,
     },
-}
-
-impl Default for ClassLikelihoodUndefined {
-    fn default() -> Self {
-        Self::Nan
-    }
 }
 
 // ---------------------------------------------------------------------------

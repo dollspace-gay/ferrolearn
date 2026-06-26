@@ -11,6 +11,7 @@
 //! |--------|---------|
 //! | [`RBFKernel`] | `k(x, x') = exp(-||x - x'||^2 / (2 l^2))` |
 //! | [`MaternKernel`] | Matern family (any nu via closed forms / Bessel K_ν / nu=inf→RBF) |
+//! | [`RationalQuadratic`] | `k(x, x') = (1 + ||x - x'||² / (2αl²))^{-α}` |
 //! | [`ConstantKernel`] | `k(x, x') = c` |
 //! | [`WhiteKernel`] | `k(x, x') = sigma^2 * delta(x, x')` |
 //! | [`DotProductKernel`] | `k(x, x') = sigma_0^2 + x . x'` |
@@ -25,10 +26,10 @@
 //! 156ef14). Design doc: `.design/kernel/gp_kernels.md` (15 REQs). Every REQ is
 //! BINARY (R-DEFER-2): SHIPPED or NOT-STARTED (with a concrete blocker). GP
 //! kernels are DETERMINISTIC, so the existing kernels' matrix values are directly
-//! oracle-verified element-wise (18 green guards in `tests/divergence_gp_kernels.rs`).
+//! oracle-verified element-wise (21 green guards in `tests/divergence_gp_kernels.rs`).
 //! The gaps are missing-feature / prerequisite blockers, not value errors.
 //!
-//! **8 SHIPPED / 7 NOT-STARTED.**
+//! **10 SHIPPED / 6 NOT-STARTED.**
 //!
 //! | REQ | Status | Notes |
 //! |---|---|---|
@@ -44,9 +45,10 @@
 //! | REQ-10 (Matern general nu) | SHIPPED | `MaternKernel::compute` now evaluates the modified-Bessel general formula `(2^{1-ν}/Γ(ν))·(√(2ν)·d)^ν·K_ν(√(2ν)·d)` for nu ∉ {0.5,1.5,2.5,inf} (`kernels.py:1729-1735`) and `nu=inf → exp(-d²/2)` (RBF, `:1727-1728`); `d≈0 → 1.0`. `K_ν` via `crate::bessel::bessel_k` (Numerical Recipes `bessik`, Temme series + CF2, ~1e-10 vs `scipy.special.kv`); Γ via `statrs::function::gamma::gamma`. Oracle `Matern(1.0,3.5)(X)[0,1]=0.5449424471128748` matches (no longer the RBF `0.6065`). Non-test consumer: `GaussianProcessRegressor` (`gaussian_process.rs` `fn fit`/`predict` via `kernel.compute`) — guarded by `tests/divergence_gaussian_process.rs::divergence_matern_general_nu_predict_std` (un-ignored). In-crate: `matern_general_nu_35_matches_sklearn`/`matern_general_nu_07_matches_sklearn`/`matern_nu_inf_is_rbf`/`matern_general_agrees_with_closed_forms`; `bessel::tests::kv_matches_scipy_oracle`. (Closes #1914, #2375.) |
 //! | REQ-11 (`WhiteKernel` Y-given semantics) | NOT-STARTED | `compute(X,X)` row-equality → `noise·I` vs sklearn explicit-Y `zeros` (`:1416`); GPR relies on the `noise·I` self-path, so a faithful fix needs a Y=None channel rippling across kernels + GPR/GPC. Blocker #1915. |
 //! | REQ-12 (anisotropic length_scale) | NOT-STARTED | scalar `length_scale` only; sklearn accepts a per-feature array (`:1472-1475`). Blocker #1916. |
-//! | REQ-13 (missing kernels) | NOT-STARTED | no `RationalQuadratic` (`:1798`), `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). Blocker #1917. |
-//! | REQ-14 (constructor defaults / `Default`) | SHIPPED | `Default` impls call `new()` with sklearn's keyword defaults: RBF `length_scale=1.0` (`kernels.py:1508`), Matern `length_scale=1.0, nu=1.5` (`:1678`), Constant `constant_value=1.0` (`:1233`), White `noise_level=1.0` (`:1363`), DotProduct `sigma_0=1.0` (`:2156`); guarded by `gp_kernel_defaults_match_sklearn`. Blocker #1918. |
+//! | REQ-13 (`RationalQuadratic`) | SHIPPED | isotropic formula `(1 + d²/(2αl²))^{-α}` matches sklearn `RationalQuadratic` (`:1798`). |
+//! | REQ-14 (constructor defaults / `Default`) | SHIPPED | `Default` impls call `new()` with sklearn's keyword defaults for RBF, Matern, RationalQuadratic, Constant, White, and DotProduct; guarded by `gp_kernel_defaults_match_sklearn`. |
 //! | REQ-15 (ferray substrate) | NOT-STARTED | `ndarray` arrays vs `ferray-core` (R-SUBSTRATE-1). Blocker #1919. |
+//! | REQ-16 (remaining missing kernels) | NOT-STARTED | no `ExpSineSquared` (`:1954`), `Exponentiation` (`:993`), `CompoundKernel` (`:514`). |
 
 use ndarray::{Array1, Array2};
 use num_traits::Float;
@@ -313,6 +315,81 @@ impl<F: Float + Send + Sync + 'static> GPKernel<F> for MaternKernel<F> {
 
     fn set_params(&mut self, params: &[F]) {
         self.length_scale = params[0].exp();
+    }
+
+    fn clone_box(&self) -> Box<dyn GPKernel<F>> {
+        Box::new(self.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Rational Quadratic Kernel
+// ---------------------------------------------------------------------------
+
+/// Rational Quadratic covariance kernel.
+///
+/// This mirrors `sklearn.gaussian_process.kernels.RationalQuadratic`'s
+/// isotropic variant:
+///
+/// `k(x, x') = (1 + ||x - x'||² / (2 * alpha * length_scale²))^{-alpha}`
+///
+/// `length_scale` controls the characteristic distance, and `alpha` controls
+/// the relative weighting of large-scale and small-scale variation.
+#[derive(Debug, Clone)]
+pub struct RationalQuadratic<F> {
+    /// Length scale parameter.
+    pub length_scale: F,
+    /// Scale-mixture parameter.
+    pub alpha: F,
+}
+
+impl<F: Float> RationalQuadratic<F> {
+    /// Create a new Rational Quadratic kernel.
+    ///
+    /// Mirrors sklearn's constructor argument order:
+    /// `RationalQuadratic(length_scale=..., alpha=...)`.
+    #[must_use]
+    pub fn new(length_scale: F, alpha: F) -> Self {
+        Self {
+            length_scale,
+            alpha,
+        }
+    }
+}
+
+impl<F: Float> Default for RationalQuadratic<F> {
+    /// Mirrors sklearn `RationalQuadratic(length_scale=1.0, alpha=1.0)`.
+    fn default() -> Self {
+        Self::new(F::one(), F::one())
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> GPKernel<F> for RationalQuadratic<F> {
+    fn compute(&self, x1: &Array2<F>, x2: &Array2<F>) -> Array2<F> {
+        let two = F::from(2.0).unwrap();
+        let ls2 = self.length_scale * self.length_scale;
+        let denom = two * self.alpha * ls2;
+        let sq = squared_distances(x1, x2);
+        sq.mapv(|d| (F::one() + d / denom).powf(-self.alpha))
+    }
+
+    fn diagonal(&self, x: &Array2<F>) -> Array1<F> {
+        Array1::from_elem(x.nrows(), F::one())
+    }
+
+    fn n_params(&self) -> usize {
+        2
+    }
+
+    fn get_params(&self) -> Vec<F> {
+        // sklearn theta order is alphabetical by hyperparameter name:
+        // alpha, then length_scale.
+        vec![self.alpha.ln(), self.length_scale.ln()]
+    }
+
+    fn set_params(&mut self, params: &[F]) {
+        self.alpha = params[0].exp();
+        self.length_scale = params[1].exp();
     }
 
     fn clone_box(&self) -> Box<dyn GPKernel<F>> {
@@ -884,6 +961,41 @@ mod tests {
         assert_abs_diff_eq!(k.length_scale, 0.5, epsilon = 1e-12);
     }
 
+    // --- RationalQuadratic ---
+
+    #[test]
+    fn rational_quadratic_default_matches_sklearn() {
+        let k = RationalQuadratic::new(1.0, 1.0);
+        let x = make_x1();
+        let km = k.compute(&x, &x);
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 2.0 / 3.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[1, 2]], 0.5, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn rational_quadratic_cross_covariance() {
+        let k = RationalQuadratic::new(1.3, 0.7);
+        let km = k.compute(&make_x1(), &make_x2());
+        assert_eq!(km.dim(), (3, 2));
+        assert_abs_diff_eq!(km[[0, 0]], 1.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[0, 1]], 0.651_255_953_178_008_1, epsilon = 1e-12);
+        assert_abs_diff_eq!(km[[1, 0]], 0.781_322_696_181_108_2, epsilon = 1e-12);
+    }
+
+    #[test]
+    fn rational_quadratic_params_roundtrip() {
+        let mut k = RationalQuadratic::new(1.3, 0.7);
+        let params = k.get_params();
+        assert_eq!(params.len(), 2);
+        assert_abs_diff_eq!(params[0], 0.7f64.ln(), epsilon = 1e-12);
+        assert_abs_diff_eq!(params[1], 1.3f64.ln(), epsilon = 1e-12);
+
+        k.set_params(&[2.0f64.ln(), 0.5f64.ln()]);
+        assert_abs_diff_eq!(k.alpha, 2.0, epsilon = 1e-12);
+        assert_abs_diff_eq!(k.length_scale, 0.5, epsilon = 1e-12);
+    }
+
     // --- Constant ---
 
     #[test]
@@ -1099,6 +1211,9 @@ mod tests {
         // Matern(length_scale=1.0, nu=1.5) kernels.py:1678
         assert_eq!(MaternKernel::<f64>::default().length_scale, 1.0);
         assert_eq!(MaternKernel::<f64>::default().nu, 1.5);
+        // RationalQuadratic(length_scale=1.0, alpha=1.0) kernels.py:1859
+        assert_eq!(RationalQuadratic::<f64>::default().length_scale, 1.0);
+        assert_eq!(RationalQuadratic::<f64>::default().alpha, 1.0);
         // ConstantKernel(constant_value=1.0) kernels.py:1233
         assert_eq!(ConstantKernel::<f64>::default().constant_value, 1.0);
         // DotProduct(sigma_0=1.0) kernels.py:2156

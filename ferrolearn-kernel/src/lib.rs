@@ -22,8 +22,9 @@
 //!   approximation (binary and multi-class one-vs-rest), with Rasmussen &
 //!   Williams Algorithm 3.2 predictions and `log_marginal_likelihood()` for
 //!   hyperparameter selection.
-//! - **GP Kernels** — RBF, Matern (any nu via closed forms / Bessel K_ν), Constant, White, DotProduct,
-//!   plus Sum and Product kernel composition via the [`gp_kernels::GPKernel`] trait.
+//! - **GP Kernels** — RBF, Matern (any nu via closed forms / Bessel K_ν),
+//!   RationalQuadratic, Constant, White, DotProduct, plus Sum and Product
+//!   kernel composition via the [`gp_kernels::GPKernel`] trait.
 //! - **[`KernelRidge`]** — Kernel ridge regression in dual form
 //!   `(K + αI) c = y` with RBF / Polynomial / Linear / Sigmoid / Laplacian
 //!   / Cosine kernels.
@@ -70,8 +71,8 @@ pub use diagnostics::{
 pub use gaussian_process::{FittedGaussianProcessRegressor, GaussianProcessRegressor};
 pub use gp_classifier::{FittedGaussianProcessClassifier, GaussianProcessClassifier};
 pub use gp_kernels::{
-    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel, SumKernel,
-    WhiteKernel,
+    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel,
+    RationalQuadratic, SumKernel, WhiteKernel,
 };
 pub use kernel_ridge::{FittedKernelRidge, KernelRidge};
 pub use kernels::{

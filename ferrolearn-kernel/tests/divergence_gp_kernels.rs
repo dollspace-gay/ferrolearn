@@ -3,8 +3,9 @@
 //! (`sklearn/gaussian_process/kernels.py`).
 //!
 //! Translation unit #1911. GP kernels are DETERMINISTIC, so every kernel-matrix
-//! value is directly oracle-comparable. The seven SHIPPED kernels (RBF, Matern
-//! nu∈{0.5,1.5,2.5}, Constant, DotProduct, White, Sum, Product) are pinned here
+//! value is directly oracle-comparable. The SHIPPED kernels (RBF, Matern
+//! nu∈{0.5,1.5,2.5}, RationalQuadratic, Constant, DotProduct, White, Sum,
+//! Product) are pinned here
 //! as PASSING oracle GREEN GUARDS: each `compute`/`diagonal` is asserted
 //! element-wise (~1e-12) against the live sklearn 1.5.2 oracle.
 //!
@@ -19,24 +20,21 @@
 //!
 //! - REQ-8 eval_gradient / analytic dK/dθ (no trait method) — blocker.
 //! - REQ-9 theta/bounds/Hyperparameter/fixed/n_dims machinery — blocker.
-//! - REQ-10 Matern general-nu (modified-Bessel) + nu=inf — blocker (needs a
-//!   `kv`/`gamma` special-function primitive).
 //! - REQ-11 WhiteKernel `Y is None` vs explicit-`Y` semantics — blocker (needs a
 //!   self/Y=None channel across every kernel + GPR/GPC).
 //! - REQ-12 anisotropic (array) length_scale — blocker.
-//! - REQ-13 RationalQuadratic/ExpSineSquared/Exponentiation/Compound — blocker.
-//! - REQ-14 constructor defaults / `Default` — blocker.
 //! - REQ-15 ferray substrate — blocker.
+//! - REQ-16 ExpSineSquared/Exponentiation/Compound — blocker.
 //!
-//! VERDICT: the 7 SHIPPED formulas all match the live oracle element-wise. No
+//! VERDICT: the SHIPPED formulas all match the live oracle element-wise. No
 //! genuine single-file-fixable element-wise mismatch was found in the existing
 //! kernels, so this file is all green guards (the correct verify-and-document
-//! outcome). The REQ-10/REQ-11 oracle divergences are documented in the blocker
+//! outcome). The remaining oracle divergences are documented in the blocker
 //! issues, not pinned as stranded red tests (R-LOOP-3).
 
 use ferrolearn_kernel::{
-    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel, SumKernel,
-    WhiteKernel,
+    ConstantKernel, DotProductKernel, GPKernel, MaternKernel, ProductKernel, RBFKernel,
+    RationalQuadratic, SumKernel, WhiteKernel,
 };
 use ndarray::{Array2, array};
 
@@ -331,4 +329,60 @@ fn green_rbf_theta_log_transform() {
         "theta {} != ln 2.0 = {oracle}",
         params[0]
     );
+}
+
+// ---------------------------------------------------------------------------
+// REQ-13 — RationalQuadratic  (GREEN GUARD)
+// oracle: RationalQuadratic(length_scale=1.3, alpha=0.7)(X), (X, X2),
+// .diag(X), and theta order [ln alpha, ln length_scale].
+// ---------------------------------------------------------------------------
+
+#[test]
+fn green_rational_quadratic_self() {
+    // sklearn 1.5.2, /tmp:
+    // RationalQuadratic(length_scale=1.3, alpha=0.7)(X)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.7813226961811082, 0.7813226961811082],
+        &[0.7813226961811082, 1.0, 0.6512559531780081],
+        &[0.7813226961811082, 0.6512559531780081, 1.0],
+    ];
+    let k = RationalQuadratic::new(1.3, 0.7);
+    let x = x3();
+    assert_mat(&k.compute(&x, &x), expected);
+}
+
+#[test]
+fn green_rational_quadratic_cross() {
+    // sklearn 1.5.2, /tmp:
+    // RationalQuadratic(length_scale=1.3, alpha=0.7)(X, X2)
+    let expected: &[&[f64]] = &[
+        &[1.0, 0.6512559531780081],
+        &[0.7813226961811082, 0.7813226961811082],
+        &[0.7813226961811082, 0.7813226961811082],
+    ];
+    let k = RationalQuadratic::new(1.3, 0.7);
+    assert_mat(&k.compute(&x3(), &x2()), expected);
+}
+
+#[test]
+fn green_rational_quadratic_diag_and_theta() {
+    // sklearn 1.5.2, /tmp:
+    // RationalQuadratic(length_scale=1.3, alpha=0.7).diag(X) == [1,1,1]
+    // theta == [ln(alpha), ln(length_scale)]
+    //       == [-0.35667494393873245, 0.26236426446749106]
+    let k = RationalQuadratic::new(1.3, 0.7);
+    for &v in &k.diagonal(&x3()) {
+        assert!((v - 1.0).abs() < 1e-12, "diag {v} != 1");
+    }
+
+    let theta_oracle = [-0.356_674_943_938_732_45_f64, 0.262_364_264_467_491_06];
+    let params = k.get_params();
+    assert_eq!(params.len(), 2);
+    for (i, &e) in theta_oracle.iter().enumerate() {
+        assert!(
+            (params[i] - e).abs() < 1e-12,
+            "theta[{i}] = {} != sklearn {e}",
+            params[i]
+        );
+    }
 }
