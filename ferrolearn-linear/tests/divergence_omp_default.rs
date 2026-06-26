@@ -1,12 +1,11 @@
-//! Divergence: `OrthogonalMatchingPursuit::fit` default-construction path
+//! Regression guard: `OrthogonalMatchingPursuit::fit` default-construction path
 //! (`ferrolearn-linear/src/omp.rs`) vs scikit-learn 1.5.2
 //! `sklearn/linear_model/_omp.py` `OrthogonalMatchingPursuit.fit`.
 //!
 //! When both `n_nonzero_coefs` and `tol` are `None`, sklearn applies
 //! `self.n_nonzero_coefs_ = max(int(0.1 * n_features), 1)`
-//! (`sklearn/linear_model/_omp.py:783-785`) and FITS. ferrolearn's
-//! `fn fit in omp.rs` instead returns `Err(FerroError::InvalidParameter)`
-//! ("at least one stopping criterion must be set", omp.rs greedy-path guard).
+//! (`sklearn/linear_model/_omp.py:783-785`) and fits. ferrolearn now mirrors
+//! that default instead of erroring.
 //!
 //! Oracle (live sklearn 1.5.2, load_diabetes, 10 features -> default n_nonzero=1):
 //! ```text
@@ -20,8 +19,8 @@
 
 use ferrolearn_core::introspection::HasCoefficients;
 use ferrolearn_core::traits::Fit;
-use ferrolearn_linear::OrthogonalMatchingPursuit;
-use ndarray::{Array1, Array2};
+use ferrolearn_linear::{OrthogonalMatchingPursuit, OrthogonalMpOptions, orthogonal_mp};
+use ndarray::{Array1, Array2, array};
 
 fn diabetes() -> (Array2<f64>, Array1<f64>) {
     let x = Array2::from_shape_vec((442, 10), X_FLAT.to_vec()).unwrap();
@@ -67,19 +66,96 @@ const SK_COEF_K5: [f64; 10] = [
 /// sklearn `OMP(n_nonzero_coefs=5).fit(X,y).intercept_` on diabetes.
 const SK_INTERCEPT_K5: f64 = 152.13348416289602;
 
+fn small_raw_omp_fixture() -> (Array2<f64>, Array1<f64>) {
+    (
+        array![[1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 1.0]],
+        array![1.0, 2.0, 3.0, 4.0],
+    )
+}
+
+/// Public helper parity: sklearn `orthogonal_mp(X, y, n_nonzero_coefs=1)`
+/// uses the raw design and returns the one-step coefficient vector.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp(X, y, n_nonzero_coefs=1) -> [2.0, 0.0]`.
+#[test]
+fn orthogonal_mp_helper_k1_matches_sklearn() {
+    let (x, y) = small_raw_omp_fixture();
+    let result = orthogonal_mp(
+        &x,
+        &y,
+        OrthogonalMpOptions::default().with_n_nonzero_coefs(Some(1)),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 1);
+    assert!((result.coefficients()[0] - 2.0).abs() < 1e-12);
+    assert!(result.coefficients()[1].abs() < 1e-12);
+    assert!(result.path().is_none());
+}
+
+/// Public helper parity for coefficient paths and `return_n_iter` equivalent.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp(X, y, n_nonzero_coefs=2, return_path=True)`
+/// -> `[[2.0, 1.0], [0.0, 2.0]]`; `return_n_iter=True` -> `2`.
+#[test]
+fn orthogonal_mp_helper_path_matches_sklearn() {
+    let (x, y) = small_raw_omp_fixture();
+    let result = orthogonal_mp(
+        &x,
+        &y,
+        OrthogonalMpOptions::default()
+            .with_n_nonzero_coefs(Some(2))
+            .with_return_path(true),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 2);
+    assert!((result.coefficients()[0] - 1.0).abs() < 1e-12);
+    assert!((result.coefficients()[1] - 2.0).abs() < 1e-12);
+    let path = result.path().expect("return_path=true should capture path");
+    assert_eq!(path.dim(), (2, 2));
+    assert!((path[[0, 0]] - 2.0).abs() < 1e-12);
+    assert!(path[[1, 0]].abs() < 1e-12);
+    assert!((path[[0, 1]] - 1.0).abs() < 1e-12);
+    assert!((path[[1, 1]] - 2.0).abs() < 1e-12);
+}
+
+/// Public helper parity: when `tol` is supplied, sklearn allows
+/// `n_nonzero_coefs > n_features` and stops on the residual tolerance instead
+/// of raising the over-large atom-count error.
+///
+/// Live sklearn 1.5.2 oracle:
+/// `orthogonal_mp(X, y, n_nonzero_coefs=3, tol=0.1) -> [1.0, 2.0]`.
+#[test]
+fn orthogonal_mp_helper_tol_allows_large_n_like_sklearn() {
+    let (x, y) = small_raw_omp_fixture();
+    let result = orthogonal_mp(
+        &x,
+        &y,
+        OrthogonalMpOptions::default()
+            .with_n_nonzero_coefs(Some(3))
+            .with_tol(Some(0.1)),
+    )
+    .unwrap();
+
+    assert_eq!(result.n_iter(), 2);
+    assert!((result.coefficients()[0] - 1.0).abs() < 1e-12);
+    assert!((result.coefficients()[1] - 2.0).abs() < 1e-12);
+}
+
 // ---------------------------------------------------------------------------
-// PRIMARY divergence (#488): default construction must FIT, not error.
+// PRIMARY regression guard (#488): default construction must FIT, not error.
 // ---------------------------------------------------------------------------
 
-/// Divergence: ferrolearn `OrthogonalMatchingPursuit::new().fit(X,y)` returns
-/// `Err(FerroError::InvalidParameter)` (omp.rs greedy-path guard:
-/// "at least one stopping criterion must be set"), whereas sklearn
-/// `OrthogonalMatchingPursuit().fit(X,y)` (`_omp.py:783-785`) sets
-/// `n_nonzero_coefs_ = max(int(0.1*n_features), 1)` and fits.
+/// Guard: ferrolearn `OrthogonalMatchingPursuit::new().fit(X,y)` matches
+/// sklearn's default `n_nonzero_coefs_ = max(int(0.1*n_features), 1)` behavior
+/// (`_omp.py:783-785`) and fits.
 ///
 /// sklearn (diabetes, 10 features): selects 1 feature (index 2),
 /// coef_[2] = 949.4352603840393, intercept_ = 152.13348416289617.
-/// ferrolearn: Err.
+/// ferrolearn previously returned `Err`; this guard keeps the fixed path green.
 ///
 /// Tracking: #488
 #[test]
@@ -87,7 +163,7 @@ fn divergence_omp_default_n_nonzero_fits() {
     let (x, y) = diabetes();
     let fitted = OrthogonalMatchingPursuit::<f64>::new()
         .fit(&x, &y)
-        .expect("sklearn OMP() fits with default n_nonzero_coefs = max(int(0.1*n_features),1); ferrolearn errors");
+        .expect("default OMP should fit with n_nonzero_coefs = max(int(0.1*n_features),1)");
 
     let coef = fitted.coefficients();
     let nnz = coef.iter().filter(|&&c| c != 0.0).count();

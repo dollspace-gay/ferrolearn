@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 80 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 79 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -54,7 +54,7 @@ public Rust surface after the alias normalization above.
 
 | sklearn module | Missing public items |
 |---|---|
-| `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram`, `lasso_path`, `orthogonal_mp`, `orthogonal_mp_gram` |
+| `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram`, `lasso_path`, `orthogonal_mp_gram` |
 | `sklearn.tree` | `export_graphviz`, `plot_tree` |
 | `sklearn.ensemble` | `StackingClassifier`, `StackingRegressor` |
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |

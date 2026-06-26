@@ -23,9 +23,9 @@ use ferrolearn_linear::{
     GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA, Lars, Lasso,
     LassoCV, LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
     LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
-    PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV,
-    RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
-    TweedieRegressor, l1_min_c, ridge_regression,
+    OrthogonalMpOptions, PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore,
+    Ridge, RidgeCV, RidgeClassifier, RidgeRegressionOptions, SGDClassifier, SGDRegressor, SVC, SVR,
+    TweedieRegressor, l1_min_c, orthogonal_mp, ridge_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -219,6 +219,17 @@ fn api_proof_omp() {
         .fit(&x, &y)
         .unwrap();
     let _ = f.score(&x, &y, None).unwrap();
+    let helper = orthogonal_mp(
+        &x,
+        &y,
+        OrthogonalMpOptions::default()
+            .with_n_nonzero_coefs(Some(1))
+            .with_return_path(true),
+    )
+    .unwrap();
+    assert_eq!(helper.coefficients().len(), x.ncols());
+    assert_eq!(helper.n_iter(), 1);
+    assert!(helper.path().is_some());
 }
 
 #[test]

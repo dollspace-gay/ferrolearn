@@ -19,8 +19,9 @@
 //! | REQ-3 (tol stopping ‖r‖²≤tol) | SHIPPED | residual-norm stopping (minor strict-before vs ≤-after boundary, equivalent for typical inputs). |
 //! | REQ-4 (predict) | SHIPPED | `Predict for FittedOMP`. |
 //! | REQ-5 (fit_intercept / HasCoefficients) | SHIPPED | centering + `HasCoefficients`. |
-//! | REQ-6..10 NOT-STARTED | Gram/precompute path (#489), OrthogonalMatchingPursuitCV (#490), n_iter_ (#491), multi-output (#492), ferray substrate (#493). |
+//! | REQ-6..10 NOT-STARTED | Gram/precompute path and `orthogonal_mp_gram` (#489), OrthogonalMatchingPursuitCV (#490), estimator `n_iter_` (#491), multi-output (#492), ferray substrate (#493). |
 //! | REQ-11 (non-finite input rejected) | SHIPPED | `Fit::fit for OrthogonalMatchingPursuit` rejects any NaN/+/-inf in X or y BEFORE the greedy path with `FerroError::InvalidParameter`, mirroring sklearn's `_validate_data(force_all_finite=True)` (`_omp.py:772`) → `ValueError("Input X contains NaN.")` / `"... contains infinity ..."`. `.iter().any(|v| !v.is_finite())` catches both NaN and Inf; OMP takes no `sample_weight`; the finite path is byte-identical. Verified vs the live sklearn 1.5.2 oracle (R-CHAR-3): `OrthogonalMatchingPursuit().fit` raises `ValueError` for NaN/+inf/-inf in X and NaN/inf in y (`tests/divergence_linear_nonfinite_batch2.rs::omp_*`). Non-test consumer: the existing `Fit::fit` / `pub use OrthogonalMatchingPursuit` boundary consumers. (#2259) |
+//! | REQ-12 (`orthogonal_mp` helper) | SHIPPED | `pub fn orthogonal_mp` exposes the dense single-output helper path with `n_iter` and optional coefficient path, reusing the estimator's greedy Cholesky OMP core. Oracle tests `orthogonal_mp_helper_*_matches_sklearn`. |
 //!
 //! acto-critic: the greedy path matches sklearn exactly (1e-12); the default-construction
 //! divergence (#488 — errored where sklearn applies 0.1·n_features) found and fixed. Two states
@@ -134,9 +135,174 @@ pub struct FittedOMP<F> {
     intercept: F,
 }
 
+/// Options for [`orthogonal_mp`].
+#[derive(Debug, Clone, Copy)]
+pub struct OrthogonalMpOptions<F> {
+    /// Desired number of non-zero coefficients.
+    pub n_nonzero_coefs: Option<usize>,
+    /// Maximum squared residual norm.
+    pub tol: Option<F>,
+    /// Whether to capture the coefficient path after each active-set update.
+    pub return_path: bool,
+}
+
+impl<F: Float> OrthogonalMpOptions<F> {
+    /// Create default options matching sklearn's dense helper defaults:
+    /// `n_nonzero_coefs=None`, `tol=None`, and `return_path=False`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            n_nonzero_coefs: None,
+            tol: None,
+            return_path: false,
+        }
+    }
+
+    /// Set the desired number of non-zero coefficients.
+    #[must_use]
+    pub fn with_n_nonzero_coefs(mut self, n_nonzero_coefs: Option<usize>) -> Self {
+        self.n_nonzero_coefs = n_nonzero_coefs;
+        self
+    }
+
+    /// Set the maximum squared residual norm.
+    #[must_use]
+    pub fn with_tol(mut self, tol: Option<F>) -> Self {
+        self.tol = tol;
+        self
+    }
+
+    /// Set whether to capture the coefficient path.
+    #[must_use]
+    pub fn with_return_path(mut self, return_path: bool) -> Self {
+        self.return_path = return_path;
+        self
+    }
+}
+
+impl<F: Float> Default for OrthogonalMpOptions<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Result returned by [`orthogonal_mp`].
+#[derive(Debug, Clone)]
+pub struct OrthogonalMpResult<F> {
+    coefficients: Array1<F>,
+    path: Option<Array2<F>>,
+    n_iter: usize,
+}
+
+impl<F: Float> OrthogonalMpResult<F> {
+    /// Borrow the final OMP coefficient vector.
+    #[must_use]
+    pub fn coefficients(&self) -> &Array1<F> {
+        &self.coefficients
+    }
+
+    /// Borrow the optional coefficient path, shaped `(n_features, n_iter)`.
+    #[must_use]
+    pub fn path(&self) -> Option<&Array2<F>> {
+        self.path.as_ref()
+    }
+
+    /// Return the number of active-set iterations.
+    #[must_use]
+    pub fn n_iter(&self) -> usize {
+        self.n_iter
+    }
+}
+
+/// Solve a dense single-output Orthogonal Matching Pursuit problem.
+///
+/// This is the Rust analogue of `sklearn.linear_model.orthogonal_mp` for dense
+/// `ndarray` inputs and a one-dimensional target. Inputs are used as provided:
+/// no intercept is fitted and no centering is performed. The returned result
+/// always includes the final coefficients and active-set iteration count; when
+/// `return_path=true`, it also includes the full coefficient path with one
+/// column per active-set update.
+///
+/// # Errors
+///
+/// Returns [`FerroError`] for inconsistent shapes, empty input, non-finite
+/// values, invalid `n_nonzero_coefs`/`tol`, or active-set solve failures.
+pub fn orthogonal_mp<F>(
+    x: &Array2<F>,
+    y: &Array1<F>,
+    options: OrthogonalMpOptions<F>,
+) -> Result<OrthogonalMpResult<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    validate_omp_inputs(x, y)?;
+    if let Some(tol) = options.tol
+        && tol < F::zero()
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "tol".into(),
+            reason: "must be non-negative".into(),
+        });
+    }
+    let solved = solve_omp(
+        x,
+        y,
+        options.n_nonzero_coefs,
+        options.tol,
+        options.return_path,
+        false,
+    )?;
+
+    Ok(OrthogonalMpResult {
+        coefficients: solved.coefficients,
+        path: solved.path,
+        n_iter: solved.n_iter,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+struct OmpSolved<F> {
+    coefficients: Array1<F>,
+    path: Option<Array2<F>>,
+    n_iter: usize,
+}
+
+fn validate_omp_inputs<F: Float>(x: &Array2<F>, y: &Array1<F>) -> Result<(), FerroError> {
+    let n_samples = x.nrows();
+    if n_samples != y.len() {
+        return Err(FerroError::ShapeMismatch {
+            expected: vec![n_samples],
+            actual: vec![y.len()],
+            context: "y length must match number of samples in X".into(),
+        });
+    }
+
+    if n_samples == 0 {
+        return Err(FerroError::InsufficientSamples {
+            required: 1,
+            actual: 0,
+            context: "OMP requires at least one sample".into(),
+        });
+    }
+
+    if x.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "X".into(),
+            reason: "Input X contains NaN or infinity.".into(),
+        });
+    }
+    if y.iter().any(|v| !v.is_finite()) {
+        return Err(FerroError::InvalidParameter {
+            name: "y".into(),
+            reason: "Input y contains NaN or infinity.".into(),
+        });
+    }
+
+    Ok(())
+}
 
 /// Cholesky solve for `A x = b`.
 fn cholesky_solve<F: Float>(a: &Array2<F>, b: &Array1<F>) -> Result<Array1<F>, FerroError> {
@@ -279,6 +445,106 @@ fn ols_active<F: Float + FromPrimitive + 'static>(
     Ok(w)
 }
 
+fn solve_omp<F>(
+    x_work: &Array2<F>,
+    y_work: &Array1<F>,
+    n_nonzero_coefs: Option<usize>,
+    tol: Option<F>,
+    return_path: bool,
+    strict_n_nonzero_limit: bool,
+) -> Result<OmpSolved<F>, FerroError>
+where
+    F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static,
+{
+    let n_features = x_work.ncols();
+
+    // Default for n_nonzero_coefs when neither stopping criterion is set:
+    // sklearn `_omp.py:123` / estimator `_omp.py:785` use
+    // `max(int(0.1 * n_features), 1)`.
+    let effective_n_nonzero = if n_nonzero_coefs.is_none() && tol.is_none() {
+        Some(((n_features as f64 * 0.1) as usize).max(1))
+    } else {
+        n_nonzero_coefs
+    };
+
+    // The estimator historically rejects any explicit over-large support
+    // request; sklearn's free helper only rejects it when no tol is supplied.
+    if let Some(n) = n_nonzero_coefs
+        && n > n_features
+        && (strict_n_nonzero_limit || tol.is_none())
+    {
+        return Err(FerroError::InvalidParameter {
+            name: "n_nonzero_coefs".into(),
+            reason: format!("cannot exceed number of features ({n_features})"),
+        });
+    }
+
+    let max_k = effective_n_nonzero.unwrap_or(n_features).min(n_features);
+    let mut support: Vec<usize> = Vec::with_capacity(max_k);
+    let mut in_support = vec![false; n_features];
+    let mut w = Array1::<F>::zeros(n_features);
+    let mut residual = y_work.clone();
+    let mut path_steps = if return_path { Some(Vec::new()) } else { None };
+
+    for _step in 0..max_k {
+        // Find feature most correlated with residual.
+        let mut best_j = None;
+        let mut best_corr = F::zero();
+        for (j, &is_in_support) in in_support.iter().enumerate() {
+            if is_in_support {
+                continue;
+            }
+            let corr = x_work.column(j).dot(&residual).abs();
+            if corr > best_corr {
+                best_corr = corr;
+                best_j = Some(j);
+            }
+        }
+
+        let j = match best_j {
+            Some(j) => j,
+            None => break,
+        };
+
+        support.push(j);
+        in_support[j] = true;
+
+        // OLS on support set.
+        w = ols_active(x_work, y_work, &support, n_features)?;
+
+        if let Some(steps) = &mut path_steps {
+            steps.push(w.clone());
+        }
+
+        // Update residual.
+        residual = y_work - &x_work.dot(&w);
+
+        // sklearn checks the residual norm after each active-set update
+        // (`_omp.py:141`) and stops on `<= tol`.
+        if let Some(tol_val) = tol {
+            let res_norm_sq = residual.dot(&residual);
+            if res_norm_sq <= tol_val {
+                break;
+            }
+        }
+    }
+
+    let path = path_steps.map(|steps| {
+        let n_steps = steps.len();
+        let mut path = Array2::<F>::zeros((n_features, n_steps));
+        for (step, coef) in steps.iter().enumerate() {
+            path.column_mut(step).assign(coef);
+        }
+        path
+    });
+
+    Ok(OmpSolved {
+        coefficients: w,
+        path,
+        n_iter: support.len(),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Fit
 // ---------------------------------------------------------------------------
@@ -298,27 +564,8 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
     ///
     /// - [`FerroError::ShapeMismatch`] — sample count mismatch.
     /// - [`FerroError::InsufficientSamples`] — zero samples.
-    /// - [`FerroError::InvalidParameter`] — `n_nonzero_coefs` exceeds features,
-    ///   or neither `n_nonzero_coefs` nor `tol` is set.
+    /// - [`FerroError::InvalidParameter`] — `n_nonzero_coefs` exceeds features.
     fn fit(&self, x: &Array2<F>, y: &Array1<F>) -> Result<FittedOMP<F>, FerroError> {
-        let (n_samples, n_features) = x.dim();
-
-        if n_samples != y.len() {
-            return Err(FerroError::ShapeMismatch {
-                expected: vec![n_samples],
-                actual: vec![y.len()],
-                context: "y length must match number of samples in X".into(),
-            });
-        }
-
-        if n_samples == 0 {
-            return Err(FerroError::InsufficientSamples {
-                required: 1,
-                actual: 0,
-                context: "OMP requires at least one sample".into(),
-            });
-        }
-
         // Non-finite input validation (#2259). sklearn
         // `OrthogonalMatchingPursuit.fit` ->
         // `self._validate_data(X, y, multi_output=True, y_numeric=True)`
@@ -328,38 +575,7 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
         // both NaN and Inf (bounds-safe, no panic, R-CODE-2). `OrthogonalMatching
         // Pursuit.fit` takes no `sample_weight`. The finite path is byte-identical
         // (the guard never fires on finite input).
-        if x.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "X".into(),
-                reason: "Input X contains NaN or infinity.".into(),
-            });
-        }
-        if y.iter().any(|v| !v.is_finite()) {
-            return Err(FerroError::InvalidParameter {
-                name: "y".into(),
-                reason: "Input y contains NaN or infinity.".into(),
-            });
-        }
-
-        // Default for n_nonzero_coefs when neither stopping criterion is set:
-        // sklearn `_omp.py:785` sets `n_nonzero_coefs_ = max(int(0.1 * n_features), 1)`
-        // (truncating int cast) and fits, rather than erroring.
-        let effective_n_nonzero = if self.n_nonzero_coefs.is_none() && self.tol.is_none() {
-            Some(((n_features as f64 * 0.1) as usize).max(1))
-        } else {
-            self.n_nonzero_coefs
-        };
-
-        let max_k = effective_n_nonzero.unwrap_or(n_features).min(n_features);
-
-        if let Some(n) = self.n_nonzero_coefs
-            && n > n_features
-        {
-            return Err(FerroError::InvalidParameter {
-                name: "n_nonzero_coefs".into(),
-                reason: format!("cannot exceed number of features ({n_features})"),
-            });
-        }
+        validate_omp_inputs(x, y)?;
 
         // Center data if fitting intercept.
         let (x_work, y_work, x_mean, y_mean) = if self.fit_intercept {
@@ -378,48 +594,15 @@ impl<F: Float + Send + Sync + ScalarOperand + FromPrimitive + 'static> Fit<Array
             (x.clone(), y.clone(), None, None)
         };
 
-        let mut support: Vec<usize> = Vec::with_capacity(max_k);
-        let mut in_support = vec![false; n_features];
-        let mut w = Array1::<F>::zeros(n_features);
-        let mut residual = y_work.clone();
-
-        for _step in 0..max_k {
-            // Check residual tolerance.
-            if let Some(tol_val) = self.tol {
-                let res_norm_sq = residual.dot(&residual);
-                if res_norm_sq < tol_val {
-                    break;
-                }
-            }
-
-            // Find feature most correlated with residual.
-            let mut best_j = None;
-            let mut best_corr = F::zero();
-            for (j, &is_in_support) in in_support.iter().enumerate() {
-                if is_in_support {
-                    continue;
-                }
-                let corr = x_work.column(j).dot(&residual).abs();
-                if corr > best_corr {
-                    best_corr = corr;
-                    best_j = Some(j);
-                }
-            }
-
-            let j = match best_j {
-                Some(j) => j,
-                None => break,
-            };
-
-            support.push(j);
-            in_support[j] = true;
-
-            // OLS on support set.
-            w = ols_active(&x_work, &y_work, &support, n_features)?;
-
-            // Update residual.
-            residual = &y_work - x_work.dot(&w);
-        }
+        let solved = solve_omp(
+            &x_work,
+            &y_work,
+            self.n_nonzero_coefs,
+            self.tol,
+            false,
+            true,
+        )?;
+        let w = solved.coefficients;
 
         let intercept = if let (Some(xm), Some(ym)) = (&x_mean, &y_mean) {
             *ym - xm.dot(&w)
