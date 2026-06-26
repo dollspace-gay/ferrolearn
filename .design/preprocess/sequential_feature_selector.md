@@ -52,9 +52,11 @@ GREEDY SEARCH SHAPE matches (REQ-1 SHIPPED), and the scoped error contracts ship
 ferrolearn, which delegates scoring to an opaque user callback. Everything
 sklearn layers on top of that scoring contract (`"auto"` default REQ-4, `tol`
 early-stop REQ-5, float-fraction `n_features_to_select` REQ-6, `cv`/`scoring`/
-`n_jobs` REQ-7, the `SelectorMixin` bool-mask surface REQ-9) is NOT-STARTED. (REQ-8
-validation boundaries are SHIPPED this iteration — #1284/#1285.) This is a
-**mostly-NOT-STARTED** unit: 3 SHIPPED (REQ-1/2/8) / 8 NOT-STARTED.
+`n_jobs` REQ-7, plus the `n_features_to_select_` / protocol residuals in REQ-9)
+is NOT-STARTED. The scoped dense `SelectorMixin` bool-mask helpers in REQ-9 now
+ship via `crate::SelectorMixin`. (REQ-8 validation boundaries are SHIPPED this
+iteration — #1284/#1285.) This is a **mostly-NOT-STARTED** unit: 4 SHIPPED
+(REQ-1/2/8 plus scoped REQ-9) / 7 NOT-STARTED, with REQ-9 residual open.
 
 **Two boundary divergences FIXED this iteration (DIV-A #1284 / DIV-B #1285, REQ-8
 SHIPPED).** (a) sklearn requires `n_features_to_select < n_features` and raises
@@ -88,7 +90,7 @@ from sklearn.linear_model import LinearRegression; \
 X=np.array([[1.,10.,0.1],[2.,20.,0.2],[3.,30.,0.3],[4.,40.,0.4]]); y=np.array([1.,2.,3.,4.]); \
 SequentialFeatureSelector(LinearRegression(), n_features_to_select=3, cv=2).fit(X,y)"
 # -> ValueError: n_features_to_select must be < n_features.   (3 == n_features=3 REJECTED)
-#    ferrolearn ALLOWS == n_features: its test_select_all_features selects 3/3. DIVERGENCE.
+#    ferrolearn now rejects == n_features too; pinned by test_select_all_features_rejected.
 
 # REQ-8b (DIV-B) — sklearn ensure_min_features=2 rejects a 1-feature X (:214):
 python3 -c "import numpy as np; \
@@ -229,7 +231,7 @@ print('auto n_sel (n//2)', s.n_features_to_select_, 'support', s.get_support().t
 | REQ-6 (float `n_features_to_select` fraction) | NOT-STARTED | open prereq blocker #1289. `n_features_to_select: usize` is an absolute count; `new(n: usize, ..)` cannot express a fraction. sklearn accepts `Interval(RealNotInt, 0, 1, closed="right")` (`:159`) -> `int(n_features * frac)` (`:230-231`). |
 | REQ-7 (`cv` / `scoring` / `n_jobs` parameters) | NOT-STARTED | open prereq blocker #1290. The ctor has only `n_features_to_select` and `direction`; there is no `cv` splitter (sklearn `cv=5` default via `check_cv`, `:177`,`:238`), no `scoring` metric (`:176`), and no `n_jobs` fold parallelism (`:178`,`:292`). All three feed the per-candidate `cross_val_score` of REQ-3 and are absent. |
 | REQ-8 (`< n_features` + `ensure_min_features=2` validation; DIV-A/DIV-B) | SHIPPED (closed #1284, #1285) | Both boundary divergences fixed. (a) DIV-A (#1284): `fit`'s count guard changed from `> n_features` to `>= n_features` with message mirroring sklearn "must be < n_features" (`:227-228`) — `n_features_to_select == n_features` now errors; in-module `test_select_all_features` rewritten to `test_select_all_features_rejected` (R-HONEST-4). (b) DIV-B (#1285): added `if n_features < 2 { Err(InvalidParameter "Found array with N feature(s) while a minimum of 2 is required...") }` placed BEFORE the count guard, mirroring sklearn `_validate_data(ensure_min_features=2)` precedence (`:214`,`:211-216` runs before `:227`). Live oracle (R-CHAR-3): `sel==n_features` → Err; 1-feature X → Err (min-features msg); 1-feature X + `sel=5` → min-features error FIRST (not count). Guards `divergence_n_features_to_select_equals_n_features` + `divergence_ensure_min_features_two` + 7 re-audit precedence guards PASS. Consumer: re-export lib.rs:156-157. Two-round critic-verified CLEAN (incl. valid `sel < n_features` not over-rejected). |
-| REQ-9 (SelectorMixin surface + `n_features_to_select_` attr) | NOT-STARTED | open prereq blocker #1291. `FittedSequentialFeatureSelector<F>` exposes `selected_indices()` (the `get_support(indices=True)` analog) and `n_features_selected()` and a `Transform` impl, but NOT the boolean `support_` / `get_support()` mask, `inverse_transform` (zero-pad dropped columns), `get_feature_names_out`, or the `n_features_to_select_ = support_.sum()` fitted attribute that sklearn inherits from `SelectorMixin` (`_get_support_mask`, `:297-299`; `:268`). |
+| REQ-9 (SelectorMixin surface + `n_features_to_select_` attr) | SHIPPED scoped / residual open | `ferrolearn_preprocess::SelectorMixin` is implemented for `FittedSequentialFeatureSelector<F>`, providing dense `get_support()`, `get_support_indices()`, `inverse_transform` zero-fill, and `get_feature_names_out`, matching sklearn `SelectorMixin` on dense arrays (`sklearn/feature_selection/_base.py:54,136,176`). `FittedSequentialFeatureSelector::n_features_in()` now exposes the stored input width needed by the mixin. Verification: `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`. Residual blocker #1291 remains for sklearn-named `n_features_to_select_`, sparse/pandas output, and Python fitted-state protocol. |
 | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1292. No `ferrolearn-python` registration of `SequentialFeatureSelector` (grep `SequentialFeatureSelector`/`sequential_feature` across `ferrolearn-python/` returns nothing); the only non-test consumer is the crate re-export (`lib.rs:156-157`). The boundary CPython `import ferrolearn` selector surface is absent. |
 | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker #1293. The search/score path uses `ndarray::{Array1, Array2}` (`x.ncols()`, `Array2::zeros`, the `select_columns` gather) + `num_traits::Float` and `Vec` bookkeeping — not `ferray-core` / `ferray-ufunc` (R-SUBSTRATE-1/2). |
 
@@ -328,12 +330,12 @@ print(SequentialFeatureSelector(LinearRegression(), n_features_to_select=2, cv=2
 ```
 
 The existing `#[test]`s exercise REQ-1 (search shape, tie-break, sorted indices,
-transform) and REQ-2 (every error path) with a synthetic `mean_sum_score`
+transform), REQ-2 (every error path), and REQ-8 validation boundaries with a synthetic `mean_sum_score`
 callback; they are **callback-grounded, not estimator+CV oracle-grounded** — by
 construction, since the scoring interface diverges (REQ-3). No currently-green
-command establishes REQ-3..REQ-11. Note `test_select_all_features` selects 3/3,
-which sklearn REJECTS (`n_features_to_select must be < n_features`, REQ-8 DIV-A) —
-the critic may pin that boundary.
+command establishes REQ-3..REQ-7, REQ-9 residuals, or REQ-10..REQ-11. `cargo test
+-p ferrolearn-preprocess --test divergence_selector_mixin` establishes the scoped
+dense `SelectorMixin` helpers in REQ-9.
 
 ## Blockers
 
@@ -357,9 +359,11 @@ NOT-STARTED REQs are open `-l blocker` issues referenced by the REQ status table
   `>= n_features`, mirroring sklearn `must be < n_features` (`:227-228`).
 - #1285 — REQ-8 DIV-B (CLOSED/fixed): added `n_features < 2` guard before the
   count check, mirroring sklearn `ensure_min_features=2` precedence (`:214`).
-- #1291 — REQ-9: no boolean `support_`/`get_support` / `inverse_transform` /
-  `get_feature_names_out` / `n_features_to_select_` (SelectorMixin surface,
-  `:297-299`,`:268`).
+- #1291 — REQ-9 residual: scoped dense `SelectorMixin` helpers now ship via
+  `crate::SelectorMixin` (`get_support` / `get_support_indices` /
+  `inverse_transform` / `get_feature_names_out`). Residual parity still lacks the
+  sklearn-named `n_features_to_select_`, sparse/pandas output, and Python
+  fitted-state protocol (`:297-299`,`:268`).
 - #1292 — REQ-10: no `ferrolearn-python` `SequentialFeatureSelector` binding
   (boundary CPython consumer absent).
 - #1293 — REQ-11: search/score path on `ndarray`/`num_traits`/`Vec`, not ferray

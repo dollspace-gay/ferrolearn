@@ -34,7 +34,7 @@
 //! | REQ-6 float `step` in (0,1) | NOT-STARTED (#1298) | sklearn `_rfe.py:301-302` |
 //! | REQ-7 `importance_getter` + `verbose` | NOT-STARTED (#1299) | sklearn `_rfe.py:211`,`:326-330` |
 //! | REQ-8 RFECV internal cross-validation | NOT-STARTED (#1300) | sklearn `_rfe.py:736-815` |
-//! | REQ-10 SelectorMixin surface + `estimator_`/`n_features_` | NOT-STARTED (#1301) | sklearn `_rfe.py:348-359` |
+//! | REQ-10 SelectorMixin surface + `estimator_`/`n_features_` | SHIPPED (scoped) / residual open (#1301) | [`crate::SelectorMixin`] supplies dense support masks, inverse zero-fill, and feature-name filtering; estimator delegation and sklearn fitted attrs remain open |
 //! | REQ-11 PyO3 binding | NOT-STARTED (#1302) | `ferrolearn-python/src/` (absent) |
 //! | REQ-12 ferray substrate | NOT-STARTED (#1303) | R-SUBSTRATE |
 

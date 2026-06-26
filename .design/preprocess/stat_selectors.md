@@ -34,11 +34,12 @@ wrapping a `score_func`: `SelectFpr<F>`, `SelectFdr<F>`, `SelectFwe<F>` (each
 selected_indices }`; accessors `p_values()`, `selected_indices()`,
 `n_features_selected()`); `Transform<Array2<F>>` gathers the selected columns
 (`ShapeMismatch` on a column-count mismatch). There is **no `score_func` wrapping
-(no `scores_` / `pvalues_` computed at `fit(X, y)`), no `SelectorMixin` surface
-(`get_support` / `inverse_transform` / `get_feature_names_out`), no
-`n_features_in_` / `feature_names_in_` fitted attributes, no PyO3 binding, and no
-ferray substrate** (the same honest gap as the sibling `select_from_model.rs`
-unit, which takes importances directly).
+(no `scores_` / `pvalues_` computed at `fit(X, y)`), scoped dense `SelectorMixin`
+helpers now ship (`get_support` / `get_support_indices` / `inverse_transform` /
+`get_feature_names_out`), and there is still no `n_features_in_` /
+`feature_names_in_` fitted-attribute parity, no PyO3 binding, and no ferray
+substrate** (the same honest gap as the sibling `select_from_model.rs` unit, which
+takes importances directly).
 
 **parity-ops correction.** The route table's `parity_ops` lists the score
 functions `f_classif` / `f_regression` / `chi2` / `mutual_info_classif`. Those are
@@ -48,10 +49,11 @@ the FPR/FDR/FWE selectors themselves** (`SelectFpr`, `SelectFdr`, `SelectFwe`),
 which consume a precomputed p-value vector; the front-matter `parity-ops` is set
 accordingly (`SelectFpr, SelectFdr, SelectFwe`).
 
-This is a **shipped-partial** unit: **4 SHIPPED** (REQ-1 FPR mask, REQ-2 FDR
+This is a **shipped-partial** unit: **5 SHIPPED** (REQ-1 FPR mask, REQ-2 FDR
 Benjamini-Hochberg mask, REQ-3 FWE Bonferroni mask, REQ-4 error /
-parameter contracts incl. `alpha ∈ [0,1]`) / **5 NOT-STARTED** (REQ-5 `score_func` wrapping, REQ-6
-`SelectorMixin` surface, REQ-7 `scores_` / `pvalues_` / `n_features_in_` fitted
+parameter contracts incl. `alpha ∈ [0,1]`, REQ-6 scoped dense `SelectorMixin`
+helpers) / **4 NOT-STARTED** plus REQ-6 residual protocol gaps (REQ-5
+`score_func` wrapping, REQ-7 `scores_` / `pvalues_` / `n_features_in_` fitted
 attrs, REQ-8 PyO3 binding, REQ-9 ferray substrate).
 
 ## Probes (live sklearn oracle, 1.5.2)
@@ -154,12 +156,13 @@ oracle (Probe B).
   functions live in the sibling `feature_scoring.rs` unit).
 
 - REQ-6: **`SelectorMixin` surface (`get_support` / `inverse_transform` /
-  `get_feature_names_out`)** (NOT-STARTED). sklearn's selectors inherit
-  `SelectorMixin` (`_BaseFilter(SelectorMixin, BaseEstimator)`, `:526`), exposing
-  `get_support()` (boolean mask / indices), `inverse_transform` (scatter selected
-  columns back into a full-width zero matrix), and `get_feature_names_out`.
-  ferrolearn's `Fitted*` types expose `selected_indices()` / `n_features_selected()`
-  but none of the mixin surface.
+  `get_feature_names_out`)** (SHIPPED scoped / residual open). sklearn's selectors
+  inherit `SelectorMixin` (`_BaseFilter(SelectorMixin, BaseEstimator)`, `:526`),
+  exposing `get_support()` (boolean mask / indices), `inverse_transform` (scatter
+  selected columns back into a full-width zero matrix), and
+  `get_feature_names_out`. ferrolearn now exposes the dense Rust analogue through
+  `crate::SelectorMixin`; sparse/pandas output and Python fitted-state protocol
+  remain residual.
 
 - REQ-7: **`scores_` / `pvalues_` as fitted attributes of the COMPUTED score +
   `n_features_in_` / `feature_names_in_`** (NOT-STARTED). sklearn exposes
@@ -240,7 +243,7 @@ oracle (Probe B).
 | REQ-3 (SelectFwe Bonferroni mask `p < alpha / n`, GIVEN a static p-value vector) | SHIPPED | impl `Fit::fit for SelectFwe in stat_selectors.rs` computes `adjusted_alpha = self.alpha / n as f64` then `selected_indices = x.iter().enumerate().filter(\|&(_, &p)\| p < adjusted_alpha_f).map(\|(j, _)\| j).collect()` — the strict `<` Bonferroni threshold mirroring `SelectFwe._get_support_mask` `return self.pvalues_ < self.alpha / len(self.pvalues_)` (`_univariate_selection.py:1044`). Live oracle (Probe C): `fwe([0.001,0.5,0.03,0.9],0.05)=[0]` (threshold `0.0125`). Non-test consumer: boundary re-export `SelectFwe` (`lib.rs:181-183`) + `pub mod stat_selectors;` (`lib.rs:122`). Verification: `cargo test -p ferrolearn-preprocess --lib` → `test_fwe_basic` (`selected_indices == [0]`), `test_fwe_two_features`, `test_fwe_none_selected`, `test_fwe_single_feature`, `test_fwe_transform`, `test_fwe_f32` green. |
 | REQ-4 (error / parameter contracts incl. `alpha ∈ [0,1]` closed-both) | SHIPPED | impl `validate_inputs in stat_selectors.rs` returns `Err(FerroError::InvalidParameter { name: "p_values", .. })` when `n_features == 0`, and `Err(FerroError::InvalidParameter { name: "alpha", .. })` when `!(0.0..=1.0).contains(&alpha)`; called from all three `Fit::fit` impls. It accepts `alpha ∈ [0, 1]` (closed-both), matching sklearn's `_parameter_constraints` `Interval(Real, 0, 1, closed="both")` (`_univariate_selection.py:868`, `:952`, `:1034`); `alpha == 0` → `fit` `Ok`, selects nothing (FPR/FWE `p < 0`, FDR all-zero BH threshold). impl `Transform::transform for FittedSelectFpr/FittedSelectFdr/FittedSelectFwe in stat_selectors.rs` returns `Err(FerroError::ShapeMismatch { .. })` when `x.ncols() != self.n_features_in`. This was the #1397 divergence (ferrolearn previously used `(0, 1]`); now RESOLVED. Non-test consumer: boundary re-export (`lib.rs:181-183`). Verification: `cargo test -p ferrolearn-preprocess` → in-module `test_{fpr,fdr,fwe}_empty_error`, `test_{fpr,fdr,fwe}_invalid_alpha` (-0.1 / 1.5 rejected), `test_{fpr,fdr,fwe}_alpha_zero_valid` (alpha=0 accepted), `test_{fpr,fdr,fwe}_shape_mismatch`, plus divergence-suite `divergence_{fpr,fwe,fdr}_alpha_zero_accepted` green. |
 | REQ-5 (`score_func` wrapping → `scores_` / `pvalues_` at `fit(X, y)`) | NOT-STARTED | open prereq blocker #1398. `Fit<Array1<F>, ()>` for all three selectors takes the p-value VECTOR directly (`x: &Array1<F>`, one value per feature) and never wraps or invokes a `score_func`. sklearn's `_BaseFilter.fit` runs `score_func_ret = self.score_func(X, y)` and stores `self.scores_, self.pvalues_ = score_func_ret` (`_univariate_selection.py:567-575`); `__init__(score_func=f_classif, ...)` (`:871`, `:955`, `:1037`). The score functions (`f_classif`/`f_regression`/`chi2`/`mutual_info_classif`) are translated in the sibling `feature_scoring.rs` unit, not here. |
-| REQ-6 (`SelectorMixin` surface: `get_support` / `inverse_transform` / `get_feature_names_out`) | NOT-STARTED | open prereq blocker #1399. `FittedSelectFpr/FittedSelectFdr/FittedSelectFwe<F>` expose `p_values()` / `selected_indices()` / `n_features_selected()` but NO `get_support` boolean-mask form, NO `inverse_transform` (scatter selected columns back to full width), and NO `get_feature_names_out`. sklearn's selectors inherit `SelectorMixin` (`_BaseFilter(SelectorMixin, BaseEstimator)`, `_univariate_selection.py:526`), providing all three. |
+| REQ-6 (`SelectorMixin` surface: `get_support` / `inverse_transform` / `get_feature_names_out`) | SHIPPED scoped / residual open | `ferrolearn_preprocess::SelectorMixin` is implemented for `FittedSelectFpr/FittedSelectFdr/FittedSelectFwe<F>`, providing dense `get_support()`, `get_support_indices()`, `inverse_transform` zero-fill, and `get_feature_names_out`, matching sklearn `SelectorMixin` on dense arrays (`sklearn/feature_selection/_base.py:54,136,176`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`. Residual blocker #1399 remains for sparse/pandas output, Python fitted-state checks, and full `_BaseFilter` score-function wrapping. |
 | REQ-7 (`scores_` / `pvalues_` of the computed score + `n_features_in_` / `feature_names_in_`) | NOT-STARTED | open prereq blocker #1400. ferrolearn's `Fitted*` stores the user-supplied INPUT vector (echoed via `p_values()`) and `n_features_in` internally, but exposes NO `scores_`, NO sklearn-named `n_features_in_` accessor, and NO `feature_names_in_`. sklearn exposes `scores_` / `pvalues_` as the score-function OUTPUT (`_univariate_selection.py:569-575`) plus `n_features_in_` / `feature_names_in_` (`SelectFpr` docstring `:828-837`). |
 | REQ-8 (PyO3 binding) | NOT-STARTED | open prereq blocker #1401. No `_RsSelectFpr` / `_RsSelectFdr` / `_RsSelectFwe` CPython binding exists — `grep -rn "SelectFpr\|SelectFdr\|SelectFwe" ferrolearn-python/src` finds none — so the selectors are unreachable from Python. |
 | REQ-9 (ferray substrate) | NOT-STARTED | open prereq blocker #1402. The mask / BH-sort / gather path uses `ndarray::Array1` / `Array2` (`x.iter()`, `select_columns`, `Array2::zeros`), `num_traits::Float`, and a `Vec<usize>` selected-index path — not `ferray-core` arrays (R-SUBSTRATE-1/2). |
@@ -304,10 +307,11 @@ Probe B), and FWE Bonferroni strict-`<` (REQ-3), plus the error / parameter cont
 (REQ-4, incl. the closed-both `alpha ∈ [0, 1]` interval). The remaining gaps are the score-function-facing filter surface: no
 `score_func` wrapping / `scores_` / `pvalues_` computation at `fit(X, y)` (REQ-5,
 the honest gap — ferrolearn's `Fit` input IS the p-value vector, and the score
-functions live in `feature_scoring.rs`); no `SelectorMixin` surface (REQ-6); no
-computed `scores_` / `pvalues_` / `n_features_in_` / `feature_names_in_` fitted
-attrs (REQ-7); no PyO3 binding (REQ-8); and the non-ferray substrate (REQ-9). This
-is a **shipped-partial** unit (4 SHIPPED / 5 NOT-STARTED).
+functions live in `feature_scoring.rs`); scoped dense `SelectorMixin` helpers now
+ship with residual protocol gaps (REQ-6); no computed `scores_` / `pvalues_` /
+`n_features_in_` / `feature_names_in_` fitted attrs (REQ-7); no PyO3 binding
+(REQ-8); and the non-ferray substrate (REQ-9). This is a **shipped-partial** unit
+(5 SHIPPED / 4 NOT-STARTED, with REQ-6 residual open).
 
 ## Verification
 
@@ -352,9 +356,11 @@ python3 -c "print('fwe',[j for j,p in enumerate([0.001,0.5,0.03,0.9]) if p<0.05/
 
 The in-module `#[test]`s exercise REQ-1 (FPR mask), REQ-2 (the BH multi-pass +
 none-selected paths), REQ-3 (FWE Bonferroni + f32), and REQ-4 (every error path).
-No green command establishes REQ-5..REQ-9 (`score_func` wrapping,
-`SelectorMixin` surface, computed `scores_` / `pvalues_` / `n_features_in_`, PyO3,
-ferray).
+No green command establishes REQ-5, REQ-6 residual protocol gaps, or REQ-7..REQ-9
+(`score_func` wrapping, sparse/pandas/Python fitted-state behavior, computed
+`scores_` / `pvalues_` / `n_features_in_`, PyO3, ferray). `cargo test -p
+ferrolearn-preprocess --test divergence_selector_mixin` establishes the scoped
+dense `SelectorMixin` helpers in REQ-6.
 
 ## Blockers
 
@@ -375,8 +381,11 @@ tracking issue #1396:
 - #1398 — REQ-5: no `score_func` wrapping; ferrolearn's `Fit` input is the
   p-value vector, and the score functions live in `feature_scoring.rs`
   (`_univariate_selection.py:567-575`, `:871`, `:955`, `:1037`).
-- #1399 — REQ-6: no `SelectorMixin` surface — `get_support` /
-  `inverse_transform` / `get_feature_names_out` (`_univariate_selection.py:526`).
+- #1399 — REQ-6 residual: scoped dense `SelectorMixin` helpers now ship via
+  `crate::SelectorMixin` (`get_support` / `get_support_indices` /
+  `inverse_transform` / `get_feature_names_out`). Residual parity still lacks
+  sparse/pandas output, Python fitted-state behavior, and the broader `_BaseFilter`
+  protocol (`_univariate_selection.py:526`).
 - #1400 — REQ-7: no computed `scores_` / `pvalues_` / `n_features_in_` /
   `feature_names_in_` fitted attributes (`:569-575`, `:828-837`).
 - #1401 — REQ-8: no PyO3 `SelectFpr` / `SelectFdr` / `SelectFwe` binding in

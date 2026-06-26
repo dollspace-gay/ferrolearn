@@ -348,7 +348,7 @@ NaN ranking, and the `k>n_features` clamp — now matches sklearn and is SHIPPED
 | REQ-5 (`VarianceThreshold` `threshold==0` ptp-guard + `np.nanvar` NaN) | NOT-STARTED | open prereq blocker #1427. sklearn, when `threshold == 0`, sets `variances_ = np.nanmin([variances_, np.ptp(X, axis=0)], axis=0)` (`sklearn/feature_selection/_variance_threshold.py:113-120`) and computes `np.nanvar` allowing NaN (`force_all_finite="allow-nan"` `:103`, `:112`), plus raises ValueError when no feature meets the threshold (`:122-126`). ferrolearn's `VarianceThreshold::fit` uses Welford (exactly `0` on constant cols, so the COMMON case matches Probe B) but has NO ptp guard, NO NaN-aware variance, and NO "no feature meets threshold" error. |
 | REQ-6 (`k='all'`/`k==0` + pluggable `score_func` + `_clean_nans`) | NOT-STARTED | open prereq blocker #1428. sklearn `SelectKBest` accepts `k="all"` → all-True (`sklearn/feature_selection/_univariate_selection.py:784-785`), `k==0` → all-False (`:786-787`), any `score_func` (default `f_classif` `:770`), and only WARNS on `k > n_features` (`:774-779`). ferrolearn's `SelectKBest<F>` has a plain `k: usize` (no `"all"` sentinel) and a single-variant `enum ScoreFunc { FClassif }` — no `chi2`/`f_regression`/`mutual_info` dispatch, no generalized `_clean_nans` (`:24-33`), and it ERRORS on `k > n_features`. |
 | REQ-7 (`GenericUnivariateSelect` mode meta-selector) | NOT-STARTED | open prereq blocker #1429 (routed parity-op, ABSENT). sklearn `GenericUnivariateSelect` (`sklearn/feature_selection/_univariate_selection.py:1054`) dispatches by `mode ∈ {percentile, k_best, fpr, fdr, fwe}` (`_selection_modes` `:1119-1125`) with default `mode='percentile'`, `param=1e-5` (`:1133`). ferrolearn has no `GenericUnivariateSelect` and no `fpr`/`fdr`/`fwe`/`percentile` filters in `feature_selection.rs`. |
-| REQ-8 (`SelectorMixin` surface + `scores_`/`pvalues_`/`n_features_in_`) | NOT-STARTED | open prereq blocker #1430. sklearn's selectors inherit `SelectorMixin` (`get_support`/`inverse_transform`/`get_feature_names_out`) and `_BaseFilter` sets `scores_`/`pvalues_`/`n_features_in_` (`sklearn/feature_selection/_univariate_selection.py:567-575`). ferrolearn exposes `selected_indices()`/`variances()`/`scores()` accessors only — no boolean `get_support(indices=…)`, no `inverse_transform`, no `get_feature_names_out`, and `SelectKBest` surfaces no `pvalues_` (`anova_f_scores` returns scores only). |
+| REQ-8 (`SelectorMixin` surface + `scores_`/`pvalues_`/`n_features_in_`) | SHIPPED scoped / residual open | `ferrolearn_preprocess::SelectorMixin` provides dense `get_support()`, `get_support_indices()`, `inverse_transform` zero-fill, and `get_feature_names_out` for `FittedVarianceThreshold` and `FittedSelectKBest`, matching sklearn `SelectorMixin` on dense arrays (`sklearn/feature_selection/_base.py:54,136,176`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`. Residual blocker #1430 remains for sklearn-named `pvalues_`, `feature_names_in_`, Python fitted-state checks, sparse/pandas output, and full `_BaseFilter` attribute parity (`_univariate_selection.py:567-575`). |
 | REQ-9 (basic `SelectFromModel` duplicate surface) | NOT-STARTED | open prereq blocker #1431 (cross-ref). `feature_selection.rs` defines a basic `pub struct SelectFromModel<F>` (`new_from_importances`, mean/explicit threshold, `imp >= thr`) DISTINCT from the rich `select_from_model.rs::SelectFromModelExt`. Its sklearn parity (vs `SelectFromModel` in `sklearn/feature_selection/_from_model.py`) is owned by `.design/preprocess/select_from_model.md` — see that doc; not re-litigated here. The DUPLICATION (two `SelectFromModel`-shaped types in one crate) is tech-debt. |
 | REQ-10 (PyO3 binding) | NOT-STARTED | open prereq blocker #1432. No CPython binding for `VarianceThreshold`/`SelectKBest`/`GenericUnivariateSelect` exists in `ferrolearn-python/src` (`grep -rln "SelectKBest\|VarianceThreshold" ferrolearn-python/src` → none), so these transformers are unreachable from Python. |
 | REQ-11 (ferray substrate) | NOT-STARTED | open prereq blocker #1433. The selectors + `select_columns`/`anova_f_scores` helpers compute over `ndarray::Array2`/`Array1` (`x.column(j)`, `Array2::zeros`) and `num_traits::Float`, not `ferray-core` arrays (R-SUBSTRATE-1/2). |
@@ -422,10 +422,11 @@ clamp+keep-all (REQ-3, resolved by #1425 + #1426) — and the dense error/parame
 contracts (REQ-4). The remaining gaps are surface/parameterization: no `threshold==0`
 ptp-guard / NaN-handling (REQ-5), no `k='all'`/`k==0` string sentinel / pluggable
 `score_func` / generalized `_clean_nans` (REQ-6), no `GenericUnivariateSelect`
-(REQ-7, absent parity-op), no `SelectorMixin` surface / `pvalues_` (REQ-8), the
-duplicate `SelectFromModel` (REQ-9, cross-ref), no PyO3 binding (REQ-10), and the
-non-ferray substrate (REQ-11). This is a **shipped-partial** unit (4 SHIPPED / 7
-NOT-STARTED).
+(REQ-7, absent parity-op), scoped dense `SelectorMixin` helpers now ship but
+`pvalues_` / sklearn-named fitted attrs remain residual (REQ-8), the duplicate
+`SelectFromModel` (REQ-9, cross-ref), no PyO3 binding (REQ-10), and the non-ferray
+substrate (REQ-11). This is a **shipped-partial** unit (5 SHIPPED / 6
+NOT-STARTED, with REQ-8 residual open).
 
 ## Verification
 
@@ -495,9 +496,11 @@ The in-module `#[test]`s pin REQ-1 (`VarianceThreshold` mask + variances), REQ-2
 `tests/divergence_feature_selection.rs` gauntlet pins REQ-3 (top-`k` selection
 tie-break + constant-feature NaN ranking + `k>n_features` clamp), all GREEN. No green
 command establishes REQ-5 (`threshold==0` ptp-guard / NaN-handling), REQ-6
-(`k='all'`/`k==0` / pluggable `score_func`), REQ-7 (`GenericUnivariateSelect`), REQ-8
-(`SelectorMixin` surface / `pvalues_`), REQ-9 (duplicate `SelectFromModel`,
-cross-ref), REQ-10 (PyO3), or REQ-11 (ferray).
+(`k='all'`/`k==0` / pluggable `score_func`), REQ-7 (`GenericUnivariateSelect`),
+REQ-8 residual fitted attrs (`pvalues_`, `feature_names_in_`), REQ-9 (duplicate
+`SelectFromModel`, cross-ref), REQ-10 (PyO3), or REQ-11 (ferray). `cargo test -p
+ferrolearn-preprocess --test divergence_selector_mixin` establishes the scoped
+dense `SelectorMixin` helpers in REQ-8.
 
 ## Blockers
 
@@ -529,9 +532,12 @@ against tracking issue #1424:
   (The `k>n_features` clamp+keep-all is now done — REQ-3 / #1426.)
 - #1429 — REQ-7: no `GenericUnivariateSelect` mode meta-selector
   (`_univariate_selection.py:1054`, modes `:1119-1125`) — routed parity-op, ABSENT.
-- #1430 — REQ-8: no `SelectorMixin` surface (`get_support`/`inverse_transform`/
-  `get_feature_names_out`) and no `pvalues_`/`scores_`/`n_features_in_` attribute
-  contract (`_univariate_selection.py:567-575`).
+- #1430 — REQ-8 residual: scoped dense `SelectorMixin` helpers now ship via
+  `crate::SelectorMixin` (`get_support` / `get_support_indices` /
+  `inverse_transform` / `get_feature_names_out`). Residual parity still lacks
+  sklearn-named `pvalues_` / `scores_` / `n_features_in_` /
+  `feature_names_in_`, sparse/pandas output, and Python fitted-state protocol
+  (`_univariate_selection.py:567-575`).
 - #1431 — REQ-9: duplicate basic `SelectFromModel` in `feature_selection.rs` vs the
   rich `SelectFromModelExt` in `select_from_model.rs` — parity owned by
   `.design/preprocess/select_from_model.md` (cross-ref, do not re-litigate); the

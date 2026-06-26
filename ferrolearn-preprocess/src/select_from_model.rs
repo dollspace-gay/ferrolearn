@@ -37,7 +37,7 @@
 //! | REQ-5 | Scaled-string `scale*mean`/`scale*median` thresholds + default-from-estimator (l1→1e-5) | NOT-STARTED | sklearn `_from_model.py:30-55` — blocker #1355 |
 //! | REQ-6 | `prefit` + `importance_getter` params | NOT-STARTED | sklearn `_from_model.py:256-271,277-284` — blocker #1356 |
 //! | REQ-7 | `max_features` callable + `_check_max_features` range validation `[0, n_features]` | NOT-STARTED | int cap only; sklearn `_from_model.py:315-331` — blocker #1357 |
-//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | NOT-STARTED | sklearn `_base.py` `SelectorMixin` — blocker #1358 |
+//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | SHIPPED (scoped) / residual open | [`crate::SelectorMixin`] supplies dense support masks, inverse zero-fill, and feature-name filtering; sparse/pandas/Python protocol residuals remain blocker #1358 |
 //! | REQ-9 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1359 |
 //! | REQ-10 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1360 |
 //!

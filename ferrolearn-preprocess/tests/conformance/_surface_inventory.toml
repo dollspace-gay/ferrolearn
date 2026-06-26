@@ -389,6 +389,11 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::SelectorMixin"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::SequentialFeatureSelector"
 phase = "preprocess"
 fixture = ""

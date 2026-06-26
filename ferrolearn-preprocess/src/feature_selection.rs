@@ -33,7 +33,7 @@
 //! | REQ-5b | VarianceThreshold `threshold==0` peak-to-peak guard (`min(var, ptp)`) | NOT-STARTED | sklearn `_variance_threshold.py:113-120` — blocker #1427 (ptp-guard only; nanvar+ValueError shipped as REQ-5a) |
 //! | REQ-6 | SelectKBest `k='all'` string + pluggable `score_func` (chi2/f_regression/mutual_info) + general `_clean_nans` | NOT-STARTED | `usize` k + `FClassif` only; sklearn `_univariate_selection.py:770-795` — blocker #1428 |
 //! | REQ-7 | `GenericUnivariateSelect` (mode meta-selector) | NOT-STARTED | absent (route parity_op); sklearn `_univariate_selection.py:1054` — blocker #1429 |
-//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) + `scores_`/`pvalues_`/`n_features_in_` attrs | NOT-STARTED | sklearn `_univariate_selection.py:526` — blocker #1430 |
+//! | REQ-8 | `SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) + `scores_`/`pvalues_`/`n_features_in_` attrs | SHIPPED (scoped) / residual open | [`crate::SelectorMixin`] supplies dense support masks, index support, inverse zero-fill, and feature-name filtering for fitted selectors; residual sklearn-named fitted attrs (`pvalues_`, `feature_names_in_`) remain blocker #1430 |
 //! | REQ-9 | Basic `SelectFromModel` here duplicates `SelectFromModelExt` | NOT-STARTED | tech-debt; parity in `.design/preprocess/select_from_model.md` — blocker #1431 |
 //! | REQ-10 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1432 |
 //! | REQ-11 | ferray substrate | NOT-STARTED | dense `Array1`/`Array2` + `num_traits::Float` only — blocker #1433 |

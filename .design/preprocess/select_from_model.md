@@ -297,7 +297,7 @@ print('G Percentile(50) ferrolearn thr=',thr,'sel=',[j for j,v in enumerate([0.5
 | REQ-5 (scaled-string thresholds + l1 default-from-estimator) | NOT-STARTED | open prereq blocker #1355. `ThresholdStrategy::{Mean, Median, Value, Percentile}` has NO `"scale*reference"` variant and NO estimator-derived default. sklearn's `_calculate_threshold` (`_from_model.py:24-71`) parses `"scale*ref"` → `scale * {np.median \| np.mean}(importances)` (`:43-55`) and, when `threshold is None`, picks `1e-5` for l1-penalized / `Lasso` / l1 `ElasticNet` estimators else `"mean"` (`:27-40`); ferrolearn's `Default` is unconditionally `Mean`. |
 | REQ-6 (`prefit` + `importance_getter` params) | NOT-STARTED | open prereq blocker #1356. `SelectFromModelExt<F> { threshold, max_features }` has NO `prefit` and NO `importance_getter` field. sklearn's ctor (`_from_model.py:256-271`) accepts `prefit=False` (`_get_support_mask` `check_is_fitted(self.estimator)` + skip re-fit when `True`, `:278-282`) and `importance_getter="auto"` (attribute-path / callable importance source); ferrolearn has no estimator to be prefit. |
 | REQ-7 (callable `max_features` + `_check_max_features` range validation) | NOT-STARTED | open prereq blocker #1357. `max_features: Option<usize>` is int-only with NO callable form and NO `[0, n_features]` validation (a `usize` larger than the feature count simply never binds). sklearn's `max_features` may be an `int` or a callable `max_features(X)`, validated by `_check_max_features` `check_scalar(max_features, "max_features", Integral, min_val=0, max_val=n_features)` (`_from_model.py:315-331`). |
-| REQ-8 (`SelectorMixin` surface: `get_support` / `inverse_transform` / `get_feature_names_out`) | NOT-STARTED | open prereq blocker #1358. `FittedSelectFromModelExt<F>` exposes `selected_indices()` / `n_features_selected()` accessors but NO `get_support` boolean-mask form, NO `inverse_transform` (scatter selected columns back to full width), and NO `get_feature_names_out`. sklearn's `SelectFromModel` inherits `SelectorMixin`, providing all three. |
+| REQ-8 (`SelectorMixin` surface: `get_support` / `inverse_transform` / `get_feature_names_out`) | SHIPPED scoped / residual open | `ferrolearn_preprocess::SelectorMixin` is implemented for both `SelectFromModel<F>` and `FittedSelectFromModelExt<F>`, providing dense `get_support()`, `get_support_indices()`, `inverse_transform` zero-fill, and `get_feature_names_out`, matching sklearn `SelectorMixin` on dense arrays (`sklearn/feature_selection/_base.py:54,136,176`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`. Residual blocker #1358 remains for sparse/pandas output, Python fitted-state checks, `feature_names_in_`, and estimator-wrapper protocol behavior. |
 | REQ-9 (PyO3 binding) | NOT-STARTED | open prereq blocker #1359. No `_RsSelectFromModel` (or `*Ext`) CPython binding exists — `grep -rn "SelectFromModel" ferrolearn-python/src` finds none — so the selector is unreachable from Python. |
 | REQ-10 (ferray substrate) | NOT-STARTED | open prereq blocker #1360. The threshold / mask / gather path uses `ndarray::Array1` / `Array2` (`x.iter()`, `select_columns`, `Array2::zeros`), `num_traits::Float`, and a `Vec<usize>` selected-index path — not `ferray-core` arrays (R-SUBSTRATE-1/2). |
 
@@ -366,10 +366,11 @@ meta-transformer surface: no estimator wrapping / coef extraction (REQ-3, the
 honest gap — ferrolearn's `Fit` input IS the importance vector); no `norm_order`
 multi-output norm (REQ-4); no `scale*ref` / l1-default thresholds (REQ-5); no
 `prefit` / `importance_getter` (REQ-6); int-only `max_features` with no callable
-or range check (REQ-7); no `SelectorMixin` surface (REQ-8); no PyO3 binding
-(REQ-9); and the non-ferray substrate (REQ-10). This is a **shipped-partial** unit
-(2 SHIPPED / 8 NOT-STARTED) whose ENTRY condition (orphan → activation) is resolved
-in the #1352 iteration.
+or range check (REQ-7); scoped dense `SelectorMixin` helpers now ship with residual
+sparse/pandas/Python protocol gaps (REQ-8); no PyO3 binding (REQ-9); and the
+non-ferray substrate (REQ-10). This is a **shipped-partial** unit (3 SHIPPED / 7
+NOT-STARTED, with REQ-8 residual open) whose ENTRY condition (orphan → activation)
+is resolved in the #1352 iteration.
 
 ## Verification
 
@@ -417,10 +418,12 @@ print('sklearn=',sk,'ferrolearn=',fl,'EQUAL=',sk==fl)"
 The in-module `#[test]`s exercise REQ-1 (the mean / median / value threshold +
 mask + max-features algebra) and REQ-2 (every error path —
 `test_empty_importances_error`, `test_percentile_invalid`,
-`test_shape_mismatch_on_transform`). No green command establishes REQ-3..REQ-10
-(estimator wrapping, `norm_order`, scaled-string / l1-default thresholds, `prefit`
-/ `importance_getter`, callable `max_features`, `SelectorMixin` surface, PyO3,
-ferray).
+`test_shape_mismatch_on_transform`). No green command establishes REQ-3..REQ-7,
+REQ-8 residual protocol gaps, or REQ-9..REQ-10 (estimator wrapping, `norm_order`,
+scaled-string / l1-default thresholds, `prefit` / `importance_getter`, callable
+`max_features`, sparse/pandas/Python fitted-state protocol, PyO3, ferray). `cargo test -p ferrolearn-preprocess --test
+divergence_selector_mixin` establishes the scoped dense `SelectorMixin` helpers in
+REQ-8.
 
 ## Blockers
 
@@ -444,8 +447,11 @@ tracking issue #1352 (placeholders `#1353..H` until filed):
   `:278-282`).
 - #1357 — REQ-7: int-only `max_features` with no callable form and no
   `_check_max_features` `[0, n_features]` validation (`:315-331`).
-- #1358 — REQ-8: no `SelectorMixin` surface — `get_support` /
-  `inverse_transform` / `get_feature_names_out`.
+- #1358 — REQ-8 residual: scoped dense `SelectorMixin` helpers now ship via
+  `crate::SelectorMixin` (`get_support` / `get_support_indices` /
+  `inverse_transform` / `get_feature_names_out`). Residual parity still lacks
+  sparse/pandas output, Python fitted-state checks, `feature_names_in_`, and the
+  estimator-wrapper protocol behavior.
 - #1359 — REQ-9: no PyO3 `SelectFromModel` binding in `ferrolearn-python`.
 - #1360 — REQ-10: fit/transform on `ndarray` / `num_traits` / `Vec<usize>`
   index path, not ferray (R-SUBSTRATE-1/2).

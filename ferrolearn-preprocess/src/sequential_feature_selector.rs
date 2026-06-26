@@ -35,7 +35,7 @@
 //! | REQ-5 `tol` early-stop + forward tol>0 validation | NOT-STARTED (#1288) | sklearn `_sequential.py:233-236`,`:258-259` |
 //! | REQ-6 float `n_features_to_select` fraction | NOT-STARTED (#1289) | sklearn `_sequential.py:159`,`:230-231` |
 //! | REQ-7 `cv` / `scoring` / `n_jobs` params | NOT-STARTED (#1290) | sklearn `_sequential.py:164-166` |
-//! | REQ-9 SelectorMixin surface + `n_features_to_select_` | NOT-STARTED (#1291) | sklearn `_sequential.py:297-299`,`:268` |
+//! | REQ-9 SelectorMixin surface + `n_features_to_select_` | SHIPPED (scoped) / residual open (#1291) | [`crate::SelectorMixin`] supplies dense support masks, inverse zero-fill, and feature-name filtering; sklearn-named `n_features_to_select_` attr remains open |
 //! | REQ-10 PyO3 binding | NOT-STARTED (#1292) | `ferrolearn-python/src/` (absent) |
 //! | REQ-11 ferray substrate | NOT-STARTED (#1293) | R-SUBSTRATE |
 
@@ -301,6 +301,12 @@ pub struct FittedSequentialFeatureSelector<F> {
 }
 
 impl<F: Float + Send + Sync + 'static> FittedSequentialFeatureSelector<F> {
+    /// Return the number of features seen during fitting.
+    #[must_use]
+    pub fn n_features_in(&self) -> usize {
+        self.n_features_in
+    }
+
     /// Return the indices of the selected features.
     #[must_use]
     pub fn selected_indices(&self) -> &[usize] {

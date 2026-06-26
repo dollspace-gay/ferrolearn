@@ -32,7 +32,7 @@
 //! | REQ-3 | SelectFwe mask `p < alpha/n` (given static p-values) | SHIPPED | [`SelectFwe`] `fit` matches sklearn `_get_support_mask` `:1044` (Bonferroni, strict `<`); oracle tests |
 //! | REQ-4 | Error/parameter contracts (empty p-values, `alpha ∈ [0,1]` closed-both, transform ncols) | SHIPPED | `validate_inputs` accepts `alpha=0` (matches sklearn `_parameter_constraints` `Interval(Real,0,1,closed="both")` `:868`, fixed #1397, see Changed); divergence error tests |
 //! | REQ-5 | `score_func` wrapping (f_classif/f_regression/chi2 → `scores_`/`pvalues_` at `fit(X,y)`) | NOT-STARTED | takes p-values directly; sklearn `_BaseFilter` `:526,569-570` — blocker #1398 |
-//! | REQ-6 | `_BaseFilter`/`SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | NOT-STARTED | sklearn `_univariate_selection.py:526` — blocker #1399 |
+//! | REQ-6 | `_BaseFilter`/`SelectorMixin` surface (`get_support`/`inverse_transform`/`get_feature_names_out`) | SHIPPED (scoped) / residual open | [`crate::SelectorMixin`] supplies dense support masks, inverse zero-fill, and feature-name filtering; `_BaseFilter` score_func wrapping remains REQ-5 and sparse/pandas/Python residuals remain blocker #1399 |
 //! | REQ-7 | Computed `scores_`/`pvalues_` fitted attrs + `n_features_in_`/`feature_names_in_` | NOT-STARTED | sklearn `:569-570` — blocker #1400 |
 //! | REQ-8 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1401 |
 //! | REQ-9 | ferray substrate | NOT-STARTED | dense `Array1`/`Array2` + `num_traits::Float` only — blocker #1402 |

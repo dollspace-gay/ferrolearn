@@ -83,10 +83,10 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block (`:106-164`) surfaces every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums and the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns), mirroring the six modules' `__all__`. The surfaced set is the documented subset that is implemented; not-yet-translated names (`GenericUnivariateSelect`, `HashingVectorizer`, `mutual_info_*`, `johnson_lindenstrauss_min_dim`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
-//! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across all 33 submodules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
+//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block (`:130-197`) surfaces every implemented estimator's unfitted + `Fitted*` pair (plus supporting enums, [`SelectorMixin`], and the `chi2`/`f_classif`/`f_regression`/`r_regression` scoring fns), mirroring the six modules' `__all__`. The surfaced set is the documented subset that is implemented; not-yet-translated names (`GenericUnivariateSelect`, `HashingVectorizer`, `mutual_info_*`, `johnson_lindenstrauss_min_dim`) are enumerated in the design doc (honest underclaim). Consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`) + the `_RsStandardScaler`/`_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer` PyO3 pyclasses (`ferrolearn-python/src/{transformers,extras}.rs`, registered `lib.rs:22,81-84`). Verification: `cargo build -p ferrolearn-preprocess` resolves every re-export; boundary-integrity green-guard `tests/divergence_lib.rs` (fails to compile if any re-export is removed); `cargo test -p ferrolearn-preprocess` green. |
+//! | REQ-2 (ferray substrate) | NOT-STARTED | the crate is `ndarray` + `num_traits` across all 36 submodules behind the boundary, not `ferray-core`/`ferray-ufunc` (R-SUBSTRATE-1) — blocker #1362 |
 //!
-//! `BinaryEncoder`/`FittedBinaryEncoder` (`:129`) is a `category_encoders`-style
+//! `BinaryEncoder`/`FittedBinaryEncoder` (`:158`) is a `category_encoders`-style
 //! extension with no sklearn `__all__` analog — an extension of the boundary, not
 //! a sklearn-parity item and not a blocker.
 
@@ -119,6 +119,7 @@ pub mod rfe;
 pub mod robust_scaler;
 pub mod select_from_model;
 pub mod select_percentile;
+pub mod selector_mixin;
 pub mod sequential_feature_selector;
 pub mod spline_transformer;
 pub mod standard_scaler;
@@ -165,6 +166,7 @@ pub use quantile_transformer::{
 pub use rfe::{RFE, RFECV};
 pub use select_from_model::{FittedSelectFromModelExt, SelectFromModelExt, ThresholdStrategy};
 pub use select_percentile::{FittedSelectPercentile, SelectPercentile};
+pub use selector_mixin::SelectorMixin;
 pub use spline_transformer::{FittedSplineTransformer, KnotStrategy, SplineTransformer};
 pub use target_encoder::{FittedTargetEncoder, TargetEncoder};
 

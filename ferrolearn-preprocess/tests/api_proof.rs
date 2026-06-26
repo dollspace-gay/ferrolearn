@@ -16,9 +16,9 @@ use ferrolearn_preprocess::{
     MissingIndicatorFeatures, MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder,
     OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer, Remainder,
     RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
-    SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
-    StandardScaler, TargetEncoder, TfidfTransformer, TfidfVectorizer, VarianceThreshold,
-    add_dummy_feature, chi2, f_classif, f_regression, make_column_selector,
+    SelectorMixin, SequentialFeatureSelector, SimpleImputer, SparseRandomProjection,
+    SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer, TfidfVectorizer,
+    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, make_column_selector,
     make_column_transformer, maxabs_scale, minmax_scale, power_transform, r_regression,
 };
 use ndarray::{Array1, Array2, array};
@@ -266,12 +266,14 @@ fn api_proof_feature_selection() {
 
     // VarianceThreshold (unsupervised)
     let f = VarianceThreshold::<f64>::new(0.0).fit(&x, &()).unwrap();
+    let _ = f.get_support();
     let _ = f.transform(&x).unwrap();
 
     // SelectKBest / SelectPercentile (supervised, FClassif)
     let f = SelectKBest::<f64>::new(2, ScoreFunc::FClassif)
         .fit(&x, &y)
         .unwrap();
+    let _ = f.get_support_indices();
     let _ = f.transform(&x).unwrap();
     let f = SelectPercentile::<f64>::new(50, ScoreFunc::FClassif)
         .fit(&x, &y)

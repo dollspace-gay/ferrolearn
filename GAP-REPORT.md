@@ -17,7 +17,7 @@ model selection.
   the version cited by most current `divergence_*` tests.
 - Local sklearn source mirror: `.sklearn-ref/scikit-learn` at commit `f1cc4e7`.
 - ferrolearn workspace: `Cargo.toml` lists 22 workspace members.
-- Test evidence: the current tree contains 341 `tests/divergence_*.rs` files.
+- Test evidence: the current tree contains 342 `tests/divergence_*.rs` files.
 
 The exact API gap list below was produced by parsing the sklearn 1.9.0 API
 index for public classes/functions and comparing it with current public Rust
@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 61 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 60 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -60,7 +60,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
 | `sklearn.cluster` | `SpectralBiclustering`, `SpectralCoclustering` |
 | `sklearn.decomposition` | `MiniBatchDictionaryLearning`, `MiniBatchSparsePCA`, `SparseCoder`, `dict_learning`, `dict_learning_online` |
-| `sklearn.feature_selection` | `GenericUnivariateSelect`, `SelectorMixin`, `mutual_info_classif`, `mutual_info_regression` |
+| `sklearn.feature_selection` | `GenericUnivariateSelect`, `mutual_info_classif`, `mutual_info_regression` |
 | `sklearn.feature_extraction` | `DictVectorizer`, `FeatureHasher` |
 | `sklearn.feature_extraction.text` | `HashingVectorizer` |
 | `sklearn.feature_extraction.image` | `PatchExtractor`, `extract_patches_2d`, `grid_to_graph`, `img_to_graph`, `reconstruct_from_patches_2d` |
@@ -165,7 +165,7 @@ Current divergence-test count by crate:
 | `ferrolearn-neighbors` | 17 |
 | `ferrolearn-neural` | 5 |
 | `ferrolearn-numerical` | 7 |
-| `ferrolearn-preprocess` | 71 |
+| `ferrolearn-preprocess` | 72 |
 | `ferrolearn-sparse` | 4 |
 | `ferrolearn-tree` | 18 |
 

@@ -26,10 +26,10 @@ analog of the `__all__` re-export boundary of **six** scikit-learn modules
 `sklearn.compose`) collapsed under one crate root. It is **not** an estimator: it
 owns no `fit`/`transform` logic. Two things live in this translation unit:
 
-1. **Module declarations** — the `pub mod` block (`:72-104`) for the 33 submodules
+1. **Module declarations** — the `pub mod` block (`:93-128`) for the 36 submodules
    (one per transformer / selector / encoder / imputer family, plus the shared
    `feature_scoring` and `stat_selectors` helpers).
-2. **The re-export block** — the `pub use` blocks (`:106-163`) that surface each
+2. **The re-export block** — the `pub use` blocks (`:130-197`) that surface each
    implemented estimator's unfitted + `Fitted*` type pair (plus supporting enums
    like `ImputeStrategy`, `BinStrategy`, `OutputDistribution`, `KnotStrategy`,
    `ThresholdStrategy`, `Direction`, `TfidfNorm`, and the `chi2`/`f_classif`/
@@ -138,14 +138,14 @@ submodule, or the crate fails to compile.
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (re-export boundary — six `__all__` lists) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:106-164`) surfaces every implemented estimator at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`), projection (`GaussianRandomProjection`, `SparseRandomProjection`), and compose (`ColumnTransformer`, `make_column_selector`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess` → 486 lib + 46 doctests, 0 failed; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
+| REQ-1 (re-export boundary — six `__all__` lists) | SHIPPED | impl: the `pub use` block `in lib.rs` (`:130-197`) surfaces every implemented estimator at the crate root — scalers (`StandardScaler`, `MinMaxScaler`, `MaxAbsScaler`, `RobustScaler`, `Normalizer`, `PowerTransformer`, `QuantileTransformer`), encoders (`OneHotEncoder`, `OrdinalEncoder`, `LabelEncoder`, `LabelBinarizer`, `MultiLabelBinarizer`, `TargetEncoder`, `KBinsDiscretizer`), feature engineering (`Binarizer`, `FunctionTransformer`, `PolynomialFeatures`, `SplineTransformer`), imputers (`SimpleImputer`, `MissingIndicator`, `KNNImputer`, `IterativeImputer`), selectors (`VarianceThreshold`, `SelectKBest`, `SelectPercentile`, `SelectFromModel`/`SelectFromModelExt`, `RFE`, `RFECV`, `SequentialFeatureSelector`, `SelectFdr`/`SelectFpr`/`SelectFwe`, `SelectorMixin`, `chi2`/`f_classif`/`f_regression`/`r_regression`), text (`CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer`), projection (`GaussianRandomProjection`, `SparseRandomProjection`), and compose (`ColumnTransformer`, `make_column_selector`, `make_column_transformer`) — each unfitted + `Fitted*` where applicable. Mirrors the `__all__` of `sklearn/preprocessing/__init__.py:30-60`, `feature_selection/__init__.py:27-47`, `feature_extraction/text.py:34-43`, `impute/__init__.py:13`, `random_projection.py:50-54`, `compose/__init__.py:15-20` (live lists in Probes). Non-test consumers: meta-crate `pub use ferrolearn_preprocess as preprocess;` (`ferrolearn/src/lib.rs:36`); PyO3 pyclasses `RsStandardScaler` (`ferrolearn-python/src/transformers.rs`, `#[pyclass(name = "_RsStandardScaler")]`, registered `ferrolearn-python/src/lib.rs:22`) and `RsMinMaxScaler`/`RsMaxAbsScaler`/`RsRobustScaler`/`RsPowerTransformer` (`ferrolearn-python/src/extras.rs`, `_RsMinMaxScaler`/`_RsMaxAbsScaler`/`_RsRobustScaler`/`_RsPowerTransformer`, registered `ferrolearn-python/src/lib.rs:81-84`). Verification: `cargo test -p ferrolearn-preprocess` → 486 lib + 46 doctests, 0 failed; `cargo build -p ferrolearn-preprocess` resolves every re-export. ABSENT (not-yet-translated) sklearn names enumerated in Architecture — the boundary correctly exports only what exists (honest underclaim). |
 | REQ-substrate (ferray) | NOT-STARTED | open prereq blocker **#1362** (crate-root substrate, R-SUBSTRATE-1). `lib.rs`'s doc-comment examples and every submodule operate on `ndarray::{Array1, Array2}` with `F: num_traits::Float + Send + Sync + 'static`; `ferrolearn-preprocess/Cargo.toml` declares `ndarray.workspace = true` + `num-traits.workspace = true`, not `ferray-core` / `ferray-ufunc`. The whole crate is on the wrong substrate; migration cascades through all 33 submodules. Not migrated. |
 
 ## Architecture
 
 **This is a boundary, not an estimator.** `lib.rs` has no transformer state. Its
-surface, in source order, is the `pub mod` block (`:72-104`) followed by the
-`pub use` re-export blocks (`:106-164`). The re-export block hoists each
+surface, in source order, is the `pub mod` block (`:93-128`) followed by the
+`pub use` re-export blocks (`:130-197`). The re-export block hoists each
 implemented estimator's unfitted + `Fitted*` type pair (and supporting
 enums/functions) to the crate root, mirroring the *function* of the six modules'
 `__all__`: defining the importable public surface. Below is the
@@ -173,10 +173,10 @@ PRESENT: `SequentialFeatureSelector`, `RFE`, `RFECV`, `SelectFdr`, `SelectFpr`,
 `feature_selection::SelectFromModel` at `:112` — the importance-threshold form —
 *and* as `SelectFromModelExt`/`FittedSelectFromModelExt` at `:137`, the
 strategy-parameterised extension), `SelectPercentile`, `VarianceThreshold`,
-`chi2`, `f_classif`, `f_regression`, `r_regression` (`:158-163`, `:136`,
-`:111-113`, `:138`, `:153-155`).
+`SelectorMixin`, `chi2`, `f_classif`, `f_regression`, `r_regression`
+(`:158-164`, `:136`, `:111-113`, `:138`, `:153-155`).
 ABSENT: `GenericUnivariateSelect`, `mutual_info_classif`,
-`mutual_info_regression`, `f_oneway`, and the `SelectorMixin` base trait.
+`mutual_info_regression`, and `f_oneway`.
 
 **`sklearn.feature_extraction.text` (`text.py:34-43`).**
 PRESENT: `CountVectorizer`, `TfidfTransformer`, `TfidfVectorizer` (`:143-144`).

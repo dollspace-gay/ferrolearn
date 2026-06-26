@@ -118,6 +118,7 @@ use ferrolearn_preprocess::{
     SelectFwe,
     SelectKBest,
     SelectPercentile,
+    SelectorMixin,
     SequentialFeatureSelector,
     SimpleImputer,
     SparseRandomProjection,
@@ -169,7 +170,7 @@ fn name_type<T>() {}
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
 /// `mutual_info_*`,
-/// `f_oneway`, `SelectorMixin`,
+/// `f_oneway`,
 /// `johnson_lindenstrauss_min_dim`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
@@ -234,6 +235,7 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedVarianceThreshold<f64>>();
     name_type::<SelectKBest<f64>>();
     name_type::<FittedSelectKBest<f64>>();
+    name_type::<&dyn SelectorMixin<f64>>();
     name_type::<SelectPercentile<f64>>();
     name_type::<FittedSelectPercentile<f64>>();
     name_type::<SelectFromModel<f64>>();

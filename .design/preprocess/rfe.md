@@ -61,21 +61,20 @@ and **squared** (`_get_feature_importances(..., transform_func="square")`,
 Everything sklearn layers on the estimator+CV machinery (the re-fit loop REQ-3,
 the `n_features_to_select=None`/float defaults REQ-5, float `step` REQ-6,
 `importance_getter`/`verbose` REQ-7, the RFECV internal cross-validation REQ-8,
-the `SelectorMixin` surface + `estimator_`/`n_features_` attrs REQ-10) is
-NOT-STARTED. This is a **mostly-NOT-STARTED** unit: 4 SHIPPED (REQ-1/2/4/9, REQ-4
-fixed #1296 this iteration) / 8 NOT-STARTED.
+and the `estimator_`/`n_features_` attrs plus delegation residuals in REQ-10)
+remains absent. The scoped dense `SelectorMixin` helpers in REQ-10 now ship via
+`crate::SelectorMixin`. This is a **mostly-NOT-STARTED** unit: 5 SHIPPED
+(REQ-1/2/4/9 plus scoped REQ-10, REQ-4 fixed #1296 this iteration) / 7
+NOT-STARTED, with REQ-10 residual open.
 
-**One boundary divergence flagged this iteration (DIV-1, REQ-4 — candidate
-fixable, the critic should pin).** sklearn `RFE` with `n_features_to_select >
-n_features` does NOT raise — it **warns** (`UserWarning`) and **keeps all
-features**, because the `while np.sum(support_) > n_features_to_select` loop never
-runs (`:288-297`,`:314`). ferrolearn's `RFE::new` instead **errors** with
-`FerroError::InvalidParameter` on `n_features_to_select > n_features` (`pub fn new`
-guard, `rfe.rs`), and the in-module `test_rfe_n_features_too_large_error` (5 of 2 →
-asserts `Err`) PINS that wrong behavior. Live oracle (Probe DIV-1):
-`RFE(LinearRegression(), n_features_to_select=5).fit(X_2feat, y)` does NOT raise
-(warns), `support_ == [True, True]`, `ranking_ == [1, 1]`. A candidate fixable
-divergence (REQ-4 NOT-STARTED with the DIV-1 note).
+**One boundary divergence fixed (DIV-1, REQ-4 — #1296).** sklearn `RFE` with
+`n_features_to_select > n_features` does NOT raise — it **warns** (`UserWarning`)
+and **keeps all features**, because the `while np.sum(support_) >
+n_features_to_select` loop never runs (`:288-297`,`:314`). ferrolearn now clamps
+the requested count and keeps all features too; there is no Rust warning surface.
+Live oracle (Probe DIV-1): `RFE(LinearRegression(), n_features_to_select=5).fit(X_2feat, y)`
+does NOT raise (warns), `support_ == [True, True]`, `ranking_ == [1, 1]`; ferrolearn
+`RFE::new(&[0.5, 0.3], 5, 1)` returns `Ok` with the same keep-all support/ranking.
 
 ## Probes (live sklearn oracle, 1.5.2)
 
@@ -106,7 +105,7 @@ print('raised? NO. support_', r.support_.tolist(), 'ranking_', r.ranking_.tolist
 # -> raised? NO. support_ [True, True] ranking_ [1, 1]
 #    Warning: 'Found n_features_to_select=5 > n_features=2. There will be no feature selection
 #    and all features will be kept.'
-#    ferrolearn::RFE::new RAISES InvalidParameter on > n_features. DIVERGENCE (DIV-1, REQ-4).
+#    ferrolearn::RFE::new now keeps all features too; no Rust warning surface.
 
 # REQ-8 — RFECV runs cross-validation INTERNALLY (cv splitter, per-fold RFE over a step grid,
 # cv_results_), picking the feature count that maximizes the mean CV score:
@@ -152,12 +151,12 @@ print('n_features_', int(r.n_features_), 'support_', r.support_.tolist(), \
   `:326-330`), and `ranks = np.argsort(importances)` (`:331`). ferrolearn's
   `RFE::new(importances, ...)` instead takes a **fixed** importance vector — no
   estimator, no per-round re-fit, no squaring (Probe REQ-3).
-- REQ-4: **`n_features_to_select > n_features` = warn + keep-all** (DIV-1, the
-  fixable boundary) — sklearn does NOT raise: it emits a `UserWarning` and keeps all
-  features (the `while np.sum(support_) > n_features_to_select` loop never runs,
-  `:288-297`,`:314`). ferrolearn's `RFE::new` RAISES `InvalidParameter` on `>
-  n_features` (`pub fn new` guard, `rfe.rs`), and `test_rfe_n_features_too_large_error`
-  pins the wrong behavior (Probe REQ-4 / DIV-1). Candidate fixable; the critic may pin.
+- REQ-4: **`n_features_to_select > n_features` = warn + keep-all** (DIV-1,
+  SHIPPED / closed #1296) — sklearn does NOT raise: it emits a `UserWarning` and
+  keeps all features (the `while np.sum(support_) > n_features_to_select` loop
+  never runs, `:288-297`,`:314`). ferrolearn now clamps the requested count and
+  keeps all features too; the only residual difference is that Rust has no warning
+  facade here.
 - REQ-5: **`n_features_to_select=None` default + float fraction** (`:286-287`,
   `:298-299`) — `None` selects `n_features // 2`; a float in `(0, 1]` selects `int(
   n_features * frac)` (`Interval(RealNotInt, 0, 1, closed="right")`, `:203`).
@@ -264,7 +263,7 @@ print('n_features_', int(r.n_features_), 'support_', r.support_.tolist(), \
 | REQ-7 (`importance_getter` + `verbose`) | NOT-STARTED | open prereq blocker #1299. `RFE::new` has only `importances` / `n_features_to_select` / `step`; there is no `importance_getter` (sklearn "auto"/attr-path str/callable selecting `coef_` vs `feature_importances_`, `:211`,`:112-127`,`:326-330`) and no `verbose` (progress printing, `:210`,`:320-321`) — both are moot because the importance vector is supplied directly (REQ-3). |
 | REQ-8 (RFECV internal cross-validation) | NOT-STARTED | open prereq blocker #1300. `RFECV::new(importances, cv_scores: &[f64], step)` takes PRE-COMPUTED per-feature-count CV scores. sklearn `RFECV.fit` builds `cv = check_cv(self.cv, y, classifier=...)` (`:736`) and `scorer = check_scoring(...)` (`:737`), runs `_rfe_single_fit` per fold (an RFE `_fit` down to `min_features_to_select` collecting `step_scores_`/`step_n_features_`, `:30-50`,`:777-780`), sums scores across folds (`:783-787`), picks `n_features_to_select = step_n_features_rev[argmax(scores_sum_rev)]` (`:788`), and populates `cv_results_` (`:810-815`). ferrolearn has NO cv splitter, NO per-fold RFE, NO scoring, NO `cv_results_` — the CV machinery is absent (Probe REQ-8: `cv=2` → `n_features_ 2`, `cv_results_` keys present). |
 | REQ-9 (RFECV optimal-count selection given static scores) | SHIPPED | impl `pub fn new in rfe.rs` (RFECV): scans `cv_scores` keeping `best_idx` under strict `if score > best_score` (first-max), sets `optimal_n_features = best_idx + 1`, and delegates to `RFE::new(importances, optimal_n_features, step)`. The strict-`>` first-max over ascending feature count picks the LOWEST count on ties — identical to sklearn's `n_features_to_select = step_n_features_rev[np.argmax(scores_sum_rev)]` (`:786-788`), where the `[::-1]` reversal makes `np.argmax` resolve ties to the lowest feature count (verified: reversed-argmax on `[0.85, 0.95, 0.95]` → lowest of the two tied counts). Accessors `optimal_n_features()` / `cv_scores()` plus delegated `ranking()`/`support()`/`selected_indices()`. **Scope (R-HONEST-3):** the scores are user-supplied, NOT per-fold-CV-produced (that is REQ-8). Non-test consumer: crate re-export `pub use rfe::{RFE, RFECV};` (`lib.rs`). Verification: `cargo test -p ferrolearn-preprocess rfe` (`test_rfecv_selects_optimal`, `test_rfecv_cv_scores_accessor`, `test_rfecv_ranking_and_support`) → green. |
-| REQ-10 (SelectorMixin surface + `estimator_`/`n_features_` attrs) | NOT-STARTED | open prereq blocker #1301. `RFE<F>`/`RFECV<F>` expose `support()` (bool mask), `selected_indices()` (the `get_support(indices=True)` analog), `ranking()`, `n_features_selected()`, and a `Transform` impl, but NOT `inverse_transform` (zero-pad dropped columns), `get_feature_names_out`, the fitted `estimator_` (sklearn `clone(self.estimator).fit(X[:, features], y)`, `:350-351`), `n_features_ = support_.sum()` (`:357`), or the `predict`/`score`/`decision_function`/`predict_proba` delegation (`:363-469`) that sklearn inherits from `SelectorMixin` + `available_if` (`_get_support_mask`, `:407-409`). |
+| REQ-10 (SelectorMixin surface + `estimator_`/`n_features_` attrs) | SHIPPED scoped / residual open | `ferrolearn_preprocess::SelectorMixin` is implemented for `RFE<F>` and `RFECV<F>`, providing dense `get_support()`, `get_support_indices()`, `inverse_transform` zero-fill, and `get_feature_names_out`, matching sklearn `SelectorMixin` on dense arrays (`sklearn/feature_selection/_base.py:54,136,176`). Verification: `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`. Residual blocker #1301 remains for the fitted `estimator_`, sklearn `n_features_` attr, prediction/score delegation, sparse/pandas output, and Python fitted-state protocol. |
 | REQ-11 (PyO3 binding) | NOT-STARTED | open prereq blocker #1302. No `ferrolearn-python` registration of `RFE`/`RFECV` (grep `RFE`/`rfe` across `ferrolearn-python/` matches only `README.md`); the only non-test consumer is the crate re-export (`lib.rs`, `pub use rfe::{RFE, RFECV}`). The boundary CPython `import ferrolearn` selector surface is absent. |
 | REQ-12 (ferray substrate) | NOT-STARTED | open prereq blocker #1303. The ranking/elimination/transform path uses `ndarray::{Array1, Array2}` (`importances.len()`, `Array2::zeros`, the `select_columns` gather) + `num_traits::Float` and `Vec` bookkeeping — not `ferray-core` / `ferray-ufunc` (R-SUBSTRATE-1/2). |
 
@@ -330,11 +329,14 @@ fundamentally different: ferrolearn takes a fixed importance vector, whereas skl
 `feature_importances_`** (`:319-330`). Every contract sklearn layers on the
 estimator+CV machinery is therefore NOT-STARTED: the `None`/float `n_features_to_select`
 defaults (REQ-5), float `step` (REQ-6), `importance_getter`/`verbose` (REQ-7), the
-RFECV internal cross-validation (REQ-8), the `SelectorMixin` surface + `estimator_`/
-`n_features_` attrs (REQ-10), the PyO3 binding (REQ-11), the ferray substrate (REQ-12).
-The `n_features_to_select > n_features` boundary (REQ-4, DIV-1) is a fixable divergence:
-sklearn warns + keeps all features, ferrolearn raises. This is a **mostly-NOT-STARTED**
-unit (4 SHIPPED / 8 NOT-STARTED; REQ-4 fixed #1296).
+RFECV internal cross-validation (REQ-8), the `estimator_` / `n_features_` attrs
+and delegation residuals in REQ-10, the PyO3 binding (REQ-11), the ferray
+substrate (REQ-12). The scoped dense `SelectorMixin` helpers in REQ-10 now ship
+via `crate::SelectorMixin`.
+The `n_features_to_select > n_features` boundary (REQ-4, DIV-1) is fixed by
+#1296: ferrolearn now clamps and keeps all features (without sklearn's warning
+surface). This is a **mostly-NOT-STARTED** unit (5 SHIPPED / 7 NOT-STARTED, with
+REQ-10 residual open; REQ-4 fixed #1296).
 
 ## Verification
 
@@ -379,22 +381,23 @@ X2=np.array([[1.,10.],[2.,20.],[3.,30.],[4.,40.]]); y=np.array([1.,2.,3.,4.]); \
 w=warnings.catch_warnings(record=True); w.__enter__(); warnings.simplefilter('always'); \
 r=RFE(LinearRegression(), n_features_to_select=5).fit(X2,y); \
 print('support_', r.support_.tolist())"
-#   -> support_ [True, True]   (ferrolearn::RFE::new RAISES here — DIV-1, REQ-4)
+#   -> support_ [True, True]   (ferrolearn::RFE::new now keeps all; no Rust warning surface)
 ```
 
 The existing `#[test]`s exercise REQ-1 (ranking/elimination shape, step, all-features),
-REQ-2 (every error path + transform), and REQ-9 (optimal-count + accessors) with fixed
+REQ-2 (every error path + transform), REQ-4 (warn-equivalent keep-all boundary),
+and REQ-9 (optimal-count + accessors) with fixed
 importance / cv-score fixtures; they are **vector-grounded, not estimator-refit
-oracle-grounded** — by construction, since the importance interface diverges (REQ-3). No
-currently-green command establishes REQ-3..REQ-8, REQ-10..REQ-12. Note
-`test_rfe_n_features_too_large_error` asserts `Err` for `n_features_to_select=5` of 2
-features, which sklearn does NOT raise (it warns + keeps all, REQ-4 DIV-1) — the critic
-should pin that boundary.
+oracle-grounded** — by construction, since the importance interface diverges (REQ-3).
+No currently-green command establishes REQ-3, REQ-5..REQ-8, REQ-10 residuals, or
+REQ-11..REQ-12. `cargo test -p ferrolearn-preprocess --test divergence_selector_mixin`
+establishes the scoped dense `SelectorMixin` helpers in REQ-10.
 
 ## Blockers
 
-REQ-1, REQ-2, REQ-9 are SHIPPED (ranking/elimination shape + scoped transform/error
-contracts + RFECV optimal-count argmax). The remaining NOT-STARTED REQs are open
+REQ-1, REQ-2, REQ-4, REQ-9, and scoped REQ-10 are SHIPPED (ranking/elimination shape,
+scoped transform/error contracts, keep-all boundary, RFECV optimal-count argmax, and
+dense `SelectorMixin` helpers). The remaining NOT-STARTED REQs are open
 `-l blocker` issues referenced by the REQ status table:
 
 - #1295 — REQ-3 (HEADLINE): `RFE::new(importances, ...)` takes a FIXED importance
@@ -402,10 +405,10 @@ contracts + RFECV optimal-count argmax). The remaining NOT-STARTED REQs are open
   importances via `_get_feature_importances(..., transform_func="square")`
   (`_rfe.py:319-331`). The importance SOURCE (estimator + per-round re-fit + squaring)
   is entirely absent.
-- #1296 — REQ-4 (DIV-1, candidate fixable): `RFE::new` RAISES `InvalidParameter` on
-  `n_features_to_select > n_features`; sklearn WARNS (`UserWarning`) and keeps ALL
-  features (the while loop never runs, `:288-297`,`:314`). `test_rfe_n_features_too_large_error`
-  pins the wrong behavior. The critic should pin this divergence.
+- #1296 — REQ-4 (DIV-1, CLOSED/fixed): `RFE::new` now clamps
+  `n_features_to_select > n_features` and keeps all features, matching sklearn's
+  warn-and-keep-all outcome (`UserWarning` has no Rust warning facade;
+  `:288-297`,`:314`).
 - #1297 — REQ-5: no `n_features_to_select=None` (`n_features // 2`, `:286-287`) or float
   fraction (`int(n_features * frac)`, `:298-299`) — the count is a required `usize`.
 - #1298 — REQ-6: `step: usize` is an absolute count; no float step `int(max(1,
@@ -415,9 +418,12 @@ contracts + RFECV optimal-count argmax). The remaining NOT-STARTED REQs are open
   scores; sklearn runs cross-validation internally (`check_cv` `:736`, per-fold RFE
   `:30-50`,`:777-780`, `cv_results_` `:810-815`) with `cv`/`scoring`/`n_jobs`/
   `min_features_to_select`.
-- #1301 — REQ-10: no `inverse_transform` / `get_feature_names_out` / `estimator_` /
-  `n_features_` / `predict`/`score` delegation (SelectorMixin + available_if surface,
-  `:350-359`,`:363-469`,`:407-409`).
+- #1301 — REQ-10 residual: scoped dense `SelectorMixin` helpers now ship via
+  `crate::SelectorMixin` (`get_support` / `get_support_indices` /
+  `inverse_transform` / `get_feature_names_out`). Residual parity still lacks
+  `estimator_`, sklearn-named `n_features_`, `predict`/`score` delegation,
+  sparse/pandas output, and Python fitted-state protocol (`:350-359`,`:363-469`,
+  `:407-409`).
 - #1302 — REQ-11: no `ferrolearn-python` `RFE`/`RFECV` binding (boundary CPython
   consumer absent; grep matches only `README.md`).
 - #1303 — REQ-12: ranking/elimination/transform path on `ndarray`/`num_traits`/`Vec`,

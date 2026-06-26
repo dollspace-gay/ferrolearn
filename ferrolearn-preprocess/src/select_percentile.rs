@@ -18,7 +18,7 @@
 //! | REQ-3 InsufficientSamples / ShapeMismatch / InvalidParameter errors | SHIPPED | `fit` / `transform` guards; sklearn `_univariate_selection.py:662` |
 //! | REQ-4 `_clean_nans` (NaN scores → dtype.min) | NOT-STARTED (#1275) | sklearn `_univariate_selection.py:24`,`:678` |
 //! | REQ-5 pluggable score_func (chi2/f_regression/mutual_info_*) | NOT-STARTED (#1276) | sklearn `_univariate_selection.py:202`,`:405`,`:596-599` |
-//! | REQ-6 SelectorMixin (get_support/inverse_transform/get_feature_names_out) | NOT-STARTED (#1277) | sklearn `feature_selection/_base.py` |
+//! | REQ-6 SelectorMixin (get_support/inverse_transform/get_feature_names_out) | SHIPPED scoped (#1277 residual) | [`crate::SelectorMixin`] supplies dense support masks, inverse zero-fill, and feature-name filtering; sparse/pandas/Python protocol residuals remain |
 //! | REQ-7 `pvalues_` fitted attribute | NOT-STARTED (#1278) | sklearn `_univariate_selection.py:567-573`,`:116` |
 //! | REQ-8 fractional `percentile` (`Interval(Real,0,100)`) | NOT-STARTED (#1279) | sklearn `_univariate_selection.py:662` |
 //! | REQ-9 PyO3 binding | NOT-STARTED (#1280) | `ferrolearn-python/src/` (absent) |

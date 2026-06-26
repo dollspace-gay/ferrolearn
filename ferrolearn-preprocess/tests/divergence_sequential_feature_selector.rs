@@ -7,13 +7,13 @@
 //! ferrolearn's `fit(x, y, score_fn)` scores subsets with a USER CALLBACK;
 //! sklearn scores with `cross_val_score(estimator, X_subset, y, cv=cv,
 //! scoring=scoring).mean()` (`:286-293`). The estimator / cv / scoring / "auto"
-//! / tol / float-fraction / SelectorMixin surface is structurally NOT-STARTED
-//! (R-DEFER-3) and is NOT pinned here. The greedy SHAPE (add-best / remove-best
-//! with lowest-index `max` tie-break, `:294`) IS shipped and is green-guarded.
+//! / tol / float-fraction surface remains structurally NOT-STARTED (R-DEFER-3)
+//! and is NOT pinned here. The greedy SHAPE (add-best / remove-best with
+//! lowest-index `max` tie-break, `:294`) and scoped dense SelectorMixin helpers
+//! are shipped and green-guarded.
 //!
-//! Two genuinely fixable validation-boundary divergences ARE pinned (failing,
-//! un-ignored): DIV-A (`n_features_to_select == n_features`) and DIV-B
-//! (`ensure_min_features=2`).
+//! Two validation-boundary divergences are now fixed and pinned green: DIV-A
+//! (`n_features_to_select == n_features`) and DIV-B (`ensure_min_features=2`).
 //!
 //! All expected values are derived from the LIVE sklearn 1.5.2 oracle, run from
 //! `/tmp` (R-CHAR-3), or from the algorithm-of-record documented at
