@@ -81,6 +81,7 @@
 
 pub mod classification;
 pub mod clustering;
+pub mod display;
 pub mod pairwise;
 pub mod ranking;
 pub mod regression;
@@ -104,6 +105,10 @@ pub use clustering::{
     fowlkes_mallows_score, homogeneity_completeness_v_measure, homogeneity_score,
     mutual_info_score, normalized_mutual_info_score, pair_confusion_matrix, rand_score,
     silhouette_samples, silhouette_score, v_measure_score,
+};
+pub use display::{
+    ConfusionMatrixDisplay, DetCurveDisplay, PrecisionRecallDisplay, PredictionErrorDisplay,
+    PredictionErrorKind, RocCurveDisplay,
 };
 pub use pairwise::{
     DISTANCE_METRIC_NAMES, DistanceMetric, KERNEL_METRIC_NAMES, Metric, PairwiseKernel,

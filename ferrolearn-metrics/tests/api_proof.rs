@@ -10,11 +10,17 @@ use ferrolearn_metrics::{
     // Classification
     Average,
     ClassLikelihoodUndefined,
+    ConfusionMatrixDisplay,
+    DetCurveDisplay,
     // Pairwise
     Metric,
     // Clustering
     NmiMethod,
     PairwiseKernel,
+    PrecisionRecallDisplay,
+    PredictionErrorDisplay,
+    PredictionErrorKind,
+    RocCurveDisplay,
     // Scorer
     Scorer,
     accuracy_score,
@@ -210,6 +216,49 @@ fn api_proof_classification_binary_scores() {
     let proba = Array2::<f64>::from_shape_vec((3, 2), vec![0.9, 0.1, 0.2, 0.8, 0.4, 0.6]).unwrap();
     let _ = log_loss(&y_lab, &proba).unwrap();
     let _ = top_k_accuracy_score(&y_lab, &proba, 1).unwrap();
+}
+
+#[test]
+fn api_proof_metric_displays() {
+    let y_true = array![0usize, 0, 1, 1];
+    let y_pred = array![0usize, 1, 1, 1];
+    let y_score = array![0.1_f64, 0.4, 0.35, 0.8];
+
+    let cm_display = ConfusionMatrixDisplay::from_predictions(&y_true, &y_pred).unwrap();
+    assert_eq!(cm_display.confusion_matrix.dim(), (2, 2));
+    assert_eq!(cm_display.display_labels.len(), 2);
+
+    let roc_display: RocCurveDisplay<f64> =
+        RocCurveDisplay::from_predictions(&y_true, &y_score).unwrap();
+    assert_eq!(roc_display.fpr.len(), roc_display.tpr.len());
+    assert!(roc_display.roc_auc.is_some());
+
+    let pr_display: PrecisionRecallDisplay<f64> =
+        PrecisionRecallDisplay::from_predictions(&y_true, &y_score).unwrap();
+    assert_eq!(pr_display.precision.len(), pr_display.recall.len());
+    assert!(pr_display.average_precision.is_some());
+
+    let det_display: DetCurveDisplay<f64> =
+        DetCurveDisplay::from_predictions(&y_true, &y_score).unwrap();
+    assert_eq!(det_display.fpr.len(), det_display.fnr.len());
+
+    let yt = array![3.0, -0.5, 2.0];
+    let yp = array![2.5, 0.0, 2.1];
+    let pred_display =
+        PredictionErrorDisplay::from_predictions(&yt, &yp, PredictionErrorKind::ActualVsPredicted)
+            .unwrap();
+    let (x, y) = pred_display.plot_data();
+    assert_eq!(x, &pred_display.y_true);
+    assert_eq!(y, &pred_display.y_pred);
+
+    let residual_display = PredictionErrorDisplay::from_predictions(
+        &yt,
+        &yp,
+        PredictionErrorKind::ResidualVsPredicted,
+    )
+    .unwrap();
+    let (_, residuals) = residual_display.plot_data();
+    assert_eq!(residuals, &residual_display.residuals);
 }
 
 // =============================================================================

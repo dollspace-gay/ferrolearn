@@ -14,6 +14,11 @@ phase = "metrics"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_metrics::ConfusionMatrixDisplay"
+phase = "metrics"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_metrics::confusion_matrix_at_thresholds"
 phase = "metrics"
 fixture = ""
@@ -25,6 +30,11 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_metrics::DistanceMetric"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::DetCurveDisplay"
 phase = "metrics"
 fixture = ""
 
@@ -45,6 +55,26 @@ fixture = ""
 
 [[item]]
 path = "ferrolearn_metrics::PairwiseKernel"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::PrecisionRecallDisplay"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::PredictionErrorDisplay"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::PredictionErrorKind"
+phase = "metrics"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_metrics::RocCurveDisplay"
 phase = "metrics"
 fixture = ""
 
