@@ -19,8 +19,9 @@ use ferrolearn_preprocess::{
     RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
     SelectorMixin, SequentialFeatureSelector, SimpleImputer, SparseRandomProjection,
     SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer, TfidfVectorizer,
-    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, make_column_selector,
-    make_column_transformer, maxabs_scale, minmax_scale, power_transform, r_regression,
+    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, grid_to_graph,
+    img_to_graph, make_column_selector, make_column_transformer, maxabs_scale, minmax_scale,
+    power_transform, r_regression,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -100,6 +101,10 @@ fn api_proof_feature_engineering() {
     let _ = FunctionTransformer::<f64>::new(|v: f64| v * 2.0)
         .transform(&x)
         .unwrap();
+
+    let image = array![[0.0_f64, 0.0], [0.0, 1.0]];
+    assert_eq!(grid_to_graph::<f64>(2, 2, 1, None).unwrap().dim(), (4, 4));
+    assert_eq!(img_to_graph(&image, None).unwrap().dim(), (4, 4));
 }
 
 #[test]

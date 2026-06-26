@@ -8,6 +8,7 @@
 //!   * `sklearn.preprocessing`        (`preprocessing/__init__.py:30-60` `__all__`)
 //!   * `sklearn.feature_selection`    (`feature_selection/__init__.py:27-47` `__all__`)
 //!   * `sklearn.feature_extraction.text` (`text.py:34-43`)
+//!   * `sklearn.feature_extraction.image` (`image.py:23-26` scoped subset)
 //!   * `sklearn.impute`               (`impute/__init__.py:13` `__all__`)
 //!   * `sklearn.random_projection`    (`random_projection.py:50-54` `__all__`)
 //!   * `sklearn.compose`              (`compose/__init__.py:15-20` `__all__`)
@@ -15,7 +16,7 @@
 //! Mirrors the bayes/lib precedent (`ferrolearn-bayes/tests/divergence_lib.rs`,
 //! `api_proof` pattern): this file PINS the public surface. The single
 //! `use ferrolearn_preprocess::{...}` block below names every re-exported item
-//! the design doc claims PRESENT. If any re-export at `lib.rs:132-202` is ever
+//! the design doc claims PRESENT. If any re-export at `lib.rs:132-204` is ever
 //! removed or renamed, this test file fails to COMPILE — that compile failure is
 //! the boundary's regression guard (AC-1: every name in the `pub use` block
 //! resolves to an existing type/function).
@@ -29,7 +30,7 @@
 //! `.design/preprocess/lib.md` Probes), not transcribed from the ferrolearn side.
 
 // The compile-time boundary guard. Every name here is a re-export at
-// `ferrolearn-preprocess/src/lib.rs:132-202`. Removal => unresolved import =>
+// `ferrolearn-preprocess/src/lib.rs:132-204`. Removal => unresolved import =>
 // this crate's test build fails. This is intentional and load-bearing.
 use ferrolearn_preprocess::{
     // supporting enums for the preprocessing estimators
@@ -142,6 +143,8 @@ use ferrolearn_preprocess::{
     compute_scores_regression,
     f_classif,
     f_regression,
+    grid_to_graph,
+    img_to_graph,
     make_column_selector,
     make_column_transformer,
     maxabs_scale,
@@ -163,19 +166,21 @@ fn name_type<T>() {}
 ///   * `sklearn/preprocessing/__init__.py:30-60` (`__all__`)
 ///   * `sklearn/feature_selection/__init__.py:27-47` (`__all__`)
 ///   * `sklearn/feature_extraction/text.py:34-43`
+///   * `sklearn/feature_extraction/image.py:23-26` (scoped subset)
 ///   * `sklearn/impute/__init__.py:13` (`__all__`)
 ///   * `sklearn/random_projection.py:50-54` (`__all__`)
 ///   * `sklearn/compose/__init__.py:15-20` (`__all__`)
 ///
 /// Each re-exported estimator surfaced at `ferrolearn-preprocess/src/lib.rs`
-/// (`:132-202`) is named below. If any `pub use` is removed/renamed the `use`
+/// (`:132-204`) is named below. If any `pub use` is removed/renamed the `use`
 /// block above + the references here fail to compile, pinning the regression.
 ///
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`mutual_info_*`,
 /// `f_oneway`,
 /// `johnson_lindenstrauss_min_dim`,
-/// `TransformedTargetRegressor`, `HashingVectorizer`) are
+/// `TransformedTargetRegressor`, `HashingVectorizer`, `PatchExtractor`,
+/// `extract_patches_2d`, `reconstruct_from_patches_2d`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
 #[allow(
     clippy::assertions_on_constants,
@@ -277,6 +282,10 @@ fn boundary_integrity_six_module_all_surface() {
     name_type::<FittedTfidfTransformer<f64>>();
     name_type::<TfidfVectorizer>();
     name_type::<FittedTfidfVectorizer>();
+
+    // --- feature_extraction.image (scoped dense helper subset) ---
+    let _grid_to_graph = grid_to_graph::<f64>;
+    let _img_to_graph = img_to_graph::<f64>;
 
     // --- impute (IterativeImputer is experimental in sklearn 1.5.2) ---
     name_type::<SimpleImputer<f64>>();
