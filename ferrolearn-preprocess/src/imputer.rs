@@ -29,7 +29,7 @@
 //! | REQ-3 | Error/parameter contracts (n_samples==0, transform ncols, unfitted) | SHIPPED (scoped) | [`SimpleImputer::fit`]/[`FittedSimpleImputer`] `transform`; in-module + divergence error tests |
 //! | REQ-4 | `keep_empty_features` param (True → fill 0 + keep all-NaN cols) | NOT-STARTED | always drops; sklearn `_base.py:583,501` — blocker #1365 |
 //! | REQ-5 | `missing_values` param (non-NaN sentinel / None / str) | NOT-STARTED | NaN-only; sklearn `_base.py:161,288` — blocker #1366 |
-//! | REQ-6 | `add_indicator` + `MissingIndicator` estimator (route parity_op, ABSENT) | NOT-STARTED | needs acto-builder; sklearn `_base.py:205` + `MissingIndicator` — blocker #1367 |
+//! | REQ-6 | Standalone `MissingIndicator`; `SimpleImputer(add_indicator=True)` | SHIPPED for standalone dense NaN indicator; NOT-STARTED for `add_indicator` | [`MissingIndicator`] supports dense `features="missing-only"`/`"all"` and `error_on_new`; `SimpleImputer` still has no `add_indicator`/mask concatenation — blocker #1367 |
 //! | REQ-7 | `inverse_transform` (requires add_indicator) | NOT-STARTED | sklearn `_base.py:641` — blocker #1368 |
 //! | REQ-8 | `fill_value=None`→0 default + `statistics_` attr name + `copy` param | NOT-STARTED | `Constant(F)` explicit; sklearn `_base.py:425-427,223,288` — blocker #1369 |
 //! | REQ-9 | string/object dtype (most_frequent/constant on non-numeric) | NOT-STARTED | `F: Float` only; sklearn `_base.py:42-52,526` — blocker #1370 |
@@ -37,6 +37,8 @@
 //! | REQ-11 | `get_feature_names_out` + `n_features_in_`/`feature_names_in_` | NOT-STARTED | `_BaseImputer` — blocker #1372 |
 //! | REQ-12 | PyO3 binding | NOT-STARTED | no `ferrolearn-python` registration — blocker #1373 |
 //! | REQ-13 | ferray substrate | NOT-STARTED | dense `Array2` + `num_traits::Float` only — blocker #1374 |
+
+use std::marker::PhantomData;
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::pipeline::{FittedPipelineTransformer, PipelineTransformer};
@@ -145,6 +147,131 @@ impl<F: Float + Send + Sync + 'static> FittedSimpleImputer<F> {
     pub fn kept_indices(&self) -> &[usize] {
         &self.kept_indices
     }
+}
+
+// ---------------------------------------------------------------------------
+// MissingIndicator
+// ---------------------------------------------------------------------------
+
+/// Which features a [`MissingIndicator`] should emit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingIndicatorFeatures {
+    /// Emit only columns that had missing values during fitting.
+    MissingOnly,
+    /// Emit one indicator column for every input feature.
+    All,
+}
+
+/// Binary missing-value indicator for dense numeric data.
+///
+/// This is the dense, NaN-only Rust analog of
+/// `sklearn.impute.MissingIndicator`. By default it emits only the features
+/// that contained missing values during fitting and errors if transform data
+/// introduces missing values in a previously complete feature.
+#[derive(Debug, Clone)]
+pub struct MissingIndicator<F> {
+    features: MissingIndicatorFeatures,
+    error_on_new: bool,
+    _marker: PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> MissingIndicator<F> {
+    /// Create a new missing indicator.
+    ///
+    /// Defaults mirror sklearn's common dense settings:
+    /// `features="missing-only"` and `error_on_new=true`. ferrolearn supports
+    /// only NaN as the missing sentinel and always returns a dense boolean
+    /// matrix.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            features: MissingIndicatorFeatures::MissingOnly,
+            error_on_new: true,
+            _marker: PhantomData,
+        }
+    }
+
+    /// Emit indicators for every input feature.
+    #[must_use]
+    pub fn with_all_features(mut self) -> Self {
+        self.features = MissingIndicatorFeatures::All;
+        self
+    }
+
+    /// Emit indicators only for features that were missing during fit.
+    #[must_use]
+    pub fn with_missing_only_features(mut self) -> Self {
+        self.features = MissingIndicatorFeatures::MissingOnly;
+        self
+    }
+
+    /// Configure whether transform should error on new missing features.
+    ///
+    /// This applies only when [`MissingIndicatorFeatures::MissingOnly`] is
+    /// active, matching sklearn's `error_on_new` behavior.
+    #[must_use]
+    pub fn with_error_on_new(mut self, error_on_new: bool) -> Self {
+        self.error_on_new = error_on_new;
+        self
+    }
+
+    /// Return the configured feature mode.
+    #[must_use]
+    pub fn feature_mode(&self) -> MissingIndicatorFeatures {
+        self.features
+    }
+
+    /// Return whether transform errors on new missing features.
+    #[must_use]
+    pub fn error_on_new(&self) -> bool {
+        self.error_on_new
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Default for MissingIndicator<F> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A fitted missing-value indicator.
+#[derive(Debug, Clone)]
+pub struct FittedMissingIndicator<F> {
+    features: MissingIndicatorFeatures,
+    features_: Vec<usize>,
+    n_features_in_: usize,
+    error_on_new: bool,
+    _marker: PhantomData<F>,
+}
+
+impl<F: Float + Send + Sync + 'static> FittedMissingIndicator<F> {
+    /// Return the feature indices emitted by [`Transform::transform`].
+    ///
+    /// Mirrors sklearn's `features_` attribute.
+    #[must_use]
+    pub fn features_(&self) -> &[usize] {
+        &self.features_
+    }
+
+    /// Return the number of input features seen during fit.
+    ///
+    /// Mirrors sklearn's `n_features_in_` attribute.
+    #[must_use]
+    pub fn n_features_in_(&self) -> usize {
+        self.n_features_in_
+    }
+
+    /// Return the feature mode used by the fitted indicator.
+    #[must_use]
+    pub fn feature_mode(&self) -> MissingIndicatorFeatures {
+        self.features
+    }
+}
+
+fn missing_feature_indices<F: Float>(x: &Array2<F>) -> Vec<usize> {
+    (0..x.ncols())
+        .filter(|&j| x.column(j).iter().any(|v| v.is_nan()))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -425,6 +552,109 @@ impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for SimpleImputer
     ///
     /// Returns an error if fitting fails (e.g. zero rows).
     fn fit_transform(&self, x: &Array2<F>) -> Result<Array2<F>, FerroError> {
+        let fitted = self.fit(x, &())?;
+        fitted.transform(x)
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Fit<Array2<F>, ()> for MissingIndicator<F> {
+    type Fitted = FittedMissingIndicator<F>;
+    type Error = FerroError;
+
+    /// Fit the indicator by recording which features contain NaN values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::InsufficientSamples`] if the input has zero rows.
+    fn fit(&self, x: &Array2<F>, _y: &()) -> Result<FittedMissingIndicator<F>, FerroError> {
+        if x.nrows() == 0 {
+            return Err(FerroError::InsufficientSamples {
+                required: 1,
+                actual: 0,
+                context: "MissingIndicator::fit".into(),
+            });
+        }
+
+        let features_ = match self.features {
+            MissingIndicatorFeatures::MissingOnly => missing_feature_indices(x),
+            MissingIndicatorFeatures::All => (0..x.ncols()).collect(),
+        };
+
+        Ok(FittedMissingIndicator {
+            features: self.features,
+            features_,
+            n_features_in_: x.ncols(),
+            error_on_new: self.error_on_new,
+            _marker: PhantomData,
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for FittedMissingIndicator<F> {
+    type Output = Array2<bool>;
+    type Error = FerroError;
+
+    /// Generate a boolean missing-value mask for the configured features.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FerroError::ShapeMismatch`] when the number of input columns
+    /// differs from fit time. Returns [`FerroError::InvalidParameter`] when
+    /// `error_on_new` is enabled and transform data has missing values in
+    /// features that were complete during fit.
+    fn transform(&self, x: &Array2<F>) -> Result<Array2<bool>, FerroError> {
+        if x.ncols() != self.n_features_in_ {
+            return Err(FerroError::ShapeMismatch {
+                expected: vec![x.nrows(), self.n_features_in_],
+                actual: vec![x.nrows(), x.ncols()],
+                context: "FittedMissingIndicator::transform".into(),
+            });
+        }
+
+        if self.features == MissingIndicatorFeatures::MissingOnly && self.error_on_new {
+            let fitted: std::collections::HashSet<usize> = self.features_.iter().copied().collect();
+            let new_missing: Vec<usize> = missing_feature_indices(x)
+                .into_iter()
+                .filter(|j| !fitted.contains(j))
+                .collect();
+            if !new_missing.is_empty() {
+                return Err(FerroError::InvalidParameter {
+                    name: "error_on_new".into(),
+                    reason: format!(
+                        "features {new_missing:?} have missing values in transform but not in fit"
+                    ),
+                });
+            }
+        }
+
+        let mut out = Array2::from_elem((x.nrows(), self.features_.len()), false);
+        for (out_j, &in_j) in self.features_.iter().enumerate() {
+            for (row, &v) in x.column(in_j).iter().enumerate() {
+                out[[row, out_j]] = v.is_nan();
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// Implement `Transform` on the unfitted indicator to satisfy the
+/// `FitTransform: Transform` supertrait bound. Always returns an error.
+impl<F: Float + Send + Sync + 'static> Transform<Array2<F>> for MissingIndicator<F> {
+    type Output = Array2<bool>;
+    type Error = FerroError;
+
+    fn transform(&self, _x: &Array2<F>) -> Result<Array2<bool>, FerroError> {
+        Err(FerroError::InvalidParameter {
+            name: "MissingIndicator".into(),
+            reason: "indicator must be fitted before calling transform; use fit() first".into(),
+        })
+    }
+}
+
+impl<F: Float + Send + Sync + 'static> FitTransform<Array2<F>> for MissingIndicator<F> {
+    type FitError = FerroError;
+
+    fn fit_transform(&self, x: &Array2<F>) -> Result<Array2<bool>, FerroError> {
         let fitted = self.fit(x, &())?;
         fitted.transform(x)
     }

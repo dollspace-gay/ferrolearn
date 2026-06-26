@@ -12,12 +12,13 @@ use ferrolearn_preprocess::{
     BinEncoding, BinStrategy, Binarizer, BinaryEncoder, CountVectorizer, Direction,
     FunctionTransformer, GaussianRandomProjection, InitialStrategy, IterativeImputer,
     KBinsDiscretizer, KNNImputer, KNNWeights, KernelCenterer, KnotStrategy, LabelBinarizer,
-    LabelEncoder, MaxAbsScaler, MinMaxScaler, MultiLabelBinarizer, Normalizer, OneHotEncoder,
-    OrdinalEncoder, OutputDistribution, PolynomialFeatures, PowerTransformer, QuantileTransformer,
-    RobustScaler, ScoreFunc, SelectFdr, SelectFpr, SelectFwe, SelectKBest, SelectPercentile,
-    SequentialFeatureSelector, SimpleImputer, SparseRandomProjection, SplineTransformer,
-    StandardScaler, TargetEncoder, TfidfTransformer, VarianceThreshold, add_dummy_feature, chi2,
-    f_classif, f_regression, maxabs_scale, minmax_scale, power_transform,
+    LabelEncoder, MaxAbsScaler, MinMaxScaler, MissingIndicator, MissingIndicatorFeatures,
+    MultiLabelBinarizer, Normalizer, OneHotEncoder, OrdinalEncoder, OutputDistribution,
+    PolynomialFeatures, PowerTransformer, QuantileTransformer, RobustScaler, ScoreFunc, SelectFdr,
+    SelectFpr, SelectFwe, SelectKBest, SelectPercentile, SequentialFeatureSelector, SimpleImputer,
+    SparseRandomProjection, SplineTransformer, StandardScaler, TargetEncoder, TfidfTransformer,
+    VarianceThreshold, add_dummy_feature, chi2, f_classif, f_regression, maxabs_scale,
+    minmax_scale, power_transform,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -204,6 +205,16 @@ fn api_proof_imputers() {
             .fit_transform(&x_with_nan)
             .unwrap();
     }
+
+    let indicator = MissingIndicator::<f64>::new();
+    let fitted_indicator = indicator.fit(&x_with_nan, &()).unwrap();
+    assert_eq!(
+        fitted_indicator.feature_mode(),
+        MissingIndicatorFeatures::MissingOnly
+    );
+    let mask = fitted_indicator.transform(&x_with_nan).unwrap();
+    assert_eq!(mask.nrows(), x_with_nan.nrows());
+    assert_eq!(mask.ncols(), fitted_indicator.features_().len());
 
     for w in [KNNWeights::Uniform, KNNWeights::Distance] {
         let _ = KNNImputer::<f64>::new(2, w)

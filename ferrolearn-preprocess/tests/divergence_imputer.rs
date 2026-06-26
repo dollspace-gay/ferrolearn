@@ -14,7 +14,7 @@
 //! Tracking #1363, blocker #1364.
 
 use ferrolearn_core::traits::{Fit, FitTransform, Transform};
-use ferrolearn_preprocess::imputer::{ImputeStrategy, SimpleImputer};
+use ferrolearn_preprocess::imputer::{ImputeStrategy, MissingIndicator, SimpleImputer};
 use ndarray::{Array2, array};
 
 // ===========================================================================
@@ -340,6 +340,115 @@ fn green_unfitted_transform_errors() {
         imputer.transform(&x).is_err(),
         "unfitted transform must error"
     );
+}
+
+// ===========================================================================
+// GREEN-GUARD: MissingIndicator dense NaN mask (REQ-6 scoped)
+// ===========================================================================
+
+/// Green guard: default `MissingIndicator(features='missing-only')` emits only
+/// columns that had NaNs during fit, in ascending feature order.
+///
+/// Oracle (sklearn 1.5.2):
+/// `X=[[1,nan,3],[nan,nan,6],[7,8,9]]`
+/// -> `features_=[0,1]`,
+/// `transform(X)=[[False,True],[True,True],[False,False]]`.
+#[test]
+fn green_missing_indicator_missing_only_matches_sklearn() {
+    let x = array![
+        [1.0, f64::NAN, 3.0],
+        [f64::NAN, f64::NAN, 6.0],
+        [7.0, 8.0, 9.0]
+    ];
+    let indicator = MissingIndicator::<f64>::new();
+    let fitted = indicator.fit(&x, &()).unwrap();
+    assert_eq!(fitted.features_(), &[0usize, 1usize]);
+    assert_eq!(fitted.n_features_in_(), 3);
+
+    let mask = fitted.transform(&x).unwrap();
+    let expected = array![[false, true], [true, true], [false, false]];
+    assert_eq!(mask, expected);
+}
+
+/// Green guard: `features='all'` emits one boolean mask column per input
+/// feature, including features that were complete during fit.
+///
+/// Oracle (sklearn 1.5.2):
+/// `MissingIndicator(features='all').fit(X).features_ == [0,1,2]`.
+#[test]
+fn green_missing_indicator_all_features_matches_sklearn() {
+    let x = array![
+        [1.0, f64::NAN, 3.0],
+        [f64::NAN, f64::NAN, 6.0],
+        [7.0, 8.0, 9.0]
+    ];
+    let fitted = MissingIndicator::<f64>::new()
+        .with_all_features()
+        .fit(&x, &())
+        .unwrap();
+    assert_eq!(fitted.features_(), &[0usize, 1usize, 2usize]);
+
+    let mask = fitted.transform(&x).unwrap();
+    let expected = array![
+        [false, true, false],
+        [true, true, false],
+        [false, false, false]
+    ];
+    assert_eq!(mask, expected);
+}
+
+/// Green guard: no missing values at fit time yields a `(n_samples, 0)` mask
+/// under the default `features='missing-only'`.
+///
+/// Oracle (sklearn 1.5.2): `MissingIndicator().fit([[1,2],[3,4]])` has
+/// `features_=[]` and `transform(X).shape == (2, 0)`.
+#[test]
+fn green_missing_indicator_no_missing_zero_columns() {
+    let x = array![[1.0, 2.0], [3.0, 4.0]];
+    let fitted = MissingIndicator::<f64>::new().fit(&x, &()).unwrap();
+    assert!(fitted.features_().is_empty());
+    let mask = fitted.transform(&x).unwrap();
+    assert_eq!(mask.nrows(), 2);
+    assert_eq!(mask.ncols(), 0);
+}
+
+/// Green guard: default `error_on_new=True` errors when transform data has NaN
+/// in a feature that had no NaNs during fit. Disabling it mirrors sklearn by
+/// still returning only the fitted missing-only feature columns.
+#[test]
+fn green_missing_indicator_error_on_new_contract() {
+    let x_fit = array![[1.0, f64::NAN], [2.0, 3.0]];
+    let x_new = array![[f64::NAN, f64::NAN], [4.0, 5.0]];
+
+    let fitted = MissingIndicator::<f64>::new().fit(&x_fit, &()).unwrap();
+    assert!(
+        fitted.transform(&x_new).is_err(),
+        "default error_on_new must reject new missing feature 0"
+    );
+
+    let fitted = MissingIndicator::<f64>::new()
+        .with_error_on_new(false)
+        .fit(&x_fit, &())
+        .unwrap();
+    let mask = fitted.transform(&x_new).unwrap();
+    let expected = array![[true], [false]];
+    assert_eq!(
+        mask, expected,
+        "error_on_new=false keeps only fit-time missing feature 1"
+    );
+}
+
+/// Green guard: MissingIndicator enforces the same basic input validation shape
+/// contracts as the imputer.
+#[test]
+fn green_missing_indicator_error_contracts() {
+    let x_zero: Array2<f64> = Array2::zeros((0, 2));
+    assert!(MissingIndicator::<f64>::new().fit(&x_zero, &()).is_err());
+
+    let x = array![[1.0, f64::NAN], [2.0, 3.0]];
+    let fitted = MissingIndicator::<f64>::new().fit(&x, &()).unwrap();
+    let x_bad = array![[1.0, 2.0, 3.0]];
+    assert!(fitted.transform(&x_bad).is_err());
 }
 
 // ===========================================================================

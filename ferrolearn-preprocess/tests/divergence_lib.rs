@@ -60,6 +60,7 @@ use ferrolearn_preprocess::{
     FittedLabelEncoder,
     FittedMaxAbsScaler,
     FittedMinMaxScaler,
+    FittedMissingIndicator,
     FittedMultiLabelBinarizer,
     FittedOneHotEncoder,
     FittedOrdinalEncoder,
@@ -94,6 +95,8 @@ use ferrolearn_preprocess::{
     LabelEncoder,
     MaxAbsScaler,
     MinMaxScaler,
+    MissingIndicator,
+    MissingIndicatorFeatures,
     MultiLabelBinarizer,
     Normalizer,
     OneHotEncoder,
@@ -161,7 +164,7 @@ fn name_type<T>() {}
 /// PRESENT/ABSENT accounting verified against the live sklearn 1.5.2 `__all__`
 /// (R-CHAR-3); ABSENT names (`GenericUnivariateSelect`,
 /// `mutual_info_*`, `r_regression`,
-/// `f_oneway`, `SelectorMixin`, `MissingIndicator`,
+/// `f_oneway`, `SelectorMixin`,
 /// `johnson_lindenstrauss_min_dim`, `make_column_selector`,
 /// `TransformedTargetRegressor`, `HashingVectorizer`, `TfidfVectorizer`) are
 /// deliberately NOT named here — the boundary ships exactly what is implemented.
@@ -260,6 +263,9 @@ fn boundary_integrity_six_module_all_surface() {
     // --- impute (IterativeImputer is experimental in sklearn 1.5.2) ---
     name_type::<SimpleImputer<f64>>();
     name_type::<FittedSimpleImputer<f64>>();
+    name_type::<MissingIndicator<f64>>();
+    name_type::<FittedMissingIndicator<f64>>();
+    name_type::<MissingIndicatorFeatures>();
     name_type::<KNNImputer<f64>>();
     name_type::<FittedKNNImputer<f64>>();
     name_type::<IterativeImputer<f64>>();

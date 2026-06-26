@@ -254,6 +254,21 @@ phase = "preprocess"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_preprocess::MissingIndicator"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::FittedMissingIndicator"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
+path = "ferrolearn_preprocess::MissingIndicatorFeatures"
+phase = "preprocess"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_preprocess::MinMaxScaler"
 phase = "preprocess"
 fixture = ""
@@ -397,4 +412,3 @@ fixture = ""
 path = "ferrolearn_preprocess::VarianceThreshold"
 phase = "preprocess"
 fixture = ""
-

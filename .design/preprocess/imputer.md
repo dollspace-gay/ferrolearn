@@ -32,7 +32,10 @@ produces `FittedSimpleImputer<F> { fill_values: Array1<F>, kept_indices: Vec<usi
 computes the chosen statistic (`Mean` = `sum/n`, `Median` = `median_of`,
 `MostFrequent` = `most_frequent_of` with tie → smallest, `Constant(c)` = `c`), and
 `Transform::transform` (`transform in imputer.rs`) substitutes `fill_values[j]` for
-every NaN in column `j`.
+every NaN in column `j`. The same module now also ships a standalone dense
+`MissingIndicator<F>` with sklearn's default `features="missing-only"` behavior,
+an `all`-features mode, `error_on_new`, `features_`, and `n_features_in_` over
+NaN-missing numeric arrays.
 
 The former HEADLINE divergence DIV-1 (#1364) is now **RESOLVED**: for a column
 that is entirely NaN at fit time under `Mean`/`Median`/`MostFrequent`, ferrolearn
@@ -41,19 +44,19 @@ now mirrors sklearn's DEFAULT (`keep_empty_features=False`) by setting
 `kept_indices`, and **DROPPING** that column at `transform`
 (`:501,510-512,534-537,586-603`); under `Constant`, every column (including
 all-NaN ones) is KEPT and filled with the user constant (`:545,583`). Beyond the
-now-resolved DIV-1, ferrolearn still has **no `MissingIndicator`, no
-`inverse_transform`, no `add_indicator`, no `missing_values` param (NaN-only), no
-`keep_empty_features` param, no `statistics_` attribute name, no `fill_value=None`
-numeric default / `copy` param, no string/object dtype, no sparse `_sparse_fit`, no
-`get_feature_names_out` / `n_features_in_`, and no PyO3 binding**. This is a
-**shipped-partial** unit: **3 SHIPPED** (REQ-1 fill values for columns with ≥1
-observed value, REQ-2 the all-NaN-column default-DROP, REQ-3 scoped error /
-parameter contracts) / **10 NOT-STARTED** (REQ-4 `keep_empty_features`, REQ-5
-`missing_values`, REQ-6 `add_indicator` + `MissingIndicator`, REQ-7
+now-resolved DIV-1, ferrolearn still has **no `SimpleImputer(add_indicator=True)`
+concatenation, no `inverse_transform`, no configurable `missing_values` param
+(NaN-only), no `keep_empty_features` param, no `statistics_` attribute name, no
+`fill_value=None` numeric default / `copy` param, no string/object dtype, no sparse
+`_sparse_fit`, incomplete `get_feature_names_out` / feature-name plumbing, and no
+PyO3 binding**. This is a **shipped-partial** unit: shipped facets are REQ-1 fill
+values for columns with ≥1 observed value, REQ-2 the all-NaN-column default-DROP,
+REQ-3 scoped error / parameter contracts, and REQ-6 standalone dense
+`MissingIndicator`. Remaining NOT-STARTED facets are REQ-4 `keep_empty_features`,
+REQ-5 `missing_values`, REQ-6 `SimpleImputer(add_indicator=True)`, REQ-7
 `inverse_transform`, REQ-8 `fill_value=None` default + `statistics_` name + `copy`,
-REQ-9 string/object dtype, REQ-10 sparse `_sparse_fit`, REQ-11
-`get_feature_names_out` / feature-name introspection, REQ-12 PyO3, REQ-13 ferray
-substrate).
+REQ-9 string/object dtype, REQ-10 sparse `_sparse_fit`, REQ-11 full feature-name
+plumbing, REQ-12 PyO3, and REQ-13 ferray substrate.
 
 ## Probes (live sklearn oracle, 1.5.2)
 
@@ -194,18 +197,24 @@ print('constant fill_value=None =',SimpleImputer(strategy='constant').fit(np.arr
   matches against it. ferrolearn detects missingness **only** via `v.is_nan()`
   (`fit`/`transform in imputer.rs`) — no configurable sentinel. Open prereq blocker #1366.
 
-- REQ-6: **`add_indicator` + `MissingIndicator` estimator** (NOT-STARTED, route
-  parity_op). sklearn's `add_indicator=False` (`:295`) appends a binary
-  missing-mask via `_BaseImputer._fit_indicator` / `_concatenate_indicator`
-  (`:485,637-639`), backed by the separate `MissingIndicator` class
-  (`features="missing-only"|"all"`). ferrolearn has **no `MissingIndicator` and no
-  `add_indicator`** — this estimator is ABSENT and requires acto-builder in a
-  separate iteration. Open prereq blocker #1367.
+- REQ-6: **Standalone `MissingIndicator` + `add_indicator` integration** (SHIPPED
+  for standalone dense NaN indicator; NOT-STARTED for
+  `SimpleImputer(add_indicator=True)`). sklearn's `MissingIndicator` class
+  (`:787`) emits a boolean mask for either `features="missing-only"` or
+  `features="all"`, stores `features_`, validates `n_features_in_`, and can
+  reject new missing features at transform when `error_on_new=True`. ferrolearn
+  now mirrors that dense numeric, NaN-only standalone estimator via
+  `MissingIndicator<F>` / `FittedMissingIndicator<F>`. sklearn's
+  `SimpleImputer(add_indicator=True)` (`:295`) still appends a binary missing-mask
+  via `_BaseImputer._fit_indicator` / `_concatenate_indicator` (`:485,637-639`);
+  ferrolearn has **no `add_indicator` concatenation path**. Open prereq blocker
+  #1367 remains for the integration facet.
 
 - REQ-7: **`inverse_transform`** (NOT-STARTED). sklearn's `SimpleImputer.inverse_transform`
   (`:641`) reverses `transform` for rows recoverable via the `add_indicator` mask.
-  ferrolearn exposes **no `inverse_transform`** (and, lacking `add_indicator`, has
-  no mask to invert against). Open prereq blocker #1368.
+  ferrolearn exposes **no `inverse_transform`** and the standalone
+  `MissingIndicator` is not yet wired into `SimpleImputer(add_indicator=True)`.
+  Open prereq blocker #1368.
 
 - REQ-8: **`fill_value=None` numeric default + `statistics_` attribute name +
   `copy` param** (NOT-STARTED). sklearn's `fill_value=None` resolves to `0` for
@@ -282,9 +291,12 @@ print('constant fill_value=None =',SimpleImputer(strategy='constant').fit(np.arr
 - AC-5 (REQ-5): `SimpleImputer(missing_values=-1).fit_transform([[−1, 2],[3, −1]])`
   treats `-1` as missing (`_get_mask`, `:491`); ferrolearn detects only `NaN`.
 
-- AC-6 (REQ-6): `SimpleImputer(add_indicator=True)` appends a binary
-  `MissingIndicator` mask (`:637-639`); ferrolearn has neither the param nor the
-  estimator.
+- AC-6 (REQ-6): `MissingIndicator().fit(X).features_` and `transform(X)` match
+  sklearn's dense NaN mask for `features='missing-only'`; `features='all'` emits
+  every feature; no-missing fit yields `(n_samples, 0)` under the default; default
+  `error_on_new=True` rejects newly-missing features. Pinned by
+  `green_missing_indicator_*` tests. `SimpleImputer(add_indicator=True)` still
+  does not append that mask.
 
 - AC-7 (REQ-7): `imp.inverse_transform(imp.transform(X))` recovers missing positions
   via the indicator (`:641`); ferrolearn has no `inverse_transform`.
@@ -321,8 +333,8 @@ print('constant fill_value=None =',SimpleImputer(strategy='constant').fit(np.arr
 | REQ-3 (error / parameter contracts, scoped) | SHIPPED (scoped) | impl `fn fit in imputer.rs` returns `Err(FerroError::InsufficientSamples { required: 1, actual: 0, context: "SimpleImputer::fit".into() })` when `n_samples == 0`; impl `fn transform in imputer.rs` returns `Err(FerroError::ShapeMismatch { expected: vec![x.nrows(), n_features], actual: vec![x.nrows(), x.ncols()], context: "FittedSimpleImputer::transform".into() })` when `x.ncols() != n_features` (mirroring `transform`'s `X.shape[1] != statistics_.shape[0]` ValueError `_base.py:573-577`); impl `Transform for SimpleImputer in imputer.rs` (the unfitted handle) returns `Err(FerroError::InvalidParameter { name: "SimpleImputer".into(), reason: "imputer must be fitted before calling transform; use fit() first".into() })` (mirroring `check_is_fitted` `:568`). Non-test consumer: the boundary re-export at `lib.rs:136` routes every fit/transform through these guards. Verification: `cargo test -p ferrolearn-preprocess imputer` → `test_fit_zero_rows_error`, `test_transform_shape_mismatch_error`, `test_unfitted_transform_error` green. |
 | REQ-4 (`keep_empty_features` param) | NOT-STARTED | open prereq blocker #1365. `SimpleImputer<F> { strategy }` has NO `keep_empty_features` field. sklearn's ctor accepts `keep_empty_features=False` (`_base.py:296`); when `True`, all-NaN cols are filled with `0` and KEPT (`_dense_fit:501,510-512,534-537`; `transform:583-585`). ferrolearn hardwires the `keep_empty_features=False` default drop (REQ-2) and cannot toggle to the keep-and-fill-0 behavior (Probe 2). |
 | REQ-5 (`missing_values` param: non-NaN sentinel / None / str) | NOT-STARTED | open prereq blocker #1366. Missingness is detected ONLY via `v.is_nan()` (`fn fit` / `fn transform in imputer.rs`). sklearn's ctor accepts `missing_values=np.nan` (`_base.py:291`) and matches any scalar sentinel via `missing_mask = _get_mask(X, missing_values)` (`_dense_fit:491`, `transform:580`) — ferrolearn has no configurable sentinel. |
-| REQ-6 (`add_indicator` + `MissingIndicator` estimator) | NOT-STARTED | open prereq blocker #1367. There is NO `MissingIndicator` type and NO `add_indicator` param in `imputer.rs`. sklearn's `add_indicator=False` (`_base.py:295`) appends a binary missing-mask via `_BaseImputer._fit_indicator` / `_concatenate_indicator` (`:485,637-639`), backed by the separate `MissingIndicator` class (`features="missing-only"\|"all"`). This route parity_op is ABSENT and needs acto-builder in a separate iteration. |
-| REQ-7 (`inverse_transform`) | NOT-STARTED | open prereq blocker #1368. `FittedSimpleImputer<F>` exposes only `fill_values()` and a `Transform` impl — NO `inverse_transform`. sklearn's `SimpleImputer.inverse_transform` (`_base.py:641`) reverses `transform` using the `add_indicator` mask; ferrolearn lacks both the method and (REQ-6) the indicator to invert against. |
+| REQ-6 (standalone `MissingIndicator`; `add_indicator`) | SHIPPED for standalone dense NaN indicator; NOT-STARTED for `add_indicator` | `MissingIndicator<F>` / `FittedMissingIndicator<F>` support sklearn's dense numeric, NaN-only `features="missing-only"` default, `features="all"` via `with_all_features`, `error_on_new`, `features_()`, and `n_features_in_()`. Verification: `green_missing_indicator_missing_only_matches_sklearn`, `green_missing_indicator_all_features_matches_sklearn`, `green_missing_indicator_no_missing_zero_columns`, `green_missing_indicator_error_on_new_contract`, `green_missing_indicator_error_contracts`. Open blocker #1367 remains for `SimpleImputer(add_indicator=True)` mask concatenation (`_base.py:295,485,637-639`). |
+| REQ-7 (`inverse_transform`) | NOT-STARTED | open prereq blocker #1368. `FittedSimpleImputer<F>` exposes only `fill_values()` and a `Transform` impl — NO `inverse_transform`. sklearn's `SimpleImputer.inverse_transform` (`_base.py:641`) reverses `transform` using the `add_indicator` mask; ferrolearn lacks both the method and the `SimpleImputer(add_indicator=True)` integration path. |
 | REQ-8 (`fill_value=None` numeric default + `statistics_` name + `copy`) | NOT-STARTED | open prereq blocker #1369. `ImputeStrategy::Constant(F)` requires an explicit `F` (no `None`-default-to-0), the fitted accessor is `fill_values()` (NOT `statistics_`), and `fn transform in imputer.rs` always copies (`let mut out = x.to_owned()`) with no `copy` toggle. sklearn's `fill_value=None` → `0` for numeric (`_base.py:425-427`, Probe 7), stores results in `statistics_`, and `copy=True` (`:294`) governs in-place transform. |
 | REQ-9 (string / object dtype) | NOT-STARTED | open prereq blocker #1370. `SimpleImputer<F>` is bounded `F: Float + Send + Sync + 'static` — numeric only. sklearn supports `strategy='most_frequent'` / `'constant'` on object/string arrays (the object branch of `_most_frequent` Counter + `min` tie-break `_base.py:42-52`; `np.full(fill_value)` with a string `:545`). |
 | REQ-10 (sparse `_sparse_fit`) | NOT-STARTED | open prereq blocker #1371. `Fit<Array2<F>, ()>` and `Transform<Array2<F>>` operate only on dense `ndarray::Array2<F>`. sklearn dispatches sparse input to `_sparse_fit` (`_base.py:444`) and imputes over `X.data` (`transform:606-624`); ferrolearn has no sparse path. |
@@ -356,8 +368,18 @@ X[:, valid_statistics_indexes]`). The unfitted `Transform for SimpleImputer` is 
 error stub (`InvalidParameter`) satisfying the `FitTransform: Transform` supertrait;
 `FitTransform`, `PipelineTransformer`, and `FittedPipelineTransformer` wrap the
 fit/transform path. The grandfathered boundary re-export at `lib.rs:136` (`pub use
-imputer::{FittedSimpleImputer, ImputeStrategy, SimpleImputer}`) is the non-test
-production consumer that pins REQ-1 / REQ-2 / REQ-3 SHIPPED.
+imputer::{FittedMissingIndicator, FittedSimpleImputer, ImputeStrategy,
+MissingIndicator, MissingIndicatorFeatures, SimpleImputer}`) is the non-test
+production consumer that pins REQ-1 / REQ-2 / REQ-3 and the standalone
+MissingIndicator facet of REQ-6 SHIPPED.
+
+`MissingIndicator<F>` is a sibling dense transformer in the same module. It fits
+by recording either the columns that contained NaNs (`features="missing-only"`) or
+all input columns (`features="all"`), stores those indices in `features_`, stores
+the fit width as `n_features_in_`, and transforms by emitting a dense
+`Array2<bool>` mask. With the default `error_on_new=true`, transform rejects NaNs
+that appear in a previously complete column, matching sklearn's dense
+`MissingIndicator` contract.
 
 **sklearn (target contract).** `SimpleImputer(_BaseImputer)` (`_base.py:147`,
 `_BaseImputer:73`) takes `__init__(*, missing_values=np.nan, strategy="mean",
@@ -374,8 +396,9 @@ validates the column count (`:573-577`), and — unless `strategy == "constant"`
 `invalid_mask = _get_mask(statistics, np.nan)` / `X = X[:,
 valid_statistics_indexes]` with a warning (`:586-603`), then imputes the survivors
 (dense `:625-635`, sparse `:606-624`) and optionally concatenates the indicator
-(`:637-639`). `inverse_transform` (`:641`) and the `add_indicator` /
-`MissingIndicator` surface come from `_BaseImputer`.
+(`:637-639`). `inverse_transform` (`:641`) comes from `_BaseImputer`, while the
+standalone `MissingIndicator` class (`:787`) owns `features="missing-only"|"all"`,
+`error_on_new`, `features_`, and `n_features_in_`.
 
 **The gap.** ferrolearn matches sklearn on the *fill-value algebra for columns with
 at least one observed value* (mean / median / most-frequent-with-smallest-tie /
@@ -384,17 +407,18 @@ DIV-1, now RESOLVED via `kept_indices` projection + `fill_values[j]=NaN`, Probes
 1-3-6), and on the scoped structural contracts (zero-rows, column-count, unfitted —
 REQ-3). The remaining gaps are the surrounding `_BaseImputer` surface and
 configuration: no `keep_empty_features` toggle (REQ-4), no configurable
-`missing_values` sentinel (REQ-5, NaN-only), no `add_indicator` / `MissingIndicator`
-(REQ-6, the second route parity_op, ABSENT), no `inverse_transform` (REQ-7), no
+`missing_values` sentinel (REQ-5, NaN-only), no `SimpleImputer(add_indicator=True)`
+mask concatenation (REQ-6 integration facet), no `inverse_transform` (REQ-7), no
 `fill_value=None` default / `statistics_` name / `copy` (REQ-8), no string/object
-dtype (REQ-9), no sparse `_sparse_fit` (REQ-10), no feature-name introspection
+dtype (REQ-9), no sparse `_sparse_fit` (REQ-10), incomplete feature-name plumbing
 (REQ-11), no PyO3 binding (REQ-12), and the non-ferray substrate (REQ-13). This is
-a **shipped-partial** unit (3 SHIPPED / 10 NOT-STARTED).
+a **shipped-partial** unit.
 
 ## Verification
 
 Commands establishing the SHIPPED claims (REQ-1 fill values for columns with ≥1
-observed value, REQ-2 all-NaN-column default drop, REQ-3 scoped error contracts):
+observed value, REQ-2 all-NaN-column default drop, REQ-3 scoped error contracts,
+and the standalone MissingIndicator facet of REQ-6):
 
 ```bash
 # Consumer / module wiring check:
@@ -455,18 +479,21 @@ and REQ-3 (every error path — `test_fit_zero_rows_error`,
 `test_transform_shape_mismatch_error`, `test_unfitted_transform_error`). The 19-test
 `tests/divergence_imputer.rs` suite pins the REQ-2 default drop end-to-end against
 the live sklearn 1.5.2 oracle (column-order, all-dropped, MostFrequent, Constant
-keep+fill, `statistics_`-NaN, separate-matrix projection, f32). No green ferrolearn
-command establishes REQ-4..REQ-13 (`keep_empty_features`, `missing_values`,
-`add_indicator` / `MissingIndicator`, `inverse_transform`, `fill_value=None` /
-`statistics_` / `copy`, string dtype, sparse, feature-name introspection, PyO3,
-ferray).
+keep+fill, `statistics_`-NaN, separate-matrix projection, f32) and pins standalone
+`MissingIndicator` behavior (`missing-only`, `all`, zero-output no-missing,
+`error_on_new`, shape errors). No green ferrolearn command establishes the
+remaining REQ-4..REQ-13 facets (`keep_empty_features`, configurable
+`missing_values`, `SimpleImputer(add_indicator=True)`, `inverse_transform`,
+`fill_value=None` / `statistics_` / `copy`, string dtype, sparse, full feature-name
+plumbing, PyO3, ferray).
 
 ## Blockers
 
 REQ-1 (per-column fill values for columns with ≥1 observed value, HEADLINE), REQ-2
-(all-NaN-column default drop, formerly DIV-1), and REQ-3 (scoped error / parameter
-contracts) are SHIPPED, with the boundary re-export at `lib.rs:136` as the
-grandfathered (S5 / R-DEFER-1) non-test production consumer.
+(all-NaN-column default drop, formerly DIV-1), REQ-3 (scoped error / parameter
+contracts), and the standalone MissingIndicator facet of REQ-6 are SHIPPED, with
+the boundary re-export at `lib.rs:136` as the grandfathered (S5 / R-DEFER-1)
+non-test production consumer.
 
 DIV-1 / #1364 (REQ-2 all-NaN default drop) is **RESOLVED**: `fit` sets
 `fill_values[j]=NaN` + excludes `j` from `kept_indices`, `transform` projects onto
@@ -480,8 +507,8 @@ issue #1363:
   `transform:583-585`); ferrolearn hardwires the default drop.
 - #1366 — REQ-5: no configurable `missing_values` sentinel — NaN-only
   (`_base.py:291`, `_get_mask` `_dense_fit:491`, `transform:580`).
-- #1367 — REQ-6: no `add_indicator` / `MissingIndicator` (route parity_op, ABSENT;
-  `_base.py:295,485,637-639`, `MissingIndicator` class) — needs acto-builder.
+- #1367 — REQ-6: no `SimpleImputer(add_indicator=True)` mask concatenation
+  (`_base.py:295,485,637-639`). Standalone dense `MissingIndicator` is now shipped.
 - #1368 — REQ-7: no `inverse_transform` (`_base.py:641`).
 - #1369 — REQ-8: no `fill_value=None`→0 default, `statistics_` accessor name, or
   `copy` param (`_base.py:294,425-427`).

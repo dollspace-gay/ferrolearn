@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 92 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 91 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -61,7 +61,6 @@ public Rust surface after the alias normalization above.
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
 | `sklearn.cluster` | `SpectralBiclustering`, `SpectralCoclustering`, `cluster_optics_xi`, `compute_optics_graph`, `kmeans_plusplus`, `ward_tree` |
 | `sklearn.decomposition` | `MiniBatchDictionaryLearning`, `MiniBatchSparsePCA`, `SparseCoder`, `dict_learning`, `dict_learning_online`, `non_negative_factorization`, `sparse_encode` |
-| `sklearn.impute` | `MissingIndicator` |
 | `sklearn.feature_selection` | `GenericUnivariateSelect`, `SelectorMixin`, `mutual_info_classif`, `mutual_info_regression`, `r_regression` |
 | `sklearn.feature_extraction` | `DictVectorizer`, `FeatureHasher` |
 | `sklearn.feature_extraction.text` | `HashingVectorizer`, `TfidfVectorizer` |
@@ -79,7 +78,7 @@ public Rust surface after the alias normalization above.
 The following scoped modules had no exact public-item miss in this pass:
 `sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
 `sklearn.discriminant_analysis`, `sklearn.pipeline`, `sklearn.preprocessing`,
-`sklearn.random_projection`, `sklearn.semi_supervised`,
+`sklearn.impute`, `sklearn.random_projection`, `sklearn.semi_supervised`,
 `sklearn.metrics.pairwise`, `sklearn.kernel_ridge`, `sklearn.gaussian_process`,
 `sklearn.covariance`, `sklearn.neural_network`, `sklearn.dummy`,
 `sklearn.multiclass`, `sklearn.multioutput`, and `sklearn.isotonic`. This means
@@ -122,7 +121,7 @@ The source and tests document many narrower gaps. Important recurring themes:
 | Naive Bayes | All five estimator names exist, but base/discrete sklearn conveniences are incomplete: `coef_`/`intercept_` properties, shared `_count`/`_update_feature_log_prob` style internals, exact prior/alpha edge semantics, `sample_weight`, warning/error ABI, and some `partial_fit` edge contracts remain narrower than sklearn. |
 | Cluster / mixture / semi-supervised | Exact missing items include biclustering/coclustering and several standalone functions. Present estimators have documented non-parity around BIRCH's CF-tree splitting and online API, BisectingKMeans centers/inertia/label numbering/tree-descent prediction, KMeans/MiniBatchKMeans defaults and RNG/local-optimum details, BayesianGMM pruning, Agglomerative full dendrogram/label numbering, FeatureAgglomeration inverse-transform shape behavior, HDBSCAN/OPTICS boundary precision, and semi-supervised zero-row/probability edge cases. |
 | Decomposition / manifold / cross-decomposition | Missing decomposition helper functions and sparse/dictionary online variants remain. Present estimators still have gaps such as PCA `svd_solver` override/ARPACK/MLE/parameter surface, repeated-eigenbasis exactness, rank-deficient score precision, PLS fitted attributes/constructor modes/inverse transform/PyO3 bindings, LDA topic-model RNG initialization, and manifold helper-function/API differences. |
-| Preprocess / impute / feature extraction / feature selection | This remains one of the biggest contract-parity areas. Exact missing names include `MissingIndicator`, mutual-information scoring, generic univariate selection, and dict/hash/text/image extraction APIs. Common gaps include dense-only implementations where sklearn supports sparse, limited string/object/mixed dtype handling, incomplete feature-name plumbing, reduced Python/PyO3 exposure, random-projection RNG and component-orientation differences, KBins k-means/local-optimum edge cases, spline/quantile/power-transform edge cases, TF-IDF unsmoothed idf behavior, and degenerate feature-scoring semantics. |
+| Preprocess / impute / feature extraction / feature selection | This remains one of the biggest contract-parity areas. Exact missing names include mutual-information scoring, generic univariate selection, and dict/hash/text/image extraction APIs. Common gaps include dense-only implementations where sklearn supports sparse, limited string/object/mixed dtype handling, incomplete feature-name plumbing, reduced Python/PyO3 exposure, random-projection RNG and component-orientation differences, KBins k-means/local-optimum edge cases, spline/quantile/power-transform edge cases, TF-IDF unsmoothed idf behavior, and degenerate feature-scoring semantics. |
 | Metrics / scoring / pairwise | Many metrics now exist, but missing display, threshold, consensus, chunked pairwise, and several pairwise-kernel functions remain. Regression metrics are documented as mostly 1D/unweighted; `sample_weight`, `multioutput`, keyword/default surfaces, exact validation exceptions, and PyO3 exposure are incomplete. Scorer utilities are present but not full sklearn scoring/protocol parity. |
 | Model selection / compose / calibration / multiclass / multioutput | Many names exist, but some exact sklearn public names are absent (`check_cv` and displays). Several implementations use Rust closures or simplified wrappers rather than sklearn's estimator-cloning protocol. RNG exactness, result-table parity, threshold/calibration displays, and some group/splitter edge semantics remain documented divergence areas. |
 | Kernel / GP / covariance / neural | Core estimator names exist, but GP kernels are incomplete (`RationalQuadratic`, `ExpSineSquared`, `Exponentiation`, `CompoundKernel`, `Hyperparameter`). Kernel approximation is missing three sklearn estimators. Covariance and neural crates have public surfaces but many fitted-state items are still in conformance exclusions or have narrower solver/optimizer/attribute contracts than sklearn. |
