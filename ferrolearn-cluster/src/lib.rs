@@ -112,5 +112,5 @@ pub use label_propagation::{FittedLabelPropagation, LabelPropagation, LabelPropa
 pub use label_spreading::{FittedLabelSpreading, LabelSpreading, LabelSpreadingKernel};
 pub use mean_shift::{FittedMeanShift, MeanShift};
 pub use mini_batch_kmeans::{FittedMiniBatchKMeans, MiniBatchKMeans, MiniBatchKMeansInit};
-pub use optics::{FittedOPTICS, OPTICS, cluster_optics_xi};
+pub use optics::{FittedOPTICS, OPTICS, cluster_optics_xi, compute_optics_graph};
 pub use spectral::{FittedSpectralClustering, SpectralClustering};

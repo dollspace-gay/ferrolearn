@@ -25,7 +25,7 @@ use ferrolearn_cluster::{
     FeatureAgglomeration, GaussianMixture, Hdbscan, KMeans, LabelPropagation,
     LabelPropagationKernel, LabelSpreading, LabelSpreadingKernel, Linkage, MeanShift,
     MiniBatchKMeans, MiniBatchKMeansInit, OPTICS, PoolingFunc, SpectralClustering, WeightPriorType,
-    cluster_optics_xi, kmeans_plusplus, kmeans_plusplus_with_options,
+    cluster_optics_xi, compute_optics_graph, kmeans_plusplus, kmeans_plusplus_with_options,
 };
 use ferrolearn_core::traits::{Fit, Predict, Transform};
 use ndarray::{Array1, Array2, array};
@@ -172,6 +172,12 @@ fn api_proof_optics() {
         .with_min_cluster_size(2);
     let f = m.fit(&x, &()).unwrap();
     let _ = f.labels();
+    let (ordering, core_distances, reachability, predecessor) =
+        compute_optics_graph(&x, 2, 5.0).unwrap();
+    assert_eq!(ordering.len(), x.nrows());
+    assert_eq!(core_distances.len(), x.nrows());
+    assert_eq!(reachability.len(), x.nrows());
+    assert_eq!(predecessor.len(), x.nrows());
     let (xi_labels, xi_hierarchy) = cluster_optics_xi(
         f.reachability(),
         f.predecessor(),

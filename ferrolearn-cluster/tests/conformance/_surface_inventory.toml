@@ -49,6 +49,11 @@ phase = "cluster"
 fixture = ""
 
 [[item]]
+path = "ferrolearn_cluster::compute_optics_graph"
+phase = "cluster"
+fixture = ""
+
+[[item]]
 path = "ferrolearn_cluster::CovarianceType"
 phase = "cluster"
 fixture = ""

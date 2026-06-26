@@ -19,7 +19,7 @@
 //!         (formerly `divergence_ordering_small10`; the fix landed so the pin is green)
 
 use ferrolearn_cluster::optics::OpticsClusterMethod;
-use ferrolearn_cluster::{OPTICS, cluster_optics_xi};
+use ferrolearn_cluster::{OPTICS, cluster_optics_xi, compute_optics_graph};
 use ferrolearn_core::Fit;
 use ndarray::Array2;
 
@@ -256,6 +256,62 @@ fn green_reachability_docstring() {
             sk_reach[i]
         );
     }
+}
+
+/// Public helper: `ferrolearn_cluster::compute_optics_graph` mirrors
+/// `sklearn.cluster.compute_optics_graph` for the Euclidean dense-array subset.
+///
+/// LIVE ORACLE (sklearn 1.5.2, run from /tmp):
+///   python3 -c "import numpy as np; from sklearn.cluster import compute_optics_graph; \
+///     X=np.array([[1,2],[2,5],[3,6],[8,7],[8,8],[7,3]], dtype=float); \
+///     o,cd,r,p=compute_optics_graph(X,min_samples=2,max_eps=np.inf,metric='minkowski',p=2,metric_params=None,algorithm='auto',leaf_size=30,n_jobs=None); \
+///     print(o.tolist()); print([repr(float(v)) for v in cd]); print([repr(float(v)) for v in r]); print(p.tolist())"
+///   -> ordering_:        [0, 1, 2, 5, 3, 4]
+///      core_distances_:  [3.16227766016838, 1.414213562373095, 1.414213562373095, 1.0, 1.0, 4.12310562561766]
+///      reachability_:    [inf, 3.16227766016838, 1.414213562373095, 4.12310562561766, 1.0, 5.0]
+///      predecessor_:     [-1, 0, 1, 5, 3, 2]
+#[test]
+fn green_compute_optics_graph_public_helper_docstring() {
+    let (ordering, core, reachability, predecessor) =
+        compute_optics_graph(&docstring(), 2, f64::INFINITY).unwrap();
+    assert_eq!(ordering, vec![0, 1, 2, 5, 3, 4]);
+
+    let sk_core = [
+        3.16227766016838,
+        1.414213562373095,
+        1.414213562373095,
+        1.0,
+        1.0,
+        4.12310562561766,
+    ];
+    for (i, &sk) in sk_core.iter().enumerate() {
+        assert!(
+            (core[i] - sk).abs() <= TOL,
+            "core_distances_[{i}]: ferro={} sklearn={sk}",
+            core[i]
+        );
+    }
+
+    let sk_reachability = [
+        f64::INFINITY,
+        3.16227766016838,
+        1.414213562373095,
+        4.12310562561766,
+        1.0,
+        5.0,
+    ];
+    for (i, &sk) in sk_reachability.iter().enumerate() {
+        if sk.is_infinite() {
+            assert!(reachability[i].is_infinite());
+        } else {
+            assert!(
+                (reachability[i] - sk).abs() <= TOL,
+                "reachability_[{i}]: ferro={} sklearn={sk}",
+                reachability[i]
+            );
+        }
+    }
+    assert_eq!(predecessor.as_slice().unwrap(), &[-1, 0, 1, 5, 3, 2]);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
