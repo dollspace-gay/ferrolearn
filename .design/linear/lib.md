@@ -17,7 +17,7 @@ scikit-learn's `sklearn/linear_model/__init__.py` `__all__` (`__init__.py:48-98`
 **broader**: per the workspace's dependency-order grouping ("linear_model, svm,
 discriminant_analysis, isotonic", goal.md scope §2), `lib.rs` also surfaces the public types of
 `sklearn.svm` and `sklearn.discriminant_analysis` and `sklearn.isotonic` at the same crate root.
-Beyond the re-exports, `lib.rs` defines three cross-cutting crate-level helpers: two public score
+The SVM helper `l1_min_c` is also surfaced from this boundary. Beyond the re-exports, `lib.rs` defines three cross-cutting crate-level helpers: two public score
 traits (`ClassifierScore`/`RegressorScore`) backing the `score(&x, &y)` convenience method, and a
 `pub(crate)` `log_proba` used as the body of every classifier `predict_log_proba`. The
 per-estimator behavior lives in the sibling modules (each separately routed, e.g.
@@ -60,7 +60,8 @@ Observed oracle values: constant `y_true` with non-zero residual → **0.0** (wi
 - REQ-1: The crate root re-exports every linear/SVM/discriminant/isotonic estimator ferrolearn
   implements as the crate's public API, mirroring sklearn's `__all__` re-export boundary
   (`sklearn/linear_model/__init__.py:48-98`), broadened to also surface `sklearn.svm`,
-  `sklearn.discriminant_analysis`, and `sklearn.isotonic` public types (goal.md scope §2 grouping).
+  `sklearn.discriminant_analysis`, and `sklearn.isotonic` public types plus `sklearn.svm.l1_min_c`
+  (goal.md scope §2 grouping).
 - REQ-2: `ClassifierScore::score(x, y)` returns mean accuracy of `predict(x)` vs `y`, mirroring
   `ClassifierMixin.score` → `accuracy_score` (`base.py:738-764`, body `base.py:764`).
 - REQ-3: `RegressorScore::score(x, y)` returns the in-regime R² coefficient of determination
@@ -83,7 +84,7 @@ Observed oracle values: constant `y_true` with non-zero residual → **0.0** (wi
 
 - AC-1 (REQ-1): The set of estimator types named in the `pub use` block at the crate root is a
   superset of sklearn `linear_model.__all__` minus the types ferrolearn lacks (see Architecture),
-  plus the `sklearn.svm`/`discriminant_analysis`/`isotonic` public types; each is reachable as
+  plus the `sklearn.svm`/`discriminant_analysis`/`isotonic` public types and `l1_min_c`; each is reachable as
   `ferrolearn_linear::<Type>` and routed by its own `.design/linear/<doc>.md`.
 - AC-2 (REQ-2): For a fitted classifier with integer-label predictions, `score(x, y)` equals
   `(# predicted == true) / n`, matching `sklearn …ClassifierMixin.score` (= `accuracy_score`)
@@ -110,7 +111,7 @@ the same basis REQ-1 ships on. Honest underclaim (R-HONEST-3): no production cod
 
 | REQ | Status | Evidence |
 |---|---|---|
-| REQ-1 (re-export boundary) | SHIPPED | impl: the `pub use` block `in lib.rs` surfaces every implemented estimator at the crate root — `LinearRegression`, `Ridge`/`RidgeCV`/`RidgeClassifier`, `Lasso`/`LassoCV`, `ElasticNet`/`ElasticNetCV`, `BayesianRidge`, `ARDRegression`, `HuberRegressor`, `QuantileRegressor`, `Lars`/`LassoLars`, `OrthogonalMatchingPursuit`, `RANSACRegressor`, `LogisticRegression`/`LogisticRegressionCV`, `LinearSVC`/`LinearSVR`, `SVC`/`SVR`/`NuSVC`/`NuSVR`/`OneClassSVM`, `SGDClassifier`/`SGDRegressor`/`SGDOneClassSVM`, `LDA`/`QDA`, `IsotonicRegression`, the GLM family (`GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`) — mirroring sklearn `linear_model.__all__` (`__init__.py:48-98`), broadened per goal.md scope §2. Non-test consumers: the meta-crate `ferrolearn/src/lib.rs` (`pub use ferrolearn_linear as linear;`) and the PyO3 shim `ferrolearn-python/src/{regressors,classifiers,extras}.rs` (each imports concrete estimator types from `ferrolearn_linear`). Boundary estimator types are grandfathered public API (goal.md S5/R-DEFER-1). Verification: `cargo build -p ferrolearn` (green); per-estimator routes in `.design/linear/*.md`. |
+| REQ-1 (re-export boundary) | SHIPPED | impl: the `pub use` block `in lib.rs` surfaces every implemented estimator at the crate root — `LinearRegression`, `Ridge`/`RidgeCV`/`RidgeClassifier`, `Lasso`/`LassoCV`, `ElasticNet`/`ElasticNetCV`, `BayesianRidge`, `ARDRegression`, `HuberRegressor`, `QuantileRegressor`, `Lars`/`LassoLars`, `OrthogonalMatchingPursuit`, `RANSACRegressor`, `LogisticRegression`/`LogisticRegressionCV`, `LinearSVC`/`LinearSVR`, `SVC`/`SVR`/`NuSVC`/`NuSVR`/`OneClassSVM`, `SGDClassifier`/`SGDRegressor`/`SGDOneClassSVM`, `LDA`/`QDA`, `IsotonicRegression`, the GLM family (`GLMRegressor`/`PoissonRegressor`/`GammaRegressor`/`TweedieRegressor`), and the SVM helper `l1_min_c`/`L1MinCLoss` — mirroring sklearn `linear_model.__all__` (`__init__.py:48-98`) and the grouped sklearn.svm boundary, broadened per goal.md scope §2. Non-test consumers: the meta-crate `ferrolearn/src/lib.rs` (`pub use ferrolearn_linear as linear;`) and the PyO3 shim `ferrolearn-python/src/{regressors,classifiers,extras}.rs` (each imports concrete estimator types from `ferrolearn_linear`); `l1_min_c` is covered by `tests/api_proof.rs` and `tests/divergence_svm_bounds.rs`. Boundary estimator types are grandfathered public API (goal.md S5/R-DEFER-1). Verification: `cargo build -p ferrolearn` (green); per-estimator/helper routes in `.design/linear/*.md`. |
 | REQ-2 (ClassifierScore == mean accuracy) | SHIPPED | impl `pub trait ClassifierScore` + blanket impl over `Predict<Array2<F>, Output=Array1<usize>>` `in lib.rs`, body `mean_accuracy in lib.rs` (`correct / n`) mirrors `ClassifierMixin.score` → `accuracy_score` (`base.py:738-764`). Critic-verified clean vs the live oracle (`accuracy_score([0,1,2,1],[0,1,1,1]) = 0.75 = correct/n`). Consumer: grandfathered crate/meta-crate re-export of the pre-existing `pub trait` (goal.md S5). Verification: `cargo test -p ferrolearn-linear` green; `tests/api_proof.rs` exercises `.score`. Underclaim: no production `.score()` caller yet; multilabel "subset accuracy" N/A (`Output=Array1<usize>`, single-label). |
 | REQ-3 (RegressorScore == in-regime R²) | SHIPPED | impl `pub trait RegressorScore` + blanket impl over `Predict<Array2<F>, Output=Array1<F>>` `in lib.rs`, body `r2_score in lib.rs` computes `1 − ss_res/ss_tot` mirroring `RegressorMixin.score` → `metrics.r2_score` (`base.py:805-849`; R² def `base.py:807-816`). Critic-verified clean: matches the live oracle `r2_score([3.,5.,2.,7.],[2.5,5.,2.,8.]) = 0.9152542372881356` within 1e-8 (`r2_in_regime_matches_oracle`, `tests/divergence_lib.rs`). Consumer: grandfathered re-export (S5). Underclaim: no production `.score()` caller yet. |
 | REQ-4 (constant-y edge parity) | SHIPPED | FIXED #1104. `r2_score in lib.rs` now returns `F::zero()` (was `F::neg_infinity()`) when `ss_tot == 0 ∧ ss_res != 0`, matching `sklearn.metrics.r2_score` (`_regression.py:891`: `output_scores[nonzero_numerator & ~nonzero_denominator] = 0.0`, the `RegressorMixin.score` delegate `base.py:849`). The zero-residual sub-case stays `1.0`. Live oracle: `r2_score([5.,5.,5.],[4.,5.,6.])=0.0`, `r2_score([5.,5.,5.],[5.,5.,5.])=1.0`. Verification (both green): `divergence_r2_constant_ytrue_nonzero_residual_returns_zero` + `r2_constant_ytrue_zero_residual_returns_one` in `tests/divergence_lib.rs`. |
@@ -130,7 +131,7 @@ the same basis REQ-1 ships on. Honest underclaim (R-HONEST-3): no production cod
    `linear_model/__init__.py` `__all__` (`__init__.py:48-98`): defining the importable public
    surface. **Breadth divergence (intended, per goal.md scope §2):** ferrolearn groups four
    sklearn modules under one crate, so `lib.rs` *adds* the public types of `sklearn.svm`
-   (`SVC`/`SVR`/`NuSVC`/`NuSVR`/`OneClassSVM`/`LinearSVC`/`LinearSVR` + kernels) and
+   (`SVC`/`SVR`/`NuSVC`/`NuSVR`/`OneClassSVM`/`LinearSVC`/`LinearSVR` + kernels + `l1_min_c`) and
    `sklearn.discriminant_analysis` (`LDA`/`QDA`) and `sklearn.isotonic` (`IsotonicRegression`),
    which are *not* in `linear_model.__all__`.
    **Omissions (estimators ferrolearn lacks — documented, not a `lib.rs` gap):** relative to

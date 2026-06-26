@@ -20,11 +20,11 @@ use ferrolearn_linear::sgd::{ClassifierLoss, LearningRateSchedule, RegressorLoss
 use ferrolearn_linear::svm::{LinearKernel, RbfKernel};
 use ferrolearn_linear::{
     ARDRegression, BayesianRidge, ClassifierScore, ElasticNet, ElasticNetCV, GLMFamily,
-    GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, LDA, Lars, Lasso, LassoCV,
-    LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
+    GLMRegressor, GammaRegressor, HuberRegressor, IsotonicRegression, L1MinCLoss, LDA, Lars, Lasso,
+    LassoCV, LassoLars, LinearRegression, LinearSVC, LinearSVCLoss, LinearSVR, LinearSVRLoss,
     LogisticRegression, LogisticRegressionCV, NuSVC, NuSVR, OneClassSVM, OrthogonalMatchingPursuit,
     PoissonRegressor, QDA, QuantileRegressor, RANSACRegressor, RegressorScore, Ridge, RidgeCV,
-    RidgeClassifier, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor,
+    RidgeClassifier, SGDClassifier, SGDRegressor, SVC, SVR, TweedieRegressor, l1_min_c,
 };
 use ndarray::{Array1, Array2, array};
 
@@ -348,6 +348,9 @@ fn api_proof_sgd_classifier_and_regressor() {
 #[test]
 fn api_proof_linear_svc() {
     let (x, y) = binary_data();
+    let min_c = l1_min_c(&x, &y, L1MinCLoss::SquaredHinge, true, 1.0).unwrap();
+    assert!(min_c > 0.0);
+
     for loss in [LinearSVCLoss::Hinge, LinearSVCLoss::SquaredHinge] {
         let f = LinearSVC::<f64>::new()
             .with_c(1.0)

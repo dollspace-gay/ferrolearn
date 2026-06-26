@@ -54,7 +54,7 @@
 //!
 //! | REQ | Status | Evidence |
 //! |---|---|---|
-//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block re-exports every implemented linear/svm/discriminant_analysis/isotonic estimator at the crate root, mirroring sklearn `linear_model.__all__` (`__init__.py:48-98`), broadened per goal.md scope §2. Consumers: meta-crate `pub use ferrolearn_linear as linear` + PyO3 shim `ferrolearn-python/src/{regressors,classifiers,extras}.rs`. |
+//! | REQ-1 (re-export boundary) | SHIPPED | the `pub use` block re-exports every implemented linear/svm/discriminant_analysis/isotonic estimator plus the `sklearn.svm` helper `l1_min_c` at the crate root, mirroring sklearn `linear_model.__all__` (`__init__.py:48-98`) and the broader SVM grouping per goal.md scope §2. Consumers: meta-crate `pub use ferrolearn_linear as linear` + PyO3 shim `ferrolearn-python/src/{regressors,classifiers,extras}.rs`; `l1_min_c` is exercised by `tests/api_proof.rs` and `tests/divergence_svm_bounds.rs`. |
 //! | REQ-2 (`ClassifierScore::score` == mean accuracy) | SHIPPED | `ClassifierScore` blanket impl body `mean_accuracy` (`correct / n`) mirrors `ClassifierMixin.score` → `accuracy_score` (`base.py:738-764`); critic-verified vs live oracle (`accuracy_score([0,1,2,1],[0,1,1,1])=0.75`). Consumer: grandfathered crate/meta re-export (S5). Underclaim: no production `.score()` caller; single-label (`Output=Array1<usize>`). |
 //! | REQ-3 (`RegressorScore::score` == in-regime R²) | SHIPPED | `RegressorScore` blanket impl body `r2_score` = `1 − ss_res/ss_tot` mirrors `RegressorMixin.score` → `metrics.r2_score` (`base.py:805-849`); matches live oracle `r2_score([3.,5.,2.,7.],[2.5,5.,2.,8.])=0.9152542372881356` (`r2_in_regime_matches_oracle`). Consumer: grandfathered re-export (S5). |
 //! | REQ-4 (constant-y R² edge parity) | SHIPPED | FIXED #1104. `r2_score` now returns `0.0` (was `neg_infinity()`) when `ss_tot==0 ∧ ss_res!=0`, matching `metrics.r2_score` (`_regression.py:891`); zero-residual stays `1.0`. Green: `divergence_r2_constant_ytrue_nonzero_residual_returns_zero` + `r2_constant_ytrue_zero_residual_returns_one`. |
@@ -96,6 +96,7 @@ pub mod ridge_classifier_cv;
 pub mod ridge_cv;
 pub mod sgd;
 pub mod svm;
+pub mod svm_bounds;
 
 // Re-export the main types at the crate root.
 pub use ard::{ARDRegression, FittedARDRegression};
@@ -138,6 +139,7 @@ pub use svm::{
     FittedSVC, FittedSVR, Kernel, LinearKernel, PolynomialKernel, RbfKernel, SVC, SVR,
     SigmoidKernel,
 };
+pub use svm_bounds::{L1MinCLoss, l1_min_c};
 
 use ferrolearn_core::error::FerroError;
 use ferrolearn_core::traits::Predict;

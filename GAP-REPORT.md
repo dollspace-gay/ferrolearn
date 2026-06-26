@@ -33,7 +33,7 @@ parity.
 
 ferrolearn is now broad but still not sklearn-parity complete.
 
-- Scoped ML-facing sklearn API gaps: 91 exact public items missing across the
+- Scoped ML-facing sklearn API gaps: 90 exact public items missing across the
   modules listed below.
 - Whole sklearn infrastructure areas are not counted in that exact gap count: callbacks,
   frozen estimators, full `sklearn.base` estimator protocol, `sklearn.utils`,
@@ -55,7 +55,6 @@ public Rust surface after the alias normalization above.
 | sklearn module | Missing public items |
 |---|---|
 | `sklearn.linear_model` | `PassiveAggressiveClassifier`, `LarsCV`, `LassoLarsCV`, `LassoLarsIC`, `OrthogonalMatchingPursuitCV`, `TheilSenRegressor`, `PassiveAggressiveRegressor`, `enet_path`, `lars_path`, `lars_path_gram`, `lasso_path`, `orthogonal_mp`, `orthogonal_mp_gram`, `ridge_regression` |
-| `sklearn.svm` | `l1_min_c` |
 | `sklearn.tree` | `export_graphviz`, `export_text`, `plot_tree` |
 | `sklearn.ensemble` | `StackingClassifier`, `StackingRegressor` |
 | `sklearn.neighbors` | `KNeighborsTransformer`, `KernelDensity`, `NeighborhoodComponentsAnalysis`, `RadiusNeighborsTransformer` |
@@ -76,7 +75,7 @@ public Rust surface after the alias normalization above.
 | `sklearn.inspection` | `DecisionBoundaryDisplay`, `PartialDependenceDisplay` |
 
 The following scoped modules had no exact public-item miss in this pass:
-`sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
+`sklearn.svm`, `sklearn.naive_bayes`, `sklearn.mixture`, `sklearn.cross_decomposition`,
 `sklearn.discriminant_analysis`, `sklearn.pipeline`, `sklearn.preprocessing`,
 `sklearn.impute`, `sklearn.random_projection`, `sklearn.semi_supervised`,
 `sklearn.metrics.pairwise`, `sklearn.kernel_ridge`, `sklearn.gaussian_process`,
